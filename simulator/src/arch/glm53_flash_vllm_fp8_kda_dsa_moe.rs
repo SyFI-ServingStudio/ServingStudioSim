@@ -76,7 +76,6 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::all_reduce_fusion::fused_all_reduce_refusal;
-use crate::timing::kernels::gdn_causal_conv_prefill::launches_per_sequence;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
@@ -123,12 +122,18 @@ const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 pub(crate) const MHC_BACKENDS: &[&str] = &["vllm_tilelang"];
 const RMS_NORM_BACKENDS: &[&str] = &["vllm_cuda"];
 const KDA_BACKENDS: &[&str] = &["vllm_triton"];
+/// The fork's FLA `chunk_kda_with_fused_gate`.
+const KDA_PREFILL_BACKENDS: &[&str] = &["vllm_triton"];
+/// vLLM's one varlen `causal_conv1d_fn` launch.
+const CONV_PREFILL_BACKENDS: &[&str] = &["vllm_triton"];
 const CONV_DECODE_BACKENDS: &[&str] = &["vllm_triton"];
 const QKV_NORM_BACKENDS: &[&str] = &["vllm_triton"];
 const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_no_rope"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_unpadded"];
 const MQA_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
+/// vLLM's `top_k_per_row_prefill`.
+const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
 /// The fork's `fp8_fp4_mqa_logits` is DeepGEMM's `sm100_mqa_logits`; the
 /// packaged `deepgemm_fp8` rows time the same kernel (0.573 ms at 2048 x 65536
 /// against 0.55 ms measured at a 261K-token context in capture 20260925_4).
@@ -472,64 +477,25 @@ pub struct Glm53FlashVllmParallel {
     pub kernel_path: Glm53FlashKernelPath,
 }
 
-/// Which vLLM code path the layers' kernels follow where the fork this arch was
-/// captured on (3f667d7) and current vLLM differ.
+/// Which vLLM code path the layers follow where the fork this arch was
+/// captured on (3f667d7) and current vLLM differ in more than a kernel's
+/// backend. Backends are chosen per kernel through the run config's
+/// `backends` override, like every other arch's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Glm53FlashKernelPath {
-    /// `kda_chunk_prefill` backend of the KDA prefill core.
-    pub kda_prefill_backend: &'static str,
     /// Whether the DSA layers pay the fork's `q_concat` and output
     /// `masked_fill_` copies.
     pub mla_layout_copies: bool,
-    /// `mhc_fused_post_pre_rms_norm` backend of every fused mHC boundary.
-    pub mhc_fused_backend: &'static str,
-    /// `indexer_topk_backend`: `vllm_cuda`, `deep_select` or `fastest`.
-    pub indexer_topk_backend: &'static str,
     /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`.
     pub indexer_max_logits_mb: u32,
-    /// `gdn_causal_conv_prefill` backend of the KDA short conv.
-    pub causal_conv_backend: &'static str,
-}
-
-impl Glm53FlashKernelPath {
-    /// FlashKDA and FlashInfer's persistent kernel apply the beta sigmoid
-    /// inside their call; FLA's chain takes beta already passed through one.
-    pub fn kda_prefill_takes_beta_logits(&self) -> bool {
-        matches!(
-            self.kda_prefill_backend,
-            "flashkda" | "flashinfer_cute_persistent"
-        )
-    }
-
-    /// A per-sequence short-conv backend runs each prefill sequence as its own
-    /// launch and leaves the decode tokens to `causal_conv1d_update`; vLLM's
-    /// varlen call covers prefills and decodes in one launch.
-    pub fn causal_conv_launches_per_sequence(&self) -> bool {
-        launches_per_sequence(self.causal_conv_backend)
-    }
-}
-
-impl Glm53FlashKernelPath {
-    /// The `dsa_topk_prefill` candidates of the prefill indexer's top-k;
-    /// `fastest` lets best-of-N pick per launch shape.
-    pub fn indexer_topk_prefill_backends(&self) -> Vec<&'static str> {
-        match self.indexer_topk_backend {
-            "fastest" => vec!["deep_select", "vllm_cuda"],
-            backend => vec![backend],
-        }
-    }
 }
 
 impl Default for Glm53FlashKernelPath {
     /// The captured fork.
     fn default() -> Self {
         Self {
-            kda_prefill_backend: "vllm_triton",
             mla_layout_copies: true,
-            mhc_fused_backend: MHC_BACKENDS[0],
-            indexer_topk_backend: "vllm_cuda",
             indexer_max_logits_mb: 512,
-            causal_conv_backend: "vllm_triton",
         }
     }
 }
@@ -620,10 +586,10 @@ pub struct Glm53FlashVllmConfigs {
     pub routed: Vec<Glm53RoutedMoeLocalWorkletConfig>,
     pub embedding: ElementwiseKernelConfig,
     pub hc_expand: ElementwiseKernelConfig,
-    /// The first pre and the last post (TileLang); `mhc_fused` differs only in
-    /// its backends.
+    /// The first pre and the last post (TileLang only).
     pub mhc: MhcRmsNormKernelConfig,
-    /// Every fused post/pre boundary, on `kernel_path.mhc_fused_backend`.
+    /// Every fused post/pre boundary (`*_mhc_post_pre` roles), the ones a
+    /// `backends` override may move to `deepgemm_mega_nonshifted`.
     pub mhc_fused: MhcRmsNormKernelConfig,
     pub all_reduce: AllReduceFusionKernelConfig,
     /// The all-reduce vLLM falls back to above FlashInfer's workspace cap.
@@ -749,12 +715,10 @@ pub fn build_configs(
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
             bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
-            conv_prefill_backends: vec![parallel.kernel_path.causal_conv_backend],
-            conv_prefill_per_sequence: parallel.kernel_path.causal_conv_launches_per_sequence(),
+            conv_prefill_backends: CONV_PREFILL_BACKENDS.to_vec(),
             conv_decode_backends: CONV_DECODE_BACKENDS.to_vec(),
             core_backends: KDA_BACKENDS.to_vec(),
-            chunk_prefill_backends: vec![parallel.kernel_path.kda_prefill_backend],
-            chunk_prefill_takes_beta_logits: parallel.kernel_path.kda_prefill_takes_beta_logits(),
+            chunk_prefill_backends: KDA_PREFILL_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
@@ -781,7 +745,7 @@ pub fn build_configs(
             mqa_logits_backends: MQA_LOGITS_BACKENDS.to_vec(),
             topk_backends: TOPK_BACKENDS.to_vec(),
             mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
-            topk_prefill_backends: parallel.kernel_path.indexer_topk_prefill_backends(),
+            topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
             sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
@@ -814,10 +778,7 @@ pub fn build_configs(
         embedding: ew(hidden_bytes, hidden_bytes),
         hc_expand: ew(hidden_bytes, stream_bytes),
         mhc: mhc.clone(),
-        mhc_fused: MhcRmsNormKernelConfig {
-            backends: vec![parallel.kernel_path.mhc_fused_backend],
-            ..mhc
-        },
+        mhc_fused: mhc,
         all_reduce: AllReduceFusionKernelConfig {
             backends: all_reduce_backends.to_vec(),
             gpu_name: gpu.clone(),
@@ -1733,26 +1694,6 @@ mod tests {
     }
 
     #[test]
-    fn fastest_indexer_top_k_offers_both_backends_to_best_of_n() {
-        let path = |indexer_topk_backend| Glm53FlashKernelPath {
-            indexer_topk_backend,
-            ..Glm53FlashKernelPath::default()
-        };
-        assert_eq!(
-            path("vllm_cuda").indexer_topk_prefill_backends(),
-            vec!["vllm_cuda"]
-        );
-        assert_eq!(
-            path("deep_select").indexer_topk_prefill_backends(),
-            vec!["deep_select"]
-        );
-        assert_eq!(
-            path("fastest").indexer_topk_prefill_backends(),
-            vec!["deep_select", "vllm_cuda"]
-        );
-    }
-
-    #[test]
     fn graph_padding_rounds_up_to_the_next_captured_size() {
         let sizes = [1, 2, 4, 8, 16, 24];
         let padded: Vec<u32> = [1, 3, 5, 16, 17, 24, 25]
@@ -1791,16 +1732,28 @@ mod tests {
         build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
     }
 
-    /// Catches `mhc_fused_backend` not reaching the fused boundaries, or
-    /// leaking into the first pre and the terminal post, whose TileLang
-    /// decomposition has no other backend's rows.
+    /// The fused boundaries' role names are what a `backends` override moving
+    /// them to DeepGEMM lists; the first pre and the terminal post, whose
+    /// TileLang decomposition has no other backend's rows, are not among them.
     #[test]
-    fn mhc_fused_backend_selects_only_the_fused_boundaries() {
-        let mut parallel = parallel();
-        parallel.kernel_path.mhc_fused_backend = "deepgemm_mega_nonshifted";
+    fn a_backends_override_moves_only_the_fused_mhc_boundaries() {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
-        let configs = build_configs(&model_cfg(), &parallel, &demand()).unwrap();
+        let configs = build_configs(&model_cfg(), &parallel(), &demand()).unwrap();
+        let roles = |bridge: &PerfApiBridge| -> Vec<String> {
+            build("unified".into(), resolve_configs(&configs), bridge).unwrap();
+            bridge
+                .take_enum_report()
+                .into_iter()
+                .filter(|leaf| leaf.name.ends_with("_mhc_post_pre"))
+                .map(|leaf| leaf.name)
+                .collect()
+        };
+        let overrides: std::collections::HashMap<String, Vec<String>> = roles(&bridge)
+            .into_iter()
+            .map(|role| (role, vec!["deepgemm_mega_nonshifted".to_string()]))
+            .collect();
+        let _scope = bridge.with_backend_overrides("main", Some(&overrides));
         build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
         let mhc: Vec<_> = bridge
             .take_enum_report()

@@ -16,11 +16,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::arch::config::{
-    AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind,
-    GLM53_FLASH_CAUSAL_CONV_BACKENDS, GLM53_FLASH_INDEXER_TOPK_BACKENDS,
-    GLM53_FLASH_KDA_PREFILL_BACKENDS, GLM53_FLASH_MHC_FUSED_BACKENDS,
-};
+use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
@@ -1816,111 +1812,47 @@ pub fn qwen3_fp8_ffn_moe(
         .context("building native FP8 Qwen3 AFD ffn-side model")
 }
 
-/// The vLLM code path a GLM-5.3-Flash arch tag's kernels follow.
+/// The vLLM code path a GLM-5.3-Flash arch tag's layers follow.
 pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath> {
-    let (backend, mla_layout_copies, mhc_backend, topk_backend, indexer_max_logits_mb, conv_backend) = match sel {
+    let (mla_layout_copies, indexer_max_logits_mb) = match sel {
         IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
-            kda_prefill_backend,
             mla_layout_copies,
-            mhc_fused_backend,
-            indexer_topk_backend,
             indexer_max_logits_mb,
-            causal_conv_backend,
             ..
         }
         | IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe {
-            kda_prefill_backend,
             mla_layout_copies,
-            mhc_fused_backend,
-            indexer_topk_backend,
             indexer_max_logits_mb,
-            causal_conv_backend,
             ..
         }
         | IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe {
-            kda_prefill_backend,
             mla_layout_copies,
-            mhc_fused_backend,
-            indexer_topk_backend,
             indexer_max_logits_mb,
-            causal_conv_backend,
             ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe {
-            kda_prefill_backend,
             mla_layout_copies,
-            mhc_fused_backend,
-            indexer_topk_backend,
             indexer_max_logits_mb,
-            causal_conv_backend,
             ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe {
-            kda_prefill_backend,
             mla_layout_copies,
-            mhc_fused_backend,
-            indexer_topk_backend,
             indexer_max_logits_mb,
-            causal_conv_backend,
             ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe {
-            kda_prefill_backend,
             mla_layout_copies,
-            mhc_fused_backend,
-            indexer_topk_backend,
             indexer_max_logits_mb,
-            causal_conv_backend,
             ..
-        } => (
-            kda_prefill_backend,
-            *mla_layout_copies,
-            mhc_fused_backend,
-            indexer_topk_backend,
-            *indexer_max_logits_mb,
-            causal_conv_backend,
-        ),
+        } => (*mla_layout_copies, *indexer_max_logits_mb),
         other => unreachable!("{other:?} is not a GLM-5.3-Flash arch tag"),
-    };
-    let Some(&kda_prefill_backend) = GLM53_FLASH_KDA_PREFILL_BACKENDS
-        .iter()
-        .find(|&&known| known == backend.as_str())
-    else {
-        bail!("kda_prefill_backend {backend:?} is not one of {GLM53_FLASH_KDA_PREFILL_BACKENDS:?}");
-    };
-    let Some(&causal_conv_backend) = GLM53_FLASH_CAUSAL_CONV_BACKENDS
-        .iter()
-        .find(|&&known| known == conv_backend.as_str())
-    else {
-        bail!(
-            "causal_conv_backend {conv_backend:?} is not one of {GLM53_FLASH_CAUSAL_CONV_BACKENDS:?}"
-        );
-    };
-    let Some(&indexer_topk_backend) = GLM53_FLASH_INDEXER_TOPK_BACKENDS
-        .iter()
-        .find(|&&known| known == topk_backend.as_str())
-    else {
-        bail!(
-            "indexer_topk_backend {topk_backend:?} is not one of \
-             {GLM53_FLASH_INDEXER_TOPK_BACKENDS:?}"
-        );
     };
     if indexer_max_logits_mb == 0 {
         bail!("indexer_max_logits_mb must be positive");
     }
-    let Some(&mhc_fused_backend) = GLM53_FLASH_MHC_FUSED_BACKENDS
-        .iter()
-        .find(|&&known| known == mhc_backend.as_str())
-    else {
-        bail!("mhc_fused_backend {mhc_backend:?} is not one of {GLM53_FLASH_MHC_FUSED_BACKENDS:?}");
-    };
     Ok(Glm53FlashKernelPath {
-        kda_prefill_backend,
         mla_layout_copies,
-        mhc_fused_backend,
-        indexer_topk_backend,
         indexer_max_logits_mb,
-        causal_conv_backend,
     })
 }
 
@@ -2828,9 +2760,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn glm53_flash_causal_conv_backend_reaches_the_kernel_path() {
-        // A dropped or unvalidated param would silently price the short conv
-        // on vLLM's varlen launch whatever the preset asked for.
+    fn glm53_flash_kernel_path_reads_the_layout_params() {
+        // Kernel backends are no longer arch params (the run config's
+        // `backends` override picks them); only the two layout params remain.
         let sel = |extra: &str| -> IterArchSel {
             serde_json::from_str(&format!(
                 r#"{{"type": "glm53_flash_vllm_nvfp4_pp_kda_dsa_moe",
@@ -2839,14 +2771,13 @@ mod tests {
             ))
             .unwrap()
         };
-        let default = glm53_flash_kernel_path(&sel("")).unwrap();
-        assert_eq!(default.causal_conv_backend, "vllm_triton");
-        assert!(!default.causal_conv_launches_per_sequence());
-        let dao =
-            glm53_flash_kernel_path(&sel(r#", "causal_conv_backend": "dao_channellast""#)).unwrap();
-        assert_eq!(dao.causal_conv_backend, "dao_channellast");
-        assert!(dao.causal_conv_launches_per_sequence());
-        assert!(glm53_flash_kernel_path(&sel(r#", "causal_conv_backend": "fla""#)).is_err());
+        assert_eq!(
+            glm53_flash_kernel_path(&sel("")).unwrap(),
+            Glm53FlashKernelPath::default()
+        );
+        let current = glm53_flash_kernel_path(&sel(r#", "mla_layout_copies": false"#)).unwrap();
+        assert!(!current.mla_layout_copies);
+        assert!(glm53_flash_kernel_path(&sel(r#", "indexer_max_logits_mb": 0"#)).is_err());
     }
 
     #[test]

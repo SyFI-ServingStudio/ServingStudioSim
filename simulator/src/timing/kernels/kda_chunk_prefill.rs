@@ -67,6 +67,16 @@ pub struct KdaChunkPrefillKernelInput {
     pub num_decode_sequences: u32,
 }
 
+/// Whether `backend` takes the raw beta logits and applies the sigmoid inside
+/// its call (FlashKDA, FlashInfer's `recurrent_kda`). FLA's chain
+/// (`vllm_triton`) takes beta already through a sigmoid its caller launches.
+pub fn takes_beta_logits(backend: &str) -> bool {
+    matches!(
+        backend,
+        "flashkda" | "flashinfer_cute_persistent" | "flashinfer_tirx"
+    )
+}
+
 impl SweepCoords for KdaChunkPrefillKernelInput {
     /// Panics on an input outside the callable's domain: a pure-decode batch
     /// (no prefill) is `fused_recurrent_kda`, a different kind, and anything
