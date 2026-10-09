@@ -7,7 +7,7 @@
 //! `text-generation-independent`'s optional `prefix_len` column, which the shared
 //! crate does not declare yet; [`super::pinned_prefix`] reads it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -63,7 +63,7 @@ fn parse_independent_metadata(
     session_start_times: &mut HashMap<u32, Time>,
     source_identities: &mut SourceIdentities,
 ) -> Result<ParsedMetadata> {
-    let request_id = source_identities.intern_request(source_request_id)?;
+    let request_id = source_identities.intern_request(source_request_id);
     let (release_session, session_input) = match session.session_id.as_deref() {
         Some(source_session_id) if !source_session_id.is_empty() => {
             let session_id = source_identities.intern_session(source_session_id);
@@ -209,6 +209,7 @@ impl TraceDefinition for TextGenerationDefinition {
             ),
             InputFileFormat::TextGenerationSessionExecutionV2 => {
                 let sessions = text_generation::session::load(path, input_file_schema)?;
+                output.reserve(sessions.iter().map(|(_, rounds)| rounds.len()).sum());
                 for (source_session_id, rounds) in sessions {
                     let session_id = source_identities.intern_session(&source_session_id);
                     let declared_session_start_time = Time::from_ms(
@@ -221,7 +222,7 @@ impl TraceDefinition for TextGenerationDefinition {
                         .entry(session_id)
                         .or_insert(declared_session_start_time);
                     for round in rounds {
-                        let request_id = source_identities.intern_request(&round.request_id)?;
+                        let request_id = source_identities.intern_request(round.request_id);
                         let declared_prefix_tokens = usize_to_u32(round.prefix_len, "prefix_len")?;
                         output.push(ScheduledRequest {
                             release: ReleaseMetadata {
@@ -603,7 +604,6 @@ fn resolve_count(duration: f64, rate: f64, duration_name: &str, rate_name: &str)
 pub struct SourceIdentities {
     sessions: HashMap<String, u32>,
     session_order: Vec<String>,
-    request_ids: HashMap<String, RequestId>,
     requests: Vec<String>,
 }
 
@@ -618,14 +618,22 @@ impl SourceIdentities {
         dense
     }
 
-    fn intern_request(&mut self, source_id: &str) -> Result<RequestId> {
-        if self.request_ids.contains_key(source_id) {
-            bail!("duplicate request id {source_id:?} across input files");
+    /// Reject a request id seen twice, then free the session lookup map: after
+    /// loading only the dense-to-source vectors are read. Ids are checked once
+    /// here, borrowed, rather than copied into a map row by row.
+    pub(super) fn finish_loading(&mut self) -> Result<()> {
+        let mut seen = HashSet::with_capacity(self.requests.len());
+        if let Some(duplicate) = self.requests.iter().find(|id| !seen.insert(id.as_str())) {
+            bail!("duplicate request id {duplicate:?} across input files");
         }
+        self.sessions = HashMap::new();
+        Ok(())
+    }
+
+    fn intern_request(&mut self, source_id: impl Into<String>) -> RequestId {
         let dense = RequestId(self.requests.len() as u32);
-        self.request_ids.insert(source_id.to_string(), dense);
-        self.requests.push(source_id.to_string());
-        Ok(dense)
+        self.requests.push(source_id.into());
+        dense
     }
 
     pub fn session_source_ids(&self) -> &[String] {

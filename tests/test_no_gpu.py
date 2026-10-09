@@ -121,8 +121,50 @@ def test_a_cache_prebuild_with_missing_rows_fails_without_starting_a_builder(
     monkeypatch.setattr(cache_build, "build_cli_command", lambda *args, **kwargs: ["build"])
     monkeypatch.setattr(cache_build, "_probe_missing", probe)
     monkeypatch.setattr(cache_build._PROCESS_SUPERVISOR, "run", _untouchable)
+    monkeypatch.setattr(cache_build, "_LAUNCHER_LEASES", _TmpLeases(tmp_path))
 
     ok = asyncio.run(cache_build.prebuild_caches([{}], None, base_dir=tmp_path))
 
     assert ok is False
     assert "filling 7 missing profile.db spec(s) needs a GPU" in capsys.readouterr().err
+
+
+class _TmpLeases:
+    """The profile-DB lease under `tmp_path`, so a test never queues behind a
+    simulation that holds the repository's real lease."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def profile_database(self, *, write):
+        from launcher.process.leases import ResourceLease
+
+        return ResourceLease(
+            lock_path=self.root / "profile-db.lock",
+            resource="profile-db:test",
+            mode="exclusive" if write else "shared",
+        )
+
+
+def test_a_warm_cache_prebuild_runs_beside_a_running_simulation(no_gpu, monkeypatch, tmp_path):
+    """A running simulation holds the profile DB shared. A second launcher whose
+    cache is already warm must not wait for it to finish."""
+    from launcher import cache_build
+
+    async def probe(*args, **kwargs):
+        return 0
+
+    leases = _TmpLeases(tmp_path)
+    monkeypatch.setattr(cache_build, "_unique_by_cache_key", lambda params, registry: params)
+    monkeypatch.setattr(cache_build, "_prebuild_log_dir", lambda base, config: tmp_path)
+    monkeypatch.setattr(cache_build, "build_cli_command", lambda *args, **kwargs: ["build"])
+    monkeypatch.setattr(cache_build, "_probe_missing", probe)
+    monkeypatch.setattr(cache_build._PROCESS_SUPERVISOR, "run", _untouchable)
+    monkeypatch.setattr(cache_build, "_LAUNCHER_LEASES", leases)
+
+    with leases.profile_database(write=False):
+        ok = asyncio.run(
+            asyncio.wait_for(cache_build.prebuild_caches([{}], None, base_dir=tmp_path), 10)
+        )
+
+    assert ok is True

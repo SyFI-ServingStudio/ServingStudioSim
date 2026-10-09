@@ -52,7 +52,7 @@ DOC = KernelDoc(
         "W = Σ over two-query tiles ⌈(num_keys − num_queries + 1 + final query index) / 256⌉ · 256",
         "C = 2 · W",
         "TFLOPS = 2 · C · num_heads · head_dim / time",
-        "B = num_queries · num_heads · head_dim + W · head_dim + 4 · W "
+        "B = num_queries · num_heads · head_dim + num_keys · head_dim + 4 · num_keys "
         "+ 4 · num_queries · num_heads + 8 · num_queries + 4 · C",
         "GB/s = B / time",
     ),
@@ -67,8 +67,11 @@ DOC = KernelDoc(
     caveats=(
         "Only one sequence with clean_logits = false is measured; the torch "
         "backend marks invalid positions with NaN.",
-        "Both backends' TFLOPS and GB/s use DeepGEMM's schedule of two-query, "
-        "256-key tiles, not the torch launches or physical traffic.",
+        "Both backends' TFLOPS and the logits term of GB/s use DeepGEMM's schedule "
+        "of two-query, 256-key tiles, not the torch launches.",
+        "GB/s counts each key once. Every two-query tile reads its key window "
+        "again, but the one sequence's FP8 keys stay in L2 across tiles, so those "
+        "re-reads are not HBM traffic.",
     ),
     reference="profiling.runners.attention.dsa_mqa_logits_prefill_reference",
 )

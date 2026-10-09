@@ -2490,6 +2490,27 @@ def test_glm53_kpool_batch_and_array_paths_match_the_per_request_sums(glm53):
             assert rows(direct)[name][1] == pytest.approx(bytes_, rel=1e-12)
 
 
+def test_replicated_geometry_past_2_53_is_compared_as_a_double():
+    """The saturated-worker label replicates a whole run 10,000x; its f64 scalars
+    past 2**53 carry only the nearest double, which must not read as a missing
+    group, while a real gap still does."""
+    totals = _g53_geometry_totals([(240_001, 16_383)], [])
+    factor = 10_000_019
+    replicated = {
+        name: float(value * factor) for name, value in totals.items() if name != "request_geometry"
+    }
+    replicated["request_geometry"] = {
+        key: float(count * factor) for key, count in totals["request_geometry"].items()
+    }
+    assert replicated["prefill_pairs"] > 2**53
+    assert replicated["prefill_pairs"] != int(totals["prefill_pairs"]) * factor
+    assert len(work_floors._request_interactions(replicated)) == 1
+
+    replicated["prefill_pairs"] *= 1.001
+    with pytest.raises(ValueError, match="per-request geometry must cover every group"):
+        work_floors._request_interactions(replicated)
+
+
 @pytest.mark.parametrize(
     "key",
     ["decode:0", "decode:5:6", "decode:x", "prefill:3", "prefill:3:0", "prefill:3:4:5", "other:1"],
@@ -2775,7 +2796,8 @@ def test_glm53_location_map_variants_differ_only_in_routed_rank_fan_out(variant,
 
 
 def test_glm53_dp_attn_ep_location_maps_consume_every_semantic_row_once():
-    """DP4/EP4 and DP8/EP8 maps reuse the TP map's semantics; collectives map to ``[]``."""
+    """DP4/EP4 and DP8/EP8 maps reuse the TP map's semantics; collectives are not
+    locations, since the analyzer matches a map to the non-communication leaves."""
     tp_rules = {
         row["location"]: row["semantics"]
         for row in json.loads(G53_LOCATION_MAP.read_text())["locations"]
@@ -2794,8 +2816,9 @@ def test_glm53_dp_attn_ep_location_maps_consume_every_semantic_row_once():
         assert len(mapped) == len(set(mapped))
         assert set(mapped) == expected
         for tag in ("dsa_moe", "kda_moe"):
-            for op in ("dispatch_quant", "dispatch_all_gather", "combine_reduce_scatter"):
-                assert rules[f"unified.{tag}.moe.{op}"] == []
+            assert rules[f"unified.{tag}.moe.dispatch_quant"] == []
+            for op in ("dispatch_all_gather", "combine_reduce_scatter"):
+                assert f"unified.{tag}.moe.{op}" not in rules
             for rank in range(1, ep):
                 assert rules[f"unified.{tag}.moe.routed_rank{rank}.fused_moe"] == []
         for location, semantics in rules.items():

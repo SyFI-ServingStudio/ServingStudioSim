@@ -261,10 +261,9 @@ impl Glm53KpoolSparseMlaOp {
                 .remap
                 .clone()
                 .unwrap_or(DsaSparseIndexRemapKernelInput {
-                    request_row_counts: Vec::new(),
-                    local_span_lengths: Vec::new(),
-                    valid_counts: Vec::new(),
-                    workspace_partition: None,
+                    num_queries: 0,
+                    total_valid_count: 0,
+                    workspace_query_rows: 0,
                 })
                 .into()
         });
@@ -325,16 +324,18 @@ fn causal_tail_slots(num_queries: u32, num_cache_tokens: u32, cap: u32) -> u64 {
     ramp + (last - ramp_last) * cap
 }
 
-/// One `CausalTail` query carrying `valid_counts.len()` rows and, as closely as
-/// the encoding allows, their total of valid slots.
+/// One `CausalTail` query carrying `num_queries` rows and, as closely as the
+/// encoding allows, their `target` total of valid slots.
 ///
 /// The ramp total grows monotonically with the cache length, from `Q(Q+1)/2`
 /// at `S = Q` to `Q * cap` once every row is clipped, and every kpool count is
 /// at most `cap`, so the target is reachable unless it is below the minimum
 /// ramp (then `S = Q`).
-fn combined_causal_query(valid_counts: &[u32], cap: u32) -> DsaSparseMlaAttentionKernelInput {
-    let num_queries = valid_counts.len() as u32;
-    let target: u64 = valid_counts.iter().map(|&c| u64::from(c)).sum();
+fn combined_causal_query(
+    num_queries: u32,
+    target: u64,
+    cap: u32,
+) -> DsaSparseMlaAttentionKernelInput {
     let (mut lo, mut hi) = (num_queries, num_queries + cap - 1);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
@@ -362,23 +363,49 @@ fn pooled_valid_count(span: u32, index_topk: u32, index_kpool: u32) -> u32 {
     span.min(index_topk + span % index_kpool)
 }
 
+/// [`pooled_valid_count`] summed over the spans `first..=last`. Spans up to
+/// `index_topk` read every slot and spans from `index_topk + index_kpool` read
+/// `index_topk` plus their pool remainder, both in closed form; only the fewer
+/// than `index_kpool` spans between them go row by row.
+fn pooled_valid_total(first: u32, last: u32, index_topk: u32, index_kpool: u32) -> u64 {
+    let (first, last) = (u64::from(first), u64::from(last));
+    let (topk, kpool) = (u64::from(index_topk), u64::from(index_kpool));
+    // Sum of `span % kpool` over the spans below `n`.
+    let remainders_below = |n: u64| {
+        let partial = n % kpool;
+        n / kpool * (kpool * (kpool - 1) / 2) + partial * partial.saturating_sub(1) / 2
+    };
+    let mut total = 0;
+    let ramp_last = last.min(topk);
+    if first <= ramp_last {
+        total += (first + ramp_last) * (ramp_last - first + 1) / 2;
+    }
+    let pooled_first = first.max(topk + kpool);
+    if pooled_first <= last {
+        total += (last - pooled_first + 1) * topk + remainders_below(last + 1)
+            - remainders_below(pooled_first);
+    }
+    for span in first.max(topk + 1)..=last.min(topk + kpool - 1) {
+        total += u64::from(pooled_valid_count(span as u32, index_topk, index_kpool));
+    }
+    total
+}
+
 fn derive_shape(
     input: &Glm53KpoolSparseMlaInput,
     index_topk: u32,
     index_kpool: u32,
     selected_k: u32,
 ) -> Result<Shape, String> {
-    let mut request_row_counts = Vec::new();
-    let mut local_span_lengths = Vec::new();
-    let mut valid_counts = Vec::new();
+    let mut num_rows: u64 = 0;
+    let mut total_valid_count: u64 = 0;
     // vLLM lays decode rows out ahead of prefill rows in a mixed batch.
     for (request, &context) in input.decode_context_lens.iter().enumerate() {
         if context == 0 {
             return Err(format!("decode request {request} context must be positive"));
         }
-        request_row_counts.push(1);
-        local_span_lengths.push(context);
-        valid_counts.push(pooled_valid_count(context, index_topk, index_kpool));
+        num_rows += 1;
+        total_valid_count += u64::from(pooled_valid_count(context, index_topk, index_kpool));
     }
     for (request, &(num_queries, context)) in input.prefill_query_cache_pairs.iter().enumerate() {
         if num_queries == 0 || num_queries > context {
@@ -386,16 +413,15 @@ fn derive_shape(
                 "prefill request {request} requires 0 < Q <= S, got ({num_queries}, {context})"
             ));
         }
-        request_row_counts.push(num_queries);
-        for span in context - num_queries + 1..=context {
-            local_span_lengths.push(span);
-            valid_counts.push(pooled_valid_count(span, index_topk, index_kpool));
-        }
+        num_rows += u64::from(num_queries);
+        total_valid_count +=
+            pooled_valid_total(context - num_queries + 1, context, index_topk, index_kpool);
     }
-    let num_rows = u32::try_from(local_span_lengths.len())
-        .map_err(|_| "query-row count exceeds u32".to_string())?;
+    let num_rows =
+        u32::try_from(num_rows).map_err(|_| "query-row count exceeds u32".to_string())?;
     let prefill_bearing = !input.prefill_query_cache_pairs.is_empty();
-    let prefill = prefill_bearing.then(|| combined_causal_query(&valid_counts, selected_k));
+    let prefill =
+        prefill_bearing.then(|| combined_causal_query(num_rows, total_valid_count, selected_k));
     let decode = input
         .decode_context_lens
         .iter()
@@ -410,10 +436,9 @@ fn derive_shape(
         num_rows,
         prefill,
         remap: (num_rows > 0).then_some(DsaSparseIndexRemapKernelInput {
-            request_row_counts,
-            local_span_lengths,
-            valid_counts,
-            workspace_partition: None,
+            num_queries: num_rows,
+            total_valid_count,
+            workspace_query_rows: 0,
         }),
         decode,
     })
@@ -492,6 +517,25 @@ mod tests {
     }
 
     #[test]
+    fn pooled_total_matches_the_row_by_row_sum() {
+        for (topk, kpool) in [(2048, 4), (2048, 1), (64, 7)] {
+            for first in [1, 2, 63, 64, 65, 2045, 2048, 2049, 2050, 2052, 2053, 5000] {
+                for len in [1, 2, 3, 5, 9, 4096, 9000] {
+                    let last = first + len - 1;
+                    let rows: u64 = (first..=last)
+                        .map(|span| u64::from(pooled_valid_count(span, topk, kpool)))
+                        .sum();
+                    assert_eq!(
+                        pooled_valid_total(first, last, topk, kpool),
+                        rows,
+                        "topk {topk} kpool {kpool} spans {first}..={last}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn mixed_batch_runs_every_row_through_one_prefill_query() {
         let input = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(3, 5)],
@@ -500,9 +544,8 @@ mod tests {
         let shape = derive_shape(&input, 2048, 4, 2176).unwrap();
         assert_eq!(shape.num_rows, 5);
         let remap = shape.remap.unwrap();
-        assert_eq!(remap.request_row_counts, [1, 1, 3]);
-        assert_eq!(remap.local_span_lengths, [1000, 4003, 3, 4, 5]);
-        assert_eq!(remap.valid_counts, [1000, 2051, 3, 4, 5]);
+        assert_eq!(remap.num_queries, 5);
+        assert_eq!(remap.total_valid_count, 1000 + 2051 + 3 + 4 + 5);
         assert!(shape.decode.is_none());
         let prefill = shape.prefill.unwrap();
         assert_eq!(prefill.num_queries, 5);

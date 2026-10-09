@@ -279,11 +279,7 @@ def profile_dsa_sparse_mla_prefill_flashinfer_trtllm_fp8(
     except Exception as exc:
         raise KernelLaunchFailed(f"{_BACKEND} native callable failed") from exc
 
-    flops = _logical_flops(
-        num_queries=shape.num_queries,
-        num_heads=shape.num_heads,
-        selected_k=shape.selected_k,
-    )
+    flops = _logical_flops(num_heads=shape.num_heads, valid_counts=shape.valid_counts)
     logical_bytes = _logical_bytes(
         num_queries=shape.num_queries,
         num_heads=shape.num_heads,

@@ -13,6 +13,7 @@ use crate::io::{read_cost_manifests, read_run_meta, read_worker_gpu_counts, SCHE
 use crate::kernel_query::owning_repo_root;
 use crate::session::{build_session, register_cost_log, require_columns, COST_LOG_TABLE};
 
+use super::compute_dtype::ComputeDtypeFields;
 use super::ladder::{KernelLadder, NecessaryWorkPolicy};
 use super::run::COST_COLS;
 use super::spec::{self, GpuSpec};
@@ -356,9 +357,10 @@ async fn fold_exact_iteration(
         .unwrap_or((discovered_gpu_name, discovered_gpu_count));
     let gpu_count = gpu_count as f64;
     // `gpu/spec.json` is read from the checkout that produced this run.
-    let (gpu_spec_matched, gpu_spec) = owning_repo_root(log_dir)
-        .ok()
-        .and_then(|repo_root| spec::load_gpu_spec(&repo_root, &gpu_name))
+    let repo_root = owning_repo_root(log_dir).ok();
+    let (gpu_spec_matched, gpu_spec) = repo_root
+        .as_deref()
+        .and_then(|repo_root| spec::load_gpu_spec(repo_root, &gpu_name))
         .map(|(name, spec)| (Some(name), spec))
         .unwrap_or((None, GpuSpec::default()));
     let hardware_bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;
@@ -368,8 +370,13 @@ async fn fold_exact_iteration(
         grid_peaks::load_cached(log_dir)
     };
     let peaks_source = grid_peak_catalog.source.clone();
-    let (kernel_locations, section_fold_plan_by_key) =
-        prepare::build_section_fold_plans(&manifests_by_worker, &grid_peak_catalog, &gpu_spec);
+    let compute_dtypes = ComputeDtypeFields::for_repo(repo_root.as_deref());
+    let (kernel_locations, section_fold_plan_by_key) = prepare::build_section_fold_plans(
+        &manifests_by_worker,
+        &grid_peak_catalog,
+        &gpu_spec,
+        &compute_dtypes,
+    );
 
     let Some(worker) =
         fold::read_exact_iteration_total(context, pool_tag, worker_id, iter_id, gpu_count).await?

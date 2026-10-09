@@ -10,10 +10,11 @@
 //!
 //! The native Triton launch scans a fixed `selected_k` row for every query.
 //! Its variable physical work is captured by query rows, mean valid slots, and
-//! the number of rows routed into the prefill workspace. Request boundaries and
-//! all per-row vectors remain typed in `Input` and in the cost log even though
-//! they are intentionally not independent cache dimensions; the log carries them
-//! run-encoded (`timing::run_encoded`), since they are one value per query row.
+//! the number of rows routed into the prefill workspace, so `Input` holds those
+//! three totals and nothing per row: a caller sums its rows' valid slots in
+//! closed form, and a 32k-token microbatch costs the same to evaluate and log as
+//! one decode row. Only the profiled grid points expand into per-row vectors,
+//! for the runner's payload.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -26,10 +27,12 @@ const SELECTED_K_TILE: u32 = 128;
 /// Remapped slot ids are int32, so one request's block table must fit in it.
 const MAX_SLOT_ID: u64 = i32::MAX as u64;
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct DsaSparseIndexRemapWorkspacePartition {
-    pub decode_requests: u32,
-    pub chunk_sizes: Vec<u32>,
+/// The rows of a prefill workspace: request suffix after `decode_requests`,
+/// grouped into `chunk_sizes` chunks. Only canonical payloads carry one.
+#[derive(Clone, Debug)]
+struct WorkspacePartition {
+    decode_requests: u32,
+    chunk_sizes: Vec<u32>,
 }
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -46,56 +49,23 @@ pub struct DsaSparseIndexRemapKernelConfig {
     pub index_dtype: String,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// The remap's variable work: what the cache reads, and all a cost-log row carries.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DsaSparseIndexRemapKernelInput {
-    #[serde(with = "crate::timing::run_encoded")]
-    pub request_row_counts: Vec<u32>,
-    #[serde(with = "crate::timing::run_encoded")]
-    pub local_span_lengths: Vec<u32>,
-    #[serde(with = "crate::timing::run_encoded")]
-    pub valid_counts: Vec<u32>,
-    pub workspace_partition: Option<DsaSparseIndexRemapWorkspacePartition>,
+    /// Query rows across every request, decode and prefill.
+    pub num_queries: u32,
+    /// Valid slots summed over those rows; each row holds at most `selected_k`.
+    pub total_valid_count: u64,
+    /// Rows routed into the prefill workspace.
+    pub workspace_query_rows: u32,
 }
 
 impl DsaSparseIndexRemapKernelInput {
     fn work(&self) -> (u32, f64, u32) {
-        assert!(!self.request_row_counts.is_empty());
-        assert!(self.request_row_counts.iter().all(|&rows| rows > 0));
-
-        let num_queries = self.request_row_counts.iter().copied().sum::<u32>();
-        assert!(num_queries > 0);
-        assert_eq!(self.local_span_lengths.len(), num_queries as usize);
-        assert_eq!(self.valid_counts.len(), num_queries as usize);
-        assert!(self
-            .local_span_lengths
-            .iter()
-            .all(|&span| u64::from(span) <= MAX_SLOT_ID));
-        assert!(self
-            .valid_counts
-            .iter()
-            .zip(&self.local_span_lengths)
-            .all(|(&count, &span)| count <= span));
-
-        let workspace_rows = match &self.workspace_partition {
-            None => 0,
-            Some(partition) => {
-                let decode_requests = partition.decode_requests as usize;
-                assert!(decode_requests < self.request_row_counts.len());
-                assert!(!partition.chunk_sizes.is_empty());
-                assert!(partition.chunk_sizes.iter().all(|&size| size > 0));
-                assert_eq!(
-                    partition.chunk_sizes.iter().copied().sum::<u32>() as usize,
-                    self.request_row_counts.len() - decode_requests
-                );
-                self.request_row_counts[decode_requests..]
-                    .iter()
-                    .copied()
-                    .sum()
-            }
-        };
-        let mean_valid = self.valid_counts.iter().map(|&v| u64::from(v)).sum::<u64>() as f64
-            / f64::from(num_queries);
-        (num_queries, mean_valid, workspace_rows)
+        assert!(self.num_queries > 0);
+        assert!(self.workspace_query_rows <= self.num_queries);
+        let mean_valid = self.total_valid_count as f64 / f64::from(self.num_queries);
+        (self.num_queries, mean_valid, self.workspace_query_rows)
     }
 }
 
@@ -114,12 +84,20 @@ impl SweepCoords for DsaSparseIndexRemapKernelInput {
     }
 }
 
+/// The per-row layout the runner profiles at one grid point.
+struct CanonicalRows {
+    request_row_counts: Vec<u32>,
+    local_span_lengths: Vec<u32>,
+    valid_counts: Vec<u32>,
+    workspace_partition: Option<WorkspacePartition>,
+}
+
 fn canonical_input(
     selected_k: u32,
     num_queries: u32,
     valid_count: u32,
     workspace_rows: u32,
-) -> Option<DsaSparseIndexRemapKernelInput> {
+) -> Option<CanonicalRows> {
     if num_queries == 0 || valid_count > selected_k || workspace_rows > num_queries {
         return None;
     }
@@ -127,20 +105,20 @@ fn canonical_input(
         0 => (vec![num_queries], None),
         rows if rows == num_queries => (
             vec![num_queries],
-            Some(DsaSparseIndexRemapWorkspacePartition {
+            Some(WorkspacePartition {
                 decode_requests: 0,
                 chunk_sizes: vec![1],
             }),
         ),
         rows => (
             vec![num_queries - rows, rows],
-            Some(DsaSparseIndexRemapWorkspacePartition {
+            Some(WorkspacePartition {
                 decode_requests: 1,
                 chunk_sizes: vec![1],
             }),
         ),
     };
-    Some(DsaSparseIndexRemapKernelInput {
+    Some(CanonicalRows {
         request_row_counts,
         local_span_lengths: vec![valid_count; num_queries as usize],
         valid_counts: vec![valid_count; num_queries as usize],
@@ -189,7 +167,7 @@ fn encode_vector(values: &[u32], allow_clipped: bool, selected_k: u32) -> String
     format!("g:({group})x{}", values.len() / period)
 }
 
-fn encode_workspace(input: &DsaSparseIndexRemapKernelInput) -> String {
+fn encode_workspace(input: &CanonicalRows) -> String {
     match &input.workspace_partition {
         None => "none".to_string(),
         Some(partition) => format!(
@@ -314,15 +292,12 @@ mod tests {
     }
 
     #[test]
-    fn ragged_input_preserves_workspace_topology() {
+    fn coords_are_the_mean_of_the_summed_valid_slots() {
+        // 8 rows at 128 valid slots and 16 at 256, the 16 in the workspace.
         let input = DsaSparseIndexRemapKernelInput {
-            request_row_counts: vec![8, 16],
-            local_span_lengths: vec![128; 8].into_iter().chain(vec![256; 16]).collect(),
-            valid_counts: vec![128; 8].into_iter().chain(vec![256; 16]).collect(),
-            workspace_partition: Some(DsaSparseIndexRemapWorkspacePartition {
-                decode_requests: 1,
-                chunk_sizes: vec![1],
-            }),
+            num_queries: 24,
+            total_valid_count: 8 * 128 + 16 * 256,
+            workspace_query_rows: 16,
         };
         assert_eq!(input.coords()[0], 24.0);
         assert!((input.coords()[1] - 213.333_333_333_333_34).abs() < 1e-12);
@@ -330,39 +305,25 @@ mod tests {
     }
 
     #[test]
-    fn long_context_rows_serialize_as_runs_and_round_trip() {
-        // One decode row, then two causal prefill chunks deep into a 1M context.
-        let pairs = [(4096_u32, 323_318_u32), (4096, 1_000_000)];
-        let mut input = DsaSparseIndexRemapKernelInput {
-            request_row_counts: vec![1],
-            local_span_lengths: vec![70_001],
-            valid_counts: vec![2048],
-            workspace_partition: None,
+    fn a_long_context_microbatch_logs_as_three_numbers() {
+        let input = DsaSparseIndexRemapKernelInput {
+            num_queries: 8193,
+            total_valid_count: 8193 * 2048,
+            workspace_query_rows: 0,
         };
-        for (rows, context) in pairs {
-            input.request_row_counts.push(rows);
-            for span in context - rows + 1..=context {
-                input.local_span_lengths.push(span);
-                input.valid_counts.push(span.min(2048));
-            }
-        }
         let text = serde_json::to_string(&input).unwrap();
-        assert!(text.len() < 200, "{text}");
+        assert!(text.len() < 100, "{text}");
         let back: DsaSparseIndexRemapKernelInput = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.request_row_counts, input.request_row_counts);
-        assert_eq!(back.local_span_lengths, input.local_span_lengths);
-        assert_eq!(back.valid_counts, input.valid_counts);
-        assert_eq!(back.coords()[..], input.coords()[..]);
+        assert_eq!(back, input);
     }
 
     #[test]
-    fn coords_admit_any_request_count_and_rows_past_the_grid() {
+    fn coords_admit_rows_past_the_grid() {
         let rows = 16_384 + 64;
         let input = DsaSparseIndexRemapKernelInput {
-            request_row_counts: vec![1; rows as usize],
-            local_span_lengths: vec![4096; rows as usize],
-            valid_counts: vec![2048; rows as usize],
-            workspace_partition: None,
+            num_queries: rows,
+            total_valid_count: u64::from(rows) * 2048,
+            workspace_query_rows: 0,
         };
         assert_eq!(input.coords()[0], f64::from(rows));
         assert_eq!(input.coords()[1], 2048.0);
@@ -466,10 +427,9 @@ mod tests {
             .all(|payload| payload.fields().get("selected_k") == Some(&Value::from(2176_u32))));
         // kpool rows hold up to index_topk + index_kpool - 1 = 2051 valid slots.
         let input = DsaSparseIndexRemapKernelInput {
-            request_row_counts: vec![4],
-            local_span_lengths: vec![4096; 4],
-            valid_counts: vec![2048, 2049, 2050, 2051],
-            workspace_partition: None,
+            num_queries: 4,
+            total_valid_count: 2048 + 2049 + 2050 + 2051,
+            workspace_query_rows: 0,
         };
         assert_eq!(input.coords()[1], 2049.5);
     }

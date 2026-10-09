@@ -189,14 +189,6 @@
       "semantics": []
     },
     {
-      "location": "unified.dsa_moe.moe.combine_reduce_scatter",
-      "semantics": []
-    },
-    {
-      "location": "unified.dsa_moe.moe.dispatch_all_gather",
-      "semantics": []
-    },
-    {
       "location": "unified.dsa_moe.moe.dispatch_quant",
       "semantics": []
     },
@@ -654,14 +646,6 @@
     },
     {
       "location": "unified.kda_moe.moe.combine_glue",
-      "semantics": []
-    },
-    {
-      "location": "unified.kda_moe.moe.combine_reduce_scatter",
-      "semantics": []
-    },
-    {
-      "location": "unified.kda_moe.moe.dispatch_all_gather",
       "semantics": []
     },
     {

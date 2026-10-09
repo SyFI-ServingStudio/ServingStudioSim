@@ -311,10 +311,9 @@ impl DsaSparseMlaAttentionOp {
                 ev.push(metrics, || {
                     shape
                         .unwrap_or(DsaSparseIndexRemapKernelInput {
-                            request_row_counts: Vec::new(),
-                            local_span_lengths: Vec::new(),
-                            valid_counts: Vec::new(),
-                            workspace_partition: None,
+                            num_queries: 0,
+                            total_valid_count: 0,
+                            workspace_query_rows: 0,
                         })
                         .into()
                 });
@@ -760,70 +759,75 @@ fn normalize_input(
     })
 }
 
-/// Build the exact row topology consumed by vLLM's remap wrapper. Decode rows
-/// precede prefill rows, matching vLLM's mixed-batch metadata layout. Every
-/// row's local span is its causal position within that request; valid slots are
-/// the same span capped by top-k. FlashInfer uses global cache slots, so this
-/// path has no prefill workspace partition and requests share no fake merge.
+/// The rows vLLM's remap wrapper scans, as totals. Decode rows precede prefill
+/// rows, matching vLLM's mixed-batch metadata layout. Every row's local span is
+/// its causal position within that request; valid slots are the same span capped
+/// by top-k. FlashInfer uses global cache slots, so this path has no prefill
+/// workspace partition.
 fn production_index_remap_input(
     input: &DsaSparseMlaAttentionInput,
     decode_next_n: u32,
     selected_k: u32,
 ) -> Result<Option<DsaSparseIndexRemapKernelInput>, String> {
-    let mut request_row_counts = Vec::new();
-    let mut local_span_lengths = Vec::new();
-    let mut valid_counts = Vec::new();
+    let mut num_queries: u64 = 0;
+    let mut total_valid_count: u64 = 0;
 
-    if let Some((num_queries, uniform_context)) = input.decode_query_cache {
-        if num_queries % decode_next_n != 0 {
+    if let Some((decode_rows, uniform_context)) = input.decode_query_cache {
+        if decode_rows % decode_next_n != 0 {
             return Err(format!(
-                "decode query rows {num_queries} must be divisible by decode_next_n {decode_next_n}"
+                "decode query rows {decode_rows} must be divisible by decode_next_n {decode_next_n}"
             ));
         }
-        let num_requests = num_queries / decode_next_n;
-        let contexts = input
-            .decode_context_lens
-            .clone()
-            .unwrap_or_else(|| vec![uniform_context; num_requests as usize]);
-        if contexts.len() != num_requests as usize {
-            return Err(format!(
-                "decode_context_lens has {} entries, expected {num_requests}",
-                contexts.len()
-            ));
-        }
-        for context in contexts {
+        let num_requests = decode_rows / decode_next_n;
+        let uniform = [uniform_context];
+        let (contexts, repeat) = match &input.decode_context_lens {
+            Some(contexts) if contexts.len() != num_requests as usize => {
+                return Err(format!(
+                    "decode_context_lens has {} entries, expected {num_requests}",
+                    contexts.len()
+                ));
+            }
+            Some(contexts) => (contexts.as_slice(), 1),
+            None => (uniform.as_slice(), u64::from(num_requests)),
+        };
+        for &context in contexts {
             if context < decode_next_n {
                 return Err(format!(
                     "decode context {context} must be at least decode_next_n {decode_next_n}"
                 ));
             }
-            request_row_counts.push(decode_next_n);
-            let first = context - decode_next_n + 1;
-            for span in first..=context {
-                local_span_lengths.push(span);
-                valid_counts.push(span.min(selected_k));
-            }
+            num_queries += repeat * u64::from(decode_next_n);
+            total_valid_count +=
+                repeat * capped_span_total(context - decode_next_n + 1, context, selected_k);
         }
     }
 
-    for &(num_queries, context) in &input.prefill_query_cache_pairs {
-        request_row_counts.push(num_queries);
-        let first = context - num_queries + 1;
-        for span in first..=context {
-            local_span_lengths.push(span);
-            valid_counts.push(span.min(selected_k));
-        }
+    for &(rows, context) in &input.prefill_query_cache_pairs {
+        num_queries += u64::from(rows);
+        total_valid_count += capped_span_total(context - rows + 1, context, selected_k);
     }
 
-    if request_row_counts.is_empty() {
+    if num_queries == 0 {
         return Ok(None);
     }
     Ok(Some(DsaSparseIndexRemapKernelInput {
-        request_row_counts,
-        local_span_lengths,
-        valid_counts,
-        workspace_partition: None,
+        num_queries: u32::try_from(num_queries)
+            .map_err(|_| "remap query-row count overflows u32".to_string())?,
+        total_valid_count,
+        workspace_query_rows: 0,
     }))
+}
+
+/// `min(span, cap)` summed over the spans `first..=last`.
+fn capped_span_total(first: u32, last: u32, cap: u32) -> u64 {
+    let (first, last, cap) = (u64::from(first), u64::from(last), u64::from(cap));
+    let ramp_last = last.min(cap);
+    let ramp = if first <= ramp_last {
+        (first + ramp_last) * (ramp_last - first + 1) / 2
+    } else {
+        0
+    };
+    ramp + (last - ramp_last.max(first - 1)) * cap
 }
 
 fn eval_or_zero(kernel: &ElementwiseKernel, input: &ElementwiseKernelInput) -> LeafMetrics {
@@ -837,10 +841,10 @@ fn eval_or_zero(kernel: &ElementwiseKernel, input: &ElementwiseKernelInput) -> L
 #[cfg(test)]
 mod tests {
     use super::{
-        legacy_index_remap_config, normalize_input, production_index_remap_input,
-        query_concat_config, subkernel_configs, DsaSparseMlaAttentionConfig,
-        DsaSparseMlaAttentionInput, DsaSparseMlaExactVarlenConfig, DsaSparseMlaLaunchGraph,
-        IndexRemapConfig, PrefillConfig, SLOT_SUFFIXES,
+        capped_span_total, legacy_index_remap_config, normalize_input,
+        production_index_remap_input, query_concat_config, subkernel_configs,
+        DsaSparseMlaAttentionConfig, DsaSparseMlaAttentionInput, DsaSparseMlaExactVarlenConfig,
+        DsaSparseMlaLaunchGraph, IndexRemapConfig, PrefillConfig, SLOT_SUFFIXES,
     };
     use crate::timing::bridge::DType;
     use crate::timing::kernels::engine::KernelSpec;
@@ -1105,18 +1109,30 @@ mod tests {
             .unwrap()
             .expect("nonempty input must produce remap work");
 
-        assert_eq!(remap.request_row_counts, vec![2, 2, 8, 16]);
-        assert_eq!(&remap.local_span_lengths[..4], &[599, 600, 599, 600]);
-        assert_eq!(
-            &remap.local_span_lengths[4..12],
-            &(121..=128).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            &remap.local_span_lengths[12..],
-            &(241..=256).collect::<Vec<_>>()
-        );
-        assert_eq!(remap.valid_counts, remap.local_span_lengths);
-        assert!(remap.workspace_partition.is_none());
+        assert_eq!(remap.num_queries, 2 + 2 + 8 + 16);
+        let spans = (599_u32..=600)
+            .chain(599..=600)
+            .chain(121..=128)
+            .chain(241..=256);
+        assert_eq!(remap.total_valid_count, spans.map(u64::from).sum::<u64>());
+        assert_eq!(remap.workspace_query_rows, 0);
+    }
+
+    #[test]
+    fn capped_span_total_matches_the_row_by_row_sum() {
+        for cap in [1_u32, 64, 2048] {
+            for first in [1, 2, 63, 64, 65, 2047, 2048, 2049, 5000] {
+                for len in [1, 2, 3, 100, 4096] {
+                    let last = first + len - 1;
+                    let rows: u64 = (first..=last).map(|span| u64::from(span.min(cap))).sum();
+                    assert_eq!(
+                        capped_span_total(first, last, cap),
+                        rows,
+                        "{first}..={last} @ {cap}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1137,7 +1153,8 @@ mod tests {
         let remap = production_index_remap_input(&many_requests, 1, 2048)
             .unwrap()
             .unwrap();
-        assert_eq!(remap.request_row_counts.len(), 1024 + 257);
+        assert_eq!(remap.num_queries, 1024 + 257);
+        assert_eq!(remap.total_valid_count, 1024 * 2048 + 257);
 
         let past_profiled_rows = DsaSparseMlaAttentionInput {
             prefill_query_cache_pairs: vec![(16384, 16384), (1, 1)],
@@ -1146,7 +1163,7 @@ mod tests {
         let remap = production_index_remap_input(&past_profiled_rows, 1, 2048)
             .unwrap()
             .unwrap();
-        assert_eq!(remap.local_span_lengths.len(), 16385);
+        assert_eq!(remap.num_queries, 16385);
 
         let rounded_spec5_prefill = DsaSparseMlaAttentionInput {
             prefill_query_cache_pairs: vec![(8196, 8196)],
@@ -1155,8 +1172,7 @@ mod tests {
         let remap = production_index_remap_input(&rounded_spec5_prefill, 6, 2048)
             .unwrap()
             .unwrap();
-        assert_eq!(remap.request_row_counts, vec![8196]);
-        assert_eq!(remap.local_span_lengths.len(), 8196);
+        assert_eq!(remap.num_queries, 8196);
     }
 
     #[test]
@@ -1196,9 +1212,8 @@ mod tests {
         let remap = production_index_remap_input(&input, 1, 2048)
             .unwrap()
             .expect("decode rows must produce remap work");
-        assert_eq!(remap.request_row_counts, vec![1, 1, 1, 1]);
-        assert_eq!(remap.local_span_lengths, vec![12, 190, 12, 190]);
-        assert_eq!(remap.valid_counts, vec![12, 190, 12, 190]);
+        assert_eq!(remap.num_queries, 4);
+        assert_eq!(remap.total_valid_count, 12 + 190 + 12 + 190);
     }
 
     #[test]

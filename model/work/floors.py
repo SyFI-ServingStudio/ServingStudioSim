@@ -400,6 +400,9 @@ def _exact_count(value, name: str) -> int:
     return int(value)
 
 
+_F64_EXACT_INTEGER_LIMIT = float(2**53)
+
+
 def _request_interactions(totals: dict) -> list[AttnInteraction]:
     """Exact causal interactions from logged per-request geometry.
 
@@ -451,7 +454,16 @@ def _request_interactions(totals: dict) -> list[AttnInteraction]:
         "prefill_cached": prefill_cached,
     }
     for name, value in derived.items():
-        if int(totals.get(name, 0)) != value:
+        carried = totals.get(name, 0)
+        # The workload scalars travel as f64. Past 2**53 (a replicated saturated
+        # worker reaches ~5e18 prefill pairs) they hold only the nearest double, so
+        # an exact geometry is compared at that precision; a missing group is still
+        # off by far more than one ulp.
+        if isinstance(carried, float) and abs(carried) >= _F64_EXACT_INTEGER_LIMIT:
+            agrees = float(value) == carried
+        else:
+            agrees = int(carried) == value
+        if not agrees:
             raise ValueError(
                 f"request_geometry gives {name}={value} but the workload carries "
                 f"{int(totals.get(name, 0))}; per-request geometry must cover every group"

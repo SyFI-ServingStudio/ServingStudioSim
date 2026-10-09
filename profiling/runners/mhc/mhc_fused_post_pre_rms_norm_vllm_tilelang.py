@@ -58,15 +58,30 @@ class _Launch:
         )
 
 
-def _logical_bytes(shape: Shape) -> int:
-    """Read the layer output, the streams, the previous mixes and the weights
-    once; write the updated streams, the next mixes and the next block input."""
-    return (
+# vLLM's `mhc_fused_post_pre_tilelang` is one kernel only up to this many
+# tokens (`use_small_fma`).
+SMALL_FMA_MAX_TOKENS = 16
+
+
+def call_bytes(shape: Shape) -> int:
+    """HBM traffic of the launches the call issues.
+
+    Every path reads the layer output, the streams, the previous mixes and the
+    weights, and writes the updated streams, the next mixes and the next block
+    input. Above `SMALL_FMA_MAX_TOKENS` the call is three launches (mhc_post,
+    the prenorm GEMM, the pre big-fuse), and the GEMM and the big-fuse each
+    read the updated streams again. The GEMM's split-K partials (about 100 B
+    per token per split) are left out.
+    """
+    one_pass = (
         2 * residual_bytes(shape)
         + 2 * mix_bytes(shape)
         + 2 * hidden_bytes(shape)
         + pre_weight_bytes(shape)
     )
+    if shape.num_tokens <= SMALL_FMA_MAX_TOKENS:
+        return one_pass
+    return one_pass + 2 * residual_bytes(shape)
 
 
 def _validate_args(num_tokens: int, hidden_size: int, hc_mult: int, hidden_dtype: DType | str):
@@ -116,7 +131,7 @@ def profile_mhc_fused_post_pre_rms_norm_vllm_tilelang(
     return ComputeMetrics(
         time_ms=float(time_ms),
         tflops=0.0,
-        memory_bandwidth_gbps=bandwidth_gbps(_logical_bytes(shape), time_ms),
+        memory_bandwidth_gbps=bandwidth_gbps(call_bytes(shape), time_ms),
         energy_j=float(energy_j),
     )
 

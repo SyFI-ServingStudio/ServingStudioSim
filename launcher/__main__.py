@@ -55,6 +55,9 @@ from .schema.loader import (
     schema_path,
 )
 
+# The axis a multi-preset batch adds, valued by each preset's file stem.
+BATCH_PRESET_AXIS = "preset"
+
 
 def _build_argparse():
     """The launcher's argparse: positional preset paths + repeatable
@@ -628,6 +631,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.emit_backends is not None:
         return _emit_backends(args, schema)
 
+    stems = [Path(path).stem for path in args.presets]
+    if len(args.presets) > 1 and len(set(stems)) != len(stems):
+        print(
+            f"[invalid] presets in one batch need distinct file names: {stems}",
+            file=sys.stderr,
+        )
+        return 2
     all_candidates: list[dict] = []
     last_preset: dict = {}
     analyze_subjects: list[str] | None = None
@@ -666,6 +676,19 @@ def main(argv: list[str] | None = None) -> int:
             cands = _expand_preset(preset, schema, preset_path)
         if cands is None:
             return 2
+        if len(args.presets) > 1:
+            # A batch of presets is one experiment: the file is its own axis, so
+            # runs from different presets never share a manifest coordinate.
+            for cand in cands:
+                env = cand.setdefault("_env", {})
+                if BATCH_PRESET_AXIS in env:
+                    print(
+                        f"[invalid] {preset_path}: sweep name {BATCH_PRESET_AXIS!r} collides "
+                        "with the batch's preset axis; rename it",
+                        file=sys.stderr,
+                    )
+                    return 2
+                env[BATCH_PRESET_AXIS] = Path(preset_path).stem
         all_candidates.extend(cands)
 
     if not _apply_energy_policy(args.energy, preset_energy, args.presets):
