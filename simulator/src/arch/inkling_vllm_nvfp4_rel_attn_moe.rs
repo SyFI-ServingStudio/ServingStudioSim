@@ -63,12 +63,12 @@ use crate::worklet::deepseek_v41_common::all_gather_as_all_reduce_bytes;
 use crate::worklet::glm53_common::{atomic, push_or_zero};
 use crate::worklet::{
     Bf16MoeLocalWorklet, Bf16MoeLocalWorkletConfig, Bf16MoeLocalWorkletInput,
-    Bf16MoeLocalWorkletResolved, InklingAttnLocalWorklet, InklingAttnLocalWorkletConfig,
-    InklingAttnLocalWorkletInput, InklingAttnLocalWorkletResolved, InklingMlpLocalWorklet,
-    InklingMlpLocalWorkletConfig, InklingMlpLocalWorkletInput, InklingMlpLocalWorkletResolved,
-    InklingRouterLocalWorklet, InklingRouterLocalWorkletConfig, InklingRouterLocalWorkletInput,
-    Nvfp4MoeLocalWorklet, Nvfp4MoeLocalWorkletConfig, Nvfp4MoeLocalWorkletInput,
-    Nvfp4MoeLocalWorkletResolved,
+    Bf16MoeLocalWorkletResolved, Glm53MlpLocalWorklet, Glm53MlpLocalWorkletConfig,
+    Glm53MlpLocalWorkletInput, Glm53MlpLocalWorkletResolved, Glm53WeightPrecision,
+    InklingAttnLocalWorklet, InklingAttnLocalWorkletConfig, InklingAttnLocalWorkletInput,
+    InklingAttnLocalWorkletResolved, InklingRouterLocalWorklet, InklingRouterLocalWorkletConfig,
+    InklingRouterLocalWorkletInput, Nvfp4MoeLocalWorklet, Nvfp4MoeLocalWorkletConfig,
+    Nvfp4MoeLocalWorkletInput, Nvfp4MoeLocalWorkletResolved,
 };
 
 const ARCH_KIND: &str = "inkling_vllm_nvfp4_rel_attn_moe";
@@ -200,8 +200,13 @@ pub struct InklingVllmConfigs {
     pub groups: Vec<InklingLayerGroup>,
     pub attn_local: InklingAttnLocalWorkletConfig,
     pub attn_global: InklingAttnLocalWorkletConfig,
-    pub dense_ffn: InklingMlpLocalWorkletConfig,
-    pub sink: InklingMlpLocalWorkletConfig,
+    /// The dense FFN's gated MLP; `dense_global_scale` is its trailing
+    /// in-place `x.mul_(global_scale)` when the checkpoint has one.
+    pub dense_ffn: Glm53MlpLocalWorkletConfig,
+    pub dense_global_scale: Option<ElementwiseKernelConfig>,
+    /// Both sink experts' gated MLP, merged on each rank. Its activation is
+    /// `_sink_epilogue`, which folds each token's sink gate weight in.
+    pub sink: Glm53MlpLocalWorkletConfig,
     pub router: InklingRouterLocalWorkletConfig,
     /// One per ranked EP workload (one under MoE TP); empty without NVFP4
     /// layers.
@@ -278,15 +283,15 @@ pub fn build_configs(
             attention_backends: REL_ATTENTION_BACKENDS.to_vec(),
         })
     };
-    let mlp = |intermediate: u32, global_scale_mul: bool| InklingMlpLocalWorkletConfig {
+    let mlp = |intermediate: u32| Glm53MlpLocalWorkletConfig {
         hidden: model.hidden.into(),
         intermediate: intermediate.into(),
-        global_scale_mul,
-        dtype: ACTIVATION_DTYPE,
+        precision: Glm53WeightPrecision::Bf16,
+        activation_dtype: ACTIVATION_DTYPE,
         gpu_name: gpu.clone(),
+        quant_backends: Vec::new(),
         gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
-        activation_backends: TRITON_ELEMENTWISE_BACKENDS.to_vec(),
-        scale_backends: TORCH_ELEMENTWISE_BACKENDS.to_vec(),
+        elementwise_backends: TRITON_ELEMENTWISE_BACKENDS.to_vec(),
     };
     let lamport = |has_shared: bool| RsSconvAgResidualRmsNormKernelConfig {
         backends: LAMPORT_BACKENDS.to_vec(),
@@ -384,17 +389,18 @@ pub fn build_configs(
         groups: layer_groups(model),
         attn_local: attention(true)?,
         attn_global: attention(false)?,
-        dense_ffn: mlp(
-            divide("dense_intermediate_size", model.dense_intermediate_size)?,
-            model.use_global_scale,
-        ),
-        sink: mlp(
-            divide(
-                "sink intermediate",
-                model.intermediate_size * model.n_shared_experts,
-            )?,
-            false,
-        ),
+        dense_ffn: mlp(divide(
+            "dense_intermediate_size",
+            model.dense_intermediate_size,
+        )?),
+        // One hidden row in and out.
+        dense_global_scale: model
+            .use_global_scale
+            .then(|| ew(TORCH_ELEMENTWISE_BACKENDS, hidden_bytes, hidden_bytes)),
+        sink: mlp(divide(
+            "sink intermediate",
+            model.intermediate_size * model.n_shared_experts,
+        )?),
         router: InklingRouterLocalWorkletConfig {
             hidden: model.hidden.into(),
             n_routed_experts: model.n_routed_experts,
@@ -447,8 +453,8 @@ pub struct InklingVllmResolved {
     pub raw_cfg: InklingVllmConfigs,
     pub attn_local: InklingAttnLocalWorkletResolved,
     pub attn_global: InklingAttnLocalWorkletResolved,
-    pub dense_ffn: InklingMlpLocalWorkletResolved,
-    pub sink: InklingMlpLocalWorkletResolved,
+    pub dense_ffn: Glm53MlpLocalWorkletResolved,
+    pub sink: Glm53MlpLocalWorkletResolved,
     pub routed_nvfp4: Vec<Nvfp4MoeLocalWorkletResolved>,
     pub routed_bf16: Vec<Bf16MoeLocalWorkletResolved>,
 }
@@ -457,8 +463,8 @@ pub fn resolve_configs(cfgs: &InklingVllmConfigs) -> InklingVllmResolved {
     InklingVllmResolved {
         attn_local: InklingAttnLocalWorklet::resolve_config(&cfgs.attn_local),
         attn_global: InklingAttnLocalWorklet::resolve_config(&cfgs.attn_global),
-        dense_ffn: InklingMlpLocalWorklet::resolve_config(&cfgs.dense_ffn),
-        sink: InklingMlpLocalWorklet::resolve_config(&cfgs.sink),
+        dense_ffn: Glm53MlpLocalWorklet::resolve_config(&cfgs.dense_ffn),
+        sink: Glm53MlpLocalWorklet::resolve_config(&cfgs.sink),
         routed_nvfp4: cfgs
             .routed_nvfp4
             .iter()
@@ -517,7 +523,7 @@ impl RoutedRank {
 struct MoeBlock {
     name: String,
     router: InklingRouterLocalWorklet,
-    sink: InklingMlpLocalWorklet,
+    sink: Glm53MlpLocalWorklet,
     routed: Vec<RoutedRank>,
 }
 
@@ -565,7 +571,7 @@ impl MoeBlock {
     fn eval(&self, num_tokens: u32, overlapped: bool, ev: &mut Evaluator) {
         self.router
             .eval(&InklingRouterLocalWorkletInput { num_tokens }, ev);
-        let sink = InklingMlpLocalWorkletInput { num_tokens };
+        let sink = Glm53MlpLocalWorkletInput { num_tokens };
         for routed in &self.routed {
             self.sink.eval_or_zero(&sink, !overlapped, ev);
             routed.eval_or_zero(num_tokens, !overlapped, ev);
@@ -576,8 +582,36 @@ impl MoeBlock {
 }
 
 enum Ffn {
-    Dense(InklingMlpLocalWorklet),
+    Dense(DenseFfn),
     Moe(MoeBlock),
+}
+
+/// The dense FFN: the gated MLP, then the optional in-place global-scale mul.
+struct DenseFfn {
+    mlp: Glm53MlpLocalWorklet,
+    global_scale: Option<Op<ElementwiseKernel>>,
+}
+
+impl DenseFfn {
+    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        let mlp = self.mlp.compile(builder);
+        match &self.global_scale {
+            None => mlp,
+            Some(op) => CostNode::Sum(vec![mlp, op.compile(builder)]),
+        }
+    }
+
+    fn eval(&self, num_tokens: u32, ev: &mut Evaluator) {
+        self.mlp.eval(&Glm53MlpLocalWorkletInput { num_tokens }, ev);
+        if let Some(op) = &self.global_scale {
+            push_or_zero(
+                op,
+                ElementwiseKernelInput { num_tokens },
+                num_tokens == 0,
+                ev,
+            );
+        }
+    }
 }
 
 /// One built layer group: the leaves of a single layer of its shape.
@@ -611,7 +645,7 @@ impl LayerGroup {
             self.attn.compile(builder),
             self.attn_reduce.compile(builder),
             match &self.ffn {
-                Ffn::Dense(worklet) => worklet.compile(builder),
+                Ffn::Dense(dense) => dense.compile(builder),
                 Ffn::Moe(block) => block.compile(builder),
             },
             self.ffn_reduce.compile(builder),
@@ -637,9 +671,7 @@ impl LayerGroup {
         let reduce = RsSconvAgResidualRmsNormKernelInput { num_tokens: tokens };
         push_or_zero(&self.attn_reduce, reduce.clone(), false, ev);
         match &self.ffn {
-            Ffn::Dense(worklet) => {
-                worklet.eval(&InklingMlpLocalWorkletInput { num_tokens: tokens }, ev)
-            }
+            Ffn::Dense(dense) => dense.eval(tokens, ev),
             Ffn::Moe(block) => block.eval(tokens, sinks_overlap, ev),
         }
         push_or_zero(&self.ffn_reduce, reduce, false, ev);
@@ -665,15 +697,26 @@ fn build_layer_group(
     )?;
     let attn_reduce = build_lamport(&format!("{p}.attn"), &cfg.reduce, bridge)?;
     let (ffn, ffn_name, ffn_reduce_cfg) = match group.ffn {
-        FfnKind::Dense => (
-            Ffn::Dense(InklingMlpLocalWorklet::build(
-                format!("{p}.ffn"),
-                resolved.dense_ffn.clone(),
-                bridge,
-            )?),
-            format!("{p}.ffn"),
-            &cfg.reduce,
-        ),
+        FfnKind::Dense => {
+            let ffn = format!("{p}.ffn");
+            let dense = DenseFfn {
+                mlp: Glm53MlpLocalWorklet::build(ffn.clone(), resolved.dense_ffn.clone(), bridge)?,
+                global_scale: cfg
+                    .dense_global_scale
+                    .clone()
+                    .map(|scale| {
+                        atomic(
+                            &ffn,
+                            "global_scale",
+                            scale,
+                            ElementwiseKernel::build,
+                            bridge,
+                        )
+                    })
+                    .transpose()?,
+            };
+            (Ffn::Dense(dense), ffn, &cfg.reduce)
+        }
         FfnKind::Moe(precision) => {
             let moe = format!("{p}.moe");
             let routed = match precision {
@@ -717,7 +760,7 @@ fn build_layer_group(
                         InklingRouterLocalWorklet::resolve_config(&cfg.router),
                         bridge,
                     )?,
-                    sink: InklingMlpLocalWorklet::build(
+                    sink: Glm53MlpLocalWorklet::build(
                         format!("{moe}.sink"),
                         resolved.sink.clone(),
                         bridge,
@@ -1153,6 +1196,19 @@ mod tests {
         assert_eq!(configs.routed_bf16.len(), 4);
         assert_eq!(configs.dense_ffn.intermediate.get(), 4096);
         assert_eq!(configs.sink.intermediate.get(), 1024);
+        // Dense FFN at TP4: 16384 / 4 = 4096 per rank, gate_up N=8192, then
+        // the in-place global-scale mul over one bf16 hidden row.
+        let dense = Glm53MlpLocalWorklet::resolve_config(&configs.dense_ffn);
+        assert_eq!((dense.gate_up.n.get(), dense.gate_up.k.get()), (8192, 4096));
+        assert_eq!((dense.down.n.get(), dense.down.k.get()), (4096, 4096));
+        assert!(dense.gate_up_quant.is_none() && dense.down_quant.is_none());
+        let scale = configs
+            .dense_global_scale
+            .expect("dense FFN scales its output");
+        assert_eq!(scale.input_bytes_per_token.get(), 8192);
+        // Two sinks x 2048 / 4 = 1024 per rank: gate_up N=2048, down K=1024.
+        let sink = Glm53MlpLocalWorklet::resolve_config(&configs.sink);
+        assert_eq!((sink.gate_up.n.get(), sink.down.k.get()), (2048, 1024));
         assert_eq!(configs.lm_head.n.get(), 50256);
         assert!(configs.moe_reduce.has_shared && !configs.reduce.has_shared);
         assert_eq!(configs.attn_local.rel_extent, 512);

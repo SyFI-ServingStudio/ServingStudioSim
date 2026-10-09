@@ -43,7 +43,6 @@ pub mod glm53_kda_attn_local;
 pub mod glm53_mlp_local;
 pub mod glm53_moe_local;
 pub mod inkling_attn_local;
-pub mod inkling_mlp_local;
 pub mod inkling_router_local;
 pub mod mlp_block_tp;
 pub mod moe_expert_compute_local;
@@ -191,10 +190,6 @@ pub use glm53_moe_local::{
 pub use inkling_attn_local::{
     InklingAttnLocalWorklet, InklingAttnLocalWorkletConfig, InklingAttnLocalWorkletInput,
     InklingAttnLocalWorkletResolved,
-};
-pub use inkling_mlp_local::{
-    InklingMlpLocalWorklet, InklingMlpLocalWorkletConfig, InklingMlpLocalWorkletInput,
-    InklingMlpLocalWorkletResolved,
 };
 pub use inkling_router_local::{
     InklingRouterLocalWorklet, InklingRouterLocalWorkletConfig, InklingRouterLocalWorkletInput,

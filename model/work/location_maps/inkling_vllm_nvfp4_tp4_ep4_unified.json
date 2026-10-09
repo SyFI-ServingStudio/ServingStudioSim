@@ -62,7 +62,7 @@
       ]
     },
     {
-      "location": "unified.local_dense.ffn.activation",
+      "location": "unified.local_dense.ffn.act_and_mul",
       "semantics": []
     },
     {
@@ -148,7 +148,7 @@
       ]
     },
     {
-      "location": "unified.local_bf16_moe.moe.sink.activation",
+      "location": "unified.local_bf16_moe.moe.sink.act_and_mul",
       "semantics": []
     },
     {
@@ -247,7 +247,7 @@
       ]
     },
     {
-      "location": "unified.local_nvfp4_moe.moe.sink.activation",
+      "location": "unified.local_nvfp4_moe.moe.sink.act_and_mul",
       "semantics": []
     },
     {
@@ -362,7 +362,7 @@
       ]
     },
     {
-      "location": "unified.global_nvfp4_moe.moe.sink.activation",
+      "location": "unified.global_nvfp4_moe.moe.sink.act_and_mul",
       "semantics": []
     },
     {
