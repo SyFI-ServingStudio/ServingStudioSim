@@ -23,13 +23,17 @@ a random position, its three prior taps pre-populated in scattered physical
 blocks. ``PREFILL_LAYOUT`` (one request, consecutive positions, taps from the
 same call) exists for the sensitivity check only.
 
-Timing mirrors the FlashInfer fused all-reduce runner: the call runs inside a
-CUDA graph (``_CALLS_PER_GRAPH`` back-to-back calls, a multiple of the three
-Lamport buffer generations, as production's 84 calls per graph are). After a
-host barrier aligns the ranks, wall-clock replay time per call is taken, the
-median of three trials per rank, and the slowest rank is kept. Every rank runs
-the same calls, so the spin-waits see balanced arrival; serving-time cross-rank
-skew is not folded in.
+Timing follows the compute kinds' cold-L2 rule inside a CUDA graph. One graph
+interleaves the profilers' L2 clear (a read over a buffer of at least twice L2,
+``default_l2_flush_bytes``) with the call, ``_CALLS_PER_GRAPH`` times (a multiple
+of the three Lamport buffer generations); a second graph holds the clears alone.
+CUDA events time replays of both after a host barrier aligns the ranks, and the
+call costs the difference per call: the median of three trials per rank, the
+slowest rank kept. The clear in between keeps each call's working set out of L2,
+as the other kernels of a forward leave it, and gives its first launch no PDL
+edge into the previous call, so consecutive calls do not overlap. Every rank
+runs the same graph, so the spin-waits see balanced arrival; serving-time
+cross-rank skew is not folded in.
 """
 
 from __future__ import annotations
@@ -38,7 +42,6 @@ import functools
 import math
 import statistics
 import sys
-import time
 from collections import defaultdict
 
 from profiling.db.args import DType
@@ -425,39 +428,58 @@ def validate_case(torch, case: dict, launch, *, rank: int, world_size: int) -> d
 
 
 def _time_cuda_graph(*, torch, dist, tp_group, launch, device, warmup: int, rep: int) -> float:
+    from profiling.profilers.cupti_kernel_profiler import default_l2_flush_bytes
+
     for _ in range(warmup):
         launch()
     torch.cuda.synchronize()
 
-    # Production replays the call inside a CUDA graph (84 calls per forward).
+    flush = torch.empty(default_l2_flush_bytes(device) // 4, dtype=torch.float32, device=device)
+    flush.fill_(1.0)
+    flush_sum = torch.empty((), dtype=torch.float32, device=device)
+
+    def clear_l2():
+        torch.sum(flush, out=flush_sum)
+
+    # Production replays the call inside a CUDA graph (84 calls per forward),
+    # between other kernels; here an L2 clear separates consecutive calls.
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for _ in range(_CALLS_PER_GRAPH):
+            clear_l2()
             launch()
+    clears = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(clears):
+        for _ in range(_CALLS_PER_GRAPH):
+            clear_l2()
     torch.cuda.synchronize()
 
-    tp_group.barrier()
-    start = time.perf_counter()
-    for _ in range(2):
-        graph.replay()
-    torch.cuda.synchronize()
-    estimate = (time.perf_counter() - start) / 2
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+
+    def replay_ms(target, replays: int) -> float:
+        torch.cuda.synchronize()
+        tp_group.barrier()
+        start.record()
+        for _ in range(replays):
+            target.replay()
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end)
+
+    estimate_s = replay_ms(graph, 2) / 2 / 1000.0
     # Every rank must replay the same number of calls, or a spin-wait never ends.
-    wanted = max(math.ceil(rep / _CALLS_PER_GRAPH), math.ceil(_MIN_TIMED_SECONDS / estimate))
+    wanted = max(math.ceil(rep / _CALLS_PER_GRAPH), math.ceil(_MIN_TIMED_SECONDS / estimate_s))
     replays = torch.tensor(float(wanted), dtype=torch.float32, device=device)
     dist.all_reduce(replays, op=dist.ReduceOp.MAX, group=tp_group.device_group)
     replays = int(replays.item())
+    replay_ms(clears, 2)
 
     trials = []
     for _ in range(_TIMED_TRIALS):
-        torch.cuda.synchronize()
-        tp_group.barrier()
-        start = time.perf_counter()
-        for _ in range(replays):
-            graph.replay()
-        torch.cuda.synchronize()
-        trials.append((time.perf_counter() - start) / (replays * _CALLS_PER_GRAPH))
-    local_ms = torch.tensor(statistics.median(trials) * 1000.0, dtype=torch.float32, device=device)
+        with_calls = replay_ms(graph, replays)
+        clears_only = replay_ms(clears, replays)
+        trials.append((with_calls - clears_only) / (replays * _CALLS_PER_GRAPH))
+    local_ms = torch.tensor(statistics.median(trials), dtype=torch.float32, device=device)
     dist.all_reduce(local_ms, op=dist.ReduceOp.MAX, group=tp_group.device_group)
-    del graph
+    del graph, clears
     return float(local_ms.item())

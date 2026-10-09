@@ -80,17 +80,18 @@ DOC = KernelDoc(
     ),
     default_metric="time_ms",
     method=(
-        "Wall-clock time of CUDA graph replays of 30 back-to-back calls, since "
-        "vLLM runs the call inside a graph. After a reference check and 50 "
-        "direct calls, a host barrier aligns the GPUs before each of three "
-        "timed trials; the median trial per GPU and the slowest GPU are kept."
+        "CUDA-event time of graph replays (vLLM runs the call inside a graph) "
+        "of 30 calls, each after an L2 clear, minus replays of the 30 clears "
+        "alone. After a reference check and 50 direct calls, a host barrier "
+        "aligns the GPUs before each of three timed trials; the median trial "
+        "per GPU and the slowest GPU are kept."
     ),
     caveats=(
         "Every GPU arrives together, so the time excludes the cross-GPU skew "
         "that the spin-waits absorb in serving (for example uneven expert load "
         "before an MoE call).",
-        "Back-to-back calls let one call's launch overlap the previous call's tail "
-        "through PDL; in serving other kernels run between calls.",
+        "The clear before each call leaves its input cold too; in serving the "
+        "GEMM that writes it runs just before.",
         "algbw and busbw divide the reduce-scatter input size by the whole call's "
         "time, so they include the conv, residual and norm work.",
     ),
