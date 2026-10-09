@@ -26,14 +26,15 @@ same call) exists for the sensitivity check only.
 Timing follows the compute kinds' cold-L2 rule inside a CUDA graph. One graph
 interleaves the profilers' L2 clear (a read over a buffer of at least twice L2,
 ``default_l2_flush_bytes``) with the call, ``_CALLS_PER_GRAPH`` times (a multiple
-of the three Lamport buffer generations); a second graph holds the clears alone.
-CUDA events time replays of both after a host barrier aligns the ranks, and the
-call costs the difference per call: the median of three trials per rank, the
-slowest rank kept. The clear in between keeps each call's working set out of L2,
+of the three Lamport buffer generations). CUPTI records the replays after a host
+barrier aligns the ranks; each call costs the interval union of its own four
+kernels, so neither the clear nor the clear's writeback of the call's dirty
+lines is charged to it. A rank keeps the median call of the median of three
+trials, and the fastest rank is kept: a call ends when its last peer arrives,
+so the last rank to arrive waits least and the others add only the harness's
+arrival skew. The clear in between keeps each call's working set out of L2,
 as the other kernels of a forward leave it, and gives its first launch no PDL
-edge into the previous call, so consecutive calls do not overlap. Every rank
-runs the same graph, so the spin-waits see balanced arrival; serving-time
-cross-rank skew is not folded in.
+edge into the previous call, so consecutive calls do not overlap.
 """
 
 from __future__ import annotations
@@ -429,7 +430,11 @@ def validate_case(torch, case: dict, launch, *, rank: int, world_size: int) -> d
 
 
 def _time_cuda_graph(*, torch, dist, tp_group, launch, device, warmup: int, rep: int) -> float:
-    from profiling.profilers.cupti_kernel_profiler import default_l2_flush_bytes
+    from profiling.profilers.cupti_kernel_profiler import (
+        CuptiKernelProfiler,
+        default_l2_flush_bytes,
+        interval_union_duration_ns,
+    )
 
     for _ in range(warmup):
         launch()
@@ -449,38 +454,52 @@ def _time_cuda_graph(*, torch, dist, tp_group, launch, device, warmup: int, rep:
         for _ in range(_CALLS_PER_GRAPH):
             clear_l2()
             launch()
-    clears = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(clears):
-        for _ in range(_CALLS_PER_GRAPH):
-            clear_l2()
     torch.cuda.synchronize()
 
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    profiler = CuptiKernelProfiler(device=device, clear_l2_bytes=4)
+    clear_names = {
+        record.name for record in profiler.capture_once(clear_l2, clear_l2_before_run=False)
+    }
 
-    def replay_ms(target, replays: int) -> float:
+    def capture(replays: int):
         torch.cuda.synchronize()
         tp_group.barrier()
-        start.record()
-        for _ in range(replays):
-            target.replay()
-        end.record()
-        end.synchronize()
-        return start.elapsed_time(end)
+        return profiler.capture_once(
+            lambda: [graph.replay() for _ in range(replays)], clear_l2_before_run=False
+        )
 
-    estimate_s = replay_ms(graph, 2) / 2 / 1000.0
+    def call_durations_ns(records) -> list[int]:
+        # Each clear opens a call; the call costs its own kernels' interval
+        # union, so the clear and its writeback of the call's dirty lines stay out.
+        calls: list[list] = []
+        for record in sorted(records, key=lambda r: (r.start_ns, r.end_ns, r.correlation_id)):
+            if record.name in clear_names:
+                calls.append([])
+            elif calls:
+                calls[-1].append(record)
+        sizes = {len(call) for call in calls}
+        if len(calls) % _CALLS_PER_GRAPH or len(sizes) != 1 or 0 in sizes:
+            raise KernelLaunchFailed(
+                f"Lamport CUPTI capture is not {_CALLS_PER_GRAPH}-call aligned "
+                f"(calls={len(calls)}, kernels per call={sorted(sizes)})"
+            )
+        return [interval_union_duration_ns(call) for call in calls]
+
+    estimate_s = sum(call_durations_ns(capture(1))) / _CALLS_PER_GRAPH / 1e9
     # Every rank must replay the same number of calls, or a spin-wait never ends.
-    wanted = max(math.ceil(rep / _CALLS_PER_GRAPH), math.ceil(_MIN_TIMED_SECONDS / estimate_s))
+    wanted = max(
+        math.ceil(rep / _CALLS_PER_GRAPH),
+        math.ceil(_MIN_TIMED_SECONDS / (estimate_s * _CALLS_PER_GRAPH)),
+    )
     replays = torch.tensor(float(wanted), dtype=torch.float32, device=device)
     dist.all_reduce(replays, op=dist.ReduceOp.MAX, group=tp_group.device_group)
     replays = int(replays.item())
-    replay_ms(clears, 2)
 
-    trials = []
-    for _ in range(_TIMED_TRIALS):
-        with_calls = replay_ms(graph, replays)
-        clears_only = replay_ms(clears, replays)
-        trials.append((with_calls - clears_only) / (replays * _CALLS_PER_GRAPH))
+    trials = [
+        statistics.median(call_durations_ns(capture(replays))) / 1e6 for _ in range(_TIMED_TRIALS)
+    ]
     local_ms = torch.tensor(statistics.median(trials), dtype=torch.float32, device=device)
-    dist.all_reduce(local_ms, op=dist.ReduceOp.MAX, group=tp_group.device_group)
-    del graph, clears
+    # A call waits on its slowest peer; the last rank to arrive waits least, so
+    # its span is the call's cost and the others add only harness arrival skew.
+    dist.all_reduce(local_ms, op=dist.ReduceOp.MIN, group=tp_group.device_group)
     return float(local_ms.item())
