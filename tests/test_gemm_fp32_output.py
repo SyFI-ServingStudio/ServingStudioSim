@@ -94,13 +94,13 @@ def test_fp32_prepare_needs_highest_precision_and_caches_a_contiguous_weight() -
     assert (launch.input_tensor, launch.weight_transposed) == ("input", "weight.T.contiguous()")
 
 
-def test_inkling_router_backend_reuses_the_kind_schema_in_the_fork_env() -> None:
-    # The Inkling module exists only in the alignment fork; any other env would
+def test_ll_bf16_backend_reuses_the_kind_schema_in_the_fork_env() -> None:
+    # The vllm.models.inkling module exists only in the alignment fork; any other env would
     # fail every spec at import time.
     from profiling.db.registry import find_kernel_profiler_spec
     from profiling.kernels.gemm_fp32_output import GemmFp32OutputArgs
 
-    spec = find_kernel_profiler_spec("gemm_fp32_output", "vllm_inkling_router_auto")
+    spec = find_kernel_profiler_spec("gemm_fp32_output", "vllm_ll_bf16_auto")
     assert spec.args_schema is GemmFp32OutputArgs
     assert spec.subprocess_env == "vllm_upstream_fork_env"
     assert spec.supports.compute == frozenset({DType.BF16})
@@ -114,14 +114,14 @@ def test_inkling_router_backend_reuses_the_kind_schema_in_the_fork_env() -> None
         ((8, 264, 0, "bf16"), ValueError),
     ],
 )
-def test_inkling_router_rejects_unbuilt_dtype_and_empty_shapes(
+def test_ll_bf16_rejects_unbuilt_dtype_and_empty_shapes(
     arguments: tuple[object, ...], error
 ) -> None:
     # The production call casts nothing: an fp32 activation would silently take
     # the cuBLAS branch at every m and mislabel it as the ll_bf16 path.
-    from profiling.runners.gemm.gemm_fp32_output_vllm_inkling_router import (
-        profile_gemm_fp32_output_vllm_inkling_router,
+    from profiling.runners.gemm.gemm_fp32_output_vllm_ll_bf16 import (
+        profile_gemm_fp32_output_vllm_ll_bf16,
     )
 
     with pytest.raises(error):
-        profile_gemm_fp32_output_vllm_inkling_router(*arguments)
+        profile_gemm_fp32_output_vllm_ll_bf16(*arguments)

@@ -1,4 +1,4 @@
-"""Profile Inkling's fused QKVR prep (``fused_qkvr_prep``) from the alignment fork.
+"""Profile the fused short-conv QKVR prep (``fused_qkvr_prep``) from the alignment fork.
 
 ``vllm_triton`` times one call of
 ``vllm.models.inkling.nvidia.ops.qkvr_prep.fused_qkvr_prep`` with the arguments
@@ -26,7 +26,7 @@ Inputs follow the layer's producer contract: one request per token, each with
 a random earlier context so all ``W - 1`` conv taps come from the conv-state
 cache, as in decode (see ``timing_layout``). Outside the timed region the call's
 outputs are checked against the independent Torch reference in
-``inkling_qkvr_prep_reference``: q, rel logits, the K/V rows written to the
+``sconv_qkvr_prep_reference``: q, rel logits, the K/V rows written to the
 attention cache, the raw K/V written to the conv-state cache, and that every
 other cache slot is untouched.
 """
@@ -38,7 +38,7 @@ from typing import Any
 
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention.inkling_qkvr_prep_reference import (
+from profiling.runners.attention.sconv_qkvr_prep_reference import (
     PrepShape,
     compare,
     reference_conv,
@@ -47,7 +47,7 @@ from profiling.runners.attention.inkling_qkvr_prep_reference import (
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-KIND = "inkling_qkvr_prep"
+KIND = "sconv_qkvr_prep"
 _BACKEND = f"{KIND}:vllm_triton"
 _MAX_TOKENS = 65_536
 # Bound for the random request contexts. Positions only index the conv-state
@@ -418,7 +418,7 @@ def logical_bytes(shape: PrepShape, num_tokens: int) -> int:
     return 2 * (per_token * num_tokens + shape.d_rel * shape.rel_extent)
 
 
-def profile_inkling_qkvr_prep_vllm_triton(
+def profile_sconv_qkvr_prep_vllm_triton(
     num_tokens: int,
     num_q_heads: int,
     num_kv_heads: int,
@@ -450,7 +450,7 @@ def profile_inkling_qkvr_prep_vllm_triton(
         from vllm.models.inkling.nvidia.ops.qkvr_prep import fused_qkvr_prep
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires the alignment vLLM fork with Inkling (vllm_upstream_fork_env)"
+            f"{_BACKEND} requires the alignment vLLM fork (vllm_upstream_fork_env)"
         ) from exc
     shape = PrepShape(num_q_heads, num_kv_heads, head_dim, d_rel, rel_extent, sconv_kernel_size)
     try:
@@ -499,6 +499,6 @@ __all__ = [
     "capture_graph",
     "check_outputs",
     "logical_bytes",
-    "profile_inkling_qkvr_prep_vllm_triton",
+    "profile_sconv_qkvr_prep_vllm_triton",
     "timing_layout",
 ]

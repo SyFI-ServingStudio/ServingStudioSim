@@ -1,4 +1,4 @@
-"""Inkling's MoE gate select: sigmoid + bias top-k, then a joint renorm with the sink logits.
+"""MoE gate select: sigmoid + bias top-k, then a joint renorm with the sink logits.
 
 Source: alignment fork, ``vllm/models/inkling/nvidia/moe.py``
 (``inkling_gate_select`` launching ``_inkling_gate_select_kernel``), called once
@@ -64,7 +64,7 @@ DOC = KernelDoc(
         "renormalize their logits together with the sink experts' logits."
     ),
     description=(
-        "Inkling's router: per token, score the routed experts as sigmoid(logit) "
+        "Per token, score the routed experts as sigmoid(logit) "
         "plus a selection bias and keep the top_k (ties to the lowest id). The "
         "selected raw logits and the sink experts' logits are renormalized "
         "jointly as sigmoid(l) / Σ sigmoid(l) and scaled by route_scale and the "
@@ -91,7 +91,7 @@ DOC = KernelDoc(
         "Logits are random fp32 values and the bias is synthetic; the kernel's "
         "work does not depend on them (K full-width argmax passes per token).",
         "route_scale and the global scale do not change the work; the runner "
-        "uses route_scale 8 (Inkling) and global scale 1.25.",
+        "uses route_scale 8 and global scale 1.25.",
         "top_k + num_shared_experts must be a power of two (a Triton arange "
         "spans the selected set).",
         "TFLOPS is not computed. GB/s counts the routed and sink logits read "
@@ -118,7 +118,7 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.FP32}),
         ),
-        # Inkling exists only in the upstream-rebased alignment fork.
+        # inkling_gate_select exists only in the upstream-rebased alignment fork.
         subprocess_env="vllm_upstream_fork_env",
         doc=BackendDoc(
             summary=(

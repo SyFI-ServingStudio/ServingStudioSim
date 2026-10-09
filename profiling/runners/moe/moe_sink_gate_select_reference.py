@@ -1,4 +1,4 @@
-"""Independent Torch reference for Inkling's sink-renormalized gate select.
+"""Independent Torch reference for the sink-renormalized gate select.
 
 Written from the routing semantics in the alignment fork's module docstring
 and ``InklingGate`` (``vllm/models/inkling/nvidia/moe.py``: sigmoid gate plus

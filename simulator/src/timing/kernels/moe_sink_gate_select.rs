@@ -1,4 +1,4 @@
-//! Inkling's MoE gate select: one `inkling_gate_select` call per MoE layer.
+//! Sink-renormalized MoE gate select: one `inkling_gate_select` call per MoE layer.
 //!
 //! On the router GEMM's fp32 logits (`num_routed_experts` routed columns, then
 //! `num_shared_experts` sink columns, then GEMM padding up to
@@ -32,7 +32,7 @@ pub struct MoeSinkGateSelectKernelConfig {
     /// Routed experts selected per token.
     pub top_k: u32,
     /// Row stride of the logits: routed + sink columns plus the router GEMM's
-    /// padding (Inkling pads 258 to 264).
+    /// padding (e.g. 258 padded to 264).
     pub logits_row_stride: u32,
     /// Per-expert selection bias added to the sigmoid scores.
     pub has_bias: bool,

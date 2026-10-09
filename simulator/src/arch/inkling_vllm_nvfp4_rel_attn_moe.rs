@@ -92,7 +92,7 @@ const REL_ATTENTION_BACKENDS: &[&str] = &["tml_fa4"];
 const LAMPORT_BACKENDS: &[&str] = &["vllm_lamport_triton"];
 /// The fork's `_linear_with_fp32_out`: cute-DSL `ll_bf16` at T <= 64, cuBLAS
 /// `torch.mm(out_dtype=fp32)` above.
-const ROUTER_BACKENDS: &[&str] = &["vllm_inkling_router_auto"];
+const ROUTER_BACKENDS: &[&str] = &["vllm_ll_bf16_auto"];
 const GATE_SELECT_BACKENDS: &[&str] = &["vllm_triton"];
 /// Triton launches (embed + norm, `_silu_and_mul_triton`, `_sink_epilogue`).
 const TRITON_ELEMENTWISE_BACKENDS: &[&str] = &["triton"];

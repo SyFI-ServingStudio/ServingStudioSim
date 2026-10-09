@@ -1,6 +1,6 @@
-"""Torch semantics for Inkling's fused RS + short-conv + AG + residual + RMSNorm.
+"""Torch semantics for the fused RS + short-conv + AG + residual + RMSNorm.
 
-The production call (vLLM Inkling ``LamportRSConv.rs_sconv_ag_add_norm``) is a
+The production call (the alignment fork's ``LamportRSConv.rs_sconv_ag_add_norm``) is a
 tensor-parallel collective. This reference computes the same result on one
 device from every rank's inputs at once, with no communication and no paging:
 

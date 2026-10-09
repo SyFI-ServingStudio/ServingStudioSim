@@ -48,8 +48,6 @@ from profiling.kernels import (
     gdn_recurrent_decode,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
     grouped_gemm,  # noqa: F401
-    inkling_qkvr_prep,  # noqa: F401
-    inkling_rel_attention,  # noqa: F401
     inv_rope_fp8_quant,  # noqa: F401
     kda_chunk_prefill,  # noqa: F401
     kda_recurrent_decode,  # noqa: F401
@@ -82,9 +80,11 @@ from profiling.kernels import (
     q_kv_rms_norm,  # noqa: F401
     q_pad_kv_rope_mxfp8_insert,  # noqa: F401
     qnorm_rope_kv_insert,  # noqa: F401
+    rel_bias_attention,  # noqa: F401
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
     rs_sconv_ag_residual_rms_norm,  # noqa: F401
+    sconv_qkvr_prep,  # noqa: F401
     single_gemm,  # noqa: F401
     vllm_fused_moe,  # noqa: F401
     vllm_mla_rope,  # noqa: F401

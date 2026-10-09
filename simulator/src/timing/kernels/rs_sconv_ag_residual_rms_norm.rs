@@ -1,4 +1,4 @@
-//! Inkling's fused TP collective: reduce-scatter over the hidden dim + causal
+//! Fused TP collective: reduce-scatter over the hidden dim + causal
 //! depthwise short conv (k=4, with skip) on each rank's shard through the
 //! paged conv-state cache + all-gather + residual add + RMSNorm.
 //!

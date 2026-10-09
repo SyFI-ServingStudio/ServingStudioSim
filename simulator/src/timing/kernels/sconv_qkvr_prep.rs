@@ -1,4 +1,4 @@
-//! Inkling fused QKVR prep: one `fused_qkvr_prep` call per attention layer.
+//! Fused short-conv QKVR prep: one `fused_qkvr_prep` call per attention layer.
 //!
 //! From the per-rank `qkvr` GEMM row (q | k | v | r) the call short-convs K
 //! and V (taps from the paged conv-state cache for earlier forwards), RMS-norms
@@ -27,7 +27,7 @@ use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct InklingQkvrPrepKernelConfig {
+pub struct SconvQkvrPrepKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
@@ -55,13 +55,13 @@ pub struct InklingQkvrPrepKernelConfig {
 }
 
 #[derive(SweepCoords, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct InklingQkvrPrepKernelInput {
+pub struct SconvQkvrPrepKernelInput {
     pub num_tokens: u32,
 }
 
-pub struct InklingQkvrPrepSpec;
+pub struct SconvQkvrPrepSpec;
 
-fn validate_config(config: &InklingQkvrPrepKernelConfig) {
+fn validate_config(config: &SconvQkvrPrepKernelConfig) {
     // fused_qkvr_prep asserts both (qkvr_prep.py:820-821).
     assert_eq!(config.head_dim, 128, "fused_qkvr_prep needs head_dim 128");
     assert_eq!(config.d_rel, 16, "fused_qkvr_prep needs d_rel 16");
@@ -72,13 +72,13 @@ fn validate_config(config: &InklingQkvrPrepKernelConfig) {
         config.num_kv_heads
     );
     assert!(config.rel_extent > 0, "rel_extent must be positive");
-    assert_eq!(config.dtype, DType::Bf16, "the Inkling conv-state cache is bf16 only");
+    assert_eq!(config.dtype, DType::Bf16, "the conv-state cache is bf16 only");
 }
 
-impl KernelSpec for InklingQkvrPrepSpec {
-    type Config = InklingQkvrPrepKernelConfig;
-    type Input = InklingQkvrPrepKernelInput;
-    const KIND: KernelKind = "inkling_qkvr_prep";
+impl KernelSpec for SconvQkvrPrepSpec {
+    type Config = SconvQkvrPrepKernelConfig;
+    type Input = SconvQkvrPrepKernelInput;
+    const KIND: KernelKind = "sconv_qkvr_prep";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         validate_config(config);
@@ -116,14 +116,14 @@ impl KernelSpec for InklingQkvrPrepSpec {
     }
 }
 
-register_kernel!(InklingQkvrPrepKernel, InklingQkvrPrepSpec);
+register_kernel!(SconvQkvrPrepKernel, SconvQkvrPrepSpec);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn config(rel_extent: u32, apply_log_scaling: bool) -> InklingQkvrPrepKernelConfig {
-        InklingQkvrPrepKernelConfig {
+    fn config(rel_extent: u32, apply_log_scaling: bool) -> SconvQkvrPrepKernelConfig {
+        SconvQkvrPrepKernelConfig {
             backends: vec!["vllm_triton"],
             gpu_name: "NVIDIA B200".to_string(),
             num_q_heads: 8,
@@ -145,7 +145,7 @@ mod tests {
     /// other's range.
     #[test]
     fn grid_brackets_every_implementation_switch_with_adjacent_points() {
-        let grid = InklingQkvrPrepSpec::sweep_grid(&config(512, false));
+        let grid = SconvQkvrPrepSpec::sweep_grid(&config(512, false));
         let axis = &grid.axes()[0];
         for switch in [128.0, 256.0, 1024.0] {
             let i = axis.iter().position(|&t| t == switch).unwrap();
@@ -155,12 +155,12 @@ mod tests {
     }
 
     /// Catches a payload that drops or renames a field the Python
-    /// `InklingQkvrPrepArgs` schema requires, or leaks an extra one.
+    /// `SconvQkvrPrepArgs` schema requires, or leaks an extra one.
     #[test]
     fn payload_matches_python_args() {
         let cfg = config(1024, true);
-        let grid = InklingQkvrPrepSpec::sweep_grid(&cfg);
-        let payloads = InklingQkvrPrepSpec::enumerate(&cfg, &grid, "vllm_triton");
+        let grid = SconvQkvrPrepSpec::sweep_grid(&cfg);
+        let payloads = SconvQkvrPrepSpec::enumerate(&cfg, &grid, "vllm_triton");
         let fields = payloads[21].fields();
         let keys: Vec<_> = fields.keys().map(String::as_str).collect();
         assert_eq!(
@@ -192,6 +192,6 @@ mod tests {
     fn rejects_a_head_dim_the_call_asserts_away() {
         let mut cfg = config(512, false);
         cfg.head_dim = 64;
-        InklingQkvrPrepSpec::sweep_grid(&cfg);
+        SconvQkvrPrepSpec::sweep_grid(&cfg);
     }
 }

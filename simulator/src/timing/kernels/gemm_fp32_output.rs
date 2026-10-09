@@ -1,7 +1,7 @@
 //! GEMM (BF16 or FP32 inputs) whose production callable materializes an FP32 output.
 //!
 //! Backends: `torch_cublas` is `torch.mm(..., out_dtype=fp32)` alone;
-//! `sglang_router_auto` and `vllm_inkling_router_auto` time a framework's whole
+//! `sglang_router_auto` and `vllm_ll_bf16_auto` time a framework's whole
 //! router dispatch, which switches kernels with `m` inside one call.
 //!
 //! Coverage gap: the DeepSeek-V4.1 router GateLinear (n=384, k=5120) runs a
@@ -9,8 +9,8 @@
 //! tier of vLLM's `GateLinear`); only m > 16 falls through to
 //! `torch.mm(..., out_dtype=fp32)`. No backend profiles that tier yet, so the
 //! m <= 16 rows of that shape are the cuBLAS/nvjet time, not the production one.
-//! (Inkling's router reaches the same `ll_bf16_gemm` through its own m <= 64
-//! dispatch, which `vllm_inkling_router_auto` measures.)
+//! (The alignment fork's `_linear_with_fp32_out` reaches the same `ll_bf16_gemm`
+//! through its own m <= 64 dispatch, which `vllm_ll_bf16_auto` measures.)
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -36,16 +36,17 @@ pub struct GemmFp32OutputKernelInput {
 
 pub struct GemmFp32OutputSpec;
 
-/// The alignment fork's Inkling router dispatch (`moe.py::_linear_with_fp32_out`).
-const VLLM_INKLING_ROUTER_AUTO: &str = "vllm_inkling_router_auto";
+/// The alignment fork's `_linear_with_fp32_out` dispatch (`moe.py`): cute-DSL
+/// `ll_bf16` at m <= 64, cuBLAS `torch.mm(out_dtype=fp32)` above.
+const VLLM_LL_BF16_AUTO: &str = "vllm_ll_bf16_auto";
 
-/// `m` points added for `vllm_inkling_router_auto`. The call switches kernels
+/// `m` points added for `vllm_ll_bf16_auto`. The call switches kernels
 /// at two points: `ll_bf16` dot-product (m <= 4) to split-K (m >= 5), and
 /// `ll_bf16` (m <= 64) to cuBLAS (m >= 65). Both sides of each switch are
 /// measured so linear interpolation never spans one, and every CUDA-graph
 /// capture size up to 128 (multiples of 8), where decode batches are padded to,
 /// is a measured point.
-fn inkling_router_m_points() -> Vec<f64> {
+fn ll_bf16_m_points() -> Vec<f64> {
     Axis::chain([Axis::values([3, 5, 65]), Axis::arithmetic(8, 128, 8)])
 }
 
@@ -57,10 +58,10 @@ impl KernelSpec for GemmFp32OutputSpec {
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         let mut m = Axis::chain([Axis::pow2(0, 4), Axis::token_axis()]);
-        // Only the Inkling dispatch has the in-call switches; keeping its extra
+        // Only the ll_bf16 dispatch has the in-call switches; keeping its extra
         // points off the other backends avoids resampling their existing rows.
-        if config.backends.contains(&VLLM_INKLING_ROUTER_AUTO) {
-            m = Axis::chain([m, inkling_router_m_points()]);
+        if config.backends.contains(&VLLM_LL_BF16_AUTO) {
+            m = Axis::chain([m, ll_bf16_m_points()]);
             m.sort_by(f64::total_cmp);
         }
         SweepGrid::new(vec![m])
@@ -90,7 +91,7 @@ register_kernel!(GemmFp32OutputKernel, GemmFp32OutputSpec);
 
 #[cfg(test)]
 mod tests {
-    use super::{GemmFp32OutputKernelConfig, GemmFp32OutputSpec, VLLM_INKLING_ROUTER_AUTO};
+    use super::{GemmFp32OutputKernelConfig, GemmFp32OutputSpec, VLLM_LL_BF16_AUTO};
     use crate::timing::bridge::DType;
     use crate::timing::kernels::engine::KernelSpec;
 
@@ -127,8 +128,8 @@ mod tests {
     }
 
     #[test]
-    fn inkling_router_grid_brackets_both_kernel_switches() {
-        let m = m_axis(vec![VLLM_INKLING_ROUTER_AUTO]);
+    fn ll_bf16_grid_brackets_both_kernel_switches() {
+        let m = m_axis(vec![VLLM_LL_BF16_AUTO]);
         // Linear interpolation must never span a kernel switch inside the call.
         for switch in [4.0, 5.0, 64.0, 65.0] {
             assert!(m.contains(&switch), "missing m={switch}");

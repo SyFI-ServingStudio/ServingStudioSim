@@ -3,8 +3,8 @@ import math
 import pytest
 import torch
 
-from profiling.runners.attention import inkling_rel_attention as runner
-from profiling.runners.attention.inkling_rel_attention_reference import (
+from profiling.runners.attention import rel_bias_attention as runner
+from profiling.runners.attention.rel_bias_attention_reference import (
     gather_request_kv,
     rel_attention_reference,
 )

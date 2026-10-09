@@ -1,7 +1,7 @@
-"""Inkling relative-position attention (tml FA4) kernel kind.
+"""Relative-position attention (tml FA4) kernel kind.
 
-All Python-side per-kernel knowledge for ``inkling_rel_attention`` lives here: the
-wire string ``KIND``, the ``InklingRelAttentionArgs`` schema, and the
+All Python-side per-kernel knowledge for ``rel_bias_attention`` lives here: the
+wire string ``KIND``, the ``RelBiasAttentionArgs`` schema, and the
 ``register(...)`` call that wires the kind into ``profiling.db.registry``.
 
 Source: the alignment vLLM fork (``alignment/profiler/vllm``). Per layer,
@@ -50,11 +50,11 @@ from profiling.db.registry import (
     register,
 )
 
-KIND = "inkling_rel_attention"
+KIND = "rel_bias_attention"
 
 
 @dataclass(frozen=True)
-class InklingRelAttentionArgs(KernelArgs):
+class RelBiasAttentionArgs(KernelArgs):
     num_qo_heads: int = arg(unit="heads", doc="Query and output heads on this GPU.")
     num_kv_heads: int = arg(unit="heads", doc="KV heads on this GPU.")
     head_dim: int = arg(unit="elements", doc="Dimension of each query, key and value head.")
@@ -82,20 +82,21 @@ class InklingRelAttentionArgs(KernelArgs):
 
 
 DOC = KernelDoc(
-    title="Inkling relative-position attention",
+    title="Relative-position attention",
     summary=(
         "Paged causal or sliding-window GQA attention with a per-query relative-position "
         "logit added to every score, over one mixed decode and prefill batch."
     ),
     description=(
-        "Inkling's attention has no RoPE: each query row carries rel_extent learned "
+        "No RoPE is applied: each query row carries rel_extent learned "
         "logits, one per distance, added to its scores against the last rel_extent "
         "keys. Local layers also restrict keys to that window; global layers are "
         "full causal with no bias beyond it. One call covers the whole varlen batch "
         "over a paged LBNHC KV cache (K and V of one token and head packed side by "
         "side). On Blackwell the call first shears the logits into a KV-tile-aligned "
         "bias tensor, then runs FlashAttention 4 with bias tiles; global layers split "
-        "the KV range by Inkling's rule and combine the partials."
+        "the KV range by the fork's inkling_fa4_num_splits rule and combine the "
+        "partials."
     ),
     category="Attention",
     subcategory="MHA / GQA",
@@ -122,7 +123,7 @@ DOC = KernelDoc(
         "KV pages are shuffled across a pool sized to the batch; the page table is "
         "max_model_len / page_size wide, as vLLM's.",
     ),
-    reference="profiling.runners.attention.inkling_rel_attention_reference",
+    reference="profiling.runners.attention.rel_bias_attention_reference",
 )
 
 
@@ -139,11 +140,11 @@ register(
         kernel_kind=KIND,
         backend="tml_fa4",
         runner_ref=RunnerRef(
-            module_name="profiling.runners.attention.inkling_rel_attention",
-            function_name="profile_inkling_rel_attention_tml_fa4",
+            module_name="profiling.runners.attention.rel_bias_attention",
+            function_name="profile_rel_bias_attention_tml_fa4",
         ),
         table_name=KIND,
-        args_schema=InklingRelAttentionArgs,
+        args_schema=RelBiasAttentionArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=_SUPPORT,
@@ -158,4 +159,4 @@ register(
     )
 )
 
-__all__ = ["InklingRelAttentionArgs", "KIND"]
+__all__ = ["RelBiasAttentionArgs", "KIND"]

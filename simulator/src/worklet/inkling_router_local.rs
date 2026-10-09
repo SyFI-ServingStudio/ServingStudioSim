@@ -170,7 +170,7 @@ mod tests {
             has_global_scale: true,
             activation_dtype: DType::Bf16,
             gpu_name: "NVIDIA B200".into(),
-            router_backends: vec!["vllm_inkling_router_auto"],
+            router_backends: vec!["vllm_ll_bf16_auto"],
             gate_select_backends: vec!["vllm_triton"],
             copy_backends: vec!["torch"],
         });
