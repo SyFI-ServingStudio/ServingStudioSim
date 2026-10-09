@@ -243,25 +243,12 @@ def interval_union_duration_ns(records: list[KernelRecord]) -> int:
     return total + merged_end - merged_start
 
 
-def wall_span_duration_ns(records: list[KernelRecord]) -> int:
-    """Return first kernel start to last kernel end, idle gaps included."""
-
-    if not records:
-        return 0
-    return max(record.end_ns for record in records) - min(record.start_ns for record in records)
-
-
-def _duration_ms(
-    records: list[KernelRecord], *, interval_union: bool, wall_span: bool = False
-) -> float:
-    if interval_union and wall_span:
-        raise ValueError("interval_union and wall_span are mutually exclusive")
-    if wall_span:
-        duration_ns = wall_span_duration_ns(records)
-    elif interval_union:
-        duration_ns = interval_union_duration_ns(records)
-    else:
-        duration_ns = sum(record.duration_ns for record in records)
+def _duration_ms(records: list[KernelRecord], *, interval_union: bool) -> float:
+    duration_ns = (
+        interval_union_duration_ns(records)
+        if interval_union
+        else sum(record.duration_ns for record in records)
+    )
     return duration_ns / 1e6
 
 
@@ -337,7 +324,6 @@ def _capture_launch_unit(
     kernel_name_contains: str | None,
     launch_pattern: _LaunchPattern | None,
     interval_union: bool = False,
-    wall_span: bool = False,
 ) -> tuple[list[float], set[str], list[int]]:
     """Capture one unit and return one duration/count per logical callable run."""
 
@@ -355,7 +341,7 @@ def _capture_launch_unit(
             kernel_name_contains=kernel_name_contains,
         )
         return (
-            [_duration_ms(matched, interval_union=interval_union, wall_span=wall_span)],
+            [_duration_ms(matched, interval_union=interval_union)],
             {record.name for record in matched},
             [len(matched)],
         )
@@ -374,12 +360,12 @@ def _capture_launch_unit(
             f"expected={expected_count}, captured={len(records)}"
         )
 
-    # A multi-stream callable (the interval-union and wall-span cases) starts
-    # its streams' kernels in no fixed order, so only the multiset of names is
-    # stable within one launch. Launches still occupy contiguous record blocks:
-    # each one joins its streams before the next launch (or L2 clear) starts.
+    # A multi-stream callable (the interval-union case) starts its streams'
+    # kernels in no fixed order, so only the multiset of names is stable
+    # within one launch. Launches still occupy contiguous record blocks: each
+    # one joins its streams before the next launch (or L2 clear) starts.
     def launch_signature(names: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(sorted(names)) if interval_union or wall_span else names
+        return tuple(sorted(names)) if interval_union else names
 
     expected_signature = launch_signature(launch_pattern.callable_kernel_names)
     cursor = 0
@@ -399,9 +385,7 @@ def _capture_launch_unit(
             callable_records,
             kernel_name_contains=kernel_name_contains,
         )
-        per_launch_ms.append(
-            _duration_ms(matched, interval_union=interval_union, wall_span=wall_span)
-        )
+        per_launch_ms.append(_duration_ms(matched, interval_union=interval_union))
         matched_kernel_names.update(record.name for record in matched)
         matched_kernel_counts.append(len(matched))
 
@@ -567,7 +551,6 @@ class CuptiKernelProfiler:
         clear_l2_between_launches: bool = True,
         kernel_name_contains: str | None = None,
         interval_union: bool = False,
-        wall_span: bool = False,
     ) -> KernelProfileSummary:
         if launches_per_run <= 0:
             raise ValueError("launches_per_run must be positive")
@@ -594,9 +577,7 @@ class CuptiKernelProfiler:
                 clear_l2_between_launches=clear_l2_between_launches,
             )
             matched = match_kernel_records(records, kernel_name_contains=kernel_name_contains)
-            per_iter_ms.append(
-                _duration_ms(matched, interval_union=interval_union, wall_span=wall_span)
-            )
+            per_iter_ms.append(_duration_ms(matched, interval_union=interval_union))
             matched_kernel_names.update(record.name for record in matched)
             matched_kernel_count_per_run.append(len(matched))
 
@@ -630,7 +611,6 @@ class CuptiKernelProfiler:
         clear_l2_between_launches: bool = True,
         kernel_name_contains: str | None = None,
         interval_union: bool = False,
-        wall_span: bool = False,
     ) -> KernelProfileSummary:
         """Sample per-kernel timings until the mean estimate converges, then stop.
 
@@ -701,7 +681,6 @@ class CuptiKernelProfiler:
                     kernel_name_contains=kernel_name_contains,
                     launch_pattern=launch_pattern,
                     interval_union=interval_union,
-                    wall_span=wall_span,
                 )
                 per_iter_ms.extend(unit_per_launch_ms)
                 accumulated_kernel_ms += sum(unit_per_launch_ms)
@@ -752,7 +731,6 @@ class CuptiKernelProfiler:
         clear_l2_between_launches: bool = True,
         kernel_name_contains: str | None = None,
         interval_union: bool = False,
-        wall_span: bool = False,
     ) -> KernelProfileSummary:
         """Estimate a launch count, then measure it in one CUPTI window.
 
@@ -818,7 +796,6 @@ class CuptiKernelProfiler:
                 kernel_name_contains=kernel_name_contains,
                 launch_pattern=launch_pattern,
                 interval_union=interval_union,
-                wall_span=wall_span,
             )
             estimate_mean_ms = fmean(estimate_ms)
             if estimate_mean_ms <= 0:
@@ -843,7 +820,6 @@ class CuptiKernelProfiler:
             kernel_name_contains=kernel_name_contains,
             launch_pattern=launch_pattern,
             interval_union=interval_union,
-            wall_span=wall_span,
         )
         return KernelProfileSummary(
             matched_kernel_names=sorted(matched_kernel_names),
@@ -971,7 +947,6 @@ def profile_kernel(
     clear_l2_between_launches: bool = True,
     kernel_name_contains: str | None = None,
     interval_union: bool = False,
-    wall_span: bool = False,
 ) -> KernelProfileSummary:
     profiler = CuptiKernelProfiler(device=device, clear_l2_bytes=clear_l2_bytes)
     return profiler.profile(
@@ -983,7 +958,6 @@ def profile_kernel(
         clear_l2_between_launches=clear_l2_between_launches,
         kernel_name_contains=kernel_name_contains,
         interval_union=interval_union,
-        wall_span=wall_span,
     )
 
 
@@ -1003,7 +977,6 @@ def profile_kernel_until_converged(
     clear_l2_between_launches: bool = True,
     kernel_name_contains: str | None = None,
     interval_union: bool = False,
-    wall_span: bool = False,
 ) -> KernelProfileSummary:
     profiler = CuptiKernelProfiler(device=device, clear_l2_bytes=clear_l2_bytes)
     return profiler.profile_until_converged(
@@ -1019,7 +992,6 @@ def profile_kernel_until_converged(
         clear_l2_between_launches=clear_l2_between_launches,
         kernel_name_contains=kernel_name_contains,
         interval_union=interval_union,
-        wall_span=wall_span,
     )
 
 
@@ -1038,7 +1010,6 @@ def profile_kernel_for_duration(
     clear_l2_between_launches: bool = True,
     kernel_name_contains: str | None = None,
     interval_union: bool = False,
-    wall_span: bool = False,
 ) -> KernelProfileSummary:
     profiler = CuptiKernelProfiler(device=device, clear_l2_bytes=clear_l2_bytes)
     return profiler.profile_for_duration(
@@ -1053,5 +1024,4 @@ def profile_kernel_for_duration(
         clear_l2_between_launches=clear_l2_between_launches,
         kernel_name_contains=kernel_name_contains,
         interval_union=interval_union,
-        wall_span=wall_span,
     )

@@ -216,24 +216,8 @@ def test_interval_union_capture_accepts_either_stream_starting_first():
         _Profiler(), lambda: None, interval_union=True, **kwargs
     )
     assert per_launch == [90 / 1e6, 92 / 1e6]
-    per_launch, _, _ = cupti._capture_launch_unit(
-        _Profiler(), lambda: None, wall_span=True, **kwargs
-    )
-    assert per_launch == [90 / 1e6, 92 / 1e6]
     with pytest.raises(RuntimeError, match="pattern changed"):
         cupti._capture_launch_unit(_Profiler(), lambda: None, **kwargs)
-
-
-def test_wall_span_counts_the_gaps_interval_union_drops():
-    # Defect caught: a forked callable priced without the idle gap between
-    # its kernels, which a CUDA-graph replay of the call really spends.
-    from profiling.profilers.cupti_kernel_profiler import _duration_ms
-
-    records = [_record("q", 0, 50, 0), _record("rel", 60, 40, 1), _record("kv", 5, 30, 2)]
-    assert _duration_ms(records, interval_union=True) == 90 / 1e6
-    assert _duration_ms(records, interval_union=False, wall_span=True) == 100 / 1e6
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        _duration_ms(records, interval_union=True, wall_span=True)
 
 
 def test_split_launch_series_warm_layout():

@@ -30,25 +30,6 @@ host barrier aligns the ranks, wall-clock replay time per call is taken, the
 median of three trials per rank, and the slowest rank is kept. Every rank runs
 the same calls, so the spin-waits see balanced arrival; serving-time cross-rank
 skew is not folded in.
-
-The ``served`` regime (backend ``vllm_lamport_triton_served``) times the call
-the way a decode step runs it instead of back to back. Each call follows a
-cuBLAS GEMM that writes its input partial (the o_proj / routed-output shape
-``[T, hidden/tp] x [hidden/tp, hidden]``), so its first launch chains to a GEMM
-under PDL, not to the previous call's gather. Every call owns its own
-"layer" (input, residual, conv-state cache, conv/norm weights and GEMM weight,
-one per decoder layer up to 42, as production's per-layer conv caches), so
-everything not written by the immediate predecessor is cold in L2 when the call
-starts, except the residual: each call without a sink partial takes the
-previous call's residual output, as an attention call takes the residual the
-previous layer's MoE call just wrote. A ``has_shared`` (MoE) call keeps its
-own cold residual, since the routed experts stream far more than L2 between
-it and the attention call that wrote it. With ``has_shared`` the sink partial
-is produced on a side stream and joined by an event before the call, as vLLM's
-aux-stream sinks are on a decode step; the two-parent join leaves the first
-launch no PDL edge. The row is the marginal cost: replay time of
-[predecessors, call] x N minus that of [predecessors] x N, per call, on the
-slowest rank.
 """
 
 from __future__ import annotations
@@ -82,21 +63,6 @@ INKLING_RMS_NORM_EPS = 1e-6
 DECODE_LAYOUT = "decode"
 PREFILL_LAYOUT = "prefill"
 
-BALANCED_REGIME = "balanced"
-SERVED_REGIME = "served"
-# One "layer" per call in the served regime: Inkling-Small has 42 decoder
-# layers, each with its own conv-state cache. A multiple of the three Lamport
-# buffer generations.
-_SERVED_MAX_SLOTS = 42
-# Device bytes the served regime may keep across its per-layer slots; large T
-# keeps fewer (the call itself then streams far more than L2 holds).
-_SERVED_SLOT_BUDGET_BYTES = 12 << 30
-# The served regime's sink stand-in: [T, _SINK_K] x [_SINK_K, hidden] on the
-# side stream, shorter than the main-stream predecessor so the main stream
-# arrives last, as the routed call does against the aux-stream sinks.
-_SINK_K = 256
-_SERVED_TRIALS = 5
-
 _CALLS_PER_GRAPH = 30
 _TIMED_TRIALS = 3
 _MIN_TIMED_SECONDS = 0.02
@@ -115,15 +81,7 @@ def profile_rs_sconv_ag_residual_rms_norm_batch(
     return run_lamport_batch(kwargs_list, layout=DECODE_LAYOUT)
 
 
-def profile_rs_sconv_ag_residual_rms_norm_served_batch(
-    kwargs_list: list[dict],
-) -> list[RunnerResult]:
-    return run_lamport_batch(kwargs_list, layout=DECODE_LAYOUT, regime=SERVED_REGIME)
-
-
-def run_lamport_batch(
-    kwargs_list: list[dict], *, layout: str, regime: str = BALANCED_REGIME
-) -> list[RunnerResult]:
+def run_lamport_batch(kwargs_list: list[dict], *, layout: str) -> list[RunnerResult]:
     """Spawn one vLLM TP group for the chunk and profile every spec in order."""
     if not kwargs_list:
         return []
@@ -138,7 +96,7 @@ def run_lamport_batch(
         return all_error(len(kwargs_list), str(exc))
     return run_comm_batch(
         VllmTpGroupLauncher(num_gpus),
-        functools.partial(_per_rank_batch, layout=layout, regime=regime),
+        functools.partial(_per_rank_batch, layout=layout),
         kwargs_list,
     )
 
@@ -188,7 +146,6 @@ def _per_rank_batch(
     warmup: int,
     rep: int,
     layout: str,
-    regime: str = BALANCED_REGIME,
 ) -> list[dict] | None:
     torch, dist, get_tp_group, lamport_cls = _imports()
     tp_group = get_tp_group()
@@ -213,7 +170,6 @@ def _per_rank_batch(
                 layout=layout,
                 warmup=warmup,
                 rep=rep,
-                regime=regime,
             )
         del state
         torch.cuda.synchronize()
@@ -224,9 +180,7 @@ def _per_rank_batch(
     return list(results)  # type: ignore[arg-type]
 
 
-def _profile_one(
-    *, torch, dist, tp_group, state, spec, layout, warmup, rep, regime=BALANCED_REGIME
-) -> dict:
+def _profile_one(*, torch, dist, tp_group, state, spec, layout, warmup, rep) -> dict:
     rank, world = tp_group.rank_in_group, tp_group.world_size
     tokens = int(spec["num_tokens"])
     hidden = int(spec["hidden_dim"])
@@ -279,37 +233,15 @@ def _profile_one(
             flush=True,
         )
 
-    if regime == SERVED_REGIME:
-        cases = served_slot_cases(
-            torch,
-            first=case,
-            rank=rank,
-            world_size=world,
-            tokens=tokens,
-            hidden=hidden,
-            has_shared=has_shared,
-            layout=layout,
-        )
-        time_ms = time_served(
-            torch=torch,
-            dist=dist,
-            tp_group=tp_group,
-            state=state,
-            cases=cases,
-            side_stream_shared=has_shared,
-            chain_residual=not has_shared,
-            warmup=warmup,
-        )
-    else:
-        time_ms = _time_cuda_graph(
-            torch=torch,
-            dist=dist,
-            tp_group=tp_group,
-            launch=launch,
-            device=case["residual"].device,
-            warmup=warmup,
-            rep=rep,
-        )
+    time_ms = _time_cuda_graph(
+        torch=torch,
+        dist=dist,
+        tp_group=tp_group,
+        launch=launch,
+        device=case["residual"].device,
+        warmup=warmup,
+        rep=rep,
+    )
     message_bytes = tokens * hidden * case["residual"].element_size()
     latency_s = time_ms / 1000.0
     algbw = message_bytes / latency_s / 1e9 if latency_s > 0 else 0.0
@@ -529,195 +461,3 @@ def _time_cuda_graph(*, torch, dist, tp_group, launch, device, warmup: int, rep:
     dist.all_reduce(local_ms, op=dist.ReduceOp.MAX, group=tp_group.device_group)
     del graph
     return float(local_ms.item())
-
-
-# Tensors one served-regime slot keeps; the rest of ``build_case`` is reference data.
-_LAUNCH_KEYS = (
-    "input",
-    "shared",
-    "residual",
-    "conv_weight",
-    "norm_weight",
-    "cache",
-    "positions",
-    "block_table",
-    "seq_idx",
-    "slot_mapping",
-    "off_s",
-    "ws",
-    "block_size",
-)
-
-
-def served_slot_count(tokens: int, hidden: int, world_size: int, has_shared: bool) -> int:
-    """Per-layer slots for the served regime: up to 42, within the byte budget."""
-    layout = conv_cache_layout(hidden, world_size, has_shared)
-    cache_bytes = 2 * tokens * layout["heads_per_rank"] * SUPPORTED_CONV_KERNEL_SIZE
-    cache_bytes *= layout["head_size"] * 2
-    rows = 3 + int(has_shared)  # input, residual, (shared), one output row
-    gemm_weight_bytes = (hidden // world_size) * hidden * 2
-    per_slot = cache_bytes + rows * tokens * hidden * 2 + gemm_weight_bytes
-    slots = min(_SERVED_MAX_SLOTS, _SERVED_SLOT_BUDGET_BYTES // per_slot)
-    return max(3, slots - slots % 3)
-
-
-def served_slot_cases(
-    torch, *, first, rank, world_size, tokens, hidden, has_shared, layout, slots=None
-) -> list[dict]:
-    """``first`` plus fresh per-layer slots, each with its own buffers and GEMM weights.
-
-    Every slot also carries the predecessor operands: ``pred_a`` (shared by all
-    slots) times its own ``pred_w`` writes ``input``; with ``has_shared`` the
-    side-stream ``sink_a x sink_w`` writes ``shared``.
-    """
-    if slots is None:
-        slots = served_slot_count(tokens, hidden, world_size, has_shared)
-    device = first["residual"].device
-    bf16 = torch.bfloat16
-    gen = torch.Generator(device=device).manual_seed(_SEED + 31 * tokens + rank)
-    k = hidden // world_size
-    pred_a = (torch.randn(tokens, k, generator=gen, device=device) * 0.05).to(bf16)
-    sink_a = (torch.randn(tokens, _SINK_K, generator=gen, device=device) * 0.05).to(bf16)
-    cases = []
-    for slot in range(slots):
-        full = (
-            first
-            if slot == 0
-            else build_case(
-                torch,
-                rank=rank,
-                world_size=world_size,
-                tokens=tokens,
-                hidden=hidden,
-                has_shared=has_shared,
-                layout=layout,
-                device=device,
-            )
-        )
-        kept = {key: full[key] for key in _LAUNCH_KEYS}
-        del full
-        kept["pred_a"] = pred_a
-        kept["pred_w"] = (torch.randn(k, hidden, generator=gen, device=device) * 0.05).to(bf16)
-        if has_shared:
-            kept["sink_a"] = sink_a
-            kept["sink_w"] = (torch.randn(_SINK_K, hidden, generator=gen, device=device) * 0.05).to(
-                bf16
-            )
-        cases.append(kept)
-    torch.cuda.synchronize()
-    return cases
-
-
-def time_served(
-    *,
-    torch,
-    dist,
-    tp_group,
-    state,
-    cases,
-    side_stream_shared,
-    warmup,
-    chain_residual=False,
-    min_calls=30,
-) -> float:
-    """Marginal per-call ms of the Lamport call after its served predecessors.
-
-    Graph A replays, per slot, the predecessor GEMM and, for a slot with a sink
-    partial, the sink GEMM (forked onto a side stream and joined when
-    ``side_stream_shared``, else serial on the main stream); graph B adds the
-    Lamport call after each. ``len(cases)`` must be a multiple of 3 (buffer
-    generations). With ``chain_residual`` each call takes the previous call's
-    residual output, as consecutive sublayers do in serving. Trials alternate A
-    and B; each rank keeps its median, and the slowest rank's B minus the
-    slowest rank's A is the marginal cost.
-    """
-    if len(cases) % 3:
-        raise ValueError("served slots must be a multiple of the 3 Lamport generations")
-    rounds = max(1, math.ceil(min_calls / len(cases)))
-    side = torch.cuda.Stream()
-    device = cases[0]["residual"].device
-
-    def predecessors(case):
-        if case["shared"] is None:
-            torch.matmul(case["pred_a"], case["pred_w"], out=case["input"])
-        elif side_stream_shared:
-            main = torch.cuda.current_stream()
-            side.wait_stream(main)
-            with torch.cuda.stream(side):
-                torch.matmul(case["sink_a"], case["sink_w"], out=case["shared"])
-            torch.matmul(case["pred_a"], case["pred_w"], out=case["input"])
-            main.wait_stream(side)
-        else:
-            torch.matmul(case["sink_a"], case["sink_w"], out=case["shared"])
-            torch.matmul(case["pred_a"], case["pred_w"], out=case["input"])
-
-    def call(case, residual=None):
-        _, residual_out = state.rs_sconv_ag_add_norm(
-            case["input"],
-            case["residual"] if residual is None else residual,
-            case["conv_weight"],
-            case["norm_weight"],
-            INKLING_RMS_NORM_EPS,
-            case["cache"],
-            case["positions"],
-            case["block_table"],
-            case["seq_idx"],
-            case["slot_mapping"],
-            case["off_s"],
-            case["ws"],
-            case["block_size"],
-            shared_tensor=case["shared"],
-        )
-        return residual_out if chain_residual else None
-
-    def calls_in_order():
-        residual = None
-        for case in cases:
-            predecessors(case)
-            residual = call(case, residual)
-
-    for _ in range(max(1, warmup // len(cases))):
-        calls_in_order()
-    torch.cuda.synchronize()
-
-    graph_a = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph_a):
-        for _ in range(rounds):
-            for case in cases:
-                predecessors(case)
-    graph_b = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph_b):
-        for _ in range(rounds):
-            calls_in_order()
-    torch.cuda.synchronize()
-    calls = rounds * len(cases)
-
-    def replay_seconds(graph, replays):
-        torch.cuda.synchronize()
-        tp_group.barrier()
-        start = time.perf_counter()
-        for _ in range(replays):
-            graph.replay()
-        torch.cuda.synchronize()
-        return time.perf_counter() - start
-
-    estimate = replay_seconds(graph_b, 2) / 2
-    wanted = torch.tensor(
-        float(max(2, math.ceil(_MIN_TIMED_SECONDS / estimate))), dtype=torch.float32, device=device
-    )
-    dist.all_reduce(wanted, op=dist.ReduceOp.MAX, group=tp_group.device_group)
-    replays = int(wanted.item())
-
-    trials_a, trials_b = [], []
-    for _ in range(_SERVED_TRIALS):
-        trials_a.append(replay_seconds(graph_a, replays) / (replays * calls))
-        trials_b.append(replay_seconds(graph_b, replays) / (replays * calls))
-    medians = torch.tensor(
-        [statistics.median(trials_a) * 1000.0, statistics.median(trials_b) * 1000.0],
-        dtype=torch.float32,
-        device=device,
-    )
-    dist.all_reduce(medians, op=dist.ReduceOp.MAX, group=tp_group.device_group)
-    del graph_a, graph_b
-    pred_ms, total_ms = (float(v) for v in medians.tolist())
-    return total_ms - pred_ms

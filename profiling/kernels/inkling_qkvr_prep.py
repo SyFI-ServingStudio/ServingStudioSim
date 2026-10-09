@@ -22,7 +22,7 @@ below; above, ``_kv_kernel`` on vLLM's ``aux_stream()`` in parallel with
 throughput variant once ``8 * num_tokens`` reaches 8192 rows for ``rel_extent``
 512 or 2048 rows otherwise). The elementwise byte placeholder cannot express it:
 its output is 3.7-6.2x its input, decode is launch-bound, and the fork overlaps
-two streams. One row is one whole call, priced by wall span.
+two streams. One row is one whole call, priced by its kernels' interval union.
 
 Tap source: a decode token reads ``W - 1`` cached taps from the conv-state
 cache, a prefill token reads them from ``qkvr``. The runner times all-decode
@@ -102,9 +102,9 @@ DOC = KernelDoc(
     default_metric="time_ms",
     method=(
         f"{CUPTI_METHOD} One call is captured into a CUDA graph, as production "
-        "runs it, and each graph replay is one launch, priced from its first "
-        "kernel start to its last kernel end on either stream (wall span: the "
-        "streams' overlap counts once, in-graph gaps count), not summed. Before "
+        "runs it, and each graph replay is one launch, priced by the interval "
+        "union of its kernels on both streams (the overlap counts once), not "
+        "summed. Before "
         "timing, q, rel logits, the attention-cache K/V and the conv-cache "
         "writes must match an independent PyTorch reference, with every other "
         "cache slot untouched."

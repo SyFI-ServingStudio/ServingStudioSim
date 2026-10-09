@@ -98,10 +98,10 @@ DOC = KernelDoc(
 )
 
 
-def _lamport_spec(backend: str, function_name: str, summary: str) -> KernelProfilerSpec:
-    return KernelProfilerSpec(
+register(
+    KernelProfilerSpec(
         kernel_kind=KIND,
-        backend=backend,
+        backend="vllm_lamport_triton",
         # BF16 only: rs_sconv_ag_add_norm rejects other dtypes. The Triton
         # kernels do BF16 arithmetic and bit packing (sm_80+); PDL is enabled
         # only from compute capability 9 (lamport.py LamportRSConv.__init__).
@@ -111,7 +111,7 @@ def _lamport_spec(backend: str, function_name: str, summary: str) -> KernelProfi
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.comm.vllm_lamport_triton",
-            function_name=function_name,
+            function_name="profile_rs_sconv_ag_residual_rms_norm_batch",
         ),
         table_name=KIND,
         args_schema=RsSconvAgResidualRmsNormArgs,
@@ -121,27 +121,11 @@ def _lamport_spec(backend: str, function_name: str, summary: str) -> KernelProfi
         subprocess_env="vllm_upstream_fork_env",
         gpu_count_fn=lambda spec: int(spec["num_gpus"]),
         list_native=True,
-        doc=BackendDoc(summary=summary),
-    )
-
-
-register(
-    _lamport_spec(
-        "vllm_lamport_triton",
-        "profile_rs_sconv_ag_residual_rms_norm_batch",
-        "vLLM Inkling's LamportRSConv.rs_sconv_ag_add_norm: four PDL-chained "
-        "Triton launches over torch symmetric memory, run in a real vLLM TP group.",
-    )
-)
-# The same call in the decode-step regime: after a GEMM that writes its input,
-# with per-layer cold buffers and (has_shared) the side-stream sink join. The
-# marginal cost over those predecessors; see the runner's module docstring.
-register(
-    _lamport_spec(
-        "vllm_lamport_triton_served",
-        "profile_rs_sconv_ag_residual_rms_norm_served_batch",
-        "The same vLLM call timed as a decode step runs it: each call follows the "
-        "cuBLAS GEMM that writes its input, owns cold per-layer buffers and, with "
-        "has_shared, joins a side-stream sink GEMM; marginal time over those predecessors.",
+        doc=BackendDoc(
+            summary=(
+                "vLLM Inkling's LamportRSConv.rs_sconv_ag_add_norm: four PDL-chained "
+                "Triton launches over torch symmetric memory, run in a real vLLM TP group."
+            ),
+        ),
     )
 )

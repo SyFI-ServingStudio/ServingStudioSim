@@ -14,15 +14,13 @@ rel-projection kernels run on the current stream
 (``_rel_proj_throughput_kernel`` once ``8 * num_tokens`` reaches 8192 rows for
 ``rel_extent`` 512 or 2048 rows otherwise; ``_rel_proj_low_latency_kernel``
 below), and the current stream joins the side stream. The L1 unit is the whole
-call, priced by its wall span, never the sum of its kernels.
+call, priced by the interval union of its kernels, never their sum.
 
 Production runs this call inside a CUDA graph (FULL graphs for decode, the
 breakable graph for mixed batches up to the 2048-token capture size), so the
 runner captures one call into a CUDA graph and times graph replays: CUPTI
-records each replay's kernels and ``wall_span`` prices the replay from its
-first kernel start to its last kernel end, so the two streams' overlap counts
-once and the in-graph gaps between kernels count too. Eager launches would
-instead price the Python launch gaps of the three Triton calls.
+records each replay's kernels and ``interval_union`` prices the replay so the
+two streams' overlap counts once, as for the other multi-stream callables.
 
 Inputs follow the layer's producer contract: one request per token, each with
 a random earlier context so all ``W - 1`` conv taps come from the conv-state
@@ -477,7 +475,7 @@ def profile_inkling_qkvr_prep_vllm_triton(
         if not (torch.equal(graph_q, q_out) and torch.equal(graph_rel, rel_out)):
             raise KernelLaunchFailed(f"{_BACKEND} CUDA-graph replay differs from the eager call")
 
-        time_ms = Timer.cupti(graph.replay, wall_span=True)
+        time_ms = Timer.cupti(graph.replay, interval_union=True)
         energy_j = Energy.perf(graph.replay, per_iter_time_ms=time_ms)
     except torch.OutOfMemoryError as exc:
         raise OOMError(f"{_BACKEND} ran out of CUDA memory") from exc
