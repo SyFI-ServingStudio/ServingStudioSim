@@ -152,13 +152,6 @@ def execute_profile_batch(
     if prepared_specs:
         require_gpu(f"profiling {len(prepared_specs)} {kernel_kind} spec(s)")
 
-    if pool is None:
-        from profiling.exec import get_default_pool
-
-        selected_pool = get_default_pool()
-    else:
-        selected_pool = pool
-
     # Same backend shares one profiler spec/env; same GPU count shares one
     # acquired chunk shape.
     classified_by_backend_gpu_count: dict[tuple[str, int], list[_PreparedProfileSpec]] = (
@@ -182,6 +175,12 @@ def execute_profile_batch(
     # Identity validation happens once after all chunks finish, before any insert.
     for (backend, gpu_count), classified_specs in classified_by_backend_gpu_count.items():
         profiler_spec = find_kernel_profiler_spec(kernel_kind, backend)
+        if pool is None:
+            from profiling.exec import get_default_pool
+
+            selected_pool = get_default_pool(profiler_spec.supports.device_family)
+        else:
+            selected_pool = pool
         with span("pool.acquire", kind=kernel_kind, backend=backend):
             reserved_chunks = list(
                 selected_pool.acquire_chunks(

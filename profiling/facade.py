@@ -427,11 +427,15 @@ def _resolve_gpu_name(gpu_name: str | None) -> str:
             return str(torch.cuda.get_device_name(0))
     except ImportError:
         pass
-    raise ValueError("gpu_name is required when CUDA is unavailable")
+    from profiling.exec.neuron import current_neuron_name
+
+    try:
+        return current_neuron_name()
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("gpu_name is required when CUDA and Neuron are unavailable") from None
 
 
 def get_current_gpu_name() -> str:
-    """Resolve the current CUDA device's DB gpu_name key. Raises when CUDA is
-    unavailable — callers targeting a non-current or remote GPU must supply the
-    gpu_name explicitly instead of relying on this."""
+    """Resolve a local CUDA or Neuron device's DB key. Callers targeting a
+    different or remote device must supply gpu_name explicitly."""
     return _resolve_gpu_name(None)

@@ -170,6 +170,7 @@ def _host_worker_command(
     # The row's own worker policy (KernelProfilerSpec.worker_env) wins over the
     # inherited environment; the backend-owned variables below win over both.
     env.update(worker_env or {})
+    env["PATH"] = f"{profiler_env.python_executable.parent}{os.pathsep}{env.get('PATH', '')}"
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in gpus)
     env["PYTHONPATH"] = compose_pythonpath(profiler_env, env.get("PYTHONPATH"))
     if profiler_env.additional_library_paths:

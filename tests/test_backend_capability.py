@@ -79,6 +79,7 @@ def test_supported_backends_filters_options_by_dtype():
     # The dry-run `options` column: filter registered backends to a dtype.
     assert supported_backends("single_gemm", DType.FP8_E4M3) == ["deepgemm"]
     assert supported_backends("single_gemm", DType.BF16) == [
+        "neuron_nki_qkv",
         "torch",
         "torch_linear_vllm",
         "torch_linear",

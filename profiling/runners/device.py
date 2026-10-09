@@ -1,11 +1,9 @@
 """The device and runtime checks every runner shares.
 
-Every backend times a CUDA device, and a backend's capability requirement is
-declared once, as its ``BackendSupport`` (``min_compute_capability`` /
-``sm_targets``). The worker checks both against the real device before it
-loads the runner (``unsupported_device``). A runner therefore repeats neither;
-it keeps only checks that depend on the spec's shape, such as which head counts
-a kernel build has on this device.
+Each backend declares its device family and capability requirements in
+``BackendSupport``. The worker checks these against the physical device before
+loading the runner (``unsupported_device``). Runners retain only checks that
+depend on the operation's shape, such as supported head counts.
 
 Loaded only inside the worker subprocess; torch is imported lazily.
 """
@@ -14,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from profiling.db.args import DType
 from profiling.db.registry import BackendSupport
 from profiling.runners.exceptions import ProfilerNotImplemented
 
@@ -49,12 +48,23 @@ def _major_minor(version: object) -> tuple[int, int] | None:
 
 
 def unsupported_device(supports: BackendSupport, label: str) -> str | None:
-    """Why this process's CUDA device 0 cannot run a backend declaring
-    ``supports``, or ``None`` when it can. No CUDA device runs any backend.
+    """Return an error when the physical device cannot run the declared backend.
 
-    Reads the real device rather than resolving the requested GPU name through
-    the catalog, so a GPU the catalog does not know is still checked.
+    Neuron identity comes from neuron-ls; CUDA capability comes from Torch.
+    A requested profile label never substitutes for the physical device.
     """
+    if supports.device_family == "neuron":
+        from profiling.exec.neuron import current_neuron_name
+
+        try:
+            name = current_neuron_name()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return f"Neuron is required for {label}: {exc}"
+        compute = next(iter(supports.compute or (DType.BF16,)))
+        kv = next(iter(supports.kv)) if supports.kv else None
+        if supports.allows(compute, kv, gpu=name):
+            return None
+        return f"{label} does not support {name}"
     try:
         import torch
     except ImportError:

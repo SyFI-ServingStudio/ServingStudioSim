@@ -40,10 +40,10 @@ def test_non_isolated_env_forwards_inherited_path_verbatim():
     )
 
 
-def test_only_the_vllm_upstream_fork_env_is_isolated():
+def test_framework_venvs_cannot_inherit_controller_site_packages():
     isolated = {
         name
         for name, env in ENV_REGISTRY.items()
         if isinstance(env, ProfileEnv) and env.isolated_site_packages
     }
-    assert isolated == {"vllm_upstream_fork_env"}
+    assert isolated == {"vllm_upstream_fork_env", "neuron_env", "neuron_trace_env"}

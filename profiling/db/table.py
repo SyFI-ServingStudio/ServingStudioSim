@@ -21,7 +21,7 @@ from profiling.db import storage
 from profiling.db.args import KernelArgs, field_types
 from profiling.db.kind import KernelKind
 from profiling.db.migrate import SCHEMA_HASH, migrate_connection, require_current
-from profiling.db.registry import KernelProfilerSpec, MetricFamily
+from profiling.db.registry import KernelProfilerSpec, MetricFamily, find_kernel_profiler_spec
 from profiling.runners.metrics import CommMetrics, ComputeMetrics, Metrics
 
 STANDARD_COLUMNS = [
@@ -442,10 +442,19 @@ class Table:
     ) -> list[Any]:
         key = self.db_key(row.args)
         metric_values = _metrics_to_db(row.metrics)
+        # A kind/table can contain both CUDA and Neuron backends. Controller
+        # CUDA defaults apply only to this row's registered execution family.
+        profiler_spec = self.profiler_spec
+        if row.backend != profiler_spec.backend:
+            profiler_spec = find_kernel_profiler_spec(profiler_spec.kernel_kind, row.backend)
+        cuda_version, driver_version = row.cuda_version, row.driver_version
+        if profiler_spec.supports.device_family == "cuda":
+            cuda_version = cuda_version or _cuda_version()
+            driver_version = driver_version or _driver_version()
         provenance = (
             row.profiler_git_hash or default_git_hash,
-            row.cuda_version or _cuda_version(),
-            row.driver_version or _driver_version(),
+            cuda_version,
+            driver_version,
             row.backend_version or _backend_version(row.backend),
         )
         return [

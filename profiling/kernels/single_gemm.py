@@ -9,13 +9,14 @@ Wire string: ``"single_gemm"`` — matches Rust ``KernelSpec::KIND`` in
 by ``profiling.facade`` to generate ``get_single_gemm_times`` /
 ``count_missing_single_gemm``.
 
-Seven backends share this kind/table/schema: ``torch`` (contiguous-RHS
+Eight backends share this kind/table/schema: ``torch`` (contiguous-RHS
 ``torch.mm``), ``torch_linear`` (model-weight-layout ``F.linear`` in the main
 environment), ``torch_linear_vllm`` (the same expression in vLLM's pinned
 environment), ``sglang_bf16_auto`` and ``sglang_fused_a_auto`` (SGLang's
 production BF16 dispatches, SM100 only), ``deepgemm`` (FP8 dense GEMM,
 ``dtype = fp8_e4m3``), and ``flashinfer_mxfp8`` (MXFP8 dense linear:
-activation quant + FlashInfer CuTe-DSL block-scaled GEMM, ``dtype = mxfp8_e4m3``).
+activation quant + FlashInfer CuTe-DSL block-scaled GEMM, ``dtype = mxfp8_e4m3``),
+and ``neuron_nki_qkv`` (BF16 public NxDI QKV pure matmul on Trainium2 LNC2).
 BF16/FP16 model defaults offer both generic Torch variants and the timing cache
 selects the faster one per shape.
 
@@ -77,15 +78,47 @@ DOC = KernelDoc(
         "flashinfer_mxfp8 takes bf16 activations and includes their MXFP8 "
         "quantization in the time; its GB/s adds the bf16 read and the "
         "quantized write of the activation.",
+        "neuron_nki_qkv times one LNC2 unit; energy sampling is unavailable and energy_j is zero.",
+        "neuron_nki_qkv supports the verified TKG path with 1..96 rows; CTE is unavailable.",
     ),
     method=(
         f"{CUPTI_METHOD} The torch and SGLang backends count overlapping launches "
         "once, by the time the GPU is busy, because Blackwell can split one logical "
         "GEMM into several; deepgemm and flashinfer_mxfp8 sum their launches "
-        "(flashinfer_mxfp8 autotunes the call once before timing)."
+        "(flashinfer_mxfp8 autotunes the call once before timing). Neuron uses "
+        "the median native device interval union across both physical cores, "
+        "with an independent BF16 matmul check outside timing."
     ),
     # torch.mm is its own reference: the torch backend measures exactly it.
     reference=None,
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="neuron_nki_qkv",
+        # Public NxDI QKV kernel with norm, residual, bias and RoPE disabled;
+        # NKI [2] runs on the physical pair within a Trainium2 LNC2 unit.
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            device_family="neuron",
+            architectures=frozenset({"Trainium2"}),
+        ),
+        runner_ref=RunnerRef("profiling.runners.neuron.dense", "profile_single_gemm"),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="neuron_env",
+        doc=BackendDoc(
+            summary=(
+                "AWS NKI QKV pure-matmul specialization on LNC2, timed by native "
+                "device interval union; input [1,m,k], weight [k,n]."
+            ),
+            url="https://github.com/aws-neuron/nki-library/blob/2.32_release/src/nkilib_src/nkilib/core/qkv/qkv.py",
+        ),
+    )
 )
 
 

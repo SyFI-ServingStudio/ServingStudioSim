@@ -33,7 +33,7 @@ without a database, and why the cache can be reorganized without touching kernel
 | `get_<kind>_times(specs, *, backend, gpu_name=None, force=False)` | Batch query: cached `Metrics` per spec, or `MissingEntry` on a miss. |
 | `count_missing_<kind>(specs, *, backend, gpu_name=None)` | Read-only dry run: how many specs are not cached. Never profiles. |
 | `enable_jit_profiling()` / `disable_jit_profiling()` | Process-wide toggle: may a cache miss trigger a real GPU run? |
-| `get_current_gpu_name()` | Resolve the CUDA device-0 name used as the DB key. |
+| `get_current_gpu_name()` | Resolve the physical accelerator name used as the DB key. |
 | `get_db_metadata()` / `get_profiler_versions(...)` | Schema + provenance for run manifests. |
 
 The `get_<kind>_times` / `count_missing_<kind>` names are **generated** — one
@@ -46,6 +46,52 @@ backend=, gpu_name=)`, deriving the function name with `format!("get_{kind}_time
 This is why `KernelKind` strings must match exactly across the boundary (below).
 
 **Required from below** (only paid when an actual measurement happens):
+
+The requirements below describe CUDA backends. Neuron backends use
+`exec/neuron.py` for physical discovery and whole-chip reservation, isolated
+Neuron interpreters, and the native LNC2 timer in `profilers/neuron_timer.py`.
+Backend metadata routes each device family to its executor; a CUDA backend
+cannot profile a Neuron target. See [Trainium2 support](../doc/trainium2.md) for
+the supported boundaries, setup and measurement contract.
+
+Neuron rows can also declare a `ContainerProfileEnv` with an approved immutable
+local image ID/digest, explicit `docker_command` argv prefix, local absolute
+`unix://` `docker_host`, and an absolute image-owned `python_executable`. Setup
+provides these values; the executor does not build/pull images or start Docker.
+The existing two-argument CUDA declarations retain their defaults. No final
+whole-forward container backend is registered by this infrastructure.
+
+`exec/neuron.py` keeps the host whole-chip lock through image inspection, worker
+execution and result validation. It maps the selected `/dev/neuronN` without
+renumbering, exposes one reserved LNC2 logical core, and runs the JSON worker
+offline as the invoking nonroot user. Worktree mode mounts that request's
+`profiling/`, `gpu/` and `tools/` read-only at their original paths; image source
+mode requires a future approved source-snapshot contract. Explicit
+`SERVINGSTUDIO_NXDI_MODEL_DIR`, `SERVINGSTUDIO_NXDI_COMPILED_DIR` and
+`SERVINGSTUDIO_NXDI_COMPILER_WORKDIR` directories are mounted read-only and are
+required for whole-forward container requests. `SERVINGSTUDIO_NEURON_PROFILE_CACHE_DIR`
+selects a writable cache; its default is a dedicated subtree of workspace
+`TMPDIR`. Cache/exchange/timeline mounts must not overlap source, data or the
+Docker socket. The image owns Python and native library paths.
+
+Before loading a runner, the worker compares the reservation payload and exact
+visibility with its own `neuron-ls` observation. Worker provenance includes SDK,
+Torch/NumPy/ml-dtypes and RPM or Ubuntu dpkg runtime versions. The controller
+appends inspected image identity and installed host driver-package version to
+existing row fingerprints. These observations establish execution provenance;
+full-model numerical acceptance and native timing remain separate gates.
+
+The stock `neuron_dense_mlp/vllm_neuron` backend uses the same immutable
+`vllm_neuron_env` with one reserved LNC2 unit. Set
+`SERVINGSTUDIO_VLLM_NEURON_MODEL_DIR` to the original Llama 3.1 8B checkpoint;
+the executor mounts it read-only. It measures the public rank-local fused MLP
+at BF16 H4096/I3584 and rows 1, 16 or 512. An independent FP32 oracle must pass
+relative L2 <=0.02 and peak error/reference peak <=0.05 before timing. Artifacts
+under `SERVINGSTUDIO_NEURON_PROFILE_CACHE_DIR/mlp-runs/` retain inputs, outputs,
+source/package identities, compiler artifacts and 20 complete native executions.
+The median unions both physical cores; copies, compilation and warmup are
+excluded. These component rows exclude collectives, norm, residual and bias;
+they do not establish full-forward additivity.
 
 - One or more **idle GPUs** (`exec/local.py:find_idle_gpus` reads `nvidia-smi`).
   Host workers receive those indices through `CUDA_VISIBLE_DEVICES`; container

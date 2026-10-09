@@ -514,6 +514,28 @@
       "nvl_domain_size": null,
       "dollar_per_hour": null,
       "notes": "BF16 and FP8 have same peak TFLOPS by design. Not listed on getdeploying at the as_of date."
+    },
+    {
+      "name": "Trainium2-LNC2",
+      "aliases": ["AWS Trainium2 LNC2"],
+      "vendor": "AWS",
+      "architecture": "Trainium2",
+      "compute_capability": null,
+      "year": 2024,
+      "mem_size_gb": null,
+      "mem_type": "HBM3",
+      "mem_bandwidth_gbps": 725,
+      "fp16_tflops": 158,
+      "fp8_tflops": null,
+      "bf16_tflops": 158,
+      "fp32_tflops": null,
+      "int8_tops": null,
+      "tdp_watts": null,
+      "interconnect": "NeuronLink",
+      "interconnect_bandwidth_gbps": null,
+      "nvl_domain_size": null,
+      "dollar_per_hour": null,
+      "notes": "One logical LNC2 unit combines two physical NC-v3 Tensor Engines: dense BF16/FP16 peak = 2 x 79 = 158 TFLOPS (https://awsdocs-neuron.readthedocs-hosted.com/en/v2.27.0/about-neuron/arch/neuron-hardware/neuron-core-v3.html). HBM bandwidth 725 GB/s is a nominal equal-bank analysis estimate: published chip 2.9 TB/s divided among four 24GB banks, each shared by one core pair; AWS does not independently publish or guarantee this unit rate (https://awsdocs-neuron.readthedocs-hosted.com/en/v2.27.0/about-neuron/arch/neuron-features/logical-neuroncore-config.html and https://awsdocs-neuron.readthedocs-hosted.com/en/v2.27.0/about-neuron/arch/neuron-hardware/trainium2.html). Roofline/R6/R7 results depend on that bandwidth assumption; it is not measured timing. Physical-core intervals are unioned per invocation. Capacity comes from neuron-ls; price and whole-chip heterogeneous compute peaks are not assigned to this unit."
     }
   ]
 }

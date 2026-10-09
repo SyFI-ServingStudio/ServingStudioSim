@@ -8,6 +8,7 @@ import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
@@ -77,12 +78,45 @@ class ContainerProfileEnv:
 
     name: str
     image: str
+    docker_command: tuple[str, ...] = ("docker",)
+    docker_host: str | None = None
+    # An image-owned path; never resolve/stat it in the controller's filesystem.
+    python_executable: Path | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.docker_command, str):
+            raise TypeError("docker_command must be an argv tuple, not a shell string")
+        object.__setattr__(self, "docker_command", tuple(self.docker_command))
+        if not self.docker_command or any(
+            not isinstance(value, str) or not value for value in self.docker_command
+        ):
+            raise ValueError("docker_command must contain nonempty argv strings")
+        if self.docker_host is not None:
+            address = urlparse(self.docker_host)
+            if (
+                not self.docker_host.startswith("unix://")
+                or address.scheme != "unix"
+                or address.netloc
+                or not Path(address.path).is_absolute()
+                or address.query
+                or address.fragment
+            ):
+                raise ValueError("docker_host must be a local absolute unix:// socket URI")
+        if self.python_executable is not None:
+            path = Path(self.python_executable)
+            if not path.is_absolute():
+                raise ValueError("container Python executable must be absolute inside the image")
+            object.__setattr__(self, "python_executable", path)
 
     def validate(self) -> None:
         if not self.image:
             raise ValueError(f"profiling env {self.name!r} has no container image")
-        if shutil.which("docker") is None:
-            raise FileNotFoundError("docker is required for container profiling")
+        if shutil.which(self.docker_command[0]) is None:
+            raise FileNotFoundError(
+                f"container profiling executable is unavailable: {self.docker_command[0]}"
+            )
+        if self.docker_host is not None and not Path(urlparse(self.docker_host).path).is_socket():
+            raise FileNotFoundError(f"container Docker socket is unavailable: {self.docker_host}")
 
 
 _PROFILE_ENVS_ROOT = Path.home() / "profile_envs"
@@ -118,7 +152,39 @@ def _default_python() -> Path:
 
 
 ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
+    "vllm_neuron_env": ContainerProfileEnv(
+        "vllm_neuron_env",
+        "sha256:44d2eef799027b5c925af25a1ad9f45a93aae07451bdf9c02857ec8a7635a24a",
+        ("sudo", "-n", "docker"),
+        os.environ.get(
+            "SERVINGSTUDIO_NEURON_DOCKER_HOST",
+            f"unix://{_PROJECT_ROOT.parent / 'tmp/trn2-docker/docker.sock'}",
+        ),
+        Path("/opt/conda/bin/python"),
+    ),
     "default_env": ProfileEnv("default_env", _default_python()),
+    "neuron_env": ProfileEnv(
+        "neuron_env",
+        Path(
+            os.environ.get(
+                "SERVINGSTUDIO_NEURON_PYTHON",
+                _PROJECT_ROOT / ".venv-neuron" / "bin" / "python",
+            )
+        ),
+        additional_library_paths=(Path("/opt/aws/neuron/lib"),),
+        isolated_site_packages=True,
+    ),
+    "neuron_trace_env": ProfileEnv(
+        "neuron_trace_env",
+        Path(
+            os.environ.get(
+                "SERVINGSTUDIO_NEURON_TRACE_PYTHON",
+                _PROJECT_ROOT / ".venv-neuron-trace" / "bin" / "python",
+            )
+        ),
+        additional_library_paths=(Path("/opt/aws/neuron/lib"),),
+        isolated_site_packages=True,
+    ),
     # Most profilers should stay on default_env via subprocess_env=None. In this
     # repo, default_env is the uv-managed project .venv when it exists.
     # Add or use a named env only for real import/linker/dependency isolation.

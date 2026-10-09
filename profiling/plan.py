@@ -244,6 +244,7 @@ def issue(
 
     from profiling.db.batch import execute_profile_batch
     from profiling.exec.local import LocalGpuPool
+    from profiling.exec.neuron import LocalNeuronPool
 
     report = IssueReport()
     units = collector.units()
@@ -251,11 +252,17 @@ def issue(
     report.specs = sum(unit.size for unit in units)
 
     def run(unit: WorkUnit, assigned: list[int]) -> None:
+        spec = find_kernel_profiler_spec(unit.kernel_kind, unit.backend)
+        pool = (
+            LocalNeuronPool(devices=assigned)
+            if spec.supports.device_family == "neuron"
+            else LocalGpuPool(gpus=assigned)
+        )
         with span("unit.run", kind=unit.kernel_kind, backend=unit.backend, specs=unit.size):
             outcome = execute_profile_batch(
                 unit.kernel_kind,
                 [dict(spec, backend=unit.backend) for spec in unit.specs],
-                pool=LocalGpuPool(gpus=assigned),
+                pool=pool,
                 db_path=db_path,
                 gpu_name=unit.gpu_name if unit.gpu_name is not None else gpu_name,
             )

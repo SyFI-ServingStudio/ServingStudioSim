@@ -53,29 +53,59 @@ DOC = KernelDoc(
         "fuses in. Models use it wherever a tensor is normalized alone, for "
         "example before the attention projections. The input has m token rows "
         "of hidden features; input and weight are random normal. ε is 1e-6 "
-        "for flashinfer and 1e-5 for vllm_cuda."
+        "for flashinfer and 1e-5 for vllm_cuda and neuron_torch_rms."
     ),
     category="Normalization",
     subcategory="RMSNorm",
     formula=(
         "y = x / √(mean(x²) + ε) · weight, per token",
         "flashinfer: TFLOPS = 5·m·hidden / time; GB/s = 2·m·hidden·bytes per element / time",
-        "vllm_cuda: TFLOPS = (4·m·hidden + 2·m) / time; "
+        "vllm_cuda and neuron_torch_rms: TFLOPS = (4·m·hidden + 2·m) / time; "
         "GB/s = (2·m·hidden + hidden)·bytes per element / time",
     ),
     default_metric="memory_bandwidth_gbps",
     method=(
         f"{CUPTI_METHOD} Only the norm kernel is counted: RMSNormKernel for "
         "flashinfer, rms_norm_kernel for vllm_cuda. vllm_cuda checks one output "
-        "against a PyTorch RMSNorm before timing."
+        "against a PyTorch RMSNorm before timing. Neuron times the compiled "
+        "CustomRMSNorm expression, including its FP32 promotion and BF16 return, "
+        "using the median native device interval union on one LNC2 unit."
     ),
     caveats=(
         "The backends count work differently: flashinfer's GB/s leaves out the "
         "weight read and its TFLOPS assumes 5 operations per element; vllm_cuda "
         "counts the weight read and 4 operations per element plus 2 per row.",
+        "Neuron uses the same logical work/operand formulas as vllm_cuda; "
+        "internal cast traffic is excluded. Energy sampling is unavailable and energy_j is zero.",
     ),
     # No separate PyTorch reference implementation exists for this kind.
     reference=None,
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="neuron_torch_rms",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            device_family="neuron",
+            architectures=frozenset({"Trainium2"}),
+        ),
+        runner_ref=RunnerRef("profiling.runners.neuron.rms_norm", "profile_rms_norm"),
+        table_name=KIND,
+        args_schema=RmsNormArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="neuron_trace_env",
+        doc=BackendDoc(
+            summary=(
+                "NxDI CustomRMSNorm's public RmsNorm.apply, compiled for LNC2; "
+                "FP32 input promotion, epsilon1e-5, BF16 output, native device interval union."
+            ),
+            url="https://github.com/aws-neuron/neuronx-distributed-inference/blob/main/src/neuronx_distributed_inference/modules/custom_calls.py",
+        ),
+    )
 )
 
 

@@ -21,7 +21,7 @@ from profiling.db.args import DType, KernelArgs
 from profiling.db.doc import BackendDoc
 from profiling.db.kind import KernelKind
 from profiling.db.outlier import BatchOutlierPolicy
-from profiling.gpu_catalog import gpu_compute_capability
+from profiling.gpu_catalog import gpu_compute_capability, resolve_gpu_spec
 from profiling.runners.metrics import Metrics, RunnerResult
 
 ProfileFn = Callable[..., Metrics]
@@ -121,6 +121,10 @@ class BackendSupport:
     kv: frozenset[DType] | None = None
     min_compute_capability: tuple[int, int] | None = None
     sm_targets: frozenset[str] | None = None
+    # Neuron ISA generations are independent of CUDA SM versions. Existing
+    # backends stay CUDA; a Neuron row explicitly declares its execution family.
+    device_family: str = "cuda"
+    architectures: frozenset[str] | None = None
 
     def allows(
         self,
@@ -134,6 +138,14 @@ class BackendSupport:
             return False
         if gpu is None:
             return True
+        spec = resolve_gpu_spec(gpu)
+        if spec is not None:
+            if spec.device_family != self.device_family:
+                return False
+            if self.architectures is not None and spec.architecture not in self.architectures:
+                return False
+        elif self.device_family == "neuron":
+            return False
         return self.allows_compute_capability(gpu_compute_capability(gpu))
 
     def allows_compute_capability(self, capability: tuple[int, int] | None) -> bool:
@@ -185,6 +197,10 @@ class KernelProfilerSpec:
     # spec. When False (the default) the single-spec runner is wrapped by
     # ``batched`` to satisfy the same contract.
     list_native: bool = False
+    # Neuron reserves a whole chip even for a single logical core. TP forward
+    # backends request their actual logical-core span without treating ranks as
+    # separate physical GPUs in gpu_count_fn.
+    neuron_logical_cores: int = 1
     # Environment variables the execution backend sets on this row's worker
     # process, on top of the inherited environment. For measurement policy that
     # must hold before the framework is imported and that a runner therefore
@@ -296,6 +312,21 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
         # An empty dtype set means "supports nothing", which is never intended —
         # dtype-agnostic axes use `None`.
         supports = profiler_spec.supports
+        if (
+            type(profiler_spec.neuron_logical_cores) is not int
+            or profiler_spec.neuron_logical_cores < 1
+        ):
+            raise ValueError("neuron_logical_cores must be a positive integer")
+        if supports.device_family != "neuron" and profiler_spec.neuron_logical_cores != 1:
+            raise ValueError("only Neuron backends can reserve multiple logical cores")
+        if supports.device_family not in {"cuda", "neuron"}:
+            raise ValueError(f"unknown device family {supports.device_family!r}")
+        if supports.device_family == "neuron" and (
+            supports.min_compute_capability is not None or supports.sm_targets is not None
+        ):
+            raise ValueError("Neuron backends must use architecture rules, not CUDA SM rules")
+        if supports.architectures is not None and not supports.architectures:
+            raise ValueError("empty architecture set supports no device")
         for axis, allowed in (("compute", supports.compute), ("kv", supports.kv)):
             if allowed is not None and not allowed:
                 raise ValueError(

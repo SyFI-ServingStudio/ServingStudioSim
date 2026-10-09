@@ -141,6 +141,7 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "sglang_fused_a_auto",
         "deepgemm",
         "flashinfer_mxfp8",
+        "neuron_nki_qkv",
     }
 
 
@@ -1531,7 +1532,7 @@ def test_run_profile_batch_rejects_invalid_gpu_count():
         )
 
 
-def test_documented_profile_env_registry_complete():
+def test_documented_profile_env_registry_complete(monkeypatch):
     expected_envs = {
         "default_env",
         "flashinfer_pip_env",
@@ -1539,6 +1540,9 @@ def test_documented_profile_env_registry_complete():
         "sglang_env",
         "vllm_env",
         "vllm_upstream_fork_env",
+        "neuron_env",
+        "neuron_trace_env",
+        "vllm_neuron_env",
     }
     assert set(ENV_REGISTRY) == expected_envs
     assert (
@@ -1548,6 +1552,8 @@ def test_documented_profile_env_registry_complete():
     vllm_env = ENV_REGISTRY["vllm_env"]
     assert isinstance(vllm_env, ContainerProfileEnv)
     assert vllm_env.image == "vibesim-profiler-vllm:cu130-3f667d7e"
+    # Registry validation is a CPU check; it does not launch a container.
+    monkeypatch.setattr(exec_env.shutil, "which", lambda executable: "/usr/bin/docker")
     vllm_env.validate()
     # The fork env resolves Torch's CUDA runtime from its own venv first.
     fork_env = ENV_REGISTRY["vllm_upstream_fork_env"]

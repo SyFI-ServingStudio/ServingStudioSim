@@ -11,6 +11,7 @@ kernel kind owns its Python wire format and registry presence.
 """
 
 from profiling.kernels import (
+    neuron_llama_forward,  # noqa: F401
     all_reduce,  # noqa: F401
     all_reduce_fusion,  # noqa: F401
     all_reduce_residual_rms_norm,  # noqa: F401
@@ -70,6 +71,9 @@ from profiling.kernels import (
     moe_sum,  # noqa: F401
     moe_topk_softplus_sqrt,  # noqa: F401
     mxfp4_marlin_moe_gemm,  # noqa: F401
+    neuron_dense_mlp,  # noqa: F401
+    neuron_embedding,  # noqa: F401
+    neuron_llama_decoder,  # noqa: F401
     nvfp4_fused_moe,  # noqa: F401
     nvfp4_quant,  # noqa: F401
     p2p_inter,  # noqa: F401

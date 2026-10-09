@@ -13,6 +13,8 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -52,6 +54,18 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
     if "energy" in worker_request:
         set_energy_enabled(bool(worker_request["energy"]))
 
+    observed_neuron = None
+    execution = worker_request.get("execution")
+    if profiler_spec.supports.device_family == "neuron":
+        if worker_request.get("energy") or worker_request.get("measure") is not None:
+            raise ValueError("Neuron workers do not support energy or CUPTI measure requests")
+        if execution is not None:
+            from profiling.exec.neuron import observe_neuron_reservation
+
+            observed_neuron = observe_neuron_reservation(execution)
+    elif execution is not None:
+        raise ValueError("Neuron reservation payload cannot execute a CUDA backend")
+
     # An optional `measure` block turns this run into the trend+telemetry probe:
     # the context makes the shared Timer.cupti seam capture per-launch durations
     # instead of a single mean, without touching the runner. Absent block → the
@@ -88,8 +102,16 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
     finally:
         if measure_context is not None:
             clear_measure_context()
-    gpu_name = _current_gpu_name()
-    runtime_versions = _runtime_versions(backend)
+    if profiler_spec.supports.device_family == "neuron":
+        from profiling.exec.neuron import current_neuron_name
+
+        gpu_name = (
+            observed_neuron.gpu_name if observed_neuron is not None else current_neuron_name()
+        )
+        runtime_versions = _neuron_versions()
+    else:
+        gpu_name = _current_gpu_name()
+        runtime_versions = _runtime_versions(backend)
     row_provenance = profiler_spec.load_row_provenance()
     worker_results = [
         _to_payload(
@@ -196,6 +218,58 @@ def _runtime_versions(backend: str) -> dict[str, str | None]:
         "cuda_version": str(torch.version.cuda) if torch.version.cuda else None,
         "backend_version": backend_version,
     }
+
+
+def _neuron_versions() -> dict[str, str | None]:
+    versions = []
+    for package in (
+        "torch",
+        "numpy",
+        "ml-dtypes",
+        "nki",
+        "nki-library",
+        "neuronx-cc",
+        "torch-neuronx",
+        "torch-xla",
+        "islpy",
+        "neuronx-distributed",
+        "neuronx-distributed-inference",
+    ):
+        try:
+            versions.append(f"{package}={importlib.metadata.version(package)}")
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    if shutil.which("rpm"):
+        packages = (
+            "aws-neuronx-dkms",
+            "aws-neuronx-runtime-lib",
+            "aws-neuronx-collectives",
+            "aws-neuronx-tools",
+        )
+        result = subprocess.run(
+            ["rpm", "-q", "--queryformat", "%{NAME}=%{VERSION}-%{RELEASE}\\n", *packages],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            versions.extend(result.stdout.splitlines())
+    elif shutil.which("dpkg-query"):
+        result = subprocess.run(
+            [
+                "dpkg-query",
+                "--show",
+                "--showformat=${binary:Package}=${Version}\n",
+                "aws-neuronx-runtime-lib",
+                "aws-neuronx-collectives",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            versions.extend(result.stdout.splitlines())
+    return {"cuda_version": None, "backend_version": "; ".join(versions) or None}
 
 
 def main(argv: list[str] | None = None) -> int:

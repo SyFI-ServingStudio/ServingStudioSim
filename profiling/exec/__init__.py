@@ -27,9 +27,15 @@ def set_default_pool(pool: GpuPool | None) -> None:
     _default_pool = pool
 
 
-def get_default_pool() -> GpuPool:
+def get_default_pool(device_family: str = "cuda") -> GpuPool:
     if _default_pool is not None:
         return _default_pool
+    if device_family == "neuron":
+        from profiling.exec.neuron import LocalNeuronPool
+
+        return LocalNeuronPool()
+    if device_family != "cuda":
+        raise ValueError(f"unknown profiling device family: {device_family}")
     # Escape hatch: VIBESIM_PROFILE_GPUS=0,1,2,3 forces profiling onto an explicit
     # GPU set, bypassing the idle-GPU guard (find_idle_gpus). Use only when you
     # know those GPUs are yours to use — it will profile regardless of other jobs'

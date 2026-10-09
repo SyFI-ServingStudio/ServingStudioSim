@@ -81,8 +81,10 @@ def issue_collected(expected_specs: int | None = None) -> None:
     Raises when a unit could not run, for the same reason.
     """
 
+    from profiling.db.registry import find_kernel_profiler_spec
     from profiling.exec import get_default_pool
     from profiling.exec.local import LocalGpuPool, find_idle_gpus
+    from profiling.exec.neuron import LocalNeuronPool
     from profiling.gpu_policy import require_gpu
     from profiling.plan import issue, set_collector
 
@@ -114,8 +116,17 @@ def issue_collected(expected_specs: int | None = None) -> None:
         return
     require_gpu(f"measuring {recorded} missing profile.db spec(s)")
 
-    pool = get_default_pool()
-    gpus = pool.gpus if isinstance(pool, LocalGpuPool) and pool.gpus else find_idle_gpus()
+    families = {
+        find_kernel_profiler_spec(unit.kernel_kind, unit.backend).supports.device_family
+        for unit in collector.units()
+    }
+    if len(families) != 1:
+        raise RuntimeError("a profiling fill must target one accelerator family")
+    pool = get_default_pool(families.pop())
+    if isinstance(pool, LocalNeuronPool):
+        gpus = [device.device_id for device in pool.idle_devices()]
+    else:
+        gpus = pool.gpus if isinstance(pool, LocalGpuPool) and pool.gpus else find_idle_gpus()
     if not gpus:
         raise RuntimeError("no GPUs available to issue the collected profiling work")
 

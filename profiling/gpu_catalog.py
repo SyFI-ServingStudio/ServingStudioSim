@@ -67,6 +67,12 @@ class GpuSpecResolution:
     interconnect_bandwidth_gbps: float | None = None
     # CUDA ``(major, minor)``; ``None`` for a non-NVIDIA part.
     compute_capability: tuple[int, int] | None = None
+    vendor: str | None = None
+    architecture: str | None = None
+
+    @property
+    def device_family(self) -> str:
+        return "neuron" if self.vendor == "AWS" else "cuda"
 
     @property
     def interconnect_one_way_gbps(self) -> float | None:
@@ -144,6 +150,8 @@ def resolve_gpu_spec(name: str, root: Path | None = None) -> GpuSpecResolution |
             interconnect=_string_or_none(gpu, "interconnect"),
             interconnect_bandwidth_gbps=_number(gpu, "interconnect_bandwidth_gbps"),
             compute_capability=_compute_capability(gpu),
+            vendor=_string_or_none(gpu, "vendor"),
+            architecture=_string_or_none(gpu, "architecture"),
         )
     return None
 
