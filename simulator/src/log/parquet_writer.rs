@@ -49,6 +49,15 @@ fn writer_properties(
         .build())
 }
 
+/// Arrow bytes a row group may take in before it is written out. The writer
+/// otherwise closes a row group only at 1M rows, which a cost log never reaches,
+/// and it buffers each finished page in a `Vec` sized to the page's
+/// *uncompressed* bytes: an 8 h PP8 run held every stage's whole cost log at
+/// its uncompressed size (~4 GB a stage) until the run ended. The input batches'
+/// Arrow size bounds that, where the writer's own `in_progress_size` counts the
+/// compressed bytes, ~11x fewer for `slot_input`.
+const ROW_GROUP_FLUSH_BYTES: usize = 64 << 20;
+
 /// Appends record batches to one parquet file. The file (and its parent dir)
 /// is created on the first non-empty `write`, so a stream that never produces a
 /// row leaves no file behind.
@@ -57,6 +66,8 @@ pub struct StreamingParquetWriter {
     schema: Arc<Schema>,
     writer: Option<ArrowWriter<File>>,
     rows_written: usize,
+    /// Arrow bytes written since the last row group closed.
+    unflushed_bytes: usize,
     /// Parquet dictionary encoding — on by default (best on-disk size for the
     /// low-cardinality cost/kv streams). A high-volume, low-cardinality-string
     /// stream (the net log) turns it off via [`Self::with_dictionary_enabled`] to
@@ -81,6 +92,7 @@ impl StreamingParquetWriter {
             schema,
             writer: None,
             rows_written: 0,
+            unflushed_bytes: 0,
             dictionary_enabled: true,
             statistics_enabled: true,
             no_dictionary_columns: Vec::new(),
@@ -183,6 +195,11 @@ impl StreamingParquetWriter {
             return Ok(0);
         }
         self.writer_mut()?.write(batch)?;
+        self.unflushed_bytes += batch.get_array_memory_size();
+        if self.unflushed_bytes >= ROW_GROUP_FLUSH_BYTES {
+            self.writer_mut()?.flush()?;
+            self.unflushed_bytes = 0;
+        }
         self.rows_written += num_rows;
         Ok(num_rows)
     }
