@@ -44,6 +44,40 @@ bytes exceeding the independent minimum at every checked iteration. The diagnost
 remains visible; it does not establish missing work or negative redundancy.
 Non-contraction and intermediate work are still omitted from the estimates.
 
+### Model/head region composition (experimental)
+
+Set `composition: model_head_regions` on `llama3_vllm_neuron` to cost each
+iteration as two measured `neuron_llama_region/vllm_neuron_fx_regions` leaves.
+The profiler splits the stock FX graph at the public `LlamaModel.forward` return
+and compiles both parts with the stock backend and original flags. Every stock
+operation is kept unchanged. The `model` region holds the embedding, all 32
+layers, the final norm, the SP gather and all 64 KV updates. The `head` region
+holds row selection, `lm_head`, the logit all-gather and greedy sampling. Each
+profiling run must pass four gates before it writes rows:
+
+1. The structural partition proof holds for every rank and shape.
+2. The unchanged vendor full-logit check passes on both the split and the stock
+   engine.
+3. The split is equivalent to stock: every case generates the same tokens, and
+   RMS(split−FP32) ≤ 1.10 × RMS(stock−FP32) per case.
+4. Per shape, the model and head medians sum to within 5% of the stock
+   whole-forward median measured in the same run.
+
+The first run passed all four gates. Logits were bit-identical in 22 of 24
+cases; the two that differ change at one position each, with a worst error
+ratio of 1.0000018. The region sums differed from the whole forward by −0.31%
+(prefill512), +1.76% (decode1) and +0.25% (decode16). An earlier
+HF-relative hidden-state gate is not used, because unsplit stock also fails it.
+The split reproduces the stock output, which is what this gate needs to show.
+
+The scope is C512 with decode buckets [1,16] only. Use
+`presets/predict_llama3_8b_vllm_neuron_regions.json` and
+`presets/unified_llama3_8b_vllm_neuron_regions.yaml`. Rows live in the private
+`$TMPDIR/neuron-region-smoke/profile.db`, which also holds the whole-forward
+rows. The `llama3-vllm-neuron-regions-v1` work map assigns `lm_head` to the head
+region and all remaining semantics to the model region. Whole-forward costing
+remains the default.
+
 ## Earlier NxDI TP1 path and experiment history
 
 The sections below preserve the separate NxDI implementation and its numerical

@@ -3,7 +3,15 @@
 //! All layers, communication and greedy sampling are inside one measured
 //! executable. Its time already spans all ranks; work estimates are per rank.
 //! The configured bucket inventory is explicit, not the stock default inventory.
+//!
+//! The experimental `model_head_regions` composition costs the same stock
+//! operations compiled as two executables split at the `LlamaModel` return:
+//! the model region (embedding, layers, final norm, KV updates) then the head
+//! region (vocabulary projection, logit collectives and sampling). Its rows are
+//! accepted only when the split reproduces unsplit stock logits and the region
+//! sum stays within 5% of the whole-forward time.
 
+use crate::arch::config::VllmNeuronComposition;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::model_cfg::ModelCfg;
 use crate::op::Op;
@@ -12,7 +20,8 @@ use crate::timing::kernels::engine::KernelSpec;
 use crate::timing::kernels::neuron_llama_forward::NeuronLlamaForwardSpec;
 use crate::timing::kernels::{
     NeuronLlamaForwardKernel, NeuronLlamaForwardKernelConfig, NeuronLlamaForwardKernelInput,
-    NeuronLlamaForwardPhase,
+    NeuronLlamaForwardPhase, NeuronLlamaRegion, NeuronLlamaRegionKernel,
+    NeuronLlamaRegionKernelConfig, NeuronLlamaRegionKernelInput,
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
@@ -27,21 +36,33 @@ pub struct VllmNeuronParallel {
     pub max_model_len: u32,
     pub decode_buckets: Vec<u32>,
     pub tp_size: u16,
+    pub composition: VllmNeuronComposition,
 }
 
 pub struct Llama3VllmNeuronConfigs {
     pub forward: NeuronLlamaForwardKernelConfig,
+    pub composition: VllmNeuronComposition,
 }
 
 pub struct Llama3VllmNeuronResolved {
     pub forward: NeuronLlamaForwardKernelConfig,
+    pub composition: VllmNeuronComposition,
+}
+
+/// The measured executables one iteration runs, in execution order.
+pub enum VllmNeuronLeaves {
+    WholeForward(Op<NeuronLlamaForwardKernel>),
+    ModelHeadRegions {
+        model: Op<NeuronLlamaRegionKernel>,
+        head: Op<NeuronLlamaRegionKernel>,
+    },
 }
 
 pub struct Llama3VllmNeuronModel {
     pub name: String,
     pub max_model_len: u32,
     pub decode_buckets: Vec<u32>,
-    pub forward: Op<NeuronLlamaForwardKernel>,
+    pub leaves: VllmNeuronLeaves,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -79,12 +100,14 @@ pub fn build_configs(model: &ModelCfg, parallel: &VllmNeuronParallel) -> Llama3V
             dtype: model.dtype,
             decode_buckets: parallel.decode_buckets.clone(),
         },
+        composition: parallel.composition,
     }
 }
 
 pub fn resolve_configs(cfgs: &Llama3VllmNeuronConfigs) -> Llama3VllmNeuronResolved {
     Llama3VllmNeuronResolved {
         forward: cfgs.forward.clone(),
+        composition: cfgs.composition,
     }
 }
 
@@ -97,6 +120,35 @@ pub fn validate_config(cfg: &NeuronLlamaForwardKernelConfig) -> Result<()> {
     Ok(())
 }
 
+/// A region shares the whole forward's compiled inventory and runtime identity.
+pub fn region_config(
+    forward: &NeuronLlamaForwardKernelConfig,
+    region: NeuronLlamaRegion,
+) -> NeuronLlamaRegionKernelConfig {
+    NeuronLlamaRegionKernelConfig {
+        backends: vec!["vllm_neuron_fx_regions"],
+        gpu_name: forward.gpu_name.clone(),
+        region,
+        max_model_len: forward.max_model_len.clone(),
+        kv_blocks: forward.kv_blocks.clone(),
+        block_size: forward.block_size.clone(),
+        tp_size: forward.tp_size.clone(),
+        dtype: forward.dtype,
+        decode_buckets: forward.decode_buckets.clone(),
+    }
+}
+
+fn region_op(
+    name: &str,
+    forward: &NeuronLlamaForwardKernelConfig,
+    region: NeuronLlamaRegion,
+    bridge: &PerfApiBridge,
+) -> Result<Op<NeuronLlamaRegionKernel>, BuildError> {
+    let slot = format!("{name}.{}", region.as_str());
+    let kernel = NeuronLlamaRegionKernel::build(slot.clone(), region_config(forward, region), bridge)?;
+    Ok(Op::new(slot, Arc::new(kernel)))
+}
+
 pub fn build(
     name: String,
     resolved: Llama3VllmNeuronResolved,
@@ -106,19 +158,28 @@ pub fn build(
         kind: "neuron_llama_forward",
         reason: e.to_string(),
     })?;
-    let slot = format!("{name}.forward");
+    let leaves = match resolved.composition {
+        VllmNeuronComposition::WholeForward => {
+            let slot = format!("{name}.forward");
+            VllmNeuronLeaves::WholeForward(Op::new(
+                slot.clone(),
+                Arc::new(NeuronLlamaForwardKernel::build(
+                    slot,
+                    resolved.forward.clone(),
+                    bridge,
+                )?),
+            ))
+        }
+        VllmNeuronComposition::ModelHeadRegions => VllmNeuronLeaves::ModelHeadRegions {
+            model: region_op(&name, &resolved.forward, NeuronLlamaRegion::Model, bridge)?,
+            head: region_op(&name, &resolved.forward, NeuronLlamaRegion::Head, bridge)?,
+        },
+    };
     let mut model = Llama3VllmNeuronModel {
         name,
         max_model_len: resolved.forward.max_model_len.get(),
         decode_buckets: resolved.forward.decode_buckets.clone(),
-        forward: Op::new(
-            slot.clone(),
-            Arc::new(NeuronLlamaForwardKernel::build(
-                slot,
-                resolved.forward,
-                bridge,
-            )?),
-        ),
+        leaves,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -186,19 +247,32 @@ fn lower_input(
 impl Llama3VllmNeuronModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
-        let forward = self.forward.compile(&mut b);
-        b.finish(CostNode::Labeled {
-            label: format!(
-                "{} [stock vLLM Neuron; full 32 layers, TP4/LNC2]",
-                self.name
+        let (detail, child) = match &self.leaves {
+            VllmNeuronLeaves::WholeForward(forward) => ("full 32 layers", forward.compile(&mut b)),
+            VllmNeuronLeaves::ModelHeadRegions { model, head } => (
+                "model then head regions",
+                CostNode::Sum(vec![model.compile(&mut b), head.compile(&mut b)]),
             ),
-            child: Box::new(forward),
+        };
+        b.finish(CostNode::Labeled {
+            label: format!("{} [stock vLLM Neuron; {detail}, TP4/LNC2]", self.name),
+            child: Box::new(child),
         })
     }
     fn eval_into(&self, batch: &UnifiedArchInput, ev: &mut Evaluator) {
         let input = lower_input(batch, self.max_model_len, &self.decode_buckets)
             .expect("unsupported vLLM Neuron iteration");
-        self.forward.eval(&input, ev);
+        match &self.leaves {
+            VllmNeuronLeaves::WholeForward(forward) => forward.eval(&input, ev),
+            VllmNeuronLeaves::ModelHeadRegions { model, head } => {
+                let region_input = NeuronLlamaRegionKernelInput {
+                    phase: input.phase,
+                    token_bucket: input.token_bucket,
+                };
+                model.eval(&region_input, ev);
+                head.eval(&region_input, ev);
+            }
+        }
     }
 }
 
@@ -318,6 +392,7 @@ mod tests {
             max_model_len: 512,
             decode_buckets: vec![1, 16],
             tp_size: 4,
+            composition: VllmNeuronComposition::WholeForward,
         };
         let cfg = resolve_configs(&build_configs(&model, &parallel)).forward;
         assert!(validate_config(&cfg).is_ok());
@@ -337,5 +412,47 @@ mod tests {
         model.num_layers = 32;
         model.kv_dtype = DType::Fp16;
         assert!(validate_model(&model).is_err());
+    }
+    #[test]
+    fn regions_share_the_whole_forward_inventory() {
+        use crate::timing::kernels::NeuronLlamaRegionSpec;
+        let parallel = VllmNeuronParallel {
+            gpu_name: "AWS Trainium2 LNC2".into(),
+            max_model_len: 512,
+            decode_buckets: vec![1, 16],
+            tp_size: 4,
+            composition: VllmNeuronComposition::ModelHeadRegions,
+        };
+        let resolved = resolve_configs(&build_configs(&ModelCfg::llama3_8b(), &parallel));
+        assert_eq!(resolved.composition, VllmNeuronComposition::ModelHeadRegions);
+        for region in [NeuronLlamaRegion::Model, NeuronLlamaRegion::Head] {
+            let cfg = region_config(&resolved.forward, region);
+            NeuronLlamaRegionSpec::validate_config(&cfg).unwrap();
+            assert_eq!(cfg.region, region);
+            assert_eq!(cfg.decode_buckets, resolved.forward.decode_buckets);
+            assert_eq!(cfg.backends, ["vllm_neuron_fx_regions"]);
+        }
+    }
+    #[test]
+    fn selector_defaults_to_the_whole_forward() {
+        use crate::arch::config::IterArchSel;
+        let parse = |extra: &str| -> IterArchSel {
+            serde_json::from_str(&format!(
+                r#"{{"type":"llama3_vllm_neuron","model_config":"m.json","fp8":false{extra}}}"#
+            ))
+            .unwrap()
+        };
+        for (extra, expected) in [
+            ("", VllmNeuronComposition::WholeForward),
+            (
+                r#","composition":"model_head_regions""#,
+                VllmNeuronComposition::ModelHeadRegions,
+            ),
+        ] {
+            let IterArchSel::Llama3VllmNeuron { composition, .. } = parse(extra) else {
+                panic!("wrong selector")
+            };
+            assert_eq!(composition, expected);
+        }
     }
 }

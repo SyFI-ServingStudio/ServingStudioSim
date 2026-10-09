@@ -826,6 +826,7 @@ pub fn llama3_vllm_neuron(
     max_model_len: u32,
     decode_buckets: &[u32],
     tp_size: u16,
+    composition: crate::arch::config::VllmNeuronComposition,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -843,12 +844,13 @@ pub fn llama3_vllm_neuron(
         max_model_len,
         decode_buckets: decode_buckets.to_vec(),
         tp_size,
+        composition,
     };
     let configs = crate::arch::llama3_vllm_neuron::build_configs(&model_cfg, &parallel);
     crate::arch::llama3_vllm_neuron::validate_config(&configs.forward)?;
     let resolved = crate::arch::llama3_vllm_neuron::resolve_configs(&configs);
     crate::arch::llama3_vllm_neuron::build(name.to_string(), resolved, bridge).context(
-        "building stock vLLM Neuron full forward (check pinned runtime and profile.db rows)",
+        "building stock vLLM Neuron forward or regions (check pinned runtime and profile.db rows)",
     )
 }
 
@@ -1681,11 +1683,13 @@ pub fn build_iter_model(
             max_model_len,
             decode_buckets,
             tp_size,
+            composition,
         } => Box::new(llama3_vllm_neuron(
             model,
             *max_model_len,
             decode_buckets,
             *tp_size,
+            *composition,
             gpu,
             name,
             bridge,

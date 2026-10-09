@@ -46,7 +46,7 @@ use crate::timing::kernels::EngramLookupKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::{
     NeuronDenseMlpKernelInput, NeuronEmbeddingKernelInput, NeuronLlamaDecoderKernelInput,
-    NeuronLlamaForwardKernelInput,
+    NeuronLlamaForwardKernelInput, NeuronLlamaRegionKernelInput,
 };
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
@@ -120,6 +120,7 @@ log_inputs! {
     Gemm        => SingleGemmKernelInput,
     NeuronDenseMlp => NeuronDenseMlpKernelInput,
     NeuronLlamaForward => NeuronLlamaForwardKernelInput,
+    NeuronLlamaRegion => NeuronLlamaRegionKernelInput,
     NeuronEmbedding => NeuronEmbeddingKernelInput,
     NeuronLlamaDecoder => NeuronLlamaDecoderKernelInput,
     BatchedGemm => BatchedGemmKernelInput,

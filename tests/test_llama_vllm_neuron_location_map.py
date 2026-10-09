@@ -51,3 +51,21 @@ def test_stock_forward_map_reconciles_independent_logical_work(
     assert label.flops_total == expected_flops
     assert label.bytes_total == expected_bytes
     assert label.params["total"] == 8_030_261_248
+
+
+REGIONS_MAP = ROOT / "model/work/location_maps/llama3_vllm_neuron_regions.json"
+
+
+def test_region_map_partitions_the_whole_forward_semantics():
+    """The region split moves only the vocabulary projection to the head."""
+    whole = json.loads(MAP.read_text())
+    regions = json.loads(REGIONS_MAP.read_text())
+    assert regions["schema_version"] == 1
+    assert regions["mapping_id"] == "llama3-vllm-neuron-regions-v1"
+    assert regions["arch_types"] == whole["arch_types"]
+    by_location = {rule["location"]: rule["semantics"] for rule in regions["locations"]}
+    assert set(by_location) == {"unified.model", "unified.head"}
+    assert by_location["unified.head"] == ["lm_head"]
+    assert Counter(name for names in by_location.values() for name in names) == Counter(
+        whole["locations"][0]["semantics"]
+    )

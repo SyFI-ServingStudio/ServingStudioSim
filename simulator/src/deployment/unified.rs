@@ -305,6 +305,7 @@ impl Deployment for UnifiedDeployment {
                 max_model_len,
                 decode_buckets,
                 tp_size,
+                composition,
                 ..
             } => {
                 ensure_stock_neuron_worker(
@@ -320,6 +321,7 @@ impl Deployment for UnifiedDeployment {
                     *max_model_len,
                     decode_buckets,
                     *tp_size,
+                    *composition,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

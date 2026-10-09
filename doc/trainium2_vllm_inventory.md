@@ -31,6 +31,11 @@ configurations; seven failed configurations are excluded from timing acceptance.
 
 ### Later composition experiment (2026-10-09 UTC)
 
+**Update:** a two-region composition at the `LlamaModel` return is now
+registered as `neuron_llama_region`. It is accepted because it reproduces
+unsplit stock logits; see [Model/head region composition](trainium2.md#modelhead-region-composition-experimental).
+The finer per-op decomposition below is still not additive.
+
 An AMD-style decomposition has now been tried against this stock path. Public
 `NF.mlp`, `NF.qkv_proj` (including RoPE), `NF.flash_attention`, and `NF.o_proj`
 all ran through the stock compiler with independent FP32 numerical checks.
