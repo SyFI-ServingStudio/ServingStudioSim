@@ -89,6 +89,15 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     } else {
         admission
     };
+    let admission = match config.load_budget {
+        Some(budget) => admission.with_load_budget(budget),
+        None => admission,
+    };
+    let admission = if config.srpt {
+        admission.with_srpt()
+    } else {
+        admission
+    };
 
     IterBatchWorker::from_components(
         essentials.context,

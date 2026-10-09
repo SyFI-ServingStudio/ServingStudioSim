@@ -38,6 +38,8 @@ use crate::orchestrator::{
     UnifiedWorkerFactory,
 };
 use crate::timing::PerfApiBridge;
+use crate::worker::config::{check_read_wait, resolve_load_budget, PrefixTierReadWaitPolicy};
+use crate::worker::LoadBudget;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
     build_hybrid_chunked_prefill_worker, build_qwen36_hybrid_worker, build_speculative_worker,
@@ -168,6 +170,8 @@ impl Deployment for UnifiedDeployment {
                 bail!("unified: the pipeline_chunked_prefill worker belongs to the `pp` deployment")
             }
         };
+        let (load_budget, srpt, prefix_tier_max_read_wait_ms, prefix_tier_read_wait_policy) =
+            chunked_prefill_scheduler(&g.worker)?;
         let prefix_cache = resolve_prefix_cache_config(
             "unified",
             prefix_cache_mode,
@@ -233,8 +237,16 @@ impl Deployment for UnifiedDeployment {
                 } => *force_schedule_after_ms,
                 _ => 0.0,
             },
+            load_budget,
+            srpt,
+            prefix_tier_max_read_wait_ms,
+            prefix_tier_read_wait_policy,
             ..WorkerConfig::default()
         };
+        ensure!(
+            prefix_tier_max_read_wait_ms == 0.0 || worker_config.prefix_tiers != [None, None],
+            "unified: prefix_tier_max_read_wait_ms needs a DRAM or SSD tier"
+        );
 
         ensure!(
             pool.placement != PlacementPolicy::LeastWorkAhead,
@@ -967,6 +979,45 @@ fn prefill_chunk_alignment(worker: &IterWorkerSel) -> PrefillChunkAlignment {
     }
 }
 
+/// The `chunked_prefill` selector's scheduler options that are not vLLM: the
+/// per-rank load-following budget, srpt, and the tier read-wait bound and
+/// policy. Every other selector keeps vLLM's scheduler.
+fn chunked_prefill_scheduler(
+    worker: &IterWorkerSel,
+) -> anyhow::Result<(Option<LoadBudget>, bool, f64, PrefixTierReadWaitPolicy)> {
+    let IterWorkerSel::ChunkedPrefill {
+        max_batch_tokens,
+        load_budget_low_tokens,
+        load_budget_backlog_lo_tokens,
+        load_budget_backlog_hi_tokens,
+        srpt,
+        prefix_tier_max_read_wait_ms,
+        prefix_tier_read_wait_policy,
+        ..
+    } = worker
+    else {
+        return Ok((None, false, 0.0, PrefixTierReadWaitPolicy::default()));
+    };
+    let load_budget = resolve_load_budget(
+        "unified",
+        *load_budget_low_tokens,
+        *load_budget_backlog_lo_tokens,
+        *load_budget_backlog_hi_tokens,
+        *max_batch_tokens,
+    )?;
+    check_read_wait(
+        "unified",
+        *prefix_tier_max_read_wait_ms,
+        *prefix_tier_read_wait_policy,
+    )?;
+    Ok((
+        load_budget,
+        *srpt,
+        *prefix_tier_max_read_wait_ms,
+        *prefix_tier_read_wait_policy,
+    ))
+}
+
 /// The `chunked_prefill` selector's per-request prefill cap (`0` is off); every
 /// other selector leaves only the batch budget.
 fn long_prefill_token_threshold(worker: &IterWorkerSel) -> Option<u32> {
@@ -1221,7 +1272,13 @@ mod tests {
             ssd_tier_gb: 0.0,
             ssd_tier_gb_per_s: 10.0,
             prefix_tier_warm_start: false,
+            prefix_tier_max_read_wait_ms: 0.0,
+            prefix_tier_read_wait_policy: PrefixTierReadWaitPolicy::PassOver,
             force_schedule_after_ms: 0.0,
+            load_budget_low_tokens: 0,
+            load_budget_backlog_lo_tokens: 0,
+            load_budget_backlog_hi_tokens: 0,
+            srpt: false,
             external_decode: false,
         }
     }

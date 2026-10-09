@@ -33,6 +33,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::common::{RequestId, SessionInput, Time};
+use crate::worker::config::PrefixTierReadWaitPolicy;
 use crate::worker::kv::{PrefixKv, PrefixTierHit, PrefixTierSpec, PrefixTiers};
 
 use super::AdmissionCandidate;
@@ -291,10 +292,12 @@ pub(crate) enum AtHead {
     Read,
     /// A read is needed but the request does not fit in HBM beside what is
     /// running and the other reads' holds (vLLM's waiting loop breaks when an
-    /// async load cannot allocate its blocks): stop admitting.
+    /// async load cannot allocate its blocks), or, under the `block` policy,
+    /// its tier's queue is past the read-wait bound: stop admitting.
     Blocked,
-    /// A read is needed but its tier's queue is past the read-wait bound:
-    /// pass it over, holding nothing, and admit the requests behind it.
+    /// A read is needed but its tier's queue is past the read-wait bound
+    /// (`pass-over` policy): pass it over, holding nothing, and admit the
+    /// requests behind it.
     PassedOver,
 }
 
@@ -304,6 +307,8 @@ pub(crate) struct PrefixFetch {
     warm_start: bool,
     /// Start a read only while its tier would begin it within this long.
     max_read_wait: Option<Time>,
+    /// What a request past `max_read_wait` gets.
+    read_wait_policy: PrefixTierReadWaitPolicy,
     /// Reads in flight, by landing time.
     reads: BinaryHeap<Reverse<(Time, RequestId)>>,
     /// Requests out of their queue while their read runs.
@@ -333,6 +338,7 @@ impl PrefixFetch {
             partitions,
             warm_start,
             max_read_wait: None,
+            read_wait_policy: PrefixTierReadWaitPolicy::PassOver,
             reads: BinaryHeap::new(),
             reading: HashMap::new(),
             landed: HashMap::new(),
@@ -343,13 +349,20 @@ impl PrefixFetch {
     }
 
     /// Start a read only while its tier would begin it within `ms`; past
-    /// that, admission passes the request over, holding nothing, and goes on
-    /// to the requests behind it. A long queue of reads otherwise holds their
-    /// HBM blocks for its whole wait, and a request waiting at the head would
-    /// keep HBM and DRAM hits out. 0 leaves reads unbounded, as vLLM does.
-    pub(crate) fn with_max_read_wait_ms(mut self, ms: f64) -> Self {
+    /// that, `policy` decides. `PassOver` leaves the request queued, holding
+    /// nothing, and admission goes on to the requests behind it; `Block` stops
+    /// admission at it, as a read that cannot fit does. A long queue of reads
+    /// otherwise holds their HBM blocks for its whole wait; a blocked head
+    /// also keeps the HBM and DRAM hits behind it out. 0 leaves reads
+    /// unbounded, as vLLM does. Not vLLM.
+    pub(crate) fn with_max_read_wait_ms(
+        mut self,
+        ms: f64,
+        policy: PrefixTierReadWaitPolicy,
+    ) -> Self {
         assert!(ms >= 0.0, "prefix_tier_max_read_wait_ms must be >= 0");
         self.max_read_wait = (ms > 0.0).then(|| Time::from_ms(ms));
+        self.read_wait_policy = policy;
         self
     }
 
@@ -445,7 +458,10 @@ impl PrefixFetch {
             .max_read_wait
             .is_some_and(|max| tiers.queue_wait(hit, now) > max)
         {
-            return AtHead::PassedOver;
+            return match self.read_wait_policy {
+                PrefixTierReadWaitPolicy::PassOver => AtHead::PassedOver,
+                PrefixTierReadWaitPolicy::Block => AtHead::Blocked,
+            };
         }
         if !kv_store.fits(partition, &footprint) {
             return AtHead::Blocked;

@@ -6,8 +6,8 @@
 //! `after` since its arrival, admission takes it out of the pending order into
 //! the partition's overdue queue, which admission serves, oldest arrival first,
 //! before the pending order and with no shortest-first bound. A pipeline head
-//! with srpt also runs overdue started prompts before the others
-//! (`pipelined_chunked_prefill_admission.rs`).
+//! or chunked-prefill DP rank with srpt also runs overdue started prompts
+//! before the others (`srpt.rs`).
 
 use std::collections::VecDeque;
 
@@ -22,8 +22,9 @@ pub(crate) struct OverdueQueue {
     arrivals: Vec<VecDeque<(Time, RequestId)>>,
     /// Per partition: requests taken out of the pending order, oldest first.
     overdue: Vec<VecDeque<AdmissionCandidate>>,
-    /// Prefill tokens the overdue requests carry, before any prefix hit.
-    overdue_prompt_tokens: u64,
+    /// Per partition: prefill tokens the overdue requests carry, before any
+    /// prefix hit.
+    overdue_prompt_tokens: Vec<u64>,
 }
 
 impl OverdueQueue {
@@ -33,7 +34,7 @@ impl OverdueQueue {
             after: Time::from_ms(after_ms),
             arrivals: Vec::new(),
             overdue: Vec::new(),
-            overdue_prompt_tokens: 0,
+            overdue_prompt_tokens: Vec::new(),
         }
     }
 
@@ -41,6 +42,7 @@ impl OverdueQueue {
         if self.arrivals.len() <= partition {
             self.arrivals.resize_with(partition + 1, VecDeque::new);
             self.overdue.resize_with(partition + 1, VecDeque::new);
+            self.overdue_prompt_tokens.resize(partition + 1, 0);
         }
     }
 
@@ -76,7 +78,7 @@ impl OverdueQueue {
             }
             self.arrivals[partition].pop_front();
             if let Some(candidate) = policy.remove(request) {
-                self.overdue_prompt_tokens += u64::from(candidate.fresh_prompt_tokens);
+                self.overdue_prompt_tokens[partition] += u64::from(candidate.fresh_prompt_tokens);
                 self.overdue[partition].push_back(candidate);
             }
         }
@@ -90,7 +92,8 @@ impl OverdueQueue {
 
     pub(crate) fn pop(&mut self, partition: u16) -> Option<AdmissionCandidate> {
         let candidate = self.overdue.get_mut(usize::from(partition))?.pop_front()?;
-        self.overdue_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
+        self.overdue_prompt_tokens[usize::from(partition)] -=
+            u64::from(candidate.fresh_prompt_tokens);
         Some(candidate)
     }
 
@@ -98,16 +101,16 @@ impl OverdueQueue {
     pub(crate) fn push_front(&mut self, partition: u16, candidate: AdmissionCandidate) {
         let partition = usize::from(partition);
         self.ensure(partition);
-        self.overdue_prompt_tokens += u64::from(candidate.fresh_prompt_tokens);
+        self.overdue_prompt_tokens[partition] += u64::from(candidate.fresh_prompt_tokens);
         self.overdue[partition].push_front(candidate);
     }
 
     /// Drop `request` from the overdue queue, if it is there.
     pub(crate) fn remove(&mut self, request: RequestId) -> bool {
-        for queue in &mut self.overdue {
+        for (queue, tokens) in self.overdue.iter_mut().zip(&mut self.overdue_prompt_tokens) {
             if let Some(index) = queue.iter().position(|c| c.request_id == request) {
                 let candidate = queue.remove(index).expect("index is in range");
-                self.overdue_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
+                *tokens -= u64::from(candidate.fresh_prompt_tokens);
                 return true;
             }
         }
@@ -119,7 +122,15 @@ impl OverdueQueue {
     }
 
     pub(crate) fn prompt_tokens(&self) -> u64 {
+        self.overdue_prompt_tokens.iter().sum()
+    }
+
+    /// Prefill tokens `partition`'s overdue requests carry.
+    pub(crate) fn partition_prompt_tokens(&self, partition: u16) -> u64 {
         self.overdue_prompt_tokens
+            .get(usize::from(partition))
+            .copied()
+            .unwrap_or(0)
     }
 }
 

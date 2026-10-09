@@ -113,6 +113,74 @@ pub(crate) fn resolve_microbatch_sizing(
     }
 }
 
+/// What admission does with a request whose DRAM/SSD read would start past
+/// `prefix_tier_max_read_wait_ms` (not vLLM, which has no such bound).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefixTierReadWaitPolicy {
+    /// Pass the request over: it stays queued, holds no HBM, and admission
+    /// goes on to the requests behind it.
+    #[default]
+    PassOver,
+    /// Stop admitting at the request, as when its read cannot fit in HBM: the
+    /// queue behind it waits too.
+    Block,
+}
+
+const PREFIX_TIER_READ_WAIT_POLICY_CHOICES: [&str; 2] = ["pass-over", "block"];
+
+/// Lower the `load_budget_*` selector triple (the floor `0`: off). The floor
+/// must lie in `1..=max_batch_tokens` and needs `lo < hi`; the bounds alone
+/// are rejected.
+pub(crate) fn resolve_load_budget(
+    deployment: &str,
+    low_tokens: u32,
+    backlog_lo_tokens: u64,
+    backlog_hi_tokens: u64,
+    max_batch_tokens: u32,
+) -> Result<Option<super::types::LoadBudget>> {
+    ensure!(
+        low_tokens <= max_batch_tokens,
+        "{deployment}: load_budget_low_tokens ({low_tokens}) must be <= max_batch_tokens \
+         ({max_batch_tokens})"
+    );
+    if low_tokens == 0 {
+        ensure!(
+            backlog_lo_tokens == 0 && backlog_hi_tokens == 0,
+            "{deployment}: load_budget_backlog_*_tokens need load_budget_low_tokens"
+        );
+        return Ok(None);
+    }
+    ensure!(
+        backlog_lo_tokens < backlog_hi_tokens,
+        "{deployment}: load_budget_low_tokens needs load_budget_backlog_lo_tokens < \
+         load_budget_backlog_hi_tokens, got {backlog_lo_tokens} and {backlog_hi_tokens}"
+    );
+    Ok(Some(super::types::LoadBudget {
+        low_tokens,
+        backlog_lo_tokens,
+        backlog_hi_tokens,
+    }))
+}
+
+/// Check the `prefix_tier_max_read_wait_ms` / `prefix_tier_read_wait_policy`
+/// pair: the bound is `>= 0` (`0`: none), and `block` needs a bound to act on.
+pub(crate) fn check_read_wait(
+    deployment: &str,
+    max_read_wait_ms: f64,
+    policy: PrefixTierReadWaitPolicy,
+) -> Result<()> {
+    ensure!(
+        max_read_wait_ms >= 0.0,
+        "{deployment}: prefix_tier_max_read_wait_ms ({max_read_wait_ms}) must be >= 0"
+    );
+    ensure!(
+        policy == PrefixTierReadWaitPolicy::PassOver || max_read_wait_ms > 0.0,
+        "{deployment}: prefix_tier_read_wait_policy: block needs prefix_tier_max_read_wait_ms > 0"
+    );
+    Ok(())
+}
+
 /// KV-capacity rule paired with chunked prefill. `FullFootprint` preserves the
 /// historical no-retraction lifecycle. `BoundedFuture` uses an explicit
 /// future-token estimate and therefore requires decode retraction.
@@ -481,7 +549,7 @@ pub enum IterWorkerSel {
         /// Order of each rank's waiting queue. `fifo` is vLLM's FCFS;
         /// `shortest-prefill-first` offers the prompt with the fewest tokens to
         /// compute first, counting what HBM or a prefix tier holds as reused
-        /// (not vLLM). Started prompts keep priority either way.
+        /// (not vLLM). Started prompts keep priority either way unless `srpt`.
         #[serde(default = "default_pipeline_pending_order")]
         #[param(string, default = "fifo", choices = PENDING_ORDER_CHOICES)]
         pending_order: PendingOrderKind,
@@ -511,12 +579,49 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         prefix_tier_warm_start: bool,
+        /// With a tier: start a read only while its rank's tier would begin it
+        /// within this many ms; past that, `prefix_tier_read_wait_policy`
+        /// decides. `0`: no bound (vLLM); a bound needs a tier. Not vLLM.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        prefix_tier_max_read_wait_ms: f64,
+        /// With `prefix_tier_max_read_wait_ms`: `pass-over` leaves a request
+        /// whose read would wait past the bound queued, holding no HBM, and
+        /// admits the ones behind it; `block` stops the rank's admission at it.
+        /// Not vLLM.
+        #[serde(default)]
+        #[param(string, default = "pass-over", choices = PREFIX_TIER_READ_WAIT_POLICY_CHOICES)]
+        prefix_tier_read_wait_policy: PrefixTierReadWaitPolicy,
         /// Serve a queued request that has waited this many ms since arrival
         /// before the rest of its queue, so shortest-first cannot starve it
-        /// (`0`: off). Not vLLM.
+        /// (`0`: off); with `srpt`, overdue started prompts go first too. Not
+        /// vLLM.
         #[serde(default)]
         #[param(default = 0.0)]
         force_schedule_after_ms: f64,
+        /// Load-following budget floor, per attention DP rank (`0`: off,
+        /// vLLM's fixed budget). A rank's iteration budget is this many tokens
+        /// while its prefill backlog (queued and started prompts' tokens) is at
+        /// most `load_budget_backlog_lo_tokens`, rising linearly to
+        /// `max_batch_tokens` at `load_budget_backlog_hi_tokens`; both bounds
+        /// are required when the floor is set. Each rank is one vLLM engine
+        /// with its own scheduler, so backlog and budget are the rank's own.
+        /// Not vLLM.
+        #[serde(default)]
+        #[param(default = 0)]
+        load_budget_low_tokens: u32,
+        #[serde(default)]
+        #[param(default = 0)]
+        load_budget_backlog_lo_tokens: u64,
+        #[serde(default)]
+        #[param(default = 0)]
+        load_budget_backlog_hi_tokens: u64,
+        /// Shortest remaining prefill first across each rank's started and
+        /// queued prompts (queue order should be `shortest-prefill-first`),
+        /// instead of vLLM's started-first order. Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        srpt: bool,
         #[serde(default)]
         #[param(default = false)]
         external_decode: bool,
@@ -680,12 +785,18 @@ pub enum IterWorkerSel {
         #[param(default = false)]
         prefix_tier_warm_start: bool,
         /// With a tier: start a read only while its tier would begin it within
-        /// this many ms; past that, admission stops and the request waits in
-        /// its queue holding no HBM. Bounds what in-flight reads hold. 0: no
-        /// bound (vLLM). Not vLLM.
+        /// this many ms; past that, `prefix_tier_read_wait_policy` decides.
+        /// Bounds what in-flight reads hold. 0: no bound (vLLM). Not vLLM.
         #[serde(default)]
         #[param(default = 0.0)]
         prefix_tier_max_read_wait_ms: f64,
+        /// With `prefix_tier_max_read_wait_ms`: `pass-over` leaves a request
+        /// whose read would wait past the bound queued, holding no HBM, and
+        /// admits the ones behind it; `block` stops admission at it, so the
+        /// queue behind waits too. Not vLLM.
+        #[serde(default)]
+        #[param(string, default = "pass-over", choices = PREFIX_TIER_READ_WAIT_POLICY_CHOICES)]
+        prefix_tier_read_wait_policy: PrefixTierReadWaitPolicy,
         /// With a tier: every stage reads the pipeline's mean KV bytes per
         /// token, as if the stages held equal shares, instead of the most
         /// loaded stage's. Sizes tier capacity the same way; HBM is unchanged.
@@ -860,6 +971,63 @@ mod tests {
             resolve_microbatch_sizing(MicrobatchSplit::Even, 1024, 8192).unwrap(),
             MicrobatchSizing::Even { min_tokens: 1024 }
         );
+    }
+
+    #[test]
+    fn chunked_prefill_scheduler_options_default_to_vllm_and_validate() {
+        let worker: IterWorkerSel = serde_yaml::from_str(
+            "type: chunked_prefill\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\nbatch_policy: mix\n",
+        )
+        .expect("parse chunked_prefill worker");
+        let IterWorkerSel::ChunkedPrefill {
+            srpt,
+            load_budget_low_tokens,
+            load_budget_backlog_lo_tokens,
+            load_budget_backlog_hi_tokens,
+            prefix_tier_max_read_wait_ms,
+            prefix_tier_read_wait_policy,
+            ..
+        } = worker
+        else {
+            panic!("expected chunked_prefill");
+        };
+        assert!(!srpt);
+        assert_eq!(prefix_tier_max_read_wait_ms, 0.0);
+        assert_eq!(
+            prefix_tier_read_wait_policy,
+            PrefixTierReadWaitPolicy::PassOver
+        );
+        assert_eq!(
+            resolve_load_budget(
+                "t",
+                load_budget_low_tokens,
+                load_budget_backlog_lo_tokens,
+                load_budget_backlog_hi_tokens,
+                8192
+            )
+            .unwrap(),
+            None
+        );
+
+        // The floor needs ordered bounds, the bounds need the floor, and the
+        // floor cannot exceed the cap.
+        assert!(resolve_load_budget("t", 4096, 0, 0, 8192).is_err());
+        assert!(resolve_load_budget("t", 4096, 3_000_000, 1_000_000, 8192).is_err());
+        assert!(resolve_load_budget("t", 0, 1_000_000, 3_000_000, 8192).is_err());
+        assert!(resolve_load_budget("t", 16384, 1_000_000, 3_000_000, 8192).is_err());
+        assert_eq!(
+            resolve_load_budget("t", 4096, 1_000_000, 3_000_000, 8192)
+                .unwrap()
+                .map(|budget| budget.target(2_000_000, 8192)),
+            Some(6144)
+        );
+
+        assert!(check_read_wait("t", -1.0, PrefixTierReadWaitPolicy::PassOver).is_err());
+        assert!(check_read_wait("t", 0.0, PrefixTierReadWaitPolicy::Block).is_err());
+        assert!(check_read_wait("t", 1000.0, PrefixTierReadWaitPolicy::Block).is_ok());
+        let policy: PrefixTierReadWaitPolicy =
+            serde_yaml::from_str("block").expect("parse the block policy");
+        assert_eq!(policy, PrefixTierReadWaitPolicy::Block);
     }
 
     #[test]

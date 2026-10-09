@@ -11,8 +11,9 @@
 //! (one state at a retained entry's end, `HybridGdnKv::with_exact_prefix_reuse`).
 //!
 //! The selector's DRAM/SSD tiers go to the admission (one set per attention DP
-//! rank, read when a request reaches the head of its rank's queue; sessions
-//! sticky to their rank), and the shell is wrapped in `SessionTierWorker`,
+//! rank, read when a request reaches the head of its rank's queue, bounded by
+//! the read-wait bound and policy; sessions sticky to their rank), and the
+//! shell is wrapped in `SessionTierWorker`,
 //! which writes finished contexts through and runs `external_decode`.
 
 use std::path::PathBuf;
@@ -176,9 +177,23 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     } else {
         admission
     };
+    let admission = match config.load_budget {
+        Some(budget) => admission.with_load_budget(budget),
+        None => admission,
+    };
+    let admission = if config.srpt {
+        admission.with_srpt()
+    } else {
+        admission
+    };
     let has_tiers = !tiers.is_empty();
     let admission = if has_tiers {
-        admission.with_prefix_fetch(PrefixFetch::new(tiers, config.prefix_tier_warm_start))
+        admission.with_prefix_fetch(
+            PrefixFetch::new(tiers, config.prefix_tier_warm_start).with_max_read_wait_ms(
+                config.prefix_tier_max_read_wait_ms,
+                config.prefix_tier_read_wait_policy,
+            ),
+        )
     } else {
         admission
     };

@@ -20,8 +20,23 @@
 //! mechanism selected by SGLang when `enable_mixed_chunk` is false; admission
 //! capacity estimation and decode retraction are separate policies.
 //!
-//! `with_force_after(ms)` (not vLLM) serves a queued request that has waited
-//! `ms` since arrival before the rest of its partition's queue (`overdue.rs`).
+//! Three scheduler options are not vLLM, and each acts per partition, since
+//! each attention DP rank is one vLLM engine with its own scheduler:
+//!
+//! - `with_force_after(ms)` serves a queued request that has waited `ms` since
+//!   arrival before the rest of its partition's queue (`overdue.rs`).
+//! - `with_srpt()` orders a partition's prefill by remaining tokens across its
+//!   started and queued prompts instead of started first (`srpt.rs`, shared
+//!   with the pipeline head); overdue started prompts then go first too.
+//! - `with_load_budget` runs a partition's iteration at the budget floor while
+//!   its prefill backlog (its queued and started prompts' tokens) is at most
+//!   the low bound, rising linearly to `max_batch_tokens` at the high bound
+//!   (`LoadBudget`, shared with the pipeline head).
+//!
+//! With DRAM/SSD tiers (`prefix_fetch.rs`), a read-wait bound either passes a
+//! request whose read would wait too long over (it stays queued, holding no
+//! HBM, and admission goes on to the requests behind it) or stops the
+//! partition's admission at it.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -32,10 +47,12 @@ use crate::worker::config::{
 };
 use crate::worker::kv::{ChunkedPrefillKv, ResolvedPrefillContext};
 use crate::worker::shared::context::WorkerContext;
-use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
+use crate::worker::types::{IterBatchPlan, LoadBudget, WorkerEventCommon, WorkerMsgCommon};
 
+use super::fresh_source::{FreshQueues, FreshSource};
 use super::overdue::OverdueQueue;
 use super::prefix_fetch::{AtHead, PrefixFetch};
+use super::srpt::SrptFill;
 use super::{
     AdmissionCandidate, DecodeCompletion, EnqueueSequence, IterAdmission, LoadBalance,
     PartitionLoad, PendingOrderPolicy, SingleTokenDecodeCompletion,
@@ -80,6 +97,21 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// Queued requests that waited past the force-schedule bound; `None`: no
     /// bound.
     overdue: Option<OverdueQueue>,
+    /// Per-partition budget that follows the partition's prefill backlog;
+    /// `None` keeps `max_batch_tokens` at every load (vLLM).
+    load_budget: Option<LoadBudget>,
+    /// Shortest remaining prefill first across a partition's started and
+    /// queued prompts; `false` keeps vLLM's started-first order.
+    srpt: bool,
+}
+
+/// What gates one partition's fresh-prompt admission in the iteration being
+/// formed, beyond its budget and KV.
+pub(super) struct FreshAdmissionStep {
+    /// `false` after a retracting decode step (vLLM admits nothing then).
+    admits: bool,
+    /// Future verify-window slots left (speculative decode only).
+    future_decode_slots: Option<u32>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -152,7 +184,47 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             session_partitions: None,
             prefix_fetch: None,
             overdue: None,
+            load_budget: None,
+            srpt: false,
         }
+    }
+
+    /// Run each partition's iteration at `low_tokens` while its prefill
+    /// backlog (queued and started tokens) is at most `backlog_lo_tokens`,
+    /// rising to `max_batch_tokens` at `backlog_hi_tokens`. Not vLLM, whose
+    /// budget is fixed.
+    pub(crate) fn with_load_budget(mut self, budget: LoadBudget) -> Self {
+        self.load_budget = Some(budget.checked(self.max_batch_tokens));
+        self
+    }
+
+    /// Order each partition's prefill by remaining tokens across its started
+    /// and queued prompts. The queue must offer its shortest prompt first.
+    /// Not vLLM.
+    pub(crate) fn with_srpt(mut self) -> Self {
+        self.srpt = true;
+        self
+    }
+
+    /// `partition`'s prefill backlog: its started prompts' unscheduled tokens
+    /// plus its queued (pending and overdue) prompts' tokens, before any
+    /// prefix hit. Reading requests are out of the queue and not counted.
+    fn partition_backlog_tokens<K: ChunkedPrefillKv>(&self, kv_store: &K, partition: usize) -> u64 {
+        let started: u64 = self.started_prefills[partition]
+            .iter()
+            .map(|candidate| {
+                u64::from(
+                    kv_store
+                        .resolved_prefill_context(candidate.request_id)
+                        .remaining_prefill_tokens(),
+                )
+            })
+            .sum();
+        started
+            + self.partition_policies[partition].0.queued_prompt_tokens()
+            + self.overdue.as_ref().map_or(0, |overdue| {
+                overdue.partition_prompt_tokens(partition as u16)
+            })
     }
 
     /// Serve a queued request that has waited `after_ms` since arrival before
@@ -460,6 +532,202 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
     }
 }
 
+impl<P, D, K> SrptFill<K> for ChunkedPrefillAdmission<P, D>
+where
+    P: PendingOrderPolicy,
+    D: DecodeCompletion<K>,
+    K: ChunkedPrefillKv,
+{
+    type Step = FreshAdmissionStep;
+
+    fn force_bound(&self) -> Option<&OverdueQueue> {
+        self.overdue.as_ref()
+    }
+
+    fn started_prefills_mut(&mut self, partition: u16) -> &mut Vec<AdmissionCandidate> {
+        &mut self.started_prefills[usize::from(partition)]
+    }
+
+    /// Every admitted prompt also spends the drafter's slots. Requests whose
+    /// read is past the read-wait bound are passed over and go back where
+    /// they were.
+    fn admit_fresh_prompts(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        partition: u16,
+        step: &mut FreshAdmissionStep,
+        budget: u32,
+        now: Time,
+        no_longer_than: Option<u32>,
+        overdue_only: bool,
+    ) -> u32 {
+        let bounded_config = self.bounded_config();
+        let mixes_prefill_with_decode = self.batch_policy == BatchPolicy::Mix;
+        let query_width = self.decode_completion.query_tokens_per_request();
+        let drafting_slots = self.drafting_slots;
+        let partition_index = usize::from(partition);
+        let mut remaining_budget = budget;
+        let mut passed_over = Vec::new();
+        let (policy, policy_context) = &mut self.partition_policies[partition_index];
+        let mut queues = FreshQueues {
+            partition,
+            policy,
+            policy_context,
+            prefix_fetch: &mut self.prefix_fetch,
+            overdue: &mut self.overdue,
+        };
+        while step.admits && remaining_budget > drafting_slots {
+            let Some((source, candidate)) = queues.peek(kv_store, overdue_only) else {
+                break;
+            };
+            if let Some(fetch) = queues.prefix_fetch.as_mut() {
+                match fetch.at_head(kv_store, partition, candidate, now) {
+                    AtHead::Admit => {}
+                    AtHead::Read => {
+                        queues.take(source, candidate);
+                        continue;
+                    }
+                    AtHead::Blocked => break,
+                    AtHead::PassedOver => {
+                        queues.take(source, candidate);
+                        passed_over.push((source, candidate));
+                        continue;
+                    }
+                }
+            }
+            if candidate.remaining_output_tokens > 1 && step.future_decode_slots == Some(0) {
+                break;
+            }
+            let resolved_prefill = kv_store.preview_prefill_context(
+                partition,
+                candidate.fresh_prompt_tokens,
+                candidate.session_input,
+            );
+            if source == FreshSource::Policy
+                && no_longer_than
+                    .is_some_and(|bound| resolved_prefill.remaining_prefill_tokens() > bound)
+            {
+                break;
+            }
+            // A fresh prompt whose first chunk cannot end on a checkpoint
+            // boundary within the budget stops admission (vLLM breaks its
+            // waiting loop here rather than skipping ahead).
+            let chunk_tokens = next_chunk_tokens(
+                resolved_prefill,
+                remaining_budget - drafting_slots,
+                self.chunk_end_quantum,
+                self.max_batch_tokens,
+                self.long_prefill_threshold,
+            );
+            if chunk_tokens == 0 {
+                break;
+            }
+            let footprint = match bounded_config {
+                None => kv_store.footprint(
+                    candidate.request_id,
+                    resolved_prefill.post_prefill_context_tokens(),
+                    candidate.remaining_output_tokens,
+                ),
+                Some(config) => kv_store.bounded_future_footprint(
+                    candidate.request_id,
+                    resolved_prefill.post_prefill_context_tokens(),
+                    candidate.remaining_output_tokens,
+                    config.max_future_tokens,
+                    config.page_size,
+                ),
+            };
+            let fits = match bounded_config {
+                None => kv_store.fits(partition, &footprint),
+                Some(config) => kv_store.fits_bounded_future(
+                    partition,
+                    &footprint,
+                    config.max_future_tokens,
+                    self.current_new_token_ratio,
+                    if mixes_prefill_with_decode {
+                        query_width
+                    } else {
+                        0
+                    },
+                ),
+            };
+            if !fits {
+                break;
+            }
+            queues.take(source, candidate);
+            self.admission_order
+                .insert(candidate.request_id, self.next_admission);
+            self.next_admission += 1;
+            if candidate.remaining_output_tokens > 1 {
+                if let Some(slots) = step.future_decode_slots.as_mut() {
+                    *slots -= 1;
+                }
+            }
+            kv_store.reserve_chunked_prefill_context(
+                candidate.request_id,
+                partition,
+                resolved_prefill,
+                footprint,
+                now,
+            );
+            {
+                let mut store = context.requests.borrow_mut();
+                store.mark_admitted(candidate.request_id);
+                let record = &mut store[candidate.request_id];
+                if candidate.retracted {
+                    record.begin_reprocessed_prefill(resolved_prefill.resident_prefix_tokens());
+                } else {
+                    record
+                        .record_prefix_cache_hit_tokens(resolved_prefill.resident_prefix_tokens());
+                }
+                context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
+            }
+            if let Some(fetch) = queues.prefix_fetch.as_mut() {
+                fetch.admitted(
+                    partition,
+                    candidate,
+                    resolved_prefill.resident_prefix_tokens(),
+                    now,
+                );
+            }
+            assert!(
+                self.prefill_episodes
+                    .insert(candidate.request_id, candidate.retracted)
+                    .is_none(),
+                "request entered two simultaneous prefill episodes"
+            );
+            kv_store.schedule_prefill_chunk(candidate.request_id, partition, chunk_tokens);
+            remaining_budget -= chunk_tokens + drafting_slots;
+            if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
+                self.started_prefills[partition_index].push(candidate);
+            }
+        }
+        queues.return_passed_over(passed_over);
+        budget - remaining_budget
+    }
+
+    fn schedule_started_chunk(
+        &mut self,
+        kv_store: &mut K,
+        partition: u16,
+        candidate: AdmissionCandidate,
+        budget: u32,
+    ) -> (u32, u32) {
+        let chunk_tokens = next_chunk_tokens(
+            kv_store.resolved_prefill_context(candidate.request_id),
+            budget.saturating_sub(self.drafting_slots),
+            self.chunk_end_quantum,
+            self.max_batch_tokens,
+            self.long_prefill_threshold,
+        );
+        if chunk_tokens == 0 {
+            return (0, 0);
+        }
+        kv_store.schedule_prefill_chunk(candidate.request_id, partition, chunk_tokens);
+        (chunk_tokens, chunk_tokens + self.drafting_slots)
+    }
+}
+
 impl<P, D, K> IterAdmission<K> for ChunkedPrefillAdmission<P, D>
 where
     P: PendingOrderPolicy,
@@ -552,7 +820,6 @@ where
             _ => false,
         };
         let had_decode = has_live_decode(kv_store);
-        let current_new_token_ratio = self.current_new_token_ratio;
         // Every scheduled request, decode or prefill chunk, also spends the
         // drafter's slots.
         let drafting_slots = self.drafting_slots;
@@ -563,7 +830,7 @@ where
         // One short prompt can create a whole verify window next iteration.
         // Reserve those future query slots before admitting its prefill; an
         // unfinished started prompt keeps its reservation across iterations.
-        let mut future_decode_slots = (query_width > 1).then(|| {
+        let future_decode_slots = (query_width > 1).then(|| {
             (0..num_partitions)
                 .map(|partition| {
                     let started = self.started_prefills[partition]
@@ -594,208 +861,71 @@ where
             })
             .collect();
 
-        // Started prompts keep partition-local priority, in start order, until
-        // their prompt is complete, matching one EngineCore scheduler queue per
-        // DP partition. One that cannot run this iteration keeps its place.
-        for partition_index in 0..num_partitions {
-            let mut started_prefills = std::mem::take(&mut self.started_prefills[partition_index]);
-            started_prefills.retain(|candidate| {
-                let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
-                let chunk_tokens = next_chunk_tokens(
-                    resolved_prefill,
-                    remaining_budgets[partition_index].saturating_sub(drafting_slots),
-                    chunk_end_quantum,
-                    max_batch_tokens,
-                    long_prefill_threshold,
-                );
-                if chunk_tokens == 0 {
-                    return true;
-                }
-                kv_store.schedule_prefill_chunk(
-                    candidate.request_id,
-                    partition_index as u16,
-                    chunk_tokens,
-                );
-                remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
-                chunk_tokens < resolved_prefill.remaining_prefill_tokens()
-            });
-            self.started_prefills[partition_index] = started_prefills;
+        if let Some(load) = self.load_budget {
+            for (partition, budget) in remaining_budgets.iter_mut().enumerate() {
+                let backlog = self.partition_backlog_tokens(kv_store, partition);
+                *budget = (*budget).min(load.target(backlog, max_batch_tokens));
+            }
         }
+        let mut steps: Vec<FreshAdmissionStep> = (0..num_partitions)
+            .map(|partition| FreshAdmissionStep {
+                admits: !retracted_before_admission,
+                future_decode_slots: future_decode_slots.as_ref().map(|slots| slots[partition]),
+            })
+            .collect();
 
-        for partition_index in 0..num_partitions {
-            let partition = partition_index as u16;
-            while !retracted_before_admission && remaining_budgets[partition_index] > drafting_slots
-            {
-                let (policy, policy_context) = &mut self.partition_policies[partition_index];
-                let fetch = &mut self.prefix_fetch;
-                // Landed reads hold their blocks and go before the queue, then
-                // requests that waited past the force bound.
-                let landed = fetch
-                    .as_ref()
-                    .and_then(|fetch| fetch.peek_landed(partition));
-                let overdue = self
-                    .overdue
-                    .as_ref()
-                    .and_then(|overdue| overdue.peek(partition))
-                    .filter(|_| landed.is_none());
-                let candidate = match landed.or(overdue) {
-                    Some(candidate) => candidate,
-                    None => {
-                        policy.refresh_head(&mut |candidate| {
-                            let hbm = kv_store.resident_prefix_tokens(
-                                candidate.fresh_prompt_tokens,
-                                candidate.session_input,
-                            );
-                            fetch.as_ref().map_or(hbm, |fetch| {
-                                fetch.rank_tokens(partition, candidate.session_input, hbm)
-                            })
-                        });
-                        let Some(candidate) = policy.peek() else {
-                            break;
-                        };
-                        candidate
-                    }
-                };
-                let take = |fetch: &mut Option<PrefixFetch>,
-                            overdue_queue: &mut Option<OverdueQueue>,
-                            policy: &mut P,
-                            policy_context: &mut P::Context| {
-                    if landed.is_some() {
-                        fetch
-                            .as_mut()
-                            .expect("a landed request implies prefix fetch")
-                            .pop_landed(partition);
-                    } else if overdue.is_some() {
-                        let popped = overdue_queue
-                            .as_mut()
-                            .expect("an overdue request implies the bound")
-                            .pop(partition);
-                        debug_assert_eq!(popped, Some(candidate));
-                    } else {
-                        let popped = policy.pop(policy_context);
-                        debug_assert_eq!(popped, Some(candidate));
-                    }
-                };
-                if let Some(state) = fetch.as_mut() {
-                    match state.at_head(kv_store, partition, candidate, now) {
-                        AtHead::Admit => {}
-                        AtHead::Read => {
-                            take(fetch, &mut self.overdue, policy, policy_context);
-                            continue;
-                        }
-                        // Only a pipeline head sets the read-wait bound.
-                        AtHead::Blocked | AtHead::PassedOver => break,
-                    }
-                }
-                if candidate.remaining_output_tokens > 1
-                    && future_decode_slots
-                        .as_ref()
-                        .is_some_and(|slots| slots[partition_index] == 0)
-                {
-                    break;
-                }
-                let resolved_prefill = kv_store.preview_prefill_context(
-                    partition,
-                    candidate.fresh_prompt_tokens,
-                    candidate.session_input,
-                );
-                // A fresh prompt whose first chunk cannot end on a checkpoint
-                // boundary within the budget stops admission (vLLM breaks its
-                // waiting loop here rather than skipping ahead).
-                let chunk_tokens = next_chunk_tokens(
-                    resolved_prefill,
-                    remaining_budgets[partition_index] - drafting_slots,
-                    chunk_end_quantum,
-                    max_batch_tokens,
-                    long_prefill_threshold,
-                );
-                if chunk_tokens == 0 {
-                    break;
-                }
-                let footprint = match bounded_config {
-                    None => kv_store.footprint(
-                        candidate.request_id,
-                        resolved_prefill.post_prefill_context_tokens(),
-                        candidate.remaining_output_tokens,
-                    ),
-                    Some(config) => kv_store.bounded_future_footprint(
-                        candidate.request_id,
-                        resolved_prefill.post_prefill_context_tokens(),
-                        candidate.remaining_output_tokens,
-                        config.max_future_tokens,
-                        config.page_size,
-                    ),
-                };
-                let fits = match bounded_config {
-                    None => kv_store.fits(partition, &footprint),
-                    Some(config) => kv_store.fits_bounded_future(
-                        partition,
-                        &footprint,
-                        config.max_future_tokens,
-                        current_new_token_ratio,
-                        if mixes_prefill_with_decode {
-                            query_width
-                        } else {
-                            0
-                        },
-                    ),
-                };
-                if !fits {
-                    break;
-                }
-                take(
-                    &mut self.prefix_fetch,
-                    &mut self.overdue,
-                    policy,
-                    policy_context,
-                );
-                self.admission_order
-                    .insert(candidate.request_id, self.next_admission);
-                self.next_admission += 1;
-                if candidate.remaining_output_tokens > 1 {
-                    if let Some(slots) = future_decode_slots.as_mut() {
-                        slots[partition_index] -= 1;
-                    }
-                }
-                kv_store.reserve_chunked_prefill_context(
-                    candidate.request_id,
-                    partition,
-                    resolved_prefill,
-                    footprint,
+        if self.srpt {
+            for (partition_index, step) in steps.iter_mut().enumerate() {
+                self.form_prefill_srpt(
+                    kv_store,
+                    context,
+                    partition_index as u16,
+                    step,
+                    remaining_budgets[partition_index],
                     now,
                 );
-                {
-                    let mut store = context.requests.borrow_mut();
-                    store.mark_admitted(candidate.request_id);
-                    let record = &mut store[candidate.request_id];
-                    if candidate.retracted {
-                        record.begin_reprocessed_prefill(resolved_prefill.resident_prefix_tokens());
-                    } else {
-                        record.record_prefix_cache_hit_tokens(
-                            resolved_prefill.resident_prefix_tokens(),
-                        );
-                    }
-                    context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
-                }
-                if let Some(fetch) = &mut self.prefix_fetch {
-                    fetch.admitted(
-                        partition,
-                        candidate,
-                        resolved_prefill.resident_prefix_tokens(),
-                        now,
+            }
+        } else {
+            // Started prompts keep partition-local priority, in start order,
+            // until their prompt is complete, matching one EngineCore scheduler
+            // queue per DP partition. One that cannot run this iteration keeps
+            // its place.
+            for partition_index in 0..num_partitions {
+                let mut started_prefills =
+                    std::mem::take(&mut self.started_prefills[partition_index]);
+                started_prefills.retain(|candidate| {
+                    let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
+                    let chunk_tokens = next_chunk_tokens(
+                        resolved_prefill,
+                        remaining_budgets[partition_index].saturating_sub(drafting_slots),
+                        chunk_end_quantum,
+                        max_batch_tokens,
+                        long_prefill_threshold,
                     );
-                }
-                assert!(
-                    self.prefill_episodes
-                        .insert(candidate.request_id, candidate.retracted)
-                        .is_none(),
-                    "request entered two simultaneous prefill episodes"
+                    if chunk_tokens == 0 {
+                        return true;
+                    }
+                    kv_store.schedule_prefill_chunk(
+                        candidate.request_id,
+                        partition_index as u16,
+                        chunk_tokens,
+                    );
+                    remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
+                    chunk_tokens < resolved_prefill.remaining_prefill_tokens()
+                });
+                self.started_prefills[partition_index] = started_prefills;
+            }
+            for (partition_index, step) in steps.iter_mut().enumerate() {
+                self.admit_fresh_prompts(
+                    kv_store,
+                    context,
+                    partition_index as u16,
+                    step,
+                    remaining_budgets[partition_index],
+                    now,
+                    None,
+                    false,
                 );
-                kv_store.schedule_prefill_chunk(candidate.request_id, partition, chunk_tokens);
-                remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
-                if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
-                    self.started_prefills[partition_index].push(candidate);
-                }
             }
         }
 

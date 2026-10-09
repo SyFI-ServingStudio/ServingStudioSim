@@ -92,11 +92,7 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         admission = admission.with_long_prefill_threshold(threshold);
     }
     if let Some(load) = config.load_budget {
-        admission = admission.with_load_budget(
-            load.low_tokens,
-            load.backlog_lo_tokens,
-            load.backlog_hi_tokens,
-        );
+        admission = admission.with_load_budget(load);
     }
     if config.srpt {
         admission = admission.with_srpt();
@@ -107,8 +103,10 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     let has_tiers = prefix_tiers.is_some();
     if let Some(tiers) = prefix_tiers {
         admission = admission.with_prefix_fetch(
-            PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start)
-                .with_max_read_wait_ms(config.prefix_tier_max_read_wait_ms),
+            PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start).with_max_read_wait_ms(
+                config.prefix_tier_max_read_wait_ms,
+                config.prefix_tier_read_wait_policy,
+            ),
         );
     }
 
@@ -278,11 +276,7 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         admission = admission.with_long_prefill_threshold(threshold);
     }
     if let Some(load) = config.load_budget {
-        admission = admission.with_load_budget(
-            load.low_tokens,
-            load.backlog_lo_tokens,
-            load.backlog_hi_tokens,
-        );
+        admission = admission.with_load_budget(load);
     }
     if config.srpt {
         admission = admission.with_srpt();
@@ -293,8 +287,10 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     let has_tiers = prefix_tiers.is_some();
     if let Some(tiers) = prefix_tiers {
         admission = admission.with_prefix_fetch(
-            PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start)
-                .with_max_read_wait_ms(config.prefix_tier_max_read_wait_ms),
+            PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start).with_max_read_wait_ms(
+                config.prefix_tier_max_read_wait_ms,
+                config.prefix_tier_read_wait_policy,
+            ),
         );
     }
 

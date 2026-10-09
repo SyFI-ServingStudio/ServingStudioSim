@@ -27,8 +27,8 @@ use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_hybrid_pipeline_head_worker, build_pipeline_head_worker, build_pipeline_stage_worker,
     resolve_microbatch_sizing, resolve_prefix_cache_config, CostSource, IterWorker, IterWorkerSel,
-    PipelineHeadEvent, PipelineHeadMsg, PipelineHybridState, PipelineLayout, PipelineLoadBudget,
-    PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    PipelineHeadEvent, PipelineHeadMsg, PipelineHybridState, PipelineLayout, PrefillChunkAlignment,
+    PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -268,6 +268,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         ssd_tier_gb_per_s,
         prefix_tier_warm_start,
         prefix_tier_max_read_wait_ms,
+        prefix_tier_read_wait_policy,
         force_schedule_after_ms,
         external_decode,
         ..
@@ -293,24 +294,18 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
     let microbatch_sizing =
         resolve_microbatch_sizing(*microbatch_split, *min_microbatch_tokens, *max_batch_tokens)
             .context("pp: pipeline_chunked_prefill")?;
-    ensure!(
-        *load_budget_low_tokens <= *max_batch_tokens,
-        "pp: load_budget_low_tokens ({load_budget_low_tokens}) must be <= max_batch_tokens \
-         ({max_batch_tokens})"
-    );
-    if *load_budget_low_tokens > 0 {
-        ensure!(
-            load_budget_backlog_lo_tokens < load_budget_backlog_hi_tokens,
-            "pp: load_budget_low_tokens needs load_budget_backlog_lo_tokens < \
-             load_budget_backlog_hi_tokens, got {load_budget_backlog_lo_tokens} and \
-             {load_budget_backlog_hi_tokens}"
-        );
-    } else {
-        ensure!(
-            *load_budget_backlog_lo_tokens == 0 && *load_budget_backlog_hi_tokens == 0,
-            "pp: load_budget_backlog_*_tokens need load_budget_low_tokens"
-        );
-    }
+    let load_budget = crate::worker::config::resolve_load_budget(
+        "pp",
+        *load_budget_low_tokens,
+        *load_budget_backlog_lo_tokens,
+        *load_budget_backlog_hi_tokens,
+        *max_batch_tokens,
+    )?;
+    crate::worker::config::check_read_wait(
+        "pp",
+        *prefix_tier_max_read_wait_ms,
+        *prefix_tier_read_wait_policy,
+    )?;
     Ok(WorkerConfig {
         attn_kv_bytes: (*attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times: cfg.io.log_output_token_times,
@@ -324,15 +319,12 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         microbatch_sizing,
         long_prefill_token_threshold: (*long_prefill_token_threshold > 0)
             .then_some(*long_prefill_token_threshold),
-        load_budget: (*load_budget_low_tokens > 0).then_some(PipelineLoadBudget {
-            low_tokens: *load_budget_low_tokens,
-            backlog_lo_tokens: *load_budget_backlog_lo_tokens,
-            backlog_hi_tokens: *load_budget_backlog_hi_tokens,
-        }),
+        load_budget,
         srpt: *srpt,
         prefix_tiers,
         prefix_tier_warm_start: *prefix_tier_warm_start,
         prefix_tier_max_read_wait_ms: *prefix_tier_max_read_wait_ms,
+        prefix_tier_read_wait_policy: *prefix_tier_read_wait_policy,
         force_schedule_after_ms: *force_schedule_after_ms,
         external_decode: *external_decode,
         ..WorkerConfig::default()

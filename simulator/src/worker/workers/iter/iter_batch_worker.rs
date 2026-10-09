@@ -718,6 +718,109 @@ mod tests {
         assert_eq!(starved_spf_progress(3.0), 5_000);
     }
 
+    /// A 5000-token prompt starts alone under a 2048-token budget; a 500-token
+    /// prompt then queues. Returns the next iteration's prefill chunks.
+    fn chunks_after_a_short_prompt_queues_behind_a_long_one(srpt: bool) -> Vec<(u32, u32)> {
+        use crate::worker::admission::PendingOrderKind;
+        let store = shared_with(&[(0, 5_000, 1), (1, 500, 1)]);
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(2_048),
+                pending_order: PendingOrderKind::ShortestPrefillFirst,
+                srpt,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        assert!(worker.form_batch(Time::ZERO));
+        worker.admission.complete_iteration(
+            &mut worker.kv_store,
+            &worker.context,
+            &worker.batch_plan,
+            &mut Vec::new(),
+            Time::from_ms(1.0),
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        assert!(worker.form_batch(Time::from_ms(1.0)));
+        let mut input = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &worker.batch_plan,
+            &mut input,
+        );
+        let mut chunks = input.groups[0].prefill_chunk_pairs.clone();
+        chunks.sort_unstable();
+        chunks
+    }
+
+    #[test]
+    fn srpt_runs_a_queued_prompt_shorter_than_the_started_one_first() {
+        // vLLM order: the started prompt's 2952 tokens left fill the budget.
+        assert_eq!(
+            chunks_after_a_short_prompt_queues_behind_a_long_one(false),
+            [(2_048, 2_048)]
+        );
+        // srpt: the queued 500 go first; the started prompt takes the rest.
+        assert_eq!(
+            chunks_after_a_short_prompt_queues_behind_a_long_one(true),
+            [(0, 500), (2_048, 1_548)]
+        );
+    }
+
+    #[test]
+    fn a_load_budget_follows_each_dp_rank_own_backlog() {
+        use crate::worker::types::LoadBudget;
+        // Round-robin: rank 0 queues 3000 tokens, rank 1 800.
+        let store = shared_with(&[(0, 3_000, 1), (1, 800, 1)]);
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel {
+                ms: 1.0,
+                dp_groups: 2,
+            }),
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(2_048),
+                dp_placement: DpPlacement::RoundRobin,
+                load_budget: Some(LoadBudget {
+                    low_tokens: 512,
+                    backlog_lo_tokens: 1_000,
+                    backlog_hi_tokens: 5_000,
+                }),
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        assert!(worker.form_batch(Time::ZERO));
+        let mut input = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &worker.batch_plan,
+            &mut input,
+        );
+        // Rank 0's backlog is halfway from 1000 to 5000: halfway from 512 to
+        // 2048. Rank 1's is below 1000: the floor. One shared backlog (3800)
+        // would give both ranks 1459.
+        assert_eq!(input.groups[0].prefill_chunk_pairs, [(0, 1_280)]);
+        assert_eq!(input.groups[1].prefill_chunk_pairs, [(0, 512)]);
+    }
+
     #[test]
     fn long_prefill_threshold_lets_a_short_prompt_share_the_iteration() {
         let store = shared_with(&[(0, 16_384, 2), (1, 100, 2)]);

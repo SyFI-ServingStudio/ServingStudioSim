@@ -8,6 +8,7 @@ use crate::worker::types::IterBatchPlan;
 mod chunked_prefill_admission;
 mod decode_completion;
 mod fresh_request_slot_admission;
+mod fresh_source;
 mod local_prefill_decode_admission;
 mod overdue;
 mod pipelined_chunked_prefill_admission;
@@ -15,6 +16,7 @@ mod placement;
 mod policy;
 mod prefill_handoff_admission;
 mod prefix_fetch;
+mod srpt;
 mod token_budget;
 
 pub use decode_completion::{

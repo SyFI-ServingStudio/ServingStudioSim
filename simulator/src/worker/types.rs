@@ -522,15 +522,43 @@ pub struct WorkerStatus {
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-/// A pipeline head's load-following microbatch budget: `low_tokens` while the
-/// prefill backlog (queued, started and in-flight tokens) is at most
-/// `backlog_lo_tokens`, rising linearly to `max_batch_tokens` at
-/// `backlog_hi_tokens`.
+/// A load-following prefill budget (not vLLM): `low_tokens` while the prefill
+/// backlog is at most `backlog_lo_tokens`, rising linearly to
+/// `max_batch_tokens` at `backlog_hi_tokens`. A pipeline head's backlog counts
+/// queued, started and in-flight tokens; a chunked-prefill DP rank's, its own
+/// queued and started tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PipelineLoadBudget {
+pub struct LoadBudget {
     pub low_tokens: u32,
     pub backlog_lo_tokens: u64,
     pub backlog_hi_tokens: u64,
+}
+
+impl LoadBudget {
+    /// Panic unless the floor lies in `1..=max_batch_tokens` and the backlog
+    /// bounds are ordered (`resolve_load_budget` checks the selector first).
+    pub fn checked(self, max_batch_tokens: u32) -> Self {
+        assert!(
+            self.low_tokens > 0 && self.low_tokens <= max_batch_tokens,
+            "load budget floor {} must lie in 1..={max_batch_tokens}",
+            self.low_tokens
+        );
+        assert!(
+            self.backlog_lo_tokens < self.backlog_hi_tokens,
+            "load budget needs backlog lo < hi tokens, got {}..{}",
+            self.backlog_lo_tokens,
+            self.backlog_hi_tokens
+        );
+        self
+    }
+
+    /// The budget at `backlog_tokens` for a `max_tokens` cap.
+    pub fn target(&self, backlog_tokens: u64, max_tokens: u32) -> u32 {
+        let rise = ((backlog_tokens as f64 - self.backlog_lo_tokens as f64)
+            / (self.backlog_hi_tokens - self.backlog_lo_tokens) as f64)
+            .clamp(0.0, 1.0);
+        self.low_tokens + (f64::from(max_tokens - self.low_tokens) * rise).round() as u32
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -605,11 +633,11 @@ pub struct WorkerConfig {
     /// selectors): the most prefill tokens one request takes per iteration.
     /// `None` leaves only the batch budget. Only chunked-prefill recipes read it.
     pub long_prefill_token_threshold: Option<u32>,
-    /// Pipeline head only: the load-following microbatch budget, `None` for
-    /// the fixed `max_batch_tokens`.
-    pub load_budget: Option<PipelineLoadBudget>,
-    /// Pipeline head only: shortest remaining prefill first across started and
-    /// queued prompts.
+    /// Pipeline head and chunked prefill (per DP rank): the load-following
+    /// budget, `None` for the fixed `max_batch_tokens`.
+    pub load_budget: Option<LoadBudget>,
+    /// Pipeline head and chunked prefill (per DP rank): shortest remaining
+    /// prefill first across started and queued prompts.
     pub srpt: bool,
     /// Pipeline head and hybrid chunked prefill: the DRAM and SSD tiers behind
     /// the HBM prefix cache, fastest first (`None`: no such tier).
@@ -621,6 +649,8 @@ pub struct WorkerConfig {
     /// With prefix tiers: start a read only while its tier would begin it
     /// within this many ms (0: no bound).
     pub prefix_tier_max_read_wait_ms: f64,
+    /// With a read-wait bound: pass a request past it over, or stop admitting.
+    pub prefix_tier_read_wait_policy: crate::worker::config::PrefixTierReadWaitPolicy,
     /// Pipeline head and chunked prefill: serve a request that has waited
     /// this many ms since arrival before the others (0: off).
     pub force_schedule_after_ms: f64,
@@ -668,6 +698,7 @@ impl Default for WorkerConfig {
             prefix_tiers: [None, None],
             prefix_tier_warm_start: false,
             prefix_tier_max_read_wait_ms: 0.0,
+            prefix_tier_read_wait_policy: crate::worker::config::PrefixTierReadWaitPolicy::PassOver,
             force_schedule_after_ms: 0.0,
             external_decode: false,
             speculative_draft_tokens: 0,

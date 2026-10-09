@@ -1110,7 +1110,7 @@ mod tests {
     #[test]
     fn a_load_budget_follows_queued_and_in_flight_tokens() {
         use crate::worker::config::MicrobatchSizing;
-        use crate::worker::types::PipelineLoadBudget;
+        use crate::worker::types::LoadBudget;
         let store = shared_with(&[(0, 3000, 1)]);
         let mut worker = build_pipeline_head_worker(
             WorkerId(0),
@@ -1122,7 +1122,7 @@ mod tests {
                 max_batch_tokens: Some(2048),
                 attn_kv_bytes: 1_000_000,
                 microbatch_sizing: MicrobatchSizing::Greedy,
-                load_budget: Some(PipelineLoadBudget {
+                load_budget: Some(LoadBudget {
                     low_tokens: 512,
                     backlog_lo_tokens: 1000,
                     backlog_hi_tokens: 5000,
@@ -1696,6 +1696,70 @@ mod tests {
                 "bound {bound_ms}"
             );
         }
+    }
+
+    #[test]
+    fn the_block_policy_stops_admission_at_a_request_past_the_read_wait_bound() {
+        use crate::worker::config::PrefixTierReadWaitPolicy;
+        // As above with a 0.5 ms bound: passed over, request 2 runs at 0.1 ms;
+        // blocked (the policy before pass-over), it waits behind session 9 until
+        // the channel drains and session 7's read lands at 0.8 ms.
+        let first_token_of_request_2 = |policy| {
+            let store = shared_with(&[(0, 4, 1), (1, 2, 1), (2, 8, 1)]);
+            as_session(&store, 0, 7, 40, 0.0);
+            as_session(&store, 1, 9, 20, 0.1);
+            let mut worker = head_with(
+                Rc::clone(&store),
+                WorkerConfig {
+                    prefix_tier_warm_start: true,
+                    prefix_tier_max_read_wait_ms: 0.5,
+                    prefix_tier_read_wait_policy: policy,
+                    max_batch_tokens: Some(64),
+                    attn_kv_bytes: 240,
+                    prefix_tiers: [
+                        Some(crate::worker::kv::PrefixTierSpec {
+                            name: "dram",
+                            capacity_gb_per_gpu: 1e-6,
+                            read_gb_per_s_per_gpu: 1e-4,
+                        }),
+                        None,
+                    ],
+                    ..WorkerConfig::default()
+                },
+            );
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(0.1), &mut events);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+            run_until(
+                &mut worker,
+                Time::from_ms(0.1),
+                Time::from_ms(60.0),
+                &mut events,
+            );
+            assert_eq!(completed(&events).len(), 3, "{policy:?}");
+            assert_eq!(
+                store.borrow()[RequestId(1)]
+                    .telemetry
+                    .prefix_cache_hit_tokens,
+                Some(20),
+                "{policy:?}"
+            );
+            let first_token = store.borrow()[RequestId(2)]
+                .telemetry
+                .first_output_time
+                .expect("request 2 finishes");
+            first_token
+        };
+        assert_eq!(
+            first_token_of_request_2(PrefixTierReadWaitPolicy::PassOver),
+            Time::from_ms(2.1)
+        );
+        assert_eq!(
+            first_token_of_request_2(PrefixTierReadWaitPolicy::Block),
+            Time::from_ms(2.8)
+        );
     }
 
     #[test]

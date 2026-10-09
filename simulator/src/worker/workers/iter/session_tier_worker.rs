@@ -147,6 +147,7 @@ mod tests {
     use super::*;
     use crate::common::{PoolId, SessionInput, SharedRequests};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
+    use crate::worker::config::PrefixTierReadWaitPolicy;
     use crate::worker::kv::PrefixTierSpec;
     use crate::worker::types::WorkerConfig;
     use crate::worker::workers::iter::build_hybrid_chunked_prefill_worker;
@@ -220,6 +221,78 @@ mod tests {
         store.borrow()[RequestId(id)]
             .telemetry
             .prefix_cache_hit_tokens
+    }
+
+    /// Sessions 7 (40 pre-run tokens) and 9 (20) and a standalone 8-token
+    /// prompt arrive at 0 ms on one rank. Session 7's read holds the DRAM
+    /// channel until 0.4 ms, past a 0.1 ms read-wait bound for session 9.
+    /// Returns the standalone prompt's first-token time.
+    fn first_token_behind_a_read_past_the_bound(policy: PrefixTierReadWaitPolicy) -> Time {
+        let store = shared_with(&[(0, 4, 1), (1, 2, 1), (2, 8, 1)]);
+        as_session(&store, 0, 7, 40, 0.0);
+        as_session(&store, 1, 9, 20, 0.0);
+        let mut worker = build_hybrid_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel {
+                ms: 1.0,
+                dp_groups: 1,
+            }),
+            store.clone(),
+            WorkerConfig {
+                max_batch_tokens: Some(256),
+                attn_kv_bytes: 120,
+                prefix_tiers: [
+                    Some(PrefixTierSpec {
+                        name: "dram",
+                        capacity_gb_per_gpu: 1e-6,
+                        read_gb_per_s_per_gpu: 1e-4,
+                    }),
+                    None,
+                ],
+                prefix_tier_warm_start: true,
+                prefix_tier_max_read_wait_ms: 0.1,
+                prefix_tier_read_wait_policy: policy,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        let mut events = Vec::new();
+        for id in 0..3 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        run_until(&mut worker, Time::ZERO, Time::from_ms(20.0), &mut events);
+        assert_eq!(events.len(), 3, "{policy:?}");
+        for (id, tokens) in [(0, 40), (1, 20)] {
+            assert_eq!(hit(&store, id), Some(tokens), "{policy:?}");
+        }
+        let first_token = store.borrow()[RequestId(2)]
+            .telemetry
+            .first_output_time
+            .expect("the standalone prompt finishes");
+        first_token
+    }
+
+    #[test]
+    fn a_rank_passes_over_a_read_past_the_bound_for_the_request_behind() {
+        // Session 9 is passed over, holding nothing; the prompt runs at 0 ms.
+        assert_eq!(
+            first_token_behind_a_read_past_the_bound(PrefixTierReadWaitPolicy::PassOver),
+            Time::from_ms(1.0)
+        );
+    }
+
+    #[test]
+    fn a_rank_blocks_at_a_read_past_the_bound_under_the_block_policy() {
+        // Session 9 stops admission until its read would start within the
+        // bound: the tick at 0.3 ms, 0.1 ms before session 7's read lands.
+        assert_eq!(
+            first_token_behind_a_read_past_the_bound(PrefixTierReadWaitPolicy::Block),
+            Time::from_ms(1.3)
+        );
     }
 
     #[test]
