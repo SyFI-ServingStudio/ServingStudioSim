@@ -110,6 +110,13 @@ def build_inputs(request: BuildRequest) -> BuildResult:
     # Iteration metrics only: the kernel rows are the bulk of a capture and the
     # builder never reads one.
     parsed = read_parsed(request.parsed_nsys, kernels=False)
+    native = parsed.get("trace_provider") == "neuron_system_trace"
+    if native:
+        expected = {"nxdi": "llama3_nxdi", "vllm_neuron": "llama3_vllm_neuron"}
+        if parsed.get("engine") not in expected or request.arch.get("type") != expected[
+            parsed["engine"]
+        ]:
+            raise ValueError("native engine capture requires its own whole-forward architecture")
     cases, case_map, excluded = build_cases(
         parsed,
         request.input_spec.measured_phase,
@@ -155,7 +162,7 @@ def build_inputs(request: BuildRequest) -> BuildResult:
                 "schema_version": 1,
                 "simulation_preset": str(request.simulation_preset.resolve()),
                 "profile_log_dir": str(request.profile_log_dir.resolve()),
-                "parsed_nsys": str(request.parsed_nsys.resolve()),
+                "parsed_trace" if native else "parsed_nsys": str(request.parsed_nsys.resolve()),
                 "predict_log_dir": str(output_dir),
                 "timing_predict_cases": str(cases_path),
                 "timing_predict_case_map": str(case_map_path),

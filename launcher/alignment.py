@@ -218,6 +218,9 @@ def _load_profile_result(profile_log_dir: Path) -> dict[str, Any]:
     result = json.loads(result_path.read_text())
     if not isinstance(result, dict):
         raise ValueError(f"profile result must be a JSON object: {result_path}")
+    if (result.get("engine") in {"nxdi", "vllm_neuron"}
+            and result.get("producer_kind") != "framework_capture"):
+        raise ValueError("Neuron profile result requires explicit framework_capture producer_kind")
     recorded = result.get("log_dir")
     if not isinstance(recorded, str) or Path(recorded).resolve() != profile_log_dir.resolve():
         raise ValueError(f"profile result does not identify configured directory: {result_path}")
@@ -225,6 +228,8 @@ def _load_profile_result(profile_log_dir: Path) -> dict[str, Any]:
 
 
 def _profile_artifact(result: dict[str, Any], key: str) -> Path:
+    if key == "parsed_nsys" and result.get("parsed_trace") is not None:
+        key = "parsed_trace"
     value = result.get(key)
     if not isinstance(value, str):
         raise ValueError(f"profile_result.json has no {key!r}")
@@ -295,6 +300,8 @@ def _read_input_manifest(timing_predict_log_dir: Path) -> dict[str, Any]:
 
 
 def _manifest_path(manifest: dict[str, Any], key: str) -> Path:
+    if key == "parsed_nsys" and manifest.get("parsed_trace") is not None:
+        key = "parsed_trace"
     value = manifest.get(key)
     if not isinstance(value, str):
         raise ValueError(f"timing-predict input manifest has no {key!r}")
@@ -356,7 +363,9 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
         manifest = {
             **common,
             "profile_log_dir": str(config.profile_log_dir),
-            "parsed_nsys": str(_manifest_path(input_manifest, "parsed_nsys")),
+            "parsed_trace" if "parsed_trace" in input_manifest else "parsed_nsys": str(
+                _manifest_path(input_manifest, "parsed_nsys")
+            ),
             "predict_log_dir": str(config.timing_predict_log_dir),
             "timing_predict_case_map": str(
                 _manifest_path(input_manifest, "timing_predict_case_map")
@@ -480,9 +489,10 @@ def _run_profile(args: argparse.Namespace) -> int:
     _snapshot_config(args.config, Path(config.log_dir), "profile")
     print(f"[alignment] {'resuming' if args.resume else 'profiling'}: {args.config}")
     result = run_profile(config, resume=args.resume)
-    if result.get("profile_kind", "nsys") == "nsys":
+    if result.get("profile_kind", "nsys") in {"nsys", "neuron"}:
+        parsed_path = result.get("parsed_trace", result.get("parsed_nsys"))
         print(
-            f"[alignment] profiling complete: {result['parsed_nsys']}\n"
+            f"[alignment] profiling complete: {parsed_path}\n"
             "[alignment] inspect parsed.json, then create timing_predict.yaml"
         )
     else:

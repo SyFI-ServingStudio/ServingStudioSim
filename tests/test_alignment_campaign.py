@@ -105,7 +105,9 @@ def test_pack_check_reports_no_errors(pack):
 def test_campaign_rejects_measured_routing_files_under_synthetic_routing(pack, routing):
     original = pack.variant_of(pack.cases[0])
     arch = dict(original.arch)
-    # Each pack carries one measured artifact: a marginal or a token corpus.
+    if not {"expert_popularity_file", "token_corpus_file"} & arch.keys():
+        pytest.skip("dense pack has no measured expert-routing artifact")
+    # MoE packs carry one measured artifact: a marginal or a token corpus.
     kind = "popularity" if "expert_popularity_file" in arch else "corpus"
     if routing is None:
         arch.pop("routing", None)
@@ -467,6 +469,8 @@ def test_profile_pass_warmup_reaches_frontend_config(pack, tmp_path):
 def test_speculative_case_keeps_replay_trace_and_calibrates_simulation(pack, tmp_path):
     original_case = pack.cases[0]
     original_variant = pack.variant_of(original_case)
+    if original_variant.engine not in {"vllm", "sglang"}:
+        pytest.skip("this speculative server protocol is a CUDA engine contract")
     rates = [0.8, 0.5, 0.25, 0.5, 0.0]
     case = dataclasses.replace(
         original_case, chunk_size=4096,
@@ -526,6 +530,8 @@ def test_speculative_case_keeps_replay_trace_and_calibrates_simulation(pack, tmp
 def test_acceptance_by_output_position_gives_each_request_its_own_chain(pack, tmp_path):
     original_case = pack.cases[0]
     original_variant = pack.variant_of(original_case)
+    if original_variant.engine not in {"vllm", "sglang"}:
+        pytest.skip("this speculative server protocol is a CUDA engine contract")
     calibrated = original_case.attn_gpu_memory_gb
     early = [0.5, 0.25, 0.25]  # E = 1.75 tokens per round
     late = [0.0, 0.0, 1.0]  # E = 3
@@ -582,6 +588,8 @@ def test_acceptance_by_output_position_rejects_malformed_buckets(buckets, messag
 def _with_speculative_args(pack, extra_args, draft_checkpoint="dflash2_draft"):
     case = pack.cases[0]
     original = pack.variant_of(case)
+    if original.engine not in {"vllm", "sglang"}:
+        pytest.skip("draft-checkpoint CLI flags are a CUDA engine contract")
     variant = dataclasses.replace(
         original,
         server={**original.server, "extra_args": extra_args},
@@ -672,7 +680,10 @@ def test_a_schema_six_parse_without_its_kernel_rows_is_not_complete(pack, tmp_pa
     phase = next(
         name
         for name in phase_names(variant)
-        if (variant.pass_named(name) is not None and variant.pass_named(name).kind == "nsys")
+        if (
+            variant.pass_named(name) is not None
+            and variant.pass_named(name).kind in {"nsys", "neuron"}
+        )
     )
     host = check_module.host_for(pack, None)
     render_case(pack, case, host, tmp_path, REPO_ROOT)
@@ -1175,8 +1186,8 @@ def test_every_pack_case_device_role_is_recorded_with_the_right_width(pack):
     Host profiles are local files — a real one is absolute paths to an HF cache
     and a corpus — so this cannot be checked against the machine itself. What it
     can check is that the split the pack *claims* is internally consistent: a
-    role must name exactly `tp_size * dp_size` distinct devices, which is the
-    error a copied case would introduce.
+    CUDA roles name `tp_size * dp_size` devices. Neuron roles name one physical
+    chip; the server allocates its logical cores to the explicit TP ranks.
     """
     roles = pack.recorded_on.get("device_roles", {})
     assert roles, f"{pack.name} does not record the device split it ran on"
@@ -1185,7 +1196,8 @@ def test_every_pack_case_device_role_is_recorded_with_the_right_width(pack):
         assert case.device_role in roles, f"{case.slug}: role not in recorded_on"
         devices = str(roles[case.device_role]).split(",")
         world = int(variant.server.get("tp_size", 1)) * int(variant.server.get("dp_size", 1))
-        assert len(devices) == world, case.slug
+        expected = 1 if variant.engine in {"nxdi", "vllm_neuron"} else world
+        assert len(devices) == expected, case.slug
         assert len(set(devices)) == len(devices), case.slug
 
 

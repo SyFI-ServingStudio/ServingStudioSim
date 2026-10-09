@@ -16,6 +16,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from alignment.load_generator.config import LoadGeneratorConfig
+from alignment.neuron.config import NxdiProfileConfig, NxdiServerConfig
+from alignment.neuron.vllm_config import VllmNeuronProfileConfig, VllmNeuronServerConfig
 from alignment.profiler.config import (
     PROFILE_KINDS,
     ROUTING_PROFILE_KINDS,
@@ -107,7 +109,9 @@ class AnalyzePhaseConfig:
         return selected
 
 
-def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> ProfileConfig:
+def load_profile_config(
+    path: Path, *, require_python_runtime: bool = True
+) -> ProfileConfig | NxdiProfileConfig | VllmNeuronProfileConfig:
     """Load the profile-only schema and normalize its filesystem inputs.
 
     ``require_python_runtime=False`` exists only for ``profile --resume``:
@@ -116,6 +120,12 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
     """
     raw = _phase_document(path, "profile")
     base = path.resolve().parent
+    if raw.get("engine") == "nxdi":
+        return _load_nxdi_profile(raw, base, require_python_runtime=require_python_runtime)
+    if raw.get("engine") == "vllm_neuron":
+        return _load_vllm_neuron_profile(raw, base, require_python_runtime=require_python_runtime)
+    if raw.get("profile_kind") == "neuron":
+        raise ValueError("native neuron capture requires engine nxdi or vllm_neuron")
     try:
         server_raw = _pop_mapping(raw, "server", "profile")
         workload_raw = _pop_mapping(raw, "workload", "profile")
@@ -299,6 +309,70 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
                 f"{config.driver_compat_lib_dir}"
             )
     return config
+
+
+def _load_nxdi_profile(raw: dict, base: Path, *, require_python_runtime: bool) -> NxdiProfileConfig:
+    raw = dict(raw)
+    raw.pop("engine")
+    try:
+        server_raw = _pop_mapping(raw, "server", "profile")
+        for field in ("model_path", "compiled_path"):
+            server_raw[field] = str(_config_path(base, server_raw[field], "server." + field))
+        server = NxdiServerConfig(**server_raw)
+        workload = LoadGeneratorConfig.from_mapping(_pop_mapping(raw, "workload", "profile"))
+        workload = replace(
+            workload,
+            frontend=replace(
+                workload.frontend,
+                path=str(_config_path(base, workload.frontend.path, "workload.frontend.path")),
+            ),
+            text_file=str(_config_path(base, workload.text_file, "workload.text_file")),
+        )
+        raw["log_dir"] = str(_config_path(base, raw["log_dir"], "log_dir"))
+        raw["fork_python"] = str(
+            _config_path_preserving_symlink(base, raw["fork_python"], "fork_python")
+        )
+        config = NxdiProfileConfig(server=server, workload=workload, **raw)
+        config.validate()
+        _require_nonempty(config.name, "name")
+        if require_python_runtime and not Path(config.fork_python).is_file():
+            raise ValueError("NxDI fork_python does not exist")
+        return config
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"invalid NxDI profile config: {error}") from error
+
+
+def _load_vllm_neuron_profile(
+    raw: dict, base: Path, *, require_python_runtime: bool
+) -> VllmNeuronProfileConfig:
+    raw = dict(raw)
+    raw.pop("engine")
+    try:
+        server_raw = _pop_mapping(raw, "server", "profile")
+        for name in ("model_path", "cache_path", "req_frontend_binary"):
+            server_raw[name] = str(_config_path(base, server_raw[name], "server." + name))
+        server = VllmNeuronServerConfig(**server_raw)
+        workload = LoadGeneratorConfig.from_mapping(_pop_mapping(raw, "workload", "profile"))
+        workload = replace(
+            workload,
+            frontend=replace(workload.frontend, path=str(_config_path(
+                base, workload.frontend.path, "workload.frontend.path"))),
+            text_file=str(_config_path(base, workload.text_file, "workload.text_file")),
+            tokenizer=str(_config_path(base, workload.tokenizer, "workload.tokenizer")),
+        )
+        raw["log_dir"] = str(_config_path(base, raw["log_dir"], "log_dir"))
+        config = VllmNeuronProfileConfig(server=server, workload=workload, **raw)
+        config.validate()
+        _require_nonempty(config.name, "name")
+        if require_python_runtime:
+            for name in ("model_path", "cache_path"):
+                if not Path(getattr(server, name)).is_dir():
+                    raise ValueError(f"stock server.{name} does not exist")
+            if not Path(server.req_frontend_binary).is_file():
+                raise ValueError("stock req_frontend_binary does not exist")
+        return config
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"invalid vllm_neuron profile config: {error}") from error
 
 
 def _validate_python_runtime(config: PythonRuntimeConfig) -> None:

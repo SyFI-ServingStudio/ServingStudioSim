@@ -1,0 +1,6 @@
+{
+  "schema_version": 2,
+  "rule_files": ["whole_forward.json"],
+  "provenance": "Stock TP4 native NRT inventory in logs/20261009_2_trainium_stock_server_timings, joined to the accepted full32 BF16 forward graph identities.",
+  "note": "One whole compiled forward owns all model layers, collectives, head and sampling. Exact repeated graph occurrences fold without a rank sum or layer multiplier."
+}

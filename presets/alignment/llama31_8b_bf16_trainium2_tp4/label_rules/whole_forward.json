@@ -1,0 +1,13 @@
+{
+  "rules": [
+    {
+      "name": "Stock vLLM Neuron Llama3.1-8B TP4",
+      "phase": "forward",
+      "operation": "model.forward",
+      "type": "model",
+      "role": "whole compiled forward including sampling",
+      "slot_suffixes": ["forward"],
+      "note": "Exact native graph identities and TP4 union; the L4 slot owns the complete32-layer program, collectives, head and sampling. No layer multiplier or rank sum."
+    }
+  ]
+}

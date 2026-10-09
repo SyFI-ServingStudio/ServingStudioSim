@@ -167,6 +167,25 @@ Each pass can also set `warmup: true` (default false). This renders
 drain, prefix-cache reset and measurement boundary. vLLM variants must enable
 server load tracking. Warmup does not alter either materialized trace.
 
+The bounded stock `vllm_neuron` pack uses `neuron` and `workload_metrics`
+passes. Its device role names one physical Trainium chip, whose four LNC2 units
+serve the explicit TP4 ranks. An optional host `neuron_server` mapping supplies
+`cache_path`, immutable `image`, private `docker_host`, `req_frontend_binary`
+and `accepted_forward_path`; `docker_command` and `python_executable` are
+optional. These machine paths are excluded from the portable variant. Static
+pack checking validates the stock config without requiring those paths to
+exist; actual `alignment profile --dry-run` still checks them. Stock traces
+reproduce sixteen simultaneous 504+8 requests, including the exact C512
+boundary. Other engines retain their existing trace rules. See the stock
+pack's README for its corpus preflight and separate duty-calibration recipe.
+
+Stock host filesystem paths may be absolute or relative to the simulator
+repository. Rendering anchors them before writing the phase configs, so output
+directory depth does not change their meaning. The stock loader resolves local
+checkpoint/tokenizer symlinks together; socket URIs and image interpreter paths
+retain their declared spelling. Direct stock profile configs require an absolute
+`server.accepted_forward_path`.
+
 A **case** is one operating point: `max_model_len`, `max_concurrency`, the two
 arrival modes, `gpu_memory_utilization`, `capture_seconds`, `device_role`, its
 `workload_trace` (and `kernel_trace` where the NSYS capture is bounded

@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
-SUPPORTED_INPUT_ADAPTERS = frozenset({"vllm_text", "sglang_text"})
+SUPPORTED_INPUT_ADAPTERS = frozenset({"vllm_text", "sglang_text", "nxdi_text", "vllm_neuron_text"})
 
 
 def _validated_shape(

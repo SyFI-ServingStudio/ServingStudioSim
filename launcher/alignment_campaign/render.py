@@ -167,7 +167,12 @@ def acceptance_chain(case: Case, output_len: int) -> list[float]:
 
 
 def trace_text(
-    case: Case, spec: TraceSpec, *, speculative_acceptance: Callable[[int], list[float]] | None = None
+    case: Case,
+    spec: TraceSpec,
+    *,
+    speculative_acceptance: Callable[[int], list[float]] | None = None,
+    simultaneous: bool = False,
+    allow_exact_context: bool = False,
 ) -> str:
     """Regenerate one trace from its shapes.
 
@@ -185,12 +190,14 @@ def trace_text(
     rows = [shape for _ in range(spec.repeats) for shape in spec.shapes]
     prefix = case.slug if spec.id_suffix is None else f"{case.slug}-{spec.id_suffix}"
     for index, (input_len, output_len) in enumerate(rows):
-        if input_len + output_len >= case.max_model_len:
+        total = input_len + output_len
+        if total > case.max_model_len or (total == case.max_model_len and not allow_exact_context):
             raise PackError(
                 f"{case.slug} trace row {index} reaches max_model_len: "
                 f"{input_len}+{output_len} >= {case.max_model_len}"
             )
-        row = [f"{prefix}-{index:04d}", input_len, output_len, float(index * 1000)]
+        arrival = 0.0 if simultaneous else float(index * 1000)
+        row = [f"{prefix}-{index:04d}", input_len, output_len, arrival]
         if speculative_acceptance is not None:
             row.append(json.dumps(speculative_acceptance(output_len), separators=(",", ":")))
         writer.writerow(row)
@@ -273,6 +280,45 @@ def _extra_args(variant: Variant, case: Case) -> list[str]:
 
 
 def _server_block(pack: Pack, variant: Variant, case: Case, host: HostProfile) -> dict[str, Any]:
+    if variant.engine == "vllm_neuron":
+        allowed = {
+            "cache_path", "image", "docker_host", "req_frontend_binary",
+            "accepted_forward_path", "docker_command", "python_executable",
+        }
+        required = allowed - {"docker_command", "python_executable"}
+        unknown = set(host.neuron_server) - allowed
+        missing = required - set(host.neuron_server)
+        if unknown or missing:
+            raise PackError(
+                f"stock Neuron host fields: missing {sorted(missing)}, unknown {sorted(unknown)}"
+            )
+        if set(variant.server) & allowed:
+            raise PackError("stock Neuron runtime paths and image must come from the host profile")
+        devices = host.devices(case.device_role).split(",")
+        if len(devices) != 1 or not devices[0].isdigit():
+            raise PackError("stock Neuron TP4 requires one whole-chip device role")
+        return {
+            **variant.server, **host.neuron_server,
+            "model_path": host.checkpoint_path(variant.checkpoint),
+            "port": host.port, "startup_timeout": host.startup_timeout,
+            "neuron_device": int(devices[0]), "max_model_len": case.max_model_len,
+        }
+    if variant.engine == "nxdi":
+        body = dict(variant.server)
+        compiled = body.pop("compiled_checkpoint", None)
+        if not isinstance(compiled, str):
+            raise PackError("NxDI variant.server.compiled_checkpoint must name a host checkpoint")
+        body.update(
+            model_path=host.checkpoint_path(variant.checkpoint),
+            compiled_path=host.checkpoint_path(compiled),
+            port=host.port,
+            startup_timeout=host.startup_timeout,
+        )
+        devices = host.devices(case.device_role).split(",")
+        if len(devices) != 1:
+            raise PackError("NxDI alignment requires one whole-chip device role")
+        body["neuron_device"] = int(devices[0])
+        return body
     body = {
         "model_path": host.checkpoint_path(variant.checkpoint),
         "port": host.port,
@@ -308,6 +354,10 @@ def _workload_block(
     if case.rate is not None:
         body["rate"] = case.rate.value
     body["max_model_len"] = case.max_model_len
+    if variant.engine == "vllm_neuron":
+        # The stock adapter deliberately accepts only this frozen 16-request
+        # museum replay. Its pool uses eight 9973-token segments, not enwik9.
+        body.update(max_items=16, token_pool_limit=8 * 9973, stream_idle_timeout_secs=600)
     return body
 
 
@@ -335,10 +385,11 @@ def profile_document(
         "name": f"{prefix}_{case.slug}_{short}",
         "log_dir": f"./{pass_name}",
         "gpu": variant.gpu,
-        "cuda_visible_devices": host.devices(case.device_role),
         "profile_kind": profile_pass.kind,
         "engine": variant.engine,
     }
+    if variant.engine not in {"nxdi", "vllm_neuron"}:
+        document["cuda_visible_devices"] = host.devices(case.device_role)
     if host.fork_python:
         document["fork_python"] = _absolute(host.fork_python, repo_root)
     if variant.python_runtime is not None:
@@ -360,6 +411,14 @@ def profile_document(
             nsys["analyze_iteration_end"] = end
         document["nsys"] = nsys
     document["workload"] = _workload_block(variant, case, host, trace_name, profile_pass.kind)
+    if variant.engine == "vllm_neuron":
+        # Host-profile filesystem paths are repository-relative, independent
+        # of where the campaign is rendered. Image/socket URIs and the image's
+        # interpreter keep their declared spelling.
+        for key in ("model_path", "cache_path", "req_frontend_binary", "accepted_forward_path"):
+            document["server"][key] = _absolute(document["server"][key], repo_root)
+        for key in ("tokenizer", "text_file"):
+            document["workload"][key] = _absolute(document["workload"][key], repo_root)
     if profile_pass.warmup:
         document["workload"]["warmup"] = True
     return document
@@ -455,7 +514,7 @@ def simulation_document(
         raise PackError(
             f"variants.{variant.name}.arch must not set max_model_len; it is per-case"
         )
-    arch["max_model_len"] = case.max_model_len
+    arch["kv_capacity" if variant.engine == "nxdi" else "max_model_len"] = case.max_model_len
     # Both measured-routing artifacts are named pack-relative in a variant and
     # must reach the simulator as paths it can resolve from the repository root.
     # A corpus manifest is resolved relative to the process, so leaving it
@@ -498,6 +557,11 @@ def simulation_document(
             }
         },
     }
+    if variant.engine == "vllm_neuron":
+        # Preserve the accepted stock simulation's request-timing evidence.
+        document["io"].update(
+            log_output_token_times=True, log_stage_transitions=True, kv_log_stride=1
+        )
     for key, value in variant.raw_overrides.items():
         document[key] = value
     return document
@@ -505,10 +569,10 @@ def simulation_document(
 
 def _kernel_pass(variant: Variant):
     for item in variant.profile_passes:
-        if item.kind == "nsys":
+        if item.kind in {"nsys", "neuron"}:
             return item
     raise PackError(
-        f"variants.{variant.name} has no nsys profile pass; kernel alignment needs one"
+        f"variants.{variant.name} has no native kernel capture pass; kernel alignment needs one"
     )
 
 
@@ -567,7 +631,7 @@ def case_documents(
 
 def case_traces(pack: Pack, case: Case) -> dict[str, str]:
     """Trace file name → contents for one rendered case directory."""
-    traces = {WORKLOAD_TRACE_NAME: trace_text(case, case.workload_trace)}
+    traces = {WORKLOAD_TRACE_NAME: case_trace_text(pack, case, case.workload_trace)}
     if case.speculative_acceptance is not None:
         traces[SPECULATIVE_TRACE_NAME] = trace_text(
             case,
@@ -575,8 +639,14 @@ def case_traces(pack: Pack, case: Case) -> dict[str, str]:
             speculative_acceptance=lambda output_len: acceptance_chain(case, output_len),
         )
     if case.kernel_trace is not None:
-        traces[KERNEL_TRACE_NAME] = trace_text(case, case.kernel_trace)
+        traces[KERNEL_TRACE_NAME] = case_trace_text(pack, case, case.kernel_trace)
     return traces
+
+
+def case_trace_text(pack: Pack, case: Case, spec: TraceSpec) -> str:
+    """Use the stock Neuron adapter's simultaneous, inclusive-context contract."""
+    stock = pack.variant_of(case).engine == "vllm_neuron"
+    return trace_text(case, spec, simultaneous=stock, allow_exact_context=stock)
 
 
 def render_case(

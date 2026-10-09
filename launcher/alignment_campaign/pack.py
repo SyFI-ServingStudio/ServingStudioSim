@@ -273,6 +273,9 @@ class HostProfile:
     device_roles: dict[str, str]
     port: int
     startup_timeout: float
+    #: Stock Neuron's image/socket/cache and evidence paths belong to the host,
+    #: while TP/LNC/context and workload policy remain in the portable pack.
+    neuron_server: dict[str, Any] = field(default_factory=dict)
 
     def checkpoint_path(self, key: str) -> str:
         try:
@@ -659,9 +662,7 @@ def load_host(path: Path) -> HostProfile:
         checkpoints=dict(_typed(_require(raw, "checkpoints", where), dict,
                                 f"{where}.checkpoints")),
         text_corpus=_typed(_require(raw, "text_corpus", where), str, f"{where}.text_corpus"),
-        nsys_executable=_typed(
-            _require(raw, "nsys_executable", where), str, f"{where}.nsys_executable"
-        ),
+        nsys_executable=_typed(raw.pop("nsys_executable", ""), str, f"{where}.nsys_executable"),
         fork_python=_typed(raw.pop("fork_python", ""), str, f"{where}.fork_python"),
         device_roles=dict(
             _typed(_require(raw, "device_roles", where), dict, f"{where}.device_roles")
@@ -669,6 +670,9 @@ def load_host(path: Path) -> HostProfile:
         port=_typed(raw.pop("port", 8000), int, f"{where}.port"),
         startup_timeout=float(
             _typed(raw.pop("startup_timeout", 900.0), (int, float), f"{where}.startup_timeout")
+        ),
+        neuron_server=dict(
+            _typed(raw.pop("neuron_server", {}), dict, f"{where}.neuron_server")
         ),
     )
     _reject_extra(raw, where)

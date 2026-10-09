@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -94,7 +95,12 @@ def host_for(pack: Pack, host: HostProfile | None) -> HostProfile:
     checkpoints = dict(base.checkpoints)
     roles = dict(base.device_roles)
     for variant in pack.variants.values():
-        for key in (variant.checkpoint, variant.tokenizer, variant.draft_checkpoint):
+        for key in (
+            variant.checkpoint,
+            variant.tokenizer,
+            variant.draft_checkpoint,
+            variant.server.get("compiled_checkpoint"),
+        ):
             if key is None:
                 continue
             checkpoints.setdefault(key, f"/nonexistent/checkpoints/{key}")
@@ -102,10 +108,24 @@ def host_for(pack: Pack, host: HostProfile | None) -> HostProfile:
         for case in pack.cases:
             if case.variant != variant.name:
                 continue
-            roles.setdefault(case.device_role, ",".join(str(index) for index in range(world_size)))
+            width = 1 if variant.engine in {"nxdi", "vllm_neuron"} else world_size
+            roles.setdefault(case.device_role, ",".join(str(index) for index in range(width)))
     from dataclasses import replace
 
-    return replace(base, checkpoints=checkpoints, device_roles=roles)
+    # Static checks never import the runtime. NxDI requires an explicit Python
+    # path, so the stub supplies a real executable solely to validate its schema.
+    fork_python = sys.executable if any(v.engine == "nxdi" for v in pack.variants.values()) else ""
+    neuron_server = {}
+    if any(v.engine == "vllm_neuron" for v in pack.variants.values()):
+        neuron_server = {
+            "cache_path": "/nonexistent/neuron/cache",
+            "image": "sha256:" + "0" * 64,
+            "docker_host": "unix:///nonexistent/docker.sock",
+            "req_frontend_binary": "/nonexistent/session_runner",
+            "accepted_forward_path": "/nonexistent/accepted-forward",
+        }
+    return replace(base, checkpoints=checkpoints, device_roles=roles, fork_python=fork_python,
+                   neuron_server=neuron_server)
 
 
 # ── trace invariants ─────────────────────────────────────────────────────────
@@ -151,7 +171,10 @@ def compute_invariants(pack: Pack) -> dict[str, Any]:
         for spec in (case.workload_trace, case.kernel_trace):
             if spec is None:
                 continue
-            traces[spec.file] = trace_invariants(trace_text(case, spec))
+            stock = pack.variant_of(case).engine == "vllm_neuron"
+            traces[spec.file] = trace_invariants(trace_text(
+                case, spec, simultaneous=stock, allow_exact_context=stock,
+            ))
     return {
         "schema_version": INVARIANTS_SCHEMA_VERSION,
         "note": (
@@ -275,7 +298,10 @@ def _check_traces(pack: Pack) -> list[Finding]:
                 continue
             where = f"cases[{case.slug}].{role}"
             try:
-                regenerated = trace_text(case, spec)
+                stock = pack.variant_of(case).engine == "vllm_neuron"
+                regenerated = trace_text(
+                    case, spec, simultaneous=stock, allow_exact_context=stock,
+                )
             except PackError as exc:
                 findings.append(Finding("error", where, str(exc)))
                 continue
@@ -288,7 +314,9 @@ def _check_traces(pack: Pack) -> list[Finding]:
                 )
             if actual["distinct_request_ids"] != actual["request_count"]:
                 findings.append(Finding("error", where, f"{spec.file} repeats a request id"))
-            if actual["max_total_len"] >= case.max_model_len:
+            if actual["max_total_len"] > case.max_model_len or (
+                actual["max_total_len"] == case.max_model_len and not stock
+            ):
                 findings.append(
                     Finding("error", where,
                             f"{spec.file} has a request reaching max_model_len "
@@ -559,7 +587,9 @@ def _load_rendered(pack: Pack, case: Case, case_dir: Path) -> list[Finding]:
     for profile_pass in variant.profile_passes:
         path = case_dir / f"{profile_pass.name}.yaml"
         try:
-            config = load_profile_config(path)
+            config = load_profile_config(
+                path, require_python_runtime=variant.engine != "vllm_neuron"
+            )
         except ValueError as exc:
             findings.append(Finding("error", f"{where}.{profile_pass.name}", str(exc)))
             continue
@@ -603,8 +633,9 @@ def _check_cross_phase(pack: Pack, case: Case, documents: dict[str, Any]) -> lis
     if case.chunk_size is not None and group["worker"].get("max_batch_tokens") != case.chunk_size:
         findings.append(Finding("error", f"{where}.simulation", "worker token ceiling differs from case.chunk_size"))
 
-    if group["arch"]["max_model_len"] != case.max_model_len:
-        findings.append(Finding("error", f"{where}.simulation", "arch.max_model_len drifted"))
+    capacity_key = "kv_capacity" if variant.engine == "nxdi" else "max_model_len"
+    if group["arch"][capacity_key] != case.max_model_len:
+        findings.append(Finding("error", f"{where}.simulation", f"arch.{capacity_key} drifted"))
     if simulation["workload"].get("max_concurrency") != case.max_concurrency:
         findings.append(Finding("error", f"{where}.simulation", "max_concurrency drifted"))
     expected_sim_mode = case.profile_arrival_mode.replace("-", "_")
@@ -623,6 +654,20 @@ def _check_cross_phase(pack: Pack, case: Case, documents: dict[str, Any]) -> lis
             findings.append(
                 Finding("error", f"{where}.{profile_pass.name}", "workload.max_model_len drifted")
             )
+        if variant.engine == "vllm_neuron":
+            server = document["server"]
+            if server.get("max_model_len") != case.max_model_len:
+                findings.append(Finding("error", f"{where}.{profile_pass.name}",
+                                        "stock Neuron context limit differs from the case"))
+            if "cuda_visible_devices" in document or "extra_args" in server:
+                findings.append(Finding("error", f"{where}.{profile_pass.name}",
+                                        "stock Neuron must use its whole-chip server contract"))
+            continue
+        if variant.engine == "nxdi":
+            if case.max_model_len != document["server"].get("kv_bucket", 512):
+                findings.append(Finding("error", f"{where}.{profile_pass.name}",
+                                        "NxDI context limit differs from its compiled KV bucket"))
+            continue
         flags = document["server"]["extra_args"]
         limit_flag = CONTEXT_LIMIT_FLAG.get(variant.engine)
         if limit_flag is None:

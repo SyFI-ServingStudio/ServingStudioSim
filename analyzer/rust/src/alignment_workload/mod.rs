@@ -25,7 +25,8 @@ use crate::session::{
 
 /// The `input_adapter` tags this build knows how to read, one per instrumented
 /// serving engine. The record shape behind them is identical.
-const SUPPORTED_INPUT_ADAPTERS: &[&str] = &["vllm_text", "sglang_text"];
+const SUPPORTED_INPUT_ADAPTERS: &[&str] =
+    &["vllm_text", "sglang_text", "nxdi_text", "vllm_neuron_text"];
 
 const COST_COLUMNS: &[&str] = &[
     "pool_tag",
@@ -708,6 +709,24 @@ mod tests {
                 Some(observed),
             )
         }
+    }
+
+    #[test]
+    fn stock_neuron_metrics_preserve_scheduled_workload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        let row = json!({
+            "schema_version":2, "input_adapter":"vllm_neuron_text", "iteration_index":3,
+            "prefill_tokens":0, "decode_kv_lens":[505,506], "prefill_chunk_pairs":[],
+            "observed_start_monotonic_ns":100, "observed_end_monotonic_ns":200,
+            "observed_elapsed_ms":0.0001
+        });
+        fs::write(&path, format!("{row}\n")).unwrap();
+        let points = read_measured_points(&path, None, None).unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].iteration_id, 3);
+        assert_eq!(points[0].decode_batch_size, 2);
+        assert_eq!(points[0].scheduled_kv_tokens, 1011);
     }
 
     #[test]

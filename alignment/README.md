@@ -2,7 +2,7 @@
 
 Alignment exchanges evidence in both directions: measured framework runs validate
 ServingStudio Sim predictions, while ServingStudio Sim predictions provide the reference used to
-attribute framework changes. Both directions consume the same normalized Nsight
+attribute framework changes. Both directions consume the same normalized device
 evidence; their comparison policies remain separate.
 
 The framework-to-simulator path is an explicit phased workflow; each phase has
@@ -82,6 +82,7 @@ alignment/
   load_generator/           thin req-frontend invocation adapter
   profiler/                 vLLM/SGLang lifecycle and NSYS capture
   nsys/                     shared NSYS evidence; serving iteration normalization
+  neuron/                   native Neuron trace and NxDI/stock vLLM serving adapters
   timing_predict_input/     measured iteration → generic predictor inputs
 
 launcher/
@@ -91,6 +92,14 @@ launcher/
 analyzer/
   rust + python             comparison, statistics, payloads, and plots
 ```
+
+Trainium2 uses the native [Neuron adapters](neuron/README.md) with the same
+prediction, inventory labeling and analyzer stages. `nxdi` retains its TP1
+boundary; `vllm_neuron` captures stock TP4 serving for the separately registered
+`llama3_vllm_neuron` architecture. The trace provider and whole-model compiled
+boundary remain explicit in evidence and reports. Stock HTTP alignment is
+initially bounded to the documented C512, `[1,16]` bucket inventory and museum
+corpus; broader Phase0 measurements do not expand that HTTP adapter contract.
 
 `alignment/timing_predict_input` does not parse phase configs or launch the
 predictor. It receives resolved artifacts from the launcher and writes only

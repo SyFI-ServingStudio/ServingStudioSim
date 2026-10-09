@@ -167,7 +167,7 @@ class NsysConfig:
 
 
 #: Every `profile_kind` a profile config may name.
-PROFILE_KINDS = frozenset({"nsys", "workload_metrics", "expert_popularity", "token_corpus"})
+PROFILE_KINDS = frozenset({"nsys", "neuron", "workload_metrics", "expert_popularity", "token_corpus"})
 
 #: The passes that observe MoE routing. They launch the server bare with the
 #: engine's timing instrumentation off. Whichever of them aggregates a

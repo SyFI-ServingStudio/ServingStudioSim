@@ -200,9 +200,11 @@ def _label(args) -> int:
     failed = 0
     for case in _selected_cases(pack, args.case):
         variant = pack.variant_of(case)
-        kernel_pass = next((item for item in variant.profile_passes if item.kind == "nsys"), None)
+        kernel_pass = next(
+            (item for item in variant.profile_passes if item.kind in {"nsys", "neuron"}), None
+        )
         if kernel_pass is None:
-            print(f"[label] {case.slug}: variant has no nsys pass; skipped")
+            print(f"[label] {case.slug}: variant has no native kernel capture pass; skipped")
             continue
         case_dir = out_root / case.slug
         if not case_dir.is_dir():

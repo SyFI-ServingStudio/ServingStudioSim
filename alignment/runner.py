@@ -361,6 +361,14 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     manifest). The GPU capture is the expensive, non-reproducible part of this
     pipeline; a failure in extraction or parsing must never cost a re-capture.
     """
+    if cfg.engine == "nxdi":
+        from .neuron.runner import run_profile as run_nxdi_profile
+
+        return run_nxdi_profile(cfg, resume=resume)
+    if cfg.engine == "vllm_neuron":
+        from .neuron.vllm_runner import run_profile as run_vllm_neuron_profile
+
+        return run_vllm_neuron_profile(cfg, resume=resume)
     if not resume:
         require_gpu(f"an alignment {cfg.profile_kind} capture (starts {cfg.engine})")
     driver, _, _ = _engine(cfg)

@@ -22,7 +22,11 @@ const MAX_GRID_POINTS: usize = 16_384;
 struct GridResponse {
     kind: String,
     describe_config: Value,
+    /// Physical Input fields accepted by simulator `eval`.
+    #[allow(dead_code)] // Physical query metadata is intentionally not a plotted axis.
     input_fields: Vec<String>,
+    /// Grid-axis names accepted by `eval_coords`; these label plotted points.
+    cache_coords: Vec<String>,
     grid_axes: Vec<Vec<f64>>,
 }
 
@@ -67,7 +71,7 @@ pub(super) fn analyze_kernel_throughput(
         );
     }
     let (display_points, coordinate_points) =
-        expand_grid_points(&grid.input_fields, &grid.grid_axes)?;
+        expand_grid_points(&grid.cache_coords, &grid.grid_axes)?;
     let eval = run_kernel_query(
         repo_root,
         &simulator,
@@ -104,7 +108,8 @@ pub(super) fn analyze_kernel_throughput(
         "slot": slot,
         "exact_input": leaf.pointer("/stats/input"),
         "describe_config": grid.describe_config,
-        "input_fields": grid.input_fields,
+        // Keep the plotted-axis contract used by existing UI clients.
+        "input_fields": grid.cache_coords,
         "grid_axes": grid.grid_axes,
         "points": results,
         "semantics": "cache_eval_at_declared_grid",
@@ -227,6 +232,27 @@ mod tests {
                 "{error:#}"
             );
         }
+    }
+
+    #[test]
+    fn categorical_grid_uses_cache_axis_not_physical_query_fields() {
+        let grid: GridResponse = serde_json::from_value(json!({
+            "kind":"neuron_llama_forward", "describe_config":{},
+            "input_fields":["phase","token_bucket"],
+            "cache_coords":["compiled_variant"], "grid_axes":[[0.0,1.0,2.0]]
+        }))
+        .unwrap();
+        let (display, coords) = expand_grid_points(&grid.cache_coords, &grid.grid_axes).unwrap();
+        assert_eq!(grid.input_fields, ["phase", "token_bucket"]);
+        assert_eq!(
+            display,
+            vec![
+                json!({"compiled_variant":0}),
+                json!({"compiled_variant":1}),
+                json!({"compiled_variant":2})
+            ]
+        );
+        assert_eq!(coords, vec![vec![0.0], vec![1.0], vec![2.0]]);
     }
 
     #[test]

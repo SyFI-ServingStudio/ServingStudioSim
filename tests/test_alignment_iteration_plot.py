@@ -404,12 +404,12 @@ def test_stream_breakdown_draws_the_reported_path_on_the_busiest_rank(
     axis = figure.axes[0]
     title = axis.get_title()
     assert "streams of GPU 1 · critical rank changed 4x" in title
-    assert "Nsight 10.000 ms ·" in title
+    assert "Measured 10.000 ms ·" in title
     assert "Timing-predict 12.000 ms" in title
     assert "delta +2.000 ms (+20.00%)" in title
     labels = [label.get_text() for label in axis.get_yticklabels()]
     assert labels[0].startswith("GPU 1 ")
-    assert labels[-2:] == ["Nsight barrier critical path", "Timing-predict critical path"]
+    assert labels[-2:] == ["Measured barrier critical path", "Timing-predict critical path"]
 
     tick_by_label = {
         label.get_text(): tick for label, tick in zip(axis.get_yticklabels(), axis.get_yticks())
@@ -424,5 +424,5 @@ def test_stream_breakdown_draws_the_reported_path_on_the_busiest_rank(
         ]
 
     assert sum(row_widths("Timing-predict critical path")) == pytest.approx(12.0)
-    assert sum(row_widths("Nsight barrier critical path")) == pytest.approx(10.0)
+    assert sum(row_widths("Measured barrier critical path")) == pytest.approx(10.0)
     series_plot.plt.close(figure)

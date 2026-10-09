@@ -63,6 +63,10 @@ GPU_PHASES = frozenset({SIMULATION_PHASE})
 #: marker so an interrupted phase is re-run rather than skipped.
 _PROFILE_ARTIFACTS = {
     "nsys": ("profile_result.json", "parsed.json", "kernel_sequences.json"),
+    "neuron": (
+        "profile_result.json", "system-trace.json", "forward-records.json",
+        "parsed.json", "kernel_sequences.json",
+    ),
     "workload_metrics": ("profile_result.json",),
     "expert_popularity": ("profile_result.json",),
     "token_corpus": ("profile_result.json", "token_corpus/manifest.json"),
@@ -136,7 +140,7 @@ def _artifacts_for(variant: Variant, phase: str) -> tuple[str, ...]:
 #: them. A schema-6 NSYS parse keeps its kernel rows beside `parsed.json`,
 #: which is unreadable without them; an older capture has no such sibling and
 #: names none, so it is still complete.
-_RECORDED_PROFILE_ARTIFACTS = {"nsys": ("parsed_kernel_rows",)}
+_RECORDED_PROFILE_ARTIFACTS = {"nsys": ("parsed_kernel_rows",), "neuron": ("parsed_kernel_rows",)}
 
 
 def _recorded_artifacts_exist(directory: Path, kind: str) -> bool:
@@ -194,7 +198,9 @@ def phase_requirements(case_dir: Path, variant: Variant, phase: str) -> list[str
             missing.append(f"{trace} not rendered")
         return missing
 
-    kernel_pass = next((item for item in variant.profile_passes if item.kind == "nsys"), None)
+    kernel_pass = next(
+        (item for item in variant.profile_passes if item.kind in {"nsys", "neuron"}), None
+    )
     workload_pass = next(
         (item for item in variant.profile_passes if item.kind == "workload_metrics"), None
     )
