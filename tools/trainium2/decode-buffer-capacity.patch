@@ -1,0 +1,17 @@
+--- stock/neuron_model_runner.py
++++ candidate/neuron_model_runner.py
+@@ -8489,7 +8489,13 @@
+         self.input_batch = InputBatch(
+             max_num_reqs=self.max_num_reqs,
+             max_model_len=self.max_model_len,
+-            max_num_batched_tokens=self.max_num_batched_tokens,
++            # Allocation capacity must cover both prefill tokens and padded decode rows.
++            # Keep prefill/segmentation/scheduler budgets unchanged. This trial is
++            # restricted to ordinary one-token decode, without speculative decoding.
++            max_num_batched_tokens=max(
++                self.max_num_batched_tokens,
++                max(self.neuron_config.num_seqs_buckets),
++            ),
+             device=self.device,
+             vocab_size=self.vocab_size,
+             block_sizes=block_sizes,
