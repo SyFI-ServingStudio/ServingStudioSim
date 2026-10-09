@@ -1,4 +1,4 @@
-//! Inkling relative-position attention: the fork's tml FA4 call over one
+//! Relative-position attention: the fork's tml FA4 call over one
 //! varlen batch (`InklingFA4RelAttentionKernel.kernel`).
 //!
 //! Per layer the model makes ONE call for the whole scheduler step, decode and
@@ -100,7 +100,7 @@ const CONTEXT_DOUBLING_END: u32 = 2048;
 const BISECTION_STEPS: usize = 48;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct InklingRelAttentionKernelConfig {
+pub struct RelBiasAttentionKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
@@ -123,7 +123,7 @@ pub struct InklingRelAttentionKernelConfig {
 /// One scheduler step's requests as `(query_len, context_len)`, context
 /// including the query, in the order the batch holds them.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct InklingRelAttentionKernelInput {
+pub struct RelBiasAttentionKernelInput {
     pub query_context_pairs: Vec<(u32, u32)>,
     /// Requests the call is launched over when a FULL CUDA graph pads the
     /// batch with zero-length requests (the capture size); 0, or anything up
@@ -132,7 +132,7 @@ pub struct InklingRelAttentionKernelInput {
     pub padded_requests: u32,
 }
 
-impl SweepCoords for InklingRelAttentionKernelInput {
+impl SweepCoords for RelBiasAttentionKernelInput {
     fn coords(&self) -> Coords {
         // The equivalent context needs the Config (window, heads, splits);
         // `cache_coords` owns the real projection. This config-free view
@@ -172,7 +172,7 @@ fn bucket(max_query: u32) -> u32 {
     max_query.max(1).next_power_of_two()
 }
 
-fn group(config: &InklingRelAttentionKernelConfig) -> u32 {
+fn group(config: &RelBiasAttentionKernelConfig) -> u32 {
     config.num_qo_heads.get() / config.num_kv_heads.get()
 }
 
@@ -184,7 +184,7 @@ fn group(config: &InklingRelAttentionKernelConfig) -> u32 {
 /// than KV tiles and a lone decode stays near 64. The CTA model keeps the cap:
 /// the canonical rows carry the real count, and the cap only steers the
 /// context projection, where a lower count on short requests moves little.
-fn num_splits(config: &InklingRelAttentionKernelConfig, batch: u32, bucket: u32) -> u32 {
+fn num_splits(config: &RelBiasAttentionKernelConfig, batch: u32, bucket: u32) -> u32 {
     if config.is_local {
         return 1;
     }
@@ -223,7 +223,7 @@ fn num_splits(config: &InklingRelAttentionKernelConfig, batch: u32, bucket: u32)
 /// `launched` is the batch the split rule sees: `pairs.len()`, or the
 /// graph-padded size (the padding slots add no CTA work).
 fn cta_works(
-    config: &InklingRelAttentionKernelConfig,
+    config: &RelBiasAttentionKernelConfig,
     pairs: &[(u32, u32)],
     launched: u32,
 ) -> Vec<f64> {
@@ -262,7 +262,7 @@ fn cta_works(
 /// Modelled FA4 makespan: `max(longest CTA, total / SMs)` plus the shared
 /// share. Continuous and monotone in every context; the context projection
 /// inverts it.
-fn makespan(config: &InklingRelAttentionKernelConfig, pairs: &[(u32, u32)], launched: u32) -> f64 {
+fn makespan(config: &RelBiasAttentionKernelConfig, pairs: &[(u32, u32)], launched: u32) -> f64 {
     let works = cta_works(config, pairs, launched);
     let longest = works.iter().copied().fold(0.0, f64::max);
     let per_sm = works.iter().sum::<f64>() / B200_SMS;
@@ -273,7 +273,7 @@ fn makespan(config: &InklingRelAttentionKernelConfig, pairs: &[(u32, u32)], laun
 /// 148 lasting as long as its first. It carries the steps a batch-size change
 /// makes (another wave, a different split count), which the decode-count
 /// coordinate follows between grid points.
-fn wave_makespan(config: &InklingRelAttentionKernelConfig, pairs: &[(u32, u32)]) -> f64 {
+fn wave_makespan(config: &RelBiasAttentionKernelConfig, pairs: &[(u32, u32)]) -> f64 {
     let mut works = cta_works(config, pairs, pairs.len() as u32);
     works.sort_unstable_by(|lhs, rhs| rhs.total_cmp(lhs));
     let waves = works.iter().step_by(B200_SMS as usize).sum::<f64>();
@@ -286,7 +286,7 @@ fn wave_makespan(config: &InklingRelAttentionKernelConfig, pairs: &[(u32, u32)])
 /// from 3 to 1 between 4 and 8 requests beside a 128-token chunk) lands where
 /// it happens rather than being spread over the cell.
 fn decode_coordinate(
-    config: &InklingRelAttentionKernelConfig,
+    config: &RelBiasAttentionKernelConfig,
     decodes: u32,
     prefill: u32,
     context: f64,
@@ -321,7 +321,7 @@ fn decode_coordinate(
 
 /// The canonical batch at a grid point; `None` for the empty batch.
 fn canonical_pairs(
-    config: &InklingRelAttentionKernelConfig,
+    config: &RelBiasAttentionKernelConfig,
     decodes: u32,
     prefill: u32,
     context: u32,
@@ -341,7 +341,7 @@ fn canonical_pairs(
 /// The cache coordinates of a real batch launched over `padded_requests`
 /// slots (see the module doc; 0 = unpadded).
 fn project(
-    config: &InklingRelAttentionKernelConfig,
+    config: &RelBiasAttentionKernelConfig,
     pairs: &[(u32, u32)],
     padded_requests: u32,
 ) -> [f64; 3] {
@@ -366,7 +366,7 @@ fn project(
 
 /// The context at which the canonical batch has the real batch's makespan.
 fn equivalent_context(
-    config: &InklingRelAttentionKernelConfig,
+    config: &RelBiasAttentionKernelConfig,
     pairs: &[(u32, u32)],
     launched: u32,
     decodes: u32,
@@ -405,7 +405,7 @@ fn equivalent_context(
 
 /// The top of the context axis: one window past the window, a local layer's
 /// work is flat, so that is where a longer local batch lands.
-fn context_top(config: &InklingRelAttentionKernelConfig) -> u32 {
+fn context_top(config: &RelBiasAttentionKernelConfig) -> u32 {
     if config.is_local {
         (2 * config.rel_extent + CONTEXT_TILE_OFFSET).min(config.max_model_len)
     } else {
@@ -413,7 +413,7 @@ fn context_top(config: &InklingRelAttentionKernelConfig) -> u32 {
     }
 }
 
-fn context_axis(config: &InklingRelAttentionKernelConfig) -> Vec<f64> {
+fn context_axis(config: &RelBiasAttentionKernelConfig) -> Vec<f64> {
     let mut values: Vec<u32> = if config.is_local {
         let window = config.rel_extent;
         vec![1, window * 5 / 8, window + CONTEXT_TILE_OFFSET]
@@ -444,13 +444,13 @@ fn prefill_coordinate(prefill: u32) -> u32 {
     }
 }
 
-pub struct InklingRelAttentionSpec;
+pub struct RelBiasAttentionSpec;
 
-impl KernelSpec for InklingRelAttentionSpec {
-    type Config = InklingRelAttentionKernelConfig;
-    type Input = InklingRelAttentionKernelInput;
+impl KernelSpec for RelBiasAttentionSpec {
+    type Config = RelBiasAttentionKernelConfig;
+    type Input = RelBiasAttentionKernelInput;
 
-    const KIND: KernelKind = "inkling_rel_attention";
+    const KIND: KernelKind = "rel_bias_attention";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         assert!(config.max_model_len > 0 && config.rel_extent > 0);
@@ -509,15 +509,15 @@ impl KernelSpec for InklingRelAttentionSpec {
     }
 }
 
-register_kernel!(InklingRelAttentionKernel, InklingRelAttentionSpec);
+register_kernel!(RelBiasAttentionKernel, RelBiasAttentionSpec);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::Value;
 
-    fn config(is_local: bool) -> InklingRelAttentionKernelConfig {
-        InklingRelAttentionKernelConfig {
+    fn config(is_local: bool) -> RelBiasAttentionKernelConfig {
+        RelBiasAttentionKernelConfig {
             backends: vec!["tml_fa4"],
             gpu_name: "NVIDIA B200".to_string(),
             num_qo_heads: 8.into(),
@@ -553,7 +553,7 @@ mod tests {
         assert_eq!(num_splits(&config(true), 1, 1), 1);
         // At max_model_len 131072 a lone decode's cap rises to 128; two
         // requests keep 128 // (2 B) = 32.
-        let long = InklingRelAttentionKernelConfig {
+        let long = RelBiasAttentionKernelConfig {
             max_model_len: 131072,
             ..config(false)
         };
@@ -655,12 +655,12 @@ mod tests {
     fn grid_stays_under_the_coordinate_ceiling() {
         for max_model_len in [8192, 131072] {
             for is_local in [false, true] {
-                let cfg = InklingRelAttentionKernelConfig {
+                let cfg = RelBiasAttentionKernelConfig {
                     max_model_len,
                     ..config(is_local)
                 };
-                let grid = InklingRelAttentionSpec::sweep_grid(&cfg);
-                let feasible = InklingRelAttentionSpec::infeasible_mask(&cfg, &grid)
+                let grid = RelBiasAttentionSpec::sweep_grid(&cfg);
+                let feasible = RelBiasAttentionSpec::infeasible_mask(&cfg, &grid)
                     .iter()
                     .filter(|&&masked| !masked)
                     .count();
@@ -679,11 +679,11 @@ mod tests {
         // coordinate ceiling); and a local axis that grows with max_model_len
         // though a local layer reads only its window.
         let axis = |is_local: bool, max_model_len: u32| {
-            let cfg = InklingRelAttentionKernelConfig {
+            let cfg = RelBiasAttentionKernelConfig {
                 max_model_len,
                 ..config(is_local)
             };
-            InklingRelAttentionSpec::sweep_grid(&cfg).axes()[2].clone()
+            RelBiasAttentionSpec::sweep_grid(&cfg).axes()[2].clone()
         };
         assert_eq!(axis(true, 8192), [1.0, 320.0, 576.0, 1088.0]);
         assert_eq!(axis(true, 131072), [1.0, 320.0, 576.0, 1088.0]);
@@ -694,7 +694,7 @@ mod tests {
         );
         // A context past the window and the longest global request both
         // project inside the axis.
-        let global = InklingRelAttentionKernelConfig {
+        let global = RelBiasAttentionKernelConfig {
             max_model_len: 131072,
             ..config(false)
         };
@@ -711,7 +711,7 @@ mod tests {
         // decodes padded to 16 run 4 splits (combine grid steps 8 -> 16 in
         // the diverse_100 capture), not 7, so their CTAs read ~1.75x longer
         // slices than the 8-request rows the unpadded projection leans on.
-        let cfg = InklingRelAttentionKernelConfig {
+        let cfg = RelBiasAttentionKernelConfig {
             max_model_len: 131072,
             ..config(false)
         };
@@ -743,9 +743,8 @@ mod tests {
     fn padded_requests_defaults_to_unpadded() {
         // Defect caught: an older input payload without the field failing to
         // deserialize.
-        let input: InklingRelAttentionKernelInput =
-            serde_json::from_value(serde_json::json!({"query_context_pairs": [[1, 10]]}))
-                .unwrap();
+        let input: RelBiasAttentionKernelInput =
+            serde_json::from_value(serde_json::json!({"query_context_pairs": [[1, 10]]})).unwrap();
         assert_eq!(input.padded_requests, 0);
     }
 
@@ -757,9 +756,9 @@ mod tests {
             Axis::values([64]),
             Axis::values([512]),
         ]);
-        let payload = &InklingRelAttentionSpec::enumerate(&cfg, &grid, "tml_fa4")[0];
+        let payload = &RelBiasAttentionSpec::enumerate(&cfg, &grid, "tml_fa4")[0];
         let fields = payload.fields();
-        // profiling/kernels/inkling_rel_attention.py InklingRelAttentionArgs + backend.
+        // profiling/kernels/rel_bias_attention.py RelBiasAttentionArgs + backend.
         assert_eq!(fields.len(), 12);
         assert_eq!(fields.get("is_local"), Some(&Value::from(true)));
         assert_eq!(fields.get("kv_layout"), Some(&Value::from("lbnhc")));

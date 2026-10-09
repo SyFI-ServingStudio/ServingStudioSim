@@ -1,4 +1,4 @@
-"""Cache fidelity for `rs_sconv_ag_residual_rms_norm` (Inkling Lamport TP collective).
+"""Cache fidelity for `rs_sconv_ag_residual_rms_norm` (Lamport TP collective).
 
 Thin caller of `cache_fidelity.run_fidelity` with physical token probes. The
 generic probes are not used because their `extrap` points sit above the

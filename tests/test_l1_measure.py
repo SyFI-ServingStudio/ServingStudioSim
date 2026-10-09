@@ -187,7 +187,7 @@ def test_interval_union_duration_merges_overlap_but_preserves_gaps():
 
 
 def test_interval_union_capture_accepts_either_stream_starting_first():
-    # Defect caught: a two-stream callable (inkling_qkvr_prep's KV kernel on a
+    # Defect caught: a two-stream callable (sconv_qkvr_prep's KV kernel on a
     # side stream beside its q kernel) aborts the capture when the side
     # stream's kernel happens to start first in a later launch.
     from profiling.profilers import cupti_kernel_profiler as cupti

@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from profiling.runners.attention import inkling_qkvr_prep_vllm_triton as runner
-from profiling.runners.attention.inkling_qkvr_prep_reference import PrepShape, reference_conv
+from profiling.runners.attention import sconv_qkvr_prep_vllm_triton as runner
+from profiling.runners.attention.sconv_qkvr_prep_reference import PrepShape, reference_conv
 from profiling.runners.exceptions import ProfilerNotImplemented
 
 _SHAPE = PrepShape(

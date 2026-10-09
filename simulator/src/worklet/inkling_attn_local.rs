@@ -13,9 +13,9 @@
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    InklingQkvrPrepKernel, InklingQkvrPrepKernelConfig, InklingQkvrPrepKernelInput,
-    InklingRelAttentionKernel, InklingRelAttentionKernelConfig, InklingRelAttentionKernelInput,
-    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    RelBiasAttentionKernel, RelBiasAttentionKernelConfig, RelBiasAttentionKernelInput,
+    SconvQkvrPrepKernel, SconvQkvrPrepKernelConfig, SconvQkvrPrepKernelInput, SingleGemmKernel,
+    SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
@@ -53,8 +53,8 @@ pub struct InklingAttnLocalWorkletConfig {
 pub struct InklingAttnLocalWorkletResolved {
     pub raw_cfg: InklingAttnLocalWorkletConfig,
     pub qkvr_proj: SingleGemmKernelConfig,
-    pub qkvr_prep: InklingQkvrPrepKernelConfig,
-    pub rel_attention: InklingRelAttentionKernelConfig,
+    pub qkvr_prep: SconvQkvrPrepKernelConfig,
+    pub rel_attention: RelBiasAttentionKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
 }
 
@@ -72,8 +72,8 @@ pub struct InklingAttnLocalWorkletInput {
 pub struct InklingAttnLocalWorklet {
     pub name: String,
     pub qkvr_proj: Op<SingleGemmKernel>,
-    pub qkvr_prep: Op<InklingQkvrPrepKernel>,
-    pub rel_attention: Op<InklingRelAttentionKernel>,
+    pub qkvr_prep: Op<SconvQkvrPrepKernel>,
+    pub rel_attention: Op<RelBiasAttentionKernel>,
     pub o_proj: Op<SingleGemmKernel>,
     resolved: InklingAttnLocalWorkletResolved,
 }
@@ -97,7 +97,7 @@ impl InklingAttnLocalWorklet {
         };
         InklingAttnLocalWorkletResolved {
             qkvr_proj: gemm(qkvr_width, cfg.hidden.clone()),
-            qkvr_prep: InklingQkvrPrepKernelConfig {
+            qkvr_prep: SconvQkvrPrepKernelConfig {
                 backends: cfg.prep_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_q_heads: cfg.num_q_heads,
@@ -113,7 +113,7 @@ impl InklingAttnLocalWorklet {
                 page_size: cfg.page_size,
                 dtype: cfg.dtype,
             },
-            rel_attention: InklingRelAttentionKernelConfig {
+            rel_attention: RelBiasAttentionKernelConfig {
                 backends: cfg.attention_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_qo_heads: cfg.num_q_heads.into(),
@@ -151,14 +151,14 @@ impl InklingAttnLocalWorklet {
                 n,
                 "qkvr_prep",
                 r.qkvr_prep,
-                InklingQkvrPrepKernel::build,
+                SconvQkvrPrepKernel::build,
                 bridge,
             )?,
             rel_attention: atomic(
                 n,
                 "rel_attention",
                 r.rel_attention,
-                InklingRelAttentionKernel::build,
+                RelBiasAttentionKernel::build,
                 bridge,
             )?,
             o_proj: atomic(n, "o_proj", r.o_proj, SingleGemmKernel::build, bridge)?,
@@ -194,7 +194,7 @@ impl InklingAttnLocalWorklet {
         push_or_zero(&self.qkvr_proj, rows.clone(), false, ev);
         push_or_zero(
             &self.qkvr_prep,
-            InklingQkvrPrepKernelInput {
+            SconvQkvrPrepKernelInput {
                 num_tokens: input.num_tokens,
             },
             false,
@@ -202,7 +202,7 @@ impl InklingAttnLocalWorklet {
         );
         push_or_zero(
             &self.rel_attention,
-            InklingRelAttentionKernelInput {
+            RelBiasAttentionKernelInput {
                 query_context_pairs: input.query_context_pairs.clone(),
                 padded_requests: input.padded_requests,
             },

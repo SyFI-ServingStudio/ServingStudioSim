@@ -1,4 +1,4 @@
-"""Profile the Inkling MoE router GEMM dispatch of the alignment vLLM fork.
+"""Profile the alignment vLLM fork's ``_linear_with_fp32_out`` GEMM dispatch.
 
 The timed callable is ``vllm.models.inkling.nvidia.moe._linear_with_fp32_out``
 itself, so the runner follows the production dispatch rather than restating it:
@@ -25,7 +25,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_BACKEND = "gemm_fp32_output:vllm_inkling_router_auto"
+_BACKEND = "gemm_fp32_output:vllm_ll_bf16_auto"
 # FP32 accumulation of bf16 products in a different order than the reference;
 # relative to the output's Frobenius norm.
 _REL_FROBENIUS_TOL = 1e-4
@@ -58,7 +58,7 @@ def _check_output(torch: Any, hidden: Any, weight: Any, actual: Any) -> None:
         raise AssertionError(f"relative Frobenius error {float(error):.3e} exceeds tolerance")
 
 
-def profile_gemm_fp32_output_vllm_inkling_router(
+def profile_gemm_fp32_output_vllm_ll_bf16(
     m: int,
     n: int,
     k: int,
@@ -70,7 +70,7 @@ def profile_gemm_fp32_output_vllm_inkling_router(
         from vllm.models.inkling.nvidia.moe import _linear_with_fp32_out
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires the alignment vLLM fork with Inkling (vllm_upstream_fork_env)"
+            f"{_BACKEND} requires the alignment vLLM fork (vllm_upstream_fork_env)"
         ) from exc
 
     try:
@@ -107,4 +107,4 @@ def profile_gemm_fp32_output_vllm_inkling_router(
     )
 
 
-__all__ = ["profile_gemm_fp32_output_vllm_inkling_router"]
+__all__ = ["profile_gemm_fp32_output_vllm_ll_bf16"]

@@ -1,6 +1,6 @@
-"""Inkling's fused reduce-scatter + short conv + all-gather + residual + RMSNorm.
+"""Fused reduce-scatter + short conv + all-gather + residual + RMSNorm.
 
-Inkling replaces every tensor-parallel all-reduce with one collective call,
+The model replaces every tensor-parallel all-reduce with one collective call,
 ``LamportRSConv.rs_sconv_ag_add_norm`` (vLLM ``models/inkling/nvidia/ops/
 lamport.py``): the TP-partial sublayer output (plus the MoE sink partial) is
 reduce-scattered over the hidden dim, each rank runs the causal depthwise
@@ -60,14 +60,14 @@ DOC = KernelDoc(
         "GPU's hidden shard, gather it back, add the residual and RMS-normalize."
     ),
     description=(
-        "Inkling's TP collective after every attention and MLP sublayer. Each GPU "
+        "The TP collective after every attention and MLP sublayer. Each GPU "
         "publishes its partial (plus the MoE sink partial when has_shared) to the "
         "shard owners through symmetric memory; each owner sums them, writes the "
         "result into the paged conv-state cache, applies the causal depthwise "
         "k=4 convolution with skip over that cache, adds the residual and "
         "publishes its shard to every GPU, which gathers the full row and applies "
         "RMSNorm. Inputs are random BF16 partials; the conv-state cache uses "
-        "Inkling's paged layout (block size 4) with one decode token per request "
+        "the fork's paged layout (block size 4) with one decode token per request "
         "and its prior taps already cached."
     ),
     category="Communication",
@@ -118,13 +118,13 @@ register(
         args_schema=RsSconvAgResidualRmsNormArgs,
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
-        # The Inkling model code exists only in the rebased alignment checkout.
+        # LamportRSConv exists only in the rebased alignment checkout.
         subprocess_env="vllm_upstream_fork_env",
         gpu_count_fn=lambda spec: int(spec["num_gpus"]),
         list_native=True,
         doc=BackendDoc(
             summary=(
-                "vLLM Inkling's LamportRSConv.rs_sconv_ag_add_norm: four PDL-chained "
+                "The alignment fork's LamportRSConv.rs_sconv_ag_add_norm: four PDL-chained "
                 "Triton launches over torch symmetric memory, run in a real vLLM TP group."
             ),
         ),

@@ -37,13 +37,12 @@ pub mod glm52_moe_router_local;
 pub mod glm52_mtp_head_local;
 pub mod glm52_mtp_prelude_local;
 pub mod glm52_shared_expert_local;
-mod glm53_common;
+pub(crate) mod glm53_common;
 pub mod glm53_dsa_attn_local;
 pub mod glm53_kda_attn_local;
 pub mod glm53_mlp_local;
 pub mod glm53_moe_local;
 pub mod inkling_attn_local;
-pub mod inkling_mlp_local;
 pub mod inkling_router_local;
 pub mod mlp_block_tp;
 pub mod moe_expert_compute_local;
@@ -191,10 +190,6 @@ pub use glm53_moe_local::{
 pub use inkling_attn_local::{
     InklingAttnLocalWorklet, InklingAttnLocalWorkletConfig, InklingAttnLocalWorkletInput,
     InklingAttnLocalWorkletResolved,
-};
-pub use inkling_mlp_local::{
-    InklingMlpLocalWorklet, InklingMlpLocalWorkletConfig, InklingMlpLocalWorkletInput,
-    InklingMlpLocalWorkletResolved,
 };
 pub use inkling_router_local::{
     InklingRouterLocalWorklet, InklingRouterLocalWorkletConfig, InklingRouterLocalWorkletInput,

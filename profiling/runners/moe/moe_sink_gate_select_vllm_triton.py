@@ -1,4 +1,4 @@
-"""Profile Inkling's gate select (``inkling_gate_select``) from the alignment fork.
+"""Profile the sink-renormalized gate select (``inkling_gate_select``) from the alignment fork.
 
 ``vllm_triton`` times one call of
 ``vllm.models.inkling.nvidia.moe.inkling_gate_select`` with the arguments
@@ -190,7 +190,7 @@ def _import_callable() -> tuple[Any, Any]:
         from vllm.models.inkling.nvidia.moe import inkling_gate_select
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires the alignment vLLM fork with Inkling (vllm_upstream_fork_env)"
+            f"{_BACKEND} requires the alignment vLLM fork (vllm_upstream_fork_env)"
         ) from exc
     return torch, inkling_gate_select
 

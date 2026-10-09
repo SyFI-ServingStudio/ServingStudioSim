@@ -1,4 +1,4 @@
-"""Independent Torch reference for Inkling's fused QKVR prep.
+"""Independent Torch reference for the fused short-conv QKVR prep.
 
 Written from the layer math in the alignment fork
 (``vllm/models/inkling/nvidia/attention.py``: ``InklingShortConv`` on K and V,
@@ -140,7 +140,7 @@ def reference_prep(
 
 
 def log_scaling_tau(torch: Any, positions: Any, n_floor: int, alpha: float) -> Any:
-    """Inkling's per-token log-length scale (fp32), as the model computes it."""
+    """The per-token log-length scale (fp32), as the model computes it."""
     n = (positions + 1).float() / float(n_floor)
     return 1.0 + alpha * torch.log(torch.clamp(n, min=1.0))
 

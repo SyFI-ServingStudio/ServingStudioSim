@@ -1,4 +1,4 @@
-"""PyTorch reference for Inkling relative-position attention.
+"""PyTorch reference for relative-position attention.
 
 Independent of tml_fa4: it reads keys and values through the page table and
 applies the relative logits by distance, the way the model defines them

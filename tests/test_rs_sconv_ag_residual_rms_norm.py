@@ -1,4 +1,4 @@
-"""CPU tests for the Inkling Lamport RS + short-conv + AG + residual + RMSNorm kind."""
+"""CPU tests for the Lamport RS + short-conv + AG + residual + RMSNorm kind."""
 
 from __future__ import annotations
 

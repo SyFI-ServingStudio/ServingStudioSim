@@ -1,4 +1,4 @@
-"""vLLM Inkling Lamport RS + short-conv + AG + residual + RMSNorm runner.
+"""vLLM Lamport RS + short-conv + AG + residual + RMSNorm runner.
 
 Times the production public call
 ``vllm.models.inkling.nvidia.ops.lamport.LamportRSConv.rs_sconv_ag_add_norm``
@@ -13,9 +13,9 @@ so each rank initializes vLLM's real distributed state
 
 Inputs follow the production producer contract. The partials are TP-partial
 ``[T, H]`` sublayer outputs (plus the MoE sink partial when ``has_shared``);
-the conv-state cache is Inkling's paged per-layer SWA cache
-``[num_blocks, H_rank, block_size, D]`` whose layout the runner derives from the
-Inkling config (``sconv_swa_attn.py``): ``ws = hidden / num_kv_heads``,
+the conv-state cache is the model's paged per-layer SWA cache
+``[num_blocks, H_rank, block_size, D]`` whose layout the runner derives as
+``sconv_swa_attn.py`` does: ``ws = hidden / num_kv_heads``,
 ``H_rank = (hidden / tp) / ws``, ``D = next_pow2(2·head_dim + 2·ws)``, and the
 stream offset ``2·head_dim`` (attention sublayer) or ``2·head_dim + ws`` (MLP
 sublayer). The default token layout is decode-like: one token per request at
@@ -57,11 +57,12 @@ SUPPORTED_CONV_KERNEL_SIZE = 4
 # ``lamport._MAX_TOKENS``: the symmetric buffers hold at most this many tokens.
 MAX_TOKENS = 16384
 
-# Inkling config constants that fix the conv-state cache layout
-# (Inkling-Small: num_key_value_heads 8, head_dim 128).
-INKLING_NUM_KV_HEADS = 8
-INKLING_HEAD_DIM = 128
-INKLING_RMS_NORM_EPS = 1e-6
+# Defaults for the model config values that fix the conv-state cache layout
+# (``num_key_value_heads``, ``head_dim``) and the norm epsilon. The kind's args
+# do not carry them: adding a field would rehash every measured row.
+CONV_STATE_NUM_KV_HEADS = 8
+CONV_STATE_HEAD_DIM = 128
+RMS_NORM_EPS = 1e-6
 
 DECODE_LAYOUT = "decode"
 PREFILL_LAYOUT = "prefill"
@@ -119,11 +120,11 @@ def _check_spec(spec: dict, num_gpus: int) -> None:
         raise ValueError(f"Lamport RS+sconv is bf16 only, got {spec['dtype']}")
     hidden = int(spec["hidden_dim"])
     shard = hidden // num_gpus
-    if hidden % (2 * num_gpus) or hidden % INKLING_NUM_KV_HEADS:
+    if hidden % (2 * num_gpus) or hidden % CONV_STATE_NUM_KV_HEADS:
         raise ValueError(f"hidden_dim {hidden} does not shard over TP {num_gpus}")
-    if shard % (hidden // INKLING_NUM_KV_HEADS):
+    if shard % (hidden // CONV_STATE_NUM_KV_HEADS):
         raise ValueError(
-            f"TP {num_gpus} exceeds the {INKLING_NUM_KV_HEADS} conv-state heads "
+            f"TP {num_gpus} exceeds the {CONV_STATE_NUM_KV_HEADS} conv-state heads "
             "(sconv_swa_attn requires tp <= num_kv_heads)"
         )
 
@@ -136,7 +137,7 @@ def _imports():
         from vllm.models.inkling.nvidia.ops.lamport import LamportRSConv
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            "the vLLM checkout with the Inkling model (vllm_upstream_fork_env) is required"
+            "the alignment vLLM checkout (vllm_upstream_fork_env) is required"
         ) from exc
     return torch, dist, get_tp_group, LamportRSConv
 
@@ -205,7 +206,7 @@ def _profile_one(*, torch, dist, tp_group, state, spec, layout, warmup, rep) -> 
             case["residual"],
             case["conv_weight"],
             case["norm_weight"],
-            INKLING_RMS_NORM_EPS,
+            RMS_NORM_EPS,
             case["cache"],
             case["positions"],
             case["block_table"],
@@ -256,13 +257,13 @@ def _profile_one(*, torch, dist, tp_group, state, spec, layout, warmup, rep) -> 
 
 
 def conv_cache_layout(hidden: int, world_size: int, has_shared: bool) -> dict[str, int]:
-    """Inkling's per-rank conv-state cache geometry (``sconv_swa_attn.py``)."""
-    ws = hidden // INKLING_NUM_KV_HEADS
+    """The per-rank conv-state cache geometry (``sconv_swa_attn.py``)."""
+    ws = hidden // CONV_STATE_NUM_KV_HEADS
     heads_per_rank = (hidden // world_size) // ws
-    head_size = 1 << (2 * INKLING_HEAD_DIM + 2 * ws - 1).bit_length()
+    head_size = 1 << (2 * CONV_STATE_HEAD_DIM + 2 * ws - 1).bit_length()
     # MoE (has_shared) calls are MLP-sublayer calls; the others are mostly
     # attention-sublayer calls. The offset only moves the stream within a page.
-    off_s = 2 * INKLING_HEAD_DIM + (ws if has_shared else 0)
+    off_s = 2 * CONV_STATE_HEAD_DIM + (ws if has_shared else 0)
     return {"ws": ws, "heads_per_rank": heads_per_rank, "head_size": head_size, "off_s": off_s}
 
 
@@ -387,7 +388,7 @@ def validate_case(torch, case: dict, launch, *, rank: int, world_size: int) -> d
         case["residual"],
         case["conv_weight_full"],
         case["norm_weight"],
-        INKLING_RMS_NORM_EPS,
+        RMS_NORM_EPS,
         case["prior_taps"],
         case["positions"],
         case["seq_idx"],

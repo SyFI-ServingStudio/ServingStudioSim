@@ -1,11 +1,11 @@
-"""Profile Inkling relative-position attention: the fork's tml FA4 call.
+"""Profile relative-position attention: the fork's tml FA4 call.
 
 Builds one varlen batch from ``query_context_pairs`` over a paged LBNHC KV cache,
 picks ``num_splits`` and the bucketed ``max_seqlen_q`` exactly as
 ``InklingAttention._attention`` does, and times
 ``InklingFA4RelAttentionKernel.kernel`` with CUPTI summing every launch.
 
-Cache layout. vLLM allocates the Inkling attention cache as LBNHC: per layer a
+Cache layout. vLLM allocates this attention cache as LBNHC: per layer a
 page is ``[page_size, kv_heads, 2 * head_dim]`` with K and V of one (token, head)
 side by side, and ``_split_kv_cache`` hands FA4 the two strided halves
 (token stride ``2 * kv_heads * head_dim``). The runner allocates the same raw
@@ -24,7 +24,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-KIND = "inkling_rel_attention"
+KIND = "rel_bias_attention"
 _MAX_REQUESTS = 1024  # past this tml_fa4 skips the cu-blocks path (another launch set)
 _MAX_TOKENS = 32768
 _SUPPORTED_HEAD_DIMS = (128,)
@@ -222,7 +222,7 @@ def check_rows(torch: Any, query: int) -> Any:
 
 def check_against_reference(torch: Any, shape: _Shape, work: _Workload) -> dict:
     """Compare sampled output rows with the float32 PyTorch reference."""
-    from profiling.runners.attention.inkling_rel_attention_reference import (
+    from profiling.runners.attention.rel_bias_attention_reference import (
         gather_request_kv,
         rel_attention_reference,
     )
@@ -274,7 +274,7 @@ def build_tml_fa4(torch: Any, shape: _Shape, device: Any) -> tuple[_Workload, An
         )
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{KIND}:tml_fa4 requires the Inkling vLLM fork (vllm_upstream_fork_env)"
+            f"{KIND}:tml_fa4 requires the alignment vLLM fork (vllm_upstream_fork_env)"
         ) from exc
 
     work = _build_workload(torch, shape, device)
@@ -309,7 +309,7 @@ def build_tml_fa4(torch: Any, shape: _Shape, device: Any) -> tuple[_Workload, An
     return work, run, num_splits
 
 
-def profile_inkling_rel_attention_tml_fa4(**kwargs: Any) -> ComputeMetrics:
+def profile_rel_bias_attention_tml_fa4(**kwargs: Any) -> ComputeMetrics:
     """Time the fork's InklingFA4RelAttentionKernel.kernel over one varlen batch."""
     shape = _validate_args(**kwargs)
     try:

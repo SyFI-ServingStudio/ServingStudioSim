@@ -1,4 +1,4 @@
-"""`inkling_rel_attention` cache fidelity: a Recipe-B caller.
+"""`rel_bias_attention` cache fidelity: a Recipe-B caller.
 
 Why a dedicated caller: the Rust Input is a ragged `query_context_pairs` batch
 that the cache projects to (decode requests, prefill tokens, equivalent
@@ -23,11 +23,11 @@ and global layers) at `--max-model-len` (default 8192):
 
 Two stages, run from the repo root under uv:
 
-    uv run python tools/cache-fidelity-analyzer/inkling_rel_attention_fidelity.py \
+    uv run python tools/cache-fidelity-analyzer/rel_bias_attention_fidelity.py \
         probes --out-dir DIR [--max-model-len N] [--capture-probes FILE]
-    uv run python -m profiling run inkling_rel_attention --backend tml_fa4 \
+    uv run python -m profiling run rel_bias_attention --backend tml_fa4 \
         --specs DIR/probe_specs.json --fresh --output-dir OUT --json > DIR/truth.json
-    uv run python tools/cache-fidelity-analyzer/inkling_rel_attention_fidelity.py \
+    uv run python tools/cache-fidelity-analyzer/rel_bias_attention_fidelity.py \
         report --out-dir DIR --truth DIR/truth.json
 
 `report` evaluates the Rust cache through `simulator kernel-query eval`, which
@@ -45,7 +45,7 @@ from pathlib import Path
 
 import cache_fidelity as cf  # the generic core (sibling file)
 
-KIND = "inkling_rel_attention"
+KIND = "rel_bias_attention"
 BACKEND = "tml_fa4"
 GPU = "NVIDIA B200"
 _DIMS = {

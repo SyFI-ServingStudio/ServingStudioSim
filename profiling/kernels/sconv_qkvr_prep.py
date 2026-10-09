@@ -1,4 +1,4 @@
-"""Inkling's fused QKVR prep: K/V short conv, q/k norms, log scaling, KV insert, rel logits.
+"""Fused QKVR prep: K/V short conv, q/k norms, log scaling, KV insert, rel logits.
 
 Source: alignment fork, ``vllm/models/inkling/nvidia/ops/qkvr_prep.py``
 (``fused_qkvr_prep``), called once per layer by ``InklingAttention.forward``
@@ -50,11 +50,11 @@ from profiling.db.registry import (
     register,
 )
 
-KIND = "inkling_qkvr_prep"
+KIND = "sconv_qkvr_prep"
 
 
 @dataclass(frozen=True)
-class InklingQkvrPrepArgs(KernelArgs):
+class SconvQkvrPrepArgs(KernelArgs):
     num_tokens: int = arg(unit="tokens", doc="Rows of the qkvr input in this call.")
     num_q_heads: int = arg(unit="heads", doc="Query heads on this GPU.")
     num_kv_heads: int = arg(unit="heads", doc="KV heads on this GPU.")
@@ -73,7 +73,7 @@ class InklingQkvrPrepArgs(KernelArgs):
 
 
 DOC = KernelDoc(
-    title="Inkling QKVR prep",
+    title="Short-conv QKVR prep",
     summary=(
         "Short-conv K and V, RMS-normalize q and k, scale by tau, insert K/V into "
         "the paged cache and project the relative-position logits, in one call."
@@ -118,7 +118,7 @@ DOC = KernelDoc(
         "TFLOPS is not computed. GB/s counts the qkvr read, q and rel-logit "
         "writes and both caches' K/V writes, not the cached conv taps.",
     ),
-    reference="profiling.runners.attention.inkling_qkvr_prep_reference",
+    reference="profiling.runners.attention.sconv_qkvr_prep_reference",
 )
 
 
@@ -127,11 +127,11 @@ register(
         kernel_kind=KIND,
         backend="vllm_triton",
         runner_ref=RunnerRef(
-            module_name="profiling.runners.attention.inkling_qkvr_prep_vllm_triton",
-            function_name="profile_inkling_qkvr_prep_vllm_triton",
+            module_name="profiling.runners.attention.sconv_qkvr_prep_vllm_triton",
+            function_name="profile_sconv_qkvr_prep_vllm_triton",
         ),
         table_name=KIND,
-        args_schema=InklingQkvrPrepArgs,
+        args_schema=SconvQkvrPrepArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         # Portable Triton kernels; the rel projection is a bf16 tl.dot, which
@@ -141,7 +141,7 @@ register(
             kv=frozenset({DType.BF16}),
             min_compute_capability=(8, 0),
         ),
-        # Inkling exists only in the upstream-rebased alignment fork.
+        # The fused_qkvr_prep call exists only in the upstream-rebased alignment fork.
         subprocess_env="vllm_upstream_fork_env",
         doc=BackendDoc(
             summary=(
@@ -153,4 +153,4 @@ register(
     )
 )
 
-__all__ = ["InklingQkvrPrepArgs", "KIND"]
+__all__ = ["SconvQkvrPrepArgs", "KIND"]
