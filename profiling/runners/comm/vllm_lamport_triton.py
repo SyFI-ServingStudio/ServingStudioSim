@@ -440,7 +440,7 @@ def _time_cuda_graph(*, torch, dist, tp_group, launch, device, warmup: int, rep:
     flush_sum = torch.empty((), dtype=torch.float32, device=device)
 
     def clear_l2():
-        torch.sum(flush, out=flush_sum)
+        torch.sum(flush, dim=0, out=flush_sum)
 
     # Production replays the call inside a CUDA graph (84 calls per forward),
     # between other kernels; here an L2 clear separates consecutive calls.
