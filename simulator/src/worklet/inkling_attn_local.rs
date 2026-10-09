@@ -64,6 +64,9 @@ pub struct InklingAttnLocalWorkletInput {
     pub num_tokens: u32,
     /// The step's real requests as `(query_len, context_len)`.
     pub query_context_pairs: Vec<(u32, u32)>,
+    /// Requests attention is launched over when a FULL CUDA graph pads the
+    /// batch with zero-length requests; 0 = unpadded.
+    pub padded_requests: u32,
 }
 
 pub struct InklingAttnLocalWorklet {
@@ -201,6 +204,7 @@ impl InklingAttnLocalWorklet {
             &self.rel_attention,
             InklingRelAttentionKernelInput {
                 query_context_pairs: input.query_context_pairs.clone(),
+                padded_requests: input.padded_requests,
             },
             false,
             ev,

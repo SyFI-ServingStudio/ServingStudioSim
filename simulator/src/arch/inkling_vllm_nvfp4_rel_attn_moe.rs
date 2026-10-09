@@ -668,6 +668,7 @@ impl LayerGroup {
             &InklingAttnLocalWorkletInput {
                 num_tokens: tokens,
                 query_context_pairs: batch.query_context_pairs.clone(),
+                padded_requests: attention_padded_requests(batch, tokens),
             },
             ev,
         );
@@ -1035,6 +1036,22 @@ fn sinks_on_aux_stream(batch: &NormalizedBatch, padded_tokens: u32, capture_size
     padded_tokens <= SINK_STREAM_TOKEN_THRESHOLD && (uniform_decode || eager)
 }
 
+/// The request count attention is launched over. A uniform-decode step that
+/// fits a captured size replays a FULL graph, whose attention metadata the
+/// model runner pads to the capture size with zero-length requests
+/// (`pad_attn`, `num_reqs_padded` in gpu_model_runner.py); the fork's FA4 split
+/// count follows that size. Steps with a prefill chunk replay a piecewise
+/// graph over the real requests, and a step past the largest size runs eagerly
+/// (`padded_tokens` is then the real count), so both stay unpadded (0).
+fn attention_padded_requests(batch: &NormalizedBatch, padded_tokens: u32) -> u32 {
+    let uniform_decode = batch.query_context_pairs.iter().all(|&(query, _)| query == 1);
+    if uniform_decode {
+        padded_tokens
+    } else {
+        0
+    }
+}
+
 /// Which Lamport calls of a step take the served decode-step row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LamportServed {
@@ -1367,6 +1384,24 @@ mod tests {
             lamport_served(&decode, sinks_overlap(&decode, &wide)),
             LamportServed { dense: true, moe: false }
         );
+    }
+
+    #[test]
+    fn full_graph_decode_launches_attention_over_the_capture_size() {
+        // Defect caught: FA4's split count taken from the real decode count
+        // when the FULL graph pads seq_lens to the capture size.
+        let sizes = parallel().cudagraph_capture_sizes;
+        let padded = |batch: NormalizedBatch| {
+            let tokens = graph_padded_tokens(&sizes, batch.total_tokens);
+            attention_padded_requests(&batch, tokens)
+        };
+        assert_eq!(padded(step(vec![], vec![400; 9])), 16);
+        assert_eq!(padded(step(vec![], vec![400; 8])), 8);
+        assert_eq!(padded(step(vec![], vec![400; 3])), 4);
+        // A prefill chunk runs piecewise over the real requests.
+        assert_eq!(padded(step(vec![(0, 50)], vec![400; 7])), 0);
+        // Past the largest captured size the step runs eagerly, unpadded.
+        assert_eq!(padded(step(vec![], vec![400; 33])), 33);
     }
 
     #[test]

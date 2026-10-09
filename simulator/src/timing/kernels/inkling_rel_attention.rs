@@ -42,6 +42,18 @@
 //! CTA model counted in whole waves of 148 CTAs (`decode_coordinate`), so a
 //! wave or split-count step lands where it happens instead of being averaged
 //! across the cell.
+//!
+//! A FULL CUDA-graph decode step launches over the captured batch size, not
+//! the real one: the model runner pads `seq_lens` with zero-length requests
+//! up to the capture size (`gpu_model_runner._build_attention_metadata`) and
+//! `InklingAttention._attention` passes `seq_lens.shape[0]` to
+//! `inkling_fa4_num_splits`. `padded_requests` carries that size. The split
+//! count follows it (9 real decodes padded to 16 run 4 splits, not 7), and the
+//! padding slots count as decodes in the cache coordinate, so the step reads
+//! the canonical rows of the padded size, which have the same split count.
+//! The zero-length slots add no CTA work. Local layers never split, so they
+//! keep the real batch. In the standard diverse_100 capture the combine grid
+//! steps at 1, 2, 4, 8, 16 requests and nowhere between.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -113,6 +125,11 @@ pub struct InklingRelAttentionKernelConfig {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InklingRelAttentionKernelInput {
     pub query_context_pairs: Vec<(u32, u32)>,
+    /// Requests the call is launched over when a FULL CUDA graph pads the
+    /// batch with zero-length requests (the capture size); 0, or anything up
+    /// to the real count, means unpadded.
+    #[serde(default)]
+    pub padded_requests: u32,
 }
 
 impl SweepCoords for InklingRelAttentionKernelInput {
@@ -203,14 +220,20 @@ fn num_splits(config: &InklingRelAttentionKernelConfig, batch: u32, bucket: u32)
 }
 
 /// Every CTA's modelled work in KV-tile units (see the module doc).
-fn cta_works(config: &InklingRelAttentionKernelConfig, pairs: &[(u32, u32)]) -> Vec<f64> {
+/// `launched` is the batch the split rule sees: `pairs.len()`, or the
+/// graph-padded size (the padding slots add no CTA work).
+fn cta_works(
+    config: &InklingRelAttentionKernelConfig,
+    pairs: &[(u32, u32)],
+    launched: u32,
+) -> Vec<f64> {
     assert!(!pairs.is_empty(), "query_context_pairs must be non-empty");
     let max_query = pairs.iter().map(|&(query, _)| query).max().unwrap();
     let bucket = bucket(max_query);
     let g = group(config);
     let q_stage = if bucket * g > TILE_M { 2 } else { 1 };
     let tile_tokens = (TILE_M * q_stage / g).max(1);
-    let splits = num_splits(config, pairs.len() as u32, bucket);
+    let splits = num_splits(config, launched.max(pairs.len() as u32), bucket);
     let copies = (splits * config.num_kv_heads.get()) as usize;
     let window = f64::from(config.rel_extent);
 
@@ -239,8 +262,8 @@ fn cta_works(config: &InklingRelAttentionKernelConfig, pairs: &[(u32, u32)]) -> 
 /// Modelled FA4 makespan: `max(longest CTA, total / SMs)` plus the shared
 /// share. Continuous and monotone in every context; the context projection
 /// inverts it.
-fn makespan(config: &InklingRelAttentionKernelConfig, pairs: &[(u32, u32)]) -> f64 {
-    let works = cta_works(config, pairs);
+fn makespan(config: &InklingRelAttentionKernelConfig, pairs: &[(u32, u32)], launched: u32) -> f64 {
+    let works = cta_works(config, pairs, launched);
     let longest = works.iter().copied().fold(0.0, f64::max);
     let per_sm = works.iter().sum::<f64>() / B200_SMS;
     longest.max(per_sm) + SHARED_WORK_WEIGHT * per_sm
@@ -251,7 +274,7 @@ fn makespan(config: &InklingRelAttentionKernelConfig, pairs: &[(u32, u32)]) -> f
 /// makes (another wave, a different split count), which the decode-count
 /// coordinate follows between grid points.
 fn wave_makespan(config: &InklingRelAttentionKernelConfig, pairs: &[(u32, u32)]) -> f64 {
-    let mut works = cta_works(config, pairs);
+    let mut works = cta_works(config, pairs, pairs.len() as u32);
     works.sort_unstable_by(|lhs, rhs| rhs.total_cmp(lhs));
     let waves = works.iter().step_by(B200_SMS as usize).sum::<f64>();
     waves + SHARED_WORK_WEIGHT * works.iter().sum::<f64>() / B200_SMS
@@ -315,11 +338,25 @@ fn canonical_pairs(
     Some(pairs)
 }
 
-/// The cache coordinates of a real batch (see the module doc).
-fn project(config: &InklingRelAttentionKernelConfig, pairs: &[(u32, u32)]) -> [f64; 3] {
+/// The cache coordinates of a real batch launched over `padded_requests`
+/// slots (see the module doc; 0 = unpadded).
+fn project(
+    config: &InklingRelAttentionKernelConfig,
+    pairs: &[(u32, u32)],
+    padded_requests: u32,
+) -> [f64; 3] {
     let (decodes, prefill) = counts(pairs);
     let prefill = prefill_coordinate(prefill);
-    let context = equivalent_context(config, pairs, decodes, prefill);
+    // Local layers never split, so padding leaves their launch unchanged.
+    let launched = if config.is_local {
+        pairs.len() as u32
+    } else {
+        padded_requests.max(pairs.len() as u32)
+    };
+    // Padding slots are decode-shaped: the canonical batch of `decodes +
+    // padding` decodes is launched over the same `launched` requests.
+    let decodes = decodes + (launched - pairs.len() as u32);
+    let context = equivalent_context(config, pairs, launched, decodes, prefill);
     [
         decode_coordinate(config, decodes, prefill, context),
         f64::from(prefill),
@@ -331,14 +368,15 @@ fn project(config: &InklingRelAttentionKernelConfig, pairs: &[(u32, u32)]) -> [f
 fn equivalent_context(
     config: &InklingRelAttentionKernelConfig,
     pairs: &[(u32, u32)],
+    launched: u32,
     decodes: u32,
     prefill: u32,
 ) -> f64 {
-    let target = makespan(config, pairs);
+    let target = makespan(config, pairs, launched);
     let canonical = |context: f64| {
         let pairs = canonical_pairs(config, decodes, prefill, context.round() as u32)
             .expect("a non-empty batch has a canonical batch");
-        makespan(config, &pairs)
+        makespan(config, &pairs, pairs.len() as u32)
     };
     // Fractional contexts: the model is linear in the context between integer
     // points, so interpolate there to keep the projection continuous.
@@ -432,7 +470,11 @@ impl KernelSpec for InklingRelAttentionSpec {
     }
 
     fn cache_coords(config: &Self::Config, input: &Self::Input) -> Coords {
-        Coords::new(project(config, &input.query_context_pairs))
+        Coords::new(project(
+            config,
+            &input.query_context_pairs,
+            input.padded_requests,
+        ))
     }
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
@@ -538,7 +580,7 @@ mod tests {
                     continue;
                 }
                 let pairs = canonical_pairs(&cfg, decodes, prefill, context).unwrap();
-                let [d, a, c] = project(&cfg, &pairs);
+                let [d, a, c] = project(&cfg, &pairs, 0);
                 assert_eq!((d, a), (f64::from(decodes), f64::from(prefill)));
                 let tolerance = if is_local && context >= cfg.rel_extent {
                     // Past the window the local model is flat in the context.
@@ -563,7 +605,7 @@ mod tests {
         let cfg = config(false);
         let mut pairs = vec![(256, 256)];
         pairs.extend((0..30).map(|i| (1, 1000 + 100 * i)));
-        let [d, a, c] = project(&cfg, &pairs);
+        let [d, a, c] = project(&cfg, &pairs, 0);
         assert_eq!((d, a), (30.0, 256.0));
         let mean = pairs.iter().map(|&(_, kv)| f64::from(kv)).sum::<f64>() / 31.0;
         assert!(c > mean + 500.0, "equivalent context {c} vs mean {mean}");
@@ -592,7 +634,7 @@ mod tests {
         let cfg = config(true);
         let mut pairs = vec![(1, 2000); 20];
         pairs.push((40, 2040));
-        assert_eq!(project(&cfg, &pairs)[1], 64.0);
+        assert_eq!(project(&cfg, &pairs, 0)[1], 64.0);
         assert_eq!(prefill_coordinate(3), 32);
         assert_eq!(prefill_coordinate(100), 128);
         assert_eq!(prefill_coordinate(300), 300);
@@ -656,10 +698,55 @@ mod tests {
             max_model_len: 131072,
             ..config(false)
         };
-        let [_, _, c] = project(&global, &[(1, 131072)]);
+        let [_, _, c] = project(&global, &[(1, 131072)], 0);
         assert!((c - 131072.0).abs() <= 1.0, "{c}");
-        let [_, _, c] = project(&global, &[(1, 45000), (2048, 130048)]);
+        let [_, _, c] = project(&global, &[(1, 45000), (2048, 130048)], 0);
         assert!(c > 125_000.0 && c <= 131_072.0, "{c}");
+    }
+
+    #[test]
+    fn graph_padded_decode_reads_the_padded_rows() {
+        // Defect caught: a FULL-graph decode step priced at the real batch's
+        // split count. The fork's num_splits sees the capture size: 9 real
+        // decodes padded to 16 run 4 splits (combine grid steps 8 -> 16 in
+        // the diverse_100 capture), not 7, so their CTAs read ~1.75x longer
+        // slices than the 8-request rows the unpadded projection leans on.
+        let cfg = InklingRelAttentionKernelConfig {
+            max_model_len: 131072,
+            ..config(false)
+        };
+        assert_eq!(num_splits(&cfg, 9, 1), 7);
+        assert_eq!(num_splits(&cfg, 16, 1), 4);
+        // Captured iteration 4843 (9 decodes).
+        let contexts = [654, 934, 1048, 2294, 17473, 25436, 34561, 64887, 84167];
+        let pairs: Vec<(u32, u32)> = contexts.iter().map(|&c| (1, c)).collect();
+        let [d_real, _, _] = project(&cfg, &pairs, 0);
+        assert!(d_real > 8.0 && d_real < 16.0, "{d_real}");
+        let [d, a, c] = project(&cfg, &pairs, 16);
+        assert_eq!((d, a), (16.0, 0.0));
+        // Single wave (9 x 2 x 4 CTAs): the longest request sets the context,
+        // less the shared-work share the 16 canonical requests carry.
+        assert!(c > 60_000.0 && c < 84_167.0, "{c}");
+        // Padding is exact on a canonical padded batch, a no-op at or below
+        // the real count, and ignored on local layers, which never split.
+        let full = vec![(1, 32832); 16];
+        let [d, _, c] = project(&cfg, &full, 16);
+        assert_eq!(d, 16.0);
+        assert!((c - 32832.0).abs() <= 1.0, "{c}");
+        assert_eq!(project(&cfg, &pairs, 9), project(&cfg, &pairs, 0));
+        assert_eq!(project(&cfg, &pairs, 4), project(&cfg, &pairs, 0));
+        let local = config(true);
+        assert_eq!(project(&local, &pairs[..3], 4), project(&local, &pairs[..3], 0));
+    }
+
+    #[test]
+    fn padded_requests_defaults_to_unpadded() {
+        // Defect caught: an older input payload without the field failing to
+        // deserialize.
+        let input: InklingRelAttentionKernelInput =
+            serde_json::from_value(serde_json::json!({"query_context_pairs": [[1, 10]]}))
+                .unwrap();
+        assert_eq!(input.padded_requests, 0);
     }
 
     #[test]
