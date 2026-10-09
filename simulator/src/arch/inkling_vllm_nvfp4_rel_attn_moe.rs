@@ -40,6 +40,9 @@
 use anyhow::Result;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
+    graph_padded_tokens, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
+};
 use crate::arch::inkling_model_cfg::{InklingExpertPrecision, InklingModelCfg};
 use crate::common::Fabric;
 use crate::op::Op;
@@ -54,9 +57,10 @@ use crate::timing::kernels::{
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
-    LeafMetrics, PerfApiBridge, Probe, SlotInput,
+    LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::deepseek_v41_common::all_gather_as_all_reduce_bytes;
+use crate::worklet::glm53_common::{atomic, push_or_zero};
 use crate::worklet::{
     Bf16MoeLocalWorklet, Bf16MoeLocalWorkletConfig, Bf16MoeLocalWorkletInput,
     Bf16MoeLocalWorkletResolved, InklingAttnLocalWorklet, InklingAttnLocalWorkletConfig,
@@ -72,9 +76,6 @@ const ACTIVATION_DTYPE: DType = DType::Bf16;
 /// Attention KV page: vLLM's `unify_kv_cache_spec_page_size` doubles the
 /// 16-token default so a page matches the 32 KiB conv-state page.
 const PAGE_SIZE: u32 = 32;
-/// `VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD`: the sinks may run on the aux
-/// stream at or below this batch size (see [`sinks_on_aux_stream`]).
-pub const SINK_STREAM_TOKEN_THRESHOLD: u32 = 256;
 /// `Parallel{overlap}` of the aux-stream sinks against the routed call. The
 /// two streams contend for SMs and HBM: over the decode steps of the standard
 /// diverse_100 capture (`logs/20261008_9_inkling_small_nvfp4_tp4ep4_diverse100`,
@@ -546,7 +547,7 @@ impl MoeBlock {
         CostNode::Labeled {
             label: format!(
                 "{} (MoE) [EP{ep} ranked ranks; sinks overlap routed on decode-only T<={}]",
-                self.name, SINK_STREAM_TOKEN_THRESHOLD
+                self.name, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
             ),
             child: Box::new(CostNode::Sum(vec![
                 router,
@@ -964,15 +965,6 @@ impl IterwiseUnifiedModel for InklingVllmModel {
     }
 }
 
-/// The row count vLLM runs a CUDA-graph replay on: the smallest captured size
-/// that holds `tokens`, or `tokens` itself above the largest (eager).
-fn graph_padded_tokens(sorted_sizes: &[u32], tokens: u32) -> u32 {
-    match sorted_sizes.binary_search(&tokens) {
-        Ok(_) => tokens,
-        Err(index) => sorted_sizes.get(index).copied().unwrap_or(tokens),
-    }
-}
-
 /// Whether the sink experts run on the aux stream, concurrent with the routed
 /// call (`InklingMoE.forward_partials`, vllm/models/inkling/nvidia/moe.py).
 ///
@@ -987,9 +979,8 @@ fn graph_padded_tokens(sorted_sizes: &[u32], tokens: u32) -> u32 {
 /// breakable piecewise graph captured with the sinks inline, and a step above
 /// the largest captured size runs eagerly (aux stream again).
 fn sinks_on_aux_stream(batch: &NormalizedBatch, padded_tokens: u32, capture_sizes: &[u32]) -> bool {
-    let uniform_decode = batch.query_context_pairs.iter().all(|&(query, _)| query == 1);
     let eager = capture_sizes.last().is_none_or(|&largest| batch.total_tokens > largest);
-    padded_tokens <= SINK_STREAM_TOKEN_THRESHOLD && (uniform_decode || eager)
+    padded_tokens <= SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD && (batch.is_uniform_decode() || eager)
 }
 
 /// The request count attention is launched over. A uniform-decode step that
@@ -1000,8 +991,7 @@ fn sinks_on_aux_stream(batch: &NormalizedBatch, padded_tokens: u32, capture_size
 /// graph over the real requests, and a step past the largest size runs eagerly
 /// (`padded_tokens` is then the real count), so both stay unpadded (0).
 fn attention_padded_requests(batch: &NormalizedBatch, padded_tokens: u32) -> u32 {
-    let uniform_decode = batch.query_context_pairs.iter().all(|&(query, _)| query == 1);
-    if uniform_decode {
+    if batch.is_uniform_decode() {
         padded_tokens
     } else {
         0
@@ -1014,6 +1004,16 @@ struct NormalizedBatch {
     request_count: u32,
     /// Real requests as `(query_len, context_len)`, prefill chunks first.
     query_context_pairs: Vec<(u32, u32)>,
+}
+
+impl NormalizedBatch {
+    /// Every request decodes one token: the step vLLM replays as a FULL graph
+    /// when it fits a captured size.
+    fn is_uniform_decode(&self) -> bool {
+        self.query_context_pairs
+            .iter()
+            .all(|&(query, _)| query == 1)
+    }
 }
 
 fn normalize_input(
@@ -1081,37 +1081,6 @@ fn normalize_input(
         request_count: group.request_count(),
         query_context_pairs: pairs,
     })
-}
-
-fn atomic<K, C, F>(
-    prefix: &str,
-    suffix: &str,
-    config: C,
-    build_kernel: F,
-    bridge: &PerfApiBridge,
-) -> std::result::Result<Op<K>, BuildError>
-where
-    K: Probe,
-    F: FnOnce(String, C, &PerfApiBridge) -> std::result::Result<K, BuildError>,
-{
-    let name = format!("{prefix}.{suffix}");
-    Ok(Op::new(
-        name.clone(),
-        std::sync::Arc::new(build_kernel(name, config, bridge)?),
-    ))
-}
-
-fn push_or_zero<K>(op: &Op<K>, input: K::Input, zero: bool, ev: &mut Evaluator)
-where
-    K: Probe,
-    K::Input: Clone + Into<SlotInput>,
-{
-    let metrics = if zero {
-        LeafMetrics::ZERO
-    } else {
-        op.kernel.eval(&input)
-    };
-    ev.push(metrics, || input.clone().into());
 }
 
 fn fit_failed(reason: impl Into<String>) -> BuildError {

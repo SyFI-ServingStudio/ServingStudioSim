@@ -37,7 +37,7 @@ pub mod glm52_moe_router_local;
 pub mod glm52_mtp_head_local;
 pub mod glm52_mtp_prelude_local;
 pub mod glm52_shared_expert_local;
-mod glm53_common;
+pub(crate) mod glm53_common;
 pub mod glm53_dsa_attn_local;
 pub mod glm53_kda_attn_local;
 pub mod glm53_mlp_local;
