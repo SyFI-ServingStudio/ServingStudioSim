@@ -109,6 +109,10 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         config.batch_policy,
         config.kv_admission,
         balance,
+    )
+    .with_request_limits(
+        config.max_prefill_requests_per_iteration,
+        config.max_resident_requests_per_partition,
     );
     let admission = match chunk_end_quantum {
         Some(quantum) => admission.with_chunk_end_quantum(quantum),

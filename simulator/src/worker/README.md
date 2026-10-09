@@ -326,3 +326,22 @@ by `chunked_prefill` and `speculative`:
 - `decode_retraction_policy` selects the victim. `length` (SGLang) takes the
   fewest emitted tokens and requeues behind waiting requests. `fcfs` (vLLM)
   takes the most recently admitted request and requeues it at the head.
+
+### Optional chunked-prefill request limits
+
+`chunked_prefill` can bound scheduled prefill requests per partition per iteration
+with `max_prefill_requests_per_iteration`, and resident decodes plus started
+prompts per partition with `max_resident_requests_per_partition`. Both default to
+unlimited and reject zero. The lifecycle derives these counts from KV decode
+membership and its existing started-prompts list at batch formation; no second
+pending queue or resource ledger is introduced. Fresh admissions count even when
+they finish with one output token. A started prompt scheduled to finish retains
+its resident slot until iteration completion.
+
+The selector also exposes `prefix_cache_mode`, defaulting to the existing
+opportunistic behavior. The stock vLLM Neuron recipe uses disabled prefix reuse,
+FIFO, separate-prefill-priority, full-footprint admission, one whole prompt per
+iteration, and a context-sized token budget. Its resident cap is the lesser of
+its largest configured decode bucket and the fixed paged-pool capacity divided
+by context length. It reuses `ChunkedPrefillWorker` and all four existing owners;
+there is no Trainium-specific shell or KV store.

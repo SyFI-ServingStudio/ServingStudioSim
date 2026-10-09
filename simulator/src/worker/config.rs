@@ -310,6 +310,16 @@ pub enum IterWorkerSel {
         attn_gpu_memory_gb: f64,
         /// Chunked-prefill cap: max tokens per batch.
         max_batch_tokens: u32,
+        /// Scheduled prefill requests per partition per iteration; None is unlimited.
+        #[serde(default)]
+        max_prefill_requests_per_iteration: Option<u32>,
+        /// Resident decodes plus started prompts per partition; None is unlimited.
+        #[serde(default)]
+        max_resident_requests_per_partition: Option<u32>,
+        /// Completed-session prefix reuse, independent of admission limits.
+        #[serde(default)]
+        #[param(string, default = "opportunistic", choices = PREFIX_CACHE_MODE_CHOICES)]
+        prefix_cache_mode: PrefixCacheMode,
         /// How resident decode shares an iteration with chunked prefill.
         /// `mix` charges both to the same token budget. Under
         /// `separate-prefill-priority`, any runnable prefill makes that

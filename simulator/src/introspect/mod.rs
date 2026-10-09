@@ -95,10 +95,10 @@ struct GridResponse {
     kind: String,
     /// Structured resolved config; rich Dim objects retain formula provenance.
     describe_config: Value,
-    /// Coordinate labels in `grid_axes` order. For a direct-axis scalar kernel
-    /// these are also Input field names; ragged/re-axis kernels expose derived
-    /// work labels instead.
+    /// Physical Input fields accepted by `eval`; not necessarily cache axes.
     input_fields: &'static [&'static str],
+    /// Coordinate labels in `grid_axes` order, accepted by `eval_coords`.
+    cache_coords: &'static [&'static str],
     /// The fitted grid, in coords space, one ascending axis per dim.
     grid_axes: Vec<Vec<f64>>,
 }
@@ -178,12 +178,14 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
     let out = match req {
         // grid: pure metadata from `sweep_grid` — no bridge, no profiling.
         KernelQueryRequest::Grid { kind, config } => {
-            let (describe_config, grid_axes, input_fields) = (lookup(&kind)?.describe)(config)
-                .with_context(|| format!("describing '{kind}' grid"))?;
+            let entry = lookup(&kind)?;
+            let (describe_config, grid_axes, input_fields) =
+                (entry.describe)(config).with_context(|| format!("describing '{kind}' grid"))?;
             serde_json::to_string_pretty(&GridResponse {
                 kind,
                 describe_config,
                 input_fields,
+                cache_coords: (entry.coord_fields)(),
                 grid_axes,
             })?
         }
@@ -367,6 +369,34 @@ pub fn run_kernel_list() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod kernel_list_tests {
+    #[test]
+    fn grid_distinguishes_physical_input_from_categorical_cache_axis() {
+        let entry = super::lookup("neuron_llama_forward").unwrap();
+        let (describe_config, grid_axes, input_fields) = (entry.describe)(serde_json::json!({
+            "backends":["vllm_neuron"], "gpu_name":"AWS Trainium2 LNC2",
+            "max_model_len":512, "kv_blocks":6782, "block_size":32,
+            "tp_size":4, "dtype":"bf16", "decode_buckets":[1,16]
+        }))
+        .unwrap();
+        let value = serde_json::to_value(super::GridResponse {
+            kind: entry.kind.into(),
+            describe_config,
+            grid_axes,
+            input_fields,
+            cache_coords: (entry.coord_fields)(),
+        })
+        .unwrap();
+        assert_eq!(
+            value["input_fields"],
+            serde_json::json!(["phase", "token_bucket"])
+        );
+        assert_eq!(
+            value["cache_coords"],
+            serde_json::json!(["compiled_variant"])
+        );
+        assert_eq!(value["grid_axes"], serde_json::json!([[0.0, 1.0, 2.0]]));
+    }
+
     use super::{kernel_list, KernelQueryEntry};
 
     #[test]

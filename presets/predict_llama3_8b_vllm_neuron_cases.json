@@ -1,0 +1,39 @@
+[
+  {
+    "groups": [
+      {
+        "prefill_chunk_pairs": [
+          [
+            0,
+            504
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "groups": [
+      {
+        "decode_kv_lens": [
+          505
+        ]
+      }
+    ]
+  },
+  {
+    "groups": [
+      {
+        "decode_count": 9,
+        "average_decode_length": 505
+      }
+    ]
+  },
+  {
+    "groups": [
+      {
+        "decode_count": 16,
+        "average_decode_length": 505
+      }
+    ]
+  }
+]

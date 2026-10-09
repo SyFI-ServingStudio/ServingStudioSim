@@ -38,7 +38,35 @@ impl KernelSpec for RmsNormSpec {
 
     const KIND: KernelKind = "rms_norm";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
+        if neuron_only(config) {
+            anyhow::ensure!(
+                config.dtype == DType::Bf16,
+                "Neuron RMSNorm supports BF16 only"
+            );
+            anyhow::ensure!(
+                config.hidden.get() > 0,
+                "Neuron RMSNorm hidden width must be positive"
+            );
+            anyhow::ensure!(
+                matches!(
+                    config.gpu_name.as_str(),
+                    "AWS Trainium2 LNC2" | "Trainium2-LNC2"
+                ),
+                "Neuron timing requires a Trainium2 LNC2 target"
+            );
+        }
+        Ok(())
+    }
+
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if neuron_only(config) {
+            // Small compiled shapes have discontinuous native timings, so
+            // measure each integer through 16 instead of smoothing them.
+            return SweepGrid::new(vec![Axis::values([
+                1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128,
+            ])]);
+        }
         SweepGrid::new(vec![Axis::token_axis()])
     }
 
@@ -61,6 +89,14 @@ impl KernelSpec for RmsNormSpec {
     }
 }
 
+fn neuron_only(config: &RmsNormKernelConfig) -> bool {
+    !config.backends.is_empty()
+        && config
+            .backends
+            .iter()
+            .all(|backend| *backend == "neuron_torch_rms")
+}
+
 register_kernel!(RmsNormKernel, RmsNormSpec);
 
 #[cfg(test)]
@@ -70,6 +106,29 @@ mod tests {
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::SweepCoords;
     use serde_json::Value;
+
+    #[test]
+    fn neuron_norm_profiles_small_queries_without_changing_cuda_grid() {
+        let mut config = RmsNormKernelConfig {
+            backends: vec!["neuron_torch_rms"],
+            gpu_name: "AWS Trainium2 LNC2".into(),
+            hidden: 4096.into(),
+            dtype: DType::Bf16,
+        };
+        RmsNormSpec::validate_config(&config).unwrap();
+        assert_eq!(
+            RmsNormSpec::sweep_grid(&config).axes()[0],
+            [
+                1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16., 32., 64.,
+                128.
+            ]
+        );
+        config.backends = vec!["flashinfer"];
+        assert_eq!(
+            RmsNormSpec::sweep_grid(&config).axes()[0],
+            crate::timing::sweep::Axis::token_axis()
+        );
+    }
 
     #[test]
     fn config_identity_includes_backend_and_shape() {

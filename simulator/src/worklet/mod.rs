@@ -47,6 +47,7 @@ pub mod moe_expert_compute_local;
 pub mod native_fp8_moe_router_local;
 pub mod native_moe_expert_compute_local;
 pub mod native_moe_router_local;
+pub mod neuron_llama_decoder_local;
 pub mod nvfp4_moe_local;
 pub mod post_attn_local;
 pub mod post_attn_router_tp;
@@ -202,6 +203,10 @@ pub use native_moe_expert_compute_local::{
 pub use native_moe_router_local::{
     NativeMoeRouterLocalWorklet, NativeMoeRouterLocalWorkletConfig,
     NativeMoeRouterLocalWorkletInput, NativeMoeRouterLocalWorkletResolved,
+};
+pub use neuron_llama_decoder_local::{
+    NeuronLlamaDecoderLocalWorklet, NeuronLlamaDecoderLocalWorkletConfig,
+    NeuronLlamaDecoderLocalWorkletInput, NeuronLlamaDecoderLocalWorkletResolved,
 };
 pub use nvfp4_moe_local::{
     Nvfp4MoeLocalWorklet, Nvfp4MoeLocalWorkletConfig, Nvfp4MoeLocalWorkletInput,

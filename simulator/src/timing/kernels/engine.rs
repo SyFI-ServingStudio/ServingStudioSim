@@ -616,7 +616,7 @@ where
     S::Config: serde::de::DeserializeOwned,
     S::Input: serde::de::DeserializeOwned,
 {
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
 
     let config: S::Config = serde_json::from_value(config)
         .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
@@ -793,6 +793,7 @@ fn describe_from_json<S>(
 where
     S: KernelSpec,
     S::Config: serde::de::DeserializeOwned,
+    S::Input: serde::de::DeserializeOwned,
 {
     let config: S::Config = serde_json::from_value(config)
         .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
@@ -801,7 +802,7 @@ where
     Ok((
         config.describe_config(),
         grid_axes,
-        <S::Input as SweepCoords>::coord_field_names(),
+        serde_field_names::<S::Input>(),
     ))
 }
 
@@ -903,7 +904,25 @@ fn ensure_has_backends(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_has_backends, KernelConfig, KernelSpec};
+    #[test]
+    fn grid_describes_physical_fields_separately_from_cache_coordinates() {
+        use crate::timing::kernels::neuron_llama_forward::NeuronLlamaForwardSpec;
+        let json = serde_json::json!({
+            "backends": ["vllm_neuron"], "gpu_name": "AWS Trainium2 LNC2",
+            "max_model_len": 512, "kv_blocks": 6782, "block_size": 32,
+            "tp_size": 4, "dtype": "bf16", "decode_buckets": [1,16]
+        });
+        let (_, axes, fields) =
+            super::describe_from_json::<NeuronLlamaForwardSpec>(json.clone()).unwrap();
+        assert_eq!(fields, ["phase", "token_bucket"]);
+        assert_eq!(axes, [vec![0.0, 1.0, 2.0]]);
+        let cfg = serde_json::from_value(json).unwrap();
+        let grid = super::config_grid::<NeuronLlamaForwardSpec>(&cfg).unwrap();
+        assert_eq!(grid.cache_coords, ["compiled_variant"]);
+        assert_eq!(grid.cells[1]["token_bucket"], 1);
+    }
+
+    use super::{KernelConfig, KernelSpec, ensure_has_backends};
     use crate::timing::bridge::{ArgsPayload, KernelKind};
     use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::{BuildError, Coords, SweepCoords, SweepGrid};

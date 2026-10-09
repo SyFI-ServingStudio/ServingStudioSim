@@ -135,6 +135,17 @@ const fn default_dflash2_sliding_window() -> u32 {
     2048
 }
 
+fn default_neuron_kv_capacity() -> u32 {
+    512
+}
+
+fn default_neuron_decode_buckets() -> Vec<u32> {
+    vec![1, 16]
+}
+fn default_neuron_tp_size() -> u16 {
+    4
+}
+
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
 /// that consume them (provider-first: select the arch, then it exposes its own
 /// params).
@@ -164,6 +175,29 @@ pub enum IterArchSel {
     Llama3Dense {
         #[serde(flatten)]
         model: ModelSpec,
+    },
+    /// Separately compiled BF16 Llama3.1 layers on one Trainium2 LNC2 unit.
+    Llama3Neuron {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default = "default_neuron_kv_capacity")]
+        #[param(default = 512, cache_key)]
+        kv_capacity: u32,
+    },
+    /// Original full Llama3.1-8B executable on stock vLLM Neuron TP4/LNC2.
+    Llama3VllmNeuron {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default = "default_neuron_kv_capacity")]
+        #[param(default = 512, cache_key)]
+        max_model_len: u32,
+        /// Exact engine bucket inventory, including bucket 1.
+        #[serde(default = "default_neuron_decode_buckets")]
+        #[param(cache_key)]
+        decode_buckets: Vec<u32>,
+        #[serde(default = "default_neuron_tp_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
     },
     /// Megatron TP over dense Llama 3. `tp_size` must divide the KV heads (8).
     Llama3DenseTp {
@@ -616,6 +650,8 @@ impl IterArchSel {
         match self {
             Self::Qwen36Local { model, .. }
             | Self::Llama3Dense { model }
+            | Self::Llama3Neuron { model, .. }
+            | Self::Llama3VllmNeuron { model, .. }
             | Self::Llama3DenseTp { model, .. }
             | Self::Llama3DpAttnTpFfn { model, .. }
             | Self::Qwen3MoeDpAttnEpFfn { model, .. }
@@ -640,7 +676,9 @@ impl IterArchSel {
     /// vLLM defaults it. Every variant is listed so a new one decides which.
     pub fn max_model_len(&self) -> anyhow::Result<u32> {
         match self {
-            Self::Glm52VllmNvfp4DsaMoe { max_model_len, .. }
+            Self::Llama3Neuron { kv_capacity, .. } => Ok(*kv_capacity),
+            Self::Llama3VllmNeuron { max_model_len, .. }
+            | Self::Glm52VllmNvfp4DsaMoe { max_model_len, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { max_model_len, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { max_model_len, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { max_model_len, .. }
@@ -904,9 +942,11 @@ mod iter_tests {
         assert_eq!(*expert_popularity_file, None);
         assert_eq!(*token_corpus_file, None);
         assert!(std::ptr::eq(parsed.model(), model));
-        assert!(IterArchSel::SCHEMA
-            .iter()
-            .any(|(tag, _)| *tag == "glm52_vllm_nvfp4_dsa_moe"));
+        assert!(
+            IterArchSel::SCHEMA
+                .iter()
+                .any(|(tag, _)| *tag == "glm52_vllm_nvfp4_dsa_moe")
+        );
     }
 
     #[test]
@@ -1071,9 +1111,11 @@ mod iter_tests {
 
     #[test]
     fn retired_glm52_selector_is_not_published_or_accepted() {
-        assert!(!IterArchSel::SCHEMA
-            .iter()
-            .any(|(tag, _)| *tag == "glm52_dsa_moe"));
+        assert!(
+            !IterArchSel::SCHEMA
+                .iter()
+                .any(|(tag, _)| *tag == "glm52_dsa_moe")
+        );
         let raw =
             r#"{"type":"glm52_dsa_moe","model_config":"model/config/glm52.json","fp8":false}"#;
         assert!(serde_json::from_str::<IterArchSel>(raw).is_err());
@@ -1277,12 +1319,16 @@ mod layerwise_tests {
 
     #[test]
     fn unimplemented_layerwise_placeholders_are_not_published_or_accepted() {
-        assert!(!AttnArchSel::SCHEMA
-            .iter()
-            .any(|(tag, _)| *tag == "llama3_attn_tp"));
-        assert!(!FfnArchSel::SCHEMA
-            .iter()
-            .any(|(tag, _)| *tag == "deepseek_ffn_moe"));
+        assert!(
+            !AttnArchSel::SCHEMA
+                .iter()
+                .any(|(tag, _)| *tag == "llama3_attn_tp")
+        );
+        assert!(
+            !FfnArchSel::SCHEMA
+                .iter()
+                .any(|(tag, _)| *tag == "deepseek_ffn_moe")
+        );
 
         let llama = r#"{"type":"llama3_attn_tp","model_config":"m.json","fp8":false,"tp_size":2,"head_parallel":1}"#;
         let deepseek = r#"{"type":"deepseek_ffn_moe","model_config":"m.json","fp8":false,"tp_size":2,"ep_size":8}"#;

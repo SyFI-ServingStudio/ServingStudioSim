@@ -124,6 +124,7 @@ impl Deployment for UnifiedDeployment {
                 attn_gpu_memory_gb,
                 max_batch_tokens,
                 batch_policy,
+                prefix_cache_mode,
                 kv_admission,
                 gpu_time_multiplier,
                 // Read by `prefill_gpu_time_multiplier` below.
@@ -133,7 +134,7 @@ impl Deployment for UnifiedDeployment {
                 *gpu_time_multiplier,
                 Some(*max_batch_tokens),
                 PendingOrderKind::Fifo,
-                PrefixCacheMode::Opportunistic,
+                *prefix_cache_mode,
                 PrefixCachePolicy::Lru,
                 None,
                 *batch_policy,
@@ -170,6 +171,8 @@ impl Deployment for UnifiedDeployment {
             prefix_cache_max_gpu_memory_gb,
             attn_gpu_memory_gb,
         )?;
+        let (max_prefill_requests_per_iteration, max_resident_requests_per_partition) =
+            chunked_request_limits(&g.worker)?;
         let worker_config = WorkerConfig {
             attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
             log_output_token_times: cfg.io.log_output_token_times,
@@ -178,6 +181,8 @@ impl Deployment for UnifiedDeployment {
             gpu_time_multiplier,
             prefill_gpu_time_multiplier: prefill_gpu_time_multiplier(&g.worker)?,
             max_batch_tokens,
+            max_prefill_requests_per_iteration,
+            max_resident_requests_per_partition,
             pending_order,
             batch_policy,
             kv_admission,
@@ -286,6 +291,78 @@ impl Deployment for UnifiedDeployment {
                 let model = Arc::new(arch_build::dense(
                     model_spec, &gpu_name, MODEL_NAME, bridge,
                 )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_barebone_worker,
+                ))
+            }
+            IterArchSel::Llama3VllmNeuron {
+                max_model_len,
+                decode_buckets,
+                tp_size,
+                ..
+            } => {
+                ensure_stock_neuron_worker(
+                    &g.worker,
+                    &worker_config,
+                    *max_model_len,
+                    decode_buckets,
+                    *tp_size,
+                    g.replicas,
+                )?;
+                let model = Arc::new(arch_build::llama3_vllm_neuron(
+                    model_spec,
+                    *max_model_len,
+                    decode_buckets,
+                    *tp_size,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_chunked_prefill_worker,
+                ))
+            }
+            IterArchSel::Llama3Neuron { kv_capacity, .. } => {
+                ensure_barebone(&g.worker)?;
+                // A soft one-token admission budget admits one whole prefill
+                // when idle, then reserves that token for its live decode.
+                ensure!(
+                    worker_config.max_batch_tokens == Some(1),
+                    "Trainium2 Llama requires barebone max_batch_tokens=1 to keep batch1"
+                );
+                ensure!(
+                    prefix_cache_mode == PrefixCacheMode::Disabled,
+                    "Trainium2 Llama initially requires prefix_cache_mode=disabled"
+                );
+                ensure!(
+                    g.replicas == 1,
+                    "Trainium2 Llama initially supports one LNC2 replica"
+                );
+                let model = Arc::new(arch_build::llama3_neuron(
+                    model_spec,
+                    *kv_capacity,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                let allocated_kv_bytes = *kv_capacity as u64 * model.total_kv_bytes_per_token();
+                ensure!(
+                    worker_config.attn_kv_bytes == allocated_kv_bytes,
+                    "Trainium2 Llama KV budget must equal its fixed cache allocation ({} bytes)",
+                    allocated_kv_bytes
+                );
                 Ok(assemble_flow(
                     model,
                     store,
@@ -716,6 +793,76 @@ impl Deployment for UnifiedDeployment {
 /// The model's dotted-leaf prefix for this deployment (e.g. `unified.embedding`).
 const MODEL_NAME: &str = "unified";
 
+/// Generic request-count limits apply per attention partition. Zero would
+/// permanently stall admission, so reject it before constructing a worker.
+fn chunked_request_limits(sel: &IterWorkerSel) -> anyhow::Result<(Option<u32>, Option<u32>)> {
+    if let IterWorkerSel::ChunkedPrefill {
+        max_prefill_requests_per_iteration,
+        max_resident_requests_per_partition,
+        ..
+    } = sel
+    {
+        ensure!(
+            *max_prefill_requests_per_iteration != Some(0)
+                && *max_resident_requests_per_partition != Some(0),
+            "chunked-prefill request limits must be positive when present"
+        );
+        Ok((
+            *max_prefill_requests_per_iteration,
+            *max_resident_requests_per_partition,
+        ))
+    } else {
+        Ok((None, None))
+    }
+}
+
+/// The measured stock scheduler has one full-prompt lane and a fixed paged
+/// pool. Validate its concrete pairing here; shared admission has no arch tag.
+fn ensure_stock_neuron_worker(
+    sel: &IterWorkerSel,
+    config: &WorkerConfig,
+    context: u32,
+    buckets: &[u32],
+    tp_size: u16,
+    replicas: u16,
+) -> anyhow::Result<()> {
+    ensure!(
+        matches!(sel, IterWorkerSel::ChunkedPrefill { .. }),
+        "stock vLLM Neuron requires worker chunked_prefill"
+    );
+    ensure!(
+        tp_size == 4 && replicas == 1,
+        "stock vLLM Neuron requires TP4 and exactly one replica"
+    );
+    ensure!(
+        context > 0 && !buckets.is_empty(),
+        "stock vLLM Neuron needs a nonempty compiled inventory"
+    );
+    let resident_cap = buckets.last().copied().unwrap().min(217024 / context);
+    ensure!(config.max_batch_tokens == Some(context)
+        && config.max_prefill_requests_per_iteration == Some(1)
+        && config.max_resident_requests_per_partition == Some(resident_cap),
+        "stock vLLM Neuron requires context-sized token budget, prefill limit1 and resident limit{resident_cap}");
+    ensure!(
+        config.batch_policy == BatchPolicy::SeparatePrefillPriority
+            && matches!(config.kv_admission, KvAdmissionConfig::FullFootprint)
+            && config.pending_order == PendingOrderKind::Fifo,
+        "stock vLLM Neuron requires FIFO, separate-prefill-priority and full-footprint admission"
+    );
+    ensure!(
+        matches!(
+            config.prefix_cache,
+            crate::worker::kv::PrefixCacheConfig::Disabled
+        ),
+        "stock vLLM Neuron requires prefix_cache_mode=disabled"
+    );
+    ensure!(
+        config.attn_kv_bytes == 32768 * 217024,
+        "stock vLLM Neuron requires exactly 7111442432 KV bytes per rank (6782 pages)"
+    );
+    Ok(())
+}
+
 /// The dense / dense_tp archs run on the single-group barebone worker.
 fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
@@ -1000,6 +1147,9 @@ mod tests {
         IterWorkerSel::ChunkedPrefill {
             attn_gpu_memory_gb: 120.0,
             max_batch_tokens: 2048,
+            max_prefill_requests_per_iteration: None,
+            max_resident_requests_per_partition: None,
+            prefix_cache_mode: PrefixCacheMode::Opportunistic,
             batch_policy: BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionSpec::default(),
             gpu_time_multiplier: 1.0,
@@ -1012,6 +1162,51 @@ mod tests {
         W: IterWorker<Event = WorkerEventCommon> + 'static,
         W::Msg: From<RequestId>,
     {
+    }
+
+    #[test]
+    fn stock_neuron_pair_requires_the_exact_scheduler_and_pool() {
+        assert_iter_worker_contract::<ChunkedPrefillWorker<crate::arch::Llama3VllmNeuronModel>>();
+        let sel = chunked_prefill_worker();
+        let valid = WorkerConfig {
+            attn_kv_bytes: 7111442432,
+            max_batch_tokens: Some(512),
+            max_prefill_requests_per_iteration: Some(1),
+            max_resident_requests_per_partition: Some(16),
+            batch_policy: BatchPolicy::SeparatePrefillPriority,
+            pending_order: PendingOrderKind::Fifo,
+            prefix_cache: crate::worker::kv::PrefixCacheConfig::Disabled,
+            ..WorkerConfig::default()
+        };
+        assert!(ensure_stock_neuron_worker(&sel, &valid, 512, &[1, 16], 4, 1).is_ok());
+        for (tp, replicas) in [(1, 1), (4, 2)] {
+            assert!(ensure_stock_neuron_worker(&sel, &valid, 512, &[1, 16], tp, replicas).is_err());
+        }
+        for mutate in [
+            |c: &mut WorkerConfig| c.attn_kv_bytes -= 1,
+            |c: &mut WorkerConfig| c.max_batch_tokens = Some(256),
+            |c: &mut WorkerConfig| c.max_prefill_requests_per_iteration = Some(2),
+            |c: &mut WorkerConfig| c.max_resident_requests_per_partition = Some(17),
+            |c: &mut WorkerConfig| c.batch_policy = BatchPolicy::Mix,
+            |c: &mut WorkerConfig| c.pending_order = PendingOrderKind::SessionStart,
+            |c: &mut WorkerConfig| c.prefix_cache = Default::default(),
+        ] {
+            let mut invalid = valid.clone();
+            mutate(&mut invalid);
+            assert!(ensure_stock_neuron_worker(&sel, &invalid, 512, &[1, 16], 4, 1).is_err());
+        }
+        assert!(
+            ensure_stock_neuron_worker(&barebone_worker(), &valid, 512, &[1, 16], 4, 1).is_err()
+        );
+        let mut zero = chunked_prefill_worker();
+        if let IterWorkerSel::ChunkedPrefill {
+            max_prefill_requests_per_iteration,
+            ..
+        } = &mut zero
+        {
+            *max_prefill_requests_per_iteration = Some(0);
+        }
+        assert!(chunked_request_limits(&zero).is_err());
     }
 
     #[test]

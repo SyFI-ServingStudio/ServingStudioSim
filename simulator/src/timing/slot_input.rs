@@ -42,8 +42,12 @@ use crate::timing::kernels::{
 };
 
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
-use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
+use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
+use crate::timing::kernels::{
+    NeuronDenseMlpKernelInput, NeuronEmbeddingKernelInput, NeuronLlamaDecoderKernelInput,
+    NeuronLlamaForwardKernelInput,
+};
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
 /// fan-out the attention op summed into one slot (many prefill requests fold to a
@@ -114,6 +118,10 @@ macro_rules! log_inputs {
 
 log_inputs! {
     Gemm        => SingleGemmKernelInput,
+    NeuronDenseMlp => NeuronDenseMlpKernelInput,
+    NeuronLlamaForward => NeuronLlamaForwardKernelInput,
+    NeuronEmbedding => NeuronEmbeddingKernelInput,
+    NeuronLlamaDecoder => NeuronLlamaDecoderKernelInput,
     BatchedGemm => BatchedGemmKernelInput,
     GroupedGemm => GroupedGemmKernelInput,
     RmsNorm     => RmsNormKernelInput,

@@ -13,7 +13,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
@@ -21,29 +21,30 @@ use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
-    deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
-    glm52_vllm_nvfp4_dsa_moe, glm53_flash_vllm_fp8_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2,
-    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
-    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
-    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
-    DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV4ModelCfg,
-    DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel, DenseTpParallel,
-    Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode,
-    Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
-    Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm53FlashModelCfg, Glm53FlashVllmModel,
-    Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel,
-    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
-    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
-    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
-    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
-    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    AttnLayerwiseModel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
+    DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel, DenseParallel,
+    DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg,
+    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
+    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel,
+    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm53FlashModelCfg,
+    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
+    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel,
+    Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
+    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel, Qwen36LocalModel, Qwen36LocalParallel,
+    Qwen36ModelCfg, deepseek_v4_vllm, deepseek_v41_vllm, glm52_sglang_nvfp4_tp_dsa_moe,
+    glm52_vllm_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
+    glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
+    qwen3_attn_layerwise, qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise,
+    qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn,
+    qwen36_local,
 };
 use crate::common::Fabric;
+use crate::timing::ExpertDemand;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::AllReduceKernelConfig;
 use crate::timing::routing::RoutingDistribution;
-use crate::timing::ExpertDemand;
 use crate::timing::{Dim, PerfApiBridge};
 use crate::worklet::{
     Dflash2ContextKvLocalWorklet, Dflash2ContextKvLocalWorkletConfig, Dflash2DraftAttnLocalWorklet,
@@ -751,6 +752,104 @@ pub fn dense(
         llama3_dense::resolve_configs(&llama3_dense::build_configs(&model_cfg, &parallel));
     llama3_dense::build(name.to_string(), resolved, bridge)
         .context("building Llama3-dense model (often a missing profile.db row)")
+}
+
+/// Fixed Llama3.1 semantics required by the measured Neuron decoder backend.
+fn ensure_neuron_math(raw: &serde_json::Value) -> Result<()> {
+    let rope = &raw["rope_scaling"];
+    ensure!(
+        raw["model_type"].as_str() == Some("llama")
+            && raw["hidden_act"].as_str() == Some("silu")
+            && raw["rms_norm_eps"].as_f64() == Some(1e-5)
+            && raw["rope_theta"].as_f64() == Some(500000.0)
+            && rope["rope_type"].as_str() == Some("llama3")
+            && rope["factor"].as_f64() == Some(8.0)
+            && rope["low_freq_factor"].as_f64() == Some(1.0)
+            && rope["high_freq_factor"].as_f64() == Some(4.0)
+            && rope["original_max_position_embeddings"].as_u64() == Some(8192)
+            && !raw["attention_bias"].as_bool().unwrap_or(false)
+            && !raw["mlp_bias"].as_bool().unwrap_or(false),
+        "Trainium2 decoder requires the measured Llama3.1 RoPE, RMSNorm and unbiased SiLU math"
+    );
+    Ok(())
+}
+
+pub fn llama3_neuron(
+    model_spec: &ModelSpec,
+    kv_capacity: u32,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<crate::arch::Llama3NeuronModel> {
+    ensure!(
+        !model_spec.fp8,
+        "Trainium2 Llama initially supports BF16 only"
+    );
+    ensure!(
+        kv_capacity == 512,
+        "Trainium2 Llama initially supports KV capacity512 only"
+    );
+    ensure!(
+        matches!(gpu, "AWS Trainium2 LNC2" | "Trainium2-LNC2"),
+        "Trainium2 Llama requires an LNC2 target"
+    );
+    let raw: serde_json::Value = serde_json::from_reader(File::open(&model_spec.model_config)?)?;
+    ensure_neuron_math(&raw)?;
+    let model_cfg = dense_model_cfg(model_spec)?;
+    ensure!(
+        (
+            model_cfg.hidden.get(),
+            model_cfg.intermediate.get(),
+            model_cfg.num_qo_heads.get(),
+            model_cfg.num_kv_heads.get(),
+            model_cfg.head_dim.get(),
+            model_cfg.vocab.get()
+        ) == (4096, 14336, 32, 8, 128, 128256)
+            && model_cfg.dtype == DType::Bf16
+            && model_cfg.kv_dtype == DType::Bf16
+            && (1..=32).contains(&model_cfg.num_layers),
+        "Trainium2 Llama requires the BF16 Llama3.1 8B dimensions and 1..32 layers"
+    );
+    let parallel = crate::arch::NeuronParallel {
+        gpu_name: gpu.to_string(),
+        kv_capacity,
+    };
+    let configs = crate::arch::llama3_neuron::build_configs(&model_cfg, &parallel);
+    let resolved = crate::arch::llama3_neuron::resolve_configs(&configs);
+    crate::arch::llama3_neuron::build(name.to_string(), resolved, bridge)
+        .context("building Trainium2 Llama model (check Neuron setup and profile.db rows)")
+}
+
+/// Pinned stock vLLM Neuron full-model executable (all layers and sampling).
+pub fn llama3_vllm_neuron(
+    model_spec: &ModelSpec,
+    max_model_len: u32,
+    decode_buckets: &[u32],
+    tp_size: u16,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<crate::arch::Llama3VllmNeuronModel> {
+    ensure!(
+        !model_spec.fp8 && model_spec.num_layers.is_none() && model_spec.sim_num_layers.is_none(),
+        "stock vLLM Neuron requires BF16 and the original model without layer overrides"
+    );
+    let raw: serde_json::Value = serde_json::from_reader(File::open(&model_spec.model_config)?)?;
+    ensure_neuron_math(&raw)?;
+    let model_cfg = dense_model_cfg(model_spec)?;
+    crate::arch::llama3_vllm_neuron::validate_model(&model_cfg)?;
+    let parallel = crate::arch::VllmNeuronParallel {
+        gpu_name: gpu.to_string(),
+        max_model_len,
+        decode_buckets: decode_buckets.to_vec(),
+        tp_size,
+    };
+    let configs = crate::arch::llama3_vllm_neuron::build_configs(&model_cfg, &parallel);
+    crate::arch::llama3_vllm_neuron::validate_config(&configs.forward)?;
+    let resolved = crate::arch::llama3_vllm_neuron::resolve_configs(&configs);
+    crate::arch::llama3_vllm_neuron::build(name.to_string(), resolved, bridge).context(
+        "building stock vLLM Neuron full forward (check pinned runtime and profile.db rows)",
+    )
 }
 
 /// Build the tensor-parallel dense Llama3 model.
@@ -1574,6 +1673,23 @@ pub fn build_iter_model(
             bridge,
         )?),
         IterArchSel::Llama3Dense { model } => Box::new(dense(model, gpu, name, bridge)?),
+        IterArchSel::Llama3Neuron { model, kv_capacity } => {
+            Box::new(llama3_neuron(model, *kv_capacity, gpu, name, bridge)?)
+        }
+        IterArchSel::Llama3VllmNeuron {
+            model,
+            max_model_len,
+            decode_buckets,
+            tp_size,
+        } => Box::new(llama3_vllm_neuron(
+            model,
+            *max_model_len,
+            decode_buckets,
+            *tp_size,
+            gpu,
+            name,
+            bridge,
+        )?),
         IterArchSel::Llama3DenseTp { model, tp_size } => {
             Box::new(dense_tp(model, *tp_size, gpu, name, bridge)?)
         }
@@ -2485,21 +2601,17 @@ mod tests {
         }
         let error =
             resolve_routing_source(RoutingKind::Popularity, None, 4, 2, 2, 2, None).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("requires expert_popularity_file"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires expert_popularity_file")
+        );
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.json");
-        assert!(resolve_routing_source(
-            RoutingKind::Popularity,
-            None,
-            4,
-            2,
-            2,
-            2,
-            missing.to_str(),
-        )
-        .is_err());
+        assert!(
+            resolve_routing_source(RoutingKind::Popularity, None, 4, 2, 2, 2, missing.to_str(),)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2532,16 +2644,10 @@ mod tests {
             RoutingDistribution::TOTAL_PPM
         );
         assert!(routing.ppm()[0] > routing.ppm()[1]);
-        assert!(resolve_routing_source(
-            RoutingKind::Random,
-            Some(7),
-            4,
-            2,
-            2,
-            2,
-            Some(profile_path),
-        )
-        .is_err());
+        assert!(
+            resolve_routing_source(RoutingKind::Random, Some(7), 4, 2, 2, 2, Some(profile_path),)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2679,16 +2785,18 @@ mod tests {
         });
         let mut v3_file = tempfile::NamedTempFile::new().unwrap();
         write!(v3_file, "{v3_profile}").unwrap();
-        assert!(resolve_routing_source(
-            RoutingKind::Popularity,
-            None,
-            4,
-            2,
-            2,
-            2,
-            v3_file.path().to_str(),
-        )
-        .is_ok());
+        assert!(
+            resolve_routing_source(
+                RoutingKind::Popularity,
+                None,
+                4,
+                2,
+                2,
+                2,
+                v3_file.path().to_str(),
+            )
+            .is_ok()
+        );
 
         v3_profile["aggregation"]["raw_record_count"] = serde_json::json!(4);
         let mut invalid_v3_file = tempfile::NamedTempFile::new().unwrap();
@@ -2902,10 +3010,12 @@ mod tests {
             let mut overridden = glm52_model_spec();
             overridden.num_layers = num_layers;
             overridden.sim_num_layers = sim_num_layers;
-            assert!(glm52_model_cfg(&overridden)
-                .unwrap_err()
-                .to_string()
-                .contains("rejects num_layers/sim_num_layers"));
+            assert!(
+                glm52_model_cfg(&overridden)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("rejects num_layers/sim_num_layers")
+            );
         }
     }
 
@@ -3057,7 +3167,7 @@ mod tests {
         assert_eq!(ffn_cfgs.lm_head.gemm.backends, vec!["deepgemm"]);
         assert_eq!(ffn_cfgs.lm_head.quant.hidden_size, 4096);
         assert_eq!(ffn_cfgs.final_norm.dtype, DType::Bf16); // final_norm stays bf16
-                                                            // dispatch/combine ship the hidden activation fp8.
+        // dispatch/combine ship the hidden activation fp8.
         assert_eq!(ffn_cfgs.moe_dispatch.dtype, DType::Fp8E4m3);
         assert_eq!(ffn_cfgs.moe_combine.dtype, DType::Fp8E4m3);
     }
@@ -3205,9 +3315,11 @@ mod tests {
                 }
             }
         }
-        assert!(build_arch_blocks(&sample_blocks(), false)
-            .iter()
-            .all(|b| b.kernel_configs.is_none() && b.slot_configs.is_none()));
+        assert!(
+            build_arch_blocks(&sample_blocks(), false)
+                .iter()
+                .all(|b| b.kernel_configs.is_none() && b.slot_configs.is_none())
+        );
     }
 
     /// Each build names the `timing-predict` selector its cases go under and
@@ -3282,4 +3394,15 @@ mod tests {
         assert_ne!(json(&built[0]), json(&built[2]));
         assert!(built[1].error.as_deref().unwrap().contains("no_such_arch"));
     }
+}
+#[test]
+fn neuron_math_rejects_same_shape_with_different_rope_or_norm() {
+    let mut config: serde_json::Value =
+        serde_json::from_str(include_str!("../../../model/config/llama3_8b.json")).unwrap();
+    assert!(ensure_neuron_math(&config).is_ok());
+    config["rope_scaling"]["factor"] = serde_json::json!(4.0);
+    assert!(ensure_neuron_math(&config).is_err());
+    config["rope_scaling"]["factor"] = serde_json::json!(8.0);
+    config["rms_norm_eps"] = serde_json::json!(1e-6);
+    assert!(ensure_neuron_math(&config).is_err());
 }

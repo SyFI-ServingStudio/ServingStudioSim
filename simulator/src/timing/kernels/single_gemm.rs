@@ -10,7 +10,7 @@ use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
-use crate::timing::{Dim, KernelConfig, SweepCoords};
+use crate::timing::{Coords, Dim, KernelConfig, SweepCoords};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SingleGemmKernelConfig {
@@ -68,7 +68,44 @@ impl KernelSpec for SingleGemmSpec {
 
     const KIND: KernelKind = "single_gemm";
 
+    fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
+        if neuron_only(config) {
+            anyhow::ensure!(
+                config.dtype == DType::Bf16,
+                "Neuron GEMM supports BF16 only"
+            );
+            anyhow::ensure!(
+                config.n.get() > 0
+                    && config.k.get() > 0
+                    && config.n.get() % 256 == 0
+                    && config.k.get() % 256 == 0,
+                "Neuron LNC2 GEMM feature dimensions must be positive multiples of256"
+            );
+            anyhow::ensure!(
+                matches!(
+                    config.gpu_name.as_str(),
+                    "AWS Trainium2 LNC2" | "Trainium2-LNC2"
+                ),
+                "Neuron timing requires a Trainium2 LNC2 target"
+            );
+        }
+        Ok(())
+    }
+
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if neuron_only(config) {
+            // The initial batch1 architecture selects one last-token hidden
+            // vector for logits. Compiling unused full-vocabulary m>1 shapes
+            // costs minutes without covering another reachable LM-head input.
+            let axis = if config.n == 128256 && config.k == 4096 {
+                Axis::values([1u32])
+            } else {
+                // The entry switches to CTE above 96. Its default LNC2
+                // allocation exceeds SBUF for H4096; only TKG is verified.
+                Axis::values([1u32, 2, 4, 8, 16, 32, 64, 96])
+            };
+            return SweepGrid::new(vec![axis]);
+        }
         if config.dtype == DType::Mxfp8E4m3 {
             return SweepGrid::new(vec![mxfp8_m_axis()]);
         }
@@ -82,6 +119,20 @@ impl KernelSpec for SingleGemmSpec {
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
         CacheKind::Cache1DLinear
+    }
+
+    fn cache_coords(config: &Self::Config, input: &Self::Input) -> Coords {
+        if neuron_only(config) {
+            if config.n == 128256 && config.k == 4096 {
+                assert_eq!(input.m, 1, "Neuron batch1 LM head requires one token row");
+            } else {
+                assert!(
+                    (1..=96).contains(&input.m),
+                    "Neuron GEMM TKG supports 1..96 token rows"
+                );
+            }
+        }
+        input.coords()
     }
 
     fn enumerate(
@@ -100,6 +151,14 @@ impl KernelSpec for SingleGemmSpec {
     }
 }
 
+fn neuron_only(config: &SingleGemmKernelConfig) -> bool {
+    !config.backends.is_empty()
+        && config
+            .backends
+            .iter()
+            .all(|backend| *backend == "neuron_nki_qkv")
+}
+
 register_kernel!(SingleGemmKernel, SingleGemmSpec);
 
 #[cfg(test)]
@@ -109,6 +168,58 @@ mod tests {
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::SweepCoords;
     use serde_json::Value;
+
+    #[test]
+    fn neuron_grid_profiles_verified_tkg_without_expanding_single_token_head() {
+        let mut config = SingleGemmKernelConfig {
+            backends: vec!["neuron_nki_qkv"],
+            gpu_name: "AWS Trainium2 LNC2".into(),
+            n: 4096.into(),
+            k: 4096.into(),
+            dtype: DType::Bf16,
+        };
+        SingleGemmSpec::validate_config(&config).unwrap();
+        assert_eq!(
+            SingleGemmSpec::sweep_grid(&config).axes()[0],
+            [1., 2., 4., 8., 16., 32., 64., 96.]
+        );
+        config.n = 6144.into();
+        assert_eq!(
+            SingleGemmSpec::sweep_grid(&config).axes()[0],
+            [1., 2., 4., 8., 16., 32., 64., 96.]
+        );
+        config.n = 128256.into();
+        assert_eq!(SingleGemmSpec::sweep_grid(&config).axes()[0], [1.]);
+        config.dtype = DType::Fp16;
+        assert!(SingleGemmSpec::validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn neuron_gemm_rejects_out_of_domain_queries_while_cuda_still_extrapolates() {
+        let mut config = SingleGemmKernelConfig {
+            backends: vec!["neuron_nki_qkv"],
+            gpu_name: "AWS Trainium2 LNC2".into(),
+            n: 6144.into(),
+            k: 4096.into(),
+            dtype: DType::Bf16,
+        };
+        assert!(std::panic::catch_unwind(|| SingleGemmSpec::cache_coords(
+            &config,
+            &SingleGemmKernelInput { m: 97 }
+        ))
+        .is_err());
+        config.n = 128256.into();
+        assert!(std::panic::catch_unwind(|| SingleGemmSpec::cache_coords(
+            &config,
+            &SingleGemmKernelInput { m: 2 }
+        ))
+        .is_err());
+        config.backends = vec!["torch"];
+        assert_eq!(
+            &*SingleGemmSpec::cache_coords(&config, &SingleGemmKernelInput { m: 256 }),
+            &[256.]
+        );
+    }
 
     #[test]
     fn config_identity_includes_backend_and_shape() {
@@ -266,7 +377,10 @@ mod tests {
                 assert!(has(b + 1), "first m past bucket {b} missing");
             }
         }
-        assert!(axis.windows(2).all(|w| w[0] < w[1]), "axis must be strictly increasing");
+        assert!(
+            axis.windows(2).all(|w| w[0] < w[1]),
+            "axis must be strictly increasing"
+        );
         assert_eq!(axis.first(), Some(&1.0));
         assert_eq!(axis.last(), Some(&8192.0));
         assert_eq!(axis.len(), 58);
@@ -281,6 +395,9 @@ mod tests {
         let fields = payloads[0].fields();
         assert_eq!(fields.len(), 5);
         assert_eq!(fields.get("dtype"), Some(&Value::from("mxfp8_e4m3")));
-        assert_eq!(fields.get("backend"), Some(&Value::from("flashinfer_mxfp8")));
+        assert_eq!(
+            fields.get("backend"),
+            Some(&Value::from("flashinfer_mxfp8"))
+        );
     }
 }

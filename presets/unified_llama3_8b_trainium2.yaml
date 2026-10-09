@@ -1,0 +1,29 @@
+# Device timings of separately compiled layers, not whole NxDI serving latency.
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/smoke.csv
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  run_to_end: true
+
+io:
+  log_dir: logs/unified_llama3_8b_trainium2
+
+pools:
+  main:
+    groups:
+      - gpu: AWS Trainium2 LNC2
+        replicas: 1
+        arch:
+          type: llama3_neuron
+          model_config: model/config/llama3_8b.json
+          kv_capacity: 512
+        worker:
+          type: barebone
+          # Fixed cache: 512 tokens * 131072 bytes/token = 64MiB.
+          attn_gpu_memory_gb: 0.067108864
+          # Soft budget admits one whole prefill when idle; live decode uses it.
+          max_batch_tokens: 1
+          prefix_cache_mode: disabled

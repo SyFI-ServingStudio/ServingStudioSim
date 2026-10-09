@@ -61,6 +61,10 @@ pub mod moe_fused_topk;
 pub mod moe_sum;
 pub mod moe_topk_softplus_sqrt;
 pub mod mxfp4_marlin_moe_gemm;
+pub mod neuron_dense_mlp;
+pub mod neuron_embedding;
+pub mod neuron_llama_decoder;
+pub mod neuron_llama_forward;
 pub mod nvfp4_fused_moe;
 pub mod nvfp4_quant;
 pub mod p2p_inter;
@@ -285,6 +289,21 @@ pub use mxfp4_marlin_moe_gemm::{
     Mxfp4MarlinMoeFcRole, Mxfp4MarlinMoeGemmKernel, Mxfp4MarlinMoeGemmKernelConfig,
     Mxfp4MarlinMoeGemmKernelInput, Mxfp4MarlinMoeGemmSpec,
 };
+pub use neuron_dense_mlp::{
+    NeuronDenseMlpKernel, NeuronDenseMlpKernelConfig, NeuronDenseMlpKernelInput, NeuronDenseMlpSpec,
+};
+pub use neuron_embedding::{
+    NeuronEmbeddingKernel, NeuronEmbeddingKernelConfig, NeuronEmbeddingKernelInput,
+    NeuronEmbeddingSpec,
+};
+pub use neuron_llama_decoder::{
+    NeuronLlamaDecoderKernel, NeuronLlamaDecoderKernelConfig, NeuronLlamaDecoderKernelInput,
+    NeuronLlamaDecoderPhase, NeuronLlamaDecoderSpec,
+};
+pub use neuron_llama_forward::{
+    NeuronLlamaForwardKernel, NeuronLlamaForwardKernelConfig, NeuronLlamaForwardKernelInput,
+    NeuronLlamaForwardPhase, NeuronLlamaForwardSpec,
+};
 pub use nvfp4_fused_moe::{
     Nvfp4FusedMoeKernel, Nvfp4FusedMoeKernelConfig, Nvfp4FusedMoeKernelInput, Nvfp4FusedMoeSpec,
 };
@@ -317,8 +336,8 @@ pub use single_gemm::{
     SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput, SingleGemmSpec,
 };
 pub use vllm_fused_moe::{
-    VllmFusedMoeKernel, VllmFusedMoeKernelConfig, VllmFusedMoeKernelInput, VllmFusedMoeSpec,
-    LAUNCH_ROLE_DOWN, LAUNCH_ROLE_GATE_UP,
+    LAUNCH_ROLE_DOWN, LAUNCH_ROLE_GATE_UP, VllmFusedMoeKernel, VllmFusedMoeKernelConfig,
+    VllmFusedMoeKernelInput, VllmFusedMoeSpec,
 };
 pub use vllm_mla_rope::{
     VllmMlaRopeKernel, VllmMlaRopeKernelConfig, VllmMlaRopeKernelInput, VllmMlaRopeSpec,

@@ -1,0 +1,13 @@
+{
+  "arch": {
+    "iter": {
+      "type": "llama3_neuron",
+      "model_config": "model/config/llama3_8b.json",
+      "kv_capacity": 512,
+      "fp8": false
+    }
+  },
+  "gpu": "AWS Trainium2 LNC2",
+  "log_dir": "logs/predict_llama3_8b_trainium2",
+  "cases_file": "predict_llama3_8b_trainium2_cases.json"
+}

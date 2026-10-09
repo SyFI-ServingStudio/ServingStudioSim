@@ -18,6 +18,8 @@ pub mod glm53_vllm_nvfp4_dsa_moe_dflash2;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;
 pub mod llama3_dp_attn_tp_ffn;
+pub mod llama3_neuron;
+pub mod llama3_vllm_neuron;
 pub mod model_cfg;
 pub mod moe_model_cfg;
 pub mod qwen36_local;
@@ -34,13 +36,13 @@ pub use contract::{
     IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput, SpeculativeDecodeInput,
     SpeculativeUnifiedModel, UnifiedArchInput,
 };
-pub use deepseek_v41_vllm::{
-    DeepseekV41ModelCfg, DeepseekV41VllmConfigs, DeepseekV41VllmModel, DeepseekV41VllmParallel,
-    DeepseekV41VllmResolved,
-};
 pub use deepseek_v4_vllm::{
     DeepseekV4ModelCfg, DeepseekV4VllmConfigs, DeepseekV4VllmModel, DeepseekV4VllmParallel,
     DeepseekV4VllmResolved,
+};
+pub use deepseek_v41_vllm::{
+    DeepseekV41ModelCfg, DeepseekV41VllmConfigs, DeepseekV41VllmModel, DeepseekV41VllmParallel,
+    DeepseekV41VllmResolved,
 };
 pub use glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 pub use glm52_sglang_nvfp4_tp_dsa_moe::{
@@ -63,14 +65,16 @@ pub use glm53_vllm_nvfp4_dsa_moe_dflash2::{
 pub use llama3_dense::{DenseParallel, Llama3DenseModel};
 pub use llama3_dense_tp::{DenseTpParallel, Llama3DenseTpModel};
 pub use llama3_dp_attn_tp_ffn::{DpAttnTpFfnParallel, Llama3DpAttnTpFfnModel};
+pub use llama3_neuron::{Llama3NeuronModel, NeuronParallel};
+pub use llama3_vllm_neuron::{Llama3VllmNeuronModel, VllmNeuronParallel};
 pub use model_cfg::ModelCfg;
 pub use moe_model_cfg::MoeModelCfg;
-pub use qwen36_local::{
-    Qwen36LocalConfigs, Qwen36LocalModel, Qwen36LocalParallel, Qwen36LocalResolved, Qwen36ModelCfg,
-};
 pub use qwen3_attn_layerwise::{Qwen3AttnLayerwiseModel, Qwen3AttnParallel};
 pub use qwen3_ffn_moe_layerwise::{Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel};
 pub use qwen3_fp8_ffn_moe_layerwise::{Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel};
 pub use qwen3_moe_dp_attn_ep_ffn::{Qwen3MoeDpAttnEpFfnModel, Qwen3MoeParallel};
 pub use qwen3_moe_fp8_dp_attn_ep_ffn::{Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel};
 pub use qwen3_vllm_moe_dp_attn_ep_ffn::{Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel};
+pub use qwen36_local::{
+    Qwen36LocalConfigs, Qwen36LocalModel, Qwen36LocalParallel, Qwen36LocalResolved, Qwen36ModelCfg,
+};

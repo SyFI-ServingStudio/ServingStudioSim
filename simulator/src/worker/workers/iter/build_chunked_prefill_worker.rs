@@ -78,6 +78,10 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         config.batch_policy,
         config.kv_admission,
         balance,
+    )
+    .with_request_limits(
+        config.max_prefill_requests_per_iteration,
+        config.max_resident_requests_per_partition,
     );
 
     IterBatchWorker::from_components(
