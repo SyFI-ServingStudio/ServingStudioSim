@@ -291,9 +291,11 @@ pub(crate) enum AtHead {
     Read,
     /// A read is needed but the request does not fit in HBM beside what is
     /// running and the other reads' holds (vLLM's waiting loop breaks when an
-    /// async load cannot allocate its blocks), or its tier's queue is past
-    /// the read-wait bound: stop admitting.
+    /// async load cannot allocate its blocks): stop admitting.
     Blocked,
+    /// A read is needed but its tier's queue is past the read-wait bound:
+    /// pass it over, holding nothing, and admit the requests behind it.
+    PassedOver,
 }
 
 /// The tiers of every partition and the reads in flight.
@@ -341,9 +343,10 @@ impl PrefixFetch {
     }
 
     /// Start a read only while its tier would begin it within `ms`; past
-    /// that, the request at the head waits in its queue holding nothing. A
-    /// long queue of reads otherwise holds their HBM blocks for its whole
-    /// wait. 0 leaves reads unbounded, as vLLM does.
+    /// that, admission passes the request over, holding nothing, and goes on
+    /// to the requests behind it. A long queue of reads otherwise holds their
+    /// HBM blocks for its whole wait, and a request waiting at the head would
+    /// keep HBM and DRAM hits out. 0 leaves reads unbounded, as vLLM does.
     pub(crate) fn with_max_read_wait_ms(mut self, ms: f64) -> Self {
         assert!(ms >= 0.0, "prefix_tier_max_read_wait_ms must be >= 0");
         self.max_read_wait = (ms > 0.0).then(|| Time::from_ms(ms));
@@ -438,11 +441,13 @@ impl PrefixFetch {
             post_prefill_context_tokens,
             candidate.remaining_output_tokens,
         );
-        if !kv_store.fits(partition, &footprint)
-            || self
-                .max_read_wait
-                .is_some_and(|max| tiers.queue_wait(hit, now) > max)
+        if self
+            .max_read_wait
+            .is_some_and(|max| tiers.queue_wait(hit, now) > max)
         {
+            return AtHead::PassedOver;
+        }
+        if !kv_store.fits(partition, &footprint) {
             return AtHead::Blocked;
         }
         kv_store.hold_for_read(candidate.request_id, partition, &footprint, now);

@@ -665,6 +665,59 @@ mod tests {
             .is_some());
     }
 
+    /// A 5000-token prompt queued at 0 ms behind one 1000-token prompt arriving
+    /// every ms, each filling an iteration under SPF; returns the long prompt's
+    /// prefill tokens processed after 8 iterations.
+    fn starved_spf_progress(force_schedule_after_ms: f64) -> u32 {
+        use crate::worker::admission::PendingOrderKind;
+        let mut requests = vec![(0, 5_000, 1)];
+        requests.extend((1..=8).map(|id| (id, 1_000, 1)));
+        let store = shared_with(&requests);
+        for id in 1..=8 {
+            store.borrow_mut()[RequestId(id)].request.core.arrival_time =
+                Time::from_ms(f64::from(id - 1));
+        }
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(1_000),
+                pending_order: PendingOrderKind::ShortestPrefillFirst,
+                force_schedule_after_ms,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        for step in 0..8_u32 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(step + 1)));
+            assert!(worker.form_batch(Time::from_ms(f64::from(step))));
+            worker.admission.complete_iteration(
+                &mut worker.kv_store,
+                &worker.context,
+                &worker.batch_plan,
+                &mut Vec::new(),
+                Time::from_ms(f64::from(step + 1)),
+            );
+        }
+        let progress = store.borrow()[RequestId(0)]
+            .progress
+            .prefill_tokens_processed;
+        progress
+    }
+
+    #[test]
+    fn a_request_waiting_past_the_force_bound_leaves_the_spf_queue_first() {
+        assert_eq!(starved_spf_progress(0.0), 0, "SPF alone starves it");
+        // Overdue at 3 ms: it starts then and, started, keeps its place.
+        assert_eq!(starved_spf_progress(3.0), 5_000);
+    }
+
     #[test]
     fn long_prefill_threshold_lets_a_short_prompt_share_the_iteration() {
         let store = shared_with(&[(0, 16_384, 2), (1, 100, 2)]);

@@ -1184,6 +1184,88 @@ mod tests {
         );
     }
 
+    /// A 10k-token prompt queued at 0 ms behind one 2048-token prompt arriving
+    /// every ms, each filling a microbatch under SPF + srpt; returns the long
+    /// prompt's prefill tokens processed by 12 ms.
+    fn starved_prompt_progress(force_schedule_after_ms: f64) -> u32 {
+        use crate::worker::admission::PendingOrderKind;
+        use crate::worker::config::MicrobatchSizing;
+        let mut requests = vec![(0, 10_000, 1)];
+        requests.extend((1..=12).map(|id| (id, 2048, 1)));
+        let store = shared_with(&requests);
+        for id in 1..=12 {
+            store.borrow_mut()[RequestId(id)].request.core.arrival_time =
+                Time::from_ms(f64::from(id - 1));
+        }
+        let mut worker = build_pipeline_head_worker(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            PipelineLayout { depth: 4, ..LAYOUT },
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(2048),
+                attn_kv_bytes: 1_000_000,
+                microbatch_sizing: MicrobatchSizing::Greedy,
+                pending_order: PendingOrderKind::ShortestPrefillFirst,
+                srpt: true,
+                force_schedule_after_ms,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut exits: Vec<(u64, Time)> = Vec::new();
+        for step in 0..12_u32 {
+            let start = Time::from_ms(f64::from(step));
+            let end = Time::from_ms(f64::from(step + 1));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(step + 1)));
+            let mut now = start;
+            loop {
+                exits.retain(|&(microbatch, at)| {
+                    let due = at <= now;
+                    if due {
+                        worker.enqueue(PipelineHeadMsg::MicrobatchExit { microbatch, at });
+                    }
+                    !due
+                });
+                let mut events = Vec::new();
+                let wakeup = worker.tick(now, &mut events);
+                for (id, _, ready) in launched(&events) {
+                    exits.push((id, ready + Time::from_ms(1.0)));
+                }
+                let next = [wakeup, exits.iter().map(|&(_, at)| at).min()]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                match next {
+                    Some(next) if next > now && next < end => now = next,
+                    _ => break,
+                }
+            }
+        }
+        let progress = store.borrow()[RequestId(0)]
+            .progress
+            .prefill_tokens_processed;
+        progress
+    }
+
+    #[test]
+    fn a_request_waiting_past_the_force_bound_runs_before_shorter_ones() {
+        // SPF + srpt alone: every microbatch goes to a newer, shorter prompt.
+        assert_eq!(starved_prompt_progress(0.0), 0);
+        // Overdue at 5 ms, it takes whole microbatches from then on: at least
+        // three have left the pipeline by 12 ms.
+        assert!(
+            starved_prompt_progress(5.0) >= 3 * 2048,
+            "progress {}",
+            starved_prompt_progress(5.0)
+        );
+    }
+
     #[test]
     fn long_prefill_threshold_caps_the_even_target_per_request() {
         use crate::worker::config::MicrobatchSizing;
@@ -1552,6 +1634,67 @@ mod tests {
                     "bound {bound_ms}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_request_past_the_read_wait_bound_is_passed_over_for_the_ones_behind() {
+        // Session 7's 40-token read keeps the DRAM channel busy until 0.8 ms.
+        // Session 9 reaches the head at 0.1 ms; request 2 behind it needs no
+        // read. Unbounded, session 9's read queues and request 2 follows it;
+        // with a 0.5 ms bound session 9 is passed over rather than stopping
+        // admission, so request 2 still runs at 0.1 ms (1 ms stage) instead of
+        // after the channel drains.
+        for bound_ms in [0.0, 0.5] {
+            let store = shared_with(&[(0, 4, 1), (1, 2, 1), (2, 8, 1)]);
+            as_session(&store, 0, 7, 40, 0.0);
+            as_session(&store, 1, 9, 20, 0.1);
+            let mut worker = head_with(
+                Rc::clone(&store),
+                WorkerConfig {
+                    prefix_tier_warm_start: true,
+                    prefix_tier_max_read_wait_ms: bound_ms,
+                    max_batch_tokens: Some(64),
+                    attn_kv_bytes: 240,
+                    prefix_tiers: [
+                        Some(crate::worker::kv::PrefixTierSpec {
+                            name: "dram",
+                            capacity_gb_per_gpu: 1e-6,
+                            read_gb_per_s_per_gpu: 1e-4,
+                        }),
+                        None,
+                    ],
+                    ..WorkerConfig::default()
+                },
+            );
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(0.1), &mut events);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+            run_until(
+                &mut worker,
+                Time::from_ms(0.1),
+                Time::from_ms(60.0),
+                &mut events,
+            );
+            assert_eq!(
+                launched(&events)[0],
+                (1, 8, Time::from_ms(1.1)),
+                "bound {bound_ms}"
+            );
+            assert_eq!(
+                completed(&events),
+                vec![RequestId(2), RequestId(0), RequestId(1)],
+                "bound {bound_ms}"
+            );
+            assert_eq!(
+                store.borrow()[RequestId(1)]
+                    .telemetry
+                    .prefix_cache_hit_tokens,
+                Some(20),
+                "bound {bound_ms}"
+            );
         }
     }
 

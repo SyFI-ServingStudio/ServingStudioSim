@@ -226,6 +226,13 @@ impl Deployment for UnifiedDeployment {
                     ..
                 }
             ),
+            force_schedule_after_ms: match &g.worker {
+                IterWorkerSel::ChunkedPrefill {
+                    force_schedule_after_ms,
+                    ..
+                } => *force_schedule_after_ms,
+                _ => 0.0,
+            },
             ..WorkerConfig::default()
         };
 
@@ -1214,6 +1221,7 @@ mod tests {
             ssd_tier_gb: 0.0,
             ssd_tier_gb_per_s: 10.0,
             prefix_tier_warm_start: false,
+            force_schedule_after_ms: 0.0,
             external_decode: false,
         }
     }

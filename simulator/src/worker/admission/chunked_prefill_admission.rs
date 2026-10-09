@@ -19,6 +19,9 @@
 //! resident and unadvanced until a later decode-only iteration. This is the
 //! mechanism selected by SGLang when `enable_mixed_chunk` is false; admission
 //! capacity estimation and decode retraction are separate policies.
+//!
+//! `with_force_after(ms)` (not vLLM) serves a queued request that has waited
+//! `ms` since arrival before the rest of its partition's queue (`overdue.rs`).
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -31,6 +34,7 @@ use crate::worker::kv::{ChunkedPrefillKv, ResolvedPrefillContext};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
 
+use super::overdue::OverdueQueue;
 use super::prefix_fetch::{AtHead, PrefixFetch};
 use super::{
     AdmissionCandidate, DecodeCompletion, EnqueueSequence, IterAdmission, LoadBalance,
@@ -73,6 +77,9 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// DRAM/SSD tiers behind each partition's HBM, read when a request
     /// reaches the head of its queue.
     prefix_fetch: Option<PrefixFetch>,
+    /// Queued requests that waited past the force-schedule bound; `None`: no
+    /// bound.
+    overdue: Option<OverdueQueue>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -144,7 +151,15 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             drafting_slots,
             session_partitions: None,
             prefix_fetch: None,
+            overdue: None,
         }
+    }
+
+    /// Serve a queued request that has waited `after_ms` since arrival before
+    /// the rest of its partition's queue (`overdue.rs`). Not vLLM.
+    pub(crate) fn with_force_after(mut self, after_ms: f64) -> Self {
+        self.overdue = Some(OverdueQueue::new(after_ms));
+        self
     }
 
     /// Read session contexts back from each partition's DRAM/SSD tiers when a
@@ -457,12 +472,19 @@ where
     fn accept_message(&mut self, kv_store: &mut K, msg: Self::Msg, context: &WorkerContext) {
         let WorkerMsgCommon::Request(request) = msg;
         debug_assert_eq!(self.partition_policies.len(), kv_store.num_partitions());
-        let (fresh_prompt_tokens, remaining_output_tokens, session_input, conversation_start_time) = {
+        let (
+            arrival_time,
+            fresh_prompt_tokens,
+            remaining_output_tokens,
+            session_input,
+            conversation_start_time,
+        ) = {
             let mut store = context.requests.borrow_mut();
             let record = &mut store[request];
             let arrival_time = record.request.core.arrival_time;
             context.stamp_stage(record, arrival_time, UnifiedStage::Pending as u16);
             (
+                arrival_time,
                 record.request.definition.prompt_tokens,
                 record.request.definition.target_output_tokens,
                 record.request.definition.session,
@@ -491,6 +513,9 @@ where
         let (policy, policy_context) = &mut self.partition_policies[partition];
         debug_assert!(!policy.contains(request));
         policy.push(candidate, policy_context);
+        if let Some(overdue) = &mut self.overdue {
+            overdue.arrived(partition as u16, request, arrival_time);
+        }
     }
 
     fn form_batch(
@@ -503,6 +528,11 @@ where
         self.land_prefix_reads(kv_store, now);
         let num_partitions = kv_store.num_partitions();
         debug_assert_eq!(self.partition_policies.len(), num_partitions);
+        if let Some(overdue) = &mut self.overdue {
+            for (partition, (policy, _)) in self.partition_policies.iter_mut().enumerate() {
+                overdue.promote(partition as u16, policy, now);
+            }
+        }
         self.started_prefills.resize_with(num_partitions, Vec::new);
         batch_plan.reset_decode_participation(num_partitions, true);
         let has_live_decode = |kv_store: &K| {
@@ -598,11 +628,17 @@ where
             {
                 let (policy, policy_context) = &mut self.partition_policies[partition_index];
                 let fetch = &mut self.prefix_fetch;
-                // Landed reads hold their blocks and go before the queue.
+                // Landed reads hold their blocks and go before the queue, then
+                // requests that waited past the force bound.
                 let landed = fetch
                     .as_ref()
                     .and_then(|fetch| fetch.peek_landed(partition));
-                let candidate = match landed {
+                let overdue = self
+                    .overdue
+                    .as_ref()
+                    .and_then(|overdue| overdue.peek(partition))
+                    .filter(|_| landed.is_none());
+                let candidate = match landed.or(overdue) {
                     Some(candidate) => candidate,
                     None => {
                         policy.refresh_head(&mut |candidate| {
@@ -621,6 +657,7 @@ where
                     }
                 };
                 let take = |fetch: &mut Option<PrefixFetch>,
+                            overdue_queue: &mut Option<OverdueQueue>,
                             policy: &mut P,
                             policy_context: &mut P::Context| {
                     if landed.is_some() {
@@ -628,6 +665,12 @@ where
                             .as_mut()
                             .expect("a landed request implies prefix fetch")
                             .pop_landed(partition);
+                    } else if overdue.is_some() {
+                        let popped = overdue_queue
+                            .as_mut()
+                            .expect("an overdue request implies the bound")
+                            .pop(partition);
+                        debug_assert_eq!(popped, Some(candidate));
                     } else {
                         let popped = policy.pop(policy_context);
                         debug_assert_eq!(popped, Some(candidate));
@@ -637,10 +680,11 @@ where
                     match state.at_head(kv_store, partition, candidate, now) {
                         AtHead::Admit => {}
                         AtHead::Read => {
-                            take(fetch, policy, policy_context);
+                            take(fetch, &mut self.overdue, policy, policy_context);
                             continue;
                         }
-                        AtHead::Blocked => break,
+                        // Only a pipeline head sets the read-wait bound.
+                        AtHead::Blocked | AtHead::PassedOver => break,
                     }
                 }
                 if candidate.remaining_output_tokens > 1
@@ -699,7 +743,12 @@ where
                 if !fits {
                     break;
                 }
-                take(&mut self.prefix_fetch, policy, policy_context);
+                take(
+                    &mut self.prefix_fetch,
+                    &mut self.overdue,
+                    policy,
+                    policy_context,
+                );
                 self.admission_order
                     .insert(candidate.request_id, self.next_admission);
                 self.next_admission += 1;
@@ -917,7 +966,11 @@ where
         self.partition_policies
             .iter()
             .map(|(policy, _)| policy.len() as u32)
-            .sum()
+            .sum::<u32>()
+            + self
+                .overdue
+                .as_ref()
+                .map_or(0, |overdue| overdue.len() as u32)
     }
 
     fn cancel_pending(&mut self, request: RequestId) -> bool {
@@ -932,6 +985,13 @@ where
             if policy.remove(request).is_some() {
                 return true;
             }
+        }
+        if self
+            .overdue
+            .as_mut()
+            .is_some_and(|overdue| overdue.remove(request))
+        {
+            return true;
         }
         for started_prefills in &mut self.started_prefills {
             let started_count = started_prefills.len();

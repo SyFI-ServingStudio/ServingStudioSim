@@ -84,6 +84,11 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         Some(threshold) => admission.with_long_prefill_threshold(threshold),
         None => admission,
     };
+    let admission = if config.force_schedule_after_ms > 0.0 {
+        admission.with_force_after(config.force_schedule_after_ms)
+    } else {
+        admission
+    };
 
     IterBatchWorker::from_components(
         essentials.context,

@@ -171,6 +171,11 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     } else {
         admission
     };
+    let admission = if config.force_schedule_after_ms > 0.0 {
+        admission.with_force_after(config.force_schedule_after_ms)
+    } else {
+        admission
+    };
     let has_tiers = !tiers.is_empty();
     let admission = if has_tiers {
         admission.with_prefix_fetch(PrefixFetch::new(tiers, config.prefix_tier_warm_start))

@@ -511,6 +511,12 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         prefix_tier_warm_start: bool,
+        /// Serve a queued request that has waited this many ms since arrival
+        /// before the rest of its queue, so shortest-first cannot starve it
+        /// (`0`: off). Not vLLM.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        force_schedule_after_ms: f64,
         #[serde(default)]
         #[param(default = false)]
         external_decode: bool,
@@ -687,6 +693,12 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         prefix_tier_balanced_load: bool,
+        /// Serve a request that has waited this many ms since arrival before
+        /// every other one, queued or started, so srpt / shortest-first cannot
+        /// starve it (`0`: off). Not vLLM.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        force_schedule_after_ms: f64,
         #[serde(default)]
         #[param(default = false)]
         external_decode: bool,

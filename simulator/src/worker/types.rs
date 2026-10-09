@@ -621,6 +621,9 @@ pub struct WorkerConfig {
     /// With prefix tiers: start a read only while its tier would begin it
     /// within this many ms (0: no bound).
     pub prefix_tier_max_read_wait_ms: f64,
+    /// Pipeline head and chunked prefill: serve a request that has waited
+    /// this many ms since arrival before the others (0: off).
+    pub force_schedule_after_ms: f64,
     /// Pipeline head and hybrid chunked prefill: decode runs elsewhere;
     /// requests complete at their first token and retain their whole target
     /// context.
@@ -665,6 +668,7 @@ impl Default for WorkerConfig {
             prefix_tiers: [None, None],
             prefix_tier_warm_start: false,
             prefix_tier_max_read_wait_ms: 0.0,
+            force_schedule_after_ms: 0.0,
             external_decode: false,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
