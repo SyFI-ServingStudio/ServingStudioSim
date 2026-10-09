@@ -22,6 +22,8 @@ the graph that produced them.
 | Selector | Precision and execution graph | Parallel coverage | Why it remains |
 |---|---|---|---|
 | `llama3_dense` | dense local | one GPU | only local dense graph |
+| `llama3_neuron` | Llama 3.1 8B BF16; separately compiled NxDI decoder layers | one Trainium2 LNC2 unit, TP1, batch one; prefix-free prefill through 128 tokens, KV capacity 512 | measured Neuron execution boundary; see [Trainium2 support](trainium2.md) |
+| `llama3_vllm_neuron` | Llama 3.1 8B BF16; stock full32-layer forward including sampling | one Trainium2 chip, TP4/LNC2; initial serving context512, configured decode buckets1/16 | measured compiled boundary, stock admission limits and independent work map; see [stock inventory](trainium2_vllm_inventory.md) |
 | `llama3_dense_tp` | dense TP | one configurable TP group | covers TP layouts |
 | `llama3_dp_attn_tp_ffn` | dense split attention/FFN | `attn_tp_size` divides `ffn_tp_size`; attention DP is `ffn_tp_size / attn_tp_size` | covers distinct attention-DP layouts |
 | `qwen3_moe_dp_attn_ep_ffn` | native BF16 MoE | configurable attention TP, attention DP, EP, HP, and NVLink domains | only BF16 unified graph |
