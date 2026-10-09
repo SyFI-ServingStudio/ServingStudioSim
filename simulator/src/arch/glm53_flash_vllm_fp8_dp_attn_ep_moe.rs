@@ -1199,6 +1199,16 @@ mod tests {
                 .cost_log_manifest()
                 .slots
                 .into_iter()
+                .filter(|slot| {
+                    !matches!(
+                        slot.kind.as_str(),
+                        "all_gather"
+                            | "reduce_scatter"
+                            | "moe_ep_all_gather"
+                            | "moe_ep_quantized_all_gather"
+                            | "moe_ep_reduce_scatter"
+                    )
+                })
                 .map(|slot| slot.name)
                 .collect();
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1220,9 +1230,10 @@ mod tests {
     #[test]
     fn necessary_work_maps_cover_the_compiled_locations() {
         // The TP map's 125 less 8 per-rank input quants, plus per MoE kind
-        // the dispatch quant, gather, scatter and ranks 4..dp.
+        // the dispatch quant and ranks 4..dp (the gather and scatter are
+        // communication, which no map lists).
         assert_maps_cover(&model_cfg(), ARCH_KIND, |dp| {
-            125 - 8 + 2 * (3 + usize::from(dp) - 4)
+            125 - 8 + 2 * (1 + usize::from(dp) - 4)
         });
     }
 
@@ -1232,7 +1243,7 @@ mod tests {
         assert_maps_cover(
             &config("glm53_flash_nvfp4"),
             "glm53_flash_vllm_nvfp4_dp_attn_ep_moe",
-            |dp| 125 - 8 + 2 * (3 + usize::from(dp) - 4) - 2,
+            |dp| 125 - 8 + 2 * (1 + usize::from(dp) - 4) - 2,
         );
     }
 
