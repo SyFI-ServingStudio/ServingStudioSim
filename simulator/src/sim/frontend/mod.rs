@@ -324,6 +324,7 @@ fn load_typed<Definition: TraceDefinition>(
     if scheduled_requests.is_empty() {
         bail!("trace files contained no rows");
     }
+    source_identities.finish_loading()?;
     validate_arrival_order(&scheduled_requests)?;
     let releases = scheduled_requests
         .iter()
