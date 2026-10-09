@@ -58,7 +58,7 @@ DOC = KernelDoc(
     formula=(
         "O = softmax(softmax_scale · q · K_selectedᵀ) · V_selected",
         "D = latent_dim + rope_dim; Q = num_queries; H = num_heads; K = selected_k",
-        "TFLOPS = 2·Q·H·K·(D + value_dim) / time",
+        "TFLOPS = 2·H·Σvalid_counts·(D + value_dim) / time",
         "logical bytes = bq·Q·H·D + 4·Q·K + bc·Σvalid_counts·D + 2·Q·H·value_dim + 8·Q·H",
         "GB/s = logical bytes / time; bq = bc = 2 for BF16, 1 for FP8",
     ),
@@ -72,7 +72,7 @@ DOC = KernelDoc(
     caveats=(
         "Selected positions and tensor values are constructed, not taken from "
         "an indexer or a serving KV cache.",
-        "TFLOPS counts all selected_k slots even when fewer are valid.",
+        "TFLOPS counts only valid slots; masked selected_k slots take time but do no attention work.",
         "torch and vllm_flashmla_bf16 accept only rope_dim = 64; "
         "flashinfer_trtllm_fp8 also accepts rope_dim = 0, with its own cache "
         "layout. vllm_flashmla_bf16 needs selected_k to be a multiple of "

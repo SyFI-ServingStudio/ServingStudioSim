@@ -675,9 +675,12 @@ def _check_flashmla_correctness(
 
 
 def _logical_flops(
-    *, num_queries: int, num_heads: int, selected_k: int, score_dim: int = _SCORE_DIM
+    *, num_heads: int, valid_counts: Sequence[int], score_dim: int = _SCORE_DIM
 ) -> int:
-    return 2 * num_queries * num_heads * selected_k * (score_dim + _VALUE_DIM)
+    """Score and value FLOPs over the valid selected slots only: a masked slot costs
+    the kernel time but does no attention work, so counting all selected_k slots
+    would credit a mostly-masked shape with FLOPs it never ran."""
+    return 2 * num_heads * sum(valid_counts) * (score_dim + _VALUE_DIM)
 
 
 def _logical_bytes(
@@ -766,7 +769,7 @@ def profile_dsa_sparse_mla_attention_torch(
     except Exception as exc:
         raise KernelLaunchFailed("dsa_sparse_mla_attention:torch composite failed") from exc
 
-    flops = _logical_flops(num_queries=num_queries, num_heads=num_heads, selected_k=selected_k)
+    flops = _logical_flops(num_heads=num_heads, valid_counts=validated.valid_counts)
     logical_bytes = _logical_bytes(
         num_queries=num_queries,
         num_heads=num_heads,
@@ -967,9 +970,8 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
         raise KernelLaunchFailed(f"{_TRTLLM_FP8_BACKEND} native callable failed") from exc
 
     flops = _logical_flops(
-        num_queries=num_queries,
         num_heads=num_heads,
-        selected_k=selected_k,
+        valid_counts=validated.valid_counts,
         score_dim=_LATENT_DIM + rope_dim,
     )
     logical_bytes = _logical_bytes(
@@ -1079,7 +1081,7 @@ def profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(
     except Exception as exc:
         raise KernelLaunchFailed(f"{_FLASHMLA_BACKEND} native callable failed") from exc
 
-    flops = _logical_flops(num_queries=num_queries, num_heads=num_heads, selected_k=selected_k)
+    flops = _logical_flops(num_heads=num_heads, valid_counts=validated.valid_counts)
     logical_bytes = _logical_bytes(
         num_queries=num_queries,
         num_heads=num_heads,
