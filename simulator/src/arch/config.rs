@@ -118,51 +118,8 @@ const fn default_glm53_flash_enable_expert_parallel() -> bool {
     true
 }
 
-/// `kda_chunk_prefill` backends a GLM-5.3-Flash arch can run its KDA prefill
-/// on: the fork's Triton `chunk_kda_with_fused_gate`, or FlashKDA, which
-/// upstream vLLM picks by default on SM90 / SM10x (`kda_prefill_backend: auto`).
-/// `vllm_triton` is the fork's FLA chain, `flashkda` upstream vLLM's SM10x
-/// default; `flashinfer_cute_persistent` needs a vLLM patch to dispatch.
-pub(crate) const GLM53_FLASH_KDA_PREFILL_BACKENDS: [&str; 3] =
-    ["vllm_triton", "flashkda", "flashinfer_cute_persistent"];
-
-fn default_glm53_flash_kda_prefill_backend() -> String {
-    "vllm_triton".to_string()
-}
-
-/// `gdn_causal_conv_prefill` backends a GLM-5.3-Flash arch can run its KDA
-/// short-conv prefill on: vLLM's varlen Triton call, or Dao-AILab
-/// causal-conv1d's channel-last kernel, one launch per sequence.
-pub(crate) const GLM53_FLASH_CAUSAL_CONV_BACKENDS: [&str; 2] = ["vllm_triton", "dao_channellast"];
-
-fn default_glm53_flash_causal_conv_backend() -> String {
-    "vllm_triton".to_string()
-}
-
 const fn default_glm53_flash_mla_layout_copies() -> bool {
     true
-}
-
-/// `mhc_fused_post_pre_rms_norm` backends a GLM-5.3-Flash arch can run its
-/// fused mHC boundaries on: `vllm_tilelang`, vLLM's TileLang call (one launch
-/// up to 16 tokens, three above), or `deepgemm_mega_nonshifted`, DeepGEMM's
-/// one-launch `mega_mhc` without the shifted collapse (SM10x, hidden a
-/// multiple of 1024, four streams), which vLLM does not dispatch yet.
-pub(crate) const GLM53_FLASH_MHC_FUSED_BACKENDS: [&str; 2] =
-    ["vllm_tilelang", "deepgemm_mega_nonshifted"];
-
-fn default_glm53_flash_mhc_fused_backend() -> String {
-    "vllm_tilelang".to_string()
-}
-
-/// `dsa_topk_prefill` choices for a GLM-5.3-Flash arch's prefill indexer:
-/// vLLM's `top_k_per_row_prefill`, DeepSelect (needs a vLLM patch to dispatch
-/// on prefill), or the faster of the two per launch shape.
-pub(crate) const GLM53_FLASH_INDEXER_TOPK_BACKENDS: [&str; 3] =
-    ["vllm_cuda", "deep_select", "fastest"];
-
-fn default_glm53_flash_indexer_topk_backend() -> String {
-    "vllm_cuda".to_string()
 }
 
 /// vLLM's default `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB` (`vllm/envs.py`).
@@ -721,13 +678,6 @@ pub enum IterArchSel {
         /// padding (eager).
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
-        /// KDA chunked-prefill kernel (`kda_chunk_prefill` backend):
-        /// `vllm_triton`, the fork's `chunk_kda_with_fused_gate`, or
-        /// `flashkda`, upstream vLLM's default on SM90 / SM10x. Decode keeps
-        /// `fused_recurrent_kda`.
-        #[serde(default = "default_glm53_flash_kda_prefill_backend")]
-        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_KDA_PREFILL_BACKENDS, cache_key)]
-        kda_prefill_backend: String,
         /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
         /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
         /// over the attention output. vLLM 04730e8 and later write the query
@@ -735,37 +685,12 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mla_layout_copies")]
         #[param(default = true, cache_key)]
         mla_layout_copies: bool,
-        /// Backend of every fused mHC post/pre boundary
-        /// (`mhc_fused_post_pre_rms_norm`): `vllm_tilelang` or
-        /// `deepgemm_mega_nonshifted`. The first pre and the last post keep
-        /// TileLang.
-        #[serde(default = "default_glm53_flash_mhc_fused_backend")]
-        #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
-        mhc_fused_backend: String,
-        /// DSA prefill-indexer top-k (`dsa_topk_prefill` backend):
-        /// `vllm_cuda` (`top_k_per_row_prefill`, what vLLM runs), `deep_select`
-        /// (DeepSelect, which vLLM runs only for decode), or `fastest`, the
-        /// per-launch best of the two. A launch packing several requests has
-        /// nonzero row starts, which DeepSelect cannot take, so it stays on
-        /// `vllm_cuda` under every choice.
-        #[serde(default = "default_glm53_flash_indexer_topk_backend")]
-        #[param(string, default = "vllm_cuda", choices = GLM53_FLASH_INDEXER_TOPK_BACKENDS, cache_key)]
-        indexer_topk_backend: String,
         /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
         /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
         /// fits this many MiB, and runs logits and top-k once per piece.
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
-        /// KDA short-conv prefill kernel (`gdn_causal_conv_prefill` backend):
-        /// `vllm_triton`, vLLM's one varlen `causal_conv1d_fn` launch over every
-        /// token, or `dao_channellast`, Dao-AILab causal-conv1d's channel-last
-        /// kernel launched once per prefill sequence, with the iteration's
-        /// decode tokens on vLLM's `causal_conv1d_update`. No vLLM release
-        /// dispatches to the latter.
-        #[serde(default = "default_glm53_flash_causal_conv_backend")]
-        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_CAUSAL_CONV_BACKENDS, cache_key)]
-        causal_conv_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under pure pipeline
     /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
@@ -810,13 +735,6 @@ pub enum IterArchSel {
         /// summing to 45. Empty: vLLM's default `get_pp_indices` split.
         #[serde(default)]
         layer_partition: Vec<u32>,
-        /// KDA chunked-prefill kernel (`kda_chunk_prefill` backend):
-        /// `vllm_triton`, the fork's `chunk_kda_with_fused_gate`, or
-        /// `flashkda`, upstream vLLM's default on SM90 / SM10x. Decode keeps
-        /// `fused_recurrent_kda`.
-        #[serde(default = "default_glm53_flash_kda_prefill_backend")]
-        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_KDA_PREFILL_BACKENDS, cache_key)]
-        kda_prefill_backend: String,
         /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
         /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
         /// over the attention output. vLLM 04730e8 and later write the query
@@ -824,37 +742,12 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mla_layout_copies")]
         #[param(default = true, cache_key)]
         mla_layout_copies: bool,
-        /// Backend of every fused mHC post/pre boundary
-        /// (`mhc_fused_post_pre_rms_norm`): `vllm_tilelang` or
-        /// `deepgemm_mega_nonshifted`. The first pre and the last post keep
-        /// TileLang.
-        #[serde(default = "default_glm53_flash_mhc_fused_backend")]
-        #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
-        mhc_fused_backend: String,
-        /// DSA prefill-indexer top-k (`dsa_topk_prefill` backend):
-        /// `vllm_cuda` (`top_k_per_row_prefill`, what vLLM runs), `deep_select`
-        /// (DeepSelect, which vLLM runs only for decode), or `fastest`, the
-        /// per-launch best of the two. A launch packing several requests has
-        /// nonzero row starts, which DeepSelect cannot take, so it stays on
-        /// `vllm_cuda` under every choice.
-        #[serde(default = "default_glm53_flash_indexer_topk_backend")]
-        #[param(string, default = "vllm_cuda", choices = GLM53_FLASH_INDEXER_TOPK_BACKENDS, cache_key)]
-        indexer_topk_backend: String,
         /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
         /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
         /// fits this many MiB, and runs logits and top-k once per piece.
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
-        /// KDA short-conv prefill kernel (`gdn_causal_conv_prefill` backend):
-        /// `vllm_triton`, vLLM's one varlen `causal_conv1d_fn` launch over every
-        /// token, or `dao_channellast`, Dao-AILab causal-conv1d's channel-last
-        /// kernel launched once per prefill sequence, with the iteration's
-        /// decode tokens on vLLM's `causal_conv1d_update`. No vLLM release
-        /// dispatches to the latter.
-        #[serde(default = "default_glm53_flash_causal_conv_backend")]
-        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_CAUSAL_CONV_BACKENDS, cache_key)]
-        causal_conv_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under data-parallel
     /// attention and expert-parallel MoE (vLLM `--data-parallel-size ep_size
@@ -896,13 +789,6 @@ pub enum IterArchSel {
         /// they run eager on their own rows. Empty: always eager.
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
-        /// KDA chunked-prefill kernel (`kda_chunk_prefill` backend):
-        /// `vllm_triton`, the fork's `chunk_kda_with_fused_gate`, or
-        /// `flashkda`, upstream vLLM's default on SM90 / SM10x. Decode keeps
-        /// `fused_recurrent_kda`.
-        #[serde(default = "default_glm53_flash_kda_prefill_backend")]
-        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_KDA_PREFILL_BACKENDS, cache_key)]
-        kda_prefill_backend: String,
         /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
         /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
         /// over the attention output. vLLM 04730e8 and later write the query
@@ -910,37 +796,12 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mla_layout_copies")]
         #[param(default = true, cache_key)]
         mla_layout_copies: bool,
-        /// Backend of every fused mHC post/pre boundary
-        /// (`mhc_fused_post_pre_rms_norm`): `vllm_tilelang` or
-        /// `deepgemm_mega_nonshifted`. The first pre and the last post keep
-        /// TileLang.
-        #[serde(default = "default_glm53_flash_mhc_fused_backend")]
-        #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
-        mhc_fused_backend: String,
-        /// DSA prefill-indexer top-k (`dsa_topk_prefill` backend):
-        /// `vllm_cuda` (`top_k_per_row_prefill`, what vLLM runs), `deep_select`
-        /// (DeepSelect, which vLLM runs only for decode), or `fastest`, the
-        /// per-launch best of the two. A launch packing several requests has
-        /// nonzero row starts, which DeepSelect cannot take, so it stays on
-        /// `vllm_cuda` under every choice.
-        #[serde(default = "default_glm53_flash_indexer_topk_backend")]
-        #[param(string, default = "vllm_cuda", choices = GLM53_FLASH_INDEXER_TOPK_BACKENDS, cache_key)]
-        indexer_topk_backend: String,
         /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
         /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
         /// fits this many MiB, and runs logits and top-k once per piece.
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
-        /// KDA short-conv prefill kernel (`gdn_causal_conv_prefill` backend):
-        /// `vllm_triton`, vLLM's one varlen `causal_conv1d_fn` launch over every
-        /// token, or `dao_channellast`, Dao-AILab causal-conv1d's channel-last
-        /// kernel launched once per prefill sequence, with the iteration's
-        /// decode tokens on vLLM's `causal_conv1d_update`. No vLLM release
-        /// dispatches to the latter.
-        #[serde(default = "default_glm53_flash_causal_conv_backend")]
-        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_CAUSAL_CONV_BACKENDS, cache_key)]
-        causal_conv_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s graph for NVIDIA's ModelOpt NVFP4
     /// checkpoint (`nvidia/GLM-5.3-Flash-NVFP4`): NVFP4 routed experts and
@@ -985,13 +846,6 @@ pub enum IterArchSel {
         /// padding (eager).
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
-        /// KDA chunked-prefill kernel (`kda_chunk_prefill` backend):
-        /// `vllm_triton`, the fork's `chunk_kda_with_fused_gate`, or
-        /// `flashkda`, upstream vLLM's default on SM90 / SM10x. Decode keeps
-        /// `fused_recurrent_kda`.
-        #[serde(default = "default_glm53_flash_kda_prefill_backend")]
-        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_KDA_PREFILL_BACKENDS, cache_key)]
-        kda_prefill_backend: String,
         /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
         /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
         /// over the attention output. vLLM 04730e8 and later write the query
@@ -999,37 +853,12 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mla_layout_copies")]
         #[param(default = true, cache_key)]
         mla_layout_copies: bool,
-        /// Backend of every fused mHC post/pre boundary
-        /// (`mhc_fused_post_pre_rms_norm`): `vllm_tilelang` or
-        /// `deepgemm_mega_nonshifted`. The first pre and the last post keep
-        /// TileLang.
-        #[serde(default = "default_glm53_flash_mhc_fused_backend")]
-        #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
-        mhc_fused_backend: String,
-        /// DSA prefill-indexer top-k (`dsa_topk_prefill` backend):
-        /// `vllm_cuda` (`top_k_per_row_prefill`, what vLLM runs), `deep_select`
-        /// (DeepSelect, which vLLM runs only for decode), or `fastest`, the
-        /// per-launch best of the two. A launch packing several requests has
-        /// nonzero row starts, which DeepSelect cannot take, so it stays on
-        /// `vllm_cuda` under every choice.
-        #[serde(default = "default_glm53_flash_indexer_topk_backend")]
-        #[param(string, default = "vllm_cuda", choices = GLM53_FLASH_INDEXER_TOPK_BACKENDS, cache_key)]
-        indexer_topk_backend: String,
         /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
         /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
         /// fits this many MiB, and runs logits and top-k once per piece.
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
-        /// KDA short-conv prefill kernel (`gdn_causal_conv_prefill` backend):
-        /// `vllm_triton`, vLLM's one varlen `causal_conv1d_fn` launch over every
-        /// token, or `dao_channellast`, Dao-AILab causal-conv1d's channel-last
-        /// kernel launched once per prefill sequence, with the iteration's
-        /// decode tokens on vLLM's `causal_conv1d_update`. No vLLM release
-        /// dispatches to the latter.
-        #[serde(default = "default_glm53_flash_causal_conv_backend")]
-        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_CAUSAL_CONV_BACKENDS, cache_key)]
-        causal_conv_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8PpKdaDsaMoe`] for the NVFP4 checkpoint (see
     /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]). Runs only under deployment `pp`.
@@ -1069,13 +898,6 @@ pub enum IterArchSel {
         /// summing to 45. Empty: vLLM's default `get_pp_indices` split.
         #[serde(default)]
         layer_partition: Vec<u32>,
-        /// KDA chunked-prefill kernel (`kda_chunk_prefill` backend):
-        /// `vllm_triton`, the fork's `chunk_kda_with_fused_gate`, or
-        /// `flashkda`, upstream vLLM's default on SM90 / SM10x. Decode keeps
-        /// `fused_recurrent_kda`.
-        #[serde(default = "default_glm53_flash_kda_prefill_backend")]
-        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_KDA_PREFILL_BACKENDS, cache_key)]
-        kda_prefill_backend: String,
         /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
         /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
         /// over the attention output. vLLM 04730e8 and later write the query
@@ -1083,37 +905,12 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mla_layout_copies")]
         #[param(default = true, cache_key)]
         mla_layout_copies: bool,
-        /// Backend of every fused mHC post/pre boundary
-        /// (`mhc_fused_post_pre_rms_norm`): `vllm_tilelang` or
-        /// `deepgemm_mega_nonshifted`. The first pre and the last post keep
-        /// TileLang.
-        #[serde(default = "default_glm53_flash_mhc_fused_backend")]
-        #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
-        mhc_fused_backend: String,
-        /// DSA prefill-indexer top-k (`dsa_topk_prefill` backend):
-        /// `vllm_cuda` (`top_k_per_row_prefill`, what vLLM runs), `deep_select`
-        /// (DeepSelect, which vLLM runs only for decode), or `fastest`, the
-        /// per-launch best of the two. A launch packing several requests has
-        /// nonzero row starts, which DeepSelect cannot take, so it stays on
-        /// `vllm_cuda` under every choice.
-        #[serde(default = "default_glm53_flash_indexer_topk_backend")]
-        #[param(string, default = "vllm_cuda", choices = GLM53_FLASH_INDEXER_TOPK_BACKENDS, cache_key)]
-        indexer_topk_backend: String,
         /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
         /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
         /// fits this many MiB, and runs logits and top-k once per piece.
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
-        /// KDA short-conv prefill kernel (`gdn_causal_conv_prefill` backend):
-        /// `vllm_triton`, vLLM's one varlen `causal_conv1d_fn` launch over every
-        /// token, or `dao_channellast`, Dao-AILab causal-conv1d's channel-last
-        /// kernel launched once per prefill sequence, with the iteration's
-        /// decode tokens on vLLM's `causal_conv1d_update`. No vLLM release
-        /// dispatches to the latter.
-        #[serde(default = "default_glm53_flash_causal_conv_backend")]
-        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_CAUSAL_CONV_BACKENDS, cache_key)]
-        causal_conv_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8DpAttnEpMoe`] for the NVFP4 checkpoint (see
     /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]): the routed experts sit behind
@@ -1152,13 +949,6 @@ pub enum IterArchSel {
         /// they run eager on their own rows. Empty: always eager.
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
-        /// KDA chunked-prefill kernel (`kda_chunk_prefill` backend):
-        /// `vllm_triton`, the fork's `chunk_kda_with_fused_gate`, or
-        /// `flashkda`, upstream vLLM's default on SM90 / SM10x. Decode keeps
-        /// `fused_recurrent_kda`.
-        #[serde(default = "default_glm53_flash_kda_prefill_backend")]
-        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_KDA_PREFILL_BACKENDS, cache_key)]
-        kda_prefill_backend: String,
         /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
         /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
         /// over the attention output. vLLM 04730e8 and later write the query
@@ -1166,37 +956,12 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mla_layout_copies")]
         #[param(default = true, cache_key)]
         mla_layout_copies: bool,
-        /// Backend of every fused mHC post/pre boundary
-        /// (`mhc_fused_post_pre_rms_norm`): `vllm_tilelang` or
-        /// `deepgemm_mega_nonshifted`. The first pre and the last post keep
-        /// TileLang.
-        #[serde(default = "default_glm53_flash_mhc_fused_backend")]
-        #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
-        mhc_fused_backend: String,
-        /// DSA prefill-indexer top-k (`dsa_topk_prefill` backend):
-        /// `vllm_cuda` (`top_k_per_row_prefill`, what vLLM runs), `deep_select`
-        /// (DeepSelect, which vLLM runs only for decode), or `fastest`, the
-        /// per-launch best of the two. A launch packing several requests has
-        /// nonzero row starts, which DeepSelect cannot take, so it stays on
-        /// `vllm_cuda` under every choice.
-        #[serde(default = "default_glm53_flash_indexer_topk_backend")]
-        #[param(string, default = "vllm_cuda", choices = GLM53_FLASH_INDEXER_TOPK_BACKENDS, cache_key)]
-        indexer_topk_backend: String,
         /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
         /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
         /// fits this many MiB, and runs logits and top-k once per piece.
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
-        /// KDA short-conv prefill kernel (`gdn_causal_conv_prefill` backend):
-        /// `vllm_triton`, vLLM's one varlen `causal_conv1d_fn` launch over every
-        /// token, or `dao_channellast`, Dao-AILab causal-conv1d's channel-last
-        /// kernel launched once per prefill sequence, with the iteration's
-        /// decode tokens on vLLM's `causal_conv1d_update`. No vLLM release
-        /// dispatches to the latter.
-        #[serde(default = "default_glm53_flash_causal_conv_backend")]
-        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_CAUSAL_CONV_BACKENDS, cache_key)]
-        causal_conv_backend: String,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by

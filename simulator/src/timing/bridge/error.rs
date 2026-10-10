@@ -63,6 +63,30 @@ pub enum BuildError {
         first: &'static str,
         other: &'static str,
     },
+
+    /// A position's candidate backends disagree on a property that sets the
+    /// leaves around the kernel, so no one leaf structure fits them all and
+    /// best-of-N cannot choose between them.
+    #[error(
+        "{role} ({kind}): backends {backends:?} disagree on whether {property}; \
+         list backends that agree"
+    )]
+    MixedBackendProperty {
+        kind: KernelKind,
+        role: String,
+        backends: Vec<&'static str>,
+        property: &'static str,
+    },
+
+    /// None of a position's candidate backends can run a launch shape the
+    /// position issues.
+    #[error("{role} ({kind}): none of backends {backends:?} can run {launch}")]
+    NoBackendForLaunch {
+        kind: KernelKind,
+        role: String,
+        backends: Vec<&'static str>,
+        launch: &'static str,
+    },
 }
 
 impl BuildError {

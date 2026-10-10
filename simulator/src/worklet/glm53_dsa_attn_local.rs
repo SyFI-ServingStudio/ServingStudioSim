@@ -40,6 +40,7 @@ use crate::op::attention::{
 };
 use crate::op::Op;
 use crate::timing::bridge::DType;
+use crate::timing::kernels::dsa_topk_prefill::takes_row_starts;
 use crate::timing::kernels::{
     BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, DsaMqaLogitsPrefillKernel,
     DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput, DsaPagedMqaLogitsDecodeKernel,
@@ -194,9 +195,9 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub topk_decode: Op<DsaPersistentTopkDecodeKernel>,
     pub mqa_logits_prefill: Op<DsaMqaLogitsPrefillKernel>,
     pub topk_prefill: Op<DsaTopkPrefillKernel>,
-    /// `vllm_cuda` top-k for launches that pack several requests, when
-    /// `topk_prefill` offers a backend that needs every row to start at key 0.
-    /// Its time lands in the `topk_prefill` slot.
+    /// Top-k for launches that pack several requests: `topk_prefill`'s
+    /// backends that take row starts (`dsa_topk_prefill::takes_row_starts`),
+    /// when some of them do not. Its time lands in the `topk_prefill` slot.
     topk_prefill_packed: Option<Arc<DsaTopkPrefillKernel>>,
     pub expand_pools: Op<ElementwiseKernel>,
     pub q_absorb: Op<BatchedGemmKernel>,
@@ -402,7 +403,7 @@ impl Glm53DsaAttnLocalWorklet {
         let ew = |suffix: &str, config| atomic(n, suffix, config, ElementwiseKernel::build, bridge);
         let gemm =
             |suffix: &str, config| atomic(n, suffix, config, SingleGemmKernel::build, bridge);
-        Ok(Self {
+        let mut worklet = Self {
             fused_qkv_a: gemm("fused_qkv_a", r.fused_qkv_a)?,
             q_kv_norm: atomic(
                 n,
@@ -450,23 +451,7 @@ impl Glm53DsaAttnLocalWorklet {
                 DsaMqaLogitsPrefillKernel::build,
                 bridge,
             )?,
-            topk_prefill_packed: if r
-                .topk_prefill
-                .backends
-                .iter()
-                .any(|backend| ROW_START_ZERO_TOPK_BACKENDS.contains(backend))
-            {
-                Some(Arc::new(DsaTopkPrefillKernel::build(
-                    format!("{n}.indexer.topk_prefill.packed"),
-                    DsaTopkPrefillKernelConfig {
-                        backends: vec![PACKED_TOPK_BACKEND],
-                        ..r.topk_prefill.clone()
-                    },
-                    bridge,
-                )?))
-            } else {
-                None
-            },
+            topk_prefill_packed: None,
             topk_prefill: atomic(
                 n,
                 "indexer.topk_prefill",
@@ -490,7 +475,34 @@ impl Glm53DsaAttnLocalWorklet {
             prefill_glue: ew("prefill_glue", r.prefill_glue)?,
             name,
             resolved,
-        })
+        };
+        // The backends as built, after any run-config override.
+        let topk = &worklet.topk_prefill;
+        let backends = topk.kernel.config.backends.clone();
+        let packed: Vec<&'static str> = backends
+            .iter()
+            .copied()
+            .filter(|&backend| takes_row_starts(backend))
+            .collect();
+        if packed.is_empty() {
+            return Err(BuildError::NoBackendForLaunch {
+                kind: "dsa_topk_prefill",
+                role: topk.name.clone(),
+                backends,
+                launch: "a launch packing several requests (row starts)",
+            });
+        }
+        if packed.len() < backends.len() {
+            worklet.topk_prefill_packed = Some(Arc::new(DsaTopkPrefillKernel::build(
+                format!("{}.packed", topk.name),
+                DsaTopkPrefillKernelConfig {
+                    backends: packed,
+                    ..topk.kernel.config.clone()
+                },
+                bridge,
+            )?));
+        }
+        Ok(worklet)
     }
 
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
@@ -679,13 +691,14 @@ impl Glm53DsaAttnLocalWorklet {
                 (Some(packed), false) => {
                     let mut metrics = packed.eval(&input);
                     // Report the pick against the slot's own backend list.
+                    let picked = packed.config.backends[usize::from(metrics.backend_index)];
                     metrics.backend_index = self
                         .topk_prefill
                         .kernel
                         .config
                         .backends
                         .iter()
-                        .position(|&backend| backend == PACKED_TOPK_BACKEND)
+                        .position(|&backend| backend == picked)
                         .map_or(LeafMetrics::NO_BACKEND, |index| index as u8);
                     metrics
                 }
@@ -719,11 +732,6 @@ struct Work {
 /// vLLM `get_max_prefill_buffer_size`: the gathered index-K workspace holds
 /// `40 * max_model_len` keys, and a request pack never exceeds it.
 const PREFILL_KEY_WORKSPACE_PER_MODEL_LEN: u64 = 40;
-/// Top-k backends that take no row start (DeepSelect's `begin` is
-/// unsupported), so every row of a launch must start at key 0.
-const ROW_START_ZERO_TOPK_BACKENDS: &[&str] = &["deep_select"];
-/// The top-k vLLM runs on every prefill chunk, packed ones included.
-const PACKED_TOPK_BACKEND: &str = "vllm_cuda";
 
 /// What bounds the prefill indexer's launches.
 struct IndexerBudget {
@@ -887,6 +895,8 @@ fn integer_sqrt(value: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     pub(crate) fn cfg() -> Glm53DsaAttnLocalWorkletConfig {
@@ -1115,29 +1125,37 @@ mod tests {
     }
 
     #[test]
-    fn a_row_start_zero_top_k_gets_a_vllm_fallback_for_packed_launches() {
-        // DeepSelect takes no row starts, so a pack of several requests must
-        // still price its top-k on vllm_cuda, inside the same slot.
-        let build = |backends: Vec<&'static str>| {
+    fn packed_launches_run_on_the_backends_that_take_row_starts() {
+        // DeepSelect takes no row starts, so a pack of several requests prices
+        // its top-k on the other candidates, inside the same slot. The
+        // candidates are the backends as built, after any override.
+        let build = |overrides: Option<Vec<&str>>| {
             let bridge = PerfApiBridge::new_uninit_for_test();
             bridge.enable_enumerate();
-            let mut config = cfg();
-            config.topk_prefill_backends = backends;
+            let map: HashMap<String, Vec<String>> = overrides
+                .into_iter()
+                .map(|backends| {
+                    let backends = backends.iter().map(|b| b.to_string()).collect();
+                    ("m.dsa.indexer.topk_prefill".to_string(), backends)
+                })
+                .collect();
+            let _scope = bridge.with_backend_overrides("main", Some(&map));
             Glm53DsaAttnLocalWorklet::build(
                 "m.dsa".into(),
-                Glm53DsaAttnLocalWorklet::resolve_config(&config),
+                Glm53DsaAttnLocalWorklet::resolve_config(&cfg()),
                 &bridge,
             )
-            .unwrap()
         };
-        assert!(build(vec!["vllm_cuda"]).topk_prefill_packed.is_none());
-        for backends in [vec!["deep_select"], vec!["deep_select", "vllm_cuda"]] {
-            let worklet = build(backends);
-            let packed = worklet.topk_prefill_packed.as_ref().unwrap();
-            assert_eq!(packed.config.backends, vec!["vllm_cuda"]);
-            let mut builder = CostTreeBuilder::new();
-            let root = worklet.compile(&mut builder);
-            assert_eq!(builder.finish(root).slots.len(), 24 + 4 + 3);
-        }
+        assert!(build(None).unwrap().topk_prefill_packed.is_none());
+        let worklet = build(Some(vec!["deep_select", "vllm_cuda"])).unwrap();
+        let packed = worklet.topk_prefill_packed.as_ref().unwrap();
+        assert_eq!(packed.config.backends, vec!["vllm_cuda"]);
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        assert_eq!(builder.finish(root).slots.len(), 24 + 4 + 3);
+        assert!(matches!(
+            build(Some(vec!["deep_select"])),
+            Err(BuildError::NoBackendForLaunch { .. })
+        ));
     }
 }

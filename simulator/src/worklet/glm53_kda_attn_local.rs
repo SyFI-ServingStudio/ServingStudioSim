@@ -32,6 +32,8 @@
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
+use crate::timing::kernels::gdn_causal_conv_prefill::launches_per_sequence;
+use crate::timing::kernels::kda_chunk_prefill::takes_beta_logits;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelInput, GdnCausalConvDecodeKernel,
     GdnCausalConvDecodeKernelConfig, GdnCausalConvDecodeKernelInput, GdnCausalConvPrefillKernel,
@@ -45,7 +47,7 @@ use crate::timing::{
     PerfApiBridge,
 };
 
-use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
+use super::glm53_common::{atomic, backends_agree, elementwise, push_or_zero, repeated};
 
 const STATE_TRANSFER_UNIT_BYTES: u32 = 4096;
 /// Beta sigmoid ahead of a prefill core that takes beta already passed
@@ -67,19 +69,12 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     pub bf16_gemm_backends: Vec<&'static str>,
     /// Short-conv prefill backends (`gdn_causal_conv_prefill`).
     pub conv_prefill_backends: Vec<&'static str>,
-    /// The prefill backend launches once per sequence
-    /// (`gdn_causal_conv_prefill::launches_per_sequence`) rather than once over
-    /// every token of the iteration.
-    pub conv_prefill_per_sequence: bool,
     /// Short-conv decode backends (`gdn_causal_conv_decode`).
     pub conv_decode_backends: Vec<&'static str>,
     /// Recurrent-decode backends.
     pub core_backends: Vec<&'static str>,
     /// Chunked-prefill backends: the serving engine's KDA prefill kernel.
     pub chunk_prefill_backends: Vec<&'static str>,
-    /// The chunked-prefill core applies the beta sigmoid itself (FlashKDA),
-    /// so no separate sigmoid launch runs ahead of it.
-    pub chunk_prefill_takes_beta_logits: bool,
     pub elementwise_backends: Vec<&'static str>,
 }
 
@@ -126,6 +121,13 @@ pub struct Glm53KdaAttnLocalWorklet {
     pub state_scatter: Op<ElementwiseKernel>,
     pub gated_norm: Op<ElementwiseKernel>,
     pub o_proj: Op<SingleGemmKernel>,
+    /// The short-conv prefill backends launch once per sequence
+    /// (`gdn_causal_conv_prefill::launches_per_sequence`) rather than once over
+    /// every token of the iteration.
+    conv_per_sequence: bool,
+    /// The beta sigmoid's launches: none when the chunked-prefill backends
+    /// apply it inside their call (`kda_chunk_prefill::takes_beta_logits`).
+    beta_sigmoid_launches: u32,
     resolved: Glm53KdaAttnLocalWorkletResolved,
 }
 
@@ -213,7 +215,7 @@ impl Glm53KdaAttnLocalWorklet {
     ) -> Result<Self, BuildError> {
         let r = resolved.clone();
         let n = name.as_str();
-        Ok(Self {
+        let mut worklet = Self {
             in_proj: atomic(n, "in_proj", r.in_proj, SingleGemmKernel::build, bridge)?,
             f_b: atomic(n, "f_b_proj", r.f_b, SingleGemmKernel::build, bridge)?,
             g_b: atomic(n, "g_b_proj", r.g_b, SingleGemmKernel::build, bridge)?,
@@ -274,9 +276,24 @@ impl Glm53KdaAttnLocalWorklet {
                 bridge,
             )?,
             o_proj: atomic(n, "o_proj", r.o_proj, SingleGemmKernel::build, bridge)?,
+            conv_per_sequence: false,
+            beta_sigmoid_launches: 0,
             name,
             resolved,
-        })
+        };
+        // The backends as built, after any run-config override, set the leaves
+        // around the two cores.
+        worklet.conv_per_sequence = backends_agree(
+            &worklet.conv_prefill,
+            "they launch once per sequence",
+            launches_per_sequence,
+        )?;
+        worklet.beta_sigmoid_launches = u32::from(!backends_agree(
+            &worklet.chunk_prefill,
+            "they take beta logits",
+            takes_beta_logits,
+        )?);
+        Ok(worklet)
     }
 
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
@@ -294,7 +311,7 @@ impl Glm53KdaAttnLocalWorklet {
                 self.conv_decode.compile(builder),
                 repeated(
                     &self.prefill_small_glue,
-                    prefill_small_glue_launches(cfg),
+                    self.beta_sigmoid_launches,
                     builder,
                 ),
                 self.state_gather.compile(builder),
@@ -315,7 +332,7 @@ impl Glm53KdaAttnLocalWorklet {
             num_tokens: w.total_tokens,
         };
         let decode_only = !w.prefill_bearing;
-        let per_sequence = self.resolved.raw_cfg.conv_prefill_per_sequence;
+        let per_sequence = self.conv_per_sequence;
         push_or_zero(&self.in_proj, rows.clone(), false, ev);
         push_or_zero(&self.f_b, rows.clone(), false, ev);
         push_or_zero(&self.g_b, rows.clone(), false, ev);
@@ -444,13 +461,10 @@ fn derive_work(input: &Glm53KdaAttnLocalWorkletInput, state_bytes: u32) -> Resul
     })
 }
 
-/// One beta sigmoid launch, or none when the prefill core applies it.
-fn prefill_small_glue_launches(cfg: &Glm53KdaAttnLocalWorkletConfig) -> u32 {
-    u32::from(!cfg.chunk_prefill_takes_beta_logits)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     pub(crate) fn cfg() -> Glm53KdaAttnLocalWorkletConfig {
@@ -464,21 +478,62 @@ mod tests {
             gpu_name: "NVIDIA B200".into(),
             bf16_gemm_backends: vec!["torch_linear_vllm"],
             conv_prefill_backends: vec!["vllm_triton"],
-            conv_prefill_per_sequence: false,
             conv_decode_backends: vec!["vllm_triton"],
             core_backends: vec!["vllm_triton"],
             chunk_prefill_backends: vec!["vllm_triton"],
-            chunk_prefill_takes_beta_logits: false,
             elementwise_backends: vec!["triton"],
         }
     }
 
     #[test]
-    fn a_core_taking_beta_logits_drops_the_sigmoid_launch() {
-        let mut flashkda = cfg();
-        flashkda.chunk_prefill_takes_beta_logits = true;
-        assert_eq!(prefill_small_glue_launches(&cfg()), 1);
-        assert_eq!(prefill_small_glue_launches(&flashkda), 0);
+    fn the_built_backends_set_the_sigmoid_and_conv_launches() {
+        // An override replaces the arch's backends inside Kernel::build; the
+        // leaves around the cores must follow the backends as built.
+        let build = |overrides: &[(&str, &str)]| {
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let map: HashMap<String, Vec<String>> = overrides
+                .iter()
+                .map(|(role, backend)| (role.to_string(), vec![backend.to_string()]))
+                .collect();
+            let _scope = bridge.with_backend_overrides("main", Some(&map));
+            Glm53KdaAttnLocalWorklet::build(
+                "m.kda".into(),
+                Glm53KdaAttnLocalWorklet::resolve_config(&cfg()),
+                &bridge,
+            )
+        };
+        let fla = build(&[]).unwrap();
+        assert_eq!(
+            (fla.beta_sigmoid_launches, fla.conv_per_sequence),
+            (1, false)
+        );
+        let fast = build(&[
+            ("m.kda.chunk_prefill", "flashinfer_cute_persistent"),
+            ("m.kda.short_conv_prefill", "dao_channellast"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (fast.beta_sigmoid_launches, fast.conv_per_sequence),
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn backends_with_different_beta_inputs_are_rejected() {
+        let mut mixed = cfg();
+        mixed.chunk_prefill_backends = vec!["vllm_triton", "flashkda"];
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let built = Glm53KdaAttnLocalWorklet::build(
+            "m.kda".into(),
+            Glm53KdaAttnLocalWorklet::resolve_config(&mixed),
+            &bridge,
+        );
+        assert!(matches!(
+            built,
+            Err(BuildError::MixedBackendProperty { .. })
+        ));
     }
 
     #[test]
