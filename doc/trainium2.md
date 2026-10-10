@@ -145,6 +145,13 @@ duty-calibrated one (x1.0637) are within all 13 campaign bounds. Use
 Trace export peaks near 47 GB per rank. Export ranks one at a time, and run
 trace analysis under a memory cap.
 
+### Scope limits
+
+Below the collective-delimited blocks, QKV, attention and O-projection share one
+synchronization interval. Standalone probes of those operations covered about
+69% of the forward and were not additive, so no finer stock rows are
+registered. Only C512 with decode buckets [1,16] is validated.
+
 ## Earlier NxDI TP1 path and experiment history
 
 The sections below preserve the separate NxDI implementation and its numerical
