@@ -54,3 +54,49 @@ def estimate_region_work(
     if region == "model":
         return {name: whole[name] - head[name] for name in whole}
     raise ValueError("region must be model or head")
+
+
+NORM_BYTES_PER_RANK = 2 * 4096  # One replicated BF16 RMSNorm weight.
+
+
+def estimate_segment_work(
+    segment: str, phase: str, token_bucket: int, max_model_len: int
+) -> dict[str, int]:
+    """Split ``estimate_work`` by the semantic owner of each collective segment.
+
+    ``embedding``: gathered BF16 embedding rows, no contraction. ``attention_block``
+    and ``mlp_block`` are ONE layer: its input or post-attention RMSNorm weight,
+    QKV/O (with 1/32 of the attention contractions and KV-cache bytes) or the gated
+    MLP. ``head``: final norm plus the lm_head contraction and shard. Then
+    embedding + 32 x (attention + MLP) + head equals the whole-forward estimate.
+    Same caveats: estimates, not counters.
+    """
+    tokens = token_bucket
+    whole = estimate_work(phase, token_bucket, max_model_len)
+    head = estimate_region_work("head", phase, token_bucket, max_model_len)
+    cache_bytes = whole["persistent_operand_bytes_per_rank"] - 3752861696 - 2 * tokens * 4096
+    attention = whole["attention_flops_per_rank"] // 32
+    rows = {
+        "embedding": (0, 0, 2 * tokens * 4096),
+        "attention_block": (
+            2 * tokens * (4096 * 1536 + 1024 * 4096) + attention,
+            attention,
+            2 * (4096 * 1536 + 1024 * 4096) + NORM_BYTES_PER_RANK + cache_bytes // 32,
+        ),
+        "mlp_block": (
+            2 * tokens * 3 * 4096 * 3584, 0, 2 * 3 * 4096 * 3584 + NORM_BYTES_PER_RANK
+        ),
+        "head": (
+            head["contraction_flops_per_rank"],
+            0,
+            head["persistent_operand_bytes_per_rank"] + NORM_BYTES_PER_RANK,
+        ),
+    }
+    if segment not in rows:
+        raise ValueError("segment must be embedding, attention_block, mlp_block or head")
+    flops, attention_flops, persistent = rows[segment]
+    return {
+        "contraction_flops_per_rank": flops,
+        "attention_flops_per_rank": attention_flops,
+        "persistent_operand_bytes_per_rank": persistent,
+    }

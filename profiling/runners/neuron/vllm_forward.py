@@ -75,12 +75,18 @@ def verify_identity(model):
     return {"versions": observed, "model_sha256": hashes}
 
 
-def run_stage(root, stage, engine="profiling.runners.neuron.vllm_forward_engine"):
-    """Run one isolated stage; ``engine`` selects the serving-process entry module."""
+def run_stage(root, stage, engine="profiling.runners.neuron.vllm_forward_engine", env=None):
+    """Run one isolated stage; ``engine`` selects the serving-process entry module.
+
+    ``env`` adds stage-only variables (for example device-profiler buffer sizes).
+    """
     module = "profiling.runners.neuron.vllm_forward_reference" if stage == "reference" else engine
     with (root / f"{stage}.log").open("w") as log:
         result = subprocess.run(
-            [sys.executable, "-m", module, str(root), stage], stdout=log, stderr=subprocess.STDOUT
+            [sys.executable, "-m", module, str(root), stage],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, **env} if env else None,
         )
     if result.returncode:
         raise RuntimeError(f"{stage} failed ({result.returncode}); see {root / (stage + '.log')}")

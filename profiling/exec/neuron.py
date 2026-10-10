@@ -266,7 +266,7 @@ def _neuron_container_worker_command(
     policy.update(worker_env or {})
     policy = {name: value for name, value in policy.items() if name not in _CONTAINER_ABI_ENV}
     if (
-        kernel_kind in ("neuron_llama_forward", "neuron_llama_region")
+        kernel_kind in ("neuron_llama_forward", "neuron_llama_region", "neuron_llama_segment")
         and not policy.get("SERVINGSTUDIO_VLLM_NEURON_MODEL_DIR")
         and any(not policy.get(name) for name in _NXDI_DATA_ENV)
     ):
