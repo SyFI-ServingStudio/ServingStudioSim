@@ -89,6 +89,51 @@ local) gives:
   native kernel analysis): 13/13 pass. Server TTFT and iteration cycle are close
   to their bounds.
 
+### Collective-delimited layer segments (experimental, rows pending)
+
+Adding compiled region cuts costs device time at decode1: about 0.17 ms for
+the model/head split, and +0.53 ms for a three-region trial. Per-layer cuts
+would therefore fail the 5% gate. `composition: layer_segments` instead keeps
+the unchanged stock executable and cuts its native instruction-trace timeline
+at the reduction collectives that close each sublayer:
+
+- the first reduction ends the embedding;
+- each layer has an attention block and an MLP block, each ending at one of
+  the layer's two reductions;
+- everything after the last reduction is the head.
+
+Decode uses AllReduce; prefill uses ReduceScatter with AllGather between. The
+segments sum exactly to the forward with no added launches. Block rows are
+per-layer means, and the L4 folds them as 32 x (attention + MLP).
+
+`neuron_llama_segment/vllm_neuron_collective_segments` gates rows on:
+
+- traced NEFFs byte-identical to the stock forward, plus the unchanged vendor
+  logit check;
+- complete two-core traces, allowing at most 10 us of trailing control
+  instructions past the execution end;
+- interior layers 1-30 within 10% of the layer mean, measured as per-layer
+  medians;
+- the composed forward within 5% of the untraced whole forward.
+
+Systematic first- and last-layer offsets come from where the compiler places
+partition boundaries; they are recorded rather than gated. Examples are
+decode1 layer-0 attention (+36%) and prefill layer-31 MLP (-10.5%).
+
+Offline replay of a 4-rank, 39-forward capture passes every gate:
+
+- worst interior layer 1.8% from the mean;
+- composed versus whole forward +1.78% (decode1), +0.18% (decode16) and
+  +0.76% (prefill512).
+
+Per layer, decode16 is about 1.47 ms of attention and 0.22 ms of MLP; prefill512
+is about 0.29 ms of attention and 0.88 ms of MLP. Rows have not yet been
+written through the CLI. Use `SERVINGSTUDIO_NEURON_SEGMENT_RESUME` to finish
+that run from its completed device stages.
+
+Trace export peaks near 47 GB per rank. Export ranks one at a time, and run
+trace analysis under a memory cap.
+
 ## Earlier NxDI TP1 path and experiment history
 
 The sections below preserve the separate NxDI implementation and its numerical
