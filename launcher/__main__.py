@@ -713,8 +713,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # Backend-map gate (compiler front-end): for every candidate carrying a
-    # `backends` block, enumerate its kernels + check the map — unknown role,
-    # strict coverage, or a backend incompatible with the role's dtype. No-op when
+    # `backends` block, enumerate its kernels + check the map — unknown role or
+    # a backend incompatible with the role's dtype. No-op when
     # no candidate has backends. Grouped by structure, so a backend-only sweep
     # enumerates once.
     from .backends import BackendEnumError, validate_backends_for_candidates

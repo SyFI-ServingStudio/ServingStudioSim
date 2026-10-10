@@ -155,8 +155,9 @@ at eval. The default set is the arch's const-default. To tailor it per kernel:
    role names (e.g. `attn/afd.attn.prefill`), stable across a tp/ep sweep.
 
 The launcher re-enumerates + validates every concrete run: an unknown/stale role
-key, a backend the kernel can't run at its dtype/GPU, or a role left unassigned
-(strict coverage) is a hard error. If a sweep yields runs with DIFFERENT kernel
+key or a backend the kernel can't run at its dtype/GPU is a hard error. A role the
+map leaves out keeps its arch default, so a map may name only the kernels it
+changes. If a sweep yields runs with DIFFERENT kernel
 role sets (e.g. `tp=1` has no `tp_allreduce`), `--emit-backends` hard-rejects —
 split those into separate presets/files. Shape-only differences across the sweep
 are fine (the skeleton marks the moved shape `(varies)`; one map still spans it).

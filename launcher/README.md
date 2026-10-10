@@ -360,8 +360,9 @@ shape-invariant, so one file spans a tp/ep sweep; the override is injected in Ru
 at each `Kernel::build` by role name, before caches fit.
 
 Validation (below) re-enumerates per concrete run and rejects an unknown/stale
-role key, a backend the kernel can't run at its dtype/GPU, or a role left
-unassigned (strict coverage). If a sweep yields runs with DIFFERENT role sets
+role key or a backend the kernel can't run at its dtype/GPU. A role the map
+leaves out keeps the arch's const-default, so a map may name only the kernels it
+changes. If a sweep yields runs with DIFFERENT role sets
 (e.g. `tp=1` drops `tp_allreduce`), `--emit-backends` hard-rejects — split those
 into separate presets. Shape-only differences are fine (marked `(varies)`).
 
