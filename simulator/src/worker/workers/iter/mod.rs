@@ -18,8 +18,10 @@ pub(crate) use build_hp_worker::build_hp_worker;
 pub(crate) use build_hybrid_chunked_prefill_worker::build_hybrid_chunked_prefill_worker;
 pub(crate) use build_pd_prefill_worker::build_pd_prefill_worker;
 pub(crate) use build_qwen36_hybrid_worker::build_qwen36_hybrid_worker;
-pub(crate) use build_speculative_worker::build_speculative_worker;
+pub(crate) use build_speculative_worker::{
+    build_hybrid_speculative_worker, build_speculative_worker,
+};
 pub use iter_batch_worker::{
     BareboneWorker, ChunkedPrefillWorker, HpUnifiedWorker, HybridChunkedPrefillWorker,
-    PdPrefillWorker, Qwen36HybridWorker, SpeculativeWorker,
+    HybridSpeculativeWorker, PdPrefillWorker, Qwen36HybridWorker, SpeculativeWorker,
 };

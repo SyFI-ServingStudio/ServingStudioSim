@@ -16,12 +16,13 @@ use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{
     ChunkedPrefillAdmission, LoadBalance, PendingOrder, SpeculativeDecodeCompletion,
 };
+use crate::worker::config::DpPlacement;
 use crate::worker::execution::SpeculativeIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::FullAttnKv;
+use crate::worker::kv::{FullAttnKv, HybridGdnKv};
 use crate::worker::types::WorkerConfig;
 
-use super::iter_batch_worker::{IterBatchWorker, SpeculativeWorker};
+use super::iter_batch_worker::{HybridSpeculativeWorker, IterBatchWorker, SpeculativeWorker};
 use crate::worker::workers::iter_build_essentials::{
     full_attention_token_capacity, prepare_iter_build_essentials,
 };
@@ -92,6 +93,118 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         LoadBalance::Single
     } else {
         LoadBalance::RoundRobin { next: 0 }
+    };
+    let admission = ChunkedPrefillAdmission::with_decode_completion(
+        (0..num_partitions)
+            .map(|_| (PendingOrder::new(config.pending_order), ()))
+            .collect(),
+        max_batch_tokens,
+        config.batch_policy,
+        config.kv_admission,
+        balance,
+        SpeculativeDecodeCompletion::new(
+            draft_tokens,
+            config.speculative_acceptance_seed.unwrap_or(0),
+        ),
+        drafting_slots,
+    );
+
+    IterBatchWorker::from_components(
+        essentials.context,
+        kv_store,
+        admission,
+        SpeculativeIterExecution::new(model, essentials.cost, draft_tokens),
+    )
+}
+
+/// `build_speculative_worker` with a `HybridGdnKv` store: each request's
+/// recurrent state (target linear-attention layers plus any per-request draft
+/// state) shares one capacity with the per-token attention KV, as in
+/// `build_hybrid_chunked_prefill_worker`. Prefill chunks are not checkpoint
+/// aligned here; the verify step is what this worker models.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
+    id: WorkerId,
+    pool_tag: &'static str,
+    model: Arc<M>,
+    requests: SharedRequests,
+    config: WorkerConfig,
+    cost_log_dir: Option<PathBuf>,
+    pool: PoolId,
+    gpu_name: &str,
+    cluster: SharedGpuCluster,
+) -> HybridSpeculativeWorker<M> {
+    let max_batch_tokens = config
+        .max_batch_tokens
+        .expect("speculative worker requires max_batch_tokens");
+    let draft_tokens = config.speculative_draft_tokens;
+    assert!(
+        draft_tokens > 0,
+        "speculative worker requires speculative_draft_tokens > 0; \
+         zero drafts is the chunked-prefill worker"
+    );
+    let drafting_slots = model.drafting_slots_per_request();
+    assert!(
+        draft_tokens
+            .checked_add(1)
+            .and_then(|width| width.checked_add(drafting_slots))
+            .is_some_and(|width| width <= max_batch_tokens),
+        "speculative verify width must fit max_batch_tokens"
+    );
+    let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
+    let num_partitions = model.num_attn_dp_groups().max(1) as usize;
+    let kv_capacity = full_attention_token_capacity(
+        model.num_attn_shards(),
+        model.total_kv_bytes_per_token(),
+        &config,
+    );
+    let state_tokens_per_request = model
+        .recurrent_state_bytes_per_request()
+        .div_ceil(model.total_kv_bytes_per_token().max(1));
+    let checkpoint_interval_tokens = config
+        .ssm_checkpoint_interval_tokens
+        .unwrap_or_else(|| model.recurrent_checkpoint_interval_tokens());
+    tracing::info!(
+        worker = id.0,
+        pool_tag,
+        state_tokens_per_request,
+        checkpoint_interval_tokens,
+        max_batch_tokens,
+        kv_capacity_tokens = kv_capacity,
+        "hybrid speculative: recurrent state shares the attention capacity"
+    );
+    let prefix_cache = config.prefix_cache.resolve_tokens(
+        kv_capacity,
+        model.total_kv_bytes_per_token(),
+        model.num_attn_shards(),
+    );
+    let essentials = prepare_iter_build_essentials(
+        id,
+        pool_tag,
+        requests,
+        &config,
+        cost_log_dir,
+        pool,
+        gpu_name,
+        &cluster,
+        model.gpus_per_replica(),
+        model.cost_log_manifest(),
+        kv_capacity,
+        num_partitions,
+    );
+    let kv_store = HybridGdnKv::new(
+        num_partitions,
+        essentials.kv_capacity,
+        state_tokens_per_request,
+        checkpoint_interval_tokens,
+        prefix_cache,
+        essentials.sampler,
+        prefix_cache_logger,
+    );
+    let balance = match (num_partitions, config.dp_placement) {
+        (1, _) => LoadBalance::Single,
+        (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },
+        (_, DpPlacement::VllmLeastLoaded) => LoadBalance::LeastLoaded { next: 0 },
     };
     let admission = ChunkedPrefillAdmission::with_decode_completion(
         (0..num_partitions)
@@ -223,6 +336,94 @@ mod tests {
             }
         }
         panic!("the request never completed");
+    }
+
+    #[test]
+    fn the_hybrid_recipe_charges_recurrent_state_against_capacity() {
+        // The defect this catches: building a hybrid speculative arch on the
+        // full-attention store, which would leave each request's recurrent
+        // state out of capacity and admit several times too many decodes.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const CAPACITY: u64 = 1000;
+        struct StatefulModel {
+            state_bytes: u64,
+            most_decodes: AtomicU32,
+        }
+        impl SpeculativeUnifiedModel for StatefulModel {
+            fn eval_speculative_iter(
+                &self,
+                batch: &SpeculativeArchInput,
+                slots: &mut Vec<LeafMetrics>,
+                scratch: &mut Vec<LeafMetrics>,
+            ) -> LeafMetrics {
+                for group in &batch.groups {
+                    self.most_decodes
+                        .fetch_max(group.decode_requests.len() as u32, Ordering::Relaxed);
+                }
+                FakeSpeculativeModel.eval_speculative_iter(batch, slots, scratch)
+            }
+            fn total_kv_bytes_per_token(&self) -> u64 {
+                1024
+            }
+            fn recurrent_state_bytes_per_request(&self) -> u64 {
+                self.state_bytes
+            }
+            fn max_model_len(&self) -> u32 {
+                8192
+            }
+            fn gpus_per_replica(&self) -> u16 {
+                1
+            }
+        }
+        let most_decodes = |state_bytes: u64| {
+            let rows: Vec<_> = (0..16)
+                .map(|id| (id, PROMPT_TOKENS, OUTPUT_TOKENS))
+                .collect();
+            let requests = shared_with(&rows);
+            for id in 0..16 {
+                requests.borrow_mut()[RequestId(id)]
+                    .request
+                    .definition
+                    .decoding = DecodingStrategy::Speculative {
+                    accept_rate: AcceptanceProfile::Uniform(0.0),
+                };
+            }
+            let model = Arc::new(StatefulModel {
+                state_bytes,
+                most_decodes: AtomicU32::new(0),
+            });
+            let mut config = config(KvAdmissionConfig::FullFootprint);
+            config.attn_kv_bytes = CAPACITY * 1024;
+            let mut worker = build_hybrid_speculative_worker(
+                WorkerId(0),
+                "test",
+                model.clone(),
+                requests.clone(),
+                config,
+                None,
+                PoolId(0),
+                "test-gpu",
+                test_cluster(),
+            );
+            for id in 0..16 {
+                worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+            }
+            for tick in 0..400 {
+                worker.tick(Time::from_ms(tick as f64), &mut Vec::new());
+            }
+            for id in 0..16 {
+                assert!(requests.borrow()[RequestId(id)].lifecycle.completed);
+            }
+            model.most_decodes.load(Ordering::Relaxed)
+        };
+        let stateless = most_decodes(0);
+        let stateful = most_decodes(200 * 1024);
+        assert_eq!(stateless, 16);
+        assert!(
+            stateful * 3 < stateless,
+            "200 state tokens per request must cap 1000-token capacity at a few \
+             decodes, got {stateful} against {stateless}"
+        );
     }
 
     #[test]
