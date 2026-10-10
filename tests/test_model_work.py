@@ -1917,12 +1917,16 @@ def test_every_public_arch_on_an_fp4_checkpoint_is_labeled_fp4():
         if "arch" not in preset or "checkpoint" not in preset:
             continue
         config = root / "model" / "config" / f"{catalog[preset['checkpoint']]['config']}.json"
+        raw = json.loads(config.read_text())
         # Only the compute dtype matters here, so per-layer ModelOpt exclusions
         # (GLM-5.3-Flash NVFP4) need no layer resolution.
-        quant = parse_quantization_config(
-            json.loads(config.read_text()), layer_qualified_exclusions=True
-        )
-        fp4 = quant is not None and quant.compute_dtype == "fp4"
+        quant = parse_quantization_config(raw, layer_qualified_exclusions=True)
+        # Inkling keeps ModelOpt's hf_quant_config.json verbatim instead of a
+        # quantization_config; model/work/models/inkling.py reads it from there.
+        hf_quant = (raw.get("hf_quant_config") or {}).get("quantization") or {}
+        fp4 = (quant is not None and quant.compute_dtype == "fp4") or hf_quant.get(
+            "quant_algo"
+        ) == "NVFP4"
         assert (preset["arch"]["type"] in work_floors._FP4_ARCHS) == fp4, path.name
 
 
