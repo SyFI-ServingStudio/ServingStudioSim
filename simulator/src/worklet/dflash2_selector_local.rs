@@ -42,12 +42,7 @@ use crate::timing::{
     SlotInput,
 };
 
-const HIDDEN_DIM: u32 = 6144;
-const VOCAB_SIZE: u32 = 154880;
-/// `dflash_config.selector_rank`.
-const SELECTOR_RANK: u32 = 256;
-/// `dflash_config.selector_top_k`.
-const SELECTOR_TOP_K: u32 = 16;
+use super::dflash2_checkpoint::validate_against_checkpoints;
 
 #[derive(Clone, Debug)]
 pub struct Dflash2SelectorLocalWorkletConfig {
@@ -278,16 +273,14 @@ impl Dflash2SelectorLocalWorklet {
 }
 
 fn validate_config(cfg: &Dflash2SelectorLocalWorkletConfig) -> Result<(), String> {
-    for (name, actual, required) in [
-        ("hidden_dim", cfg.hidden_dim.get(), HIDDEN_DIM),
-        ("vocab_size", cfg.vocab_size.get(), VOCAB_SIZE),
-        ("selector_rank", cfg.selector_rank, SELECTOR_RANK),
-        ("selector_top_k", cfg.selector_top_k, SELECTOR_TOP_K),
-    ] {
-        if actual != required {
-            return Err(format!("{name} must be {required}, got {actual}"));
-        }
-    }
+    validate_against_checkpoints(|c| {
+        vec![
+            ("hidden_dim", cfg.hidden_dim.get(), c.hidden_dim),
+            ("vocab_size", cfg.vocab_size.get(), c.vocab_size),
+            ("selector_rank", cfg.selector_rank, c.selector_rank),
+            ("selector_top_k", cfg.selector_top_k, c.selector_top_k),
+        ]
+    })?;
     if cfg.tp_size == 0 || cfg.vocab_size.get() % u32::from(cfg.tp_size) != 0 {
         return Err(format!(
             "vocab_size {} must be divisible by positive tp_size {}",
@@ -350,6 +343,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worklet::dflash2_checkpoint::GLM53_DFLASH2 as CKPT;
+
+    const HIDDEN_DIM: u32 = CKPT.hidden_dim;
+    const VOCAB_SIZE: u32 = CKPT.vocab_size;
+    const SELECTOR_RANK: u32 = CKPT.selector_rank;
+    const SELECTOR_TOP_K: u32 = CKPT.selector_top_k;
 
     fn cfg() -> Dflash2SelectorLocalWorkletConfig {
         Dflash2SelectorLocalWorkletConfig {

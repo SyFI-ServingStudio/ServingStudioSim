@@ -36,13 +36,7 @@ use crate::timing::{
     SlotInput,
 };
 
-const HIDDEN_DIM: u32 = 6144;
-const HEAD_DIM: u32 = 128;
-const NUM_KV_HEADS: u32 = 8;
-const NUM_DRAFT_LAYERS: u32 = 6;
-/// Target layers whose hidden states the draft consumes — `dflash_config.target_layer_ids`
-/// is `[5, 19, 33, 47, 61, 75]`, so `fc` reads six concatenated hidden vectors.
-const NUM_AUX_LAYERS: u32 = 6;
+use super::dflash2_checkpoint::validate_against_checkpoints;
 
 /// Raw DFlash2 context-KV identity for one rank-local compute section.
 #[derive(Clone, Debug)]
@@ -365,17 +359,17 @@ impl Dflash2ContextKvLocalWorklet {
 }
 
 fn validate_config(cfg: &Dflash2ContextKvLocalWorkletConfig) -> Result<(), String> {
-    for (name, actual, required) in [
-        ("hidden_dim", cfg.hidden_dim.get(), HIDDEN_DIM),
-        ("head_dim", cfg.head_dim.get(), HEAD_DIM),
-        ("num_kv_heads", cfg.num_kv_heads.get(), NUM_KV_HEADS),
-        ("num_draft_layers", cfg.num_draft_layers, NUM_DRAFT_LAYERS),
-        ("num_aux_layers", cfg.num_aux_layers, NUM_AUX_LAYERS),
-    ] {
-        if actual != required {
-            return Err(format!("{name} must be {required}, got {actual}"));
-        }
-    }
+    // `num_aux_layers` is the length of `dflash_config.target_layer_ids`: `fc`
+    // reads that many concatenated target hidden vectors.
+    validate_against_checkpoints(|c| {
+        vec![
+            ("hidden_dim", cfg.hidden_dim.get(), c.hidden_dim),
+            ("head_dim", cfg.head_dim.get(), c.head_dim),
+            ("num_kv_heads", cfg.num_kv_heads.get(), c.num_kv_heads),
+            ("num_draft_layers", cfg.num_draft_layers, c.num_draft_layers),
+            ("num_aux_layers", cfg.num_aux_layers, c.num_aux_layers),
+        ]
+    })?;
     if cfg.dtype != DType::Bf16 {
         return Err(format!(
             "dtype must be {}, got {}",
@@ -445,6 +439,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worklet::dflash2_checkpoint::GLM53_DFLASH2 as CKPT;
+
+    const HIDDEN_DIM: u32 = CKPT.hidden_dim;
+    const HEAD_DIM: u32 = CKPT.head_dim;
+    const NUM_KV_HEADS: u32 = CKPT.num_kv_heads;
+    const NUM_DRAFT_LAYERS: u32 = CKPT.num_draft_layers;
+    const NUM_AUX_LAYERS: u32 = CKPT.num_aux_layers;
 
     fn cfg() -> Dflash2ContextKvLocalWorkletConfig {
         Dflash2ContextKvLocalWorkletConfig {
