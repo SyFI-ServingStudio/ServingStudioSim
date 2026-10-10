@@ -66,6 +66,7 @@ pub mod neuron_embedding;
 pub mod neuron_llama_decoder;
 pub mod neuron_llama_forward;
 pub mod neuron_llama_region;
+pub mod neuron_llama_segment;
 pub mod nvfp4_fused_moe;
 pub mod nvfp4_quant;
 pub mod p2p_inter;
@@ -308,6 +309,10 @@ pub use neuron_llama_forward::{
 pub use neuron_llama_region::{
     NeuronLlamaRegion, NeuronLlamaRegionKernel, NeuronLlamaRegionKernelConfig,
     NeuronLlamaRegionKernelInput, NeuronLlamaRegionSpec,
+};
+pub use neuron_llama_segment::{
+    NeuronLlamaSegment, NeuronLlamaSegmentKernel, NeuronLlamaSegmentKernelConfig,
+    NeuronLlamaSegmentKernelInput, NeuronLlamaSegmentSpec,
 };
 pub use nvfp4_fused_moe::{
     Nvfp4FusedMoeKernel, Nvfp4FusedMoeKernelConfig, Nvfp4FusedMoeKernelInput, Nvfp4FusedMoeSpec,

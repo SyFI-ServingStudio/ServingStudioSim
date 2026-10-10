@@ -10,6 +10,10 @@
 //! region (vocabulary projection, logit collectives and sampling). Its rows are
 //! accepted only when the split reproduces unsplit stock logits and the region
 //! sum stays within 5% of the whole-forward time.
+//!
+//! The `layer_segments` composition keeps the unchanged executable and costs
+//! its native timeline cut at the sublayer-closing collectives: embedding, a
+//! 32-layer fold of attention and MLP blocks, then the head.
 
 use crate::arch::config::VllmNeuronComposition;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
@@ -21,7 +25,8 @@ use crate::timing::kernels::neuron_llama_forward::NeuronLlamaForwardSpec;
 use crate::timing::kernels::{
     NeuronLlamaForwardKernel, NeuronLlamaForwardKernelConfig, NeuronLlamaForwardKernelInput,
     NeuronLlamaForwardPhase, NeuronLlamaRegion, NeuronLlamaRegionKernel,
-    NeuronLlamaRegionKernelConfig, NeuronLlamaRegionKernelInput,
+    NeuronLlamaRegionKernelConfig, NeuronLlamaRegionKernelInput, NeuronLlamaSegment,
+    NeuronLlamaSegmentKernel, NeuronLlamaSegmentKernelConfig, NeuronLlamaSegmentKernelInput,
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
@@ -56,7 +61,16 @@ pub enum VllmNeuronLeaves {
         model: Op<NeuronLlamaRegionKernel>,
         head: Op<NeuronLlamaRegionKernel>,
     },
+    LayerSegments {
+        embedding: Op<NeuronLlamaSegmentKernel>,
+        attention: Op<NeuronLlamaSegmentKernel>,
+        mlp: Op<NeuronLlamaSegmentKernel>,
+        head: Op<NeuronLlamaSegmentKernel>,
+    },
 }
+
+/// The validated model's layer count; `validate_model` pins it.
+const NUM_LAYERS: u32 = 32;
 
 pub struct Llama3VllmNeuronModel {
     pub name: String,
@@ -138,6 +152,36 @@ pub fn region_config(
     }
 }
 
+/// A segment shares the whole forward's compiled inventory and runtime identity.
+pub fn segment_config(
+    forward: &NeuronLlamaForwardKernelConfig,
+    segment: NeuronLlamaSegment,
+) -> NeuronLlamaSegmentKernelConfig {
+    NeuronLlamaSegmentKernelConfig {
+        backends: vec!["vllm_neuron_collective_segments"],
+        gpu_name: forward.gpu_name.clone(),
+        segment,
+        max_model_len: forward.max_model_len.clone(),
+        kv_blocks: forward.kv_blocks.clone(),
+        block_size: forward.block_size.clone(),
+        tp_size: forward.tp_size.clone(),
+        dtype: forward.dtype,
+        decode_buckets: forward.decode_buckets.clone(),
+    }
+}
+
+fn segment_op(
+    name: &str,
+    forward: &NeuronLlamaForwardKernelConfig,
+    segment: NeuronLlamaSegment,
+    bridge: &PerfApiBridge,
+) -> Result<Op<NeuronLlamaSegmentKernel>, BuildError> {
+    let slot = format!("{name}.{}", segment.as_str());
+    let kernel =
+        NeuronLlamaSegmentKernel::build(slot.clone(), segment_config(forward, segment), bridge)?;
+    Ok(Op::new(slot, Arc::new(kernel)))
+}
+
 fn region_op(
     name: &str,
     forward: &NeuronLlamaForwardKernelConfig,
@@ -145,7 +189,8 @@ fn region_op(
     bridge: &PerfApiBridge,
 ) -> Result<Op<NeuronLlamaRegionKernel>, BuildError> {
     let slot = format!("{name}.{}", region.as_str());
-    let kernel = NeuronLlamaRegionKernel::build(slot.clone(), region_config(forward, region), bridge)?;
+    let kernel =
+        NeuronLlamaRegionKernel::build(slot.clone(), region_config(forward, region), bridge)?;
     Ok(Op::new(slot, Arc::new(kernel)))
 }
 
@@ -174,6 +219,15 @@ pub fn build(
             model: region_op(&name, &resolved.forward, NeuronLlamaRegion::Model, bridge)?,
             head: region_op(&name, &resolved.forward, NeuronLlamaRegion::Head, bridge)?,
         },
+        VllmNeuronComposition::LayerSegments => {
+            let op = |segment| segment_op(&name, &resolved.forward, segment, bridge);
+            VllmNeuronLeaves::LayerSegments {
+                embedding: op(NeuronLlamaSegment::Embedding)?,
+                attention: op(NeuronLlamaSegment::AttentionBlock)?,
+                mlp: op(NeuronLlamaSegment::MlpBlock)?,
+                head: op(NeuronLlamaSegment::Head)?,
+            }
+        }
     };
     let mut model = Llama3VllmNeuronModel {
         name,
@@ -253,6 +307,29 @@ impl Llama3VllmNeuronModel {
                 "model then head regions",
                 CostNode::Sum(vec![model.compile(&mut b), head.compile(&mut b)]),
             ),
+            VllmNeuronLeaves::LayerSegments {
+                embedding,
+                attention,
+                mlp,
+                head,
+            } => {
+                let embedding = embedding.compile(&mut b);
+                let layer = CostNode::Labeled {
+                    label: "layer".to_string(),
+                    child: Box::new(CostNode::Scale {
+                        n: NUM_LAYERS,
+                        child: Box::new(CostNode::Sum(vec![
+                            attention.compile(&mut b),
+                            mlp.compile(&mut b),
+                        ])),
+                    }),
+                };
+                let head = head.compile(&mut b);
+                (
+                    "collective-delimited embedding, 32 layers and head",
+                    CostNode::Sum(vec![embedding, layer, head]),
+                )
+            }
         };
         b.finish(CostNode::Labeled {
             label: format!("{} [stock vLLM Neuron; {detail}, TP4/LNC2]", self.name),
@@ -271,6 +348,20 @@ impl Llama3VllmNeuronModel {
                 };
                 model.eval(&region_input, ev);
                 head.eval(&region_input, ev);
+            }
+            VllmNeuronLeaves::LayerSegments {
+                embedding,
+                attention,
+                mlp,
+                head,
+            } => {
+                let segment_input = NeuronLlamaSegmentKernelInput {
+                    phase: input.phase,
+                    token_bucket: input.token_bucket,
+                };
+                for op in [embedding, attention, mlp, head] {
+                    op.eval(&segment_input, ev);
+                }
             }
         }
     }
@@ -424,7 +515,10 @@ mod tests {
             composition: VllmNeuronComposition::ModelHeadRegions,
         };
         let resolved = resolve_configs(&build_configs(&ModelCfg::llama3_8b(), &parallel));
-        assert_eq!(resolved.composition, VllmNeuronComposition::ModelHeadRegions);
+        assert_eq!(
+            resolved.composition,
+            VllmNeuronComposition::ModelHeadRegions
+        );
         for region in [NeuronLlamaRegion::Model, NeuronLlamaRegion::Head] {
             let cfg = region_config(&resolved.forward, region);
             NeuronLlamaRegionSpec::validate_config(&cfg).unwrap();
@@ -432,6 +526,30 @@ mod tests {
             assert_eq!(cfg.decode_buckets, resolved.forward.decode_buckets);
             assert_eq!(cfg.backends, ["vllm_neuron_fx_regions"]);
         }
+    }
+    #[test]
+    fn segments_share_the_whole_forward_inventory() {
+        use crate::timing::kernels::NeuronLlamaSegmentSpec;
+        let parallel = VllmNeuronParallel {
+            gpu_name: "AWS Trainium2 LNC2".into(),
+            max_model_len: 512,
+            decode_buckets: vec![1, 16],
+            tp_size: 4,
+            composition: VllmNeuronComposition::LayerSegments,
+        };
+        let resolved = resolve_configs(&build_configs(&ModelCfg::llama3_8b(), &parallel));
+        for segment in [
+            NeuronLlamaSegment::Embedding,
+            NeuronLlamaSegment::AttentionBlock,
+            NeuronLlamaSegment::MlpBlock,
+            NeuronLlamaSegment::Head,
+        ] {
+            let cfg = segment_config(&resolved.forward, segment);
+            NeuronLlamaSegmentSpec::validate_config(&cfg).unwrap();
+            assert_eq!(cfg.segment, segment);
+            assert_eq!(cfg.backends, ["vllm_neuron_collective_segments"]);
+        }
+        assert_eq!(ModelCfg::llama3_8b().num_layers, NUM_LAYERS);
     }
     #[test]
     fn selector_defaults_to_the_whole_forward() {
@@ -447,6 +565,10 @@ mod tests {
             (
                 r#","composition":"model_head_regions""#,
                 VllmNeuronComposition::ModelHeadRegions,
+            ),
+            (
+                r#","composition":"layer_segments""#,
+                VllmNeuronComposition::LayerSegments,
             ),
         ] {
             let IterArchSel::Llama3VllmNeuron { composition, .. } = parse(extra) else {

@@ -146,17 +146,21 @@ fn default_neuron_tp_size() -> u16 {
     4
 }
 
-/// How the stock vLLM Neuron forward is costed: one measured executable, or the
-/// same stock operations compiled and measured as model and head regions.
+/// How the stock vLLM Neuron forward is costed: one measured executable, the
+/// same stock operations compiled and measured as model and head regions, or
+/// the unchanged executable's collective-delimited embedding, per-layer
+/// attention and MLP blocks, and head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VllmNeuronComposition {
     #[default]
     WholeForward,
     ModelHeadRegions,
+    LayerSegments,
 }
 
-const VLLM_NEURON_COMPOSITIONS: [&str; 2] = ["whole_forward", "model_head_regions"];
+const VLLM_NEURON_COMPOSITIONS: [&str; 3] =
+    ["whole_forward", "model_head_regions", "layer_segments"];
 
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
 /// that consume them (provider-first: select the arch, then it exposes its own

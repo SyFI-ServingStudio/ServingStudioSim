@@ -69,3 +69,25 @@ def test_region_map_partitions_the_whole_forward_semantics():
     assert Counter(name for names in by_location.values() for name in names) == Counter(
         whole["locations"][0]["semantics"]
     )
+
+
+SEGMENTS_MAP = ROOT / "model/work/location_maps/llama3_vllm_neuron_segments.json"
+
+
+def test_segment_map_partitions_the_whole_forward_semantics():
+    """Collective-delimited blocks own their sublayer's semantics, once each."""
+    whole = json.loads(MAP.read_text())
+    segments = json.loads(SEGMENTS_MAP.read_text())
+    assert segments["mapping_id"] == "llama3-vllm-neuron-segments-v1"
+    assert segments["arch_types"] == whole["arch_types"]
+    by_location = {rule["location"]: rule["semantics"] for rule in segments["locations"]}
+    assert set(by_location) == {
+        "unified.embedding",
+        "unified.attention_block",
+        "unified.mlp_block",
+        "unified.head",
+    }
+    assert by_location["unified.mlp_block"] == ["post_norm", "gate_up", "down"]
+    assert Counter(name for names in by_location.values() for name in names) == Counter(
+        whole["locations"][0]["semantics"]
+    )

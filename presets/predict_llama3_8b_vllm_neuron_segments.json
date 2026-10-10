@@ -1,0 +1,19 @@
+{
+  "arch": {
+    "iter": {
+      "type": "llama3_vllm_neuron",
+      "model_config": "model/config/llama3_8b.json",
+      "max_model_len": 512,
+      "decode_buckets": [
+        1,
+        16
+      ],
+      "tp_size": 4,
+      "fp8": false,
+      "composition": "layer_segments"
+    }
+  },
+  "gpu": "AWS Trainium2 LNC2",
+  "log_dir": "logs/predict_llama3_8b_vllm_neuron_segments",
+  "cases_file": "predict_llama3_8b_vllm_neuron_cases.json"
+}
