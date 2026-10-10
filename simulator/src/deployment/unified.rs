@@ -1513,6 +1513,7 @@ pools:
             kv_admission: Default::default(),
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
+            dp_placement: Default::default(),
         }
     }
 
