@@ -1,8 +1,8 @@
-//! CPU handoff test for Inkling-Small-NVFP4 at TP4 + EP4: per-request Arrow
-//! geometry -> Python accountant (sliding-window / global relative attention,
-//! short-conv states) -> semantic location map -> R6/R7. The simulator's
-//! necessary_work_map_covers_the_compiled_locations test checks the same map
-//! against the real compiled tree.
+//! CPU handoff tests for Inkling-Small-NVFP4 at TP4 + EP4 and Inkling-NVFP4 at
+//! TP8 + EP8: per-request Arrow geometry -> Python accountant (sliding-window /
+//! global relative attention, short-conv states) -> semantic location map ->
+//! R6/R7. The simulator's necessary_work_map_covers_the_compiled_locations test
+//! checks the maps against the real compiled tree.
 
 use std::sync::Arc;
 
@@ -11,11 +11,22 @@ use datafusion::{arrow::json::ReaderBuilder, prelude::SessionContext};
 use serde_json::{json, Value};
 
 use super::{
-    floors, ladder, levels::BaseRungs, location::LocationCatalog, prepare::KernelLocation, spec,
+    floors::{self, IterationLabel},
+    ladder,
+    levels::BaseRungs,
+    location::LocationCatalog,
+    prepare::KernelLocation,
+    spec,
 };
 
-#[tokio::test]
-async fn inkling_exact_iteration_handoff_reconciles_r6_r7() {
+/// Labels timing-predict case 3 for `model_config`, attributes it through
+/// `map_file` and checks that R6/R7 reconcile with the label's floors.
+async fn handoff(
+    model_config: &str,
+    map_file: &str,
+    mapping_id: &str,
+    gpus: f64,
+) -> IterationLabel {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -31,7 +42,7 @@ async fn inkling_exact_iteration_handoff_reconciles_r6_r7() {
         dir.path().join("raw/params.json"),
         json!({"pools":{"main":{"groups":[{
             "gpu":"NVIDIA B200", "arch":{"type":"inkling_vllm_nvfp4_rel_attn_moe",
-                "model_config":"model/config/inkling_small_nvfp4.json"}
+                "model_config":model_config}
         }]}}})
         .to_string(),
     )
@@ -79,10 +90,7 @@ async fn inkling_exact_iteration_handoff_reconciles_r6_r7() {
         .await
         .unwrap();
     let map: Value = serde_json::from_slice(
-        &std::fs::read(
-            repo.join("model/work/location_maps/inkling_vllm_nvfp4_tp4_ep4_unified.json"),
-        )
-        .unwrap(),
+        &std::fs::read(repo.join("model/work/location_maps").join(map_file)).unwrap(),
     )
     .unwrap();
     let locations: Vec<_> = map["locations"]
@@ -105,38 +113,70 @@ async fn inkling_exact_iteration_handoff_reconciles_r6_r7() {
             &mut ladder,
             &label,
             gpu,
-            4.0,
+            gpus,
             ladder::NecessaryWorkPolicy::BatchLocked,
         )
         .unwrap();
-    assert_eq!(
-        attribution.mapping_id,
-        "inkling-vllm-nvfp4-tp4-ep4-unified-v1"
-    );
+    assert_eq!(attribution.mapping_id, mapping_id);
     assert!((ladder.rungs.segmented_necessary.unwrap() - label.floors.segmented).abs() < 1e-12);
     assert!((ladder.rungs.scope_fused_necessary.unwrap() - label.floors.fused).abs() < 1e-12);
     assert!(label.floors.segmented >= label.floors.fused && label.floors.fused > 0.0);
+    label
+}
+
+fn segment_flops(label: &IterationLabel, name: &str) -> f64 {
+    label
+        .segments
+        .iter()
+        .find(|segment| segment.name == name)
+        .unwrap()
+        .flops
+}
+
+#[tokio::test]
+async fn inkling_exact_iteration_handoff_reconciles_r6_r7() {
+    let label = handoff(
+        "model/config/inkling_small_nvfp4.json",
+        "inkling_vllm_nvfp4_tp4_ep4_unified.json",
+        "inkling-vllm-nvfp4-tp4-ep4-unified-v1",
+        4.0,
+    )
+    .await;
     // The Python accountant's totals for the same geometry.
     let flops: f64 = label.segments.iter().map(|segment| segment.flops).sum();
     let bytes: f64 = label.segments.iter().map(|segment| segment.bytes).sum();
     assert_eq!(label.segments.len(), 96);
     assert_eq!(flops, 42_791_756_742_656.0);
     assert!((bytes - 165_667_202_212.0).abs() < 1.0);
-    let segment = |name: &str| {
-        label
-            .segments
-            .iter()
-            .find(|segment| segment.name == name)
-            .unwrap()
-            .flops
-    };
     // Global decodes see every cached key; local ones at most 512 (32 heads x 128).
     assert_eq!(
-        segment("global_nvfp4_moe.attn.decode"),
+        segment_flops(&label, "global_nvfp4_moe.attn.decode"),
         4.0 * 32.0 * 128.0 * 15828.0 * 7.0
     );
     assert_eq!(
-        segment("local_nvfp4_moe.attn.decode"),
+        segment_flops(&label, "local_nvfp4_moe.attn.decode"),
         4.0 * 32.0 * 128.0 * 3904.0 * 32.0
+    );
+}
+
+#[tokio::test]
+async fn inkling_large_tp8_ep8_handoff_reconciles_r6_r7() {
+    // The TP8 + EP8 map adds routed_rank4..7; the semantic rows are the same 96.
+    let label = handoff(
+        "model/config/inkling_nvfp4.json",
+        "inkling_vllm_nvfp4_tp8_ep8_unified.json",
+        "inkling-vllm-nvfp4-tp8-ep8-unified-v1",
+        8.0,
+    )
+    .await;
+    assert_eq!(label.segments.len(), 96);
+    // 64 heads x 128 on both kinds; 11 global and 52 local NVFP4-expert layers.
+    assert_eq!(
+        segment_flops(&label, "global_nvfp4_moe.attn.decode"),
+        4.0 * 64.0 * 128.0 * 15828.0 * 11.0
+    );
+    assert_eq!(
+        segment_flops(&label, "local_nvfp4_moe.attn.decode"),
+        4.0 * 64.0 * 128.0 * 3904.0 * 52.0
     );
 }

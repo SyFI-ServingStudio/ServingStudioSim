@@ -47,7 +47,10 @@ interaction per request, which is exact. A collapsed analyzer aggregate (one
 the phase's request and token counts — exact for a single request and whenever
 every request sits on one side of the window and extent caps. A global layer's
 pairs are taken from the interactions themselves, so they stay exact either way.
-The simulator arch logs per-request decode geometry, so analyzer labels are exact.
+The relative-logit bytes are the exception: they read ``ceil`` of the mean
+request's context, so below the extent they count the mean context, not the
+longest. The simulator arch logs per-request decode geometry, so analyzer labels
+are exact.
 """
 
 from __future__ import annotations

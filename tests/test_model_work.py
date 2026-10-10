@@ -3352,13 +3352,7 @@ INKLING_SMALL = (
     Path(__file__).resolve().parents[1] / "model" / "config" / "inkling_small_nvfp4.json"
 )
 INKLING_LARGE = Path(__file__).resolve().parents[1] / "model" / "config" / "inkling_nvfp4.json"
-INKLING_MAP = (
-    Path(__file__).resolve().parents[1]
-    / "model"
-    / "work"
-    / "location_maps"
-    / "inkling_vllm_nvfp4_tp4_ep4_unified.json"
-)
+INKLING_MAPS = Path(__file__).resolve().parents[1] / "model" / "work" / "location_maps"
 # Inkling-Small text_config, read off config.json and the checkpoint shapes.
 INK_H, INK_LAYERS, INK_HEADS, INK_KV, INK_HD, INK_DREL = 4096, 42, 32, 8, 128, 16
 INK_REL_EXTENT, INK_WINDOW, INK_SCONV = 1024, 512, 4
@@ -3380,9 +3374,10 @@ INK_STACKS = {
 INK_SMALL_TEXT_PARAMS = 263_655_199_274
 # thinkingmachines/Inkling-NVFP4 headers, model.llm.* (952,377,623,626 in all).
 INK_LARGE_TEXT_PARAMS = 947_025_564_226
-# Inkling-Small-NVFP4 model.llm.* stored bytes, and the parts no forward needs:
-# per-expert FP32 scale2 (79,872 B), BF16 input_amax (156 B), int64
-# original_shape (1,872 B), and the 966 padding rows of embed and unembed.
+# Inkling-Small-NVFP4 model.llm.* stored bytes, and the parts model.work leaves
+# out: the per-tensor scalars it treats as negligible — per-expert FP32 scale2
+# (79,872 B), BF16 input_amax (156 B), int64 original_shape (1,872 B) — and the
+# 966 padding rows of embed and unembed, which no forward reads.
 INK_SMALL_TEXT_BYTES = 166_130_594_960
 INK_SMALL_UNREAD_BYTES = 79_872 + 156 + 1_872 + 2 * (INK_VOCAB_ROWS - INK_VOCAB) * INK_H * 2
 
@@ -3583,11 +3578,25 @@ def test_inkling_decode_byte_goldens(inkling):
     assert bf16 == pytest.approx(hit * expert * 2)
     assert rows["local_nvfp4_moe.shared_gate_up"] == 2 * INK_I * INK_SINKS * INK_H * 2
     assert rows["local_nvfp4_moe.router"] == (INK_E + INK_SINKS) * INK_H * 2
-    assert rows["local_nvfp4_moe.gate_bias"] == INK_E * 4
-    assert rows["local_nvfp4_moe.gate_global_scale"] == 4
+    assert rows["local_nvfp4_moe.router_bias"] == INK_E * 4
+    assert rows["local_nvfp4_moe.router_global_scale"] == 4
     assert rows["local_dense.global_scale"] == 2
     assert rows["lm_head"] == INK_VOCAB * INK_H * 2  # the padding rows are never read
     assert rows["local_dense.qkvr"] == INK_QKVR * INK_H * 2
+
+
+def test_inkling_large_decode_kv_bytes_follow_each_layer_kind():
+    """Inkling-NVFP4 (the TP8 checkpoint) gives its local layers 16 KV heads
+    (``swa_num_key_value_heads``) and its global layers 8 (``num_key_value_heads``),
+    so the two kinds read different bytes per cached key."""
+    label = load_model(INKLING_LARGE).label(Workload.causal_lm(decode=[4096]))
+    rows = {segment.name: segment.bytes for segment in label.segments}
+    # K + V x KV heads x head_dim 128 x 2 B (BF16): 2*16*128*2 = 8192 B local,
+    # 2*8*128*2 = 4096 B global.
+    # Local: 511 cached keys inside the 512-key window, 511 * 8192 = 4,186,112 B.
+    assert rows["local_nvfp4_moe.attn.decode"] == 4_186_112
+    # Global: every one of the 4095 cached keys, 4095 * 4096 = 16,773,120 B.
+    assert rows["global_nvfp4_moe.attn.decode"] == 16_773_120
 
 
 def test_inkling_window_extent_and_state_caps(inkling):
@@ -3677,17 +3686,30 @@ def test_inkling_floors_accept_the_nvfp4_arch(inkling):
     work_floors._check_precision(inkling, spec)
 
 
-def test_inkling_location_map_consumes_every_semantic_once(inkling):
-    location_map = json.loads(INKLING_MAP.read_text())
+@pytest.mark.parametrize(
+    ("map_file", "config", "ranks", "location_count"),
+    [
+        # Inkling-Small-NVFP4 at TP4 + EP4.
+        ("inkling_vllm_nvfp4_tp4_ep4_unified.json", INKLING_SMALL, 4, 69),
+        # Inkling-NVFP4 at TP8 + EP8: four more routed ranks in each of the three
+        # MoE groups, with an input quant per rank on the two NVFP4 groups.
+        ("inkling_vllm_nvfp4_tp8_ep8_unified.json", INKLING_LARGE, 8, 69 + 4 * (1 + 2 + 2)),
+    ],
+)
+def test_inkling_location_map_consumes_every_semantic_once(
+    map_file, config, ranks, location_count
+):
+    location_map = json.loads((INKLING_MAPS / map_file).read_text())
+    model = load_model(config)
     assert location_map["schema_version"] == 1
-    assert location_map["mapping_id"] == "inkling-vllm-nvfp4-tp4-ep4-unified-v1"
+    assert location_map["mapping_id"] == f"inkling-vllm-nvfp4-tp{ranks}-ep{ranks}-unified-v1"
     assert location_map["arch_types"] == ["inkling_vllm_nvfp4_rel_attn_moe"]
     # The set is checked against the compiled tree by the Rust test
     # `necessary_work_map_covers_the_compiled_locations` in
     # `simulator/src/arch/inkling_vllm_nvfp4_rel_attn_moe.rs`.
     locations = [row["location"] for row in location_map["locations"]]
     mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
-    assert len(locations) == len(set(locations)) == 69
+    assert len(locations) == len(set(locations)) == location_count
     assert len(mapped) == len(set(mapped)) == 96
     for workload in (
         Workload.causal_lm(decode=[4096] * 3, sampled=3),
@@ -3698,7 +3720,7 @@ def test_inkling_location_map_consumes_every_semantic_once(inkling):
              "prefill_requests": 1}
         ),
     ):
-        assert set(mapped) == {segment.name for segment in inkling.label(workload).segments}
+        assert set(mapped) == {segment.name for segment in model.label(workload).segments}
     semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
     # The logits all-gather is communication and has no row.
     assert "unified.logits_all_gather" not in semantics
@@ -3709,14 +3731,20 @@ def test_inkling_location_map_consumes_every_semantic_once(inkling):
     ]
     assert semantics["unified.global_nvfp4_moe.moe.rs_sconv_ag_norm"][-1] == "final_norm"
     for tag in ("local_bf16_moe", "local_nvfp4_moe", "global_nvfp4_moe"):
+        assert semantics[f"unified.{tag}.moe.gate_select"] == [
+            f"{tag}.router_bias", f"{tag}.router_global_scale"
+        ]
         assert semantics[f"unified.{tag}.moe.routed_rank0.fused_moe"] == [
             f"{tag}.expert_gate_up", f"{tag}.expert_down"
         ]
-        for rank in (1, 2, 3):
+        for rank in range(1, ranks):
             assert semantics[f"unified.{tag}.moe.routed_rank{rank}.fused_moe"] == []
+        assert f"unified.{tag}.moe.routed_rank{ranks}.fused_moe" not in semantics
     assert not any(
         location.endswith("input_quant") and rules for location, rules in semantics.items()
     )
     # Zero-minimum leaves: the tau launches, the two activations, the top-k copies,
-    # ranks 1-3 of each routed fold, and the eight NVFP4 activation quants.
-    assert sum(not row["semantics"] for row in location_map["locations"]) == 1 + 1 + 3 * 5 + 8
+    # ranks 1.. of each routed fold, and one NVFP4 activation quant per rank on
+    # the two NVFP4 groups.
+    zero = 1 + 1 + 3 * (2 + ranks - 1) + 2 * ranks
+    assert sum(not row["semantics"] for row in location_map["locations"]) == zero

@@ -31,7 +31,7 @@ _SUBLAYERS = ("attn", "mlp")
 
 
 @dataclass
-class InklingSublayerShortConv:
+class SublayerShortConv:
     """The two sublayer-output convolutions and the two norms of one layer."""
 
     hidden: int

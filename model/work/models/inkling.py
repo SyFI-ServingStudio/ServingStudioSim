@@ -12,7 +12,7 @@ FFN -> sconv + residual``:
   sliding-window (``local_layer_ids``, ``swa_*`` geometry, ``sliding_window_size``
   relative extent) or global (the rest; ``rel_extent``, log-scaled ``q``);
 - the two sublayer-output short convolutions and the two norms:
-  :class:`~model.work.mixers.short_conv.InklingSublayerShortConv`;
+  :class:`~model.work.mixers.short_conv.SublayerShortConv`;
 - FFN: a dense SwiGLU (``dense_intermediate_size``, learned ``global_scale``) on
   layers ``0..dense_mlp_idx``, then the shared :class:`~model.work.ffn.moe.MoE`:
   ``n_routed_experts`` routed experts, top ``num_experts_per_tok``, and
@@ -51,7 +51,7 @@ from ..attention.inkling_rel import InklingRelAttention
 from ..core import LayerStack, LearnedWeightGroup, Model, dtype_bytes
 from ..ffn.dense import DenseSwiGLU
 from ..ffn.moe import MoE
-from ..mixers.short_conv import InklingSublayerShortConv
+from ..mixers.short_conv import SublayerShortConv
 from ..quantization import QuantScheme
 
 _LAYER_ENTRY = re.compile(r"^model\.llm\.layers\.(\d+)\.(.+)$")
@@ -80,8 +80,8 @@ class _InklingMoE(MoE):
 
     def learned_weight_groups(self) -> list[LearnedWeightGroup]:
         return [
-            LearnedWeightGroup("gate_bias", self.num_experts, 1, "router", dtype_bytes=4),
-            LearnedWeightGroup("gate_global_scale", 1, 1, "router", dtype_bytes=4),
+            LearnedWeightGroup("router_bias", self.num_experts, 1, "router", dtype_bytes=4),
+            LearnedWeightGroup("router_global_scale", 1, 1, "router", dtype_bytes=4),
         ]
 
 
@@ -204,7 +204,7 @@ def build(raw_config: dict) -> Model:
             ffn_kind = "bf16_moe" if layer in bf16_experts else "nvfp4_moe"
         schedule.setdefault(f"{attn_kind}_{ffn_kind}", []).append(layer)
 
-    mixer = InklingSublayerShortConv(hidden=hidden, kernel=kernel, state_dtype_bytes=master_bytes)
+    mixer = SublayerShortConv(hidden=hidden, kernel=kernel, state_dtype_bytes=master_bytes)
     stacks = [
         LayerStack(
             attn=attention(tag.startswith("local_")),

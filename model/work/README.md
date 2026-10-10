@@ -114,7 +114,7 @@ models/glm52.py      dense/full-index + sparse/index-share stacks + shared MoE
 attention/deepseek_v41.py  DeepSeek-V4.1 window + compressed sparse attention
 models/deepseek_v41.py     10 role stacks + MXFP4 MoE + FP32 mHC mixing + engram
 attention/inkling_rel.py   Inkling relative-position SWA/global attention + K/V short conv
-mixers/short_conv.py       Inkling sublayer-output short convolutions + their norms
+mixers/short_conv.py       sublayer-output short convolutions + their norms (Inkling)
 models/inkling.py          local/global x dense/BF16/NVFP4-expert stacks + sink-expert MoE
 ```
 

@@ -133,8 +133,8 @@
     {
       "location": "unified.local_bf16_moe.moe.gate_select",
       "semantics": [
-        "local_bf16_moe.gate_bias",
-        "local_bf16_moe.gate_global_scale"
+        "local_bf16_moe.router_bias",
+        "local_bf16_moe.router_global_scale"
       ]
     },
     {
@@ -232,8 +232,8 @@
     {
       "location": "unified.local_nvfp4_moe.moe.gate_select",
       "semantics": [
-        "local_nvfp4_moe.gate_bias",
-        "local_nvfp4_moe.gate_global_scale"
+        "local_nvfp4_moe.router_bias",
+        "local_nvfp4_moe.router_global_scale"
       ]
     },
     {
@@ -347,8 +347,8 @@
     {
       "location": "unified.global_nvfp4_moe.moe.gate_select",
       "semantics": [
-        "global_nvfp4_moe.gate_bias",
-        "global_nvfp4_moe.gate_global_scale"
+        "global_nvfp4_moe.router_bias",
+        "global_nvfp4_moe.router_global_scale"
       ]
     },
     {

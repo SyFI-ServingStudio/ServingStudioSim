@@ -114,7 +114,8 @@ _FP8_MLA_CACHE_ARCHS = frozenset(
 )
 
 #: Arch types that run an NVFP4 checkpoint's FP4 path; their model config must
-#: declare the matching ``quantization_config`` (:func:`_check_precision`).
+#: declare the matching quantization scheme (``quantization_config``, or
+#: ModelOpt's ``hf_quant_config``; :func:`_check_precision`).
 _FP4_ARCHS = frozenset(
     {
         "glm52_vllm_nvfp4_dsa_moe",
@@ -238,8 +239,9 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
     the same per-group revisit as the rest of the analyzer.
 
     ``dtype`` is only the fallback for segments that make no precision claim; the
-    real per-segment precisions come from the model config's own
-    ``quantization_config``. The two must agree — see :func:`_check_precision`.
+    real per-segment precisions come from the model config's own quantization
+    scheme (``quantization_config``, or ModelOpt's ``hf_quant_config``). The two
+    must agree — see :func:`_check_precision`.
     """
     params = json.loads((log_dir / "raw" / "params.json").read_text())
     specs: dict[str, dict] = {}
