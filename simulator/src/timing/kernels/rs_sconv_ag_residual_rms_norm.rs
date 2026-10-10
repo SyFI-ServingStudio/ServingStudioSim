@@ -7,7 +7,8 @@
 //! timed apart. The profile is the balanced (all ranks arrive together) cost;
 //! cross-rank skew from upstream work belongs to that work's max over ranks.
 //!
-//! `hidden_dim`, `num_gpus` and `has_shared` (the MoE sink partial) are static
+//! `hidden_dim`, `num_gpus` and `has_shared` (the MoE sink partial: the sum of
+//! the `num_shared_experts` sink experts' output) are static
 //! config; `num_tokens` (every rank holds every token) is the sweep axis. The
 //! kernel splits its grid 8 ways only at one token, so the grid keeps T=1..8
 //! exactly, then follows the CTA-count growth up to the symmetric buffer's
@@ -22,8 +23,8 @@ use crate::timing::{KernelConfig, SweepCoords};
 
 /// `lamport._MAX_TOKENS`: the Lamport symmetric buffers hold at most this many
 /// tokens; vLLM uses `min(16384, max_num_batched_tokens)` and falls back to
-/// NCCL above it.
-pub const RS_SCONV_MAX_TOKENS: u32 = 16384;
+/// NCCL above it. That NCCL fallback is not modelled; the grid ends here.
+const RS_SCONV_MAX_TOKENS: u32 = 16384;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RsSconvAgResidualRmsNormKernelConfig {
@@ -37,7 +38,8 @@ pub struct RsSconvAgResidualRmsNormKernelConfig {
     pub fabric: Fabric,
     /// Short-conv window; the production kernel requires 4.
     pub conv_kernel_size: u32,
-    /// Whether the call also sums the MoE sink partial (MoE MLP sublayers).
+    /// Whether the call also sums the MoE sink partial, the output of the
+    /// `num_shared_experts` sink experts (MoE MLP sublayers).
     pub has_shared: bool,
 }
 
@@ -48,16 +50,27 @@ pub struct RsSconvAgResidualRmsNormKernelInput {
 
 pub struct RsSconvAgResidualRmsNormSpec;
 
+fn validate_config(config: &RsSconvAgResidualRmsNormKernelConfig) {
+    // The conv kernel static_asserts WINDOW == 4 (lamport.py).
+    assert_eq!(
+        config.conv_kernel_size, 4,
+        "rs_sconv_ag_add_norm needs conv_kernel_size 4"
+    );
+}
+
 impl KernelSpec for RsSconvAgResidualRmsNormSpec {
     type Config = RsSconvAgResidualRmsNormKernelConfig;
     type Input = RsSconvAgResidualRmsNormKernelInput;
 
     const KIND: KernelKind = "rs_sconv_ag_residual_rms_norm";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        validate_config(config);
         // T=1 is its own 8-way-split launch shape; 2..8 are latency-bound
         // single-CTA-per-token grids. Above that the cost grows with the CTA
-        // count, with warp-count switches at 128, 256 and 2048 tokens.
+        // count, with warp-count switches at 128, 256 and 2048 tokens. The
+        // neighbours 112/128, 224/256 and 2048/2560 straddle those switches,
+        // so tokens inside those cells interpolate across them.
         SweepGrid::new(vec![Axis::chain([
             Axis::arithmetic(1, 8, 1),
             Axis::arithmetic(12, 32, 4),
@@ -126,6 +139,14 @@ mod tests {
             assert!(tokens.contains(&boundary), "missing warp switch {boundary}");
         }
         assert!(tokens.len() <= 500);
+    }
+
+    #[test]
+    #[should_panic(expected = "conv_kernel_size 4")]
+    fn rejects_a_conv_window_the_kernel_asserts_away() {
+        let mut cfg = config(false);
+        cfg.conv_kernel_size = 3;
+        RsSconvAgResidualRmsNormSpec::sweep_grid(&cfg);
     }
 
     #[test]

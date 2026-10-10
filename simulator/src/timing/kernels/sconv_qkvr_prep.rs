@@ -11,11 +11,12 @@
 //! - below 128 tokens one `_qkvr_qkv_kernel` launch; from 128 a two-stream
 //!   fork (`_kv_kernel` ∥ `_q_kernel` + rel projection);
 //! - inside the fork the rel projection takes its throughput variant once
-//!   `8 * num_tokens` rows reach 8192 (`rel_extent` 512) or 2048 (otherwise),
-//!   i.e. at 1024 or 256 tokens for 8 heads.
+//!   `num_tokens * num_q_heads` rows reach 8192 (`rel_extent` 512) or 2048
+//!   (otherwise), i.e. at 1024 or 256 tokens for 8 heads.
 //!
-//! The grid holds 127/128, 255/256 and 1023/1024 so linear interpolation
-//! never bridges a switch with a sample from farther away. Rows are profiled
+//! The grid holds 127/128 and both sides of each rel-projection switch
+//! (255/256 and 1023/1024 for 8 heads) so linear interpolation never bridges
+//! a switch with a sample from farther away. Rows are profiled
 //! on all-decode batches (every conv tap read from the cache); prefill-heavy
 //! batches of the same size run 5-20% faster on B200, a band that did not
 //! justify a tap-source axis, so `num_tokens` is the only input.
@@ -61,6 +62,17 @@ pub struct SconvQkvrPrepKernelInput {
 
 pub struct SconvQkvrPrepSpec;
 
+/// `use_rel_proj_throughput` (qkvr_prep.py): q rows at which the rel
+/// projection takes its throughput variant, for `rel_extent` 512 and otherwise.
+const REL_PROJ_THROUGHPUT_ROWS: [u32; 2] = [8192, 2048];
+
+/// First token count on the throughput side of each rel-projection switch.
+/// Both are bracketed on every config, which keeps the 8-head grid as
+/// profiled (1024 and 256).
+fn rel_proj_switch_tokens(config: &SconvQkvrPrepKernelConfig) -> [u32; 2] {
+    REL_PROJ_THROUGHPUT_ROWS.map(|rows| rows.div_ceil(config.num_q_heads))
+}
+
 fn validate_config(config: &SconvQkvrPrepKernelConfig) {
     // fused_qkvr_prep asserts both (qkvr_prep.py:820-821).
     assert_eq!(config.head_dim, 128, "fused_qkvr_prep needs head_dim 128");
@@ -72,7 +84,11 @@ fn validate_config(config: &SconvQkvrPrepKernelConfig) {
         config.num_kv_heads
     );
     assert!(config.rel_extent > 0, "rel_extent must be positive");
-    assert_eq!(config.dtype, DType::Bf16, "the conv-state cache is bf16 only");
+    assert_eq!(
+        config.dtype,
+        DType::Bf16,
+        "the conv-state cache is bf16 only"
+    );
 }
 
 impl KernelSpec for SconvQkvrPrepSpec {
@@ -82,11 +98,17 @@ impl KernelSpec for SconvQkvrPrepSpec {
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         validate_config(config);
-        SweepGrid::new(vec![Axis::values([
+        let mut tokens = vec![
             1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 72, 80, 96, 112, 120, 127,
-            128, 136, 152, 176, 192, 224, 255, 256, 288, 320, 384, 448, 512, 640, 768, 896, 1023,
-            1024, 1088, 1280, 1536, 1792, 2048, 3072, 4096, 6144, 8192,
-        ])])
+            128, 136, 152, 176, 192, 224, 256, 288, 320, 384, 448, 512, 640, 768, 896, 1024, 1088,
+            1280, 1536, 1792, 2048, 3072, 4096, 6144, 8192,
+        ];
+        for switch in rel_proj_switch_tokens(config) {
+            tokens.extend([switch - 1, switch].into_iter().filter(|&t| t >= 1));
+        }
+        tokens.sort_unstable();
+        tokens.dedup();
+        SweepGrid::new(vec![Axis::values(tokens)])
     }
 
     fn cache_kind(_: &'static str) -> CacheKind {
@@ -145,13 +167,37 @@ mod tests {
     /// other's range.
     #[test]
     fn grid_brackets_every_implementation_switch_with_adjacent_points() {
-        let grid = SconvQkvrPrepSpec::sweep_grid(&config(512, false));
-        let axis = &grid.axes()[0];
-        for switch in [128.0, 256.0, 1024.0] {
-            let i = axis.iter().position(|&t| t == switch).unwrap();
-            assert_eq!(axis[i - 1], switch - 1.0, "no point just below {switch}");
+        for num_q_heads in [4, 8, 16] {
+            let cfg = SconvQkvrPrepKernelConfig {
+                num_q_heads,
+                ..config(512, false)
+            };
+            let grid = SconvQkvrPrepSpec::sweep_grid(&cfg);
+            let axis = &grid.axes()[0];
+            let [wide, narrow] = rel_proj_switch_tokens(&cfg);
+            for switch in [128, wide, narrow] {
+                let switch = f64::from(switch);
+                let i = axis.iter().position(|&t| t == switch).unwrap();
+                assert_eq!(axis[i - 1], switch - 1.0, "no point just below {switch}");
+            }
+            assert!(axis.windows(2).all(|w| w[0] < w[1]));
+            assert!(axis.len() <= 500);
         }
-        assert!(axis.len() <= 500);
+    }
+
+    /// Deriving the switches from `num_q_heads` must not move the profiled
+    /// 8-head rows.
+    #[test]
+    fn eight_head_grid_is_unchanged() {
+        let profiled = Axis::values([
+            1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 72, 80, 96, 112, 120, 127,
+            128, 136, 152, 176, 192, 224, 255, 256, 288, 320, 384, 448, 512, 640, 768, 896, 1023,
+            1024, 1088, 1280, 1536, 1792, 2048, 3072, 4096, 6144, 8192,
+        ]);
+        for rel_extent in [512, 1024] {
+            let grid = SconvQkvrPrepSpec::sweep_grid(&config(rel_extent, false));
+            assert_eq!(grid.axes()[0], profiled);
+        }
     }
 
     /// Catches a payload that drops or renames a field the Python

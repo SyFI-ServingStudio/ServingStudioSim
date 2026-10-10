@@ -59,8 +59,8 @@ pub mod moe_ep_reduce_scatter;
 pub mod moe_finalize_fuse_shared;
 pub mod moe_finalize_routing;
 pub mod moe_fused_topk;
-pub mod moe_sum;
 pub mod moe_sink_gate_select;
+pub mod moe_sum;
 pub mod moe_topk_softplus_sqrt;
 pub mod mxfp4_marlin_moe_gemm;
 pub mod nvfp4_fused_moe;
@@ -284,11 +284,11 @@ pub use moe_finalize_routing::{
 pub use moe_fused_topk::{
     MoeFusedTopkKernel, MoeFusedTopkKernelConfig, MoeFusedTopkKernelInput, MoeFusedTopkSpec,
 };
-pub use moe_sum::{MoeSumKernel, MoeSumKernelConfig, MoeSumKernelInput, MoeSumSpec};
 pub use moe_sink_gate_select::{
     MoeSinkGateSelectKernel, MoeSinkGateSelectKernelConfig, MoeSinkGateSelectKernelInput,
     MoeSinkGateSelectSpec,
 };
+pub use moe_sum::{MoeSumKernel, MoeSumKernelConfig, MoeSumKernelInput, MoeSumSpec};
 pub use moe_topk_softplus_sqrt::{
     MoeTopkSoftplusSqrtKernel, MoeTopkSoftplusSqrtKernelConfig, MoeTopkSoftplusSqrtKernelInput,
     MoeTopkSoftplusSqrtSpec,

@@ -4,10 +4,11 @@
 //! Per layer the model makes ONE call for the whole scheduler step, decode and
 //! prefill requests together. The call issues ShearingBias, FlashAttention
 //! forward with bias tiles, and, depending on the batch, the cu-blocks metadata
-//! pair (bucketed max query > 64 at GQA 4) and the split scheduler + combine
-//! (global layers, `inkling_fa4_num_splits` > 1). The profiler counts every
-//! launch. `is_local` selects the 512-token sliding window; `max_model_len`
-//! drives the global split count, so both are Config identity.
+//! pair (packed rows, bucketed max query x q heads per KV head, > 256) and the
+//! split scheduler + combine (global layers, `inkling_fa4_num_splits` > 1). The
+//! profiler counts every launch. `is_local` selects the sliding window of
+//! `rel_extent` tokens; `max_model_len` drives the global split count, so both
+//! are Config identity.
 //!
 //! The runtime input is the exact `query_context_pairs` batch. A mixed batch is
 //! one lookup, never a decode lookup plus a prefill lookup: the launches are
@@ -20,8 +21,9 @@
 //!   tile shape, the M-tile count and the ShearingBias rows. Up to 128 tokens
 //!   it is rounded up to its power-of-two bucket (at least 32): there the
 //!   bucket, not the count, decides the q_stage, the cu-blocks launches, the
-//!   split rule and the M-tile count (one tile per 64 tokens), so a 40-token
-//!   chunk runs like a 64-token one, not like the mean of 32 and 64.
+//!   split rule and the M-tile count (one tile per `128 * q_stage` packed
+//!   rows), so a 40-token chunk runs like a 64-token one, not like the mean of
+//!   32 and 64.
 //! - `equivalent_context`: the context `C` at which the canonical batch with
 //!   the same two counts has the same modelled FA4 makespan as the real batch.
 //!   The canonical batch is `num_decode_requests` decodes at context `C` and,
@@ -73,15 +75,19 @@ const CTA_OVERHEAD_TILES: f64 = 1.0;
 /// keeps the model strictly increasing where the critical path is flat (a
 /// local prefill chunk beside short decodes).
 const SHARED_WORK_WEIGHT: f64 = 0.25;
-/// Decode-request counts on the grid. 80 sits just past the first CTA wave
-/// (2 KV heads x 74 requests fill 148 SMs; B200 local decode goes 20 -> 31 us
-/// from 64 to 128 requests). 2 and 4 are left out: 1 -> 8 interpolates them
-/// within 5% (B200 global decode at max_model_len 131072, 131072 keys: 2
-/// requests 78 us measured, 83 us interpolated).
+/// Decode-request counts on the grid, placed for GQA 4 with 2 KV heads. A
+/// local decode runs one CTA per (request, KV head), so the first wave fills
+/// 148 SMs at `148 / num_kv_heads` requests; 80 sits just past it at 2 KV heads
+/// (74 requests; B200 local decode goes 20 -> 31 us from 64 to 128 requests).
+/// 2 and 4 are left out: 1 -> 8 interpolates them within 7% (B200 global
+/// decode at max_model_len 131072, 131072 keys: 2 requests 78 us measured,
+/// 83 us interpolated).
 const DECODE_AXIS: [u32; 9] = [0, 1, 8, 16, 32, 64, 80, 128, 256];
-/// Prefill-token counts: 32 and 64 bracket the q_stage switch (packed rows >
-/// 128) and the cu-blocks launch (packed rows > 256); 2048 is the step budget.
-/// No point below 32: up to 32 tokens (128 packed rows at GQA 4) a chunk is
+/// Prefill-token counts, placed for GQA 4. q_stage goes to 2 when the packed
+/// rows (bucketed tokens x q heads per KV head) exceed `TILE_M`, and the
+/// cu-blocks pair launches when they exceed 256; at GQA 4 those switches fall
+/// between 32 and 64 and between 64 and 128 tokens. 2048 is the step budget.
+/// No point below 32: at GQA 4 up to 32 tokens (128 packed rows) a chunk is
 /// one M tile at q_stage 1 whatever its size (B200 global, 4175 keys: 28.6 us
 /// at 16 tokens, 28.2 us at 32).
 const PREFILL_AXIS: [u32; 8] = [0, 32, 64, 128, 256, 512, 1024, 2048];
@@ -172,7 +178,7 @@ fn bucket(max_query: u32) -> u32 {
     max_query.max(1).next_power_of_two()
 }
 
-fn group(config: &RelBiasAttentionKernelConfig) -> u32 {
+fn q_heads_per_kv_head(config: &RelBiasAttentionKernelConfig) -> u32 {
     config.num_qo_heads.get() / config.num_kv_heads.get()
 }
 
@@ -190,7 +196,7 @@ fn num_splits(config: &RelBiasAttentionKernelConfig, batch: u32, bucket: u32) ->
     }
     let kv_heads = config.num_kv_heads.get();
     let max_kv_len = config.max_model_len;
-    let q_tiles = (bucket * group(config)).div_ceil(256);
+    let q_tiles = (bucket * q_heads_per_kv_head(config)).div_ceil(256);
     let base_ctas = batch * kv_heads * q_tiles;
     let single = q_tiles == 1 && batch == 1;
     let target = if single {
@@ -230,7 +236,7 @@ fn cta_works(
     assert!(!pairs.is_empty(), "query_context_pairs must be non-empty");
     let max_query = pairs.iter().map(|&(query, _)| query).max().unwrap();
     let bucket = bucket(max_query);
-    let g = group(config);
+    let g = q_heads_per_kv_head(config);
     let q_stage = if bucket * g > TILE_M { 2 } else { 1 };
     let tile_tokens = (TILE_M * q_stage / g).max(1);
     let splits = num_splits(config, launched.max(pairs.len() as u32), bucket);
@@ -319,7 +325,8 @@ fn decode_coordinate(
     f64::from(lo) + t * f64::from(hi - lo)
 }
 
-/// The canonical batch at a grid point; `None` for the empty batch.
+/// The canonical batch at a grid point; `None` for the empty batch. Its
+/// prefill tokens are one chunk, however many requests they came from.
 fn canonical_pairs(
     config: &RelBiasAttentionKernelConfig,
     decodes: u32,
@@ -345,6 +352,11 @@ fn project(
     pairs: &[(u32, u32)],
     padded_requests: u32,
 ) -> [f64; 3] {
+    // Known limit: several prefill requests in one step are projected as one
+    // chunk of their summed query tokens. When the real batch has less work
+    // than that chunk at C = 1 (eight fresh 256-token prompts against one
+    // 2048-token chunk), the context clamps to C = 1 and the step is
+    // overpriced.
     let (decodes, prefill) = counts(pairs);
     let prefill = prefill_coordinate(prefill);
     // Local layers never split, so padding leaves their launch unchanged.
@@ -538,7 +550,8 @@ mod tests {
         // Defect caught: a global split count that drifts from
         // inkling_fa4_num_splits, which picks the prepare/combine launches.
         let global = config(false);
-        // Decode (bucket 1): 128 // (2 B), B = 1 gets the 32-split cap.
+        // Decode (bucket 1): B = 1 gets 256 // 2 capped at 32; B >= 2 gets
+        // 128 // (2 B).
         assert_eq!(num_splits(&global, 1, 1), 32);
         assert_eq!(num_splits(&global, 2, 1), 32);
         assert_eq!(num_splits(&global, 7, 1), 9);
@@ -609,6 +622,21 @@ mod tests {
         assert_eq!((d, a), (30.0, 256.0));
         let mean = pairs.iter().map(|&(_, kv)| f64::from(kv)).sum::<f64>() / 31.0;
         assert!(c > mean + 500.0, "equivalent context {c} vs mean {mean}");
+    }
+
+    #[test]
+    fn several_prefills_project_as_one_summed_chunk() {
+        // Known limit, not a target: eight fresh 256-token prompts project as
+        // one 2048-token chunk. The real batch has less work than that chunk
+        // at C = 1, so the context clamps to 1 and the step is overpriced.
+        for is_local in [false, true] {
+            let cfg = config(is_local);
+            let pairs = vec![(256, 256); 8];
+            assert_eq!(project(&cfg, &pairs, 0), [0.0, 2048.0, 1.0]);
+            let chunk = canonical_pairs(&cfg, 0, 2048, 1).unwrap();
+            assert_eq!(chunk, [(2048, 2048)]);
+            assert!(makespan(&cfg, &pairs, 8) < makespan(&cfg, &chunk, 1));
+        }
     }
 
     #[test]
@@ -736,7 +764,10 @@ mod tests {
         assert_eq!(project(&cfg, &pairs, 9), project(&cfg, &pairs, 0));
         assert_eq!(project(&cfg, &pairs, 4), project(&cfg, &pairs, 0));
         let local = config(true);
-        assert_eq!(project(&local, &pairs[..3], 4), project(&local, &pairs[..3], 0));
+        assert_eq!(
+            project(&local, &pairs[..3], 4),
+            project(&local, &pairs[..3], 0)
+        );
     }
 
     #[test]

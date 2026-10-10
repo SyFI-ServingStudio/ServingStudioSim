@@ -6,8 +6,10 @@
 //! `sigmoid(l) + bias`, keeps the `top_k` best, and renormalizes the selected
 //! raw logits jointly with the sink logits (`sigmoid(l) / Σ sigmoid(l)`, times
 //! `route_scale` and the global scale). Output: ids and weights
-//! `[T, top_k + num_shared_experts]`, sinks last. One Triton program per token,
-//! one launch, so `num_tokens` is the only input.
+//! `[T, top_k + num_shared_experts]`, sinks last. The sinks are the model's
+//! shared experts (`num_shared_experts`): every token activates them, weighted
+//! by the same renormalization. One Triton program per token, one launch, so
+//! `num_tokens` is the only input.
 //!
 //! The grid holds every CUDA-graph capture size vLLM pads a batch to up to the
 //! 2048-token `max_num_batched_tokens` (1, 2, 4, then steps of 8 to 256 and 16
@@ -27,7 +29,8 @@ pub struct MoeSinkGateSelectKernelConfig {
     pub gpu_name: String,
     /// Experts top-k selects from.
     pub num_routed_experts: u32,
-    /// Sink experts every token activates; their logits follow the routed ones.
+    /// Shared experts, which act as sinks: every token activates them and
+    /// their logits follow the routed ones.
     pub num_shared_experts: u32,
     /// Routed experts selected per token.
     pub top_k: u32,
@@ -68,7 +71,11 @@ fn validate_config(config: &MoeSinkGateSelectKernelConfig) {
         config.logits_row_stride
     );
     // inkling_gate_select asserts fp32 logits.
-    assert_eq!(config.logits_dtype, DType::Fp32, "gate select needs fp32 logits");
+    assert_eq!(
+        config.logits_dtype,
+        DType::Fp32,
+        "gate select needs fp32 logits"
+    );
 }
 
 impl KernelSpec for MoeSinkGateSelectSpec {
@@ -116,7 +123,7 @@ register_kernel!(MoeSinkGateSelectKernel, MoeSinkGateSelectSpec);
 mod tests {
     use super::*;
 
-    fn inkling_small() -> MoeSinkGateSelectKernelConfig {
+    fn routed256_sink2_top6() -> MoeSinkGateSelectKernelConfig {
         MoeSinkGateSelectKernelConfig {
             backends: vec!["vllm_triton"],
             gpu_name: "NVIDIA B200".to_string(),
@@ -134,7 +141,7 @@ mod tests {
     /// capture size up to 2048 is a grid point, and the grid extends past it.
     #[test]
     fn grid_holds_every_cuda_graph_capture_size() {
-        let grid = MoeSinkGateSelectSpec::sweep_grid(&inkling_small());
+        let grid = MoeSinkGateSelectSpec::sweep_grid(&routed256_sink2_top6());
         let axis = &grid.axes()[0];
         let capture = [1u32, 2, 4]
             .into_iter()
@@ -151,7 +158,7 @@ mod tests {
     /// `MoeSinkGateSelectArgs` schema requires, or leaks an extra one.
     #[test]
     fn payload_matches_python_args() {
-        let cfg = inkling_small();
+        let cfg = routed256_sink2_top6();
         let grid = MoeSinkGateSelectSpec::sweep_grid(&cfg);
         let payloads = MoeSinkGateSelectSpec::enumerate(&cfg, &grid, "vllm_triton");
         let fields = payloads[3].fields();
@@ -180,7 +187,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "power of two")]
     fn rejects_a_selected_set_the_kernel_cannot_span() {
-        let mut cfg = inkling_small();
+        let mut cfg = routed256_sink2_top6();
         cfg.top_k = 5;
         MoeSinkGateSelectSpec::sweep_grid(&cfg);
     }
