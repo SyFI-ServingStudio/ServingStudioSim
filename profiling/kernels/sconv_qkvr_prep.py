@@ -115,6 +115,10 @@ DOC = KernelDoc(
         "run 5-20% faster on B200.",
         "tau values do not change the work; the runner draws them in [1, 1.3).",
         "head_dim 128, d_rel 16 and bf16 only, as the production call asserts.",
+        "Rows were measured on one conv-state layout that the args do not carry: "
+        "a per-head packed width of 2048, which is 2·head_dim + 2·hidden_size / "
+        "(the model's KV heads) padded to a power of two, measured with 512 "
+        "hidden columns per KV head. The width sets only the cache stride.",
         "TFLOPS is not computed. GB/s counts the qkvr read, q and rel-logit "
         "writes and both caches' K/V writes, not the cached conv taps.",
     ),

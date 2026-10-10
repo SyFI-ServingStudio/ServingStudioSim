@@ -252,7 +252,7 @@ def profile_moe_sink_gate_select_vllm_triton(
 
 # Anchor shapes for the full oracle: Inkling-Small (256 routed, 2 sinks, top-6,
 # stride 264) at decode and mixed-batch sizes, plus the flag variants.
-_INKLING = dict(
+_ANCHOR = dict(
     num_routed_experts=256,
     num_shared_experts=2,
     top_k=6,
@@ -261,12 +261,12 @@ _INKLING = dict(
 )
 ORACLE_ANCHORS: tuple[dict[str, Any], ...] = (
     *(
-        dict(_INKLING, num_tokens=t, has_bias=True, has_global_scale=True)
+        dict(_ANCHOR, num_tokens=t, has_bias=True, has_global_scale=True)
         for t in (1, 32, 256, 2048)
     ),
-    dict(_INKLING, num_tokens=32, has_bias=False, has_global_scale=True),
-    dict(_INKLING, num_tokens=32, has_bias=True, has_global_scale=False),
-    dict(_INKLING, num_tokens=4096, has_bias=False, has_global_scale=False),
+    dict(_ANCHOR, num_tokens=32, has_bias=False, has_global_scale=True),
+    dict(_ANCHOR, num_tokens=32, has_bias=True, has_global_scale=False),
+    dict(_ANCHOR, num_tokens=4096, has_bias=False, has_global_scale=False),
 )
 
 

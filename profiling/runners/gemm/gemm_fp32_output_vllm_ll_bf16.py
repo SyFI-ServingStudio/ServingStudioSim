@@ -11,6 +11,9 @@ itself, so the runner follows the production dispatch rather than restating it:
 - otherwise ``torch.mm(x, w.T, out_dtype=torch.float32)`` (cuBLAS, one kernel
   or a split-K pair).
 
+A shape that would take the cute-DSL tier on a host without cute-DSL raises
+``ProfilerNotImplemented`` instead of timing the torch.mm fallback.
+
 The cute-DSL kernels compile on the first call, which runs before timing.
 CUPTI counts every launch of one call, overlapping launches once.
 """
@@ -67,11 +70,27 @@ def profile_gemm_fp32_output_vllm_ll_bf16(
     m, n, k = _validate_args(m, n, k, input_dtype)
     try:
         import torch
-        from vllm.models.inkling.nvidia.moe import _linear_with_fp32_out
+        from vllm.models.inkling.nvidia.moe import (
+            _INKLING_LL_BF16_MAX_TOKENS,
+            _linear_with_fp32_out,
+            current_platform,
+            ll_bf16,
+        )
     except ImportError as exc:
         raise ProfilerNotImplemented(
             f"{_BACKEND} requires the alignment vLLM fork (vllm_upstream_fork_env)"
         ) from exc
+    # Without cute-DSL the call silently runs torch.mm where it would run
+    # ll_bf16_gemm; those rows would be cuBLAS times under this backend's label.
+    if (
+        m <= _INKLING_LL_BF16_MAX_TOKENS
+        and k % 8 == 0
+        and current_platform.has_device_capability(90)
+        and not ll_bf16.is_available()
+    ):
+        raise ProfilerNotImplemented(
+            f"{_BACKEND} requires cute-DSL (cutlass.cute) for m <= {_INKLING_LL_BF16_MAX_TOKENS}"
+        )
 
     try:
         device = torch.device("cuda", torch.cuda.current_device())

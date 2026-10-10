@@ -84,8 +84,9 @@ DOC = KernelDoc(
         f"{CUPTI_METHOD} One inkling_gate_select call is one "
         "_inkling_gate_select_kernel launch; only that kernel is counted. Every "
         "spec checks the outputs' structure (sink ids, distinct in-range routed "
-        "ids, weights summing to route_scale · gs) before timing; anchor shapes "
-        "are checked against an independent PyTorch reference."
+        "ids, weights summing to route_scale · gs) before timing. The comparison "
+        "with the independent PyTorch reference runs only on fixed anchor shapes, "
+        "through the runner's manual --oracle command, not during profiling."
     ),
     caveats=(
         "Logits are random fp32 values and the bias is synthetic; the kernel's "

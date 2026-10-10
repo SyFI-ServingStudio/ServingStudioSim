@@ -2,7 +2,7 @@
 
 Written from the layer math in the alignment fork
 (``vllm/models/inkling/nvidia/attention.py``: ``InklingShortConv`` on K and V,
-``InklingRMSNorm`` on q and k, ``compute_log_scaling_tau``, ``RelLogitsProj``)
+``InklingRMSNorm`` on q and k, the tau multiply, ``RelLogitsProj``)
 and not from ``ops/qkvr_prep.py``. It shares no code with the Triton kernels:
 the tap source is decided by absolute position (a tap at or after the
 request's first new position comes from this forward's ``qkvr``, an earlier one
@@ -139,12 +139,6 @@ def reference_prep(
     }
 
 
-def log_scaling_tau(torch: Any, positions: Any, n_floor: int, alpha: float) -> Any:
-    """The per-token log-length scale (fp32), as the model computes it."""
-    n = (positions + 1).float() / float(n_floor)
-    return 1.0 + alpha * torch.log(torch.clamp(n, min=1.0))
-
-
 def compare(torch: Any, got: Any, want: Any) -> dict[str, float]:
     """Max absolute error and max error relative to the reference's max magnitude."""
     g = got.float()
@@ -161,7 +155,6 @@ def compare(torch: Any, got: Any, want: Any) -> dict[str, float]:
 __all__ = [
     "PrepShape",
     "compare",
-    "log_scaling_tau",
     "reference_conv",
     "reference_prep",
 ]

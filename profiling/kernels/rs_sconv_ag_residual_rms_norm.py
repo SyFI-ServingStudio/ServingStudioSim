@@ -1,15 +1,15 @@
 """Fused reduce-scatter + short conv + all-gather + residual + RMSNorm.
 
-The model replaces every tensor-parallel all-reduce with one collective call,
-``LamportRSConv.rs_sconv_ag_add_norm`` (vLLM ``models/inkling/nvidia/ops/
-lamport.py``): the TP-partial sublayer output (plus the MoE sink partial) is
-reduce-scattered over the hidden dim, each rank runs the causal depthwise
-k=4 short conv with skip on its shard using the paged conv-state cache, the
-shards are all-gathered, added to the residual and RMS-normalized with the next
-sublayer's norm. It is four PDL-chained Triton launches whose cross-GPU
-spin-waits couple them, so the kind times the whole call as one unit. No
-all-reduce kind fits: the comm pattern, the conv-state cache semantics and the
-launch boundary all differ.
+One collective call, ``LamportRSConv.rs_sconv_ag_add_norm`` (vLLM
+``models/inkling/nvidia/ops/lamport.py``), runs a reduce-scatter, a short conv,
+an all-gather, a residual add and an RMSNorm: the TP-partial sublayer output
+(plus the MoE sink partial) is reduce-scattered over the hidden dim, each rank
+runs the causal depthwise k=4 short conv with skip on its shard using the paged
+conv-state cache, the shards are all-gathered, added to the residual and
+RMS-normalized with the next sublayer's norm. It is four PDL-chained Triton
+launches whose cross-GPU spin-waits couple them, so the kind times the whole
+call as one unit. No all-reduce kind fits: the comm pattern, the conv-state
+cache semantics and the launch boundary all differ.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ class RsSconvAgResidualRmsNormArgs(KernelArgs):
     num_gpus: int = arg(unit="GPUs", doc="GPUs in the tensor-parallel group.")
     num_tokens: int = arg(
         unit="tokens",
-        doc="Token rows on every GPU (the padded CUDA-graph batch); one token runs 8-way split.",
+        doc="Token rows on every GPU (the padded CUDA-graph batch).",
     )
     hidden_dim: int = arg(
         unit="elements", doc="Model hidden size; each GPU owns hidden_dim / num_gpus."
@@ -60,7 +60,8 @@ DOC = KernelDoc(
         "GPU's hidden shard, gather it back, add the residual and RMS-normalize."
     ),
     description=(
-        "The TP collective after every attention and MLP sublayer. Each GPU "
+        "One fused call: reduce-scatter, short conv, all-gather, residual add "
+        "and RMSNorm. Each GPU "
         "publishes its partial (plus the MoE sink partial when has_shared) to the "
         "shard owners through symmetric memory; each owner sums them, writes the "
         "result into the paged conv-state cache, applies the causal depthwise "
@@ -91,6 +92,11 @@ DOC = KernelDoc(
         "before an MoE call).",
         "algbw and busbw divide the reduce-scatter input size by the whole call's "
         "time, so they include the conv, residual and norm work.",
+        "The 30 calls in a graph reuse the same buffers with no L2 clear between "
+        "them, so the inputs and the conv-cache rows are L2-warm.",
+        "Rows were measured on one conv-state layout that the args do not carry: "
+        "8 KV heads of head_dim 128 (per-head width 2·128 + 2·hidden_dim/8, padded "
+        "to a power of two), so num_gpus is at most 8.",
     ),
     reference="profiling.runners.comm.rs_sconv_ag_residual_rms_norm_reference",
 )

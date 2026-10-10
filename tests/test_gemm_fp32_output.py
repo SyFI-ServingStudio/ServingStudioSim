@@ -125,3 +125,27 @@ def test_ll_bf16_rejects_unbuilt_dtype_and_empty_shapes(
 
     with pytest.raises(error):
         profile_gemm_fp32_output_vllm_ll_bf16(*arguments)
+
+
+def test_ll_bf16_rejects_the_cute_dsl_tier_without_cute_dsl(monkeypatch) -> None:
+    # The production call would run torch.mm at m <= 64 and the row would be a
+    # cuBLAS time under the ll_bf16 label.
+    import sys
+
+    from profiling.runners.gemm.gemm_fp32_output_vllm_ll_bf16 import (
+        profile_gemm_fp32_output_vllm_ll_bf16,
+    )
+
+    def unexpected_call(*_args):
+        raise AssertionError("the GEMM must not run")
+
+    fake_moe = SimpleNamespace(
+        _INKLING_LL_BF16_MAX_TOKENS=64,
+        _linear_with_fp32_out=unexpected_call,
+        current_platform=SimpleNamespace(has_device_capability=lambda capability: True),
+        ll_bf16=SimpleNamespace(is_available=lambda: False),
+    )
+    monkeypatch.setitem(sys.modules, "vllm.models.inkling.nvidia.moe", fake_moe)
+
+    with pytest.raises(ProfilerNotImplemented, match="cute-DSL"):
+        profile_gemm_fp32_output_vllm_ll_bf16(64, 264, 4096, "bf16")

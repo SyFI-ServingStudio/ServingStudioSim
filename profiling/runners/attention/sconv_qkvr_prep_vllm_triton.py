@@ -56,9 +56,11 @@ _MAX_TOKENS = 65_536
 # rows stay valid for any max_model_len, including 131072.
 _MAX_POSITION = 8192
 _EPS = 1e-6
-# Per-head packed width of the conv-state cache: K | V | attn-out | mlp-out,
-# padded to a power of two (sconv_swa_attn.py). 2048 for Inkling-Small at TP4;
-# it only sets a stride.
+# Measured-layout constant: the per-head packed width of the conv-state cache,
+# K | V | attn-out | mlp-out = 2 * head_dim + 2 * hidden / num_kv_heads padded
+# to a power of two (sconv_swa_attn.py), independent of TP. Every row was
+# measured at 2048 (head_dim 128, hidden / num_kv_heads 512); it only sets a
+# stride, and the kind's args do not carry it.
 _CONV_HEAD_WIDTH = 2048
 _SEED = 0x1A7C
 _KV_POISON = 77.0
@@ -431,7 +433,7 @@ def profile_sconv_qkvr_prep_vllm_triton(
     page_size: int,
     dtype: object,
 ) -> ComputeMetrics:
-    """Time one ``fused_qkvr_prep`` call (CUDA-graph replay, wall span)."""
+    """Time one ``fused_qkvr_prep`` call (CUDA-graph replay, interval union)."""
     _validate_args(
         num_tokens,
         num_q_heads,

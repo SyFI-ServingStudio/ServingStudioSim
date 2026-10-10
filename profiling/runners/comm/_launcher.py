@@ -148,40 +148,7 @@ class VllmLauncher(MultiGpuLauncher):
         self.master_port = master_port or _find_free_port()
 
     def run(self, per_rank_fn: Callable[..., Any], **kwargs) -> Any:
-        try:
-            import torch.multiprocessing as mp
-        except ImportError as exc:
-            raise ProfilerNotImplemented("torch.multiprocessing is unavailable") from exc
-
-        context = mp.get_context("spawn")
-        result_queue = context.SimpleQueue()
-        try:
-            mp.spawn(
-                _vllm_mp_entry,
-                args=(
-                    self.num_gpus,
-                    self.master_addr,
-                    self.master_port,
-                    per_rank_fn,
-                    kwargs,
-                    result_queue,
-                ),
-                nprocs=self.num_gpus,
-                join=True,
-            )
-        except Exception as exc:
-            if not result_queue.empty():
-                ok, error_kind, payload = result_queue.get()
-                if not ok:
-                    _raise_remote_error(error_kind, payload)
-            raise KernelLaunchFailed(str(exc)) from exc
-
-        if result_queue.empty():
-            raise KernelLaunchFailed("vLLM rank group returned no result")
-        ok, error_kind, payload = result_queue.get()
-        if not ok:
-            _raise_remote_error(error_kind, payload)
-        return payload
+        return _spawn_vllm_ranks(self, _vllm_mp_entry, "vLLM rank group", per_rank_fn, kwargs)
 
 
 class VllmTpGroupLauncher(MultiGpuLauncher):
@@ -209,40 +176,57 @@ class VllmTpGroupLauncher(MultiGpuLauncher):
         self.master_port = master_port or _find_free_port()
 
     def run(self, per_rank_fn: Callable[..., Any], **kwargs) -> Any:
-        try:
-            import torch.multiprocessing as mp
-        except ImportError as exc:
-            raise ProfilerNotImplemented("torch.multiprocessing is unavailable") from exc
+        return _spawn_vllm_ranks(
+            self, _vllm_tp_group_entry, "vLLM TP rank group", per_rank_fn, kwargs
+        )
 
-        context = mp.get_context("spawn")
-        result_queue = context.SimpleQueue()
-        try:
-            mp.spawn(
-                _vllm_tp_group_entry,
-                args=(
-                    self.num_gpus,
-                    self.master_addr,
-                    self.master_port,
-                    per_rank_fn,
-                    kwargs,
-                    result_queue,
-                ),
-                nprocs=self.num_gpus,
-                join=True,
-            )
-        except Exception as exc:
-            if not result_queue.empty():
-                ok, error_kind, payload = result_queue.get()
-                if not ok:
-                    _raise_remote_error(error_kind, payload)
-            raise KernelLaunchFailed(str(exc)) from exc
 
-        if result_queue.empty():
-            raise KernelLaunchFailed("vLLM TP rank group returned no result")
-        ok, error_kind, payload = result_queue.get()
-        if not ok:
-            _raise_remote_error(error_kind, payload)
-        return payload
+def _spawn_vllm_ranks(
+    launcher: VllmLauncher | VllmTpGroupLauncher,
+    entry: Callable[..., None],
+    group: str,
+    per_rank_fn: Callable[..., Any],
+    kwargs: dict[str, Any],
+) -> Any:
+    """Spawn ``entry`` on every rank and return rank 0's payload.
+
+    A failing rank's typed error is re-raised here, also when ``mp.spawn``
+    itself raised.
+    """
+    try:
+        import torch.multiprocessing as mp
+    except ImportError as exc:
+        raise ProfilerNotImplemented("torch.multiprocessing is unavailable") from exc
+
+    context = mp.get_context("spawn")
+    result_queue = context.SimpleQueue()
+    try:
+        mp.spawn(
+            entry,
+            args=(
+                launcher.num_gpus,
+                launcher.master_addr,
+                launcher.master_port,
+                per_rank_fn,
+                kwargs,
+                result_queue,
+            ),
+            nprocs=launcher.num_gpus,
+            join=True,
+        )
+    except Exception as exc:
+        if not result_queue.empty():
+            ok, error_kind, payload = result_queue.get()
+            if not ok:
+                _raise_remote_error(error_kind, payload)
+        raise KernelLaunchFailed(str(exc)) from exc
+
+    if result_queue.empty():
+        raise KernelLaunchFailed(f"{group} returned no result")
+    ok, error_kind, payload = result_queue.get()
+    if not ok:
+        _raise_remote_error(error_kind, payload)
+    return payload
 
 
 def _vllm_tp_group_entry(

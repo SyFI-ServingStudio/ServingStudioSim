@@ -51,9 +51,10 @@ SUPPORTED_CONV_KERNEL_SIZE = 4
 # ``lamport._MAX_TOKENS``: the symmetric buffers hold at most this many tokens.
 MAX_TOKENS = 16384
 
-# Defaults for the model config values that fix the conv-state cache layout
-# (``num_key_value_heads``, ``head_dim``) and the norm epsilon. The kind's args
-# do not carry them: adding a field would rehash every measured row.
+# Measured-layout constants: every row was measured on a conv-state cache of
+# 8 KV heads (``num_key_value_heads``) of head_dim 128, which allows TP <= 8,
+# with norm epsilon 1e-6. The kind's args do not carry them: adding a field
+# would rehash every measured row.
 CONV_STATE_NUM_KV_HEADS = 8
 CONV_STATE_HEAD_DIM = 128
 RMS_NORM_EPS = 1e-6

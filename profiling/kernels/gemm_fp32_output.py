@@ -59,8 +59,9 @@ DOC = KernelDoc(
         "whose kernel (cuBLAS, HPC-Ops or DeepGEMM) is chosen by "
         "SGLANG_OPT_BF16_FP32_GEMM_ALGO in the profiling environment.",
         "vllm_ll_bf16_auto switches kernels at m = 64 (cute-DSL ll_bf16 at "
-        "or below, cuBLAS above) and at m = 4 (dot-product below, split-K above), "
-        "so its time is not smooth across those points.",
+        "or below, cuBLAS above); within ll_bf16 it runs the dot-product kernel "
+        "when m ≤ 4 or k < 2048 and split-K otherwise, so its time is not smooth "
+        "across those points.",
     ),
     # The measured library calls have no separate PyTorch reference module.
     reference=None,
