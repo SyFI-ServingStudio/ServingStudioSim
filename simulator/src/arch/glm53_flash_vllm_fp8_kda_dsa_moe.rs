@@ -1377,36 +1377,42 @@ pub(crate) fn hybrid_block_tokens(kda_state_page_bytes: u64, mla_bytes_per_token
 impl Glm53FlashVllmModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
+        let root = self.compile_root(&mut builder);
+        builder.finish(root)
+    }
+
+    /// The whole forward as one node in `builder`, so a speculative model can
+    /// compile it beside its draft stage. [`Self::eval_into`] fills it.
+    pub(crate) fn compile_root(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let mut children = vec![
-            self.embedding.compile(&mut builder),
-            self.embedding_all_reduce.compile(&mut builder),
-            self.hc_expand.compile(&mut builder),
+            self.embedding.compile(builder),
+            self.embedding_all_reduce.compile(builder),
+            self.hc_expand.compile(builder),
         ];
         for group in &self.groups {
-            children.push(group.compile(&mut builder));
+            children.push(group.compile(builder));
         }
         children.extend([
-            self.terminal_post.compile(&mut builder),
-            self.hc_contract_mean.compile(&mut builder),
-            self.final_norm.compile(&mut builder),
-            self.lm_head.compile(&mut builder),
+            self.terminal_post.compile(builder),
+            self.hc_contract_mean.compile(builder),
+            self.final_norm.compile(builder),
+            self.lm_head.compile(builder),
         ]);
         let layout = if self.enable_expert_parallel {
             format!("TP=EP{}", self.tp_size)
         } else {
             format!("TP{} with MoE TP{}", self.tp_size, self.tp_size)
         };
-        let root = CostNode::Labeled {
+        CostNode::Labeled {
             label: format!(
                 "{} (Glm53FlashVllmModel) [{layout}; timing_context<={}]",
                 self.name, self.max_model_len
             ),
             child: Box::new(CostNode::Sum(children)),
-        };
-        builder.finish(root)
+        }
     }
 
-    fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
+    pub(crate) fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
         let batch = normalize_input(input, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid Glm53FlashVllmModel input: {reason}"));
         let tokens = graph_padded_tokens(&self.cudagraph_capture_sizes, batch.total_tokens);

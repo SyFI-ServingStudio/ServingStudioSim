@@ -79,22 +79,24 @@ pub struct Dflash2DraftResolved {
 
 /// The proposer: one context-KV precomputation, `num_draft_layers` identical
 /// decoder layers, and the selector head.
-struct Dflash2DraftStage {
-    name: String,
+pub(crate) struct Dflash2DraftStage {
+    pub(crate) name: String,
     num_draft_layers: u32,
     sliding_window: u32,
     context_kv: Dflash2ContextKvLocalWorklet,
     draft_attn: Dflash2DraftAttnLocalWorklet,
     draft_ffn: Dflash2DraftFfnLocalWorklet,
     selector: Dflash2SelectorLocalWorklet,
-    attn_allreduce: Op<AllReduceKernel>,
-    ffn_allreduce: Op<AllReduceKernel>,
+    /// `None` on a single-rank draft (an attention-DP rank), which reduces
+    /// nothing.
+    attn_allreduce: Option<Op<AllReduceKernel>>,
+    ffn_allreduce: Option<Op<AllReduceKernel>>,
     /// Each collective reduces one hidden vector per query row.
     allreduce_bytes_per_token: u32,
 }
 
 impl Dflash2DraftStage {
-    fn build(
+    pub(crate) fn build(
         name: String,
         resolved: &Dflash2DraftResolved,
         bridge: &PerfApiBridge,
@@ -119,18 +121,27 @@ impl Dflash2DraftStage {
             resolved.selector.clone(),
             bridge,
         )?;
-        let attn_allreduce = build_atomic(
-            format!("{name}.layer.attn_allreduce"),
-            resolved.tp_allreduce.clone(),
-            AllReduceKernel::build,
-            bridge,
-        )?;
-        let ffn_allreduce = build_atomic(
-            format!("{name}.layer.ffn_allreduce"),
-            resolved.tp_allreduce.clone(),
-            AllReduceKernel::build,
-            bridge,
-        )?;
+        let reduces = resolved.tp_allreduce.num_gpus > 1;
+        let attn_allreduce = reduces
+            .then(|| {
+                build_atomic(
+                    format!("{name}.layer.attn_allreduce"),
+                    resolved.tp_allreduce.clone(),
+                    AllReduceKernel::build,
+                    bridge,
+                )
+            })
+            .transpose()?;
+        let ffn_allreduce = reduces
+            .then(|| {
+                build_atomic(
+                    format!("{name}.layer.ffn_allreduce"),
+                    resolved.tp_allreduce.clone(),
+                    AllReduceKernel::build,
+                    bridge,
+                )
+            })
+            .transpose()?;
         Ok(Self {
             name,
             num_draft_layers: resolved.context_kv.raw_cfg.num_draft_layers,
@@ -153,8 +164,16 @@ impl Dflash2DraftStage {
         })
     }
 
-    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+    pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let layers = self.num_draft_layers;
+        let mut layer = vec![self.draft_attn.compile(builder)];
+        if let Some(op) = &self.attn_allreduce {
+            layer.push(op.compile(builder));
+        }
+        layer.push(self.draft_ffn.compile(builder));
+        if let Some(op) = &self.ffn_allreduce {
+            layer.push(op.compile(builder));
+        }
         CostNode::Sum(vec![
             CostNode::Labeled {
                 label: format!(
@@ -174,12 +193,7 @@ impl Dflash2DraftStage {
                 // over advancing contexts the way a recurrent proposer needs.
                 child: Box::new(CostNode::Scale {
                     n: layers,
-                    child: Box::new(CostNode::Sum(vec![
-                        self.draft_attn.compile(builder),
-                        self.attn_allreduce.compile(builder),
-                        self.draft_ffn.compile(builder),
-                        self.ffn_allreduce.compile(builder),
-                    ])),
+                    child: Box::new(CostNode::Sum(layer)),
                 }),
             },
             CostNode::Labeled {
@@ -191,22 +205,41 @@ impl Dflash2DraftStage {
 
     fn eval(&self, batch: &NormalizedBatch, draft_tokens: u32, ev: &mut Evaluator) {
         let group = &batch.groups[0];
+        self.eval_group(
+            group.request_count,
+            group.batch_tokens,
+            &group.endpoint_context_lens,
+            draft_tokens,
+            ev,
+        );
+    }
+
+    /// One rank's draft call: `request_count` requests drafting over
+    /// `batch_tokens` target rows this step, each ending at the matching entry
+    /// of `endpoint_context_lens`.
+    pub(crate) fn eval_group(
+        &self,
+        request_count: u32,
+        batch_tokens: u32,
+        endpoint_context_lens: &[u32],
+        draft_tokens: u32,
+        ev: &mut Evaluator,
+    ) {
         let query_width = draft_tokens.saturating_add(1);
-        let query_tokens = group.request_count.saturating_mul(query_width);
+        let query_tokens = request_count.saturating_mul(query_width);
 
         // The proposer consumes the target's hidden states for every row this
         // step scheduled -- prefilling and verifying alike.
         self.context_kv.eval(
             &Dflash2ContextKvLocalWorkletInput {
-                context_tokens: group.batch_tokens,
+                context_tokens: batch_tokens,
             },
             ev,
         );
 
         // One rectangle per request: the whole query block against the context
         // the sliding window admits.
-        let rectangles = group
-            .endpoint_context_lens
+        let rectangles = endpoint_context_lens
             .iter()
             .map(|&context| (query_width, context.min(self.sliding_window)))
             .collect::<Vec<_>>();
@@ -217,26 +250,30 @@ impl Dflash2DraftStage {
             },
             ev,
         );
-        eval_atomic_or_zero(
-            &self.attn_allreduce,
-            self.allreduce_input(query_tokens),
-            query_tokens == 0,
-            ev,
-        );
+        if let Some(op) = &self.attn_allreduce {
+            eval_atomic_or_zero(
+                op,
+                self.allreduce_input(query_tokens),
+                query_tokens == 0,
+                ev,
+            );
+        }
         self.draft_ffn
             .eval(&Dflash2DraftFfnLocalWorkletInput { query_tokens }, ev);
-        eval_atomic_or_zero(
-            &self.ffn_allreduce,
-            self.allreduce_input(query_tokens),
-            query_tokens == 0,
-            ev,
-        );
+        if let Some(op) = &self.ffn_allreduce {
+            eval_atomic_or_zero(
+                op,
+                self.allreduce_input(query_tokens),
+                query_tokens == 0,
+                ev,
+            );
+        }
 
         // Only drafted positions reach the selector; the bonus token is the
         // target's, not a proposal.
         self.selector.eval(
             &Dflash2SelectorLocalWorkletInput {
-                scored_rows: group.request_count.saturating_mul(draft_tokens),
+                scored_rows: request_count.saturating_mul(draft_tokens),
             },
             ev,
         );

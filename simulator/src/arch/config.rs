@@ -145,6 +145,10 @@ const fn default_dflash2_draft_tokens() -> u32 {
 }
 
 /// `sliding_window` in the DFlash2 draft checkpoint.
+const fn default_dflash2_kv_full_attention() -> bool {
+    true
+}
+
 const fn default_dflash2_sliding_window() -> u32 {
     2048
 }
@@ -963,6 +967,109 @@ pub enum IterArchSel {
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
     },
+    /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`] verifying a DFlash2 proposer's
+    /// drafts: each verify row is billed as a decode row, and the proposer is
+    /// the GLM-5.3 DFlash2 draft. Not aligned against a capture.
+    Glm53FlashVllmNvfp4KdaDsaMoeDflash2 {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        #[serde(default = "default_glm53_flash_enable_expert_parallel")]
+        #[param(default = true, cache_key)]
+        enable_expert_parallel: bool,
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`, as for the base Flash graph.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+        /// Candidate positions drafted per request per iteration. Fixes the
+        /// verify width at `draft_tokens + 1`.
+        #[serde(default = "default_dflash2_draft_tokens")]
+        #[param(default = 7, cache_key)]
+        draft_tokens: u32,
+        /// The draft's own attention window (caps the context each draft query
+        /// attends to).
+        #[serde(default = "default_dflash2_sliding_window")]
+        #[param(default = 2048, cache_key)]
+        draft_sliding_window: u32,
+        /// True: the draft's KV grows with every token, as vLLM allocated it
+        /// for GLM-5.3 (page sizes not unifiable, window layers held as full
+        /// attention). False: only `draft_sliding_window` tokens of it per request.
+        #[serde(default = "default_dflash2_kv_full_attention")]
+        #[param(default = true, cache_key)]
+        draft_kv_full_attention: bool,
+    },
+    /// [`Self::Glm53FlashVllmNvfp4DpAttnEpMoe`] verifying a DFlash2 proposer's
+    /// drafts, one TP1 proposer per attention DP rank. See
+    /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoeDflash2`].
+    Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`, as for the base Flash graph.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+        /// Candidate positions drafted per request per iteration. Fixes the
+        /// verify width at `draft_tokens + 1`.
+        #[serde(default = "default_dflash2_draft_tokens")]
+        #[param(default = 7, cache_key)]
+        draft_tokens: u32,
+        /// The draft's own attention window (caps the context each draft query
+        /// attends to).
+        #[serde(default = "default_dflash2_sliding_window")]
+        #[param(default = 2048, cache_key)]
+        draft_sliding_window: u32,
+        /// True: the draft's KV grows with every token, as vLLM allocated it
+        /// for GLM-5.3 (page sizes not unifiable, window layers held as full
+        /// attention). False: only `draft_sliding_window` tokens of it per request.
+        #[serde(default = "default_dflash2_kv_full_attention")]
+        #[param(default = true, cache_key)]
+        draft_kv_full_attention: bool,
+    },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
     /// TP, so there is no expert-parallel or NVLink-domain selector.
@@ -1023,6 +1130,8 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4KdaDsaMoe { model, .. }
             | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { model, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { model, .. }
+            | Self::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { model, .. }
+            | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
         }
     }
@@ -1044,6 +1153,8 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4KdaDsaMoe { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { max_model_len, .. }
+            | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { max_model_len, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. } => Ok(*max_model_len),
             Self::DeepseekV41Vllm {
                 model,
