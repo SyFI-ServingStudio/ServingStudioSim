@@ -5,8 +5,9 @@
 //! - the **target** is the ordinary GLM-5.3-Flash graph, either the TP/EP one
 //!   ([`Glm53FlashVllmModel`]) or the DP-attention/EP one
 //!   ([`Glm53FlashDpAttnEpModel`]), compiled unchanged;
-//! - the **proposer** is the GLM-5.3 [`Dflash2DraftStage`], one per attention
-//!   DP rank.
+//! - the **proposer** is the `incoai/GLM-5.3-Flash-DFlash2` checkpoint
+//!   (five GQA layers, hidden 4096, block 8) priced through the shared
+//!   [`Dflash2DraftStage`], one per attention DP rank.
 //!
 //! # The verify pass is billed as decode rows
 //!
@@ -21,12 +22,16 @@
 //! row, where a multi-query kernel would read them once. Nothing here was
 //! aligned against a speculative Flash capture.
 //!
-//! # The proposer is the GLM-5.3 one
+//! # The proposer
 //!
-//! No DFlash2 checkpoint for Flash is modeled; the draft keeps the GLM-5.3
-//! proposer's dimensions (hidden 6144, six GQA layers) so its profiled rows are
-//! reused. Under attention DP each rank drafts its own requests at TP1, and the
-//! ranks draft concurrently, so the draft costs the slowest rank's call.
+//! Under attention DP each rank drafts its own requests at TP1, and the ranks
+//! draft concurrently, so the draft costs the slowest rank's call. Every draft
+//! layer attends a 2048-token sliding window, and the draft's KV is held as
+//! that window per request: the store charges it beside the KDA state, not per
+//! context token. (vLLM's GLM-5.3 build allocated the window layers as full
+//! attention because their pages could not be unified with the MLA latent; that
+//! fallback needs every layer to be attention and is unavailable beside KDA, so
+//! a Flash engine pages the draft as its own group.)
 
 use crate::arch::contract::{
     ArchGroupInput, IterwiseUnifiedModel, SpeculativeArchInput, SpeculativeUnifiedModel,
@@ -80,10 +85,8 @@ pub struct Glm53FlashVllmNvfp4Dflash2Model<T> {
     /// assumes this depth.
     draft_tokens: u32,
     max_model_len: u32,
-    /// The draft's per-token KV, summed over one group's attention shards, as
-    /// the worker's capacity contract counts the target's.
-    draft_kv_bytes_per_token: u64,
-    /// The draft's KV held per request instead, when its window caps it.
+    /// The draft's sliding-window KV held per request, summed over one group's
+    /// attention shards as the worker's capacity contract counts the target's.
     draft_kv_bytes_per_request: u64,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
@@ -242,7 +245,7 @@ impl<T: Glm53FlashVerifyTarget> SpeculativeUnifiedModel for Glm53FlashVllmNvfp4D
     }
 
     fn total_kv_bytes_per_token(&self) -> u64 {
-        self.target.total_kv_bytes_per_token() + self.draft_kv_bytes_per_token
+        self.target.total_kv_bytes_per_token()
     }
 
     fn recurrent_state_bytes_per_request(&self) -> u64 {
@@ -305,18 +308,14 @@ impl<T: Glm53FlashVerifyTarget> SpeculativeUnifiedModel for Glm53FlashVllmNvfp4D
     }
 }
 
-/// Wrap a built Flash `target` with one DFlash2 proposer per attention DP group.
-///
-/// `draft_kv_full_attention` true bills the draft's KV per token, uncapped by
-/// its window, as vLLM allocated it for GLM-5.3 (`KV cache page sizes cannot be
-/// unified`); false holds `sliding_window` tokens of it per request instead.
+/// Wrap a built Flash `target` with one DFlash2 proposer per attention DP group,
+/// holding `draft.sliding_window` tokens of the draft's KV per request.
 pub fn build<T: Glm53FlashVerifyTarget>(
     name: &str,
     target: T,
     max_model_len: u32,
     draft_tokens: u32,
     draft: &Dflash2DraftResolved,
-    draft_kv_full_attention: bool,
     bridge: &PerfApiBridge,
 ) -> Result<Glm53FlashVllmNvfp4Dflash2Model<T>, BuildError> {
     if draft_tokens == 0 {
@@ -329,18 +328,17 @@ pub fn build<T: Glm53FlashVerifyTarget>(
     let drafts = (0..groups)
         .map(|_| Dflash2DraftStage::build(format!("{name}.dflash2"), draft, bridge))
         .collect::<Result<Vec<_>, _>>()?;
-    let draft_bytes = draft_kv_bytes_per_token(draft)?;
-    let (draft_kv_bytes_per_token, draft_kv_bytes_per_request) = if draft_kv_full_attention {
-        (draft_bytes, 0)
-    } else {
-        (0, draft_bytes * u64::from(draft.sliding_window))
-    };
+    let draft_kv_bytes_per_request = draft_kv_bytes_per_token(draft)?
+        .checked_mul(u64::from(draft.sliding_window))
+        .ok_or_else(|| BuildError::FitFailed {
+            kind: ARCH_KIND,
+            reason: "DFlash2 draft window KV overflows u64".to_string(),
+        })?;
     let mut model = Glm53FlashVllmNvfp4Dflash2Model {
         target,
         drafts,
         draft_tokens,
         max_model_len,
-        draft_kv_bytes_per_token,
         draft_kv_bytes_per_request,
         cost_flat: Vec::new(),
         n_slots: 0,

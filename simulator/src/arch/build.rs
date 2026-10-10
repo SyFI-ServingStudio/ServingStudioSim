@@ -50,6 +50,7 @@ use crate::timing::kernels::AllReduceKernelConfig;
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::ExpertDemand;
 use crate::timing::{Dim, PerfApiBridge};
+use crate::worklet::dflash2_checkpoint::{Dflash2Checkpoint, GLM53_DFLASH2, GLM53_FLASH_DFLASH2};
 use crate::worklet::{
     Dflash2ContextKvLocalWorklet, Dflash2ContextKvLocalWorkletConfig, Dflash2DraftAttnLocalWorklet,
     Dflash2DraftFfnLocalWorklet, Dflash2DraftLayerLocalWorkletConfig, Dflash2SelectorLocalWorklet,
@@ -1590,17 +1591,22 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
     )
     .context("expanding GLM NVFP4 target configs for a DFlash2 deployment")?;
     let resolved = glm52_vllm_nvfp4_dsa_moe::resolve_configs(&configs);
-    let draft = dflash2_draft_resolved(ep_size, gpu, draft_tokens, draft_sliding_window)
-        .context("expanding the DFlash2 draft configs")?;
+    let draft = dflash2_draft_resolved(
+        &GLM53_DFLASH2,
+        ep_size,
+        gpu,
+        draft_tokens,
+        draft_sliding_window,
+    )
+    .context("expanding the DFlash2 draft configs")?;
     glm53_vllm_nvfp4_dsa_moe_dflash2::build_dflash2(name.to_string(), resolved, draft, bridge)
         .context("building GLM-5.3 NVFP4 + DFlash2 (often a missing profile.db row)")
 }
 
-/// The DFlash2 draft checkpoint's dimensions, from its own `config.json`:
-/// 6 layers, hidden 6144, intermediate 12288, 64 query / 8 KV heads at
-/// head_dim 128, vocab 154880, `conv_kernel_size` 2, `conv_group_size` 16,
-/// `selector_rank` 256, `selector_top_k` 16, and six `target_layer_ids`.
+/// One DFlash2 draft checkpoint's worklet configs at `tp_size`, every shape
+/// taken from the checkpoint's own `config.json` (see [`Dflash2Checkpoint`]).
 fn dflash2_draft_resolved(
+    checkpoint: &Dflash2Checkpoint,
     tp_size: u16,
     gpu: &str,
     draft_tokens: u32,
@@ -1623,13 +1629,13 @@ fn dflash2_draft_resolved(
         attention_backends: vec!["fa2"],
         tp_size,
         gpu_name: gpu_name.clone(),
-        hidden_dim: Dim::param("dflash2_hidden", 6144),
-        intermediate_dim: Dim::param("dflash2_intermediate", 12288),
-        num_qo_heads: Dim::param("dflash2_qo_heads", 64),
-        num_kv_heads: Dim::param("dflash2_kv_heads", 8),
-        head_dim: Dim::param("dflash2_head_dim", 128),
-        conv_taps: 2,
-        conv_group_size: 16,
+        hidden_dim: Dim::param("dflash2_hidden", checkpoint.hidden_dim),
+        intermediate_dim: Dim::param("dflash2_intermediate", checkpoint.intermediate_dim),
+        num_qo_heads: Dim::param("dflash2_qo_heads", checkpoint.num_qo_heads),
+        num_kv_heads: Dim::param("dflash2_kv_heads", checkpoint.num_kv_heads),
+        head_dim: Dim::param("dflash2_head_dim", checkpoint.head_dim),
+        conv_taps: checkpoint.conv_taps,
+        conv_group_size: checkpoint.conv_group_size,
         dtype: DType::Bf16,
         gemm_dtype: DType::Bf16,
         attn_q_dtype: DType::Bf16,
@@ -1642,11 +1648,11 @@ fn dflash2_draft_resolved(
         kv_cache_append_backends: vec!["vllm_cuda"],
         tp_size,
         gpu_name: gpu_name.clone(),
-        hidden_dim: Dim::param("dflash2_hidden", 6144),
-        num_draft_layers: 6,
-        num_aux_layers: 6,
-        num_kv_heads: Dim::param("dflash2_kv_heads", 8),
-        head_dim: Dim::param("dflash2_head_dim", 128),
+        hidden_dim: Dim::param("dflash2_hidden", checkpoint.hidden_dim),
+        num_draft_layers: checkpoint.num_draft_layers,
+        num_aux_layers: checkpoint.num_aux_layers,
+        num_kv_heads: Dim::param("dflash2_kv_heads", checkpoint.num_kv_heads),
+        head_dim: Dim::param("dflash2_head_dim", checkpoint.head_dim),
         kv_cache_block_size: 64,
         kv_cache_layout: "NHD".to_string(),
         kv_scale_granularity: "tensor".to_string(),
@@ -1664,10 +1670,10 @@ fn dflash2_draft_resolved(
         topk_backends: vec!["flashinfer", "torch"],
         tp_size,
         gpu_name: gpu_name.clone(),
-        hidden_dim: Dim::param("dflash2_hidden", 6144),
-        vocab_size: Dim::param("dflash2_vocab", 154880),
-        selector_rank: 256,
-        selector_top_k: 16,
+        hidden_dim: Dim::param("dflash2_hidden", checkpoint.hidden_dim),
+        vocab_size: Dim::param("dflash2_vocab", checkpoint.vocab_size),
+        selector_rank: checkpoint.selector_rank,
+        selector_top_k: checkpoint.selector_top_k,
         dtype: DType::Bf16,
         gemm_dtype: DType::Bf16,
     };
@@ -1684,6 +1690,31 @@ fn dflash2_draft_resolved(
             fabric: Fabric::Nvlink,
         },
     })
+}
+
+/// The `incoai/GLM-5.3-Flash-DFlash2` draft at `tp_size`. Its block is 8, so
+/// it drafts exactly 7 tokens; its window is the checkpoint's.
+fn glm53_flash_dflash2_draft(
+    tp_size: u16,
+    gpu: &str,
+    draft_tokens: u32,
+) -> Result<Dflash2DraftResolved> {
+    let checkpoint = &GLM53_FLASH_DFLASH2;
+    anyhow::ensure!(
+        draft_tokens == checkpoint.draft_tokens(),
+        "the {} draft has block_size {} and drafts {} tokens, not {draft_tokens}",
+        checkpoint.name,
+        checkpoint.block_size,
+        checkpoint.draft_tokens()
+    );
+    dflash2_draft_resolved(
+        checkpoint,
+        tp_size,
+        gpu,
+        draft_tokens,
+        checkpoint.sliding_window,
+    )
+    .context("expanding the DFlash2 draft configs")
 }
 
 /// GLM-5.3-Flash NVFP4 (TP/EP graph) verifying a DFlash2 proposer. The target
@@ -1706,8 +1737,6 @@ pub fn glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(
         token_corpus_file,
         cudagraph_capture_sizes,
         draft_tokens,
-        draft_sliding_window,
-        draft_kv_full_attention,
         ..
     } = sel
     else {
@@ -1729,15 +1758,13 @@ pub fn glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(
         name,
         bridge,
     )?;
-    let draft = dflash2_draft_resolved(*tp_size, gpu, *draft_tokens, *draft_sliding_window)
-        .context("expanding the DFlash2 draft configs")?;
+    let draft = glm53_flash_dflash2_draft(*tp_size, gpu, *draft_tokens)?;
     glm53_flash_vllm_nvfp4_dflash2::build(
         name,
         target,
         *max_model_len,
         *draft_tokens,
         &draft,
-        *draft_kv_full_attention,
         bridge,
     )
     .context("building GLM-5.3-Flash NVFP4 + DFlash2 (often a missing profile.db row)")
@@ -1765,8 +1792,6 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         token_corpus_file,
         cudagraph_capture_sizes,
         draft_tokens,
-        draft_sliding_window,
-        draft_kv_full_attention,
         ..
     } = sel
     else {
@@ -1787,15 +1812,13 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         name,
         bridge,
     )?;
-    let draft = dflash2_draft_resolved(1, gpu, *draft_tokens, *draft_sliding_window)
-        .context("expanding the DFlash2 draft configs")?;
+    let draft = glm53_flash_dflash2_draft(1, gpu, *draft_tokens)?;
     glm53_flash_vllm_nvfp4_dflash2::build(
         name,
         target,
         *max_model_len,
         *draft_tokens,
         &draft,
-        *draft_kv_full_attention,
         bridge,
     )
     .context("building GLM-5.3-Flash NVFP4 DP + DFlash2 (often a missing profile.db row)")
@@ -3746,8 +3769,8 @@ mod tests {
         // allocates the draft layers "as full attention for cache allocation".
         // Billing a window would under-count the pool by context / window,
         // which at 131072 tokens is 64x.
-        let narrow = dflash2_draft_resolved(4, "NVIDIA B200", 7, 512).unwrap();
-        let wide = dflash2_draft_resolved(4, "NVIDIA B200", 7, 131_072).unwrap();
+        let narrow = dflash2_draft_resolved(&GLM53_DFLASH2, 4, "NVIDIA B200", 7, 512).unwrap();
+        let wide = dflash2_draft_resolved(&GLM53_DFLASH2, 4, "NVIDIA B200", 7, 131_072).unwrap();
         let narrow_bytes =
             glm53_vllm_nvfp4_dsa_moe_dflash2::draft_kv_bytes_per_token(&narrow).unwrap();
         assert_eq!(
@@ -3757,6 +3780,28 @@ mod tests {
         // 6 layers * 8 KV heads * 128 * 2 (K and V) * 1 byte, summed over the
         // four attention ranks the heads are sharded across.
         assert_eq!(narrow_bytes, 6 * 8 * 128 * 2);
+    }
+
+    #[test]
+    fn the_flash_draft_takes_its_own_checkpoint_shapes() {
+        let draft = glm53_flash_dflash2_draft(1, "NVIDIA B200", 7).unwrap();
+        assert_eq!(draft.context_kv.raw_cfg.hidden_dim.get(), 4096);
+        assert_eq!(draft.context_kv.raw_cfg.num_draft_layers, 5);
+        assert_eq!(draft.context_kv.raw_cfg.num_aux_layers, 5);
+        assert_eq!(draft.sliding_window, 2048);
+        // 5 layers * 8 KV heads * 128 * 2 (K and V) * 1 byte fp8, at TP1; the
+        // Flash arch holds 2048 tokens of it per request.
+        assert_eq!(
+            glm53_vllm_nvfp4_dsa_moe_dflash2::draft_kv_bytes_per_token(&draft).unwrap(),
+            5 * 8 * 128 * 2
+        );
+    }
+
+    #[test]
+    fn the_flash_draft_only_drafts_its_block() {
+        // block_size 8: one bonus position and seven drafts, nothing shorter.
+        let err = glm53_flash_dflash2_draft(1, "NVIDIA B200", 3).unwrap_err();
+        assert!(err.to_string().contains("block_size 8"), "{err}");
     }
 
     /// An arch block on `gpu` with `params`, its model config a `model/config/`
