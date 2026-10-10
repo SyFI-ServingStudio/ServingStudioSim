@@ -46,7 +46,7 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         "a pipeline stage runs on one GPU"
     );
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
-    let prefix_tiers = head_prefix_tiers(&config, &layout, 0, 1, cost_log_dir.as_deref(), id);
+    let prefix_tiers = head_prefix_tiers(&config, &layout, 1, cost_log_dir.as_deref(), id);
     let kv_capacity = full_attention_token_capacity(1, layout.kv_bytes_per_token, &config);
     let prefix_cache =
         config
@@ -199,7 +199,6 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     let prefix_tiers = head_prefix_tiers(
         &config,
         &layout,
-        state_tokens_per_request,
         if hybrid.align_mode {
             hybrid.block_tokens
         } else {
@@ -217,6 +216,7 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         kv_capacity_tokens = kv_capacity,
         block_tokens = hybrid.block_tokens,
         state_tokens_per_request,
+        tier_state_bytes_per_request = layout.tier_state_bytes_per_request,
         chunk_end_quantum,
         max_batch_tokens,
         "hybrid pipeline head: one block pool sized by the most constrained stage"
@@ -309,10 +309,11 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
 }
 
 /// The DRAM/SSD tiers `config` asks for, in the pipeline's per-GPU token units.
+/// A context's recurrent state is charged as `layout.tier_state_bytes_per_request`
+/// in those units.
 fn head_prefix_tiers(
     config: &WorkerConfig,
     layout: &PipelineLayout,
-    state_tokens: u64,
     hit_quantum: u32,
     log_dir: Option<&std::path::Path>,
     id: WorkerId,
@@ -322,7 +323,9 @@ fn head_prefix_tiers(
         SessionPrefixTiers::new(
             &specs,
             layout.tier_kv_bytes_per_token,
-            state_tokens,
+            layout
+                .tier_state_bytes_per_request
+                .div_ceil(layout.tier_kv_bytes_per_token.max(1)),
             hit_quantum,
             log_dir,
             &format!("w{}", id.0),

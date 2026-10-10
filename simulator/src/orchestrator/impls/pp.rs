@@ -396,6 +396,7 @@ mod tests {
             depth,
             kv_bytes_per_token: 1,
             tier_kv_bytes_per_token: 1,
+            tier_state_bytes_per_request: 0,
             activation_bytes_per_token: 0,
         };
         let flow = PpFlow::new(

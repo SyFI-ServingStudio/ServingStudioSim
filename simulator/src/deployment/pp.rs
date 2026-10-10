@@ -99,6 +99,7 @@ impl Deployment for PpDeployment {
                         pipeline.total_kv_bytes_per_token(),
                         pipeline.pp_size(),
                     ),
+                    tier_state_bytes_per_request: 0,
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
                 };
                 let head_model = Arc::clone(&pipeline.stages()[0]);
@@ -180,6 +181,19 @@ impl Deployment for PpDeployment {
                         pipeline.total_kv_bytes_per_token(),
                         pipeline.pp_size(),
                     ),
+                    tier_state_bytes_per_request: tier_state_bytes_per_request(
+                        &g.worker,
+                        &pipeline
+                            .stages()
+                            .iter()
+                            .map(|s| {
+                                (
+                                    s.total_kv_bytes_per_token(),
+                                    s.recurrent_state_bytes_per_request(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
                 };
                 let hybrid = PipelineHybridState {
@@ -245,6 +259,31 @@ fn tier_kv_bytes_per_token(
             ..
         } => total.div_ceil(u64::from(depth.max(1))),
         _ => most_loaded,
+    }
+}
+
+/// Recurrent-state bytes each GPU reads from a tier per load, given each
+/// stage's `(KV bytes per token, state bytes per request)`: with
+/// `prefix_tier_balanced_load` the stages' mean (rounded up), otherwise the
+/// state of the stage [`tier_kv_bytes_per_token`] reads for (the first with the
+/// most KV bytes per token).
+fn tier_state_bytes_per_request(worker: &IterWorkerSel, stages: &[(u64, u64)]) -> u64 {
+    match worker {
+        IterWorkerSel::PipelineChunkedPrefill {
+            prefix_tier_balanced_load: true,
+            ..
+        } => stages
+            .iter()
+            .map(|&(_, state)| state)
+            .sum::<u64>()
+            .div_ceil(stages.len().max(1) as u64),
+        _ => stages
+            .iter()
+            .fold(None::<(u64, u64)>, |best, &(kv, state)| match best {
+                Some((best_kv, _)) if best_kv >= kv => best,
+                _ => Some((kv, state)),
+            })
+            .map_or(0, |(_, state)| state),
     }
 }
 
@@ -415,5 +454,25 @@ mod tests {
             750,
             "5995 B over 8 stages, rounded up"
         );
+    }
+
+    #[test]
+    fn tiers_read_one_state_per_context_on_the_same_gpu_as_the_kv() {
+        // (KV bytes per token, state bytes per request) per stage.
+        let stages = [(545, 30), (1090, 20), (1090, 50), (0, 7)];
+        assert_eq!(
+            tier_state_bytes_per_request(&pipeline_worker(""), &stages),
+            20,
+            "the first stage with the most KV bytes per token"
+        );
+        assert_eq!(
+            tier_state_bytes_per_request(
+                &pipeline_worker("prefix_tier_balanced_load: true\n"),
+                &stages
+            ),
+            27,
+            "107 B over 4 stages, rounded up"
+        );
+        assert_eq!(tier_state_bytes_per_request(&pipeline_worker(""), &[]), 0);
     }
 }

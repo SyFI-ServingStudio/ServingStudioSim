@@ -362,7 +362,9 @@ lifecycles take fresh prompts from the same sources in the same order (landed
 reads, overdue requests, the pending order; `admission/fresh_source.rs`), and a
 passed-over request goes back to the front of the queue it came from.
 A tier is sized and read in the most loaded stage's bytes per token;
-`prefix_tier_balanced_load` (not vLLM) uses the stages' mean instead. A shortest-prefill-first order ranks a request by what HBM or a tier
+`prefix_tier_balanced_load` (not vLLM) uses the stages' mean instead. A hybrid
+pipeline's entry adds one recurrent state on that same GPU, in real bytes (the
+stage's own, or the stages' mean), not the HBM pool's padded state blocks. A shortest-prefill-first order ranks a request by what HBM or a tier
 holds. With `prefix_tier_warm_start`, a session request whose declared prefix
 exceeds every context the run stored for it is a pre-run conversation, read
 from the slowest tier (closed-loop traces that join sessions mid-life).

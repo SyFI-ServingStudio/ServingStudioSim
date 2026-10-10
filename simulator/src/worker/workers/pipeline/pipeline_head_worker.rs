@@ -66,6 +66,12 @@ pub struct PipelineLayout {
     /// stage's (`kv_bytes_per_token`), or the stages' mean when tier loads
     /// are assumed balanced (`prefix_tier_balanced_load`).
     pub tier_kv_bytes_per_token: u64,
+    /// Recurrent-state bytes each GPU reads from a tier per load, on the same
+    /// GPU as `tier_kv_bytes_per_token`: the most loaded stage's own state, or
+    /// the stages' mean with `prefix_tier_balanced_load`. A tier stores one
+    /// state per context (see `prefix_tiers.rs`), not the HBM pool's padded
+    /// state blocks. 0 for a pipeline with no recurrent layers.
+    pub tier_state_bytes_per_request: u64,
     /// Bytes one token's activations occupy between two stages.
     pub activation_bytes_per_token: u64,
 }
@@ -415,6 +421,7 @@ mod tests {
         depth: 2,
         kv_bytes_per_token: 2,
         tier_kv_bytes_per_token: 2,
+        tier_state_bytes_per_request: 0,
         activation_bytes_per_token: 4,
     };
 
