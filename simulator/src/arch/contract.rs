@@ -368,6 +368,18 @@ pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
     /// See [`IterwiseUnifiedModel::total_kv_bytes_per_token`].
     fn total_kv_bytes_per_token(&self) -> u64;
 
+    /// See [`IterwiseUnifiedModel::recurrent_state_bytes_per_request`]. Nonzero
+    /// only for a hybrid target, which a speculative worker must then hold in a
+    /// hybrid KV store.
+    fn recurrent_state_bytes_per_request(&self) -> u64 {
+        0
+    }
+
+    /// See [`IterwiseUnifiedModel::recurrent_checkpoint_interval_tokens`].
+    fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
+        0
+    }
+
     /// Maximum context accepted by the model's timing kernels. A complete
     /// fixed-width verify window must fit within this bound.
     fn max_model_len(&self) -> u32;
