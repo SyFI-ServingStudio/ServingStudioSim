@@ -89,8 +89,6 @@ DOC = KernelDoc(
         "Every GPU arrives together, so the time excludes the cross-GPU skew "
         "that the spin-waits absorb in serving (for example uneven expert load "
         "before an MoE call).",
-        "The clear before each call leaves its input cold too; in serving the "
-        "GEMM that writes it runs just before.",
         "algbw and busbw divide the reduce-scatter input size by the whole call's "
         "time, so they include the conv, residual and norm work.",
     ),
