@@ -89,7 +89,7 @@ local) gives:
   native kernel analysis): 13/13 pass. Server TTFT and iteration cycle are close
   to their bounds.
 
-### Collective-delimited layer segments (experimental, rows pending)
+### Collective-delimited layer segments (experimental)
 
 Adding compiled region cuts costs device time at decode1: about 0.17 ms for
 the model/head split, and +0.53 ms for a three-region trial. Per-layer cuts
@@ -127,9 +127,20 @@ Offline replay of a 4-rank, 39-forward capture passes every gate:
   +0.76% (prefill512).
 
 Per layer, decode16 is about 1.47 ms of attention and 0.22 ms of MLP; prefill512
-is about 0.29 ms of attention and 0.88 ms of MLP. Rows have not yet been
-written through the CLI. Use `SERVINGSTUDIO_NEURON_SEGMENT_RESUME` to finish
-that run from its completed device stages.
+is about 0.28 ms of attention and 0.87 ms of MLP.
+
+A fresh public-CLI run wrote the 12 rows to the private
+`$TMPDIR/neuron-segment-smoke/profile.db`, and every gate passed:
+
+- interior layers within 1.1-2.9% of the layer mean;
+- composed versus whole forward +1.83% (decode1), +0.19% (decode16) and +0.58%
+  (prefill512).
+
+Replaying the stock native and clean captures with `composition: layer_segments`
+(`logs/20261010_1_trainium_segments_alignment/`, local) gives kernel error +0.49%
+with 100% map coverage. Both the neutral simulation (E2E -6.93%) and the
+duty-calibrated one (x1.0637) are within all 13 campaign bounds. Use
+`presets/*_vllm_neuron_segments.*`.
 
 Trace export peaks near 47 GB per rank. Export ranks one at a time, and run
 trace analysis under a memory cap.
