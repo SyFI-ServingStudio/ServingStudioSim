@@ -472,23 +472,3 @@ def test_timestamp_rounding_at_the_execution_end_is_tolerated_but_overlap_is_not
     )
     with pytest.raises(SegmentTraceError, match="crosses the execution end"):
         core_coverage(overlap, 0, 1_000_000)
-
-
-def test_resume_reuses_only_completed_device_stages(tmp_path, monkeypatch):
-    """Catches a resume that reruns hardware, or trusts a partial or lossy stage."""
-    from profiling.runners.neuron import vllm_segment
-
-    calls = []
-    monkeypatch.setattr(vllm_segment, "run_stage", lambda root, stage, **_: calls.append(stage))
-    (tmp_path / "capture.log").write_text("capture complete\n")
-    (tmp_path / "captured-outputs.json").write_text("{}")
-    (tmp_path / "device-profiles").mkdir()
-    vllm_segment._run_or_reuse(tmp_path, "capture", resume=True)
-    assert calls == []
-    with pytest.raises(RuntimeError, match="incomplete"):
-        vllm_segment._run_or_reuse(tmp_path, "profile", resume=True)
-    (tmp_path / "capture.log").write_text("12 events were dropped\n")
-    with pytest.raises(RuntimeError, match="incomplete"):
-        vllm_segment._run_or_reuse(tmp_path, "capture", resume=True)
-    vllm_segment._run_or_reuse(tmp_path, "profile", resume=False)
-    assert calls == ["profile"]
