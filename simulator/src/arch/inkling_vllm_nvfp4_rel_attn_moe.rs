@@ -1,7 +1,8 @@
 //! Inkling (`InklingForConditionalGeneration`) ModelOpt NVFP4 checkpoints on
-//! B200, aligned to the vLLM fork's TP / EP deployment (`ink/`, MTP, vision
-//! and audio off). Measured against Inkling-Small-NVFP4 at TP4 + EP4
-//! (`logs/20261007_0_inkling_small_nvfp4_tp4ep4`).
+//! B200, aligned to the vLLM fork's TP / EP deployment
+//! (`vllm/models/inkling/nvidia/`, MTP, vision and audio off). Measured
+//! against vLLM captures of Inkling-Small-NVFP4 at TP4 + EP4 and Inkling-NVFP4
+//! at TP8 + EP8 on the diverse_100 trace.
 //!
 //! One rank group of `tp_size` ranks. Attention, the dense FFN and the two
 //! sink experts are tensor-parallel; the router is replicated; the routed
@@ -28,12 +29,14 @@
 //! The MoE: router, gate select and the top-k copies on every rank, then a
 //! `Max` over the EP ranks' ranked routed workloads; inside each rank the sink
 //! experts run on vLLM's aux stream concurrently with the routed call on a
-//! decode-only step of at most 256 tokens, and serially after it otherwise
-//! (`maybe_execute_in_parallel`, `ink/moe.py`; see `sinks_on_aux_stream`).
-//! The top-k copies launch only above one token. Both copies are compiled and
-//! the inactive one is pushed as zeros. The routed call includes its NVFP4
-//! activation quant. Layer 2's BF16 experts run FlashInfer CUTLASS in
-//! production; the `bf16_fused_moe` trtllm-gen backend stands in for it.
+//! step of at most 256 padded tokens that is either a uniform decode replaying
+//! a FULL graph or eager (prefills included), and serially after it otherwise
+//! (`maybe_execute_in_parallel`, `vllm/models/inkling/nvidia/moe.py`; see
+//! `sinks_on_aux_stream`). Both the concurrent and the serial pair are
+//! compiled and the inactive one is pushed as zeros. The top-k copies launch
+//! only above one token. The routed call includes its NVFP4 activation quant.
+//! Layer 2's BF16 experts run FlashInfer CUTLASS in production; the
+//! `bf16_fused_moe` trtllm-gen backend stands in for it.
 //!
 //! Sampling is not modeled.
 
@@ -49,11 +52,10 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::{
-    AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, Bf16FusedMoeKernelInput,
-    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, Nvfp4FusedMoeKernelInput,
-    Nvfp4QuantKernelInput, RsSconvAgResidualRmsNormKernel, RsSconvAgResidualRmsNormKernelConfig,
-    RsSconvAgResidualRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, ElementwiseKernel,
+    ElementwiseKernelConfig, ElementwiseKernelInput, RsSconvAgResidualRmsNormKernel,
+    RsSconvAgResidualRmsNormKernelConfig, RsSconvAgResidualRmsNormKernelInput, SingleGemmKernel,
+    SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
@@ -67,22 +69,25 @@ use crate::worklet::{
     Glm53MlpLocalWorkletInput, Glm53MlpLocalWorkletResolved, Glm53WeightPrecision,
     InklingAttnLocalWorklet, InklingAttnLocalWorkletConfig, InklingAttnLocalWorkletInput,
     InklingAttnLocalWorkletResolved, InklingRouterLocalWorklet, InklingRouterLocalWorkletConfig,
-    InklingRouterLocalWorkletInput, Nvfp4MoeLocalWorklet, Nvfp4MoeLocalWorkletConfig,
-    Nvfp4MoeLocalWorkletInput, Nvfp4MoeLocalWorkletResolved,
+    InklingRouterLocalWorkletInput, InklingRouterLocalWorkletResolved, Nvfp4MoeLocalWorklet,
+    Nvfp4MoeLocalWorkletConfig, Nvfp4MoeLocalWorkletInput, Nvfp4MoeLocalWorkletResolved,
 };
 
 const ARCH_KIND: &str = "inkling_vllm_nvfp4_rel_attn_moe";
 const ACTIVATION_DTYPE: DType = DType::Bf16;
 /// Attention KV page: vLLM's `unify_kv_cache_spec_page_size` doubles the
-/// 16-token default so a page matches the 32 KiB conv-state page.
+/// 16-token default so a page matches the 32 KiB conv-state page. The TP8
+/// Inkling-NVFP4 server also logged `kv lcm block sizes 32`.
 const PAGE_SIZE: u32 = 32;
 /// `Parallel{overlap}` of the aux-stream sinks against the routed call. The
-/// two streams contend for SMs and HBM: over the decode steps of the standard
-/// diverse_100 capture (`logs/20261008_9_inkling_small_nvfp4_tp4ep4_diverse100`,
-/// 3609 steps, NVFP4 layers), the measured union of input quant, routed call
-/// and sinks is 1.124x the isolated max of their rows, while the routed rows
-/// alone match the serial (mixed-step) copies within 3%. -> 1/1.124, as
-/// GLM-5.3's `SHARED_EXPERTS_STREAM_OVERLAP`.
+/// two streams contend for SMs and HBM: over the decode steps of the
+/// Inkling-Small-NVFP4 TP4 + EP4 diverse_100 capture (3609 steps, NVFP4
+/// layers), the measured union of input quant, routed call and sinks is
+/// 1.124x the isolated max of their rows, while the routed rows alone match
+/// the serial (mixed-step) copies within 3%. -> 1/1.124, as GLM-5.3's
+/// `SHARED_EXPERTS_STREAM_OVERLAP`. On TP8 the measured union is 1.061x the
+/// isolated max, so this constant charges too much contention there (a known
+/// gap).
 const SINK_STREAM_OVERLAP: f32 = 0.89;
 /// `compute_log_scaling_tau`: add, cast, mul, clamp, log, mul, add over [T].
 const LOG_SCALING_TAU_LAUNCHES: u32 = 7;
@@ -236,7 +241,7 @@ pub fn build_configs(
         )));
     }
     let divide = |what: &str, value: u32| -> std::result::Result<u32, BuildError> {
-        if value % tp != 0 {
+        if !value.is_multiple_of(tp) {
             return Err(fit_failed(format!("{what} {value} must divide by TP {tp}")));
         }
         Ok(value / tp)
@@ -455,6 +460,7 @@ pub struct InklingVllmResolved {
     pub attn_global: InklingAttnLocalWorkletResolved,
     pub dense_ffn: Glm53MlpLocalWorkletResolved,
     pub sink: Glm53MlpLocalWorkletResolved,
+    pub router: InklingRouterLocalWorkletResolved,
     pub routed_nvfp4: Vec<Nvfp4MoeLocalWorkletResolved>,
     pub routed_bf16: Vec<Bf16MoeLocalWorkletResolved>,
 }
@@ -465,6 +471,7 @@ pub fn resolve_configs(cfgs: &InklingVllmConfigs) -> InklingVllmResolved {
         attn_global: InklingAttnLocalWorklet::resolve_config(&cfgs.attn_global),
         dense_ffn: Glm53MlpLocalWorklet::resolve_config(&cfgs.dense_ffn),
         sink: Glm53MlpLocalWorklet::resolve_config(&cfgs.sink),
+        router: InklingRouterLocalWorklet::resolve_config(&cfgs.router),
         routed_nvfp4: cfgs
             .routed_nvfp4
             .iter()
@@ -494,28 +501,13 @@ impl RoutedRank {
     }
 
     fn eval_or_zero(&self, num_tokens: u32, zero: bool, ev: &mut Evaluator) {
-        match (self, zero) {
-            (Self::Nvfp4(worklet), false) => {
-                worklet.eval(&Nvfp4MoeLocalWorkletInput { num_tokens }, ev)
+        match self {
+            Self::Nvfp4(worklet) => {
+                worklet.eval_or_zero(&Nvfp4MoeLocalWorkletInput { num_tokens }, zero, ev)
             }
-            (Self::Nvfp4(worklet), true) => {
-                push_or_zero(&worklet.quant, Nvfp4QuantKernelInput { num_tokens }, true, ev);
-                push_or_zero(
-                    &worklet.fused_moe,
-                    Nvfp4FusedMoeKernelInput { num_tokens },
-                    true,
-                    ev,
-                );
+            Self::Bf16(worklet) => {
+                worklet.eval_or_zero(&Bf16MoeLocalWorkletInput { num_tokens }, zero, ev)
             }
-            (Self::Bf16(worklet), false) => {
-                worklet.eval(&Bf16MoeLocalWorkletInput { num_tokens }, ev)
-            }
-            (Self::Bf16(worklet), true) => push_or_zero(
-                &worklet.fused_moe,
-                Bf16FusedMoeKernelInput { num_tokens },
-                true,
-                ev,
-            ),
         }
     }
 }
@@ -552,7 +544,7 @@ impl MoeBlock {
             .collect();
         CostNode::Labeled {
             label: format!(
-                "{} (MoE) [EP{ep} ranked ranks; sinks overlap routed on decode-only T<={}]",
+                "{} (MoE) [EP{ep} ranked ranks; sinks overlap routed on FULL-graph decode or eager steps of padded T<={}]",
                 self.name, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
             ),
             child: Box::new(CostNode::Sum(vec![
@@ -757,7 +749,7 @@ fn build_layer_group(
                 Ffn::Moe(MoeBlock {
                     router: InklingRouterLocalWorklet::build(
                         moe.clone(),
-                        InklingRouterLocalWorklet::resolve_config(&cfg.router),
+                        resolved.router.clone(),
                         bridge,
                     )?,
                     sink: Glm53MlpLocalWorklet::build(
@@ -861,8 +853,9 @@ pub fn build(
 
 /// K and V of every layer's KV heads, summed over the ranks. Sliding-window
 /// layers are counted at full length: vLLM frees their pages behind the
-/// window, which this per-token total cannot express, so capacity is a
-/// lower bound.
+/// window, which this per-token total cannot express, so on that count
+/// capacity is a lower bound. vLLM's per-request conv-state pages share the
+/// same pool and are not counted, which pulls the other way.
 fn total_kv_bytes_per_token(model: &InklingModelCfg) -> u64 {
     (0..model.num_layers)
         .map(|layer| {
@@ -1031,8 +1024,8 @@ fn sinks_on_aux_stream(batch: &NormalizedBatch, padded_tokens: u32, capture_size
 /// model runner pads to the capture size with zero-length requests
 /// (`pad_attn`, `num_reqs_padded` in gpu_model_runner.py); the fork's FA4 split
 /// count follows that size. Steps with a prefill chunk replay a piecewise
-/// graph over the real requests, and a step past the largest size runs eagerly
-/// (`padded_tokens` is then the real count), so both stay unpadded (0).
+/// graph over the real requests (0), and a step past the largest size runs
+/// eagerly (`padded_tokens` is then the real count); both mean unpadded.
 fn attention_padded_requests(batch: &NormalizedBatch, padded_tokens: u32) -> u32 {
     if batch.is_uniform_decode() {
         padded_tokens
@@ -1250,32 +1243,65 @@ mod tests {
             .any(|slot| slot.name == "unified.global_nvfp4_moe.moe.gate_select"));
     }
 
-    #[test]
-    fn necessary_work_map_covers_the_compiled_locations() {
-        use std::collections::BTreeSet;
-        let model = built();
-        assert!(model.logs_decode_kv_lens());
-        // Communication leaves never appear in a map (`analyzer` optimality).
-        let actual: BTreeSet<String> = model
+    /// The compiled leaf locations, communication leaves excluded: they never
+    /// appear in a map (`analyzer` optimality).
+    fn compiled_locations(model: &InklingVllmModel) -> std::collections::BTreeSet<String> {
+        model
             .cost_log_manifest()
             .slots
             .into_iter()
             .filter(|slot| slot.kind != "all_reduce")
             .map(|slot| slot.name)
-            .collect();
-        let map: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../model/work/location_maps/inkling_vllm_nvfp4_tp4_ep4_unified.json"
-        ))
-        .unwrap();
+            .collect()
+    }
+
+    fn mapped_locations(map_json: &str) -> std::collections::BTreeSet<String> {
+        let map: serde_json::Value = serde_json::from_str(map_json).unwrap();
         assert_eq!(map["arch_types"][0], ARCH_KIND);
-        let mapped: BTreeSet<String> = map["locations"]
+        map["locations"]
             .as_array()
             .unwrap()
             .iter()
             .map(|row| row["location"].as_str().unwrap().to_string())
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn necessary_work_map_covers_the_compiled_locations() {
+        let model = built();
+        assert!(model.logs_decode_kv_lens());
+        let actual = compiled_locations(&model);
         assert_eq!(actual.len(), 69);
-        assert_eq!(actual, mapped);
+        assert_eq!(
+            actual,
+            mapped_locations(include_str!(
+                "../../../model/work/location_maps/inkling_vllm_nvfp4_tp4_ep4_unified.json"
+            ))
+        );
+    }
+
+    #[test]
+    fn tp8_ep8_necessary_work_map_covers_the_compiled_locations() {
+        // The public Inkling-NVFP4 layout: four more EP ranks, each with its
+        // own routed leaves.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("model/config/inkling_nvfp4.json");
+        let cfg = InklingModelCfg::from_json(&path).unwrap();
+        let parallel = InklingVllmParallel {
+            tp_size: 8,
+            ..parallel()
+        };
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let configs = build_configs(&cfg, &parallel, &demand()).unwrap();
+        let model = build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
+        let actual = compiled_locations(&model);
+        assert_eq!(actual.len(), 89);
+        assert_eq!(
+            actual,
+            mapped_locations(include_str!(
+                "../../../model/work/location_maps/inkling_vllm_nvfp4_tp8_ep8_unified.json"
+            ))
+        );
     }
 
     fn step(prefill_chunk_pairs: Vec<(u32, u32)>, decode_kv_lens: Vec<u32>) -> NormalizedBatch {
@@ -1300,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn sinks_overlap_only_on_decode_only_steps_up_to_the_threshold() {
+    fn sinks_overlap_on_full_graph_decode_or_eager_steps_up_to_the_threshold() {
         // The capture's sizes: [1, 2, 4] + 8..256 by 8 + 256..=2048 by 16.
         let mut sizes = vec![1, 2, 4];
         sizes.extend((8..256).step_by(8));

@@ -168,10 +168,6 @@ impl InklingModelCfg {
         self.local_layer_ids.contains(&layer)
     }
 
-    pub fn is_dense(&self, layer: u32) -> bool {
-        layer < self.dense_mlp_idx
-    }
-
     pub fn num_moe_layers(&self) -> u32 {
         self.num_layers - self.dense_mlp_idx
     }
@@ -216,7 +212,8 @@ impl InklingModelCfg {
 
 /// Per MoE layer, the routed experts' precision from the ModelOpt
 /// `exclude_modules`. Only the modeled scheme is accepted: NVFP4 with
-/// 16-element groups, a BF16 KV cache, and exclusions that keep exactly
+/// 16-element groups (a config that names no group size is taken as 16, the
+/// ModelOpt NVFP4 default), a BF16 KV cache, and exclusions that keep exactly
 /// attention, the router, the sink experts and the dense FFN in BF16.
 fn expert_precision(
     root: &Value,

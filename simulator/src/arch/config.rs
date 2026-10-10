@@ -1012,7 +1012,10 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_enable_expert_parallel")]
         #[param(default = true, cache_key)]
         enable_expert_parallel: bool,
-        /// Configured context cap: the global layers' FA4 split count.
+        /// Configured context cap: the global layers' FA4 split count. It is
+        /// also part of every attention layer's kernel config, local layers
+        /// included (their context axis stops at it), and each request's
+        /// context is validated against it.
         #[serde(default = "default_glm53_flash_max_model_len")]
         #[param(default = 8192, cache_key)]
         max_model_len: u32,
@@ -1033,8 +1036,10 @@ pub enum IterArchSel {
         #[param(cache_key)]
         token_corpus_file: Option<String>,
         /// vLLM `--cudagraph-capture-sizes`. Every kernel but attention runs
-        /// on the token count padded up to the next captured size. Empty: no
-        /// padding (eager).
+        /// on the token count padded up to the next captured size; attention
+        /// on a uniform-decode step runs at the padded request count. The
+        /// sizes also decide whether the sink experts overlap the routed call
+        /// (FULL-graph decode or eager steps only). Empty: no padding (eager).
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },

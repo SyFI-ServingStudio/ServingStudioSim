@@ -1,4 +1,5 @@
-//! Inkling attention on one TP rank, up to the reduction (`ink/attention.py`).
+//! Inkling attention on one TP rank, up to the reduction
+//! (`vllm/models/inkling/nvidia/attention.py`).
 //!
 //! Four launches in order: the merged QKVR projection (`F.linear`, q | k | v |
 //! the relative-position branch r), the fused QKVR prep (k/v short conv, q/k
@@ -22,7 +23,7 @@ use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfA
 use super::glm53_common::{atomic, push_or_zero};
 
 /// The fork's paged KV layout: K and V of one (token, head) side by side.
-pub const INKLING_KV_LAYOUT: &str = "lbnhc";
+const INKLING_KV_LAYOUT: &str = "lbnhc";
 
 #[derive(Clone, Debug)]
 pub struct InklingAttnLocalWorkletConfig {
@@ -81,7 +82,7 @@ pub struct InklingAttnLocalWorklet {
 impl InklingAttnLocalWorklet {
     pub fn resolve_config(cfg: &InklingAttnLocalWorkletConfig) -> InklingAttnLocalWorkletResolved {
         assert!(
-            cfg.num_kv_heads > 0 && cfg.num_q_heads % cfg.num_kv_heads == 0,
+            cfg.num_kv_heads > 0 && cfg.num_q_heads.is_multiple_of(cfg.num_kv_heads),
             "query heads must group evenly over KV heads"
         );
         let q_width = cfg.num_q_heads * cfg.head_dim;

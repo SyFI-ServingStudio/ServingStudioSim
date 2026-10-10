@@ -1,5 +1,5 @@
 //! The Inkling MoE router on one rank, ahead of the routed and sink experts
-//! (`ink/moe.py`): the replicated BF16 router GEMM with fp32 logits over the
+//! (`vllm/models/inkling/nvidia/moe.py`): the replicated BF16 router GEMM with fp32 logits over the
 //! routed and sink experts (`_linear_with_fp32_out`, padded to 264 columns),
 //! the gate select (sigmoid + bias top-k over the routed experts, then the
 //! log-sigmoid renorm with the sink logits, `_inkling_gate_select_kernel`),
