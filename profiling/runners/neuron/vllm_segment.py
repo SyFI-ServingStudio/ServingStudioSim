@@ -118,7 +118,30 @@ def _require_precision(root: Path, shapes: set[str]) -> None:
         raise RuntimeError(f"stock full-logit vendor check failed for {failed}")
 
 
-def _measure_group(root: Path, cache: Path, context: int, specs: list[dict]) -> dict:
+# A completed device stage leaves these files; a resumed run reuses the stage only
+# when all of them exist and its log reports no dropped trace events.
+_STAGE_OUTPUTS = {
+    "accuracy": ("accuracy-outputs.json", "accuracy-binaries-after.json"),
+    "reference": ("precision.json",),
+    "profile": ("timing.json",),
+    "capture": ("captured-outputs.json", "device-profiles"),
+}
+
+
+def _run_or_reuse(root: Path, stage: str, resume: bool, **kwargs) -> None:
+    """Run a device stage, or on resume reuse its completed outputs unchanged."""
+    if resume:
+        log = root / f"{stage}.log"
+        done = log.exists() and all((root / name).exists() for name in _STAGE_OUTPUTS[stage])
+        if done and "events were dropped" not in log.read_text():
+            return
+        raise RuntimeError(f"cannot resume: {stage} stage in {root} is incomplete")
+    run_stage(root, stage, **kwargs)
+
+
+def _measure_group(
+    root: Path, cache: Path, context: int, specs: list[dict], resume: bool = False
+) -> dict:
     """Run every stage and gate for one context group; return per-forward segments."""
     from profiling.runners.neuron.vllm_forward_trace import export_and_measure
     from profiling.runners.neuron.vllm_identity import (
@@ -136,16 +159,16 @@ def _measure_group(root: Path, cache: Path, context: int, specs: list[dict]) -> 
 
     compile_cache = cache / "cache/neuron/compile_cache"
     shapes = {(spec["phase"], spec["token_bucket"]) for spec in specs}
-    run_stage(root, "accuracy")
-    run_stage(root, "reference")
+    _run_or_reuse(root, "accuracy", resume)
+    _run_or_reuse(root, "reference", resume)
     _require_precision(root, {precision_shape(spec, context) for spec in specs})
     sealed = seal_accuracy_binaries(root)
     if not sealed["binary_binding_available"]:
         raise RuntimeError("stock NEFFs were not warm-loaded; binary identity is unproven")
     graphs = sealed["graphs"]
-    run_stage(root, "profile")
+    _run_or_reuse(root, "profile", resume)
     stock_times = export_and_measure(root, compile_cache)
-    run_stage(root, "capture", engine=SEGMENT_ENGINE, env=CAPTURE_ENV)
+    _run_or_reuse(root, "capture", resume, engine=SEGMENT_ENGINE, env=CAPTURE_ENV)
     sessions_dirs = export_device_sessions(root / "device-profiles", root / "device-parquet")
     graph_shapes = {graph: (row["phase"], row["token_bucket"]) for graph, row in graphs.items()}
     sessions = [analyze_session(path, graph_shapes) for path in sessions_dirs]
@@ -221,19 +244,29 @@ def profile_segment_batch(kwargs_list):
         return [result or RunnerResult(error=str(error)) for result in results]
     from profiling.runners.neuron.vllm_forward_work import estimate_segment_work
 
+    resume_root = os.environ.get("SERVINGSTUDIO_NEURON_SEGMENT_RESUME")
     for context, indices in groups.items():
-        root = cache / "segment-runs" / uuid.uuid4().hex
-        root.mkdir(parents=True)
+        root = Path(resume_root) if resume_root else cache / "segment-runs" / uuid.uuid4().hex
+        root.mkdir(parents=True, exist_ok=bool(resume_root))
         forward_specs = []
         for index in indices:
             spec = {name: v for name, v in kwargs_list[index].items() if name != "segment"}
             if spec not in forward_specs:
                 forward_specs.append(spec)
+        previous_plan = (root / "plan.json").read_text() if resume_root else None
         plan = write_plan(root, forward_specs, context, model, identity, cache)
         plan.update(capture_calls=capture_calls(forward_specs), capture_ranks=CAPTURE_RANKS)
-        (root / "plan.json").write_text(json.dumps(plan, indent=2, default=str))
+        plan_text = json.dumps(plan, indent=2, default=str)
+        if resume_root and previous_plan != plan_text:
+            (root / "plan.json").write_text(previous_plan)
+            for index in indices:
+                results[index] = RunnerResult(
+                    error=f"cannot resume {root}: its plan differs from the requested specs"
+                )
+            continue
+        (root / "plan.json").write_text(plan_text)
         try:
-            group = _measure_group(root, cache, context, forward_specs)
+            group = _measure_group(root, cache, context, forward_specs, bool(resume_root))
         except Exception as error:
             for index in indices:
                 results[index] = RunnerResult(error=f"{error}; artifacts={root}")
