@@ -13,7 +13,7 @@
 //! `charge_per_checkpoint` for every snapshot it keeps. Both knobs are
 //! constructor parameters; `(1, 0)` is exactly the pre-hybrid behavior.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::Deserialize;
 
@@ -175,6 +175,10 @@ pub(crate) struct PrefixCache {
     /// Extra occupancy every retained snapshot costs on top of its context KV.
     charge_per_checkpoint: u64,
     entries: HashMap<u32, PrefixEntry>,
+    /// `entries` ordered by the policy's eviction key, session id last, so the
+    /// victim is the first element. A retained entry never changes (a hit
+    /// removes it), so only insert and remove touch this.
+    eviction_order: BTreeSet<(u64, u64, u32)>,
     next_sequence: u64,
 }
 
@@ -193,6 +197,7 @@ impl PrefixCache {
             quantum_tokens: u64::from(quantum_tokens.max(1)),
             charge_per_checkpoint,
             entries: HashMap::new(),
+            eviction_order: BTreeSet::new(),
             next_sequence: 0,
         }
     }
@@ -318,15 +323,15 @@ impl PrefixCache {
             .unwrap_or(sequence);
         let frequency = return_metadata.map(|value| value.frequency).unwrap_or(0);
         let cache_used_before = self.used_tokens;
-        self.entries.insert(
-            session_id,
-            PrefixEntry {
-                tokens: retained_tokens,
-                insertion_sequence,
-                last_access_sequence: sequence,
-                frequency,
-            },
-        );
+        let entry = PrefixEntry {
+            tokens: retained_tokens,
+            insertion_sequence,
+            last_access_sequence: sequence,
+            frequency,
+        };
+        self.eviction_order
+            .insert(self.eviction_key(session_id, &entry));
+        self.entries.insert(session_id, entry);
         self.used_tokens += retained_tokens;
         self.used_checkpoints += retained_tokens / self.quantum_tokens;
         mutations.push(PrefixCacheMutation {
@@ -360,33 +365,31 @@ impl PrefixCache {
     }
 
     fn victim(&self) -> Option<u32> {
+        self.eviction_order
+            .first()
+            .map(|&(_, _, session_id)| session_id)
+    }
+
+    /// Where `entry` sorts in [`Self::eviction_order`]: smallest is evicted
+    /// first, with the session id breaking every tie.
+    fn eviction_key(&self, session_id: u32, entry: &PrefixEntry) -> (u64, u64, u32) {
         match self.policy {
-            PrefixCachePolicy::Lru => self
-                .entries
-                .iter()
-                .min_by_key(|(session_id, entry)| (entry.last_access_sequence, **session_id)),
-            PrefixCachePolicy::Fifo => self
-                .entries
-                .iter()
-                .min_by_key(|(session_id, entry)| (entry.insertion_sequence, **session_id)),
-            PrefixCachePolicy::Lfu => self.entries.iter().min_by_key(|(session_id, entry)| {
-                (entry.frequency, entry.insertion_sequence, **session_id)
-            }),
-            PrefixCachePolicy::LargestFirst => {
-                self.entries.iter().min_by_key(|(session_id, entry)| {
-                    (
-                        std::cmp::Reverse(entry.tokens),
-                        entry.insertion_sequence,
-                        **session_id,
-                    )
-                })
-            }
+            PrefixCachePolicy::Lru => (entry.last_access_sequence, 0, session_id),
+            PrefixCachePolicy::Fifo => (entry.insertion_sequence, 0, session_id),
+            PrefixCachePolicy::Lfu => (entry.frequency, entry.insertion_sequence, session_id),
+            // Largest first: more tokens sort earlier.
+            PrefixCachePolicy::LargestFirst => (
+                u64::MAX - entry.tokens,
+                entry.insertion_sequence,
+                session_id,
+            ),
         }
-        .map(|(session_id, _)| *session_id)
     }
 
     fn remove(&mut self, session_id: u32) -> Option<PrefixEntry> {
         let entry = self.entries.remove(&session_id)?;
+        self.eviction_order
+            .remove(&self.eviction_key(session_id, &entry));
         self.used_tokens = self.used_tokens.saturating_sub(entry.tokens);
         self.used_checkpoints = self
             .used_checkpoints
@@ -501,6 +504,23 @@ mod tests {
             cache.insert(3, 40, 100, None);
             assert_eq!(cache.peek(expected_victim, 40), 0);
         }
+    }
+
+    #[test]
+    fn lfu_evicts_the_least_consumed_session_then_the_oldest() {
+        let mut cache =
+            PrefixCache::new(100, PrefixCachePolicy::Lfu, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
+        cache.insert(1, 30, 100, None);
+        cache.insert(2, 30, 100, None);
+        cache.insert(3, 30, 100, None);
+        // Session 1 was consumed once, so 2 (older than 3) goes first, then 3.
+        let take_result = cache.take(1, 30);
+        cache.insert(1, 30, 100, take_result.return_metadata);
+        cache.insert(4, 30, 100, None);
+        assert_eq!(cache.peek(2, 30), 0);
+        cache.insert(5, 30, 100, None);
+        assert_eq!(cache.peek(3, 30), 0);
+        assert_eq!(cache.peek(1, 30), 30);
     }
 
     #[test]

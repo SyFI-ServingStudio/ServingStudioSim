@@ -122,17 +122,22 @@ const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 pub(crate) const MHC_BACKENDS: &[&str] = &["vllm_tilelang"];
 const RMS_NORM_BACKENDS: &[&str] = &["vllm_cuda"];
 const KDA_BACKENDS: &[&str] = &["vllm_triton"];
-const CONV_BACKENDS: &[&str] = &["vllm_triton"];
+/// The fork's FLA `chunk_kda_with_fused_gate`.
+const KDA_PREFILL_BACKENDS: &[&str] = &["vllm_triton"];
+/// vLLM's one varlen `causal_conv1d_fn` launch.
+const CONV_PREFILL_BACKENDS: &[&str] = &["vllm_triton"];
+const CONV_DECODE_BACKENDS: &[&str] = &["vllm_triton"];
 const QKV_NORM_BACKENDS: &[&str] = &["vllm_triton"];
 const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_no_rope"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_unpadded"];
 const MQA_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
+/// vLLM's `top_k_per_row_prefill`.
+const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
 /// The fork's `fp8_fp4_mqa_logits` is DeepGEMM's `sm100_mqa_logits`; the
 /// packaged `deepgemm_fp8` rows time the same kernel (0.573 ms at 2048 x 65536
 /// against 0.55 ms measured at a 261K-token context in capture 20260925_4).
 const MQA_LOGITS_PREFILL_BACKENDS: &[&str] = &["deepgemm_fp8"];
-const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_triton"];
@@ -469,6 +474,30 @@ pub struct Glm53FlashVllmParallel {
     pub gpu_name: String,
     /// vLLM `--cudagraph-capture-sizes`; empty runs eager (no padding).
     pub cudagraph_capture_sizes: Vec<u32>,
+    pub kernel_path: Glm53FlashKernelPath,
+}
+
+/// Which vLLM code path the layers follow where the fork this arch was
+/// captured on (3f667d7) and current vLLM differ in more than a kernel's
+/// backend. Backends are chosen per kernel through the run config's
+/// `backends` override, like every other arch's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Glm53FlashKernelPath {
+    /// Whether the DSA layers pay the fork's `q_concat` and output
+    /// `masked_fill_` copies.
+    pub mla_layout_copies: bool,
+    /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`.
+    pub indexer_max_logits_mb: u32,
+}
+
+impl Default for Glm53FlashKernelPath {
+    /// The captured fork.
+    fn default() -> Self {
+        Self {
+            mla_layout_copies: true,
+            indexer_max_logits_mb: 512,
+        }
+    }
 }
 
 /// Which attention and FFN a layer group carries, and how it opens.
@@ -557,7 +586,11 @@ pub struct Glm53FlashVllmConfigs {
     pub routed: Vec<Glm53RoutedMoeLocalWorkletConfig>,
     pub embedding: ElementwiseKernelConfig,
     pub hc_expand: ElementwiseKernelConfig,
+    /// The first pre and the last post (TileLang only).
     pub mhc: MhcRmsNormKernelConfig,
+    /// Every fused post/pre boundary (`*_mhc_post_pre` roles), the ones a
+    /// `backends` override may move to `deepgemm_mega_nonshifted`.
+    pub mhc_fused: MhcRmsNormKernelConfig,
     pub all_reduce: AllReduceFusionKernelConfig,
     /// The all-reduce vLLM falls back to above FlashInfer's workspace cap.
     pub large_all_reduce: AllReduceKernelConfig,
@@ -664,6 +697,13 @@ pub fn build_configs(
         expert_demand: demand.clone(),
         folded_rank_position: 0,
     };
+    let mhc = MhcRmsNormKernelConfig {
+        backends: MHC_BACKENDS.to_vec(),
+        gpu_name: gpu.clone(),
+        hidden_size: model.hidden.into(),
+        hc_mult: model.hc_mult,
+        hidden_dtype: ACTIVATION_DTYPE,
+    };
     Ok(Glm53FlashVllmConfigs {
         groups: layer_groups(model),
         kda: Glm53KdaAttnLocalWorkletConfig {
@@ -675,8 +715,10 @@ pub fn build_configs(
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
             bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
-            conv_backends: CONV_BACKENDS.to_vec(),
+            conv_prefill_backends: CONV_PREFILL_BACKENDS.to_vec(),
+            conv_decode_backends: CONV_DECODE_BACKENDS.to_vec(),
             core_backends: KDA_BACKENDS.to_vec(),
+            chunk_prefill_backends: KDA_PREFILL_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
@@ -708,6 +750,10 @@ pub fn build_configs(
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            mla_layout_copies: parallel.kernel_path.mla_layout_copies,
+            indexer_max_logits_bytes: u64::from(parallel.kernel_path.indexer_max_logits_mb)
+                * 1024
+                * 1024,
         },
         dense_ffn: mlp(
             divide("intermediate_size", model.intermediate_size)?,
@@ -731,13 +777,8 @@ pub fn build_configs(
         // Row gather: reads and writes one hidden row per token.
         embedding: ew(hidden_bytes, hidden_bytes),
         hc_expand: ew(hidden_bytes, stream_bytes),
-        mhc: MhcRmsNormKernelConfig {
-            backends: MHC_BACKENDS.to_vec(),
-            gpu_name: gpu.clone(),
-            hidden_size: model.hidden.into(),
-            hc_mult: model.hc_mult,
-            hidden_dtype: ACTIVATION_DTYPE,
-        },
+        mhc: mhc.clone(),
+        mhc_fused: mhc,
         all_reduce: AllReduceFusionKernelConfig {
             backends: all_reduce_backends.to_vec(),
             gpu_name: gpu.clone(),
@@ -1096,7 +1137,7 @@ pub(crate) fn build_layer_group(
         Boundary::Fused(atomic(
             p,
             "attn_mhc_post_pre",
-            cfg.mhc.clone(),
+            cfg.mhc_fused.clone(),
             MhcFusedPostPreRmsNormKernel::build,
             bridge,
         )?)
@@ -1177,7 +1218,7 @@ pub(crate) fn build_layer_group(
         ffn_boundary: atomic(
             p,
             "ffn_mhc_post_pre",
-            cfg.mhc.clone(),
+            cfg.mhc_fused.clone(),
             MhcFusedPostPreRmsNormKernel::build,
             bridge,
         )?,
@@ -1648,6 +1689,7 @@ mod tests {
             max_model_len: 8192,
             gpu_name: "NVIDIA B200".into(),
             cudagraph_capture_sizes: Vec::new(),
+            kernel_path: Default::default(),
         }
     }
 
@@ -1688,6 +1730,51 @@ mod tests {
         bridge.enable_enumerate();
         let configs = build_configs(model, &parallel, &demand()).unwrap();
         build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
+    }
+
+    /// The fused boundaries' role names are what a `backends` override moving
+    /// them to DeepGEMM lists; the first pre and the terminal post, whose
+    /// TileLang decomposition has no other backend's rows, are not among them.
+    #[test]
+    fn a_backends_override_moves_only_the_fused_mhc_boundaries() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let configs = build_configs(&model_cfg(), &parallel(), &demand()).unwrap();
+        let roles = |bridge: &PerfApiBridge| -> Vec<String> {
+            build("unified".into(), resolve_configs(&configs), bridge).unwrap();
+            bridge
+                .take_enum_report()
+                .into_iter()
+                .filter(|leaf| leaf.name.ends_with("_mhc_post_pre"))
+                .map(|leaf| leaf.name)
+                .collect()
+        };
+        let overrides: std::collections::HashMap<String, Vec<String>> = roles(&bridge)
+            .into_iter()
+            .map(|role| (role, vec!["deepgemm_mega_nonshifted".to_string()]))
+            .collect();
+        let _scope = bridge.with_backend_overrides("main", Some(&overrides));
+        build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
+        let mhc: Vec<_> = bridge
+            .take_enum_report()
+            .into_iter()
+            .filter(|leaf| leaf.kind.starts_with("mhc_"))
+            .collect();
+        let fused_boundaries = mhc
+            .iter()
+            .filter(|leaf| leaf.name.ends_with("_mhc_post_pre"))
+            .inspect(|leaf| {
+                assert_eq!(leaf.kind, "mhc_fused_post_pre_rms_norm");
+                assert_eq!(leaf.backends, ["deepgemm_mega_nonshifted"], "{}", leaf.name);
+            })
+            .count();
+        assert!(fused_boundaries > 0);
+        for leaf in mhc
+            .iter()
+            .filter(|leaf| !leaf.name.ends_with("_mhc_post_pre"))
+        {
+            assert_eq!(leaf.backends, ["vllm_tilelang"], "{}", leaf.name);
+        }
     }
 
     #[test]
@@ -1810,8 +1897,8 @@ mod tests {
         assert_eq!(ep8.recurrent_state_bytes_per_request(), 8 * 34 * 1152 * 512);
         assert_eq!((ep8.gpus_per_replica(), ep8.num_attn_shards()), (8, 8));
         let moe = |ranks: usize| 2 + 2 + ranks * 14;
-        let kda_dense = 6 + 13 + 5;
-        let total = |ranks| 4 + 2 * kda_dense + (6 + 31 + moe(ranks)) + (6 + 13 + moe(ranks)) + 4;
+        let kda_dense = 6 + 12 + 5;
+        let total = |ranks| 4 + 2 * kda_dense + (6 + 31 + moe(ranks)) + (6 + 12 + moe(ranks)) + 4;
         assert_eq!(ep8.n_slots, total(8));
         assert_eq!(built_with(layout(4, false)).n_slots, total(1));
         assert_eq!(built_with(layout(8, false)).n_slots, total(1));
@@ -1890,12 +1977,12 @@ mod tests {
     fn compiled_tree_has_a_fixed_slot_count() {
         let model = built();
         // Prologue 4 (the all-reduce is a fused + large pair); per group:
-        // 2 boundaries + 2 all-reduce pairs + attention (KDA 13, DSA 31) +
+        // 2 boundaries + 2 all-reduce pairs + attention (KDA 12, DSA 31) +
         // FFN (dense 5; MoE 2 router + 2 glue + 4 ranks x (concurrent 5 + 2,
         // serial 2 + 5)); epilogue 4.
-        let kda_dense = 6 + 13 + 5;
+        let kda_dense = 6 + 12 + 5;
         let dsa_moe = 6 + 31 + 60;
-        let kda_moe = 6 + 13 + 60;
+        let kda_moe = 6 + 12 + 60;
         assert_eq!(model.n_slots, 4 + 2 * kda_dense + dsa_moe + kda_moe + 4);
         assert_eq!(model.cost_log_manifest().slots.len(), model.n_slots);
     }
@@ -1918,17 +2005,17 @@ mod tests {
                     include_str!(
                         "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified.json"
                     ),
-                    128,
+                    125,
                 ),
                 (
                     layout(8, true),
                     include_str!(
                         "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_ep8.json"
                     ),
-                    144,
+                    141,
                 ),
-                (layout(4, false), moe_tp, 116),
-                (layout(8, false), moe_tp, 116),
+                (layout(4, false), moe_tp, 113),
+                (layout(8, false), moe_tp, 113),
             ],
         );
     }
@@ -1949,17 +2036,17 @@ mod tests {
                     include_str!(
                         "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_kda_dsa_moe_unified.json"
                     ),
-                    124,
+                    121,
                 ),
                 (
                     layout(8, true),
                     include_str!(
                         "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_kda_dsa_moe_unified_ep8.json"
                     ),
-                    140,
+                    137,
                 ),
-                (layout(4, false), moe_tp, 112),
-                (layout(8, false), moe_tp, 112),
+                (layout(4, false), moe_tp, 109),
+                (layout(8, false), moe_tp, 109),
             ],
         );
     }

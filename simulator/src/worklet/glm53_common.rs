@@ -6,12 +6,35 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     ElementwiseKernelConfig, Fp8PerTokenGroupQuantKernel, Fp8PerTokenGroupQuantKernelConfig,
-    Fp8PerTokenGroupQuantKernelInput, Nvfp4QuantKernel, Nvfp4QuantKernelConfig,
-    Nvfp4QuantKernelInput,
+    Fp8PerTokenGroupQuantKernelInput, Kernel, KernelConfig, KernelSpec, Nvfp4QuantKernel,
+    Nvfp4QuantKernelConfig, Nvfp4QuantKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge, Probe, SlotInput,
 };
+
+/// The value a backend property takes on every candidate of `op`, as built:
+/// after any run-config `backends` override replaced the arch's list. The
+/// property shapes the leaves around the kernel, and one structure has to fit
+/// whichever candidate best-of-N picks, so candidates that disagree are
+/// rejected.
+pub(crate) fn backends_agree<S: KernelSpec>(
+    op: &Op<Kernel<S>>,
+    property: &'static str,
+    holds: fn(&str) -> bool,
+) -> Result<bool, BuildError> {
+    let backends = op.kernel.config.backends();
+    let first = backends.first().is_some_and(|&backend| holds(backend));
+    if backends.iter().any(|&backend| holds(backend) != first) {
+        return Err(BuildError::MixedBackendProperty {
+            kind: S::KIND,
+            role: op.name.clone(),
+            backends: backends.to_vec(),
+            property,
+        });
+    }
+    Ok(first)
+}
 
 /// Build one atomic op named `{prefix}.{suffix}`.
 pub(crate) fn atomic<K, C, F>(

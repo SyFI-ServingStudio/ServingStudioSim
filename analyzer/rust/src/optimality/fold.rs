@@ -380,17 +380,24 @@ fn leaf_per_config_best_ms(
     grid_peak_gbps: f64,
 ) -> f64 {
     if lock_batch_size {
-        observed_time_ms
-    } else {
-        leaf_selected_throughput_ms(
-            observed_time_ms,
-            work_flops,
-            traffic_bytes,
-            uses_compute_throughput,
-            grid_peak_tflops,
-            grid_peak_gbps,
-        )
+        return observed_time_ms;
     }
+    let selected_ms = leaf_selected_throughput_ms(
+        observed_time_ms,
+        work_flops,
+        traffic_bytes,
+        uses_compute_throughput,
+        grid_peak_tflops,
+        grid_peak_gbps,
+    );
+    if uses_compute_throughput || grid_peak_tflops <= 0.0 || work_flops <= 0.0 {
+        return selected_ms;
+    }
+    // A leaf below the GPU ridge can still be capped by its own compute rate
+    // (KDA chunk prefill: ~126 FLOP/B, MMA-bound near 138 TFLOP/s at ~1 TB/s).
+    // Its bytes scale with its work, so both fitted grid rates bound it.
+    let compute_floor_ms = work_flops / grid_peak_tflops / 1e9;
+    selected_ms.max(compute_floor_ms).min(observed_time_ms)
 }
 
 fn current_point_uses_compute_throughput(
@@ -441,6 +448,25 @@ mod tests {
         assert!(!current_point_uses_compute_throughput(
             400.0, 1.0, true, 900.0, 3_000.0
         ));
+    }
+
+    #[test]
+    fn r3_bounds_a_bandwidth_leaf_by_its_own_compute_peak_too() {
+        // 2 TFLOP at a 1,000 TFLOP/s grid peak is 2 ms; 1 GB at 1,000 GB/s is 1 ms.
+        assert_eq!(
+            leaf_per_config_best_ms(false, 10.0, 2.0e12, 1.0e9, false, 1_000.0, 1_000.0),
+            2.0
+        );
+        // Neither floor exceeds the observed time.
+        assert_eq!(
+            leaf_per_config_best_ms(false, 1.5, 2.0e12, 1.0e9, false, 1_000.0, 1_000.0),
+            1.5
+        );
+        // A compute-classified leaf keeps the compute basis alone.
+        assert_eq!(
+            leaf_per_config_best_ms(false, 10.0, 2.0e12, 9.0e9, true, 1_000.0, 1_000.0),
+            2.0
+        );
     }
 
     #[test]

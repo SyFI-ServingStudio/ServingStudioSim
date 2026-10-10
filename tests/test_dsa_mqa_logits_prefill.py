@@ -590,12 +590,14 @@ def test_scheduled_work(num_queries, num_keys, expected_sum_w, expected_cells, e
 @pytest.mark.parametrize(
     ("num_queries", "num_keys", "expected_bytes"),
     [
-        (1, 128, 44_296),
-        (16, 4096, 4_722_816),
-        (128, 4096, 37_782_528),
+        (1, 128, 27_400),
+        (16, 4096, 938_112),
+        (128, 4096, 3_720_192),
     ],
 )
 def test_logical_scheduled_bytes(num_queries, num_keys, expected_bytes):
+    # Keys count once: the per-tile re-reads are L2 hits, and counting them put
+    # the B200 rows at ~17 TB/s, above HBM.
     from profiling.runners.attention.dsa_mqa_logits_prefill import (
         _logical_scheduled_bytes,
     )

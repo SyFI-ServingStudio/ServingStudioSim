@@ -6,10 +6,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use serde_json::Value;
-
 use crate::trace::manifest::{Manifest, ManifestDoc};
 
+use super::compute_dtype::ComputeDtypeFields;
 use super::grid_peaks::GridPeakCatalog;
 use super::spec::GpuSpec;
 
@@ -78,6 +77,7 @@ pub(super) fn build_section_fold_plans(
     manifests_by_worker: &BTreeMap<(String, u16), ManifestDoc>,
     grid_peak_catalog: &GridPeakCatalog,
     gpu_spec: &GpuSpec,
+    compute_dtypes: &ComputeDtypeFields,
 ) -> (
     Vec<KernelLocation>,
     HashMap<(String, u16, String), SectionFoldPlan>,
@@ -118,11 +118,11 @@ pub(super) fn build_section_fold_plans(
                     .unwrap_or_default();
                 grid_peak_tflops_by_slot.push(peak.tflops);
                 grid_peak_gbps_by_slot.push(peak.gbps);
-                let dtype = compute_dtype(&leaf.kernel_config);
+                let dtype = compute_dtypes.dtype(&leaf.kind, &leaf.kernel_config);
                 let hardware_peak_tflops = if is_communication {
                     0.0
                 } else {
-                    gpu_spec.peak_tflops(&dtype)
+                    gpu_spec.peak_tflops(dtype)
                 };
                 hardware_peak_tflops_by_slot.push(hardware_peak_tflops);
                 let hardware_bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;
@@ -169,17 +169,6 @@ fn r3_uses_compute_throughput(
     !is_communication
         && peak_tflops > 0.0
         && max_arithmetic_intensity_flops_per_byte >= hardware_ridge_flops_per_byte
-}
-
-/// Best-effort compute dtype for a leaf's roofline: the first present of the
-/// GEMM/norm `dtype`, then attention `q_dtype`, then an input dtype; else bf16.
-fn compute_dtype(config: &Value) -> String {
-    for key in ["dtype", "q_dtype", "input_dtype", "kv_dtype"] {
-        if let Some(s) = config.get(key).and_then(Value::as_str) {
-            return s.to_string();
-        }
-    }
-    "bf16".to_string()
 }
 
 /// Collective / point-to-point leaves — dropped at R4 ("ignore network") and R5.

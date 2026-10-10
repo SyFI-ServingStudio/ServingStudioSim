@@ -2217,3 +2217,53 @@ def test_energy_flag_still_overrides_an_exported_policy(monkeypatch):
 
     assert apply(False, [None], ["p.yaml"]) is True
     assert energy.energy_enabled() is False
+
+
+def test_a_multi_preset_batch_gives_each_preset_its_own_manifest_coordinate(
+    tmp_path, schema, monkeypatch
+):
+    """Two presets sweeping the same axis into one experiment root used to write
+    duplicate manifest coordinates, so the sweep aggregate refused them."""
+    import launcher.exec as exec_module
+    import launcher.sweep as sweep_module
+    from launcher import __main__ as main_module
+
+    root = tmp_path / "exp"
+    for name, model in (("pp8", "m.json"), ("dp", "n.json")):
+        (tmp_path / f"{name}.json").write_text(
+            json.dumps(
+                _base(
+                    arch={"type": "llama3_dense_tp", "tp_size": "${ptp}", "model_config": model},
+                    sweep={"ptp": [1, 2]},
+                    log_dir=str(root / name / "tp{ptp}"),
+                )
+            )
+        )
+    seen = []
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
+    monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
+    monkeypatch.setattr(sweep_module, "run_sweep", lambda candidates, *a, **k: seen.extend(candidates) or 0)
+
+    assert main_module.main([str(tmp_path / "pp8.json"), str(tmp_path / "dp.json")]) == 0
+
+    manifest = json.loads(_write_sweep_manifest(seen, root).read_text())
+    assert manifest["axes"] == ["ptp", "preset"]
+    coordinates = [tuple(run["coordinates"].values()) for run in manifest["runs"]]
+    assert sorted(coordinates) == [(1, "dp"), (1, "pp8"), (2, "dp"), (2, "pp8")]
+
+
+def test_a_multi_preset_batch_rejects_presets_with_the_same_file_name(
+    tmp_path, schema, monkeypatch, capsys
+):
+    import launcher.exec as exec_module
+    from launcher import __main__ as main_module
+
+    for sub in ("a", "b"):
+        (tmp_path / sub).mkdir()
+        (tmp_path / sub / "preset.json").write_text(json.dumps(_base(log_dir=f"logs/{sub}")))
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
+    monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
+
+    argv = [str(tmp_path / "a" / "preset.json"), str(tmp_path / "b" / "preset.json"), "--dry-run"]
+    assert main_module.main(argv) == 2
+    assert "distinct file names" in capsys.readouterr().err

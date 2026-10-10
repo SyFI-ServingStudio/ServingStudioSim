@@ -86,6 +86,7 @@ pub struct Glm53FlashVllmFp8PpParallel {
     /// vLLM `VLLM_PP_LAYER_PARTITION`: layers per stage, in stage order.
     /// Empty: vLLM's default `get_pp_indices` split.
     pub layer_partition: Vec<u32>,
+    pub kernel_path: flash::Glm53FlashKernelPath,
 }
 
 /// Each stage's `[start, end)` layer range: `layer_partition` when given,
@@ -153,6 +154,7 @@ pub fn build_configs(
             max_model_len: parallel.max_model_len,
             gpu_name: parallel.gpu_name.clone(),
             cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
+            kernel_path: parallel.kernel_path.clone(),
         },
         demand,
     )?;
@@ -849,6 +851,7 @@ mod tests {
             gpu_name: "NVIDIA B200".to_string(),
             cudagraph_capture_sizes: Vec::new(),
             layer_partition: Vec::new(),
+            kernel_path: Default::default(),
         }
     }
 
@@ -1142,7 +1145,7 @@ mod tests {
             include_str!(
                 "../../../model/work/location_maps/glm53_flash_vllm_fp8_pp_kda_dsa_moe_pp.json"
             ),
-            116,
+            113,
         );
     }
 
@@ -1154,7 +1157,7 @@ mod tests {
             include_str!(
                 "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_pp_kda_dsa_moe_pp.json"
             ),
-            112,
+            109,
         );
     }
 }

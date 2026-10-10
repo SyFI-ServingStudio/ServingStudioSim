@@ -801,7 +801,9 @@ def test_logical_accounting_matches_contract() -> None:
         _logical_flops,
     )
 
-    assert _logical_flops(num_queries=2, num_heads=64, selected_k=2048) == (
+    # Only valid slots do attention work: (0, 2) is two of 2 x 2048 selected slots.
+    assert _logical_flops(num_heads=64, valid_counts=(0, 2)) == (2 * 64 * 2 * (576 + 512))
+    assert _logical_flops(num_heads=64, valid_counts=(2048, 2048)) == (
         2 * 2 * 64 * 2048 * (576 + 512)
     )
     assert _logical_bytes(
@@ -920,7 +922,7 @@ def test_flashmla_profile_times_only_native_callable_and_reuses_accounting(
     assert metrics.energy_j == 0.25
     assert (
         metrics.tflops
-        == runner._logical_flops(num_queries=1, num_heads=64, selected_k=2048) / 0.002 / 1e12
+        == runner._logical_flops(num_heads=64, valid_counts=(2048,)) / 0.002 / 1e12
     )
     assert (
         metrics.memory_bandwidth_gbps

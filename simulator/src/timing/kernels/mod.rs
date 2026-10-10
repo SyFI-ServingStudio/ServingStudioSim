@@ -144,7 +144,7 @@ pub use dsa_persistent_topk_decode::{
 };
 pub use dsa_sparse_index_remap::{
     DsaSparseIndexRemapKernel, DsaSparseIndexRemapKernelConfig, DsaSparseIndexRemapKernelInput,
-    DsaSparseIndexRemapSpec, DsaSparseIndexRemapWorkspacePartition,
+    DsaSparseIndexRemapSpec,
 };
 pub use dsa_sparse_mla_attention::{
     DsaSparseMlaAttentionKernel, DsaSparseMlaAttentionKernelConfig,

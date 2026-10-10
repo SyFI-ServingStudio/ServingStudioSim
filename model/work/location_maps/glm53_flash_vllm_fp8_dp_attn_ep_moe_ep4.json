@@ -189,14 +189,6 @@
       "semantics": []
     },
     {
-      "location": "unified.dsa_moe.moe.combine_reduce_scatter",
-      "semantics": []
-    },
-    {
-      "location": "unified.dsa_moe.moe.dispatch_all_gather",
-      "semantics": []
-    },
-    {
       "location": "unified.dsa_moe.moe.dispatch_quant",
       "semantics": []
     },
@@ -368,10 +360,6 @@
       "semantics": []
     },
     {
-      "location": "unified.first_kda_dense.kda.prefill_qkv_copy",
-      "semantics": []
-    },
-    {
       "location": "unified.first_kda_dense.kda.recurrent_decode",
       "semantics": [
         "first_kda_dense.attn.decode",
@@ -508,10 +496,6 @@
       "semantics": []
     },
     {
-      "location": "unified.kda_dense.kda.prefill_qkv_copy",
-      "semantics": []
-    },
-    {
       "location": "unified.kda_dense.kda.recurrent_decode",
       "semantics": [
         "kda_dense.attn.decode",
@@ -616,10 +600,6 @@
       "semantics": []
     },
     {
-      "location": "unified.kda_moe.kda.prefill_qkv_copy",
-      "semantics": []
-    },
-    {
       "location": "unified.kda_moe.kda.recurrent_decode",
       "semantics": [
         "kda_moe.attn.decode",
@@ -658,14 +638,6 @@
     },
     {
       "location": "unified.kda_moe.moe.combine_glue",
-      "semantics": []
-    },
-    {
-      "location": "unified.kda_moe.moe.combine_reduce_scatter",
-      "semantics": []
-    },
-    {
-      "location": "unified.kda_moe.moe.dispatch_all_gather",
       "semantics": []
     },
     {

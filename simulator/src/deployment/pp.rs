@@ -159,6 +159,7 @@ impl Deployment for PpDeployment {
                     token_corpus_file.as_deref(),
                     cudagraph_capture_sizes,
                     layer_partition,
+                    arch_build::glm53_flash_kernel_path(&g.arch)?,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

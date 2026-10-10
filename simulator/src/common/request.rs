@@ -274,10 +274,12 @@ impl ActiveRequest<TextGenerationDefinition> {
 ///
 /// `records[id]` keeps direct request lookup O(1); `None` means the trace
 /// reserved the id but the replay scheduler has not released that request yet.
+/// A record is boxed so a reserved slot costs a pointer, not a whole request: a
+/// closed-loop trace reserves millions of ids its run never releases.
 /// The id vectors avoid scanning every reserved slot for arrived/admitted views.
 #[derive(Debug)]
 pub struct RequestStore<Definition: RequestDefinition = TextGenerationDefinition> {
-    records: Vec<Option<ActiveRequest<Definition>>>,
+    records: Vec<Option<Box<ActiveRequest<Definition>>>>,
     /// Request ids in release order. Every present record occurs exactly once.
     arrived_ids: Vec<RequestId>,
     /// Request ids in first-admission order. Every admitted record occurs once.
@@ -315,7 +317,7 @@ impl<Definition: RequestDefinition> RequestStore<Definition> {
         let slot = request_id.0 as usize;
         if slot == self.records.len() {
             self.records
-                .push(Some(ActiveRequest::from_request(request)));
+                .push(Some(Box::new(ActiveRequest::from_request(request))));
             self.arrived_ids.push(request_id);
             return;
         }
@@ -327,16 +329,18 @@ impl<Definition: RequestDefinition> RequestStore<Definition> {
             );
         };
         assert!(record_slot.is_none(), "request id {slot} inserted twice");
-        *record_slot = Some(ActiveRequest::from_request(request));
+        *record_slot = Some(Box::new(ActiveRequest::from_request(request)));
         self.arrived_ids.push(request_id);
     }
 
     pub fn get(&self, id: RequestId) -> Option<&ActiveRequest<Definition>> {
-        self.records.get(id.0 as usize).and_then(Option::as_ref)
+        self.records.get(id.0 as usize).and_then(Option::as_deref)
     }
 
     pub fn get_mut(&mut self, id: RequestId) -> Option<&mut ActiveRequest<Definition>> {
-        self.records.get_mut(id.0 as usize).and_then(Option::as_mut)
+        self.records
+            .get_mut(id.0 as usize)
+            .and_then(Option::as_deref_mut)
     }
 
     pub fn len(&self) -> usize {

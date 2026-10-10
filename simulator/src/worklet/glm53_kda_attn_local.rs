@@ -14,15 +14,26 @@
 //! ALL of its tokens, decodes included, through one `chunk_kda_with_fused_gate`
 //! call (`kda_chunk_prefill`, `D` = decode count) and one varlen conv; a
 //! decode-only iteration uses `causal_conv1d_update` and `fused_recurrent_kda`.
+//! A per-sequence short-conv prefill backend (`conv_prefill_per_sequence`)
+//! instead launches once per prefill sequence and runs the iteration's
+//! decode tokens through `causal_conv1d_update`, so its short conv is the sum of
+//! the `(1, L_i)` rows plus one decode launch.
 //! Only prefill-bearing iterations gather and scatter the fp32 SSM state.
 //!
-//! Placeholders (elementwise, byte-sized): the split/copy glue, the gated
+//! The prefill core's q/k/v `.contiguous()` copies and the FLA chain's
+//! scratch fills run inside the call `kda_chunk_prefill` times, so they have no
+//! leaf here. FLA's chunk-index setup (about 11 small launches, ~17 us) runs
+//! once per step and is cached across layers; it is left out.
+//!
+//! Placeholders (elementwise, byte-sized): the beta sigmoid, the gated
 //! RMSNorm (`gdn_gated_rms_norm` is H200-only and a different entry point),
 //! and the state gather/scatter. State movement is expressed in 4-KiB transfer
 //! units, as in `qwen36_gdn_local`, so one 1-MiB state is 256 units.
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
+use crate::timing::kernels::gdn_causal_conv_prefill::launches_per_sequence;
+use crate::timing::kernels::kda_chunk_prefill::takes_beta_logits;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelInput, GdnCausalConvDecodeKernel,
     GdnCausalConvDecodeKernelConfig, GdnCausalConvDecodeKernelInput, GdnCausalConvPrefillKernel,
@@ -31,16 +42,18 @@ use crate::timing::kernels::{
     KdaRecurrentDecodeKernelConfig, KdaRecurrentDecodeKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
+use crate::timing::{
+    BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, GdnCausalConvPrefillLog, LeafMetrics,
+    PerfApiBridge,
+};
 
-use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
+use super::glm53_common::{atomic, backends_agree, elementwise, push_or_zero, repeated};
 
 const STATE_TRANSFER_UNIT_BYTES: u32 = 4096;
-/// Prefill-bearing q/k/v `.contiguous()` copies ahead of the qk l2norm.
-const PREFILL_COPY_LAUNCHES: u32 = 3;
-/// Prefill-bearing small launches: beta sigmoid, index scans, gate views.
-const PREFILL_SMALL_GLUE_LAUNCHES: u32 = 17;
-const SMALL_GLUE_BYTES_PER_TOKEN: u32 = 64;
+/// Beta sigmoid ahead of a prefill core that takes beta already passed
+/// through one: reads the bf16 logits, writes fp32 (capture 20260924_0).
+const BETA_SIGMOID_IN_BYTES_PER_HEAD: u32 = 2;
+const BETA_SIGMOID_OUT_BYTES_PER_HEAD: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct Glm53KdaAttnLocalWorkletConfig {
@@ -54,8 +67,14 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     pub activation_dtype: DType,
     pub gpu_name: String,
     pub bf16_gemm_backends: Vec<&'static str>,
-    pub conv_backends: Vec<&'static str>,
+    /// Short-conv prefill backends (`gdn_causal_conv_prefill`).
+    pub conv_prefill_backends: Vec<&'static str>,
+    /// Short-conv decode backends (`gdn_causal_conv_decode`).
+    pub conv_decode_backends: Vec<&'static str>,
+    /// Recurrent-decode backends.
     pub core_backends: Vec<&'static str>,
+    /// Chunked-prefill backends: the serving engine's KDA prefill kernel.
+    pub chunk_prefill_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
 }
 
@@ -67,7 +86,6 @@ pub struct Glm53KdaAttnLocalWorkletResolved {
     pub g_b: SingleGemmKernelConfig,
     pub conv_prefill: GdnCausalConvPrefillKernelConfig,
     pub conv_decode: GdnCausalConvDecodeKernelConfig,
-    pub prefill_copy: crate::timing::kernels::ElementwiseKernelConfig,
     pub prefill_small_glue: crate::timing::kernels::ElementwiseKernelConfig,
     pub state_gather: crate::timing::kernels::ElementwiseKernelConfig,
     pub chunk_prefill: KdaChunkPrefillKernelConfig,
@@ -96,7 +114,6 @@ pub struct Glm53KdaAttnLocalWorklet {
     pub g_b: Op<SingleGemmKernel>,
     pub conv_prefill: Op<GdnCausalConvPrefillKernel>,
     pub conv_decode: Op<GdnCausalConvDecodeKernel>,
-    pub prefill_copy: Op<ElementwiseKernel>,
     pub prefill_small_glue: Op<ElementwiseKernel>,
     pub state_gather: Op<ElementwiseKernel>,
     pub chunk_prefill: Op<KdaChunkPrefillKernel>,
@@ -104,6 +121,13 @@ pub struct Glm53KdaAttnLocalWorklet {
     pub state_scatter: Op<ElementwiseKernel>,
     pub gated_norm: Op<ElementwiseKernel>,
     pub o_proj: Op<SingleGemmKernel>,
+    /// The short-conv prefill backends launch once per sequence
+    /// (`gdn_causal_conv_prefill::launches_per_sequence`) rather than once over
+    /// every token of the iteration.
+    conv_per_sequence: bool,
+    /// The beta sigmoid's launches: none when the chunked-prefill backends
+    /// apply it inside their call (`kda_chunk_prefill::takes_beta_logits`).
+    beta_sigmoid_launches: u32,
     resolved: Glm53KdaAttnLocalWorkletResolved,
 }
 
@@ -140,7 +164,7 @@ impl Glm53KdaAttnLocalWorklet {
             f_b: gemm(value_width.into(), cfg.gate_rank.into()),
             g_b: gemm(value_width.into(), cfg.gate_rank.into()),
             conv_prefill: GdnCausalConvPrefillKernelConfig {
-                backends: cfg.conv_backends.clone(),
+                backends: cfg.conv_prefill_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 channels: conv_channels.into(),
                 kernel_size: cfg.conv_kernel_size.clone(),
@@ -148,19 +172,20 @@ impl Glm53KdaAttnLocalWorklet {
                 state_dtype: cfg.activation_dtype,
             },
             conv_decode: GdnCausalConvDecodeKernelConfig {
-                backends: cfg.conv_backends.clone(),
+                backends: cfg.conv_decode_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 channels: conv_channels.into(),
                 kernel_size: cfg.conv_kernel_size.clone(),
                 dtype: cfg.activation_dtype,
                 state_dtype: cfg.activation_dtype,
             },
-            // One q/k/v-sized head-major copy per launch.
-            prefill_copy: ew(per_head_bytes, per_head_bytes),
-            prefill_small_glue: ew(SMALL_GLUE_BYTES_PER_TOKEN, SMALL_GLUE_BYTES_PER_TOKEN),
+            prefill_small_glue: ew(
+                heads * BETA_SIGMOID_IN_BYTES_PER_HEAD,
+                heads * BETA_SIGMOID_OUT_BYTES_PER_HEAD,
+            ),
             state_gather: ew(STATE_TRANSFER_UNIT_BYTES, STATE_TRANSFER_UNIT_BYTES),
             chunk_prefill: KdaChunkPrefillKernelConfig {
-                backends: cfg.core_backends.clone(),
+                backends: cfg.chunk_prefill_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_heads: cfg.num_heads.clone(),
                 head_dim: cfg.head_dim.clone(),
@@ -190,7 +215,7 @@ impl Glm53KdaAttnLocalWorklet {
     ) -> Result<Self, BuildError> {
         let r = resolved.clone();
         let n = name.as_str();
-        Ok(Self {
+        let mut worklet = Self {
             in_proj: atomic(n, "in_proj", r.in_proj, SingleGemmKernel::build, bridge)?,
             f_b: atomic(n, "f_b_proj", r.f_b, SingleGemmKernel::build, bridge)?,
             g_b: atomic(n, "g_b_proj", r.g_b, SingleGemmKernel::build, bridge)?,
@@ -206,13 +231,6 @@ impl Glm53KdaAttnLocalWorklet {
                 "short_conv_decode",
                 r.conv_decode,
                 GdnCausalConvDecodeKernel::build,
-                bridge,
-            )?,
-            prefill_copy: atomic(
-                n,
-                "prefill_qkv_copy",
-                r.prefill_copy,
-                ElementwiseKernel::build,
                 bridge,
             )?,
             prefill_small_glue: atomic(
@@ -258,9 +276,24 @@ impl Glm53KdaAttnLocalWorklet {
                 bridge,
             )?,
             o_proj: atomic(n, "o_proj", r.o_proj, SingleGemmKernel::build, bridge)?,
+            conv_per_sequence: false,
+            beta_sigmoid_launches: 0,
             name,
             resolved,
-        })
+        };
+        // The backends as built, after any run-config override, set the leaves
+        // around the two cores.
+        worklet.conv_per_sequence = backends_agree(
+            &worklet.conv_prefill,
+            "they launch once per sequence",
+            launches_per_sequence,
+        )?;
+        worklet.beta_sigmoid_launches = u32::from(!backends_agree(
+            &worklet.chunk_prefill,
+            "they take beta logits",
+            takes_beta_logits,
+        )?);
+        Ok(worklet)
     }
 
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
@@ -276,10 +309,9 @@ impl Glm53KdaAttnLocalWorklet {
                 self.g_b.compile(builder),
                 self.conv_prefill.compile(builder),
                 self.conv_decode.compile(builder),
-                repeated(&self.prefill_copy, PREFILL_COPY_LAUNCHES, builder),
                 repeated(
                     &self.prefill_small_glue,
-                    PREFILL_SMALL_GLUE_LAUNCHES,
+                    self.beta_sigmoid_launches,
                     builder,
                 ),
                 self.state_gather.compile(builder),
@@ -300,27 +332,31 @@ impl Glm53KdaAttnLocalWorklet {
             num_tokens: w.total_tokens,
         };
         let decode_only = !w.prefill_bearing;
+        let per_sequence = self.conv_per_sequence;
         push_or_zero(&self.in_proj, rows.clone(), false, ev);
         push_or_zero(&self.f_b, rows.clone(), false, ev);
         push_or_zero(&self.g_b, rows.clone(), false, ev);
-        push_or_zero(
-            &self.conv_prefill,
-            GdnCausalConvPrefillKernelInput {
-                batch_size: 1,
-                sequence_length: w.total_tokens,
-            },
-            decode_only,
-            ev,
-        );
+        if per_sequence {
+            push_conv_per_sequence(&self.conv_prefill, &input.prefill_sequence_lengths, ev);
+        } else {
+            push_or_zero(
+                &self.conv_prefill,
+                GdnCausalConvPrefillKernelInput {
+                    batch_size: 1,
+                    sequence_length: w.total_tokens,
+                },
+                decode_only,
+                ev,
+            );
+        }
         push_or_zero(
             &self.conv_decode,
             GdnCausalConvDecodeKernelInput {
                 batch_size: input.decode_batch_size,
             },
-            w.prefill_bearing,
+            !decode_conv_runs(per_sequence, w.prefill_bearing, input.decode_batch_size),
             ev,
         );
-        push_or_zero(&self.prefill_copy, tokens.clone(), decode_only, ev);
         push_or_zero(&self.prefill_small_glue, tokens.clone(), decode_only, ev);
         let state = ElementwiseKernelInput {
             num_tokens: w.state_units,
@@ -348,6 +384,43 @@ impl Glm53KdaAttnLocalWorklet {
         push_or_zero(&self.gated_norm, tokens, false, ev);
         push_or_zero(&self.o_proj, rows, false, ev);
     }
+}
+
+/// Whether the decode short conv launches: in a decode-only iteration, and in
+/// a mixed one only when the prefill backend launches per sequence, since
+/// vLLM's varlen prefill launch covers the decode tokens too.
+fn decode_conv_runs(per_sequence: bool, prefill_bearing: bool, decode_batch_size: u32) -> bool {
+    decode_batch_size > 0 && (per_sequence || !prefill_bearing)
+}
+
+/// One `(1, L_i)` launch per prefill sequence, summed into the one slot. No
+/// prefill sequence is zero work and skips the cache lookup.
+fn push_conv_per_sequence(
+    op: &Op<GdnCausalConvPrefillKernel>,
+    sequence_lengths: &[u32],
+    ev: &mut Evaluator,
+) {
+    let metrics = sum_per_sequence(sequence_lengths, |input| op.kernel.eval(input));
+    ev.push(metrics, || {
+        GdnCausalConvPrefillLog {
+            sequence_lengths: sequence_lengths.to_vec(),
+        }
+        .into()
+    });
+}
+
+fn sum_per_sequence(
+    sequence_lengths: &[u32],
+    mut eval: impl FnMut(&GdnCausalConvPrefillKernelInput) -> LeafMetrics,
+) -> LeafMetrics {
+    let mut metrics = LeafMetrics::ZERO;
+    for &sequence_length in sequence_lengths {
+        metrics.add_fanin(eval(&GdnCausalConvPrefillKernelInput {
+            batch_size: 1,
+            sequence_length,
+        }));
+    }
+    metrics
 }
 
 struct Work {
@@ -390,6 +463,8 @@ fn derive_work(input: &Glm53KdaAttnLocalWorkletInput, state_bytes: u32) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     pub(crate) fn cfg() -> Glm53KdaAttnLocalWorkletConfig {
@@ -402,10 +477,90 @@ mod tests {
             activation_dtype: DType::Bf16,
             gpu_name: "NVIDIA B200".into(),
             bf16_gemm_backends: vec!["torch_linear_vllm"],
-            conv_backends: vec!["vllm_triton"],
+            conv_prefill_backends: vec!["vllm_triton"],
+            conv_decode_backends: vec!["vllm_triton"],
             core_backends: vec!["vllm_triton"],
+            chunk_prefill_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
         }
+    }
+
+    #[test]
+    fn the_built_backends_set_the_sigmoid_and_conv_launches() {
+        // An override replaces the arch's backends inside Kernel::build; the
+        // leaves around the cores must follow the backends as built.
+        let build = |overrides: &[(&str, &str)]| {
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let map: HashMap<String, Vec<String>> = overrides
+                .iter()
+                .map(|(role, backend)| (role.to_string(), vec![backend.to_string()]))
+                .collect();
+            let _scope = bridge.with_backend_overrides("main", Some(&map));
+            Glm53KdaAttnLocalWorklet::build(
+                "m.kda".into(),
+                Glm53KdaAttnLocalWorklet::resolve_config(&cfg()),
+                &bridge,
+            )
+        };
+        let fla = build(&[]).unwrap();
+        assert_eq!(
+            (fla.beta_sigmoid_launches, fla.conv_per_sequence),
+            (1, false)
+        );
+        let fast = build(&[
+            ("m.kda.chunk_prefill", "flashinfer_cute_persistent"),
+            ("m.kda.short_conv_prefill", "dao_channellast"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (fast.beta_sigmoid_launches, fast.conv_per_sequence),
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn backends_with_different_beta_inputs_are_rejected() {
+        let mut mixed = cfg();
+        mixed.chunk_prefill_backends = vec!["vllm_triton", "flashkda"];
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let built = Glm53KdaAttnLocalWorklet::build(
+            "m.kda".into(),
+            Glm53KdaAttnLocalWorklet::resolve_config(&mixed),
+            &bridge,
+        );
+        assert!(matches!(
+            built,
+            Err(BuildError::MixedBackendProperty { .. })
+        ));
+    }
+
+    #[test]
+    fn per_sequence_conv_sums_one_row_per_prefill_sequence() {
+        // A per-sequence backend priced as one (1, T) row would hide a launch
+        // per request; each length must reach the cache as its own B=1 row.
+        let mut seen = Vec::new();
+        let metrics = sum_per_sequence(&[3, 65, 2], |input| {
+            seen.push((input.batch_size, input.sequence_length));
+            let mut leaf = LeafMetrics::ZERO;
+            leaf.m.time_ms = input.sequence_length as f32;
+            leaf
+        });
+        assert_eq!(seen, [(1, 3), (1, 65), (1, 2)]);
+        assert_eq!(metrics.m.time_ms, 70.0);
+        assert_eq!(sum_per_sequence(&[], |_| unreachable!()).m.time_ms, 0.0);
+    }
+
+    #[test]
+    fn decode_tokens_leave_the_varlen_launch_only_for_a_per_sequence_backend() {
+        // vllm_triton: decodes ride in the one varlen prefill launch.
+        assert!(!decode_conv_runs(false, true, 29));
+        assert!(decode_conv_runs(false, false, 32));
+        // dao_channellast: a mixed iteration still runs causal_conv1d_update.
+        assert!(decode_conv_runs(true, true, 29));
+        assert!(decode_conv_runs(true, false, 32));
+        assert!(!decode_conv_runs(true, true, 0));
     }
 
     #[test]
@@ -457,8 +612,8 @@ mod tests {
         let mut builder = CostTreeBuilder::new();
         let root = worklet.compile(&mut builder);
         let tree = builder.finish(root);
-        assert_eq!(tree.slots.len(), 13);
-        assert_eq!(tree.slots[8].name, "m.kda.chunk_prefill");
-        assert_eq!(tree.slots[9].name, "m.kda.recurrent_decode");
+        assert_eq!(tree.slots.len(), 12);
+        assert_eq!(tree.slots[7].name, "m.kda.chunk_prefill");
+        assert_eq!(tree.slots[8].name, "m.kda.recurrent_decode");
     }
 }

@@ -6,6 +6,18 @@
 //! launch cliff. The rectangular sweep is capped at the checkpoint's 262,144
 //! total tokens through `infeasible_mask`. `state_dtype` remains an explicit
 //! profiler/cache key, but is not a standard KV capability axis.
+//!
+//! A row `(B, L)` is B equal fresh sequences, and backends cover them with
+//! different launch shapes, which decides how a caller prices a ragged batch:
+//!
+//! - `vllm_triton` (vLLM `causal_conv1d_fn`) runs the whole varlen batch in one
+//!   launch, program grid `Σ ceil(L_i / 8)`. Its cost tracks total tokens, so a
+//!   caller that issues it once over T tokens prices `(1, T)`.
+//! - `dao_channellast` (Dao-AILab causal-conv1d) has no varlen form that keeps
+//!   final states, so it launches once per sequence and its `(B, L)` row is B
+//!   launches. A ragged batch is the sum of `(1, L_i)` rows.
+//!
+//! [`launches_per_sequence`] is that distinction for callers.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -42,6 +54,12 @@ impl SweepCoords for GdnCausalConvPrefillKernelInput {
     fn coord_field_names() -> &'static [&'static str] {
         &["batch_size", "sequence_length"]
     }
+}
+
+/// Whether `backend` issues one launch per sequence, so a ragged batch is
+/// priced as the sum of its `(1, L_i)` rows rather than one varlen launch.
+pub fn launches_per_sequence(backend: &str) -> bool {
+    backend == "dao_channellast"
 }
 
 pub struct GdnCausalConvPrefillSpec;
@@ -243,8 +261,17 @@ mod tests {
     }
 
     #[test]
-    fn both_backends_use_linear_2d_cache() {
-        for backend in ["torch", "vllm_triton"] {
+    fn only_the_dao_backend_launches_per_sequence() {
+        // A varlen backend priced per sequence would charge a launch per
+        // request; a per-sequence backend priced as one launch would hide them.
+        assert!(super::launches_per_sequence("dao_channellast"));
+        assert!(!super::launches_per_sequence("vllm_triton"));
+        assert!(!super::launches_per_sequence("torch"));
+    }
+
+    #[test]
+    fn every_backend_uses_linear_2d_cache() {
+        for backend in ["torch", "vllm_triton", "dao_channellast"] {
             assert_eq!(
                 GdnCausalConvPrefillSpec::cache_kind(backend),
                 CacheKind::Cache2DLinear(Extrapolation::Product)

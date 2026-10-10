@@ -3,7 +3,11 @@
 Wire string: ``"kda_chunk_prefill"`` -- the facade stem is
 ``get_kda_chunk_prefill_times`` / ``count_missing_kda_chunk_prefill``.
 
-The measured boundary is one call of the vendored
+Two backends measure the same operation. ``flashkda`` is the FlashKDA call
+upstream vLLM makes by default on SM90/SM10x/SM12x (``_flashkda_prefill``); it
+is described beside its registration below. ``vllm_triton`` is described here.
+
+The ``vllm_triton`` measured boundary is one call of the vendored
 ``vllm.models.glm5next.nvidia.ops.third_party.kda.chunk_kda_with_fused_gate``,
 made exactly as ``Glm5NextLinearAttention._forward`` makes it on the prefill
 branch. That callable launches a fixed chain of FLA Triton kernels: the q/k/v
@@ -35,6 +39,13 @@ tokens as ``P // max_sequence_length`` full sequences plus one remainder, which
 is the chunked-prefill shape. Chunk size (64), fp32 state in ``[N,H,V,K]``
 layout, ``safe_gate=True`` and ``lower_bound=-5.0`` are fixed by the
 production path. They are not args.
+
+The ``flashinfer_*`` backends time ``flashinfer.kda.recurrent_kda`` with an
+explicit Blackwell backend, called as vLLM's ``--kda-prefill-backend
+flashinfer`` path calls it, on the same operand layout: the q/k/v copies, then
+one fused kernel that also does the L2 norms, the gate and the beta sigmoid.
+That call takes the raw bf16 beta logit, so the beta sigmoid that the
+``vllm_triton`` row leaves outside is inside these rows.
 """
 
 from __future__ import annotations
@@ -76,15 +87,17 @@ DOC = KernelDoc(
     description=(
         "KDA is a gated delta rule like Gated DeltaNet, but its decay gate has "
         "one value per key channel instead of one per head. In prefill vLLM "
-        "makes one chunk_kda_with_fused_gate call: it copies the strided q, k "
-        "and v views, L2-normalizes q and k, computes the gate from the raw "
-        "projection, and runs FLA's chunked Triton kernels to write every "
-        "token's output and each sequence's final state. Decode requests "
+        "makes one call: it copies the strided q, k and v views, L2-normalizes "
+        "q and k, computes the gate from the raw projection, and writes every "
+        "token's output and each sequence's final state. The vllm_triton "
+        "backend is FLA's chunked Triton kernels (chunk_kda_with_fused_gate); "
+        "flashkda is FlashKDA, vLLM's default on SM90, SM10x and SM12x. Decode requests "
         "scheduled in the same step join the call as one-token sequences, "
         "placed first; the remaining tokens form full max_sequence_length "
         "sequences plus one shorter remainder. Decode sequences start from "
-        "random FP32 states, prefill sequences from zero; beta arrives already "
-        "passed through a sigmoid."
+        "random FP32 states, prefill sequences from zero. vllm_triton takes "
+        "beta already passed through a sigmoid; flashkda takes the raw logits "
+        "and applies the sigmoid inside the call."
     ),
     category="Attention",
     subcategory="Gated DeltaNet",
@@ -102,21 +115,29 @@ DOC = KernelDoc(
     default_metric="tflops",
     method=(
         f"{CUPTI_METHOD} Five warm-up calls run first; every launch of the call "
-        "is counted, the q, k and v copies included. Triton autotuning runs once "
-        "per worker, at 2048 tokens (one 2019-token prefill and 29 decodes); its"
-        " keys omit the token count, so those configs serve every later shape. "
+        "is counted, the q, k and v copies included. vllm_triton's Triton "
+        "autotuning runs once per worker, at 2048 tokens (one 2019-token prefill "
+        "and 29 decodes); its keys omit the token count, so those configs serve "
+        "every later shape; FlashKDA has no autotuning. "
         "Before timing, the shape cut to at most 8 decodes and 1024-token "
         "sequences is checked against a per-token PyTorch reference."
     ),
     caveats=(
-        "FLA's chunk kernels take head_dim up to 256.",
-        "Each one-token decode sequence occupies a whole 64-token chunk in the "
-        "chunk-parallel kernels.",
+        "FLA's chunk kernels take head_dim up to 256; FlashKDA takes only 128.",
+        "Each one-token decode sequence occupies a whole chunk in the "
+        "chunk-parallel kernels: 64 tokens in FLA, 16 in FlashKDA.",
+        "FlashKDA splits each head's value dimension across two blocks only while "
+        "2·num_heads·sequences blocks fit one wave of SMs (148 on B200), so its "
+        "time steps up where that stops: about 1.4x at 8 heads from 9 to 17 "
+        "sequences of one 8192-token prefill.",
         "The timed calls reuse one cu_seqlens tensor, so FLA's cached chunk-index "
-        "setup, which the first layer of a step pays, is not in the time.",
-        "The beta sigmoid and the gather and scatter of recurrent states run outside the call.",
+        "setup, which the first layer of a step pays, is not in the vllm_triton time.",
+        "The gather and scatter of recurrent states run outside the call, and "
+        "so does vllm_triton's beta sigmoid.",
         "FLOPs are logical counts at a 64-token chunk width; bytes count each "
         "input once and leave out the copies and intermediates.",
+        "The flashinfer_* backends fuse the beta sigmoid into the call and need "
+        "head_dim 128 and num_heads divisible by 8.",
     ),
     reference="profiling.runners.attention.kda_chunk_prefill_reference",
 )
@@ -152,6 +173,124 @@ register(
         worker_env=(("TRITON_CACHE_AUTOTUNING", "0"),),
         row_provenance_ref=RunnerRef(
             module_name="profiling.runners.attention.kda_chunk_prefill_vllm_triton",
+            function_name="row_provenance",
+        ),
+    )
+)
+
+
+# FlashInfer's Blackwell KDA prefill (flashinfer/kda.py `recurrent_kda`). Both
+# backends refuse any device but CC 10.0 / 10.3 (`get_compute_capability(...)
+# not in ((10, 0), (10, 3))` in flashinfer/kda_prefill_tirx.py and
+# kda_prefill_persistent.py), hence sm_100a / sm_103a rather than sm_100f.
+# FlashInfer's `ptx` backend is SM103a-only and its `cake` and `small-bh`
+# backends reject an FP32 state, so none of them is registered for this
+# contract.
+_FLASHINFER_BLACKWELL = BackendSupport(
+    compute=frozenset({DType.BF16}),
+    sm_targets=frozenset({"sm_100a", "sm_103a"}),
+)
+_FLASHINFER_RUNNER = "profiling.runners.attention.kda_chunk_prefill_flashinfer"
+_FLASHINFER_KDA_URL = "https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/kda.py"
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_tirx",
+        supports=_FLASHINFER_BLACKWELL,
+        runner_ref=RunnerRef(
+            module_name=_FLASHINFER_RUNNER,
+            function_name="profile_kda_chunk_prefill_flashinfer_tirx",
+        ),
+        table_name=KIND,
+        args_schema=KdaChunkPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="flashinfer_kda_env",
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer recurrent_kda(backend='tirx'), the NVlabs KDA-for-KDA TIRx "
+                "kernel: three q/k/v copies, a host-built work plan that uploads its "
+                "work list and clears handoff flags (two small fills) on every call, "
+                "then one persistent BT64 kernel that does the L2 norms, gate, beta "
+                "sigmoid and recurrence, handing FP32 state between CTAs."
+            ),
+            url=_FLASHINFER_KDA_URL,
+        ),
+        row_provenance_ref=RunnerRef(
+            module_name=_FLASHINFER_RUNNER,
+            function_name="row_provenance_tirx",
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_cute_persistent",
+        supports=_FLASHINFER_BLACKWELL,
+        runner_ref=RunnerRef(
+            module_name=_FLASHINFER_RUNNER,
+            function_name="profile_kda_chunk_prefill_flashinfer_cute_persistent",
+        ),
+        table_name=KIND,
+        args_schema=KdaChunkPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="flashinfer_kda_env",
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer recurrent_kda(backend='cute-dsl-persistent'), the CuTe DSL "
+                "persistent prefill kernel: three q/k/v copies, then one kernel that "
+                "does the L2 norms, gate, beta sigmoid and recurrence. Its work plan "
+                "is cached per sequence layout and adds no launch."
+            ),
+            url=_FLASHINFER_KDA_URL,
+        ),
+        row_provenance_ref=RunnerRef(
+            module_name=_FLASHINFER_RUNNER,
+            function_name="row_provenance_cute_persistent",
+        ),
+    )
+)
+
+
+# FlashKDA: upstream vLLM's default KDA prefill on SM90/SM10x/SM12x.
+# vllm/models/glm5next/common/kda.py `_resolve_kda_prefill_backend` picks it for
+# CUDA major 9/10/12, bf16, head_dim 128 and a bounded gate; vLLM builds it
+# (cmake/external_projects/flashkda.cmake, vllm-project/FlashKDA@17a037d) for
+# 9.0a, 10.0f and 12.0f with CUDA 13, and flash_kda.cpp checks bf16 q/k/v/g/beta/
+# out and D == 128. The TMA/setmaxnreg kernels have no pre-SM90 build.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashkda",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_90a", "sm_100f", "sm_120f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_chunk_prefill_flashkda",
+            function_name="profile_kda_chunk_prefill_flashkda",
+        ),
+        table_name=KIND,
+        args_schema=KdaChunkPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="flashkda_env",
+        doc=BackendDoc(
+            summary=(
+                "FlashKDA (vLLM's _flashkda_C), as vLLM's _flashkda_prefill calls it: "
+                "q, k and v copies, then one fwd that transposes beta, runs a "
+                "prepare kernel (L2 norms, gate, 16-token chunk factors) and a "
+                "recurrence kernel. Only head_dim 128. Unlike vllm_triton, it "
+                "takes raw beta logits and applies the sigmoid inside the call, "
+                "so no separate beta sigmoid runs outside it."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/models/glm5next/common/kda.py",
+        ),
+        row_provenance_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_chunk_prefill_flashkda",
             function_name="row_provenance",
         ),
     )

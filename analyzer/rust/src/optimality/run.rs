@@ -17,11 +17,13 @@ use crate::io::{
 use crate::kernel_query::owning_repo_root;
 use crate::session::{register_cost_log, require_columns, COST_LOG_TABLE};
 
+use super::compute_dtype::ComputeDtypeFields;
 use super::ladder::NecessaryWorkPolicy;
 use super::spec::{self, GpuSpec};
 use super::{
     bucket_keys, ms_to_s, ratio, rung_keys, BUCKET_KEYS, FLOORS_TARGET_SAMPLED_ITERS,
-    KERNEL_RUNG_KEYS, RUNG_KEYS, UNLOCKED_ITERATION_REPLICATION_FACTOR,
+    FLOORS_TARGET_SAMPLED_PREFILL_ITERS, KERNEL_RUNG_KEYS, RUNG_KEYS,
+    UNLOCKED_ITERATION_REPLICATION_FACTOR,
 };
 use super::{floors, fold, grid_peaks, kernel, levels, location, prepare};
 
@@ -130,9 +132,21 @@ pub async fn run_optimality(
         ));
     }
 
+    let compute_dtypes = ComputeDtypeFields::for_repo(repository_root.as_deref());
+    if !compute_dtypes.is_available() {
+        caveats.push(format!(
+            "kernel compute dtypes {}: R5 peaks guess each leaf's dtype from its config keys",
+            compute_dtypes.source
+        ));
+    }
+
     // Intern locations + precompute per-section metadata.
-    let (kernel_locations, section_fold_plan_by_key) =
-        prepare::build_section_fold_plans(&manifests_by_worker, &grid_peak_catalog, &gpu_spec);
+    let (kernel_locations, section_fold_plan_by_key) = prepare::build_section_fold_plans(
+        &manifests_by_worker,
+        &grid_peak_catalog,
+        &gpu_spec,
+        &compute_dtypes,
+    );
     let kernel_locations_by_worker = prepare::kernel_locations_by_worker(&manifests_by_worker);
 
     // Exact per-worker busy + span (all rows).
@@ -191,7 +205,13 @@ pub async fn run_optimality(
     // its roofline with occurrence weight. Unlocked composition uses one saturated
     // large-batch label per worker and may recompute rooflines after work rollup.
     let run_label_result = if lock_batch_size {
-        floors::compute_batch_locked_run_labels(ctx, log_dir, FLOORS_TARGET_SAMPLED_ITERS).await
+        floors::compute_batch_locked_run_labels(
+            ctx,
+            log_dir,
+            FLOORS_TARGET_SAMPLED_ITERS,
+            FLOORS_TARGET_SAMPLED_PREFILL_ITERS,
+        )
+        .await
     } else {
         floors::compute_saturated_run_labels(ctx, log_dir, UNLOCKED_ITERATION_REPLICATION_FACTOR)
             .await
@@ -341,6 +361,8 @@ pub async fn run_optimality(
         "composed_necessary_work_iterations": run_labels.as_ref().and_then(|labels| labels.batch_locked_iterations),
         "composed_necessary_work_sampled_iterations": run_labels.as_ref().and_then(|labels| labels.batch_locked_sampled_iterations),
         "composed_necessary_work_sample_stride": run_labels.as_ref().and_then(|labels| labels.batch_locked_sample_stride),
+        "composed_necessary_work_prefill_iterations": run_labels.as_ref().and_then(|labels| labels.batch_locked_prefill_iterations),
+        "composed_necessary_work_sampled_prefill_iterations": run_labels.as_ref().and_then(|labels| labels.batch_locked_sampled_prefill_iterations),
         "composed_necessary_work_affine_bases": run_labels.as_ref().and_then(|labels| labels.batch_locked_affine_bases),
         "composed_necessary_work_direct_fallback_bases": run_labels.as_ref().and_then(|labels| labels.batch_locked_direct_fallback_bases),
         "composed_location_mapping_ids": composed_location_mapping_ids,

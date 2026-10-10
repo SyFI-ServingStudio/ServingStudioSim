@@ -78,6 +78,51 @@ inherited site-packages from `PYTHONPATH`, so the project Torch cannot shadow
 the venv's own build. Once the container is rebuilt from the rebased checkout,
 move those backends to `vllm_env` and remove this env.
 
+`flashkda_env` is a host venv at `~/profile_envs/flashkda_env` (a symlink to a
+disk with room is fine) for the `kda_chunk_prefill` `flashkda` backend. It holds
+Torch 2.13.0 (cu130, upstream vLLM's pin) and FlashKDA built from
+`vllm-project/FlashKDA@17a037d98da546deb4591e967cf961a43c034d8b`, the commit
+upstream vLLM vendors as `_flashkda_C`. The project Torch is cu128 and cannot
+build FlashKDA's `sm_100f`/`sm_120f` code, so the backend needs its own venv.
+Build it with a CUDA 13 toolkit:
+
+```bash
+uv venv --python 3.12 ~/profile_envs/flashkda_env
+uv pip install --python ~/profile_envs/flashkda_env/bin/python \
+  torch==2.13.0 numpy nvidia-ml-py setuptools wheel packaging ninja
+git clone https://github.com/vllm-project/FlashKDA.git && cd FlashKDA
+git checkout 17a037d98da546deb4591e967cf961a43c034d8b
+git submodule update --init --depth 1 cutlass
+CUDA_HOME=/usr/local/cuda-13.1 FLASH_KDA_CUDA_ARCHS=90a,100f,120f \
+  uv pip install --python ~/profile_envs/flashkda_env/bin/python --no-build-isolation .
+```
+
+The package version (`0.0.1+17a037d`) goes into each row's `backend_version`.
+
+`flashinfer_kda_env` is a host venv at `~/profile_envs/flashinfer_kda` (or a
+symlink to it) for the `kda_chunk_prefill` `flashinfer_*` backends. FlashInfer's
+Blackwell KDA prefill kernels are only on its main branch, and they need Torch
+cu130, CuTe DSL >= 4.7 and a CUDA-enabled TVM with TIRx, so neither the project
+venv nor `vllm_env` can host them. `profiling/exec/flashinfer_kda_env.sh [DIR]`
+builds it from a pinned, hash-checked FlashInfer nightly. TIRx compiles its
+kernels with the CUDA 13 `nvcc` on `CUDA_PATH`/`PATH`; FlashInfer's JIT cache
+follows `FLASHINFER_WORKSPACE_BASE` (default `$HOME`).
+
+`causal_conv1d_env` serves the `gdn_causal_conv_prefill` `dao_channellast`
+backend. It runs the project interpreter with one extra import directory,
+`~/profile_envs/causal_conv1d` (a symlink to a disk with room is fine), that
+holds Dao-AILab `causal-conv1d` 1.7.0 from its prebuilt release wheel. The
+wheel is built against the project Torch (2.10, CUDA 12, cxx11 ABI) and ships
+SASS for sm_75 through sm_120, so it needs no venv or compiler. After a project
+Torch upgrade, install the wheel built for the new Torch instead:
+
+```bash
+uv pip install --python .venv/bin/python --no-deps --target ~/profile_envs/causal_conv1d \
+  https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/causal_conv1d-1.7.0+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+```
+
+Rows record `causal-conv1d <version>` as `backend_version`.
+
 `Timer.cupti`'s duration path is a two-pass GPU-active-time measurement. It
 first records 10 real callable launches, computes
 `ceil(min_duration_ms / estimate_mean_ms)`, then records exactly that many
