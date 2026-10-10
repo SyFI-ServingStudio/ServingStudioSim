@@ -40,10 +40,10 @@ use crate::orchestrator::{
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
-    build_hybrid_chunked_prefill_worker, build_qwen36_hybrid_worker, build_speculative_worker,
-    resolve_prefix_cache_config, BatchPolicy, DpPlacement, IterWorker, IterWorkerSel,
-    KvAdmissionConfig, PendingOrderKind, PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy,
-    WorkerConfig,
+    build_hybrid_chunked_prefill_worker, build_hybrid_speculative_worker,
+    build_qwen36_hybrid_worker, build_speculative_worker, resolve_prefix_cache_config, BatchPolicy,
+    DpPlacement, IterWorker, IterWorkerSel, KvAdmissionConfig, PendingOrderKind,
+    PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -191,7 +191,8 @@ impl Deployment for UnifiedDeployment {
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
             dp_placement: match &g.worker {
-                IterWorkerSel::ChunkedPrefill { dp_placement, .. } => *dp_placement,
+                IterWorkerSel::ChunkedPrefill { dp_placement, .. }
+                | IterWorkerSel::Speculative { dp_placement, .. } => *dp_placement,
                 _ => DpPlacement::RoundRobin,
             },
             ..WorkerConfig::default()
@@ -746,6 +747,39 @@ impl Deployment for UnifiedDeployment {
                     gpu_name,
                     dp_cfg,
                     build_speculative_worker,
+                ))
+            }
+            // DFlash2 on GLM-5.3-Flash: verify on the Flash target, draft reused
+            // from GLM-5.3. KDA state and any per-request draft state share the
+            // attention budget, so the speculative recipe uses the hybrid store.
+            IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { draft_tokens, .. } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(
+                    &g.arch, &gpu_name, MODEL_NAME, bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_hybrid_speculative_worker,
+                ))
+            }
+            IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { draft_tokens, .. } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+                    &g.arch, &gpu_name, MODEL_NAME, bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_hybrid_speculative_worker,
                 ))
             }
             IterArchSel::Glm52VllmNvfp4DpAttnDsaMoe {

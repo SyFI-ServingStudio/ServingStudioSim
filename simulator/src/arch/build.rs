@@ -24,22 +24,22 @@ use crate::arch::{
     deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
     glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
     glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
-    glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense,
-    llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
-    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
-    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
-    DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV4ModelCfg,
-    DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel, DenseTpParallel,
-    Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode,
-    Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
-    Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel,
-    Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
-    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashKernelPath,
-    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel,
-    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
-    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel,
-    Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel,
-    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_flash_vllm_nvfp4_dflash2,
+    glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
+    qwen36_local, qwen3_attn_layerwise, qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise,
+    qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn,
+    AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel,
+    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
+    DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg,
+    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
+    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel,
+    Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
+    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel,
+    Glm53FlashKernelPath, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel,
+    Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel, Glm53FlashVllmParallel,
+    Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
+    Llama3DpAttnTpFfnModel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
+    Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
     Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
     Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
     Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
@@ -1590,7 +1590,7 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
     )
     .context("expanding GLM NVFP4 target configs for a DFlash2 deployment")?;
     let resolved = glm52_vllm_nvfp4_dsa_moe::resolve_configs(&configs);
-    let draft = dflash2_draft_resolved(&parallel, draft_tokens, draft_sliding_window)
+    let draft = dflash2_draft_resolved(ep_size, gpu, draft_tokens, draft_sliding_window)
         .context("expanding the DFlash2 draft configs")?;
     glm53_vllm_nvfp4_dsa_moe_dflash2::build_dflash2(name.to_string(), resolved, draft, bridge)
         .context("building GLM-5.3 NVFP4 + DFlash2 (often a missing profile.db row)")
@@ -1601,7 +1601,8 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
 /// head_dim 128, vocab 154880, `conv_kernel_size` 2, `conv_group_size` 16,
 /// `selector_rank` 256, `selector_top_k` 16, and six `target_layer_ids`.
 fn dflash2_draft_resolved(
-    parallel: &Glm52VllmNvfp4DsaMoeParallel,
+    tp_size: u16,
+    gpu: &str,
     draft_tokens: u32,
     sliding_window: u32,
 ) -> Result<Dflash2DraftResolved> {
@@ -1610,8 +1611,7 @@ fn dflash2_draft_resolved(
         sliding_window > 0,
         "DFlash2 draft_sliding_window must be positive"
     );
-    let tp_size = parallel.ep_size;
-    let gpu_name = parallel.gpu_name.clone();
+    let gpu_name = gpu.to_string();
     let layer_cfg = Dflash2DraftLayerLocalWorkletConfig {
         residual_norm_backends: vec!["vllm_cuda"],
         norm_backends: vec!["flashinfer"],
@@ -1684,6 +1684,121 @@ fn dflash2_draft_resolved(
             fabric: Fabric::Nvlink,
         },
     })
+}
+
+/// GLM-5.3-Flash NVFP4 (TP/EP graph) verifying a DFlash2 proposer. The target
+/// is [`glm53_flash_vllm_fp8_kda_dsa_moe`] unchanged; the draft runs at the
+/// target's TP.
+pub fn glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(
+    sel: &IterArchSel,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<glm53_flash_vllm_nvfp4_dflash2::Glm53FlashVllmNvfp4Dflash2Model<Glm53FlashVllmModel>> {
+    let IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 {
+        model,
+        tp_size,
+        enable_expert_parallel,
+        max_model_len,
+        routing,
+        routing_seed,
+        expert_popularity_file,
+        token_corpus_file,
+        cudagraph_capture_sizes,
+        draft_tokens,
+        draft_sliding_window,
+        draft_kv_full_attention,
+        ..
+    } = sel
+    else {
+        bail!("{sel:?} is not glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2");
+    };
+    let target = glm53_flash_vllm_fp8_kda_dsa_moe(
+        model,
+        Glm53FlashQuant::Nvfp4,
+        *tp_size,
+        *enable_expert_parallel,
+        *max_model_len,
+        *routing,
+        *routing_seed,
+        expert_popularity_file.as_deref(),
+        token_corpus_file.as_deref(),
+        cudagraph_capture_sizes,
+        glm53_flash_kernel_path(sel)?,
+        gpu,
+        name,
+        bridge,
+    )?;
+    let draft = dflash2_draft_resolved(*tp_size, gpu, *draft_tokens, *draft_sliding_window)
+        .context("expanding the DFlash2 draft configs")?;
+    glm53_flash_vllm_nvfp4_dflash2::build(
+        name,
+        target,
+        *max_model_len,
+        *draft_tokens,
+        &draft,
+        *draft_kv_full_attention,
+        bridge,
+    )
+    .context("building GLM-5.3-Flash NVFP4 + DFlash2 (often a missing profile.db row)")
+}
+
+/// GLM-5.3-Flash NVFP4 (DP-attention/EP graph) verifying a DFlash2 proposer:
+/// one TP1 draft per attention DP rank.
+pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+    sel: &IterArchSel,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<
+    glm53_flash_vllm_nvfp4_dflash2::Glm53FlashVllmNvfp4Dflash2Model<
+        glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpModel,
+    >,
+> {
+    let IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+        model,
+        ep_size,
+        max_model_len,
+        routing,
+        routing_seed,
+        expert_popularity_file,
+        token_corpus_file,
+        cudagraph_capture_sizes,
+        draft_tokens,
+        draft_sliding_window,
+        draft_kv_full_attention,
+        ..
+    } = sel
+    else {
+        bail!("{sel:?} is not glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2");
+    };
+    let target = glm53_flash_vllm_fp8_dp_attn_ep_moe(
+        model,
+        Glm53FlashQuant::Nvfp4,
+        *ep_size,
+        *max_model_len,
+        *routing,
+        *routing_seed,
+        expert_popularity_file.as_deref(),
+        token_corpus_file.as_deref(),
+        cudagraph_capture_sizes,
+        glm53_flash_kernel_path(sel)?,
+        gpu,
+        name,
+        bridge,
+    )?;
+    let draft = dflash2_draft_resolved(1, gpu, *draft_tokens, *draft_sliding_window)
+        .context("expanding the DFlash2 draft configs")?;
+    glm53_flash_vllm_nvfp4_dflash2::build(
+        name,
+        target,
+        *max_model_len,
+        *draft_tokens,
+        &draft,
+        *draft_kv_full_attention,
+        bridge,
+    )
+    .context("building GLM-5.3-Flash NVFP4 DP + DFlash2 (often a missing profile.db row)")
 }
 
 /// Build SGLang's B200 GLM-5.2 NVFP4 graph under pure tensor parallelism.
@@ -1844,6 +1959,16 @@ pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath
             mla_layout_copies,
             indexer_max_logits_mb,
             ..
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 {
+            mla_layout_copies,
+            indexer_max_logits_mb,
+            ..
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+            mla_layout_copies,
+            indexer_max_logits_mb,
+            ..
         } => (*mla_layout_copies, *indexer_max_logits_mb),
         other => unreachable!("{other:?} is not a GLM-5.3-Flash arch tag"),
     };
@@ -1861,7 +1986,9 @@ pub fn glm53_flash_quant(sel: &IterArchSel) -> Glm53FlashQuant {
     match sel {
         IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe { .. }
         | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe { .. }
-        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe { .. } => Glm53FlashQuant::Nvfp4,
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe { .. }
+        | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { .. }
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. } => Glm53FlashQuant::Nvfp4,
         IterArchSel::Glm53FlashVllmFp8KdaDsaMoe { .. }
         | IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe { .. }
         | IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe { .. } => Glm53FlashQuant::Fp8Block,
@@ -2277,7 +2404,9 @@ pub fn build_iter_model(
             bridge,
         )?),
         IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
-        | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
+        | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+        | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { .. }
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
         }
     })
@@ -2346,6 +2475,18 @@ pub fn build_speculative_iter_model(
                 gpu,
                 name,
                 bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { draft_tokens, .. } => Ok((
+            Box::new(glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(
+                selector, gpu, name, bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { draft_tokens, .. } => Ok((
+            Box::new(glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+                selector, gpu, name, bridge,
             )?),
             *draft_tokens,
         )),
@@ -2588,7 +2729,9 @@ fn build_arch(
                 // own tree: the verify pass plus its draft passes.
                 let (gpus, shape, manifest) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
-                    | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
+                    | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+                    | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { .. }
+                    | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. } => {
                         let (model, draft_tokens) = build_speculative_iter_model(
                             selector,
                             gpu,
@@ -3603,14 +3746,8 @@ mod tests {
         // allocates the draft layers "as full attention for cache allocation".
         // Billing a window would under-count the pool by context / window,
         // which at 131072 tokens is 64x.
-        let parallel = Glm52VllmNvfp4DsaMoeParallel {
-            ep_size: 4,
-            nvl_num_gpu: 4,
-            max_model_len: 8192,
-            gpu_name: "NVIDIA B200".to_string(),
-        };
-        let narrow = dflash2_draft_resolved(&parallel, 7, 512).unwrap();
-        let wide = dflash2_draft_resolved(&parallel, 7, 131_072).unwrap();
+        let narrow = dflash2_draft_resolved(4, "NVIDIA B200", 7, 512).unwrap();
+        let wide = dflash2_draft_resolved(4, "NVIDIA B200", 7, 131_072).unwrap();
         let narrow_bytes =
             glm53_vllm_nvfp4_dsa_moe_dflash2::draft_kv_bytes_per_token(&narrow).unwrap();
         assert_eq!(

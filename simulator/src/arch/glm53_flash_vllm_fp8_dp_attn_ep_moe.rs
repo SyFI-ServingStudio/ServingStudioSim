@@ -732,13 +732,20 @@ fn build_group(
 
 impl Glm53FlashDpAttnEpModel {
     pub fn cost_tree(&self) -> CostTree {
-        let dp = usize::from(self.dp_size);
         let mut builder = CostTreeBuilder::new();
+        let root = self.compile_root(&mut builder);
+        builder.finish(root)
+    }
+
+    /// The whole forward as one node in `builder`, so a speculative model can
+    /// compile it beside its draft stage. [`Self::eval_into`] fills it.
+    pub(crate) fn compile_root(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        let dp = usize::from(self.dp_size);
         let prologue = (0..dp)
             .map(|_| {
                 CostNode::Sum(vec![
-                    self.embedding.compile(&mut builder),
-                    self.hc_expand.compile(&mut builder),
+                    self.embedding.compile(builder),
+                    self.hc_expand.compile(builder),
                 ])
             })
             .collect();
@@ -750,15 +757,15 @@ impl Glm53FlashDpAttnEpModel {
             }),
         }];
         for group in &self.groups {
-            children.push(group.compile(dp, &mut builder));
+            children.push(group.compile(dp, builder));
         }
         let epilogue = (0..dp)
             .map(|_| {
                 CostNode::Sum(vec![
-                    self.terminal_post.compile(&mut builder),
-                    self.hc_contract_mean.compile(&mut builder),
-                    self.final_norm.compile(&mut builder),
-                    self.lm_head.compile(&mut builder),
+                    self.terminal_post.compile(builder),
+                    self.hc_contract_mean.compile(builder),
+                    self.final_norm.compile(builder),
+                    self.lm_head.compile(builder),
                 ])
             })
             .collect();
@@ -769,18 +776,17 @@ impl Glm53FlashDpAttnEpModel {
                 children: epilogue,
             }),
         });
-        let root = CostNode::Labeled {
+        CostNode::Labeled {
             label: format!(
                 "{} (Glm53FlashDpAttnEpModel) [attention DP{}/TP1; MoE EP{} \
                  all_gatherv/reduce_scatterv; timing_context<={}]",
                 self.name, self.dp_size, self.dp_size, self.max_model_len
             ),
             child: Box::new(CostNode::Sum(children)),
-        };
-        builder.finish(root)
+        }
     }
 
-    fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
+    pub(crate) fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
         let batch = normalize_input(
             input,
             self.dp_size,
