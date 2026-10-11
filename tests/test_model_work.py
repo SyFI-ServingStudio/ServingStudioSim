@@ -1917,12 +1917,16 @@ def test_every_public_arch_on_an_fp4_checkpoint_is_labeled_fp4():
         if "arch" not in preset or "checkpoint" not in preset:
             continue
         config = root / "model" / "config" / f"{catalog[preset['checkpoint']]['config']}.json"
+        raw = json.loads(config.read_text())
         # Only the compute dtype matters here, so per-layer ModelOpt exclusions
         # (GLM-5.3-Flash NVFP4) need no layer resolution.
-        quant = parse_quantization_config(
-            json.loads(config.read_text()), layer_qualified_exclusions=True
-        )
-        fp4 = quant is not None and quant.compute_dtype == "fp4"
+        quant = parse_quantization_config(raw, layer_qualified_exclusions=True)
+        # Inkling keeps ModelOpt's hf_quant_config.json verbatim instead of a
+        # quantization_config; model/work/models/inkling.py reads it from there.
+        hf_quant = (raw.get("hf_quant_config") or {}).get("quantization") or {}
+        fp4 = (quant is not None and quant.compute_dtype == "fp4") or hf_quant.get(
+            "quant_algo"
+        ) == "NVFP4"
         assert (preset["arch"]["type"] in work_floors._FP4_ARCHS) == fp4, path.name
 
 
@@ -3337,3 +3341,410 @@ def test_unlocked_pipeline_stage_levels_add_up_to_one_whole_model(monkeypatch, a
     assert result["pp/__saturated_worker__/1"] == result["pp/1"]
     assert "sum of its stages" in result["pp"]["error"]
     assert "sum of its stages" in result["cluster"]["error"]
+
+
+# ---------------------------------------------------------------------------
+# Inkling (InklingForConditionalGeneration): relative-position SWA/global attention,
+# short convolutions, sink-expert MoE, ModelOpt NVFP4 routed experts.
+# ---------------------------------------------------------------------------
+
+INKLING_SMALL = (
+    Path(__file__).resolve().parents[1] / "model" / "config" / "inkling_small_nvfp4.json"
+)
+INKLING_LARGE = Path(__file__).resolve().parents[1] / "model" / "config" / "inkling_nvfp4.json"
+INKLING_MAPS = Path(__file__).resolve().parents[1] / "model" / "work" / "location_maps"
+# Inkling-Small text_config, read off config.json and the checkpoint shapes.
+INK_H, INK_LAYERS, INK_HEADS, INK_KV, INK_HD, INK_DREL = 4096, 42, 32, 8, 128, 16
+INK_REL_EXTENT, INK_WINDOW, INK_SCONV = 1024, 512, 4
+INK_DENSE_I, INK_I, INK_E, INK_TOPK, INK_SINKS = 16384, 2048, 256, 6, 2
+INK_VOCAB, INK_VOCAB_ROWS = 200_058, 201_024
+INK_GLOBAL = (5, 11, 17, 23, 29, 35, 41)
+INK_STACKS = {
+    "local_dense": (0, 1),
+    "local_bf16_moe": (2,),
+    "local_nvfp4_moe": tuple(
+        layer for layer in range(3, INK_LAYERS) if layer not in INK_GLOBAL
+    ),
+    "global_nvfp4_moe": INK_GLOBAL,
+}
+# Logical text-path (`model.llm.*`) parameters of the safetensors headers: equal in
+# thinkingmachines/Inkling-Small (BF16; 265,956,439,090 in all, with 64,080,384
+# vision + 5,246,976 audio + 2,231,912,456 MTP) and Inkling-Small-NVFP4 @ b6a99534
+# (two E2M1 weights per packed byte, scales excluded).
+INK_SMALL_TEXT_PARAMS = 263_655_199_274
+# thinkingmachines/Inkling-NVFP4 headers, model.llm.* (952,377,623,626 in all).
+INK_LARGE_TEXT_PARAMS = 947_025_564_226
+# Inkling-Small-NVFP4 model.llm.* stored bytes, and the parts model.work leaves
+# out: the per-tensor scalars it treats as negligible — per-expert FP32 scale2
+# (79,872 B), BF16 input_amax (156 B), int64 original_shape (1,872 B) — and the
+# 966 padding rows of embed and unembed, which no forward reads.
+INK_SMALL_TEXT_BYTES = 166_130_594_960
+INK_SMALL_UNREAD_BYTES = 79_872 + 156 + 1_872 + 2 * (INK_VOCAB_ROWS - INK_VOCAB) * INK_H * 2
+
+
+def _inkling_text_params(
+    hidden, layers, heads, kv_global, kv_local, head_dim, global_layers, dense_layers,
+    dense_intermediate, intermediate, *, d_rel=16, rel_extent=1024, window=512, sconv=4,
+    experts=256, top_k=6, sinks=2, rows=201_024, activated=False,
+):
+    """Hand inventory of one Inkling text decoder, tensor by checkpoint tensor."""
+    total = 2 * rows * hidden + 2 * hidden  # embed, unembed; embed_norm, final norm
+    if activated:
+        total -= 2 * rows * hidden
+    for layer in range(layers):
+        is_global = layer in global_layers
+        kv = kv_global if is_global else kv_local
+        total += (heads + 2 * kv) * head_dim * hidden + heads * d_rel * hidden  # wq|wk|wv|wr
+        total += hidden * heads * head_dim  # wo_ud
+        total += d_rel * (rel_extent if is_global else window)  # rel_logits_proj
+        total += 2 * kv * head_dim * sconv + 2 * head_dim  # k/v_sconv, q/k_norm
+        total += 2 * hidden * sconv + 2 * hidden  # attn/mlp_sconv, attn/mlp_norm
+        if layer < dense_layers:
+            total += 3 * dense_intermediate * hidden + 1  # w13_dn, w2_md, global_scale
+            continue
+        used_experts = top_k if activated else experts
+        total += used_experts * 3 * intermediate * hidden  # routed w13 + w2
+        total += sinks * 3 * intermediate * hidden  # sink (shared) w13 + w2
+        total += (experts + sinks) * hidden + experts + 1  # gate weight, bias, global_scale
+    return total
+
+
+@pytest.fixture(scope="module")
+def inkling():
+    return load_model(INKLING_SMALL)
+
+
+def test_inkling_registry_schedule_and_precision(inkling):
+    from model.work.models import inkling as inkling_builder
+
+    assert REGISTRY["InklingForConditionalGeneration"] is inkling_builder.build
+    assert {stack.tag: stack.layers for stack in inkling.layers} == INK_STACKS
+    assert inkling.vocab == INK_VOCAB and inkling.param_vocab == INK_VOCAB_ROWS
+    by_tag = {stack.tag: stack for stack in inkling.layers}
+    assert by_tag["global_nvfp4_moe"].attn.window is None
+    assert by_tag["global_nvfp4_moe"].attn.rel_extent == INK_REL_EXTENT
+    assert by_tag["local_nvfp4_moe"].attn.window == INK_WINDOW
+    assert by_tag["local_nvfp4_moe"].attn.rel_extent == INK_WINDOW
+    router = by_tag["local_nvfp4_moe"].ffn.matmul_groups()[0]
+    assert (router.name, router.n) == ("router", INK_E + INK_SINKS)  # 258, not vLLM's 264
+    dtypes = {
+        segment.name: segment.compute_dtype
+        for segment in inkling.label(Workload.causal_lm(decode=[64])).segments
+    }
+    assert dtypes["local_nvfp4_moe.expert_gate_up"] == "fp4"
+    assert dtypes["global_nvfp4_moe.expert_down"] == "fp4"
+    # Layer 2's experts are excluded from quantization; everything else is BF16.
+    assert dtypes["local_bf16_moe.expert_gate_up"] == "bf16"
+    fp4 = {name for name, dtype in dtypes.items() if dtype == "fp4"}
+    assert fp4 == {
+        f"{tag}.expert_{projection}"
+        for tag in ("local_nvfp4_moe", "global_nvfp4_moe")
+        for projection in ("gate_up", "down")
+    }
+
+
+def test_inkling_params_reconcile_with_the_safetensors_headers(inkling):
+    params = inkling.label(Workload(matmul_tokens=0, head_positions=0)).params
+    hand = _inkling_text_params(
+        INK_H, INK_LAYERS, INK_HEADS, INK_KV, INK_KV, INK_HD, INK_GLOBAL, 2, INK_DENSE_I, INK_I
+    )
+    assert hand == INK_SMALL_TEXT_PARAMS
+    assert params["total"] == INK_SMALL_TEXT_PARAMS
+    activated = _inkling_text_params(
+        INK_H, INK_LAYERS, INK_HEADS, INK_KV, INK_KV, INK_HD, INK_GLOBAL, 2, INK_DENSE_I, INK_I,
+        activated=True,
+    )
+    assert params["activated"]["layers"] == activated == 10_350_170_666
+    assert params["activated"]["with_embed_head"] == 11_996_959_274
+    assert params["breakdown"]["embedding"] == params["breakdown"]["lm_head"] == 201_024 * 4096
+    assert params["breakdown"]["experts"] == 40 * INK_E * 3 * INK_I * INK_H
+    assert params["breakdown"]["shared"] == 40 * INK_SINKS * 3 * INK_I * INK_H
+    assert params["breakdown"]["router"] == 40 * ((INK_E + INK_SINKS) * INK_H + INK_E + 1)
+    assert compute_parameter_counts(INKLING_SMALL)["total"] == INK_SMALL_TEXT_PARAMS
+    # The large checkpoint: 66 layers, 6144 wide, 16 KV heads on its local layers.
+    large = load_model(INKLING_LARGE).label(Workload(matmul_tokens=0, head_positions=0))
+    large_global = tuple(range(5, 66, 6))
+    assert (
+        _inkling_text_params(6144, 66, 64, 8, 16, 128, large_global, 2, 24576, 3072)
+        == large.params["total"]
+        == INK_LARGE_TEXT_PARAMS
+    )
+
+
+def test_inkling_saturated_weight_bytes_reconcile_with_the_checkpoint(inkling):
+    """With every expert hit, every table row gathered and every context past the
+    relative extent, the label reads each text-path tensor once at its stored
+    precision — exactly the checkpoint bytes less the bytes no forward needs."""
+    tokens = 300_000  # > vocab, and enough top-6 draws to hit all 256 experts
+    workload = Workload(
+        matmul_tokens=tokens,
+        head_positions=tokens,
+        attn=[AttnInteraction(1, 2048, 2047, "causal", "decode", tokens)],
+        attention_step_count=tokens,
+        attention_step_count_by_phase={"prefill": 0, "decode": tokens},
+        attention_tokens_by_phase={"prefill": 0, "decode": tokens},
+    )
+    weights = inkling.label(workload).bytes["weights"]
+    assert weights == INK_SMALL_TEXT_BYTES - INK_SMALL_UNREAD_BYTES
+
+
+# Per-token matmul FLOPs (2·n·k), hand-derived per Inkling-Small layer.
+INK_QKVR = (INK_HEADS + 2 * INK_KV) * INK_HD + INK_HEADS * INK_DREL  # 6656
+INK_ATTN_MM = 2 * INK_QKVR * INK_H + 2 * INK_H * INK_HEADS * INK_HD  # 88,080,384
+INK_SCONV_MM = 2 * 2 * INK_KV * INK_HD * INK_SCONV + 2 * 2 * INK_H * INK_SCONV  # 81,920
+INK_DENSE_MM = 2 * 3 * INK_DENSE_I * INK_H  # 402,653,184
+INK_ROUTER_MM = 2 * (INK_E + INK_SINKS) * INK_H  # 2,113,536
+INK_MOE_MM = (INK_TOPK + INK_SINKS) * 2 * 3 * INK_I * INK_H  # 402,653,184
+INK_LM_HEAD = 2 * INK_H * INK_VOCAB  # 1,638,875,136
+INK_PAIR = 4 * INK_HEADS * INK_HD  # QK + PV per (query, key) pair
+INK_REL = 2 * INK_HEADS * INK_DREL  # relative logits per (query, distance) pair
+
+
+def _ink_capped(n: int, cap: int) -> int:
+    """sum_{j=1..n} min(j, cap), written out independently of the spec."""
+    return sum(min(j, cap) for j in range(1, n + 1))
+
+
+def _ink_layer_flops(tokens: int, local: bool, dense: bool, pairs: int, distances: int) -> int:
+    ffn = INK_DENSE_MM if dense else INK_ROUTER_MM + INK_MOE_MM
+    return tokens * (INK_ATTN_MM + INK_SCONV_MM + ffn) + INK_PAIR * pairs + INK_REL * distances
+
+
+def test_inkling_decode_and_prefill_flop_goldens(inkling):
+    # One decode token at kv_len 4096 (4095 cached): a local layer sees 512 keys and
+    # 512 distances, a global layer 4096 keys and 1024 distances.
+    decode = {
+        "local_dense": _ink_layer_flops(1, True, True, 512, 512),
+        "local_moe": _ink_layer_flops(1, True, False, 512, 512),
+        "global_moe": _ink_layer_flops(1, False, False, 4096, 1024),
+    }
+    assert decode == {
+        "local_dense": 499_728_384,
+        "local_moe": 501_841_920,
+        "global_moe": 561_086_464,
+    }
+    label = inkling.label(Workload.causal_lm(decode=[4096]))
+    assert sum(label.flops.values()) == (
+        2 * decode["local_dense"] + 33 * decode["local_moe"] + 7 * decode["global_moe"]
+        + INK_LM_HEAD
+    ) == 23_126_720_512
+    assert label.flops["lm_head"] == INK_LM_HEAD
+    assert label.flops["router"] == 40 * INK_ROUTER_MM
+    assert label.flops["residual_mix"] == 42 * 2 * 2 * INK_H * INK_SCONV
+
+    # A 1024-token prefill from position 0, one sampled position.
+    local_pairs, global_pairs = _ink_capped(1024, 512), 1024 * 1025 // 2
+    assert (local_pairs, global_pairs) == (393_472, 524_800)
+    prefill = {
+        "local_dense": _ink_layer_flops(1024, True, True, local_pairs, local_pairs),
+        "local_moe": _ink_layer_flops(1024, True, False, local_pairs, local_pairs),
+        "global_moe": _ink_layer_flops(1024, False, False, global_pairs, global_pairs),
+    }
+    assert prefill == {
+        "local_dense": 509_444_620_288,
+        "local_moe": 511_608_881_152,
+        "global_moe": 513_895_038_976,
+    }
+    label = inkling.label(Workload.causal_lm(prefill=[(1024, 0)]))
+    assert sum(label.flops.values()) == (
+        2 * prefill["local_dense"] + 33 * prefill["local_moe"] + 7 * prefill["global_moe"]
+        + INK_LM_HEAD
+    ) == 21_500_886_466_560
+    names = {segment.name: segment for segment in label.segments}
+    assert names["global_nvfp4_moe.attn.prefill"].flops == INK_PAIR * global_pairs
+    assert names["local_dense.attn.prefill"].flops == INK_PAIR * local_pairs
+    assert names["local_dense.rel_logits"].flops == INK_REL * local_pairs
+
+
+def test_inkling_decode_byte_goldens(inkling):
+    label = inkling.label(Workload.causal_lm(decode=[4096]))
+    rows = {segment.name: segment.bytes for segment in label.segments}
+    kv_token = 2 * INK_KV * INK_HD * 2  # K + V, BF16
+    # Cached keys: 511 inside a local window, all 4095 on a global layer.
+    assert rows["local_nvfp4_moe.attn.decode"] == 511 * kv_token
+    assert rows["global_nvfp4_moe.attn.decode"] == 4095 * kv_token
+    assert rows["local_nvfp4_moe.kv_cache_append"] == kv_token
+    # Short-conv state: three cached rows read, one new row written, per stream.
+    assert rows["local_dense.kv_sconv_state"] == (3 + 1) * kv_token
+    assert rows["local_dense.attn_sconv_state"] == (3 + 1) * INK_H * 2
+    assert rows["global_nvfp4_moe.rel_logits"] == INK_DREL * INK_REL_EXTENT * 2
+    assert rows["local_dense.rel_logits"] == INK_DREL * INK_WINDOW * 2
+    # NVFP4: half a byte per weight plus one FP8 scale per 16; BF16 elsewhere.
+    expert = 3 * INK_I * INK_H
+    hit = INK_E * (1 - (1 - 1 / INK_E) ** INK_TOPK)
+    nvfp4 = rows["local_nvfp4_moe.expert_gate_up"] + rows["local_nvfp4_moe.expert_down"]
+    assert nvfp4 == pytest.approx(hit * expert * (0.5 + 1 / 16))
+    bf16 = rows["local_bf16_moe.expert_gate_up"] + rows["local_bf16_moe.expert_down"]
+    assert bf16 == pytest.approx(hit * expert * 2)
+    assert rows["local_nvfp4_moe.shared_gate_up"] == 2 * INK_I * INK_SINKS * INK_H * 2
+    assert rows["local_nvfp4_moe.router"] == (INK_E + INK_SINKS) * INK_H * 2
+    assert rows["local_nvfp4_moe.router_bias"] == INK_E * 4
+    assert rows["local_nvfp4_moe.router_global_scale"] == 4
+    assert rows["local_dense.global_scale"] == 2
+    assert rows["lm_head"] == INK_VOCAB * INK_H * 2  # the padding rows are never read
+    assert rows["local_dense.qkvr"] == INK_QKVR * INK_H * 2
+
+
+def test_inkling_large_decode_kv_bytes_follow_each_layer_kind():
+    """Inkling-NVFP4 (the TP8 checkpoint) gives its local layers 16 KV heads
+    (``swa_num_key_value_heads``) and its global layers 8 (``num_key_value_heads``),
+    so the two kinds read different bytes per cached key."""
+    label = load_model(INKLING_LARGE).label(Workload.causal_lm(decode=[4096]))
+    rows = {segment.name: segment.bytes for segment in label.segments}
+    # K + V x KV heads x head_dim 128 x 2 B (BF16): 2*16*128*2 = 8192 B local,
+    # 2*8*128*2 = 4096 B global.
+    # Local: 511 cached keys inside the 512-key window, 511 * 8192 = 4,186,112 B.
+    assert rows["local_nvfp4_moe.attn.decode"] == 4_186_112
+    # Global: every one of the 4095 cached keys, 4095 * 4096 = 16,773,120 B.
+    assert rows["global_nvfp4_moe.attn.decode"] == 16_773_120
+
+
+def test_inkling_window_extent_and_state_caps(inkling):
+    def rows(workload):
+        return {segment.name: segment for segment in inkling.label(workload).segments}
+
+    short, long = rows(Workload.causal_lm(decode=[1024])), rows(Workload.causal_lm(decode=[8192]))
+    # A local layer's attention and relative logits saturate at its window ...
+    assert short["local_nvfp4_moe.attn.decode"].flops == long["local_nvfp4_moe.attn.decode"].flops
+    assert short["local_nvfp4_moe.rel_logits"].flops == long["local_nvfp4_moe.rel_logits"].flops
+    # ... a global layer's attention grows with context, its logits stop at 1024.
+    assert long["global_nvfp4_moe.attn.decode"].flops == 8 * short[
+        "global_nvfp4_moe.attn.decode"
+    ].flops
+    assert short["global_nvfp4_moe.rel_logits"].flops == long["global_nvfp4_moe.rel_logits"].flops
+    # A long prefill chunk keeps only the last 511 keys of a local layer.
+    chunk = rows(Workload.causal_lm(prefill=[(2048, 0)]))
+    assert chunk["local_dense.kv_cache_append"].bytes == 511 * 2 * INK_KV * INK_HD * 2
+    assert chunk["global_nvfp4_moe.kv_cache_append"].bytes == 2048 * 2 * INK_KV * INK_HD * 2
+    # A fresh prefill reads no state and writes the newest three rows.
+    assert chunk["local_dense.mlp_sconv_state"].bytes == 3 * INK_H * 2
+    # A short prefill reads only the columns of the relative table it reaches.
+    tiny = rows(Workload.causal_lm(prefill=[(100, 0)]))
+    assert tiny["global_nvfp4_moe.rel_logits"].bytes == INK_DREL * 100 * 2
+    assert tiny["global_nvfp4_moe.rel_logits"].flops == INK_REL * 100 * 101 // 2
+
+
+def test_inkling_collapsed_geometry_matches_single_requests(inkling):
+    """The analyzer's collapsed scalars rebuild a mean request: exact for one
+    request; the global causal triangle is exact for any batch."""
+    for exact, totals in (
+        (
+            Workload.causal_lm(prefill=[(1500, 700)]),
+            {"matmul_tokens": 1500, "prefill_tokens": 1500, "decode_passes": 0,
+             "prefill_pairs": 1500 * 700 + 1500 * 1501 // 2, "prefill_cached": 700,
+             "decode_kv": 0, "prefill_requests": 1},
+        ),
+        (
+            Workload.causal_lm(decode=[3000] * 5),
+            {"matmul_tokens": 5, "prefill_tokens": 0, "decode_passes": 5, "prefill_pairs": 0,
+             "prefill_cached": 0, "decode_kv": 15000, "prefill_requests": 0},
+        ),
+    ):
+        collapsed = work_floors._aggregate_workload(totals)
+        expected = {s.name: (s.flops_total, s.bytes_total) for s in inkling.label(exact).segments}
+        got = {s.name: (s.flops_total, s.bytes_total) for s in inkling.label(collapsed).segments}
+        assert got.keys() == expected.keys()
+        for name, value in expected.items():
+            assert got[name] == pytest.approx(value, rel=1e-12), name
+    # Logged request geometry rebuilds exact causal interactions per request.
+    geometry = work_floors._aggregate_workload(
+        {"matmul_tokens": 3, "prefill_tokens": 0, "decode_passes": 3, "prefill_pairs": 0,
+         "prefill_cached": 0, "decode_kv": 100 + 600 + 5000, "prefill_requests": 0,
+         "request_geometry": {"decode:100": 1, "decode:600": 1, "decode:5000": 1}}
+    )
+    rows = {s.name: s for s in inkling.label(geometry).segments}
+    assert rows["local_dense.attn.decode"].flops == INK_PAIR * (100 + 512 + 512)
+    assert rows["local_dense.attn.decode"].bytes == (99 + 511 + 511) * 2 * INK_KV * INK_HD * 2
+
+
+def test_inkling_rejects_unmodeled_checkpoints():
+    raw = json.loads(INKLING_SMALL.read_text())
+    with pytest.raises(ValueError, match="does not model exclusion"):
+        quant = raw["hf_quant_config"]["quantization"]
+        build_model(
+            {**raw, "hf_quant_config": {"quantization": {
+                **quant, "exclude_modules": [*quant["exclude_modules"], "model.llm.extra"]
+            }}}
+        )
+    without_attn = [
+        entry for entry in raw["hf_quant_config"]["quantization"]["exclude_modules"]
+        if entry != "model.llm.layers.7.attn"
+    ]
+    with pytest.raises(ValueError, match="layer 7"):
+        build_model(
+            {**raw, "hf_quant_config": {"quantization": {
+                **raw["hf_quant_config"]["quantization"], "exclude_modules": without_attn
+            }}}
+        )
+    with pytest.raises(ValueError, match="hf_quant_config"):
+        build_model({key: value for key, value in raw.items() if key != "hf_quant_config"})
+
+
+def test_inkling_floors_accept_the_nvfp4_arch(inkling):
+    spec = {"config": str(INKLING_SMALL), "arch_fp8": False, "arch_quant_dtype": "fp4"}
+    assert "inkling_vllm_nvfp4_rel_attn_moe" in work_floors._FP4_ARCHS
+    work_floors._check_precision(inkling, spec)
+
+
+@pytest.mark.parametrize(
+    ("map_file", "config", "ranks", "location_count"),
+    [
+        # Inkling-Small-NVFP4 at TP4 + EP4.
+        ("inkling_vllm_nvfp4_tp4_ep4_unified.json", INKLING_SMALL, 4, 69),
+        # Inkling-NVFP4 at TP8 + EP8: four more routed ranks in each of the three
+        # MoE groups, with an input quant per rank on the two NVFP4 groups.
+        ("inkling_vllm_nvfp4_tp8_ep8_unified.json", INKLING_LARGE, 8, 69 + 4 * (1 + 2 + 2)),
+    ],
+)
+def test_inkling_location_map_consumes_every_semantic_once(
+    map_file, config, ranks, location_count
+):
+    location_map = json.loads((INKLING_MAPS / map_file).read_text())
+    model = load_model(config)
+    assert location_map["schema_version"] == 1
+    assert location_map["mapping_id"] == f"inkling-vllm-nvfp4-tp{ranks}-ep{ranks}-unified-v1"
+    assert location_map["arch_types"] == ["inkling_vllm_nvfp4_rel_attn_moe"]
+    # The set is checked against the compiled tree by the Rust test
+    # `necessary_work_map_covers_the_compiled_locations` in
+    # `simulator/src/arch/inkling_vllm_nvfp4_rel_attn_moe.rs`.
+    locations = [row["location"] for row in location_map["locations"]]
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    assert len(locations) == len(set(locations)) == location_count
+    assert len(mapped) == len(set(mapped)) == 96
+    for workload in (
+        Workload.causal_lm(decode=[4096] * 3, sampled=3),
+        Workload.causal_lm(prefill=[(2048, 0)], sampled=1),
+        work_floors._aggregate_workload(
+            {"matmul_tokens": 2048, "prefill_tokens": 2020, "decode_passes": 28,
+             "prefill_pairs": 2020 * 2021 // 2, "prefill_cached": 0, "decode_kv": 60_000,
+             "prefill_requests": 1}
+        ),
+    ):
+        assert set(mapped) == {segment.name for segment in model.label(workload).segments}
+    semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    # The logits all-gather is communication and has no row.
+    assert "unified.logits_all_gather" not in semantics
+    # The Lamport boundary is not a communication kind: it carries the sublayer
+    # short convolution, its state and the next norm.
+    assert semantics["unified.local_dense.attn.rs_sconv_ag_norm"] == [
+        "local_dense.attn_sconv", "local_dense.attn_sconv_state", "local_dense.mlp_norm"
+    ]
+    assert semantics["unified.global_nvfp4_moe.moe.rs_sconv_ag_norm"][-1] == "final_norm"
+    for tag in ("local_bf16_moe", "local_nvfp4_moe", "global_nvfp4_moe"):
+        assert semantics[f"unified.{tag}.moe.gate_select"] == [
+            f"{tag}.router_bias", f"{tag}.router_global_scale"
+        ]
+        assert semantics[f"unified.{tag}.moe.routed_rank0.fused_moe"] == [
+            f"{tag}.expert_gate_up", f"{tag}.expert_down"
+        ]
+        for rank in range(1, ranks):
+            assert semantics[f"unified.{tag}.moe.routed_rank{rank}.fused_moe"] == []
+        assert f"unified.{tag}.moe.routed_rank{ranks}.fused_moe" not in semantics
+    assert not any(
+        location.endswith("input_quant") and rules for location, rules in semantics.items()
+    )
+    # Zero-minimum leaves: the tau launches, the two activations, the top-k copies,
+    # ranks 1.. of each routed fold, and one NVFP4 activation quant per rank on
+    # the two NVFP4 groups.
+    zero = 1 + 1 + 3 * (2 + ranks - 1) + 2 * ranks
+    assert sum(not row["semantics"] for row in location_map["locations"]) == zero

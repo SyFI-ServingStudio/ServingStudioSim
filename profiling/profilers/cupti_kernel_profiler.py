@@ -360,6 +360,14 @@ def _capture_launch_unit(
             f"expected={expected_count}, captured={len(records)}"
         )
 
+    # A multi-stream callable (the interval-union case) starts its streams'
+    # kernels in no fixed order, so only the multiset of names is stable
+    # within one launch. Launches still occupy contiguous record blocks: each
+    # one joins its streams before the next launch (or L2 clear) starts.
+    def launch_signature(names: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(sorted(names)) if interval_union else names
+
+    expected_signature = launch_signature(launch_pattern.callable_kernel_names)
     cursor = 0
     per_launch_ms: list[float] = []
     matched_kernel_names: set[str] = set()
@@ -368,7 +376,7 @@ def _capture_launch_unit(
         callable_records = records[cursor : cursor + callable_count]
         cursor += callable_count
         callable_names = tuple(record.name for record in callable_records)
-        if callable_names != launch_pattern.callable_kernel_names:
+        if launch_signature(callable_names) != expected_signature:
             raise RuntimeError(
                 "CUPTI callable kernel pattern changed inside the multi-launch "
                 f"capture at logical launch {launch_index}"

@@ -47,6 +47,7 @@ the graph that produced them.
 | `glm53_flash_vllm_nvfp4_dp_attn_ep_moe` | the NVFP4 Flash graph under vLLM DP attention + EP MoE: vLLM top-k select, NVFP4 quant, quantized all-gatherv (FP4 + scales + top-k), TRT-LLM routed MoE, BF16 reduce-scatterv | as `glm53_flash_vllm_fp8_dp_attn_ep_moe` | NVFP4 dispatch replaces the FP8 one |
 | `glm52_sglang_nvfp4_tp_dsa_moe` | SGLang-aligned NVFP4 DSA/MoE | pure TP with EP1; every rank owns all experts | covers a topology the vLLM graph cannot represent |
 | `qwen36_local` | heterogeneous local FP8 graph | fixed TP1/EP1 | only Qwen3.6 graph |
+| `inkling_vllm_nvfp4_rel_attn_moe` | vLLM-fork-aligned Inkling ModelOpt NVFP4: sliding-window and global relative-position attention (FA4), BF16 dense FFN, router and sink experts, NVFP4 routed experts (BF16 where the checkpoint excludes them), Lamport RS + sconv + AG + norm at every sublayer | one TP group (`tp_size` >= 2; TP4/EP4 and TP8/EP8 profiled), routed experts EP = TP or MoE TP; one attention group; `hp_unified` or `chunked_prefill` worker | only Inkling graph |
 
 ## Retired selectors
 

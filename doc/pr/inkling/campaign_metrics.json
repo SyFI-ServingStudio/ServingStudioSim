@@ -1,0 +1,821 @@
+{
+ "cases": {
+  "tp8_ep8/01_micro_throughput_c256": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/01_micro_throughput_c256",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": 2.764976958525356,
+    "e2e_mean_pct": -4.02185320560422,
+    "gpu_time_multiplier": 1.043447748242366,
+    "iteration_cycle_mean_pct": -1.8370631720421193,
+    "iterations_pct": -2.6905829596412523,
+    "kernel_abs_pct": 2.5148761308119854,
+    "kernel_signed_pct": -0.6060901475688458,
+    "map_coverage_pct": 98.7775659162353,
+    "output_tps_pct": 5.066234253370783,
+    "prefill_tokens_mean_pct": 2.764976958525356,
+    "scheduled_kv_mean_pct": 2.7655553499075003,
+    "server_tpot_mean_pct": -1.375499875750985,
+    "server_ttft_mean_pct": 2.3039390368497115
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/01_micro_throughput_c256/analysis_kernel",
+    "iteration_count": 223,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/01_micro_throughput_c256/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/01_micro_throughput_c256/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 1024,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/01_micro_throughput_c256/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/01_micro_throughput_c256/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/01_micro_throughput_c256/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/01_micro_throughput_c256/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/01_micro_throughput_c256/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/02_graph_boundaries_c128": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/02_graph_boundaries_c128",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": 2.5751072961373467,
+    "e2e_mean_pct": -2.7339748572387523,
+    "gpu_time_multiplier": 1.0355971132707613,
+    "iteration_cycle_mean_pct": -0.20794530724079774,
+    "iterations_pct": -2.5104602510460206,
+    "kernel_abs_pct": 1.9773528963091087,
+    "kernel_signed_pct": 1.3389109779120307,
+    "map_coverage_pct": 99.04396469862903,
+    "output_tps_pct": 3.3426422177175175,
+    "prefill_tokens_mean_pct": 2.5751072961373467,
+    "scheduled_kv_mean_pct": 2.5618964579103176,
+    "server_tpot_mean_pct": 0.39044286156593166,
+    "server_ttft_mean_pct": -1.8703415148687896
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/02_graph_boundaries_c128/analysis_kernel",
+    "iteration_count": 239,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/02_graph_boundaries_c128/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/02_graph_boundaries_c128/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 528,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/02_graph_boundaries_c128/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/02_graph_boundaries_c128/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/02_graph_boundaries_c128/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/02_graph_boundaries_c128/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/02_graph_boundaries_c128/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/03_balanced_anchor_c32": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/03_balanced_anchor_c32",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": 0.4338394793926392,
+    "e2e_mean_pct": -2.1299724745644677,
+    "gpu_time_multiplier": 1.0244549716111446,
+    "iteration_cycle_mean_pct": -1.0412895239172326,
+    "iterations_pct": -0.4319654427645814,
+    "kernel_abs_pct": 1.1069698945789035,
+    "kernel_signed_pct": -0.7566986615169685,
+    "map_coverage_pct": 99.3209864056631,
+    "output_tps_pct": 1.7939454856682246,
+    "prefill_tokens_mean_pct": 0.4338394793926392,
+    "scheduled_kv_mean_pct": 0.4141612194022537,
+    "server_tpot_mean_pct": -0.6271740014370475,
+    "server_ttft_mean_pct": -7.991674139007454
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/03_balanced_anchor_c32/analysis_kernel",
+    "iteration_count": 708,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/03_balanced_anchor_c32/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/03_balanced_anchor_c32/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 128,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/03_balanced_anchor_c32/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/03_balanced_anchor_c32/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/03_balanced_anchor_c32/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/03_balanced_anchor_c32/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/03_balanced_anchor_c32/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/04_prefill_spectrum_c32": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/04_prefill_spectrum_c32",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": 1.2698412698412653,
+    "e2e_mean_pct": -3.913983706118207,
+    "gpu_time_multiplier": 1.0265355706866037,
+    "iteration_cycle_mean_pct": -1.8824775746744016,
+    "iterations_pct": -1.253918495297801,
+    "kernel_abs_pct": 1.4911515767682462,
+    "kernel_signed_pct": -0.9607966103452308,
+    "map_coverage_pct": 99.5015172658464,
+    "output_tps_pct": 3.9356357777769357,
+    "prefill_tokens_mean_pct": 1.2698412698412653,
+    "scheduled_kv_mean_pct": 1.2498534889486823,
+    "server_tpot_mean_pct": -1.7303012155665098,
+    "server_ttft_mean_pct": -3.793487695378994
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/04_prefill_spectrum_c32/analysis_kernel",
+    "iteration_count": 319,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/04_prefill_spectrum_c32/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/04_prefill_spectrum_c32/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 128,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/04_prefill_spectrum_c32/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/04_prefill_spectrum_c32/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/04_prefill_spectrum_c32/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/04_prefill_spectrum_c32/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/04_prefill_spectrum_c32/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/05_decode_spectrum_c64": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/05_decode_spectrum_c64",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": 0.048812235600381726,
+    "e2e_mean_pct": -0.014947371734386206,
+    "gpu_time_multiplier": 1.0211767818839532,
+    "iteration_cycle_mean_pct": 1.0695861025960873,
+    "iterations_pct": -0.04878842088144042,
+    "kernel_abs_pct": 0.6514543907512274,
+    "kernel_signed_pct": 0.42127188870950394,
+    "map_coverage_pct": 99.12741526437136,
+    "output_tps_pct": -0.9703820428698995,
+    "prefill_tokens_mean_pct": 0.04881223560040393,
+    "scheduled_kv_mean_pct": 0.04883737458178938,
+    "server_tpot_mean_pct": -0.326919145225657,
+    "server_ttft_mean_pct": -8.533059262466402
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/05_decode_spectrum_c64/analysis_kernel",
+    "iteration_count": 823,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/05_decode_spectrum_c64/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/05_decode_spectrum_c64/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 128,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/05_decode_spectrum_c64/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/05_decode_spectrum_c64/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/05_decode_spectrum_c64/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/05_decode_spectrum_c64/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/05_decode_spectrum_c64/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/06_long_long_c8": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/06_long_long_c8",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": 0.03777148253070184,
+    "e2e_mean_pct": 4.114104353059855,
+    "gpu_time_multiplier": 1.0294644054973885,
+    "iteration_cycle_mean_pct": 4.100310148658437,
+    "iterations_pct": -0.03775722106852397,
+    "kernel_abs_pct": 5.466594043202326,
+    "kernel_signed_pct": 5.404039624025981,
+    "map_coverage_pct": 99.1503447299211,
+    "output_tps_pct": -3.879058537514035,
+    "prefill_tokens_mean_pct": 0.037771482530679634,
+    "scheduled_kv_mean_pct": 0.038598374347409425,
+    "server_tpot_mean_pct": 4.234754041314526,
+    "server_ttft_mean_pct": -9.055698976048953
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/06_long_long_c8/analysis_kernel",
+    "iteration_count": 1351,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/06_long_long_c8/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/06_long_long_c8/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 35,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/06_long_long_c8/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/06_long_long_c8/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/06_long_long_c8/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/06_long_long_c8/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/06_long_long_c8/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/07_quadrant_interference_c48": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/07_quadrant_interference_c48",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": 0.1054185114906181,
+    "e2e_mean_pct": 0.6074578498353134,
+    "gpu_time_multiplier": 1.0223905850840433,
+    "iteration_cycle_mean_pct": 0.7605975329828984,
+    "iterations_pct": -0.1053074978938473,
+    "kernel_abs_pct": 1.7580660686815182,
+    "kernel_signed_pct": 1.41796277544247,
+    "map_coverage_pct": 99.23542646969156,
+    "output_tps_pct": -0.5415743841976961,
+    "prefill_tokens_mean_pct": 0.1054185114906181,
+    "scheduled_kv_mean_pct": 0.10639021329927889,
+    "server_tpot_mean_pct": 0.21865753825183187,
+    "server_ttft_mean_pct": -3.037679781379188
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/07_quadrant_interference_c48/analysis_kernel",
+    "iteration_count": 718,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/07_quadrant_interference_c48/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/07_quadrant_interference_c48/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 96,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/07_quadrant_interference_c48/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/07_quadrant_interference_c48/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/07_quadrant_interference_c48/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/07_quadrant_interference_c48/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/07_quadrant_interference_c48/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/08_completion_churn_c96": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/08_completion_churn_c96",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": 0.13847219016847045,
+    "e2e_mean_pct": -0.8746739933775949,
+    "gpu_time_multiplier": 1.0217229215344654,
+    "iteration_cycle_mean_pct": -0.478163132599585,
+    "iterations_pct": -0.13828070984097662,
+    "kernel_abs_pct": 1.767434446110113,
+    "kernel_signed_pct": -0.03033519470772384,
+    "map_coverage_pct": 99.15999023219024,
+    "output_tps_pct": 0.6783516742000062,
+    "prefill_tokens_mean_pct": 0.13847219016847045,
+    "scheduled_kv_mean_pct": 0.13843432014284396,
+    "server_tpot_mean_pct": -1.2666309535441234,
+    "server_ttft_mean_pct": -1.5501263083963046
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/08_completion_churn_c96/analysis_kernel",
+    "iteration_count": 694,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/08_completion_churn_c96/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/08_completion_churn_c96/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 192,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/08_completion_churn_c96/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/08_completion_churn_c96/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/08_completion_churn_c96/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/08_completion_churn_c96/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/08_completion_churn_c96/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/09_rate_knee": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/09_rate_knee",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": -0.8842710290704159,
+    "e2e_mean_pct": -1.2729371393798816,
+    "gpu_time_multiplier": 1.034435645842024,
+    "iteration_cycle_mean_pct": -0.7125321000138185,
+    "iterations_pct": 0.8921601427456238,
+    "kernel_abs_pct": 5.242064688303952,
+    "kernel_signed_pct": 5.190752901140875,
+    "map_coverage_pct": 99.17620478055915,
+    "output_tps_pct": -0.1691945212557,
+    "prefill_tokens_mean_pct": -0.8842710290704048,
+    "scheduled_kv_mean_pct": -0.8842558620895447,
+    "server_tpot_mean_pct": -1.1517230851686544,
+    "server_ttft_mean_pct": -10.255914381792131
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/09_rate_knee/analysis_kernel",
+    "iteration_count": 1860,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/09_rate_knee/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/09_rate_knee/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "arrival_time_scale_matches": true,
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 512,
+     "simulated_arrival_time_scale": 1.0
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/09_rate_knee/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/09_rate_knee/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/09_rate_knee/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/09_rate_knee/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/09_rate_knee/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/10_full_saturation_rate": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/10_full_saturation_rate",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": -0.07508916838746549,
+    "e2e_mean_pct": -4.683292403129224,
+    "gpu_time_multiplier": 1.0264955894326482,
+    "iteration_cycle_mean_pct": -3.878238560392322,
+    "iterations_pct": 0.07514559458952075,
+    "kernel_abs_pct": 2.1481081060577214,
+    "kernel_signed_pct": -2.115918177523563,
+    "map_coverage_pct": 99.3253474604676,
+    "output_tps_pct": 4.12818099322334,
+    "prefill_tokens_mean_pct": -0.07508916838744328,
+    "scheduled_kv_mean_pct": -0.07409590607115879,
+    "server_tpot_mean_pct": -4.828089129326784,
+    "server_ttft_mean_pct": -3.0675772848448024
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/10_full_saturation_rate/analysis_kernel",
+    "iteration_count": 385,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/10_full_saturation_rate/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/10_full_saturation_rate/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 512,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/10_full_saturation_rate/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/10_full_saturation_rate/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/10_full_saturation_rate/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/10_full_saturation_rate/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/10_full_saturation_rate/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/11_long_prefill_ladder_c1": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/11_long_prefill_ladder_c1",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": 0.0,
+    "e2e_mean_pct": -3.452439375368155,
+    "gpu_time_multiplier": 1.023680992136194,
+    "iteration_cycle_mean_pct": -3.428835699274313,
+    "iterations_pct": 0.0,
+    "kernel_abs_pct": 0.6060418426045739,
+    "kernel_signed_pct": 0.4920298012777132,
+    "map_coverage_pct": 99.66246532282757,
+    "output_tps_pct": 3.597801718686666,
+    "prefill_tokens_mean_pct": 0.0,
+    "scheduled_kv_mean_pct": 0.0,
+    "server_tpot_mean_pct": -6.314380222449467,
+    "server_ttft_mean_pct": -1.753399812101697
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/11_long_prefill_ladder_c1/analysis_kernel",
+    "iteration_count": 641,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/11_long_prefill_ladder_c1/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/11_long_prefill_ladder_c1/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 20,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/11_long_prefill_ladder_c1/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/11_long_prefill_ladder_c1/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/11_long_prefill_ladder_c1/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/11_long_prefill_ladder_c1/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/11_long_prefill_ladder_c1/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/12_ultra_context_decode_c1": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/12_ultra_context_decode_c1",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": 0.0,
+    "e2e_mean_pct": 0.09163038450021865,
+    "gpu_time_multiplier": 1.0219699445798507,
+    "iteration_cycle_mean_pct": 0.19390229977853668,
+    "iterations_pct": 0.0,
+    "kernel_abs_pct": 0.8751341318451152,
+    "kernel_signed_pct": 0.8277392049352064,
+    "map_coverage_pct": 99.66360481350767,
+    "output_tps_pct": -0.0872022783871329,
+    "prefill_tokens_mean_pct": 0.0,
+    "scheduled_kv_mean_pct": 0.0,
+    "server_tpot_mean_pct": 1.5853684490397368,
+    "server_ttft_mean_pct": -1.6293083211956993
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/12_ultra_context_decode_c1/analysis_kernel",
+    "iteration_count": 615,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/12_ultra_context_decode_c1/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/12_ultra_context_decode_c1/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 15,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/12_ultra_context_decode_c1/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/12_ultra_context_decode_c1/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/12_ultra_context_decode_c1/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/12_ultra_context_decode_c1/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/12_ultra_context_decode_c1/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/13_generation_length_matrix_c8": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/13_generation_length_matrix_c8",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": 0.016776220470027248,
+    "e2e_mean_pct": 4.343156993159258,
+    "gpu_time_multiplier": 1.0299817216007001,
+    "iteration_cycle_mean_pct": 4.262830359595715,
+    "iterations_pct": -0.016773406526382484,
+    "kernel_abs_pct": 3.035072769057641,
+    "kernel_signed_pct": 2.3983271340948145,
+    "map_coverage_pct": 99.34357174599312,
+    "output_tps_pct": -4.061675345897076,
+    "prefill_tokens_mean_pct": 0.016776220470049452,
+    "scheduled_kv_mean_pct": 0.016767596488342917,
+    "server_tpot_mean_pct": 4.413508219137419,
+    "server_ttft_mean_pct": -6.1170479718847925
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/13_generation_length_matrix_c8/analysis_kernel",
+    "iteration_count": 299,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/13_generation_length_matrix_c8/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/13_generation_length_matrix_c8/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 24,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/13_generation_length_matrix_c8/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/13_generation_length_matrix_c8/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/13_generation_length_matrix_c8/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/13_generation_length_matrix_c8/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/13_generation_length_matrix_c8/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/14_near_full_long_decode_c21": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/14_near_full_long_decode_c21",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": -0.07767744441208313,
+    "e2e_mean_pct": -0.66064869066772,
+    "gpu_time_multiplier": 1.0238045478439866,
+    "iteration_cycle_mean_pct": 0.0815346841104514,
+    "iterations_pct": 0.0777378291711095,
+    "kernel_abs_pct": 1.5799856022848815,
+    "kernel_signed_pct": -0.18835656124704783,
+    "map_coverage_pct": 99.6090797062247,
+    "output_tps_pct": -0.0701268421640866,
+    "prefill_tokens_mean_pct": -0.07767744441207203,
+    "scheduled_kv_mean_pct": -0.07714735894738256,
+    "server_tpot_mean_pct": -0.740399935688485,
+    "server_ttft_mean_pct": 11.446490880603765
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/14_near_full_long_decode_c21/analysis_kernel",
+    "iteration_count": 558,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/14_near_full_long_decode_c21/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/14_near_full_long_decode_c21/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 60,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/14_near_full_long_decode_c21/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/14_near_full_long_decode_c21/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/14_near_full_long_decode_c21/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/14_near_full_long_decode_c21/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/14_near_full_long_decode_c21/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  },
+  "tp8_ep8/15_kv_overcommit_mixed_churn_c14": {
+   "analyzer_schema": {
+    "e2e": 1,
+    "iteration": 3,
+    "workload": 1
+   },
+   "available": true,
+   "directory": "logs/20261009_1_inkling_nvfp4_tp8_campaign/15_kv_overcommit_mixed_churn_c14",
+   "issues": [],
+   "metrics": {
+    "decode_batch_mean_pct": -0.10717330410424664,
+    "e2e_mean_pct": 3.5227986740534067,
+    "gpu_time_multiplier": 1.0216875220289419,
+    "iteration_cycle_mean_pct": 3.5267783127263197,
+    "iterations_pct": 0.10728828850796734,
+    "kernel_abs_pct": 1.9027548372250018,
+    "kernel_signed_pct": -1.0059623430555553,
+    "map_coverage_pct": 99.65747545391068,
+    "output_tps_pct": -3.480064152550366,
+    "prefill_tokens_mean_pct": -0.10717330410424664,
+    "scheduled_kv_mean_pct": -0.1074578972345086,
+    "server_tpot_mean_pct": 3.494112227964985,
+    "server_ttft_mean_pct": 27.7256347669518
+   },
+   "provenance": {
+    "analysis_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/15_kv_overcommit_mixed_churn_c14/analysis_kernel",
+    "iteration_count": 647,
+    "predict_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/15_kv_overcommit_mixed_churn_c14/timing_predict",
+    "profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/15_kv_overcommit_mixed_churn_c14/profile_nsys",
+    "request_population_audit": {
+     "all_ok": true,
+     "arrival_time_scale": 1.0,
+     "available": true,
+     "checks": {
+      "per_request_lengths_arrivals_and_completion": true,
+      "simulated_population": true,
+      "unique_simulated_ids": true
+     },
+     "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+     "mapping_basis": "independent CSV row order before scheduling",
+     "mismatched_source_ids": [],
+     "requests": 72,
+     "simulated_arrival_time_scale": null
+    },
+    "simulation_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/15_kv_overcommit_mixed_churn_c14/simulation",
+    "workload_profile_log_dir": "logs/20261009_1_inkling_nvfp4_tp8_campaign/15_kv_overcommit_mixed_churn_c14/profile_workload"
+   },
+   "reports": {
+    "e2e": "logs/20261009_1_inkling_nvfp4_tp8_campaign/15_kv_overcommit_mixed_churn_c14/analysis_e2e/reports/alignment_e2e_report.json",
+    "iteration": "logs/20261009_1_inkling_nvfp4_tp8_campaign/15_kv_overcommit_mixed_churn_c14/analysis_kernel/reports/alignment_iteration_report.json",
+    "workload": "logs/20261009_1_inkling_nvfp4_tp8_campaign/15_kv_overcommit_mixed_churn_c14/analysis_e2e/reports/alignment_workload_report.json"
+   }
+  }
+ },
+ "formulas": {
+  "decode_batch_mean_pct": "ratio(workload.metrics.decode_batch_size.{simulated,measured}.mean)",
+  "e2e_mean_pct": "ratio(e2e.latency.e2e.{simulated,measured}_ms.mean)",
+  "gpu_time_multiplier": "iteration.meta.recommended_gpu_time_multiplier",
+  "iteration_cycle_mean_pct": "ratio(workload.metrics.iteration_cycle_ms.{simulated,measured}.mean)",
+  "iterations_pct": "ratio(workload.meta.{simulated,measured}_iterations)",
+  "kernel_abs_pct": "iteration.comparison.all.absolute_error_pct",
+  "kernel_signed_pct": "iteration.comparison.all.signed_error_pct",
+  "map_coverage_pct": "iteration.mapping.coverage.measured_duration_fraction * 100",
+  "output_tps_pct": "ratio(e2e.throughput.simulated_completion_tps, e2e.throughput.measured_client_completion_tps)",
+  "prefill_tokens_mean_pct": "ratio(workload.metrics.prefill_tokens.{simulated,measured}.mean)",
+  "scheduled_kv_mean_pct": "ratio(workload.metrics.scheduled_kv_tokens.{simulated,measured}.mean)",
+  "server_tpot_mean_pct": "ratio(e2e.latency.server_tpot.{simulated,measured}_ms.mean)",
+  "server_ttft_mean_pct": "ratio(e2e.latency.server_ttft.{simulated,measured}_ms.mean)"
+ },
+ "generated_by": "python -m launcher alignment-campaign extract",
+ "pack": "inkling_nvfp4_b200_tp8",
+ "roots": [
+  "logs/20261009_1_inkling_nvfp4_tp8_campaign"
+ ],
+ "schema_version": 1
+}

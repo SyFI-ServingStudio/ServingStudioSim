@@ -667,6 +667,43 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
+            IterArchSel::InklingVllmNvfp4RelAttnMoe {
+                tp_size,
+                enable_expert_parallel,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("Inkling NVFP4 vLLM", &g.worker)?;
+                let model = Arc::new(arch_build::inkling_vllm_nvfp4_rel_attn_moe(
+                    model_spec,
+                    *tp_size,
+                    *enable_expert_parallel,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "Inkling NVFP4 vLLM",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
             IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative {
                 ep_size,
                 nvl_num_gpu,

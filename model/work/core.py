@@ -713,6 +713,11 @@ class Model:
     #: Once-per-forward semantic work after the last layer that is neither a norm nor
     #: the head (GLM-5.3's final mHC post). Each item exposes ``semantic_segments(wl)``.
     epilogue: list[object] = field(default_factory=list)
+    #: Rows the checkpoint's embedding and head tables hold when they are padded past
+    #: ``vocab`` (Inkling stores 201,024 rows for 200,058 tokens). The padding rows
+    #: are parameters, but no token gathers them and no logit is kept from them, so
+    #: they add to the parameter counts only. ``None`` means the tables hold ``vocab``.
+    param_vocab: int | None = None
 
     def __post_init__(self) -> None:
         # Builders pass the config's own spelling ("bfloat16"); segments and the
@@ -1085,7 +1090,8 @@ class Model:
         # entries cannot force more than one full table pass, and a smaller batch
         # touches at most ``tokens`` distinct rows. Without the cap a giant aggregate
         # batch (T ≫ vocab) would over-count the embedding read ~T/vocab times.
-        embedding_params = self.vocab * self.hidden
+        table_rows = self.vocab if self.param_vocab is None else self.param_vocab
+        embedding_params = table_rows * self.hidden
         breakdown["embedding"] += embedding_params
         total_params += embedding_params
         # The embedding table always stays at the master dtype: FP8 quantizers walk
@@ -1106,7 +1112,7 @@ class Model:
         )
 
         # --- lm_head projection (whole iteration): reads its weight matrix once. ---
-        lm_head_params = 0 if self.tie_word_embeddings else self.vocab * self.hidden
+        lm_head_params = 0 if self.tie_word_embeddings else table_rows * self.hidden
         breakdown["lm_head"] += lm_head_params
         total_params += lm_head_params
         lm_head_group = MatmulGroup(

@@ -1,4 +1,5 @@
-//! Shared construction helpers for the GLM-5.3-Flash worklets.
+//! Construction helpers shared by the vLLM worklets and arches: GLM-5.3-Flash,
+//! Inkling and the NVFP4 / BF16 routed-MoE callables.
 
 use std::sync::Arc;
 

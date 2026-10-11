@@ -68,6 +68,7 @@ from profiling.kernels import (
     moe_finalize_fuse_shared,  # noqa: F401
     moe_finalize_routing,  # noqa: F401
     moe_fused_topk,  # noqa: F401
+    moe_sink_gate_select,  # noqa: F401
     moe_sum,  # noqa: F401
     moe_topk_softplus_sqrt,  # noqa: F401
     mxfp4_marlin_moe_gemm,  # noqa: F401
@@ -79,8 +80,11 @@ from profiling.kernels import (
     q_kv_rms_norm,  # noqa: F401
     q_pad_kv_rope_mxfp8_insert,  # noqa: F401
     qnorm_rope_kv_insert,  # noqa: F401
+    rel_bias_attention,  # noqa: F401
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
+    rs_sconv_ag_residual_rms_norm,  # noqa: F401
+    sconv_qkvr_prep,  # noqa: F401
     single_gemm,  # noqa: F401
     vllm_fused_moe,  # noqa: F401
     vllm_mla_rope,  # noqa: F401

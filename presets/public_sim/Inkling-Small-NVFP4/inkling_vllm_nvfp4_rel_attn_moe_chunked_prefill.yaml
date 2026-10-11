@@ -1,0 +1,23 @@
+# vLLM Inkling-Small-NVFP4 on 4 B200s, TP4 attention with EP4 experts, chunked prefill at
+# 2048 tokens, as the diverse_100 capture's server ran
+# (logs/20261008_10_inkling_standard: vLLM fork, --max-model-len 131072,
+# --max-num-batched-tokens 2048, --gpu-memory-utilization 0.85).
+# attn_gpu_memory_gb is the KV pool per GPU, measured from
+# `Available KV cache memory: 106.11 GiB` in the capture's workload log (x 1.073741824).
+# gpu_time_multiplier is that capture's kernel alignment recommendation
+# (sum of measured GPU cycle / sum of measured kernel time).
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: inkling_vllm_nvfp4_rel_attn_moe
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: 2048
+          batch_policy: mix
+          gpu_time_multiplier: 1.0465
+          attn_gpu_memory_gb: 113.9349
+sweep:
+  replicas: [1, 2]

@@ -21,6 +21,8 @@ use crate::timing::kernels::{
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
+use super::glm53_common::push_or_zero;
+
 #[derive(Clone, Debug)]
 pub struct Nvfp4MoeLocalWorkletConfig {
     pub hidden: Dim,
@@ -239,6 +241,19 @@ impl Nvfp4MoeLocalWorklet {
             &Nvfp4FusedMoeKernelInput {
                 num_tokens: input.num_tokens,
             },
+            ev,
+        );
+    }
+
+    /// Push zeros instead when this copy of the call does not run (a consumer
+    /// that compiles a concurrent and a serial copy, of which one runs).
+    pub fn eval_or_zero(&self, input: &Nvfp4MoeLocalWorkletInput, zero: bool, ev: &mut Evaluator) {
+        let num_tokens = input.num_tokens;
+        push_or_zero(&self.quant, Nvfp4QuantKernelInput { num_tokens }, zero, ev);
+        push_or_zero(
+            &self.fused_moe,
+            Nvfp4FusedMoeKernelInput { num_tokens },
+            zero,
             ev,
         );
     }
