@@ -65,24 +65,28 @@ class Transport:
             )
         return path
 
-    def ssh_argv(self) -> list[str]:
-        """The ssh command (without the destination) every call shares."""
+    def ssh_argv(self, *, shared: bool = True) -> list[str]:
+        """The ssh command (without the destination) every call shares.
+
+        ``shared=False`` opens a connection of its own instead of riding the
+        ControlMaster, for a call that carries a port forward.
+        """
 
         ssh = self.remote.ssh
         assert ssh is not None
-        argv = [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ControlMaster=auto",
-            "-o",
-            f"ControlPath={self.control_path()}",
-            "-o",
-            "ControlPersist=120",
-            "-o",
-            "ServerAliveInterval=30",
-        ]
+        argv = ["ssh", "-o", "BatchMode=yes"]
+        if shared:
+            argv += [
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                f"ControlPath={self.control_path()}",
+                "-o",
+                "ControlPersist=120",
+            ]
+        else:
+            argv += ["-o", "ControlPath=none"]
+        argv += ["-o", "ServerAliveInterval=30"]
         known_hosts = self.remote.config_dir / ".remote" / "known_hosts"
         if known_hosts.is_file():
             argv += [
@@ -103,6 +107,24 @@ class Transport:
         # ssh joins its arguments into one string for the remote shell, so the
         # script is quoted once here and unquoted once there.
         return [*self.ssh_argv(), self.remote.ssh.host, "bash -lc " + shlex.quote(script)]
+
+    def forward_argv(self, script: str, *, remote_port: int, local_port: int) -> list[str]:
+        """Run ``script`` there with its ``127.0.0.1:remote_port`` reaching ours.
+
+        The forward fails the call when the remote port is taken.
+        """
+
+        ssh = self.remote.ssh
+        assert ssh is not None
+        return [
+            *self.ssh_argv(shared=False),
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-R",
+            f"127.0.0.1:{remote_port}:127.0.0.1:{local_port}",
+            ssh.host,
+            "bash -lc " + shlex.quote(script),
+        ]
 
     def run(
         self,

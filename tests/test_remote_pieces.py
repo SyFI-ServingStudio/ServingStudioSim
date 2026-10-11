@@ -416,3 +416,12 @@ def test_an_in_image_remote_runs_kernel_profile_only(monkeypatch, capsys):
     monkeypatch.setattr(remote_run, "load_remote", lambda name, sets: pod)
     assert remote_run.run(None, ["presets/x.yaml"], GlobalOptions(remote="r")) == 2
     assert "runs kernel-profile only" in capsys.readouterr().err
+
+
+def test_a_forwarding_call_opens_its_own_connection():
+    transport = Transport(_remote(ssh=Ssh("me@h", port=2222)))
+    argv = transport.forward_argv("docker pull x", remote_port=40001, local_port=5001)
+    assert "ControlPath=none" in argv and not any(a.startswith("ControlMaster") for a in argv)
+    assert argv[argv.index("-R") + 1] == "127.0.0.1:40001:127.0.0.1:5001"
+    assert "ExitOnForwardFailure=yes" in argv
+    assert argv[-2:] == ["me@h", "bash -lc 'docker pull x'"]

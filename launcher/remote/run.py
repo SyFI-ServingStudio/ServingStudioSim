@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 from ..cli import GlobalOptions
-from . import launch
+from . import image_send, launch
 from .config import Remote, RemoteConfigError, load_remote
 from .layout import Layout
 from .node import SHIPPED_MARKER
@@ -358,22 +358,10 @@ class Session:
             )
         image_id, size = local.stdout.split()
         _say(f"sending image {tag} ({int(size) / 1e9:.1f} GB) to {self.remote.name}")
-        save = subprocess.Popen(["docker", "save", tag], stdout=subprocess.PIPE)
-        pack = subprocess.Popen(
-            ["zstd", "-T0", "-3", "-q", "-c"], stdin=save.stdout, stdout=subprocess.PIPE
-        )
-        assert save.stdout is not None and pack.stdout is not None
-        save.stdout.close()
-        load = subprocess.run(
-            self.transport.command_argv("zstd -dcq | docker load -q"),
-            stdin=pack.stdout,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        pack.stdout.close()
-        if save.wait() != 0 or pack.wait() != 0 or load.returncode != 0:
-            raise RemoteRunError(f"sending image {tag} failed: {load.stderr.strip()}")
+        try:
+            image_send.send(self.transport, tag, say=_say)
+        except image_send.ImageSendError as exc:
+            raise RemoteRunError(f"sending image {tag} failed: {exc}") from None
         sent = self.transport.run(inspect + q(tag)).stdout.strip()
         if sent != image_id:
             raise RemoteRunError(f"{self.remote.name} loaded {tag} as {sent}, not {image_id}")

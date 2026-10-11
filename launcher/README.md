@@ -106,6 +106,7 @@ remote/        `--remote NAME`: run a command on another machine and copy the
   source.py      The shipped file list, its version, venv key and stamp.
   layout.py      The remote workdir layout.
   launch.py      direct (setsid) or Slurm (sbatch) jobs: submit, poll, cancel.
+  image_send.py  Send a profiler image: only the layers the remote lacks.
   node.py        The remote side: build a version, run one job, prune.
   run.py         The sending side: plan, register, ship, run, relay, copy back.
 exec.py        cargo_build (+ schema discovery, INV-8), the PyO3 subprocess env,
@@ -846,8 +847,16 @@ runs with `VIBESIM_PROFILE_RUNTIME=container`: every worker runs in the image
 `profiling/container/images.py` assigns its profile env — never on a host
 interpreter, and an env with no image is refused — so the remote needs only
 docker with the NVIDIA runtime. The image is named by a hash of its dependency
-inputs; when the remote lacks it, it is sent from here (`docker save | zstd |
-docker load`, verified by image id), so build it here first. Under Slurm the job
+inputs; when the remote lacks it, it is sent from here, so build it here first.
+Only the layers the remote lacks move (`remote/image_send.py`): the image is
+pushed to a `registry` container on this machine's loopback, over a persistent
+store (`~/.cache/vibesim-profiler/registry`, or `VIBESIM_PROFILE_REGISTRY_DIR`),
+and the remote pulls it through an `ssh -R` forward, then the image id is
+checked against this one. A new tag of an image the remote already has costs
+its last few layers (seconds); the first send of an image pays for compressing
+all of it into the store, and a remote whose layers came from `docker load`
+pulls them once more, since docker cannot match them to registry digests. `python -m launcher.remote.image_send clear` empties the store.
+Under Slurm the job
 asks for the GPUs its specs need (`--gres=gpu:N`, or more with `launch.slurm.gpus`)
 and the controller addresses them by UUID. The JIT cache persists in
 `<workdir>/cache`.
