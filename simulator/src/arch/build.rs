@@ -3603,7 +3603,7 @@ mod tests {
             assert_eq!(leaf.kv_dtype, Some(DType::Bf16), "{}", leaf.name);
         }
         for leaf in &commit {
-            assert_eq!(leaf.backends, ["vllm_triton"], "{}", leaf.name);
+            assert_eq!(leaf.backends, ["tilelang", "vllm_triton"], "{}", leaf.name);
             assert_eq!(leaf.kv_dtype, Some(DType::Bf16), "{}", leaf.name);
         }
     }
