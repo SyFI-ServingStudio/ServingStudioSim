@@ -12,7 +12,8 @@ description: >-
   declines, capture a real vLLM/SGLang run first and let the measured kernel
   inventory — not source-reading guesswork — decide which kernels to add, largest
   first. This is a routing/sequencing skill; it delegates each phase to a lower
-  skill and does not implement leaves itself.
+  skill and does not implement leaves itself. Landing the finished model on main
+  is dev-finalize-model-addition.
 ---
 
 # Top Add New Arch
@@ -257,4 +258,5 @@ is complete only when every element from the Phase 1 table has a home at its
 correct layer, the arch is wired (Phase 3), `model.work` support and the intended
 deployment maps are complete (Phase 4), and the Phase 5 checks pass — including,
 unless the user declined Phase 0, a Check 1 comparison with no missing large
-kernel and every material deviation attributed.
+kernel and every material deviation attributed. To publish and merge the
+finished model, continue with `dev-finalize-model-addition`.
