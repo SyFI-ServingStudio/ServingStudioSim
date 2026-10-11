@@ -116,17 +116,37 @@ through a local public API and the Intro site.
   | Small TP4/EP4 | -2.6% | +14.5% | +11.6% | -3.4% | `logs/20261008_10_inkling_standard/e2e_b2b_table.md`, `b2b_m1046` |
   | Inkling-NVFP4 TP8/EP8 | -4.4% | +2.3% | +2.5% | -2.8% | `logs/20261009_0_inkling_nvfp4_tp8ep8_diverse100/e2e_table.md` |
 
-- **Campaign.** All 15 cases completed. Kernel abs error is 0.61-5.47% and
-  coverage 98.78-99.66%. E2E is -4.68% to +4.34%, TPOT -6.31% to +4.41%.
-  Out of tolerance:
+- **Campaign** on Inkling-NVFP4 TP8/EP8, all 15 cases. The table is the
+  output of `alignment-campaign compare --markdown`, copied from
+  [`alignment_matrix.md`](alignment_matrix.md). Each value is simulated
+  against measured:
+
+  | Case | kernel_abs_pct | kernel_signed_pct | map_coverage_pct | e2e_mean_pct | output_tps_pct | server_tpot_mean_pct | server_ttft_mean_pct |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | tp8_ep8/01_micro_throughput_c256 | +2.51% | -0.61% | 98.78% | -4.02% | +5.07% | -1.38% | +2.30% |
+  | tp8_ep8/02_graph_boundaries_c128 | +1.98% | +1.34% | 99.04% | -2.73% | +3.34% | +0.39% | -1.87% |
+  | tp8_ep8/03_balanced_anchor_c32 | +1.11% | -0.76% | 99.32% | -2.13% | +1.79% | -0.63% | -7.99% |
+  | tp8_ep8/04_prefill_spectrum_c32 | +1.49% | -0.96% | 99.50% | -3.91% | +3.94% | -1.73% | -3.79% |
+  | tp8_ep8/05_decode_spectrum_c64 | +0.65% | +0.42% | 99.13% | -0.01% | -0.97% | -0.33% | -8.53% |
+  | tp8_ep8/06_long_long_c8 | +5.47% | +5.40% | 99.15% | +4.11% | -3.88% | +4.23% | -9.06% |
+  | tp8_ep8/07_quadrant_interference_c48 | +1.76% | +1.42% | 99.24% | +0.61% | -0.54% | +0.22% | -3.04% |
+  | tp8_ep8/08_completion_churn_c96 | +1.77% | -0.03% | 99.16% | -0.87% | +0.68% | -1.27% | -1.55% |
+  | tp8_ep8/09_rate_knee | +5.24% | +5.19% | 99.18% | -1.27% | -0.17% | -1.15% | -10.26% |
+  | tp8_ep8/10_full_saturation_rate | +2.15% | -2.12% | 99.33% | -4.68% | +4.13% | -4.83% | -3.07% |
+  | tp8_ep8/11_long_prefill_ladder_c1 | +0.61% | +0.49% | 99.66% | -3.45% | +3.60% | -6.31% | -1.75% |
+  | tp8_ep8/12_ultra_context_decode_c1 | +0.88% | +0.83% | 99.66% | +0.09% | -0.09% | +1.59% | -1.63% |
+  | tp8_ep8/13_generation_length_matrix_c8 | +3.04% | +2.40% | 99.34% | +4.34% | -4.06% | +4.41% | -6.12% |
+  | tp8_ep8/14_near_full_long_decode_c21 | +1.58% | -0.19% | 99.61% | -0.66% | -0.07% | -0.74% | +11.45% |
+  | tp8_ep8/15_kv_overcommit_mixed_churn_c14 | +1.90% | -1.01% | 99.66% | +3.52% | -3.48% | +3.49% | +27.73% |
+
+  Kernel abs error is 0.61-5.47% and coverage 98.78-99.66%. E2E is -4.68% to
+  +4.34%, TPOT -6.31% to +4.41%. Out of tolerance:
   - the iteration population of cases 01, 02 and 04 (2.69-2.77%, 2.51-2.58%,
     1.25-1.27% against 1%);
   - decode kernel error in cases 06 and 09 (+5.40% and +5.19% signed against
     5%);
   - case 15 server TTFT (+27.73% against 12%), from the order of the requests
     submitted at t=0.
-
-  Source: [`alignment_matrix.md`](alignment_matrix.md).
 
 [`README.md`](README.md) explains each miss and the remaining gaps: Small TPOT
 +14.5%, the TP8 decode cost items (sink overlap, `topk_copy` L2 timing,
