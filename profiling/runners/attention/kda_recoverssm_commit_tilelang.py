@@ -23,10 +23,21 @@ with ``G_t`` the per-channel cumulative log gate through row ``t`` and
    fork's plan kernel does (``min(max(num_accepted, 0), query_len,
    spec_query_len)``, zero on a NULL slot);
 2. a TileLang fold: one program owns a ``[BLOCK_V, K]`` state tile, scales it
-   by the total decay and adds the whole update as one ``[BLOCK_V, T] @ [T,
-   K]`` tensor-core product before a single store, so the state is read and
+   by the total decay and adds the accepted rows' outer products as an
+   unrolled fp32 FMA chain before a single store, so the state is read and
    written once whatever the accepted length;
 3. the conv window compaction, exactly as the fork's.
+
+The update is a rank-n product with n at most the window, so the fold is
+mostly a state stream (an fp32 pool within 6% of a plain copy; a bf16 pool
+1.1-1.6x one, the FMA chain only partly hidden at eight rows). A tensor-core
+product would pin the tile to the mma accumulator layout, whose two adjacent
+elements per thread turn a bf16 state's loads and stores into 4-byte
+accesses; a free-layout tile lets them vectorise to 32 bytes per thread, as
+the state streaming of NVlabs/kda's TIRx KDA forward does. The chain runs to
+the accepted length rounded up to a power of two (rows past it are zero), and
+the program is held to a register budget that keeps more of them resident to
+cover the state's latency.
 
 Each layer's page is reached through a per-layer base-address table, as the
 fork's context does, so the pages keep their interleaved vLLM layout. The
@@ -64,13 +75,16 @@ from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "kda_recoverssm_commit:tilelang"
 # The fold owns whole state rows, so each (request, layer, head) runs its prep
-# math once; B200 job 5641 found 128 rows at 128 threads fastest for a bf16
-# pool and within 2% of the best for fp32.
+# math once. Threads and resident programs per SM per state dtype: B200 jobs
+# 5665 and 5670 (logs/20261011_9_kda_commit_nvkda) found a bf16 pool's fold
+# fastest at 128 threads held to 3 programs per SM, and an fp32 pool's, which
+# is within 6% of a plain copy of its state, at 256 threads held to 2.
 FOLD_BLOCK_V = 128
-FOLD_THREADS = 128
-# T.gemm reduces over at least 8 window rows; padded rows carry zeros.
-MIN_BLOCK_T = 8
-CONV_BLOCK_D = 256
+FOLD_LAUNCH = {"bfloat16": (128, 3), "float32": (256, 2)}
+# One warp per (request, layer, head) prep record ran 1.9-2.4x faster than
+# four in B200 job 5665; job 5671 found 1024-channel conv blocks fastest.
+PREP_WARPS = 1
+CONV_BLOCK_D = 1024
 
 try:
     import triton
@@ -185,6 +199,18 @@ except ImportError:  # pragma: no cover - triton ships with torch on CUDA hosts
     triton = None
 
 
+def _decay_and_fold(
+    state_tile: Any, decay_s: Any, correction_s: Any, key_s: Any, v: Any, k: Any, rows: int
+) -> Any:
+    """``S[v, k] exp(G_n[k]) + sum_t u_t[v] key_t[k]`` over ``rows`` window
+    rows, in fp32. Plain Python, so the chain unrolls at trace time instead of
+    becoming a TIR loop."""
+    acc = state_tile[v, k] * decay_s[k]
+    for t in range(rows):
+        acc = acc + correction_s[t, v] * key_s[t, k]
+    return acc
+
+
 @cache
 def _fold_kernel(
     num_layers: int,
@@ -202,6 +228,9 @@ def _fold_kernel(
     state_bytes = 4 if state_dtype == "float32" else 2
     batch = T.dynamic("batch")
     layer_heads = num_layers * num_heads
+    threads, min_programs = FOLD_LAUNCH[state_dtype]
+    # Chain lengths for accepted lengths up to 1, 2, 4 and the whole window.
+    short, mid, long = (min(rows, block_t) for rows in (1, 2, 4))
 
     @tilelang.jit(out_idx=[])
     def build() -> Any:
@@ -214,11 +243,12 @@ def _fold_kernel(
             decayed_key: T.Tensor((batch, layer_heads, block_t, dim), "float32"),
             total_decay: T.Tensor((batch, layer_heads, dim), "float32"),
         ) -> None:
-            with T.Kernel(dim // FOLD_BLOCK_V, batch, layer_heads, threads=FOLD_THREADS) as (
+            with T.Kernel(dim // FOLD_BLOCK_V, batch, layer_heads, threads=threads) as (
                 bv,
                 b,
                 lh,
             ):
+                T.annotate_min_blocks_per_sm(min_programs)
                 state_tile = T.alloc_fragment((FOLD_BLOCK_V, dim), "float32")
                 correction_s = T.alloc_shared((block_t, FOLD_BLOCK_V), "float32")
                 key_s = T.alloc_shared((block_t, dim), "float32")
@@ -245,9 +275,26 @@ def _fold_kernel(
                         )
                     T.copy(decayed_key[b, lh, 0, 0], key_s)
                     T.copy(total_decay[b, lh, 0], decay_s)
-                    for v, k in T.Parallel(FOLD_BLOCK_V, dim):
-                        state_tile[v, k] = state_tile[v, k] * decay_s[k]
-                    T.gemm(correction_s, key_s, state_tile, transpose_A=True)
+                    if n <= 1:
+                        for v, k in T.Parallel(FOLD_BLOCK_V, dim):
+                            state_tile[v, k] = _decay_and_fold(
+                                state_tile, decay_s, correction_s, key_s, v, k, short
+                            )
+                    elif n <= 2:
+                        for v, k in T.Parallel(FOLD_BLOCK_V, dim):
+                            state_tile[v, k] = _decay_and_fold(
+                                state_tile, decay_s, correction_s, key_s, v, k, mid
+                            )
+                    elif n <= 4:
+                        for v, k in T.Parallel(FOLD_BLOCK_V, dim):
+                            state_tile[v, k] = _decay_and_fold(
+                                state_tile, decay_s, correction_s, key_s, v, k, long
+                            )
+                    else:
+                        for v, k in T.Parallel(FOLD_BLOCK_V, dim):
+                            state_tile[v, k] = _decay_and_fold(
+                                state_tile, decay_s, correction_s, key_s, v, k, block_t
+                            )
                     T.copy(state_tile, state[bv * FOLD_BLOCK_V, 0])
 
         return fold
@@ -301,7 +348,7 @@ def build_plan(
             [getattr(page, name).data_ptr() for page in pages], dtype=torch.int64, device=device
         )
 
-    block_t = max(MIN_BLOCK_T, triton.next_power_of_2(spec))
+    block_t = triton.next_power_of_2(spec)
     layer_heads = shape.num_layers * heads
     state_dtype = {torch.float32: "float32", torch.bfloat16: "bfloat16"}[state.dtype]
     return TileLangCommitPlan(
@@ -356,7 +403,7 @@ def commit(
         K=dim,
         SPEC=shape.spec_query_len,
         BLOCK_T=plan.block_t,
-        num_warps=4,
+        num_warps=PREP_WARPS,
     )
     plan.fold(
         plan.state_addrs,

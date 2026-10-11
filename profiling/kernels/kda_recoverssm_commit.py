@@ -29,7 +29,7 @@ runs in fp32 and rounds once on the store.
 Backend ``tilelang`` is this repository's own kernel for the same call
 (``profiling.runners.attention.kda_recoverssm_commit_tilelang``), shipped by
 no engine: a Triton prep forms each row's decayed key, then a TileLang fold
-adds the accepted rows in closed form with one tensor-core product per state
+adds the accepted rows in closed form as one fp32 rank-n update per state
 tile, so the state is read and written once whatever the accepted length;
 the conv compaction is the fork's. It runs in the main environment, not the
 vLLM fork's.
@@ -147,8 +147,8 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="tilelang",
-        # T.gemm on fp32 operands runs on Ampere+ tensor cores; fp32 and bf16
-        # pools both load into an fp32 fold and store back at the pool's dtype.
+        # fp32 and bf16 pools both load into an fp32 fold and store back at the
+        # pool's dtype.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.FP32, DType.BF16}),
@@ -165,8 +165,8 @@ register(
         doc=BackendDoc(
             summary=(
                 "This repository's commit (no engine ships it): a Triton prep, a "
-                "TileLang closed-form fold of the accepted rows with one tensor-core "
-                "product per state tile, and the conv compaction; three launches."
+                "TileLang closed-form fold of the accepted rows as one rank-n update "
+                "per state tile, and the conv compaction; three launches."
             ),
         ),
     )
