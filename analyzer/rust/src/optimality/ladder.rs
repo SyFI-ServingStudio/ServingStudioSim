@@ -1,6 +1,6 @@
 //! Typed kernel-ladder domain and the single worker -> pool -> cluster reducer.
 //!
-//! R0..R5 are additive GPU-second measurements. R6/R7 follow the declared policy:
+//! R0..R5 (with R4a) are additive GPU-second measurements. R6/R7 follow the declared policy:
 //! batch-locked composition adds rooflines already evaluated at each fixed-batch
 //! boundary, while saturated composition adds (`flops`, `bytes`) and reevaluates
 //! rooflines at the wider scope. Keeping this distinction here prevents a hierarchy
@@ -72,6 +72,7 @@ pub(super) struct LadderRungs {
     pub(super) balanced: f64,
     pub(super) per_config_best: f64,
     pub(super) ignore_network: f64,
+    pub(super) achievable_limit: f64,
     pub(super) hardware_limit: f64,
     pub(super) segmented_necessary: Option<f64>,
     pub(super) scope_fused_necessary: Option<f64>,
@@ -85,6 +86,7 @@ impl LadderRungs {
             balanced: ms_to_s(rungs.balanced),
             per_config_best: ms_to_s(rungs.per_config_best),
             ignore_network: ms_to_s(rungs.ignore_network),
+            achievable_limit: ms_to_s(rungs.achievable_limit),
             hardware_limit: ms_to_s(rungs.hardware_limit),
             segmented_necessary: None,
             scope_fused_necessary: None,
@@ -97,6 +99,7 @@ impl LadderRungs {
         self.balanced += other.balanced;
         self.per_config_best += other.per_config_best;
         self.ignore_network += other.ignore_network;
+        self.achievable_limit += other.achievable_limit;
         self.hardware_limit += other.hardware_limit;
     }
 
@@ -107,6 +110,7 @@ impl LadderRungs {
             "balanced": self.balanced,
             "per_config_best": self.per_config_best,
             "ignore_network": self.ignore_network,
+            "achievable_limit": self.achievable_limit,
             "hardware_limit": self.hardware_limit,
         });
         if let Some(segmented_necessary) = self.segmented_necessary {
@@ -159,16 +163,19 @@ pub(super) struct KernelRungs {
     pub(super) balanced: f64,
     pub(super) per_config_best: f64,
     pub(super) ignore_network: f64,
+    pub(super) achievable_limit: f64,
     pub(super) hardware_limit: f64,
 }
 
 impl KernelRungs {
-    pub(super) fn from_gpu_ms(rungs: [f64; 4]) -> Self {
+    /// `[R2, R3, R4, R4a, R5]` in GPU·ms, the fold's per-location order.
+    pub(super) fn from_gpu_ms(rungs: [f64; 5]) -> Self {
         Self {
             balanced: ms_to_s(rungs[0]),
             per_config_best: ms_to_s(rungs[1]),
             ignore_network: ms_to_s(rungs[2]),
-            hardware_limit: ms_to_s(rungs[3]),
+            achievable_limit: ms_to_s(rungs[3]),
+            hardware_limit: ms_to_s(rungs[4]),
         }
     }
 
@@ -176,6 +183,7 @@ impl KernelRungs {
         self.balanced += other.balanced;
         self.per_config_best += other.per_config_best;
         self.ignore_network += other.ignore_network;
+        self.achievable_limit += other.achievable_limit;
         self.hardware_limit += other.hardware_limit;
     }
 }
@@ -327,6 +335,7 @@ impl KernelContribution {
             "balanced": self.rungs.balanced,
             "per_config_best": self.rungs.per_config_best,
             "ignore_network": self.rungs.ignore_network,
+            "achievable_limit": self.rungs.achievable_limit,
             "hardware_limit": self.rungs.hardware_limit,
         });
         if let Some(necessary_limit) = necessary_limit {
@@ -629,6 +638,14 @@ impl KernelLadder {
                 self.rungs.ignore_network,
             ),
             (
+                "achievable_limit",
+                self.kernels
+                    .iter()
+                    .map(|kernel| kernel.rungs.achievable_limit)
+                    .sum::<f64>(),
+                self.rungs.achievable_limit,
+            ),
+            (
                 "hardware_limit",
                 self.kernels
                     .iter()
@@ -705,6 +722,7 @@ mod tests {
                 balanced,
                 per_config_best: balanced,
                 ignore_network: balanced,
+                achievable_limit: balanced,
                 hardware_limit: balanced,
             },
             necessary_work: Some(KernelNecessaryWork {
@@ -736,6 +754,7 @@ mod tests {
                 balanced,
                 per_config_best: balanced,
                 ignore_network: balanced,
+                achievable_limit: balanced,
                 hardware_limit: balanced,
                 ..LadderRungs::default()
             },

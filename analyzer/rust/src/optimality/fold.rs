@@ -3,9 +3,9 @@
 //! R0/R1 are exact SQL sums over every row ([`read_exact_worker_totals`]). R2..R5 fold
 //! a stride-sampled set of rows ([`accumulate_fold`]): each rung substitutes its
 //! leaf values and re-evaluates the section's tree with [`BalancedFold`] (rank
-//! `Max` → mean, stream `Parallel` → max), one tree walk per row for all four
-//! rungs. Unlocked analysis selects one grid throughput basis for
-//! R3 and reuses it for R5. Locked-batch analysis sets R3=R2 and selects R5's
+//! `Max` → mean, stream `Parallel` → max), one tree walk per row for all five
+//! rungs (R2, R3, R4, R4a, R5). Unlocked analysis selects one grid throughput
+//! basis for R3 and reuses it for R4a and R5. Locked-batch analysis sets R3=R2 and selects R5's
 //! basis from each current leaf. The sampled sums land in each worker's
 //! accumulators and, per slot, in `(location, worker)` attribution cells.
 
@@ -29,9 +29,10 @@ pub(super) struct WorkerFoldAccumulator {
     /// Exact `Σ total_time_ms` and wall span (ms) over ALL rows.
     pub(super) busy_ms: f64,
     pub(super) span_ms: f64,
-    /// Sampled `Σ total_time_ms` and the sampled mean-fold sums for R2..R5 (ms).
+    /// Sampled `Σ total_time_ms` and the sampled mean-fold sums for
+    /// `[R2, R3, R4, R4a, R5]` (ms).
     pub(super) sampled_busy_ms: f64,
-    pub(super) sampled_rungs_ms: [f64; 4],
+    pub(super) sampled_rungs_ms: [f64; 5],
 }
 
 /// Exact per-worker `Σ total_time_ms` and wall span from ALL rows (cheap SQL).
@@ -71,7 +72,7 @@ pub(super) async fn read_exact_worker_totals(
                 busy_ms,
                 span_ms,
                 sampled_busy_ms: 0.0,
-                sampled_rungs_ms: [0.0; 4],
+                sampled_rungs_ms: [0.0; 5],
             });
         }
     }
@@ -111,7 +112,7 @@ pub(super) async fn read_exact_iteration_total(
         busy_ms,
         span_ms: busy_ms,
         sampled_busy_ms: 0.0,
-        sampled_rungs_ms: [0.0; 4],
+        sampled_rungs_ms: [0.0; 5],
     }))
 }
 
@@ -144,7 +145,7 @@ pub(super) async fn accumulate_fold(
     section_fold_plan_by_key: &HashMap<(String, u16, String), SectionFoldPlan>,
     worker_index_by_key: &HashMap<(String, u16), usize>,
     workers: &mut [WorkerFoldAccumulator],
-    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 4]>,
+    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 5]>,
 ) -> Result<u64> {
     let sql = format!(
         "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, worker_id, \
@@ -177,7 +178,7 @@ pub(super) async fn accumulate_iteration_fold(
     section_fold_plan_by_key: &HashMap<(String, u16, String), SectionFoldPlan>,
     worker_index_by_key: &HashMap<(String, u16), usize>,
     workers: &mut [WorkerFoldAccumulator],
-    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 4]>,
+    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 5]>,
 ) -> Result<u64> {
     let pool_tag = sql_string_literal(pool_tag);
     let sql = format!(
@@ -208,12 +209,12 @@ async fn accumulate_fold_query(
     section_fold_plan_by_key: &HashMap<(String, u16, String), SectionFoldPlan>,
     worker_index_by_key: &HashMap<(String, u16), usize>,
     workers: &mut [WorkerFoldAccumulator],
-    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 4]>,
+    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 5]>,
 ) -> Result<u64> {
     let record_batches = collect(ctx, &sql).await?;
     let mut sampled_rows = 0u64;
-    let mut balanced_fold = BalancedFold::<4>::default();
-    let mut leaf_rungs_by_slot: Vec<[f64; 4]> = Vec::new();
+    let mut balanced_fold = BalancedFold::<5>::default();
+    let mut leaf_rungs_by_slot: Vec<[f64; 5]> = Vec::new();
     for batch in &record_batches {
         let pool_tags = string_column(batch, "pool_tag")?;
         let worker_ids = col(batch, "worker_id")?;
@@ -263,7 +264,7 @@ async fn accumulate_fold_query(
             let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
             let num_slots = fold_plan.location_id_by_slot.len();
             leaf_rungs_by_slot.clear();
-            leaf_rungs_by_slot.resize(num_slots, [0.0; 4]);
+            leaf_rungs_by_slot.resize(num_slots, [0.0; 5]);
             for (slot, value_index) in (start..end).enumerate().take(num_slots) {
                 let observed_time_ms = times.value(value_index) as f64;
                 let leaf_flops = flops.value(value_index) as f64;
@@ -289,7 +290,10 @@ async fn accumulate_fold_query(
                     fold_plan.grid_peak_tflops_by_slot[slot],
                     fold_plan.grid_peak_gbps_by_slot[slot],
                 );
-                let hardware_limit_ms = if is_communication {
+                // R4a and R5 reuse the basis R3 chose (or the locked current
+                // point): the same work at the best measured GEMM / copy, then at
+                // the spec peak. Each is bounded by the rung above it.
+                let achievable_limit_ms = if is_communication {
                     0.0
                 } else {
                     leaf_selected_throughput_ms(
@@ -297,11 +301,23 @@ async fn accumulate_fold_query(
                         leaf_flops,
                         leaf_bytes,
                         uses_compute_throughput,
+                        fold_plan.achievable_peak_tflops_by_slot[slot],
+                        fold_plan.achievable_peak_gbps_by_slot[slot],
+                    )
+                };
+                let hardware_limit_ms = if is_communication {
+                    0.0
+                } else {
+                    leaf_selected_throughput_ms(
+                        achievable_limit_ms,
+                        leaf_flops,
+                        leaf_bytes,
+                        uses_compute_throughput,
                         fold_plan.hardware_peak_tflops_by_slot[slot],
                         hardware_bandwidth_gbps,
                     )
                 };
-                // R2 real, R3 per-config-best, R4 drop-comm, R5 hardware.
+                // R2 real, R3 per-config-best, R4 drop-comm, R4a achievable, R5 hardware.
                 leaf_rungs_by_slot[slot] = [
                     observed_time_ms,
                     per_config_best_ms,
@@ -310,31 +326,28 @@ async fn accumulate_fold_query(
                     } else {
                         per_config_best_ms
                     },
-                    if is_communication {
-                        0.0
-                    } else {
-                        hardware_limit_ms
-                    },
+                    achievable_limit_ms,
+                    hardware_limit_ms,
                 ];
             }
             let row_rungs_ms = balanced_fold.fold(
                 &fold_plan.manifest,
                 0,
                 1.0,
-                &|slot| leaf_rungs_by_slot.get(slot).copied().unwrap_or([0.0; 4]),
+                &|slot| leaf_rungs_by_slot.get(slot).copied().unwrap_or([0.0; 5]),
                 &mut |slot, contribution_ms| {
                     let Some(&location_id) = fold_plan.location_id_by_slot.get(slot) else {
                         return;
                     };
                     let location_worker_rungs = sampled_rungs_by_location_worker
                         .entry((location_id, worker_index))
-                        .or_insert([0.0; 4]);
-                    for rung_index in 0..4 {
+                        .or_insert([0.0; 5]);
+                    for rung_index in 0..5 {
                         location_worker_rungs[rung_index] += contribution_ms[rung_index];
                     }
                 },
             );
-            for rung_index in 0..4 {
+            for rung_index in 0..5 {
                 workers[worker_index].sampled_rungs_ms[rung_index] += row_rungs_ms[rung_index];
             }
         }
@@ -347,8 +360,9 @@ fn sql_string_literal(value: &str) -> String {
 }
 
 /// Apply one already-selected productive-throughput unit. Unlocked R3 calls
-/// this with profiled grid peaks; R5 calls it with hardware peaks and either the
-/// unlocked grid classification or the locked current-point classification.
+/// this with profiled grid peaks; R4a with the best measured GEMM / copy rates
+/// and R5 with hardware peaks, both under either the unlocked grid
+/// classification or the locked current-point classification.
 fn leaf_selected_throughput_ms(
     observed_upper_bound_ms: f64,
     work_flops: f64,

@@ -28,6 +28,8 @@ R2 Balanced
 R3 Per-config best
   - communication
 R4 Ignore network
+  - kernel gap
+R4a Achievable limit
   - hardware gap
 R5 Hardware limit
   - excess over necessary work
@@ -50,7 +52,7 @@ another parallel degree. If the roster is unavailable, the analyzer degrades to
 The base ladder is monotone after defensive clamping:
 
 ```text
-R0 ≥ R1 ≥ R2 ≥ R3 ≥ R4 ≥ R5 ≥ 0
+R0 ≥ R1 ≥ R2 ≥ R3 ≥ R4 ≥ R4a ≥ R5 ≥ 0
 ```
 
 R6 and R7 are optional independent bounds. In the intended accounting they obey
@@ -111,7 +113,7 @@ For worker `w`, the sampled fold is anchored to exact R1 with:
 
 ```text
 A_w = exact_busy_ms_w × G_w / sampled_busy_ms_w
-Rk_w = A_w × sampled_fold_Rk_w / 1000,  k ∈ {2, 3, 4, 5}
+Rk_w = A_w × sampled_fold_Rk_w / 1000,  k ∈ {2, 3, 4, 4a, 5}
 ```
 
 This anchor includes both the sample upscaling and the worker GPU count. If a
@@ -238,35 +240,70 @@ that introduces it.
 The `R3 - R4` difference is the modeled communication cost under the R3 batching
 assumption.
 
+### R4a — Achievable limit
+
+R4a asks what the leaf would cost at the best rate any measured kernel reaches
+for the same kind of work on this GPU, rather than at the spec sheet. It uses
+two measured ceilings from `profile.db`, read by `profiling/db/achievable.py`
+and cached as `raw/achievable_peaks.json`:
+
+- **compute:** the highest `single_gemm` TFLOP/s of the leaf's dtype class over
+  every backend and shape. The class groups dtype strings by tensor-core
+  precision (`fp8_e4m3` and `mxfp8_e4m3` are both fp8), with the same
+  classifier R5 uses.
+- **bandwidth:** the highest `elementwise` copy (`input_size_bytes ==
+  output_size_bytes`) GB/s among rows with at least 1 GiB of input. Smaller
+  copies overstate HBM bandwidth even though the profiler cold-flushes L2 first:
+  L2 is write-back, so a copy whose output fits in L2 finishes before its writes
+  reach HBM (a B200 copy of 80 MB reads 8.4 TB/s against an 8 TB/s HBM). At
+  1 GiB, at least 8× the L2 of every catalogued GPU, the absorbed writes are a
+  few percent of the traffic.
+
+Outlier rows are excluded, and each rate is capped at the matching spec peak
+so R4a never falls below R5. R4a uses the same compute-versus-bandwidth
+classification as R5. Communication leaves remain zero.
+
+```text
+tA_l = min(t4_l, FLOPs_l / best_gemm_TFLOP/s(dtype class))   compute-classified
+tA_l = min(t4_l, bytes_l / best_large_copy_GB/s)             bandwidth-classified
+```
+
+The `R4 - R4a` difference is the **kernel gap**: how far the modeled kernels are
+from the best measured GEMM or copy on the same GPU. It is attainable by a real
+kernel in principle, though a non-GEMM operation need not reach a GEMM's rate.
+If `profile.db`, the run's GPU, or the dtype class has no qualifying rows, the
+affected leaf keeps its R4 value and the kernel gap is zero.
+
 ### R5 — Hardware limit
 
-R5 replaces the profiled grid ceiling with the matching dense compute peak or HBM
+R5 replaces the achievable ceiling with the matching dense compute peak or HBM
 bandwidth from `gpu/spec.json`. Communication leaves remain zero.
 
-In batch-unlocked mode, R5 reuses the compute-versus-bandwidth classification
+In batch-unlocked mode, R4a and R5 reuse the compute-versus-bandwidth classification
 chosen for R3. In batch-locked mode, it classifies every observed leaf from its
 current arithmetic intensity relative to the hardware ridge point.
 
 For a compute-classified non-communication leaf:
 
 ```text
-t5_l = min(t3_l, FLOPs_l / dtype_hardware_peak_TFLOP/s)
+t5_l = min(tA_l, FLOPs_l / dtype_hardware_peak_TFLOP/s)
 ```
 
 For a bandwidth-classified non-communication leaf:
 
 ```text
-t5_l = min(t3_l, bytes_l / hardware_HBM_GB/s)
+t5_l = min(tA_l, bytes_l / hardware_HBM_GB/s)
 ```
 
 The dtype peak is selected from the leaf config (`dtype`, `q_dtype`,
-`input_dtype`, then `kv_dtype`; default `bf16`). The `R4 - R5` difference is the
-profiled-kernel versus spec-sheet-hardware gap under that selected regime. It is
-a kernel-maturity headroom estimate, not a prediction that the spec peak is
-attainable by the current implementation.
+`input_dtype`, then `kv_dtype`; default `bf16`). Because the achievable rates
+are capped at the spec peaks, R5 equals what it would be computed directly from
+R4. The `R4a - R5` difference is the **hardware gap**: the best measured kernel
+versus the spec sheet under that selected regime. No measured kernel closes it,
+so it is not a prediction that the spec peak is attainable.
 
-If the GPU spec or required dtype peak is absent, the affected leaf uses its R4
-upper bound, so R5 collapses onto R4 and hardware gap is zero.
+If the GPU spec or required dtype peak is absent, the affected leaf uses its R4a
+upper bound, so R5 collapses onto R4a and hardware gap is zero.
 
 ### R6 — Segmented necessary work
 
@@ -340,7 +377,8 @@ All values below are GPU·seconds.
 - **R2 — Balanced:** R1 after replacing each parallel group's slowest branch with its average branch time.
 - **R3 — Per-config best:** R2 with every fixed kernel configuration run at its best measured grid rate.
 - **R4 — Ignore network:** R3 with all communication time removed.
-- **R5 — Hardware limit:** R4 with compute and memory work run at the GPU's theoretical hardware limits.
+- **R4a — Achievable limit:** R4 with compute work run at the fastest measured GEMM of the same precision and memory work at the fastest measured large copy.
+- **R5 — Hardware limit:** R4a with compute and memory work run at the GPU's theoretical hardware limits.
 - **R6 — Segmented necessary:** the minimum semantic compute and memory work, with each semantic segment paying its own roofline cost.
 - **R7 — Scope-fused necessary:** the same minimum semantic work, with all segments in the allowed scope fully fused or overlapped before one roofline cost is paid.
 
@@ -358,6 +396,7 @@ The additive kernel baseline starts at R2:
 kernel R2 = anchored Σ c_l(observed_time)
 kernel R3 = anchored Σ c_l(per_config_best)
 kernel R4 = anchored Σ c_l(ignore_network)
+kernel R4a = anchored Σ c_l(achievable_limit)
 kernel R5 = anchored Σ c_l(hardware_limit)
 ```
 
@@ -381,6 +420,7 @@ The complete worker kernel ladder reconciles as:
 Σ_kernel R2 = worker R2
 Σ_kernel R3 = worker R3
 Σ_kernel R4 = worker R4
+Σ_kernel R4a = worker R4a
 Σ_kernel R5 = worker R5
 
 worker R1 = Σ_kernel R2 + aggregate imbalance
@@ -392,7 +432,7 @@ worker R0 = worker R1 + aggregate idle
 For every base rung:
 
 ```text
-Rk_pool = Σ_workers_in_pool Rk_worker,  k ∈ {0, 1, 2, 3, 4, 5}
+Rk_pool = Σ_workers_in_pool Rk_worker,  k ∈ {0, 1, 2, 3, 4, 4a, 5}
 ```
 
 Pool idle and imbalance are therefore sums of worker gaps, not a newly measured
@@ -407,7 +447,7 @@ it from worker JSON.
 For every base rung:
 
 ```text
-Rk_cluster = Σ_all_workers Rk_worker,  k ∈ {0, 1, 2, 3, 4, 5}
+Rk_cluster = Σ_all_workers Rk_worker,  k ∈ {0, 1, 2, 3, 4, 4a, 5}
 ```
 
 As at pool level, cluster R0 is the sum of worker-held GPU capacity, not
@@ -464,7 +504,8 @@ Without R6/R7, the left-to-right sections are:
 | Bar section | Exact value | Meaning |
 |---|---:|---|
 | `hardware_optimal` | R5 | Hardware-roofline work remaining after all modeled headroom above it |
-| `hardware_gap` | R4−R5 | Profiled kernel versus spec-sheet compute/HBM peak |
+| `hardware_gap` | R4a−R5 | Best measured GEMM / large copy versus spec-sheet compute/HBM peak |
+| `kernel_gap` | R4−R4a | Profiled kernel versus the best measured GEMM / large copy |
 | `communication` | R3−R4 | Communication leaves removed at R4 |
 | `batching` | R2−R3 | Loss relative to the best fitted rate for the fixed config |
 | `imbalance` | R1−R2 | Rank `Max` critical path versus balanced mean |
@@ -509,11 +550,11 @@ there are no idle or imbalance sections.
 Without mapped necessary work:
 
 ```text
-R2 = (R2-R3) + (R3-R4) + (R4-R5) + R5
+R2 = (R2-R3) + (R3-R4) + (R4-R4a) + (R4a-R5) + R5
 ```
 
-The sections are batching, communication, hardware gap, and hardware optimal,
-with R5 drawn at the left.
+The sections are batching, communication, kernel gap, hardware gap, and
+hardware optimal, with R5 drawn at the left.
 
 With mapped necessary work, `viz-ui` splits R5 per location:
 
@@ -521,7 +562,8 @@ With mapped necessary work, `viz-ui` splits R5 per location:
 |---|---:|
 | `necessaryCovered` | `min(R5_location, R6_location)` |
 | `redundant` | `max(R5_location - R6_location, 0)` |
-| `hardwareGap` | `max(R4_location - R5_location, 0)` |
+| `hardwareGap` | `max(R4a_location - R5_location, 0)` |
+| `kernelGap` | `max(R4_location - R4a_location, 0)` |
 | `communication` | `max(R3_location - R4_location, 0)` |
 | `batching` | `max(R2_location - R3_location, 0)` |
 
@@ -538,7 +580,7 @@ locations into `other`. It can toggle:
 - **Normalized**: each kernel's own R2 is 100%.
 
 The offline `optimality_kernels*.png` files use the run-wide legacy top-16
-location array and currently show only the R2–R5 four-section form, even when
+location array and currently show only the R2–R5 five-section form, even when
 mapped R6 data exists elsewhere in the payload.
 
 ### Kernel rung ladder
@@ -554,6 +596,7 @@ For the complete-scope view:
 - R2 uses the attributable balanced kernel pieces;
 - R3 uses each kernel's per-config-best value;
 - R4 uses each kernel's ignore-network value; communication locations disappear;
+- R4a uses each kernel's achievable-limit value;
 - R5 uses each kernel's hardware-limit value;
 - R6, when present, uses each location's mapped necessary work;
 - R7, when present, is one aggregate globally fused segment.
@@ -581,7 +624,8 @@ R0 = R1 + idle
 R1 = R2 + imbalance
 R2 = R3 + batching
 R3 = R4 + communication
-R4 = R5 + hardware_gap
+R4 = R4a + kernel_gap
+R4a = R5 + hardware_gap
 R5 = displayed_R6 + excess_over_necessary
 displayed_R6 = displayed_R7 + fusion   (in the scope waterfall)
 ```
@@ -604,7 +648,9 @@ scope-fused and aggregate-only.
   is understated.
 - Batch-locked mode: R3=R2 by definition; zero batching is policy, not evidence
   that the observed batches are large.
-- Missing GPU spec or dtype peak: R5 collapses toward R4; hardware gap is
+- Missing `profile.db` rows for the GPU or dtype class: R4a collapses toward R4;
+  kernel gap is understated or zero (`meta.achievable_peaks.source`).
+- Missing GPU spec or dtype peak: R5 collapses toward R4a; hardware gap is
   understated or zero.
 - Missing `model.work` label: the bar ends at R5 and uses
   `hardware_optimal`; this does not prove all R5 work is semantically necessary.

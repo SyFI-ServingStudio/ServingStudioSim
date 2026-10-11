@@ -1,6 +1,6 @@
 //! On-demand exact optimality details for one `(worker, iter_id)`. The waterfall
 //! and kernel ladder have separate transport contracts, while both reuse this
-//! module's all-row fold so their R0..R5 values are defined identically.
+//! module's all-row fold so their R0..R5 values (with R4a) are defined identically.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -18,7 +18,7 @@ use super::ladder::{KernelLadder, NecessaryWorkPolicy};
 use super::run::COST_COLS;
 use super::spec::{self, GpuSpec};
 use super::{
-    floors, fold, grid_peaks, kernel, levels, location, prepare,
+    achievable, floors, fold, grid_peaks, kernel, levels, location, prepare,
     UNLOCKED_ITERATION_REPLICATION_FACTOR,
 };
 
@@ -36,6 +36,7 @@ struct ExactIterationFold {
     gpu_name: String,
     gpu_spec_matched: Option<String>,
     peaks_source: String,
+    achievable_peaks_source: String,
     gpu_count: f64,
     folded_rows: u64,
     kernel_locations: Vec<prepare::KernelLocation>,
@@ -161,6 +162,7 @@ async fn iteration_kernel_ladder_with_gpu(
             "gpu_name": analysis.exact.gpu_name,
             "gpu_spec_matched": analysis.exact.gpu_spec_matched,
             "peaks_source": analysis.exact.peaks_source,
+            "achievable_peaks_source": analysis.exact.achievable_peaks_source,
             "gpu_count": analysis.exact.gpu_count,
             "folded_rows": analysis.exact.folded_rows,
             "batch_size_locked": lock_batch_size,
@@ -261,6 +263,7 @@ async fn iteration_waterfall_with_gpu(
             "gpu_name": analysis.exact.gpu_name,
             "gpu_spec_matched": analysis.exact.gpu_spec_matched,
             "peaks_source": analysis.exact.peaks_source,
+            "achievable_peaks_source": analysis.exact.achievable_peaks_source,
             "gpu_count": analysis.exact.gpu_count,
             "folded_rows": analysis.exact.folded_rows,
             "batch_size_locked": lock_batch_size,
@@ -370,10 +373,14 @@ async fn fold_exact_iteration(
         grid_peaks::load_cached(log_dir)
     };
     let peaks_source = grid_peak_catalog.source.clone();
+    // Read-only like the grid peaks: an exact-iteration request reuses the
+    // sidecar `analyze run` wrote rather than spawning a profile.db query.
+    let achievable_peaks = achievable::load_cached(log_dir, &gpu_name);
     let compute_dtypes = ComputeDtypeFields::for_repo(repo_root.as_deref());
     let (kernel_locations, section_fold_plan_by_key) = prepare::build_section_fold_plans(
         &manifests_by_worker,
         &grid_peak_catalog,
+        &achievable_peaks,
         &gpu_spec,
         &compute_dtypes,
     );
@@ -421,6 +428,7 @@ async fn fold_exact_iteration(
         gpu_name,
         gpu_spec_matched,
         peaks_source,
+        achievable_peaks_source: achievable_peaks.source.clone(),
         gpu_count,
         folded_rows,
         kernel_locations,

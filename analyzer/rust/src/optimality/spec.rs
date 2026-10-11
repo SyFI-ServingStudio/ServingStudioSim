@@ -1,4 +1,5 @@
 //! Hardware peaks from `gpu/spec.json` — the R5 "hardware limit" rung.
+//! [`DtypeClass`] also keys the achievable rung's measured GEMM peaks.
 //!
 //! R5 divides each leaf's active throughput unit by the matching spec-sheet
 //! peak. Unlocked analysis reuses R3's grid regime; locked-batch analysis uses
@@ -31,26 +32,52 @@ pub(crate) struct GpuSpec {
     pub mem_bandwidth_gbps: f64,
 }
 
+/// The tensor-core precision a dtype string runs at. R5 picks its spec-sheet
+/// peak by class, and the achievable rung its best measured GEMM by class, so
+/// `fp8_e4m3` and `mxfp8_e4m3` share one fp8 ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DtypeClass {
+    Fp4,
+    Fp8,
+    Int8,
+    Fp16,
+    Fp32,
+    /// bf16 / bfloat16 and anything unrecognized (the common default).
+    Bf16,
+}
+
+impl DtypeClass {
+    pub(crate) fn of(dtype: &str) -> Self {
+        let d = dtype.to_ascii_lowercase();
+        if d.contains("fp4") || d.contains("e2m1") {
+            Self::Fp4
+        } else if d.contains("fp8") || d.contains("e4m3") || d.contains("e5m2") {
+            Self::Fp8
+        } else if d.contains("int8") {
+            Self::Int8
+        } else if d.contains("fp16") || d.contains("half") {
+            Self::Fp16
+        } else if d.contains("fp32") || d.contains("float32") || d.contains("tf32") {
+            Self::Fp32
+        } else {
+            Self::Bf16
+        }
+    }
+}
+
 impl GpuSpec {
     /// Dense compute peak (TFLOP/s) for a leaf's compute `dtype`. Falls back to
     /// bf16 (the common training/inference default) for an unrecognized dtype, and
     /// to `0.0` — meaning "no hardware ceiling, R5 leaf degrades to R4" — when the
     /// matched spec entry lacks that field (e.g. an fp8 kernel on a pre-fp8 GPU).
     pub fn peak_tflops(&self, dtype: &str) -> f64 {
-        let d = dtype.to_ascii_lowercase();
-        if d.contains("fp4") || d.contains("e2m1") {
-            self.fp4_tflops
-        } else if d.contains("fp8") || d.contains("e4m3") || d.contains("e5m2") {
-            self.fp8_tflops
-        } else if d.contains("int8") {
-            self.int8_tops
-        } else if d.contains("fp16") || d.contains("half") {
-            self.fp16_tflops
-        } else if d.contains("fp32") || d.contains("float32") || d.contains("tf32") {
-            self.fp32_tflops
-        } else {
-            // bf16 / bfloat16 / anything else → bf16 peak.
-            self.bf16_tflops
+        match DtypeClass::of(dtype) {
+            DtypeClass::Fp4 => self.fp4_tflops,
+            DtypeClass::Fp8 => self.fp8_tflops,
+            DtypeClass::Int8 => self.int8_tops,
+            DtypeClass::Fp16 => self.fp16_tflops,
+            DtypeClass::Fp32 => self.fp32_tflops,
+            DtypeClass::Bf16 => self.bf16_tflops,
         }
     }
 }

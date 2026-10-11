@@ -20,12 +20,12 @@ use crate::session::{register_cost_log, require_columns, COST_LOG_TABLE};
 use super::compute_dtype::ComputeDtypeFields;
 use super::ladder::NecessaryWorkPolicy;
 use super::spec::{self, GpuSpec};
+use super::{achievable, floors, fold, grid_peaks, kernel, levels, location, prepare};
 use super::{
     bucket_keys, ms_to_s, ratio, rung_keys, BUCKET_KEYS, FLOORS_TARGET_SAMPLED_ITERS,
     FLOORS_TARGET_SAMPLED_PREFILL_ITERS, KERNEL_RUNG_KEYS, RUNG_KEYS,
     UNLOCKED_ITERATION_REPLICATION_FACTOR,
 };
-use super::{floors, fold, grid_peaks, kernel, levels, location, prepare};
 
 /// cost_log columns this subject depends on (drift guard).
 pub(super) const COST_COLS: &[&str] = &[
@@ -132,6 +132,16 @@ pub async fn run_optimality(
         ));
     }
 
+    // R4a reads the run GPU's best measured GEMM / large-copy rates; it does not
+    // depend on the batching assumption, so both modes load it.
+    let achievable_peaks = achievable::load_or_generate(log_dir, &gpu_name);
+    if achievable_peaks.is_empty() {
+        caveats.push(format!(
+            "achievable peaks {}: R4a achievable limit collapses onto R4 (kernel gap = 0)",
+            achievable_peaks.source
+        ));
+    }
+
     let compute_dtypes = ComputeDtypeFields::for_repo(repository_root.as_deref());
     if !compute_dtypes.is_available() {
         caveats.push(format!(
@@ -144,6 +154,7 @@ pub async fn run_optimality(
     let (kernel_locations, section_fold_plan_by_key) = prepare::build_section_fold_plans(
         &manifests_by_worker,
         &grid_peak_catalog,
+        &achievable_peaks,
         &gpu_spec,
         &compute_dtypes,
     );
@@ -185,7 +196,7 @@ pub async fn run_optimality(
 
     // Sampled fold for R2..R5 + per-(location, worker) raw contributions.
     let sample_stride = fold::choose_stride(ctx).await?;
-    let mut sampled_rungs_by_location_worker: HashMap<(u32, usize), [f64; 4]> = HashMap::new();
+    let mut sampled_rungs_by_location_worker: HashMap<(u32, usize), [f64; 5]> = HashMap::new();
     let sampled_row_count = fold::accumulate_fold(
         ctx,
         sample_stride,
@@ -348,6 +359,7 @@ pub async fn run_optimality(
         "batch_size_locked": lock_batch_size,
         "gpu_spec_matched": gpu_spec_matched,
         "peaks_source": grid_peak_catalog.source,
+        "achievable_peaks": achievable_peaks.meta_json(),
         "sample_stride": sample_stride,
         "sampled_rows": sampled_row_count,
         "gpu_counts_available": has_worker_gpu_counts,
@@ -434,7 +446,7 @@ fn definitions(lock_batch_size: bool) -> Value {
     } else {
         "model/work labeler bounds below R5: segmented necessary work sums per-location rooflines; scope-fused necessary work adds FLOPs/bytes first and applies one roofline at that scope"
     };
-    let buckets = "idle, imbalance, batching, communication, hardware_gap, then R5 split into excess_over_necessary, fusion, hardware_necessary when labeler bounds are available; sum to Real";
+    let buckets = "idle, imbalance, batching, communication, kernel_gap, hardware_gap, then R5 split into excess_over_necessary, fusion, hardware_necessary when labeler bounds are available; sum to Real";
     json!({
         "scope": "per-worker CostTree manifest re-folded with per-rung leaf substitutions; \
                   unit GPU-seconds = wall time × the worker's run_meta gpu_ids count",
@@ -444,14 +456,15 @@ fn definitions(lock_batch_size: bool) -> Value {
             "balanced": "real slot times, Max folded to mean — perfect load balance; gap = imbalance",
             "per_config_best": per_config_best,
             "ignore_network": "per_config_best with comm leaves dropped; gap = communication",
-            "hardware_limit": "active compute or memory work unit / matching gpu-spec peak; unlocked reuses the R3 grid regime, locked uses each current operating point; gap = profiled↔hardware",
+            "achievable_limit": "R4a: active compute work / the best measured single_gemm TFLOP/s of the leaf's dtype class, or active memory work / the best measured elementwise copy GB/s at >= 1 GiB, each capped at the spec peak; same regime as hardware_limit; gap vs ignore_network = kernel_gap",
+            "hardware_limit": "active compute or memory work unit / matching gpu-spec peak; unlocked reuses the R3 grid regime, locked uses each current operating point; gap vs achievable_limit = hardware_gap (best measured kernel vs spec sheet)",
             "necessary_work": necessary_work,
         },
         "buckets": buckets,
         "sampling": "R0/R1 exact over all rows; R2..R5 folded over 1-in-sample_stride iterations \
                      and anchored to the exact R1 by their sampled ratio",
         "kernel_level": "per manifest location (name); Max siblings + DP replicas pool; \
-                         single-leaf so no idle/imbalance — only batching/communication/hw",
+                         single-leaf so no idle/imbalance — only batching/communication/kernel/hw",
         "kernel_ladders": "the analyzer emits complete worker/pool/cluster ladders: R0/R1 reuse \
                            the attributable R2 kernel baseline plus aggregate idle/imbalance; \
                            R2..R6 carry per-location values; R7 is aggregate-only; unlocked parents \
