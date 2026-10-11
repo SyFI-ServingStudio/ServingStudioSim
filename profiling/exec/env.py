@@ -264,21 +264,60 @@ def compose_library_path(profile_env: ProfileEnv, existing: str | None) -> str:
     return os.pathsep.join(entries)
 
 
+# "host" runs a host env on its interpreter; "container" runs it in the image
+# `profiling/container/images.py` assigns it, and refuses an env with no image
+# rather than measure it in some other environment under the same DB key.
+PROFILE_RUNTIME_ENV = "VIBESIM_PROFILE_RUNTIME"
+_PROFILE_RUNTIMES = ("host", "container")
+
+
+def profile_runtime() -> str:
+    runtime = os.environ.get(PROFILE_RUNTIME_ENV, "").strip() or "host"
+    if runtime not in _PROFILE_RUNTIMES:
+        raise ValueError(
+            f"{PROFILE_RUNTIME_ENV} must be one of {_PROFILE_RUNTIMES}, got {runtime!r}"
+        )
+    return runtime
+
+
 def resolve_profile_env(name: str | None) -> ProfileEnv | ContainerProfileEnv:
     env_name = name or "default_env"
     try:
-        return ENV_REGISTRY[env_name]
+        env = ENV_REGISTRY[env_name]
     except KeyError as exc:
         known_envs = sorted(ENV_REGISTRY)
         raise ValueError(f"unknown profiling env {env_name!r}; known envs: {known_envs}") from exc
+    if isinstance(env, ProfileEnv) and profile_runtime() == "container":
+        return ContainerProfileEnv(env_name, container_image(env_name))
+    return env
+
+
+def container_image(name: str | None) -> str:
+    """The image that runs profile env ``name`` under the container runtime."""
+    env_name = name or "default_env"
+    env = ENV_REGISTRY.get(env_name)
+    if isinstance(env, ContainerProfileEnv):
+        return env.image
+    from profiling.container.images import image_for_env
+
+    image = image_for_env(env_name, _PROJECT_ROOT)
+    if image is None:
+        raise ValueError(
+            f"profiling env {env_name!r} has no image, so {PROFILE_RUNTIME_ENV}=container "
+            "cannot run it (profiling/container/images.py)"
+        )
+    return image
 
 
 __all__ = [
     "ENV_REGISTRY",
     "ContainerProfileEnv",
+    "PROFILE_RUNTIME_ENV",
     "ProfileEnv",
     "compose_library_path",
     "compose_pythonpath",
+    "container_image",
+    "profile_runtime",
     "register_profile_env",
     "resolve_profile_env",
     "set_worker_python_env",

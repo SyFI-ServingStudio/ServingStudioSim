@@ -61,3 +61,22 @@ docker image inspect vibesim-profiler-vllm:cu130-3f667d7e
 
 The container does not virtualize the GPU driver. Validate the target GPU,
 driver, and a real production kernel after every image or host-driver change.
+
+## Images for the host envs
+
+`default.Dockerfile` is the project's own `profiling` dependency group (Torch
+2.10 cu128, FlashInfer 0.6, Triton, NVSHMEM, DeepGEMM, and the causal-conv1d
+wheel), installed from `uv.lock` the way `just sync` installs it. It serves
+`default_env`, `flashinfer_pip_env` and `causal_conv1d_env` when
+`VIBESIM_PROFILE_RUNTIME=container`:
+
+```bash
+uv run python -m profiling.container.images build default   # prints the tag
+uv run python -m profiling.container.images env default_env # the tag that env uses
+```
+
+The tag is a hash of the Dockerfile and the files it copies before the source,
+so a checkout with the same dependencies names the same image and a host that
+has the tag has the image. The commit is only a label, written last so a new
+commit reuses every dependency layer. Workers overlay the checkout's source as
+for `vllm_env`.

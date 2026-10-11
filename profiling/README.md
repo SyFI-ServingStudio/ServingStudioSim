@@ -63,11 +63,16 @@ This is why `KernelKind` strings must match exactly across the boundary (below).
 - The `profilers/` timing primitives (`Timer.cupti`, `Energy.perf`, the CUPTI
   C++ extension).
 
-The pinned `vllm_env` also owns a `lib/cuda-compat` link beside its virtual
-environment. Point that link at the unpacked NVIDIA forward-compatibility
-library used by the matching alignment run. Environment validation fails before
-acquiring a GPU when the link is absent; the execution layer prepends it to
-`LD_LIBRARY_PATH` before Torch's libraries.
+`vllm_env` is a container image (`profiling/container/`). Its CUDA 13.0 build
+also runs on an older datacenter driver: the CUDA base image carries the
+forward-compatibility libraries (`/usr/local/cuda/compat`), which the NVIDIA
+container runtime uses when the host driver predates the image's CUDA (seen on
+driver 570, CUDA 12.8). Nothing on the host side is involved. The host envs `default_env`,
+`flashinfer_pip_env` and `causal_conv1d_env` also have an image (CUDA 12.8,
+`profiling/container/images.py`); `VIBESIM_PROFILE_RUNTIME=container` runs them
+there instead of on the project interpreter, and refuses any env without an
+image. `--remote` profiling always uses it (launcher/README.md "Remote
+execution").
 
 `vllm_upstream_fork_env` is a host env: the alignment checkout
 `alignment/profiler/vllm` (or `$VIBESIM_VLLM_FORK_ROOT`) and its own `.venv`. It
