@@ -21,9 +21,20 @@ no records. Here the operands are strided views taken directly (no copies), the
 state is only read, and the window length is a launch constant.
 
 ``causal_conv1d_update`` on the window runs before the call and is costed
-elsewhere. The state is fp32 (``kda_state_dtype``), ``lower_bound=-5.0``,
-``scale=K**-0.5``, BV=32, 4 warps and 2 stages are fixed by the production
-path.
+elsewhere. ``lower_bound=-5.0``, ``scale=K**-0.5``, BV=32, 4 warps and 2
+stages are fixed by the production path.
+
+``state_dtype`` is the checkpoint pool's element type (vLLM
+``--mamba-ssm-cache-dtype``). The fork's Triton op loads the checkpoint at its
+pool dtype and runs the recurrence in fp32, so it serves fp32 and bf16 pools.
+
+Backend ``flashinfer_cute`` is FlashInfer's drop-in for the same op:
+``recurrent_kda(..., disable_state_update=True, correction_cache=...,
+kg_cache=...)``, which reaches ``kda_decode_wy_output_only.kda_recoverssm_verify``.
+It evaluates the window in the chunk-parallel WY form with tensor-core MMAs
+instead of a per-token recurrence, reads the checkpoint once and writes the
+same fp32 correction and raw key/gate records RecoverSSM's commit consumes.
+It needs a bf16 pool and ``K == V == 128``.
 """
 
 from __future__ import annotations
@@ -55,6 +66,7 @@ class KdaRecoverSSMVerifyArgs(KernelArgs):
         unit="tokens", doc="Window per request: the target token plus the drafts (k + 1)."
     )
     dtype: DType = arg(doc="Element type of the activations, key/gate record and output.")
+    state_dtype: DType = arg(doc="Element type of the checkpoint state pool the call reads.")
 
 
 DOC = KernelDoc(
@@ -106,8 +118,10 @@ register(
         backend="vllm_triton",
         # A plain @triton.jit kernel with no arch-specific instructions; the
         # fork serves it in bf16 (the kg record must match the activation dtype).
+        # It loads the checkpoint at the pool's dtype and upcasts to fp32.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.FP32, DType.BF16}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.kda_recoverssm_vllm_triton",
@@ -126,6 +140,44 @@ register(
                 "reads the checkpoint, verifies the window and writes the records."
             ),
             url="https://github.com/vllm-project/vllm",
+        ),
+    )
+)
+
+
+# FlashInfer's frozen verify. kda_decode_wy_output_only.py: "Requires SM90+
+# (TMA + mbarrier), validated on SM100a (B200); K == V == 128; bf16 I/O and
+# state"; recurrent_kda rejects disable_state_update without a bf16 pool.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_cute",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            min_compute_capability=(9, 0),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_recoverssm_flashinfer",
+            function_name="profile_kda_recoverssm_verify_flashinfer_cute",
+        ),
+        table_name=KIND,
+        args_schema=KdaRecoverSSMVerifyArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        # FlashInfer main after 0.7.1 with CuTe DSL >= 4.7 (see env.py).
+        subprocess_env="flashinfer_kda_env",
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer recurrent_kda frozen verify (disable_state_update=True with "
+                "RecoverSSM correction and key/gate caches): the WY-parallel tensor-core "
+                "kernel over the window, reading a bf16 checkpoint once."
+            ),
+            url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/kda_decode.py",
+        ),
+        row_provenance_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_recoverssm_flashinfer",
+            function_name="row_provenance_flashinfer_cute",
         ),
     )
 )

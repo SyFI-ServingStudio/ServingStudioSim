@@ -10,7 +10,8 @@ implementation; Kimi-K3's KDA layer is the same op GLM-5.3-Flash uses
 
 Cache pages. vLLM stores one KDA layer's states in one page per block, in
 ``get_state_shape`` order: conv ``[state_len, conv_dim]`` (SD layout, bf16),
-the fp32 checkpoint ``[H, V, K]``, the fp32 correction record ``[H, S, V]``
+the checkpoint ``[H, V, K]`` (``state_dtype``: fp32 by default, bf16 with
+``--mamba-ssm-cache-dtype bfloat16``), the fp32 correction record ``[H, S, V]``
 and the key/gate record ``[H, S, 2K]`` (activation dtype). Each is a strided
 view of the layer's raw page buffer whose block stride is the whole page.
 ``_layer_page`` reproduces that layout; ``state_len = conv_size - 1 + S - 1``
@@ -94,6 +95,9 @@ CONV_KERNEL_SIZE = 4
 OUTPUT_RMSE_RATIO_TOL = 4e-3
 CORRECTION_RMSE_RATIO_TOL = 1e-3
 STATE_RMSE_RATIO_TOL = 1e-3
+# A bf16 checkpoint rounds the committed state once on the store.
+BF16_STATE_RMSE_RATIO_TOL = 4e-3
+STATE_DTYPES = (DType.FP32, DType.BF16)
 
 
 # --------------------------------------------------------------------------
@@ -108,6 +112,7 @@ class KdaRecoverSSMShape:
     head_dim: int
     spec_query_len: int
     dtype: DType
+    state_dtype: DType = DType.FP32
     commit_len: int = 0
     num_layers: int = 1
 
@@ -139,7 +144,12 @@ class KdaRecoverSSMShape:
 
 
 def _validate_common(
-    batch_size: int, num_heads: int, head_dim: int, spec_query_len: int, dtype: DType | str
+    batch_size: int,
+    num_heads: int,
+    head_dim: int,
+    spec_query_len: int,
+    dtype: DType | str,
+    state_dtype: DType | str,
 ) -> KdaRecoverSSMShape:
     shape = KdaRecoverSSMShape(
         batch_size=_exact_int("batch_size", batch_size),
@@ -147,6 +157,7 @@ def _validate_common(
         head_dim=_exact_int("head_dim", head_dim),
         spec_query_len=_exact_int("spec_query_len", spec_query_len),
         dtype=DType.from_value(dtype),
+        state_dtype=DType.from_value(state_dtype),
     )
     if shape.batch_size < 1:
         raise ValueError("batch_size must be >= 1")
@@ -162,13 +173,22 @@ def _validate_common(
     # The kg record must match the activation dtype; the fork serves bf16.
     if shape.dtype is not DType.BF16:
         raise ValueError(f"KDA RecoverSSM requires dtype=bf16, got {shape.dtype}")
+    if shape.state_dtype not in STATE_DTYPES:
+        raise ValueError(
+            f"KDA RecoverSSM state_dtype must be fp32 or bf16, got {shape.state_dtype}"
+        )
     return shape
 
 
 def validate_verify_args(
-    batch_size: int, num_heads: int, head_dim: int, spec_query_len: int, dtype: DType | str
+    batch_size: int,
+    num_heads: int,
+    head_dim: int,
+    spec_query_len: int,
+    dtype: DType | str,
+    state_dtype: DType | str,
 ) -> KdaRecoverSSMShape:
-    return _validate_common(batch_size, num_heads, head_dim, spec_query_len, dtype)
+    return _validate_common(batch_size, num_heads, head_dim, spec_query_len, dtype, state_dtype)
 
 
 def validate_commit_args(
@@ -179,8 +199,9 @@ def validate_commit_args(
     spec_query_len: int,
     num_layers: int,
     dtype: DType | str,
+    state_dtype: DType | str,
 ) -> KdaRecoverSSMShape:
-    base = _validate_common(batch_size, num_heads, head_dim, spec_query_len, dtype)
+    base = _validate_common(batch_size, num_heads, head_dim, spec_query_len, dtype, state_dtype)
     commit_len = _exact_int("commit_len", commit_len)
     num_layers = _exact_int("num_layers", num_layers)
     # Spec decode always accepts the target token, and the plan kernel clamps
@@ -195,6 +216,7 @@ def validate_commit_args(
         head_dim=base.head_dim,
         spec_query_len=base.spec_query_len,
         dtype=base.dtype,
+        state_dtype=base.state_dtype,
         commit_len=commit_len,
         num_layers=num_layers,
     )
@@ -217,7 +239,7 @@ class LayerPage:
 
     raw: Any
     conv: Any  # [blocks, state_len, conv_dim] bf16 (SD layout)
-    checkpoint: Any  # [blocks, H, V, K] fp32
+    checkpoint: Any  # [blocks, H, V, K] state_dtype
     correction: Any  # [blocks, H, S, V] fp32
     kg: Any  # [blocks, H, S, 2K] bf16
     a_log: Any  # [H] fp32
@@ -229,7 +251,7 @@ def _layer_page(torch: Any, shape: KdaRecoverSSMShape, *, device: Any, generator
     blocks = shape.batch_size + 1
     parts = (
         ((shape.conv_state_len, shape.conv_dim), torch.bfloat16),
-        ((heads, dim, dim), torch.float32),
+        ((heads, dim, dim), state_torch_dtype(torch, shape.state_dtype)),
         ((heads, spec, dim), torch.float32),
         ((heads, spec, 2 * dim), torch.bfloat16),
     )
@@ -265,6 +287,10 @@ def _layer_page(torch: Any, shape: KdaRecoverSSMShape, *, device: Any, generator
         torch.randn(heads * dim, generator=generator, device=device, dtype=torch.float32) * 0.1
     )
     return LayerPage(raw, conv, checkpoint, correction, kg, a_log, dt_bias)
+
+
+def state_torch_dtype(torch: Any, state_dtype: DType) -> Any:
+    return torch.bfloat16 if state_dtype is DType.BF16 else torch.float32
 
 
 def _numel(dims: tuple[int, ...]) -> int:
@@ -425,10 +451,19 @@ oracle cheap at batch 512 and many layers."""
 
 
 def check_verify(
-    torch: Any, callable_: Any, operands: VerifyOperands, shape: KdaRecoverSSMShape
+    torch: Any,
+    callable_: Any,
+    operands: VerifyOperands,
+    shape: KdaRecoverSSMShape,
+    *,
+    invoke: Any = None,
+    output_tol: float = OUTPUT_RMSE_RATIO_TOL,
+    correction_tol: float = CORRECTION_RMSE_RATIO_TOL,
 ) -> None:
     """Compare one call against the oracle on the first requests. The
-    records it writes are rewritten by every timed call, so nothing is restored."""
+    records it writes are rewritten by every timed call, so nothing is restored.
+    ``invoke`` and the tolerances let another backend of the same kind reuse
+    the check with its own call and its own numerics."""
     from profiling.runners.attention.kda_chunk_prefill_reference import rmse_ratio
     from profiling.runners.attention.kda_recoverssm_reference import (
         kda_recoverssm_verify_reference,
@@ -452,7 +487,7 @@ def check_verify(
         lower_bound=LOWER_BOUND,
     )
     checkpoint_before = page.checkpoint[slots].clone()
-    output = invoke_verify(callable_, operands, shape.spec_query_len)
+    output = (invoke or invoke_verify)(callable_, operands, shape.spec_query_len)
     torch.cuda.synchronize()
     if output is not operands.out:
         raise AssertionError("kda_recoverssm_verify must write the given out")
@@ -464,11 +499,11 @@ def check_verify(
     corr_err = rmse_ratio(expected_corr, page.correction[slots])
     if not torch.equal(page.kg[slots], expected_kg):
         raise AssertionError("key/gate record mismatch")
-    if not (o_err < OUTPUT_RMSE_RATIO_TOL and corr_err < CORRECTION_RMSE_RATIO_TOL):
+    if not (o_err < output_tol and corr_err < correction_tol):
         raise AssertionError(
             f"verify mismatch vs oracle: o rmse ratio {o_err:.2e} "
-            f"(tol {OUTPUT_RMSE_RATIO_TOL:.0e}), correction {corr_err:.2e} "
-            f"(tol {CORRECTION_RMSE_RATIO_TOL:.0e})"
+            f"(tol {output_tol:.0e}), correction {corr_err:.2e} "
+            f"(tol {correction_tol:.0e})"
         )
 
 
@@ -508,10 +543,10 @@ def check_commit(torch: Any, operands: CommitOperands, shape: KdaRecoverSSMShape
         if not torch.isfinite(actual).all():
             raise AssertionError(f"non-finite committed state in layer {layer}")
         err = rmse_ratio(state, actual)
-        if err >= STATE_RMSE_RATIO_TOL:
+        tol = BF16_STATE_RMSE_RATIO_TOL if shape.state_dtype is DType.BF16 else STATE_RMSE_RATIO_TOL
+        if err >= tol:
             raise AssertionError(
-                f"commit state mismatch in layer {layer}: rmse ratio {err:.2e} "
-                f"(tol {STATE_RMSE_RATIO_TOL:.0e})"
+                f"commit state mismatch in layer {layer}: rmse ratio {err:.2e} (tol {tol:.0e})"
             )
         if not torch.equal(page.conv[slots].transpose(-1, -2), conv):
             raise AssertionError(f"conv compaction mismatch in layer {layer}")
@@ -548,9 +583,12 @@ def profile_kda_recoverssm_verify_vllm_triton(
     head_dim: int,
     spec_query_len: int,
     dtype: DType | str,
+    state_dtype: DType | str,
 ) -> ComputeMetrics:
     """Profile one GLM-5.3-Flash KDA RecoverSSM verify call."""
-    shape = validate_verify_args(batch_size, num_heads, head_dim, spec_query_len, dtype)
+    shape = validate_verify_args(
+        batch_size, num_heads, head_dim, spec_query_len, dtype, state_dtype
+    )
     torch = _import_torch(_VERIFY_BACKEND)
     try:
         callable_ = load_required_callable(
@@ -586,10 +624,18 @@ def profile_kda_recoverssm_commit_vllm_triton(
     spec_query_len: int,
     num_layers: int,
     dtype: DType | str,
+    state_dtype: DType | str,
 ) -> ComputeMetrics:
     """Profile one KDA RecoverSSM accepted-state commit over ``num_layers`` layers."""
     shape = validate_commit_args(
-        batch_size, commit_len, num_heads, head_dim, spec_query_len, num_layers, dtype
+        batch_size,
+        commit_len,
+        num_heads,
+        head_dim,
+        spec_query_len,
+        num_layers,
+        dtype,
+        state_dtype,
     )
     torch = _import_torch(_COMMIT_BACKEND)
     try:
@@ -630,14 +676,20 @@ def verify_flops(shape: KdaRecoverSSMShape) -> float:
 
 
 def verify_bytes(shape: KdaRecoverSSMShape) -> float:
-    """q/k/v/raw_g and raw_beta in, out and the two records out, the fp32
+    """q/k/v/raw_g and raw_beta in, out and the two records out, the
     checkpoint read once per request."""
     elements = shape.tokens * shape.projection
-    checkpoint = shape.batch_size * shape.num_heads * shape.head_dim * shape.head_dim * 4
+    checkpoint = (
+        shape.batch_size * shape.num_heads * shape.head_dim * shape.head_dim
+    ) * state_bytes(shape)
     records = shape.tokens * shape.num_heads * shape.head_dim * (4 + 2 * 2)
     return float(
         4 * elements * 2 + shape.tokens * shape.num_heads * 2 + elements * 2 + records + checkpoint
     )
+
+
+def state_bytes(shape: KdaRecoverSSMShape) -> int:
+    return 2 if shape.state_dtype is DType.BF16 else 4
 
 
 def commit_flops(shape: KdaRecoverSSMShape) -> float:
@@ -652,7 +704,7 @@ def commit_bytes(shape: KdaRecoverSSMShape) -> float:
     """Per layer: the checkpoint read and written once, the accepted records
     read, and the conv history read and written."""
     heads, dim = shape.num_heads, shape.head_dim
-    state = heads * dim * dim * 4 * 2
+    state = heads * dim * dim * state_bytes(shape) * 2
     records = shape.commit_len * heads * dim * (4 + 2 * 2)
     conv = shape.conv_dim * shape.conv_history_len * 2 * 2
     return float(shape.num_layers * shape.batch_size * (state + records + conv))
@@ -671,7 +723,9 @@ __all__ = [
     "invoke_verify",
     "profile_kda_recoverssm_commit_vllm_triton",
     "profile_kda_recoverssm_verify_vllm_triton",
+    "state_bytes",
     "state_slots",
+    "state_torch_dtype",
     "validate_commit_args",
     "validate_verify_args",
     "verify_bytes",

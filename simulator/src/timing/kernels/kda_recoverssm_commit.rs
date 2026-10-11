@@ -3,7 +3,7 @@
 //!
 //! One semantic call, three launches: the commit plan, the conv-window
 //! compaction of every layer, and the fused fold of every layer's accepted
-//! records into its fp32 checkpoint (one state read and one write per request,
+//! records into its checkpoint (fp32 or bf16; the pool dtype is the KV axis) (one state read and one write per request,
 //! head and layer). vLLM makes the call once per KDA KV-cache group, and one
 //! call covers all `num_layers` layers of the group, so the layer count is
 //! static identity: billing a one-layer row per layer would repeat the plan and
@@ -37,6 +37,9 @@ pub struct KdaRecoverSSMCommitKernelConfig {
     pub num_layers: Dim,
     #[compute_dtype]
     pub dtype: DType,
+    /// Element type of the checkpoint state pool.
+    #[kv_dtype]
+    pub state_dtype: DType,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -100,6 +103,7 @@ impl KernelSpec for KdaRecoverSSMCommitSpec {
                 .with("spec_query_len", config.spec_query_len.get())
                 .with("num_layers", config.num_layers.get())
                 .with("dtype", config.dtype.as_str())
+                .with("state_dtype", config.state_dtype.as_str())
         })
     }
 }
@@ -125,16 +129,17 @@ mod tests {
             spec_query_len: spec_query_len.into(),
             num_layers: 9.into(),
             dtype: DType::Bf16,
+            state_dtype: DType::Bf16,
         }
     }
 
     /// Catches a dtype tag drift that would hide the kind from launcher
-    /// backend selection (Python BackendSupport is compute bf16, no KV axis).
+    /// backend selection (Python BackendSupport is compute bf16, KV the pool).
     #[test]
-    fn dtype_tag_is_compute_only() {
+    fn dtype_tags_are_compute_and_state_pool() {
         let cfg = config(8);
         assert_eq!(cfg.compute_dtype(), Some(DType::Bf16));
-        assert_eq!(cfg.kv_dtype(), None);
+        assert_eq!(cfg.kv_dtype(), Some(DType::Bf16));
     }
 
     /// Catches a length axis that profiles a length the plan kernel would
@@ -186,11 +191,13 @@ mod tests {
                     "head_dim",
                     "num_heads",
                     "num_layers",
-                    "spec_query_len"
+                    "spec_query_len",
+                    "state_dtype"
                 ]
             );
         }
         let last = payloads[49].fields();
+        assert_eq!(last["state_dtype"], Value::from("bf16"));
         assert_eq!(last["batch_size"], Value::from(512_u32));
         assert_eq!(last["commit_len"], Value::from(8_u32));
         assert_eq!(last["num_layers"], Value::from(9_u32));
