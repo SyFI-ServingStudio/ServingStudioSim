@@ -22,7 +22,9 @@ size of the smallest attention type. ``commit_len`` is the accepted count of
 every request (1..spec_query_len; spec decode always accepts the target token).
 
 The non-align cache mode is measured (no prefix caching), so the committed
-state goes back to the checkpoint's own slot.
+state goes back to the checkpoint's own slot. ``state_dtype`` is the
+checkpoint pool's element type (vLLM ``--mamba-ssm-cache-dtype``); the fold
+runs in fp32 and rounds once on the store.
 """
 
 from __future__ import annotations
@@ -56,6 +58,7 @@ class KdaRecoverSSMCommitArgs(KernelArgs):
     )
     num_layers: int = arg(unit="layers", doc="KDA layers committed by the one call.")
     dtype: DType = arg(doc="Element type of the activations and key/gate record.")
+    state_dtype: DType = arg(doc="Element type of the checkpoint state pool the call folds into.")
 
 
 DOC = KernelDoc(
@@ -104,8 +107,11 @@ register(
         backend="vllm_triton",
         # Plain @triton.jit kernels with no arch-specific instructions; the
         # fork serves them in bf16.
+        # The fold loads the checkpoint at the pool's dtype, accumulates in
+        # fp32 and stores back at the pool's dtype, so fp32 and bf16 pools run.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.FP32, DType.BF16}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.kda_recoverssm_vllm_triton",

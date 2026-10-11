@@ -1,13 +1,16 @@
 //! KDA RecoverSSM speculative-verify `kda_recoverssm_verify` call (vLLM fork,
 //! Kimi-K3 ops; the GLM-5.3-Flash KDA layer is the same op).
 //!
-//! One semantic call, one Triton launch per layer: read each request's fp32
-//! checkpoint once, run its full `spec_query_len` window through the KDA
-//! recurrence in registers, write the outputs and the per-token correction and
-//! key/gate records. No state is written; `kda_recoverssm_commit` folds the
-//! accepted records later. Head geometry, window length and dtype are static
-//! identity; the number of verified requests is the only runtime axis (every
-//! request verifies a full window, `batch_size * spec_query_len` tokens).
+//! One semantic call per layer: read each request's checkpoint once, run its
+//! full `spec_query_len` window through the KDA recurrence, write the outputs
+//! and the per-token correction and key/gate records. No state is written;
+//! `kda_recoverssm_commit` folds the accepted records later. The fork's Triton
+//! op runs the recurrence in registers over an fp32 or bf16 pool; FlashInfer's
+//! `flashinfer_cute` drop-in evaluates the window in the WY tensor-core form
+//! and takes only a bf16 pool, so the pool dtype is the KV axis. Head
+//! geometry, window length and the dtypes are static identity; the number of
+//! verified requests is the only runtime axis (every request verifies a full
+//! window, `batch_size * spec_query_len` tokens).
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -25,6 +28,9 @@ pub struct KdaRecoverSSMVerifyKernelConfig {
     pub spec_query_len: Dim,
     #[compute_dtype]
     pub dtype: DType,
+    /// Element type of the checkpoint state pool.
+    #[kv_dtype]
+    pub state_dtype: DType,
 }
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
@@ -94,6 +100,7 @@ impl KernelSpec for KdaRecoverSSMVerifySpec {
                 .with("head_dim", config.head_dim.get())
                 .with("spec_query_len", config.spec_query_len.get())
                 .with("dtype", config.dtype.as_str())
+                .with("state_dtype", config.state_dtype.as_str())
         })
     }
 }
@@ -118,16 +125,17 @@ mod tests {
             head_dim: 128.into(),
             spec_query_len: 8.into(),
             dtype: DType::Bf16,
+            state_dtype: DType::Fp32,
         }
     }
 
     /// Catches a dtype tag drift that would hide the kind from launcher
-    /// backend selection (Python BackendSupport is compute bf16, no KV axis).
+    /// backend selection (Python BackendSupport is compute bf16, KV the pool).
     #[test]
-    fn dtype_tag_is_compute_only() {
+    fn dtype_tags_are_compute_and_state_pool() {
         let cfg = config();
         assert_eq!(cfg.compute_dtype(), Some(DType::Bf16));
-        assert_eq!(cfg.kv_dtype(), None);
+        assert_eq!(cfg.kv_dtype(), Some(DType::Fp32));
     }
 
     /// Catches payload keys that would miss the Python KernelArgs DB key, or a
@@ -148,11 +156,13 @@ mod tests {
                     "dtype",
                     "head_dim",
                     "num_heads",
-                    "spec_query_len"
+                    "spec_query_len",
+                    "state_dtype"
                 ]
             );
         }
         let last = payloads[129].fields();
+        assert_eq!(last["state_dtype"], Value::from("fp32"));
         assert_eq!(last["batch_size"], Value::from(512_u32));
         assert_eq!(last["spec_query_len"], Value::from(8_u32));
         assert_eq!(last["num_heads"], Value::from(8_u32));

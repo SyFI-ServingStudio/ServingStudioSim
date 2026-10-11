@@ -63,6 +63,7 @@ use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
 };
+use crate::worklet::glm53_kda_attn_local::RECOVERSSM_COMMIT_BACKENDS;
 
 const ARCH_KIND: &str = "glm53_flash_vllm_nvfp4_dflash2";
 
@@ -418,13 +419,14 @@ pub fn build<T: Glm53FlashVerifyTarget>(
                 name,
                 &format!("kda_recoverssm_commit_group{index}"),
                 KdaRecoverSSMCommitKernelConfig {
-                    backends: verify.backends.clone(),
+                    backends: RECOVERSSM_COMMIT_BACKENDS.to_vec(),
                     gpu_name: verify.gpu_name.clone(),
                     num_heads: verify.num_heads.clone(),
                     head_dim: verify.head_dim.clone(),
                     spec_query_len: verify.spec_query_len.clone(),
                     num_layers: layers.into(),
                     dtype: verify.dtype,
+                    state_dtype: verify.state_dtype,
                 },
                 KdaRecoverSSMCommitKernel::build,
                 bridge,

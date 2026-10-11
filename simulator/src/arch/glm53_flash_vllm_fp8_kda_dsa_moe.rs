@@ -721,6 +721,7 @@ pub fn build_configs(
             chunk_prefill_backends: KDA_PREFILL_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             decode_query_len: 1,
+            ssm_state_dtype: DType::Fp32,
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
             hidden: model.hidden.into(),
@@ -1363,8 +1364,9 @@ pub(crate) fn dsa_layer_bytes_per_token(model: &Glm53FlashModelCfg) -> u64 {
         + u64::from(model.index_head_dim + 4) / u64::from(model.index_kpool)
 }
 
-/// One rank's recurrent state of one KDA layer for one request: the fp32 SSM
-/// state, the causal-conv window, and a verify graph's RecoverSSM records.
+/// One rank's recurrent state of one KDA layer for one request: the SSM state
+/// at the pool dtype, the causal-conv window, and a verify graph's RecoverSSM
+/// records.
 pub(crate) fn kda_layer_state_bytes_per_request(resolved: &Glm53FlashVllmResolved) -> u64 {
     u64::from(resolved.kda.ssm_state_bytes_per_request)
         + u64::from(resolved.kda.conv_state_bytes_per_request)
@@ -1607,6 +1609,12 @@ pub(crate) fn verify_width(cfg: &Glm53FlashVllmConfigs) -> std::result::Result<u
         return Err(fit_failed(format!(
             "KDA decode_query_len {} and DSA decode_next_n {width} must be one positive verify width",
             cfg.kda.decode_query_len
+        )));
+    }
+    if width == 1 && cfg.kda.ssm_state_dtype != DType::Fp32 {
+        return Err(fit_failed(format!(
+            "a {:?} KDA state pool is modeled only for a speculative verify; plain decode's recurrent rows are fp32-pool",
+            cfg.kda.ssm_state_dtype
         )));
     }
     Ok(width)
@@ -1873,6 +1881,29 @@ mod tests {
         {
             assert_eq!(leaf.backends, ["vllm_tilelang"], "{}", leaf.name);
         }
+    }
+
+    /// Catches a bf16 pool slipping into plain decode, whose recurrent rows
+    /// carry no state dtype, or a verify graph that ignores the pool in its
+    /// state bytes.
+    #[test]
+    fn a_bf16_kda_pool_halves_the_state_and_needs_a_verify_graph() {
+        let mut configs = build_configs(&model_cfg(), &parallel(), &demand()).unwrap();
+        configs.kda.ssm_state_dtype = DType::Bf16;
+        let err = verify_width(&configs).unwrap_err().to_string();
+        assert!(err.contains("speculative verify"), "{err}");
+        configs.dsa.decode_next_n = 4;
+        configs.kda.decode_query_len = 4;
+        assert_eq!(verify_width(&configs).unwrap(), 4);
+        let bf16 = resolve_configs(&configs);
+        configs.kda.ssm_state_dtype = DType::Fp32;
+        let fp32 = resolve_configs(&configs);
+        assert_eq!(
+            2 * bf16.kda.ssm_state_bytes_per_request,
+            fp32.kda.ssm_state_bytes_per_request
+        );
+        let plan = kda_commit_plan(&bf16).unwrap();
+        assert_eq!(plan.verify.state_dtype, DType::Bf16);
     }
 
     #[test]

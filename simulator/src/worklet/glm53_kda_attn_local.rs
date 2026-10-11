@@ -18,7 +18,13 @@
 //! instead launches once per prefill sequence and runs the iteration's
 //! decode tokens through `causal_conv1d_update`, so its short conv is the sum of
 //! the `(1, L_i)` rows plus one decode launch.
-//! Only prefill-bearing iterations gather and scatter the fp32 SSM state.
+//! Only prefill-bearing iterations gather and scatter the SSM state.
+//!
+//! The state pool is fp32 (vLLM's default) or bf16 (`--mamba-ssm-cache-dtype
+//! bfloat16`). The pool dtype sizes the per-request state and its gather and
+//! scatter, and keys the RecoverSSM verify and commit rows. A bf16 pool is
+//! modeled only for a verify graph: the recurrent and chunked-prefill rows
+//! carry no state-dtype axis and stay fp32-pool measurements.
 //!
 //! The prefill core's q/k/v `.contiguous()` copies and the FLA chain's
 //! scratch fills run inside the call `kda_chunk_prefill` times, so they have no
@@ -51,8 +57,15 @@ use crate::timing::{
 use super::glm53_common::{atomic, backends_agree, elementwise, push_or_zero, repeated};
 
 const STATE_TRANSFER_UNIT_BYTES: u32 = 4096;
-/// RecoverSSM ships only as the vLLM fork's Triton kernels.
-const RECOVERSSM_BACKENDS: &[&str] = &["vllm_triton"];
+/// The RecoverSSM verify over an fp32 pool: only the vLLM fork's Triton op.
+const RECOVERSSM_VERIFY_FP32_BACKENDS: &[&str] = &["vllm_triton"];
+/// Over a bf16 pool FlashInfer's frozen WY verify (`recurrent_kda` with
+/// `disable_state_update`) is a drop-in for the fork op; best-of-N keeps the
+/// faster.
+const RECOVERSSM_VERIFY_BF16_BACKENDS: &[&str] = &["flashinfer_cute", "vllm_triton"];
+/// The RecoverSSM commit ships only as the vLLM fork's Triton kernels;
+/// FlashInfer has no commit.
+pub const RECOVERSSM_COMMIT_BACKENDS: &[&str] = &["vllm_triton"];
 /// Beta sigmoid ahead of a prefill core that takes beta already passed
 /// through one: reads the bf16 logits, writes fp32 (capture 20260924_0).
 const BETA_SIGMOID_IN_BYTES_PER_HEAD: u32 = 2;
@@ -83,6 +96,8 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     /// speculative verify. Above 1 the decode core is the RecoverSSM verify
     /// and commit instead of the recurrent step.
     pub decode_query_len: u32,
+    /// Element type of the recurrent state pool (fp32 or bf16).
+    pub ssm_state_dtype: DType,
 }
 
 #[derive(Clone, Debug)]
@@ -103,7 +118,8 @@ pub struct Glm53KdaAttnLocalWorkletResolved {
     pub state_scatter: crate::timing::kernels::ElementwiseKernelConfig,
     pub gated_norm: crate::timing::kernels::ElementwiseKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
-    /// fp32 `[H, K, V]` recurrent state of one request on this rank.
+    /// `[H, K, V]` recurrent state of one request on this rank, at the pool
+    /// dtype.
     pub ssm_state_bytes_per_request: u32,
     /// bf16 `(kernel_size - 1 + decode_query_len - 1)`-token conv window of one
     /// request on this rank.
@@ -179,7 +195,13 @@ impl Glm53KdaAttnLocalWorklet {
             elementwise(&cfg.elementwise_backends, &cfg.gpu_name, input, output)
         };
         let per_head_bytes = value_width * bpe;
-        let ssm_state_bytes_per_request = heads * head_dim * head_dim * DType::Fp32.size_bytes();
+        assert!(
+            matches!(cfg.ssm_state_dtype, DType::Fp32 | DType::Bf16),
+            "KDA state pool must be fp32 or bf16, got {:?}",
+            cfg.ssm_state_dtype
+        );
+        let ssm_state_bytes_per_request =
+            heads * head_dim * head_dim * cfg.ssm_state_dtype.size_bytes();
         assert_eq!(
             ssm_state_bytes_per_request % STATE_TRANSFER_UNIT_BYTES,
             0,
@@ -226,12 +248,17 @@ impl Glm53KdaAttnLocalWorklet {
             },
             recoverssm_verify: (cfg.decode_query_len > 1).then(|| {
                 KdaRecoverSSMVerifyKernelConfig {
-                    backends: RECOVERSSM_BACKENDS.to_vec(),
+                    backends: match cfg.ssm_state_dtype {
+                        DType::Bf16 => RECOVERSSM_VERIFY_BF16_BACKENDS,
+                        _ => RECOVERSSM_VERIFY_FP32_BACKENDS,
+                    }
+                    .to_vec(),
                     gpu_name: cfg.gpu_name.clone(),
                     num_heads: cfg.num_heads.clone(),
                     head_dim: cfg.head_dim.clone(),
                     spec_query_len: cfg.decode_query_len.into(),
                     dtype: cfg.activation_dtype,
+                    state_dtype: cfg.ssm_state_dtype,
                 }
             }),
             state_scatter: ew(STATE_TRANSFER_UNIT_BYTES, STATE_TRANSFER_UNIT_BYTES),
@@ -599,6 +626,7 @@ mod tests {
             chunk_prefill_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
             decode_query_len: 1,
+            ssm_state_dtype: DType::Fp32,
         }
     }
 

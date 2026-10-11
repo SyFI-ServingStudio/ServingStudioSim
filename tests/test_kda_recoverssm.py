@@ -15,6 +15,7 @@ import torch
 
 from profiling.kernels.kda_recoverssm_commit import KdaRecoverSSMCommitArgs
 from profiling.kernels.kda_recoverssm_verify import KdaRecoverSSMVerifyArgs
+from profiling.runners.attention import kda_recoverssm_flashinfer as flashinfer_runner
 from profiling.runners.attention import kda_recoverssm_vllm_triton as runner
 from profiling.runners.attention.kda_recoverssm_reference import (
     compact_conv_state_reference,
@@ -25,7 +26,9 @@ from profiling.runners.attention.kda_recurrent_decode_reference import (
     kda_recurrent_decode_reference,
 )
 
-_VERIFY = dict(batch_size=4, num_heads=8, head_dim=128, spec_query_len=8, dtype="bf16")
+_VERIFY = dict(
+    batch_size=4, num_heads=8, head_dim=128, spec_query_len=8, dtype="bf16", state_dtype="fp32"
+)
 _COMMIT = dict(
     batch_size=4,
     commit_len=8,
@@ -34,14 +37,24 @@ _COMMIT = dict(
     spec_query_len=8,
     num_layers=2,
     dtype="bf16",
+    state_dtype="fp32",
 )
 
 
 def test_args_fields_are_the_runner_kwargs() -> None:
     # Defect: schema/DB key order drifting from what the worker passes the runner.
     verify = [f.name for f in fields(KdaRecoverSSMVerifyArgs)]
-    assert verify == ["batch_size", "num_heads", "head_dim", "spec_query_len", "dtype"]
+    assert verify == [
+        "batch_size",
+        "num_heads",
+        "head_dim",
+        "spec_query_len",
+        "dtype",
+        "state_dtype",
+    ]
     signature = inspect.signature(runner.profile_kda_recoverssm_verify_vllm_triton)
+    assert list(signature.parameters) == verify
+    signature = inspect.signature(flashinfer_runner.profile_kda_recoverssm_verify_flashinfer_cute)
     assert list(signature.parameters) == verify
     commit = [f.name for f in fields(KdaRecoverSSMCommitArgs)]
     assert commit == [
@@ -52,6 +65,7 @@ def test_args_fields_are_the_runner_kwargs() -> None:
         "spec_query_len",
         "num_layers",
         "dtype",
+        "state_dtype",
     ]
     signature = inspect.signature(runner.profile_kda_recoverssm_commit_vllm_triton)
     assert list(signature.parameters) == commit
@@ -59,12 +73,29 @@ def test_args_fields_are_the_runner_kwargs() -> None:
 
 @pytest.mark.parametrize(
     "override",
-    [{"dtype": "fp16"}, {"spec_query_len": 1}, {"batch_size": 0}, {"num_heads": True}],
+    [
+        {"dtype": "fp16"},
+        {"spec_query_len": 1},
+        {"batch_size": 0},
+        {"num_heads": True},
+        {"state_dtype": "fp16"},
+    ],
 )
 def test_verify_rejects_shapes_outside_the_production_path(override: dict) -> None:
     # Defect: profiling a window with no drafts or a dtype the kg record cannot hold.
     with pytest.raises(ValueError):
         runner.validate_verify_args(**{**_VERIFY, **override})
+
+
+@pytest.mark.parametrize(
+    "override", [{"state_dtype": "fp32"}, {"head_dim": 64}, {"spec_query_len": 17}]
+)
+def test_flashinfer_verify_rejects_what_the_wy_kernel_cannot_take(override: dict) -> None:
+    # Defect: a flashinfer_cute row for a pool dtype, head width or window the
+    # WY kernel rejects (or silently routes elsewhere) at launch.
+    flashinfer_runner.validate_args(**{**_VERIFY, "state_dtype": "bf16"})
+    with pytest.raises(ValueError):
+        flashinfer_runner.validate_args(**{**_VERIFY, "state_dtype": "bf16", **override})
 
 
 @pytest.mark.parametrize(

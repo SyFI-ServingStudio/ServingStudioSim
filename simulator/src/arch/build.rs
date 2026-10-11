@@ -1348,6 +1348,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     cudagraph_capture_sizes: &[u32],
     kernel_path: Glm53FlashKernelPath,
     verify_width: u32,
+    kda_state_dtype: DType,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1375,6 +1376,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
             .context("expanding GLM-5.3-Flash architecture configs")?;
     configs.dsa.decode_next_n = verify_width;
     configs.kda.decode_query_len = verify_width;
+    configs.kda.ssm_state_dtype = kda_state_dtype;
     let resolved = glm53_flash_vllm_fp8_kda_dsa_moe::resolve_configs(&configs);
     glm53_flash_vllm_fp8_kda_dsa_moe::build(name.to_string(), resolved, bridge)
         .context("building GLM-5.3-Flash model (often a missing profile.db row)")
@@ -1509,6 +1511,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     cudagraph_capture_sizes: &[u32],
     kernel_path: Glm53FlashKernelPath,
     verify_width: u32,
+    kda_state_dtype: DType,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1543,6 +1546,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
             .context("expanding GLM-5.3-Flash DP-attention/EP architecture configs")?;
     configs.local.dsa.decode_next_n = verify_width;
     configs.local.kda.decode_query_len = verify_width;
+    configs.local.kda.ssm_state_dtype = kda_state_dtype;
     let resolved = glm53_flash_vllm_fp8_dp_attn_ep_moe::resolve_configs(&configs);
     glm53_flash_vllm_fp8_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
         .context("building GLM-5.3-Flash DP-attention/EP model (often a missing profile.db row)")
@@ -1752,6 +1756,7 @@ pub fn glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(
         token_corpus_file,
         cudagraph_capture_sizes,
         draft_tokens,
+        kda_state_dtype,
         ..
     } = sel
     else {
@@ -1770,6 +1775,7 @@ pub fn glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(
         cudagraph_capture_sizes,
         glm53_flash_kernel_path(sel)?,
         *draft_tokens + 1,
+        kda_state_dtype.dtype(),
         gpu,
         name,
         bridge,
@@ -1808,6 +1814,7 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         token_corpus_file,
         cudagraph_capture_sizes,
         draft_tokens,
+        kda_state_dtype,
         ..
     } = sel
     else {
@@ -1825,6 +1832,7 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         cudagraph_capture_sizes,
         glm53_flash_kernel_path(sel)?,
         *draft_tokens + 1,
+        kda_state_dtype.dtype(),
         gpu,
         name,
         bridge,
@@ -2365,6 +2373,7 @@ pub fn build_iter_model(
             cudagraph_capture_sizes,
             glm53_flash_kernel_path(sel)?,
             1,
+            DType::Fp32,
             gpu,
             name,
             bridge,
@@ -2441,6 +2450,7 @@ pub fn build_iter_model(
             cudagraph_capture_sizes,
             glm53_flash_kernel_path(sel)?,
             1,
+            DType::Fp32,
             gpu,
             name,
             bridge,
@@ -3556,6 +3566,46 @@ mod tests {
         // Four KDA cache groups on each of eight ranks.
         assert_eq!(stages.iter().filter(|&&s| s == 1).count(), 32);
         assert!(stages.contains(&2));
+    }
+
+    /// Catches a bf16 KDA pool that does not reach the RecoverSSM rows: the
+    /// verify must key its rows on the bf16 pool and add FlashInfer's frozen
+    /// verify, while the commit, which FlashInfer lacks, stays the fork's
+    /// Triton op on the same pool.
+    #[test]
+    fn a_bf16_kda_pool_keys_the_recoverssm_rows_and_adds_flashinfer_verify() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let sel: IterArchSel = serde_json::from_value(serde_json::json!({
+            "type": "glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2",
+            "model_config": Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("model/config/glm53_flash_nvfp4.json"),
+            "fp8": false,
+            "tp_size": 8,
+            "draft_tokens": 3,
+            "kda_state_dtype": "bf16",
+        }))
+        .unwrap();
+        glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(&sel, "NVIDIA B200", "test", &bridge).unwrap();
+        let report = bridge.take_enum_report();
+        let of_kind =
+            |kind: &str| -> Vec<_> { report.iter().filter(|leaf| leaf.kind == kind).collect() };
+        let verify = of_kind("kda_recoverssm_verify");
+        let commit = of_kind("kda_recoverssm_commit");
+        assert!(!verify.is_empty() && !commit.is_empty());
+        for leaf in &verify {
+            assert_eq!(
+                leaf.backends,
+                ["flashinfer_cute", "vllm_triton"],
+                "{}",
+                leaf.name
+            );
+            assert_eq!(leaf.kv_dtype, Some(DType::Bf16), "{}", leaf.name);
+        }
+        for leaf in &commit {
+            assert_eq!(leaf.backends, ["vllm_triton"], "{}", leaf.name);
+            assert_eq!(leaf.kv_dtype, Some(DType::Bf16), "{}", leaf.name);
+        }
     }
 
     #[test]

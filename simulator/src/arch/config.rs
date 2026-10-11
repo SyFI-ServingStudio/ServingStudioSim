@@ -83,6 +83,29 @@ pub enum RoutingKind {
 }
 
 /// The `routing` choices the launcher schema advertises (mirror of [`RoutingKind`]).
+/// Element type of a KDA layer's recurrent state pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KdaStateDtype {
+    /// vLLM's `mamba_ssm_cache_dtype` default for KDA.
+    #[default]
+    Fp32,
+    /// `--mamba-ssm-cache-dtype bfloat16`: half the state bytes, and the only
+    /// pool FlashInfer's frozen RecoverSSM verify takes.
+    Bf16,
+}
+
+impl KdaStateDtype {
+    pub fn dtype(self) -> crate::timing::bridge::DType {
+        match self {
+            Self::Fp32 => crate::timing::bridge::DType::Fp32,
+            Self::Bf16 => crate::timing::bridge::DType::Bf16,
+        }
+    }
+}
+
+const KDA_STATE_DTYPES: [&str; 2] = ["fp32", "bf16"];
+
 const ROUTING_KINDS: [&str; 4] = ["uniform", "random", "popularity", "corpus"];
 
 // Only the GLM-5.2 NVFP4 and DeepSeek-V4.1 archs read a token corpus so far;
@@ -1000,12 +1023,18 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
-        /// Candidate positions drafted per request per iteration: the Flash
-        /// draft checkpoint's `block_size - 1` (7), the only depth it drafts.
-        /// The speculative worker's `draft_tokens` must match.
+        /// Candidate positions drafted per request per iteration: at most
+        /// the Flash draft checkpoint's `block_size - 1` (7); a shorter block
+        /// drafts fewer. The speculative worker's `draft_tokens` must match.
         #[serde(default = "default_dflash2_draft_tokens")]
         #[param(default = 7, cache_key)]
         draft_tokens: u32,
+        /// KDA recurrent state pool dtype (vLLM `--mamba-ssm-cache-dtype`):
+        /// the per-request state bytes, and the pool the RecoverSSM verify and
+        /// commit kernels read. `bf16` adds FlashInfer's frozen verify.
+        #[serde(default)]
+        #[param(string, default = "fp32", choices = KDA_STATE_DTYPES, cache_key)]
+        kda_state_dtype: KdaStateDtype,
     },
     /// [`Self::Glm53FlashVllmNvfp4DpAttnEpMoe`] verifying a DFlash2 proposer's
     /// drafts, one TP1 proposer per attention DP rank. See
@@ -1040,12 +1069,18 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
-        /// Candidate positions drafted per request per iteration: the Flash
-        /// draft checkpoint's `block_size - 1` (7), the only depth it drafts.
-        /// The speculative worker's `draft_tokens` must match.
+        /// Candidate positions drafted per request per iteration: at most
+        /// the Flash draft checkpoint's `block_size - 1` (7); a shorter block
+        /// drafts fewer. The speculative worker's `draft_tokens` must match.
         #[serde(default = "default_dflash2_draft_tokens")]
         #[param(default = 7, cache_key)]
         draft_tokens: u32,
+        /// KDA recurrent state pool dtype (vLLM `--mamba-ssm-cache-dtype`):
+        /// the per-request state bytes, and the pool the RecoverSSM verify and
+        /// commit kernels read. `bf16` adds FlashInfer's frozen verify.
+        #[serde(default)]
+        #[param(string, default = "fp32", choices = KDA_STATE_DTYPES, cache_key)]
+        kda_state_dtype: KdaStateDtype,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
