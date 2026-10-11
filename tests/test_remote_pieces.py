@@ -96,6 +96,25 @@ def test_ssh_never_prompts_and_pins_host_keys_beside_remote_yaml(tmp_path):
     assert Transport(_remote()).command_argv("true") == ["bash", "-lc", "true"]
 
 
+def test_the_ssh_control_socket_fits_a_deep_tmpdir_or_is_named(monkeypatch):
+    import tempfile
+
+    from launcher.remote.transport import CONTROL_PATH_LIMIT, TransportError
+
+    # As deep as an agent turn's task directory: ssh's own %C would not fit.
+    deep = "/" + "d" * (CONTROL_PATH_LIMIT - len("/vssh-") - 16 - 1)
+    monkeypatch.setattr(tempfile, "tempdir", deep)
+    transport = Transport(_remote(ssh=Ssh("me@h")))
+    control = transport.control_path()
+    assert str(control.parent) == deep and len(str(control)) <= CONTROL_PATH_LIMIT
+    assert f"ControlPath={control}" in transport.ssh_argv()
+    assert Transport(_remote(ssh=Ssh("me@other"))).control_path() != control
+
+    monkeypatch.setattr(tempfile, "tempdir", deep + "e")
+    with pytest.raises(TransportError, match="point TMPDIR at a shorter directory"):
+        transport.ssh_argv()
+
+
 def test_the_sbatch_script_clears_the_managed_context_and_states_a_time_limit():
     script = launch.sbatch_script(
         Slurm(time="01:00:00", partition="cpu", cpus_per_task=8, extra=("--qos=low",)),

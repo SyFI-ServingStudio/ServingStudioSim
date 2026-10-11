@@ -13,6 +13,8 @@ up the remote user's PATH (uv, cargo, sbatch live there on most hosts).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shlex
 import subprocess
 import tempfile
@@ -27,6 +29,11 @@ class TransportError(RuntimeError):
     """A remote command or copy failed; the message carries its output."""
 
 
+# A unix socket path holds 107 bytes, and ssh appends a 17-byte random suffix
+# while it creates the master's socket.
+CONTROL_PATH_LIMIT = 107 - 17
+
+
 @dataclass(frozen=True)
 class Transport:
     remote: Remote
@@ -39,12 +46,30 @@ class Transport:
     def host_label(self) -> str:
         return "localhost" if self.remote.ssh is None else self.remote.ssh.host
 
+    def control_path(self) -> Path:
+        """The master connection's socket under TMPDIR, one per ssh setting.
+
+        Named by a short hash rather than ssh's 40-character ``%C``, so a
+        TMPDIR as deep as an agent turn's still fits a unix socket path.
+        """
+
+        ssh = self.remote.ssh
+        assert ssh is not None
+        key = json.dumps([ssh.host, ssh.port, ssh.identity_file, list(ssh.options)])
+        digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+        path = Path(tempfile.gettempdir()).resolve() / f"vssh-{digest}"
+        if len(str(path).encode()) > CONTROL_PATH_LIMIT:
+            raise TransportError(
+                f"the ssh control socket {path} is too long for a unix socket "
+                f"(over {CONTROL_PATH_LIMIT} bytes); point TMPDIR at a shorter directory"
+            )
+        return path
+
     def ssh_argv(self) -> list[str]:
         """The ssh command (without the destination) every call shares."""
 
         ssh = self.remote.ssh
         assert ssh is not None
-        control = Path(tempfile.gettempdir()) / "vibesim-ssh-%C"
         argv = [
             "ssh",
             "-o",
@@ -52,7 +77,7 @@ class Transport:
             "-o",
             "ControlMaster=auto",
             "-o",
-            f"ControlPath={control}",
+            f"ControlPath={self.control_path()}",
             "-o",
             "ControlPersist=120",
             "-o",
