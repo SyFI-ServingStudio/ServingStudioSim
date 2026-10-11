@@ -17,7 +17,6 @@ def _stamp(root: Path, **fields) -> dict:
     stamp = {
         "schema_version": 1,
         "version": "v1",
-        "build_hash": "b1",
         "head_oneline": "deadbee Some commit",
         "status": " M launcher/cli.py",
         "diff": "diff --git a/x b/x",
@@ -28,16 +27,23 @@ def _stamp(root: Path, **fields) -> dict:
     return stamp
 
 
-def _bin_dir(tmp_path: Path, build_hash: str | None = "b1") -> Path:
+def _bin_dir(tmp_path: Path, root: Path) -> Path:
     directory = tmp_path / "bin"
     directory.mkdir()
     simulator = directory / "simulator"
     simulator.write_text("#!/bin/sh\n")
     simulator.chmod(0o755)
     (directory / "deployment_schema.json").write_text("{}")
-    if build_hash is not None:
-        (directory / ".build-hash").write_text(build_hash + "\n")
+    binaries.record_build(directory, root, ["Cargo.toml", "gpu/spec.json"])
     return directory
+
+
+def _checkout(tmp_path: Path) -> Path:
+    root = tmp_path / "src"
+    (root / "gpu").mkdir(parents=True)
+    (root / "Cargo.toml").write_text("[package]\n")
+    (root / "gpu" / "spec.json").write_text("{}")
+    return root
 
 
 def test_without_the_variable_binaries_come_from_cargo_target(monkeypatch):
@@ -57,27 +63,50 @@ def test_the_variable_replaces_the_release_output_dir(monkeypatch, tmp_path):
         binaries.build_output_dir("dev")
 
 
-def test_a_prebuilt_set_must_be_complete(tmp_path, monkeypatch):
-    monkeypatch.setattr(binaries, "REPO_ROOT", tmp_path)
-    directory = _bin_dir(tmp_path)
-    binaries.check_prebuilt(directory)  # no stamp here: completeness only
+def test_a_prebuilt_set_must_be_complete(tmp_path):
+    root = _checkout(tmp_path)
+    directory = _bin_dir(tmp_path, root)
+    binaries.check_prebuilt(directory, root)
+    (directory / ".build-inputs").unlink()
+    with pytest.raises(PrebuiltBinaryError, match="does not record its build inputs"):
+        binaries.check_prebuilt(directory, root)
     (directory / "deployment_schema.json").unlink()
     with pytest.raises(PrebuiltBinaryError, match="deployment_schema.json"):
-        binaries.check_prebuilt(directory)
+        binaries.check_prebuilt(directory, root)
     (directory / "simulator").chmod(0o644)
     with pytest.raises(PrebuiltBinaryError, match="no executable simulator"):
-        binaries.check_prebuilt(directory)
+        binaries.check_prebuilt(directory, root)
 
 
-@pytest.mark.parametrize("built_from", ["b0", None])
-def test_a_shipped_tree_refuses_binaries_from_other_sources(tmp_path, monkeypatch, built_from):
-    monkeypatch.setattr(binaries, "REPO_ROOT", tmp_path)
-    _stamp(tmp_path, build_hash="b1")
-    binaries.check_prebuilt(_bin_dir(tmp_path, "b1"))
-    other = tmp_path / "other"
-    other.mkdir()
-    with pytest.raises(PrebuiltBinaryError, match="build inputs are b1"):
-        binaries.check_prebuilt(_bin_dir(other, built_from))
+def test_a_prebuilt_set_is_refused_once_its_sources_change(tmp_path):
+    root = _checkout(tmp_path)
+    directory = _bin_dir(tmp_path, root)
+    (root / "README.md").write_text("not a build input\n")
+    binaries.check_prebuilt(directory, root)
+    # An include_str! data file is an input like any source.
+    (root / "gpu" / "spec.json").write_text('{"H100": {}}')
+    with pytest.raises(PrebuiltBinaryError, match="built from other sources"):
+        binaries.check_prebuilt(directory, root)
+
+
+def test_dep_info_names_the_inputs_with_their_crate_manifests(tmp_path):
+    root = tmp_path / "src"
+    for name in ("Cargo.toml", "Cargo.lock", "gpu/spec.json", "a b/src/lib.rs", "a b/Cargo.toml"):
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text("")
+    dep_info = tmp_path / "simulator.d"
+    dep_info.write_text(
+        f"{root}/target/release/simulator: {root}/gpu/spec.json {root}/a\\ b/src/lib.rs"
+        f" /elsewhere/x.rs\n\n{root}/gpu/spec.json:\n"
+    )
+
+    assert binaries.dep_info_inputs(root, [dep_info]) == [
+        "Cargo.lock",
+        "Cargo.toml",
+        "a b/Cargo.toml",
+        "a b/src/lib.rs",
+        "gpu/spec.json",
+    ]
 
 
 def test_a_stamp_with_an_unknown_schema_is_an_error(tmp_path):

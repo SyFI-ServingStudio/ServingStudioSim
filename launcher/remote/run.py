@@ -1,0 +1,523 @@
+"""The sending side of `--remote`: plan here, run there, bring results back.
+
+One invocation is one remote job and blocks until it ends:
+
+1. Plan locally, as the command would (`plan_simulation`, the predictor's
+   config), to learn where results go and to reject a bad command before
+   anything is shipped. Outputs must be relative paths under ``logs/``.
+2. Register a managed job here when the caller runs inside one, and seed the
+   remote output directory with the identity files that registration produced
+   (``experiment.meta.json``, ``prediction.meta.json``), which the remote run
+   then keeps. The remote run itself never registers (`node.py`).
+3. Ship the tree (`source.py`), give the remote its venv and binaries
+   (`node.py build`), and start the job (`launch.py`) with ``--no-gpu
+   --no-plot``.
+4. Relay the job's output, with a heartbeat at least once a minute so a
+   supervising agent does not take a long, quiet run for a hung one.
+5. Copy the results back to the same relative path here, write
+   ``remote.json`` beside them, and report the managed status.
+
+The experiment stays on the remote in full; the copy leaves out the bulky
+per-iteration logs (``raw/cost_log/``) and plots unless the remote is
+``ephemeral``.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import signal
+import socket
+import sys
+import time
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+
+from ..cli import GlobalOptions
+from . import launch
+from .config import Remote, RemoteConfigError, load_remote
+from .layout import Layout
+from .node import SHIPPED_MARKER
+from .source import REPO_ROOT, Source, SourceError, collect, source_stamp
+from .transport import Transport, TransportError, q
+
+LOGS = REPO_ROOT / "logs"
+POLL_SECONDS = 10.0
+HEARTBEAT_SECONDS = 60.0
+# A job seen neither running nor finished this many polls in a row is lost
+# (one missed `squeue` answer is not enough).
+LOST_POLLS = 3
+SIMULATION_COPY_EXCLUDES = ("raw/cost_log/", "plots/", "/experiment.meta.json")
+REMOTE_RECORD = "remote.json"
+
+
+class RemoteRunError(RuntimeError):
+    """The remote run cannot proceed; the message says why."""
+
+
+class _Interrupted(Exception):
+    pass
+
+
+@dataclass
+class JobOutcome:
+    job_id: str
+    exit_code: int
+    slurm_id: str | None
+    started_at: str
+    finished_at: str
+    detail: str = ""
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _say(message: str) -> None:
+    print(f"[remote] {message}", flush=True)
+
+
+def _warn(message: str) -> None:
+    print(f"[remote] warning: {message}", file=sys.stderr, flush=True)
+
+
+def _env_prefix(env: dict[str, str]) -> str:
+    return "".join(f"export {key}={q(value)}; " for key, value in env.items())
+
+
+class Session:
+    """One remote run: the remote, how to reach it, and the shipped source."""
+
+    def __init__(self, remote: Remote):
+        self.remote = remote
+        self.transport = Transport(remote)
+        # `files: shared` moves files with a local copy; commands still run on
+        # the access host.
+        self.data = (
+            Transport(dataclasses.replace(remote, ssh=None))
+            if remote.files == "shared"
+            else self.transport
+        )
+        self.layout = Layout(remote.workdir)
+        self.source: Source | None = None
+        self.bin_dir: PurePosixPath | None = None
+
+    # ── code ──────────────────────────────────────────────────────────────
+
+    def ship(self) -> Source:
+        source = collect()
+        self.source = source
+        src = self.layout.src(source.version)
+        shipped = self.transport.run(f"test -f {q(src / SHIPPED_MARKER)}", check=False)
+        if shipped.returncode == 0:
+            _say(f"code version {source.version} already on {self.remote.name}")
+            return source
+        src_root = self.layout.workdir / "src"
+        previous = self.transport.run(
+            f"cd {q(src_root)} 2>/dev/null && ls -1t | while read -r d; do "
+            f'[ -f "$d/{SHIPPED_MARKER}" ] && echo "$d" && break; done',
+            check=False,
+        ).stdout.strip()
+        incoming = src_root / f".incoming-{source.version}-{uuid.uuid4().hex[:8]}"
+        self.transport.run(f"mkdir -p {q(incoming)} {q(self.layout.logs)}")
+        options = ["--from0", "--files-from=-"]
+        if previous:
+            # Unchanged files become hard links to the previous version.
+            options.append(f"--link-dest={src_root / previous}")
+        _say(
+            f"shipping code version {source.version} ({len(source.files)} files"
+            + (f", linked against {previous}" if previous else "")
+            + ")"
+        )
+        self.data.rsync(
+            f"{source.root}/",
+            self.data.remote_spec(incoming, directory=True),
+            options=options,
+            input="\0".join(source.files),
+        )
+        self.transport.write_text(
+            incoming / ".source-stamp.json", json.dumps(source_stamp(source), indent=2) + "\n"
+        )
+        # A concurrent sender may have shipped the same version meanwhile.
+        self.transport.run(
+            f"cd {q(incoming)} && ln -sfn ../../logs logs && cd .. && "
+            f"if [ -e {q(src)} ]; then rm -rf {q(incoming)}; "
+            f"else mv {q(incoming)} {q(src)}; fi && touch {q(src / SHIPPED_MARKER)}"
+        )
+        return source
+
+    def prepare(self) -> PurePosixPath:
+        """The remote venv and binaries for the shipped version; returns the bin dir."""
+
+        source = self.source
+        assert source is not None
+        src = self.layout.src(source.version)
+        venv = self.layout.venv(source.venv_key)
+        ready = venv / ".vibesim-ready"
+        lock = self.remote.node_local / f"vibesim-remote-{source.venv_key}-venv.lock"
+        groups = " ".join(f"--group {group}" for group in source.groups)
+        sync = (
+            f"if [ ! -f {q(ready)} ]; then cd {q(src)} && "
+            f"UV_PROJECT_ENVIRONMENT={q(venv)} uv sync --frozen --no-default-groups {groups} "
+            f"&& touch {q(ready)}; fi"
+        )
+        script = (
+            # The sender's venv must not leak in when the access host is this one.
+            f"set -e; unset VIRTUAL_ENV; {_env_prefix(self.remote.env)}"
+            f"if [ ! -f {q(ready)} ]; then mkdir -p {q(self.remote.node_local)}; "
+            f"echo '[remote] creating venv {source.venv_key}'; "
+            f"flock {q(lock)} bash -c {q(sync)}; fi; "
+            f"ln -sfn ../../venvs/{source.venv_key} {q(src / '.venv')}; "
+            f"cd {q(src)} && .venv/bin/python -m launcher.remote.node build "
+            f"{q(self.layout.workdir)} {source.version} --node-local {q(self.remote.node_local)}"
+        )
+        if self.transport.stream(script) != 0:
+            raise RemoteRunError(f"{self.remote.name}: preparing version {source.version} failed")
+        resolved = self.transport.run(f"readlink -f {q(src / 'bin')}").stdout.strip()
+        self.bin_dir = PurePosixPath(resolved)
+        self.transport.run(
+            f"cd {q(src)} && .venv/bin/python -m launcher.remote.node prune "
+            f"{q(self.layout.workdir)} --keep {self.remote.keep_versions}",
+            check=False,
+        )
+        return self.bin_dir
+
+    # ── files ─────────────────────────────────────────────────────────────
+
+    def remote_logs_path(self, local: Path) -> PurePosixPath:
+        return self.layout.logs / local.resolve().relative_to(LOGS.resolve()).as_posix()
+
+    def push_files(self, paths: list[Path]) -> None:
+        """Copy local files under ``logs/`` to the same place under the remote's."""
+
+        for path in paths:
+            destination = self.remote_logs_path(path)
+            self.transport.run(f"mkdir -p {q(destination.parent)}")
+            self.data.rsync(str(path), self.data.remote_spec(destination))
+
+    def fetch(self, local: Path, *, excludes: tuple[str, ...] = ()) -> None:
+        local.mkdir(parents=True, exist_ok=True)
+        if self.remote.ephemeral:
+            # The remote may not exist tomorrow: keep everything but identity.
+            excludes = tuple(e for e in excludes if e.startswith("/"))
+        self.data.rsync(
+            self.data.remote_spec(self.remote_logs_path(local), directory=True),
+            f"{local}/",
+            options=[f"--exclude={pattern}" for pattern in excludes],
+        )
+
+    # ── the job ───────────────────────────────────────────────────────────
+
+    def run_job(self, argv: list[str]) -> JobOutcome:
+        source, bin_dir = self.source, self.bin_dir
+        assert source is not None and bin_dir is not None
+        job_id = f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+        jobdir = self.layout.job(job_id)
+        src = self.layout.src(source.version)
+        job = {
+            "job_id": job_id,
+            "version": source.version,
+            "src": str(src),
+            "argv": argv,
+            "env": self.remote.env,
+            "node_local": str(self.remote.node_local),
+            "bin_dir": str(bin_dir),
+            "sender": socket.gethostname(),
+            "created_at": _now(),
+        }
+        self.transport.write_text(jobdir / "job.json", json.dumps(job, indent=2) + "\n")
+        started = _now()
+        submitted = launch.submit(
+            self.transport,
+            self.remote,
+            job_id=job_id,
+            jobdir=jobdir,
+            cwd=src,
+            remote_python=self.layout.python(source.version),
+        )
+        where = f"Slurm job {submitted.handle}" if submitted.slurm else f"pid {submitted.handle}"
+        _say(f"job {job_id} started on {self.transport.host_label} ({where})")
+        status = self._wait(submitted, job_id)
+        return JobOutcome(
+            job_id=job_id,
+            exit_code=status.exit_code if status.exit_code is not None else 1,
+            slurm_id=submitted.handle if submitted.slurm else None,
+            started_at=started,
+            finished_at=_now(),
+            detail=status.detail,
+        )
+
+    def _wait(self, submitted: launch.Submitted, job_id: str) -> launch.Status:
+        offset, lost_polls = 0, 0
+        began = last_output = time.monotonic()
+        previous = signal.signal(signal.SIGTERM, _raise_interrupted)
+        try:
+            delay = 2.0
+            while True:
+                time.sleep(delay)
+                delay = POLL_SECONDS
+                try:
+                    status = launch.poll(self.transport, submitted, offset)
+                except TransportError as exc:
+                    _warn(f"poll failed, retrying: {exc}")
+                    continue
+                if status.log_chunk:
+                    sys.stdout.write(status.log_chunk)
+                    sys.stdout.flush()
+                    last_output = time.monotonic()
+                offset = status.log_size
+                if status.log_total > offset:
+                    delay = 0.2  # more output is already waiting
+                    continue
+                if status.exit_code is not None:
+                    return status
+                lost_polls = lost_polls + 1 if status.lost else 0
+                if lost_polls >= LOST_POLLS:
+                    _warn(f"job {job_id} vanished without an exit code ({status.detail})")
+                    return status
+                if time.monotonic() - last_output >= HEARTBEAT_SECONDS:
+                    minutes = (time.monotonic() - began) / 60
+                    state = f", {status.detail}" if status.detail else ""
+                    _say(f"job {job_id} still running ({minutes:.0f} min{state})")
+                    last_output = time.monotonic()
+        except (KeyboardInterrupt, _Interrupted):
+            _say(f"interrupted; stopping job {job_id}")
+            launch.cancel(self.transport, submitted)
+            raise KeyboardInterrupt from None
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+    def record(self, local_root: Path, outcome: JobOutcome, command: list[str]) -> None:
+        source = self.source
+        assert source is not None
+        record = {
+            "schema_version": 1,
+            "remote": self.remote.name,
+            "host": self.transport.host_label,
+            "remote_path": str(self.remote_logs_path(local_root)),
+            "code_version": source.version,
+            "bin_dir": str(self.bin_dir),
+            "job_id": outcome.job_id,
+            "slurm_job_id": outcome.slurm_id,
+            "command": command,
+            "started_at": outcome.started_at,
+            "finished_at": outcome.finished_at,
+            "exit_code": outcome.exit_code,
+            "copied_back": "all" if self.remote.ephemeral else "without raw/cost_log and plots",
+        }
+        local_root.mkdir(parents=True, exist_ok=True)
+        (local_root / REMOTE_RECORD).write_text(json.dumps(record, indent=2) + "\n", "utf-8")
+
+
+def _raise_interrupted(_signum, _frame):
+    raise _Interrupted
+
+
+def _report(job, status: str, **kwargs) -> None:
+    """A managed status update that may not fail the run (e.g. an expired token)."""
+
+    if job is None:
+        return
+    try:
+        job.report(status, **kwargs)
+    except Exception as exc:
+        _warn(f"could not report managed status {status!r}: {exc}")
+
+
+# ── inputs and outputs ────────────────────────────────────────────────────
+
+
+def _require_repo_cwd() -> None:
+    if Path.cwd().resolve() != REPO_ROOT.resolve():
+        raise RemoteRunError(
+            f"run --remote from the checkout root ({REPO_ROOT}): relative paths in the "
+            "command must mean the same thing on the remote"
+        )
+
+
+def _under_logs(path: Path, what: str) -> Path:
+    resolved = path.resolve()
+    if not resolved.is_relative_to(LOGS.resolve()) or resolved == LOGS.resolve():
+        raise RemoteRunError(f"{what} {path} must be a directory under logs/ for --remote")
+    return resolved
+
+
+def _input_files(paths: list[Path], source: Source) -> list[Path]:
+    """Input files the remote lacks: the ones under ``logs/`` (which is not shipped).
+
+    An input outside the checkout, or ignored by git outside ``logs/`` and
+    ``trace/``, cannot reach the remote and is an error.
+    """
+
+    shipped = set(source.files)
+    extra: list[Path] = []
+    for path in paths:
+        resolved = path.resolve()
+        if not resolved.is_relative_to(REPO_ROOT.resolve()):
+            raise RemoteRunError(f"input {path} is outside the checkout; --remote cannot ship it")
+        if resolved.is_relative_to(LOGS.resolve()):
+            extra.append(resolved)
+        elif resolved.relative_to(REPO_ROOT.resolve()).as_posix() not in shipped:
+            raise RemoteRunError(f"input {path} is ignored by git, so --remote does not ship it")
+    return extra
+
+
+# ── commands ──────────────────────────────────────────────────────────────
+
+
+def _simulation(session: Session, argv: list[str]) -> int:
+    from ..__main__ import parse_simulation_args, plan_simulation
+    from ..managed_run import EXPERIMENT_METADATA_FILENAME, prepare_experiment
+    from ..sweep import _experiment_root, _sweep_axes, log_dir_of
+
+    args = parse_simulation_args(argv)
+    for flag, used in (
+        ("--dry-run", args.dry_run),
+        ("--cache-report", args.cache_report),
+        ("--emit-backends", args.emit_backends is not None),
+        ("--profile", args.profile),
+    ):
+        if used:
+            raise RemoteRunError(f"{flag} runs locally; drop --remote")
+    plan = plan_simulation(args)
+    if isinstance(plan, int):
+        return plan
+    candidates = plan.candidates
+    single = len(candidates) == 1
+    root = Path(log_dir_of(candidates[0])) if single else _experiment_root(candidates)
+    root = _under_logs(root, "the experiment root")
+
+    source = session.ship()
+    inputs = _input_files([Path(p) for p in args.presets], source)
+    managed = prepare_experiment(
+        root, run_count=len(candidates), axes=[] if single else _sweep_axes(candidates)
+    )
+    session.push_files([*inputs, root / EXPERIMENT_METADATA_FILENAME])
+    session.prepare()
+    _report(managed, "running")
+    command = [*argv, "--no-gpu", "--no-plot"]
+    try:
+        outcome = session.run_job(command)
+    except KeyboardInterrupt:
+        _report(managed, "interrupted")
+        raise
+    _report(managed, "analysis_running")
+    session.fetch(root, excludes=SIMULATION_COPY_EXCLUDES)
+    session.record(root, outcome, command)
+    _report(managed, "ready" if outcome.exit_code == 0 else "failed")
+    _say(
+        f"{'done' if outcome.exit_code == 0 else f'failed (exit {outcome.exit_code})'}: "
+        f"{root.relative_to(REPO_ROOT)} (remote copy: "
+        f"{session.transport.host_label}:{session.remote_logs_path(root)})"
+    )
+    return outcome.exit_code
+
+
+def _timing_predict(session: Session, argv: list[str]) -> int:
+    from ..managed_job import prepare_managed_job
+    from ..timing_predict import (
+        _build_argparse,
+        _load_config,
+        _predict_descriptor,
+        _prediction_id,
+    )
+
+    args = _build_argparse().parse_intermixed_args(argv)
+    if args.dry_run:
+        raise RemoteRunError("--dry-run runs locally; drop --remote")
+    if not args.configs:
+        raise RemoteRunError("timing-predict: no config given")
+    planned: list[tuple[Path, Path, dict]] = []
+    inputs: list[Path] = []
+    for name in args.configs:
+        config_path = Path(name).resolve()
+        if not config_path.is_file():
+            raise RemoteRunError(f"{name}: not a file")
+        cfg = _load_config(config_path)
+        if not isinstance(cfg.get("log_dir"), str) or not cfg["log_dir"]:
+            raise RemoteRunError(f"{name}: timing-predict config requires log_dir")
+        # Relative to the checkout root, as `timing_predict.run_one` reads it.
+        log_dir = _under_logs(REPO_ROOT / cfg["log_dir"], "log_dir")
+        inputs.append(config_path)
+        cases = cfg.get("cases_file")
+        if isinstance(cases, str) and cases and not cases.startswith("hf://"):
+            cases_path = Path(cases)
+            if not cases_path.is_absolute():
+                cases_path = config_path.parent / cases_path
+            inputs.append(cases_path)
+        planned.append((config_path, log_dir, cfg))
+
+    source = session.ship()
+    extra = _input_files(inputs, source)
+    jobs = []
+    seeds: list[Path] = []
+    for config_path, log_dir, cfg in planned:
+        prediction_id = _prediction_id(log_dir)
+        job = prepare_managed_job(
+            "timing_predict",
+            log_dir,
+            descriptor=_predict_descriptor(config_path, cfg),
+            analyzer_resource_id=prediction_id,
+        )
+        jobs.append(job)
+        if job is not None and not (log_dir / "prediction.meta.json").is_file():
+            # The remote prediction keeps this id (`_prediction_id`).
+            log_dir.mkdir(parents=True, exist_ok=True)
+            seed = log_dir / "prediction.meta.json"
+            seed.write_text(json.dumps({"prediction_id": prediction_id}) + "\n", "utf-8")
+            seeds.append(seed)
+    session.push_files([*extra, *seeds])
+    # A seed is not a prediction's metadata; the remote writes the real file.
+    for seed in seeds:
+        seed.unlink()
+    session.prepare()
+    for job in jobs:
+        _report(job, "running")
+    command = ["timing-predict", *argv, "--no-gpu", "--no-plot"]
+    try:
+        outcome = session.run_job(command)
+    except KeyboardInterrupt:
+        for job in jobs:
+            _report(job, "interrupted")
+        raise
+    for (config_path, log_dir, cfg), job in zip(planned, jobs, strict=True):
+        session.fetch(log_dir)
+        session.record(log_dir, outcome, command)
+        metadata = log_dir / "prediction.meta.json"
+        complete = metadata.is_file() and len(json.loads(metadata.read_text("utf-8"))) > 1
+        if not complete:
+            # A failed remote prediction leaves only the seed behind.
+            metadata.unlink(missing_ok=True)
+        if complete:
+            _report(job, "ready", summary=_predict_descriptor(config_path, cfg))
+        else:
+            _report(job, "failed")
+        _say(f"{'done' if complete else 'failed'}: {log_dir.relative_to(REPO_ROOT)}")
+    return outcome.exit_code
+
+
+COMMANDS: dict[str | None, Callable[[Session, list[str]], int]] = {
+    None: _simulation,
+    "timing-predict": _timing_predict,
+}
+
+
+def run(subcommand: str | None, argv: list[str], options: GlobalOptions) -> int:
+    if subcommand not in COMMANDS:
+        print(
+            f"python -m launcher: --remote {subcommand} is not implemented yet",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        _require_repo_cwd()
+        remote = load_remote(options.remote or "", options.remote_set)
+        return COMMANDS[subcommand](Session(remote), argv)
+    except (RemoteConfigError, RemoteRunError, SourceError, TransportError) as exc:
+        print(f"python -m launcher --remote: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130

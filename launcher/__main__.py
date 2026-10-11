@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from .cli import UsageError, apply_dotted, dispatch, modes_help
@@ -525,15 +526,18 @@ def main(argv: list[str] | None = None) -> int:
     return dispatch(list(sys.argv[1:] if argv is None else argv), simulation=run_simulation)
 
 
-def run_simulation(argv: list[str]) -> int:
-    """The default mode: run or sweep simulation presets."""
-    args = _build_argparse().parse_intermixed_args(argv)
-    if not args.presets:
-        sys.exit(
-            "no preset given; usage: python -m launcher PRESET.yaml|json [...] "
-            "(or choose timing-predict, kernel-profile, alignment, or list-params)"
-        )
+@dataclass(frozen=True)
+class SimulationPlan:
+    """A validated simulation batch, ready to run here or ship (`launcher/remote`)."""
 
+    candidates: list[dict]
+    # The last preset loaded, as `metadata.write_shared_metadata` records it.
+    preset: dict
+    schema: Registry
+    analyze_subjects: list[str] | None
+
+
+def _built_schema(args) -> Registry:
     # INV-8 / design §1.2.3: the single shared build per batch. Building also
     # runs `list-params` → deployment_schema.json (§1.2.7), so this is what
     # guarantees the load_schema below reads a schema matching the just-built
@@ -545,13 +549,17 @@ def run_simulation(argv: list[str]) -> int:
         sys.exit("launcher preparation failed (see stage-specific error above)")
 
     try:
-        schema = load_schema(args.build_type)
+        return load_schema(args.build_type)
     except SchemaNotFound as exc:
         sys.exit(str(exc))
 
-    if args.emit_backends is not None:
-        return _emit_backends(args, schema)
 
+def plan_simulation(args) -> SimulationPlan | int:
+    """Build, then load, expand and validate every preset of the batch.
+
+    Returns the plan, or the exit code after printing why there is none.
+    """
+    schema = _built_schema(args)
     stems = [Path(path).stem for path in args.presets]
     if len(args.presets) > 1 and len(set(stems)) != len(stems):
         print(
@@ -650,6 +658,30 @@ def run_simulation(argv: list[str]) -> int:
             f"--profile requires exactly one run, but the preset expands to "
             f"{len(all_candidates)}; narrow it (e.g. via --override) to a single run"
         )
+
+    return SimulationPlan(all_candidates, last_preset, schema, analyze_subjects)
+
+
+def parse_simulation_args(argv: list[str]):
+    args = _build_argparse().parse_intermixed_args(argv)
+    if not args.presets:
+        sys.exit(
+            "no preset given; usage: python -m launcher PRESET.yaml|json [...] "
+            "(or choose timing-predict, kernel-profile, alignment, or list-params)"
+        )
+    return args
+
+
+def run_simulation(argv: list[str]) -> int:
+    """The default mode: run or sweep simulation presets."""
+    args = parse_simulation_args(argv)
+    if args.emit_backends is not None:
+        return _emit_backends(args, _built_schema(args))
+    plan = plan_simulation(args)
+    if isinstance(plan, int):
+        return plan
+    all_candidates = plan.candidates
+    last_preset, schema, analyze_subjects = plan.preset, plan.schema, plan.analyze_subjects
 
     if args.dry_run:
         for candidate in all_candidates:
