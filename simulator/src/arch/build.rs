@@ -3515,6 +3515,46 @@ mod tests {
         assert_eq!(built.num_attn_shards(), 4);
     }
 
+    /// Catches the DFlash2 wrapper compiling its stages in a different order
+    /// than `eval_into` pushes them (target, commit, draft): the slots would
+    /// then receive another kernel's input.
+    #[test]
+    fn flash_dflash2_compiles_target_commit_then_draft_slots() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let sel: IterArchSel = serde_json::from_value(serde_json::json!({
+            "type": "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+            "model_config": Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("model/config/glm53_flash_nvfp4.json"),
+            "fp8": false,
+            "ep_size": 8,
+            "draft_tokens": 7,
+        }))
+        .unwrap();
+        let model =
+            glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(&sel, "NVIDIA B200", "test", &bridge)
+                .unwrap();
+        let stage = |name: &str| {
+            if name.starts_with("test.dflash2") {
+                2
+            } else if name.starts_with("test.kda_recoverssm_commit") {
+                1
+            } else {
+                0
+            }
+        };
+        let stages: Vec<u8> = model
+            .cost_log_manifest()
+            .slots
+            .iter()
+            .map(|slot| stage(&slot.name))
+            .collect();
+        assert!(stages.windows(2).all(|w| w[0] <= w[1]), "{stages:?}");
+        // Four KDA cache groups on each of eight ranks.
+        assert_eq!(stages.iter().filter(|&&s| s == 1).count(), 32);
+        assert!(stages.contains(&2));
+    }
+
     #[test]
     fn dflash2_necessary_work_map_covers_the_compiled_locations() {
         use std::collections::BTreeSet;
