@@ -1704,8 +1704,11 @@ fn dflash2_draft_resolved(
     })
 }
 
-/// The `incoai/GLM-5.3-Flash-DFlash2` draft at `tp_size`. Its block is 8, so
-/// it drafts exactly 7 tokens; its window is the checkpoint's.
+/// The `incoai/GLM-5.3-Flash-DFlash2` draft at `tp_size`; its window is the
+/// checkpoint's. The checkpoint's block is 8 (7 drafts), and a shorter block
+/// drafts fewer: SGLang's `--speculative-num-draft-tokens` sets the block it
+/// runs (one bonus position plus `draft_tokens` masks), warning when it differs
+/// from the checkpoint's.
 fn glm53_flash_dflash2_draft(
     tp_size: u16,
     gpu: &str,
@@ -1713,8 +1716,8 @@ fn glm53_flash_dflash2_draft(
 ) -> Result<Dflash2DraftResolved> {
     let checkpoint = &GLM53_FLASH_DFLASH2;
     anyhow::ensure!(
-        draft_tokens == checkpoint.draft_tokens(),
-        "the {} draft has block_size {} and drafts {} tokens, not {draft_tokens}",
+        (1..=checkpoint.draft_tokens()).contains(&draft_tokens),
+        "the {} draft has block_size {} and drafts 1..={} tokens, not {draft_tokens}",
         checkpoint.name,
         checkpoint.block_size,
         checkpoint.draft_tokens()
@@ -3854,10 +3857,13 @@ mod tests {
     }
 
     #[test]
-    fn the_flash_draft_only_drafts_its_block() {
-        // block_size 8: one bonus position and seven drafts, nothing shorter.
-        let err = glm53_flash_dflash2_draft(1, "NVIDIA B200", 3).unwrap_err();
-        assert!(err.to_string().contains("block_size 8"), "{err}");
+    fn the_flash_draft_runs_a_block_no_longer_than_its_checkpoints() {
+        // block_size 8: up to seven drafts; a shorter block drafts fewer.
+        assert!(glm53_flash_dflash2_draft(1, "NVIDIA B200", 3).is_ok());
+        for draft_tokens in [0, 8] {
+            let err = glm53_flash_dflash2_draft(1, "NVIDIA B200", draft_tokens).unwrap_err();
+            assert!(err.to_string().contains("block_size 8"), "{err}");
+        }
     }
 
     /// An arch block on `gpu` with `params`, its model config a `model/config/`
