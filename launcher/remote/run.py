@@ -115,6 +115,8 @@ class Session:
         self.layout = Layout(remote.workdir)
         self.source: Source | None = None
         self.bin_dir: PurePosixPath | None = None
+        # The remote is itself a profiler image (`prepare_in_image`).
+        self.in_image = False
         # The job's own venv, when it is not the version's (CPU) `.venv`.
         self.job_venv: PurePosixPath | None = None
 
@@ -257,7 +259,7 @@ class Session:
         """Run ``python -m launcher ARGV`` there; ``keep_db`` keeps its profile.db copy."""
 
         source, bin_dir = self.source, self.bin_dir
-        assert source is not None and bin_dir is not None
+        assert source is not None and (bin_dir is not None or self.in_image)
         job_id = f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
         jobdir = self.layout.job(job_id)
         src = self.layout.src(source.version)
@@ -270,7 +272,7 @@ class Session:
             "keep_db": keep_db,
             "venv": str(self.job_venv or src / ".venv"),
             "node_local": str(self.remote.node_local),
-            "bin_dir": str(bin_dir),
+            "bin_dir": "" if bin_dir is None else str(bin_dir),
             "sender": socket.gethostname(),
             "created_at": _now(),
         }
@@ -377,6 +379,41 @@ class Session:
             raise RemoteRunError(f"{self.remote.name} loaded {tag} as {sent}, not {image_id}")
         return sent
 
+    def prepare_in_image(self, env_name: str, tag: str) -> str:
+        """Run jobs on the interpreter of the profiler image the remote is; its inputs.
+
+        The remote must be ``tag``, the image this checkout names for
+        ``env_name``: its manifest (written by every profiler Dockerfile) has to
+        carry the same inputs hash and serve the env. Nothing is built there.
+        """
+
+        from profiling.exec.env import IMAGE_MANIFEST
+
+        source = self.source
+        assert source is not None
+        found = self.transport.run(f"cat {q(IMAGE_MANIFEST)}", check=False)
+        try:
+            manifest = json.loads(found.stdout)
+        except ValueError:
+            manifest = None
+        if found.returncode != 0 or not isinstance(manifest, dict):
+            raise RemoteRunError(
+                f"{self.remote.name} has profile_runtime: in-image, but no profiler image "
+                f"manifest at {IMAGE_MANIFEST}: it does not run a profiler image "
+                "(or one built before the manifest existed)"
+            )
+        inputs = tag.rpartition(":")[2]
+        if manifest.get("inputs") != inputs or env_name not in manifest.get("envs", ()):
+            raise RemoteRunError(
+                f"{env_name} needs image {tag}, but {self.remote.name} runs an image "
+                f"with inputs {manifest.get('inputs')} serving {manifest.get('envs')}"
+            )
+        src = self.layout.src(source.version)
+        venv = PurePosixPath(manifest["python"]).parents[1]
+        self.transport.run(f"ln -sfn {q(venv)} {q(src / '.venv')}")
+        self.in_image = True
+        return inputs
+
     def fetch_job_file(self, job_id: str, name: str, local: Path) -> None:
         self.data.rsync(self.data.remote_spec(self.layout.job(job_id) / name), str(local))
 
@@ -397,7 +434,7 @@ class Session:
             "host": self.transport.host_label,
             "remote_path": str(self.remote_logs_path(local_root)),
             "code_version": source.version,
-            "bin_dir": str(self.bin_dir),
+            "bin_dir": None if self.bin_dir is None else str(self.bin_dir),
             "job_id": outcome.job_id,
             "slurm_job_id": outcome.slurm_id,
             "command": command,
@@ -650,10 +687,6 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
             "--db cannot be used with --remote: the remote job writes its own copy, "
             "merged back into this checkout's profile.db (VIBESIM_PROFILE_DB)"
         )
-    if session.remote.profile_runtime != "docker":
-        raise RemoteRunError(
-            f"profile_runtime {session.remote.profile_runtime!r} is not implemented yet"
-        )
     measure = args.command == "measure"
     if args.output_dir is None and not measure:
         raise RemoteRunError("kernel-profile run --remote requires --output-dir under logs/")
@@ -695,10 +728,17 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
     session.push_files([*extra, *seeds])
     for seed in seeds:
         seed.unlink()
-    # The controller runs as it does here: on the project's profiling stack.
-    session.prepare(job_groups=(*CPU_GROUPS, "profiling"))
-    image_id = session.ensure_image(image)
-    _say(f"{args.table}/{args.backend} runs in {image} ({image_id[:19]})")
+    env_name = profiler_spec.subprocess_env or "default_env"
+    in_image = session.remote.profile_runtime == "in-image"
+    if in_image:
+        # The remote is the image: controller and workers run on its interpreter.
+        image_id = session.prepare_in_image(env_name, image)
+        _say(f"{args.table}/{args.backend} runs on {session.remote.name}, which is {image}")
+    else:
+        # The controller runs as it does here: on the project's profiling stack.
+        session.prepare(job_groups=(*CPU_GROUPS, "profiling"))
+        image_id = session.ensure_image(image)
+        _say(f"{args.table}/{args.backend} runs in {image} ({image_id[:19]})")
     _report(job, "running")
     command = ["kernel-profile", *argv]
     keep_db = not measure and not args.fresh
@@ -706,9 +746,9 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
         outcome = session.run_job(
             command,
             env={
-                PROFILE_RUNTIME_ENV: "container",
+                PROFILE_RUNTIME_ENV: "in-image" if in_image else "container",
                 # The shipped tree has no git to compute the tag from.
-                IMAGES_ENV: json.dumps({profiler_spec.subprocess_env or "default_env": image}),
+                IMAGES_ENV: json.dumps({env_name: image}),
                 "VIBESIM_PROFILE_CACHE_DIR": str(session.layout.workdir / "cache"),
             },
             keep_db=keep_db,
@@ -734,7 +774,8 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
         command,
         copied_back="all",
         image=image,
-        image_id=image_id,
+        # A pod has no docker to name an image id; its manifest names the inputs.
+        **({"image_inputs": image_id} if in_image else {"image_id": image_id}),
         profile_db=merged,
     )
     metadata = output_dir / metadata_name
@@ -769,6 +810,11 @@ def run(subcommand: str | None, argv: list[str], options: GlobalOptions) -> int:
     try:
         _require_repo_cwd()
         remote = load_remote(options.remote or "", options.remote_set)
+        if remote.profile_runtime == "in-image" and subcommand != "kernel-profile":
+            raise RemoteRunError(
+                f"{remote.name} is a profiler image (profile_runtime: in-image), "
+                "which runs kernel-profile only"
+            )
         return COMMANDS[subcommand](Session(remote), argv)
     except (RemoteConfigError, RemoteRunError, SourceError, TransportError) as exc:
         print(f"python -m launcher --remote: {exc}", file=sys.stderr)

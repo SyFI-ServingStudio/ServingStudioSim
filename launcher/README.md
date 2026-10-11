@@ -862,6 +862,29 @@ artifact metadata carries the observed GPU as for a local run. Under a managed
 job the `kp_`/`km_` id is registered here and seeded into the remote output
 directory, as for a prediction.
 
+**A remote that is a profiler image** (`profile_runtime: in-image`, e.g. a
+RunPod pod started from one). There is no docker inside, so the job runs with
+`VIBESIM_PROFILE_RUNTIME=in-image`: controller and workers run on the image's
+own interpreter, and only the envs that image serves. Before anything runs, the
+remote's `/etc/vibesim-profiler-image.json` (written by every profiler
+Dockerfile) must name the inputs of the image this checkout assigns the
+backend's env; nothing is built, synced or sent. Such a remote runs
+`kernel-profile` only. The image's entrypoint is the worker, so start the pod
+with entrypoint `bash -c` and this command, which installs ssh and rsync, keeps
+the image's environment for ssh sessions, and authorizes the pod's
+`PUBLIC_KEY`:
+
+```
+export -p | grep -vE '^declare -x (HOME|PWD|OLDPWD|SHLVL)=' > /etc/profile.d/00-vibesim-image.sh
+apt-get update -qq && apt-get install -y -qq openssh-server rsync >/dev/null
+mkdir -p /run/sshd /root/.ssh && echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
+chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && exec /usr/sbin/sshd -D -e
+```
+
+Expose `22/tcp` (RunPod's proxied ssh cannot carry rsync), pull the image from
+a registry under the same tag (`docker tag` + `docker push` from here), and
+set `ephemeral: true` so results come back whole.
+
 **Limits.** One invocation is one blocking remote job; a managed job's
 capability token must outlive it (6 h). A job whose process or allocation
 vanishes without an exit code fails after three consecutive polls.

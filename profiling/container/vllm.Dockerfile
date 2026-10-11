@@ -74,6 +74,9 @@ RUN python -c "import importlib.metadata, torch; assert torch.version.cuda == '1
 # Last, so a new commit only rewrites the labels, not the dependency layers.
 ARG VIBESIM_REVISION=unknown
 ARG VIBESIM_IMAGE_INPUTS=unknown
+# What this image is, for a process running inside it
+# (`VIBESIM_PROFILE_RUNTIME=in-image`, profiling/exec/env.py).
+RUN /opt/vibesim/alignment/profiler/vllm/.venv/bin/python -c "import json, os; json.dump({'inputs': '${VIBESIM_IMAGE_INPUTS}', 'envs': '${VIBESIM_PROFILE_ENVS}'.split(), 'python': '/opt/vibesim/alignment/profiler/vllm/.venv/bin/python', 'python_paths': [p for p in os.environ['PYTHONPATH'].split(':') if p and p != '/opt/vibesim']}, open('/etc/vibesim-profiler-image.json', 'w'))"
 LABEL org.opencontainers.image.title="VibeSim vLLM kernel profiler" \
       org.opencontainers.image.revision="${VIBESIM_REVISION}" \
       ai.vibesim.image.inputs="${VIBESIM_IMAGE_INPUTS}" \

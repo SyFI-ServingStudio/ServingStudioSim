@@ -26,7 +26,8 @@
 #   keep_versions    shipped code versions to keep (default 10); experiments are never deleted.
 #   profile_runtime  `docker` (default): kernel-profile runs every worker in its env's
 #                    image (profiling/container/images.py), sent from here when the
-#                    remote lacks it. `in-image`: the remote is itself a profiling image.
+#                    remote lacks it. `in-image`: the remote is itself a profiling image
+#                    (a pod); it runs kernel-profile only, for the envs that image serves.
 #   ephemeral        true when the remote's disk may vanish (a pod): copy results back whole.
 
 remotes:
@@ -57,7 +58,8 @@ remotes:
     files: shared
     workdir: /shared/me/vibesim-remote
 
-  # A RunPod pod with exposed TCP ssh (the proxied ssh cannot carry rsync).
+  # A RunPod pod started from a profiler image, with exposed TCP ssh (the
+  # proxied ssh cannot carry rsync); its start command is in launcher/README.md.
   pod:
     access: {ssh: root@203.0.113.7, port: 40022, identity_file: ~/.ssh/runpod}
     workdir: /workspace/vibesim-remote

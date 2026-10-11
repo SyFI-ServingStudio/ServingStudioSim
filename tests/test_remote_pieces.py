@@ -372,3 +372,47 @@ def test_a_remote_jobs_rows_merge_into_the_local_database(tmp_path, monkeypatch)
     with pytest.raises(run.RemoteRunError, match="conflict"):
         run._merge_profile_db(conflicting, tmp_path / "report2.json")
     assert local.read_bytes() == before
+
+
+def test_an_in_image_remote_runs_on_the_images_interpreter_only_if_it_is_the_image(
+    tmp_path, monkeypatch
+):
+    import types
+
+    import profiling.exec.env as profile_env
+    from launcher.remote.run import RemoteRunError, Session
+
+    manifest = tmp_path / "manifest.json"
+    monkeypatch.setattr(profile_env, "IMAGE_MANIFEST", manifest)
+    session = Session(_remote(workdir=PurePosixPath(tmp_path / "w")))
+    session.source = types.SimpleNamespace(version="v1")
+    (tmp_path / "w" / "src" / "v1").mkdir(parents=True)
+    tag = "vibesim-profiler-vllm:abc123"
+    with pytest.raises(RemoteRunError, match="no profiler image manifest"):
+        session.prepare_in_image("vllm_env", tag)
+
+    manifest.write_text(
+        json.dumps({"inputs": "abc123", "envs": ["vllm_env"], "python": "/opt/v/.venv/bin/python"})
+    )
+    with pytest.raises(RemoteRunError, match="serving \\['vllm_env'\\]"):
+        session.prepare_in_image("default_env", tag)
+    with pytest.raises(RemoteRunError, match="with inputs abc123"):
+        session.prepare_in_image("vllm_env", "vibesim-profiler-vllm:newer")
+    assert not session.in_image
+
+    assert session.prepare_in_image("vllm_env", tag) == "abc123"
+    assert session.in_image
+    assert (tmp_path / "w" / "src" / "v1" / ".venv").readlink() == Path("/opt/v/.venv")
+
+
+def test_an_in_image_remote_runs_kernel_profile_only(monkeypatch, capsys):
+    import dataclasses
+
+    from launcher.cli import GlobalOptions
+    from launcher.remote import run as remote_run
+
+    pod = dataclasses.replace(_remote(), profile_runtime="in-image")
+    monkeypatch.setattr(remote_run, "_require_repo_cwd", lambda: None)
+    monkeypatch.setattr(remote_run, "load_remote", lambda name, sets: pod)
+    assert remote_run.run(None, ["presets/x.yaml"], GlobalOptions(remote="r")) == 2
+    assert "runs kernel-profile only" in capsys.readouterr().err

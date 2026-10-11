@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -256,11 +257,18 @@ def compose_library_path(profile_env: ProfileEnv, existing: str | None) -> str:
 
 
 # Every env runs in the image `profiling/container/images.py` assigns it
-# ("container"). "host" runs it on the host interpreter its entry above names,
-# for debugging an env against a local build; rows it writes share the image's
-# DB key, so compare against the image before keeping them.
+# ("container"). "in-image" is for a process that already runs inside one of
+# those images (a container host such as a RunPod pod): the envs that image
+# serves run on its own interpreter, and any other env is refused. "host" runs
+# an env on the host interpreter its entry above names, for debugging an env
+# against a local build; rows it writes share the image's DB key, so compare
+# against the image before keeping them.
 PROFILE_RUNTIME_ENV = "VIBESIM_PROFILE_RUNTIME"
-_PROFILE_RUNTIMES = ("container", "host")
+_PROFILE_RUNTIMES = ("container", "in-image", "host")
+# Written by every profiler image's Dockerfile: the image's input hash (its
+# tag's suffix), the envs it serves, its interpreter and import path.
+IMAGE_MANIFEST_ENV = "VIBESIM_PROFILE_IMAGE_MANIFEST"
+IMAGE_MANIFEST = Path("/etc/vibesim-profiler-image.json")
 
 
 def profile_runtime() -> str:
@@ -279,9 +287,45 @@ def resolve_profile_env(name: str | None) -> ProfileEnv | ContainerProfileEnv:
     except KeyError as exc:
         known_envs = sorted(ENV_REGISTRY)
         raise ValueError(f"unknown profiling env {env_name!r}; known envs: {known_envs}") from exc
-    if profile_runtime() == "container":
+    runtime = profile_runtime()
+    if runtime == "container":
         return ContainerProfileEnv(env_name, container_image(env_name))
+    if runtime == "in-image":
+        return in_image_env(env_name)
     return env
+
+
+def in_image_env(env_name: str) -> ProfileEnv:
+    """Profile env ``env_name`` on the interpreter of the image this process runs in.
+
+    Only an env that image serves, and only when the image is the one this
+    checkout names for it: another image's rows would share the same DB key.
+    """
+    path = Path(os.environ.get(IMAGE_MANIFEST_ENV) or IMAGE_MANIFEST)
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise FileNotFoundError(
+            f"{PROFILE_RUNTIME_ENV}=in-image, but {path} is not a profiler image "
+            f"manifest ({exc}); this process does not run in a profiler image"
+        ) from None
+    if env_name not in manifest["envs"]:
+        raise ValueError(
+            f"profiling env {env_name!r} needs image {container_image(env_name)}; "
+            f"the image this process runs in serves only {manifest['envs']}"
+        )
+    expected = container_image(env_name)
+    if expected.rpartition(":")[2] != manifest["inputs"]:
+        raise ValueError(
+            f"profiling env {env_name!r} needs image {expected}, but this process "
+            f"runs in an image built from inputs {manifest['inputs']}"
+        )
+    return ProfileEnv(
+        env_name,
+        Path(manifest["python"]),
+        additional_python_paths=tuple(Path(p) for p in manifest["python_paths"]),
+        isolated_site_packages=True,
+    )
 
 
 def container_image(name: str | None) -> str:
@@ -301,11 +345,14 @@ def container_image(name: str | None) -> str:
 __all__ = [
     "ENV_REGISTRY",
     "ContainerProfileEnv",
+    "IMAGE_MANIFEST",
+    "IMAGE_MANIFEST_ENV",
     "PROFILE_RUNTIME_ENV",
     "ProfileEnv",
     "compose_library_path",
     "compose_pythonpath",
     "container_image",
+    "in_image_env",
     "profile_runtime",
     "register_profile_env",
     "resolve_profile_env",

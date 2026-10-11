@@ -4,6 +4,7 @@ its host interpreter."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from profiling.container import images
 from profiling.exec.env import (
     ENV_REGISTRY,
+    IMAGE_MANIFEST_ENV,
     PROFILE_RUNTIME_ENV,
     ContainerProfileEnv,
     ProfileEnv,
@@ -103,3 +105,45 @@ def test_the_selfcheck_needs_an_env_with_backends(capsys):
     assert selfcheck.main([]) == 2
     assert selfcheck.main(["no_such_env"]) == 1
     assert "no backend runs in no_such_env" in capsys.readouterr().err
+
+
+def _manifest(tmp_path, monkeypatch, **fields):
+    manifest = {
+        "inputs": "abc123",
+        "envs": ["vllm_env"],
+        "python": "/opt/v/.venv/bin/python",
+        "python_paths": ["/opt/extra"],
+        **fields,
+    }
+    path = tmp_path / "vibesim-profiler-image.json"
+    path.write_text(json.dumps(manifest))
+    monkeypatch.setenv(IMAGE_MANIFEST_ENV, str(path))
+    monkeypatch.setenv(PROFILE_RUNTIME_ENV, "in-image")
+    monkeypatch.setenv(images.IMAGES_ENV, '{"vllm_env": "vibesim-profiler-vllm:abc123"}')
+
+
+def test_in_image_runs_the_images_env_on_its_own_interpreter(tmp_path, monkeypatch):
+    _manifest(tmp_path, monkeypatch)
+    env = resolve_profile_env("vllm_env")
+    assert env == ProfileEnv(
+        "vllm_env",
+        Path("/opt/v/.venv/bin/python"),
+        additional_python_paths=(Path("/opt/extra"),),
+        isolated_site_packages=True,
+    )
+
+
+def test_in_image_refuses_another_env_and_another_build(tmp_path, monkeypatch):
+    _manifest(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="serves only"):
+        resolve_profile_env(None)
+    _manifest(tmp_path, monkeypatch, inputs="other")
+    with pytest.raises(ValueError, match="built from inputs other"):
+        resolve_profile_env("vllm_env")
+
+
+def test_in_image_outside_an_image_says_so(tmp_path, monkeypatch):
+    monkeypatch.setenv(PROFILE_RUNTIME_ENV, "in-image")
+    monkeypatch.setenv(IMAGE_MANIFEST_ENV, str(tmp_path / "absent.json"))
+    with pytest.raises(FileNotFoundError, match="does not run in a profiler image"):
+        resolve_profile_env("vllm_env")

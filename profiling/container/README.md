@@ -57,6 +57,14 @@ it is rebased on (the parent of its first `feat(alignment):` commit,
 build; `images.py` refuses a fork that changes native code. The SGLang image
 installs the checkout editable against the cu130 Torch index.
 
+Every image also writes `/etc/vibesim-profiler-image.json`: its input hash
+(the tag's suffix), the envs it serves, its interpreter and import path. A
+process that itself runs in an image (a pod started from it) sets
+`VIBESIM_PROFILE_RUNTIME=in-image`; the envs in that manifest then run on the
+image's interpreter, and any other env, or an image whose inputs differ from
+the tag this checkout computes, is refused (launcher/README.md, "Remote
+execution").
+
 The container does not virtualize the GPU driver. After an image or host-driver
 change, validate the target GPU, the driver, and a real production kernel
 against the rows already in the DB.
