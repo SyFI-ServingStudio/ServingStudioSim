@@ -16,10 +16,12 @@ source of truth.
 - `top-*`: top-level entry points for major user requests. A top skill may
   complete the request by sequencing lower-level skills, but should stay concise
   and route work rather than duplicate implementation details.
-- `orchestrator-*`: planning and verification roles. An orchestrator classifies
-  intent, writes implementer briefs, defines completion evidence, and verifies
-  returned work. It should not contain detailed implementation contracts that
-  belong in an implement skill.
+- `orchestrator-*`: planning and verification roles. An orchestrator skill
+  classifies intent, defines the steps and their completion evidence, and
+  verifies the result. Its reader owns that piece of work: a coordinator
+  briefing an implementer, or the agent the whole piece was handed to. It
+  should not contain detailed implementation contracts that belong in an
+  implement skill.
 - `impl-*`: leaf implementation roles. An implement skill owns a concrete write
   scope or investigation scope, states the files/contracts to follow, and lists
   the tests or smoke commands that prove completion.
@@ -68,7 +70,7 @@ top-add-new-arch - add a whole model architecture end to end (capture → split 
 ├── top-align-with-framework - Phase 5: close the loop on the same capture; ranks which placeholder to promote next
 └── dev-finalize-model-addition - after Phase 5: check results, publish presets and captures, merge main, review, open the PR
 
-top-add-kernel - add an L1 kernel end to end (several at once: fan out one subagent per kernel, 3 at a time)
+top-add-kernel - add an L1 kernel end to end; one kernel is one delegated task (several at once: fan out one subagent per kernel, 3 at a time)
 ├── orchestrator-add-kernel-to-python-profile - plan and verify Python profiling
 │   ├── dev-explore-kernel - search vLLM/SGLang/FlashInfer for a source to wrap (shared)
 │   └── impl-register-kernel - register a Python profiler kind or backend
