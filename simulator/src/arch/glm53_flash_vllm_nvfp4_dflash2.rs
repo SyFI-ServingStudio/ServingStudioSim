@@ -136,6 +136,20 @@ impl<T: Glm53FlashVerifyTarget> Glm53FlashVllmNvfp4Dflash2Model<T> {
     fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
         let target = self.target.compile_target(&mut builder);
+        // Slots are filled in compile order: target, commit, then the drafts,
+        // as `eval_into` pushes them.
+        let commit_ranks: Vec<CostNode> = self
+            .drafts
+            .iter()
+            .map(|_| {
+                CostNode::Sum(
+                    self.commit
+                        .iter()
+                        .map(|op| op.compile(&mut builder))
+                        .collect(),
+                )
+            })
+            .collect();
         let mut drafts: Vec<CostNode> = self
             .drafts
             .iter()
@@ -149,18 +163,6 @@ impl<T: Glm53FlashVerifyTarget> Glm53FlashVllmNvfp4Dflash2Model<T> {
                 children: drafts,
             }
         };
-        let commit_ranks: Vec<CostNode> = self
-            .drafts
-            .iter()
-            .map(|_| {
-                CostNode::Sum(
-                    self.commit
-                        .iter()
-                        .map(|op| op.compile(&mut builder))
-                        .collect(),
-                )
-            })
-            .collect();
         let width = self.draft_tokens + 1;
         builder.finish(CostNode::Labeled {
             label: format!(
