@@ -149,6 +149,10 @@ def build(workdir: Path, version: str, node_local: Path) -> Path:
         return destination
 
 
+def _job_venv(job: dict) -> Path:
+    return Path(job.get("venv") or Path(job["src"]) / ".venv").resolve()
+
+
 def _job_environment(job: dict, scratch: Path) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in MANAGED_CONTEXT_VARIABLES}
     env.update(job.get("env", {}))
@@ -160,7 +164,10 @@ def _job_environment(job: dict, scratch: Path) -> dict[str, str]:
     # project's default groups (the whole GPU profiling stack) into the shared
     # venv. That venv is made once, by `run.py`, for its key's groups only.
     env["UV_NO_SYNC"] = "1"
-    env["VIRTUAL_ENV"] = str((Path(job["src"]) / ".venv").resolve())
+    venv = str(_job_venv(job))
+    env["VIRTUAL_ENV"] = venv
+    # The project `uv run` resolves to, which would otherwise be the version's `.venv`.
+    env["UV_PROJECT_ENVIRONMENT"] = venv
     env[PROFILE_DB_ENV] = str(scratch / "profile.db")
     return env
 
@@ -174,7 +181,7 @@ def run_job(jobdir: Path) -> int:
     exit_code = 1
     try:
         shutil.copy2(src / "profiling" / "profile.db", scratch / "profile.db")
-        argv = [str(src / ".venv" / "bin" / "python"), "-m", "launcher", *job["argv"]]
+        argv = [str(_job_venv(job) / "bin" / "python"), "-m", "launcher", *job["argv"]]
         with (jobdir / "stdout.log").open("ab") as log:
             child = subprocess.Popen(
                 argv,

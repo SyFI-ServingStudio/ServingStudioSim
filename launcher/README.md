@@ -749,16 +749,20 @@ takes them off before dispatch): `--no-gpu`, and `--remote NAME` with repeatable
 
 ### Remote execution
 
-`--remote NAME` runs a simulation or `timing-predict` on another machine — to
-use its CPUs and disk — and blocks until the results are back here. The command
-is otherwise the one you would run locally; the remote runs it unchanged but for
-`--no-gpu --no-plot`, so it never profiles and never draws PNGs. `kernel-profile
-run|measure` will follow once every profile env is a container image.
+`--remote NAME` runs a simulation, `timing-predict` or `kernel-profile
+run|measure` on another machine — to use its CPUs, disk or GPUs — and blocks
+until the results are back here. The command is otherwise the one you would run
+locally. A simulation or prediction runs with `--no-gpu --no-plot`, so it never
+profiles and never draws PNGs; a kernel profile runs each worker in its env's
+image (below).
 
 ```
 python -m launcher presets/x.yaml --remote bigbox
 python -m launcher timing-predict presets/predict_x.json --remote cluster \
     --remote-set launch.slurm.time=00:30:00
+python -m launcher kernel-profile run single_gemm --backend torch_linear \
+    --spec '{"m":8,"n":4096,"k":4096,"dtype":"bf16"}' \
+    --output-dir logs/20261011_1_gemm_h200 --remote gpubox
 ```
 
 **Configuration.** Remotes live in an untracked `remote.yaml`: `$VIBESIM_REMOTE_CONFIG`,
@@ -836,6 +840,27 @@ instead of running cargo (`binaries.py`). The set records its build inputs
 launcher recomputes the hash against its own checkout and refuses a set built
 from other sources or another Python, and checks the schema against the
 simulator's own `list-params`. Only `--build-type release` can use it.
+
+**Kernel profiling** (`kernel-profile run|measure --remote`). The remote job
+runs with `VIBESIM_PROFILE_RUNTIME=container`: every worker runs in the image
+`profiling/container/images.py` assigns its profile env — never on a host
+interpreter, and an env with no image is refused — so the remote needs only
+docker with the NVIDIA runtime. The image is named by a hash of its dependency
+inputs; when the remote lacks it, it is sent from here (`docker save | zstd |
+docker load`, verified by image id), so build it here first. Under Slurm the job
+asks for the GPUs its specs need (`--gres=gpu:N`, or more with `launch.slurm.gpus`)
+and the controller addresses them by UUID. The JIT cache persists in
+`<workdir>/cache`.
+
+`--output-dir` is required and must be under `logs/`; `--db` is refused. The job
+measures into its own profile.db copy, which is fetched and merged into this
+checkout's (`VIBESIM_PROFILE_DB` or `profiling/profile.db`) under the profile-DB
+write lease. A conflicting row merges nothing: the report is left in the output
+directory. `--fresh` writes no rows and merges nothing. The whole output
+directory comes back; `remote-run.json` adds the image and its id, and the
+artifact metadata carries the observed GPU as for a local run. Under a managed
+job the `kp_`/`km_` id is registered here and seeded into the remote output
+directory, as for a prediction.
 
 **Limits.** One invocation is one blocking remote job; a managed job's
 capability token must outlive it (6 h). A job whose process or allocation

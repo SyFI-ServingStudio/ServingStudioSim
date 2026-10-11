@@ -62,7 +62,7 @@ def test_remote_set_overrides_one_field_for_this_call(remote_yaml):
         ("workdir=relative/dir", "workdir must be an absolute path"),
         ("files=nfs", "files must be rsync or shared"),
         ("launch.slurm.time=", "launch.slurm.time is required"),
-        ("launch.slurm.gpus=1", "unknown field.*launch.slurm.gpus"),
+        ("launch.slurm.nodes=1", "unknown field.*launch.slurm.nodes"),
         ("lanch=direct", "unknown field.*lanch"),
         ("access=ssh", "access must be `local`"),
         ("profile_runtime=podman", "profile_runtime must be"),

@@ -109,6 +109,18 @@ def test_the_sbatch_script_clears_the_managed_context_and_states_a_time_limit():
     assert "#SBATCH --qos=low" in script and "#SBATCH --chdir=/w/src/v" in script
     unset = script.index("unset VIBESIM_MANAGED_JOB_CONTEXT VIBESIM_MANAGED_RUN_CONTEXT")
     assert unset < script.index("exec python -m launcher.remote.node")
+    assert "--gres" not in script
+
+
+def test_a_gpu_job_asks_slurm_for_its_cards():
+    script = launch.sbatch_script(
+        Slurm(time="01:00:00", gpus=2),
+        name="vibesim-j",
+        jobdir=PurePosixPath("/w/jobs/j"),
+        cwd=PurePosixPath("/w/src/v"),
+        command="true",
+    )
+    assert "#SBATCH --gres=gpu:2" in script
 
 
 def test_status_reports_the_next_log_offset_in_bytes():
@@ -235,6 +247,40 @@ def test_run_job_isolates_the_database_and_drops_the_managed_context(tmp_path, m
     assert not scratch.exists()
 
 
+def test_a_job_with_its_own_venv_runs_and_keeps_its_database(tmp_path):
+    src = tmp_path / "src"
+    (src / "profiling").mkdir(parents=True)
+    (src / "profiling" / "profile.db").write_bytes(b"db")
+    venv = tmp_path / "venvs" / "gpu"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text(
+        f"#!{sys.executable}\n"
+        "import json, os\n"
+        "keys = ('VIRTUAL_ENV', 'UV_PROJECT_ENVIRONMENT')\n"
+        "print(json.dumps({k: os.environ.get(k) for k in keys}))\n"
+        "open(os.environ['VIBESIM_PROFILE_DB'], 'ab').write(b'+row')\n"
+    )
+    (venv / "bin" / "python").chmod(0o755)
+    jobdir = tmp_path / "jobs" / "j"
+    jobdir.mkdir(parents=True)
+    job = {
+        "job_id": "j",
+        "src": str(src),
+        "venv": str(venv),
+        "argv": ["kernel-profile", "run"],
+        "node_local": str(tmp_path / "local"),
+        "bin_dir": "/w/bin/h",
+        "keep_db": True,
+    }
+    (jobdir / "job.json").write_text(json.dumps(job))
+
+    assert node.run_job(jobdir) == 0
+
+    seen = json.loads((jobdir / "stdout.log").read_text())
+    assert seen == {"VIRTUAL_ENV": str(venv), "UV_PROJECT_ENVIRONMENT": str(venv)}
+    assert (jobdir / "profile.db").read_bytes() == b"db+row"
+
+
 def test_prune_keeps_recent_and_busy_versions_and_their_binaries(tmp_path):
     import os
     import time
@@ -255,3 +301,55 @@ def test_prune_keeps_recent_and_busy_versions_and_their_binaries(tmp_path):
 
     assert sorted(p.name for p in (tmp_path / "src").iterdir()) == ["busy", "mid", "new"]
     assert sorted(p.name for p in (tmp_path / "bin").iterdir()) == ["busy", "mid", "new"]
+
+
+def _copy_db_with_new_gemm_row(source_db: Path, target: Path, *, time_ms: float) -> None:
+    import shutil
+    import sqlite3
+
+    shutil.copy2(source_db, target)
+    with sqlite3.connect(target) as conn:
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(single_gemm)")]
+        row = dict(
+            zip(columns, conn.execute("SELECT * FROM single_gemm LIMIT 1").fetchone(), strict=True)
+        )
+        row.pop("id")
+        row["m"], row["args_hash"], row["time_ms"] = 999_983, "remote-merge-test", time_ms
+        conn.execute(
+            f"INSERT INTO single_gemm ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
+            list(row.values()),
+        )
+
+
+def test_a_remote_jobs_rows_merge_into_the_local_database(tmp_path, monkeypatch):
+    from launcher.remote import run
+
+    repo_db = source.REPO_ROOT / "profiling" / "profile.db"
+    local = tmp_path / "profile.db"
+    import shutil
+
+    shutil.copy2(repo_db, local)
+    local.chmod(0o664)
+    job_db = tmp_path / "job.db"
+    _copy_db_with_new_gemm_row(repo_db, job_db, time_ms=1.0)
+    monkeypatch.setenv("VIBESIM_PROFILE_DB", str(local))
+    monkeypatch.setattr(run, "REPO_ROOT", tmp_path)
+
+    message = run._merge_profile_db(job_db, tmp_path / "report.json")
+
+    assert message.startswith("1 new row(s) merged")
+    import sqlite3
+
+    with sqlite3.connect(local) as conn:
+        assert conn.execute("SELECT time_ms FROM single_gemm WHERE m = 999983").fetchall() == [
+            (1.0,)
+        ]
+    assert local.stat().st_mode & 0o777 == 0o664
+
+    # The same key with another value is a conflict: nothing changes here.
+    before = local.read_bytes()
+    conflicting = tmp_path / "conflict.db"
+    _copy_db_with_new_gemm_row(repo_db, conflicting, time_ms=2.0)
+    with pytest.raises(run.RemoteRunError, match="conflict"):
+        run._merge_profile_db(conflicting, tmp_path / "report2.json")
+    assert local.read_bytes() == before

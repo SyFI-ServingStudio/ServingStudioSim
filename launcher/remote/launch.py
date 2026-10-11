@@ -70,6 +70,8 @@ def sbatch_script(
         lines.append(f"#SBATCH --mem={slurm.mem}")
     if slurm.account:
         lines.append(f"#SBATCH --account={slurm.account}")
+    if slurm.gpus:
+        lines.append(f"#SBATCH --gres=gpu:{slurm.gpus}")
     lines += [f"#SBATCH {extra}" for extra in slurm.extra]
     lines += [
         # sbatch exports the submitting shell; the sender owns the managed job.

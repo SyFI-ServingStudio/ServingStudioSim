@@ -43,6 +43,9 @@ class Slurm:
     cpus_per_task: int | None = None
     mem: str | None = None
     account: str | None = None
+    # GPUs per job (`--gres=gpu:N`). A GPU command asks for at least what its
+    # specs need; 0 leaves a CPU job without any.
+    gpus: int = 0
     # Extra `#SBATCH` arguments, verbatim (e.g. "--qos=foo").
     extra: tuple[str, ...] = ()
 
@@ -209,7 +212,9 @@ def _parse_launch(raw: Any) -> Slurm | None:
         raise RemoteConfigError("launch must be `direct` or `{slurm: {time: ..., ...}}`")
     body = raw["slurm"]
     _reject_unknown(
-        body, {"time", "partition", "cpus_per_task", "mem", "account", "extra"}, "launch.slurm."
+        body,
+        {"time", "partition", "cpus_per_task", "mem", "account", "gpus", "extra"},
+        "launch.slurm.",
     )
     time = body.get("time")
     if not isinstance(time, str) or not time:
@@ -220,6 +225,9 @@ def _parse_launch(raw: Any) -> Slurm | None:
         raise RemoteConfigError(
             f"launch.slurm.cpus_per_task must be a positive integer, got {cpus!r}"
         )
+    gpus = body.get("gpus", 0)
+    if not isinstance(gpus, int) or isinstance(gpus, bool) or gpus < 0:
+        raise RemoteConfigError(f"launch.slurm.gpus must be a non-negative integer, got {gpus!r}")
     for key in ("partition", "mem", "account"):
         if body.get(key) is not None and not isinstance(body[key], str):
             raise RemoteConfigError(f"launch.slurm.{key} must be a string")
@@ -232,6 +240,7 @@ def _parse_launch(raw: Any) -> Slurm | None:
         cpus_per_task=cpus,
         mem=body.get("mem"),
         account=body.get("account"),
+        gpus=gpus,
         extra=tuple(extra),
     )
 

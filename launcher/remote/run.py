@@ -26,9 +26,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import signal
 import socket
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import Callable
@@ -41,7 +44,15 @@ from . import launch
 from .config import Remote, RemoteConfigError, load_remote
 from .layout import Layout
 from .node import SHIPPED_MARKER
-from .source import REPO_ROOT, Source, SourceError, collect, source_stamp
+from .source import (
+    CPU_GROUPS,
+    REPO_ROOT,
+    Source,
+    SourceError,
+    collect,
+    source_stamp,
+    venv_key,
+)
 from .transport import Transport, TransportError, q
 
 LOGS = REPO_ROOT / "logs"
@@ -104,6 +115,8 @@ class Session:
         self.layout = Layout(remote.workdir)
         self.source: Source | None = None
         self.bin_dir: PurePosixPath | None = None
+        # The job's own venv, when it is not the version's (CPU) `.venv`.
+        self.job_venv: PurePosixPath | None = None
 
     # ── code ──────────────────────────────────────────────────────────────
 
@@ -149,27 +162,54 @@ class Session:
         )
         return source
 
-    def prepare(self) -> PurePosixPath:
-        """The remote venv and binaries for the shipped version; returns the bin dir."""
+    def _venv_script(self, key: str, groups: tuple[str, ...]) -> str:
+        """Create venv ``key`` with ``groups`` once per remote, under a host lock."""
+
+        source = self.source
+        assert source is not None
+        venv = self.layout.venv(key)
+        ready = venv / ".vibesim-ready"
+        lock = self.remote.node_local / f"vibesim-remote-{key}-venv.lock"
+        sync = f"UV_PROJECT_ENVIRONMENT={q(venv)} uv sync --frozen --no-default-groups " + " ".join(
+            f"--group {group}" for group in groups
+        )
+        if "profiling" in groups:
+            # As `just sync`: DeepGEMM builds without isolation against the env's
+            # Torch, so everything else goes in first.
+            sync = (
+                f"export DG_USE_LOCAL_VERSION=0; {sync} --inexact "
+                f"--no-install-package deep-gemm && {sync}"
+            )
+        sync = (
+            f"if [ ! -f {q(ready)} ]; then cd {q(self.layout.src(source.version))} && "
+            f"{sync} && touch {q(ready)}; fi"
+        )
+        return (
+            f"if [ ! -f {q(ready)} ]; then mkdir -p {q(self.remote.node_local)}; "
+            f"echo '[remote] creating venv {key} ({' '.join(groups)})'; "
+            f"flock {q(lock)} bash -c {q(sync)}; fi; "
+        )
+
+    def prepare(self, job_groups: tuple[str, ...] | None = None) -> PurePosixPath:
+        """The remote venv and binaries for the shipped version; returns the bin dir.
+
+        The version's ``.venv`` is always the CPU venv, which builds and runs the
+        job runner. ``job_groups`` gives the job a venv of its own with those groups.
+        """
 
         source = self.source
         assert source is not None
         src = self.layout.src(source.version)
-        venv = self.layout.venv(source.venv_key)
-        ready = venv / ".vibesim-ready"
-        lock = self.remote.node_local / f"vibesim-remote-{source.venv_key}-venv.lock"
-        groups = " ".join(f"--group {group}" for group in source.groups)
-        sync = (
-            f"if [ ! -f {q(ready)} ]; then cd {q(src)} && "
-            f"UV_PROJECT_ENVIRONMENT={q(venv)} uv sync --frozen --no-default-groups {groups} "
-            f"&& touch {q(ready)}; fi"
-        )
         script = (
             # The sender's venv must not leak in when the access host is this one.
             f"set -e; unset VIRTUAL_ENV; {_env_prefix(self.remote.env)}"
-            f"if [ ! -f {q(ready)} ]; then mkdir -p {q(self.remote.node_local)}; "
-            f"echo '[remote] creating venv {source.venv_key}'; "
-            f"flock {q(lock)} bash -c {q(sync)}; fi; "
+            + self._venv_script(source.venv_key, source.groups)
+        )
+        if job_groups is not None:
+            key = venv_key(source.root, job_groups)
+            self.job_venv = self.layout.venv(key)
+            script += self._venv_script(key, job_groups)
+        script += (
             f"ln -sfn ../../venvs/{source.venv_key} {q(src / '.venv')}; "
             f"cd {q(src)} && .venv/bin/python -m launcher.remote.node build "
             f"{q(self.layout.workdir)} {source.version} --node-local {q(self.remote.node_local)}"
@@ -211,7 +251,11 @@ class Session:
 
     # ── the job ───────────────────────────────────────────────────────────
 
-    def run_job(self, argv: list[str]) -> JobOutcome:
+    def run_job(
+        self, argv: list[str], *, env: dict[str, str] | None = None, keep_db: bool = False
+    ) -> JobOutcome:
+        """Run ``python -m launcher ARGV`` there; ``keep_db`` keeps its profile.db copy."""
+
         source, bin_dir = self.source, self.bin_dir
         assert source is not None and bin_dir is not None
         job_id = f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
@@ -222,7 +266,9 @@ class Session:
             "version": source.version,
             "src": str(src),
             "argv": argv,
-            "env": self.remote.env,
+            "env": {**self.remote.env, **(env or {})},
+            "keep_db": keep_db,
+            "venv": str(self.job_venv or src / ".venv"),
             "node_local": str(self.remote.node_local),
             "bin_dir": str(bin_dir),
             "sender": socket.gethostname(),
@@ -290,7 +336,59 @@ class Session:
         finally:
             signal.signal(signal.SIGTERM, previous)
 
-    def record(self, local_root: Path, outcome: JobOutcome, command: list[str]) -> None:
+    def ensure_image(self, tag: str) -> str:
+        """Make ``tag`` present on the remote, sending it from here if needed; its id."""
+
+        inspect = "docker image inspect --format '{{.Id}}' "
+        found = self.transport.run(inspect + q(tag), check=False)
+        if found.returncode == 0:
+            return found.stdout.strip()
+        local = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}} {{.Size}}", tag],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if local.returncode != 0:
+            raise RemoteRunError(
+                f"image {tag} is neither on {self.remote.name} nor here; build it first "
+                "(python -m profiling.container.images build NAME)"
+            )
+        image_id, size = local.stdout.split()
+        _say(f"sending image {tag} ({int(size) / 1e9:.1f} GB) to {self.remote.name}")
+        save = subprocess.Popen(["docker", "save", tag], stdout=subprocess.PIPE)
+        pack = subprocess.Popen(
+            ["zstd", "-T0", "-3", "-q", "-c"], stdin=save.stdout, stdout=subprocess.PIPE
+        )
+        assert save.stdout is not None and pack.stdout is not None
+        save.stdout.close()
+        load = subprocess.run(
+            self.transport.command_argv("zstd -dcq | docker load -q"),
+            stdin=pack.stdout,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        pack.stdout.close()
+        if save.wait() != 0 or pack.wait() != 0 or load.returncode != 0:
+            raise RemoteRunError(f"sending image {tag} failed: {load.stderr.strip()}")
+        sent = self.transport.run(inspect + q(tag)).stdout.strip()
+        if sent != image_id:
+            raise RemoteRunError(f"{self.remote.name} loaded {tag} as {sent}, not {image_id}")
+        return sent
+
+    def fetch_job_file(self, job_id: str, name: str, local: Path) -> None:
+        self.data.rsync(self.data.remote_spec(self.layout.job(job_id) / name), str(local))
+
+    def record(
+        self,
+        local_root: Path,
+        outcome: JobOutcome,
+        command: list[str],
+        *,
+        copied_back: str | None = None,
+        **extra: object,
+    ) -> None:
         source = self.source
         assert source is not None
         record = {
@@ -306,7 +404,9 @@ class Session:
             "started_at": outcome.started_at,
             "finished_at": outcome.finished_at,
             "exit_code": outcome.exit_code,
-            "copied_back": "all" if self.remote.ephemeral else "without raw/cost_log and plots",
+            "copied_back": copied_back
+            or ("all" if self.remote.ephemeral else "without raw/cost_log and plots"),
+            **extra,
         }
         local_root.mkdir(parents=True, exist_ok=True)
         (local_root / REMOTE_RECORD).write_text(json.dumps(record, indent=2) + "\n", "utf-8")
@@ -499,9 +599,160 @@ def _timing_predict(session: Session, argv: list[str]) -> int:
     return outcome.exit_code
 
 
+def _merge_profile_db(job_db: Path, report: Path) -> str:
+    """Fold a remote job's profile.db into this checkout's, under its write lease."""
+
+    from profiling.db.merge import merge_profile_databases
+
+    from ..process.leases import LauncherLeases
+
+    target = Path(
+        os.environ.get("VIBESIM_PROFILE_DB", REPO_ROOT / "profiling" / "profile.db")
+    ).resolve()
+    with LauncherLeases(REPO_ROOT).profile_database(write=True):
+        merged = target.with_name(f".{target.name}.remote-{uuid.uuid4().hex[:8]}")
+        result = merge_profile_databases(target, job_db, merged, report_path=report)
+        if not result.published:
+            raise RemoteRunError(
+                f"the remote rows conflict with {target}; nothing was merged. "
+                f"Review {report} (the job's DB is kept at {job_db})"
+            )
+        # The merge writes a private temporary file; keep the database's own mode.
+        os.chmod(merged, target.stat().st_mode & 0o7777)
+        os.replace(merged, target)
+    inserted = sum(table.inserted_rows for table in result.tables)
+    return f"{inserted} new row(s) merged into {target.relative_to(REPO_ROOT)}"
+
+
+def _kernel_profile(session: Session, argv: list[str]) -> int:
+    from profiling.artifacts import MEASUREMENT_METADATA_FILENAME, PROFILE_METADATA_FILENAME
+    from profiling.cli import (
+        _load_specs,
+        _measurement_id,
+        _profile_id,
+        _resolve_profiler_spec,
+        _spec_gpu_count,
+        build_parser,
+        measure_descriptor,
+        measure_output_dir,
+        run_descriptor,
+    )
+    from profiling.exec.env import PROFILE_RUNTIME_ENV, container_image
+
+    from ..managed_job import prepare_managed_job
+
+    args = build_parser(prog="python -m launcher kernel-profile").parse_args(argv)
+    if args.command not in ("run", "measure"):
+        raise RemoteRunError(f"kernel-profile {args.command} runs locally; drop --remote")
+    if args.db is not None:
+        raise RemoteRunError(
+            "--db cannot be used with --remote: the remote job writes its own copy, "
+            "merged back into this checkout's profile.db (VIBESIM_PROFILE_DB)"
+        )
+    if session.remote.profile_runtime != "docker":
+        raise RemoteRunError(
+            f"profile_runtime {session.remote.profile_runtime!r} is not implemented yet"
+        )
+    measure = args.command == "measure"
+    if args.output_dir is None and not measure:
+        raise RemoteRunError("kernel-profile run --remote requires --output-dir under logs/")
+    output_dir = _under_logs(
+        measure_output_dir(args) if measure else args.output_dir, "--output-dir"
+    )
+    specs = _load_specs(args.spec, args.specs)
+    profiler_spec = _resolve_profiler_spec(args.table, args.backend)
+    image = container_image(profiler_spec.subprocess_env)
+    if session.remote.slurm is not None:
+        gpus = max(session.remote.slurm.gpus, _spec_gpu_count(profiler_spec, specs))
+        session.remote = dataclasses.replace(
+            session.remote, slurm=dataclasses.replace(session.remote.slurm, gpus=gpus)
+        )
+
+    source = session.ship()
+    extra = _input_files([args.specs] if args.specs is not None else [], source)
+    if measure:
+        kind, metadata_name, id_key = (
+            "kernel_measure",
+            MEASUREMENT_METADATA_FILENAME,
+            "measurement_id",
+        )
+        resource_id, descriptor = _measurement_id(output_dir), measure_descriptor(args)
+    else:
+        kind, metadata_name, id_key = "kernel_profile", PROFILE_METADATA_FILENAME, "profile_id"
+        resource_id = _profile_id(output_dir)
+        descriptor = run_descriptor(args, profiler_spec, specs)
+    job = prepare_managed_job(
+        kind, output_dir, descriptor=descriptor, analyzer_resource_id=resource_id
+    )
+    seeds: list[Path] = []
+    if job is not None and not (output_dir / metadata_name).is_file():
+        # The remote run keeps this id (`_profile_id` / `_measurement_id`).
+        output_dir.mkdir(parents=True, exist_ok=True)
+        seed = output_dir / metadata_name
+        seed.write_text(json.dumps({id_key: resource_id}) + "\n", "utf-8")
+        seeds.append(seed)
+    session.push_files([*extra, *seeds])
+    for seed in seeds:
+        seed.unlink()
+    # The controller runs as it does here: on the project's profiling stack.
+    session.prepare(job_groups=(*CPU_GROUPS, "profiling"))
+    image_id = session.ensure_image(image)
+    _say(f"{args.table}/{args.backend} runs in {image} ({image_id[:19]})")
+    _report(job, "running")
+    command = ["kernel-profile", *argv]
+    keep_db = not measure and not args.fresh
+    try:
+        outcome = session.run_job(
+            command,
+            env={
+                PROFILE_RUNTIME_ENV: "container",
+                "VIBESIM_PROFILE_CACHE_DIR": str(session.layout.workdir / "cache"),
+            },
+            keep_db=keep_db,
+        )
+    except KeyboardInterrupt:
+        _report(job, "interrupted")
+        raise
+    _report(job, "analysis_running")
+    session.fetch(output_dir)
+    merged = "not merged (the run wrote no rows)"
+    if keep_db and outcome.exit_code in (0, 1):
+        # Exit 1 is a run with missing rows: the rows it did measure still count.
+        held = Path(tempfile.mkdtemp(prefix="vibesim-remote-db-"))
+        job_db = held / "profile.db"
+        session.fetch_job_file(outcome.job_id, "profile.db", job_db)
+        merged = _merge_profile_db(job_db, output_dir / "remote-profile-db.merge-report.json")
+        job_db.unlink()
+        held.rmdir()
+        _say(merged)
+    session.record(
+        output_dir,
+        outcome,
+        command,
+        copied_back="all",
+        image=image,
+        image_id=image_id,
+        profile_db=merged,
+    )
+    metadata = output_dir / metadata_name
+    complete = metadata.is_file() and len(json.loads(metadata.read_text("utf-8"))) > 1
+    if not complete:
+        # A failed remote run leaves only the seed behind.
+        metadata.unlink(missing_ok=True)
+    ok = outcome.exit_code == 0 and complete
+    _report(job, "ready" if ok else "failed")
+    _say(
+        f"{'done' if ok else f'failed (exit {outcome.exit_code})'}: "
+        f"{output_dir.relative_to(REPO_ROOT)} (remote copy: "
+        f"{session.transport.host_label}:{session.remote_logs_path(output_dir)})"
+    )
+    return outcome.exit_code
+
+
 COMMANDS: dict[str | None, Callable[[Session, list[str]], int]] = {
     None: _simulation,
     "timing-predict": _timing_predict,
+    "kernel-profile": _kernel_profile,
 }
 
 
