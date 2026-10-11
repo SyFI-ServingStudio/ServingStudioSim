@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 use crate::arch::contract::SpeculativeUnifiedModel;
+use crate::arch::hisparse::HisparseConfig;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
@@ -1171,6 +1172,7 @@ pub fn glm52_vllm_nvfp4_dp_attn_dsa_moe(
     expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
+    hisparse: Option<&HisparseConfig>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1186,6 +1188,7 @@ pub fn glm52_vllm_nvfp4_dp_attn_dsa_moe(
         token_corpus_file,
         cudagraph_capture_sizes,
         None,
+        hisparse,
         gpu,
         name,
         bridge,
@@ -1194,7 +1197,8 @@ pub fn glm52_vllm_nvfp4_dp_attn_dsa_moe(
 
 /// [`glm52_vllm_nvfp4_dp_attn_dsa_moe`], or with `draft_tokens` the target of
 /// a DFlash2 verify: every decode request presents `draft_tokens + 1` rows, and
-/// the routed demand groups that many consecutive rows.
+/// the routed demand groups that many consecutive rows. `hisparse` serves the
+/// cache through SGLang HiSparse ([`Glm52VllmNvfp4DpAttnDsaMoeModel::with_hisparse`]).
 #[allow(clippy::too_many_arguments)]
 fn glm52_vllm_nvfp4_dp_attn_target(
     model_spec: &ModelSpec,
@@ -1207,6 +1211,7 @@ fn glm52_vllm_nvfp4_dp_attn_target(
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
     draft_tokens: Option<u32>,
+    hisparse: Option<&HisparseConfig>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1258,9 +1263,14 @@ fn glm52_vllm_nvfp4_dp_attn_target(
     }
     .context("expanding B200 GLM-5.2 NVFP4 DP-attention + EP architecture configs")?;
     let resolved = glm52_vllm_nvfp4_dp_attn_dsa_moe::resolve_configs(&configs);
-    glm52_vllm_nvfp4_dp_attn_dsa_moe::build(name.to_string(), resolved, bridge).context(
-        "building B200 GLM-5.2 NVFP4 DP-attention + EP model (often a missing profile.db row)",
-    )
+    let model = glm52_vllm_nvfp4_dp_attn_dsa_moe::build(name.to_string(), resolved, bridge)
+        .context(
+            "building B200 GLM-5.2 NVFP4 DP-attention + EP model (often a missing profile.db row)",
+        )?;
+    match hisparse {
+        None => Ok(model),
+        Some(config) => Ok(model.with_hisparse(config.clone(), nvl_num_gpu)?),
+    }
 }
 
 /// Build the B200 GLM-5.2/5.3 NVFP4 graph under pure pipeline parallelism:
@@ -1923,6 +1933,7 @@ pub fn glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         cudagraph_capture_sizes,
         draft_tokens,
         draft_sliding_window,
+        ..
     } = sel
     else {
         bail!("{sel:?} is not glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2");
@@ -1946,6 +1957,7 @@ pub fn glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         token_corpus_file.as_deref(),
         cudagraph_capture_sizes,
         Some(*draft_tokens),
+        sel.hisparse().as_ref(),
         gpu,
         name,
         bridge,
@@ -2395,6 +2407,7 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
+            ..
         } => Box::new(glm52_vllm_nvfp4_dp_attn_dsa_moe(
             model,
             *ep_size,
@@ -2405,6 +2418,7 @@ pub fn build_iter_model(
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
+            sel.hisparse().as_ref(),
             gpu,
             name,
             bridge,
@@ -3786,6 +3800,63 @@ mod tests {
         }
         assert!(glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(&deep, "NVIDIA B200", "test", &bridge)
             .is_err());
+    }
+
+    /// Catches HiSparse on the GLM-5.3 DP + DFlash2 target leaving the draft's
+    /// KV per token: under HiSparse only the indexer keys grow per token, and
+    /// the draft holds its 2,048-token window beside the target's buffer.
+    #[test]
+    fn glm53_dp_dflash2_hisparse_holds_the_draft_window_beside_the_buffer() {
+        use crate::arch::contract::KvHostOffload;
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let sel = |hisparse: serde_json::Value| -> IterArchSel {
+            serde_json::from_value(serde_json::json!({
+                "type": "glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+                "model_config": Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("model/config/glm52_nvfp4.json"),
+                "fp8": false,
+                "ep_size": 8,
+                "nvl_num_gpu": 8,
+                "max_model_len": 131_072,
+                "draft_tokens": 3,
+                "hisparse_buffer_tokens": hisparse,
+            }))
+            .unwrap()
+        };
+        let model = glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+            &sel(serde_json::json!(8192)),
+            "NVIDIA B200",
+            "test",
+            &bridge,
+        )
+        .unwrap();
+        assert_eq!(model.total_kv_bytes_per_token(), 10_296);
+        assert_eq!(model.recurrent_state_bytes_per_request(), 0);
+        assert_eq!(
+            model.kv_host_offload(),
+            Some(KvHostOffload {
+                device_bytes_per_request: 8192 * 44_928 + 2048 * 12_288,
+                host_bytes_per_token: 44_928,
+                host_bytes_per_partition: 250_000_000_000,
+            })
+        );
+        let copies = model
+            .cost_log_manifest()
+            .slots
+            .iter()
+            .filter(|slot| slot.kind == "hisparse_h2d_io")
+            .count();
+        assert_eq!(copies, 8);
+        let plain = glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+            &sel(serde_json::Value::Null),
+            "NVIDIA B200",
+            "test",
+            &bridge,
+        )
+        .unwrap();
+        assert!(plain.kv_host_offload().is_none());
+        assert_eq!(plain.total_kv_bytes_per_token(), 55_224 + 12_288);
     }
 
     /// Catches a bf16 KDA pool that does not reach the RecoverSSM rows: the

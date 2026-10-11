@@ -60,8 +60,8 @@
 //!   on a DP rank too.
 
 use crate::arch::contract::{
-    ArchGroupInput, IterwiseUnifiedModel, SpeculativeArchInput, SpeculativeUnifiedModel,
-    UnifiedArchInput,
+    ArchGroupInput, IterwiseUnifiedModel, KvHostOffload, SpeculativeArchInput,
+    SpeculativeUnifiedModel, UnifiedArchInput,
 };
 use crate::arch::glm52_vllm_nvfp4_dp_attn_dsa_moe::Glm52VllmNvfp4DpAttnDsaMoeModel;
 use crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpModel;
@@ -177,6 +177,9 @@ pub struct Dflash2VerifyModel<T> {
     /// The draft's full-attention KV per context token, on the same contract
     /// as the target's per-token bytes. Zero when it is held as a window.
     draft_kv_bytes_per_token: u64,
+    /// The target's HiSparse host tier, its device buffer joined by the
+    /// draft's window. `None` when the target keeps its cache on the GPU.
+    host_offload: Option<KvHostOffload>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -386,6 +389,10 @@ impl<T: Dflash2VerifyTarget> SpeculativeUnifiedModel for Dflash2VerifyModel<T> {
         self.target.recurrent_checkpoint_interval_tokens()
     }
 
+    fn kv_host_offload(&self) -> Option<KvHostOffload> {
+        self.host_offload
+    }
+
     fn max_model_len(&self) -> u32 {
         self.max_model_len
     }
@@ -506,17 +513,26 @@ pub fn build<T: Dflash2VerifyTarget>(
         .map(|_| Dflash2DraftStage::build(format!("{name}.dflash2"), draft, bridge))
         .collect::<Result<Vec<_>, _>>()?;
     let draft_per_token = draft_kv_bytes_per_token(draft)?;
-    let (draft_kv_bytes_per_request, draft_kv_bytes_per_token) = if recurrent {
-        let window = draft_per_token
-            .checked_mul(u64::from(draft.sliding_window))
-            .ok_or_else(|| BuildError::FitFailed {
-                kind: ARCH_KIND,
-                reason: "DFlash2 draft window KV overflows u64".to_string(),
-            })?;
-        (window, 0)
-    } else {
-        (0, draft_per_token)
-    };
+    let window = draft_per_token
+        .checked_mul(u64::from(draft.sliding_window))
+        .ok_or_else(|| BuildError::FitFailed {
+            kind: ARCH_KIND,
+            reason: "DFlash2 draft window KV overflows u64".to_string(),
+        })?;
+    // Under HiSparse the draft's window joins the target's fixed device
+    // buffer: an engine that already pages the target's cache per request is
+    // assumed to hold only the window the draft attends to (an assumption;
+    // vLLM's unified pool does not, see `draft_kv_bytes_per_token`).
+    let host_offload = target.kv_host_offload().map(|offload| KvHostOffload {
+        device_bytes_per_request: offload.device_bytes_per_request + window,
+        ..offload
+    });
+    let (draft_kv_bytes_per_request, draft_kv_bytes_per_token) =
+        match (recurrent, host_offload.is_some()) {
+            (true, _) => (window, 0),
+            (false, true) => (0, 0),
+            (false, false) => (0, draft_per_token),
+        };
     let mut model = Dflash2VerifyModel {
         target,
         commit,
@@ -525,6 +541,7 @@ pub fn build<T: Dflash2VerifyTarget>(
         max_model_len,
         draft_kv_bytes_per_request,
         draft_kv_bytes_per_token,
+        host_offload,
         cost_flat: Vec::new(),
         n_slots: 0,
     };

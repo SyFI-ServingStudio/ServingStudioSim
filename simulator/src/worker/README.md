@@ -152,6 +152,15 @@ component. The sampler keeps both values from the same throttle-window peak
 submit, so their difference is a valid non-prefix occupancy rather than a
 difference between unrelated maxima.
 
+A model whose cache is split between GPU and host memory (SGLang HiSparse,
+`arch::hisparse`) reports `kv_host_offload()`. The `chunked_prefill` and
+`speculative` recipes then build `FullAttnKv::with_host_tier`: the GPU
+capacity counts only the per-token part that stays on the GPU plus a fixed
+per-request device buffer (the same fixed-charge seam a recurrent store uses),
+and `fits` also tests the partition's host capacity against the summed context,
+derived from the same resident and promised ledgers. Only full-footprint
+admission supports it; `iter_build_essentials::host_kv_tier` refuses the rest.
+
 Every prefix-capable KV worker also owns one sparse `PrefixCacheLogger`. It
 writes `prefix_cache_event` from mutation receipts returned by
 `kv/prefix_cache.rs`: admission-time ownership transfer (`activate`), exact

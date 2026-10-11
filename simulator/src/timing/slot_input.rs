@@ -93,6 +93,20 @@ pub struct DsaIndexerPrefillLog {
     pub prefill_query_key_pairs: Vec<(u32, u32)>,
 }
 
+/// SGLang HiSparse's analytic host -> device miss copy for one attention DP
+/// rank in one step (`arch::hisparse`): the rank's decode requests, how many
+/// overflow the device buffer, their summed context, the misses per layer
+/// summed over requests, and the bytes copied over all layers. The slot's time
+/// is the exposed share of that copy.
+#[derive(Clone, Serialize)]
+pub struct HisparseH2dIoLog {
+    pub decode_requests: u32,
+    pub offloaded_requests: u32,
+    pub context_tokens: u64,
+    pub misses_per_layer: f64,
+    pub io_bytes: f64,
+}
+
 /// Declare the `SlotInput` enum + a `From<Input>` per variant from one central
 /// list. `#[serde(untagged)]` so each variant serializes as just its inner input
 /// object (e.g. `{"m":512}`) — the slot's kernel kind is recovered from the
@@ -171,6 +185,7 @@ log_inputs! {
     AttnDecode  => FlashinferAttnDecodeKernelInput,
     AttnRect    => FlashinferAttnRectKernelInput,
     Dflash2DraftAttn => Dflash2DraftAttnLog,
+    HisparseH2dIo => HisparseH2dIoLog,
     KvCacheAppend => KvCacheAppendKernelInput,
     MlaCacheAppend => MlaCacheAppendKernelInput,
     DsaIndexCacheAppend => DsaIndexCacheAppendKernelInput,

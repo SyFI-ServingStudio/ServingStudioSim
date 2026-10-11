@@ -2680,8 +2680,17 @@ fn expected_speculative_slot_count(
 /// also allocates its FP8 index key plus one FP32 scale, even when that layer
 /// reuses a previous layer's top-k result and skips the indexer compute.
 pub(crate) fn decoder_layer_state_bytes_per_token() -> u64 {
+    mla_latent_bytes_per_layer_token() + index_key_bytes_per_layer_token()
+}
+
+/// One layer's fp8 MLA latent (compressed KV plus RoPE key) for one token.
+pub(crate) fn mla_latent_bytes_per_layer_token() -> u64 {
     u64::from(KV_LORA_RANK + ROPE_DIM) * u64::from(DType::Fp8E4m3.size_bytes())
-        + u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes())
+}
+
+/// One layer's DSA indexer key for one token: the fp8 key plus its fp32 scale.
+pub(crate) fn index_key_bytes_per_layer_token() -> u64 {
+    u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes())
 }
 
 pub(crate) fn state_bytes_per_token(

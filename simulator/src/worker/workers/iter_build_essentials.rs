@@ -11,11 +11,14 @@
 
 use std::path::PathBuf;
 
+use crate::arch::contract::KvHostOffload;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::KvSampler;
 use crate::timing::{CostManifest, CostManifestDoc};
+use crate::worker::config::KvAdmissionConfig;
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
+use crate::worker::kv::HostKvTier;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::WorkerConfig;
 
@@ -40,6 +43,31 @@ pub(super) fn full_attention_token_capacity(
         .attn_kv_bytes
         .saturating_mul(num_attn_shards.max(1) as u64);
     (partition_kv_bytes / total_kv_bytes_per_token.max(1)).max(1)
+}
+
+/// A model's host-tier facts (`IterwiseUnifiedModel::kv_host_offload`) in a
+/// full-attention store's token units: the fixed device bytes per request in
+/// units of `total_kv_bytes_per_token` (rounded up), the host bytes per
+/// partition in context tokens. Only the full-footprint admission checks a
+/// host tier, so any other admission is refused here rather than silently
+/// over-admitting.
+pub(super) fn host_kv_tier(
+    offload: Option<KvHostOffload>,
+    total_kv_bytes_per_token: u64,
+    config: &WorkerConfig,
+) -> Option<HostKvTier> {
+    let offload = offload?;
+    assert!(
+        matches!(config.kv_admission, KvAdmissionConfig::FullFootprint),
+        "a host-tier KV cache supports only full-footprint KV admission"
+    );
+    Some(HostKvTier {
+        device_tokens_per_request: offload
+            .device_bytes_per_request
+            .div_ceil(total_kv_bytes_per_token.max(1)),
+        host_capacity_tokens: offload.host_bytes_per_partition
+            / offload.host_bytes_per_token.max(1),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -63,6 +63,16 @@ impl KvCapacityState {
         decodes: impl Iterator<Item = &'a ResidentDecodeState>,
         fixed_charge_per_request: u64,
     ) -> u64 {
+        Self::projected_peak_from(self.resident_tokens, decodes, fixed_charge_per_request)
+    }
+
+    /// [`Self::projected_peak`] from an explicit current total `resident`,
+    /// whose per-request charge is `current_kv + fixed_charge_per_request`.
+    fn projected_peak_from<'a>(
+        resident: u64,
+        decodes: impl Iterator<Item = &'a ResidentDecodeState>,
+        fixed_charge_per_request: u64,
+    ) -> u64 {
         let mut entries: Vec<(u32, u64)> = decodes
             .map(|state| {
                 (
@@ -72,7 +82,7 @@ impl KvCapacityState {
             })
             .collect();
         if entries.is_empty() {
-            return self.resident_tokens;
+            return resident;
         }
         entries.sort_by_key(|(remaining_decode, _)| *remaining_decode);
 
@@ -85,7 +95,7 @@ impl KvCapacityState {
             kv_prefix.push(kv_prefix.last().unwrap() + charge);
         }
 
-        let mut peak = self.resident_tokens;
+        let mut peak = resident;
         let mut last_exit_step: Option<u32> = None;
         for index in Self::sample_indices(num_decodes) {
             let exit_step = entries[index].0;
@@ -95,9 +105,8 @@ impl KvCapacityState {
             last_exit_step = Some(exit_step);
             let departed =
                 entries.partition_point(|(remaining_decode, _)| *remaining_decode < exit_step);
-            let kv_at_exit = self.resident_tokens
-                + (num_decodes - departed) as u64 * exit_step as u64
-                - kv_prefix[departed];
+            let kv_at_exit =
+                resident + (num_decodes - departed) as u64 * exit_step as u64 - kv_prefix[departed];
             peak = peak.max(kv_at_exit);
         }
         peak
@@ -344,6 +353,22 @@ impl ResidentPartitionState {
 
     pub(crate) fn projected_peak_kv(&self) -> u64 {
         self.cached_peak
+    }
+
+    /// Resident context tokens: the charge without the fixed per-request part.
+    pub(crate) fn resident_context_tokens(&self) -> u64 {
+        self.capacity.resident_tokens - self.fixed_charge_per_request * self.decodes.len() as u64
+    }
+
+    /// [`Self::projected_peak_kv`] over context tokens alone, as a store with a
+    /// second, context-only ledger (a host tier) needs. Not cached: only such a
+    /// store asks, once per admission test.
+    pub(crate) fn projected_peak_context_tokens(&self) -> u64 {
+        KvCapacityState::projected_peak_from(
+            self.resident_context_tokens(),
+            self.decodes.iter().map(|(_, state)| state),
+            0,
+        )
     }
 
     /// How many checkpoint boundaries every live decode has crossed, in units of

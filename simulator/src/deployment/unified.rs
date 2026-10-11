@@ -815,7 +815,15 @@ impl Deployment for UnifiedDeployment {
                 cudagraph_capture_sizes,
                 ..
             } => {
+                let hisparse = g.arch.hisparse();
                 ensure_hp_or_chunked_worker("GLM-5.2 NVFP4 DP attention", &g.worker)?;
+                // Only the chunked-prefill recipe sizes its store from the
+                // model's host tier; HP would silently drop it.
+                ensure!(
+                    hisparse.is_none() || matches!(g.worker, IterWorkerSel::ChunkedPrefill { .. }),
+                    "unified: hisparse needs worker chunked_prefill, got {:?}",
+                    g.worker
+                );
                 let model = Arc::new(arch_build::glm52_vllm_nvfp4_dp_attn_dsa_moe(
                     model_spec,
                     *ep_size,
@@ -826,6 +834,7 @@ impl Deployment for UnifiedDeployment {
                     expert_popularity_file.as_deref(),
                     token_corpus_file.as_deref(),
                     cudagraph_capture_sizes,
+                    hisparse.as_ref(),
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

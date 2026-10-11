@@ -10,6 +10,18 @@
 //! per-request charge, and a prefix reuse quantum of one token. A model that
 //! also carries recurrent state gets a different store (`hybrid_gdn`) rather
 //! than a flag here.
+//!
+//! ## Host tier (HiSparse)
+//!
+//! [`FullAttnKv::with_host_tier`] splits each request's cache between GPU and
+//! host memory (SGLang HiSparse). The GPU charge then counts the per-token part
+//! the GPU keeps (the indexer keys) plus a fixed device buffer per request,
+//! through the same fixed-charge seam a recurrent store uses; a second, host
+//! capacity bounds the requests' summed context. Both are derived from the
+//! existing ledgers -- the host occupancy is the charge minus the fixed part,
+//! resident and promised alike -- so no second ledger can drift, and
+//! [`KvStore::fits`] tests both. Bounded-future admission and PD handoff do not
+//! check the host tier; the recipes that build one reject them.
 
 use crate::common::{RequestId, SessionInput, Time};
 use crate::log::{
@@ -42,7 +54,19 @@ enum ReservationBasis {
 
 pub struct FullAttentionKvFootprint {
     reserved_tokens: u64,
+    /// The context part of `reserved_tokens`, which a host tier holds.
+    context_tokens: u64,
     basis: ReservationBasis,
+}
+
+/// The host half of a HiSparse-style split cache, in the store's token units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostKvTier {
+    /// Fixed GPU charge per resident or promised request, in units of the
+    /// per-token GPU bytes the store's capacity is counted in.
+    pub device_tokens_per_request: u64,
+    /// Context tokens one partition's host memory holds.
+    pub host_capacity_tokens: u64,
 }
 
 impl FullAttentionKvFootprint {
@@ -59,6 +83,7 @@ pub struct FullAttnKv {
     prefix_caches: Vec<PrefixCache>,
     journal: PrefixCacheJournal,
     sampler: Option<KvSampler>,
+    host_tier: Option<HostKvTier>,
 }
 
 impl KvStore for FullAttnKv {
@@ -150,12 +175,23 @@ impl IterWorkerKv for FullAttnKv {
         FullAttnKv::status_active(self, partition)
     }
 
+    /// With a host tier, the fuller of the two memories.
     fn kv_usage(&self, partition: PartitionId) -> f64 {
         let partition_state = &self.partitions[partition as usize];
         let used = partition_state.resident_tokens()
             + self.ledger.partition_held(partition)
             + self.ledger.partition_promised(partition);
-        used as f64 / partition_state.capacity_tokens().max(1) as f64
+        let gpu = used as f64 / partition_state.capacity_tokens().max(1) as f64;
+        match self.host_tier {
+            None => gpu,
+            Some(tier) => {
+                let host = (partition_state.resident_context_tokens()
+                    + self.promised_context_tokens(partition, tier))
+                    as f64
+                    / tier.host_capacity_tokens.max(1) as f64;
+                gpu.max(host)
+            }
+        }
     }
 
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId> {
@@ -198,12 +234,13 @@ impl ChunkedPrefillKv for FullAttnKv {
         max_future_tokens: u32,
         page_size: u32,
     ) -> Self::Footprint {
-        let reserved_tokens = u64::from(post_prefill_context_tokens)
+        let context_tokens = u64::from(post_prefill_context_tokens)
             .checked_add(u64::from(remaining_output_tokens.min(max_future_tokens)))
             .and_then(|tokens| tokens.checked_add(u64::from(page_size)))
             .expect("bounded-future KV footprint overflow");
         FullAttentionKvFootprint {
-            reserved_tokens,
+            reserved_tokens: context_tokens + self.device_tokens_per_request(),
+            context_tokens,
             basis: ReservationBasis::BoundedFuture,
         }
     }
@@ -488,6 +525,7 @@ impl FullAttnKv {
             partitions: (0..num_partitions)
                 .map(|_| ResidentPartitionState::new(kv_capacity, NO_FIXED_CHARGE))
                 .collect(),
+            host_tier: None,
             ledger: RequestLedger::new(num_partitions),
             prefix_caches: (0..num_partitions)
                 .map(|_| {
@@ -504,6 +542,39 @@ impl FullAttnKv {
         }
     }
 
+    /// Split each request's cache between the GPU (this store's capacity,
+    /// plus `tier.device_tokens_per_request` fixed per request) and a host
+    /// tier of `tier.host_capacity_tokens` context tokens per partition. Call
+    /// before any request is admitted.
+    pub(crate) fn with_host_tier(mut self, tier: HostKvTier) -> Self {
+        assert!(
+            self.ledger.placement_is_empty(),
+            "a host tier must be set before admission"
+        );
+        for partition in &mut self.partitions {
+            *partition = ResidentPartitionState::new(
+                partition.capacity_tokens(),
+                tier.device_tokens_per_request,
+            );
+        }
+        self.host_tier = Some(tier);
+        self
+    }
+
+    #[inline]
+    fn device_tokens_per_request(&self) -> u64 {
+        self.host_tier
+            .map_or(NO_FIXED_CHARGE, |tier| tier.device_tokens_per_request)
+    }
+
+    /// Context tokens promised on `partition`: each promise's charge less its
+    /// fixed device part.
+    fn promised_context_tokens(&self, partition: PartitionId, tier: HostKvTier) -> u64 {
+        self.ledger.partition_promised(partition)
+            - tier.device_tokens_per_request
+                * u64::from(self.ledger.partition_promised_count(partition))
+    }
+
     #[inline]
     pub(crate) fn num_partitions(&self) -> usize {
         self.partitions.len()
@@ -516,9 +587,11 @@ impl FullAttnKv {
         post_prefill_context_tokens: u32,
         remaining_output_tokens: u32,
     ) -> FullAttentionKvFootprint {
+        let context_tokens =
+            u64::from(post_prefill_context_tokens) + u64::from(remaining_output_tokens);
         FullAttentionKvFootprint {
-            reserved_tokens: u64::from(post_prefill_context_tokens)
-                + u64::from(remaining_output_tokens),
+            reserved_tokens: context_tokens + self.device_tokens_per_request(),
+            context_tokens,
             basis: ReservationBasis::FullFootprint,
         }
     }
@@ -536,6 +609,20 @@ impl FullAttnKv {
         partition_state.resident_tokens() + reserved_tokens <= partition_state.capacity_tokens()
             && partition_state.projected_peak_kv() + reserved_tokens
                 <= partition_state.capacity_tokens()
+            && self.host_fits(partition, footprint)
+    }
+
+    /// The host tier's half of [`Self::fits`]: the same immediate and
+    /// projected-peak tests over context tokens alone.
+    fn host_fits(&self, partition: PartitionId, footprint: &FullAttentionKvFootprint) -> bool {
+        let Some(tier) = self.host_tier else {
+            return true;
+        };
+        let partition_state = &self.partitions[partition as usize];
+        let reserved = self.promised_context_tokens(partition, tier) + footprint.context_tokens;
+        partition_state.resident_context_tokens() + reserved <= tier.host_capacity_tokens
+            && partition_state.projected_peak_context_tokens() + reserved
+                <= tier.host_capacity_tokens
     }
 
     pub(crate) fn reserve(
@@ -888,6 +975,73 @@ mod tests {
         let reservation = kv_store.footprint(RequestId(1), 10, 10);
         kv_store.reserve(RequestId(1), 0, reservation, Time::ZERO);
         assert!(!kv_store.fits(0, &candidate));
+    }
+
+    fn admit(kv_store: &mut FullAttnKv, request: u32, context: u32, output: u32) {
+        let footprint = kv_store.footprint(RequestId(request), context, output);
+        assert!(kv_store.fits(0, &footprint));
+        kv_store.reserve(RequestId(request), 0, footprint, Time::ZERO);
+        kv_store.drain_ready();
+        kv_store.commit_resident(RequestId(request), 0, u64::from(context), output);
+    }
+
+    #[test]
+    fn a_host_tier_charges_the_device_buffer_on_the_gpu() {
+        // GPU: 1000 units, 100 fixed per request; host: ample.
+        let tier = HostKvTier {
+            device_tokens_per_request: 100,
+            host_capacity_tokens: 1_000_000,
+        };
+        let mut kv_store = FullAttnKv::without_prefix_cache(1, 1_000, None).with_host_tier(tier);
+        let footprint = kv_store.footprint(RequestId(0), 90, 10);
+        assert_eq!(footprint.reserved_tokens(), 200);
+        for request in 0..5 {
+            admit(&mut kv_store, request, 90, 10);
+        }
+        // Five requests: 5 * (90 + 100) resident, and each still grows by 10.
+        assert_eq!(kv_store.partitions[0].resident_tokens(), 950);
+        assert_eq!(kv_store.partitions[0].resident_context_tokens(), 450);
+        assert!(!kv_store.fits(0, &kv_store.footprint(RequestId(5), 1, 0)));
+        kv_store.release(RequestId(0), 0);
+        assert_eq!(kv_store.partitions[0].resident_tokens(), 760);
+        assert!(kv_store.fits(0, &kv_store.footprint(RequestId(5), 90, 10)));
+    }
+
+    #[test]
+    fn a_host_tier_bounds_the_summed_context() {
+        // GPU ample; host holds 250 context tokens per partition.
+        let tier = HostKvTier {
+            device_tokens_per_request: 100,
+            host_capacity_tokens: 250,
+        };
+        let mut kv_store =
+            FullAttnKv::without_prefix_cache(1, 1_000_000, None).with_host_tier(tier);
+        admit(&mut kv_store, 0, 90, 10);
+        // A promise counts against the host tier too, without its device part.
+        let footprint = kv_store.footprint(RequestId(1), 90, 10);
+        kv_store.reserve(RequestId(1), 0, footprint, Time::ZERO);
+        assert_eq!(kv_store.promised_context_tokens(0, tier), 100);
+        assert!(!kv_store.fits(0, &kv_store.footprint(RequestId(2), 90, 10)));
+        assert!(kv_store.fits(0, &kv_store.footprint(RequestId(2), 40, 10)));
+        // The projected peak counts the residents' remaining growth: at 90 + 10
+        // each, 200 of 250 host tokens are already spoken for.
+        kv_store.drain_ready();
+        kv_store.commit_resident(RequestId(1), 0, 90, 10);
+        assert_eq!(kv_store.partitions[0].resident_context_tokens(), 180);
+        assert_eq!(kv_store.partitions[0].projected_peak_context_tokens(), 200);
+        assert!(!kv_store.fits(0, &kv_store.footprint(RequestId(2), 45, 10)));
+        assert!(kv_store.fits(0, &kv_store.footprint(RequestId(2), 40, 10)));
+        // Usage reports the fuller memory, the host's.
+        assert!((kv_store.kv_usage(0) - 180.0 / 250.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn without_a_host_tier_the_footprint_is_the_context() {
+        let kv_store = FullAttnKv::without_prefix_cache(1, 1_000, None);
+        let footprint = kv_store.footprint(RequestId(0), 90, 10);
+        assert_eq!(footprint.reserved_tokens(), 100);
+        assert_eq!(footprint.context_tokens, 100);
+        assert!(kv_store.host_tier.is_none());
     }
 
     #[test]

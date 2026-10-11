@@ -10,6 +10,25 @@
 
 use crate::timing::{CostManifest, CostManifestDoc, LeafMetrics, SlotInput};
 
+/// Capacity facts of a KV cache whose bulk lives in host memory (SGLang
+/// HiSparse). Same "total over the attention ranks of one KV partition"
+/// convention as [`IterwiseUnifiedModel::total_kv_bytes_per_token`].
+///
+/// A request's GPU footprint is `context * total_kv_bytes_per_token +
+/// device_bytes_per_request`; its host footprint is `context *
+/// host_bytes_per_token`, and the host tier of one KV partition holds at most
+/// `host_bytes_per_partition`. Admission must fit both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvHostOffload {
+    /// Fixed GPU bytes one request holds whatever its context: the device
+    /// buffer the sparse attention reads from, plus any windowed cache.
+    pub device_bytes_per_request: u64,
+    /// Host bytes one context token occupies.
+    pub host_bytes_per_token: u64,
+    /// Host memory one KV partition may use.
+    pub host_bytes_per_partition: u64,
+}
+
 /// One attention/FFN group view for an iter-wise batch. Local/unified and PD
 /// prefill/decode workers usually pass one group; HP/DP-attn variants may pass
 /// multiple groups.
@@ -197,6 +216,16 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
         0
     }
 
+    /// The host tier of a KV cache split between GPU and host memory
+    /// (SGLang HiSparse), or `None` (the default) for a GPU-resident cache.
+    ///
+    /// When `Some`, [`Self::total_kv_bytes_per_token`] is only the part of a
+    /// token's cache that stays on the GPU for the request's whole life, and
+    /// the returned facts carry the rest: see [`KvHostOffload`].
+    fn kv_host_offload(&self) -> Option<KvHostOffload> {
+        None
+    }
+
     /// GPUs one replica of this model spans. The model_arch is the source of truth
     /// for this: it resolved the parallel layout, so it knows the real extent — the
     /// EP span with TP/HP groups nested inside it, *not* a `tp×ep×hp` product. L5/L6
@@ -382,6 +411,11 @@ pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
     /// See [`IterwiseUnifiedModel::recurrent_checkpoint_interval_tokens`].
     fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
         0
+    }
+
+    /// See [`IterwiseUnifiedModel::kv_host_offload`].
+    fn kv_host_offload(&self) -> Option<KvHostOffload> {
+        None
     }
 
     /// Maximum context accepted by the model's timing kernels. A complete

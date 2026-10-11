@@ -20,6 +20,7 @@ pub mod glm53_flash_vllm_fp8_kda_dsa_moe;
 pub mod glm53_flash_vllm_fp8_pp_kda_dsa_moe;
 pub mod glm53_flash_vllm_nvfp4_dflash2;
 pub mod glm53_vllm_nvfp4_dsa_moe_dflash2;
+pub mod hisparse;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;
 pub mod llama3_dp_attn_tp_ffn;

@@ -24,7 +24,7 @@ use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{HybridSpeculativeWorker, IterBatchWorker, SpeculativeWorker};
 use crate::worker::workers::iter_build_essentials::{
-    full_attention_token_capacity, prepare_iter_build_essentials,
+    full_attention_token_capacity, host_kv_tier, prepare_iter_build_essentials,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -82,6 +82,11 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         kv_capacity,
         num_partitions,
     );
+    let host_tier = host_kv_tier(
+        model.kv_host_offload(),
+        model.total_kv_bytes_per_token(),
+        &config,
+    );
     let kv_store = FullAttnKv::with_prefix_cache(
         num_partitions,
         essentials.kv_capacity,
@@ -89,6 +94,22 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
+    // A host-tier cache (HiSparse) charges a fixed device buffer per request
+    // and bounds the summed context by host memory.
+    let kv_store = match host_tier {
+        Some(tier) => {
+            tracing::info!(
+                worker = id.0,
+                pool_tag,
+                kv_capacity_tokens = essentials.kv_capacity,
+                device_tokens_per_request = tier.device_tokens_per_request,
+                host_capacity_tokens = tier.host_capacity_tokens,
+                "host-tier KV: per-request device buffer and host context cap"
+            );
+            kv_store.with_host_tier(tier)
+        }
+        None => kv_store,
+    };
     let balance = match (num_partitions, config.dp_placement) {
         (1, _) => LoadBalance::Single,
         (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },

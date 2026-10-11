@@ -56,10 +56,16 @@
 //! see the request's rows as one verify block. Padding and the dummy batch are
 //! unchanged: they count tokens, and an idle rank's `execute_dummy_batch`
 //! still schedules one.
+//!
+//! [`Glm52VllmNvfp4DpAttnDsaMoeModel::with_hisparse`] serves the cache through
+//! SGLang HiSparse (`arch::hisparse`, a rough analytic model): the per-token
+//! GPU cache shrinks to the indexer keys, a fixed latent buffer per request and
+//! a host tier join the capacity contract (`kv_host_offload`), and each step
+//! adds the exposed host -> device miss copy as one more `Max` over ranks.
 
 use std::sync::Arc;
 
-use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::contract::{IterwiseUnifiedModel, KvHostOffload, UnifiedArchInput};
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
     self as ep_graph, build_atomic, eval_atomic_or_zero, normalize_group, state_bytes_per_token,
@@ -68,6 +74,7 @@ use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
 };
 use crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::eval_compiled;
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::graph_padded_tokens;
+use crate::arch::hisparse::{push_rank_step, HisparseConfig, HisparseRankStep};
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
@@ -506,6 +513,8 @@ struct DpBatch {
     /// Every token the routed experts see on each rank; zero only when no
     /// rank has work.
     gathered_tokens: u32,
+    /// Each rank's HiSparse miss copy; empty without HiSparse.
+    hisparse: Vec<HisparseRankStep>,
 }
 
 /// vLLM's DP step agreement (`vllm/v1/worker/dp_utils.py`
@@ -574,6 +583,7 @@ fn normalize_input(
         rows,
         collective_tokens,
         gathered_tokens,
+        hisparse: Vec::new(),
     })
 }
 
@@ -596,6 +606,10 @@ pub struct Glm52VllmNvfp4DpAttnDsaMoeModel {
     /// the target of a DFlash2 verify.
     verify_width: u32,
     cudagraph_capture_sizes: Vec<u32>,
+    /// SGLang HiSparse KV offload (see [`Self::with_hisparse`]); `None` keeps
+    /// the whole cache on the GPU.
+    hisparse: Option<HisparseConfig>,
+    host_offload: Option<KvHostOffload>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -687,12 +701,12 @@ pub fn build(
         max_model_len: recipe.parallel.max_model_len,
         verify_width,
         cudagraph_capture_sizes: resolved.parallel.cudagraph_capture_sizes.clone(),
+        hisparse: None,
+        host_offload: None,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
-    let tree = model.cost_tree();
-    model.cost_flat = tree.flatten();
-    model.n_slots = tree.n_slots();
+    model.recompile();
     Ok(model)
 }
 
@@ -703,6 +717,44 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
 
     pub fn verify_width(&self) -> u32 {
         self.verify_width
+    }
+
+    fn recompile(&mut self) {
+        let tree = self.cost_tree();
+        self.cost_flat = tree.flatten();
+        self.n_slots = tree.n_slots();
+    }
+
+    /// Serve the cache through SGLang HiSparse (`arch::hisparse`): each rank
+    /// keeps every layer's indexer keys and a `buffer_tokens` latent buffer
+    /// per request on the GPU, the whole latent cache in its share of the
+    /// node's host DRAM (`nvl_num_gpu` GPUs per node unless the config says
+    /// otherwise), and pays the exposed host -> device miss copy as one more
+    /// `Max` over ranks per step. Kernels are unchanged.
+    pub fn with_hisparse(
+        mut self,
+        config: HisparseConfig,
+        nvl_num_gpu: u16,
+    ) -> Result<Self, BuildError> {
+        let unit = |value: f64| (0.0..=1.0).contains(&value);
+        if config.buffer_tokens == 0
+            || config.top_k == 0
+            || !(config.h2d_gb_per_s > 0.0)
+            || !(config.host_dram_gb_per_node > 0.0)
+            || !unit(config.exposed_io_fraction)
+            || !unit(config.intra_step_overlap)
+        {
+            return Err(fit_failed(format!("invalid hisparse config {config:?}")));
+        }
+        let layers = u64::from(ep_graph::NUM_LAYERS);
+        let latent_bytes_per_token = layers * ep_graph::mla_latent_bytes_per_layer_token();
+        // A token's indexer keys stay on the GPU; vLLM's pool allocates them on
+        // all 78 layers, IndexShare layers included, and this keeps that count.
+        self.kv_bytes_per_token = layers * ep_graph::index_key_bytes_per_layer_token();
+        self.host_offload = Some(config.kv_host_offload(latent_bytes_per_token, 0, nvl_num_gpu, 1));
+        self.hisparse = Some(config);
+        self.recompile();
+        Ok(self)
     }
 
     fn per_rank(
@@ -770,6 +822,10 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
                 CostNode::Sum(vec![self.final_norm.compile(b), self.lm_head.compile(b)])
             }),
         );
+        let mut sections = vec![embedding, dense, initial_shared, cycle, head];
+        if let Some(hisparse) = &self.hisparse {
+            sections.push(hisparse.compile(&self.name, self.ep_size, builder));
+        }
         CostNode::Labeled {
             label: format!(
                 "{} (Glm52VllmNvfp4DpAttnDsaMoeModel) [DP attention x{n} at TP1; EP{n} NVFP4 MoE; \
@@ -779,25 +835,34 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
                 self.max_model_len,
                 n = self.ep_size
             ),
-            child: Box::new(CostNode::Sum(vec![
-                embedding,
-                dense,
-                initial_shared,
-                cycle,
-                head,
-            ])),
+            child: Box::new(CostNode::Sum(sections)),
         }
     }
 
     fn normalize(&self, input: &UnifiedArchInput) -> DpBatch {
-        normalize_input(
+        let mut batch = normalize_input(
             input,
             self.ep_size,
             self.verify_width,
             self.max_model_len,
             &self.cudagraph_capture_sizes,
         )
-        .unwrap_or_else(|reason| panic!("invalid Glm52VllmNvfp4DpAttnDsaMoeModel input: {reason}"))
+        .unwrap_or_else(|reason| panic!("invalid Glm52VllmNvfp4DpAttnDsaMoeModel input: {reason}"));
+        if let Some(hisparse) = &self.hisparse {
+            batch.hisparse = input
+                .groups
+                .iter()
+                .map(|group| {
+                    hisparse.rank_step(
+                        &group.decode_kv_lens,
+                        self.verify_width,
+                        ep_graph::mla_latent_bytes_per_layer_token(),
+                        ep_graph::NUM_LAYERS,
+                    )
+                })
+                .collect();
+        }
+        batch
     }
 
     /// Fill the slots of [`Self::compile_root`] for one iteration.
@@ -842,6 +907,9 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
                 ev,
             );
         }
+        for &step in &batch.hisparse {
+            push_rank_step(step, ev);
+        }
     }
 }
 
@@ -861,6 +929,10 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4DpAttnDsaMoeModel {
     /// plus index key, with nothing replicated.
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.kv_bytes_per_token
+    }
+
+    fn kv_host_offload(&self) -> Option<KvHostOffload> {
+        self.host_offload
     }
 
     fn gpus_per_replica(&self) -> u16 {
@@ -1147,6 +1219,56 @@ mod tests {
                 / model.total_kv_bytes_per_token();
             assert_eq!(per_partition, 817_408);
         }
+    }
+
+    #[test]
+    fn hisparse_keeps_the_indexer_on_the_gpu_and_bills_one_copy_per_rank() {
+        use crate::arch::hisparse::{HisparseConfig, HISPARSE_H2D_IO_KIND};
+        let ep_size = 8;
+        let model = built("glm52_nvfp4", ep_size)
+            .with_hisparse(HisparseConfig::default(), ep_size)
+            .unwrap();
+        // 55,224 = 78 * (576 latent + 132 indexer key): only the keys stay.
+        assert_eq!(model.total_kv_bytes_per_token(), 78 * 132);
+        assert_eq!(model.total_kv_bytes_per_token(), 10_296);
+        let offload = model.kv_host_offload().unwrap();
+        assert_eq!(offload.host_bytes_per_token, 78 * 576);
+        assert_eq!(offload.device_bytes_per_request, 4096 * 44_928);
+        assert_eq!(offload.host_bytes_per_partition, 250_000_000_000);
+        // One analytic leaf per rank, after every kernel slot.
+        assert_eq!(
+            model.n_slots,
+            expected_slot_count(ep_size) + usize::from(ep_size)
+        );
+        let slots = model.cost_log_manifest().slots;
+        let copies: Vec<_> = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.kind == HISPARSE_H2D_IO_KIND)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            copies,
+            (expected_slot_count(ep_size)..model.n_slots).collect::<Vec<_>>()
+        );
+        // Per-rank work from each rank's decode lengths at the verify width.
+        let mut groups = vec![group(&[], &[]); usize::from(ep_size)];
+        groups[0] = group(&[], &[100_000, 2_000]);
+        groups[3] = group(&[], &[120_000]);
+        let batch = model.normalize(&input(groups));
+        assert_eq!(batch.hisparse.len(), usize::from(ep_size));
+        assert_eq!(batch.hisparse[0].offloaded_requests, 1);
+        assert_eq!(batch.hisparse[0].context_tokens, 102_000);
+        assert!((batch.hisparse[0].misses_per_layer - 0.134 * 2048.0).abs() < 1e-6);
+        assert_eq!(batch.hisparse[3].offloaded_requests, 1);
+        assert_eq!(batch.hisparse[1].decode_requests, 0);
+        // Off: no slot, no work, the GPU-resident accounting.
+        let plain = built("glm52_nvfp4", ep_size);
+        assert!(plain.kv_host_offload().is_none());
+        assert!(plain
+            .normalize(&input(vec![group(&[], &[100_000]); 8]))
+            .hisparse
+            .is_empty());
     }
 
     #[test]

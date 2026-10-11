@@ -65,6 +65,10 @@ impl RequestLedger {
 
     // ── placement ────────────────────────────────────────────────────────────
 
+    pub(crate) fn placement_is_empty(&self) -> bool {
+        self.placement.is_empty()
+    }
+
     pub(crate) fn placement(&self, request: RequestId) -> Option<PartitionId> {
         self.placement.get(&request).copied()
     }
