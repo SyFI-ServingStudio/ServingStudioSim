@@ -117,8 +117,7 @@ impl SpeculativeDecodeCompletion {
         }
     }
 
-    /// Tokens this verify retires: the target's own token, plus the leading run
-    /// of accepted drafts, truncated by the request's remaining output length.
+    /// Tokens this verify retires (see [`speculative_accepted_length`]).
     fn accepted_length(
         &self,
         request: RequestId,
@@ -126,22 +125,45 @@ impl SpeculativeDecodeCompletion {
         accept_rate: &AcceptanceProfile,
         remaining_output_tokens: u32,
     ) -> u32 {
-        let mut accepted = 1_u32;
-        for draft_position in 0..self.draft_tokens {
-            let position_rate = accept_rate.at_position(draft_position, self.draft_tokens);
-            if !bernoulli(
-                self.seed,
-                request,
-                output_tokens_emitted,
-                draft_position,
-                position_rate,
-            ) {
-                break;
-            }
-            accepted += 1;
-        }
-        accepted.min(remaining_output_tokens)
+        speculative_accepted_length(
+            self.seed,
+            self.draft_tokens,
+            request,
+            output_tokens_emitted,
+            accept_rate,
+            remaining_output_tokens,
+        )
     }
+}
+
+/// Tokens a verify retires: the target's own token, plus the leading run of
+/// accepted drafts, truncated by the request's remaining output length.
+///
+/// A pure function of the seed and the request's progress, so the execution
+/// that bills a verify sees the same count the completion retires.
+pub(crate) fn speculative_accepted_length(
+    seed: u64,
+    draft_tokens: u32,
+    request: RequestId,
+    output_tokens_emitted: u32,
+    accept_rate: &AcceptanceProfile,
+    remaining_output_tokens: u32,
+) -> u32 {
+    let mut accepted = 1_u32;
+    for draft_position in 0..draft_tokens {
+        let position_rate = accept_rate.at_position(draft_position, draft_tokens);
+        if !bernoulli(
+            seed,
+            request,
+            output_tokens_emitted,
+            draft_position,
+            position_rate,
+        ) {
+            break;
+        }
+        accepted += 1;
+    }
+    accepted.min(remaining_output_tokens)
 }
 
 impl<K: IterWorkerKv> DecodeCompletion<K> for SpeculativeDecodeCompletion {

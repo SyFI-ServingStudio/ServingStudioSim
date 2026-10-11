@@ -26,6 +26,7 @@ use crate::arch::contract::{
     SpeculativeUnifiedModel,
 };
 use crate::common::{DecodingStrategy, SharedRequests, Time};
+use crate::worker::admission::speculative_accepted_length;
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::execution::{IterModelExecution, ModelKvLayout};
 use crate::worker::kv::{IterWorkerKv, PrefixKv};
@@ -38,10 +39,18 @@ pub struct SpeculativeIterExecution<M: SpeculativeUnifiedModel> {
     /// is `draft_tokens + 1`; the model was compiled for that width, so it is a
     /// worker-lifetime constant rather than a per-iteration quantity.
     draft_tokens: u32,
+    /// The completion's acceptance seed, so each request's committed rows are
+    /// the ones its verify will retire.
+    acceptance_seed: u64,
 }
 
 impl<M: SpeculativeUnifiedModel> SpeculativeIterExecution<M> {
-    pub(crate) fn new(model: Arc<M>, cost: CostBuffers, draft_tokens: u32) -> Self {
+    pub(crate) fn new(
+        model: Arc<M>,
+        cost: CostBuffers,
+        draft_tokens: u32,
+        acceptance_seed: u64,
+    ) -> Self {
         assert!(
             draft_tokens > 0,
             "a speculative execution adapter must draft at least one candidate; \
@@ -51,6 +60,7 @@ impl<M: SpeculativeUnifiedModel> SpeculativeIterExecution<M> {
             model,
             cost,
             draft_tokens,
+            acceptance_seed,
         }
     }
 
@@ -122,12 +132,30 @@ impl<M: SpeculativeUnifiedModel> SpeculativeIterExecution<M> {
                          max_model_len={max_model_len}; variable-width boundary batches are unsupported",
                         request.0
                     );
+                    let DecodingStrategy::Speculative { accept_rate } =
+                        &record.request.definition.decoding
+                    else {
+                        unreachable!("asserted speculative above");
+                    };
+                    let committed_rows = speculative_accepted_length(
+                        self.acceptance_seed,
+                        self.draft_tokens,
+                        request,
+                        record.progress.output_tokens_emitted,
+                        accept_rate,
+                        record
+                            .request
+                            .definition
+                            .target_output_tokens
+                            .saturating_sub(record.progress.output_tokens_emitted),
+                    );
                     let current_kv = current_kv as u32;
                     group.decode_requests.push(SpeculativeDecodeInput {
                         // Resident KV excludes the pending target input token.
                         // Every query, including that token, extends context.
                         kv_len: current_kv + verify_width,
                         query_len: verify_width,
+                        committed_rows,
                     });
                     group.total_kv_len += current_kv;
                 });
@@ -240,7 +268,7 @@ mod tests {
             &CostManifestDoc::single("iter", FakeSpeculativeModel.cost_log_manifest()),
             1.0,
         );
-        SpeculativeIterExecution::new(Arc::new(FakeSpeculativeModel), cost, DRAFT_TOKENS)
+        SpeculativeIterExecution::new(Arc::new(FakeSpeculativeModel), cost, DRAFT_TOKENS, 0)
     }
 
     /// `count` resident speculative decode requests, each holding

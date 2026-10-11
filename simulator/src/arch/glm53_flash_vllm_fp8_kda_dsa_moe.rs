@@ -80,9 +80,9 @@ use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel, MhcRmsNormKernelConfig,
-    MhcRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput,
-    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    KdaRecoverSSMVerifyKernelConfig, MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel,
+    MhcRmsNormKernelConfig, MhcRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig,
+    RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
@@ -720,6 +720,7 @@ pub fn build_configs(
             core_backends: KDA_BACKENDS.to_vec(),
             chunk_prefill_backends: KDA_PREFILL_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            decode_query_len: 1,
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
             hidden: model.hidden.into(),
@@ -754,6 +755,7 @@ pub fn build_configs(
             indexer_max_logits_bytes: u64::from(parallel.kernel_path.indexer_max_logits_mb)
                 * 1024
                 * 1024,
+            decode_next_n: 1,
         },
         dense_ffn: mlp(
             divide("intermediate_size", model.intermediate_size)?,
@@ -1232,6 +1234,9 @@ pub struct Glm53FlashVllmModel {
     pub tp_size: u16,
     pub enable_expert_parallel: bool,
     pub max_model_len: u32,
+    /// Query rows each decode request presents: 1, or `k + 1` when this graph
+    /// verifies a speculative chain (`decode_next_n` of its sublayers).
+    pub verify_width: u32,
     /// Sorted, deduplicated capture sizes (see `Glm53FlashVllmParallel`).
     cudagraph_capture_sizes: Vec<u32>,
     embedding: Op<ElementwiseKernel>,
@@ -1247,6 +1252,8 @@ pub struct Glm53FlashVllmModel {
     /// vLLM's hybrid block size: the token interval at which the KDA state is
     /// checkpointed and a prefix-cache hit can resume.
     hybrid_block_size: u32,
+    /// The RecoverSSM commit a verify graph's KDA layers need; `None` at width 1.
+    pub(crate) kda_commit: Option<KdaCommitPlan>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1327,6 +1334,7 @@ pub fn build(
         tp_size: cfg.parallel.tp_size,
         enable_expert_parallel: cfg.parallel.enable_expert_parallel,
         max_model_len: cfg.parallel.max_model_len,
+        verify_width: verify_width(cfg)?,
         cudagraph_capture_sizes: {
             let mut sizes = cfg.parallel.cudagraph_capture_sizes.clone();
             sizes.sort_unstable();
@@ -1336,6 +1344,7 @@ pub fn build(
         total_kv_bytes_per_token,
         recurrent_state_bytes_per_request,
         hybrid_block_size,
+        kda_commit: kda_commit_plan(&resolved),
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -1355,9 +1364,52 @@ pub(crate) fn dsa_layer_bytes_per_token(model: &Glm53FlashModelCfg) -> u64 {
 }
 
 /// One rank's recurrent state of one KDA layer for one request: the fp32 SSM
-/// state plus the causal-conv window.
+/// state, the causal-conv window, and a verify graph's RecoverSSM records.
 pub(crate) fn kda_layer_state_bytes_per_request(resolved: &Glm53FlashVllmResolved) -> u64 {
-    u64::from(resolved.kda.ssm_state_bytes_per_request + resolved.kda.conv_state_bytes_per_request)
+    u64::from(resolved.kda.ssm_state_bytes_per_request)
+        + u64::from(resolved.kda.conv_state_bytes_per_request)
+        + u64::from(resolved.kda.verify_cache_bytes_per_request)
+}
+
+/// What a speculative verify's RecoverSSM commit needs from a Flash graph.
+#[derive(Clone, Debug)]
+pub struct KdaCommitPlan {
+    /// The rank-local KDA verify shape whose records the commit folds.
+    pub verify: KdaRecoverSSMVerifyKernelConfig,
+    /// KDA layers in each of vLLM's KDA KV-cache groups; one commit call
+    /// covers one group.
+    pub cache_group_layers: Vec<u32>,
+}
+
+/// The commit plan of a graph compiled at verify width above 1.
+pub(crate) fn kda_commit_plan(resolved: &Glm53FlashVllmResolved) -> Option<KdaCommitPlan> {
+    let verify = resolved.kda.recoverssm_verify.clone()?;
+    let model = &resolved.raw_cfg.model;
+    Some(KdaCommitPlan {
+        verify,
+        cache_group_layers: kda_cache_group_layers(
+            model.kda_layers.len() as u32,
+            model.num_dsa_layers(),
+        ),
+    })
+}
+
+/// vLLM's split of the KDA layers into KV-cache groups (`kv_cache_utils.py`,
+/// uniform page size): the group size is the smaller layer count of the two
+/// cache types, or the larger when it is under 1.5x the smaller, and group `i`
+/// takes every `num_groups`-th layer from `i`. A DFlash2 draft's window layers
+/// are paged as their own group and take no part. 34 KDA beside 11 DSA layers
+/// make groups of 9, 9, 8 and 8.
+pub(crate) fn kda_cache_group_layers(kda_layers: u32, dsa_layers: u32) -> Vec<u32> {
+    let (fewer, more) = (kda_layers.min(dsa_layers), kda_layers.max(dsa_layers));
+    if fewer == 0 {
+        return vec![kda_layers];
+    }
+    let size = if 2 * more < 3 * fewer { more } else { fewer };
+    let groups = kda_layers.div_ceil(size);
+    (0..groups)
+        .map(|i| (kda_layers - i).div_ceil(groups))
+        .collect()
 }
 
 /// vLLM's hybrid attention block size (`platforms/interface.py`
@@ -1413,7 +1465,7 @@ impl Glm53FlashVllmModel {
     }
 
     pub(crate) fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
-        let batch = normalize_input(input, self.max_model_len)
+        let batch = normalize_input(input, self.max_model_len, self.verify_width)
             .unwrap_or_else(|reason| panic!("invalid Glm53FlashVllmModel input: {reason}"));
         let tokens = graph_padded_tokens(&self.cudagraph_capture_sizes, batch.total_tokens);
         push(
@@ -1473,7 +1525,7 @@ impl Glm53FlashVllmModel {
 
 impl IterwiseUnifiedModel for Glm53FlashVllmModel {
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
-        normalize_input(batch, self.max_model_len).map(|_| ())
+        normalize_input(batch, self.max_model_len, self.verify_width).map(|_| ())
     }
 
     fn total_kv_bytes_per_token(&self) -> u64 {
@@ -1548,9 +1600,24 @@ pub(crate) struct NormalizedBatch {
     dsa: Glm53DsaAttnLocalWorkletInput,
 }
 
+/// The verify width both attention sublayers were configured for.
+pub(crate) fn verify_width(cfg: &Glm53FlashVllmConfigs) -> std::result::Result<u32, BuildError> {
+    let width = cfg.dsa.decode_next_n;
+    if width == 0 || cfg.kda.decode_query_len != width {
+        return Err(fit_failed(format!(
+            "KDA decode_query_len {} and DSA decode_next_n {width} must be one positive verify width",
+            cfg.kda.decode_query_len
+        )));
+    }
+    Ok(width)
+}
+
+/// `verify_width` is the query rows of each decode request: a decode request
+/// is one `decode_kv_lens` entry and `verify_width` of `decode_tokens`.
 pub(crate) fn normalize_input(
     input: &UnifiedArchInput,
     max_model_len: u32,
+    verify_width: u32,
 ) -> std::result::Result<NormalizedBatch, String> {
     let [group] = input.groups.as_slice() else {
         return Err(format!(
@@ -1582,16 +1649,16 @@ pub(crate) fn normalize_input(
         ));
     }
     for (request, &context) in group.decode_kv_lens.iter().enumerate() {
-        if !(1..=max_model_len).contains(&context) {
+        if !(verify_width..=max_model_len).contains(&context) {
             return Err(format!(
-                "decode request {request} context {context} must be in 1..={max_model_len}"
+                "decode request {request} context {context} must be in {verify_width}..={max_model_len}"
             ));
         }
     }
-    let decode_tokens = group.decode_kv_lens.len() as u32;
+    let decode_tokens = group.decode_kv_lens.len() as u32 * verify_width;
     if group.decode_tokens != decode_tokens {
         return Err(format!(
-            "decode_tokens {} must equal decode_kv_lens length {decode_tokens}",
+            "decode_tokens {} must equal decode_kv_lens length x verify width {verify_width}",
             group.decode_tokens
         ));
     }
@@ -2005,6 +2072,13 @@ mod tests {
     }
 
     #[test]
+    fn kda_layers_split_into_vllm_cache_groups() {
+        assert_eq!(kda_cache_group_layers(34, 11), vec![9, 9, 8, 8]);
+        // gpt-oss-style near-equal counts use the larger count as the size.
+        assert_eq!(kda_cache_group_layers(12, 13), vec![12]);
+    }
+
+    #[test]
     fn compiled_tree_has_a_fixed_slot_count() {
         let model = built();
         // Prologue 4 (the all-reduce is a fused + large pair); per group:
@@ -2208,13 +2282,13 @@ mod tests {
             }],
             tokens_per_source_rank: Vec::new(),
         };
-        let batch = normalize_input(&input, 8192).unwrap();
+        let batch = normalize_input(&input, 8192, 1).unwrap();
         assert_eq!((batch.total_tokens, batch.request_count), (2048, 30));
         assert_eq!(batch.kda.prefill_sequence_lengths, [2019]);
         assert_eq!(batch.kda.decode_batch_size, 29);
         assert_eq!(batch.dsa.decode_kv_lens.len(), 29);
         let mut bad = input.clone();
         bad.groups[0].decode_kv_lens = vec![9000; 29];
-        assert!(normalize_input(&bad, 8192).is_err());
+        assert!(normalize_input(&bad, 8192, 1).is_err());
     }
 }

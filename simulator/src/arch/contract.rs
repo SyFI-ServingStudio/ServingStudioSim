@@ -253,6 +253,10 @@ pub struct SpeculativeDecodeInput {
     pub kv_len: u32,
     /// Query rows emitted for this request in the current verify group.
     pub query_len: u32,
+    /// Of those rows, the ones this verify accepts (the target's own token
+    /// plus the leading accepted drafts, `1..=query_len`): what a model that
+    /// commits recurrent state after the verify folds in.
+    pub committed_rows: u32,
 }
 
 /// One attention/FFN group view for a speculative iter-wise batch.
@@ -427,10 +431,12 @@ mod speculative_arch_input_tests {
                 SpeculativeDecodeInput {
                     kv_len: 64,
                     query_len: 6,
+                    committed_rows: 6,
                 },
                 SpeculativeDecodeInput {
                     kv_len: 91,
                     query_len: 6,
+                    committed_rows: 6,
                 },
             ],
             total_kv_len: 155,

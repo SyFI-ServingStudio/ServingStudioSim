@@ -3473,6 +3473,7 @@ mod tests {
                     .map(|&kv_len| SpeculativeDecodeInput {
                         kv_len,
                         query_len: verify_width,
+                        committed_rows: verify_width,
                     })
                     .collect(),
                 total_kv_len: decode_kv_lens

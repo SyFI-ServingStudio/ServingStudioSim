@@ -335,9 +335,12 @@ impl SpeculativePredictGroup {
                 .total_kv_len
                 .checked_add(kv_len - query_len)
                 .context("decode KV sum overflows u32")?;
-            group
-                .decode_requests
-                .push(SpeculativeDecodeInput { kv_len, query_len });
+            // A case states no acceptance, so every row commits.
+            group.decode_requests.push(SpeculativeDecodeInput {
+                kv_len,
+                query_len,
+                committed_rows: query_len,
+            });
         }
         group.batch_tokens = group
             .prefill_tokens
@@ -915,7 +918,8 @@ mod tests {
             lowered.decode_requests[1],
             SpeculativeDecodeInput {
                 kv_len: 206,
-                query_len: 6
+                query_len: 6,
+                committed_rows: 6,
             }
         );
         assert!(

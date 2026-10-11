@@ -19,6 +19,7 @@ mod prefix_fetch;
 mod srpt;
 mod token_budget;
 
+pub(crate) use decode_completion::speculative_accepted_length;
 pub use decode_completion::{
     DecodeCompletion, SingleTokenDecodeCompletion, SpeculativeDecodeCompletion,
 };

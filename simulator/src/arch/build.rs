@@ -1347,6 +1347,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
     kernel_path: Glm53FlashKernelPath,
+    verify_width: u32,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1359,6 +1360,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
         routing_seed,
         expert_popularity_file,
         token_corpus_file,
+        verify_width,
     )?;
     let parallel = Glm53FlashVllmParallel {
         tp_size,
@@ -1368,8 +1370,11 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
         kernel_path,
     };
-    let configs = glm53_flash_vllm_fp8_kda_dsa_moe::build_configs(&model_cfg, &parallel, &demand)
-        .context("expanding GLM-5.3-Flash architecture configs")?;
+    let mut configs =
+        glm53_flash_vllm_fp8_kda_dsa_moe::build_configs(&model_cfg, &parallel, &demand)
+            .context("expanding GLM-5.3-Flash architecture configs")?;
+    configs.dsa.decode_next_n = verify_width;
+    configs.kda.decode_query_len = verify_width;
     let resolved = glm53_flash_vllm_fp8_kda_dsa_moe::resolve_configs(&configs);
     glm53_flash_vllm_fp8_kda_dsa_moe::build(name.to_string(), resolved, bridge)
         .context("building GLM-5.3-Flash model (often a missing profile.db row)")
@@ -1410,6 +1415,7 @@ fn glm53_flash_model_and_demand(
     routing_seed: Option<u64>,
     expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
+    verify_width: u32,
 ) -> Result<(
     Glm53FlashModelCfg,
     crate::timing::expert_demand::ExpertDemand,
@@ -1431,8 +1437,10 @@ fn glm53_flash_model_and_demand(
         token_corpus_file,
         num_routed_layers: routed_layers,
     };
-    // Ordinary decode: one row per request, so a verify block is one token.
-    let demand = source.demand(0..routed_layers as usize, 1)?;
+    // One request contributes `verify_width` consecutive rows to a step: one
+    // for ordinary decode, the drafted positions plus the token they extend for
+    // a speculative verify.
+    let demand = source.demand(0..routed_layers as usize, verify_width)?;
     Ok((model_cfg, demand))
 }
 
@@ -1467,6 +1475,7 @@ pub fn glm53_flash_vllm_fp8_pp_kda_dsa_moe(
         routing_seed,
         expert_popularity_file,
         token_corpus_file,
+        1,
     )?;
     let parallel = Glm53FlashVllmFp8PpParallel {
         pp_size,
@@ -1499,6 +1508,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
     kernel_path: Glm53FlashKernelPath,
+    verify_width: u32,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1520,7 +1530,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         token_corpus_file,
         num_routed_layers: routed_layers,
     };
-    let demand = source.demand(0..routed_layers as usize, 1)?;
+    let demand = source.demand(0..routed_layers as usize, verify_width)?;
     let parallel = glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpParallel {
         dp_size: ep_size,
         max_model_len,
@@ -1528,9 +1538,11 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
         kernel_path,
     };
-    let configs =
+    let mut configs =
         glm53_flash_vllm_fp8_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
             .context("expanding GLM-5.3-Flash DP-attention/EP architecture configs")?;
+    configs.local.dsa.decode_next_n = verify_width;
+    configs.local.kda.decode_query_len = verify_width;
     let resolved = glm53_flash_vllm_fp8_dp_attn_ep_moe::resolve_configs(&configs);
     glm53_flash_vllm_fp8_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
         .context("building GLM-5.3-Flash DP-attention/EP model (often a missing profile.db row)")
@@ -1754,6 +1766,7 @@ pub fn glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(
         token_corpus_file.as_deref(),
         cudagraph_capture_sizes,
         glm53_flash_kernel_path(sel)?,
+        *draft_tokens + 1,
         gpu,
         name,
         bridge,
@@ -1808,6 +1821,7 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         token_corpus_file.as_deref(),
         cudagraph_capture_sizes,
         glm53_flash_kernel_path(sel)?,
+        *draft_tokens + 1,
         gpu,
         name,
         bridge,
@@ -2347,6 +2361,7 @@ pub fn build_iter_model(
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
             glm53_flash_kernel_path(sel)?,
+            1,
             gpu,
             name,
             bridge,
@@ -2422,6 +2437,7 @@ pub fn build_iter_model(
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
             glm53_flash_kernel_path(sel)?,
+            1,
             gpu,
             name,
             bridge,

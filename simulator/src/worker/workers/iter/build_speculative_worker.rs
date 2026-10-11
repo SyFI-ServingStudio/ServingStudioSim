@@ -113,7 +113,12 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         essentials.context,
         kv_store,
         admission,
-        SpeculativeIterExecution::new(model, essentials.cost, draft_tokens),
+        SpeculativeIterExecution::new(
+            model,
+            essentials.cost,
+            draft_tokens,
+            config.speculative_acceptance_seed.unwrap_or(0),
+        ),
     )
 }
 
@@ -225,7 +230,12 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         essentials.context,
         kv_store,
         admission,
-        SpeculativeIterExecution::new(model, essentials.cost, draft_tokens),
+        SpeculativeIterExecution::new(
+            model,
+            essentials.cost,
+            draft_tokens,
+            config.speculative_acceptance_seed.unwrap_or(0),
+        ),
     )
 }
 
