@@ -677,7 +677,9 @@ python -m launcher alignment-campaign {check,render,run,label,extract,compare} .
 python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
 ```
 
-`--no-gpu` may be added anywhere to any of these commands.
+Global options may be added anywhere to any of these commands (`launcher/cli.py`
+takes them off before dispatch): `--no-gpu`, and `--remote NAME` with repeatable
+`--remote-set key=value` (see Remote execution).
 
 - Simulation presets, timing-predict configs, and all alignment stage inputs
   accept YAML (`.yaml` / `.yml`) or JSON.

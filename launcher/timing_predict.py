@@ -118,9 +118,7 @@ def _prediction_labeler_params(cfg: dict) -> dict | None:
         return None
     return {
         "pools": {
-            PREDICTION_POOL_TAG: {
-                "groups": [{"arch": dict(architecture_config), "gpu": gpu_name}]
-            }
+            PREDICTION_POOL_TAG: {"groups": [{"arch": dict(architecture_config), "gpu": gpu_name}]}
         }
     }
 
@@ -199,8 +197,7 @@ def _valid_prediction_id(value: object) -> bool:
         1 <= len(suffix) <= 64
         and suffix.isascii()
         and all(
-            character.islower() or character.isdigit() or character == "_"
-            for character in suffix
+            character.islower() or character.isdigit() or character == "_" for character in suffix
         )
     )
 
@@ -544,33 +541,50 @@ def dry_run_report(config_path: Path, build_type: str) -> tuple[str, dict | None
         return result.output, report, binary_error(error_path)
 
 
+def _build_argparse():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m launcher timing-predict",
+        description="Evaluate explicit batch shapes with the offline timing predictor.",
+    )
+    parser.add_argument("configs", nargs="*", help="Timing-predict config YAML/JSON path(s).")
+    parser.add_argument(
+        "--build-type", default="release", help="Cargo profile of the binary (default: release)."
+    )
+    analysis = parser.add_mutually_exclusive_group()
+    analysis.add_argument(
+        "--no-analyze",
+        dest="analysis",
+        action="store_const",
+        const="none",
+        default="full",
+        help="Skip the analyzer after each prediction.",
+    )
+    analysis.add_argument(
+        "--analyzer-essential-only",
+        dest="analysis",
+        action="store_const",
+        const="essential",
+        help="Run only the essential analyzer subjects.",
+    )
+    parser.add_argument("--no-plot", action="store_true", help="Render no PNGs.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Check every case against the model and print the specs a real run would JIT.",
+    )
+    return parser
+
+
 def main(argv: list[str]) -> int:
-    build_type = "release"
-    analysis = "full"
-    render = True
-    dry_run = False
-    configs: list[str] = []
-    it = iter(argv)
-    for tok in it:
-        if tok == "--build-type":
-            build_type = next(it, "")
-            if not build_type:
-                sys.exit("timing-predict: --build-type needs a value")
-        elif tok in ("--no-analyze", "--analyzer-essential-only"):
-            level = "none" if tok == "--no-analyze" else "essential"
-            if analysis not in ("full", level):
-                sys.exit(
-                    "timing-predict: --no-analyze and --analyzer-essential-only exclude each other"
-                )
-            analysis = level
-        elif tok == "--no-plot":
-            render = False
-        elif tok == "--dry-run":
-            dry_run = True
-        elif tok.startswith("-"):
-            sys.exit(f"timing-predict: unknown flag {tok}")
-        else:
-            configs.append(tok)
+    # Intermixed: config paths may follow options, as the hand-written parser allowed.
+    args = _build_argparse().parse_intermixed_args(argv)
+    build_type = args.build_type
+    analysis = args.analysis
+    render = not args.no_plot
+    dry_run = args.dry_run
+    configs: list[str] = args.configs
 
     if not configs:
         sys.exit(

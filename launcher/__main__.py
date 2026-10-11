@@ -16,11 +16,14 @@ enumeration (`--emit-backends`), and simulator wallclock profiling (`--profile`)
 paths. YAML and JSON are accepted for simulation presets, timing-predict configs,
 and alignment stage configs.
 
-`--no-gpu`, anywhere on the command line of any mode, guarantees the command
-uses no GPU: it sets `SERVINGSTUDIO_NO_GPU=1` (which has the same effect when
-set directly) and empties `CUDA_VISIBLE_DEVICES` for every child. A step that
-would need one -- profiling a missing `profile.db` row, an alignment capture --
-fails and names itself instead. See `profiling/gpu_policy.py`.
+Global options (`--no-gpu`, `--remote NAME`, `--remote-set K=V`) may appear
+anywhere on the line of any mode; `launcher/cli.py` takes them off before
+dispatch. `--no-gpu` guarantees the command uses no GPU: it sets
+`SERVINGSTUDIO_NO_GPU=1` (which has the same effect when set directly) and
+empties `CUDA_VISIBLE_DEVICES` for every child. A step that would need one --
+profiling a missing `profile.db` row, an alignment capture -- fails and names
+itself instead. See `profiling/gpu_policy.py`. `--remote` runs the command on
+another machine (`launcher/remote`).
 
 Single versus batch execution is decided by the number of expanded configs.
 Sweep expansion belongs to `launcher.schema`. No `--web` / `--tui` / `--gui`
@@ -34,6 +37,7 @@ import json
 import sys
 from pathlib import Path
 
+from .cli import dispatch, modes_help
 from .corpus import CorpusError, resolve_hf_references
 from .schema import (
     _format_log_dir,
@@ -68,15 +72,7 @@ def _build_argparse():
     parser = argparse.ArgumentParser(
         prog="python -m launcher",
         description="ServingStudioSim launcher simulation mode — run or sweep YAML/JSON presets.",
-        epilog=(
-            "Other modes:\n"
-            "  python -m launcher timing-predict CONFIG.yaml|json [...]\n"
-            "  python -m launcher kernel-profile "
-            "{list,query,count-missing,run,measure,merge-db,audit-provenance} ...\n"
-            "  python -m launcher alignment {sim,profile,timing-predict,analyze} ...\n"
-            "  python -m launcher list-params [--human]\n"
-            "--no-gpu applies to every mode: see --no-gpu below."
-        ),
+        epilog=modes_help(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -95,12 +91,6 @@ def _build_argparse():
         "--dry-run",
         action="store_true",
         help="Validate + expand only; do not launch subprocesses.",
-    )
-    parser.add_argument(
-        "--no-gpu",
-        action="store_true",
-        help="Guarantee no GPU is used, in any mode (also SERVINGSTUDIO_NO_GPU=1). "
-        "A missing profile.db row fails instead of being profiled.",
     )
     parser.add_argument(
         "--cache-report",
@@ -295,8 +285,7 @@ def _emit_backends(args, schema: Registry) -> int:
     try:
         # The builder reads a corpus to size its sweep, so it needs the file.
         normalized = [
-            resolve_hf_references(_format_log_dir(normalize_params(c, schema)))
-            for c in candidates
+            resolve_hf_references(_format_log_dir(normalize_params(c, schema))) for c in candidates
         ]
         roles = emit_roles(normalized, args.build_type)
     except CorpusError as exc:
@@ -540,73 +529,34 @@ def _apply_energy_policy(
     return True
 
 
+def list_params(argv: list[str]) -> int:
+    """`list-params`: dump the Rust-authoritative schema of the built binary."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m launcher list-params",
+        description="Print the simulator's parameter schema (JSON, or a table with --human).",
+    )
+    parser.add_argument("--human", action="store_true", help="Print a readable table.")
+    parser.add_argument(
+        "--build-type", default="release", help="Cargo profile of the schema (default: release)."
+    )
+    args = parser.parse_args(argv)
+    try:
+        schema = load_schema(args.build_type)
+    except SchemaNotFound as exc:
+        sys.exit(str(exc))
+    _print_params_table(schema, args.human, args.build_type)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
+    return dispatch(list(sys.argv[1:] if argv is None else argv), simulation=run_simulation)
 
-    # `--no-gpu` holds for every mode, so it is taken before dispatch; the
-    # environment carries it to every child. The variable alone gets the same
-    # hidden devices, so a child cannot see a GPU either way.
-    from profiling.gpu_policy import disable_gpus, gpu_disabled
 
-    if "--no-gpu" in argv:
-        argv = [token for token in argv if token != "--no-gpu"]
-        disable_gpus()
-    elif gpu_disabled():
-        disable_gpus()
-
-    # `alignment` exposes explicit workflow stages. Its `sim` handler re-enters
-    # this main function, so dispatch must short-circuit before preset parsing.
-    if argv and argv[0] == "alignment":
-        from .alignment import main as run_alignment
-
-        return run_alignment(argv[1:])
-
-    # `timing-predict` runs the offline per-building-block timing predictor. Its
-    # config is a minimal arch+cases file, NOT a deployment RunConfig, so it has its
-    # own handler that bypasses schema expansion / sweeps entirely.
-    if argv and argv[0] == "timing-predict":
-        from .timing_predict import main as run_timing_predict
-
-        return run_timing_predict(argv[1:])
-
-    # Keep L1 profiling ownership in ``profiling.cli`` while exposing one
-    # operator-facing ServingStudioSim command surface alongside timing-predict and sim.
-    if argv and argv[0] == "kernel-profile":
-        from profiling.cli import main as run_kernel_profile
-
-        return run_kernel_profile(
-            argv[1:],
-            prog="python -m launcher kernel-profile",
-        )
-
-    # `alignment-campaign` drives the stages `alignment` runs — it renders case
-    # directories, fans ONE phase across them, and reads the resulting reports.
-    # Top-level rather than nested under `alignment`, whose parser owns "one
-    # explicit stage"; see `launcher/alignment_campaign/cli.py`.
-    if argv and argv[0] == "alignment-campaign":
-        from .alignment_campaign import main as run_alignment_campaign
-
-        return run_alignment_campaign(argv[1:])
-
-    if argv and argv[0] == "migrate-artifact-kinds":
-        from .migrate_artifact_kinds import main as migrate_artifact_kinds
-
-        return migrate_artifact_kinds(argv[1:])
-
-    # `list-params` subcommand short-circuits before any preset handling.
-    if argv and argv[0] == "list-params":
-        human = "--human" in argv[1:]
-        build_type = "release"
-        if "--build-type" in argv:
-            build_type = argv[argv.index("--build-type") + 1]
-        try:
-            schema = load_schema(build_type)
-        except SchemaNotFound as exc:
-            sys.exit(str(exc))
-        _print_params_table(schema, human, build_type)
-        return 0
-
-    args = _build_argparse().parse_args(argv)
+def run_simulation(argv: list[str]) -> int:
+    """The default mode: run or sweep simulation presets."""
+    args = _build_argparse().parse_intermixed_args(argv)
     if not args.presets:
         sys.exit(
             "no preset given; usage: python -m launcher PRESET.yaml|json [...] "
