@@ -2315,7 +2315,7 @@ pub(crate) fn normalize_input(
             input.groups.len()
         ));
     }
-    let group = normalize_group(0, &input.groups[0], max_model_len)?;
+    let group = normalize_group(0, &input.groups[0], 1, max_model_len)?;
     let total_tokens = group.batch_tokens;
     Ok(NormalizedBatch {
         groups: vec![group],
@@ -2328,11 +2328,19 @@ pub(crate) fn normalize_input(
 /// `group_index` only labels errors. A data-parallel graph lowers each of its
 /// attention groups through this, so every group obeys the same rules as the
 /// single tensor-parallel group.
+///
+/// Each decode request presents `verify_width` query rows at its final KV
+/// length: 1 for plain decode, `draft_tokens + 1` for a speculative verify
+/// whose proposer is not the MTP layer (see [`build_verify_configs`]).
 pub(crate) fn normalize_group(
     group_index: usize,
     group: &ArchGroupInput,
+    verify_width: u32,
     max_model_len: u32,
 ) -> std::result::Result<NormalizedGroup, String> {
+    if verify_width == 0 {
+        return Err("verify width must be positive".to_string());
+    }
     let mut prefill_tokens = 0_u32;
     let mut prefill_query_cache_pairs = Vec::with_capacity(group.prefill_chunk_pairs.len());
     let mut endpoint_context_lens =
@@ -2365,19 +2373,23 @@ pub(crate) fn normalize_group(
             group.prefill_tokens
         ));
     }
-    let decode_tokens = u32::try_from(group.decode_kv_lens.len())
+    let decode_request_count = u32::try_from(group.decode_kv_lens.len())
         .map_err(|_| format!("group {group_index} decode request count exceeds u32"))?;
+    let decode_tokens = decode_request_count
+        .checked_mul(verify_width)
+        .ok_or_else(|| format!("group {group_index} decode token count overflows u32"))?;
     if group.decode_tokens != decode_tokens {
         return Err(format!(
-            "group {group_index} decode_tokens {} must equal decode_kv_lens length {decode_tokens}",
+            "group {group_index} decode_tokens {} must equal decode_kv_lens length x verify width \
+             {verify_width} = {decode_tokens}",
             group.decode_tokens
         ));
     }
     let mut decode_context = None;
     for (request_index, &context) in group.decode_kv_lens.iter().enumerate() {
-        if !(1..=max_model_len).contains(&context) {
+        if !(verify_width..=max_model_len).contains(&context) {
             return Err(format!(
-                "group {group_index} decode request {request_index} context {context} must be in 1..={max_model_len}"
+                "group {group_index} decode request {request_index} context {context} must be in {verify_width}..={max_model_len}"
             ));
         }
         decode_context = Some(decode_context.map_or(context, |current: u32| current.max(context)));
@@ -2393,20 +2405,26 @@ pub(crate) fn normalize_group(
         ));
     }
     check_sparse_attention_rows(group_index, batch_tokens)?;
-    let request_count = u32::try_from(group.prefill_chunk_pairs.len() + group.decode_kv_lens.len())
-        .map_err(|_| format!("group {group_index} request count exceeds u32"))?;
+    let prefill_request_count = u32::try_from(group.prefill_chunk_pairs.len())
+        .map_err(|_| format!("group {group_index} prefill request count exceeds u32"))?;
+    let request_count = prefill_request_count
+        .checked_add(decode_request_count)
+        .ok_or_else(|| format!("group {group_index} request count overflows u32"))?;
+    // One row per prefill request and every decode query row: a verify scores
+    // all of them, and plain decode submits one per request.
+    let logits_rows = prefill_request_count
+        .checked_add(decode_tokens)
+        .ok_or_else(|| format!("group {group_index} logits row count overflows u32"))?;
     Ok(NormalizedGroup {
         batch_tokens,
         request_count,
-        // Without speculation every decode request submits one query row,
-        // so the sampler scores exactly one row per request.
-        logits_rows: request_count,
+        logits_rows,
         endpoint_context_lens,
         attention_input: VllmGlm52DsaAttnLocalWorkletInput {
             num_new_tokens: batch_tokens,
             prefill_query_cache_pairs,
             decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
-                batch_size: decode_tokens,
+                batch_size: decode_request_count,
                 context_len,
                 context_lens: Some(group.decode_kv_lens.clone()),
                 requires_padding: false,

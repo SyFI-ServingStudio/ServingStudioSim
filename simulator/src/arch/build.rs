@@ -1175,6 +1175,42 @@ pub fn glm52_vllm_nvfp4_dp_attn_dsa_moe(
     name: &str,
     bridge: &PerfApiBridge,
 ) -> Result<Glm52VllmNvfp4DpAttnDsaMoeModel> {
+    glm52_vllm_nvfp4_dp_attn_target(
+        model_spec,
+        ep_size,
+        nvl_num_gpu,
+        max_model_len,
+        routing_kind,
+        routing_seed,
+        expert_popularity_file,
+        token_corpus_file,
+        cudagraph_capture_sizes,
+        None,
+        gpu,
+        name,
+        bridge,
+    )
+}
+
+/// [`glm52_vllm_nvfp4_dp_attn_dsa_moe`], or with `draft_tokens` the target of
+/// a DFlash2 verify: every decode request presents `draft_tokens + 1` rows, and
+/// the routed demand groups that many consecutive rows.
+#[allow(clippy::too_many_arguments)]
+fn glm52_vllm_nvfp4_dp_attn_target(
+    model_spec: &ModelSpec,
+    ep_size: u16,
+    nvl_num_gpu: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    draft_tokens: Option<u32>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52VllmNvfp4DpAttnDsaMoeModel> {
     let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 NVFP4 config")?;
     let source = ExpertDemandSource {
         kind: routing_kind,
@@ -1186,7 +1222,13 @@ pub fn glm52_vllm_nvfp4_dp_attn_dsa_moe(
         token_corpus_file,
         num_routed_layers: num_sparse_layers(&model_cfg),
     };
-    let body_demand = source.demand(0..num_sparse_layers(&model_cfg) as usize, 1)?;
+    let verify_width = match draft_tokens {
+        None => 1,
+        Some(draft_tokens) => draft_tokens
+            .checked_add(1)
+            .context("speculative draft_tokens + 1 overflows u32")?,
+    };
+    let body_demand = source.demand(0..num_sparse_layers(&model_cfg) as usize, verify_width)?;
     let parallel = Glm52VllmNvfp4DpAttnParallel {
         ep_size,
         nvl_num_gpu,
@@ -1199,12 +1241,21 @@ pub fn glm52_vllm_nvfp4_dp_attn_dsa_moe(
             sizes
         },
     };
-    let configs = glm52_vllm_nvfp4_dp_attn_dsa_moe::build_configs(
-        &model_cfg,
-        &parallel,
-        &body_demand,
-        model_spec.fp8,
-    )
+    let configs = match draft_tokens {
+        None => glm52_vllm_nvfp4_dp_attn_dsa_moe::build_configs(
+            &model_cfg,
+            &parallel,
+            &body_demand,
+            model_spec.fp8,
+        ),
+        Some(draft_tokens) => glm52_vllm_nvfp4_dp_attn_dsa_moe::build_verify_configs(
+            &model_cfg,
+            &parallel,
+            &body_demand,
+            model_spec.fp8,
+            draft_tokens,
+        ),
+    }
     .context("expanding B200 GLM-5.2 NVFP4 DP-attention + EP architecture configs")?;
     let resolved = glm52_vllm_nvfp4_dp_attn_dsa_moe::resolve_configs(&configs);
     glm52_vllm_nvfp4_dp_attn_dsa_moe::build(name.to_string(), resolved, bridge).context(
@@ -1744,7 +1795,7 @@ pub fn glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
-) -> Result<glm53_flash_vllm_nvfp4_dflash2::Glm53FlashVllmNvfp4Dflash2Model<Glm53FlashVllmModel>> {
+) -> Result<glm53_flash_vllm_nvfp4_dflash2::Dflash2VerifyModel<Glm53FlashVllmModel>> {
     let IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 {
         model,
         tp_size,
@@ -1800,7 +1851,7 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
     name: &str,
     bridge: &PerfApiBridge,
 ) -> Result<
-    glm53_flash_vllm_nvfp4_dflash2::Glm53FlashVllmNvfp4Dflash2Model<
+    glm53_flash_vllm_nvfp4_dflash2::Dflash2VerifyModel<
         glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpModel,
     >,
 > {
@@ -1847,6 +1898,69 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         bridge,
     )
     .context("building GLM-5.3-Flash NVFP4 DP + DFlash2 (often a missing profile.db row)")
+}
+
+/// GLM-5.3 NVFP4 (DP-attention/EP graph) verifying the GLM-5.3 DFlash2
+/// proposer: one TP1 draft per attention DP rank. The target is
+/// [`glm52_vllm_nvfp4_dp_attn_dsa_moe`] compiled at verify width
+/// `draft_tokens + 1`; the draft is the one [`glm53_vllm_nvfp4_dsa_moe_dflash2`]
+/// runs, at TP1.
+pub fn glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+    sel: &IterArchSel,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<glm53_flash_vllm_nvfp4_dflash2::Dflash2VerifyModel<Glm52VllmNvfp4DpAttnDsaMoeModel>> {
+    let IterArchSel::Glm53VllmNvfp4DpAttnEpMoeDflash2 {
+        model,
+        ep_size,
+        nvl_num_gpu,
+        max_model_len,
+        routing,
+        routing_seed,
+        expert_popularity_file,
+        token_corpus_file,
+        cudagraph_capture_sizes,
+        draft_tokens,
+        draft_sliding_window,
+    } = sel
+    else {
+        bail!("{sel:?} is not glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2");
+    };
+    let checkpoint = &GLM53_DFLASH2;
+    anyhow::ensure!(
+        (1..=checkpoint.draft_tokens()).contains(draft_tokens),
+        "the {} draft has block_size {} and drafts 1..={} tokens, not {draft_tokens}",
+        checkpoint.name,
+        checkpoint.block_size,
+        checkpoint.draft_tokens()
+    );
+    let target = glm52_vllm_nvfp4_dp_attn_target(
+        model,
+        *ep_size,
+        *nvl_num_gpu,
+        *max_model_len,
+        *routing,
+        *routing_seed,
+        expert_popularity_file.as_deref(),
+        token_corpus_file.as_deref(),
+        cudagraph_capture_sizes,
+        Some(*draft_tokens),
+        gpu,
+        name,
+        bridge,
+    )?;
+    let draft = dflash2_draft_resolved(checkpoint, 1, gpu, *draft_tokens, *draft_sliding_window)
+        .context("expanding the DFlash2 draft configs")?;
+    glm53_flash_vllm_nvfp4_dflash2::build(
+        name,
+        target,
+        *max_model_len,
+        *draft_tokens,
+        &draft,
+        bridge,
+    )
+    .context("building GLM-5.3 NVFP4 DP + DFlash2 (often a missing profile.db row)")
 }
 
 /// Build SGLang's B200 GLM-5.2 NVFP4 graph under pure tensor parallelism.
@@ -2457,6 +2571,7 @@ pub fn build_iter_model(
         )?),
         IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
         | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+        | IterArchSel::Glm53VllmNvfp4DpAttnEpMoeDflash2 { .. }
         | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { .. }
         | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
@@ -2538,6 +2653,12 @@ pub fn build_speculative_iter_model(
         )),
         IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { draft_tokens, .. } => Ok((
             Box::new(glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+                selector, gpu, name, bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Glm53VllmNvfp4DpAttnEpMoeDflash2 { draft_tokens, .. } => Ok((
+            Box::new(glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(
                 selector, gpu, name, bridge,
             )?),
             *draft_tokens,
@@ -2782,6 +2903,7 @@ fn build_arch(
                 let (gpus, shape, manifest) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
                     | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+                    | IterArchSel::Glm53VllmNvfp4DpAttnEpMoeDflash2 { .. }
                     | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { .. }
                     | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. } => {
                         let (model, draft_tokens) = build_speculative_iter_model(
@@ -3566,6 +3688,104 @@ mod tests {
         // Four KDA cache groups on each of eight ranks.
         assert_eq!(stages.iter().filter(|&&s| s == 1).count(), 32);
         assert!(stages.contains(&2));
+    }
+
+    /// Catches the GLM-5.3 DP + DFlash2 composition losing a piece: the target
+    /// verifies `k + 1` rows with no RecoverSSM commit after it, each of the
+    /// eight ranks runs its own TP1 draft (no all-reduce) after the target's
+    /// slots, and the draft's full-attention KV adds to every token of a rank.
+    #[test]
+    fn glm53_dp_dflash2_drafts_per_rank_after_a_commitless_verify() {
+        use crate::arch::contract::{
+            SpeculativeArchGroupInput, SpeculativeArchInput, SpeculativeDecodeInput,
+        };
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let sel: IterArchSel = serde_json::from_value(serde_json::json!({
+            "type": "glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+            "model_config": Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("model/config/glm52_nvfp4.json"),
+            "fp8": false,
+            "ep_size": 8,
+            "nvl_num_gpu": 8,
+            "max_model_len": 131_072,
+            "draft_tokens": 7,
+            "cudagraph_capture_sizes": [64, 8, 16, 32],
+        }))
+        .unwrap();
+        let model =
+            glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(&sel, "NVIDIA B200", "test", &bridge).unwrap();
+        let slots = model.cost_log_manifest().slots;
+        let drafted: Vec<bool> = slots
+            .iter()
+            .map(|slot| slot.name.starts_with("test.dflash2"))
+            .collect();
+        assert!(drafted.windows(2).all(|w| w[0] <= w[1]), "{drafted:?}");
+        assert!(slots.iter().all(|slot| !slot.kind.starts_with("kda_")));
+        assert!(slots
+            .iter()
+            .filter(|slot| slot.name.starts_with("test.dflash2"))
+            .all(|slot| !slot.kind.starts_with("all_reduce")));
+        let context_kv = |prefix: &str| {
+            slots
+                .iter()
+                .filter(|slot| slot.name.starts_with(prefix))
+                .count()
+        };
+        let per_rank = context_kv("test.dflash2.context_kv");
+        assert!(per_rank > 0 && per_rank % 8 == 0, "{per_rank}");
+
+        assert_eq!(model.gpus_per_replica(), 8);
+        assert_eq!(model.num_attn_dp_groups(), 8);
+        assert_eq!(model.num_attn_shards(), 1);
+        assert_eq!(model.drafting_slots_per_request(), 7);
+        assert_eq!(model.recurrent_state_bytes_per_request(), 0);
+        // 78 layers x 708 B of MLA latent and index key, plus six draft layers
+        // x 8 KV heads x 128 x K/V x fp8, all on the one rank holding the token.
+        assert_eq!(model.total_kv_bytes_per_token(), 55_224 + 12_288);
+
+        let group = |decodes: usize| SpeculativeArchGroupInput {
+            batch_tokens: decodes as u32 * 8,
+            prefill_tokens: 0,
+            decode_tokens: decodes as u32 * 8,
+            prefill_chunk_pairs: Vec::new(),
+            decode_requests: vec![
+                SpeculativeDecodeInput {
+                    kv_len: 1_000,
+                    query_len: 8,
+                    committed_rows: 3,
+                };
+                decodes
+            ],
+            total_kv_len: decodes as u32 * 992,
+        };
+        let groups: Vec<_> = (0..8).map(|rank| group(rank % 3)).collect();
+        let input = SpeculativeArchInput {
+            draft_tokens: 7,
+            tokens_per_source_rank: groups.iter().map(|g| g.batch_tokens).collect(),
+            groups,
+        };
+        assert!(model.check_input(&input).is_ok());
+        let mut narrow = input.clone();
+        narrow.groups[1].decode_requests[0].query_len = 4;
+        assert!(model.check_input(&narrow).is_err());
+        let mut wrong_depth = input.clone();
+        wrong_depth.draft_tokens = 3;
+        assert!(model.check_input(&wrong_depth).is_err());
+        assert!(model
+            .check_input(&SpeculativeArchInput {
+                groups: input.groups[..4].to_vec(),
+                tokens_per_source_rank: input.tokens_per_source_rank[..4].to_vec(),
+                draft_tokens: 7,
+            })
+            .is_err());
+
+        let mut deep = sel.clone();
+        if let IterArchSel::Glm53VllmNvfp4DpAttnEpMoeDflash2 { draft_tokens, .. } = &mut deep {
+            *draft_tokens = 8;
+        }
+        assert!(glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(&deep, "NVIDIA B200", "test", &bridge)
+            .is_err());
     }
 
     /// Catches a bf16 KDA pool that does not reach the RecoverSSM rows: the

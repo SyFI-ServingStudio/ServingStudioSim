@@ -1,14 +1,21 @@
-//! GLM-5.3-Flash NVFP4 with a DFlash2 block-parallel proposer.
+//! GLM-5.3-Flash NVFP4 with a DFlash2 block-parallel proposer, and the same
+//! composition over GLM-5.3 NVFP4 under data-parallel attention.
 //!
 //! A composition of two models:
 //!
-//! - the **target** is the GLM-5.3-Flash graph, either the TP/EP one
-//!   ([`Glm53FlashVllmModel`]) or the DP-attention/EP one
-//!   ([`Glm53FlashDpAttnEpModel`]), compiled at verify width
-//!   `draft_tokens + 1`;
-//! - the **proposer** is the `incoai/GLM-5.3-Flash-DFlash2` checkpoint
-//!   (five GQA layers, hidden 4096, block 8) priced through the shared
+//! - the **target** is a [`Dflash2VerifyTarget`] compiled at verify width
+//!   `draft_tokens + 1`: the GLM-5.3-Flash TP/EP graph
+//!   ([`Glm53FlashVllmModel`]), its DP-attention/EP graph
+//!   ([`Glm53FlashDpAttnEpModel`]), or the GLM-5.2/5.3 NVFP4 DP-attention/EP
+//!   graph ([`Glm52VllmNvfp4DpAttnDsaMoeModel`]);
+//! - the **proposer** is the matching DFlash2 checkpoint
+//!   (`incoai/GLM-5.3-Flash-DFlash2`: five GQA layers, hidden 4096;
+//!   GLM-5.3's: six, hidden 6144; both block 8) priced through the shared
 //!   [`Dflash2DraftStage`], one per attention DP rank.
+//!
+//! The GLM-5.3 target has no KDA, so its verify is the DSA/MLA graph over the
+//! `draft_tokens + 1` rows and nothing is committed afterwards; what follows
+//! about KDA applies to the Flash targets only.
 //!
 //! # The verify pass
 //!
@@ -37,17 +44,26 @@
 //!
 //! Under attention DP each rank drafts its own requests at TP1, and the ranks
 //! draft concurrently, so the draft costs the slowest rank's call. Every draft
-//! layer attends a 2048-token sliding window, and the draft's KV is held as
-//! that window per request: the store charges it beside the KDA state, not per
-//! context token. (vLLM's GLM-5.3 build allocated the window layers as full
-//! attention because their pages could not be unified with the MLA latent; that
-//! fallback needs every layer to be attention and is unavailable beside KDA, so
-//! a Flash engine pages the draft as its own group.)
+//! layer attends a 2048-token sliding window. Where the draft's KV lives
+//! follows what vLLM can allocate beside the target:
+//!
+//! - beside KDA (Flash) it is held as that window per request: the store
+//!   charges it beside the KDA state, not per context token, because a Flash
+//!   engine pages the draft as its own group;
+//! - beside an all-attention target (GLM-5.3) vLLM cannot unify the draft's
+//!   GQA pages with the MLA latent and allocates the window layers as full
+//!   attention (`KV cache page sizes cannot be unified; treating sliding-window
+//!   layers as full attention`), so the draft's KV grows with every context
+//!   token and is added to the target's per-token bytes. The window still caps
+//!   what the draft attends to. At TP1 the page sizes differ as they do at TP4
+//!   (2048 B per draft layer against the 576 B latent), so the fallback holds
+//!   on a DP rank too.
 
 use crate::arch::contract::{
     ArchGroupInput, IterwiseUnifiedModel, SpeculativeArchInput, SpeculativeUnifiedModel,
     UnifiedArchInput,
 };
+use crate::arch::glm52_vllm_nvfp4_dp_attn_dsa_moe::Glm52VllmNvfp4DpAttnDsaMoeModel;
 use crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpModel;
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
     atomic, push, Glm53FlashVllmModel, KdaCommitPlan,
@@ -67,18 +83,23 @@ use crate::worklet::glm53_kda_attn_local::RECOVERSSM_COMMIT_BACKENDS;
 
 const ARCH_KIND: &str = "glm53_flash_vllm_nvfp4_dflash2";
 
-/// A Flash graph a DFlash2 verify pass can run on: compiled as one node beside
+/// A target graph a DFlash2 verify pass can run on: compiled as one node beside
 /// the draft, and filled from an ordinary unified batch.
-pub trait Glm53FlashVerifyTarget: IterwiseUnifiedModel {
+pub trait Dflash2VerifyTarget: IterwiseUnifiedModel {
+    /// Reader-facing model name for the cost tree's root label.
+    const MODEL: &'static str;
     /// Query rows per decode request the graph was compiled for.
     fn verify_width(&self) -> u32;
-    /// The RecoverSSM commit its KDA layers need after a verify.
+    /// The RecoverSSM commit its KDA layers need after a verify; `None` for a
+    /// target without recurrent layers.
     fn kda_commit(&self) -> Option<&KdaCommitPlan>;
     fn compile_target(&self, builder: &mut CostTreeBuilder) -> CostNode;
     fn eval_target(&self, input: &UnifiedArchInput, ev: &mut Evaluator);
 }
 
-impl Glm53FlashVerifyTarget for Glm53FlashVllmModel {
+impl Dflash2VerifyTarget for Glm53FlashVllmModel {
+    const MODEL: &'static str = "GLM-5.3-Flash NVFP4";
+
     fn verify_width(&self) -> u32 {
         self.verify_width
     }
@@ -96,7 +117,9 @@ impl Glm53FlashVerifyTarget for Glm53FlashVllmModel {
     }
 }
 
-impl Glm53FlashVerifyTarget for Glm53FlashDpAttnEpModel {
+impl Dflash2VerifyTarget for Glm53FlashDpAttnEpModel {
+    const MODEL: &'static str = "GLM-5.3-Flash NVFP4";
+
     fn verify_width(&self) -> u32 {
         self.verify_width
     }
@@ -114,11 +137,32 @@ impl Glm53FlashVerifyTarget for Glm53FlashDpAttnEpModel {
     }
 }
 
-/// GLM-5.3-Flash NVFP4 deployed with a DFlash2 proposer in front of it.
-pub struct Glm53FlashVllmNvfp4Dflash2Model<T> {
+impl Dflash2VerifyTarget for Glm52VllmNvfp4DpAttnDsaMoeModel {
+    const MODEL: &'static str = "GLM-5.3 NVFP4";
+
+    fn verify_width(&self) -> u32 {
+        Glm52VllmNvfp4DpAttnDsaMoeModel::verify_width(self)
+    }
+
+    fn kda_commit(&self) -> Option<&KdaCommitPlan> {
+        None
+    }
+
+    fn compile_target(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        self.compile_root(builder)
+    }
+
+    fn eval_target(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
+        self.eval_into(input, ev);
+    }
+}
+
+/// A GLM-5.3(-Flash) NVFP4 target deployed with a DFlash2 proposer in front
+/// of it.
+pub struct Dflash2VerifyModel<T> {
     target: T,
     /// One RecoverSSM commit call per KDA KV-cache group, run on every
-    /// attention DP rank.
+    /// attention DP rank; empty for a target without KDA.
     commit: Vec<Op<KdaRecoverSSMCommitKernel>>,
     /// One proposer per attention DP group, in group order.
     drafts: Vec<Dflash2DraftStage>,
@@ -128,29 +172,36 @@ pub struct Glm53FlashVllmNvfp4Dflash2Model<T> {
     max_model_len: u32,
     /// The draft's sliding-window KV held per request, summed over one group's
     /// attention shards as the worker's capacity contract counts the target's.
+    /// Zero when the draft's KV is full attention.
     draft_kv_bytes_per_request: u64,
+    /// The draft's full-attention KV per context token, on the same contract
+    /// as the target's per-token bytes. Zero when it is held as a window.
+    draft_kv_bytes_per_token: u64,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
 
-impl<T: Glm53FlashVerifyTarget> Glm53FlashVllmNvfp4Dflash2Model<T> {
+impl<T: Dflash2VerifyTarget> Dflash2VerifyModel<T> {
     fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
         let target = self.target.compile_target(&mut builder);
         // Slots are filled in compile order: target, commit, then the drafts,
         // as `eval_into` pushes them.
-        let commit_ranks: Vec<CostNode> = self
-            .drafts
-            .iter()
-            .map(|_| {
-                CostNode::Sum(
-                    self.commit
-                        .iter()
-                        .map(|op| op.compile(&mut builder))
-                        .collect(),
-                )
-            })
-            .collect();
+        let commit_ranks: Vec<CostNode> = if self.commit.is_empty() {
+            Vec::new()
+        } else {
+            self.drafts
+                .iter()
+                .map(|_| {
+                    CostNode::Sum(
+                        self.commit
+                            .iter()
+                            .map(|op| op.compile(&mut builder))
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
         let mut drafts: Vec<CostNode> = self
             .drafts
             .iter()
@@ -165,42 +216,44 @@ impl<T: Glm53FlashVerifyTarget> Glm53FlashVllmNvfp4Dflash2Model<T> {
             }
         };
         let width = self.draft_tokens + 1;
+        let mut stages = vec![CostNode::Labeled {
+            label: format!("target verify [{width} query rows per resident request]"),
+            child: Box::new(target),
+        }];
+        if !commit_ranks.is_empty() {
+            stages.push(CostNode::Labeled {
+                label: format!(
+                    "kda recoverssm commit [{} KDA cache group call(s); Max over attention DP \
+                     ranks]",
+                    self.commit.len()
+                ),
+                child: Box::new(CostNode::Max {
+                    overlap: 1.0,
+                    children: commit_ranks,
+                }),
+            });
+        }
+        stages.push(CostNode::Labeled {
+            label: "dflash2 proposer [Max over attention DP ranks]".to_string(),
+            child: Box::new(draft),
+        });
         builder.finish(CostNode::Labeled {
             label: format!(
-                "GLM-5.3-Flash NVFP4 + DFlash2 [draft_tokens={}; verify width={width}; \
-                 {} draft rank(s)]",
+                "{} + DFlash2 [draft_tokens={}; verify width={width}; {} draft rank(s)]",
+                T::MODEL,
                 self.draft_tokens,
                 self.drafts.len()
             ),
-            child: Box::new(CostNode::Sum(vec![
-                CostNode::Labeled {
-                    label: format!("target verify [{width} query rows per resident request]"),
-                    child: Box::new(target),
-                },
-                CostNode::Labeled {
-                    label: format!(
-                        "kda recoverssm commit [{} KDA cache group call(s); Max over attention DP \
-                         ranks]",
-                        self.commit.len()
-                    ),
-                    child: Box::new(CostNode::Max {
-                        overlap: 1.0,
-                        children: commit_ranks,
-                    }),
-                },
-                CostNode::Labeled {
-                    label: "dflash2 proposer [Max over attention DP ranks]".to_string(),
-                    child: Box::new(draft),
-                },
-            ])),
+            child: Box::new(CostNode::Sum(stages)),
         })
     }
 
     fn eval_into(&self, input: &SpeculativeArchInput, ev: &mut Evaluator) {
         self.check_input(input).unwrap_or_else(|reason| {
-            panic!("invalid Glm53FlashVllmNvfp4Dflash2Model input: {reason}")
+            panic!("invalid Dflash2VerifyModel input: {reason}")
         });
         self.target.eval_target(&verify_batch(input), ev);
+        // A target without KDA commits nothing, so this pushes no slot.
         for group in &input.groups {
             let requests = group.decode_requests.len() as u32;
             let committed: u32 = group.decode_requests.iter().map(|d| d.committed_rows).sum();
@@ -282,7 +335,7 @@ fn verify_batch(input: &SpeculativeArchInput) -> UnifiedArchInput {
     }
 }
 
-impl<T: Glm53FlashVerifyTarget> SpeculativeUnifiedModel for Glm53FlashVllmNvfp4Dflash2Model<T> {
+impl<T: Dflash2VerifyTarget> SpeculativeUnifiedModel for Dflash2VerifyModel<T> {
     fn check_input(&self, batch: &SpeculativeArchInput) -> Result<(), String> {
         if batch.draft_tokens != self.draft_tokens {
             return Err(format!(
@@ -322,7 +375,7 @@ impl<T: Glm53FlashVerifyTarget> SpeculativeUnifiedModel for Glm53FlashVllmNvfp4D
     }
 
     fn total_kv_bytes_per_token(&self) -> u64 {
-        self.target.total_kv_bytes_per_token()
+        self.target.total_kv_bytes_per_token() + self.draft_kv_bytes_per_token
     }
 
     fn recurrent_state_bytes_per_request(&self) -> u64 {
@@ -385,16 +438,18 @@ impl<T: Glm53FlashVerifyTarget> SpeculativeUnifiedModel for Glm53FlashVllmNvfp4D
     }
 }
 
-/// Wrap a built Flash `target` with one DFlash2 proposer per attention DP group,
-/// holding `draft.sliding_window` tokens of the draft's KV per request.
-pub fn build<T: Glm53FlashVerifyTarget>(
+/// Wrap a built `target` with one DFlash2 proposer per attention DP group. The
+/// draft's KV is `draft.sliding_window` tokens per request beside a recurrent
+/// target, and full attention per context token beside an all-attention one
+/// (see the module docs).
+pub fn build<T: Dflash2VerifyTarget>(
     name: &str,
     target: T,
     max_model_len: u32,
     draft_tokens: u32,
     draft: &Dflash2DraftResolved,
     bridge: &PerfApiBridge,
-) -> Result<Glm53FlashVllmNvfp4Dflash2Model<T>, BuildError> {
+) -> Result<Dflash2VerifyModel<T>, BuildError> {
     if draft_tokens == 0 || target.verify_width() != draft_tokens + 1 {
         return Err(BuildError::FitFailed {
             kind: ARCH_KIND,
@@ -405,15 +460,28 @@ pub fn build<T: Glm53FlashVerifyTarget>(
             ),
         });
     }
-    let plan = target.kda_commit().ok_or_else(|| BuildError::FitFailed {
-        kind: ARCH_KIND,
-        reason: "the verify target compiled no RecoverSSM commit plan".to_string(),
-    })?;
+    // KDA layers are exactly what needs a commit, and exactly what keeps vLLM
+    // from paging the draft's window layers as full attention.
+    let recurrent = target.recurrent_state_bytes_per_request() > 0;
+    let plan = match (target.kda_commit(), recurrent) {
+        (Some(plan), true) => Some(plan),
+        (None, false) => None,
+        (plan, _) => {
+            return Err(BuildError::FitFailed {
+                kind: ARCH_KIND,
+                reason: format!(
+                    "a verify target {} recurrent state compiled {} RecoverSSM commit plan",
+                    if recurrent { "with" } else { "without" },
+                    if plan.is_some() { "a" } else { "no" }
+                ),
+            })
+        }
+    };
     let commit = plan
-        .cache_group_layers
-        .iter()
+        .into_iter()
+        .flat_map(|plan| plan.cache_group_layers.iter().map(move |layers| (plan, layers)))
         .enumerate()
-        .map(|(index, &layers)| {
+        .map(|(index, (plan, &layers))| {
             let verify = &plan.verify;
             atomic(
                 name,
@@ -437,19 +505,26 @@ pub fn build<T: Glm53FlashVerifyTarget>(
     let drafts = (0..groups)
         .map(|_| Dflash2DraftStage::build(format!("{name}.dflash2"), draft, bridge))
         .collect::<Result<Vec<_>, _>>()?;
-    let draft_kv_bytes_per_request = draft_kv_bytes_per_token(draft)?
-        .checked_mul(u64::from(draft.sliding_window))
-        .ok_or_else(|| BuildError::FitFailed {
-            kind: ARCH_KIND,
-            reason: "DFlash2 draft window KV overflows u64".to_string(),
-        })?;
-    let mut model = Glm53FlashVllmNvfp4Dflash2Model {
+    let draft_per_token = draft_kv_bytes_per_token(draft)?;
+    let (draft_kv_bytes_per_request, draft_kv_bytes_per_token) = if recurrent {
+        let window = draft_per_token
+            .checked_mul(u64::from(draft.sliding_window))
+            .ok_or_else(|| BuildError::FitFailed {
+                kind: ARCH_KIND,
+                reason: "DFlash2 draft window KV overflows u64".to_string(),
+            })?;
+        (window, 0)
+    } else {
+        (0, draft_per_token)
+    };
+    let mut model = Dflash2VerifyModel {
         target,
         commit,
         drafts,
         draft_tokens,
         max_model_len,
         draft_kv_bytes_per_request,
+        draft_kv_bytes_per_token,
         cost_flat: Vec::new(),
         n_slots: 0,
     };

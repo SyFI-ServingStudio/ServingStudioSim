@@ -89,10 +89,10 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
-    let balance = if num_partitions == 1 {
-        LoadBalance::Single
-    } else {
-        LoadBalance::RoundRobin { next: 0 }
+    let balance = match (num_partitions, config.dp_placement) {
+        (1, _) => LoadBalance::Single,
+        (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },
+        (_, DpPlacement::VllmLeastLoaded) => LoadBalance::LeastLoaded { next: 0 },
     };
     let admission = ChunkedPrefillAdmission::with_decode_completion(
         (0..num_partitions)

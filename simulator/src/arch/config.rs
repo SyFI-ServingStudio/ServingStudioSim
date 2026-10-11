@@ -657,6 +657,60 @@ pub enum IterArchSel {
         #[param(cache_key)]
         token_corpus_file: Option<String>,
     },
+    /// [`Self::Glm52VllmNvfp4DpAttnDsaMoe`] (the GLM-5.3 NVFP4 graph under vLLM
+    /// data-parallel attention and expert-parallel MoE, TP1 per rank) verifying
+    /// a DFlash2 proposer's drafts, one TP1 proposer per attention DP rank. See
+    /// [`Self::Glm53VllmNvfp4DsaMoeDflash2`]. No KDA, so nothing is committed
+    /// after a verify, and the draft's KV is full attention per token as there.
+    Glm53VllmNvfp4DpAttnEpMoeDflash2 {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Data-parallel attention ranks, which are also the expert-parallel
+        /// group: one GPU each.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        nvl_num_gpu: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity. Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token target expert routes from a `token_corpus` pass,
+        /// as a manifest path. Requires `routing = corpus`. Only the body
+        /// slice is read, grouped by the verify width.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM's CUDA-graph capture sizes, as for
+        /// [`Self::Glm52VllmNvfp4DpAttnDsaMoe`]: counted in tokens, so a
+        /// verify step pads its `requests * (draft_tokens + 1)` rows.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// Candidate positions drafted per request per iteration: at most the
+        /// draft checkpoint's `block_size - 1` (7). The speculative worker's
+        /// `draft_tokens` must match.
+        #[serde(default = "default_dflash2_draft_tokens")]
+        #[param(default = 7, cache_key)]
+        draft_tokens: u32,
+        /// The draft's own attention window. It caps the context each draft
+        /// query attends to, not the draft's KV (see
+        /// [`Self::Glm53VllmNvfp4DsaMoeDflash2`]).
+        #[serde(default = "default_dflash2_sliding_window")]
+        #[param(default = 2048, cache_key)]
+        draft_sliding_window: u32,
+    },
     /// GLM-5.3-Flash FP8 block checkpoint on B200 through the vLLM fork: 34 KDA
     /// + 11 DSA (kpool indexer) layers, 3 dense + 42 MoE FFNs, 4-wide mHC. One
     /// tensor-parallel rank group whose routed experts are either expert- or
@@ -1136,6 +1190,7 @@ impl IterArchSel {
             | Self::Glm52VllmNvfp4DpAttnDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { model, .. }
+            | Self::Glm53VllmNvfp4DpAttnEpMoeDflash2 { model, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { model, .. }
             | Self::Glm53FlashVllmFp8PpKdaDsaMoe { model, .. }
             | Self::Glm53FlashVllmFp8DpAttnEpMoe { model, .. }
@@ -1159,6 +1214,7 @@ impl IterArchSel {
             | Self::Glm52VllmNvfp4DpAttnDsaMoe { max_model_len, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { max_model_len, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { max_model_len, .. }
+            | Self::Glm53VllmNvfp4DpAttnEpMoeDflash2 { max_model_len, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { max_model_len, .. }
             | Self::Glm53FlashVllmFp8PpKdaDsaMoe { max_model_len, .. }
             | Self::Glm53FlashVllmFp8DpAttnEpMoe { max_model_len, .. }

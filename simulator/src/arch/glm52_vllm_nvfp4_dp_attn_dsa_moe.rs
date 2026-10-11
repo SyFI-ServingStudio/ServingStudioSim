@@ -47,6 +47,15 @@
 //! the padded rows; attention and the lm_head (on the sampled rows only) keep
 //! the real counts. With no capture sizes every step is eager, and an idle
 //! rank's compute is billed as zero (it hides under the busy ranks' `Max`).
+//!
+//! The same graph is the target of a DFlash2 verify
+//! (`glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2`, built through
+//! [`build_verify_configs`]): each decode request then presents
+//! `draft_tokens + 1` rows at its final KV length, the DSA indexer scores them
+//! as one `next_n` group, the lm_head scores every one, and the routed experts
+//! see the request's rows as one verify block. Padding and the dummy batch are
+//! unchanged: they count tokens, and an idle rank's `execute_dummy_batch`
+//! still schedules one.
 
 use std::sync::Arc;
 
@@ -146,6 +155,31 @@ pub fn build_configs(
     body_demand: &ExpertDemand,
     fp8: bool,
 ) -> Result<Glm52VllmNvfp4DpAttnConfigs, BuildError> {
+    build_configs_for(model, parallel, body_demand, fp8, None)
+}
+
+/// The target of a speculative deployment whose proposer is a separate
+/// checkpoint (GLM-5.3's DFlash2): every rank verifies `draft_tokens + 1` rows
+/// per decode request, through the TP/EP graph's
+/// [`build_verify_configs`](ep_graph::build_verify_configs) recipe at TP1.
+/// `body_demand` must group the verify width's rows.
+pub fn build_verify_configs(
+    model: &Glm52ModelCfg,
+    parallel: &Glm52VllmNvfp4DpAttnParallel,
+    body_demand: &ExpertDemand,
+    fp8: bool,
+    draft_tokens: u32,
+) -> Result<Glm52VllmNvfp4DpAttnConfigs, BuildError> {
+    build_configs_for(model, parallel, body_demand, fp8, Some(draft_tokens))
+}
+
+fn build_configs_for(
+    model: &Glm52ModelCfg,
+    parallel: &Glm52VllmNvfp4DpAttnParallel,
+    body_demand: &ExpertDemand,
+    fp8: bool,
+    draft_tokens: Option<u32>,
+) -> Result<Glm52VllmNvfp4DpAttnConfigs, BuildError> {
     // The two collective kernels are measured on 2, 4 and 8 GPUs of one node.
     if !matches!(parallel.ep_size, 2 | 4 | 8) {
         return Err(fit_failed(format!(
@@ -172,19 +206,18 @@ pub fn build_configs(
             "cudagraph_capture_sizes {sizes:?} must be positive, ascending and distinct"
         )));
     }
-    let mut local = ep_graph::build_configs(
-        model,
-        &Glm52VllmNvfp4DsaMoeParallel {
-            ep_size: 1,
-            nvl_num_gpu: 1,
-            max_model_len: parallel.max_model_len,
-            gpu_name: parallel.gpu_name.clone(),
-        },
-        body_demand,
-        None,
-        fp8,
-        Glm52MtpMode::Off,
-    )?;
+    let rank = Glm52VllmNvfp4DsaMoeParallel {
+        ep_size: 1,
+        nvl_num_gpu: 1,
+        max_model_len: parallel.max_model_len,
+        gpu_name: parallel.gpu_name.clone(),
+    };
+    let mut local = match draft_tokens {
+        None => ep_graph::build_configs(model, &rank, body_demand, None, fp8, Glm52MtpMode::Off)?,
+        Some(draft_tokens) => {
+            ep_graph::build_verify_configs(model, &rank, body_demand, fp8, draft_tokens)?
+        }
+    };
     // The modular experts take routing already chosen, so the router runs
     // vLLM's bias top-k on each GPU's own tokens before dispatch.
     local.sparse_router.include_router_select = true;
@@ -490,6 +523,7 @@ fn dp_graph_rows(sorted_capture_sizes: &[u32], collective_tokens: &[u32]) -> Opt
 fn normalize_input(
     input: &UnifiedArchInput,
     ep_size: u16,
+    verify_width: u32,
     max_model_len: u32,
     sorted_capture_sizes: &[u32],
 ) -> Result<DpBatch, String> {
@@ -504,7 +538,7 @@ fn normalize_input(
         .groups
         .iter()
         .enumerate()
-        .map(|(index, group)| normalize_group(index, group, max_model_len))
+        .map(|(index, group)| normalize_group(index, group, verify_width, max_model_len))
         .collect::<Result<Vec<_>, _>>()?;
     if !input.tokens_per_source_rank.is_empty() {
         let expected: Vec<u32> = groups.iter().map(|group| group.batch_tokens).collect();
@@ -558,6 +592,9 @@ pub struct Glm52VllmNvfp4DpAttnDsaMoeModel {
     /// Full vocabulary: a TP1 `ParallelLMHead` shards nothing.
     lm_head: Op<SingleGemmKernel>,
     kv_bytes_per_token: u64,
+    /// Query rows each decode request presents: 1, or `draft_tokens + 1` for
+    /// the target of a DFlash2 verify.
+    verify_width: u32,
     cudagraph_capture_sizes: Vec<u32>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
@@ -575,11 +612,18 @@ pub fn build(
             recipe.parallel.ep_size, recipe.parallel.nvl_num_gpu
         )));
     }
-    if recipe.mtp_mode != Glm52MtpMode::Off || recipe.speculative_draft_tokens.is_some() {
-        return Err(fit_failed(
-            "data-parallel attention runs neither the MTP layer nor a speculative verify",
-        ));
+    // A verify is supported only for a proposer outside this graph: the MTP
+    // layer's draft passes are not modeled under data-parallel attention.
+    if recipe.mtp_mode != Glm52MtpMode::Off {
+        return Err(fit_failed("data-parallel attention does not run the MTP layer"));
     }
+    let verify_width = match recipe.speculative_draft_tokens {
+        None => 1,
+        Some(draft_tokens) => draft_tokens
+            .checked_add(1)
+            .filter(|&width| width > 1)
+            .ok_or_else(|| fit_failed("speculative draft_tokens must be in 1..u32::MAX"))?,
+    };
     let ep_size = resolved.parallel.ep_size;
     if resolved.routed_experts.len() != usize::from(ep_size)
         || resolved.dispatch.num_gpus != u32::from(ep_size)
@@ -641,6 +685,7 @@ pub fn build(
         name,
         ep_size,
         max_model_len: recipe.parallel.max_model_len,
+        verify_width,
         cudagraph_capture_sizes: resolved.parallel.cudagraph_capture_sizes.clone(),
         cost_flat: Vec::new(),
         n_slots: 0,
@@ -656,6 +701,10 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
         self.ep_size
     }
 
+    pub fn verify_width(&self) -> u32 {
+        self.verify_width
+    }
+
     fn per_rank(
         &self,
         builder: &mut CostTreeBuilder,
@@ -666,9 +715,16 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
 
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
+        let root = self.compile_root(&mut builder);
+        builder.finish(root)
+    }
+
+    /// The whole graph as one node of `builder`, so a speculative model can
+    /// compile it beside its proposer. Slots are declared in `eval_into` order.
+    pub(crate) fn compile_root(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let embedding = labeled_max(
             format!("{}.main.embedding [Max over DP ranks]", self.name),
-            self.per_rank(&mut builder, |b| self.embedding.compile(b)),
+            self.per_rank(builder, |b| self.embedding.compile(b)),
         );
         let dense = CostNode::Labeled {
             label: "layers 0..2: dense + full index (3 layers) [Max over DP ranks]".to_string(),
@@ -676,7 +732,7 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
                 n: NUM_DENSE_LAYERS,
                 child: Box::new(CostNode::Max {
                     overlap: 1.0,
-                    children: self.per_rank(&mut builder, |b| {
+                    children: self.per_rank(builder, |b| {
                         CostNode::Sum(vec![
                             self.dense_attention.compile(b),
                             self.dense_ffn.compile(b),
@@ -689,7 +745,7 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
             label: "layers 3..5: sparse + IndexShare (3 layers)".to_string(),
             child: Box::new(CostNode::Scale {
                 n: NUM_INITIAL_SHARED_LAYERS,
-                child: Box::new(self.initial_shared.compile(&mut builder)),
+                child: Box::new(self.initial_shared.compile(builder)),
             }),
         };
         let cycle = CostNode::Labeled {
@@ -697,10 +753,10 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
             child: Box::new(CostNode::Scale {
                 n: NUM_SPARSE_CYCLES,
                 child: Box::new(CostNode::Sum(vec![
-                    self.cycle_full.compile(&mut builder),
+                    self.cycle_full.compile(builder),
                     CostNode::Scale {
                         n: NUM_SHARED_PER_CYCLE,
-                        child: Box::new(self.cycle_shared.compile(&mut builder)),
+                        child: Box::new(self.cycle_shared.compile(builder)),
                     },
                 ])),
             }),
@@ -710,15 +766,16 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
                 "{}.main output head [Max over DP ranks: final residual RMSNorm -> full-vocab lm_head]",
                 self.name
             ),
-            self.per_rank(&mut builder, |b| {
+            self.per_rank(builder, |b| {
                 CostNode::Sum(vec![self.final_norm.compile(b), self.lm_head.compile(b)])
             }),
         );
-        let root = CostNode::Labeled {
+        CostNode::Labeled {
             label: format!(
                 "{} (Glm52VllmNvfp4DpAttnDsaMoeModel) [DP attention x{n} at TP1; EP{n} NVFP4 MoE; \
-                 timing_context<={}]",
+                 {} query row(s) per decode request; timing_context<={}]",
                 self.name,
+                self.verify_width,
                 self.max_model_len,
                 n = self.ep_size
             ),
@@ -729,18 +786,23 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
                 cycle,
                 head,
             ])),
-        };
-        builder.finish(root)
+        }
     }
 
     fn normalize(&self, input: &UnifiedArchInput) -> DpBatch {
         normalize_input(
             input,
             self.ep_size,
+            self.verify_width,
             self.max_model_len,
             &self.cudagraph_capture_sizes,
         )
         .unwrap_or_else(|reason| panic!("invalid Glm52VllmNvfp4DpAttnDsaMoeModel input: {reason}"))
+    }
+
+    /// Fill the slots of [`Self::compile_root`] for one iteration.
+    pub(crate) fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
+        self.eval_normalized(&self.normalize(input), ev);
     }
 
     fn eval_normalized(&self, batch: &DpBatch, ev: &mut Evaluator) {
@@ -788,6 +850,7 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4DpAttnDsaMoeModel {
         normalize_input(
             batch,
             self.ep_size,
+            self.verify_width,
             self.max_model_len,
             &self.cudagraph_capture_sizes,
         )
@@ -951,6 +1014,19 @@ mod tests {
         }
     }
 
+    /// A verify group: each decode request presents `width` rows.
+    fn verify_group(decode: &[u32], width: u32) -> ArchGroupInput {
+        let decode_tokens = decode.len() as u32 * width;
+        ArchGroupInput {
+            batch_tokens: decode_tokens,
+            prefill_tokens: 0,
+            decode_tokens,
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: decode.to_vec(),
+            total_kv_len: decode.iter().map(|&kv| kv.saturating_sub(width)).sum(),
+        }
+    }
+
     fn input(groups: Vec<ArchGroupInput>) -> UnifiedArchInput {
         UnifiedArchInput {
             tokens_per_source_rank: groups.iter().map(|group| group.batch_tokens).collect(),
@@ -1110,6 +1186,7 @@ mod tests {
                 group(&[], &[]),
             ]),
             4,
+            1,
             131_072,
             &[],
         )
@@ -1119,7 +1196,7 @@ mod tests {
         assert_eq!(busy.gathered_tokens, 6_148);
         assert_eq!(busy.groups[2].batch_tokens, 2_050);
 
-        let idle = normalize_input(&input(vec![group(&[], &[]); 4]), 4, 131_072, &[]).unwrap();
+        let idle = normalize_input(&input(vec![group(&[], &[]); 4]), 4, 1, 131_072, &[]).unwrap();
         assert_eq!(idle.collective_tokens, vec![0; 4]);
         assert_eq!(idle.gathered_tokens, 0);
     }
@@ -1131,7 +1208,7 @@ mod tests {
         assert_eq!(sizes[..5], [1, 2, 4, 8, 16]);
         assert_eq!(sizes.last(), Some(&2_048));
         let step = |groups: Vec<ArchGroupInput>| {
-            normalize_input(&input(groups), 4, 131_072, &sizes).unwrap()
+            normalize_input(&input(groups), 4, 1, 131_072, &sizes).unwrap()
         };
 
         // One 1000-token prompt: the busy rank's graph is 1008, and the three
@@ -1182,6 +1259,77 @@ mod tests {
         let idle = step(vec![group(&[], &[]); 4]);
         assert_eq!(idle.rows, vec![0; 4]);
         assert_eq!(idle.gathered_tokens, 0);
+    }
+
+    /// Catches a verify target that bills a request's `k + 1` rows as `k + 1`
+    /// requests, scores only one logit per request, or pads the request count
+    /// rather than its rows.
+    #[test]
+    fn a_verify_step_lowers_each_request_once_with_its_rows() {
+        let sizes = vllm_capture_sizes(2_048);
+        let batch = normalize_input(
+            &input(vec![
+                verify_group(&[100, 2_000, 300], 4),
+                verify_group(&[50], 4),
+                group(&[], &[]),
+                verify_group(&[], 4),
+            ]),
+            4,
+            4,
+            131_072,
+            &sizes,
+        )
+        .unwrap();
+        let busy = &batch.groups[0];
+        assert_eq!(busy.batch_tokens, 12);
+        assert_eq!(busy.request_count, 3);
+        assert_eq!(busy.logits_rows, 12);
+        assert_eq!(busy.endpoint_context_lens, vec![100, 2_000, 300]);
+        let decode = busy.attention_input.decode.as_ref().unwrap();
+        assert_eq!(busy.attention_input.num_new_tokens, 12);
+        assert_eq!(decode.batch_size, 3);
+        assert_eq!(decode.context_len, 2_000);
+        // Twelve rows replay the 16-token graph on every rank.
+        assert_eq!(batch.rows, vec![16; 4]);
+        assert_eq!(batch.collective_tokens, vec![16; 4]);
+        assert_eq!(batch.gathered_tokens, 64);
+
+        let ragged = |group: ArchGroupInput| {
+            normalize_input(&input(vec![group; 4]), 4, 4, 131_072, &sizes).is_err()
+        };
+        // A decode request must present exactly the verify width ...
+        assert!(ragged(group(&[], &[100, 200])));
+        // ... at a context that holds it.
+        assert!(ragged(verify_group(&[3], 4)));
+    }
+
+    #[test]
+    fn a_verify_target_compiles_the_same_leaves_at_its_width() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let cfgs = build_verify_configs(
+            &model_cfg("glm52_nvfp4"),
+            &parallel(8),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(256), 4),
+            false,
+            3,
+        )
+        .unwrap();
+        assert_eq!(cfgs.local.speculative_draft_tokens, Some(3));
+        for attention in [
+            &cfgs.local.dense_full_index_attention,
+            &cfgs.local.initial_shared_attention,
+            &cfgs.local.cycle_full_attention,
+            &cfgs.local.cycle_shared_attention,
+        ] {
+            assert_eq!(attention.decode_next_n, 4);
+        }
+        assert!(cfgs.local.mtp_attention.is_none());
+        let model = build("unified".to_string(), resolve_configs(&cfgs), &bridge).unwrap();
+        assert_eq!(model.verify_width(), 4);
+        assert_eq!(model.n_slots, expected_slot_count(8));
+        assert_eq!(model.total_kv_bytes_per_token(), 55_224);
+        assert_eq!(built("glm52_nvfp4", 8).verify_width(), 1);
     }
 
     #[test]
