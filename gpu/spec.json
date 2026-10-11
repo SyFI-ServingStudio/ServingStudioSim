@@ -192,7 +192,15 @@
       "interconnect": "NVLink 4.0",
       "interconnect_bandwidth_gbps": 900,
       "nvl_domain_size": 8,
-      "dollar_per_hour": 4.33
+      "dollar_per_hour": 4.33,
+      "sustained": {
+        "tflops": {
+          "bf16": 694,
+          "fp16": 104,
+          "fp8_e4m3": 1090
+        },
+        "copy_gbps": 4307
+      }
     },
     {
       "name": "B200-SXM-180GB",
