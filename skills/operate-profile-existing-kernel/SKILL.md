@@ -160,6 +160,35 @@ will profile on top of someone else's job, so use it only for GPUs you know are
 yours. Note again that `--gpu-name` is a profile.db key/filter, **not** a device
 selector — it neither adds nor removes hardware from the pool.
 
+### Workers run in their env's image
+
+Each worker runs in the image `profiling/container/images.py` assigns to its
+backend's profile env (`subprocess_env`, default `default_env`), here and on a
+remote. When that image is not built on this host, the run fails with
+"build it with `python -m profiling.container.images build <name>`". Report that;
+building is `just profile-container-build <name>` (tens of GB, tens of minutes),
+so ask before starting it. `VIBESIM_PROFILE_RUNTIME=host` runs on host
+interpreters instead. It exists for debugging a runner, not for producing rows.
+`profiling/container/README.md` lists the images.
+
+### On a remote GPU host: `--remote NAME`
+
+`kernel-profile run|measure ... --remote NAME` runs the same call on a machine
+from the untracked `remote.yaml` (`remote.example.yaml` lists the fields). Use
+it when the user asks, or when the target GPU (`--gpu-name`) is only available
+there. Run from the checkout root. The output directory must be under `logs/`
+(`run` requires `--output-dir`); `--db` is refused. The remote needs only docker with the NVIDIA runtime:
+the image is sent from here when it lacks it, so it must be built here first.
+The first send of an image is 30–40 GB and takes minutes; later calls reuse it.
+The job measures into a private profile.db copy, which is merged into this
+checkout's DB when the job finishes (`--fresh` merges nothing). A conflicting
+row merges nothing and leaves the merge report in the output directory: report
+that and do not force it. `remote-run.json` in the output directory records the
+host, the image and its id, and the remote path. A Slurm remote asks for the
+GPUs the specs need, and `--remote-set launch.slurm.time=...` changes the limit
+for one call. Do not create or edit `remote.yaml` or ssh setup unless asked.
+Details: `launcher/README.md`, "Remote execution" (Kernel profiling).
+
 ## The `measure` diagnostic (NVML telemetry, out of the cache path)
 
 `launcher kernel-profile` has a fifth verb, `measure`, that the four cache verbs

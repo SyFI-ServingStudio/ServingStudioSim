@@ -255,6 +255,28 @@ prebuild fails before profiling and names the missing count; check coverage
 first with `--cache-report`. Report that failure; do not drop `--no-gpu`
 without asking.
 
+### On another machine: `--remote NAME`
+
+Append `--remote NAME` to the launch command (step 9) to run it on a machine
+from `remote.yaml` (an untracked file; `remote.example.yaml` lists the fields),
+when the user asks for it or this host's CPUs are not available. The dry run in
+step 8 stays local. Run from the checkout root; the preset and `io.log_dir`
+must be under `logs/`. The command blocks until the results are copied back to
+the same `logs/<experiment-name>/`, relaying remote output with a heartbeat at
+least once a minute; rerunning it resumes on the remote. A managed run is
+registered here, so the Analyzer ID is the same as for a local run.
+
+The remote runs with `--no-gpu --no-plot`: it never profiles, so check
+`--cache-report` first and fill missing rows locally (or with
+`kernel-profile run --remote`), and it renders no PNGs. Copy-back leaves out
+`raw/cost_log/` and `plots/`; the full run stays on the remote, and
+`remote-run.json` in the experiment root records where. Report the remote name
+and that file's remote path. A one-call field change is
+`--remote-set launch.slurm.time=04:00:00`. Do not create or edit `remote.yaml`,
+its ssh keys, or `.remote/known_hosts` unless the user asks; if the named remote
+is missing or ssh fails, stop and report it. Details: `launcher/README.md`,
+"Remote execution".
+
 ## Analysis output
 
 Each finished run is auto-analyzed (best-effort — a failure never fails the run)
