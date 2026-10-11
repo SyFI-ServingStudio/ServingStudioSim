@@ -1605,22 +1605,47 @@ pub(crate) fn normalize_input(
     if total_tokens == 0 {
         return Err("an iteration must carry at least one token".into());
     }
+    let (kda, dsa) = attention_inputs(&group.prefill_chunk_pairs, &group.decode_kv_lens);
     Ok(NormalizedBatch {
         total_tokens,
         request_count: group.request_count(),
-        kda: Glm53KdaAttnLocalWorkletInput {
-            prefill_sequence_lengths: group
-                .prefill_chunk_pairs
-                .iter()
-                .map(|&(_, append)| append)
-                .collect(),
-            decode_batch_size: decode_tokens,
-        },
-        dsa: Glm53DsaAttnLocalWorkletInput {
-            prefill_chunk_pairs: group.prefill_chunk_pairs.clone(),
-            decode_kv_lens: group.decode_kv_lens.clone(),
-        },
+        kda,
+        dsa,
     })
+}
+
+/// The KDA and DSA sublayer inputs for one attention group, with each request
+/// classified the way vLLM's attention metadata does.
+///
+/// `split_decodes_and_prefills` (`vllm/v1/attention/backends/utils.py`) calls a
+/// request a decode when it schedules one query token on top of prior state,
+/// so a one-token append after a cached prefix -- the step an engine runs after
+/// a full prefix hit or a P/D KV transfer -- runs the decode kernels: KDA's
+/// recurrent step instead of pulling the whole batch through `chunk_kda`, and
+/// the DSA decode indexer and sparse MLA.
+pub(crate) fn attention_inputs(
+    prefill_chunk_pairs: &[(u32, u32)],
+    decode_kv_lens: &[u32],
+) -> (Glm53KdaAttnLocalWorkletInput, Glm53DsaAttnLocalWorkletInput) {
+    let mut prefills = Vec::with_capacity(prefill_chunk_pairs.len());
+    let mut decodes = decode_kv_lens.to_vec();
+    for &(prefix, append) in prefill_chunk_pairs {
+        if append == 1 && prefix > 0 {
+            decodes.push(prefix + 1);
+        } else {
+            prefills.push((prefix, append));
+        }
+    }
+    (
+        Glm53KdaAttnLocalWorkletInput {
+            prefill_sequence_lengths: prefills.iter().map(|&(_, append)| append).collect(),
+            decode_batch_size: decodes.len() as u32,
+        },
+        Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: prefills,
+            decode_kv_lens: decodes,
+        },
+    )
 }
 
 pub(crate) fn atomic<K, C, F>(
@@ -2146,6 +2171,18 @@ mod tests {
                 leaf_order(child, out)
             }
         }
+    }
+
+    /// Catches a one-token append after a cached prefix (a full prefix hit or
+    /// a P/D-transferred request) billed as a prefill, which would send the
+    /// whole iteration through `chunk_kda` with a full state gather/scatter.
+    #[test]
+    fn a_one_token_append_after_a_prefix_runs_as_a_decode() {
+        let (kda, dsa) = attention_inputs(&[(70_000, 1), (0, 1), (500, 64)], &[9_000]);
+        assert_eq!(kda.prefill_sequence_lengths, [1, 64]);
+        assert_eq!(kda.decode_batch_size, 2);
+        assert_eq!(dsa.prefill_chunk_pairs, [(0, 1), (500, 64)]);
+        assert_eq!(dsa.decode_kv_lens, [9_000, 70_001]);
     }
 
     #[test]
