@@ -1,33 +1,40 @@
 ---
 name: top-add-kernel
 description: >-
-  Use as the entry point whenever the user asks to add a ServingStudio Sim L1 kernel. This
-  is a top-level orchestrator skill: it does not contain implementation details. Do not pass
-  the whole end-to-end kernel request to an implementer; implementers only
-  receive bounded impl-* subtasks issued from the relevant orchestrator phase.
+  Use as the entry point whenever a ServingStudio Sim L1 kernel is to be added. It
+  sequences two child skills for one kernel: Python profiling, then Rust
+  timing/cache wiring. A kernel is the unit of delegation: an orchestrator hands
+  each kernel over whole, and whoever owns it runs this skill end to end.
 ---
 
 # Top Add Kernel
 
-Use this skill when you are the orchestrator for an end-to-end L1 kernel
-request. Do not implement from this file, and do not treat this file as an
-implementer brief. Use it to enter the two child orchestrator skills in order.
-
-## Delegation Boundary
-
-Stay in the orchestrator role. Read and follow
-`orchestrator-add-kernel-to-python-profile` first. After that phase produces a
-working Python-to-Rust handoff, read and follow
+Use this skill to add one L1 kernel end to end. It holds no implementation
+details: read and follow `orchestrator-add-kernel-to-python-profile` first, and
+after it produces a working Python-to-Rust handoff, read and follow
 `orchestrator-wire-kernel-to-rust`.
 
-Do not ask an implementer to "add the kernel end to end", use this top-level
-skill, choose the orchestration sequence, or own both Python profiling and Rust
-timing/cache wiring.
+## One kernel is one task
 
-Only issue implementer work from inside the relevant child orchestrator phase.
-Each implementer brief must be a narrow leaf task that names the exact `impl-*`
-skill to use and the evidence required for you, the orchestrator, to verify
-completion.
+Whoever owns a kernel runs this skill for it end to end, Python through Rust,
+and works through the child skills' tasks as its own steps. Splitting one kernel
+into a delegation per step turns each step into a round trip and a review, and
+the kernel's owner loses the context the next step needs.
+
+- **Orchestrator of a larger build** (such as `top-add-new-arch`). Take the
+  reuse verdict below, then delegate each kernel whole. The brief names the
+  kernel, the verdict and target kind/backend, its measured share and capture
+  evidence, and the decisions that must come back to you. Review once, at the
+  kernel's closeout: read the diff and the evidence and spot-check the claims
+  that matter.
+- **Kernel owner** (an implementer handed the kernel, or the only agent). Run
+  this skill end to end. Check each step against the child skills' "Things to
+  verify" lists before moving on, and stop at the first check that fails.
+  Return before the closeout only for a decision that is not yours: one the child skills reserve for the user, or
+  anything that would change the verdict you were given.
+
+The child skills speak to "the orchestrator" and say "ask the implementer".
+When you own the kernel, do those steps yourself.
 
 ## Several kernels at once
 
@@ -40,12 +47,13 @@ fans out depends on the role you are in:
 - **Only agent** (nobody above you, nobody below). Launch one subagent per
   kernel, three at a time; each runs this skill end to end for its own kernel.
   Do not walk the list yourself.
-- **Orchestrator.** Hand over **three kernels per brief**, and issue the next
-  brief after that batch closes out. One kernel per brief serializes work that
-  has no ordering constraint; the whole table in one brief hands down a queue
-  the implementer has to bound anyway.
+- **Orchestrator.** Hand over **three whole kernels per brief**, and issue the
+  next brief after that batch closes out. One kernel per brief serializes work
+  that has no ordering constraint; the whole table in one brief hands down a
+  queue the implementer has to bound anyway.
 - **Implementer handed a batch.** Fan out — one subagent per kernel, all three
-  at once. Receiving several kernels is not an instruction to do them in order.
+  at once, each running this skill end to end. Receiving several kernels is not
+  an instruction to do them in order.
 
 Three, not all of them: each agent wants a GPU for its profiling submission and
 its own worktree build, so an unbounded fan-out contends for both and you get
@@ -97,6 +105,6 @@ handoff:
 
 ## Completion
 
-End-to-end kernel work is complete only when both orchestrators have produced
+End-to-end kernel work is complete only when both child skills have produced
 their closeout evidence, or when the user explicitly asks for only the Python
 side or only the Rust side.
