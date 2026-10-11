@@ -2,15 +2,15 @@
 
 The Rust `optimality` subject emits, per aggregation **level** (cluster / pool /
 worker / iteration), telescoping buckets that sum to that level's Real GPU·s:
-`idle | imbalance | batching | communication | kernel_gap | hardware_gap |
-hardware_optimal`.
+`idle | imbalance | batching | communication | kernel_gap | power_gap |
+hardware_gap | hardware_optimal`.
 When the `model.work` labeler floors are available, the single green
 `hardware_optimal` is replaced by a three-step green ramp that sums back to it —
 `excess_over_necessary | fusion | hardware_necessary` (deep green = the irreducible
 global-roofline floor; pale = recoverable weight-reload + activation I/O). The
 draw code is bucket-key driven, so both shapes render from the same loop.
 It also emits a per-kernel array (the balanced Real of each location split into
-batching / communication / kernel_gap / hardware_gap / hardware_optimal).
+batching / communication / kernel_gap / power_gap / hardware_gap / hardware_optimal).
 
 The overview emits four figures with the same horizontal stacked-bar shape aligned to the optimal
 floor (the green `hardware_optimal` segment sits at the left, waste grows
@@ -22,8 +22,9 @@ normalized (every bar scaled to its own Real = 100%) variant:
 * `optimality_kernels.png`   / `_normalized.png` — one bar per kernel (top-N + `other`).
 
 It also emits one `optimality_workers/<worker>_kernel_ladder.png` per worker.
-Each ladder has one bar for every R0–R5 rung, R4a included. Kernel colors persist between bars;
-translucent ribbons track the same kernel as its attributable time shrinks.
+Each ladder has one bar for every R0–R5 rung, R4a and R4b included. Kernel colors
+persist between bars; translucent ribbons track the same kernel as its attributable
+time shrinks.
 R0/R1 append aggregate idle/imbalance chunks because those gaps have no
 per-kernel attribution.
 """
@@ -50,7 +51,8 @@ BUCKET_COLOR = {
     "fusion": "#5FA777",  # medium green — op-segmentation headroom (fuse/overlap)
     "excess_over_necessary": "#ACD9A5",  # pale green — weight reload + activation I/O
     "hardware_gap": "#4C78A8",  # blue — best measured kernel ↔ spec sheet
-    "kernel_gap": "#9ECAE9",  # light blue — this kernel ↔ best measured kernel
+    "power_gap": "#72B7B2",  # teal — sustained (power-capped) ↔ best measured kernel
+    "kernel_gap": "#9ECAE9",  # light blue — this kernel ↔ sustained GEMM / copy
     "communication": "#E45756",  # red — network
     "batching": "#F58518",  # orange — small-batch loss
     "imbalance": "#B279A2",  # purple — straggler
@@ -61,15 +63,23 @@ BUCKET_LABEL = {
     "imbalance": "imbalance (straggler)",
     "batching": "batching (small batch)",
     "communication": "communication (network)",
-    "kernel_gap": "kernel gap (vs best measured GEMM / copy)",
+    "kernel_gap": "kernel gap (vs sustained GEMM / copy)",
+    "power_gap": "power gap (sustained vs best measured)",
     "hardware_gap": "hardware gap (best measured vs spec)",
     "hardware_optimal": "hardware-optimal (irreducible)",
     "excess_over_necessary": "excess (weight reload + activation I/O)",
     "fusion": "fusion headroom (op segmentation)",
     "hardware_necessary": "hardware-necessary (irreducible)",
 }
-# Kernel-level bars carry only the five attributable-to-a-leaf buckets.
-KERNEL_BUCKETS = ["batching", "communication", "kernel_gap", "hardware_gap", "hardware_optimal"]
+# Kernel-level bars carry only the six attributable-to-a-leaf buckets.
+KERNEL_BUCKETS = [
+    "batching",
+    "communication",
+    "kernel_gap",
+    "power_gap",
+    "hardware_gap",
+    "hardware_optimal",
+]
 # Muted categorical colors for kernel identity. The assignment is importance-
 # ordered across the run (largest R2 kernels get the strongest early colors), so
 # charts avoid the arbitrary neon extremes of a continuous rainbow colormap.
@@ -105,7 +115,8 @@ RUNG_LABEL = {
     "balanced": "R2 Balanced",
     "per_config_best": "R3 Per-config best",
     "ignore_network": "R4 Ignore network",
-    "achievable_limit": "R4a Achievable limit",
+    "sustained_limit": "R4a Sustained limit",
+    "achievable_limit": "R4b Achievable peak",
     "hardware_limit": "R5 Hardware limit",
 }
 
@@ -318,6 +329,7 @@ def _render_worker_kernel_ladder(
         "balanced": "balanced",
         "per_config_best": "per_config_best",
         "ignore_network": "ignore_network",
+        "sustained_limit": "sustained_limit",
         "achievable_limit": "achievable_limit",
         "hardware_limit": "hardware_limit",
     }

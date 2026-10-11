@@ -293,8 +293,9 @@ curl -s "$P/cases/0/subjects/optimality-waterfall/payload" | jq '{meta, level: (
 ```
 
 The waterfall's `buckets` are `hardware_optimal`, `hardware_gap` (best measured
-kernel vs spec sheet), `kernel_gap` (this kernel vs the best measured GEMM or
-large copy), `communication`, `imbalance`, `batching` and `idle`, in GPU-seconds. Check
+kernel vs spec sheet), `power_gap` (the rate a GEMM or copy sustains back to back
+under the power limit vs its best measured rate), `kernel_gap` (this kernel vs
+that sustained rate), `communication`, `imbalance`, `batching` and `idle`, in GPU-seconds. Check
 `meta.necessary_work_available` and `meta.caveats` first: when the Analyzer
 cannot label the iteration's necessary work exactly, it estimates it
 (`meta.necessary_work_mode`) and says why in `caveats`; pass that on with the

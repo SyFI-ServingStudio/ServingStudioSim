@@ -1,6 +1,6 @@
 //! Typed kernel-ladder domain and the single worker -> pool -> cluster reducer.
 //!
-//! R0..R5 (with R4a) are additive GPU-second measurements. R6/R7 follow the declared policy:
+//! R0..R5 (with R4a, R4b) are additive GPU-second measurements. R6/R7 follow the declared policy:
 //! batch-locked composition adds rooflines already evaluated at each fixed-batch
 //! boundary, while saturated composition adds (`flops`, `bytes`) and reevaluates
 //! rooflines at the wider scope. Keeping this distinction here prevents a hierarchy
@@ -72,6 +72,7 @@ pub(super) struct LadderRungs {
     pub(super) balanced: f64,
     pub(super) per_config_best: f64,
     pub(super) ignore_network: f64,
+    pub(super) sustained_limit: f64,
     pub(super) achievable_limit: f64,
     pub(super) hardware_limit: f64,
     pub(super) segmented_necessary: Option<f64>,
@@ -86,6 +87,7 @@ impl LadderRungs {
             balanced: ms_to_s(rungs.balanced),
             per_config_best: ms_to_s(rungs.per_config_best),
             ignore_network: ms_to_s(rungs.ignore_network),
+            sustained_limit: ms_to_s(rungs.sustained_limit),
             achievable_limit: ms_to_s(rungs.achievable_limit),
             hardware_limit: ms_to_s(rungs.hardware_limit),
             segmented_necessary: None,
@@ -99,6 +101,7 @@ impl LadderRungs {
         self.balanced += other.balanced;
         self.per_config_best += other.per_config_best;
         self.ignore_network += other.ignore_network;
+        self.sustained_limit += other.sustained_limit;
         self.achievable_limit += other.achievable_limit;
         self.hardware_limit += other.hardware_limit;
     }
@@ -110,6 +113,7 @@ impl LadderRungs {
             "balanced": self.balanced,
             "per_config_best": self.per_config_best,
             "ignore_network": self.ignore_network,
+            "sustained_limit": self.sustained_limit,
             "achievable_limit": self.achievable_limit,
             "hardware_limit": self.hardware_limit,
         });
@@ -163,19 +167,21 @@ pub(super) struct KernelRungs {
     pub(super) balanced: f64,
     pub(super) per_config_best: f64,
     pub(super) ignore_network: f64,
+    pub(super) sustained_limit: f64,
     pub(super) achievable_limit: f64,
     pub(super) hardware_limit: f64,
 }
 
 impl KernelRungs {
-    /// `[R2, R3, R4, R4a, R5]` in GPU·ms, the fold's per-location order.
-    pub(super) fn from_gpu_ms(rungs: [f64; 5]) -> Self {
+    /// `[R2, R3, R4, R4a, R4b, R5]` in GPU·ms, the fold's per-location order.
+    pub(super) fn from_gpu_ms(rungs: [f64; 6]) -> Self {
         Self {
             balanced: ms_to_s(rungs[0]),
             per_config_best: ms_to_s(rungs[1]),
             ignore_network: ms_to_s(rungs[2]),
-            achievable_limit: ms_to_s(rungs[3]),
-            hardware_limit: ms_to_s(rungs[4]),
+            sustained_limit: ms_to_s(rungs[3]),
+            achievable_limit: ms_to_s(rungs[4]),
+            hardware_limit: ms_to_s(rungs[5]),
         }
     }
 
@@ -183,6 +189,7 @@ impl KernelRungs {
         self.balanced += other.balanced;
         self.per_config_best += other.per_config_best;
         self.ignore_network += other.ignore_network;
+        self.sustained_limit += other.sustained_limit;
         self.achievable_limit += other.achievable_limit;
         self.hardware_limit += other.hardware_limit;
     }
@@ -335,6 +342,7 @@ impl KernelContribution {
             "balanced": self.rungs.balanced,
             "per_config_best": self.rungs.per_config_best,
             "ignore_network": self.rungs.ignore_network,
+            "sustained_limit": self.rungs.sustained_limit,
             "achievable_limit": self.rungs.achievable_limit,
             "hardware_limit": self.rungs.hardware_limit,
         });
@@ -638,6 +646,14 @@ impl KernelLadder {
                 self.rungs.ignore_network,
             ),
             (
+                "sustained_limit",
+                self.kernels
+                    .iter()
+                    .map(|kernel| kernel.rungs.sustained_limit)
+                    .sum::<f64>(),
+                self.rungs.sustained_limit,
+            ),
+            (
                 "achievable_limit",
                 self.kernels
                     .iter()
@@ -722,6 +738,7 @@ mod tests {
                 balanced,
                 per_config_best: balanced,
                 ignore_network: balanced,
+                sustained_limit: balanced,
                 achievable_limit: balanced,
                 hardware_limit: balanced,
             },
@@ -754,6 +771,7 @@ mod tests {
                 balanced,
                 per_config_best: balanced,
                 ignore_network: balanced,
+                sustained_limit: balanced,
                 achievable_limit: balanced,
                 hardware_limit: balanced,
                 ..LadderRungs::default()

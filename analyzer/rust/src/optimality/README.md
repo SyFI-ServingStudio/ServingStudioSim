@@ -13,7 +13,8 @@ each successive gap is an attributable source of sub-optimality:
 | R2 Balanced        | real times, rank `Max`→mean, stream `Parallel` kept | **imbalance** (DP/EP straggler) |
 | R3 per-config best | unlocked: selected grid-peak throughput; locked: R2 unchanged | **batching** |
 | R4 ignore network  | R3, comm leaves → 0  | **communication** |
-| R4a achievable limit | active regime's work unit / best measured `single_gemm` (same dtype class) or ≥1 GiB copy | **kernel gap** |
+| R4a sustained limit | active regime's work unit / back-to-back GEMM (same dtype class) or large-copy rate from `gpu/spec.json` `sustained` | **kernel gap** |
+| R4b achievable peak | active regime's work unit / best measured `single_gemm` (same dtype class) or ≥1 GiB copy | **power gap** (power-capped clocks) |
 | R5 hardware limit  | active regime's work unit / matching GPU-spec peak | **hardware gap** (best measured ↔ spec) |
 | R6 segmented necessary | sum of per-location semantic rooflines | **redundant work** |
 | R7 scope-fused necessary | fused semantic roofline within the allowed batch boundary | **fusion** |
@@ -103,7 +104,7 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   per-worker accumulators into named R0..R5 values and rolls them up; `levels_json`
   + `level_entry_json` + `rung_report_json` emit the level/report JSON.
 - `kernel.rs` — the kernel tier. Per-location bars (`kernel_levels_json`, single-leaf so
-  only batching/communication/kernel gap/hw), the report's `worst_batching`, and the
+  only batching/communication/kernel gap/power gap/hw), the report's `worst_batching`, and the
   per-worker kernel rung ladders.
 - `ladder.rs` — typed kernel-ladder/work domain and the sole worker → pool →
   cluster reducer. It serializes at the publication boundary only. Unlocked parents
@@ -114,13 +115,15 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   batched `kernel-query peak` call (including maximum grid arithmetic intensity,
   used with the GPU ridge point to select one throughput basis), caches it as
   `raw/kernel_grid_peaks.json`. Absent + un-generatable → R3 = R2 with a caveat.
-- `achievable.rs` — the R4a ceiling. Runs `python -m profiling.db.achievable` once
+- `achievable.rs` — the R4b ceiling. Runs `python -m profiling.db.achievable` once
   in the owning checkout for the run's GPU (best `single_gemm` TFLOP/s per dtype,
   best elementwise copy GB/s at ≥1 GiB, outliers excluded) and caches it as
   `raw/achievable_peaks.json`, keyed by GPU name. `prepare.rs` caps each rate at
-  the spec peak, so R5 is unchanged. Absent → R4a = R4 with a caveat; the exact-
+  the spec peak, so R5 is unchanged. Absent → R4b = R4a with a caveat; the exact-
   iteration service path reads the cached sidecar only.
-- `spec.rs` — the R5 hardware ceilings. `DtypeClass` also keys R4a's GEMM peaks. Resolves the run's `gpu_name` to a `gpu/spec.json`
+- `spec.rs` — the R5 hardware ceilings and the entry's `sustained` rates for R4a
+  (measured by `gpu/measure_sustained.py`; absent → R4a = R4b with a caveat).
+  `DtypeClass` also keys R4a's and R4b's GEMM rates. Resolves the run's `gpu_name` to a `gpu/spec.json`
   entry by its explicit `aliases`, then dense peak TFLOP/s by dtype + HBM GB/s.
 - `floors.rs` — bridge to the independent `model.work` labeler. One batched call computes
   unlocked per-level/saturated-worker labels or deduplicated fixed-iteration labels;
@@ -195,6 +198,7 @@ reported under a subtree label.
   `optimality_batch_locked_waterfall.json`. A normal analyzer invocation generates
   both whenever optimality is selected; `--lock-batch-size` recomputes only the
   locked variant. Exact iteration requests carry the mode explicitly.
-- R4a and R5 use the active regime: unlocked analysis reuses the R3 grid
+- R4a, R4b and R5 use the active regime: unlocked analysis reuses the R3 grid
   classification; locked analysis uses the current-point classification. R4a is
-  `min(R4 leaf, work / achievable rate)` and R5 `min(R4a leaf, work / spec peak)`.
+  `min(R4 leaf, work / sustained rate)`, R4b `min(R4a leaf, work / achievable rate)`
+  and R5 `min(R4b leaf, work / spec peak)`.

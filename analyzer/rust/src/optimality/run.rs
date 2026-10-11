@@ -132,13 +132,19 @@ pub async fn run_optimality(
         ));
     }
 
-    // R4a reads the run GPU's best measured GEMM / large-copy rates; it does not
+    // R4b reads the run GPU's best measured GEMM / large-copy rates; it does not
     // depend on the batching assumption, so both modes load it.
     let achievable_peaks = achievable::load_or_generate(log_dir, &gpu_name);
     if achievable_peaks.is_empty() {
         caveats.push(format!(
-            "achievable peaks {}: R4a achievable limit collapses onto R4 (kernel gap = 0)",
+            "achievable peaks {}: R4b achievable peak collapses onto R4a",
             achievable_peaks.source
+        ));
+    }
+    if !gpu_spec.has_sustained() {
+        caveats.push(format!(
+            "gpu/spec.json has no sustained rates for {gpu_name:?}: R4a sustained limit \
+             collapses onto R4b (power gap = 0; run gpu/measure_sustained.py)"
         ));
     }
 
@@ -196,7 +202,7 @@ pub async fn run_optimality(
 
     // Sampled fold for R2..R5 + per-(location, worker) raw contributions.
     let sample_stride = fold::choose_stride(ctx).await?;
-    let mut sampled_rungs_by_location_worker: HashMap<(u32, usize), [f64; 5]> = HashMap::new();
+    let mut sampled_rungs_by_location_worker: HashMap<(u32, usize), [f64; 6]> = HashMap::new();
     let sampled_row_count = fold::accumulate_fold(
         ctx,
         sample_stride,
@@ -360,6 +366,7 @@ pub async fn run_optimality(
         "gpu_spec_matched": gpu_spec_matched,
         "peaks_source": grid_peak_catalog.source,
         "achievable_peaks": achievable_peaks.meta_json(),
+        "sustained_rates_available": gpu_spec.has_sustained(),
         "sample_stride": sample_stride,
         "sampled_rows": sampled_row_count,
         "gpu_counts_available": has_worker_gpu_counts,
@@ -446,7 +453,7 @@ fn definitions(lock_batch_size: bool) -> Value {
     } else {
         "model/work labeler bounds below R5: segmented necessary work sums per-location rooflines; scope-fused necessary work adds FLOPs/bytes first and applies one roofline at that scope"
     };
-    let buckets = "idle, imbalance, batching, communication, kernel_gap, hardware_gap, then R5 split into excess_over_necessary, fusion, hardware_necessary when labeler bounds are available; sum to Real";
+    let buckets = "idle, imbalance, batching, communication, kernel_gap, power_gap, hardware_gap, then R5 split into excess_over_necessary, fusion, hardware_necessary when labeler bounds are available; sum to Real";
     json!({
         "scope": "per-worker CostTree manifest re-folded with per-rung leaf substitutions; \
                   unit GPU-seconds = wall time × the worker's run_meta gpu_ids count",
@@ -456,7 +463,8 @@ fn definitions(lock_batch_size: bool) -> Value {
             "balanced": "real slot times, Max folded to mean — perfect load balance; gap = imbalance",
             "per_config_best": per_config_best,
             "ignore_network": "per_config_best with comm leaves dropped; gap = communication",
-            "achievable_limit": "R4a: active compute work / the best measured single_gemm TFLOP/s of the leaf's dtype class, or active memory work / the best measured elementwise copy GB/s at >= 1 GiB, each capped at the spec peak; same regime as hardware_limit; gap vs ignore_network = kernel_gap",
+            "sustained_limit": "R4a: active compute work / the back-to-back (power-capped) GEMM TFLOP/s of the leaf's dtype class, or active memory work / the back-to-back large-copy GB/s, from gpu/spec.json sustained; capped at achievable_limit's rate; same regime as hardware_limit; gap vs ignore_network = kernel_gap",
+            "achievable_limit": "R4b: active compute work / the best measured single_gemm TFLOP/s of the leaf's dtype class, or active memory work / the best measured elementwise copy GB/s at >= 1 GiB, each capped at the spec peak; gap vs sustained_limit = power_gap (short profiled kernels hold clocks a continuous workload cannot)",
             "hardware_limit": "active compute or memory work unit / matching gpu-spec peak; unlocked reuses the R3 grid regime, locked uses each current operating point; gap vs achievable_limit = hardware_gap (best measured kernel vs spec sheet)",
             "necessary_work": necessary_work,
         },

@@ -149,6 +149,7 @@ def measure_kernel(
     telemetry_hz: float = 20.0,
     clear_l2: bool = True,
     telemetry: bool = True,
+    cuda_graph: bool = False,
 ):
     """Cache-free trend+telemetry diagnostic for one CUPTI kernel spec.
 
@@ -169,6 +170,7 @@ def measure_kernel(
         telemetry_hz=telemetry_hz,
         clear_l2=clear_l2,
         telemetry=telemetry,
+        cuda_graph=cuda_graph,
     )
 
 
