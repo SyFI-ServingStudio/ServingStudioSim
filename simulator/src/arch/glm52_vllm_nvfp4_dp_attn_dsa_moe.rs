@@ -748,9 +748,10 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
         }
         let layers = u64::from(ep_graph::NUM_LAYERS);
         let latent_bytes_per_token = layers * ep_graph::mla_latent_bytes_per_layer_token();
-        // A token's indexer keys stay on the GPU; vLLM's pool allocates them on
-        // all 78 layers, IndexShare layers included, and this keeps that count.
-        self.kv_bytes_per_token = layers * ep_graph::index_key_bytes_per_layer_token();
+        // A token's indexer keys stay on the GPU: one per full-index layer
+        // (IndexShare layers build no indexer and cache no key).
+        let index_layers = ep_graph::FULL_INDEX_LAYERS.len() as u64;
+        self.kv_bytes_per_token = index_layers * ep_graph::index_key_bytes_per_layer_token();
         self.host_offload = Some(config.kv_host_offload(latent_bytes_per_token, 0, nvl_num_gpu, 1));
         self.hisparse = Some(config);
         self.recompile();
@@ -1201,14 +1202,17 @@ mod tests {
 
     #[test]
     fn each_rank_holds_whole_tokens_of_kv_in_its_own_partition() {
-        assert_eq!(decoder_layer_state_bytes_per_token(), 708);
+        // A full-index layer caches latent + index key, an IndexShare layer the
+        // latent only: 78 * 576 + 21 * 132.
+        assert_eq!(decoder_layer_state_bytes_per_token(0), 708);
+        assert_eq!(decoder_layer_state_bytes_per_token(3), 576);
         for ep_size in [4_u16, 8] {
             let model = built("glm52_nvfp4", ep_size);
             assert_eq!(
                 model.total_kv_bytes_per_token(),
-                u64::from(NUM_LAYERS) * 708
+                u64::from(NUM_LAYERS) * 576 + 21 * 132
             );
-            assert_eq!(model.total_kv_bytes_per_token(), 55_224);
+            assert_eq!(model.total_kv_bytes_per_token(), 47_700);
             assert_eq!(model.gpus_per_replica(), ep_size);
             assert_eq!(model.num_attn_dp_groups(), ep_size);
             assert_eq!(model.num_attn_shards(), 1);
@@ -1217,7 +1221,7 @@ mod tests {
             let attn_kv_bytes: u64 = 45_140_539_392;
             let per_partition = attn_kv_bytes * u64::from(model.num_attn_shards())
                 / model.total_kv_bytes_per_token();
-            assert_eq!(per_partition, 817_408);
+            assert_eq!(per_partition, 946_342);
         }
     }
 
@@ -1228,9 +1232,9 @@ mod tests {
         let model = built("glm52_nvfp4", ep_size)
             .with_hisparse(HisparseConfig::default(), ep_size)
             .unwrap();
-        // 55,224 = 78 * (576 latent + 132 indexer key): only the keys stay.
-        assert_eq!(model.total_kv_bytes_per_token(), 78 * 132);
-        assert_eq!(model.total_kv_bytes_per_token(), 10_296);
+        // 47,700 = 78 * 576 latent + 21 * 132 indexer key: only the keys stay.
+        assert_eq!(model.total_kv_bytes_per_token(), 21 * 132);
+        assert_eq!(model.total_kv_bytes_per_token(), 2_772);
         let offload = model.kv_host_offload().unwrap();
         assert_eq!(offload.host_bytes_per_token, 78 * 576);
         assert_eq!(offload.device_bytes_per_request, 4096 * 44_928);
@@ -1450,7 +1454,7 @@ mod tests {
         let model = build("unified".to_string(), resolve_configs(&cfgs), &bridge).unwrap();
         assert_eq!(model.verify_width(), 4);
         assert_eq!(model.n_slots, expected_slot_count(8));
-        assert_eq!(model.total_kv_bytes_per_token(), 55_224);
+        assert_eq!(model.total_kv_bytes_per_token(), 47_700);
         assert_eq!(built("glm52_nvfp4", 8).verify_width(), 1);
     }
 

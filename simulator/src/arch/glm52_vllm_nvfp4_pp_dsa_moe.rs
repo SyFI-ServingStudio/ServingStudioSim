@@ -30,7 +30,7 @@ use std::sync::Arc;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
-    self as ep_graph, build_atomic, decoder_layer_state_bytes_per_token, eval_atomic_or_zero,
+    self as ep_graph, build_atomic, eval_atomic_or_zero, layer_range_state_bytes_per_token,
     normalize_input, Glm52SparseBody, Glm52VllmNvfp4DsaMoeConfigs, Glm52VllmNvfp4DsaMoeParallel,
     Glm52VllmNvfp4DsaMoeResolved, NormalizedBatch, CHECKPOINT_MAX_CONTEXT, FULL_INDEX_LAYERS,
     HIDDEN_DIM, NUM_DENSE_LAYERS, NUM_INITIAL_SHARED_LAYERS,
@@ -375,9 +375,7 @@ impl Glm52VllmNvfp4PpStageModel {
         let cycle_shared = pick(counts.cycle_shared, &sections.cycle_shared);
         let head = (stage_index + 1 == num_stages).then(|| Arc::clone(&sections.head));
         // vLLM allocates cache only for the layers a stage owns.
-        let kv_bytes_per_token = u64::from(counts.total())
-            .checked_mul(decoder_layer_state_bytes_per_token())
-            .ok_or_else(|| fit_failed("stage state bytes overflow u64"))?;
+        let kv_bytes_per_token = layer_range_state_bytes_per_token(layer_range.0, layer_range.1);
         let mut stage = Self {
             name: name.to_string(),
             stage_index,
@@ -792,6 +790,7 @@ pub(crate) fn eval_compiled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arch::glm52_vllm_nvfp4_dsa_moe::decoder_layer_state_bytes_per_token;
     use crate::arch::contract::ArchGroupInput;
     use crate::arch::glm52_vllm_nvfp4_dsa_moe::{state_bytes_per_token, NUM_LAYERS};
     use crate::test_helpers::lm;
@@ -988,14 +987,16 @@ mod tests {
 
     #[test]
     fn cache_and_activation_bytes_follow_the_stage_layers() {
-        // 576 B FP8 MLA latent + rope, 128 B FP8 index key + 4 B FP32 scale.
-        assert_eq!(decoder_layer_state_bytes_per_token(), 708);
+        // 576 B FP8 MLA latent + rope in every layer; 128 B FP8 index key + 4 B
+        // FP32 scale only in a full-index layer.
+        assert_eq!(decoder_layer_state_bytes_per_token(0), 708);
+        assert_eq!(decoder_layer_state_bytes_per_token(3), 576);
         for pp_size in [4_u16, 8] {
             let model = built("glm52_nvfp4", pp_size);
             let mut max = 0;
             for stage in model.stages() {
                 let (start, end) = stage.layer_range();
-                let bytes = u64::from(end - start) * decoder_layer_state_bytes_per_token();
+                let bytes: u64 = (start..end).map(decoder_layer_state_bytes_per_token).sum();
                 assert_eq!(stage.total_kv_bytes_per_token(), bytes);
                 max = max.max(bytes);
             }
@@ -1008,7 +1009,8 @@ mod tests {
             assert_eq!(model.activation_bytes_per_token(), 2 * 6_144 * 2);
         }
         let pp4 = built("glm52_nvfp4", 4);
-        assert_eq!(pp4.pipeline_kv_bytes_per_token(), 20 * 708);
+        // The largest stage holds 20 layers, five of them full-index.
+        assert_eq!(pp4.pipeline_kv_bytes_per_token(), 20 * 576 + 5 * 132);
     }
 
     #[test]

@@ -2674,13 +2674,25 @@ fn expected_speculative_slot_count(
     expected_slot_count(ep_size) + expected_mtp_pass_slots(ep_size, false) + recurrent
 }
 
-/// One decoder layer's cached state for one token on one rank.
+/// Decoder layer `layer`'s cached state for one token on one rank.
 ///
-/// MLA stores one FP8 (kv_lora_rank + rope_dim) vector. Every decoder layer
-/// also allocates its FP8 index key plus one FP32 scale, even when that layer
-/// reuses a previous layer's top-k result and skips the indexer compute.
-pub(crate) fn decoder_layer_state_bytes_per_token() -> u64 {
-    mla_latent_bytes_per_layer_token() + index_key_bytes_per_layer_token()
+/// MLA stores one FP8 (kv_lora_rank + rope_dim) vector in every layer. Only a
+/// full-index layer builds a DSA indexer and so allocates its FP8 index key
+/// plus one FP32 scale: an IndexShare layer reuses an earlier layer's top-k and
+/// vLLM constructs no `Indexer` (hence no `DeepseekV32IndexerCache`) for it
+/// (vLLM #45895, `deepseek_v2.py` `_skip_topk`).
+pub(crate) fn decoder_layer_state_bytes_per_token(layer: u32) -> u64 {
+    let index = if FULL_INDEX_LAYERS.contains(&layer) {
+        index_key_bytes_per_layer_token()
+    } else {
+        0
+    };
+    mla_latent_bytes_per_layer_token() + index
+}
+
+/// Cached state for one token on one rank over decoder layers `start..end`.
+pub(crate) fn layer_range_state_bytes_per_token(start: u32, end: u32) -> u64 {
+    (start..end).map(decoder_layer_state_bytes_per_token).sum()
 }
 
 /// One layer's fp8 MLA latent (compressed KV plus RoPE key) for one token.
@@ -2697,11 +2709,9 @@ pub(crate) fn state_bytes_per_token(
     ep_size: u16,
     mtp_mode: Glm52MtpMode,
 ) -> std::result::Result<u64, BuildError> {
-    // vLLM keeps both caches replicated on every TP rank, and every one of the
-    // 78 body layers allocates the same per-layer state.
-    let main_per_rank = u64::from(NUM_LAYERS)
-        .checked_mul(decoder_layer_state_bytes_per_token())
-        .ok_or_else(|| fit_failed("main state bytes overflow u64"))?;
+    // vLLM keeps both caches replicated on every TP rank: an MLA latent in
+    // all 78 body layers, an index key only in the 21 full-index layers.
+    let main_per_rank = layer_range_state_bytes_per_token(0, NUM_LAYERS);
     let mtp_mla_per_rank = u64::from(KV_LORA_RANK + ROPE_DIM)
         .checked_mul(u64::from(DType::Fp8E4m3.size_bytes()))
         .ok_or_else(|| fit_failed("MTP MLA state bytes overflow u64"))?;
@@ -3408,32 +3418,33 @@ mod tests {
     fn state_and_topology_contracts_are_exact() {
         assert_eq!(
             state_bytes_per_token(4, Glm52MtpMode::Off).unwrap(),
-            220_896
+            190_800
         );
         assert_eq!(
             state_bytes_per_token(4, Glm52MtpMode::FullIndex).unwrap(),
-            223_728
+            193_632
         );
         assert_eq!(
             state_bytes_per_token(4, Glm52MtpMode::IndexShare).unwrap(),
-            223_200
+            193_104
         );
     }
 
     #[test]
-    fn replicated_fp8_cache_matches_the_profiled_vllm_capacity() {
-        // B200 vLLM startup evidence at gpu_memory_utilization=0.75 reported
-        // 17.55 GiB available per rank and exactly 341,120 cache tokens. The
-        // byte value below is independently recovered from that token count
-        // and vLLM's per-rank cache allocation, avoiding rounded GiB math.
-        const PROFILED_BYTES_PER_RANK: u64 = 18_838_010_880;
-        const PROFILED_TOKENS: u64 = 341_120;
-        const TP_SIZE: u16 = 4;
-
-        let total_bytes = PROFILED_BYTES_PER_RANK * u64::from(TP_SIZE);
-        let bytes_per_token = state_bytes_per_token(TP_SIZE, Glm52MtpMode::Off).unwrap();
-        assert_eq!(total_bytes / bytes_per_token, PROFILED_TOKENS);
-        assert_eq!(total_bytes % bytes_per_token, 0);
+    fn only_full_index_layers_cache_an_index_key() {
+        // vLLM builds a DSA indexer (and its DeepseekV32IndexerCache) only on
+        // the 21 full-index layers; the 57 IndexShare layers cache the MLA
+        // latent alone. (An older vLLM allocated an index key on every layer:
+        // 341,120 tokens in 17.55 GiB per TP4 rank, i.e. 78 * 708 B/token.)
+        assert_eq!(FULL_INDEX_LAYERS.len(), 21);
+        assert_eq!(
+            layer_range_state_bytes_per_token(0, NUM_LAYERS),
+            78 * 576 + 21 * 132
+        );
+        assert_eq!(
+            state_bytes_per_token(4, Glm52MtpMode::Off).unwrap(),
+            4 * layer_range_state_bytes_per_token(0, NUM_LAYERS)
+        );
     }
 
     fn group(prefill_tokens: u32, decode_lens: Vec<u32>, pairs: Vec<(u32, u32)>) -> ArchGroupInput {

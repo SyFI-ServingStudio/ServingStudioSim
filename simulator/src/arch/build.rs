@@ -3754,9 +3754,10 @@ mod tests {
         assert_eq!(model.num_attn_shards(), 1);
         assert_eq!(model.drafting_slots_per_request(), 7);
         assert_eq!(model.recurrent_state_bytes_per_request(), 0);
-        // 78 layers x 708 B of MLA latent and index key, plus six draft layers
+        // 78 layers x 576 B of MLA latent, 21 full-index layers x 132 B of index
+        // key, plus six draft layers
         // x 8 KV heads x 128 x K/V x fp8, all on the one rank holding the token.
-        assert_eq!(model.total_kv_bytes_per_token(), 55_224 + 12_288);
+        assert_eq!(model.total_kv_bytes_per_token(), 47_700 + 12_288);
 
         let group = |decodes: usize| SpeculativeArchGroupInput {
             batch_tokens: decodes as u32 * 8,
@@ -3831,7 +3832,7 @@ mod tests {
             &bridge,
         )
         .unwrap();
-        assert_eq!(model.total_kv_bytes_per_token(), 10_296);
+        assert_eq!(model.total_kv_bytes_per_token(), 2_772);
         assert_eq!(model.recurrent_state_bytes_per_request(), 0);
         assert_eq!(
             model.kv_host_offload(),
@@ -3856,7 +3857,7 @@ mod tests {
         )
         .unwrap();
         assert!(plain.kv_host_offload().is_none());
-        assert_eq!(plain.total_kv_bytes_per_token(), 55_224 + 12_288);
+        assert_eq!(plain.total_kv_bytes_per_token(), 47_700 + 12_288);
     }
 
     /// Catches a bf16 KDA pool that does not reach the RecoverSSM rows: the
