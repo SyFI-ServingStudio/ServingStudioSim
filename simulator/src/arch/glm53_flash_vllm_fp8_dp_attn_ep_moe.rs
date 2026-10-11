@@ -50,8 +50,8 @@ use anyhow::Result;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
-    self as tp_arch, atomic, graph_padded_tokens, push, AttnKind, Boundary, FfnKind,
-    Glm53FlashLayerGroup, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmConfigs,
+    self as tp_arch, atomic, attention_inputs, graph_padded_tokens, push, AttnKind, Boundary,
+    FfnKind, Glm53FlashLayerGroup, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmConfigs,
     Glm53FlashVllmParallel, ACTIVATION_DTYPE, SHARED_EXPERTS_STREAM_OVERLAP,
     SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
 };
@@ -1022,20 +1022,7 @@ fn normalize_input(
                 },
             )
         } else {
-            (
-                Glm53KdaAttnLocalWorkletInput {
-                    prefill_sequence_lengths: group
-                        .prefill_chunk_pairs
-                        .iter()
-                        .map(|&(_, append)| append)
-                        .collect(),
-                    decode_batch_size: decode_tokens,
-                },
-                Glm53DsaAttnLocalWorkletInput {
-                    prefill_chunk_pairs: group.prefill_chunk_pairs.clone(),
-                    decode_kv_lens: group.decode_kv_lens.clone(),
-                },
-            )
+            attention_inputs(&group.prefill_chunk_pairs, &group.decode_kv_lens)
         };
         ranks.push(RankBatch {
             rows: total.max(1),
