@@ -52,3 +52,8 @@ model/work/examples/
 
 /tmp/
 .cache/
+
+# `--remote` machines are per user (launcher/README.md "Remote execution"); only
+# remote.example.yaml is tracked. `.remote/` holds the pinned ssh host keys.
+/remote.yaml
+/.remote/

@@ -32,12 +32,11 @@ Sweep expansion belongs to `launcher.schema`. No `--web` / `--tui` / `--gui`
 
 from __future__ import annotations
 
-import copy
 import json
 import sys
 from pathlib import Path
 
-from .cli import dispatch, modes_help
+from .cli import UsageError, apply_dotted, dispatch, modes_help
 from .corpus import CorpusError, resolve_hf_references
 from .schema import (
     _format_log_dir,
@@ -167,40 +166,12 @@ def _build_argparse():
     return parser
 
 
-def _set_path(tree: dict, dotted: str, value) -> None:
-    """Set `value` at a dotted path into the config tree, e.g.
-    `io.log_dir`, `pools.main.groups.0.arch.tp_size`. Integer segments index
-    into lists; everything else into dicts (auto-vivifying missing dicts)."""
-    parts = dotted.split(".")
-    node = tree
-    for part in parts[:-1]:
-        if isinstance(node, list):
-            node = node[int(part)]
-        else:
-            node = node.setdefault(part, {})
-    last = parts[-1]
-    if isinstance(node, list):
-        node[int(last)] = value
-    else:
-        node[last] = value
-
-
 def _apply_overrides(preset: dict, overrides: list[str]) -> dict:
-    """Apply `--override path=value` into the config tree. The path is dotted
-    (`io.log_dir`, `pools.main.groups.0.arch.tp_size`); values are parsed as JSON
-    when possible (`tp_size=4`→int, `fp8=true`→bool, `[1,2]`→list) and otherwise
-    kept as a bare string (`model_config=model/x.json`)."""
-    out = copy.deepcopy(preset)
-    for item in overrides:
-        if "=" not in item:
-            sys.exit(f"bad --override {item!r}; expected path=value")
-        key, _, raw = item.partition("=")
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError:
-            value = raw  # bare string
-        _set_path(out, key.strip(), value)
-    return out
+    """Apply `--override path=value` into the config tree (`cli.apply_dotted`)."""
+    try:
+        return apply_dotted(preset, overrides)
+    except UsageError as exc:
+        sys.exit(f"bad --override: {exc}")
 
 
 def _params_line(pdef: dict) -> str:

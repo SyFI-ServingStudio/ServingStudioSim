@@ -86,3 +86,15 @@ def test_outside_a_git_repo_reports_unknown(tmp_path: Path) -> None:
     plain.mkdir()
 
     assert _git_tree_stamp(plain) == "unknown"
+
+
+def test_a_shipped_tree_reports_the_stamp_its_sender_computed(tmp_path: Path) -> None:
+    import json
+
+    shipped = tmp_path / "shipped"
+    shipped.mkdir()
+    (shipped / ".source-stamp.json").write_text(
+        json.dumps({"schema_version": 1, "profiler_git_hash": "abc123-dirty"})
+    )
+
+    assert _git_tree_stamp(shipped) == "abc123-dirty"

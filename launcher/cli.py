@@ -19,6 +19,8 @@ below only names them, which keeps help text and remote support in one place.
 
 from __future__ import annotations
 
+import copy
+import json
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -81,6 +83,45 @@ def take_global_options(argv: list[str]) -> tuple[GlobalOptions, list[str]]:
     if remote_set and remote is None:
         raise UsageError("--remote-set needs --remote NAME")
     return GlobalOptions(no_gpu, remote, tuple(remote_set)), rest
+
+
+def _set_path(tree: dict, dotted: str, value) -> None:
+    """Set `value` at a dotted path into the config tree, e.g.
+    `io.log_dir`, `pools.main.groups.0.arch.tp_size`. Integer segments index
+    into lists; everything else into dicts (auto-vivifying missing dicts)."""
+    parts = dotted.split(".")
+    node = tree
+    for part in parts[:-1]:
+        if isinstance(node, list):
+            node = node[int(part)]
+        else:
+            node = node.setdefault(part, {})
+    last = parts[-1]
+    if isinstance(node, list):
+        node[int(last)] = value
+    else:
+        node[last] = value
+
+
+def apply_dotted(tree: dict, assignments: list[str]) -> dict:
+    """A copy of ``tree`` with each ``path=value`` assignment applied.
+
+    The path is dotted (`io.log_dir`, `pools.main.groups.0.arch.tp_size`);
+    values are parsed as JSON when possible (`tp_size=4`→int, `fp8=true`→bool,
+    `[1,2]`→list) and otherwise kept as a bare string (`model_config=model/x.json`).
+    `--override` (presets) and `--remote-set` (remote.yaml) share this form.
+    """
+    out = copy.deepcopy(tree)
+    for item in assignments:
+        if "=" not in item:
+            raise UsageError(f"{item!r}; expected path=value")
+        key, _, raw = item.partition("=")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw  # bare string
+        _set_path(out, key.strip(), value)
+    return out
 
 
 @dataclass(frozen=True)
