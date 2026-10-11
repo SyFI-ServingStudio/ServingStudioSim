@@ -202,7 +202,7 @@ def test_run_job_isolates_the_database_and_drops_the_managed_context(tmp_path, m
         f"#!{sys.executable}\n"
         "import json, os, sys\n"
         "keys = ('TMPDIR', 'VIBESIM_BIN_DIR', 'VIBESIM_PROFILE_DB', "
-        "'VIBESIM_MANAGED_JOB_CONTEXT', 'HF_HOME')\n"
+        "'VIBESIM_MANAGED_JOB_CONTEXT', 'HF_HOME', 'UV_NO_SYNC')\n"
         "print(json.dumps({'argv': sys.argv[1:], **{k: os.environ.get(k) for k in keys}}))\n"
         "print(open(os.environ['VIBESIM_PROFILE_DB'], 'rb').read().decode())\n"
         "sys.exit(5)\n"
@@ -230,6 +230,7 @@ def test_run_job_isolates_the_database_and_drops_the_managed_context(tmp_path, m
     assert seen["VIBESIM_PROFILE_DB"] == str(scratch / "profile.db") and second == "db"
     assert seen["TMPDIR"] == str(scratch / "tmp") and seen["VIBESIM_BIN_DIR"] == "/w/bin/h"
     assert seen["VIBESIM_MANAGED_JOB_CONTEXT"] is None and seen["HF_HOME"] == "/hf"
+    assert seen["UV_NO_SYNC"] == "1"
     assert (jobdir / "exit_code").read_text() == "5\n"
     assert not scratch.exists()
 

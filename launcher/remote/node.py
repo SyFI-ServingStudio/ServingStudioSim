@@ -53,6 +53,8 @@ MANAGED_CONTEXT_VARIABLES = ("VIBESIM_MANAGED_JOB_CONTEXT", "VIBESIM_MANAGED_RUN
 PROFILE_DB_ENV = "VIBESIM_PROFILE_DB"
 _BUILD_EXCLUDES = ("/target", "/.venv", "/bin", "/logs")
 _BUILT_FILES = ("simulator", "analyze")
+# Overrides `.cargo/config.toml`'s `-fuse-ld=mold` (cargo reads config from env).
+_LINKER_FLAGS_ENV = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"
 # Written last when a version has been shipped completely (`run.py`).
 SHIPPED_MARKER = ".shipped"
 
@@ -106,6 +108,11 @@ def build(workdir: Path, version: str, node_local: Path) -> Path:
 
         env = {k: v for k, v in os.environ.items() if k != BIN_DIR_ENV}
         env["VIRTUAL_ENV"] = str((src / ".venv").resolve())
+        if shutil.which("mold") is None:
+            # .cargo/config.toml links with mold only for speed; a remote
+            # without it links with the system linker instead of failing.
+            env[_LINKER_FLAGS_ENV] = ""
+            print(f"[remote] {version}: no mold on this host; using the default linker")
         compiled = subprocess.run(
             [
                 str(build_src / ".venv" / "bin" / "python"),
@@ -149,6 +156,10 @@ def _job_environment(job: dict, scratch: Path) -> dict[str, str]:
     tmp.mkdir(parents=True, exist_ok=True)
     env["TMPDIR"] = str(tmp)
     env[BIN_DIR_ENV] = job["bin_dir"]
+    # The analyzer starts helpers with `uv run`, which would first sync the
+    # project's default groups (the whole GPU profiling stack) into the shared
+    # venv. That venv is made once, by `run.py`, for its key's groups only.
+    env["UV_NO_SYNC"] = "1"
     env["VIRTUAL_ENV"] = str((Path(job["src"]) / ".venv").resolve())
     env[PROFILE_DB_ENV] = str(scratch / "profile.db")
     return env
