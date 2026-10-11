@@ -91,10 +91,13 @@ def submit(
 ) -> Submitted:
     command = node_command(remote_python, jobdir)
     if remote.slurm is None:
+        # Braced so `&` backgrounds only the job: backgrounding the whole `&&`
+        # list would leave a subshell holding this command's output open until
+        # the job ends.
         script = (
             f"mkdir -p {q(jobdir)} && cd {q(cwd)} && "
-            f"setsid nohup {command} >> {q(jobdir / 'node.log')} 2>&1 < /dev/null & "
-            "echo $!"
+            f"{{ setsid nohup {command} >> {q(jobdir / 'node.log')} 2>&1 < /dev/null & "
+            "echo $!; }"
         )
         pid = transport.run(script).stdout.strip()
         transport.write_text(jobdir / "launch.pid", pid + "\n")
@@ -166,7 +169,9 @@ def cancel(transport: Transport, submitted: Submitted) -> None:
         return
     # node.py runs as its session's leader and forwards the signal to the job.
     jobdir = q(submitted.jobdir)
+    # A job that has ended may have had its pid reused: signal only a live one.
     transport.run(
-        f'pid=$(cat {jobdir}/pid 2>/dev/null || cat {jobdir}/launch.pid); kill -TERM "$pid"',
+        f"[ -f {jobdir}/exit_code ] || {{ pid=$(cat {jobdir}/pid 2>/dev/null || "
+        f'cat {jobdir}/launch.pid); kill -TERM "$pid"; }}',
         check=False,
     )

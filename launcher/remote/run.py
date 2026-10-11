@@ -15,7 +15,7 @@ One invocation is one remote job and blocks until it ends:
 4. Relay the job's output, with a heartbeat at least once a minute so a
    supervising agent does not take a long, quiet run for a hung one.
 5. Copy the results back to the same relative path here, write
-   ``remote.json`` beside them, and report the managed status.
+   ``remote-run.json`` beside them, and report the managed status.
 
 The experiment stays on the remote in full; the copy leaves out the bulky
 per-iteration logs (``raw/cost_log/``) and plots unless the remote is
@@ -51,7 +51,7 @@ HEARTBEAT_SECONDS = 60.0
 # (one missed `squeue` answer is not enough).
 LOST_POLLS = 3
 SIMULATION_COPY_EXCLUDES = ("raw/cost_log/", "plots/", "/experiment.meta.json")
-REMOTE_RECORD = "remote.json"
+REMOTE_RECORD = "remote-run.json"
 
 
 class RemoteRunError(RuntimeError):

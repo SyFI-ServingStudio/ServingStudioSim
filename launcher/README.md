@@ -802,7 +802,7 @@ the workdir on a filesystem its compute nodes share.
 5. Output is relayed every ~10 s, with a heartbeat at least once a minute.
    Ctrl-C or SIGTERM stops the remote job (`kill` or `scancel`).
 6. The output directory is copied back without `raw/cost_log/` and `plots/`
-   (everything, if the remote is `ephemeral`), and `remote.json` beside it
+   (everything, if the remote is `ephemeral`), and `remote-run.json` beside it
    records the remote, host, remote path, code version, job and Slurm ids,
    times and exit code. The full experiment stays on the remote.
 

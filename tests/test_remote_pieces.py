@@ -128,6 +128,41 @@ def test_status_reports_the_next_log_offset_in_bytes():
     assert big.log_size == 5 + launch.LOG_CHUNK_BYTES
 
 
+def test_a_direct_submit_returns_while_the_job_still_runs(tmp_path):
+    import time
+
+    jobdir = PurePosixPath(tmp_path / "jobs" / "j")
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        '#!/bin/bash\nj="${@: -1}"; echo $$ > "$j/pid"; '
+        "trap 'echo 143 > \"$j/exit_code\"; exit 143' TERM; sleep 30 & wait\n"
+    )
+    fake_python.chmod(0o755)
+    transport = Transport(_remote())
+    began = time.monotonic()
+    submitted = launch.submit(
+        transport,
+        _remote(),
+        job_id="j",
+        jobdir=jobdir,
+        cwd=PurePosixPath(tmp_path),
+        remote_python=PurePosixPath(fake_python),
+    )
+    assert time.monotonic() - began < 10
+    for _ in range(100):
+        if (tmp_path / "jobs" / "j" / "pid").is_file():
+            break
+        time.sleep(0.05)
+    assert launch.poll(transport, submitted, 0).exit_code is None
+    launch.cancel(transport, submitted)
+    for _ in range(100):
+        status = launch.poll(transport, submitted, 0)
+        if status.exit_code is not None:
+            break
+        time.sleep(0.05)
+    assert status.exit_code == 143
+
+
 def test_a_direct_job_runs_detached_and_is_polled_to_its_exit(tmp_path, monkeypatch):
     jobdir = PurePosixPath(tmp_path / "jobs" / "j")
     fake_python = tmp_path / "python"
