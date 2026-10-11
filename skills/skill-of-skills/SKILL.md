@@ -65,7 +65,8 @@ top-add-new-arch - add a whole model architecture end to end (capture → split 
 ├── impl-compose-arch - wire worklets into the L4 model_arch cost file
 ├── impl-wire-new-arch - integrate the arch into dispatch/build/timing-predict/deployment (Phase 3)
 ├── impl-add-model-work-label - add the independent model.work label and semantic location maps for R6/R7 (Phase 4, before Validate)
-└── top-align-with-framework - Phase 5: close the loop on the same capture; ranks which placeholder to promote next
+├── top-align-with-framework - Phase 5: close the loop on the same capture; ranks which placeholder to promote next
+└── dev-finalize-model-addition - after Phase 5: check results, publish presets and captures, merge main, review, open the PR
 
 top-add-kernel - add an L1 kernel end to end (several at once: fan out one subagent per kernel, 3 at a time)
 ├── orchestrator-add-kernel-to-python-profile - plan and verify Python profiling
@@ -123,6 +124,7 @@ dev-run-tests - select and run ServingStudioSim test tiers
 dev-compose-worker - plan, estimate, implement, compose, and review production L5 workers against the four-axis ownership rules
 dev-file-design-review - review one file against docs and contracts
 dev-present-changes-for-review - organize a diff for human review
+dev-finalize-model-addition - land an aligned model on main: result checks, public presets, HF captures, profiling, merge, review worktree, PR
 dev-clean-reimplement-for-merge - rebuild accepted but unmergeably iterative branch work cleanly from main, preserving behavior
 dev-build-serving-repetitive-unit - kernel/layer-timing development with reduced depth but production model, loader, engine, API, and profiler paths
 dev-compose-kernel - compose a real serving kernel, fused boundary, or collective change through six practical steps
