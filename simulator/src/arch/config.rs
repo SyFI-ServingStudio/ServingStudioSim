@@ -31,6 +31,7 @@ use serde::Deserialize;
 use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::glm52_model_cfg::Glm52MtpMode;
+use super::ep_comm::{EpCommConfig, EpCommKind, EpCommModel};
 use super::hisparse::HisparseConfig;
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
@@ -115,6 +116,8 @@ const MARGINAL_ROUTING_KINDS: [&str; 3] = ["uniform", "random", "popularity"];
 
 // AFD FFN selectors do not yet accept popularity files.
 const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
+const EP_COMM_KINDS: [&str; 2] = ["allgather_reducescatter", "alltoall"];
+const EP_COMM_MODELS: [&str; 2] = ["measured", "analytic"];
 
 /// GLM-5.2 proposer modes exposed by the iter selector. This mirrors
 /// [`Glm52MtpMode`]'s serde representation.
@@ -549,7 +552,32 @@ pub enum IterArchSel {
         /// HiSparse: overlap of consecutive query positions' top-k in one
         /// verify step (default 0.5).
         #[serde(default)]
-        hisparse_intra_step_overlap: Option<f64>,
+        hisparse_intra_step_overlap: Option<f64>,        /// Expert exchange (`arch::ep_comm`): `allgather_reducescatter`
+        /// (default) or `alltoall` (flashinfer two-sided MNNVL).
+        #[serde(default)]
+        #[param(string, default = "allgather_reducescatter", choices = EP_COMM_KINDS)]
+        ep_comm: EpCommKind,
+        /// `measured` (default; all-gather / reduce-scatter at EP 2, 4, 8 with
+        /// `nvl_num_gpu == ep_size`) or `analytic` (any `ep_size` dividing the
+        /// experts inside one `nvl_num_gpu` NVLink domain).
+        #[serde(default)]
+        #[param(string, default = "measured", choices = EP_COMM_MODELS)]
+        ep_comm_model: EpCommModel,
+        /// Analytic: effective per-direction NVLink GB/s per GPU (default 620).
+        #[serde(default)]
+        ep_link_gb_per_s: Option<f64>,
+        /// Analytic: one all-to-all `moe_comm` call's fixed us (default 6).
+        #[serde(default)]
+        ep_comm_latency_us: Option<f64>,
+        /// Analytic: multiplier on every collective's fixed cost (default 1).
+        #[serde(default)]
+        ep_comm_latency_scale: Option<f64>,
+        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 16.8).
+        #[serde(default)]
+        ep_prepare_latency_us: Option<f64>,
+        /// Analytic all-to-all: multiplier on the whole prepare (default 1).
+        #[serde(default)]
+        ep_prepare_scale: Option<f64>,
     },
     /// [`Self::Glm52VllmNvfp4DsaMoe`]'s kernels under pure pipeline
     /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
@@ -763,7 +791,32 @@ pub enum IterArchSel {
         /// HiSparse: overlap of consecutive query positions' top-k in one
         /// verify step (default 0.5).
         #[serde(default)]
-        hisparse_intra_step_overlap: Option<f64>,
+        hisparse_intra_step_overlap: Option<f64>,        /// Expert exchange (`arch::ep_comm`): `allgather_reducescatter`
+        /// (default) or `alltoall` (flashinfer two-sided MNNVL).
+        #[serde(default)]
+        #[param(string, default = "allgather_reducescatter", choices = EP_COMM_KINDS)]
+        ep_comm: EpCommKind,
+        /// `measured` (default; all-gather / reduce-scatter at EP 2, 4, 8 with
+        /// `nvl_num_gpu == ep_size`) or `analytic` (any `ep_size` dividing the
+        /// experts inside one `nvl_num_gpu` NVLink domain).
+        #[serde(default)]
+        #[param(string, default = "measured", choices = EP_COMM_MODELS)]
+        ep_comm_model: EpCommModel,
+        /// Analytic: effective per-direction NVLink GB/s per GPU (default 620).
+        #[serde(default)]
+        ep_link_gb_per_s: Option<f64>,
+        /// Analytic: one all-to-all `moe_comm` call's fixed us (default 6).
+        #[serde(default)]
+        ep_comm_latency_us: Option<f64>,
+        /// Analytic: multiplier on every collective's fixed cost (default 1).
+        #[serde(default)]
+        ep_comm_latency_scale: Option<f64>,
+        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 16.8).
+        #[serde(default)]
+        ep_prepare_latency_us: Option<f64>,
+        /// Analytic all-to-all: multiplier on the whole prepare (default 1).
+        #[serde(default)]
+        ep_prepare_scale: Option<f64>,
     },
     /// GLM-5.3-Flash FP8 block checkpoint on B200 through the vLLM fork: 34 KDA
     /// + 11 DSA (kpool indexer) layers, 3 dense + 42 MoE FFNs, 4-wide mHC. One
@@ -1254,6 +1307,44 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { model, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
+        }
+    }
+
+    /// The `ep_*` exchange params as one config (the measured default on an
+    /// arch that does not take them).
+    pub fn ep_comm(&self) -> EpCommConfig {
+        let (Self::Glm52VllmNvfp4DpAttnDsaMoe {
+            ep_comm,
+            ep_comm_model,
+            ep_link_gb_per_s,
+            ep_comm_latency_us,
+            ep_comm_latency_scale,
+            ep_prepare_latency_us,
+            ep_prepare_scale,
+            ..
+        }
+        | Self::Glm53VllmNvfp4DpAttnEpMoeDflash2 {
+            ep_comm,
+            ep_comm_model,
+            ep_link_gb_per_s,
+            ep_comm_latency_us,
+            ep_comm_latency_scale,
+            ep_prepare_latency_us,
+            ep_prepare_scale,
+            ..
+        }) = self
+        else {
+            return EpCommConfig::default();
+        };
+        let defaults = EpCommConfig::default();
+        EpCommConfig {
+            kind: *ep_comm,
+            model: *ep_comm_model,
+            link_gb_per_s: ep_link_gb_per_s.unwrap_or(defaults.link_gb_per_s),
+            a2a_latency_us: ep_comm_latency_us.unwrap_or(defaults.a2a_latency_us),
+            latency_scale: ep_comm_latency_scale.unwrap_or(defaults.latency_scale),
+            prepare_latency_us: ep_prepare_latency_us.unwrap_or(defaults.prepare_latency_us),
+            prepare_scale: ep_prepare_scale.unwrap_or(defaults.prepare_scale),
         }
     }
 

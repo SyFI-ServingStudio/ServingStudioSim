@@ -107,6 +107,19 @@ pub struct HisparseH2dIoLog {
     pub io_bytes: f64,
 }
 
+/// The analytic expert-parallel exchange of one sparse layer on its busiest
+/// rank (`arch::ep_comm`): which leg (`prepare`, `dispatch`, `combine`), the
+/// busiest sender's and receiver's rows, the bytes over the link and the fixed
+/// cost included in the slot's time.
+#[derive(Clone, Serialize)]
+pub struct EpCommAnalyticLog {
+    pub op: &'static str,
+    pub max_send_rows: f64,
+    pub max_recv_rows: f64,
+    pub bytes: f64,
+    pub latency_us: f64,
+}
+
 /// Declare the `SlotInput` enum + a `From<Input>` per variant from one central
 /// list. `#[serde(untagged)]` so each variant serializes as just its inner input
 /// object (e.g. `{"m":512}`) — the slot's kernel kind is recovered from the
@@ -186,6 +199,7 @@ log_inputs! {
     AttnRect    => FlashinferAttnRectKernelInput,
     Dflash2DraftAttn => Dflash2DraftAttnLog,
     HisparseH2dIo => HisparseH2dIoLog,
+    EpCommAnalytic => EpCommAnalyticLog,
     KvCacheAppend => KvCacheAppendKernelInput,
     MlaCacheAppend => MlaCacheAppendKernelInput,
     DsaIndexCacheAppend => DsaIndexCacheAppendKernelInput,

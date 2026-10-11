@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 use crate::arch::contract::SpeculativeUnifiedModel;
+use crate::arch::ep_comm::EpCommConfig;
 use crate::arch::hisparse::HisparseConfig;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
@@ -1173,6 +1174,7 @@ pub fn glm52_vllm_nvfp4_dp_attn_dsa_moe(
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
     hisparse: Option<&HisparseConfig>,
+    ep_comm: &EpCommConfig,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1189,6 +1191,7 @@ pub fn glm52_vllm_nvfp4_dp_attn_dsa_moe(
         cudagraph_capture_sizes,
         None,
         hisparse,
+        ep_comm,
         gpu,
         name,
         bridge,
@@ -1212,6 +1215,7 @@ fn glm52_vllm_nvfp4_dp_attn_target(
     cudagraph_capture_sizes: &[u32],
     draft_tokens: Option<u32>,
     hisparse: Option<&HisparseConfig>,
+    ep_comm: &EpCommConfig,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1245,6 +1249,7 @@ fn glm52_vllm_nvfp4_dp_attn_target(
             sizes.dedup();
             sizes
         },
+        ep_comm: ep_comm.clone(),
     };
     let configs = match draft_tokens {
         None => glm52_vllm_nvfp4_dp_attn_dsa_moe::build_configs(
@@ -1958,6 +1963,7 @@ pub fn glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         cudagraph_capture_sizes,
         Some(*draft_tokens),
         sel.hisparse().as_ref(),
+        &sel.ep_comm(),
         gpu,
         name,
         bridge,
@@ -2419,6 +2425,7 @@ pub fn build_iter_model(
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
             sel.hisparse().as_ref(),
+            &sel.ep_comm(),
             gpu,
             name,
             bridge,

@@ -62,10 +62,21 @@
 //! GPU cache shrinks to the indexer keys, a fixed latent buffer per request and
 //! a host tier join the capacity contract (`kv_host_offload`), and each step
 //! adds the exposed host -> device miss copy as one more `Max` over ranks.
+//!
+//! The exchange can instead be priced by `arch::ep_comm`'s analytic link model
+//! (`ep_comm_model: analytic`), as the naive all-gather / reduce-scatter or as
+//! flashinfer's two-sided MNNVL all-to-all (`ep_comm: alltoall`). That is the
+//! only way past the measured collectives' 8 GPUs: an EP group of up to the
+//! whole NVLink domain (GB200 NVL72), `ep_size` dividing the 256 experts. The
+//! all-to-all adds its metadata prepare, the receiver's NVFP4 scale swizzle,
+//! and the combine's zeroed `tokens x top_k` staging buffer and top-k sum
+//! (measured elementwise leaves). The default, measured all-gather /
+//! reduce-scatter, is unchanged.
 
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, KvHostOffload, UnifiedArchInput};
+use crate::arch::ep_comm::{push_leg, AnalyticEpComm, EpCommConfig, EpCommKind, EpCommModel};
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
     self as ep_graph, build_atomic, eval_atomic_or_zero, normalize_group, state_bytes_per_token,
@@ -79,7 +90,7 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelInput, MoeEpCollectiveKernelInput,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, MoeEpCollectiveKernelInput,
     MoeEpQuantizedAllGatherKernel, MoeEpQuantizedAllGatherKernelConfig, MoeEpReduceScatterKernel,
     MoeEpReduceScatterKernelConfig, Nvfp4FusedMoeKernel, Nvfp4FusedMoeKernelInput,
     Nvfp4QuantKernel, Nvfp4QuantKernelInput, ResidualRmsNormKernel, ResidualRmsNormKernelInput,
@@ -109,6 +120,7 @@ const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
 const MAX_RANK_BATCH_TOKENS: u32 = 8_192;
 const COLLECTIVE_BACKENDS: &[&str] = &["vllm_pynccl"];
 const ROUTED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_routed_sm100"];
+const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 
 fn fit_failed(reason: impl Into<String>) -> BuildError {
     BuildError::FitFailed {
@@ -127,6 +139,9 @@ pub struct Glm52VllmNvfp4DpAttnParallel {
     /// vLLM's CUDA-graph capture sizes, ascending and deduplicated. Empty:
     /// every step runs eager.
     pub cudagraph_capture_sizes: Vec<u32>,
+    /// How the expert exchange runs and is priced (`arch::ep_comm`). The
+    /// default is the measured all-gather / reduce-scatter.
+    pub ep_comm: EpCommConfig,
 }
 
 /// The EP1 recipe every GPU's non-expert work builds from, plus the expert
@@ -143,6 +158,23 @@ pub struct Glm52VllmNvfp4DpAttnConfigs {
     pub routed_experts: Vec<Nvfp4MoeLocalWorkletConfig>,
     pub dispatch: MoeEpQuantizedAllGatherKernelConfig,
     pub combine: MoeEpReduceScatterKernelConfig,
+    /// The analytic exchange; `None` on the measured path.
+    pub analytic: Option<AnalyticEpComm>,
+    /// The all-to-all's elementwise leaves; `None` unless `ep_comm` is
+    /// `alltoall`.
+    pub alltoall: Option<AlltoallElementwise>,
+}
+
+/// The all-to-all's measured elementwise work around its two transfers.
+#[derive(Clone, Debug)]
+pub struct AlltoallElementwise {
+    /// `nvfp4_block_scale_interleave` on the received block scales, over the
+    /// receive allocation (`max tokens per rank x ep_size` rows).
+    pub scale_swizzle: ElementwiseKernelConfig,
+    /// `torch.zeros(tokens * top_k, hidden)` bf16 staging buffer.
+    pub combine_fill: ElementwiseKernelConfig,
+    /// `torch.sum` over the top-k axis back to one bf16 row per token.
+    pub combine_reduce: ElementwiseKernelConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +184,8 @@ pub struct Glm52VllmNvfp4DpAttnResolved {
     pub routed_experts: Vec<Nvfp4MoeLocalWorkletResolved>,
     pub dispatch: MoeEpQuantizedAllGatherKernelConfig,
     pub combine: MoeEpReduceScatterKernelConfig,
+    pub analytic: Option<AnalyticEpComm>,
+    pub alltoall: Option<AlltoallElementwise>,
 }
 
 /// `body_demand` is the whole body's routed demand, folded over `ep_size`
@@ -187,19 +221,45 @@ fn build_configs_for(
     fp8: bool,
     draft_tokens: Option<u32>,
 ) -> Result<Glm52VllmNvfp4DpAttnConfigs, BuildError> {
-    // The two collective kernels are measured on 2, 4 and 8 GPUs of one node.
-    if !matches!(parallel.ep_size, 2 | 4 | 8) {
-        return Err(fit_failed(format!(
-            "ep_size {} must be 2, 4 or 8: data-parallel attention needs more than one \
-             rank, and the dispatch and combine collectives span one NVLink node",
-            parallel.ep_size
-        )));
-    }
-    if parallel.nvl_num_gpu != parallel.ep_size {
-        return Err(fit_failed(format!(
-            "nvl_num_gpu {} must equal ep_size {}: the group is one NVLink node",
-            parallel.nvl_num_gpu, parallel.ep_size
-        )));
+    parallel.ep_comm.validate().map_err(fit_failed)?;
+    match parallel.ep_comm.model {
+        EpCommModel::Measured => {
+            if parallel.ep_comm.kind != EpCommKind::AllgatherReducescatter {
+                return Err(fit_failed(
+                    "ep_comm alltoall has no measured B200 rows: set ep_comm_model analytic",
+                ));
+            }
+            // The two collective kernels are measured on 2, 4 and 8 GPUs of one node.
+            if !matches!(parallel.ep_size, 2 | 4 | 8) {
+                return Err(fit_failed(format!(
+                    "ep_size {} must be 2, 4 or 8: data-parallel attention needs more than one \
+                     rank, and the dispatch and combine collectives span one NVLink node \
+                     (ep_comm_model analytic goes further)",
+                    parallel.ep_size
+                )));
+            }
+            if parallel.nvl_num_gpu != parallel.ep_size {
+                return Err(fit_failed(format!(
+                    "nvl_num_gpu {} must equal ep_size {}: the group is one NVLink node",
+                    parallel.nvl_num_gpu, parallel.ep_size
+                )));
+            }
+        }
+        EpCommModel::Analytic => {
+            let experts = model.num_experts.get();
+            if parallel.ep_size < 2 || experts % u32::from(parallel.ep_size) != 0 {
+                return Err(fit_failed(format!(
+                    "ep_size {} must be >= 2 and divide the {experts} routed experts",
+                    parallel.ep_size
+                )));
+            }
+            if parallel.nvl_num_gpu < parallel.ep_size {
+                return Err(fit_failed(format!(
+                    "nvl_num_gpu {} must hold the ep_size {} group in one NVLink domain",
+                    parallel.nvl_num_gpu, parallel.ep_size
+                )));
+            }
+        }
     }
     if !(1..=CHECKPOINT_MAX_CONTEXT).contains(&parallel.max_model_len) {
         return Err(fit_failed(format!(
@@ -264,12 +324,42 @@ fn build_configs_for(
         fabric: "nvlink".to_string(),
         max_total_tokens,
     };
+    let hidden = model.hidden_dim.get();
+    let top_k = u32::from(model.router_top_k);
+    let analytic = match parallel.ep_comm.model {
+        EpCommModel::Measured => None,
+        EpCommModel::Analytic => Some(
+            AnalyticEpComm::new(
+                parallel.ep_comm.clone(),
+                parallel.ep_size,
+                hidden,
+                model.num_experts.get(),
+                top_k,
+                body_demand,
+            )
+            .map_err(|error| fit_failed(format!("analytic ep_comm: {error:#}")))?,
+        ),
+    };
+    let elementwise = |input: u32, output: u32| ElementwiseKernelConfig {
+        backends: ELEMENTWISE_BACKENDS.to_vec(),
+        gpu_name: parallel.gpu_name.clone(),
+        input_bytes_per_token: input.into(),
+        output_bytes_per_token: output.into(),
+    };
+    let bf16_row = 2 * hidden;
+    let alltoall = (parallel.ep_comm.kind == EpCommKind::Alltoall).then(|| AlltoallElementwise {
+        scale_swizzle: elementwise(hidden / 16, hidden / 16),
+        combine_fill: elementwise(0, top_k * bf16_row),
+        combine_reduce: elementwise(top_k * bf16_row, bf16_row),
+    });
     Ok(Glm52VllmNvfp4DpAttnConfigs {
         parallel: parallel.clone(),
         local,
         routed_experts,
         dispatch,
         combine,
+        analytic,
+        alltoall,
     })
 }
 
@@ -284,6 +374,8 @@ pub fn resolve_configs(cfgs: &Glm52VllmNvfp4DpAttnConfigs) -> Glm52VllmNvfp4DpAt
             .collect(),
         dispatch: cfgs.dispatch.clone(),
         combine: cfgs.combine.clone(),
+        analytic: cfgs.analytic.clone(),
+        alltoall: cfgs.alltoall.clone(),
     }
 }
 
@@ -294,10 +386,27 @@ struct DpSparseLayer {
     router: Glm52MoeRouterLocalWorklet,
     shared_expert: Glm52SharedExpertLocalWorklet,
     input_quant: Op<Nvfp4QuantKernel>,
-    dispatch: Op<MoeEpQuantizedAllGatherKernel>,
+    exchange: Exchange,
     /// One per EP rank, ordered by identity-free active-expert workload.
     routed_experts: Vec<Op<Nvfp4FusedMoeKernel>>,
-    combine: Op<MoeEpReduceScatterKernel>,
+}
+
+/// How the routed tokens reach the experts and come back.
+enum Exchange {
+    /// The profiled quantized all-gather and bf16 reduce-scatter.
+    Measured {
+        dispatch: Op<MoeEpQuantizedAllGatherKernel>,
+        combine: Op<MoeEpReduceScatterKernel>,
+    },
+    /// `arch::ep_comm`'s all-gather / reduce-scatter.
+    AnalyticAllgather(Arc<AnalyticEpComm>),
+    /// `arch::ep_comm`'s all-to-all with its measured elementwise work.
+    AnalyticAlltoall {
+        comm: Arc<AnalyticEpComm>,
+        scale_swizzle: Op<ElementwiseKernel>,
+        combine_fill: Op<ElementwiseKernel>,
+        combine_reduce: Op<ElementwiseKernel>,
+    },
 }
 
 impl DpSparseLayer {
@@ -342,19 +451,8 @@ impl DpSparseLayer {
                 bridge,
             )?,
             input_quant,
-            dispatch: build_atomic(
-                format!("{name}.moe.dispatch_ep_all_gather"),
-                resolved.dispatch.clone(),
-                MoeEpQuantizedAllGatherKernel::build,
-                bridge,
-            )?,
+            exchange: Exchange::build(&name, resolved, bridge)?,
             routed_experts: experts.into_iter().map(|expert| expert.fused_moe).collect(),
-            combine: build_atomic(
-                format!("{name}.moe.combine_ep_reduce_scatter"),
-                resolved.combine.clone(),
-                MoeEpReduceScatterKernel::build,
-                bridge,
-            )?,
             name,
         })
     }
@@ -393,7 +491,38 @@ impl DpSparseLayer {
                 .map(|_| self.shared_expert.compile(builder))
                 .collect(),
         );
-        let dispatch = self.dispatch.compile(builder);
+        let ranks_max = |builder: &mut CostTreeBuilder, op: &Op<ElementwiseKernel>, what: &str| {
+            labeled_max(
+                format!("{}.moe.{what} [Max over EP ranks]", self.name),
+                (0..ranks).map(|_| op.compile(builder)).collect(),
+            )
+        };
+        let mut chain = Vec::new();
+        match &self.exchange {
+            Exchange::Measured { dispatch, .. } => chain.push(dispatch.compile(builder)),
+            Exchange::AnalyticAllgather(comm) => chain.push(comm.compile_leg(
+                format!("{}.moe.dispatch_ep_all_gather", self.name),
+                "dispatch",
+                builder,
+            )),
+            Exchange::AnalyticAlltoall {
+                comm,
+                scale_swizzle,
+                ..
+            } => {
+                chain.push(comm.compile_leg(
+                    format!("{}.moe.dispatch_alltoall_prepare", self.name),
+                    "prepare",
+                    builder,
+                ));
+                chain.push(comm.compile_leg(
+                    format!("{}.moe.dispatch_alltoall", self.name),
+                    "dispatch",
+                    builder,
+                ));
+                chain.push(ranks_max(builder, scale_swizzle, "dispatch_scale_swizzle"));
+            }
+        }
         let routed = labeled_max(
             format!(
                 "{}.moe.routed_experts [Max over EP ranks; every gathered token]",
@@ -404,16 +533,45 @@ impl DpSparseLayer {
                 .map(|expert| expert.compile(builder))
                 .collect(),
         );
-        let combine = self.combine.compile(builder);
+        chain.push(routed);
+        match &self.exchange {
+            Exchange::Measured { combine, .. } => chain.push(combine.compile(builder)),
+            Exchange::AnalyticAllgather(comm) => chain.push(comm.compile_leg(
+                format!("{}.moe.combine_ep_reduce_scatter", self.name),
+                "combine",
+                builder,
+            )),
+            Exchange::AnalyticAlltoall {
+                comm,
+                combine_fill,
+                combine_reduce,
+                ..
+            } => {
+                chain.push(ranks_max(builder, combine_fill, "combine_output_fill"));
+                chain.push(comm.compile_leg(
+                    format!("{}.moe.combine_alltoall", self.name),
+                    "combine",
+                    builder,
+                ));
+                chain.push(ranks_max(builder, combine_reduce, "combine_reduce"));
+            }
+        }
+        let path = match &self.exchange {
+            Exchange::Measured { .. } => {
+                "quantized all-gather -> routed experts -> reduce-scatter".to_string()
+            }
+            Exchange::AnalyticAllgather(comm) | Exchange::AnalyticAlltoall { comm, .. } => {
+                comm.label()
+            }
+        };
         let exchange = CostNode::Labeled {
             label: format!(
-                "{}.moe exchange [quantized all-gather -> routed experts -> reduce-scatter, \
-                 auxiliary-stream shared expert alongside]",
+                "{}.moe exchange [{path}, auxiliary-stream shared expert alongside]",
                 self.name
             ),
             child: Box::new(CostNode::Parallel {
                 overlap: 1.0,
-                children: vec![aux_shared, CostNode::Sum(vec![dispatch, routed, combine])],
+                children: vec![aux_shared, CostNode::Sum(chain)],
             }),
         };
         CostNode::Labeled {
@@ -454,14 +612,40 @@ impl DpSparseLayer {
             );
         }
         let idle = batch.gathered_tokens == 0;
-        eval_atomic_or_zero(
-            &self.dispatch,
-            MoeEpCollectiveKernelInput {
-                per_rank_tokens: batch.collective_tokens.clone(),
-            },
-            idle,
-            ev,
-        );
+        let analytic = match &self.exchange {
+            Exchange::AnalyticAllgather(comm) | Exchange::AnalyticAlltoall { comm, .. } => {
+                comm.step(&batch.collective_tokens)
+            }
+            Exchange::Measured { .. } => Default::default(),
+        };
+        match &self.exchange {
+            Exchange::Measured { dispatch, .. } => eval_atomic_or_zero(
+                dispatch,
+                MoeEpCollectiveKernelInput {
+                    per_rank_tokens: batch.collective_tokens.clone(),
+                },
+                idle,
+                ev,
+            ),
+            Exchange::AnalyticAllgather(_) => push_leg("dispatch", analytic.dispatch, ev),
+            Exchange::AnalyticAlltoall { scale_swizzle, .. } => {
+                push_leg("prepare", analytic.prepare, ev);
+                push_leg("dispatch", analytic.dispatch, ev);
+                // Every rank swizzles its whole receive allocation.
+                let busiest = batch.collective_tokens.iter().copied().max().unwrap_or(0);
+                let allocation = busiest.saturating_mul(self.ranks() as u32);
+                for _ in 0..self.ranks() {
+                    eval_atomic_or_zero(
+                        scale_swizzle,
+                        ElementwiseKernelInput {
+                            num_tokens: allocation,
+                        },
+                        idle,
+                        ev,
+                    );
+                }
+            }
+        }
         for expert in &self.routed_experts {
             eval_atomic_or_zero(
                 expert,
@@ -472,14 +656,84 @@ impl DpSparseLayer {
                 ev,
             );
         }
-        eval_atomic_or_zero(
-            &self.combine,
-            MoeEpCollectiveKernelInput {
-                per_rank_tokens: batch.collective_tokens.clone(),
-            },
-            idle,
-            ev,
-        );
+        match &self.exchange {
+            Exchange::Measured { combine, .. } => eval_atomic_or_zero(
+                combine,
+                MoeEpCollectiveKernelInput {
+                    per_rank_tokens: batch.collective_tokens.clone(),
+                },
+                idle,
+                ev,
+            ),
+            Exchange::AnalyticAllgather(_) => push_leg("combine", analytic.combine, ev),
+            Exchange::AnalyticAlltoall {
+                combine_fill,
+                combine_reduce,
+                ..
+            } => {
+                // The staging buffer and the sum run on each rank's own tokens.
+                for &tokens in &batch.collective_tokens {
+                    eval_atomic_or_zero(
+                        combine_fill,
+                        ElementwiseKernelInput { num_tokens: tokens },
+                        tokens == 0,
+                        ev,
+                    );
+                }
+                push_leg("combine", analytic.combine, ev);
+                for &tokens in &batch.collective_tokens {
+                    eval_atomic_or_zero(
+                        combine_reduce,
+                        ElementwiseKernelInput { num_tokens: tokens },
+                        tokens == 0,
+                        ev,
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl Exchange {
+    fn build(
+        name: &str,
+        resolved: &Glm52VllmNvfp4DpAttnResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let Some(comm) = &resolved.analytic else {
+            return Ok(Self::Measured {
+                dispatch: build_atomic(
+                    format!("{name}.moe.dispatch_ep_all_gather"),
+                    resolved.dispatch.clone(),
+                    MoeEpQuantizedAllGatherKernel::build,
+                    bridge,
+                )?,
+                combine: build_atomic(
+                    format!("{name}.moe.combine_ep_reduce_scatter"),
+                    resolved.combine.clone(),
+                    MoeEpReduceScatterKernel::build,
+                    bridge,
+                )?,
+            });
+        };
+        let comm = Arc::new(comm.clone());
+        let Some(alltoall) = &resolved.alltoall else {
+            return Ok(Self::AnalyticAllgather(comm));
+        };
+        let elementwise = |leaf: &str, config: &ElementwiseKernelConfig| {
+            build_atomic(
+                format!("{name}.moe.{leaf}"),
+                config.clone(),
+                ElementwiseKernel::build,
+                bridge,
+            )
+        };
+        Ok(Self::AnalyticAlltoall {
+            comm,
+            scale_swizzle: elementwise("dispatch_scale_swizzle", &alltoall.scale_swizzle)?,
+            combine_fill: elementwise("combine_output_fill", &alltoall.combine_fill)?,
+            combine_reduce: elementwise("combine_reduce", &alltoall.combine_reduce)?,
+        })
     }
 }
 
@@ -642,6 +896,10 @@ pub fn build(
     if resolved.routed_experts.len() != usize::from(ep_size)
         || resolved.dispatch.num_gpus != u32::from(ep_size)
         || resolved.combine.num_gpus != u32::from(ep_size)
+        || resolved
+            .analytic
+            .as_ref()
+            .is_some_and(|comm| comm.ep_size != ep_size)
     {
         return Err(fit_failed(format!(
             "the expert shards and collectives must span ep_size {ep_size} ranks"
@@ -1041,6 +1299,7 @@ mod tests {
             max_model_len: 131_072,
             gpu_name: "NVIDIA B200".to_string(),
             cudagraph_capture_sizes: Vec::new(),
+            ep_comm: EpCommConfig::default(),
         }
     }
 
@@ -1456,6 +1715,79 @@ mod tests {
         assert_eq!(model.n_slots, expected_slot_count(8));
         assert_eq!(model.total_kv_bytes_per_token(), 47_700);
         assert_eq!(built("glm52_nvfp4", 8).verify_width(), 1);
+    }
+
+    fn analytic(ep_size: u16, nvl_num_gpu: u16, kind: EpCommKind) -> Glm52VllmNvfp4DpAttnParallel {
+        Glm52VllmNvfp4DpAttnParallel {
+            nvl_num_gpu,
+            ep_comm: EpCommConfig {
+                kind,
+                model: EpCommModel::Analytic,
+                ..EpCommConfig::default()
+            },
+            ..parallel(ep_size)
+        }
+    }
+
+    fn built_with(p: &Glm52VllmNvfp4DpAttnParallel) -> Glm52VllmNvfp4DpAttnDsaMoeModel {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let cfgs = build_configs(&model_cfg("glm52_nvfp4"), p, &demand(), false).unwrap();
+        build("unified".to_string(), resolve_configs(&cfgs), &bridge).unwrap()
+    }
+
+    #[test]
+    fn the_analytic_exchange_spans_an_nvl72_domain() {
+        for ep_size in [8_u16, 16, 64] {
+            // All-gather / reduce-scatter: the two collectives become analytic
+            // leaves under the same names, nothing else changes.
+            let model = built_with(&analytic(ep_size, 72, EpCommKind::AllgatherReducescatter));
+            assert_eq!(model.n_slots, expected_slot_count(ep_size), "EP{ep_size}");
+            let slots = model.cost_log_manifest().slots;
+            let leaves: Vec<_> = slots
+                .iter()
+                .filter(|slot| slot.kind == crate::arch::ep_comm::EP_COMM_ANALYTIC_KIND)
+                .collect();
+            assert_eq!(leaves.len(), 6);
+            assert!(slots
+                .iter()
+                .all(|slot| !slot.kind.starts_with("moe_ep_")));
+            // All-to-all: a prepare per section and three elementwise leaves
+            // per rank per section on top.
+            let model = built_with(&analytic(ep_size, 72, EpCommKind::Alltoall));
+            assert_eq!(
+                model.n_slots,
+                expected_slot_count(ep_size) + 3 * (1 + 3 * usize::from(ep_size)),
+                "EP{ep_size}"
+            );
+            assert_eq!(model.gpus_per_replica(), ep_size);
+            let resolved = resolve_configs(
+                &build_configs(
+                    &model_cfg("glm52_nvfp4"),
+                    &analytic(ep_size, 72, EpCommKind::Alltoall),
+                    &demand(),
+                    false,
+                )
+                .unwrap(),
+            );
+            for rank in &resolved.routed_experts {
+                assert_eq!(rank.experts_per_device.get(), 256 / u32::from(ep_size));
+            }
+        }
+    }
+
+    #[test]
+    fn measured_exchange_stays_inside_the_profiled_groups() {
+        let model = model_cfg("glm52_nvfp4");
+        // Measured all-to-all has no B200 rows.
+        let mut p = parallel(8);
+        p.ep_comm.kind = EpCommKind::Alltoall;
+        assert!(build_configs(&model, &p, &demand(), false).is_err());
+        // Analytic: the group must divide the experts and fit the domain.
+        for (ep_size, nvl) in [(1_u16, 72_u16), (3, 72), (96, 128), (64, 32)] {
+            let p = analytic(ep_size, nvl, EpCommKind::Alltoall);
+            assert!(build_configs(&model, &p, &demand(), false).is_err(), "{ep_size}/{nvl}");
+        }
     }
 
     #[test]

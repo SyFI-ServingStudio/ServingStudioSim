@@ -9,6 +9,7 @@ pub mod config;
 pub mod contract;
 pub mod deepseek_v41_vllm;
 pub mod deepseek_v4_vllm;
+pub mod ep_comm;
 pub mod glm52_model_cfg;
 pub mod glm52_sglang_nvfp4_tp_dsa_moe;
 pub mod glm52_vllm_dsa_moe;

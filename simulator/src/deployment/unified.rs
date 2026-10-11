@@ -835,6 +835,7 @@ impl Deployment for UnifiedDeployment {
                     token_corpus_file.as_deref(),
                     cudagraph_capture_sizes,
                     hisparse.as_ref(),
+                    &g.arch.ep_comm(),
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
