@@ -107,12 +107,19 @@ Write `doc/pr/<feature>/PR.md` and `doc/pr/<feature>/README.md`. Follow `doc/pr/
 - `README.md` holds the evidence. Include the deployment modeled, how each model feature is modeled, the
   kernels, Check 1, the simulation, changes that reach other models, modeling choices, known gaps, and how
   to reproduce the results.
-- Include the performance numbers from step 1. These are the diverse_100 kernel and E2E deviations and the
-  campaign table: kernel abs and signed error, coverage, E2E, output tps, TPOT, and TTFT. Copy them from
-  the generated `compare` markdown and metrics JSON. Name the source file and never retype a number.
+- `PR.md`'s Test Result carries the performance numbers from step 1 as tables, not as ranges:
+  - for each deployment, the diverse_100 Check 1 table (signed median per phase, coverage, multiplier) and
+    the E2E table (TTFT, TPOT, E2E, throughput);
+  - the campaign table with one row per case run: kernel abs and signed error, coverage, E2E, output tps,
+    TPOT, and TTFT.
+
+  Paste the campaign table from the generated `alignment-campaign compare --markdown` output, and commit
+  that output as `doc/pr/<feature>/alignment_matrix.md` beside the metrics JSON. Name each table's source
+  file and never retype a number.
 - List every out-of-tolerance item with its cause, and every change that alters other models' predictions.
 
-Stop: show the user the draft.
+Stop: show the user the draft. Before showing it, check that every case in the pack's run appears as a row
+in `PR.md`.
 
 ## 7. Create the review worktree
 

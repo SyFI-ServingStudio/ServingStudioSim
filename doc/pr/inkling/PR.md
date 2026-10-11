@@ -57,6 +57,9 @@ sublayer's collective. Check it against vLLM captures on 4 and 8 B200s.
   - The NVFP4 and BF16 MoE worklets gain an `eval_or_zero` that GLM does not
     call.
   - No existing profile.db row changes.
+- **Skill.** `dev-finalize-model-addition` step 6 now requires the
+  diverse_100 tables and one campaign row per case in `PR.md`'s Test Result,
+  pasted from the generated output.
 
 [`README.md`](README.md) has the modeling notes, the evidence and the open
 items. [`alignment_matrix.md`](alignment_matrix.md) is the generated campaign
