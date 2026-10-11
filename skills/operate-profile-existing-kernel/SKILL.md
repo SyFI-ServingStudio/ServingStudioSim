@@ -170,7 +170,8 @@ util / temp / throttle drift for one kernel spec, **not** to fill or refresh
 
 ```bash
 uv run python -m launcher kernel-profile measure <table> --backend <backend> --spec JSON \
-  [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2] [--gpu-name NAME] [--db PATH] [--json]
+  [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2] [--cuda-graph] \
+  [--gpu-name NAME] [--db PATH] [--json]
 ```
 
 How it differs from the cache verbs:
@@ -189,6 +190,10 @@ How it differs from the cache verbs:
 - `--no-clear-l2` switches from the default cold per-launch L2 displacement
   (which matches the `profile.db` measurement) to a warm continuous window that
   surfaces sustained power/clock drift.
+- `--cuda-graph` replays the kernel from a CUDA graph. Without it, a kernel with
+  slow host dispatch (e.g. CuTe-DSL) leaves the GPU idle between launches even
+  with `--no-clear-l2`, so it never reaches the power-limited clock that
+  back-to-back serving runs at.
 - Only kernels whose runner times through `Timer.cupti` are accepted; comm
   kernels are rejected.
 
