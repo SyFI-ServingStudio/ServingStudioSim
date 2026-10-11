@@ -132,11 +132,11 @@ def test_vllm_registration_reuses_schema_table_family_support_and_facades() -> N
     assert hasattr(perf_api, "count_missing_dsa_topk_prefill")
 
 
-def test_deep_select_runs_in_the_rebased_fork_env_on_sm10x_only() -> None:
+def test_deep_select_runs_in_the_vllm_env_on_sm10x_only() -> None:
     spec = find_kernel_profiler_spec(KIND, _DEEP_SELECT_BACKEND)
 
     assert spec.args_schema is DsaTopkPrefillArgs
-    assert spec.subprocess_env == "vllm_upstream_fork_env"
+    assert spec.subprocess_env == "vllm_env"
     assert spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
     assert not spec.supports.allows(DType.BF16, gpu="NVIDIA B200")

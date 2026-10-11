@@ -63,48 +63,26 @@ This is why `KernelKind` strings must match exactly across the boundary (below).
 - The `profilers/` timing primitives (`Timer.cupti`, `Energy.perf`, the CUPTI
   C++ extension).
 
-`vllm_env` is a container image (`profiling/container/`). Its CUDA 13.0 build
-also runs on an older datacenter driver: the CUDA base image carries the
-forward-compatibility libraries (`/usr/local/cuda/compat`), which the NVIDIA
-container runtime uses when the host driver predates the image's CUDA (seen on
-driver 570, CUDA 12.8). Nothing on the host side is involved. The host envs `default_env`,
-`flashinfer_pip_env` and `causal_conv1d_env` also have an image (CUDA 12.8,
-`profiling/container/images.py`); `VIBESIM_PROFILE_RUNTIME=container` runs them
-there instead of on the project interpreter, and refuses any env without an
-image. `--remote` profiling always uses it (launcher/README.md "Remote
-execution").
+Every profile env runs its workers in an image
+(`profiling/container/images.py`, `profiling/container/README.md`): build them
+with `just profile-container-build`, and a worker whose image is missing fails
+with the command that builds it. The CUDA 13 images also run on an older
+datacenter driver: the CUDA base image carries the forward-compatibility
+libraries (`/usr/local/cuda/compat`), which the NVIDIA container runtime uses
+when the host driver predates the image's CUDA (seen on driver 570, CUDA 12.8).
 
-`vllm_upstream_fork_env` is a host env: the alignment checkout
-`alignment/profiler/vllm` (or `$VIBESIM_VLLM_FORK_ROOT`) and its own `.venv`. It
-serves the backends that need that checkout rebased onto upstream vLLM (its
-models and newer FlashInfer, DeepGEMM and FlashMLA builds), which the
-`vllm_env` image, built from fork commit 3f667d7, lacks. The worker drops
-inherited site-packages from `PYTHONPATH`, so the project Torch cannot shadow
-the venv's own build. Once the container is rebuilt from the rebased checkout,
-move those backends to `vllm_env` and remove this env.
+`VIBESIM_PROFILE_RUNTIME=host` runs each env on the host interpreter its
+registry entry names instead, for debugging against a local build. Those rows
+carry the same DB key as the image's, so compare them against the image before
+keeping them. The host setups follow.
 
-`flashkda_env` is a host venv at `~/profile_envs/flashkda_env` (a symlink to a
-disk with room is fine) for the `kda_chunk_prefill` `flashkda` backend. It holds
-Torch 2.13.0 (cu130, upstream vLLM's pin) and FlashKDA built from
-`vllm-project/FlashKDA@17a037d98da546deb4591e967cf961a43c034d8b`, the commit
-upstream vLLM vendors as `_flashkda_C`. The project Torch is cu128 and cannot
-build FlashKDA's `sm_100f`/`sm_120f` code, so the backend needs its own venv.
-Build it with a CUDA 13 toolkit:
+`vllm_env` on the host is the alignment checkout `alignment/profiler/vllm` (or
+`$VIBESIM_VLLM_FORK_ROOT`) and its own `.venv`, built as
+`alignment/profiler/README.md` describes. The worker drops inherited
+site-packages from `PYTHONPATH`, so the project Torch cannot shadow the venv's
+own build.
 
-```bash
-uv venv --python 3.12 ~/profile_envs/flashkda_env
-uv pip install --python ~/profile_envs/flashkda_env/bin/python \
-  torch==2.13.0 numpy nvidia-ml-py setuptools wheel packaging ninja
-git clone https://github.com/vllm-project/FlashKDA.git && cd FlashKDA
-git checkout 17a037d98da546deb4591e967cf961a43c034d8b
-git submodule update --init --depth 1 cutlass
-CUDA_HOME=/usr/local/cuda-13.1 FLASH_KDA_CUDA_ARCHS=90a,100f,120f \
-  uv pip install --python ~/profile_envs/flashkda_env/bin/python --no-build-isolation .
-```
-
-The package version (`0.0.1+17a037d`) goes into each row's `backend_version`.
-
-`flashinfer_kda_env` is a host venv at `~/profile_envs/flashinfer_kda` (or a
+`flashinfer_kda_env` on the host is a venv at `~/profile_envs/flashinfer_kda` (or a
 symlink to it) for the `kda_chunk_prefill` `flashinfer_*` backends. FlashInfer's
 Blackwell KDA prefill kernels are only on its main branch, and they need Torch
 cu130, CuTe DSL >= 4.7 and a CUDA-enabled TVM with TIRx, so neither the project

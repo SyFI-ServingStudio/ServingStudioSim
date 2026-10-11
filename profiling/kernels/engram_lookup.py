@@ -129,7 +129,7 @@ register(
             compute=frozenset({DType.FP8_E4M3}),
             min_compute_capability=(8, 9),
         ),
-        subprocess_env="vllm_upstream_fork_env",
+        subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
                 "vLLM's Triton _engram_lookup_kernel through ParallelEngramEmbedding.lookup, "

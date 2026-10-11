@@ -1,5 +1,6 @@
-"""Which environment runs a profile env's worker: its host interpreter, or the
-image `profiling/container/images.py` assigns it (`VIBESIM_PROFILE_RUNTIME`)."""
+"""Which environment runs a profile env's worker: the image
+`profiling/container/images.py` assigns it, or (`VIBESIM_PROFILE_RUNTIME=host`)
+its host interpreter."""
 
 from __future__ import annotations
 
@@ -43,28 +44,62 @@ def test_every_imaged_env_is_a_registered_host_env():
             assert isinstance(ENV_REGISTRY[name], ProfileEnv), name
 
 
-def test_the_host_runtime_is_the_default(monkeypatch):
+def test_every_registered_env_has_an_image():
+    for name in ENV_REGISTRY:
+        assert images.image_for_env(name) is not None, name
+
+
+def test_the_container_runtime_is_the_default(monkeypatch):
     monkeypatch.delenv(PROFILE_RUNTIME_ENV, raising=False)
-    assert isinstance(resolve_profile_env("default_env"), ProfileEnv)
-
-
-def test_the_container_runtime_runs_host_envs_in_their_image(monkeypatch):
-    monkeypatch.setenv(PROFILE_RUNTIME_ENV, "container")
     env = resolve_profile_env(None)
     assert isinstance(env, ContainerProfileEnv)
     assert env.name == "default_env"
     assert env.image == images.IMAGES["default"].tag()
-    assert resolve_profile_env("vllm_env") == ENV_REGISTRY["vllm_env"]
-    assert container_image("vllm_env") == ENV_REGISTRY["vllm_env"].image
+    assert container_image("vllm_env") == images.IMAGES["vllm"].tag()
 
 
-def test_the_container_runtime_refuses_an_env_without_an_image(monkeypatch):
-    monkeypatch.setenv(PROFILE_RUNTIME_ENV, "container")
-    with pytest.raises(ValueError, match="sglang_env.*has no image"):
+def test_the_host_runtime_runs_the_registered_interpreter(monkeypatch):
+    monkeypatch.setenv(PROFILE_RUNTIME_ENV, "host")
+    assert resolve_profile_env("vllm_env") is ENV_REGISTRY["vllm_env"]
+
+
+def test_an_override_names_the_image(monkeypatch):
+    monkeypatch.delenv(PROFILE_RUNTIME_ENV, raising=False)
+    monkeypatch.setenv(images.IMAGES_ENV, '{"sglang_env": "vibesim-profiler-sglang:sent"}')
+    assert resolve_profile_env("sglang_env").image == "vibesim-profiler-sglang:sent"
+    monkeypatch.setenv(images.IMAGES_ENV, '["not", "a", "map"]')
+    with pytest.raises(images.ImageError, match=images.IMAGES_ENV):
         resolve_profile_env("sglang_env")
+
+
+def test_an_env_without_an_image_runs_only_on_the_host(monkeypatch):
+    monkeypatch.setitem(ENV_REGISTRY, "local_env", ProfileEnv("local_env", Path("/bin/true")))
+    monkeypatch.delenv(PROFILE_RUNTIME_ENV, raising=False)
+    with pytest.raises(ValueError, match="local_env.*has no image"):
+        resolve_profile_env("local_env")
+    monkeypatch.setenv(PROFILE_RUNTIME_ENV, "host")
+    assert resolve_profile_env("local_env").name == "local_env"
+
+
+def test_a_missing_image_names_its_build_command(monkeypatch):
+    monkeypatch.setattr(
+        "profiling.exec.env.subprocess.run",
+        lambda *a, **k: __import__("subprocess").CompletedProcess(a, 1, "", "No such image"),
+    )
+    monkeypatch.setattr("profiling.exec.env.shutil.which", lambda _: "/usr/bin/docker")
+    with pytest.raises(FileNotFoundError, match="images build flashinfer-kda"):
+        ContainerProfileEnv("flashinfer_kda_env", "vibesim-profiler-flashinfer-kda:0123").validate()
 
 
 def test_an_unknown_runtime_is_rejected(monkeypatch):
     monkeypatch.setenv(PROFILE_RUNTIME_ENV, "docker")
     with pytest.raises(ValueError, match=PROFILE_RUNTIME_ENV):
         resolve_profile_env("default_env")
+
+
+def test_the_selfcheck_needs_an_env_with_backends(capsys):
+    from profiling.container import selfcheck
+
+    assert selfcheck.main([]) == 2
+    assert selfcheck.main(["no_such_env"]) == 1
+    assert "no backend runs in no_such_env" in capsys.readouterr().err

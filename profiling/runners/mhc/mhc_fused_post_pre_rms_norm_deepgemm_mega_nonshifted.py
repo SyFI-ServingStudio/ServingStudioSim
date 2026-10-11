@@ -21,7 +21,7 @@ streams back from global memory (``ld_evict_first`` in
 The call is DeepGEMM's public ``mega_mhc``, as vLLM re-exports it from
 ``vllm.utils.deep_gemm``. No vLLM model dispatches the non-shifted form yet; the
 alignment fork (rebased on upstream 04730e8) vendors the DeepGEMM build that
-has it, hence ``vllm_upstream_fork_env``.
+has it, hence ``vllm_env``.
 
 DeepGEMM picks the split count (the second template argument) on the host from
 ``num_tokens``, so one args schema covers every specialization; the time steps
@@ -158,7 +158,7 @@ def profile_mhc_fused_post_pre_rms_norm_deepgemm_mega_nonshifted(
         from vllm.utils.deep_gemm import _import_deep_gemm, is_deep_gemm_supported, mega_mhc
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{_KIND} requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)"
+            f"{_KIND} requires the upstream-rebased vLLM fork (vllm_env)"
         ) from exc
 
     try:

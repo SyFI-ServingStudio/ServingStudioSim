@@ -637,6 +637,7 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
         measure_output_dir,
         run_descriptor,
     )
+    from profiling.container.images import IMAGES_ENV
     from profiling.exec.env import PROFILE_RUNTIME_ENV, container_image
 
     from ..managed_job import prepare_managed_job
@@ -706,6 +707,8 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
             command,
             env={
                 PROFILE_RUNTIME_ENV: "container",
+                # The shipped tree has no git to compute the tag from.
+                IMAGES_ENV: json.dumps({profiler_spec.subprocess_env or "default_env": image}),
                 "VIBESIM_PROFILE_CACHE_DIR": str(session.layout.workdir / "cache"),
             },
             keep_db=keep_db,

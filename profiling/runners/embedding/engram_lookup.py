@@ -255,7 +255,7 @@ def profile_engram_lookup_vllm_triton(
         from vllm.models.deepseek_v41.common.engram import ParallelEngramEmbedding
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)"
+            f"{_BACKEND} requires the upstream-rebased vLLM fork (vllm_env)"
         ) from exc
     try:
         device = torch.device("cuda", torch.cuda.current_device())

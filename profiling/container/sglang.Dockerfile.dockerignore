@@ -1,0 +1,20 @@
+# BuildKit reads this instead of /.dockerignore for sglang.Dockerfile: the same
+# exclusions, except that the SGLang checkout is part of this image.
+.git
+**/.git
+**/.venv
+**/__pycache__
+**/*.pyc
+.uv
+target
+logs
+.launcher
+.codex
+.claude
+profiling/profile.db
+*.db-journal
+*.parquet
+*.pftrace
+trace
+alignment/load_generator
+alignment/profiler/vllm

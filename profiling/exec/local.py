@@ -30,7 +30,6 @@ from profiling.profilers.timer import CUPTI_BUDGET_ENV, CUPTI_TRACE_ENV, TIMER_C
 CONTAINER_INDUCTOR_CACHE_ENV = "VIBESIM_CONTAINER_INDUCTOR_CACHE"
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_CONTAINER_SOURCE_MODE_ENV = "VIBESIM_PROFILE_SOURCE_MODE"
 _CONTAINER_SOURCE_DIRS = ("profiling", "launcher", "gpu")
 
 
@@ -201,7 +200,9 @@ def _container_worker_command(
             "VIBESIM_PROFILE_CACHE_DIR",
             Path.home() / ".cache" / "vibesim-profiler",
         )
-    ).resolve()
+    ).resolve() / profiler_env.image.replace("/", "_").replace(":", "_")
+    # Per image: a JIT cache (Torch extensions, Triton, FlashInfer) holds builds
+    # against that image's libraries, which another image cannot load.
     cache_dir.mkdir(parents=True, exist_ok=True)
     # Address the cards by UUID, never by index. See gpu_uuids_for_indices.
     gpu_request = f'"device={",".join(gpu_uuids_for_indices(gpus))}"'
@@ -279,6 +280,10 @@ def _container_worker_command(
             "USER=vibesim",
             "--env",
             "LOGNAME=vibesim",
+            # The CUPTI timer's extension; its default under TMPDIR, /tmp here,
+            # would rebuild it in every container.
+            "--env",
+            "MOESIM_CUPTI_BUILD_DIR=/cache/cupti-ext",
             # Inductor defaults to /tmp/torchinductor_<user>, and /tmp inside a
             # --rm container dies with the container, so every submission
             # recompiles from nothing. /cache is the bind mount below, so this
@@ -305,23 +310,14 @@ def _container_worker_command(
 
 
 def _container_source_volume_args() -> list[str]:
-    """Select current-worktree code for development or the baked image snapshot.
+    """Overlay this checkout's worker code on the image, read-only.
 
-    The image owns the dependency boundary, including the instrumented vLLM
-    checkout, its virtual environment, and native extensions. Development mode
-    overlays only ServingStudioSim's pure-Python worker code and GPU catalog read-only so
-    newly registered profilers run without rebuilding that dependency image.
-    Release measurements can request the fully frozen source snapshot with
-    ``VIBESIM_PROFILE_SOURCE_MODE=image``.
+    The image owns the dependency boundary: the alignment checkouts, their
+    virtual environments and native extensions. ServingStudioSim's pure-Python
+    worker code and GPU catalog come from the checkout, so a code change never
+    rebuilds an image. The copy baked into the image only serves its build-time
+    self-check.
     """
-
-    source_mode = os.environ.get(_CONTAINER_SOURCE_MODE_ENV, "worktree")
-    if source_mode == "image":
-        return []
-    if source_mode != "worktree":
-        raise ValueError(
-            f"{_CONTAINER_SOURCE_MODE_ENV} must be 'worktree' or 'image', got {source_mode!r}"
-        )
 
     volume_args: list[str] = []
     for directory in _CONTAINER_SOURCE_DIRS:

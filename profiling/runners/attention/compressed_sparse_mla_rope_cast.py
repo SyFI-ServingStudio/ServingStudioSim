@@ -511,7 +511,7 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
         )
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{KIND}:flashmla_mega requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)"
+            f"{KIND}:flashmla_mega requires the upstream-rebased vLLM fork (vllm_env)"
         ) from exc
     supported, reason = is_flashmla_mega_attn_supported()
     if not supported:

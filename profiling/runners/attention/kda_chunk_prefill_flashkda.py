@@ -6,12 +6,10 @@ metrics. DB writes, subprocess selection and registry routing live in L1b.
 Upstream vLLM runs this prefill with FlashKDA by default on SM90/SM10x/SM12x
 (``vllm/models/glm5next/common/kda.py``: ``_resolve_kda_prefill_backend`` and
 ``Glm5NextLinearAttention._flashkda_prefill``). vLLM vendors the kernel from
-vllm-project/FlashKDA at ``17a037d98da546deb4591e967cf961a43c034d8b``
-(``cmake/external_projects/flashkda.cmake``) and registers it as
-``torch.ops._flashkda_C.fwd``. ``flashkda_env`` builds the same commit with its
-own ``setup.py``, which registers the same C++ ``fwd`` with the same schema as
-``torch.ops.flash_kda.fwd``. The runner calls that op positionally, exactly as
-``_flashkda_prefill`` does:
+vllm-project/FlashKDA (``cmake/external_projects/flashkda.cmake``, ``b59532f`` at
+the alignment fork's upstream base) and registers it as
+``torch.ops._flashkda_C.fwd``; ``vllm_env`` runs that build. The runner calls the
+op positionally, exactly as ``_flashkda_prefill`` does:
 
 - q/k/v are row-strided ``[1,T,H,K]`` views into one ``[T, 3*H*K]`` short-conv
   output, as in the vllm_triton runner, so their ``.contiguous()`` calls are
@@ -68,10 +66,9 @@ from profiling.runners.exceptions import (
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "kda_chunk_prefill:flashkda"
-# Standalone build of the kernel vLLM vendors; importing it registers
-# torch.ops.flash_kda (vLLM's build registers the same op as torch.ops._flashkda_C).
-_MODULE = "flash_kda"
-_PACKAGE = "flash_kda"
+# vLLM's FlashKDA extension; importing it registers torch.ops._flashkda_C.
+_MODULE = "vllm._flashkda_C"
+_PACKAGE = "vllm"
 # flash_kda.cpp: STD_TORCH_CHECK(D == 128), and K = V.
 HEAD_DIM = 128
 # FlashKDA's own end-to-end tolerance is RMSE-ratio based too. Its recurrent
@@ -79,8 +76,8 @@ HEAD_DIM = 128
 # and store (FlashKDA 17a037d commit message: a ~1.6e-3 floor; 3.1e-3 final
 # state and 4.7e-3 output on real GLM-5.3-Flash activations), so the fork's
 # 5e-3 Triton bound is too tight. Measured on B200 against the per-token oracle
-# with these random inputs, H 8-64, up to 32832 tokens: output 4.1e-3 to
-# 5.7e-3, state 2.4e-3 to 4.7e-3.
+# with these random inputs, vLLM's b59532f build, H 8-64, up to 32832 tokens:
+# output 4.6e-3 to 5.6e-3, state 2.4e-3 to 4.6e-3.
 RMSE_RATIO_TOL = 1e-2
 
 
@@ -126,9 +123,9 @@ def load_fwd(torch: Any) -> Any:
         importlib.import_module(_MODULE)
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires the {_MODULE!r} package (run under flashkda_env)"
+            f"{_BACKEND} requires vLLM's {_MODULE!r} extension (run under vllm_env)"
         ) from exc
-    return torch.ops.flash_kda.fwd, torch.ops.flash_kda.get_workspace_size
+    return torch.ops._flashkda_C.fwd, torch.ops._flashkda_C.get_workspace_size
 
 
 def build_operands(
@@ -227,7 +224,7 @@ def check_correctness(
         raise AssertionError("non-finite or unwritten FlashKDA output or state")
     for name, snapshot in snapshots.items():
         if not torch.equal(getattr(operands, name), snapshot):
-            raise AssertionError(f"flash_kda.fwd mutated {name}")
+            raise AssertionError(f"_flashkda_C.fwd mutated {name}")
 
     expected_o, expected_state = kda_chunk_prefill_reference(
         operands.q.squeeze(0),
@@ -308,10 +305,10 @@ def row_provenance(
     head_dim: int,
     dtype: DType | str,
 ) -> str | None:
-    """The FlashKDA build that measured the row (registry hook)."""
+    """The vLLM build, whose CMake pins the FlashKDA commit (registry hook)."""
     del num_tokens, max_sequence_length, num_decode_sequences, num_heads, head_dim, dtype
     try:
-        return f"flash_kda {importlib.metadata.version(_PACKAGE)}"
+        return f"vllm {importlib.metadata.version(_PACKAGE)} _flashkda_C"
     except importlib.metadata.PackageNotFoundError:
         return None
 

@@ -529,7 +529,7 @@ def test_measure_worker_uses_container_and_mounts_output(tmp_path, monkeypatch):
 
 
 @pytest.mark.gpu
-def test_measure_kernel_writes_artifacts_end_to_end(tmp_path):
+def test_measure_kernel_writes_artifacts_end_to_end(tmp_path, monkeypatch):
     from pathlib import Path
 
     pytest.importorskip("torch")
@@ -544,6 +544,9 @@ def test_measure_kernel_writes_artifacts_end_to_end(tmp_path):
     if not find_idle_gpus():
         pytest.skip("no idle GPU available for the measure smoke run")
 
+    # The host worker: the plots need matplotlib, which the images leave out
+    # (a missing renderer only skips them).
+    monkeypatch.setenv("VIBESIM_PROFILE_RUNTIME", "host")
     output_dir = tmp_path / "measure_smoke"
     result = measure_kernel(
         "single_gemm",

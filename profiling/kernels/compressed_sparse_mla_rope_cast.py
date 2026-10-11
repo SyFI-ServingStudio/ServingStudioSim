@@ -206,7 +206,7 @@ register(
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=_MEGA_SUPPORT,
-        subprocess_env="vllm_upstream_fork_env",
+        subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
                 "FlashMLA's fused_norm_rope_attn_rope_cast decode and prefill kernels, "

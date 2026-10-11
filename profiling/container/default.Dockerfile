@@ -52,8 +52,10 @@ COPY profiling /opt/vibesim/profiling
 COPY launcher /opt/vibesim/launcher
 COPY gpu /opt/vibesim/gpu
 
+# The envs images.py assigns this image (`selfcheck` loads their runners).
+ARG VIBESIM_PROFILE_ENVS
 RUN python -c "import torch, flashinfer, deep_gemm, causal_conv1d; assert torch.version.cuda == '12.8'; print(torch.__version__, flashinfer.__version__)" \
-    && python -m profiling list --json >/dev/null
+    && python -m profiling.container.selfcheck ${VIBESIM_PROFILE_ENVS}
 
 # Last, so a new commit only rewrites the labels, not the dependency layers.
 ARG VIBESIM_REVISION=unknown
@@ -62,7 +64,7 @@ LABEL org.opencontainers.image.title="VibeSim default kernel profiler" \
       org.opencontainers.image.revision="${VIBESIM_REVISION}" \
       ai.vibesim.image.inputs="${VIBESIM_IMAGE_INPUTS}" \
       ai.vibesim.cuda.version="${CUDA_VERSION}" \
-      ai.vibesim.profile-envs="default_env flashinfer_pip_env causal_conv1d_env" \
+      ai.vibesim.profile-envs="${VIBESIM_PROFILE_ENVS}" \
       ai.vibesim.python="/opt/venv/bin/python"
 
 ENTRYPOINT ["/opt/venv/bin/python", "-m", "profiling.exec.local_worker"]
