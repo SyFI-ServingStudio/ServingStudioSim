@@ -480,6 +480,8 @@ pub struct Glm53FlashDpAttnEpModel {
     pub name: String,
     pub dp_size: u16,
     pub max_model_len: u32,
+    /// Query rows each decode request presents (see `Glm53FlashVllmModel`).
+    pub verify_width: u32,
     cudagraph_capture_sizes: Vec<u32>,
     embedding: Op<ElementwiseKernel>,
     hc_expand: Op<ElementwiseKernel>,
@@ -491,6 +493,8 @@ pub struct Glm53FlashDpAttnEpModel {
     total_kv_bytes_per_token: u64,
     recurrent_state_bytes_per_request: u64,
     hybrid_block_size: u32,
+    /// The RecoverSSM commit of a verify graph (see `Glm53FlashVllmModel`).
+    pub(crate) kda_commit: Option<tp_arch::KdaCommitPlan>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -568,6 +572,7 @@ pub fn build(
         )?,
         dp_size: cfg.parallel.dp_size,
         max_model_len: cfg.parallel.max_model_len,
+        verify_width: tp_arch::verify_width(&cfg.local)?,
         cudagraph_capture_sizes: {
             let mut sizes = cfg.parallel.cudagraph_capture_sizes.clone();
             sizes.sort_unstable();
@@ -577,6 +582,7 @@ pub fn build(
         total_kv_bytes_per_token: u64::from(model_cfg.num_dsa_layers()) * dsa_bytes_per_token,
         recurrent_state_bytes_per_request,
         hybrid_block_size,
+        kda_commit: tp_arch::kda_commit_plan(&resolved.local),
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -791,6 +797,7 @@ impl Glm53FlashDpAttnEpModel {
             input,
             self.dp_size,
             self.max_model_len,
+            self.verify_width,
             &self.cudagraph_capture_sizes,
         )
         .unwrap_or_else(|reason| panic!("invalid Glm53FlashDpAttnEpModel input: {reason}"));
@@ -860,6 +867,7 @@ impl IterwiseUnifiedModel for Glm53FlashDpAttnEpModel {
             batch,
             self.dp_size,
             self.max_model_len,
+            self.verify_width,
             &self.cudagraph_capture_sizes,
         )
         .map(|_| ())
@@ -943,6 +951,7 @@ fn normalize_input(
     input: &UnifiedArchInput,
     dp_size: u16,
     max_model_len: u32,
+    verify_width: u32,
     sorted_capture_sizes: &[u32],
 ) -> std::result::Result<NormalizedBatch, String> {
     let dp = usize::from(dp_size);
@@ -987,17 +996,18 @@ fn normalize_input(
             ));
         }
         for (request, &context) in group.decode_kv_lens.iter().enumerate() {
-            if !(1..=max_model_len).contains(&context) {
+            if !(verify_width..=max_model_len).contains(&context) {
                 return Err(format!(
                     "rank {rank} decode request {request} context {context} must be in \
-                     1..={max_model_len}"
+                     {verify_width}..={max_model_len}"
                 ));
             }
         }
-        let decode_tokens = group.decode_kv_lens.len() as u32;
+        let decode_tokens = group.decode_kv_lens.len() as u32 * verify_width;
         if group.decode_tokens != decode_tokens {
             return Err(format!(
-                "rank {rank} decode_tokens {} must equal decode_kv_lens length {decode_tokens}",
+                "rank {rank} decode_tokens {} must equal decode_kv_lens length x verify width \
+                 {verify_width}",
                 group.decode_tokens
             ));
         }
@@ -1010,7 +1020,7 @@ fn normalize_input(
             ));
         }
         let (kda, dsa) = if total == 0 {
-            // `execute_dummy_batch`: one decode token on dummy slots.
+            // `execute_dummy_batch`: one decode request on dummy slots.
             (
                 Glm53KdaAttnLocalWorkletInput {
                     prefill_sequence_lengths: Vec::new(),
@@ -1018,14 +1028,14 @@ fn normalize_input(
                 },
                 Glm53DsaAttnLocalWorkletInput {
                     prefill_chunk_pairs: Vec::new(),
-                    decode_kv_lens: vec![1],
+                    decode_kv_lens: vec![verify_width],
                 },
             )
         } else {
             attention_inputs(&group.prefill_chunk_pairs, &group.decode_kv_lens)
         };
         ranks.push(RankBatch {
-            rows: total.max(1),
+            rows: total.max(verify_width),
             logits_rows: group.request_count(),
             kda,
             dsa,
@@ -1290,6 +1300,7 @@ mod tests {
             ]),
             4,
             131072,
+            1,
             &[],
         )
         .unwrap();
@@ -1313,6 +1324,7 @@ mod tests {
             ]),
             4,
             131072,
+            1,
             &sizes,
         )
         .unwrap();
@@ -1328,6 +1340,7 @@ mod tests {
             ]),
             4,
             131072,
+            1,
             &sizes,
         )
         .unwrap();
@@ -1344,18 +1357,18 @@ mod tests {
             prefill(0, 8),
         ]);
         bad.tokens_per_source_rank[1] = 7;
-        assert!(normalize_input(&bad, 4, 131072, &[]).is_err());
+        assert!(normalize_input(&bad, 4, 131072, 1, &[]).is_err());
         let empty = input(vec![ArchGroupInput::default(); 4]);
-        assert!(normalize_input(&empty, 4, 131072, &[]).is_err());
+        assert!(normalize_input(&empty, 4, 131072, 1, &[]).is_err());
         let three = input(vec![prefill(0, 8); 3]);
-        assert!(normalize_input(&three, 4, 131072, &[]).is_err());
+        assert!(normalize_input(&three, 4, 131072, 1, &[]).is_err());
         let long = input(vec![
             prefill(131000, 100),
             prefill(0, 8),
             prefill(0, 8),
             prefill(0, 8),
         ]);
-        assert!(normalize_input(&long, 4, 131072, &[]).is_err());
+        assert!(normalize_input(&long, 4, 131072, 1, &[]).is_err());
     }
 
     #[test]

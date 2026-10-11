@@ -131,6 +131,13 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     /// in bytes): the fp32 `[rows, pools]` matrix of one MQA-logits call stays
     /// within it, and each call is followed by its own top-k.
     pub indexer_max_logits_bytes: u64,
+    /// Query rows per decode request: 1 for plain decode, `k + 1` for a
+    /// speculative verify, whose rows sit at the request's last `k + 1`
+    /// positions. The decode indexer scores a request's rows in one group
+    /// (DeepGEMM `fp8_paged_mqa_logits` at `next_n`, one read of the request's
+    /// index keys) and its top-k selects per row; every other leaf, sparse MLA
+    /// included, bills the flattened rows.
+    pub decode_next_n: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -171,7 +178,8 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
 pub struct Glm53DsaAttnLocalWorkletInput {
     /// `(prefix, append)` per prefill request.
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
-    /// KV length per decode request, including the token being decoded.
+    /// KV length per decode request, including every query row it presents
+    /// (`decode_next_n` of them, ending at this length).
     pub decode_kv_lens: Vec<u32>,
 }
 
@@ -289,7 +297,7 @@ impl Glm53DsaAttnLocalWorklet {
             mqa_logits_decode: DsaPagedMqaLogitsDecodeKernelConfig {
                 backends: cfg.mqa_logits_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                next_n: 1,
+                next_n: cfg.decode_next_n,
                 max_model_len: max_model_len.clone(),
                 num_heads: cfg.index_num_heads.clone(),
                 head_dim: cfg.index_head_dim.clone(),
@@ -307,7 +315,7 @@ impl Glm53DsaAttnLocalWorklet {
             topk_decode: DsaPersistentTopkDecodeKernelConfig {
                 backends: cfg.topk_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                next_n: 1,
+                next_n: cfg.decode_next_n,
                 max_model_len: max_model_len.clone(),
                 top_k: cfg.index_topk / kpool,
                 logits_row_stride: max_model_len,
@@ -604,7 +612,7 @@ impl Glm53DsaAttnLocalWorklet {
         push_or_zero(
             &self.mqa_logits_decode,
             DsaPagedMqaLogitsDecodeKernelInput {
-                batch_size: w.decode_rows,
+                batch_size: w.decode_requests,
                 context_len: w.decode_pools,
             },
             no_decode,
@@ -613,7 +621,7 @@ impl Glm53DsaAttnLocalWorklet {
         push_or_zero(
             &self.topk_decode,
             DsaPersistentTopkDecodeKernelInput {
-                batch_size: w.decode_rows,
+                batch_size: w.decode_requests,
                 context_len: w.decode_pools,
             },
             no_decode,
@@ -642,7 +650,10 @@ impl Glm53DsaAttnLocalWorklet {
                     .iter()
                     .map(|&(prefix, append)| (append, prefix + append))
                     .collect(),
-                decode_context_lens: input.decode_kv_lens.clone(),
+                decode_context_lens: decode_row_context_lens(
+                    &input.decode_kv_lens,
+                    cfg.decode_next_n,
+                ),
             },
             ev,
         );
@@ -663,6 +674,7 @@ impl Glm53DsaAttnLocalWorklet {
     fn indexer_budget(&self) -> IndexerBudget {
         let cfg = &self.resolved.raw_cfg;
         IndexerBudget {
+            decode_next_n: cfg.decode_next_n,
             index_topk: cfg.index_topk,
             index_kpool: cfg.index_kpool,
             max_logits_elems: cfg.indexer_max_logits_bytes / u64::from(DType::Fp32.size_bytes()),
@@ -719,6 +731,8 @@ struct Work {
     total_tokens: u32,
     prefill_tokens: u32,
     decode_rows: u32,
+    /// Decode requests: `decode_rows / decode_next_n`.
+    decode_requests: u32,
     /// `ceil(max decode context / index_kpool)`.
     decode_pools: u32,
     /// Every prefill row once any prefill context exceeds `index_topk`, else
@@ -735,6 +749,7 @@ const PREFILL_KEY_WORKSPACE_PER_MODEL_LEN: u64 = 40;
 
 /// What bounds the prefill indexer's launches.
 struct IndexerBudget {
+    decode_next_n: u32,
     index_topk: u32,
     index_kpool: u32,
     /// fp32 logits elements one call may hold.
@@ -858,10 +873,16 @@ fn derive_work(
     } else {
         (0, Vec::new())
     };
-    let decode_rows = input.decode_kv_lens.len() as u32;
-    if input.decode_kv_lens.contains(&0) {
-        return Err("decode KV lengths must be positive".into());
+    let decode_requests = input.decode_kv_lens.len() as u32;
+    let next_n = budget.decode_next_n;
+    if input.decode_kv_lens.iter().any(|&context| context < next_n) {
+        return Err(format!(
+            "decode KV lengths must cover their decode_next_n {next_n} query rows"
+        ));
     }
+    let decode_rows = decode_requests
+        .checked_mul(next_n)
+        .ok_or("decode row count overflows u32")?;
     let max_decode = input.decode_kv_lens.iter().copied().max().unwrap_or(0);
     let total_tokens = prefill_tokens
         .checked_add(decode_rows)
@@ -873,10 +894,19 @@ fn derive_work(
         total_tokens,
         prefill_tokens,
         decode_rows,
+        decode_requests,
         decode_pools: max_decode.div_ceil(index_kpool),
         prefill_indexer_rows,
         prefill_indexer_chunks,
     })
+}
+
+/// Each request's query rows, at its last `next_n` positions.
+fn decode_row_context_lens(kv_lens: &[u32], next_n: u32) -> Vec<u32> {
+    kv_lens
+        .iter()
+        .flat_map(|&kv_len| kv_len + 1 - next_n..=kv_len)
+        .collect()
 }
 
 /// `sum over x in 1..=n of x / kpool`: the pools spanned by the rows at
@@ -931,12 +961,14 @@ mod tests {
             elementwise_backends: vec!["triton"],
             mla_layout_copies: true,
             indexer_max_logits_bytes: 512 << 20,
+            decode_next_n: 1,
         }
     }
 
     /// vLLM's defaults: 512 MiB of fp32 logits, `40 * 1M` workspace pools.
     fn budget() -> IndexerBudget {
         IndexerBudget {
+            decode_next_n: 1,
             index_topk: 2048,
             index_kpool: 4,
             max_logits_elems: (512 << 20) / 4,
@@ -977,6 +1009,35 @@ mod tests {
         assert_eq!((r.v_up.n.get(), r.v_up.k.get()), (256, 512));
         assert_eq!(r.sparse_mla.softmax_scale_denominator, 16);
         assert_eq!(r.expand_pools.output_bytes_per_token.get(), 4 * 2051);
+    }
+
+    /// Catches a verify graph whose indexer bills each query row as its own
+    /// request (re-reading the index keys `next_n` times) or that loses rows.
+    #[test]
+    fn a_verify_request_scores_its_rows_in_one_indexer_group() {
+        let budget = IndexerBudget {
+            decode_next_n: 8,
+            ..budget()
+        };
+        let input = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![1000, 4001],
+        };
+        let w = derive_work(&input, &budget).unwrap();
+        assert_eq!(
+            (w.decode_requests, w.decode_rows, w.total_tokens),
+            (2, 16, 16)
+        );
+        assert_eq!(w.decode_pools, 1001);
+        assert_eq!(
+            decode_row_context_lens(&[10, 50], 4),
+            [7, 8, 9, 10, 47, 48, 49, 50]
+        );
+        let short = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![7],
+        };
+        assert!(derive_work(&short, &budget).is_err());
     }
 
     #[test]

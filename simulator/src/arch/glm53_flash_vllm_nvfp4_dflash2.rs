@@ -1,26 +1,37 @@
 //! GLM-5.3-Flash NVFP4 with a DFlash2 block-parallel proposer.
 //!
-//! A composition of two models that already exist, with no new L1 kernel:
+//! A composition of two models:
 //!
-//! - the **target** is the ordinary GLM-5.3-Flash graph, either the TP/EP one
+//! - the **target** is the GLM-5.3-Flash graph, either the TP/EP one
 //!   ([`Glm53FlashVllmModel`]) or the DP-attention/EP one
-//!   ([`Glm53FlashDpAttnEpModel`]), compiled unchanged;
+//!   ([`Glm53FlashDpAttnEpModel`]), compiled at verify width
+//!   `draft_tokens + 1`;
 //! - the **proposer** is the `incoai/GLM-5.3-Flash-DFlash2` checkpoint
 //!   (five GQA layers, hidden 4096, block 8) priced through the shared
 //!   [`Dflash2DraftStage`], one per attention DP rank.
 //!
-//! # The verify pass is billed as decode rows
+//! # The verify pass
 //!
-//! A verify step scores `draft_tokens + 1` query rows per resident request.
-//! The Flash graph has no multi-query decode path: its DSA indexer and sparse
-//! MLA are built at `next_n = 1` and the KDA recurrent kernel steps one token.
-//! So each verify row is lowered to its own decode row at its own context
-//! length, and every kernel the target bills is a profiled decode kernel.
+//! A verify step scores `draft_tokens + 1` query rows per resident request,
+//! and the target takes each request once with that many rows. Each kernel
+//! bills the work it does on them:
 //!
-//! That is an upper bound on the verify cost, not a measurement: the rows of
-//! one request re-read that request's KV, indexer keys and KDA state once per
-//! row, where a multi-query kernel would read them once. Nothing here was
-//! aligned against a speculative Flash capture.
+//! - the DSA indexer scores a request's rows in one DeepGEMM paged MQA-logits
+//!   group (`next_n` = width), reading the request's index keys once; top-k,
+//!   sparse MLA and every projection run per row;
+//! - KDA verifies with RecoverSSM: the verify reads the request's checkpoint
+//!   state once and caches a correction and a key/gate vector per row, and a
+//!   commit folds the accepted rows into the state with one read and one write.
+//!   vLLM commits once per KDA KV-cache group (9, 9, 8 and 8 layers), and the
+//!   commit of a rank's requests costs their mean committed rows (the target
+//!   token plus the accepted drafts). The store holds one state plus those
+//!   per-row vectors, not a state per row;
+//! - MoE routing groups the request's consecutive rows (`verify_width` of the
+//!   expert demand).
+//!
+//! A request whose first step after a P/D transfer has no draft yet is billed
+//! as a full-width request. Nothing here was aligned against a speculative
+//! Flash capture.
 //!
 //! # The proposer
 //!
@@ -38,9 +49,15 @@ use crate::arch::contract::{
     UnifiedArchInput,
 };
 use crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpModel;
-use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::Glm53FlashVllmModel;
+use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
+    atomic, push, Glm53FlashVllmModel, KdaCommitPlan,
+};
 use crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::{
     draft_kv_bytes_per_token, Dflash2DraftResolved, Dflash2DraftStage,
+};
+use crate::op::Op;
+use crate::timing::kernels::{
+    KdaRecoverSSMCommitKernel, KdaRecoverSSMCommitKernelConfig, KdaRecoverSSMCommitKernelInput,
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
@@ -52,11 +69,23 @@ const ARCH_KIND: &str = "glm53_flash_vllm_nvfp4_dflash2";
 /// A Flash graph a DFlash2 verify pass can run on: compiled as one node beside
 /// the draft, and filled from an ordinary unified batch.
 pub trait Glm53FlashVerifyTarget: IterwiseUnifiedModel {
+    /// Query rows per decode request the graph was compiled for.
+    fn verify_width(&self) -> u32;
+    /// The RecoverSSM commit its KDA layers need after a verify.
+    fn kda_commit(&self) -> Option<&KdaCommitPlan>;
     fn compile_target(&self, builder: &mut CostTreeBuilder) -> CostNode;
     fn eval_target(&self, input: &UnifiedArchInput, ev: &mut Evaluator);
 }
 
 impl Glm53FlashVerifyTarget for Glm53FlashVllmModel {
+    fn verify_width(&self) -> u32 {
+        self.verify_width
+    }
+
+    fn kda_commit(&self) -> Option<&KdaCommitPlan> {
+        self.kda_commit.as_ref()
+    }
+
     fn compile_target(&self, builder: &mut CostTreeBuilder) -> CostNode {
         self.compile_root(builder)
     }
@@ -67,6 +96,14 @@ impl Glm53FlashVerifyTarget for Glm53FlashVllmModel {
 }
 
 impl Glm53FlashVerifyTarget for Glm53FlashDpAttnEpModel {
+    fn verify_width(&self) -> u32 {
+        self.verify_width
+    }
+
+    fn kda_commit(&self) -> Option<&KdaCommitPlan> {
+        self.kda_commit.as_ref()
+    }
+
     fn compile_target(&self, builder: &mut CostTreeBuilder) -> CostNode {
         self.compile_root(builder)
     }
@@ -79,6 +116,9 @@ impl Glm53FlashVerifyTarget for Glm53FlashDpAttnEpModel {
 /// GLM-5.3-Flash NVFP4 deployed with a DFlash2 proposer in front of it.
 pub struct Glm53FlashVllmNvfp4Dflash2Model<T> {
     target: T,
+    /// One RecoverSSM commit call per KDA KV-cache group, run on every
+    /// attention DP rank.
+    commit: Vec<Op<KdaRecoverSSMCommitKernel>>,
     /// One proposer per attention DP group, in group order.
     drafts: Vec<Dflash2DraftStage>,
     /// Candidate positions drafted per request per iteration. The compiled tree
@@ -109,18 +149,41 @@ impl<T: Glm53FlashVerifyTarget> Glm53FlashVllmNvfp4Dflash2Model<T> {
                 children: drafts,
             }
         };
+        let commit_ranks: Vec<CostNode> = self
+            .drafts
+            .iter()
+            .map(|_| {
+                CostNode::Sum(
+                    self.commit
+                        .iter()
+                        .map(|op| op.compile(&mut builder))
+                        .collect(),
+                )
+            })
+            .collect();
         let width = self.draft_tokens + 1;
         builder.finish(CostNode::Labeled {
             label: format!(
-                "GLM-5.3-Flash NVFP4 + DFlash2 [draft_tokens={}; verify width={width} as decode rows; \
+                "GLM-5.3-Flash NVFP4 + DFlash2 [draft_tokens={}; verify width={width}; \
                  {} draft rank(s)]",
                 self.draft_tokens,
                 self.drafts.len()
             ),
             child: Box::new(CostNode::Sum(vec![
                 CostNode::Labeled {
-                    label: format!("target verify [{width} decode rows per resident request]"),
+                    label: format!("target verify [{width} query rows per resident request]"),
                     child: Box::new(target),
+                },
+                CostNode::Labeled {
+                    label: format!(
+                        "kda recoverssm commit [{} KDA cache group call(s); Max over attention DP \
+                         ranks]",
+                        self.commit.len()
+                    ),
+                    child: Box::new(CostNode::Max {
+                        overlap: 1.0,
+                        children: commit_ranks,
+                    }),
                 },
                 CostNode::Labeled {
                     label: "dflash2 proposer [Max over attention DP ranks]".to_string(),
@@ -134,7 +197,26 @@ impl<T: Glm53FlashVerifyTarget> Glm53FlashVllmNvfp4Dflash2Model<T> {
         self.check_input(input).unwrap_or_else(|reason| {
             panic!("invalid Glm53FlashVllmNvfp4Dflash2Model input: {reason}")
         });
-        self.target.eval_target(&verify_as_decode_rows(input), ev);
+        self.target.eval_target(&verify_batch(input), ev);
+        for group in &input.groups {
+            let requests = group.decode_requests.len() as u32;
+            let committed: u32 = group.decode_requests.iter().map(|d| d.committed_rows).sum();
+            let commit = KdaRecoverSSMCommitKernelInput {
+                batch_size: requests,
+                mean_commit_len: if requests == 0 {
+                    1.0
+                } else {
+                    f64::from(committed) / f64::from(requests)
+                },
+            };
+            for op in &self.commit {
+                if requests == 0 {
+                    ev.push(LeafMetrics::ZERO, || commit.clone().into());
+                } else {
+                    push(op, commit.clone(), ev);
+                }
+            }
+        }
         for (draft, group) in self.drafts.iter().zip(&input.groups) {
             let endpoints: Vec<u32> = group
                 .prefill_chunk_pairs
@@ -177,31 +259,20 @@ impl<T: Glm53FlashVerifyTarget> Glm53FlashVllmNvfp4Dflash2Model<T> {
 }
 
 /// The verify batch as the target sees it: prefill chunks unchanged, and each
-/// decode request's `query_len` rows as that many decode rows ending at its
-/// final KV length.
-fn verify_as_decode_rows(input: &SpeculativeArchInput) -> UnifiedArchInput {
+/// decode request as one entry at its final KV length that presents the
+/// target's verify width of query rows.
+fn verify_batch(input: &SpeculativeArchInput) -> UnifiedArchInput {
     UnifiedArchInput {
         groups: input
             .groups
             .iter()
-            .map(|group| {
-                let decode_kv_lens: Vec<u32> = group
-                    .decode_requests
-                    .iter()
-                    .flat_map(|decode| {
-                        let first = decode.kv_len - decode.query_len + 1;
-                        first..=decode.kv_len
-                    })
-                    .collect();
-                let decode_tokens = decode_kv_lens.len() as u32;
-                ArchGroupInput {
-                    batch_tokens: group.prefill_tokens + decode_tokens,
-                    prefill_tokens: group.prefill_tokens,
-                    decode_tokens,
-                    prefill_chunk_pairs: group.prefill_chunk_pairs.clone(),
-                    decode_kv_lens,
-                    total_kv_len: group.total_kv_len,
-                }
+            .map(|group| ArchGroupInput {
+                batch_tokens: group.batch_tokens,
+                prefill_tokens: group.prefill_tokens,
+                decode_tokens: group.decode_tokens,
+                prefill_chunk_pairs: group.prefill_chunk_pairs.clone(),
+                decode_kv_lens: group.decode_requests.iter().map(|d| d.kv_len).collect(),
+                total_kv_len: group.total_kv_len,
             })
             .collect(),
         tokens_per_source_rank: input.tokens_per_source_rank.clone(),
@@ -226,11 +297,14 @@ impl<T: Glm53FlashVerifyTarget> SpeculativeUnifiedModel for Glm53FlashVllmNvfp4D
         let width = self.draft_tokens + 1;
         for (index, group) in batch.groups.iter().enumerate() {
             for decode in &group.decode_requests {
-                if decode.query_len != width || decode.kv_len < width {
+                if decode.query_len != width
+                    || decode.kv_len < width
+                    || !(1..=width).contains(&decode.committed_rows)
+                {
                     return Err(format!(
-                        "group {index} decode request (kv_len {}, query_len {}) needs query_len {width} \
-                         and kv_len >= it",
-                        decode.kv_len, decode.query_len
+                        "group {index} decode request (kv_len {}, query_len {}, committed_rows {}) \
+                         needs query_len {width}, kv_len >= it and 1..={width} committed rows",
+                        decode.kv_len, decode.query_len, decode.committed_rows
                     ));
                 }
             }
@@ -241,7 +315,7 @@ impl<T: Glm53FlashVerifyTarget> SpeculativeUnifiedModel for Glm53FlashVllmNvfp4D
                 return Err(format!("group {index} token counts are inconsistent"));
             }
         }
-        self.target.check_input(&verify_as_decode_rows(batch))
+        self.target.check_input(&verify_batch(batch))
     }
 
     fn total_kv_bytes_per_token(&self) -> u64 {
@@ -318,12 +392,43 @@ pub fn build<T: Glm53FlashVerifyTarget>(
     draft: &Dflash2DraftResolved,
     bridge: &PerfApiBridge,
 ) -> Result<Glm53FlashVllmNvfp4Dflash2Model<T>, BuildError> {
-    if draft_tokens == 0 {
+    if draft_tokens == 0 || target.verify_width() != draft_tokens + 1 {
         return Err(BuildError::FitFailed {
             kind: ARCH_KIND,
-            reason: "DFlash2 draft_tokens must be positive".to_string(),
+            reason: format!(
+                "DFlash2 draft_tokens {draft_tokens} needs a target compiled at verify width \
+                 draft_tokens + 1, got {}",
+                target.verify_width()
+            ),
         });
     }
+    let plan = target.kda_commit().ok_or_else(|| BuildError::FitFailed {
+        kind: ARCH_KIND,
+        reason: "the verify target compiled no RecoverSSM commit plan".to_string(),
+    })?;
+    let commit = plan
+        .cache_group_layers
+        .iter()
+        .enumerate()
+        .map(|(index, &layers)| {
+            let verify = &plan.verify;
+            atomic(
+                name,
+                &format!("kda_recoverssm_commit_group{index}"),
+                KdaRecoverSSMCommitKernelConfig {
+                    backends: verify.backends.clone(),
+                    gpu_name: verify.gpu_name.clone(),
+                    num_heads: verify.num_heads.clone(),
+                    head_dim: verify.head_dim.clone(),
+                    spec_query_len: verify.spec_query_len.clone(),
+                    num_layers: layers.into(),
+                    dtype: verify.dtype,
+                },
+                KdaRecoverSSMCommitKernel::build,
+                bridge,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let groups = usize::from(target.num_attn_dp_groups().max(1));
     let drafts = (0..groups)
         .map(|_| Dflash2DraftStage::build(format!("{name}.dflash2"), draft, bridge))
@@ -336,6 +441,7 @@ pub fn build<T: Glm53FlashVerifyTarget>(
         })?;
     let mut model = Glm53FlashVllmNvfp4Dflash2Model {
         target,
+        commit,
         drafts,
         draft_tokens,
         max_model_len,
@@ -355,10 +461,9 @@ mod tests {
     use crate::arch::contract::{SpeculativeArchGroupInput, SpeculativeDecodeInput};
 
     #[test]
-    fn each_verify_row_becomes_a_decode_row_at_its_own_context() {
-        // Two decodes at width 4 beside one prefill chunk: the target must see
-        // eight decode rows ending at each request's final KV length, and the
-        // prefill chunk unchanged.
+    fn each_verify_request_reaches_the_target_once_at_its_final_context() {
+        // Two decodes at width 4 beside one prefill chunk: the target sees two
+        // decode requests at their final KV lengths, and eight decode tokens.
         let input = SpeculativeArchInput {
             draft_tokens: 3,
             groups: vec![SpeculativeArchGroupInput {
@@ -370,24 +475,26 @@ mod tests {
                     SpeculativeDecodeInput {
                         kv_len: 10,
                         query_len: 4,
+                        committed_rows: 2,
                     },
                     SpeculativeDecodeInput {
                         kv_len: 50,
                         query_len: 4,
+                        committed_rows: 4,
                     },
                 ],
                 total_kv_len: 6 + 46,
             }],
             tokens_per_source_rank: vec![24],
         };
-        let rows = verify_as_decode_rows(&input);
-        let group = &rows.groups[0];
-        assert_eq!(group.decode_kv_lens, vec![7, 8, 9, 10, 47, 48, 49, 50]);
+        let target = verify_batch(&input);
+        let group = &target.groups[0];
+        assert_eq!(group.decode_kv_lens, vec![10, 50]);
         assert_eq!(group.decode_tokens, 8);
         assert_eq!(group.prefill_tokens, 16);
         assert_eq!(group.batch_tokens, 24);
         assert_eq!(group.prefill_chunk_pairs, vec![(100, 16)]);
         assert_eq!(group.total_kv_len, 52);
-        assert_eq!(rows.tokens_per_source_rank, vec![24]);
+        assert_eq!(target.tokens_per_source_rank, vec![24]);
     }
 }

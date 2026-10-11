@@ -589,7 +589,7 @@ impl Glm53FlashVllmFp8PpStageModel {
     }
 
     fn normalize(&self, input: &UnifiedArchInput) -> NormalizedBatch {
-        normalize_input(input, self.max_model_len).unwrap_or_else(|reason| {
+        normalize_input(input, self.max_model_len, 1).unwrap_or_else(|reason| {
             panic!("invalid Glm53FlashVllmFp8PpStageModel input: {reason}")
         })
     }
@@ -597,7 +597,7 @@ impl Glm53FlashVllmFp8PpStageModel {
 
 impl IterwiseUnifiedModel for Glm53FlashVllmFp8PpStageModel {
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
-        normalize_input(batch, self.max_model_len).map(|_| ())
+        normalize_input(batch, self.max_model_len, 1).map(|_| ())
     }
 
     /// This stage's DSA layers only: vLLM allocates cache per stage.
@@ -740,7 +740,7 @@ impl Glm53FlashVllmFp8PpModel {
     }
 
     fn normalize(&self, input: &UnifiedArchInput) -> NormalizedBatch {
-        normalize_input(input, self.max_model_len)
+        normalize_input(input, self.max_model_len, 1)
             .unwrap_or_else(|reason| panic!("invalid Glm53FlashVllmFp8PpModel input: {reason}"))
     }
 
@@ -753,7 +753,7 @@ impl Glm53FlashVllmFp8PpModel {
 
 impl IterwiseUnifiedModel for Glm53FlashVllmFp8PpModel {
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
-        normalize_input(batch, self.max_model_len).map(|_| ())
+        normalize_input(batch, self.max_model_len, 1).map(|_| ())
     }
 
     /// The physical total over all stages: each stage caches only its own
