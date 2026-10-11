@@ -652,6 +652,7 @@ def test_managed_measure_registration_carries_analyzer_resource_id(
             telemetry_hz=20.0,
             telemetry=True,
             clear_l2=True,
+            cuda_graph=False,
             energy=True,
         )
     )

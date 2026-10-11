@@ -1,6 +1,6 @@
 //! On-demand exact optimality details for one `(worker, iter_id)`. The waterfall
 //! and kernel ladder have separate transport contracts, while both reuse this
-//! module's all-row fold so their R0..R5 values (with R4a) are defined identically.
+//! module's all-row fold so their R0..R5 values (with R4a, R4b) are defined identically.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -163,6 +163,7 @@ async fn iteration_kernel_ladder_with_gpu(
             "gpu_spec_matched": analysis.exact.gpu_spec_matched,
             "peaks_source": analysis.exact.peaks_source,
             "achievable_peaks_source": analysis.exact.achievable_peaks_source,
+            "sustained_rates_available": analysis.exact.gpu_spec.has_sustained(),
             "gpu_count": analysis.exact.gpu_count,
             "folded_rows": analysis.exact.folded_rows,
             "batch_size_locked": lock_batch_size,
@@ -264,6 +265,7 @@ async fn iteration_waterfall_with_gpu(
             "gpu_spec_matched": analysis.exact.gpu_spec_matched,
             "peaks_source": analysis.exact.peaks_source,
             "achievable_peaks_source": analysis.exact.achievable_peaks_source,
+            "sustained_rates_available": analysis.exact.gpu_spec.has_sustained(),
             "gpu_count": analysis.exact.gpu_count,
             "folded_rows": analysis.exact.folded_rows,
             "batch_size_locked": lock_batch_size,

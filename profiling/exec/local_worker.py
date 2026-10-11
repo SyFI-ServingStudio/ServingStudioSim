@@ -127,6 +127,7 @@ def _build_measure_context(
         telemetry_hz=float(measure_request.get("telemetry_hz", 20.0)),
         clear_l2=bool(measure_request.get("clear_l2", True)),
         telemetry=bool(measure_request.get("telemetry", True)),
+        cuda_graph=bool(measure_request.get("cuda_graph", False)),
     )
 
 

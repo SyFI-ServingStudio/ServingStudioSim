@@ -54,6 +54,8 @@ def run_measure_capture(fn: Callable[[], object], context: MeasureContext) -> fl
 
     output_dir = Path(context.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if context.cuda_graph:
+        fn = graph_replay(fn)
 
     sampler = None
     capture_hook = None
@@ -125,6 +127,30 @@ def run_measure_capture(fn: Callable[[], object], context: MeasureContext) -> fl
     context.time_ms = median_ms
     context.artifacts = [str(path) for path in artifacts]
     return median_ms
+
+
+def graph_replay(fn: Callable[[], object]) -> Callable[[], object]:
+    """Capture one call of ``fn`` into a CUDA graph and return its replay.
+
+    A replay costs microseconds of host time, so the host stays ahead of any
+    kernel longer than that and the GPU runs launches back to back. Warm-up runs
+    on a side stream first, as graph capture requires (lazy init, autotuning,
+    JIT compilation must not happen during capture).
+    """
+
+    import torch
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            fn()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    torch.cuda.synchronize()
+    return graph.replay
 
 
 def _render_optional_plot(render: Callable[[], None]) -> tuple[bool, str | None]:

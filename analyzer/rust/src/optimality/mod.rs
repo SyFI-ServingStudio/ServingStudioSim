@@ -15,7 +15,8 @@
 //! | R2 Balanced        | real times, Max→mean | **imbalance** (DP/EP straggler)|
 //! | R3 per-config best | work / grid-peak rate | **batching** (small-batch loss)|
 //! | R4 ignore network  | R3, comm leaves→0  | **communication**               |
-//! | R4a achievable limit | active work unit / best measured GEMM or large copy | **kernel gap** |
+//! | R4a sustained limit | active work unit / back-to-back GEMM or large copy (`gpu/spec.json` `sustained`) | **kernel gap** |
+//! | R4b achievable peak | active work unit / best measured GEMM or large copy (`profile.db`) | **power gap** (power-capped clocks) |
 //! | R5 hardware limit  | active work unit / matching spec peak | **hardware gap** (achievable↔spec) |
 //! | R6 segmented necessary | Σ per-location semantic rooflines | **redundant work**    |
 //! | R7 scope-fused necessary | one roofline over this scope's semantic work | **fusion** |
@@ -70,8 +71,9 @@
 //! - `kernel.rs` — the kernel tier: per-location bars, per-worker kernel ladders,
 //!   and analyzer-owned pool/cluster ladder rollups.
 //! - `grid_peaks.rs` — the R3 grid-peak ceiling sidecar.
-//! - `achievable.rs` — the R4a best-measured GEMM / large-copy ceiling sidecar.
-//! - `spec.rs` — the R5 GPU-spec compute/bandwidth ceilings.
+//! - `achievable.rs` — the R4b best-measured GEMM / large-copy ceiling sidecar.
+//! - `spec.rs` — the R5 GPU-spec compute/bandwidth ceilings and the R4a
+//!   sustained rates.
 
 mod achievable;
 mod compute_dtype;
@@ -96,21 +98,23 @@ pub use run::run_optimality;
 pub(crate) use scoped::{compute_scoped, run_scoped};
 
 /// Waterfall segment order (top of the Real bar → the irreducible floor).
-pub(crate) const BUCKET_KEYS: [&str; 7] = [
+pub(crate) const BUCKET_KEYS: [&str; 8] = [
     "idle",
     "imbalance",
     "batching",
     "communication",
     "kernel_gap",
+    "power_gap",
     "hardware_gap",
     "hardware_optimal",
 ];
-pub(crate) const RUNG_KEYS: [&str; 7] = [
+pub(crate) const RUNG_KEYS: [&str; 8] = [
     "real",
     "busy",
     "balanced",
     "per_config_best",
     "ignore_network",
+    "sustained_limit",
     "achievable_limit",
     "hardware_limit",
 ];
@@ -127,10 +131,10 @@ pub(crate) const FLOOR_BUCKET_KEYS: [&str; 3] =
 pub(crate) const FLOOR_RUNG_KEYS: [&str; 2] = ["segmented_necessary", "hardware_necessary"];
 
 /// Waterfall bucket keys in top-down order, with the green split into the three floor
-/// sub-buckets when the labeler floors are present (else the plain 7).
+/// sub-buckets when the labeler floors are present (else the plain 8).
 pub(crate) fn bucket_keys(with_floors: bool) -> Vec<&'static str> {
     if with_floors {
-        BUCKET_KEYS[..6]
+        BUCKET_KEYS[..7]
             .iter()
             .copied()
             .chain(FLOOR_BUCKET_KEYS)
@@ -148,11 +152,12 @@ pub(crate) fn rung_keys(with_floors: bool) -> Vec<&'static str> {
         RUNG_KEYS.to_vec()
     }
 }
-/// The five attributable rungs a kernel carries (R2..R5 with R4a); no idle/imbalance.
-pub(crate) const KERNEL_RUNG_KEYS: [&str; 5] = [
+/// The six attributable rungs a kernel carries (R2..R5 with R4a, R4b); no idle/imbalance.
+pub(crate) const KERNEL_RUNG_KEYS: [&str; 6] = [
     "balanced",
     "per_config_best",
     "ignore_network",
+    "sustained_limit",
     "achievable_limit",
     "hardware_limit",
 ];
