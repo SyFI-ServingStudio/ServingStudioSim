@@ -63,9 +63,10 @@ const RECOVERSSM_VERIFY_FP32_BACKENDS: &[&str] = &["vllm_triton"];
 /// `disable_state_update`) is a drop-in for the fork op; best-of-N keeps the
 /// faster.
 const RECOVERSSM_VERIFY_BF16_BACKENDS: &[&str] = &["flashinfer_cute", "vllm_triton"];
-/// The RecoverSSM commit ships only as the vLLM fork's Triton kernels;
-/// FlashInfer has no commit.
-pub const RECOVERSSM_COMMIT_BACKENDS: &[&str] = &["vllm_triton"];
+/// The RecoverSSM commit: this repository's closed-form TileLang fold and the
+/// vLLM fork's Triton kernels (FlashInfer has no commit); best-of-N keeps the
+/// faster.
+pub const RECOVERSSM_COMMIT_BACKENDS: &[&str] = &["tilelang", "vllm_triton"];
 /// Beta sigmoid ahead of a prefill core that takes beta already passed
 /// through one: reads the bf16 logits, writes fp32 (capture 20260924_0).
 const BETA_SIGMOID_IN_BYTES_PER_HEAD: u32 = 2;

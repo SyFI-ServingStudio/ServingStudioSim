@@ -25,6 +25,14 @@ The non-align cache mode is measured (no prefix caching), so the committed
 state goes back to the checkpoint's own slot. ``state_dtype`` is the
 checkpoint pool's element type (vLLM ``--mamba-ssm-cache-dtype``); the fold
 runs in fp32 and rounds once on the store.
+
+Backend ``tilelang`` is this repository's own kernel for the same call
+(``profiling.runners.attention.kda_recoverssm_commit_tilelang``), shipped by
+no engine: a Triton prep forms each row's decayed key, then a TileLang fold
+adds the accepted rows in closed form with one tensor-core product per state
+tile, so the state is read and written once whatever the accepted length;
+the conv compaction is the fork's. It runs in the main environment, not the
+vLLM fork's.
 """
 
 from __future__ import annotations
@@ -130,6 +138,36 @@ register(
                 "compaction and the fused all-layer state fold."
             ),
             url="https://github.com/vllm-project/vllm",
+        ),
+    )
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="tilelang",
+        # T.gemm on fp32 operands runs on Ampere+ tensor cores; fp32 and bf16
+        # pools both load into an fp32 fold and store back at the pool's dtype.
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.FP32, DType.BF16}),
+            min_compute_capability=(8, 0),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_recoverssm_commit_tilelang",
+            function_name="profile_kda_recoverssm_commit_tilelang",
+        ),
+        table_name=KIND,
+        args_schema=KdaRecoverSSMCommitArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "This repository's commit (no engine ships it): a Triton prep, a "
+                "TileLang closed-form fold of the accepted rows with one tensor-core "
+                "product per state tile, and the conv compaction; three launches."
+            ),
         ),
     )
 )

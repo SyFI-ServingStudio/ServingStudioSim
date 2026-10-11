@@ -66,7 +66,7 @@ FLOPs and bytes are semantic logical counts, not physical Triton work.
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -379,10 +379,12 @@ def invoke_verify(callable_: Any, operands: VerifyOperands, spec_query_len: int)
 @dataclass(frozen=True)
 class CommitOperands:
     pages: tuple[LayerPage, ...]
-    context: Any
     num_accepted_tokens: Any
     state_indices: Any
     query_start_loc: Any
+    # The fork's commit context over ``pages``; None for a backend that brings
+    # its own tables.
+    context: Any = None
 
 
 def commit_layers(pages: tuple[LayerPage, ...], shape: KdaRecoverSSMShape) -> list[Any]:
@@ -403,20 +405,25 @@ def commit_layers(pages: tuple[LayerPage, ...], shape: KdaRecoverSSMShape) -> li
 def build_commit_operands(
     torch: Any, context_cls: Any, shape: KdaRecoverSSMShape, *, device: Any
 ) -> CommitOperands:
+    operands = build_commit_pages(torch, shape, device=device)
+    context = context_cls.create(
+        commit_layers(operands.pages, shape),
+        spec_query_len=shape.spec_query_len,
+        max_num_reqs=shape.batch_size,
+    )
+    return replace(operands, context=context)
+
+
+def build_commit_pages(torch: Any, shape: KdaRecoverSSMShape, *, device: Any) -> CommitOperands:
+    """Every layer's page and the commit metadata, without the fork's context."""
     generator = torch.Generator(device=device).manual_seed(42)
     pages = tuple(
         _layer_page(torch, shape, device=device, generator=generator)
         for _ in range(shape.num_layers)
     )
-    context = context_cls.create(
-        commit_layers(pages, shape),
-        spec_query_len=shape.spec_query_len,
-        max_num_reqs=shape.batch_size,
-    )
     batch = shape.batch_size
     return CommitOperands(
         pages=pages,
-        context=context,
         num_accepted_tokens=torch.full(
             (batch,), shape.commit_len, dtype=torch.int32, device=device
         ),
@@ -507,10 +514,13 @@ def check_verify(
         )
 
 
-def check_commit(torch: Any, operands: CommitOperands, shape: KdaRecoverSSMShape) -> None:
+def check_commit(
+    torch: Any, operands: CommitOperands, shape: KdaRecoverSSMShape, *, invoke: Any = None
+) -> None:
     """Compare one call against the oracles on the first requests of every
     layer. Timed calls keep advancing the same states, as production does, so
-    the checked call is not undone."""
+    the checked call is not undone. ``invoke`` lets another backend of the
+    kind run its own call over the same pages."""
     from profiling.runners.attention.kda_chunk_prefill_reference import rmse_ratio
     from profiling.runners.attention.kda_recoverssm_reference import (
         compact_conv_state_reference,
@@ -536,7 +546,10 @@ def check_commit(torch: Any, operands: CommitOperands, shape: KdaRecoverSSMShape
             page.conv[slots].transpose(-1, -2), commit_lens, shape.conv_history_len
         )
         expected.append((state, conv))
-    invoke_commit(operands)
+    if invoke is None:
+        invoke_commit(operands)
+    else:
+        invoke()
     torch.cuda.synchronize()
     for layer, (page, (state, conv)) in enumerate(zip(operands.pages, expected, strict=True)):
         actual = page.checkpoint[slots]
@@ -714,6 +727,7 @@ __all__ = [
     "KdaRecoverSSMShape",
     "CHECK_REQUESTS",
     "build_commit_operands",
+    "build_commit_pages",
     "build_verify_operands",
     "check_commit",
     "check_verify",

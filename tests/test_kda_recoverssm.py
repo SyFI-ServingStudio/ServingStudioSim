@@ -15,6 +15,7 @@ import torch
 
 from profiling.kernels.kda_recoverssm_commit import KdaRecoverSSMCommitArgs
 from profiling.kernels.kda_recoverssm_verify import KdaRecoverSSMVerifyArgs
+from profiling.runners.attention import kda_recoverssm_commit_tilelang as tilelang_runner
 from profiling.runners.attention import kda_recoverssm_flashinfer as flashinfer_runner
 from profiling.runners.attention import kda_recoverssm_vllm_triton as runner
 from profiling.runners.attention.kda_recoverssm_reference import (
@@ -69,6 +70,8 @@ def test_args_fields_are_the_runner_kwargs() -> None:
     ]
     signature = inspect.signature(runner.profile_kda_recoverssm_commit_vllm_triton)
     assert list(signature.parameters) == commit
+    signature = inspect.signature(tilelang_runner.profile_kda_recoverssm_commit_tilelang)
+    assert list(signature.parameters) == commit
 
 
 @pytest.mark.parametrize(
@@ -106,6 +109,14 @@ def test_commit_rejects_unreachable_lengths(override: dict) -> None:
     # program; > window reads past the records).
     with pytest.raises(ValueError):
         runner.validate_commit_args(**{**_COMMIT, **override})
+
+
+@pytest.mark.parametrize("head_dim", [64, 192])
+def test_tilelang_commit_rejects_heads_its_fold_tile_cannot_cover(head_dim: int) -> None:
+    # Defect: a tilelang row for a head width the whole-row fold tile would
+    # under-cover or read past, timed before any launch fails.
+    with pytest.raises(ValueError):
+        tilelang_runner.profile_kda_recoverssm_commit_tilelang(**{**_COMMIT, "head_dim": head_dim})
 
 
 def _window(batch: int, spec: int, heads: int = 2, dim: int = 8, seed: int = 0):
