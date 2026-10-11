@@ -957,7 +957,13 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
                 f"{_TRTLLM_FP8_BACKEND} returned {output.dtype} {tuple(output.shape)}, "
                 f"expected BF16 {expected_shape}"
             )
-        if not torch.isfinite(output).all():
+        # A row with no valid slot leaves its output unspecified: in a small
+        # 64-head batch the kernel writes NaN there (B200, Slurm job 5693,
+        # `g:(0,1,2,3)` at 4..=64 queries). Production never submits one -- a
+        # verify row always sees its own context -- so only rows with work
+        # must be finite.
+        nonempty = torch.tensor(validated.valid_counts, device=device) > 0
+        if not torch.isfinite(output[nonempty]).all():
             raise KernelLaunchFailed(f"{_TRTLLM_FP8_BACKEND} output must be finite")
 
         time_ms = Timer.cupti(kernel, kernel_name=_TRTLLM_KERNEL_NAME)
