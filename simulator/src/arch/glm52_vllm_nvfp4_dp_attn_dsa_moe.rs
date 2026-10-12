@@ -284,7 +284,8 @@ impl DpSparseLayer {
             .collect::<Result<Vec<_>, _>>()?;
         let input_quant = experts
             .first()
-            .map(|expert| Op::new(expert.quant.name.clone(), Arc::clone(&expert.quant.kernel)))
+            .and_then(|expert| expert.quant.as_ref())
+            .map(|quant| Op::new(quant.name.clone(), Arc::clone(&quant.kernel)))
             .ok_or_else(|| fit_failed("no routed-expert rank to quantize for"))?;
         Ok(Self {
             attention: VllmGlm52DsaAttnLocalWorklet::build(

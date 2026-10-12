@@ -591,6 +591,7 @@ fn build_configs_for_decode(
             quant_backends: NVFP4_QUANT_BACKENDS.to_vec(),
             moe_backends: NVFP4_FUSED_MOE_BACKENDS.to_vec(),
             weight_format: DType::Nvfp4E2m1,
+            activation_format: None,
             group_size: 16,
             routing_method: "minimax2".to_string(),
             n_group: 1,
