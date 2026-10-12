@@ -26,8 +26,26 @@ use crate::log::schemas::cost_log_schema;
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
 use parquet::schema::types::ColumnPath;
 
+/// Most rows in one chunk handed to the writer thread.
 const STREAM_FLUSH_ROWS: usize = 8_192;
-const CHANNEL_CAP: usize = 64;
+/// Buffered bytes that close a chunk early. A row's size scales with the
+/// deployment's slot count (1,271 slots on GLM-5.2 EP8, 8,649 on GLM-5.3 EP64),
+/// so a row-count cap alone let one chunk reach ~5 GB.
+const CHUNK_BYTE_BUDGET: usize = 64 << 20;
+/// Chunks queued for the writer before the sim thread blocks. With
+/// [`CHUNK_BYTE_BUDGET`] this bounds a stream's in-flight rows to about 1 GB.
+const CHANNEL_CAP: usize = 16;
+
+/// Rows per chunk for a row of these sizes: [`CHUNK_BYTE_BUDGET`] worth, at
+/// least one and at most [`STREAM_FLUSH_ROWS`].
+fn rows_per_chunk(groups: usize, slots: usize, slot_inputs: usize) -> usize {
+    let slot_bytes = 3 * std::mem::size_of::<f32>() + 2 * std::mem::size_of::<u8>();
+    let row_bytes = std::mem::size_of::<CostLogEntry>()
+        + groups * std::mem::size_of::<GroupInputLog>()
+        + slots * slot_bytes
+        + slot_inputs * std::mem::size_of::<SlotInput>();
+    (CHUNK_BYTE_BUDGET / row_bytes.max(1)).clamp(1, STREAM_FLUSH_ROWS)
+}
 
 /// Parquet *leaf* path of one per-slot list column.
 fn slot_list_column(column: &str) -> ColumnPath {
@@ -120,6 +138,10 @@ pub struct CostLogger {
     groups_per_row: usize,
     slots_per_row: usize,
     slot_inputs_per_row: usize,
+    /// Rows that close a chunk ([`rows_per_chunk`] of the per-row sizes).
+    chunk_rows: usize,
+    /// Set after the first backpressure warning, so a writer-bound run logs it once.
+    backpressure_warned: bool,
     closed: bool,
     /// Set once the writer has failed: later rows are dropped, since the stream's
     /// file is already gone and the failure is on record.
@@ -196,6 +218,8 @@ impl CostLogger {
             groups_per_row: 0,
             slots_per_row: 0,
             slot_inputs_per_row: 0,
+            chunk_rows: STREAM_FLUSH_ROWS,
+            backpressure_warned: false,
             closed: false,
             failed: false,
         })
@@ -224,17 +248,15 @@ impl CostLogger {
             self.groups_per_row = group_len;
             self.slots_per_row = slot_len;
             self.slot_inputs_per_row = slot_input_len;
-            self.buf
-                .group_logs
-                .reserve(STREAM_FLUSH_ROWS * group_len.max(1));
-            self.buf.slot_times.reserve(STREAM_FLUSH_ROWS * slot_len);
-            self.buf.slot_covs.reserve(STREAM_FLUSH_ROWS * slot_len);
-            self.buf.slot_flops.reserve(STREAM_FLUSH_ROWS * slot_len);
-            self.buf.slot_bytes.reserve(STREAM_FLUSH_ROWS * slot_len);
-            self.buf.slot_backends.reserve(STREAM_FLUSH_ROWS * slot_len);
-            self.buf
-                .slot_inputs
-                .reserve(STREAM_FLUSH_ROWS * slot_input_len);
+            self.chunk_rows = rows_per_chunk(group_len, slot_len, slot_input_len);
+            let rows = self.chunk_rows;
+            self.buf.group_logs.reserve(rows * group_len.max(1));
+            self.buf.slot_times.reserve(rows * slot_len);
+            self.buf.slot_covs.reserve(rows * slot_len);
+            self.buf.slot_flops.reserve(rows * slot_len);
+            self.buf.slot_bytes.reserve(rows * slot_len);
+            self.buf.slot_backends.reserve(rows * slot_len);
+            self.buf.slot_inputs.reserve(rows * slot_input_len);
         }
         entry.group_len = group_len;
         entry.slot_len = slot_len;
@@ -253,7 +275,7 @@ impl CostLogger {
         self.buf.group_logs.append(groups);
         self.buf.slot_inputs.extend_from_slice(slot_inputs);
         self.buf.entries.push(entry);
-        if self.buf.len() >= STREAM_FLUSH_ROWS {
+        if self.buf.len() >= self.chunk_rows {
             if let Err(e) = self.send() {
                 return Err(self.fail(e));
             }
@@ -269,10 +291,10 @@ impl CostLogger {
             &mut self.buf,
             CostLogChunk::with_capacity(
                 self.pool_tag,
-                STREAM_FLUSH_ROWS,
-                STREAM_FLUSH_ROWS * self.groups_per_row.max(1),
-                STREAM_FLUSH_ROWS * self.slots_per_row,
-                STREAM_FLUSH_ROWS * self.slot_inputs_per_row,
+                self.chunk_rows,
+                self.chunk_rows * self.groups_per_row.max(1),
+                self.chunk_rows * self.slots_per_row,
+                self.chunk_rows * self.slot_inputs_per_row,
             ),
         );
         let tx = self.tx.as_ref().expect("tx present until flush");
@@ -282,10 +304,13 @@ impl CostLogger {
         let chunk = match tx.try_send(chunk) {
             Ok(()) => return Ok(()),
             Err(TrySendError::Full(chunk)) => {
-                tracing::warn!(
-                    "cost-log channel full ({CHANNEL_CAP} chunks in flight): sim thread \
-                     blocking on cost-logger backpressure"
-                );
+                if !self.backpressure_warned {
+                    self.backpressure_warned = true;
+                    tracing::warn!(
+                        "cost-log channel full ({CHANNEL_CAP} chunks in flight): sim thread \
+                         blocking on cost-logger backpressure (warned once per stream)"
+                    );
+                }
                 chunk
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -891,6 +916,19 @@ mod tests {
             logger.record(entry, &slots, &mut Vec::new(), &[])?;
         }
         Ok(())
+    }
+
+    /// Catches a chunk sized by row count alone: a wide row (GLM-5.3 EP64,
+    /// 8,649 slots) must close its chunk long before 8,192 rows, so the queued
+    /// chunks stay near `CHANNEL_CAP x CHUNK_BYTE_BUDGET`.
+    #[test]
+    fn a_chunk_holds_a_byte_budget_of_rows() {
+        assert_eq!(rows_per_chunk(0, 1, 0), STREAM_FLUSH_ROWS);
+        let wide = rows_per_chunk(64, 8_649, 8_649);
+        assert!(wide < STREAM_FLUSH_ROWS / 4, "{wide}");
+        let slot_bytes = 14 + std::mem::size_of::<SlotInput>();
+        assert!(wide * 8_649 * slot_bytes <= CHUNK_BYTE_BUDGET, "{wide}");
+        assert_eq!(rows_per_chunk(0, usize::MAX / 64, 0), 1);
     }
 
     #[test]
