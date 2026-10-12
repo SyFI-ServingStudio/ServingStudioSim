@@ -1225,4 +1225,42 @@ mod tests {
         let error = build_configs(&model_cfg(), &layout, &demand()).unwrap_err();
         assert!(error.to_string().contains("fused all-reduce"), "{error}");
     }
+
+    /// Every compiled location that is not a collective (the fused all-reduce
+    /// + RMSNorm sites and the logits all-gather) has a row in the
+    /// necessary-work map, and the map names nothing the arch does not compile.
+    #[test]
+    fn necessary_work_map_covers_the_compiled_locations() {
+        let model = built();
+        assert!(model.logs_decode_kv_lens());
+        let actual: std::collections::BTreeSet<String> = model
+            .cost_log_manifest()
+            .slots
+            .into_iter()
+            .filter(|slot| {
+                !matches!(
+                    slot.kind.as_str(),
+                    "all_reduce" | "all_reduce_residual_rms_norm"
+                )
+            })
+            .map(|slot| slot.name)
+            .collect();
+        assert_eq!(actual.len(), 36);
+        let map: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../model/work/location_maps/mimo_v2_vllm_fp8_swa_moe_tp4_ep4_unified.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            map["mapping_id"],
+            "mimo-v2-vllm-fp8-swa-moe-tp4-ep4-unified-v1"
+        );
+        assert_eq!(map["arch_types"][0], ARCH_KIND);
+        let mapped: std::collections::BTreeSet<String> = map["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["location"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(actual, mapped);
+    }
 }
