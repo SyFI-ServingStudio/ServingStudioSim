@@ -25,6 +25,7 @@ pub mod kv_layout;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;
 pub mod llama3_dp_attn_tp_ffn;
+pub mod llama3_vllm_neuron;
 pub mod model_cfg;
 pub mod moe_model_cfg;
 pub mod qwen36_local;
@@ -87,6 +88,7 @@ pub use inkling_vllm_nvfp4_rel_attn_moe::{
 pub use llama3_dense::{DenseParallel, Llama3DenseModel};
 pub use llama3_dense_tp::{DenseTpParallel, Llama3DenseTpModel};
 pub use llama3_dp_attn_tp_ffn::{DpAttnTpFfnParallel, Llama3DpAttnTpFfnModel};
+pub use llama3_vllm_neuron::{Llama3VllmNeuronModel, VllmNeuronParallel};
 pub use model_cfg::ModelCfg;
 pub use moe_model_cfg::MoeModelCfg;
 pub use qwen36_local::{

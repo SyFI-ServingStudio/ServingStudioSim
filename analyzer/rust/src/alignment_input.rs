@@ -32,6 +32,7 @@ pub struct KernelAlignManifest {
     pub schema_version: u32,
     pub analysis_log_dir: PathBuf,
     pub profile_log_dir: PathBuf,
+    #[serde(alias = "parsed_trace")]
     pub parsed_nsys: PathBuf,
     pub predict_log_dir: PathBuf,
     pub timing_predict_case_map: PathBuf,

@@ -63,6 +63,10 @@ pub mod moe_sink_gate_select;
 pub mod moe_sum;
 pub mod moe_topk_softplus_sqrt;
 pub mod mxfp4_marlin_moe_gemm;
+pub mod neuron_llama_forward;
+pub mod neuron_llama_region;
+pub mod neuron_llama_segment;
+pub mod neuron_llama_segmented_forward;
 pub mod nvfp4_fused_moe;
 pub mod nvfp4_quant;
 pub mod p2p_inter;
@@ -296,6 +300,22 @@ pub use moe_topk_softplus_sqrt::{
 pub use mxfp4_marlin_moe_gemm::{
     Mxfp4MarlinMoeFcRole, Mxfp4MarlinMoeGemmKernel, Mxfp4MarlinMoeGemmKernelConfig,
     Mxfp4MarlinMoeGemmKernelInput, Mxfp4MarlinMoeGemmSpec,
+};
+pub use neuron_llama_forward::{
+    NeuronLlamaForwardKernel, NeuronLlamaForwardKernelConfig, NeuronLlamaForwardKernelInput,
+    NeuronLlamaForwardPhase, NeuronLlamaForwardSpec,
+};
+pub use neuron_llama_region::{
+    NeuronLlamaRegion, NeuronLlamaRegionKernel, NeuronLlamaRegionKernelConfig,
+    NeuronLlamaRegionKernelInput, NeuronLlamaRegionSpec,
+};
+pub use neuron_llama_segment::{
+    NeuronLlamaSegment, NeuronLlamaSegmentKernel, NeuronLlamaSegmentKernelConfig,
+    NeuronLlamaSegmentKernelInput, NeuronLlamaSegmentSpec,
+};
+pub use neuron_llama_segmented_forward::{
+    NeuronLlamaSegmentedForwardKernel, NeuronLlamaSegmentedForwardKernelConfig,
+    NeuronLlamaSegmentedForwardKernelInput, NeuronLlamaSegmentedForwardSpec,
 };
 pub use nvfp4_fused_moe::{
     Nvfp4FusedMoeKernel, Nvfp4FusedMoeKernelConfig, Nvfp4FusedMoeKernelInput, Nvfp4FusedMoeSpec,

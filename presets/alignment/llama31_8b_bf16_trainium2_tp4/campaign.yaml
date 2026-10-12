@@ -1,0 +1,87 @@
+schema_version: 1
+pack: llama31_8b_bf16_trainium2_tp4
+description: >-
+  Bounded stock vLLM Neuron Llama 3.1 8B BF16 alignment on one Trainium2 chip,
+  TP4 with one LNC2 unit per rank. Sixteen simultaneous 504+8 requests consume
+  the eight accepted museum subjects twice. This is one validated operating
+  point, not a broader context/batch matrix. Acceptance policy was selected
+  after the saved evidence, inherited unchanged from the generic defaults.
+recorded_on:
+  host: trainium2_stock
+  gpu: AWS Trainium2 LNC2
+  device_roles: {primary: '0'}
+  tp_ranks: 4
+  logical_nc_config: 2
+  image: sha256:44d2eef799027b5c925af25a1ad9f45a93aae07451bdf9c02857ec8a7635a24a
+  corpus:
+    pool_tokens: 79784
+    ordinal_stride: 9973
+    prompt_tokens: 504
+    subjects: 8
+    repeats: 2
+    pool_sha256: 3748777f787c61fd63ebda494c6ba0aa946f6d5fc031fc0155805c9e23aeaee6
+    tokenizer_json_sha256: 76e48799b099d43365bd24ccd8ecc5aedac831718da780552f03b0a6eb4412aa
+variants:
+  tp4_lnc2:
+    deployment: unified
+    gpu: AWS Trainium2 LNC2
+    replicas: 1
+    checkpoint: llama31_8b
+    engine: vllm_neuron
+    backend: openai
+    server:
+      host: 127.0.0.1
+      tp_size: 4
+      dp_size: 1
+      logical_nc_config: 2
+      max_num_seqs: 16
+      token_buckets: [1, 16]
+      kv_blocks: 6782
+      block_size: 32
+      dtype: bfloat16
+    arch:
+      type: llama3_vllm_neuron
+      model_config: model/config/llama3_8b.json
+      tp_size: 4
+      decode_buckets: [1, 16]
+      fp8: false
+    worker:
+      type: chunked_prefill
+      max_batch_tokens: 512
+      max_prefill_requests_per_iteration: 1
+      max_resident_requests_per_partition: 16
+      batch_policy: separate-prefill-priority
+      kv_admission_policy: full-footprint
+      prefix_cache_mode: disabled
+    profile_passes:
+      - {kind: neuron, name: profile_native, trace: workload, warmup: false}
+      - {kind: workload_metrics, name: profile_clean, trace: workload, warmup: false}
+    input_builder: {type: engine_text, measured_phase: forward, group_assignment: single}
+    label_rules: label_rules/manifest.json
+cases:
+  - index: 1
+    name: stock_16x504_8
+    variant: tp4_lnc2
+    purpose: >-
+      Reproduce the accepted native/clean HTTP corpus and judge whole-forward
+      timing, scheduler geometry, duty cycle and server TTFT/TPOT independently.
+    coverage: [prefill512, decode16, native_nrt, clean_server_timing, full32_bf16]
+    max_model_len: 512
+    max_concurrency: 16
+    profile_arrival_mode: saturated
+    simulation_arrival_mode: saturated
+    gpu_memory_utilization: 0.9
+    capture_seconds: 30
+    device_role: primary
+    workload_trace: {file: stock_16x504_8.csv, shapes: [[504, 8]], repeats: 16}
+    attn_gpu_memory_gb:
+      value: 7.111442432
+      status: measured
+      derived_from: stock model metadata; 6782 BF16 KV blocks x 1048576 bytes per TP rank
+      evidence: logs/20261009_2_trainium_stock_server_timings; native model-metadata.json
+    provenance:
+      evidence_scope: one stock full32 BF16 TP4 C512 operating point
+      corpus_recipe: python -m alignment.neuron.vllm_corpus
+      policy_timing: selected after evidence; unchanged existing generic default thresholds
+      original_comparison: logs/20261009_2_trainium_stock_server_timings/comparison.json
+      retained_unjudged: true

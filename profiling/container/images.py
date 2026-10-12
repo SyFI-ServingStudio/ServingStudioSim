@@ -166,6 +166,36 @@ IMAGES = {
 }
 
 
+@dataclass(frozen=True)
+class VendorImage:
+    """An image this checkout runs but never builds: a vendor release, named by
+    its immutable content digest, whose own interpreter runs the worker."""
+
+    name: str
+    image: str
+    envs: tuple[str, ...]
+    python: str
+
+
+VENDOR_IMAGES = {
+    image.name: image
+    for image in (
+        # The stock vLLM Neuron release the Trainium2 kinds measure
+        # (doc/trainium2.md); `exec/neuron.py` runs it.
+        VendorImage(
+            "vllm-neuron",
+            "sha256:44d2eef799027b5c925af25a1ad9f45a93aae07451bdf9c02857ec8a7635a24a",
+            ("vllm_neuron_env",),
+            "/opt/conda/bin/python",
+        ),
+    )
+}
+
+
+def vendor_image_for_env(env_name: str) -> VendorImage | None:
+    return next((image for image in VENDOR_IMAGES.values() if env_name in image.envs), None)
+
+
 def _overrides() -> dict[str, str]:
     raw = os.environ.get(IMAGES_ENV, "").strip()
     if not raw:
@@ -190,7 +220,8 @@ def image_for_env(env_name: str, root: Path = REPO_ROOT) -> str | None:
     for image in IMAGES.values():
         if env_name in image.envs:
             return image.tag(root)
-    return None
+    vendor = vendor_image_for_env(env_name)
+    return vendor.image if vendor is not None else None
 
 
 # Directory names `.dockerignore` keeps out of every build context.
@@ -252,6 +283,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "list":
             for image in IMAGES.values():
                 print(f"{image.tag()}  {' '.join(image.envs)}")
+            for vendor in VENDOR_IMAGES.values():
+                print(f"{vendor.image}  {' '.join(vendor.envs)}  (vendor, not built)")
         elif args.command == "tag":
             print(IMAGES[args.image].tag())
         elif args.command == "build":

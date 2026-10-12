@@ -267,6 +267,18 @@ Barebone, HP, and PD-prefill differ only in their build recipe. HP changes the
 number of KV partitions and placement; PD-prefill changes admission and adds a
 send comm group.
 
+`with_async_lookahead(Some(w), w_idle)` selects the shell's opt-in async
+one-step lookahead planning cadence (only the chunked-prefill recipe passes it,
+from `async_lookahead_us` and `WorkerConfig::async_lookahead_from_idle`). Step
+N+1 is planned `w` after step N starts, or `w_idle` (default `w`) when N
+started from an idle engine. A message
+enqueued while a step runs waits in a shell-owned engine inbox until that plan
+moment, then reaches admission. N+1 is formed after N completes and starts at
+`max(N end, plan moment)`. An idle engine, or a planned-empty step, sees the
+inbox at once. The inbox is transport state: admission and its policy still own
+every not-yet-started request they have seen. `None` keeps the synchronous
+cadence bit-identical.
+
 ### 2. Pull plus decode: `workers/pd_decode/`
 
 `PullDecodeWorker` coordinates two timelines:
@@ -375,6 +387,16 @@ sets it to the layout's engine block when the layout keeps a resumable
 per-request state, prefix caching is on, and `prefill_chunk_alignment` resolves
 to `checkpoint`; unset follows `kv_overhead` (`vllm` aligns, `none` does not),
 and `plain` gives `min(remaining, budget)` chunks.
+
+Two optional request-count limits bound each partition independently of the
+token budget: `max_prefill_requests_per_iteration` (prefill requests scheduled
+per iteration, continued chunks and fresh prompts alike) and
+`max_resident_requests_per_partition` (started prompts plus resident decodes).
+Both default to unlimited and reject zero. The lifecycle counts them at batch
+formation from KV decode membership and its started-prompts list, with no second
+queue or ledger; a prompt that completes in an iteration keeps its resident slot
+until its request completes, even with a single output token. The selector's
+`prefix_cache_mode` defaults to `opportunistic`.
 
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;

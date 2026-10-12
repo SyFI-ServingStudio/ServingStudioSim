@@ -413,7 +413,7 @@ def _coerce_input_specs(
     return args_list
 
 
-# gpu_name is a DB key. CUDA auto-detect is only a convenience for local use;
+# gpu_name is a DB key. Device auto-detect is only a convenience for local use;
 # bridge/build paths should pass it explicitly for non-current or remote GPUs.
 def _resolve_gpu_name(gpu_name: str | None) -> str:
     if gpu_name:
@@ -427,11 +427,16 @@ def _resolve_gpu_name(gpu_name: str | None) -> str:
             return str(torch.cuda.get_device_name(0))
     except ImportError:
         pass
-    raise ValueError("gpu_name is required when CUDA is unavailable")
+    from profiling.exec.neuron import current_neuron_name
+
+    try:
+        return current_neuron_name()
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("gpu_name is required when CUDA and Neuron are unavailable") from None
 
 
 def get_current_gpu_name() -> str:
-    """Resolve the current CUDA device's DB gpu_name key. Raises when CUDA is
-    unavailable — callers targeting a non-current or remote GPU must supply the
-    gpu_name explicitly instead of relying on this."""
+    """Resolve the current CUDA (else Neuron) device's DB gpu_name key. Raises
+    when neither is available — callers targeting a non-current or remote GPU
+    must supply the gpu_name explicitly instead of relying on this."""
     return _resolve_gpu_name(None)

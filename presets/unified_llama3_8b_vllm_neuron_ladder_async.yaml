@@ -1,0 +1,80 @@
+# Stock vLLM Neuron TP4/LNC2 context ladder with the measured host-side
+# scheduling race modeled (see doc/trainium2.md, "Async scheduling and frontend
+# hand-off"). Identical to unified_llama3_8b_vllm_neuron_ladder.yaml except:
+# - worker async_lookahead_us: the engine plans step N+1 1.04 ms after step N
+#   starts, from the requests visible then. With the hand-off model on, the
+#   step after one that started from an idle engine uses the seed's draw of the
+#   measured first-step plan offset for the context instead;
+# - workload frontend_handoff: the API server sends simultaneous requests one
+#   at a time (measured ingest, first gap, later gaps) and each becomes visible
+#   a measured send-to-visible delay later, all resampled at the context of
+#   max_model_len; the seed picks one deterministic realization (override
+#   workload.frontend_handoff_seed, or sweep it, for a distribution);
+# - tick_dt_us 10: the race is decided by sub-millisecond differences, so the
+#   default 100 us tick would quantize it.
+# Distribution data and provenance: alignment/neuron/data/vllm_neuron_handoff.json.
+deployment: unified
+workload:
+  trace_files: ["${trace}"]
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  run_to_end: true
+  tick_dt_us: 10
+  frontend_handoff: vllm-neuron-0.24
+  frontend_handoff_seed: 0
+io:
+  log_dir: logs/unified_llama3_8b_vllm_neuron_ladder_async/{context}
+  log_output_token_times: true
+  log_stage_transitions: true
+  kv_log_stride: 1
+pools:
+  main:
+    groups:
+      - gpu: AWS Trainium2 LNC2
+        replicas: 1
+        arch:
+          type: llama3_vllm_neuron
+          model_config: model/config/llama3_8b.json
+          max_model_len: ${max_model_len}
+          decode_buckets: ${decode_buckets}
+          tp_size: 4
+          fp8: false
+        worker:
+          type: chunked_prefill
+          # 6782 pages * 32 tokens * 32768 bytes/token per TP rank.
+          attn_gpu_memory_gb: 7.111442432
+          max_batch_tokens: ${max_model_len}
+          max_prefill_requests_per_iteration: 1
+          max_resident_requests_per_partition: ${resident}
+          batch_policy: separate-prefill-priority
+          kv_admission_policy: full-footprint
+          prefix_cache_mode: disabled
+          gpu_time_multiplier: 1.0
+          async_lookahead_us: 1040
+compound:
+  context:
+    c512:
+      max_model_len: 512
+      decode_buckets: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+      resident: 423
+      trace: trace/trainium_stock_smoke.csv
+    c1024:
+      max_model_len: 1024
+      decode_buckets: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+      resident: 211
+      trace: trace/trainium_stock_smoke_c1024.csv
+    c2048:
+      max_model_len: 2048
+      decode_buckets: [1, 2, 4, 8, 16, 32, 64, 128]
+      resident: 105
+      trace: trace/trainium_stock_smoke_c2048.csv
+    c4096:
+      max_model_len: 4096
+      decode_buckets: [16, 32]
+      resident: 32
+      trace: trace/trainium_stock_smoke_c4096.csv
+    c8192:
+      max_model_len: 8192
+      decode_buckets: [1, 16, 32]
+      resident: 26
+      trace: trace/trainium_stock_smoke_c8192.csv

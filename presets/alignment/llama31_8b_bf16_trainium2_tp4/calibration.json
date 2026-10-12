@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "purpose": "Separate duty-calibrated experiment; never injected by the campaign renderer",
+  "worker_field": "pools.main.groups.0.worker.gpu_time_multiplier",
+  "value": 1.0619761644688026,
+  "source_report": "logs/20261009_1_trainium_stock_alignment/analysis_kernel/reports/alignment_timeline_report.json",
+  "source_sha256": "8305eb40d433f83ffea5fd771024107e2e9c50c180984c7c87b49693987053d8",
+  "source_field": "meta.recommended_gpu_time_multiplier",
+  "derivation": "Pooled measured iteration cycle divided by native compiled-forward duration, before the fresh server-timing comparison",
+  "scope": "One TP4/LNC2 C512 [1,16] stock operating point; includes measured host gaps and is not an L1 timing refit",
+  "selection": "Previously adopted duty calibration; unchanged for this policy judgment. Not selected from E2E residuals."
+}
