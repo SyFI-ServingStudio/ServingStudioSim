@@ -169,6 +169,23 @@ impl HisparseConfig {
         miss_fraction(f64::from(self.buffer_tokens) / union) * union
     }
 
+    /// Reject a config no step or capacity can be priced from: a zero buffer
+    /// or top-k, a non-positive bandwidth or host DRAM, or a fraction outside
+    /// `0..=1`.
+    pub fn validate(&self) -> Result<(), String> {
+        let unit = |value: f64| (0.0..=1.0).contains(&value);
+        if self.buffer_tokens == 0
+            || self.top_k == 0
+            || !(self.h2d_gb_per_s > 0.0)
+            || !(self.host_dram_gb_per_node > 0.0)
+            || !unit(self.exposed_io_fraction)
+            || !unit(self.intra_step_overlap)
+        {
+            return Err(format!("invalid hisparse config {self:?}"));
+        }
+        Ok(())
+    }
+
     /// GPUs one node's host DRAM is split across.
     fn gpus_per_node(&self, nvl_num_gpu: u16) -> u16 {
         self.gpus_per_node.unwrap_or(nvl_num_gpu).max(1)

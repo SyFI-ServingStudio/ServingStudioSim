@@ -1202,16 +1202,7 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
         config: HisparseConfig,
         nvl_num_gpu: u16,
     ) -> Result<Self, BuildError> {
-        let unit = |value: f64| (0.0..=1.0).contains(&value);
-        if config.buffer_tokens == 0
-            || config.top_k == 0
-            || !(config.h2d_gb_per_s > 0.0)
-            || !(config.host_dram_gb_per_node > 0.0)
-            || !unit(config.exposed_io_fraction)
-            || !unit(config.intra_step_overlap)
-        {
-            return Err(fit_failed(format!("invalid hisparse config {config:?}")));
-        }
+        config.validate().map_err(fit_failed)?;
         let layers = u64::from(ep_graph::NUM_LAYERS);
         let latent_bytes_per_token = layers * ep_graph::mla_latent_bytes_per_layer_token();
         // A token's indexer keys stay on the GPU: one per full-index layer

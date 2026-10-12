@@ -1563,7 +1563,10 @@ pub fn glm53_flash_vllm_fp8_pp_kda_dsa_moe(
 
 /// Build the B200 GLM-5.3-Flash FP8 model under data-parallel attention and
 /// expert-parallel MoE (vLLM `--data-parallel-size ep_size
-/// --enable-expert-parallel`, TP1).
+/// --enable-expert-parallel`, TP1). `hisparse` serves the DSA layers' cache
+/// through SGLang HiSparse
+/// ([`glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpModel::with_hisparse`]),
+/// one node's host DRAM shared by the `ep_size` GPUs unless it says otherwise.
 #[allow(clippy::too_many_arguments)]
 pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     model_spec: &ModelSpec,
@@ -1578,6 +1581,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     kernel_path: Glm53FlashKernelPath,
     verify_width: u32,
     kda_state_dtype: DType,
+    hisparse: Option<&HisparseConfig>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1614,8 +1618,12 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     configs.local.kda.decode_query_len = verify_width;
     configs.local.kda.ssm_state_dtype = kda_state_dtype;
     let resolved = glm53_flash_vllm_fp8_dp_attn_ep_moe::resolve_configs(&configs);
-    glm53_flash_vllm_fp8_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
-        .context("building GLM-5.3-Flash DP-attention/EP model (often a missing profile.db row)")
+    let model = glm53_flash_vllm_fp8_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
+        .context("building GLM-5.3-Flash DP-attention/EP model (often a missing profile.db row)")?;
+    match hisparse {
+        None => Ok(model),
+        Some(config) => Ok(model.with_hisparse(config.clone(), ep_size)?),
+    }
 }
 
 /// Build the GLM target graph driven by a DFlash2 block-parallel proposer.
@@ -1899,6 +1907,7 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         glm53_flash_kernel_path(sel)?,
         *draft_tokens + 1,
         kda_state_dtype.dtype(),
+        sel.hisparse().as_ref(),
         gpu,
         name,
         bridge,
@@ -2586,6 +2595,7 @@ pub fn build_iter_model(
             glm53_flash_kernel_path(sel)?,
             1,
             DType::Fp32,
+            sel.hisparse().as_ref(),
             gpu,
             name,
             bridge,
@@ -3808,6 +3818,72 @@ mod tests {
         }
         assert!(glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(&deep, "NVIDIA B200", "test", &bridge)
             .is_err());
+    }
+
+    /// Catches HiSparse on the Flash DP + DFlash2 target charging the draft's
+    /// window twice: beside KDA the window is already per-request state, so
+    /// the host tier's device bytes are the latent buffer alone, and the KDA
+    /// state plus window is unchanged.
+    #[test]
+    fn glm53_flash_dp_dflash2_hisparse_keeps_the_window_as_state() {
+        use crate::arch::contract::KvHostOffload;
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let sel = |hisparse: serde_json::Value| -> IterArchSel {
+            serde_json::from_value(serde_json::json!({
+                "type": "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+                "model_config": Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("model/config/glm53_flash_nvfp4.json"),
+                "fp8": false,
+                "ep_size": 8,
+                "max_model_len": 131_072,
+                "draft_tokens": 3,
+                "kda_state_dtype": "bf16",
+                "hisparse_buffer_tokens": hisparse,
+                "hisparse_host_dram_gb_per_node": 1500.0,
+            }))
+            .unwrap()
+        };
+        let model = glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+            &sel(serde_json::json!(49_152)),
+            "NVIDIA B200",
+            "test",
+            &bridge,
+        )
+        .unwrap();
+        let plain = glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+            &sel(serde_json::Value::Null),
+            "NVIDIA B200",
+            "test",
+            &bridge,
+        )
+        .unwrap();
+        assert!(plain.kv_host_offload().is_none());
+        assert_eq!(plain.total_kv_bytes_per_token(), 11 * (512 + 33));
+        assert_eq!(model.total_kv_bytes_per_token(), 11 * 33);
+        assert_eq!(
+            model.recurrent_state_bytes_per_request(),
+            plain.recurrent_state_bytes_per_request()
+        );
+        assert_eq!(
+            model.kv_host_offload(),
+            Some(KvHostOffload {
+                device_bytes_per_request: 49_152 * 11 * 512,
+                host_bytes_per_token: 11 * 512,
+                host_bytes_per_partition: 187_500_000_000,
+            })
+        );
+        let copies = model
+            .cost_log_manifest()
+            .slots
+            .iter()
+            .filter(|slot| slot.kind == "hisparse_h2d_io")
+            .count();
+        assert_eq!(copies, 8);
+        assert_eq!(
+            model.cost_log_manifest().slots.len(),
+            plain.cost_log_manifest().slots.len() + 8
+        );
     }
 
     /// Catches HiSparse on the GLM-5.3 DP + DFlash2 target leaving the draft's

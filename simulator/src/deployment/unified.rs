@@ -400,6 +400,7 @@ impl Deployment for UnifiedDeployment {
                     arch_build::glm53_flash_kernel_path(&g.arch)?,
                     1,
                     crate::timing::bridge::DType::Fp32,
+                    g.arch.hisparse().as_ref(),
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

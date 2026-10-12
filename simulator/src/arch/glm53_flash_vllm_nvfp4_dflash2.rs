@@ -178,7 +178,8 @@ pub struct Dflash2VerifyModel<T> {
     /// as the target's per-token bytes. Zero when it is held as a window.
     draft_kv_bytes_per_token: u64,
     /// The target's HiSparse host tier, its device buffer joined by the
-    /// draft's window. `None` when the target keeps its cache on the GPU.
+    /// draft's window when that window is not already per-request state.
+    /// `None` when the target keeps its cache on the GPU.
     host_offload: Option<KvHostOffload>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
@@ -519,12 +520,16 @@ pub fn build<T: Dflash2VerifyTarget>(
             kind: ARCH_KIND,
             reason: "DFlash2 draft window KV overflows u64".to_string(),
         })?;
-    // Under HiSparse the draft's window joins the target's fixed device
-    // buffer: an engine that already pages the target's cache per request is
-    // assumed to hold only the window the draft attends to (an assumption;
-    // vLLM's unified pool does not, see `draft_kv_bytes_per_token`).
+    // Under HiSparse the draft holds only its window. Beside KDA that window
+    // is already per-request state (below), which the hybrid store charges
+    // apart from the host tier's buffer. Beside an all-attention target it
+    // joins the target's fixed device buffer: an engine that already pages
+    // the target's cache per request is assumed to hold only the window the
+    // draft attends to (an assumption; vLLM's unified pool does not, see
+    // `draft_kv_bytes_per_token`).
     let host_offload = target.kv_host_offload().map(|offload| KvHostOffload {
-        device_bytes_per_request: offload.device_bytes_per_request + window,
+        device_bytes_per_request: offload.device_bytes_per_request
+            + if recurrent { 0 } else { window },
         ..offload
     });
     let (draft_kv_bytes_per_request, draft_kv_bytes_per_token) =

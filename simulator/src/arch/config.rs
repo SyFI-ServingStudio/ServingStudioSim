@@ -1148,6 +1148,34 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
+        /// SGLang HiSparse KV offload (`arch::hisparse`) of the 11 DSA layers,
+        /// enabled by setting this: the per-request latent buffer on the GPU,
+        /// in token slots per layer. Their kpool index cache stays on the GPU,
+        /// their MLA latent moves to host DRAM, and the exposed host -> device
+        /// miss copy is billed per step. The KDA state stays on the GPU.
+        /// Absent: the whole cache stays on the GPU.
+        #[serde(default)]
+        hisparse_buffer_tokens: Option<u32>,
+        /// HiSparse: indexer top-k per layer per query position (default 2048).
+        #[serde(default)]
+        hisparse_top_k: Option<u32>,
+        /// HiSparse: host DRAM per node for the latent cache, GB (default 2000).
+        #[serde(default)]
+        hisparse_host_dram_gb_per_node: Option<f64>,
+        /// HiSparse: GPUs sharing a node's host DRAM (default `ep_size`: one
+        /// node holds the whole DP group).
+        #[serde(default)]
+        hisparse_gpus_per_node: Option<u16>,
+        /// HiSparse: host -> device GB/s per GPU (default 50).
+        #[serde(default)]
+        hisparse_h2d_gb_per_s: Option<f64>,
+        /// HiSparse: share of the miss copy not hidden by prefetch (default 0.5).
+        #[serde(default)]
+        hisparse_exposed_io_fraction: Option<f64>,
+        /// HiSparse: overlap of consecutive query positions' top-k in one
+        /// verify step (default 0.5).
+        #[serde(default)]
+        hisparse_intra_step_overlap: Option<f64>,
     },
     /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`] verifying the
     /// `incoai/GLM-5.3-Flash-DFlash2` proposer's drafts: each verify row is
@@ -1244,6 +1272,35 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "fp32", choices = KDA_STATE_DTYPES, cache_key)]
         kda_state_dtype: KdaStateDtype,
+        /// SGLang HiSparse KV offload (`arch::hisparse`) of the 11 DSA layers,
+        /// enabled by setting this: the per-request latent buffer on the GPU,
+        /// in token slots per layer. Their kpool index cache stays on the GPU,
+        /// their MLA latent moves to host DRAM, and the exposed host -> device
+        /// miss copy is billed per step. The KDA state stays on the GPU.
+        /// The draft keeps only its sliding window, as without HiSparse.
+        /// Absent: the whole cache stays on the GPU.
+        #[serde(default)]
+        hisparse_buffer_tokens: Option<u32>,
+        /// HiSparse: indexer top-k per layer per query position (default 2048).
+        #[serde(default)]
+        hisparse_top_k: Option<u32>,
+        /// HiSparse: host DRAM per node for the latent cache, GB (default 2000).
+        #[serde(default)]
+        hisparse_host_dram_gb_per_node: Option<f64>,
+        /// HiSparse: GPUs sharing a node's host DRAM (default `ep_size`: one
+        /// node holds the whole DP group).
+        #[serde(default)]
+        hisparse_gpus_per_node: Option<u16>,
+        /// HiSparse: host -> device GB/s per GPU (default 50).
+        #[serde(default)]
+        hisparse_h2d_gb_per_s: Option<f64>,
+        /// HiSparse: share of the miss copy not hidden by prefetch (default 0.5).
+        #[serde(default)]
+        hisparse_exposed_io_fraction: Option<f64>,
+        /// HiSparse: overlap of consecutive query positions' top-k in one
+        /// verify step (default 0.5).
+        #[serde(default)]
+        hisparse_intra_step_overlap: Option<f64>,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
@@ -1364,6 +1421,26 @@ impl IterArchSel {
             ..
         }
         | Self::Glm53VllmNvfp4DpAttnEpMoeDflash2 {
+            hisparse_buffer_tokens,
+            hisparse_top_k,
+            hisparse_host_dram_gb_per_node,
+            hisparse_gpus_per_node,
+            hisparse_h2d_gb_per_s,
+            hisparse_exposed_io_fraction,
+            hisparse_intra_step_overlap,
+            ..
+        }
+        | Self::Glm53FlashVllmNvfp4DpAttnEpMoe {
+            hisparse_buffer_tokens,
+            hisparse_top_k,
+            hisparse_host_dram_gb_per_node,
+            hisparse_gpus_per_node,
+            hisparse_h2d_gb_per_s,
+            hisparse_exposed_io_fraction,
+            hisparse_intra_step_overlap,
+            ..
+        }
+        | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
             hisparse_buffer_tokens,
             hisparse_top_k,
             hisparse_host_dram_gb_per_node,

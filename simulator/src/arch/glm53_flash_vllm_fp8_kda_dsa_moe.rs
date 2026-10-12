@@ -1357,11 +1357,21 @@ pub fn build(
 }
 
 /// One rank's cache bytes per token of one DSA layer: the fp8 MLA latent (no
-/// rope part) plus the kpool index cache, one 128-byte fp8 key and a 4-byte
-/// scale per 4-token pool.
+/// rope part) plus the kpool index cache.
 pub(crate) fn dsa_layer_bytes_per_token(model: &Glm53FlashModelCfg) -> u64 {
+    dsa_layer_latent_bytes_per_token(model) + dsa_layer_index_bytes_per_token(model)
+}
+
+/// The fp8 MLA latent of one DSA layer for one token (no rope part): what
+/// SGLang HiSparse moves to host memory.
+pub(crate) fn dsa_layer_latent_bytes_per_token(model: &Glm53FlashModelCfg) -> u64 {
     u64::from(model.kv_lora_rank)
-        + u64::from(model.index_head_dim + 4) / u64::from(model.index_kpool)
+}
+
+/// The kpool index cache of one DSA layer per token: one 128-byte fp8 key and
+/// a 4-byte scale per 4-token pool. HiSparse keeps it on the GPU.
+pub(crate) fn dsa_layer_index_bytes_per_token(model: &Glm53FlashModelCfg) -> u64 {
+    u64::from(model.index_head_dim + 4) / u64::from(model.index_kpool)
 }
 
 /// One rank's recurrent state of one KDA layer for one request: the SSM state

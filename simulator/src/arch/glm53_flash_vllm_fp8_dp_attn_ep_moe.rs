@@ -45,16 +45,25 @@
 //! At or below 256 local tokens vLLM runs the shared expert on an aux stream,
 //! launched before the gate and joined after the combine; that copy overlaps
 //! the dispatch, routed experts and combine (`Max{overlap}` as in the TP arch).
+//!
+//! [`Glm53FlashDpAttnEpModel::with_hisparse`] serves the 11 DSA layers' cache
+//! through SGLang HiSparse (`arch::hisparse`, a rough analytic model, as on
+//! the GLM-5.3 DP graph): their MLA latent moves to host memory, their kpool
+//! index cache and a fixed latent buffer per request stay on the GPU, and each
+//! step adds the exposed host -> device miss copy as one more `Max` over
+//! ranks. The 34 KDA layers' recurrent state and conv window cannot be
+//! offloaded and stay on the GPU unchanged.
 
 use anyhow::Result;
 
-use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::contract::{IterwiseUnifiedModel, KvHostOffload, UnifiedArchInput};
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
     self as tp_arch, atomic, attention_inputs, graph_padded_tokens, push, AttnKind, Boundary,
     FfnKind, Glm53FlashLayerGroup, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmConfigs,
     Glm53FlashVllmParallel, ACTIVATION_DTYPE, SHARED_EXPERTS_STREAM_OVERLAP,
     SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
 };
+use crate::arch::hisparse::{push_rank_step, HisparseConfig, HisparseRankStep};
 use crate::op::mhc::{MhcTerminalPostConfig, MhcTerminalPostInput, MhcTerminalPostOp};
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -495,6 +504,14 @@ pub struct Glm53FlashDpAttnEpModel {
     hybrid_block_size: u32,
     /// The RecoverSSM commit of a verify graph (see `Glm53FlashVllmModel`).
     pub(crate) kda_commit: Option<tp_arch::KdaCommitPlan>,
+    /// The layers with a per-token cache, and the parts of one layer's token.
+    num_dsa_layers: u32,
+    dsa_latent_bytes_per_token: u64,
+    dsa_index_bytes_per_token: u64,
+    /// SGLang HiSparse KV offload (see [`Glm53FlashDpAttnEpModel::with_hisparse`]);
+    /// `None` keeps the whole cache on the GPU.
+    hisparse: Option<HisparseConfig>,
+    host_offload: Option<KvHostOffload>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -583,13 +600,16 @@ pub fn build(
         recurrent_state_bytes_per_request,
         hybrid_block_size,
         kda_commit: tp_arch::kda_commit_plan(&resolved.local),
+        num_dsa_layers: model_cfg.num_dsa_layers(),
+        dsa_latent_bytes_per_token: tp_arch::dsa_layer_latent_bytes_per_token(model_cfg),
+        dsa_index_bytes_per_token: tp_arch::dsa_layer_index_bytes_per_token(model_cfg),
+        hisparse: None,
+        host_offload: None,
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
     };
-    let tree = model.cost_tree();
-    model.cost_flat = tree.flatten();
-    model.n_slots = tree.n_slots();
+    model.recompile();
     Ok(model)
 }
 
@@ -737,6 +757,43 @@ fn build_group(
 }
 
 impl Glm53FlashDpAttnEpModel {
+    fn recompile(&mut self) {
+        let tree = self.cost_tree();
+        self.cost_flat = tree.flatten();
+        self.n_slots = tree.n_slots();
+    }
+
+    /// Serve the DSA layers' cache through SGLang HiSparse (`arch::hisparse`),
+    /// as [`Glm52VllmNvfp4DpAttnDsaMoeModel::with_hisparse`] does for GLM-5.3:
+    /// each rank keeps the 11 DSA layers' kpool index cache per token and a
+    /// `buffer_tokens` latent buffer per request on the GPU, their whole
+    /// latent in its share of the node's host DRAM (`gpus_per_node` GPUs per
+    /// node unless the config says otherwise), and pays the exposed host ->
+    /// device miss copy of those 11 layers as one more `Max` over ranks per
+    /// step. The KDA state is not offloadable and is unchanged. Kernels are
+    /// unchanged.
+    ///
+    /// [`Glm52VllmNvfp4DpAttnDsaMoeModel::with_hisparse`]:
+    /// crate::arch::glm52_vllm_nvfp4_dp_attn_dsa_moe::Glm52VllmNvfp4DpAttnDsaMoeModel::with_hisparse
+    pub fn with_hisparse(
+        mut self,
+        config: HisparseConfig,
+        gpus_per_node: u16,
+    ) -> std::result::Result<Self, BuildError> {
+        config.validate().map_err(fit_failed)?;
+        let layers = u64::from(self.num_dsa_layers);
+        self.total_kv_bytes_per_token = layers * self.dsa_index_bytes_per_token;
+        self.host_offload = Some(config.kv_host_offload(
+            layers * self.dsa_latent_bytes_per_token,
+            0,
+            gpus_per_node,
+            1,
+        ));
+        self.hisparse = Some(config);
+        self.recompile();
+        Ok(self)
+    }
+
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
         let root = self.compile_root(&mut builder);
@@ -782,6 +839,9 @@ impl Glm53FlashDpAttnEpModel {
                 children: epilogue,
             }),
         });
+        if let Some(hisparse) = &self.hisparse {
+            children.push(hisparse.compile(&self.name, self.dp_size, builder));
+        }
         CostNode::Labeled {
             label: format!(
                 "{} (Glm53FlashDpAttnEpModel) [attention DP{}/TP1; MoE EP{} \
@@ -835,6 +895,29 @@ impl Glm53FlashDpAttnEpModel {
                 push(&self.lm_head, rows, ev);
             }
         }
+        for step in self.hisparse_steps(input) {
+            push_rank_step(step, ev);
+        }
+    }
+
+    /// Each rank's HiSparse miss copy; empty without HiSparse. Only the DSA
+    /// layers hold a latent cache, so only they miss.
+    fn hisparse_steps(&self, input: &UnifiedArchInput) -> Vec<HisparseRankStep> {
+        let Some(hisparse) = &self.hisparse else {
+            return Vec::new();
+        };
+        input
+            .groups
+            .iter()
+            .map(|group| {
+                hisparse.rank_step(
+                    &group.decode_kv_lens,
+                    self.verify_width,
+                    self.dsa_latent_bytes_per_token,
+                    self.num_dsa_layers,
+                )
+            })
+            .collect()
     }
 
     fn eval_checked(
@@ -873,7 +956,8 @@ impl IterwiseUnifiedModel for Glm53FlashDpAttnEpModel {
         .map(|_| ())
     }
 
-    /// One DP rank's KV for a token (the rank that owns the request).
+    /// One DP rank's KV for a token (the rank that owns the request); under
+    /// HiSparse only the DSA layers' index cache, the part the GPU keeps.
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_kv_bytes_per_token
     }
@@ -881,6 +965,10 @@ impl IterwiseUnifiedModel for Glm53FlashDpAttnEpModel {
     /// One DP rank's KDA state for a request: all 64 heads of 34 layers.
     fn recurrent_state_bytes_per_request(&self) -> u64 {
         self.recurrent_state_bytes_per_request
+    }
+
+    fn kv_host_offload(&self) -> Option<KvHostOffload> {
+        self.host_offload
     }
 
     fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
@@ -1266,6 +1354,116 @@ mod tests {
             ["flashinfer_trtllm_routed_sm100"]
         );
         assert_eq!(resolved.routed[0].fused_moe.routing_method, "deepseek_v3");
+    }
+
+    fn decode(kv_lens: &[u32]) -> ArchGroupInput {
+        ArchGroupInput {
+            batch_tokens: kv_lens.len() as u32,
+            prefill_tokens: 0,
+            decode_tokens: kv_lens.len() as u32,
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: kv_lens.to_vec(),
+            total_kv_len: kv_lens.iter().sum(),
+        }
+    }
+
+    fn hisparse(buffer_tokens: u32) -> HisparseConfig {
+        HisparseConfig {
+            buffer_tokens,
+            host_dram_gb_per_node: 1500.0,
+            ..HisparseConfig::default()
+        }
+    }
+
+    /// Catches HiSparse offloading the wrong part of a Flash token: only the
+    /// 11 DSA layers' 512-byte latent leaves the GPU, their 33-byte kpool
+    /// index stays, and the latent buffer is charged per request.
+    #[test]
+    fn hisparse_moves_only_the_dsa_latent_to_the_host() {
+        let plain = built(8);
+        assert!(plain.kv_host_offload().is_none());
+        assert_eq!(plain.total_kv_bytes_per_token(), 11 * (512 + 33));
+        let model = built(8).with_hisparse(hisparse(49_152), 8).unwrap();
+        assert_eq!(model.total_kv_bytes_per_token(), 11 * 33);
+        assert_eq!(
+            model.kv_host_offload(),
+            Some(KvHostOffload {
+                device_bytes_per_request: 49_152 * 11 * 512,
+                host_bytes_per_token: 11 * 512,
+                host_bytes_per_partition: 187_500_000_000,
+            })
+        );
+        // GPU + host bytes of one token are the plain per-token bytes.
+        assert_eq!(
+            model.total_kv_bytes_per_token() + 11 * 512,
+            plain.total_kv_bytes_per_token()
+        );
+        // An explicit node size splits the host DRAM over that many GPUs.
+        let shared = built(4)
+            .with_hisparse(
+                HisparseConfig {
+                    gpus_per_node: Some(8),
+                    ..hisparse(4096)
+                },
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            shared.kv_host_offload().unwrap().host_bytes_per_partition,
+            187_500_000_000
+        );
+        assert!(built(8).with_hisparse(hisparse(0), 8).is_err());
+    }
+
+    /// Catches HiSparse touching the KDA layers: their recurrent state and
+    /// conv window are not offloadable and keep their size and checkpoint.
+    #[test]
+    fn hisparse_leaves_the_kda_state_on_the_gpu_unchanged() {
+        let plain = built(8);
+        let model = built(8).with_hisparse(hisparse(49_152), 8).unwrap();
+        assert_eq!(
+            model.recurrent_state_bytes_per_request(),
+            plain.recurrent_state_bytes_per_request()
+        );
+        assert_eq!(model.recurrent_state_bytes_per_request(), 34 * 8576 * 512);
+        assert_eq!(
+            model.recurrent_checkpoint_interval_tokens(),
+            plain.recurrent_checkpoint_interval_tokens()
+        );
+    }
+
+    /// Catches the miss copy billing all 45 layers, or a KDA layer: bytes are
+    /// the misses times one 512-byte latent times the 11 DSA layers, and one
+    /// copy leaf per rank is appended after the unchanged forward.
+    #[test]
+    fn hisparse_miss_io_scales_with_the_dsa_layers_only() {
+        let plain = built(8);
+        let model = built(8).with_hisparse(hisparse(4096), 8).unwrap();
+        assert_eq!(model.n_slots, plain.n_slots + 8);
+        let copies: Vec<_> = model
+            .cost_log_manifest()
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.kind == crate::arch::hisparse::HISPARSE_H2D_IO_KIND)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(copies, (plain.n_slots..model.n_slots).collect::<Vec<_>>());
+        let mut groups = vec![ArchGroupInput::default(); 8];
+        groups[0] = decode(&[100_000, 2_000]);
+        groups[5] = decode(&[200_000]);
+        let steps = model.hisparse_steps(&input(groups));
+        assert_eq!(steps.len(), 8);
+        // r = 4096 / 2048 = 2: 13.4% of the top-k misses per layer.
+        let misses = 0.134 * 2048.0;
+        assert_eq!(steps[0].offloaded_requests, 1);
+        assert!((steps[0].misses_per_layer - misses).abs() < 1e-6);
+        assert!((steps[0].io_bytes - misses * 512.0 * 11.0).abs() < 1e-3);
+        assert!((steps[5].io_bytes - steps[0].io_bytes).abs() < 1e-6);
+        assert_eq!(steps[1], HisparseRankStep::default());
+        assert!(plain
+            .hisparse_steps(&input(vec![decode(&[100_000]); 8]))
+            .is_empty());
     }
 
     fn leaf_order(node: &CostNode, out: &mut Vec<usize>) {
