@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 use crate::timing::bridge::{ArgsPayload, ConfigGrid, KernelKind, KernelMetrics, PerfApiBridge};
-use crate::timing::cache::interp::LeafMetrics;
+use crate::timing::cache::interp::{CoverageFlags, LeafMetrics};
 use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning, PeakRates};
 use crate::timing::result::CacheProbe;
 use crate::timing::sweep::{SweepCoords, SweepGrid};
@@ -376,7 +376,8 @@ impl<S: KernelSpec> Kernel<S> {
 
     /// All-four-metrics best-of-N for the CostTree eval path: return the
     /// [`LeafMetrics`] from the backend with the smallest non-negative wallclock,
-    /// preserving that backend's coverage bits.
+    /// preserving that backend's coverage bits. A covered answer always beats a
+    /// [`CoverageFlags::NO_COVERAGE`] one.
     ///
     /// Each backend answers an input past its grid as its spec's
     /// [`KernelSpec::off_grid`] says.
@@ -426,15 +427,24 @@ impl<S: KernelSpec> Kernel<S> {
                 only
             }
             [first_cache, rest @ ..] => {
+                // A backend with no coverage at this input answers a 0-time
+                // `MISS`; it must never undercut a backend that measured it. Rank
+                // covered answers ahead of uncovered ones, then by wallclock.
+                let rank = |leaf: &LeafMetrics| {
+                    (
+                        leaf.coverage.contains(CoverageFlags::NO_COVERAGE),
+                        leaf.m.time_ms.max(0.0),
+                    )
+                };
                 let mut best = eval(0, first_cache);
-                let mut best_time_ms = best.m.time_ms.max(0.0);
+                let mut best_rank = rank(&best);
                 let mut best_index = 0u8;
                 for (offset, backend_cache) in rest.iter().enumerate() {
                     let candidate = eval(offset + 1, backend_cache);
-                    let candidate_time_ms = candidate.m.time_ms.max(0.0);
-                    if candidate_time_ms < best_time_ms {
+                    let candidate_rank = rank(&candidate);
+                    if candidate_rank < best_rank {
                         best = candidate;
-                        best_time_ms = candidate_time_ms;
+                        best_rank = candidate_rank;
                         best_index = (offset + 1) as u8;
                     }
                 }
@@ -903,9 +913,12 @@ fn ensure_has_backends(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_has_backends, KernelConfig, KernelSpec};
-    use crate::timing::bridge::{ArgsPayload, KernelKind};
-    use crate::timing::cache::{CacheKind, Extrapolation};
+    use std::marker::PhantomData;
+
+    use super::{ensure_has_backends, Kernel, KernelConfig, KernelSpec};
+    use crate::timing::bridge::{ArgsPayload, KernelKind, KernelMetrics};
+    use crate::timing::cache::interp::CoverageFlags;
+    use crate::timing::cache::{BackendCache, CacheKind, Extrapolation};
     use crate::timing::{BuildError, Coords, SweepCoords, SweepGrid};
 
     #[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Serialize)]
@@ -1078,5 +1091,63 @@ mod tests {
             &*DefaultCoordsSpec::cache_coords(&config, &DefaultCoordsInput),
             &[3.0, 5.0]
         );
+    }
+
+    fn metrics(time_ms: f64) -> KernelMetrics {
+        KernelMetrics {
+            time_ms,
+            tflops: Some(1.0),
+            memory_bandwidth_gbps: Some(1.0),
+            algbw_gbps: None,
+            busbw_gbps: None,
+            energy_j: time_ms,
+        }
+    }
+
+    /// One backend per sample time; NaN drops every cell, so that backend
+    /// answers `MISS` everywhere.
+    fn kernel_with_backends(times: &[f64]) -> Kernel<DefaultCoordsSpec> {
+        let grid = SweepGrid::new(vec![vec![1.0, 2.0], vec![1.0, 2.0]]);
+        let backend_caches = times
+            .iter()
+            .map(|&time_ms| {
+                BackendCache::fit(
+                    DefaultCoordsSpec::KIND,
+                    "test",
+                    CacheKind::Cache2DLinear(Extrapolation::Clamp),
+                    &grid,
+                    &vec![metrics(time_ms); 4],
+                )
+                .unwrap()
+                .0
+            })
+            .collect();
+        Kernel {
+            config: DefaultCoordsConfig {
+                backends: vec!["test"; times.len()],
+                gpu_name: "test-gpu".to_string(),
+            },
+            outlier_warnings: Vec::new(),
+            backend_caches,
+            _spec: PhantomData,
+        }
+    }
+
+    #[test]
+    fn best_of_never_selects_a_backend_without_coverage() {
+        let coords = Coords::new([1.5, 1.5]);
+        for (times, covered_index) in [(vec![f64::NAN, 2.0], 1), (vec![2.0, f64::NAN], 0)] {
+            let leaf = kernel_with_backends(&times).eval_cache_coords(&coords);
+            assert_eq!(leaf.backend_index, covered_index);
+            assert_eq!(leaf.coverage, CoverageFlags::EMPTY);
+            assert_eq!(leaf.m.time_ms, 2.0);
+        }
+
+        let leaf = kernel_with_backends(&[3.0, 2.0]).eval_cache_coords(&coords);
+        assert_eq!((leaf.backend_index, leaf.m.time_ms), (1, 2.0));
+
+        let leaf = kernel_with_backends(&[f64::NAN, f64::NAN]).eval_cache_coords(&coords);
+        assert!(leaf.coverage.contains(CoverageFlags::NO_COVERAGE));
+        assert_eq!(leaf.m.time_ms, 0.0);
     }
 }
