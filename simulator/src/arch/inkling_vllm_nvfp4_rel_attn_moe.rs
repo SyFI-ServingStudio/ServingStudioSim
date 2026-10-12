@@ -47,6 +47,7 @@ use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
     graph_padded_tokens, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
 };
 use crate::arch::inkling_model_cfg::{InklingExpertPrecision, InklingModelCfg};
+use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -789,7 +790,7 @@ pub struct InklingVllmModel {
     lm_head: Op<SingleGemmKernel>,
     logits_all_gather: Op<AllReduceKernel>,
     vocab_size: u32,
-    total_kv_bytes_per_token: u64,
+    kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -831,7 +832,7 @@ pub fn build(
             bridge,
         )?,
         vocab_size: model_cfg.vocab_size,
-        total_kv_bytes_per_token: total_kv_bytes_per_token(model_cfg),
+        kv_cache_layout: kv_cache_layout(model_cfg, cfg.parallel.tp_size),
         tp_size: cfg.parallel.tp_size,
         enable_expert_parallel: cfg.parallel.enable_expert_parallel,
         max_model_len: cfg.parallel.max_model_len,
@@ -851,22 +852,51 @@ pub fn build(
     Ok(model)
 }
 
-/// K and V of every layer's KV heads, summed over the ranks. Sliding-window
-/// layers are counted at full length: vLLM frees their pages behind the
-/// window, which this per-token total cannot express, so on that count
-/// capacity is a lower bound. vLLM's per-request conv-state pages share the
-/// same pool and are not counted, which pulls the other way.
-fn total_kv_bytes_per_token(model: &InklingModelCfg) -> u64 {
-    (0..model.num_layers)
-        .map(|layer| {
-            let (kv_heads, head_dim) = if model.is_local(layer) {
-                (model.swa_num_key_value_heads, model.swa_head_dim)
-            } else {
-                (model.num_key_value_heads, model.head_dim)
-            };
-            2 * u64::from(kv_heads * head_dim) * u64::from(ACTIVATION_DTYPE.size_bytes())
-        })
-        .sum()
+/// One request's cache over the TP group: K and V of the global layers for
+/// every token; K and V of the sliding-window layers for the last
+/// `sliding_window_size` tokens; and every layer's short-conv state for the
+/// last `sconv_kernel_size` tokens.
+///
+/// vLLM keeps the conv state as one sliding-window cache per layer whose
+/// per-KV-head row packs K, V and the attention- and MLP-output chunks
+/// (`2 * head_dim + 2 * hidden / kv_heads`), padded to a power of two so every
+/// conv page is the same size (fork `sconv_swa_attn.py`).
+fn kv_cache_layout(model: &InklingModelCfg, tp_size: u16) -> KvCacheLayout {
+    let bf16 = u64::from(ACTIVATION_DTYPE.size_bytes());
+    let tp = u64::from(tp_size);
+    let (mut global, mut swa, mut conv, mut conv_padded) = (0, 0, 0, 0);
+    for layer in 0..model.num_layers {
+        let local = model.is_local(layer);
+        let (kv_heads, head_dim) = if local {
+            (model.swa_num_key_value_heads, model.swa_head_dim)
+        } else {
+            (model.num_key_value_heads, model.head_dim)
+        };
+        let (kv_heads, head_dim) = (u64::from(kv_heads), u64::from(head_dim));
+        let attn = gqa_kv_bytes_per_token(1, kv_heads, head_dim, head_dim, bf16, tp);
+        if local {
+            swa += attn;
+        } else {
+            global += attn;
+        }
+        let conv_row = 2 * head_dim + 2 * u64::from(model.hidden) / kv_heads;
+        conv += kv_heads * conv_row * bf16;
+        conv_padded += kv_heads * conv_row.next_power_of_two() * bf16;
+    }
+    let mut layout = KvCacheLayout::new();
+    if global > 0 {
+        layout = layout.with_part(KvCachePart::per_token("global_attn", global));
+    }
+    if swa > 0 {
+        layout = layout.with_part(KvCachePart::sliding_window(
+            "swa_attn",
+            model.sliding_window_size,
+            swa,
+        ));
+    }
+    layout.with_part(
+        KvCachePart::sliding_window("sconv", model.sconv_kernel_size, conv).padded_to(conv_padded),
+    )
 }
 
 impl InklingVllmModel {
@@ -952,8 +982,8 @@ impl IterwiseUnifiedModel for InklingVllmModel {
         normalize_input(batch, self.max_model_len).map(|_| ())
     }
 
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn gpus_per_replica(&self) -> u16 {
@@ -1162,6 +1192,53 @@ mod tests {
         bridge.enable_enumerate();
         let configs = build_configs(&model_cfg(), &parallel(), &demand()).unwrap();
         build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
+    }
+
+    #[test]
+    fn kv_cache_layout_reproduces_vllms_logged_concurrency() {
+        use crate::worker::kv::{KvAccounting, KvAccountingOptions};
+        // The fork's "Maximum concurrency for N tokens per request" with two
+        // async batches of 2048 tokens in flight. Inkling TP8 at 73.85 GiB per
+        // rank; Inkling-Small TP4 at 106.11 GiB per rank.
+        let cases: [(&str, u16, f64, &[(u64, f64)]); 2] = [
+            (
+                "inkling_nvfp4.json",
+                8,
+                73.85,
+                &[
+                    (8192, 56.00),
+                    (65536, 45.6),
+                    (131072, 37.61),
+                    (262144, 27.9),
+                    (524288, 18.3),
+                ],
+            ),
+            (
+                "inkling_small_nvfp4.json",
+                4,
+                106.11,
+                &[(8192, 69.6), (131072, 45.25)],
+            ),
+        ];
+        for (file, tp_size, gib_per_rank, logged) in cases {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("model/config")
+                .join(file);
+            let layout = kv_cache_layout(&InklingModelCfg::from_json(&path).unwrap(), tp_size);
+            let budget = (gib_per_rank * f64::from(1u32 << 30)) as u64 * u64::from(tp_size);
+            let options = KvAccountingOptions {
+                max_in_flight_tokens: Some(2 * 2048),
+                ..Default::default()
+            };
+            let accounting = KvAccounting::resolve(&layout, options, budget).unwrap();
+            for &(max_model_len, logged) in logged {
+                let concurrency = accounting.concurrency_at(max_model_len);
+                assert!(
+                    (concurrency / logged - 1.0).abs() < 0.005,
+                    "{file} at {max_model_len}: {concurrency} vs {logged}"
+                );
+            }
+        }
     }
 
     #[test]

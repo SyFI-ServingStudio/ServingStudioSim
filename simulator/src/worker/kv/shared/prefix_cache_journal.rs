@@ -57,6 +57,7 @@ impl PrefixCacheJournal {
                 0
             },
             hit_tokens: 0,
+            full_hit_tokens: 0,
         });
     }
 

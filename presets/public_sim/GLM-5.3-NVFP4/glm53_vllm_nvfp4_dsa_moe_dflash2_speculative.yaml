@@ -29,8 +29,8 @@ sweep:
   replicas: [1, 2]
 compound:
   server:
-    ctx8k: {max_model_len: 8192, max_batch_tokens: 2048, attn_gpu_memory_gb: 7.514121216}
-    ctx8k_chunk4k: {max_model_len: 8192, max_batch_tokens: 4096, attn_gpu_memory_gb: 6.917170176}
-    ctx16k: {max_model_len: 16384, max_batch_tokens: 4096, attn_gpu_memory_gb: 6.644811264}
-    ctx16k_chunk8k: {max_model_len: 16384, max_batch_tokens: 8192, attn_gpu_memory_gb: 5.383752192}
-    ctx128k: {max_model_len: 131072, max_batch_tokens: 8192, attn_gpu_memory_gb: 26.47104768}
+    ctx8k: {max_model_len: 8192, max_batch_tokens: 2048, attn_gpu_memory_gb: 6.544307712}
+    ctx8k_chunk4k: {max_model_len: 8192, max_batch_tokens: 4096, attn_gpu_memory_gb: 6.024402432}
+    ctx16k: {max_model_len: 16384, max_batch_tokens: 4096, attn_gpu_memory_gb: 5.787195648}
+    ctx16k_chunk8k: {max_model_len: 16384, max_batch_tokens: 8192, attn_gpu_memory_gb: 4.688895744}
+    ctx128k: {max_model_len: 131072, max_batch_tokens: 8192, attn_gpu_memory_gb: 23.05454976}

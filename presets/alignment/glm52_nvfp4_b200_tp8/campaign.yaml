@@ -96,9 +96,9 @@ cases:
       - 64
     repeats: 256
   attn_gpu_memory_gb:
-    value: 75.9917583
+    value: 65.6382528
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/01_micro_throughput_c256/profile_workload/vllm/glm52_b200_tp8_ep8_01_micro_throughput_c256_workload_server.log
   provenance:
     accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/01_micro_throughput_c256
@@ -149,9 +149,9 @@ cases:
       - 64
     repeats: 48
   attn_gpu_memory_gb:
-    value: 75.9917583
+    value: 65.6382528
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/02_graph_boundaries_c128/profile_workload/vllm/glm52_b200_tp8_ep8_02_graph_boundaries_c128_workload_server.log
   provenance:
     accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/02_graph_boundaries_c128
@@ -190,9 +190,9 @@ cases:
       - 256
     repeats: 16
   attn_gpu_memory_gb:
-    value: 75.9917583
+    value: 65.6382528
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/03_balanced_anchor_c32/profile_workload/vllm/glm52_b200_tp8_ep8_03_balanced_anchor_c32_workload_server.log
   provenance:
     accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/03_balanced_anchor_c32
@@ -232,9 +232,9 @@ cases:
       - 64
     repeats: 16
   attn_gpu_memory_gb:
-    value: 75.9917583
+    value: 65.6382528
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/04_prefill_spectrum_c32/profile_workload/vllm/glm52_b200_tp8_ep8_04_prefill_spectrum_c32_workload_server.log
   provenance:
     accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/04_prefill_spectrum_c32
@@ -274,9 +274,9 @@ cases:
       - 4096
     repeats: 16
   attn_gpu_memory_gb:
-    value: 75.9917583
+    value: 65.6382528
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/05_decode_spectrum_c64/profile_workload/vllm/glm52_b200_tp8_ep8_05_decode_spectrum_c64_workload_server.log
   provenance:
     accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/05_decode_spectrum_c64
@@ -310,9 +310,9 @@ cases:
       - 1920
     repeats: 7
   attn_gpu_memory_gb:
-    value: 75.9917583
+    value: 65.6382528
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/06_long_long_c8/profile_workload/vllm/glm52_b200_tp8_ep8_06_long_long_c8_workload_server.log
   provenance:
     accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/06_long_long_c8
@@ -344,9 +344,9 @@ cases:
       - 3072
     repeats: 24
   attn_gpu_memory_gb:
-    value: 75.9917583
+    value: 65.6382528
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/07_quadrant_interference_c48/profile_workload/vllm/glm52_b200_tp8_ep8_07_quadrant_interference_c48_workload_server.log
   provenance:
     accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/07_quadrant_interference_c48
@@ -382,9 +382,9 @@ cases:
       - 4096
     repeats: 32
   attn_gpu_memory_gb:
-    value: 75.9917583
+    value: 65.6382528
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/08_completion_churn_c96/profile_workload/vllm/glm52_b200_tp8_ep8_08_completion_churn_c96_workload_server.log
   provenance:
     accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/08_completion_churn_c96
@@ -428,9 +428,9 @@ cases:
     derived_from: queueing knee of the case-10 saturation sweep; DESIGN.md step 2
     evidence: ''
   attn_gpu_memory_gb:
-    value: 95.1407908
+    value: 82.1783232
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/09_rate_knee/profile_workload/vllm/glm52_b200_tp8_ep8_09_rate_knee_workload_server.log
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/09_rate_knee
@@ -470,9 +470,9 @@ cases:
       - 4096
     repeats: 64
   attn_gpu_memory_gb:
-    value: 95.1407908
+    value: 82.1783232
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/10_full_saturation_rate/profile_workload/vllm/glm52_b200_tp8_ep8_10_full_saturation_rate_workload_server.log
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate
@@ -536,9 +536,9 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 88.0014321
+    value: 76.0116672
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/11_long_prefill_ladder_c1/profile_workload/vllm/glm52_b200_tp8_ep8_11_long_prefill_ladder_c1_workload_server.log
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/11_long_prefill_ladder_c1
@@ -604,9 +604,9 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 88.0014321
+    value: 76.0116672
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/12_ultra_context_decode_c1/profile_workload/vllm/glm52_b200_tp8_ep8_12_ultra_context_decode_c1_workload_server.log
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/12_ultra_context_decode_c1
@@ -699,9 +699,9 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 93.4584468
+    value: 80.7251904
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/13_generation_length_matrix_c8/profile_workload/vllm/glm52_b200_tp8_ep8_13_generation_length_matrix_c8_workload_server.log
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/13_generation_length_matrix_c8
@@ -784,9 +784,9 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 93.8048118
+    value: 81.0243648
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/14_near_full_long_decode_c21/profile_workload/vllm/glm52_b200_tp8_ep8_14_near_full_long_decode_c21_workload_server.log
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21
@@ -856,9 +856,9 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 91.5357681
+    value: 79.0644672
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: tp8_20260901/15_kv_overcommit_mixed_churn_c14/profile_workload/vllm/glm52_b200_tp8_ep8_15_kv_overcommit_mixed_churn_c14_workload_server.log
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14

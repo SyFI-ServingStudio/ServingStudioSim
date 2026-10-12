@@ -53,6 +53,7 @@ pools:
           gpu_time_multiplier: 1.0361
           # vLLM KV pool per GPU in capture 2: 603004 blocks x 135168 B (the
           # smallest rank's budget; "GPU KV cache size: 46,767,420 tokens" is
-          # that pool divided into 131072-token requests). The arch charges
-          # 1056 B/token/rank, so the simulator sees 77,184,512 tokens.
+          # that pool divided into 131072-token requests). The arch's layout
+          # charges the compressed caches, the sliding window and the
+          # compressor ring as vLLM's packed groups do.
           attn_gpu_memory_gb: 81.506844672

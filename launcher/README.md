@@ -68,7 +68,7 @@ callbacks until those copies are migrated.
 ```
 __main__.py    CLI entry. Thin dispatch only: parse argv, apply --override,
                build once, then validate → expand → (dry-run | cache-report |
-               run_single | run_sweep). No sim logic.
+               kv-report | run_single | run_sweep). No sim logic.
 alignment.py   Explicit alignment stage entry: sim, profile, timing-predict, and
                analyze. No stage implicitly starts the next one.
 alignment_campaign/
@@ -116,6 +116,8 @@ sweep.py       Top-level flow: `run_single` / `run_sweep`. Resume markers,
                resource-scheduled parallel launch, sweep-axis aggregation contract.
 cache_build.py Prebuild profile.db per unique cache key, sequentially (INV-3),
                so parallel runs don't race the GPU / SQLite. `--cache-report`.
+kv_report.py   `--kv-report[-json]`: the binary's structure-only `kv-cache` report
+               per distinct candidate.
 metadata.py    Repro metadata written BEFORE spawn (INV-2): preset.json,
                git_snapshot/, raw/params.json, command.txt, manifest.json.
 
@@ -152,7 +154,8 @@ workflow/      Explicit stage topology and in-process resource scheduling.
 4. **Guard:** reject duplicate `log_dir`s across the whole plan
    (`validate_unique_log_dirs`).
 5. **Branch:** `--dry-run` prints the expanded configs and stops; `--cache-report`
-   probes coverage and stops; otherwise hand off to `sweep`.
+   probes coverage and stops; `--kv-report` prints KV capacity and stops;
+   otherwise hand off to `sweep`.
 6. **Run** (`sweep.run_single` / `run_sweep`): ensure cache → simulate → validate
    raw artifacts → optional analyzer compute/render/trace → finalize. A sweep
    schedules simulations and analysis independently instead of making one
@@ -675,7 +678,8 @@ silently mixing incompatible sweep geometries.
 ```
 python -m launcher <preset.yaml|json> [<preset2.yaml|json> ...]
                    [--override path=value ...]
-                   [--dry-run] [--cache-report] [--refresh]
+                   [--dry-run] [--cache-report] [--kv-report | --kv-report-json]
+                   [--refresh]
                    [--build-type <cargo-profile>] [--profile [--profile-freq HZ]]
                    [--energy | --no-energy]
                    [--no-analyze] [--no-plot] [--emit-backends [FILE]]
@@ -705,6 +709,14 @@ takes them off before dispatch): `--no-gpu`, and `--remote NAME` with repeatable
   when possible, else kept as a bare string.
 - `--dry-run` validates + expands + prints the resolved configs; spawns nothing.
 - `--cache-report` reports profile.db coverage per unique cache key, then exits.
+- `--kv-report` prints each KV pool's layout, what one request at `max_model_len`
+  holds per part, and the max concurrency under both `kv_overhead` modes, then
+  exits (`kv_report.py`). It runs the binary's `kv-cache` subcommand, which
+  builds structure only: no profile.db, GPU or log_dir. Candidates differing only
+  in `workload`/`io` run once, and identical reports print once under every
+  run's log_dir. `--kv-report-json` prints one document,
+  `{schema_version, reports: [{log_dirs, kv_cache}]}`, where `kv_cache` is the
+  run's `raw/kv_cache.json`.
 - `--emit-backends [FILE]` enumerates the distinct kernels (structural, no GPU) and
   writes the annotated `backends:` skeleton (stdout, or `FILE`), then exits — the
   starting point for a `backends_file` (see the `backends` section above).

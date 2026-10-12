@@ -204,6 +204,7 @@ pub fn prefix_cache_event_schema() -> Arc<Schema> {
         Field::new("cache_used_after", DataType::UInt64, false),
         Field::new("requested_tokens", DataType::UInt64, false),
         Field::new("hit_tokens", DataType::UInt64, false),
+        Field::new("full_hit_tokens", DataType::UInt64, false),
     ]))
 }
 

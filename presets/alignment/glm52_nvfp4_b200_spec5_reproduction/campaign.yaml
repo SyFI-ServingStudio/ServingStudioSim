@@ -249,9 +249,9 @@
         "repeats": 256
       },
       "attn_gpu_memory_gb": {
-        "value": 9.440211456,
+        "value": 8.1540288,
         "status": "measured",
-        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9",
         "evidence": "logs/20260831_0_glm52_nvfp4_b200_spec5_matrix/01_micro_throughput_c256/profile_workload/vllm/glm52_b200_ep4_01_micro_throughput_c256_workload_server.log"
       },
       "provenance": {
@@ -343,9 +343,9 @@
         "repeats": 48
       },
       "attn_gpu_memory_gb": {
-        "value": 9.440211456,
+        "value": 8.1540288,
         "status": "measured",
-        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9",
         "evidence": "logs/20260831_0_glm52_nvfp4_b200_spec5_matrix/02_graph_boundaries_c128/profile_workload/vllm/glm52_b200_ep4_02_graph_boundaries_c128_workload_server.log"
       },
       "provenance": {

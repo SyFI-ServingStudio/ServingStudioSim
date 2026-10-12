@@ -53,12 +53,13 @@ use std::sync::Arc;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
-    self as ep_graph, build_atomic, eval_atomic_or_zero, normalize_group, state_bytes_per_token,
+    self as ep_graph, build_atomic, eval_atomic_or_zero, kv_cache_layout, normalize_group,
     Glm52VllmNvfp4DsaMoeConfigs, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeResolved,
     NormalizedGroup, CHECKPOINT_MAX_CONTEXT, NUM_DENSE_LAYERS, NUM_INITIAL_SHARED_LAYERS,
 };
 use crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::eval_compiled;
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::graph_padded_tokens;
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
@@ -557,7 +558,7 @@ pub struct Glm52VllmNvfp4DpAttnDsaMoeModel {
     final_norm: Op<ResidualRmsNormKernel>,
     /// Full vocabulary: a TP1 `ParallelLMHead` shards nothing.
     lm_head: Op<SingleGemmKernel>,
-    kv_bytes_per_token: u64,
+    kv_cache_layout: KvCacheLayout,
     cudagraph_capture_sizes: Vec<u32>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
@@ -637,7 +638,7 @@ pub fn build(
             bridge,
         )?,
         // A token's whole cache lives on the one rank that admitted it.
-        kv_bytes_per_token: state_bytes_per_token(1, Glm52MtpMode::Off)?,
+        kv_cache_layout: kv_cache_layout(1, Glm52MtpMode::Off),
         name,
         ep_size,
         max_model_len: recipe.parallel.max_model_len,
@@ -796,8 +797,8 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4DpAttnDsaMoeModel {
 
     /// One token's cache, which one rank holds whole: 78 layers of MLA latent
     /// plus index key, with nothing replicated.
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.kv_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn gpus_per_replica(&self) -> u16 {
@@ -853,7 +854,9 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4DpAttnDsaMoeModel {
 mod tests {
     use super::*;
     use crate::arch::contract::ArchGroupInput;
-    use crate::arch::glm52_vllm_nvfp4_dsa_moe::{decoder_layer_state_bytes_per_token, NUM_LAYERS};
+    use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
+        indexer_bytes_per_layer_token, mla_bytes_per_layer_token, NUM_LAYERS,
+    };
     use crate::timing::routing::RoutingDistribution;
     use std::collections::BTreeSet;
     use std::path::Path;
@@ -1053,23 +1056,25 @@ mod tests {
 
     #[test]
     fn each_rank_holds_whole_tokens_of_kv_in_its_own_partition() {
-        assert_eq!(decoder_layer_state_bytes_per_token(), 708);
+        // Every layer's 576 B latent; the 21 full-index layers' 132 B key.
+        assert_eq!(
+            (mla_bytes_per_layer_token(), indexer_bytes_per_layer_token()),
+            (576, 132)
+        );
         for ep_size in [4_u16, 8] {
             let model = built("glm52_nvfp4", ep_size);
-            assert_eq!(
-                model.total_kv_bytes_per_token(),
-                u64::from(NUM_LAYERS) * 708
-            );
-            assert_eq!(model.total_kv_bytes_per_token(), 55_224);
+            let bytes_per_token = model.kv_cache_layout().per_token_bytes();
+            assert_eq!(bytes_per_token, u64::from(NUM_LAYERS) * 576 + 21 * 132);
+            assert_eq!(bytes_per_token, 47_700);
             assert_eq!(model.gpus_per_replica(), ep_size);
             assert_eq!(model.num_attn_dp_groups(), ep_size);
             assert_eq!(model.num_attn_shards(), 1);
             // The chunked-prefill worker sizes each partition as
-            // attn_kv_bytes * num_attn_shards / total_kv_bytes_per_token.
+            // attn_kv_bytes * num_attn_shards / bytes per token.
             let attn_kv_bytes: u64 = 45_140_539_392;
-            let per_partition = attn_kv_bytes * u64::from(model.num_attn_shards())
-                / model.total_kv_bytes_per_token();
-            assert_eq!(per_partition, 817_408);
+            let per_partition =
+                attn_kv_bytes * u64::from(model.num_attn_shards()) / bytes_per_token;
+            assert_eq!(per_partition, 946_342);
         }
     }
 

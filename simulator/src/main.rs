@@ -5,6 +5,7 @@
 //!   - `run <config>`              — run one sim
 //!   - `build-cache-only <config>` — prebuild profile.db, no sim
 //!   - `dry-run <config>`          — report missing profile.db rows, no sim
+//!   - `kv-cache <config>`         — each KV pool's capacity breakdown, no sim
 //!   - `emit-backends <config>`    — enumerate distinct kernels (JSON), no sim
 //!   - `list-params`               — emit the param-schema registry JSON
 //!   - `kernel-list`               — every kernel kind's config / sweep fields
@@ -67,6 +68,12 @@ enum Cmd {
     /// Report how many kernel specs are missing from profile.db (the JIT work a
     /// cache build would do), per kernel, then exit without building or running.
     DryRun(DryRunArgs),
+    /// Print each KV pool's capacity breakdown — the declared layout, the
+    /// resolved options, what each part is charged, and the concurrency at
+    /// `max_model_len` under both `kv_overhead` modes — then exit without
+    /// simulating. Builds the flow structure only (no Python, profile.db or
+    /// GPU), with its logs redirected so the config's `log_dir` is untouched.
+    KvCache(KvCacheArgs),
     /// Print the deployment schema JSON consumed by the launcher (§1.2.7).
     ListParams,
     /// Enumerate the distinct kernels this config touches — one JSON record per
@@ -86,8 +93,9 @@ enum Cmd {
     /// kernel registry only (no config, GPU or profile.db).
     KernelList,
     /// Build each given arch block on its GPU, iter-wise or layer-wise, and
-    /// print each one's cost tree (the `cost_manifest` form) as JSON. Structure
-    /// only: no run config, Python perf_api, profile.db or GPU.
+    /// print each one's cost tree (the `cost_manifest` form) and, when it holds
+    /// attention, its KV cache layout (`kv_cache`) as JSON. Structure only: no
+    /// run config, Python perf_api, profile.db or GPU.
     CostTrees(CostTreeArgs),
     /// Predict per-building-block timing offline for a batch of explicit batch
     /// shapes — NO sim/scheduler/trace. Reads a minimal config (one arch selector
@@ -159,6 +167,15 @@ struct DryRunArgs {
     /// is null for a non-speculative worker).
     #[arg(long, value_name = "FILE")]
     report_json: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct KvCacheArgs {
+    #[command(flatten)]
+    run: RunArgs,
+    /// Print the `raw/kv_cache.json` document instead of text.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Shared payload for `run` / `build-cache-only` / `dry-run` / `emit-backends`: a path to one
@@ -275,6 +292,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
         Cmd::BuildCacheOnly(args) => cmd_build_cache(&args.config),
         Cmd::DryRun(args) => cmd_dry_run(&args.run.config, args.report_json.as_deref()),
         Cmd::EmitBackends(args) => cmd_emit_backends(&args.config),
+        Cmd::KvCache(args) => cmd_kv_cache(&args.run.config, args.json),
         Cmd::ListParams => {
             // serde_json::Value serializes infallibly; pretty for `list-params`.
             println!(
@@ -363,6 +381,7 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // Run-level GPU facts sidecar (L7): written before the tick loop so the
     // analyzer can normalize per-GPU even if the run later fails.
     simulator::log::write_run_meta(log_dir, &flow.cluster().borrow(), cfg.stage_vocab())?;
+    simulator::log::write_kv_cache(log_dir, &flow.cluster().borrow())?;
     let summary = run_sim(flow.as_mut(), &store, &mut frontend, &mut logger, &tick_cfg)?;
     // run_sim emits the stats summary (completed/throughput/wall) to the log;
     // persist the structured form as `<log_dir>/summary.json` for regression
@@ -454,6 +473,40 @@ fn cmd_dry_run(config: &Path, report_json: Option<&Path>) -> anyhow::Result<()> 
         let mut document = dry_run_document(&report);
         document["pools"] = serde_json::to_value(pool_bounds(&cfg)?)?;
         write_dry_run_report(path, &document)?;
+    }
+    Ok(())
+}
+
+/// `kv-cache` — build the flow structure only (no Python, `profile.db` or GPU)
+/// and print every KV pool's report (`raw/kv_cache.json`'s document with
+/// `--json`). Workers open their
+/// log streams at construction, which clears an earlier run's files, so the
+/// build logs into a scratch directory under `TMPDIR` instead of `log_dir`.
+fn cmd_kv_cache(config: &Path, json: bool) -> anyhow::Result<()> {
+    let mut cfg = load_config(config)?;
+    let scratch = std::env::temp_dir().join(format!("simulator-kv-cache-{}", std::process::id()));
+    cfg.io_mut().log_dir = scratch.clone();
+    // KV capacity needs the layout and the worker options, never a kernel time:
+    // build structure only, with no Python, profile.db or GPU.
+    let bridge = PerfApiBridge::structure_only();
+    let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+    let printed = build_flow(&cfg, &bridge, store).map(|flow| {
+        let cluster = flow.cluster().borrow();
+        if json {
+            serde_json::to_string_pretty(&simulator::log::kv_cache_document(&cluster))
+                .expect("kv_cache document serializes")
+        } else {
+            simulator::log::kv_cache_text(&cluster)
+        }
+    });
+    if let Err(error) = std::fs::remove_dir_all(&scratch) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("removing {}: {error}", scratch.display());
+        }
+    }
+    print!("{}", printed?);
+    if json {
+        println!();
     }
     Ok(())
 }

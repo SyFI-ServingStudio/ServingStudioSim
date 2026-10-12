@@ -18,7 +18,7 @@ use crate::worker::admission::LoadBalance;
 use crate::worker::execution::{IterModelExecution, UnifiedIterExecution};
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
-use crate::worker::kv::{FullAttnKv, IterWorkerKv};
+use crate::worker::kv::{IterWorkerKv, KvCacheStore, SharedKvAccounting};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{
@@ -49,7 +49,8 @@ struct PullPipeline {
     pull_budget_tokens: u64,
     cluster: SharedGpuCluster,
     receive_group_id: u16,
-    kv_bytes_per_token: u64,
+    /// Sizes a pulled request's KV transfer.
+    kv_accounting: SharedKvAccounting,
 }
 
 struct DecodeIterationFsm {
@@ -74,7 +75,7 @@ where
 }
 
 /// Compatibility name used by the existing L6 PD factory.
-pub type PdDecodeWorker<M> = PullDecodeWorker<FullAttnKv, UnifiedIterExecution<M>>;
+pub type PdDecodeWorker<M> = PullDecodeWorker<KvCacheStore, UnifiedIterExecution<M>>;
 
 impl<K, E> PullDecodeWorker<K, E>
 where
@@ -90,7 +91,7 @@ where
         cluster: SharedGpuCluster,
         receive_group_id: u16,
         pull_budget_tokens: u64,
-        kv_bytes_per_token: u64,
+        kv_accounting: SharedKvAccounting,
     ) -> Self {
         Self {
             context,
@@ -107,7 +108,7 @@ where
                 pull_budget_tokens,
                 cluster,
                 receive_group_id,
-                kv_bytes_per_token,
+                kv_accounting,
             },
             decode_fsm: DecodeIterationFsm {
                 worker_state: WorkerFsmState::Idle,
@@ -268,9 +269,10 @@ where
             }
 
             let (request, transfer) = self.pull_pipeline.pending_pulls.pop_front().unwrap();
-            let bytes = transfer
-                .tokens
-                .saturating_mul(self.pull_pipeline.kv_bytes_per_token);
+            let bytes = self
+                .pull_pipeline
+                .kv_accounting
+                .transfer_bytes(transfer.tokens);
             let pull_end = self.pull_pipeline.cluster.borrow_mut().submit_transfer(
                 now,
                 transfer.send_gid,
@@ -494,10 +496,7 @@ mod tests {
         build_pd_decode_worker(
             WorkerId(0),
             "decode",
-            Arc::new(FakeModel {
-                ms: 1.0,
-                dp_groups: num_partitions,
-            }),
+            Arc::new(FakeModel::with_dp_groups(1.0, num_partitions)),
             store,
             WorkerConfig::default(),
             None,
@@ -608,10 +607,7 @@ mod tests {
         let mut worker = build_pd_decode_worker(
             WorkerId(0),
             "decode",
-            Arc::new(FakeModel {
-                ms: 1.0,
-                dp_groups: 1,
-            }),
+            Arc::new(FakeModel::with_dp_groups(1.0, 1)),
             Rc::clone(&store),
             WorkerConfig {
                 attn_kv_bytes: 1000,
@@ -647,10 +643,7 @@ mod tests {
         let mut worker = build_pd_decode_worker(
             WorkerId(0),
             "decode",
-            Arc::new(FakeModel {
-                ms: 1.0,
-                dp_groups: 1,
-            }),
+            Arc::new(FakeModel::with_dp_groups(1.0, 1)),
             Rc::clone(&store),
             WorkerConfig {
                 attn_kv_bytes: 1000,

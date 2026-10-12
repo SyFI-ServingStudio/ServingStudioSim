@@ -11,6 +11,8 @@ use anyhow::Result;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
+use crate::arch::glm52_vllm_nvfp4_dsa_moe::mla_dsa_kv_cache_layout;
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::common::Fabric;
 use crate::op::attention::DsaSparseMlaExactVarlenConfig;
 use crate::op::Op;
@@ -802,7 +804,7 @@ pub struct Glm52SglangNvfp4TpDsaMoeModel {
     pub mtp_mode: Glm52MtpMode,
     pub tp_size: u16,
     pub max_model_len: u32,
-    pub total_state_bytes_per_token: u64,
+    pub kv_cache_layout: KvCacheLayout,
     embedding: Op<ElementwiseKernel>,
     embedding_allreduce: Op<AllReduceKernel>,
     embedding_allreduce_fusion: Op<AllReduceFusionKernel>,
@@ -944,7 +946,7 @@ pub fn build(
         mtp_mode,
         tp_size,
         max_model_len,
-        total_state_bytes_per_token: state_bytes_per_token(tp_size, mtp_mode)?,
+        kv_cache_layout: kv_cache_layout(tp_size, mtp_mode),
         embedding,
         embedding_allreduce,
         embedding_allreduce_fusion,
@@ -1151,8 +1153,8 @@ impl IterwiseUnifiedModel for Glm52SglangNvfp4TpDsaMoeModel {
         normalize_input(batch, self.max_model_len).map(|_| ())
     }
 
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_state_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn gpus_per_replica(&self) -> u16 {
@@ -1337,35 +1339,6 @@ fn normalize_input(
     })
 }
 
-fn state_bytes_per_token(
-    tp_size: u16,
-    mtp_mode: Glm52MtpMode,
-) -> std::result::Result<u64, BuildError> {
-    let mla_per_rank = u64::from(NUM_LAYERS)
-        .checked_mul(u64::from(KV_LORA_RANK + ROPE_DIM))
-        .ok_or_else(|| fit_failed("MLA state overflow"))?;
-    let index_per_rank = u64::from(NUM_LAYERS)
-        .checked_mul(u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes()))
-        .ok_or_else(|| fit_failed("index state overflow"))?;
-    let main = mla_per_rank
-        .checked_add(index_per_rank)
-        .ok_or_else(|| fit_failed("main state overflow"))?;
-    let mtp_mla = u64::from(KV_LORA_RANK + ROPE_DIM);
-    let per_rank = match mtp_mode {
-        Glm52MtpMode::Off => main,
-        Glm52MtpMode::FullIndex => main
-            .checked_add(mtp_mla)
-            .and_then(|value| value.checked_add(u64::from(INDEX_HEAD_DIM + 4)))
-            .ok_or_else(|| fit_failed("MTP full-index state overflow"))?,
-        Glm52MtpMode::IndexShare => main
-            .checked_add(mtp_mla)
-            .ok_or_else(|| fit_failed("MTP shared state overflow"))?,
-    };
-    per_rank
-        .checked_mul(u64::from(tp_size))
-        .ok_or_else(|| fit_failed("physical TP state overflow"))
-}
-
 fn uses_fusion(num_tokens: u32, cap: u32) -> bool {
     num_tokens > 0 && num_tokens <= cap
 }
@@ -1424,6 +1397,20 @@ where
         op.kernel.eval(&input)
     };
     ev.push(metrics, || input.clone().into());
+}
+
+/// SGLang's NSA pools keep vLLM's FP8 latent and index key, replicated on
+/// every TP rank, but give every layer an index key (`IndexKeyCache` spans the
+/// pool's `layer_num`), shared or not. The MTP layer adds its latent and,
+/// unless it shares the previous layer's index, its key.
+fn kv_cache_layout(tp_size: u16, mtp_mode: Glm52MtpMode) -> KvCacheLayout {
+    let (mtp_mla, mtp_index) = match mtp_mode {
+        Glm52MtpMode::Off => (0, 0),
+        Glm52MtpMode::FullIndex => (1, 1),
+        Glm52MtpMode::IndexShare => (1, 0),
+    };
+    mla_dsa_kv_cache_layout(NUM_LAYERS + mtp_mla, NUM_LAYERS + mtp_index)
+        .held_on_each_rank(u64::from(tp_size))
 }
 
 #[cfg(test)]
@@ -1758,18 +1745,10 @@ mod tests {
 
     #[test]
     fn topology_state_and_mtp_modes_are_exact() {
-        assert_eq!(
-            state_bytes_per_token(4, Glm52MtpMode::Off).unwrap(),
-            220_896
-        );
-        assert_eq!(
-            state_bytes_per_token(4, Glm52MtpMode::FullIndex).unwrap(),
-            223_728
-        );
-        assert_eq!(
-            state_bytes_per_token(4, Glm52MtpMode::IndexShare).unwrap(),
-            223_200
-        );
+        let bytes = |mode| kv_cache_layout(4, mode).per_token_bytes();
+        assert_eq!(bytes(Glm52MtpMode::Off), 220_896);
+        assert_eq!(bytes(Glm52MtpMode::FullIndex), 223_728);
+        assert_eq!(bytes(Glm52MtpMode::IndexShare), 223_200);
         for mode in [
             Glm52MtpMode::Off,
             Glm52MtpMode::FullIndex,

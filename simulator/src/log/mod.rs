@@ -12,6 +12,7 @@
 //! still has a schema but no writer is wired yet.
 
 pub mod cost_logger;
+pub mod kv_cache;
 pub mod kv_sampler;
 pub mod network_logger;
 pub mod parquet_writer;
@@ -22,6 +23,7 @@ pub mod schemas;
 pub mod session;
 
 pub use cost_logger::{cost_log_failures, CostLogger};
+pub use kv_cache::{kv_cache_document, kv_cache_text, write_kv_cache};
 pub use kv_sampler::{KvSampler, KvSubmit};
 pub use network_logger::NetworkLogger;
 pub use parquet_writer::StreamingParquetWriter;

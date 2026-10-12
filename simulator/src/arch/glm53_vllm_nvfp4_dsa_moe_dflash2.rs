@@ -42,9 +42,10 @@ use std::sync::Arc;
 use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
 use crate::arch::glm52_model_cfg::Glm52MtpMode;
 use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
-    fit_failed, normalize_speculative_input, state_bytes_per_token, Glm52TargetForward,
+    fit_failed, kv_cache_layout, normalize_speculative_input, Glm52TargetForward,
     Glm52VllmNvfp4DsaMoeResolved, NormalizedBatch,
 };
+use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
 use crate::op::Op;
 use crate::timing::kernels::{AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput};
 use crate::timing::{
@@ -264,42 +265,12 @@ pub struct Glm53VllmNvfp4DsaMoeDflash2Model {
     max_model_len: u32,
     num_attn_dp_groups: u16,
     num_attn_shards: u16,
-    total_state_bytes_per_token: u64,
-    /// Per-token bytes the draft's own KV adds to the target's, summed over the
-    /// attention ranks. See [`Self::draft_kv_bytes_per_token`].
-    draft_kv_bytes_per_token: u64,
+    kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
 
 impl Glm53VllmNvfp4DsaMoeDflash2Model {
-    /// The draft's KV is billed **per token**, uncapped by its window.
-    ///
-    /// The window bounds what the draft *attends to*, so the natural guess is
-    /// that it also bounds what the draft *stores* -- a flat per-request reserve
-    /// of `sliding_window` tokens instead of a per-token addend. The capture
-    /// says otherwise, in one line at startup:
-    ///
-    /// ```text
-    /// kv_cache_utils.py:1868] KV cache page sizes cannot be unified; treating
-    /// sliding-window layers as full attention for cache allocation.
-    /// Sliding-window attention compute is unchanged.
-    /// ```
-    ///
-    /// The draft's six layers cannot share a page size with the target's MLA
-    /// latent, so vLLM gives up on unifying them and allocates them as full
-    /// attention out of the one pool it reports as `GPU KV cache size`. The
-    /// window survives only on the compute side, which is exactly where this
-    /// model keeps it: the attention rectangles cap `kv_len` at
-    /// `sliding_window` while this addend does not.
-    ///
-    /// Folding it into the per-token scalar is therefore both the faithful
-    /// model and the one the worker contract already carries -- no per-request
-    /// reserve has to be subtracted in `build_speculative_worker`.
-    pub fn draft_kv_bytes_per_token(&self) -> u64 {
-        self.draft_kv_bytes_per_token
-    }
-
     fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
         let mut children = self.target.compile_children(&mut builder);
@@ -339,8 +310,8 @@ impl SpeculativeUnifiedModel for Glm53VllmNvfp4DsaMoeDflash2Model {
         normalize_speculative_input(batch, self.draft_tokens, self.max_model_len).map(|_| ())
     }
 
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_state_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn max_model_len(&self) -> u32 {
@@ -443,10 +414,9 @@ pub fn build_dflash2(
         // separate checkpoint, so it adds none of MTP's *target-side* state.
         // What it does add is its own six GQA layers, which vLLM allocates out
         // of the same pool -- see `draft_kv_bytes_per_token`.
-        total_state_bytes_per_token: state_bytes_per_token(ep_size, Glm52MtpMode::Off)?
-            .checked_add(draft_kv_bytes_per_token)
-            .ok_or_else(|| fit_failed("total state bytes per token overflow u64"))?,
-        draft_kv_bytes_per_token,
+        kv_cache_layout: kv_cache_layout(ep_size, Glm52MtpMode::Off).with_part(
+            KvCachePart::per_token("dflash2_draft", draft_kv_bytes_per_token),
+        ),
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -457,10 +427,30 @@ pub fn build_dflash2(
 }
 
 /// `layers * kv_heads * head_dim * 2 (K and V) * kv_dtype`, summed over the
-/// attention ranks so it matches the worker's physical-total KV contract.
+/// attention ranks.
 ///
-/// `sliding_window` is deliberately absent -- see
-/// [`Glm53VllmNvfp4DsaMoeDflash2Model::draft_kv_bytes_per_token`].
+/// The draft's KV is billed **per token**, uncapped by its window.
+///
+/// The window bounds what the draft *attends to*, so the natural guess is
+/// that it also bounds what the draft *stores* -- a flat per-request reserve
+/// of `sliding_window` tokens instead of a per-token addend. The capture
+/// says otherwise, in one line at startup:
+///
+/// ```text
+/// kv_cache_utils.py:1868] KV cache page sizes cannot be unified; treating
+/// sliding-window layers as full attention for cache allocation.
+/// Sliding-window attention compute is unchanged.
+/// ```
+///
+/// The draft's six layers cannot share a page size with the target's MLA
+/// latent, so vLLM gives up on unifying them and allocates them as full
+/// attention out of the one pool it reports as `GPU KV cache size`. The
+/// window survives only on the compute side, which is exactly where this
+/// model keeps it: the attention rectangles cap `kv_len` at
+/// `sliding_window` while this addend does not.
+///
+/// The draft is therefore a per-token part of the layout, not a sliding
+/// window.
 pub(crate) fn draft_kv_bytes_per_token(draft: &Dflash2DraftResolved) -> Result<u64, BuildError> {
     let append = &draft.context_kv.context_kv_append;
     let per_rank_per_token = u64::from(draft.context_kv.raw_cfg.num_draft_layers)

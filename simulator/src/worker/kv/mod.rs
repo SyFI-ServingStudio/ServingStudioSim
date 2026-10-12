@@ -3,20 +3,20 @@
 //! `KvStore` is the common resource lifecycle. `IterWorkerKv` is the narrow
 //! capability required by the whole-iteration worker family. Membership is
 //! exposed through generic visitors, not owned snapshots, so abstraction does
-//! not add hot-path allocation or leak `FullAttnPartitionState`.
+//! not add hot-path allocation or leak partition state.
 
 use crate::common::{RequestId, SessionInput, Time};
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
 
 use self::shared::prefix_cache::PrefixCacheReturnMetadata;
 
-mod full_attn;
-mod hybrid_gdn;
+mod kv_cache_store;
 mod shared;
 
-pub use full_attn::FullAttnKv;
-pub use hybrid_gdn::HybridGdnKv;
-pub(crate) use shared::prefix_cache::PrefixCacheTokenConfig;
+pub use kv_cache_store::KvCacheStore;
+pub(crate) use shared::kv_accounting::{KvAccounting, KvAccountingOptions, SharedKvAccounting};
+pub use shared::kv_accounting::{KvOverhead, PrefixResumePoints};
+pub use shared::kv_cache_report::KvCacheReport;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 
 /// KV-owned runtime facts for one request's prefill on one partition.
@@ -253,7 +253,7 @@ pub trait ChunkedPrefillKv: PrefixKv + IterWorkerKv {
         new_token_ratio: f64,
         decode_step_tokens: u32,
     ) -> bool;
-    /// Shortfall, in tokens, for the next decode step, after shrinking the
+    /// Shortfall, in KV units, for the next decode step, after shrinking the
     /// prefix cache. `step_tokens` is how far one decode can advance per step:
     /// 1 for autoregressive decode, the verify width for a speculating engine.
     fn prepare_next_decode(

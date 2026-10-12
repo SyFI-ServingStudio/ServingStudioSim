@@ -1,66 +1,101 @@
 ---
 name: dev-calculate-kv-cache-capacity
-description: "Use when the user asks to calculate, estimate, or sanity-check KV cache size, attention-state size, available KV memory budget, bytes per token, max cached tokens, max concurrent requests, or capacity for a model. Uses a concise three-step workflow: determine available memory after model/reserves, calculate and show per-token or per-request cache/state size from config and public architecture sources, then draw the capacity conclusion. Covers dense MHA/MQA/GQA KV, MLA/DSA/GDN/custom cached states, sliding-window or paged allocation, and ServingStudio Sim attention memory budgets."
+description: "Use when the user asks for KV cache size, attention-state size, bytes per token, max cached tokens, max concurrent requests, or KV capacity of a model or deployment. For a model ServingStudio Sim already has an arch for, read the numbers from the simulator (`launcher <preset> --kv-report`, a run's `raw/kv_cache.json`, `simulator cost-trees`' `kv_cache`) instead of calculating by hand. For a model without an arch, derive its cache part by part (per-token, sliding-window, per-request) from config/public sources and vLLM's allocator, in the `KvCacheLayout` form its arch will declare, and show every step."
 ---
 
 # Dev Calculate KV Cache Capacity
 
-Use this skill to answer capacity questions with a short, auditable calculation.
-Do not teach every possible config key. Identify the mechanism from the model
-config plus README/model card/blog/paper, inspect code only when those sources do
-not establish the persistent cache/state tensors, then calculate.
+First check whether the model has a ServingStudio Sim arch (an arch `type` in
+`uv run python -m launcher list-params`, a file in `simulator/src/arch/`). That
+decides the route.
 
-## Workflow
+## Existing arch: read the simulator, do not calculate
 
-1. Find available memory capacity.
+The answer has two halves, and each comes from a different block of the config:
 
-- Use operate-gpu-spec skill to determine the per-GPU HBM size
-- Determine the model weight memory occupation. Be careful about the dtype of the model weights
+- **arch**: the layout (each part's growth, bytes per entry, padding, copies,
+  prefix reuse; the engine block and fixed bytes), the GPUs one KV partition
+  spans (`attention_shards`), and `max_model_len`;
+- **worker**: the KV budget (`attn_gpu_memory_gb`), `kv_overhead: vllm|none`,
+  prefix caching and its resume points, the tokens in flight
+  (`kv_max_in_flight_tokens`, or 2 × `max_batch_tokens`), and any units the
+  worker sets aside (PD decode).
 
-2. Calculate and show cache/state size.
+| Question | Read it from |
+| --- | --- |
+| Max concurrency / KV tokens of a deployment | `uv run python -m launcher <preset> --kv-report` (`--kv-report-json` for the machine form). No profile.db, GPU or run. |
+| A what-if (budget, context, overhead mode, chunk size) | the same, with `--override`, e.g. `pools.main.groups.0.worker.attn_gpu_memory_gb=100`, `pools.main.groups.0.arch.max_model_len=131072`, `pools.main.groups.0.worker.kv_overhead=none` |
+| What a finished run used | `<log_dir>/raw/kv_cache.json` (fields: `simulator/src/log/README.md`) |
+| The arch's layout alone | `simulator cost-trees <blocks.json>` (a JSON list of `{gpu, arch}`): each build's `kv_cache {attention_shards, layout}`. Bytes are over one partition; divide by `attention_shards` for one GPU. |
 
-First classify what persists between decode steps:
+Quote the printed numbers and the per-part split ("One request at max_model_len,
+per GPU"); do not re-derive them. The report prints the concurrency under both
+`kv_overhead` modes, so the engine's tax is the gap between the two.
 
-- dense `MHA`/`MQA`/`GQA`: per-token K and V;
-- `MLA`: latent/compressed tensors and any RoPE-side persistent tensors;
-- `DSA` or sparse/window attention: dense KV plus sparse metadata, or retained
-  sparse tokens only, depending on source evidence;
-- `GDN`/linear-attention/state-space-like blocks: recurrent and convolution
-  state, often per request rather than per token;
-- custom mechanisms: use README/model card/blog/paper as primary evidence, then
-  code lookup if persistent tensors or shapes remain unclear.
+When a printed number disagrees with a vLLM log ("Maximum concurrency for N
+tokens per request", "GPU KV cache size"), the arch's `kv_cache_layout` is wrong
+or missing a part: fix it with `impl-compose-arch` instead of correcting the
+answer by hand.
 
-MUST show the calculation process clearly, step by step, to the user. Search for online resources to validate the calculation. Again, pay attention to dtype of the cache.
+## New model: derive the layout
 
-3. Draw the capacity conclusion.
+The derivation is the arch's future `kv_cache_layout`, so write it in that
+form. Show every step with substituted values. Mind the cache dtype, which is
+often not the weight dtype.
 
-Use the available budget and shown cache/state size to answer the user's actual
-question.
+1. **Budget.** Prefer vLLM's logged "Available KV cache memory" from a capture.
+   Without one, use the per-GPU HBM (`operate-gpu-spec`) times
+   `gpu_memory_utilization`, minus the weights (mind their dtype), activations
+   and CUDA graphs. Say which reserves you assumed.
+2. **Parts.** Classify each tensor that persists between decode steps into one
+   part, listing its layers and its bytes per entry on one GPU:
+   - per token: GQA K/V (`max(num_kv_heads, tp)` heads, since replicated heads
+     are still stored), MLA latent plus RoPE key, a DSA indexer key or a
+     compressed cache (one entry per `tokens_per_entry` tokens);
+   - sliding window: SWA layers, a short-convolution window;
+   - per request: GDN/KDA/Mamba recurrent and conv state, ring buffers.
 
-For per-request recurrent state, divide available bytes by per-request state
-bytes. For mixed dense KV plus recurrent state, include both terms in the live
-request memory equation.
+   Note whether a part is split across ranks (KV heads) or held whole on each
+   rank (MLA latent, recurrent state).
+3. **vLLM's overhead on top.** Add page padding (hybrid models unify page
+   sizes), the block size, and extra state copies (one more per speculative
+   block). With prefix caching on, `mamba_cache_mode: align` also holds the
+   previous step's state, so a per-request part costs one extra copy. Count the
+   null block as well.
+4. **One request at `max_model_len` L, and capacity.** Charge each part by its
+   growth:
+   - per token: L rounded up to whole blocks;
+   - sliding window: `min(L, W − 1 + in-flight)`, where in-flight is
+     2 × `max_num_batched_tokens` under async scheduling;
+   - per request: bytes × copies.
 
-## Evidence Rules
+   vLLM's "Maximum concurrency for L tokens per request" is the budget over this
+   one-request charge. Its "GPU KV cache size: N tokens" is a token pool only
+   when every part grows per token.
+5. **Hand off.** Implement the parts as the arch's `kv_cache_layout`
+   (`impl-compose-arch`), pin it against the capture's logged concurrency, and
+   check `launcher <preset> --kv-report` reproduces this derivation. From then
+   on, the model takes the first route.
+
+## Evidence rules
 
 - Use `top-explore-models` first when the model repo/config is not resolved.
-- Treat `config.json`, README/model card, official blog, technical report,
-  paper, and release notes as primary evidence.
-- Use `dev-lookup-transformers-model` when public/config sources do not prove
-  persistent cached tensors or when code contradicts them.
-- Do not guess for MLA, DSA, GDN, quantized KV, compressed KV, or custom
-  mechanisms. If tensor shapes are unresolved, report the unresolved fields and
-  the source needed.
+- Treat `config.json`, the README/model card, official blog, technical report,
+  paper and release notes as primary evidence. For what vLLM allocates, read the
+  model's vLLM implementation and its attention backend's cache spec.
+- Use `dev-lookup-transformers-model` when public sources do not prove the
+  persistent tensors or when code contradicts them.
+- Do not guess for MLA, DSA, GDN, quantized, compressed or custom caches. If a
+  shape is unresolved, report the field and the source that would settle it.
 
-## Report Back
+## Report back
 
-Return:
-
-- available memory calculation and reserve assumptions;
-- DETAILED CALCULATION STEPS FOR PER-TOKEN OR PER-REQUEST CACHE/STATE SIZE, with substituted values;
-- source evidence used for the attention/cache mechanism;
-- per-token or per-request cache/state size, with formula and substituted values;
-- raw and page-rounded capacity when relevant;
-- final max tokens or max concurrent requests;
-- caveats for sharding, mixed layer types, sliding window, quantization metadata,
-  speculative decode, or unresolved tensor shapes.
+- Existing arch: the command you ran, the printed report (or its relevant
+  lines), and which arch and worker values drove the result.
+- New model:
+  - the budget and its reserve assumptions;
+  - each part with its formula, substituted values and source;
+  - vLLM's overhead terms;
+  - the one-request charge and the resulting concurrency or token capacity;
+  - caveats (sharding, mixed layer types, sliding windows, quantization
+    metadata, speculative decoding, unresolved shapes).

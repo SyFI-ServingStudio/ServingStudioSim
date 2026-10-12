@@ -30,11 +30,12 @@ use std::sync::Arc;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
-    self as ep_graph, build_atomic, decoder_layer_state_bytes_per_token, eval_atomic_or_zero,
-    normalize_input, Glm52SparseBody, Glm52VllmNvfp4DsaMoeConfigs, Glm52VllmNvfp4DsaMoeParallel,
+    self as ep_graph, build_atomic, eval_atomic_or_zero, mla_dsa_kv_cache_layout, normalize_input,
+    Glm52SparseBody, Glm52VllmNvfp4DsaMoeConfigs, Glm52VllmNvfp4DsaMoeParallel,
     Glm52VllmNvfp4DsaMoeResolved, NormalizedBatch, CHECKPOINT_MAX_CONTEXT, FULL_INDEX_LAYERS,
     HIDDEN_DIM, NUM_DENSE_LAYERS, NUM_INITIAL_SHARED_LAYERS,
 };
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
@@ -126,6 +127,12 @@ impl StageLayerCounts {
 
     pub fn total(&self) -> u32 {
         self.dense + self.initial_shared + self.cycle_full + self.cycle_shared
+    }
+
+    /// Layers that compute their own top-k: the dense layers and the cycle's
+    /// full-index layers.
+    pub fn index_layers(&self) -> u32 {
+        self.dense + self.cycle_full
     }
 }
 
@@ -351,7 +358,7 @@ pub struct Glm52VllmNvfp4PpStageModel {
     cycle_shared: Option<Arc<Glm52SparseBody>>,
     head: Option<Arc<OutputHead>>,
     max_model_len: u32,
-    kv_bytes_per_token: u64,
+    kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -374,10 +381,9 @@ impl Glm52VllmNvfp4PpStageModel {
         let cycle_full = pick(counts.cycle_full, &sections.cycle_full);
         let cycle_shared = pick(counts.cycle_shared, &sections.cycle_shared);
         let head = (stage_index + 1 == num_stages).then(|| Arc::clone(&sections.head));
-        // vLLM allocates cache only for the layers a stage owns.
-        let kv_bytes_per_token = u64::from(counts.total())
-            .checked_mul(decoder_layer_state_bytes_per_token())
-            .ok_or_else(|| fit_failed("stage state bytes overflow u64"))?;
+        // vLLM allocates cache only for the layers a stage owns: every
+        // layer's latent, and an index key where the layer has an indexer.
+        let kv_cache_layout = mla_dsa_kv_cache_layout(counts.total(), counts.index_layers());
         let mut stage = Self {
             name: name.to_string(),
             stage_index,
@@ -391,7 +397,7 @@ impl Glm52VllmNvfp4PpStageModel {
             cycle_shared,
             head,
             max_model_len: resolved.raw_cfg.parallel.max_model_len,
-            kv_bytes_per_token,
+            kv_cache_layout,
             cost_flat: Vec::new(),
             n_slots: 0,
         };
@@ -563,8 +569,8 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4PpStageModel {
     }
 
     /// This stage's layers only: vLLM allocates cache per stage.
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.kv_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn gpus_per_replica(&self) -> u16 {
@@ -638,15 +644,16 @@ impl Glm52VllmNvfp4PpDsaMoeModel {
         self.stages.len() as u16
     }
 
-    /// Cache bytes per token of the most constrained stage. vLLM sizes one
-    /// shared block table by the stage with the fewest blocks, so a token's
-    /// capacity on every GPU is set by the stage with the most layers.
-    pub fn pipeline_kv_bytes_per_token(&self) -> u64 {
+    /// The cache of the most constrained stage. vLLM sizes one shared block
+    /// table by the stage with the fewest blocks, so a token's capacity on
+    /// every GPU is set by the stage with the most layers.
+    pub fn pipeline_kv_cache_layout(&self) -> KvCacheLayout {
         self.stages
             .iter()
-            .map(|stage| stage.kv_bytes_per_token)
-            .max()
-            .unwrap_or(0)
+            .map(|stage| &stage.kv_cache_layout)
+            .max_by_key(|layout| layout.per_token_bytes())
+            .expect("a pipeline has stages")
+            .clone()
     }
 
     /// Bytes one token sends from one stage to the next: vLLM's PP
@@ -693,12 +700,9 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4PpDsaMoeModel {
     }
 
     /// The physical total over all stages: each stage caches only its own
-    /// layers, so the stages' bytes add up to one token's whole state.
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.stages
-            .iter()
-            .map(|stage| stage.kv_bytes_per_token)
-            .sum()
+    /// layers, so the stages together hold one token's whole state.
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        ep_graph::kv_cache_layout(1, Glm52MtpMode::Off)
     }
 
     fn gpus_per_replica(&self) -> u16 {
@@ -793,7 +797,9 @@ pub(crate) fn eval_compiled(
 mod tests {
     use super::*;
     use crate::arch::contract::ArchGroupInput;
-    use crate::arch::glm52_vllm_nvfp4_dsa_moe::{state_bytes_per_token, NUM_LAYERS};
+    use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
+        indexer_bytes_per_layer_token, kv_cache_layout, mla_bytes_per_layer_token, NUM_LAYERS,
+    };
     use crate::test_helpers::lm;
     use crate::timing::routing::RoutingDistribution;
     use std::collections::BTreeSet;
@@ -988,27 +994,39 @@ mod tests {
 
     #[test]
     fn cache_and_activation_bytes_follow_the_stage_layers() {
-        // 576 B FP8 MLA latent + rope, 128 B FP8 index key + 4 B FP32 scale.
-        assert_eq!(decoder_layer_state_bytes_per_token(), 708);
+        // 576 B FP8 MLA latent + rope in every layer; 128 B FP8 index key +
+        // 4 B FP32 scale in the layers with an indexer.
+        assert_eq!(mla_bytes_per_layer_token(), 576);
+        assert_eq!(indexer_bytes_per_layer_token(), 132);
         for pp_size in [4_u16, 8] {
             let model = built("glm52_nvfp4", pp_size);
-            let mut max = 0;
+            let (mut max, mut sum) = (0, 0);
             for stage in model.stages() {
                 let (start, end) = stage.layer_range();
-                let bytes = u64::from(end - start) * decoder_layer_state_bytes_per_token();
-                assert_eq!(stage.total_kv_bytes_per_token(), bytes);
+                let index_layers = (start..end)
+                    .filter(|layer| FULL_INDEX_LAYERS.contains(layer))
+                    .count() as u64;
+                let bytes = u64::from(end - start) * 576 + index_layers * 132;
+                assert_eq!(stage.kv_cache_layout().per_token_bytes(), bytes);
                 max = max.max(bytes);
+                sum += bytes;
             }
             // The physical total is the EP1 graph's whole-model state.
             assert_eq!(
-                model.total_kv_bytes_per_token(),
-                state_bytes_per_token(1, Glm52MtpMode::Off).unwrap()
+                model.kv_cache_layout(),
+                kv_cache_layout(1, Glm52MtpMode::Off)
             );
-            assert_eq!(model.pipeline_kv_bytes_per_token(), max);
+            assert_eq!(model.kv_cache_layout().per_token_bytes(), sum);
+            assert_eq!(model.pipeline_kv_cache_layout().per_token_bytes(), max);
             assert_eq!(model.activation_bytes_per_token(), 2 * 6_144 * 2);
         }
         let pp4 = built("glm52_nvfp4", 4);
-        assert_eq!(pp4.pipeline_kv_bytes_per_token(), 20 * 708);
+        // Stage 1 owns layers 19..39: 20 latents and the keys of 22..=38 step 4.
+        assert_eq!(pp4.stages()[1].layer_range(), (19, 39));
+        assert_eq!(
+            pp4.pipeline_kv_cache_layout().per_token_bytes(),
+            20 * 576 + 5 * 132
+        );
     }
 
     #[test]

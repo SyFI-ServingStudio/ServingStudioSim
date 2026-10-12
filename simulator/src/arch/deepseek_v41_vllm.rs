@@ -42,11 +42,14 @@ use serde::Deserialize;
 
 use crate::arch::config::ModelSpec;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
 use crate::op::attention::DeepseekV41CandidateRole;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::all_reduce_fusion::fused_all_reduce_refusal;
-use crate::timing::kernels::compressed_sparse_mla_rope_cast::NVFP4_RECORD_BYTES;
+use crate::timing::kernels::compressed_sparse_mla_rope_cast::{
+    MXFP8_RECORD_BYTES, NVFP4_RECORD_BYTES,
+};
 use crate::timing::kernels::kv_compress_store::FP8_INDEXER_ROW_BYTES;
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
@@ -634,7 +637,7 @@ pub struct DeepseekV41VllmConfigs {
     pub bodies: Vec<DeepseekV41LayerConfig>,
     plan: Vec<PlanNode>,
     pub head: DeepseekV41HeadTpWorkletConfig,
-    pub total_kv_bytes_per_token: u64,
+    pub kv_cache_layout: KvCacheLayout,
     /// `Some` with `decoder_swa_bounded_replay` on.
     pub bounded_replay: Option<BoundedReplay>,
     /// Per body: evaluated on the bounded-replay input (all layers late).
@@ -655,7 +658,7 @@ pub struct DeepseekV41VllmResolved {
     bodies: Vec<DeepseekV41LayerResolved>,
     plan: Vec<PlanNode>,
     head: DeepseekV41HeadTpWorkletResolved,
-    total_kv_bytes_per_token: u64,
+    kv_cache_layout: KvCacheLayout,
     bounded_replay: Option<BoundedReplay>,
     late_bodies: Vec<bool>,
 }
@@ -760,7 +763,7 @@ pub fn build_configs(
             all_gather_backends: ALL_GATHER_PROXY_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
-        total_kv_bytes_per_token: total_kv_bytes_per_token(model, parallel.tp_size),
+        kv_cache_layout: kv_cache_layout(model, parallel.tp_size),
         bounded_replay,
         late_bodies,
     })
@@ -781,36 +784,86 @@ fn index_plan(
         .collect()
 }
 
-/// All-rank bytes of per-token KV state, in vLLM's page layout. Each TP rank
-/// holds the one KV head (replicated). vLLM packs, per 128-token block, every
-/// KV-source layer's NVFP4 compressed page (288 B per `ratio` tokens) and each
-/// owned indexer FP8 key page (132 B per `ratio` tokens), each page rounded up
-/// to the 512 B TMA stride. With sources 2/8/14 at ratio 2 and 20 at ratio 1
-/// that is 135168 B per block, 1056 B per token per rank (the ratio-2 index
-/// pages round 8448 B up to 8704 B).
+/// One request's cache over the TP group, in vLLM's packed groups (fork
+/// `v1/kv_cache_interface.py`, BLHNC layout). Each rank holds the one KV head,
+/// so the TP group holds one rank's layout on each of its `tp_size` ranks.
 ///
-/// The sliding-window cache (40 layers x 528 B, 128-token window) and the
-/// ratio-2 compressor rings are per-request constants vLLM frees outside the
-/// window, not per-token state, so they are left out (a few MB per request).
-fn total_kv_bytes_per_token(model: &DeepseekV41ModelCfg, tp_size: u32) -> u64 {
-    const BLOCK_TOKENS: u64 = 128;
+/// Per 128-token block, the full-attention group packs every KV-source layer's
+/// NVFP4 compressed page (288 B per `ratio` tokens) and each owned indexer FP8
+/// key page (132 B per `ratio` tokens), each page rounded up to the 512 B TMA
+/// stride. With sources 2/8/14 at ratio 2 and 20 at ratio 1 that is 135,168 B
+/// per rank, the pool's block, and 1056 B per token (the ratio-2 index pages
+/// round 8448 B up to 8704 B). Every layer keeps a 128-token sliding window of
+/// 528 B MXFP8 rows in 32-token blocks, eight layers to a group; vLLM's SWA
+/// bounded replay (`swa_bounded_replay`, on by default) recomputes it after a
+/// prefix hit instead of reusing it. Each ratio-2 source's compressor keeps a
+/// ring of eight fp32 [kv, score] rows, one block per request, also never
+/// reused. vLLM reserves one null block.
+fn kv_cache_layout(model: &DeepseekV41ModelCfg, tp_size: u32) -> KvCacheLayout {
+    const BLOCK_TOKENS: u64 = KV_BLOCK_SIZE as u64;
     const PAGE_ALIGN: u64 = 512;
-    let page = |states: u64, bytes: u64| (states * bytes).div_ceil(PAGE_ALIGN) * PAGE_ALIGN;
-    let per_rank_block: u64 = model
+    const RING_ROWS: u64 = 8;
+    const FP32: u64 = 4;
+    let page = |entries: u64, bytes: u64| (entries * bytes).div_ceil(PAGE_ALIGN) * PAGE_ALIGN;
+    let (record, index_row) = (
+        u64::from(NVFP4_RECORD_BYTES),
+        u64::from(FP8_INDEXER_ROW_BYTES),
+    );
+    let sources_at = |ratio: u32, indexed: bool| {
+        model
+            .kv_source_layer_ids
+            .iter()
+            .filter(|&&layer| model.compress_ratios[layer as usize] == ratio)
+            .filter(|layer| !indexed || model.index_source_layer_ids.contains(layer))
+            .count() as u64
+    };
+
+    let mut layout = KvCacheLayout::new();
+    let mut block = 0;
+    for (ratio, kv_name, index_name) in [(2, "c2_kv", "c2_indexer"), (1, "c1_kv", "c1_indexer")] {
+        let entries = BLOCK_TOKENS / u64::from(ratio);
+        let (kv_layers, index_layers) = (sources_at(ratio, false), sources_at(ratio, true));
+        let (kv_page, index_page) = (page(entries, record), page(entries, index_row));
+        block += kv_layers * kv_page + index_layers * index_page;
+        layout = layout
+            .with_part(
+                KvCachePart::compressed(kv_name, ratio, kv_layers * record)
+                    .padded_to(kv_layers * kv_page / entries),
+            )
+            .with_part(
+                KvCachePart::compressed(index_name, ratio, index_layers * index_row)
+                    .padded_to(index_layers * index_page / entries),
+            );
+    }
+    // A kind whose layers' pages fill whole groups pays a block per group.
+    let groups = |pages: u64| pages.div_ceil(block);
+
+    let swa_layers = model.compress_ratios.len() as u64;
+    let swa_row = u64::from(MXFP8_RECORD_BYTES);
+    let swa_block = u64::from(SWA_BLOCK_SIZE);
+    let swa_groups = groups(swa_layers * page(swa_block, swa_row));
+    let ring_layers = model
         .kv_source_layer_ids
         .iter()
-        .map(|&layer| {
-            let states = BLOCK_TOKENS / u64::from(model.compress_ratios[layer as usize]);
-            // Index K caches are owned by KV sources that are also index sources.
-            let index = if model.index_source_layer_ids.contains(&layer) {
-                page(states, u64::from(FP8_INDEXER_ROW_BYTES))
-            } else {
-                0
-            };
-            page(states, u64::from(NVFP4_RECORD_BYTES)) + index
+        .filter(|&&layer| model.compress_ratios[layer as usize] > 1)
+        .count() as u64;
+    let ring_layer_bytes = RING_ROWS * 2 * u64::from(model.head_dim) * FP32;
+    layout
+        .with_part(
+            KvCachePart::sliding_window("swa", model.sliding_window, swa_layers * swa_row)
+                .padded_to(swa_groups * block / swa_block)
+                .not_prefix_reusable(),
+        )
+        .with_part(
+            KvCachePart::per_request("compressor_ring", ring_layers * ring_layer_bytes)
+                .padded_to(groups(ring_layers * page(1, ring_layer_bytes)) * block)
+                .not_prefix_reusable(),
+        )
+        .with_engine(EngineOverhead {
+            block_tokens: Some(KV_BLOCK_SIZE),
+            fixed_device_bytes: block,
         })
-        .sum();
-    per_rank_block / BLOCK_TOKENS * u64::from(tp_size)
+        .held_on_each_rank(u64::from(tp_size))
 }
 
 fn layer_config(
@@ -930,7 +983,7 @@ pub fn resolve_configs(configs: &DeepseekV41VllmConfigs) -> DeepseekV41VllmResol
         bodies: configs.bodies.iter().map(resolve_layer).collect(),
         plan: configs.plan.clone(),
         head: DeepseekV41HeadTpWorklet::resolve_config(&configs.head),
-        total_kv_bytes_per_token: configs.total_kv_bytes_per_token,
+        kv_cache_layout: configs.kv_cache_layout.clone(),
         bounded_replay: configs.bounded_replay,
         late_bodies: configs.late_bodies.clone(),
     }
@@ -1015,7 +1068,7 @@ pub struct DeepseekV41VllmModel {
     serialize_streams: bool,
     /// Longest request context; longer inputs are refused.
     max_model_len: u32,
-    total_kv_bytes_per_token: u64,
+    kv_cache_layout: KvCacheLayout,
     bounded_replay: Option<BoundedReplay>,
     late_bodies: Vec<bool>,
     cost_flat: Vec<FlatCostNode>,
@@ -1051,7 +1104,7 @@ pub fn build(
         head: DeepseekV41HeadTpWorklet::build(format!("{name}.head"), resolved.head, bridge)?,
         serialize_streams,
         max_model_len,
-        total_kv_bytes_per_token: resolved.total_kv_bytes_per_token,
+        kv_cache_layout: resolved.kv_cache_layout,
         bounded_replay: resolved.bounded_replay,
         late_bodies: resolved.late_bodies,
         cost_flat: Vec::new(),
@@ -1195,8 +1248,8 @@ impl IterwiseUnifiedModel for DeepseekV41VllmModel {
         self.cost_tree().manifest()
     }
 
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn gpus_per_replica(&self) -> u16 {
@@ -1481,6 +1534,56 @@ mod tests {
     }
 
     #[test]
+    fn kv_cache_layout_reproduces_vllms_packed_groups() {
+        use crate::worker::kv::{KvAccounting, KvAccountingOptions};
+        let layout = kv_cache_layout(&model_cfg(), 4);
+        let part = |name: &str| *layout.parts.iter().find(|part| part.name == name).unwrap();
+        let padded = |name: &str| part(name).overhead.padded_bytes_per_entry.unwrap();
+        // vLLM block of 128 tokens: 3 x (18432 + 8704) + (36864 + 16896)
+        // = 135168 B per rank -> 1056 B/token, replicated on 4 ranks.
+        let block = 135_168;
+        assert_eq!(layout.engine.fixed_device_bytes, 4 * block);
+        assert_eq!(
+            padded("c2_kv") / 2 + padded("c2_indexer") / 2 + padded("c1_kv") + padded("c1_indexer"),
+            4 * 1056
+        );
+        // Five SWA groups of eight layers fill their 32-token blocks exactly.
+        assert_eq!(padded("swa"), 4 * 5 * block / 32);
+        assert_eq!(part("swa").bytes_per_entry, 4 * 40 * 528);
+        // Three compressor rings of 32 KiB share one block per request.
+        assert_eq!(
+            (
+                part("compressor_ring").bytes_per_entry,
+                padded("compressor_ring")
+            ),
+            (4 * 3 * 32_768, 4 * block)
+        );
+        assert!(!part("swa").prefix_reusable && !part("compressor_ring").prefix_reusable);
+
+        // The capture's "Maximum concurrency for 131,072 tokens per request:
+        // 404.89x" at 86.14 GiB per rank, two 2048-token batches in flight.
+        // vLLM rounds each SWA group's window to blocks plus one, 1690 blocks
+        // per request where the model charges 1685.
+        // Capture 2's pool of 603,004 blocks per rank logged "GPU KV cache
+        // size: 46,767,420 tokens", 356.81 requests of 131,072 tokens.
+        for (budget, logged) in [
+            (4 * (86.14 * f64::from(1u32 << 30)) as u64, 404.89),
+            (4 * 603_004 * block, 46_767_420.0 / 131_072.0),
+        ] {
+            let options = KvAccountingOptions {
+                max_in_flight_tokens: Some(2 * 2048),
+                ..Default::default()
+            };
+            let accounting = KvAccounting::resolve(&layout, options, budget).unwrap();
+            let concurrency = accounting.concurrency_at(131_072);
+            assert!(
+                (concurrency / logged - 1.0).abs() < 0.005,
+                "{concurrency} vs {logged}"
+            );
+        }
+    }
+
+    #[test]
     fn build_configs_threads_the_deployment_and_rejects_others() {
         let cfg = model_cfg();
         let configs = build_configs(&cfg, &parallel(), &uniform_demand()).unwrap();
@@ -1502,9 +1605,12 @@ mod tests {
         }
         assert_eq!(configs.head.vocab_size, 129_280);
         assert_eq!(configs.engram_prefetch.table_rows, ENGRAM_TABLE_ROWS_RANK0);
-        // vLLM block of 128 tokens: 3 x (18432 + 8704) + (36864 + 16896)
-        // = 135168 B per rank -> 1056 B/token, replicated on 4 ranks.
-        assert_eq!(configs.total_kv_bytes_per_token, 1056 * 4);
+        // Three ratio-2 sources with their indexers and one ratio-1 source,
+        // replicated on 4 ranks.
+        assert_eq!(
+            configs.kv_cache_layout.per_token_bytes(),
+            (3 * (288 + 132) / 2 + 288 + 132) * 4
+        );
 
         let resolved = resolve_configs(&configs);
         assert_eq!(resolved.head.lm_head.n.get(), 32_320);

@@ -175,11 +175,11 @@ cases:
       - 64
     repeats: 256
   attn_gpu_memory_gb:
-    value: 7.514121216
+    value: 6.544307712
     status: measured
-    derived_from: Workload GPU KV cache capacity 128896 tokens; 58296 bytes/token/rank is 55224 (target
-      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
-      so per-rank budget is C * 58296 / 1e9 GB.
+    derived_from: Workload GPU KV cache capacity 128896 tokens; 50772 bytes/token/rank is 47700 (target
+      MLA on 78 layers + index on 21, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 50772 / 1e9 GB.
     evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/01_micro_throughput_c256/profile_workload/vllm/glm53_b200_ep4_dflash2_01_micro_throughput_c256_workload_server.log
   provenance:
     workload_source: glm52_nvfp4_b200_spec5 case 01, same shapes and repeats
@@ -265,11 +265,11 @@ cases:
       - 64
     repeats: 48
   attn_gpu_memory_gb:
-    value: 7.514121216
+    value: 6.544307712
     status: measured
-    derived_from: Workload GPU KV cache capacity 128896 tokens; 58296 bytes/token/rank is 55224 (target
-      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
-      so per-rank budget is C * 58296 / 1e9 GB.
+    derived_from: Workload GPU KV cache capacity 128896 tokens; 50772 bytes/token/rank is 47700 (target
+      MLA on 78 layers + index on 21, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 50772 / 1e9 GB.
     evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/02_graph_boundaries_c128/profile_workload/vllm/glm53_b200_ep4_dflash2_02_graph_boundaries_c128_workload_server.log
   provenance:
     workload_source: glm52_nvfp4_b200_spec5 case 02, same shapes and repeats
@@ -362,11 +362,11 @@ cases:
       - 256
     repeats: 24
   attn_gpu_memory_gb:
-    value: 6.917170176
+    value: 6.024402432
     status: measured
-    derived_from: Workload GPU KV cache capacity 118656 tokens; 58296 bytes/token/rank is 55224 (target
-      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
-      so per-rank budget is C * 58296 / 1e9 GB.
+    derived_from: Workload GPU KV cache capacity 118656 tokens; 50772 bytes/token/rank is 47700 (target
+      MLA on 78 layers + index on 21, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 50772 / 1e9 GB.
     evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/03_balanced_anchor_c32/profile_workload/vllm/glm53_b200_ep4_dflash2_03_balanced_anchor_c32_workload_server.log
   provenance:
     workload_source: glm52_nvfp4_b200_spec5 case 03, same shapes and repeats
@@ -459,11 +459,11 @@ cases:
       - 64
     repeats: 12
   attn_gpu_memory_gb:
-    value: 26.47104768
+    value: 23.05454976
     status: measured
-    derived_from: Workload GPU KV cache capacity 454080 tokens; 58296 bytes/token/rank is 55224 (target
-      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
-      so per-rank budget is C * 58296 / 1e9 GB.
+    derived_from: Workload GPU KV cache capacity 454080 tokens; 50772 bytes/token/rank is 47700 (target
+      MLA on 78 layers + index on 21, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 50772 / 1e9 GB.
     evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/04_prefill_spectrum_c32/profile_workload/vllm/glm53_b200_ep4_dflash2_04_prefill_spectrum_c32_workload_server.log
   provenance:
     workload_source: glm52_nvfp4_b200_spec5 case 04, same shapes and repeats
@@ -599,11 +599,11 @@ cases:
       - 4096
     repeats: 16
   attn_gpu_memory_gb:
-    value: 6.644811264
+    value: 5.787195648
     status: measured
-    derived_from: Workload GPU KV cache capacity 113984 tokens; 58296 bytes/token/rank is 55224 (target
-      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
-      so per-rank budget is C * 58296 / 1e9 GB.
+    derived_from: Workload GPU KV cache capacity 113984 tokens; 50772 bytes/token/rank is 47700 (target
+      MLA on 78 layers + index on 21, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 50772 / 1e9 GB.
     evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/05_decode_spectrum_c64/profile_workload/vllm/glm53_b200_ep4_dflash2_05_decode_spectrum_c64_workload_server.log
   provenance:
     workload_source: glm52_nvfp4_b200_spec5 case 05, same shapes and repeats
@@ -723,11 +723,11 @@ cases:
       - 2048
     repeats: 8
   attn_gpu_memory_gb:
-    value: 6.644811264
+    value: 5.787195648
     status: measured
-    derived_from: Workload GPU KV cache capacity 113984 tokens; 58296 bytes/token/rank is 55224 (target
-      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
-      so per-rank budget is C * 58296 / 1e9 GB.
+    derived_from: Workload GPU KV cache capacity 113984 tokens; 50772 bytes/token/rank is 47700 (target
+      MLA on 78 layers + index on 21, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 50772 / 1e9 GB.
     evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/06_long_long_c8/profile_workload/vllm/glm53_b200_ep4_dflash2_06_long_long_c8_workload_server.log
   provenance:
     workload_source: glm52_nvfp4_b200_spec5 case 06, same shapes and repeats
@@ -847,11 +847,11 @@ cases:
       - 1024
     repeats: 24
   attn_gpu_memory_gb:
-    value: 5.383752192
+    value: 4.688895744
     status: measured
-    derived_from: Workload GPU KV cache capacity 92352 tokens; 58296 bytes/token/rank is 55224 (target MLA
-      + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V), so
-      per-rank budget is C * 58296 / 1e9 GB.
+    derived_from: Workload GPU KV cache capacity 92352 tokens; 50772 bytes/token/rank is 47700 (target MLA
+      on 78 layers + index on 21, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V), so
+      per-rank budget is C * 50772 / 1e9 GB.
     evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/07_quadrant_interference_c48/profile_workload/vllm/glm53_b200_ep4_dflash2_07_quadrant_interference_c48_workload_server.log
   provenance:
     workload_source: glm52_nvfp4_b200_spec5 case 07, same shapes and repeats
@@ -979,11 +979,11 @@ cases:
       - 2048
     repeats: 24
   attn_gpu_memory_gb:
-    value: 7.514121216
+    value: 6.544307712
     status: measured
-    derived_from: Workload GPU KV cache capacity 128896 tokens; 58296 bytes/token/rank is 55224 (target
-      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
-      so per-rank budget is C * 58296 / 1e9 GB.
+    derived_from: Workload GPU KV cache capacity 128896 tokens; 50772 bytes/token/rank is 47700 (target
+      MLA on 78 layers + index on 21, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 50772 / 1e9 GB.
     evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/08_completion_churn_c96/profile_workload/vllm/glm53_b200_ep4_dflash2_08_completion_churn_c96_workload_server.log
   provenance:
     workload_source: glm52_nvfp4_b200_spec5 case 08, same shapes and repeats

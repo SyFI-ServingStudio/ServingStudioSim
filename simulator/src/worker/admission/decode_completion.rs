@@ -273,7 +273,7 @@ mod tests {
 
     use crate::common::{PoolId, SharedRequests, WorkerId};
     use crate::test_helpers::shared_with;
-    use crate::worker::kv::{FullAttnKv, KvStore};
+    use crate::worker::kv::{KvAccounting, KvCacheStore, KvStore};
 
     const DRAFT_TOKENS: u32 = 3;
 
@@ -342,7 +342,7 @@ mod tests {
         per_request: &[DecodingStrategy],
         target_output_tokens: u32,
         kv_decode_budget: u32,
-    ) -> (FullAttnKv, WorkerContext) {
+    ) -> (KvCacheStore, WorkerContext) {
         let rows: Vec<(u32, u32, u32)> = (0..per_request.len() as u32)
             .map(|id| (id, 8, target_output_tokens))
             .collect();
@@ -356,7 +356,8 @@ mod tests {
                 record.record_token(Time::ZERO, false);
             }
         }
-        let mut kv_store = FullAttnKv::without_prefix_cache(1, 10_000, None);
+        let mut kv_store =
+            KvCacheStore::without_prefix_cache(1, KvAccounting::tokens_for_test(10_000), None);
         for id in 0..per_request.len() as u32 {
             let request = RequestId(id);
             let footprint = kv_store.footprint(request, 8, target_output_tokens);
@@ -370,7 +371,7 @@ mod tests {
         target_output_tokens: u32,
         kv_decode_budget: u32,
         decoding: DecodingStrategy,
-    ) -> (FullAttnKv, WorkerContext) {
+    ) -> (KvCacheStore, WorkerContext) {
         resident_decodes(&[decoding], target_output_tokens, kv_decode_budget)
     }
 
@@ -378,8 +379,8 @@ mod tests {
     /// They must agree: KV that outruns emission is exactly the silent
     /// over-allocation this policy exists to avoid.
     fn run_one_iteration(
-        policy: &mut impl DecodeCompletion<FullAttnKv>,
-        kv_store: &mut FullAttnKv,
+        policy: &mut impl DecodeCompletion<KvCacheStore>,
+        kv_store: &mut KvCacheStore,
         context: &WorkerContext,
     ) -> (u32, u64) {
         let before = context.requests.borrow()[RequestId(0)]
@@ -402,11 +403,13 @@ mod tests {
     #[test]
     fn a_verify_window_is_wider_than_an_ordinary_decode_row() {
         assert_eq!(
-            DecodeCompletion::<FullAttnKv>::query_tokens_per_request(&SingleTokenDecodeCompletion),
+            DecodeCompletion::<KvCacheStore>::query_tokens_per_request(
+                &SingleTokenDecodeCompletion
+            ),
             1
         );
         assert_eq!(
-            DecodeCompletion::<FullAttnKv>::query_tokens_per_request(
+            DecodeCompletion::<KvCacheStore>::query_tokens_per_request(
                 &SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 0)
             ),
             DRAFT_TOKENS + 1,
@@ -510,7 +513,8 @@ mod tests {
             }
         }
         let context = context_for(requests);
-        let mut kv_store = FullAttnKv::without_prefix_cache(1, 10_000, None);
+        let mut kv_store =
+            KvCacheStore::without_prefix_cache(1, KvAccounting::tokens_for_test(10_000), None);
         for id in 0..2u32 {
             let request = RequestId(id);
             let footprint = kv_store.footprint(request, 8, 64);
@@ -611,7 +615,8 @@ mod tests {
             store[request].progress.prefill_tokens_processed = 8;
         }
         let context = context_for(requests);
-        let mut kv_store = FullAttnKv::without_prefix_cache(1, 10_000, None);
+        let mut kv_store =
+            KvCacheStore::without_prefix_cache(1, KvAccounting::tokens_for_test(10_000), None);
         let footprint = kv_store.footprint(request, 8, 64);
         KvStore::reserve(&mut kv_store, request, 0, footprint, Time::ZERO);
         kv_store.commit_resident(request, 0, 8, 64);

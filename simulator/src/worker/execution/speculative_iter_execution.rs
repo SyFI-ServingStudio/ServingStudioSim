@@ -27,7 +27,7 @@ use crate::arch::contract::{
 };
 use crate::common::{DecodingStrategy, SharedRequests, Time};
 use crate::worker::cost_buffers::CostBuffers;
-use crate::worker::execution::{IterModelExecution, ModelKvLayout};
+use crate::worker::execution::IterModelExecution;
 use crate::worker::kv::{IterWorkerKv, PrefixKv};
 use crate::worker::types::IterBatchPlan;
 
@@ -162,13 +162,6 @@ where
 {
     type Input = SpeculativeArchInput;
 
-    fn model_kv_layout(&self) -> ModelKvLayout {
-        ModelKvLayout {
-            total_kv_bytes_per_token: self.model.total_kv_bytes_per_token(),
-            num_attn_shards: self.model.num_attn_shards(),
-        }
-    }
-
     fn build_iteration_input(
         &self,
         kv_store: &K,
@@ -191,7 +184,7 @@ mod tests {
     use crate::common::{AcceptanceProfile, RequestId, SharedRequests, WorkerId};
     use crate::test_helpers::shared_with;
     use crate::timing::{CostManifest, CostManifestDoc, LeafMetrics};
-    use crate::worker::kv::{FullAttnKv, KvStore};
+    use crate::worker::kv::{KvAccounting, KvCacheStore, KvStore};
 
     const DRAFT_TOKENS: u32 = 3;
     const MAX_MODEL_LEN: u32 = 4096;
@@ -219,8 +212,9 @@ mod tests {
             }
         }
 
-        fn total_kv_bytes_per_token(&self) -> u64 {
-            1
+        fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+            crate::arch::kv_layout::KvCacheLayout::new()
+                .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1))
         }
 
         fn max_model_len(&self) -> u32 {
@@ -245,7 +239,7 @@ mod tests {
 
     /// `count` resident speculative decode requests, each holding
     /// `context_tokens` of KV, plus the request store the adapter reads.
-    fn resident_decodes(count: u32, context_tokens: u32) -> (FullAttnKv, SharedRequests) {
+    fn resident_decodes(count: u32, context_tokens: u32) -> (KvCacheStore, SharedRequests) {
         let rows: Vec<(u32, u32, u32)> = (0..count).map(|id| (id, context_tokens, 64)).collect();
         let requests = shared_with(&rows);
         {
@@ -259,7 +253,8 @@ mod tests {
                 record.record_token(Time::ZERO, false);
             }
         }
-        let mut kv_store = FullAttnKv::without_prefix_cache(1, 10_000_000, None);
+        let mut kv_store =
+            KvCacheStore::without_prefix_cache(1, KvAccounting::tokens_for_test(10_000_000), None);
         for id in 0..count {
             let request = RequestId(id);
             let footprint = kv_store.footprint(request, context_tokens, 64);

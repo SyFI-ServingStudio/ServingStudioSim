@@ -8,6 +8,7 @@
 //! at the per-layer attn/ffn boundary so the two disaggregated worker pools can
 //! interleave attn-of-layer-N with ffn-of-layer-(N-1).
 
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::timing::{CostManifest, CostManifestDoc, LeafMetrics, SlotInput};
 
 /// One attention/FFN group view for an iter-wise batch. Local/unified and PD
@@ -143,32 +144,11 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
         }
     }
 
-    /// **Total** KV-cache bytes one token occupies — summed over **all** layers,
-    /// **all** KV heads, **all** attention ranks. This is the wire size of a
-    /// token's KV (what a PD handoff transfers across the comm group); it is
-    /// *not* per-GPU.
-    ///
-    /// To size one worker KV partition for an attention shard, the worker reads
-    /// `attn_kv_bytes` (per-GPU budget), multiplies by `num_attn_shards()` (the
-    /// GPUs in one attn shard set), and divides by this total to get capacity
-    /// in tokens. To compute a PD transfer size, the prefill worker multiplies
-    /// tokens by this to get total wire bytes; the cluster then divides by
-    /// link count to recover per-rank bytes.
-    fn total_kv_bytes_per_token(&self) -> u64;
-
-    /// **Total** recurrent-state bytes one *request* occupies — summed over
-    /// **all** recurrent (SSM / linear-attention) layers, **all** heads, **all**
-    /// attention ranks, and including both the SSM state and the causal-conv
-    /// window (neither alone can resume a sequence). Same "total, not per-GPU"
-    /// convention as [`Self::total_kv_bytes_per_token`], so a worker converts it
-    /// to that function's token unit by dividing.
-    ///
-    /// Unlike KV, this is **fixed per request**: it does not grow as the request
-    /// decodes. A pure full-attention model has no such state and returns 0
-    /// (the default), which is what keeps every dense arch untouched.
-    fn recurrent_state_bytes_per_request(&self) -> u64 {
-        0
-    }
+    /// What one request keeps in the KV cache, part by part (global attention,
+    /// sliding windows, compressed indexers, recurrent states), with bytes summed
+    /// over every rank of one KV partition. L5 sizes capacity, admission, prefix
+    /// entries and PD transfers from it; see [`crate::arch::kv_layout`].
+    fn kv_cache_layout(&self) -> KvCacheLayout;
 
     /// Whether the `cost_log` must keep each decode request's KV length.
     ///
@@ -179,22 +159,6 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// reconstructs each request's exact causal interaction.
     fn logs_decode_kv_lens(&self) -> bool {
         false
-    }
-
-    /// Token interval at which a checkpoint of [`Self::recurrent_state_bytes_per_request`]
-    /// can be taken and later resumed from — vLLM's hybrid `block_size`.
-    ///
-    /// A recurrent state is a single rolling snapshot, not per-token entries, so
-    /// it is only reusable at positions where a snapshot was actually written.
-    /// vLLM writes them at multiples of this interval (`mamba_cache_mode`), which
-    /// quantizes every prefix-cache hit to a multiple of it. `0` means the model
-    /// has no recurrent state; `1` would mean "resumable anywhere", which no real
-    /// recurrent layer is.
-    ///
-    /// The arch owns the derivation because only it knows the state and KV page
-    /// shapes; L5 only reads the value (and may override it from a preset).
-    fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-        0
     }
 
     /// GPUs one replica of this model spans. The model_arch is the source of truth
@@ -365,8 +329,9 @@ pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
         }
     }
 
-    /// See [`IterwiseUnifiedModel::total_kv_bytes_per_token`].
-    fn total_kv_bytes_per_token(&self) -> u64;
+    /// The target model's layout plus the drafter's own cache parts. See
+    /// [`IterwiseUnifiedModel::kv_cache_layout`].
+    fn kv_cache_layout(&self) -> KvCacheLayout;
 
     /// Maximum context accepted by the model's timing kernels. A complete
     /// fixed-width verify window must fit within this bound.
@@ -507,10 +472,9 @@ pub trait AttnLayerwiseModel: Send + Sync + 'static {
         (self.gpus_per_replica() / self.num_attn_dp_groups().max(1)).max(1)
     }
 
-    /// **Total** KV-cache bytes one token occupies (all layers / KV heads / attn
-    /// ranks). Sizes the attention worker's KV partition capacity (same
-    /// definition as the iter-wise `total_kv_bytes_per_token`).
-    fn total_kv_bytes_per_token(&self) -> u64;
+    /// The attention side's KV cache layout, summed over one attention shard.
+    /// See [`IterwiseUnifiedModel::kv_cache_layout`].
+    fn kv_cache_layout(&self) -> KvCacheLayout;
 
     /// Bytes the attn side emits per token to the ffn side after a layer's
     /// attention (the attention output, `q_dim · bpe`). The attn worker attaches

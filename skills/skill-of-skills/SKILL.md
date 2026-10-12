@@ -79,7 +79,7 @@ top-add-kernel - add an L1 kernel end to end; one kernel is one delegated task (
     └── impl-validate-kernel-cache - measure Rust cache fidelity
 
 top-explore-models - understand a new model or checkpoint from HF/public sources
-├── dev-calculate-kv-cache-capacity - calculate KV cache bytes and capacity
+├── dev-calculate-kv-cache-capacity - KV capacity: read it from the sim for an existing arch, derive the layout for a new model
 └── dev-lookup-transformers-model - inspect local Transformers/Torch semantics
 
 top-split-model-into-kernels - break a model forward into the ServingStudioSim kernel sequence, ordered by measured share

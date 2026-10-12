@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
 use crate::arch::model_cfg::ModelCfg;
 use crate::common::Fabric;
 use crate::op::Op;
@@ -76,9 +77,8 @@ pub struct Llama3DenseTpModel {
     pub name: String,
     pub num_layers: u32,
     pub tp_size: u16,
-    /// Symbolic KV footprint per token (folds to bytes only at the worker's
-    /// KV partition-capacity seam). See `llama3_dense`.
-    pub total_kv_bytes_per_token: Dim,
+    /// Per-token KV bytes over one KV partition, for the KV cache layout.
+    pub kv_bytes_per_token: u64,
     pub attn_block: AttnBlockTpWorklet,
     pub mlp_block: MlpBlockTpWorklet,
     pub embed: Op<ElementwiseKernel>,
@@ -164,17 +164,20 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseTpParallel) -> Llama3Dens
     }
 }
 
-/// **Total** KV-cache bytes one token occupies — summed across all `tp_size`
-/// attention ranks, all layers, all KV heads. This is the wire size of a
-/// token's KV (what a PD handoff transfers); to get per-rank bytes (per-GPU
-/// footprint), divide by `tp_size`. Read straight off the un-sharded
-/// `raw_cfg` — no per-rank ÷tp ×tp round-trip needed.
-fn total_kv_bytes_per_token(resolved: &Llama3DenseTpResolved) -> Dim {
-    let raw = &resolved.attn_block.raw_cfg;
-    2 * raw.num_kv_heads.clone()
-        * raw.head_dim.clone()
-        * Dim::param("bytes", raw.kv_dtype().size_bytes())
-        * Dim::param("num_layers", resolved.num_layers)
+/// Per-token KV bytes of every GQA layer over one attention TP group
+/// (`2 × KV heads × head_dim × kv dtype × layers`, heads replicated when the TP
+/// degree exceeds them). Arch-specific: MLA's compressed latent or cross-layer
+/// sharing would compute it differently, so it lives in the model_arch.
+fn kv_bytes_per_token(resolved: &Llama3DenseTpResolved) -> u64 {
+    let attn = &resolved.attn_block.raw_cfg;
+    gqa_kv_bytes_per_token(
+        u64::from(resolved.num_layers),
+        u64::from(attn.num_kv_heads.get()),
+        u64::from(attn.head_dim.get()),
+        u64::from(attn.head_dim.get()),
+        u64::from(attn.kv_dtype().size_bytes()),
+        u64::from(resolved.tp_size),
+    )
 }
 
 pub fn resolve_configs(cfgs: &Llama3DenseTpConfigs) -> Llama3DenseTpResolved {
@@ -196,7 +199,7 @@ pub fn build(
 ) -> Result<Llama3DenseTpModel, BuildError> {
     let num_layers = resolved.num_layers;
     let tp_size = resolved.tp_size;
-    let total_kv_bytes_per_token = total_kv_bytes_per_token(&resolved);
+    let kv_bytes_per_token = kv_bytes_per_token(&resolved);
 
     let embed_name = format!("{model_name}.embedding");
     let final_norm_name = format!("{model_name}.final_norm");
@@ -250,7 +253,7 @@ pub fn build(
         name: model_name,
         num_layers,
         tp_size,
-        total_kv_bytes_per_token,
+        kv_bytes_per_token,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -333,8 +336,8 @@ impl Llama3DenseTpModel {
 }
 
 impl IterwiseUnifiedModel for Llama3DenseTpModel {
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token.get() as u64
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        KvCacheLayout::new().with_part(KvCachePart::per_token("gqa", self.kv_bytes_per_token))
     }
 
     /// One replica spans the `tp_size` ranks of the TP group (no HP/EP nesting in
@@ -437,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn total_kv_bytes_per_token_sums_across_ranks() {
+    fn kv_bytes_per_token_sums_across_ranks() {
         let cfgs = build_configs(
             &ModelCfg::llama3_8b(),
             &DenseTpParallel {
@@ -447,7 +450,7 @@ mod tests {
         );
         let r = resolve_configs(&cfgs);
         // total kv heads = 8 (model-level, not per-rank); 2·8·128·2·32.
-        assert_eq!(total_kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
+        assert_eq!(kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
     }
 
     #[test]
@@ -461,7 +464,7 @@ mod tests {
             },
         );
         let r = resolve_configs(&cfgs);
-        assert_eq!(total_kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
+        assert_eq!(kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
         assert_eq!(r.tp_size, 1);
     }
 }

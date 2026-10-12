@@ -27,6 +27,7 @@ use crate::arch::contract::{
     UnifiedArchInput,
 };
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
+use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
 use crate::op::attention::DsaSparseMlaExactVarlenConfig;
 use crate::op::Op;
@@ -1560,7 +1561,7 @@ pub struct Glm52VllmNvfp4DsaMoeModel {
     pub max_model_len: u32,
     pub num_attn_dp_groups: u16,
     pub num_attn_shards: u16,
-    pub total_state_bytes_per_token: u64,
+    pub kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1584,7 +1585,7 @@ pub struct Glm52VllmNvfp4DsaMoeSpeculativeModel {
     max_model_len: u32,
     num_attn_dp_groups: u16,
     num_attn_shards: u16,
-    total_state_bytes_per_token: u64,
+    kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1735,7 +1736,7 @@ pub fn build(
         max_model_len,
         num_attn_dp_groups: 1,
         num_attn_shards: ep_size,
-        total_state_bytes_per_token: state_bytes_per_token(ep_size, Glm52MtpMode::Off)?,
+        kv_cache_layout: kv_cache_layout(ep_size, Glm52MtpMode::Off),
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -1810,7 +1811,7 @@ pub fn build_speculative(
         max_model_len,
         num_attn_dp_groups: 1,
         num_attn_shards: ep_size,
-        total_state_bytes_per_token: state_bytes_per_token(ep_size, mtp_mode)?,
+        kv_cache_layout: kv_cache_layout(ep_size, mtp_mode),
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -2056,8 +2057,8 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4DsaMoeModel {
         normalize_input(batch, self.target.ep_size, self.max_model_len).map(|_| ())
     }
 
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_state_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn gpus_per_replica(&self) -> u16 {
@@ -2168,8 +2169,8 @@ impl SpeculativeUnifiedModel for Glm52VllmNvfp4DsaMoeSpeculativeModel {
         normalize_speculative_input(batch, self.draft_tokens, self.max_model_len).map(|_| ())
     }
 
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_state_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn max_model_len(&self) -> u32 {
@@ -2656,45 +2657,47 @@ fn expected_speculative_slot_count(
     expected_slot_count(ep_size) + expected_mtp_pass_slots(ep_size, false) + recurrent
 }
 
-/// One decoder layer's cached state for one token on one rank.
-///
-/// MLA stores one FP8 (kv_lora_rank + rope_dim) vector. Every decoder layer
-/// also allocates its FP8 index key plus one FP32 scale, even when that layer
-/// reuses a previous layer's top-k result and skips the indexer compute.
-pub(crate) fn decoder_layer_state_bytes_per_token() -> u64 {
+/// One decoder layer's MLA cache for one token on one rank: one FP8
+/// (kv_lora_rank + rope_dim) vector.
+pub(crate) fn mla_bytes_per_layer_token() -> u64 {
     u64::from(KV_LORA_RANK + ROPE_DIM) * u64::from(DType::Fp8E4m3.size_bytes())
-        + u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes())
 }
 
-pub(crate) fn state_bytes_per_token(
-    ep_size: u16,
-    mtp_mode: Glm52MtpMode,
-) -> std::result::Result<u64, BuildError> {
-    // vLLM keeps both caches replicated on every TP rank, and every one of the
-    // 78 body layers allocates the same per-layer state.
-    let main_per_rank = u64::from(NUM_LAYERS)
-        .checked_mul(decoder_layer_state_bytes_per_token())
-        .ok_or_else(|| fit_failed("main state bytes overflow u64"))?;
-    let mtp_mla_per_rank = u64::from(KV_LORA_RANK + ROPE_DIM)
-        .checked_mul(u64::from(DType::Fp8E4m3.size_bytes()))
-        .ok_or_else(|| fit_failed("MTP MLA state bytes overflow u64"))?;
-    let per_rank = match mtp_mode {
-        Glm52MtpMode::Off => Some(main_per_rank),
-        Glm52MtpMode::FullIndex => main_per_rank
-            .checked_add(mtp_mla_per_rank)
-            .and_then(|value| {
-                value.checked_add(u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes()))
-            }),
-        Glm52MtpMode::IndexShare => main_per_rank.checked_add(mtp_mla_per_rank),
-    }
-    .ok_or_else(|| fit_failed("per-rank state bytes overflow u64"))?;
+/// One indexer layer's DSA index cache for one token on one rank: the FP8
+/// index key plus one FP32 scale.
+pub(crate) fn indexer_bytes_per_layer_token() -> u64 {
+    u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes())
+}
 
-    // IterwiseUnifiedModel's KV contract is the physical total across all
-    // attention ranks. Multiplying the replicated per-rank allocation by TP
-    // keeps both worker capacity and PD wire-size accounting consistent.
-    per_rank
-        .checked_mul(u64::from(ep_size))
-        .ok_or_else(|| fit_failed("replicated state bytes overflow u64"))
+/// One rank's MLA latent and DSA index caches of `mla_layers` and
+/// `index_layers` layers. vLLM replicates both on every attention TP rank, so a
+/// TP group holds this layout on each rank.
+pub(crate) fn mla_dsa_kv_cache_layout(mla_layers: u32, index_layers: u32) -> KvCacheLayout {
+    KvCacheLayout::new()
+        .with_part(KvCachePart::per_token(
+            "mla",
+            u64::from(mla_layers) * mla_bytes_per_layer_token(),
+        ))
+        .with_part(KvCachePart::per_token(
+            "indexer",
+            u64::from(index_layers) * indexer_bytes_per_layer_token(),
+        ))
+}
+
+/// The whole model's cache: the latent of all 78 body layers and the index key
+/// of the 21 full-index layers, plus the MTP layer's latent and index key.
+///
+/// vLLM builds an indexer, and so an index cache, only on a layer that
+/// computes its own top-k; a shared layer reuses the previous result and has
+/// none. The MTP layer always builds one, whether or not its later draft steps
+/// share the index (fork `deepseek_v2.py`, `DeepseekV2MLAAttention`).
+pub(crate) fn kv_cache_layout(attn_tp: u16, mtp_mode: Glm52MtpMode) -> KvCacheLayout {
+    let mtp = match mtp_mode {
+        Glm52MtpMode::Off => 0,
+        Glm52MtpMode::FullIndex | Glm52MtpMode::IndexShare => NUM_MTP_LAYERS,
+    };
+    mla_dsa_kv_cache_layout(NUM_LAYERS + mtp, FULL_INDEX_LAYERS.len() as u32 + mtp)
+        .held_on_each_rank(u64::from(attn_tp))
 }
 
 #[cfg(test)]
@@ -3379,34 +3382,52 @@ mod tests {
 
     #[test]
     fn state_and_topology_contracts_are_exact() {
+        // 78 latents of 576 B and 21 index keys of 132 B per rank, plus one
+        // of each for the MTP layer in either MTP mode.
+        let bytes = |mode| kv_cache_layout(4, mode).per_token_bytes();
+        assert_eq!(bytes(Glm52MtpMode::Off), 4 * (78 * 576 + 21 * 132));
+        assert_eq!(bytes(Glm52MtpMode::FullIndex), 4 * (79 * 576 + 22 * 132));
         assert_eq!(
-            state_bytes_per_token(4, Glm52MtpMode::Off).unwrap(),
-            220_896
-        );
-        assert_eq!(
-            state_bytes_per_token(4, Glm52MtpMode::FullIndex).unwrap(),
-            223_728
-        );
-        assert_eq!(
-            state_bytes_per_token(4, Glm52MtpMode::IndexShare).unwrap(),
-            223_200
+            bytes(Glm52MtpMode::IndexShare),
+            bytes(Glm52MtpMode::FullIndex)
         );
     }
 
+    /// The fork's (892da082) "GPU KV cache size" and "Maximum concurrency for
+    /// N tokens per request" at TP4, without and with five MTP drafts. An
+    /// older vLLM gave every layer an index key (55,224 B per rank and token);
+    /// this one gives it only to the layers that compute top-k.
     #[test]
-    fn replicated_fp8_cache_matches_the_profiled_vllm_capacity() {
-        // B200 vLLM startup evidence at gpu_memory_utilization=0.75 reported
-        // 17.55 GiB available per rank and exactly 341,120 cache tokens. The
-        // byte value below is independently recovered from that token count
-        // and vLLM's per-rank cache allocation, avoiding rounded GiB math.
-        const PROFILED_BYTES_PER_RANK: u64 = 18_838_010_880;
-        const PROFILED_TOKENS: u64 = 341_120;
-        const TP_SIZE: u16 = 4;
-
-        let total_bytes = PROFILED_BYTES_PER_RANK * u64::from(TP_SIZE);
-        let bytes_per_token = state_bytes_per_token(TP_SIZE, Glm52MtpMode::Off).unwrap();
-        assert_eq!(total_bytes / bytes_per_token, PROFILED_TOKENS);
-        assert_eq!(total_bytes % bytes_per_token, 0);
+    fn kv_cache_layout_reproduces_vllms_logged_concurrency() {
+        use crate::worker::kv::{KvAccounting, KvAccountingOptions};
+        for (gib_per_rank, max_model_len, mtp_mode, logged_tokens, logged) in [
+            (41.58, 131_072, Glm52MtpMode::Off, 935_872, 7.14),
+            (35.26, 131_072, Glm52MtpMode::Off, 793_600, 6.05),
+            (34.49, 131_072, Glm52MtpMode::FullIndex, 764_992, 5.84),
+            (11.89, 8192, Glm52MtpMode::FullIndex, 263_616, 32.18),
+        ] {
+            let layout = kv_cache_layout(4, mtp_mode);
+            let budget = (gib_per_rank * f64::from(1u32 << 30)) as u64 * 4;
+            let tokens = budget / layout.per_token_bytes();
+            assert!(
+                (tokens as f64 / f64::from(logged_tokens) - 1.0).abs() < 0.005,
+                "{gib_per_rank} GiB {mtp_mode:?}: {tokens} vs {logged_tokens} tokens"
+            );
+            let options = KvAccountingOptions {
+                prefix_caching: true,
+                ..Default::default()
+            };
+            let accounting = KvAccounting::resolve(&layout, options, budget).unwrap();
+            let concurrency = accounting.concurrency_at(max_model_len);
+            assert!(
+                (concurrency / logged - 1.0).abs() < 0.005,
+                "{gib_per_rank} GiB {mtp_mode:?}: {concurrency} vs {logged}"
+            );
+            // `kv_cache.json` reports the same two numbers.
+            let report = accounting.report(Some(max_model_len as u32)).result;
+            assert_eq!(report.capacity_tokens, Some(tokens));
+            assert_eq!(report.max_concurrency_at_max_model_len, Some(concurrency));
+        }
     }
 
     fn group(prefill_tokens: u32, decode_lens: Vec<u32>, pairs: Vec<(u32, u32)>) -> ArchGroupInput {

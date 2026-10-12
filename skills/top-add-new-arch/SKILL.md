@@ -181,6 +181,10 @@ Build in strict bottom-up order; each layer only wires the layer below.
 - **L4 — arch (fan-out + stitch).** Wire the chosen worklets into the
   `model_arch` cost file: prologue / per-layer / epilogue groups, multi-rank
   fan-out, and `WorkletGroup` boundaries. It computes no partition itself.
+  The arch also declares one request's KV state part by part
+  (`kv_cache_layout`: per-token, sliding-window, per-request), which sizes
+  capacity, admission and prefix hits; check it against the Phase 0 capture's
+  logged vLLM KV concurrency.
   Skill `impl-compose-arch` (contract: `simulator/src/arch/README.md`).
 
 ## Phase 3 — Wire (make it selectable & predictable)

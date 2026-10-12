@@ -196,15 +196,19 @@ speculative execution 仍只是被保真存储，在真实 consumer 与 capabili
 当前 text worker 已通过 L5 `PrefixKv` 实现 prefix-aware KV，chunked prefill 仍未实现。
 `TextGenerationDefinition.prompt_tokens` 只表示本次 fresh suffix；
 `SessionInput::Session.declared_prefix_tokens` 是 immutable requirement，不是 observed hit。
-`FullAttnKv` 在目标 attention partition 上解析：
+`KvCacheStore` 在目标 attention partition 上解析：
 
 ```text
-resident = min(local retained session KV, declared prefix)
+resident = max{ p in retained entry resume positions : p <= declared prefix }, or 0
 prefill_tokens_to_compute = fresh prompt + declared prefix - resident
 post_prefill_context_tokens = fresh prompt + declared prefix
 ```
 
-`ResolvedPrefillContext` 只存于 `FullAttnKv`。Execution 从 `PrefixKv` 读取
+只含 per-token part 的 layout 在任意长度都可恢复，此时
+`resident = min(local retained session KV, declared prefix)`；sliding window 与 recurrent
+state 只能在 entry 保留的位置恢复（L5 §3.2）。
+
+`ResolvedPrefillContext` 只存于 `KvCacheStore`。Execution 从 `PrefixKv` 读取
 resident 与 `prefill_tokens_to_compute`；`TextGenerationProgress` 仍只保存真实 processed prefill
 work 与 emitted output tokens。cache disabled/evicted/placement miss 都会重算缺失 prefix，
 不会把 declaration 当成 guaranteed hit；唯一例外是 `SessionInput::PinnedPrefix`，

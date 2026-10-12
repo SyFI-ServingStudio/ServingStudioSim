@@ -4,18 +4,21 @@
 //! A lookup is destructive: retained KV ownership moves to the admitted request,
 //! so this cache never models inter-request sharing or ref-counted prefix pages.
 //!
-//! ## Reuse quantum
+//! ## Resume positions
 //!
-//! Full-attention KV is per-token, so any prefix length is reusable — that is a
-//! quantum of one. A recurrent state is a single rolling snapshot instead, only
-//! written at multiples of the model's checkpoint interval, so its reuse
-//! quantizes to that interval and each retained entry additionally carries one
-//! `charge_per_checkpoint` for every snapshot it keeps. Both knobs are
-//! constructor parameters; `(1, 0)` is exactly the pre-hybrid behavior.
+//! Per-token KV can be resumed from any length. A sliding window or a
+//! recurrent state can only be resumed where the engine kept it, so an entry
+//! records the [`ResumePositions`] its request left behind and a hit is the
+//! largest of them a later request's declared prefix reaches. The entry pays
+//! for its per-token parts up to its last position plus the window tails and
+//! states at each position ([`KvAccounting::entry_charge`]); with only
+//! per-token parts that is its token count, as before.
 
 use std::collections::{BTreeSet, HashMap};
 
 use serde::Deserialize;
+
+use crate::worker::kv::shared::kv_accounting::{KvAccounting, ResumePositions, SharedKvAccounting};
 
 /// Whether completed-session KV may be retained after a request finishes.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -66,51 +69,63 @@ impl Default for PrefixCacheConfig {
     }
 }
 
-/// Construction-time token-space form consumed by `FullAttnKv`.
+/// Construction-time form consumed by `KvCacheStore`, in the partition's KV
+/// units.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PrefixCacheTokenConfig {
-    pub(crate) max_retained_tokens: u64,
+pub(crate) struct PrefixCacheBudget {
+    pub(crate) max_retained_units: u64,
     pub(crate) policy: PrefixCachePolicy,
 }
 
+impl PrefixCacheBudget {
+    pub(crate) const DISABLED: Self = Self {
+        max_retained_units: 0,
+        policy: PrefixCachePolicy::Lru,
+    };
+}
+
 impl PrefixCacheConfig {
-    /// Convert the optional byte ceiling with the same model KV layout used for
-    /// total attention capacity. An uncapped opportunistic cache resolves to the
-    /// full capacity; runtime physical slack still shrinks it below that value.
-    pub(crate) fn resolve_tokens(
+    /// Convert the optional per-GPU byte ceiling into units of `accounting`,
+    /// over the partition's `num_attn_shards` GPUs. An uncapped opportunistic
+    /// cache resolves to the full capacity; runtime physical slack still
+    /// shrinks it below that value.
+    pub(crate) fn resolve_units(
         self,
-        total_capacity_tokens: u64,
-        total_kv_bytes_per_token: u64,
+        accounting: &KvAccounting,
         num_attn_shards: u16,
-    ) -> PrefixCacheTokenConfig {
+    ) -> PrefixCacheBudget {
         match self {
-            Self::Disabled => PrefixCacheTokenConfig {
-                max_retained_tokens: 0,
-                policy: PrefixCachePolicy::Lru,
-            },
+            Self::Disabled => PrefixCacheBudget::DISABLED,
             Self::Opportunistic {
                 policy,
                 max_retained_bytes,
             } => {
-                let max_retained_tokens = max_retained_bytes
+                let capacity_units = accounting.capacity_units();
+                let max_retained_units = max_retained_bytes
                     .map(|bytes| {
-                        bytes.saturating_mul(u64::from(num_attn_shards.max(1)))
-                            / total_kv_bytes_per_token.max(1)
+                        accounting
+                            .units_of_bytes(bytes.saturating_mul(u64::from(num_attn_shards.max(1))))
                     })
-                    .unwrap_or(total_capacity_tokens)
-                    .min(total_capacity_tokens);
-                PrefixCacheTokenConfig {
-                    max_retained_tokens,
+                    .unwrap_or(capacity_units)
+                    .min(capacity_units);
+                PrefixCacheBudget {
+                    max_retained_units,
                     policy,
                 }
             }
         }
     }
+
+    pub(crate) fn enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PrefixEntry {
-    tokens: u64,
+    positions: ResumePositions,
+    /// Units the entry occupies.
+    charge: u64,
     insertion_sequence: u64,
     last_access_sequence: u64,
     frequency: u64,
@@ -150,6 +165,10 @@ pub(crate) enum PrefixCacheMutationKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PrefixCacheTakeResult {
     pub(crate) hit_tokens: u32,
+    /// What the hit would be if every position were resumable: the declared
+    /// prefix, capped at the entry's context. The gap to `hit_tokens` is what
+    /// the entry's resume positions cost.
+    pub(crate) full_hit_tokens: u32,
     pub(crate) entry_tokens: u64,
     pub(crate) cache_used_before: u64,
     pub(crate) cache_used_after: u64,
@@ -164,16 +183,13 @@ pub(crate) struct PrefixCacheInsertResult {
 
 /// One attention partition's evictable retained-session tier.
 pub(crate) struct PrefixCache {
-    max_retained_tokens: u64,
+    accounting: SharedKvAccounting,
+    max_retained_units: u64,
+    /// Units the entries occupy, the sum of their charges.
+    used_units: u64,
+    /// Context tokens the entries keep; reported in receipts.
     used_tokens: u64,
-    /// Snapshots behind `used_tokens`, tracked incrementally so `used_charge`
-    /// stays O(1) inside the eviction loops.
-    used_checkpoints: u64,
     policy: PrefixCachePolicy,
-    /// Reuse granularity in context tokens. `1` = any prefix length is reusable.
-    quantum_tokens: u64,
-    /// Extra occupancy every retained snapshot costs on top of its context KV.
-    charge_per_checkpoint: u64,
     entries: HashMap<u32, PrefixEntry>,
     /// `entries` ordered by the policy's eviction key, session id last, so the
     /// victim is the first element. A retained entry never changes (a hit
@@ -183,74 +199,36 @@ pub(crate) struct PrefixCache {
 }
 
 impl PrefixCache {
-    pub(crate) fn new(
-        max_retained_tokens: u64,
-        policy: PrefixCachePolicy,
-        quantum_tokens: u32,
-        charge_per_checkpoint: u64,
-    ) -> Self {
+    pub(crate) fn new(accounting: SharedKvAccounting, budget: PrefixCacheBudget) -> Self {
         Self {
-            max_retained_tokens,
+            max_retained_units: budget.max_retained_units.min(accounting.capacity_units()),
+            accounting,
+            used_units: 0,
             used_tokens: 0,
-            used_checkpoints: 0,
-            policy,
-            quantum_tokens: u64::from(quantum_tokens.max(1)),
-            charge_per_checkpoint,
+            policy: budget.policy,
             entries: HashMap::new(),
             eviction_order: BTreeSet::new(),
             next_sequence: 0,
         }
     }
 
-    /// Context tokens held. Deliberately test-only: every production decision
-    /// is about occupancy, which is [`Self::used_charge`]. The two differ once
-    /// retained snapshots carry a charge of their own.
-    #[cfg(test)]
+    /// Context tokens held, as receipts report them. Every capacity decision
+    /// is about occupancy, which is [`Self::used_units`].
     pub(crate) fn used_tokens(&self) -> u64 {
         self.used_tokens
     }
 
-    /// What this tier actually occupies: retained context KV plus one charge per
-    /// retained snapshot. Equals [`Self::used_tokens`] when there is no per-
-    /// checkpoint charge.
-    pub(crate) fn used_charge(&self) -> u64 {
-        self.used_tokens + self.used_checkpoints * self.charge_per_checkpoint
+    /// Units this tier occupies.
+    pub(crate) fn used_units(&self) -> u64 {
+        self.used_units
     }
 
-    /// Round a length down to the coarsest boundary this cache can resume from.
-    fn floor_to_quantum(&self, tokens: u64) -> u64 {
-        tokens / self.quantum_tokens * self.quantum_tokens
-    }
-
-    /// Occupancy a quantized `tokens` would add: the context KV plus one charge
-    /// for each snapshot inside it.
-    fn charge_of(&self, tokens: u64) -> u64 {
-        tokens + tokens / self.quantum_tokens * self.charge_per_checkpoint
-    }
-
-    /// The largest quantized length not exceeding `tokens` whose charge fits
-    /// `capacity`. Each retained snapshot costs `quantum + charge_per_checkpoint`,
-    /// so the count is a plain division; at quantum one with no charge this is
-    /// `min(tokens, capacity)`, the pre-hybrid rule.
-    fn largest_fitting_length(&self, tokens: u64, capacity: u64) -> u64 {
-        let per_checkpoint = self.quantum_tokens + self.charge_per_checkpoint;
-        let checkpoints = (tokens / self.quantum_tokens).min(capacity / per_checkpoint);
-        checkpoints * self.quantum_tokens
-    }
-
-    /// Pure preview used by admission's token-budget and capacity gates.
-    ///
-    /// A request declaring `requested_tokens` can only resume at a boundary it
-    /// shares with the retained entry, so the hit is the smaller of the two
-    /// quantized lengths. At quantum one this is the plain `min`.
+    /// Pure preview used by admission's token-budget and capacity gates: the
+    /// largest position of the entry within `requested_tokens`.
     pub(crate) fn peek(&self, session_id: u32, requested_tokens: u32) -> u32 {
         self.entries
             .get(&session_id)
-            .map(|entry| {
-                entry
-                    .tokens
-                    .min(self.floor_to_quantum(u64::from(requested_tokens))) as u32
-            })
+            .map(|entry| entry.positions.floor(u64::from(requested_tokens)) as u32)
             .unwrap_or(0)
     }
 
@@ -263,13 +241,16 @@ impl PrefixCache {
         let cache_used_before = self.used_tokens;
         let hit_tokens = self.peek(session_id, requested_tokens);
         let removed_entry = self.remove(session_id);
-        let entry_tokens = removed_entry.map(|entry| entry.tokens).unwrap_or(0);
+        let entry_tokens = removed_entry
+            .map(|entry| entry.positions.end())
+            .unwrap_or(0);
         let return_metadata = removed_entry.map(|entry| PrefixCacheReturnMetadata {
             insertion_sequence: entry.insertion_sequence,
             frequency: entry.frequency.saturating_add(1),
         });
         PrefixCacheTakeResult {
             hit_tokens,
+            full_hit_tokens: entry_tokens.min(u64::from(requested_tokens)) as u32,
             entry_tokens,
             cache_used_before,
             cache_used_after: self.used_tokens,
@@ -277,15 +258,18 @@ impl PrefixCache {
         }
     }
 
-    /// Retain a completed request's physically resident KV.
+    /// Retain a completed request's physically resident KV: `context_tokens`
+    /// of context after a `prompt_tokens` prompt.
     ///
     /// `physical_limit` is the current slack left by active/promised/held KV in
     /// the partition. An optional experiment ceiling was already resolved into
-    /// `max_retained_tokens`; the inserted entry is clamped to the smaller limit.
+    /// `max_retained_units`; the entry is cut at the last position that fits the
+    /// smaller limit.
     pub(crate) fn insert(
         &mut self,
         session_id: u32,
-        tokens: u64,
+        prompt_tokens: u64,
+        context_tokens: u64,
         physical_limit: u64,
         return_metadata: Option<PrefixCacheReturnMetadata>,
     ) -> PrefixCacheInsertResult {
@@ -295,19 +279,25 @@ impl PrefixCache {
         {
             mutations.push(mutation);
         }
-        let effective_capacity = self.max_retained_tokens.min(physical_limit);
+        let effective_capacity = self.max_retained_units.min(physical_limit);
         mutations.extend(self.shrink_to(effective_capacity));
-        // Only whole snapshots are resumable, so a tail shorter than one quantum
-        // is dropped rather than retained as unusable KV.
-        let retained_tokens = self.largest_fitting_length(tokens, effective_capacity);
+        // Only kept positions are resumable, so context past the last one that
+        // fits is dropped rather than retained as unusable KV.
+        let positions = self
+            .accounting
+            .resume_positions(prompt_tokens, context_tokens);
+        let positions = self
+            .accounting
+            .largest_fitting(&positions, effective_capacity);
+        let retained_tokens = positions.end();
         if retained_tokens == 0 {
             return PrefixCacheInsertResult {
                 mutations,
                 retained_tokens,
             };
         }
-        let retained_charge = self.charge_of(retained_tokens);
-        while self.used_charge().saturating_add(retained_charge) > effective_capacity {
+        let charge = self.accounting.entry_charge(&positions);
+        while self.used_units.saturating_add(charge) > effective_capacity {
             let Some(victim) = self.victim() else {
                 break;
             };
@@ -324,7 +314,8 @@ impl PrefixCache {
         let frequency = return_metadata.map(|value| value.frequency).unwrap_or(0);
         let cache_used_before = self.used_tokens;
         let entry = PrefixEntry {
-            tokens: retained_tokens,
+            positions,
+            charge,
             insertion_sequence,
             last_access_sequence: sequence,
             frequency,
@@ -332,8 +323,8 @@ impl PrefixCache {
         self.eviction_order
             .insert(self.eviction_key(session_id, &entry));
         self.entries.insert(session_id, entry);
+        self.used_units += charge;
         self.used_tokens += retained_tokens;
-        self.used_checkpoints += retained_tokens / self.quantum_tokens;
         mutations.push(PrefixCacheMutation {
             kind: PrefixCacheMutationKind::Retain,
             session_id,
@@ -349,9 +340,9 @@ impl PrefixCache {
     }
 
     pub(crate) fn shrink_to(&mut self, physical_limit: u64) -> Vec<PrefixCacheMutation> {
-        let effective_capacity = self.max_retained_tokens.min(physical_limit);
+        let effective_capacity = self.max_retained_units.min(physical_limit);
         let mut mutations = Vec::new();
-        while self.used_charge() > effective_capacity {
+        while self.used_units > effective_capacity {
             let Some(victim) = self.victim() else {
                 break;
             };
@@ -377,9 +368,9 @@ impl PrefixCache {
             PrefixCachePolicy::Lru => (entry.last_access_sequence, 0, session_id),
             PrefixCachePolicy::Fifo => (entry.insertion_sequence, 0, session_id),
             PrefixCachePolicy::Lfu => (entry.frequency, entry.insertion_sequence, session_id),
-            // Largest first: more tokens sort earlier.
+            // Largest first: a larger charge sorts earlier.
             PrefixCachePolicy::LargestFirst => (
-                u64::MAX - entry.tokens,
+                u64::MAX - entry.charge,
                 entry.insertion_sequence,
                 session_id,
             ),
@@ -390,10 +381,8 @@ impl PrefixCache {
         let entry = self.entries.remove(&session_id)?;
         self.eviction_order
             .remove(&self.eviction_key(session_id, &entry));
-        self.used_tokens = self.used_tokens.saturating_sub(entry.tokens);
-        self.used_checkpoints = self
-            .used_checkpoints
-            .saturating_sub(entry.tokens / self.quantum_tokens);
+        self.used_units -= entry.charge;
+        self.used_tokens -= entry.positions.end();
         Some(entry)
     }
 
@@ -407,7 +396,7 @@ impl PrefixCache {
         Some(PrefixCacheMutation {
             kind,
             session_id,
-            entry_tokens_before: entry.tokens,
+            entry_tokens_before: entry.positions.end(),
             entry_tokens_after: 0,
             cache_used_before,
             cache_used_after: self.used_tokens,
@@ -425,25 +414,38 @@ impl PrefixCache {
 mod tests {
     use super::*;
 
-    /// Full-attention settings: every prefix length is resumable and a retained
-    /// entry costs exactly its tokens. The quantized/charged behaviour is
-    /// covered by the hybrid store's own tests.
-    const TOKEN_QUANTUM: u32 = 1;
-    const NO_EXTRA_CHARGE: u64 = 0;
+    /// Plain token accounting: every prefix length is resumable and a retained
+    /// entry costs exactly its tokens. Positions and charges of other layouts
+    /// are covered by `kv_accounting` and the store's tests.
+    fn cache(max_retained_units: u64, policy: PrefixCachePolicy) -> PrefixCache {
+        PrefixCache::new(
+            KvAccounting::tokens_for_test(max_retained_units),
+            PrefixCacheBudget {
+                max_retained_units,
+                policy,
+            },
+        )
+    }
 
     #[test]
-    fn runtime_config_resolves_disabled_uncapped_and_bounded_token_limits() {
+    fn runtime_config_resolves_disabled_uncapped_and_bounded_unit_limits() {
+        // 2000-byte units, 1000 of them over two shards.
+        let layout = crate::arch::kv_layout::KvCacheLayout::new()
+            .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 2_000));
+        let accounting = KvAccounting::resolve(
+            &layout,
+            crate::worker::kv::shared::kv_accounting::KvAccountingOptions::default(),
+            2_000_000,
+        )
+        .unwrap();
         assert_eq!(
-            PrefixCacheConfig::Disabled.resolve_tokens(1_000, 2_000, 2),
-            PrefixCacheTokenConfig {
-                max_retained_tokens: 0,
-                policy: PrefixCachePolicy::Lru,
-            }
+            PrefixCacheConfig::Disabled.resolve_units(&accounting, 2),
+            PrefixCacheBudget::DISABLED
         );
         assert_eq!(
-            PrefixCacheConfig::default().resolve_tokens(1_000, 2_000, 2),
-            PrefixCacheTokenConfig {
-                max_retained_tokens: 1_000,
+            PrefixCacheConfig::default().resolve_units(&accounting, 2),
+            PrefixCacheBudget {
+                max_retained_units: 1_000,
                 policy: PrefixCachePolicy::Lru,
             }
         );
@@ -452,9 +454,9 @@ mod tests {
                 policy: PrefixCachePolicy::Fifo,
                 max_retained_bytes: Some(400_000),
             }
-            .resolve_tokens(1_000, 2_000, 2),
-            PrefixCacheTokenConfig {
-                max_retained_tokens: 400,
+            .resolve_units(&accounting, 2),
+            PrefixCacheBudget {
+                max_retained_units: 400,
                 policy: PrefixCachePolicy::Fifo,
             }
         );
@@ -462,9 +464,8 @@ mod tests {
 
     #[test]
     fn take_transfers_ownership_instead_of_sharing() {
-        let mut cache =
-            PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
-        cache.insert(7, 80, 100, None);
+        let mut cache = cache(100, PrefixCachePolicy::Lru);
+        cache.insert(7, 80, 80, 100, None);
         assert_eq!(cache.take(7, 50).hit_tokens, 50);
         assert_eq!(cache.peek(7, 50), 0);
         assert_eq!(cache.used_tokens(), 0);
@@ -472,20 +473,18 @@ mod tests {
 
     #[test]
     fn lru_evicts_the_oldest_retained_session() {
-        let mut cache =
-            PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
-        cache.insert(1, 60, 100, None);
-        cache.insert(2, 60, 100, None);
+        let mut cache = cache(100, PrefixCachePolicy::Lru);
+        cache.insert(1, 60, 60, 100, None);
+        cache.insert(2, 60, 60, 100, None);
         assert_eq!(cache.peek(1, 60), 0);
         assert_eq!(cache.peek(2, 60), 60);
     }
 
     #[test]
     fn physical_slack_can_shrink_below_the_configured_ceiling() {
-        let mut cache =
-            PrefixCache::new(100, PrefixCachePolicy::Fifo, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
-        cache.insert(1, 40, 100, None);
-        cache.insert(2, 40, 100, None);
+        let mut cache = cache(100, PrefixCachePolicy::Fifo);
+        cache.insert(1, 40, 40, 100, None);
+        cache.insert(2, 40, 40, 100, None);
         cache.shrink_to(40);
         assert_eq!(cache.used_tokens(), 40);
         assert_eq!(cache.peek(1, 40), 0);
@@ -496,44 +495,38 @@ mod tests {
     fn lru_refreshes_returned_metadata_but_fifo_preserves_first_residency() {
         for (policy, expected_victim) in [(PrefixCachePolicy::Lru, 2), (PrefixCachePolicy::Fifo, 1)]
         {
-            let mut cache = PrefixCache::new(100, policy, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
-            cache.insert(1, 40, 100, None);
-            cache.insert(2, 40, 100, None);
+            let mut cache = cache(100, policy);
+            cache.insert(1, 40, 40, 100, None);
+            cache.insert(2, 40, 40, 100, None);
             let take_result = cache.take(1, 40);
-            cache.insert(1, 40, 100, take_result.return_metadata);
-            cache.insert(3, 40, 100, None);
+            cache.insert(1, 40, 40, 100, take_result.return_metadata);
+            cache.insert(3, 40, 40, 100, None);
             assert_eq!(cache.peek(expected_victim, 40), 0);
         }
     }
 
     #[test]
     fn lfu_evicts_the_least_consumed_session_then_the_oldest() {
-        let mut cache =
-            PrefixCache::new(100, PrefixCachePolicy::Lfu, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
-        cache.insert(1, 30, 100, None);
-        cache.insert(2, 30, 100, None);
-        cache.insert(3, 30, 100, None);
+        let mut cache = cache(100, PrefixCachePolicy::Lfu);
+        cache.insert(1, 30, 30, 100, None);
+        cache.insert(2, 30, 30, 100, None);
+        cache.insert(3, 30, 30, 100, None);
         // Session 1 was consumed once, so 2 (older than 3) goes first, then 3.
         let take_result = cache.take(1, 30);
-        cache.insert(1, 30, 100, take_result.return_metadata);
-        cache.insert(4, 30, 100, None);
+        cache.insert(1, 30, 30, 100, take_result.return_metadata);
+        cache.insert(4, 30, 30, 100, None);
         assert_eq!(cache.peek(2, 30), 0);
-        cache.insert(5, 30, 100, None);
+        cache.insert(5, 30, 30, 100, None);
         assert_eq!(cache.peek(3, 30), 0);
         assert_eq!(cache.peek(1, 30), 30);
     }
 
     #[test]
     fn largest_first_evicts_the_biggest_retained_session() {
-        let mut cache = PrefixCache::new(
-            100,
-            PrefixCachePolicy::LargestFirst,
-            TOKEN_QUANTUM,
-            NO_EXTRA_CHARGE,
-        );
-        cache.insert(1, 70, 100, None);
-        cache.insert(2, 20, 100, None);
-        cache.insert(3, 30, 100, None);
+        let mut cache = cache(100, PrefixCachePolicy::LargestFirst);
+        cache.insert(1, 70, 70, 100, None);
+        cache.insert(2, 20, 20, 100, None);
+        cache.insert(3, 30, 30, 100, None);
         assert_eq!(cache.peek(1, 70), 0);
         assert_eq!(cache.peek(2, 20), 20);
         assert_eq!(cache.peek(3, 30), 30);
@@ -541,10 +534,9 @@ mod tests {
 
     #[test]
     fn mutation_receipts_form_an_exact_occupancy_replay() {
-        let mut cache =
-            PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
-        let first_insert = cache.insert(1, 60, 100, None);
-        let second_insert = cache.insert(2, 60, 100, None);
+        let mut cache = cache(100, PrefixCachePolicy::Lru);
+        let first_insert = cache.insert(1, 60, 60, 100, None);
+        let second_insert = cache.insert(2, 60, 60, 100, None);
         let take = cache.take(2, 40);
 
         let mutations: Vec<PrefixCacheMutation> = first_insert

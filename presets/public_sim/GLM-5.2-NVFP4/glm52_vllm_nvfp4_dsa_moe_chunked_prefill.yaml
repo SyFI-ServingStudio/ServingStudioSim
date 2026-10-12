@@ -20,13 +20,13 @@ sweep:
   replicas: [1, 2]
 compound:
   server:
-    ep4_ctx8k: {ep_size: 4, max_model_len: 8192, attn_gpu_memory_gb: 37.990577664}
-    ep4_ctx64k: {ep_size: 4, max_model_len: 65536, attn_gpu_memory_gb: 37.686624768}
-    ep4_ctx128k: {ep_size: 4, max_model_len: 131072, attn_gpu_memory_gb: 37.34025984}
-    ep4_ctx256k: {ep_size: 4, max_model_len: 262144, attn_gpu_memory_gb: 35.933594112}
-    ep4_ctx512k: {ep_size: 4, max_model_len: 524288, attn_gpu_memory_gb: 32.402792448}
-    ep8_ctx8k: {ep_size: 8, max_model_len: 8192, attn_gpu_memory_gb: 95.1407908}
-    ep8_ctx64k: {ep_size: 8, max_model_len: 65536, attn_gpu_memory_gb: 93.8048118}
-    ep8_ctx128k: {ep_size: 8, max_model_len: 131072, attn_gpu_memory_gb: 93.4584468}
-    ep8_ctx256k: {ep_size: 8, max_model_len: 262144, attn_gpu_memory_gb: 91.5357681}
-    ep8_ctx512k: {ep_size: 8, max_model_len: 524288, attn_gpu_memory_gb: 88.0014321}
+    ep4_ctx8k: {ep_size: 4, max_model_len: 8192, attn_gpu_memory_gb: 32.8145472}
+    ep4_ctx64k: {ep_size: 4, max_model_len: 65536, attn_gpu_memory_gb: 32.5520064}
+    ep4_ctx128k: {ep_size: 4, max_model_len: 131072, attn_gpu_memory_gb: 32.252832}
+    ep4_ctx256k: {ep_size: 4, max_model_len: 262144, attn_gpu_memory_gb: 31.0378176}
+    ep4_ctx512k: {ep_size: 4, max_model_len: 524288, attn_gpu_memory_gb: 27.9880704}
+    ep8_ctx8k: {ep_size: 8, max_model_len: 8192, attn_gpu_memory_gb: 82.1783232}
+    ep8_ctx64k: {ep_size: 8, max_model_len: 65536, attn_gpu_memory_gb: 81.0243648}
+    ep8_ctx128k: {ep_size: 8, max_model_len: 131072, attn_gpu_memory_gb: 80.7251904}
+    ep8_ctx256k: {ep_size: 8, max_model_len: 262144, attn_gpu_memory_gb: 79.0644672}
+    ep8_ctx512k: {ep_size: 8, max_model_len: 524288, attn_gpu_memory_gb: 76.0116672}

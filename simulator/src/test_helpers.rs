@@ -1,8 +1,8 @@
 //! Test-only helpers shared across worker / orchestrator / sim unit tests.
 //! Each test module used to roll its own `FakeModel`, `test_cluster`, and
 //! request-store builders — identical bodies, copy-paste drift. Centralized
-//! here so a trait change (e.g. renaming `kv_bytes_per_token` →
-//! `total_kv_bytes_per_token`) touches one impl, not seven.
+//! here so a trait change (e.g. a new required method) touches one impl, not
+//! seven.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -72,15 +72,28 @@ pub(crate) const fn text_request(
 /// Fixed-cost stand-in for an L4 model. `eval_iter` returns `time_ms = ms`
 /// (no cost-tree, empty slot vector) and asserts the worker fed exactly one
 /// group per DP shard. `dp_groups` doubles as `gpus_per_replica` and
-/// `num_attn_dp_groups`; default `for_ms` uses `dp_groups: 1`.
+/// `num_attn_dp_groups`; default `for_ms` uses `dp_groups: 1`. The KV layout
+/// is one byte per token unless `kv_layout` says otherwise.
 pub(crate) struct FakeModel {
     pub ms: f64,
     pub dp_groups: u16,
+    pub kv_layout: Option<crate::arch::kv_layout::KvCacheLayout>,
 }
 
 impl FakeModel {
     pub fn for_ms(ms: f64) -> Self {
-        Self { ms, dp_groups: 1 }
+        Self {
+            ms,
+            dp_groups: 1,
+            kv_layout: None,
+        }
+    }
+
+    pub fn with_dp_groups(ms: f64, dp_groups: u16) -> Self {
+        Self {
+            dp_groups,
+            ..Self::for_ms(ms)
+        }
     }
 }
 
@@ -104,8 +117,11 @@ impl IterwiseUnifiedModel for FakeModel {
             backend_index: LeafMetrics::NO_BACKEND,
         }
     }
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        1
+    fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+        self.kv_layout.clone().unwrap_or_else(|| {
+            crate::arch::kv_layout::KvCacheLayout::new()
+                .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1))
+        })
     }
     fn gpus_per_replica(&self) -> u16 {
         self.dp_groups
@@ -130,8 +146,9 @@ impl AttnLayerwiseModel for FakeAttn {
     fn gpus_per_replica(&self) -> u16 {
         1
     }
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        1
+    fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+        crate::arch::kv_layout::KvCacheLayout::new()
+            .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1))
     }
     fn attn_to_ffn_bytes_per_token(&self) -> u64 {
         2

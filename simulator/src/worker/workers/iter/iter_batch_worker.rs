@@ -12,7 +12,7 @@ use crate::worker::execution::{
     IterModelExecution, SpeculativeIterExecution, UnifiedIterExecution,
 };
 use crate::worker::iter_worker::IterWorker;
-use crate::worker::kv::{FullAttnKv, HybridGdnKv, IterWorkerKv};
+use crate::worker::kv::{IterWorkerKv, KvCacheStore};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{
     BatchFsmState, IterBatchPlan, IterCursor, WorkerFsmState, WorkerStatus,
@@ -58,35 +58,27 @@ where
 /// concrete policy so the queue discipline stays a preset knob without fanning
 /// this alias — and every alias below it — out by one type per policy. The
 /// policy axis is still static: see `pending_policy_is_a_composition_axis_for_iter_lifecycles`.
-pub type BareboneWorker<M> =
-    IterBatchWorker<FullAttnKv, LocalPrefillDecodeAdmission<PendingOrder>, UnifiedIterExecution<M>>;
+pub type BareboneWorker<M> = IterBatchWorker<
+    KvCacheStore,
+    LocalPrefillDecodeAdmission<PendingOrder>,
+    UnifiedIterExecution<M>,
+>;
 /// Multi-partition HP/DP recipe uses the same whole-iteration shell.
 pub type HpUnifiedWorker<M> = BareboneWorker<M>;
 pub type ChunkedPrefillWorker<M> =
-    IterBatchWorker<FullAttnKv, ChunkedPrefillAdmission<PendingOrder>, UnifiedIterExecution<M>>;
+    IterBatchWorker<KvCacheStore, ChunkedPrefillAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 /// `ChunkedPrefillWorker` with a speculating decode engine. Two axes change
 /// together because they are two halves of one fact: the lifecycle's decode
 /// completion retires an accepted chain instead of one token, and the execution
 /// adapter submits the matching verify width to the model. KV, policy, and shell
 /// are unchanged — speculation is not a cadence.
 pub type SpeculativeWorker<M> = IterBatchWorker<
-    FullAttnKv,
+    KvCacheStore,
     ChunkedPrefillAdmission<PendingOrder, SpeculativeDecodeCompletion>,
     SpeculativeIterExecution<M>,
 >;
-/// Barebone on every axis but KV: a hybrid arch's per-request recurrent state
-/// shares the attention capacity with its per-token KV. Only the store differs.
-pub type Qwen36HybridWorker<M> = IterBatchWorker<
-    HybridGdnKv,
-    LocalPrefillDecodeAdmission<PendingOrder>,
-    UnifiedIterExecution<M>,
->;
-/// `ChunkedPrefillWorker` on every axis but KV: the hybrid store charges each
-/// request's recurrent state against the attention capacity.
-pub type HybridChunkedPrefillWorker<M> =
-    IterBatchWorker<HybridGdnKv, ChunkedPrefillAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 pub type PdPrefillWorker<M> =
-    IterBatchWorker<FullAttnKv, PrefillHandoffAdmission<PendingOrder>, UnifiedIterExecution<M>>;
+    IterBatchWorker<KvCacheStore, PrefillHandoffAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 
 impl<K, A, E> IterBatchWorker<K, A, E>
 where
@@ -260,7 +252,6 @@ mod tests {
     use crate::worker::types::{WorkerConfig, WorkerEventCommon, WorkerMsgCommon};
     use crate::worker::workers::iter::{
         build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
-        build_hybrid_chunked_prefill_worker,
     };
     use crate::worker::{BatchPolicy, DecodeRetractionPolicy, KvAdmissionConfig};
 
@@ -270,28 +261,28 @@ mod tests {
     fn pending_policy_is_a_composition_axis_for_iter_lifecycles() {
         assert_iter_worker::<
             IterBatchWorker<
-                FullAttnKv,
+                KvCacheStore,
                 LocalPrefillDecodeAdmission<FifoOrder>,
                 UnifiedIterExecution<FakeModel>,
             >,
         >();
         assert_iter_worker::<
             IterBatchWorker<
-                FullAttnKv,
+                KvCacheStore,
                 LocalPrefillDecodeAdmission<ShortestJobFirst>,
                 UnifiedIterExecution<FakeModel>,
             >,
         >();
         assert_iter_worker::<
             IterBatchWorker<
-                FullAttnKv,
+                KvCacheStore,
                 PrefillHandoffAdmission<FifoOrder>,
                 UnifiedIterExecution<FakeModel>,
             >,
         >();
         assert_iter_worker::<
             IterBatchWorker<
-                FullAttnKv,
+                KvCacheStore,
                 PrefillHandoffAdmission<ShortestJobFirst>,
                 UnifiedIterExecution<FakeModel>,
             >,
@@ -565,7 +556,7 @@ mod tests {
         build_hp_worker(
             WorkerId(0),
             "main",
-            Arc::new(FakeModel { ms: 1.0, dp_groups }),
+            Arc::new(FakeModel::with_dp_groups(1.0, dp_groups)),
             store,
             config,
             None,
@@ -705,30 +696,40 @@ mod tests {
         assert!(record.telemetry.first_output_time.is_some());
     }
 
+    /// A chunked-prefill worker over a layout with a one-byte recurrent state
+    /// on a `checkpoint_block`-token engine block, or plain per-token KV.
     fn hybrid_chunked_worker(
         store: SharedRequests,
-        chunk_end_quantum: Option<u32>,
-    ) -> HybridChunkedPrefillWorker<FakeModel> {
-        hybrid_chunked_worker_aligned(
-            store,
-            chunk_end_quantum,
-            crate::worker::config::PrefillChunkAlignment::Checkpoint,
-        )
+        checkpoint_block: Option<u32>,
+    ) -> ChunkedPrefillWorker<FakeModel> {
+        hybrid_chunked_worker_aligned(store, checkpoint_block, None)
     }
 
     fn hybrid_chunked_worker_aligned(
         store: SharedRequests,
-        chunk_end_quantum: Option<u32>,
-        prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment,
-    ) -> HybridChunkedPrefillWorker<FakeModel> {
-        build_hybrid_chunked_prefill_worker(
+        checkpoint_block: Option<u32>,
+        prefill_chunk_alignment: Option<crate::worker::config::PrefillChunkAlignment>,
+    ) -> ChunkedPrefillWorker<FakeModel> {
+        use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
+        let kv_layout = checkpoint_block.map(|block| {
+            KvCacheLayout::new()
+                .with_part(KvCachePart::per_token("kv", 1))
+                .with_part(KvCachePart::per_request("state", 1))
+                .with_engine(EngineOverhead {
+                    block_tokens: Some(block),
+                    fixed_device_bytes: 0,
+                })
+        });
+        build_chunked_prefill_worker(
             WorkerId(0),
             "main",
-            Arc::new(FakeModel::for_ms(1.0)),
+            Arc::new(FakeModel {
+                kv_layout,
+                ..FakeModel::for_ms(1.0)
+            }),
             store,
             WorkerConfig {
                 max_batch_tokens: Some(10),
-                ssm_checkpoint_interval_tokens: chunk_end_quantum,
                 prefill_chunk_alignment,
                 ..WorkerConfig::default()
             },
@@ -740,7 +741,7 @@ mod tests {
     }
 
     fn hybrid_chunk_pairs(
-        worker: &mut HybridChunkedPrefillWorker<FakeModel>,
+        worker: &mut ChunkedPrefillWorker<FakeModel>,
         now: Time,
     ) -> Vec<(u32, u32)> {
         assert!(worker.form_batch(now));
@@ -759,11 +760,6 @@ mod tests {
             now,
         );
         input.groups[0].prefill_chunk_pairs.clone()
-    }
-
-    #[test]
-    fn hybrid_chunked_prefill_is_an_iter_worker() {
-        assert_iter_worker::<HybridChunkedPrefillWorker<FakeModel>>();
     }
 
     #[test]
@@ -804,7 +800,7 @@ mod tests {
         let mut worker = hybrid_chunked_worker_aligned(
             Rc::clone(&store),
             Some(4),
-            crate::worker::config::PrefillChunkAlignment::Plain,
+            Some(crate::worker::config::PrefillChunkAlignment::Plain),
         );
         worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
         worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
@@ -833,61 +829,6 @@ mod tests {
         assert_eq!(
             hybrid_chunk_pairs(&mut worker, Time::from_ms(2.0)),
             [(0, 2)]
-        );
-    }
-
-    /// [`third_request_partition`] on the hybrid (recurrent-state) worker.
-    fn hybrid_third_request_partition(dp_placement: DpPlacement) -> (usize, usize) {
-        let store = shared_with(&[(0, 4, 500), (1, 4, 1), (2, 4, 1)]);
-        let mut worker = build_hybrid_chunked_prefill_worker(
-            WorkerId(0),
-            "main",
-            Arc::new(FakeModel {
-                ms: 1.0,
-                dp_groups: 2,
-            }),
-            store,
-            WorkerConfig {
-                max_batch_tokens: Some(64),
-                dp_placement,
-                ..WorkerConfig::default()
-            },
-            None,
-            PoolId(0),
-            "test-gpu",
-            test_cluster(),
-        );
-        let mut events = Vec::new();
-        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
-        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
-        for step in 0..20 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-        }
-        assert_eq!(events.len(), 1, "only request 1 has finished");
-        worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
-        assert!(worker.form_batch(Time::from_ms(20.0)));
-        let mut input: crate::arch::UnifiedArchInput = Default::default();
-        worker.execution.build_iteration_input(
-            &worker.kv_store,
-            &worker.context.requests,
-            &worker.batch_plan,
-            &mut input,
-        );
-        (
-            input.groups[0].prefill_chunk_pairs.len(),
-            input.groups[1].prefill_chunk_pairs.len(),
-        )
-    }
-
-    #[test]
-    fn hybrid_worker_honours_the_dp_placement() {
-        assert_eq!(
-            hybrid_third_request_partition(DpPlacement::RoundRobin),
-            (1, 0)
-        );
-        assert_eq!(
-            hybrid_third_request_partition(DpPlacement::VllmLeastLoaded),
-            (0, 1)
         );
     }
 
@@ -1197,10 +1138,7 @@ mod tests {
         let _ = build_chunked_prefill_worker(
             WorkerId(0),
             "main",
-            Arc::new(FakeModel {
-                ms: 1.0,
-                dp_groups: 2,
-            }),
+            Arc::new(FakeModel::with_dp_groups(1.0, 2)),
             shared_with(&[]),
             bounded_future_config(64, 24),
             None,
@@ -1218,10 +1156,7 @@ mod tests {
         let mut worker = build_chunked_prefill_worker(
             WorkerId(0),
             "main",
-            Arc::new(FakeModel {
-                ms: 1.0,
-                dp_groups: 2,
-            }),
+            Arc::new(FakeModel::with_dp_groups(1.0, 2)),
             store,
             WorkerConfig {
                 max_batch_tokens: Some(64),

@@ -18,12 +18,11 @@ use crate::worker::admission::{
 };
 use crate::worker::execution::SpeculativeIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::FullAttnKv;
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{IterBatchWorker, SpeculativeWorker};
 use crate::worker::workers::iter_build_essentials::{
-    full_attention_token_capacity, prepare_iter_build_essentials,
+    kv_cache_store, prepare_iter_build_essentials, resolve_kv_accounting,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -57,16 +56,8 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
     );
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let num_partitions = model.num_attn_dp_groups().max(1) as usize;
-    let kv_capacity = full_attention_token_capacity(
-        model.num_attn_shards(),
-        model.total_kv_bytes_per_token(),
-        &config,
-    );
-    let prefix_cache = config.prefix_cache.resolve_tokens(
-        kv_capacity,
-        model.total_kv_bytes_per_token(),
-        model.num_attn_shards(),
-    );
+    let kv_accounting =
+        resolve_kv_accounting(&model.kv_cache_layout(), model.num_attn_shards(), &config);
     let essentials = prepare_iter_build_essentials(
         id,
         pool_tag,
@@ -78,13 +69,14 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         &cluster,
         model.gpus_per_replica(),
         model.cost_log_manifest(),
-        kv_capacity,
+        &kv_accounting,
         num_partitions,
     );
-    let kv_store = FullAttnKv::with_prefix_cache(
+    let kv_store = kv_cache_store(
+        kv_accounting,
         num_partitions,
-        essentials.kv_capacity,
-        prefix_cache,
+        model.num_attn_shards(),
+        &config,
         essentials.sampler,
         prefix_cache_logger,
     );
@@ -160,8 +152,9 @@ mod tests {
             lm(1.0)
         }
 
-        fn total_kv_bytes_per_token(&self) -> u64 {
-            1024
+        fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+            crate::arch::kv_layout::KvCacheLayout::new()
+                .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1024))
         }
 
         fn max_model_len(&self) -> u32 {
@@ -311,8 +304,9 @@ mod tests {
                 }
                 FakeSpeculativeModel.eval_speculative_iter(batch, slots, scratch)
             }
-            fn total_kv_bytes_per_token(&self) -> u64 {
-                1024
+            fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+                crate::arch::kv_layout::KvCacheLayout::new()
+                    .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1024))
             }
             fn max_model_len(&self) -> u32 {
                 8192
@@ -361,7 +355,7 @@ mod tests {
             worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
         }
         for tick in 0..400 {
-            // `FullAttnKv::advance` asserts the store never overfills.
+            // `KvCacheStore::advance` asserts the store never overfills.
             worker.tick(Time::from_ms(tick as f64), &mut Vec::new());
         }
 
@@ -424,8 +418,9 @@ mod tests {
                 }
                 FakeSpeculativeModel.eval_speculative_iter(batch, slots, scratch)
             }
-            fn total_kv_bytes_per_token(&self) -> u64 {
-                1024
+            fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+                crate::arch::kv_layout::KvCacheLayout::new()
+                    .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1024))
             }
             fn max_model_len(&self) -> u32 {
                 8192
@@ -495,8 +490,9 @@ mod tests {
                 assert!(batch.groups.iter().all(|group| group.batch_tokens <= 8));
                 FakeSpeculativeModel.eval_speculative_iter(batch, slots, scratch)
             }
-            fn total_kv_bytes_per_token(&self) -> u64 {
-                1024
+            fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+                crate::arch::kv_layout::KvCacheLayout::new()
+                    .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1024))
             }
             fn max_model_len(&self) -> u32 {
                 8192

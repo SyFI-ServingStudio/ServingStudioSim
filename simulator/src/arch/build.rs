@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 use crate::arch::contract::SpeculativeUnifiedModel;
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
@@ -2535,6 +2536,10 @@ pub struct ArchBuild {
     pub predict: Option<PredictShape>,
     /// The cost tree, in the `cost_manifest/*.json` form; `None` on error.
     pub cost_manifest: Option<crate::timing::CostManifestDoc>,
+    /// What the arch alone fixes about its KV cache; `None` for an FFN side,
+    /// which holds none, and on error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_cache: Option<ArchKvCache>,
     /// The kernel configs the build asks profile.db for, as
     /// [`config_records_document`](crate::timing::bridge::config_records_document)
     /// builds; only when asked for, and `None` on error.
@@ -2579,9 +2584,27 @@ impl PredictShape {
     }
 }
 
+/// The arch's half of a KV report: its declared layout and how many GPUs one
+/// partition spans. Budget, `kv_overhead`, prefix caching and tokens in flight
+/// come from the worker, so the concurrency is in a run's `raw/kv_cache.json`
+/// (or `launcher <preset> --kv-report`), not here.
+#[derive(Debug, serde::Serialize)]
+pub struct ArchKvCache {
+    /// GPUs one KV partition spans; the layout's bytes are over all of them,
+    /// so divide by this for one GPU. Partitions per replica are the
+    /// prediction shape's `groups`.
+    pub attention_shards: u16,
+    pub layout: KvCacheLayout,
+}
+
 /// What a structure-only build returns: the replica width, its prediction case
-/// shape and its cost tree.
-type Built = (u16, PredictShape, crate::timing::CostManifestDoc);
+/// shape, its cost tree and its KV cache.
+type Built = (
+    u16,
+    PredictShape,
+    crate::timing::CostManifestDoc,
+    Option<ArchKvCache>,
+);
 
 /// The dotted-leaf prefix a deployment gives its model, which starts every leaf
 /// name and kernel-config role. Arch builds use the deployment's own, as
@@ -2636,6 +2659,7 @@ pub fn build_arch_blocks(blocks: &[ArchBlock], kernel_configs: bool) -> Vec<Arch
                     gpus_per_replica: None,
                     predict: None,
                     cost_manifest: None,
+                    kv_cache: None,
                     kernel_configs: None,
                     slot_configs: None,
                     error: Some(format!("no arch contract provides {tag:?}")),
@@ -2682,7 +2706,7 @@ fn build_arch(
             |selector: &IterArchSel, gpu, bridge| {
                 // A speculative arch builds a different model type, with its
                 // own tree: the verify pass plus its draft passes.
-                let (gpus, shape, manifest) = match selector {
+                let (gpus, shape, manifest, kv_cache) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
                     | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
                         let (model, draft_tokens) = build_speculative_iter_model(
@@ -2696,7 +2720,16 @@ fn build_arch(
                             max_model_len: Some(selector.max_model_len()?),
                             ..PredictShape::new("speculative_iter", model.num_attn_dp_groups())
                         };
-                        (model.gpus_per_replica(), shape, model.cost_log_manifest())
+                        let kv_cache = ArchKvCache {
+                            attention_shards: model.num_attn_shards(),
+                            layout: model.kv_cache_layout(),
+                        };
+                        (
+                            model.gpus_per_replica(),
+                            shape,
+                            model.cost_log_manifest(),
+                            kv_cache,
+                        )
                     }
                     _ => {
                         let model = build_iter_model(selector, gpu, UNIFIED_MODEL_NAME, bridge)?;
@@ -2704,13 +2737,23 @@ fn build_arch(
                             max_model_len: Some(selector.max_model_len()?),
                             ..PredictShape::new("iter", model.num_attn_dp_groups())
                         };
-                        (model.gpus_per_replica(), shape, model.cost_log_manifest())
+                        let kv_cache = ArchKvCache {
+                            attention_shards: model.num_attn_shards(),
+                            layout: model.kv_cache_layout(),
+                        };
+                        (
+                            model.gpus_per_replica(),
+                            shape,
+                            model.cost_log_manifest(),
+                            kv_cache,
+                        )
                     }
                 };
                 Ok((
                     gpus,
                     shape,
                     crate::timing::CostManifestDoc::single("iter", manifest),
+                    Some(kv_cache),
                 ))
             },
         ),
@@ -2724,7 +2767,16 @@ fn build_arch(
                     max_model_len: Some(selector.max_model_len()?),
                     ..PredictShape::new("attn", model.num_attn_dp_groups())
                 };
-                Ok((model.gpus_per_replica(), shape, model.cost_log_manifest()))
+                let kv_cache = ArchKvCache {
+                    attention_shards: model.num_attn_shards(),
+                    layout: model.kv_cache_layout(),
+                };
+                Ok((
+                    model.gpus_per_replica(),
+                    shape,
+                    model.cost_log_manifest(),
+                    Some(kv_cache),
+                ))
             },
         ),
         _ => build_selector(
@@ -2734,7 +2786,12 @@ fn build_arch(
             |selector: &FfnArchSel, gpu, bridge| {
                 let model = build_ffn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
                 let shape = PredictShape::new("ffn", model.num_dp_groups());
-                Ok((model.gpus_per_replica(), shape, model.cost_log_manifest()))
+                Ok((
+                    model.gpus_per_replica(),
+                    shape,
+                    model.cost_log_manifest(),
+                    None,
+                ))
             },
         ),
     };
@@ -2746,14 +2803,16 @@ fn build_arch(
         gpus_per_replica: None,
         predict: None,
         cost_manifest: None,
+        kv_cache: None,
         kernel_configs: None,
         slot_configs: None,
         error: None,
     };
     match built {
-        Ok(((gpus_per_replica, shape, manifest), configs)) => {
+        Ok(((gpus_per_replica, shape, manifest, kv_cache), configs)) => {
             out.gpus_per_replica = Some(gpus_per_replica);
             out.predict = Some(shape);
+            out.kv_cache = kv_cache;
             if let Some((document, slots)) = configs {
                 out.kernel_configs = Some(document);
                 out.slot_configs = Some(slots);
@@ -2898,7 +2957,7 @@ mod tests {
         let built = build_iter_model(&selector, "NVIDIA H200", "test", &bridge)
             .expect("build exact local Qwen3.6 model");
         assert_eq!(built.gpus_per_replica(), 1);
-        assert_eq!(built.total_kv_bytes_per_token(), 20_480);
+        assert_eq!(built.kv_cache_layout().per_token_bytes(), 20_480);
         assert_eq!(built.cost_log_manifest().slots.len(), 72);
     }
 
@@ -3571,7 +3630,7 @@ mod tests {
         );
         // total KV bytes: 2 (k+v) × kv_heads × head_dim × kv_dtype × layers.
         assert_eq!(
-            attn_cfgs.total_kv_bytes_per_token.get() as u64,
+            attn_cfgs.kv_bytes_per_token,
             2 * model.num_kv_heads.get() as u64
                 * model.head_dim.get() as u64
                 * model.kv_dtype.size_bytes() as u64
@@ -3617,7 +3676,7 @@ mod tests {
             q_dim * 1
         );
         assert_eq!(
-            attn_cfgs.total_kv_bytes_per_token.get() as u64,
+            attn_cfgs.kv_bytes_per_token,
             2 * model.num_kv_heads.get() as u64
                 * model.head_dim.get() as u64
                 * 1
@@ -3716,6 +3775,39 @@ mod tests {
         // 6 layers * 8 KV heads * 128 * 2 (K and V) * 1 byte, summed over the
         // four attention ranks the heads are sharded across.
         assert_eq!(narrow_bytes, 6 * 8 * 128 * 2);
+
+        // With the target's 78 latents and 21 index keys, the pool matches the
+        // fork's GLM-5.3 DFlash2 logs at 131072 tokens: "GPU KV cache size:
+        // 779,136 tokens ... 5.94x" at 36.84 GiB, 912,832 / 6.96x at 43.17.
+        use crate::arch::glm52_model_cfg::Glm52MtpMode;
+        use crate::arch::kv_layout::KvCachePart;
+        use crate::worker::kv::{KvAccounting, KvAccountingOptions};
+        let layout = crate::arch::glm52_vllm_nvfp4_dsa_moe::kv_cache_layout(4, Glm52MtpMode::Off)
+            .with_part(KvCachePart::per_token("dflash2_draft", narrow_bytes));
+        assert_eq!(
+            layout.per_token_bytes(),
+            4 * (78 * 576 + 21 * 132 + 6 * 8 * 128 * 2 / 4)
+        );
+        for (gib_per_rank, logged_tokens, logged) in
+            [(36.84, 779_136, 5.94), (43.17, 912_832, 6.96)]
+        {
+            let budget = (gib_per_rank * f64::from(1u32 << 30)) as u64 * 4;
+            let tokens = budget / layout.per_token_bytes();
+            assert!(
+                (tokens as f64 / f64::from(logged_tokens) - 1.0).abs() < 0.005,
+                "{tokens}"
+            );
+            let options = KvAccountingOptions {
+                prefix_caching: true,
+                ..Default::default()
+            };
+            let accounting = KvAccounting::resolve(&layout, options, budget).unwrap();
+            let concurrency = accounting.concurrency_at(131_072);
+            assert!(
+                (concurrency / logged - 1.0).abs() < 0.005,
+                "{concurrency} vs {logged}"
+            );
+        }
     }
 
     /// An arch block on `gpu` with `params`, its model config a `model/config/`
@@ -3854,6 +3946,49 @@ mod tests {
                 ("attn", 1, None, Some(40_960)),
                 ("iter", 4, None, Some(40_960)),
                 ("speculative_iter", 1, Some(6), Some(8192)),
+            ]
+        );
+    }
+
+    /// An attention-holding build carries the arch's KV layout and how many
+    /// GPUs one partition spans (bytes over all of them); an FFN side, none.
+    #[test]
+    fn arch_blocks_carry_their_kv_cache_layout() {
+        let mut blocks = sample_blocks();
+        blocks.push(arch_block(
+            "NVIDIA H200",
+            "qwen3_ffn_moe",
+            "qwen3_235b",
+            serde_json::json!({"ep_size": 4, "routing": "uniform"}),
+        ));
+        let built = build_arch_blocks(&blocks, false);
+        let kv: Vec<_> = built
+            .iter()
+            .map(|b| {
+                assert_eq!(b.error, None, "{}", b.arch);
+                b.kv_cache.as_ref().map(|kv| {
+                    let parts: Vec<_> = kv
+                        .layout
+                        .parts
+                        .iter()
+                        .map(|part| {
+                            let per_gpu = part.bytes_per_entry / u64::from(kv.attention_shards);
+                            (part.name, per_gpu)
+                        })
+                        .collect();
+                    (kv.attention_shards, parts)
+                })
+            })
+            .collect();
+        assert_eq!(
+            kv,
+            [
+                // GLM-5.2's MLA latent and indexer keys are held on each rank.
+                Some((4, vec![("mla", 44_928), ("indexer", 2_772)])),
+                // Qwen3-235B's 4 KV heads over attention TP4: one bf16 K and
+                // V head of 128 per GPU on 94 layers.
+                Some((4, vec![("gqa", 94 * 2 * 128 * 2)])),
+                None,
             ]
         );
     }

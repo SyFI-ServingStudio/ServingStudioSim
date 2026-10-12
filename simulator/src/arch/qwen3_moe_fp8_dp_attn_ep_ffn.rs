@@ -50,6 +50,7 @@
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::common::Fabric;
 use crate::op::gemm::{
@@ -171,8 +172,8 @@ pub struct Qwen3MoeFp8DpAttnEpFfnModel {
     pub nvl_num_gpu: u16,
     pub top_k: u32,
     pub num_experts: u32,
-    /// Symbolic KV footprint per token (folds to bytes at the worker seam).
-    pub total_kv_bytes_per_token: Dim,
+    /// Per-token KV bytes over one KV partition, for the KV cache layout.
+    pub kv_bytes_per_token: u64,
     pub attn_block: Fp8AttnBlockTpWorklet,
     pub moe_router: NativeFp8MoeRouterLocalWorklet,
     pub moe_dispatch: MoeDispatchOp,
@@ -376,16 +377,20 @@ pub fn build_configs(
     }
 }
 
-/// **Total** KV-cache bytes one token occupies — summed across all
-/// `attn_tp_size` ranks of one DP shard, all layers, all KV heads. Same
-/// definition as `llama3_dp_attn_tp_ffn`: the wire size of a token's KV for a
-/// PD handoff (each DP shard owns one full copy of every KV head).
-fn total_kv_bytes_per_token(resolved: &Qwen3MoeFp8DpAttnEpFfnResolved) -> Dim {
-    let raw = &resolved.attn_block.raw_cfg;
-    2 * raw.num_kv_heads.clone()
-        * raw.head_dim.clone()
-        * Dim::param("bytes", raw.kv_dtype().size_bytes())
-        * Dim::param("num_layers", resolved.num_layers)
+/// Per-token KV bytes of every GQA layer over one attention TP group
+/// (`2 × KV heads × head_dim × kv dtype × layers`, heads replicated when the TP
+/// degree exceeds them). Arch-specific: MLA's compressed latent or cross-layer
+/// sharing would compute it differently, so it lives in the model_arch.
+fn kv_bytes_per_token(resolved: &Qwen3MoeFp8DpAttnEpFfnResolved) -> u64 {
+    let attn = &resolved.attn_block.raw_cfg;
+    gqa_kv_bytes_per_token(
+        u64::from(resolved.num_layers),
+        u64::from(attn.num_kv_heads.get()),
+        u64::from(attn.head_dim.get()),
+        u64::from(attn.head_dim.get()),
+        u64::from(attn.kv_dtype().size_bytes()),
+        u64::from(resolved.attn_tp_size),
+    )
 }
 
 pub fn resolve_configs(cfgs: &Qwen3MoeFp8DpAttnEpFfnConfigs) -> Qwen3MoeFp8DpAttnEpFfnResolved {
@@ -427,7 +432,7 @@ pub fn build(
     let nvl_num_gpu = resolved.nvl_num_gpu;
     let top_k = resolved.top_k;
     let num_experts = resolved.num_experts;
-    let total_kv_bytes_per_token = total_kv_bytes_per_token(&resolved);
+    let kv_bytes_per_token = kv_bytes_per_token(&resolved);
 
     let embed_name = format!("{model_name}.embedding");
     let final_norm_name = format!("{model_name}.final_norm");
@@ -512,7 +517,7 @@ pub fn build(
         nvl_num_gpu,
         top_k,
         num_experts,
-        total_kv_bytes_per_token,
+        kv_bytes_per_token,
         attn_block,
         moe_router,
         moe_dispatch,
@@ -728,8 +733,8 @@ impl Qwen3MoeFp8DpAttnEpFfnModel {
 }
 
 impl IterwiseUnifiedModel for Qwen3MoeFp8DpAttnEpFfnModel {
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token.get() as u64
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        KvCacheLayout::new().with_part(KvCachePart::per_token("gqa", self.kv_bytes_per_token))
     }
 
     /// One replica spans the EP group — `ep_size` GPUs, with the DP-attention

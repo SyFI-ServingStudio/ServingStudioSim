@@ -1,4 +1,10 @@
 //! Multi-partition hard-capped chunked-prefill worker recipe.
+//!
+//! When the arch's layout keeps a resumable recurrent state and prefix caching
+//! is on, vLLM runs it in its Mamba `align` cache mode, which only checkpoints
+//! state at block boundaries and therefore ends every non-final prefill chunk
+//! on one. The lifecycle gets that block as its chunk-end quantum to match,
+//! unless the selector asks for `plain` chunking.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,12 +16,11 @@ use crate::worker::admission::{ChunkedPrefillAdmission, LoadBalance, PendingOrde
 use crate::worker::config::DpPlacement;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::FullAttnKv;
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{ChunkedPrefillWorker, IterBatchWorker};
 use crate::worker::workers::iter_build_essentials::{
-    full_attention_token_capacity, prepare_iter_build_essentials,
+    kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials, resolve_kv_accounting,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -35,15 +40,17 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         .expect("chunked-prefill worker requires max_batch_tokens");
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let num_partitions = model.num_attn_dp_groups().max(1) as usize;
-    let kv_capacity = full_attention_token_capacity(
-        model.num_attn_shards(),
-        model.total_kv_bytes_per_token(),
-        &config,
-    );
-    let prefix_cache = config.prefix_cache.resolve_tokens(
-        kv_capacity,
-        model.total_kv_bytes_per_token(),
-        model.num_attn_shards(),
+    let kv_accounting =
+        resolve_kv_accounting(&model.kv_cache_layout(), model.num_attn_shards(), &config);
+    let chunk_end_quantum = prefill_chunk_end_quantum(&kv_accounting, &config);
+    tracing::info!(
+        worker = id.0,
+        pool_tag,
+        kv_capacity_units = kv_accounting.capacity_units(),
+        kv_bytes_per_unit = kv_accounting.bytes_per_unit(),
+        chunk_end_quantum,
+        max_batch_tokens,
+        "chunked prefill KV"
     );
     let essentials = prepare_iter_build_essentials(
         id,
@@ -56,13 +63,14 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         &cluster,
         model.gpus_per_replica(),
         model.cost_log_manifest(),
-        kv_capacity,
+        &kv_accounting,
         num_partitions,
     );
-    let kv_store = FullAttnKv::with_prefix_cache(
+    let kv_store = kv_cache_store(
+        kv_accounting,
         num_partitions,
-        essentials.kv_capacity,
-        prefix_cache,
+        model.num_attn_shards(),
+        &config,
         essentials.sampler,
         prefix_cache_logger,
     );
@@ -80,6 +88,10 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         config.kv_admission,
         balance,
     );
+    let admission = match chunk_end_quantum {
+        Some(quantum) => admission.with_chunk_end_quantum(quantum),
+        None => admission,
+    };
 
     IterBatchWorker::from_components(
         essentials.context,

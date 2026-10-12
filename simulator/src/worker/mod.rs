@@ -42,19 +42,13 @@ pub use workers::afd_attention::DisaggAttnWorker;
 pub(crate) use workers::afd_ffn::build_afd_ffn_worker;
 pub use workers::afd_ffn::DisaggFfnWorker;
 pub(crate) use workers::iter::{
-    build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
-    build_hybrid_chunked_prefill_worker, build_pd_prefill_worker, build_qwen36_hybrid_worker,
+    build_barebone_worker, build_chunked_prefill_worker, build_hp_worker, build_pd_prefill_worker,
     build_speculative_worker,
 };
 pub use workers::iter::{
-    BareboneWorker, ChunkedPrefillWorker, HpUnifiedWorker, HybridChunkedPrefillWorker,
-    PdPrefillWorker, Qwen36HybridWorker, SpeculativeWorker,
+    BareboneWorker, ChunkedPrefillWorker, HpUnifiedWorker, PdPrefillWorker, SpeculativeWorker,
 };
 pub(crate) use workers::pd_decode::build_pd_decode_worker;
 pub use workers::pd_decode::PdDecodeWorker;
-pub(crate) use workers::pipeline::{
-    build_hybrid_pipeline_head_worker, build_pipeline_head_worker, build_pipeline_stage_worker,
-};
-pub use workers::pipeline::{
-    HybridPipelineHead, PipelineHead, PipelineHybridState, PipelineLayout, PipelineStage,
-};
+pub(crate) use workers::pipeline::{build_pipeline_head_worker, build_pipeline_stage_worker};
+pub use workers::pipeline::{PipelineHead, PipelineLayout, PipelineStage};
