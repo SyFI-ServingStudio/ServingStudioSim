@@ -1,0 +1,10 @@
+{
+ "schema_version": 2,
+ "rule_files": [
+  "rules.json"
+ ],
+ "note": "Forward rules pending: they come from the diverse_100 Check-1 labels of the fused all-reduce capture (Slurm job 6264, logs/20261012_1_mimo_fused_ar_nsys in wt-mimo-v2-clean) labeled against the MiMo arch's CostTree, and are added to rules.json as one order-independent set before `alignment-campaign label` runs. Families in that capture: fused MoE (FlashInfer TRT-LLM MXFP4 x BF16), GA and SWA FA4 attention (scheduler + forward + combine), FlashInfer MNNVL all-reduce + residual + RMSNorm (97 sites per iteration), FP8 per-token-group quant, DeepGEMM QKV, o_proj / lm_head, router GEMM, DiffKV cache append.",
+ "source": {
+  "capture": "logs/20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264, wt-mimo-v2-clean)"
+ }
+}

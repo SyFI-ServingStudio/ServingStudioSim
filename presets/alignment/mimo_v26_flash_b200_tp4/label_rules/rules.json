@@ -1,0 +1,15 @@
+{
+ "schema_version": 1,
+ "note": "MiMo-V2.6-Flash-RL, vLLM fork 892da082 TP4/EP4 on B200, fused all-reduce capture (Slurm job 6264). Only the arch-independent decision so far; the forward rules come from the arch's diverse_100 Check-1 labels (see manifest.json).",
+ "rules": [
+  {
+   "operation": "sample.logits.tp_allgather",
+   "name": "ncclDevKernel_AllGather_RING_LL",
+   "status": "unmapped",
+   "cross_rank": "synchronizing",
+   "phase": "sample",
+   "note": "vocab-parallel logits all-gather before sampling (the only NCCL kernel in the capture); the unified CostTree has no sampling leaf",
+   "source_experiment": "logs/20261012_1_mimo_fused_ar_nsys (Slurm job 6264)"
+  }
+ ]
+}
