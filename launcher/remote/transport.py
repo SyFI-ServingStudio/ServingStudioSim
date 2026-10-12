@@ -18,6 +18,7 @@ import json
 import shlex
 import subprocess
 import tempfile
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -134,11 +135,16 @@ class Transport:
         input: str | None = None,
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run ``script`` on the access host and capture its output."""
+        """Run ``script`` on the access host and capture its output.
 
+        A login shell's startup files may print (a module system, a greeting);
+        only what ``script`` itself prints, after a marker line, is returned.
+        """
+
+        marker = f"vibesim-remote-output-{uuid.uuid4().hex}"
         try:
             result = subprocess.run(
-                self.command_argv(script),
+                self.command_argv(f"echo {marker}; {script}"),
                 input=input,
                 capture_output=True,
                 text=True,
@@ -150,6 +156,9 @@ class Transport:
         except subprocess.TimeoutExpired as exc:
             message = f"{self.host_label}: timed out after {timeout}s: {_first_line(script)}"
             raise TransportError(message) from exc
+        _, found, after = result.stdout.partition(marker + "\n")
+        if found:
+            result.stdout = after
         if check and result.returncode != 0:
             raise TransportError(
                 f"{self.host_label}: exit {result.returncode}: {_first_line(script)}\n"

@@ -91,11 +91,14 @@ def _set_path(tree: dict, dotted: str, value) -> None:
     into lists; everything else into dicts (auto-vivifying missing dicts)."""
     parts = dotted.split(".")
     node = tree
-    for part in parts[:-1]:
+    for depth, part in enumerate(parts[:-1]):
         if isinstance(node, list):
             node = node[int(part)]
         else:
             node = node.setdefault(part, {})
+        if not isinstance(node, dict | list):
+            prefix = ".".join(parts[: depth + 1])
+            raise UsageError(f"{dotted}: {prefix} is {node!r}, not a mapping or a list")
     last = parts[-1]
     if isinstance(node, list):
         node[int(last)] = value

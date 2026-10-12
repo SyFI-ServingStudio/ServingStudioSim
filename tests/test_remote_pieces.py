@@ -316,8 +316,16 @@ def test_prune_keeps_recent_and_busy_versions_and_their_binaries(tmp_path):
     job.mkdir(parents=True)
     (job / "job.json").write_text(json.dumps({"version": "busy"}))
 
-    node.prune(tmp_path, keep=2)
+    # The caller's own version is kept however old: it is about to run.
+    node.prune(tmp_path, keep=2, protect="old", node_local=tmp_path / "node")
+    assert sorted(p.name for p in (tmp_path / "src").iterdir()) == [
+        "busy",
+        "mid",
+        "new",
+        "old",
+    ]
 
+    node.prune(tmp_path, keep=2, protect="new", node_local=tmp_path / "node")
     assert sorted(p.name for p in (tmp_path / "src").iterdir()) == ["busy", "mid", "new"]
     assert sorted(p.name for p in (tmp_path / "bin").iterdir()) == ["busy", "mid", "new"]
 
@@ -507,3 +515,41 @@ def test_a_job_database_that_does_not_come_back_is_reported_and_cleaned_up(tmp_p
     message, merged = remote_run._fold_job_db(session, "j", tmp_path)
     assert not merged and "conflict" in message
     assert held.exists()
+
+
+def test_only_the_scripts_own_output_is_parsed_after_a_chatty_login(tmp_path, monkeypatch):
+    # An HPC profile that prints on login must not corrupt a pid or a path.
+    (tmp_path / ".bash_profile").write_text("echo 'Loading modules...'\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    transport = Transport(_remote())
+    assert transport.run("echo 4242").stdout == "4242\n"
+    assert transport.read_text(PurePosixPath(tmp_path / ".bash_profile")).startswith("echo")
+
+
+def test_a_stop_before_the_job_starts_still_records_an_exit_code(tmp_path, monkeypatch):
+    import os
+    import signal
+
+    src = tmp_path / "src"
+    (src / "profiling").mkdir(parents=True)
+    (src / "profiling" / "profile.db").write_bytes(b"db")
+    jobdir = tmp_path / "job"
+    jobdir.mkdir()
+    job = {"job_id": "j", "src": str(src), "argv": [], "env": {}, "venv": sys.prefix}
+    job.update(node_local=str(tmp_path / "node"), bin_dir="")
+    (jobdir / "job.json").write_text(json.dumps(job))
+    copy = node.shutil.copy2
+
+    def copy_then_stopped(source, destination):
+        copy(source, destination)
+        os.kill(os.getpid(), signal.SIGTERM)  # `scancel` while the DB is copied
+
+    monkeypatch.setattr(node.shutil, "copy2", copy_then_stopped)
+    previous = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    try:
+        assert node.run_job(jobdir) == 128 + signal.SIGTERM
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+    assert (jobdir / "exit_code").read_text() == f"{128 + signal.SIGTERM}\n"
+    assert not (tmp_path / "node" / "vibesim-job-j").exists()

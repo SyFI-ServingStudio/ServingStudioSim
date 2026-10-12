@@ -36,7 +36,9 @@ image therefore downloads every FlashInfer cubin at build time) and get a
 temporary JSON exchange directory and a persistent JIT cache at `/cache`: one
 directory per image tag under `VIBESIM_PROFILE_CACHE_DIR` (default
 `~/.cache/vibesim-profiler`), since Torch extensions, Triton and FlashInfer
-builds link that image's libraries. `kernel-profile measure` also mounts its
+builds link that image's libraries. A use touches its directory, and an
+earlier tag's directory of the same image unused for 30 days is removed.
+`kernel-profile measure` also mounts its
 output directory so the CUPTI/NVML artifacts survive the worker; the images
 carry no matplotlib, so its plots are skipped there (`VIBESIM_PROFILE_RUNTIME=host`
 renders them). The host keeps GPU

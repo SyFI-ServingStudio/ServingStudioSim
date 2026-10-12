@@ -113,7 +113,10 @@ def _main_worktree_root(repo_root: Path) -> Path | None:
 
 def load_remote(name: str, overrides: tuple[str, ...] = (), *, path: Path | None = None) -> Remote:
     path = find_config() if path is None else path
-    document = yaml.safe_load(path.read_text("utf-8")) or {}
+    try:
+        document = yaml.safe_load(path.read_text("utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise RemoteConfigError(f"{path}: not valid YAML: {exc}") from None
     remotes = document.get("remotes") if isinstance(document, dict) else None
     if not isinstance(remotes, dict):
         raise RemoteConfigError(f"{path}: expected a top-level `remotes:` mapping")

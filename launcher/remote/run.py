@@ -155,7 +155,10 @@ class Session:
         source = collect()
         self.source = source
         src = self.layout.src(source.version)
-        shipped = self.transport.run(f"test -f {q(src / SHIPPED_MARKER)}", check=False)
+        # Touched, so `prune` counts it among the newest versions again.
+        shipped = self.transport.run(
+            f"test -f {q(src / SHIPPED_MARKER)} && touch {q(src / SHIPPED_MARKER)}", check=False
+        )
         if shipped.returncode == 0:
             _say(f"code version {source.version} already on {self.remote.name}")
             return source
@@ -182,6 +185,11 @@ class Session:
             options=options,
             input="\0".join(source.files),
         )
+        if collect().version != source.version:
+            # The copy is not the version it would be named: a file changed
+            # while it was sent (an editor, another agent in this tree).
+            self.transport.run(f"rm -rf {q(incoming)}", check=False)
+            raise RemoteRunError("the checkout changed while it was shipped; run again")
         self.transport.write_text(
             incoming / ".source-stamp.json", json.dumps(source_stamp(source), indent=2) + "\n"
         )
@@ -251,7 +259,8 @@ class Session:
         self.bin_dir = PurePosixPath(resolved)
         self.transport.run(
             f"cd {q(src)} && .venv/bin/python -m launcher.remote.node prune "
-            f"{q(self.layout.workdir)} --keep {self.remote.keep_versions}",
+            f"{q(self.layout.workdir)} --keep {self.remote.keep_versions} "
+            f"--protect {source.version} --node-local {q(self.remote.node_local)}",
             check=False,
         )
         return self.bin_dir

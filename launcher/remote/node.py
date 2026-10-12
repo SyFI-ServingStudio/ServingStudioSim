@@ -36,6 +36,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
@@ -55,8 +56,17 @@ _BUILD_EXCLUDES = ("/target", "/.venv", "/bin", "/logs")
 _BUILT_FILES = ("simulator", "analyze")
 # Overrides `.cargo/config.toml`'s `-fuse-ld=mold` (cargo reads config from env).
 _LINKER_FLAGS_ENV = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"
-# Written last when a version has been shipped completely (`run.py`).
+# Written last when a version has been shipped completely (`run.py`), and
+# touched whenever a sender uses it again: `prune` keeps the newest.
 SHIPPED_MARKER = ".shipped"
+INCOMING_MAX_AGE = 24 * 3600
+# The simulator must build; the analyzer only gates post-run analysis.
+_ANALYZER_FAILED = 3
+_BUILD_SCRIPT = (
+    "import sys; from launcher.exec import cargo_build, cargo_build_analyzer; "
+    "sys.exit(1 if not cargo_build('release', build_analyzer=False) "
+    f"else 0 if cargo_build_analyzer('release') else {_ANALYZER_FAILED})"
+)
 
 
 @contextmanager
@@ -117,18 +127,20 @@ def build(workdir: Path, version: str, node_local: Path) -> Path:
             [
                 str(build_src / ".venv" / "bin" / "python"),
                 "-c",
-                "import sys; from launcher.exec import cargo_build; "
-                "sys.exit(0 if cargo_build('release') else 1)",
+                _BUILD_SCRIPT,
             ],
             cwd=build_src,
             env=env,
             check=False,
         )
-        if compiled.returncode != 0:
+        if compiled.returncode not in (0, _ANALYZER_FAILED):
             raise SystemExit(f"[remote] {version}: build failed")
+        # A failed analyzer build leaves the last good `analyze` in the shared
+        # target; it belongs to other sources and is not collected.
+        built = _BUILT_FILES if compiled.returncode == 0 else ("simulator",)
 
         release = target / "release"
-        dep_info = [release / f"{name}.d" for name in _BUILT_FILES if (release / name).is_file()]
+        dep_info = [release / f"{name}.d" for name in built if (release / name).is_file()]
         inputs = dep_info_inputs(build_src, dep_info)
         if not any(name.endswith(".rs") for name in inputs):
             raise SystemExit(f"[remote] {version}: no Rust sources in {dep_info}; cannot pin")
@@ -138,7 +150,7 @@ def build(workdir: Path, version: str, node_local: Path) -> Path:
             staging = destination.with_name(f".{build_hash}.{os.getpid()}")
             shutil.rmtree(staging, ignore_errors=True)
             staging.mkdir(parents=True)
-            for name in (*_BUILT_FILES, "deployment_schema.json"):
+            for name in (*built, "deployment_schema.json"):
                 if (release / name).is_file():
                     shutil.copy2(release / name, staging / name)
             record_build(staging, build_src, inputs)
@@ -174,7 +186,24 @@ def _job_environment(job: dict, scratch: Path) -> dict[str, str]:
 
 def run_job(jobdir: Path) -> int:
     job = json.loads((jobdir / "job.json").read_text("utf-8"))
-    (jobdir / "pid").write_text(f"{os.getpid()}\n")
+    # A stop that arrives before the child exists is held, not lost: it would
+    # otherwise kill this process before `finally` records an exit code.
+    child: subprocess.Popen | None = None
+    stopped: list[int] = []
+
+    def forward(signum, _frame):
+        stopped.append(signum)
+        if child is not None:
+            try:
+                os.killpg(child.pid, signum)
+            except ProcessLookupError:
+                pass
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, forward)
+    pid = jobdir / "pid.tmp"
+    pid.write_text(f"{os.getpid()}\n")
+    pid.replace(jobdir / "pid")
     src = Path(job["src"])
     scratch = Path(job["node_local"]) / f"vibesim-job-{job['job_id']}"
     scratch.mkdir(parents=True, exist_ok=True)
@@ -183,6 +212,9 @@ def run_job(jobdir: Path) -> int:
         shutil.copy2(src / "profiling" / "profile.db", scratch / "profile.db")
         argv = [str(_job_venv(job) / "bin" / "python"), "-m", "launcher", *job["argv"]]
         with (jobdir / "stdout.log").open("ab") as log:
+            if stopped:
+                exit_code = 128 + stopped[0]
+                return exit_code
             child = subprocess.Popen(
                 argv,
                 cwd=src,
@@ -192,15 +224,8 @@ def run_job(jobdir: Path) -> int:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-
-            def forward(signum, _frame):
-                try:
-                    os.killpg(child.pid, signum)
-                except ProcessLookupError:
-                    pass
-
-            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-                signal.signal(signum, forward)
+            if stopped:
+                os.killpg(child.pid, stopped[0])
             exit_code = child.wait()
             if exit_code < 0:
                 exit_code = 128 - exit_code
@@ -214,13 +239,20 @@ def run_job(jobdir: Path) -> int:
     return exit_code
 
 
-def prune(workdir: Path, keep: int) -> None:
+def prune(workdir: Path, keep: int, *, protect: str, node_local: Path) -> None:
     """Delete all but the ``keep`` newest shipped versions, and orphaned binaries.
 
-    A version with an unfinished job is kept regardless. Experiments under
-    ``logs/`` are never touched.
+    ``protect`` (the caller's version) and a version with an unfinished job
+    are kept regardless. Experiments under ``logs/`` are never touched. The
+    build lock is held, so a build's new binaries are linked before they are
+    judged orphaned.
     """
 
+    with _host_lock(workdir, "build", node_local):
+        _prune(workdir, keep, protect)
+
+
+def _prune(workdir: Path, keep: int, protect: str) -> None:
     layout = Layout(PurePosixPath(workdir))
     src_root = Path(layout.workdir / "src")
     shipped = sorted(
@@ -228,7 +260,7 @@ def prune(workdir: Path, keep: int) -> None:
         key=lambda path: (path / SHIPPED_MARKER).stat().st_mtime,
         reverse=True,
     )
-    busy = set()
+    busy = {protect}
     jobs_root = Path(layout.workdir / "jobs")
     for jobdir in jobs_root.iterdir() if jobs_root.is_dir() else ():
         if not (jobdir / "exit_code").exists() and (jobdir / "job.json").is_file():
@@ -239,6 +271,12 @@ def prune(workdir: Path, keep: int) -> None:
     for path in shipped[keep:]:
         if path.name not in busy:
             print(f"[remote] pruning version {path.name}")
+            shutil.rmtree(path, ignore_errors=True)
+    # A send that failed midway leaves its `.incoming-*` tree; a live one is
+    # minutes old.
+    for path in src_root.glob(".incoming-*"):
+        if time.time() - path.stat().st_mtime > INCOMING_MAX_AGE:
+            print(f"[remote] removing an abandoned send {path.name}")
             shutil.rmtree(path, ignore_errors=True)
     in_use = {
         (path / "bin").resolve() for path in src_root.iterdir() if (path / "bin").is_symlink()
@@ -262,12 +300,14 @@ def main(argv: list[str] | None = None) -> int:
     prune_parser = commands.add_parser("prune")
     prune_parser.add_argument("workdir", type=Path)
     prune_parser.add_argument("--keep", type=int, required=True)
+    prune_parser.add_argument("--protect", required=True)
+    prune_parser.add_argument("--node-local", type=Path, default=Path("/tmp"))
     args = parser.parse_args(argv)
     if args.command == "build":
         build(args.workdir, args.version, args.node_local)
         return 0
     if args.command == "prune":
-        prune(args.workdir, args.keep)
+        prune(args.workdir, args.keep, protect=args.protect, node_local=args.node_local)
         return 0
     return run_job(args.jobdir)
 

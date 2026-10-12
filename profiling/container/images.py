@@ -27,7 +27,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 IMAGES_ENV = "VIBESIM_PROFILE_IMAGES"
@@ -77,8 +77,13 @@ def _vllm_args(root: Path) -> dict[str, str]:
 
     checkout = root / "alignment" / "profiler" / "vllm"
     first = _git(
-        checkout, "log", "--reverse", "--format=%H", "--fixed-strings",
-        "--grep=feat(alignment):", "HEAD",
+        checkout,
+        "log",
+        "--reverse",
+        "--format=%H",
+        "--fixed-strings",
+        "--grep=feat(alignment):",
+        "HEAD",
     ).splitlines()
     if not first:
         raise ImageError("cannot resolve the vLLM fork's first alignment commit")
@@ -188,6 +193,10 @@ def image_for_env(env_name: str, root: Path = REPO_ROOT) -> str | None:
     return None
 
 
+# Directory names `.dockerignore` keeps out of every build context.
+_DOCKER_IGNORED = frozenset({".git", ".venv", "__pycache__"})
+
+
 def _require_pinned_checkouts(image: Image, root: Path) -> None:
     for path in image.submodules:
         checkout = root / path
@@ -196,8 +205,20 @@ def _require_pinned_checkouts(image: Image, root: Path) -> None:
         head, pinned = _git(checkout, "rev-parse", "HEAD"), gitlink(root, path)
         if head != pinned:
             raise ImageError(f"{path} is at {head[:12]}, but the gitlink pins {pinned[:12]}")
-        if _git(checkout, "status", "--porcelain", "--untracked-files=no"):
-            raise ImageError(f"{path} has uncommitted changes; the image would not be its gitlink")
+        # Untracked and ignored files are copied in too (`.dockerignore` drops
+        # only the entries below), and would change the image under one tag.
+        listed = _git(checkout, "status", "--porcelain", "--ignored").splitlines()
+        stray = [
+            name
+            for name in (line.split(maxsplit=1)[-1] for line in listed)
+            if not _DOCKER_IGNORED.intersection(PurePosixPath(name.rstrip("/")).parts)
+            and not name.endswith(".pyc")
+        ]
+        if stray:
+            raise ImageError(
+                f"{path} differs from its gitlink (changed, untracked or ignored files: "
+                f"{', '.join(stray[:5])}); the image would not be it"
+            )
 
 
 def build(name: str, root: Path = REPO_ROOT) -> str:

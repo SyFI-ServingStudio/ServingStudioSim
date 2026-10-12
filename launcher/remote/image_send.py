@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import os
 import random
 import shutil
@@ -83,10 +84,17 @@ def local_registry() -> Iterator[int]:
         port = _free_port()
         name = f"vibesim-registry-{uuid.uuid4().hex[:8]}"
         _docker(
-            "run", "-d", "--rm", "--name", name,
-            "--user", f"{os.getuid()}:{os.getgid()}",
-            "-p", f"127.0.0.1:{port}:5000",
-            "-v", f"{store.resolve()}:/var/lib/registry",
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            name,
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "-p",
+            f"127.0.0.1:{port}:5000",
+            "-v",
+            f"{store.resolve()}:/var/lib/registry",
             REGISTRY_IMAGE,
         )
         try:
@@ -107,6 +115,17 @@ def local_registry() -> Iterator[int]:
             _docker("stop", name, check=False)
 
 
+def _pushed_digest(staged: str) -> str:
+    """The manifest digest ``staged`` was pushed under (one per registry)."""
+
+    inspected = _docker("image", "inspect", "--format", "{{json .RepoDigests}}", staged)
+    prefix = staged.rpartition(":")[0] + "@"
+    for name in json.loads(inspected.stdout):
+        if name.startswith(prefix):
+            return name.removeprefix(prefix)
+    raise ImageSendError(f"docker push {staged} recorded no digest")
+
+
 def send(transport: Transport, tag: str, *, say=print) -> None:
     """Make ``tag`` present on the remote, moving only the layers it lacks."""
 
@@ -122,11 +141,15 @@ def send(transport: Transport, tag: str, *, say=print) -> None:
             )
             if pushed.returncode != 0:
                 raise ImageSendError(f"docker push {staged} failed")
+            # Pulled by digest: the forward is open to every user of the
+            # remote host, and a digest names exactly what was pushed here.
+            digest = _pushed_digest(staged)
         finally:
             _docker("rmi", staged, check=False)
+        repository = tag.rpartition(":")[0]
         for _ in range(FORWARD_ATTEMPTS):
             remote_port = random.randint(20000, 60000)
-            pulled = f"127.0.0.1:{remote_port}/{tag}"
+            pulled = f"127.0.0.1:{remote_port}/{repository}@{digest}"
             script = (
                 f"docker pull -q {q(pulled)} >/dev/null && docker tag {q(pulled)} {q(tag)} "
                 f"&& docker rmi {q(pulled)} >/dev/null"

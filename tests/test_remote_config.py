@@ -66,11 +66,20 @@ def test_remote_set_overrides_one_field_for_this_call(remote_yaml):
         ("lanch=direct", "unknown field.*lanch"),
         ("access=ssh", "access must be `local`"),
         ("profile_runtime=podman", "profile_runtime must be"),
+        # A path through a plain value is a usage error, not a traceback.
+        ("files.mode=rsync", "files is 'shared', not a mapping"),
     ],
 )
 def test_a_malformed_remote_names_the_field(remote_yaml, override, message):
     with pytest.raises(RemoteConfigError, match=message):
         load_remote("cluster", (override,), path=remote_yaml)
+
+
+def test_a_broken_remote_yaml_is_a_config_error(tmp_path):
+    path = tmp_path / "remote.yaml"
+    path.write_text("remotes:\n  box: [unclosed\n")
+    with pytest.raises(RemoteConfigError, match="not valid YAML"):
+        load_remote("box", path=path)
 
 
 def test_an_unknown_remote_lists_the_known_ones(remote_yaml):

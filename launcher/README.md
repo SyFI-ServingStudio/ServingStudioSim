@@ -834,9 +834,13 @@ once per remote:
 
 A version whose Rust sources did not change reuses its predecessor's binaries;
 a Rust edit recompiles only this repository's crates. Builds are serialized by
-a lock on the access host. `keep_versions` (default 10) prunes older `src/`
-trees not used by an unfinished job, and binaries no tree links to; the shared
-`build/target` grows like any cargo target and can be cleaned with `cargo clean`.
+a lock on the access host. A failed analyzer build is not collected (the run
+skips post-run analysis), so a stale `analyze` never passes for the new one.
+`keep_versions` (default 10) prunes the least recently used `src/` trees other
+than the caller's and those of unfinished jobs, binaries no tree links to (under
+the build lock), and sends abandoned for a day; the shared `build/target` grows
+like any cargo target and can be cleaned with `cargo clean`. A checkout that
+changes while it is shipped fails the send rather than misname the copy.
 
 **Prebuilt binaries.** A job runs with `VIBESIM_BIN_DIR` set, which makes the
 launcher use that directory's `simulator`, `analyze` and `deployment_schema.json`

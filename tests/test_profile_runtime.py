@@ -147,3 +147,63 @@ def test_in_image_outside_an_image_says_so(tmp_path, monkeypatch):
     monkeypatch.setenv(IMAGE_MANIFEST_ENV, str(tmp_path / "absent.json"))
     with pytest.raises(FileNotFoundError, match="does not run in a profiler image"):
         resolve_profile_env("vllm_env")
+
+
+def test_an_image_builds_only_from_a_checkout_that_is_exactly_its_gitlink(tmp_path):
+    import subprocess
+
+    def git(where, *args):
+        subprocess.run(
+            ["git", "-C", str(where), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+            check=True,
+            capture_output=True,
+        )
+
+    root, checkout = tmp_path / "root", tmp_path / "root" / "sub"
+    checkout.mkdir(parents=True)
+    git(checkout, "init", "-q")
+    (checkout / ".gitignore").write_text("build/\n")
+    git(checkout, "add", ".gitignore")
+    git(checkout, "commit", "-qm", "c")
+    head = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    git(root, "init", "-q")
+    git(root, "update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+    image = images.Image(name="x", dockerfile="x", envs=("e",), submodules=("sub",))
+
+    (checkout / "__pycache__").mkdir()
+    (checkout / "__pycache__" / "m.pyc").write_bytes(b"")
+    images._require_pinned_checkouts(image, root)  # never copied into an image
+
+    # An ignored build output and an untracked file are copied in all the same.
+    for stray in ("build/_C.so", "notes.txt"):
+        (checkout / stray).parent.mkdir(exist_ok=True)
+        (checkout / stray).write_text("x")
+        with pytest.raises(images.ImageError, match="untracked or ignored"):
+            images._require_pinned_checkouts(image, root)
+        (checkout / stray).unlink()
+
+
+def test_a_superseded_image_tags_jit_cache_is_removed_once_stale(tmp_path, monkeypatch):
+    import os
+    import time
+
+    from profiling.exec import local
+
+    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path))
+    old = time.time() - local.STALE_CACHE_SECONDS - 60
+    for name in ("vibesim-profiler-vllm_old", "vibesim-profiler-vllm_recent", "other_old"):
+        (tmp_path / name).mkdir()
+    for name in ("vibesim-profiler-vllm_old", "other_old"):
+        os.utime(tmp_path / name, (old, old))
+
+    cache = local._image_cache_dir("vibesim-profiler-vllm:new")
+
+    assert cache == tmp_path / "vibesim-profiler-vllm_new"
+    # Only the same image's stale tags go; another image's cache is its own.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "other_old",
+        "vibesim-profiler-vllm_new",
+        "vibesim-profiler-vllm_recent",
+    ]
