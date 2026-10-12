@@ -59,6 +59,15 @@ from .schema.loader import (
 BATCH_PRESET_AXIS = "preset"
 
 
+def _positive_int(text: str) -> int:
+    import argparse
+
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
+
+
 def _build_argparse():
     """The launcher's argparse: positional preset paths + repeatable
     `--override key=value`. Adding a schema param needs no edit here (params come
@@ -114,6 +123,14 @@ def _build_argparse():
         action="store_true",
         help="Re-run every run, ignoring `.complete` markers (default: resume — "
         "skip runs already marked complete).",
+    )
+    parser.add_argument(
+        "--parallelism",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="Most runs of a sweep in flight at once (default: 200). Lower it when "
+        "each run needs a lot of memory.",
     )
     parser.add_argument(
         "--build-type",
@@ -769,6 +786,7 @@ def main(argv: list[str] | None = None) -> int:
         schema,
         args.build_type,
         refresh=args.refresh,
+        **({"parallelism": args.parallelism} if args.parallelism else {}),
         analyze=not args.no_analyze,
         analyze_subjects=analyze_subjects,
         plot=not args.no_plot,
