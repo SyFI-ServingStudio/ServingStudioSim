@@ -616,6 +616,11 @@ pub struct WorkerConfig {
     /// Attention-DP partition placement (from the chunked-prefill selector).
     /// Only multi-partition chunked-prefill workers read it.
     pub dp_placement: crate::worker::config::DpPlacement,
+    /// Async one-step lookahead plan offset (from the chunked-prefill
+    /// selector's `async_lookahead_us`). `Some(w)` plans each next step `w`
+    /// after the current one starts, from the messages visible by then; `None`
+    /// is the synchronous cadence. Only the chunked-prefill recipe reads it.
+    pub async_lookahead: Option<Time>,
 }
 
 impl Default for WorkerConfig {
@@ -645,6 +650,7 @@ impl Default for WorkerConfig {
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,
+            async_lookahead: None,
         }
     }
 }

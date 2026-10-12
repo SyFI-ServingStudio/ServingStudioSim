@@ -30,7 +30,7 @@ use anyhow::{bail, ensure};
 use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::arch::{Glm52MtpMode, IterArchSel};
-use crate::common::{PoolId, SharedRequests};
+use crate::common::{PoolId, SharedRequests, Time};
 use crate::deployment::UnifiedConfig;
 use crate::orchestrator::common::WorkerBuildFn;
 use crate::orchestrator::{
@@ -197,8 +197,15 @@ impl Deployment for UnifiedDeployment {
                 IterWorkerSel::ChunkedPrefill { dp_placement, .. } => *dp_placement,
                 _ => DpPlacement::RoundRobin,
             },
+            async_lookahead: async_lookahead(&g.worker),
             ..WorkerConfig::default()
         };
+        ensure!(
+            worker_config.async_lookahead.is_none()
+                || matches!(&g.arch, IterArchSel::Llama3VllmNeuron { .. }),
+            "unified: async_lookahead_us is validated only for stock vLLM Neuron \
+             (llama3_vllm_neuron)"
+        );
         g.worker
             .kv_accounting()
             .apply("unified", &mut worker_config)?;
@@ -1064,7 +1071,34 @@ fn ensure_stock_neuron_worker(
         "stock vLLM Neuron requires attn_gpu_memory_gb to be exactly its paged KV pool, \
          {pool_bytes_per_rank} bytes per rank"
     );
+    // The async plan offset is a sub-step host latency: the measured first-step
+    // offsets are 0.70-3.49 ms (alignment/neuron/data/vllm_neuron_handoff.json),
+    // far below a compiled step, so a zero or step-sized offset is a
+    // configuration error.
+    if let Some(offset) = config.async_lookahead {
+        ensure!(
+            offset > Time::ZERO && offset <= Time::from_us(MAX_STOCK_NEURON_ASYNC_LOOKAHEAD_US),
+            "stock vLLM Neuron async_lookahead_us must be in \
+             1..={MAX_STOCK_NEURON_ASYNC_LOOKAHEAD_US}"
+        );
+    }
     Ok(())
+}
+
+/// Upper bound on the stock vLLM Neuron async plan offset: above the largest
+/// measured first-step offset (3.49 ms) and below the shortest measured step
+/// (about 9.7 ms, a bucket-1 decode).
+const MAX_STOCK_NEURON_ASYNC_LOOKAHEAD_US: u64 = 5_000;
+
+/// Async one-step lookahead plan offset, carried by the `chunked_prefill`
+/// selector only. Range checks belong to the arch pairing that validated it.
+fn async_lookahead(worker: &IterWorkerSel) -> Option<Time> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill {
+            async_lookahead_us, ..
+        } => async_lookahead_us.map(|us| Time::from_us(u64::from(us))),
+        _ => None,
+    }
 }
 
 /// The chunked-prefill worker's request-count limits. Zero would stall
@@ -1286,6 +1320,7 @@ mod tests {
             dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: None,
             kv_accounting: Default::default(),
+            async_lookahead_us: None,
         }
     }
 
@@ -1328,6 +1363,47 @@ mod tests {
             mutate(&mut invalid);
             assert!(check(&sel, &invalid, &[1, 16], 1).is_err());
         }
+    }
+
+    #[test]
+    fn stock_neuron_async_lookahead_is_opt_in_and_bounded() {
+        const POOL: u64 = 7_111_442_432;
+        let mut sel = chunked_prefill_worker();
+        assert_eq!(
+            async_lookahead(&sel),
+            None,
+            "absent keeps the synchronous cadence"
+        );
+        if let IterWorkerSel::ChunkedPrefill {
+            async_lookahead_us, ..
+        } = &mut sel
+        {
+            *async_lookahead_us = Some(1040);
+        }
+        assert_eq!(async_lookahead(&sel), Some(Time::from_us(1040)));
+        assert_eq!(async_lookahead(&barebone_worker()), None);
+        let base = WorkerConfig {
+            attn_kv_bytes: POOL,
+            max_batch_tokens: Some(512),
+            max_prefill_requests_per_iteration: Some(1),
+            max_resident_requests_per_partition: Some(16),
+            batch_policy: BatchPolicy::SeparatePrefillPriority,
+            pending_order: PendingOrderKind::Fifo,
+            prefix_cache: crate::worker::kv::PrefixCacheConfig::Disabled,
+            ..WorkerConfig::default()
+        };
+        let check = |offset_us: Option<u64>| {
+            let config = WorkerConfig {
+                async_lookahead: offset_us.map(Time::from_us),
+                ..base
+            };
+            ensure_stock_neuron_worker(&sel, &config, 512, None, &[1, 16], 1, POOL)
+        };
+        assert!(check(None).is_ok());
+        assert!(check(Some(1040)).is_ok());
+        assert!(check(Some(MAX_STOCK_NEURON_ASYNC_LOOKAHEAD_US)).is_ok());
+        assert!(check(Some(0)).is_err());
+        assert!(check(Some(MAX_STOCK_NEURON_ASYNC_LOOKAHEAD_US + 1)).is_err());
     }
 
     #[test]

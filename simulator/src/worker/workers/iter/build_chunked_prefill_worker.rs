@@ -103,4 +103,5 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         admission,
         UnifiedIterExecution::new(model, essentials.cost),
     )
+    .with_async_lookahead(config.async_lookahead)
 }

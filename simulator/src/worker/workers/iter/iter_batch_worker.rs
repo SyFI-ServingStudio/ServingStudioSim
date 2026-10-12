@@ -2,6 +2,27 @@
 //!
 //! The shell owns cadence and cross-axis sequencing. KV, Admission, and Execution
 //! are statically composed; the FSM itself is deliberately not an axis.
+//!
+//! Two planning cadences share the one iteration loop:
+//!
+//! - **Synchronous (default).** Every message reaches admission when it is
+//!   enqueued, and step N+1 is formed when step N completes from everything
+//!   enqueued so far.
+//! - **Async one-step lookahead (opt-in, [`IterBatchWorker::with_async_lookahead`]).**
+//!   An engine with async scheduling plans step N+1 a fixed offset `w` after
+//!   step N starts, while N executes, treating N's scheduled work as done. Its
+//!   input queue is drained only at that plan moment. The shell models this
+//!   with [`AsyncLookahead`]: a message enqueued while a step runs waits in the
+//!   shell's engine inbox until the next plan moment, so a request that arrives
+//!   after `start + w` misses step N+1. Step N+1 still starts when N finishes
+//!   (or at the plan moment if N was shorter than `w`), and is formed after N's
+//!   completion, which is exactly "N's work treated as complete". An idle engine
+//!   polls its queue, so with no step running a message is visible at once, and
+//!   a planned-empty step makes the inbox visible immediately.
+//!
+//! The inbox is transport state, not pending membership: admission and its
+//! selection policy never see an inbox message until the plan moment delivers
+//! it, so the policy remains the sole owner of not-yet-started requests.
 
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::{
@@ -37,6 +58,20 @@ impl IterationFsm {
     }
 }
 
+/// Async-scheduling ingress: the engine input queue and the next plan moment.
+///
+/// Present only when the recipe opts in. `next_plan_at` is set when a step
+/// starts and cleared at the plan moment, when the inbox is delivered to
+/// admission. While it is set, the step's successor has not been planned yet.
+struct AsyncLookahead<M> {
+    /// Plan moment offset after a step starts.
+    offset: Time,
+    /// Messages that reached the engine while a step ran and that no plan
+    /// moment has delivered yet, in arrival order.
+    inbox: Vec<M>,
+    next_plan_at: Option<Time>,
+}
+
 pub struct IterBatchWorker<K, A, E>
 where
     K: IterWorkerKv,
@@ -50,6 +85,8 @@ where
     input: E::Input,
     batch_plan: IterBatchPlan,
     iteration_fsm: IterationFsm,
+    /// `None` is the synchronous cadence.
+    lookahead: Option<AsyncLookahead<A::Msg>>,
 }
 
 /// Compatibility name retained for L6 factories and deployment selectors.
@@ -100,12 +137,30 @@ where
             input: Default::default(),
             batch_plan: IterBatchPlan::default(),
             iteration_fsm: IterationFsm::new(),
+            lookahead: None,
         }
     }
 
+    /// Select async one-step lookahead with plan offset `offset` (`None` keeps
+    /// the synchronous cadence). See the module documentation.
+    pub(super) fn with_async_lookahead(mut self, offset: Option<Time>) -> Self {
+        self.lookahead = offset.map(|offset| AsyncLookahead {
+            offset,
+            inbox: Vec::new(),
+            next_plan_at: None,
+        });
+        self
+    }
+
     pub fn enqueue(&mut self, msg: A::Msg) {
-        self.admission
-            .accept_message(&mut self.kv_store, msg, &self.context);
+        match &mut self.lookahead {
+            Some(lookahead) if self.iteration_fsm.worker_state == WorkerFsmState::Active => {
+                lookahead.inbox.push(msg);
+            }
+            _ => self
+                .admission
+                .accept_message(&mut self.kv_store, msg, &self.context),
+        }
     }
 
     pub fn tick(&mut self, now: Time, events: &mut Vec<A::Event>) -> Option<Time> {
@@ -113,9 +168,18 @@ where
         use WorkerFsmState::{Active, Idle};
 
         loop {
+            self.plan_if_due(now);
             match self.iteration_fsm.worker_state {
                 Idle => {
+                    if self.awaiting_plan() {
+                        break;
+                    }
                     if !self.form_batch(now) {
+                        // An engine whose planned step is empty goes back to
+                        // polling its input queue, so the inbox is visible now.
+                        if self.deliver_inbox() {
+                            continue;
+                        }
                         break;
                     }
                     self.iteration_fsm.worker_state = Active;
@@ -150,6 +214,40 @@ where
         self.next_wakeup(now)
     }
 
+    /// At the plan moment, the engine drains its input queue: deliver the inbox.
+    fn plan_if_due(&mut self, now: Time) {
+        let Some(lookahead) = &mut self.lookahead else {
+            return;
+        };
+        if lookahead.next_plan_at.is_some_and(|plan_at| plan_at <= now) {
+            lookahead.next_plan_at = None;
+            self.deliver_inbox();
+        }
+    }
+
+    /// The previous step finished before its successor's plan moment.
+    fn awaiting_plan(&self) -> bool {
+        self.lookahead
+            .as_ref()
+            .is_some_and(|lookahead| lookahead.next_plan_at.is_some())
+    }
+
+    /// Hand every inbox message to admission in arrival order. Returns whether
+    /// any message was delivered.
+    fn deliver_inbox(&mut self) -> bool {
+        let Some(lookahead) = &mut self.lookahead else {
+            return false;
+        };
+        if lookahead.inbox.is_empty() {
+            return false;
+        }
+        for msg in lookahead.inbox.drain(..) {
+            self.admission
+                .accept_message(&mut self.kv_store, msg, &self.context);
+        }
+        true
+    }
+
     fn form_batch(&mut self, now: Time) -> bool {
         if !self
             .admission
@@ -173,32 +271,54 @@ where
             self.iteration_fsm.iteration as u64,
             now,
         );
+        if let Some(lookahead) = &mut self.lookahead {
+            lookahead.next_plan_at = Some(now + lookahead.offset);
+        }
         now + cost
     }
 
     fn next_wakeup(&self, now: Time) -> Option<Time> {
+        let next_plan_at = self
+            .lookahead
+            .as_ref()
+            .and_then(|lookahead| lookahead.next_plan_at);
         match self.iteration_fsm.worker_state {
             WorkerFsmState::Idle => {
+                if next_plan_at.is_some() {
+                    return next_plan_at;
+                }
                 let status = self.status();
                 (status.queued_requests > 0 || status.active_requests > 0).then_some(now)
             }
             WorkerFsmState::Active => match self.iteration_fsm.batch_state.cursor {
                 IterCursor::NotStarted | IterCursor::Done => Some(now),
-                IterCursor::Computing => Some(self.iteration_fsm.batch_state.compute_end),
+                IterCursor::Computing => {
+                    let compute_end = self.iteration_fsm.batch_state.compute_end;
+                    Some(next_plan_at.map_or(compute_end, |plan_at| plan_at.min(compute_end)))
+                }
             },
         }
     }
 
+    /// Queued counts both admission's pending requests and async-lookahead
+    /// inbox messages not yet delivered to it.
     pub fn status(&self) -> WorkerStatus {
         let active_requests = (0..self.kv_store.num_partitions() as u16)
             .map(|partition| self.kv_store.status_active(partition))
             .sum();
+        let inbox = self
+            .lookahead
+            .as_ref()
+            .map_or(0, |lookahead| lookahead.inbox.len() as u32);
         WorkerStatus {
-            queued_requests: self.admission.queued_requests(),
+            queued_requests: self.admission.queued_requests() + inbox,
             active_requests,
         }
     }
 
+    /// Cancel a pending request or release a resident one. A message still in
+    /// the async-lookahead inbox is invisible to admission and is not found;
+    /// no L6 caller cancels an iteration worker's request today.
     pub fn release_request(&mut self, request: RequestId, current_kv: u64) -> Option<u16> {
         if self.admission.cancel_pending(request) {
             return None;
@@ -1317,6 +1437,146 @@ mod tests {
             third_request_partition(DpPlacement::VllmLeastLoaded),
             (0, 1)
         );
+    }
+
+    /// Stock-Neuron-shaped chunked worker: one prefill per iteration,
+    /// separate-prefill-priority, FIFO, 1 ms iterations.
+    fn stock_shaped_worker(
+        store: SharedRequests,
+        async_lookahead: Option<Time>,
+    ) -> ChunkedPrefillWorker<FakeModel> {
+        build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            store,
+            WorkerConfig {
+                attn_kv_bytes: 256,
+                max_batch_tokens: Some(64),
+                max_prefill_requests_per_iteration: Some(1),
+                max_resident_requests_per_partition: Some(16),
+                batch_policy: BatchPolicy::SeparatePrefillPriority,
+                pending_order: crate::worker::PendingOrderKind::Fifo,
+                prefix_cache: PrefixCacheConfig::Disabled,
+                async_lookahead,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    /// Drive `worker` on a 0.1 ms clock, enqueuing each `(time_us, request)`
+    /// at the first tick at or after its time, and return each iteration's
+    /// start time (µs) and kind: `P` prefill, `D` decode.
+    fn iteration_kinds(
+        worker: &mut ChunkedPrefillWorker<FakeModel>,
+        arrivals: &[(u64, u32)],
+        until_us: u64,
+    ) -> Vec<(u64, char)> {
+        let mut kinds = Vec::new();
+        let mut events = Vec::new();
+        let mut next_arrival = 0;
+        for now_us in (0..=until_us).step_by(100) {
+            while next_arrival < arrivals.len() && arrivals[next_arrival].0 <= now_us {
+                worker.enqueue(WorkerMsgCommon::Request(RequestId(
+                    arrivals[next_arrival].1,
+                )));
+                next_arrival += 1;
+            }
+            let before = worker.iteration_fsm.iteration;
+            worker.tick(Time::from_us(now_us), &mut events);
+            if worker.iteration_fsm.iteration != before {
+                let prefill = !worker.input.groups[0].prefill_chunk_pairs.is_empty();
+                kinds.push((now_us, if prefill { 'P' } else { 'D' }));
+            }
+        }
+        kinds
+    }
+
+    fn kind_string(kinds: &[(u64, char)]) -> String {
+        kinds.iter().map(|(_, kind)| kind).collect()
+    }
+
+    #[test]
+    fn async_lookahead_runs_a_solo_decode_when_the_second_request_misses_the_plan() {
+        // Step 0 starts at 0 and plans step 1 at 0.3 ms. Request 1 reaches the
+        // engine at 0.5 ms, after that plan, so step 1 decodes request 0 alone.
+        let store = shared_with(&[(0, 4, 3), (1, 4, 3)]);
+        let mut worker = stock_shaped_worker(Rc::clone(&store), Some(Time::from_us(300)));
+        let kinds = iteration_kinds(&mut worker, &[(0, 0), (500, 1)], 10_000);
+        assert_eq!(kind_string(&kinds), "PDPDD");
+        assert_eq!(kinds[2].0, 2_000, "request 1 prefills in step 2");
+        assert!(store.borrow()[RequestId(0)].lifecycle.completed);
+        assert!(store.borrow()[RequestId(1)].lifecycle.completed);
+    }
+
+    #[test]
+    fn async_lookahead_prefills_back_to_back_when_the_second_request_beats_the_plan() {
+        let store = shared_with(&[(0, 4, 3), (1, 4, 3)]);
+        let mut worker = stock_shaped_worker(store, Some(Time::from_us(300)));
+        let kinds = iteration_kinds(&mut worker, &[(0, 0), (200, 1)], 10_000);
+        assert_eq!(kind_string(&kinds), "PPDD");
+    }
+
+    #[test]
+    fn synchronous_cadence_sees_every_arrival_before_the_step_ends() {
+        // Default: the same late arrival is visible when step 0 completes.
+        let store = shared_with(&[(0, 4, 3), (1, 4, 3)]);
+        let mut worker = stock_shaped_worker(store, None);
+        let kinds = iteration_kinds(&mut worker, &[(0, 0), (500, 1)], 10_000);
+        assert_eq!(kind_string(&kinds), "PPDD");
+    }
+
+    #[test]
+    fn async_lookahead_inbox_counts_as_queued_until_the_next_plan() {
+        let store = shared_with(&[(0, 4, 3), (1, 4, 3)]);
+        let mut worker = stock_shaped_worker(store, Some(Time::from_us(300)));
+        let mut events = Vec::new();
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        assert_eq!(
+            worker.tick(Time::ZERO, &mut events),
+            Some(Time::from_us(300))
+        );
+        assert_eq!(
+            worker.tick(Time::from_us(300), &mut events),
+            Some(Time::from_ms(1.0))
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        assert_eq!(worker.status().queued_requests, 1);
+        let admission_queued = |worker: &ChunkedPrefillWorker<FakeModel>| {
+            IterAdmission::<KvCacheStore>::queued_requests(&worker.admission)
+        };
+        assert_eq!(admission_queued(&worker), 0, "admission has not seen it");
+        // Step 1 (a solo decode) starts at 1 ms and plans step 2 at 1.3 ms.
+        assert_eq!(
+            worker.tick(Time::from_ms(1.0), &mut events),
+            Some(Time::from_us(1_300))
+        );
+        worker.tick(Time::from_us(1_300), &mut events);
+        assert_eq!(admission_queued(&worker), 1);
+    }
+
+    #[test]
+    fn async_lookahead_makes_the_inbox_visible_when_the_planned_step_is_empty() {
+        // Request 0 finishes with its prefill, so the step planned at 0.3 ms
+        // is empty: the engine polls its queue and starts request 1 at 1 ms.
+        let store = shared_with(&[(0, 4, 1), (1, 4, 2)]);
+        let mut worker = stock_shaped_worker(store, Some(Time::from_us(300)));
+        let kinds = iteration_kinds(&mut worker, &[(0, 0), (500, 1)], 10_000);
+        assert_eq!(kinds, [(0, 'P'), (1_000, 'P'), (2_000, 'D')]);
+    }
+
+    #[test]
+    fn async_lookahead_longer_than_a_step_waits_for_the_plan_moment() {
+        // Step 0 ends at 1 ms but step 1 is planned only at 1.5 ms, so a
+        // request arriving at 1.2 ms is still visible to step 1.
+        let store = shared_with(&[(0, 4, 3), (1, 4, 3)]);
+        let mut worker = stock_shaped_worker(store, Some(Time::from_us(1_500)));
+        let kinds = iteration_kinds(&mut worker, &[(0, 0), (1_200, 1)], 10_000);
+        assert_eq!(kinds[..2], [(0, 'P'), (1_500, 'P')]);
     }
 
     #[test]

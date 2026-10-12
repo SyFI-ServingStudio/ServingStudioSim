@@ -29,8 +29,8 @@ use simulator::deployment::{build_flow, check_trace, pool_bounds, RunConfig, Wor
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
 use simulator::sim::{
-    run_sim, trace_formats, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema,
-    LoadedTrace, TickCfg, TraceFrontend, TraceTag,
+    run_sim, trace_formats, ArrivalSchedule, CapacityLimit, FrontendHandoffConfig, InputFileFormat,
+    InputFileSchema, LoadedTrace, TickCfg, TraceFrontend, TraceTag,
 };
 use simulator::timing::bridge::{dry_run_document, print_dry_run, write_dry_run_report};
 use simulator::timing::PerfApiBridge;
@@ -218,8 +218,15 @@ fn load_frontend(workload: &WorkloadSpec) -> Result<TraceFrontend> {
     let input_file_schema = InputFileSchema::new(input_file_format, input_file_tags)?;
     let arrival = ArrivalSchedule::parse(&workload.arrival_mode, workload.request_rate)?;
     let capacity = CapacityLimit::parse(workload.max_concurrency.map(|n| n as usize))?;
-    LoadedTrace::load(&workload.trace_files, &input_file_schema, arrival, capacity)?
-        .into_current_text_frontend()
+    let handoff = FrontendHandoffConfig::parse(
+        workload.frontend_handoff.as_deref(),
+        workload.frontend_handoff_seed,
+    )?;
+    Ok(
+        LoadedTrace::load(&workload.trace_files, &input_file_schema, arrival, capacity)?
+            .into_current_text_frontend()?
+            .with_frontend_handoff(handoff),
+    )
 }
 
 /// Compact wall-clock log timestamp: `[MM:SS.mmm]` (UTC minute-of-hour). Drops

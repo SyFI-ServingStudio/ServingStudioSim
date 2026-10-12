@@ -453,6 +453,14 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
         prefill_chunk_alignment: Option<PrefillChunkAlignment>,
+        /// Async one-step lookahead plan offset (µs). When set, step N+1 is
+        /// planned this long after step N starts, from the requests visible by
+        /// then and treating N's work as done; it starts when N finishes. A
+        /// request arriving after the plan moment waits for the next plan.
+        /// Absent keeps the synchronous cadence. Validated only for stock
+        /// vLLM Neuron (`llama3_vllm_neuron`).
+        #[serde(default)]
+        async_lookahead_us: Option<u32>,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode and retires

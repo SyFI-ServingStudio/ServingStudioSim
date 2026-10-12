@@ -42,6 +42,16 @@ For the layer overview see `doc/detailed_design/L7.md`.
   capped replay of a recorded timeline is a real workload and a single fused
   enum could not express it.
 
+  An opt-in **frontend hand-off** (`handoff.rs`, `workload.frontend_handoff` +
+  `frontend_handoff_seed`) sits after release. It is one serial stage. A request
+  reaching it idle becomes visible after a measured ingest delay; one arriving
+  while earlier requests are still being handed off follows its predecessor
+  after a measured gap. Both delays are resampled from an embedded empirical
+  distribution (`alignment/neuron/data/vllm_neuron_handoff.json`). Draws are
+  keyed by `(seed, request id)`, so a seed is one deterministic realization.
+  The request keeps its release instant as `arrival_time`, and requests in
+  hand-off count as in flight. Absent, release emits at once, as before.
+
   Under `chained`, a session takes its slot when its head is released and holds
   it until its final round completes — **including across tool waits**, when it
   has no request in flight at all. This is why the cap cannot be served by the
