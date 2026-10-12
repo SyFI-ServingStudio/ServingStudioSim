@@ -1,6 +1,6 @@
 # Stock vLLM Neuron TP4/LNC2 across the validated context ladder. Each context
 # compiles only the decode buckets whose rows passed the unchanged vendor logit
-# check and native trace coverage; a decode batch pads to
+# check and native trace coverage (see doc/trainium2.md); a decode batch pads to
 # the smallest configured bucket. Residents = min(largest bucket, 217024 // context).
 # Full-model native device time; HTTP/host overhead is not calibrated here.
 deployment: unified
@@ -41,17 +41,17 @@ compound:
   context:
     c512:
       max_model_len: 512
-      decode_buckets: [1, 4, 8, 16, 32, 64, 128, 256, 512]
+      decode_buckets: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
       resident: 423
       trace: trace/trainium_stock_smoke.csv
     c1024:
       max_model_len: 1024
-      decode_buckets: [1, 4, 8, 16, 32, 64, 128, 256]
+      decode_buckets: [1, 2, 4, 8, 16, 32, 64, 128, 256]
       resident: 211
       trace: trace/trainium_stock_smoke_c1024.csv
     c2048:
       max_model_len: 2048
-      decode_buckets: [1, 4, 8, 16, 32, 64, 128]
+      decode_buckets: [1, 2, 4, 8, 16, 32, 64, 128]
       resident: 105
       trace: trace/trainium_stock_smoke_c2048.csv
     c4096:

@@ -60,14 +60,16 @@ that holds it, and inventories need not start at 1.
 
 | Context | Decode buckets | Resident | Prefill ms | Decode ms by bucket |
 | ---: | --- | ---: | ---: | --- |
-| 512 | 1,4,8,16,32,64,128,256,512 | 423 | 38.2 | 9.9, 12.3, 15.5, 55.3, 58.1, 114.7, 84.3, 153.3, 303.1 |
-| 1024 | 1,4,8,16,32,64,128,256 | 211 | 65.8 | 9.7, 12.3, 14.9, 38.8, 196.4, 310.6, 309.8, 615.5 |
-| 2048 | 1,4,8,16,32,64,128 | 105 | 121.1 | 10.1, 35.6, 102.3, 117.1, 106.9, 1025.0, 571.2 |
+| 512 | 1,2,4,8,16,32,64,128,256,512 | 423 | 38.2 | 9.9, 11.3, 12.3, 15.5, 55.3, 58.1, 114.7, 84.3, 153.3, 303.1 |
+| 1024 | 1,2,4,8,16,32,64,128,256 | 211 | 65.8 | 9.7, 10.9, 12.3, 14.9, 38.8, 196.4, 310.6, 309.8, 615.5 |
+| 2048 | 1,2,4,8,16,32,64,128 | 105 | 121.1 | 10.1, 22.3, 35.6, 102.3, 117.1, 106.9, 1025.0, 571.2 |
 | 4096 | 16,32 | 32 | 236.3 | 230.4, 112.2 |
 | 8192 | 1,16,32 | 26 | 489.2 | 21.6, 120.7, 1071.0 |
 
-Bucket 2 is absent everywhere because some batch-2 calls ran a decode at bucket
-1 first; C4096 B1-B8/B64 and C8192 B2-B8 fail the vendor criterion. Decode time
+Bucket 2 (11.30, 10.93 and 22.25 ms at C512, C1024 and C2048) passes only under
+the one-early-decode coverage rule, because stock async scheduling can run one
+batch-2 decode at bucket 1 first. C4096 B1-B8/B64 and C8192 B2-B8 fail the
+vendor criterion. Decode time
 is not monotonic in the bucket (C2048 B64, C8192 B32); this reproduces across
 runs and is a property of the stock compiled graphs.
 
@@ -119,8 +121,19 @@ prior `k × S` from dedicated batch-1 calls and interpolated linearly between
 measured priors; a prior beyond the largest one or off the 32-token grid is
 rejected. Decode rows are exact buckets. On the arch, `prefill_segment_size: S`
 (with `whole_forward`) costs both phases in the one `forward` slot, and the
-worker budget becomes S. No device rows are recorded yet; the decode
-inventories in `presets/*_vllm_neuron_segmented.*` are provisional.
+worker budget becomes S.
+
+C16384 at S2048 is recorded. Its vendor gate passes for the b1, b4, b8 and b13
+validation shapes through the per-position BC route (RMS ratio 1.037-1.042),
+against row-chunked eager references.
+
+| C16384/S2048 | ms |
+| --- | --- |
+| prefill at prior 0, 2048, ..., 14336 | 261.0, 279.6, 299.7, 319.8, 339.9, 360.1, 380.1, 400.2 |
+| decode b1, b4, b8, b16 | 13.51, 80.98, 151.70, 236.90 |
+
+`presets/*_vllm_neuron_segmented.*` use decode buckets `[1,4,8,16]` at C16384;
+C32768 `[1,4,8]` stays provisional until its rows are recorded.
 
 ## Alignment
 
@@ -134,29 +147,60 @@ unchanged thresholds (see the next section).
 
 ## Async scheduling and frontend hand-off (opt-in)
 
-Stock vLLM Neuron plans step N+1 about 1 ms after step N starts. If the second
-of a burst of simultaneous requests reaches EngineCore later than that, step 1
-is a solo decode of the first request. The default simulator forms each batch
-when the previous step ends, with every arrival visible, so it never runs that
-decode. `presets/unified_llama3_8b_vllm_neuron_ladder_async.yaml` enables two
-models of this race:
+Stock vLLM Neuron plans step N+1 shortly after step N starts. If the second of
+a burst of simultaneous requests reaches EngineCore later than step 1's plan,
+step 1 is a solo decode of the first request. The default simulator forms each
+batch when the previous step ends, with every arrival visible, so it never runs
+that decode. `presets/unified_llama3_8b_vllm_neuron_ladder_async.yaml` enables
+two models of this race (at a 10 us tick):
 
 - `worker.async_lookahead_us` (chunked prefill on `llama3_vllm_neuron` only,
   1..=5000): step N+1 is planned `w` after step N starts from the requests
-  visible then; later arrivals wait for the next plan. The preset uses the
-  median measured first-step offset, 1040 µs.
+  visible then; later arrivals wait for the next plan (preset 1040 us). With the
+  hand-off model also on, the step after one that started from an idle engine
+  uses a per-seed draw of the measured first-step plan offset for the context
+  (`WorkerConfig::async_lookahead_from_idle`).
 - `workload.frontend_handoff: vllm-neuron-0.24` with
-  `workload.frontend_handoff_seed`: requests become visible one at a time, the
-  first after a measured ingest delay (19-41 ms), later ones at measured gaps,
-  resampled per (seed, request id). The data and its provenance are in
-  `alignment/neuron/data/vllm_neuron_handoff.json`
-  (`alignment/neuron/vllm_handoff_distribution.py` regenerates it, preferring
-  API-server hand-off stamps when a capture has them).
+  `workload.frontend_handoff_seed`: in a burst into an idle server, request k
+  is sent at `arrival + ingest + gap_1 + ... + gap_k` and becomes visible at
+  `max(visible_{k-1}, send_k + send_to_visible_k)`. Each delay is resampled
+  from measured values per (seed, request id); `arrival_time` stays the trace
+  arrival, so TTFT includes the hand-off.
 
-Over seeds 0-49 the model runs the extra decode in 52% of bursts against 10 of
-13 (77%) measured: it reproduces the mechanism but under-predicts the rate,
-likely because frontend arrival gaps are not the unobserved engine hand-off
-gaps. With both models off, runs are bit-identical to the default cadence.
+Inputs come from 11 hand-off-stamped captures (`server.handoff_stamp: true`;
+C512 x4, C2048 x4, C8192 x3), measured and never fitted to the outcome; the
+frontend uses the largest measured context at or below the serving context
+(C1024 borrows C512, C4096 borrows C2048). `alignment/neuron/vllm_handoff_distribution.py`
+regenerates `alignment/neuron/data/vllm_neuron_handoff.json` and records which
+inputs are keyed by context (disjoint ranges) and which are pooled.
+
+| Input (ms) | C512 | C2048 | C8192 | Keyed |
+| --- | --- | --- | --- | --- |
+| ingest (first arrival to first send) | 17.7-20.6 | 19.6-20.1 | 27.2-27.3 | context |
+| first gap (send 1 - send 0) | 1.06-1.15 | 1.24-1.33 | 0.45-0.54 | context |
+| later gaps | median 0.50 | 0.56 | 0.69 | pooled |
+| send to visible (idle engine) | 0.51-0.95 | 0.52-0.73 | 0.71-0.88 | pooled |
+| first-step plan offset | 0.71-0.90 | 0.75-0.83 | 1.00-1.67 | context |
+
+Probability of the extra decode (24 steps) for the 16-request burst, seeds
+0-99 per context, with exact binomial 95% intervals:
+
+| Context | Simulated | Stamped captures | Earlier unstamped captures |
+| ---: | --- | --- | --- |
+| 512 | 0.91 (0.84-0.96) | 3/4 | 3/3 |
+| 1024 (borrows 512) | 0.91 (0.84-0.96) | — | 3/3 |
+| 2048 | 1.00 (0.96-1.00) | 4/4 | 2/4 |
+| 4096 (borrows 2048) | 1.00 (0.96-1.00) | — | — |
+| 8192 | 0.00 (0.00-0.04) | 0/3 | 2/3 |
+
+The model reproduces every stamped context, including the context dependence
+(a short first gap and a long plan offset at C8192). It is calibrated to one
+session's client spacing: the earlier unstamped session falls outside the
+simulated intervals at C2048 and C8192, and its outcomes track how far apart the
+load generator sent the first two requests. Inputs and comparison come from the
+same captures (3-4 per context), and C1024 and C4096 have none. With both
+models off, or only the lookahead on, ladder runs are bit-identical to the
+default cadence.
 
 ## Work estimates
 
@@ -177,7 +221,7 @@ missing work.
 - Region and segment rows are validated only where recorded (above); layer
   segment capture beyond small C512 buckets exceeds the 512 MB instruction
   buffer.
-- Segmented prefill has no recorded rows.
+- Segmented prefill rows exist only for C16384/S2048.
 - HTTP passes do not repeat the full-logit validation; they bind the observed
   graphs to the validated forward run.
 - Host-side overhead is calibrated only by the separate duty multiplier

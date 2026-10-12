@@ -6,7 +6,6 @@
       "max_model_len": 16384,
       "decode_buckets": [
         1,
-        2,
         4,
         8,
         16

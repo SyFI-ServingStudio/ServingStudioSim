@@ -50,12 +50,12 @@ compound:
     c16384:
       max_model_len: 16384
       segment: 2048
-      decode_buckets: [1, 2, 4, 8, 16]
+      decode_buckets: [1, 4, 8, 16]
       resident: 13
       trace: trace/trainium_stock_segprefill_smoke_c16384.csv
     c32768:
       max_model_len: 32768
       segment: 2048
-      decode_buckets: [1, 2, 4, 8]
+      decode_buckets: [1, 4, 8]
       resident: 6
       trace: trace/trainium_stock_segprefill_smoke_c32768.csv
