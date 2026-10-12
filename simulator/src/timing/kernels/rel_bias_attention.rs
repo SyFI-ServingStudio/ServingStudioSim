@@ -196,8 +196,8 @@ impl Fa4VarlenCall for RelBiasAttentionKernelConfig {
         self.is_local.then_some(self.rel_extent)
     }
 
-    fn decode_axis(&self) -> &'static [u32] {
-        &DECODE_AXIS
+    fn decode_axis(&self) -> Vec<u32> {
+        DECODE_AXIS.to_vec()
     }
 
     /// One window past the window, a local layer's work is flat, so that is

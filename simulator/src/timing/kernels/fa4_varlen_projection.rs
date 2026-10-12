@@ -68,7 +68,7 @@ pub(crate) trait Fa4VarlenCall {
     /// for full causal attention.
     fn window(&self) -> Option<u32>;
     /// Decode-request counts on the grid.
-    fn decode_axis(&self) -> &'static [u32];
+    fn decode_axis(&self) -> Vec<u32>;
     /// The top of the context axis, where the longest batch lands.
     fn context_top(&self) -> u32;
     /// The cache coordinate of `prefill` query tokens.
@@ -77,6 +77,14 @@ pub(crate) trait Fa4VarlenCall {
     /// size when this step runs from a FULL CUDA graph (padding slots are
     /// zero-length requests that add no CTA work).
     fn launched_requests(&self, pairs: &[(u32, u32)], padded_requests: u32) -> u32;
+    /// Contexts after which the canonical batch's modelled makespan drops (a
+    /// split count switching on with the context): the inversion takes the
+    /// first segment between them that reaches the target. Empty where the
+    /// model is monotone in the context.
+    fn context_breaks(&self, _decodes: u32, _prefill: u32) -> Vec<u32> {
+        Vec::new()
+    }
+
     /// The tile shape and per-request split counts of a launch over `pairs`
     /// padded to `launched` requests.
     fn tiling(&self, pairs: &[(u32, u32)], launched: u32) -> VarlenTiling;
@@ -255,13 +263,39 @@ fn equivalent_context<C: Fa4VarlenCall>(
         let t = context - lo;
         canonical(lo) * (1.0 - t) + canonical(lo + 1.0) * t
     };
-    let (mut lo, mut hi) = (1.0_f64, f64::from(call.context_top()));
+    let mut lo = 1.0_f64;
     if target <= model(lo) {
         return lo;
     }
-    if target >= model(hi) {
-        return hi;
+    // The first segment between breaks (or the whole axis) whose end reaches
+    // the target; the model is monotone inside each segment. A segment that
+    // ends flat at the target is searched for where it reaches it; at the
+    // axis top a batch as long as that, or longer, takes the top.
+    let top = call.context_top();
+    let mut ends: Vec<u32> = call
+        .context_breaks(decodes, prefill)
+        .into_iter()
+        .filter(|&end| end > 1 && end < top)
+        .collect();
+    ends.sort_unstable();
+    ends.push(top);
+    let mut reached = None;
+    for end in ends {
+        let reaches = if end == top {
+            model(f64::from(end)) > target
+        } else {
+            model(f64::from(end)) >= target
+        };
+        let end = f64::from(end);
+        if reaches {
+            reached = Some(end);
+            break;
+        }
+        lo = end;
     }
+    let Some(mut hi) = reached else {
+        return f64::from(top);
+    };
     for _ in 0..BISECTION_STEPS {
         let mid = 0.5 * (lo + hi);
         if model(mid) < target {
