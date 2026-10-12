@@ -2,20 +2,35 @@
 //! TP4 over the four LNC2 cores of one Trainium2 chip.
 //!
 //! The engine runs every layer, its collectives and greedy sampling inside one
-//! compiled executable, and the arch costs it as that one measured leaf
-//! (`neuron_llama_forward`, slot `<name>.forward`): its time already spans all
-//! ranks. The engine compiles one prefill graph of the whole context and one
-//! decode graph per configured bucket (`decode_buckets`, an explicit inventory,
-//! not vLLM Neuron's default one). This arch lowers each iteration's logical
-//! batch onto those graphs: a prefill must be one prefix-free prompt alone, and
-//! a decode-only batch pads to the smallest bucket that holds it. The stock
-//! scheduler that only forms such batches is the L6 pairing
-//! (`deployment/unified.rs`, `ensure_stock_neuron_worker`).
+//! compiled executable, and by default (`composition: whole_forward`) the arch
+//! costs it as that one measured leaf (`neuron_llama_forward`, slot
+//! `<name>.forward`): its time already spans all ranks. The engine compiles one
+//! prefill graph of the whole context and one decode graph per configured
+//! bucket (`decode_buckets`, an explicit inventory, not vLLM Neuron's default
+//! one). This arch lowers each iteration's logical batch onto those graphs: a
+//! prefill must be one prefix-free prompt alone, and a decode-only batch pads
+//! to the smallest bucket that holds it. The stock scheduler that only forms
+//! such batches is the L6 pairing (`deployment/unified.rs`,
+//! `ensure_stock_neuron_worker`).
+//!
+//! Two experimental compositions cost the same executables in finer slots:
+//! `model_head_regions` sums the stock operations compiled as two executables
+//! split at the `LlamaModel` return (`neuron_llama_region`: model, then head),
+//! and `layer_segments` cuts the unchanged executable's native timeline at the
+//! sublayer-closing collectives (`neuron_llama_segment`: embedding, a 32-layer
+//! fold of attention and MLP blocks, then head).
+//!
+//! With `prefill_segment_size = S` the engine compiles one S-token prefill
+//! graph (`max_num_batched_tokens = S`) instead of the whole-context one. A
+//! prompt then runs as one call per S-token chunk, each attending the chunk's
+//! cached prefix; both phases cost through `neuron_llama_segmented_forward`,
+//! still in the one `forward` slot.
 
 use std::sync::Arc;
 
 use anyhow::{ensure, Result};
 
+use crate::arch::config::VllmNeuronComposition;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
 use crate::arch::model_cfg::ModelCfg;
@@ -27,7 +42,11 @@ use crate::timing::kernels::neuron_llama_forward::{
 };
 use crate::timing::kernels::{
     NeuronLlamaForwardKernel, NeuronLlamaForwardKernelConfig, NeuronLlamaForwardKernelInput,
-    NeuronLlamaForwardPhase, NeuronLlamaForwardSpec,
+    NeuronLlamaForwardPhase, NeuronLlamaForwardSpec, NeuronLlamaRegion, NeuronLlamaRegionKernel,
+    NeuronLlamaRegionKernelConfig, NeuronLlamaRegionKernelInput, NeuronLlamaSegment,
+    NeuronLlamaSegmentKernel, NeuronLlamaSegmentKernelConfig, NeuronLlamaSegmentKernelInput,
+    NeuronLlamaSegmentedForwardKernel, NeuronLlamaSegmentedForwardKernelConfig,
+    NeuronLlamaSegmentedForwardKernelInput, NeuronLlamaSegmentedForwardSpec,
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
@@ -40,24 +59,53 @@ pub struct VllmNeuronParallel {
     pub max_model_len: u32,
     pub decode_buckets: Vec<u32>,
     pub tp_size: u16,
+    pub composition: VllmNeuronComposition,
+    /// Compiled prefill segment S; `None` keeps the whole-context prefill graph.
+    pub prefill_segment_size: Option<u32>,
 }
 
-/// The one measured leaf's kernel config, plus the KV one token adds over the
-/// four ranks (32 layers x 8 KV heads x (K + V) x 128 x BF16).
+/// The whole-forward kernel config (the runtime identity every composition
+/// shares), the selected composition, the segmented-prefill config when the
+/// prefill is segmented (it then replaces `forward`), and the KV one token adds
+/// over the four ranks (32 layers x 8 KV heads x (K + V) x 128 x BF16).
 pub struct Llama3VllmNeuronConfigs {
     pub forward: NeuronLlamaForwardKernelConfig,
+    pub composition: VllmNeuronComposition,
+    pub segmented: Option<NeuronLlamaSegmentedForwardKernelConfig>,
     pub kv_bytes_per_token: u64,
 }
 
-/// An atomic op passes its kernel config straight through.
+/// Atomic ops pass their kernel configs straight through.
 pub type Llama3VllmNeuronResolved = Llama3VllmNeuronConfigs;
+
+/// The measured executables one iteration runs, in execution order.
+pub enum VllmNeuronLeaves {
+    WholeForward(Op<NeuronLlamaForwardKernel>),
+    /// One call per prefill segment or decode step, in the same `forward` slot.
+    SegmentedForward(Op<NeuronLlamaSegmentedForwardKernel>),
+    ModelHeadRegions {
+        model: Op<NeuronLlamaRegionKernel>,
+        head: Op<NeuronLlamaRegionKernel>,
+    },
+    LayerSegments {
+        embedding: Op<NeuronLlamaSegmentKernel>,
+        attention: Op<NeuronLlamaSegmentKernel>,
+        mlp: Op<NeuronLlamaSegmentKernel>,
+        head: Op<NeuronLlamaSegmentKernel>,
+    },
+}
+
+/// The validated model's layer count; `validate_model` pins it.
+const NUM_LAYERS: u32 = 32;
 
 pub struct Llama3VllmNeuronModel {
     pub name: String,
     pub max_model_len: u32,
     pub decode_buckets: Vec<u32>,
     pub tp_size: u16,
-    pub forward: Op<NeuronLlamaForwardKernel>,
+    pub leaves: VllmNeuronLeaves,
+    /// Segment geometry when prefill is segmented: (S, largest measured prior).
+    segmented: Option<(u32, u32)>,
     kv_bytes_per_token: u64,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
@@ -105,17 +153,23 @@ pub fn validate_checkpoint_math(raw: &serde_json::Value) -> Result<()> {
 }
 
 pub fn build_configs(model: &ModelCfg, parallel: &VllmNeuronParallel) -> Llama3VllmNeuronConfigs {
+    let forward = NeuronLlamaForwardKernelConfig {
+        backends: vec!["vllm_neuron"],
+        gpu_name: parallel.gpu_name.clone(),
+        max_model_len: Dim::param("max_model_len", parallel.max_model_len),
+        kv_blocks: Dim::param("kv_blocks", STOCK_KV_BLOCKS),
+        block_size: Dim::param("block_size", STOCK_BLOCK_SIZE),
+        tp_size: Dim::param("tp_size", u32::from(parallel.tp_size)),
+        dtype: model.dtype,
+        decode_buckets: parallel.decode_buckets.clone(),
+    };
+    let segmented = parallel
+        .prefill_segment_size
+        .map(|segment| segmented_config(&forward, segment));
     Llama3VllmNeuronConfigs {
-        forward: NeuronLlamaForwardKernelConfig {
-            backends: vec!["vllm_neuron"],
-            gpu_name: parallel.gpu_name.clone(),
-            max_model_len: Dim::param("max_model_len", parallel.max_model_len),
-            kv_blocks: Dim::param("kv_blocks", STOCK_KV_BLOCKS),
-            block_size: Dim::param("block_size", STOCK_BLOCK_SIZE),
-            tp_size: Dim::param("tp_size", u32::from(parallel.tp_size)),
-            dtype: model.dtype,
-            decode_buckets: parallel.decode_buckets.clone(),
-        },
+        forward,
+        composition: parallel.composition,
+        segmented,
         kv_bytes_per_token: gqa_kv_bytes_per_token(
             u64::from(model.num_layers),
             u64::from(model.num_kv_heads.get()),
@@ -130,8 +184,109 @@ pub fn build_configs(model: &ModelCfg, parallel: &VllmNeuronParallel) -> Llama3V
 pub fn resolve_configs(cfgs: &Llama3VllmNeuronConfigs) -> Llama3VllmNeuronResolved {
     Llama3VllmNeuronConfigs {
         forward: cfgs.forward.clone(),
+        composition: cfgs.composition,
+        segmented: cfgs.segmented.clone(),
         kv_bytes_per_token: cfgs.kv_bytes_per_token,
     }
+}
+
+/// The segmented forward shares the whole forward's runtime identity and
+/// decode inventory; only its prefill graph and context list differ.
+pub fn segmented_config(
+    forward: &NeuronLlamaForwardKernelConfig,
+    segment: u32,
+) -> NeuronLlamaSegmentedForwardKernelConfig {
+    NeuronLlamaSegmentedForwardKernelConfig {
+        backends: vec!["vllm_neuron_segmented"],
+        gpu_name: forward.gpu_name.clone(),
+        max_model_len: forward.max_model_len.clone(),
+        kv_blocks: forward.kv_blocks.clone(),
+        block_size: forward.block_size.clone(),
+        tp_size: forward.tp_size.clone(),
+        dtype: forward.dtype,
+        segment_size: Dim::param("prefill_segment_size", segment),
+        decode_buckets: forward.decode_buckets.clone(),
+    }
+}
+
+/// A region shares the whole forward's compiled inventory and runtime identity.
+pub fn region_config(
+    forward: &NeuronLlamaForwardKernelConfig,
+    region: NeuronLlamaRegion,
+) -> NeuronLlamaRegionKernelConfig {
+    NeuronLlamaRegionKernelConfig {
+        backends: vec!["vllm_neuron_fx_regions"],
+        gpu_name: forward.gpu_name.clone(),
+        region,
+        max_model_len: forward.max_model_len.clone(),
+        kv_blocks: forward.kv_blocks.clone(),
+        block_size: forward.block_size.clone(),
+        tp_size: forward.tp_size.clone(),
+        dtype: forward.dtype,
+        decode_buckets: forward.decode_buckets.clone(),
+    }
+}
+
+/// A segment shares the whole forward's compiled inventory and runtime identity.
+pub fn segment_config(
+    forward: &NeuronLlamaForwardKernelConfig,
+    segment: NeuronLlamaSegment,
+) -> NeuronLlamaSegmentKernelConfig {
+    NeuronLlamaSegmentKernelConfig {
+        backends: vec!["vllm_neuron_collective_segments"],
+        gpu_name: forward.gpu_name.clone(),
+        segment,
+        max_model_len: forward.max_model_len.clone(),
+        kv_blocks: forward.kv_blocks.clone(),
+        block_size: forward.block_size.clone(),
+        tp_size: forward.tp_size.clone(),
+        dtype: forward.dtype,
+        decode_buckets: forward.decode_buckets.clone(),
+    }
+}
+
+/// Validate the executable the selected composition actually costs: the
+/// segmented leaf when prefill is segmented (only under `whole_forward`), else
+/// the whole forward, whose rules the region and segment kinds share.
+pub fn validate_selected(
+    forward: &NeuronLlamaForwardKernelConfig,
+    composition: VllmNeuronComposition,
+    segmented: Option<&NeuronLlamaSegmentedForwardKernelConfig>,
+) -> Result<()> {
+    match segmented {
+        None => NeuronLlamaForwardSpec::validate_config(forward),
+        Some(cfg) => {
+            ensure!(
+                composition == VllmNeuronComposition::WholeForward,
+                "segmented prefill (prefill_segment_size) requires composition whole_forward"
+            );
+            NeuronLlamaSegmentedForwardSpec::validate_config(cfg)
+        }
+    }
+}
+
+fn region_op(
+    name: &str,
+    forward: &NeuronLlamaForwardKernelConfig,
+    region: NeuronLlamaRegion,
+    bridge: &PerfApiBridge,
+) -> Result<Op<NeuronLlamaRegionKernel>, BuildError> {
+    let slot = format!("{name}.{}", region.as_str());
+    let kernel =
+        NeuronLlamaRegionKernel::build(slot.clone(), region_config(forward, region), bridge)?;
+    Ok(Op::new(slot, Arc::new(kernel)))
+}
+
+fn segment_op(
+    name: &str,
+    forward: &NeuronLlamaForwardKernelConfig,
+    segment: NeuronLlamaSegment,
+    bridge: &PerfApiBridge,
+) -> Result<Op<NeuronLlamaSegmentKernel>, BuildError> {
+    let slot = format!("{name}.{}", segment.as_str());
+    let kernel =
+        NeuronLlamaSegmentKernel::build(slot.clone(), segment_config(forward, segment), bridge)?;
+    Ok(Op::new(slot, Arc::new(kernel)))
 }
 
 pub fn build(
@@ -139,21 +294,62 @@ pub fn build(
     resolved: Llama3VllmNeuronResolved,
     bridge: &PerfApiBridge,
 ) -> Result<Llama3VllmNeuronModel, BuildError> {
-    let forward = resolved.forward;
-    NeuronLlamaForwardSpec::validate_config(&forward).map_err(|e| BuildError::FitFailed {
-        kind: NeuronLlamaForwardSpec::KIND,
+    validate_selected(
+        &resolved.forward,
+        resolved.composition,
+        resolved.segmented.as_ref(),
+    )
+    .map_err(|e| BuildError::FitFailed {
+        kind: if resolved.segmented.is_some() {
+            NeuronLlamaSegmentedForwardSpec::KIND
+        } else {
+            NeuronLlamaForwardSpec::KIND
+        },
         reason: e.to_string(),
     })?;
-    let tp_size = forward.tp_size.get() as u16;
-    let slot = format!("{name}.forward");
+    let segmented = resolved
+        .segmented
+        .as_ref()
+        .map(|cfg| (cfg.segment_size.get(), cfg.largest_prior()));
+    let leaves = match (resolved.composition, resolved.segmented) {
+        (_, Some(cfg)) => {
+            let slot = format!("{name}.forward");
+            VllmNeuronLeaves::SegmentedForward(Op::new(
+                slot.clone(),
+                Arc::new(NeuronLlamaSegmentedForwardKernel::build(slot, cfg, bridge)?),
+            ))
+        }
+        (VllmNeuronComposition::WholeForward, None) => {
+            let slot = format!("{name}.forward");
+            VllmNeuronLeaves::WholeForward(Op::new(
+                slot.clone(),
+                Arc::new(NeuronLlamaForwardKernel::build(
+                    slot,
+                    resolved.forward.clone(),
+                    bridge,
+                )?),
+            ))
+        }
+        (VllmNeuronComposition::ModelHeadRegions, None) => VllmNeuronLeaves::ModelHeadRegions {
+            model: region_op(&name, &resolved.forward, NeuronLlamaRegion::Model, bridge)?,
+            head: region_op(&name, &resolved.forward, NeuronLlamaRegion::Head, bridge)?,
+        },
+        (VllmNeuronComposition::LayerSegments, None) => {
+            let op = |segment| segment_op(&name, &resolved.forward, segment, bridge);
+            VllmNeuronLeaves::LayerSegments {
+                embedding: op(NeuronLlamaSegment::Embedding)?,
+                attention: op(NeuronLlamaSegment::AttentionBlock)?,
+                mlp: op(NeuronLlamaSegment::MlpBlock)?,
+                head: op(NeuronLlamaSegment::Head)?,
+            }
+        }
+    };
     let mut model = Llama3VllmNeuronModel {
-        max_model_len: forward.max_model_len.get(),
-        decode_buckets: forward.decode_buckets.clone(),
-        tp_size,
-        forward: Op::new(
-            slot.clone(),
-            Arc::new(NeuronLlamaForwardKernel::build(slot, forward, bridge)?),
-        ),
+        max_model_len: resolved.forward.max_model_len.get(),
+        decode_buckets: resolved.forward.decode_buckets.clone(),
+        tp_size: resolved.forward.tp_size.get() as u16,
+        leaves,
+        segmented,
         kv_bytes_per_token: resolved.kv_bytes_per_token,
         name,
         cost_flat: Vec::new(),
@@ -229,29 +425,142 @@ fn lower_decode(g: &ArchGroupInput, context: u32, buckets: &[u32]) -> Result<u32
         .ok_or_else(|| "vLLM Neuron decode exceeds the largest configured bucket".into())
 }
 
+/// Segmented prefill: one request's chunk of at most S tokens, whose cached
+/// prefix is block-aligned and within the measured prior range, runs the
+/// S-token graph at that prior. Decode lowers as in the whole-context engine.
+fn lower_segmented_input(
+    batch: &UnifiedArchInput,
+    context: u32,
+    buckets: &[u32],
+    (segment, largest_prior): (u32, u32),
+) -> Result<NeuronLlamaSegmentedForwardKernelInput, String> {
+    if batch.groups.len() != 1 || !batch.tokens_per_source_rank.is_empty() {
+        return Err("vLLM Neuron requires exactly one group and no source-rank routing".into());
+    }
+    let g = &batch.groups[0];
+    if let [(prefix, q)] = g.prefill_chunk_pairs.as_slice() {
+        if (1..=segment).contains(q)
+            && prefix % STOCK_BLOCK_SIZE == 0
+            && *prefix <= largest_prior
+            && prefix + q <= context
+            && g.decode_kv_lens.is_empty()
+            && g.decode_tokens == 0
+            && g.prefill_tokens == *q
+            && g.batch_tokens == *q
+        {
+            return Ok(NeuronLlamaSegmentedForwardKernelInput {
+                phase: NeuronLlamaForwardPhase::Prefill,
+                token_bucket: segment,
+                prior_tokens: *prefix,
+            });
+        }
+        return Err(format!(
+            "vLLM Neuron segmented prefill requires one chunk of at most {segment} tokens, a \
+             {STOCK_BLOCK_SIZE}-aligned prefix within the measured {largest_prior}-token prior \
+             range, and no decodes"
+        ));
+    }
+    Ok(NeuronLlamaSegmentedForwardKernelInput {
+        phase: NeuronLlamaForwardPhase::Decode,
+        token_bucket: lower_decode(g, context, buckets)?,
+        prior_tokens: 0,
+    })
+}
+
 impl Llama3VllmNeuronModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
-        let forward = self.forward.compile(&mut b);
-        b.finish(CostNode::Labeled {
-            label: format!(
-                "{} [stock vLLM Neuron; full 32 layers, TP4/LNC2]",
-                self.name
+        let (detail, child) = match &self.leaves {
+            VllmNeuronLeaves::WholeForward(forward) => ("full 32 layers", forward.compile(&mut b)),
+            VllmNeuronLeaves::SegmentedForward(forward) => {
+                ("full 32 layers, segmented prefill", forward.compile(&mut b))
+            }
+            VllmNeuronLeaves::ModelHeadRegions { model, head } => (
+                "model then head regions",
+                CostNode::Sum(vec![model.compile(&mut b), head.compile(&mut b)]),
             ),
-            child: Box::new(forward),
+            VllmNeuronLeaves::LayerSegments {
+                embedding,
+                attention,
+                mlp,
+                head,
+            } => {
+                let embedding = embedding.compile(&mut b);
+                let layer = CostNode::Labeled {
+                    label: "layer".to_string(),
+                    child: Box::new(CostNode::Scale {
+                        n: NUM_LAYERS,
+                        child: Box::new(CostNode::Sum(vec![
+                            attention.compile(&mut b),
+                            mlp.compile(&mut b),
+                        ])),
+                    }),
+                };
+                let head = head.compile(&mut b);
+                (
+                    "collective-delimited embedding, 32 layers and head",
+                    CostNode::Sum(vec![embedding, layer, head]),
+                )
+            }
+        };
+        b.finish(CostNode::Labeled {
+            label: format!("{} [stock vLLM Neuron; {detail}, TP4/LNC2]", self.name),
+            child: Box::new(child),
         })
     }
 
     fn eval_into(&self, batch: &UnifiedArchInput, ev: &mut Evaluator) {
+        if let (VllmNeuronLeaves::SegmentedForward(forward), Some(geometry)) =
+            (&self.leaves, self.segmented)
+        {
+            let input =
+                lower_segmented_input(batch, self.max_model_len, &self.decode_buckets, geometry)
+                    .expect("unsupported vLLM Neuron segmented iteration");
+            forward.eval(&input, ev);
+            return;
+        }
         let input = lower_input(batch, self.max_model_len, &self.decode_buckets)
             .expect("unsupported vLLM Neuron iteration");
-        self.forward.eval(&input, ev);
+        match &self.leaves {
+            VllmNeuronLeaves::WholeForward(forward) => forward.eval(&input, ev),
+            VllmNeuronLeaves::SegmentedForward(_) => {
+                unreachable!("segmented leaf without segment geometry")
+            }
+            VllmNeuronLeaves::ModelHeadRegions { model, head } => {
+                let region_input = NeuronLlamaRegionKernelInput {
+                    phase: input.phase,
+                    token_bucket: input.token_bucket,
+                };
+                model.eval(&region_input, ev);
+                head.eval(&region_input, ev);
+            }
+            VllmNeuronLeaves::LayerSegments {
+                embedding,
+                attention,
+                mlp,
+                head,
+            } => {
+                let segment_input = NeuronLlamaSegmentKernelInput {
+                    phase: input.phase,
+                    token_bucket: input.token_bucket,
+                };
+                for op in [embedding, attention, mlp, head] {
+                    op.eval(&segment_input, ev);
+                }
+            }
+        }
     }
 }
 
 impl IterwiseUnifiedModel for Llama3VllmNeuronModel {
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
-        lower_input(batch, self.max_model_len, &self.decode_buckets).map(|_| ())
+        match self.segmented {
+            Some(geometry) => {
+                lower_segmented_input(batch, self.max_model_len, &self.decode_buckets, geometry)
+                    .map(|_| ())
+            }
+            None => lower_input(batch, self.max_model_len, &self.decode_buckets).map(|_| ()),
+        }
     }
 
     fn kv_cache_layout(&self) -> KvCacheLayout {
@@ -379,6 +688,8 @@ mod tests {
             max_model_len: 512,
             decode_buckets: vec![1, 16],
             tp_size: 4,
+            composition: VllmNeuronComposition::WholeForward,
+            prefill_segment_size: None,
         };
         let resolved = resolve_configs(&build_configs(&model, &parallel));
         assert_eq!(resolved.kv_bytes_per_token, 131_072);
@@ -416,5 +727,199 @@ mod tests {
             changed[key] = value;
             assert!(validate_checkpoint_math(&changed).is_err(), "{key}");
         }
+    }
+
+    #[test]
+    fn regions_share_the_whole_forward_inventory() {
+        use crate::timing::kernels::NeuronLlamaRegionSpec;
+        let parallel = VllmNeuronParallel {
+            gpu_name: "AWS Trainium2 LNC2".into(),
+            max_model_len: 512,
+            decode_buckets: vec![1, 16],
+            tp_size: 4,
+            composition: VllmNeuronComposition::ModelHeadRegions,
+            prefill_segment_size: None,
+        };
+        let resolved = resolve_configs(&build_configs(&ModelCfg::llama3_8b(), &parallel));
+        assert_eq!(
+            resolved.composition,
+            VllmNeuronComposition::ModelHeadRegions
+        );
+        for region in [NeuronLlamaRegion::Model, NeuronLlamaRegion::Head] {
+            let cfg = region_config(&resolved.forward, region);
+            NeuronLlamaRegionSpec::validate_config(&cfg).unwrap();
+            assert_eq!(cfg.region, region);
+            assert_eq!(cfg.decode_buckets, resolved.forward.decode_buckets);
+            assert_eq!(cfg.backends, ["vllm_neuron_fx_regions"]);
+        }
+    }
+    #[test]
+    fn segments_share_the_whole_forward_inventory() {
+        use crate::timing::kernels::NeuronLlamaSegmentSpec;
+        let parallel = VllmNeuronParallel {
+            gpu_name: "AWS Trainium2 LNC2".into(),
+            max_model_len: 512,
+            decode_buckets: vec![1, 16],
+            tp_size: 4,
+            composition: VllmNeuronComposition::LayerSegments,
+            prefill_segment_size: None,
+        };
+        let resolved = resolve_configs(&build_configs(&ModelCfg::llama3_8b(), &parallel));
+        for segment in [
+            NeuronLlamaSegment::Embedding,
+            NeuronLlamaSegment::AttentionBlock,
+            NeuronLlamaSegment::MlpBlock,
+            NeuronLlamaSegment::Head,
+        ] {
+            let cfg = segment_config(&resolved.forward, segment);
+            NeuronLlamaSegmentSpec::validate_config(&cfg).unwrap();
+            assert_eq!(cfg.segment, segment);
+            assert_eq!(cfg.backends, ["vllm_neuron_collective_segments"]);
+        }
+        assert_eq!(ModelCfg::llama3_8b().num_layers, NUM_LAYERS);
+    }
+    fn segmented_prefill(prefix: u32, q: u32) -> UnifiedArchInput {
+        UnifiedArchInput {
+            groups: vec![ArchGroupInput {
+                prefill_chunk_pairs: vec![(prefix, q)],
+                prefill_tokens: q,
+                batch_tokens: q,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn segmented_prefill_lowers_each_chunk_to_the_segment_graph_at_its_prior() {
+        // C16384/S2048: the measured priors are 0..=14336.
+        let geometry = (2048, 14336);
+        let buckets = [1, 2, 4, 8, 16];
+        for (prefix, q) in [
+            (0, 2048),
+            (2048, 2048),
+            (14336, 2040),
+            (0, 1),
+            (4096 + 32, 100),
+        ] {
+            let input =
+                lower_segmented_input(&segmented_prefill(prefix, q), 16384, &buckets, geometry)
+                    .unwrap();
+            assert_eq!(input.phase, NeuronLlamaForwardPhase::Prefill);
+            assert_eq!((input.token_bucket, input.prior_tokens), (2048, prefix));
+        }
+        for (prefix, q) in [
+            (0, 2049),       // chunk above the segment
+            (16, 2048),      // prefix off the 32-token page grid
+            (14336 + 32, 8), // prior beyond the measured range
+            (0, 0),
+        ] {
+            assert!(lower_segmented_input(
+                &segmented_prefill(prefix, q),
+                16384,
+                &buckets,
+                geometry
+            )
+            .is_err());
+        }
+        let mut mixed = segmented_prefill(0, 2048);
+        mixed.groups[0].decode_kv_lens.push(10);
+        assert!(lower_segmented_input(&mixed, 16384, &buckets, geometry).is_err());
+        let mut two = segmented_prefill(0, 1024);
+        two.groups[0].prefill_chunk_pairs.push((0, 1024));
+        two.groups[0].prefill_tokens = 2048;
+        two.groups[0].batch_tokens = 2048;
+        assert!(lower_segmented_input(&two, 16384, &buckets, geometry).is_err());
+        // Decode lowers as in the whole-context engine; 13 residents fit C16384.
+        for (n, bucket) in [(1, 1), (3, 4), (13, 16)] {
+            let input =
+                lower_segmented_input(&decode(n, 16384), 16384, &buckets, geometry).unwrap();
+            assert_eq!(input.phase, NeuronLlamaForwardPhase::Decode);
+            assert_eq!((input.token_bucket, input.prior_tokens), (bucket, 0));
+        }
+        assert!(lower_segmented_input(&decode(14, 16384), 16384, &buckets, geometry).is_err());
+        assert!(lower_segmented_input(&decode(1, 16385), 16384, &buckets, geometry).is_err());
+    }
+
+    #[test]
+    fn segmented_prefill_requires_whole_forward_and_a_segmented_context() {
+        use crate::timing::kernels::NeuronLlamaSegmentedForwardSpec;
+        let mut parallel = VllmNeuronParallel {
+            gpu_name: "AWS Trainium2 LNC2".into(),
+            max_model_len: 16384,
+            decode_buckets: vec![1, 2, 4, 8, 16],
+            tp_size: 4,
+            composition: VllmNeuronComposition::WholeForward,
+            prefill_segment_size: Some(2048),
+        };
+        let cfgs = build_configs(&ModelCfg::llama3_8b(), &parallel);
+        let segmented = cfgs.segmented.as_ref().unwrap();
+        assert_eq!(segmented.backends, ["vllm_neuron_segmented"]);
+        assert_eq!(segmented.segment_size, 2048);
+        assert_eq!(segmented.decode_buckets, parallel.decode_buckets);
+        NeuronLlamaSegmentedForwardSpec::validate_config(segmented).unwrap();
+        // C16384 is outside the unsegmented ladder; only the segmented leaf is checked.
+        assert!(NeuronLlamaForwardSpec::validate_config(&cfgs.forward).is_err());
+        validate_selected(&cfgs.forward, cfgs.composition, cfgs.segmented.as_ref()).unwrap();
+        for composition in [
+            VllmNeuronComposition::ModelHeadRegions,
+            VllmNeuronComposition::LayerSegments,
+        ] {
+            parallel.composition = composition;
+            let cfgs = build_configs(&ModelCfg::llama3_8b(), &parallel);
+            assert!(
+                validate_selected(&cfgs.forward, cfgs.composition, cfgs.segmented.as_ref())
+                    .is_err()
+            );
+        }
+        parallel.composition = VllmNeuronComposition::WholeForward;
+        parallel.prefill_segment_size = None;
+        let cfgs = build_configs(&ModelCfg::llama3_8b(), &parallel);
+        assert!(cfgs.segmented.is_none());
+        assert!(
+            validate_selected(&cfgs.forward, cfgs.composition, cfgs.segmented.as_ref()).is_err(),
+            "unsegmented C16384 has no whole-context profile"
+        );
+    }
+
+    #[test]
+    fn selector_defaults_to_the_whole_forward() {
+        use crate::arch::config::IterArchSel;
+        let parse = |extra: &str| -> IterArchSel {
+            serde_json::from_str(&format!(
+                r#"{{"type":"llama3_vllm_neuron","model_config":"m.json","fp8":false{extra}}}"#
+            ))
+            .unwrap()
+        };
+        for (extra, expected) in [
+            ("", VllmNeuronComposition::WholeForward),
+            (
+                r#","composition":"model_head_regions""#,
+                VllmNeuronComposition::ModelHeadRegions,
+            ),
+            (
+                r#","composition":"layer_segments""#,
+                VllmNeuronComposition::LayerSegments,
+            ),
+        ] {
+            let IterArchSel::Llama3VllmNeuron {
+                composition,
+                prefill_segment_size,
+                ..
+            } = parse(extra)
+            else {
+                panic!("wrong selector")
+            };
+            assert_eq!(composition, expected);
+            assert_eq!(prefill_segment_size, None);
+        }
+        let IterArchSel::Llama3VllmNeuron {
+            prefill_segment_size,
+            ..
+        } = parse(r#","prefill_segment_size":2048"#)
+        else {
+            panic!("wrong selector")
+        };
+        assert_eq!(prefill_segment_size, Some(2048));
     }
 }

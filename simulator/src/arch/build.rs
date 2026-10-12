@@ -780,14 +780,17 @@ pub fn dense_tp(
         .context("building Llama3-dense-TP model (often a missing profile.db row)")
 }
 
-/// Build the original Llama 3.1 8B on stock vLLM Neuron (TP4/LNC2), costed as
-/// its one measured forward. The checkpoint must be exactly the measured one:
+/// Build the original Llama 3.1 8B on stock vLLM Neuron (TP4/LNC2), costed in
+/// the selected composition. The checkpoint must be exactly the measured one:
 /// no layer overrides, BF16, and the Llama 3.1 math the executable computes.
+#[allow(clippy::too_many_arguments)]
 pub fn llama3_vllm_neuron(
     model_spec: &ModelSpec,
     max_model_len: u32,
     decode_buckets: &[u32],
     tp_size: u16,
+    composition: crate::arch::config::VllmNeuronComposition,
+    prefill_segment_size: Option<u32>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -809,10 +812,14 @@ pub fn llama3_vllm_neuron(
         max_model_len,
         decode_buckets: decode_buckets.to_vec(),
         tp_size,
+        composition,
+        prefill_segment_size,
     };
     let resolved = stock::resolve_configs(&stock::build_configs(&model_cfg, &parallel));
-    stock::build(name.to_string(), resolved, bridge)
-        .context("building the stock vLLM Neuron forward (often a missing profile.db row)")
+    stock::build(name.to_string(), resolved, bridge).context(
+        "building the stock vLLM Neuron forward, regions or segments \
+         (often a missing profile.db row)",
+    )
 }
 
 /// Build the exact local TP1/EP1 Qwen3.6 heterogeneous model. The nested
@@ -2010,11 +2017,15 @@ pub fn build_iter_model(
             max_model_len,
             decode_buckets,
             tp_size,
+            composition,
+            prefill_segment_size,
         } => Box::new(llama3_vllm_neuron(
             model,
             *max_model_len,
             decode_buckets,
             *tp_size,
+            *composition,
+            *prefill_segment_size,
             gpu,
             name,
             bridge,

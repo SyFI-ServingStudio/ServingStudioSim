@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "mapping_id": "llama3-vllm-neuron-segments-v1",
+  "arch_types": ["llama3_vllm_neuron"],
+  "locations": [
+    {"location": "unified.embedding", "semantics": ["embedding"]},
+    {
+      "location": "unified.attention_block",
+      "semantics": ["input_norm", "qkv", "kv_cache_append", "attn.prefill", "attn.decode", "o"]
+    },
+    {"location": "unified.mlp_block", "semantics": ["post_norm", "gate_up", "down"]},
+    {"location": "unified.head", "semantics": ["final_norm", "lm_head"]}
+  ]
+}

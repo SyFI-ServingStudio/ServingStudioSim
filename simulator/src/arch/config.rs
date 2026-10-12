@@ -161,6 +161,22 @@ const fn default_vllm_neuron_tp_size() -> u16 {
     4
 }
 
+/// How the stock vLLM Neuron forward is costed: one measured executable, the
+/// same stock operations compiled and measured as model and head regions, or
+/// the unchanged executable's collective-delimited embedding, per-layer
+/// attention and MLP blocks, and head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VllmNeuronComposition {
+    #[default]
+    WholeForward,
+    ModelHeadRegions,
+    LayerSegments,
+}
+
+const VLLM_NEURON_COMPOSITIONS: [&str; 3] =
+    ["whole_forward", "model_head_regions", "layer_segments"];
+
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
 /// that consume them (provider-first: select the arch, then it exposes its own
 /// params).
@@ -208,6 +224,15 @@ pub enum IterArchSel {
         #[serde(default = "default_vllm_neuron_tp_size")]
         #[param(default = 4, cache_key)]
         tp_size: u16,
+        #[serde(default)]
+        #[param(string, default = "whole_forward", choices = VLLM_NEURON_COMPOSITIONS, cache_key)]
+        composition: VllmNeuronComposition,
+        /// Segmented (chunked) prefill: the engine's token budget and compiled
+        /// prefill segment S. Unset keeps one whole-context prefill executable.
+        /// Requires `composition: whole_forward`.
+        #[serde(default)]
+        #[param(cache_key)]
+        prefill_segment_size: Option<u32>,
     },
     /// Megatron TP over dense Llama 3. `tp_size` must divide the KV heads (8).
     Llama3DenseTp {

@@ -378,6 +378,8 @@ impl Deployment for UnifiedDeployment {
                 max_model_len,
                 decode_buckets,
                 tp_size,
+                composition,
+                prefill_segment_size,
                 ..
             } => {
                 let model = Arc::new(arch_build::llama3_vllm_neuron(
@@ -385,6 +387,8 @@ impl Deployment for UnifiedDeployment {
                     *max_model_len,
                     decode_buckets,
                     *tp_size,
+                    *composition,
+                    *prefill_segment_size,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
@@ -393,6 +397,7 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                     &worker_config,
                     *max_model_len,
+                    *prefill_segment_size,
                     decode_buckets,
                     g.replicas,
                     model.kv_cache_layout().per_token_bytes() * u64::from(STOCK_KV_SLOTS)
@@ -1011,15 +1016,18 @@ fn prefill_gpu_time_multiplier(worker: &IterWorkerSel) -> anyhow::Result<Option<
 }
 
 /// Stock vLLM Neuron's scheduler on the generic chunked-prefill worker: one
-/// replica, a context-sized token budget (its one compiled prefill graph), one
-/// prompt per iteration that never shares it with decode, FIFO, no prefix
+/// replica, a token budget equal to its one compiled prefill graph (the whole
+/// context, or one S-token segment when prefill is segmented), one prefill
+/// request per iteration that never shares it with decode, FIFO, no prefix
 /// reuse, and at most as many residents as both its largest compiled decode
 /// bucket and the paged pool hold. Its KV budget is exactly that pool,
-/// `pool_bytes_per_rank`.
+/// `pool_bytes_per_rank`. With an S budget the generic worker runs a prompt as
+/// consecutive S-token chunks, each prior a multiple of S.
 fn ensure_stock_neuron_worker(
     worker: &IterWorkerSel,
     config: &WorkerConfig,
     context: u32,
+    prefill_segment_size: Option<u32>,
     decode_buckets: &[u32],
     replicas: u16,
     pool_bytes_per_rank: u64,
@@ -1034,13 +1042,14 @@ fn ensure_stock_neuron_worker(
     );
     let largest_bucket = decode_buckets.iter().copied().max().unwrap_or(0);
     let residents = largest_bucket.min(resident_capacity(context));
+    let token_budget = prefill_segment_size.unwrap_or(context);
     ensure!(
-        config.max_batch_tokens == Some(context)
+        config.max_batch_tokens == Some(token_budget)
             && config.max_prefill_requests_per_iteration == Some(1)
             && config.max_resident_requests_per_partition == Some(residents),
-        "stock vLLM Neuron requires max_batch_tokens {context}, \
-         max_prefill_requests_per_iteration 1 and max_resident_requests_per_partition \
-         {residents}"
+        "stock vLLM Neuron requires max_batch_tokens {token_budget} (the context, or \
+         prefill_segment_size when segmented), max_prefill_requests_per_iteration 1 and \
+         max_resident_requests_per_partition {residents}"
     );
     ensure!(
         config.batch_policy == BatchPolicy::SeparatePrefillPriority
@@ -1297,7 +1306,7 @@ mod tests {
             ..WorkerConfig::default()
         };
         let check = |worker: &IterWorkerSel, config: &WorkerConfig, buckets: &[u32], replicas| {
-            ensure_stock_neuron_worker(worker, config, 512, buckets, replicas, POOL)
+            ensure_stock_neuron_worker(worker, config, 512, None, buckets, replicas, POOL)
         };
         check(&sel, &valid, &[1, 16], 1).unwrap();
         assert!(check(&sel, &valid, &[1, 16], 2).is_err());
@@ -1319,6 +1328,32 @@ mod tests {
             mutate(&mut invalid);
             assert!(check(&sel, &invalid, &[1, 16], 1).is_err());
         }
+    }
+
+    #[test]
+    fn segmented_stock_neuron_budget_is_the_segment_not_the_context() {
+        const POOL: u64 = 7_111_442_432;
+        let sel = chunked_prefill_worker();
+        // C16384: 217024 // 16384 = 13 residents under bucket 16.
+        let valid = WorkerConfig {
+            attn_kv_bytes: POOL,
+            max_batch_tokens: Some(2048),
+            max_prefill_requests_per_iteration: Some(1),
+            max_resident_requests_per_partition: Some(13),
+            batch_policy: BatchPolicy::SeparatePrefillPriority,
+            pending_order: PendingOrderKind::Fifo,
+            prefix_cache: crate::worker::kv::PrefixCacheConfig::Disabled,
+            ..WorkerConfig::default()
+        };
+        let check = |config: &WorkerConfig, segment| {
+            ensure_stock_neuron_worker(&sel, config, 16384, segment, &[1, 2, 4, 8, 16], 1, POOL)
+        };
+        check(&valid, Some(2048)).unwrap();
+        // The unsegmented engine still needs the context-sized budget.
+        assert!(check(&valid, None).is_err());
+        let mut whole = valid;
+        whole.max_batch_tokens = Some(16384);
+        assert!(check(&whole, Some(2048)).is_err());
     }
 
     #[test]
