@@ -2385,14 +2385,12 @@ pub(crate) fn normalize_group(
             group.decode_tokens
         ));
     }
-    let mut decode_context = None;
     for (request_index, &context) in group.decode_kv_lens.iter().enumerate() {
         if !(verify_width..=max_model_len).contains(&context) {
             return Err(format!(
                 "group {group_index} decode request {request_index} context {context} must be in {verify_width}..={max_model_len}"
             ));
         }
-        decode_context = Some(decode_context.map_or(context, |current: u32| current.max(context)));
         endpoint_context_lens.push(context);
     }
     let batch_tokens = prefill_tokens
@@ -2420,17 +2418,54 @@ pub(crate) fn normalize_group(
         request_count,
         logits_rows,
         endpoint_context_lens,
-        attention_input: VllmGlm52DsaAttnLocalWorkletInput {
-            num_new_tokens: batch_tokens,
+        attention_input: attention_input(
             prefill_query_cache_pairs,
-            decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
-                batch_size: decode_request_count,
-                context_len,
-                context_lens: Some(group.decode_kv_lens.clone()),
-                requires_padding: false,
-            }),
-        },
+            group.decode_kv_lens.clone(),
+            verify_width,
+        ),
     })
+}
+
+/// One group's attention input, with each request classified the way vLLM's
+/// DSA indexer metadata does.
+///
+/// `split_decodes_and_prefills` (`vllm/v1/attention/backends/utils.py`, called
+/// with `treat_short_extends_as_decodes` from the indexer builder) calls a
+/// request a decode when it schedules at most `1 + num_speculative_tokens`
+/// query tokens on top of prior state. So a one-token append after a cached
+/// prefix -- the step an engine runs after a full prefix hit or a P/D KV
+/// transfer -- runs the paged decode indexer and decode sparse MLA, not the
+/// prefill indexer over the whole context. Under a speculative verify the
+/// decode launch here is uniform, so that request is billed a full
+/// `verify_width` row group (vLLM's varlen path would run one row).
+fn attention_input(
+    prefill_query_cache_pairs: Vec<(u32, u32)>,
+    mut decode_context_lens: Vec<u32>,
+    verify_width: u32,
+) -> VllmGlm52DsaAttnLocalWorkletInput {
+    let mut prefills = Vec::with_capacity(prefill_query_cache_pairs.len());
+    for (append, cache) in prefill_query_cache_pairs {
+        if append == 1 && cache > 1 {
+            decode_context_lens.push(cache.max(verify_width));
+        } else {
+            prefills.push((append, cache));
+        }
+    }
+    let prefill_rows: u32 = prefills.iter().map(|&(append, _)| append).sum();
+    let decode_requests = decode_context_lens.len() as u32;
+    let decode = decode_context_lens.iter().copied().max().map(|context_len| {
+        VllmGlm52DsaAttnLocalDecodeInput {
+            batch_size: decode_requests,
+            context_len,
+            context_lens: Some(decode_context_lens),
+            requires_padding: false,
+        }
+    });
+    VllmGlm52DsaAttnLocalWorkletInput {
+        num_new_tokens: prefill_rows + decode_requests * verify_width,
+        prefill_query_cache_pairs: prefills,
+        decode,
+    }
 }
 
 /// vLLM runs sparse attention as one FlashInfer launch over every token row of
@@ -2505,7 +2540,6 @@ pub(crate) fn normalize_speculative_input(
         let decode_request_count = u32::try_from(group.decode_requests.len())
             .map_err(|_| format!("group {group_index} decode request count exceeds u32"))?;
         let mut decode_tokens = 0_u32;
-        let mut decode_context = None;
         let mut decode_context_lens = Vec::with_capacity(group.decode_requests.len());
         for (request_index, decode) in group.decode_requests.iter().enumerate() {
             // The scheduler does not admit partial verify groups, because a
@@ -2527,9 +2561,6 @@ pub(crate) fn normalize_speculative_input(
             decode_tokens = decode_tokens
                 .checked_add(decode.query_len)
                 .ok_or_else(|| format!("group {group_index} decode token sum overflows u32"))?;
-            decode_context = Some(
-                decode_context.map_or(decode.kv_len, |current: u32| current.max(decode.kv_len)),
-            );
             decode_context_lens.push(decode.kv_len);
             endpoint_context_lens.push(decode.kv_len);
         }
@@ -2567,16 +2598,11 @@ pub(crate) fn normalize_speculative_input(
             request_count,
             logits_rows,
             endpoint_context_lens,
-            attention_input: VllmGlm52DsaAttnLocalWorkletInput {
-                num_new_tokens: batch_tokens,
+            attention_input: attention_input(
                 prefill_query_cache_pairs,
-                decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
-                    batch_size: decode_request_count,
-                    context_len,
-                    context_lens: Some(decode_context_lens),
-                    requires_padding: false,
-                }),
-            },
+                decode_context_lens,
+                verify_width,
+            ),
         });
     }
     Ok(NormalizedBatch {
@@ -3840,5 +3866,25 @@ mod tests {
         };
         let reason = normalize_input(&over, 4, 202_752).unwrap_err();
         assert!(reason.contains("65536 token rows"), "{reason}");
+    }
+
+    /// Catches a one-token append after a cached prefix (a full prefix hit or
+    /// a P/D-transferred request) billed as a prefill, which would run the DSA
+    /// prefill indexer over its whole context.
+    #[test]
+    fn a_one_token_append_after_a_prefix_runs_as_a_decode() {
+        let plain = attention_input(vec![(1, 70_001), (1, 1), (64, 564)], vec![9_000], 1);
+        assert_eq!(plain.prefill_query_cache_pairs, [(1, 1), (64, 564)]);
+        let decode = plain.decode.unwrap();
+        assert_eq!(decode.batch_size, 2);
+        assert_eq!(decode.context_len, 70_001);
+        assert_eq!(decode.context_lens, Some(vec![9_000, 70_001]));
+        assert_eq!(plain.num_new_tokens, 1 + 64 + 2);
+
+        // A verify bills the admitted request a whole uniform row group.
+        let verify = attention_input(vec![(1, 70_001)], vec![9_000], 4);
+        assert!(verify.prefill_query_cache_pairs.is_empty());
+        assert_eq!(verify.decode.unwrap().batch_size, 2);
+        assert_eq!(verify.num_new_tokens, 8);
     }
 }
