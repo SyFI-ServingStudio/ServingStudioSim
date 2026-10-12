@@ -116,6 +116,8 @@ models/deepseek_v41.py     10 role stacks + MXFP4 MoE + FP32 mHC mixing + engram
 attention/inkling_rel.py   Inkling relative-position SWA/global attention + K/V short conv
 mixers/short_conv.py       sublayer-output short convolutions + their norms (Inkling)
 models/inkling.py          local/global x dense/BF16/NVFP4-expert stacks + sink-expert MoE
+attention/sliding_window.py  causal sliding-window GQA (exact per-request geometry)
+models/mimo_v2.py          GA/SWA x dense/MoE stacks, asymmetric QK/V, SWA sinks, MXFP4 MoE
 ```
 
 - **New attention (MLA/SWA/SSM)** → one new `attention/*.py`; every FFN combination is free.
@@ -198,6 +200,22 @@ counts as parameters only. Text-path parameters reconcile exactly with both
 checkpoints' safetensors headers (263,655,199,274 Small, 947,025,564,226 large).
 The arch opts into per-request decode geometry, because the window, the extent and
 the short-conv states make the minimum non-linear in context.
+
+MiMo-V2.6-Flash (`MiMoV2ForCausalLM`, text decoder only) composes generic pieces.
+`GQA` takes a `v_head_dim` (QK 192, V 128: a pair costs `2*H*(d_qk + d_v)` FLOPs and
+the cache stores `d_qk + d_v` per KV head) and optional per-head softmax sinks, which
+add no key and no FLOP, only their learned vector. Its nine global layers (KV4) are
+plain `GQA`; its 39 window layers (KV8, 128 keys including the query's own, sinks)
+are `SlidingWindowGQA`, which counts `sum_q min(pos_q + 1, W)` pairs, reads
+`min(prefix, W - 1)` cached keys and keeps `min(append, W - 1)` new ones. That
+window is not linear in summed geometry, so the spec labels only the logged
+per-request geometry and refuses a collapsed aggregate; the arch must log
+`decode_kv_lens`. Layer 0 is a dense SwiGLU, the other 47 the shared MoE (E256 top-8,
+sigmoid `noaux_tc` with an FP32 selection bias). The FP8 config's `ignored_layers`
+(vLLM's preferred key) keeps every `o_proj` BF16 and `store_dtype: mxfp4` stores the
+routed experts as E2M1 plus one E8M0 scale per 32 weights, multiplied by BF16
+activations; the router and `lm_head` are BF16 in the checkpoint though unlisted.
+Text-path parameters reconcile exactly with the safetensors headers (308,778,780,864).
 
 ## Modality-agnostic workload
 

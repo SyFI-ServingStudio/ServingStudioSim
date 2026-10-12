@@ -3748,3 +3748,311 @@ def test_inkling_location_map_consumes_every_semantic_once(
     # the two NVFP4 groups.
     zero = 1 + 1 + 3 * (2 + ranks - 1) + 2 * ranks
     assert sum(not row["semantics"] for row in location_map["locations"]) == zero
+
+
+# ---------------------------------------------------------------------------
+# MiMo-V2.6-Flash (MiMoV2ForCausalLM): GA/SWA hybrid with asymmetric QK/V heads and
+# SWA sinks, dense layer 0 then MXFP4 MoE, FP8 block-quantized Linear weights.
+# ---------------------------------------------------------------------------
+
+MIMO = Path(__file__).resolve().parents[1] / "model" / "config" / "mimo_v2_6_flash_rl.json"
+# Read off config.json (XiaomiMiMo/MiMo-V2.6-Flash-RL @ 5711b268) and its safetensors.
+MIMO_H, MIMO_V, MIMO_Q, MIMO_DQK, MIMO_DV = 4096, 152_576, 64, 192, 128
+MIMO_KV_GA, MIMO_KV_SWA, MIMO_WINDOW = 4, 8, 128
+MIMO_DENSE_I, MIMO_I, MIMO_E, MIMO_TOPK = 16_384, 2048, 256, 8
+MIMO_GA = (0, 5, 11, 17, 23, 29, 35, 41, 47)
+MIMO_STACKS = {
+    "ga_dense": (0,),
+    "swa_moe": tuple(layer for layer in range(48) if layer not in MIMO_GA),
+    "ga_moe": MIMO_GA[1:],
+}
+# Per-layer matrices (n x k), by hand:
+#   GA  qkv_proj: (64*192 + 4*(192 + 128)) x 4096 = 13568 x 4096 = 55,574,528
+#   SWA qkv_proj: (64*192 + 8*(192 + 128)) x 4096 = 14848 x 4096 = 60,817,408
+#   o_proj: 4096 x (64*128 = 8192) = 33,554,432
+#   layer-0 dense SwiGLU: 3 x 16384 x 4096 = 201,326,592
+#   one routed expert: 3 x 2048 x 4096 = 25,165,824; router: 256 x 4096 = 1,048,576
+MIMO_GA_QKV = 13_568 * 4096
+MIMO_SWA_QKV = 14_848 * 4096
+MIMO_O = 4096 * 8192
+MIMO_DENSE = 3 * 16_384 * 4096
+MIMO_EXPERT = 3 * 2048 * 4096
+MIMO_ROUTER = 256 * 4096
+# 2 RMSNorms x 48 layers + final norm, 64 SWA sinks x 39 layers, 256 FP32 router
+# biases x 47 MoE layers: 397,312 + 2,496 + 12,032 = 411,840.
+MIMO_LEARNED = 97 * 4096 + 39 * 64 + 47 * 256
+MIMO_TABLE = 152_576 * 4096  # embed_tokens and (untied) lm_head, each 624,951,296
+# Text-path parameters of the safetensors headers (model.layers.*, embed_tokens,
+# norm, lm_head): BF16 1,660,291,520 + FP32 router biases 12,032 + FP8
+# 3,073,376,256 + 2 x 151,397,597,184 packed E2M1 bytes + 2 x 624,951,296 + 4,096.
+# Weight scales are not parameters; vision, audio and MTP tensors are not labelled.
+MIMO_TEXT_PARAMS = 308_778_780_864
+
+
+@pytest.fixture(scope="module")
+def mimo():
+    return load_model(MIMO)
+
+
+def test_mimo_registry_schedule_and_geometry(mimo):
+    from model.work.attention.sliding_window import SlidingWindowGQA
+    from model.work.models import mimo_v2
+
+    assert REGISTRY["MiMoV2ForCausalLM"] is mimo_v2.build
+    assert mimo.name == "MiMoV2ForCausalLM" and mimo.num_layers == 48
+    assert {stack.tag: stack.layers for stack in mimo.layers} == MIMO_STACKS
+    by_tag = {stack.tag: stack for stack in mimo.layers}
+    for tag, kv_heads in (("ga_dense", 4), ("ga_moe", 4), ("swa_moe", 8)):
+        attn = by_tag[tag].attn
+        assert (attn.num_qo_heads, attn.num_kv_heads) == (MIMO_Q, kv_heads)
+        assert (attn.head_dim, attn.v_dim) == (MIMO_DQK, MIMO_DV)
+        assert attn.attention_sinks == (tag == "swa_moe")
+    assert isinstance(by_tag["swa_moe"].attn, SlidingWindowGQA)
+    assert by_tag["swa_moe"].attn.window == MIMO_WINDOW
+    assert not isinstance(by_tag["ga_moe"].attn, SlidingWindowGQA)
+    assert by_tag["ga_dense"].ffn.intermediate == MIMO_DENSE_I
+    moe = by_tag["swa_moe"].ffn
+    assert (moe.num_experts, moe.top_k, moe.moe_intermediate) == (MIMO_E, MIMO_TOPK, MIMO_I)
+    assert moe.shared_intermediate == 0
+
+
+def test_mimo_params_reconcile_with_the_safetensors_headers(mimo):
+    params = mimo.label(Workload(matmul_tokens=0, head_positions=0)).params
+    attn = 9 * (MIMO_GA_QKV + MIMO_O) + 39 * (MIMO_SWA_QKV + MIMO_O)  # 4,482,662,400
+    routed = 47 * MIMO_E * MIMO_EXPERT  # 302,795,194,368
+    total = attn + MIMO_DENSE + routed + 47 * MIMO_ROUTER + MIMO_LEARNED + 2 * MIMO_TABLE
+    assert total == params["total"] == MIMO_TEXT_PARAMS
+    # Activated: 8 of 256 experts per MoE layer -> 14.20 B, 15.45 B with the tables
+    # (the model card's "A15B").
+    activated = attn + MIMO_DENSE + 47 * 8 * MIMO_EXPERT + 47 * MIMO_ROUTER + MIMO_LEARNED
+    assert params["activated"]["layers"] == activated == 14_196_033_728
+    assert params["activated"]["with_embed_head"] == 15_445_936_320
+    breakdown = params["breakdown"]
+    assert breakdown["attn"] == attn + 39 * 64
+    assert breakdown["ffn"] == MIMO_DENSE
+    assert breakdown["experts"] == routed
+    assert breakdown["router"] == 47 * (MIMO_ROUTER + 256)
+    assert breakdown["norm"] == 97 * 4096
+    assert breakdown["embedding"] == breakdown["lm_head"] == MIMO_TABLE
+    assert compute_parameter_counts(MIMO)["total"] == MIMO_TEXT_PARAMS
+
+
+# Per-token matmul FLOPs (2·n·k) per layer kind.
+MIMO_GA_ATTN_MM = 2 * (MIMO_GA_QKV + MIMO_O)  # 178,257,920
+MIMO_SWA_ATTN_MM = 2 * (MIMO_SWA_QKV + MIMO_O)  # 188,743,680
+MIMO_MOE_MM = 2 * MIMO_TOPK * MIMO_EXPERT  # 402,653,184
+MIMO_DENSE_MM = 2 * MIMO_DENSE  # 402,653,184
+MIMO_ROUTER_MM = 2 * MIMO_ROUTER  # 2,097,152
+# QK^T (2 x 192) + P·V (2 x 128) per (query head, key): 2 x 64 x 320 = 40,960.
+MIMO_PAIR = 2 * MIMO_Q * (MIMO_DQK + MIMO_DV)
+MIMO_LM_HEAD = 2 * MIMO_H * MIMO_V  # 1,249,902,592
+
+
+def _mimo_requests(prefill, decode):
+    """(append, prefix) per request; a decode kv_len counts its own new token."""
+    return [*prefill, *((1, kv_len - 1) for kv_len in decode)]
+
+
+def _mimo_window_counts(prefill, decode):
+    """Brute-force key loops, independent of the spec: global pairs, window pairs,
+    cached keys read (global, window) and window-cache rows kept."""
+    ga = swa = ga_cached = swa_cached = swa_kept = 0
+    for append, prefix in _mimo_requests(prefill, decode):
+        old_window_keys = set()
+        for position in range(prefix, prefix + append):
+            visible = range(max(0, position - MIMO_WINDOW + 1), position + 1)
+            ga += position + 1
+            swa += len(visible)
+            old_window_keys.update(key for key in visible if key < prefix)
+        ga_cached += prefix
+        swa_cached += len(old_window_keys)
+        # Only the newest W - 1 rows of a chunk are ever read by a later query.
+        newest = prefix + append - (MIMO_WINDOW - 1)
+        swa_kept += sum(1 for key in range(prefix, prefix + append) if key >= newest)
+    return ga, swa, ga_cached, swa_cached, swa_kept
+
+
+@pytest.mark.parametrize(
+    ("prefill", "decode", "sampled"),
+    [
+        ([(8192, 0)], [], 1),
+        ([], [4096] * 4, 4),
+        ([(3, 126), (130, 0), (2, 127)], [1, 127, 128, 129, 8192], 4),
+    ],
+)
+def test_mimo_flop_and_byte_goldens(mimo, prefill, decode, sampled):
+    label = mimo.label(Workload.causal_lm(prefill=prefill, decode=decode, sampled=sampled))
+    tokens = sum(append for append, _ in prefill) + len(decode)
+    ga, swa, ga_cached, swa_cached, swa_kept = _mimo_window_counts(prefill, decode)
+    assert label.flops == {
+        "attn_proj": tokens * (9 * MIMO_GA_ATTN_MM + 39 * MIMO_SWA_ATTN_MM),
+        "attn_internal": MIMO_PAIR * (9 * ga + 39 * swa),
+        "ffn": tokens * (MIMO_DENSE_MM + 47 * MIMO_MOE_MM),
+        "router": tokens * 47 * MIMO_ROUTER_MM,
+        "lm_head": sampled * MIMO_LM_HEAD,
+    }
+    # KV entry: K (192) + V (128) per KV head, BF16 -> 2,560 B GA, 5,120 B SWA.
+    ga_entry, swa_entry = 4 * 320 * 2, 8 * 320 * 2
+    assert label.bytes["kv"] == (
+        9 * ga_entry * (ga_cached + tokens) + 39 * swa_entry * (swa_cached + swa_kept)
+    )
+    # Weights at their stored precision, each read once:
+    # FP8 matrices add one FP32 scale per 128x128 block (ceil(n/128)·ceil(k/128)·4 B).
+    ga_qkv = MIMO_GA_QKV + 106 * 32 * 4
+    swa_qkv = MIMO_SWA_QKV + 116 * 32 * 4
+    dense = MIMO_DENSE + (256 * 32 + 32 * 128) * 4  # gate|up 32768x4096, down 4096x16384
+    # MXFP4 experts: half a byte per weight + one E8M0 byte per 32, only hit experts
+    # (uniform balls-in-bins over tokens·top_k draws).
+    hit = 256 * (1 - (255 / 256) ** (8 * tokens))
+    experts = 47 * hit * MIMO_EXPERT * (1 / 2 + 1 / 32)
+    expected_weights = (
+        9 * ga_qkv + 39 * swa_qkv + 48 * 2 * MIMO_O  # BF16 o_proj (ignored_layers)
+        + dense + experts
+        + 47 * (2 * MIMO_ROUTER + 4 * 256)  # BF16 router, FP32 selection bias
+        + 2 * (97 * 4096 + 39 * 64)  # BF16 norms and SWA sinks
+        + 2 * 4096 * min(tokens, MIMO_V)  # embedding rows gathered
+        + 2 * MIMO_TABLE  # BF16 lm_head
+    )
+    assert label.bytes["weights"] == pytest.approx(expected_weights, rel=1e-12)
+    assert sum(segment.flops_total for segment in label.segments) == sum(label.flops.values())
+
+
+def test_mimo_8k_prefill_and_4k_decode_totals(mimo):
+    """The two reference workloads, written out to the last FLOP."""
+    # 8192-token prefill from 0: global triangle 8192·8193/2 = 33,558,528 pairs; a
+    # window layer sees 128·129/2 + (8192 - 128)·128 = 1,040,448 pairs.
+    prefill = mimo.label(Workload.causal_lm(prefill=[(8192, 0)]))
+    assert prefill.flops == {
+        # 8192 x (9 x 178,257,920 + 39 x 188,743,680) = 8192 x 8,965,324,800
+        "attn_proj": 73_443_940_761_600,
+        # 40,960 x (9 x 33,558,528 + 39 x 1,040,448) = 40,960 x 342,604,224
+        "attn_internal": 14_033_069_015_040,
+        # 8192 x (dense 402,653,184 + 47 x top-8 402,653,184) = 8192 x 19,327,352,832
+        "ffn": 158_329_674_399_744,
+        "router": 807_453_851_648,  # 8192 x 47 x 2,097,152
+        "lm_head": 1_249_902_592,  # one sampled position
+    }
+    assert sum(prefill.flops.values()) == 246_615_387_930_624
+    # 4 decodes at kv_len 4096: 4 x 4096 global keys, 4 x 128 window keys.
+    decode = mimo.label(Workload.causal_lm(decode=[4096] * 4))
+    assert decode.flops == {
+        "attn_proj": 35_861_299_200,  # 4 x 8,965,324,800
+        "attn_internal": 6_857_687_040,  # 40,960 x 4 x (9 x 4096 + 39 x 128)
+        "ffn": 77_309_411_328,  # 4 x 19,327,352,832
+        "router": 394_264_576,  # 4 x 47 x 2,097,152
+        "lm_head": 4_999_610_368,  # 4 x 1,249,902,592
+    }
+    assert sum(decode.flops.values()) == 125_422_272_512
+    rows = {segment.name: segment.bytes_total for segment in decode.segments}
+    assert rows["ga_moe.attn.decode"] == 8 * 4 * 4095 * 2560
+    assert rows["swa_moe.attn.decode"] == 39 * 4 * 127 * 5120
+    assert rows["swa_moe.kv_cache_append"] == 39 * 4 * 5120
+
+
+def test_mimo_precision_follows_the_checkpoint(mimo):
+    label = mimo.label(Workload.causal_lm(decode=[256]))
+    dtypes = {segment.name: segment.compute_dtype for segment in label.segments}
+    for tag in MIMO_STACKS:
+        assert dtypes[f"{tag}.qkv"] == "fp8"
+        assert dtypes[f"{tag}.o"] == "bf16"  # every layer's o_proj is in ignored_layers
+    assert dtypes["ga_dense.gate_up"] == dtypes["ga_dense.down"] == "fp8"
+    for tag in ("ga_moe", "swa_moe"):
+        assert dtypes[f"{tag}.router"] == "bf16"
+        # MXFP4 storage, BF16 activations.
+        assert dtypes[f"{tag}.expert_gate_up"] == dtypes[f"{tag}.expert_down"] == "bf16"
+    assert dtypes["lm_head"] == "bf16"
+    assert mimo.quant.compute_dtype == "fp8"
+    spec = {"config": str(MIMO), "arch_fp8": True, "arch_quant_dtype": "fp8"}
+    work_floors._check_precision(mimo, spec)
+
+
+def test_mimo_rejects_layer_specific_exclusions_and_unmodeled_configs():
+    raw = json.loads(MIMO.read_text())
+    quant = raw["quantization_config"]
+    # One layer's o_proj converted while the others stay BF16 is not one stack.
+    partial = [
+        entry for entry in quant["ignored_layers"] if entry != "model.layers.7.self_attn.o_proj"
+    ]
+    with pytest.raises(ValueError, match="layer 7"):
+        build_model({**raw, "quantization_config": {**quant, "ignored_layers": partial}})
+    with pytest.raises(ValueError, match="layers"):
+        parse_quantization_config(raw)  # per-layer ignored_layers need the builder
+    with pytest.raises(ValueError, match="store_dtype"):
+        build_model({**raw, "quantization_config": {**quant, "store_dtype": "nvfp4"}})
+    for key, value in (
+        ("n_shared_experts", 1),
+        ("tie_word_embeddings", True),
+        ("hybrid_layer_pattern", [0] * 47),
+        ("attention_projection_layout", "split"),
+    ):
+        with pytest.raises(ValueError, match=key):
+            build_model({**raw, key: value})
+    with pytest.raises(UnknownArchitecture):
+        build_model({**raw, "architectures": ["MiMoV3ForCausalLM"]})
+
+
+@pytest.mark.parametrize(("append", "prefix"), [(1, 0), (3, 126), (129, 0), (8, 127), (1, 131_071)])
+def test_sliding_window_gqa_matches_brute_force_key_loops(append, prefix):
+    from model.work.attention.sliding_window import SlidingWindowGQA
+
+    spec = SlidingWindowGQA(
+        hidden=8, num_qo_heads=4, num_kv_heads=2, head_dim=6, v_head_dim=2,
+        kv_dtype_bytes=2, window=128,
+    )
+    rows = {row.name: row for row in spec.semantic_segments(
+        Workload.causal_lm(prefill=[(append, prefix)])
+    )}
+    pairs = sum(
+        len(range(max(0, position - 127), position + 1))
+        for position in range(prefix, prefix + append)
+    )
+    entry = 2 * (6 + 2) * 2  # 2 KV heads x (QK 6 + V 2) x 2 B
+    assert rows["attn.prefill"].flops == 2 * 4 * (6 + 2) * pairs
+    assert rows["attn.prefill"].bytes == entry * min(prefix, 127)
+    assert rows["kv_cache_append"].bytes == entry * min(append, 127)
+    # Sinks join the softmax denominator only: no key, no FLOP, one vector read.
+    assert SlidingWindowGQA(
+        hidden=8, num_qo_heads=4, num_kv_heads=2, head_dim=6, kv_dtype_bytes=2,
+        attention_sinks=True, window=128,
+    ).learned_weight_groups()[0].elements == 4
+
+
+@pytest.mark.parametrize(
+    "interaction",
+    [
+        AttnInteraction(1, 5000, 5000, "full", "decode"),  # analyzer-collapsed decode
+        AttnInteraction(2, 129, 128, "causal", "prefill"),  # key != prefix + append
+    ],
+)
+def test_sliding_window_gqa_refuses_inexact_geometry(interaction):
+    from model.work.attention.sliding_window import SlidingWindowGQA
+
+    spec = SlidingWindowGQA(
+        hidden=8, num_qo_heads=4, num_kv_heads=2, head_dim=6, kv_dtype_bytes=2, window=128
+    )
+    with pytest.raises(ValueError, match="exact per-request"):
+        spec.semantic_segments(Workload(2, 1, [interaction]))
+
+
+def test_mimo_floors_label_logged_request_geometry_exactly(mimo):
+    exact = mimo.label(Workload.causal_lm(prefill=[(300, 50)], decode=[100, 600, 5000], sampled=4))
+    totals = {
+        "matmul_tokens": 303, "prefill_tokens": 300, "decode_passes": 3,
+        "prefill_pairs": 300 * 50 + 300 * 301 // 2, "prefill_cached": 50,
+        "decode_kv": 100 + 600 + 5000, "prefill_requests": 1,
+        "request_geometry": {"prefill:50:300": 1, "decode:100": 1, "decode:600": 1,
+                             "decode:5000": 1},
+    }
+    logged = mimo.label(work_floors._aggregate_workload(totals))
+    expected = {s.name: (s.flops_total, s.bytes_total) for s in exact.segments}
+    assert {s.name: (s.flops_total, s.bytes_total) for s in logged.segments} == expected
+    # Without per-request geometry the window rows cannot be labelled.
+    with pytest.raises(ValueError, match="exact per-request"):
+        mimo.label(work_floors._aggregate_workload(
+            {key: value for key, value in totals.items() if key != "request_geometry"}
+        ))
+    # The scalar rows remain available for the analyzer's split labelling.
+    scalar = mimo.label(work_floors._aggregate_workload(
+        {key: value for key, value in totals.items() if key != "request_geometry"}
+    ), geometry_attention=False)
+    assert not any(segment.name.startswith("swa_moe.attn") for segment in scalar.segments)

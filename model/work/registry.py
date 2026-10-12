@@ -20,6 +20,7 @@ from .models import (
     glm53_flash,
     inkling,
     llama3,
+    mimo_v2,
     qwen3_6,
     qwen3_6_moe,
     qwen3_moe,
@@ -39,6 +40,9 @@ REGISTRY: dict[str, Callable[[dict], Model]] = {
     # Inkling (Small and large): relative-position SWA/global attention, short
     # convolutions, sink-expert MoE; text decoder only.
     "InklingForConditionalGeneration": inkling.build,
+    # MiMo-V2 (Flash): GA/SWA hybrid with asymmetric QK/V heads and SWA sinks, dense
+    # layer 0 then MXFP4 MoE; text decoder only.
+    "MiMoV2ForCausalLM": mimo_v2.build,
 }
 
 

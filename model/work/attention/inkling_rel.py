@@ -56,11 +56,11 @@ are exact.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..core import LearnedWeightGroup, MatmulGroup, Workload
 from .base import AttentionSemantic
+from .sliding_window import capped_cumulative
 
 
 @dataclass(frozen=True)
@@ -71,31 +71,6 @@ class InklingRequest:
     count: float
     append: float
     prefix: float
-
-
-def _interpolate(function: Callable[[int], float], x: float) -> float:
-    """An integer-domain function at a real point, linearly interpolated: a mean
-    request rebuilt from a collapsed aggregate may have fractional lengths."""
-    low = math.floor(x)
-    value = float(function(low))
-    fraction = x - low
-    if fraction:
-        value += fraction * (function(low + 1) - value)
-    return value
-
-
-def capped_cumulative(n: float, cap: int | None) -> float:
-    """``sum_{j=1..n} min(j, cap)``: keys (or distances) visible to the first
-    ``n`` positions of a sequence. ``cap=None`` is the causal triangle."""
-    if cap is None:
-        return n * (n + 1) / 2.0
-
-    def exact(m: int) -> int:
-        if m <= cap:
-            return m * (m + 1) // 2
-        return cap * (cap + 1) // 2 + (m - cap) * cap
-
-    return _interpolate(exact, n)
 
 
 def _phase_requests(phase: str | None, workload: Workload) -> list[InklingRequest]:
