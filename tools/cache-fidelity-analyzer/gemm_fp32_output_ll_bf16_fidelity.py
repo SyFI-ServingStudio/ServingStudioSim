@@ -7,7 +7,7 @@ the ll_bf16 to cuBLAS switch (m 64 -> 65), plus eager decode sizes between the
 CUDA-graph points, mixed-batch sizes and beyond-grid extrapolation.
 
 Pre-fill the grid rows first with `launcher kernel-profile run` (the
-`vllm_upstream_fork_env` backend should be profiled from a Python process, not
+`vllm_env` backend should be profiled from a Python process, not
 JIT-filled through the `kernel-query` bridge). Off-grid ground truth is
 JIT-profiled, so point `VIBESIM_PROFILE_DB` at a scratch copy. On a B200:
 

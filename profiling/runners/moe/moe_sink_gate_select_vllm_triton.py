@@ -190,7 +190,7 @@ def _import_callable() -> tuple[Any, Any]:
         from vllm.models.inkling.nvidia.moe import inkling_gate_select
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires the alignment vLLM fork (vllm_upstream_fork_env)"
+            f"{_BACKEND} requires the alignment vLLM fork (vllm_env)"
         ) from exc
     return torch, inkling_gate_select
 

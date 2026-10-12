@@ -452,7 +452,7 @@ def profile_sconv_qkvr_prep_vllm_triton(
         from vllm.models.inkling.nvidia.ops.qkvr_prep import fused_qkvr_prep
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires the alignment vLLM fork (vllm_upstream_fork_env)"
+            f"{_BACKEND} requires the alignment vLLM fork (vllm_env)"
         ) from exc
     shape = PrepShape(num_q_heads, num_kv_heads, head_dim, d_rel, rel_extent, sconv_kernel_size)
     try:

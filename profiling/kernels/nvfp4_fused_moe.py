@@ -247,11 +247,11 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_trtllm_routed_sm100_fork",
-        # The routed call above, run in the alignment vLLM checkout's own venv
-        # (vllm_upstream_fork_env). That checkout's FlashInfer is newer than the
-        # pinned vllm_env image's, and its trtllm-gen cubins and autotuner pick
-        # different tactics at large token counts, so a deployment served from
-        # the checkout measures against this backend.
+        # The routed call above, run in the alignment vLLM checkout's env
+        # (vllm_env). It was added when vllm_env's image was an older fork
+        # build whose FlashInfer picked different trtllm-gen tactics at large
+        # token counts; vllm_env now builds the checkout itself, so this backend
+        # measures the same stack as flashinfer_trtllm_routed_sm100.
         supports=BackendSupport(
             compute=frozenset({DType.NVFP4_E2M1}),
             sm_targets=frozenset({"sm_100f"}),
@@ -272,7 +272,7 @@ register(
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py",
         ),
-        subprocess_env="vllm_upstream_fork_env",
+        subprocess_env="vllm_env",
     )
 )
 

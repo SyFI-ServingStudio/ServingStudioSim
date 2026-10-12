@@ -8,7 +8,7 @@ mixed-batch sizes (eager or differently padded deployments), the gap between
 2048 and the first extrapolation row, and sizes past the 16384-token grid edge.
 
 Pre-fill the grid rows first with `python -m profiling run` (the
-`vllm_upstream_fork_env` backend should be profiled from a Python process, not
+`vllm_env` backend should be profiled from a Python process, not
 JIT-filled through the `kernel-query` bridge). Off-grid ground truth is
 JIT-profiled, so point `VIBESIM_PROFILE_DB` at a scratch copy. On a B200:
 

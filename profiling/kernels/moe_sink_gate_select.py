@@ -120,7 +120,7 @@ register(
             compute=frozenset({DType.FP32}),
         ),
         # inkling_gate_select exists only in the upstream-rebased alignment fork.
-        subprocess_env="vllm_upstream_fork_env",
+        subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
                 "The alignment fork's inkling_gate_select: one _inkling_gate_select_kernel "
