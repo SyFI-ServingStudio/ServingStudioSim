@@ -48,6 +48,7 @@ the graph that produced them.
 | `glm52_sglang_nvfp4_tp_dsa_moe` | SGLang-aligned NVFP4 DSA/MoE | pure TP with EP1; every rank owns all experts | covers a topology the vLLM graph cannot represent |
 | `qwen36_local` | heterogeneous local FP8 graph | fixed TP1/EP1 | only Qwen3.6 graph |
 | `inkling_vllm_nvfp4_rel_attn_moe` | vLLM-fork-aligned Inkling ModelOpt NVFP4: sliding-window and global relative-position attention (FA4), BF16 dense FFN, router and sink experts, NVFP4 routed experts (BF16 where the checkpoint excludes them), Lamport RS + sconv + AG + norm at every sublayer | one TP group (`tp_size` >= 2; TP4/EP4 and TP8/EP8 profiled), routed experts EP = TP or MoE TP; one attention group; `hp_unified` or `chunked_prefill` worker | only Inkling graph |
+| `mimo_v2_vllm_fp8_swa_moe` | vLLM-aligned MiMo-V2 (FP8 block attention and dense FFN, MXFP4 routed experts): 9 global + 39 sliding-window (sink) layers on FA4 DiffKV, DeepGEMM FP8 QKV, BF16 o_proj and FP32-output router, MXFP4 x BF16 TRT-LLM routed MoE (weight-only, no activation quant), FlashInfer MNNVL all-reduce + residual + RMSNorm at every sublayer | one TP group (`tp_size` >= 2 with a fused all-reduce; TP4/EP4 profiled), routed experts EP = TP; `fp8: true`; steps above the fused all-reduce token cap are refused; `hp_unified` or `chunked_prefill` worker | only MiMo-V2 graph |
 
 ## Retired selectors
 

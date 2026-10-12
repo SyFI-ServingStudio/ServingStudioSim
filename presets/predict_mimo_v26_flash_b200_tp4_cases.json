@@ -1,0 +1,9 @@
+[
+  { "groups": [ { "prefill_chunk_pairs": [[0, 2048]] } ] },
+  { "groups": [ { "prefill_chunk_pairs": [[65536, 2048]] } ] },
+  { "groups": [ { "prefill_chunk_pairs": [[0, 1990]], "decode_count": 58, "average_decode_length": 9000 } ] },
+  { "groups": [ { "prefill_chunk_pairs": [[0, 120]], "decode_count": 7, "average_decode_length": 3000 } ] },
+  { "groups": [ { "decode_count": 3, "average_decode_length": 2000 } ] },
+  { "groups": [ { "decode_count": 64, "average_decode_length": 12000 } ] },
+  { "groups": [ { "decode_kv_lens": [300, 1200, 4500, 17000, 60000, 120000] } ] }
+]

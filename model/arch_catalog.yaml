@@ -59,3 +59,5 @@ deepseek_v41_vllm_serial_streams:
   name: "vLLM, TP attention, EP MoE, side streams serialized"
 inkling_vllm_nvfp4_rel_attn_moe:
   name: "vLLM, TP attention, EP MoE"
+mimo_v2_vllm_fp8_swa_moe:
+  name: "vLLM, TP attention, EP MoE"

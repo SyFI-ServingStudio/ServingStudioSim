@@ -103,6 +103,7 @@ Each module re-exports its `{Worklet, Config, Input, Resolved}` quartet through
 | `glm53_vllm_nvfp4_dsa_moe_dflash2` | Same target sections without the MTP layer; draft uses `dflash2_context_kv_local`, `dflash2_draft_layer_local` (attention and FFN halves), and `dflash2_selector_local` |
 | `glm52_sglang_nvfp4_tp_dsa_moe` | `sglang_glm52_dsa_attn_local`, `sglang_glm52_moe_router_local`, `sglang_moe_finalize_local`, neutral `glm52_dense_ffn_local`, `glm52_shared_expert_local`, `nvfp4_moe_local`, plus the unchanged GLM MTP sections |
 | `inkling_vllm_nvfp4_rel_attn_moe` | `inkling_attn_local`, `inkling_router_local`, `glm53_mlp_local` (dense FFN and sink experts), `nvfp4_moe_local`, `bf16_moe_local` |
+| `mimo_v2_vllm_fp8_swa_moe` | `mimo_v2_attn_local`, `glm53_mlp_local` (layer-0 dense FFN), `nvfp4_moe_local` (weight-only: `activation_format` set, no quant leaf) |
 
 When a provider-prefixed module has a neutral sibling, it is the **same sync
 section** cut into the leaves that provider actually launches (for example,
