@@ -1,0 +1,36 @@
+# Exact configured stock vLLM Neuron TP4/LNC2 bucket inventory.
+# Full-model native device time; HTTP/host overhead is not calibrated here.
+deployment: unified
+workload:
+  trace_files: [trace/trainium_stock_smoke.csv]
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  run_to_end: true
+io:
+  log_dir: logs/unified_llama3_8b_vllm_neuron
+  log_output_token_times: true
+  log_stage_transitions: true
+  kv_log_stride: 1
+pools:
+  main:
+    groups:
+      - gpu: AWS Trainium2 LNC2
+        replicas: 1
+        arch:
+          type: llama3_vllm_neuron
+          model_config: model/config/llama3_8b.json
+          max_model_len: 512
+          decode_buckets: [1, 16]
+          tp_size: 4
+          fp8: false
+        worker:
+          type: chunked_prefill
+          # 6782 pages * 32 tokens * 32768 bytes/token per TP rank.
+          attn_gpu_memory_gb: 7.111442432
+          max_batch_tokens: 512
+          max_prefill_requests_per_iteration: 1
+          max_resident_requests_per_partition: 16
+          batch_policy: separate-prefill-priority
+          kv_admission_policy: full-footprint
+          prefix_cache_mode: disabled
+          gpu_time_multiplier: 1.0
