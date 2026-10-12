@@ -20,7 +20,7 @@ use std::thread::JoinHandle;
 use anyhow::{anyhow, Result};
 
 use crate::common::WorkerId;
-use crate::log::parquet_writer::StreamingParquetWriter;
+use crate::log::parquet_writer::{EncodeThreads, StreamingParquetWriter};
 use crate::log::rows::{cost_to_record_batches, CostLogChunk, CostLogEntry, GroupInputLog};
 use crate::log::schemas::cost_log_schema;
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
@@ -35,6 +35,10 @@ const CHUNK_BYTE_BUDGET: usize = 64 << 20;
 /// Chunks queued for the writer before the sim thread blocks. With
 /// [`CHUNK_BYTE_BUDGET`] this bounds a stream's in-flight rows to about 1 GB.
 const CHANNEL_CAP: usize = 16;
+/// Most threads that encode one stream's columns. The six `slot_*` list
+/// columns are ~99% of the encode time and `slot_input` alone ~30%, so past
+/// three or four threads the `slot_input` thread alone sets the pace.
+const MAX_ENCODE_THREADS: usize = 4;
 
 /// Rows per chunk for a row of these sizes: [`CHUNK_BYTE_BUDGET`] worth, at
 /// least one and at most [`STREAM_FLUSH_ROWS`].
@@ -142,6 +146,9 @@ pub struct CostLogger {
     chunk_rows: usize,
     /// Set after the first backpressure warning, so a writer-bound run logs it once.
     backpressure_warned: bool,
+    /// The writer's column-encode threads, raised one at a time while the
+    /// channel is full.
+    encode_threads: EncodeThreads,
     closed: bool,
     /// Set once the writer has failed: later rows are dropped, since the stream's
     /// file is already gone and the failure is on record.
@@ -192,9 +199,11 @@ impl CostLogger {
                 Err(e) => return Err(e.into()),
             }
         }
+        let encode_threads = EncodeThreads::new(MAX_ENCODE_THREADS);
         let mut writer = StreamingParquetWriter::new(parquet_path.clone(), cost_log_schema())
             .with_column_dictionary_disabled(high_cardinality_slot_columns())
-            .with_column_statistics_disabled(slot_list_columns());
+            .with_column_statistics_disabled(slot_list_columns())
+            .with_encode_threads(encode_threads.handle());
         let (tx, rx) = sync_channel::<CostLogChunk>(CHANNEL_CAP);
         let handle = std::thread::Builder::new()
             .name("vibesim-cost-logger".to_string())
@@ -220,6 +229,7 @@ impl CostLogger {
             slot_inputs_per_row: 0,
             chunk_rows: STREAM_FLUSH_ROWS,
             backpressure_warned: false,
+            encode_threads,
             closed: false,
             failed: false,
         })
@@ -304,6 +314,11 @@ impl CostLogger {
         let chunk = match tx.try_send(chunk) {
             Ok(()) => return Ok(()),
             Err(TrySendError::Full(chunk)) => {
+                // A full channel means the writer is behind: give it another
+                // column-encode thread before blocking the sim thread.
+                if let Some(threads) = self.encode_threads.grow() {
+                    tracing::debug!("cost-log writer behind: encoding on {threads} threads");
+                }
                 if !self.backpressure_warned {
                     self.backpressure_warned = true;
                     tracing::warn!(
