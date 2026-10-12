@@ -158,6 +158,10 @@ impl IterWorkerKv for FullAttnKv {
         used as f64 / partition_state.capacity_tokens().max(1) as f64
     }
 
+    fn kv_capacity_tokens(&self, partition: PartitionId) -> u64 {
+        self.partitions[partition as usize].capacity_tokens()
+    }
+
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId> {
         FullAttnKv::release_external(self, request, current_kv)
     }

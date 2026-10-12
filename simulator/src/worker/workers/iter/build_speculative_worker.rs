@@ -210,6 +210,8 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         (1, _) => LoadBalance::Single,
         (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },
         (_, DpPlacement::VllmLeastLoaded) => LoadBalance::LeastLoaded { next: 0 },
+        (_, DpPlacement::KvLeastLoaded) => LoadBalance::KvLeastLoaded { next: 0 },
+        (_, DpPlacement::KvFitLeastLoaded) => LoadBalance::KvFitLeastLoaded { next: 0 },
     };
     let admission = ChunkedPrefillAdmission::with_decode_completion(
         (0..num_partitions)

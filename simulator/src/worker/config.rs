@@ -38,9 +38,16 @@ pub enum DpPlacement {
     #[default]
     RoundRobin,
     VllmLeastLoaded,
+    KvLeastLoaded,
+    KvFitLeastLoaded,
 }
 
-const DP_PLACEMENT_CHOICES: [&str; 2] = ["round-robin", "vllm-least-loaded"];
+const DP_PLACEMENT_CHOICES: [&str; 4] = [
+    "round-robin",
+    "vllm-least-loaded",
+    "kv-least-loaded",
+    "kv-fit-least-loaded",
+];
 
 /// Where the chunked-prefill worker may end a hybrid (recurrent +
 /// full-attention) arch's non-final prefill chunk. A pure full-attention arch
@@ -529,7 +536,11 @@ pub enum IterWorkerSel {
         /// partitions when it has more than one (`num_attn_dp_groups`).
         /// `round-robin` rotates blindly; `vllm-least-loaded` is vLLM's DP load
         /// balancer (fewest waiting + running, waiting penalised under KV
-        /// pressure). Retained-prefix affinity overrides either.
+        /// pressure); `kv-least-loaded` (not vLLM) picks the lowest KV in use
+        /// plus queued KV footprint, as a fraction of capacity;
+        /// `kv-fit-least-loaded` (not vLLM) picks the fewest waiting + running
+        /// among partitions where the request's footprint fits on top of that,
+        /// else the lowest KV. Retained-prefix affinity overrides all of them.
         #[serde(default)]
         #[param(string, default = "round-robin", choices = DP_PLACEMENT_CHOICES)]
         dp_placement: DpPlacement,

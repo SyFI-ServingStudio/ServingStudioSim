@@ -300,8 +300,9 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         &mut self,
         kv_store: &K,
         session_input: SessionInput,
+        footprint_tokens: u64,
     ) -> usize {
-        let partition = self.place(kv_store, session_input);
+        let partition = self.place(kv_store, session_input, footprint_tokens);
         if let (Some(sessions), Some(session_id)) =
             (&mut self.session_partitions, session_input.session_id())
         {
@@ -310,7 +311,14 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         partition
     }
 
-    fn place<K: ChunkedPrefillKv>(&mut self, kv_store: &K, session_input: SessionInput) -> usize {
+    /// `footprint_tokens`: the new request's full KV footprint (prompt,
+    /// declared prefix and output), for placements that check it fits.
+    fn place<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &K,
+        session_input: SessionInput,
+        footprint_tokens: u64,
+    ) -> usize {
         if let Some(partition) = kv_store.retained_prefix_partition(session_input) {
             return usize::from(partition);
         }
@@ -327,10 +335,15 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             .partition_policies
             .iter()
             .enumerate()
-            .map(|(partition, (policy, _))| PartitionLoad {
-                waiting: u32::try_from(policy.len()).expect("pending queue exceeds u32"),
-                running: kv_store.status_active(partition as u16),
-                kv_usage: kv_store.kv_usage(partition as u16),
+            .map(|(partition, (policy, _))| {
+                let capacity = kv_store.kv_capacity_tokens(partition as u16).max(1) as f64;
+                PartitionLoad {
+                    waiting: u32::try_from(policy.len()).expect("pending queue exceeds u32"),
+                    running: kv_store.status_active(partition as u16),
+                    kv_usage: kv_store.kv_usage(partition as u16),
+                    queued_kv_usage: policy.queued_kv_tokens() as f64 / capacity,
+                    incoming_kv_usage: footprint_tokens as f64 / capacity,
+                }
             })
             .collect();
         self.balance.choose_by_load(&loads)
@@ -766,7 +779,10 @@ where
         // Placement is frozen when the request enters the worker. Retained KV
         // has hard affinity; cold requests use the same generic balance policy
         // as ordinary local admission.
-        let partition = self.choose_partition(kv_store, session_input);
+        let footprint_tokens = u64::from(fresh_prompt_tokens)
+            + u64::from(session_input.declared_prefix_tokens())
+            + u64::from(remaining_output_tokens);
+        let partition = self.choose_partition(kv_store, session_input, footprint_tokens);
         let hbm_tokens = kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input);
         let candidate = self.enqueue_sequence.freeze(
             request,

@@ -328,6 +328,8 @@ pub trait IterWorkerKv: KvStore {
     /// have reserved (retained prefix KV is reclaimable, so it does not count),
     /// the analogue of vLLM's per-engine `kv_cache_usage`.
     fn kv_usage(&self, partition: PartitionId) -> f64;
+    /// The partition's static KV token budget, the denominator of [`Self::kv_usage`].
+    fn kv_capacity_tokens(&self, partition: PartitionId) -> u64;
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId>;
 
     /// Static-dispatch iteration over this iteration's fresh prefills.

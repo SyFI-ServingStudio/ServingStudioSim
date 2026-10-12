@@ -70,6 +70,8 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         (1, _) => LoadBalance::Single,
         (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },
         (_, DpPlacement::VllmLeastLoaded) => LoadBalance::LeastLoaded { next: 0 },
+        (_, DpPlacement::KvLeastLoaded) => LoadBalance::KvLeastLoaded { next: 0 },
+        (_, DpPlacement::KvFitLeastLoaded) => LoadBalance::KvFitLeastLoaded { next: 0 },
     };
     let admission = ChunkedPrefillAdmission::new(
         (0..num_partitions)

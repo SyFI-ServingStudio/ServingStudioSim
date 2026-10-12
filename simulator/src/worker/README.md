@@ -433,14 +433,26 @@ chooses where a cold request lands. `round-robin` (default) rotates blindly;
 `vllm-least-loaded` ports vLLM's DP load balancer
 (`DPLBAsyncMPClient.get_core_engine_for_request`): lowest `waiting + running`,
 waiting requests penalised by `6 * max(0, kv_usage - 0.5)` each, scan start
-rotated per placement. Retained-prefix affinity still wins over both.
+rotated per placement. `kv-least-loaded` (not vLLM) picks the lowest
+`kv_usage` plus the queued requests' full KV footprint over capacity, so
+long-tailed contexts do not fill one rank while others idle.
+`kv-fit-least-loaded` (not vLLM) picks the fewest `waiting + running` among
+ranks where the request's footprint fits on top of that KV, else the lowest
+KV: DP ranks step in lockstep, so request counts set the step time and KV only
+guards capacity. Retained-prefix affinity still wins over all of them.
 
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;
 `vllm-least-loaded` ports vLLM's DP load balancer
 (`DPLBAsyncMPClient.get_core_engine_for_request`): lowest `waiting + running`,
 waiting requests penalised by `6 * max(0, kv_usage - 0.5)` each, scan start
-rotated per placement. Retained-prefix affinity still wins over both.
+rotated per placement. `kv-least-loaded` (not vLLM) picks the lowest
+`kv_usage` plus the queued requests' full KV footprint over capacity, so
+long-tailed contexts do not fill one rank while others idle.
+`kv-fit-least-loaded` (not vLLM) picks the fewest `waiting + running` among
+ranks where the request's footprint fits on top of that KV, else the lowest
+KV: DP ranks step in lockstep, so request counts set the step time and KV only
+guards capacity. Retained-prefix affinity still wins over all of them.
 
 `chunked_prefill` takes the pipeline head's scheduler options too, all off by
 default and none of them vLLM, so a PP vs DP comparison can differ only in
