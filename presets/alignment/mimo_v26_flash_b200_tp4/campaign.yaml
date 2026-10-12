@@ -780,11 +780,11 @@ cases:
       - 4096
     repeats: 64
   rate:
-    value: 3.03
+    value: 3.34
     status: measured
     derived_from: 'queueing knee = 0.8 x the case-10 saturated request rate on the same shapes: 512 requests over
-      a 135.04 s measured client completion span = 3.79 req/s'
-    evidence: logs/20261012_4_mimo_align_campaign/10_full_saturation_rate/analysis_e2e
+      a 122.67 s measured client completion span = 4.17 req/s (Slurm job 6364, this pack''s serving config)'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/10_full_saturation_rate/profile_workload
   attn_gpu_memory_gb:
     value: 116.4366
     status: measured
