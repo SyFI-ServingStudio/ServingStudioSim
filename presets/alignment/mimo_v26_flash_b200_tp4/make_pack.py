@@ -225,12 +225,10 @@ CASES = [
     dict(index=9, name="rate_knee", purpose="Maximum sustainable open-loop request rate.",
          coverage=["arrival_rate_knee"], max_concurrency=S, capture_seconds=20.0, arrival="trace",
          workload_trace=dict(shapes=MIX, repeats=64),
-         rate=dict(value=2.0, status="provisional",
-                   derived_from="0.8 x an estimated case-10 saturated rate of 2.53 req/s (512 requests in ~202 s): a "
-                                "step model fitted to job 6264's iteration log, decode 3.73 + 0.148 n + 4.05 K[M tok] "
-                                "ms per step and 21.2 ms per 1000 prefill tokens, replayed over this trace at c = S. "
-                                "Replace with 0.8 x case 10's measured request rate (glm53 precedent).",
-                   evidence=""),
+         rate=dict(value=3.03, status="measured",
+                   derived_from="queueing knee = 0.8 x the case-10 saturated request rate on the same shapes: "
+                                "512 requests over a 135.04 s measured client completion span = 3.79 req/s",
+                   evidence="logs/20261012_4_mimo_align_campaign/10_full_saturation_rate/analysis_e2e"),
          derivation="GLM's knee rule (0.8 x the case-10 saturated rate) on MiMo's throughput; same 8-shape mix and "
                     "512 requests. max_concurrency S caps in-flight requests on both sides, so an arrival burst "
                     "queues at the client instead of exceeding vLLM's max_num_seqs."),
