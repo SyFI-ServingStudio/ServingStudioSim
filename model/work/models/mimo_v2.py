@@ -21,7 +21,7 @@ Each decoder layer is ``input_layernorm -> attention -> post_attention_layernorm
   top ``num_experts_per_tok``, no shared expert) whose sigmoid ``noaux_tc`` router
   adds an FP32 ``e_score_correction_bias`` per expert.
 
-Layers group into stacks by (attention kind, FFN kind): ``ga_dense``, ``ga_moe``
+Layers group into stacks by (attention kind, FFN kind): ``global_dense``, ``global_moe``
 and ``swa_moe`` for the released checkpoint.
 
 Precision (``quantization_config``, vLLM ``Fp8Config``): Linear weights are FP8
@@ -107,7 +107,7 @@ def build(raw_config: dict) -> Model:
     for layer, (swa, moe) in enumerate(
         zip(raw_config["hybrid_layer_pattern"], raw_config["moe_layer_freq"], strict=True)
     ):
-        schedule.setdefault(f"{'swa' if swa else 'ga'}_{'moe' if moe else 'dense'}", []).append(
+        schedule.setdefault(f"{'swa' if swa else 'global'}_{'moe' if moe else 'dense'}", []).append(
             layer
         )
     moe = MoE(

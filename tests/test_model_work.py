@@ -3762,9 +3762,9 @@ MIMO_KV_GA, MIMO_KV_SWA, MIMO_WINDOW = 4, 8, 128
 MIMO_DENSE_I, MIMO_I, MIMO_E, MIMO_TOPK = 16_384, 2048, 256, 8
 MIMO_GA = (0, 5, 11, 17, 23, 29, 35, 41, 47)
 MIMO_STACKS = {
-    "ga_dense": (0,),
+    "global_dense": (0,),
     "swa_moe": tuple(layer for layer in range(48) if layer not in MIMO_GA),
-    "ga_moe": MIMO_GA[1:],
+    "global_moe": MIMO_GA[1:],
 }
 # Per-layer matrices (n x k), by hand:
 #   GA  qkv_proj: (64*192 + 4*(192 + 128)) x 4096 = 13568 x 4096 = 55,574,528
@@ -3802,15 +3802,15 @@ def test_mimo_registry_schedule_and_geometry(mimo):
     assert mimo.name == "MiMoV2ForCausalLM" and mimo.num_layers == 48
     assert {stack.tag: stack.layers for stack in mimo.layers} == MIMO_STACKS
     by_tag = {stack.tag: stack for stack in mimo.layers}
-    for tag, kv_heads in (("ga_dense", 4), ("ga_moe", 4), ("swa_moe", 8)):
+    for tag, kv_heads in (("global_dense", 4), ("global_moe", 4), ("swa_moe", 8)):
         attn = by_tag[tag].attn
         assert (attn.num_qo_heads, attn.num_kv_heads) == (MIMO_Q, kv_heads)
         assert (attn.head_dim, attn.v_dim) == (MIMO_DQK, MIMO_DV)
         assert attn.attention_sinks == (tag == "swa_moe")
     assert isinstance(by_tag["swa_moe"].attn, SlidingWindowGQA)
     assert by_tag["swa_moe"].attn.window == MIMO_WINDOW
-    assert not isinstance(by_tag["ga_moe"].attn, SlidingWindowGQA)
-    assert by_tag["ga_dense"].ffn.intermediate == MIMO_DENSE_I
+    assert not isinstance(by_tag["global_moe"].attn, SlidingWindowGQA)
+    assert by_tag["global_dense"].ffn.intermediate == MIMO_DENSE_I
     moe = by_tag["swa_moe"].ffn
     assert (moe.num_experts, moe.top_k, moe.moe_intermediate) == (MIMO_E, MIMO_TOPK, MIMO_I)
     assert moe.shared_intermediate == 0
@@ -3944,7 +3944,7 @@ def test_mimo_8k_prefill_and_4k_decode_totals(mimo):
     }
     assert sum(decode.flops.values()) == 125_422_272_512
     rows = {segment.name: segment.bytes_total for segment in decode.segments}
-    assert rows["ga_moe.attn.decode"] == 8 * 4 * 4095 * 2560
+    assert rows["global_moe.attn.decode"] == 8 * 4 * 4095 * 2560
     assert rows["swa_moe.attn.decode"] == 39 * 4 * 127 * 5120
     assert rows["swa_moe.kv_cache_append"] == 39 * 4 * 5120
 
@@ -3955,8 +3955,8 @@ def test_mimo_precision_follows_the_checkpoint(mimo):
     for tag in MIMO_STACKS:
         assert dtypes[f"{tag}.qkv"] == "fp8"
         assert dtypes[f"{tag}.o"] == "bf16"  # every layer's o_proj is in ignored_layers
-    assert dtypes["ga_dense.gate_up"] == dtypes["ga_dense.down"] == "fp8"
-    for tag in ("ga_moe", "swa_moe"):
+    assert dtypes["global_dense.gate_up"] == dtypes["global_dense.down"] == "fp8"
+    for tag in ("global_moe", "swa_moe"):
         assert dtypes[f"{tag}.router"] == "bf16"
         # MXFP4 storage, BF16 activations.
         assert dtypes[f"{tag}.expert_gate_up"] == dtypes[f"{tag}.expert_down"] == "bf16"
