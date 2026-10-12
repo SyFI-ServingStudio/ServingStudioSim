@@ -26,6 +26,13 @@
 //! context that keeps the same critical path: a single-wave batch follows its
 //! longest request, a many-wave batch its total work.
 //!
+//! A window layer can opt into a ragged segment past `context_top`
+//! ([`Fa4VarlenCall::ragged_short_context`]): FA4 splits each request by its
+//! FULL context while a split reads only the window, so beside one long
+//! request the short ones stay unsplit and read the whole window in one CTA.
+//! No uniform batch reaches that critical path; the segment's end
+//! (`max_model_len`) holds the batch that does (see [`canonical_pairs`]).
+//!
 //! Between two grid decode counts the decode coordinate is placed by the same
 //! CTA model counted in whole waves of 148 CTAs (`decode_coordinate`), so a
 //! wave or split-count step lands where it happens instead of being averaged
@@ -92,6 +99,15 @@ pub(crate) trait Fa4VarlenCall {
     /// model is monotone in the context.
     fn context_breaks(&self, _decodes: u32, _prefill: u32) -> Vec<u32> {
         Vec::new()
+    }
+
+    /// Opt-in (default `None`): the context of the short requests in the
+    /// ragged canonical batch that ends a segment from `context_top` to
+    /// `max_model_len` (see [`ragged_segment`]). A call whose split count
+    /// follows each request's full context while its CTAs read only a
+    /// window returns the first context that fills the window.
+    fn ragged_short_context(&self) -> Option<u32> {
+        None
     }
 
     /// The tile shape and per-request split counts of a launch over `pairs`
@@ -184,11 +200,15 @@ pub(crate) fn decode_coordinate<C: Fa4VarlenCall>(
         return f64::from(decodes);
     }
     let lo = axis[hi_index - 1];
-    let context = context.round() as u32;
     let model = |count: u32| {
-        let pairs = canonical_pairs(call, count, prefill, context)
-            .expect("a grid neighbour of a decode count >= 1 is non-empty");
-        wave_makespan(call, &pairs, pairs.len() as u32)
+        segment_model(call, count, prefill, context, |pairs, launched| {
+            wave_makespan(call, pairs, launched)
+        })
+        .unwrap_or_else(|| {
+            let pairs = canonical_pairs(call, count, prefill, context.round() as u32)
+                .expect("a grid neighbour of a decode count >= 1 is non-empty");
+            wave_makespan(call, &pairs, pairs.len() as u32)
+        })
     };
     let (m_lo, m, m_hi) = (model(lo), model(decodes), model(hi));
     let linear = f64::from(decodes - lo) / f64::from(hi - lo);
@@ -204,8 +224,23 @@ pub(crate) fn decode_coordinate<C: Fa4VarlenCall>(
     f64::from(lo) + t * f64::from(hi - lo)
 }
 
+/// The ragged segment `(context_top, max_model_len, short context)` when the
+/// call opts in and the context axis has room past its top.
+fn ragged_segment<C: Fa4VarlenCall>(call: &C) -> Option<(u32, u32, u32)> {
+    let short = call.ragged_short_context()?;
+    let (top, end) = (call.context_top(), call.max_model_len());
+    (top < end && short < top).then_some((top, end, short))
+}
+
 /// The canonical batch at a grid point; `None` for the empty batch. Its
 /// prefill tokens are one chunk, however many requests they came from.
+///
+/// At the end of a ragged segment (`max_model_len`, [`ragged_segment`]) one
+/// decode, the anchor, holds `max_model_len` keys and the other decodes and
+/// the chunk's prefix the short context: the anchor's KV blocks dominate
+/// the per-SM share the split rule divides by, so the short requests run
+/// unsplit over their whole window while the anchor splits. A batch without
+/// a decode has no anchor and keeps the uniform batch.
 pub(crate) fn canonical_pairs<C: Fa4VarlenCall>(
     call: &C,
     decodes: u32,
@@ -217,12 +252,47 @@ pub(crate) fn canonical_pairs<C: Fa4VarlenCall>(
     }
     let max_model_len = call.max_model_len();
     let context = context.clamp(1, max_model_len);
+    if let Some((_, end, short)) = ragged_segment(call) {
+        if context == end && decodes > 0 {
+            let mut pairs = vec![(1, end)];
+            pairs.extend(std::iter::repeat_n((1, short), decodes as usize - 1));
+            if prefill > 0 {
+                let prefix = (short - 1).min(max_model_len.saturating_sub(prefill));
+                pairs.push((prefill, prefix + prefill));
+            }
+            return Some(pairs);
+        }
+    }
     let mut pairs = vec![(1, context); decodes as usize];
     if prefill > 0 {
         let prefix = (context - 1).min(max_model_len.saturating_sub(prefill));
         pairs.push((prefill, prefix + prefill));
     }
     Some(pairs)
+}
+
+/// The canonical model inside a ragged segment: the cache interpolates
+/// linearly between the segment's two ends, which hold different batches, so
+/// the model there is the same blend of their modelled costs. `None` outside
+/// a segment.
+fn segment_model<C: Fa4VarlenCall>(
+    call: &C,
+    decodes: u32,
+    prefill: u32,
+    context: f64,
+    cost: impl Fn(&[(u32, u32)], u32) -> f64,
+) -> Option<f64> {
+    let (top, end, _) = ragged_segment(call)?;
+    if context <= f64::from(top) {
+        return None;
+    }
+    let at = |context: u32| {
+        let pairs = canonical_pairs(call, decodes, prefill, context)
+            .expect("a non-empty batch has a canonical batch");
+        cost(&pairs, pairs.len() as u32)
+    };
+    let t = ((context - f64::from(top)) / f64::from(end - top)).min(1.0);
+    Some(at(top) * (1.0 - t) + at(end) * t)
 }
 
 /// The cache coordinates of a real batch launched over `padded_requests`
@@ -275,6 +345,9 @@ fn equivalent_context<C: Fa4VarlenCall>(
     // Fractional contexts: the model is linear in the context between integer
     // points, so interpolate there to keep the projection continuous.
     let model = |context: f64| {
+        if let Some(cost) = segment_model(call, decodes, prefill, context, cost) {
+            return cost;
+        }
         let lo = context.floor();
         let t = context - lo;
         canonical(lo) * (1.0 - t) + canonical(lo + 1.0) * t
@@ -286,14 +359,19 @@ fn equivalent_context<C: Fa4VarlenCall>(
     // The first segment between breaks (or the whole axis) whose end reaches
     // the target; the model is monotone inside each segment. A segment that
     // ends flat at the target is searched for where it reaches it; at the
-    // axis top a batch as long as that, or longer, takes the top.
-    let top = call.context_top();
+    // axis top a batch as long as that, or longer, takes the top. A ragged
+    // segment continues the axis past `context_top` to its own end.
+    let mut top = call.context_top();
     let mut ends: Vec<u32> = call
         .context_breaks(decodes, prefill)
         .into_iter()
         .filter(|&end| end > 1 && end < top)
         .collect();
     ends.sort_unstable();
+    if let Some((segment_start, end, _)) = ragged_segment(call) {
+        ends.push(segment_start);
+        top = end;
+    }
     ends.push(top);
     let mut reached = None;
     for end in ends {

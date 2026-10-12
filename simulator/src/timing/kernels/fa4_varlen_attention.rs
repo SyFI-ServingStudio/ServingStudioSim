@@ -296,6 +296,18 @@ impl Fa4VarlenCall for Fa4VarlenAttentionKernelConfig {
         true
     }
 
+    /// A window layer splits each request by its full context
+    /// (`FlashPrepareScheduler`, prepare_scheduler.py: `ceil(kv_blocks /
+    /// per_sm)` over `seqused_k`) while each split reads only the window
+    /// (block_info.py `get_n_block_min_max`). Beside one long request the
+    /// short ones keep one split and read the whole window in one CTA: a
+    /// ragged step's critical path, which no uniform batch has. Its short
+    /// requests sit one window of tiles plus half a tile past the start, where
+    /// every query reads a whole window.
+    fn ragged_short_context(&self) -> Option<u32> {
+        (self.window > 0).then_some(self.window + TILE_N + CONTEXT_TILE_OFFSET)
+    }
+
     fn decode_axis(&self) -> Vec<u32> {
         let mut axis = DECODE_KNOTS.to_vec();
         axis.push(self.first_unsplit_decodes());
@@ -407,6 +419,11 @@ fn context_axis(config: &Fa4VarlenAttentionKernelConfig) -> Vec<f64> {
         values.sort_unstable();
         values.dedup();
         values.push(top);
+        // The ragged segment's end: one decode at `max_model_len`, the rest
+        // short (`ragged_short_context`, `canonical_pairs`).
+        if top < config.max_model_len {
+            values.push(config.max_model_len);
+        }
         values
     };
     Axis::values(values)
@@ -653,6 +670,8 @@ mod tests {
                 (8, 64, 1),
                 (cfg.first_unsplit_decodes(), cfg.first_tile_tokens(), 192),
                 (128, 0, 32832),
+                (16, 0, 131072),
+                (8, 256, 131072),
             ] {
                 let pairs = canonical_pairs(&cfg, decodes, prefill, context).unwrap();
                 let [d, a, c] = project(&cfg, &pairs, 0);
@@ -676,6 +695,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ragged_window_decode_reaches_past_the_uniform_top() {
+        // Defect caught: a window graph decode with long and short requests
+        // clamped to the uniform top. The short ones keep one split (FA4
+        // splits by the full context) and read their whole window in one CTA,
+        // longer than any uniform batch's CTA (capture 6264, iteration 4094:
+        // nine decodes padded to 16, measured 13% over the uniform top).
+        let cfg = config(true);
+        let real = [
+            (1, 85403),
+            (1, 26672),
+            (1, 2879),
+            (1, 2830),
+            (1, 66789),
+            (1, 19428),
+            (1, 4550),
+            (1, 124417),
+            (1, 2112),
+        ];
+        assert_eq!(cfg.tiling(&real, 16).splits, [4, 4, 1, 1, 4, 4, 1, 4, 1]);
+        let [d, a, c] = project(&cfg, &real, 16);
+        assert_eq!((d, a), (16.0, 0.0));
+        assert!(c > 32832.0 && c < 131072.0, "{c}");
+        // The segment's end holds that critical path: the anchor splits, the
+        // short decodes do not.
+        let anchor = canonical_pairs(&cfg, 16, 0, 131072).unwrap();
+        let splits = cfg.tiling(&anchor, 16).splits;
+        assert_eq!((splits[0], splits[1]), (4, 1));
+        // An all-long batch stays on the uniform axis.
+        let long = [(1, 90000), (1, 120000), (1, 100000)];
+        assert!(project(&cfg, &long, 16)[2] <= 32832.0);
+        // A full-causal layer has no segment.
+        assert_eq!(config(false).ragged_short_context(), None);
     }
 
     #[test]
@@ -719,7 +773,7 @@ mod tests {
         );
         assert_eq!(
             local[2],
-            [1.0, 80.0, 192.0, 1088.0, 4160.0, 8256.0, 32832.0]
+            [1.0, 80.0, 192.0, 1088.0, 4160.0, 8256.0, 32832.0, 131072.0]
         );
         for window in [false, true] {
             let cfg = config(window);
