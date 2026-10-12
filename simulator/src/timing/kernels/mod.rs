@@ -25,6 +25,8 @@ pub mod dsa_topk_prefill;
 pub mod elementwise;
 pub mod engine;
 pub mod engram_lookup;
+pub mod fa4_varlen_attention;
+pub mod fa4_varlen_projection;
 pub mod flashinfer_attn_decode;
 pub mod flashinfer_attn_prefill;
 pub mod flashinfer_attn_rect;
@@ -163,6 +165,10 @@ pub use elementwise::{
 pub use engine::{Kernel, KernelConfig, KernelSpec, OffGrid};
 pub use engram_lookup::{
     EngramLookupKernel, EngramLookupKernelConfig, EngramLookupKernelInput, EngramLookupSpec,
+};
+pub use fa4_varlen_attention::{
+    Fa4VarlenAttentionKernel, Fa4VarlenAttentionKernelConfig, Fa4VarlenAttentionKernelInput,
+    Fa4VarlenAttentionSpec,
 };
 pub use flashinfer_attn_decode::{
     FlashinferAttnDecodeKernel, FlashinferAttnDecodeKernelConfig, FlashinferAttnDecodeKernelInput,
