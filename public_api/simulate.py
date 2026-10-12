@@ -215,7 +215,7 @@ def check_capture(
     build_type: str = "release",
     *,
     build: bool = True,
-) -> tuple[dict[str, int] | None, dict | None, list[dict] | None]:
+) -> tuple[dict[str, int] | None, dict | None, list[dict] | None, dict | None]:
     """What a run of ``member`` on ``capture`` meets, from the run's own checks
     of one run config, its trace written as a run writes it
     (:func:`write_trace`):
@@ -227,7 +227,8 @@ def check_capture(
       ``{"reason", "pool", "max_model_len", "requests", "total"}``, the limit when the
       simulator gives them; None when they fit;
     - the pools' request bounds (:attr:`SimMember.bounds`): the build's, else
-      the member's own.
+      the member's own;
+    - with ``build``, its KV cache (:attr:`SimMember.kv_cache`), else None.
 
     A drafting member stands in an acceptance the capture lacks: the reader
     gives one, and its value changes neither answer."""
@@ -245,21 +246,23 @@ def check_capture(
         tags, _ = write_trace(member, source, workload, path, bounds)
         trace = TraceSource(path, source.input_file_format, tuple(tags), source.name)
         config = concrete(run_tree(index, member, capture, read_block(trace), scratch), registry)
-        missing = None
+        missing = kv_cache = None
         if build:
-            missing, bounds = _dry_run(config, scratch, build_type)
+            missing, bounds, kv_cache = _dry_run(config, scratch, build_type)
             write_trace(member, source, workload, path, bounds)
         try:
             plan_run(config, build_type)
             misfit = None
         except BadWorkload as refusal:
             misfit = {"reason": str(refusal), **(refusal.too_long or {})}
-    return missing, misfit, bounds
+    return missing, misfit, bounds, kv_cache
 
 
-def _dry_run(config: dict, scratch: Path, build_type: str) -> tuple[dict[str, int], list[dict]]:
-    """``simulator dry-run`` of ``config``: the profile.db rows it lacks, and
-    its pools' request bounds."""
+def _dry_run(
+    config: dict, scratch: Path, build_type: str
+) -> tuple[dict[str, int], list[dict], dict]:
+    """``simulator dry-run`` of ``config``: the profile.db rows it lacks, its
+    pools' request bounds, and its KV cache (the run's ``raw/kv_cache.json``)."""
     report, error = scratch / "dry_run_report.json", scratch / ERROR_JSON
     argv = build_cli_command(
         config, binary_path(build_type), scratch / "run_config.yaml", "dry-run", error_json=error
@@ -277,7 +280,7 @@ def _dry_run(config: dict, scratch: Path, build_type: str) -> tuple[dict[str, in
     if result.returncode:
         raise RuntimeError(_cause(binary_error(error), result.stderr, scratch))
     document = json.loads(report.read_text())
-    return missing_by_role(document), document["pools"]
+    return missing_by_role(document), document["pools"], document["kv_cache"]
 
 
 # -- workloads -----------------------------------------------------------------

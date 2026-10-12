@@ -97,6 +97,7 @@ The tree route takes the preset's `id` from `/models`, which has the form
 ```bash
 curl -s "$API/models/Llama-3.1-8B/llama3_dense_tp/tree?tp_size=2" > tree.json
 jq '{arch, gpu, gpus_per_replica, predict, missing}' tree.json
+jq '.kv_cache' tree.json   # the arch's KV layout; bytes over attention_shards GPUs
 jq -r '.sections[] | .section as $s | .slots | to_entries[]
   | [$s, .key, .value.name, .value.kernel, .value.config] | @tsv' tree.json
 ```
