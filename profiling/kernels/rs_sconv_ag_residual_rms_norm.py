@@ -122,7 +122,7 @@ register(
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
         # LamportRSConv exists only in the rebased alignment checkout.
-        subprocess_env="vllm_upstream_fork_env",
+        subprocess_env="vllm_env",
         gpu_count_fn=lambda spec: int(spec["num_gpus"]),
         list_native=True,
         doc=BackendDoc(

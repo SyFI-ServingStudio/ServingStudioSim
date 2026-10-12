@@ -78,7 +78,7 @@ def profile_gemm_fp32_output_vllm_ll_bf16(
         )
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires the alignment vLLM fork (vllm_upstream_fork_env)"
+            f"{_BACKEND} requires the alignment vLLM fork (vllm_env)"
         ) from exc
     # Without cute-DSL the call silently runs torch.mm where it would run
     # ll_bf16_gemm; those rows would be cuBLAS times under this backend's label.

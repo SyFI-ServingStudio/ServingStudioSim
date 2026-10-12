@@ -7,7 +7,7 @@ at `8 * num_tokens` = 8192 rows (`rel_extent` 512) or 2048 rows (otherwise),
 plus decode-sized shapes, mixed-batch shapes and beyond-grid extrapolation.
 
 Pre-fill the grid rows first with `launcher kernel-profile run` (the
-`vllm_upstream_fork_env` backend should be profiled from a Python process, not
+`vllm_env` backend should be profiled from a Python process, not
 JIT-filled through the `kernel-query` bridge). Off-grid ground truth is
 JIT-profiled, so point `VIBESIM_PROFILE_DB` at a scratch copy. On a B200:
 

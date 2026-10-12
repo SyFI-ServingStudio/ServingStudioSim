@@ -142,7 +142,7 @@ register(
             compute=frozenset({DType.BF16}),
         ),
         # _linear_with_fp32_out exists only in the upstream-rebased alignment fork.
-        subprocess_env="vllm_upstream_fork_env",
+        subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
                 "The alignment fork's _linear_with_fp32_out dispatch: "
