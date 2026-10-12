@@ -192,6 +192,11 @@ class KernelProfilerSpec:
     # ``@autotune`` selection never leaks between worker processes through
     # ``TRITON_CACHE_DIR``. Runners must not mutate ``os.environ`` for this.
     worker_env: tuple[tuple[str, str], ...] = ()
+    # The runner allocates CUDA fabric memory (CU_MEM_HANDLE_TYPE_FABRIC), as
+    # FlashInfer's MNNVL workspace does, which needs an IMEX channel device. A
+    # container worker gets that device only when this is set (see
+    # profiling/exec/local.py); a host worker sees the host's /dev directly.
+    imex_channel: bool = False
     # Optional lazy ``(**schema_kwargs) -> str | None`` called in the worker
     # right after the chunk runs, once per successful spec. A returned note is
     # appended to the row's ``backend_version`` so worker-process state that
