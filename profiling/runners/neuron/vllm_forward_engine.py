@@ -107,13 +107,50 @@ def seqs_buckets(plan, cases):
     return sorted(buckets)
 
 
+def segment_timing_cases(plan, cases):
+    """Batch-1 prefill timing calls of a segmented plan, one per validation subject.
+
+    A lone request is the only sequence the scheduler can prefill, so the k-th
+    prefill execution of the call is its k-th segment (prior = k x segment).
+    Each call reuses the subject's prompt from the prefill validation shape and
+    must reproduce that accepted request's tokens. Whole-forward plans get none.
+    """
+    if not plan.get("segment_size") or not any(s["phase"] == "prefill" for s in plan["specs"]):
+        return []
+    bucket = prefill_validation_bucket(plan["context"])
+    validation = [case for case in cases if case["bucket"] == bucket]
+    slots = [(case, slot) for case in validation for slot in range(len(case["prompts"]))]
+    smallest = min(seqs_buckets(plan, cases))
+    timing = []
+    for subject in range(8):
+        case, slot = slots[subject]
+        timing.append(
+            {
+                "id": f"segment-timing-subject{subject}",
+                "shape_id": case["shape_id"],
+                # A batch-1 decode pads to the smallest compiled graph.
+                "bucket": smallest,
+                "prompts": [case["prompts"][slot]],
+                "expected_case_id": f"{case['id']}-slot{slot}",
+                "segment_timing": True,
+            }
+        )
+    return timing
+
+
 def engine_config(plan, cases, root, mode):
-    """Public ``LLM`` arguments; ``cases`` is the full (unfiltered) canonical workload."""
-    tokens = plan["context"]
+    """Public ``LLM`` arguments; ``cases`` is the full (unfiltered) canonical workload.
+
+    A plan with ``segment_size`` S serves the same context with the stock prefill
+    segmentation: S-token budgets, S-token batched-token and KV-segment buckets.
+    """
+    tokens = plan.get("segment_size", plan["context"])
     nc = {
         "num_batched_tokens_buckets": [tokens],
         "num_seqs_buckets": seqs_buckets(plan, cases),
     }
+    if "segment_size" in plan:
+        nc["kv_segment_size_buckets"] = [tokens]
     extra = {"neuron_config": nc}
     if mode == "accuracy":
         nc["debug_logits_dir"] = str(root / "raw-logits")
@@ -141,9 +178,17 @@ def engine_config(plan, cases, root, mode):
     return config
 
 
-def profile_cases(cases, precision):
-    """The numerically accepted calls the timing stage replays."""
-    selected = [case for case in cases if precision["by_shape"][case["shape_id"]]["passed"]]
+def profile_cases(plan, cases, timing, precision):
+    """Numerically accepted calls for the timing stage.
+
+    Segmented plans time prefill only from the batch-1 ``timing`` calls, so the
+    canonical calls run only when decode rows need them.
+    """
+    if timing and not any(s["phase"] == "decode" for s in plan["specs"]):
+        cases = []
+    selected = [
+        case for case in cases + timing if precision["by_shape"][case["shape_id"]]["passed"]
+    ]
     if not selected:
         raise ValueError("no numerically accepted cases to profile")
     return selected
@@ -159,9 +204,13 @@ def main(root, mode):
         plan, AutoTokenizer.from_pretrained(plan["model"], local_files_only=True)
     )
     save(root, "cases.json", cases)
+    timing = segment_timing_cases(plan, cases)
+    if timing:
+        save(root, "timing-cases.json", timing)
     config = engine_config(plan, cases, root, mode)
     if mode == "profile":
-        cases = profile_cases(cases, json.loads((root / "precision.json").read_text()))
+        precision = json.loads((root / "precision.json").read_text())
+        cases = profile_cases(plan, cases, timing, precision)
     save(root, f"{mode}-config.json", config)
     from profiling.runners.neuron.vllm_identity import (
         accuracy_source_identity,
@@ -192,6 +241,8 @@ def main(root, mode):
             "stop_epoch_ns": time.time_ns(),
             "requests": [],
         }
+        if case.get("segment_timing"):
+            result["segment_timing"] = True
         for slot, output in enumerate(outputs):
             tokens = output.outputs[0].token_ids
             if output.prompt_token_ids != case["prompts"][slot] or len(tokens) != 8:
@@ -255,7 +306,8 @@ def main(root, mode):
         def checked(case):
             row = generate(case)
             if any(
-                request["token_ids"] != expected[request["case_id"]] for request in row["requests"]
+                request["token_ids"] != expected[case.get("expected_case_id", request["case_id"])]
+                for request in row["requests"]
             ):
                 raise RuntimeError("production sampling differs from numerical validation")
             return row

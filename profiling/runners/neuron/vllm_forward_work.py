@@ -29,3 +29,103 @@ def estimate_work(phase: str, token_bucket: int, max_model_len: int) -> dict[str
         "attention_flops_per_rank": attention,
         "persistent_operand_bytes_per_rank": 3752861696 + 2 * tokens * 4096 + cache_bytes,
     }
+
+
+def estimate_segmented_work(
+    phase: str, token_bucket: int, prior_tokens: int, max_model_len: int
+) -> dict[str, int]:
+    """One forward of the segmented-prefill engine; same caveats as ``estimate_work``.
+
+    Decode is the stock decode graph (``prior_tokens`` 0). A prefill segment of
+    S = ``token_bucket`` padded tokens attends to its ``prior_tokens`` cached
+    history in full plus the causal self part, tiled like the whole-forward CTE
+    loop (128-row query tiles; 512-token causal key tiles within the segment). It
+    reads the prior KV and writes the segment's. With no prior it equals the
+    whole-forward prefill of S tokens.
+    """
+    if phase == "decode":
+        if prior_tokens:
+            raise ValueError("decode forwards carry no segment prior")
+        return estimate_work(phase, token_bucket, max_model_len)
+    if phase != "prefill":
+        raise ValueError("unknown segmented-forward phase")
+    tokens = token_bucket
+    whole = estimate_work("prefill", tokens, tokens)
+    # Every query row scores and mixes every prior key (QK and PV pairs alike).
+    prior_attention = 32 * 2 * 8 * 128 * 2 * tokens * prior_tokens
+    return {
+        "contraction_flops_per_rank": whole["contraction_flops_per_rank"] + prior_attention,
+        "attention_flops_per_rank": whole["attention_flops_per_rank"] + prior_attention,
+        "persistent_operand_bytes_per_rank": (
+            whole["persistent_operand_bytes_per_rank"] + 32768 * prior_tokens
+        ),
+    }
+
+
+LM_HEAD_BYTES_PER_RANK = 2 * 32064 * 4096  # BF16 vocabulary shard read by the projection.
+
+
+def estimate_region_work(
+    region: str, phase: str, token_bucket: int, max_model_len: int
+) -> dict[str, int]:
+    """Split ``estimate_work`` at the public LlamaModel return; same caveats.
+
+    ``head`` is the lm_head contraction over the sampled rows and its weight
+    shard; ``model`` is the whole-forward estimate minus ``head``.
+    """
+    whole = estimate_work(phase, token_bucket, max_model_len)
+    sampled_rows = 1 if phase == "prefill" else token_bucket
+    head = {
+        "contraction_flops_per_rank": 2 * sampled_rows * 4096 * 32064,
+        "attention_flops_per_rank": 0,
+        "persistent_operand_bytes_per_rank": LM_HEAD_BYTES_PER_RANK,
+    }
+    if region == "head":
+        return head
+    if region == "model":
+        return {name: whole[name] - head[name] for name in whole}
+    raise ValueError("region must be model or head")
+
+
+NORM_BYTES_PER_RANK = 2 * 4096  # One replicated BF16 RMSNorm weight.
+
+
+def estimate_segment_work(
+    segment: str, phase: str, token_bucket: int, max_model_len: int
+) -> dict[str, int]:
+    """Split ``estimate_work`` by the semantic owner of each collective segment.
+
+    ``embedding``: gathered BF16 embedding rows, no contraction. ``attention_block``
+    and ``mlp_block`` are ONE layer: its input or post-attention RMSNorm weight,
+    QKV/O (with 1/32 of the attention contractions and KV-cache bytes) or the gated
+    MLP. ``head``: final norm plus the lm_head contraction and shard. Then
+    embedding + 32 x (attention + MLP) + head equals the whole-forward estimate.
+    Same caveats: estimates, not counters.
+    """
+    tokens = token_bucket
+    whole = estimate_work(phase, token_bucket, max_model_len)
+    head = estimate_region_work("head", phase, token_bucket, max_model_len)
+    cache_bytes = whole["persistent_operand_bytes_per_rank"] - 3752861696 - 2 * tokens * 4096
+    attention = whole["attention_flops_per_rank"] // 32
+    rows = {
+        "embedding": (0, 0, 2 * tokens * 4096),
+        "attention_block": (
+            2 * tokens * (4096 * 1536 + 1024 * 4096) + attention,
+            attention,
+            2 * (4096 * 1536 + 1024 * 4096) + NORM_BYTES_PER_RANK + cache_bytes // 32,
+        ),
+        "mlp_block": (2 * tokens * 3 * 4096 * 3584, 0, 2 * 3 * 4096 * 3584 + NORM_BYTES_PER_RANK),
+        "head": (
+            head["contraction_flops_per_rank"],
+            0,
+            head["persistent_operand_bytes_per_rank"] + NORM_BYTES_PER_RANK,
+        ),
+    }
+    if segment not in rows:
+        raise ValueError("segment must be embedding, attention_block, mlp_block or head")
+    flops, attention_flops, persistent = rows[segment]
+    return {
+        "contraction_flops_per_rank": flops,
+        "attention_flops_per_rank": attention_flops,
+        "persistent_operand_bytes_per_rank": persistent,
+    }

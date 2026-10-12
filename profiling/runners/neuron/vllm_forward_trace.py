@@ -51,6 +51,54 @@ def model_geometry(metadata, expected_context=None):
     return phase, int(token_match[1])
 
 
+def compiled_inputs(metadata):
+    """``example_inputs.txt`` as {index: (shape, dtype)}."""
+    inputs = {}
+    for index, shape, dtype in re.findall(
+        r"Input (\d+):\s+Shape: \(([^)]*)\)\s+Dtype: (\w+)", metadata
+    ):
+        inputs[int(index)] = (tuple(int(n) for n in shape.replace(",", " ").split()), dtype)
+    return inputs
+
+
+KV_POOL = ((KV_BLOCKS, 2, BLOCK_SIZE, 128), "bfloat16")
+
+
+def segmented_model_geometry(metadata, context, segment_size):
+    """Geometry of a stock segmented-prefill engine's graphs.
+
+    The prefill graph runs one sequence's S-token segment against its cached
+    history: S token ids, a (1, 1) cached-length operand (input 5), a
+    (1, context/32) block table and the 64 per-layer K/V pools. Decode graphs are
+    the stock ones (``model_geometry``); an unsegmented prefill graph is refused.
+    """
+    inputs = compiled_inputs(metadata)
+    if inputs.get(5) == ((1, 1), "int32"):
+        if inputs.get(0) != ((segment_size,), "int64"):
+            raise ValueError("compiled prefill segment differs from declared segment size")
+        if ((1, context // BLOCK_SIZE), "int32") not in inputs.values():
+            raise ValueError("compiled segment block-table width differs from declared context")
+        if sum(value == KV_POOL for value in inputs.values()) != 64:
+            raise ValueError("compiled segment KV pool or dtype differs from declared layout")
+        return "prefill", segment_size
+    phase, bucket = model_geometry(metadata, context)
+    if phase != "decode":
+        raise ValueError("segmented engine compiled an unsegmented prefill graph")
+    return phase, bucket
+
+
+def plan_geometry(metadata, plan):
+    """The (phase, bucket) of a compiled graph under ``plan``'s engine."""
+    if "segment_size" in plan:
+        return segmented_model_geometry(metadata, plan["context"], plan["segment_size"])
+    return model_geometry(metadata, plan["context"])
+
+
+def segment_count(context, segment_size):
+    """Prefill executions of one (context-8)-token canonical prompt."""
+    return -(-(context - 8) // segment_size)
+
+
 def group_executions(events, requests, physical_cores):
     """Join rank intervals into whole-chip executions inside one public request.
 
@@ -145,6 +193,56 @@ def measure_trace(events, requests, model_info, physical_cores):
     return dict(measured), records
 
 
+def measure_segmented_trace(events, requests, model_info, physical_cores, segments):
+    """Time a segmented-prefill run; keys are (phase, bucket, prior_tokens).
+
+    Every call must show ``segments`` prefill executions per request. Prefill
+    timing comes only from batch-1 ``segment_timing`` calls: the lone request is
+    the only sequence the scheduler can prefill, so its k-th prefill execution
+    in device order is segment k (prior = k x S), and all of them precede its
+    first decode. Decode keys use prior 0. The unchanged whole-forward coverage
+    check then sees one prefill per request (the last segment, which samples).
+    """
+    records, measured, coverage = [], collections.defaultdict(list), []
+    by_call = collections.defaultdict(list)
+    for execution in group_executions(events, requests, physical_cores):
+        phase, bucket = model_info[execution["model_hash"]]
+        record = {
+            "request_index": execution["request_index"],
+            "exec_id": execution["exec_id"],
+            "model_id": execution["model_id"],
+            "model_hash": execution["model_hash"],
+            "phase": phase,
+            "token_bucket": bucket,
+            "prior_tokens": 0 if phase == "decode" else None,
+            "start_ns": execution["spans"][0][0],
+            "time_ms": union_duration(execution["spans"]) / 1e6,
+        }
+        records.append(record)
+        by_call[execution["request_index"]].append(record)
+    for index, request in enumerate(requests):
+        ordered = sorted(by_call[index], key=lambda record: record["start_ns"])
+        prefills = [record for record in ordered if record["phase"] == "prefill"]
+        if len(prefills) != request["batch"] * segments:
+            raise ValueError("native trace is missing a prefill segment")
+        if request.get("segment_timing"):
+            if request["batch"] != 1:
+                raise ValueError("segment timing requires one request per call")
+            if any(record["phase"] == "decode" for record in ordered[:segments]):
+                raise ValueError("a decode ran before the lone request finished its prefill")
+            for ordinal, record in enumerate(prefills):
+                record["prior_tokens"] = ordinal * record["token_bucket"]
+        coverage += [record for record in ordered if record["phase"] == "decode"]
+        coverage += prefills[segments - 1 :: segments]
+    for record in records:
+        if record["prior_tokens"] is not None:
+            measured[(record["phase"], record["token_bucket"], record["prior_tokens"])].append(
+                record["time_ms"]
+            )
+    check_forward_coverage(coverage, requests)
+    return dict(measured), records
+
+
 def export_events(root):
     """Export the NRT system trace under ``root/profiles``; return device executions."""
     output = root / "system-trace.json"
@@ -209,12 +307,18 @@ def export_and_measure(root, compile_cache):
         files = list((compile_cache / model_hash).rglob("example_inputs.txt"))
         if not files:
             raise ValueError("cannot recover compiled input geometry")
-        geometries = {model_geometry(path.read_text(), plan["context"]) for path in files}
+        geometries = {plan_geometry(path.read_text(), plan) for path in files}
         if len(geometries) != 1:
             raise ValueError("compiled graph rank geometries disagree")
         models[model_hash] = geometries.pop()
     requests = json.loads((root / "profiled-outputs.json").read_text())
-    measured, records = measure_trace(events, requests, models, reserved_physical_cores())
+    if "segment_size" in plan:
+        segments = segment_count(plan["context"], plan["segment_size"])
+        measured, records = measure_segmented_trace(
+            events, requests, models, reserved_physical_cores(), segments
+        )
+    else:
+        measured, records = measure_trace(events, requests, models, reserved_physical_cores())
     (root / "execution-records.json").write_text(json.dumps(records, indent=2))
     (root / "timing.json").write_text(
         json.dumps({":".join(map(str, key)): values for key, values in measured.items()}, indent=2)

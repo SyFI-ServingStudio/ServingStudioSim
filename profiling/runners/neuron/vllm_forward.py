@@ -78,16 +78,20 @@ def verify_identity(model):
     return {"versions": observed, "model_sha256": hashes}
 
 
-def run_stage(root, stage):
-    """Run one isolated stage process; its log stays with the run's artifacts."""
-    module = (
-        "profiling.runners.neuron.vllm_forward_reference"
-        if stage == "reference"
-        else "profiling.runners.neuron.vllm_forward_engine"
-    )
+def run_stage(root, stage, engine="profiling.runners.neuron.vllm_forward_engine", env=None):
+    """Run one isolated stage process; its log stays with the run's artifacts.
+
+    ``engine`` selects the serving-process entry module (a region or segment
+    run wraps the stock engine); ``env`` adds stage-only variables (for example
+    device-profiler buffer sizes).
+    """
+    module = "profiling.runners.neuron.vllm_forward_reference" if stage == "reference" else engine
     with (root / f"{stage}.log").open("w") as log:
         result = subprocess.run(
-            [sys.executable, "-m", module, str(root), stage], stdout=log, stderr=subprocess.STDOUT
+            [sys.executable, "-m", module, str(root), stage],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, **env} if env else None,
         )
     if result.returncode:
         raise RuntimeError(f"{stage} failed ({result.returncode}); see {root / (stage + '.log')}")
@@ -95,7 +99,8 @@ def run_stage(root, stage):
         raise RuntimeError(f"native trace dropped events; see {root / (stage + '.log')}")
 
 
-def write_plan(root, specs, context, model, identity, cache):
+def write_plan(root, specs, context, model, identity, cache, segment_size=None):
+    """``segment_size`` selects the stock segmented-prefill engine (absent otherwise)."""
     plan = {
         "specs": specs,
         "context": context,
@@ -104,6 +109,8 @@ def write_plan(root, specs, context, model, identity, cache):
         "reference_cache": str(cache / "forward-reference-cache"),
         "profile_repeats": 3,
     }
+    if segment_size is not None:
+        plan["segment_size"] = segment_size
     (root / "plan.json").write_text(json.dumps(plan, indent=2, default=str))
     return plan
 

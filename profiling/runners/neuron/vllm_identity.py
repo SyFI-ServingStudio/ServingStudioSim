@@ -130,7 +130,7 @@ def verify_cache_binaries(cache: Path, graphs: dict) -> dict:
 
 def _accuracy_graphs(root: Path) -> tuple[dict, dict]:
     """Reconstruct the receipt from acquisition files, including geometry and load scope."""
-    from profiling.runners.neuron.vllm_forward_trace import model_geometry
+    from profiling.runners.neuron.vllm_forward_trace import plan_geometry
 
     plan = json.loads((root / "plan.json").read_text())
     if plan["identity"]["model_sha256"] != MODEL_HASHES:
@@ -139,7 +139,7 @@ def _accuracy_graphs(root: Path) -> tuple[dict, dict]:
     before = json.loads((root / "accuracy-binaries-before.json").read_text())
     after = json.loads((root / "accuracy-binaries-after.json").read_text())
     log = (root / "accuracy.log").read_text()
-    expected = {("prefill", plan["context"])} | {
+    expected = {("prefill", plan.get("segment_size", plan["context"]))} | {
         ("decode", case["bucket"]) for case in json.loads((root / "cases.json").read_text())
     }
     graphs = {}
@@ -150,7 +150,7 @@ def _accuracy_graphs(root: Path) -> tuple[dict, dict]:
         if f"Compilation cache key: {key}" not in log:
             continue
         try:
-            geometry = model_geometry(binary["input_metadata"], plan["context"])
+            geometry = plan_geometry(binary["input_metadata"], plan)
         except ValueError:
             continue  # Other context entries can share the persistent cache.
         if geometry not in expected:
