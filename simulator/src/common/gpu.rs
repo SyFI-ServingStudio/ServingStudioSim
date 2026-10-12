@@ -13,28 +13,52 @@ pub fn compute_capability(gpu_name: &str) -> Option<(u32, u32)> {
     BY_NAME.get_or_init(load).get(&key(gpu_name)).copied()
 }
 
+/// The catalog name of a GPU looked up by its name or any alias, matched as
+/// [`compute_capability`] matches. `None` for a GPU the catalog does not list.
+pub fn canonical_name(gpu_name: &str) -> Option<&'static str> {
+    static BY_NAME: OnceLock<HashMap<String, &'static str>> = OnceLock::new();
+    BY_NAME
+        .get_or_init(|| {
+            let mut by_name = HashMap::new();
+            for gpu in catalog() {
+                let canonical: &'static str = Box::leak(gpu.name.clone().into_boxed_str());
+                for name in std::iter::once(&gpu.name).chain(&gpu.aliases) {
+                    by_name.entry(key(name)).or_insert(canonical);
+                }
+            }
+            by_name
+        })
+        .get(&key(gpu_name))
+        .copied()
+}
+
 /// The form a GPU name is matched in.
 fn key(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
-fn load() -> HashMap<String, (u32, u32)> {
+#[derive(serde::Deserialize)]
+struct Gpu {
+    name: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    compute_capability: Option<String>,
+}
+
+fn catalog() -> Vec<Gpu> {
     #[derive(serde::Deserialize)]
     struct Catalog {
         gpus: Vec<Gpu>,
     }
-    #[derive(serde::Deserialize)]
-    struct Gpu {
-        name: String,
-        #[serde(default)]
-        aliases: Vec<String>,
-        compute_capability: Option<String>,
-    }
 
     let catalog: Catalog = serde_json::from_str(include_str!("../../../gpu/spec.json"))
         .expect("gpu/spec.json is a GPU catalog");
+    catalog.gpus
+}
+
+fn load() -> HashMap<String, (u32, u32)> {
     let mut by_name = HashMap::new();
-    for gpu in catalog.gpus {
+    for gpu in catalog() {
         let Some(text) = gpu.compute_capability else {
             continue;
         };
@@ -56,7 +80,15 @@ fn load() -> HashMap<String, (u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_capability;
+    use super::{canonical_name, compute_capability};
+
+    #[test]
+    fn aliases_resolve_to_the_catalog_name() {
+        assert_eq!(canonical_name("AWS Trainium2 LNC2"), Some("Trainium2-LNC2"));
+        assert_eq!(canonical_name(" trainium2-lnc2"), Some("Trainium2-LNC2"));
+        assert_eq!(canonical_name("No Such GPU"), None);
+        assert_eq!(compute_capability("AWS Trainium2 LNC2"), None);
+    }
 
     #[test]
     fn names_and_aliases_resolve_to_the_catalog_capability() {
