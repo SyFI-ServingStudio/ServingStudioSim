@@ -61,11 +61,18 @@ const SPLIT_MIN_TILES: u32 = 64;
 /// in one CTA; past that its grid has more than one CTA and every request
 /// keeps one split.
 const PREPARE_MAX_REQUESTS: u32 = 31 * 32;
-/// Prefill-token counts on the grid past the first M tile: doubling, because
-/// a fresh chunk's causal work grows with the square of its length (a 4x step
-/// would interpolate a 1024-token fresh chunk 50% high), up to the 2048-token
-/// step budget.
-const PREFILL_KNOTS: [u32; 5] = [64, 256, 512, 1024, 2048];
+/// Prefill-token counts on the grid past the first M tile, besides the
+/// per-request split cliffs (`split_cliff_prefills`): a 4x step from 64
+/// (a fresh chunk's causal work grows with the square of its length), up to
+/// the 2048-token step budget.
+const PREFILL_KNOTS: [u32; 3] = [64, 256, 2048];
+/// The grid ceiling for this kind, above the usual 500: a long-context chunk's
+/// time halves where `FlashPrepareScheduler` drops it from two KV splits to
+/// one (and falls by a third from three to two), so the prefill axis carries
+/// a knot on each side of the one-split cliff and at the two-split edge.
+/// That is 8 prefill knots against the 7 a doubling axis needs: GA 568 and
+/// SWA 497 feasible coordinates at 16 query heads.
+const GRID_CEILING: usize = 600;
 /// Decode-request counts on the grid besides the split edge
 /// (`first_unsplit_decodes`). A graph decode splits `148 / (B x KV heads)`
 /// ways, so time grows about linearly in B between powers of two and the
@@ -228,12 +235,36 @@ fn request_splits(
         })
         .sum();
     let sms = B200_SMS as f32;
-    let margin = (sms / 128.0 + 0.001).max(1.1);
-    let per_sm = ((total as f32 * margin * config.num_kv_heads.get() as f32 / sms) as u32).max(1);
+    let per_sm =
+        ((total as f32 * prepare_margin() * config.num_kv_heads.get() as f32 / sms) as u32).max(1);
     pairs
         .iter()
         .map(|pair| blocks(pair).0.div_ceil(per_sm).min(static_count).max(1))
         .collect()
+}
+
+/// `FlashPrepareScheduler`'s `sm_margin` (prepare_scheduler.py).
+fn prepare_margin() -> f32 {
+    (B200_SMS as f32 / 128.0 + 0.001).max(1.1)
+}
+
+/// The prefill lengths where a lone chunk over a long context changes its
+/// per-request split count: `FlashPrepareScheduler` gives a request
+/// `ceil(kv_blocks / per_sm)` splits with `per_sm` about `kv_blocks x m_blocks
+/// x margin x KV heads / 148`, so the chunk keeps at most `k` splits once its
+/// M blocks (`ceil(P x G / 128)`) reach `148 / (k x margin x KV heads)`,
+/// whatever the context. Returns the first two-split length, the last
+/// two-split length and the first one-split length.
+fn split_cliff_prefills(config: &Fa4VarlenAttentionKernelConfig) -> [u32; 3] {
+    let per_block = prepare_margin() * config.num_kv_heads.get() as f32;
+    let first_with_at_most = |splits: u32| {
+        let m_blocks = (1..)
+            .find(|&m| m as f32 * per_block * splits as f32 >= B200_SMS as f32)
+            .expect("an M-block count reaches the SMs");
+        (m_blocks - 1) * TILE_M / config.q_heads_per_kv_head() + 1
+    };
+    let one = first_with_at_most(1);
+    [first_with_at_most(2), one - 1, one]
 }
 
 impl Fa4VarlenCall for Fa4VarlenAttentionKernelConfig {
@@ -383,10 +414,14 @@ fn context_axis(config: &Fa4VarlenAttentionKernelConfig) -> Vec<f64> {
 
 fn prefill_axis(config: &Fa4VarlenAttentionKernelConfig) -> Vec<f64> {
     let first = config.first_tile_tokens();
-    let values: Vec<u32> = [0, first]
+    let mut values: Vec<u32> = PREFILL_KNOTS
         .into_iter()
-        .chain(PREFILL_KNOTS.into_iter().filter(|&knot| knot > first))
+        .chain(split_cliff_prefills(config))
+        .filter(|&knot| knot > first)
         .collect();
+    values.extend([0, first]);
+    values.sort_unstable();
+    values.dedup();
     Axis::values(values)
 }
 
@@ -656,7 +691,8 @@ mod tests {
     #[test]
     fn grid_axes_follow_the_config_and_stay_under_the_ceiling() {
         // Defect caught: knots that ignore the KV-head count (the split edge
-        // moves with it), and grids past the 500-coordinate ceiling.
+        // moves with it), a prefill axis that misses the split cliffs, and
+        // grids past the kind's ceiling.
         let axes = |window| {
             Fa4VarlenAttentionSpec::sweep_grid(&config(window))
                 .axes()
@@ -667,14 +703,20 @@ mod tests {
             global[0],
             [0.0, 1.0, 8.0, 16.0, 32.0, 64.0, 75.0, 128.0, 256.0]
         );
-        assert_eq!(global[1], [0.0, 16.0, 64.0, 256.0, 512.0, 1024.0, 2048.0]);
+        assert_eq!(
+            global[1],
+            [0.0, 16.0, 64.0, 256.0, 505.0, 1016.0, 1017.0, 2048.0]
+        );
         assert_eq!(
             global[2],
             [1.0, 576.0, 1088.0, 2112.0, 4160.0, 8256.0, 32832.0, 131072.0]
         );
         let local = axes(true);
         assert!(local[0].contains(&38.0));
-        assert_eq!(local[1][1], 32.0);
+        assert_eq!(
+            local[1],
+            [0.0, 32.0, 64.0, 256.0, 497.0, 1008.0, 1009.0, 2048.0]
+        );
         assert_eq!(
             local[2],
             [1.0, 80.0, 192.0, 1088.0, 4160.0, 8256.0, 32832.0]
@@ -686,7 +728,26 @@ mod tests {
                 .iter()
                 .filter(|&&masked| !masked)
                 .count();
-            assert!(feasible <= 500, "window={window}: {feasible}");
+            assert!(feasible <= GRID_CEILING, "window={window}: {feasible}");
+        }
+    }
+
+    #[test]
+    fn prefill_knots_sit_on_the_lone_chunk_split_cliffs() {
+        // Defect caught: a cliff knot off by one M block, so a cell
+        // interpolates across a split change (a 1000-token chunk at 121000
+        // keys measured 1.26 ms against 2.38 ms interpolated toward 1024).
+        for window in [false, true] {
+            let cfg = config(window);
+            let [two, last_two, one] = split_cliff_prefills(&cfg);
+            let split = |prefill: u32| {
+                let pairs = [(prefill, cfg.max_model_len)];
+                cfg.tiling(&pairs, 1).splits[0]
+            };
+            assert_eq!(split(two - 1), 3, "window={window}");
+            assert_eq!(split(two), 2, "window={window}");
+            assert_eq!(split(last_two), 2, "window={window}");
+            assert_eq!(split(one), 1, "window={window}");
         }
     }
 
