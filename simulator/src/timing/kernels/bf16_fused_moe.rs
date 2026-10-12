@@ -218,6 +218,7 @@ mod tests {
                 top_k: TOP_K,
                 input_dtype: DType::Bf16,
                 weight_format: DType::Nvfp4E2m1,
+                activation_format: None,
                 group_size: 16,
                 routing_method: "minimax2".to_string(),
                 n_group: 1,
