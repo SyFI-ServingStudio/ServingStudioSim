@@ -180,3 +180,15 @@ RECORDS_BY_ADAPTER = {
     VLLM_RECORDS.adapter: VLLM_RECORDS,
     SGLANG_RECORDS.adapter: SGLANG_RECORDS,
 }
+
+VLLM_NEURON_RECORDS = EngineRecords(
+    adapter="vllm_neuron_text",
+    rank_prefix_re=None,
+    # Stock 0.24 input_processor randomizes external engine IDs with eight
+    # lowercase UUID hex characters. Retain the earlier public wrappers too.
+    request_id_unwrappers=(
+        re.compile(r"^cmpl-(.+)-0-[0-9a-f]{8}$"),
+        *VLLM_RECORDS.request_id_unwrappers,
+    ),
+)
+RECORDS_BY_ADAPTER[VLLM_NEURON_RECORDS.adapter] = VLLM_NEURON_RECORDS

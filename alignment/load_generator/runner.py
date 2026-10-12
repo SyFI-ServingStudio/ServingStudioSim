@@ -76,6 +76,8 @@ def run_replay(
     model: str,
     measurement_ready: Callable[[], None] | None = None,
     routed_experts_dir: Path | None = None,
+    session_runner: Path | None = None,
+    timeline_path: Path | None = None,
 ) -> dict:
     """Replay the shared trace through its explicitly selected wire backend.
 
@@ -90,7 +92,7 @@ def run_replay(
         else base_url.rstrip("/")
     )
     argv = [
-        str(SESSION_RUNNER),
+        str(session_runner if session_runner is not None else SESSION_RUNNER),
         "--trace",
         str(prepared.trace_path),
         "--input-file-format",
@@ -112,6 +114,8 @@ def run_replay(
         "--stream-idle-timeout-secs",
         str(config.stream_idle_timeout_secs),
     ]
+    if timeline_path is not None:
+        argv.extend(["--timeline-path", str(timeline_path)])
     optional_args = (
         ("--max-items", config.max_items),
         ("--rate", config.rate),
@@ -166,6 +170,7 @@ def run_replay(
         "backend_type": config.backend.type,
         "log_path": str(prepared.log_path),
         "summary_path": str(prepared.summary_path),
+        "timeline_path": str(timeline_path) if timeline_path is not None else None,
         "warmup": config.warmup,
         "routed_experts_dir": str(routed_experts_dir) if routed_experts_dir else None,
     }

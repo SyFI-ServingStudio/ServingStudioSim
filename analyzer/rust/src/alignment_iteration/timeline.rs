@@ -474,6 +474,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .with_context(|| format!("no iter section in {}", manifest_path.display()))?;
 
     let meta = json!({
+        "trace_provider": measured.trace_provider,
+        "measurement_granularity": measured.measurement_granularity,
+        "physical_core_ids": measured.physical_core_ids,
         "analysis_log_dir": log_dir.display().to_string(),
         "profile_log_dir": input.profile_log_dir.display().to_string(),
         "predict_log_dir": input.predict_log_dir.display().to_string(),
@@ -499,7 +502,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "anchor_rule": ANCHOR_RULE,
         "time_origin_ns": time_origin_ns,
         "time_base": "capture-relative nanoseconds: every *_ns in this file is \
-                      (nsys timestamp - meta.time_origin_ns)",
+                      (synchronized capture timestamp - meta.time_origin_ns)",
         // The roster, rules and string pool of the host lane, or null when the
         // capture was parsed before the sidecar existed. What is still missing
         // even when this is present is time spent OUTSIDE any CUDA call: the
