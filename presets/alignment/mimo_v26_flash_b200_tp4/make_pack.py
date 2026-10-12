@@ -6,10 +6,24 @@ derived them from GLM's (`c x mean terminal length / KV pool` for the KV cases, 
 saturated rate, lengths as fractions of the context limit). Every case states its derivation in
 `provenance.derivation`; `CASES` below is the one place it is computed.
 
-Serving config. The server block is the validated capture's, verbatim: Slurm job 6264,
-`logs/20261012_1_mimo_fused_ar_nsys/profile-6264.yaml` in wt-mimo-v2-clean (vLLM fork 892da082, checkpoint
-revision 5711b268, FlashInfer 0.7.0, FlashInfer all-reduce + RMSNorm fusion on `backend=mnnvl`). Only
-`--max-model-len` moves out of `extra_args`, because rendering appends it from each case (always 131072 here).
+Serving config. The server block is the validated capture's (Slurm job 6264,
+`logs/20261012_1_mimo_fused_ar_nsys/profile-6264.yaml` in wt-mimo-v2-clean: vLLM fork 892da082, checkpoint
+revision 5711b268, FlashInfer 0.7.0, FlashInfer all-reduce + RMSNorm fusion on `backend=mnnvl`) with two capture
+settings changed, both from the first campaign run (logs/20261012_4_mimo_align_campaign, progress.md Step 6):
+
+- `max_cudagraph_capture_size: 2048`, as the Inkling pack sets. Job 6264 left it to vLLM's default,
+  min(2 x max_num_seqs, 1024) = 200 (vllm/config/vllm.py:2408-2420), so every mixed step above 200 tokens ran
+  eager at a ~47 ms host floor that the simulator does not model.
+- `warmup: true` on both passes, as `glm53_flash_fp8_b200_tp4_ep4` sets, plus a persistent FA4 CuTeDSL disk cache
+  (`FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`; the host's job wrapper exports `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR`
+  next to its other JIT caches, since the pack holds no host paths). Without them FA4 JIT-compiled each new kernel
+  variant inside the measured window: 3.6-6 s stalls at iteration 0 and on later variants. Req-frontend's warmup
+  (req-frontend/src/runner.rs:101-140) replays one request alone, then the pass's whole trace at the same
+  max_concurrency with saturated arrivals and outputs capped at 32 tokens, so every prompt shape is prefilled
+  (chunks with a nonzero start for prompts over 2048, contexts to the case's longest) and decoded at the case's
+  batch sizes before the measurement boundary.
+
+Only `--max-model-len` moves out of `extra_args`, because rendering appends it from each case (always 131072 here).
 Cases 14 and 15 add `--kv-cache-memory-bytes` (their own variants), as `glm53_flash_fp8_b200_tp4_ep4` does;
 see `kv_pinned_bytes`.
 
@@ -17,8 +31,13 @@ MiMo's limits (TP4/EP4, gpu_memory_utilization 0.85, chunk 2048):
 
 - S = 100 (`--max-num-seqs`). The simulated chunked-prefill worker has no running-request cap, so no case offers
   more than S concurrent requests: above S, vLLM queues and the simulator would batch them all.
-- CUDA graphs: vLLM captured [1, 2, 4, 8, 16..96 step 8, 100, 104..200 step 8] (server log of job 6264),
-  max 200 = 2 x S. FULL_AND_PIECEWISE, so decode batches <= 100 replay full graphs.
+- CUDA graphs, FULL_AND_PIECEWISE: `capture_sizes()` below is vLLM 892da082's list for an explicit
+  max_cudagraph_capture_size 2048 with max_num_batched_tokens 2048 (vllm/config/vllm.py:2499-2553): [1, 2, 4],
+  8..248 step 8, 256..2048 step 16 = 147 sizes. An explicit ceiling skips the default branch that would insert
+  max_num_seqs (vllm.py:2408-2498), so 100 is not captured: 97-100 running requests pad to 104
+  (v1/cudagraph_dispatcher.py:139). Every size is a PIECEWISE graph; uniform decode also gets FULL graphs at
+  the sizes <= S, i.e. up to 96 (cudagraph_dispatcher.py:216), so a decode step of 97-100 requests replays the
+  104 PIECEWISE graph.
 - L = 131072 (`--max-model-len`); rendering rejects a trace row with input + output >= L.
 - KV pool. 110.52 GiB per GPU in the draft captures (jobs 4198/4220/4223: `GPU KV cache size: 15,566,522 tokens,
   Maximum concurrency for 131,072 tokens per request: 118.76x`). The exact serving config (job 6264, whose
@@ -46,14 +65,33 @@ HERE = Path(__file__).resolve().parent
 # ---------------------------------------------------------------- MiMo limits
 S = 100
 L = 131072
-CAPTURE_SIZES = [1, 2, 4, 8] + list(range(16, 97, 8)) + [100] + list(range(104, 201, 8))
+MAX_CUDAGRAPH_CAPTURE_SIZE = 2048
+CHUNK = 2048
+
+
+def capture_sizes(max_size: int, max_num_tokens: int) -> list[int]:
+    """vLLM 892da082 `VllmConfig._set_cudagraph_sizes` for an explicit max_cudagraph_capture_size, balanced
+    performance mode, no sequence parallelism (vllm/config/vllm.py:2499-2553)."""
+    max_size = min(max_num_tokens, max_size)
+    sizes = [i for i in (1, 2, 4) if i <= max_size]
+    if max_size >= 8:
+        sizes += list(range(8, min(max_size + 1, 256), 8))
+    if max_size >= 256:
+        sizes += list(range(256, max_size + 1, 16))
+    if max_num_tokens <= max_size and max_num_tokens not in sizes:
+        sizes.append(max_num_tokens)
+    return sorted(set(sizes))
+
+
+CAPTURE_SIZES = capture_sizes(MAX_CUDAGRAPH_CAPTURE_SIZE, CHUNK)
 PAGE_BYTES = 20_480
 BLOCK_BYTES = 9 * PAGE_BYTES
 GA_TOKENS_PER_BLOCK = 32
 SWA_BLOCKS_PER_REQUEST = 5 * (math.ceil(128 / 16) + 1)
 GIB = 1 << 30
 
-# The arch block matches presets/public/MiMo-V2.6-Flash-RL/mimo_v2_vllm_fp8_swa_moe.yaml (its diverse_100 member).
+# The arch block matches presets/public/MiMo-V2.6-Flash-RL/mimo_v2_vllm_fp8_swa_moe.yaml (its diverse_100 member)
+# except cudagraph_capture_sizes: the public preset keeps the diverse_100 capture's default list (ceiling 200).
 ARCH_TYPE = "mimo_v2_vllm_fp8_swa_moe"
 
 CAPTURE = "logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log"
@@ -76,7 +114,8 @@ SERVER = {
     "tp_size": 4,
     "dp_size": 1,
     "expert_parallel_size": 4,
-    "chunk_size": 2048,
+    "chunk_size": CHUNK,
+    "max_cudagraph_capture_size": MAX_CUDAGRAPH_CAPTURE_SIZE,
     "enforce_eager": False,
     "enable_server_load_tracking": True,
     "api_server_count": 4,
@@ -102,8 +141,8 @@ SERVER = {
     ],
 }
 PYTHON_RUNTIME = {
-    # Job 6264's runtime block, plus the engine-ready timeout that block exported from its sbatch: a cold
-    # torch.compile / inductor cache pushes engine startup past vLLM's 600 s default.
+    # Job 6264's runtime block, plus the engine-ready timeout that block exported from its sbatch (a cold
+    # torch.compile / inductor cache pushes engine startup past vLLM's 600 s default) and the FA4 disk cache.
     "packages": [{
         "name": "flashinfer-python",
         "version": "0.7.0",
@@ -114,6 +153,9 @@ PYTHON_RUNTIME = {
         "HF_HUB_OFFLINE": "0",
         "TRANSFORMERS_OFFLINE": "1",
         "VLLM_ENGINE_READY_TIMEOUT_S": "1800",
+        # Persist FA4 CuTeDSL compiles across passes; the directory is the job wrapper's
+        # FLASH_ATTENTION_CUTE_DSL_CACHE_DIR (a host path, so not in the pack).
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",
     },
     "lock_timeout_seconds": 30,
     "install_timeout_seconds": 30,
@@ -148,10 +190,10 @@ def variant(extra_args=()) -> dict:
         "python_runtime": PYTHON_RUNTIME,
         "server": server,
         "arch": dict(ARCH),
-        "worker": {"type": "chunked_prefill", "max_batch_tokens": 2048, "batch_policy": "mix"},
+        "worker": {"type": "chunked_prefill", "max_batch_tokens": CHUNK, "batch_policy": "mix"},
         "profile_passes": [
-            {"kind": "nsys", "name": "profile_nsys", "trace": "kernel"},
-            {"kind": "workload_metrics", "name": "profile_workload", "trace": "workload"},
+            {"kind": "nsys", "name": "profile_nsys", "trace": "kernel", "warmup": True},
+            {"kind": "workload_metrics", "name": "profile_workload", "trace": "workload", "warmup": True},
         ],
         "input_builder": {"type": "engine_text", "measured_phase": "forward", "group_assignment": "single"},
         "label_rules": "label_rules/manifest.json",
@@ -182,11 +224,11 @@ CASES = [
          coverage=["cuda_graph_boundaries", "small_batch"], max_concurrency=S, capture_seconds=15.0,
          workload_trace=dict(shapes=[[1, 32], [15, 32], [16, 32], [31, 32], [32, 32], [63, 64], [64, 64],
                                      [99, 64], [100, 64], [199, 64], [200, 64], [201, 64]], repeats=34),
-         derivation="c = S: as the batch drains, decode replays every captured size 1..100. Prompts straddle "
-                    "MiMo's capture edges instead of GLM's: 15/16, 31/32, 63/64 kept; 127/128 -> 99/100 (the "
-                    "inserted max_num_seqs size); 255/256 -> 199/200/201 (the top of the list, 2 x S, and the "
-                    "first uncaptured size). repeats 48 -> 34 keeps ~4.1 requests per slot. No "
-                    "analyze_iterations: the whole capture is the subject."),
+         derivation="c = S: as the batch drains, decode replays every captured size 1..104. Prompts straddle "
+                    "capture edges: 15/16, 31/32, 63/64 kept from GLM; 127/128 -> 99/100 and 255/256 -> "
+                    "199/200/201, chosen against the first run's default list (100 inserted, top 200). Under "
+                    "max_cudagraph_capture_size 2048 they still straddle 96/104 and 200/208. repeats 48 -> 34 keeps "
+                    "~4.1 requests per slot. No analyze_iterations: the whole capture is the subject."),
     dict(index=3, name="balanced_anchor_c32", purpose="Comparable extension of the existing c32 anchor.",
          coverage=["balanced_anchor"], max_concurrency=32, capture_seconds=15.0,
          workload_trace=dict(shapes=[[256, 128], [256, 256], [1024, 128], [1024, 256], [2048, 128],
