@@ -1,14 +1,17 @@
 # Stock vLLM Neuron TP4/LNC2 context ladder with the measured host-side
 # scheduling race modeled (see doc/trainium2.md, "Async scheduling and frontend
 # hand-off"). Identical to unified_llama3_8b_vllm_neuron_ladder.yaml except:
-# - worker async_lookahead_us: the engine plans step N+1 1.04 ms (median measured
-#   first-step plan offset) after step N starts, from the requests visible then;
-# - workload frontend_handoff: the API server makes simultaneous requests
-#   visible one at a time with resampled measured ingest delay and gaps; the
-#   seed picks one deterministic realization (override
+# - worker async_lookahead_us: the engine plans step N+1 1.04 ms after step N
+#   starts, from the requests visible then. With the hand-off model on, the
+#   step after one that started from an idle engine uses the seed's draw of the
+#   measured first-step plan offset for the context instead;
+# - workload frontend_handoff: the API server sends simultaneous requests one
+#   at a time (measured ingest, first gap, later gaps) and each becomes visible
+#   a measured send-to-visible delay later, all resampled at the context of
+#   max_model_len; the seed picks one deterministic realization (override
 #   workload.frontend_handoff_seed, or sweep it, for a distribution);
-# - tick_dt_us 10: both effects are ~1 ms, so the default 100 us tick would
-#   quantize the race by up to 10%.
+# - tick_dt_us 10: the race is decided by sub-millisecond differences, so the
+#   default 100 us tick would quantize it.
 # Distribution data and provenance: alignment/neuron/data/vllm_neuron_handoff.json.
 deployment: unified
 workload:
@@ -52,17 +55,17 @@ compound:
   context:
     c512:
       max_model_len: 512
-      decode_buckets: [1, 4, 8, 16, 32, 64, 128, 256, 512]
+      decode_buckets: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
       resident: 423
       trace: trace/trainium_stock_smoke.csv
     c1024:
       max_model_len: 1024
-      decode_buckets: [1, 4, 8, 16, 32, 64, 128, 256]
+      decode_buckets: [1, 2, 4, 8, 16, 32, 64, 128, 256]
       resident: 211
       trace: trace/trainium_stock_smoke_c1024.csv
     c2048:
       max_model_len: 2048
-      decode_buckets: [1, 4, 8, 16, 32, 64, 128]
+      decode_buckets: [1, 2, 4, 8, 16, 32, 64, 128]
       resident: 105
       trace: trace/trainium_stock_smoke_c2048.csv
     c4096:

@@ -707,8 +707,12 @@ mod tests {
             .collect();
         let path = write_csv(dir.path(), "burst.csv", &body);
         let handoff = |seed| {
-            FrontendHandoffConfig::parse(Some(FrontendHandoffConfig::VLLM_NEURON), Some(seed))
-                .unwrap()
+            FrontendHandoffConfig::parse(
+                Some(FrontendHandoffConfig::VLLM_NEURON),
+                Some(seed),
+                Some(512),
+            )
+            .unwrap()
         };
         // Visibility instant of each request on a 10 µs clock.
         let emissions = |config: Option<FrontendHandoffConfig>| {
@@ -733,8 +737,8 @@ mod tests {
         assert_eq!(serialized.len(), 16);
         assert!(serialized.windows(2).all(|pair| pair[0].1 <= pair[1].1));
         assert!(
-            serialized[0].1 >= Time::from_ms(19.0),
-            "the first request pays the measured ingest delay"
+            serialized[0].1 >= Time::from_ms(18.0),
+            "the first request pays the measured ingest and transport delays"
         );
         assert_eq!(serialized, emissions(handoff(4)));
         assert_ne!(serialized, emissions(handoff(5)));

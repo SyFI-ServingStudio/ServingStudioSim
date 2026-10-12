@@ -267,9 +267,11 @@ Barebone, HP, and PD-prefill differ only in their build recipe. HP changes the
 number of KV partitions and placement; PD-prefill changes admission and adds a
 send comm group.
 
-`with_async_lookahead(Some(w))` selects the shell's opt-in async one-step
-lookahead planning cadence (only the chunked-prefill recipe passes it, from
-`async_lookahead_us`). Step N+1 is planned `w` after step N starts. A message
+`with_async_lookahead(Some(w), w_idle)` selects the shell's opt-in async
+one-step lookahead planning cadence (only the chunked-prefill recipe passes it,
+from `async_lookahead_us` and `WorkerConfig::async_lookahead_from_idle`). Step
+N+1 is planned `w` after step N starts, or `w_idle` (default `w`) when N
+started from an idle engine. A message
 enqueued while a step runs waits in a shell-owned engine inbox until that plan
 moment, then reaches admission. N+1 is formed after N completes and starts at
 `max(N end, plan moment)`. An idle engine, or a planned-empty step, sees the

@@ -208,7 +208,10 @@ fn parse_file<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result
 /// Load and type-check a workload's trace into the text frontend a run replays:
 /// the declared format and tags, the replay settings, then every row. Shared by
 /// `run` and `workload-plan`, so a plan is the requests a run would release.
-fn load_frontend(workload: &WorkloadSpec) -> Result<TraceFrontend> {
+///
+/// `max_model_len` is the run's serving context ([`serving_context`]); only the
+/// opt-in frontend hand-off model reads it, to pick its measured context.
+fn load_frontend(workload: &WorkloadSpec, max_model_len: Option<u32>) -> Result<TraceFrontend> {
     let input_file_format = InputFileFormat::parse(&workload.input_file_format)?;
     let input_file_tags = workload
         .input_file_tags
@@ -221,12 +224,36 @@ fn load_frontend(workload: &WorkloadSpec) -> Result<TraceFrontend> {
     let handoff = FrontendHandoffConfig::parse(
         workload.frontend_handoff.as_deref(),
         workload.frontend_handoff_seed,
+        max_model_len,
     )?;
+    if let Some(handoff) = &handoff {
+        tracing::info!(
+            "frontend hand-off {}: measured context {} for max_model_len {}",
+            workload.frontend_handoff.as_deref().unwrap_or_default(),
+            handoff.measured_context(),
+            max_model_len.unwrap_or_default(),
+        );
+    }
     Ok(
         LoadedTrace::load(&workload.trace_files, &input_file_schema, arrival, capacity)?
             .into_current_text_frontend()?
             .with_frontend_handoff(handoff),
     )
+}
+
+/// The serving context the frontend hand-off model is keyed by: the one
+/// `max_model_len` of every request-serving pool group (`None` when they
+/// differ). Read only when the workload selects the model, so a deployment
+/// whose arch has no `max_model_len` is unaffected otherwise.
+fn serving_context(cfg: &RunConfig) -> Result<Option<u32>> {
+    if cfg.workload().frontend_handoff.is_none() {
+        return Ok(None);
+    }
+    let lens: std::collections::BTreeSet<u32> = pool_bounds(cfg)?
+        .into_iter()
+        .map(|bound| bound.max_model_len)
+        .collect();
+    Ok((lens.len() == 1).then(|| lens.into_iter().next().expect("one element")))
 }
 
 /// Compact wall-clock log timestamp: `[MM:SS.mmm]` (UTC minute-of-hour). Drops
@@ -337,12 +364,12 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             let frontend = match (&args.config, &args.workload) {
                 (Some(config), _) => {
                     let cfg = load_config(config)?;
-                    let frontend = load_frontend(cfg.workload())?;
+                    let frontend = load_frontend(cfg.workload(), serving_context(&cfg)?)?;
                     check_trace(&cfg, &frontend)?;
                     frontend
                 }
                 (None, Some(workload)) => {
-                    load_frontend(&parse_file::<WorkloadSpec>(workload, "workload")?)?
+                    load_frontend(&parse_file::<WorkloadSpec>(workload, "workload")?, None)?
                 }
                 (None, None) => unreachable!("clap requires a workload or --config"),
             };
@@ -365,7 +392,7 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // Parse into a concrete request family and narrow to the currently
     // supported text path before starting the bridge or building L4.
     let workload = cfg.workload();
-    let mut frontend = load_frontend(workload)?;
+    let mut frontend = load_frontend(workload, serving_context(&cfg)?)?;
     check_trace(&cfg, &frontend)?;
     let tick_cfg = TickCfg::new(
         workload.duration_ms,

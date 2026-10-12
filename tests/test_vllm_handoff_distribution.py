@@ -13,14 +13,11 @@ DATA = Path(__file__).resolve().parents[1] / "alignment/neuron/data/vllm_neuron_
 MS = 1_000_000
 
 
-def write_capture(
-    root: Path, name: str, arrivals_ms, receives_ms, plans_ms, ends_ms, phases, sends_ms=None
-):
+def write_capture(root: Path, name: str, arrivals_ms, sends_ms, receives_ms, plans_ms, phases):
     capture = root / name
-    capture.mkdir()
-    sends_ms = sends_ms or [None] * len(arrivals_ms)
+    capture.mkdir(parents=True)
     with (capture / "request_timings.jsonl").open("w") as handle:
-        for arrival, receive, send in zip(arrivals_ms, receives_ms, sends_ms):
+        for arrival, send, receive in zip(arrivals_ms, sends_ms, receives_ms):
             row = {
                 "frontend_arrival_monotonic_ns": int(arrival * MS),
                 "engine_receive_monotonic_ns": int(receive * MS),
@@ -29,98 +26,109 @@ def write_capture(
                 row["api_send_monotonic_ns"] = None if send is None else int(send * MS)
             handle.write(json.dumps(row) + "\n")
     with (capture / "metrics.jsonl").open("w") as handle:
-        for plan, end, phase in zip(plans_ms, ends_ms, phases):
-            handle.write(
-                json.dumps(
-                    {
-                        "observed_start_monotonic_ns": int(plan * MS),
-                        "observed_end_monotonic_ns": int(end * MS),
-                        "phase": phase,
-                    }
-                )
-                + "\n"
-            )
+        for index, (plan, phase) in enumerate(zip(plans_ms, phases)):
+            step = {
+                "observed_start_monotonic_ns": int(plan * MS),
+                "observed_end_monotonic_ns": int((plan + 40.0) * MS),
+                "phase": phase,
+                "iteration_index": index,
+            }
+            handle.write(json.dumps(step) + "\n")
 
 
-def test_extraction_reads_ingest_gaps_plan_offsets_and_outcome(tmp_path):
-    # Arrival order is not file order; gaps come from sorted arrivals.
+def stamped(root, name, first_gap, plan_offset, ingest=20.0, transport=0.5, solo=True):
+    """Four simultaneous requests: send gaps first_gap, 0.25, 0.5 (file order shuffled)."""
+    sends = [ingest, ingest + first_gap, ingest + first_gap + 0.25, ingest + first_gap + 0.75]
+    receive0 = ingest + transport
+    plan1 = receive0 + plan_offset
+    # Request 1 is drained before step 1 when it beats the plan, else after step 0.
+    late = receive0 + 40.0
+    receives = [receive0, late if solo else plan1 - 0.02, late, late]
+    order = [2, 0, 3, 1]
     write_capture(
-        tmp_path,
-        "c512-1",
-        arrivals_ms=[1.5, 0.0, 0.5],
-        receives_ms=[60.0, 20.0, 60.0],
-        plans_ms=[20.0, 21.0, 60.2, 100.1],
-        ends_ms=[60.0, 100.0, 140.0, 150.0],
-        phases=["prefill", "decode", "prefill", "prefill"],
+        root,
+        name,
+        arrivals_ms=[0.0] * 4,
+        sends_ms=[sends[i] for i in order],
+        receives_ms=[receives[i] for i in order],
+        plans_ms=[receive0 + 0.06, plan1, late + 0.1],
+        phases=["prefill", "decode" if solo else "prefill", "prefill"],
     )
+
+
+def test_extraction_composes_position_aware_inputs_per_context(tmp_path):
+    stamped_root, old_root = tmp_path / "race2", tmp_path / "race"
+    # Contexts 512 and 8192 differ clearly in first gap and plan offset.
+    stamped(stamped_root, "c512-1", first_gap=1.1, plan_offset=0.7, transport=0.5)
+    stamped(stamped_root, "c512-2", first_gap=1.2, plan_offset=0.8, transport=0.9)
+    stamped(stamped_root, "c8192-1", first_gap=0.5, plan_offset=1.2, transport=0.7, solo=False)
+    stamped(stamped_root, "c8192-2", first_gap=0.4, plan_offset=1.5, transport=0.6, solo=False)
+    # Unstamped: outcome only.
     write_capture(
-        tmp_path,
-        "c8192-1",
-        arrivals_ms=[0.0, 2.0],
-        receives_ms=[30.0, 30.5],
-        plans_ms=[30.0, 30.6, 80.1],
-        ends_ms=[80.0, 130.0, 180.0],
-        phases=["prefill", "prefill", "decode"],
+        old_root,
+        "c1024-1",
+        arrivals_ms=[0.0, 1.0],
+        sends_ms=["absent", "absent"],
+        receives_ms=[20.0, 60.0],
+        plans_ms=[20.1, 21.0, 60.1],
+        phases=["prefill", "decode", "prefill"],
     )
-    (tmp_path / "c512-2").mkdir()  # failed capture without records
+    (old_root / "c512-9").mkdir()  # failed capture without records
 
-    data = build_distribution(tmp_path)
+    data = build_distribution([stamped_root, old_root])
 
-    assert data["provenance"]["captures"] == ["c512-1", "c8192-1"]
-    assert data["provenance"]["handoff_gap_source"] == {
-        "c512-1": "frontend_arrival",
-        "c8192-1": "frontend_arrival",
+    assert data["schema_version"] == 2
+    assert data["provenance"]["model_captures"] == [
+        "race2/c512-1",
+        "race2/c512-2",
+        "race2/c8192-1",
+        "race2/c8192-2",
+    ]
+    assert data["provenance"]["outcome_only_captures"] == ["race/c1024-1"]
+    assert "race/c512-9" in data["provenance"]["skipped"]
+    keys = {quantity: entry["key"] for quantity, entry in data["keying"].items()}
+    assert keys == {
+        "ingest_ms": "pooled",
+        "first_gap_ms": "context",
+        "send_to_visible_ms": "pooled",
+        "first_plan_offset_ms": "context",
+        "later_gap_ms": "pooled",
     }
-    assert "c512-2" in data["provenance"]["skipped"]
-    assert data["ingest_delay_ms"] == [20.0, 30.0]
-    assert data["handoff_gap_ms"] == [0.5, 1.0, 2.0]
-    assert data["first_plan_offset_ms"] == [1.0, 0.6]
-    assert data["outcome"]["extra_solo_decode"] == 1
-    assert data["outcome"]["steps"] == {"c512-1": 4, "c8192-1": 3}
-    # Step 3 of c512-1 is planned 0.1 ms after step 1 finishes.
-    assert abs(data["steady_plan_offset_median_ms"] - 0.1) < 1e-9
+    c512, c8192 = data["contexts"]["512"], data["contexts"]["8192"]
+    assert c512["first_gap_ms"] == [1.1, 1.2]
+    assert c8192["first_gap_ms"] == [0.5, 0.4]
+    assert c512["first_plan_offset_ms"] == [0.7, 0.8]
+    assert c8192["first_plan_offset_ms"] == [1.2, 1.5]
+    # Pooled quantities repeat every stamped capture in every context.
+    assert c512["send_to_visible_ms"] == c8192["send_to_visible_ms"] == [0.5, 0.9, 0.7, 0.6]
+    assert c512["ingest_ms"] == [20.0] * 4
+    assert c512["later_gap_ms"] == [0.25] * 4 + [0.5] * 4
+    # A later receive at the drain before step 1 bounds its transport from above.
+    assert c512["later_send_to_receive_upper_bound_ms"] == []
+    assert [round(v, 6) for v in c8192["later_send_to_receive_upper_bound_ms"]] == [1.38, 1.68]
+    assert c512["outcome"] == {"captures": 2, "extra_solo_decode": 2}
+    assert c8192["outcome"] == {"captures": 2, "extra_solo_decode": 0}
+    assert data["outcome"]["by_context"]["1024"] == {
+        "stamped": {},
+        "unstamped": {"race/c1024-1": 3},
+    }
 
 
-def test_checked_in_distribution_matches_the_race_campaign():
+def test_checked_in_distribution_matches_the_stamped_campaign():
     data = json.loads(DATA.read_text())
-    captures = data["provenance"]["captures"]
-    assert len(captures) == data["outcome"]["captures"] == 13
-    assert len(data["ingest_delay_ms"]) == 13
-    assert len(data["handoff_gap_ms"]) == 13 * 15
-    assert data["handoff_gap_ms"] == sorted(data["handoff_gap_ms"])
-    assert data["outcome"]["extra_solo_decode"] == 10
-    assert min(data["ingest_delay_ms"]) > 0
-
-
-def test_extraction_prefers_measured_api_send_gaps(tmp_path):
-    common = dict(
-        plans_ms=[30.0, 31.0, 80.1, 90.1],
-        ends_ms=[80.0, 90.0, 100.0, 110.0],
-        phases=["prefill", "prefill", "decode", "decode"],
-    )
-    # Stamped capture: send gaps (0.25, 0.5 ms) replace the arrival gaps (0, 0 ms).
-    write_capture(
-        tmp_path,
-        "c512-1",
-        [0.0, 0.0, 0.0],
-        [30.0, 31.0, 32.0],
-        sends_ms=[1.0, 1.75, 1.25],
-        **common,
-    )
-    # One request without a stamp: the capture keeps its frontend-gap fallback.
-    write_capture(tmp_path, "c512-2", [0.0, 2.0], [30.0, 31.0], sends_ms=[1.0, None], **common)
-    # Arrival sub-version 1 rows have no send field at all.
-    write_capture(
-        tmp_path, "c512-3", [0.0, 3.0], [30.0, 31.0], sends_ms=["absent", "absent"], **common
-    )
-
-    data = build_distribution(tmp_path)
-
-    assert data["provenance"]["handoff_gap_source"] == {
-        "c512-1": "api_send",
-        "c512-2": "frontend_arrival",
-        "c512-3": "frontend_arrival",
-    }
-    assert data["handoff_gap_ms"] == [0.25, 0.5, 2.0, 3.0]
-    # The ingest delay still runs from the first frontend arrival.
-    assert data["ingest_delay_ms"] == [30.0, 30.0, 30.0]
+    assert data["schema_version"] == 2
+    assert len(data["provenance"]["model_captures"]) == 11
+    assert all(name.startswith("race2/") for name in data["provenance"]["model_captures"])
+    assert sorted(data["contexts"], key=int) == ["512", "2048", "8192"]
+    for entry in data["contexts"].values():
+        captures = len(entry["captures"])
+        assert len(entry["ingest_ms"]) == len(entry["first_gap_ms"]) == captures
+        assert len(entry["first_plan_offset_ms"]) == captures
+        assert len(entry["send_to_visible_ms"]) == 11
+        assert len(entry["later_gap_ms"]) == 11 * 14
+        assert entry["later_gap_ms"] == sorted(entry["later_gap_ms"])
+    keys = {quantity: entry["key"] for quantity, entry in data["keying"].items()}
+    assert keys["first_gap_ms"] == keys["first_plan_offset_ms"] == "context"
+    assert keys["send_to_visible_ms"] == "pooled"
+    extra = sum(entry["outcome"]["extra_solo_decode"] for entry in data["contexts"].values())
+    assert extra == 7

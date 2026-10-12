@@ -198,6 +198,7 @@ impl Deployment for UnifiedDeployment {
                 _ => DpPlacement::RoundRobin,
             },
             async_lookahead: async_lookahead(&g.worker),
+            async_lookahead_from_idle: async_lookahead_from_idle(cfg, &g.worker, &g.arch)?,
             ..WorkerConfig::default()
         };
         ensure!(
@@ -1072,9 +1073,10 @@ fn ensure_stock_neuron_worker(
          {pool_bytes_per_rank} bytes per rank"
     );
     // The async plan offset is a sub-step host latency: the measured first-step
-    // offsets are 0.70-3.49 ms (alignment/neuron/data/vllm_neuron_handoff.json),
-    // far below a compiled step, so a zero or step-sized offset is a
-    // configuration error.
+    // offsets are 0.71-1.67 ms in the hand-off-stamped captures
+    // (alignment/neuron/data/vllm_neuron_handoff.json) and up to 3.55 ms in
+    // earlier ones, far below a compiled step, so a zero or step-sized offset is
+    // a configuration error.
     if let Some(offset) = config.async_lookahead {
         ensure!(
             offset > Time::ZERO && offset <= Time::from_us(MAX_STOCK_NEURON_ASYNC_LOOKAHEAD_US),
@@ -1086,7 +1088,7 @@ fn ensure_stock_neuron_worker(
 }
 
 /// Upper bound on the stock vLLM Neuron async plan offset: above the largest
-/// measured first-step offset (3.49 ms) and below the shortest measured step
+/// measured first-step offset (3.55 ms) and below the shortest measured step
 /// (about 9.7 ms, a bucket-1 decode).
 const MAX_STOCK_NEURON_ASYNC_LOOKAHEAD_US: u64 = 5_000;
 
@@ -1131,6 +1133,27 @@ fn speculative_draft_tokens(worker: &IterWorkerSel) -> u32 {
         IterWorkerSel::Speculative { draft_tokens, .. } => *draft_tokens,
         _ => 0,
     }
+}
+
+/// Plan offset after a step that started from an idle engine. Present only
+/// when the worker plans with async lookahead and the workload selects the
+/// frontend hand-off model: that model's seed draws one measured first-step
+/// offset for the run, at the arch's serving context. Otherwise every step
+/// uses `async_lookahead_us`, as before.
+fn async_lookahead_from_idle(
+    cfg: &UnifiedConfig,
+    worker: &IterWorkerSel,
+    arch: &IterArchSel,
+) -> anyhow::Result<Option<crate::common::Time>> {
+    if async_lookahead(worker).is_none() || cfg.workload.frontend_handoff.is_none() {
+        return Ok(None);
+    }
+    let handoff = crate::sim::FrontendHandoffConfig::parse(
+        cfg.workload.frontend_handoff.as_deref(),
+        cfg.workload.frontend_handoff_seed,
+        Some(arch.max_model_len()?),
+    )?;
+    Ok(handoff.map(|handoff| handoff.first_plan_offset()))
 }
 
 /// Which deterministic acceptance stream the speculative worker draws from.
@@ -1551,6 +1574,59 @@ mod tests {
         let error = ensure_hp_unified(&pd_prefill).unwrap_err().to_string();
         assert!(error.contains("worker `hp_unified`"));
         assert!(error.contains("PdPrefill"));
+    }
+
+    #[test]
+    fn async_lookahead_from_idle_is_the_handoff_seed_draw_at_the_arch_context() {
+        let config = |max_model_len: u32, handoff: &str, lookahead: &str| {
+            let yaml = format!(
+                r#"
+deployment: unified
+workload: {{ trace_files: ["trace/trainium_stock_smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0{handoff} }}
+io: {{ log_dir: "logs/test", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }}
+pools:
+  main:
+    placement: least-queued
+    groups:
+      - gpu: AWS Trainium2 LNC2
+        replicas: 1
+        arch: {{ type: llama3_vllm_neuron, model_config: model/config/llama3_8b.json, max_model_len: {max_model_len}, decode_buckets: [1, 16], tp_size: 4, fp8: false }}
+        worker: {{ type: chunked_prefill, attn_gpu_memory_gb: 7.111442432, max_batch_tokens: {max_model_len}, max_prefill_requests_per_iteration: 1, max_resident_requests_per_partition: 16, batch_policy: separate-prefill-priority, kv_admission_policy: full-footprint, prefix_cache_mode: disabled, gpu_time_multiplier: 1.0{lookahead} }}
+"#
+            );
+            let cfg: crate::deployment::RunConfig =
+                serde_yaml::from_str(&yaml).expect("stock Neuron config parses");
+            let crate::deployment::RunConfig::Unified(cfg) = cfg else {
+                panic!("expected unified config")
+            };
+            cfg
+        };
+        let from_idle = |cfg: &UnifiedConfig| {
+            let group = &cfg.pools.main.groups[0];
+            async_lookahead_from_idle(cfg, &group.worker, &group.arch).unwrap()
+        };
+        let handoff = |seed: u64| {
+            format!(", frontend_handoff: vllm-neuron-0.24, frontend_handoff_seed: {seed}")
+        };
+        let lookahead = ", async_lookahead_us: 1040";
+        // Opt-in on both sides: either model alone leaves every step on
+        // `async_lookahead_us`.
+        assert_eq!(from_idle(&config(512, "", lookahead)), None);
+        assert_eq!(from_idle(&config(512, &handoff(3), "")), None);
+        for (max_model_len, seed) in [(512, 3), (8192, 3), (8192, 9)] {
+            let expected = crate::sim::FrontendHandoffConfig::parse(
+                Some(crate::sim::FrontendHandoffConfig::VLLM_NEURON),
+                Some(seed),
+                Some(max_model_len),
+            )
+            .unwrap()
+            .unwrap()
+            .first_plan_offset();
+            assert_eq!(
+                from_idle(&config(max_model_len, &handoff(seed), lookahead)),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

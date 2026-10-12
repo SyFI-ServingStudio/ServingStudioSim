@@ -621,6 +621,12 @@ pub struct WorkerConfig {
     /// after the current one starts, from the messages visible by then; `None`
     /// is the synchronous cadence. Only the chunked-prefill recipe reads it.
     pub async_lookahead: Option<Time>,
+    /// Plan offset of the step after one that started from an idle engine
+    /// (nothing in flight, so no predecessor's output gates its successor's
+    /// plan). `None` uses `async_lookahead` for every step. The deployment sets
+    /// it from the frontend hand-off model's per-seed draw of the measured
+    /// first-step offsets; it has no effect without `async_lookahead`.
+    pub async_lookahead_from_idle: Option<Time>,
 }
 
 impl Default for WorkerConfig {
@@ -651,6 +657,7 @@ impl Default for WorkerConfig {
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,
             async_lookahead: None,
+            async_lookahead_from_idle: None,
         }
     }
 }
