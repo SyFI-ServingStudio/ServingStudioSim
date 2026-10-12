@@ -8,7 +8,11 @@ from pathlib import Path
 import pytest
 
 from profiling.exec.env import ContainerProfileEnv
-from profiling.exec.local import _container_worker_command, gpu_uuids_for_indices
+from profiling.exec.local import (
+    IMEX_CHANNEL_CDI_DEVICE,
+    _container_worker_command,
+    gpu_uuids_for_indices,
+)
 from profiling.profilers.energy import ENERGY_ENV
 from profiling.profilers.timer import CUPTI_TRACE_ENV
 
@@ -199,3 +203,35 @@ def test_container_worker_redirects_the_inductor_cache_into_the_mount(
     inductor = next(a for a in command if a.startswith("TORCHINDUCTOR_CACHE_DIR="))
     assert inductor.split("=", 1)[1].startswith("/cache/")
     assert any(a.endswith(":/cache") for a in cache_dir)
+
+
+def test_container_worker_requests_imex_channel_only_when_asked(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
+    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test")
+
+    plain, _env = _container_worker_command(profiler_env, [0, 1], tmp_path)
+    fabric, _env = _container_worker_command(profiler_env, [0, 1], tmp_path, imex_channel=True)
+
+    assert IMEX_CHANNEL_CDI_DEVICE == "nvidia.com/imex-channel=0"
+    assert "--device" not in plain
+    device = fabric.index("--device")
+    assert fabric[device + 1] == IMEX_CHANNEL_CDI_DEVICE
+    # Docker options must precede the image name.
+    assert device < fabric.index("profiler:test")
+    assert [arg for arg in fabric if arg not in ("--device", IMEX_CHANNEL_CDI_DEVICE)] == plain
+
+
+def test_imex_channel_is_declared_by_the_mnnvl_all_reduce_backends_only() -> None:
+    from profiling.db.registry import iter_kernel_profiler_specs
+
+    declared = {
+        (spec.kernel_kind, spec.backend)
+        for spec in iter_kernel_profiler_specs()
+        if spec.imex_channel
+    }
+    assert declared == {
+        ("all_reduce_fusion", "flashinfer_mnnvl"),
+        ("all_reduce_residual_rms_norm", "flashinfer_mnnvl"),
+    }

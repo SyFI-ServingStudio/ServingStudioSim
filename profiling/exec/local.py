@@ -31,6 +31,12 @@ from profiling.profilers.timer import CUPTI_BUDGET_ENV, CUPTI_TRACE_ENV, TIMER_C
 
 CONTAINER_INDUCTOR_CACHE_ENV = "VIBESIM_CONTAINER_INDUCTOR_CACHE"
 
+# CDI name of IMEX channel 0, which fabric-handle cuMemCreate needs. Docker's
+# --device passes a CDI name as a device request; the host registers the device
+# in /etc/cdi/nvidia-imex.yaml (the NVIDIA toolkit's generated spec has no IMEX
+# entry), and `docker info` lists it under CDI devices.
+IMEX_CHANNEL_CDI_DEVICE = "nvidia.com/imex-channel=0"
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _CONTAINER_SOURCE_DIRS = ("profiling", "launcher", "gpu")
 
@@ -93,7 +99,11 @@ class LocalGpuChunk(GpuChunk):
             worker_env = dict(profiler_spec.worker_env)
             if isinstance(profiler_env, ContainerProfileEnv):
                 cmd, env = _container_worker_command(
-                    profiler_env, self.gpus, Path(tmp), worker_env=worker_env
+                    profiler_env,
+                    self.gpus,
+                    Path(tmp),
+                    worker_env=worker_env,
+                    imex_channel=profiler_spec.imex_channel,
                 )
             else:
                 cmd, env = _host_worker_command(
@@ -224,6 +234,7 @@ def _container_worker_command(
     additional_volumes: tuple[tuple[Path, Path], ...] = (),
     *,
     worker_env: Mapping[str, str] | None = None,
+    imex_channel: bool = False,
 ) -> tuple[list[str], dict[str, str]]:
     cache_dir = _image_cache_dir(profiler_env.image)
     # Address the cards by UUID, never by index. See gpu_uuids_for_indices.
@@ -292,6 +303,8 @@ def _container_worker_command(
             "host",
             "--gpus",
             gpu_request,
+            # Only backends that allocate fabric memory ask for the channel.
+            *(["--device", IMEX_CHANNEL_CDI_DEVICE] if imex_channel else []),
             "--user",
             f"{os.getuid()}:{os.getgid()}",
             "--env",

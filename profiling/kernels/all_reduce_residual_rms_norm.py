@@ -150,6 +150,8 @@ register(
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="vllm_env",
+        # The MNNVL workspace is fabric-handle memory.
+        imex_channel=True,
         gpu_count_fn=lambda spec: int(spec["num_gpus"]),
         list_native=True,
         doc=BackendDoc(
