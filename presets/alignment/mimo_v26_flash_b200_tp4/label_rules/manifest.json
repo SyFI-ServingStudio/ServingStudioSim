@@ -3,8 +3,18 @@
  "rule_files": [
   "rules.json"
  ],
- "note": "Forward rules pending: they come from the diverse_100 Check-1 labels of the fused all-reduce capture (Slurm job 6264, logs/20261012_1_mimo_fused_ar_nsys in wt-mimo-v2-clean) labeled against the MiMo arch's CostTree, and are added to rules.json as one order-independent set before `alignment-campaign label` runs. Families in that capture: fused MoE (FlashInfer TRT-LLM MXFP4 x BF16), GA and SWA FA4 attention (scheduler + forward + combine), FlashInfer MNNVL all-reduce + residual + RMSNorm (97 sites per iteration), FP8 per-token-group quant, DeepGEMM QKV, o_proj / lm_head, router GEMM, DiffKV cache append.",
+ "note": "MiMo-V2.6-Flash-RL on 4x B200, vLLM fork 892da082 TP4 attention / EP4 experts, labeled against the mimo_v2_vllm_fp8_swa_moe CostTree. One order-independent rule set (rules.json), written by gen_rules.py: the 39 rules of the arch's kernel-align run (wt-mimo-v2-clean logs/20261012_2_mimo_arch_kernel_align/make_rules.py) plus two folded-body-start rules for the MoE all-reduce. On capture 6264's folded inventory every forward kernel is mapped except the residual zeros_like fill.",
  "source": {
-  "capture": "logs/20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264, wt-mimo-v2-clean)"
+  "capture": "logs/20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)",
+  "cost_manifest": "logs/20261012_2_mimo_arch_kernel_align/timing_predict/raw/cost_manifest",
+  "arch": "mimo_v2_vllm_fp8_swa_moe, model/config/mimo_v2_6_flash_rl.json, routing corpus"
+ },
+ "unmapped_decisions": {
+  "forward": {
+   "triton_poi_fused_zeros_like_0": "zero residual for the layer-0 fused AR + norm; no CostTree leaf"
+  },
+  "preprocess": "input preparation and attention metadata; no CostTree leaf",
+  "sample": "sampling kernels (gumbel sample, argmax reduce, scatter/gather, counters) are not modelled; the logits row gather, LM head and logits all-gather are mapped",
+  "bookkeep": "scheduler bookkeeping"
  }
 }

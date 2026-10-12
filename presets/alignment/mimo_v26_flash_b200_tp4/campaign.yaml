@@ -74,10 +74,10 @@ variants:
       - --quantization-config
       - '{"moe":{"activation":"mxfp8"}}'
     arch:
-      type: mimo_v2_vllm_mxfp4_swa_moe
+      type: mimo_v2_vllm_fp8_swa_moe
       model_config: model/config/mimo_v2_6_flash_rl.json
+      fp8: true
       tp_size: 4
-      enable_expert_parallel: true
       routing: corpus
       token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@18506fd7afbaf925da2d31821287d079fffba5a6/mimo_v26_flash_rl/vllm/diverse_100/capture/20261007/manifest.json
       cudagraph_capture_sizes: &id002
@@ -177,10 +177,10 @@ variants:
       - --kv-cache-memory-bytes
       - '19621785600'
     arch:
-      type: mimo_v2_vllm_mxfp4_swa_moe
+      type: mimo_v2_vllm_fp8_swa_moe
       model_config: model/config/mimo_v2_6_flash_rl.json
+      fp8: true
       tp_size: 4
-      enable_expert_parallel: true
       routing: corpus
       token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@18506fd7afbaf925da2d31821287d079fffba5a6/mimo_v26_flash_rl/vllm/diverse_100/capture/20261007/manifest.json
       cudagraph_capture_sizes: *id002
@@ -251,10 +251,10 @@ variants:
       - --kv-cache-memory-bytes
       - '27457597440'
     arch:
-      type: mimo_v2_vllm_mxfp4_swa_moe
+      type: mimo_v2_vllm_fp8_swa_moe
       model_config: model/config/mimo_v2_6_flash_rl.json
+      fp8: true
       tp_size: 4
-      enable_expert_parallel: true
       routing: corpus
       token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@18506fd7afbaf925da2d31821287d079fffba5a6/mimo_v26_flash_rl/vllm/diverse_100/capture/20261007/manifest.json
       cudagraph_capture_sizes: *id002

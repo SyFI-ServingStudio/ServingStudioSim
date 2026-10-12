@@ -53,9 +53,8 @@ GA_TOKENS_PER_BLOCK = 32
 SWA_BLOCKS_PER_REQUEST = 5 * (math.ceil(128 / 16) + 1)
 GIB = 1 << 30
 
-# The arch tag is being built in wt-mimo-v2-clean (`simulator/src/arch/mimo_v2_*`). Set it to that tag and rerun
-# this script once the arch lands; nothing else in the pack depends on the name.
-ARCH_TYPE = "mimo_v2_vllm_mxfp4_swa_moe"
+# The arch block matches presets/public/MiMo-V2.6-Flash-RL/mimo_v2_vllm_fp8_swa_moe.yaml (its diverse_100 member).
+ARCH_TYPE = "mimo_v2_vllm_fp8_swa_moe"
 
 CAPTURE = "logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log"
 
@@ -122,8 +121,9 @@ PYTHON_RUNTIME = {
 ARCH = {
     "type": ARCH_TYPE,
     "model_config": "model/config/mimo_v2_6_flash_rl.json",
+    # FP8 block-quantized QKV / dense FFN; the routed experts are expert-parallel over the TP ranks by construction.
+    "fp8": True,
     "tp_size": 4,
-    "enable_expert_parallel": True,
     # Recorded routes of the diverse_100 capture (job 4220, EPLB off, linear placement).
     "routing": "corpus",
     "token_corpus_file": "hf://datasets/UW-SyFI/servingstudio-workload@18506fd7afbaf925da2d31821287d079fffba5a6/"
