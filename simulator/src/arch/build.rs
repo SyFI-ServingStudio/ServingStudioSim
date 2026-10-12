@@ -13,7 +13,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
@@ -778,6 +778,41 @@ pub fn dense_tp(
         llama3_dense_tp::resolve_configs(&llama3_dense_tp::build_configs(&model_cfg, &parallel));
     llama3_dense_tp::build(name.to_string(), resolved, bridge)
         .context("building Llama3-dense-TP model (often a missing profile.db row)")
+}
+
+/// Build the original Llama 3.1 8B on stock vLLM Neuron (TP4/LNC2), costed as
+/// its one measured forward. The checkpoint must be exactly the measured one:
+/// no layer overrides, BF16, and the Llama 3.1 math the executable computes.
+pub fn llama3_vllm_neuron(
+    model_spec: &ModelSpec,
+    max_model_len: u32,
+    decode_buckets: &[u32],
+    tp_size: u16,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<crate::arch::Llama3VllmNeuronModel> {
+    use crate::arch::llama3_vllm_neuron as stock;
+    ensure!(
+        !model_spec.fp8 && model_spec.num_layers.is_none() && model_spec.sim_num_layers.is_none(),
+        "stock vLLM Neuron requires BF16 and the original model without layer overrides"
+    );
+    let raw: serde_json::Value = serde_json::from_reader(
+        File::open(&model_spec.model_config)
+            .with_context(|| format!("opening {}", model_spec.model_config))?,
+    )?;
+    stock::validate_checkpoint_math(&raw)?;
+    let model_cfg = dense_model_cfg(model_spec)?;
+    stock::validate_model(&model_cfg)?;
+    let parallel = crate::arch::VllmNeuronParallel {
+        gpu_name: gpu.to_string(),
+        max_model_len,
+        decode_buckets: decode_buckets.to_vec(),
+        tp_size,
+    };
+    let resolved = stock::resolve_configs(&stock::build_configs(&model_cfg, &parallel));
+    stock::build(name.to_string(), resolved, bridge)
+        .context("building the stock vLLM Neuron forward (often a missing profile.db row)")
 }
 
 /// Build the exact local TP1/EP1 Qwen3.6 heterogeneous model. The nested
@@ -1970,6 +2005,20 @@ pub fn build_iter_model(
             bridge,
         )?),
         IterArchSel::Llama3Dense { model } => Box::new(dense(model, gpu, name, bridge)?),
+        IterArchSel::Llama3VllmNeuron {
+            model,
+            max_model_len,
+            decode_buckets,
+            tp_size,
+        } => Box::new(llama3_vllm_neuron(
+            model,
+            *max_model_len,
+            decode_buckets,
+            *tp_size,
+            gpu,
+            name,
+            bridge,
+        )?),
         IterArchSel::Llama3DenseTp { model, tp_size } => {
             Box::new(dense_tp(model, *tp_size, gpu, name, bridge)?)
         }

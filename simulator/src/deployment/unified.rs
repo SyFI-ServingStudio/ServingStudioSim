@@ -37,6 +37,7 @@ use crate::orchestrator::{
     DpPlacementPolicy, Flow, PlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig,
     UnifiedWorkerFactory,
 };
+use crate::timing::kernels::neuron_llama_forward::{resident_capacity, STOCK_KV_SLOTS};
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker, build_speculative_worker,
@@ -371,6 +372,40 @@ impl Deployment for UnifiedDeployment {
                     gpu_name,
                     dp_cfg,
                     build_barebone_worker,
+                ))
+            }
+            IterArchSel::Llama3VllmNeuron {
+                max_model_len,
+                decode_buckets,
+                tp_size,
+                ..
+            } => {
+                let model = Arc::new(arch_build::llama3_vllm_neuron(
+                    model_spec,
+                    *max_model_len,
+                    decode_buckets,
+                    *tp_size,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                ensure_stock_neuron_worker(
+                    &g.worker,
+                    &worker_config,
+                    *max_model_len,
+                    decode_buckets,
+                    g.replicas,
+                    model.kv_cache_layout().per_token_bytes() * u64::from(STOCK_KV_SLOTS)
+                        / u64::from(model.num_attn_shards()),
+                )?;
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_chunked_prefill_worker,
                 ))
             }
             IterArchSel::Llama3DenseTp { tp_size, .. } => {
@@ -975,6 +1010,54 @@ fn prefill_gpu_time_multiplier(worker: &IterWorkerSel) -> anyhow::Result<Option<
     Ok(multiplier)
 }
 
+/// Stock vLLM Neuron's scheduler on the generic chunked-prefill worker: one
+/// replica, a context-sized token budget (its one compiled prefill graph), one
+/// prompt per iteration that never shares it with decode, FIFO, no prefix
+/// reuse, and at most as many residents as both its largest compiled decode
+/// bucket and the paged pool hold. Its KV budget is exactly that pool,
+/// `pool_bytes_per_rank`.
+fn ensure_stock_neuron_worker(
+    worker: &IterWorkerSel,
+    config: &WorkerConfig,
+    context: u32,
+    decode_buckets: &[u32],
+    replicas: u16,
+    pool_bytes_per_rank: u64,
+) -> anyhow::Result<()> {
+    ensure!(
+        matches!(worker, IterWorkerSel::ChunkedPrefill { .. }),
+        "stock vLLM Neuron requires worker chunked_prefill"
+    );
+    ensure!(
+        replicas == 1,
+        "stock vLLM Neuron serves one chip: exactly one replica"
+    );
+    let largest_bucket = decode_buckets.iter().copied().max().unwrap_or(0);
+    let residents = largest_bucket.min(resident_capacity(context));
+    ensure!(
+        config.max_batch_tokens == Some(context)
+            && config.max_prefill_requests_per_iteration == Some(1)
+            && config.max_resident_requests_per_partition == Some(residents),
+        "stock vLLM Neuron requires max_batch_tokens {context}, \
+         max_prefill_requests_per_iteration 1 and max_resident_requests_per_partition \
+         {residents}"
+    );
+    ensure!(
+        config.batch_policy == BatchPolicy::SeparatePrefillPriority
+            && matches!(config.kv_admission, KvAdmissionConfig::FullFootprint)
+            && config.pending_order == PendingOrderKind::Fifo
+            && !config.prefix_cache.enabled(),
+        "stock vLLM Neuron requires FIFO, separate-prefill-priority, full-footprint admission \
+         and prefix_cache_mode disabled"
+    );
+    ensure!(
+        config.attn_kv_bytes == pool_bytes_per_rank,
+        "stock vLLM Neuron requires attn_gpu_memory_gb to be exactly its paged KV pool, \
+         {pool_bytes_per_rank} bytes per rank"
+    );
+    Ok(())
+}
+
 /// The chunked-prefill worker's request-count limits. Zero would stall
 /// admission for good, so it is rejected here rather than at build.
 fn chunked_request_limits(worker: &IterWorkerSel) -> anyhow::Result<(Option<u32>, Option<u32>)> {
@@ -1194,6 +1277,47 @@ mod tests {
             dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: None,
             kv_accounting: Default::default(),
+        }
+    }
+
+    #[test]
+    fn stock_neuron_pair_requires_the_exact_scheduler_and_pool() {
+        assert_iter_worker_contract::<ChunkedPrefillWorker<crate::arch::Llama3VllmNeuronModel>>();
+        // 6782 pages x 32 tokens x 32768 bytes per token per TP rank.
+        const POOL: u64 = 7_111_442_432;
+        let sel = chunked_prefill_worker();
+        let valid = WorkerConfig {
+            attn_kv_bytes: POOL,
+            max_batch_tokens: Some(512),
+            max_prefill_requests_per_iteration: Some(1),
+            max_resident_requests_per_partition: Some(16),
+            batch_policy: BatchPolicy::SeparatePrefillPriority,
+            pending_order: PendingOrderKind::Fifo,
+            prefix_cache: crate::worker::kv::PrefixCacheConfig::Disabled,
+            ..WorkerConfig::default()
+        };
+        let check = |worker: &IterWorkerSel, config: &WorkerConfig, buckets: &[u32], replicas| {
+            ensure_stock_neuron_worker(worker, config, 512, buckets, replicas, POOL)
+        };
+        check(&sel, &valid, &[1, 16], 1).unwrap();
+        assert!(check(&sel, &valid, &[1, 16], 2).is_err());
+        assert!(check(&barebone_worker(), &valid, &[1, 16], 1).is_err());
+        // The pool, not the largest bucket, caps C512 residents at 423.
+        let mut ladder = valid;
+        ladder.max_resident_requests_per_partition = Some(423);
+        check(&sel, &ladder, &[1, 512], 1).unwrap();
+        for mutate in [
+            |c: &mut WorkerConfig| c.attn_kv_bytes -= 1,
+            |c: &mut WorkerConfig| c.max_batch_tokens = Some(256),
+            |c: &mut WorkerConfig| c.max_prefill_requests_per_iteration = Some(2),
+            |c: &mut WorkerConfig| c.max_resident_requests_per_partition = Some(17),
+            |c: &mut WorkerConfig| c.batch_policy = BatchPolicy::Mix,
+            |c: &mut WorkerConfig| c.pending_order = PendingOrderKind::SessionStart,
+            |c: &mut WorkerConfig| c.prefix_cache = Default::default(),
+        ] {
+            let mut invalid = valid;
+            mutate(&mut invalid);
+            assert!(check(&sel, &invalid, &[1, 16], 1).is_err());
         }
     }
 

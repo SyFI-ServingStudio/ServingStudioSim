@@ -149,6 +149,18 @@ const fn default_dflash2_sliding_window() -> u32 {
     2048
 }
 
+const fn default_vllm_neuron_max_model_len() -> u32 {
+    512
+}
+
+fn default_vllm_neuron_decode_buckets() -> Vec<u32> {
+    vec![1, 16]
+}
+
+const fn default_vllm_neuron_tp_size() -> u16 {
+    4
+}
+
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
 /// that consume them (provider-first: select the arch, then it exposes its own
 /// params).
@@ -178,6 +190,24 @@ pub enum IterArchSel {
     Llama3Dense {
         #[serde(flatten)]
         model: ModelSpec,
+    },
+    /// The original BF16 Llama 3.1 8B on stock vLLM Neuron, TP4 over the four
+    /// LNC2 cores of one Trainium2 chip, costed as one measured forward.
+    Llama3VllmNeuron {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// The compiled context: prefill graph width and decode block-table span.
+        #[serde(default = "default_vllm_neuron_max_model_len")]
+        #[param(default = 512, cache_key)]
+        max_model_len: u32,
+        /// The compiled decode graphs (`num_seqs_buckets`); a decode batch pads to
+        /// the smallest one that holds it. Need not include 1.
+        #[serde(default = "default_vllm_neuron_decode_buckets")]
+        #[param(cache_key)]
+        decode_buckets: Vec<u32>,
+        #[serde(default = "default_vllm_neuron_tp_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
     },
     /// Megatron TP over dense Llama 3. `tp_size` must divide the KV heads (8).
     Llama3DenseTp {
@@ -1051,6 +1081,7 @@ impl IterArchSel {
         match self {
             Self::Qwen36Local { model, .. }
             | Self::Llama3Dense { model }
+            | Self::Llama3VllmNeuron { model, .. }
             | Self::Llama3DenseTp { model, .. }
             | Self::Llama3DpAttnTpFfn { model, .. }
             | Self::Qwen3MoeDpAttnEpFfn { model, .. }
@@ -1095,7 +1126,8 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { max_model_len, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. }
-            | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. } => Ok(*max_model_len),
+            | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. }
+            | Self::Llama3VllmNeuron { max_model_len, .. } => Ok(*max_model_len),
             Self::DeepseekV41Vllm {
                 model,
                 max_model_len,
