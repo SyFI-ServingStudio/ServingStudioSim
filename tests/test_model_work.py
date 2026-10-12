@@ -4056,3 +4056,38 @@ def test_mimo_floors_label_logged_request_geometry_exactly(mimo):
         {key: value for key, value in totals.items() if key != "request_geometry"}
     ), geometry_attention=False)
     assert not any(segment.name.startswith("swa_moe.attn") for segment in scalar.segments)
+
+
+def test_mimo_location_map_consumes_every_semantic_once(mimo):
+    location_map = json.loads(
+        (INKLING_MAPS / "mimo_v2_vllm_fp8_swa_moe_tp4_ep4_unified.json").read_text()
+    )
+    assert location_map["schema_version"] == 1
+    assert location_map["mapping_id"] == "mimo-v2-vllm-fp8-swa-moe-tp4-ep4-unified-v1"
+    assert location_map["arch_types"] == ["mimo_v2_vllm_fp8_swa_moe"]
+    locations = [row["location"] for row in location_map["locations"]]
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    # 44 compiled leaves at TP4 = EP4 less 7 fused all-reduce + residual + RMSNorm
+    # leaves and the logits all-gather, which are communication.
+    assert len(locations) == len(set(locations)) == 36
+    for workload in (
+        Workload.causal_lm(decode=[4096] * 3, sampled=3),
+        Workload.causal_lm(prefill=[(2048, 0)], decode=[300], sampled=2),
+    ):
+        names = [segment.name for segment in mimo.label(workload).segments]
+        assert sorted(mapped) == sorted(names)
+    semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    # The RMSNorms run inside the communication leaves, so each learned scale sits
+    # at the GEMM its output feeds; the final norm feeds the head.
+    assert semantics["unified.swa_moe.attn.qkv_proj.gemm"] == ["swa_moe.qkv", "swa_moe.input_norm"]
+    assert semantics["unified.lm_head"] == ["lm_head", "final_norm"]
+    assert semantics["unified.swa_moe.attn.attention"][-1] == "swa_moe.attention_sinks"
+    for tag in ("swa_moe", "global_moe"):
+        assert semantics[f"unified.{tag}.moe.routed_rank0.fused_moe"] == [
+            f"{tag}.expert_gate_up", f"{tag}.expert_down", f"{tag}.router_bias"
+        ]
+        for rank in (1, 2, 3):
+            assert semantics[f"unified.{tag}.moe.routed_rank{rank}.fused_moe"] == []
+    # Zero-minimum leaves: three qkv input quants, three RoPEs, the dense FFN's two
+    # input quants and activation, six routed ranks past rank 0, the logits select.
+    assert sum(not row["semantics"] for row in location_map["locations"]) == 3 + 3 + 3 + 6 + 1

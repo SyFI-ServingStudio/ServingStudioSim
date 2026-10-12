@@ -216,6 +216,11 @@ sigmoid `noaux_tc` with an FP32 selection bias). The FP8 config's `ignored_layer
 routed experts as E2M1 plus one E8M0 scale per 32 weights, multiplied by BF16
 activations; the router and `lm_head` are BF16 in the checkpoint though unlisted.
 Text-path parameters reconcile exactly with the safetensors headers (308,778,780,864).
+`mimo_v2_vllm_fp8_swa_moe_tp4_ep4_unified.json` maps it onto the TP4 = EP4 arch. Its
+RMSNorms run only inside the fused all-reduce leaves (communication), so each learned
+scale sits at the GEMM its output feeds (input norm -> `qkv_proj.gemm`, post-attention
+norm -> dense `gate_up` / MoE `router`, final norm -> `lm_head`); the sinks join the
+attention row and the FP32 selection bias the rank-0 routed leaf.
 
 ## Modality-agnostic workload
 
