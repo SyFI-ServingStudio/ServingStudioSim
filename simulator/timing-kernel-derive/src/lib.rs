@@ -81,7 +81,10 @@ pub fn derive_sweep_coords(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-#[proc_macro_derive(KernelConfig, attributes(compute_dtype, kv_dtype))]
+#[proc_macro_derive(
+    KernelConfig,
+    attributes(compute_dtype, compute_dtype_override, kv_dtype)
+)]
 pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
@@ -128,10 +131,28 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
             .find(|f| f.attrs.iter().any(|a| a.path().is_ident(attr)))
             .map(|f| f.ident.as_ref().expect("named fields enforced above"))
     };
-    let compute_dtype_impl = find_dtype_field("compute_dtype").map(|field| {
+    // `#[compute_dtype_override]` tags an `Option<DType>` field that, when set,
+    // replaces the `#[compute_dtype]` field's value: a backend family whose
+    // tensor cores run another precision than the tagged field names (BF16 MMA
+    // over weight-only quantized experts). Unset, the tagged field stands.
+    let compute_dtype_field_ident = find_dtype_field("compute_dtype");
+    let compute_dtype_override_ident = find_dtype_field("compute_dtype_override");
+    if let (Some(field), None) = (compute_dtype_override_ident, compute_dtype_field_ident) {
+        return syn::Error::new_spanned(
+            field,
+            "#[compute_dtype_override] needs a #[compute_dtype] field to fall back to",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let compute_dtype_impl = compute_dtype_field_ident.map(|field| {
+        let value = match compute_dtype_override_ident {
+            Some(over) => quote! { self.#over.or(::core::option::Option::Some(self.#field)) },
+            None => quote! { ::core::option::Option::Some(self.#field) },
+        };
         quote! {
             fn compute_dtype(&self) -> ::core::option::Option<::simulator::timing::DType> {
-                ::core::option::Option::Some(self.#field)
+                #value
             }
         }
     });
@@ -151,6 +172,8 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
         })
     };
     let compute_dtype_field = dtype_field_const("compute_dtype", "COMPUTE_DTYPE_FIELD");
+    let compute_dtype_override_field =
+        dtype_field_const("compute_dtype_override", "COMPUTE_DTYPE_OVERRIDE_FIELD");
     let kv_dtype_field = dtype_field_const("kv_dtype", "KV_DTYPE_FIELD");
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
@@ -158,6 +181,7 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
     let expanded = quote! {
         impl #impl_generics ::simulator::timing::KernelConfig for #name #ty_generics #where_clause {
             #compute_dtype_field
+            #compute_dtype_override_field
             #kv_dtype_field
 
             fn backends(&self) -> &[&'static str] {
