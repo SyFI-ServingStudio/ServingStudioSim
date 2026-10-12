@@ -70,6 +70,7 @@ use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
 use crate::op::mhc::{MhcTerminalPostConfig, MhcTerminalPostInput, MhcTerminalPostOp};
 use crate::op::Op;
@@ -1242,11 +1243,7 @@ pub struct Glm53FlashVllmModel {
     hc_contract_mean: Op<ElementwiseKernel>,
     final_norm: Op<RmsNormKernel>,
     lm_head: Op<SingleGemmKernel>,
-    total_kv_bytes_per_token: u64,
-    recurrent_state_bytes_per_request: u64,
-    /// vLLM's hybrid block size: the token interval at which the KDA state is
-    /// checkpointed and a prefix-cache hit can resume.
-    hybrid_block_size: u32,
+    kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1265,18 +1262,18 @@ pub fn build(
         .map(|group| build_layer_group(n, group, &resolved, true, bridge))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let model_cfg = &cfg.model;
-    let tp = u64::from(cfg.parallel.tp_size);
-    let total_kv_bytes_per_token =
-        tp * u64::from(model_cfg.num_dsa_layers()) * dsa_layer_bytes_per_token(model_cfg);
-    let kda_layers = model_cfg.kda_layers.len() as u64;
-    let hybrid_block_size = hybrid_block_tokens(
-        kda_layer_state_bytes_per_request(&resolved),
-        u64::from(model_cfg.kv_lora_rank),
-    );
-    // vLLM pads each KDA layer's mamba page up to one attention page ("Padding
-    // mamba page size by 2.64%" at TP4), so that is what a request holds.
-    let recurrent_state_bytes_per_request =
-        tp * kda_layers * u64::from(hybrid_block_size) * u64::from(model_cfg.kv_lora_rank);
+    let dsa_layers = model_cfg.num_dsa_layers();
+    let kda_layers = model_cfg.kda_layers.len() as u32;
+    let kda_state_bytes = kda_layer_state_bytes_per_request(&resolved);
+    let kv_cache_layout = hybrid_kv_cache_layout(
+        model_cfg,
+        kda_state_bytes,
+        dsa_layers,
+        kda_layers,
+        kda_layers.div_ceil(dsa_layers.max(1)),
+        hybrid_block_tokens(kda_state_bytes, u64::from(model_cfg.kv_lora_rank)),
+    )
+    .held_on_each_rank(u64::from(cfg.parallel.tp_size));
     let mut model = Glm53FlashVllmModel {
         embedding: atomic(
             n,
@@ -1333,9 +1330,7 @@ pub fn build(
             sizes.dedup();
             sizes
         },
-        total_kv_bytes_per_token,
-        recurrent_state_bytes_per_request,
-        hybrid_block_size,
+        kv_cache_layout,
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -1346,12 +1341,63 @@ pub fn build(
     Ok(model)
 }
 
-/// One rank's cache bytes per token of one DSA layer: the fp8 MLA latent (no
-/// rope part) plus the kpool index cache, one 128-byte fp8 key and a 4-byte
-/// scale per 4-token pool.
-pub(crate) fn dsa_layer_bytes_per_token(model: &Glm53FlashModelCfg) -> u64 {
-    u64::from(model.kv_lora_rank)
-        + u64::from(model.index_head_dim + 4) / u64::from(model.index_kpool)
+/// One request's cache on one rank for `dsa_layers` DSA and `kda_layers` KDA
+/// layers, as vLLM's GLM-5.3 hybrid manager allocates it
+/// (`kv_cache_utils.py` `_get_kv_cache_groups_glm5_next`).
+///
+/// One block id spans every DSA layer's MLA latent and kpool index pages for
+/// `block_tokens` tokens, so its bytes are the DSA layers' alone. Each KDA layer
+/// keeps its state in a slot of one of those blocks, padded to an MLA page, and
+/// the KDA layers are dealt over `kda_groups` groups: a request holds one block
+/// per group, `kda_groups` blocks however few KDA layers fill the last one. The
+/// kpool tail, the raw index keys of a pool still filling up, takes one more
+/// block per request and is never reused by a prefix hit. vLLM reserves one null
+/// block out of the pool.
+pub(crate) fn hybrid_kv_cache_layout(
+    model: &Glm53FlashModelCfg,
+    kda_state_bytes_per_layer: u64,
+    dsa_layers: u32,
+    kda_layers: u32,
+    kda_groups: u32,
+    block_tokens: u32,
+) -> KvCacheLayout {
+    let dsa = u64::from(dsa_layers);
+    let index_entry_bytes = u64::from(model.index_head_dim + DType::Fp32.size_bytes());
+    let block_bytes = dsa
+        * (u64::from(block_tokens) * u64::from(model.kv_lora_rank)
+            + u64::from(block_tokens / model.index_kpool) * index_entry_bytes);
+    // The tail ring holds [K, gate score] for `index_kpool` tokens in bf16.
+    let tail_bytes = dsa
+        * u64::from(model.index_kpool)
+        * 2
+        * u64::from(model.index_head_dim)
+        * u64::from(DType::Bf16.size_bytes());
+    let mut layout = KvCacheLayout::new()
+        .with_part(KvCachePart::per_token(
+            "mla",
+            dsa * u64::from(model.kv_lora_rank),
+        ))
+        .with_part(KvCachePart::compressed(
+            "indexer",
+            model.index_kpool,
+            dsa * index_entry_bytes,
+        ));
+    if kda_layers > 0 {
+        layout = layout.with_part(
+            KvCachePart::per_request("kda", u64::from(kda_layers) * kda_state_bytes_per_layer)
+                .padded_to(u64::from(kda_groups) * block_bytes),
+        );
+    }
+    layout
+        .with_part(
+            KvCachePart::per_request("kpool_tail", tail_bytes)
+                .padded_to(block_bytes)
+                .not_prefix_reusable(),
+        )
+        .with_engine(EngineOverhead {
+            block_tokens: Some(block_tokens),
+            fixed_device_bytes: block_bytes,
+        })
 }
 
 /// One rank's recurrent state of one KDA layer for one request: the fp32 SSM
@@ -1470,16 +1516,8 @@ impl IterwiseUnifiedModel for Glm53FlashVllmModel {
         normalize_input(batch, self.max_model_len).map(|_| ())
     }
 
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token
-    }
-
-    fn recurrent_state_bytes_per_request(&self) -> u64 {
-        self.recurrent_state_bytes_per_request
-    }
-
-    fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-        self.hybrid_block_size
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     /// The kpool DSA's top-k cap makes necessary work per-request in context.
@@ -1674,6 +1712,14 @@ fn fit_failed(reason: impl Into<String>) -> BuildError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn state_part(layout: &KvCacheLayout, name: &str) -> KvCachePart {
+        *layout
+            .parts
+            .iter()
+            .find(|part| part.name == name)
+            .unwrap_or_else(|| panic!("no {name} part"))
+    }
     use crate::arch::contract::ArchGroupInput;
     use crate::timing::routing::RoutingDistribution;
 
@@ -1891,10 +1937,17 @@ mod tests {
         // Every rank keeps the whole MLA latent, so per-token bytes scale with
         // TP; the KDA heads split, so the per-request state only changes by
         // its padding to the hybrid block.
-        assert_eq!(ep8.total_kv_bytes_per_token(), 8 * 11 * (512 + 33));
+        let kv_layout = ep8.kv_cache_layout();
+        assert_eq!(kv_layout.per_token_bytes(), 8 * 11 * (512 + 33));
         // Half the KDA heads per rank: a 1152-token hybrid block (9 x 128).
-        assert_eq!(ep8.recurrent_checkpoint_interval_tokens(), 1152);
-        assert_eq!(ep8.recurrent_state_bytes_per_request(), 8 * 34 * 1152 * 512);
+        assert_eq!(kv_layout.engine.block_tokens, Some(1152));
+        let block_bytes = 1152 * 8 * 11 * (512 + 33);
+        assert_eq!(
+            state_part(&kv_layout, "kda")
+                .overhead
+                .padded_bytes_per_entry,
+            Some(4 * block_bytes)
+        );
         assert_eq!((ep8.gpus_per_replica(), ep8.num_attn_shards()), (8, 8));
         let moe = |ranks: usize| 2 + 2 + ranks * 14;
         let kda_dense = 6 + 12 + 5;
@@ -1938,20 +1991,56 @@ mod tests {
     }
 
     #[test]
-    fn kv_and_recurrent_state_bytes_are_whole_model_totals() {
+    fn kv_cache_layout_follows_vllms_hybrid_groups() {
         let model = built();
-        assert_eq!(model.total_kv_bytes_per_token(), 4 * 11 * (512 + 33));
+        let layout = model.kv_cache_layout();
+        assert_eq!(layout.per_token_bytes(), 4 * 11 * (512 + 33));
+        assert_eq!(layout.engine.block_tokens, Some(2176));
         // The true state is (1 << 20) + 6144 * 3 * 2 bytes per rank and layer;
-        // vLLM pads it to one 2176-token attention page, 2.64% more.
-        assert_eq!(model.recurrent_checkpoint_interval_tokens(), 2176);
-        assert_eq!(
-            model.recurrent_state_bytes_per_request(),
-            4 * 34 * 2176 * 512
-        );
+        // vLLM pads it to one 2176-token MLA page, 2.64% more.
         let true_state = (1u64 << 20) + 6144 * 3 * 2;
         let padding = (2176 * 512) as f64 / true_state as f64 - 1.0;
         assert!((padding - 0.0264).abs() < 5e-5, "{padding}");
+        // The 34 KDA layers deal over ceil(34 / 11) = 4 groups, one block each,
+        // and a block spans the 11 DSA layers' latent and index pages.
+        let block_bytes = 2176 * 4 * 11 * (512 + 33);
+        let kda = state_part(&layout, "kda");
+        assert_eq!(kda.bytes_per_entry, 4 * 34 * true_state);
+        assert_eq!(kda.overhead.padded_bytes_per_entry, Some(4 * block_bytes));
+        let tail = state_part(&layout, "kpool_tail");
+        assert_eq!(tail.overhead.padded_bytes_per_entry, Some(block_bytes));
+        assert!(!tail.prefix_reusable);
+        assert_eq!(layout.engine.fixed_device_bytes, block_bytes);
         assert_eq!((model.gpus_per_replica(), model.num_attn_shards()), (4, 4));
+    }
+
+    /// The fork's "Maximum concurrency for N tokens per request" at TP4 with
+    /// prefix caching on, so the KDA state runs in align mode (one more state
+    /// block per request).
+    #[test]
+    fn kv_cache_layout_reproduces_vllms_logged_concurrency() {
+        use crate::worker::kv::{KvAccounting, KvAccountingOptions};
+        let layout = built().kv_cache_layout();
+        for (gib_per_rank, max_model_len, max_batch_tokens, logged) in [
+            (64.11, 8192, 2048, 405.85),
+            (58.42, 524_288, 2048, 19.23),
+            (63.9, 131_072, 8192, 75.13),
+            (6_871_947_673.0 / f64::from(1u32 << 30), 65_536, 2048, 13.15),
+            (5_315_022_028.0 / f64::from(1u32 << 30), 262_144, 2048, 3.13),
+        ] {
+            let options = KvAccountingOptions {
+                max_in_flight_tokens: Some(2 * max_batch_tokens),
+                prefix_caching: true,
+                ..Default::default()
+            };
+            let budget = (gib_per_rank * f64::from(1u32 << 30)) as u64 * 4;
+            let accounting = KvAccounting::resolve(&layout, options, budget).unwrap();
+            let concurrency = accounting.concurrency_at(max_model_len);
+            assert!(
+                (concurrency / logged - 1.0).abs() < 0.005,
+                "{gib_per_rank} GiB at {max_model_len}: {concurrency} vs {logged}"
+            );
+        }
     }
 
     #[test]

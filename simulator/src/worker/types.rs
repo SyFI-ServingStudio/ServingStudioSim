@@ -178,9 +178,8 @@ pub enum PdDecodeMsg {
         /// Sender's comm-group id (registered at prefill worker construction).
         send_gid: u16,
         /// Total KV **tokens** produced by prefill and transferred for this
-        /// request. The decode side multiplies by its arch's
-        /// `total_kv_bytes_per_token` when calling `cluster.submit_transfer` to
-        /// recover wire bytes.
+        /// request. The decode side converts them to wire bytes with its KV
+        /// accounting's `transfer_bytes` when calling `cluster.submit_transfer`.
         tokens: u64,
         /// The prefill worker that holds this request's KV until the pull
         /// completes. Carried through the decode worker's pending-pull → in-
@@ -240,7 +239,7 @@ impl From<RequestId> for PdDecodeMsg {
 /// is `Copy` and no allocation is needed per handoff. `prefill_worker` is the
 /// owner of the held KV at the source side, threaded through so the decode
 /// worker can ack the prefill side once the pull lands. `tokens` is the wire
-/// KV count; `cluster.submit_transfer` is called with `tokens × total_kv_bytes_per_token`.
+/// KV count; `cluster.submit_transfer` is called with its `transfer_bytes`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferPlan {
     pub send_gid: u16,
@@ -526,9 +525,9 @@ pub struct WorkerStatus {
 pub struct WorkerConfig {
     pub balance: LoadBalance,
     /// This worker's KV-cache memory allowance in bytes (its GPU's attention
-    /// budget). Same per-worker tier as `gpu_name`; the worker divides it by the
-    /// model's `total_kv_bytes_per_token` and attention shard count to size each
-    /// full-attention KV partition.
+    /// budget). Same per-worker tier as `gpu_name`; times the attention shard
+    /// count it is one KV partition's budget, which the arch's
+    /// `kv_cache_layout` turns into capacity units.
     pub attn_kv_bytes: u64,
     /// Mirror of `io.log_output_token_times`: when off, decodes do not build the
     /// per-token timestamp array (the hot-path cost on saturated runs). Threaded
@@ -578,15 +577,26 @@ pub struct WorkerConfig {
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
-    /// Preset override for a hybrid arch's SSM snapshot interval, in context
-    /// tokens (from the worker selector). `None` uses the arch's own
-    /// `recurrent_checkpoint_interval_tokens`. Only the hybrid KV recipe reads
-    /// it.
-    pub ssm_checkpoint_interval_tokens: Option<u32>,
-    /// Whether a hybrid arch's non-final prefill chunks end on its recurrent
-    /// checkpoint interval (from the `chunked_prefill` selector). Only the
-    /// hybrid chunked-prefill recipe reads it.
-    pub prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment,
+    /// Whether KV charges include the serving engine's own allocation (padding,
+    /// state copies, engine blocks, in-flight window tokens).
+    pub kv_overhead: crate::worker::kv::KvOverhead,
+    /// Where a finished request keeps sliding-window tails and recurrent state
+    /// for prefix reuse. `None` follows `kv_overhead`.
+    pub prefix_resume_points: Option<crate::worker::kv::PrefixResumePoints>,
+    /// Also keep them at every multiple of this many tokens.
+    pub prefix_resume_interval: Option<u32>,
+    /// Tokens one step may have in flight, which caps what admission charges a
+    /// sliding window. `None` is two steps of `max_batch_tokens` (vLLM's async
+    /// scheduling), or the whole prompt without a token budget.
+    pub kv_max_in_flight_tokens: Option<u32>,
+    /// The longest request the arch serves (`IterArchSel::max_model_len`). Used
+    /// only to report KV concurrency at that length (`kv_cache.json`); `None`
+    /// when the arch cannot give one.
+    pub max_model_len: Option<u32>,
+    /// Whether non-final prefill chunks end on the layout's checkpoint block
+    /// when the layout keeps a resumable recurrent state and prefix caching is
+    /// on. `None` follows `kv_overhead`: vLLM aligns, the model alone does not.
+    pub prefill_chunk_alignment: Option<crate::worker::config::PrefillChunkAlignment>,
     /// Candidate positions the drafter proposes per request per iteration (from
     /// the worker selector). The verify width is one more than this. Only the
     /// speculative recipe reads it, and it must match the width the model was
@@ -618,8 +628,12 @@ impl Default for WorkerConfig {
             kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
             balance_decode_microbatches: false,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
-            ssm_checkpoint_interval_tokens: None,
-            prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment::Checkpoint,
+            kv_overhead: crate::worker::kv::KvOverhead::Vllm,
+            prefix_resume_points: None,
+            prefix_resume_interval: None,
+            kv_max_in_flight_tokens: None,
+            max_model_len: None,
+            prefill_chunk_alignment: None,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,

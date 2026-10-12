@@ -6,8 +6,8 @@
 //! Wired pairs: `glm52_vllm_nvfp4_pp_dsa_moe` and the hybrid
 //! `glm53_flash_vllm_fp8_pp_kda_dsa_moe`, each with `pipeline_chunked_prefill`.
 //! The arch builds every stage's model once; the stage models are shared across
-//! replicas. The hybrid head charges KV and recurrent state against one block
-//! pool (`PipelineHybridState`).
+//! replicas. The head sizes the pipeline's KV from the arch's
+//! `pipeline_kv_cache_layout`: the most constrained stage's cache.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,10 +25,9 @@ use crate::orchestrator::{
 use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::{
-    build_hybrid_pipeline_head_worker, build_pipeline_head_worker, build_pipeline_stage_worker,
-    resolve_prefix_cache_config, CostSource, IterWorker, IterWorkerSel, PendingOrderKind,
-    PipelineHeadEvent, PipelineHeadMsg, PipelineHybridState, PipelineLayout, PrefillChunkAlignment,
-    PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    build_pipeline_head_worker, build_pipeline_stage_worker, resolve_prefix_cache_config,
+    CostSource, IterWorker, IterWorkerSel, PendingOrderKind, PipelineHeadEvent, PipelineHeadMsg,
+    PipelineLayout, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -56,7 +55,7 @@ impl Deployment for PpDeployment {
             pool.groups.len()
         );
         let g = &pool.groups[0];
-        let worker_config = worker_config(cfg, &g.worker)?;
+        let worker_config = worker_config(cfg, &g.worker, g.arch.max_model_len().ok())?;
         let gpu_name = g.gpu.clone();
         let log_dir = Some(cfg.io.log_dir.clone());
         let placement = match pool.placement {
@@ -91,9 +90,9 @@ impl Deployment for PpDeployment {
                 )?;
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
-                    kv_bytes_per_token: pipeline.pipeline_kv_bytes_per_token(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
                 };
+                let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
@@ -116,6 +115,7 @@ impl Deployment for PpDeployment {
                             STAGE_POOL_TAG,
                             Arc::clone(&head_model),
                             layout,
+                            &kv_cache_layout,
                             std::rc::Rc::clone(&head_store),
                             worker_config,
                             head_log_dir.clone(),
@@ -166,20 +166,9 @@ impl Deployment for PpDeployment {
                 )?;
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
-                    kv_bytes_per_token: pipeline.pipeline_kv_bytes_per_token(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
                 };
-                let hybrid = PipelineHybridState {
-                    block_tokens: pipeline.block_tokens(),
-                    state_blocks_per_request: pipeline.state_blocks_per_request(),
-                    block_aligned_chunks: matches!(
-                        g.worker,
-                        IterWorkerSel::PipelineChunkedPrefill {
-                            prefill_chunk_alignment: PrefillChunkAlignment::Checkpoint,
-                            ..
-                        }
-                    ),
-                };
+                let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
@@ -197,12 +186,12 @@ impl Deployment for PpDeployment {
                     },
                     build_activation_cost(&gpu_name, bridge)?,
                     move |id, cluster| {
-                        build_hybrid_pipeline_head_worker(
+                        build_pipeline_head_worker(
                             id,
                             STAGE_POOL_TAG,
                             Arc::clone(&head_model),
                             layout,
-                            hybrid,
+                            &kv_cache_layout,
                             std::rc::Rc::clone(&head_store),
                             worker_config,
                             head_log_dir.clone(),
@@ -218,12 +207,17 @@ impl Deployment for PpDeployment {
     }
 }
 
-fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<WorkerConfig> {
+fn worker_config(
+    cfg: &PpConfig,
+    worker: &IterWorkerSel,
+    max_model_len: Option<u32>,
+) -> anyhow::Result<WorkerConfig> {
     let IterWorkerSel::PipelineChunkedPrefill {
         attn_gpu_memory_gb,
         max_batch_tokens,
         gpu_time_multiplier,
         balance_decode_microbatches,
+        prefill_chunk_alignment,
         ..
     } = worker
     else {
@@ -237,7 +231,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         None,
         *attn_gpu_memory_gb,
     )?;
-    Ok(WorkerConfig {
+    let mut config = WorkerConfig {
         attn_kv_bytes: (*attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times: cfg.io.log_output_token_times,
         log_stage_transitions: cfg.io.log_stage_transitions,
@@ -247,8 +241,12 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         pending_order: PendingOrderKind::Fifo,
         prefix_cache,
         balance_decode_microbatches: *balance_decode_microbatches,
+        prefill_chunk_alignment: *prefill_chunk_alignment,
+        max_model_len,
         ..WorkerConfig::default()
-    })
+    };
+    worker.kv_accounting().apply("pp", &mut config)?;
+    Ok(config)
 }
 
 /// Stages of one pipeline share an NVLink domain, so activations move on the

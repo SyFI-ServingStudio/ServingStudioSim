@@ -39,8 +39,9 @@ pub(crate) struct RequestLedger {
     chunked_prefill: HashMap<RequestId, (PartitionId, u64)>,
     /// Charge and count of `promised` plus `chunked_prefill`, per partition.
     reserved_by_partition: Vec<(u64, u32)>,
-    /// Prefilled KV awaiting a decode-side pull acknowledgement.
-    held: HashMap<RequestId, (PartitionId, u64)>,
+    /// Prefilled KV awaiting a decode-side pull acknowledgement, as
+    /// `(partition, units, context tokens)`.
+    held: HashMap<RequestId, (PartitionId, u64, u64)>,
     held_by_partition: Vec<u64>,
     /// Sticky placement. Outlives `promised`; cleared on release.
     placement: HashMap<RequestId, PartitionId>,
@@ -181,24 +182,32 @@ impl RequestLedger {
 
     // ── held ─────────────────────────────────────────────────────────────────
 
-    /// Move a prefilled request's KV into the held ledger. Held KV is no longer
-    /// placed: its owner has handed the request off.
-    pub(crate) fn hold(&mut self, request: RequestId, partition: PartitionId, kv_tokens: u64) {
+    /// Move a prefilled request's KV, `units` charged for `kv_tokens` of
+    /// context, into the held ledger. Held KV is no longer placed: its owner
+    /// has handed the request off.
+    pub(crate) fn hold(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        units: u64,
+        kv_tokens: u64,
+    ) {
         self.placement.remove(&request);
-        if let Some((previous_partition, previous_tokens)) =
-            self.held.insert(request, (partition, kv_tokens))
+        if let Some((previous_partition, previous_units, _)) =
+            self.held.insert(request, (partition, units, kv_tokens))
         {
             let total = &mut self.held_by_partition[previous_partition as usize];
-            *total = total.saturating_sub(previous_tokens);
+            *total = total.saturating_sub(previous_units);
         }
-        self.held_by_partition[partition as usize] += kv_tokens;
+        self.held_by_partition[partition as usize] += units;
     }
 
-    /// Drop a held reservation and report what it was, if anything.
+    /// Drop a held reservation and report its partition and context tokens,
+    /// if anything was held.
     pub(crate) fn take_held(&mut self, request: RequestId) -> Option<(PartitionId, u64)> {
-        let (partition, kv_tokens) = self.held.remove(&request)?;
+        let (partition, units, kv_tokens) = self.held.remove(&request)?;
         let total = &mut self.held_by_partition[partition as usize];
-        *total = total.saturating_sub(kv_tokens);
+        *total = total.saturating_sub(units);
         Some((partition, kv_tokens))
     }
 
@@ -321,15 +330,15 @@ mod tests {
     fn holding_moves_a_request_out_of_placement_and_totals_per_partition() {
         let mut ledger = RequestLedger::new(2);
         ledger.promise(RequestId(0), 0, 10);
-        ledger.hold(RequestId(0), 0, 64);
+        ledger.hold(RequestId(0), 0, 96, 64);
         assert_eq!(ledger.placement(RequestId(0)), None);
-        assert_eq!(ledger.partition_held(0), 64);
+        assert_eq!(ledger.partition_held(0), 96);
 
         // Re-holding on another partition moves the whole total, never doubles it.
-        ledger.hold(RequestId(0), 1, 64);
+        ledger.hold(RequestId(0), 1, 96, 64);
         assert_eq!(
             (ledger.partition_held(0), ledger.partition_held(1)),
-            (0, 64)
+            (0, 96)
         );
 
         assert_eq!(ledger.take_held(RequestId(0)), Some((1, 64)));

@@ -93,7 +93,12 @@ pub struct PrefixCacheEvent {
     pub cache_used_before: u64,
     pub cache_used_after: u64,
     pub requested_tokens: u64,
+    /// Tokens the activation resumes from: the entry's last resume position at
+    /// or below the request's shared prefix.
     pub hit_tokens: u64,
+    /// The shared prefix the entry covers, wherever it could resume. The gap to
+    /// `hit_tokens` is what resume positions cost a hit.
+    pub full_hit_tokens: u64,
 }
 
 /// Sim-thread handle for one worker's sparse cache-operation stream. Sequence
@@ -173,6 +178,7 @@ impl PrefixCacheLogger {
             cache_used_after: event.cache_used_after,
             requested_tokens: event.requested_tokens,
             hit_tokens: event.hit_tokens,
+            full_hit_tokens: event.full_hit_tokens,
         });
         self.next_sequence = self.next_sequence.saturating_add(1);
         if self.buffer.len() >= STREAM_FLUSH_ROWS {
@@ -266,6 +272,7 @@ mod tests {
             cache_used_after: 180,
             requested_tokens: 100,
             hit_tokens: 100,
+            full_hit_tokens: 100,
         });
         logger.record(PrefixCacheEvent {
             partition_id: 1,
@@ -279,6 +286,7 @@ mod tests {
             cache_used_after: 320,
             requested_tokens: 140,
             hit_tokens: 0,
+            full_hit_tokens: 0,
         });
         logger.flush_all().unwrap();
 

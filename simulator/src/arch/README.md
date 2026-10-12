@@ -10,10 +10,12 @@ The canonical layer contract is
 ## Read the tree in this order
 
 1. `contract.rs` — the three L4↔L5 query contracts and their input types.
-2. `model_cfg.rs` / `moe_model_cfg.rs` — dense and MoE model dimensions.
-3. `config.rs` — serde selector surfaces.
-4. `build.rs` — shared selector-to-concrete-model builders.
-5. `llama3_*.rs` / `qwen3_*.rs` / `glm52_*.rs` — concrete model composition.
+2. `kv_layout.rs` — `KvCacheLayout`, the per-request KV state the contracts
+   report.
+3. `model_cfg.rs` / `moe_model_cfg.rs` — dense and MoE model dimensions.
+4. `config.rs` — serde selector surfaces.
+5. `build.rs` — shared selector-to-concrete-model builders.
+6. `llama3_*.rs` / `qwen3_*.rs` / `glm52_*.rs` — concrete model composition.
 
 ## Contracts (`contract.rs`)
 
@@ -34,18 +36,26 @@ The model fills caller-owned `slots` and `scratch` buffers and returns aggregate
 
 Capacity/topology methods are:
 
-- `total_kv_bytes_per_token()` — total all-layer/all-rank KV bytes for one token;
+- `kv_cache_layout()` — one request's persistent KV state as a `KvCacheLayout`
+  (`kv_layout.rs`), part by part, bytes summed over one KV partition's ranks;
 - `gpus_per_replica()` — physical extent of one replica;
 - `num_attn_dp_groups()` — independent attention-DP groups;
 - `num_attn_shards()` — GPUs in one attention shard.
 
-The worker derives a partition's token capacity from:
+`kv_cache_layout()` is required on all three KV-owning contracts
+(`IterwiseUnifiedModel`, `SpeculativeUnifiedModel`, `AttnLayerwiseModel`). Each
+`KvCachePart` says how it grows (`KvGrowth::PerToken { tokens_per_entry }`,
+`SlidingWindow { window_tokens }`, `PerRequest`), its `bytes_per_entry`, whether
+a prefix hit can resume from it (`prefix_reusable`), and what vLLM allocates on
+top (`PartOverhead`: padded entry bytes, extra copies). `EngineOverhead` holds
+the pool-wide terms: a large engine block and fixed device bytes. Use
+`gqa_kv_bytes_per_token` for GQA layers; it counts the heads replicated when TP
+exceeds `num_kv_heads`.
 
-```text
-attn_kv_bytes_per_gpu × num_attn_shards
-────────────────────────────────────────
-       total_kv_bytes_per_token
-```
+The worker resolves the layout into KV units against the partition budget
+`attn_kv_bytes_per_gpu × num_attn_shards` (L5 `KvAccounting`); a layout of one
+per-token part counts plain tokens. Contract and rationale:
+`doc/detailed_design/L4.md` (KV cache layout).
 
 ### Speculative Iter-wise
 

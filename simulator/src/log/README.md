@@ -1,8 +1,8 @@
 # Log — streaming parquet output
 
 Cross-layer logging: turn the sim's per-request and per-iteration events into
-parquet streams plus JSON sidecars (`run_meta.json` and per-worker
-`cost_manifest/*.json`) under `<log_dir>/raw/`. The design
+parquet streams plus JSON sidecars (`run_meta.json`, `kv_cache.json` and
+per-worker `cost_manifest/*.json`) under `<log_dir>/raw/`. The design
 constraint is that **logging must not slow the sim**: the sim thread only fills
 row buffers and hands full chunks to a background thread that does the heavy
 parquet encode + ZSTD compression off the critical path.
@@ -79,6 +79,8 @@ prefix_cache_logger.rs
 network_logger.rs NetworkLogger — the shared GpuCluster transfer stream writer.
 run_meta.rs       write_run_meta — the run_meta.json GPU-facts sidecar (plain
                   serde_json, not parquet / not threaded).
+kv_cache.rs       write_kv_cache — the kv_cache.json per-pool capacity sidecar,
+                  and the text form `simulator kv-cache` prints.
 ```
 
 ## The streams & files (under `<log_dir>/raw/`)
@@ -89,10 +91,11 @@ run_meta.rs       write_run_meta — the run_meta.json GPU-facts sidecar (plain
 | `request_state.parquet` | `LoggerSession` | L7 `run_sim` | periodic dense snapshot over the admitted set |
 | `cost_log/worker_<pool_tag>_<worker_id>.parquet` | `CostLogger` | each L5 worker | one row per iteration: envelope + per-group `input_section` + the CostTree per-slot breakdown |
 | `cost_manifest/worker_<pool_tag>_<worker_id>.json` | `CostLogger` | each L5 worker | the matching `CostManifest` (slots + flat aggregation nodes) written once at open |
-| `kv_snapshot/worker_<pool_tag>_<worker_id>.parquet` | `KvSampler` | each KV-owning L5 worker | throttled per-partition active/retained-prefix/projected/promised KV series |
+| `kv_snapshot/worker_<pool_tag>_<worker_id>.parquet` | `KvSampler` | each KV-owning L5 worker | throttled per-partition active/retained-prefix/projected/promised KV series, in the pool's KV units |
 | `prefix_cache_event/worker_<pool_tag>_<worker_id>.parquet` | `PrefixCacheLogger` | each prefix-capable KV-owning L5 worker | every session-cache ownership transition, with exact entry/cache before and after token counts |
 | `gpu_cluster.parquet` | `NetworkLogger` | shared `GpuCluster` for PD/AFD | one resolved cross-worker transfer with both endpoints and timing window |
-| `run_meta.json` | `run_meta` | L7 (pre-loop) | GPU registry, worker grouping, KV capacities, comm groups, and stage vocabulary |
+| `run_meta.json` | `run_meta` | L7 (pre-loop) | GPU registry, worker grouping, KV pools (`capacity_units`, `bytes_per_unit`, `kv_overhead`), comm groups, and stage vocabulary |
+| `kv_cache.json` | `kv_cache` | L7 (pre-loop) | one entry per KV pool (`pool_tag`, `pool`, `worker_id`, `group_id`, `gpu_name`): the GPUs one partition spans (`attention_shards`; bytes are over the partition, divide by it for one GPU), the arch's declared layout (`parts`, `engine`), the resolved options, what each part is charged (`bytes_per_unit`, `capacity_units`, units and copies per part, the align copy), and the result (units per request and its per-part split `request_parts` at `max_model_len`, max concurrency under this and the other `kv_overhead`, `capacity_tokens` when every part grows per token). `simulator kv-cache <config>` prints it per GPU for reading, or the same JSON with `--json` |
 
 `network_event` remains a reserved schema with no writer; production transfer
 logging uses the richer `gpu_cluster` stream.
@@ -151,7 +154,9 @@ variants pair each operation with only its legal reason family. `operation` and
 The row's `request_id` identifies the operation trigger and `session_id`
 identifies the mutated entry. `requested_tokens` and `hit_tokens` explain an
 `activate`; for a partial declaration the entire count-only entry is removed but
-only the declared portion is a hit. This stream does not mirror active decode
+only the declared portion is a hit, and only up to the entry's last resume
+position. `full_hit_tokens` is the hit the entry would give if every position
+were resumable; its gap to `hit_tokens` is what resume positions cost. This stream does not mirror active decode
 growth and does not maintain a second cache ledger: `PrefixCache` returns the
 mutation receipts that are written verbatim. `kv_snapshot` remains the compact
 occupancy view; `prefix_cache_event` is the exact diagnostic replay.
@@ -177,7 +182,8 @@ path), with a `"null"` fallback if serialization fails — never panicking the r
 
 ## Up / down
 
-- **Above (writers):** the L7 `sim` loop (`LoggerSession` + `run_meta`), each
+- **Above (writers):** the L7 `sim` loop (`LoggerSession` + `run_meta` +
+  `kv_cache`), each
   KV-owning L5 worker (`CostLogger` + `KvSampler`), and the shared `GpuCluster`
   (`NetworkLogger` for PD/AFD transfers).
 - **Below (used):** Arrow / parquet (`arrow_array`, `arrow_schema`, `parquet`

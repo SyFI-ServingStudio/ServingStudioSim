@@ -1070,8 +1070,8 @@ mod tests {
             ) -> LeafMetrics {
                 unreachable!("a rejected case must not be costed")
             }
-            fn total_kv_bytes_per_token(&self) -> u64 {
-                self.0.total_kv_bytes_per_token()
+            fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+                self.0.kv_cache_layout()
             }
             fn gpus_per_replica(&self) -> u16 {
                 self.0.gpus_per_replica()

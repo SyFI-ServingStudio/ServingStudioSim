@@ -27,6 +27,7 @@
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
 use crate::arch::model_cfg::ModelCfg;
 use crate::common::Fabric;
 use crate::op::Op;
@@ -88,7 +89,8 @@ pub struct Llama3DpAttnTpFfnModel {
     pub attn_tp_size: u16,
     pub ffn_tp_size: u16,
     pub num_dp_groups: u16,
-    pub total_kv_bytes_per_token: Dim,
+    /// Per-token KV bytes over one KV partition, for the KV cache layout.
+    pub kv_bytes_per_token: u64,
     pub attn_block: AttnBlockTpWorklet,
     pub mlp_block: MlpBlockTpWorklet,
     pub embed: Op<ElementwiseKernel>,
@@ -189,16 +191,20 @@ pub fn build_configs(model: &ModelCfg, parallel: &DpAttnTpFfnParallel) -> Llama3
     }
 }
 
-/// **Total** KV-cache bytes one token occupies — summed across all
-/// `attn_tp_size` ranks of one DP shard, all layers, all KV heads. This is
-/// the wire size of a token's KV for a PD handoff (each DP shard owns one
-/// full copy of every KV head). Read off `raw_cfg`'s un-sharded values.
-fn total_kv_bytes_per_token(resolved: &Llama3DpAttnTpFfnResolved) -> Dim {
-    let raw = &resolved.attn_block.raw_cfg;
-    2 * raw.num_kv_heads.clone()
-        * raw.head_dim.clone()
-        * Dim::param("bytes", raw.kv_dtype().size_bytes())
-        * Dim::param("num_layers", resolved.num_layers)
+/// Per-token KV bytes of every GQA layer over one attention TP group
+/// (`2 × KV heads × head_dim × kv dtype × layers`, heads replicated when the TP
+/// degree exceeds them). Arch-specific: MLA's compressed latent or cross-layer
+/// sharing would compute it differently, so it lives in the model_arch.
+fn kv_bytes_per_token(resolved: &Llama3DpAttnTpFfnResolved) -> u64 {
+    let attn = &resolved.attn_block.raw_cfg;
+    gqa_kv_bytes_per_token(
+        u64::from(resolved.num_layers),
+        u64::from(attn.num_kv_heads.get()),
+        u64::from(attn.head_dim.get()),
+        u64::from(attn.head_dim.get()),
+        u64::from(attn.kv_dtype().size_bytes()),
+        u64::from(resolved.attn_tp_size),
+    )
 }
 
 pub fn resolve_configs(cfgs: &Llama3DpAttnTpFfnConfigs) -> Llama3DpAttnTpFfnResolved {
@@ -224,7 +230,7 @@ pub fn build(
     let attn_tp_size = resolved.attn_tp_size;
     let ffn_tp_size = resolved.ffn_tp_size;
     let num_dp_groups = resolved.num_dp_groups;
-    let total_kv_bytes_per_token = total_kv_bytes_per_token(&resolved);
+    let kv_bytes_per_token = kv_bytes_per_token(&resolved);
 
     let embed_name = format!("{model_name}.embedding");
     let final_norm_name = format!("{model_name}.final_norm");
@@ -280,7 +286,7 @@ pub fn build(
         attn_tp_size,
         ffn_tp_size,
         num_dp_groups,
-        total_kv_bytes_per_token,
+        kv_bytes_per_token,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -379,8 +385,8 @@ impl Llama3DpAttnTpFfnModel {
 }
 
 impl IterwiseUnifiedModel for Llama3DpAttnTpFfnModel {
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token.get() as u64
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        KvCacheLayout::new().with_part(KvCachePart::per_token("gqa", self.kv_bytes_per_token))
     }
 
     /// One replica spans the FFN TP group — `ffn_tp_size` GPUs, with the DP
@@ -486,10 +492,10 @@ mod tests {
     }
 
     #[test]
-    fn total_kv_bytes_per_token_sums_across_attn_ranks() {
+    fn kv_bytes_per_token_sums_across_attn_ranks() {
         let r = resolve_configs(&build_configs(&ModelCfg::llama3_8b(), &parallel(4, 8)));
         // Total kv heads = 8 (per-rank 2 × attn_tp 4); 2·8·128·2·32.
-        assert_eq!(total_kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
+        assert_eq!(kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
     }
 
     #[test]

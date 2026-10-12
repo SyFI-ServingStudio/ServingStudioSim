@@ -17,6 +17,7 @@ use serde::Deserialize;
 
 use crate::arch::config::ModelSpec;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
 use crate::op::Op;
 use crate::timing::kernels::{ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput};
 use crate::timing::routing::RoutingDistribution;
@@ -410,9 +411,7 @@ pub struct Qwen36LocalModel {
     pub num_layers: u32,
     pub num_gdn_layers: u32,
     pub num_gqa_layers: u32,
-    pub total_kv_bytes_per_token: Dim,
-    pub recurrent_state_bytes_per_request: Dim,
-    pub recurrent_checkpoint_interval_tokens: Dim,
+    pub kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -569,7 +568,7 @@ pub fn resolve_configs(cfg: &Qwen36LocalConfigs) -> Qwen36LocalResolved {
 
 /// One full-attention layer's KV bytes for one token — K and V together. This is
 /// the unit vLLM's hybrid page alignment measures the SSM page against, so it is
-/// factored out rather than inlined into [`total_kv_bytes_per_token`].
+/// factored out rather than inlined into [`gqa_bytes_per_token`].
 fn attention_page_bytes_per_token_per_layer(resolved: &Qwen36LocalResolved) -> Dim {
     let attn = &resolved.gated_gqa.attention;
     2 * attn.num_kv_heads.clone()
@@ -577,7 +576,7 @@ fn attention_page_bytes_per_token_per_layer(resolved: &Qwen36LocalResolved) -> D
         * Dim::param("kv_bytes", attn.kv_dtype().size_bytes())
 }
 
-fn total_kv_bytes_per_token(resolved: &Qwen36LocalResolved) -> Dim {
+fn gqa_bytes_per_token(resolved: &Qwen36LocalResolved) -> Dim {
     attention_page_bytes_per_token_per_layer(resolved)
         * Dim::param("num_gqa_layers", resolved.num_gqa_layers)
 }
@@ -615,12 +614,12 @@ fn mamba_page_bytes_per_layer(resolved: &Qwen36LocalResolved) -> Dim {
 ///
 /// vLLM's hybrid allocator gives the mamba and attention groups one common page
 /// size: it picks the attention block from the mamba page
-/// ([`recurrent_checkpoint_interval_tokens`]) and then pads the mamba page up to
-/// that attention page, so the charged footprint is the padded one — for this
-/// model 2,162,688 B/layer against a 2,146,304 B true state, the "Padding mamba
-/// page size by 0.76%" the engine logs at startup.
-fn recurrent_state_bytes_per_request(resolved: &Qwen36LocalResolved) -> Dim {
-    recurrent_checkpoint_interval_tokens(resolved)
+/// ([`hybrid_block_tokens`]) and then pads the mamba page up to
+/// that attention page — for this model 2,162,688 B/layer against a 2,146,304 B
+/// true state, the "Padding mamba page size by 0.76%" the engine logs at
+/// startup.
+fn padded_gdn_state_bytes(resolved: &Qwen36LocalResolved) -> Dim {
+    hybrid_block_tokens(resolved)
         * attention_page_bytes_per_token_per_layer(resolved)
         * Dim::param("num_gdn_layers", resolved.num_gdn_layers)
 }
@@ -640,9 +639,8 @@ fn recurrent_state_bytes_per_request(resolved: &Qwen36LocalResolved) -> Dim {
 /// mamba page size by 0.76%") only reconstructs with both terms whole, and each
 /// correction alone misses (2112 and 1024 respectively).
 ///
-/// Returns 0 for a layer prefix with no GDN layer, matching the trait's "no
-/// recurrent state" encoding.
-fn recurrent_checkpoint_interval_tokens(resolved: &Qwen36LocalResolved) -> Dim {
+/// Returns 0 for a layer prefix with no GDN layer: there is no state to align.
+fn hybrid_block_tokens(resolved: &Qwen36LocalResolved) -> Dim {
     if resolved.num_gdn_layers == 0 {
         return Dim::param("no_gdn_layers", 0);
     }
@@ -657,14 +655,39 @@ fn recurrent_checkpoint_interval_tokens(resolved: &Qwen36LocalResolved) -> Dim {
     kernel_block_size * ((mamba_page + quantum.clone() - 1) / quantum)
 }
 
+/// One request's cache: K and V of every gated-GQA layer per token, and one
+/// SSM + conv state per GDN layer, padded to vLLM's attention page. vLLM's
+/// hybrid block is the checkpoint interval, and one null block of every
+/// full-attention layer's page leaves the pool.
+fn kv_cache_layout(resolved: &Qwen36LocalResolved) -> KvCacheLayout {
+    let kv_bytes_per_token = u64::from(gqa_bytes_per_token(resolved).get());
+    let mut layout = KvCacheLayout::new();
+    if kv_bytes_per_token > 0 {
+        layout = layout.with_part(KvCachePart::per_token("gqa", kv_bytes_per_token));
+    }
+    if resolved.num_gdn_layers == 0 {
+        return layout;
+    }
+    let block_tokens = hybrid_block_tokens(resolved).get();
+    let state_bytes =
+        u64::from(mamba_page_bytes_per_layer(resolved).get()) * u64::from(resolved.num_gdn_layers);
+    layout
+        .with_part(
+            KvCachePart::per_request("gdn", state_bytes)
+                .padded_to(u64::from(padded_gdn_state_bytes(resolved).get())),
+        )
+        .with_engine(EngineOverhead {
+            block_tokens: Some(block_tokens),
+            fixed_device_bytes: u64::from(block_tokens) * kv_bytes_per_token,
+        })
+}
+
 pub fn build(
     name: String,
     resolved: Qwen36LocalResolved,
     bridge: &PerfApiBridge,
 ) -> std::result::Result<Qwen36LocalModel, BuildError> {
-    let total_kv_bytes_per_token = total_kv_bytes_per_token(&resolved);
-    let recurrent_state_bytes_per_request = recurrent_state_bytes_per_request(&resolved);
-    let recurrent_checkpoint_interval_tokens = recurrent_checkpoint_interval_tokens(&resolved);
+    let kv_cache_layout = kv_cache_layout(&resolved);
     let embedding_name = format!("{name}.embedding");
     let embedding = Op::new(
         embedding_name.clone(),
@@ -708,9 +731,7 @@ pub fn build(
         num_layers: resolved.num_layers,
         num_gdn_layers: resolved.num_gdn_layers,
         num_gqa_layers: resolved.num_gqa_layers,
-        total_kv_bytes_per_token,
-        recurrent_state_bytes_per_request,
-        recurrent_checkpoint_interval_tokens,
+        kv_cache_layout,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -723,12 +744,9 @@ pub fn build(
         tree.describe()
     );
     tracing::info!(
-        "[build] Qwen3.6 local recurrent state: {} B/request over {} GDN layer(s), \
-         reusable every {} tokens ({} B/token of full-attention KV)",
-        model.recurrent_state_bytes_per_request.get(),
+        "[build] Qwen3.6 local KV cache over {} GDN layer(s): {:?}",
         model.num_gdn_layers,
-        model.recurrent_checkpoint_interval_tokens.get(),
-        model.total_kv_bytes_per_token.get(),
+        model.kv_cache_layout,
     );
     Ok(model)
 }
@@ -1028,14 +1046,8 @@ impl IterwiseUnifiedModel for Qwen36LocalModel {
     fn cost_log_manifest(&self) -> CostManifest {
         self.cost_tree().manifest()
     }
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        u64::from(self.total_kv_bytes_per_token.get())
-    }
-    fn recurrent_state_bytes_per_request(&self) -> u64 {
-        u64::from(self.recurrent_state_bytes_per_request.get())
-    }
-    fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-        self.recurrent_checkpoint_interval_tokens.get()
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
     fn gpus_per_replica(&self) -> u16 {
         1
@@ -1244,7 +1256,7 @@ mod tests {
             ),
             (2048, 248320, DType::Bf16)
         );
-        assert_eq!(total_kv_bytes_per_token(&r).get(), 20_480);
+        assert_eq!(gqa_bytes_per_token(&r).get(), 20_480);
     }
 
     #[test]
@@ -1526,27 +1538,27 @@ mod tests {
             (40, 20_480),
         ] {
             assert_eq!(
-                total_kv_bytes_per_token(&resolve_configs(&cfgs(layers))).get(),
+                gqa_bytes_per_token(&resolve_configs(&cfgs(layers))).get(),
                 expected
             );
         }
     }
 
     #[test]
-    fn recurrent_state_bytes_charge_the_padded_page_on_every_gdn_layer() {
+    fn gdn_state_charges_the_padded_page_on_every_gdn_layer() {
         const PADDED_PER_LAYER: u32 = 1056 * 2048;
         assert_eq!(PADDED_PER_LAYER, 2_162_688);
         for (layers, gdn_layers) in [(1, 1), (3, 3), (4, 3), (5, 4), (39, 30), (40, 30)] {
             let resolved = resolve_configs(&cfgs(layers));
             assert_eq!(resolved.num_gdn_layers, gdn_layers, "L={layers}");
             assert_eq!(
-                recurrent_state_bytes_per_request(&resolved).get(),
+                padded_gdn_state_bytes(&resolved).get(),
                 PADDED_PER_LAYER * gdn_layers,
                 "L={layers}",
             );
         }
         assert_eq!(
-            recurrent_state_bytes_per_request(&resolve_configs(&cfgs(40))).get(),
+            padded_gdn_state_bytes(&resolve_configs(&cfgs(40))).get(),
             64_880_640
         );
     }
@@ -1569,9 +1581,9 @@ mod tests {
             (2_048, 2_097_152, 49_152, 2_146_304),
             "per-token attention page and per-layer mamba page feeding the rule",
         );
-        assert_eq!(recurrent_checkpoint_interval_tokens(&resolved).get(), 1_056);
+        assert_eq!(hybrid_block_tokens(&resolved).get(), 1_056);
 
-        let padded = recurrent_checkpoint_interval_tokens(&resolved).get()
+        let padded = hybrid_block_tokens(&resolved).get()
             * attention_page_bytes_per_token_per_layer(&resolved).get();
         let padding_percent = 100.0
             * (f64::from(padded) / f64::from(mamba_page_bytes_per_layer(&resolved).get()) - 1.0);
@@ -1584,7 +1596,7 @@ mod tests {
         // layers the prefix keeps — only "no GDN layer at all" turns it off.
         for (layers, expected) in [(1, 1056), (3, 1056), (4, 1056), (39, 1056), (40, 1056)] {
             assert_eq!(
-                recurrent_checkpoint_interval_tokens(&resolve_configs(&cfgs(layers))).get(),
+                hybrid_block_tokens(&resolve_configs(&cfgs(layers))).get(),
                 expected,
                 "L={layers}"
             );
@@ -1592,21 +1604,46 @@ mod tests {
     }
 
     #[test]
-    fn built_model_exposes_the_recurrent_state_contract() {
+    fn built_model_exposes_its_kv_cache_layout() {
         let model = enumerate_model(40);
-        assert_eq!(model.recurrent_state_bytes_per_request(), 64_880_640);
-        assert_eq!(model.recurrent_checkpoint_interval_tokens(), 1_056);
+        let layout = model.kv_cache_layout();
+        assert_eq!(layout.per_token_bytes(), 20_480);
+        assert_eq!(layout.engine.block_tokens, Some(1_056));
+        assert_eq!(layout.engine.fixed_device_bytes, 1_056 * 20_480);
+        let gdn = layout.parts.iter().find(|part| part.name == "gdn").unwrap();
+        assert_eq!(gdn.bytes_per_entry, 30 * 2_146_304);
+        assert_eq!(gdn.overhead.padded_bytes_per_entry, Some(64_880_640));
         // One checkpoint costs 3168 tokens of full-attention KV: the alignment
         // rule equalizes PER-LAYER pages, and this model has 30 GDN : 10 GQA
         // layers, so a checkpoint is 3x the KV of the span it covers.
-        let state_tokens = model
-            .recurrent_state_bytes_per_request()
-            .div_ceil(model.total_kv_bytes_per_token());
-        assert_eq!(state_tokens, 3_168);
-        assert_eq!(
-            state_tokens,
-            3 * u64::from(model.recurrent_checkpoint_interval_tokens())
-        );
+        assert_eq!(64_880_640 / 20_480, 3 * 1_056);
+    }
+
+    /// The engine's "Maximum concurrency for 9,216 tokens per request" at TP1.
+    /// Prefix caching runs the GDN state in align mode, which holds one more
+    /// state block per request.
+    #[test]
+    fn kv_cache_layout_reproduces_vllms_logged_concurrency() {
+        use crate::worker::kv::{KvAccounting, KvAccountingOptions};
+        let layout = kv_cache_layout(&resolve_configs(&cfgs(40)));
+        for (gib, prefix_caching, logged) in [
+            (88.88, false, 367.67),
+            (57.34, false, 237.17),
+            (88.88, true, 294.13),
+        ] {
+            let options = KvAccountingOptions {
+                max_in_flight_tokens: Some(2 * 8192),
+                prefix_caching,
+                ..Default::default()
+            };
+            let budget = (gib * f64::from(1u32 << 30)) as u64;
+            let accounting = KvAccounting::resolve(&layout, options, budget).unwrap();
+            let concurrency = accounting.concurrency_at(9216);
+            assert!(
+                (concurrency / logged - 1.0).abs() < 0.005,
+                "{gib} GiB, prefix caching {prefix_caching}: {concurrency} vs {logged}"
+            );
+        }
     }
 
     #[test]

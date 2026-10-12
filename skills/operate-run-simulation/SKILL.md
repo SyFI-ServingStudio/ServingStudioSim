@@ -231,6 +231,13 @@ per kernel per cache key, builds nothing). Reach for
 `operate-profile-existing-kernel` only for a question about one specific
 kernel's rows, never as a pre-step for a simulation.
 
+**KV capacity before a run.** `uv run python -m launcher <preset> --kv-report`
+prints each KV pool's layout, what one request at `max_model_len` holds per
+part, and the max concurrency, with no profile.db, GPU or log_dir
+(`--kv-report-json` for the machine form). A finished run has the same document
+at `raw/kv_cache.json`. For KV questions in general, use skill
+`dev-calculate-kv-cache-capacity`.
+
 ## GPU selection
 
 **Do not restrict how many GPUs the run may use unless there is a concrete

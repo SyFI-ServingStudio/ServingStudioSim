@@ -109,6 +109,18 @@ def _build_argparse():
         "exit without building caches or running.",
     )
     parser.add_argument(
+        "--kv-report",
+        action="store_true",
+        help="Print each KV pool's layout, the charge of one request at "
+        "max_model_len and the resulting max concurrency, for every distinct "
+        "candidate — then exit. Structure only: no profile.db, GPU or run.",
+    )
+    parser.add_argument(
+        "--kv-report-json",
+        action="store_true",
+        help="As --kv-report, as one JSON document (`raw/kv_cache.json` per run).",
+    )
+    parser.add_argument(
         "--refresh",
         action="store_true",
         help="Re-run every run, ignoring `.complete` markers (default: resume — "
@@ -640,7 +652,12 @@ def plan_simulation(args) -> SimulationPlan | int:
     if not _apply_energy_policy(args.energy, preset_energy, args.presets):
         return 2
 
-    print(f"[plan] {len(all_candidates)} run(s) across {len(args.presets)} preset(s)")
+    # A JSON report owns stdout; the plan line is a diagnostic there.
+    plan_stream = sys.stderr if getattr(args, "kv_report_json", False) else sys.stdout
+    print(
+        f"[plan] {len(all_candidates)} run(s) across {len(args.presets)} preset(s)",
+        file=plan_stream,
+    )
     if not all_candidates:
         sys.exit(
             "no runs after expansion — an empty sweep dim or constraints that reject "
@@ -709,6 +726,11 @@ def run_simulation(argv: list[str]) -> int:
         from .cache_build import report_cache_coverage
 
         return report_cache_coverage(all_candidates, schema, args.build_type)
+
+    if args.kv_report or args.kv_report_json:
+        from .kv_report import report_kv_cache
+
+        return report_kv_cache(all_candidates, args.build_type, as_json=args.kv_report_json)
 
     if args.profile:
         from .exec import perf_available

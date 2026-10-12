@@ -55,6 +55,7 @@ use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
     Glm53FlashVllmParallel, ACTIVATION_DTYPE, SHARED_EXPERTS_STREAM_OVERLAP,
     SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
 };
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::op::mhc::{MhcTerminalPostConfig, MhcTerminalPostInput, MhcTerminalPostOp};
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -488,9 +489,7 @@ pub struct Glm53FlashDpAttnEpModel {
     hc_contract_mean: Op<ElementwiseKernel>,
     final_norm: Op<RmsNormKernel>,
     lm_head: Op<SingleGemmKernel>,
-    total_kv_bytes_per_token: u64,
-    recurrent_state_bytes_per_request: u64,
-    hybrid_block_size: u32,
+    kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -508,18 +507,19 @@ pub fn build(
         groups.push(build_group(n, group, &resolved, bridge)?);
     }
     let model_cfg = &local.model;
-    // One rank holds a request's whole KV: the fp8 MLA latent plus the kpool
-    // index cache of each DSA layer. Nothing is replicated across ranks.
-    let dsa_bytes_per_token = tp_arch::dsa_layer_bytes_per_token(model_cfg);
-    let hybrid_block_size = tp_arch::hybrid_block_tokens(
-        tp_arch::kda_layer_state_bytes_per_request(&resolved.local),
-        u64::from(model_cfg.kv_lora_rank),
+    // One rank holds a request's whole KV and all 64 KDA heads: nothing is
+    // replicated across ranks, and the block is vLLM's TP1 hybrid block.
+    let dsa_layers = model_cfg.num_dsa_layers();
+    let kda_layers = model_cfg.kda_layers.len() as u32;
+    let kda_state_bytes = tp_arch::kda_layer_state_bytes_per_request(&resolved.local);
+    let kv_cache_layout = tp_arch::hybrid_kv_cache_layout(
+        model_cfg,
+        kda_state_bytes,
+        dsa_layers,
+        kda_layers,
+        kda_layers.div_ceil(dsa_layers.max(1)),
+        tp_arch::hybrid_block_tokens(kda_state_bytes, u64::from(model_cfg.kv_lora_rank)),
     );
-    // vLLM pads each KDA layer's mamba page up to one attention page (block x
-    // 512 B; +1.1% at TP1), so that is what a request holds on its rank.
-    let recurrent_state_bytes_per_request = model_cfg.kda_layers.len() as u64
-        * u64::from(hybrid_block_size)
-        * u64::from(model_cfg.kv_lora_rank);
     let mut model = Glm53FlashDpAttnEpModel {
         embedding: atomic(
             n,
@@ -574,9 +574,7 @@ pub fn build(
             sizes.dedup();
             sizes
         },
-        total_kv_bytes_per_token: u64::from(model_cfg.num_dsa_layers()) * dsa_bytes_per_token,
-        recurrent_state_bytes_per_request,
-        hybrid_block_size,
+        kv_cache_layout,
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -859,18 +857,10 @@ impl IterwiseUnifiedModel for Glm53FlashDpAttnEpModel {
         .map(|_| ())
     }
 
-    /// One DP rank's KV for a token (the rank that owns the request).
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token
-    }
-
-    /// One DP rank's KDA state for a request: all 64 heads of 34 layers.
-    fn recurrent_state_bytes_per_request(&self) -> u64 {
-        self.recurrent_state_bytes_per_request
-    }
-
-    fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-        self.hybrid_block_size
+    /// One DP rank's cache for a request (the rank that owns it): the DSA
+    /// layers' KV and all 64 KDA heads of 34 layers.
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     /// The kpool DSA's top-k cap makes necessary work per-request in context.
@@ -1151,17 +1141,18 @@ mod tests {
     fn a_rank_checkpoints_at_the_tp1_hybrid_block() {
         // All 64 KDA heads on one rank: vLLM's TP1 block (the TP arch's
         // `hybrid_block_tokens` test pins TP4 to the logged 2176).
-        assert_eq!(built(4).recurrent_checkpoint_interval_tokens(), 8576);
+        assert_eq!(built(4).kv_cache_layout().engine.block_tokens, Some(8576));
     }
 
     #[test]
     fn kv_and_state_are_one_ranks_full_heads_not_replicated() {
         for dp in [4, 8] {
             let model = built(dp);
-            assert_eq!(model.total_kv_bytes_per_token(), 11 * (512 + 33));
-            // The true state is (4 << 20) + 24576 * 3 * 2 bytes per layer;
-            // vLLM pads it to one 8576-token attention page.
-            assert_eq!(model.recurrent_state_bytes_per_request(), 34 * 8576 * 512);
+            let layout = model.kv_cache_layout();
+            assert_eq!(layout.per_token_bytes(), 11 * (512 + 33));
+            // The true state is (4 << 20) + 24576 * 3 * 2 bytes per layer.
+            let kda = layout.parts.iter().find(|part| part.name == "kda").unwrap();
+            assert_eq!(kda.bytes_per_entry, 34 * ((4 << 20) + 24576 * 3 * 2));
             assert_eq!(model.gpus_per_replica(), dp);
             assert_eq!(model.num_attn_dp_groups(), dp);
             assert_eq!(model.num_attn_shards(), 1);

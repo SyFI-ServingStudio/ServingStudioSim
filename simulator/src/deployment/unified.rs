@@ -39,11 +39,9 @@ use crate::orchestrator::{
 };
 use crate::timing::PerfApiBridge;
 use crate::worker::{
-    build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
-    build_hybrid_chunked_prefill_worker, build_qwen36_hybrid_worker, build_speculative_worker,
+    build_barebone_worker, build_chunked_prefill_worker, build_hp_worker, build_speculative_worker,
     resolve_prefix_cache_config, BatchPolicy, DpPlacement, IterWorker, IterWorkerSel,
-    KvAdmissionConfig, PendingOrderKind, PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy,
-    WorkerConfig,
+    KvAdmissionConfig, PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -96,9 +94,8 @@ impl Deployment for UnifiedDeployment {
                 prefix_cache_mode,
                 prefix_cache_policy,
                 prefix_cache_max_gpu_memory_gb,
-                // Read by `ssm_checkpoint_interval_tokens` and
-                // `prefill_gpu_time_multiplier` below, so the two arms keep the
-                // same bindings.
+                // Read by `prefill_gpu_time_multiplier` below, so the two arms
+                // keep the same bindings.
                 ..
             }
             | IterWorkerSel::HpUnified {
@@ -147,7 +144,7 @@ impl Deployment for UnifiedDeployment {
                 kv_admission,
                 gpu_time_multiplier,
                 // Read by the two helpers below so this arm keeps the same
-                // bindings as its siblings. See `ssm_checkpoint_interval_tokens`.
+                // bindings as its siblings.
                 ..
             } => (
                 *attn_gpu_memory_gb,
@@ -174,7 +171,7 @@ impl Deployment for UnifiedDeployment {
             prefix_cache_max_gpu_memory_gb,
             attn_gpu_memory_gb,
         )?;
-        let worker_config = WorkerConfig {
+        let mut worker_config = WorkerConfig {
             attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
             log_output_token_times: cfg.io.log_output_token_times,
             log_stage_transitions: cfg.io.log_stage_transitions,
@@ -186,8 +183,8 @@ impl Deployment for UnifiedDeployment {
             batch_policy,
             kv_admission,
             prefix_cache,
-            ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
-            prefill_chunk_alignment: prefill_chunk_alignment(&g.worker),
+            prefill_chunk_alignment: g.worker.prefill_chunk_alignment(),
+            max_model_len: g.arch.max_model_len().ok(),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
             dp_placement: match &g.worker {
@@ -196,6 +193,9 @@ impl Deployment for UnifiedDeployment {
             },
             ..WorkerConfig::default()
         };
+        g.worker
+            .kv_accounting()
+            .apply("unified", &mut worker_config)?;
 
         let dp_cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
@@ -220,16 +220,16 @@ impl Deployment for UnifiedDeployment {
         // single-group barebone worker; the DP-attn / MoE archs run on the
         // multi-group hp_unified worker (one KV partition state per DP shard).
         match &g.arch {
-            // Hybrid KV: 30 GDN layers of per-request recurrent state and 10
-            // GQA layers of per-token KV live in one attention budget, so only
-            // the KV axis differs from the arms below.
+            // 30 GDN layers of per-request recurrent state and 10 GQA layers of
+            // per-token KV share one attention budget through the arch's KV
+            // layout.
             IterArchSel::Qwen36Local {
                 routing,
                 routing_seed,
                 expert_popularity_file,
                 ..
             } => {
-                ensure_hybrid_worker("Qwen3.6 local", &g.worker)?;
+                ensure_barebone_or_chunked_worker("Qwen3.6 local", &g.worker)?;
                 let model = Arc::new(arch_build::qwen36_local(
                     model_spec,
                     *routing,
@@ -239,7 +239,7 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                assemble_hybrid_flow(
+                assemble_barebone_or_chunked_flow(
                     "Qwen3.6 local",
                     model,
                     store,
@@ -250,11 +250,9 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
-            // Hybrid KV like Qwen3.6: 34 KDA layers of per-request recurrent
-            // state (fp32 SSM + conv window) and 11 DSA layers of per-token MLA
-            // latent + kpool index cache share one attention budget. Only the
-            // hybrid recipes charge both; the full-attention chunked and
-            // hp_unified recipes would leave the KDA state invisible.
+            // Like Qwen3.6: 34 KDA layers of per-request recurrent state (fp32
+            // SSM + conv window) and 11 DSA layers of per-token MLA latent +
+            // kpool index cache share one attention budget.
             IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
                 tp_size,
                 enable_expert_parallel,
@@ -277,7 +275,7 @@ impl Deployment for UnifiedDeployment {
                 cudagraph_capture_sizes,
                 ..
             } => {
-                ensure_hybrid_worker("GLM-5.3-Flash vLLM", &g.worker)?;
+                ensure_barebone_or_chunked_worker("GLM-5.3-Flash vLLM", &g.worker)?;
                 let model = Arc::new(arch_build::glm53_flash_vllm_fp8_kda_dsa_moe(
                     model_spec,
                     arch_build::glm53_flash_quant(&g.arch),
@@ -294,7 +292,7 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                assemble_hybrid_flow(
+                assemble_barebone_or_chunked_flow(
                     "GLM-5.3-Flash vLLM",
                     model,
                     store,
@@ -327,7 +325,7 @@ impl Deployment for UnifiedDeployment {
                 cudagraph_capture_sizes,
                 ..
             } => {
-                // Barebone's hybrid recipe holds one partition, not one per rank.
+                // Barebone holds one partition, not one per rank.
                 ensure_chunked_prefill_worker("GLM-5.3-Flash vLLM DP-attention/EP", &g.worker)?;
                 let model = Arc::new(arch_build::glm53_flash_vllm_fp8_dp_attn_ep_moe(
                     model_spec,
@@ -344,7 +342,7 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                assemble_hybrid_flow(
+                assemble_barebone_or_chunked_flow(
                     "GLM-5.3-Flash vLLM DP-attention/EP",
                     model,
                     store,
@@ -567,10 +565,7 @@ impl Deployment for UnifiedDeployment {
                 ..
             }) => {
                 // Pure TP4 attention (one attention group, four replicated KV
-                // shards) like the GLM-5.2 SGLang TP4 arch. The worker's
-                // `FullAttnKv` sizes on the arch's per-token compressed + index
-                // pages; the sliding-window cache is a per-request constant the
-                // arch leaves out (see `total_kv_bytes_per_token`).
+                // shards) like the GLM-5.2 SGLang TP4 arch.
                 ensure_hp_or_chunked_worker("DeepSeek-V4.1", &g.worker)?;
                 let serialize_streams =
                     matches!(arch, IterArchSel::DeepseekV41VllmSerialStreams { .. });
@@ -883,9 +878,13 @@ fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
     }
 }
 
-/// Hybrid-KV archs run on a hybrid-store recipe under either lifecycle:
-/// barebone admission or hard-capped chunked prefill.
-fn ensure_hybrid_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Result<()> {
+/// Recurrent-state archs run under either lifecycle: barebone admission or
+/// hard-capped chunked prefill. Their KV layout, not the recipe, carries the
+/// state.
+fn ensure_barebone_or_chunked_worker(
+    arch_name: &str,
+    worker: &IterWorkerSel,
+) -> anyhow::Result<()> {
     match worker {
         IterWorkerSel::Barebone { .. } | IterWorkerSel::ChunkedPrefill { .. } => Ok(()),
         other => bail!(
@@ -901,7 +900,7 @@ fn ensure_chunked_prefill_worker(arch_name: &str, worker: &IterWorkerSel) -> any
     }
 }
 
-fn assemble_hybrid_flow<M>(
+fn assemble_barebone_or_chunked_flow<M>(
     arch_name: &str,
     model: Arc<M>,
     store: SharedRequests,
@@ -922,7 +921,7 @@ where
             log_dir,
             gpu_name,
             dp_cfg,
-            build_qwen36_hybrid_worker,
+            build_barebone_worker,
         )),
         IterWorkerSel::ChunkedPrefill { .. } => Ok(assemble_flow(
             model,
@@ -931,33 +930,9 @@ where
             log_dir,
             gpu_name,
             dp_cfg,
-            build_hybrid_chunked_prefill_worker,
+            build_chunked_prefill_worker,
         )),
         other => bail!("unified: unsupported {arch_name} worker {other:?}"),
-    }
-}
-
-/// The hybrid KV recipe's optional snapshot-interval override. Only `barebone`
-/// carries it; every other selector leaves the arch's own alignment in force.
-fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
-    match worker {
-        IterWorkerSel::Barebone {
-            ssm_checkpoint_interval_tokens,
-            ..
-        } => *ssm_checkpoint_interval_tokens,
-        _ => None,
-    }
-}
-
-/// The `chunked_prefill` selector's hybrid chunk alignment; every other
-/// selector keeps the checkpoint-aligned default.
-fn prefill_chunk_alignment(worker: &IterWorkerSel) -> PrefillChunkAlignment {
-    match worker {
-        IterWorkerSel::ChunkedPrefill {
-            prefill_chunk_alignment,
-            ..
-        } => *prefill_chunk_alignment,
-        _ => PrefillChunkAlignment::default(),
     }
 }
 
@@ -1147,7 +1122,7 @@ mod tests {
         Glm53FlashVllmModel, Qwen36LocalModel,
     };
     use crate::common::RequestId;
-    use crate::worker::{ChunkedPrefillWorker, HpUnifiedWorker, WorkerEventCommon};
+    use crate::worker::{BareboneWorker, ChunkedPrefillWorker, HpUnifiedWorker, WorkerEventCommon};
 
     fn hp_worker() -> IterWorkerSel {
         IterWorkerSel::HpUnified {
@@ -1159,6 +1134,7 @@ mod tests {
             prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
             prefix_cache_max_gpu_memory_gb: None,
             prefill_gpu_time_multiplier: None,
+            kv_accounting: Default::default(),
         }
     }
 
@@ -1171,8 +1147,8 @@ mod tests {
             prefix_cache_mode: crate::worker::PrefixCacheMode::Opportunistic,
             prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
             prefix_cache_max_gpu_memory_gb: None,
-            ssm_checkpoint_interval_tokens: None,
             prefill_gpu_time_multiplier: None,
+            kv_accounting: Default::default(),
         }
     }
 
@@ -1185,7 +1161,8 @@ mod tests {
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             dp_placement: DpPlacement::RoundRobin,
-            prefill_chunk_alignment: PrefillChunkAlignment::Checkpoint,
+            prefill_chunk_alignment: None,
+            kv_accounting: Default::default(),
         }
     }
 
@@ -1209,63 +1186,27 @@ mod tests {
             .expect("GLM NVFP4 accepts the dedicated chunked-prefill worker");
     }
 
-    /// Qwen3.6 local keeps the `barebone` preset tag — cadence, admission and
-    /// execution really are barebone — but composes the hybrid KV store, so the
-    /// contract is asserted against `Qwen36HybridWorker`, not `BareboneWorker`.
     #[test]
     fn qwen36_local_barebone_pair_satisfies_the_iter_worker_contract() {
-        assert_iter_worker_contract::<crate::worker::Qwen36HybridWorker<Qwen36LocalModel>>();
+        assert_iter_worker_contract::<BareboneWorker<Qwen36LocalModel>>();
         ensure_barebone(&barebone_worker()).expect("Qwen3.6 local accepts barebone");
         let error = ensure_barebone(&hp_worker()).unwrap_err().to_string();
         assert!(error.contains("requires worker `barebone`"));
     }
 
-    /// Both hybrid archs take the hybrid store under either lifecycle.
+    /// Both recurrent-state archs run under either lifecycle.
     #[test]
-    fn hybrid_archs_pair_with_barebone_or_chunked_prefill() {
-        assert_iter_worker_contract::<crate::worker::Qwen36HybridWorker<Glm53FlashVllmModel>>();
-        assert_iter_worker_contract::<crate::worker::HybridChunkedPrefillWorker<Glm53FlashVllmModel>>(
-        );
-        assert_iter_worker_contract::<crate::worker::HybridChunkedPrefillWorker<Qwen36LocalModel>>(
-        );
+    fn recurrent_state_archs_pair_with_barebone_or_chunked_prefill() {
+        assert_iter_worker_contract::<BareboneWorker<Glm53FlashVllmModel>>();
+        assert_iter_worker_contract::<ChunkedPrefillWorker<Glm53FlashVllmModel>>();
+        assert_iter_worker_contract::<ChunkedPrefillWorker<Qwen36LocalModel>>();
         for worker in [barebone_worker(), chunked_prefill_worker()] {
-            ensure_hybrid_worker("GLM-5.3-Flash", &worker).expect("hybrid lifecycle");
+            ensure_barebone_or_chunked_worker("GLM-5.3-Flash", &worker).expect("hybrid lifecycle");
         }
-        let error = ensure_hybrid_worker("GLM-5.3-Flash", &hp_worker())
+        let error = ensure_barebone_or_chunked_worker("GLM-5.3-Flash", &hp_worker())
             .unwrap_err()
             .to_string();
         assert!(error.contains("requires worker `barebone` or `chunked_prefill`"));
-    }
-
-    #[test]
-    fn the_snapshot_interval_override_is_barebone_only_and_defaults_to_the_arch() {
-        assert_eq!(ssm_checkpoint_interval_tokens(&barebone_worker()), None);
-        assert_eq!(ssm_checkpoint_interval_tokens(&hp_worker()), None);
-        let IterWorkerSel::Barebone {
-            attn_gpu_memory_gb,
-            gpu_time_multiplier,
-            max_batch_tokens,
-            pending_order,
-            prefix_cache_mode,
-            prefix_cache_policy,
-            prefix_cache_max_gpu_memory_gb,
-            ..
-        } = barebone_worker()
-        else {
-            unreachable!()
-        };
-        let overridden = IterWorkerSel::Barebone {
-            attn_gpu_memory_gb,
-            gpu_time_multiplier,
-            max_batch_tokens,
-            pending_order,
-            prefix_cache_mode,
-            prefix_cache_policy,
-            prefix_cache_max_gpu_memory_gb,
-            ssm_checkpoint_interval_tokens: Some(528),
-            prefill_gpu_time_multiplier: None,
-        };
-        assert_eq!(ssm_checkpoint_interval_tokens(&overridden), Some(528));
     }
 
     #[test]
@@ -1324,6 +1265,7 @@ mod tests {
             prefix_cache_mode: crate::worker::PrefixCacheMode::Opportunistic,
             prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
             prefix_cache_max_gpu_memory_gb: None,
+            kv_accounting: Default::default(),
         };
         let error = ensure_hp_unified(&pd_prefill).unwrap_err().to_string();
         assert!(error.contains("worker `hp_unified`"));
@@ -1385,6 +1327,7 @@ pools:
             kv_admission: Default::default(),
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
+            kv_accounting: Default::default(),
         }
     }
 

@@ -16,7 +16,7 @@ use crate::worker::admission::{
 };
 use crate::worker::execution::{AttentionLayerExecution, AttentionLayerExecutionAdapter};
 use crate::worker::iter_worker::{AfdAttnWorker, IterWorker};
-use crate::worker::kv::{FullAttnKv, PrefixKv, SlotPipelineKv};
+use crate::worker::kv::{KvCacheStore, PrefixKv, SlotPipelineKv};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{AttnWorkerEvent, AttnWorkerMsg, WorkerStatus};
 
@@ -35,7 +35,7 @@ where
 
 /// Compatibility name retained at the L6 controller surface.
 pub type DisaggAttnWorker<M> = SlotAttentionWorker<
-    FullAttnKv,
+    KvCacheStore,
     FreshRequestSlotAdmission<SessionStartOrder>,
     AttentionLayerExecutionAdapter<M>,
 >;
@@ -194,14 +194,14 @@ mod tests {
     fn pending_policy_is_a_composition_axis_for_afd_admission() {
         assert_afd_attn_worker::<
             SlotAttentionWorker<
-                FullAttnKv,
+                KvCacheStore,
                 FreshRequestSlotAdmission<FifoOrder>,
                 AttentionLayerExecutionAdapter<FakeAttn>,
             >,
         >();
         assert_afd_attn_worker::<
             SlotAttentionWorker<
-                FullAttnKv,
+                KvCacheStore,
                 FreshRequestSlotAdmission<ShortestJobFirst>,
                 AttentionLayerExecutionAdapter<FakeAttn>,
             >,

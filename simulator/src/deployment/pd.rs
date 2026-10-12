@@ -72,6 +72,7 @@ impl Deployment for PdDeployment {
 
         let prefill_wc = worker_config(
             &pg.worker,
+            pg.arch.max_model_len().ok(),
             &cfg.io.log_dir,
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
@@ -79,6 +80,7 @@ impl Deployment for PdDeployment {
         )?;
         let decode_wc = worker_config(
             &dg.worker,
+            dg.arch.max_model_len().ok(),
             &cfg.io.log_dir,
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
@@ -222,6 +224,7 @@ fn ensure_pd_decode(worker: &IterWorkerSel) -> anyhow::Result<()> {
 
 fn worker_config(
     worker: &IterWorkerSel,
+    max_model_len: Option<u32>,
     _log_dir: &Path,
     log_output_token_times: bool,
     log_stage_transitions: bool,
@@ -234,6 +237,7 @@ fn worker_config(
             prefix_cache_mode,
             prefix_cache_policy,
             prefix_cache_max_gpu_memory_gb,
+            ..
         } => (
             *attn_gpu_memory_gb,
             *gpu_time_multiplier,
@@ -248,6 +252,7 @@ fn worker_config(
         IterWorkerSel::PdDecode {
             attn_gpu_memory_gb,
             gpu_time_multiplier,
+            ..
         } => (
             *attn_gpu_memory_gb,
             *gpu_time_multiplier,
@@ -272,15 +277,18 @@ fn worker_config(
             )?,
         ),
     };
-    Ok(WorkerConfig {
+    let mut config = WorkerConfig {
         attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times,
         log_stage_transitions,
         kv_log_stride,
         gpu_time_multiplier,
         prefix_cache,
+        max_model_len,
         ..WorkerConfig::default()
-    })
+    };
+    worker.kv_accounting().apply("pd", &mut config)?;
+    Ok(config)
 }
 
 fn pool_cfg(

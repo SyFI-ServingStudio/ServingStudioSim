@@ -62,9 +62,35 @@ backends/algorithms = different arch files (no in-file if/match polymorphism).
   `cost_tree` order (the cursor must fill `n_slots`).
 - `impl IterwiseUnifiedModel` — `eval_iter` (fill `slots`, `CostTree::aggregate`),
   `eval_iter_with_inputs` (same via `Evaluator::with_inputs` for cost_log),
-  `cost_log_manifest`, `total_kv_bytes_per_token`, `gpus_per_replica`.
-- an arch-specific `total_kv_bytes_per_token(resolved)` (KV layout is arch
-  knowledge — GQA vs MLA differ — so it lives here, not on `ModelCfg`).
+  `cost_log_manifest`, `kv_cache_layout`, `gpus_per_replica`.
+- an arch-specific `kv_cache_layout(resolved) -> KvCacheLayout` (KV layout is
+  arch knowledge, so it lives here, not on `ModelCfg`). Build it from
+  `KvCachePart`s (`arch/kv_layout.rs`), one per kind of cached state:
+  `per_token` for GQA/MLA KV, `compressed(name, tokens_per_entry, …)` for a
+  DSA indexer or compressed cache, `sliding_window` for SWA or a short-conv
+  window, `per_request` for a GDN/KDA state or ring buffer.
+  - Bytes are summed over the part's layers **and every rank of one KV
+    partition** (one attention TP group). For GQA use `gqa_kv_bytes_per_token`,
+    which counts heads replicated when TP exceeds `num_kv_heads`. A state every
+    rank holds whole (MLA latent, recurrent state) is described for one rank
+    and finished with `.held_on_each_rank(attn_tp)`.
+  - `bytes_per_entry` is the model's own state. Put what vLLM allocates on top
+    in the overhead, never in `bytes_per_entry`: `.padded_to(…)` (padded head,
+    mamba page, packed group page), `.with_copies(…)` (speculative blocks), and
+    `EngineOverhead { block_tokens, fixed_device_bytes }` (large hybrid block,
+    null block). Do not add align mode's extra state copy; L5 adds it.
+  - Mark state a prefix hit cannot resume from with `.not_prefix_reusable()`
+    (bounded-replay SWA, a buffer vLLM never caches).
+  - When a vLLM capture exists, pin the layout with a unit test that resolves it
+    at the logged KV budget and checks `KvAccounting::concurrency_at(max_model_len)`
+    against the logged "Maximum concurrency" (pattern:
+    `kv_cache_layout_reproduces_vllms_packed_groups` in `deepseek_v4_vllm.rs` /
+    `deepseek_v41_vllm.rs`, 0.5% tolerance). A larger miss usually means a
+    missing part or overhead term.
+  - Read the result instead of recomputing it: `launcher <preset> --kv-report`
+    prints the layout per GPU, one request's per-part charge and the
+    concurrency, and `simulator cost-trees` carries the arch's `kv_cache`
+    (skill `dev-calculate-kv-cache-capacity`).
 
 ## Rules
 

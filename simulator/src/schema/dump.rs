@@ -31,7 +31,9 @@ use crate::deployment::config::{IoSpec, WorkloadSpec};
 use crate::orchestrator::config::{GroupSpec, PoolSpec};
 use crate::schema::ParamDef;
 use crate::timing_predict::{PredictGroup, SpeculativePredictGroup};
-use crate::worker::config::{AttnWorkerSel, FfnWorkerSel, IterWorkerSel, KvAdmissionSpec};
+use crate::worker::config::{
+    AttnWorkerSel, FfnWorkerSel, IterWorkerSel, KvAccountingSpec, KvAdmissionSpec,
+};
 
 /// Serialize a `const PARAMS` slice to a JSON array of ParamDef objects.
 fn params(p: &[ParamDef]) -> Value {
@@ -43,7 +45,8 @@ fn providers(schema: &[(&str, &[ParamDef])]) -> Value {
     providers_with_flattened(schema, &[])
 }
 
-/// Add params from selector components flattened into only one provider tag.
+/// Add params from selector components flattened into provider tags; a tag
+/// may take several components.
 fn providers_with_flattened(
     schema: &[(&str, &[ParamDef])],
     flattened: &[(&str, &[ParamDef])],
@@ -51,7 +54,7 @@ fn providers_with_flattened(
     let mut m = Map::new();
     for (tag, p) in schema {
         let mut provider_params = p.to_vec();
-        if let Some((_, extra)) = flattened.iter().find(|(owner, _)| owner == tag) {
+        for (_, extra) in flattened.iter().filter(|(owner, _)| owner == tag) {
             provider_params.extend_from_slice(extra);
         }
         m.insert(
@@ -81,11 +84,21 @@ pub fn list_params() -> Value {
                 "iter_wise":       providers_with_flattened(
                     IterWorkerSel::SCHEMA,
                     &[
+                        ("barebone", KvAccountingSpec::PARAMS),
+                        ("hp_unified", KvAccountingSpec::PARAMS),
+                        ("chunked_prefill", KvAccountingSpec::PARAMS),
                         ("chunked_prefill", KvAdmissionSpec::PARAMS),
+                        ("speculative", KvAccountingSpec::PARAMS),
                         ("speculative", KvAdmissionSpec::PARAMS),
+                        ("pipeline_chunked_prefill", KvAccountingSpec::PARAMS),
+                        ("pd_prefill", KvAccountingSpec::PARAMS),
+                        ("pd_decode", KvAccountingSpec::PARAMS),
                     ],
                 ),
-                "layer_wise_attn": providers(AttnWorkerSel::SCHEMA),
+                "layer_wise_attn": providers_with_flattened(
+                    AttnWorkerSel::SCHEMA,
+                    &[("disagg_attn", KvAccountingSpec::PARAMS)],
+                ),
                 "layer_wise_ffn":  providers(FfnWorkerSel::SCHEMA),
             },
         },

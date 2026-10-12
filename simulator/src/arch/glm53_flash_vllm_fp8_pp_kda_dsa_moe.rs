@@ -49,11 +49,12 @@ use std::sync::Arc;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::{eval_compiled, pp_indices};
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
-    self as flash, atomic, build_layer_group, dsa_layer_bytes_per_token, graph_padded_tokens,
-    hybrid_block_tokens, kda_layer_state_bytes_per_request, normalize_input, push,
+    self as flash, atomic, build_layer_group, graph_padded_tokens, hybrid_block_tokens,
+    hybrid_kv_cache_layout, kda_layer_state_bytes_per_request, normalize_input, push,
     Glm53FlashModelCfg, Glm53FlashVllmConfigs, Glm53FlashVllmParallel, Glm53FlashVllmResolved,
     LayerGroup, NormalizedBatch, ACTIVATION_DTYPE, MHC_BACKENDS,
 };
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::op::mhc::{MhcTerminalPostConfig, MhcTerminalPostInput, MhcTerminalPostOp};
 use crate::op::Op;
 use crate::timing::expert_demand::ExpertDemand;
@@ -241,6 +242,7 @@ pub fn build(
                 index as u16,
                 pp_size,
                 layers,
+                kda_groups,
                 block_tokens,
             )
             .map(Arc::new)
@@ -252,8 +254,15 @@ pub fn build(
         max_model_len: recipe.parallel.max_model_len,
         hidden: recipe.model.hidden,
         hc_mult: recipe.model.hc_mult,
-        block_tokens,
         kda_groups,
+        kv_cache_layout: hybrid_kv_cache_layout(
+            &recipe.model,
+            kda_layer_state_bytes_per_request(&resolved.stage),
+            recipe.model.num_dsa_layers(),
+            recipe.model.kda_layers.len() as u32,
+            kda_groups,
+            block_tokens,
+        ),
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -400,9 +409,7 @@ pub struct Glm53FlashVllmFp8PpStageModel {
     output: Option<Arc<OutputHead>>,
     max_model_len: u32,
     cudagraph_capture_sizes: Vec<u32>,
-    kv_bytes_per_token: u64,
-    recurrent_state_bytes_per_request: u64,
-    block_tokens: u32,
+    kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -415,6 +422,7 @@ impl Glm53FlashVllmFp8PpStageModel {
         stage_index: u16,
         num_stages: u16,
         layer_range: (u32, u32),
+        kda_groups: u32,
         block_tokens: u32,
     ) -> Result<Self, BuildError> {
         let cfg = &resolved.raw_cfg;
@@ -435,10 +443,16 @@ impl Glm53FlashVllmFp8PpStageModel {
             groups.iter().map(|(_, count)| count).sum::<u32>(),
             counts.total()
         );
-        // vLLM allocates cache only for the layers a stage owns.
-        let kv_bytes_per_token = u64::from(counts.dsa) * dsa_layer_bytes_per_token(&cfg.model);
-        let recurrent_state_bytes_per_request =
-            u64::from(counts.kda) * kda_layer_state_bytes_per_request(resolved);
+        // vLLM allocates cache only for the layers a stage owns, in blocks
+        // of this stage's DSA layers.
+        let kv_cache_layout = hybrid_kv_cache_layout(
+            &cfg.model,
+            kda_layer_state_bytes_per_request(resolved),
+            counts.dsa,
+            counts.kda,
+            kda_groups,
+            block_tokens,
+        );
         let mut sizes = cfg.parallel.cudagraph_capture_sizes.clone();
         sizes.sort_unstable();
         sizes.dedup();
@@ -453,9 +467,7 @@ impl Glm53FlashVllmFp8PpStageModel {
             output: (stage_index + 1 == num_stages).then(|| Arc::clone(&sections.output)),
             max_model_len: cfg.parallel.max_model_len,
             cudagraph_capture_sizes: sizes,
-            kv_bytes_per_token,
-            recurrent_state_bytes_per_request,
-            block_tokens,
+            kv_cache_layout,
             cost_flat: Vec::new(),
             n_slots: 0,
         };
@@ -600,18 +612,9 @@ impl IterwiseUnifiedModel for Glm53FlashVllmFp8PpStageModel {
         normalize_input(batch, self.max_model_len).map(|_| ())
     }
 
-    /// This stage's DSA layers only: vLLM allocates cache per stage.
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.kv_bytes_per_token
-    }
-
-    /// This stage's KDA layers only.
-    fn recurrent_state_bytes_per_request(&self) -> u64 {
-        self.recurrent_state_bytes_per_request
-    }
-
-    fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-        self.block_tokens
+    /// This stage's layers only: vLLM allocates cache per stage.
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn logs_decode_kv_lens(&self) -> bool {
@@ -672,8 +675,8 @@ pub struct Glm53FlashVllmFp8PpModel {
     max_model_len: u32,
     hidden: u32,
     hc_mult: u32,
-    block_tokens: u32,
     kda_groups: u32,
+    kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -687,30 +690,20 @@ impl Glm53FlashVllmFp8PpModel {
         self.stages.len() as u16
     }
 
-    /// Cache bytes per token on the stage with the most DSA layers. vLLM sizes
-    /// one shared block pool by the stage with the fewest blocks.
-    pub fn pipeline_kv_bytes_per_token(&self) -> u64 {
+    /// The cache of the stage with the most DSA layers. vLLM sizes one
+    /// shared block pool by the stage with the fewest blocks.
+    pub fn pipeline_kv_cache_layout(&self) -> KvCacheLayout {
         self.stages
             .iter()
-            .map(|stage| stage.kv_bytes_per_token)
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// Tokens per cache block, in every group.
-    pub fn block_tokens(&self) -> u32 {
-        self.block_tokens
+            .map(|stage| &stage.kv_cache_layout)
+            .max_by_key(|layout| layout.per_token_bytes())
+            .expect("a pipeline has stages")
+            .clone()
     }
 
     /// vLLM's KDA cache-group count `G`; see [`kda_group_count`].
     pub fn kda_groups(&self) -> u32 {
         self.kda_groups
-    }
-
-    /// Blocks a request holds whatever its length: one per KDA group (its live
-    /// state) plus one kpool-tail scratch block.
-    pub fn state_blocks_per_request(&self) -> u32 {
-        self.kda_groups + 1
     }
 
     /// Bytes one token sends from one stage to the next: vLLM's PP
@@ -757,23 +750,10 @@ impl IterwiseUnifiedModel for Glm53FlashVllmFp8PpModel {
     }
 
     /// The physical total over all stages: each stage caches only its own
-    /// layers, so the stages' bytes add up to one token's whole state.
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.stages
-            .iter()
-            .map(|stage| stage.kv_bytes_per_token)
-            .sum()
-    }
-
-    fn recurrent_state_bytes_per_request(&self) -> u64 {
-        self.stages
-            .iter()
-            .map(|stage| stage.recurrent_state_bytes_per_request)
-            .sum()
-    }
-
-    fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-        self.block_tokens
+    /// layers in blocks of its own DSA layers, so the stages together hold
+    /// the whole model's layout.
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn logs_decode_kv_lens(&self) -> bool {
@@ -1020,20 +1000,30 @@ mod tests {
     fn each_stage_caches_only_its_own_layers() {
         let model = built(4);
         let kda_state = 64 * 128 * 128 * 4 + 3 * 8192 * 3 * 2;
+        let state_bytes = |layout: &KvCacheLayout| {
+            layout
+                .parts
+                .iter()
+                .find(|part| part.name == "kda")
+                .map_or(0, |part| part.bytes_per_entry)
+        };
+        let block_bytes = |dsa: u64| 8_576 * dsa * 545;
         for stage in model.stages() {
             let counts = stage.layer_counts();
+            let layout = stage.kv_cache_layout();
+            assert_eq!(layout.per_token_bytes(), u64::from(counts.dsa) * 545);
+            assert_eq!(state_bytes(&layout), u64::from(counts.kda) * kda_state);
+            // The null block is one block of this stage's DSA layers.
             assert_eq!(
-                stage.total_kv_bytes_per_token(),
-                u64::from(counts.dsa) * (512 + 33)
-            );
-            assert_eq!(
-                stage.recurrent_state_bytes_per_request(),
-                u64::from(counts.kda) * kda_state
+                layout.engine.fixed_device_bytes,
+                block_bytes(u64::from(counts.dsa))
             );
         }
         // The stages add up to the whole model at TP1.
-        assert_eq!(model.total_kv_bytes_per_token(), 11 * 545);
-        assert_eq!(model.recurrent_state_bytes_per_request(), 34 * kda_state);
+        let whole = model.kv_cache_layout();
+        assert_eq!(whole.per_token_bytes(), 11 * 545);
+        assert_eq!(state_bytes(&whole), 34 * kda_state);
+        assert_eq!(whole.engine.fixed_device_bytes, block_bytes(11));
         assert_eq!(model.activation_bytes_per_token(), 4 * 4096 * 2);
     }
 
@@ -1046,14 +1036,27 @@ mod tests {
             .collect();
         assert_eq!(groups, [4, 4, 5, 4, 5, 4, 4]);
         let pp4 = built(4);
-        assert_eq!(pp4.block_tokens(), 8_576);
         assert_eq!(pp4.kda_groups(), 5);
-        assert_eq!(pp4.state_blocks_per_request(), 6);
-        assert_eq!(pp4.pipeline_kv_bytes_per_token(), 3 * 545);
+        let pipeline = pp4.pipeline_kv_cache_layout();
+        assert_eq!(pipeline.per_token_bytes(), 3 * 545);
+        // A request holds one block per KDA group plus the kpool tail.
+        let block_bytes = 8_576 * 3 * 545;
+        let padded = |name: &str| {
+            pipeline
+                .parts
+                .iter()
+                .find(|part| part.name == name)
+                .and_then(|part| part.overhead.padded_bytes_per_entry)
+        };
+        assert_eq!(padded("kda"), Some(5 * block_bytes));
+        assert_eq!(padded("kpool_tail"), Some(block_bytes));
         for stage in pp4.stages() {
-            assert_eq!(stage.recurrent_checkpoint_interval_tokens(), 8_576);
+            assert_eq!(stage.kv_cache_layout().engine.block_tokens, Some(8_576));
         }
-        assert_eq!(built(8).pipeline_kv_bytes_per_token(), 2 * 545);
+        assert_eq!(
+            built(8).pipeline_kv_cache_layout().per_token_bytes(),
+            2 * 545
+        );
     }
 
     #[test]
