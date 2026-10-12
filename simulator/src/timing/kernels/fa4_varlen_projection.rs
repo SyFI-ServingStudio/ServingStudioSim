@@ -77,6 +77,15 @@ pub(crate) trait Fa4VarlenCall {
     /// size when this step runs from a FULL CUDA graph (padding slots are
     /// zero-length requests that add no CTA work).
     fn launched_requests(&self, pairs: &[(u32, u32)], padded_requests: u32) -> u32;
+    /// Whether the context inversion counts CTAs in whole waves of 148
+    /// ([`wave_makespan`]) instead of the continuous `max(longest, total /
+    /// SMs)` ([`makespan`]). Waves price a canonical batch of more CTAs than
+    /// SMs at its real two-wave length, and a ragged batch at its longest CTA
+    /// with the short ones filling the rest.
+    fn whole_waves(&self) -> bool {
+        false
+    }
+
     /// Contexts after which the canonical batch's modelled makespan drops (a
     /// split count switching on with the context): the inversion takes the
     /// first segment between them that reaches the target. Empty where the
@@ -149,8 +158,8 @@ pub(crate) fn makespan<C: Fa4VarlenCall>(call: &C, pairs: &[(u32, u32)], launche
 /// 148 lasting as long as its first. It carries the steps a batch-size change
 /// makes (another wave, a different split count), which the decode-count
 /// coordinate follows between grid points.
-fn wave_makespan<C: Fa4VarlenCall>(call: &C, pairs: &[(u32, u32)]) -> f64 {
-    let mut works = cta_works(call, pairs, pairs.len() as u32);
+fn wave_makespan<C: Fa4VarlenCall>(call: &C, pairs: &[(u32, u32)], launched: u32) -> f64 {
+    let mut works = cta_works(call, pairs, launched);
     works.sort_unstable_by(|lhs, rhs| rhs.total_cmp(lhs));
     let waves = works.iter().step_by(B200_SMS as usize).sum::<f64>();
     waves + SHARED_WORK_WEIGHT * works.iter().sum::<f64>() / B200_SMS
@@ -179,7 +188,7 @@ pub(crate) fn decode_coordinate<C: Fa4VarlenCall>(
     let model = |count: u32| {
         let pairs = canonical_pairs(call, count, prefill, context)
             .expect("a grid neighbour of a decode count >= 1 is non-empty");
-        wave_makespan(call, &pairs)
+        wave_makespan(call, &pairs, pairs.len() as u32)
     };
     let (m_lo, m, m_hi) = (model(lo), model(decodes), model(hi));
     let linear = f64::from(decodes - lo) / f64::from(hi - lo);
@@ -250,11 +259,18 @@ fn equivalent_context<C: Fa4VarlenCall>(
     decodes: u32,
     prefill: u32,
 ) -> f64 {
-    let target = makespan(call, pairs, launched);
+    let cost = |pairs: &[(u32, u32)], launched: u32| {
+        if call.whole_waves() {
+            wave_makespan(call, pairs, launched)
+        } else {
+            makespan(call, pairs, launched)
+        }
+    };
+    let target = cost(pairs, launched);
     let canonical = |context: f64| {
         let pairs = canonical_pairs(call, decodes, prefill, context.round() as u32)
             .expect("a non-empty batch has a canonical batch");
-        makespan(call, &pairs, pairs.len() as u32)
+        cost(&pairs, pairs.len() as u32)
     };
     // Fractional contexts: the model is linear in the context between integer
     // points, so interpolate there to keep the projection continuous.

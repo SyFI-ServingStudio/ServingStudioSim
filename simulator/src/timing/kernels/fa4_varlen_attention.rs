@@ -245,8 +245,24 @@ impl Fa4VarlenCall for Fa4VarlenAttentionKernelConfig {
         self.max_model_len
     }
 
+    /// The keys charged to a windowed query: FA4 reads whole 128-key tiles
+    /// (block_info.py `get_n_block_min_max` rounds the window start down),
+    /// and a window that starts off a tile boundary (almost every one) spans
+    /// on average `window + TILE_N - 1` keys of tiles; a 128-key window reads
+    /// two tiles, not one.
     fn window(&self) -> Option<u32> {
-        (self.window > 0).then_some(self.window)
+        (self.window > 0).then_some(self.window + TILE_N - 1)
+    }
+
+    /// A step of more CTAs than SMs runs in waves: the SM100 forward fills
+    /// shared memory to 224 KiB (flash_fwd_sm100.py `kv_stage`), so one CTA
+    /// is resident per SM; a non-split decode-only launch walks its tiles
+    /// with the static persistent scheduler (interface.py
+    /// `is_static_persistent`, grid `min(SMs, tiles)`), any other varlen
+    /// launch is one CTA per tile (`SingleTileVarlenScheduler`). A mixed
+    /// step's chunk CTAs alone outnumber the SMs at 2048 tokens.
+    fn whole_waves(&self) -> bool {
+        true
     }
 
     fn decode_axis(&self) -> Vec<u32> {
