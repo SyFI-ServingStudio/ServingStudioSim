@@ -71,6 +71,28 @@ datacenter driver: the CUDA base image carries the forward-compatibility
 libraries (`/usr/local/cuda/compat`), which the NVIDIA container runtime uses
 when the host driver predates the image's CUDA (seen on driver 570, CUDA 12.8).
 
+A Neuron backend (`BackendSupport.device_family = "neuron"`) is measured on an
+AWS Trainium chip instead (`exec/neuron.py`). Its env names a vendor image that
+this checkout never builds, pinned by content digest (`VENDOR_IMAGES` in
+`profiling/container/images.py`); it has no host or in-image runtime. The pool
+takes a nonblocking whole-chip lock under `/tmp`, so checkouts with different
+`TMPDIR`s never share a chip, and it refuses an inherited
+`NEURON_RT_VISIBLE_CORES`/`NEURON_VISIBLE_DEVICES`. A backend that runs several
+ranks names its logical-core span as `KernelProfilerSpec.neuron_logical_cores`.
+The worker runs offline as the invoking user with only `/dev/neuronN` mapped,
+compares its own `neuron-ls` observation with the reservation before it loads
+the runner, and records the image's SDK and runtime packages; the controller
+appends the inspected image ID and the host driver package. Neuron rows keep
+NULL CUDA and driver versions. Host configuration:
+
+- `SERVINGSTUDIO_NEURON_DOCKER_HOST` (required): the local `unix://` socket of
+  the Docker daemon that runs Neuron workers; `SERVINGSTUDIO_NEURON_DOCKER_COMMAND`
+  is its CLI argv (default `docker`, e.g. `sudo -n docker`).
+- `SERVINGSTUDIO_VLLM_NEURON_MODEL_DIR` (required): the checkpoint directory,
+  mounted read-only at its own path.
+- `SERVINGSTUDIO_NEURON_PROFILE_CACHE_DIR`: the writable compile cache, mounted
+  at its own path (default `$TMPDIR/servingstudio-neuron-cache`).
+
 `VIBESIM_PROFILE_RUNTIME=host` runs each env on the host interpreter its
 registry entry names instead, for debugging against a local build. Those rows
 carry the same DB key as the image's, so compare them against the image before
