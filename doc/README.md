@@ -57,6 +57,8 @@ infrastructure.
 - **[detailed_design/](detailed_design/)** — one concise document per layer
   (`L1.md` … `L7.md`): its role, boundary, the directory and key types that
   implement it, and its own invariants.
+- **[trainium2.md](trainium2.md)** — the AWS Trainium2 target: stock vLLM Neuron
+  Llama 3.1 8B kinds, context ladder, compositions, serving pairing and alignment.
 - **[analyzer.md](analyzer.md)** — the post-run analyzer's design contract (the
   Rust-computes / Python-renders split, the report/payload envelope, the flat
   subject registry, applicability/scope, and the speed budget).

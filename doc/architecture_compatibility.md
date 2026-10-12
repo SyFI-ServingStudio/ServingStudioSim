@@ -22,7 +22,7 @@ the graph that produced them.
 | Selector | Precision and execution graph | Parallel coverage | Why it remains |
 |---|---|---|---|
 | `llama3_dense` | dense local | one GPU | only local dense graph |
-| `llama3_vllm_neuron` | Llama 3.1 8B BF16; the stock vLLM Neuron 32-layer forward with sampling, as one measured executable | one Trainium2 chip, TP4/LNC2; contexts 128 to 8192 with a configured decode-bucket inventory | the only Neuron execution boundary; pairs with `chunked_prefill` under the stock scheduler's limits |
+| `llama3_vllm_neuron` | Llama 3.1 8B BF16; the stock vLLM Neuron 32-layer forward with sampling, as one measured executable (or, experimentally, model/head regions or collective-delimited layer segments) | one Trainium2 chip, TP4/LNC2; contexts 128 to 8192 with a configured decode-bucket inventory, and 16384/32768 with segmented prefill | the only Neuron execution boundary; pairs with `chunked_prefill` under the stock scheduler's limits ([trainium2.md](trainium2.md)) |
 | `llama3_dense_tp` | dense TP | one configurable TP group | covers TP layouts |
 | `llama3_dp_attn_tp_ffn` | dense split attention/FFN | `attn_tp_size` divides `ffn_tp_size`; attention DP is `ffn_tp_size / attn_tp_size` | covers distinct attention-DP layouts |
 | `qwen3_moe_dp_attn_ep_ffn` | native BF16 MoE | configurable attention TP, attention DP, EP, HP, and NVLink domains | only BF16 unified graph |

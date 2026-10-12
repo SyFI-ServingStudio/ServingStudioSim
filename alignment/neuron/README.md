@@ -118,6 +118,11 @@ all-null or complete, with arrival <= send <= receive. Sub-version 1 rows stay
 readable, with null hand-off fields. Provenance `handoff_stamp: true`, which
 needs `request_arrival_timing_schema: 2`, requires a stamp for every request.
 Without it, the hand-off fields are null and any stamp is an error.
+`vllm_handoff_distribution.py` builds the simulator's frontend hand-off data
+(`data/vllm_neuron_handoff.json`, `doc/trainium2.md`) from race captures; it
+takes `handoff_gap_ms` from consecutive send stamps when every request of a
+capture has one, else from frontend inter-arrival gaps, and records the source
+per capture in `provenance.handoff_gap_source`.
 These EngineCore durations exclude HTTP ingress and SSE delivery; the clean
 workload pass supplies server latency comparisons. Scheduler observations
 retain the stock resolved async policy and pre-increment progress, actual

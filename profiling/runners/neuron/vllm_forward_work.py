@@ -1,7 +1,7 @@
 """Per-rank graph contractions and persistent operand estimates, not counters.
 
 Derived from stock model/FX shapes and nkilib attention_cte causal tile loops;
-see doc/trainium2_vllm_inventory.md. These intentionally do not use model.work.
+see doc/trainium2.md ("Work estimates"). These intentionally do not use model.work.
 Nonmatmul arithmetic, temporaries, collectives, spills and residency are omitted.
 """
 
