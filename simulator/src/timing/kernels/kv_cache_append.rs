@@ -1,7 +1,10 @@
 //! Paged KV-cache append: write newly produced K/V rows into cache slots.
 //!
-//! Static identity captures the physical write path (KV heads/head size, page
-//! size, input/cache dtypes, NHD/HND layout, and tensor/head scale). Runtime is
+//! Static identity captures the physical write path (KV heads, key and value
+//! head sizes, page size, input/cache dtypes, NHD/HND layout, and tensor/head
+//! scale). `head_dim_v` is unset for ordinary attention (V as wide as K); it is
+//! set when V is narrower than K (the `vllm_triton_diffkv` backend writes both
+//! into one packed `[blocks, page, heads, head_dim + head_dim_v]` cache). Runtime is
 //! the number of actual appended tokens, matching vLLM's use of
 //! `slot_mapping.size(0)` rather than any CUDA-graph padded tensor length.
 
@@ -17,7 +20,13 @@ pub struct KvCacheAppendKernelConfig {
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
     pub num_kv_heads: Dim,
+    /// Key head size.
     pub head_dim: Dim,
+    /// Value head size when it differs from `head_dim`. Unset (and equal values)
+    /// stay out of the identity and the profile args, so symmetric configs key
+    /// the rows they keyed before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_dim_v: Option<Dim>,
     pub block_size: u32,
     #[compute_dtype]
     pub input_dtype: DType,
@@ -61,8 +70,13 @@ impl KernelSpec for KvCacheAppendSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
+        let head_dim_v = config
+            .head_dim_v
+            .as_ref()
+            .map(Dim::get)
+            .filter(|&v| v != config.head_dim.get());
         grid.expand_1d(|num_tokens| {
-            ArgsPayload::new()
+            let payload = ArgsPayload::new()
                 .with("backend", backend)
                 .with("num_kv_heads", config.num_kv_heads.get())
                 .with("head_dim", config.head_dim.get())
@@ -71,7 +85,11 @@ impl KernelSpec for KvCacheAppendSpec {
                 .with("kv_dtype", config.kv_dtype.as_str())
                 .with("cache_layout", config.cache_layout.clone())
                 .with("scale_granularity", config.scale_granularity.clone())
-                .with("num_tokens", num_tokens as u32)
+                .with("num_tokens", num_tokens as u32);
+            match head_dim_v {
+                Some(v) => payload.with("head_dim_v", v),
+                None => payload,
+            }
         })
     }
 }
@@ -93,6 +111,7 @@ mod tests {
             gpu_name: "NVIDIA H200".to_string(),
             num_kv_heads: 8.into(),
             head_dim: 128.into(),
+            head_dim_v: None,
             block_size: 16,
             input_dtype: DType::Bf16,
             kv_dtype: DType::Bf16,
@@ -149,6 +168,7 @@ mod tests {
         assert_eq!(fields.get("backend"), Some(&Value::from("vllm_cuda")));
         assert_eq!(fields.get("num_kv_heads"), Some(&Value::from(8_u32)));
         assert_eq!(fields.get("head_dim"), Some(&Value::from(128_u32)));
+        assert!(!fields.contains_key("head_dim_v"));
         assert_eq!(fields.get("block_size"), Some(&Value::from(16_u32)));
         assert_eq!(fields.get("input_dtype"), Some(&Value::from("bf16")));
         assert_eq!(fields.get("kv_dtype"), Some(&Value::from("bf16")));
@@ -158,5 +178,39 @@ mod tests {
             Some(&Value::from("tensor"))
         );
         assert_eq!(fields.get("num_tokens"), Some(&Value::from(1_u32)));
+    }
+
+    #[test]
+    fn asymmetric_value_head_reaches_the_payload() {
+        // A V dim dropped or copied from K here would look up symmetric rows.
+        let cfg = KvCacheAppendKernelConfig {
+            backends: vec!["vllm_triton_diffkv"],
+            num_kv_heads: 1.into(),
+            head_dim: 192.into(),
+            head_dim_v: Some(128.into()),
+            block_size: 32,
+            ..config()
+        };
+        let grid = KvCacheAppendSpec::sweep_grid(&cfg);
+        let payload = &KvCacheAppendSpec::enumerate(&cfg, &grid, "vllm_triton_diffkv")[0];
+        let fields = payload.fields();
+        assert_eq!(fields.get("head_dim"), Some(&Value::from(192_u32)));
+        assert_eq!(fields.get("head_dim_v"), Some(&Value::from(128_u32)));
+        assert_eq!(
+            fields.get("backend"),
+            Some(&Value::from("vllm_triton_diffkv"))
+        );
+    }
+
+    #[test]
+    fn a_value_head_equal_to_the_key_head_keys_like_an_unset_one() {
+        // Spelled-out symmetric K/V must hit the rows keyed without the field.
+        let cfg = KvCacheAppendKernelConfig {
+            head_dim_v: Some(128.into()),
+            ..config()
+        };
+        let grid = KvCacheAppendSpec::sweep_grid(&cfg);
+        let payload = &KvCacheAppendSpec::enumerate(&cfg, &grid, "vllm_cuda")[0];
+        assert!(!payload.fields().contains_key("head_dim_v"));
     }
 }

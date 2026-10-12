@@ -213,6 +213,8 @@ fn kv_cache_append_config(cfg: &FlashInferAttentionConfig) -> KvCacheAppendKerne
         gpu_name: cfg.gpu_name.clone(),
         num_kv_heads: cfg.num_kv_heads.clone(),
         head_dim: cfg.head_dim.clone(),
+        // FlashInfer attention keeps K and V at one head size.
+        head_dim_v: None,
         block_size: cfg.kv_cache_block_size,
         input_dtype: cfg.dtype,
         kv_dtype: cfg.kv_dtype(),
