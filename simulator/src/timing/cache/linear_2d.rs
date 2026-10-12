@@ -193,7 +193,9 @@ impl Cache for Cache2DLinear {
         if x0.is_nan() || x1.is_nan() || !self.any_valid {
             return LeafMetrics::MISS;
         }
-        let (cell, extrapolated) = self.lookup(x0 as f32, x1 as f32);
+        let Some((cell, extrapolated)) = self.lookup(x0 as f32, x1 as f32) else {
+            return LeafMetrics::MISS;
+        };
         LeafMetrics {
             m: cell.clamped(),
             coverage: if extrapolated {
@@ -335,8 +337,9 @@ impl Cache2DLinear {
     /// weights themselves carry `t` past `[0,1]`. The other two evaluate at the
     /// clamped coordinates (a point that is always inside the grid, so the four
     /// corners are real measurements) and then add the policy's increment, which
-    /// is zero on the boundary and therefore continuous with the table.
-    fn lookup(&self, x0: f32, x1: f32) -> (Metrics4, bool) {
+    /// is zero on the boundary and therefore continuous with the table. `None`
+    /// when the bracketing cell kept no finite corner.
+    fn lookup(&self, x0: f32, x1: f32) -> Option<(Metrics4, bool)> {
         if let Extrapolation::Product = self.extrapolation {
             return self.interpolate_cell(x0, x1);
         }
@@ -347,9 +350,9 @@ impl Cache2DLinear {
         let clamped0 = x0.clamp(lo0, hi0);
         let clamped1 = x1.clamp(lo1, hi1);
         let outside = clamped0 != x0 || clamped1 != x1;
-        let (mut cell, _) = self.interpolate_cell(clamped0, clamped1);
+        let (mut cell, partial) = self.interpolate_cell(clamped0, clamped1)?;
         if !outside {
-            return (cell, false);
+            return Some((cell, partial));
         }
         if let Some(slopes) = self.slopes {
             // Only overshoot *above* the grid is priced, and each axis is priced
@@ -361,15 +364,16 @@ impl Cache2DLinear {
             cell.add_scaled(slopes.per_axis[0], (x0 - hi0).max(0.0));
             cell.add_scaled(slopes.per_axis[1], (x1 - hi1).max(0.0));
         }
-        (cell, true)
+        Some((cell, true))
     }
 
     /// Locate the 2D bracketing cell once (one branchless `locate` per axis),
     /// then bilinear-blend all four metrics of the (up to) four corners in a
     /// single pass — the corner cells and their weights are computed once and
     /// shared across metrics. Returns the interpolated `Metrics4` plus whether
-    /// `(x0, x1)` fell outside the grid.
-    fn interpolate_cell(&self, x0: f32, x1: f32) -> (Metrics4, bool) {
+    /// `(x0, x1)` fell outside the grid or leaned on a dropped corner; `None`
+    /// when every corner of the cell was dropped.
+    fn interpolate_cell(&self, x0: f32, x1: f32) -> Option<(Metrics4, bool)> {
         let (i0, i1, t0, out0) = locate(&self.xs0, x0);
         let (j0, j1, t1, out1) = locate(&self.xs1, x1);
         let c = self.xs1.len();
@@ -395,7 +399,7 @@ impl Cache2DLinear {
             acc.add_scaled(self.cells[idx01], w01);
             acc.add_scaled(self.cells[idx10], w10);
             acc.add_scaled(self.cells[idx11], w11);
-            return (acc, outside);
+            return Some((acc, outside));
         }
 
         // Slow path: some cell was dropped non-finite. Re-derive per-corner
@@ -421,7 +425,7 @@ impl Cache2DLinear {
                     acc.add_scaled(cell, weight);
                 }
             }
-            return (acc, outside);
+            return Some((acc, outside));
         }
 
         // A weighted corner was dropped as non-finite. Blend the surviving
@@ -430,7 +434,8 @@ impl Cache2DLinear {
         // weights can't distort or cancel it. When no positive weight remains
         // (the query sits on the dropped corner itself), fall back to the
         // surviving corner nearest to the query in normalized cell coordinates.
-        // Coverage is partial either way → flag extrapolated.
+        // Coverage is partial either way → flag extrapolated. No surviving corner
+        // at all is a miss, not a zero.
         let mut acc = Metrics4::ZERO;
         let mut weight_sum = 0.0;
         for &(_, _, cell, weight) in &corners {
@@ -442,7 +447,7 @@ impl Cache2DLinear {
         }
         if weight_sum > f32::EPSILON {
             acc.scale(1.0 / weight_sum);
-            return (acc, true);
+            return Some((acc, true));
         }
         let normalized_distance = |axis: &[f32], lo: usize, hi: usize, x: f32, idx: usize| {
             let width = (axis[hi] - axis[lo]).abs();
@@ -452,7 +457,7 @@ impl Cache2DLinear {
                 ((x - axis[idx]) / width).abs()
             }
         };
-        let nearest = corners
+        corners
             .iter()
             .filter_map(|&(i, j, cell, _)| {
                 cell.map(|cell| {
@@ -462,9 +467,7 @@ impl Cache2DLinear {
                 })
             })
             .min_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
-            .map(|(cell, _)| cell)
-            .unwrap_or(Metrics4::ZERO);
-        (nearest, true)
+            .map(|(cell, _)| (cell, true))
     }
 }
 
@@ -502,7 +505,7 @@ mod tests {
         cells: &[Option<super::Metrics4>],
         x0: f32,
         x1: f32,
-    ) -> (super::Metrics4, bool) {
+    ) -> Option<(super::Metrics4, bool)> {
         use crate::timing::cache::interp::locate;
         let (i0, i1, t0, out0) = locate(xs0, x0);
         let (j0, j1, t1, out1) = locate(xs1, x1);
@@ -524,7 +527,7 @@ mod tests {
                     acc.add_scaled(cell, weight);
                 }
             }
-            return (acc, out0 || out1);
+            return Some((acc, out0 || out1));
         }
         let mut acc = super::Metrics4::ZERO;
         let mut weight_sum = 0.0;
@@ -537,7 +540,7 @@ mod tests {
         }
         if weight_sum > f32::EPSILON {
             acc.scale(1.0 / weight_sum);
-            return (acc, true);
+            return Some((acc, true));
         }
         let normalized_distance = |axis: &[f32], lo: usize, hi: usize, x: f32, idx: usize| {
             let width = (axis[hi] - axis[lo]).abs();
@@ -547,7 +550,7 @@ mod tests {
                 ((x - axis[idx]) / width).abs()
             }
         };
-        let nearest = corners
+        corners
             .iter()
             .filter_map(|&(i, j, cell, _)| {
                 cell.map(|cell| {
@@ -557,9 +560,7 @@ mod tests {
                 })
             })
             .min_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
-            .map(|(cell, _)| cell)
-            .unwrap_or(super::Metrics4::ZERO);
-        (nearest, true)
+            .map(|(cell, _)| (cell, true))
     }
 
     /// Build a `Cache2DLinear` and the parallel `Vec<Option<Metrics4>>` grid the
@@ -608,9 +609,16 @@ mod tests {
 
         for &x0 in &probes0 {
             for &x1 in &probes1 {
-                let (got_m, got_ex) = cache.interpolate_cell(x0, x1);
-                let (want_m, want_ex) =
-                    interpolate_oracle(&cache.xs0, &cache.xs1, &opt_cells, x0, x1);
+                let got = cache.interpolate_cell(x0, x1);
+                let want = interpolate_oracle(&cache.xs0, &cache.xs1, &opt_cells, x0, x1);
+                let (Some((got_m, got_ex)), Some((want_m, want_ex))) = (got, want) else {
+                    assert_eq!(
+                        got.is_none(),
+                        want.is_none(),
+                        "coverage diverges at ({x0},{x1}) drops={drops:?}"
+                    );
+                    continue;
+                };
                 assert_eq!(
                     got_ex, want_ex,
                     "extrapolated flag diverges at ({x0},{x1}) drops={drops:?}"
@@ -717,7 +725,7 @@ mod tests {
             locate(&cache.xs0, a).2 + locate(&cache.xs1, b).2
         });
         run("interpolate_cell (4 fields)", &|a, b| {
-            cache.interpolate_cell(a, b).0.time_ms
+            cache.interpolate_cell(a, b).unwrap().0.time_ms
         });
         run("eval", &|a, b| cache.eval(&[a as f64, b as f64]).m.time_ms);
     }
@@ -818,6 +826,46 @@ mod tests {
     }
 
     #[test]
+    fn cell_with_every_corner_dropped_is_a_miss_not_a_zero() {
+        // The (1..2, 10..20) cell loses all four corners; the rest of the grid
+        // survives, so this is a local hole rather than an empty cache.
+        let grid = SweepGrid::new(vec![vec![1.0, 2.0, 3.0], vec![10.0, 20.0, 30.0]]);
+        let samples: Vec<_> = (0..9)
+            .map(|index| match index {
+                0 | 1 | 3 | 4 => nan_sample(),
+                _ => sample(1.0 + index as f64),
+            })
+            .collect();
+        for policy in [
+            Extrapolation::Product,
+            Extrapolation::Clamp,
+            Extrapolation::Weighted,
+        ] {
+            let (cache, _) = Cache2DLinear::from_samples_with(&grid, &samples, policy);
+            let hole = cache.eval(&[1.5, 15.0]);
+            assert_eq!(hole.coverage, CoverageFlags::NO_COVERAGE, "{policy:?}");
+            assert_eq!(hole.m.time_ms, 0.0);
+            assert!(cache.eval(&[2.5, 25.0]).m.time_ms > 0.0);
+        }
+    }
+
+    #[test]
+    fn clamp_policy_flags_interior_lookups_that_lean_on_a_dropped_corner() {
+        let grid = SweepGrid::new(vec![vec![1.0, 2.0], vec![10.0, 20.0]]);
+        let samples = vec![sample(1.0), sample(2.0), sample(3.0), nan_sample()];
+        for policy in [
+            Extrapolation::Product,
+            Extrapolation::Clamp,
+            Extrapolation::Weighted,
+        ] {
+            let (cache, _) = Cache2DLinear::from_samples_with(&grid, &samples, policy);
+            let partial = cache.eval(&[1.5, 15.0]);
+            assert!(partial.m.time_ms > 0.0);
+            assert_eq!(partial.coverage, CoverageFlags::EXTRAPOLATED, "{policy:?}");
+        }
+    }
+
+    #[test]
     fn non_monotonic_time_along_axis_flags_break() {
         // Along axis-1 at x0=1: 1.0 → 0.4 is a 60% drop (> 10% tol).
         let grid = SweepGrid::new(vec![vec![1.0, 2.0], vec![10.0, 20.0]]);
@@ -885,7 +933,11 @@ mod tests {
         // both must agree with the raw bilinear blend everywhere, on-grid and off.
         let (default, _) = Cache2DLinear::from_samples(&grid, &samples);
         for &(x0, x1) in &[(300.0, 700.0), (1024.0, 1024.0), (4096.0, 4096.0)] {
-            let expected = product.interpolate_cell(x0 as f32, x1 as f32).0.time_ms;
+            let expected = product
+                .interpolate_cell(x0 as f32, x1 as f32)
+                .unwrap()
+                .0
+                .time_ms;
             assert_eq!(product.eval(&[x0, x1]).m.time_ms, expected);
             assert_eq!(default.eval(&[x0, x1]).m.time_ms, expected);
         }
