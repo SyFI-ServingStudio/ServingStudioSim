@@ -63,20 +63,26 @@
 //! a host tier join the capacity contract (`kv_host_offload`), and each step
 //! adds the exposed host -> device miss copy as one more `Max` over ranks.
 //!
-//! The exchange can instead be priced by `arch::ep_comm`'s analytic link model
-//! (`ep_comm_model: analytic`), as the naive all-gather / reduce-scatter or as
-//! flashinfer's two-sided MNNVL all-to-all (`ep_comm: alltoall`). That is the
-//! only way past the measured collectives' 8 GPUs: an EP group of up to the
-//! whole NVLink domain (GB200 NVL72), `ep_size` dividing the 256 experts. The
-//! all-to-all adds its metadata prepare, the receiver's NVFP4 scale swizzle,
-//! and the combine's zeroed `tokens x top_k` staging buffer and top-k sum
-//! (measured elementwise leaves). The default, measured all-gather /
-//! reduce-scatter, is unchanged.
+//! The exchange can instead run as flashinfer's two-sided MNNVL all-to-all
+//! (`ep_comm: alltoall`), which adds its metadata prepare, the receiver's NVFP4
+//! scale swizzle, and the combine's zeroed `tokens x top_k` staging buffer and
+//! top-k sum (measured elementwise leaves). At EP8 its prepare and transfers
+//! can be the profiled B200 `moe_alltoall_prepare` / `moe_alltoall` rows
+//! (`ep_comm_model: measured`): the prepare at the busiest rank's tokens, the
+//! NVFP4 activations and their block scales as two lookups, the bf16 combine as
+//! one, at `arch::ep_comm`'s busiest-sender / busiest-receiver rows.
+//! `arch::ep_comm`'s analytic link model (`ep_comm_model: analytic`) prices
+//! either exchange at any size and is the only way past the measured 8 GPUs: an
+//! EP group of up to the whole NVLink domain (GB200 NVL72), `ep_size` dividing
+//! the 256 experts. The default, measured all-gather / reduce-scatter, is
+//! unchanged.
 
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, KvHostOffload, UnifiedArchInput};
-use crate::arch::ep_comm::{push_leg, AnalyticEpComm, EpCommConfig, EpCommKind, EpCommModel};
+use crate::arch::ep_comm::{
+    push_leg, AlltoallRows, AnalyticEpComm, EpCommConfig, EpCommKind, EpCommModel,
+};
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
     self as ep_graph, build_atomic, eval_atomic_or_zero, normalize_group, state_bytes_per_token,
@@ -86,11 +92,14 @@ use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
 use crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::eval_compiled;
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::graph_padded_tokens;
 use crate::arch::hisparse::{push_rank_step, HisparseConfig, HisparseRankStep};
+use crate::common::Fabric;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, MoeEpCollectiveKernelInput,
+    MoeAlltoallDirection, MoeAlltoallKernel, MoeAlltoallKernelConfig, MoeAlltoallKernelInput,
+    MoeAlltoallPrepareKernel, MoeAlltoallPrepareKernelConfig, MoeAlltoallPrepareKernelInput,
     MoeEpQuantizedAllGatherKernel, MoeEpQuantizedAllGatherKernelConfig, MoeEpReduceScatterKernel,
     MoeEpReduceScatterKernelConfig, Nvfp4FusedMoeKernel, Nvfp4FusedMoeKernelInput,
     Nvfp4QuantKernel, Nvfp4QuantKernelInput, ResidualRmsNormKernel, ResidualRmsNormKernelInput,
@@ -119,6 +128,9 @@ const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
 /// tokens; a larger budget extrapolates past the grid.
 const MAX_RANK_BATCH_TOKENS: u32 = 8_192;
 const COLLECTIVE_BACKENDS: &[&str] = &["vllm_pynccl"];
+const ALLTOALL_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
+/// The only group the `moe_alltoall` / `moe_alltoall_prepare` rows span.
+const MEASURED_ALLTOALL_EP_SIZE: u16 = 8;
 const ROUTED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_routed_sm100"];
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 
@@ -158,11 +170,29 @@ pub struct Glm52VllmNvfp4DpAttnConfigs {
     pub routed_experts: Vec<Nvfp4MoeLocalWorkletConfig>,
     pub dispatch: MoeEpQuantizedAllGatherKernelConfig,
     pub combine: MoeEpReduceScatterKernelConfig,
-    /// The analytic exchange; `None` on the measured path.
+    /// The analytic exchange, and the all-to-all's row model on the measured
+    /// path; `None` on the measured all-gather / reduce-scatter.
     pub analytic: Option<AnalyticEpComm>,
     /// The all-to-all's elementwise leaves; `None` unless `ep_comm` is
     /// `alltoall`.
     pub alltoall: Option<AlltoallElementwise>,
+    /// The measured all-to-all's kernels; `None` unless `ep_comm` is
+    /// `alltoall` and `ep_comm_model` is `measured`.
+    pub measured_alltoall: Option<MeasuredAlltoall>,
+}
+
+/// The profiled flashinfer MNNVL all-to-all of vLLM's two-sided path.
+#[derive(Clone, Debug)]
+pub struct MeasuredAlltoall {
+    /// `mnnvl_moe_alltoallv_prepare_without_allgather`.
+    pub prepare: MoeAlltoallPrepareKernelConfig,
+    /// The packed NVFP4 activations, `hidden / 2` bytes per row.
+    pub dispatch: MoeAlltoallKernelConfig,
+    /// Their fp8 block scales, `hidden / 16` bytes per row: a second
+    /// `moe_comm` call.
+    pub dispatch_scales: MoeAlltoallKernelConfig,
+    /// The bf16 expert outputs back, `2 hidden` bytes per row.
+    pub combine: MoeAlltoallKernelConfig,
 }
 
 /// The all-to-all's measured elementwise work around its two transfers.
@@ -186,6 +216,7 @@ pub struct Glm52VllmNvfp4DpAttnResolved {
     pub combine: MoeEpReduceScatterKernelConfig,
     pub analytic: Option<AnalyticEpComm>,
     pub alltoall: Option<AlltoallElementwise>,
+    pub measured_alltoall: Option<MeasuredAlltoall>,
 }
 
 /// `body_demand` is the whole body's routed demand, folded over `ep_size`
@@ -223,12 +254,24 @@ fn build_configs_for(
 ) -> Result<Glm52VllmNvfp4DpAttnConfigs, BuildError> {
     parallel.ep_comm.validate().map_err(fit_failed)?;
     match parallel.ep_comm.model {
-        EpCommModel::Measured => {
-            if parallel.ep_comm.kind != EpCommKind::AllgatherReducescatter {
-                return Err(fit_failed(
-                    "ep_comm alltoall has no measured B200 rows: set ep_comm_model analytic",
-                ));
+        EpCommModel::Measured if parallel.ep_comm.kind == EpCommKind::Alltoall => {
+            // The MNNVL rows are profiled on one 8-GPU group.
+            if parallel.ep_size != MEASURED_ALLTOALL_EP_SIZE {
+                return Err(fit_failed(format!(
+                    "ep_size {} has no measured all-to-all rows: ep_comm alltoall with \
+                     ep_comm_model measured needs ep_size {MEASURED_ALLTOALL_EP_SIZE} \
+                     (ep_comm_model analytic goes further)",
+                    parallel.ep_size
+                )));
             }
+            if parallel.nvl_num_gpu < parallel.ep_size {
+                return Err(fit_failed(format!(
+                    "nvl_num_gpu {} must hold the ep_size {} group in one NVLink domain",
+                    parallel.nvl_num_gpu, parallel.ep_size
+                )));
+            }
+        }
+        EpCommModel::Measured => {
             // The two collective kernels are measured on 2, 4 and 8 GPUs of one node.
             if !matches!(parallel.ep_size, 2 | 4 | 8) {
                 return Err(fit_failed(format!(
@@ -326,9 +369,11 @@ fn build_configs_for(
     };
     let hidden = model.hidden_dim.get();
     let top_k = u32::from(model.router_top_k);
-    let analytic = match parallel.ep_comm.model {
-        EpCommModel::Measured => None,
-        EpCommModel::Analytic => Some(
+    let alltoall_kind = parallel.ep_comm.kind == EpCommKind::Alltoall;
+    // The measured all-to-all still takes its rows from the analytic model.
+    let analytic = match (parallel.ep_comm.model, alltoall_kind) {
+        (EpCommModel::Measured, false) => None,
+        _ => Some(
             AnalyticEpComm::new(
                 parallel.ep_comm.clone(),
                 parallel.ep_size,
@@ -347,11 +392,36 @@ fn build_configs_for(
         output_bytes_per_token: output.into(),
     };
     let bf16_row = 2 * hidden;
-    let alltoall = (parallel.ep_comm.kind == EpCommKind::Alltoall).then(|| AlltoallElementwise {
+    let alltoall = alltoall_kind.then(|| AlltoallElementwise {
         scale_swizzle: elementwise(hidden / 16, hidden / 16),
         combine_fill: elementwise(0, top_k * bf16_row),
         combine_reduce: elementwise(top_k * bf16_row, bf16_row),
     });
+    let alltoall_kernel = |hidden_bytes: u32, direction| MoeAlltoallKernelConfig {
+        backends: ALLTOALL_BACKENDS.to_vec(),
+        gpu_name: parallel.gpu_name.clone(),
+        ep_size: u32::from(parallel.ep_size),
+        top_k,
+        // No EPLB redundancy: one slot per expert.
+        slot_count: model.num_experts.get(),
+        hidden_bytes: hidden_bytes.into(),
+        direction,
+        fabric: Fabric::Nvlink,
+    };
+    let measured_alltoall = (alltoall_kind && parallel.ep_comm.model == EpCommModel::Measured)
+        .then(|| MeasuredAlltoall {
+            prepare: MoeAlltoallPrepareKernelConfig {
+                backends: ALLTOALL_BACKENDS.to_vec(),
+                gpu_name: parallel.gpu_name.clone(),
+                ep_size: u32::from(parallel.ep_size),
+                top_k,
+                slot_count: model.num_experts.get(),
+                fabric: Fabric::Nvlink,
+            },
+            dispatch: alltoall_kernel(hidden / 2, MoeAlltoallDirection::Dispatch),
+            dispatch_scales: alltoall_kernel(hidden / 16, MoeAlltoallDirection::Dispatch),
+            combine: alltoall_kernel(bf16_row, MoeAlltoallDirection::Combine),
+        });
     Ok(Glm52VllmNvfp4DpAttnConfigs {
         parallel: parallel.clone(),
         local,
@@ -360,6 +430,7 @@ fn build_configs_for(
         combine,
         analytic,
         alltoall,
+        measured_alltoall,
     })
 }
 
@@ -376,6 +447,7 @@ pub fn resolve_configs(cfgs: &Glm52VllmNvfp4DpAttnConfigs) -> Glm52VllmNvfp4DpAt
         combine: cfgs.combine.clone(),
         analytic: cfgs.analytic.clone(),
         alltoall: cfgs.alltoall.clone(),
+        measured_alltoall: cfgs.measured_alltoall.clone(),
     }
 }
 
@@ -394,19 +466,67 @@ struct DpSparseLayer {
 /// How the routed tokens reach the experts and come back.
 enum Exchange {
     /// The profiled quantized all-gather and bf16 reduce-scatter.
-    Measured {
+    MeasuredAllgather {
         dispatch: Op<MoeEpQuantizedAllGatherKernel>,
         combine: Op<MoeEpReduceScatterKernel>,
     },
     /// `arch::ep_comm`'s all-gather / reduce-scatter.
     AnalyticAllgather(Arc<AnalyticEpComm>),
-    /// `arch::ep_comm`'s all-to-all with its measured elementwise work.
-    AnalyticAlltoall {
+    /// flashinfer's two-sided MNNVL all-to-all with its measured elementwise
+    /// work. `comm` gives the busiest ranks' rows, and prices the prepare and
+    /// transfers unless `measured` does.
+    Alltoall {
         comm: Arc<AnalyticEpComm>,
+        measured: Option<MeasuredAlltoallOps>,
         scale_swizzle: Op<ElementwiseKernel>,
         combine_fill: Op<ElementwiseKernel>,
         combine_reduce: Op<ElementwiseKernel>,
     },
+}
+
+/// The profiled all-to-all prepare and transfers (EP8).
+struct MeasuredAlltoallOps {
+    prepare: Op<MoeAlltoallPrepareKernel>,
+    dispatch: Op<MoeAlltoallKernel>,
+    dispatch_scales: Op<MoeAlltoallKernel>,
+    combine: Op<MoeAlltoallKernel>,
+}
+
+/// The measured all-to-all's lookups at the analytic model's rows: the
+/// prepare at the busiest rank's tokens, dispatch at (busiest sender,
+/// busiest receiver) and combine at its transpose. Each `moe_comm` call
+/// moves whole rows.
+struct MeasuredAlltoallInputs {
+    prepare: MoeAlltoallPrepareKernelInput,
+    dispatch: MoeAlltoallKernelInput,
+    combine: MoeAlltoallKernelInput,
+}
+
+impl MeasuredAlltoallInputs {
+    fn new(rows: &AlltoallRows) -> Self {
+        let whole = |rows: f64| {
+            if rows > 0.0 {
+                (rows.round() as u32).max(1)
+            } else {
+                0
+            }
+        };
+        let (send, recv) = (whole(rows.send), whole(rows.recv));
+        Self {
+            prepare: MoeAlltoallPrepareKernelInput {
+                tokens_per_rank: rows.busiest_tokens,
+            },
+            dispatch: MoeAlltoallKernelInput {
+                max_send_rows: send,
+                max_recv_rows: recv,
+            },
+            // Each expert rank returns one reduced row per row it got.
+            combine: MoeAlltoallKernelInput {
+                max_send_rows: recv,
+                max_recv_rows: send,
+            },
+        }
+    }
 }
 
 impl DpSparseLayer {
@@ -499,27 +619,37 @@ impl DpSparseLayer {
         };
         let mut chain = Vec::new();
         match &self.exchange {
-            Exchange::Measured { dispatch, .. } => chain.push(dispatch.compile(builder)),
+            Exchange::MeasuredAllgather { dispatch, .. } => chain.push(dispatch.compile(builder)),
             Exchange::AnalyticAllgather(comm) => chain.push(comm.compile_leg(
                 format!("{}.moe.dispatch_ep_all_gather", self.name),
                 "dispatch",
                 builder,
             )),
-            Exchange::AnalyticAlltoall {
+            Exchange::Alltoall {
                 comm,
+                measured,
                 scale_swizzle,
                 ..
             } => {
-                chain.push(comm.compile_leg(
-                    format!("{}.moe.dispatch_alltoall_prepare", self.name),
-                    "prepare",
-                    builder,
-                ));
-                chain.push(comm.compile_leg(
-                    format!("{}.moe.dispatch_alltoall", self.name),
-                    "dispatch",
-                    builder,
-                ));
+                match measured {
+                    Some(measured) => {
+                        chain.push(measured.prepare.compile(builder));
+                        chain.push(measured.dispatch.compile(builder));
+                        chain.push(measured.dispatch_scales.compile(builder));
+                    }
+                    None => {
+                        chain.push(comm.compile_leg(
+                            format!("{}.moe.dispatch_alltoall_prepare", self.name),
+                            "prepare",
+                            builder,
+                        ));
+                        chain.push(comm.compile_leg(
+                            format!("{}.moe.dispatch_alltoall", self.name),
+                            "dispatch",
+                            builder,
+                        ));
+                    }
+                }
                 chain.push(ranks_max(builder, scale_swizzle, "dispatch_scale_swizzle"));
             }
         }
@@ -535,34 +665,39 @@ impl DpSparseLayer {
         );
         chain.push(routed);
         match &self.exchange {
-            Exchange::Measured { combine, .. } => chain.push(combine.compile(builder)),
+            Exchange::MeasuredAllgather { combine, .. } => chain.push(combine.compile(builder)),
             Exchange::AnalyticAllgather(comm) => chain.push(comm.compile_leg(
                 format!("{}.moe.combine_ep_reduce_scatter", self.name),
                 "combine",
                 builder,
             )),
-            Exchange::AnalyticAlltoall {
+            Exchange::Alltoall {
                 comm,
+                measured,
                 combine_fill,
                 combine_reduce,
                 ..
             } => {
                 chain.push(ranks_max(builder, combine_fill, "combine_output_fill"));
-                chain.push(comm.compile_leg(
-                    format!("{}.moe.combine_alltoall", self.name),
-                    "combine",
-                    builder,
-                ));
+                chain.push(match measured {
+                    Some(measured) => measured.combine.compile(builder),
+                    None => comm.compile_leg(
+                        format!("{}.moe.combine_alltoall", self.name),
+                        "combine",
+                        builder,
+                    ),
+                });
                 chain.push(ranks_max(builder, combine_reduce, "combine_reduce"));
             }
         }
         let path = match &self.exchange {
-            Exchange::Measured { .. } => {
+            Exchange::MeasuredAllgather { .. } => {
                 "quantized all-gather -> routed experts -> reduce-scatter".to_string()
             }
-            Exchange::AnalyticAllgather(comm) | Exchange::AnalyticAlltoall { comm, .. } => {
-                comm.label()
-            }
+            Exchange::Alltoall {
+                measured: Some(_), ..
+            } => "measured flashinfer MNNVL all-to-all (EP8 rows)".to_string(),
+            Exchange::AnalyticAllgather(comm) | Exchange::Alltoall { comm, .. } => comm.label(),
         };
         let exchange = CostNode::Labeled {
             label: format!(
@@ -613,13 +748,26 @@ impl DpSparseLayer {
         }
         let idle = batch.gathered_tokens == 0;
         let analytic = match &self.exchange {
-            Exchange::AnalyticAllgather(comm) | Exchange::AnalyticAlltoall { comm, .. } => {
-                comm.step(&batch.collective_tokens)
-            }
-            Exchange::Measured { .. } => Default::default(),
+            Exchange::AnalyticAllgather(comm)
+            | Exchange::Alltoall {
+                comm,
+                measured: None,
+                ..
+            } => comm.step(&batch.collective_tokens),
+            _ => Default::default(),
+        };
+        let measured_inputs = match &self.exchange {
+            Exchange::Alltoall {
+                comm,
+                measured: Some(_),
+                ..
+            } => Some(MeasuredAlltoallInputs::new(
+                &comm.alltoall_rows(&batch.collective_tokens),
+            )),
+            _ => None,
         };
         match &self.exchange {
-            Exchange::Measured { dispatch, .. } => eval_atomic_or_zero(
+            Exchange::MeasuredAllgather { dispatch, .. } => eval_atomic_or_zero(
                 dispatch,
                 MoeEpCollectiveKernelInput {
                     per_rank_tokens: batch.collective_tokens.clone(),
@@ -628,9 +776,28 @@ impl DpSparseLayer {
                 ev,
             ),
             Exchange::AnalyticAllgather(_) => push_leg("dispatch", analytic.dispatch, ev),
-            Exchange::AnalyticAlltoall { scale_swizzle, .. } => {
-                push_leg("prepare", analytic.prepare, ev);
-                push_leg("dispatch", analytic.dispatch, ev);
+            Exchange::Alltoall {
+                measured,
+                scale_swizzle,
+                ..
+            } => {
+                match (measured, &measured_inputs) {
+                    (Some(measured), Some(inputs)) => {
+                        eval_atomic_or_zero(&measured.prepare, inputs.prepare.clone(), idle, ev);
+                        eval_atomic_or_zero(&measured.dispatch, inputs.dispatch.clone(), idle, ev);
+                        // The block scales are a second `moe_comm` of the same rows.
+                        eval_atomic_or_zero(
+                            &measured.dispatch_scales,
+                            inputs.dispatch.clone(),
+                            idle,
+                            ev,
+                        );
+                    }
+                    _ => {
+                        push_leg("prepare", analytic.prepare, ev);
+                        push_leg("dispatch", analytic.dispatch, ev);
+                    }
+                }
                 // Every rank swizzles its whole receive allocation.
                 let busiest = batch.collective_tokens.iter().copied().max().unwrap_or(0);
                 let allocation = busiest.saturating_mul(self.ranks() as u32);
@@ -657,7 +824,7 @@ impl DpSparseLayer {
             );
         }
         match &self.exchange {
-            Exchange::Measured { combine, .. } => eval_atomic_or_zero(
+            Exchange::MeasuredAllgather { combine, .. } => eval_atomic_or_zero(
                 combine,
                 MoeEpCollectiveKernelInput {
                     per_rank_tokens: batch.collective_tokens.clone(),
@@ -666,7 +833,8 @@ impl DpSparseLayer {
                 ev,
             ),
             Exchange::AnalyticAllgather(_) => push_leg("combine", analytic.combine, ev),
-            Exchange::AnalyticAlltoall {
+            Exchange::Alltoall {
+                measured,
                 combine_fill,
                 combine_reduce,
                 ..
@@ -680,7 +848,12 @@ impl DpSparseLayer {
                         ev,
                     );
                 }
-                push_leg("combine", analytic.combine, ev);
+                match (measured, measured_inputs) {
+                    (Some(measured), Some(inputs)) => {
+                        eval_atomic_or_zero(&measured.combine, inputs.combine, idle, ev);
+                    }
+                    _ => push_leg("combine", analytic.combine, ev),
+                }
                 for &tokens in &batch.collective_tokens {
                     eval_atomic_or_zero(
                         combine_reduce,
@@ -701,7 +874,7 @@ impl Exchange {
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
         let Some(comm) = &resolved.analytic else {
-            return Ok(Self::Measured {
+            return Ok(Self::MeasuredAllgather {
                 dispatch: build_atomic(
                     format!("{name}.moe.dispatch_ep_all_gather"),
                     resolved.dispatch.clone(),
@@ -728,8 +901,37 @@ impl Exchange {
                 bridge,
             )
         };
-        Ok(Self::AnalyticAlltoall {
+        let measured = resolved
+            .measured_alltoall
+            .as_ref()
+            .map(|kernels| -> Result<_, BuildError> {
+                let transfer = |leaf: &str, config: &MoeAlltoallKernelConfig| {
+                    build_atomic(
+                        format!("{name}.moe.{leaf}"),
+                        config.clone(),
+                        MoeAlltoallKernel::build,
+                        bridge,
+                    )
+                };
+                Ok(MeasuredAlltoallOps {
+                    prepare: build_atomic(
+                        format!("{name}.moe.dispatch_alltoall_prepare"),
+                        kernels.prepare.clone(),
+                        MoeAlltoallPrepareKernel::build,
+                        bridge,
+                    )?,
+                    dispatch: transfer("dispatch_alltoall", &kernels.dispatch)?,
+                    dispatch_scales: transfer(
+                        "dispatch_alltoall_scales",
+                        &kernels.dispatch_scales,
+                    )?,
+                    combine: transfer("combine_alltoall", &kernels.combine)?,
+                })
+            })
+            .transpose()?;
+        Ok(Self::Alltoall {
             comm,
+            measured,
             scale_swizzle: elementwise("dispatch_scale_swizzle", &alltoall.scale_swizzle)?,
             combine_fill: elementwise("combine_output_fill", &alltoall.combine_fill)?,
             combine_reduce: elementwise("combine_reduce", &alltoall.combine_reduce)?,
@@ -1776,13 +1978,110 @@ mod tests {
         }
     }
 
+    fn measured_alltoall(ep_size: u16, nvl_num_gpu: u16) -> Glm52VllmNvfp4DpAttnParallel {
+        Glm52VllmNvfp4DpAttnParallel {
+            nvl_num_gpu,
+            ep_comm: EpCommConfig {
+                kind: EpCommKind::Alltoall,
+                model: EpCommModel::Measured,
+                ..EpCommConfig::default()
+            },
+            ..parallel(ep_size)
+        }
+    }
+
+    #[test]
+    fn the_measured_alltoall_looks_up_the_ep8_mnnvl_rows() {
+        let p = measured_alltoall(8, 72);
+        let cfgs = build_configs(&model_cfg("glm52_nvfp4"), &p, &demand(), false).unwrap();
+        let kernels = cfgs.measured_alltoall.as_ref().unwrap();
+        // NVFP4 activations and their block scales are two lookups; the combine
+        // moves bf16 rows.
+        for (kernel, bytes, direction) in [
+            (&kernels.dispatch, 3_072, MoeAlltoallDirection::Dispatch),
+            (&kernels.dispatch_scales, 384, MoeAlltoallDirection::Dispatch),
+            (&kernels.combine, 12_288, MoeAlltoallDirection::Combine),
+        ] {
+            assert_eq!(kernel.hidden_bytes.get(), bytes);
+            assert_eq!(kernel.direction, direction);
+            assert_eq!(kernel.backends, ["flashinfer_mnnvl"]);
+            assert_eq!(
+                (kernel.ep_size, kernel.top_k, kernel.slot_count),
+                (8, 8, 256)
+            );
+            assert_eq!(kernel.gpu_name, "NVIDIA B200");
+        }
+        assert_eq!(
+            (kernels.prepare.ep_size, kernels.prepare.top_k, kernels.prepare.slot_count),
+            (8, 8, 256)
+        );
+
+        // Three sections, each with a prepare, two dispatch calls and a combine
+        // in place of the all-gather and reduce-scatter, plus the three
+        // elementwise leaves per rank.
+        let model = built_with(&p);
+        assert_eq!(model.n_slots, expected_slot_count(8) + 3 * (2 + 3 * 8));
+        let slots = model.cost_log_manifest().slots;
+        let named = |kind: &str| -> Vec<String> {
+            slots
+                .iter()
+                .filter(|slot| slot.kind == kind)
+                .map(|slot| slot.name.rsplit('.').next().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(named("moe_alltoall_prepare"), ["dispatch_alltoall_prepare"; 3]);
+        assert_eq!(
+            named("moe_alltoall"),
+            ["dispatch_alltoall", "dispatch_alltoall_scales", "combine_alltoall"].repeat(3)
+        );
+        assert!(named(crate::arch::ep_comm::EP_COMM_ANALYTIC_KIND).is_empty());
+        assert!(slots.iter().all(|slot| !slot.kind.starts_with("moe_ep_")));
+
+        // The lookups sit at the analytic model's busiest-rank rows.
+        let comm = cfgs.analytic.as_ref().unwrap();
+        let tokens = [40, 64, 8, 1, 1, 30, 64, 12];
+        let rows = comm.alltoall_rows(&tokens);
+        let step = comm.step(&tokens);
+        assert_eq!(rows.send, step.dispatch.max_send_rows);
+        assert_eq!(rows.recv, step.dispatch.max_recv_rows);
+        let inputs = MeasuredAlltoallInputs::new(&rows);
+        assert_eq!(inputs.prepare.tokens_per_rank, 64);
+        assert_eq!(inputs.dispatch.max_send_rows, rows.send.round() as u32);
+        assert_eq!(inputs.dispatch.max_recv_rows, rows.recv.round() as u32);
+        assert_eq!(inputs.combine.max_send_rows, inputs.dispatch.max_recv_rows);
+        assert_eq!(inputs.combine.max_recv_rows, inputs.dispatch.max_send_rows);
+        // 64 tokens reach ~5.3 of 8 ranks each; the busiest receiver gets at
+        // least the mean share of all 220 tokens.
+        assert!((330..=345).contains(&inputs.dispatch.max_send_rows));
+        assert!(inputs.dispatch.max_recv_rows >= (220.0 * comm.uniform_hit).floor() as u32);
+        // A lone token still moves whole rows; nothing moves nothing.
+        let one = MeasuredAlltoallInputs::new(&comm.alltoall_rows(&[1, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(one.dispatch.max_send_rows >= 1 && one.dispatch.max_recv_rows >= 1);
+        let none = MeasuredAlltoallInputs::new(&comm.alltoall_rows(&[0; 8]));
+        assert_eq!(
+            (
+                none.prepare.tokens_per_rank,
+                none.dispatch.max_send_rows,
+                none.dispatch.max_recv_rows
+            ),
+            (0, 0, 0)
+        );
+    }
+
     #[test]
     fn measured_exchange_stays_inside_the_profiled_groups() {
         let model = model_cfg("glm52_nvfp4");
-        // Measured all-to-all has no B200 rows.
-        let mut p = parallel(8);
-        p.ep_comm.kind = EpCommKind::Alltoall;
-        assert!(build_configs(&model, &p, &demand(), false).is_err());
+        // Measured all-to-all: EP8 rows only, inside one NVLink domain.
+        for (ep_size, nvl) in [(8_u16, 8_u16), (8, 72)] {
+            let p = measured_alltoall(ep_size, nvl);
+            assert!(build_configs(&model, &p, &demand(), false).is_ok());
+        }
+        for (ep_size, nvl) in [(4_u16, 4_u16), (16, 72), (64, 72), (8, 4)] {
+            let error = build_configs(&model, &measured_alltoall(ep_size, nvl), &demand(), false)
+                .err()
+                .unwrap_or_else(|| panic!("EP{ep_size} nvl {nvl} must fail"));
+            assert!(error.to_string().contains("ep_size"), "{error}");
+        }
         // Analytic: the group must divide the experts and fit the domain.
         for (ep_size, nvl) in [(1_u16, 72_u16), (3, 72), (96, 128), (64, 32)] {
             let p = analytic(ep_size, nvl, EpCommKind::Alltoall);

@@ -558,8 +558,8 @@ pub enum IterArchSel {
         #[param(string, default = "allgather_reducescatter", choices = EP_COMM_KINDS)]
         ep_comm: EpCommKind,
         /// `measured` (default; all-gather / reduce-scatter at EP 2, 4, 8 with
-        /// `nvl_num_gpu == ep_size`) or `analytic` (any `ep_size` dividing the
-        /// experts inside one `nvl_num_gpu` NVLink domain).
+        /// `nvl_num_gpu == ep_size`, all-to-all at EP8 only) or `analytic` (any
+        /// `ep_size` dividing the experts inside one `nvl_num_gpu` NVLink domain).
         #[serde(default)]
         #[param(string, default = "measured", choices = EP_COMM_MODELS)]
         ep_comm_model: EpCommModel,
@@ -797,8 +797,8 @@ pub enum IterArchSel {
         #[param(string, default = "allgather_reducescatter", choices = EP_COMM_KINDS)]
         ep_comm: EpCommKind,
         /// `measured` (default; all-gather / reduce-scatter at EP 2, 4, 8 with
-        /// `nvl_num_gpu == ep_size`) or `analytic` (any `ep_size` dividing the
-        /// experts inside one `nvl_num_gpu` NVLink domain).
+        /// `nvl_num_gpu == ep_size`, all-to-all at EP8 only) or `analytic` (any
+        /// `ep_size` dividing the experts inside one `nvl_num_gpu` NVLink domain).
         #[serde(default)]
         #[param(string, default = "measured", choices = EP_COMM_MODELS)]
         ep_comm_model: EpCommModel,

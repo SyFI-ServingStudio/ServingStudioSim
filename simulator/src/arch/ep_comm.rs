@@ -94,7 +94,8 @@ pub enum EpCommKind {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EpCommModel {
-    /// Profiled collectives (all-gather / reduce-scatter on 2, 4 or 8 GPUs).
+    /// Profiled collectives: all-gather / reduce-scatter on 2, 4 or 8 GPUs,
+    /// the MNNVL all-to-all on 8 (at this module's rows).
     #[default]
     Measured,
     /// This module's link model.
@@ -176,6 +177,18 @@ pub struct EpCommLeg {
     pub bytes: f64,
     pub latency_us: f64,
     pub time_us: f64,
+}
+
+/// The all-to-all's dispatch rows on the busiest rank (combine is the
+/// transpose).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AlltoallRows {
+    /// The busiest rank's tokens: vLLM sizes the prepare and the buffers by it.
+    pub busiest_tokens: u32,
+    /// Rows leaving the busiest sender, `max(t_r) D`.
+    pub send: f64,
+    /// Rows reaching the busiest receiver, `T p_max`.
+    pub recv: f64,
 }
 
 /// One sparse layer's analytic exchange, in eval order.
@@ -321,6 +334,24 @@ impl AnalyticEpComm {
         self.config.prepare_latency_us * growth
     }
 
+    /// The all-to-all's busiest-rank rows for one exchange of `tokens` (each
+    /// rank's rows, as [`Self::step`] takes them). The measured EP8 path looks
+    /// its `moe_alltoall` rows up at exactly these counts.
+    pub fn alltoall_rows(&self, tokens: &[u32]) -> AlltoallRows {
+        let total: f64 = tokens.iter().map(|&t| f64::from(t)).sum();
+        let busiest_tokens = tokens.iter().copied().max().unwrap_or(0);
+        if total == 0.0 {
+            return AlltoallRows::default();
+        }
+        let fanout = self.uniform_hit * f64::from(self.ep_size);
+        AlltoallRows {
+            busiest_tokens,
+            send: f64::from(busiest_tokens) * fanout,
+            // Never below the mean, `total D / N`: busiest_hit >= D / N.
+            recv: total * self.busiest_hit(total.round() as u32),
+        }
+    }
+
     /// One sparse layer's exchange; `tokens` are each rank's rows in the
     /// exchange (padded, with idle ranks' dummy token).
     pub fn step(&self, tokens: &[u32]) -> EpCommStep {
@@ -354,11 +385,11 @@ impl AnalyticEpComm {
                 }
             }
             EpCommKind::Alltoall => {
-                let busiest = tokens.iter().copied().max().unwrap_or(0);
-                let fanout = self.uniform_hit * f64::from(self.ep_size);
-                let send = f64::from(busiest) * fanout;
-                // Never below the mean, `total D / N`: busiest_hit >= D / N.
-                let recv = total * self.busiest_hit(total.round() as u32);
+                let AlltoallRows {
+                    busiest_tokens: busiest,
+                    send,
+                    recv,
+                } = self.alltoall_rows(tokens);
                 // Prepare: the per-token scan, then the ids and weights of
                 // every received row over the link.
                 let metadata = recv * f64::from(8 * self.top_k);
