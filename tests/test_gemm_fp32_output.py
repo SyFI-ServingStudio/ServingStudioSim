@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from profiling.db.args import DType
 from profiling.runners.exceptions import ProfilerNotImplemented
 from profiling.runners.gemm.gemm_fp32_output_torch_cublas import (
     _Launch,
@@ -91,3 +92,60 @@ def test_fp32_prepare_needs_highest_precision_and_caches_a_contiguous_weight() -
     launch = _prepare(fake_torch, shape)
     assert launch.fp32_input
     assert (launch.input_tensor, launch.weight_transposed) == ("input", "weight.T.contiguous()")
+
+
+def test_ll_bf16_backend_reuses_the_kind_schema_in_the_fork_env() -> None:
+    # The vllm.models.inkling module exists only in the alignment fork; any other env would
+    # fail every spec at import time.
+    from profiling.db.registry import find_kernel_profiler_spec
+    from profiling.kernels.gemm_fp32_output import GemmFp32OutputArgs
+
+    spec = find_kernel_profiler_spec("gemm_fp32_output", "vllm_ll_bf16_auto")
+    assert spec.args_schema is GemmFp32OutputArgs
+    assert spec.subprocess_env == "vllm_upstream_fork_env"
+    assert spec.supports.compute == frozenset({DType.BF16})
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error"),
+    [
+        ((8, 264, 4096, "fp32"), ProfilerNotImplemented),
+        ((0, 264, 4096, "bf16"), ValueError),
+        ((8, 264, 0, "bf16"), ValueError),
+    ],
+)
+def test_ll_bf16_rejects_unbuilt_dtype_and_empty_shapes(
+    arguments: tuple[object, ...], error
+) -> None:
+    # The production call casts nothing: an fp32 activation would silently take
+    # the cuBLAS branch at every m and mislabel it as the ll_bf16 path.
+    from profiling.runners.gemm.gemm_fp32_output_vllm_ll_bf16 import (
+        profile_gemm_fp32_output_vllm_ll_bf16,
+    )
+
+    with pytest.raises(error):
+        profile_gemm_fp32_output_vllm_ll_bf16(*arguments)
+
+
+def test_ll_bf16_rejects_the_cute_dsl_tier_without_cute_dsl(monkeypatch) -> None:
+    # The production call would run torch.mm at m <= 64 and the row would be a
+    # cuBLAS time under the ll_bf16 label.
+    import sys
+
+    from profiling.runners.gemm.gemm_fp32_output_vllm_ll_bf16 import (
+        profile_gemm_fp32_output_vllm_ll_bf16,
+    )
+
+    def unexpected_call(*_args):
+        raise AssertionError("the GEMM must not run")
+
+    fake_moe = SimpleNamespace(
+        _INKLING_LL_BF16_MAX_TOKENS=64,
+        _linear_with_fp32_out=unexpected_call,
+        current_platform=SimpleNamespace(has_device_capability=lambda capability: True),
+        ll_bf16=SimpleNamespace(is_available=lambda: False),
+    )
+    monkeypatch.setitem(sys.modules, "vllm.models.inkling.nvidia.moe", fake_moe)
+
+    with pytest.raises(ProfilerNotImplemented, match="cute-DSL"):
+        profile_gemm_fp32_output_vllm_ll_bf16(64, 264, 4096, "bf16")

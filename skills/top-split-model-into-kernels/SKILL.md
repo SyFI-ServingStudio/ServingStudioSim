@@ -53,9 +53,10 @@ The capture gives you the folded kernel sequence per engine phase: how many
 launches each region of the forward really issues, and each one's share of
 iteration time. It does not give you semantics — a demangled name and its
 `suggested_category` are hints, not proof, so keep reading the model source for
-what the math is. Without a capture, everything below still works; just record
-each granularity call as `inferred, unverified` so the reader knows which
-verdicts have not been checked against a real run.
+what the math is. Splitting without a capture needs the user's explicit
+confirmation (see `top-add-new-arch` Phase 0). With it, everything below still
+works; record each granularity call as `inferred, unverified` so the reader
+knows which verdicts have not been checked against a real run.
 
 ## Per-op investigation
 

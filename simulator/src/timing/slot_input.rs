@@ -37,13 +37,16 @@ use crate::timing::kernels::{
     MoeTopkSoftplusSqrtKernelInput, Mxfp4MarlinMoeGemmKernelInput, Nvfp4FusedMoeKernelInput,
     Nvfp4QuantKernelInput, P2pInterKernelInput, P2pIntraKernelInput,
     PackedKvCacheGatherKernelInput, QKvRmsNormKernelInput, QnormRopeKvInsertKernelInput,
-    ResidualRmsNormKernelInput, RmsNormKernelInput, SingleGemmKernelInput, VllmFusedMoeKernelInput,
+    RelBiasAttentionKernelInput, ResidualRmsNormKernelInput, RmsNormKernelInput,
+    RsSconvAgResidualRmsNormKernelInput, SingleGemmKernelInput, VllmFusedMoeKernelInput,
     VllmMlaRopeKernelInput,
 };
 
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
-use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
+use crate::timing::kernels::MoeSinkGateSelectKernelInput;
+use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
+use crate::timing::kernels::SconvQkvrPrepKernelInput;
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
 /// fan-out the attention op summed into one slot (many prefill requests fold to a
@@ -155,8 +158,11 @@ log_inputs! {
     CompressedSparseMlaRopeCast => CompressedSparseMlaRopeCastKernelInput,
     QPadKvRopeMxfp8Insert => QPadKvRopeMxfp8InsertKernelInput,
     EngramLookup => EngramLookupKernelInput,
+    SconvQkvrPrep => SconvQkvrPrepKernelInput,
     MoeTopkSoftplusSqrt => MoeTopkSoftplusSqrtKernelInput,
+    MoeSinkGateSelect => MoeSinkGateSelectKernelInput,
     GemmFp32Output => GemmFp32OutputKernelInput,
+    RelBiasAttention => RelBiasAttentionKernelInput,
     MlaRopeQuantizeFp8 => MlaRopeQuantizeFp8KernelInput,
     MoeFinalizeFuseShared => MoeFinalizeFuseSharedKernelInput,
     MhcRmsNorm => MhcRmsNormKernelInput,
@@ -184,6 +190,7 @@ log_inputs! {
     AllReduce   => AllReduceKernelInput,
     AllReduceFusion => AllReduceFusionKernelInput,
     AllReduceResidualRmsNorm => AllReduceResidualRmsNormKernelInput,
+    RsSconvAgResidualRmsNorm => RsSconvAgResidualRmsNormKernelInput,
     P2pIntra    => P2pIntraKernelInput,
     P2pInter    => P2pInterKernelInput,
 }

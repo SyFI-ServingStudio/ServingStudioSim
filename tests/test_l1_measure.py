@@ -186,6 +186,40 @@ def test_interval_union_duration_merges_overlap_but_preserves_gaps():
     assert interval_union_duration_ns(records) == 400
 
 
+def test_interval_union_capture_accepts_either_stream_starting_first():
+    # Defect caught: a two-stream callable (sconv_qkvr_prep's KV kernel on a
+    # side stream beside its q kernel) aborts the capture when the side
+    # stream's kernel happens to start first in a later launch.
+    from profiling.profilers import cupti_kernel_profiler as cupti
+
+    pattern = cupti._LaunchPattern(callable_kernel_names=("kv", "q"), clear_kernel_names=("clr",))
+    records = [
+        _record("kv", 0, 90, 0),
+        _record("q", 5, 50, 1),
+        _record("clr", 200, 10, 2),
+        _record("q", 300, 50, 3),
+        _record("kv", 302, 90, 4),
+    ]
+
+    class _Profiler:
+        def capture_once(self, fn, **_):
+            return records
+
+    kwargs = dict(
+        launches_per_run=2,
+        clear_l2_before_run=True,
+        clear_l2_between_launches=True,
+        kernel_name_contains=None,
+        launch_pattern=pattern,
+    )
+    per_launch, _, _ = cupti._capture_launch_unit(
+        _Profiler(), lambda: None, interval_union=True, **kwargs
+    )
+    assert per_launch == [90 / 1e6, 92 / 1e6]
+    with pytest.raises(RuntimeError, match="pattern changed"):
+        cupti._capture_launch_unit(_Profiler(), lambda: None, **kwargs)
+
+
 def test_split_launch_series_warm_layout():
     from profiling.profilers.cupti_kernel_profiler import _LaunchPattern, split_launch_series
 

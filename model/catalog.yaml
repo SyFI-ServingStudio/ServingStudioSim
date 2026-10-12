@@ -67,3 +67,11 @@ deepseek-ai/DeepSeek-V4.1-Flash:
   name: DeepSeek V4.1 Flash
   family: DeepSeek
   config: deepseek_v41_flash
+thinkingmachines/Inkling-NVFP4:
+  name: Inkling NVFP4
+  family: Inkling
+  config: inkling_nvfp4
+thinkingmachines/Inkling-Small-NVFP4:
+  name: Inkling Small NVFP4
+  family: Inkling
+  config: inkling_small_nvfp4

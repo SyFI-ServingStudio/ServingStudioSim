@@ -18,6 +18,8 @@ pub mod glm52_vllm_nvfp4_pp_dsa_moe;
 pub mod glm53_flash_vllm_fp8_dp_attn_ep_moe;
 pub mod glm53_flash_vllm_fp8_kda_dsa_moe;
 pub mod glm53_flash_vllm_fp8_pp_kda_dsa_moe;
+pub mod inkling_model_cfg;
+pub mod inkling_vllm_nvfp4_rel_attn_moe;
 pub mod glm53_vllm_nvfp4_dsa_moe_dflash2;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;
@@ -75,6 +77,11 @@ pub use glm53_flash_vllm_fp8_pp_kda_dsa_moe::{
 };
 pub use glm53_vllm_nvfp4_dsa_moe_dflash2::{
     Dflash2DraftResolved, Glm53VllmNvfp4DsaMoeDflash2Model,
+};
+pub use inkling_model_cfg::{InklingExpertPrecision, InklingModelCfg};
+pub use inkling_vllm_nvfp4_rel_attn_moe::{
+    InklingExpertDemand, InklingVllmConfigs, InklingVllmModel, InklingVllmParallel,
+    InklingVllmResolved,
 };
 pub use llama3_dense::{DenseParallel, Llama3DenseModel};
 pub use llama3_dense_tp::{DenseTpParallel, Llama3DenseTpModel};

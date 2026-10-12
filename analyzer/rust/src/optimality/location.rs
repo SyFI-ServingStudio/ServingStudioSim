@@ -605,6 +605,8 @@ mod tests {
             balanced: 10_000.0,
             per_config_best: 9_000.0,
             ignore_network: 9_000.0,
+            sustained_limit: 8_700.0,
+            achievable_limit: 8_500.0,
             hardware_limit: 8_000.0,
         };
         let mut ladder = KernelLadder::worker(
@@ -615,7 +617,9 @@ mod tests {
                 name: "unified.fused".to_string(),
                 kind: "single_gemm".to_string(),
                 is_comm: false,
-                rungs: KernelRungs::from_gpu_ms([10_000.0, 9_000.0, 9_000.0, 8_000.0]),
+                rungs: KernelRungs::from_gpu_ms([
+                    10_000.0, 9_000.0, 9_000.0, 8_700.0, 8_500.0, 8_000.0,
+                ]),
                 necessary_work: None,
             }],
         );

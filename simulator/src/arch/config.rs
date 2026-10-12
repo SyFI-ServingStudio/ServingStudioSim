@@ -994,6 +994,55 @@ pub enum IterArchSel {
         #[param(cache_key)]
         token_corpus_file: Option<String>,
     },
+    /// Inkling's ModelOpt NVFP4 checkpoints (`thinkingmachines/Inkling-NVFP4`,
+    /// `Inkling-Small-NVFP4`) under the vLLM fork's TP group: TP attention,
+    /// dense FFN and sink experts, replicated router, routed experts EP = TP
+    /// or MoE TP, and every sublayer closed by the Lamport RS + sconv + AG +
+    /// norm call.
+    InklingVllmNvfp4RelAttnMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count (at least 2: the Lamport boundary).
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// vLLM `--enable-expert-parallel`. On, each rank owns
+        /// `n_routed_experts / tp_size` whole experts (EP = TP). Off, each rank
+        /// owns every expert, sliced on the intermediate axis (MoE TP).
+        #[serde(default = "default_glm53_flash_enable_expert_parallel")]
+        #[param(default = true, cache_key)]
+        enable_expert_parallel: bool,
+        /// Configured context cap: the global layers' FA4 split count. It is
+        /// also part of every attention layer's kernel config, local layers
+        /// included (their context axis stops at it), and each request's
+        /// context is validated against it.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Its layer axis is the
+        /// MoE layers; the BF16-expert layers and the NVFP4 ones each fold
+        /// their own slice.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. Every kernel but attention runs
+        /// on the token count padded up to the next captured size; attention
+        /// on a uniform-decode step runs at the padded request count. The
+        /// sizes also decide whether the sink experts overlap the routed call
+        /// (FULL-graph decode or eager steps only). Empty: no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
 }
 
 impl IterArchSel {
@@ -1023,7 +1072,8 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4KdaDsaMoe { model, .. }
             | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { model, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { model, .. }
-            | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
+            | Self::Glm52SglangNvfp4TpDsaMoe { model, .. }
+            | Self::InklingVllmNvfp4RelAttnMoe { model, .. } => model,
         }
     }
 
@@ -1044,7 +1094,8 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4KdaDsaMoe { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { max_model_len, .. }
-            | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. } => Ok(*max_model_len),
+            | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. }
+            | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. } => Ok(*max_model_len),
             Self::DeepseekV41Vllm {
                 model,
                 max_model_len,

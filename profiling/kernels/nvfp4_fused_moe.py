@@ -225,6 +225,39 @@ register(
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
+        backend="flashinfer_trtllm_routed_sm100_fork",
+        # The routed call above, run in the alignment vLLM checkout's own venv
+        # (vllm_upstream_fork_env). That checkout's FlashInfer is newer than the
+        # pinned vllm_env image's, and its trtllm-gen cubins and autotuner pick
+        # different tactics at large token counts, so a deployment served from
+        # the checkout measures against this backend.
+        supports=BackendSupport(
+            compute=frozenset({DType.NVFP4_E2M1}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.nvfp4_fused_moe",
+            function_name="profile_nvfp4_fused_moe_routed_sm100",
+        ),
+        table_name=KIND,
+        args_schema=Nvfp4FusedMoeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "flashinfer_trtllm_routed_sm100's trtllm_fp4_block_scale_routed_moe "
+                "call, measured with the alignment vLLM checkout's FlashInfer "
+                "instead of the pinned profiler image's."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py",
+        ),
+        subprocess_env="vllm_upstream_fork_env",
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
         backend="flashinfer_trtllm_sm100_deferred_finalize",
         # Same SM10x TRT-LLM-gen cubins as flashinfer_trtllm_sm100.
         supports=BackendSupport(

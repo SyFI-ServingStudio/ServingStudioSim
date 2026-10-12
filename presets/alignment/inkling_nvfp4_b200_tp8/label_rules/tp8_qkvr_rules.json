@@ -1,0 +1,98 @@
+{
+ "schema_version": 1,
+ "note": "Inkling-NVFP4 TP8/EP8 additions: QKVR GEMM positions the Small TP4 rules miss (prefix-end layer-0 GEMM, q/rel-stream GEMM before _q_kernel, split-K reduces).",
+ "rules": [
+  {
+   "operation": "attn.qkvr_proj",
+   "type": "attention",
+   "role": "fused QKV + relative-position projection GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "attn.qkvr_proj"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261009_1_inkling_nvfp4_tp8_campaign (cases 01-15, Slurm jobs 5273-5292)",
+   "name": "nvjet_sm100",
+   "after": "prologue.log_scaling_tau",
+   "note": "Layer-0 QKVR GEMM, the first GEMM after log_scaling_tau. When the layers fold into a repeat body that starts at _kv_kernel, this GEMM ends the prefix and has no before_name neighbour. Mapped nvjet after log_scaling_tau: 212/212 qkvr_proj."
+  },
+  {
+   "operation": "attn.qkvr_proj",
+   "type": "attention",
+   "role": "fused QKV + relative-position projection GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "attn.qkvr_proj"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261009_1_inkling_nvfp4_tp8_campaign (cases 01-15, Slurm jobs 5273-5292)",
+   "name": "nvjet_sm100",
+   "after": "ffn.rs_sconv_ag_norm",
+   "note": "QKVR GEMM of the layer after a dense FFN layer (it follows the FFN's RS/sconv/AG norm). Mapped nvjet after ffn.rs_sconv_ag_norm: 212/212 qkvr_proj."
+  },
+  {
+   "operation": "attn.qkvr_proj",
+   "type": "attention",
+   "role": "fused QKV + relative-position projection GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "attn.qkvr_proj"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261009_1_inkling_nvfp4_tp8_campaign (cases 01-15, Slurm jobs 5273-5292)",
+   "name": "nvjet_sm100",
+   "after": "moe.rs_sconv_ag_norm",
+   "note": "QKVR GEMM of the layer after a MoE layer. Mapped nvjet after moe.rs_sconv_ag_norm: 1176/1176 qkvr_proj."
+  },
+  {
+   "operation": "attn.qkvr_proj",
+   "type": "attention",
+   "role": "fused QKV + relative-position projection GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "attn.qkvr_proj"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261009_1_inkling_nvfp4_tp8_campaign (cases 01-15, Slurm jobs 5273-5292)",
+   "name": "nvjet_sm100",
+   "before_name": "_q_kernel",
+   "note": "QKVR GEMM launched on the q/rel stream: at some TP8 batch sizes vLLM issues it on the concurrent track, right before _q_kernel."
+  },
+  {
+   "operation": "attn.qkvr_proj",
+   "type": "attention",
+   "role": "fused QKV + relative-position projection GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "attn.qkvr_proj"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261009_1_inkling_nvfp4_tp8_campaign (cases 01-15, Slurm jobs 5273-5292)",
+   "name": "splitKreduce_kernel",
+   "before_name": "_q_kernel",
+   "note": "QKVR split-K reduce on the q/rel stream, right before _q_kernel."
+  },
+  {
+   "operation": "attn.qkvr_proj",
+   "type": "attention",
+   "role": "fused QKV + relative-position projection GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "attn.qkvr_proj"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261009_1_inkling_nvfp4_tp8_campaign (cases 01-15, Slurm jobs 5273-5292)",
+   "name": "splitKreduce_kernel",
+   "before_name": "_kv_kernel",
+   "note": "QKVR split-K reduce right before _kv_kernel (TP8 picks split-K at small T)."
+  },
+  {
+   "operation": "attn.qkvr_proj",
+   "type": "attention",
+   "role": "fused QKV + relative-position projection GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "attn.qkvr_proj"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261009_1_inkling_nvfp4_tp8_campaign (cases 01-15, Slurm jobs 5273-5292)",
+   "name": "splitKreduce_kernel",
+   "after": "attn.qkvr_proj",
+   "before_name": "<none>",
+   "note": "QKVR split-K reduce that ends a folded body: its GEMM is the last mapped kernel before it and nothing follows."
+  }
+ ]
+}

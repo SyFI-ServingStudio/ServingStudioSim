@@ -2267,3 +2267,35 @@ def test_a_multi_preset_batch_rejects_presets_with_the_same_file_name(
     argv = [str(tmp_path / "a" / "preset.json"), str(tmp_path / "b" / "preset.json"), "--dry-run"]
     assert main_module.main(argv) == 2
     assert "distinct file names" in capsys.readouterr().err
+
+
+def test_parallelism_flag_caps_the_sweep_and_rejects_zero(tmp_path, schema, monkeypatch, capsys):
+    """`--parallelism` must reach run_sweep, its absence must keep run_sweep's
+    default, and a zero cap (a sweep that never starts) must be refused."""
+    import launcher.exec as exec_module
+    import launcher.sweep as sweep_module
+    from launcher import __main__ as main_module
+
+    preset = tmp_path / "p.json"
+    preset.write_text(
+        json.dumps(
+            _base(
+                arch={"type": "llama3_dense_tp", "tp_size": "${ptp}", "model_config": "m.json"},
+                sweep={"ptp": [1, 2]},
+                log_dir=str(tmp_path / "exp" / "tp{ptp}"),
+            )
+        )
+    )
+    calls = []
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
+    monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
+    monkeypatch.setattr(sweep_module, "run_sweep", lambda *a, **k: calls.append(k) or 0)
+
+    assert main_module.main([str(preset), "--parallelism", "4"]) == 0
+    assert main_module.main([str(preset)]) == 0
+    assert calls[0]["parallelism"] == 4
+    assert "parallelism" not in calls[1]
+
+    with pytest.raises(SystemExit):
+        main_module.main([str(preset), "--parallelism", "0"])
+    assert "must be at least 1" in capsys.readouterr().err

@@ -194,7 +194,15 @@
       "interconnect": "NVLink 4.0",
       "interconnect_bandwidth_gbps": 900,
       "nvl_domain_size": 8,
-      "dollar_per_hour": 4.33
+      "dollar_per_hour": 4.33,
+      "sustained": {
+        "tflops": {
+          "bf16": 694,
+          "fp16": 104,
+          "fp8_e4m3": 1090
+        },
+        "copy_gbps": 4307
+      }
     },
     {
       "name": "B200-SXM-180GB",
@@ -220,7 +228,15 @@
       "interconnect": "NVLink 5.0",
       "interconnect_bandwidth_gbps": 1800,
       "nvl_domain_size": 8,
-      "dollar_per_hour": 6.73
+      "dollar_per_hour": 6.73,
+      "sustained": {
+        "tflops": {
+          "bf16": 1403,
+          "fp8_e4m3": 2526,
+          "nvfp4_e2m1": 5395
+        },
+        "copy_gbps": 6943
+      }
     },
     {
       "name": "B300-SXM-288GB",

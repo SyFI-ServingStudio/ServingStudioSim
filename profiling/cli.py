@@ -158,6 +158,14 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
         action="store_false",
         help="Warm continuous window (no per-launch L2 displacement); reveals power/clock drift.",
     )
+    measure_parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help=(
+            "Replay the kernel from a CUDA graph so host dispatch leaves no gaps; with "
+            "--no-clear-l2 the window runs back to back at the sustained power limit."
+        ),
+    )
     measure_energy = measure_parser.add_mutually_exclusive_group()
     measure_energy.add_argument(
         "--energy",
@@ -560,6 +568,7 @@ def _cmd_measure(args: argparse.Namespace) -> int:
             telemetry_hz=args.telemetry_hz,
             telemetry=args.telemetry,
             clear_l2=args.clear_l2,
+            cuda_graph=args.cuda_graph,
         )
         runner_error = result.get("runner_error")
         if runner_error:

@@ -354,7 +354,7 @@ python -m launcher kernel-profile list [--json]
 python -m launcher kernel-profile query         <table> --backend <b> [--spec '{...}'] [--specs file] [--gpu-name N] [--db path]
 python -m launcher kernel-profile count-missing <table> --backend <b> ...
 python -m launcher kernel-profile run           <table> --backend <b> [--force | --fresh] ...
-python -m launcher kernel-profile measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2]
+python -m launcher kernel-profile measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2] [--cuda-graph]
 python -m launcher kernel-profile merge-db LEFT.db RIGHT.db --output MERGED.db [--report REPORT.json]
 python -m launcher kernel-profile migrate-db profile.db
 python -m launcher kernel-profile audit-provenance [--db profile.db] [--json]
@@ -426,4 +426,8 @@ for this verb (see `profilers/measure_context.py`, `profilers/trend.py`) — **n
 runner changes**, and the guard is inert for every other call. `--no-clear-l2`
 switches from the default cold per-launch L2-displacement (matching the `profile.db`
 measurement) to a warm continuous window that surfaces sustained power/clock drift.
+`--cuda-graph` replays the kernel from a CUDA graph so host dispatch leaves no gap
+between launches; with `--no-clear-l2` the GPU then runs it back to back, as a
+graph-captured serving step does, and settles at its power-limited clock
+(`gpu/measure_sustained.py` uses this for the `sustained` rates in `gpu/spec.json`).
 Kernels whose runner does not time through `Timer.cupti` (e.g. comm) are rejected.

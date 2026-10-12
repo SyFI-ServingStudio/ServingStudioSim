@@ -113,6 +113,9 @@ models/qwen3_6.py    hybrid [GDN×3, GQA×1] + dense    registry.py  architectur
 models/glm52.py      dense/full-index + sparse/index-share stacks + shared MoE
 attention/deepseek_v41.py  DeepSeek-V4.1 window + compressed sparse attention
 models/deepseek_v41.py     10 role stacks + MXFP4 MoE + FP32 mHC mixing + engram
+attention/inkling_rel.py   Inkling relative-position SWA/global attention + K/V short conv
+mixers/short_conv.py       sublayer-output short convolutions + their norms (Inkling)
+models/inkling.py          local/global x dense/BF16/NVFP4-expert stacks + sink-expert MoE
 ```
 
 - **New attention (MLA/SWA/SSM)** → one new `attention/*.py`; every FFN combination is free.
@@ -179,6 +182,22 @@ analyzer sends one summed interaction per phase, so this spec reconstructs a
 mean request per phase: exact for a single request, an over-estimate of the
 sparse-attention floor when a batch straddles the window/top-k caps. The DSpark
 MTP layers and the vision tower are not labeled.
+
+Inkling (`InklingForConditionalGeneration`, text decoder only) mixes 512-key
+sliding-window layers with global layers. Every query also adds a learned
+relative logit per head and distance (`d_rel x E` table; `E` is the window on
+local layers, `rel_extent` on global ones): only distances a query can reach are
+necessary, so those FLOPs are `2*H*d_rel*sum_q min(pos_q + 1, E)`. A depthwise
+4-tap short convolution runs on K, on V, and on each sublayer output; its
+persistent state is the last `W - 1` inputs per stream, so a request reads
+`min(prefix, 3)` and writes `min(append, 3)` rows. A local layer's KV cache keeps
+only `min(append, 511)` new tokens. The two always-on sink experts are the MoE's
+shared expert, and the router scores all 258 experts. The checkpoint's tables
+hold 201,024 rows for a 200,058-token vocabulary (`Model.param_vocab`): the padding
+counts as parameters only. Text-path parameters reconcile exactly with both
+checkpoints' safetensors headers (263,655,199,274 Small, 947,025,564,226 large).
+The arch opts into per-request decode geometry, because the window, the extent and
+the short-conv states make the minimum non-linear in context.
 
 ## Modality-agnostic workload
 

@@ -8,11 +8,13 @@ description: >-
   one criterion running through the timing layers is the
   timing-prediction wiring — where each element's timing comes from: L1 is the
   only layer that MEASURES a number (profile.db); L2/L3/L4 only COMPOSE measured
-  L1 timings. Adding an arch is paired with alignment by default: unless the user
-  declines, capture a real vLLM/SGLang run first and let the measured kernel
-  inventory — not source-reading guesswork — decide which kernels to add, largest
-  first. This is a routing/sequencing skill; it delegates each phase to a lower
-  skill and does not implement leaves itself.
+  L1 timings. Adding an arch is paired with alignment: capture a real
+  vLLM/SGLang run first and let the measured kernel inventory — not
+  source-reading guesswork — decide which kernels to add, largest first. Skipping
+  the capture requires the user's explicit confirmation. This is a
+  routing/sequencing skill; it delegates each phase to a lower skill and does not
+  implement leaves itself. Landing the finished model on main is
+  dev-finalize-model-addition.
 ---
 
 # Top Add New Arch
@@ -46,11 +48,12 @@ build bottom-up, and at each element ask "measure it, or wire it from below?"
 
 ## Phase 0 — Capture the real kernel sequence first
 
-**Run this before Phase 1 unless the user declines.** Nearly every architecture
-worth adding already runs in vLLM or SGLang, so the kernels you are about to
-model can be watched instead of inferred. A capture answers two questions no
-amount of source reading answers reliably: **which math is really one fused
-launch**, and **which launches are big enough to matter**.
+**Run this before Phase 1.** Nearly every architecture worth adding already runs
+in vLLM or SGLang, so the kernels you are about to model can be watched instead
+of inferred. A capture answers two questions no amount of source reading answers
+reliably: **which math is really one fused launch**, and **which launches are big
+enough to matter**. Without them, every kernel gets the same effort and the
+fusion guesses stay untested until Phase 5.
 
 It can run this early because the profile phase stands alone — it needs only the
 real engine running the checkpoint, not any ServingStudio Sim code. (Only the
@@ -77,11 +80,16 @@ needs the arch you have not written yet.)
   launch edges are and which ones are large; `dev-lookup-transformers-model`
   still tells you what each one computes.
 
-If the user declines, or the model has no vLLM/SGLang implementation, or there is
-no GPU or checkpoint: Phase 1's source-reading path still works, but mark every
-granularity verdict `inferred, unverified` in the decision table and say plainly
-what that costs — Phase 5 becomes the first and only place those guesses are
-tested, and a fusion edge found wrong there is a rebuild of L1/L2, not a retune.
+Missing prerequisites — weights not yet downloaded, an engine environment not
+yet installed, a GPU allocation still queued — are setup work for this phase,
+not reasons to skip it.
+
+**Skipping the capture requires the user's explicit confirmation.** If it truly
+cannot run, ask the user, stating the blocker and what skipping costs; do not
+decide it yourself. With that confirmation, Phase 1's source-reading path still
+works, but mark every granularity verdict `inferred, unverified` in the decision
+table — Phase 5 becomes the first and only place those guesses are tested, and a
+fusion edge found wrong there is a rebuild of L1/L2, not a retune.
 
 ## Phase 1 — Explore & split against the capture
 
@@ -116,12 +124,12 @@ Build in strict bottom-up order; each layer only wires the layer below.
 - **L1 — kernels (get the timing), largest first.** For each *new dedicated
   kernel* verdict, run `top-add-kernel` (Python profiling + Rust timing/cache).
   Reuse / elementwise / fold verdicts need no new L1. Done when `profile.db` has
-  the rows and the Rust cache resolves.
+  the rows and the Rust cache resolves. Scale each kernel's cache-fidelity
+  effort to its measured share (`impl-validate-kernel-cache`).
 
-  Work the Phase 1 table top-down, biggest measured share first. Everything below
-  your current line already has a home — an `elementwise` placeholder or a fold —
-  so the arch is complete and runnable at every point in the build; descending the
-  table improves precision, not coverage.
+  Work the Phase 1 table top-down, biggest measured share first. Ops you do not
+  build keep their Phase 1 home, an `elementwise` placeholder or a fold, so L1
+  can stop before the end of the table without leaving a gap.
 
   Not forward order. Iteration time is dominated by a handful of kernels, so error
   retires fastest at the top of the table: a placeholder standing in for a 0.5% op
@@ -129,14 +137,16 @@ Build in strict bottom-up order; each layer only wires the layer below.
   Building embed → norm → QKV → … in forward order spends the expensive
   `top-add-kernel` budget on ops that cannot move the number.
 
-  Stop rule: after each new kernel, re-run Phase 5's checks and watch the
-  deviation drop. Promote the next placeholder only while its remaining share
-  justifies it — a placeholder the comparison already shows is close is a finished
-  answer, not a debt.
+  Stop rule: choose the set to build from the measured shares before starting,
+  and leave the rest as placeholders. L1 is done when every kernel in the set has
+  `profile.db` rows and a resolving Rust cache; only then move to L2. Do not
+  start L2 while L1 work is still open. After Phase 5, its comparison ranks which
+  placeholder to promote next; that starts a new L1 round, followed by the L2–L4
+  rewiring it needs.
 
   The stop rule picks *which* kernels to build, not the order you build them in.
-  Once several have cleared it, hand them to `top-add-kernel` as one set and let
-  it fan out — see its "Several kernels at once".
+  Hand the chosen set to `top-add-kernel` together and let it fan out — see its
+  "Several kernels at once".
 - **L2 — ops (sum + normalize).** Compose kernels into named ops: atomic
   (`Op<K>`, one kernel, naming only) or compound (hand-written, multi-kernel +
   op normalization). Boundary — a fixed 0-overlap sequence; comm merges into the
@@ -256,5 +266,6 @@ or a deviation from the design docs — rather than deciding it silently. The bu
 is complete only when every element from the Phase 1 table has a home at its
 correct layer, the arch is wired (Phase 3), `model.work` support and the intended
 deployment maps are complete (Phase 4), and the Phase 5 checks pass — including,
-unless the user declined Phase 0, a Check 1 comparison with no missing large
-kernel and every material deviation attributed.
+unless the user explicitly declined Phase 0, a Check 1 comparison with no
+missing large kernel and every material deviation attributed. To publish and
+merge the finished model, continue with `dev-finalize-model-addition`.

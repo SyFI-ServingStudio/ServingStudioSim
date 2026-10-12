@@ -41,6 +41,10 @@ pub struct ResolvedGpu {
     pub int8_tops: Option<f64>,
     pub interconnect: Option<String>,
     pub interconnect_bandwidth_gbps: Option<f64>,
+    /// Measured back-to-back rates (`gpu/measure_sustained.py`): GEMM TFLOP/s by
+    /// dtype string and large-copy GB/s. Empty / `None` when not measured.
+    pub sustained_tflops: Vec<(String, f64)>,
+    pub sustained_copy_gbps: Option<f64>,
 }
 
 impl ResolvedGpu {
@@ -126,5 +130,13 @@ fn match_gpu(gpu: &Value, target: &str) -> Option<ResolvedGpu> {
             .and_then(Value::as_str)
             .map(str::to_owned),
         interconnect_bandwidth_gbps: num("interconnect_bandwidth_gbps"),
+        sustained_tflops: gpu
+            .pointer("/sustained/tflops")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter_map(|(dtype, tflops)| Some((dtype.clone(), tflops.as_f64()?)))
+            .collect(),
+        sustained_copy_gbps: gpu.pointer("/sustained/copy_gbps").and_then(Value::as_f64),
     })
 }
