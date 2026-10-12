@@ -10,6 +10,7 @@ use super::{AdmissionCandidate, PendingOrderPolicy};
 pub struct FifoOrder {
     queue: VecDeque<AdmissionCandidate>,
     queued_kv_tokens: u64,
+    queued_prompt_tokens: u64,
 }
 
 impl FifoOrder {
@@ -24,12 +25,14 @@ impl PendingOrderPolicy for FifoOrder {
     #[inline]
     fn push(&mut self, candidate: AdmissionCandidate, _context: &mut Self::Context) {
         self.queued_kv_tokens += candidate.queued_kv_tokens();
+        self.queued_prompt_tokens += u64::from(candidate.fresh_prompt_tokens);
         self.queue.push_back(candidate);
     }
 
     #[inline]
     fn push_front(&mut self, candidate: AdmissionCandidate, _context: &mut Self::Context) {
         self.queued_kv_tokens += candidate.queued_kv_tokens();
+        self.queued_prompt_tokens += u64::from(candidate.fresh_prompt_tokens);
         self.queue.push_front(candidate);
     }
 
@@ -42,6 +45,7 @@ impl PendingOrderPolicy for FifoOrder {
     fn pop(&mut self, _context: &mut Self::Context) -> Option<AdmissionCandidate> {
         let candidate = self.queue.pop_front()?;
         self.queued_kv_tokens -= candidate.queued_kv_tokens();
+        self.queued_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
         Some(candidate)
     }
 
@@ -55,6 +59,7 @@ impl PendingOrderPolicy for FifoOrder {
             .remove(position)
             .expect("position came from the same FIFO");
         self.queued_kv_tokens -= candidate.queued_kv_tokens();
+        self.queued_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
         Some(candidate)
     }
 
@@ -73,6 +78,11 @@ impl PendingOrderPolicy for FifoOrder {
     #[inline]
     fn queued_kv_tokens(&self) -> u64 {
         self.queued_kv_tokens
+    }
+
+    #[inline]
+    fn queued_prompt_tokens(&self) -> u64 {
+        self.queued_prompt_tokens
     }
 }
 
@@ -106,8 +116,10 @@ mod tests {
 
         assert_eq!(policy.peek().unwrap().request_id, RequestId(0));
         assert_eq!(policy.queued_kv_tokens(), 17);
+        assert_eq!(policy.queued_prompt_tokens(), 14);
         assert_eq!(policy.pop(&mut ()).unwrap().request_id, RequestId(0));
         assert_eq!(policy.queued_kv_tokens(), 5);
+        assert_eq!(policy.queued_prompt_tokens(), 4);
     }
 
     #[test]
@@ -122,5 +134,6 @@ mod tests {
         );
         assert!(!policy.contains(RequestId(1)));
         assert_eq!(policy.queued_kv_tokens(), 12);
+        assert_eq!(policy.queued_prompt_tokens(), 10);
     }
 }

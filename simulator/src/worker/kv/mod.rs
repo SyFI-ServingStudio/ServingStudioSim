@@ -18,6 +18,8 @@ pub use full_attn::{FullAttnKv, HostKvTier};
 pub use hybrid_gdn::HybridGdnKv;
 pub(crate) use shared::prefix_cache::PrefixCacheTokenConfig;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
+pub use shared::prefix_tiers::PrefixTierSpec;
+pub(crate) use shared::prefix_tiers::{PrefixTierHit, PrefixTiers};
 
 /// KV-owned runtime facts for one request's prefill on one partition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -191,6 +193,34 @@ pub trait PrefixKv: KvStore {
     fn resolved_prefill_context(&self, request: RequestId) -> ResolvedPrefillContext;
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time);
 
+    /// Put `tokens` of `session_id`'s context into the retained tier, as a
+    /// read from a slower tier or a decode run elsewhere hands them back. It
+    /// replaces the session's entry and is clamped to the slack like any
+    /// retention.
+    fn restore_prefix(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session_id: u32,
+        tokens: u64,
+        now: Time,
+    );
+
+    /// Hold `footprint` for a request whose prefix a slower tier is reading
+    /// back. vLLM allocates an async load's blocks when the load starts and
+    /// keeps them for the whole transfer, so a read in flight counts against
+    /// [`KvStore::fits`] and pushes retained prefixes out like a reservation.
+    fn hold_for_read(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        footprint: &Self::Footprint,
+        now: Time,
+    );
+
+    /// Drop a read's hold, if it has one.
+    fn release_read_hold(&mut self, request: RequestId);
+
     /// How much of `session_input`'s declared prefix is resident *right now*,
     /// wherever it lives. This is what a cache-aware pending order ranks by;
     /// `declared_prefix_tokens` is only its upper bound. A session with no
@@ -298,6 +328,8 @@ pub trait IterWorkerKv: KvStore {
     /// have reserved (retained prefix KV is reclaimable, so it does not count),
     /// the analogue of vLLM's per-engine `kv_cache_usage`.
     fn kv_usage(&self, partition: PartitionId) -> f64;
+    /// The partition's static KV token budget, the denominator of [`Self::kv_usage`].
+    fn kv_capacity_tokens(&self, partition: PartitionId) -> u64;
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId>;
 
     /// Static-dispatch iteration over this iteration's fresh prefills.

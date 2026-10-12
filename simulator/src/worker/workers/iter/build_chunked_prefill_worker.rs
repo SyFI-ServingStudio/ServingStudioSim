@@ -91,6 +91,8 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         (1, _) => LoadBalance::Single,
         (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },
         (_, DpPlacement::VllmLeastLoaded) => LoadBalance::LeastLoaded { next: 0 },
+        (_, DpPlacement::KvLeastLoaded) => LoadBalance::KvLeastLoaded { next: 0 },
+        (_, DpPlacement::KvFitLeastLoaded) => LoadBalance::KvFitLeastLoaded { next: 0 },
     };
     let admission = ChunkedPrefillAdmission::new(
         (0..num_partitions)
@@ -101,6 +103,24 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         config.kv_admission,
         balance,
     );
+    let admission = match config.long_prefill_token_threshold {
+        Some(threshold) => admission.with_long_prefill_threshold(threshold),
+        None => admission,
+    };
+    let admission = if config.force_schedule_after_ms > 0.0 {
+        admission.with_force_after(config.force_schedule_after_ms)
+    } else {
+        admission
+    };
+    let admission = match config.load_budget {
+        Some(budget) => admission.with_load_budget(budget),
+        None => admission,
+    };
+    let admission = if config.srpt {
+        admission.with_srpt()
+    } else {
+        admission
+    };
 
     IterBatchWorker::from_components(
         essentials.context,

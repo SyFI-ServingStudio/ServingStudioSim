@@ -38,6 +38,9 @@
 //! per-snapshot charge, so a retained prefix pays for the snapshots that make it
 //! resumable.
 //!
+//! [`HybridGdnKv::with_exact_prefix_reuse`] leaves that engine limitation out:
+//! a retained entry keeps the state at its end and resumes at any token.
+//!
 //! ## Not modeled
 //!
 //! Live snapshots yield to admission but are never *proactively* shed: there is
@@ -264,6 +267,10 @@ impl IterWorkerKv for HybridGdnKv {
         used as f64 / partition_state.capacity_tokens().max(1) as f64
     }
 
+    fn kv_capacity_tokens(&self, partition: PartitionId) -> u64 {
+        self.partitions[partition as usize].capacity_tokens()
+    }
+
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId> {
         let Some(partition) = self.ledger.forget_placement(request) else {
             self.ledger.take_held(request);
@@ -400,6 +407,50 @@ impl PrefixKv for HybridGdnKv {
         self.ledger
             .prefill_context(request)
             .expect("resolved prefill context must exist for an admitted fresh request")
+    }
+
+    fn hold_for_read(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        footprint: &Self::Footprint,
+        now: Time,
+    ) {
+        self.ledger
+            .hold(request, partition, footprint.reserved_charge());
+        for eviction in self.trim_prefix_cache_to_physical_slack(partition) {
+            self.journal.record_mutation(
+                request,
+                partition,
+                now,
+                eviction,
+                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ActiveKvPressure),
+                0,
+            );
+        }
+    }
+
+    fn release_read_hold(&mut self, request: RequestId) {
+        self.ledger.take_held(request);
+    }
+
+    fn restore_prefix(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session_id: u32,
+        tokens: u64,
+        now: Time,
+    ) {
+        self.retain_prefix(
+            request,
+            partition,
+            session_id,
+            tokens,
+            None,
+            now,
+            PrefixCacheRetentionReason::Restore,
+        );
     }
 
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time) {
@@ -621,6 +672,21 @@ impl HybridGdnKv {
             state_tokens_per_request,
             checkpoint_interval_tokens,
         }
+    }
+
+    /// Exact prefix reuse, the engine vLLM's `align` mode works around: a
+    /// retained session keeps its context and the state at its end, so a hit
+    /// resumes at any token instead of the last checkpoint, and costs one state
+    /// instead of one per checkpoint. Live decodes then leave no snapshots
+    /// behind either.
+    pub(crate) fn with_exact_prefix_reuse(mut self) -> Self {
+        let state_tokens = self.state_tokens_per_request;
+        self.prefix_caches = std::mem::take(&mut self.prefix_caches)
+            .into_iter()
+            .map(|cache| cache.with_entry_charge(state_tokens))
+            .collect();
+        self.checkpoint_interval_tokens = 0;
+        self
     }
 
     /// Hard-tier occupancy: whichever of the immediate and the projected total

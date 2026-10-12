@@ -194,6 +194,10 @@ impl IterWorkerKv for FullAttnKv {
         }
     }
 
+    fn kv_capacity_tokens(&self, partition: PartitionId) -> u64 {
+        self.partitions[partition as usize].capacity_tokens()
+    }
+
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId> {
         FullAttnKv::release_external(self, request, current_kv)
     }
@@ -461,6 +465,50 @@ impl PrefixKv for FullAttnKv {
         self.ledger
             .prefill_context(request)
             .expect("resolved prefill context must exist for an admitted fresh request")
+    }
+
+    fn hold_for_read(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        footprint: &Self::Footprint,
+        now: Time,
+    ) {
+        self.ledger
+            .hold(request, partition, footprint.reserved_tokens());
+        for eviction in self.trim_prefix_cache_to_physical_slack(partition) {
+            self.journal.record_mutation(
+                request,
+                partition,
+                now,
+                eviction,
+                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ActiveKvPressure),
+                0,
+            );
+        }
+    }
+
+    fn release_read_hold(&mut self, request: RequestId) {
+        self.ledger.take_held(request);
+    }
+
+    fn restore_prefix(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session_id: u32,
+        tokens: u64,
+        now: Time,
+    ) {
+        self.retain_prefix(
+            request,
+            partition,
+            session_id,
+            tokens,
+            None,
+            now,
+            PrefixCacheRetentionReason::Restore,
+        );
     }
 
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time) {

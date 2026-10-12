@@ -267,7 +267,7 @@ def test_merge_variants_single_structure_is_passthrough():
 
 
 def _full_map(roles):
-    """A strict-coverage map pinning every pooled role to its default."""
+    """A map pinning every pooled role to its default."""
     out: dict = {}
     for r in roles:
         if r.pool:
@@ -324,16 +324,20 @@ def test_validate_incompatible_backend_dtype():
     assert any("unsupported for single_gemm at dtype=fp8_e4m3" in e for e in errs)
 
 
-def test_validate_missing_coverage():
+def test_validate_partial_map_keeps_defaults():
+    # A role the map leaves out keeps its arch default; naming one role is enough.
     roles = _afd_roles()
     m = _full_map(roles)
     del m["ffn"]["afd.moe_expert_compute.gate_up"]
-    errs = validate_backend_map(m, roles)
-    assert any("strict coverage" in e and "moe_expert_compute.gate_up" in e for e in errs)
+    assert validate_backend_map(m, roles) == []
+    gate_up = next(r for r in roles if r.name == "afd.moe_expert_compute.gate_up")
+    one = {"ffn": {gate_up.name: list(gate_up.default)}}
+    assert validate_backend_map(one, roles) == []
+    assert validate_backend_map({}, roles) == []
 
 
-def test_validate_deployment_level_exempt_from_coverage():
-    # the pool="" transfer kernel must NOT be required for strict coverage.
+def test_validate_deployment_level_kernels_are_not_override_targets():
+    # the pool="" transfer kernel is not part of any pool's map.
     roles = _afd_roles()
     errs = validate_backend_map(_full_map(roles), roles)
     assert not any("afd_qkv_transfer" in e for e in errs)

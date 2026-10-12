@@ -7,8 +7,9 @@ turns those records into
 
   1. the `backends` skeleton (`launcher … --emit-backends`), one entry per distinct
      kernel role, and
-  2. a validation pass over a user backend map — unknown role key, missing strict
-     coverage, or a backend incompatible with the role's dtype / GPU.
+  2. a validation pass over a user backend map — unknown role key, or a backend
+     incompatible with the role's dtype / GPU. Roles the map leaves out keep
+     their arch-declared backends.
 
 Capability + the dtype/gpu-filtered `options` come from the single source of truth,
 `profiling.db.registry` (`supported_backends` / `backend_supports`). The dtype and
@@ -338,14 +339,14 @@ def render_skeleton(roles: list[Role], pool_arch: dict[str, str] | None = None) 
 
 def validate_backend_map(nested: dict, roles: list[Role]) -> list[str]:
     """Validate a nested `pool -> role -> backends` map against the enumerated
-    roles. Reports: an unknown role key; a role left unassigned (strict coverage);
-    an unknown backend; a backend incompatible with the role's dtype."""
+    roles. Reports: an unknown role key; an unknown backend; a backend
+    incompatible with the role's dtype. A role the map leaves out keeps its
+    arch-declared backends."""
     errors: list[str] = []
     # Only per-pool roles are override targets; deployment-level kernels (pool
-    # "") aren't routable by the per-pool map, so they're exempt from coverage.
+    # "") aren't routable by the per-pool map.
     pooled = [r for r in roles if r.pool]
     role_by = {(r.pool, r.name): r for r in pooled}
-    seen: set[tuple[str, str]] = set()
 
     for pool, submap in nested.items():
         if not isinstance(submap, dict):
@@ -359,7 +360,6 @@ def validate_backend_map(nested: dict, roles: list[Role]) -> list[str]:
                     "config (run --emit-backends for the exact role keys)"
                 )
                 continue
-            seen.add((pool, name))
             if not isinstance(backends, list) or not backends:
                 errors.append(f"{pool}/{name}: backends must be a non-empty list")
                 continue
@@ -378,14 +378,6 @@ def validate_backend_map(nested: dict, roles: list[Role]) -> list[str]:
                         f"{pool}/{name}: backend {be!r} unsupported for {role.kind} "
                         f"at {at} (options: {role.options})"
                     )
-
-    missing = [r.key for r in pooled if (r.pool, r.name) not in seen]
-    if missing:
-        shown = ", ".join(missing[:6]) + (" …" if len(missing) > 6 else "")
-        errors.append(
-            f"backend map is missing {len(missing)} role(s) (strict coverage — "
-            f"every kernel must be assigned): {shown}. Start from --emit-backends."
-        )
     return errors
 
 

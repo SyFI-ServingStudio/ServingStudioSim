@@ -182,3 +182,37 @@ rounds at the same arrival times and differ only in the prefix/fresh split.
 Contexts reach 999,888 tokens, so runs need `max_model_len: 1048576`. The
 pinned prefix is reserved only while its request runs, so this replay measures
 prefill compute, not prefix-cache capacity.
+
+### Sessions with decode elsewhere
+
+`session_decode_wait.py` keeps a session trace whole (sessions, rounds, the
+timeline, prefixes) for a pipeline head with `external_decode: true`, which
+completes each round at its first token. The script adds the rest of the
+round's decode to its tool wait, `(output_len - 1) / decode_tok_s` seconds. So
+a prefix-cache study sees each round arrive when it would have, and the
+cache, not the trace, decides each hit. Zero-input rounds become one fresh
+token after a one-shorter prefix. `--sessions N` keeps the first N sessions by
+arrival.
+
+```bash
+uv run python trace/session_decode_wait.py trace/tracelab_preserving.csv \
+  "$TMPDIR/mono_sessions_d80.csv" --decode-tok-s 80
+```
+
+`session_closed_loop.py` orders such a trace for a closed loop of N sessions
+(`arrival_mode: saturated`, `workload.max_concurrency: N`) that starts in steady
+state. Session durations are heavy-tailed, and half of all session-time sits in
+sessions longer than 3 h, so a loop started from N fresh sessions drifts for
+many hours. The first N sessions are therefore drawn by duration, and each one
+joins at a random point of its life. A one-token placeholder round holds its slot
+for the rest of the wait that point fell in, so joining rounds arrive as they
+would in steady state, not all at once. The joining round keeps its declared
+prefix: an engine without the context recomputes it, and one with
+`prefix_tier_warm_start` reads it from its slowest tier. `--cold-at-once` keeps
+the earlier start (every joining round at t = 0, its context as fresh tokens).
+Every later session is drawn whole.
+
+```bash
+uv run python trace/session_closed_loop.py "$TMPDIR/mono_sessions_d80.csv" \
+  "$TMPDIR/closed_c1000.csv" --concurrency 1000 --after 20000 --seed 0
+```

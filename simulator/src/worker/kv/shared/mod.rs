@@ -16,6 +16,7 @@
 //! - [`prefix_cache`] — the evictable retained-session tier and its four
 //!   replacement policies.
 //! - [`prefix_cache_journal`] — turning cache mutations into logged events.
+//! - [`prefix_tiers`] — the DRAM/SSD tiers a pipeline head keeps behind HBM.
 //!
 //! The store-specific knobs each piece takes are constructor parameters, so a
 //! full-attention store passes the identity values (no fixed charge, quantum of
@@ -23,5 +24,6 @@
 
 pub(crate) mod prefix_cache;
 pub(crate) mod prefix_cache_journal;
+pub(crate) mod prefix_tiers;
 pub(crate) mod request_ledger;
 pub(crate) mod resident_partition;

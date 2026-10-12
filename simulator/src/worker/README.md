@@ -315,6 +315,84 @@ default (vLLM); `balance_decode_microbatches` caps them at
 decode subset into `IterBatchPlan`, and input lowering skips the resident decodes
 outside it.
 
+Prefill fills each microbatch greedily up to `max_batch_tokens` by default
+(`microbatch_split: greedy`, vLLM). `microbatch_split: even` sizes it to
+`clamp(ceil((pending + in-flight prefill tokens) / depth), min_microbatch_tokens,
+max_batch_tokens)`: pending is started prompts' unscheduled tokens plus the
+policy's `queued_prompt_tokens()`, in-flight is the prefill of formed microbatches
+that have not exited. One prompt into an empty pipeline therefore runs as `depth`
+equal slices. The split never holds a microbatch back, and
+`min_microbatch_tokens` is rejected unless the split is `even`.
+
+Three knobs compose with either split. `long_prefill_token_threshold` caps any
+one request's chunk per microbatch, as vLLM's knob of that name does.
+`load_budget_low_tokens` (not vLLM) runs microbatches at that budget while the
+prefill backlog (queued, started and in-flight tokens) is at most
+`load_budget_backlog_lo_tokens`, rising linearly to `max_batch_tokens` at
+`load_budget_backlog_hi_tokens`; both bounds are required with the floor.
+`srpt` (not vLLM) orders prefill by remaining tokens across started and queued
+prompts instead of started first; pair it with `pending_order:
+shortest-prefill-first` so the queue offers its shortest prompt first. The
+budget (`LoadBudget`) and the srpt order (`admission/srpt.rs`) are shared with
+`chunked_prefill`, which applies both per attention DP rank.
+`force_schedule_after_ms` (not vLLM; also on `chunked_prefill`) serves a request
+that has waited that long since arrival before every other one, oldest first:
+queued ones leave the pending order for an overdue queue admission takes first,
+and with `srpt` overdue started prompts also go first. Shortest-first alone can
+leave a long prompt waiting for hours under a saturated closed loop
+(`admission/overdue.rs`).
+
+A hybrid head (`HybridGdnKv`) follows `prefill_chunk_alignment`. `checkpoint` is
+vLLM's Mamba `align` mode: non-final chunks end on the KV block and prefix hits
+floor to it, one state per block. `plain` chunks plainly and reuses exactly: a
+retained session keeps its context and the state at its end.
+
+Behind HBM's retained tier a head can keep host DRAM and SSD tiers
+(`dram_tier_gb`, `ssd_tier_gb`, per GPU, with read bandwidths). They are
+write-through LRUs of each session's latest context, plus one state for a hybrid
+model (`kv/shared/prefix_tiers.rs`). The admission owns them
+(`admission/prefix_fetch.rs`) and looks a session up when its request reaches the
+head of the queue, as vLLM's KV connector does at scheduling. If a tier holds
+more than HBM does, floored to HBM's hit quantum, the request leaves the queue
+while that tier's FIFO channel reads just the difference. As vLLM allocates an
+async load's blocks before it starts, the read starts only if the whole request
+fits in HBM (`KvStore::fits`), and holds that footprint (`PrefixKv::hold_for_read`)
+until admission; otherwise admission stops. A landed request waits in its
+partition's landed queue, which admission takes before the pending order (vLLM's
+skipped-waiting queue); there the context goes back into HBM (`restore_prefix`)
+and the hold turns into the request's reservation. A lookup at arrival would miss
+every context HBM evicts while the request queues. On the pipeline head,
+`prefix_tier_max_read_wait_ms` (not vLLM) starts a read only while its tier would
+begin it within that bound, so a long read queue does not sit on HBM. A request
+past it is passed over by default (`prefix_tier_read_wait_policy: pass-over`),
+holding nothing, and admission goes on to the ones behind; `block` stops
+admission at it instead, so the queue behind waits too. Both admission
+lifecycles take fresh prompts from the same sources in the same order (landed
+reads, overdue requests, the pending order; `admission/fresh_source.rs`), and a
+passed-over request goes back to the front of the queue it came from.
+A tier is sized and read in the most loaded stage's bytes per token;
+`prefix_tier_balanced_load` (not vLLM) uses the stages' mean instead. A hybrid
+pipeline's entry adds one recurrent state on that same GPU, in real bytes (the
+stage's own, or the stages' mean), not the HBM pool's padded state blocks. A shortest-prefill-first order ranks a request by what HBM or a tier
+holds. With `prefix_tier_warm_start`, a session request whose declared prefix
+exceeds every context the run stored for it is a pre-run conversation, read
+from the slowest tier (closed-loop traces that join sessions mid-life).
+`prefix_tiers_w<id>.csv` / `.json` record each admitted session request and the
+tiers' totals. With `external_decode`, a round completes at its first token. The head
+then restores its context with every output but the last (whose KV the next
+round computes) as if a decode instance handed it back. The trace carries the
+decode time in its tool waits (`trace/session_decode_wait.py`). The `pp` flow
+keeps each session on the replica its first round went to.
+
+The hybrid `chunked_prefill` worker (DP attention included) takes the same
+`dram_tier_gb` / `ssd_tier_gb` / `prefix_tier_warm_start` /
+`prefix_tier_max_read_wait_ms` / `prefix_tier_read_wait_policy` /
+`external_decode` knobs (a read-wait bound needs a tier there). Its admission reads from one tier set per attention DP rank and keeps a
+session on the rank it last ran on (`ChunkedPrefillAdmission::with_sticky_sessions`);
+`SessionTierWorker` (`workers/iter/session_tier_worker.rs`) wraps the shell to
+write finished contexts through and run `external_decode`. There `plain` alignment also
+means exact prefix reuse.
+
 `PipelineStageWorker` has no KV/admission axes. It runs microbatches FIFO,
 double-buffering one activation pull against one compute, at exact times derived
 from the previous stage's `ready_at`. It stamps no request stage, so requests stay
@@ -364,14 +442,39 @@ chooses where a cold request lands. `round-robin` (default) rotates blindly;
 `vllm-least-loaded` ports vLLM's DP load balancer
 (`DPLBAsyncMPClient.get_core_engine_for_request`): lowest `waiting + running`,
 waiting requests penalised by `6 * max(0, kv_usage - 0.5)` each, scan start
-rotated per placement. Retained-prefix affinity still wins over both.
+rotated per placement. `kv-least-loaded` (not vLLM) picks the lowest
+`kv_usage` plus the queued requests' full KV footprint over capacity, so
+long-tailed contexts do not fill one rank while others idle.
+`kv-fit-least-loaded` (not vLLM) picks the fewest `waiting + running` among
+ranks where the request's footprint fits on top of that KV, else the lowest
+KV: DP ranks step in lockstep, so request counts set the step time and KV only
+guards capacity. Retained-prefix affinity still wins over all of them.
 
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;
 `vllm-least-loaded` ports vLLM's DP load balancer
 (`DPLBAsyncMPClient.get_core_engine_for_request`): lowest `waiting + running`,
 waiting requests penalised by `6 * max(0, kv_usage - 0.5)` each, scan start
-rotated per placement. Retained-prefix affinity still wins over both.
+rotated per placement. `kv-least-loaded` (not vLLM) picks the lowest
+`kv_usage` plus the queued requests' full KV footprint over capacity, so
+long-tailed contexts do not fill one rank while others idle.
+`kv-fit-least-loaded` (not vLLM) picks the fewest `waiting + running` among
+ranks where the request's footprint fits on top of that KV, else the lowest
+KV: DP ranks step in lockstep, so request counts set the step time and KV only
+guards capacity. Retained-prefix affinity still wins over all of them.
+
+`chunked_prefill` takes the pipeline head's scheduler options too, all off by
+default and none of them vLLM, so a PP vs DP comparison can differ only in
+parallelism. Each acts per attention DP rank, as each rank is one vLLM engine
+with its own scheduler. `srpt` merges a rank's started prompts into its queue's
+shortest-first order (`admission/srpt.rs`, the head's code). `load_budget_*`
+runs a rank's iteration at `load_budget_low_tokens` while the rank's own
+backlog (its queued and started prompts' tokens; there is nothing in flight
+between iterations) is at most the low bound, rising linearly to
+`max_batch_tokens` at the high bound. `force_schedule_after_ms` also puts
+overdue started prompts first under `srpt`. With tiers,
+`prefix_tier_max_read_wait_ms` and `prefix_tier_read_wait_policy` bound a
+rank's reads as on the head.
 
 KV admission is a separate selector component (`kv_admission_policy`), shared
 by `chunked_prefill` and `speculative`:
