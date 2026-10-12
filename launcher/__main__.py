@@ -116,6 +116,13 @@ def _build_argparse():
         "skip runs already marked complete).",
     )
     parser.add_argument(
+        "--parallelism",
+        type=int,
+        default=None,
+        help="Most runs of a sweep in flight at once (default: 200). Lower it when "
+        "each run needs a lot of memory.",
+    )
+    parser.add_argument(
         "--build-type",
         default="release",
         help="Cargo profile / target subdir for the schema + binary (default: release).",
@@ -769,6 +776,7 @@ def main(argv: list[str] | None = None) -> int:
         schema,
         args.build_type,
         refresh=args.refresh,
+        **({"parallelism": args.parallelism} if args.parallelism else {}),
         analyze=not args.no_analyze,
         analyze_subjects=analyze_subjects,
         plot=not args.no_plot,
