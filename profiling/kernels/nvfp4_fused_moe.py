@@ -330,7 +330,7 @@ register(
         args_schema=Nvfp4FusedMoeArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        subprocess_env="vllm_upstream_fork_env",
+        subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
                 "FlashInfer trtllm_fp4_block_scale_routed_moe (MXFP4 weights, MXFP8 "

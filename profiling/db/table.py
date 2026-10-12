@@ -555,6 +555,13 @@ def _git_tree_stamp(repo_root: Path) -> str:
     ``profiling/`` therefore add ``-dirty``. Unrelated simulator or docs edits
     do not weaken this profiling-specific stamp.
     """
+    from launcher.source_stamp import has_git_metadata, read_source_stamp
+
+    if not has_git_metadata(repo_root):
+        # A tree shipped by `--remote` carries the stamp its sender computed
+        # here, from its own git metadata, before shipping.
+        stamp = read_source_stamp(repo_root)
+        return "unknown" if stamp is None else stamp["profiler_git_hash"]
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel", "HEAD"],

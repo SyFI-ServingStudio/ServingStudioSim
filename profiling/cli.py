@@ -398,13 +398,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # a conversation backend.
     create_time = _utc_now()
     profile_id = _profile_id(output_dir)
-    descriptor = {
-        "table": args.table,
-        "kernelKind": str(profiler_spec.kernel_kind),
-        "backend": args.backend,
-        "metricFamily": profiler_spec.metric_family.value,
-        "pointCount": len(specs),
-    }
+    descriptor = run_descriptor(args, profiler_spec, specs)
     if managed_job is not None:
         assert output_dir is not None
         managed_job.register(
@@ -546,20 +540,14 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     specs = _load_specs(args.spec, args.specs)
     if len(specs) != 1:
         raise ValueError(f"measure takes exactly one spec, got {len(specs)}")
+    _set_db_path(args.db)
     if args.energy is not None:
         set_energy_enabled(args.energy)
-    output_dir = args.output_dir or Path(f"measure_{args.table}_{args.backend}")
+    output_dir = measure_output_dir(args)
     profiler_spec = _resolve_profiler_spec(args.table, args.backend)
     create_time = _utc_now()
     measurement_id = _measurement_id(output_dir)
-    descriptor = {
-        "table": args.table,
-        "backend": args.backend,
-        "pointCount": 1,
-        "durationSeconds": args.duration_s,
-        "clearL2": args.clear_l2,
-        "energyMeasured": energy_enabled(),
-    }
+    descriptor = measure_descriptor(args)
     managed_job = ManagedJob.from_environment("kernel_measure")
     if managed_job is not None:
         managed_job.register(
@@ -641,6 +629,36 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         _print_measure_result(result)
         print(f"measurement: {output_dir / MEASUREMENT_METADATA_FILENAME}")
     return 0
+
+
+def run_descriptor(
+    args: argparse.Namespace, profiler_spec: KernelProfilerSpec, specs: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """The managed-job descriptor of a `run` (also registered by `--remote`)."""
+    return {
+        "table": args.table,
+        "kernelKind": str(profiler_spec.kernel_kind),
+        "backend": args.backend,
+        "metricFamily": profiler_spec.metric_family.value,
+        "pointCount": len(specs),
+    }
+
+
+def measure_descriptor(args: argparse.Namespace) -> dict[str, Any]:
+    """The managed-job descriptor of a `measure` (also registered by `--remote`)."""
+    return {
+        "table": args.table,
+        "backend": args.backend,
+        "pointCount": 1,
+        "durationSeconds": args.duration_s,
+        "clearL2": args.clear_l2,
+        # Read after --energy/--no-energy has been applied.
+        "energyMeasured": energy_enabled() if args.energy is None else args.energy,
+    }
+
+
+def measure_output_dir(args: argparse.Namespace) -> Path:
+    return args.output_dir or Path(f"measure_{args.table}_{args.backend}")
 
 
 def _print_measure_result(result: Mapping[str, Any]) -> None:

@@ -107,3 +107,11 @@ def test_invoke_reproduces_vllms_flashkda_prefill_call() -> None:
     assert bool(h0[:4].abs().sum(dim=(1, 2, 3)).gt(0).all()) and bool(h0[4:].eq(0).all())
     assert cu.dtype is torch.int32 and cu.tolist() == [0, 1, 2, 3, 4, 70]
     assert cs is None and co is None
+
+
+def test_runs_vllms_own_flashkda_build() -> None:
+    # Defect: measuring a standalone FlashKDA build instead of the commit vLLM
+    # vendors (_flashkda_C, pinned by the fork's CMake).
+    spec = find_kernel_profiler_spec("kda_chunk_prefill", "flashkda")
+    assert spec.subprocess_env == "vllm_env"
+    assert runner._MODULE == "vllm._flashkda_C"

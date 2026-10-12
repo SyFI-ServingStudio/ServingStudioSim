@@ -1,0 +1,67 @@
+# Machines `python -m launcher ... --remote NAME` can run on.
+#
+# Copy to `remote.yaml` at this checkout's root (untracked), or at the main
+# checkout's root to share it across worktrees, or point VIBESIM_REMOTE_CONFIG
+# at it. `--remote-set dotted.path=value` overrides one field for one call,
+# e.g. `--remote-set launch.slurm.time=08:00:00`. launcher/README.md "Remote
+# execution" explains the flow; launcher/remote/config.py is the authority on
+# which fields are accepted.
+#
+# Fields:
+#   access           `local`, or {ssh: user@host|alias, port, identity_file, options: [...]}.
+#                    ssh runs with BatchMode, so use a key without a passphrase
+#                    (agents cannot reach an ssh-agent). Host keys are pinned in
+#                    `.remote/known_hosts` beside this file when it exists.
+#   launch           `direct` (a detached process on the access host), or
+#                    {slurm: {time (required), partition, cpus_per_task, mem, account, gpus, extra: [...]}}
+#                    submitted from the access host (a login node, or this machine).
+#                    `gpus` is `--gres=gpu:N`; kernel-profile asks for at least
+#                    what its specs need, so a GPU remote can leave it at 0.
+#   files            `rsync` (ship code, fetch results over access) or `shared`
+#                    (workdir is visible here at the same path). Slurm jobs need
+#                    workdir on a filesystem the compute nodes share.
+#   workdir          absolute path on the remote: code versions, builds, venvs, jobs, logs.
+#   node_local       node-local scratch for each job's TMPDIR and profile.db copy (default /tmp).
+#   env              extra environment for remote jobs.
+#   keep_versions    shipped code versions to keep (default 10); experiments are never deleted.
+#   profile_runtime  `docker` (default): kernel-profile runs every worker in its env's
+#                    image (profiling/container/images.py), sent from here when the
+#                    remote lacks it. `in-image`: the remote is itself a profiling image
+#                    (a pod); it runs kernel-profile only, for the envs that image serves.
+#   ephemeral        true when the remote's disk may vanish (a pod): copy results back whole.
+
+remotes:
+  # A server reached over ssh, running jobs directly.
+  bigbox:
+    access: {ssh: me@bigbox.example.org, identity_file: ~/.ssh/vibesim_remote}
+    workdir: /data/me/vibesim-remote
+    env: {HF_HOME: /data/me/hf}
+
+  # A Slurm cluster: ssh to its login node, submit there.
+  cluster:
+    access: {ssh: me@login.cluster.example.org}
+    launch: {slurm: {time: "04:00:00", partition: cpu, cpus_per_task: 32, mem: 64G}}
+    workdir: /shared/me/vibesim-remote
+    node_local: /tmp
+
+  # GPU kernel profiling on a single-node Slurm GPU server; CPU work on the
+  # same host is better run `direct`, outside a 1-CPU allocation.
+  gpubox:
+    access: {ssh: gpubox}
+    launch: {slurm: {time: "01:00:00", partition: main}}
+    workdir: /data/me/vibesim-remote
+
+  # Already on a Slurm login node whose shared disk this machine sees.
+  here-slurm:
+    access: local
+    launch: {slurm: {time: "02:00:00", partition: main}}
+    files: shared
+    workdir: /shared/me/vibesim-remote
+
+  # A RunPod pod started from a profiler image, with exposed TCP ssh (the
+  # proxied ssh cannot carry rsync); its start command is in launcher/README.md.
+  pod:
+    access: {ssh: root@203.0.113.7, port: 40022, identity_file: ~/.ssh/runpod}
+    workdir: /workspace/vibesim-remote
+    profile_runtime: in-image
+    ephemeral: true

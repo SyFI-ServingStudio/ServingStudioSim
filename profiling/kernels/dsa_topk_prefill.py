@@ -137,7 +137,7 @@ register(
         args_schema=DsaTopkPrefillArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        subprocess_env="vllm_upstream_fork_env",
+        subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
                 "DeepSelect's exact FP32 top-k (torch.ops.deep_select.topk), "

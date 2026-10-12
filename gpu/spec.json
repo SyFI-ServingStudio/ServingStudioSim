@@ -124,6 +124,7 @@
       "name": "H100-SXM5-80GB",
       "aliases": [
         "NVIDIA H100",
+        "NVIDIA H100 80GB HBM3",
         "H100",
         "H100-SXM",
         "H100-SXM5"
@@ -149,6 +150,7 @@
     {
       "name": "H100-PCIe-80GB",
       "aliases": [
+        "NVIDIA H100 PCIe",
         "H100-PCIe"
       ],
       "vendor": "NVIDIA",

@@ -94,6 +94,21 @@ schema/        The single source of param truth on the Python side. Per-param
                  grammar gate that stays in lock-step with it).
   argv.py        Concrete config tree → config file on disk + [binary, sub, path].
 
+binaries.py    Where the simulator/analyzer/schema live: `target/<build>/`, or a
+               prebuilt, source-pinned set under `VIBESIM_BIN_DIR`.
+source_stamp.py
+               `.source-stamp.json`: git provenance for a tree shipped without
+               `.git` (read by `metadata.save_git_snapshot` and profile.db rows).
+remote/        `--remote NAME`: run a command on another machine and copy the
+               results back (see Remote execution below).
+  config.py      remote.yaml lookup and validation, `--remote-set`.
+  transport.py   Local or ssh (BatchMode, shared connection) commands and rsync.
+  source.py      The shipped file list, its version, venv key and stamp.
+  layout.py      The remote workdir layout.
+  launch.py      direct (setsid) or Slurm (sbatch) jobs: submit, poll, cancel.
+  image_send.py  Send a profiler image: only the layers the remote lacks.
+  node.py        The remote side: build a version, run one job, prune.
+  run.py         The sending side: plan, register, ship, run, relay, copy back.
 exec.py        cargo_build (+ schema discovery, INV-8), the PyO3 subprocess env,
                supervised stage adapters, `run_analysis`, and the measured-profile
                `run_alignment_analysis` handoff.
@@ -677,7 +692,9 @@ python -m launcher alignment-campaign {check,render,run,label,extract,compare} .
 python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
 ```
 
-`--no-gpu` may be added anywhere to any of these commands.
+Global options may be added anywhere to any of these commands (`launcher/cli.py`
+takes them off before dispatch): `--no-gpu`, and `--remote NAME` with repeatable
+`--remote-set key=value` (see Remote execution).
 
 - Simulation presets, timing-predict configs, and all alignment stage inputs
   accept YAML (`.yaml` / `.yml`) or JSON.
@@ -730,6 +747,164 @@ python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
   and ordered-axis curve payload under `DIR`; reopening that job reads its own
   result snapshot rather than a later mutable `profile.db` state.
 - `list-params` dumps the Rust-authoritative schema (`--human` for a table).
+
+### Remote execution
+
+`--remote NAME` runs a simulation, `timing-predict` or `kernel-profile
+run|measure` on another machine — to use its CPUs, disk or GPUs — and blocks
+until the results are back here. The command is otherwise the one you would run
+locally. A simulation or prediction runs with `--no-gpu --no-plot`, so it never
+profiles and never draws PNGs; a kernel profile runs each worker in its env's
+image (below).
+
+```
+python -m launcher presets/x.yaml --remote bigbox
+python -m launcher timing-predict presets/predict_x.json --remote cluster \
+    --remote-set launch.slurm.time=00:30:00
+python -m launcher kernel-profile run single_gemm --backend torch_linear \
+    --spec '{"m":8,"n":4096,"k":4096,"dtype":"bf16"}' \
+    --output-dir logs/20261011_1_gemm_h200 --remote gpubox
+```
+
+**Configuration.** Remotes live in an untracked `remote.yaml`: `$VIBESIM_REMOTE_CONFIG`,
+else this checkout's root, else the main checkout's root (so worktrees share one).
+`remote.example.yaml` documents every field; the axes are independent:
+
+| Field | Values |
+| --- | --- |
+| `access` | `local`, or `{ssh: host, port, identity_file, options}` (a server or a login node) |
+| `launch` | `direct` (detached on the access host), or `{slurm: {time, partition, cpus_per_task, mem, account, extra}}` |
+| `files` | `rsync` over the access host, or `shared` (the workdir is visible here at the same path) |
+| `workdir`, `node_local`, `env`, `keep_versions`, `profile_runtime`, `ephemeral` | see the example |
+
+ssh runs with `BatchMode=yes` (an agent turn has no terminal and no ssh-agent,
+so use a key file without a passphrase) and one shared ControlMaster connection
+under `$TMPDIR`. When `.remote/known_hosts` exists beside remote.yaml it is the
+only host-key store, so a sandbox that cannot write `~/.ssh` still connects;
+seed it once with `ssh-keyscan host >> .remote/known_hosts`. The remote needs
+`bash`, `rsync`, `flock`, `uv` and `cargo` on its login-shell PATH; Slurm needs
+the workdir on a filesystem its compute nodes share.
+
+**What happens** (`remote/run.py`):
+
+1. The command is planned here (built and expanded, as a dry run would), which
+   fixes the experiment root. It must be a relative directory under `logs/`, and
+   `--remote` must run from the checkout root, so the same relative path means
+   the same place on both sides. `--dry-run`, `--cache-report`,
+   `--emit-backends` and `--profile` stay local.
+2. Under a managed Agent job the job is registered here, and the identity file
+   that produced (`experiment.meta.json`, or a seed `prediction.meta.json`) is
+   copied into the remote output directory, where the remote run keeps it. The
+   remote job runs without the managed context and never registers.
+3. The code is shipped as a file tree with `.source-stamp.json` (commit, status,
+   capped diff, profiler stamp), not as a repository: tracked and untracked
+   non-ignored files, the req-frontend submodule, the ignored `Cargo.lock`, and
+   ignored data under `trace/`. Inputs under `logs/` named on the command line
+   (a preset, a predictor config or its cases file) are copied to the remote's
+   `logs/`; any other ignored input is an error.
+4. The remote builds once per set of build inputs and runs the job with its own
+   private profile.db copy on node-local disk (`remote/node.py`).
+5. Output is relayed every ~10 s, with a heartbeat at least once a minute.
+   Ctrl-C or SIGTERM stops the remote job (`kill` or `scancel`). A remote that
+   cannot be reached for 10 minutes ends the wait with an error that names the
+   job's remote directory; the job itself may still be running there.
+6. The output directory is copied back without `raw/cost_log/` and `plots/`
+   (everything, if the remote is `ephemeral`), and `remote-run.json` beside it
+   records the remote, host, remote path, code version, job and Slurm ids,
+   times and exit code. A copy that fails is recorded there as `incomplete` and
+   fails the run. Whatever stops a run early, no managed job is left `running`:
+   it is reported `failed`, or `interrupted` on Ctrl-C.
+
+Rerunning the same command resumes on the remote exactly as it would locally:
+the remote `logs/` is one tree across code versions.
+
+**Remote layout** (`remote/layout.py`). Only code is kept per version, hard-linked
+to the previous version so an unchanged file costs nothing; the heavy parts exist
+once per remote:
+
+```
+<workdir>/src/<version>/   shipped tree (+ .venv, bin, logs symlinks)
+<workdir>/venvs/<key>/     one per uv.lock + groups (CPU groups only: launcher, analyze, dev)
+<workdir>/build/src/       the one checkout cargo builds in (a fixed path keeps it incremental)
+<workdir>/build/target/    the one cargo target
+<workdir>/bin/<hash>/      binaries per set of build inputs
+<workdir>/logs/            every experiment, kept
+<workdir>/jobs/<id>/       job.json, stdout.log, exit_code, job.sbatch
+```
+
+A version whose Rust sources did not change reuses its predecessor's binaries;
+a Rust edit recompiles only this repository's crates. Builds are serialized by
+a lock on the access host. A failed analyzer build is not collected (the run
+skips post-run analysis), so a stale `analyze` never passes for the new one.
+`keep_versions` (default 10) prunes the least recently used `src/` trees other
+than the caller's and those of unfinished jobs, binaries no tree links to (under
+the build lock), and sends abandoned for a day; the shared `build/target` grows
+like any cargo target and can be cleaned with `cargo clean`. A checkout that
+changes while it is shipped fails the send rather than misname the copy.
+
+**Prebuilt binaries.** A job runs with `VIBESIM_BIN_DIR` set, which makes the
+launcher use that directory's `simulator`, `analyze` and `deployment_schema.json`
+instead of running cargo (`binaries.py`). The set records its build inputs
+(from cargo's dep-info, so `include_str!` data counts) and their hash; the
+launcher recomputes the hash against its own checkout and refuses a set built
+from other sources or another Python, and checks the schema against the
+simulator's own `list-params`. Only `--build-type release` can use it.
+
+**Kernel profiling** (`kernel-profile run|measure --remote`). The remote job
+runs with `VIBESIM_PROFILE_RUNTIME=container`: every worker runs in the image
+`profiling/container/images.py` assigns its profile env — never on a host
+interpreter, and an env with no image is refused — so the remote needs only
+docker with the NVIDIA runtime. The image is named by a hash of its dependency
+inputs; when the remote lacks it, it is sent from here, so build it here first.
+Only the layers the remote lacks move (`remote/image_send.py`): the image is
+pushed to a `registry` container on this machine's loopback, over a persistent
+store (`~/.cache/vibesim-profiler/registry`, or `VIBESIM_PROFILE_REGISTRY_DIR`),
+and the remote pulls it through an `ssh -R` forward, then the image id is
+checked against this one. A new tag of an image the remote already has costs
+its last few layers (seconds); the first send of an image pays for compressing
+all of it into the store, and a remote whose layers came from `docker load`
+pulls them once more, since docker cannot match them to registry digests. `python -m launcher.remote.image_send clear` empties the store.
+Under Slurm the job
+asks for the GPUs its specs need (`--gres=gpu:N`, or more with `launch.slurm.gpus`)
+and the controller addresses them by UUID. The JIT cache persists in
+`<workdir>/cache`.
+
+`--output-dir` is required and must be under `logs/`; `--db` is refused. The job
+measures into its own profile.db copy, which is fetched and merged into this
+checkout's (`VIBESIM_PROFILE_DB` or `profiling/profile.db`) under the profile-DB
+write lease. A conflicting row merges nothing: the report is left in the output
+directory. `--fresh` writes no rows and merges nothing. The whole output
+directory comes back; `remote-run.json` adds the image and its id, and the
+artifact metadata carries the observed GPU as for a local run. Under a managed
+job the `kp_`/`km_` id is registered here and seeded into the remote output
+directory, as for a prediction.
+
+**A remote that is a profiler image** (`profile_runtime: in-image`, e.g. a
+RunPod pod started from one). There is no docker inside, so the job runs with
+`VIBESIM_PROFILE_RUNTIME=in-image`: controller and workers run on the image's
+own interpreter, and only the envs that image serves. Before anything runs, the
+remote's `/etc/vibesim-profiler-image.json` (written by every profiler
+Dockerfile) must name the inputs of the image this checkout assigns the
+backend's env; nothing is built, synced or sent. Such a remote runs
+`kernel-profile` only. The image's entrypoint is the worker, so start the pod
+with entrypoint `bash -c` and this command, which installs ssh and rsync, keeps
+the image's environment for ssh sessions, and authorizes the pod's
+`PUBLIC_KEY`:
+
+```
+export -p | grep -vE '^declare -x (HOME|PWD|OLDPWD|SHLVL)=' > /etc/profile.d/00-vibesim-image.sh
+apt-get update -qq && apt-get install -y -qq openssh-server rsync >/dev/null
+mkdir -p /run/sshd /root/.ssh && echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
+chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && exec /usr/sbin/sshd -D -e
+```
+
+Expose `22/tcp` (RunPod's proxied ssh cannot carry rsync), pull the image from
+a registry under the same tag (`docker tag` + `docker push` from here), and
+set `ephemeral: true` so results come back whole.
+
+**Limits.** One invocation is one blocking remote job; a managed job's
+capability token must outlive it (6 h). A job whose process or allocation
+vanishes without an exit code fails after three consecutive polls.
 
 ### Staged simulation ↔ real profiling alignment
 

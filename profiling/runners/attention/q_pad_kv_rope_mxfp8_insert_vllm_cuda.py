@@ -206,7 +206,7 @@ def profile_q_pad_kv_rope_mxfp8_insert_vllm_cuda(
         import vllm._C_stable_libtorch  # noqa: F401
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)"
+            f"{_BACKEND} requires the upstream-rebased vLLM fork (vllm_env)"
         ) from exc
     try:
         device = torch.device("cuda", torch.cuda.current_device())

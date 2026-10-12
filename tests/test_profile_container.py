@@ -46,7 +46,9 @@ def test_container_worker_mounts_worktree_source_read_only(tmp_path: Path, monke
     assert "USER=vibesim" in command
     assert "LOGNAME=vibesim" in command
     assert f"{exchange_dir}:/io" in command
-    assert f"{cache_dir}:/cache" in command
+    # Each image keeps its own JIT cache: builds against one image's libraries.
+    assert f"{cache_dir}/profiler_test:/cache" in command
+    assert "MOESIM_CUPTI_BUILD_DIR=/cache/cupti-ext" in command
     project_root = Path(__file__).parents[1].resolve()
     for directory in ("profiling", "launcher", "gpu"):
         assert f"{project_root / directory}:/opt/vibesim/{directory}:ro" in command
@@ -57,42 +59,6 @@ def test_container_worker_mounts_worktree_source_read_only(tmp_path: Path, monke
         "--worker-output",
         "/io/output.json",
     ]
-
-
-def test_container_worker_can_use_frozen_image_source(tmp_path: Path, monkeypatch) -> None:
-    exchange_dir = tmp_path / "exchange"
-    cache_dir = tmp_path / "cache"
-    exchange_dir.mkdir()
-    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(cache_dir))
-    monkeypatch.setenv("VIBESIM_PROFILE_SOURCE_MODE", "image")
-
-    command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
-        [3],
-        exchange_dir,
-    )
-
-    assert not any("/opt/vibesim/profiling:ro" in argument for argument in command)
-    assert not any("/opt/vibesim/launcher:ro" in argument for argument in command)
-    assert not any("/opt/vibesim/gpu:ro" in argument for argument in command)
-
-
-def test_container_worker_rejects_unknown_source_mode(tmp_path: Path, monkeypatch) -> None:
-    exchange_dir = tmp_path / "exchange"
-    exchange_dir.mkdir()
-    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.setenv("VIBESIM_PROFILE_SOURCE_MODE", "surprise")
-
-    try:
-        _container_worker_command(
-            ContainerProfileEnv("vllm_env", "profiler:test"),
-            [3],
-            exchange_dir,
-        )
-    except ValueError as exc:
-        assert "VIBESIM_PROFILE_SOURCE_MODE" in str(exc)
-    else:
-        raise AssertionError("unknown source mode must fail")
 
 
 def test_container_worker_mounts_explicit_additional_volume(tmp_path: Path, monkeypatch) -> None:

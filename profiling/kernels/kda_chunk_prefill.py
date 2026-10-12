@@ -258,9 +258,10 @@ register(
 # FlashKDA: upstream vLLM's default KDA prefill on SM90/SM10x/SM12x.
 # vllm/models/glm5next/common/kda.py `_resolve_kda_prefill_backend` picks it for
 # CUDA major 9/10/12, bf16, head_dim 128 and a bounded gate; vLLM builds it
-# (cmake/external_projects/flashkda.cmake, vllm-project/FlashKDA@17a037d) for
+# (cmake/external_projects/flashkda.cmake, vllm-project/FlashKDA@b59532f) for
 # 9.0a, 10.0f and 12.0f with CUDA 13, and flash_kda.cpp checks bf16 q/k/v/g/beta/
-# out and D == 128. The TMA/setmaxnreg kernels have no pre-SM90 build.
+# out and D == 128. The TMA/setmaxnreg kernels have no pre-SM90 build. It runs
+# in vllm_env, on the extension the alignment fork's vLLM build carries.
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
@@ -277,7 +278,7 @@ register(
         args_schema=KdaChunkPrefillArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        subprocess_env="flashkda_env",
+        subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
                 "FlashKDA (vLLM's _flashkda_C), as vLLM's _flashkda_prefill calls it: "

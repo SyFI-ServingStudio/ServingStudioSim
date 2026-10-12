@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .process import ProcessSpec, ProcessSupervisor
+from .source_stamp import has_git_metadata, read_source_stamp
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _PROCESS_SUPERVISOR = ProcessSupervisor()
@@ -126,6 +127,17 @@ def _git_diff_capped(max_lines: int) -> str:
 def save_git_snapshot(log_dir: Path, timestamp: datetime) -> None:
     snapshot_dir = log_dir / "git_snapshot"
     snapshot_dir.mkdir(parents=True, exist_ok=True)
+    stamp = None if has_git_metadata(REPO_ROOT) else read_source_stamp(REPO_ROOT)
+    if stamp is not None:
+        # A tree shipped by `--remote` has no git; its stamp carries the same
+        # three facts, taken from the sending checkout.
+        (snapshot_dir / "commit.txt").write_text(
+            f"# {timestamp.isoformat()}\n{stamp['head_oneline']}\n"
+            f"# shipped source version {stamp['version']}\n"
+        )
+        (snapshot_dir / "status.txt").write_text(stamp["status"] + "\n")
+        (snapshot_dir / "diff.patch").write_text(stamp["diff"] + "\n")
+        return
     (snapshot_dir / "commit.txt").write_text(
         f"# {timestamp.isoformat()}\n" + _git(["git", "log", "-1", "--oneline"]) + "\n"
     )

@@ -7,8 +7,10 @@ writer, while every longer row uses the bundled cooperative radix path. Its
 workspace memset and one persistent kernel write all ``top_k`` slots. The
 indexer's separate outer global index-buffer fill remains excluded. The
 corrected extension is compiled for ``sm_90`` only, so every other device calls
-the image vLLM's own ``persistent_topk`` (3f667d7eb), whose buffered selection
-paths have a known tie-overflow bug (``_overflow_buffer``).
+the image vLLM's own ``persistent_topk`` (the alignment fork, upstream base
+04730e8). The previous image's build (3f667d7eb) had a tie-overflow bug in its
+buffered selection paths (``_overflow_buffer``), which the correctness check
+still allows for.
 """
 
 from __future__ import annotations

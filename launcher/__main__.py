@@ -16,11 +16,14 @@ enumeration (`--emit-backends`), and simulator wallclock profiling (`--profile`)
 paths. YAML and JSON are accepted for simulation presets, timing-predict configs,
 and alignment stage configs.
 
-`--no-gpu`, anywhere on the command line of any mode, guarantees the command
-uses no GPU: it sets `SERVINGSTUDIO_NO_GPU=1` (which has the same effect when
-set directly) and empties `CUDA_VISIBLE_DEVICES` for every child. A step that
-would need one -- profiling a missing `profile.db` row, an alignment capture --
-fails and names itself instead. See `profiling/gpu_policy.py`.
+Global options (`--no-gpu`, `--remote NAME`, `--remote-set K=V`) may appear
+anywhere on the line of any mode; `launcher/cli.py` takes them off before
+dispatch. `--no-gpu` guarantees the command uses no GPU: it sets
+`SERVINGSTUDIO_NO_GPU=1` (which has the same effect when set directly) and
+empties `CUDA_VISIBLE_DEVICES` for every child. A step that would need one --
+profiling a missing `profile.db` row, an alignment capture -- fails and names
+itself instead. See `profiling/gpu_policy.py`. `--remote` runs the command on
+another machine (`launcher/remote`).
 
 Single versus batch execution is decided by the number of expanded configs.
 Sweep expansion belongs to `launcher.schema`. No `--web` / `--tui` / `--gui`
@@ -29,11 +32,12 @@ Sweep expansion belongs to `launcher.schema`. No `--web` / `--tui` / `--gui`
 
 from __future__ import annotations
 
-import copy
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
+from .cli import UsageError, apply_dotted, dispatch, modes_help
 from .corpus import CorpusError, resolve_hf_references
 from .schema import (
     _format_log_dir,
@@ -77,15 +81,7 @@ def _build_argparse():
     parser = argparse.ArgumentParser(
         prog="python -m launcher",
         description="ServingStudioSim launcher simulation mode — run or sweep YAML/JSON presets.",
-        epilog=(
-            "Other modes:\n"
-            "  python -m launcher timing-predict CONFIG.yaml|json [...]\n"
-            "  python -m launcher kernel-profile "
-            "{list,query,count-missing,run,measure,merge-db,audit-provenance} ...\n"
-            "  python -m launcher alignment {sim,profile,timing-predict,analyze} ...\n"
-            "  python -m launcher list-params [--human]\n"
-            "--no-gpu applies to every mode: see --no-gpu below."
-        ),
+        epilog=modes_help(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -104,12 +100,6 @@ def _build_argparse():
         "--dry-run",
         action="store_true",
         help="Validate + expand only; do not launch subprocesses.",
-    )
-    parser.add_argument(
-        "--no-gpu",
-        action="store_true",
-        help="Guarantee no GPU is used, in any mode (also SERVINGSTUDIO_NO_GPU=1). "
-        "A missing profile.db row fails instead of being profiled.",
     )
     parser.add_argument(
         "--cache-report",
@@ -194,40 +184,12 @@ def _build_argparse():
     return parser
 
 
-def _set_path(tree: dict, dotted: str, value) -> None:
-    """Set `value` at a dotted path into the config tree, e.g.
-    `io.log_dir`, `pools.main.groups.0.arch.tp_size`. Integer segments index
-    into lists; everything else into dicts (auto-vivifying missing dicts)."""
-    parts = dotted.split(".")
-    node = tree
-    for part in parts[:-1]:
-        if isinstance(node, list):
-            node = node[int(part)]
-        else:
-            node = node.setdefault(part, {})
-    last = parts[-1]
-    if isinstance(node, list):
-        node[int(last)] = value
-    else:
-        node[last] = value
-
-
 def _apply_overrides(preset: dict, overrides: list[str]) -> dict:
-    """Apply `--override path=value` into the config tree. The path is dotted
-    (`io.log_dir`, `pools.main.groups.0.arch.tp_size`); values are parsed as JSON
-    when possible (`tp_size=4`→int, `fp8=true`→bool, `[1,2]`→list) and otherwise
-    kept as a bare string (`model_config=model/x.json`)."""
-    out = copy.deepcopy(preset)
-    for item in overrides:
-        if "=" not in item:
-            sys.exit(f"bad --override {item!r}; expected path=value")
-        key, _, raw = item.partition("=")
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError:
-            value = raw  # bare string
-        _set_path(out, key.strip(), value)
-    return out
+    """Apply `--override path=value` into the config tree (`cli.apply_dotted`)."""
+    try:
+        return apply_dotted(preset, overrides)
+    except UsageError as exc:
+        sys.exit(f"bad --override: {exc}")
 
 
 def _params_line(pdef: dict) -> str:
@@ -312,8 +274,7 @@ def _emit_backends(args, schema: Registry) -> int:
     try:
         # The builder reads a corpus to size its sweep, so it needs the file.
         normalized = [
-            resolve_hf_references(_format_log_dir(normalize_params(c, schema)))
-            for c in candidates
+            resolve_hf_references(_format_log_dir(normalize_params(c, schema))) for c in candidates
         ]
         roles = emit_roles(normalized, args.build_type)
     except CorpusError as exc:
@@ -557,79 +518,43 @@ def _apply_energy_policy(
     return True
 
 
+def list_params(argv: list[str]) -> int:
+    """`list-params`: dump the Rust-authoritative schema of the built binary."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m launcher list-params",
+        description="Print the simulator's parameter schema (JSON, or a table with --human).",
+    )
+    parser.add_argument("--human", action="store_true", help="Print a readable table.")
+    parser.add_argument(
+        "--build-type", default="release", help="Cargo profile of the schema (default: release)."
+    )
+    args = parser.parse_args(argv)
+    try:
+        schema = load_schema(args.build_type)
+    except SchemaNotFound as exc:
+        sys.exit(str(exc))
+    _print_params_table(schema, args.human, args.build_type)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
+    return dispatch(list(sys.argv[1:] if argv is None else argv), simulation=run_simulation)
 
-    # `--no-gpu` holds for every mode, so it is taken before dispatch; the
-    # environment carries it to every child. The variable alone gets the same
-    # hidden devices, so a child cannot see a GPU either way.
-    from profiling.gpu_policy import disable_gpus, gpu_disabled
 
-    if "--no-gpu" in argv:
-        argv = [token for token in argv if token != "--no-gpu"]
-        disable_gpus()
-    elif gpu_disabled():
-        disable_gpus()
+@dataclass(frozen=True)
+class SimulationPlan:
+    """A validated simulation batch, ready to run here or ship (`launcher/remote`)."""
 
-    # `alignment` exposes explicit workflow stages. Its `sim` handler re-enters
-    # this main function, so dispatch must short-circuit before preset parsing.
-    if argv and argv[0] == "alignment":
-        from .alignment import main as run_alignment
+    candidates: list[dict]
+    # The last preset loaded, as `metadata.write_shared_metadata` records it.
+    preset: dict
+    schema: Registry
+    analyze_subjects: list[str] | None
 
-        return run_alignment(argv[1:])
 
-    # `timing-predict` runs the offline per-building-block timing predictor. Its
-    # config is a minimal arch+cases file, NOT a deployment RunConfig, so it has its
-    # own handler that bypasses schema expansion / sweeps entirely.
-    if argv and argv[0] == "timing-predict":
-        from .timing_predict import main as run_timing_predict
-
-        return run_timing_predict(argv[1:])
-
-    # Keep L1 profiling ownership in ``profiling.cli`` while exposing one
-    # operator-facing ServingStudioSim command surface alongside timing-predict and sim.
-    if argv and argv[0] == "kernel-profile":
-        from profiling.cli import main as run_kernel_profile
-
-        return run_kernel_profile(
-            argv[1:],
-            prog="python -m launcher kernel-profile",
-        )
-
-    # `alignment-campaign` drives the stages `alignment` runs — it renders case
-    # directories, fans ONE phase across them, and reads the resulting reports.
-    # Top-level rather than nested under `alignment`, whose parser owns "one
-    # explicit stage"; see `launcher/alignment_campaign/cli.py`.
-    if argv and argv[0] == "alignment-campaign":
-        from .alignment_campaign import main as run_alignment_campaign
-
-        return run_alignment_campaign(argv[1:])
-
-    if argv and argv[0] == "migrate-artifact-kinds":
-        from .migrate_artifact_kinds import main as migrate_artifact_kinds
-
-        return migrate_artifact_kinds(argv[1:])
-
-    # `list-params` subcommand short-circuits before any preset handling.
-    if argv and argv[0] == "list-params":
-        human = "--human" in argv[1:]
-        build_type = "release"
-        if "--build-type" in argv:
-            build_type = argv[argv.index("--build-type") + 1]
-        try:
-            schema = load_schema(build_type)
-        except SchemaNotFound as exc:
-            sys.exit(str(exc))
-        _print_params_table(schema, human, build_type)
-        return 0
-
-    args = _build_argparse().parse_args(argv)
-    if not args.presets:
-        sys.exit(
-            "no preset given; usage: python -m launcher PRESET.yaml|json [...] "
-            "(or choose timing-predict, kernel-profile, alignment, or list-params)"
-        )
-
+def _built_schema(args) -> Registry:
     # INV-8 / design §1.2.3: the single shared build per batch. Building also
     # runs `list-params` → deployment_schema.json (§1.2.7), so this is what
     # guarantees the load_schema below reads a schema matching the just-built
@@ -641,13 +566,17 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit("launcher preparation failed (see stage-specific error above)")
 
     try:
-        schema = load_schema(args.build_type)
+        return load_schema(args.build_type)
     except SchemaNotFound as exc:
         sys.exit(str(exc))
 
-    if args.emit_backends is not None:
-        return _emit_backends(args, schema)
 
+def plan_simulation(args) -> SimulationPlan | int:
+    """Build, then load, expand and validate every preset of the batch.
+
+    Returns the plan, or the exit code after printing why there is none.
+    """
+    schema = _built_schema(args)
     stems = [Path(path).stem for path in args.presets]
     if len(args.presets) > 1 and len(set(stems)) != len(stems):
         print(
@@ -746,6 +675,30 @@ def main(argv: list[str] | None = None) -> int:
             f"--profile requires exactly one run, but the preset expands to "
             f"{len(all_candidates)}; narrow it (e.g. via --override) to a single run"
         )
+
+    return SimulationPlan(all_candidates, last_preset, schema, analyze_subjects)
+
+
+def parse_simulation_args(argv: list[str]):
+    args = _build_argparse().parse_intermixed_args(argv)
+    if not args.presets:
+        sys.exit(
+            "no preset given; usage: python -m launcher PRESET.yaml|json [...] "
+            "(or choose timing-predict, kernel-profile, alignment, or list-params)"
+        )
+    return args
+
+
+def run_simulation(argv: list[str]) -> int:
+    """The default mode: run or sweep simulation presets."""
+    args = parse_simulation_args(argv)
+    if args.emit_backends is not None:
+        return _emit_backends(args, _built_schema(args))
+    plan = plan_simulation(args)
+    if isinstance(plan, int):
+        return plan
+    all_candidates = plan.candidates
+    last_preset, schema, analyze_subjects = plan.preset, plan.schema, plan.analyze_subjects
 
     if args.dry_run:
         for candidate in all_candidates:
