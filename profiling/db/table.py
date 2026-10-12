@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, get_origin
 
 from profiling.db import storage
-from profiling.db.args import KernelArgs, field_types
+from profiling.db.args import KernelArgs, canonical_args, field_types, optional_fields
 from profiling.db.kind import KernelKind
 from profiling.db.migrate import SCHEMA_HASH, migrate_connection, require_current
 from profiling.db.registry import KernelProfilerSpec, MetricFamily
@@ -132,16 +132,38 @@ class Table:
         self.name = profiler_spec.table_name
         self.db_path = Path(db_path)
         self.args_columns = [field.name for field in fields(profiler_spec.args_schema)]
+        # Optional args (`optional_arg`): nullable columns appended to the table
+        # only once a row sets one, and left out of `args_hash` while unset.
+        self.optional_columns = list(optional_fields(profiler_spec.args_schema))
 
     def insert(self, rows: list[ProfileRow]) -> None:
         if not rows:
             return
         metric_columns = self._metric_columns()
         self._validate_row_metric_family(rows)
+        set_optional = [
+            column
+            for column in self.optional_columns
+            if any(
+                self.db_key(row.args)[self.args_columns.index(column)] is not None for row in rows
+            )
+        ]
+        with self._write_transaction() as conn:
+            self._ensure_optional_columns(conn, set_optional)
+            stored = self._stored_args_columns(conn)
+            self._insert(conn, rows, metric_columns, stored)
+
+    def _insert(
+        self,
+        conn: sqlite3.Connection,
+        rows: list[ProfileRow],
+        metric_columns: list[str],
+        stored: list[str],
+    ) -> None:
         columns = [
             "gpu_name",
             "backend",
-            *self.args_columns,
+            *stored,
             "args_hash",
             "run_key",
             "profiler_run_at",
@@ -163,11 +185,10 @@ class Table:
         default_git_hash = (
             _current_git_hash() if any(not row.profiler_git_hash for row in rows) else ""
         )
-        with self._write_transaction() as conn:
-            conn.executemany(
-                sql,
-                [self._row_values(conn, row, metric_columns, default_git_hash) for row in rows],
-            )
+        conn.executemany(
+            sql,
+            [self._row_values(conn, row, metric_columns, default_git_hash, stored) for row in rows],
+        )
 
     def query(
         self,
@@ -209,31 +230,36 @@ class Table:
             if not self._table_exists(conn):
                 return [None for _ in args_list]
             select = storage.logical_select(conn, self.name)
+            stored = self._stored_args_columns(conn)
             out: list[dict[str, Any] | None] = []
             for args in args_list:
-                where, values = self._where(args, backend, gpu_name)
+                lookup = self._where(args, backend, gpu_name, stored)
+                if lookup is None:
+                    out.append(None)
+                    continue
+                where, values = lookup
                 row = conn.execute(f"{select} WHERE {where} LIMIT 1", values).fetchone()
                 out.append(dict(row) if row is not None else None)
             return out
 
     def db_key(self, args: KernelArgs) -> tuple[Any, ...]:
-        """``args`` as this table stores them, in ``args_columns`` order."""
+        """``args`` as this table stores them, in ``args_columns`` order; an
+        unset optional arg is ``None``."""
+        args = canonical_args(args)
         return tuple(_to_db_value(getattr(args, column)) for column in self.args_columns)
 
     def args_hash(self, key: tuple[Any, ...]) -> bytes:
-        """The ``args_hash`` column of a row whose args are ``key`` (:meth:`db_key`)."""
-        return storage.args_hash(
-            dict(zip(self.args_columns, key, strict=True)),
-            _declared_types(self.profiler_spec.args_schema),
-        )
+        """The ``args_hash`` column of a row whose args are ``key`` (:meth:`db_key`).
 
-    def args_match_sql(self, alias: str = "") -> str:
-        """``args_hash = ? AND <each args column> = ?`` over ``alias``'s columns;
-        bind :meth:`args_hash` then the :meth:`db_key` values. The hash finds the
-        row through the unique index; the columns confirm it."""
-        prefix = f"{alias}." if alias else ""
-        return " AND ".join(
-            [f"{prefix}args_hash = ?", *(f"{prefix}{column} = ?" for column in self.args_columns)]
+        Unset optional args are not hashed, so a row keeps the hash it had
+        before its kind declared them."""
+        return storage.args_hash(
+            {
+                column: value
+                for column, value in zip(self.args_columns, key, strict=True)
+                if value is not None or column not in self.optional_columns
+            },
+            _declared_types(self.profiler_spec.args_schema),
         )
 
     def exists(
@@ -327,6 +353,7 @@ class Table:
                 [
                     f"{column} {declared} NOT NULL"
                     for column, declared in _declared_types(self.profiler_spec.args_schema).items()
+                    if column not in self.optional_columns
                 ],
                 [
                     f"{column} {column_def}"
@@ -397,25 +424,34 @@ class Table:
         columns confirm it in SQL, where each column's declared type converts the
         ``VALUES`` value exactly as it converts a bound ``column = ?``.
         """
-        columns = ["_i", "_hash", *self.args_columns]
+        stored = self._stored_args_columns(conn)
+        columns = ["_i", "_hash", *stored]
         match = " AND ".join(
             [
                 "t.gpu_name = ?",
                 "t.backend = ?",
                 "t.args_hash = c._hash",
-                *(f"t.{column} = c.{column}" for column in self.args_columns),
+                # `IS` so an unset optional arg (NULL) matches NULL.
+                *(
+                    f"t.{column} {'IS' if column in self.optional_columns else '='} c.{column}"
+                    for column in stored
+                ),
                 *([] if include_outliers else ["t.is_outlier = 0"]),
             ]
         )
         found: list[sqlite3.Row | None] = [None] * len(args_list)
+        keyed = [
+            (index, key)
+            for index, key in enumerate(self.db_key(args) for args in args_list)
+            if self._storable(key, stored)
+        ]
         chunk = max(1, (_SQL_VARIABLES - 2) // len(columns))
-        for start in range(0, len(args_list), chunk):
-            part = args_list[start : start + chunk]
+        for start in range(0, len(keyed), chunk):
+            part = keyed[start : start + chunk]
             values = ", ".join([f"({', '.join('?' * len(columns))})"] * len(part))
             bound: list[Any] = []
-            for index, args in enumerate(part, start):
-                key = self.db_key(args)
-                bound += [index, self.args_hash(key), *key]
+            for index, key in part:
+                bound += [index, self.args_hash(key), *self._stored_values(key, stored)]
             # CROSS JOIN keeps `c` the outer loop, so `t` is probed by its index.
             sql = (
                 f"WITH c({', '.join(columns)}) AS (VALUES {values}) "
@@ -426,12 +462,60 @@ class Table:
                 found[row["_i"]] = row
         return found
 
-    def _where(self, args: KernelArgs, backend: str, gpu_name: str) -> tuple[str, list[Any]]:
+    def _where(
+        self, args: KernelArgs, backend: str, gpu_name: str, stored: list[str]
+    ) -> tuple[str, list[Any]] | None:
         """Unqualified columns: the caller's FROM names this table once (the
-        logical select aliases it ``t``, whose columns these still resolve to)."""
+        logical select aliases it ``t``, whose columns these still resolve to).
+        None when ``args`` sets an optional arg the table has no column for."""
         key = self.db_key(args)
-        where = f"gpu_name = ? AND backend = ? AND {self.args_match_sql()}"
-        return where, [gpu_name, backend, self.args_hash(key), *key]
+        if not self._storable(key, stored):
+            return None
+        match = " AND ".join(
+            [
+                "args_hash = ?",
+                *(
+                    f"{column} {'IS' if column in self.optional_columns else '='} ?"
+                    for column in stored
+                ),
+            ]
+        )
+        where = f"gpu_name = ? AND backend = ? AND {match}"
+        return where, [gpu_name, backend, self.args_hash(key), *self._stored_values(key, stored)]
+
+    def _stored_args_columns(self, conn: sqlite3.Connection) -> list[str]:
+        """The args columns this table holds: every required one, and each
+        optional one some row has set (see :meth:`_ensure_optional_columns`)."""
+        if not self.optional_columns:
+            return self.args_columns
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({self.name})")}
+        return [
+            column
+            for column in self.args_columns
+            if column not in self.optional_columns or column in present
+        ]
+
+    def _storable(self, key: tuple[Any, ...], stored: list[str]) -> bool:
+        """Whether a row keyed ``key`` can be in a table holding ``stored``."""
+        return all(
+            value is None or column in stored
+            for column, value in zip(self.args_columns, key, strict=True)
+        )
+
+    def _stored_values(self, key: tuple[Any, ...], stored: list[str]) -> list[Any]:
+        by_column = dict(zip(self.args_columns, key, strict=True))
+        return [by_column[column] for column in stored]
+
+    def _ensure_optional_columns(self, conn: sqlite3.Connection, columns: list[str]) -> None:
+        """Append each optional args column in ``columns`` the table lacks.
+
+        Appended and nullable, so existing rows read NULL (unset) and keep their
+        hash, and every DB that gains the column gains it in the same place."""
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({self.name})")}
+        declared = _declared_types(self.profiler_spec.args_schema)
+        for column in columns:
+            if column not in present:
+                conn.execute(f"ALTER TABLE {self.name} ADD COLUMN {column} {declared[column]}")
 
     def _row_values(
         self,
@@ -439,6 +523,7 @@ class Table:
         row: ProfileRow,
         metric_columns: list[str],
         default_git_hash: str,
+        stored: list[str],
     ) -> list[Any]:
         key = self.db_key(row.args)
         metric_values = _metrics_to_db(row.metrics)
@@ -451,7 +536,7 @@ class Table:
         return [
             row.gpu_name,
             row.backend,
-            *key,
+            *self._stored_values(key, stored),
             self.args_hash(key),
             storage.run_key(conn, provenance),
             storage.epoch(row.profiler_run_at or _utc_now()),
