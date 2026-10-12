@@ -376,6 +376,16 @@ per-request state, prefix caching is on, and `prefill_chunk_alignment` resolves
 to `checkpoint`; unset follows `kv_overhead` (`vllm` aligns, `none` does not),
 and `plain` gives `min(remaining, budget)` chunks.
 
+Two optional request-count limits bound each partition independently of the
+token budget: `max_prefill_requests_per_iteration` (prefill requests scheduled
+per iteration, continued chunks and fresh prompts alike) and
+`max_resident_requests_per_partition` (started prompts plus resident decodes).
+Both default to unlimited and reject zero. The lifecycle counts them at batch
+formation from KV decode membership and its started-prompts list, with no second
+queue or ledger; a prompt that completes in an iteration keeps its resident slot
+until its request completes, even with a single output token. The selector's
+`prefix_cache_mode` defaults to `opportunistic`.
+
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;
 `vllm-least-loaded` ports vLLM's DP load balancer

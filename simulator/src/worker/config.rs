@@ -401,6 +401,18 @@ pub enum IterWorkerSel {
         kv_accounting: KvAccountingSpec,
         /// Chunked-prefill cap: max tokens per batch.
         max_batch_tokens: u32,
+        /// Prefill requests scheduled per partition per iteration, continued
+        /// chunks included; absent is unlimited.
+        #[serde(default)]
+        max_prefill_requests_per_iteration: Option<u32>,
+        /// Resident requests per partition, started prompts and decodes alike;
+        /// absent is unlimited.
+        #[serde(default)]
+        max_resident_requests_per_partition: Option<u32>,
+        /// Completed-session prefix reuse; independent of the request limits.
+        #[serde(default)]
+        #[param(string, default = "opportunistic", choices = PREFIX_CACHE_MODE_CHOICES)]
+        prefix_cache_mode: PrefixCacheMode,
         /// How resident decode shares an iteration with chunked prefill.
         /// `mix` charges both to the same token budget. Under
         /// `separate-prefill-priority`, any runnable prefill makes that

@@ -559,6 +559,12 @@ pub struct WorkerConfig {
     /// budget is applied per DP group. See
     /// [`crate::worker::admission::prefill_fits_budget`].
     pub max_batch_tokens: Option<u32>,
+    /// Chunked prefill: prefill requests scheduled per partition per iteration,
+    /// continued chunks and fresh prompts alike. None is unlimited.
+    pub max_prefill_requests_per_iteration: Option<u32>,
+    /// Chunked prefill: resident requests per partition, started prompts and
+    /// decodes alike. None is unlimited; KV stays the physical capacity owner.
+    pub max_resident_requests_per_partition: Option<u32>,
     /// Queue discipline the admission lifecycle uses to pick the head it gates
     /// (from the worker selector). Only the iter-wise local-prefill/decode and
     /// prefill-handoff lifecycles read it today.
@@ -623,6 +629,8 @@ impl Default for WorkerConfig {
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             max_batch_tokens: None,
+            max_prefill_requests_per_iteration: None,
+            max_resident_requests_per_partition: None,
             pending_order: crate::worker::admission::PendingOrderKind::default(),
             batch_policy: crate::worker::config::BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,

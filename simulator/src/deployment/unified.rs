@@ -121,6 +121,7 @@ impl Deployment for UnifiedDeployment {
             IterWorkerSel::ChunkedPrefill {
                 attn_gpu_memory_gb,
                 max_batch_tokens,
+                prefix_cache_mode,
                 batch_policy,
                 kv_admission,
                 gpu_time_multiplier,
@@ -131,7 +132,7 @@ impl Deployment for UnifiedDeployment {
                 *gpu_time_multiplier,
                 Some(*max_batch_tokens),
                 PendingOrderKind::Fifo,
-                PrefixCacheMode::Opportunistic,
+                *prefix_cache_mode,
                 PrefixCachePolicy::Lru,
                 None,
                 *batch_policy,
@@ -171,6 +172,8 @@ impl Deployment for UnifiedDeployment {
             prefix_cache_max_gpu_memory_gb,
             attn_gpu_memory_gb,
         )?;
+        let (max_prefill_requests_per_iteration, max_resident_requests_per_partition) =
+            chunked_request_limits(&g.worker)?;
         let mut worker_config = WorkerConfig {
             attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
             log_output_token_times: cfg.io.log_output_token_times,
@@ -179,6 +182,8 @@ impl Deployment for UnifiedDeployment {
             gpu_time_multiplier,
             prefill_gpu_time_multiplier: prefill_gpu_time_multiplier(&g.worker)?,
             max_batch_tokens,
+            max_prefill_requests_per_iteration,
+            max_resident_requests_per_partition,
             pending_order,
             batch_policy,
             kv_admission,
@@ -970,6 +975,29 @@ fn prefill_gpu_time_multiplier(worker: &IterWorkerSel) -> anyhow::Result<Option<
     Ok(multiplier)
 }
 
+/// The chunked-prefill worker's request-count limits. Zero would stall
+/// admission for good, so it is rejected here rather than at build.
+fn chunked_request_limits(worker: &IterWorkerSel) -> anyhow::Result<(Option<u32>, Option<u32>)> {
+    let IterWorkerSel::ChunkedPrefill {
+        max_prefill_requests_per_iteration,
+        max_resident_requests_per_partition,
+        ..
+    } = worker
+    else {
+        return Ok((None, None));
+    };
+    ensure!(
+        *max_prefill_requests_per_iteration != Some(0)
+            && *max_resident_requests_per_partition != Some(0),
+        "unified: max_prefill_requests_per_iteration and max_resident_requests_per_partition \
+         must be positive when present"
+    );
+    Ok((
+        *max_prefill_requests_per_iteration,
+        *max_resident_requests_per_partition,
+    ))
+}
+
 /// Draft candidate count, carried by the `speculative` selector only. Every other
 /// worker leaves it at `0`, which is what marks it as not speculating.
 fn speculative_draft_tokens(worker: &IterWorkerSel) -> u32 {
@@ -1156,6 +1184,9 @@ mod tests {
         IterWorkerSel::ChunkedPrefill {
             attn_gpu_memory_gb: 120.0,
             max_batch_tokens: 2048,
+            max_prefill_requests_per_iteration: None,
+            max_resident_requests_per_partition: None,
+            prefix_cache_mode: crate::worker::PrefixCacheMode::Opportunistic,
             batch_policy: BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionSpec::default(),
             gpu_time_multiplier: 1.0,
@@ -1164,6 +1195,21 @@ mod tests {
             prefill_chunk_alignment: None,
             kv_accounting: Default::default(),
         }
+    }
+
+    #[test]
+    fn chunked_request_limits_are_absent_by_default_and_never_zero() {
+        let mut worker = chunked_prefill_worker();
+        assert_eq!(chunked_request_limits(&worker).unwrap(), (None, None));
+        let IterWorkerSel::ChunkedPrefill {
+            max_resident_requests_per_partition,
+            ..
+        } = &mut worker
+        else {
+            unreachable!()
+        };
+        *max_resident_requests_per_partition = Some(0);
+        assert!(chunked_request_limits(&worker).is_err());
     }
 
     fn assert_iter_worker_contract<W>()

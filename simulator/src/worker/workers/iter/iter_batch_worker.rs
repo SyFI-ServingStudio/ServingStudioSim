@@ -897,6 +897,126 @@ mod tests {
         );
     }
 
+    fn limited_chunked_worker(
+        store: SharedRequests,
+        max_prefill_requests_per_iteration: Option<u32>,
+        max_resident_requests_per_partition: Option<u32>,
+        max_batch_tokens: u32,
+    ) -> ChunkedPrefillWorker<FakeModel> {
+        build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            store,
+            WorkerConfig {
+                attn_kv_bytes: 64,
+                max_batch_tokens: Some(max_batch_tokens),
+                max_prefill_requests_per_iteration,
+                max_resident_requests_per_partition,
+                batch_policy: BatchPolicy::SeparatePrefillPriority,
+                prefix_cache: PrefixCacheConfig::Disabled,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    fn prefill_admits(worker: &ChunkedPrefillWorker<FakeModel>) -> Vec<RequestId> {
+        let mut admits = Vec::new();
+        worker
+            .kv_store
+            .visit_prefill_admits(0, |request| admits.push(request));
+        admits
+    }
+
+    #[test]
+    fn request_limits_preserve_fifo_suspend_decode_and_reopen_after_release() {
+        let store = shared_with(&[(0, 4, 3), (1, 4, 3), (2, 4, 2)]);
+        let mut worker = limited_chunked_worker(store.clone(), Some(1), Some(2), 32);
+        for id in 0..3 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        // One prompt per iteration, in FIFO order, though the budget fits all.
+        for id in 0..2 {
+            let input = form_chunked_input(&mut worker, Time::from_ms(id as f64));
+            assert_eq!(input.groups[0].prefill_chunk_pairs, [(0, 4)]);
+            assert_eq!(input.groups[0].decode_tokens, 0);
+            assert_eq!(prefill_admits(&worker), [RequestId(id)]);
+            complete_chunked_iteration(&mut worker, Time::from_ms((id + 1) as f64));
+        }
+        assert_eq!(
+            store.borrow()[RequestId(0)].progress.output_tokens_emitted,
+            1
+        );
+        // Two residents fill the cap: the third waits while both decode.
+        assert!(!store.borrow()[RequestId(2)].lifecycle.admitted);
+        for step in 2..4 {
+            let input = form_chunked_input(&mut worker, Time::from_ms(step as f64));
+            assert!(input.groups[0].prefill_chunk_pairs.is_empty());
+            assert_eq!(input.groups[0].decode_tokens, 2);
+            complete_chunked_iteration(&mut worker, Time::from_ms((step + 1) as f64));
+        }
+        assert_eq!(worker.status().active_requests, 0);
+        let input = form_chunked_input(&mut worker, Time::from_ms(4.0));
+        assert_eq!(input.groups[0].prefill_chunk_pairs, [(0, 4)]);
+        assert!(store.borrow()[RequestId(2)].lifecycle.admitted);
+        complete_chunked_iteration(&mut worker, Time::from_ms(5.0));
+        let _ = form_chunked_input(&mut worker, Time::from_ms(5.0));
+        complete_chunked_iteration(&mut worker, Time::from_ms(6.0));
+        assert_eq!(worker.status().active_requests, 0);
+        assert_eq!(worker.status().queued_requests, 0);
+        let entire_pool = worker.kv_store.footprint(RequestId(99), 63, 1);
+        assert!(
+            worker.kv_store.fits(0, &entire_pool),
+            "completion releases the entire KV reservation"
+        );
+    }
+
+    #[test]
+    fn resident_limit_counts_output_one_and_completed_scheduled_prefills() {
+        let store = shared_with(&[(0, 2, 1), (1, 2, 1), (2, 2, 1)]);
+        let mut worker = limited_chunked_worker(store, None, Some(2), 32);
+        for id in 0..3 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        let input = form_chunked_input(&mut worker, Time::ZERO);
+        assert_eq!(input.groups[0].prefill_chunk_pairs.len(), 2);
+        assert_eq!(worker.status().queued_requests, 1);
+        complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
+        let input = form_chunked_input(&mut worker, Time::from_ms(1.0));
+        assert_eq!(input.groups[0].prefill_chunk_pairs.len(), 1);
+
+        let store = shared_with(&[(0, 12, 1), (1, 2, 1)]);
+        let mut worker = limited_chunked_worker(store, None, Some(1), 8);
+        for id in 0..2 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        let input = form_chunked_input(&mut worker, Time::ZERO);
+        assert_eq!(input.groups[0].prefill_chunk_pairs, [(0, 8)]);
+        complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
+        // Finishing a started prompt still occupies the resident slot for this iteration.
+        let input = form_chunked_input(&mut worker, Time::from_ms(1.0));
+        assert_eq!(input.groups[0].prefill_chunk_pairs, [(8, 4)]);
+        assert_eq!(worker.status().queued_requests, 1);
+        complete_chunked_iteration(&mut worker, Time::from_ms(2.0));
+        let input = form_chunked_input(&mut worker, Time::from_ms(2.0));
+        assert_eq!(input.groups[0].prefill_chunk_pairs, [(0, 2)]);
+    }
+
+    #[test]
+    fn absent_request_limits_keep_multiple_prefills_per_iteration() {
+        let store = shared_with(&[(0, 2, 1), (1, 2, 1), (2, 2, 1)]);
+        let mut worker = limited_chunked_worker(store, None, None, 32);
+        for id in 0..3 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        let input = form_chunked_input(&mut worker, Time::ZERO);
+        assert_eq!(input.groups[0].prefill_chunk_pairs.len(), 3);
+    }
+
     #[test]
     fn separate_prefill_priority_suspends_and_then_resumes_resident_decode() {
         let store = shared_with(&[(0, 4, 5), (1, 16, 1)]);
