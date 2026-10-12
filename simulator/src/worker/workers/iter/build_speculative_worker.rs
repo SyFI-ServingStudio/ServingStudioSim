@@ -229,6 +229,26 @@ pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
+    // A host-tier cache (HiSparse) adds a fixed device buffer per request
+    // beside the recurrent state and bounds the summed context by host memory.
+    let kv_store = match host_kv_tier(
+        model.kv_host_offload(),
+        model.total_kv_bytes_per_token(),
+        &config,
+    ) {
+        Some(tier) => {
+            tracing::info!(
+                worker = id.0,
+                pool_tag,
+                kv_capacity_tokens = essentials.kv_capacity,
+                device_tokens_per_request = tier.device_tokens_per_request,
+                host_capacity_tokens = tier.host_capacity_tokens,
+                "host-tier KV: per-request device buffer and host context cap"
+            );
+            kv_store.with_host_tier(tier)
+        }
+        None => kv_store,
+    };
     let balance = match (num_partitions, config.dp_placement) {
         (1, _) => LoadBalance::Single,
         (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },

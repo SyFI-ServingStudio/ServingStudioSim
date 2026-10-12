@@ -14,8 +14,9 @@ mod full_attn;
 mod hybrid_gdn;
 mod shared;
 
-pub use full_attn::{FullAttnKv, HostKvTier};
+pub use full_attn::FullAttnKv;
 pub use hybrid_gdn::HybridGdnKv;
+pub use shared::host_tier::HostKvTier;
 pub(crate) use shared::prefix_cache::PrefixCacheTokenConfig;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub use shared::prefix_tiers::PrefixTierSpec;

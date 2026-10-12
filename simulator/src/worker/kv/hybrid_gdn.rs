@@ -41,6 +41,17 @@
 //! [`HybridGdnKv::with_exact_prefix_reuse`] leaves that engine limitation out:
 //! a retained entry keeps the state at its end and resumes at any token.
 //!
+//! ## Host tier (HiSparse)
+//!
+//! [`HybridGdnKv::with_host_tier`] moves the attention layers' per-token
+//! cache to host memory as [`FullAttnKv`](super::FullAttnKv) does: the
+//! per-token unit becomes what the GPU keeps of a token, the device buffer
+//! joins the recurrent state in the fixed per-request charge, and a host
+//! capacity ([`HostKvTier`]) bounds the summed context. The recurrent state
+//! stays on the GPU. Snapshot charges keep the recurrent state alone: a
+//! retained prefix holds no device buffer. Bounded-future admission does not
+//! check the host tier; the recipes that build one reject it.
+//!
 //! ## Not modeled
 //!
 //! Live snapshots yield to admission but are never *proactively* shed: there is
@@ -54,6 +65,7 @@ use crate::log::{
     KvSampler, KvSubmit, PrefixCacheActivation, PrefixCacheEvent, PrefixCacheEventKind,
     PrefixCacheEvictionReason, PrefixCacheLogger, PrefixCacheRetentionReason,
 };
+use crate::worker::kv::shared::host_tier::HostKvTier;
 use crate::worker::kv::shared::prefix_cache::{
     PrefixCache, PrefixCacheMutation, PrefixCacheReturnMetadata,
 };
@@ -72,16 +84,21 @@ pub struct HybridKvFootprint {
     /// Decode tokens the reservation covers: the whole remaining output, or a
     /// bounded-future estimate plus one page.
     future_decode_tokens: u32,
-    /// The whole model's recurrent state for this one request. Constant.
+    /// The whole model's recurrent state for this one request, plus any host
+    /// tier's device buffer. Constant.
     state_tokens: u64,
 }
 
 impl HybridKvFootprint {
+    /// The context part: what a host tier holds.
+    #[inline]
+    fn context_tokens(&self) -> u64 {
+        u64::from(self.post_prefill_context_tokens) + u64::from(self.future_decode_tokens)
+    }
+
     #[inline]
     fn reserved_charge(&self) -> u64 {
-        u64::from(self.post_prefill_context_tokens)
-            + u64::from(self.future_decode_tokens)
-            + self.state_tokens
+        self.context_tokens() + self.state_tokens
     }
 }
 
@@ -96,6 +113,8 @@ pub struct HybridGdnKv {
     state_tokens_per_request: u64,
     /// Context-token spacing of resumable snapshots. `0` = no recurrent state.
     checkpoint_interval_tokens: u32,
+    /// A HiSparse-style host tier for the per-token cache (see the module docs).
+    host_tier: Option<HostKvTier>,
 }
 
 impl KvStore for HybridGdnKv {
@@ -114,13 +133,14 @@ impl KvStore for HybridGdnKv {
         HybridKvFootprint {
             post_prefill_context_tokens,
             future_decode_tokens: remaining_output_tokens,
-            state_tokens: self.state_tokens_per_request,
+            state_tokens: self.fixed_tokens_per_request(),
         }
     }
 
     /// Both halves of the footprint are tested against one capacity, against
     /// both the immediate resident total and the projected decode peak. The
-    /// soft tier is deliberately absent: it yields to this decision.
+    /// soft tier is deliberately absent: it yields to this decision. A host
+    /// tier adds the same two tests over context tokens.
     fn fits(&self, partition: PartitionId, footprint: &Self::Footprint) -> bool {
         let partition_state = &self.partitions[partition as usize];
         let reserved_charge = self.ledger.partition_promised(partition)
@@ -129,6 +149,13 @@ impl KvStore for HybridGdnKv {
         partition_state.resident_tokens() + reserved_charge <= partition_state.capacity_tokens()
             && partition_state.projected_peak_kv() + reserved_charge
                 <= partition_state.capacity_tokens()
+            && self.host_tier.is_none_or(|tier| {
+                tier.fits(
+                    partition_state,
+                    self.promised_context_tokens(partition),
+                    footprint.context_tokens(),
+                )
+            })
     }
 
     fn reserve(
@@ -161,7 +188,7 @@ impl KvStore for HybridGdnKv {
         remaining_output_tokens: u32,
     ) {
         self.ledger.forget_promise(request);
-        // `ResidentPartitionState` charges `state_tokens_per_request` here and
+        // `ResidentPartitionState` charges `fixed_tokens_per_request` here and
         // releases it in `release_decode`; it is never advanced.
         self.partitions[partition as usize].begin_decode(
             request,
@@ -258,13 +285,20 @@ impl IterWorkerKv for HybridGdnKv {
             + self.partitions[partition as usize].prefill_admit_count()
     }
 
+    /// With a host tier, the fuller of the two memories.
     fn kv_usage(&self, partition: PartitionId) -> f64 {
         let partition_state = &self.partitions[partition as usize];
         let used = partition_state.resident_tokens()
             + self.clamped_live_checkpoint_charge(partition)
             + self.ledger.partition_held(partition)
             + self.ledger.partition_promised(partition);
-        used as f64 / partition_state.capacity_tokens().max(1) as f64
+        let gpu = used as f64 / partition_state.capacity_tokens().max(1) as f64;
+        match self.host_tier {
+            None => gpu,
+            Some(tier) => {
+                gpu.max(tier.usage(partition_state, self.promised_context_tokens(partition)))
+            }
+        }
     }
 
     fn kv_capacity_tokens(&self, partition: PartitionId) -> u64 {
@@ -498,7 +532,7 @@ impl ChunkedPrefillKv for HybridGdnKv {
         HybridKvFootprint {
             post_prefill_context_tokens,
             future_decode_tokens,
-            state_tokens: self.state_tokens_per_request,
+            state_tokens: self.fixed_tokens_per_request(),
         }
     }
 
@@ -671,7 +705,43 @@ impl HybridGdnKv {
             sampler,
             state_tokens_per_request,
             checkpoint_interval_tokens,
+            host_tier: None,
         }
+    }
+
+    /// Keep the per-token cache in a host tier: each request also holds
+    /// `tier.device_tokens_per_request` on the GPU beside its recurrent state,
+    /// and a partition's summed context is bounded by
+    /// `tier.host_capacity_tokens`. Call before any request is admitted.
+    pub(crate) fn with_host_tier(mut self, tier: HostKvTier) -> Self {
+        assert!(
+            self.ledger.placement_is_empty(),
+            "a host tier must be set before admission"
+        );
+        self.host_tier = Some(tier);
+        let fixed = self.fixed_tokens_per_request();
+        for partition in &mut self.partitions {
+            *partition = ResidentPartitionState::new(partition.capacity_tokens(), fixed);
+        }
+        self
+    }
+
+    /// GPU charge every request holds whatever its context: the recurrent
+    /// state, plus a host tier's device buffer.
+    #[inline]
+    fn fixed_tokens_per_request(&self) -> u64 {
+        self.state_tokens_per_request
+            + self
+                .host_tier
+                .map_or(0, |tier| tier.device_tokens_per_request)
+    }
+
+    fn promised_context_tokens(&self, partition: PartitionId) -> u64 {
+        HostKvTier::promised_context_tokens(
+            &self.ledger,
+            partition,
+            self.fixed_tokens_per_request(),
+        )
     }
 
     /// Exact prefix reuse, the engine vLLM's `align` mode works around: a
@@ -1138,5 +1208,76 @@ mod tests {
         assert_eq!(kv_store.prefix_caches[0].peek(7, 137), 137);
         assert_eq!(kv_store.prefix_caches[0].used_charge(), 137);
         assert_eq!(kv_store.clamped_live_checkpoint_charge(0), 0);
+    }
+
+    // ── host tier (HiSparse) ─────────────────────────────────────────────────
+
+    fn admit(kv_store: &mut HybridGdnKv, request: u32, context: u32, output: u32) {
+        let footprint = kv_store.footprint(RequestId(request), context, output);
+        assert!(kv_store.fits(0, &footprint));
+        kv_store.reserve(RequestId(request), 0, footprint, Time::ZERO);
+        kv_store.drain_ready();
+        kv_store.commit_resident(RequestId(request), 0, u64::from(context), output);
+    }
+
+    /// Catches a host tier replacing the recurrent state instead of joining
+    /// it: a request holds its state and the device buffer on the GPU.
+    #[test]
+    fn a_host_tier_charges_the_buffer_beside_the_recurrent_state() {
+        let tier = HostKvTier {
+            device_tokens_per_request: 300,
+            host_capacity_tokens: 1_000_000,
+        };
+        let mut kv_store = store(10_000, 100, 0).with_host_tier(tier);
+        let footprint = kv_store.footprint(RequestId(0), 90, 10);
+        assert_eq!(footprint.reserved_charge(), 100 + 100 + 300);
+        assert_eq!(footprint.context_tokens(), 100);
+        // 20 requests of 500 at their peak fill 10_000 exactly.
+        for request in 0..20 {
+            admit(&mut kv_store, request, 90, 10);
+        }
+        assert_eq!(kv_store.partitions[0].resident_tokens(), 20 * (90 + 400));
+        assert_eq!(kv_store.partitions[0].resident_context_tokens(), 20 * 90);
+        assert!(!kv_store.fits(0, &kv_store.footprint(RequestId(20), 1, 0)));
+        kv_store.release(RequestId(0), 0);
+        assert_eq!(kv_store.partitions[0].resident_tokens(), 19 * (90 + 400));
+        assert!(kv_store.fits(0, &kv_store.footprint(RequestId(20), 90, 10)));
+        // Snapshots keep pricing the recurrent state alone.
+        assert_eq!(kv_store.state_tokens_per_request, 100);
+    }
+
+    /// Catches the host tier counting the GPU's fixed charges as context: the
+    /// summed context of resident and promised requests is what it bounds.
+    #[test]
+    fn a_host_tier_bounds_the_summed_context_of_a_hybrid_store() {
+        let tier = HostKvTier {
+            device_tokens_per_request: 300,
+            host_capacity_tokens: 250,
+        };
+        let mut kv_store = store(1_000_000, 100, 0).with_host_tier(tier);
+        admit(&mut kv_store, 0, 90, 10);
+        let footprint = kv_store.footprint(RequestId(1), 90, 10);
+        kv_store.reserve(RequestId(1), 0, footprint, Time::ZERO);
+        assert_eq!(kv_store.promised_context_tokens(0), 100);
+        assert!(!kv_store.fits(0, &kv_store.footprint(RequestId(2), 90, 10)));
+        assert!(kv_store.fits(0, &kv_store.footprint(RequestId(2), 40, 10)));
+        kv_store.drain_ready();
+        kv_store.commit_resident(RequestId(1), 0, 90, 10);
+        assert_eq!(kv_store.partitions[0].resident_context_tokens(), 180);
+        assert_eq!(kv_store.partitions[0].projected_peak_context_tokens(), 200);
+        assert!(!kv_store.fits(0, &kv_store.footprint(RequestId(2), 45, 10)));
+        assert!(kv_store.fits(0, &kv_store.footprint(RequestId(2), 40, 10)));
+        assert!((kv_store.kv_usage(0) - 180.0 / 250.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn without_a_host_tier_the_fixed_charge_is_the_state() {
+        let kv_store = store(10_000, 100, 0);
+        assert!(kv_store.host_tier.is_none());
+        assert_eq!(kv_store.fixed_tokens_per_request(), 100);
+        assert_eq!(
+            kv_store.footprint(RequestId(0), 90, 10).reserved_charge(),
+            200
+        );
     }
 }

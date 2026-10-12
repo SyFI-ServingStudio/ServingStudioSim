@@ -17,17 +17,17 @@
 //! host memory (SGLang HiSparse). The GPU charge then counts the per-token part
 //! the GPU keeps (the indexer keys) plus a fixed device buffer per request,
 //! through the same fixed-charge seam a recurrent store uses; a second, host
-//! capacity bounds the requests' summed context. Both are derived from the
-//! existing ledgers -- the host occupancy is the charge minus the fixed part,
-//! resident and promised alike -- so no second ledger can drift, and
-//! [`KvStore::fits`] tests both. Bounded-future admission and PD handoff do not
-//! check the host tier; the recipes that build one reject them.
+//! capacity bounds the requests' summed context ([`HostKvTier`], shared with
+//! the hybrid store), and [`KvStore::fits`] tests both. Bounded-future
+//! admission and PD handoff do not check the host tier; the recipes that build
+//! one reject them.
 
 use crate::common::{RequestId, SessionInput, Time};
 use crate::log::{
     KvSampler, KvSubmit, PrefixCacheActivation, PrefixCacheEvent, PrefixCacheEventKind,
     PrefixCacheEvictionReason, PrefixCacheLogger, PrefixCacheRetentionReason,
 };
+use crate::worker::kv::shared::host_tier::HostKvTier;
 use crate::worker::kv::shared::prefix_cache::{
     PrefixCache, PrefixCacheMutation, PrefixCacheReturnMetadata,
 };
@@ -57,16 +57,6 @@ pub struct FullAttentionKvFootprint {
     /// The context part of `reserved_tokens`, which a host tier holds.
     context_tokens: u64,
     basis: ReservationBasis,
-}
-
-/// The host half of a HiSparse-style split cache, in the store's token units.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostKvTier {
-    /// Fixed GPU charge per resident or promised request, in units of the
-    /// per-token GPU bytes the store's capacity is counted in.
-    pub device_tokens_per_request: u64,
-    /// Context tokens one partition's host memory holds.
-    pub host_capacity_tokens: u64,
 }
 
 impl FullAttentionKvFootprint {
@@ -184,13 +174,10 @@ impl IterWorkerKv for FullAttnKv {
         let gpu = used as f64 / partition_state.capacity_tokens().max(1) as f64;
         match self.host_tier {
             None => gpu,
-            Some(tier) => {
-                let host = (partition_state.resident_context_tokens()
-                    + self.promised_context_tokens(partition, tier))
-                    as f64
-                    / tier.host_capacity_tokens.max(1) as f64;
-                gpu.max(host)
-            }
+            Some(tier) => gpu.max(tier.usage(
+                partition_state,
+                self.promised_context_tokens(partition, tier),
+            )),
         }
     }
 
@@ -618,9 +605,7 @@ impl FullAttnKv {
     /// Context tokens promised on `partition`: each promise's charge less its
     /// fixed device part.
     fn promised_context_tokens(&self, partition: PartitionId, tier: HostKvTier) -> u64 {
-        self.ledger.partition_promised(partition)
-            - tier.device_tokens_per_request
-                * u64::from(self.ledger.partition_promised_count(partition))
+        HostKvTier::promised_context_tokens(&self.ledger, partition, tier.device_tokens_per_request)
     }
 
     #[inline]
@@ -666,11 +651,11 @@ impl FullAttnKv {
         let Some(tier) = self.host_tier else {
             return true;
         };
-        let partition_state = &self.partitions[partition as usize];
-        let reserved = self.promised_context_tokens(partition, tier) + footprint.context_tokens;
-        partition_state.resident_context_tokens() + reserved <= tier.host_capacity_tokens
-            && partition_state.projected_peak_context_tokens() + reserved
-                <= tier.host_capacity_tokens
+        tier.fits(
+            &self.partitions[partition as usize],
+            self.promised_context_tokens(partition, tier),
+            footprint.context_tokens,
+        )
     }
 
     pub(crate) fn reserve(

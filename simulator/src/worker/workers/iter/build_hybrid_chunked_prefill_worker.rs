@@ -35,7 +35,7 @@ use crate::worker::types::WorkerConfig;
 use super::iter_batch_worker::{HybridChunkedPrefillWorker, IterBatchWorker};
 use super::session_tier_worker::SessionTierWorker;
 use crate::worker::workers::iter_build_essentials::{
-    full_attention_token_capacity, prepare_iter_build_essentials,
+    full_attention_token_capacity, host_kv_tier, prepare_iter_build_essentials,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -140,6 +140,26 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
+    // A host-tier cache (HiSparse) adds a fixed device buffer per request
+    // beside the recurrent state and bounds the summed context by host memory.
+    let kv_store = match host_kv_tier(
+        model.kv_host_offload(),
+        model.total_kv_bytes_per_token(),
+        &config,
+    ) {
+        Some(tier) => {
+            tracing::info!(
+                worker = id.0,
+                pool_tag,
+                kv_capacity_tokens = essentials.kv_capacity,
+                device_tokens_per_request = tier.device_tokens_per_request,
+                host_capacity_tokens = tier.host_capacity_tokens,
+                "host-tier KV: per-request device buffer and host context cap"
+            );
+            kv_store.with_host_tier(tier)
+        }
+        None => kv_store,
+    };
     let kv_store = if exact_reuse {
         kv_store.with_exact_prefix_reuse()
     } else {
