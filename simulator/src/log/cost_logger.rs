@@ -14,10 +14,12 @@
 //! run once the workers are dropped ([`cost_log_failures`]).
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 
 use anyhow::{anyhow, Result};
+
+use arrow_array::RecordBatch;
 
 use crate::common::WorkerId;
 use crate::log::parquet_writer::{EncodeThreads, StreamingParquetWriter};
@@ -88,6 +90,50 @@ fn high_cardinality_slot_columns() -> Vec<ColumnPath> {
         .iter()
         .map(|column| slot_list_column(column))
         .collect()
+}
+
+/// Arrow-converted chunks waiting for the encoder: enough to keep it busy
+/// while the next chunk converts, few enough to stay a small fraction of the
+/// queued rows.
+const BATCH_CHANNEL_CAP: usize = 2;
+
+/// The writer thread: convert `rx`'s chunks to Arrow on a second thread and
+/// encode them here, so the two stages overlap. Conversion is about a third of
+/// the writer's work (mostly serializing each `SlotInput`) and was serial with
+/// the encode. A failed encode drops the batch channel, which stops the
+/// converter at its next send; a failed conversion closes it, ending the
+/// encode loop. Either error is returned, the encoder's first.
+fn write_stream(rx: Receiver<CostLogChunk>, mut writer: StreamingParquetWriter) -> Result<()> {
+    std::thread::scope(|scope| {
+        let (batch_tx, batch_rx) = sync_channel::<Vec<RecordBatch>>(BATCH_CHANNEL_CAP);
+        let converter = std::thread::Builder::new()
+            .name("vibesim-cost-convert".to_string())
+            .spawn_scoped(scope, move || -> Result<()> {
+                for chunk in rx {
+                    let batches = cost_to_record_batches(&chunk)?;
+                    drop(chunk);
+                    if batch_tx.send(batches).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            })?;
+        let encoded = (|| -> Result<()> {
+            for batches in batch_rx {
+                for batch in &batches {
+                    writer.write(batch)?;
+                }
+            }
+            Ok(())
+        })();
+        let converted = converter
+            .join()
+            .map_err(|_| anyhow!("cost-log converter thread panicked"))?;
+        encoded?;
+        converted?;
+        writer.close()?;
+        Ok(())
+    })
 }
 
 pub(crate) fn cost_artifact_stem(pool_tag: &str, worker_id: WorkerId) -> String {
@@ -200,22 +246,14 @@ impl CostLogger {
             }
         }
         let encode_threads = EncodeThreads::new(MAX_ENCODE_THREADS);
-        let mut writer = StreamingParquetWriter::new(parquet_path.clone(), cost_log_schema())
+        let writer = StreamingParquetWriter::new(parquet_path.clone(), cost_log_schema())
             .with_column_dictionary_disabled(high_cardinality_slot_columns())
             .with_column_statistics_disabled(slot_list_columns())
             .with_encode_threads(encode_threads.handle());
         let (tx, rx) = sync_channel::<CostLogChunk>(CHANNEL_CAP);
         let handle = std::thread::Builder::new()
             .name("vibesim-cost-logger".to_string())
-            .spawn(move || -> Result<()> {
-                for chunk in rx {
-                    for batch in cost_to_record_batches(&chunk)? {
-                        writer.write(&batch)?;
-                    }
-                }
-                writer.close()?;
-                Ok(())
-            })?;
+            .spawn(move || write_stream(rx, writer))?;
 
         Ok(Self {
             tx: Some(tx),
