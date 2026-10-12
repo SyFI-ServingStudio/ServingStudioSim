@@ -108,9 +108,9 @@ pub struct HisparseH2dIoLog {
 }
 
 /// The analytic expert-parallel exchange of one sparse layer on its busiest
-/// rank (`arch::ep_comm`): which leg (`prepare`, `dispatch`, `combine`), the
-/// busiest sender's and receiver's rows, the bytes over the link and the fixed
-/// cost included in the slot's time.
+/// rank (`arch::ep_comm`): which leg (`prepare`, `dispatch`, `dispatch_scales`,
+/// `combine`), the busiest sender's and receiver's rows, the bytes over the
+/// link and the fixed cost included in the slot's time.
 #[derive(Clone, Serialize)]
 pub struct EpCommAnalyticLog {
     pub op: &'static str,

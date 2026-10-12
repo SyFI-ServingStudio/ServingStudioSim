@@ -1,10 +1,11 @@
 //! Analytic expert-parallel dispatch/combine for the GLM-5.3 NVFP4
 //! data-parallel-attention arches beyond one NVLink node (GB200 NVL72).
 //!
-//! The measured `moe_ep_quantized_all_gather` / `moe_ep_reduce_scatter` rows
-//! span at most 8 GPUs, so an EP group of 16..64 ranks in one NVL72 domain
-//! needs a model. This one is a link-bandwidth plus fixed-latency model per
-//! collective, priced on the busiest rank (the collective ends when it does).
+//! The measured `moe_ep_quantized_all_gather` / `moe_ep_reduce_scatter` and
+//! `moe_alltoall` rows span at most 8 GPUs, so an EP group of 16..64 ranks in
+//! one NVL72 domain needs a model. This one prices each collective on the
+//! busiest rank (the collective ends when it does) from its rows, their width
+//! and a fixed cost.
 //!
 //! ## Exchanges
 //!
@@ -24,9 +25,16 @@
 //!   the experts, and the combine: a zeroed `tokens x top_k` bf16 staging
 //!   buffer, one `moe_comm` of bf16 rows back, and a `torch.sum` over top-k.
 //!   The swizzle, fill and sum are measured elementwise leaves in the arch;
-//!   this module prices the prepare and the two transfers. One `moe_comm`
-//!   costs `latency + max(send, recv) bytes / link` on the busiest rank: one
-//!   CTA per peer, so the latency is flat in the peer count.
+//!   this module prices the prepare and the three `moe_comm` calls. One call
+//!   of `B`-byte rows costs, on the busiest rank,
+//!   `a + max(B / c, rows hypot(p, B / L))` with `rows = max(send, w recv)`:
+//!   a fixed cost `a`, flat in the peer count (one CTA per peer); a floor of
+//!   one row moved at `c`, which sets the small-message time and grows with
+//!   the row width; then a per-row cost that is the issue cost `p` for narrow
+//!   rows (the 384-byte scales run at ~140 GB/s) and the link `L` for wide
+//!   ones, joined in quadrature (a sum overshoots the 3,072-byte rows, a max
+//!   undershoots them). A received row weighs `w < 1` of a sent one: fan-in
+//!   arrives from every sender in parallel, egress leaves one GPU.
 //!
 //! ## Rows
 //!
@@ -42,11 +50,26 @@
 //!
 //! ## Calibration caveat
 //!
-//! The link default is NVLink5's 900 GB/s per direction times the 0.69
-//! efficiency the flashinfer MNNVL all-to-all reaches on H200 NVLink4
-//! (~310 of 450 GB/s); the all-to-all latency is the H200 graph-replay floor
-//! (a vLLM trace reads 25-50% higher at decode); the prepare is the H200 EP8
-//! fit. The peer scaling of the prepare is an assumption.
+//! The all-to-all constants are a fit to the B200 EP8 `flashinfer_mnnvl`
+//! rows profiled 2026-10-11 (`moe_alltoall`: 705 rows over 3,072-, 384- and
+//! 12,288-byte rows, send x recv 1..65,536; `moe_alltoall_prepare`: 68 rows,
+//! 1..65,536 tokens per rank; graph replay). The transfer fit is relative
+//! least squares over the 3 x 105 shapes with both sides >= 8 rows and within
+//! 2x of each other, the shapes this model produces: rms 4.2 / 3.9 / 4.2%,
+//! worst 16 / 13 / 19% (3,072 / 384 / 12,288 bytes); on the send = recv
+//! diagonal it reads 0-10% low, mostly 1-5%. Off the band it overprices
+//! receive-heavy shapes (4-8x more received than sent: up to +25..+50% at a
+//! few hundred to a few thousand rows), and at 1-4 rows it reads 4.2-7.3 us
+//! against 3.0-4.3 us measured (not every peer is reached). The prepare is
+//! the B200 EP8 intercept and slope over all 68 rows (rms 3.7%, worst +11% at
+//! 1 token).
+//! Applying them past EP8 assumes the per-call cost stays flat in the peer
+//! count and the link and per-row costs do not change on NVL72's
+//! inter-tray NVLink; the prepare's peer scaling is an assumption. The
+//! all-gather / reduce-scatter link is NVLink5's 900 GB/s per direction
+//! times the 0.69 efficiency the MNNVL all-to-all reached on H200 NVLink4.
+//! `tools/ep-comm-fit/fit_alltoall.py` refits them and prints the error
+//! tables.
 
 use serde::{Deserialize, Serialize};
 
@@ -57,15 +80,30 @@ use crate::timing::{CostNode, CostTreeBuilder, CoverageFlags, Evaluator, LeafMet
 /// The slot kind of every analytic exchange leaf.
 pub const EP_COMM_ANALYTIC_KIND: &str = "ep_comm_analytic";
 
-/// Default effective per-direction NVLink bandwidth per GPU: NVLink5 900 GB/s
-/// times the MNNVL all-to-all efficiency measured on H200 (0.69).
+/// Default effective per-direction NVLink bandwidth per GPU of the
+/// all-gather / reduce-scatter: NVLink5 900 GB/s times the MNNVL all-to-all
+/// efficiency measured on H200 (0.69).
 pub const DEFAULT_LINK_GB_PER_S: f64 = 620.0;
-/// One `moe_comm` call's floor: the H200 EP8 graph-replay fit at <= 1024 rows.
-pub const DEFAULT_A2A_LATENCY_US: f64 = 6.0;
-/// The all-to-all prepare at EP8: intercept and per-token slope of the H200
-/// EP8 `moe_alltoall_prepare` rows up to 2,048 tokens per rank.
-pub const DEFAULT_PREPARE_LATENCY_US: f64 = 16.8;
-const PREPARE_US_PER_TOKEN: f64 = 0.0147;
+/// The all-to-all's link `L`: B200 EP8 `moe_alltoall` fit (2026-10-11; the
+/// 12,288-byte combine tops out at ~625 GB/s).
+pub const DEFAULT_A2A_LINK_GB_PER_S: f64 = 638.0;
+/// One `moe_comm` call's fixed cost `a`: B200 EP8 `moe_alltoall` fit
+/// (2026-10-11; floors of 4.5 / 5.0 / 7.4 us at 8..128 rows of 384 / 3,072 /
+/// 12,288 bytes).
+pub const DEFAULT_A2A_LATENCY_US: f64 = 4.11;
+/// The all-to-all's one-row floor `c`, GB/s (B200 EP8 fit, 2026-10-11).
+const A2A_ROW_FLOOR_GB_PER_S: f64 = 3.81;
+/// The all-to-all's per-row issue cost `p`, us (B200 EP8 fit, 2026-10-11:
+/// 2.55 ns; the 384-byte scales run at ~2.75 ns per row at 64k rows).
+const A2A_PER_ROW_US: f64 = 0.002_55;
+/// Weight `w` of a received row against a sent one (B200 EP8 fit,
+/// 2026-10-11).
+const A2A_RECV_ROW_WEIGHT: f64 = 0.9;
+/// The all-to-all prepare at EP8: intercept and per-token slope of the B200
+/// EP8 `moe_alltoall_prepare` rows, 1..65,536 tokens per rank, with the
+/// metadata transfer over [`DEFAULT_A2A_LINK_GB_PER_S`] (2026-10-11; rms 3.7%).
+pub const DEFAULT_PREPARE_LATENCY_US: f64 = 21.9;
+const PREPARE_US_PER_TOKEN: f64 = 0.0133;
 /// Growth of the prepare's fixed part per doubling of the EP group past 8
 /// (more peers to signal and wait on; assumption).
 const PREPARE_GROWTH_PER_DOUBLING: f64 = 0.25;
@@ -107,8 +145,10 @@ pub enum EpCommModel {
 pub struct EpCommConfig {
     pub kind: EpCommKind,
     pub model: EpCommModel,
-    /// Effective per-direction NVLink bandwidth per GPU, GB/s (1e9).
-    pub link_gb_per_s: f64,
+    /// Effective per-direction NVLink bandwidth per GPU, GB/s (1e9); `None`
+    /// is the kind's default ([`DEFAULT_LINK_GB_PER_S`] or
+    /// [`DEFAULT_A2A_LINK_GB_PER_S`]).
+    pub link_gb_per_s: Option<f64>,
     /// One all-to-all `moe_comm` call's fixed cost, us.
     pub a2a_latency_us: f64,
     /// Multiplies every collective's fixed cost (all-gather, reduce-scatter
@@ -125,7 +165,7 @@ impl Default for EpCommConfig {
         Self {
             kind: EpCommKind::default(),
             model: EpCommModel::default(),
-            link_gb_per_s: DEFAULT_LINK_GB_PER_S,
+            link_gb_per_s: None,
             a2a_latency_us: DEFAULT_A2A_LATENCY_US,
             latency_scale: 1.0,
             prepare_latency_us: DEFAULT_PREPARE_LATENCY_US,
@@ -139,10 +179,18 @@ impl EpCommConfig {
         self.model == EpCommModel::Measured && self.kind == EpCommKind::AllgatherReducescatter
     }
 
+    /// The link the analytic model prices this kind's rows over, GB/s.
+    pub fn link_gb_per_s(&self) -> f64 {
+        self.link_gb_per_s.unwrap_or(match self.kind {
+            EpCommKind::AllgatherReducescatter => DEFAULT_LINK_GB_PER_S,
+            EpCommKind::Alltoall => DEFAULT_A2A_LINK_GB_PER_S,
+        })
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let positive = |value: f64| value.is_finite() && value > 0.0;
         let non_negative = |value: f64| value.is_finite() && value >= 0.0;
-        if !positive(self.link_gb_per_s)
+        if !positive(self.link_gb_per_s())
             || !non_negative(self.a2a_latency_us)
             || !non_negative(self.latency_scale)
             || !non_negative(self.prepare_latency_us)
@@ -196,7 +244,10 @@ pub struct AlltoallRows {
 pub struct EpCommStep {
     /// All-to-all only.
     pub prepare: EpCommLeg,
+    /// The all-gather, or the all-to-all's NVFP4 activations.
     pub dispatch: EpCommLeg,
+    /// All-to-all only: the block scales' own `moe_comm` call.
+    pub dispatch_scales: EpCommLeg,
     pub combine: EpCommLeg,
 }
 
@@ -278,7 +329,7 @@ impl AnalyticEpComm {
     }
 
     fn bytes_per_us(&self) -> f64 {
-        self.config.link_gb_per_s * 1e3
+        self.config.link_gb_per_s() * 1e3
     }
 
     fn leg(&self, send: f64, recv: f64, row_bytes: f64, latency_us: f64) -> EpCommLeg {
@@ -289,6 +340,39 @@ impl AnalyticEpComm {
             bytes,
             latency_us,
             time_us: latency_us + bytes / self.bytes_per_us(),
+        }
+    }
+
+    /// One all-to-all `moe_comm` call of `row_bytes`-wide rows on the busiest
+    /// rank (the module doc's form).
+    pub fn alltoall_call(&self, send: f64, recv: f64, row_bytes: f64) -> EpCommLeg {
+        let latency_us = self.a2a_latency_us();
+        let rows = send.max(A2A_RECV_ROW_WEIGHT * recv);
+        let per_row_us = A2A_PER_ROW_US.hypot(row_bytes / self.bytes_per_us());
+        let floor_us = row_bytes / (A2A_ROW_FLOOR_GB_PER_S * 1e3);
+        EpCommLeg {
+            max_send_rows: send,
+            max_recv_rows: recv,
+            bytes: send.max(recv) * row_bytes,
+            latency_us,
+            time_us: latency_us + floor_us.max(rows * per_row_us),
+        }
+    }
+
+    /// The all-to-all prepare: the per-token scan of the busiest rank's
+    /// `busiest_tokens`, then the ids and weights of the busiest receiver's
+    /// `recv` rows over the link.
+    pub fn alltoall_prepare(&self, busiest_tokens: u32, recv: f64) -> EpCommLeg {
+        let metadata = recv * f64::from(8 * self.top_k);
+        let fixed_us = self.config.prepare_scale * self.prepare_fixed_us();
+        EpCommLeg {
+            max_send_rows: f64::from(busiest_tokens),
+            max_recv_rows: recv,
+            bytes: metadata,
+            latency_us: fixed_us,
+            time_us: fixed_us
+                + self.config.prepare_scale * PREPARE_US_PER_TOKEN * f64::from(busiest_tokens)
+                + metadata / self.bytes_per_us(),
         }
     }
 
@@ -307,9 +391,14 @@ impl AnalyticEpComm {
         f64::from(self.hidden * 2)
     }
 
-    /// NVFP4 activations plus block scales of one dispatched row.
-    pub fn dispatch_row_bytes(&self) -> f64 {
-        f64::from(self.hidden / 2 + self.hidden / 16)
+    /// The NVFP4 activations of one dispatched row.
+    pub fn nvfp4_row_bytes(&self) -> f64 {
+        f64::from(self.hidden / 2)
+    }
+
+    /// The fp8 block scales of one dispatched row (one per 16 elements).
+    pub fn scale_row_bytes(&self) -> f64 {
+        f64::from(self.hidden / 16)
     }
 
     pub fn ag_latency_us(&self) -> f64 {
@@ -370,6 +459,7 @@ impl AnalyticEpComm {
                 });
                 EpCommStep {
                     prepare: EpCommLeg::default(),
+                    dispatch_scales: EpCommLeg::default(),
                     dispatch: self.leg(
                         gather_send,
                         gather_recv,
@@ -390,26 +480,13 @@ impl AnalyticEpComm {
                     send,
                     recv,
                 } = self.alltoall_rows(tokens);
-                // Prepare: the per-token scan, then the ids and weights of
-                // every received row over the link.
-                let metadata = recv * f64::from(8 * self.top_k);
-                let prepare_us = self.config.prepare_scale
-                    * (self.prepare_fixed_us() + PREPARE_US_PER_TOKEN * f64::from(busiest))
-                    + metadata / self.bytes_per_us();
-                let latency = self.a2a_latency_us();
-                // Activations and scales are two `moe_comm` calls.
-                let dispatch = self.leg(send, recv, self.dispatch_row_bytes(), 2.0 * latency);
                 EpCommStep {
-                    prepare: EpCommLeg {
-                        max_send_rows: f64::from(busiest),
-                        max_recv_rows: recv,
-                        bytes: metadata,
-                        latency_us: self.config.prepare_scale * self.prepare_fixed_us(),
-                        time_us: prepare_us,
-                    },
-                    dispatch,
+                    prepare: self.alltoall_prepare(busiest, recv),
+                    // Activations and scales are two `moe_comm` calls.
+                    dispatch: self.alltoall_call(send, recv, self.nvfp4_row_bytes()),
+                    dispatch_scales: self.alltoall_call(send, recv, self.scale_row_bytes()),
                     // Each expert rank returns one reduced row per row it got.
-                    combine: self.leg(recv, send, self.bf16_row_bytes(), latency),
+                    combine: self.alltoall_call(recv, send, self.bf16_row_bytes()),
                 }
             }
         }
@@ -418,7 +495,9 @@ impl AnalyticEpComm {
     pub fn label(&self) -> String {
         format!(
             "analytic {:?} over {} GB/s per direction; latency x{}",
-            self.config.kind, self.config.link_gb_per_s, self.config.latency_scale
+            self.config.kind,
+            self.config.link_gb_per_s(),
+            self.config.latency_scale
         )
     }
 
@@ -432,7 +511,7 @@ impl AnalyticEpComm {
                 "op": op,
                 "kind": self.config.kind,
                 "ep_size": self.ep_size,
-                "link_gb_per_s": self.config.link_gb_per_s,
+                "link_gb_per_s": self.config.link_gb_per_s(),
                 "latency_scale": self.config.latency_scale,
                 "prepare_scale": self.config.prepare_scale,
             }),
@@ -542,17 +621,73 @@ mod tests {
         let mean = 64.0 * 32.0 * a2a.uniform_hit;
         assert!(step.dispatch.max_recv_rows >= mean * 0.999);
         assert!(step.dispatch.max_recv_rows <= mean * 2.5);
-        assert!(close(step.dispatch.latency_us, 12.0));
+        // Activations and scales: two calls of the same rows.
+        assert!(close(step.dispatch.latency_us, 4.11));
+        assert!(close(step.dispatch_scales.latency_us, 4.11));
+        assert_eq!(step.dispatch_scales.max_send_rows, step.dispatch.max_send_rows);
+        assert!(close(step.dispatch.bytes, 8.0 * step.dispatch_scales.bytes));
         assert!(close(step.combine.max_send_rows, step.dispatch.max_recv_rows));
         assert!(close(
             step.combine.bytes,
             step.dispatch.max_recv_rows.max(step.dispatch.max_send_rows) * 12288.0
         ));
         // Prepare: fixed part grows 1.75x from EP8 to EP64.
-        assert!(close(a2a.prepare_fixed_us(), 16.8 * 1.75));
-        assert!(step.prepare.time_us > 16.8 * 1.75);
+        assert!(close(a2a.prepare_fixed_us(), 21.9 * 1.75));
+        assert!(step.prepare.time_us > 21.9 * 1.75);
         // Skew decays to uniform at large exchanges.
         assert!(a2a.busiest_hit(64) >= a2a.busiest_hit(131_072));
         assert!((a2a.busiest_hit(131_072) / a2a.uniform_hit - 1.0).abs() < 0.05);
+    }
+
+    /// The all-to-all constants are the 2026-10-11 fit to the B200 EP8
+    /// `flashinfer_mnnvl` rows; the targets below are those rows (us, graph
+    /// replay, send = recv). Re-fitting moves this test on purpose.
+    #[test]
+    fn the_alltoall_fit_reproduces_the_b200_ep8_rows() {
+        assert_eq!(DEFAULT_A2A_LINK_GB_PER_S, 638.0);
+        assert_eq!(DEFAULT_A2A_LATENCY_US, 4.11);
+        assert_eq!(A2A_ROW_FLOOR_GB_PER_S, 3.81);
+        assert_eq!(A2A_PER_ROW_US, 0.002_55);
+        assert_eq!(A2A_RECV_ROW_WEIGHT, 0.9);
+        assert_eq!(DEFAULT_PREPARE_LATENCY_US, 21.9);
+        assert_eq!(PREPARE_US_PER_TOKEN, 0.0133);
+        // The all-gather / reduce-scatter keep their link.
+        let ag = comm(EpCommKind::AllgatherReducescatter, 8);
+        assert_eq!(ag.config.link_gb_per_s(), 620.0);
+        let a2a = comm(EpCommKind::Alltoall, 8);
+        assert_eq!(a2a.config.link_gb_per_s(), 638.0);
+        assert_eq!(
+            EpCommConfig {
+                link_gb_per_s: Some(900.0),
+                ..a2a.config.clone()
+            }
+            .link_gb_per_s(),
+            900.0
+        );
+        let within = |model: f64, measured: f64, tolerance: f64, what: &str| {
+            let error = model / measured - 1.0;
+            assert!(error.abs() <= tolerance, "{what}: {model:.2} vs {measured:.2} us");
+        };
+        // (rows, NVFP4 activations, block scales, bf16 combine) on the diagonal.
+        for (rows, x, scales, combine) in [
+            (64.0, 4.97, 4.52, 7.38),
+            (1_024.0, 10.05, 7.18, 24.46),
+            (8_192.0, 49.25, 27.02, 168.58),
+            (65_536.0, 372.23, 180.16, 1_290.41),
+        ] {
+            for (bytes, measured) in [(3_072.0, x), (384.0, scales), (12_288.0, combine)] {
+                let model = a2a.alltoall_call(rows, rows, bytes).time_us;
+                within(model, measured, 0.06, &format!("{bytes} B x {rows}"));
+            }
+        }
+        // Off the diagonal a received row weighs 0.9 of a sent one.
+        within(a2a.alltoall_call(8_192.0, 4_096.0, 12_288.0).time_us, 162.67, 0.02, "send-heavy");
+        within(a2a.alltoall_call(4_096.0, 8_192.0, 12_288.0).time_us, 145.57, 0.02, "recv-heavy");
+        // Prepare at the busiest rank's tokens, uniform EP8 receive.
+        for (tokens, measured) in [(64, 22.56), (1_024, 36.83), (8_192, 131.55), (24_576, 342.57)] {
+            let recv = f64::from(tokens) * 8.0 * a2a.uniform_hit;
+            let model = a2a.alltoall_prepare(tokens, recv).time_us;
+            within(model, measured, 0.06, &format!("prepare x {tokens}"));
+        }
     }
 }

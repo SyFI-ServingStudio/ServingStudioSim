@@ -563,16 +563,17 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "measured", choices = EP_COMM_MODELS)]
         ep_comm_model: EpCommModel,
-        /// Analytic: effective per-direction NVLink GB/s per GPU (default 620).
+        /// Analytic: effective per-direction NVLink GB/s per GPU (default 620
+        /// for the all-gather / reduce-scatter, 638 for the all-to-all).
         #[serde(default)]
         ep_link_gb_per_s: Option<f64>,
-        /// Analytic: one all-to-all `moe_comm` call's fixed us (default 6).
+        /// Analytic: one all-to-all `moe_comm` call's fixed us (default 4.11).
         #[serde(default)]
         ep_comm_latency_us: Option<f64>,
         /// Analytic: multiplier on every collective's fixed cost (default 1).
         #[serde(default)]
         ep_comm_latency_scale: Option<f64>,
-        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 16.8).
+        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.9).
         #[serde(default)]
         ep_prepare_latency_us: Option<f64>,
         /// Analytic all-to-all: multiplier on the whole prepare (default 1).
@@ -802,16 +803,17 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "measured", choices = EP_COMM_MODELS)]
         ep_comm_model: EpCommModel,
-        /// Analytic: effective per-direction NVLink GB/s per GPU (default 620).
+        /// Analytic: effective per-direction NVLink GB/s per GPU (default 620
+        /// for the all-gather / reduce-scatter, 638 for the all-to-all).
         #[serde(default)]
         ep_link_gb_per_s: Option<f64>,
-        /// Analytic: one all-to-all `moe_comm` call's fixed us (default 6).
+        /// Analytic: one all-to-all `moe_comm` call's fixed us (default 4.11).
         #[serde(default)]
         ep_comm_latency_us: Option<f64>,
         /// Analytic: multiplier on every collective's fixed cost (default 1).
         #[serde(default)]
         ep_comm_latency_scale: Option<f64>,
-        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 16.8).
+        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.9).
         #[serde(default)]
         ep_prepare_latency_us: Option<f64>,
         /// Analytic all-to-all: multiplier on the whole prepare (default 1).
@@ -1340,7 +1342,7 @@ impl IterArchSel {
         EpCommConfig {
             kind: *ep_comm,
             model: *ep_comm_model,
-            link_gb_per_s: ep_link_gb_per_s.unwrap_or(defaults.link_gb_per_s),
+            link_gb_per_s: *ep_link_gb_per_s,
             a2a_latency_us: ep_comm_latency_us.unwrap_or(defaults.a2a_latency_us),
             latency_scale: ep_comm_latency_scale.unwrap_or(defaults.latency_scale),
             prepare_latency_us: ep_prepare_latency_us.unwrap_or(defaults.prepare_latency_us),

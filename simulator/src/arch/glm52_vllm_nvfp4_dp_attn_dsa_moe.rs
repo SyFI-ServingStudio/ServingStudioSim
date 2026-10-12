@@ -648,6 +648,11 @@ impl DpSparseLayer {
                             "dispatch",
                             builder,
                         ));
+                        chain.push(comm.compile_leg(
+                            format!("{}.moe.dispatch_alltoall_scales", self.name),
+                            "dispatch_scales",
+                            builder,
+                        ));
                     }
                 }
                 chain.push(ranks_max(builder, scale_swizzle, "dispatch_scale_swizzle"));
@@ -796,6 +801,7 @@ impl DpSparseLayer {
                     _ => {
                         push_leg("prepare", analytic.prepare, ev);
                         push_leg("dispatch", analytic.dispatch, ev);
+                        push_leg("dispatch_scales", analytic.dispatch_scales, ev);
                     }
                 }
                 // Every rank swizzles its whole receive allocation.
@@ -1954,13 +1960,31 @@ mod tests {
             assert!(slots
                 .iter()
                 .all(|slot| !slot.kind.starts_with("moe_ep_")));
-            // All-to-all: a prepare per section and three elementwise leaves
-            // per rank per section on top.
+            // All-to-all: a prepare and a second dispatch call (the block
+            // scales) per section and three elementwise leaves per rank per
+            // section on top, named as the measured EP8 lookups.
             let model = built_with(&analytic(ep_size, 72, EpCommKind::Alltoall));
             assert_eq!(
                 model.n_slots,
-                expected_slot_count(ep_size) + 3 * (1 + 3 * usize::from(ep_size)),
+                expected_slot_count(ep_size) + 3 * (2 + 3 * usize::from(ep_size)),
                 "EP{ep_size}"
+            );
+            let analytic_leaves: Vec<_> = model
+                .cost_log_manifest()
+                .slots
+                .into_iter()
+                .filter(|slot| slot.kind == crate::arch::ep_comm::EP_COMM_ANALYTIC_KIND)
+                .map(|slot| slot.name.rsplit('.').next().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                analytic_leaves,
+                [
+                    "dispatch_alltoall_prepare",
+                    "dispatch_alltoall",
+                    "dispatch_alltoall_scales",
+                    "combine_alltoall"
+                ]
+                .repeat(3)
             );
             assert_eq!(model.gpus_per_replica(), ep_size);
             let resolved = resolve_configs(
