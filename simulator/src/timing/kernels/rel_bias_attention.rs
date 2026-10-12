@@ -13,37 +13,17 @@
 //! The runtime input is the exact `query_context_pairs` batch. A mixed batch is
 //! one lookup, never a decode lookup plus a prefill lookup: the launches are
 //! shared and the decode CTAs run on the prefill's tile shape. The batch
-//! projects to three cache coordinates:
+//! projects to `(num_decode_requests, prefill_tokens, equivalent_context)` by
+//! the shared FA4 varlen projection (`fa4_varlen_projection`); this file holds
+//! the fork's rules it is parameterized by:
 //!
-//! - `num_decode_requests`: requests with one query token. In decode-only
-//!   steps this is the batch size and sets the global split count.
-//! - `prefill_tokens`: query tokens of the other requests. It sets the bucketed
-//!   tile shape, the M-tile count and the ShearingBias rows. Up to 128 tokens
-//!   it is rounded up to its power-of-two bucket (at least 32): there the
-//!   bucket, not the count, decides the q_stage, the cu-blocks launches, the
-//!   split rule and the M-tile count (one tile per `128 * q_stage` packed
-//!   rows), so a 40-token chunk runs like a 64-token one, not like the mean of
-//!   32 and 64.
-//! - `equivalent_context`: the context `C` at which the canonical batch with
-//!   the same two counts has the same modelled FA4 makespan as the real batch.
-//!   The canonical batch is `num_decode_requests` decodes at context `C` and,
-//!   when `prefill_tokens > 0`, one chunk of `prefill_tokens` with prefix
-//!   `min(C - 1, max_model_len - prefill_tokens)`.
-//!
-//! The makespan model counts KV tiles (128 keys) per CTA: one CTA per
-//! (request, KV head, M tile, split), the M tile holding `128 * q_stage` packed
-//! query rows, a local tile reading only its window. A CTA costs its tiles plus
-//! a fixed overhead, and the launch lasts `max(longest CTA, total / SMs)` plus
-//! a quarter of `total / SMs` for the bandwidth the CTAs share. It
-//! is monotone in `C`, so the projection is exact on every canonical point and
-//! a heterogeneous batch maps to the uniform context that keeps the same
-//! critical path: a single-wave batch follows its longest request, a
-//! many-wave batch its total work.
-//!
-//! Between two grid decode counts the decode coordinate is placed by the same
-//! CTA model counted in whole waves of 148 CTAs (`decode_coordinate`), so a
-//! wave or split-count step lands where it happens instead of being averaged
-//! across the cell.
+//! - `prefill_tokens` up to 128 is rounded up to its power-of-two bucket (at
+//!   least 32): there the bucket, not the count, decides the q_stage, the
+//!   cu-blocks launches, the split rule and the M-tile count (one tile per
+//!   `128 * q_stage` packed rows), so a 40-token chunk runs like a 64-token
+//!   one, not like the mean of 32 and 64.
+//! - The split count is `inkling_fa4_num_splits` (`num_splits`), uniform over
+//!   the batch; local layers read only their `rel_extent` window.
 //!
 //! A FULL CUDA-graph decode step launches over the captured batch size, not
 //! the real one: the model runner pads `seq_lens` with zero-length requests
@@ -60,21 +40,15 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::fa4_varlen_projection::{
+    canonical_pairs, counts, global_context_axis, project, Fa4VarlenCall, VarlenTiling,
+    CONTEXT_TILE_OFFSET,
+};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
-/// SMs on the only supported GPU (NVIDIA B200).
-const B200_SMS: f64 = 148.0;
-/// FA4 SM100 tile: 128 packed query rows per stage, 128 keys per KV tile.
+/// FA4 SM100 tile: 128 packed query rows per stage.
 const TILE_M: u32 = 128;
-const TILE_N: f64 = 128.0;
-/// Per-CTA prologue/epilogue cost in KV-tile units.
-const CTA_OVERHEAD_TILES: f64 = 1.0;
-/// Weight of the per-SM share of all work on top of the critical path: CTAs
-/// share HBM and L2, so work off the critical path still slows it. It also
-/// keeps the model strictly increasing where the critical path is flat (a
-/// local prefill chunk beside short decodes).
-const SHARED_WORK_WEIGHT: f64 = 0.25;
 /// Decode-request counts on the grid, placed for GQA 4 with 2 KV heads. A
 /// local decode runs one CTA per (request, KV head), so the first wave fills
 /// 148 SMs at `148 / num_kv_heads` requests; 80 sits just past it at 2 KV heads
@@ -91,10 +65,6 @@ const DECODE_AXIS: [u32; 9] = [0, 1, 8, 16, 32, 64, 80, 128, 256];
 /// one M tile at q_stage 1 whatever its size (B200 global, 4175 keys: 28.6 us
 /// at 16 tokens, 28.2 us at 32).
 const PREFILL_AXIS: [u32; 8] = [0, 32, 64, 128, 256, 512, 1024, 2048];
-/// Contexts sit half a KV tile past a tile boundary (`128 k + 64`): a real
-/// context is rarely tile-aligned, and an aligned one reads one KV tile fewer
-/// (B200 local decode: 18.7 us at 1024 keys, 20.8 us at 6000).
-const CONTEXT_TILE_OFFSET: u32 = 64;
 /// Global contexts double from 512 keys up to this many, then grow by 4x.
 /// Up to here the split scheduler still raises the per-request split count
 /// with the context (one KV tile per split while a request has fewer tiles
@@ -103,7 +73,6 @@ const CONTEXT_TILE_OFFSET: u32 = 64;
 /// 131072 keys: 4x steps interpolate 1 to 256 decodes and 2048-token chunks
 /// within 10%).
 const CONTEXT_DOUBLING_END: u32 = 2048;
-const BISECTION_STEPS: usize = 48;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RelBiasAttentionKernelConfig {
@@ -162,17 +131,6 @@ impl SweepCoords for RelBiasAttentionKernelInput {
     }
 }
 
-/// `(decode requests, prefill query tokens)`.
-fn counts(pairs: &[(u32, u32)]) -> (u32, u32) {
-    let decodes = pairs.iter().filter(|&&(query, _)| query == 1).count() as u32;
-    let prefill = pairs
-        .iter()
-        .filter(|&&(query, _)| query > 1)
-        .map(|&(query, _)| query)
-        .sum();
-    (decodes, prefill)
-}
-
 /// `bucket_max_seqlen_q`: the max query length rounded up to a power of two.
 fn bucket(max_query: u32) -> u32 {
     max_query.max(1).next_power_of_two()
@@ -225,224 +183,76 @@ fn num_splits(config: &RelBiasAttentionKernelConfig, batch: u32, bucket: u32) ->
         .max(1)
 }
 
-/// Every CTA's modelled work in KV-tile units (see the module doc).
-/// `launched` is the batch the split rule sees: `pairs.len()`, or the
-/// graph-padded size (the padding slots add no CTA work).
-fn cta_works(
-    config: &RelBiasAttentionKernelConfig,
-    pairs: &[(u32, u32)],
-    launched: u32,
-) -> Vec<f64> {
-    assert!(!pairs.is_empty(), "query_context_pairs must be non-empty");
-    let max_query = pairs.iter().map(|&(query, _)| query).max().unwrap();
-    let bucket = bucket(max_query);
-    let g = q_heads_per_kv_head(config);
-    let q_stage = if bucket * g > TILE_M { 2 } else { 1 };
-    let tile_tokens = (TILE_M * q_stage / g).max(1);
-    let splits = num_splits(config, launched.max(pairs.len() as u32), bucket);
-    let copies = (splits * config.num_kv_heads.get()) as usize;
-    let window = f64::from(config.rel_extent);
-
-    let mut works = Vec::new();
-    for &(query, context) in pairs {
-        assert!(
-            query > 0 && query <= context,
-            "each pair needs 0 < query <= context"
-        );
-        let prefix = f64::from(context - query);
-        for tile in 0..query.div_ceil(tile_tokens) {
-            let first = prefix + f64::from(tile * tile_tokens);
-            let end = prefix + f64::from(((tile + 1) * tile_tokens).min(query));
-            let start = if config.is_local {
-                (first + 1.0 - window).max(0.0)
-            } else {
-                0.0
-            };
-            let cta = (end - start) / TILE_N / f64::from(splits) + CTA_OVERHEAD_TILES;
-            works.extend(std::iter::repeat_n(cta, copies));
-        }
+impl Fa4VarlenCall for RelBiasAttentionKernelConfig {
+    fn num_kv_heads(&self) -> u32 {
+        self.num_kv_heads.get()
     }
-    works
-}
 
-/// Modelled FA4 makespan: `max(longest CTA, total / SMs)` plus the shared
-/// share. Continuous and monotone in every context; the context projection
-/// inverts it.
-fn makespan(config: &RelBiasAttentionKernelConfig, pairs: &[(u32, u32)], launched: u32) -> f64 {
-    let works = cta_works(config, pairs, launched);
-    let longest = works.iter().copied().fold(0.0, f64::max);
-    let per_sm = works.iter().sum::<f64>() / B200_SMS;
-    longest.max(per_sm) + SHARED_WORK_WEIGHT * per_sm
-}
+    fn max_model_len(&self) -> u32 {
+        self.max_model_len
+    }
 
-/// Modelled FA4 makespan with whole CTA waves: CTAs longest first, each wave of
-/// 148 lasting as long as its first. It carries the steps a batch-size change
-/// makes (another wave, a different split count), which the decode-count
-/// coordinate follows between grid points.
-fn wave_makespan(config: &RelBiasAttentionKernelConfig, pairs: &[(u32, u32)]) -> f64 {
-    let mut works = cta_works(config, pairs, pairs.len() as u32);
-    works.sort_unstable_by(|lhs, rhs| rhs.total_cmp(lhs));
-    let waves = works.iter().step_by(B200_SMS as usize).sum::<f64>();
-    waves + SHARED_WORK_WEIGHT * works.iter().sum::<f64>() / B200_SMS
-}
+    fn window(&self) -> Option<u32> {
+        self.is_local.then_some(self.rel_extent)
+    }
 
-/// The decode-count coordinate. On the grid it is the count; between two grid
-/// counts it is placed where the wave model of the canonical batch puts it, so
-/// a step (a third CTA wave at 150 requests, the global split count dropping
-/// from 3 to 1 between 4 and 8 requests beside a 128-token chunk) lands where
-/// it happens rather than being spread over the cell.
-fn decode_coordinate(
-    config: &RelBiasAttentionKernelConfig,
-    decodes: u32,
-    prefill: u32,
-    context: f64,
-) -> f64 {
-    let Some(hi_index) = DECODE_AXIS.iter().position(|&grid| grid >= decodes) else {
-        return f64::from(decodes);
-    };
-    let hi = DECODE_AXIS[hi_index];
-    if hi == decodes || hi_index == 0 {
-        return f64::from(decodes);
+    fn decode_axis(&self) -> &'static [u32] {
+        &DECODE_AXIS
     }
-    let lo = DECODE_AXIS[hi_index - 1];
-    let context = context.round() as u32;
-    let model = |count: u32| {
-        let pairs = canonical_pairs(config, count, prefill, context)
-            .expect("a grid neighbour of a decode count >= 1 is non-empty");
-        wave_makespan(config, &pairs)
-    };
-    let (m_lo, m, m_hi) = (model(lo), model(decodes), model(hi));
-    let linear = f64::from(decodes - lo) / f64::from(hi - lo);
-    let t = if m_hi - m_lo > 1e-9 {
-        ((m - m_lo) / (m_hi - m_lo)).clamp(0.0, 1.0)
-    } else {
-        linear
-    };
-    // Where the model is linear across the cell, keep the count itself exact.
-    if (t - linear).abs() < 1e-6 {
-        return f64::from(decodes);
-    }
-    f64::from(lo) + t * f64::from(hi - lo)
-}
 
-/// The canonical batch at a grid point; `None` for the empty batch. Its
-/// prefill tokens are one chunk, however many requests they came from.
-fn canonical_pairs(
-    config: &RelBiasAttentionKernelConfig,
-    decodes: u32,
-    prefill: u32,
-    context: u32,
-) -> Option<Vec<(u32, u32)>> {
-    if decodes == 0 && prefill == 0 {
-        return None;
-    }
-    let context = context.clamp(1, config.max_model_len);
-    let mut pairs = vec![(1, context); decodes as usize];
-    if prefill > 0 {
-        let prefix = (context - 1).min(config.max_model_len.saturating_sub(prefill));
-        pairs.push((prefill, prefix + prefill));
-    }
-    Some(pairs)
-}
-
-/// The cache coordinates of a real batch launched over `padded_requests`
-/// slots (see the module doc; 0 = unpadded).
-fn project(
-    config: &RelBiasAttentionKernelConfig,
-    pairs: &[(u32, u32)],
-    padded_requests: u32,
-) -> [f64; 3] {
-    // Known limit: several prefill requests in one step are projected as one
-    // chunk of their summed query tokens. When the real batch has less work
-    // than that chunk at C = 1 (eight fresh 256-token prompts against one
-    // 2048-token chunk), the context clamps to C = 1 and the step is
-    // overpriced.
-    let (decodes, prefill) = counts(pairs);
-    let prefill = prefill_coordinate(prefill);
-    // Local layers never split, so padding leaves their launch unchanged.
-    let launched = if config.is_local {
-        pairs.len() as u32
-    } else {
-        padded_requests.max(pairs.len() as u32)
-    };
-    // Padding slots are decode-shaped: the canonical batch of `decodes +
-    // padding` decodes is launched over the same `launched` requests.
-    let decodes = decodes + (launched - pairs.len() as u32);
-    let context = equivalent_context(config, pairs, launched, decodes, prefill);
-    [
-        decode_coordinate(config, decodes, prefill, context),
-        f64::from(prefill),
-        context,
-    ]
-}
-
-/// The context at which the canonical batch has the real batch's makespan.
-fn equivalent_context(
-    config: &RelBiasAttentionKernelConfig,
-    pairs: &[(u32, u32)],
-    launched: u32,
-    decodes: u32,
-    prefill: u32,
-) -> f64 {
-    let target = makespan(config, pairs, launched);
-    let canonical = |context: f64| {
-        let pairs = canonical_pairs(config, decodes, prefill, context.round() as u32)
-            .expect("a non-empty batch has a canonical batch");
-        makespan(config, &pairs, pairs.len() as u32)
-    };
-    // Fractional contexts: the model is linear in the context between integer
-    // points, so interpolate there to keep the projection continuous.
-    let model = |context: f64| {
-        let lo = context.floor();
-        let t = context - lo;
-        canonical(lo) * (1.0 - t) + canonical(lo + 1.0) * t
-    };
-    let (mut lo, mut hi) = (1.0_f64, f64::from(context_top(config)));
-    if target <= model(lo) {
-        return lo;
-    }
-    if target >= model(hi) {
-        return hi;
-    }
-    for _ in 0..BISECTION_STEPS {
-        let mid = 0.5 * (lo + hi);
-        if model(mid) < target {
-            lo = mid;
+    /// One window past the window, a local layer's work is flat, so that is
+    /// where a longer local batch lands.
+    fn context_top(&self) -> u32 {
+        if self.is_local {
+            (2 * self.rel_extent + CONTEXT_TILE_OFFSET).min(self.max_model_len)
         } else {
-            hi = mid;
+            self.max_model_len
         }
     }
-    0.5 * (lo + hi)
-}
 
-/// The top of the context axis: one window past the window, a local layer's
-/// work is flat, so that is where a longer local batch lands.
-fn context_top(config: &RelBiasAttentionKernelConfig) -> u32 {
-    if config.is_local {
-        (2 * config.rel_extent + CONTEXT_TILE_OFFSET).min(config.max_model_len)
-    } else {
-        config.max_model_len
+    fn prefill_coordinate(&self, prefill: u32) -> u32 {
+        prefill_coordinate(prefill)
+    }
+
+    /// Local layers never split, so padding leaves their launch unchanged.
+    fn launched_requests(&self, pairs: &[(u32, u32)], padded_requests: u32) -> u32 {
+        if self.is_local {
+            pairs.len() as u32
+        } else {
+            padded_requests.max(pairs.len() as u32)
+        }
+    }
+
+    /// The bucketed max query sets q_stage and the split count; every request
+    /// gets the same count.
+    fn tiling(&self, pairs: &[(u32, u32)], launched: u32) -> VarlenTiling {
+        let max_query = pairs.iter().map(|&(query, _)| query).max().unwrap();
+        let bucket = bucket(max_query);
+        let g = q_heads_per_kv_head(self);
+        let q_stage = if bucket * g > TILE_M { 2 } else { 1 };
+        let splits = num_splits(self, launched.max(pairs.len() as u32), bucket);
+        VarlenTiling {
+            tile_tokens: (TILE_M * q_stage / g).max(1),
+            splits: vec![splits; pairs.len()],
+        }
     }
 }
 
 fn context_axis(config: &RelBiasAttentionKernelConfig) -> Vec<f64> {
-    let mut values: Vec<u32> = if config.is_local {
-        let window = config.rel_extent;
-        vec![1, window * 5 / 8, window + CONTEXT_TILE_OFFSET]
-    } else {
+    let top = config.context_top();
+    if !config.is_local {
         // 1, then 512, 1024, 2048, 8192, 32768, ... keys, each half a tile
         // past the boundary.
-        let boundaries = std::iter::successors(Some(512_u32), |&keys| {
-            let step = if keys < CONTEXT_DOUBLING_END { 2 } else { 4 };
-            keys.checked_mul(step)
-        });
-        std::iter::once(1)
-            .chain(boundaries.map(|keys| keys + CONTEXT_TILE_OFFSET))
-            .take_while(|&context| context < config.max_model_len)
-            .collect()
-    };
-    values.retain(|&context| context < context_top(config));
-    values.push(context_top(config));
+        return Axis::values(global_context_axis(
+            config.max_model_len,
+            CONTEXT_DOUBLING_END,
+            top,
+        ));
+    }
+    let window = config.rel_extent;
+    let mut values = vec![1, window * 5 / 8, window + CONTEXT_TILE_OFFSET];
+    values.retain(|&context| context < top);
+    values.push(top);
     Axis::values(values)
 }
 
@@ -526,6 +336,7 @@ register_kernel!(RelBiasAttentionKernel, RelBiasAttentionSpec);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timing::kernels::fa4_varlen_projection::{decode_coordinate, makespan};
     use serde_json::Value;
 
     fn config(is_local: bool) -> RelBiasAttentionKernelConfig {
@@ -589,7 +400,7 @@ mod tests {
                 (8, 64, 1),
                 (80, 32, 320),
             ] {
-                if is_local && context > context_top(&cfg) {
+                if is_local && context > cfg.context_top() {
                     continue;
                 }
                 let pairs = canonical_pairs(&cfg, decodes, prefill, context).unwrap();
