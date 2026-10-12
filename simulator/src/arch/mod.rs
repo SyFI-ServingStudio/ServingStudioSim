@@ -7,6 +7,7 @@
 pub mod build;
 pub mod config;
 pub mod contract;
+pub mod cudagraph;
 pub mod deepseek_v41_vllm;
 pub mod deepseek_v4_vllm;
 pub mod glm52_model_cfg;

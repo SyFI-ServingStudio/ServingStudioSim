@@ -37,7 +37,9 @@
 use anyhow::Result;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
-use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::graph_padded_tokens;
+use crate::arch::cudagraph::{
+    full_decode_graph_max_tokens, graph_padded_tokens, sorted_capture_sizes,
+};
 use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
 use crate::arch::mimo_v2_model_cfg::{MimoV2AttnShape, MimoV2ModelCfg};
 use crate::common::Fabric;
@@ -108,6 +110,8 @@ pub struct MimoV2VllmParallel {
     pub gpu_name: String,
     /// vLLM `--cudagraph-capture-sizes`; empty runs eager (no padding).
     pub cudagraph_capture_sizes: Vec<u32>,
+    /// vLLM `--max-num-seqs`: bounds the FULL-graph decode steps.
+    pub max_num_seqs: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,12 +268,10 @@ pub fn build_configs(
         input_bytes_per_token: input.into(),
         output_bytes_per_token: output.into(),
     };
-    let full_cudagraph_max_size = parallel
-        .cudagraph_capture_sizes
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let full_cudagraph_max_size = full_decode_graph_max_tokens(
+        &sorted_capture_sizes(&parallel.cudagraph_capture_sizes),
+        parallel.max_num_seqs,
+    );
     let attention = |shape: &MimoV2AttnShape,
                      window: u32,
                      page_size: u32|
@@ -484,12 +486,12 @@ impl LayerGroup {
         }
     }
 
-    fn eval(&self, batch: &NormalizedBatch, tokens: u32, ev: &mut Evaluator) {
+    fn eval(&self, batch: &NormalizedBatch, tokens: u32, full_decode_max: u32, ev: &mut Evaluator) {
         self.attn.eval(
             &MimoV2AttnLocalWorkletInput {
                 num_tokens: tokens,
                 query_context_pairs: batch.query_context_pairs.clone(),
-                padded_requests: attention_padded_requests(batch, tokens),
+                padded_requests: attention_padded_requests(batch, tokens, full_decode_max),
             },
             ev,
         );
@@ -593,6 +595,8 @@ pub struct MimoV2VllmModel {
     pub max_model_len: u32,
     /// Sorted, deduplicated capture sizes.
     cudagraph_capture_sizes: Vec<u32>,
+    /// Largest uniform-decode step that replays a FULL graph.
+    full_decode_graph_max: u32,
     /// Largest step the fused all-reduce + RMSNorm takes (vLLM's workspace
     /// cap); a larger step would fall back to the unfused path.
     max_fused_tokens: u32,
@@ -655,12 +659,11 @@ pub fn build(
         kv_cache_layout: kv_cache_layout(&cfg.model, cfg.parallel.tp_size)?,
         tp_size: cfg.parallel.tp_size,
         max_model_len: cfg.parallel.max_model_len,
-        cudagraph_capture_sizes: {
-            let mut sizes = cfg.parallel.cudagraph_capture_sizes.clone();
-            sizes.sort_unstable();
-            sizes.dedup();
-            sizes
-        },
+        cudagraph_capture_sizes: sorted_capture_sizes(&cfg.parallel.cudagraph_capture_sizes),
+        full_decode_graph_max: full_decode_graph_max_tokens(
+            &sorted_capture_sizes(&cfg.parallel.cudagraph_capture_sizes),
+            cfg.parallel.max_num_seqs,
+        ),
         max_fused_tokens: AllReduceResidualRmsNormSpec::max_fused_tokens(&cfg.ar_norm),
         cost_flat: Vec::new(),
         n_slots: 0,
@@ -785,7 +788,7 @@ impl MimoV2VllmModel {
             ev,
         );
         for group in &self.groups {
-            group.eval(&batch, tokens, ev);
+            group.eval(&batch, tokens, self.full_decode_graph_max, ev);
         }
         let logits = batch.request_count;
         push_or_zero(
@@ -902,14 +905,18 @@ impl IterwiseUnifiedModel for MimoV2VllmModel {
 }
 
 /// The request count attention is launched over. A uniform-decode step that
-/// fits a captured size replays a FULL graph, whose attention metadata the
-/// model runner pads to the capture size with zero-length requests
-/// (`pad_attn`, `num_reqs_padded` in gpu_model_runner.py); FA4's split count
-/// follows that size. Steps with a prefill chunk replay a piecewise graph over
-/// the real requests (0), and a step past the largest size runs eagerly
-/// (`padded_tokens` is then the real count); both mean unpadded.
-fn attention_padded_requests(batch: &NormalizedBatch, padded_tokens: u32) -> u32 {
-    if batch.is_uniform_decode() {
+/// pads to a size with a FULL graph (at most `full_decode_max`) replays it,
+/// and the model runner pads its attention metadata to the capture size with
+/// zero-length requests (`pad_attn`, `num_reqs_padded` in
+/// gpu_model_runner.py); FA4's split count follows that size. Every other
+/// step (a prefill chunk, or a decode past the FULL bound: PIECEWISE or eager)
+/// runs attention over the real requests (0).
+fn attention_padded_requests(
+    batch: &NormalizedBatch,
+    padded_tokens: u32,
+    full_decode_max: u32,
+) -> u32 {
+    if batch.is_uniform_decode() && padded_tokens <= full_decode_max {
         padded_tokens
     } else {
         0
@@ -1034,6 +1041,7 @@ mod tests {
             max_model_len: 131072,
             gpu_name: "NVIDIA B200".into(),
             cudagraph_capture_sizes: capture_sizes(),
+            max_num_seqs: 100,
         }
     }
 
@@ -1133,7 +1141,7 @@ mod tests {
             (configs.attn_swa.num_kv_heads, configs.attn_swa.page_size),
             (2, 16)
         );
-        assert_eq!(configs.attn_swa.full_cudagraph_max_size, 200);
+        assert_eq!(configs.attn_swa.full_cudagraph_max_size, 100);
         assert_eq!(
             (
                 configs.embed.input_bytes_per_token.get(),
@@ -1198,16 +1206,39 @@ mod tests {
             sizes.dedup();
             sizes
         };
-        let padded = |input: UnifiedArchInput| {
+        let padded_up_to = |full_decode_max: u32, input: UnifiedArchInput| {
             let batch = normalize_input(&input, 131072).unwrap();
             let tokens = graph_padded_tokens(&sizes, batch.total_tokens);
-            attention_padded_requests(&batch, tokens)
+            attention_padded_requests(&batch, tokens, full_decode_max)
         };
+        let padded = |input| padded_up_to(full_decode_graph_max_tokens(&sizes, 100), input);
         assert_eq!(padded(step(vec![], vec![400; 97])), 100);
         assert_eq!(padded(step(vec![], vec![400; 3])), 4);
         assert_eq!(padded(step(vec![(0, 50)], vec![400; 7])), 0);
         // Past the largest captured size a step runs eagerly, unpadded.
-        assert_eq!(padded(step(vec![], vec![400; 201])), 201);
+        assert_eq!(padded(step(vec![], vec![400; 201])), 0);
+        // vLLM's list for an explicit 2048 cap has no 100: at max_num_seqs
+        // 100 a 97-request decode pads to 104 and replays PIECEWISE.
+        let explicit: Vec<u32> = [1, 2, 4]
+            .into_iter()
+            .chain((8..256).step_by(8))
+            .chain((256..=2048).step_by(16))
+            .collect();
+        let full_decode_max = full_decode_graph_max_tokens(&explicit, 100);
+        assert_eq!(full_decode_max, 96);
+        let batch = normalize_input(&step(vec![], vec![400; 97]), 131072).unwrap();
+        let tokens = graph_padded_tokens(&explicit, batch.total_tokens);
+        assert_eq!(tokens, 104);
+        assert_eq!(
+            attention_padded_requests(&batch, tokens, full_decode_max),
+            0
+        );
+        let batch = normalize_input(&step(vec![], vec![400; 95]), 131072).unwrap();
+        let tokens = graph_padded_tokens(&explicit, batch.total_tokens);
+        assert_eq!(
+            attention_padded_requests(&batch, tokens, full_decode_max),
+            96
+        );
     }
 
     #[test]

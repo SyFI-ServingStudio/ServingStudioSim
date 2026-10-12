@@ -671,6 +671,7 @@ impl Deployment for UnifiedDeployment {
                 expert_popularity_file,
                 token_corpus_file,
                 cudagraph_capture_sizes,
+                max_num_seqs,
                 ..
             } => {
                 ensure_hp_or_chunked_worker("Inkling NVFP4 vLLM", &g.worker)?;
@@ -684,6 +685,7 @@ impl Deployment for UnifiedDeployment {
                     expert_popularity_file.as_deref(),
                     token_corpus_file.as_deref(),
                     cudagraph_capture_sizes,
+                    *max_num_seqs,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
@@ -707,6 +709,7 @@ impl Deployment for UnifiedDeployment {
                 expert_popularity_file,
                 token_corpus_file,
                 cudagraph_capture_sizes,
+                max_num_seqs,
                 ..
             } => {
                 ensure_hp_or_chunked_worker("MiMo-V2 FP8 vLLM", &g.worker)?;
@@ -719,6 +722,7 @@ impl Deployment for UnifiedDeployment {
                     expert_popularity_file.as_deref(),
                     token_corpus_file.as_deref(),
                     cudagraph_capture_sizes,
+                    *max_num_seqs,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

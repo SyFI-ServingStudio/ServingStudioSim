@@ -70,6 +70,7 @@ use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::cudagraph::graph_padded_tokens;
 use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
 use crate::op::mhc::{MhcTerminalPostConfig, MhcTerminalPostInput, MhcTerminalPostOp};
@@ -1563,15 +1564,6 @@ impl IterwiseUnifiedModel for Glm53FlashVllmModel {
     }
 }
 
-/// The row count vLLM runs a CUDA-graph replay on: the smallest captured size
-/// that holds `tokens`, or `tokens` itself above the largest (eager).
-pub(crate) fn graph_padded_tokens(sorted_sizes: &[u32], tokens: u32) -> u32 {
-    match sorted_sizes.binary_search(&tokens) {
-        Ok(_) => tokens,
-        Err(index) => sorted_sizes.get(index).copied().unwrap_or(tokens),
-    }
-}
-
 /// One iteration, as every layer sees it (one TP group, no attention DP).
 pub(crate) struct NormalizedBatch {
     pub(crate) total_tokens: u32,
@@ -1737,17 +1729,6 @@ mod tests {
             cudagraph_capture_sizes: Vec::new(),
             kernel_path: Default::default(),
         }
-    }
-
-    #[test]
-    fn graph_padding_rounds_up_to_the_next_captured_size() {
-        let sizes = [1, 2, 4, 8, 16, 24];
-        let padded: Vec<u32> = [1, 3, 5, 16, 17, 24, 25]
-            .iter()
-            .map(|&t| graph_padded_tokens(&sizes, t))
-            .collect();
-        assert_eq!(padded, [1, 4, 8, 16, 24, 24, 25]);
-        assert_eq!(graph_padded_tokens(&[], 7), 7);
     }
 
     fn built() -> Glm53FlashVllmModel {

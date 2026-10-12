@@ -51,6 +51,7 @@
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::cudagraph::graph_padded_tokens;
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
     self as ep_graph, build_atomic, eval_atomic_or_zero, kv_cache_layout, normalize_group,
@@ -58,7 +59,6 @@ use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
     NormalizedGroup, CHECKPOINT_MAX_CONTEXT, NUM_DENSE_LAYERS, NUM_INITIAL_SHARED_LAYERS,
 };
 use crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::eval_compiled;
-use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::graph_padded_tokens;
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::op::Op;
 use crate::timing::bridge::DType;
