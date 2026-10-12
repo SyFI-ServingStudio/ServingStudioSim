@@ -425,3 +425,85 @@ def test_a_forwarding_call_opens_its_own_connection():
     assert argv[argv.index("-R") + 1] == "127.0.0.1:40001:127.0.0.1:5001"
     assert "ExitOnForwardFailure=yes" in argv
     assert argv[-2:] == ["me@h", "bash -lc 'docker pull x'"]
+
+
+def test_a_wait_survives_a_dropped_poll_but_not_a_lost_remote(monkeypatch):
+    from launcher.remote import run as remote_run
+    from launcher.remote.transport import TransportError
+
+    session = remote_run.Session(_remote())
+    submitted = launch.Submitted(jobdir=PurePosixPath("/w/jobs/j"), handle="1", slurm=False)
+    monkeypatch.setattr(remote_run.time, "sleep", lambda _s: None)
+    answers = iter([TransportError("ssh: timeout"), launch.Status(0, False, 0, 0, "")])
+
+    def poll(_transport, _submitted, _offset):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(remote_run.launch, "poll", poll)
+    assert session._wait(submitted, "j").exit_code == 0
+
+    def unreachable(_transport, _submitted, _offset):
+        raise TransportError("ssh: no route to host")
+
+    monkeypatch.setattr(remote_run.launch, "poll", unreachable)
+    monkeypatch.setattr(remote_run, "UNREACHABLE_SECONDS", 0.0)
+    with pytest.raises(remote_run.RemoteRunError, match="lost contact .* may still be running"):
+        session._wait(submitted, "j")
+
+
+def test_a_run_that_stops_early_leaves_no_managed_job_running(monkeypatch, capsys):
+    from launcher.cli import GlobalOptions
+    from launcher.remote import run as remote_run
+
+    class Job:
+        def __init__(self):
+            self.statuses = []
+
+        def report(self, status, **_kwargs):
+            self.statuses.append(status)
+
+    finished, stopped = Job(), Job()
+
+    def command(session, _argv):
+        session.report(session.track(finished), "ready")
+        session.report(session.track(stopped), "running")
+        session.track(None)
+        raise remote_run.RemoteRunError("the copy back failed")
+
+    monkeypatch.setattr(remote_run, "_require_repo_cwd", lambda: None)
+    monkeypatch.setattr(remote_run, "load_remote", lambda name, sets: _remote())
+    monkeypatch.setitem(remote_run.COMMANDS, None, command)
+    assert remote_run.run(None, [], GlobalOptions(remote="r")) == 2
+    assert finished.statuses == ["ready"]
+    assert stopped.statuses == ["running", "failed"]
+    assert "the copy back failed" in capsys.readouterr().err
+
+
+def test_a_job_database_that_does_not_come_back_is_reported_and_cleaned_up(tmp_path, monkeypatch):
+    from launcher.remote import run as remote_run
+    from launcher.remote.transport import TransportError
+
+    held = tmp_path / "held"
+    monkeypatch.setattr(remote_run.tempfile, "mkdtemp", lambda **_kw: str(held.mkdir() or held))
+    session = remote_run.Session(_remote())
+
+    def missing(_job_id, _name, _local):
+        raise TransportError("rsync: No such file or directory")
+
+    monkeypatch.setattr(session, "fetch_job_file", missing)
+    message, merged = remote_run._fold_job_db(session, "j", tmp_path)
+    assert not merged and "not copied back" in message
+    assert not held.exists()
+
+    # A conflict keeps the job's DB where the message says it is.
+    def conflict(_job_db, _report):
+        raise remote_run.RemoteRunError(f"conflict; the job's DB is kept at {held}")
+
+    monkeypatch.setattr(session, "fetch_job_file", lambda *_a: None)
+    monkeypatch.setattr(remote_run, "_merge_profile_db", conflict)
+    message, merged = remote_run._fold_job_db(session, "j", tmp_path)
+    assert not merged and "conflict" in message
+    assert held.exists()

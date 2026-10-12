@@ -805,11 +805,15 @@ the workdir on a filesystem its compute nodes share.
 4. The remote builds once per set of build inputs and runs the job with its own
    private profile.db copy on node-local disk (`remote/node.py`).
 5. Output is relayed every ~10 s, with a heartbeat at least once a minute.
-   Ctrl-C or SIGTERM stops the remote job (`kill` or `scancel`).
+   Ctrl-C or SIGTERM stops the remote job (`kill` or `scancel`). A remote that
+   cannot be reached for 10 minutes ends the wait with an error that names the
+   job's remote directory; the job itself may still be running there.
 6. The output directory is copied back without `raw/cost_log/` and `plots/`
    (everything, if the remote is `ephemeral`), and `remote-run.json` beside it
    records the remote, host, remote path, code version, job and Slurm ids,
-   times and exit code. The full experiment stays on the remote.
+   times and exit code. A copy that fails is recorded there as `incomplete` and
+   fails the run. Whatever stops a run early, no managed job is left `running`:
+   it is reported `failed`, or `interrupted` on Ctrl-C.
 
 Rerunning the same command resumes on the remote exactly as it would locally:
 the remote `logs/` is one tree across code versions.

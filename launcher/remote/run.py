@@ -27,6 +27,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -61,8 +62,12 @@ HEARTBEAT_SECONDS = 60.0
 # A job seen neither running nor finished this many polls in a row is lost
 # (one missed `squeue` answer is not enough).
 LOST_POLLS = 3
+# Polls that cannot reach the remote for this long end the wait; the job may
+# still be running there.
+UNREACHABLE_SECONDS = 600.0
 SIMULATION_COPY_EXCLUDES = ("raw/cost_log/", "plots/", "/experiment.meta.json")
 REMOTE_RECORD = "remote-run.json"
+FINAL_STATUSES = frozenset({"ready", "failed", "interrupted"})
 
 
 class RemoteRunError(RuntimeError):
@@ -119,6 +124,30 @@ class Session:
         self.in_image = False
         # The job's own venv, when it is not the version's (CPU) `.venv`.
         self.job_venv: PurePosixPath | None = None
+        # Managed jobs this run registered, with the status last reported.
+        self.managed: list[list] = []
+
+    # ── managed status ────────────────────────────────────────────────────
+
+    def track(self, job):
+        """Register a managed job (None when unmanaged) for `report` and `settle`."""
+
+        if job is not None:
+            self.managed.append([job, None])
+        return job
+
+    def report(self, job, status: str, **kwargs) -> None:
+        for entry in self.managed:
+            if entry[0] is job:
+                entry[1] = status
+                _report(job, status, **kwargs)
+
+    def settle(self, status: str) -> None:
+        """Report ``status`` for every job the run left unfinished."""
+
+        for job, last in self.managed:
+            if last not in FINAL_STATUSES:
+                self.report(job, status)
 
     # ── code ──────────────────────────────────────────────────────────────
 
@@ -240,6 +269,16 @@ class Session:
             self.transport.run(f"mkdir -p {q(destination.parent)}")
             self.data.rsync(str(path), self.data.remote_spec(destination))
 
+    def copy_back(self, local: Path, *, excludes: tuple[str, ...] = ()) -> str | None:
+        """`fetch`, reporting a failed copy instead of raising; returns its error."""
+
+        try:
+            self.fetch(local, excludes=excludes)
+        except TransportError as exc:
+            _warn(f"copying {local.relative_to(REPO_ROOT)} back failed: {exc}")
+            return str(exc).splitlines()[0]
+        return None
+
     def fetch(self, local: Path, *, excludes: tuple[str, ...] = ()) -> None:
         local.mkdir(parents=True, exist_ok=True)
         if self.remote.ephemeral:
@@ -300,7 +339,7 @@ class Session:
 
     def _wait(self, submitted: launch.Submitted, job_id: str) -> launch.Status:
         offset, lost_polls = 0, 0
-        began = last_output = time.monotonic()
+        began = last_output = last_contact = time.monotonic()
         previous = signal.signal(signal.SIGTERM, _raise_interrupted)
         try:
             delay = 2.0
@@ -310,8 +349,16 @@ class Session:
                 try:
                     status = launch.poll(self.transport, submitted, offset)
                 except TransportError as exc:
+                    silent = time.monotonic() - last_contact
+                    if silent >= UNREACHABLE_SECONDS:
+                        raise RemoteRunError(
+                            f"lost contact with {self.transport.host_label} for "
+                            f"{silent / 60:.0f} min; job {job_id} may still be running "
+                            f"there ({self.layout.job(job_id)})"
+                        ) from exc
                     _warn(f"poll failed, retrying: {exc}")
                     continue
+                last_contact = time.monotonic()
                 if status.log_chunk:
                     sys.stdout.write(status.log_chunk)
                     sys.stdout.flush()
@@ -444,8 +491,6 @@ def _raise_interrupted(_signum, _frame):
 def _report(job, status: str, **kwargs) -> None:
     """A managed status update that may not fail the run (e.g. an expired token)."""
 
-    if job is None:
-        return
     try:
         job.report(status, **kwargs)
     except Exception as exc:
@@ -517,28 +562,34 @@ def _simulation(session: Session, argv: list[str]) -> int:
 
     source = session.ship()
     inputs = _input_files([Path(p) for p in args.presets], source)
-    managed = prepare_experiment(
-        root, run_count=len(candidates), axes=[] if single else _sweep_axes(candidates)
+    managed = session.track(
+        prepare_experiment(
+            root, run_count=len(candidates), axes=[] if single else _sweep_axes(candidates)
+        )
     )
     session.push_files([*inputs, root / EXPERIMENT_METADATA_FILENAME])
     session.prepare()
-    _report(managed, "running")
+    session.report(managed, "running")
     command = [*argv, "--no-gpu", "--no-plot"]
-    try:
-        outcome = session.run_job(command)
-    except KeyboardInterrupt:
-        _report(managed, "interrupted")
-        raise
-    _report(managed, "analysis_running")
-    session.fetch(root, excludes=SIMULATION_COPY_EXCLUDES)
-    session.record(root, outcome, command)
-    _report(managed, "ready" if outcome.exit_code == 0 else "failed")
+    outcome = session.run_job(command)
+    session.report(managed, "analysis_running")
+    copy_error = session.copy_back(root, excludes=SIMULATION_COPY_EXCLUDES)
+    session.record(root, outcome, command, copied_back=copy_error and f"incomplete: {copy_error}")
+    exit_code = outcome.exit_code or (1 if copy_error else 0)
+    session.report(managed, "ready" if exit_code == 0 else "failed")
+    verdict = "done" if exit_code == 0 else _failure(outcome, copy_error and "the copy back failed")
     _say(
-        f"{'done' if outcome.exit_code == 0 else f'failed (exit {outcome.exit_code})'}: "
+        f"{verdict}: "
         f"{root.relative_to(REPO_ROOT)} (remote copy: "
         f"{session.transport.host_label}:{session.remote_logs_path(root)})"
     )
-    return outcome.exit_code
+    return exit_code
+
+
+def _failure(outcome: JobOutcome, problem: str | None) -> str:
+    if outcome.exit_code == 0 and problem:
+        return f"failed ({problem})"
+    return f"failed (exit {outcome.exit_code})"
 
 
 def _timing_predict(session: Session, argv: list[str]) -> int:
@@ -581,11 +632,13 @@ def _timing_predict(session: Session, argv: list[str]) -> int:
     seeds: list[Path] = []
     for config_path, log_dir, cfg in planned:
         prediction_id = _prediction_id(log_dir)
-        job = prepare_managed_job(
-            "timing_predict",
-            log_dir,
-            descriptor=_predict_descriptor(config_path, cfg),
-            analyzer_resource_id=prediction_id,
+        job = session.track(
+            prepare_managed_job(
+                "timing_predict",
+                log_dir,
+                descriptor=_predict_descriptor(config_path, cfg),
+                analyzer_resource_id=prediction_id,
+            )
         )
         jobs.append(job)
         if job is not None and not (log_dir / "prediction.meta.json").is_file():
@@ -600,28 +653,31 @@ def _timing_predict(session: Session, argv: list[str]) -> int:
         seed.unlink()
     session.prepare()
     for job in jobs:
-        _report(job, "running")
+        session.report(job, "running")
     command = ["timing-predict", *argv, "--no-gpu", "--no-plot"]
-    try:
-        outcome = session.run_job(command)
-    except KeyboardInterrupt:
-        for job in jobs:
-            _report(job, "interrupted")
-        raise
+    outcome = session.run_job(command)
+    exit_code = outcome.exit_code
     for (config_path, log_dir, cfg), job in zip(planned, jobs, strict=True):
-        session.fetch(log_dir)
-        session.record(log_dir, outcome, command)
+        copy_error = session.copy_back(log_dir)
+        session.record(
+            log_dir, outcome, command, copied_back=copy_error and f"incomplete: {copy_error}"
+        )
         metadata = log_dir / "prediction.meta.json"
-        complete = metadata.is_file() and len(json.loads(metadata.read_text("utf-8"))) > 1
+        complete = (
+            copy_error is None
+            and metadata.is_file()
+            and len(json.loads(metadata.read_text("utf-8"))) > 1
+        )
+        exit_code = exit_code or (0 if complete else 1)
         if not complete:
             # A failed remote prediction leaves only the seed behind.
             metadata.unlink(missing_ok=True)
         if complete:
-            _report(job, "ready", summary=_predict_descriptor(config_path, cfg))
+            session.report(job, "ready", summary=_predict_descriptor(config_path, cfg))
         else:
-            _report(job, "failed")
+            session.report(job, "failed")
         _say(f"{'done' if complete else 'failed'}: {log_dir.relative_to(REPO_ROOT)}")
-    return outcome.exit_code
+    return exit_code
 
 
 def _merge_profile_db(job_db: Path, report: Path) -> str:
@@ -647,6 +703,24 @@ def _merge_profile_db(job_db: Path, report: Path) -> str:
         os.replace(merged, target)
     inserted = sum(table.inserted_rows for table in result.tables)
     return f"{inserted} new row(s) merged into {target.relative_to(REPO_ROOT)}"
+
+
+def _fold_job_db(session: Session, job_id: str, output_dir: Path) -> tuple[str, bool]:
+    """Copy the job's profile.db back and merge it; returns (what happened, merged)."""
+
+    held = Path(tempfile.mkdtemp(prefix="vibesim-remote-db-"))
+    job_db, keep = held / "profile.db", False
+    try:
+        session.fetch_job_file(job_id, "profile.db", job_db)
+        return _merge_profile_db(job_db, output_dir / "remote-profile-db.merge-report.json"), True
+    except TransportError as exc:
+        return f"not merged: the job's profile.db was not copied back ({exc})", False
+    except RemoteRunError as exc:
+        keep = True  # a conflict: the message points at the kept DB
+        return f"not merged: {exc}", False
+    finally:
+        if not keep:
+            shutil.rmtree(held, ignore_errors=True)
 
 
 def _kernel_profile(session: Session, argv: list[str]) -> int:
@@ -703,8 +777,10 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
         kind, metadata_name, id_key = "kernel_profile", PROFILE_METADATA_FILENAME, "profile_id"
         resource_id = _profile_id(output_dir)
         descriptor = run_descriptor(args, profiler_spec, specs)
-    job = prepare_managed_job(
-        kind, output_dir, descriptor=descriptor, analyzer_resource_id=resource_id
+    job = session.track(
+        prepare_managed_job(
+            kind, output_dir, descriptor=descriptor, analyzer_resource_id=resource_id
+        )
     )
     seeds: list[Path] = []
     if job is not None and not (output_dir / metadata_name).is_file():
@@ -727,40 +803,31 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
         session.prepare(job_groups=(*CPU_GROUPS, "profiling"))
         image_id = session.ensure_image(image)
         _say(f"{args.table}/{args.backend} runs in {image} ({image_id[:19]})")
-    _report(job, "running")
+    session.report(job, "running")
     command = ["kernel-profile", *argv]
     keep_db = not measure and not args.fresh
-    try:
-        outcome = session.run_job(
-            command,
-            env={
-                PROFILE_RUNTIME_ENV: "in-image" if in_image else "container",
-                # The shipped tree has no git to compute the tag from.
-                IMAGES_ENV: json.dumps({env_name: image}),
-                "VIBESIM_PROFILE_CACHE_DIR": str(session.layout.workdir / "cache"),
-            },
-            keep_db=keep_db,
-        )
-    except KeyboardInterrupt:
-        _report(job, "interrupted")
-        raise
-    _report(job, "analysis_running")
-    session.fetch(output_dir)
-    merged = "not merged (the run wrote no rows)"
+    outcome = session.run_job(
+        command,
+        env={
+            PROFILE_RUNTIME_ENV: "in-image" if in_image else "container",
+            # The shipped tree has no git to compute the tag from.
+            IMAGES_ENV: json.dumps({env_name: image}),
+            "VIBESIM_PROFILE_CACHE_DIR": str(session.layout.workdir / "cache"),
+        },
+        keep_db=keep_db,
+    )
+    session.report(job, "analysis_running")
+    copy_error = session.copy_back(output_dir)
+    merged, merge_ok = "not merged (the run wrote no rows)", True
     if keep_db and outcome.exit_code in (0, 1):
         # Exit 1 is a run with missing rows: the rows it did measure still count.
-        held = Path(tempfile.mkdtemp(prefix="vibesim-remote-db-"))
-        job_db = held / "profile.db"
-        session.fetch_job_file(outcome.job_id, "profile.db", job_db)
-        merged = _merge_profile_db(job_db, output_dir / "remote-profile-db.merge-report.json")
-        job_db.unlink()
-        held.rmdir()
-        _say(merged)
+        merged, merge_ok = _fold_job_db(session, outcome.job_id, output_dir)
+        (_say if merge_ok else _warn)(merged)
     session.record(
         output_dir,
         outcome,
         command,
-        copied_back="all",
+        copied_back=f"incomplete: {copy_error}" if copy_error else "all",
         image=image,
         # A pod has no docker to name an image id; its manifest names the inputs.
         **({"image_inputs": image_id} if in_image else {"image_id": image_id}),
@@ -771,14 +838,16 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
     if not complete:
         # A failed remote run leaves only the seed behind.
         metadata.unlink(missing_ok=True)
-    ok = outcome.exit_code == 0 and complete
-    _report(job, "ready" if ok else "failed")
+    ok = outcome.exit_code == 0 and complete and copy_error is None and merge_ok
+    session.report(job, "ready" if ok else "failed")
+    problem = "the copy back failed" if copy_error else None if merge_ok else merged
+    verdict = "done" if ok else _failure(outcome, problem)
     _say(
-        f"{'done' if ok else f'failed (exit {outcome.exit_code})'}: "
+        f"{verdict}: "
         f"{output_dir.relative_to(REPO_ROOT)} (remote copy: "
         f"{session.transport.host_label}:{session.remote_logs_path(output_dir)})"
     )
-    return outcome.exit_code
+    return outcome.exit_code or (0 if ok else 1)
 
 
 COMMANDS: dict[str | None, Callable[[Session, list[str]], int]] = {
@@ -803,9 +872,19 @@ def run(subcommand: str | None, argv: list[str], options: GlobalOptions) -> int:
                 f"{remote.name} is a profiler image (profile_runtime: in-image), "
                 "which runs kernel-profile only"
             )
-        return COMMANDS[subcommand](Session(remote), argv)
+    except (RemoteConfigError, RemoteRunError) as exc:
+        print(f"python -m launcher --remote: {exc}", file=sys.stderr)
+        return 2
+    session = Session(remote)
+    try:
+        return COMMANDS[subcommand](session, argv)
     except (RemoteConfigError, RemoteRunError, SourceError, TransportError) as exc:
+        session.settle("failed")
         print(f"python -m launcher --remote: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
+        session.settle("interrupted")
         return 130
+    except BaseException:
+        session.settle("failed")
+        raise
