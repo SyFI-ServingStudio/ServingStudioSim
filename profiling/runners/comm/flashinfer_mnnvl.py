@@ -1,7 +1,7 @@
-"""FlashInfer MNNVL standalone all-reduce runner.
+"""FlashInfer MNNVL all-reduce runners: standalone and fused with residual + RMSNorm.
 
-Mirrors vLLM's ``FlashInferAllReduce.all_reduce`` on B200 when
-``VLLM_FLASHINFER_ALLREDUCE_BACKEND=auto`` resolves to ``mnnvl``
+The standalone call mirrors vLLM's ``FlashInferAllReduce.all_reduce`` on B200
+when ``VLLM_FLASHINFER_ALLREDUCE_BACKEND=auto`` resolves to ``mnnvl``
 (``vllm/distributed/device_communicators/flashinfer_all_reduce.py``
 ``_resolve_fi_ar_backend`` and ``all_reduce``):
 
@@ -13,9 +13,16 @@ Mirrors vLLM's ``FlashInferAllReduce.all_reduce`` on B200 when
   ``num_tokens * hidden_dim * num_gpus * elem_size <= 1 MiB``
   (``flashinfer/comm/trtllm_mnnvl_ar.py`` ``MNNVL_ONE_SHOT_THRESHOLD``).
 
+The fused call mirrors vLLM's ``allreduce_rms`` compilation pass
+(``vllm/compilation/passes/fusion/allreduce_rms_fusion.py``
+``call_trtllm_fused_allreduce_norm``) over the same workspace: pattern
+``kARResidualRMSNorm`` with ``use_oneshot=None`` (vLLM leaves the MNNVL
+strategy to FlashInfer), ``fp32_acc`` and the spec's PDL arguments.
+
 The timed boundary is the same CUDA-graph replay throughput as the TRT-LLM
-backend, reduced to the slowest rank. The reduced output is checked against the
-fp32 sum of every rank's input before timing.
+backend, reduced to the slowest rank. Before timing, the output is checked against an
+fp32 reference: the rank sum (standalone), or the rank sum plus residual and its
+RMSNorm (fused).
 """
 
 from __future__ import annotations
@@ -45,6 +52,8 @@ MIB = 1024 * 1024
 # vLLM ``PDL_ADVANCE_LAUNCH_TOKENS``; FlashInfer ignores it on MNNVL but the
 # call keeps production's arguments.
 PDL_ADVANCE_LAUNCH_TOKENS = 16
+# The fused runner's RMSNorm epsilon, as the trtllm fused runner uses.
+RMS_EPS = 1e-6
 # FlashInfer ``MNNVL_ONE_SHOT_THRESHOLD`` (bytes of num_tokens*hidden*tp*elem).
 ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 # Graph replay amortizes host launch cost over several back-to-back collectives.
@@ -92,13 +101,31 @@ def spec_error(spec: dict) -> str | None:
     return None
 
 
+def fused_spec_error(spec: dict) -> str | None:
+    """``spec_error`` plus the fused call's strategy: vLLM never forces it on MNNVL."""
+    if spec["strategy"] != "auto":
+        return (
+            "vLLM leaves the MNNVL one-shot/two-shot choice to FlashInfer "
+            f"(strategy auto), got strategy={spec['strategy']!r}"
+        )
+    return spec_error(spec)
+
+
 def profile_all_reduce_fusion_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
+    return _profile_batch(kwargs_list, spec_error, _all_reduce_per_rank_batch)
+
+
+def profile_all_reduce_residual_rms_norm_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
+    return _profile_batch(kwargs_list, fused_spec_error, _fused_per_rank_batch)
+
+
+def _profile_batch(kwargs_list: list[dict], error_fn, per_rank_fn) -> list[RunnerResult]:
     if not kwargs_list:
         return []
     results: list[RunnerResult | None] = [None] * len(kwargs_list)
     runnable: list[int] = []
     for index, spec in enumerate(kwargs_list):
-        error = spec_error(spec)
+        error = error_fn(spec)
         if error is None:
             runnable.append(index)
         else:
@@ -107,7 +134,7 @@ def profile_all_reduce_fusion_batch(kwargs_list: list[dict]) -> list[RunnerResul
         num_gpus = int(kwargs_list[runnable[0]]["num_gpus"])
         measured = run_comm_batch(
             TorchMpLauncher(num_gpus, backend="cpu:gloo,cuda:nccl"),
-            _all_reduce_per_rank_batch,
+            per_rank_fn,
             [kwargs_list[index] for index in runnable],
         )
         for index, result in zip(runnable, measured, strict=True):
@@ -116,12 +143,19 @@ def profile_all_reduce_fusion_batch(kwargs_list: list[dict]) -> list[RunnerResul
 
 
 def _all_reduce_per_rank_batch(
-    *,
-    rank: int,
-    world_size: int,
-    specs: list[dict],
-    warmup: int,
-    rep: int,
+    *, rank: int, world_size: int, specs: list[dict], warmup: int, rep: int
+) -> list[dict] | None:
+    return _per_rank_batch(_profile_one_shape, rank, world_size, specs, warmup, rep)
+
+
+def _fused_per_rank_batch(
+    *, rank: int, world_size: int, specs: list[dict], warmup: int, rep: int
+) -> list[dict] | None:
+    return _per_rank_batch(_profile_one_fused_shape, rank, world_size, specs, warmup, rep)
+
+
+def _per_rank_batch(
+    profile_one, rank: int, world_size: int, specs: list[dict], warmup: int, rep: int
 ) -> list[dict] | None:
     flashinfer_comm, torch, dist, torch_dist_backend = _imports()
     # vLLM passes the TP group's gloo CPU group to the workspace.
@@ -149,7 +183,7 @@ def _all_reduce_per_rank_batch(
                 if not getattr(workspace, "mc_ptr", 0):
                     raise RuntimeError("FlashInfer MNNVL multicast is unavailable")
                 for spec_index, spec in indexed_specs:
-                    ordered[spec_index] = _profile_one_shape(
+                    ordered[spec_index] = profile_one(
                         flashinfer_comm=flashinfer_comm,
                         torch=torch,
                         dist=dist,
@@ -169,7 +203,7 @@ def _all_reduce_per_rank_batch(
     if rank != 0:
         return None
     if any(result is None for result in ordered):
-        raise KernelLaunchFailed("missing rank-0 MNNVL all-reduce result")
+        raise KernelLaunchFailed("missing rank-0 MNNVL result")
     return ordered
 
 
@@ -248,6 +282,98 @@ def _profile_one_shape(
         message_size_bytes=input_tensor.numel() * input_tensor.element_size(),
         world_size=world_size,
     )
+
+
+def _profile_one_fused_shape(
+    *,
+    flashinfer_comm,
+    torch,
+    dist,
+    workspace,
+    rank: int,
+    world_size: int,
+    spec: dict,
+    torch_dtype,
+    warmup: int,
+    rep: int,
+) -> dict:
+    num_tokens = int(spec["num_tokens"])
+    hidden_dim = int(spec["hidden_dim"])
+    if not workspace.is_buffer_size_sufficient(
+        tp_size=world_size,
+        num_tokens=num_tokens,
+        hidden_dim=hidden_dim,
+        dtype=torch_dtype,
+    ):
+        raise ValueError(
+            f"MNNVL workspace cannot hold num_tokens={num_tokens} hidden_dim={hidden_dim}"
+        )
+    generator = torch.Generator(device="cuda").manual_seed(1234 + rank)
+    input_tensor = torch.randn(
+        num_tokens, hidden_dim, dtype=torch_dtype, device="cuda", generator=generator
+    )
+    # The residual stream is replicated across TP ranks, as in production.
+    residual_in = torch.randn(
+        num_tokens,
+        hidden_dim,
+        dtype=torch_dtype,
+        device="cuda",
+        generator=torch.Generator(device="cuda").manual_seed(4321),
+    )
+    residual_out = torch.empty_like(input_tensor)
+    norm_out = torch.empty_like(input_tensor)
+    rms_gamma = torch.ones(hidden_dim, dtype=torch_dtype, device="cuda")
+
+    def launch():
+        flashinfer_comm.allreduce_fusion(
+            input=input_tensor,
+            workspace=workspace,
+            pattern=flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+            launch_with_pdl=bool(spec["launch_with_pdl"]),
+            residual_out=residual_out,
+            norm_out=norm_out,
+            residual_in=residual_in,
+            rms_gamma=rms_gamma,
+            rms_eps=RMS_EPS,
+            use_oneshot=None,
+            fp32_acc=bool(spec["fp32_acc"]),
+            trigger_completion_at_end=bool(spec["trigger_completion_at_end"]),
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    gathered = [torch.empty_like(input_tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, input_tensor)
+    summed = torch.stack(gathered).float().sum(dim=0) + residual_in.float()
+    normed = summed * torch.rsqrt(summed.pow(2).mean(dim=-1, keepdim=True) + RMS_EPS)
+    _check_close(torch=torch, dist=dist, actual=residual_out, reference=summed, what="residual")
+    _check_close(torch=torch, dist=dist, actual=norm_out, reference=normed, what="RMSNorm")
+
+    time_ms = _time_cuda_graph(
+        torch=torch,
+        dist=dist,
+        launch=launch,
+        input_tensor=input_tensor,
+        warmup=warmup,
+        rep=max(rep, MIN_TIMED_OPERATIONS),
+        operations_per_graph=OPERATIONS_PER_GRAPH,
+    )
+    return _comm_payload(
+        time_ms=time_ms,
+        message_size_bytes=input_tensor.numel() * input_tensor.element_size(),
+        world_size=world_size,
+    )
+
+
+def _check_close(*, torch, dist, actual, reference, what: str) -> None:
+    tolerance = 2e-2 * reference.abs() + 3e-2
+    worst = ((actual.float() - reference).abs() - tolerance).max().reshape(1)
+    dist.all_reduce(worst, op=dist.ReduceOp.MAX)
+    if worst.item() > 0:
+        raise AssertionError(
+            f"MNNVL fused {what} differs from the fp32 reference by {worst.item():.4g} "
+            "beyond tolerance"
+        )
 
 
 def _check_against_torch_sum(*, torch, dist, input_tensor, output_tensor, world_size: int) -> None:
