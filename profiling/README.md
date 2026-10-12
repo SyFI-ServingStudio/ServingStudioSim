@@ -326,6 +326,14 @@ SELECT t.*, r.profiler_git_hash, datetime(t.profiler_run_at, 'unixepoch')
 FROM single_gemm t JOIN _profile_run r USING (run_key)
 ```
 
+An args field added to a kind that already has rows is declared with
+`optional_arg(same_as=...)` (`profiling/db/doc.py`), last in its schema: unset
+(or equal to `same_as`) it is stored NULL and left out of `args_hash`, so
+existing rows keep their keys and no migration runs. The table gains the
+nullable column, appended, only when a row first sets it; readers of a table
+without it treat it as unset, and `merge-db` merges a table with it and one
+without. Example: `kv_cache_append.head_dim_v` (`same_as="head_dim"`).
+
 A DB an older checkout wrote (schema v2) is refused by readers until
 `python -m launcher kernel-profile migrate-db <path>` upgrades it in place; the
 upgrade keeps every row and id and then VACUUMs the file.

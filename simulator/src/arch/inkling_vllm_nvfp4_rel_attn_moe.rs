@@ -343,6 +343,7 @@ pub fn build_configs(
                 quant_backends: NVFP4_QUANT_BACKENDS.to_vec(),
                 moe_backends: NVFP4_ROUTED_MOE_BACKENDS.to_vec(),
                 weight_format: DType::Nvfp4E2m1,
+                activation_format: None,
                 group_size: NVFP4_GROUP_SIZE,
                 routing_method: ROUTING_METHOD.to_string(),
                 n_group: 1,

@@ -36,6 +36,10 @@ pub trait KernelConfig:
 
     /// The field tagged `#[compute_dtype]`, if any. Derived.
     const COMPUTE_DTYPE_FIELD: Option<&'static str> = None;
+    /// The `Option<DType>` field tagged `#[compute_dtype_override]`, if any:
+    /// when set it is the compute dtype instead of `COMPUTE_DTYPE_FIELD`'s
+    /// value. Derived.
+    const COMPUTE_DTYPE_OVERRIDE_FIELD: Option<&'static str> = None;
     /// The field tagged `#[kv_dtype]`, if any. Derived.
     const KV_DTYPE_FIELD: Option<&'static str> = None;
 
@@ -48,7 +52,8 @@ pub trait KernelConfig:
     /// The compute/activation dtype (a GEMM's `dtype`, attention's `q_dtype`), or
     /// `None` for a dtype-agnostic kernel (size-keyed comm, byte-keyed
     /// elementwise). `#[derive(KernelConfig)]` overrides the default from the
-    /// field tagged `#[compute_dtype]`. Emitted as a typed field in the enumerate
+    /// field tagged `#[compute_dtype]`, or from the `#[compute_dtype_override]`
+    /// field when that one is set. Emitted as a typed field in the enumerate
     /// record so the launcher's capability gate reads it directly — never
     /// re-parses `describe_config`.
     fn compute_dtype(&self) -> Option<DType> {
@@ -551,6 +556,7 @@ pub(crate) struct KernelQueryEntry {
     /// The cache coordinates an `Input` projects onto (`SweepCoords`).
     pub coord_fields: fn() -> &'static [&'static str],
     pub compute_dtype_field: Option<&'static str>,
+    pub compute_dtype_override_field: Option<&'static str>,
     pub kv_dtype_field: Option<&'static str>,
     /// `rows` path: the profile.db rows one config measures and the rows each
     /// runtime input reads ([`rows_from_json`]). No bridge, DB or GPU.
@@ -593,6 +599,7 @@ impl KernelQueryEntry {
             input_fields: serde_field_names::<S::Input>,
             coord_fields: <S::Input as SweepCoords>::coord_field_names,
             compute_dtype_field: <S::Config as KernelConfig>::COMPUTE_DTYPE_FIELD,
+            compute_dtype_override_field: <S::Config as KernelConfig>::COMPUTE_DTYPE_OVERRIDE_FIELD,
             kv_dtype_field: <S::Config as KernelConfig>::KV_DTYPE_FIELD,
             rows: rows_from_json::<S>,
             build: build_probe_from_json::<S>,

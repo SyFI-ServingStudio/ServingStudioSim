@@ -1,4 +1,7 @@
-"""FlashInfer TRT-LLM fused all-reduce + residual + RMSNorm kernel kind.
+"""FlashInfer fused all-reduce + residual + RMSNorm kernel kind.
+
+Backends: ``flashinfer_trtllm`` (TRT-LLM IPC workspace) and ``flashinfer_mnnvl``
+(NVLink-multicast workspace, vLLM's default on B200).
 
 This is deliberately separate from ``all_reduce``: the production vLLM path
 launches one ``kARResidualRMSNorm`` device kernel whose grid depends on the 2-D
@@ -51,15 +54,18 @@ DOC = KernelDoc(
     ),
     description=(
         "vLLM fuses the all-reduce at the end of a tensor-parallel block with "
-        "the residual add and RMSNorm that follow into one FlashInfer TRT-LLM "
-        "kernel, up to a per-GPU fusion-size limit, above which it runs them "
-        "unfused. The input and residual are random normal [num_tokens, "
+        "the residual add and RMSNorm that follow into one FlashInfer kernel, "
+        "over a TRT-LLM IPC workspace or, by default on B200, an NVLink-multicast "
+        "(MNNVL) workspace, up to a per-GPU fusion-size limit, above which it "
+        "runs them unfused. The input and residual are random normal [num_tokens, "
         "hidden_dim] tensors; the norm weight is all ones and ε is 1e-6."
     ),
     category="Communication",
     formula=(
         "s = Σᵣ inputᵣ + residual",
         "y = s / √(mean(s²) + 1e-6) · weight",
+        "MNNVL: one-shot when num_tokens·hidden_dim·num_gpus·bytes per element ≤ 1 MiB, "
+        "otherwise two-shot",
         "algbw = num_tokens·hidden_dim·bytes per element / time",
         "busbw = algbw · 2(num_gpus − 1) / num_gpus",
     ),
@@ -67,8 +73,10 @@ DOC = KernelDoc(
     method=(
         "Wall-clock time of CUDA graph replays, since vLLM runs this call "
         "inside a graph. Each graph holds ten fused calls. After 50 direct "
-        "calls and 5 replays, 100 calls are timed from a barrier to a device "
-        "synchronize, and the slowest rank's mean per call is kept."
+        "calls and 5 replays, the timed replays run from a barrier to a device "
+        "synchronize, and the slowest rank's mean per call is kept. "
+        "flashinfer_trtllm times 100 calls; flashinfer_mnnvl times 1000, after "
+        "checking the residual and normalized outputs against an FP32 reference."
     ),
     caveats=(
         "algbw and busbw divide the all-reduce input size by the time of the "
@@ -77,6 +85,9 @@ DOC = KernelDoc(
         "Host time around graph replays includes the replay launch cost, not only kernel time.",
         "The fabric argument labels the row; the run uses whatever links "
         "connect the reserved GPUs.",
+        "flashinfer_mnnvl is measured only where vLLM routes to it: fabric "
+        "nvlink, strategy auto, a TP size vLLM has a FlashInfer budget for, and "
+        "a tensor within that budget.",
     ),
     # No separate PyTorch reference implements the entire fused call.
     reference=None,
@@ -112,6 +123,44 @@ register(
                 "FlashInfer's TRT-LLM allreduce_fusion call with the kARResidualRMSNorm pattern."
             ),
             url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/comm/allreduce.py",
+        ),
+    )
+)
+
+# vLLM's default fused backend on single-node B200: the allreduce_rms pass uses
+# the MNNVL workspace whenever ``VLLM_FLASHINFER_ALLREDUCE_BACKEND=auto`` can
+# create it (``flashinfer_all_reduce.py`` ``_resolve_fi_ar_backend``), and leaves
+# one-shot vs two-shot to FlashInfer, so ``strategy`` must be ``auto``. Same
+# environment, SM100 budget and TP sizes as ``all_reduce_fusion``'s
+# ``flashinfer_mnnvl``, which shares its runner module and workspace.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_mnnvl",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_100a"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.comm.flashinfer_mnnvl",
+            function_name="profile_all_reduce_residual_rms_norm_batch",
+        ),
+        table_name=KIND,
+        args_schema=AllReduceResidualRmsNormArgs,
+        metric_family=MetricFamily.COMM,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        # The MNNVL workspace is fabric-handle memory.
+        imex_channel=True,
+        gpu_count_fn=lambda spec: int(spec["num_gpus"]),
+        list_native=True,
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer's allreduce_fusion with the kARResidualRMSNorm pattern over an "
+                "NVLink-multicast workspace, as vLLM calls it on B200; FlashInfer picks "
+                "one-shot or two-shot by size."
+            ),
+            url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/comm/trtllm_mnnvl_ar.py",
         ),
     )
 )

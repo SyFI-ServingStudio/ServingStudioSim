@@ -1,7 +1,8 @@
 """Whole FlashInfer TRT-LLM block-quantized MoE callable used on B200.
 
-The operation starts with already-quantized activations and contains routing,
-both expert GEMMs, SwiGLU, and finalize routing.  It is intentionally one L1
+The operation starts with already-quantized activations (BF16 ones for the
+weight-only MXFP4/BF16 backend) and contains routing, both expert GEMMs,
+SwiGLU, and finalize routing.  It is intentionally one L1
 kind: SM100 uses PDL between several physical launches, so summing independently
 profiled stages would double-count overlap and could select different tactics.
 
@@ -12,8 +13,11 @@ blocks with per-token-group-128 FP8 activations. The MXFP4 backend
 (`trtllm_fp4_block_scale_routed_moe`) takes `mxfp4_e2m1` / group 32 with MXFP8
 activations and `routing_method="precomputed_dsv4"`: finished top-k ids and
 weights come in, so it only permutes (n_group = topk_group = 1, routed scale
-1/1; the router already applied the scale). `input_dtype` is the unquantized
-activation and output precision in every backend.
+1/1; the router already applied the scale). The MXFP4/BF16 backend
+(`trtllm_fp4_block_scale_moe`) takes the same `mxfp4_e2m1` / group 32 weights
+but leaves the activations in BF16: the GEMMs cast the weights and run BF16
+MMA, and it routes inside the call (`deepseek_v3`, ungrouped). `input_dtype`
+is the unquantized activation and output precision in every backend.
 """
 
 from __future__ import annotations
@@ -44,13 +48,20 @@ class Nvfp4FusedMoeArgs(KernelArgs):
         unit="experts", doc="Routed experts whose weights reside on this GPU."
     )
     top_k: int = arg(unit="experts", doc="Experts selected for each token.")
-    input_dtype: DType = arg(doc="Element type before the hidden states are quantized.")
+    input_dtype: DType = arg(
+        doc=(
+            "Element type of the hidden states before any quantization, and of the"
+            " output. The MXFP4/BF16 backend keeps the activations in it."
+        )
+    )
     weight_format: DType = arg(
         doc=(
-            "Packed expert weight format, and the tensor-core precision: the call"
-            " quantizes activations to it, so both GEMM operands share it."
-            " nvfp4_e2m1 for the NVFP4 backends, fp8_e4m3 for the FP8 block-scale backend,"
-            " mxfp4_e2m1 for the MXFP4 backend (whose activations are MXFP8)."
+            "Packed expert weight format. It is also the tensor-core precision"
+            " when the activations are quantized to it: nvfp4_e2m1 for the NVFP4"
+            " backends, fp8_e4m3 for the FP8 block-scale backend, mxfp4_e2m1 for"
+            " the MXFP4 backend (whose activations are MXFP8). The MXFP4/BF16"
+            " backend takes mxfp4_e2m1 weights but runs BF16 MMA on input_dtype"
+            " activations."
         )
     )
     group_size: int = arg(
@@ -66,8 +77,8 @@ class Nvfp4FusedMoeArgs(KernelArgs):
             " deepseek_v3: DeepSeekV3 sigmoid + bias top-k with the routed scale, over"
             " FP32 logits and bias. precomputed_dsv4: finished top-k ids and weights."
             " The vLLM NVFP4 backends take minimax2 or deepseek_v3, the SGLang backend"
-            " minimax2, the FP8 block-scale backend deepseek_v3, the MXFP4 backend"
-            " precomputed_dsv4."
+            " minimax2, the FP8 block-scale and MXFP4/BF16 backends deepseek_v3, the"
+            " MXFP4 backend precomputed_dsv4."
         )
     )
     n_group: int = arg(unit="groups", doc="Expert groups considered by the router.")
@@ -89,14 +100,15 @@ DOC = KernelDoc(
     description=(
         "A routed MoE layer runs as this one FlashInfer call on hidden states"
         " already quantized to weight_format (NVFP4, FP8 with 128-wide "
-        "block scales, or MXFP8 for MXFP4 weights): routing, the gate-up "
-        "projection, SwiGLU "
+        "block scales, or MXFP8 for MXFP4 weights), or on the BF16 hidden "
+        "states themselves for the weight-only MXFP4/BF16 backend: routing, the "
+        "gate-up projection, SwiGLU "
         "and the down projection. per_expert_batches gives the tokens routed to"
         " every expert across all GPUs, and the first num_local_experts are "
         "this GPU's. The vLLM backend also combines the expert outputs; the "
         "SGLang backend leaves the combine to a later kernel, "
-        "moe_finalize_fuse_shared. The FP8 block-scale and MXFP4 backends also "
-        "combine. The routed backend takes top-k IDs and weights chosen before the "
+        "moe_finalize_fuse_shared. The FP8 block-scale, MXFP4 and MXFP4/BF16 "
+        "backends also combine. The routed backend takes top-k IDs and weights chosen before the "
         "call, as vLLM does under data plus expert parallelism, so routing_method, "
         "n_group, topk_group and the scaling factor do not reach the kernel. The "
         "MXFP4 backend takes finished top-k ids and weights, so its routing step "
@@ -129,6 +141,10 @@ DOC = KernelDoc(
         "weight_bytes = active_experts·(3·intermediate_size·hidden_size/2 "
         "+ 3·intermediate_size·hidden_size/32); GB/s = (routing_bytes + activation_bytes "
         "+ weight_bytes + 4·num_local_experts + 2·hidden_size·num_tokens) / time",
+        "MXFP4/BF16: routing_bytes = 4·(num_tokens·num_experts + num_experts) "
+        "(FP32 logits and bias, deepseek_v3); activation_bytes = 2·local_rows·hidden_size "
+        "(BF16, no scale); weight_bytes as MXFP4; GB/s = (routing_bytes + activation_bytes "
+        "+ weight_bytes + 2·hidden_size·num_tokens) / time",
     ),
     default_metric="time_ms",
     method=(
@@ -149,6 +165,11 @@ DOC = KernelDoc(
         "The MXFP4 backend accepts only precomputed_dsv4 routing with group 32, "
         "n_group = topk_group = 1 and routed scaling 1/1, with the SwiGLU clamp "
         "applied; it too tunes up to 8192 tokens.",
+        "The MXFP4/BF16 backend accepts only ungrouped deepseek_v3 routing over FP32 "
+        "logits and bias, with group 32 and no SwiGLU clamp, bias, alpha or beta; it "
+        "too tunes up to 8192 tokens. Its tensor cores run BF16, not the weight format: "
+        "the Rust config states that with activation_format, and the precision column "
+        "still shows the weight format.",
         "Activation quantization is outside the call, and the router logits are synthetic.",
         "The vLLM NVFP4 backends tune up to max(8192, next power of two ≥ num_tokens); "
         "vLLM tunes up to max_num_batched_tokens·dp_size, which picks the same "
@@ -336,6 +357,39 @@ register(
                 "FlashInfer trtllm_fp4_block_scale_routed_moe (MXFP4 weights, MXFP8 "
                 "activations) on precomputed top-k, as vLLM's TRT-LLM MXFP4 experts "
                 "call it, including final expert combination."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py",
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_trtllm_sm100_mxfp4_bf16",
+        # Same SM10x TRT-LLM-gen cubins as flashinfer_trtllm_sm100_mxfp4 (vLLM:
+        # TrtLlmMxfp4ExpertsBase, is_device_capability_family(100)). The GEMMs run
+        # BF16 MMA on the unquantized activations, so the compute dtype the
+        # launcher gates on is bf16 (the config's activation_format).
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.mxfp4_bf16_fused_moe",
+            function_name="profile_mxfp4_bf16_fused_moe_sm100",
+        ),
+        table_name=KIND,
+        args_schema=Nvfp4FusedMoeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer trtllm_fp4_block_scale_moe with MXFP4 weights and BF16 "
+                "activations (BF16 MMA), routing inside the call, as vLLM's "
+                "FLASHINFER_TRTLLM_MXFP4_BF16 monolithic experts call it, including "
+                "final expert combination."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py",
         ),

@@ -222,7 +222,7 @@ def tuning_label(args: dict[str, Any], stack: str, precomputed_routing: bool) ->
     )
 
 
-def _forced_routing(
+def forced_routing(
     torch: Any, ids: list[list[int]], args: dict[str, Any], device: Any = "cuda"
 ) -> tuple[Any, Any]:
     """Router logits and zero correction bias whose top-k is exactly ``ids``.
@@ -381,7 +381,7 @@ def _profile_nvfp4_fused_moe_sm100(
             top_k=args["top_k"],
             per_expert_batches=args["per_expert_batches"],
         )
-        routing_logits, routing_bias = _forced_routing(torch, ids, args)
+        routing_logits, routing_bias = forced_routing(torch, ids, args)
         hidden, hidden_scale, per_token_scale = _quantized_hidden(
             torch, quantize, args["num_tokens"], args["hidden_size"]
         )
