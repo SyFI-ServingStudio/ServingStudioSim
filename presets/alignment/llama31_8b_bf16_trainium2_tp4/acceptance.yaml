@@ -1,0 +1,22 @@
+# Selected after the saved Trainium evidence, not prospectively registered.
+# These are the unchanged generic defaults in
+# glm53_flash_fp8_b200_tp4_ep4/acceptance.yaml. No result-specific exceptions.
+schema_version: 1
+analyzer_schema: {iteration: 3, e2e: 1, workload: 1}
+warn_fraction: 0.8
+tolerances:
+  default:
+    kernel_abs_pct: 5.0
+    kernel_signed_pct: 5.0
+    map_coverage_pct: 97.0
+    gpu_time_multiplier: 1.5
+    iteration_cycle_mean_pct: 8.0
+    iterations_pct: 1.0
+    prefill_tokens_mean_pct: 1.0
+    decode_batch_mean_pct: 1.0
+    scheduled_kv_mean_pct: 1.0
+    output_tps_pct: 8.0
+    server_ttft_mean_pct: 12.0
+    server_tpot_mean_pct: 11.0
+    e2e_mean_pct: 7.0
+  per_case: {}

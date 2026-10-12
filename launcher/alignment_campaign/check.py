@@ -60,8 +60,8 @@ from .render import (
     TIMING_PREDICT_PHASE,
     WORKLOAD_TRACE_NAME,
     case_documents,
+    case_trace_text,
     case_traces,
-    trace_text,
 )
 
 INVARIANTS_SCHEMA_VERSION = 1
@@ -102,10 +102,17 @@ def host_for(pack: Pack, host: HostProfile | None) -> HostProfile:
         for case in pack.cases:
             if case.variant != variant.name:
                 continue
-            roles.setdefault(case.device_role, ",".join(str(index) for index in range(world_size)))
+            width = 1 if variant.contract.native_server else world_size
+            roles.setdefault(case.device_role, ",".join(str(index) for index in range(width)))
     from dataclasses import replace
 
-    return replace(base, checkpoints=checkpoints, device_roles=roles)
+    # Static checks never touch the machine: an engine-owned server block gets
+    # syntactically valid stand-ins for its host fields.
+    neuron_server = dict(base.neuron_server)
+    for variant in pack.variants.values():
+        for key, value in variant.contract.host_server_stub.items():
+            neuron_server.setdefault(key, value)
+    return replace(base, checkpoints=checkpoints, device_roles=roles, neuron_server=neuron_server)
 
 
 # ── trace invariants ─────────────────────────────────────────────────────────
@@ -151,7 +158,7 @@ def compute_invariants(pack: Pack) -> dict[str, Any]:
         for spec in (case.workload_trace, case.kernel_trace):
             if spec is None:
                 continue
-            traces[spec.file] = trace_invariants(trace_text(case, spec))
+            traces[spec.file] = trace_invariants(case_trace_text(pack, case, spec))
     return {
         "schema_version": INVARIANTS_SCHEMA_VERSION,
         "note": (
@@ -275,7 +282,8 @@ def _check_traces(pack: Pack) -> list[Finding]:
                 continue
             where = f"cases[{case.slug}].{role}"
             try:
-                regenerated = trace_text(case, spec)
+                simultaneous = pack.variant_of(case).contract.simultaneous_trace
+                regenerated = case_trace_text(pack, case, spec)
             except PackError as exc:
                 findings.append(Finding("error", where, str(exc)))
                 continue
@@ -288,7 +296,9 @@ def _check_traces(pack: Pack) -> list[Finding]:
                 )
             if actual["distinct_request_ids"] != actual["request_count"]:
                 findings.append(Finding("error", where, f"{spec.file} repeats a request id"))
-            if actual["max_total_len"] >= case.max_model_len:
+            if actual["max_total_len"] > case.max_model_len or (
+                actual["max_total_len"] == case.max_model_len and not simultaneous
+            ):
                 findings.append(
                     Finding("error", where,
                             f"{spec.file} has a request reaching max_model_len "
@@ -559,7 +569,9 @@ def _load_rendered(pack: Pack, case: Case, case_dir: Path) -> list[Finding]:
     for profile_pass in variant.profile_passes:
         path = case_dir / f"{profile_pass.name}.yaml"
         try:
-            config = load_profile_config(path)
+            config = load_profile_config(
+                path, require_python_runtime=not variant.contract.native_server
+            )
         except ValueError as exc:
             findings.append(Finding("error", f"{where}.{profile_pass.name}", str(exc)))
             continue
@@ -623,6 +635,25 @@ def _check_cross_phase(pack: Pack, case: Case, documents: dict[str, Any]) -> lis
             findings.append(
                 Finding("error", f"{where}.{profile_pass.name}", "workload.max_model_len drifted")
             )
+        if variant.contract.native_server:
+            server = document["server"]
+            if server.get("max_model_len") != case.max_model_len:
+                findings.append(
+                    Finding(
+                        "error",
+                        f"{where}.{profile_pass.name}",
+                        "server.max_model_len differs from the case",
+                    )
+                )
+            if "cuda_visible_devices" in document or "extra_args" in server:
+                findings.append(
+                    Finding(
+                        "error",
+                        f"{where}.{profile_pass.name}",
+                        f"{variant.engine} must use its whole-chip server contract",
+                    )
+                )
+            continue
         flags = document["server"]["extra_args"]
         limit_flag = CONTEXT_LIMIT_FLAG.get(variant.engine)
         if limit_flag is None:
