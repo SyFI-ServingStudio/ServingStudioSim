@@ -430,11 +430,12 @@ cases:
       - 64
     repeats: 100
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 01
     derivation: GLM c256 is the matrix's largest offered batch; MiMo's is S = 100 (--max-num-seqs), and the simulated
@@ -483,11 +484,12 @@ cases:
       - 64
     repeats: 34
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 02
     derivation: 'c = S: as the batch drains, decode replays every captured size 1..104. Prompts straddle capture
@@ -529,11 +531,12 @@ cases:
       - 256
     repeats: 16
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 03
     derivation: 'The cross-model anchor: unchanged. c32 <= S; KV demand 32 x 4352 tokens = 0.7% of the pool.'
@@ -572,11 +575,12 @@ cases:
       - 64
     repeats: 16
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 04
     derivation: 'Unchanged: MiMo''s chunk is also 2048, so 1984/2048/2112 are still the boundary. c32 <= S.'
@@ -615,11 +619,12 @@ cases:
       - 4096
     repeats: 16
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 05
     derivation: 'Unchanged: c64 <= S, and every decode context already starts at the 128-token sliding window, so
@@ -653,11 +658,12 @@ cases:
       - 1920
     repeats: 7
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 06
     derivation: 'GLM''s prompts are 25-75% of its 8192 context limit; MiMo serves 131072, so prompts x16 (32K-96K).
@@ -690,11 +696,12 @@ cases:
       - 3072
     repeats: 24
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 07
     derivation: 'Unchanged: the quadrants are defined against the 2048 chunk (4096 = two chunks), not the context
@@ -730,11 +737,12 @@ cases:
       - 4096
     repeats: 32
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 08
     derivation: 'Unchanged: c96 <= S keeps 4 slots of headroom, so replacements are admitted at once.'
@@ -778,11 +786,12 @@ cases:
       a 135.04 s measured client completion span = 3.79 req/s'
     evidence: logs/20261012_4_mimo_align_campaign/10_full_saturation_rate/analysis_e2e
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 09
     derivation: GLM's knee rule (0.8 x the case-10 saturated rate) on MiMo's throughput; same 8-shape mix and 512
@@ -807,11 +816,12 @@ cases:
     shapes: *id003
     repeats: 64
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 10
     derivation: GLM c256 -> S = 100, the engine's own batch ceiling (above it vLLM queues and the simulator would
@@ -875,11 +885,12 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 11
     derivation: 'GLM''s rungs are 1/32 .. 15/16 of its 524288 limit; the same fractions of 131072 (each rung / 4).
@@ -945,11 +956,12 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 12
     derivation: 'Prompts are GLM''s / 4 (same fractions of the context limit; the top, 114688 + 4096, is 88% of
@@ -1043,11 +1055,12 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 118.1868
-    status: provisional
-    derived_from: '`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264''s server log, the exact
-      serving config at gpu_memory_utilization 0.85; re-read from this case''s workload pass'
-    evidence: logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log
+    value: 116.4366
+    status: measured
+    derived_from: '`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass (Slurm job
+      6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB below job 6264''s 110.07 GiB at the
+      default 200-token graph ceiling'
+    evidence: logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 13
     derivation: 'Unchanged: GLM already ran it at max_model_len 131072, and its longest row (65536) fits. c8 <=

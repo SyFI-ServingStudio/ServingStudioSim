@@ -41,7 +41,8 @@ MiMo's limits (TP4/EP4, gpu_memory_utilization 0.85, chunk 2048):
 - L = 131072 (`--max-model-len`); rendering rejects a trace row with input + output >= L.
 - KV pool. 110.52 GiB per GPU in the draft captures (jobs 4198/4220/4223: `GPU KV cache size: 15,566,522 tokens,
   Maximum concurrency for 131,072 tokens per request: 118.76x`). The exact serving config (job 6264, whose
-  FlashInfer MNNVL workspace takes 0.45 GiB more) reports 110.07 GiB / 15,503,779 tokens / 118.28x.
+  FlashInfer MNNVL workspace takes 0.45 GiB more) reports 110.07 GiB / 15,503,779 tokens / 118.28x, and with
+  this pack's 2048-token graph ceiling 108.44 GiB / 15,273,913 tokens / 116.53x (case 01 workload pass, job 6360).
   vLLM's hybrid allocator holds 6 KV groups of 9 layers, one block id spanning 9 per-position tensors:
     page   = 20,480 B per layer per block: GA 1 KV head/rank x (192 K + 128 V) x 2 B x 32 tokens
              = SWA 2 KV heads/rank x 320 x 2 B x 16 tokens;
@@ -93,8 +94,6 @@ GIB = 1 << 30
 # The arch block matches presets/public/MiMo-V2.6-Flash-RL/mimo_v2_vllm_fp8_swa_moe.yaml (its diverse_100 member)
 # except cudagraph_capture_sizes: the public preset keeps the diverse_100 capture's default list (ceiling 200).
 ARCH_TYPE = "mimo_v2_vllm_fp8_swa_moe"
-
-CAPTURE = "logs/20261012_1_mimo_fused_ar_nsys/profile_nsys/vllm/mimo_v26_flash_rl_tp4_ep4_fused_ar_nsys_server.log"
 
 
 def blocks(terminal: int) -> int:
@@ -342,12 +341,12 @@ def kv_calibration(case: dict) -> dict:
         pinned = KV15
     else:
         return {
-            "value": round(110.07 * GIB / 1e9, 4),
-            "status": "provisional",
-            "derived_from": "`Available KV cache memory: 110.07 GiB` (x 1.073741824) in job 6264's server log, the "
-                            "exact serving config at gpu_memory_utilization 0.85; re-read from this case's workload "
-                            "pass",
-            "evidence": CAPTURE,
+            "value": round(108.44 * GIB / 1e9, 4),
+            "status": "measured",
+            "derived_from": "`Available KV cache memory: 108.44 GiB` (x 1.073741824) in the case-01 workload pass "
+                            "(Slurm job 6360) of this serving config at gpu_memory_utilization 0.85, 1.63 GiB "
+                            "below job 6264's 110.07 GiB at the default 200-token graph ceiling",
+            "evidence": "logs/20261012_5_mimo_align_campaign_v2/01_micro_throughput_c100/profile_workload",
         }
     return {
         "value": round(pinned / 1e9, 4),
