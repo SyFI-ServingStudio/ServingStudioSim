@@ -244,7 +244,7 @@ def neuron_container(env_name: str | None) -> NeuronContainer:
     )
 
 
-def _docker_cli_environment() -> dict[str, str]:
+def docker_cli_environment() -> dict[str, str]:
     # The declared socket owns the transport: inherited DOCKER_* context or TLS
     # settings must not redirect this subprocess. The caller's env is untouched.
     return {name: value for name, value in os.environ.items() if not name.startswith("DOCKER_")}
@@ -254,7 +254,7 @@ def _inspect_neuron_image(container: NeuronContainer) -> str:
     """The local image ID the declared digest resolves to; never pulled."""
     completed = subprocess.run(
         [*container.prefix, "image", "inspect", container.image],
-        env=_docker_cli_environment(),
+        env=docker_cli_environment(),
         capture_output=True,
         text=True,
         timeout=30,
@@ -401,7 +401,7 @@ def _neuron_container_worker_command(
             "/io/output.json",
         )
     )
-    return command, _docker_cli_environment()
+    return command, docker_cli_environment()
 
 
 class LocalNeuronPool(GpuPool):

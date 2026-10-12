@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -155,6 +156,31 @@ def test_checkpoint_weight_mutation_without_config_change_rejected(tmp_path, mon
     (tmp_path / "weights.safetensors").write_bytes(b"different-weights")
     with pytest.raises(ValueError, match="checkpoint/config/tokenizer"):
         identity.verify_checkpoint(tmp_path)
+
+
+def test_fresh_accuracy_only_http_authority_and_legacy_refusal(numeric_run, tmp_path):
+    from alignment.neuron import vllm_runner as runner
+
+    root, cache, snapshot = numeric_run
+    identity.seal_accuracy_binaries(root)
+    evidence = runner.accepted_forward_evidence(root)
+    cfg = SimpleNamespace(server=SimpleNamespace(cache_path=str(cache.parent)))
+    # Configured cache root is <root>/cache/neuron/compile_cache; use the real helper separately.
+    assert set(evidence["graphs"]) == {"prefill:512", "decode:1", "decode:16"}
+    assert evidence["binary_provenance"]["available"]
+    with pytest.raises(ValueError, match="requires producer-recorded"):
+        runner.capture_binary_snapshot(cfg, {"binary_provenance": {"available": False}})
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    assert runner.captured_binary_provenance(capture, evidence)["available"] is False
+    for name in ("before", "after"):
+        write(capture, f"capture-binaries-{name}.json", snapshot)
+    write(capture, "checkpoint-provenance.json", {"model_sha256": identity.MODEL_HASHES})
+    (capture / "server.log").write_text(loader_log(snapshot))
+    assert runner.captured_binary_provenance(capture, evidence)["available"]
+    (capture / "server.log").write_text(loader_log(snapshot, ranks=[0, 1, 2]))
+    with pytest.raises(ValueError, match="four rank"):
+        runner.captured_binary_provenance(capture, evidence)
 
 
 def test_legacy_receipt_does_not_gain_binary_proof(tmp_path):
