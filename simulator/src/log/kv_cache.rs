@@ -275,9 +275,9 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
             (KvGrowth::PerToken { .. }, Some(tokens)) if tokens > u64::from(max_model_len) => {
                 let block = accounting.charged_block_tokens;
                 format!(
-                    "{} tokens ({} blocks of {})",
+                    "{} tokens ({} of {})",
                     grouped(tokens),
-                    grouped(tokens / block),
+                    plural(tokens / block, "block"),
                     grouped(block)
                 )
             }

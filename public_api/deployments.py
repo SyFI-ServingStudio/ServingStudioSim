@@ -95,6 +95,9 @@ class Member:
     contract: str | None = None
     gpus_per_replica: int | None = None
     predict: dict | None = None
+    # The arch's own KV cache (`cost-trees` `kv_cache`): `attention_shards`
+    # and the `layout`, bytes over one partition. None for an FFN side.
+    kv_cache: dict | None = None
     sections: list[dict] = field(default_factory=list)
     error: str | None = None
     # profile.db rows its kernels lack, {kind: count} and {config id: count}
@@ -311,6 +314,7 @@ class DeploymentIndex:
             return
         member.gpus_per_replica = built["gpus_per_replica"]
         member.predict = built["predict"]
+        member.kv_cache = built.get("kv_cache")
         ids = [
             config_id(record["kind"], record["gpu_name"], record["identity"])
             for record in built["kernel_configs"]["configs"]
@@ -414,6 +418,7 @@ class DeploymentIndex:
             "contract": member.contract,
             "gpus_per_replica": member.gpus_per_replica,
             "predict": member.predict,
+            "kv_cache": member.kv_cache,
             "error": member.error,
             "missing": member.missing,
             "sections": member.sections,

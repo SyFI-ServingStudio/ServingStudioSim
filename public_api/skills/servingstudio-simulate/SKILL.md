@@ -56,7 +56,13 @@ including one recorded on another model). Each member gives:
 - `gpus`: the GPUs it occupies, every pool and replica included.
 - `pools`: per role, `replicas`, the arch preset's `arch_params`,
   `max_model_len` (the longest request the pool serves; `arch_params` may leave
-  it to the model's own limit), `gpus_per_replica` and the `worker` block.
+  it to the model's own limit), `gpus_per_replica`, the `worker` block, and
+  `kv_cache`: the pool's KV cache as its build sizes it, the first
+  partition's entry of a run's `raw/kv_cache.json` plus `partitions` (per
+  replica). `result.max_concurrency_at_max_model_len` is vLLM's "Maximum
+  concurrency" for one partition, `result.request_parts` what one request of
+  `max_model_len` holds per part, and `layout` the arch's declared parts;
+  bytes are over `attention_shards` GPUs.
 - `unavailable`: per capture, why the member cannot run it: `{"error": ...}`
   when it does not build, `{"missing": {<kernel role>: <rows>}}` when
   profile.db lacks rows, or `{"misfit": {"reason", "max_model_len", ...}}`

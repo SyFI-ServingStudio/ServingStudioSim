@@ -109,6 +109,25 @@ def test_every_sim_member_builds_and_is_measured(sims):
 
 @pytest.mark.presets
 @pytest.mark.needs_binary
+@pytest.mark.needs_db
+def test_every_sim_pool_reports_its_kv_cache(sims):
+    """Each pool of a member carries its build's KV report, which the Simulate
+    page shows: on the pool's GPU, at the pool's longest request."""
+    for preset in sims.presets.values():
+        for member in preset.members:
+            for role, pool in member.summary(sims.index)["pools"].items():
+                kv = pool["kv_cache"]
+                where = (preset.id, member.params, role)
+                assert kv is not None, where
+                assert kv["gpu_name"] == preset.pools[role]["gpu"], where
+                assert kv["partitions"] >= 1, where
+                result = kv["result"]
+                assert result["max_model_len"] == pool["max_model_len"], where
+                assert result["max_concurrency_at_max_model_len"] > 0, where
+
+
+@pytest.mark.presets
+@pytest.mark.needs_binary
 def test_a_capture_longer_than_the_members_context_does_not_fit(bound):
     """A capture whose requests exceed a member's context is that capture's
     misfit, counted as the simulator's own check counts it; a longer context
@@ -116,7 +135,7 @@ def test_a_capture_longer_than_the_members_context_does_not_fit(bound):
     sims, registry = bound
     preset = "GLM-5.3-Flash/glm53_flash_vllm_fp8_kda_dsa_moe_chunked_prefill"
     short = sims.member(preset, {"replicas": 1, "server": "ctx8k"})
-    _, found, _ = simulate.check_capture(
+    _, found, _, _ = simulate.check_capture(
         sims.index, short, short.capture("diverse_100"), registry, build=False
     )
     assert {k: found[k] for k in ("requests", "total", "max_model_len")} == {
@@ -125,7 +144,7 @@ def test_a_capture_longer_than_the_members_context_does_not_fit(bound):
         "max_model_len": 8192,
     }
     long = sims.member(preset, {"replicas": 1, "server": "ctx128k"})
-    _, fits, _ = simulate.check_capture(
+    _, fits, _, _ = simulate.check_capture(
         sims.index, long, long.capture("diverse_100"), registry, build=False
     )
     assert fits is None

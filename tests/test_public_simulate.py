@@ -179,8 +179,8 @@ def sims(tmp_path: Path, arch_presets: Path) -> SimIndex:
             for role, pool in member.pools.items()
         ]
         if not build:
-            return None, None, member.bounds
-        return {"layer.qkv": 1} if lacks else {}, None, bounds
+            return None, None, member.bounds, None
+        return {"layer.qkv": 1} if lacks else {}, None, bounds, None
 
     sims.check(check, jobs=2)
     return sims
@@ -444,7 +444,7 @@ def test_a_capture_too_long_for_a_member_is_that_captures_misfit(sims) -> None:
 
     def check(member, capture, build):
         fits = member is not spec or capture.name != names[0]
-        return {} if build else None, None if fits else too_long, member.bounds
+        return {} if build else None, None if fits else too_long, member.bounds, None
 
     sims.check(check, jobs=2)
     assert spec.summary(sims.index)["unavailable"] == {names[0]: {"misfit": too_long}}
@@ -482,8 +482,8 @@ def test_rows_a_capture_lacks_block_it_before_its_misfit(sims) -> None:
     def check(member, capture, build):
         mine = member is spec and capture.name == first
         if build:
-            return ({"moe": 2} if mine else {}), None, member.bounds
-        return None, too_long if mine else None, member.bounds
+            return ({"moe": 2} if mine else {}), None, member.bounds, None
+        return None, too_long if mine else None, member.bounds, None
 
     sims.check(check, jobs=2)
     assert spec.summary(sims.index)["unavailable"] == {first: {"missing": {"moe": 2}}}
