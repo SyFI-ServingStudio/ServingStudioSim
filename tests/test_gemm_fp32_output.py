@@ -102,7 +102,7 @@ def test_ll_bf16_backend_reuses_the_kind_schema_in_the_fork_env() -> None:
 
     spec = find_kernel_profiler_spec("gemm_fp32_output", "vllm_ll_bf16_auto")
     assert spec.args_schema is GemmFp32OutputArgs
-    assert spec.subprocess_env == "vllm_upstream_fork_env"
+    assert spec.subprocess_env == "vllm_env"
     assert spec.supports.compute == frozenset({DType.BF16})
 
 
