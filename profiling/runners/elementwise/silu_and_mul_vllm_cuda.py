@@ -46,6 +46,9 @@ def profile_silu_and_mul_vllm_cuda(
         energy_j = Energy.perf(launch, warmup=5, per_iter_time_ms=time_ms)
     except torch.OutOfMemoryError as exc:
         raise OOMError(f"{_BACKEND} ran out of CUDA memory") from exc
+    except AssertionError:
+        # A reference mismatch is a wrong result, not a failed launch.
+        raise
     except Exception as exc:
         raise KernelLaunchFailed(f"{_BACKEND} failed: {exc}") from exc
 
