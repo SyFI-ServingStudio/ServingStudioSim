@@ -15,8 +15,15 @@
 //!   reading one logits row.
 //!
 //! Both leaves are elementwise byte placeholders (decision D8), with byte rates
-//! from the vocabulary and the logits dtype only. For scale, in the diverse_100
-//! capture (`wt-qf-capture/logs/20261013_1_qf_diverse100/phase0`) the sample
+//! from the vocabulary and the logits dtype only. Each is priced as one
+//! same-size streaming pass over the logits row (in = out = row bytes). The
+//! elementwise kernel realizes in/out bytes as a fan-in of round(in/out) that
+//! it loops over serially inside one output tile, so a vocab-wide reduction
+//! priced with its real tiny output becomes a single-CTA latency chain instead
+//! of the many-CTA memory-bound read the real kernels do.
+//!
+//! For scale, in the diverse_100 capture
+//! (`wt-qf-capture/logs/20261013_1_qf_diverse100/phase0`) the sample
 //! phase was 0.93% of kernel time, of which the target lm_head GEMM was ~0.7%
 //! (priced in `spec_head_local`) and these launches ~0.15%: logits stats
 //! ~20 us/iter, resample ~25, rejection ~7, the small rest ~15. The capture is
@@ -29,12 +36,6 @@ use crate::timing::bridge::DType;
 use crate::timing::kernels::{ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput};
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 use crate::worklet::glm53_common::{atomic, elementwise, push_or_zero};
-
-/// `VOCAB_BLOCK_SIZE` of the stats kernel (`rejection_sampler_utils.py:1070`).
-const STATS_VOCAB_BLOCK: u32 = 8192;
-/// Per vocab block: int64 target argmax plus four fp32 max / sum-exp partials.
-const STATS_BYTES_PER_BLOCK: u32 = 8 + 4 * 4;
-const TOKEN_ID_BYTES: u32 = 8;
 
 #[derive(Clone, Debug)]
 pub struct SpecSampleLocalWorkletConfig {
@@ -74,11 +75,10 @@ impl SpecSampleLocalWorklet {
         let row_bytes = vocab
             .checked_mul(cfg.logits_dtype.size_bytes())
             .expect("logits row bytes overflow u32");
-        let stats_bytes = vocab.div_ceil(STATS_VOCAB_BLOCK) * STATS_BYTES_PER_BLOCK;
         let ew = &cfg.elementwise_backends;
         SpecSampleLocalWorkletResolved {
-            logits_stats: elementwise(ew, &cfg.gpu_name, row_bytes, stats_bytes),
-            rejection_resample: elementwise(ew, &cfg.gpu_name, row_bytes, TOKEN_ID_BYTES),
+            logits_stats: elementwise(ew, &cfg.gpu_name, row_bytes, row_bytes),
+            rejection_resample: elementwise(ew, &cfg.gpu_name, row_bytes, row_bytes),
             raw_cfg: cfg.clone(),
         }
     }
@@ -153,20 +153,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stats_read_each_logits_row_and_write_block_partials() {
+    fn stats_and_resample_stream_one_logits_row() {
         let r = SpecSampleLocalWorklet::resolve_config(&SpecSampleLocalWorkletConfig {
             gpu_name: "NVIDIA B200".to_string(),
             vocab_size: Dim::param("vocab_size", 248_320),
             logits_dtype: DType::Bf16,
             elementwise_backends: vec!["triton"],
         });
-        assert_eq!(r.logits_stats.input_bytes_per_token.get(), 248_320 * 2);
-        // 248320 / 8192 -> 31 blocks.
-        assert_eq!(r.logits_stats.output_bytes_per_token.get(), 31 * 24);
-        assert_eq!(
-            r.rejection_resample.input_bytes_per_token.get(),
-            248_320 * 2
-        );
+        for leaf in [&r.logits_stats, &r.rejection_resample] {
+            assert_eq!(leaf.input_bytes_per_token.get(), 248_320 * 2);
+            assert_eq!(leaf.output_bytes_per_token.get(), 248_320 * 2);
+        }
     }
 
     #[test]

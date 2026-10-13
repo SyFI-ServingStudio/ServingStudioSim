@@ -15,8 +15,10 @@
 //!
 //! The gather and the argmax are elementwise byte placeholders: the gather
 //! moves one hidden row plus an int64 index per row; the argmax reads one
-//! logits row (`logits_dtype`, BF16 in the capture's `ArgMaxOps<BFloat16>`) and
-//! writes one int64 token. The lm_head GEMM is measured. TP1: no collective.
+//! logits row (`logits_dtype`, BF16 in the capture's `ArgMaxOps<BFloat16>`),
+//! priced as one same-size streaming pass over the row (in = out = row bytes;
+//! see `spec_sample_local` for why a tiny output is not used). The lm_head GEMM
+//! is measured. TP1: no collective.
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -28,7 +30,6 @@ use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfA
 use crate::worklet::glm53_common::{atomic, elementwise, push_or_zero};
 
 const INDEX_BYTES: u32 = 8;
-const TOKEN_ID_BYTES: u32 = 8;
 
 #[derive(Clone, Debug)]
 pub struct SpecHeadLocalWorkletConfig {
@@ -91,7 +92,7 @@ impl SpecHeadLocalWorklet {
                 k: cfg.hidden.clone(),
                 dtype: cfg.lm_head_dtype,
             },
-            logits_reduce: elementwise(ew, &cfg.gpu_name, logits_row_bytes, TOKEN_ID_BYTES),
+            logits_reduce: elementwise(ew, &cfg.gpu_name, logits_row_bytes, logits_row_bytes),
             raw_cfg: cfg.clone(),
         }
     }
@@ -194,7 +195,7 @@ mod tests {
         let r = SpecHeadLocalWorklet::resolve_config(&cfg());
         assert_eq!((r.lm_head.n.get(), r.lm_head.k.get()), (248_320, 2560));
         assert_eq!(r.logits_reduce.input_bytes_per_token.get(), 248_320 * 2);
-        assert_eq!(r.logits_reduce.output_bytes_per_token.get(), TOKEN_ID_BYTES);
+        assert_eq!(r.logits_reduce.output_bytes_per_token.get(), 248_320 * 2);
         assert_eq!(r.logits_gather.output_bytes_per_token.get(), 2560 * 2);
     }
 
