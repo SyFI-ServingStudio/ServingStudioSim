@@ -6,9 +6,8 @@
 //! Order: gate/up GEMM, `act_and_mul`, down GEMM, the `[hidden, 1]` gate GEMM,
 //! eager `sigmoid`, and the broadcast `sigmoid(gate) * out` multiply.
 //!
-//! * `act_and_mul` is vLLM's `act_and_mul_kernel`; it is priced as a byte-sized
-//!   elementwise placeholder (gate|up in, product out) until a dedicated
-//!   `silu_and_mul` realization is profiled.
+//! * `act_and_mul` is `SiluAndMul.forward_cuda`, vLLM's `act_and_mul_kernel`
+//!   custom op, priced on the `silu_and_mul` kind at the intermediate width.
 //! * The gate multiply is a strided broadcast `MulFunctor`; it is priced at its
 //!   output bytes on the realization the arch passes (`glue_map.md` D2: the
 //!   strided copy matched it to 0.98-1.05, the plain torch pass did not).
@@ -19,8 +18,9 @@
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, SingleGemmKernel,
-    SingleGemmKernelConfig, SingleGemmKernelInput,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, SiluAndMulKernel,
+    SiluAndMulKernelConfig, SiluAndMulKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
+    SingleGemmKernelInput,
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
@@ -35,7 +35,7 @@ pub struct Bf16GatedSharedExpertLocalWorkletConfig {
     pub gpu_name: String,
     /// BF16 `F.linear` realization for gate/up, down and the scalar gate.
     pub gemm_backends: Vec<&'static str>,
-    /// Placeholder realization for `act_and_mul`.
+    /// `silu_and_mul` realization for `act_and_mul`.
     pub act_backends: Vec<&'static str>,
     /// Eager `sigmoid` on the `[T, 1]` gate.
     pub sigmoid_backends: Vec<&'static str>,
@@ -47,7 +47,7 @@ pub struct Bf16GatedSharedExpertLocalWorkletConfig {
 pub struct Bf16GatedSharedExpertLocalWorkletResolved {
     pub raw_cfg: Bf16GatedSharedExpertLocalWorkletConfig,
     pub gate_up: SingleGemmKernelConfig,
-    pub act_and_mul: ElementwiseKernelConfig,
+    pub act_and_mul: SiluAndMulKernelConfig,
     pub down: SingleGemmKernelConfig,
     pub gate: SingleGemmKernelConfig,
     pub gate_sigmoid: ElementwiseKernelConfig,
@@ -62,7 +62,7 @@ pub struct Bf16GatedSharedExpertLocalWorkletInput {
 pub struct Bf16GatedSharedExpertLocalWorklet {
     pub name: String,
     pub gate_up: Op<SingleGemmKernel>,
-    pub act_and_mul: Op<ElementwiseKernel>,
+    pub act_and_mul: Op<SiluAndMulKernel>,
     pub down: Op<SingleGemmKernel>,
     pub gate: Op<SingleGemmKernel>,
     pub gate_sigmoid: Op<ElementwiseKernel>,
@@ -97,7 +97,12 @@ impl Bf16GatedSharedExpertLocalWorklet {
         let row_bytes = hidden * bytes;
         Bf16GatedSharedExpertLocalWorkletResolved {
             gate_up: gemm((2 * width).into(), cfg.hidden.clone()),
-            act_and_mul: elementwise(&cfg.act_backends, gpu, 2 * width * bytes, width * bytes),
+            act_and_mul: SiluAndMulKernelConfig {
+                backends: cfg.act_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_dim: cfg.intermediate.clone(),
+                dtype: cfg.activation_dtype,
+            },
             down: gemm(cfg.hidden.clone(), cfg.intermediate.clone()),
             // `shared_expert_gate`: ReplicatedLinear(hidden, 1, quant_config=None).
             gate: gemm(1.into(), cfg.hidden.clone()),
@@ -120,7 +125,7 @@ impl Bf16GatedSharedExpertLocalWorklet {
                 n,
                 "act_and_mul",
                 r.act_and_mul,
-                ElementwiseKernel::build,
+                SiluAndMulKernel::build,
                 bridge,
             )?,
             down: atomic(n, "down", r.down, SingleGemmKernel::build, bridge)?,
@@ -173,7 +178,8 @@ impl Bf16GatedSharedExpertLocalWorklet {
         let gemm = SingleGemmKernelInput { m: rows };
         let ew = ElementwiseKernelInput { num_tokens: rows };
         push_or_zero(&self.gate_up, gemm.clone(), zero, ev);
-        push_or_zero(&self.act_and_mul, ew.clone(), zero, ev);
+        let act = SiluAndMulKernelInput { num_tokens: rows };
+        push_or_zero(&self.act_and_mul, act, zero, ev);
         push_or_zero(&self.down, gemm.clone(), zero, ev);
         push_or_zero(&self.gate, gemm, zero, ev);
         push_or_zero(&self.gate_sigmoid, ew.clone(), zero, ev);
@@ -192,7 +198,7 @@ pub(crate) mod tests {
             activation_dtype: DType::Bf16,
             gpu_name: "NVIDIA B200".into(),
             gemm_backends: vec!["torch_linear_vllm"],
-            act_backends: vec!["torch"],
+            act_backends: vec!["vllm_cuda"],
             sigmoid_backends: vec!["torch"],
             gate_mul_backends: vec!["torch_strided_copy"],
         }
@@ -213,7 +219,7 @@ pub(crate) mod tests {
                 c.output_bytes_per_token.get(),
             )
         };
-        assert_eq!(rates(&r.act_and_mul), (2560, 1280));
+        assert_eq!(r.act_and_mul.hidden_dim.get(), 640);
         assert_eq!(rates(&r.gate_sigmoid), (2, 2));
         assert_eq!(rates(&r.gate_mul), (5120, 5120));
         assert_eq!(r.gate_mul.backends, ["torch_strided_copy"]);
