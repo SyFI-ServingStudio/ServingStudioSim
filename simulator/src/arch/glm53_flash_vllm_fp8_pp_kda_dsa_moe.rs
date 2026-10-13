@@ -171,10 +171,13 @@ pub fn resolve_configs(cfgs: &Glm53FlashVllmFp8PpConfigs) -> Glm53FlashVllmFp8Pp
     }
 }
 
+/// pp_size 1 is one stage holding the whole model on one GPU: the single-GPU
+/// reference (no split, no collective); the pipeline flow already exits a
+/// depth-1 microbatch at the head.
 fn validate_pp_size(pp_size: u16, num_layers: u32) -> Result<(), BuildError> {
-    if pp_size < 2 || u32::from(pp_size) > num_layers {
+    if pp_size < 1 || u32::from(pp_size) > num_layers {
         return Err(fit_failed(format!(
-            "pp_size {pp_size} must be in 2..={num_layers}; one stage is not a pipeline"
+            "pp_size {pp_size} must be in 1..={num_layers}"
         )));
     }
     Ok(())
@@ -1081,10 +1084,12 @@ mod tests {
     #[test]
     fn invalid_pipelines_fail_closed() {
         let model = model_cfg();
-        for pp_size in [0_u16, 1, 46] {
+        for pp_size in [0_u16, 46] {
             let error = build_configs(&model, &parallel(pp_size), &uniform()).unwrap_err();
             assert!(error.to_string().contains("pp_size"), "{error}");
         }
+        // One stage is the whole model on one GPU, the single-GPU reference.
+        assert!(build_configs(&model, &parallel(1), &uniform()).is_ok());
         // From PP12 stage 0 (layers 0-2 or fewer) has KDA layers and no DSA.
         for pp_size in [12_u16, 15, 45] {
             let error = build_configs(&model, &parallel(pp_size), &uniform()).unwrap_err();
