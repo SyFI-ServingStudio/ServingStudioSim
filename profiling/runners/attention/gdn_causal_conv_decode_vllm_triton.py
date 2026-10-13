@@ -15,10 +15,12 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.attention import gdn_causal_conv_verify_vllm_triton as verify
 from profiling.runners.attention._gdn_common import (
     conv_state_dim_first,
     conv_state_pool,
     load_required_callable,
+    tokens_per_request,
 )
 from profiling.runners.attention.gdn_causal_conv_decode_torch import (
     _logical_bytes,
@@ -247,9 +249,11 @@ def profile_gdn_causal_conv_decode_vllm_triton(
     kernel_size: int,
     dtype: DType | str,
     state_dtype: DType | str,
+    num_tokens: int | None = None,
 ) -> ComputeMetrics:
-    """Profile vLLM's fused causal-convolution decode."""
+    """Profile vLLM's fused causal-convolution decode (or verify, ``num_tokens``)."""
     args = _validate_args(batch_size, channels, kernel_size, dtype, state_dtype)
+    per_request = tokens_per_request(args.batch_size, num_tokens)
     try:
         import torch
     except ImportError as exc:
@@ -258,13 +262,31 @@ def profile_gdn_causal_conv_decode_vllm_triton(
     try:
         fused_callable = _load_fused_callable()
         device = torch.device("cuda", torch.cuda.current_device())
-        operands = _build_operands(
-            torch, args, device=device, state_dim_first=conv_state_dim_first()
-        )
-        _check_correctness(torch, fused_callable, operands, args)
+        if per_request == 1:
+            operands = _build_operands(
+                torch, args, device=device, state_dim_first=conv_state_dim_first()
+            )
+            _check_correctness(torch, fused_callable, operands, args)
 
-        def kernel() -> Any:
-            return _invoke_fused(fused_callable, operands)
+            def kernel() -> Any:
+                return _invoke_fused(fused_callable, operands)
+
+        else:
+            verify_operands = verify.build_operands(
+                torch,
+                batch_size=args.batch_size,
+                per_request=per_request,
+                channels=args.channels,
+                kernel_size=args.kernel_size,
+                dtype=args.dtype.torch(),
+                state_dtype=args.state_dtype.torch(),
+                device=device,
+                state_dim_first=conv_state_dim_first(),
+            )
+            verify.check_correctness(torch, fused_callable, verify_operands)
+
+            def kernel() -> Any:
+                return verify.invoke(fused_callable, verify_operands)
 
         # No reset is included in either measurement region. Every callable is
         # one fused decode: state advances in place and the prior in-place output
@@ -283,6 +305,7 @@ def profile_gdn_causal_conv_decode_vllm_triton(
         batch_size=args.batch_size,
         channels=args.channels,
         kernel_size=args.kernel_size,
+        per_request=per_request,
     )
     logical_bytes = _logical_bytes(
         batch_size=args.batch_size,
@@ -290,6 +313,7 @@ def profile_gdn_causal_conv_decode_vllm_triton(
         kernel_size=args.kernel_size,
         dtype=args.dtype,
         state_dtype=args.state_dtype,
+        per_request=per_request,
     )
     elapsed_s = time_ms / 1000.0
     return ComputeMetrics(

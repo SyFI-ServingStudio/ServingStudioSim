@@ -71,3 +71,30 @@ def conv_state_pool(
     if dim_first:
         return torch.empty((slots, channels, state_len), dtype=dtype, device=device)
     return torch.empty((slots, state_len, channels), dtype=dtype, device=device).transpose(-1, -2)
+
+
+def tokens_per_request(batch_size: int, num_tokens: int | None) -> int:
+    """Uniform tokens per request of a decode spec; 1 when ``num_tokens`` is absent.
+
+    ``num_tokens`` is the optional ``same_as="batch_size"`` arg of the decode
+    kinds: a speculative verify step carries the accepted token plus the drafts
+    of every request, an equal count each.
+    """
+    if num_tokens is None:
+        return 1
+    num_tokens = int(num_tokens)
+    if num_tokens <= 0 or batch_size <= 0 or num_tokens % batch_size != 0:
+        raise ValueError(
+            f"num_tokens must be a positive multiple of batch_size, got {num_tokens} "
+            f"for batch_size={batch_size}"
+        )
+    return num_tokens // batch_size
+
+
+def reject_verify_tokens(backend: str, batch_size: int, num_tokens: int | None) -> None:
+    """Refuse a multi-token (verify) spec on a backend that decodes one token per request."""
+    if tokens_per_request(batch_size, num_tokens) != 1:
+        raise ValueError(
+            f"{backend} decodes one token per request; num_tokens={num_tokens} with "
+            f"batch_size={batch_size} is a verify step"
+        )
