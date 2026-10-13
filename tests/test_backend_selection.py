@@ -166,7 +166,7 @@ def test_render_skeleton_shape():
     text = render_skeleton(_afd_roles(), {"attn": "qwen3_attn_tp", "ffn": "qwen3_ffn_moe"})
     assert "# ── pool: attn   (arch qwen3_attn_tp) ──" in text
     assert "# ── pool: ffn   (arch qwen3_ffn_moe) ──" in text
-    # attention: bf16, options exclude trt (fp8-only) and include cudnn.
+    # attention: bf16, options include cudnn.
     assert "attn/afd.attn.prefill:" in text
     assert "options: fa2 fa3 cudnn" in text
     # reused expert GEMM collapses to one knob with an xN marker.
@@ -340,33 +340,34 @@ def test_validate_deployment_level_exempt_from_coverage():
 
 
 def test_emit_filters_and_rejects_backends_by_gpu():
-    # An fp8 attention role carries its run GPU (parsed from `gpu_name=`); the
+    # An fp8 GEMM role carries its run GPU (parsed from `gpu_name=`); the
     # options column and the validator both honour the capability GPU axis.
-    def prefill_role(gpu, backends):
+    sm100_only = "flashinfer_fp8_tensor"
+
+    def gemm_role(gpu, backends):
         return dedup_roles(
             [
                 _rec(
                     "attn",
-                    "afd.attn.prefill",
-                    "flashinfer_attn_prefill",
-                    {"gpu_name": gpu, "q_dtype": "fp8_e4m3", "kv_dtype": "fp8_e4m3"},
+                    "attn.o_proj",
+                    "single_gemm",
+                    {"gpu_name": gpu, "dtype": "fp8_e4m3"},
                     backends,
                     compute=DType.FP8_E4M3,
-                    kv=DType.FP8_E4M3,
                     gpu=gpu,
                 )
             ]
         )[0]
 
-    h200 = prefill_role("NVIDIA H200", ["fa3"])
+    h200 = gemm_role("NVIDIA H200", ["deepgemm"])
     assert h200.gpu == "NVIDIA H200"
-    assert "trt" not in h200.options and "fa3" in h200.options  # trt filtered on H200
-    errs = validate_backend_map({"attn": {"afd.attn.prefill": ["trt"]}}, [h200])
-    assert any("gpu=NVIDIA H200" in e for e in errs)  # pinning trt on H200 rejected
+    assert sm100_only not in h200.options and "deepgemm" in h200.options
+    errs = validate_backend_map({"attn": {"attn.o_proj": [sm100_only]}}, [h200])
+    assert any("gpu=NVIDIA H200" in e for e in errs)  # pinning it on H200 rejected
 
-    b200 = prefill_role("NVIDIA B200", ["fa3", "trt"])
-    assert "trt" in b200.options  # trt is a valid option on B200
-    assert validate_backend_map({"attn": {"afd.attn.prefill": ["trt"]}}, [b200]) == []
+    b200 = gemm_role("NVIDIA B200", ["deepgemm", sm100_only])
+    assert sm100_only in b200.options  # a valid option on B200
+    assert validate_backend_map({"attn": {"attn.o_proj": [sm100_only]}}, [b200]) == []
 
 
 def test_fa2_bf16_query_fp8_kv_is_valid():

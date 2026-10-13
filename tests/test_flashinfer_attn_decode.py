@@ -26,7 +26,7 @@ from profiling.kernels import flashinfer_attn_decode as decode_kernel
 from profiling.kernels.flashinfer_attn_decode import KIND, FlashinferAttnDecodeArgs
 from profiling.runners.metrics import ComputeMetrics
 
-_BACKENDS = ("fa2", "fa2_cudagraph", "fa3", "trt", "cudnn")
+_BACKENDS = ("fa2", "fa2_cudagraph", "fa3", "cudnn")
 _RUNNER_MODULE = "profiling.runners.attention.flashinfer_decode"
 
 
@@ -166,7 +166,6 @@ def _install_fake_decode_runtime(monkeypatch, events):
     monkeypatch.setattr(_common, "build_paged_decode_inputs", build_inputs)
     monkeypatch.setattr(_common, "make_workspace", lambda: "workspace")
     monkeypatch.setattr(_common, "to_torch_dtype", lambda dtype: "bf16")
-    monkeypatch.setattr(_common, "flashinfer_backend_name", lambda backend: backend)
     monkeypatch.setattr(_common, "attention_flops", lambda **kwargs: 456)
     return runner, _common
 

@@ -39,7 +39,7 @@ const NORM_BACKENDS: &[&str] = &["flashinfer"];
 const GEMM_BACKENDS: &[&str] = &["torch", "torch_linear"];
 const ACT_BACKENDS: &[&str] = &["triton"];
 // Attention backends are FlashInfer *implementations* (the profiler registers
-// `flashinfer_attn_{prefill,decode,rect}` under `fa2`/`fa3`/`trt`/`cudnn`), NOT a
+// `flashinfer_attn_{prefill,decode,rect}` under `fa2`/`fa3`/`cudnn`), NOT a
 // backend literally named "flashinfer". List the two FlashAttention paths; the
 // kernel engine picks whichever the GPU/profile.db actually has.
 const ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];

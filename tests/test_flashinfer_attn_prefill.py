@@ -21,7 +21,7 @@ from profiling.kernels import flashinfer_attn_prefill as prefill_kernel
 from profiling.kernels.flashinfer_attn_prefill import KIND, FlashinferAttnPrefillArgs
 from profiling.runners.metrics import ComputeMetrics
 
-_BACKENDS = ("fa2", "fa3", "trt", "cudnn")
+_BACKENDS = ("fa2", "fa3", "cudnn")
 _RUNNER_MODULE = "profiling.runners.attention.flashinfer_attn_prefill_and_rect"
 
 

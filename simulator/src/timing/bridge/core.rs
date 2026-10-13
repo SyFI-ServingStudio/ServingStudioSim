@@ -53,7 +53,7 @@ pub struct KernelEnum {
     pub name: String,
     pub kind: KernelKind,
     /// The run GPU (nvidia-smi name) — a typed field for the launcher's capability
-    /// GPU axis (e.g. trt = Blackwell-only), so it need not scrape `config`.
+    /// GPU axis (e.g. an sm_100f-only backend), so it need not scrape `config`.
     pub gpu: String,
     /// Compute/kv dtypes as typed fields (serialized to the wire literal `"bf16"`
     /// / `"fp8_e4m3"` by `DType`, matching the launcher's `DType` enum), `None`
