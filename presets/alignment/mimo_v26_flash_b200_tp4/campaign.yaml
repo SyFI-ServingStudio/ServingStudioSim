@@ -3,7 +3,7 @@ schema_version: 1
 pack: mimo_v26_flash_b200_tp4
 description: MiMo-V2.6-Flash-RL on B200, TP4 attention / EP4 experts / DP1 under the vLLM fork 892da082, served
   exactly as the validated fused all-reduce capture (job 6264). The fifteen operating points of glm52_nvfp4_b200_tp8
-  re-derived for MiMo's limits; see make_pack.py.
+  re-derived for MiMo's limits, plus cases 04 and 07 at chunk 4096 and 8192; see make_pack.py.
 recorded_on:
   host: b200_raid
   gpu: NVIDIA B200
@@ -1560,3 +1560,175 @@ cases:
       blocks = 27457597440 B (25.57 GiB). repeats 12 -> 34 is ~2 requests per slot, not GLM''s 5: at c100 the 5-slot
       trace is ~6.1M decode tokens (~45 min per pass). The NSYS trace prefills ~5.7M tokens (~130 s) before its
       decode steps, hence 180 s.'
+- index: 16
+  name: prefill_spectrum_chunk4k_c32
+  variant: tp4_ep4
+  purpose: Prefill scaling and the 4096-token chunk boundary.
+  coverage:
+  - prefill_scaling
+  - chunk_boundary
+  - chunk_size
+  max_model_len: 131072
+  max_concurrency: 32
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/16_prefill_spectrum_chunk4k_c32.csv
+    shapes:
+    - - 128
+      - 64
+    - - 512
+      - 64
+    - - 4032
+      - 64
+    - - 4096
+      - 64
+    - - 4160
+      - 64
+    - - 8192
+      - 64
+    - - 12288
+      - 64
+    - - 14336
+      - 64
+    repeats: 16
+  chunk_size: 4096
+  attn_gpu_memory_gb:
+    value: 116.4366
+    status: provisional
+    derived_from: the chunk-2048 pool (108.44 GiB, case-01 workload pass, job 6360); a larger --max-num-batched-tokens
+      raises vLLM's profile-run peak, so replace it with `Available KV cache memory` from this case's own workload
+      pass
+    evidence: ''
+  provenance:
+    derived_from_pack: glm52_nvfp4_b200_tp8 case 04
+    derivation: 'Case 04 at chunk 4096: the same c32 and 16 repeats, rungs moved to the new chunk boundary (4032/4096/4160)
+      and to 2/3/3.5 chunks. Steps reach 4096 tokens, inside the TP4 fused all-reduce + RMSNorm cap of 4096.'
+- index: 17
+  name: prefill_spectrum_chunk8k_c32
+  variant: tp4_ep4
+  purpose: Prefill scaling and the 8192-token chunk boundary.
+  coverage:
+  - prefill_scaling
+  - chunk_boundary
+  - chunk_size
+  max_model_len: 131072
+  max_concurrency: 32
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/17_prefill_spectrum_chunk8k_c32.csv
+    shapes:
+    - - 128
+      - 64
+    - - 512
+      - 64
+    - - 8128
+      - 64
+    - - 8192
+      - 64
+    - - 8256
+      - 64
+    - - 16384
+      - 64
+    - - 24576
+      - 64
+    - - 28672
+      - 64
+    repeats: 16
+  chunk_size: 8192
+  attn_gpu_memory_gb:
+    value: 116.4366
+    status: provisional
+    derived_from: the chunk-2048 pool (108.44 GiB, case-01 workload pass, job 6360); a larger --max-num-batched-tokens
+      raises vLLM's profile-run peak, so replace it with `Available KV cache memory` from this case's own workload
+      pass
+    evidence: ''
+  provenance:
+    derived_from_pack: glm52_nvfp4_b200_tp8 case 04
+    derivation: 'Case 04 at chunk 8192: the same c32 and 16 repeats, rungs moved to the new chunk boundary (8128/8192/8256)
+      and to 2/3/3.5 chunks. Steps reach 8192 tokens, above the TP4 fused all-reduce + RMSNorm cap of 4096.'
+- index: 18
+  name: quadrant_interference_chunk4k_c48
+  variant: tp4_ep4
+  purpose: All four IO quadrants sharing continuous batches at a 4096-token chunk.
+  coverage:
+  - io_quadrants
+  - continuous_batching
+  - chunk_size
+  max_model_len: 131072
+  max_concurrency: 48
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/18_quadrant_interference_chunk4k_c48.csv
+    shapes:
+    - - 128
+      - 128
+    - - 128
+      - 4096
+    - - 8192
+      - 128
+    - - 6144
+      - 3072
+    repeats: 24
+  chunk_size: 4096
+  attn_gpu_memory_gb:
+    value: 116.4366
+    status: provisional
+    derived_from: the chunk-2048 pool (108.44 GiB, case-01 workload pass, job 6360); a larger --max-num-batched-tokens
+      raises vLLM's profile-run peak, so replace it with `Available KV cache memory` from this case's own workload
+      pass
+    evidence: ''
+  provenance:
+    derived_from_pack: glm52_nvfp4_b200_tp8 case 07
+    derivation: 'Case 07 at chunk 4096: same c48 and 24 repeats; the long prompts stay 2 and 1.5 chunks (8192 and
+      6144), so mixed steps pair one full chunk with up to 47 decodes.'
+- index: 19
+  name: quadrant_interference_chunk8k_c48
+  variant: tp4_ep4
+  purpose: All four IO quadrants sharing continuous batches at a 8192-token chunk.
+  coverage:
+  - io_quadrants
+  - continuous_batching
+  - chunk_size
+  max_model_len: 131072
+  max_concurrency: 48
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/19_quadrant_interference_chunk8k_c48.csv
+    shapes:
+    - - 128
+      - 128
+    - - 128
+      - 4096
+    - - 16384
+      - 128
+    - - 12288
+      - 3072
+    repeats: 24
+  chunk_size: 8192
+  attn_gpu_memory_gb:
+    value: 116.4366
+    status: provisional
+    derived_from: the chunk-2048 pool (108.44 GiB, case-01 workload pass, job 6360); a larger --max-num-batched-tokens
+      raises vLLM's profile-run peak, so replace it with `Available KV cache memory` from this case's own workload
+      pass
+    evidence: ''
+  provenance:
+    derived_from_pack: glm52_nvfp4_b200_tp8 case 07
+    derivation: 'Case 07 at chunk 8192: same c48 and 24 repeats; the long prompts stay 2 and 1.5 chunks (16384 and
+      12288), so mixed steps pair one full chunk with up to 47 decodes.'
