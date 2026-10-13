@@ -61,8 +61,10 @@ DOC = KernelDoc(
         "plus the causal tail of its own open group. The call reads only those "
         "tokens' keys and values through the block table. It splits the selection "
         "into split-K partials when there are few rows, then merges them; the "
-        "configuration is the production table for this GPU. Every row is its own "
-        "request with pages drawn at random from a pool larger than L2."
+        "configuration is the production table for this GPU. Under the uniform "
+        "(decode) table every row is its own request with pages drawn at random "
+        "from a pool larger than L2; under the prefill table the rows are one "
+        "prefill chunk, sharing one request's consecutive pages."
     ),
     category="Attention",
     subcategory="Sparse GQA",

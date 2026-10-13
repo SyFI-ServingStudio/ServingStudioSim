@@ -27,6 +27,14 @@ _BACKEND = "sparse_gqa_paged_attention:vllm_triton"
 # Page size is not part of the key: it only changes which page-table entry a
 # token's address comes from. Pages are drawn at random from a pool far larger
 # than L2 so every request reads cold, scattered pages.
+#
+# Request structure follows the launch table. A uniform-table call is a decode
+# or verify step: each row is its own request with its own scattered pages. A
+# prefill-table call carries a prefill chunk, whose rows all read one request's
+# KV through one block table of consecutive pages, so rows reuse each other's
+# pages in L2. Probe logs/20261013_8_qf_probe (B200, fp8, 24/2/256): rows as
+# separate requests ran 7-9% slower than the same rows sharing one request, and
+# the shared form matched the captured mixed steps to 0-5%.
 _PAGE_SIZE = 1024
 _POOL_BYTES = 4 * 1024**3
 _CHECK_ROWS = 3
@@ -132,16 +140,26 @@ def profile_sparse_gqa_paged_attention_vllm_triton(
             scales = {"k_scale": 1.0, "v_scale": 1.0}
         else:
             scales = {}
-        # Each row is its own request with its own scattered pages.
-        block_table = torch.randint(
-            0,
-            pool,
-            (num_rows, pages_per_row),
-            dtype=torch.int32,
-            device=device,
-            generator=generator,
-        )
-        token_to_req = torch.arange(num_rows, dtype=torch.int32, device=device)
+        if prefill_config:
+            # One request: consecutive pages from a random base, every row on it.
+            base = int(
+                torch.randint(0, pool - pages_per_row + 1, (1,), device=device, generator=generator)
+            )
+            block_table = torch.arange(
+                base, base + pages_per_row, dtype=torch.int32, device=device
+            ).unsqueeze(0)
+            token_to_req = torch.zeros(num_rows, dtype=torch.int32, device=device)
+        else:
+            # Each row is its own request with its own scattered pages.
+            block_table = torch.randint(
+                0,
+                pool,
+                (num_rows, pages_per_row),
+                dtype=torch.int32,
+                device=device,
+                generator=generator,
+            )
+            token_to_req = torch.arange(num_rows, dtype=torch.int32, device=device)
         blocks, positions, visible = random_group_selection(
             torch,
             num_rows=num_rows,
