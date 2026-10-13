@@ -70,6 +70,7 @@ pub mod sglang_glm52_moe_router_local;
 pub mod sglang_moe_finalize_local;
 pub mod spec_head_local;
 pub mod spec_sample_local;
+pub mod vllm_bf16_gdn_spec_local;
 pub mod vllm_fp8_attn_block_tp;
 pub mod vllm_fp8_moe_expert_compute_local;
 pub mod vllm_fp8_moe_router_local;
