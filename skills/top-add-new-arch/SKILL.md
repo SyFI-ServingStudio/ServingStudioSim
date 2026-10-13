@@ -46,6 +46,39 @@ or **composed**? That answer is its layer.
 This is both the categorization rule and the through-line of the whole build:
 build bottom-up, and at each element ask "measure it, or wire it from below?"
 
+## Modeling rules
+
+Check every design choice, and every subagent brief, against these rules.
+
+1. **Build the simplest model that matches the measurements.** Before adding a
+   mechanism that mirrors a framework rule, measure its effect where it applies
+   (for example small batches, not only large ones). If the effect is within
+   repeat-measurement noise, leave the mechanism out.
+2. **Set no artificial limits.** Never cap batch size, tokens per step, or
+   context below what the framework allows. That means no hardcoded token cap
+   and no refusal of a step the framework would run. When the framework switches
+   path above a threshold (for example an unfused all-reduce past a fused
+   kernel's token cap), price that path instead.
+3. **Align across deployment settings, not one template value.** The alignment
+   cases must span chunk size, concurrency, and context length;
+   `operate-run-alignment` lists what a pack must cover.
+4. **Key kernel rows on model geometry and dtypes only.** A deployment setting
+   (`max_num_seqs`, a CUDA-graph capture bound, `max_model_len`) enters a row key
+   only with measured evidence that it changes kernel time. Otherwise every new
+   deployment needs a new set of rows.
+5. **Use generic grids over the full deployment range.** Never pick grid points
+   from the shapes one workload happened to produce.
+6. **Decide kernels and paths from evidence.** Cite the framework source by
+   file and line and confirm it in a capture. Profile rows on the same framework
+   build the serving run used.
+7. **Keep shared code generic and model code config-derived.** Put no model
+   names in kernel kinds or shared layers, and derive every dimension from the
+   checkpoint config. After a shared change, confirm that other models' runs are
+   unchanged per iteration.
+8. **Report honestly.** Give every out-of-tolerance result a cause you checked.
+   When a later measurement contradicts an earlier claim, correct the claim
+   explicitly.
+
 ## Phase 0 — Capture the real kernel sequence first
 
 **Run this before Phase 1.** Nearly every architecture worth adding already runs
