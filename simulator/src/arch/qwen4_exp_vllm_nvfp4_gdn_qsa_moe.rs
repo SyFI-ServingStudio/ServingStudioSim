@@ -1230,6 +1230,12 @@ impl SpeculativeUnifiedModel for Qwen4ExpVllmSpeculativeModel {
         self.normalize(batch).map(|_| ())
     }
 
+    /// vLLM's MTP drafter reads target hidden states, so its prefix lookup
+    /// prunes the last matching block (`use_eagle_block_drop`).
+    fn prunes_last_prefix_block(&self) -> bool {
+        true
+    }
+
     fn kv_cache_layout(&self) -> KvCacheLayout {
         self.kv_cache_layout.clone()
     }

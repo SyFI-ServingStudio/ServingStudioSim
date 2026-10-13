@@ -490,6 +490,13 @@ pub enum IterWorkerSel {
         /// See [`IterWorkerSel::ChunkedPrefill`]'s field of the same name.
         #[serde(default)]
         prefill_gpu_time_multiplier: Option<f64>,
+        /// Chunk-end alignment for archs whose KV layout keeps a resumable
+        /// recurrent state. See [`IterWorkerSel::ChunkedPrefill`]'s field of the
+        /// same name; the arch's drafter additionally decides whether the
+        /// prompt's last checkpoint sits one block early.
+        #[serde(default)]
+        #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
+        prefill_chunk_alignment: Option<PrefillChunkAlignment>,
     },
     /// Pipeline-parallel stage worker for the `pp` deployment: stage 0 admits
     /// requests and owns the pipeline's KV, later stages pull activations and
@@ -591,6 +598,10 @@ impl IterWorkerSel {
     pub(crate) fn prefill_chunk_alignment(&self) -> Option<PrefillChunkAlignment> {
         match self {
             Self::ChunkedPrefill {
+                prefill_chunk_alignment,
+                ..
+            }
+            | Self::Speculative {
                 prefill_chunk_alignment,
                 ..
             }
