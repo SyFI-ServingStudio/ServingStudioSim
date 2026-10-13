@@ -28,6 +28,13 @@ _MIN_BATCH_SIZE = 1
 _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _CONTEXT_MODE = "uniform"
+# Uniform lengths over seeded normal logits. The radix select's work follows
+# the score distribution: on B200, 1024 rows of 8192 cost 42.2 µs on the
+# increasing template padded to 65536 columns, 30.6 µs on the same template
+# spanning only the valid columns, and 35.1 µs on normal scores, which is what
+# a live indexer's continuous scores look like.
+_RANDOM_CONTEXT_MODE = "uniform_random"
+_CONTEXT_MODES = (_CONTEXT_MODE, _RANDOM_CONTEXT_MODE)
 # The callable's K instantiations (vLLM csrc/libtorch_stable/topk.cu dispatch);
 # an indexer over 4-token key pools selects 2048 / 4. Every backend, the fork's and
 # the Torch reference's included, shares this bound and the workspace below.
@@ -130,9 +137,10 @@ def _validate_args(
         raise ValueError(
             f"dsa_persistent_topk_decode requires index_dtype='int32', got {index_dtype!r}"
         )
-    if context_mode != _CONTEXT_MODE:
+    if context_mode not in _CONTEXT_MODES:
         raise ValueError(
-            f"dsa_persistent_topk_decode requires context_mode='uniform', got {context_mode!r}"
+            "dsa_persistent_topk_decode requires context_mode='uniform' or "
+            f"'uniform_random', got {context_mode!r}"
         )
     return (
         batch_size,
@@ -163,6 +171,7 @@ def _build_common_operands(
     top_k: int,
     logits_row_stride: int,
     device: str,
+    context_mode: str = _CONTEXT_MODE,
 ) -> tuple[Any, Any, Any, Any, Any]:
     """Build exact logits/length/output storage without row-scaled sources."""
     num_rows = batch_size * next_n
@@ -171,16 +180,21 @@ def _build_common_operands(
         dtype=torch.float32,
         device=device,
     )
-    # One row-sized template broadcasts into the exact padded production
-    # allocation. Never materialize a second [B*next_n, row_stride] source.
-    column_template = torch.linspace(
-        -1.0,
-        1.0,
-        logits_row_stride,
-        dtype=torch.float32,
-        device=device,
-    )
-    logits_backing.copy_(column_template)
+    if context_mode == _RANDOM_CONTEXT_MODE:
+        # Filled in place: no second [B*next_n, row_stride] source.
+        generator = torch.Generator(device=device).manual_seed(0)
+        logits_backing.normal_(generator=generator)
+    else:
+        # One row-sized template broadcasts into the exact padded production
+        # allocation. Never materialize a second [B*next_n, row_stride] source.
+        column_template = torch.linspace(
+            -1.0,
+            1.0,
+            logits_row_stride,
+            dtype=torch.float32,
+            device=device,
+        )
+        logits_backing.copy_(column_template)
     logits = logits_backing[:, :max_model_len]
 
     per_request_lengths = torch.arange(
@@ -205,6 +219,7 @@ def _build_operands(
     top_k: int,
     logits_row_stride: int,
     device: str,
+    context_mode: str = _CONTEXT_MODE,
 ) -> _DsaPersistentTopkDecodeOperands:
     """Build exact padded logits and pinned row-major decode lengths."""
     logits_backing, logits, lengths, flat_lengths, out = _build_common_operands(
@@ -216,6 +231,7 @@ def _build_operands(
         top_k=top_k,
         logits_row_stride=logits_row_stride,
         device=device,
+        context_mode=context_mode,
     )
 
     key_positions = torch.arange(max_model_len, dtype=torch.int32, device=device)
@@ -249,6 +265,7 @@ def _build_native_operands(
     top_k: int,
     logits_row_stride: int,
     device: str,
+    context_mode: str = _CONTEXT_MODE,
 ) -> _DsaPersistentTopkDecodeNativeOperands:
     """Build production operands without Torch-composite mask/top-k tensors."""
     logits_backing, logits, lengths, flat_lengths, out = _build_common_operands(
@@ -260,6 +277,7 @@ def _build_native_operands(
         top_k=top_k,
         logits_row_stride=logits_row_stride,
         device=device,
+        context_mode=context_mode,
     )
     workspace = torch.empty((WORKSPACE_BYTES,), dtype=torch.uint8, device=device)
     return _DsaPersistentTopkDecodeNativeOperands(
@@ -561,7 +579,7 @@ def profile_dsa_persistent_topk_decode_torch(
         logits_row_stride,
         _logits_dtype,
         _index_dtype,
-        _context_mode,
+        context_mode,
     ) = _validate_args(
         batch_size,
         context_len,
@@ -590,6 +608,7 @@ def profile_dsa_persistent_topk_decode_torch(
             top_k=top_k,
             logits_row_stride=logits_row_stride,
             device="cuda",
+            context_mode=context_mode,
         )
         _validate_semantics(
             torch,
@@ -676,7 +695,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         logits_row_stride,
         _logits_dtype,
         _index_dtype,
-        _context_mode,
+        context_mode,
     ) = _validate_args(
         batch_size,
         context_len,
@@ -710,6 +729,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             top_k=top_k,
             logits_row_stride=logits_row_stride,
             device="cuda",
+            context_mode=context_mode,
         )
         _validate_native_semantics(
             torch,

@@ -103,6 +103,11 @@ from profiling.kernels import (
     sconv_qkvr_prep,  # noqa: F401
     silu_and_mul,  # noqa: F401
     single_gemm,  # noqa: F401
+    sparse_gqa_paged_attention,  # noqa: F401
+    sparse_index_expand,  # noqa: F401
+    sparse_indexer_logits_decode,  # noqa: F401
+    sparse_indexer_logits_prefill,  # noqa: F401
+    sparse_indexer_prepare,  # noqa: F401
     static_fp8_quant,  # noqa: F401
     vllm_fused_moe,  # noqa: F401
     vllm_mla_rope,  # noqa: F401

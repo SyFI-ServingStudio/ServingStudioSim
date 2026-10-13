@@ -95,6 +95,12 @@ pub mod scaled_silu;
 pub mod sconv_qkvr_prep;
 pub mod silu_and_mul;
 pub mod single_gemm;
+pub mod sparse_gqa_paged_attention;
+pub mod sparse_index_expand;
+pub mod sparse_indexer_logits_decode;
+pub mod sparse_indexer_logits_prefill;
+pub mod sparse_indexer_prepare;
+pub mod sparse_indexer_topk;
 pub mod static_fp8_quant;
 pub mod vllm_fused_moe;
 pub mod vllm_mla_rope;
@@ -409,6 +415,27 @@ pub use silu_and_mul::{
 pub use single_gemm::{
     SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput, SingleGemmSpec,
 };
+pub use sparse_gqa_paged_attention::{
+    SparseGqaPagedAttentionKernel, SparseGqaPagedAttentionKernelConfig,
+    SparseGqaPagedAttentionKernelInput, SparseGqaPagedAttentionSpec,
+};
+pub use sparse_index_expand::{
+    SparseIndexExpandKernel, SparseIndexExpandKernelConfig, SparseIndexExpandKernelInput,
+    SparseIndexExpandSpec,
+};
+pub use sparse_indexer_logits_decode::{
+    SparseIndexerLogitsDecodeKernel, SparseIndexerLogitsDecodeKernelConfig,
+    SparseIndexerLogitsDecodeKernelInput, SparseIndexerLogitsDecodeSpec,
+};
+pub use sparse_indexer_logits_prefill::{
+    SparseIndexerLogitsPrefillKernel, SparseIndexerLogitsPrefillKernelConfig,
+    SparseIndexerLogitsPrefillKernelInput, SparseIndexerLogitsPrefillSpec,
+};
+pub use sparse_indexer_prepare::{
+    SparseIndexerPrepareKernel, SparseIndexerPrepareKernelConfig, SparseIndexerPrepareKernelInput,
+    SparseIndexerPrepareSpec,
+};
+pub use sparse_indexer_topk::{SparseIndexerTopkKernel, SparseIndexerTopkSpec};
 pub use static_fp8_quant::{
     StaticFp8QuantKernel, StaticFp8QuantKernelConfig, StaticFp8QuantKernelInput, StaticFp8QuantSpec,
 };

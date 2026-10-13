@@ -68,6 +68,11 @@ SUBCATEGORIES: dict[str, tuple[Subcategory, ...]] = {
             "plus compressed keys.",
         ),
         Subcategory(
+            "Sparse GQA",
+            "Sparse grouped-query attention: an indexer scores compressed keys and "
+            "each query attends only to the tokens of its top-k groups.",
+        ),
+        Subcategory(
             "Gated DeltaNet",
             "Linear attention: a gated delta-rule state stands in for the KV cache.",
         ),
