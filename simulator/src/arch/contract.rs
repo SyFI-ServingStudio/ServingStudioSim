@@ -360,6 +360,16 @@ pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
     fn drafting_slots_per_request(&self) -> u32 {
         0
     }
+
+    /// Whether the drafter's prefix lookup prunes the last matching block, as
+    /// vLLM does for a drafter that reads target hidden states
+    /// (`SpeculativeConfig.use_eagle_block_drop`: EAGLE, MTP, DFlash). Under
+    /// checkpoint-aligned chunking the engine then caches a prompt's recurrent
+    /// state one block before its last whole block, which moves where a chunk
+    /// must stop. Inert for a layout without resumable recurrent state.
+    fn prunes_last_prefix_block(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

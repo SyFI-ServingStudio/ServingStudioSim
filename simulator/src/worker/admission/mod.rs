@@ -104,3 +104,4 @@ pub trait SlotPipelineAdmission<K: KvStore> {
     fn queued_requests(&self) -> u32;
 }
 pub use chunked_prefill_admission::ChunkedPrefillAdmission;
+pub(crate) use chunked_prefill_admission::ChunkEndAlignment;

@@ -374,7 +374,11 @@ a clipped chunk leaves may start further prompts. `prefill_chunk_end_quantum`
 sets it to the layout's engine block when the layout keeps a resumable
 per-request state, prefix caching is on, and `prefill_chunk_alignment` resolves
 to `checkpoint`; unset follows `kv_overhead` (`vllm` aligns, `none` does not),
-and `plain` gives `min(remaining, budget)` chunks.
+and `plain` gives `min(remaining, budget)` chunks. The `speculative` recipe applies the same
+quantum; when its arch's drafter prunes the last matching prefix block
+(`SpeculativeUnifiedModel::prunes_last_prefix_block`, vLLM's
+`use_eagle_block_drop` for MTP/EAGLE/DFlash), the prompt's last checkpoint, and
+therefore the stop no chunk may run past, sits one block earlier.
 
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;

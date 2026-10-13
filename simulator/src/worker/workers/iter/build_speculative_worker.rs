@@ -5,7 +5,9 @@
 //! one, and execution lowers a verify batch through `SpeculativeIterExecution`.
 //! Both differences are the same underlying fact — a resident decode moves by a
 //! whole accepted chain per iteration rather than one token — split across the
-//! axis that owns advancement and the axis that owns model input.
+//! axis that owns advancement and the axis that owns model input. Chunk-end
+//! alignment comes from the same `prefill_chunk_end_quantum`; the drafter adds
+//! whether the prompt's last checkpoint moves one block earlier.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +16,8 @@ use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{
-    ChunkedPrefillAdmission, LoadBalance, PendingOrder, SpeculativeDecodeCompletion,
+    ChunkEndAlignment, ChunkedPrefillAdmission, LoadBalance, PendingOrder,
+    SpeculativeDecodeCompletion,
 };
 use crate::worker::execution::SpeculativeIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -22,7 +25,7 @@ use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{IterBatchWorker, SpeculativeWorker};
 use crate::worker::workers::iter_build_essentials::{
-    kv_cache_store, prepare_iter_build_essentials, resolve_kv_accounting,
+    kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials, resolve_kv_accounting,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -58,6 +61,20 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
     let num_partitions = model.num_attn_dp_groups().max(1) as usize;
     let kv_accounting =
         resolve_kv_accounting(&model.kv_cache_layout(), model.num_attn_shards(), &config);
+    let chunk_end_alignment =
+        prefill_chunk_end_quantum(&kv_accounting, &config).map(|quantum| ChunkEndAlignment {
+            quantum,
+            last_checkpoint_one_block_early: model.prunes_last_prefix_block(),
+        });
+    tracing::info!(
+        worker = id.0,
+        pool_tag,
+        kv_capacity_units = kv_accounting.capacity_units(),
+        kv_bytes_per_unit = kv_accounting.bytes_per_unit(),
+        chunk_end_alignment = ?chunk_end_alignment,
+        max_batch_tokens,
+        "speculative chunked prefill KV"
+    );
     let essentials = prepare_iter_build_essentials(
         id,
         pool_tag,
@@ -99,6 +116,10 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         ),
         drafting_slots,
     );
+    let admission = match chunk_end_alignment {
+        Some(alignment) => admission.with_chunk_end_alignment(alignment),
+        None => admission,
+    };
 
     IterBatchWorker::from_components(
         essentials.context,
@@ -548,6 +569,97 @@ mod tests {
             for id in 0..8 {
                 assert!(requests.borrow()[RequestId(id)].lifecycle.completed);
             }
+        }
+    }
+
+    #[test]
+    fn a_hybrid_layout_aligns_chunks_and_a_pruning_drafter_stops_a_block_early() {
+        // The defect this catches: a speculative recipe that ignores the
+        // layout's checkpoint block (vLLM's Mamba `align` mode), or ignores
+        // that an MTP/EAGLE drafter moves the prompt's last checkpoint one
+        // block earlier. An 18-token prompt under an 18-token cap with a
+        // 4-token block runs whole (plain), 16 + 2 (aligned), or 12 + 6
+        // (aligned, pruning drafter).
+        use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
+        use crate::worker::config::PrefillChunkAlignment;
+        use std::sync::Mutex;
+        struct HybridModel {
+            prunes: bool,
+            chunks: Mutex<Vec<(u32, u32)>>,
+        }
+        impl SpeculativeUnifiedModel for HybridModel {
+            fn eval_speculative_iter(
+                &self,
+                batch: &SpeculativeArchInput,
+                slots: &mut Vec<LeafMetrics>,
+                _scratch: &mut Vec<LeafMetrics>,
+            ) -> LeafMetrics {
+                slots.clear();
+                for group in &batch.groups {
+                    self.chunks
+                        .lock()
+                        .unwrap()
+                        .extend_from_slice(&group.prefill_chunk_pairs);
+                }
+                lm(1.0)
+            }
+            fn kv_cache_layout(&self) -> KvCacheLayout {
+                KvCacheLayout::new()
+                    .with_part(KvCachePart::per_token("kv", 1))
+                    .with_part(KvCachePart::per_request("state", 1))
+                    .with_engine(EngineOverhead {
+                        block_tokens: Some(4),
+                        fixed_device_bytes: 0,
+                    })
+            }
+            fn max_model_len(&self) -> u32 {
+                8192
+            }
+            fn gpus_per_replica(&self) -> u16 {
+                1
+            }
+            fn prunes_last_prefix_block(&self) -> bool {
+                self.prunes
+            }
+        }
+        for (alignment, prunes, expected) in [
+            (Some(PrefillChunkAlignment::Plain), true, vec![(0, 18)]),
+            (None, false, vec![(0, 16), (16, 2)]),
+            (None, true, vec![(0, 12), (12, 6)]),
+        ] {
+            let requests = shared_with(&[(0, 18, 2)]);
+            requests.borrow_mut()[RequestId(0)].request.definition.decoding =
+                DecodingStrategy::Speculative {
+                    accept_rate: AcceptanceProfile::Uniform(0.0),
+                };
+            let model = Arc::new(HybridModel {
+                prunes,
+                chunks: Mutex::new(Vec::new()),
+            });
+            let mut config = config(KvAdmissionConfig::FullFootprint);
+            config.max_batch_tokens = Some(18);
+            config.prefill_chunk_alignment = alignment;
+            let mut worker = build_speculative_worker(
+                WorkerId(0),
+                "test",
+                model.clone(),
+                requests.clone(),
+                config,
+                None,
+                PoolId(0),
+                "test-gpu",
+                test_cluster(),
+            );
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+            for tick in 0..20 {
+                worker.tick(Time::from_ms(tick as f64), &mut Vec::new());
+            }
+            assert!(requests.borrow()[RequestId(0)].lifecycle.completed);
+            assert_eq!(
+                *model.chunks.lock().unwrap(),
+                expected,
+                "alignment={alignment:?} prunes={prunes}"
+            );
         }
     }
 }

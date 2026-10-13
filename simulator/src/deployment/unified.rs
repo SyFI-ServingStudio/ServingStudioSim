@@ -1428,6 +1428,7 @@ pools:
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             kv_accounting: Default::default(),
+            prefill_chunk_alignment: None,
         }
     }
 

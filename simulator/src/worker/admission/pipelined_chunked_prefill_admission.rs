@@ -40,7 +40,7 @@ use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
 
-use super::chunked_prefill_admission::next_chunk_tokens;
+use super::chunked_prefill_admission::{next_chunk_tokens, ChunkEndAlignment};
 use super::{AdmissionCandidate, EnqueueSequence, MicrobatchAdmission, PendingOrderPolicy};
 
 /// The only attention partition of a pipeline head.
@@ -148,7 +148,7 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             let chunk_tokens = next_chunk_tokens(
                 resolved_prefill,
                 remaining_budget,
-                self.chunk_end_quantum,
+                self.chunk_end_quantum.map(ChunkEndAlignment::on_blocks),
                 self.max_batch_tokens,
             );
             if chunk_tokens == 0 {
@@ -232,7 +232,7 @@ where
         now: Time,
     ) -> bool {
         let max_batch_tokens = self.max_batch_tokens;
-        let chunk_end_quantum = self.chunk_end_quantum;
+        let chunk_end_alignment = self.chunk_end_quantum.map(ChunkEndAlignment::on_blocks);
         let mut remaining_budget = max_batch_tokens;
         // Running decodes first, as vLLM schedules its running queue before
         // waiting prompts. One whose previous step has not returned sits out.
@@ -264,7 +264,7 @@ where
             let chunk_tokens = next_chunk_tokens(
                 resolved_prefill,
                 remaining_budget,
-                chunk_end_quantum,
+                chunk_end_alignment,
                 max_batch_tokens,
             );
             if chunk_tokens == 0 {
