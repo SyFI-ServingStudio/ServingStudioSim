@@ -1597,12 +1597,12 @@ cases:
     repeats: 16
   chunk_size: 4096
   attn_gpu_memory_gb:
-    value: 116.4366
-    status: provisional
-    derived_from: the chunk-2048 pool (108.44 GiB, case-01 workload pass, job 6360); a larger --max-num-batched-tokens
-      raises vLLM's profile-run peak, so replace it with `Available KV cache memory` from this case's own workload
-      pass
-    evidence: ''
+    value: 116.2755
+    status: measured
+    derived_from: '`Available KV cache memory: 108.29 GiB` (x 1.073741824) in the chunk-4096 workload passes (Slurm
+      jobs 6429, 6431); a larger --max-num-batched-tokens raises vLLM''s profile-run peak, so the pool is below
+      chunk 2048''s 108.44 GiB'
+    evidence: logs/20261012_7_mimo_chunk_cases/16_prefill_spectrum_chunk4k_c32/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 04
     derivation: 'Case 04 at chunk 4096: the same c32 and 16 repeats, rungs moved to the new chunk boundary (4032/4096/4160)
@@ -1644,12 +1644,12 @@ cases:
     repeats: 16
   chunk_size: 8192
   attn_gpu_memory_gb:
-    value: 116.4366
-    status: provisional
-    derived_from: the chunk-2048 pool (108.44 GiB, case-01 workload pass, job 6360); a larger --max-num-batched-tokens
-      raises vLLM's profile-run peak, so replace it with `Available KV cache memory` from this case's own workload
-      pass
-    evidence: ''
+    value: 115.6635
+    status: measured
+    derived_from: '`Available KV cache memory: 107.72 GiB` (x 1.073741824) in the chunk-8192 workload passes (Slurm
+      jobs 6425, 6427); a larger --max-num-batched-tokens raises vLLM''s profile-run peak, so the pool is below
+      chunk 2048''s 108.44 GiB'
+    evidence: logs/20261012_7_mimo_chunk_cases/17_prefill_spectrum_chunk8k_c32/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 04
     derivation: 'Case 04 at chunk 8192: the same c32 and 16 repeats, rungs moved to the new chunk boundary (8128/8192/8256)
@@ -1683,12 +1683,12 @@ cases:
     repeats: 24
   chunk_size: 4096
   attn_gpu_memory_gb:
-    value: 116.4366
-    status: provisional
-    derived_from: the chunk-2048 pool (108.44 GiB, case-01 workload pass, job 6360); a larger --max-num-batched-tokens
-      raises vLLM's profile-run peak, so replace it with `Available KV cache memory` from this case's own workload
-      pass
-    evidence: ''
+    value: 116.2755
+    status: measured
+    derived_from: '`Available KV cache memory: 108.29 GiB` (x 1.073741824) in the chunk-4096 workload passes (Slurm
+      jobs 6429, 6431); a larger --max-num-batched-tokens raises vLLM''s profile-run peak, so the pool is below
+      chunk 2048''s 108.44 GiB'
+    evidence: logs/20261012_7_mimo_chunk_cases/18_quadrant_interference_chunk4k_c48/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 07
     derivation: 'Case 07 at chunk 4096: same c48 and 24 repeats; the long prompts stay 2 and 1.5 chunks (8192 and
@@ -1722,12 +1722,12 @@ cases:
     repeats: 24
   chunk_size: 8192
   attn_gpu_memory_gb:
-    value: 116.4366
-    status: provisional
-    derived_from: the chunk-2048 pool (108.44 GiB, case-01 workload pass, job 6360); a larger --max-num-batched-tokens
-      raises vLLM's profile-run peak, so replace it with `Available KV cache memory` from this case's own workload
-      pass
-    evidence: ''
+    value: 115.6635
+    status: measured
+    derived_from: '`Available KV cache memory: 107.72 GiB` (x 1.073741824) in the chunk-8192 workload passes (Slurm
+      jobs 6425, 6427); a larger --max-num-batched-tokens raises vLLM''s profile-run peak, so the pool is below
+      chunk 2048''s 108.44 GiB'
+    evidence: logs/20261012_7_mimo_chunk_cases/19_quadrant_interference_chunk8k_c48/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 07
     derivation: 'Case 07 at chunk 8192: same c48 and 24 repeats; the long prompts stay 2 and 1.5 chunks (16384 and
