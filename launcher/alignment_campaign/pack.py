@@ -237,6 +237,13 @@ class Pack:
     """Facts about the machine that produced the accepted numbers. Free-form on
     purpose: it is read by people and by `--record`'s provenance, never to
     render anything, so it must not grow into a second host profile."""
+    gpu_time_multiplier: Calibrated | None = None
+    """One duty-cycle multiplier rendered into every case's simulated worker, or
+    None for the neutral 1.0. It must be measured on a workload outside the
+    matrix (e.g. a reference trace's kernel-align `recommended_gpu_time_multiplier`),
+    so no case is judged against a factor fitted to itself; `derived_from` and
+    `evidence` name that report. Each case's own recommendation stays a reported
+    metric and is never read back."""
 
     def case_named(self, slug_or_index: str) -> Case | None:
         for case in self.cases:
@@ -250,12 +257,15 @@ class Pack:
     @property
     def provisional_fields(self) -> list[str]:
         """`<slug>.<field>` for every calibrated value still awaiting preflight."""
-        return [
+        fields = [
             f"{case.slug}.{name}"
             for case in self.cases
             for name, value in case.calibrated_fields.items()
             if value.provisional
         ]
+        if self.gpu_time_multiplier is not None and self.gpu_time_multiplier.provisional:
+            fields.insert(0, "pack.gpu_time_multiplier")
+        return fields
 
 
 @dataclass(frozen=True)
@@ -616,7 +626,14 @@ def load_pack(root: Path) -> Pack:
     recorded_on = _typed(raw.pop("recorded_on", {}), dict, f"{where}.recorded_on")
     variants_raw = _typed(_require(raw, "variants", where), dict, f"{where}.variants")
     cases_raw = _require(raw, "cases", where)
+    multiplier_raw = raw.pop("gpu_time_multiplier", None)
     _reject_extra(raw, where)
+    multiplier = None
+    if multiplier_raw is not None:
+        multiplier = _calibrated(multiplier_raw, f"{where}.gpu_time_multiplier")
+        value = multiplier.value
+        if type(value) not in (int, float) or not value > 0:
+            raise PackError(f"{where}.gpu_time_multiplier.value must be a positive number, got {value!r}")
 
     variants = {key: _variant(key, value) for key, value in variants_raw.items()}
     if not variants:
@@ -635,6 +652,7 @@ def load_pack(root: Path) -> Pack:
         cases=cases,
         acceptance=acceptance,
         recorded_on=recorded_on,
+        gpu_time_multiplier=multiplier,
     )
 
 
