@@ -1,0 +1,7 @@
+{
+ "schema_version": 2,
+ "rule_files": [
+  "rules.json"
+ ],
+ "note": "Qwen3.8-Flash-Next-NVFP4 (MTP k=3) on one B200, vLLM fork 892da082 TP1. Empty until the simulator arch (placeholder ARCH_TYPE in make_pack.py) exists: rules are written against its CostTree slots after the diverse_100 capture is labeled."
+}
