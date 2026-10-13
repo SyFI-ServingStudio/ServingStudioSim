@@ -8,11 +8,7 @@ weight.
 
 from typing import Any
 
-
-def grouped_rms_norm_reference(torch: Any, x: Any, weight: Any, eps: float, num_groups: int) -> Any:
-    values = x.float().unflatten(-1, (num_groups, -1))
-    normed = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps)
-    return (normed.flatten(-2) * (1.0 + weight.float())).to(x.dtype)
+from profiling.runners.norm.gemma_rms_norm_reference import gemma_rms_norm_reference
 
 
 def hc_combine_reference(
@@ -34,7 +30,7 @@ def hc_combine_norm_reference(
     torch: Any, residual: Any, block: Any, injection: Any, weight: Any, eps: float, hc_mult: int
 ) -> tuple[Any, Any]:
     combined = hc_combine_reference(torch, residual, block, injection, hc_mult)
-    return combined, grouped_rms_norm_reference(torch, combined, weight, eps, hc_mult)
+    return combined, gemma_rms_norm_reference(torch, combined, weight, eps, hc_mult)
 
 
 def hc_gate_mix_reference(torch: Any, x: Any, gate: Any, hc_mult: int) -> Any:
@@ -48,7 +44,6 @@ def scaled_silu_reference(torch: Any, x: Any, divisor: float) -> Any:
 
 
 __all__ = [
-    "grouped_rms_norm_reference",
     "hc_combine_norm_reference",
     "hc_combine_reference",
     "hc_gate_mix_reference",
