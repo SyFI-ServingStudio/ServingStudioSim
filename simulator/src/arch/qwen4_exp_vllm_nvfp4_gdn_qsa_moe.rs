@@ -561,8 +561,8 @@ fn kv_cache_layout(
 ) -> (KvCacheLayout, u32) {
     let act = u64::from(ACTIVATION_DTYPE.size_bytes());
     let k = u64::from(parallel.draft_tokens);
-    let attn_layers = u64::from(model.count(Qwen4ExpMixer::Qsa) + model.mtp_layers);
-    let gdn_layers = u64::from(model.count(Qwen4ExpMixer::Gdn));
+    let attn_layers = u64::from(model.layer_count(Qwen4ExpMixer::Qsa) + model.mtp_layers);
+    let gdn_layers = u64::from(model.layer_count(Qwen4ExpMixer::Gdn));
     let ple_layers = model.ple_layers.len() as u64;
     let ratio = u64::from(model.indexer_compress_ratio);
     let kv_page = gqa_kv_bytes_per_token(
