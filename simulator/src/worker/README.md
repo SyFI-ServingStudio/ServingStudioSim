@@ -199,8 +199,8 @@ one stable head through `peek`/`pop`:
 `DecodeCompletion` is a sub-axis of the chunked-prefill lifecycle, not a second
 lifecycle: it owns only how far one resident decode moves per iteration.
 `SingleTokenDecodeCompletion` is the ordinary one-row-in/one-token-out engine.
-`SpeculativeDecodeCompletion` submits a fixed `draft_tokens + 1` verify window
-per resident request and retires the target's own token plus the leading run of
+`SpeculativeDecodeCompletion` submits a `draft_tokens + 1` verify window per
+resident request (clipped at `max_model_len`, below) and retires the target's own token plus the leading run of
 accepted drafts, so its requests advance by different distances in the same
 iteration. Membership, capacity, and batch composition stay with the lifecycle;
 the query width it publishes is what sizes the mixed-iteration token budget and
@@ -240,11 +240,15 @@ Execution owns the model, reusable input buffer shape, and `CostBuffers`:
   constant because it selects a profiled kernel shape; how far a request actually
   advances after the verify belongs to the lifecycle's `DecodeCompletion`, not
   here.
-  The complete verify window must fit within `max_model_len`. A boundary batch
-  that requires fewer query rows fails explicitly; clipping only the context
-  would discard resident keys and invalidate necessary-work conservation.
-  vLLM can shorten these boundary batches, which this fixed-width model does
-  not yet represent.
+  At the context limit the width follows vLLM's scheduler: a request with
+  `resident` keys verifies `min(draft_tokens + 1, max_model_len - resident - 1)`
+  rows (`SpeculativeDecodeInput::verify_query_len`), so the position it samples
+  stays inside `max_model_len`. Its `kv_len` and `query_len` shrink together,
+  keeping necessary-work conservation, and `DecodeCompletion` retires no more
+  tokens than those rows. Arch models whose decode kernels take one uniform
+  width price that rare ragged row on their prefill (varlen) path, which is
+  also how vLLM leaves the uniform-decode graph. The mixed-iteration token
+  budget still reserves the full width for it.
 - `AttentionLayerExecutionAdapter` builds one slot's `AttnArchInput` and costs
   one attention layer.
 - `FfnSectionExecutionAdapter` splits token counts across FFN DP groups and

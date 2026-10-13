@@ -76,8 +76,13 @@ def aggregate_workload(totals: dict, proposer: str = "mtp") -> Workload:
                 else:
                     final = _integer(left, "decode context", k + 1)
                     q = _integer(right, "decode query", 1)
-                    if q != k + 1:
-                        raise ValueError("decode query must equal draft_tokens + 1")
+                    # Full width, or clipped by vLLM at the context limit so
+                    # the sampled position is the model's last.
+                    if q > k + 1 or (q < k + 1 and final != maximum - 1):
+                        raise ValueError(
+                            "decode query must equal draft_tokens + 1 "
+                            "except a verify clipped to end at max_model_len - 1"
+                        )
                     cached = final - q
                 if final > maximum:
                     raise ValueError("request context exceeds max_model_len")

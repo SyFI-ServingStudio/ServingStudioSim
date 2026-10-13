@@ -112,6 +112,7 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         balance,
         SpeculativeDecodeCompletion::new(
             draft_tokens,
+            model.max_model_len(),
             config.speculative_acceptance_seed.unwrap_or(0),
         ),
         drafting_slots,
