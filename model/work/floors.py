@@ -506,14 +506,21 @@ class _PipelineStages:
         return self._layers[worker_key]
 
     def _check_tiles(self, pool_tag: str, model) -> None:
-        """Every layer belongs to exactly one stage, or the shares would not add up."""
+        """Every layer belongs to exactly one stage of each pipeline replica, or the
+        shares would not add up: the pool is ``R`` copies of one tiling."""
         if pool_tag in self._tiled:
             return
-        ranges = sorted(
+        all_ranges = [
             layers
             for worker_key, layers in self._layers.items()
             if worker_key.split("/", 1)[0] == pool_tag
-        )
+        ]
+        ranges = sorted(set(all_ranges))
+        if len({all_ranges.count(layers) for layers in ranges}) != 1:
+            raise ValueError(
+                f"pool {pool_tag!r} stage layer ranges {sorted(all_ranges)} are not whole "
+                f"pipeline replicas"
+            )
         ends = [0, *(end for _start, end in ranges)]
         if [start for start, _end in ranges] != ends[:-1] or ends[-1] != model.num_layers:
             raise ValueError(
