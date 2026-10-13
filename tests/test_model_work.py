@@ -764,8 +764,8 @@ def test_qwen3_6_hybrid_stack():
 
 def test_qwen3_6_params_exact():
     label = load_model(QWEN36).label(Workload.causal_lm(decode=[4096], sampled=1))
-    # Equals the text path of the checkpoint's safetensors headers:
-    # 2 * 1_271_398_400 + 7_239_766_528 + 17_112_760_320 + 674_816.
+    # Equals the text path of the Qwen3.8-27B checkpoint's safetensors headers, whose
+    # text_config is the same: 2 * 1_271_398_400 + 7_239_766_528 + 17_112_760_320 + 674_816.
     assert label.params["total"] == 26_895_998_464  # "27B"
     # dense model: every layer param is activated, so activated == total minus embed/head.
     assert label.params["activated"]["layers"] == 24_353_201_664
@@ -1030,6 +1030,80 @@ def _qwen36_expected_weight_bytes(tokens: int) -> float:
     )
 
 
+# Qwen3.8-27B-NVFP4: the Qwen3.6-27B text model under ModelOpt MIXED_PRECISION.
+# Its checkpoint's `quantized_layers` stores the GDN in_proj_qkv / in_proj_z /
+# out_proj and the full-attention q/k/v/o_proj as FP8 E4M3 with one FP32 scale per
+# tensor, the MLP gate/up/down_proj and lm_head as NVFP4 (E2M1 + one E4M3 scale per
+# 16 weights), and leaves in_proj_b/a, conv1d, the norms and the embedding BF16.
+QWEN38 = Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_8_27b_nvfp4.json"
+
+
+def _fp8_tensor_bytes(n: int, k: int) -> int:
+    return n * k + 4
+
+
+def _nvfp4_bytes(n: int, k: int) -> int:
+    return n * k // 2 + n * k // 16
+
+
+# Per-layer compulsory weight bytes (hidden 5120; GDN q/k 2048, v/z 6144, 48 heads;
+# gated GQA q+gate 12288, k/v 1024, o input 6144; MLP 17408):
+Q38_GDN_BYTES = (
+    _fp8_tensor_bytes(2 * 2048 + 2 * 6144, 5120)  # in_proj_qkvz      83_886_084
+    + 2 * 96 * 5120  # in_proj_ba, BF16                                  983_040
+    + 2 * 10240 * 4  # conv1d, BF16                                       81_920
+    + _fp8_tensor_bytes(5120, 6144)  # out_proj                       31_457_284
+    + 2 * (48 + 48 + 128)  # A_log, dt_bias, gated norm                      448
+    + 2 * 2 * 5120  # input + post-attention norms                        20_480
+)  # 116_429_256
+Q38_GQA_BYTES = (
+    _fp8_tensor_bytes(12288 + 1024 + 1024, 5120)  # qkv_proj          73_400_324
+    + _fp8_tensor_bytes(5120, 6144)  # o_proj                         31_457_284
+    + 2 * 2 * 256  # q/k norms                                             1_024
+    + 2 * 2 * 5120  # input + post-attention norms                        20_480
+)  # 104_879_112
+Q38_MLP_BYTES = _nvfp4_bytes(2 * 17408, 5120) + _nvfp4_bytes(5120, 17408)  # 150_405_120
+Q38_LM_HEAD_BYTES = _nvfp4_bytes(248_320, 5120)  # 715_161_600
+# Per-token matmul FLOPs by precision (2 * n * k per weight, summed over layers):
+Q38_FP8_FLOPS = 2 * 48 * (16384 * 5120 + 5120 * 6144) + 2 * 16 * (14336 * 5120 + 5120 * 6144)
+Q38_FP4_FLOPS = 2 * 64 * 3 * 17408 * 5120
+Q38_BF16_MATMUL_FLOPS = 2 * 48 * (96 * 5120 + 10240 * 4)
+Q38_LM_HEAD_FLOPS = 2 * 248_320 * 5120
+
+
+@pytest.fixture(scope="module")
+def qwen38():
+    return load_model(QWEN38)
+
+
+def test_qwen38_is_the_qwen36_text_model_under_a_quantization_config(qwen38):
+    raw, twin = json.loads(QWEN38.read_text()), json.loads(QWEN36.read_text())
+    assert raw["architectures"] == ["Qwen3_5ForConditionalGeneration"]
+    assert raw["text_config"] == twin["text_config"]
+    assert raw["quantization_config"]["quant_algo"] == "MIXED_PRECISION"
+    wl = Workload.causal_lm(prefill=[(512, 1024)], decode=[4096] * 8, sampled=9)
+    quantized, bf16 = qwen38.label(wl), load_model(QWEN36).label(wl)
+    # Precision changes what a weight costs to read and where it computes, not how
+    # many parameters or FLOPs the model has.
+    assert quantized.params == bf16.params
+    assert quantized.params["total"] == 26_895_998_464
+    assert quantized.flops == bf16.flops
+    assert quantized.bytes["kv"] == bf16.bytes["kv"]
+
+
+def test_qwen38_mixed_precision_follows_the_checkpoint_module_by_module(qwen38):
+    label = qwen38.label(Workload.causal_lm(decode=[4096], sampled=1))
+    dtypes = {segment.name: segment.compute_dtype for segment in label.segments}
+    for name in ("linear.qkvz", "linear.out_proj", "full.qkv", "full.o"):
+        assert dtypes[name] == "fp8"
+    for name in ("linear.gate_up", "linear.down", "full.gate_up", "full.down", "lm_head"):
+        assert dtypes[name] == "fp4"
+    for name in ("linear.ba", "linear.conv1d", "embedding", "full.attn.decode"):
+        assert dtypes[name] == "bf16"
+    # The checkpoint's MTP layer (`mtp.*`, ignored and unlisted) is not part of the label.
+    assert not any(module.startswith("mtp") for module in qwen38.quant.converted_prefixes)
+
+
 def test_mixed_precision_resolves_per_layer_type_and_fused_shards():
     def config(layers: dict, ignore=()):
         return {
@@ -1088,6 +1162,49 @@ def test_mixed_precision_resolves_per_layer_type_and_fused_shards():
     refused({f"{prefix}.0.mlp.down_proj": fp8}, "layer 1 differently", ["linear", "linear"])
     refused({f"{prefix}.0.mlp.down_proj": fp8, f"{prefix}.1.mlp.down_proj": nvfp4}, "across")
     refused({"lm_head": {"quant_algo": "W4A16_NVFP4"}}, "W4A16_NVFP4")
+
+
+def test_qwen38_decode_weight_bytes_and_precision_split(qwen38):
+    label = qwen38.label(Workload.causal_lm(decode=[4096] * 256, sampled=256))
+    embedding_rows = 256 * 5120 * 2
+    final_norm = 5120 * 2
+    assert label.bytes["weights"] == (
+        48 * Q38_GDN_BYTES
+        + 16 * Q38_GQA_BYTES
+        + 64 * Q38_MLP_BYTES
+        + final_norm
+        + embedding_rows
+        + Q38_LM_HEAD_BYTES
+    )  # 17_610_391_040
+    flops_by_dtype: dict[str, float] = {}
+    for segment in label.segments:
+        if segment.bucket != "attn_internal":
+            flops_by_dtype[segment.compute_dtype] = (
+                flops_by_dtype.get(segment.compute_dtype, 0.0) + segment.flops_total
+            )
+    assert flops_by_dtype == {
+        "fp8": 256 * Q38_FP8_FLOPS,
+        "fp4": 256 * (Q38_FP4_FLOPS + Q38_LM_HEAD_FLOPS),
+        "bf16": 256 * Q38_BF16_MATMUL_FLOPS,
+    }
+
+
+def test_qwen38_prefill_work_goldens(qwen38):
+    tokens = 8192
+    label = qwen38.label(Workload.causal_lm(prefill=[(tokens, 0)], sampled=1))
+    assert label.flops["attn_proj"] == tokens * (Q38_FP8_FLOPS + Q38_BF16_MATMUL_FLOPS)
+    assert label.flops["ffn"] == tokens * Q38_FP4_FLOPS
+    assert label.flops["lm_head"] == Q38_LM_HEAD_FLOPS
+    causal_pairs = tokens * (tokens + 1) // 2
+    assert label.flops["attn_internal"] == (
+        16 * 2 * 24 * (256 + 256) * causal_pairs  # gated GQA, QK^T + PV per pair
+        + 48 * 6 * 48 * 128 * 128 * tokens  # GDN delta rule, O(T)
+    )
+    # A fresh request reads no state; it writes its GQA K/V (config-declared BF16)
+    # and each GDN layer's FP32 recurrent and BF16 conv state once.
+    assert label.bytes["kv"] == (
+        16 * tokens * 4 * (256 + 256) * 2 + 48 * (48 * 128 * 128 * 4 + 10240 * 4 * 2)
+    )
 
 
 @pytest.fixture(scope="module")

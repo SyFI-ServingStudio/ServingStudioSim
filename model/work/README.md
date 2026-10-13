@@ -77,6 +77,19 @@ Precision is then per segment, never global, because a real checkpoint is mixed:
 - GLM-5.2 NVFP4 converts only `mlp.experts`: packed E2M1 weights cost half a
   byte each and read one FP8 E4M3 scale per 16 weights. Dense layers, attention,
   router, shared experts, embedding, and head remain BF16.
+- A ModelOpt `MIXED_PRECISION` checkpoint (Qwen3.8-27B-NVFP4) instead lists
+  every converted Linear per layer under `quantized_layers`, each with its own
+  algorithm; anything unlisted stays at the master dtype, as in vLLM's
+  `ModelOptMixedPrecisionConfig`. `FP8` is E4M3 with one static FP32 scale per
+  tensor, `NVFP4` the E2M1 + per-16 E4M3 scale above. The builder passes its
+  layer schedule (every layer of one type must quantize alike) and vLLM's
+  `packed_modules_mapping`, so the checkpoint's shards (`q_proj`, `k_proj`,
+  `v_proj`) name the fused matrix the spec carries (`self_attn.qkv_proj`); its
+  shards must share one algorithm. Qwen3.8 stores the GDN `in_proj_qkvz` and
+  `out_proj` and the attention `qkv_proj`/`o_proj` in FP8, the MLP and
+  `lm_head` in NVFP4, and keeps `in_proj_ba`, `conv1d`, the norms and the
+  embedding BF16. Its KV cache is FP8 only by the serving flag
+  (`--kv-cache-dtype fp8_e4m3`), which the config does not declare.
 - A mechanism can fix its own precision independently of the weights:
   `AttentionSemantic.compute_dtype` pins GLM's DSA index logits to FP8 (the index
   cache is FP8 by construction) and its sparse MLA to BF16 (vLLM's FlashMLA
@@ -351,7 +364,8 @@ convention, so `params["activated"]` exposes **all** of them rather than picking
 - **Golden** — hand-computed FLOP buckets + `total`/`activated` params for a reference
   model, asserted in `tests/test_model_work.py`. (Llama3-8B: total 8.030 B, activated
   6.979 B; Qwen3-235B-A22B MoE: total ≈ 235 B, activated ≈ 22 B; Qwen3.6-27B hybrid:
-  total 26.896 B over 48 GDN + 16 gated-full layers, dense so activated == total.)
+  total 26.896 B over 48 GDN + 16 gated-full layers, dense so activated == total;
+  Qwen3.8-27B-NVFP4 shares that text model and its count.)
 - **Oracle** (Phase 3) — cross-check against the sim's *unsharded* per-op `slot_flops`:
   for a sharded, non-replicated matmul, `Σ achieved == labeler F_min` bucket (ratio ≈ 1).
 

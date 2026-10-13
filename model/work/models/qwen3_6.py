@@ -10,7 +10,9 @@ The 27B checkpoint ships as a ``Qwen3_5ForConditionalGeneration`` (VL wrapper), 
 text fields live under ``text_config``; this builder reads whichever is present.
 
 Every layer carries input and post-attention RMSNorm scales, a full-attention layer
-also its per-head q/k norms, and the body a final norm.
+also its per-head q/k norms, and the body a final norm. A quantized checkpoint (Qwen3.8's
+ModelOpt ``MIXED_PRECISION``) names its HF shards, which vLLM packs into the fused
+matrices the specs carry.
 """
 
 from __future__ import annotations
@@ -19,6 +21,16 @@ from ..attention.gqa import GQA
 from ..attention.linear import GatedDeltaNet
 from ..core import LayerStack, Model, NormWeightGroup, dtype_bytes
 from ..ffn.dense import DenseSwiGLU
+from ..quantization import parse_quantization_config
+
+#: vLLM ``Qwen3_5ForConditionalGeneration.packed_modules_mapping``
+#: (vllm/model_executor/models/qwen3_5.py:301-311 at 892da082).
+_PACKED_MODULES = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+    "in_proj_ba": ("in_proj_b", "in_proj_a"),
+}
 
 
 def _layer_types(text: dict) -> list[str]:
@@ -88,4 +100,7 @@ def build(raw_config: dict) -> Model:
         layers=layers,
         norm_weights=norm_weights,
         master_dtype=master_dtype,
+        quant=parse_quantization_config(
+            raw_config, layer_types=layer_types, packed_modules=_PACKED_MODULES
+        ),
     )
