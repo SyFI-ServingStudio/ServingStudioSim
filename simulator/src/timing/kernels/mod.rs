@@ -72,6 +72,8 @@ pub mod nvfp4_quant;
 pub mod p2p_inter;
 pub mod p2p_intra;
 pub mod packed_kv_cache_gather;
+pub mod paged_attn_batch_decode;
+pub mod paged_attn_batch_prefill;
 pub mod q_kv_rms_norm;
 pub mod q_pad_kv_rope_mxfp8_insert;
 pub mod qk_rms_norm_rope_gate;
@@ -327,6 +329,14 @@ pub use p2p_intra::{P2pIntraKernel, P2pIntraKernelConfig, P2pIntraKernelInput, P
 pub use packed_kv_cache_gather::{
     PackedKvCacheGatherKernel, PackedKvCacheGatherKernelConfig, PackedKvCacheGatherKernelInput,
     PackedKvCacheGatherMode, PackedKvCacheGatherSpec,
+};
+pub use paged_attn_batch_decode::{
+    PagedAttnBatchDecodeKernel, PagedAttnBatchDecodeKernelConfig, PagedAttnBatchDecodeKernelInput,
+    PagedAttnBatchDecodeSpec,
+};
+pub use paged_attn_batch_prefill::{
+    PagedAttnBatchPrefillKernel, PagedAttnBatchPrefillKernelConfig,
+    PagedAttnBatchPrefillKernelInput, PagedAttnBatchPrefillSpec,
 };
 pub use q_kv_rms_norm::{
     QKvRmsNormKernel, QKvRmsNormKernelConfig, QKvRmsNormKernelInput, QKvRmsNormSpec,

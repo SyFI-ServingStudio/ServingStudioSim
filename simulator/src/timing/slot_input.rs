@@ -51,6 +51,7 @@ use crate::timing::kernels::{
     MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput, SiluAndMulKernelInput,
     StaticFp8QuantKernelInput,
 };
+use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
 /// fan-out the attention op summed into one slot (many prefill requests fold to a
@@ -168,6 +169,8 @@ log_inputs! {
     GemmFp32Output => GemmFp32OutputKernelInput,
     RelBiasAttention => RelBiasAttentionKernelInput,
     Fa4VarlenAttention => Fa4VarlenAttentionKernelInput,
+    PagedAttnBatchDecode => PagedAttnBatchDecodeKernelInput,
+    PagedAttnBatchPrefill => PagedAttnBatchPrefillKernelInput,
     MlaRopeQuantizeFp8 => MlaRopeQuantizeFp8KernelInput,
     MoeFinalizeFuseShared => MoeFinalizeFuseSharedKernelInput,
     MhcRmsNorm => MhcRmsNormKernelInput,
