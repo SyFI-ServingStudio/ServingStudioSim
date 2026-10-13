@@ -734,6 +734,31 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
+            IterArchSel::Qwen35VllmNvfp4GdnDense {
+                max_model_len,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("Qwen3.5 NVFP4 vLLM", &g.worker)?;
+                let model = Arc::new(arch_build::qwen35_vllm_nvfp4_gdn_dense(
+                    model_spec,
+                    *max_model_len,
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "Qwen3.5 NVFP4 vLLM",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
             IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative {
                 ep_size,
                 nvl_num_gpu,

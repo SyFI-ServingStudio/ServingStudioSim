@@ -1,0 +1,19 @@
+# vLLM nvidia/Qwen3.8-27B-NVFP4 on one B200, chunked prefill at 2048 tokens, as the
+# diverse_100 capture's server ran (vLLM fork 892da082, --max-model-len 131072,
+# --max-num-batched-tokens 2048, --gpu-memory-utilization 0.85, prefix caching on).
+# attn_gpu_memory_gb is the KV pool, measured from `Available KV cache memory: 125.52 GiB`
+# in the capture's server log (x 1.073741824).
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: qwen35_vllm_nvfp4_gdn_dense
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: 2048
+          batch_policy: mix
+          attn_gpu_memory_gb: 134.7761
+sweep:
+  replicas: [1, 2]

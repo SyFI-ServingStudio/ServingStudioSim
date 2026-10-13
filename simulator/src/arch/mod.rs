@@ -29,6 +29,8 @@ pub mod mimo_v2_model_cfg;
 pub mod mimo_v2_vllm_fp8_swa_moe;
 pub mod model_cfg;
 pub mod moe_model_cfg;
+pub mod qwen35_model_cfg;
+pub mod qwen35_vllm_nvfp4_gdn_dense;
 pub mod qwen36_local;
 pub mod qwen3_attn_layerwise;
 pub mod qwen3_ffn_moe_layerwise;
@@ -95,6 +97,10 @@ pub use mimo_v2_vllm_fp8_swa_moe::{
 };
 pub use model_cfg::ModelCfg;
 pub use moe_model_cfg::MoeModelCfg;
+pub use qwen35_model_cfg::{Qwen35LinearPrecision, Qwen35Mixer, Qwen35ModelCfg, Qwen35Precisions};
+pub use qwen35_vllm_nvfp4_gdn_dense::{
+    Qwen35VllmConfigs, Qwen35VllmModel, Qwen35VllmParallel, Qwen35VllmResolved,
+};
 pub use qwen36_local::{
     Qwen36LocalConfigs, Qwen36LocalModel, Qwen36LocalParallel, Qwen36LocalResolved, Qwen36ModelCfg,
 };
