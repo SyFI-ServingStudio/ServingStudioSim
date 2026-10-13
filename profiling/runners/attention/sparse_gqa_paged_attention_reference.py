@@ -1,5 +1,7 @@
 """Independent PyTorch reference for sparse GQA paged attention with a sigmoid gate."""
 
+from __future__ import annotations
+
 from typing import Any
 
 
@@ -25,9 +27,9 @@ def sparse_gqa_paged_attention_reference(
     page_size = k_cache.shape[1]
     num_heads, head_dim = q.shape[1], q.shape[2]
     group = num_heads // k_cache.shape[2]
+    width = indices.shape[1] - 1
     out = []
     for row in rows:
-        width = indices.shape[1] - 1
         count = int(indices[row, width])
         tokens = indices[row, :count].long()
         tokens = tokens[tokens >= 0]

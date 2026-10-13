@@ -86,7 +86,7 @@ def profile_sparse_gqa_paged_attention_vllm_triton(
     kv_dtype: Any,
     prefill_config: bool,
 ) -> ComputeMetrics:
-    _q_dtype, kv_dtype = _validate(
+    _, kv_dtype = _validate(
         num_rows,
         context_len,
         num_q_heads,
