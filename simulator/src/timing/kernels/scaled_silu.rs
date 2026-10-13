@@ -1,5 +1,5 @@
-//! SiLU of an input divided by a constant: the fork's `hc_silu` Triton op, one
-//! program per row. The divisor is a compile-time scalar that does not change
+//! SiLU of an input divided by a constant: the vLLM fork's (892da082) `hc_silu`
+//! Triton op, one program per row. The divisor is a compile-time scalar that does not change
 //! the time, so it is not a field.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};

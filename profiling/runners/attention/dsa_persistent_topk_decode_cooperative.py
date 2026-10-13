@@ -15,11 +15,11 @@ from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.attention.dsa_persistent_topk_decode import (
-    _build_native_operands,
-    _logical_bytes,
-    _native_call,
-    _validate_args,
-    _validate_native_semantics,
+    build_native_operands,
+    logical_bytes,
+    native_call,
+    validate_args,
+    validate_native_semantics,
 )
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
@@ -50,7 +50,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda_cooperative(
         _logits_dtype,
         _index_dtype,
         context_mode,
-    ) = _validate_args(
+    ) = validate_args(
         batch_size,
         context_len,
         next_n,
@@ -77,7 +77,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda_cooperative(
     if op is None:
         raise ProfilerNotImplemented(f"{_BACKEND}: torch.ops._C.cooperative_topk is unavailable")
     try:
-        operands = _build_native_operands(
+        operands = build_native_operands(
             torch,
             batch_size=batch_size,
             context_len=context_len,
@@ -88,21 +88,21 @@ def profile_dsa_persistent_topk_decode_vllm_cuda_cooperative(
             device="cuda",
             context_mode=context_mode,
         )
-        _validate_native_semantics(torch, op, operands, top_k=top_k, max_seq_len=context_len)
+        validate_native_semantics(torch, op, operands, top_k=top_k, max_seq_len=context_len)
 
         def kernel() -> None:
-            return _native_call(op, operands, top_k=top_k, max_seq_len=context_len)
+            return native_call(op, operands, top_k=top_k, max_seq_len=context_len)
 
         torch.cuda.synchronize()
         time_ms = Timer.cupti(kernel, warmup=5)
         energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
-        logical_bytes = _logical_bytes(
+        num_bytes = logical_bytes(
             batch_size=batch_size, context_len=context_len, next_n=next_n, top_k=top_k
         )
         return ComputeMetrics(
             time_ms=float(time_ms),
             tflops=0.0,
-            memory_bandwidth_gbps=float(logical_bytes / (time_ms / 1000.0) / 1e9),
+            memory_bandwidth_gbps=float(num_bytes / (time_ms / 1000.0) / 1e9),
             energy_j=float(energy_j),
         )
     except RuntimeError as exc:

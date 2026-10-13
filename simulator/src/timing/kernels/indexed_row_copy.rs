@@ -33,6 +33,9 @@ pub struct IndexedRowCopyKernelInput {
     pub num_rows: u32,
 }
 
+/// Row counts for the state-row operations, which index one slot per request.
+const STATE_ROWS: [u32; 14] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128];
+
 pub struct IndexedRowCopySpec;
 
 impl KernelSpec for IndexedRowCopySpec {
@@ -51,9 +54,7 @@ impl KernelSpec for IndexedRowCopySpec {
                 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384,
             ])]);
         }
-        SweepGrid::new(vec![Axis::values([
-            1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128,
-        ])])
+        SweepGrid::new(vec![Axis::values(STATE_ROWS)])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -85,7 +86,7 @@ register_kernel!(IndexedRowCopyKernel, IndexedRowCopySpec);
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexedRowCopyKernelConfig, IndexedRowCopySpec};
+    use super::{IndexedRowCopyKernelConfig, IndexedRowCopySpec, STATE_ROWS};
     use crate::timing::bridge::DType;
     use crate::timing::kernels::engine::KernelSpec;
     use crate::timing::Dim;
@@ -104,7 +105,7 @@ mod tests {
         };
         let grid = IndexedRowCopySpec::sweep_grid(&config);
         let payloads = IndexedRowCopySpec::enumerate(&config, &grid, "torch");
-        assert_eq!(payloads.len(), 14);
+        assert_eq!(payloads.len(), STATE_ROWS.len());
         let fields = payloads[2].fields();
         assert_eq!(fields.len(), 5);
         assert_eq!(fields.get("num_rows"), Some(&Value::from(3_u32)));
@@ -137,6 +138,9 @@ mod tests {
             assert_eq!(rows.last(), Some(&16_384));
         }
         let grid = IndexedRowCopySpec::sweep_grid(&config("scatter"));
-        assert_eq!(IndexedRowCopySpec::enumerate(&config("scatter"), &grid, "torch").len(), 14);
+        assert_eq!(
+            IndexedRowCopySpec::enumerate(&config("scatter"), &grid, "torch").len(),
+            STATE_ROWS.len()
+        );
     }
 }

@@ -9,8 +9,10 @@
 //! on B200 (fp8 cache, 24/2/256). `prefill_config` is the framework's launch
 //! table switch for steps that hold a prefill row; it changes time only above
 //! 1024 rows (bp = 2·rows > 2048 for two K/V heads), where it measured 1.65x.
-//! The rows axis brackets each split-K table boundary (rows·kv_heads at 24, 32,
-//! 64, 128, 256, 512, 2048).
+//! The rows axis brackets each split-K table boundary (bp = rows·kv_heads at
+//! 24, 32, 64, 128, 256, 512, 2048), and the context axis holds the selection
+//! width `token_topk + compress_ratio - 1` where the selection saturates; both
+//! come from the config.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -42,13 +44,49 @@ pub struct SparseGqaPagedAttentionKernelInput {
     pub context_len: u32,
 }
 
-const ROWS_AXIS: [u32; 31] = [
-    1, 2, 4, 8, 12, 13, 16, 17, 24, 32, 33, 48, 64, 65, 96, 128, 129, 192, 256, 257, 384, 512, 768,
-    1024, 1025, 1536, 2048, 4096, 6144, 8192, 16384,
+/// Base rows: powers of two and their 1.5x midpoints up to the edge.
+const BASE_ROWS: [u32; 23] = [
+    1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 4096, 6144,
+    8192, 16384,
 ];
-const CONTEXT_AXIS: [u32; 14] = [
-    1, 4, 16, 64, 256, 512, 1024, 2048, 2051, 4096, 8192, 32768, 131072, 262144,
+/// Upper bounds of the default (SM100) split-K table rows, in base programs
+/// `num_rows * num_kv_heads` (fork `ops/qsa.py` `_select_config`).
+const SPLIT_K_BOUNDARIES: [u32; 7] = [24, 32, 64, 128, 256, 512, 2048];
+const BASE_CONTEXT: [u32; 13] = [
+    1, 4, 16, 64, 256, 512, 1024, 2048, 4096, 8192, 32768, 131072, 262144,
 ];
+const MAX_ROWS: u32 = 16384;
+const MAX_CONTEXT: u32 = 262144;
+
+/// Base rows plus, per split-K boundary, the last and first row count on
+/// either side of it for this config's K/V heads.
+fn rows_axis(config: &SparseGqaPagedAttentionKernelConfig) -> Vec<u32> {
+    let kv_heads = config.num_kv_heads.get().max(1);
+    let mut rows: Vec<u32> = BASE_ROWS.to_vec();
+    for boundary in SPLIT_K_BOUNDARIES {
+        let last_inside = boundary / kv_heads;
+        rows.extend(
+            [last_inside, last_inside + 1]
+                .into_iter()
+                .filter(|&r| r >= 1),
+        );
+    }
+    rows.retain(|&r| r <= MAX_ROWS);
+    rows.sort_unstable();
+    rows.dedup();
+    rows
+}
+
+/// Base contexts plus the selection width, past which every row selects
+/// `token_topk` tokens.
+fn context_axis(config: &SparseGqaPagedAttentionKernelConfig) -> Vec<u32> {
+    let selection = config.token_topk + config.compress_ratio.saturating_sub(1);
+    let mut context: Vec<u32> = BASE_CONTEXT.to_vec();
+    context.push(selection.min(MAX_CONTEXT));
+    context.sort_unstable();
+    context.dedup();
+    context
+}
 
 pub struct SparseGqaPagedAttentionSpec;
 
@@ -58,8 +96,14 @@ impl KernelSpec for SparseGqaPagedAttentionSpec {
 
     const KIND: KernelKind = "sparse_gqa_paged_attention";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![Axis::values(ROWS_AXIS), Axis::values(CONTEXT_AXIS)])
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        let (rows, context) = (rows_axis(config), context_axis(config));
+        assert!(
+            rows.len() * context.len() <= 500,
+            "sparse_gqa_paged_attention grid has {} points, over the 500 ceiling",
+            rows.len() * context.len()
+        );
+        SweepGrid::new(vec![Axis::values(rows), Axis::values(context)])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -75,8 +119,7 @@ impl KernelSpec for SparseGqaPagedAttentionSpec {
         input: &Self::Input,
         _backend: &'static str,
     ) -> OffGrid<Self::Input> {
-        let max_rows = ROWS_AXIS[ROWS_AXIS.len() - 1];
-        let max_context = CONTEXT_AXIS[CONTEXT_AXIS.len() - 1];
+        let (max_rows, max_context) = (MAX_ROWS, MAX_CONTEXT);
         if input.num_rows <= max_rows && input.context_len <= max_context {
             return OffGrid::Cache;
         }
@@ -144,7 +187,10 @@ mod tests {
         let cfg = config();
         let grid = SparseGqaPagedAttentionSpec::sweep_grid(&cfg);
         let specs = SparseGqaPagedAttentionSpec::enumerate(&cfg, &grid, "vllm_triton");
-        assert_eq!(specs.len(), ROWS_AXIS.len() * CONTEXT_AXIS.len());
+        assert_eq!(
+            specs.len(),
+            rows_axis(&cfg).len() * context_axis(&cfg).len()
+        );
         assert!(specs.len() <= 500);
         let names: Vec<&str> = specs[0].fields().keys().map(String::as_str).collect();
         assert_eq!(
@@ -163,6 +209,48 @@ mod tests {
                 "token_topk"
             ]
         );
+    }
+
+    /// The config-derived axes must reproduce the grid the B200 rows were
+    /// profiled on (24/2/256, top-2048 over ratio 4), or every lookup misses.
+    #[test]
+    fn derived_axes_match_the_profiled_grid() {
+        let cfg = config();
+        assert_eq!(
+            rows_axis(&cfg),
+            [
+                1, 2, 4, 8, 12, 13, 16, 17, 24, 32, 33, 48, 64, 65, 96, 128, 129, 192, 256, 257,
+                384, 512, 768, 1024, 1025, 1536, 2048, 4096, 6144, 8192, 16384,
+            ]
+        );
+        assert_eq!(
+            context_axis(&cfg),
+            [1, 4, 16, 64, 256, 512, 1024, 2048, 2051, 4096, 8192, 32768, 131072, 262144]
+        );
+    }
+
+    /// Catches boundaries placed for two K/V heads on another head count: each
+    /// split-K switch must have a profiled row count on both sides. (Odd head
+    /// counts such as 3 and 5 add 14 new points and reach 504 cells, past the
+    /// 500 ceiling; such a config needs its own grid decision.)
+    #[test]
+    fn rows_bracket_every_split_k_switch_for_any_kv_heads() {
+        for kv_heads in [1, 4, 6, 8, 16] {
+            let cfg = SparseGqaPagedAttentionKernelConfig {
+                num_kv_heads: Dim::param("num_kv_heads", kv_heads),
+                ..config()
+            };
+            let rows = rows_axis(&cfg);
+            for boundary in SPLIT_K_BOUNDARIES {
+                let inside = rows.iter().filter(|&&r| r * kv_heads <= boundary).max();
+                let outside = rows.iter().filter(|&&r| r * kv_heads > boundary).min();
+                let (Some(&inside), Some(&outside)) = (inside, outside) else {
+                    panic!("kv {kv_heads}: boundary {boundary} not bracketed");
+                };
+                assert_eq!(outside, inside + 1, "kv {kv_heads}, boundary {boundary}");
+            }
+            SparseGqaPagedAttentionSpec::sweep_grid(&cfg);
+        }
     }
 
     /// Past the grid the context holds and the rows split into edge pieces.

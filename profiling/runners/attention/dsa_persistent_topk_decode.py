@@ -1,4 +1,12 @@
-"""Profilers for GLM-5.2 persistent decode DSA top-k.
+"""Profilers for persistent decode top-k: the DSA indexer (GLM-5.x) and the QSA
+indexer (Qwen4Exp) alike.
+
+Logits come in two context modes: ``uniform`` (every row holds the same
+increasing sequence) and ``uniform_random`` (same lengths, seeded random
+scores); the fork backend's ``max_ragged`` lives in
+``dsa_persistent_topk_decode_fork``. The helpers here (operands, reference check, logical bytes,
+the call) are shared with ``dsa_persistent_topk_decode_cooperative``, which
+times vLLM's ``cooperative_topk`` on the same operands.
 
 The Torch backend times the complete vectorized semantic composite. The
 production backend packages a corrected vLLM v0.23-derived
@@ -78,7 +86,7 @@ class _DsaPersistentTopkDecodeNativeOperands:
     workspace: Any
 
 
-def _validate_args(
+def validate_args(
     batch_size: int,
     context_len: int,
     next_n: int,
@@ -255,7 +263,7 @@ def _build_operands(
     )
 
 
-def _build_native_operands(
+def build_native_operands(
     torch: Any,
     *,
     batch_size: int,
@@ -374,14 +382,16 @@ def _validate_semantics(
             raise RuntimeError("Torch composite output aliases an input")
 
 
-def _native_call(
+def native_call(
     op: Any,
     operands: _DsaPersistentTopkDecodeNativeOperands,
     *,
     top_k: int,
     max_seq_len: int,
 ) -> None:
-    """Invoke only the private corrected v0.23-derived callable."""
+    """Call a persistent or cooperative top-k op on the shared operands: the
+    corrected extension, the image vLLM's ``persistent_topk`` or its
+    ``cooperative_topk`` (same signature)."""
     return op(
         operands.logits,
         operands.lengths,
@@ -445,7 +455,7 @@ def _medium_overflow_explains(
     return int((selected_bins > threshold).sum()) == int((bins > threshold).sum())
 
 
-def _validate_native_semantics(
+def validate_native_semantics(
     torch: Any,
     op: Any,
     operands: _DsaPersistentTopkDecodeNativeOperands,
@@ -468,7 +478,7 @@ def _validate_native_semantics(
     expected = torch.empty_like(operands.out)
     out_storage = operands.out.untyped_storage().data_ptr()
     workspace_storage = operands.workspace.untyped_storage().data_ptr()
-    returned = _native_call(
+    returned = native_call(
         op,
         operands,
         top_k=top_k,
@@ -537,7 +547,7 @@ def _validate_native_semantics(
             raise RuntimeError("pinned CUDA output aliases another operand")
 
 
-def _logical_bytes(
+def logical_bytes(
     *,
     batch_size: int,
     context_len: int,
@@ -580,7 +590,7 @@ def profile_dsa_persistent_topk_decode_torch(
         _logits_dtype,
         _index_dtype,
         context_mode,
-    ) = _validate_args(
+    ) = validate_args(
         batch_size,
         context_len,
         next_n,
@@ -625,13 +635,13 @@ def profile_dsa_persistent_topk_decode_torch(
         # Logical traffic counts valid FP32 logits, one int32 length per row,
         # and all int32 output slots. It excludes padded columns, persistent
         # scratch workspace, Torch intermediates, and physical transactions.
-        logical_bytes = _logical_bytes(
+        num_bytes = logical_bytes(
             batch_size=batch_size,
             context_len=context_len,
             next_n=next_n,
             top_k=top_k,
         )
-        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+        bandwidth_gbps = num_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
             tflops=0.0,
@@ -696,7 +706,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         _logits_dtype,
         _index_dtype,
         context_mode,
-    ) = _validate_args(
+    ) = validate_args(
         batch_size,
         context_len,
         next_n,
@@ -720,7 +730,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
     op = _load_native_op(torch)
 
     try:
-        operands = _build_native_operands(
+        operands = build_native_operands(
             torch,
             batch_size=batch_size,
             context_len=context_len,
@@ -731,7 +741,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             device="cuda",
             context_mode=context_mode,
         )
-        _validate_native_semantics(
+        validate_native_semantics(
             torch,
             op,
             operands,
@@ -741,7 +751,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         )
 
         def kernel() -> None:
-            return _native_call(
+            return native_call(
                 op,
                 operands,
                 top_k=top_k,
@@ -768,13 +778,13 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         # Logical traffic counts valid FP32 logits, one int32 length per row,
         # and all int32 output slots. It excludes the 1 MiB scratch workspace,
         # padded logits, intermediates, and physical memory transactions.
-        logical_bytes = _logical_bytes(
+        num_bytes = logical_bytes(
             batch_size=batch_size,
             context_len=context_len,
             next_n=next_n,
             top_k=top_k,
         )
-        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+        bandwidth_gbps = num_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
             tflops=0.0,

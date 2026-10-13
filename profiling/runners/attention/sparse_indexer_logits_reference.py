@@ -1,5 +1,7 @@
 """Independent PyTorch reference for weight-free ReLU-sum indexer scores."""
 
+from __future__ import annotations
+
 from typing import Any
 
 

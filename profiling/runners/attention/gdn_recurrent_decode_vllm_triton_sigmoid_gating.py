@@ -7,8 +7,9 @@ and the same indexed FP32 state pool updated in place. The two kernels compute
 the same recurrence but schedule it differently, so this backend prices that
 call. With MTP the same call prices the verify requests of such a step
 (``num_tokens``): q tokens per request, ``num_accepted_tokens`` and ``[B, q]``
-checkpoint indices. Operand construction, the reference check and its state restoration stay
-outside CUPTI; only ``fused_sigmoid_gating_delta_rule_update_kernel`` is timed.
+checkpoint indices. Operand construction, the reference check and its state
+restoration stay outside CUPTI; only
+``fused_sigmoid_gating_delta_rule_update_kernel`` is timed.
 """
 
 from __future__ import annotations
@@ -151,7 +152,9 @@ class _VerifyCall:
     b: Any
 
 
-def _build_verify_call(torch: Any, args: _ValidatedArgs, per_request: int, *, device: Any):
+def _build_verify_call(
+    torch: Any, args: _ValidatedArgs, per_request: int, *, device: Any
+) -> _VerifyCall:
     operands = build_verify_recurrence_operands(
         torch,
         batch_size=args.batch_size,

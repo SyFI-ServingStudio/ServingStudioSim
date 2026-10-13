@@ -23,16 +23,18 @@ from profiling.runners.metrics import ComputeMetrics
 KIND = "ple_gate"
 _KERNEL_NAME = "_ple_gate_kernel"
 _EPS = 1e-6
-_MAX_TOKENS = 1 << 17
 
 
 def validate_args(num_tokens: int, hidden_size: int, hc_mult: int, dtype: object) -> None:
-    if type(num_tokens) is not int or not 1 <= num_tokens <= _MAX_TOKENS:
-        raise ValueError(f"num_tokens must be an integer in [1, {_MAX_TOKENS}]")
-    if type(hidden_size) is not int or not 1 <= hidden_size <= 16384:
-        raise ValueError("hidden_size must be an integer in [1, 16384]")
-    if type(hc_mult) is not int or not 1 <= hc_mult <= 16:
-        raise ValueError("hc_mult must be an integer in [1, 16]")
+    # No upper bounds: the grid is (tokens, hc_mult) and one program covers a
+    # whole hidden_size stream, so the kernel itself sets no size limit.
+    for name, value in (
+        ("num_tokens", num_tokens),
+        ("hidden_size", hidden_size),
+        ("hc_mult", hc_mult),
+    ):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
     if str(dtype) != "bf16":
         raise ProfilerNotImplemented(f"{KIND} is profiled for bf16 activations")
 

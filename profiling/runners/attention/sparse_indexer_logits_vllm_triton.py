@@ -24,6 +24,9 @@ _PAGE_SIZE = 512
 _POOL_BYTES = 1024**3
 # The fork's top-k (k = token_topk / ratio) is a fixed part of the call; 2048 / 4.
 _TOKEN_TOPK = 2048
+# Decode args carry no ratio; it only sizes that fixed top-k. 4 is the
+# Qwen3.8-Flash-Next ``indexer_compress_ratio`` (fork ``indexer_qsa.py``).
+_DECODE_COMPRESS_RATIO = 4
 _DECODE_KERNEL = "_qsa_mqa_paged_uniform_kernel"
 _PREFILL_KERNEL = "_qsa_mqa_paged_prefill_kernel"
 
@@ -53,11 +56,13 @@ def _imports(label: str) -> tuple[Any, Any]:
     return torch, qsa_indexer
 
 
-def _keys_cache(torch: Any, dt: Any, head_dim: int, min_pages: int, device: Any, gen: Any) -> Any:
-    page_bytes = _PAGE_SIZE * head_dim * (1 if dt == torch.float8_e4m3fn else 2)
+def _keys_cache(
+    torch: Any, torch_dtype: Any, head_dim: int, min_pages: int, device: Any, generator: Any
+) -> Any:
+    page_bytes = _PAGE_SIZE * head_dim * (1 if torch_dtype == torch.float8_e4m3fn else 2)
     pool = max(_POOL_BYTES // page_bytes, min_pages)
-    values = torch.randn((pool, _PAGE_SIZE, 1, head_dim), device=device, generator=gen) / 4
-    return values.to(dt)
+    values = torch.randn((pool, _PAGE_SIZE, 1, head_dim), device=device, generator=generator) / 4
+    return values.to(torch_dtype)
 
 
 def _check(torch: Any, actual: Any, expected: Any) -> None:
@@ -84,27 +89,33 @@ def profile_sparse_indexer_logits_decode_vllm_triton(
     )
     if num_keys > logits_width:
         raise ValueError("num_keys must be <= logits_width")
+    # The call scores page_table width x page_size columns, so a width that is
+    # not whole pages would be timed at the next page boundary.
+    if logits_width % _PAGE_SIZE:
+        raise ValueError(f"logits_width must be a multiple of {_PAGE_SIZE}, got {logits_width}")
     torch, ops = _imports(label)
     from profiling.runners.attention.sparse_indexer_logits_reference import (
         sparse_indexer_logits_reference,
     )
 
-    dt = _torch_dtype(torch, dtype, label)
-    compress_ratio = 4
+    torch_dtype = _torch_dtype(torch, dtype, label)
+    compress_ratio = _DECODE_COMPRESS_RATIO
     try:
         device = torch.device("cuda", torch.cuda.current_device())
-        gen = torch.Generator(device=device).manual_seed(0)
-        table_width = math.ceil(logits_width / _PAGE_SIZE)
-        k_cache = _keys_cache(torch, dt, head_dim, table_width, device, gen)
+        generator = torch.Generator(device=device).manual_seed(0)
+        table_width = logits_width // _PAGE_SIZE
+        k_cache = _keys_cache(torch, torch_dtype, head_dim, table_width, device, generator)
         rows = batch_size * next_n
-        q = (torch.randn((rows, num_heads, head_dim), device=device, generator=gen) / 4).to(dt)
+        q = (torch.randn((rows, num_heads, head_dim), device=device, generator=generator) / 4).to(
+            torch_dtype
+        )
         page_table = torch.randint(
             0,
             k_cache.shape[0],
             (batch_size, table_width),
             dtype=torch.int32,
             device=device,
-            generator=gen,
+            generator=generator,
         )
         visible = torch.full((rows,), num_keys, dtype=torch.int32, device=device)
         blocks = torch.empty(
@@ -138,7 +149,7 @@ def profile_sparse_indexer_logits_decode_vllm_triton(
         raise KernelLaunchFailed(f"{label} failed: {exc}") from exc
 
     seconds = time_ms / 1000.0
-    elem = 1 if dt == torch.float8_e4m3fn else 2
+    elem = 1 if torch_dtype == torch.float8_e4m3fn else 2
     flops = 2 * rows * num_heads * head_dim * num_keys
     traffic = batch_size * num_keys * head_dim * elem + 4 * rows * num_keys
     return ComputeMetrics(
@@ -173,19 +184,24 @@ def profile_sparse_indexer_logits_prefill_vllm_triton(
         sparse_indexer_logits_reference,
     )
 
-    dt = _torch_dtype(torch, dtype, label)
+    torch_dtype = _torch_dtype(torch, dtype, label)
     seq_len = prefix_len + num_queries
     try:
         device = torch.device("cuda", torch.cuda.current_device())
-        gen = torch.Generator(device=device).manual_seed(0)
+        generator = torch.Generator(device=device).manual_seed(0)
         logits_width = math.ceil(math.ceil(seq_len / compress_ratio) / 64) * 64
         table_width = math.ceil(max(logits_width, 64) / _PAGE_SIZE)
-        k_cache = _keys_cache(torch, dt, head_dim, table_width, device, gen)
-        q = (torch.randn((num_queries, num_heads, head_dim), device=device, generator=gen) / 4).to(
-            dt
-        )
+        k_cache = _keys_cache(torch, torch_dtype, head_dim, table_width, device, generator)
+        q = (
+            torch.randn((num_queries, num_heads, head_dim), device=device, generator=generator) / 4
+        ).to(torch_dtype)
         page_table = torch.randint(
-            0, k_cache.shape[0], (1, table_width), dtype=torch.int32, device=device, generator=gen
+            0,
+            k_cache.shape[0],
+            (1, table_width),
+            dtype=torch.int32,
+            device=device,
+            generator=generator,
         )
         query_start_loc = torch.tensor([0, num_queries], dtype=torch.int32, device=device)
         visible = (torch.arange(prefix_len + 1, seq_len + 1, device=device) // compress_ratio).to(
@@ -230,7 +246,7 @@ def profile_sparse_indexer_logits_prefill_vllm_triton(
     except Exception as exc:
         raise KernelLaunchFailed(f"{label} failed: {exc}") from exc
 
-    scored = sum((prefix_len + i + 1) // compress_ratio for i in range(0, num_queries))
+    scored = sum((prefix_len + i + 1) // compress_ratio for i in range(num_queries))
     seconds = time_ms / 1000.0
     return ComputeMetrics(
         time_ms=float(time_ms),

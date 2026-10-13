@@ -1,6 +1,8 @@
 //! Sparse-indexer prefill scoring: each new token of one prefilling sequence
 //! scores the compressed keys visible to it (causal over the prefix plus the
-//! chunk) in fixed-size launches. The top-k that follows is its own kind.
+//! chunk), one launch per row piece the framework's logits budget allows
+//! (`VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`, 512 MiB by default). The top-k that
+//! follows is its own kind.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};

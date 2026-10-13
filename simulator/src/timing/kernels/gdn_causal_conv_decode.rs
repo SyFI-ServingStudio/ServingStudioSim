@@ -9,7 +9,7 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
-use crate::timing::kernels::gdn_recurrent_decode::decode_batch_axis;
+use crate::timing::kernels::gdn_recurrent_decode::{decode_batch_axis, verify_tokens_per_request};
 use crate::timing::sweep::SweepGrid;
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -56,11 +56,7 @@ impl KernelSpec for GdnCausalConvDecodeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
-        let per_request = config
-            .tokens_per_request
-            .as_ref()
-            .map(Dim::get)
-            .filter(|&q| q != 1);
+        let per_request = verify_tokens_per_request(config.tokens_per_request.as_ref());
         grid.expand_1d(|batch_size| {
             let payload = ArgsPayload::new()
                 .with("backend", backend)

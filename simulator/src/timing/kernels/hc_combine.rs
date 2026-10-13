@@ -1,5 +1,5 @@
-//! Standalone delayed hyper-connection combine: the fork's `hc_combine` Triton op,
-//! one program per (token, 512-feature tile).
+//! Standalone delayed hyper-connection combine: the vLLM fork's (892da082)
+//! `hc_combine` Triton op, one program per (token, 512-feature tile).
 //!
 //! The schema is the multi-stream residual one the mHC kinds use (`hidden_size`,
 //! `hc_mult`, `hidden_dtype`, swept over `num_tokens`), so the Config, Input,

@@ -23,7 +23,7 @@ class HcGateMixArgs(KernelArgs):
     num_tokens: int = arg(unit="tokens", doc="Token rows.")
     hidden_size: int = arg(unit="elements", doc="Features in each residual stream.")
     hc_mult: int = arg(unit="streams", doc="Parallel residual streams per token.")
-    hidden_dtype: DType = arg(doc="Element type of the streams, block output and outputs.")
+    hidden_dtype: DType = arg(doc="Element type of the streams, the gate and the mixed output.")
 
 
 DOC = KernelDoc(

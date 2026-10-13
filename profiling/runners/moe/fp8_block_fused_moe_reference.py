@@ -7,9 +7,9 @@ bias only for selection, renormalized top-k, routed scale applied to the
 weights), block-dequantized per-expert gate/up and down projections, the
 SwiGLU clamp (``gate <= limit``, ``-limit <= up <= limit``), and the FP8
 re-quantization of the intermediate activation that the DeepSeek-FP8 recipe
-performs between the two GEMMs. Without a routing bias it routes as vLLM's
-RenormalizeNaive does instead (softmax, top-k, renormalize; Qwen3-Next's
-``norm_topk_prob``). Only experts in
+performs between the two GEMMs. ``routing_method="renormalize_naive"`` routes
+as vLLM's RenormalizeNaive does instead (softmax, top-k, renormalize, no bias;
+Qwen3-Next's ``norm_topk_prob``). Only experts in
 ``[local_offset, local_offset + num_local)`` contribute, as on one EP rank.
 
 Weights here are in vLLM's checkpoint order ``w13 = [gate; up]``; the runner
@@ -83,6 +83,7 @@ def fp8_block_fused_moe_reference(
     w13_scale: Any,
     w2: Any,
     w2_scale: Any,
+    routing_method: str,
     routing_logits: Any,
     routing_bias: Any,
     top_k: int,
@@ -94,17 +95,18 @@ def fp8_block_fused_moe_reference(
     """Return the FP32 ``[T, H]`` output of this rank's routed experts."""
 
     x = dequantize_token_groups(torch, hidden, hidden_scale)
-    ids, weights = (
-        renormalize_naive_routing(torch, routing_logits, top_k=top_k)
-        if routing_bias is None
-        else deepseek_v3_routing(
+    if routing_method == "renormalize_naive":
+        ids, weights = renormalize_naive_routing(torch, routing_logits, top_k=top_k)
+    elif routing_method == "deepseek_v3":
+        ids, weights = deepseek_v3_routing(
             torch,
             routing_logits,
             routing_bias,
             top_k=top_k,
             routed_scaling_factor=routed_scaling_factor,
         )
-    )
+    else:
+        raise ValueError(f"unsupported routing method: {routing_method}")
     intermediate = w13.shape[1] // 2
     output = torch.zeros_like(x)
     for local in range(num_local):

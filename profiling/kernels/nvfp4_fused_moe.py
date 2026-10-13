@@ -180,8 +180,11 @@ DOC = KernelDoc(
         "vLLM tunes up to max_num_batched_tokens·dp_size, which picks the same "
         "bucket for every shape it serves.",
         "The NVFP4 backends pass no SwiGLU clamp (gemm1_clamp_limit is None); vLLM "
-        "passes the model's swiglu_limit when it has one. The FP8 block-scale backend "
-        "passes GLM-5.3's limit 10 for deepseek_v3 and none for renormalize_naive.",
+        "passes the model's swiglu_limit when it has one. FP8 block-scale "
+        "deepseek_v3 rows were measured with SwiGLU clamp 10, renormalize_naive rows "
+        "without; the clamp is not a key axis.",
+        "renormalize_naive routing takes n_group = topk_group = 0 and no correction "
+        "bias, and does not apply the routed scale.",
         "GB/s counts logical traffic for the local rows and the experts that "
         "have rows; small side outputs are left out.",
     ),

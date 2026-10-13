@@ -98,3 +98,16 @@ def reject_verify_tokens(backend: str, batch_size: int, num_tokens: int | None) 
             f"{backend} decodes one token per request; num_tokens={num_tokens} with "
             f"batch_size={batch_size} is a verify step"
         )
+
+
+def accepted_counts(batch_size: int, per_request: int) -> tuple[int, ...]:
+    """Deterministic accepted counts covering 1..q (the verify kernels read from ``a − 1``)."""
+    return tuple(request % per_request + 1 for request in range(batch_size))
+
+
+def checkpoint_indices(batch_size: int, per_request: int) -> tuple[tuple[int, ...], ...]:
+    """vLLM's ``[B, q]`` per-token checkpoint slots; slot zero stays reserved."""
+    return tuple(
+        tuple(request * per_request + token + 1 for token in range(per_request))
+        for request in range(batch_size)
+    )

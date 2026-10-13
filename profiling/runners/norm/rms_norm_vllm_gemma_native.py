@@ -1,11 +1,13 @@
-"""vLLM ``GemmaRMSNorm.forward_native`` run eagerly, as a no-Inductor vLLM model launches it.
+"""vLLM ``GemmaRMSNorm`` as a no-Inductor vLLM model launches it, run eagerly.
 
 ``GemmaRMSNorm.forward_cuda`` calls ``forward_native``: it builds an fp32
 ``1 + weight`` and calls the ``vllm.ir`` ``rms_norm`` op. The vllm_c and oink
 providers require the weight dtype to match the input, so a bf16 input with that
-fp32 weight dispatches to the native PyTorch implementation, about ten eager
-launches (weight cast and offset, input cast, square, mean, add, rsqrt, scale,
-weight multiply, output cast). CUPTI counts every launch of the call.
+fp32 weight dispatches to the native PyTorch implementation. The runner times
+that native ``vllm.ir`` impl directly, building ``1 + weight`` inside the timed
+call: about ten eager launches (weight cast and offset, input cast, square,
+mean, add, rsqrt, scale, weight multiply, output cast). CUPTI counts every
+launch of the call.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
-from profiling.runners.mhc.hc_reference import grouped_rms_norm_reference
+from profiling.runners.norm.gemma_rms_norm_reference import gemma_rms_norm_reference
 
 _BACKEND = "rms_norm:vllm_gemma_native"
 _EPS = 1e-6
@@ -45,7 +47,7 @@ def profile_rms_norm_vllm_gemma_native(m: int, hidden: int, dtype: DType | str) 
             return native(x, weight.float() + 1.0, _EPS)
 
         torch.testing.assert_close(
-            launch(), grouped_rms_norm_reference(torch, x, weight, _EPS, 1), rtol=2e-2, atol=2e-2
+            launch(), gemma_rms_norm_reference(torch, x, weight, _EPS), rtol=2e-2, atol=2e-2
         )
         time_ms = Timer.cupti(launch, warmup=3, kernel_name=None)
         energy_j = Energy.perf(launch, warmup=3, per_iter_time_ms=time_ms)

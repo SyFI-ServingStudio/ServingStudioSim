@@ -84,6 +84,9 @@ DOC = KernelDoc(
         "The output zero-fill the framework issues before the call is not included.",
         "Selected groups are uniform random over the visible context, not a real "
         "indexer's choice; contiguous selections (context ≤ token_topk) read faster.",
+        "Every row sits at position context_len − 1. Prefill-table rows share one "
+        "request's consecutive pages, but a real chunk's rows see a causally growing "
+        "prefix; uniform-table rows are separate requests on random pages.",
         "FP8 caches use per-tensor scales of 1.",
         "GB/s counts selected K/V bytes once; queries, gates, indices and the "
         "split-K workspace are excluded.",

@@ -61,13 +61,13 @@ class _ValidatedArgs:
 
 def _validate_args(
     batch_size: int,
-    num_tokens: int,
     num_qk_heads: int,
     num_value_heads: int,
     key_head_dim: int,
     value_head_dim: int,
     dtype: DType | str,
     state_dtype: DType | str,
+    num_tokens: int,
 ) -> _ValidatedArgs:
     batch_size = int(batch_size)
     if batch_size <= 0 or int(num_qk_heads) <= 0 or int(num_value_heads) <= 0:
@@ -94,8 +94,10 @@ def _validate_args(
         or args.num_value_heads // args.num_qk_heads not in _HEAD_RATIOS
     ):
         raise ValueError(f"{_BACKEND} requires num_value_heads / num_qk_heads in {_HEAD_RATIOS}")
-    if args.dtype is not DType.BF16 or args.state_dtype is not DType.FP32:
-        raise ValueError(f"{_BACKEND} is profiled with dtype=bf16 and state_dtype=fp32")
+    # BackendSupport admits only BF16 activations; the state dtype is not a
+    # capability axis, so the runner keeps its own check.
+    if args.state_dtype is not DType.FP32:
+        raise ValueError(f"{_BACKEND} is profiled with state_dtype=fp32")
     return args
 
 
@@ -174,24 +176,24 @@ def _check_correctness(
 
 def profile_gdn_recurrent_decode_gated_norm_vllm_cuda(
     batch_size: int,
-    num_tokens: int,
     num_qk_heads: int,
     num_value_heads: int,
     key_head_dim: int,
     value_head_dim: int,
     dtype: DType | str,
     state_dtype: DType | str,
+    num_tokens: int,
 ) -> ComputeMetrics:
     """Profile vLLM's fused verify recurrence + gated norm."""
     args = _validate_args(
         batch_size,
-        num_tokens,
         num_qk_heads,
         num_value_heads,
         key_head_dim,
         value_head_dim,
         dtype,
         state_dtype,
+        num_tokens,
     )
     try:
         import torch

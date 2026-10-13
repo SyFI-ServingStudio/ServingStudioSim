@@ -69,34 +69,37 @@ def profile_sparse_indexer_prepare_vllm_triton(
 
     try:
         device = torch.device("cuda", torch.cuda.current_device())
-        gen = torch.Generator(device=device).manual_seed(0)
-        dt = torch.float8_e4m3fn if cache_dtype is DType.FP8_E4M3 else torch.bfloat16
-        tokens = num_tokens
+        generator = torch.Generator(device=device).manual_seed(0)
+        cache_torch_dtype = torch.float8_e4m3fn if cache_dtype is DType.FP8_E4M3 else torch.bfloat16
 
         def randn(*shape: int) -> Any:
-            return torch.randn(shape, dtype=torch.bfloat16, device=device, generator=gen)
+            return torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
 
-        projected = randn(tokens, (num_heads + 1) * head_dim)
+        projected = randn(num_tokens, (num_heads + 1) * head_dim)
         q_in, k_in = projected.split((num_heads * head_dim, head_dim), dim=-1)
-        positions = torch.arange(tokens, device=device)
-        cos_sin = randn(tokens + 1, head_dim // 2)
+        positions = torch.arange(num_tokens, device=device)
+        cos_sin = randn(num_tokens + 1, head_dim // 2)
         q_weight, k_weight = 0.1 * randn(head_dim), 0.1 * randn(head_dim)
-        q_out = torch.empty((tokens, num_heads, head_dim), dtype=dt, device=device)
+        q_out = torch.empty(
+            (num_tokens, num_heads, head_dim), dtype=cache_torch_dtype, device=device
+        )
         # One sequence starting at position 0: one ring block, compressed pages
         # scattered at random.
         state = torch.zeros((2, ring_size, 1, head_dim), dtype=torch.bfloat16, device=device)
         state_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
         state_slots = positions % ring_size
-        query_start_loc = torch.tensor([0, tokens], dtype=torch.int32, device=device)
-        groups = tokens // compress_ratio
+        query_start_loc = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+        groups = num_tokens // compress_ratio
         num_pages = max(1, -(-groups // _PAGE_SIZE))
         pool = num_pages + 64
-        compressed = torch.zeros((pool, _PAGE_SIZE, 1, head_dim), dtype=dt, device=device)
-        pages = torch.randperm(pool, device=device, generator=gen)[:num_pages]
+        compressed = torch.zeros(
+            (pool, _PAGE_SIZE, 1, head_dim), dtype=cache_torch_dtype, device=device
+        )
+        pages = torch.randperm(pool, device=device, generator=generator)[:num_pages]
         group_of = positions // compress_ratio
         slots = pages[group_of // _PAGE_SIZE] * _PAGE_SIZE + group_of % _PAGE_SIZE
         compressed_slots = torch.where((positions + 1) % compress_ratio == 0, slots, -1)
-        max_work = (tokens + compress_ratio - 1) // compress_ratio
+        max_work = (num_tokens + compress_ratio - 1) // compress_ratio
         work = torch.full((max_work, 2), -1, dtype=torch.int32, device=device)
         active = max(groups, 1)
         work[:active, 0] = 0
@@ -127,7 +130,7 @@ def profile_sparse_indexer_prepare_vllm_triton(
 
         launch()
         torch.cuda.synchronize()
-        rows = sorted({0, tokens // 2, tokens - 1})
+        rows = sorted({0, num_tokens // 2, num_tokens - 1})
         expected = _reference_q(
             torch,
             q_in[rows].view(len(rows), num_heads, head_dim),
@@ -151,8 +154,8 @@ def profile_sparse_indexer_prepare_vllm_triton(
     except Exception as exc:
         raise KernelLaunchFailed(f"{_BACKEND} failed: {exc}") from exc
 
-    out_bytes = 1 if dt == torch.float8_e4m3fn else 2
-    traffic = tokens * (num_heads * head_dim * (2 + out_bytes) + head_dim * 2)
+    out_bytes = 1 if cache_torch_dtype == torch.float8_e4m3fn else 2
+    traffic = num_tokens * (num_heads * head_dim * (2 + out_bytes) + head_dim * 2)
     return ComputeMetrics(
         time_ms=float(time_ms),
         tflops=0.0,

@@ -49,7 +49,7 @@ DOC = KernelDoc(
         "and its first call, at 8192 tokens or at the row's token count when larger, "
         "picks the launch config the row then uses, as vLLM's profile run at "
         "max_num_batched_tokens does. Every launch of the compiled block is counted. "
-        "The CUDA custom op writes into a preallocated output and is one launch."
+        "vllm_cuda: the CUDA custom op writes into a preallocated output and is one launch."
     ),
     caveats=("GB/s counts the two input halves and the output once each.",),
     reference="profiling.runners.elementwise.silu_and_mul_reference",

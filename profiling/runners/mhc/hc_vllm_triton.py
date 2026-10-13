@@ -21,6 +21,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.mhc import hc_reference as ref
+from profiling.runners.norm.gemma_rms_norm_reference import gemma_rms_norm_reference
 
 # eps is a constexpr scalar of the launch; its value does not change the time.
 _EPS = 1e-6
@@ -93,7 +94,7 @@ def profile_grouped_rms_norm_vllm_triton(
         x, weight = randn(num_tokens, width), randn(width, scale=0.1)
         torch.testing.assert_close(
             hc_ops.grouped_gemma_rmsnorm(x, weight, _EPS, num_groups),
-            ref.grouped_rms_norm_reference(torch, x, weight, _EPS, num_groups),
+            gemma_rms_norm_reference(torch, x, weight, _EPS, num_groups),
             **_TOL,
         )
         return lambda: hc_ops.grouped_gemma_rmsnorm(x, weight, _EPS, num_groups)

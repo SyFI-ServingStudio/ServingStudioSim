@@ -165,11 +165,11 @@ def _semantic_flops(
     readout arithmetic over the semantic FP32 state, once per token
     (``per_request`` tokens per request in a verify step).
     """
-    batch_size = batch_size * per_request
-    state_elements = batch_size * num_value_heads * key_head_dim * value_head_dim
-    qk_norm = 2 * batch_size * num_qk_heads * (3 * key_head_dim + 1)
-    query_scale = batch_size * num_value_heads * key_head_dim
-    gates = 4 * batch_size * num_value_heads + num_value_heads
+    tokens = batch_size * per_request
+    state_elements = tokens * num_value_heads * key_head_dim * value_head_dim
+    qk_norm = 2 * tokens * num_qk_heads * (3 * key_head_dim + 1)
+    query_scale = tokens * num_value_heads * key_head_dim
+    gates = 4 * tokens * num_value_heads + num_value_heads
     recurrence = 7 * state_elements
     return qk_norm + query_scale + gates + recurrence
 

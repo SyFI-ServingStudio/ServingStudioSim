@@ -15,10 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from profiling.runners.attention.gdn_causal_conv_verify_vllm_triton import (
-    accepted_counts,
-    checkpoint_indices,
-)
+from profiling.runners.attention._gdn_common import accepted_counts, checkpoint_indices
 
 
 @dataclass(frozen=True)

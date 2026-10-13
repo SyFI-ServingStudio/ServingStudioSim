@@ -1,5 +1,5 @@
 //! Hyper-connection block input, the gated mean over the normalized streams: the
-//! fork's `hc_gate_mix` Triton op, one program per (token, 512-feature tile).
+//! vLLM fork's (892da082) `hc_gate_mix` Triton op, one program per (token, 512-feature tile).
 //!
 //! The schema is the multi-stream residual one the mHC kinds use (`hidden_size`,
 //! `hc_mult`, `hidden_dtype`, swept over `num_tokens`), so the Config, Input,

@@ -30,6 +30,14 @@ KIND: str = "gdn_recurrent_decode_gated_norm"
 @dataclass(frozen=True)
 class GdnRecurrentDecodeGatedNormArgs(KernelArgs):
     batch_size: int = arg(unit="requests", doc="Requests verified together.")
+    num_qk_heads: int = arg(unit="heads", doc="Query and key heads per token.")
+    num_value_heads: int = arg(unit="heads", doc="Value heads and recurrent states per token.")
+    key_head_dim: int = arg(unit="elements", doc="Features in each query or key head.")
+    value_head_dim: int = arg(unit="elements", doc="Features in each value head.")
+    dtype: DType = arg(doc="Element type of activations, gate, norm weight and output.")
+    state_dtype: DType = arg(doc="Element type of the recurrent state and gate parameters.")
+    # After state_dtype, as in the sibling GDN decode kinds. The row hash sorts
+    # the args, so the order does not change any key.
     num_tokens: int = arg(
         unit="tokens",
         doc=(
@@ -37,12 +45,6 @@ class GdnRecurrentDecodeGatedNormArgs(KernelArgs):
             "token plus the drafts."
         ),
     )
-    num_qk_heads: int = arg(unit="heads", doc="Query and key heads per token.")
-    num_value_heads: int = arg(unit="heads", doc="Value heads and recurrent states per token.")
-    key_head_dim: int = arg(unit="elements", doc="Features in each query or key head.")
-    value_head_dim: int = arg(unit="elements", doc="Features in each value head.")
-    dtype: DType = arg(doc="Element type of activations, gate, norm weight and output.")
-    state_dtype: DType = arg(doc="Element type of the recurrent state and gate parameters.")
 
 
 DOC = KernelDoc(

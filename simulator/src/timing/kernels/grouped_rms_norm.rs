@@ -1,7 +1,8 @@
 //! Grouped Gemma RMSNorm: each of `num_groups` contiguous `hidden_size`-wide
-//! groups of a row gets its own RMS. The fork's `grouped_gemma_rmsnorm` Triton
-//! op, one program per (token, group); gated hyper-connections run it on the
-//! stream-outer residual when an HC module has no pending combine to fuse.
+//! groups of a row gets its own RMS. The vLLM fork's (892da082)
+//! `grouped_gemma_rmsnorm` Triton op, one program per (token, group); gated
+//! hyper-connections run it on the stream-outer residual when an HC module has
+//! no pending combine to fuse.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;

@@ -80,7 +80,8 @@ DOC = KernelDoc(
         "num_tokens > batch_size is a speculative verify step (vllm_triton only): "
         "each request convolves num_tokens / batch_size tokens from the history at its "
         "last accepted position, and its state row holds kernel_size − 2 + q samples "
-        "(gdn_spec_decode_reference). Bytes then count the whole history row.",
+        "(gdn_spec_decode_reference). Bytes count the kernel_size − 1 history "
+        "samples read plus the kernel_size − 2 + q history row written.",
         "torch writes a new output tensor, while vllm_triton overwrites the "
         "input token; both update the state in place.",
         "The torch reference checks request indices on the GPU inside each timed call.",
@@ -131,7 +132,9 @@ register(
         doc=BackendDoc(
             summary=(
                 "vLLM's causal_conv1d_update Triton call: convolution, SiLU and "
-                "in-place state update in one kernel."
+                "in-place state update in one kernel. Verify steps use its varlen "
+                "speculative form (query_start_loc, num_accepted_tokens, checkpoint "
+                "indices)."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
         ),
