@@ -1611,6 +1611,52 @@ mod tests {
         assert!(!names.iter().any(|n| n.starts_with("unified.gdn_first.ple")));
     }
 
+    /// The necessary-work maps name exactly the compiled locations (one GPU: no
+    /// collectives). A one-token draft compiles no recurrent MTP pass, so it
+    /// takes its own map.
+    #[test]
+    fn necessary_work_maps_cover_the_compiled_locations() {
+        for (draft_tokens, file, slots) in [
+            (
+                3,
+                include_str!(
+                    "../../../model/work/location_maps/qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_unified.json"
+                ),
+                340,
+            ),
+            (
+                1,
+                include_str!(
+                    "../../../model/work/location_maps/qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_single_draft_unified.json"
+                ),
+                286,
+            ),
+        ] {
+            let mut layout = parallel();
+            layout.draft_tokens = draft_tokens;
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let configs = build_configs(&model_cfg(), &layout, demand()).unwrap();
+            let model = build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
+            let actual: std::collections::BTreeSet<String> = model
+                .cost_log_manifest()
+                .slots
+                .into_iter()
+                .map(|slot| slot.name)
+                .collect();
+            assert_eq!(actual.len(), slots);
+            let map: serde_json::Value = serde_json::from_str(file).unwrap();
+            assert_eq!(map["arch_types"][0], ARCH_KIND);
+            let mapped: std::collections::BTreeSet<String> = map["locations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["location"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(actual, mapped, "draft_tokens = {draft_tokens}");
+        }
+    }
+
     #[test]
     fn kv_cache_layout_reproduces_the_logged_hybrid_block() {
         let (layout, block) = kv_cache_layout(&model_cfg(), &parallel());
