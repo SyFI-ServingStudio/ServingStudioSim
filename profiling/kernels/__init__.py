@@ -78,6 +78,8 @@ from profiling.kernels import (
     p2p_inter,  # noqa: F401
     p2p_intra,  # noqa: F401
     packed_kv_cache_gather,  # noqa: F401
+    paged_attn_batch_decode,  # noqa: F401
+    paged_attn_batch_prefill,  # noqa: F401
     q_kv_rms_norm,  # noqa: F401
     q_pad_kv_rope_mxfp8_insert,  # noqa: F401
     qnorm_rope_kv_insert,  # noqa: F401
