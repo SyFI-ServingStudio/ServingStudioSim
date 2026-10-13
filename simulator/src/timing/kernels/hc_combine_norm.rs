@@ -1,6 +1,6 @@
 //! Delayed hyper-connection combine fused with the next HC module's per-stream
-//! Gemma RMSNorm: the fork's `hc_combine_norm` Triton op, one program per
-//! (token, stream).
+//! Gemma RMSNorm: the vLLM fork's (892da082) `hc_combine_norm` Triton op, one
+//! program per (token, stream).
 //!
 //! The schema is the multi-stream residual one the mHC kinds use (`hidden_size`,
 //! `hc_mult`, `hidden_dtype`, swept over `num_tokens`), so the Config, Input,
