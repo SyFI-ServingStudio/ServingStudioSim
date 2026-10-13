@@ -19,7 +19,8 @@
 //! ```
 //!
 //! Under FULL_AND_PIECEWISE graphs the compiled pieces run at the graph-padded
-//! row count, and so does the core in a FULL-graph (uniform decode) replay; a
+//! row count, and so does the core in a FULL-graph (uniform decode) replay
+//! (whose decode kernels skip the padded rows' work, see `Work`); a
 //! piecewise replay runs the core (`vllm::qwen_gdn_attention_core`, a splitting
 //! op) eagerly over the real tokens.
 //!
@@ -462,7 +463,11 @@ struct Work {
     core: u32,
     prefills: u32,
     prefill_tokens: u32,
-    /// The packed decode path's rows (a decode-only step).
+    /// The packed decode path's rows (a decode-only step): the real decode
+    /// requests. A FULL-graph replay launches both decode kernels over the
+    /// padded rows, but each padded row carries `PAD_SLOT_ID` as its state index
+    /// and returns before touching any state (`causal_conv1d_update`,
+    /// `fused_recurrent_gated_delta_rule_packed_decode`), so only real rows cost.
     packed_decode_rows: u32,
     /// A mixed step's decode rows (sigmoid-gating path), else 0.
     mixed_decodes: u32,
@@ -486,7 +491,11 @@ impl Work {
             core,
             prefills,
             prefill_tokens,
-            packed_decode_rows: if prefills == 0 { core } else { 0 },
+            packed_decode_rows: if prefills == 0 {
+                input.decode_requests
+            } else {
+                0
+            },
             mixed_decodes: if mixed { input.decode_requests } else { 0 },
             output_cat_rows: if mixed { real } else { 0 },
             prefill: GdnPrefillOpInput {
@@ -546,14 +555,16 @@ mod tests {
     }
 
     #[test]
-    fn a_full_graph_decode_runs_the_packed_core_at_the_padded_rows() {
+    fn a_full_graph_decode_prices_the_packed_core_at_the_real_rows() {
         let w = Work::of(&VllmQwen35GdnLocalWorkletInput {
             padded_tokens: 8,
             full_graph_rows: 8,
             prefill_lengths: vec![],
             decode_requests: 5,
         });
-        assert_eq!((w.packed_decode_rows, w.core, w.mixed_decodes), (8, 8, 0));
+        // The padded rows exit on PAD_SLOT_ID; the core output buffer is still
+        // copied at the padded rows.
+        assert_eq!((w.packed_decode_rows, w.core, w.mixed_decodes), (5, 8, 0));
         assert_eq!(w.prefills, 0);
     }
 
