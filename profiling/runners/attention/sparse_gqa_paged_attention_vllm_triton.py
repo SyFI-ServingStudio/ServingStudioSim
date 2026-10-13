@@ -74,6 +74,16 @@ def _validate(
     return q_dtype, kv_dtype
 
 
+def _launch_table_flag(prefill_config: Any) -> bool:
+    """The flag as a bool. The table stores it as text, and a spec replayed from
+    those rows keeps "0"/"1", where ``bool("0")`` would pick the prefill table."""
+    if prefill_config is True or prefill_config == "1":
+        return True
+    if prefill_config is False or prefill_config == "0":
+        return False
+    raise ValueError(f"prefill_config must be a bool or '0'/'1', got {prefill_config!r}")
+
+
 def profile_sparse_gqa_paged_attention_vllm_triton(
     num_rows: int,
     context_len: int,
@@ -97,6 +107,7 @@ def profile_sparse_gqa_paged_attention_vllm_triton(
         q_dtype,
         kv_dtype,
     )
+    prefill_config = _launch_table_flag(prefill_config)
     try:
         import torch
         from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
@@ -194,7 +205,7 @@ def profile_sparse_gqa_paged_attention_vllm_triton(
                 indices,
                 block_table,
                 token_to_req,
-                bool(prefill_config),
+                prefill_config,
                 out,
                 output_gate=gate,
                 **scales,
