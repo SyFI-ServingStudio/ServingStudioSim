@@ -29,7 +29,7 @@ from profiling.runners.exceptions import (
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "gdn_recurrent_decode:vllm_triton"
-_CALLABLE_MODULE = "vllm.model_executor.layers.fla.ops.fused_recurrent"
+_CALLABLE_MODULE = "vllm.third_party.flash_linear_attention.ops.fused_recurrent"
 _CALLABLE_NAME = "fused_recurrent_gated_delta_rule_packed_decode"
 _KERNEL_NAME = "fused_recurrent_gated_delta_rule_packed_decode_kernel"
 _OUTPUT_ATOL = 1e-2
