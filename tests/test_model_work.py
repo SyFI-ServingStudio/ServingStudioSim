@@ -2178,13 +2178,13 @@ def test_every_public_arch_on_an_fp4_checkpoint_is_labeled_fp4():
         config = root / "model" / "config" / f"{catalog[preset['checkpoint']]['config']}.json"
         raw = json.loads(config.read_text())
         # Only the compute dtype matters here, so per-layer ModelOpt exclusions
-        # (GLM-5.3-Flash NVFP4) need no layer resolution. A checkpoint whose
-        # per-layer schedule only its own builder can read (Qwen3.8-Flash-Next's
-        # PLE table and MTP experts) reports the scheme that builder resolved.
-        try:
-            quant = parse_quantization_config(raw, layer_qualified_exclusions=True)
-        except ValueError:
+        # (GLM-5.3-Flash NVFP4) need no layer resolution. Qwen3.8-Flash-Next's
+        # per-layer list (PLE table, MTP experts) only its own builder reads, so
+        # it reports the scheme that builder resolved.
+        if raw["architectures"][0] == "Qwen4ExpForConditionalGeneration":
             quant = build_model(raw).quant
+        else:
+            quant = parse_quantization_config(raw, layer_qualified_exclusions=True)
         # Inkling keeps ModelOpt's hf_quant_config.json verbatim instead of a
         # quantization_config; model/work/models/inkling.py reads it from there.
         hf_quant = (raw.get("hf_quant_config") or {}).get("quantization") or {}
@@ -4373,13 +4373,7 @@ QF_SNAPSHOT = Path(
     "/raid/hf/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/"
     "fc694b54fb0174e0913e6adf86691ef85a4ead47"
 )
-# The arch task copies config.json verbatim to model/config; until it lands, the
-# snapshot's own config.json is the same file.
-_QF_REPO_CONFIG = (
-    Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_8_flash_next_nvfp4.json"
-)
-QF_CONFIG = _QF_REPO_CONFIG if _QF_REPO_CONFIG.exists() else QF_SNAPSHOT / "config.json"
-requires_qf = pytest.mark.skipif(not QF_CONFIG.exists(), reason="Qwen3.8-Flash-Next config absent")
+QF_CONFIG = Path(__file__).resolve().parents[1] / "model/config/qwen3_8_flash_next_nvfp4.json"
 
 QF_H, QF_V, QF_S, QF_R = 2560, 248_320, 4, 320  # hidden, vocab, HC streams, HC rank
 QF_W = QF_S * QF_H  # 10,240-wide multi-stream state
@@ -4442,7 +4436,6 @@ def qf():
     return load_model(QF_CONFIG)
 
 
-@requires_qf
 def test_qf_registry_schedule_and_geometry(qf):
     from model.work.attention.qsa import QuerySparseAttention
     from model.work.models import qwen4_exp
@@ -4493,7 +4486,6 @@ def test_qf_ple_table_rows_follow_the_prime_vocabulary_layout():
     assert ngram_table_rows(20_000_000, 16, 1, dense_layer_id=1) > 320_001_446
 
 
-@requires_qf
 def test_qf_hand_derived_params(qf):
     assert QF_BODY_PARAMS == 176_943_899_520
     assert QF_MTP_PARAMS == 2_607_150_848
@@ -4559,7 +4551,6 @@ def test_qf_params_and_expert_bytes_reconcile_with_the_safetensors_header(qf):
         assert per_layer * (48 if part == "body" else 1) == expert_bytes[part]
 
 
-@requires_qf
 def test_qf_precision_follows_the_checkpoint(qf):
     quant = qf.quant
     assert quant.is_converted("mlp.experts.gate_up_proj")
@@ -4626,7 +4617,6 @@ def _qf_flops(tokens: int, groups: int, selected: int, sampled: int) -> dict:
     }
 
 
-@requires_qf
 def test_qf_prefill_and_decode_flop_goldens(qf):
     assert QF_HC == 1_270_087_680 and QF_HC_SAMPLED == 13_127_680 and QF_PLE == 65_638_400
     # 8192 tokens from an empty cache: the query at context k scores floor(k / 4)
@@ -4647,7 +4637,6 @@ def test_qf_prefill_and_decode_flop_goldens(qf):
         )
 
 
-@requires_qf
 def test_qf_decode_byte_goldens(qf):
     label = qf.label(Workload.causal_lm(decode=[4096] * 256))
     tokens = 256
@@ -4680,7 +4669,35 @@ def test_qf_decode_byte_goldens(qf):
     assert rows["qsa.attn.decode"] == 12 * tokens * 2047 * 2048
 
 
-@requires_qf
+def test_qf_prefill_byte_goldens(qf):
+    tokens = 8192
+    label = qf.label(Workload.causal_lm(prefill=[(tokens, 0)]))
+    # Weights read once, as for decode, but 81,920 routed draws hit all 512 experts
+    # of every layer; one embedding row, 16 FP8 PLE rows (160 wide) per token.
+    dense = QF_BODY_PARAMS - 48 * 512 * QF_EXPERT - QF_PLE_TABLE - 2 * QF_TABLE
+    expected_weights = (
+        2 * dense
+        + 48 * 512 * QF_EXPERT * (0.5 + 1 / 16)
+        + 2 * QF_H * tokens
+        + tokens * 16 * 160
+        + 2 * QF_TABLE
+    )
+    assert expected_weights == 76_634_638_080
+    assert label.bytes["weights"] == pytest.approx(expected_weights, rel=1e-12)
+    # A fresh request reads no state and no cached keys. GDN writes its FP32 state
+    # (48x128x128) and BF16 conv state (10240x4) once; QSA appends every token's
+    # K/V (2 heads x 256 x 2, BF16) and one 128-wide BF16 index entry per completed
+    # group of 4; the PLE convolution keeps its last 9 rows (10240 wide, BF16).
+    gdn = 48 * 128 * 128 * 4 + 10_240 * 4 * 2
+    qsa = tokens * 2048 + tokens // 4 * 256
+    ple = 9 * QF_W * 2
+    assert label.bytes == {"weights": label.bytes["weights"], "kv": 36 * gdn + 12 * qsa + ple}
+    rows = {s.name: s.bytes_total for s in label.segments}
+    assert rows["qsa.kv_cache_append"] == 12 * tokens * 2048
+    assert rows["qsa.index_cache_append"] == 12 * 2048 * 256
+    assert rows["gdn_ple.ple.conv_state"] == ple
+
+
 def test_qf_mtp_stages_follow_the_draft_geometry(qf):
     from model.work.speculative import (
         DRAFT_FIRST_STAGE,
@@ -4812,7 +4829,6 @@ def test_ple_conv_history_matches_per_request_rows():
         ple.semantic_segments(Workload(4, 1, [AttnInteraction(4, 400, 396, "full")]))
 
 
-@requires_qf
 def test_qf_geometry_rows_and_the_rest_partition_the_label(qf):
     workload = Workload.causal_lm(prefill=[(2019, 29), (512, 0)], decode=[3000, 10, 70000])
     whole = {s.name: (s.flops_total, s.bytes_total) for s in qf.label(workload).segments}
@@ -4845,8 +4861,12 @@ def _qf_served(tmp_path, **arch_fields):
 def _qf_speculative_label(model, depth, prefill, decode):
     from model.work.speculative import aggregate_workload
 
-    geometry = {"draft_tokens": depth, "max_model_len": 131_072, "prefill": prefill,
-                "decode": decode}
+    geometry = {
+        "draft_tokens": depth,
+        "max_model_len": 131_072,
+        "prefill": prefill,
+        "decode": decode,
+    }
     tokens = sum(q for _, q in prefill)
     workload = aggregate_workload(
         {
@@ -4863,7 +4883,6 @@ def _qf_speculative_label(model, depth, prefill, decode):
     return model.label(workload)
 
 
-@requires_qf
 def test_qf_floors_resolve_the_arch_defaults(qf, tmp_path):
     """A preset that omits the arch's knobs ran the simulator's serde defaults:
     three draft tokens, FP8 KV and FP8 index caches. The floors resolve the same."""
@@ -4877,6 +4896,7 @@ def test_qf_floors_resolve_the_arch_defaults(qf, tmp_path):
     qsa = {stack.tag: stack.attn for stack in served.layers}
     for tag in ("qsa", "mtp_first", "mtp_recurrent"):
         assert (qsa[tag].kv_dtype_bytes, qsa[tag].index_cache_dtype_bytes) == (1.0, 1.0)
+
     # One verify of 4 rows at context 4100: 2047 selected keys of 2 K/V heads x 256
     # and 1023 complete 128-wide index groups per QSA layer row, now one byte each.
     def bytes_by_row(model):
@@ -4884,8 +4904,13 @@ def test_qf_floors_resolve_the_arch_defaults(qf, tmp_path):
         return {s.name: s.bytes_total for s in label.segments}
 
     rows, base = bytes_by_row(served), bytes_by_row(qf)
-    for name in ("qsa.attn.decode", "qsa.indexer.decode", "qsa.kv_cache_append",
-                 "qsa.index_cache_append", "mtp_recurrent.attn.decode"):
+    for name in (
+        "qsa.attn.decode",
+        "qsa.indexer.decode",
+        "qsa.kv_cache_append",
+        "qsa.index_cache_append",
+        "mtp_recurrent.attn.decode",
+    ):
         assert rows[name] == base[name] / 2 > 0, name
     # GDN and PLE state are not KV cache.
     assert rows["gdn.recurrent_state.decode_read"] == base["gdn.recurrent_state.decode_read"]
@@ -4897,7 +4922,6 @@ def test_qf_floors_resolve_the_arch_defaults(qf, tmp_path):
     assert work_floors._pool_specs(tmp_path)["main"]["draft_tokens"] == 2
 
 
-@requires_qf
 @pytest.mark.parametrize(
     ("depth", "mapping"),
     [
