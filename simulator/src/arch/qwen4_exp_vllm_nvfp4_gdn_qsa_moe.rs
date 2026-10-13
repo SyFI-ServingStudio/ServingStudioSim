@@ -25,14 +25,15 @@
 //!
 //! A step of at most the largest capture size replays a CUDA graph: the graph
 //! pieces run on the token count padded to the next captured size. A uniform
-//! verify step (no prefill) replays a FULL graph, so its eager breaks (QSA's
-//! `_run_qsa`, the GDN core, the PLE lookup and conv) run padded too; a step
-//! with a prefill runs them over the real rows. Larger steps run eagerly.
-//! The draft recurrent pass replays the drafter's FULL graph at the padded
-//! request count.
+//! verify step (no prefill, no clipped verify) replays a FULL graph, so
+//! `_run_qsa`, the n-gram ids, the PLE lookup and its finalize copy run at the
+//! padded rows; the GDN verify kernels and the PLE short conv skip padded
+//! requests, so they cost only the real ones. A step with a prefill runs the
+//! eager breaks over the real rows. Larger steps run eagerly. The draft
+//! recurrent pass replays the drafter's FULL graph at the padded request count.
 //!
-//! Not modeled: the post-step bookkeeping launches (decision D8) and host
-//! overhead.
+//! Not modeled: the post-step bookkeeping launches (`_post_update_kernel`,
+//! `postprocess_mamba_fused_kernel`) and host overhead.
 
 use anyhow::Result;
 
@@ -111,11 +112,12 @@ const DEVICE: &str = "device";
 const GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
 /// The fork's Triton kernels (HC, PLE, QSA, GDN conv / post-conv / norm).
 const VLLM_TRITON_BACKENDS: &[&str] = &["vllm_triton"];
-/// Eager torch launches, measured in the serving fork's venv (glue_map.md).
+/// Eager torch launches, measured in the serving fork's venv.
 const TORCH_BACKENDS: &[&str] = &["torch_vllm"];
 const STRIDED_COPY_BACKENDS: &[&str] = &["torch_strided_copy_vllm"];
 const CAT_BACKENDS: &[&str] = &["torch_cat_vllm"];
-const INDEXED_ROW_COPY_BACKENDS: &[&str] = &["torch_vllm"];
+/// `index_select` / `index_copy_` / state gather-scatter: eager torch too.
+const INDEXED_ROW_COPY_BACKENDS: &[&str] = TORCH_BACKENDS;
 /// Triton launches priced as byte placeholders (sampler, engine prep).
 const TRITON_ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 /// `F.embedding` over the BF16 vocabulary.
@@ -163,16 +165,30 @@ pub struct Qwen4ExpLayerGroup {
     mixer: Qwen4ExpMixer,
     /// `GroupedNorm` where no combine is pending: layer 0 and a PLE layer.
     attn_entry: HcMixEntry,
-    /// The layer starts with a PLE block; `Some(pending combine)`.
-    ple: Option<bool>,
+    ple: PleSlot,
+}
+
+/// Whether a layer starts with a PLE block, and whether a hyper-connection
+/// combine is pending when it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PleSlot {
+    None,
+    /// PLE in layer 0: no combine is pending.
+    First,
+    /// PLE after layer 0: the pending combine runs standalone first.
+    AfterCombine,
 }
 
 pub fn layer_groups(model: &Qwen4ExpModelCfg) -> Vec<Qwen4ExpLayerGroup> {
     let mut groups: Vec<Qwen4ExpLayerGroup> = Vec::new();
     for (layer, &mixer) in model.mixers.iter().enumerate() {
         let layer = layer as u32;
-        let ple = model.ple_layers.contains(&layer).then_some(layer > 0);
-        let attn_entry = if layer == 0 || ple.is_some() {
+        let ple = match (model.ple_layers.contains(&layer), layer) {
+            (false, _) => PleSlot::None,
+            (true, 0) => PleSlot::First,
+            (true, _) => PleSlot::AfterCombine,
+        };
+        let attn_entry = if layer == 0 || ple != PleSlot::None {
             HcMixEntry::GroupedNorm
         } else {
             HcMixEntry::CombineNorm
@@ -189,8 +205,8 @@ pub fn layer_groups(model: &Qwen4ExpModelCfg) -> Vec<Qwen4ExpLayerGroup> {
             Qwen4ExpMixer::Qsa => "qsa",
         };
         let label = match (layer, ple) {
-            (_, Some(_)) => format!("{kind}_ple"),
-            (0, None) => format!("{kind}_first"),
+            (_, PleSlot::First | PleSlot::AfterCombine) => format!("{kind}_ple"),
+            (0, PleSlot::None) => format!("{kind}_first"),
             _ => kind.to_string(),
         };
         groups.push(Qwen4ExpLayerGroup {
@@ -378,7 +394,7 @@ pub fn build_configs(
             residency: DEVICE.to_string(),
             weight_dtype: ACTIVATION_DTYPE,
         },
-        // A strided copy priced at its output bytes (glue_map.md A3).
+        // `hidden.repeat` is a strided copy, priced at its output bytes.
         hidden_repeat: elementwise(STRIDED_COPY_BACKENDS, &gpu, streams * act, streams * act),
         hc_grouped: hc(HcMixEntry::GroupedNorm, true),
         hc_combine: hc(HcMixEntry::CombineNorm, true),
@@ -512,8 +528,7 @@ pub fn build_configs(
 /// take a stride each. A recurrent state keeps `1 + k` blocks (the running
 /// state and one per speculative token); L5 adds align mode's previous-step
 /// block to vLLM's concurrency estimate only, since a running request frees
-/// it the step after it crosses a block. For Flash-Next at FP8: a 3200-token
-/// block and a 43,929,600 B stride.
+/// it the step after it crosses a block.
 fn kv_cache_layout(
     model: &Qwen4ExpModelCfg,
     parallel: &Qwen4ExpVllmParallel,
@@ -781,13 +796,13 @@ impl LayerGroup {
         Ok(Self {
             label: group.label.clone(),
             layers: group.layers.clone(),
-            ple: group
-                .ple
-                .map(|pending| {
-                    let resolved = if pending { &r.ple } else { &r.ple_first };
-                    PleLocalWorklet::build(format!("{p}.ple"), resolved.clone(), bridge)
-                })
-                .transpose()?,
+            ple: match group.ple {
+                PleSlot::None => None,
+                PleSlot::First => Some(&r.ple_first),
+                PleSlot::AfterCombine => Some(&r.ple),
+            }
+            .map(|resolved| PleLocalWorklet::build(format!("{p}.ple"), resolved.clone(), bridge))
+            .transpose()?,
             attn_mix: HcMixLocalWorklet::build(
                 format!("{p}.attn_hc"),
                 match group.attn_entry {
@@ -856,10 +871,9 @@ impl LayerGroup {
     }
 }
 
-/// The 48 target layers plus their head and sampler: the forward pass every
-/// Qwen4Exp vLLM deployment runs, speculating or not. Its own struct so an
-/// ordinary (non-MTP) model can share it by composition.
-pub(crate) struct Qwen4ExpTargetForward {
+/// The target forward pass: every decoder layer, the final mixer, the MTP
+/// hidden copy, the head and the rejection sampler.
+struct Qwen4ExpTargetForward {
     embedding: Op<EmbeddingRowGatherKernel>,
     hidden_repeat: Op<ElementwiseKernel>,
     groups: Vec<LayerGroup>,
@@ -1060,7 +1074,7 @@ impl MtpPass {
 
 /// The MTP proposer: one pass over the target's whole scheduled batch, then
 /// one pass per further drafted position over the request endpoints, compiled
-/// once and folded `draft_tokens - 1` times (the capture's `REPEAT x2`).
+/// once and folded `draft_tokens - 1` times.
 struct MtpDraftStage {
     step_0: MtpPass,
     recurrent: Option<MtpPass>,
@@ -1289,7 +1303,7 @@ struct NormalizedBatch {
     /// Rows the target head scores: one per prefill request and every verify row.
     logits_rows: u32,
     /// The recurrent passes' shape: one row per request at its context
-    /// advanced by the mean drafted position of the folded passes.
+    /// advanced by the mean advance of the folded passes, rounded up.
     recurrent: Pass,
 }
 
@@ -1384,7 +1398,7 @@ fn normalize_speculative_input(
     }
     let request_count = group.request_count();
     // Recurrent pass i runs after i drafted positions; the fold bills one
-    // evaluation at the mean advance of passes 1..=draft_tokens-1.
+    // evaluation at the mean advance of passes 1..=draft_tokens-1, rounded up.
     let mean_advance = draft_tokens.div_ceil(2);
     let recurrent_contexts = endpoints
         .iter()
@@ -1498,7 +1512,7 @@ mod tests {
     #[test]
     fn layers_fold_one_one_thirty_four_twelve() {
         let groups = layer_groups(&model_cfg());
-        let summary: Vec<(String, usize, HcMixEntry, Option<bool>)> = groups
+        let summary: Vec<(String, usize, HcMixEntry, PleSlot)> = groups
             .into_iter()
             .map(|g| (g.label, g.layers.len(), g.attn_entry, g.ple))
             .collect();
@@ -1506,10 +1520,10 @@ mod tests {
         assert_eq!(
             summary,
             [
-                ("gdn_first".to_string(), 1, GroupedNorm, None),
-                ("gdn_ple".to_string(), 1, GroupedNorm, Some(true)),
-                ("gdn".to_string(), 34, CombineNorm, None),
-                ("qsa".to_string(), 12, CombineNorm, None),
+                ("gdn_first".to_string(), 1, GroupedNorm, PleSlot::None),
+                ("gdn_ple".to_string(), 1, GroupedNorm, PleSlot::AfterCombine),
+                ("gdn".to_string(), 34, CombineNorm, PleSlot::None),
+                ("qsa".to_string(), 12, CombineNorm, PleSlot::None),
             ]
         );
     }
