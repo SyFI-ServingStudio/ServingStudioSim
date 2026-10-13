@@ -1207,6 +1207,48 @@ def test_qwen38_prefill_work_goldens(qwen38):
     )
 
 
+def test_qwen38_floors_label_the_served_fp8_kv_cache_under_the_fp4_arch(qwen38, tmp_path):
+    """vLLM serves the checkpoint with `--kv-cache-dtype fp8`, which config.json does
+    not state: the arch fixes it, so the floors halve the GQA K/V bytes and run the
+    prefill attention math on FP8 queries and keys. GDN state keeps its own dtype."""
+    arch = "qwen35_vllm_nvfp4_gdn_dense"
+    raw = json.loads(QWEN38.read_text())
+    group = {
+        "gpu": "NVIDIA B200",
+        "arch": {"type": arch, "model_config": str(QWEN38), "fp8": False},
+    }
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw" / "params.json").write_text(
+        json.dumps({"pools": {"main": {"groups": [group]}}})
+    )
+    spec = work_floors._pool_specs(tmp_path)["main"]
+    assert spec["arch_quant_dtype"] == "fp4"
+    served = work_floors._model_for_spec(spec)
+    # The mixed scheme (NVFP4 MLPs + lm_head, FP8 projections) matches the FP4 arch
+    # without an `fp8` flag; an `fp8` flag would claim a uniformly FP8 model.
+    assert served.quant.compute_dtypes == {"fp4", "fp8"}
+    work_floors._check_precision(served, spec)
+    with pytest.raises(ValueError, match="declares fp4\\+fp8 quantized compute"):
+        work_floors._check_precision(served, {**spec, "arch_fp8": True, "arch_quant_dtype": "fp8"})
+    # The compute dtype alone needs no builder: the config states its layer_types.
+    assert parse_quantization_config(raw).compute_dtype == "fp4"
+
+    linear, full = (stack.attn for stack in served.layers)
+    assert linear == qwen38.layers[0].attn
+    assert (full.kv_dtype_bytes, full.prefill_compute_dtype) == (1.0, "fp8")
+    wl = Workload.causal_lm(prefill=[(512, 0)], decode=[4096], sampled=2)
+    rows = {segment.name: segment for segment in served.label(wl).segments}
+    base = {segment.name: segment for segment in qwen38.label(wl).segments}
+    kv_entry = 4 * (256 + 256)  # one token at one layer, FP8
+    assert rows["full.attn.decode"].bytes_total == 16 * 4095 * kv_entry
+    assert rows["full.kv_cache_append"].bytes_total == 16 * (512 + 1) * kv_entry
+    assert rows["full.attn.prefill"].compute_dtype == "fp8"
+    assert rows["full.attn.decode"].compute_dtype == "bf16"
+    for name in base:
+        if not name.startswith("full.attn") and name != "full.kv_cache_append":
+            assert rows[name] == base[name], name
+
+
 @pytest.fixture(scope="module")
 def qwen36_moe():
     return load_model(QWEN36_MOE)

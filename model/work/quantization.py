@@ -84,6 +84,15 @@ class QuantScheme:
     #: ``(prefix, scheme)`` pairs; DeepSeek-V4.1's MXFP4 routed experts.
     module_schemes: tuple[tuple[str, QuantScheme], ...] = ()
 
+    @property
+    def compute_dtypes(self) -> frozenset[str]:
+        """Every compute dtype a converted matmul runs at. A single-algorithm
+        scheme has one; a ModelOpt ``MIXED_PRECISION`` scheme has its headline
+        (lowest-precision) dtype plus each other algorithm's."""
+        return frozenset(
+            {self.compute_dtype, *(scheme.compute_dtype for _, scheme in self.module_schemes)}
+        )
+
     def scheme_for(self, module: str | None) -> QuantScheme:
         """The scheme a converted ``module`` is stored under."""
         if module is not None:
@@ -274,6 +283,14 @@ def _pack_shards(
     return packed
 
 
+def config_layer_types(raw_config: dict) -> list[str] | None:
+    """The per-decoder-layer type schedule a config states (``layer_types``, under
+    ``text_config`` for a VL wrapper), or None when it leaves the schedule implicit."""
+    text = raw_config.get("text_config", raw_config)
+    layer_types = text.get("layer_types") or raw_config.get("layer_types")
+    return list(layer_types) if layer_types else None
+
+
 def _mixed_precision_scheme(
     quant: dict, layer_types: list[str] | None, packed_modules: dict[str, tuple[str, ...]]
 ) -> QuantScheme:
@@ -283,8 +300,8 @@ def _mixed_precision_scheme(
     theirs in ``module_schemes``."""
     if layer_types is None:
         raise ValueError(
-            "ModelOpt MIXED_PRECISION names single layers; the model builder must pass "
-            "its layer schedule"
+            "ModelOpt MIXED_PRECISION names single layers; the config states no "
+            "layer_types, so the model builder must pass its layer schedule"
         )
     # An excluded module is left unquantized even if listed (vLLM checks it first).
     excluded = [
@@ -326,9 +343,12 @@ def parse_quantization_config(
     schedule does before replacing ``not_converted`` with its own per-layer reading.
 
     A ModelOpt ``MIXED_PRECISION`` config names every quantized Linear per layer, so
-    it needs the builder's ``layer_types`` (one entry per decoder layer) and the
-    ``packed_modules`` its fused matrices are built from (``{"qkv_proj": ("q_proj",
-    "k_proj", "v_proj")}``, vLLM's ``packed_modules_mapping``).
+    it needs the layer schedule (one entry per decoder layer): the builder's
+    ``layer_types``, else the config's own (:func:`config_layer_types`). A builder
+    also passes the ``packed_modules`` its fused matrices are built from
+    (``{"qkv_proj": ("q_proj", "k_proj", "v_proj")}``, vLLM's
+    ``packed_modules_mapping``); without them the scheme names the checkpoint's
+    shards, which is enough for the compute dtypes but not for a fused matrix's bytes.
 
     An unrecognized ``quant_method`` raises rather than silently falling back to
     the master dtype: a wrong precision here shows up as a "minimum" larger than
@@ -346,6 +366,8 @@ def parse_quantization_config(
         )
     if method == "modelopt":
         if quant.get("quant_algo") == "MIXED_PRECISION":
+            if layer_types is None:
+                layer_types = config_layer_types(raw_config)
             return _mixed_precision_scheme(quant, layer_types, packed_modules or {})
         if quant.get("quant_algo") != "NVFP4":
             raise ValueError(
