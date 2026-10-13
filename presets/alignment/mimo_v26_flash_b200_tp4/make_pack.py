@@ -54,6 +54,13 @@ MiMo's limits (TP4/EP4, gpu_memory_utilization 0.85, chunk 2048):
   So at S x (L - 1) every slot full at the context limit holds 100 x (4,096 + 45) = 414,100 blocks = 64% of the
   pool: no workload the server admits can fill it. That is why cases 14 and 15 pin a smaller pool.
 
+Cases 16-19 repeat the two chunk-sensitive operating points (case 04's prefill spectrum and case 07's quadrant
+mix) at chunk 4096 and 8192, so the matrix spans the scheduler token budget rather than one template value. The
+per-case `chunk_size` sets both vLLM's --max-num-batched-tokens and the simulated worker's max_batch_tokens. The
+capture list is unchanged: `capture_sizes(2048, chunk)` caps at the explicit 2048 ceiling and appends no chunk
+above it, so mixed steps above 2048 tokens run eagerly in every chunk case. A larger token budget enlarges vLLM's
+profile-run activation peak, so their KV pool is re-read from their own workload pass.
+
 Run from the repo root: uv run python presets/alignment/mimo_v26_flash_b200_tp4/make_pack.py
 """
 import math
@@ -330,6 +337,37 @@ CASES = [
 ]
 
 
+def prefill_spectrum_at(chunk: int) -> list[list[int]]:
+    """Case 04's prompt ladder with its chunk-relative rungs moved to `chunk`: 128 and 512 below one chunk, the
+    boundary straddle chunk - 64 / chunk / chunk + 64, then 2, 3 and 3.5 chunks (case 04: 4096, 6144, 7168)."""
+    return [[p, 64] for p in (128, 512, chunk - 64, chunk, chunk + 64, 2 * chunk, 3 * chunk, 7 * chunk // 2)]
+
+
+def quadrants_at(chunk: int) -> list[list[int]]:
+    """Case 07's four IO quadrants with the long prompts kept at 2 and 1.5 chunks (case 07: 4096 and 3072 at chunk
+    2048). Outputs stay case 07's 128 / 4096 / 3072: they set the decode step count, not the chunk shape."""
+    return [[128, 128], [128, 4096], [2 * chunk, 128], [3 * chunk // 2, 3072]]
+
+
+for index, chunk in ((16, 4096), (17, 8192)):
+    CASES.append(dict(
+        index=index, name=f"prefill_spectrum_chunk{chunk // 1024}k_c32", chunk_size=chunk, base=4,
+        purpose=f"Prefill scaling and the {chunk}-token chunk boundary.",
+        coverage=["prefill_scaling", "chunk_boundary", "chunk_size"], max_concurrency=32, capture_seconds=15.0,
+        workload_trace=dict(shapes=prefill_spectrum_at(chunk), repeats=16),
+        derivation=f"Case 04 at chunk {chunk}: the same c32 and 16 repeats, rungs moved to the new chunk boundary "
+                   f"({chunk - 64}/{chunk}/{chunk + 64}) and to 2/3/3.5 chunks. Steps reach {chunk} tokens, "
+                   f"{'inside' if chunk <= 4096 else 'above'} the TP4 fused all-reduce + RMSNorm cap of 4096."))
+for index, chunk in ((18, 4096), (19, 8192)):
+    CASES.append(dict(
+        index=index, name=f"quadrant_interference_chunk{chunk // 1024}k_c48", chunk_size=chunk, base=7,
+        purpose=f"All four IO quadrants sharing continuous batches at a {chunk}-token chunk.",
+        coverage=["io_quadrants", "continuous_batching", "chunk_size"], max_concurrency=48, capture_seconds=15.0,
+        workload_trace=dict(shapes=quadrants_at(chunk), repeats=24),
+        derivation=f"Case 07 at chunk {chunk}: same c48 and 24 repeats; the long prompts stay 2 and 1.5 chunks "
+                   f"({2 * chunk} and {3 * chunk // 2}), so mixed steps pair one full chunk with up to 47 decodes."))
+
+
 def trace_spec(case: dict, key: str) -> dict:
     spec = dict(case[key])
     stem = f"{case['index']:02d}_{case['name']}"
@@ -342,6 +380,15 @@ def kv_calibration(case: dict) -> dict:
         pinned = KV14
     elif case.get("variant") == "kv15":
         pinned = KV15
+    elif case.get("chunk_size", CHUNK) != CHUNK:
+        return {
+            "value": round(108.44 * GIB / 1e9, 4),
+            "status": "provisional",
+            "derived_from": "the chunk-2048 pool (108.44 GiB, case-01 workload pass, job 6360); a larger "
+                            "--max-num-batched-tokens raises vLLM's profile-run peak, so replace it with "
+                            "`Available KV cache memory` from this case's own workload pass",
+            "evidence": "",
+        }
     else:
         return {
             "value": round(108.44 * GIB / 1e9, 4),
@@ -377,13 +424,15 @@ for case in CASES:
         "device_role": "primary",
         "workload_trace": trace_spec(case, "workload_trace"),
     }
+    if "chunk_size" in case:
+        out["chunk_size"] = case["chunk_size"]
     if "kernel_trace" in case:
         out["kernel_trace"] = trace_spec(case, "kernel_trace")
     if "rate" in case:
         out["rate"] = case["rate"]
     out["attn_gpu_memory_gb"] = kv_calibration(case)
     out["provenance"] = {
-        "derived_from_pack": f"glm52_nvfp4_b200_tp8 case {case['index']:02d}",
+        "derived_from_pack": f"glm52_nvfp4_b200_tp8 case {case.get('base', case['index']):02d}",
         "derivation": case["derivation"],
     }
     for spec in (out["workload_trace"], out.get("kernel_trace")):
@@ -396,7 +445,8 @@ document = {
     "pack": "mimo_v26_flash_b200_tp4",
     "description": "MiMo-V2.6-Flash-RL on B200, TP4 attention / EP4 experts / DP1 under the vLLM fork 892da082, "
                    "served exactly as the validated fused all-reduce capture (job 6264). The fifteen operating "
-                   "points of glm52_nvfp4_b200_tp8 re-derived for MiMo's limits; see make_pack.py.",
+                   "points of glm52_nvfp4_b200_tp8 re-derived for MiMo's limits, plus cases 04 and 07 at chunk "
+                   "4096 and 8192; see make_pack.py.",
     "recorded_on": {
         "host": "b200_raid",
         "gpu": "NVIDIA B200",
