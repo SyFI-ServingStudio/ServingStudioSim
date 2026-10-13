@@ -71,6 +71,7 @@ pub mod vllm_glm52_dense_ffn_local;
 pub mod vllm_glm52_dsa_attn_local;
 pub mod vllm_glm52_shared_expert_local;
 pub mod vllm_nvfp4_swiglu_mlp_local;
+pub mod vllm_qsa_attn_local;
 pub mod vllm_qwen35_gated_gqa_local;
 pub mod vllm_qwen35_gdn_local;
 
