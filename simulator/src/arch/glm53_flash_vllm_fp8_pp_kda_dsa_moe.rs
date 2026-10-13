@@ -47,13 +47,12 @@
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
-use crate::arch::cudagraph::graph_padded_tokens;
 use crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::{eval_compiled, pp_indices};
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
-    self as flash, atomic, build_layer_group, hybrid_block_tokens, hybrid_kv_cache_layout,
-    kda_layer_state_bytes_per_request, normalize_input, push, Glm53FlashModelCfg,
-    Glm53FlashVllmConfigs, Glm53FlashVllmParallel, Glm53FlashVllmResolved, LayerGroup,
-    NormalizedBatch, ACTIVATION_DTYPE, MHC_BACKENDS,
+    self as flash, atomic, build_layer_group, graph_padded_tokens, hybrid_block_tokens,
+    hybrid_kv_cache_layout, kda_layer_state_bytes_per_request, normalize_input, push,
+    Glm53FlashModelCfg, Glm53FlashVllmConfigs, Glm53FlashVllmParallel, Glm53FlashVllmResolved,
+    LayerGroup, NormalizedBatch, ACTIVATION_DTYPE, MHC_BACKENDS,
 };
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::op::mhc::{MhcTerminalPostConfig, MhcTerminalPostInput, MhcTerminalPostOp};

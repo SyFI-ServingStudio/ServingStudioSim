@@ -1457,7 +1457,6 @@ pub fn inkling_vllm_nvfp4_rel_attn_moe(
     expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
-    max_num_seqs: u32,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1501,7 +1500,6 @@ pub fn inkling_vllm_nvfp4_rel_attn_moe(
         max_model_len,
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
-        max_num_seqs,
     };
     let configs = inkling_vllm_nvfp4_rel_attn_moe::build_configs(&model_cfg, &parallel, &demand)
         .context("expanding Inkling architecture configs")?;
@@ -1526,7 +1524,6 @@ pub fn mimo_v2_vllm_fp8_swa_moe(
     expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
-    max_num_seqs: u32,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1560,7 +1557,6 @@ pub fn mimo_v2_vllm_fp8_swa_moe(
         max_model_len,
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
-        max_num_seqs,
     };
     let configs = mimo_v2_vllm_fp8_swa_moe::build_configs(&model_cfg, &parallel, &demand)
         .context("expanding MiMo-V2 architecture configs")?;
@@ -2345,7 +2341,6 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
-            max_num_seqs,
         } => Box::new(inkling_vllm_nvfp4_rel_attn_moe(
             model,
             *tp_size,
@@ -2356,7 +2351,6 @@ pub fn build_iter_model(
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
-            *max_num_seqs,
             gpu,
             name,
             bridge,
@@ -2370,7 +2364,6 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
-            max_num_seqs,
         } => Box::new(mimo_v2_vllm_fp8_swa_moe(
             model,
             *tp_size,
@@ -2380,7 +2373,6 @@ pub fn build_iter_model(
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
-            *max_num_seqs,
             gpu,
             name,
             bridge,

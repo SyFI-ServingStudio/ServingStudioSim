@@ -119,12 +119,6 @@ const fn default_mimo_v2_max_model_len() -> u32 {
     131_072
 }
 
-/// vLLM's `--max-num-seqs` default for an OpenAI server on a GPU of at least
-/// 160 GiB (B200, B300; `EngineArgs.get_batch_defaults`).
-const fn default_vllm_max_num_seqs() -> u32 {
-    1024
-}
-
 /// The captured GLM-5.3-Flash deployment ran `--enable-expert-parallel`.
 const fn default_glm53_flash_enable_expert_parallel() -> bool {
     true
@@ -1049,18 +1043,11 @@ pub enum IterArchSel {
         token_corpus_file: Option<String>,
         /// vLLM `--cudagraph-capture-sizes`. Every kernel but attention runs
         /// on the token count padded up to the next captured size; attention
-        /// on a FULL-graph decode step runs at the padded request count (see
-        /// `max_num_seqs`). The sizes also decide whether the sink experts
-        /// overlap the routed call (FULL-graph decode or eager steps only).
-        /// Empty: no padding (eager).
+        /// on a uniform-decode step runs at the padded request count. The
+        /// sizes also decide whether the sink experts overlap the routed call
+        /// (FULL-graph decode or eager steps only). Empty: no padding (eager).
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
-        /// vLLM `--max-num-seqs`. A uniform-decode step replays a FULL CUDA
-        /// graph only up to the largest capture size within it; a larger one
-        /// pads to the next size and replays PIECEWISE.
-        #[serde(default = "default_vllm_max_num_seqs")]
-        #[param(default = 1024, cache_key)]
-        max_num_seqs: u32,
     },
     /// MiMo-V2's FP8 checkpoints (`XiaomiMiMo/MiMo-V2.6-Flash-RL`) under
     /// vLLM's TP group: TP attention over global and sliding-window layers
@@ -1098,17 +1085,11 @@ pub enum IterArchSel {
         token_corpus_file: Option<String>,
         /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). Every kernel
         /// but attention runs on the token count padded up to the next
-        /// captured size; attention on a FULL-graph decode step runs at the
-        /// padded request count (see `max_num_seqs`). Empty: no padding
-        /// (eager).
+        /// captured size; attention on a uniform-decode step runs at the
+        /// padded request count, and its FA4 config takes the largest size as
+        /// the FULL-graph decode bound. Empty: no padding (eager).
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
-        /// vLLM `--max-num-seqs`. A uniform-decode step replays a FULL CUDA
-        /// graph only up to the largest capture size within it; a larger one
-        /// pads to the next size and replays PIECEWISE.
-        #[serde(default = "default_vllm_max_num_seqs")]
-        #[param(default = 1024, cache_key)]
-        max_num_seqs: u32,
     },
 }
 

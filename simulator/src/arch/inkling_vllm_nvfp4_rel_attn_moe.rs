@@ -43,10 +43,9 @@
 use anyhow::Result;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
-use crate::arch::cudagraph::{
-    full_decode_graph_max_tokens, graph_padded_tokens, sorted_capture_sizes,
+use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
+    graph_padded_tokens, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
 };
-use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD;
 use crate::arch::inkling_model_cfg::{InklingExpertPrecision, InklingModelCfg};
 use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
@@ -130,8 +129,6 @@ pub struct InklingVllmParallel {
     pub gpu_name: String,
     /// vLLM `--cudagraph-capture-sizes`; empty runs eager (no padding).
     pub cudagraph_capture_sizes: Vec<u32>,
-    /// vLLM `--max-num-seqs`: bounds the FULL-graph decode steps.
-    pub max_num_seqs: u32,
 }
 
 /// The routed demand for each expert precision's layers, each folded over
@@ -656,19 +653,12 @@ impl LayerGroup {
         }
     }
 
-    fn eval(
-        &self,
-        batch: &NormalizedBatch,
-        tokens: u32,
-        full_decode_max: u32,
-        sinks_overlap: bool,
-        ev: &mut Evaluator,
-    ) {
+    fn eval(&self, batch: &NormalizedBatch, tokens: u32, sinks_overlap: bool, ev: &mut Evaluator) {
         self.attn.eval(
             &InklingAttnLocalWorkletInput {
                 num_tokens: tokens,
                 query_context_pairs: batch.query_context_pairs.clone(),
-                padded_requests: attention_padded_requests(batch, tokens, full_decode_max),
+                padded_requests: attention_padded_requests(batch, tokens),
             },
             ev,
         );
@@ -794,8 +784,6 @@ pub struct InklingVllmModel {
     pub max_model_len: u32,
     /// Sorted, deduplicated capture sizes.
     cudagraph_capture_sizes: Vec<u32>,
-    /// Largest uniform-decode step that replays a FULL graph.
-    full_decode_graph_max: u32,
     embed: Op<ElementwiseKernel>,
     /// `None` without global layers, which alone read tau.
     log_scaling_tau: Option<Op<ElementwiseKernel>>,
@@ -849,11 +837,12 @@ pub fn build(
         tp_size: cfg.parallel.tp_size,
         enable_expert_parallel: cfg.parallel.enable_expert_parallel,
         max_model_len: cfg.parallel.max_model_len,
-        cudagraph_capture_sizes: sorted_capture_sizes(&cfg.parallel.cudagraph_capture_sizes),
-        full_decode_graph_max: full_decode_graph_max_tokens(
-            &sorted_capture_sizes(&cfg.parallel.cudagraph_capture_sizes),
-            cfg.parallel.max_num_seqs,
-        ),
+        cudagraph_capture_sizes: {
+            let mut sizes = cfg.parallel.cudagraph_capture_sizes.clone();
+            sizes.sort_unstable();
+            sizes.dedup();
+            sizes
+        },
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -943,19 +932,14 @@ impl InklingVllmModel {
         let batch = normalize_input(input, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid InklingVllmModel input: {reason}"));
         let tokens = graph_padded_tokens(&self.cudagraph_capture_sizes, batch.total_tokens);
-        let sinks_overlap = sinks_on_aux_stream(
-            &batch,
-            tokens,
-            &self.cudagraph_capture_sizes,
-            self.full_decode_graph_max,
-        );
+        let sinks_overlap = sinks_on_aux_stream(&batch, tokens, &self.cudagraph_capture_sizes);
         let rows = ElementwiseKernelInput { num_tokens: tokens };
         push_or_zero(&self.embed, rows.clone(), false, ev);
         if let Some(op) = &self.log_scaling_tau {
             push_or_zero(op, rows, false, ev);
         }
         for group in &self.groups {
-            group.eval(&batch, tokens, self.full_decode_graph_max, sinks_overlap, ev);
+            group.eval(&batch, tokens, sinks_overlap, ev);
         }
         let logits = batch.request_count;
         push_or_zero(&self.lm_head, SingleGemmKernelInput { m: logits }, false, ev);
@@ -1057,35 +1041,24 @@ impl IterwiseUnifiedModel for InklingVllmModel {
 /// capture is active. Inkling auto-enables breakable graphs
 /// (`DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES`, vllm/config/vllm.py) and the
 /// model runner wraps only PIECEWISE dispatch in them; FULL graphs are captured
-/// normally. Under FULL_AND_PIECEWISE a uniform-decode step within
-/// `full_decode_max` replays a FULL graph (sinks on the aux stream), any other
-/// step within the largest captured size replays a breakable piecewise graph
-/// captured with the sinks inline, and a step above it runs eagerly (aux
-/// stream again).
-fn sinks_on_aux_stream(
-    batch: &NormalizedBatch,
-    padded_tokens: u32,
-    capture_sizes: &[u32],
-    full_decode_max: u32,
-) -> bool {
+/// normally. Under FULL_AND_PIECEWISE a uniform-decode step replays a FULL
+/// graph (sinks on the aux stream), any step with a prefill chunk replays a
+/// breakable piecewise graph captured with the sinks inline, and a step above
+/// the largest captured size runs eagerly (aux stream again).
+fn sinks_on_aux_stream(batch: &NormalizedBatch, padded_tokens: u32, capture_sizes: &[u32]) -> bool {
     let eager = capture_sizes.last().is_none_or(|&largest| batch.total_tokens > largest);
-    let full_graph = batch.is_uniform_decode() && padded_tokens <= full_decode_max;
-    padded_tokens <= SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD && (full_graph || eager)
+    padded_tokens <= SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD && (batch.is_uniform_decode() || eager)
 }
 
 /// The request count attention is launched over. A uniform-decode step that
-/// pads to a size with a FULL graph (at most `full_decode_max`) replays it,
-/// and the model runner pads its attention metadata to the capture size with
-/// zero-length requests (`pad_attn`, `num_reqs_padded` in gpu_model_runner.py);
-/// the fork's FA4 split count follows that size. Every other step (a prefill
-/// chunk, or a decode past the FULL bound: piecewise or eager) runs attention
-/// over the real requests (0).
-fn attention_padded_requests(
-    batch: &NormalizedBatch,
-    padded_tokens: u32,
-    full_decode_max: u32,
-) -> u32 {
-    if batch.is_uniform_decode() && padded_tokens <= full_decode_max {
+/// fits a captured size replays a FULL graph, whose attention metadata the
+/// model runner pads to the capture size with zero-length requests
+/// (`pad_attn`, `num_reqs_padded` in gpu_model_runner.py); the fork's FA4 split
+/// count follows that size. Steps with a prefill chunk replay a piecewise
+/// graph over the real requests (0), and a step past the largest size runs
+/// eagerly (`padded_tokens` is then the real count); both mean unpadded.
+fn attention_padded_requests(batch: &NormalizedBatch, padded_tokens: u32) -> u32 {
+    if batch.is_uniform_decode() {
         padded_tokens
     } else {
         0
@@ -1204,7 +1177,6 @@ mod tests {
             max_model_len: 8192,
             gpu_name: "NVIDIA B200".into(),
             cudagraph_capture_sizes: vec![1, 2, 4, 8, 16, 24, 32],
-            max_num_seqs: 1024,
         }
     }
 
@@ -1428,16 +1400,7 @@ mod tests {
     }
 
     fn sinks_overlap(batch: &NormalizedBatch, sizes: &[u32]) -> bool {
-        sinks_overlap_at(batch, sizes, 1024)
-    }
-
-    fn sinks_overlap_at(batch: &NormalizedBatch, sizes: &[u32], max_num_seqs: u32) -> bool {
-        sinks_on_aux_stream(
-            batch,
-            graph_padded_tokens(sizes, batch.total_tokens),
-            sizes,
-            full_decode_graph_max_tokens(sizes, max_num_seqs),
-        )
+        sinks_on_aux_stream(batch, graph_padded_tokens(sizes, batch.total_tokens), sizes)
     }
 
     #[test]
@@ -1459,10 +1422,6 @@ mod tests {
         // A step above the largest captured size runs eagerly: the aux stream
         // is back while it stays within the threshold.
         assert!(sinks_overlap(&step(vec![(0, 40)], vec![]), &[1, 2, 4, 8, 16, 32]));
-        // A decode past the FULL bound (the largest size within max_num_seqs)
-        // replays a breakable piecewise graph: sinks inline.
-        assert!(sinks_overlap_at(&step(vec![], vec![300; 24]), &sizes, 24));
-        assert!(!sinks_overlap_at(&step(vec![], vec![300; 25]), &sizes, 24));
     }
 
     #[test]
@@ -1470,22 +1429,17 @@ mod tests {
         // Defect caught: FA4's split count taken from the real decode count
         // when the FULL graph pads seq_lens to the capture size.
         let sizes = parallel().cudagraph_capture_sizes;
-        let padded_at = |max_num_seqs: u32, batch: NormalizedBatch| {
+        let padded = |batch: NormalizedBatch| {
             let tokens = graph_padded_tokens(&sizes, batch.total_tokens);
-            let full_decode_max = full_decode_graph_max_tokens(&sizes, max_num_seqs);
-            attention_padded_requests(&batch, tokens, full_decode_max)
+            attention_padded_requests(&batch, tokens)
         };
-        let padded = |batch| padded_at(1024, batch);
         assert_eq!(padded(step(vec![], vec![400; 9])), 16);
         assert_eq!(padded(step(vec![], vec![400; 8])), 8);
         assert_eq!(padded(step(vec![], vec![400; 3])), 4);
         // A prefill chunk runs piecewise over the real requests.
         assert_eq!(padded(step(vec![(0, 50)], vec![400; 7])), 0);
         // Past the largest captured size the step runs eagerly, unpadded.
-        assert_eq!(padded(step(vec![], vec![400; 33])), 0);
-        // A decode padding past max_num_seqs replays PIECEWISE, unpadded.
-        assert_eq!(padded_at(20, step(vec![], vec![400; 17])), 0);
-        assert_eq!(padded_at(20, step(vec![], vec![400; 15])), 16);
+        assert_eq!(padded(step(vec![], vec![400; 33])), 33);
     }
 
     #[test]
