@@ -53,7 +53,7 @@ DOC = KernelDoc(
         "fuses in. Models use it wherever a tensor is normalized alone, for "
         "example before the attention projections. The input has m token rows "
         "of hidden features; input and weight are random normal. ε is 1e-6 "
-        "for flashinfer and 1e-5 for vllm_cuda."
+        "for flashinfer and vllm_gemma_native, 1e-5 for vllm_cuda."
     ),
     category="Normalization",
     subcategory="RMSNorm",
@@ -62,12 +62,15 @@ DOC = KernelDoc(
         "flashinfer: TFLOPS = 5·m·hidden / time; GB/s = 2·m·hidden·bytes per element / time",
         "vllm_cuda: TFLOPS = (4·m·hidden + 2·m) / time; "
         "GB/s = (2·m·hidden + hidden)·bytes per element / time",
+        "vllm_gemma_native: y = x / √(mean(x²) + ε) · (1 + weight); same TFLOPS and GB/s "
+        "counts as vllm_cuda",
     ),
     default_metric="memory_bandwidth_gbps",
     method=(
-        f"{CUPTI_METHOD} Only the norm kernel is counted: RMSNormKernel for "
-        "flashinfer, rms_norm_kernel for vllm_cuda. vllm_cuda checks one output "
-        "against a PyTorch RMSNorm before timing."
+        f"{CUPTI_METHOD} flashinfer and vllm_cuda count only their norm kernel "
+        "(RMSNormKernel, rms_norm_kernel); vllm_gemma_native counts every eager launch "
+        "of the call. vllm_cuda and vllm_gemma_native check one output against a "
+        "PyTorch RMSNorm before timing."
     ),
     caveats=(
         "The backends count work differently: flashinfer's GB/s leaves out the "
@@ -124,6 +127,35 @@ register(
                 "vLLM's rms_norm CUDA op, as RMSNorm.forward_cuda launches it without a residual."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/layernorm_kernels.cu",
+        ),
+    )
+)
+
+# vLLM's GemmaRMSNorm (``x · (1 + w)``) without Inductor: forward_cuda falls back to
+# forward_native, whose fp32 ``1 + weight`` makes the vllm_c and oink ``rms_norm``
+# providers decline, so the native PyTorch body runs as about ten eager launches.
+# Only the stored weight's meaning differs from the other backends.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_gemma_native",
+        # Eager PyTorch elementwise and reduction kernels: no capability rule.
+        supports=BackendSupport(compute=frozenset({DType.BF16})),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.norm.rms_norm_vllm_gemma_native",
+            function_name="profile_rms_norm_vllm_gemma_native",
+        ),
+        table_name=KIND,
+        args_schema=RmsNormArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's GemmaRMSNorm.forward_native run eagerly: the vllm.ir rms_norm "
+                "native implementation with an fp32 1 + weight."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/layernorm.py",
         ),
     )
 )

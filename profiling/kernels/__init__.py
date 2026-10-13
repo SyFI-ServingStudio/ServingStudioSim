@@ -49,6 +49,10 @@ from profiling.kernels import (
     gdn_recurrent_decode,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
     grouped_gemm,  # noqa: F401
+    grouped_rms_norm,  # noqa: F401
+    hc_combine,  # noqa: F401
+    hc_combine_norm,  # noqa: F401
+    hc_gate_mix,  # noqa: F401
     indexed_row_copy,  # noqa: F401
     inv_rope_fp8_quant,  # noqa: F401
     kda_chunk_prefill,  # noqa: F401
@@ -90,6 +94,7 @@ from profiling.kernels import (
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
     rs_sconv_ag_residual_rms_norm,  # noqa: F401
+    scaled_silu,  # noqa: F401
     sconv_qkvr_prep,  # noqa: F401
     silu_and_mul,  # noqa: F401
     single_gemm,  # noqa: F401

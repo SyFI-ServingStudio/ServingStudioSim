@@ -41,6 +41,10 @@ pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod grouped_rms_norm;
+pub mod hc_combine;
+pub mod hc_combine_norm;
+pub mod hc_gate_mix;
 pub mod indexed_row_copy;
 pub mod inv_rope_fp8_quant;
 pub mod kda_chunk_prefill;
@@ -82,6 +86,7 @@ pub mod rel_bias_attention;
 pub mod residual_rms_norm;
 pub mod rms_norm;
 pub mod rs_sconv_ag_residual_rms_norm;
+pub mod scaled_silu;
 pub mod sconv_qkvr_prep;
 pub mod silu_and_mul;
 pub mod single_gemm;
@@ -230,6 +235,12 @@ pub use gemm_fp32_output::{
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
 };
+pub use grouped_rms_norm::{
+    GroupedRmsNormKernel, GroupedRmsNormKernelConfig, GroupedRmsNormKernelInput, GroupedRmsNormSpec,
+};
+pub use hc_combine::{HcCombineKernel, HcCombineSpec};
+pub use hc_combine_norm::{HcCombineNormKernel, HcCombineNormSpec};
+pub use hc_gate_mix::{HcGateMixKernel, HcGateMixSpec};
 pub use indexed_row_copy::{
     IndexedRowCopyKernel, IndexedRowCopyKernelConfig, IndexedRowCopyKernelInput,
     IndexedRowCopySpec,
@@ -365,6 +376,9 @@ pub use rms_norm::{RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, RmsNo
 pub use rs_sconv_ag_residual_rms_norm::{
     RsSconvAgResidualRmsNormKernel, RsSconvAgResidualRmsNormKernelConfig,
     RsSconvAgResidualRmsNormKernelInput, RsSconvAgResidualRmsNormSpec,
+};
+pub use scaled_silu::{
+    ScaledSiluKernel, ScaledSiluKernelConfig, ScaledSiluKernelInput, ScaledSiluSpec,
 };
 pub use sconv_qkvr_prep::{
     SconvQkvrPrepKernel, SconvQkvrPrepKernelConfig, SconvQkvrPrepKernelInput, SconvQkvrPrepSpec,
