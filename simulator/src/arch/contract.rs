@@ -240,9 +240,11 @@ impl SpeculativeDecodeInput {
 
     /// Validate this row against the verify width and the model limit, and
     /// return whether it is a clipped boundary row (fewer than
-    /// `draft_tokens + 1` queries). A full-width row may end at
-    /// `max_model_len`; a clipped one must end exactly at `max_model_len - 1`,
-    /// the only place [`Self::verify_query_len`] produces it.
+    /// `draft_tokens + 1` queries). A clipped row must end exactly at
+    /// `max_model_len - 1`, the only place [`Self::verify_query_len`] produces
+    /// it. A full-width row may end anywhere up to `max_model_len`, although
+    /// [`Self::verify_query_len`] never ends one past `max_model_len - 1`: that
+    /// slack is accepted for callers that do not clip (offline cases).
     pub fn check_verify_row(&self, draft_tokens: u32, max_model_len: u32) -> Result<bool, String> {
         let width = draft_tokens + 1;
         if !(1..=width).contains(&self.query_len) {
@@ -414,14 +416,16 @@ pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
         0
     }
 
-    /// Whether the drafter's prefix lookup prunes the last matching block, as
-    /// vLLM does for a drafter that reads target hidden states
-    /// (`SpeculativeConfig.use_eagle_block_drop`: EAGLE, MTP, DFlash). Under
+    /// Whether the drafter's prefix lookup prunes the last matching block
+    /// (`SpeculativeConfig.use_eagle_block_drop`). Every drafter modelled here
+    /// reads target hidden states (vLLM `use_eagle()`: EAGLE, MTP, DFlash);
+    /// return false only for a drafter outside that set (ngram, suffix). Under
     /// checkpoint-aligned chunking the engine then caches a prompt's recurrent
     /// state one block before its last whole block, which moves where a chunk
-    /// must stop. Inert for a layout without resumable recurrent state.
+    /// must stop. Only the chunk-end stop reads this; prefix-hit lengths do not
+    /// yet drop the block. Inert for a layout without resumable recurrent state.
     fn prunes_last_prefix_block(&self) -> bool {
-        false
+        true
     }
 }
 
