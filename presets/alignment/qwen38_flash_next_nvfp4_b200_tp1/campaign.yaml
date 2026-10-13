@@ -1232,14 +1232,14 @@ cases:
       - 64
     repeats: 256
   speculative_acceptance:
-    value: &id002
-    - 0.7322
-    - 0.6677
-    - 0.6862
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.6655
+    - 0.5804
+    - 0.5649
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6637: 13185/19811, 7653/13185,
+      4323/7653)'
+    evidence: logs/20261013_2_qf_cases/01_micro_throughput_c256/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1293,11 +1293,14 @@ cases:
       - 64
     repeats: 48
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.6569
+    - 0.5743
+    - 0.5628
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6638: 7635/11622, 4385/7635,
+      2468/4385)'
+    evidence: logs/20261013_2_qf_cases/02_graph_boundaries_c128/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1343,11 +1346,14 @@ cases:
       - 256
     repeats: 16
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.7266
+    - 0.6605
+    - 0.6581
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6639: 7081/9745, 4677/7081,
+      3078/4677)'
+    evidence: logs/20261013_2_qf_cases/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1393,11 +1399,14 @@ cases:
       - 64
     repeats: 16
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.707
+    - 0.6278
+    - 0.6061
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6640: 2394/3386, 1503/2394,
+      911/1503)'
+    evidence: logs/20261013_2_qf_cases/04_prefill_spectrum_c32/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1443,11 +1452,14 @@ cases:
       - 4096
     repeats: 16
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.8114
+    - 0.7858
+    - 0.7961
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6641: 61337/75598, 48197/61337,
+      38370/48197)'
+    evidence: logs/20261013_2_qf_cases/05_decode_spectrum_c64/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1487,11 +1499,14 @@ cases:
       - 1920
     repeats: 7
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.8974
+    - 0.885
+    - 0.8923
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6685: 29566/32948, 26165/29566,
+      23346/26165)'
+    evidence: logs/20261013_2_qf_cases/06_long_long_c8/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1530,11 +1545,14 @@ cases:
       - 3072
     repeats: 24
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.8569
+    - 0.8363
+    - 0.8457
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6643: 48023/56043, 40162/48023,
+      33965/40162)'
+    evidence: logs/20261013_2_qf_cases/07_quadrant_interference_c48/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1576,11 +1594,14 @@ cases:
       - 4096
     repeats: 32
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.8294
+    - 0.8113
+    - 0.8208
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6644: 47409/57158, 38465/47409,
+      31573/38465)'
+    evidence: logs/20261013_2_qf_cases/08_completion_churn_c96/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1606,7 +1627,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/09_rate_knee.csv
-    shapes: &id003
+    shapes: &id002
     - - 128
       - 128
     - - 128
@@ -1625,17 +1646,21 @@ cases:
       - 4096
     repeats: 64
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.8549
+    - 0.8363
+    - 0.8457
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6695: 229456/268416, 191905/229456,
+      162293/191905)'
+    evidence: logs/20261013_2_qf_cases/09_rate_knee/profile_workload/spec_decode_metrics.json
   rate:
-    value: 1.0
-    status: provisional
-    derived_from: placeholder until case 10's workload pass gives the saturated request rate; the knee is 0.8 x
-      that rate
-    evidence: ''
+    value: 2.7
+    status: measured
+    derived_from: 'queueing knee = 0.8 x the case-10 saturated request rate on the same shapes: 512 requests over
+      a 151.75 s client run = 3.374 req/s (req-frontend summary request_throughput_per_s, Slurm job 6646, this pack''s
+      serving config)'
+    evidence: logs/20261013_2_qf_cases/10_full_saturation_rate/profile_workload
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1662,14 +1687,17 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/10_full_saturation_rate.csv
-    shapes: *id003
+    shapes: *id002
     repeats: 64
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.8573
+    - 0.8418
+    - 0.8514
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6646: 228742/266805, 192561/228742,
+      163953/192561)'
+    evidence: logs/20261013_2_qf_cases/10_full_saturation_rate/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1720,11 +1748,14 @@ cases:
     repeats: 2
     id_suffix: full
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.7704
+    - 0.6286
+    - 0.5649
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6647: 245/318, 154/245,
+      87/154)'
+    evidence: logs/20261013_2_qf_cases/11_long_prefill_ladder_c1/profile_workload/spec_decode_metrics.json
   kernel_trace:
     file: traces/11_long_prefill_ladder_c1.nsys.csv
     shapes:
@@ -1804,11 +1835,14 @@ cases:
     repeats: 1
     id_suffix: full
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.8762
+    - 0.8686
+    - 0.8843
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6648: 7115/8120, 6180/7115,
+      5465/6180)'
+    evidence: logs/20261013_2_qf_cases/12_ultra_context_decode_c1/profile_workload/spec_decode_metrics.json
   kernel_trace:
     file: traces/12_ultra_context_decode_c1.nsys.csv
     shapes:
@@ -1897,11 +1931,14 @@ cases:
     repeats: 1
     id_suffix: full
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.937
+    - 0.9385
+    - 0.948
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6649: 94639/100999, 88815/94639,
+      84197/88815)'
+    evidence: logs/20261013_2_qf_cases/13_generation_length_matrix_c8/profile_workload/spec_decode_metrics.json
   kernel_trace:
     file: traces/13_generation_length_matrix_c8.nsys.csv
     shapes:
@@ -1964,11 +2001,14 @@ cases:
     repeats: 32
     id_suffix: full
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.9037
+    - 0.8908
+    - 0.8951
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6651: 293614/324913, 261538/293614,
+      234113/261538)'
+    evidence: logs/20261013_2_qf_cases/14_near_full_long_decode_c64/profile_workload/spec_decode_metrics.json
   kernel_trace:
     file: traces/14_near_full_long_decode_c64.nsys.csv
     shapes:
@@ -2104,10 +2144,10 @@ cases:
     id_suffix: nsys
   attn_gpu_memory_gb:
     value: 68.7214
-    status: provisional
-    derived_from: --kv-cache-memory-bytes 68721423356 of this case's variant pins the KV pool to 1564 blocks; confirm
-      the block count in its workload pass
-    evidence: ''
+    status: measured
+    derived_from: --kv-cache-memory-bytes 68721423356 of this case's variant pins the KV pool to 1564 blocks; the
+      workload pass logs `Maximum concurrency ... 25.23x` x 62 = 1564 blocks (Slurm job 6651)
+    evidence: logs/20261013_2_qf_cases/14_near_full_long_decode_c64/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 14
     derivation: 'GLM''s 91.4% = c x mean terminal blocks / pool, on GLM''s shapes. Their mean holds 22.33 blocks
@@ -2146,11 +2186,14 @@ cases:
     repeats: 12
     id_suffix: full
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.9573
+    - 0.9459
+    - 0.9397
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6652: 221737/231632, 209730/221737,
+      197083/209730)'
+    evidence: logs/20261013_2_qf_cases/15_kv_overcommit_mixed_churn_c32/profile_workload/spec_decode_metrics.json
   kernel_trace:
     file: traces/15_kv_overcommit_mixed_churn_c32.nsys.csv
     shapes:
@@ -2222,10 +2265,10 @@ cases:
     id_suffix: nsys
   attn_gpu_memory_gb:
     value: 38.0516
-    status: provisional
-    derived_from: --kv-cache-memory-bytes 38051632114 of this case's variant pins the KV pool to 866 blocks; confirm
-      the block count in its workload pass
-    evidence: ''
+    status: measured
+    derived_from: --kv-cache-memory-bytes 38051632114 of this case's variant pins the KV pool to 866 blocks; the
+      workload pass logs `Maximum concurrency ... 13.97x` x 62 = 866 blocks (Slurm job 6652)
+    evidence: logs/20261013_2_qf_cases/15_kv_overcommit_mixed_churn_c32/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 15
     derivation: 'As case 14 at GLM''s 122.6%: 32 x 33.17 blocks / 1.226 = 866 blocks = 38051632114 B (35.44 GiB).
@@ -2267,11 +2310,14 @@ cases:
     repeats: 16
   chunk_size: 4096
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.7111
+    - 0.6481
+    - 0.6159
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6623: 2370/3333, 1536/2370,
+      946/1536)'
+    evidence: logs/20261013_2_qf_cases/16_prefill_spectrum_chunk4k_c32/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 83.5801
     status: measured
@@ -2320,11 +2366,14 @@ cases:
     repeats: 16
   chunk_size: 8192
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.7303
+    - 0.6443
+    - 0.6217
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6624: 2404/3292, 1549/2404,
+      963/1549)'
+    evidence: logs/20261013_2_qf_cases/17_prefill_spectrum_chunk8k_c32/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 79.1992
     status: measured
@@ -2365,11 +2414,14 @@ cases:
     repeats: 24
   chunk_size: 4096
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.8429
+    - 0.8226
+    - 0.829
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6653: 48280/57277, 39715/48280,
+      32924/39715)'
+    evidence: logs/20261013_2_qf_cases/18_quadrant_interference_chunk4k_c48/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 83.5801
     status: measured
@@ -2409,11 +2461,14 @@ cases:
     repeats: 24
   chunk_size: 8192
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.8725
+    - 0.8495
+    - 0.8583
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6654: 47842/54833, 40642/47842,
+      34881/40642)'
+    evidence: logs/20261013_2_qf_cases/19_quadrant_interference_chunk8k_c48/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 79.1992
     status: measured
@@ -2441,15 +2496,18 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/20_full_saturation_chunk8k.csv
-    shapes: *id003
+    shapes: *id002
     repeats: 64
   chunk_size: 8192
   speculative_acceptance:
-    value: *id002
-    status: provisional
-    derived_from: conditional accepted-token ratios of the smoke's warm workload pass (24 enwik9 requests, c8; per
-      position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
-    evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
+    value:
+    - 0.8511
+    - 0.8344
+    - 0.8417
+    status: measured
+    derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6655: 229565/269730, 191544/229565,
+      161232/191544)'
+    evidence: logs/20261013_2_qf_cases/20_full_saturation_chunk8k/profile_workload/spec_decode_metrics.json
   attn_gpu_memory_gb:
     value: 79.1992
     status: measured

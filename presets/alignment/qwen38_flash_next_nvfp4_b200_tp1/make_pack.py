@@ -99,6 +99,51 @@ PROVISIONAL_ACCEPTANCE = (
     "logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json",
 )
 
+# Conditional MTP acceptance per draft position (position 0 / drafts, then i / i-1) measured by each case's own
+# workload pass: case -> (ratios, Slurm job and counts, evidence).
+MEASURED_ACCEPTANCE: dict[int, tuple[list[float], str, str]] = {
+    1: ([0.6655, 0.5804, 0.5649], "job 6637: 13185/19811, 7653/13185, 4323/7653",
+        "logs/20261013_2_qf_cases/01_micro_throughput_c256/profile_workload/spec_decode_metrics.json"),
+    2: ([0.6569, 0.5743, 0.5628], "job 6638: 7635/11622, 4385/7635, 2468/4385",
+        "logs/20261013_2_qf_cases/02_graph_boundaries_c128/profile_workload/spec_decode_metrics.json"),
+    3: ([0.7266, 0.6605, 0.6581], "job 6639: 7081/9745, 4677/7081, 3078/4677",
+        "logs/20261013_2_qf_cases/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json"),
+    4: ([0.707, 0.6278, 0.6061], "job 6640: 2394/3386, 1503/2394, 911/1503",
+        "logs/20261013_2_qf_cases/04_prefill_spectrum_c32/profile_workload/spec_decode_metrics.json"),
+    5: ([0.8114, 0.7858, 0.7961], "job 6641: 61337/75598, 48197/61337, 38370/48197",
+        "logs/20261013_2_qf_cases/05_decode_spectrum_c64/profile_workload/spec_decode_metrics.json"),
+    6: ([0.8974, 0.885, 0.8923], "job 6685: 29566/32948, 26165/29566, 23346/26165",
+        "logs/20261013_2_qf_cases/06_long_long_c8/profile_workload/spec_decode_metrics.json"),
+    7: ([0.8569, 0.8363, 0.8457], "job 6643: 48023/56043, 40162/48023, 33965/40162",
+        "logs/20261013_2_qf_cases/07_quadrant_interference_c48/profile_workload/spec_decode_metrics.json"),
+    8: ([0.8294, 0.8113, 0.8208], "job 6644: 47409/57158, 38465/47409, 31573/38465",
+        "logs/20261013_2_qf_cases/08_completion_churn_c96/profile_workload/spec_decode_metrics.json"),
+    9: ([0.8549, 0.8363, 0.8457], "job 6695: 229456/268416, 191905/229456, 162293/191905",
+        "logs/20261013_2_qf_cases/09_rate_knee/profile_workload/spec_decode_metrics.json"),
+    10: ([0.8573, 0.8418, 0.8514], "job 6646: 228742/266805, 192561/228742, 163953/192561",
+        "logs/20261013_2_qf_cases/10_full_saturation_rate/profile_workload/spec_decode_metrics.json"),
+    11: ([0.7704, 0.6286, 0.5649], "job 6647: 245/318, 154/245, 87/154",
+        "logs/20261013_2_qf_cases/11_long_prefill_ladder_c1/profile_workload/spec_decode_metrics.json"),
+    12: ([0.8762, 0.8686, 0.8843], "job 6648: 7115/8120, 6180/7115, 5465/6180",
+        "logs/20261013_2_qf_cases/12_ultra_context_decode_c1/profile_workload/spec_decode_metrics.json"),
+    13: ([0.937, 0.9385, 0.948], "job 6649: 94639/100999, 88815/94639, 84197/88815",
+        "logs/20261013_2_qf_cases/13_generation_length_matrix_c8/profile_workload/spec_decode_metrics.json"),
+    14: ([0.9037, 0.8908, 0.8951], "job 6651: 293614/324913, 261538/293614, 234113/261538",
+        "logs/20261013_2_qf_cases/14_near_full_long_decode_c64/profile_workload/spec_decode_metrics.json"),
+    15: ([0.9573, 0.9459, 0.9397], "job 6652: 221737/231632, 209730/221737, 197083/209730",
+        "logs/20261013_2_qf_cases/15_kv_overcommit_mixed_churn_c32/profile_workload/spec_decode_metrics.json"),
+    16: ([0.7111, 0.6481, 0.6159], "job 6623: 2370/3333, 1536/2370, 946/1536",
+        "logs/20261013_2_qf_cases/16_prefill_spectrum_chunk4k_c32/profile_workload/spec_decode_metrics.json"),
+    17: ([0.7303, 0.6443, 0.6217], "job 6624: 2404/3292, 1549/2404, 963/1549",
+        "logs/20261013_2_qf_cases/17_prefill_spectrum_chunk8k_c32/profile_workload/spec_decode_metrics.json"),
+    18: ([0.8429, 0.8226, 0.829], "job 6653: 48280/57277, 39715/48280, 32924/39715",
+        "logs/20261013_2_qf_cases/18_quadrant_interference_chunk4k_c48/profile_workload/spec_decode_metrics.json"),
+    19: ([0.8725, 0.8495, 0.8583], "job 6654: 47842/54833, 40642/47842, 34881/40642",
+        "logs/20261013_2_qf_cases/19_quadrant_interference_chunk8k_c48/profile_workload/spec_decode_metrics.json"),
+    20: ([0.8511, 0.8344, 0.8417], "job 6655: 229565/269730, 191544/229565, 161232/191544",
+        "logs/20261013_2_qf_cases/20_full_saturation_chunk8k/profile_workload/spec_decode_metrics.json"),
+}
+
 
 def pool_gib(chunk: int = CHUNK) -> float:
     measured = MEASURED_POOL.get(chunk)
@@ -241,9 +286,20 @@ C_SAT = 256
 KV14 = kv_pinned_bytes(GLM14, C14, 0.914)
 KV15 = kv_pinned_bytes(GLM15, C15, 1.226)
 # Case 09's open-loop rate: 0.8 x case 10's saturated request rate, once case 10's workload pass has run.
-RATE_KNEE: tuple[float, str, str] | None = None
-# A pinned pool's block count as logged by its workload pass (`Maximum concurrency` x 62 blocks): None until run.
-PINNED_EVIDENCE: dict[str, tuple[str, str] | None] = {"kv14": None, "kv15": None}
+RATE_KNEE: tuple[float, str, str] | None = (
+    2.70,
+    "queueing knee = 0.8 x the case-10 saturated request rate on the same shapes: 512 requests over a 151.75 s "
+    "client run = 3.374 req/s (req-frontend summary request_throughput_per_s, Slurm job 6646, this pack's serving "
+    "config)",
+    "logs/20261013_2_qf_cases/10_full_saturation_rate/profile_workload",
+)
+# A pinned pool's block count as logged by its workload pass (`Maximum concurrency` x 62 blocks).
+PINNED_EVIDENCE: dict[str, tuple[str, str] | None] = {
+    "kv14": ("`Maximum concurrency ... 25.23x` x 62 = 1564 blocks (Slurm job 6651)",
+             "logs/20261013_2_qf_cases/14_near_full_long_decode_c64/profile_workload"),
+    "kv15": ("`Maximum concurrency ... 13.97x` x 62 = 866 blocks (Slurm job 6652)",
+             "logs/20261013_2_qf_cases/15_kv_overcommit_mixed_churn_c32/profile_workload"),
+}
 
 
 def pool_note(shapes, c: int, chunk: int = CHUNK) -> str:
@@ -438,6 +494,12 @@ def kv_calibration(case: dict) -> dict:
 
 
 def acceptance(case: dict) -> dict:
+    measured = MEASURED_ACCEPTANCE.get(case["index"])
+    if measured:
+        value, counts, evidence = measured
+        return {"value": value, "status": "measured",
+                "derived_from": f"conditional accepted-token ratios of this case's workload pass ({counts})",
+                "evidence": evidence}
     value, derived_from, evidence = PROVISIONAL_ACCEPTANCE
     return {"value": value, "status": "provisional", "derived_from": derived_from, "evidence": evidence}
 
