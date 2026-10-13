@@ -80,8 +80,8 @@ DOC = KernelDoc(
         f"{CUPTI_METHOD} Every launch of one ple_conv call is counted (one in "
         "decode, two in spec and prefill). Requests are equal length with their "
         "own state slots in an SD-layout pool viewed as [slot, channel, window], "
-        "as production canonicalizes it. Outputs are checked against a PyTorch "
-        "reference first."
+        "as production canonicalizes it. Outputs and the updated state are checked "
+        "against a PyTorch reference first."
     ),
     caveats=(
         "Requests have equal query_len; mixed batches pass a token map that the "

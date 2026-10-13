@@ -10,9 +10,8 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
-/// Token axis shared by the PLE per-token kinds: decode/verify rows through
-/// the largest scheduled step.
-pub(crate) const PLE_TOKEN_AXIS: [u32; 25] = [
+/// Decode/verify rows through the largest scheduled step.
+const TOKEN_AXIS: [u32; 25] = [
     1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
     6144, 8192, 12288, 16384, 32768,
 ];
@@ -47,7 +46,7 @@ impl KernelSpec for PleGateSpec {
             config.hidden_size > 0 && config.hc_mult > 0,
             "ple_gate needs a positive shape"
         );
-        SweepGrid::new(vec![Axis::values(PLE_TOKEN_AXIS)])
+        SweepGrid::new(vec![Axis::values(TOKEN_AXIS)])
     }
 
     fn cache_kind(_: &'static str) -> CacheKind {
@@ -88,7 +87,7 @@ mod tests {
         };
         let grid = PleGateSpec::sweep_grid(&cfg);
         let payloads = PleGateSpec::enumerate(&cfg, &grid, "vllm_triton");
-        assert_eq!(payloads.len(), PLE_TOKEN_AXIS.len());
+        assert_eq!(payloads.len(), TOKEN_AXIS.len());
         let fields = payloads[3].fields();
         let keys: Vec<_> = fields.keys().map(String::as_str).collect();
         assert_eq!(

@@ -18,16 +18,20 @@ use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
 const MODES: [&str; 3] = ["decode", "spec", "prefill"];
-/// Largest tokens in one profiled prefill call (batch x query_len).
-const MAX_PREFILL_TOKENS: u64 = 65_536;
+/// Largest tokens (batch x query_len) in one profiled call. A grid budget that
+/// bounds the prefill sweep, not a kernel limit.
+const MAX_CALL_TOKENS: u64 = 65_536;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PleShortConvKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
+    /// Depthwise conv channels (`hc_mult * hidden_size`).
     pub channels: u32,
+    /// Filter taps per channel; the state holds `(kernel_size - 1) * dilation` inputs.
     pub kernel_size: u32,
+    /// Spacing between taps, in tokens.
     pub dilation: u32,
     /// `decode`, `spec` or `prefill`.
     pub mode: String,
@@ -84,7 +88,7 @@ impl KernelSpec for PleShortConvSpec {
 
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         grid.expand_2d(|batch, query| {
-            (batch.round() as u64) * (query.round() as u64) > MAX_PREFILL_TOKENS
+            (batch.round() as u64) * (query.round() as u64) > MAX_CALL_TOKENS
         })
     }
 

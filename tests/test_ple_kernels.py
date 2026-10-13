@@ -96,6 +96,24 @@ def test_conv_reference_with_zero_state_is_a_causal_dilated_conv():
     assert torch.allclose(got, expected, atol=1e-9)
 
 
+def test_conv_state_reference_keeps_the_newest_history():
+    # Defect caught: a state check that keeps the oldest positions, or a spec
+    # rollback that does not start one past the last accepted token.
+    state = torch.arange(6.0).view(1, 1, 6)  # state_len 6, one channel
+    x = torch.tensor([[10.0], [11.0], [12.0]])
+    prefill = ple_short_conv.reference_state(
+        torch, x, state, query_len=3, state_len=6, mode="prefill"
+    )
+    assert prefill.flatten().tolist() == [3.0, 4.0, 5.0, 10.0, 11.0, 12.0]
+    spec_state = torch.arange(8.0).view(1, 1, 8)  # state_len 6 + 2 spec slots
+    spec = ple_short_conv.reference_state(
+        torch, x, spec_state, query_len=3, state_len=6, mode="spec",
+        num_accepted=torch.tensor([2]),
+    )
+    # Accepted 2 -> history starts at slot 1: [1..6] + x, drop the oldest.
+    assert spec.flatten().tolist() == [2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 11.0, 12.0]
+
+
 def test_conv_args_reject_multi_token_decode():
     # Defect caught: a decode row with query_len > 1, which the decode kernel
     # would silently treat as separate requests.

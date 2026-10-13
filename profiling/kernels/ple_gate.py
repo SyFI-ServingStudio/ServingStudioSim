@@ -86,7 +86,8 @@ register(
         args_schema=PleGateArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        # The wrapper accepts BF16/FP16 activations; the kernel uses only
+        # The wrapper accepts BF16/FP16 activations, but only BF16 (the
+        # production dtype) is profiled and declared. The kernel uses only
         # generic Triton ops (PDL wait/launch is gated on the device inside).
         supports=BackendSupport(compute=frozenset({DType.BF16})),
         subprocess_env="vllm_env",

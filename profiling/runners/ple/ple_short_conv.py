@@ -2,15 +2,20 @@
 
 ``vllm_triton`` times one call of the fork's ``ple_conv``
 (``models/qwen4_exp/nvidia/ops/ple.py``) in the requested mode, with every
-launch it issues counted. The state pool is allocated like production's
-default SD layout (``[slots, window, channels]``) and canonicalized the way
-``Qwen4ExpPLELayer._short_conv`` does (transpose to ``[slot, channel, window]``
-and keep the last ``(K - 1) * D + spec`` positions). Slot 0 is the null block;
-request ``r`` owns slot ``r + 1``.
+launch it issues counted. The state pool uses production's default SD layout
+(``[slots, window, channels]``) viewed as ``[slot, channel, window]``, as
+``Qwen4ExpPLELayer._short_conv`` canonicalizes it. Its window is the
+``(K - 1) * D + spec`` positions the call needs (``spec = query_len - 1`` in
+``spec`` mode, else 0). Production sizes every mode's window with the
+deployment's ``num_spec_tokens``, so an MTP deployment's decode and prefill
+calls see a wider window; that only spreads the slots further apart (the
+kernel reads and writes the same positions), so the runner does not model it.
+Slot 0 is the null block; request ``r`` owns slot ``r + 1``.
 
-``reference_conv`` recomputes the output rows in PyTorch from the state and
-inputs before the call. The in-place residual accumulates across timed calls,
-which does not change the work.
+``reference_conv`` and ``reference_state`` recompute the output rows and the
+updated state windows in PyTorch from the state and inputs before the call. The
+in-place residual accumulates across timed calls, which does not change the
+work.
 """
 
 from __future__ import annotations
@@ -24,8 +29,6 @@ from profiling.runners.metrics import ComputeMetrics
 
 KIND = "ple_short_conv"
 _MODES = ("decode", "spec", "prefill")
-_MAX_TOKENS = 1 << 17
-_MAX_SPEC_LEN = 16
 
 
 def validate_args(
@@ -50,10 +53,6 @@ def validate_args(
         raise ValueError(f"mode must be one of {_MODES}")
     if mode == "decode" and query_len != 1:
         raise ValueError("decode mode has query_len 1")
-    if mode == "spec" and not 1 <= query_len <= _MAX_SPEC_LEN:
-        raise ValueError(f"spec query_len must be in [1, {_MAX_SPEC_LEN}]")
-    if batch_size * query_len > _MAX_TOKENS:
-        raise ValueError(f"batch_size * query_len must be at most {_MAX_TOKENS}")
     if kernel_size < 2:
         raise ProfilerNotImplemented(f"{KIND} needs a state (kernel_size >= 2)")
     if str(dtype) != "bf16":
@@ -89,6 +88,24 @@ def reference_conv(torch: Any, x, residual, outer, state, weight, *, query_len: 
     y = (conv * torch.sigmoid(conv)).to(x.dtype)
     new = (residual.view(batch, query_len, channels) + y).to(x.dtype)
     return (outer.view(batch, query_len, channels).float() + new.float()).to(x.dtype).view_as(x)
+
+
+def reference_state(torch: Any, x, state, *, query_len: int, state_len: int, mode: str,
+                    num_accepted=None) -> Any:
+    """Updated state windows, [batch, channels, window], for requests in order.
+
+    Decode and prefill keep the last ``state_len`` inputs of the history plus
+    this call's tokens. Spec rolls back to the last accepted token and keeps
+    ``state_len + query_len - 1`` positions, one past that token's history.
+    """
+    batch, channels = state.shape[:2]
+    xs = x.view(batch, query_len, channels).transpose(1, 2)
+    if mode == "spec":
+        off = (num_accepted.long() - 1).clamp(0, query_len - 1)
+        rows = off[:, None] + torch.arange(state_len, device=x.device)[None, :]
+        hist = state.gather(2, rows[:, None, :].expand(-1, channels, -1))
+        return torch.cat([hist, xs], dim=2)[..., 1:]
+    return torch.cat([state[..., :state_len], xs], dim=2)[..., -state_len:]
 
 
 def profile_ple_short_conv_vllm_triton(
@@ -145,9 +162,14 @@ def profile_ple_short_conv_vllm_triton(
         def launch() -> None:
             ple_conv(x, residual, conv_state, weight, state_indices, outer, **kwargs)
 
+        state_before = conv_state[1:].clone()
         ref = reference_conv(
-            torch, x, residual, outer, conv_state[1:].clone(), weight,
+            torch, x, residual, outer, state_before, weight,
             query_len=query_len, dilation=dilation, mode=mode, num_accepted=num_accepted,
+        )
+        ref_state = reference_state(
+            torch, x, state_before, query_len=query_len, state_len=state_len, mode=mode,
+            num_accepted=num_accepted,
         )
         launch()
         torch.cuda.synchronize()
@@ -156,6 +178,9 @@ def profile_ple_short_conv_vllm_triton(
             raise KernelLaunchFailed(
                 f"{KIND} output differs from the reference on {float(bad.float().mean()):.2%}"
             )
+        # The state update is a pure copy, so it must match exactly.
+        if not torch.equal(conv_state[1:, :, : ref_state.shape[-1]], ref_state):
+            raise KernelLaunchFailed(f"{KIND} conv_state differs from the reference update")
         time_ms = Timer.cupti(launch, kernel_name=None)
         energy_j = Energy.perf(launch, per_iter_time_ms=time_ms)
     except torch.OutOfMemoryError as exc:
@@ -177,4 +202,10 @@ def profile_ple_short_conv_vllm_triton(
     )
 
 
-__all__ = ["logical_bytes", "profile_ple_short_conv_vllm_triton", "reference_conv", "validate_args"]
+__all__ = [
+    "logical_bytes",
+    "profile_ple_short_conv_vllm_triton",
+    "reference_conv",
+    "reference_state",
+    "validate_args",
+]

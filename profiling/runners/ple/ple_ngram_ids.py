@@ -15,7 +15,6 @@ inputs are CPU tensors. Ids must match bit for bit.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
 
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
