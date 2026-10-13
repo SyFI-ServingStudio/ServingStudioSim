@@ -231,15 +231,15 @@ cases:
       - 64
     repeats: 256
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 01
     derivation: 'GLM''s c256, the brief''s decode-batch ceiling. Every request is <= 192 tokens, so each holds 1
-      attention block + 6 GDN-state blocks: 256 x 7 = 1792 blocks = 66% of the pool. Above ~380 short requests the
+      attention block + 6 GDN-state blocks: 256 x 7 = 1792 blocks = 68% of the pool. Above ~380 short requests the
       GDN state, not max_num_seqs (1024), would bind. Shapes and repeats unchanged (4 requests per slot).'
 - index: 2
   name: graph_boundaries_c128
@@ -282,11 +282,11 @@ cases:
       - 64
     repeats: 48
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 02
     derivation: 'Unchanged from GLM: c128 <= S, and as the batch drains decode replays every captured size 1..128.
@@ -326,11 +326,11 @@ cases:
       - 256
     repeats: 16
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 03
     derivation: 'The cross-model anchor: unchanged. c32 x <= 9 blocks = 11% of the pool.'
@@ -369,11 +369,11 @@ cases:
       - 64
     repeats: 16
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 04
     derivation: 'Unchanged: the chunk is 2048, so 1984/2048/2112 straddle it; 4096/6144/7168 are 2/3/3.5 chunks.
@@ -413,11 +413,11 @@ cases:
       - 4096
     repeats: 16
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 05
     derivation: 'Unchanged: c64 <= S; at most 64 x 10 blocks = 24% of the pool. GQA decode context grows to 5120
@@ -451,11 +451,11 @@ cases:
       - 1920
     repeats: 7
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 06
     derivation: 'GLM''s prompts are 25-75% of its 8192 context limit; this deployment serves 131072, so prompts
@@ -488,11 +488,11 @@ cases:
       - 3072
     repeats: 24
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 07
     derivation: 'Unchanged: the quadrants are defined against the 2048 chunk (4096 = two chunks), not the context
@@ -528,11 +528,11 @@ cases:
       - 4096
     repeats: 32
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 08
     derivation: 'Unchanged: c96 <= S, at most 96 x 9 blocks = 32% of the pool, so replacements are admitted at once.'
@@ -577,11 +577,11 @@ cases:
       serving config)'
     evidence: logs/20261012_1_q38_align_campaign/10_full_saturation_rate/profile_workload
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 09
     derivation: GLM's knee rule (0.8 x the case-10 saturated rate) on this model's throughput; same 8-shape mix
@@ -605,14 +605,14 @@ cases:
     shapes: *id002
     repeats: 64
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 10
-    derivation: 'GLM''s c256. Mean terminal demand 256 x 8.88 blocks = 84% of the pool, so the long-output requests
+    derivation: 'GLM''s c256. Mean terminal demand 256 x 8.88 blocks = 87% of the pool, so the long-output requests
       can transiently preempt: saturation in KV as well as compute. Same trace as case 9 so the knee is a fraction
       of this rate.'
 - index: 11
@@ -674,11 +674,11 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 11
     derivation: 'GLM''s rungs are 1/32 .. 15/16 of its 524288 limit; the same fractions of 131072 (each rung / 4),
@@ -744,11 +744,11 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 12
     derivation: 'Prompts are GLM''s / 4 (same fractions of the context limit; the top, 114688 + 4096, is 88% of
@@ -841,11 +841,11 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-2048 workload pass'
-    evidence: ''
+    value: 134.7761
+    status: measured
+    derived_from: '`Available KV cache memory: 125.52 GiB` (x 1.073741824) in the chunk-2048 workload passes (Slurm
+      jobs 6479 (case 01; every warm chunk-2048 pass logs the same pool)) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 13
     derivation: 'Unchanged: GLM already ran it at max_model_len 131072, and its longest row (65536) fits. c8 x <=
@@ -1015,10 +1015,10 @@ cases:
     id_suffix: nsys
   attn_gpu_memory_gb:
     value: 91.7651
-    status: provisional
-    derived_from: --kv-cache-memory-bytes 91765080064 of this case's variant pins the KV pool; confirm against `Available
-      KV cache memory` in this case's workload pass
-    evidence: ''
+    status: measured
+    derived_from: --kv-cache-memory-bytes 91765080064 of this case's variant pins the KV pool to 1786 blocks; the
+      workload pass logs `Maximum concurrency` 19.84x = 1786 blocks (job 6459)
+    evidence: logs/20261012_1_q38_align_campaign/14_near_full_long_decode_c64/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 14
     derivation: 'GLM''s 91.4% = c x mean terminal blocks / pool, on GLM''s shapes. Their mean holds 25.50 blocks
@@ -1127,10 +1127,10 @@ cases:
     id_suffix: nsys
   attn_gpu_memory_gb:
     value: 57.4431
-    status: provisional
-    derived_from: --kv-cache-memory-bytes 57443090432 of this case's variant pins the KV pool; confirm against `Available
-      KV cache memory` in this case's workload pass
-    evidence: ''
+    status: measured
+    derived_from: --kv-cache-memory-bytes 57443090432 of this case's variant pins the KV pool to 1118 blocks; the
+      workload pass logs `Maximum concurrency` 12.42x = 1118 blocks (job 6473)
+    evidence: logs/20261012_1_q38_align_campaign/15_kv_overcommit_mixed_churn_c32/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 15
     derivation: 'As case 14 at GLM''s 122.6%: 32 x 42.83 blocks / 1.226 = 1118 blocks = 57443090432 B (53.50 GiB).
@@ -1172,11 +1172,11 @@ cases:
     repeats: 16
   chunk_size: 4096
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-4096 workload pass'
-    evidence: ''
+    value: 134.5828
+    status: measured
+    derived_from: '`Available KV cache memory: 125.34 GiB` (x 1.073741824) in the chunk-4096 workload passes (Slurm
+      jobs 6461, 6525) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/16_prefill_spectrum_chunk4k_c32/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 04
     derivation: 'Case 04 at chunk 4096: the same c32 and 16 repeats, rungs moved to the new chunk boundary (4032/4096/4160)
@@ -1218,11 +1218,11 @@ cases:
     repeats: 16
   chunk_size: 8192
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-8192 workload pass'
-    evidence: ''
+    value: 133.7882
+    status: measured
+    derived_from: '`Available KV cache memory: 124.6 GiB` (x 1.073741824) in the chunk-8192 workload passes (Slurm
+      jobs 6534, 6536, 6538) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/17_prefill_spectrum_chunk8k_c32/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 04
     derivation: 'Case 04 at chunk 8192: the same c32 and 16 repeats, rungs moved to the new chunk boundary (8128/8192/8256)
@@ -1256,11 +1256,11 @@ cases:
     repeats: 24
   chunk_size: 4096
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-4096 workload pass'
-    evidence: ''
+    value: 134.5828
+    status: measured
+    derived_from: '`Available KV cache memory: 125.34 GiB` (x 1.073741824) in the chunk-4096 workload passes (Slurm
+      jobs 6461, 6525) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/16_prefill_spectrum_chunk4k_c32/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 07
     derivation: 'Case 07 at chunk 4096: same c48 and 24 repeats; the long prompts stay 2 and 1.5 chunks (8192 and
@@ -1294,11 +1294,11 @@ cases:
     repeats: 24
   chunk_size: 8192
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-8192 workload pass'
-    evidence: ''
+    value: 133.7882
+    status: measured
+    derived_from: '`Available KV cache memory: 124.6 GiB` (x 1.073741824) in the chunk-8192 workload passes (Slurm
+      jobs 6534, 6536, 6538) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/17_prefill_spectrum_chunk8k_c32/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 07
     derivation: 'Case 07 at chunk 8192: same c48 and 24 repeats; the long prompts stay 2 and 1.5 chunks (16384 and
@@ -1324,11 +1324,11 @@ cases:
     repeats: 64
   chunk_size: 8192
   attn_gpu_memory_gb:
-    value: 138.9315
-    status: provisional
-    derived_from: 'the draft''s `Available KV cache memory: 129.39 GiB` at max_num_seqs 8 / chunk 2048; replace
-      with this deployment''s chunk-8192 workload pass'
-    evidence: ''
+    value: 133.7882
+    status: measured
+    derived_from: '`Available KV cache memory: 124.6 GiB` (x 1.073741824) in the chunk-8192 workload passes (Slurm
+      jobs 6534, 6536, 6538) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/17_prefill_spectrum_chunk8k_c32/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 10
     derivation: 'Case 10 at chunk 8192: same c256 and trace. Mixed steps carry up to ~250 decodes plus an 8192-token

@@ -38,8 +38,11 @@ Limits (TP1, gpu_memory_utilization 0.85, chunk 2048):
   ceil(131072 / 1568) + 3 x 2 = 90 blocks: the draft's 2704-block pool / 90 = 30.04x against the logged 30.03x),
   so `blocks()` below charges 6. GDN state therefore dominates short requests: a 256-token request costs 7
   blocks, 360 MB, and the pool holds only ~380 of them at once.
-  The pool is read from each chunk size's workload pass (`MEASURED_POOL`), since the profile-run activation
-  peak moves with --max-num-batched-tokens.
+  The pool is read from each chunk size's workload passes (`MEASURED_POOL`): 125.52 / 125.34 / 124.60 GiB at
+  chunk 2048 / 4096 / 8192 = 2623 / 2619 / 2603 blocks, since the profile-run activation peak moves with
+  --max-num-batched-tokens (the draft's 129.39 GiB was at max_num_seqs 8). A pass whose JIT and FlashInfer
+  autotune caches were cold logged a pool ~2 GiB smaller and untuned fp8_gemm shapes, so such passes were re-run
+  warm and only warm passes are cited.
 
 Cases 14 and 15 pin their pool with --kv-cache-memory-bytes (their own variants), as MiMo and
 `glm53_flash_fp8_b200_tp4_ep4` do, so their terminal KV demand is exact rather than a function of a measured
@@ -86,7 +89,17 @@ GIB = 1 << 30
 
 # Per-GPU KV pool (`Available KV cache memory`, GiB) logged by each chunk size's workload passes:
 # chunk -> (GiB, Slurm jobs, evidence case dir). None until measured.
-MEASURED_POOL: dict[int, tuple[float, str, str] | None] = {2048: None, 4096: None, 8192: None}
+MEASURED_POOL: dict[int, tuple[float, str, str] | None] = {
+    2048: (125.52, "6479 (case 01; every warm chunk-2048 pass logs the same pool)",
+           "logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload"),
+    4096: (125.34, "6461, 6525", "logs/20261012_1_q38_align_campaign/16_prefill_spectrum_chunk4k_c32/profile_workload"),
+    8192: (124.60, "6534, 6536, 6538", "logs/20261012_1_q38_align_campaign/17_prefill_spectrum_chunk8k_c32/profile_workload"),
+}
+# A pinned pool's block count as logged (`Maximum concurrency for 131,072 tokens per request` x 90 blocks).
+PINNED_EVIDENCE = {
+    "kv14": ("19.84x = 1786 blocks (job 6459)", "logs/20261012_1_q38_align_campaign/14_near_full_long_decode_c64/profile_workload"),
+    "kv15": ("12.42x = 1118 blocks (job 6473)", "logs/20261012_1_q38_align_campaign/15_kv_overcommit_mixed_churn_c32/profile_workload"),
+}
 # The draft's pool at max_num_seqs 8, chunk 2048: the estimate a case is derived against until measured.
 DRAFT_POOL_GIB = 129.39
 
@@ -380,12 +393,13 @@ def trace_spec(case: dict, key: str) -> dict:
 def kv_calibration(case: dict) -> dict:
     pinned = {"kv14": KV14, "kv15": KV15}.get(case.get("variant"))
     if pinned is not None:
+        logged, evidence = PINNED_EVIDENCE[case["variant"]]
         return {
             "value": round(pinned / 1e9, 4),
-            "status": "provisional",
-            "derived_from": f"--kv-cache-memory-bytes {pinned} of this case's variant pins the KV pool; confirm "
-                            "against `Available KV cache memory` in this case's workload pass",
-            "evidence": "",
+            "status": "measured",
+            "derived_from": f"--kv-cache-memory-bytes {pinned} of this case's variant pins the KV pool to "
+                            f"{pinned // BLOCK_BYTES} blocks; the workload pass logs `Maximum concurrency` {logged}",
+            "evidence": evidence,
         }
     chunk = case.get("chunk_size", CHUNK)
     measured = MEASURED_POOL[chunk]
