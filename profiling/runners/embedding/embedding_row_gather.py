@@ -20,8 +20,9 @@ table first, and the pinned cache is emptied at exit.
 
 Ids are int64 and uniform over each head's equal share of the table
 (production heads own disjoint prime-sized ranges of nearly equal size). Each
-timed call reads a different id set from a pool of at least ~4M distinct rows,
-so repeats do not hit rows an earlier call left in L2 or the TLBs.
+timed call reads the next of 4 to 4096 id sets, as many as bring the pool to
+about 4M rows (fewer for calls under 1024 ids), so consecutive calls do not
+reuse rows an earlier call left in L2 or the TLBs.
 
 Correctness (outside timing): the gathered rows must equal, byte for byte, a
 Torch ``index_select`` of the table; for ``vllm_triton`` ids outside the table
@@ -46,9 +47,6 @@ _BACKEND_RESIDENCY = {"vllm_triton": "host_uva", "torch": "device"}
 _DTYPES = {"fp8_e4m3": (1, "float8_e4m3fn"), "bf16": (2, "bfloat16")}
 _BACKEND_DTYPES = {"vllm_triton": ("fp8_e4m3",), "torch": ("fp8_e4m3", "bf16")}
 _RESIDENCIES = ("host_uva", "device")
-_MAX_TOKENS = 1 << 17
-_MAX_HEADS = 64
-_MAX_HEAD_DIM = 4096
 # 400M rows x 160 B = 64 GB: above the 51.2 GB PLE table, inside what one
 # profiling job can pin or keep in HBM.
 _MAX_TABLE_BYTES = 64 << 30
@@ -68,12 +66,13 @@ def validate_args(
     residency: str,
     weight_dtype: object,
 ) -> None:
-    if type(num_tokens) is not int or not 1 <= num_tokens <= _MAX_TOKENS:
-        raise ValueError(f"num_tokens must be an integer in [1, {_MAX_TOKENS}]")
-    if type(num_heads) is not int or not 1 <= num_heads <= _MAX_HEADS:
-        raise ValueError(f"num_heads must be an integer in [1, {_MAX_HEADS}]")
-    if type(head_dim) is not int or not 1 <= head_dim <= _MAX_HEAD_DIM:
-        raise ValueError(f"head_dim must be an integer in [1, {_MAX_HEAD_DIM}]")
+    for name, value in (
+        ("num_tokens", num_tokens),
+        ("num_heads", num_heads),
+        ("head_dim", head_dim),
+    ):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
     if type(table_rows) is not int or table_rows < num_heads:
         raise ValueError("table_rows must be an integer >= num_heads")
     if str(weight_dtype) not in _BACKEND_DTYPES[backend]:
@@ -201,10 +200,11 @@ def _profile(backend: str, **args: Any) -> ComputeMetrics:
         device = torch.device("cuda", torch.cuda.current_device())
         table = _get_table(torch, device, table_rows, head_dim, residency, weight_dtype)
         pool = build_id_pool(torch, device, num_tokens, num_heads, table_rows)
-        out = torch.empty(
-            (num_tokens, num_heads, head_dim), dtype=table["table"].dtype, device=device
-        )
+        out = None  # F.embedding allocates its own output
         if backend == "vllm_triton":
+            out = torch.empty(
+                (num_tokens, num_heads, head_dim), dtype=table["table"].dtype, device=device
+            )
             try:
                 import vllm._C_stable_libtorch  # noqa: F401  (get_cuda_view_from_cpu_tensor)
 
@@ -228,7 +228,7 @@ def _profile(backend: str, **args: Any) -> ComputeMetrics:
             torch.nn.functional.embedding(pool[0], weight)  # warm the dispatch
             check_rows(torch, table, pool[0], torch.nn.functional.embedding(pool[0], weight))
 
-            def lookup(ids: Any, out: Any) -> None:
+            def lookup(ids: Any, _out: None) -> None:
                 torch.nn.functional.embedding(ids, weight)
 
             kernel_name = None

@@ -24,6 +24,9 @@ use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
 const RESIDENCIES: [&str; 2] = ["host_uva", "device"];
+/// The one residency each backend runs on: the fork's pinned lookup reads a
+/// host table over UVA, `F.embedding` an HBM one.
+const BACKEND_RESIDENCY: [(&str, &str); 2] = [("vllm_triton", "host_uva"), ("torch", "device")];
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EmbeddingRowGatherKernelConfig {
@@ -63,6 +66,17 @@ fn validate_config(config: &EmbeddingRowGatherKernelConfig) {
         "residency must be one of {RESIDENCIES:?}, got {}",
         config.residency
     );
+    for backend in &config.backends {
+        let residency = BACKEND_RESIDENCY
+            .iter()
+            .find(|(name, _)| name == backend)
+            .map(|(_, residency)| *residency);
+        assert!(
+            residency == Some(config.residency.as_str()),
+            "embedding_row_gather backend {backend} does not run with residency {}",
+            config.residency
+        );
+    }
 }
 
 impl KernelSpec for EmbeddingRowGatherSpec {
@@ -72,8 +86,11 @@ impl KernelSpec for EmbeddingRowGatherSpec {
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         validate_config(config);
-        // 17 brackets PyTorch's small-index path (`F.embedding` on <= 16
-        // indices costs ~5x the 17-index launch), which 16 -> 32 would smear.
+        // PyTorch's `F.embedding` (index_select) takes a slower small-index
+        // path for at most 16 ids, i.e. num_tokens * num_heads <= 16. The
+        // power-of-two points bracket that switch for power-of-two head
+        // counts; 17 brackets it for a single head (the MTP token embedding),
+        // where 16 -> 32 would smear a ~5x step.
         SweepGrid::new(vec![Axis::values([
             1, 2, 4, 8, 16, 17, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048,
             3072, 4096, 6144, 8192, 12288, 16384, 32768,
@@ -150,5 +167,13 @@ mod tests {
     #[should_panic(expected = "residency")]
     fn rejects_unknown_residency() {
         EmbeddingRowGatherSpec::sweep_grid(&config("managed"));
+    }
+
+    /// Catches a deployment pairing the pinned-host lookup with an HBM table
+    /// (or `F.embedding` with a host one): the profiler has no such row.
+    #[test]
+    #[should_panic(expected = "does not run with residency device")]
+    fn rejects_a_backend_on_the_other_residency() {
+        EmbeddingRowGatherSpec::sweep_grid(&config("device"));
     }
 }

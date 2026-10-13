@@ -83,10 +83,10 @@ DOC = KernelDoc(
     default_metric="memory_bandwidth_gbps",
     method=(
         f"{CUPTI_METHOD} "
-        "Each timed call reads another id set from a pool of at least about "
-        "four million distinct rows, so no repeat finds rows left in L2 or the "
-        "TLBs by an earlier call. Before timing, the output must equal a "
-        "PyTorch index_select bit for bit."
+        "Each timed call reads the next of 4 to 4096 id sets, as many as bring "
+        "the pool to about four million rows (fewer for calls under 1024 ids), "
+        "so consecutive calls do not reuse rows left in L2 or the TLBs. Before "
+        "timing, the output must equal a PyTorch index_select bit for bit."
     ),
     caveats=(
         "Ids are uniform within each head's equal share of the table; real "
