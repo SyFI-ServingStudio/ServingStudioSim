@@ -21,7 +21,8 @@ Two kinds of evidence must exist and be reasonable:
   the `workload_metrics` pass), per `top-align-with-framework`.
 - **Campaign cases.** Take these from the model's pack under `presets/alignment/<pack>/` (the 15 standard
   operating points). Run at least one high-concurrency case, one prefill-heavy case, one decode-only case,
-  and one long-context case. Run more if the GPU budget allows. Produce the table with
+  and one long-context case, and cover `chunk_size` 2048, 4096 and 8192 (see `operate-run-alignment`).
+  Run more if the GPU budget allows. Produce the table with
   `alignment-campaign compare --measured --markdown`.
 
 "Reasonable" means one of two things. The case is within the tolerances in the pack's `acceptance.yaml`,

@@ -96,6 +96,14 @@ many cases; chaining phases would delete the explicit checkpoint between them.
 Advance the pipeline by issuing the next `--phase` yourself after inspecting the
 previous one, exactly as for a single case.
 
+**A pack's cases must span the knobs that change step shapes.** Do not copy one
+template value across the matrix. At least run prefill-heavy and mixed cases at
+`chunk_size` 2048, 4096 and 8192 (as the GLM-5.3 DFlash2 and GLM-5.2 spec5 packs
+do), and vary `max_num_seqs`, `max_model_len` or the parallel layout where the
+deployment allows it. A path no case reaches, such as a step above a fused
+kernel's token cap, is unvalidated, and the simulator must price it rather than
+refuse it.
+
 `launcher/alignment_campaign/README.md` owns the pack schema. Reach for the
 single-config path below when there is one workload and no matrix.
 
