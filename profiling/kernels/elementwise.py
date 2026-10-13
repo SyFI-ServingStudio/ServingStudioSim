@@ -88,7 +88,6 @@ DOC = KernelDoc(
 )
 
 
-
 # Two realizations of the one byte contract, and the choice is load-bearing at
 # small sizes where both kernels are launch-bound: `triton` for a slot the
 # framework hands to a Triton kernel (including torch-compile output), `torch`
@@ -114,12 +113,27 @@ _SUMMARIES = {
     "elementwise_kernel. Copies only.",
     "torch_cat": "Eager torch.cat of two bf16 halves: CatArrayBatchedCopy. Copies only.",
 }
-for _backend, _runner_module, _function in (
-    ("triton", "profiling.runners.elementwise.triton", "profile_elementwise"),
+
+# Each eager realization is also registered with a `_vllm` suffix: the same
+# runner in vLLM's pinned environment (its Torch build), for a model whose
+# glue rows must come from the serving build.
+_EAGER = (
     ("torch", "profiling.runners.elementwise.torch", "profile_elementwise"),
-    ("torch_strided_copy", "profiling.runners.elementwise.torch", "profile_elementwise_strided_copy"),
+    (
+        "torch_strided_copy",
+        "profiling.runners.elementwise.torch",
+        "profile_elementwise_strided_copy",
+    ),
     ("torch_cat", "profiling.runners.elementwise.torch", "profile_elementwise_cat"),
+)
+for _backend, _runner_module, _function, _env in (
+    ("triton", "profiling.runners.elementwise.triton", "profile_elementwise", None),
+    *((b, m, f, None) for b, m, f in _EAGER),
+    *((f"{b}_vllm", m, f, "vllm_env") for b, m, f in _EAGER),
 ):
+    _summary = _SUMMARIES[_backend.removesuffix("_vllm")]
+    if _env is not None:
+        _summary += " Run in vLLM's pinned environment."
     register(
         KernelProfilerSpec(
             kernel_kind=KIND,
@@ -135,7 +149,8 @@ for _backend, _runner_module, _function in (
             metric_family=MetricFamily.COMPUTE,
             batch_outlier_policy=BatchOutlierPolicy(),
             doc=BackendDoc(
-                summary=_SUMMARIES[_backend],
+                summary=_summary,
             ),
+            subprocess_env=_env,
         )
     )
