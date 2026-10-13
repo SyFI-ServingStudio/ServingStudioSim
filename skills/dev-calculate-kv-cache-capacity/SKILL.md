@@ -28,8 +28,8 @@ The answer has two halves, and each comes from a different block of the config:
 | What a finished run used | `<log_dir>/raw/kv_cache.json` (fields: `simulator/src/log/README.md`) |
 | The arch's layout alone | `simulator cost-trees <blocks.json>` (a JSON list of `{gpu, arch}`): each build's `kv_cache {attention_shards, layout}`. Bytes are over one partition; divide by `attention_shards` for one GPU. |
 
-Quote the printed numbers and the per-part split ("One request at max_model_len,
-per GPU"); do not re-derive them. The report prints the concurrency under both
+Quote the printed numbers and the per-part split ("One request at max_model_len
+N in vLLM's estimate, per GPU"); do not re-derive them. The report prints the concurrency under both
 `kv_overhead` modes, so the engine's tax is the gap between the two.
 
 When a printed number disagrees with a vLLM log ("Maximum concurrency for N
