@@ -443,8 +443,9 @@ pub enum IterWorkerSel {
         prefill_chunk_alignment: Option<PrefillChunkAlignment>,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
-    /// iteration submits `draft_tokens + 1` rows per resident decode and retires
-    /// the target's own token plus the leading run of accepted drafts.
+    /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a
+    /// request clipped at `max_model_len`, and retires the target's own token
+    /// plus the leading run of accepted drafts.
     ///
     /// A separate selector from `chunked_prefill` rather than a flag on it: the
     /// arch must also be the speculative one (a different model type, not the
