@@ -676,10 +676,15 @@ struct Pass {
     full_graph: bool,
     /// `(cached prefix, new tokens)` of each prefill request.
     prefills: Vec<(u32, u32)>,
-    /// Final context of each verify (or recurrent decode) request.
+    /// Final context of each full-width verify (or recurrent decode) request.
     decode_kv_lens: Vec<u32>,
-    /// Query rows of each decode request.
+    /// Query rows of each full-width decode request.
     query_len: u32,
+    /// `(resident prefix, rows)` of each verify the scheduler clipped at
+    /// `max_model_len`. QSA's uniform-decode split makes it a prefill; the GDN
+    /// and PLE conv metadata keep it a spec decode while it carries a draft
+    /// (one row: a non-spec decode).
+    clipped: Vec<(u32, u32)>,
 }
 
 impl Pass {
@@ -688,11 +693,15 @@ impl Pass {
         prefills: Vec<(u32, u32)>,
         decode_kv_lens: Vec<u32>,
         query_len: u32,
+        clipped: Vec<(u32, u32)>,
     ) -> Self {
         let tokens = prefills.iter().map(|&(_, new)| new).sum::<u32>()
-            + query_len * decode_kv_lens.len() as u32;
+            + query_len * decode_kv_lens.len() as u32
+            + clipped.iter().map(|&(_, rows)| rows).sum::<u32>();
         let padded = graph_padded_tokens(sizes, tokens);
+        // A clipped row breaks the uniform verify batch the FULL graph needs.
         let full_graph = prefills.is_empty()
+            && clipped.is_empty()
             && sizes.last().is_some_and(|&largest| padded <= largest)
             && padded.is_multiple_of(query_len);
         Self {
@@ -701,15 +710,35 @@ impl Pass {
             prefills,
             decode_kv_lens,
             query_len,
+            clipped,
         }
     }
 
     fn tokens(&self) -> u32 {
-        self.prefill_tokens() + self.query_len * self.decode_kv_lens.len() as u32
+        self.prefill_tokens()
+            + self.query_len * self.decode_kv_lens.len() as u32
+            + self.clipped.iter().map(|&(_, rows)| rows).sum::<u32>()
     }
 
     fn prefill_tokens(&self) -> u32 {
         self.prefills.iter().map(|&(_, new)| new).sum()
+    }
+
+    /// The step as the GDN and PLE conv metadata class it: `(spec requests,
+    /// spec rows, one-row non-spec decodes)`. A clipped verify that still
+    /// carries a draft is a spec request at its real rows.
+    fn mamba_decodes(&self) -> (u32, u32, u32) {
+        let full = self.decode_kv_lens.len() as u32;
+        let (mut spec, mut spec_rows, mut single) = (full, self.query_len * full, 0);
+        for &(_, rows) in &self.clipped {
+            if rows > 1 {
+                spec += 1;
+                spec_rows += rows;
+            } else {
+                single += 1;
+            }
+        }
+        (spec, spec_rows, single)
     }
 
     /// Rows of an eager break.
@@ -725,8 +754,43 @@ impl Pass {
         VllmQsaAttnLocalWorkletInput {
             padded_tokens: self.padded,
             full_graph: self.full_graph,
-            prefill_chunks: self.prefills.clone(),
+            prefill_chunks: self.prefills.iter().chain(&self.clipped).copied().collect(),
             decode_kv_lens: self.decode_kv_lens.clone(),
+        }
+    }
+
+    fn gdn_input(&self) -> VllmBf16GdnSpecLocalWorkletInput {
+        let (spec_decodes, spec_tokens, single) = self.mamba_decodes();
+        let mut prefill_lengths: Vec<u32> = self.prefills.iter().map(|&(_, new)| new).collect();
+        // Beside spec decodes a one-row decode is a one-token prefill
+        // (`gdn_attn.py`); alone it takes the plain decode path, which the
+        // worklet does not model, so it is priced as that one-token prefill.
+        let non_spec_decodes = if spec_decodes > 0 {
+            single
+        } else {
+            prefill_lengths.extend(std::iter::repeat_n(1, single as usize));
+            0
+        };
+        VllmBf16GdnSpecLocalWorkletInput {
+            padded_tokens: self.padded,
+            prefill_lengths,
+            spec_decodes,
+            spec_tokens,
+            non_spec_decodes,
+        }
+    }
+
+    fn ple_input(&self) -> PleLocalWorkletInput {
+        let (spec_requests, spec_tokens, decode_requests) = self.mamba_decodes();
+        PleLocalWorkletInput {
+            graph_rows: self.padded,
+            eager_rows: self.eager_rows(),
+            decode_requests,
+            spec_requests,
+            spec_query_len: self.query_len,
+            spec_tokens,
+            prefill_requests: self.prefills.len() as u32,
+            prefill_tokens: self.prefill_tokens(),
         }
     }
 }
@@ -815,32 +879,12 @@ impl LayerGroup {
         let rows = HcMixLocalWorkletInput {
             num_tokens: pass.padded,
         };
-        let spec_requests = pass.decode_kv_lens.len() as u32;
         if let Some(ple) = &self.ple {
-            ple.eval(
-                &PleLocalWorkletInput {
-                    graph_rows: pass.padded,
-                    eager_rows: pass.eager_rows(),
-                    decode_requests: 0,
-                    spec_requests,
-                    spec_query_len: pass.query_len,
-                    prefill_requests: pass.prefills.len() as u32,
-                    prefill_tokens: pass.prefill_tokens(),
-                },
-                ev,
-            );
+            ple.eval(&pass.ple_input(), ev);
         }
         self.attn_mix.eval(&rows, ev);
         match &self.mixer {
-            Mixer::Gdn(gdn) => gdn.eval(
-                &VllmBf16GdnSpecLocalWorkletInput {
-                    padded_tokens: pass.padded,
-                    prefill_lengths: pass.prefills.iter().map(|&(_, new)| new).collect(),
-                    spec_decodes: spec_requests,
-                    non_spec_decodes: 0,
-                },
-                ev,
-            ),
+            Mixer::Gdn(gdn) => gdn.eval(&pass.gdn_input(), ev),
             Mixer::Qsa(qsa) => qsa.eval(&pass.qsa_input(), ev),
         }
         self.mlp_mix.eval(&rows, ev);
@@ -1343,15 +1387,16 @@ fn normalize_speculative_input(
         ));
     }
     let mut decode_kv_lens = Vec::with_capacity(group.decode_requests.len());
-    let mut target_prefills = group.prefill_chunk_pairs.clone();
+    let mut clipped_verifies = Vec::new();
     let mut decode_tokens = 0_u32;
     for (request, decode) in group.decode_requests.iter().enumerate() {
         // A full verify window runs the uniform-width decode kernels;
         // acceptance truncates the output after this compute, not the compute.
         // Only a request at max_model_len verifies fewer rows. That ragged row
-        // leaves the uniform-decode graph and kernels, so it is priced on the
-        // varlen prefill path as `(resident, rows)`, a profiled shape. Such
-        // steps are rare (the last verifies of a request ending within
+        // leaves the uniform-decode graph; QSA prices it on its varlen prefill
+        // path as `(resident, rows)`, the GDN and PLE conv layers as the spec
+        // (or one-row decode) request vLLM classes it as ([`Pass::clipped`]).
+        // Such steps are rare (the last verifies of a request ending within
         // `draft_tokens` of the limit).
         let clipped = decode
             .check_verify_row(draft_tokens, max_model_len)
@@ -1361,7 +1406,7 @@ fn normalize_speculative_input(
             .ok_or("decode token sum overflows u32")?;
         endpoints.push(decode.kv_len);
         if clipped {
-            target_prefills.push((decode.kv_len - decode.query_len, decode.query_len));
+            clipped_verifies.push((decode.kv_len - decode.query_len, decode.query_len));
         } else {
             decode_kv_lens.push(decode.kv_len);
         }
@@ -1395,13 +1440,20 @@ fn normalize_speculative_input(
     Ok(NormalizedBatch {
         target: Pass::new(
             sorted_capture_sizes,
-            target_prefills,
+            group.prefill_chunk_pairs.clone(),
             decode_kv_lens,
             verify_width,
+            clipped_verifies,
         ),
         request_count,
         logits_rows: group.prefill_chunk_pairs.len() as u32 + decode_tokens,
-        recurrent: Pass::new(sorted_capture_sizes, Vec::new(), recurrent_contexts, 1),
+        recurrent: Pass::new(
+            sorted_capture_sizes,
+            Vec::new(),
+            recurrent_contexts,
+            1,
+            Vec::new(),
+        ),
     })
 }
 
@@ -1569,7 +1621,7 @@ mod tests {
     fn a_verify_clipped_at_the_model_limit_runs_as_a_varlen_row() {
         // Two rows of a request at 131069 resident keys leave its sampled
         // position at 131071. They cannot join the uniform 4-row verify graph:
-        // the step runs piecewise and prices them on the prefill path.
+        // the step runs piecewise.
         let mut input = step(vec![], vec![4096; 5]);
         let group = &mut input.groups[0];
         group.decode_requests.push(SpeculativeDecodeInput {
@@ -1579,12 +1631,51 @@ mod tests {
         group.decode_tokens += 2;
         group.batch_tokens += 2;
         let b = normalize(&input).unwrap();
-        assert_eq!(b.target.prefills, [(131069, 2)]);
+        assert!(b.target.prefills.is_empty());
+        assert_eq!(b.target.clipped, [(131069, 2)]);
         assert_eq!(b.target.decode_kv_lens, [4096; 5]);
         assert_eq!(b.target.tokens(), 22);
         assert!(!b.target.full_graph);
+        // QSA sees a prefill; GDN and the PLE conv a sixth, shorter spec decode.
+        assert_eq!(b.target.qsa_input().prefill_chunks, [(131069, 2)]);
+        let gdn = b.target.gdn_input();
+        assert!(gdn.prefill_lengths.is_empty());
+        assert_eq!((gdn.spec_decodes, gdn.spec_tokens), (6, 22));
+        let ple = b.target.ple_input();
+        assert_eq!(
+            (ple.spec_requests, ple.spec_tokens, ple.prefill_requests),
+            (6, 22, 0)
+        );
         assert_eq!((b.request_count, b.logits_rows), (6, 22));
         assert_eq!(b.recurrent.decode_kv_lens.len(), 6);
+        built().check_input(&input).unwrap();
+    }
+
+    /// A lone one-row verify carries no draft: the PLE conv's plain decode,
+    /// and on GDN the one-token chunk standing in for the unmodeled plain
+    /// decode path.
+    #[test]
+    fn a_lone_one_row_verify_is_a_plain_decode() {
+        let mut input = step(vec![], vec![]);
+        let group = &mut input.groups[0];
+        group.decode_requests.push(SpeculativeDecodeInput {
+            kv_len: 131071,
+            query_len: 1,
+        });
+        group.decode_tokens += 1;
+        group.batch_tokens += 1;
+        let b = normalize(&input).unwrap();
+        let gdn = b.target.gdn_input();
+        assert_eq!(
+            (
+                gdn.prefill_lengths.as_slice(),
+                gdn.spec_decodes,
+                gdn.non_spec_decodes
+            ),
+            (&[1][..], 0, 0)
+        );
+        let ple = b.target.ple_input();
+        assert_eq!((ple.decode_requests, ple.spec_requests), (1, 0));
         built().check_input(&input).unwrap();
     }
 

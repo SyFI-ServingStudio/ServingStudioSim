@@ -107,9 +107,12 @@ pub struct PleLocalWorkletInput {
     pub eager_rows: u32,
     /// Non-speculative single-token decode requests.
     pub decode_requests: u32,
-    /// Speculative verify requests, `spec_query_len` rows each.
+    /// Speculative verify requests, priced at `spec_query_len` rows each.
     pub spec_requests: u32,
     pub spec_query_len: u32,
+    /// Their real rows: `spec_query_len` each, fewer for a verify clipped at
+    /// `max_model_len`.
+    pub spec_tokens: u32,
     pub prefill_requests: u32,
     pub prefill_tokens: u32,
 }
@@ -153,9 +156,14 @@ impl Work {
             input.prefill_tokens == 0,
             "prefill requests and prefill tokens must be both zero or both positive"
         );
-        let real = input.decode_requests
-            + input.spec_requests * input.spec_query_len
-            + input.prefill_tokens;
+        assert!(
+            input.spec_tokens <= input.spec_requests * input.spec_query_len,
+            "{} spec tokens for {} verify requests of {} rows",
+            input.spec_tokens,
+            input.spec_requests,
+            input.spec_query_len
+        );
+        let real = input.decode_requests + input.spec_tokens + input.prefill_tokens;
         assert!(
             input.eager_rows >= real && input.graph_rows >= real,
             "PLE rows (graph {}, eager {}) below the {real} scheduled tokens",
@@ -468,6 +476,7 @@ mod tests {
             decode_requests: decodes,
             spec_requests: specs,
             spec_query_len: 4,
+            spec_tokens: 4 * specs,
             prefill_requests: prefills,
             prefill_tokens,
         }
