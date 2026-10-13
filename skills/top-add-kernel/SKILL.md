@@ -81,6 +81,15 @@ change the implementation but not those meanings. Create a new kind only when
 this comparison proves that reuse would change the contract; when source review
 is inconclusive, require a matched-shape A/B with identical logical I/O.
 
+Two rules apply to every kernel, new kind or new backend (see
+`top-add-new-arch` "Modeling rules"):
+
+- The row key holds model geometry and dtypes only. A deployment setting enters
+  the key only with a measurement showing that it changes kernel time.
+- The grid spans the full deployment range (tokens per step, batch, context)
+  on a generic axis. Never pick grid points from one workload's shapes, and
+  never add an input cap that refuses a shape the framework would run.
+
 1. Coordinate the Python profiling orchestrator.
 
 Use `orchestrator-add-kernel-to-python-profile` to define and validate the
