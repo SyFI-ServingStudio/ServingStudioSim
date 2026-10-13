@@ -105,7 +105,7 @@ Each module re-exports its `{Worklet, Config, Input, Resolved}` quartet through
 | `inkling_vllm_nvfp4_rel_attn_moe` | `inkling_attn_local`, `inkling_router_local`, `glm53_mlp_local` (dense FFN and sink experts), `nvfp4_moe_local`, `bf16_moe_local` |
 | `mimo_v2_vllm_fp8_swa_moe` | `mimo_v2_attn_local`, `glm53_mlp_local` (layer-0 dense FFN), `nvfp4_moe_local` (weight-only: `activation_format` set, no quant leaf) |
 | `qwen35_vllm_nvfp4_gdn_dense` | `vllm_qwen35_gdn_local`, `vllm_qwen35_gated_gqa_local`, `vllm_nvfp4_swiglu_mlp_local` (siblings of the `qwen36_*` and `glm53_mlp_local` sections: the ModelOpt mixed-precision recipe launches different kinds, so the op graph differs); the arch owns the multi-addend RMSNorms |
-| `qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative` | `hc_mix_local`, `ple_local`, `vllm_bf16_gdn_spec_local`, `vllm_qsa_attn_local`, `vllm_moe_shared_stream_local` (NVFP4 routed + BF16 shared expert); draft: `mtp_fc_prelude_local`, `vllm_fp8_moe_shared_stream_local` (FP8-block MTP experts) and the same HC / QSA sections; `spec_head_local`, `spec_sample_local`, `engine_prep_local` |
+| `qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative` | `hc_mix_local`, `ple_local`, `vllm_bf16_gdn_spec_local`, `vllm_qsa_attn_local`, `vllm_nvfp4_moe_shared_stream_local` (NVFP4 routed + `bf16_gated_shared_expert_local`); draft: `mtp_fc_prelude_local`, `vllm_fp8_moe_shared_stream_local` (FP8-block MTP experts) and the same HC / QSA sections; `spec_head_local`, `spec_sample_local`, `engine_prep_local` |
 
 When a provider-prefixed module has a neutral sibling, it is the **same sync
 section** cut into the leaves that provider actually launches (for example,

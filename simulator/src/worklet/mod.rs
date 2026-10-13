@@ -73,13 +73,13 @@ pub mod spec_head_local;
 pub mod spec_sample_local;
 pub mod vllm_bf16_gdn_spec_local;
 pub mod vllm_fp8_attn_block_tp;
-pub mod vllm_fp8_moe_shared_stream_local;
 pub mod vllm_fp8_moe_expert_compute_local;
 pub mod vllm_fp8_moe_router_local;
+pub mod vllm_fp8_moe_shared_stream_local;
 pub mod vllm_glm52_dense_ffn_local;
 pub mod vllm_glm52_dsa_attn_local;
 pub mod vllm_glm52_shared_expert_local;
-pub mod vllm_moe_shared_stream_local;
+pub mod vllm_nvfp4_moe_shared_stream_local;
 pub mod vllm_nvfp4_swiglu_mlp_local;
 pub mod vllm_qsa_attn_local;
 pub mod vllm_qwen35_gated_gqa_local;
@@ -91,6 +91,10 @@ pub use attn_block_tp::{
 };
 pub use attn_local::{
     AttnLocalWorklet, AttnLocalWorkletConfig, AttnLocalWorkletInput, AttnLocalWorkletResolved,
+};
+pub use bf16_gated_shared_expert_local::{
+    Bf16GatedSharedExpertLocalWorklet, Bf16GatedSharedExpertLocalWorkletConfig,
+    Bf16GatedSharedExpertLocalWorkletInput, Bf16GatedSharedExpertLocalWorkletResolved,
 };
 pub use bf16_moe_local::{
     Bf16MoeLocalWorklet, Bf16MoeLocalWorkletConfig, Bf16MoeLocalWorkletInput,
@@ -152,6 +156,10 @@ pub use dflash2_selector_local::{
     Dflash2SelectorLocalWorklet, Dflash2SelectorLocalWorkletConfig,
     Dflash2SelectorLocalWorkletInput, Dflash2SelectorLocalWorkletResolved,
 };
+pub use engine_prep_local::{
+    EnginePrepLocalWorklet, EnginePrepLocalWorkletConfig, EnginePrepLocalWorkletInput,
+    EnginePrepLocalWorkletResolved,
+};
 pub use fp8_attn_block_tp::{
     Fp8AttnBlockTpWorklet, Fp8AttnBlockTpWorkletConfig, Fp8AttnBlockTpWorkletInput,
     Fp8AttnBlockTpWorkletResolved,
@@ -202,6 +210,9 @@ pub use glm53_moe_local::{
     Glm53RoutedMoeLocalWorklet, Glm53RoutedMoeLocalWorkletConfig, Glm53RoutedMoeLocalWorkletInput,
     Glm53RoutedMoeLocalWorkletResolved,
 };
+pub use hc_mix_local::{
+    HcMixLocalWorklet, HcMixLocalWorkletConfig, HcMixLocalWorkletInput, HcMixLocalWorkletResolved,
+};
 pub use inkling_attn_local::{
     InklingAttnLocalWorklet, InklingAttnLocalWorkletConfig, InklingAttnLocalWorkletInput,
     InklingAttnLocalWorkletResolved,
@@ -221,6 +232,10 @@ pub use moe_expert_compute_local::{
     uniform_local_ppm, MoeExpertComputeLocalWorklet, MoeExpertComputeLocalWorkletConfig,
     MoeExpertComputeLocalWorkletInput, MoeExpertComputeLocalWorkletResolved,
 };
+pub use mtp_fc_prelude_local::{
+    MtpFcPreludeLocalWorklet, MtpFcPreludeLocalWorkletConfig, MtpFcPreludeLocalWorkletInput,
+    MtpFcPreludeLocalWorkletResolved,
+};
 pub use native_fp8_moe_router_local::{
     NativeFp8MoeRouterLocalWorklet, NativeFp8MoeRouterLocalWorkletConfig,
     NativeFp8MoeRouterLocalWorkletInput, NativeFp8MoeRouterLocalWorkletResolved,
@@ -236,6 +251,9 @@ pub use native_moe_router_local::{
 pub use nvfp4_moe_local::{
     Nvfp4MoeLocalWorklet, Nvfp4MoeLocalWorkletConfig, Nvfp4MoeLocalWorkletInput,
     Nvfp4MoeLocalWorkletResolved,
+};
+pub use ple_local::{
+    PleLocalWorklet, PleLocalWorkletConfig, PleLocalWorkletInput, PleLocalWorkletResolved,
 };
 pub use post_attn_local::{
     PostAttnLocalWorklet, PostAttnLocalWorkletConfig, PostAttnLocalWorkletInput,
@@ -290,6 +308,18 @@ pub use sglang_moe_finalize_local::{
     SglangMoeFinalizeLocalWorklet, SglangMoeFinalizeLocalWorkletConfig,
     SglangMoeFinalizeLocalWorkletInput, SglangMoeFinalizeLocalWorkletResolved,
 };
+pub use spec_head_local::{
+    SpecHeadLocalWorklet, SpecHeadLocalWorkletConfig, SpecHeadLocalWorkletInput,
+    SpecHeadLocalWorkletResolved,
+};
+pub use spec_sample_local::{
+    SpecSampleLocalWorklet, SpecSampleLocalWorkletConfig, SpecSampleLocalWorkletInput,
+    SpecSampleLocalWorkletResolved,
+};
+pub use vllm_bf16_gdn_spec_local::{
+    VllmBf16GdnSpecLocalWorklet, VllmBf16GdnSpecLocalWorkletConfig,
+    VllmBf16GdnSpecLocalWorkletInput, VllmBf16GdnSpecLocalWorkletResolved,
+};
 pub use vllm_fp8_attn_block_tp::{
     VllmFp8AttnBlockTpWorklet, VllmFp8AttnBlockTpWorkletConfig, VllmFp8AttnBlockTpWorkletInput,
     VllmFp8AttnBlockTpWorkletResolved,
@@ -301,6 +331,10 @@ pub use vllm_fp8_moe_expert_compute_local::{
 pub use vllm_fp8_moe_router_local::{
     VllmFp8MoeRouterLocalWorklet, VllmFp8MoeRouterLocalWorkletConfig,
     VllmFp8MoeRouterLocalWorkletInput, VllmFp8MoeRouterLocalWorkletResolved,
+};
+pub use vllm_fp8_moe_shared_stream_local::{
+    VllmFp8MoeSharedStreamLocalWorklet, VllmFp8MoeSharedStreamLocalWorkletConfig,
+    VllmFp8MoeSharedStreamLocalWorkletInput, VllmFp8MoeSharedStreamLocalWorkletResolved,
 };
 pub use vllm_glm52_dense_ffn_local::{
     VllmGlm52DenseFfnLocalWorklet, VllmGlm52DenseFfnLocalWorkletConfig,
@@ -315,9 +349,17 @@ pub use vllm_glm52_shared_expert_local::{
     VllmGlm52SharedExpertLocalWorklet, VllmGlm52SharedExpertLocalWorkletConfig,
     VllmGlm52SharedExpertLocalWorkletInput, VllmGlm52SharedExpertLocalWorkletResolved,
 };
+pub use vllm_nvfp4_moe_shared_stream_local::{
+    VllmNvfp4MoeSharedStreamLocalWorklet, VllmNvfp4MoeSharedStreamLocalWorkletConfig,
+    VllmNvfp4MoeSharedStreamLocalWorkletInput, VllmNvfp4MoeSharedStreamLocalWorkletResolved,
+};
 pub use vllm_nvfp4_swiglu_mlp_local::{
     VllmNvfp4SwigluMlpLocalWorklet, VllmNvfp4SwigluMlpLocalWorkletConfig,
     VllmNvfp4SwigluMlpLocalWorkletInput, VllmNvfp4SwigluMlpLocalWorkletResolved,
+};
+pub use vllm_qsa_attn_local::{
+    VllmQsaAttnLocalWorklet, VllmQsaAttnLocalWorkletConfig, VllmQsaAttnLocalWorkletInput,
+    VllmQsaAttnLocalWorkletResolved,
 };
 pub use vllm_qwen35_gated_gqa_local::{
     VllmQwen35GatedGqaLocalWorklet, VllmQwen35GatedGqaLocalWorkletConfig,

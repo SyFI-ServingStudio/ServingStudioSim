@@ -92,9 +92,9 @@ use crate::worklet::vllm_fp8_moe_shared_stream_local::{
     VllmFp8MoeSharedStreamLocalWorklet, VllmFp8MoeSharedStreamLocalWorkletConfig,
     VllmFp8MoeSharedStreamLocalWorkletInput, VllmFp8MoeSharedStreamLocalWorkletResolved,
 };
-use crate::worklet::vllm_moe_shared_stream_local::{
-    VllmMoeSharedStreamLocalWorklet, VllmMoeSharedStreamLocalWorkletConfig,
-    VllmMoeSharedStreamLocalWorkletInput, VllmMoeSharedStreamLocalWorkletResolved,
+use crate::worklet::vllm_nvfp4_moe_shared_stream_local::{
+    VllmNvfp4MoeSharedStreamLocalWorklet, VllmNvfp4MoeSharedStreamLocalWorkletConfig,
+    VllmNvfp4MoeSharedStreamLocalWorkletInput, VllmNvfp4MoeSharedStreamLocalWorkletResolved,
 };
 use crate::worklet::vllm_qsa_attn_local::{
     VllmQsaAttnLocalWorklet, VllmQsaAttnLocalWorkletConfig, VllmQsaAttnLocalWorkletInput,
@@ -242,7 +242,7 @@ pub struct Qwen4ExpVllmConfigs {
     /// PLE after layer 0 (a combine is pending) and in layer 0.
     pub ple: PleLocalWorkletConfig,
     pub ple_first: PleLocalWorkletConfig,
-    pub moe: VllmMoeSharedStreamLocalWorkletConfig,
+    pub moe: VllmNvfp4MoeSharedStreamLocalWorkletConfig,
     /// `_mtp_hidden_buffer[:T].copy_(multi_hidden)`.
     pub mtp_hidden_copy: ElementwiseKernelConfig,
     /// The target's lm_head; the drafter reuses it as `draft_head`, which
@@ -443,7 +443,7 @@ pub fn build_configs(
         qsa_recurrent: qsa(1),
         ple: ple(true),
         ple_first: ple(false),
-        moe: VllmMoeSharedStreamLocalWorkletConfig {
+        moe: VllmNvfp4MoeSharedStreamLocalWorkletConfig {
             hidden: model.hidden.into(),
             num_experts: model.num_experts.into(),
             activation_dtype: ACTIVATION_DTYPE,
@@ -616,7 +616,7 @@ pub struct Qwen4ExpVllmResolved {
     pub qsa_recurrent: VllmQsaAttnLocalWorkletResolved,
     pub ple: PleLocalWorkletResolved,
     pub ple_first: PleLocalWorkletResolved,
-    pub moe: VllmMoeSharedStreamLocalWorkletResolved,
+    pub moe: VllmNvfp4MoeSharedStreamLocalWorkletResolved,
     pub head: SpecHeadLocalWorkletResolved,
     pub draft_head: SpecHeadLocalWorkletResolved,
     pub sample: SpecSampleLocalWorkletResolved,
@@ -636,7 +636,7 @@ pub fn resolve_configs(cfgs: &Qwen4ExpVllmConfigs) -> Qwen4ExpVllmResolved {
         qsa_recurrent: VllmQsaAttnLocalWorklet::resolve_config(&cfgs.qsa_recurrent),
         ple: PleLocalWorklet::resolve_config(&cfgs.ple),
         ple_first: PleLocalWorklet::resolve_config(&cfgs.ple_first),
-        moe: VllmMoeSharedStreamLocalWorklet::resolve_config(&cfgs.moe),
+        moe: VllmNvfp4MoeSharedStreamLocalWorklet::resolve_config(&cfgs.moe),
         head: SpecHeadLocalWorklet::resolve_config(&cfgs.head),
         draft_head: SpecHeadLocalWorklet::resolve_config(&cfgs.draft_head),
         sample: SpecSampleLocalWorklet::resolve_config(&cfgs.sample),
@@ -793,7 +793,7 @@ struct LayerGroup {
     attn_mix: HcMixLocalWorklet,
     mixer: Mixer,
     mlp_mix: HcMixLocalWorklet,
-    moe: VllmMoeSharedStreamLocalWorklet,
+    moe: VllmNvfp4MoeSharedStreamLocalWorklet,
 }
 
 impl LayerGroup {
@@ -835,7 +835,7 @@ impl LayerGroup {
                 )?),
             },
             mlp_mix: HcMixLocalWorklet::build(format!("{p}.mlp_hc"), r.hc_combine.clone(), bridge)?,
-            moe: VllmMoeSharedStreamLocalWorklet::build(format!("{p}.moe"), r.moe.clone(), bridge)?,
+            moe: VllmNvfp4MoeSharedStreamLocalWorklet::build(format!("{p}.moe"), r.moe.clone(), bridge)?,
         })
     }
 
@@ -874,7 +874,7 @@ impl LayerGroup {
         }
         self.mlp_mix.eval(&rows, ev);
         self.moe.eval(
-            &VllmMoeSharedStreamLocalWorkletInput {
+            &VllmNvfp4MoeSharedStreamLocalWorkletInput {
                 num_tokens: pass.padded,
             },
             ev,
