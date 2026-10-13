@@ -47,6 +47,10 @@ use crate::timing::kernels::EngramLookupKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
+use crate::timing::kernels::{
+    MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput, SiluAndMulKernelInput,
+    StaticFp8QuantKernelInput,
+};
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
 /// fan-out the attention op summed into one slot (many prefill requests fold to a
@@ -188,6 +192,10 @@ log_inputs! {
     DsaTopkPrefill => DsaTopkPrefillKernelInput,
     VllmFusedMoe => VllmFusedMoeKernelInput,
     VllmMlaRope => VllmMlaRopeKernelInput,
+    MultiAddRmsNorm => MultiAddRmsNormKernelInput,
+    SiluAndMul => SiluAndMulKernelInput,
+    StaticFp8Quant => StaticFp8QuantKernelInput,
+    QkRmsNormRopeGate => QkRmsNormRopeGateKernelInput,
     AllReduce   => AllReduceKernelInput,
     AllReduceFusion => AllReduceFusionKernelInput,
     AllReduceResidualRmsNorm => AllReduceResidualRmsNormKernelInput,
