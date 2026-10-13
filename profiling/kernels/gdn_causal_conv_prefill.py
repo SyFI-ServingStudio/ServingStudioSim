@@ -82,6 +82,9 @@ DOC = KernelDoc(
         "dao_channellast passes no initial state. A continuation chunk would read "
         "the slot as initial_states and so needs its final state in a separate "
         "buffer plus a small copy back, which these rows leave out.",
+        "vllm_triton stores the state pool in the layout the installed vLLM "
+        "selects (state-first by default) and passes the transposed view, as "
+        "vLLM does; the layout moves the kernel time by up to a quarter.",
     ),
     reference="profiling.runners.attention.gdn_causal_conv_prefill_reference",
 )

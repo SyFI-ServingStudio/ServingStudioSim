@@ -72,6 +72,9 @@ DOC = KernelDoc(
         "The torch reference checks request indices on the GPU inside each timed call.",
         "FLOPs and bytes count the operation itself, not the torch backend's "
         "extra tensors and launches.",
+        "vllm_triton stores the state pool in the layout the installed vLLM "
+        "selects (state-first by default) and passes the transposed view, as "
+        "vLLM does; the layout moves the kernel time by up to a quarter.",
     ),
     reference="profiling.runners.attention.gdn_causal_conv_decode_reference",
 )
