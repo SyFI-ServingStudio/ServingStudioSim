@@ -6,42 +6,55 @@ Every number is read from a completed Analyzer report by the formula table in
 
 | Case | kernel_abs_pct | kernel_signed_pct | map_coverage_pct | e2e_mean_pct | output_tps_pct | server_tpot_mean_pct | server_ttft_mean_pct |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| tp4_ep4/01_micro_throughput_c100 | +5.07% | -1.33% | 98.91% | -7.52% | +7.67% | -5.37% | -0.17% |
-| tp4_ep4/02_graph_boundaries_c100 | +5.19% | -2.59% | 98.72% | -7.68% | +7.02% | -5.61% | +2.00% |
-| tp4_ep4/03_balanced_anchor_c32 | +2.27% | -0.80% | 99.07% | -2.39% | +2.01% | -0.91% | -7.54% |
-| tp4_ep4/04_prefill_spectrum_c32 | +4.10% | -3.36% | 99.48% | -5.25% | +5.39% | -2.82% | -8.59% |
-| tp4_ep4/05_decode_spectrum_c64 | +2.53% | -2.28% | 98.93% | -1.58% | -0.38% | -2.18% | +1.94% |
-| tp4_ep4/06_long_long_c8 | +2.78% | +0.08% | 99.43% | +3.57% | -3.83% | +4.25% | +1.19% |
-| tp4_ep4/07_quadrant_interference_c48 | +1.86% | -1.60% | 99.03% | -0.06% | -0.61% | -1.34% | -3.27% |
-| tp4_ep4/08_completion_churn_c96 | +2.23% | -1.19% | 98.93% | -0.52% | -0.49% | -1.37% | +1.45% |
-| tp4_ep4/09_rate_knee | +3.69% | +3.09% | 98.94% | -3.47% | -0.16% | -3.31% | -10.29% |
-| tp4_ep4/10_full_saturation_rate | +4.37% | -3.90% | 99.11% | -3.76% | +2.54% | -4.30% | -1.69% |
-| tp4_ep4/11_long_prefill_ladder_c1 | +3.72% | -0.72% | 99.44% | -5.66% | +6.04% | +3.16% | -4.83% |
-| tp4_ep4/12_ultra_context_decode_c1 | +4.84% | +0.42% | 99.26% | +4.45% | -4.26% | +5.63% | -5.04% |
-| tp4_ep4/13_generation_length_matrix_c8 | +3.08% | +0.03% | 99.24% | +5.71% | -6.99% | +4.86% | -5.09% |
-| tp4_ep4_kv14/14_near_full_long_decode_c100 | +2.93% | -2.46% | 99.63% | -0.42% | -0.15% | -0.25% | -3.67% |
-| tp4_ep4_kv15/15_kv_overcommit_mixed_churn_c100 | +1.28% | -0.74% | 99.74% | +2.12% | -2.74% | +1.97% | +2.58% |
+| tp4_ep4/01_micro_throughput_c100 | +5.05% | -1.36% | 98.91% | -7.53% | +7.68% | -5.38% | -0.24% |
+| tp4_ep4/02_graph_boundaries_c100 | +5.17% | -2.58% | 98.72% | -7.65% | +6.99% | -5.58% | +2.01% |
+| tp4_ep4/03_balanced_anchor_c32 | +2.25% | -0.45% | 99.07% | -1.70% | +1.33% | -0.16% | -7.55% |
+| tp4_ep4/04_prefill_spectrum_c32 | +4.08% | -3.28% | 99.48% | -5.12% | +5.24% | -2.66% | -8.59% |
+| tp4_ep4/05_decode_spectrum_c64 | +2.55% | -2.31% | 98.93% | -1.62% | -0.35% | -2.22% | +1.87% |
+| tp4_ep4/06_long_long_c8 | +2.76% | -0.16% | 99.43% | +3.44% | -3.71% | +4.13% | +0.92% |
+| tp4_ep4/07_quadrant_interference_c48 | +1.87% | -1.62% | 99.03% | -0.17% | -0.47% | -1.39% | -3.29% |
+| tp4_ep4/08_completion_churn_c96 | +2.19% | -1.24% | 98.93% | -0.65% | -0.31% | -1.40% | +1.43% |
+| tp4_ep4/09_rate_knee | +3.89% | +3.49% | 98.94% | -3.46% | -0.13% | -3.28% | -9.82% |
+| tp4_ep4/10_full_saturation_rate | +4.32% | -3.86% | 99.11% | -3.69% | +2.50% | -4.24% | -1.71% |
+| tp4_ep4/11_long_prefill_ladder_c1 | +3.78% | -0.71% | 99.44% | -5.67% | +6.04% | +3.41% | -4.90% |
+| tp4_ep4/12_ultra_context_decode_c1 | +5.04% | +0.51% | 99.26% | +4.48% | -4.28% | +5.75% | -5.12% |
+| tp4_ep4/13_generation_length_matrix_c8 | +3.15% | +0.08% | 99.24% | +5.64% | -7.01% | +4.72% | -5.10% |
+| tp4_ep4/16_prefill_spectrum_chunk4k_c32 | +4.25% | -3.75% | 99.59% | -5.51% | +5.71% | -3.90% | -5.16% |
+| tp4_ep4/17_prefill_spectrum_chunk8k_c32 | +2.52% | +0.26% | 99.77% | -0.49% | +0.47% | +1.52% | -0.68% |
+| tp4_ep4/18_quadrant_interference_chunk4k_c48 | +3.03% | -2.94% | 99.05% | -1.61% | +1.00% | -4.15% | -1.02% |
+| tp4_ep4/19_quadrant_interference_chunk8k_c48 | +2.87% | -1.91% | 99.32% | -1.54% | +0.92% | -0.79% | -2.17% |
+| tp4_ep4_kv14/14_near_full_long_decode_c100 | +3.05% | -2.59% | 99.63% | -0.21% | -0.31% | -0.02% | -3.76% |
+| tp4_ep4_kv15/15_kv_overcommit_mixed_churn_c100 | +1.47% | -1.18% | 99.74% | +2.49% | -2.96% | +2.44% | +2.50% |
 
 ## Out of tolerance
 
-- `tp4_ep4/01_micro_throughput_c100` **kernel_abs_pct** +5.07% exceeds 5
+- `tp4_ep4/01_micro_throughput_c100` **kernel_abs_pct** +5.05% exceeds 5
 - `tp4_ep4/01_micro_throughput_c100` **decode_batch_mean_pct** +3.29% exceeds 1
 - `tp4_ep4/01_micro_throughput_c100` **iterations_pct** -3.18% exceeds 1
 - `tp4_ep4/01_micro_throughput_c100` **prefill_tokens_mean_pct** +3.29% exceeds 1
 - `tp4_ep4/01_micro_throughput_c100` **scheduled_kv_mean_pct** +3.29% exceeds 1
-- `tp4_ep4/01_micro_throughput_c100` **e2e_mean_pct** -7.52% exceeds 7
-- `tp4_ep4/02_graph_boundaries_c100` **kernel_abs_pct** +5.19% exceeds 5
+- `tp4_ep4/01_micro_throughput_c100` **e2e_mean_pct** -7.53% exceeds 7
+- `tp4_ep4/02_graph_boundaries_c100` **kernel_abs_pct** +5.17% exceeds 5
 - `tp4_ep4/02_graph_boundaries_c100` **decode_batch_mean_pct** +1.92% exceeds 1
 - `tp4_ep4/02_graph_boundaries_c100` **iterations_pct** -1.89% exceeds 1
 - `tp4_ep4/02_graph_boundaries_c100` **prefill_tokens_mean_pct** +1.92% exceeds 1
 - `tp4_ep4/02_graph_boundaries_c100` **scheduled_kv_mean_pct** +1.92% exceeds 1
-- `tp4_ep4/02_graph_boundaries_c100` **e2e_mean_pct** -7.68% exceeds 7
+- `tp4_ep4/02_graph_boundaries_c100` **e2e_mean_pct** -7.65% exceeds 7
 - `tp4_ep4/04_prefill_spectrum_c32` **decode_batch_mean_pct** +2.54% exceeds 1
 - `tp4_ep4/04_prefill_spectrum_c32` **iterations_pct** -2.48% exceeds 1
 - `tp4_ep4/04_prefill_spectrum_c32` **prefill_tokens_mean_pct** +2.54% exceeds 1
 - `tp4_ep4/04_prefill_spectrum_c32` **scheduled_kv_mean_pct** +2.54% exceeds 1
-- `tp4_ep4/09_rate_knee` **decode_batch_mean_pct** -2.20% exceeds 1
-- `tp4_ep4/09_rate_knee` **iterations_pct** +2.25% exceeds 1
-- `tp4_ep4/09_rate_knee` **prefill_tokens_mean_pct** -2.20% exceeds 1
-- `tp4_ep4/09_rate_knee` **scheduled_kv_mean_pct** -2.20% exceeds 1
+- `tp4_ep4/09_rate_knee` **decode_batch_mean_pct** -2.16% exceeds 1
+- `tp4_ep4/09_rate_knee` **iterations_pct** +2.21% exceeds 1
+- `tp4_ep4/09_rate_knee` **prefill_tokens_mean_pct** -2.16% exceeds 1
+- `tp4_ep4/09_rate_knee` **scheduled_kv_mean_pct** -2.16% exceeds 1
+- `tp4_ep4/12_ultra_context_decode_c1` **kernel_abs_pct** +5.04% exceeds 5
+- `tp4_ep4/16_prefill_spectrum_chunk4k_c32` **decode_batch_mean_pct** +1.90% exceeds 1
+- `tp4_ep4/16_prefill_spectrum_chunk4k_c32` **iterations_pct** -1.87% exceeds 1
+- `tp4_ep4/16_prefill_spectrum_chunk4k_c32` **prefill_tokens_mean_pct** +1.90% exceeds 1
+- `tp4_ep4/16_prefill_spectrum_chunk4k_c32` **scheduled_kv_mean_pct** +1.74% exceeds 1
+- `tp4_ep4/17_prefill_spectrum_chunk8k_c32` **decode_batch_mean_pct** +1.59% exceeds 1
+- `tp4_ep4/17_prefill_spectrum_chunk8k_c32` **iterations_pct** -1.56% exceeds 1
+- `tp4_ep4/17_prefill_spectrum_chunk8k_c32` **prefill_tokens_mean_pct** +1.59% exceeds 1
+- `tp4_ep4/17_prefill_spectrum_chunk8k_c32` **scheduled_kv_mean_pct** +1.49% exceeds 1
 

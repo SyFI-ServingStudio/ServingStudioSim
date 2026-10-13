@@ -1,4 +1,4 @@
-# feat(mimo): MiMo-V2.6-Flash-RL on vLLM, B200 TP4/EP4, with kernel alignment and the 15-case campaign
+# feat(mimo): MiMo-V2.6-Flash-RL on vLLM, B200 TP4/EP4, with kernel alignment and the 19-case campaign
 
 ## Purpose
 
@@ -10,11 +10,13 @@ as the vLLM fork serves it on four B200s:
 - MXFP4 experts with BF16 activations;
 - MNNVL fused all-reduce + RMSNorm.
 
-Check the model against vLLM captures: `diverse_100` and the 15 standard operating points.
+Check the model against vLLM captures: `diverse_100` and 19 operating points over chunk 2048, 4096 and 8192.
 
 - **L1 kinds and backends.**
   - One new kind, `fa4_varlen_attention` / `vllm_fa4`: vLLM's FA4 varlen call (FLASH_ATTN_DIFFKV).
     - It is priced in CTA waves and whole 128-key window tiles.
+    - Rows are keyed on `cuda_graph`: a graph replay fixes the split choice at capture over `max_model_len`,
+      an eager call picks it from the real batch. The capture bound is not a key.
     - Prefill knots sit on FlashPrepareScheduler's split cliffs.
     - It shares the FA4 batch projection with `rel_bias_attention`.
   - New backends on existing kinds:
@@ -30,25 +32,27 @@ Check the model against vLLM captures: `diverse_100` and the 15 standard operati
   - The routed MoE reuses `Nvfp4MoeLocalWorklet` through a new `activation_format` (weight-only experts, no
     quant leaf).
   - KV follows vLLM's hybrid allocator (sliding-window groups padded to whole groups).
-- **FULL-graph decode cap** (`simulator/src/arch/cudagraph.rs`, shared). vLLM keeps a FULL uniform-decode key
-  only for capture sizes up to `max_num_seqs`. MiMo and Inkling gain an arch param `max_num_seqs` (default
-  1024, vLLM's B200 server default). Decode steps past the cap are priced as PIECEWISE: unpadded attention,
-  and Inkling's sinks inline. The GLM archs only move their `graph_padded_tokens` import.
+- **`TpAllReduceRmsNormOp`** (`simulator/src/op/comm/tp_all_reduce_rms_norm.rs`, shared op). Each TP boundary
+  runs vLLM's fused MNNVL all-reduce + residual + RMSNorm up to its token cap (4096 at TP4). Above the cap it
+  runs the unfused path, NCCL all-reduce then the Triton residual add + RMSNorm, instead of refusing the step.
+  At TP1 only the norm runs. Only MiMo uses it.
 - **model.work.**
   - A `SlidingWindowGQA` spec, plus GQA `v_head_dim` and `attention_sinks`.
   - FP8 `ignored_layers` and MXFP4 store dtype in `quantization.py`.
   - The MiMo accountant.
   - The TP4/EP4 location map, and a Rust test that checks it against the compiled locations.
 - **Presets.**
-  - Public arch and sim presets: replicas 1 / 2, `max_num_seqs` 100, the measured KV pool and multiplier.
+  - Public arch and sim presets: replicas 1 / 2, the measured KV pool and multiplier.
   - Catalog entries in `model/catalog.yaml` and `model/arch_catalog.yaml`.
   - Routing reads the `diverse_100` token corpus in `UW-SyFI/servingstudio-workload` at `18506fd7`.
   - The timing-predict case presets moved to the experiment tree.
-- **Alignment.** The `mimo_v26_flash_b200_tp4` pack covers the 15 operating points:
-  - GLM-5.2's cases scaled to `max_num_seqs` 100 and a 131072 context;
+- **Alignment.** The `mimo_v26_flash_b200_tp4` pack covers 19 operating points:
+  - cases 01-15: GLM-5.2's cases scaled to vLLM's `--max-num-seqs` 100 and a 131072 context;
+  - cases 16-19: the prefill spectrum and IO quadrants at chunk 4096 and 8192, so steps cross the fused
+    all-reduce cap;
   - warmed passes, with CUDA graphs captured to 2048 tokens;
-  - KV pools pinned for cases 14/15;
-  - the default tolerances and the label rules.
+  - KV pools pinned for cases 14/15 and measured per chunk for 16-19;
+  - the default tolerances and the label rules, including the unfused boundary's kernels.
 - **Changes that reach other models** are listed in [`README.md`](README.md#changes-that-reach-other-models).
   The one that moves a prediction is the refresh of five `single_gemm` / `torch_linear_vllm` rows (n 4096,
   k 2048, m 1-16), which GLM-5.3-Flash also reads.
@@ -72,9 +76,13 @@ Also run:
   nsys capture, job 6264.
 - **Simulation of `diverse_100`**, compared by the E2E Analyzer with the workload pass, job 4223 (same server
   args).
-- **The 15-case campaign** through `alignment-campaign`, from capture to `compare`.
-- **Cross-model checks** for the FULL-decode cap and the o_proj rows. Each runs simulations before and after:
+- **The 19-case campaign** through `alignment-campaign`, from capture to `compare`. The CPU phases of all 19
+  cases were rerun at the branch head.
+- **FA4 graph against eager rows** (job 6419, no DB writes), over global and SWA layers and context.
+- **Cross-model checks** for the shared FA4 projection, `TpAllReduceRmsNormOp` and the o_proj rows. Each runs
+  simulations before and after:
   - Inkling-NVFP4 campaign cases 01 and 10;
+  - MiMo campaign cases 02, 10 and 11 under the fused cap;
   - GLM-5.3-Flash-NVFP4 DP8-attn/EP8 at c512;
   - GLM-5.3-Flash TP4 campaign case 12.
 - **Cache fidelity** of `fa4_varlen_attention` against 94 off-grid B200 probes.
@@ -84,65 +92,76 @@ and the Intro site.
 
 ## Test Result
 
-- `just test-cpu`: pytest 4595 passed, 14 skipped; Rust 1440 passed, 8 ignored.
+- `just test-cpu`: pytest 4595 passed, 14 skipped; Rust 1439 passed.
 - `just test-presets`: 9 passed. Every public member, MiMo included, is fully measured in the committed
   profile.db.
-- `just test-gpu` (job 6417): 14 passed, 3 skipped. The throughput regression monitor raised no drift warning.
+- `just test-gpu` (job 6417, before the unfused all-reduce op): 14 passed, 3 skipped. The throughput
+  regression monitor raised no drift warning.
 - **Kernel alignment on `diverse_100`.** The signed median of the simulated critical path against the
   measured one, per iteration:
 
   | Deployment | Decode | Mixed | All | Coverage | Multiplier | Source |
   |---|---:|---:|---:|---:|---:|---|
-  | MiMo-V2.6-Flash-RL TP4/EP4 | +6.18% | -0.17% | +5.93% | 99.26% | 1.1103 | `logs/20261012_6_mimo_diverse100_final/check1_derived.md` |
+  | MiMo-V2.6-Flash-RL TP4/EP4 | +6.26% | -0.44% | +6.01% | 99.26% | 1.1103 | `logs/20261012_8_mimo_step11e/diverse100/check1_derived.md` |
 
 - **Simulation of `diverse_100`** at the recommended multiplier (100 requests, all ids shared):
 
   | Deployment | TTFT client mean | TPOT client mean | E2E mean | Throughput | Source |
   |---|---:|---:|---:|---:|---|
-  | MiMo-V2.6-Flash-RL TP4/EP4 | -21.5% | -1.7% | +2.9% | -3.8% | `logs/20261012_6_mimo_diverse100_final/e2e_table.md`, `mrec` |
+  | MiMo-V2.6-Flash-RL TP4/EP4 | -21.9% | -1.9% | +2.7% | -3.8% | `logs/20261012_8_mimo_step11e/diverse100/e2e_table.md`, `mrec` |
 
-  Server TTFT is -9.6%. The measured client TTFT runs 200 ms above the server's, and the simulator has no
+  Server TTFT is -10.0%. The measured client TTFT runs 200 ms above the server's, and the simulator has no
   client leg.
-- **Campaign**, all 15 cases. The table is the output of `alignment-campaign compare --markdown`, copied from
+- **Campaign**, all 19 cases. The table is the output of `alignment-campaign compare --markdown`, copied from
   [`alignment_matrix.md`](alignment_matrix.md). Each value is simulated against measured, at
   `gpu_time_multiplier` 1.0:
 
   | Case | kernel_abs_pct | kernel_signed_pct | map_coverage_pct | e2e_mean_pct | output_tps_pct | server_tpot_mean_pct | server_ttft_mean_pct |
   |---|---:|---:|---:|---:|---:|---:|---:|
-  | tp4_ep4/01_micro_throughput_c100 | +5.07% | -1.33% | 98.91% | -7.52% | +7.67% | -5.37% | -0.17% |
-  | tp4_ep4/02_graph_boundaries_c100 | +5.19% | -2.59% | 98.72% | -7.68% | +7.02% | -5.61% | +2.00% |
-  | tp4_ep4/03_balanced_anchor_c32 | +2.27% | -0.80% | 99.07% | -2.39% | +2.01% | -0.91% | -7.54% |
-  | tp4_ep4/04_prefill_spectrum_c32 | +4.10% | -3.36% | 99.48% | -5.25% | +5.39% | -2.82% | -8.59% |
-  | tp4_ep4/05_decode_spectrum_c64 | +2.53% | -2.28% | 98.93% | -1.58% | -0.38% | -2.18% | +1.94% |
-  | tp4_ep4/06_long_long_c8 | +2.78% | +0.08% | 99.43% | +3.57% | -3.83% | +4.25% | +1.19% |
-  | tp4_ep4/07_quadrant_interference_c48 | +1.86% | -1.60% | 99.03% | -0.06% | -0.61% | -1.34% | -3.27% |
-  | tp4_ep4/08_completion_churn_c96 | +2.23% | -1.19% | 98.93% | -0.52% | -0.49% | -1.37% | +1.45% |
-  | tp4_ep4/09_rate_knee | +3.69% | +3.09% | 98.94% | -3.47% | -0.16% | -3.31% | -10.29% |
-  | tp4_ep4/10_full_saturation_rate | +4.37% | -3.90% | 99.11% | -3.76% | +2.54% | -4.30% | -1.69% |
-  | tp4_ep4/11_long_prefill_ladder_c1 | +3.72% | -0.72% | 99.44% | -5.66% | +6.04% | +3.16% | -4.83% |
-  | tp4_ep4/12_ultra_context_decode_c1 | +4.84% | +0.42% | 99.26% | +4.45% | -4.26% | +5.63% | -5.04% |
-  | tp4_ep4/13_generation_length_matrix_c8 | +3.08% | +0.03% | 99.24% | +5.71% | -6.99% | +4.86% | -5.09% |
-  | tp4_ep4_kv14/14_near_full_long_decode_c100 | +2.93% | -2.46% | 99.63% | -0.42% | -0.15% | -0.25% | -3.67% |
-  | tp4_ep4_kv15/15_kv_overcommit_mixed_churn_c100 | +1.28% | -0.74% | 99.74% | +2.12% | -2.74% | +1.97% | +2.58% |
+  | tp4_ep4/01_micro_throughput_c100 | +5.05% | -1.36% | 98.91% | -7.53% | +7.68% | -5.38% | -0.24% |
+  | tp4_ep4/02_graph_boundaries_c100 | +5.17% | -2.58% | 98.72% | -7.65% | +6.99% | -5.58% | +2.01% |
+  | tp4_ep4/03_balanced_anchor_c32 | +2.25% | -0.45% | 99.07% | -1.70% | +1.33% | -0.16% | -7.55% |
+  | tp4_ep4/04_prefill_spectrum_c32 | +4.08% | -3.28% | 99.48% | -5.12% | +5.24% | -2.66% | -8.59% |
+  | tp4_ep4/05_decode_spectrum_c64 | +2.55% | -2.31% | 98.93% | -1.62% | -0.35% | -2.22% | +1.87% |
+  | tp4_ep4/06_long_long_c8 | +2.76% | -0.16% | 99.43% | +3.44% | -3.71% | +4.13% | +0.92% |
+  | tp4_ep4/07_quadrant_interference_c48 | +1.87% | -1.62% | 99.03% | -0.17% | -0.47% | -1.39% | -3.29% |
+  | tp4_ep4/08_completion_churn_c96 | +2.19% | -1.24% | 98.93% | -0.65% | -0.31% | -1.40% | +1.43% |
+  | tp4_ep4/09_rate_knee | +3.89% | +3.49% | 98.94% | -3.46% | -0.13% | -3.28% | -9.82% |
+  | tp4_ep4/10_full_saturation_rate | +4.32% | -3.86% | 99.11% | -3.69% | +2.50% | -4.24% | -1.71% |
+  | tp4_ep4/11_long_prefill_ladder_c1 | +3.78% | -0.71% | 99.44% | -5.67% | +6.04% | +3.41% | -4.90% |
+  | tp4_ep4/12_ultra_context_decode_c1 | +5.04% | +0.51% | 99.26% | +4.48% | -4.28% | +5.75% | -5.12% |
+  | tp4_ep4/13_generation_length_matrix_c8 | +3.15% | +0.08% | 99.24% | +5.64% | -7.01% | +4.72% | -5.10% |
+  | tp4_ep4/16_prefill_spectrum_chunk4k_c32 | +4.25% | -3.75% | 99.59% | -5.51% | +5.71% | -3.90% | -5.16% |
+  | tp4_ep4/17_prefill_spectrum_chunk8k_c32 | +2.52% | +0.26% | 99.77% | -0.49% | +0.47% | +1.52% | -0.68% |
+  | tp4_ep4/18_quadrant_interference_chunk4k_c48 | +3.03% | -2.94% | 99.05% | -1.61% | +1.00% | -4.15% | -1.02% |
+  | tp4_ep4/19_quadrant_interference_chunk8k_c48 | +2.87% | -1.91% | 99.32% | -1.54% | +0.92% | -0.79% | -2.17% |
+  | tp4_ep4_kv14/14_near_full_long_decode_c100 | +3.05% | -2.59% | 99.63% | -0.21% | -0.31% | -0.02% | -3.76% |
+  | tp4_ep4_kv15/15_kv_overcommit_mixed_churn_c100 | +1.47% | -1.18% | 99.74% | +2.49% | -2.96% | +2.44% | +2.50% |
 
-  195 judgements: 20 FAIL and 10 WARN. Out of tolerance:
+  247 judgements: 29 FAIL and 10 WARN. Out of tolerance:
   - **Cases 01 and 02.**
-    - E2E is -7.52% / -7.68% (tolerance 7).
-    - Kernel abs is 5.07% / 5.19% (tolerance 5). Signed is only -1.33% / -2.59%; the abs error is per-step
+    - E2E is -7.53% / -7.65% (tolerance 7).
+    - Kernel abs is 5.05% / 5.17% (tolerance 5). Signed is only -1.36% / -2.58%; the abs error is per-step
       MoE routing scatter at c100.
-  - **The iteration population of cases 01, 02, 04 and 09.** decode_batch, iterations, prefill_tokens and
-    scheduled_kv are off by 3.2-3.3%, 1.9%, 2.5% and 2.2% against 1%.
+  - **Case 12 kernel abs 5.04%.** Its c1 decode steps read +6.8% for the same rows as `diverse_100` decode
+    (router split-K, cold-L2 small launches).
+  - **The iteration population of cases 01, 02, 04, 09, 16 and 17.** decode_batch, iterations,
+    prefill_tokens and scheduled_kv are off by 3.2-3.3%, 1.9%, 2.5%, 2.2%, 1.7-1.9% and 1.5-1.6% against 1%.
 
-  Both come from per-step host time that the campaign leaves out by design:
+  The E2E and population items come from per-step host time that the campaign leaves out by design:
   - The campaign renders the multiplier at 1.0.
-  - At c100 the 97-100-request decode steps pad to 104, which has no FULL key, and replay PIECEWISE. The
-    measured duty-cycle multiplier is 1.118 / 1.132 on 01 / 02, against about 1.02 elsewhere.
-  - In 04 and 09, closed-loop requests re-enter 2-3 steps late (client/frontend round trip).
+  - At c100 the measured duty-cycle multiplier is 1.118 / 1.132 on 01 / 02, against about 1.02 elsewhere.
+  - In 04, 09, 16 and 17, closed-loop requests re-enter 2-3 steps late (client/frontend round trip).
 
   A deployment preset absorbs this host time through the recommended `gpu_time_multiplier`, as the
   `diverse_100` simulation above shows.
+- **The unfused boundary at chunk 8192** (cases 17 and 19). Above 4096 tokens vLLM runs NCCL all-reduce, then
+  Inductor's residual add + RMSNorm; the FP8 group quant kernel still runs separately after it, so the
+  simulator's quant leaves are not double-counted. Case 17 kernel signed error: decode -1.93%, mixed +0.61%.
+  The NCCL slots read -3.2%; the quant-fused norm (-33%) and the mixed-step rope (-46%) are underpriced,
+  listed in the README's known gaps.
 
-[`README.md`](README.md) explains the `diverse_100` decode gap (+6.18%: padded-row MoE charge, router and
+[`README.md`](README.md) explains the `diverse_100` decode gap (+6.26%: padded-row MoE charge, router and
 small-launch rows) and the remaining gaps. This is review evidence, not an accepted baseline. No golden is
 recorded.
 
@@ -152,12 +171,12 @@ recorded.
 - **Token corpus**: `mimo_v26_flash_rl/vllm/diverse_100/capture/20261007` in the Hugging Face dataset
   `UW-SyFI/servingstudio-workload`, pinned at `18506fd7afbaf925da2d31821287d079fffba5a6` (already
   uploaded; `manifest.json` and `routes.u16` match the local capture's sha256).
-- **`profiling/profile.db`** gains 6,268 B200 rows, all measured by this branch. They were merged row-wise by
+- **`profiling/profile.db`** gains 2,574 B200 rows, all measured by this branch. They were merged row-wise by
   semantic key onto `main`'s DB:
 
   | Kind | Rows |
   |---|---:|
-  | `fa4_varlen_attention` | 4,814 |
+  | `fa4_varlen_attention` | 1,136 |
   | `elementwise` | 378 |
   | `single_gemm` | 340 |
   | `nvfp4_fused_moe` | 292 |
