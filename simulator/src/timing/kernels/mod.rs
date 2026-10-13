@@ -23,6 +23,7 @@ pub mod dsa_sparse_mla_attention;
 pub mod dsa_sparse_mla_prefill;
 pub mod dsa_topk_prefill;
 pub mod elementwise;
+pub mod embedding_row_gather;
 pub mod engine;
 pub mod engram_lookup;
 pub mod fa4_varlen_attention;
@@ -74,6 +75,9 @@ pub mod p2p_intra;
 pub mod packed_kv_cache_gather;
 pub mod paged_attn_batch_decode;
 pub mod paged_attn_batch_prefill;
+pub mod ple_gate;
+pub mod ple_ngram_ids;
+pub mod ple_short_conv;
 pub mod q_kv_rms_norm;
 pub mod q_pad_kv_rope_mxfp8_insert;
 pub mod qk_rms_norm_rope_gate;
@@ -168,6 +172,10 @@ pub use dsa_topk_prefill::{
 };
 pub use elementwise::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, ElementwiseSpec,
+};
+pub use embedding_row_gather::{
+    EmbeddingRowGatherKernel, EmbeddingRowGatherKernelConfig, EmbeddingRowGatherKernelInput,
+    EmbeddingRowGatherSpec,
 };
 pub use engine::{Kernel, KernelConfig, KernelSpec, OffGrid};
 pub use engram_lookup::{
@@ -337,6 +345,13 @@ pub use paged_attn_batch_decode::{
 pub use paged_attn_batch_prefill::{
     PagedAttnBatchPrefillKernel, PagedAttnBatchPrefillKernelConfig,
     PagedAttnBatchPrefillKernelInput, PagedAttnBatchPrefillSpec,
+};
+pub use ple_gate::{PleGateKernel, PleGateKernelConfig, PleGateKernelInput, PleGateSpec};
+pub use ple_ngram_ids::{
+    PleNgramIdsKernel, PleNgramIdsKernelConfig, PleNgramIdsKernelInput, PleNgramIdsSpec,
+};
+pub use ple_short_conv::{
+    PleShortConvKernel, PleShortConvKernelConfig, PleShortConvKernelInput, PleShortConvSpec,
 };
 pub use q_kv_rms_norm::{
     QKvRmsNormKernel, QKvRmsNormKernelConfig, QKvRmsNormKernelInput, QKvRmsNormSpec,

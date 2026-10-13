@@ -43,6 +43,7 @@ use crate::timing::kernels::{
 };
 
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
+use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
 use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
@@ -53,6 +54,7 @@ use crate::timing::kernels::{
     StaticFp8QuantKernelInput,
 };
 use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
+use crate::timing::kernels::{PleGateKernelInput, PleNgramIdsKernelInput, PleShortConvKernelInput};
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
 /// fan-out the attention op summed into one slot (many prefill requests fold to a
@@ -172,6 +174,10 @@ log_inputs! {
     CompressedSparseMlaRopeCast => CompressedSparseMlaRopeCastKernelInput,
     QPadKvRopeMxfp8Insert => QPadKvRopeMxfp8InsertKernelInput,
     EngramLookup => EngramLookupKernelInput,
+    EmbeddingRowGather => EmbeddingRowGatherKernelInput,
+    PleNgramIds => PleNgramIdsKernelInput,
+    PleGate => PleGateKernelInput,
+    PleShortConv => PleShortConvKernelInput,
     SconvQkvrPrep => SconvQkvrPrepKernelInput,
     MoeTopkSoftplusSqrt => MoeTopkSoftplusSqrtKernelInput,
     MoeSinkGateSelect => MoeSinkGateSelectKernelInput,
