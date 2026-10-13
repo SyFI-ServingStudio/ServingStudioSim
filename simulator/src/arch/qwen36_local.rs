@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::arch::config::ModelSpec;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
-use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
+use crate::arch::kv_layout::{hybrid_attention_state_layout, KvCacheLayout};
 use crate::op::Op;
 use crate::timing::kernels::{ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput};
 use crate::timing::routing::RoutingDistribution;
@@ -567,8 +567,7 @@ pub fn resolve_configs(cfg: &Qwen36LocalConfigs) -> Qwen36LocalResolved {
 }
 
 /// One full-attention layer's KV bytes for one token — K and V together. This is
-/// the unit vLLM's hybrid page alignment measures the SSM page against, so it is
-/// factored out rather than inlined into [`gqa_bytes_per_token`].
+/// the unit vLLM's hybrid page alignment measures the SSM page against.
 fn attention_page_bytes_per_token_per_layer(resolved: &Qwen36LocalResolved) -> Dim {
     let attn = &resolved.gated_gqa.attention;
     2 * attn.num_kv_heads.clone()
@@ -576,6 +575,7 @@ fn attention_page_bytes_per_token_per_layer(resolved: &Qwen36LocalResolved) -> D
         * Dim::param("kv_bytes", attn.kv_dtype().size_bytes())
 }
 
+#[cfg(test)]
 fn gqa_bytes_per_token(resolved: &Qwen36LocalResolved) -> Dim {
     attention_page_bytes_per_token_per_layer(resolved)
         * Dim::param("num_gqa_layers", resolved.num_gqa_layers)
@@ -610,76 +610,49 @@ fn mamba_page_bytes_per_layer(resolved: &Qwen36LocalResolved) -> Dim {
     ssm_state_bytes_per_layer(resolved) + conv_state_bytes_per_layer(resolved)
 }
 
-/// Every GDN layer's mamba page **as allocated**.
-///
-/// vLLM's hybrid allocator gives the mamba and attention groups one common page
-/// size: it picks the attention block from the mamba page
-/// ([`hybrid_block_tokens`]) and then pads the mamba page up to
-/// that attention page — for this model 2,162,688 B/layer against a 2,146,304 B
-/// true state, the "Padding mamba page size by 0.76%" the engine logs at
-/// startup.
-fn padded_gdn_state_bytes(resolved: &Qwen36LocalResolved) -> Dim {
-    hybrid_block_tokens(resolved)
-        * attention_page_bytes_per_token_per_layer(resolved)
-        * Dim::param("num_gdn_layers", resolved.num_gdn_layers)
+/// Every GDN layer's mamba page **as allocated**: vLLM pads it up to one
+/// hybrid block of attention page ([`hybrid_block_tokens`]) — for this model
+/// 2,162,688 B/layer against a 2,146,304 B true state, the "Padding mamba page
+/// size by 0.76%" the engine logs at startup.
+#[cfg(test)]
+fn padded_gdn_state_bytes(resolved: &Qwen36LocalResolved) -> u64 {
+    u64::from(hybrid_block_tokens(resolved))
+        * u64::from(attention_page_bytes_per_token_per_layer(resolved).get())
+        * u64::from(resolved.num_gdn_layers)
 }
 
-/// vLLM's hybrid `block_size`: the smallest attention-kernel-aligned token count
-/// whose per-layer attention page covers one per-layer mamba page.
-///
-/// `attn_block_size = kernel_block_size * cdiv(mamba_page, kernel_block_size *
-/// attn_page_per_token)`, where `kernel_block_size` is the attention KV-cache
-/// block granularity the worklet already configures. Both operands are per-layer
-/// per-rank, so the ratio is TP-invariant; this arch is TP1 anyway.
-///
-/// The numerator is the whole mamba page (SSM **and** conv) and the denominator
-/// counts K **and** V. An earlier reading of vllm-ascend#7393 had it as SSM-only
-/// over K-only, which lands on 2048 instead; the engine's own startup log for
-/// this checkpoint ("Setting attention block size to 1056 tokens", "Padding
-/// mamba page size by 0.76%") only reconstructs with both terms whole, and each
-/// correction alone misses (2112 and 1024 respectively).
+/// vLLM's hybrid `block_size` ([`hybrid_attention_block_tokens`]) over the
+/// whole mamba page (SSM **and** conv) and the K **and** V attention page. An
+/// earlier reading of vllm-ascend#7393 had it as SSM-only over K-only, which
+/// lands on 2048 instead; the engine's own startup log for this checkpoint
+/// ("Setting attention block size to 1056 tokens", "Padding mamba page size by
+/// 0.76%") only reconstructs with both terms whole, and each correction alone
+/// misses (2112 and 1024 respectively).
 ///
 /// Returns 0 for a layer prefix with no GDN layer: there is no state to align.
-fn hybrid_block_tokens(resolved: &Qwen36LocalResolved) -> Dim {
+#[cfg(test)]
+fn hybrid_block_tokens(resolved: &Qwen36LocalResolved) -> u32 {
     if resolved.num_gdn_layers == 0 {
-        return Dim::param("no_gdn_layers", 0);
+        return 0;
     }
-    let kernel_block_size = Dim::param(
-        "kv_cache_block_size",
-        resolved.gated_gqa.raw_cfg.kv_cache_block_size,
-    );
-    let quantum = kernel_block_size.clone() * attention_page_bytes_per_token_per_layer(resolved);
-    let mamba_page = mamba_page_bytes_per_layer(resolved);
-    // cdiv without a helper: Dim has no ceiling divide, and the "+ quantum - 1"
-    // form keeps the whole derivation visible in the rendered expression.
-    kernel_block_size * ((mamba_page + quantum.clone() - 1) / quantum)
+    crate::arch::kv_layout::hybrid_attention_block_tokens(
+        u64::from(resolved.gated_gqa.raw_cfg.kv_cache_block_size),
+        u64::from(mamba_page_bytes_per_layer(resolved).get()),
+        u64::from(attention_page_bytes_per_token_per_layer(resolved).get()),
+    )
 }
 
 /// One request's cache: K and V of every gated-GQA layer per token, and one
-/// SSM + conv state per GDN layer, padded to vLLM's attention page. vLLM's
-/// hybrid block is the checkpoint interval, and one null block of every
-/// full-attention layer's page leaves the pool.
+/// SSM + conv state per GDN layer, padded to vLLM's attention page
+/// ([`hybrid_attention_state_layout`]).
 fn kv_cache_layout(resolved: &Qwen36LocalResolved) -> KvCacheLayout {
-    let kv_bytes_per_token = u64::from(gqa_bytes_per_token(resolved).get());
-    let mut layout = KvCacheLayout::new();
-    if kv_bytes_per_token > 0 {
-        layout = layout.with_part(KvCachePart::per_token("gqa", kv_bytes_per_token));
-    }
-    if resolved.num_gdn_layers == 0 {
-        return layout;
-    }
-    let block_tokens = hybrid_block_tokens(resolved).get();
-    let state_bytes =
-        u64::from(mamba_page_bytes_per_layer(resolved).get()) * u64::from(resolved.num_gdn_layers);
-    layout
-        .with_part(
-            KvCachePart::per_request("gdn", state_bytes)
-                .padded_to(u64::from(padded_gdn_state_bytes(resolved).get())),
-        )
-        .with_engine(EngineOverhead {
-            block_tokens: Some(block_tokens),
-            fixed_device_bytes: u64::from(block_tokens) * kv_bytes_per_token,
-        })
+    hybrid_attention_state_layout(
+        u64::from(resolved.gated_gqa.raw_cfg.kv_cache_block_size),
+        u64::from(attention_page_bytes_per_token_per_layer(resolved).get()),
+        u64::from(resolved.num_gqa_layers),
+        u64::from(mamba_page_bytes_per_layer(resolved).get()),
+        u64::from(resolved.num_gdn_layers),
+    )
 }
 
 pub fn build(
@@ -1546,19 +1519,19 @@ mod tests {
 
     #[test]
     fn gdn_state_charges_the_padded_page_on_every_gdn_layer() {
-        const PADDED_PER_LAYER: u32 = 1056 * 2048;
+        const PADDED_PER_LAYER: u64 = 1056 * 2048;
         assert_eq!(PADDED_PER_LAYER, 2_162_688);
         for (layers, gdn_layers) in [(1, 1), (3, 3), (4, 3), (5, 4), (39, 30), (40, 30)] {
             let resolved = resolve_configs(&cfgs(layers));
             assert_eq!(resolved.num_gdn_layers, gdn_layers, "L={layers}");
             assert_eq!(
-                padded_gdn_state_bytes(&resolved).get(),
-                PADDED_PER_LAYER * gdn_layers,
+                padded_gdn_state_bytes(&resolved),
+                PADDED_PER_LAYER * u64::from(gdn_layers),
                 "L={layers}",
             );
         }
         assert_eq!(
-            padded_gdn_state_bytes(&resolve_configs(&cfgs(40))).get(),
+            padded_gdn_state_bytes(&resolve_configs(&cfgs(40))),
             64_880_640
         );
     }
@@ -1581,9 +1554,9 @@ mod tests {
             (2_048, 2_097_152, 49_152, 2_146_304),
             "per-token attention page and per-layer mamba page feeding the rule",
         );
-        assert_eq!(hybrid_block_tokens(&resolved).get(), 1_056);
+        assert_eq!(hybrid_block_tokens(&resolved), 1_056);
 
-        let padded = hybrid_block_tokens(&resolved).get()
+        let padded = hybrid_block_tokens(&resolved)
             * attention_page_bytes_per_token_per_layer(&resolved).get();
         let padding_percent = 100.0
             * (f64::from(padded) / f64::from(mamba_page_bytes_per_layer(&resolved).get()) - 1.0);
@@ -1596,7 +1569,7 @@ mod tests {
         // layers the prefix keeps — only "no GDN layer at all" turns it off.
         for (layers, expected) in [(1, 1056), (3, 1056), (4, 1056), (39, 1056), (40, 1056)] {
             assert_eq!(
-                hybrid_block_tokens(&resolve_configs(&cfgs(layers))).get(),
+                hybrid_block_tokens(&resolve_configs(&cfgs(layers))),
                 expected,
                 "L={layers}"
             );
