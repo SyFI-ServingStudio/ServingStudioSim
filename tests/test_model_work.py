@@ -2516,7 +2516,7 @@ def test_modelopt_exclusions_need_a_per_layer_reader():
 
 
 def test_glm53_kpool_closed_forms_match_brute_force():
-    from model.work.attention.glm53_kpool_dsa import (
+    from model.work.attention.pooled_topk import (
         pooled_prefix_sum,
         selected_keys,
         selected_prefix_sum,
@@ -2720,7 +2720,7 @@ def test_glm53_geometry_rows_and_the_rest_partition_the_label(glm53):
 def test_glm53_kpool_batch_and_array_paths_match_the_per_request_sums(glm53):
     """`semantic_segments_batch`, and the numpy path a long interaction list takes,
     equal the per-request Python-int sums."""
-    from model.work.attention.glm53_kpool_dsa import _VECTORIZE_FROM
+    from model.work.attention.pooled_topk import _VECTORIZE_FROM
 
     attn = next(stack.attn for stack in glm53.layers if stack.tag == "dsa_moe")
     small = work_floors._aggregate_workload(_g53_geometry_totals([(2019, 29)], [3000, 10, 70000]))
