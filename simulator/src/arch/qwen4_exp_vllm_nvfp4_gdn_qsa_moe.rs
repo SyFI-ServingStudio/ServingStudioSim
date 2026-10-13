@@ -115,6 +115,8 @@ const GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
 const VLLM_TRITON_BACKENDS: &[&str] = &["vllm_triton"];
 /// Eager torch launches, measured in the serving fork's venv.
 const TORCH_BACKENDS: &[&str] = &["torch_vllm"];
+/// `F.embedding` row gather of a device-resident PLE table.
+const DEVICE_GATHER_BACKENDS: &[&str] = &["torch"];
 const STRIDED_COPY_BACKENDS: &[&str] = &["torch_strided_copy_vllm"];
 const CAT_BACKENDS: &[&str] = &["torch_cat_vllm"];
 /// `index_select` / `index_copy_` / state gather-scatter: eager torch too.
@@ -342,7 +344,13 @@ pub fn build_configs(
         dtype: ACTIVATION_DTYPE,
         gpu_name: gpu.clone(),
         triton_backends: VLLM_TRITON_BACKENDS.to_vec(),
-        gather_backends: VLLM_TRITON_BACKENDS.to_vec(),
+        gather_backends: match parallel.ple_table_residency {
+            // `Qwen4ExpPLEPinnedHostEmbedding._lookup`: the fork's Triton UVA gather.
+            PleTableResidency::HostUva => VLLM_TRITON_BACKENDS,
+            // `Qwen4ExpPLEDeviceEmbedding`: `F.embedding` on an HBM table.
+            PleTableResidency::Device => DEVICE_GATHER_BACKENDS,
+        }
+        .to_vec(),
         elementwise_backends: TORCH_BACKENDS.to_vec(),
         gemm_backends: GEMM_BACKENDS.to_vec(),
     };
@@ -835,7 +843,11 @@ impl LayerGroup {
                 )?),
             },
             mlp_mix: HcMixLocalWorklet::build(format!("{p}.mlp_hc"), r.hc_combine.clone(), bridge)?,
-            moe: VllmNvfp4MoeSharedStreamLocalWorklet::build(format!("{p}.moe"), r.moe.clone(), bridge)?,
+            moe: VllmNvfp4MoeSharedStreamLocalWorklet::build(
+                format!("{p}.moe"),
+                r.moe.clone(),
+                bridge,
+            )?,
         })
     }
 
@@ -1554,6 +1566,21 @@ mod tests {
         assert_eq!(r.head.lm_head.n.get(), 248320);
         assert_eq!(r.moe.routed.fused_moe.routing_method, "renormalize_naive");
         assert_eq!(c.hidden_repeat.output_bytes_per_token.get(), 20480);
+    }
+
+    /// The pinned host table is gathered by the fork's UVA kernel; a device
+    /// table by `F.embedding`.
+    #[test]
+    fn the_ple_gather_follows_the_table_residency() {
+        let host = build_configs(&model_cfg(), &parallel(), demand()).unwrap();
+        assert_eq!(host.ple.gather_backends, ["vllm_triton"]);
+        let device = Qwen4ExpVllmParallel {
+            ple_table_residency: PleTableResidency::Device,
+            ..parallel()
+        };
+        let device = build_configs(&model_cfg(), &device, demand()).unwrap();
+        assert_eq!(device.ple.gather_backends, ["torch"]);
+        assert_eq!(device.ple.residency, "device");
     }
 
     #[test]

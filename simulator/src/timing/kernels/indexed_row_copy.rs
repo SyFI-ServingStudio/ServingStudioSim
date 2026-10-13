@@ -50,8 +50,8 @@ impl KernelSpec for IndexedRowCopySpec {
             // per-index path up to 16 indices and a vectorized gather from 17, a
             // step down in time, so both sides of that boundary are grid points.
             return SweepGrid::new(vec![Axis::values([
-                1, 2, 4, 8, 12, 16, 17, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768,
-                1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384,
+                1, 2, 4, 8, 12, 16, 17, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
+                1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384,
             ])]);
         }
         SweepGrid::new(vec![Axis::values(STATE_ROWS)])

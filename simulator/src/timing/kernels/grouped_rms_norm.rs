@@ -86,7 +86,13 @@ mod tests {
         fields.sort();
         assert_eq!(
             fields,
-            ["backend", "hidden_dtype", "hidden_size", "num_groups", "num_tokens"]
+            [
+                "backend",
+                "hidden_dtype",
+                "hidden_size",
+                "num_groups",
+                "num_tokens"
+            ]
         );
         assert_eq!(payloads[0].fields()["num_tokens"], 1);
     }
