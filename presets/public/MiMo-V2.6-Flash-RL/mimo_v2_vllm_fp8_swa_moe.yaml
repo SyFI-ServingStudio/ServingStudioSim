@@ -17,7 +17,6 @@ arch:
   token_corpus_file: ${token_corpus_file}
   cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 100, 104, 112, 120, 128,
                             136, 144, 152, 160, 168, 176, 184, 192, 200]
-  max_num_seqs: 100
 compound:
   workload:
     diverse_100:

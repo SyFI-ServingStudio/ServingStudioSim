@@ -170,8 +170,6 @@ ARCH = {
     "token_corpus_file": "hf://datasets/UW-SyFI/servingstudio-workload@18506fd7afbaf925da2d31821287d079fffba5a6/"
                          "mimo_v26_flash_rl/vllm/diverse_100/capture/20261007/manifest.json",
     "cudagraph_capture_sizes": CAPTURE_SIZES,
-    # The server's --max-num-seqs: FULL decode graphs stop at the largest capture size within it (96 here).
-    "max_num_seqs": S,
 }
 
 
