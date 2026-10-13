@@ -10,11 +10,11 @@
 //! `context_mode: "uniform_random"` (independent normal scores, like a live
 //! indexer's): on B200 the increasing `uniform` template, whose valid values
 //! crowd together when a row is short of its padded width, was 20% slow at
-//! 1024 rows of 8192 and 10% fast at 1024 rows of 30000 against normal
-//! scores, which match the fork's own selection call within 3% on a long
-//! prefill chunk. The row stride only spaces the
-//! rows once the values are random, so the op passes the model's compressed
-//! context range instead of the deployment width.
+//! 1024 rows of 8192 and 10% fast at 1024 rows of 30000 against normal scores,
+//! which match the fork's own selection call within 3% on a long prefill
+//! chunk. The row stride only spaces the rows once the values are random, so
+//! the op passes the model's compressed context range instead of the
+//! deployment width.
 //!
 //! The backend is the op's choice, never the faster of two: vLLM's indexer
 //! dispatch (`model_executor/layers/indexer_topk.py:215-254`, mirrored by
@@ -43,6 +43,9 @@ use crate::timing::sweep::{Axis, SweepGrid};
 pub const COOPERATIVE_BACKEND: &str = "vllm_cuda_cooperative";
 pub const COOPERATIVE_MAX_ROWS: u32 = 64;
 
+/// 132/133 and 148/149 bracket the one-row-per-SM wave of H100 (132 SMs) and
+/// B200 (148 SMs). `gpu/spec.json` carries no SM count to derive them from, so
+/// a GPU with another SM count adds its pair here.
 const ROWS_AXIS: [u32; 31] = [
     1, 2, 4, 8, 12, 16, 17, 24, 32, 48, 64, 65, 96, 128, 132, 133, 148, 149, 192, 256, 384, 512,
     768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 16384,
@@ -63,6 +66,16 @@ fn batch_axis(next_n: u32) -> Vec<u32> {
     batches.sort_unstable();
     batches.dedup();
     batches
+}
+
+/// Most rows one profiled call holds: the cooperative kernel's ceiling when
+/// the config names it, else the grid's edge.
+fn max_rows(config: &DsaPersistentTopkDecodeKernelConfig) -> u32 {
+    if config.backends.contains(&COOPERATIVE_BACKEND) {
+        COOPERATIVE_MAX_ROWS
+    } else {
+        MAX_ROWS
+    }
 }
 
 pub struct SparseIndexerTopkSpec;
@@ -92,23 +105,22 @@ impl KernelSpec for SparseIndexerTopkSpec {
         let next_n = f64::from(config.next_n);
         let min_context = f64::from(config.next_n.saturating_sub(1));
         let max_context = f64::from(config.max_model_len.get());
-        let max_rows = f64::from(if config.backends.contains(&COOPERATIVE_BACKEND) {
-            COOPERATIVE_MAX_ROWS
-        } else {
-            MAX_ROWS
-        });
+        let max_rows = f64::from(max_rows(config));
         grid.expand_2d(|batch, context| {
             context < min_context || context > max_context || batch * next_n > max_rows
         })
     }
 
-    /// Rows are independent: a call past the grid runs as full-edge pieces.
+    /// Rows are independent: a call past the grid runs as full-edge pieces,
+    /// each no larger than the feasible edge (64 rows for the cooperative
+    /// backend).
     fn off_grid(
         config: &Self::Config,
         input: &Self::Input,
         _backend: &'static str,
     ) -> OffGrid<Self::Input> {
-        let max_batch = *batch_axis(config.next_n).last().expect("non-empty axis");
+        let axis_edge = *batch_axis(config.next_n).last().expect("non-empty axis");
+        let max_batch = axis_edge.min(max_rows(config) / config.next_n.max(1));
         if input.batch_size <= max_batch {
             return OffGrid::Cache;
         }
@@ -192,6 +204,34 @@ mod tests {
         }
         assert_eq!(batch_axis(1), ROWS_AXIS.to_vec());
         assert!(SparseIndexerTopkSpec::sweep_grid(&config("vllm_cuda", 4)).axes()[0].len() <= 35);
+    }
+
+    /// Catches cooperative calls split at the persistent edge (16384 rows),
+    /// whose pieces would land on masked, never-profiled cells.
+    #[test]
+    fn cooperative_off_grid_pieces_stay_on_feasible_cells() {
+        for next_n in [1, 3, 4] {
+            let cfg = config(COOPERATIVE_BACKEND, next_n);
+            let input = DsaPersistentTopkDecodeKernelInput {
+                batch_size: 100,
+                context_len: 4096,
+            };
+            let OffGrid::Launches(pieces) =
+                SparseIndexerTopkSpec::off_grid(&cfg, &input, COOPERATIVE_BACKEND)
+            else {
+                panic!("next_n {next_n}: 100 requests must split");
+            };
+            assert_eq!(pieces.iter().map(|p| p.batch_size).sum::<u32>(), 100);
+            let feasible = feasible(&cfg);
+            for piece in &pieces {
+                assert!(piece.batch_size * next_n <= COOPERATIVE_MAX_ROWS);
+            }
+            let edge = f64::from(pieces[0].batch_size);
+            assert!(
+                feasible.iter().any(|&(b, _)| b == edge),
+                "edge {edge} not on the grid"
+            );
+        }
     }
 
     #[test]
