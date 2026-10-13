@@ -1249,6 +1249,40 @@ def test_qwen38_floors_label_the_served_fp8_kv_cache_under_the_fp4_arch(qwen38, 
             assert rows[name] == base[name], name
 
 
+def test_qwen38_location_map_consumes_every_semantic_once(qwen38):
+    location_map = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "model/work/location_maps/qwen35_vllm_nvfp4_gdn_dense_unified.json"
+        ).read_text()
+    )
+    assert location_map["schema_version"] == 1
+    assert location_map["mapping_id"] == "qwen35-vllm-nvfp4-gdn-dense-unified-v1"
+    assert location_map["arch_types"] == ["qwen35_vllm_nvfp4_gdn_dense"]
+    locations = [row["location"] for row in location_map["locations"]]
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    # 30 leaves for vLLM's first GDN layer (its input norm adds no residual), 30
+    # for the other 47, 15 per gated-GQA layer and 4 in the head; none communicate.
+    assert len(locations) == len(set(locations)) == 79
+    for workload in (
+        Workload.causal_lm(decode=[4096] * 3, sampled=3),
+        Workload.causal_lm(prefill=[(2048, 0)], decode=[300], sampled=2),
+    ):
+        names = [segment.name for segment in qwen38.label(workload).segments]
+        assert sorted(mapped) == sorted(names)
+    semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    # One semantic row covers all 48 GDN layers, so it sits on the 47-layer stack's
+    # leaf; the first layer's leaves carry none, except that its input norm is the
+    # embedding gather's consumer (the arch has no embedding leaf).
+    first = [location for location in locations if location.startswith("unified.gdn_first.")]
+    assert len(first) == 30
+    assert semantics["unified.gdn_first.input_norm"] == ["embedding"]
+    assert all(semantics[location] == [] for location in first[1:])
+    assert semantics["unified.gdn.gdn.qkvz"] == ["linear.qkvz"]
+    assert semantics["unified.gqa.gqa.kv_append"] == ["full.kv_cache_append"]
+    assert semantics["unified.lm_head"] == ["lm_head"]
+
+
 @pytest.fixture(scope="module")
 def qwen36_moe():
     return load_model(QWEN36_MOE)
