@@ -1,4 +1,4 @@
-"""One-launch FlashInfer runner for the Qwen GDN prefill chunked delta rule.
+"""FlashInfer runner for the GDN prefill chunked delta rule.
 
 This file is L1a-only: it allocates tensors, times one kernel, and returns
 metrics. DB writes, JIT policy, subprocess selection, and registry routing all
@@ -12,8 +12,11 @@ in FP32, `beta` in FP32, and an FP32 initial state. `use_qk_l2norm_in_kernel`
 stays False because vLLM applies `l2norm_fwd` outside this call — folding it in
 would measure a kernel production never launches here.
 
-CUPTI selects only the CUTLASS delta-rule kernel; operand construction and the
-output/state allocations sit outside the measured window. Reported FLOPs and
+`cu_seqlens` is int64 and `backend="flashinfer"`, as vLLM passes them. FlashInfer
+dispatches by architecture: one CUTLASS `FlatKernel` launch on SM90, one CuTe DSL
+`GatedDeltaNetChunkedKernel` persistent launch on SM100 (or several launches if
+its context-parallel heuristic fires). CUPTI therefore counts every launch the
+call makes; operand construction sits outside the measured window. Reported FLOPs and
 bytes are semantic logical counts, not physical CUTLASS instructions or traffic.
 """
 
@@ -40,10 +43,6 @@ from profiling.runners.metrics import ComputeMetrics
 _BACKEND = "gdn_chunk_delta_rule:flashinfer"
 _CALLABLE_MODULE = "flashinfer.gdn_prefill"
 _CALLABLE_NAME = "chunk_gated_delta_rule"
-# Substring CUPTI matches. The mangled name is
-# `void cutlass::device_kernel<flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule<...>>`;
-# `FlatKernel` is the shortest fragment unique to it in a GDN layer.
-_KERNEL_NAME = "FlatKernel"
 # FlashInfer chooses its own chunk width internally; this constant only sizes
 # the semantic FLOP estimate below, never the launch.
 _SEMANTIC_CHUNK = 64
@@ -118,7 +117,7 @@ def profile_gdn_chunk_delta_rule_flashinfer(
     value_head_dim: int,
     dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile FlashInfer's single-launch GDN prefill delta rule on SM90."""
+    """Profile FlashInfer's GDN prefill delta rule exactly as vLLM calls it."""
     args = _validate_args(
         num_tokens,
         max_sequence_length,
@@ -173,7 +172,7 @@ def profile_gdn_chunk_delta_rule_flashinfer(
             len(boundaries) - 1, args.num_heads, args.key_head_dim, args.value_head_dim,
             dtype=torch.float32, device=device,
         )
-        cu_seqlens = torch.tensor(boundaries, dtype=torch.int32, device=device)
+        cu_seqlens = torch.tensor(boundaries, dtype=torch.int64, device=device)
 
         def kernel() -> Any:
             return fused_callable(
@@ -185,12 +184,13 @@ def profile_gdn_chunk_delta_rule_flashinfer(
                 initial_state=initial_state,
                 output_final_state=True,
                 cu_seqlens=cu_seqlens,
+                backend="flashinfer",
             )
 
         # `initial_state` is read-only here (`output_final_state=True` returns a
         # fresh state tensor rather than updating in place), so repeated calls
         # need no reset between launches.
-        time_ms = Timer.cupti(kernel, warmup=5, kernel_name=_KERNEL_NAME)
+        time_ms = Timer.cupti(kernel, warmup=5, kernel_name=None)
         energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
     except torch.OutOfMemoryError as exc:
         raise OOMError(f"{_BACKEND} ran out of CUDA memory") from exc
