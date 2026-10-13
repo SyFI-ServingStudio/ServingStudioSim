@@ -41,7 +41,11 @@ impl KernelSpec for GdnRecurrentDecodeGatedNormSpec {
     const KIND: KernelKind = "gdn_recurrent_decode_gated_norm";
 
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![Axis::pow2(0, 8)])
+        // One CTA per (request, value head) at every q, so dense over 1..8 even at q = 1.
+        SweepGrid::new(vec![Axis::chain([
+            Axis::arithmetic(1, 8, 1),
+            Axis::pow2(4, 8),
+        ])])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -97,8 +101,8 @@ mod tests {
         };
         let grid = GdnRecurrentDecodeGatedNormSpec::sweep_grid(&cfg);
         let payloads = GdnRecurrentDecodeGatedNormSpec::enumerate(&cfg, &grid, "vllm_cuda");
-        assert_eq!(payloads.len(), 9);
-        let last = payloads[8].fields();
+        assert_eq!(payloads.len(), 13);
+        let last = payloads[12].fields();
         let names: Vec<&str> = last.keys().map(String::as_str).collect();
         assert_eq!(
             names,

@@ -9,7 +9,8 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
-use crate::timing::sweep::{Axis, SweepGrid};
+use crate::timing::kernels::gdn_recurrent_decode::decode_batch_axis;
+use crate::timing::sweep::SweepGrid;
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -42,8 +43,8 @@ impl KernelSpec for GdnCausalConvDecodeSpec {
 
     const KIND: KernelKind = "gdn_causal_conv_decode";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![Axis::pow2(0, 8)])
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        SweepGrid::new(vec![decode_batch_axis(config.tokens_per_request.as_ref())])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -86,6 +87,7 @@ mod tests {
     use crate::timing::bridge::DType;
     use crate::timing::cache::CacheKind;
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
+    use crate::timing::sweep::Axis;
     use crate::timing::{SlotInput, SweepCoords};
     use serde_json::Value;
 
@@ -232,10 +234,17 @@ mod tests {
         cfg.tokens_per_request = Some(4.into());
         let grid = GdnCausalConvDecodeSpec::sweep_grid(&cfg);
         let payloads = GdnCausalConvDecodeSpec::enumerate(&cfg, &grid, "vllm_triton");
-        assert_eq!(payloads[3].fields()["batch_size"], Value::from(8_u32));
-        assert_eq!(payloads[3].fields()["num_tokens"], Value::from(32_u32));
+        let batches: Vec<f64> = grid.axes()[0].clone();
+        assert_eq!(
+            batches,
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+        );
+        assert_eq!(payloads[2].fields()["batch_size"], Value::from(3_u32));
+        assert_eq!(payloads[2].fields()["num_tokens"], Value::from(12_u32));
 
         cfg.tokens_per_request = Some(1.into());
+        let grid = GdnCausalConvDecodeSpec::sweep_grid(&cfg);
+        assert_eq!(grid.axes()[0], Axis::pow2(0, 8));
         let one = GdnCausalConvDecodeSpec::enumerate(&cfg, &grid, "vllm_triton");
         assert!(!one[3].fields().contains_key("num_tokens"));
     }

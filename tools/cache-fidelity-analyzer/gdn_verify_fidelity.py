@@ -5,7 +5,7 @@
 config, while the profiler args carry `num_tokens = tokens_per_request ·
 batch_size`. The generic harness builds truth specs from the config fields, so
 this thin caller swaps in a truth function that makes that mapping, then probes
-off-grid batch sizes (interior geometric midpoints and one point past the grid).
+off-grid batch sizes (interior points between grid rows and one point past the grid).
 
     uv run python tools/cache-fidelity-analyzer/gdn_verify_fidelity.py \
         --gpu-name "NVIDIA B200" --log-dir logs/<dated>/fidelity
@@ -29,7 +29,7 @@ _GEOMETRY = {
     "dtype": "bf16",
     "state_dtype": "fp32",
 }
-_INTERIOR = (3, 6, 12, 24, 48, 96, 192)
+_INTERIOR = (10, 12, 14, 24, 48, 96, 192)
 _EXTRAP = (320,)
 
 

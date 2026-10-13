@@ -36,6 +36,17 @@ pub struct GdnRecurrentDecodeKernelInput {
     pub batch_size: u32,
 }
 
+/// Decode batch axis of the GDN decode kinds. One-token decode keeps the frozen
+/// pow2 axis. A verify step (q > 1 tokens per request) is also dense over 1..8:
+/// its kernels launch one CTA per (request, value head), so small batches cross
+/// SM-wave boundaries that pow2 points straddle.
+pub(crate) fn decode_batch_axis(tokens_per_request: Option<&Dim>) -> Vec<f64> {
+    match tokens_per_request.map(Dim::get) {
+        Some(q) if q != 1 => Axis::chain([Axis::arithmetic(1, 8, 1), Axis::pow2(4, 8)]),
+        _ => Axis::pow2(0, 8),
+    }
+}
+
 pub struct GdnRecurrentDecodeSpec;
 
 impl KernelSpec for GdnRecurrentDecodeSpec {
@@ -44,8 +55,8 @@ impl KernelSpec for GdnRecurrentDecodeSpec {
 
     const KIND: KernelKind = "gdn_recurrent_decode";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![Axis::pow2(0, 8)])
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        SweepGrid::new(vec![decode_batch_axis(config.tokens_per_request.as_ref())])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -90,6 +101,7 @@ mod tests {
     use crate::timing::bridge::DType;
     use crate::timing::cache::CacheKind;
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
+    use crate::timing::sweep::Axis;
     use crate::timing::{SlotInput, SweepCoords};
     use serde_json::Value;
 
@@ -246,10 +258,17 @@ mod tests {
         cfg.tokens_per_request = Some(4.into());
         let grid = GdnRecurrentDecodeSpec::sweep_grid(&cfg);
         let payloads = GdnRecurrentDecodeSpec::enumerate(&cfg, &grid, "vllm_triton_sigmoid_gating");
-        assert_eq!(payloads[3].fields()["batch_size"], Value::from(8_u32));
-        assert_eq!(payloads[3].fields()["num_tokens"], Value::from(32_u32));
+        let batches: Vec<f64> = grid.axes()[0].clone();
+        assert_eq!(
+            batches,
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+        );
+        assert_eq!(payloads[2].fields()["batch_size"], Value::from(3_u32));
+        assert_eq!(payloads[2].fields()["num_tokens"], Value::from(12_u32));
 
         cfg.tokens_per_request = Some(1.into());
+        let grid = GdnRecurrentDecodeSpec::sweep_grid(&cfg);
+        assert_eq!(grid.axes()[0], Axis::pow2(0, 8));
         let one = GdnRecurrentDecodeSpec::enumerate(&cfg, &grid, "vllm_triton_sigmoid_gating");
         assert!(!one[3].fields().contains_key("num_tokens"));
     }
