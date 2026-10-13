@@ -1030,6 +1030,66 @@ def _qwen36_expected_weight_bytes(tokens: int) -> float:
     )
 
 
+def test_mixed_precision_resolves_per_layer_type_and_fused_shards():
+    def config(layers: dict, ignore=()):
+        return {
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "ignore": list(ignore),
+                "quantized_layers": layers,
+            }
+        }
+
+    fp8, nvfp4 = {"quant_algo": "FP8"}, {"quant_algo": "NVFP4", "group_size": 16}
+    kinds = ["linear", "full"]
+    layers = {
+        "model.language_model.layers.0.linear_attn.out_proj": fp8,
+        "model.language_model.layers.0.mlp.up_proj": nvfp4,
+        "model.language_model.layers.0.mlp.gate_proj": nvfp4,
+        "model.language_model.layers.1.self_attn.q_proj": fp8,
+        "model.language_model.layers.1.self_attn.k_proj": fp8,
+        "model.language_model.layers.1.mlp.up_proj": nvfp4,
+        "model.language_model.layers.1.mlp.gate_proj": nvfp4,
+        "model.language_model.layers.2.mlp.up_proj": fp8,  # past the body: an MTP layer
+        "mtp.layers.0.mlp.up_proj": fp8,  # excluded by `ignore`
+    }
+    packed = {"qkv_proj": ("q_proj", "k_proj"), "gate_up_proj": ("gate_proj", "up_proj")}
+    with pytest.raises(ValueError, match="layer schedule"):
+        parse_quantization_config(config(layers))
+    quant = parse_quantization_config(
+        config(layers, ignore=["mtp*"]), layer_types=kinds, packed_modules=packed
+    )
+    assert quant.converted_prefixes == {
+        "linear_attn.out_proj",
+        "self_attn.qkv_proj",
+        "mlp.gate_up_proj",
+    }
+    assert quant.compute_dtype == "fp4"
+    assert quant.scheme_for("mlp.gate_up_proj").scale_bytes(32, 64) == 32 * 4
+    assert quant.scheme_for("self_attn.qkv_proj").compute_dtype == "fp8"
+    assert quant.scheme_for("self_attn.qkv_proj").scale_bytes(32, 64) == 4
+    assert not quant.is_converted("linear_attn.in_proj_ba")
+
+    def refused(entries: dict, match: str, layer_types=kinds) -> None:
+        with pytest.raises(ValueError, match=match):
+            parse_quantization_config(
+                config(entries), layer_types=layer_types, packed_modules=packed
+            )
+
+    prefix = "model.language_model.layers"
+    # One q/k shard listed, or the two stored differently: no single fused matrix.
+    refused({f"{prefix}.1.self_attn.q_proj": fp8}, "one algorithm")
+    refused(
+        {f"{prefix}.1.self_attn.q_proj": fp8, f"{prefix}.1.self_attn.k_proj": nvfp4},
+        "one algorithm",
+    )
+    # Two layers of one kind, or two kinds sharing the MLP, quantized differently.
+    refused({f"{prefix}.0.mlp.down_proj": fp8}, "layer 1 differently", ["linear", "linear"])
+    refused({f"{prefix}.0.mlp.down_proj": fp8, f"{prefix}.1.mlp.down_proj": nvfp4}, "across")
+    refused({"lm_head": {"quant_algo": "W4A16_NVFP4"}}, "W4A16_NVFP4")
+
+
 @pytest.fixture(scope="module")
 def qwen36_moe():
     return load_model(QWEN36_MOE)
