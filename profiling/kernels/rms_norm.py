@@ -73,6 +73,8 @@ DOC = KernelDoc(
         "PyTorch RMSNorm before timing."
     ),
     caveats=(
+        "vllm_gemma_native is launch-bound below the 32-row grid start: at hidden 2560 "
+        "the cache over-predicts 1 to 24 rows by up to 1.27x (about 5 µs a call) on B200.",
         "The backends count work differently: flashinfer's GB/s leaves out the "
         "weight read and its TFLOPS assumes 5 operations per element; vllm_cuda "
         "counts the weight read and 4 operations per element plus 2 per row.",
