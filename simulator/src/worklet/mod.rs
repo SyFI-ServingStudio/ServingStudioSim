@@ -11,6 +11,7 @@
 
 pub mod attn_block_tp;
 pub mod attn_local;
+pub mod bf16_gated_shared_expert_local;
 pub mod bf16_moe_local;
 pub mod deepseek_v4_attention_local;
 pub mod deepseek_v4_moe_expert_compute_local;
@@ -72,11 +73,13 @@ pub mod spec_head_local;
 pub mod spec_sample_local;
 pub mod vllm_bf16_gdn_spec_local;
 pub mod vllm_fp8_attn_block_tp;
+pub mod vllm_fp8_moe_shared_stream_local;
 pub mod vllm_fp8_moe_expert_compute_local;
 pub mod vllm_fp8_moe_router_local;
 pub mod vllm_glm52_dense_ffn_local;
 pub mod vllm_glm52_dsa_attn_local;
 pub mod vllm_glm52_shared_expert_local;
+pub mod vllm_moe_shared_stream_local;
 pub mod vllm_nvfp4_swiglu_mlp_local;
 pub mod vllm_qwen35_gated_gqa_local;
 pub mod vllm_qwen35_gdn_local;
