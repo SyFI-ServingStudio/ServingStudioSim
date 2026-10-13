@@ -71,7 +71,9 @@ const PREFILL_KNOTS: [u32; 3] = [64, 256, 2048];
 /// one (and falls by a third from three to two), so the prefill axis carries
 /// a knot on each side of the one-split cliff and at the two-split edge.
 /// That is 8 prefill knots against the 7 a doubling axis needs: GA 568 and
-/// SWA 497 feasible coordinates at 16 query heads.
+/// SWA 497 feasible coordinates at 16 query heads. The grid test holds the
+/// sweep to it.
+#[cfg(test)]
 const GRID_CEILING: usize = 600;
 /// Decode-request counts on the grid besides the split edge
 /// (`first_unsplit_decodes`). A graph decode splits `148 / (B x KV heads)`
