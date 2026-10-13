@@ -47,6 +47,7 @@ from profiling.kernels import (
     gdn_gated_rms_norm,  # noqa: F401
     gdn_prefill_post_conv,  # noqa: F401
     gdn_recurrent_decode,  # noqa: F401
+    gdn_recurrent_decode_gated_norm,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
     grouped_gemm,  # noqa: F401
     indexed_row_copy,  # noqa: F401

@@ -202,6 +202,7 @@ impl Qwen36GdnLocalWorklet {
                 kernel_size: cfg.conv_kernel_size.clone(),
                 dtype: cfg.activation_dtype,
                 state_dtype: cfg.conv_state_dtype,
+                tokens_per_request: None,
             },
             recurrent: GdnRecurrentDecodeKernelConfig {
                 backends: cfg.recurrent_decode_backends.clone(),
@@ -212,6 +213,7 @@ impl Qwen36GdnLocalWorklet {
                 value_head_dim: cfg.value_head_dim.clone(),
                 dtype: cfg.activation_dtype,
                 state_dtype: cfg.ssm_state_dtype,
+                tokens_per_request: None,
             },
         };
 

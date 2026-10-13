@@ -5,7 +5,9 @@ vLLM runs the decode requests of a step that also carries a prefill through
 separate contiguous Q/K/V, one token per request described by ``cu_seqlens``,
 and the same indexed FP32 state pool updated in place. The two kernels compute
 the same recurrence but schedule it differently, so this backend prices that
-call. Operand construction, the reference check and its state restoration stay
+call. With MTP the same call prices the verify requests of such a step
+(``num_tokens``): q tokens per request, ``num_accepted_tokens`` and ``[B, q]``
+checkpoint indices. Operand construction, the reference check and its state restoration stay
 outside CUPTI; only ``fused_sigmoid_gating_delta_rule_update_kernel`` is timed.
 """
 
@@ -18,7 +20,11 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention._gdn_common import load_required_callable
+from profiling.runners.attention._gdn_common import load_required_callable, tokens_per_request
+from profiling.runners.attention._gdn_verify import (
+    VerifyRecurrenceOperands,
+    build_verify_recurrence_operands,
+)
 from profiling.runners.attention.gdn_recurrent_decode_torch import (
     _logical_bytes,
     _semantic_flops,
@@ -135,6 +141,101 @@ def _check_correctness(
         base.initial_state.copy_(state_snapshot)
 
 
+@dataclass(frozen=True)
+class _VerifyCall:
+    operands: VerifyRecurrenceOperands
+    query: Any
+    key: Any
+    value: Any
+    a: Any
+    b: Any
+
+
+def _build_verify_call(torch: Any, args: _ValidatedArgs, per_request: int, *, device: Any):
+    operands = build_verify_recurrence_operands(
+        torch,
+        batch_size=args.batch_size,
+        per_request=per_request,
+        num_qk_heads=args.num_qk_heads,
+        num_value_heads=args.num_value_heads,
+        key_head_dim=args.key_head_dim,
+        value_head_dim=args.value_head_dim,
+        dtype=args.dtype.torch(),
+        state_dtype=args.state_dtype.torch(),
+        device=device,
+    )
+    query, key, value = operands.semantic_qkv()
+    # The mixed step's rearrange_mixed_qkv and index_select hand the kernel
+    # contiguous [1, T, H, D] q/k/v and [T, Hv] a/b.
+    return _VerifyCall(
+        operands=operands,
+        query=query.unsqueeze(0),
+        key=key.unsqueeze(0),
+        value=value.unsqueeze(0),
+        a=operands.a.contiguous(),
+        b=operands.b.contiguous(),
+    )
+
+
+def _invoke_verify(fused_callable: Any, call: _VerifyCall, args: _ValidatedArgs) -> Any:
+    """The spec-decode call of ``_forward_core`` in a step that also carries a prefill."""
+    operands = call.operands
+    return fused_callable(
+        A_log=operands.A_log,
+        a=call.a,
+        b=call.b,
+        dt_bias=operands.dt_bias,
+        q=call.query,
+        k=call.key,
+        v=call.value,
+        scale=args.key_head_dim**-0.5,
+        initial_state=operands.state,
+        inplace_final_state=True,
+        cu_seqlens=operands.cu_seqlens,
+        ssm_state_indices=operands.state_indices,
+        num_accepted_tokens=operands.num_accepted,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+
+def _check_verify_correctness(
+    torch: Any, fused_callable: Any, call: _VerifyCall, args: _ValidatedArgs
+) -> None:
+    """Compare output and the whole checkpoint pool with the reference, then restore."""
+    from profiling.runners.attention.gdn_spec_decode_reference import (
+        gdn_recurrent_spec_decode_reference,
+    )
+
+    operands = call.operands
+    state_snapshot = operands.state.clone()
+    expected_output, expected_state = gdn_recurrent_spec_decode_reference(
+        call.query[0],
+        call.key[0],
+        call.value[0],
+        call.a,
+        call.b,
+        operands.A_log,
+        operands.dt_bias,
+        state_snapshot.clone(),
+        operands.state_indices,
+        operands.num_accepted,
+    )
+    try:
+        output, _ = _invoke_verify(fused_callable, call, args)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            output.reshape(expected_output.shape).float(),
+            expected_output.float(),
+            atol=_OUTPUT_ATOL,
+            rtol=_OUTPUT_RTOL,
+        )
+        torch.testing.assert_close(
+            operands.state, expected_state, atol=_STATE_ATOL, rtol=_STATE_RTOL
+        )
+    finally:
+        operands.state.copy_(state_snapshot)
+
+
 def profile_gdn_recurrent_decode_vllm_triton_sigmoid_gating(
     batch_size: int,
     num_qk_heads: int,
@@ -143,8 +244,13 @@ def profile_gdn_recurrent_decode_vllm_triton_sigmoid_gating(
     value_head_dim: int,
     dtype: DType | str,
     state_dtype: DType | str,
+    num_tokens: int | None = None,
 ) -> ComputeMetrics:
-    """Profile vLLM's sigmoid-gating recurrent update over one-token requests."""
+    """Profile vLLM's sigmoid-gating recurrent update.
+
+    One token per request, or ``num_tokens / batch_size`` verify tokens per
+    request with acceptance-indexed checkpoints when ``num_tokens`` is set.
+    """
     args = _validate_args(
         batch_size,
         num_qk_heads,
@@ -154,6 +260,7 @@ def profile_gdn_recurrent_decode_vllm_triton_sigmoid_gating(
         dtype,
         state_dtype,
     )
+    per_request = tokens_per_request(args.batch_size, num_tokens)
     try:
         import torch
     except ImportError as exc:
@@ -162,11 +269,19 @@ def profile_gdn_recurrent_decode_vllm_triton_sigmoid_gating(
     try:
         fused_callable = _load_callable()
         device = torch.device("cuda", torch.cuda.current_device())
-        operands = _build_varlen_operands(torch, args, device=device)
-        _check_correctness(torch, fused_callable, operands, args)
+        if per_request == 1:
+            operands = _build_varlen_operands(torch, args, device=device)
+            _check_correctness(torch, fused_callable, operands, args)
 
-        def kernel() -> Any:
-            return _invoke(fused_callable, operands, args)
+            def kernel() -> Any:
+                return _invoke(fused_callable, operands, args)
+
+        else:
+            call = _build_verify_call(torch, args, per_request, device=device)
+            _check_verify_correctness(torch, fused_callable, call, args)
+
+            def kernel() -> Any:
+                return _invoke_verify(fused_callable, call, args)
 
         time_ms = Timer.cupti(kernel, kernel_name=_KERNEL_NAME)
         energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
@@ -183,6 +298,7 @@ def profile_gdn_recurrent_decode_vllm_triton_sigmoid_gating(
         num_value_heads=args.num_value_heads,
         key_head_dim=args.key_head_dim,
         value_head_dim=args.value_head_dim,
+        per_request=per_request,
     )
     logical_bytes = _logical_bytes(
         batch_size=args.batch_size,
@@ -192,6 +308,7 @@ def profile_gdn_recurrent_decode_vllm_triton_sigmoid_gating(
         value_head_dim=args.value_head_dim,
         dtype=args.dtype,
         state_dtype=args.state_dtype,
+        per_request=per_request,
     )
     elapsed_s = time_ms / 1000.0
     return ComputeMetrics(

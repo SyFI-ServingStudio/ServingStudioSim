@@ -178,6 +178,7 @@ impl Glm53KdaAttnLocalWorklet {
                 kernel_size: cfg.conv_kernel_size.clone(),
                 dtype: cfg.activation_dtype,
                 state_dtype: cfg.activation_dtype,
+                tokens_per_request: None,
             },
             prefill_small_glue: ew(
                 heads * BETA_SIGMOID_IN_BYTES_PER_HEAD,

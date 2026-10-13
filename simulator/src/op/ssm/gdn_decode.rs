@@ -137,6 +137,7 @@ mod tests {
                 kernel_size: 4.into(),
                 dtype: DType::Bf16,
                 state_dtype: DType::Bf16,
+                tokens_per_request: None,
             },
             recurrent: GdnRecurrentDecodeKernelConfig {
                 backends: vec!["vllm_triton"],
@@ -147,6 +148,7 @@ mod tests {
                 value_head_dim: 128.into(),
                 dtype: DType::Bf16,
                 state_dtype: DType::Fp32,
+                tokens_per_request: None,
             },
         }
     }

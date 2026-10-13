@@ -39,6 +39,7 @@ pub mod gdn_chunk_delta_rule;
 pub mod gdn_gated_rms_norm;
 pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
+pub mod gdn_recurrent_decode_gated_norm;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
 pub mod indexed_row_copy;
@@ -223,6 +224,10 @@ pub use gdn_prefill_post_conv::{
 pub use gdn_recurrent_decode::{
     GdnRecurrentDecodeKernel, GdnRecurrentDecodeKernelConfig, GdnRecurrentDecodeKernelInput,
     GdnRecurrentDecodeSpec,
+};
+pub use gdn_recurrent_decode_gated_norm::{
+    GdnRecurrentDecodeGatedNormKernel, GdnRecurrentDecodeGatedNormKernelConfig,
+    GdnRecurrentDecodeGatedNormKernelInput, GdnRecurrentDecodeGatedNormSpec,
 };
 pub use gemm_fp32_output::{
     GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, GemmFp32OutputSpec,
