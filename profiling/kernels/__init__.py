@@ -49,6 +49,7 @@ from profiling.kernels import (
     gdn_recurrent_decode,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
     grouped_gemm,  # noqa: F401
+    indexed_row_copy,  # noqa: F401
     inv_rope_fp8_quant,  # noqa: F401
     kda_chunk_prefill,  # noqa: F401
     kda_recurrent_decode,  # noqa: F401
