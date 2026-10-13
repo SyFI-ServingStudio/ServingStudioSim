@@ -6,12 +6,14 @@
 //!
 //! - **Target head** (`model_runner.py:1560-1584`): `hidden[logits_indices]`
 //!   gathers the logits rows, then `compute_logits` runs the untied BF16
-//!   lm_head. The logits go to the rejection sampler unreduced, so
-//!   `logits_reduce` is zero (`greedy_argmax = false`); their reduction is
-//!   `spec_sample_local`'s `logits_stats`.
+//!   lm_head. The logits go to the rejection sampler unreduced, so its
+//!   `logits_reduce` leaf is always zero (`greedy_argmax = false`; the leaf
+//!   stays compiled so every head names the same locations); their reduction
+//!   is `spec_sample_local`'s `logits_stats`.
 //! - **Draft head** (`spec_decode/speculator.py:400-432`): the request
-//!   endpoints are gathered (`index_select`), projected by the MTP layer's own
-//!   lm_head, and reduced by `logits.argmax(dim=-1)` (`greedy_argmax = true`).
+//!   endpoints are gathered (`index_select`), projected by the shared lm_head
+//!   (the target's: the checkpoint gives the drafter no dedicated head), and
+//!   reduced by `logits.argmax(dim=-1)` (`greedy_argmax = true`).
 //!
 //! The gather and the argmax are elementwise byte placeholders: the gather
 //! moves one hidden row plus an int64 index per row; the argmax reads one
@@ -40,6 +42,8 @@ pub struct SpecHeadLocalWorkletConfig {
     pub lm_head_dtype: DType,
     /// Dtype `compute_logits` returns.
     pub logits_dtype: DType,
+    /// The head reduces its logits to one greedy token per row (draft head).
+    pub greedy_argmax: bool,
     pub elementwise_backends: Vec<&'static str>,
     pub gemm_backends: Vec<&'static str>,
 }
@@ -56,8 +60,6 @@ pub struct SpecHeadLocalWorkletResolved {
 pub struct SpecHeadLocalWorkletInput {
     /// Rows that get logits: target logits rows, or draft request endpoints.
     pub rows: u32,
-    /// The head reduces its logits to one greedy token per row (draft head).
-    pub greedy_argmax: bool,
 }
 
 pub struct SpecHeadLocalWorklet {
@@ -148,28 +150,13 @@ impl SpecHeadLocalWorklet {
     }
 
     pub fn eval(&self, input: &SpecHeadLocalWorkletInput, ev: &mut Evaluator) {
-        let w = derive_work(input);
-        let none = input.rows == 0;
-        push_or_zero(&self.logits_gather, w.logits_gather, none, ev);
-        push_or_zero(&self.lm_head, w.lm_head, none, ev);
-        push_or_zero(&self.logits_reduce, w.logits_reduce, w.reduce_zero, ev);
-    }
-}
-
-struct WorkInputs {
-    logits_gather: ElementwiseKernelInput,
-    lm_head: SingleGemmKernelInput,
-    logits_reduce: ElementwiseKernelInput,
-    reduce_zero: bool,
-}
-
-fn derive_work(input: &SpecHeadLocalWorkletInput) -> WorkInputs {
-    let rows = input.rows;
-    WorkInputs {
-        logits_gather: ElementwiseKernelInput { num_tokens: rows },
-        lm_head: SingleGemmKernelInput { m: rows },
-        logits_reduce: ElementwiseKernelInput { num_tokens: rows },
-        reduce_zero: rows == 0 || !input.greedy_argmax,
+        let rows = input.rows;
+        let none = rows == 0;
+        let tokens = ElementwiseKernelInput { num_tokens: rows };
+        push_or_zero(&self.logits_gather, tokens.clone(), none, ev);
+        push_or_zero(&self.lm_head, SingleGemmKernelInput { m: rows }, none, ev);
+        let reduce = self.resolved.raw_cfg.greedy_argmax;
+        push_or_zero(&self.logits_reduce, tokens, none || !reduce, ev);
     }
 }
 
@@ -185,6 +172,7 @@ mod tests {
             activation_dtype: DType::Bf16,
             lm_head_dtype: DType::Bf16,
             logits_dtype: DType::Bf16,
+            greedy_argmax: true,
             elementwise_backends: vec!["torch"],
             gemm_backends: vec!["torch_linear_vllm"],
         }
@@ -197,28 +185,5 @@ mod tests {
         assert_eq!(r.logits_reduce.input_bytes_per_token.get(), 248_320 * 2);
         assert_eq!(r.logits_reduce.output_bytes_per_token.get(), 248_320 * 2);
         assert_eq!(r.logits_gather.output_bytes_per_token.get(), 2560 * 2);
-    }
-
-    /// The target head hands logits to the sampler; only the draft head
-    /// reduces them to a token.
-    #[test]
-    fn argmax_runs_only_for_the_greedy_draft_head() {
-        let target = derive_work(&SpecHeadLocalWorkletInput {
-            rows: 40,
-            greedy_argmax: false,
-        });
-        assert_eq!(target.lm_head.m, 40);
-        assert!(target.reduce_zero);
-        let draft = derive_work(&SpecHeadLocalWorkletInput {
-            rows: 10,
-            greedy_argmax: true,
-        });
-        assert_eq!((draft.lm_head.m, draft.logits_reduce.num_tokens), (10, 10));
-        assert!(!draft.reduce_zero);
-        let empty = derive_work(&SpecHeadLocalWorkletInput {
-            rows: 0,
-            greedy_argmax: true,
-        });
-        assert!(empty.reduce_zero);
     }
 }

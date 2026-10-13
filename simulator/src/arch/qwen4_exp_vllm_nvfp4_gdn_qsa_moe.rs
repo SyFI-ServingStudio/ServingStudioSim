@@ -245,8 +245,10 @@ pub struct Qwen4ExpVllmConfigs {
     pub moe: VllmMoeSharedStreamLocalWorkletConfig,
     /// `_mtp_hidden_buffer[:T].copy_(multi_hidden)`.
     pub mtp_hidden_copy: ElementwiseKernelConfig,
-    /// The target's lm_head, which the drafter reuses.
+    /// The target's lm_head; the drafter reuses it as `draft_head`, which
+    /// also takes the greedy argmax.
     pub head: SpecHeadLocalWorkletConfig,
+    pub draft_head: SpecHeadLocalWorkletConfig,
     pub sample: SpecSampleLocalWorkletConfig,
     pub mtp_prelude: MtpFcPreludeLocalWorkletConfig,
     pub mtp_moe: VllmFp8MoeSharedStreamLocalWorkletConfig,
@@ -384,6 +386,18 @@ pub fn build_configs(
         },
     };
     let blocks_per_request = parallel.max_model_len.div_ceil(kv_block_size);
+    let head = |greedy_argmax| SpecHeadLocalWorkletConfig {
+        gpu_name: gpu.clone(),
+        hidden: model.hidden.into(),
+        vocab_size: model.vocab_size.into(),
+        activation_dtype: ACTIVATION_DTYPE,
+        lm_head_dtype: ACTIVATION_DTYPE,
+        // `compute_logits` returns BF16 (the capture's `ArgMaxOps<BFloat16>`).
+        logits_dtype: ACTIVATION_DTYPE,
+        greedy_argmax,
+        elementwise_backends: TORCH_BACKENDS.to_vec(),
+        gemm_backends: GEMM_BACKENDS.to_vec(),
+    };
     Ok(Qwen4ExpVllmConfigs {
         groups: layer_groups(model),
         embedding: EmbeddingRowGatherKernelConfig {
@@ -461,17 +475,8 @@ pub fn build_configs(
             },
         },
         mtp_hidden_copy: elementwise(TORCH_BACKENDS, &gpu, streams * act, streams * act),
-        head: SpecHeadLocalWorkletConfig {
-            gpu_name: gpu.clone(),
-            hidden: model.hidden.into(),
-            vocab_size: model.vocab_size.into(),
-            activation_dtype: ACTIVATION_DTYPE,
-            lm_head_dtype: ACTIVATION_DTYPE,
-            // `compute_logits` returns BF16 (the capture's `ArgMaxOps<BFloat16>`).
-            logits_dtype: ACTIVATION_DTYPE,
-            elementwise_backends: TORCH_BACKENDS.to_vec(),
-            gemm_backends: GEMM_BACKENDS.to_vec(),
-        },
+        head: head(false),
+        draft_head: head(true),
         sample: SpecSampleLocalWorkletConfig {
             gpu_name: gpu.clone(),
             vocab_size: model.vocab_size.into(),
@@ -613,6 +618,7 @@ pub struct Qwen4ExpVllmResolved {
     pub ple_first: PleLocalWorkletResolved,
     pub moe: VllmMoeSharedStreamLocalWorkletResolved,
     pub head: SpecHeadLocalWorkletResolved,
+    pub draft_head: SpecHeadLocalWorkletResolved,
     pub sample: SpecSampleLocalWorkletResolved,
     pub mtp_prelude: MtpFcPreludeLocalWorkletResolved,
     pub mtp_moe: VllmFp8MoeSharedStreamLocalWorkletResolved,
@@ -632,6 +638,7 @@ pub fn resolve_configs(cfgs: &Qwen4ExpVllmConfigs) -> Qwen4ExpVllmResolved {
         ple_first: PleLocalWorklet::resolve_config(&cfgs.ple_first),
         moe: VllmMoeSharedStreamLocalWorklet::resolve_config(&cfgs.moe),
         head: SpecHeadLocalWorklet::resolve_config(&cfgs.head),
+        draft_head: SpecHeadLocalWorklet::resolve_config(&cfgs.draft_head),
         sample: SpecSampleLocalWorklet::resolve_config(&cfgs.sample),
         mtp_prelude: MtpFcPreludeLocalWorklet::resolve_config(&cfgs.mtp_prelude),
         mtp_moe: VllmFp8MoeSharedStreamLocalWorklet::resolve_config(&cfgs.mtp_moe),
@@ -978,7 +985,6 @@ impl Qwen4ExpTargetForward {
         self.head.eval(
             &SpecHeadLocalWorkletInput {
                 rows: batch.logits_rows,
-                greedy_argmax: false,
             },
             ev,
         );
@@ -1037,7 +1043,7 @@ impl MtpPass {
                 r.final_mixer.clone(),
                 bridge,
             )?,
-            head: SpecHeadLocalWorklet::build(format!("{p}.head"), r.head.clone(), bridge)?,
+            head: SpecHeadLocalWorklet::build(format!("{p}.head"), r.draft_head.clone(), bridge)?,
         })
     }
 
@@ -1066,13 +1072,8 @@ impl MtpPass {
             ev,
         );
         self.final_mixer.eval(&mix, ev);
-        self.head.eval(
-            &SpecHeadLocalWorkletInput {
-                rows: endpoints,
-                greedy_argmax: true,
-            },
-            ev,
-        );
+        self.head
+            .eval(&SpecHeadLocalWorkletInput { rows: endpoints }, ev);
     }
 }
 
