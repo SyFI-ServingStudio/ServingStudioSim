@@ -80,8 +80,15 @@ BLOCK_BYTES = round(78.57 * GIB / POOL_BLOCKS_2048)  # ~43.94 MB; the logged GiB
 
 # Per-GPU KV pool (`Available KV cache memory`, GiB) logged by each chunk size's warm workload passes:
 # chunk -> (GiB, Slurm jobs, evidence dir). None until measured; the chunk-2048 smoke pool stands in.
+# The pool is not a pure function of the arguments: with identical argv, smoke 6600 logged 78.57 GiB (77.60 GiB
+# weights + non-torch, 3.39 GiB graph pool) and diverse_100 6613/6614 logged 79.80 GiB (76.37 + 2.78). Each case's
+# own workload pass is the authority for its pool; these values only size the case designs.
 SMOKE_POOL = (78.57, "6600 (smoke, cold and warm start alike)", "logs/20261013_0_qf_smoke/workload_warm")
-MEASURED_POOL: dict[int, tuple[float, str, str] | None] = {2048: None, 4096: None, 8192: None}
+MEASURED_POOL: dict[int, tuple[float, str, str] | None] = {
+    2048: (79.80, "6613, 6614 (diverse_100 nsys and workload)", "logs/20261013_1_qf_diverse100/profile_workload"),
+    4096: (77.84, "6623 (case 16 workload)", "logs/20261013_2_qf_cases/16_prefill_spectrum_chunk4k_c32/profile_workload"),
+    8192: (73.76, "6624 (case 17 workload)", "logs/20261013_2_qf_cases/17_prefill_spectrum_chunk8k_c32/profile_workload"),
+}
 
 # MTP acceptance per draft position (conditional: position 0 / drafts, then i / i-1) from the smoke's warm workload
 # pass; every case carries it as `provisional` until its own workload pass measures it.

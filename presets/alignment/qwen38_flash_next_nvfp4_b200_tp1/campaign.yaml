@@ -1241,16 +1241,16 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 01
     derivation: 'GLM''s c256 = max_num_seqs. Every request is <= 192 tokens, so each holds 12 blocks: 256 x 12.00
-      mean terminal blocks = 160% of the 1920-block pool. The per-request state blocks, not max_num_seqs, bind:
-      at most 160 requests run at once and the rest queue. That is this deployment''s real batching ceiling, so
+      mean terminal blocks = 158% of the 1950-block pool. The per-request state blocks, not max_num_seqs, bind:
+      at most 162 requests run at once and the rest queue. That is this deployment''s real batching ceiling, so
       the case keeps c256 (4 requests per slot).'
 - index: 2
   name: graph_boundaries_c128
@@ -1299,16 +1299,16 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 02
     derivation: Unchanged from GLM. Prompts straddle the capture edges 16/32/64/128/256 of the explicit list; decode
       verify steps of 4 tokens per request replay FULL graphs at multiples of 4. 128 x 12.00 mean terminal blocks
-      = 80% of the 1920-block pool (fits).
+      = 79% of the 1950-block pool (fits).
 - index: 3
   name: balanced_anchor_c32
   variant: tp1
@@ -1349,14 +1349,14 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 03
-    derivation: 'The cross-model anchor: unchanged. 32 x 13.00 mean terminal blocks = 22% of the 1920-block pool
+    derivation: 'The cross-model anchor: unchanged. 32 x 13.00 mean terminal blocks = 21% of the 1950-block pool
       at its largest shape.'
 - index: 4
   name: prefill_spectrum_c32
@@ -1399,11 +1399,11 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 04
     derivation: 'Unchanged: the chunk is 2048, so 1984/2048/2112 straddle it; 4096/6144/7168 are 2/3/3.5 chunks.
@@ -1449,14 +1449,14 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 05
-    derivation: 'Unchanged: 64 x 13.00 mean terminal blocks = 43% of the 1920-block pool at its largest shape. QSA
+    derivation: 'Unchanged: 64 x 13.00 mean terminal blocks = 43% of the 1950-block pool at its largest shape. QSA
       attention context grows to 5120 while GDN state stays constant per request.'
 - index: 6
   name: long_long_c8
@@ -1493,16 +1493,16 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 06
     derivation: 'GLM''s prompts are 25-75% of its 8192 context limit; this deployment serves 131072, so prompts
       x16 (32K-96K), as MiMo and Qwen3.8-27B. Outputs keep GLM''s absolute 1920-4096: they set the decode step count.
-      8 x 50.00 mean terminal blocks = 21% of the 1920-block pool at its largest shape.'
+      8 x 50.00 mean terminal blocks = 21% of the 1950-block pool at its largest shape.'
 - index: 7
   name: quadrant_interference_c48
   variant: tp1
@@ -1536,11 +1536,11 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 07
     derivation: 'Unchanged: the quadrants are defined against the 2048 chunk (4096 = two chunks), not the context
@@ -1582,14 +1582,14 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 08
-    derivation: 'Unchanged: 96 x 13.00 mean terminal blocks = 65% of the 1920-block pool at its largest shape, so
+    derivation: 'Unchanged: 96 x 13.00 mean terminal blocks = 64% of the 1950-block pool at its largest shape, so
       replacements are admitted at once.'
 - index: 9
   name: rate_knee
@@ -1637,11 +1637,11 @@ cases:
       that rate
     evidence: ''
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 09
     derivation: GLM's knee rule (0.8 x the case-10 saturated rate) on this model's throughput; same 8-shape mix
@@ -1671,14 +1671,14 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 10
-    derivation: 'GLM''s c256. 256 x 12.75 mean terminal blocks = 170% of the 1920-block pool, so admission and preemption
+    derivation: 'GLM''s c256. 256 x 12.75 mean terminal blocks = 167% of the 1950-block pool, so admission and preemption
       bind: saturation in KV as well as compute. Same trace as case 9 so the knee is a fraction of this rate.'
 - index: 11
   name: long_prefill_ladder_c1
@@ -1745,11 +1745,11 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 11
     derivation: 'GLM''s rungs are 1/32 .. 15/16 of its 524288 limit; the same fractions of 131072 (each rung / 4),
@@ -1821,11 +1821,11 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 12
     derivation: 'Prompts are GLM''s / 4 (same fractions of the context limit; the top, 114688 + 4096, is 88% of
@@ -1924,15 +1924,15 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 84.3639
+    value: 85.6846
     status: measured
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike))'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    derived_from: '`Available KV cache memory: 79.8 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 2048 (Slurm jobs 6613, 6614 (diverse_100 nsys and workload))'
+    evidence: logs/20261013_1_qf_diverse100/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 13
     derivation: 'Unchanged: GLM already ran it at max_model_len 131072, and its longest row (65536) fits. 8 x 37.00
-      mean terminal blocks = 15% of the 1920-block pool at its largest shape.'
+      mean terminal blocks = 15% of the 1950-block pool at its largest shape.'
 - index: 14
   name: near_full_long_decode_c64
   variant: tp1_kv14
@@ -2112,7 +2112,7 @@ cases:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 14
     derivation: 'GLM''s 91.4% = c x mean terminal blocks / pool, on GLM''s shapes. Their mean holds 22.33 blocks
       (blocks() above). c64: 64 x 22.33 / 0.914 = 1564 blocks x 43939529 B = 68721423356 B (64.00 GiB), pinned with
-      --kv-cache-memory-bytes, under the default 1920-block pool. repeats 32 keeps GLM''s 3 requests per slot. NSYS
+      --kv-cache-memory-bytes, under the default 1950-block pool. repeats 32 keeps GLM''s 3 requests per slot. NSYS
       trace: c requests at terminal - 256, so the window opens at the terminal KV state.'
 - index: 15
   name: kv_overcommit_mixed_churn_c32
@@ -2273,12 +2273,11 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
-    status: provisional
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike)); replace with this deployment''s chunk-4096
-      workload pass'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    value: 83.5801
+    status: measured
+    derived_from: '`Available KV cache memory: 77.84 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 4096 (Slurm jobs 6623 (case 16 workload))'
+    evidence: logs/20261013_2_qf_cases/16_prefill_spectrum_chunk4k_c32/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 04
     derivation: 'Case 04 at chunk 4096: the same c32 and 16 repeats, rungs moved to the new chunk boundary (4032/4096/4160)
@@ -2327,12 +2326,11 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
-    status: provisional
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike)); replace with this deployment''s chunk-8192
-      workload pass'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    value: 79.1992
+    status: measured
+    derived_from: '`Available KV cache memory: 73.76 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 8192 (Slurm jobs 6624 (case 17 workload))'
+    evidence: logs/20261013_2_qf_cases/17_prefill_spectrum_chunk8k_c32/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 04
     derivation: 'Case 04 at chunk 8192: the same c32 and 16 repeats, rungs moved to the new chunk boundary (8128/8192/8256)
@@ -2373,12 +2371,11 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
-    status: provisional
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike)); replace with this deployment''s chunk-4096
-      workload pass'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    value: 83.5801
+    status: measured
+    derived_from: '`Available KV cache memory: 77.84 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 4096 (Slurm jobs 6623 (case 16 workload))'
+    evidence: logs/20261013_2_qf_cases/16_prefill_spectrum_chunk4k_c32/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 07
     derivation: 'Case 07 at chunk 4096: same c48 and 24 repeats; the long prompts stay 2 and 1.5 chunks (8192 and
@@ -2418,12 +2415,11 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
-    status: provisional
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike)); replace with this deployment''s chunk-8192
-      workload pass'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    value: 79.1992
+    status: measured
+    derived_from: '`Available KV cache memory: 73.76 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 8192 (Slurm jobs 6624 (case 17 workload))'
+    evidence: logs/20261013_2_qf_cases/17_prefill_spectrum_chunk8k_c32/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 07
     derivation: 'Case 07 at chunk 8192: same c48 and 24 repeats; the long prompts stay 2 and 1.5 chunks (16384 and
@@ -2455,12 +2451,11 @@ cases:
       position 2639/3604, 1762/2639, 1209/1762); replace with this case's workload pass
     evidence: logs/20261013_0_qf_smoke/workload_warm/spec_decode_metrics.json
   attn_gpu_memory_gb:
-    value: 84.3639
-    status: provisional
-    derived_from: '`Available KV cache memory: 78.57 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
-      256, chunk 2048 (Slurm jobs 6600 (smoke, cold and warm start alike)); replace with this deployment''s chunk-8192
-      workload pass'
-    evidence: logs/20261013_0_qf_smoke/workload_warm
+    value: 79.1992
+    status: measured
+    derived_from: '`Available KV cache memory: 73.76 GiB` (x 1.073741824) at gpu_memory_utilization 0.9, max_num_seqs
+      256, chunk 8192 (Slurm jobs 6624 (case 17 workload))'
+    evidence: logs/20261013_2_qf_cases/17_prefill_spectrum_chunk8k_c32/profile_workload
   provenance:
     derived_from_pack: qwen38_27b_nvfp4_b200_tp1 case 10
     derivation: 'Case 10 at chunk 8192: same c256 and trace. Mixed steps carry up to ~250 decodes plus an 8192-token
