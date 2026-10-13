@@ -59,7 +59,7 @@ mix) at chunk 4096 and 8192, so the matrix spans the scheduler token budget rath
 per-case `chunk_size` sets both vLLM's --max-num-batched-tokens and the simulated worker's max_batch_tokens. The
 capture list is unchanged: `capture_sizes(2048, chunk)` caps at the explicit 2048 ceiling and appends no chunk
 above it, so mixed steps above 2048 tokens run eagerly in every chunk case. A larger token budget enlarges vLLM's
-profile-run activation peak, so their KV pool is re-read from their own workload pass.
+profile-run activation peak, so their KV pool is read from their own workload passes (`CHUNK_KV_POOL`).
 
 Run from the repo root: uv run python presets/alignment/mimo_v26_flash_b200_tp4/make_pack.py
 """
@@ -375,19 +375,24 @@ def trace_spec(case: dict, key: str) -> dict:
     return spec
 
 
+# Per-GPU KV pool logged by the chunk 4096 / 8192 workload passes (both cases of a chunk agree).
+CHUNK_KV_POOL = {4096: (108.29, "6429, 6431"), 8192: (107.72, "6425, 6427")}
+
+
 def kv_calibration(case: dict) -> dict:
     if case.get("variant") == "kv14":
         pinned = KV14
     elif case.get("variant") == "kv15":
         pinned = KV15
     elif case.get("chunk_size", CHUNK) != CHUNK:
+        gib, jobs = CHUNK_KV_POOL[case["chunk_size"]]
         return {
-            "value": round(108.44 * GIB / 1e9, 4),
-            "status": "provisional",
-            "derived_from": "the chunk-2048 pool (108.44 GiB, case-01 workload pass, job 6360); a larger "
-                            "--max-num-batched-tokens raises vLLM's profile-run peak, so replace it with "
-                            "`Available KV cache memory` from this case's own workload pass",
-            "evidence": "",
+            "value": round(gib * GIB / 1e9, 4),
+            "status": "measured",
+            "derived_from": f"`Available KV cache memory: {gib} GiB` (x 1.073741824) in the chunk-{case['chunk_size']} "
+                            f"workload passes (Slurm jobs {jobs}); a larger --max-num-batched-tokens raises vLLM's "
+                            "profile-run peak, so the pool is below chunk 2048's 108.44 GiB",
+            "evidence": f"logs/20261012_7_mimo_chunk_cases/{case['index']:02d}_{case['name']}/profile_workload",
         }
     else:
         return {
