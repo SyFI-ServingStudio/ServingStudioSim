@@ -936,8 +936,8 @@ mod tests {
     }
 
     /// "Maximum concurrency for 131,072 tokens per request: 29.14x" from the
-    /// capture's 125.52 GiB pool at chunk 2048, prefix caching on (align mode
-    /// holds one more state block per request).
+    /// capture's 125.52 GiB pool at chunk 2048, prefix caching on (align mode's
+    /// estimate counts one more state block per request).
     #[test]
     fn kv_cache_layout_reproduces_vllms_logged_concurrency() {
         use crate::worker::kv::{KvAccounting, KvAccountingOptions};

@@ -286,9 +286,9 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
                 let copies = charge.charged_copies;
                 if charge.align_copy == Some(true) {
                     format!(
-                        "{} ({} + align)",
-                        plural(u64::from(copies), "copy"),
-                        copies - 1
+                        "{} ({} held + align)",
+                        plural(u64::from(copies) + 1, "copy"),
+                        copies
                     )
                 } else {
                     plural(u64::from(copies), "copy")
@@ -324,6 +324,19 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
     );
     if let Some(tokens) = result.capacity_tokens {
         let _ = writeln!(out, "  GPU KV cache size: {} tokens", grouped(tokens));
+    }
+    if let (Some(held), Some(estimated)) = (
+        result.admission_units_at_max_model_len,
+        result.units_per_request_at_max_model_len,
+    ) {
+        if held < estimated {
+            let _ = writeln!(
+                out,
+                "  A running request holds {} of the estimate's {}: the align copy is not held",
+                human_bytes(per_gpu(held * accounting.bytes_per_unit)),
+                human_bytes(per_gpu(estimated * accounting.bytes_per_unit)),
+            );
+        }
     }
 }
 

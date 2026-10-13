@@ -1593,8 +1593,8 @@ mod tests {
     }
 
     /// The engine's "Maximum concurrency for 9,216 tokens per request" at TP1.
-    /// Prefix caching runs the GDN state in align mode, which holds one more
-    /// state block per request.
+    /// Prefix caching runs the GDN state in align mode, whose estimate counts
+    /// one more state block per request.
     #[test]
     fn kv_cache_layout_reproduces_vllms_logged_concurrency() {
         use crate::worker::kv::{KvAccounting, KvAccountingOptions};

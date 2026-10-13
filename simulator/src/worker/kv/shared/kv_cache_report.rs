@@ -61,10 +61,10 @@ pub struct KvPartChargeReport {
     /// The padded entry under `vllm`, the model's own under `none`.
     pub charged_bytes_per_entry: u64,
     pub units_per_entry: u64,
-    /// Copies charged per request; 1 for a part that grows with context.
+    /// Copies a running request holds; 1 for a part that grows with context.
     pub charged_copies: u32,
-    /// For a per-request part, whether one of `charged_copies` is align
-    /// mode's previous-step copy; null for any other part.
+    /// For a per-request part, whether vLLM's concurrency estimate adds align
+    /// mode's previous-step copy to `charged_copies`; null for any other part.
     pub align_copy: Option<bool>,
 }
 
@@ -73,10 +73,13 @@ pub struct KvPartChargeReport {
 pub struct KvCapacityReport {
     /// Null when the arch cannot give one.
     pub max_model_len: Option<u32>,
-    /// Units admitting one `max_model_len`-token request needs.
+    /// Units vLLM's concurrency estimate charges one `max_model_len`-token
+    /// request: what admitting it needs plus any align copies.
     pub units_per_request_at_max_model_len: Option<u64>,
-    /// Those units split over the layout's parts, in its order; empty when
-    /// `max_model_len` is unknown.
+    /// Units admitting and running that request holds (no align copy).
+    pub admission_units_at_max_model_len: Option<u64>,
+    /// The estimate's units split over the layout's parts, in its order;
+    /// empty when `max_model_len` is unknown.
     pub request_parts: Vec<KvRequestPartReport>,
     /// vLLM's "Maximum concurrency for N tokens per request".
     pub max_concurrency_at_max_model_len: Option<f64>,
@@ -90,7 +93,8 @@ pub struct KvCapacityReport {
     pub capacity_tokens: Option<u64>,
 }
 
-/// What one part holds for a `max_model_len`-token request at admission.
+/// What one part holds for a `max_model_len`-token request in vLLM's
+/// concurrency estimate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct KvRequestPartReport {
     pub name: &'static str,
@@ -98,7 +102,7 @@ pub struct KvRequestPartReport {
     /// the kept window for a sliding window; null for per-request state.
     pub tokens_held: Option<u64>,
     /// Entries charged: tokens over `tokens_per_entry`, window tokens, or
-    /// state copies.
+    /// state copies (the align copy included).
     pub entries: u64,
     /// Bytes over one KV partition.
     pub bytes: u64,
@@ -160,11 +164,11 @@ impl KvAccounting {
 
         let request_parts: Vec<KvRequestPartReport> = model_len
             .map(|len| {
-                let split = self.needed_to_admit_by_part(len);
+                let split = self.estimated_request_by_part(len);
                 debug_assert_eq!(
                     split.iter().map(|part| part.units).sum::<u64>(),
-                    self.needed_to_admit(len),
-                    "the per-part split must sum to the admission charge"
+                    self.estimated_request_units(len),
+                    "the per-part split must sum to the estimate's charge"
                 );
                 layout
                     .parts
@@ -201,7 +205,9 @@ impl KvAccounting {
             },
             result: KvCapacityReport {
                 max_model_len,
-                units_per_request_at_max_model_len: model_len.map(|len| self.needed_to_admit(len)),
+                units_per_request_at_max_model_len: model_len
+                    .map(|len| self.estimated_request_units(len)),
+                admission_units_at_max_model_len: model_len.map(|len| self.needed_to_admit(len)),
                 request_parts,
                 max_concurrency_at_max_model_len: model_len.map(|len| self.concurrency_at(len)),
                 other_kv_overhead,
@@ -271,19 +277,21 @@ mod tests {
             [
                 ("global", 1, 1, None),
                 ("swa", 1, 1, None),
-                // The padded state, kept twice: align mode adds the previous
-                // step's copy.
-                ("state", 12, 2, Some(true)),
+                // The padded state, held once; vLLM's estimate adds align
+                // mode's previous-step copy.
+                ("state", 12, 1, Some(true)),
             ]
         );
 
         // At 100 tokens: global in seven 16-token blocks (112), the window
-        // capped at W - 1 + in-flight = 95, and two 12-unit states.
+        // capped at W - 1 + in-flight = 95, and two 12-unit states in the
+        // estimate, one held.
         let result = report.result;
         assert_eq!(
             result.units_per_request_at_max_model_len,
             Some(112 + 95 + 24)
         );
+        assert_eq!(result.admission_units_at_max_model_len, Some(112 + 95 + 12));
         assert_eq!(
             result.max_concurrency_at_max_model_len,
             Some(accounting.concurrency_at(100))

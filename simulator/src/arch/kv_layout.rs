@@ -71,9 +71,9 @@ pub struct PartOverhead {
     /// such as a head size padded to a power of two or a mamba page padded to
     /// the attention page.
     pub padded_bytes_per_entry: Option<u64>,
-    /// State copies the engine keeps per request whatever the cache mode: one
-    /// plus vLLM's speculative blocks. `None` means one. L5 adds align mode's
-    /// previous-step copy itself when prefix caching is on.
+    /// State copies the engine keeps per running request whatever the cache
+    /// mode: one plus vLLM's speculative blocks. `None` means one. L5 adds
+    /// align mode's previous-step copy to vLLM's concurrency estimate only.
     pub copies: Option<u32>,
 }
 
