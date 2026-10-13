@@ -2,7 +2,8 @@
 # diverse_100 capture's server ran (vLLM fork 892da082, --max-model-len 131072,
 # --max-num-batched-tokens 2048, --gpu-memory-utilization 0.85, prefix caching on).
 # attn_gpu_memory_gb is the KV pool, measured from `Available KV cache memory: 125.52 GiB`
-# in the capture's server log (x 1.073741824).
+# in the capture's server log (x 1.073741824). gpu_time_multiplier is that capture's kernel alignment
+# recommendation (recommended_gpu_time_multiplier 1.0483, nsys job 6443), as the alignment pack declares it.
 deployment: unified
 pools:
   main:
@@ -15,5 +16,6 @@ pools:
           max_batch_tokens: 2048
           batch_policy: mix
           attn_gpu_memory_gb: 134.7761
+          gpu_time_multiplier: 1.0483
 sweep:
   replicas: [1, 2]

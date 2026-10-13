@@ -472,6 +472,15 @@ document = {
         "nsys_version": "2025.5.2",
         "device_roles": {"primary": "0"},
     },
+    # One duty-cycle multiplier for every case, measured outside the matrix: the diverse_100 capture's kernel-align
+    # `recommended_gpu_time_multiplier` (sum of measured GPU cycle / sum of measured critical path, 3408 iterations).
+    "gpu_time_multiplier": {
+        "value": 1.0483,
+        "status": "measured",
+        "derived_from": "recommended_gpu_time_multiplier 1.04834 of the diverse_100 kernel-align (nsys job 6443, "
+                        "3408 iterations, labels from this pack's rules); not fitted to any case",
+        "evidence": "logs/20261013_2_q38_diverse100/analysis_kernel/reports/alignment_iteration_report.json",
+    },
     "variants": {
         "tp1": variant(),
         "tp1_kv14": variant(["--kv-cache-memory-bytes", str(KV14)]),
