@@ -18,7 +18,14 @@ from dataclasses import replace
 
 from .core import AttnInteraction, Workload
 from .models import dflash2
-from .models.glm52 import DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE
+
+#: :attr:`Workload.stages` key for the proposer's first draft pass. It forwards
+#: the target's whole scheduled batch, because it is the pass that fills the MTP
+#: layer's own attention state.
+DRAFT_FIRST_STAGE = "mtp_first"
+#: …and for every drafted position after the first: one row per request, over a
+#: context the first pass already indexed.
+DRAFT_RECURRENT_STAGE = "mtp_recurrent"
 
 #: Proposer -> the stages its stacks run against.
 PROPOSER_STAGES = {

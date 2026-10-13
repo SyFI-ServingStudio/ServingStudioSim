@@ -136,6 +136,10 @@ mixers/short_conv.py       sublayer-output short convolutions + their norms (Ink
 models/inkling.py          local/global x dense/BF16/NVFP4-expert stacks + sink-expert MoE
 attention/sliding_window.py  causal sliding-window GQA (exact per-request geometry)
 models/mimo_v2.py          GA/SWA x dense/MoE stacks, asymmetric QK/V, SWA sinks, MXFP4 MoE
+attention/qsa.py           Qwen4Exp QSA: pooled-indexer top-k sparse GQA
+mixers/gated_hc.py         gated low-rank hyper-connection residual streams (Qwen4Exp)
+mixers/ngram_embedding.py  hashed n-gram embedding + dilated conv history (Qwen4Exp)
+models/qwen4_exp.py        GDN/QSA stacks + n-gram layer + gated HC + NVFP4 MoE + staged MTP
 ```
 
 - **New attention (MLA/SWA/SSM)** → one new `attention/*.py`; every FFN combination is free.
@@ -247,15 +251,18 @@ projection, and `2·S·hidden` FLOPs per gated stream mean and per injected comb
 final mixer collapses the streams). QSA (`attention/qsa.py`) scores mean-pooled
 groups of 4 indexer keys and attends `min(k, 2048 + k mod 4)` keys per query (the
 kpool closed forms); every pass runs its own indexer, the MTP layer's recurrent draft
-steps included (the checkpoint has no `index_share_for_mtp_iteration`). Layer 1 adds a hashed n-gram embedding (`mixers/ngram_embedding.py`):
-its 51.2 G-element FP8 table counts as parameters and is read only at the
-`16·tokens` gathered rows (the deployment keeps it in host memory), and its dilated
-convolution keeps a 9-row history per request. Every layer is a 512-expert top-10
+steps included (the checkpoint has no `index_share_for_mtp_iteration`). Layer 1
+adds a hashed n-gram embedding (`mixers/ngram_embedding.py`): its 51.2 G-element
+FP8 table counts as parameters and is read only at the `16·tokens` gathered rows
+(the deployment keeps it in host memory), and its dilated convolution keeps a 9-row
+history per request. Every layer is a 512-expert top-10
 MoE with a sigmoid-gated shared expert (NVFP4 experts); the staged MTP layer has
 FP8 128-block experts and shares the target's embedding and `lm_head`. Parameters
 reconcile exactly with the safetensors header (176,943,899,520 body,
-2,607,150,848 MTP). No location map yet: it waits for the arch's final CostTree
-locations.
+2,607,150,848 MTP). `qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_unified.json`
+(340 locations) maps `draft_tokens >= 2`;
+`qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_single_draft_unified.json` (286) maps
+`draft_tokens = 1`, which compiles no recurrent MTP pass.
 
 ## Modality-agnostic workload
 

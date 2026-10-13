@@ -56,7 +56,7 @@ from ..mixers.gated_hc import (
 )
 from ..mixers.ngram_embedding import NgramEmbeddingInjection, ngram_table_rows
 from ..quantization import QuantScheme, parse_quantization_config
-from .glm52 import DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE
+from ..speculative import DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE
 
 _GDN = "linear_attention"
 _QSA = "full_attention"
@@ -84,6 +84,7 @@ class _LayerWithNgramEmbedding:
     attn: object
     ple: NgramEmbeddingInjection
 
+    # Unused: semantic_segments carries the inner spec's own phase rows.
     split_attention_phases = False
     needs_request_geometry = True
 
@@ -96,14 +97,9 @@ class _LayerWithNgramEmbedding:
     def semantic_segments(self, wl: Workload) -> list[AttentionSemantic]:
         return [*self.attn.semantic_segments(wl), *self.ple.semantic_segments(wl)]
 
-    def internal_flops(self, wl: Workload) -> float:
-        return sum(row.flops for row in self.semantic_segments(wl) if row.bucket == "attn_internal")
-
-    def kv_bytes(self, wl: Workload) -> float:
-        return sum(row.bytes for row in self.semantic_segments(wl) if row.byte_kind == "kv")
-
-    def cache_write_bytes(self, wl: Workload) -> float:
-        return 0.0
+    # The wrapper is semantic-only: Model.label reads semantic_segments whenever a
+    # spec has it, so the historical internal_flops / kv_bytes / cache_write_bytes
+    # surface is deliberately absent rather than a second, divergent tally.
 
 
 def _schedule(text: dict) -> tuple[list[str], set[int]]:

@@ -323,7 +323,7 @@ def write_trace(
     workload: Workload,
     out: Path,
     bounds: list[dict] | None,
-) -> tuple[list[str], int]:
+) -> list[str]:
     """Write the trace this run replays to ``out``: the source's rows, every
     column kept, with an ``accept_rate`` column for a speculative worker. A
     worker that drafts nothing runs a speculative trace (a speculative
