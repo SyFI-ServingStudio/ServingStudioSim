@@ -19,9 +19,8 @@
 //! (`context < token_topk`) attend their whole context, rows at or above it
 //! attend the budget. Each group is priced at its own mean context, so a step
 //! that mixes a fresh chunk with long requests is not priced as if every row
-//! read the full budget (a single row-weighted mean context over-priced such
-//! steps by up to 1.6x on the B200 capture, logs/20261013_8_qf_probe). The
-//! framework switches its launch table to the prefill one when the longest
+//! read the full budget. The leaf logs both groups ([`SparseGqaAttentionLog`]).
+//! The framework switches its launch table to the prefill one when the longest
 //! query of the step exceeds the verify length `1 + num_speculative_tokens`;
 //! exactly one of the two attention leaves is non-zero.
 
@@ -33,6 +32,7 @@ use crate::timing::kernels::{
     KvCacheAppendKernelConfig, KvCacheAppendKernelInput, SparseGqaPagedAttentionKernel,
     SparseGqaPagedAttentionKernelConfig, SparseGqaPagedAttentionKernelInput,
 };
+use crate::timing::slot_input::SparseGqaAttentionLog;
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge, Probe,
 };
@@ -98,8 +98,6 @@ pub struct SparseGqaAttentionPlan {
     pub append_rows: u32,
     pub output_rows: u32,
     pub attention_rows: u32,
-    /// Row-weighted mean context of all rows: the logged cell.
-    pub context_len: u32,
     /// `(rows, mean context)` of the rows below the selection budget and of the
     /// rows at or above it; a group with no rows has zero rows.
     pub context_groups: [(u32, u32); 2],
@@ -237,9 +235,9 @@ impl SparseGqaAttentionOp {
         };
         ev.push(metrics, || zero.clone().into());
 
-        let cell = SparseGqaPagedAttentionKernelInput {
+        let log = SparseGqaAttentionLog {
             num_rows: p.attention_rows,
-            context_len: p.context_len,
+            context_groups: p.context_groups,
         };
         for (kernel, prefill_config) in
             [(&self.attn_uniform, false), (&self.attn_prefill_cfg, true)]
@@ -254,7 +252,7 @@ impl SparseGqaAttentionOp {
                     })
                 })
             };
-            ev.push(metrics, || cell.clone().into());
+            ev.push(metrics, || log.clone().into());
         }
     }
 }
@@ -331,12 +329,10 @@ pub fn plan(
             ((sum + n / 2) / n) as u32
         }
     };
-    let rows = groups[0].0 + groups[1].0;
     SparseGqaAttentionPlan {
         append_rows: input.append_rows,
         output_rows: input.output_rows,
         attention_rows: input.attention_rows,
-        context_len: mean((rows, groups[0].1 + groups[1].1)),
         context_groups: groups.map(|g| (g.0 as u32, mean(g))),
         prefill_config: longest_query > r.max_decode_query_len,
     }
@@ -388,8 +384,9 @@ mod tests {
         };
         let p = plan(&r, &verify);
         assert!(!p.prefill_config);
-        // Mean over rows 97..=100, 197..=200, ...: 248.5 rounds to 249.
-        assert_eq!(p.context_len, 249);
+        // Every row is below the budget; the mean over rows 97..=100,
+        // 197..=200, ...: 248.5 rounds to 249.
+        assert_eq!(p.context_groups, [(16, 249), (0, 0)]);
 
         let short_prefill = SparseGqaAttentionOpInput {
             prefill_chunks: vec![(0, 4)],
@@ -416,7 +413,6 @@ mod tests {
             },
         );
         assert!(p.prefill_config);
-        assert_eq!(p.context_len, 126976 + 1025);
         assert_eq!(p.context_groups, [(0, 0), (2048, 126976 + 1025)]);
     }
 
@@ -451,7 +447,6 @@ mod tests {
             append_rows: 4,
             output_rows: 4,
             attention_rows: 4,
-            context_len: 0,
             context_groups: [(1, 100), (3, 9000)],
             prefill_config: true,
         };

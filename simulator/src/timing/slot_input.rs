@@ -51,10 +51,9 @@ use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
 use crate::timing::kernels::{
     GroupedRmsNormKernelInput, MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput,
-    ScaledSiluKernelInput, SiluAndMulKernelInput, SparseGqaPagedAttentionKernelInput,
-    SparseIndexExpandKernelInput, SparseIndexerLogitsDecodeKernelInput,
-    SparseIndexerLogitsPrefillKernelInput, SparseIndexerPrepareKernelInput,
-    StaticFp8QuantKernelInput,
+    ScaledSiluKernelInput, SiluAndMulKernelInput, SparseIndexExpandKernelInput,
+    SparseIndexerLogitsDecodeKernelInput, SparseIndexerLogitsPrefillKernelInput,
+    SparseIndexerPrepareKernelInput, StaticFp8QuantKernelInput,
 };
 use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
 use crate::timing::kernels::{PleGateKernelInput, PleNgramIdsKernelInput, PleShortConvKernelInput};
@@ -106,6 +105,16 @@ pub struct DsaSparseMlaDecodeLog {
     pub context_lens: Vec<u32>,
     pub decode_next_n: u32,
     pub projected_context: u32,
+}
+
+/// Sparse GQA paged attention as the op prices it: one launch over `num_rows`
+/// rows, the row-weighted mean of its two context groups' times, each
+/// evaluated at `num_rows`. `context_groups` is `(rows, mean context)` of the
+/// rows below the selection budget, then of the rows at or above it.
+#[derive(Clone, Serialize)]
+pub struct SparseGqaAttentionLog {
+    pub num_rows: u32,
+    pub context_groups: [(u32, u32); 2],
 }
 
 /// DSA indexer prefill fan-in: every request-local `(Q, N)` cell aggregated by
@@ -221,7 +230,7 @@ log_inputs! {
     StaticFp8Quant => StaticFp8QuantKernelInput,
     IndexedRowCopy => IndexedRowCopyKernelInput,
     QkRmsNormRopeGate => QkRmsNormRopeGateKernelInput,
-    SparseGqaPagedAttention => SparseGqaPagedAttentionKernelInput,
+    SparseGqaPagedAttention => SparseGqaAttentionLog,
     SparseIndexExpand => SparseIndexExpandKernelInput,
     SparseIndexerLogitsDecode => SparseIndexerLogitsDecodeKernelInput,
     SparseIndexerLogitsPrefill => SparseIndexerLogitsPrefillKernelInput,
