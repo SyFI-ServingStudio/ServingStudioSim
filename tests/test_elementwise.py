@@ -183,3 +183,15 @@ def test_copy_realizations_are_registered_backends():
     ):
         spec = find_kernel_profiler_spec("elementwise", backend)
         assert spec.runner_ref.function_name == function_name
+
+
+@pytest.mark.parametrize("backend", ["torch", "torch_strided_copy", "torch_cat"])
+def test_eager_realizations_have_a_serving_env_twin(backend):
+    """Each eager backend has a `_vllm` twin: same runner, vLLM's pinned env."""
+    from profiling.db.registry import find_kernel_profiler_spec
+
+    main = find_kernel_profiler_spec("elementwise", backend)
+    twin = find_kernel_profiler_spec("elementwise", f"{backend}_vllm")
+    assert twin.runner_ref == main.runner_ref
+    assert main.subprocess_env is None
+    assert twin.subprocess_env == "vllm_env"
