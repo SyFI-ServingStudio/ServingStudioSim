@@ -13,6 +13,12 @@
 //! `n_group = topk_group = 1`, and routed scaling 5/2. Its autotuner stops at
 //! 8192 tokens, so larger grid points reuse the top tactic bucket.
 //!
+//! The monolithic NVFP4 backend routes inside the call with `minimax2`,
+//! `deepseek_v3` or `renormalize_naive` (softmax top-k renormalized over BF16
+//! logits, no bias, `n_group = topk_group = 0`); the FP8 block-scale backend
+//! takes `deepseek_v3` or `renormalize_naive`. `routing_method` is a plain
+//! profiler key, so a new method needs no Rust change.
+//!
 //! `flashinfer_trtllm_routed_sm100` is vLLM's modular call under data plus
 //! expert parallelism (`trtllm_fp4_block_scale_routed_moe`): the top-k IDs and
 //! fp32 weights arrive precomputed, so the routing fields stay in the key but do

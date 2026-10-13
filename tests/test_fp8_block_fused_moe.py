@@ -14,6 +14,7 @@ from profiling.runners.moe.fp8_block_fused_moe import (
 from profiling.runners.moe.fp8_block_fused_moe_reference import (
     deepseek_v3_routing,
     fp8_block_fused_moe_reference,
+    renormalize_naive_routing,
 )
 
 
@@ -64,10 +65,29 @@ def test_forced_logits_make_deepseek_v3_routing_realize_the_histogram() -> None:
     torch.testing.assert_close(weights.sum(dim=-1), torch.full((16,), 2.5))
 
 
+def test_forced_bf16_logits_make_renormalize_naive_routing_realize_the_histogram() -> None:
+    """Softmax routing over the BF16 logits vLLM passes for an unbiased router
+    must pick the row's experts, with weights renormalized to one."""
+    spec = _validate_args(
+        **_spec(routing_method="renormalize_naive", n_group=0, topk_group=0)
+    )
+    ids = exact_topk_ids(
+        num_tokens=spec["num_tokens"], top_k=8, per_expert_batches=spec["per_expert_batches"]
+    )
+    logits = forced_routing_logits(torch, ids, 288, "cpu", torch.bfloat16)
+
+    chosen, weights = renormalize_naive_routing(torch, logits, top_k=8)
+
+    counts = torch.bincount(chosen.flatten(), minlength=288).tolist()
+    assert counts == list(spec["per_expert_batches"])
+    torch.testing.assert_close(weights.sum(dim=-1), torch.ones(16))
+
+
 @pytest.mark.parametrize(
     ("override", "message"),
     [
         ({"n_group": 8, "topk_group": 4}, "ungrouped"),
+        ({"routing_method": "renormalize_naive"}, "n_group=topk_group=0"),
         ({"weight_format": "nvfp4_e2m1", "group_size": 16}, "fp8_e4m3"),
         ({"routing_method": "minimax2"}, "routing method"),
         ({"input_dtype": "fp16"}, "BF16"),
