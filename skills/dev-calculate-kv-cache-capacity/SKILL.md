@@ -72,8 +72,8 @@ often not the weight dtype.
 
    vLLM's "Maximum concurrency for L tokens per request" is the budget over this
    one-request charge (with the align copy); the requests it actually runs at
-   once are bounded by the held charge (without it). Its "GPU KV cache size: N tokens" is a token pool only
-   when every part grows per token.
+   once are bounded by the held charge (without it). Its "GPU KV cache size: N
+   tokens" is a token pool only when every part grows per token.
 5. **Hand off.** Implement the parts as the arch's `kv_cache_layout`
    (`impl-compose-arch`), pin it against the capture's logged concurrency, and
    check `launcher <preset> --kv-report` reproduces this derivation. From then

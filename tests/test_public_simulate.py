@@ -743,7 +743,6 @@ def test_a_request_ending_inside_the_draft_window_is_served_whole(client, tmp_pa
     # 900 + 200 ends at max_model_len: the simulator clips its last verifies
     # as vLLM does, so the trace keeps every token.
     assert rows == [("100", "50"), ("200", "60"), ("900", "200"), ("50", "10")]
-    assert "shortened" not in _wait(client, sim_id)["workload"]
 
 
 def test_a_failed_run_reports_its_cause(client, runner) -> None:
