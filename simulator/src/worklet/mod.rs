@@ -44,6 +44,7 @@ pub mod glm53_mlp_local;
 pub mod glm53_moe_local;
 pub mod inkling_attn_local;
 pub mod inkling_router_local;
+pub mod mimo_v2_attn_local;
 pub mod mlp_block_tp;
 pub mod moe_expert_compute_local;
 pub mod native_fp8_moe_router_local;
@@ -194,6 +195,10 @@ pub use inkling_attn_local::{
 pub use inkling_router_local::{
     InklingRouterLocalWorklet, InklingRouterLocalWorkletConfig, InklingRouterLocalWorkletInput,
     InklingRouterLocalWorkletResolved,
+};
+pub use mimo_v2_attn_local::{
+    MimoV2AttnLocalWorklet, MimoV2AttnLocalWorkletConfig, MimoV2AttnLocalWorkletInput,
+    MimoV2AttnLocalWorkletResolved,
 };
 pub use mlp_block_tp::{
     MlpBlockTpWorklet, MlpBlockTpWorkletConfig, MlpBlockTpWorkletInput, MlpBlockTpWorkletResolved,

@@ -175,6 +175,7 @@ impl DeepseekV41MoeFfnEpWorklet {
                 top_k: cfg.top_k,
                 input_dtype: cfg.moe_input_dtype,
                 weight_format: cfg.weight_format,
+                activation_format: None,
                 group_size: cfg.group_size,
                 routing_method: cfg.routing_method.clone(),
                 n_group: cfg.n_group,

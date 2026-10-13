@@ -75,3 +75,7 @@ thinkingmachines/Inkling-Small-NVFP4:
   name: Inkling Small NVFP4
   family: Inkling
   config: inkling_small_nvfp4
+XiaomiMiMo/MiMo-V2.6-Flash-RL:
+  name: MiMo V2.6 Flash RL
+  family: MiMo
+  config: mimo_v2_6_flash_rl

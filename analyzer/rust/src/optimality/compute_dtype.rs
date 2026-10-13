@@ -5,7 +5,10 @@
 //! precision). Config keys alone are not enough: an NVFP4 fused MoE takes BF16
 //! activations (`input_dtype`) but runs its tensor cores on the FP4 expert
 //! weights (`weight_format`), so a key-order guess gives it the BF16 peak and
-//! the kernel looks faster than the hardware.
+//! the kernel looks faster than the hardware. A kind may also name an override
+//! field (`#[compute_dtype_override]`): the weight-only MXFP4/BF16 fused MoE sets
+//! `activation_format = bf16`, because its tensor cores run BF16 over cast
+//! FP4 weights, and an FP4 peak would make it look 4x slower than its bound.
 //!
 //! The field table is read once per checkout and simulator build through
 //! `kernel-query`'s `kernel_list` op. When it cannot be read (no built
@@ -25,6 +28,8 @@ use crate::kernel_query::{run_kernel_query, simulator_binary};
 pub(crate) struct ComputeDtypeFields {
     /// kind → its `#[compute_dtype]` field, or `None` for a dtype-agnostic kind.
     field_by_kind: HashMap<String, Option<String>>,
+    /// kind → its `#[compute_dtype_override]` field, for the kinds that have one.
+    override_by_kind: HashMap<String, String>,
     /// `"kernel-list"`, or `"unavailable: <why>"` when lookups guess from keys.
     pub source: String,
 }
@@ -63,6 +68,7 @@ impl ComputeDtypeFields {
     fn unavailable(reason: &str) -> Self {
         Self {
             field_by_kind: HashMap::new(),
+            override_by_kind: HashMap::new(),
             source: format!("unavailable: {reason}"),
         }
     }
@@ -74,6 +80,14 @@ impl ComputeDtypeFields {
     /// The dtype literal whose peak bounds this leaf; `"bf16"` for a
     /// dtype-agnostic kind (it is bounded by bandwidth, not this peak).
     pub(crate) fn dtype<'a>(&self, kind: &str, config: &'a Value) -> &'a str {
+        if let Some(dtype) = self
+            .override_by_kind
+            .get(kind)
+            .and_then(|field| config.get(field))
+            .and_then(Value::as_str)
+        {
+            return dtype;
+        }
         match self.field_by_kind.get(kind) {
             Some(Some(field)) => config.get(field).and_then(Value::as_str).unwrap_or("bf16"),
             Some(None) => "bf16",
@@ -99,6 +113,7 @@ fn read_kernel_list(repo_root: &Path, simulator: &Path) -> Result<ComputeDtypeFi
         .and_then(Value::as_array)
         .context("kernel_list response has no kernels array")?;
     let mut field_by_kind = HashMap::with_capacity(kernels.len());
+    let mut override_by_kind = HashMap::new();
     for entry in kernels {
         let kind = entry
             .get("kind")
@@ -109,12 +124,16 @@ fn read_kernel_list(repo_root: &Path, simulator: &Path) -> Result<ComputeDtypeFi
             .and_then(Value::as_str)
             .map(str::to_owned);
         field_by_kind.insert(kind.to_owned(), field);
+        if let Some(over) = entry.get("compute_dtype_override").and_then(Value::as_str) {
+            override_by_kind.insert(kind.to_owned(), over.to_owned());
+        }
     }
     if field_by_kind.is_empty() {
         anyhow::bail!("kernel_list returned no kinds");
     }
     Ok(ComputeDtypeFields {
         field_by_kind,
+        override_by_kind,
         source: "kernel-list".to_owned(),
     })
 }
@@ -127,6 +146,7 @@ impl ComputeDtypeFields {
                 .iter()
                 .map(|(kind, field)| ((*kind).to_owned(), field.map(str::to_owned)))
                 .collect(),
+            override_by_kind: HashMap::new(),
             source: "test".to_owned(),
         }
     }
@@ -142,6 +162,21 @@ mod tests {
         let fields = ComputeDtypeFields::from_fields(&[("nvfp4_fused_moe", Some("weight_format"))]);
         let config = json!({"input_dtype": "bf16", "weight_format": "nvfp4_e2m1"});
         assert_eq!(fields.dtype("nvfp4_fused_moe", &config), "nvfp4_e2m1");
+    }
+
+    #[test]
+    fn a_set_override_field_wins_and_an_absent_one_falls_back() {
+        // Catches the weight-only MXFP4/BF16 MoE getting the FP4 peak.
+        let mut fields =
+            ComputeDtypeFields::from_fields(&[("nvfp4_fused_moe", Some("weight_format"))]);
+        fields
+            .override_by_kind
+            .insert("nvfp4_fused_moe".to_owned(), "activation_format".to_owned());
+        let bf16 = json!({"input_dtype": "bf16", "weight_format": "mxfp4_e2m1",
+                          "activation_format": "bf16"});
+        assert_eq!(fields.dtype("nvfp4_fused_moe", &bf16), "bf16");
+        let quantized = json!({"input_dtype": "bf16", "weight_format": "mxfp4_e2m1"});
+        assert_eq!(fields.dtype("nvfp4_fused_moe", &quantized), "mxfp4_e2m1");
     }
 
     #[test]

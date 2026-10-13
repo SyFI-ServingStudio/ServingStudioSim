@@ -113,6 +113,12 @@ const fn default_glm53_flash_max_model_len() -> u32 {
     8192
 }
 
+/// The MiMo-V2.6-Flash capture's `--max-model-len` (its attention rows'
+/// FA4 split count).
+const fn default_mimo_v2_max_model_len() -> u32 {
+    131_072
+}
+
 /// The captured GLM-5.3-Flash deployment ran `--enable-expert-parallel`.
 const fn default_glm53_flash_enable_expert_parallel() -> bool {
     true
@@ -1043,6 +1049,48 @@ pub enum IterArchSel {
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },
+    /// MiMo-V2's FP8 checkpoints (`XiaomiMiMo/MiMo-V2.6-Flash-RL`) under
+    /// vLLM's TP group: TP attention over global and sliding-window layers
+    /// (FA4 DiffKV), replicated router, routed MXFP4 experts EP = TP with BF16
+    /// activations, and every TP all-reduce fused with the residual add and
+    /// RMSNorm (FlashInfer MNNVL).
+    MimoV2VllmFp8SwaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count; the routed experts are expert-parallel
+        /// over the same ranks (`--enable-expert-parallel`).
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// Configured context cap: FA4's split count on a FULL-graph decode
+        /// and the context axis top of every attention layer's config. Each
+        /// request's context is validated against it.
+        #[serde(default = "default_mimo_v2_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Its layer axis is the
+        /// MoE layers (layer 0's dense MLP has none).
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). Every kernel
+        /// but attention runs on the token count padded up to the next
+        /// captured size; attention on a uniform-decode step runs at the
+        /// padded request count from a FULL graph. Empty: no padding, no graphs
+        /// (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
 }
 
 impl IterArchSel {
@@ -1073,7 +1121,8 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { model, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. }
-            | Self::InklingVllmNvfp4RelAttnMoe { model, .. } => model,
+            | Self::InklingVllmNvfp4RelAttnMoe { model, .. }
+            | Self::MimoV2VllmFp8SwaMoe { model, .. } => model,
         }
     }
 
@@ -1095,7 +1144,8 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { max_model_len, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. }
-            | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. } => Ok(*max_model_len),
+            | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. }
+            | Self::MimoV2VllmFp8SwaMoe { max_model_len, .. } => Ok(*max_model_len),
             Self::DeepseekV41Vllm {
                 model,
                 max_model_len,

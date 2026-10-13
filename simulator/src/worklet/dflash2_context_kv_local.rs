@@ -197,6 +197,7 @@ impl Dflash2ContextKvLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 num_kv_heads: kv_heads_per_rank,
                 head_dim: cfg.head_dim.clone(),
+                head_dim_v: None,
                 block_size: cfg.kv_cache_block_size,
                 input_dtype: cfg.dtype,
                 kv_dtype: cfg.kv_dtype,

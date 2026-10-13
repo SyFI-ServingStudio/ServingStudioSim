@@ -88,6 +88,7 @@ def measure_kernel(
         gpu_index=gpu_index,
         profiler_env=profiler_env,
         worker_env=dict(profiler_spec.worker_env),
+        imex_channel=profiler_spec.imex_channel,
         measure_block={
             "output_dir": str(resolved_output_dir),
             "duration_s": duration_s,
@@ -133,6 +134,7 @@ def _run_worker(
     profiler_env: ProfileEnv | ContainerProfileEnv,
     measure_block: dict[str, Any],
     worker_env: dict[str, str] | None = None,
+    imex_channel: bool = False,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="vibesim-measure-") as tmp:
         input_path = Path(tmp) / "input.json"
@@ -155,6 +157,7 @@ def _run_worker(
                 Path(tmp),
                 additional_volumes=((output_dir, output_dir),),
                 worker_env=worker_env,
+                imex_channel=imex_channel,
             )
         else:
             env = os.environ.copy()

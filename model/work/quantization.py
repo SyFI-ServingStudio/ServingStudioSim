@@ -27,8 +27,14 @@ E2M1 with one E8M0 scale per 32 weights along K (MXFP4). Those experts multiply
 FP8 activations, which Blackwell's mixed FP8xFP4 MMA executes at the FP8 rate,
 so their compute dtype stays ``fp8``.
 
-For FP8, ``modules_to_not_convert`` is the authority for which is which. It is stated
-as fully-qualified checkpoint paths (``model.layers.7.mlp.gate``); a
+vLLM's ``Fp8Config`` also reads two keys MiMo-V2 uses: ``ignored_layers`` (preferred
+over ``modules_to_not_convert``; exact checkpoint paths) and ``store_dtype: "mxfp4"``,
+which stores routed experts as packed E2M1 with one E8M0 scale per
+``mxfp4_block_size`` weights along K. Those experts take unquantized activations,
+so they compute at the master dtype.
+
+For FP8, ``modules_to_not_convert`` (or ``ignored_layers``) is the authority for which
+is which. It is stated as fully-qualified checkpoint paths (``model.layers.7.mlp.gate``); a
 :class:`~model.work.core.MatmulGroup` names itself with the layer-relative path
 (``mlp.gate``), so the list is normalized to layer-relative form once here.
 """
@@ -42,6 +48,7 @@ from dataclasses import dataclass, field
 # Strips the two wrappers HF puts in front of a layer-relative module path.
 _LAYER_PREFIX = re.compile(r"^model\.(?:language_model\.)?layers\.\d+\.")
 _MODEL_PREFIX = re.compile(r"^model\.")
+_LAYER_INDEX = re.compile(r"^model\.(?:language_model\.)?layers\.(\d+)\.(.+)$")
 
 _SUPPORTED_QUANT_METHODS = ("fp8", "modelopt")
 
@@ -144,6 +151,36 @@ def modelopt_excluded(quant: dict) -> list[str] | None:
     return list(excluded)
 
 
+def uniform_layer_exclusions(entries: list[str], num_layers: int) -> frozenset[str]:
+    """Layer-relative exclusions from per-layer checkpoint paths that every body
+    layer lists identically.
+
+    ``model.layers.<i>.<module>`` entries must name the same ``<module>`` set for
+    every ``i < num_layers``; otherwise one layer-relative set would convert or
+    exclude a matrix on the wrong layers, and the builder must resolve the layers
+    itself. Entries for layers past the body (a checkpoint's MTP layers) are not
+    part of the labelled model and are dropped; any other entry is returned in
+    layer-relative form.
+    """
+    per_layer: list[set[str]] = [set() for _ in range(num_layers)]
+    other: set[str] = set()
+    for entry in entries:
+        match = _LAYER_INDEX.match(entry)
+        if match is None:
+            other.add(_layer_relative(entry))
+            continue
+        layer = int(match.group(1))
+        if layer < num_layers:
+            per_layer[layer].add(match.group(2))
+    if any(modules != per_layer[0] for modules in per_layer):
+        differing = next(i for i, modules in enumerate(per_layer) if modules != per_layer[0])
+        raise ValueError(
+            f"layer {differing} excludes {sorted(per_layer[differing])} but layer 0 excludes "
+            f"{sorted(per_layer[0])}; a per-layer quantization schedule needs its own stacks"
+        )
+    return frozenset(per_layer[0] if per_layer else set()) | frozenset(other)
+
+
 def parse_quantization_config(
     raw_config: dict, *, layer_qualified_exclusions: bool = False
 ) -> QuantScheme | None:
@@ -219,7 +256,28 @@ def parse_quantization_config(
     block = quant.get("weight_block_size")
     block_shape = (int(block[0]), int(block[1])) if block else None
     expert_dtype = quant.get("expert_dtype")
+    store_dtype = quant.get("store_dtype")
     module_schemes: tuple[tuple[str, QuantScheme], ...] = ()
+    if store_dtype is not None:
+        master = raw_config.get("dtype") or raw_config.get("torch_dtype")
+        if store_dtype != "mxfp4" or expert_dtype is not None or master != "bfloat16":
+            raise ValueError(
+                f"unsupported store_dtype {store_dtype!r} (expert_dtype {expert_dtype!r}, "
+                f"master {master!r}); model.work knows only MXFP4 experts over BF16"
+            )
+        module_schemes = (
+            (
+                "mlp.experts",
+                QuantScheme(
+                    bytes_per_weight=0.5,
+                    # vLLM's Mxfp4MoEMethod multiplies unquantized BF16 activations.
+                    compute_dtype="bf16",
+                    block_shape=(1, int(quant.get("mxfp4_block_size", 32))),
+                    scale_dtype_bytes=1.0,
+                    not_converted=frozenset(),
+                ),
+            ),
+        )
     if expert_dtype is not None:
         if expert_dtype != "fp4" or scale_fmt != "ue8m0":
             raise ValueError(
@@ -239,13 +297,19 @@ def parse_quantization_config(
                 ),
             ),
         )
+    # vLLM reads `ignored_layers` first and falls back to `modules_to_not_convert`.
+    excluded = quant.get("ignored_layers") or quant.get("modules_to_not_convert") or ()
+    qualified = [entry for entry in excluded if _LAYER_PREFIX.match(entry)]
+    if "ignored_layers" in quant and qualified and not layer_qualified_exclusions:
+        raise ValueError(
+            f"FP8 ignored_layers name single layers ({qualified[0]!r}, ...); "
+            "the model builder must resolve them per layer"
+        )
     return QuantScheme(
         bytes_per_weight=1.0,
         compute_dtype="fp8",
         block_shape=block_shape,
         scale_dtype_bytes=scale_dtype_bytes,
-        not_converted=frozenset(
-            _layer_relative(module) for module in quant.get("modules_to_not_convert", ())
-        ),
+        not_converted=frozenset(_layer_relative(module) for module in excluded),
         module_schemes=module_schemes,
     )

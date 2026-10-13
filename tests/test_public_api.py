@@ -234,9 +234,22 @@ def test_a_backends_gpus_follow_its_compute_capability() -> None:
 # The FP8 block-scale backend of this kind takes FP8 weights in 128-wide blocks.
 _FP8_BLOCK_BACKEND = "flashinfer_trtllm_fp8_block_sm100"
 _MXFP4_BACKEND = "flashinfer_trtllm_sm100_mxfp4"
-_WEIGHT_FORMAT = {_FP8_BLOCK_BACKEND: DType.FP8_E4M3, _MXFP4_BACKEND: DType.MXFP4_E2M1}
-_GROUP_SIZE = {_FP8_BLOCK_BACKEND: 128, _MXFP4_BACKEND: 32}
-_ROUTING = {_FP8_BLOCK_BACKEND: "deepseek_v3", _MXFP4_BACKEND: "precomputed_dsv4"}
+# Weight-only: MXFP4 weights, BF16 activations and BF16 MMA.
+_MXFP4_BF16_BACKEND = "flashinfer_trtllm_sm100_mxfp4_bf16"
+_WEIGHT_FORMAT = {
+    _FP8_BLOCK_BACKEND: DType.FP8_E4M3,
+    _MXFP4_BACKEND: DType.MXFP4_E2M1,
+    _MXFP4_BF16_BACKEND: DType.MXFP4_E2M1,
+}
+_GROUP_SIZE = {_FP8_BLOCK_BACKEND: 128, _MXFP4_BACKEND: 32, _MXFP4_BF16_BACKEND: 32}
+_ROUTING = {
+    _FP8_BLOCK_BACKEND: "deepseek_v3",
+    _MXFP4_BACKEND: "precomputed_dsv4",
+    _MXFP4_BF16_BACKEND: "deepseek_v3",
+}
+# The tensor-core precision each backend declares; the weight format but for
+# the weight-only backend.
+_COMPUTE = {**_WEIGHT_FORMAT, _MXFP4_BF16_BACKEND: DType.BF16}
 
 
 def _nvfp4_row(backend: str) -> ProfileRow:
@@ -298,9 +311,7 @@ def test_nvfp4_fused_moe_precision_is_each_backends_weight_format(tmp_path: Path
     assert types["weight_format"] == types["input_dtype"] == "dtype"
     assert {
         name: backend["supports"]["compute"] for name, backend in detail["backends"].items()
-    } == {
-        name: [_WEIGHT_FORMAT.get(name, DType.NVFP4_E2M1).value] for name in detail["backends"]
-    }
+    } == {name: [_COMPUTE.get(name, DType.NVFP4_E2M1).value] for name in detail["backends"]}
 
 
 @pytest.mark.needs_binary
