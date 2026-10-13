@@ -34,8 +34,8 @@ impl KernelSpec for GdnGatedRmsNormSpec {
     const KIND: KernelKind = "gdn_gated_rms_norm";
 
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        // One to 8192 power-of-two tokens after flattening 32 value heads.
-        // 2^19 rows covers an 8192-token step at up to 64 value heads.
+        // Power-of-two flattened rows (tokens x value heads): 2^19 covers an
+        // 8192-token step at up to 64 value heads.
         SweepGrid::new(vec![Axis::pow2(5, 19)])
     }
 
