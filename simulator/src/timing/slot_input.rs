@@ -117,6 +117,16 @@ pub struct SparseGqaAttentionLog {
     pub context_groups: [(u32, u32); 2],
 }
 
+/// Sparse-indexer top-k leaf: the cells of the decode call and of the prefill
+/// call that chose this leaf's backend, each `(rows, context)`. A call that ran
+/// on the other backend is absent.
+#[derive(Clone, Serialize)]
+pub struct SparseIndexerTopkLog {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode: Option<(u32, u32)>,
+    pub prefill: Vec<(u32, u32)>,
+}
+
 /// DSA indexer prefill fan-in: every request-local `(Q, N)` cell aggregated by
 /// cache gather, logits, or top-k into its corresponding fixed leaf slot.
 #[derive(Clone, Serialize)]
@@ -231,6 +241,7 @@ log_inputs! {
     IndexedRowCopy => IndexedRowCopyKernelInput,
     QkRmsNormRopeGate => QkRmsNormRopeGateKernelInput,
     SparseGqaPagedAttention => SparseGqaAttentionLog,
+    SparseIndexerTopk => SparseIndexerTopkLog,
     SparseIndexExpand => SparseIndexExpandKernelInput,
     SparseIndexerLogitsDecode => SparseIndexerLogitsDecodeKernelInput,
     SparseIndexerLogitsPrefill => SparseIndexerLogitsPrefillKernelInput,

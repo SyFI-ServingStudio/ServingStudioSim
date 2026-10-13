@@ -45,6 +45,7 @@ use crate::arch::kv_layout::{
 };
 pub use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use crate::arch::qwen4_exp_model_cfg::{Qwen4ExpMixer, Qwen4ExpModelCfg};
+use crate::op::attention::ring_tokens;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
@@ -561,9 +562,12 @@ fn kv_cache_layout(
         hybrid_attention_block_tokens(KERNEL_BLOCK_TOKENS, gdn_state.max(ple_state), kv_page);
     let block = u64::from(block_tokens);
     let stride = attn_layers * (block * kv_page + block.div_ceil(ratio) * index_entry);
-    // The raw-key ring holds the open group plus every speculative row in
-    // whole groups, BF16 (`common/qsa_cache.py` `CircularBufferSpec`).
-    let ring = ratio * (ratio + k).div_ceil(ratio) * u64::from(model.indexer_head_dim) * act;
+    // The raw-key ring, BF16 (`common/qsa_cache.py` `CircularBufferSpec`).
+    let ring = u64::from(ring_tokens(
+        model.indexer_compress_ratio,
+        parallel.draft_tokens,
+    )) * u64::from(model.indexer_head_dim)
+        * act;
     let copies = 1 + parallel.draft_tokens;
     let mut layout = KvCacheLayout::new()
         .with_part(KvCachePart::per_token("qsa_kv", attn_layers * kv_page))

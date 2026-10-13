@@ -1,7 +1,7 @@
 //! One sparse-GQA (QSA) attention mixer on one GPU, in vLLM's launch
 //! granularity: a gated GQA whose rows attend only the token groups a
-//! weight-free indexer selected (`models/qwen4_exp/nvidia/qsa.py`, BF16
-//! projections, FP8 KV cache and FP8 compressed-key cache).
+//! weight-free indexer selected (`models/qwen4_exp/nvidia/qsa.py`; projection,
+//! KV and index-key dtypes from the config).
 //!
 //! The section starts after the arch's pre-attention norm and ends at the
 //! `o_proj` output.
@@ -24,7 +24,7 @@
 //! mixed step runs both the decode and the prefill selection.
 
 use crate::op::attention::{
-    SparseGqaAttentionOp, SparseGqaAttentionOpConfig, SparseGqaAttentionOpInput,
+    ring_tokens, SparseGqaAttentionOp, SparseGqaAttentionOpConfig, SparseGqaAttentionOpInput,
     SparseGqaAttentionOpResolved, SparseGqaIndexerOp, SparseGqaIndexerOpConfig,
     SparseGqaIndexerOpInput, SparseGqaIndexerOpResolved,
 };
@@ -171,9 +171,7 @@ impl VllmQsaAttnLocalWorklet {
                 head_dim: cfg.indexer_head_dim,
                 compress_ratio: ratio,
                 token_topk: cfg.indexer_token_topk,
-                // The open group plus every speculative row, in whole groups
-                // (`common/qsa_cache.py` `QSAKeyStateCache.get_kv_cache_spec`).
-                ring_size: ratio * (ratio + cfg.num_speculative_tokens).div_ceil(ratio),
+                ring_size: ring_tokens(ratio, cfg.num_speculative_tokens),
                 decode_query_len: cfg.decode_query_len,
                 max_position_embeddings: cfg.max_position_embeddings,
                 max_model_len: cfg.max_model_len,
