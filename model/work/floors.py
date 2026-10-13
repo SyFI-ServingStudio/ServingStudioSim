@@ -157,6 +157,15 @@ _SPECULATIVE_ARCHS = frozenset(
     }
 )
 
+#: Each speculative arch's ``draft_tokens`` serde default (``simulator/src/arch/
+#: config.rs``): params.json records the run config as written, so an omitted
+#: depth must resolve to what the simulator ran, not another arch's default.
+_DEFAULT_DRAFT_TOKENS = {
+    "glm52_vllm_nvfp4_dsa_moe_speculative": 5,
+    "glm53_vllm_nvfp4_dsa_moe_dflash2": 7,
+    "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative": 3,
+}
+
 #: The proposer of a speculative arch that ships as its own checkpoint, by the
 #: draft's ``config.json`` under the repo root. The run's params name only the
 #: target's config; the draft is fixed by the arch.
@@ -306,7 +315,7 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
         specs[pool_tag] = {
             "arch_type": arch_type,
             "mtp_mode": arch.get("mtp_mode", "index_share"),
-            "draft_tokens": arch.get("draft_tokens", 5),
+            "draft_tokens": arch.get("draft_tokens", _DEFAULT_DRAFT_TOKENS.get(arch_type)),
             "draft_sliding_window": arch.get("draft_sliding_window"),
             "kv_cache_dtype": arch.get("kv_cache_dtype", "fp8"),
             "indexer_kv_dtype": arch.get("indexer_kv_dtype", "fp8"),

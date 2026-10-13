@@ -23,7 +23,7 @@ Stacks follow the architecture: layer 0's attention module has no pending combin
 and each PLE layer carries the embedding, so both are their own archetype; the rest
 group by attention kind. The MTP layer is staged under the GLM-5.2 MTP stage names
 (:mod:`..speculative` builds them from the logged geometry): the first pass over the
-target's rows scores its own index; later passes reuse that selection.
+target's rows and every later one-row pass each run the full QSA indexer.
 
 Precision is the checkpoint's ModelOpt ``MIXED_PRECISION`` list: NVFP4 body experts
 (per-16 FP8 scales), FP8 per-tensor PLE table, and FP8 128x128-block MTP experts with

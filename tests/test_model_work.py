@@ -4813,3 +4813,122 @@ def test_qf_geometry_rows_and_the_rest_partition_the_label(qf):
     assert "gdn_ple.ple.conv_state" in geometry
     assert not rest.keys() & geometry.keys()
     assert rest | geometry == whole
+
+
+QF_ARCH = "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative"
+
+
+def _qf_served(tmp_path, **arch_fields):
+    """The floors' pool spec and served model for a params.json written as a preset
+    states it: omitted arch fields stay omitted."""
+    arch = {"type": QF_ARCH, "model_config": str(QF_CONFIG), **arch_fields}
+    (tmp_path / "raw").mkdir(exist_ok=True)
+    (tmp_path / "raw" / "params.json").write_text(
+        json.dumps({"pools": {"main": {"groups": [{"gpu": "NVIDIA B200", "arch": arch}]}}})
+    )
+    spec = work_floors._pool_specs(tmp_path)["main"]
+    return spec, work_floors._model_for_spec(spec)
+
+
+def _qf_speculative_label(model, depth, prefill, decode):
+    from model.work.speculative import aggregate_workload
+
+    geometry = {"draft_tokens": depth, "max_model_len": 131_072, "prefill": prefill,
+                "decode": decode}
+    tokens = sum(q for _, q in prefill)
+    workload = aggregate_workload(
+        {
+            "speculative_geometry": {json.dumps(geometry): 1},
+            "matmul_tokens": tokens + len(decode) * (depth + 1),
+            "prefill_tokens": tokens,
+            "decode_passes": len(decode),
+            "prefill_requests": len(prefill),
+            "prefill_pairs": sum(q * (q + 1) / 2 + c * q for c, q in prefill),
+            "prefill_cached": sum(c for c, _ in prefill),
+        },
+        "mtp",
+    )
+    return model.label(workload)
+
+
+@requires_qf
+def test_qf_floors_resolve_the_arch_defaults(qf, tmp_path):
+    """A preset that omits the arch's knobs ran the simulator's serde defaults:
+    three draft tokens, FP8 KV and FP8 index caches. The floors resolve the same."""
+    spec, served = _qf_served(tmp_path)
+    assert spec["draft_tokens"] == 3
+    assert spec["arch_quant_dtype"] == "fp4"
+    work_floors._check_precision(served, spec)
+    work_floors._validate_speculative_totals(
+        spec, {"speculative_geometry": {json.dumps({"draft_tokens": 3}): 1}}
+    )
+    qsa = {stack.tag: stack.attn for stack in served.layers}
+    for tag in ("qsa", "mtp_first", "mtp_recurrent"):
+        assert (qsa[tag].kv_dtype_bytes, qsa[tag].index_cache_dtype_bytes) == (1.0, 1.0)
+    # One verify of 4 rows at context 4100: 2047 selected keys of 2 K/V heads x 256
+    # and 1023 complete 128-wide index groups per QSA layer row, now one byte each.
+    def bytes_by_row(model):
+        label = _qf_speculative_label(model, 3, [], [[4100, 4]])
+        return {s.name: s.bytes_total for s in label.segments}
+
+    rows, base = bytes_by_row(served), bytes_by_row(qf)
+    for name in ("qsa.attn.decode", "qsa.indexer.decode", "qsa.kv_cache_append",
+                 "qsa.index_cache_append", "mtp_recurrent.attn.decode"):
+        assert rows[name] == base[name] / 2 > 0, name
+    # GDN and PLE state are not KV cache.
+    assert rows["gdn.recurrent_state.decode_read"] == base["gdn.recurrent_state.decode_read"]
+    assert rows["gdn_ple.ple.conv_state"] == base["gdn_ple.ple.conv_state"]
+    # Each cache follows its own knob.
+    _, bf16_index = _qf_served(tmp_path, indexer_kv_dtype="bf16", draft_tokens=2)
+    stack = next(stack.attn for stack in bf16_index.layers if stack.tag == "qsa")
+    assert (stack.kv_dtype_bytes, stack.index_cache_dtype_bytes) == (1.0, 2.0)
+    assert work_floors._pool_specs(tmp_path)["main"]["draft_tokens"] == 2
+
+
+@requires_qf
+@pytest.mark.parametrize(
+    ("depth", "mapping"),
+    [
+        (3, "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_unified"),
+        (5, "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_unified"),
+        (1, "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_single_draft_unified"),
+    ],
+)
+def test_qf_location_maps_consume_every_semantic_once(qf, depth, mapping):
+    maps = Path(__file__).resolve().parents[1] / "model/work/location_maps"
+    location_map = json.loads((maps / f"{mapping}.json").read_text())
+    assert location_map["schema_version"] == 1
+    assert location_map["mapping_id"] == mapping.replace("_", "-") + "-v1"
+    assert location_map["arch_types"] == [QF_ARCH]
+    locations = [row["location"] for row in location_map["locations"]]
+    # 340 single-GPU leaves; a one-token draft compiles no recurrent MTP pass (54).
+    assert len(locations) == len(set(locations)) == (286 if depth == 1 else 340)
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    for prefill, decode in (
+        ([[0, 2048]], [[4100, depth + 1]]),
+        ([], [[4100, depth + 1], [900, depth + 1]]),
+        ([[100, 500]], []),
+    ):
+        names = [s.name for s in _qf_speculative_label(qf, depth, prefill, decode).segments]
+        assert sorted(mapped) == sorted(names)
+    semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    # Layer 0 mixes the repeated embedding: no combine is pending.
+    assert semantics["unified.gdn_first.attn_hc.grouped_norm"] == ["gdn_first.hc.attn.norm"]
+    # The PLE layer runs its pending combine standalone before adding the n-gram
+    # embedding, so its attention module's entry is a plain norm.
+    assert semantics["unified.gdn_ple.ple.hc_combine"] == ["gdn_ple.hc.attn.combine"]
+    assert semantics["unified.gdn_ple.attn_hc.grouped_norm"] == ["gdn_ple.hc.attn.norm"]
+    assert semantics["unified.qsa.attn_hc.combine_norm"] == [
+        "qsa.hc.attn.combine",
+        "qsa.hc.attn.norm",
+    ]
+    # The merged down GEMM also emits the next combine's injection weights.
+    assert semantics["unified.gdn.mlp_hc.down"] == ["gdn.hc.mlp.down", "gdn.hc.mlp.inject"]
+    # A pure verify step takes the fused GDN verify kernels.
+    assert semantics["unified.gdn.gdn.verify_recurrent_norm"][0] == "gdn.attn.decode"
+    assert semantics["unified.qsa.qsa.indexer.prepare"][-1] == "qsa.index_cache_append"
+    # The MTP attention module merges the projected embedding with unit weight.
+    assert semantics["unified.mtp.step_0.attn_hc.combine_norm"] == ["mtp_first.hc.attn.norm"]
+    assert semantics["unified.mtp.step_0.head.lm_head"] == ["mtp_first.lm_head"]
+    assert semantics["unified.head.lm_head"] == ["lm_head"]
+    assert semantics["unified.sample.rejection_resample"] == []
