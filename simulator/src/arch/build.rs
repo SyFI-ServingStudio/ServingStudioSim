@@ -21,7 +21,7 @@ use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
-use crate::arch::qwen4_exp_vllm_nvfp4_gdn_qsa_moe::{PleTableResidency, Qwen4ExpCacheDtype};
+use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use crate::arch::{
     deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
     glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
@@ -1631,7 +1631,7 @@ pub fn qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative(
     }
     let model_cfg = Qwen4ExpModelCfg::from_json(Path::new(&model_spec.model_config))
         .context("loading Qwen4Exp config")?;
-    let body = model_cfg.num_layers();
+    let routed_layers = model_cfg.num_layers();
     let source = ExpertDemandSource {
         kind: routing_kind,
         seed: routing_seed,
@@ -1640,14 +1640,14 @@ pub fn qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative(
         ep_size: 1,
         expert_popularity_file,
         token_corpus_file,
-        num_routed_layers: body,
+        num_routed_layers: routed_layers,
     };
     // A verify step carries `draft_tokens + 1` rows per request, as does the
     // MTP's first pass; its later passes carry one.
     let verify_width = draft_tokens
         .checked_add(1)
         .context("speculative draft_tokens + 1 overflows u32")?;
-    let body = body as usize;
+    let body = routed_layers as usize;
     let demand = qwen4_exp_vllm_nvfp4_gdn_qsa_moe::Qwen4ExpDemand {
         body: source.demand(0..body, verify_width)?,
         mtp: source.demand(body..body + 1, verify_width)?,

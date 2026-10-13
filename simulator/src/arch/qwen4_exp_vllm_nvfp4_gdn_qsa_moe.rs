@@ -35,7 +35,6 @@
 //! overhead.
 
 use anyhow::Result;
-use serde::Deserialize;
 
 use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::graph_padded_tokens;
@@ -43,6 +42,7 @@ use crate::arch::kv_layout::{
     gqa_kv_bytes_per_token, hybrid_attention_block_tokens, EngineOverhead, KvCacheLayout,
     KvCachePart,
 };
+pub use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use crate::arch::qwen4_exp_model_cfg::{Qwen4ExpMixer, Qwen4ExpModelCfg};
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -140,47 +140,6 @@ const NVFP4_GROUP_SIZE: u32 = 16;
 const ROUTING_METHOD: &str = "renormalize_naive";
 const INT32_BYTES: u32 = 4;
 const INT64_BYTES: u32 = 8;
-
-/// vLLM `--kv-cache-dtype` / the QSA indexer's `indexer_kv_dtype`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Qwen4ExpCacheDtype {
-    #[default]
-    Fp8,
-    Bf16,
-}
-
-impl Qwen4ExpCacheDtype {
-    pub const CHOICES: [&'static str; 2] = ["fp8", "bf16"];
-
-    pub fn dtype(self) -> DType {
-        match self {
-            Self::Fp8 => DType::Fp8E4m3,
-            Self::Bf16 => DType::Bf16,
-        }
-    }
-}
-
-/// Where the PLE n-gram table lives: pinned host memory read over UVA
-/// (`--engram-config '{"cpu_offload": true}'`, the fork's default) or HBM.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PleTableResidency {
-    #[default]
-    HostUva,
-    Device,
-}
-
-impl PleTableResidency {
-    pub const CHOICES: [&'static str; 2] = ["host_uva", "device"];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::HostUva => "host_uva",
-            Self::Device => DEVICE,
-        }
-    }
-}
 
 /// Deployment layout: one GPU, MTP drafting.
 #[derive(Clone, Debug)]

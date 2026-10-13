@@ -36,6 +36,7 @@
 use std::path::Path;
 
 use anyhow::{bail, ensure, Context, Result};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::timing::bridge::DType;
@@ -47,6 +48,47 @@ pub enum Qwen4ExpMixer {
     Gdn,
     /// Sparse gated GQA with an indexer (`full_attention`).
     Qsa,
+}
+
+/// vLLM `--kv-cache-dtype` / the QSA indexer's `indexer_kv_dtype`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qwen4ExpCacheDtype {
+    #[default]
+    Fp8,
+    Bf16,
+}
+
+impl Qwen4ExpCacheDtype {
+    pub const CHOICES: [&'static str; 2] = ["fp8", "bf16"];
+
+    pub fn dtype(self) -> DType {
+        match self {
+            Self::Fp8 => DType::Fp8E4m3,
+            Self::Bf16 => DType::Bf16,
+        }
+    }
+}
+
+/// Where the PLE n-gram table lives: pinned host memory read over UVA
+/// (`--engram-config '{"cpu_offload": true}'`, the fork's default) or HBM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PleTableResidency {
+    #[default]
+    HostUva,
+    Device,
+}
+
+impl PleTableResidency {
+    pub const CHOICES: [&'static str; 2] = ["host_uva", "device"];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HostUva => "host_uva",
+            Self::Device => "device",
+        }
+    }
 }
 
 /// The checkpoint's text-model dimensions, read strictly from its config.
