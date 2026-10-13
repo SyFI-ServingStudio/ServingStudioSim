@@ -125,7 +125,9 @@ def _schedule(text: dict) -> tuple[list[str], set[int]]:
     return layer_types, ple_layers
 
 
-def _quant(raw: dict, layer_types: list[str], ple_layers: set[int]) -> tuple[QuantScheme | None, float]:
+def _quant(
+    raw: dict, layer_types: list[str], ple_layers: set[int]
+) -> tuple[QuantScheme | None, float]:
     """The checkpoint's scheme and the PLE table's bytes per element.
 
     The PLE table is an embedding, not a Linear, and the MTP experts sit past the
@@ -264,7 +266,7 @@ def _mtp_stacks(text: dict, master: float) -> tuple[list[LayerStack], list[NormW
             mixer=mixer,
         ),
         LayerStack(
-            attn=_qsa(text, master, module_prefix=_MTP_PREFIX, index_share=True),
+            attn=_qsa(text, master, module_prefix=_MTP_PREFIX),
             ffn=ffn,
             count=1,
             tag="mtp_recurrent",

@@ -37,10 +37,9 @@ elementwise/selection work outside the pinned denominator. The raw-key buffer of
 each request's open group is O(ratio) and could be replaced by one running sum, so
 it is excluded, which keeps the minimum a valid lower bound.
 
-``index_share=True`` is a pass that reuses another pass's selection (the MTP
-layer's later draft steps reuse step 0's rows): no indexer projection, scoring or
-index-cache write. Such a pass re-enters weights an indexing pass owns, so it must
-not be the parameter owner.
+Every pass, including each recurrent MTP draft step, runs its own indexer: the
+checkpoint has no ``index_share_for_mtp_iteration``, so no pass reuses another
+pass's selection.
 
 Cache dtypes are serving choices (``--kv-cache-dtype``, the indexer KV dtype), not
 checkpoint facts: the builder uses the master dtype and the floors layer serves
@@ -75,8 +74,6 @@ class QuerySparseAttention:
     ratio: int
     kv_dtype_bytes: float = 2.0
     index_cache_dtype_bytes: float = 2.0
-    #: Reuse another pass's selection: no scoring, no index-cache write.
-    index_share: bool = False
     #: Prepended to every checkpoint path (``mtp`` for the MTP layer).
     module_prefix: str = ""
 
@@ -100,7 +97,7 @@ class QuerySparseAttention:
 
     def matmul_groups(self) -> list[MatmulGroup]:
         q_and_gate = 2 * self.num_heads * self.head_dim
-        groups = [
+        return [
             MatmulGroup(
                 "qkv_proj",
                 n=q_and_gate + 2 * self.num_kv_heads * self.head_dim,
@@ -115,31 +112,23 @@ class QuerySparseAttention:
                 bucket="attn_proj",
                 module=self._module("self_attn.o_proj"),
             ),
-        ]
-        if not self.index_share:
             # One indexer key head next to the query heads.
-            groups.append(
-                MatmulGroup(
-                    "indexer.index_qk_proj",
-                    n=(self.index_n_heads + 1) * self.index_head_dim,
-                    k=self.hidden,
-                    bucket="attn_proj",
-                    module=self._module("self_attn.indexer.index_qk_proj"),
-                )
-            )
-        return groups
+            MatmulGroup(
+                "indexer.index_qk_proj",
+                n=(self.index_n_heads + 1) * self.index_head_dim,
+                k=self.hidden,
+                bucket="attn_proj",
+                module=self._module("self_attn.indexer.index_qk_proj"),
+            ),
+        ]
 
     def learned_weight_groups(self) -> list[LearnedWeightGroup]:
-        groups = [
+        return [
             LearnedWeightGroup("q_norm", self.head_dim, 1),
             LearnedWeightGroup("k_norm", self.head_dim, 1),
+            LearnedWeightGroup("indexer.q_norm", self.index_head_dim, 1),
+            LearnedWeightGroup("indexer.k_norm", self.index_head_dim, 1),
         ]
-        if not self.index_share:
-            groups += [
-                LearnedWeightGroup("indexer.q_norm", self.index_head_dim, 1),
-                LearnedWeightGroup("indexer.k_norm", self.index_head_dim, 1),
-            ]
-        return groups
 
     def _interaction_work(self, cached, last) -> tuple:
         """(scored groups, selected pairs, index reads, K/V reads, completed groups)
@@ -231,15 +220,14 @@ class QuerySparseAttention:
         for phase, (scored, selected, index_reads, kv_reads, completed) in phase_work:
             suffix = f".{phase}" if phase is not None else ""
             completed_groups += completed
-            if not self.index_share:
-                rows.append(
-                    AttentionSemantic(
-                        name=f"indexer{suffix}",
-                        flops=group_flops * scored,
-                        bytes=index_reads * self.index_entry_bytes,
-                        compute_dtype=index_dtype,
-                    )
+            rows.append(
+                AttentionSemantic(
+                    name=f"indexer{suffix}",
+                    flops=group_flops * scored,
+                    bytes=index_reads * self.index_entry_bytes,
+                    compute_dtype=index_dtype,
                 )
+            )
             rows.append(
                 AttentionSemantic(
                     name=f"attn{suffix}",
@@ -254,14 +242,13 @@ class QuerySparseAttention:
                 bytes=wl.matmul_tokens * self.kv_entry_bytes,
             )
         )
-        if not self.index_share:
-            rows.append(
-                AttentionSemantic(
-                    name="index_cache_append",
-                    bucket="embedding",
-                    bytes=completed_groups * self.index_entry_bytes,
-                )
+        rows.append(
+            AttentionSemantic(
+                name="index_cache_append",
+                bucket="embedding",
+                bytes=completed_groups * self.index_entry_bytes,
             )
+        )
         return rows
 
     # The historical AttentionSpec surface; Model.label uses semantic_segments.

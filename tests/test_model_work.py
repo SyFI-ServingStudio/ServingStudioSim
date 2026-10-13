@@ -4458,7 +4458,6 @@ def test_qf_registry_schedule_and_geometry(qf):
     assert isinstance(qsa, QuerySparseAttention)
     assert (qsa.num_heads, qsa.num_kv_heads, qsa.head_dim) == (24, 2, 256)
     assert (qsa.index_n_heads, qsa.index_head_dim, qsa.budget, qsa.ratio) == (4, 128, 2048, 4)
-    assert by_tag["mtp_recurrent"].attn.index_share and not by_tag["mtp_first"].attn.index_share
     ple = by_tag["gdn_ple"].attn.ple
     assert (ple.ngram_heads, ple.head_dim, ple.table_rows, ple.history) == (16, 160, QF_PLE_ROWS, 9)
     moe = by_tag["gdn"].ffn
@@ -4708,15 +4707,19 @@ def test_qf_mtp_stages_follow_the_draft_geometry(qf):
     # The attention module merges the projected embedding with unit weight.
     assert "mtp_first.hc.attn.combine" not in rows
     assert rows["mtp_first.hc.final.combine"].flops_total == 2056 * 2 * QF_W
-    # Later draft steps reuse step 0's selection: no scoring, no index write.
-    assert {"mtp_first.indexer.decode", "mtp_first.index_cache_append"} <= rows.keys()
-    assert not any(name.startswith("mtp_recurrent.index") for name in rows)
     # Each request advances twice past its final context (2048, 4100, 8000); each
     # endpoint attends min(k, 2048 + k mod 4) keys at its own context k.
     endpoints = [2049, 2050, 4101, 4102, 8001, 8002]
     assert rows["mtp_recurrent.attn.decode"].flops_total == QF_ATTN_PAIR * sum(
         min(k, 2048 + k % 4) for k in endpoints
     )
+    # No index_share_for_mtp_iteration: every draft step projects, scores its own
+    # floor(k / 4) complete groups, and writes the index cache.
+    assert rows["mtp_recurrent.indexer.decode"].flops_total == 2 * 4 * 128 * sum(
+        k // 4 for k in endpoints
+    )
+    assert rows["mtp_recurrent.indexer.index_qk_proj"].flops_total == 2 * 6 * QF_H * 5 * 128
+    assert "mtp_recurrent.index_cache_append" in rows
     # Draft heads share the target lm_head: FLOPs at the endpoints, no second read.
     assert rows["mtp_first.lm_head"].flops_total == 3 * QF_LM_HEAD
     assert rows["mtp_recurrent.lm_head"].bytes_total == 0

@@ -246,8 +246,8 @@ residual (`mixers/gated_hc.py`: per module a rank-320 down/up gate, a stream-inj
 projection, and `2·S·hidden` FLOPs per gated stream mean and per injected combine; a
 final mixer collapses the streams). QSA (`attention/qsa.py`) scores mean-pooled
 groups of 4 indexer keys and attends `min(k, 2048 + k mod 4)` keys per query (the
-kpool closed forms); an index-sharing pass (the MTP layer's later draft steps) skips
-the indexer. Layer 1 adds a hashed n-gram embedding (`mixers/ngram_embedding.py`):
+kpool closed forms); every pass runs its own indexer, the MTP layer's recurrent draft
+steps included (the checkpoint has no `index_share_for_mtp_iteration`). Layer 1 adds a hashed n-gram embedding (`mixers/ngram_embedding.py`):
 its 51.2 G-element FP8 table counts as parameters and is read only at the
 `16·tokens` gathered rows (the deployment keeps it in host memory), and its dilated
 convolution keeps a 9-row history per request. Every layer is a 512-expert top-10
