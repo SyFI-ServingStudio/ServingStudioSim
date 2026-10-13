@@ -36,8 +36,6 @@ Serving config (user decision, after the vLLM recipe for Qwen3.8-Flash-Next and 
   `adjust_cudagraph_sizes_for_spec_decode` rounding does not run under V2 (vllm/config/compilation.py:1492-1510).
 - Passes run req-frontend's warmup, and the job wrapper points every JIT cache at one persistent directory.
 
-ARCH_TYPE is a placeholder: the simulator arch for this model is not named yet.
-
 Run from the repo root: uv run python presets/alignment/qwen38_flash_next_nvfp4_b200_tp1/make_pack.py
 """
 import json
@@ -214,12 +212,20 @@ PYTHON_RUNTIME = {
     "lock_timeout_seconds": 30,
     "install_timeout_seconds": 30,
 }
-# Placeholder: the simulator arch for qwen4_exp is not named or built yet.
-ARCH_TYPE = "qwen38_flash_next_TODO"
+# The linears' precisions come from the checkpoint config's quantization_config (ModelOpt MIXED_PRECISION), so the
+# arch takes no precision field. kv_cache_dtype / indexer_kv_dtype default to fp8 and ple_table_residency to
+# host_uva, the serving config above. `variant()` adds the capture list for the variant's chunk; max_model_len is
+# per case.
+ARCH_TYPE = "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative"
+# Recorded routes of the diverse_100 token_corpus pass (Slurm job 6682, fork e1423a4d): 135144 accepted tokens x 49
+# layers (48 body + the MTP layer), top-10 of 512. Not yet on the workload dataset, so the path is the capture's.
+TOKEN_CORPUS = "../../../logs/20261013_1_qf_diverse100/profile_corpus/token_corpus/manifest.json"
 ARCH = {
     "type": ARCH_TYPE,
     "model_config": "model/config/qwen3_8_flash_next_nvfp4.json",
     "draft_tokens": DRAFT,
+    "routing": "corpus",
+    "token_corpus_file": TOKEN_CORPUS,
 }
 WORKER = {
     "type": "speculative",

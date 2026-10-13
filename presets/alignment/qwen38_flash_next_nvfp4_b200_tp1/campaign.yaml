@@ -68,9 +68,11 @@ variants:
       chunk_size: 2048
       max_cudagraph_capture_size: 2048
     arch:
-      type: qwen38_flash_next_TODO
+      type: qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative
       model_config: model/config/qwen3_8_flash_next_nvfp4.json
       draft_tokens: 3
+      routing: corpus
+      token_corpus_file: ../../../logs/20261013_1_qf_diverse100/profile_corpus/token_corpus/manifest.json
       cudagraph_capture_sizes:
       - 1
       - 2
@@ -292,9 +294,11 @@ variants:
       chunk_size: 2048
       max_cudagraph_capture_size: 2048
     arch:
-      type: qwen38_flash_next_TODO
+      type: qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative
       model_config: model/config/qwen3_8_flash_next_nvfp4.json
       draft_tokens: 3
+      routing: corpus
+      token_corpus_file: ../../../logs/20261013_1_qf_diverse100/profile_corpus/token_corpus/manifest.json
       cudagraph_capture_sizes:
       - 1
       - 2
@@ -516,9 +520,11 @@ variants:
       chunk_size: 2048
       max_cudagraph_capture_size: 2048
     arch:
-      type: qwen38_flash_next_TODO
+      type: qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative
       model_config: model/config/qwen3_8_flash_next_nvfp4.json
       draft_tokens: 3
+      routing: corpus
+      token_corpus_file: ../../../logs/20261013_1_qf_diverse100/profile_corpus/token_corpus/manifest.json
       cudagraph_capture_sizes:
       - 1
       - 2
@@ -738,9 +744,11 @@ variants:
       chunk_size: 4096
       max_cudagraph_capture_size: 4096
     arch:
-      type: qwen38_flash_next_TODO
+      type: qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative
       model_config: model/config/qwen3_8_flash_next_nvfp4.json
       draft_tokens: 3
+      routing: corpus
+      token_corpus_file: ../../../logs/20261013_1_qf_diverse100/profile_corpus/token_corpus/manifest.json
       cudagraph_capture_sizes:
       - 1
       - 2
@@ -976,9 +984,11 @@ variants:
       chunk_size: 8192
       max_cudagraph_capture_size: 8192
     arch:
-      type: qwen38_flash_next_TODO
+      type: qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative
       model_config: model/config/qwen3_8_flash_next_nvfp4.json
       draft_tokens: 3
+      routing: corpus
+      token_corpus_file: ../../../logs/20261013_1_qf_diverse100/profile_corpus/token_corpus/manifest.json
       cudagraph_capture_sizes:
       - 1
       - 2
