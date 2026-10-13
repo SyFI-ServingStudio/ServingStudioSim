@@ -586,7 +586,7 @@ struct Work {
 
 impl Work {
     fn of(input: &VllmBf16GdnSpecLocalWorkletInput, q: u32, fused_verify: bool) -> Self {
-        debug_assert!(
+        assert!(
             input.non_spec_decodes == 0 || input.spec_decodes > 0,
             "non-spec decodes without spec decodes take the plain decode path, not modeled here"
         );
@@ -722,6 +722,12 @@ mod tests {
         assert_eq!(w.path, Path::Mixed);
         assert_eq!(w.prefill_lengths, [1, 1, 1]);
         assert_eq!((w.prefills, w.prefill_tokens, w.real), (3, 3, 11));
+    }
+
+    #[test]
+    #[should_panic(expected = "plain decode path")]
+    fn non_spec_decodes_alone_are_refused() {
+        Work::of(&input(&[], 0, 2), 4, true);
     }
 
     #[test]
