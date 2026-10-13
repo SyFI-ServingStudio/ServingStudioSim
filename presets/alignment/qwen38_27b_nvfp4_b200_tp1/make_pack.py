@@ -94,7 +94,7 @@ MEASURED_POOL: dict[int, tuple[float, str, str] | None] = {
     2048: (125.52, "6479 (case 01; every warm chunk-2048 pass logs the same pool)",
            "logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload"),
     4096: (123.75, "6566, 6574", "logs/20261012_1_q38_align_campaign/18_quadrant_interference_chunk4k_c48/profile_workload"),
-    8192: (124.60, "6534, 6536, 6538", "logs/20261012_1_q38_align_campaign/17_prefill_spectrum_chunk8k_c32/profile_workload"),
+    8192: (119.82, "6570, 6572", "logs/20261012_1_q38_align_campaign/19_quadrant_interference_chunk8k_c48/profile_workload"),
 }
 # A pinned pool's block count as logged (`Maximum concurrency for 131,072 tokens per request` x 90 blocks).
 PINNED_EVIDENCE = {

@@ -2593,11 +2593,11 @@ cases:
     repeats: 16
   chunk_size: 8192
   attn_gpu_memory_gb:
-    value: 133.7882
+    value: 128.6557
     status: measured
-    derived_from: '`Available KV cache memory: 124.6 GiB` (x 1.073741824) in the chunk-8192 workload passes (Slurm
-      jobs 6534, 6536, 6538) at gpu_memory_utilization 0.85'
-    evidence: logs/20261012_1_q38_align_campaign/17_prefill_spectrum_chunk8k_c32/profile_workload
+    derived_from: '`Available KV cache memory: 119.82 GiB` (x 1.073741824) in the chunk-8192 workload passes (Slurm
+      jobs 6570, 6572) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/19_quadrant_interference_chunk8k_c48/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 04
     derivation: 'Case 04 at chunk 8192: the same c32 and 16 repeats, rungs moved to the new chunk boundary (8128/8192/8256)
@@ -2670,11 +2670,11 @@ cases:
     repeats: 24
   chunk_size: 8192
   attn_gpu_memory_gb:
-    value: 133.7882
+    value: 128.6557
     status: measured
-    derived_from: '`Available KV cache memory: 124.6 GiB` (x 1.073741824) in the chunk-8192 workload passes (Slurm
-      jobs 6534, 6536, 6538) at gpu_memory_utilization 0.85'
-    evidence: logs/20261012_1_q38_align_campaign/17_prefill_spectrum_chunk8k_c32/profile_workload
+    derived_from: '`Available KV cache memory: 119.82 GiB` (x 1.073741824) in the chunk-8192 workload passes (Slurm
+      jobs 6570, 6572) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/19_quadrant_interference_chunk8k_c48/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 07
     derivation: 'Case 07 at chunk 8192: same c48 and 24 repeats; the long prompts stay 2 and 1.5 chunks (16384 and
@@ -2700,11 +2700,11 @@ cases:
     repeats: 64
   chunk_size: 8192
   attn_gpu_memory_gb:
-    value: 133.7882
+    value: 128.6557
     status: measured
-    derived_from: '`Available KV cache memory: 124.6 GiB` (x 1.073741824) in the chunk-8192 workload passes (Slurm
-      jobs 6534, 6536, 6538) at gpu_memory_utilization 0.85'
-    evidence: logs/20261012_1_q38_align_campaign/17_prefill_spectrum_chunk8k_c32/profile_workload
+    derived_from: '`Available KV cache memory: 119.82 GiB` (x 1.073741824) in the chunk-8192 workload passes (Slurm
+      jobs 6570, 6572) at gpu_memory_utilization 0.85'
+    evidence: logs/20261012_1_q38_align_campaign/19_quadrant_interference_chunk8k_c48/profile_workload
   provenance:
     derived_from_pack: glm52_nvfp4_b200_tp8 case 10
     derivation: 'Case 10 at chunk 8192: same c256 and trace. Mixed steps carry up to ~250 decodes plus an 8192-token
