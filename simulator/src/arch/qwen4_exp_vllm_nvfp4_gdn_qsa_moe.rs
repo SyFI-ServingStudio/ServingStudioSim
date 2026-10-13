@@ -130,6 +130,8 @@ const COOPERATIVE_TOPK_BACKENDS: &[&str] = &["vllm_cuda_cooperative"];
 /// `reshape_and_cache_flash`.
 const KV_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
+/// `SiluAndMul.forward_cuda` (`torch.ops._C.silu_and_mul`).
+const SILU_AND_MUL_BACKENDS: &[&str] = &["vllm_cuda"];
 const NVFP4_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_sm100"];
 const FP8_BLOCK_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_block_sm100"];
 /// The body experts' NVFP4 scale group.
@@ -372,7 +374,7 @@ pub fn build_configs(
         activation_dtype: ACTIVATION_DTYPE,
         gpu_name: gpu.clone(),
         gemm_backends: GEMM_BACKENDS.to_vec(),
-        act_backends: TORCH_BACKENDS.to_vec(),
+        act_backends: SILU_AND_MUL_BACKENDS.to_vec(),
         sigmoid_backends: TORCH_BACKENDS.to_vec(),
         gate_mul_backends: STRIDED_COPY_BACKENDS.to_vec(),
     };
