@@ -2,7 +2,9 @@
 
 ``vllm_triton`` times the fork's ``ple_ngram_ids`` on ``num_tokens`` random
 token ids split into ``num_reqs`` near-equal requests, with random per-request
-``ngram_context``. Multipliers, head sizes and offsets come from the fork's own
+``ngram_context``. Token ids and the context are int32 on the device, as
+production passes them (``input_batch.input_ids`` and ``model_state.ngram_context``),
+so Triton specializes the same kernel. Multipliers, head sizes and offsets come from the fork's own
 ``Qwen4ExpNGramEmbedding`` helpers for a 248,320-token vocabulary and
 20M-row heads (the values only change hash results, not the work).
 
@@ -25,18 +27,27 @@ _KERNEL_NAME = "_ple_ngram_ids_kernel"
 _VOCAB = 248_320
 _EOS = 248_044
 _HEAD_ROWS = 20_000_000
-_MAX_TOKENS = 1 << 17
 
 
-def validate_args(num_tokens: int, num_reqs: int, ngram_context_len: int, heads_per_ngram: int):
-    if type(num_tokens) is not int or not 1 <= num_tokens <= _MAX_TOKENS:
-        raise ValueError(f"num_tokens must be an integer in [1, {_MAX_TOKENS}]")
+def validate_args(
+    num_tokens: int, num_reqs: int, ngram_context_len: int, heads_per_ngram: int
+) -> None:
+    # The kernel has no size limits of its own: tokens tile the grid, and the
+    # context length and head count are constexprs it unrolls over.
+    for name, value in (
+        ("num_tokens", num_tokens),
+        ("ngram_context_len", ngram_context_len),
+        ("heads_per_ngram", heads_per_ngram),
+    ):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
     if type(num_reqs) is not int or not 1 <= num_reqs <= num_tokens:
         raise ValueError("num_reqs must be an integer in [1, num_tokens]")
-    if type(ngram_context_len) is not int or not 1 <= ngram_context_len <= 8:
-        raise ValueError("ngram_context_len must be an integer in [1, 8]")
-    if type(heads_per_ngram) is not int or not 1 <= heads_per_ngram <= 32:
-        raise ValueError("heads_per_ngram must be an integer in [1, 32]")
+
+
+def logical_bytes(num_tokens: int, ngram_context_len: int, heads_per_ngram: int) -> int:
+    """int32 token ids read, int64 ids written (the small context reads are left out)."""
+    return num_tokens * (4 + 8 * ngram_context_len * heads_per_ngram)
 
 
 def query_start_loc(num_tokens: int, num_reqs: int) -> list[int]:
@@ -84,7 +95,9 @@ def profile_ple_ngram_ids_vllm_triton(
         )
         ref = Emb.compute_ngram_ids(module, tokens, qsl, context)
         dev = {k: v.to(device) for k, v in host.items()}
-        d_tokens, d_qsl, d_ctx = tokens.to(device), qsl.to(device), context.to(device)
+        d_tokens = tokens.to(device, torch.int32)
+        d_qsl = qsl.to(device)
+        d_ctx = context.to(device, torch.int32)
         out = torch.empty(num_tokens, heads, dtype=torch.int64, device=device)
 
         def launch() -> None:
@@ -106,7 +119,7 @@ def profile_ple_ngram_ids_vllm_triton(
         raise
     except Exception as exc:
         raise KernelLaunchFailed(f"{KIND}:vllm_triton failed: {exc}") from exc
-    nbytes = num_tokens * (4 + 8 * heads)
+    nbytes = logical_bytes(num_tokens, ngram_context_len, heads_per_ngram)
     return ComputeMetrics(
         time_ms=float(time_ms),
         tflops=0.0,
@@ -115,4 +128,9 @@ def profile_ple_ngram_ids_vllm_triton(
     )
 
 
-__all__ = ["profile_ple_ngram_ids_vllm_triton", "query_start_loc", "validate_args"]
+__all__ = [
+    "logical_bytes",
+    "profile_ple_ngram_ids_vllm_triton",
+    "query_start_loc",
+    "validate_args",
+]
