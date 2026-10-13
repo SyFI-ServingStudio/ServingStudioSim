@@ -160,6 +160,20 @@ pub struct DsaSparseMlaAttentionKernelConfig {
     pub cache_layout: String,
 }
 
+/// Most query rows one TRTLLM-gen sparse launch takes on B200: it rejects the
+/// 65,536-query launch, and 32,768 is the largest measured row.
+pub const TRTLLM_MAX_QUERIES_PER_LAUNCH: u32 = 32_768;
+
+impl DsaSparseMlaAttentionKernelConfig {
+    /// Most query rows one launch may carry, when a backend caps it. A caller
+    /// with more rows splits them into several launches.
+    pub fn max_queries_per_launch(&self) -> Option<u32> {
+        self.backends
+            .contains(&"flashinfer_trtllm_fp8")
+            .then_some(TRTLLM_MAX_QUERIES_PER_LAUNCH)
+    }
+}
+
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
 pub struct DsaSparseMlaAttentionKernelInput {
     pub num_queries: u32,
@@ -211,11 +225,12 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
     }
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
-        // TRTLLM-gen rejects the 65,536-query launch on B200. Production caps
-        // one iteration far below that, so 32,768 remains a generous measured
-        // extrapolation guard without requiring an unsupported launch.
+        // TRTLLM-gen rejects the 65,536-query launch on B200; callers split
+        // larger calls at `max_queries_per_launch`.
         let trtllm_query_too_large = |num_queries: f64| {
-            config.backends.contains(&"flashinfer_trtllm_fp8") && num_queries > 32_768.0
+            config
+                .max_queries_per_launch()
+                .is_some_and(|max| num_queries > f64::from(max))
         };
         match config.valid_counts_pattern {
             ValidCountsPattern::UniformFull | ValidCountsPattern::PooledUniformFull { .. } => {
