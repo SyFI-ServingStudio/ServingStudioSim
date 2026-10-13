@@ -14,7 +14,7 @@
 //! [`KvAccounting::concurrency_at`] answers a fourth, for the report only:
 //! vLLM's logged "Maximum concurrency", whose estimate charges a recurrent
 //! state one more copy than a running request holds (see
-//! [`charged_state_copies`]).
+//! [`state_copies`]).
 //!
 //! `kv_overhead` picks the byte counts. `vllm` charges what vLLM allocates:
 //! padded entries, extra state copies, whole engine blocks, and a sliding window
@@ -122,9 +122,9 @@ pub struct KvAccountingOptions {
     pub prefix_caching: bool,
 }
 
-/// One part's share of [`KvAccounting::needed_to_admit`].
+/// One part's share of [`KvAccounting::estimated_request_units`] (vLLM's concurrency estimate).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PartAtAdmission {
+pub(super) struct PartInEstimate {
     /// Context tokens the part holds: the block-rounded prompt for a per-token
     /// part, the kept window for a sliding window; `None` for per-request state.
     pub tokens_held: Option<u64>,
@@ -225,7 +225,7 @@ impl KvAccounting {
                     prefix_reusable: part.prefix_reusable,
                 }),
                 KvGrowth::PerRequest => {
-                    let (copies, aligns) = charged_state_copies(part, layout, options);
+                    let (copies, aligns) = state_copies(part, layout, options);
                     state_units += units * u64::from(copies);
                     align_estimate_units += units * u64::from(aligns);
                     if part.prefix_reusable {
@@ -444,7 +444,7 @@ impl KvAccounting {
     /// [`Self::estimated_request_units`] split over the layout's parts, in
     /// their order: what each part holds for the request and its units.
     /// Built for the report only; the parts sum to `estimated_request_units`.
-    pub(super) fn estimated_request_by_part(&self, prompt_tokens: u64) -> Vec<PartAtAdmission> {
+    pub(super) fn estimated_request_by_part(&self, prompt_tokens: u64) -> Vec<PartInEstimate> {
         let in_flight = self.max_in_flight_tokens.unwrap_or(prompt_tokens);
         let allocated = prompt_tokens.div_ceil(self.block_tokens) * self.block_tokens;
         self.layout
@@ -468,12 +468,11 @@ impl KvAccounting {
                         (Some(tokens), tokens)
                     }
                     KvGrowth::PerRequest => {
-                        let (copies, aligns) =
-                            charged_state_copies(part, &self.layout, self.options);
+                        let (copies, aligns) = state_copies(part, &self.layout, self.options);
                         (None, u64::from(copies + u32::from(aligns)))
                     }
                 };
-                PartAtAdmission {
+                PartInEstimate {
                     tokens_held,
                     entries,
                     units: units_per_entry * entries,
@@ -742,7 +741,7 @@ pub(super) fn charged_bytes_per_entry(part: &KvCachePart, overhead: KvOverhead) 
 /// state are null, and the previous step's state block is freed the step
 /// after a block boundary is crossed (`remove_skipped_blocks`). That one-step
 /// copy is left out of what a request holds.
-pub(super) fn charged_state_copies(
+pub(super) fn state_copies(
     part: &KvCachePart,
     layout: &KvCacheLayout,
     options: KvAccountingOptions,

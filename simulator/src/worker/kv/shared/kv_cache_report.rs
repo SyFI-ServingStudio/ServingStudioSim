@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::arch::kv_layout::{KvCacheLayout, KvGrowth};
 use crate::worker::kv::shared::kv_accounting::{
-    charged_bytes_per_entry, charged_state_copies, KvAccounting, KvAccountingOptions, KvOverhead,
+    charged_bytes_per_entry, state_copies, KvAccounting, KvAccountingOptions, KvOverhead,
     PrefixResumePoints,
 };
 
@@ -62,9 +62,9 @@ pub struct KvPartChargeReport {
     pub charged_bytes_per_entry: u64,
     pub units_per_entry: u64,
     /// Copies a running request holds; 1 for a part that grows with context.
-    pub charged_copies: u32,
+    pub held_copies: u32,
     /// For a per-request part, whether vLLM's concurrency estimate adds align
-    /// mode's previous-step copy to `charged_copies`; null for any other part.
+    /// mode's previous-step copy to `held_copies`; null for any other part.
     pub align_copy: Option<bool>,
 }
 
@@ -121,9 +121,9 @@ impl KvAccounting {
             .iter()
             .map(|part| {
                 let charged_bytes_per_entry = charged_bytes_per_entry(part, overhead);
-                let (charged_copies, align_copy) = match part.growth {
+                let (held_copies, align_copy) = match part.growth {
                     KvGrowth::PerRequest => {
-                        let (copies, aligns) = charged_state_copies(part, layout, options);
+                        let (copies, aligns) = state_copies(part, layout, options);
                         (copies, Some(aligns))
                     }
                     KvGrowth::PerToken { .. } | KvGrowth::SlidingWindow { .. } => (1, None),
@@ -132,7 +132,7 @@ impl KvAccounting {
                     name: part.name,
                     charged_bytes_per_entry,
                     units_per_entry: charged_bytes_per_entry / self.bytes_per_unit(),
-                    charged_copies,
+                    held_copies,
                     align_copy,
                 }
             })
@@ -267,7 +267,7 @@ mod tests {
                 (
                     part.name,
                     part.units_per_entry,
-                    part.charged_copies,
+                    part.held_copies,
                     part.align_copy,
                 )
             })

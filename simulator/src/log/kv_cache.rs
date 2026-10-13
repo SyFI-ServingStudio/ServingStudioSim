@@ -238,7 +238,7 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
     };
     let _ = writeln!(
         out,
-        "\n  One request at max_model_len {}, per GPU",
+        "\n  One request at max_model_len {} in vLLM's estimate, per GPU",
         grouped(u64::from(max_model_len))
     );
     let total: u64 = result.request_parts.iter().map(|part| part.bytes).sum();
@@ -283,7 +283,7 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
             }
             (_, Some(tokens)) => format!("{} tokens", grouped(tokens)),
             (_, None) => {
-                let copies = charge.charged_copies;
+                let copies = charge.held_copies;
                 if charge.align_copy == Some(true) {
                     format!(
                         "{} ({} held + align)",
