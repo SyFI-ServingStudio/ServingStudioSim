@@ -28,6 +28,11 @@ from profiling.runners.autotune_cache import autotune_cached
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.moe.exact_topk import exact_topk_ids
+from profiling.runners.moe.routing_methods import (
+    UNBIASED_ROUTING_METHODS,
+    forced_routing_logits,
+    validate_routing_groups,
+)
 
 # FP8 E4M3 weights with one scale per 128x128 block, and activations with one
 # scale per 1x128 group; group_size is the 128 edge.
@@ -41,22 +46,17 @@ ROUTING_METHODS = {"deepseek_v3": 2, "renormalize_naive": 4}
 # Router logits as vLLM passes them: FP32 for the GLM-5.3 gate
 # (`moe_router_dtype: float32`) with an FP32 correction bias; BF16 from a
 # GateLinear without out_dtype, with no bias, for RenormalizeNaive.
-UNBIASED_ROUTING_METHODS = frozenset({"renormalize_naive"})
 ROUTING_ELEMENT_BYTES = {"deepseek_v3": 4, "renormalize_naive": 2}
-# GLM-5.3-Flash `swiglu_limit`. vLLM forwards it as a per-local-expert
-# `gemm1_clamp_limit` tensor, and FlashInfer applies it for DeepSeekFp8 SwiGLU.
-# The deepseek_v3 rows were measured with it; the renormalize_naive rows
-# without, as vLLM calls a model that has no swiglu_limit. The clamp is one
-# min/max in the activation epilogue, so it is not a key axis.
-SWIGLU_LIMIT = 10.0
+# SwiGLU clamp each routing method's rows were measured with. vLLM forwards a
+# model's `swiglu_limit` as a per-local-expert `gemm1_clamp_limit` tensor, and
+# FlashInfer applies it for DeepSeekFp8 SwiGLU: the deepseek_v3 rows used
+# GLM-5.3-Flash's 10, the renormalize_naive rows none, as vLLM calls a model
+# without one. The clamp is one min/max in the activation epilogue, so it is
+# not a key axis.
+SWIGLU_LIMITS: dict[str, float | None] = {"deepseek_v3": 10.0, "renormalize_naive": None}
 # vLLM's `fi_moe_largest_bucket`: max(max_num_tokens * dp, 8192). The measured
 # GLM-5.3 deployment (chunk 2048, DP1) resolves to the 8192 floor.
 TUNE_MAX_NUM_TOKENS = 8192
-# Forced router logits: selected experts get distinct high scores, the rest a
-# low score, so sigmoid + top-k picks exactly the requested ids.
-_SELECTED_LOGIT = 8.0
-_SELECTED_STEP = 0.5
-_UNSELECTED_LOGIT = -8.0
 _W13_SCALE = (0.05, 0.15)
 _W2_SCALE = (0.005, 0.015)
 _WEIGHT_CHUNK = 8
@@ -112,14 +112,7 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
         )
     if args["routing_method"] not in ROUTING_METHODS:
         raise ValueError(f"unsupported routing method: {args['routing_method']}")
-    # Grouped routing only admits experts from the best `topk_group` groups, so
-    # forced logits could not realize an arbitrary per-expert histogram.
-    ungrouped = 0 if args["routing_method"] in UNBIASED_ROUTING_METHODS else 1
-    if args["n_group"] != ungrouped or args["topk_group"] != ungrouped:
-        raise ValueError(
-            f"only ungrouped {args['routing_method']} routing "
-            f"(n_group=topk_group={ungrouped}) is supported"
-        )
+    validate_routing_groups(args["routing_method"], args["n_group"], args["topk_group"])
     if args["hidden_size"] % GROUP_SIZE or args["intermediate_size"] % GROUP_SIZE:
         raise ValueError("hidden_size and intermediate_size must be multiples of 128")
     # vLLM's asserts before this call: the routing kernel holds one expert per
@@ -138,24 +131,6 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
         per_expert_batches=args["per_expert_batches"],
     )
     return args
-
-
-def forced_routing_logits(
-    torch: Any, ids: list[list[int]], num_experts: int, device: Any, dtype: Any = None
-) -> Any:
-    """Router logits whose top-k is exactly ``ids``, under DeepSeekV3 (zero
-    bias) or softmax scoring alike. FP32 unless ``dtype`` says otherwise; the
-    selected values stay distinct in BF16 for top_k <= 32."""
-
-    dtype = torch.float32 if dtype is None else dtype
-    selected = torch.tensor(ids, dtype=torch.int64, device=device)
-    logits = torch.full(
-        (selected.shape[0], num_experts), _UNSELECTED_LOGIT, dtype=dtype, device=device
-    )
-    ranks = torch.arange(selected.shape[1], dtype=dtype, device=device)
-    values = (_SELECTED_LOGIT - _SELECTED_STEP * ranks).expand_as(selected).contiguous()
-    logits.scatter_(1, selected, values)
-    return logits
 
 
 def _random_fp8(torch: Any, shape: tuple[int, ...], generator: Any) -> Any:
@@ -260,11 +235,12 @@ def _build_case(
         per_expert_batches=args["per_expert_batches"],
     )
     unbiased = args["routing_method"] in UNBIASED_ROUTING_METHODS
+    swiglu_limit = SWIGLU_LIMITS[args["routing_method"]]
     clamp = (
         None
-        if unbiased
+        if swiglu_limit is None
         else torch.full(
-            (args["num_local_experts"],), SWIGLU_LIMIT, dtype=torch.float32, device="cuda"
+            (args["num_local_experts"],), swiglu_limit, dtype=torch.float32, device="cuda"
         )
     )
     call_kwargs = {
@@ -397,7 +373,7 @@ def profile_fp8_block_fused_moe_sm100(
 
 def compare_with_reference(
     *, seed: int = 0, random_routing: bool = False, **spec: Any
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     """Run the production call once and compare it with the Torch reference.
 
     With ``random_routing`` the router logits and correction bias are random
@@ -433,6 +409,7 @@ def compare_with_reference(
         "w13_scale": weights["w13_scale"],
         "w2": weights["w2"],
         "w2_scale": weights["w2_scale"],
+        "routing_method": args["routing_method"],
         "routing_logits": call_kwargs["routing_logits"],
         "routing_bias": call_kwargs["routing_bias"],
         "top_k": args["top_k"],
@@ -440,7 +417,7 @@ def compare_with_reference(
         "local_offset": 0,
         "num_local": args["num_local_experts"],
     }
-    clamp_limit = None if call_kwargs["gemm1_clamp_limit"] is None else SWIGLU_LIMIT
+    clamp_limit = SWIGLU_LIMITS[args["routing_method"]]
     expected = fp8_block_fused_moe_reference(torch, clamp_limit=clamp_limit, **reference_kwargs)
     unclamped = fp8_block_fused_moe_reference(torch, clamp_limit=None, **reference_kwargs)
 
@@ -457,7 +434,9 @@ def compare_with_reference(
             torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
         ),
         "rel_l2_vs_unclamped_reference": rel(actual, unclamped),
-        "clamp_active_fraction_expert0": float((probe.abs() > SWIGLU_LIMIT).float().mean()),
+        "clamp_active_fraction_expert0": (
+            None if clamp_limit is None else float((probe.abs() > clamp_limit).float().mean())
+        ),
         "finite": bool(torch.isfinite(actual).all()),
     }
 
