@@ -160,3 +160,26 @@ def test_profile_passes_offset_width_to_triton_launch(
     assert all(launch[2]["USE_INT64"] is expected_use_int64 for launch in launches)
     assert metrics.time_ms == 1.0
     assert metrics.energy_j == 0.25
+
+
+@pytest.mark.parametrize(
+    "function_name", ["profile_elementwise_strided_copy", "profile_elementwise_cat"]
+)
+@pytest.mark.parametrize("input_size, output_size", [(2048, 1024), (0, 1024), (1023, 1023)])
+def test_copy_only_realizations_refuse_other_byte_contracts(function_name, input_size, output_size):
+    """The strided-copy and cat backends realize a one-input bf16 copy and nothing else."""
+    from profiling.runners.elementwise import torch as runner
+
+    with pytest.raises(ValueError):
+        getattr(runner, function_name)(input_size, output_size)
+
+
+def test_copy_realizations_are_registered_backends():
+    from profiling.db.registry import find_kernel_profiler_spec
+
+    for backend, function_name in (
+        ("torch_strided_copy", "profile_elementwise_strided_copy"),
+        ("torch_cat", "profile_elementwise_cat"),
+    ):
+        spec = find_kernel_profiler_spec("elementwise", backend)
+        assert spec.runner_ref.function_name == function_name

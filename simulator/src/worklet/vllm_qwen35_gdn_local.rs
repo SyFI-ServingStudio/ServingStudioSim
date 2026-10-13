@@ -69,8 +69,14 @@ pub struct VllmQwen35GdnLocalWorkletConfig {
     pub static_quant_backends: Vec<&'static str>,
     /// Compiled (Triton) elementwise launches.
     pub triton_elementwise_backends: Vec<&'static str>,
-    /// Eager TensorIterator copies, cat and exp.
+    /// Eager TensorIterator maps over contiguous tensors (`b.contiguous()`, index
+    /// copies, `g.exp()`).
     pub torch_elementwise_backends: Vec<&'static str>,
+    /// Eager copies whose source is a non-contiguous view; TensorIterator cannot
+    /// vectorize them (the decode q/k/v slices and the core-output copy-back).
+    pub strided_copy_backends: Vec<&'static str>,
+    /// Eager `torch.cat`.
+    pub cat_backends: Vec<&'static str>,
     pub state_copy_backends: Vec<&'static str>,
     pub causal_conv_prefill_backends: Vec<&'static str>,
     pub prefill_post_conv_backends: Vec<&'static str>,
@@ -174,6 +180,9 @@ impl VllmQwen35GdnLocalWorklet {
         let torch = |input: u32, output: u32| {
             elementwise(&cfg.torch_elementwise_backends, gpu, input, output)
         };
+        let strided_copy =
+            |bytes: u32| elementwise(&cfg.strided_copy_backends, gpu, bytes, bytes);
+        let cat = |bytes: u32| elementwise(&cfg.cat_backends, gpu, bytes, bytes);
         let state = |operation: &str| IndexedRowCopyKernelConfig {
             backends: cfg.state_copy_backends.clone(),
             gpu_name: gpu.clone(),
@@ -249,9 +258,9 @@ impl VllmQwen35GdnLocalWorklet {
                     dtype: cfg.activation_dtype,
                 },
             },
-            decode_qk_copy: torch(key_width * act, key_width * act),
-            decode_v_copy: torch(value_row, value_row),
-            decode_qkv_cat: torch(conv_channels * act, conv_channels * act),
+            decode_qk_copy: strided_copy(key_width * act),
+            decode_v_copy: strided_copy(value_row),
+            decode_qkv_cat: cat(conv_channels * act),
             mixed_decode_recurrent: recurrent(&cfg.sigmoid_gating_decode_backends),
             prefill_index_copy: torch(INDEX_BYTES, INDEX_BYTES),
             state_gather: state("gather"),
@@ -261,8 +270,8 @@ impl VllmQwen35GdnLocalWorklet {
                 cfg.num_value_heads * DType::Fp32.size_bytes(),
                 cfg.num_value_heads * DType::Fp32.size_bytes(),
             ),
-            output_cat: torch(value_row, value_row),
-            core_output_copy: torch(value_row, value_row),
+            output_cat: cat(value_row),
+            core_output_copy: strided_copy(value_row),
             gated_norm: GdnGatedRmsNormKernelConfig {
                 backends: cfg.gated_rms_norm_backends.clone(),
                 gpu_name: gpu.clone(),
@@ -510,6 +519,8 @@ mod tests {
             static_quant_backends: vec!["vllm_inductor"],
             triton_elementwise_backends: vec!["triton"],
             torch_elementwise_backends: vec!["torch"],
+            strided_copy_backends: vec!["torch_strided_copy"],
+            cat_backends: vec!["torch_cat"],
             state_copy_backends: vec!["torch"],
             causal_conv_prefill_backends: vec!["vllm_triton"],
             prefill_post_conv_backends: vec!["vllm_triton"],

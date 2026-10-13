@@ -78,6 +78,8 @@ const NVFP4_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDUCTOR_BACKENDS: &[&str] = &["vllm_inductor"];
 const TRITON_ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 const TORCH_ELEMENTWISE_BACKENDS: &[&str] = &["torch"];
+const STRIDED_COPY_BACKENDS: &[&str] = &["torch_strided_copy"];
+const CAT_BACKENDS: &[&str] = &["torch_cat"];
 const VLLM_TRITON_BACKENDS: &[&str] = &["vllm_triton"];
 /// FlashInfer's CUTLASS chunked delta rule (`auto` on SM100).
 const CHUNK_DELTA_RULE_BACKENDS: &[&str] = &["flashinfer"];
@@ -226,6 +228,8 @@ pub fn build_configs(
             static_quant_backends: INDUCTOR_BACKENDS.to_vec(),
             triton_elementwise_backends: TRITON_ELEMENTWISE_BACKENDS.to_vec(),
             torch_elementwise_backends: TORCH_ELEMENTWISE_BACKENDS.to_vec(),
+            strided_copy_backends: STRIDED_COPY_BACKENDS.to_vec(),
+            cat_backends: CAT_BACKENDS.to_vec(),
             state_copy_backends: TORCH_ELEMENTWISE_BACKENDS.to_vec(),
             causal_conv_prefill_backends: VLLM_TRITON_BACKENDS.to_vec(),
             prefill_post_conv_backends: VLLM_TRITON_BACKENDS.to_vec(),
