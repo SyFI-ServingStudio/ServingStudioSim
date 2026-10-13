@@ -7,7 +7,11 @@
 //! whole accepted chain per iteration rather than one token — split across the
 //! axis that owns advancement and the axis that owns model input. Chunk-end
 //! alignment comes from the same `prefill_chunk_end_quantum`; the drafter adds
-//! whether the prompt's last checkpoint moves one block earlier.
+//! whether the prompt's last checkpoint moves one block earlier
+//! (`SpeculativeUnifiedModel::prunes_last_prefix_block`). Only the chunk-end
+//! stop reads this; prefix-hit lengths do not yet drop the block. A layout
+//! without resumable recurrent state gets no alignment, so the hook is inert
+//! there.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -629,10 +633,12 @@ mod tests {
             (None, true, vec![(0, 12), (12, 6)]),
         ] {
             let requests = shared_with(&[(0, 18, 2)]);
-            requests.borrow_mut()[RequestId(0)].request.definition.decoding =
-                DecodingStrategy::Speculative {
-                    accept_rate: AcceptanceProfile::Uniform(0.0),
-                };
+            requests.borrow_mut()[RequestId(0)]
+                .request
+                .definition
+                .decoding = DecodingStrategy::Speculative {
+                accept_rate: AcceptanceProfile::Uniform(0.0),
+            };
             let model = Arc::new(HybridModel {
                 prunes,
                 chunks: Mutex::new(Vec::new()),

@@ -36,9 +36,10 @@ use crate::worker::types::IterBatchPlan;
 pub struct SpeculativeIterExecution<M: SpeculativeUnifiedModel> {
     model: Arc<M>,
     cost: CostBuffers,
-    /// Candidate positions drafted per request per iteration. The verify width
-    /// is `draft_tokens + 1`; the model was compiled for that width, so it is a
-    /// worker-lifetime constant, clipped only for a request at `max_model_len`.
+    /// Candidate positions drafted per request per iteration, a worker-lifetime
+    /// constant: the model was compiled for the `draft_tokens + 1` verify
+    /// width. A request at `max_model_len` verifies fewer rows
+    /// ([`SpeculativeDecodeInput::verify_query_len`]).
     draft_tokens: u32,
 }
 

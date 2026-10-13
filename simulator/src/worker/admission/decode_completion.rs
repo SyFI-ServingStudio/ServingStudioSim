@@ -3,14 +3,15 @@
 //! This is the one thing speculative decoding changes about a lifecycle: an
 //! ordinary engine emits exactly one token per resident request per iteration,
 //! a speculating engine verifies a `draft_tokens + 1` window (clipped at the
-//! context limit) and retires between one and that many. Everything else about admission — placement,
-//! chunking, capacity gates, retraction — is identical, so the difference is a
-//! sub-axis of the lifecycle rather than a second lifecycle.
+//! context limit) and retires between one and that many. Everything else about
+//! admission — placement, chunking, capacity gates, retraction — is identical,
+//! so the difference is a sub-axis of the lifecycle rather than a second
+//! lifecycle.
 //!
 //! A policy owns exactly two facts:
 //!
-//! - [`DecodeCompletion::query_tokens_per_request`], the *fixed* query width the
-//!   engine submits per resident request. It is a batch-shape fact the
+//! - [`DecodeCompletion::query_tokens_per_request`], the full query width the
+//!   engine reserves per resident request. It is a batch-shape fact the
 //!   lifecycle needs before the iteration runs (to size its token budget) and
 //!   the execution adapter needs to lower the L4 input. It does not depend on
 //!   how many tokens are ultimately accepted. A request at the context limit

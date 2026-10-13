@@ -183,7 +183,7 @@ def test_a_request_past_the_checkpoints_positions_is_refused(bound, tmp_path):
         _plan_run(bound, tmp_path, *llama, rows, [])
     assert str(error.value) == (
         "1 of 2 requests exceed pool main's max_model_len 131072 "
-        '(prefix_len + input_len + output_len), first ids ["b"]'
+        '(prefix_len + input_len + max(output_len, 1)), first ids ["b"]'
     )
 
 
@@ -200,7 +200,7 @@ def test_a_speculative_trace_fits_as_vllm_admits_it_and_matches_its_width(bound,
     header = "id,arrival_time,input_len,output_len,accept_rate\n"
     with pytest.raises(workloads.BadWorkload) as error:
         _plan_run(bound, tmp_path, *spec, header + "a,0.0,8000,193,0.7\n", ["speculative"])
-    assert "max_model_len 8192 (prefix_len + input_len + output_len)" in str(error.value)
+    assert "max_model_len 8192 (prefix_len + input_len + max(output_len, 1))" in str(error.value)
     vectors = header + 'a,0.0,100,10,"[0.9,0.8,0.7,0.6,0.5]"\nb,0.0,100,10,"[0.9,0.8]"\n'
     with pytest.raises(workloads.BadWorkload) as error:
         _plan_run(bound, tmp_path, *spec, vectors, ["speculative"])

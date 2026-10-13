@@ -51,8 +51,9 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     policy_context: P::Context,
     enqueue_sequence: EnqueueSequence,
     max_batch_tokens: u32,
-    /// Checkpoint interval a non-final chunk must end on, if any.
-    chunk_end_quantum: Option<u32>,
+    /// Where chunks may end, when the engine can only checkpoint recurrent
+    /// state on block boundaries.
+    chunk_end_alignment: Option<ChunkEndAlignment>,
     /// Prompts that have started and still have prefill tokens to schedule, in
     /// start order.
     started_prefills: Vec<AdmissionCandidate>,
@@ -102,7 +103,7 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             policy_context,
             enqueue_sequence: EnqueueSequence::default(),
             max_batch_tokens,
-            chunk_end_quantum: None,
+            chunk_end_alignment: None,
             started_prefills: Vec::new(),
             in_flight_decodes: HashSet::new(),
             scheduled_decodes: Vec::new(),
@@ -110,10 +111,10 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         }
     }
 
-    /// End every non-final chunk on a multiple of `quantum` context tokens.
-    pub(crate) fn with_chunk_end_quantum(mut self, quantum: u32) -> Self {
-        assert!(quantum > 0, "chunk-end quantum must be positive");
-        self.chunk_end_quantum = Some(quantum);
+    /// End every non-final chunk on a checkpoint boundary of `alignment`.
+    pub(crate) fn with_chunk_end_alignment(mut self, alignment: ChunkEndAlignment) -> Self {
+        assert!(alignment.quantum > 0, "chunk-end quantum must be positive");
+        self.chunk_end_alignment = Some(alignment);
         self
     }
 
@@ -148,7 +149,7 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             let chunk_tokens = next_chunk_tokens(
                 resolved_prefill,
                 remaining_budget,
-                self.chunk_end_quantum.map(ChunkEndAlignment::on_blocks),
+                self.chunk_end_alignment,
                 self.max_batch_tokens,
             );
             if chunk_tokens == 0 {
@@ -232,7 +233,7 @@ where
         now: Time,
     ) -> bool {
         let max_batch_tokens = self.max_batch_tokens;
-        let chunk_end_alignment = self.chunk_end_quantum.map(ChunkEndAlignment::on_blocks);
+        let chunk_end_alignment = self.chunk_end_alignment;
         let mut remaining_budget = max_batch_tokens;
         // Running decodes first, as vLLM schedules its running queue before
         // waiting prompts. One whose previous step has not returned sits out.

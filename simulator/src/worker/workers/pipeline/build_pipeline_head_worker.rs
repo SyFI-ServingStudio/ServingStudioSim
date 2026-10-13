@@ -7,7 +7,7 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
-use crate::worker::admission::{PendingOrder, PipelinedChunkedPrefillAdmission};
+use crate::worker::admission::{ChunkEndAlignment, PendingOrder, PipelinedChunkedPrefillAdmission};
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::types::WorkerConfig;
@@ -89,7 +89,7 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         max_batch_tokens,
     );
     let mut admission = match chunk_end_quantum {
-        Some(quantum) => admission.with_chunk_end_quantum(quantum),
+        Some(quantum) => admission.with_chunk_end_alignment(ChunkEndAlignment::on_blocks(quantum)),
         None => admission,
     };
     if config.balance_decode_microbatches {

@@ -36,6 +36,33 @@ use super::{
     PartitionLoad, PendingOrderPolicy, SingleTokenDecodeCompletion,
 };
 
+/// Where a hybrid engine lets a prefill chunk end when it can checkpoint
+/// recurrent state only on block boundaries (vLLM's Mamba `align` cache mode
+/// under prefix caching).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChunkEndAlignment {
+    /// Checkpoint interval, in context tokens, that every non-final chunk ends
+    /// on: the layout's engine block.
+    pub(crate) quantum: u32,
+    /// The prompt's last checkpoint sits one block below its last whole block.
+    /// vLLM sets this with a drafter that reads target hidden states
+    /// (`SpeculativeConfig.use_eagle_block_drop`: EAGLE, MTP, DFlash): its
+    /// prefix lookup prunes the last matching block, so the scheduler stops the
+    /// prefill one block earlier to cache the state that lookup can reach.
+    pub(crate) last_checkpoint_one_block_early: bool,
+}
+
+impl ChunkEndAlignment {
+    /// Alignment on `quantum` with the last checkpoint on the prompt's last
+    /// whole block.
+    pub(crate) const fn on_blocks(quantum: u32) -> Self {
+        Self {
+            quantum,
+            last_checkpoint_one_block_early: false,
+        }
+    }
+}
+
 pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeCompletion> {
     partition_policies: Vec<(P, P::Context)>,
     enqueue_sequence: EnqueueSequence,
@@ -803,33 +830,6 @@ where
     }
 }
 
-/// Where a hybrid engine lets a prefill chunk end when it can checkpoint
-/// recurrent state only on block boundaries (vLLM's Mamba `align` cache mode
-/// under prefix caching).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ChunkEndAlignment {
-    /// Checkpoint interval, in context tokens, that every non-final chunk ends
-    /// on: the layout's engine block.
-    pub(crate) quantum: u32,
-    /// The prompt's last checkpoint sits one block below its last whole block.
-    /// vLLM sets this with a drafter that reads target hidden states
-    /// (`SpeculativeConfig.use_eagle_block_drop`: EAGLE, MTP, DFlash): its
-    /// prefix lookup prunes the last matching block, so the scheduler stops the
-    /// prefill one block earlier to cache the state that lookup can reach.
-    pub(crate) last_checkpoint_one_block_early: bool,
-}
-
-impl ChunkEndAlignment {
-    /// Alignment on `quantum` with the last checkpoint on the prompt's last
-    /// whole block.
-    pub(crate) fn on_blocks(quantum: u32) -> Self {
-        Self {
-            quantum,
-            last_checkpoint_one_block_early: false,
-        }
-    }
-}
-
 /// The next chunk of `resolved_prefill` that `budget` tokens can carry, ending
 /// on a checkpoint boundary when `chunk_end_alignment` is set. `0` means the
 /// request cannot run this iteration.
@@ -915,21 +915,23 @@ mod tests {
     use super::{checkpoint_aligned_chunk_tokens, ChunkEndAlignment};
 
     const BLOCK: u32 = 2_176;
+    /// GLM-5.3-Flash: a 2176-token engine block, no pruning drafter.
+    const ALIGNED: ChunkEndAlignment = ChunkEndAlignment::on_blocks(BLOCK);
 
     #[test]
     fn a_non_final_chunk_ends_on_the_last_checkpoint_boundary_it_reaches() {
         // GLM-5.3-Flash at an 8192-token cap: 3 x 2176, as the trace shows.
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 40_000, 8_192, ChunkEndAlignment::on_blocks(BLOCK), 8_192),
+            checkpoint_aligned_chunk_tokens(0, 40_000, 8_192, ALIGNED, 8_192),
             6_528
         );
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(6_528, 40_000, 8_192, ChunkEndAlignment::on_blocks(BLOCK), 8_192),
+            checkpoint_aligned_chunk_tokens(6_528, 40_000, 8_192, ALIGNED, 8_192),
             6_528
         );
         // Budget shared with decode still floors to a boundary.
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 40_000, 3_837, ChunkEndAlignment::on_blocks(BLOCK), 8_192),
+            checkpoint_aligned_chunk_tokens(0, 40_000, 3_837, ALIGNED, 8_192),
             2_176
         );
     }
@@ -937,7 +939,7 @@ mod tests {
     #[test]
     fn a_budget_below_one_block_cannot_start_an_aligned_chunk() {
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 40_000, 1_664, ChunkEndAlignment::on_blocks(BLOCK), 8_192),
+            checkpoint_aligned_chunk_tokens(0, 40_000, 1_664, ALIGNED, 8_192),
             0
         );
     }
@@ -947,11 +949,11 @@ mod tests {
         // The last 4532 tokens cross 43520 = 20 x 2176; the tail runs separately.
         let prefill_end = 43_700;
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(39_168, prefill_end, 4_532, ChunkEndAlignment::on_blocks(BLOCK), 8_192),
+            checkpoint_aligned_chunk_tokens(39_168, prefill_end, 4_532, ALIGNED, 8_192),
             4_352
         );
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(43_520, prefill_end, 180, ChunkEndAlignment::on_blocks(BLOCK), 8_192),
+            checkpoint_aligned_chunk_tokens(43_520, prefill_end, 180, ALIGNED, 8_192),
             180
         );
     }
@@ -959,7 +961,7 @@ mod tests {
     #[test]
     fn a_final_chunk_that_crosses_no_boundary_is_not_clipped() {
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 1_801, 1_801, ChunkEndAlignment::on_blocks(BLOCK), 8_192),
+            checkpoint_aligned_chunk_tokens(0, 1_801, 1_801, ALIGNED, 8_192),
             1_801
         );
     }
@@ -968,15 +970,15 @@ mod tests {
     fn a_block_wider_than_the_cap_runs_sub_block_then_realigns() {
         // GLM-5.3-Flash at a 2048-token cap: 0 -> 2034 -> 2176, as the trace shows.
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 5_000, 2_034, ChunkEndAlignment::on_blocks(BLOCK), 2_048),
+            checkpoint_aligned_chunk_tokens(0, 5_000, 2_034, ALIGNED, 2_048),
             2_034
         );
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(2_034, 5_000, 2_048, ChunkEndAlignment::on_blocks(BLOCK), 2_048),
+            checkpoint_aligned_chunk_tokens(2_034, 5_000, 2_048, ALIGNED, 2_048),
             142
         );
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(2_176, 5_000, 2_048, ChunkEndAlignment::on_blocks(BLOCK), 2_048),
+            checkpoint_aligned_chunk_tokens(2_176, 5_000, 2_048, ALIGNED, 2_048),
             2_048
         );
     }

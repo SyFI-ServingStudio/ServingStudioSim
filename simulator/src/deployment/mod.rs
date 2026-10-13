@@ -173,7 +173,7 @@ pub fn check_trace(cfg: &RunConfig, trace: &TraceFrontend) -> anyhow::Result<()>
                 total: Some(total),
                 message: format!(
                     "{long} of {total} requests exceed pool {role}'s max_model_len {} \
-                     (prefix_len + input_len + output_len), first ids {long_ids:?}",
+                     (prefix_len + input_len + max(output_len, 1)), first ids {long_ids:?}",
                     pool.max_model_len
                 ),
             }
@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "2 of 4 requests exceed pool main's max_model_len 131072 \
-             (prefix_len + input_len + output_len), first ids [\"b\", \"c\"]"
+             (prefix_len + input_len + max(output_len, 1)), first ids [\"b\", \"c\"]"
         );
         let too_long = error.downcast_ref::<TooLong>().expect("a TooLong refusal");
         assert_eq!(
@@ -351,8 +351,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let speculative = llama_config("speculative", SPECULATIVE);
         // No draft room: vLLM clips the last verifies of a request ending at
-        // the limit, as it served the Qwen3.8-Flash-Next diverse_100 requests
-        // 122879 + 8192 and 131070 + 1 at max_model_len 131072.
+        // the limit, so prompt + output may reach max_model_len exactly.
         let fits = trace(
             dir.path(),
             &["speculative"],
@@ -362,7 +361,7 @@ mod tests {
         let long = trace(dir.path(), &["speculative"], "a,131000,73,0.0,0.7\n");
         let error = check_trace(&speculative, &long).unwrap_err().to_string();
         assert!(
-            error.contains("max_model_len 131072 (prefix_len + input_len + output_len)"),
+            error.contains("max_model_len 131072 (prefix_len + input_len + max(output_len, 1))"),
             "{error}"
         );
 
