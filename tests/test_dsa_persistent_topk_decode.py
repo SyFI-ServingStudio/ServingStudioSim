@@ -34,6 +34,7 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 _TORCH_BACKEND = "torch"
 _NATIVE_BACKEND = "vllm_cuda"
 _FORK_BACKEND = "vllm_fork_cuda"
+_COOPERATIVE_BACKEND = "vllm_cuda_cooperative"
 _BASE_SPEC = {
     "batch_size": 16,
     "context_len": 8192,
@@ -82,8 +83,13 @@ def test_registration_support_policy_and_facades() -> None:
 
     assert KIND == "dsa_persistent_topk_decode"
     # The fork build is its own backend; tests/test_dsa_persistent_topk_decode_fork.py
-    # covers its registration.
-    assert known_backends(KIND) == [_TORCH_BACKEND, _NATIVE_BACKEND, _FORK_BACKEND]
+    # covers its registration. The cooperative backend is the small-batch dispatch.
+    assert known_backends(KIND) == [
+        _TORCH_BACKEND,
+        _NATIVE_BACKEND,
+        _FORK_BACKEND,
+        _COOPERATIVE_BACKEND,
+    ]
     for spec in (torch_spec, native_spec):
         assert spec.kernel_kind == spec.table_name == KIND
         assert spec.args_schema is DsaPersistentTopkDecodeArgs
@@ -667,6 +673,40 @@ def test_vectorized_composite_matches_reference_and_preserves_inputs() -> None:
     assert torch.equal(actual[1], actual[3])
     assert torch.equal(operands.logits_backing, logits_before)
     assert torch.equal(operands.lengths, lengths_before)
+
+
+def test_uniform_random_rows_hold_seeded_independent_scores() -> None:
+    """uniform_random must not fall back to the increasing template: the select's
+    time follows the score distribution, so a silent fallback mis-times every row."""
+    from profiling.runners.attention.dsa_persistent_topk_decode import (
+        _build_operands,
+        _torch_composite,
+    )
+
+    def build():
+        return _build_operands(
+            torch,
+            batch_size=2,
+            context_len=600,
+            next_n=1,
+            max_model_len=640,
+            top_k=512,
+            logits_row_stride=640,
+            device="cpu",
+            context_mode="uniform_random",
+        )
+
+    operands = build()
+    logits = operands.logits_backing
+    assert torch.equal(logits, build().logits_backing)
+    assert not torch.equal(logits[0], logits[1])
+    assert not torch.equal(logits[0].sort().values, logits[0])
+    expected = torch.full_like(operands.out, -99)
+    dsa_persistent_topk_decode_reference(
+        operands.logits, operands.lengths, expected, top_k=512, max_seq_len=600
+    )
+    actual = _torch_composite(operands)
+    assert torch.equal(actual.sort(dim=1).values, expected.sort(dim=1).values)
 
 
 def test_semantic_validation_accepts_reference_equivalent_operands() -> None:

@@ -23,6 +23,7 @@ pub mod dsa_sparse_mla_attention;
 pub mod dsa_sparse_mla_prefill;
 pub mod dsa_topk_prefill;
 pub mod elementwise;
+pub mod embedding_row_gather;
 pub mod engine;
 pub mod engram_lookup;
 pub mod fa4_varlen_attention;
@@ -39,8 +40,13 @@ pub mod gdn_chunk_delta_rule;
 pub mod gdn_gated_rms_norm;
 pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
+pub mod gdn_recurrent_decode_gated_norm;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod grouped_rms_norm;
+pub mod hc_combine;
+pub mod hc_combine_norm;
+pub mod hc_gate_mix;
 pub mod indexed_row_copy;
 pub mod inv_rope_fp8_quant;
 pub mod kda_chunk_prefill;
@@ -74,6 +80,9 @@ pub mod p2p_intra;
 pub mod packed_kv_cache_gather;
 pub mod paged_attn_batch_decode;
 pub mod paged_attn_batch_prefill;
+pub mod ple_gate;
+pub mod ple_ngram_ids;
+pub mod ple_short_conv;
 pub mod q_kv_rms_norm;
 pub mod q_pad_kv_rope_mxfp8_insert;
 pub mod qk_rms_norm_rope_gate;
@@ -82,9 +91,16 @@ pub mod rel_bias_attention;
 pub mod residual_rms_norm;
 pub mod rms_norm;
 pub mod rs_sconv_ag_residual_rms_norm;
+pub mod scaled_silu;
 pub mod sconv_qkvr_prep;
 pub mod silu_and_mul;
 pub mod single_gemm;
+pub mod sparse_gqa_paged_attention;
+pub mod sparse_index_expand;
+pub mod sparse_indexer_logits_decode;
+pub mod sparse_indexer_logits_prefill;
+pub mod sparse_indexer_prepare;
+pub mod sparse_indexer_topk;
 pub mod static_fp8_quant;
 pub mod vllm_fused_moe;
 pub mod vllm_mla_rope;
@@ -169,6 +185,10 @@ pub use dsa_topk_prefill::{
 pub use elementwise::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, ElementwiseSpec,
 };
+pub use embedding_row_gather::{
+    EmbeddingRowGatherKernel, EmbeddingRowGatherKernelConfig, EmbeddingRowGatherKernelInput,
+    EmbeddingRowGatherSpec,
+};
 pub use engine::{Kernel, KernelConfig, KernelSpec, OffGrid};
 pub use engram_lookup::{
     EngramLookupKernel, EngramLookupKernelConfig, EngramLookupKernelInput, EngramLookupSpec,
@@ -224,12 +244,22 @@ pub use gdn_recurrent_decode::{
     GdnRecurrentDecodeKernel, GdnRecurrentDecodeKernelConfig, GdnRecurrentDecodeKernelInput,
     GdnRecurrentDecodeSpec,
 };
+pub use gdn_recurrent_decode_gated_norm::{
+    GdnRecurrentDecodeGatedNormKernel, GdnRecurrentDecodeGatedNormKernelConfig,
+    GdnRecurrentDecodeGatedNormKernelInput, GdnRecurrentDecodeGatedNormSpec,
+};
 pub use gemm_fp32_output::{
     GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, GemmFp32OutputSpec,
 };
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
 };
+pub use grouped_rms_norm::{
+    GroupedRmsNormKernel, GroupedRmsNormKernelConfig, GroupedRmsNormKernelInput, GroupedRmsNormSpec,
+};
+pub use hc_combine::{HcCombineKernel, HcCombineSpec};
+pub use hc_combine_norm::{HcCombineNormKernel, HcCombineNormSpec};
+pub use hc_gate_mix::{HcGateMixKernel, HcGateMixSpec};
 pub use indexed_row_copy::{
     IndexedRowCopyKernel, IndexedRowCopyKernelConfig, IndexedRowCopyKernelInput,
     IndexedRowCopySpec,
@@ -338,6 +368,13 @@ pub use paged_attn_batch_prefill::{
     PagedAttnBatchPrefillKernel, PagedAttnBatchPrefillKernelConfig,
     PagedAttnBatchPrefillKernelInput, PagedAttnBatchPrefillSpec,
 };
+pub use ple_gate::{PleGateKernel, PleGateKernelConfig, PleGateKernelInput, PleGateSpec};
+pub use ple_ngram_ids::{
+    PleNgramIdsKernel, PleNgramIdsKernelConfig, PleNgramIdsKernelInput, PleNgramIdsSpec,
+};
+pub use ple_short_conv::{
+    PleShortConvKernel, PleShortConvKernelConfig, PleShortConvKernelInput, PleShortConvSpec,
+};
 pub use q_kv_rms_norm::{
     QKvRmsNormKernel, QKvRmsNormKernelConfig, QKvRmsNormKernelInput, QKvRmsNormSpec,
 };
@@ -366,6 +403,9 @@ pub use rs_sconv_ag_residual_rms_norm::{
     RsSconvAgResidualRmsNormKernel, RsSconvAgResidualRmsNormKernelConfig,
     RsSconvAgResidualRmsNormKernelInput, RsSconvAgResidualRmsNormSpec,
 };
+pub use scaled_silu::{
+    ScaledSiluKernel, ScaledSiluKernelConfig, ScaledSiluKernelInput, ScaledSiluSpec,
+};
 pub use sconv_qkvr_prep::{
     SconvQkvrPrepKernel, SconvQkvrPrepKernelConfig, SconvQkvrPrepKernelInput, SconvQkvrPrepSpec,
 };
@@ -375,6 +415,27 @@ pub use silu_and_mul::{
 pub use single_gemm::{
     SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput, SingleGemmSpec,
 };
+pub use sparse_gqa_paged_attention::{
+    SparseGqaPagedAttentionKernel, SparseGqaPagedAttentionKernelConfig,
+    SparseGqaPagedAttentionKernelInput, SparseGqaPagedAttentionSpec,
+};
+pub use sparse_index_expand::{
+    SparseIndexExpandKernel, SparseIndexExpandKernelConfig, SparseIndexExpandKernelInput,
+    SparseIndexExpandSpec,
+};
+pub use sparse_indexer_logits_decode::{
+    SparseIndexerLogitsDecodeKernel, SparseIndexerLogitsDecodeKernelConfig,
+    SparseIndexerLogitsDecodeKernelInput, SparseIndexerLogitsDecodeSpec,
+};
+pub use sparse_indexer_logits_prefill::{
+    SparseIndexerLogitsPrefillKernel, SparseIndexerLogitsPrefillKernelConfig,
+    SparseIndexerLogitsPrefillKernelInput, SparseIndexerLogitsPrefillSpec,
+};
+pub use sparse_indexer_prepare::{
+    SparseIndexerPrepareKernel, SparseIndexerPrepareKernelConfig, SparseIndexerPrepareKernelInput,
+    SparseIndexerPrepareSpec,
+};
+pub use sparse_indexer_topk::{SparseIndexerTopkKernel, SparseIndexerTopkSpec};
 pub use static_fp8_quant::{
     StaticFp8QuantKernel, StaticFp8QuantKernelConfig, StaticFp8QuantKernelInput, StaticFp8QuantSpec,
 };

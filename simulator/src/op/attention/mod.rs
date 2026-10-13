@@ -6,6 +6,8 @@ pub mod dsa_indexer;
 pub mod dsa_sparse_mla;
 pub mod flashinfer;
 pub mod glm53_kpool_sparse_mla;
+pub mod sparse_gqa;
+pub mod sparse_gqa_indexer;
 
 pub use deepseek_v41_indexer::{
     byte_rate_placeholder_shape, DeepseekV41CandidateRole, DeepseekV41IndexerOp,
@@ -25,4 +27,12 @@ pub use flashinfer::{FlashInferAttentionConfig, FlashInferAttentionInput, FlashI
 pub use glm53_kpool_sparse_mla::{
     Glm53KpoolSparseMlaConfig, Glm53KpoolSparseMlaInput, Glm53KpoolSparseMlaOp,
     Glm53KpoolSparseMlaResolved,
+};
+pub use sparse_gqa::{
+    SparseGqaAttentionOp, SparseGqaAttentionOpConfig, SparseGqaAttentionOpInput,
+    SparseGqaAttentionOpResolved,
+};
+pub use sparse_gqa_indexer::{
+    SparseGqaIndexerOp, SparseGqaIndexerOpConfig, SparseGqaIndexerOpInput,
+    SparseGqaIndexerOpResolved,
 };

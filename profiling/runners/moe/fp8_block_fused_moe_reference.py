@@ -7,7 +7,9 @@ bias only for selection, renormalized top-k, routed scale applied to the
 weights), block-dequantized per-expert gate/up and down projections, the
 SwiGLU clamp (``gate <= limit``, ``-limit <= up <= limit``), and the FP8
 re-quantization of the intermediate activation that the DeepSeek-FP8 recipe
-performs between the two GEMMs. Only experts in
+performs between the two GEMMs. Without a routing bias it routes as vLLM's
+RenormalizeNaive does instead (softmax, top-k, renormalize; Qwen3-Next's
+``norm_topk_prob``). Only experts in
 ``[local_offset, local_offset + num_local)`` contribute, as on one EP rank.
 
 Weights here are in vLLM's checkpoint order ``w13 = [gate; up]``; the runner
@@ -39,6 +41,14 @@ def deepseek_v3_routing(
     weights = torch.gather(scores, 1, ids)
     weights = weights / weights.sum(dim=-1, keepdim=True)
     return ids, weights * routed_scaling_factor
+
+
+def renormalize_naive_routing(torch: Any, logits: Any, *, top_k: int) -> tuple[Any, Any]:
+    """Return ``(topk_ids, topk_weights)`` for softmax -> top-k -> renormalize."""
+
+    scores = torch.softmax(logits.float(), dim=-1)
+    weights, ids = torch.topk(scores, top_k, dim=-1)
+    return ids, weights / weights.sum(dim=-1, keepdim=True)
 
 
 def dequantize_blocks(torch: Any, values: Any, scales: Any) -> Any:
@@ -84,12 +94,16 @@ def fp8_block_fused_moe_reference(
     """Return the FP32 ``[T, H]`` output of this rank's routed experts."""
 
     x = dequantize_token_groups(torch, hidden, hidden_scale)
-    ids, weights = deepseek_v3_routing(
-        torch,
-        routing_logits,
-        routing_bias,
-        top_k=top_k,
-        routed_scaling_factor=routed_scaling_factor,
+    ids, weights = (
+        renormalize_naive_routing(torch, routing_logits, top_k=top_k)
+        if routing_bias is None
+        else deepseek_v3_routing(
+            torch,
+            routing_logits,
+            routing_bias,
+            top_k=top_k,
+            routed_scaling_factor=routed_scaling_factor,
+        )
     )
     intermediate = w13.shape[1] // 2
     output = torch.zeros_like(x)
@@ -114,4 +128,5 @@ __all__ = [
     "dequantize_token_groups",
     "fp8_block_fused_moe_reference",
     "quantize_token_groups",
+    "renormalize_naive_routing",
 ]

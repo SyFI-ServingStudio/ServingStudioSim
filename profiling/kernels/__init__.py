@@ -33,6 +33,7 @@ from profiling.kernels import (
     dsa_sparse_mla_prefill,  # noqa: F401
     dsa_topk_prefill,  # noqa: F401
     elementwise,  # noqa: F401
+    embedding_row_gather,  # noqa: F401
     engram_lookup,  # noqa: F401
     fa4_varlen_attention,  # noqa: F401
     flashinfer_attn_decode,  # noqa: F401
@@ -47,8 +48,13 @@ from profiling.kernels import (
     gdn_gated_rms_norm,  # noqa: F401
     gdn_prefill_post_conv,  # noqa: F401
     gdn_recurrent_decode,  # noqa: F401
+    gdn_recurrent_decode_gated_norm,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
     grouped_gemm,  # noqa: F401
+    grouped_rms_norm,  # noqa: F401
+    hc_combine,  # noqa: F401
+    hc_combine_norm,  # noqa: F401
+    hc_gate_mix,  # noqa: F401
     indexed_row_copy,  # noqa: F401
     inv_rope_fp8_quant,  # noqa: F401
     kda_chunk_prefill,  # noqa: F401
@@ -82,6 +88,9 @@ from profiling.kernels import (
     packed_kv_cache_gather,  # noqa: F401
     paged_attn_batch_decode,  # noqa: F401
     paged_attn_batch_prefill,  # noqa: F401
+    ple_gate,  # noqa: F401
+    ple_ngram_ids,  # noqa: F401
+    ple_short_conv,  # noqa: F401
     q_kv_rms_norm,  # noqa: F401
     q_pad_kv_rope_mxfp8_insert,  # noqa: F401
     qk_rms_norm_rope_gate,  # noqa: F401
@@ -90,9 +99,15 @@ from profiling.kernels import (
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
     rs_sconv_ag_residual_rms_norm,  # noqa: F401
+    scaled_silu,  # noqa: F401
     sconv_qkvr_prep,  # noqa: F401
     silu_and_mul,  # noqa: F401
     single_gemm,  # noqa: F401
+    sparse_gqa_paged_attention,  # noqa: F401
+    sparse_index_expand,  # noqa: F401
+    sparse_indexer_logits_decode,  # noqa: F401
+    sparse_indexer_logits_prefill,  # noqa: F401
+    sparse_indexer_prepare,  # noqa: F401
     static_fp8_quant,  # noqa: F401
     vllm_fused_moe,  # noqa: F401
     vllm_mla_rope,  # noqa: F401

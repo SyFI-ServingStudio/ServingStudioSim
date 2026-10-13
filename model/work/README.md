@@ -240,6 +240,23 @@ scale sits at the GEMM its output feeds (input norm -> `qkv_proj.gemm`, post-att
 norm -> dense `gate_up` / MoE `router`, final norm -> `lm_head`); the sinks join the
 attention row and the FP32 selection bias the rank-0 routed leaf.
 
+Qwen3.8-Flash-Next (`Qwen4ExpForConditionalGeneration`, text decoder only) interleaves
+36 Gated DeltaNet and 12 QSA layers over a 4-stream gated low-rank hyper-connection
+residual (`mixers/gated_hc.py`: per module a rank-320 down/up gate, a stream-injection
+projection, and `2·S·hidden` FLOPs per gated stream mean and per injected combine; a
+final mixer collapses the streams). QSA (`attention/qsa.py`) scores mean-pooled
+groups of 4 indexer keys and attends `min(k, 2048 + k mod 4)` keys per query (the
+kpool closed forms); every pass runs its own indexer, the MTP layer's recurrent draft
+steps included (the checkpoint has no `index_share_for_mtp_iteration`). Layer 1 adds a hashed n-gram embedding (`mixers/ngram_embedding.py`):
+its 51.2 G-element FP8 table counts as parameters and is read only at the
+`16·tokens` gathered rows (the deployment keeps it in host memory), and its dilated
+convolution keeps a 9-row history per request. Every layer is a 512-expert top-10
+MoE with a sigmoid-gated shared expert (NVFP4 experts); the staged MTP layer has
+FP8 128-block experts and shares the target's embedding and `lm_head`. Parameters
+reconcile exactly with the safetensors header (176,943,899,520 body,
+2,607,150,848 MTP). No location map yet: it waits for the arch's final CostTree
+locations.
+
 ## Modality-agnostic workload
 
 `Workload` is **not** a fixed causal-LM struct. The weight/FFN/param side needs only the
