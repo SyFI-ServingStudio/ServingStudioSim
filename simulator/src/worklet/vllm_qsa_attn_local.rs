@@ -321,6 +321,7 @@ pub fn step(
         },
         attention: SparseGqaAttentionOpInput {
             output_rows: input.padded_tokens,
+            append_rows: launch_rows,
             attention_rows: launch_rows,
             prefill_chunks: input.prefill_chunks.clone(),
             decode_kv_lens: input.decode_kv_lens.clone(),
@@ -408,7 +409,7 @@ mod tests {
         assert!(idx.prefill_topk.is_none() && idx.prefill_chunks.is_empty());
         let attn = sparse_gqa::plan(&r.attention, &s.attention);
         assert!(!attn.prefill_config);
-        assert_eq!(attn.append_tokens, 20);
+        assert_eq!(attn.append_rows, 24);
     }
 
     /// Mixed under a piecewise graph: `_run_qsa` at the real rows, both
@@ -428,8 +429,12 @@ mod tests {
         assert_eq!(s.padded_rows, 2048);
         assert_eq!((s.indexer.num_rows, s.indexer.decode_requests), (2016, 120));
         assert_eq!(
-            (s.attention.attention_rows, s.attention.output_rows),
-            (2016, 2048)
+            (
+                s.attention.attention_rows,
+                s.attention.append_rows,
+                s.attention.output_rows
+            ),
+            (2016, 2016, 2048)
         );
         let idx = sparse_gqa_indexer::plan(&r.indexer, &s.indexer, true);
         assert!(idx.logits_decode.is_some() && idx.prefill_topk.is_some());

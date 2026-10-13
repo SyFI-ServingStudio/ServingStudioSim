@@ -5,7 +5,7 @@
 //! `_run_qsa` / `forward_qsa`):
 //!
 //! ```text
-//! kv_append         kv_cache_append            the step's new tokens (slot_mapping)
+//! kv_append         kv_cache_append            one program per slot_mapping row
 //! out_zero          elementwise memset         output.zero_() over the output tensor rows
 //! attn_uniform      sparse_gqa_paged_attention prefill_config = false
 //! attn_prefill_cfg  sparse_gqa_paged_attention prefill_config = true
@@ -80,6 +80,10 @@ pub struct SparseGqaAttentionOpResolved {
 pub struct SparseGqaAttentionOpInput {
     /// Rows of the output tensor the memset clears (the graph-padded rows).
     pub output_rows: u32,
+    /// Rows the cache write launches over: `slot_mapping`'s length, the padded
+    /// rows under a FULL graph (a padded row's slot is -1, so its program
+    /// returns without writing).
+    pub append_rows: u32,
     /// Rows the attention launch covers (graph-padded under a FULL graph).
     pub attention_rows: u32,
     /// `(cached prefix, new tokens)` of each prefill chunk.
@@ -91,7 +95,7 @@ pub struct SparseGqaAttentionOpInput {
 /// The leaf inputs of one step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SparseGqaAttentionPlan {
-    pub append_tokens: u32,
+    pub append_rows: u32,
     pub output_rows: u32,
     pub attention_rows: u32,
     /// Row-weighted mean context of all rows: the logged cell.
@@ -214,9 +218,9 @@ impl SparseGqaAttentionOp {
         let p = plan(&self.resolved, input);
 
         let append = KvCacheAppendKernelInput {
-            num_tokens: p.append_tokens,
+            num_tokens: p.append_rows,
         };
-        let metrics = if p.append_tokens == 0 {
+        let metrics = if p.append_rows == 0 {
             LeafMetrics::ZERO
         } else {
             self.kv_append.eval(&append)
@@ -329,7 +333,7 @@ pub fn plan(
     };
     let rows = groups[0].0 + groups[1].0;
     SparseGqaAttentionPlan {
-        append_tokens: rows as u32,
+        append_rows: input.append_rows,
         output_rows: input.output_rows,
         attention_rows: input.attention_rows,
         context_len: mean((rows, groups[0].1 + groups[1].1)),
@@ -377,13 +381,13 @@ mod tests {
         let r = resolved();
         let verify = SparseGqaAttentionOpInput {
             output_rows: 16,
+            append_rows: 16,
             attention_rows: 16,
             prefill_chunks: vec![],
             decode_kv_lens: vec![100, 200, 300, 400],
         };
         let p = plan(&r, &verify);
         assert!(!p.prefill_config);
-        assert_eq!(p.append_tokens, 16);
         // Mean over rows 97..=100, 197..=200, ...: 248.5 rounds to 249.
         assert_eq!(p.context_len, 249);
 
@@ -396,9 +400,7 @@ mod tests {
             prefill_chunks: vec![(0, 5)],
             ..verify
         };
-        let p = plan(&r, &mixed);
-        assert!(p.prefill_config);
-        assert_eq!(p.append_tokens, 21);
+        assert!(plan(&r, &mixed).prefill_config);
     }
 
     #[test]
@@ -407,6 +409,7 @@ mod tests {
             &resolved(),
             &SparseGqaAttentionOpInput {
                 output_rows: 2048,
+                append_rows: 2048,
                 attention_rows: 2048,
                 prefill_chunks: vec![(126976, 2048)],
                 decode_kv_lens: vec![],
@@ -425,6 +428,7 @@ mod tests {
             &resolved(),
             &SparseGqaAttentionOpInput {
                 output_rows: 3008,
+                append_rows: 3008,
                 attention_rows: 3008,
                 prefill_chunks: vec![(1000, 3000)],
                 decode_kv_lens: vec![50_000, 8],
@@ -439,13 +443,12 @@ mod tests {
             p.context_groups,
             [(1051, mean((1051, below.1))), (1957, mean((1957, above.1)))]
         );
-        assert_eq!(p.append_tokens, 3008);
     }
 
     #[test]
     fn the_step_time_is_the_row_weighted_group_mean() {
         let p = SparseGqaAttentionPlan {
-            append_tokens: 4,
+            append_rows: 4,
             output_rows: 4,
             attention_rows: 4,
             context_len: 0,
