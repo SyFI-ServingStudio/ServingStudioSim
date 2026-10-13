@@ -12,11 +12,18 @@
 //! ```
 //!
 //! The attention is one launch over every row of the step, decode and prefill
-//! alike (a capture shows one split-K call per layer even in mixed steps), at
-//! the cell `(num_rows, row-weighted mean context)`. The framework switches its
-//! launch table to the prefill one when the longest query of the step exceeds
-//! the verify length `1 + num_speculative_tokens`; exactly one of the two
-//! attention leaves is non-zero.
+//! alike (a capture shows one split-K call per layer even in mixed steps). Rows
+//! are independent programs and a row's work is set by its context, so the call
+//! is priced as the row-weighted mean of per-row times at the step's row count.
+//! Two context groups carry that mean: rows below the selection budget
+//! (`context < token_topk`) attend their whole context, rows at or above it
+//! attend the budget. Each group is priced at its own mean context, so a step
+//! that mixes a fresh chunk with long requests is not priced as if every row
+//! read the full budget (a single row-weighted mean context over-priced such
+//! steps by up to 1.6x on the B200 capture, logs/20261013_8_qf_probe). The
+//! framework switches its launch table to the prefill one when the longest
+//! query of the step exceeds the verify length `1 + num_speculative_tokens`;
+//! exactly one of the two attention leaves is non-zero.
 
 use std::sync::Arc;
 
@@ -64,6 +71,8 @@ pub struct SparseGqaAttentionOpResolved {
     pub attn_prefill_cfg: SparseGqaPagedAttentionKernelConfig,
     pub decode_query_len: u32,
     pub max_decode_query_len: u32,
+    /// Context at which a row's selection reaches the budget (`token_topk`).
+    pub saturation_context: u32,
 }
 
 /// One step as the attention call sees it.
@@ -85,7 +94,11 @@ pub struct SparseGqaAttentionPlan {
     pub append_tokens: u32,
     pub output_rows: u32,
     pub attention_rows: u32,
+    /// Row-weighted mean context of all rows: the logged cell.
     pub context_len: u32,
+    /// `(rows, mean context)` of the rows below the selection budget and of the
+    /// rows at or above it; a group with no rows has zero rows.
+    pub context_groups: [(u32, u32); 2],
     pub prefill_config: bool,
 }
 
@@ -147,6 +160,7 @@ impl SparseGqaAttentionOp {
             attn_prefill_cfg: attention(true),
             decode_query_len: cfg.decode_query_len,
             max_decode_query_len: cfg.max_decode_query_len,
+            saturation_context: cfg.token_topk,
         }
     }
 
@@ -229,11 +243,33 @@ impl SparseGqaAttentionOp {
             let metrics = if p.attention_rows == 0 || p.prefill_config != prefill_config {
                 LeafMetrics::ZERO
             } else {
-                kernel.eval(&cell)
+                row_weighted(&p, |context_len| {
+                    kernel.eval(&SparseGqaPagedAttentionKernelInput {
+                        num_rows: p.attention_rows,
+                        context_len,
+                    })
+                })
             };
             ev.push(metrics, || cell.clone().into());
         }
     }
+}
+
+/// Row-weighted mean of the per-group times, each at the step's row count.
+fn row_weighted(
+    p: &SparseGqaAttentionPlan,
+    mut eval: impl FnMut(u32) -> LeafMetrics,
+) -> LeafMetrics {
+    let rows: u32 = p.context_groups.iter().map(|&(n, _)| n).sum();
+    let mut metrics = LeafMetrics::ZERO;
+    for &(n, context_len) in &p.context_groups {
+        if n > 0 {
+            let mut part = eval(context_len);
+            part.scale(n as f32 / rows as f32);
+            metrics.add_fanin(part);
+        }
+    }
+    metrics
 }
 
 fn leaf<K: Probe>(builder: &mut CostTreeBuilder, name: &str, slot: &str, kernel: &K) -> CostNode {
@@ -250,14 +286,26 @@ pub fn plan(
     input: &SparseGqaAttentionOpInput,
 ) -> SparseGqaAttentionPlan {
     let q = u64::from(r.decode_query_len);
-    let mut rows = 0u64;
-    let mut context_sum = 0u64;
+    let saturation = u64::from(r.saturation_context);
+    // (rows, context sum) below and at or above the selection budget.
+    let mut groups = [(0u64, 0u64); 2];
+    // Rows of one request see the consecutive contexts first..=last.
+    let mut add_rows = |first: u64, last: u64| {
+        let split = last.min(saturation.saturating_sub(1));
+        for (group, lo, hi) in [(0, first, split), (1, first.max(split + 1), last)] {
+            if lo <= hi {
+                groups[group].0 += hi - lo + 1;
+                groups[group].1 += (lo + hi) * (hi - lo + 1) / 2;
+            }
+        }
+    };
     let mut longest_query = 0u32;
     for &(prefix, new) in &input.prefill_chunks {
         let (p, n) = (u64::from(prefix), u64::from(new));
         // A row at position prefix + i sees prefix + i + 1 tokens.
-        rows += n;
-        context_sum += n * p + n * (n + 1) / 2;
+        if n > 0 {
+            add_rows(p + 1, p + n);
+        }
         longest_query = longest_query.max(new);
     }
     for &kv in &input.decode_kv_lens {
@@ -267,22 +315,25 @@ pub fn plan(
             "decode context {kv} shorter than its {q} query rows"
         );
         // Rows at positions kv - q .. kv - 1 see kv - q + 1 .. kv tokens.
-        rows += q;
-        context_sum += q * kv - q * (q - 1) / 2;
+        add_rows(kv - q + 1, kv);
     }
     if !input.decode_kv_lens.is_empty() {
         longest_query = longest_query.max(r.decode_query_len);
     }
-    let context_len = if rows == 0 {
-        0
-    } else {
-        ((context_sum + rows / 2) / rows) as u32
+    let mean = |(n, sum): (u64, u64)| {
+        if n == 0 {
+            0
+        } else {
+            ((sum + n / 2) / n) as u32
+        }
     };
+    let rows = groups[0].0 + groups[1].0;
     SparseGqaAttentionPlan {
         append_tokens: rows as u32,
         output_rows: input.output_rows,
         attention_rows: input.attention_rows,
-        context_len,
+        context_len: mean((rows, groups[0].1 + groups[1].1)),
+        context_groups: groups.map(|g| (g.0 as u32, mean(g))),
         prefill_config: longest_query > r.max_decode_query_len,
     }
 }
@@ -363,5 +414,55 @@ mod tests {
         );
         assert!(p.prefill_config);
         assert_eq!(p.context_len, 126976 + 1025);
+        assert_eq!(p.context_groups, [(0, 0), (2048, 126976 + 1025)]);
+    }
+
+    /// A fresh chunk beside long decode requests: its rows below the 2048-token
+    /// budget form their own group instead of being averaged into the long ones.
+    #[test]
+    fn rows_split_at_the_selection_budget() {
+        let p = plan(
+            &resolved(),
+            &SparseGqaAttentionOpInput {
+                output_rows: 3008,
+                attention_rows: 3008,
+                prefill_chunks: vec![(1000, 3000)],
+                decode_kv_lens: vec![50_000, 8],
+            },
+        );
+        // Chunk rows see 1001..=4000: 1047 rows at 1001..=2047, 1953 at 2048..=4000.
+        // Decode rows see 49997..=50000 and 5..=8.
+        let below = (1047, (1001 + 2047) * 1047 / 2 + 26);
+        let above = (1953, (2048 + 4000) * 1953 / 2 + 199_994);
+        let mean = |(n, s): (u64, u64)| ((s + n / 2) / n) as u32;
+        assert_eq!(
+            p.context_groups,
+            [(1051, mean((1051, below.1))), (1957, mean((1957, above.1)))]
+        );
+        assert_eq!(p.append_tokens, 3008);
+    }
+
+    #[test]
+    fn the_step_time_is_the_row_weighted_group_mean() {
+        let p = SparseGqaAttentionPlan {
+            append_tokens: 4,
+            output_rows: 4,
+            attention_rows: 4,
+            context_len: 0,
+            context_groups: [(1, 100), (3, 9000)],
+            prefill_config: true,
+        };
+        let metrics = row_weighted(&p, |context| LeafMetrics {
+            m: crate::timing::Metrics4 {
+                time_ms: context as f32,
+                flops: 0.0,
+                bytes: 0.0,
+                energy_j: 0.0,
+            },
+            coverage: crate::timing::CoverageFlags::EMPTY,
+            backend_index: 0,
+        });
+        assert!((metrics.m.time_ms - (100.0 + 3.0 * 9000.0) / 4.0).abs() < 1e-3);
+        assert_eq!(metrics.backend_index, 0);
     }
 }
