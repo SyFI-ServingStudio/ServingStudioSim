@@ -123,17 +123,21 @@ rejected. Decode rows are exact buckets. On the arch, `prefill_segment_size: S`
 (with `whole_forward`) costs both phases in the one `forward` slot, and the
 worker budget becomes S.
 
-C16384 at S2048 is recorded. Its vendor gate passes for the b1, b4, b8 and b13
-validation shapes through the per-position BC route (RMS ratio 1.037-1.042),
-against row-chunked eager references.
+C16384 and C32768 at S2048 are recorded. The vendor gate passes on every
+validation shape through the per-position BC route (RMS ratio 1.037-1.042 at
+C16384 for b1/b4/b8/b13; 1.029-1.037 at C32768 for b1/b4/b6), against
+row-chunked eager references.
 
-| C16384/S2048 | ms |
-| --- | --- |
-| prefill at prior 0, 2048, ..., 14336 | 261.0, 279.6, 299.7, 319.8, 339.9, 360.1, 380.1, 400.2 |
-| decode b1, b4, b8, b16 | 13.51, 80.98, 151.70, 236.90 |
+| S2048 rows (ms) | C16384 | C32768 |
+| --- | --- | --- |
+| prefill segment at prior 0 | 261.0 | 260.7 |
+| prefill segment at prior 14336 | 400.2 | 400.6 |
+| prefill segment at prior 30720 | - | 561.6 |
+| decode b1 / b4 / b8 / b16 | 13.51 / 80.98 / 151.70 / 236.90 | 18.28 / 151.85 / 290.70 / - |
 
-`presets/*_vllm_neuron_segmented.*` use decode buckets `[1,4,8,16]` at C16384;
-C32768 `[1,4,8]` stays provisional until its rows are recorded.
+A segment costs about 20 ms more per 2048 prior tokens, and the same at both
+contexts for equal priors (within 0.2%). `presets/*_vllm_neuron_segmented.*`
+use decode buckets `[1,4,8,16]` at C16384 and `[1,4,8]` at C32768.
 
 ## Alignment
 
@@ -221,7 +225,7 @@ missing work.
 - Region and segment rows are validated only where recorded (above); layer
   segment capture beyond small C512 buckets exceeds the 512 MB instruction
   buffer.
-- Segmented prefill rows exist only for C16384/S2048.
+- Segmented prefill rows exist only for S2048 at C16384 and C32768.
 - HTTP passes do not repeat the full-logit validation; they bind the observed
   graphs to the validated forward run.
 - Host-side overhead is calibrated only by the separate duty multiplier

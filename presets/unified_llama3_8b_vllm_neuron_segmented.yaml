@@ -5,9 +5,8 @@
 # separate-prefill-priority, prefix caching off). Prefill time interpolates over
 # the measured priors; decode buckets are exact. Residents =
 # min(largest bucket, 217024 // context).
-# NOTE: the decode bucket lists below are provisional (every power of two up to
-# the KV-resident ceiling); trim them to the buckets that pass device gating
-# (vendor logit check + native trace coverage) once rows are recorded.
+# Decode buckets are those that passed device gating (vendor logit check and
+# native trace coverage): C16384 [1,4,8,16], C32768 [1,4,8].
 # Full-model native device time; HTTP/host overhead is not calibrated here.
 deployment: unified
 workload:
