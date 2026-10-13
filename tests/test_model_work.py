@@ -1207,6 +1207,82 @@ def test_qwen38_prefill_work_goldens(qwen38):
     )
 
 
+def test_qwen38_floors_label_the_served_fp8_kv_cache_under_the_fp4_arch(qwen38, tmp_path):
+    """vLLM serves the checkpoint with `--kv-cache-dtype fp8`, which config.json does
+    not state: the arch fixes it, so the floors halve the GQA K/V bytes and run the
+    prefill attention math on FP8 queries and keys. GDN state keeps its own dtype."""
+    arch = "qwen35_vllm_nvfp4_gdn_dense"
+    raw = json.loads(QWEN38.read_text())
+    group = {
+        "gpu": "NVIDIA B200",
+        "arch": {"type": arch, "model_config": str(QWEN38), "fp8": False},
+    }
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw" / "params.json").write_text(
+        json.dumps({"pools": {"main": {"groups": [group]}}})
+    )
+    spec = work_floors._pool_specs(tmp_path)["main"]
+    assert spec["arch_quant_dtype"] == "fp4"
+    served = work_floors._model_for_spec(spec)
+    # The mixed scheme (NVFP4 MLPs + lm_head, FP8 projections) matches the FP4 arch
+    # without an `fp8` flag; an `fp8` flag would claim a uniformly FP8 model.
+    assert served.quant.compute_dtypes == {"fp4", "fp8"}
+    work_floors._check_precision(served, spec)
+    with pytest.raises(ValueError, match="declares fp4\\+fp8 quantized compute"):
+        work_floors._check_precision(served, {**spec, "arch_fp8": True, "arch_quant_dtype": "fp8"})
+    # The compute dtype alone needs no builder: the config states its layer_types.
+    assert parse_quantization_config(raw).compute_dtype == "fp4"
+
+    linear, full = (stack.attn for stack in served.layers)
+    assert linear == qwen38.layers[0].attn
+    assert (full.kv_dtype_bytes, full.prefill_compute_dtype) == (1.0, "fp8")
+    wl = Workload.causal_lm(prefill=[(512, 0)], decode=[4096], sampled=2)
+    rows = {segment.name: segment for segment in served.label(wl).segments}
+    base = {segment.name: segment for segment in qwen38.label(wl).segments}
+    kv_entry = 4 * (256 + 256)  # one token at one layer, FP8
+    assert rows["full.attn.decode"].bytes_total == 16 * 4095 * kv_entry
+    assert rows["full.kv_cache_append"].bytes_total == 16 * (512 + 1) * kv_entry
+    assert rows["full.attn.prefill"].compute_dtype == "fp8"
+    assert rows["full.attn.decode"].compute_dtype == "bf16"
+    for name in base:
+        if not name.startswith("full.attn") and name != "full.kv_cache_append":
+            assert rows[name] == base[name], name
+
+
+def test_qwen38_location_map_consumes_every_semantic_once(qwen38):
+    location_map = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "model/work/location_maps/qwen35_vllm_nvfp4_gdn_dense_unified.json"
+        ).read_text()
+    )
+    assert location_map["schema_version"] == 1
+    assert location_map["mapping_id"] == "qwen35-vllm-nvfp4-gdn-dense-unified-v1"
+    assert location_map["arch_types"] == ["qwen35_vllm_nvfp4_gdn_dense"]
+    locations = [row["location"] for row in location_map["locations"]]
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    # 30 leaves for vLLM's first GDN layer (its input norm adds no residual), 30
+    # for the other 47, 15 per gated-GQA layer and 4 in the head; none communicate.
+    assert len(locations) == len(set(locations)) == 79
+    for workload in (
+        Workload.causal_lm(decode=[4096] * 3, sampled=3),
+        Workload.causal_lm(prefill=[(2048, 0)], decode=[300], sampled=2),
+    ):
+        names = [segment.name for segment in qwen38.label(workload).segments]
+        assert sorted(mapped) == sorted(names)
+    semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    # One semantic row covers all 48 GDN layers, so it sits on the 47-layer stack's
+    # leaf; the first layer's leaves carry none, except that its input norm is the
+    # embedding gather's consumer (the arch has no embedding leaf).
+    first = [location for location in locations if location.startswith("unified.gdn_first.")]
+    assert len(first) == 30
+    assert semantics["unified.gdn_first.input_norm"] == ["embedding"]
+    assert all(semantics[location] == [] for location in first[1:])
+    assert semantics["unified.gdn.gdn.qkvz"] == ["linear.qkvz"]
+    assert semantics["unified.gqa.gqa.kv_append"] == ["full.kv_cache_append"]
+    assert semantics["unified.lm_head"] == ["lm_head"]
+
+
 @pytest.fixture(scope="module")
 def qwen36_moe():
     return load_model(QWEN36_MOE)

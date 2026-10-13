@@ -82,14 +82,19 @@ Precision is then per segment, never global, because a real checkpoint is mixed:
   algorithm; anything unlisted stays at the master dtype, as in vLLM's
   `ModelOptMixedPrecisionConfig`. `FP8` is E4M3 with one static FP32 scale per
   tensor, `NVFP4` the E2M1 + per-16 E4M3 scale above. The builder passes its
-  layer schedule (every layer of one type must quantize alike) and vLLM's
+  layer schedule (every layer of one type must quantize alike; a caller without
+  one falls back to the config's own `layer_types`) and vLLM's
   `packed_modules_mapping`, so the checkpoint's shards (`q_proj`, `k_proj`,
   `v_proj`) name the fused matrix the spec carries (`self_attn.qkv_proj`); its
   shards must share one algorithm. Qwen3.8 stores the GDN `in_proj_qkvz` and
   `out_proj` and the attention `qkv_proj`/`o_proj` in FP8, the MLP and
   `lm_head` in NVFP4, and keeps `in_proj_ba`, `conv1d`, the norms and the
   embedding BF16. Its KV cache is FP8 only by the serving flag
-  (`--kv-cache-dtype fp8_e4m3`), which the config does not declare.
+  (`--kv-cache-dtype fp8`), which the config does not declare: `floors.py`
+  serves it for the arch types in `_FP8_KV_CACHE_ARCHS` (one byte per GQA K/V
+  or MLA latent element, FP8 prefill attention math for GQA). The arch's
+  precision check matches a mixed scheme by its headline, lowest-precision
+  dtype (FP4 here), so the arch needs no `fp8` flag.
 - A mechanism can fix its own precision independently of the weights:
   `AttentionSemantic.compute_dtype` pins GLM's DSA index logits to FP8 (the index
   cache is FP8 by construction) and its sparse MLA to BF16 (vLLM's FlashMLA
