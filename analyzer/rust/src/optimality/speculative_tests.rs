@@ -40,6 +40,20 @@ async fn speculative_exact_iteration_handoff_reconciles_r6_r7() {
             7,
             "glm53_vllm_nvfp4_dsa_moe_dflash2",
         ),
+        // Qwen3.8-Flash-Next: the preset omits draft_tokens, which the simulator
+        // and the floors both resolve to the arch default of 3.
+        (
+            json!({"type":"qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative",
+                "model_config":"model/config/qwen3_8_flash_next_nvfp4.json"}),
+            3,
+            "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_unified",
+        ),
+        (
+            json!({"type":"qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative",
+                "model_config":"model/config/qwen3_8_flash_next_nvfp4.json", "draft_tokens":1}),
+            1,
+            "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_single_draft_unified",
+        ),
     ] {
         let dir = tempfile::tempdir_in(&logs).unwrap();
         std::fs::create_dir(dir.path().join("raw")).unwrap();
