@@ -37,6 +37,27 @@ def test_each_backend_runs_only_its_production_residency():
         gather.validate_args("torch", **_ROW_ARGS)
 
 
+def test_bf16_tables_run_only_on_the_torch_backend():
+    # Defect caught: a BF16 token-embedding table priced at FP8 row bytes, or
+    # the FP8-only fork kernel accepting a BF16 table.
+    token_table = dict(_ROW_ARGS, num_heads=1, head_dim=2560, table_rows=248_320)
+    gather.validate_args("torch", **dict(token_table, residency="device", weight_dtype="bf16"))
+    with pytest.raises(ProfilerNotImplemented, match="fp8_e4m3"):
+        gather.validate_args("vllm_triton", **dict(token_table, weight_dtype="bf16"))
+    with pytest.raises(ProfilerNotImplemented, match="GiB"):
+        gather.validate_args("torch", **dict(_ROW_ARGS, residency="device", weight_dtype="bf16"))
+    assert gather.logical_bytes(4, 1, 2560, "bf16") == 4 * (8 + 2 * 2560 * 2)
+    assert gather.logical_bytes(4, 1, 2560, "fp8_e4m3") == 4 * (8 + 2 * 2560)
+
+
+def test_row_check_compares_bf16_rows_bytewise():
+    # Defect caught: reshaping a BF16 gather to the table's byte width before the
+    # byte view, which pairs up rows and raises (or compares the wrong bytes).
+    table = {"table": torch.randn(32, 6, dtype=torch.bfloat16)}
+    ids = torch.tensor([[3], [17], [5]])
+    gather.check_rows(torch, table, ids, torch.nn.functional.embedding(ids, table["table"]))
+
+
 def test_gate_reference_matches_the_signed_sqrt_sigmoid_formula():
     # Defect caught: a gate without the signed square root, or norms that are
     # not per residual stream.
@@ -68,7 +89,9 @@ def test_conv_reference_with_zero_state_is_a_causal_dilated_conv():
         torch, x, zeros, zeros, state, weight, query_len=q, dilation=dilation, mode="prefill"
     )
     padded = torch.nn.functional.pad(x.T[None], ((taps - 1) * dilation, 0))
-    conv = torch.nn.functional.conv1d(padded, weight[:, None, :], dilation=dilation, groups=channels)
+    conv = torch.nn.functional.conv1d(
+        padded, weight[:, None, :], dilation=dilation, groups=channels
+    )
     expected = torch.nn.functional.silu(conv[0].T)
     assert torch.allclose(got, expected, atol=1e-9)
 

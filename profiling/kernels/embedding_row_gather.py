@@ -27,7 +27,8 @@ Args:
 - ``residency``: ``host_uva`` (pinned host memory read over UVA, the
   ``cpu_offload=True`` path) or ``device`` (HBM, ``cpu_offload=False``, where
   production calls ``F.embedding`` synchronously instead).
-- ``weight_dtype``: table element dtype (``fp8_e4m3``).
+- ``weight_dtype``: table element dtype (``fp8_e4m3``; ``bf16`` for ``torch``,
+  e.g. a token embedding table).
 """
 
 from __future__ import annotations
@@ -139,8 +140,8 @@ register(
         args_schema=EmbeddingRowGatherArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        # F.embedding on an FP8 weight is a raw index_select; no capability rule.
-        supports=BackendSupport(compute=frozenset({DType.FP8_E4M3})),
+        # F.embedding is a raw row index_select; no capability rule.
+        supports=BackendSupport(compute=frozenset({DType.FP8_E4M3, DType.BF16})),
         subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(

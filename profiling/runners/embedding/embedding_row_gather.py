@@ -42,6 +42,9 @@ from profiling.runners.metrics import ComputeMetrics
 KIND = "embedding_row_gather"
 _TRITON_KERNEL = "_lookup_ple_embedding_from_pinned_kernel"
 _BACKEND_RESIDENCY = {"vllm_triton": "host_uva", "torch": "device"}
+# Table element dtype -> (bytes per element, torch dtype attribute).
+_DTYPES = {"fp8_e4m3": (1, "float8_e4m3fn"), "bf16": (2, "bfloat16")}
+_BACKEND_DTYPES = {"vllm_triton": ("fp8_e4m3",), "torch": ("fp8_e4m3", "bf16")}
 _RESIDENCIES = ("host_uva", "device")
 _MAX_TOKENS = 1 << 17
 _MAX_HEADS = 64
@@ -73,7 +76,11 @@ def validate_args(
         raise ValueError(f"head_dim must be an integer in [1, {_MAX_HEAD_DIM}]")
     if type(table_rows) is not int or table_rows < num_heads:
         raise ValueError("table_rows must be an integer >= num_heads")
-    if table_rows * head_dim > _MAX_TABLE_BYTES:
+    if str(weight_dtype) not in _BACKEND_DTYPES[backend]:
+        raise ProfilerNotImplemented(
+            f"{KIND}:{backend} supports {', '.join(_BACKEND_DTYPES[backend])} tables"
+        )
+    if table_rows * head_dim * _DTYPES[str(weight_dtype)][0] > _MAX_TABLE_BYTES:
         raise ProfilerNotImplemented(f"tables above {_MAX_TABLE_BYTES >> 30} GiB are not pinned")
     if residency not in _RESIDENCIES:
         raise ValueError(f"residency must be one of {_RESIDENCIES}")
@@ -81,13 +88,13 @@ def validate_args(
         raise ProfilerNotImplemented(
             f"{KIND}:{backend} runs only with residency={_BACKEND_RESIDENCY[backend]}"
         )
-    if str(weight_dtype) != "fp8_e4m3":
-        raise ProfilerNotImplemented(f"{KIND} supports fp8_e4m3 tables")
 
 
-def logical_bytes(num_tokens: int, num_heads: int, head_dim: int) -> int:
-    """Int64 ids read + FP8 rows read + FP8 rows written."""
-    return num_tokens * num_heads * (8 + 2 * head_dim)
+def logical_bytes(
+    num_tokens: int, num_heads: int, head_dim: int, weight_dtype: object = "fp8_e4m3"
+) -> int:
+    """Int64 ids read + table rows read + rows written (table dtype)."""
+    return num_tokens * num_heads * (8 + 2 * head_dim * _DTYPES[str(weight_dtype)][0])
 
 
 def head_ranges(table_rows: int, num_heads: int) -> list[tuple[int, int]]:
@@ -103,7 +110,9 @@ def build_id_pool(torch: Any, device: Any, num_tokens: int, num_heads: int, tabl
     lo = torch.tensor([r[0] for r in ranges], dtype=torch.int64, device=device)
     size = torch.tensor([r[1] - r[0] for r in ranges], dtype=torch.int64, device=device)
     generator = torch.Generator(device=device).manual_seed(0x5EED)
-    raw = torch.randint(0, 1 << 62, (pool, num_tokens, num_heads), device=device, generator=generator)
+    raw = torch.randint(
+        0, 1 << 62, (pool, num_tokens, num_heads), device=device, generator=generator
+    )
     return raw % size + lo
 
 
@@ -121,23 +130,27 @@ def release_table() -> None:
 atexit.register(release_table)
 
 
-def _get_table(torch: Any, device: Any, table_rows: int, head_dim: int, residency: str) -> dict:
-    key = f"{residency}:{table_rows}:{head_dim}"
+def _get_table(
+    torch: Any, device: Any, table_rows: int, head_dim: int, residency: str, weight_dtype: str
+) -> dict:
+    key = f"{residency}:{table_rows}:{head_dim}:{weight_dtype}"
+    elem_bytes, dtype_name = _DTYPES[weight_dtype]
+    row_bytes = head_dim * elem_bytes
     if _TABLE.get("key") == key:
         return _TABLE
     release_table()
     host = residency == "host_uva"
     kwargs = dict(device="cpu", pin_memory=True) if host else dict(device=device)
-    table = torch.empty(table_rows, head_dim, dtype=torch.uint8, **kwargs)
+    table = torch.empty(table_rows, row_bytes, dtype=torch.uint8, **kwargs)
     generator = torch.Generator(device=device).manual_seed(0xE9A3)
     for start in range(0, table_rows, _FILL_CHUNK_ROWS):
         end = min(table_rows, start + _FILL_CHUNK_ROWS)
         codes = torch.randint(
-            0, 256, (end - start, head_dim), dtype=torch.uint8, device=device, generator=generator
+            0, 256, (end - start, row_bytes), dtype=torch.uint8, device=device, generator=generator
         )
         table[start:end].copy_(codes)
     torch.cuda.synchronize(device)
-    _TABLE.update(key=key, table=table.view(torch.float8_e4m3fn))
+    _TABLE.update(key=key, table=table.view(getattr(torch, dtype_name)))
     if host:
         from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
@@ -166,8 +179,10 @@ def _pinned_lookup(torch: Any, table: dict, head_dim: int):
 
 
 def check_rows(torch: Any, table: dict, ids: Any, got: Any) -> None:
-    ref = table["table"].view(torch.uint8).index_select(0, ids.reshape(-1).to(table["table"].device))
-    got = got.reshape(-1, ref.shape[1]).view(torch.uint8).to(ref.device)
+    ref = (
+        table["table"].view(torch.uint8).index_select(0, ids.reshape(-1).to(table["table"].device))
+    )
+    got = got.contiguous().view(torch.uint8).reshape(-1, ref.shape[1]).to(ref.device)
     mismatches = int((got != ref).sum().item())
     if mismatches:
         raise KernelLaunchFailed(f"{KIND} rows differ from index_select: {mismatches} bytes")
@@ -177,16 +192,17 @@ def _profile(backend: str, **args: Any) -> ComputeMetrics:
     validate_args(backend, **args)
     num_tokens, num_heads, head_dim = args["num_tokens"], args["num_heads"], args["head_dim"]
     table_rows, residency = args["table_rows"], args["residency"]
+    weight_dtype = str(args["weight_dtype"])
     try:
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{KIND}:{backend} requires torch") from exc
     try:
         device = torch.device("cuda", torch.cuda.current_device())
-        table = _get_table(torch, device, table_rows, head_dim, residency)
+        table = _get_table(torch, device, table_rows, head_dim, residency, weight_dtype)
         pool = build_id_pool(torch, device, num_tokens, num_heads, table_rows)
         out = torch.empty(
-            (num_tokens, num_heads, head_dim), dtype=torch.float8_e4m3fn, device=device
+            (num_tokens, num_heads, head_dim), dtype=table["table"].dtype, device=device
         )
         if backend == "vllm_triton":
             try:
@@ -236,7 +252,7 @@ def _profile(backend: str, **args: Any) -> ComputeMetrics:
         time_ms=float(time_ms),
         tflops=0.0,
         memory_bandwidth_gbps=float(
-            logical_bytes(num_tokens, num_heads, head_dim) / (time_ms / 1000.0) / 1e9
+            logical_bytes(num_tokens, num_heads, head_dim, weight_dtype) / (time_ms / 1000.0) / 1e9
         ),
         energy_j=float(energy_j),
     )

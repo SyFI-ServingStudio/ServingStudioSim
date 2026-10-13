@@ -72,9 +72,11 @@ impl KernelSpec for EmbeddingRowGatherSpec {
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         validate_config(config);
+        // 17 brackets PyTorch's small-index path (`F.embedding` on <= 16
+        // indices costs ~5x the 17-index launch), which 16 -> 32 would smear.
         SweepGrid::new(vec![Axis::values([
-            1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072,
-            4096, 6144, 8192, 12288, 16384, 32768,
+            1, 2, 4, 8, 16, 17, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048,
+            3072, 4096, 6144, 8192, 12288, 16384, 32768,
         ])])
     }
 
@@ -125,8 +127,8 @@ mod tests {
         let cfg = config("host_uva");
         let grid = EmbeddingRowGatherSpec::sweep_grid(&cfg);
         let payloads = EmbeddingRowGatherSpec::enumerate(&cfg, &grid, "vllm_triton");
-        assert_eq!(payloads.len(), 25);
-        let fields = payloads[7].fields();
+        assert_eq!(payloads.len(), 26);
+        let fields = payloads[8].fields();
         let keys: Vec<_> = fields.keys().map(String::as_str).collect();
         assert_eq!(
             keys,
