@@ -31,6 +31,7 @@ use serde::Deserialize;
 use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::glm52_model_cfg::Glm52MtpMode;
+use super::qwen4_exp_vllm_nvfp4_gdn_qsa_moe::{PleTableResidency, Qwen4ExpCacheDtype};
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
 /// carries no `deny_unknown_fields` (the flattened struct must let the arch's
@@ -123,6 +124,16 @@ const fn default_mimo_v2_max_model_len() -> u32 {
 const fn default_qwen35_max_model_len() -> u32 {
     131_072
 }
+
+/// The Qwen3.8-Flash-Next capture's MTP `num_speculative_tokens`.
+const fn default_qwen4_exp_draft_tokens() -> u32 {
+    3
+}
+
+/// [`Qwen4ExpCacheDtype`]'s serde representation.
+const QWEN4_EXP_CACHE_DTYPES: [&str; 2] = Qwen4ExpCacheDtype::CHOICES;
+/// [`PleTableResidency`]'s serde representation.
+const PLE_TABLE_RESIDENCIES: [&str; 2] = PleTableResidency::CHOICES;
 
 /// The captured GLM-5.3-Flash deployment ran `--enable-expert-parallel`.
 const fn default_glm53_flash_enable_expert_parallel() -> bool {
@@ -1117,6 +1128,61 @@ pub enum IterArchSel {
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },
+    /// Qwen4Exp hybrid decoders (`Qwen4ExpForConditionalGeneration`, text
+    /// only; Qwen3.8-Flash-Next) with ModelOpt mixed-precision weights on one
+    /// GPU under the vLLM fork, drafting with the checkpoint's MTP layer:
+    /// Gated DeltaNet and QSA (sparse GQA with a compressed indexer) layers
+    /// joined by hyper-connections, PLE n-gram blocks, NVFP4 routed experts
+    /// with a BF16 shared expert, and an FP8-block MTP layer. Precisions come
+    /// from the checkpoint's `quantization_config`; `fp8` is not read.
+    Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Configured context cap; each request's context is validated
+        /// against it, and it sizes the QSA top-k and block-table rows.
+        #[serde(default = "default_qwen35_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        /// MTP `num_speculative_tokens`: fixes the verify width at
+        /// `draft_tokens + 1`, a profiled kernel shape.
+        #[serde(default = "default_qwen4_exp_draft_tokens")]
+        #[param(default = 3, cache_key)]
+        draft_tokens: u32,
+        /// vLLM `--kv-cache-dtype` of the QSA KV.
+        #[serde(default)]
+        #[param(string, default = "fp8", choices = QWEN4_EXP_CACHE_DTYPES, cache_key)]
+        kv_cache_dtype: Qwen4ExpCacheDtype,
+        /// The QSA indexer's key-cache dtype.
+        #[serde(default)]
+        #[param(string, default = "fp8", choices = QWEN4_EXP_CACHE_DTYPES, cache_key)]
+        indexer_kv_dtype: Qwen4ExpCacheDtype,
+        /// Where the PLE n-gram table lives: pinned host memory over UVA
+        /// (the fork's CPU offload) or HBM.
+        #[serde(default)]
+        #[param(string, default = "host_uva", choices = PLE_TABLE_RESIDENCIES, cache_key)]
+        ple_table_residency: PleTableResidency,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Its layer axis is the
+        /// 48 body MoE layers then the MTP layer.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). The graph
+        /// pieces run on the token count padded up to the next captured size;
+        /// a uniform verify step replays a FULL graph, so its eager breaks run
+        /// padded too. Empty: no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
 }
 
 impl IterArchSel {
@@ -1149,7 +1215,8 @@ impl IterArchSel {
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. }
             | Self::InklingVllmNvfp4RelAttnMoe { model, .. }
             | Self::MimoV2VllmFp8SwaMoe { model, .. }
-            | Self::Qwen35VllmNvfp4GdnDense { model, .. } => model,
+            | Self::Qwen35VllmNvfp4GdnDense { model, .. }
+            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { model, .. } => model,
         }
     }
 
@@ -1173,7 +1240,10 @@ impl IterArchSel {
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. }
             | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. }
             | Self::MimoV2VllmFp8SwaMoe { max_model_len, .. }
-            | Self::Qwen35VllmNvfp4GdnDense { max_model_len, .. } => Ok(*max_model_len),
+            | Self::Qwen35VllmNvfp4GdnDense { max_model_len, .. }
+            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { max_model_len, .. } => {
+                Ok(*max_model_len)
+            }
             Self::DeepseekV41Vllm {
                 model,
                 max_model_len,

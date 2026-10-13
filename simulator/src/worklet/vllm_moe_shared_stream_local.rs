@@ -67,7 +67,7 @@ pub struct VllmMoeSharedStreamLocalWorkletConfig {
     /// The router `GateLinear` (BF16 weight, BF16 logits).
     pub router_backends: Vec<&'static str>,
     /// The shared + routed output add (`CUDAFunctor_add`; eager torch
-    /// elementwise, fan-in 1, two rows in and one out).
+    /// elementwise, fan-in 1 at the output bytes).
     pub add_backends: Vec<&'static str>,
     pub shared: Bf16GatedSharedExpertLocalWorkletConfig,
     /// The routed callable. Its `expert_demand` is the corpus when the
@@ -229,7 +229,9 @@ pub(super) fn resolve_shared(
     Bf16GatedSharedExpertLocalWorklet::resolve_config(cfg)
 }
 
-/// `shared_out + routed_out`: two `[T, hidden]` rows in, one out.
+/// `shared_out + routed_out`, priced as the fan-in-1 byte pass at the add's
+/// output bytes (`glue_map.md` D3: 0.95-1.39 against the real add; the
+/// two-rows-in pass measured 1.6-9.4x).
 pub(super) fn add_config(
     backends: &[&'static str],
     gpu_name: &str,
@@ -237,7 +239,7 @@ pub(super) fn add_config(
     dtype: DType,
 ) -> ElementwiseKernelConfig {
     let row = hidden.get() * dtype.size_bytes();
-    elementwise(backends, gpu_name, 2 * row, row)
+    elementwise(backends, gpu_name, row, row)
 }
 
 /// The aux-stream copy (`{name}.shared`) and the inline copy
@@ -387,7 +389,7 @@ pub(crate) mod tests {
                 r.add.input_bytes_per_token.get(),
                 r.add.output_bytes_per_token.get()
             ),
-            (10240, 5120)
+            (5120, 5120)
         );
     }
 
