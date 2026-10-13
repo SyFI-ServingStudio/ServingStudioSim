@@ -163,12 +163,14 @@ PYTHON_RUNTIME = {
     "lock_timeout_seconds": 30,
     "install_timeout_seconds": 30,
 }
-# TODO(arch): the clean Qwen3.8-27B arch tag does not exist yet. The coordinator sets ARCH_TYPE and any
-# arch-specific fields (cudagraph capture sizes, quantization) when the arch lands; the GPU passes do not read it.
-ARCH_TYPE = "qwen38_27b_TODO"
+# The linears' precisions come from the checkpoint config's quantization_config (ModelOpt MIXED_PRECISION), so
+# the arch takes no precision field. The capture list is the server's (explicit 2048 cap; chunk 4096/8192 steps
+# above it run piecewise-eager), so every chunk size shares it.
+ARCH_TYPE = "qwen35_vllm_nvfp4_gdn_dense"
 ARCH = {
     "type": ARCH_TYPE,
-    "model_config": "model/config/qwen3_6_27b.json",
+    "model_config": "model/config/qwen3_8_27b_nvfp4.json",
+    "cudagraph_capture_sizes": CAPTURE_SIZES,
 }
 WORKER = {
     "type": "chunked_prefill",
