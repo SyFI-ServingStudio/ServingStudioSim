@@ -104,6 +104,30 @@ deployment allows it. A path no case reaches, such as a step above a fused
 kernel's token cap, is unvalidated, and the simulator must price it rather than
 refuse it.
 
+**Set every vLLM capture's server like a real deployment.** Getting these
+wrong cost a full recapture:
+
+- `api_server_count: 4`. One API server queues requests at the frontend under
+  high concurrency and distorts TTFT.
+- `max_cudagraph_capture_size` equals the case's `chunk_size`. vLLM runs any
+  step above the cap with no CUDA graph (`vllm/v1/cudagraph_dispatcher.py`,
+  `num_tokens > max_size` → `CUDAGraphMode.NONE`). That includes prefill and
+  mixed steps, so a 2048 cap makes chunk-4096 steps host-bound.
+- Pass an explicit `cudagraph_capture_sizes`: vLLM's own list up to 2048, then
+  one size every 128 up to the chunk size. Do not let vLLM fill the range up to
+  8192 with its default stride of 16. That gives 531 graphs, about 15 extra
+  minutes of startup per pass, and several GiB less KV pool. Render the same
+  list into the simulator's arch `cudagraph_capture_sizes`, and check it
+  against the list the server logs.
+
+**Run passes concurrently and warm.** Give each Slurm job its own GPU, port
+and scratch, and stagger the starts by about 90 s (`--begin=now+<k*90>s`).
+Never chain passes with `afterany`, because that leaves GPUs idle. A new chunk
+size or capture list brings new GEMM shapes, so its first pass runs on a cold
+autotune cache. Let one pass per new configuration finish its startup before
+the rest start. Discard any pass that logs "No tuned config" or a smaller KV
+pool, and rerun it.
+
 `launcher/alignment_campaign/README.md` owns the pack schema. Reach for the
 single-config path below when there is one workload and no matrix.
 
