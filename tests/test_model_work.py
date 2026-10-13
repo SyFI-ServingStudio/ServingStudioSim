@@ -4510,7 +4510,7 @@ def test_qf_hand_derived_params(qf):
     assert breakdown["embedding"] == breakdown["lm_head"] == QF_TABLE
     assert compute_parameter_counts(QF_CONFIG)["total"] == QF_BODY_PARAMS
     # A draft stage adds the MTP layer's parameters, once for both stages.
-    from model.work.models.glm52 import DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE
+    from model.work.speculative import DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE
 
     draft = Workload(
         0, 0, stages={DRAFT_FIRST_STAGE: Workload(0, 0), DRAFT_RECURRENT_STAGE: Workload(0, 0)}
@@ -4679,8 +4679,12 @@ def test_qf_decode_byte_goldens(qf):
 
 @requires_qf
 def test_qf_mtp_stages_follow_the_draft_geometry(qf):
-    from model.work.models.glm52 import DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE
-    from model.work.speculative import aggregate_workload, proposer_for
+    from model.work.speculative import (
+        DRAFT_FIRST_STAGE,
+        DRAFT_RECURRENT_STAGE,
+        aggregate_workload,
+        proposer_for,
+    )
 
     assert proposer_for({stack.stage for stack in qf.layers if stack.stage}) == "mtp"
     # One 2048-token prefill and two verifies of 4 rows, 3 draft tokens.
