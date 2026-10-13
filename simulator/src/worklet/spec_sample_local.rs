@@ -14,7 +14,7 @@
 //!   Priced together as `rejection_resample`, one elementwise row per request
 //!   reading one logits row.
 //!
-//! Both leaves are elementwise byte placeholders (decision D8), with byte rates
+//! Both leaves are elementwise byte placeholders, with byte rates
 //! from the vocabulary and the logits dtype only. Each is priced as one
 //! same-size streaming pass over the logits row (in = out = row bytes). The
 //! elementwise kernel realizes in/out bytes as a fan-in of round(in/out) that
@@ -22,9 +22,7 @@
 //! priced with its real tiny output becomes a single-CTA latency chain instead
 //! of the many-CTA memory-bound read the real kernels do.
 //!
-//! For scale, in the diverse_100 capture
-//! (`wt-qf-capture/logs/20261013_1_qf_diverse100/phase0`) the sample
-//! phase was 0.93% of kernel time, of which the target lm_head GEMM was ~0.7%
+//! For scale, in the diverse_100 capture the sample phase was 0.93% of kernel time, of which the target lm_head GEMM was ~0.7%
 //! (priced in `spec_head_local`) and these launches ~0.15%: logits stats
 //! ~20 us/iter, resample ~25, rejection ~7, the small rest ~15. The capture is
 //! documentation, not a calibration input. The post-step bookkeeping launches

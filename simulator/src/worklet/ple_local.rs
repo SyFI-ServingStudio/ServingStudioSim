@@ -22,14 +22,9 @@
 //!   decodes), `spec` (verify rows) and `prefill`. Each leaf is zero when its
 //!   rows are absent; a mixed speculative step launches `spec` and `prefill`.
 //!
-//! Composition is a serial `Sum`, including the lookup. Measured on B200
-//! (qf-ple job 6589/6594, isolated lookup beside a layer-0 proxy on the main
-//! stream): from T = 64 the span is lookup + layer 0 (e.g. 268 vs 277 us
-//! summed at T = 64, 1292 vs 1284 at T = 2048), so the prefetch is not hidden.
-//! Known residual: at T <= 16 most of the lookup hides (exposed 2-6 us of an
-//! 8-14 us lookup), so the serial sum over-predicts small verify steps by up
-//! to ~8 us per step. This is the same composition as
-//! `deepseek_v41_engram_prefetch_local`.
+//! Composition is a serial `Sum`: from T = 64 the lookup is not hidden behind
+//! layer 0; at T <= 16 most of it hides, so small verify steps over-predict by
+//! a few us. Same composition as `deepseek_v41_engram_prefetch_local`.
 //!
 //! Rows. The CUDA-graph-captured pieces (`hc_combine`, dequant, `kv_proj`,
 //! `ple_gate`) run at `graph_rows`; the eager-break pieces (n-gram ids, the
@@ -37,8 +32,8 @@
 //! run on the real per-request shapes. The arch chooses both row counts from
 //! its graph mode.
 //!
-//! TODO(glue_map): the prefill branch's `query_start_loc` offset (one tiny
-//! int elementwise launch) is left to the glue attribution.
+//! Not modeled: the prefill branch's `query_start_loc` offset (one tiny int
+//! elementwise launch).
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -338,7 +333,7 @@ impl PleLocalWorklet {
             self.ngram_ids.compile(builder),
             self.lookup.compile(builder),
         ];
-        for op in [&self.combine].into_iter().flatten() {
+        if let Some(op) = &self.combine {
             children.push(op.compile(builder));
         }
         for op in [&self.finalize_copy, &self.dequant_cast, &self.dequant_scale]

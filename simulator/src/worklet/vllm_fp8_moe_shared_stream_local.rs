@@ -12,7 +12,9 @@
 //! `fused_moe/experts/trtllm_fp8_moe.py:469`), which is one strided copy of
 //! `hidden / group` FP32 values per row. That copy is not in the reused
 //! callable, so it is this worklet's `scale_transpose` leaf, at the end of the
-//! routed branch.
+//! routed branch. It launches between the quant and the fused call; the
+//! branch is a serial `Sum`, so the manifest position does not change the
+//! cost.
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
