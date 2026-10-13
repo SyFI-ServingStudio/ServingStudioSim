@@ -11,8 +11,8 @@ below is the one place it is computed.
 
 Serving config: the draft's diverse_100 capture (wt-wt-qwen-3.8-27b logs/20261008_13_qwen38_enwik9_reference:
 vLLM fork 892da082, checkpoint revision 482ca0f3, FP8 KV, FP32 SSM state, prefix caching, language-model-only,
-max_cudagraph_capture_size 2048, gpu_memory_utilization 0.85) with one change by user decision: no
-`--max-num-seqs 8`. Nothing is passed, so vLLM's B200 default applies, 1024
+max_cudagraph_capture_size 2048, gpu_memory_utilization 0.85) with two changes by user decision: no
+`--max-num-seqs 8`, and the CUDA graph ceiling follows the chunk (below). Nothing is passed, so vLLM's B200 default applies, 1024
 (vllm/engine/arg_utils.py:2789-2798, device memory >= 160 GiB). No case offers more than 256 concurrent
 requests, so it never binds. Both passes run req-frontend's warmup (`warmup: true`), and the host's job wrapper
 points every JIT cache (Inductor, Triton, vLLM, FlashInfer, CuTeDSL) at one persistent directory, so no
@@ -21,9 +21,13 @@ compilation lands inside a measured window.
 Limits (TP1, gpu_memory_utilization 0.85, chunk 2048):
 
 - S = 1024 (vLLM default `max_num_seqs`). The simulated chunked-prefill worker has no running-request cap.
-- CUDA graphs, FULL_AND_PIECEWISE: `capture_sizes()` is vLLM 892da082's list for an explicit
-  max_cudagraph_capture_size 2048 (vllm/config/vllm.py:2499-2553): [1, 2, 4], 8..248 step 8, 256..2048 step 16
-  = 147 sizes. A chunk above 2048 does not extend it, so mixed steps above 2048 tokens run piecewise-eager.
+- CUDA graphs, FULL_AND_PIECEWISE, max_cudagraph_capture_size = the variant's chunk. vLLM 892da082 dispatches a
+  step of more tokens than the largest captured size to CUDAGraphMode.NONE (vllm/v1/cudagraph_dispatcher.py:
+  271-279), so a 2048 ceiling under a 4096/8192 chunk would leave every step above 2048 tokens without even its
+  PIECEWISE graphs: host-bound, a deployment nobody would run. `variant(chunk)` therefore sets the ceiling to the
+  chunk, and `capture_sizes(chunk, chunk)` is vLLM's list for it (vllm/config/vllm.py:2499-2553): [1, 2, 4],
+  8..248 step 8, 256..chunk step 16 = 147 / 275 / 531 sizes at chunk 2048 / 4096 / 8192. The rendered arch
+  carries the same list (`cudagraph_capture_sizes`), which the simulated steps pad to.
 - L = 131072 (`--max-model-len`); rendering rejects a trace row with input + output >= L.
 - KV pool. vLLM's hybrid allocator puts the 64 layers ([GDN, GDN, GDN, GQA] x 16) into 4 groups of 16 layers:
   3 GDN (mamba) groups and 1 full-attention group, one block id spanning 16 per-layer tensors. The attention
@@ -60,7 +64,6 @@ HERE = Path(__file__).resolve().parent
 # ---------------------------------------------------------------- Qwen3.8-27B limits
 S = 1024
 L = 131072
-MAX_CUDAGRAPH_CAPTURE_SIZE = 2048
 CHUNK = 2048
 REVISION = "482ca0f3832238542f8f5295dde86b5f22711d80"
 
@@ -78,8 +81,6 @@ def capture_sizes(max_size: int, max_num_tokens: int) -> list[int]:
         sizes.append(max_num_tokens)
     return sorted(set(sizes))
 
-
-CAPTURE_SIZES = capture_sizes(MAX_CUDAGRAPH_CAPTURE_SIZE, CHUNK)
 ATTN_BLOCK_TOKENS = 1568
 PAGE_BYTES = ATTN_BLOCK_TOKENS * 4 * 256 * 2  # = the padded mamba page
 LAYERS_PER_GROUP = 16
@@ -92,7 +93,7 @@ GIB = 1 << 30
 MEASURED_POOL: dict[int, tuple[float, str, str] | None] = {
     2048: (125.52, "6479 (case 01; every warm chunk-2048 pass logs the same pool)",
            "logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload"),
-    4096: (125.34, "6461, 6525", "logs/20261012_1_q38_align_campaign/16_prefill_spectrum_chunk4k_c32/profile_workload"),
+    4096: (123.75, "6566, 6574", "logs/20261012_1_q38_align_campaign/18_quadrant_interference_chunk4k_c48/profile_workload"),
     8192: (124.60, "6534, 6536, 6538", "logs/20261012_1_q38_align_campaign/17_prefill_spectrum_chunk8k_c32/profile_workload"),
 }
 # A pinned pool's block count as logged (`Maximum concurrency for 131,072 tokens per request` x 90 blocks).
@@ -134,8 +135,6 @@ def kv_pinned_bytes(shapes, concurrency: int, ratio: float) -> int:
 SERVER = {
     "tp_size": 1,
     "dp_size": 1,
-    "chunk_size": CHUNK,
-    "max_cudagraph_capture_size": MAX_CUDAGRAPH_CAPTURE_SIZE,
     "enforce_eager": False,
     "enable_server_load_tracking": True,
     "api_server_count": 1,
@@ -164,7 +163,7 @@ PYTHON_RUNTIME = {
     "install_timeout_seconds": 30,
 }
 # TODO(arch): the clean Qwen3.8-27B arch tag does not exist yet. The coordinator sets ARCH_TYPE and any
-# arch-specific fields (cudagraph capture sizes, quantization) when the arch lands; the GPU passes do not read it.
+# arch-specific fields (quantization) when the arch lands; `variant()` adds the capture list.
 ARCH_TYPE = "qwen38_27b_TODO"
 ARCH = {
     "type": ARCH_TYPE,
@@ -187,9 +186,10 @@ WORKER = {
 }
 
 
-def variant(extra_args=()) -> dict:
-    server = dict(SERVER)
-    server["extra_args"] = SERVER["extra_args"] + list(extra_args)
+def variant(chunk: int = CHUNK, extra_args=()) -> dict:
+    """One serving config at token budget `chunk`; the CUDA graph ceiling is the chunk (see the module docstring)."""
+    server = {**SERVER, "chunk_size": chunk, "max_cudagraph_capture_size": chunk,
+              "extra_args": SERVER["extra_args"] + list(extra_args)}
     return {
         "deployment": "unified",
         "gpu": "NVIDIA B200",
@@ -201,8 +201,8 @@ def variant(extra_args=()) -> dict:
         "run_name_prefix": "qwen38_27b_nvfp4_b200_tp1",
         "python_runtime": PYTHON_RUNTIME,
         "server": server,
-        "arch": dict(ARCH),
-        "worker": dict(WORKER),
+        "arch": {**ARCH, "cudagraph_capture_sizes": capture_sizes(chunk, chunk)},
+        "worker": {**WORKER, "max_batch_tokens": chunk},
         "profile_passes": [
             {"kind": "nsys", "name": "profile_nsys", "trace": "kernel", "warmup": True},
             {"kind": "workload_metrics", "name": "profile_workload", "trace": "workload", "warmup": True},
@@ -364,8 +364,8 @@ for index, chunk in ((16, 4096), (17, 8192)):
         coverage=["prefill_scaling", "chunk_boundary", "chunk_size"], max_concurrency=32, capture_seconds=15.0,
         workload_trace=dict(shapes=prefill_spectrum_at(chunk), repeats=16),
         derivation=f"Case 04 at chunk {chunk}: the same c32 and 16 repeats, rungs moved to the new chunk boundary "
-                   f"({chunk - 64}/{chunk}/{chunk + 64}) and to 2/3/3.5 chunks. Steps reach {chunk} tokens, above "
-                   f"the 2048 graph ceiling, so they run piecewise-eager."))
+                   f"({chunk - 64}/{chunk}/{chunk + 64}) and to 2/3/3.5 chunks. Steps reach {chunk} tokens; the "
+                   f"variant's graph ceiling is the chunk, so they replay PIECEWISE graphs."))
 for index, chunk in ((18, 4096), (19, 8192)):
     CASES.append(dict(
         index=index, name=f"quadrant_interference_chunk{chunk // 1024}k_c48", chunk_size=chunk, base=7,
@@ -421,12 +421,19 @@ def kv_calibration(case: dict) -> dict:
     }
 
 
+def variant_name(case: dict) -> str:
+    if "variant" in case:
+        return f"tp1_{case['variant']}"
+    chunk = case.get("chunk_size", CHUNK)
+    return "tp1" if chunk == CHUNK else f"tp1_chunk{chunk // 1024}k"
+
+
 cases = []
 for case in CASES:
     out = {
         "index": case["index"],
         "name": case["name"],
-        "variant": {"kv14": "tp1_kv14", "kv15": "tp1_kv15"}.get(case.get("variant"), "tp1"),
+        "variant": variant_name(case),
         "purpose": case["purpose"],
         "coverage": case["coverage"],
         "max_model_len": L,
@@ -472,8 +479,10 @@ document = {
     },
     "variants": {
         "tp1": variant(),
-        "tp1_kv14": variant(["--kv-cache-memory-bytes", str(KV14)]),
-        "tp1_kv15": variant(["--kv-cache-memory-bytes", str(KV15)]),
+        "tp1_kv14": variant(extra_args=["--kv-cache-memory-bytes", str(KV14)]),
+        "tp1_kv15": variant(extra_args=["--kv-cache-memory-bytes", str(KV15)]),
+        "tp1_chunk4k": variant(4096),
+        "tp1_chunk8k": variant(8192),
     },
     "cases": cases,
 }
