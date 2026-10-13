@@ -1086,8 +1086,8 @@ pub enum IterArchSel {
         /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). Every kernel
         /// but attention runs on the token count padded up to the next
         /// captured size; attention on a uniform-decode step runs at the
-        /// padded request count, and its FA4 config takes the largest size as
-        /// the FULL-graph decode bound. Empty: no padding (eager).
+        /// padded request count from a FULL graph. Empty: no padding, no graphs
+        /// (eager).
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },

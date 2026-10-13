@@ -29,13 +29,17 @@
 //!   a window layer splits its window range like a global layer splits its
 //!   context.
 //!
-//! A decode-only step of at most `full_cudagraph_max_size` requests replays a
-//! FULL CUDA graph (FULL_AND_PIECEWISE): the host-side split choice was made at
-//! capture, over the capture size (`padded_requests`, zero-length padding
-//! requests) and `max_seqlen_k = max_model_len`
-//! (`gpu_model_runner._build_attention_metadata`, `for_cudagraph_capture`).
-//! The device-side per-request split still reads the real context lengths.
-//! Every other step runs eagerly over its real requests and longest context.
+//! With `cuda_graph`, a decode-only step replays a FULL CUDA graph
+//! (FULL_AND_PIECEWISE): the host-side split choice was made at capture, over
+//! the capture size (`padded_requests`, zero-length padding requests) and
+//! `max_seqlen_k = max_model_len` (`gpu_model_runner._build_attention_metadata`,
+//! `for_cudagraph_capture`). The device-side per-request split still reads the
+//! real context lengths. Every other step runs eagerly over its real requests
+//! and longest context. The two differ by up to 60% on a small decode batch
+//! (B200, 1-32 decodes at 576-4160 keys), so the mode is part of the row key;
+//! the capture-size bound is not: a decode past the largest capture size runs
+//! eagerly, but it launches enough CTAs (148 / KV heads requests) that both
+//! split choices give one split.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -106,10 +110,9 @@ pub struct Fa4VarlenAttentionKernelConfig {
     /// The split count's `max_seqlen_k` in a FULL CUDA graph, and the context
     /// axis top.
     pub max_model_len: u32,
-    /// Largest decode-only step that replays a FULL CUDA graph (vLLM
-    /// `max_cudagraph_capture_size` under a mode with full decode graphs); 0
-    /// when no step does.
-    pub full_cudagraph_max_size: u32,
+    /// Decode-only steps replay a FULL CUDA graph (vLLM captures decode graphs:
+    /// FULL_AND_PIECEWISE with capture sizes); false runs every step eagerly.
+    pub cuda_graph: bool,
 }
 
 /// One scheduler step's requests as `(query_len, context_len)`, context
@@ -152,12 +155,9 @@ impl Fa4VarlenAttentionKernelConfig {
         self.num_qo_heads.get() / self.num_kv_heads.get()
     }
 
-    /// Whether `pairs` replays a FULL CUDA graph: decode-only and within the
-    /// largest capture size.
+    /// Whether `pairs` replays a FULL CUDA graph: graphs on and decode-only.
     fn replays_graph(&self, pairs: &[(u32, u32)]) -> bool {
-        self.full_cudagraph_max_size > 0
-            && pairs.len() as u32 <= self.full_cudagraph_max_size
-            && pairs.iter().all(|&(query, _)| query == 1)
+        self.cuda_graph && pairs.iter().all(|&(query, _)| query == 1)
     }
 
     /// A chunk of at most `2 * TILE_M / g` tokens fits one M tile (q_stage 1
@@ -347,11 +347,8 @@ impl Fa4VarlenCall for Fa4VarlenAttentionKernelConfig {
     /// split count does not move with the context.
     fn context_breaks(&self, decodes: u32, prefill: u32) -> Vec<u32> {
         let edge = (SPLIT_MIN_TILES - 1) * TILE_N + 1;
-        let replays = self.full_cudagraph_max_size > 0
-            && prefill == 0
-            && decodes <= self.full_cudagraph_max_size;
         let mut breaks = Vec::new();
-        if replays {
+        if self.cuda_graph && prefill == 0 {
             return breaks;
         }
         if decodes > 0 {
@@ -505,7 +502,7 @@ impl KernelSpec for Fa4VarlenAttentionSpec {
                 .with("q_dtype", config.q_dtype.as_str())
                 .with("kv_dtype", config.kv_dtype.as_str())
                 .with("max_model_len", config.max_model_len)
-                .with("full_cudagraph_max_size", config.full_cudagraph_max_size)
+                .with("cuda_graph", config.cuda_graph)
                 .with("query_context_pairs", serde_json::json!(pairs))
                 .with("padded_requests", 0)
         })
@@ -538,7 +535,7 @@ mod tests {
             q_dtype: DType::Bf16,
             kv_dtype: DType::Bf16,
             max_model_len: 131072,
-            full_cudagraph_max_size: 200,
+            cuda_graph: true,
         }
     }
 
@@ -619,7 +616,7 @@ mod tests {
         let graph = cfg.tiling(&pairs, 16);
         assert_eq!(graph.splits, vec![9; 9]);
         let eager = Fa4VarlenAttentionKernelConfig {
-            full_cudagraph_max_size: 0,
+            cuda_graph: false,
             ..config(false)
         };
         assert_eq!(eager.launched_requests(&pairs, 16), 9);
@@ -637,7 +634,7 @@ mod tests {
         // static cap: one 131072-key decode beside 39 one-token ones (eager,
         // 40 CTAs -> 3 static splits) keeps 3, the short ones 1.
         let cfg = Fa4VarlenAttentionKernelConfig {
-            full_cudagraph_max_size: 0,
+            cuda_graph: false,
             ..config(false)
         };
         let mut pairs = vec![(1, 131072)];
@@ -830,10 +827,7 @@ mod tests {
         assert_eq!(fields.len(), 15);
         assert_eq!(fields.get("window"), Some(&Value::from(128)));
         assert_eq!(fields.get("sinks"), Some(&Value::from(true)));
-        assert_eq!(
-            fields.get("full_cudagraph_max_size"),
-            Some(&Value::from(200))
-        );
+        assert_eq!(fields.get("cuda_graph"), Some(&Value::from(true)));
         assert_eq!(fields.get("padded_requests"), Some(&Value::from(0)));
         assert_eq!(
             fields.get("query_context_pairs"),

@@ -21,7 +21,7 @@ _BASE = dict(
     q_dtype="bf16",
     kv_dtype="bf16",
     max_model_len=8192,
-    full_cudagraph_max_size=0,
+    cuda_graph=False,
 )
 
 
@@ -107,9 +107,7 @@ def test_graph_step_uses_capture_time_shape():
     # Defect caught: a FULL-graph decode step called with the real batch and
     # longest context, which picks a different split count than the replayed
     # graph (fa4_varlen_attention.rs `tiling`).
-    graph = _shape(
-        full_cudagraph_max_size=16, query_context_pairs=((1, 1000),) * 9, padded_requests=16
-    )
+    graph = _shape(cuda_graph=True, query_context_pairs=((1, 1000),) * 9, padded_requests=16)
     assert graph.replays_graph
     assert graph.launched_requests == 16
     assert (graph.max_seqlen_q, graph.max_seqlen_k) == (1, 8192)
@@ -118,10 +116,9 @@ def test_graph_step_uses_capture_time_shape():
 @pytest.mark.parametrize(
     "overrides",
     [
-        # Eager runs: no graph, a batch over the capture limit, a prefill token.
-        dict(full_cudagraph_max_size=0, query_context_pairs=((1, 1000),) * 9),
-        dict(full_cudagraph_max_size=8, query_context_pairs=((1, 1000),) * 9),
-        dict(full_cudagraph_max_size=16, query_context_pairs=((1, 1000),) * 8 + ((2, 900),)),
+        # Eager runs: no graph, a prefill token.
+        dict(cuda_graph=False, query_context_pairs=((1, 1000),) * 9),
+        dict(cuda_graph=True, query_context_pairs=((1, 1000),) * 8 + ((2, 900),)),
     ],
 )
 def test_eager_step_uses_real_shape_and_ignores_padding(overrides):
@@ -147,7 +144,7 @@ def test_padding_rows_are_empty_and_point_at_the_null_page():
     # Defect caught: padding requests that read real pages or carry a query.
     shape = _shape(
         window=8,
-        full_cudagraph_max_size=4,
+        cuda_graph=True,
         query_context_pairs=((1, 40), (1, 3)),
         padded_requests=4,
     )
@@ -170,6 +167,7 @@ def test_padding_rows_are_empty_and_point_at_the_null_page():
         dict(num_kv_heads=3),
         dict(window=-1),
         dict(padded_requests=-1),
+        dict(cuda_graph=1),
     ],
 )
 def test_invalid_shapes_are_rejected(overrides):

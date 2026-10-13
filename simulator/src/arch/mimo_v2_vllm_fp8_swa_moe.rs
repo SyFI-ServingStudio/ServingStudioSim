@@ -264,12 +264,7 @@ pub fn build_configs(
         input_bytes_per_token: input.into(),
         output_bytes_per_token: output.into(),
     };
-    let full_cudagraph_max_size = parallel
-        .cudagraph_capture_sizes
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let cuda_graph = !parallel.cudagraph_capture_sizes.is_empty();
     let attention = |shape: &MimoV2AttnShape,
                      window: u32,
                      page_size: u32|
@@ -286,7 +281,7 @@ pub fn build_configs(
             page_size,
             quant_group_size: model.fp8_block_size,
             max_model_len: parallel.max_model_len,
-            full_cudagraph_max_size,
+            cuda_graph,
             dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
             quant_backends: FP8_QUANT_BACKENDS.to_vec(),
@@ -1133,7 +1128,7 @@ mod tests {
             (configs.attn_swa.num_kv_heads, configs.attn_swa.page_size),
             (2, 16)
         );
-        assert_eq!(configs.attn_swa.full_cudagraph_max_size, 200);
+        assert!(configs.attn_swa.cuda_graph);
         assert_eq!(
             (
                 configs.embed.input_bytes_per_token.get(),

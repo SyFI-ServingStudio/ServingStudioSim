@@ -15,8 +15,8 @@ shuffled across a pool sized to the batch; physical page 0 is the null page
 sliding window point at, as the sliding-window manager leaves them. The page
 table is ``ceil(max_model_len / page_size)`` wide, like vLLM's.
 
-Step shape. A decode-only step of at most ``full_cudagraph_max_size``
-requests replays the FULL CUDA graph captured at ``padded_requests``: FA4's
+Step shape. With ``cuda_graph`` a decode-only step replays the FULL CUDA
+graph captured at ``padded_requests``: FA4's
 host-side split choice was made then, from ``max_seqlen_q = 1``,
 ``max_seqlen_k = max_model_len`` and the padded batch
 (``gpu_model_runner._build_attention_metadata`` with ``for_cudagraph_capture``).
@@ -62,7 +62,7 @@ class _Shape:
     sinks: bool
     page_size: int
     max_model_len: int
-    full_cudagraph_max_size: int
+    cuda_graph: bool
     pairs: tuple[tuple[int, int], ...]
     padded_requests: int
 
@@ -73,8 +73,7 @@ class _Shape:
     @property
     def replays_graph(self) -> bool:
         """A decode-only step the FULL CUDA graph covers (Rust `replays_graph`)."""
-        cap = self.full_cudagraph_max_size
-        return cap > 0 and len(self.pairs) <= cap and all(q == 1 for q, _ in self.pairs)
+        return self.cuda_graph and all(q == 1 for q, _ in self.pairs)
 
     @property
     def launched_requests(self) -> int:
@@ -122,7 +121,7 @@ def _validate_args(
     q_dtype: object,
     kv_dtype: object,
     max_model_len: int,
-    full_cudagraph_max_size: int,
+    cuda_graph: bool,
     query_context_pairs: tuple[tuple[int, int], ...],
     padded_requests: int = 0,
 ) -> _Shape:
@@ -136,13 +135,13 @@ def _validate_args(
         _positive(name, value)
     for name, value in (
         ("window", window),
-        ("full_cudagraph_max_size", full_cudagraph_max_size),
         ("padded_requests", padded_requests),
     ):
         if type(value) is not int or value < 0:
             raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
-    if type(sinks) is not bool:
-        raise TypeError(f"sinks must be a bool, got {sinks!r}")
+    for name, flag in (("sinks", sinks), ("cuda_graph", cuda_graph)):
+        if type(flag) is not bool:
+            raise TypeError(f"{name} must be a bool, got {flag!r}")
     if num_qo_heads % num_kv_heads:
         raise ValueError("num_qo_heads must be a multiple of num_kv_heads")
     for name, dim in (("head_dim_qk", head_dim_qk), ("head_dim_v", head_dim_v)):
@@ -179,7 +178,7 @@ def _validate_args(
         sinks,
         page_size,
         max_model_len,
-        full_cudagraph_max_size,
+        cuda_graph,
         tuple(query_context_pairs),
         padded_requests,
     )

@@ -9,9 +9,9 @@ physical probes and compares.
 
 The layer comes from `--config` (a full KernelConfig JSON: backends, gpu_name
 and the Fa4VarlenAttentionArgs dims); several configs may be given. Probes are
-placed off the grid relative to the config's `max_model_len`,
-`full_cudagraph_max_size` and `--capture-sizes` (the graph sizes a decode step
-pads to) and `--chunk` (the step's prefill token budget):
+placed off the grid relative to the config's `max_model_len` and `cuda_graph`,
+`--capture-sizes` (the graph sizes a decode step pads to; the largest is the
+graph limit) and `--chunk` (the step's prefill token budget):
 
 - `graph_decode_uniform` / `graph_decode_ragged`: decode-only steps within the
   graph limit, padded to the next capture size;
@@ -64,7 +64,7 @@ def _padded(batch: int, capture_sizes: list[int]) -> int:
 def probes_for(cfg: dict, capture_sizes: list[int], chunk: int) -> list[dict]:
     """Physical probes off the config's grid."""
     mml = cfg["max_model_len"]
-    cap = cfg["full_cudagraph_max_size"]
+    cap = max(capture_sizes, default=0) if cfg["cuda_graph"] else 0
     out: list[dict] = []
 
     def add(pairs: list[list[int]], region: str) -> None:

@@ -24,11 +24,11 @@ The whole call is the L1 unit; CUPTI takes the busy union of its launches.
 
 ``query_context_pairs`` is the exact batch: ``(query tokens, context tokens)``
 per request, the context including the query. A mixed batch is one call, so it
-is ONE spec. ``padded_requests`` is the FULL CUDA graph capture size a
-decode-only step replays (``full_cudagraph_max_size`` > 0, every query 1 token,
-at most that many requests): such a step's host-side split choice was frozen at
-capture over the padded batch and ``max_seqlen_k = max_model_len``, and the
-padding requests run as empty queries over empty contexts.
+is ONE spec. With ``cuda_graph`` a decode-only step (every query 1 token)
+replays a FULL CUDA graph captured at ``padded_requests``: its host-side split
+choice was frozen at capture over the padded batch and ``max_seqlen_k =
+max_model_len``, and the padding requests run as empty queries over empty
+contexts.
 """
 
 from __future__ import annotations
@@ -70,9 +70,8 @@ class Fa4VarlenAttentionArgs(KernelArgs):
         unit="tokens",
         doc="Model context limit; sizes the page table and a graph step's split choice.",
     )
-    full_cudagraph_max_size: int = arg(
-        unit="requests",
-        doc=("Largest decode batch replayed as a FULL CUDA graph; 0 runs every step eagerly."),
+    cuda_graph: bool = arg(
+        doc="Decode-only steps replay a FULL CUDA graph; false runs every step eagerly."
     )
     query_context_pairs: tuple[tuple[int, int], ...] = arg(
         doc=(

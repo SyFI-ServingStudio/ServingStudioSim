@@ -67,8 +67,8 @@ pub struct MimoV2AttnLocalWorkletConfig {
     /// FP8 activation quant group (the checkpoint's weight block edge).
     pub quant_group_size: u32,
     pub max_model_len: u32,
-    /// Largest decode-only step that replays a FULL CUDA graph; 0 = none.
-    pub full_cudagraph_max_size: u32,
+    /// Decode-only steps replay a FULL CUDA graph.
+    pub cuda_graph: bool,
     pub dtype: DType,
     pub gpu_name: String,
     pub quant_backends: Vec<&'static str>,
@@ -172,7 +172,7 @@ impl MimoV2AttnLocalWorklet {
                 q_dtype: cfg.dtype,
                 kv_dtype: cfg.dtype,
                 max_model_len: cfg.max_model_len,
-                full_cudagraph_max_size: cfg.full_cudagraph_max_size,
+                cuda_graph: cfg.cuda_graph,
             },
             o_proj: SingleGemmKernelConfig {
                 backends: cfg.o_proj_backends.clone(),
@@ -287,7 +287,7 @@ mod tests {
             page_size,
             quant_group_size: 128,
             max_model_len: 131072,
-            full_cudagraph_max_size: 200,
+            cuda_graph: true,
             dtype: DType::Bf16,
             gpu_name: "NVIDIA B200".into(),
             quant_backends: vec!["vllm_cuda"],
