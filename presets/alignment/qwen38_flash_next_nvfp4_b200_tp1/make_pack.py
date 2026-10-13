@@ -510,6 +510,22 @@ def acceptance(case: dict) -> dict:
     return {"value": value, "status": "provisional", "derived_from": derived_from, "evidence": evidence}
 
 
+# Acceptance by output position, per case, from its workload pass; acceptance_by_position.py derives the file.
+BY_POSITION = json.loads((HERE / "acceptance_by_position.json").read_text())
+
+
+def acceptance_by_position(case: dict) -> dict:
+    measured = BY_POSITION[str(case["index"])]
+    return {
+        "value": measured["buckets"],
+        "status": "measured",
+        "derived_from": "per-verify-round distribution of accepted drafts in this case's workload pass "
+                        "`decode_request_progress`, bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, "
+                        "4096, 8192]; buckets under 50 rounds merged into the previous one (acceptance_by_position.py)",
+        "evidence": measured["evidence"],
+    }
+
+
 def variant_name(case: dict) -> str:
     if "variant" in case:
         return f"tp1_{case['variant']}"
@@ -537,6 +553,7 @@ for case in CASES:
     if "chunk_size" in case:
         out["chunk_size"] = case["chunk_size"]
     out["speculative_acceptance"] = acceptance(case)
+    out["speculative_acceptance_by_output_position"] = acceptance_by_position(case)
     if "kernel_trace" in case:
         out["kernel_trace"] = trace_spec(case, "kernel_trace")
     if "rate" in case:

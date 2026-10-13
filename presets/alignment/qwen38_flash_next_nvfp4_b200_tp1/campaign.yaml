@@ -1250,6 +1250,25 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6637: 13185/19811, 7653/13185,
       4323/7653)'
     evidence: logs/20261013_2_qf_cases/01_micro_throughput_c256/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.3452306733167082
+      - 0.28686097256857856
+      - 0.16552369077306733
+      - 0.2023846633416459
+    - from: 32
+      p:
+      - 0.31465826049577306
+      - 0.2652242441610546
+      - 0.17280412666571143
+      - 0.24731336867746095
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/01_micro_throughput_c256/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_01_micro_throughput_c256_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1311,6 +1330,25 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6638: 7635/11622, 4385/7635,
       2468/4385)'
     evidence: logs/20261013_2_qf_cases/02_graph_boundaries_c128/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.3546397164982281
+      - 0.27903924399527497
+      - 0.16865730410815066
+      - 0.19766373539834625
+    - from: 32
+      p:
+      - 0.3143289606458123
+      - 0.28355196770938446
+      - 0.15943491422805248
+      - 0.24268415741675076
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/02_graph_boundaries_c128/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_02_graph_boundaries_c128_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1364,6 +1402,31 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6639: 7081/9745, 4677/7081,
       3078/4677)'
     evidence: logs/20261013_2_qf_cases/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.30267753201396974
+      - 0.2724097788125728
+      - 0.16938300349243307
+      - 0.25552968568102447
+    - from: 32
+      p:
+      - 0.27700101317122594
+      - 0.25673758865248225
+      - 0.16271529888551164
+      - 0.30354609929078014
+    - from: 128
+      p:
+      - 0.2512936610608021
+      - 0.21636481241914618
+      - 0.16332470892626133
+      - 0.3690168175937904
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/03_balanced_anchor_c32/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_03_balanced_anchor_c32_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1417,6 +1480,25 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6640: 2394/3386, 1503/2394,
       911/1503)'
     evidence: logs/20261013_2_qf_cases/04_prefill_spectrum_c32/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.3006993006993007
+      - 0.2668997668997669
+      - 0.17482517482517482
+      - 0.25757575757575757
+    - from: 32
+      p:
+      - 0.28502994011976046
+      - 0.2592814371257485
+      - 0.17485029940119762
+      - 0.2808383233532934
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/04_prefill_spectrum_c32/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_04_prefill_spectrum_c32_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1470,6 +1552,49 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6641: 61337/75598, 48197/61337,
       38370/48197)'
     evidence: logs/20261013_2_qf_cases/05_decode_spectrum_c64/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.3309222423146474
+      - 0.2640144665461121
+      - 0.161543098251959
+      - 0.2435201928872815
+    - from: 32
+      p:
+      - 0.3095026642984014
+      - 0.2544404973357016
+      - 0.17517761989342806
+      - 0.2608792184724689
+    - from: 128
+      p:
+      - 0.24275336258361505
+      - 0.23261166654678847
+      - 0.15485866359778466
+      - 0.3697763072718118
+    - from: 512
+      p:
+      - 0.2201777961546413
+      - 0.18923575218799532
+      - 0.13817104265729446
+      - 0.45241540900006894
+    - from: 1024
+      p:
+      - 0.16257943045422452
+      - 0.15349493998587904
+      - 0.11998117204048012
+      - 0.5639444575194164
+    - from: 2048
+      p:
+      - 0.11599919093851133
+      - 0.11706108414239483
+      - 0.10431836569579288
+      - 0.662621359223301
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/05_decode_spectrum_c64/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_05_decode_spectrum_c64_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1517,6 +1642,49 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6685: 29566/32948, 26165/29566,
       23346/26165)'
     evidence: logs/20261013_2_qf_cases/06_long_long_c8/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.32196162046908317
+      - 0.2281449893390192
+      - 0.17484008528784648
+      - 0.27505330490405117
+    - from: 32
+      p:
+      - 0.27630582891748673
+      - 0.23164269492808479
+      - 0.17411052233156699
+      - 0.31794095382286147
+    - from: 128
+      p:
+      - 0.20552276559865093
+      - 0.20193929173693087
+      - 0.1431281618887015
+      - 0.4494097807757167
+    - from: 512
+      p:
+      - 0.13152664859981933
+      - 0.12682926829268293
+      - 0.11291779584462511
+      - 0.6287262872628726
+    - from: 1024
+      p:
+      - 0.06221626083367726
+      - 0.070160957490714
+      - 0.06747833264548081
+      - 0.8001444490301279
+    - from: 2048
+      p:
+      - 0.050058103155448286
+      - 0.057924376508447305
+      - 0.04907481898632341
+      - 0.842942701349781
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/06_long_long_c8/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_06_long_long_c8_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1563,6 +1731,49 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6643: 48023/56043, 40162/48023,
       33965/40162)'
     evidence: logs/20261013_2_qf_cases/07_quadrant_interference_c48/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.3089368258859784
+      - 0.2696456086286595
+      - 0.17796610169491525
+      - 0.24345146379044685
+    - from: 32
+      p:
+      - 0.28509719222462204
+      - 0.242170626349892
+      - 0.17116630669546437
+      - 0.3015658747300216
+    - from: 128
+      p:
+      - 0.2622740856695603
+      - 0.21702006546179023
+      - 0.15511598121531237
+      - 0.3655898676533371
+    - from: 512
+      p:
+      - 0.15353432987078794
+      - 0.15264758044084115
+      - 0.11743096022295414
+      - 0.5763871294654168
+    - from: 1024
+      p:
+      - 0.1193559208319356
+      - 0.12183830929218382
+      - 0.10204629319020463
+      - 0.6567594766856759
+    - from: 2048
+      p:
+      - 0.08149893942964884
+      - 0.09747819938722602
+      - 0.08456280933301909
+      - 0.7364600518501061
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/07_quadrant_interference_c48/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_07_quadrant_interference_c48_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1612,6 +1823,49 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6644: 47409/57158, 38465/47409,
       31573/38465)'
     evidence: logs/20261013_2_qf_cases/08_completion_churn_c96/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.316735112936345
+      - 0.2551334702258727
+      - 0.1704312114989733
+      - 0.25770020533880905
+    - from: 32
+      p:
+      - 0.29490806223479493
+      - 0.264026402640264
+      - 0.17256011315417255
+      - 0.2685054219707685
+    - from: 128
+      p:
+      - 0.2523813927679645
+      - 0.21677610283917506
+      - 0.1589753075002312
+      - 0.37186719689262926
+    - from: 512
+      p:
+      - 0.20295592504618634
+      - 0.18747250813759128
+      - 0.13292865311867688
+      - 0.4766429136975455
+    - from: 1024
+      p:
+      - 0.1379208214038898
+      - 0.12360548918945602
+      - 0.10376147694737882
+      - 0.6347122124592753
+    - from: 2048
+      p:
+      - 0.07760330135591403
+      - 0.0857495042606785
+      - 0.08290905193204352
+      - 0.753738142451364
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/08_completion_churn_c96/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_08_completion_churn_c96_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1664,6 +1918,49 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6695: 229456/268416, 191905/229456,
       162293/191905)'
     evidence: logs/20261013_2_qf_cases/09_rate_knee/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.30091364574123197
+      - 0.2581786030061892
+      - 0.17108753315649866
+      - 0.26982021809608014
+    - from: 32
+      p:
+      - 0.2899256729610285
+      - 0.24799116110887906
+      - 0.16407191643230212
+      - 0.2980112494977903
+    - from: 128
+      p:
+      - 0.23562001992031872
+      - 0.20908034528552458
+      - 0.15365620849933598
+      - 0.4016434262948207
+    - from: 512
+      p:
+      - 0.1701531262306855
+      - 0.16313387541408947
+      - 0.12664767067435773
+      - 0.5400653276808673
+    - from: 1024
+      p:
+      - 0.10951733514615908
+      - 0.11595853161114889
+      - 0.09763766145479266
+      - 0.6768864717878994
+    - from: 2048
+      p:
+      - 0.06557108360012676
+      - 0.07561271429976289
+      - 0.07175559173504956
+      - 0.7870606103650608
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/09_rate_knee/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_09_rate_knee_workload_metrics.jsonl
   rate:
     value: 2.7
     status: measured
@@ -1708,6 +2005,49 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6646: 228742/266805, 192561/228742,
       163953/192561)'
     evidence: logs/20261013_2_qf_cases/10_full_saturation_rate/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.31187974314068884
+      - 0.25569176882662
+      - 0.1690017513134851
+      - 0.2634267367192061
+    - from: 32
+      p:
+      - 0.2812579383224102
+      - 0.24259513285576387
+      - 0.17106132195295431
+      - 0.3050856068688716
+    - from: 128
+      p:
+      - 0.22908763178302696
+      - 0.20737356165244913
+      - 0.14994445725304437
+      - 0.41359434931147954
+    - from: 512
+      p:
+      - 0.1707452725250278
+      - 0.16418705969595848
+      - 0.12170930663700408
+      - 0.5433583611420096
+    - from: 1024
+      p:
+      - 0.11175748063734689
+      - 0.11023917567982532
+      - 0.08975058855641611
+      - 0.6882527551264117
+    - from: 2048
+      p:
+      - 0.061124694376528114
+      - 0.06842661732637283
+      - 0.07066234939095575
+      - 0.7997863389061433
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/10_full_saturation_rate/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_10_full_saturation_rate_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 85.6846
     status: measured
@@ -1766,6 +2106,25 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6647: 245/318, 154/245,
       87/154)'
     evidence: logs/20261013_2_qf_cases/11_long_prefill_ladder_c1/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.23157894736842105
+      - 0.28421052631578947
+      - 0.21052631578947367
+      - 0.2736842105263158
+    - from: 32
+      p:
+      - 0.2265625
+      - 0.2890625
+      - 0.2109375
+      - 0.2734375
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/11_long_prefill_ladder_c1/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_11_long_prefill_ladder_c1_workload_metrics.jsonl
   kernel_trace:
     file: traces/11_long_prefill_ladder_c1.nsys.csv
     shapes:
@@ -1853,6 +2212,49 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6648: 7115/8120, 6180/7115,
       5465/6180)'
     evidence: logs/20261013_2_qf_cases/12_ultra_context_decode_c1/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.2698412698412698
+      - 0.2222222222222222
+      - 0.14814814814814814
+      - 0.35978835978835977
+    - from: 32
+      p:
+      - 0.20238095238095238
+      - 0.2123015873015873
+      - 0.14285714285714285
+      - 0.44246031746031744
+    - from: 128
+      p:
+      - 0.20659062103929024
+      - 0.19898605830164764
+      - 0.13624841571609633
+      - 0.45817490494296575
+    - from: 512
+      p:
+      - 0.13875
+      - 0.14
+      - 0.11
+      - 0.61125
+    - from: 1024
+      p:
+      - 0.08356545961002786
+      - 0.06197771587743733
+      - 0.0584958217270195
+      - 0.7959610027855153
+    - from: 2048
+      p:
+      - 0.06541059367223605
+      - 0.056523284749377886
+      - 0.049768929968005686
+      - 0.8282971916103804
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/12_ultra_context_decode_c1/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_12_ultra_context_decode_c1_workload_metrics.jsonl
   kernel_trace:
     file: traces/12_ultra_context_decode_c1.nsys.csv
     shapes:
@@ -1949,6 +2351,61 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6649: 94639/100999, 88815/94639,
       84197/88815)'
     evidence: logs/20261013_2_qf_cases/13_generation_length_matrix_c8/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.3108974358974359
+      - 0.22435897435897437
+      - 0.17307692307692307
+      - 0.2916666666666667
+    - from: 32
+      p:
+      - 0.2720348204570185
+      - 0.25244831338411317
+      - 0.1632208922742111
+      - 0.31229597388465724
+    - from: 128
+      p:
+      - 0.26540418315432446
+      - 0.22696438665912946
+      - 0.14443188241944602
+      - 0.36319954776710006
+    - from: 512
+      p:
+      - 0.20247259155586658
+      - 0.19617448098903661
+      - 0.13529274550968043
+      - 0.4660601819454164
+    - from: 1024
+      p:
+      - 0.1302905665384105
+      - 0.12790234841448853
+      - 0.09221175534032108
+      - 0.6495953297067799
+    - from: 2048
+      p:
+      - 0.0757641291810842
+      - 0.07929642445213379
+      - 0.06999711649365628
+      - 0.7749423298731257
+    - from: 4096
+      p:
+      - 0.033955338023860505
+      - 0.049709391251147136
+      - 0.04022636892015907
+      - 0.8761089018048333
+    - from: 8192
+      p:
+      - 0.02959544383346426
+      - 0.016476826394344068
+      - 0.01704634721131186
+      - 0.9368813825608798
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/13_generation_length_matrix_c8/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_13_generation_length_matrix_c8_workload_metrics.jsonl
   kernel_trace:
     file: traces/13_generation_length_matrix_c8.nsys.csv
     shapes:
@@ -2019,6 +2476,55 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6651: 293614/324913, 261538/293614,
       234113/261538)'
     evidence: logs/20261013_2_qf_cases/14_near_full_long_decode_c64/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.32123960695389264
+      - 0.263416477702192
+      - 0.16288737717309146
+      - 0.25245653817082386
+    - from: 32
+      p:
+      - 0.2969328397673189
+      - 0.24114225277630882
+      - 0.17411422527763087
+      - 0.2878106821787414
+    - from: 128
+      p:
+      - 0.24275322983389425
+      - 0.22038866572576268
+      - 0.1617631093258061
+      - 0.375094995114537
+    - from: 512
+      p:
+      - 0.1789816874371553
+      - 0.1691702976934093
+      - 0.12898016392943112
+      - 0.5228678509400043
+    - from: 1024
+      p:
+      - 0.12712089959411804
+      - 0.1252744693592388
+      - 0.09739503626322443
+      - 0.6502095947834188
+    - from: 2048
+      p:
+      - 0.0556781512325486
+      - 0.06664522782465984
+      - 0.06581354860887789
+      - 0.8118630723339136
+    - from: 4096
+      p:
+      - 0.030180236410251485
+      - 0.04198154425250382
+      - 0.04977866546317013
+      - 0.8780595538740745
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/14_near_full_long_decode_c64/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_14_near_full_long_decode_c64_workload_metrics.jsonl
   kernel_trace:
     file: traces/14_near_full_long_decode_c64.nsys.csv
     shapes:
@@ -2204,6 +2710,61 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6652: 221737/231632, 209730/221737,
       197083/209730)'
     evidence: logs/20261013_2_qf_cases/15_kv_overcommit_mixed_churn_c32/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.37249283667621774
+      - 0.2110792741165234
+      - 0.17191977077363896
+      - 0.24450811843361986
+    - from: 32
+      p:
+      - 0.27472527472527475
+      - 0.23406593406593407
+      - 0.17216117216117216
+      - 0.319047619047619
+    - from: 128
+      p:
+      - 0.2232276026648106
+      - 0.20880978422988963
+      - 0.16048523416525803
+      - 0.40747737894004177
+    - from: 512
+      p:
+      - 0.15294814313509855
+      - 0.1494797394467473
+      - 0.1186870823111412
+      - 0.578885035107013
+    - from: 1024
+      p:
+      - 0.0930048435171386
+      - 0.10013040238450074
+      - 0.08648472429210134
+      - 0.7203800298062594
+    - from: 2048
+      p:
+      - 0.03570558128198879
+      - 0.05008530343650987
+      - 0.04914087253229344
+      - 0.8650682427492079
+    - from: 4096
+      p:
+      - 0.009704892057833234
+      - 0.021826104179045354
+      - 0.033095662507427216
+      - 0.9353733412556942
+    - from: 8192
+      p:
+      - 0.012074340054452907
+      - 0.023517342066842917
+      - 0.03787041786686659
+      - 0.9265379000118376
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/15_kv_overcommit_mixed_churn_c32/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_15_kv_overcommit_mixed_churn_c32_workload_metrics.jsonl
   kernel_trace:
     file: traces/15_kv_overcommit_mixed_churn_c32.nsys.csv
     shapes:
@@ -2328,6 +2889,25 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6623: 2370/3333, 1536/2370,
       946/1536)'
     evidence: logs/20261013_2_qf_cases/16_prefill_spectrum_chunk4k_c32/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.29518072289156627
+      - 0.23313253012048193
+      - 0.1825301204819277
+      - 0.2891566265060241
+    - from: 32
+      p:
+      - 0.28272564255827853
+      - 0.26718469814704127
+      - 0.17154811715481172
+      - 0.2785415421398685
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/16_prefill_spectrum_chunk4k_c32/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_16_prefill_spectrum_chunk4k_c32_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 83.5801
     status: measured
@@ -2384,6 +2964,25 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6624: 2404/3292, 1549/2404,
       963/1549)'
     evidence: logs/20261013_2_qf_cases/17_prefill_spectrum_chunk8k_c32/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.2819436112777445
+      - 0.25674865026994603
+      - 0.1859628074385123
+      - 0.27534493101379726
+    - from: 32
+      p:
+      - 0.2572307692307692
+      - 0.26276923076923075
+      - 0.16984615384615384
+      - 0.31015384615384617
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/17_prefill_spectrum_chunk8k_c32/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_17_prefill_spectrum_chunk8k_c32_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 79.1992
     status: measured
@@ -2432,6 +3031,49 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6653: 48280/57277, 39715/48280,
       32924/39715)'
     evidence: logs/20261013_2_qf_cases/18_quadrant_interference_chunk4k_c48/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.2935126582278481
+      - 0.26819620253164556
+      - 0.1606012658227848
+      - 0.2776898734177215
+    - from: 32
+      p:
+      - 0.2914085645030972
+      - 0.23646646916240238
+      - 0.16805817398330192
+      - 0.3040667923511985
+    - from: 128
+      p:
+      - 0.24610726643598616
+      - 0.2243367935409458
+      - 0.15542099192618225
+      - 0.3741349480968858
+    - from: 512
+      p:
+      - 0.17338067833965962
+      - 0.16701359128198848
+      - 0.13517815599363292
+      - 0.524427574384719
+    - from: 1024
+      p:
+      - 0.13501279275733125
+      - 0.1304861247785869
+      - 0.11014892081611231
+      - 0.6243521616479696
+    - from: 2048
+      p:
+      - 0.10763414411952264
+      - 0.1110959278491391
+      - 0.09579119978136102
+      - 0.6854787282499772
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/18_quadrant_interference_chunk4k_c48/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_18_quadrant_interference_chunk4k_c48_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 83.5801
     status: measured
@@ -2479,6 +3121,49 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6654: 47842/54833, 40642/47842,
       34881/40642)'
     evidence: logs/20261013_2_qf_cases/19_quadrant_interference_chunk8k_c48/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.311284046692607
+      - 0.2614785992217899
+      - 0.15953307392996108
+      - 0.267704280155642
+    - from: 32
+      p:
+      - 0.2976063829787234
+      - 0.2444148936170213
+      - 0.16489361702127658
+      - 0.29308510638297874
+    - from: 128
+      p:
+      - 0.24542704882615585
+      - 0.22454270488261557
+      - 0.155984444764511
+      - 0.37404580152671757
+    - from: 512
+      p:
+      - 0.16470003726245186
+      - 0.16035275121102968
+      - 0.13377220221090547
+      - 0.541175009315613
+    - from: 1024
+      p:
+      - 0.08747459171514685
+      - 0.10114249667063854
+      - 0.08915679540197659
+      - 0.722226116212238
+    - from: 2048
+      p:
+      - 0.05816729185950212
+      - 0.08047936863643007
+      - 0.07326935256004287
+      - 0.7880839869440249
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/19_quadrant_interference_chunk8k_c48/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_19_quadrant_interference_chunk8k_c48_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 79.1992
     status: measured
@@ -2518,6 +3203,49 @@ cases:
     derived_from: 'conditional accepted-token ratios of this case''s workload pass (job 6655: 229565/269730, 191544/229565,
       161232/191544)'
     evidence: logs/20261013_2_qf_cases/20_full_saturation_chunk8k/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.2970180100383821
+      - 0.25922645408916445
+      - 0.18216710953646295
+      - 0.26158842633599055
+    - from: 32
+      p:
+      - 0.2879496855345912
+      - 0.24855345911949686
+      - 0.16251572327044025
+      - 0.3009811320754717
+    - from: 128
+      p:
+      - 0.24608276003696478
+      - 0.21063764246842592
+      - 0.14818769894239656
+      - 0.3950918985522128
+    - from: 512
+      p:
+      - 0.18369401107196778
+      - 0.16347165667749464
+      - 0.12314132772109622
+      - 0.5296930045294413
+    - from: 1024
+      p:
+      - 0.11279668890953627
+      - 0.11838837739673959
+      - 0.10262691105667708
+      - 0.666188022637047
+    - from: 2048
+      p:
+      - 0.06274801316177837
+      - 0.07558184024399577
+      - 0.07842408474261289
+      - 0.7832460618516129
+    status: measured
+    derived_from: per-verify-round distribution of accepted drafts in this case's workload pass `decode_request_progress`,
+      bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096, 8192]; buckets under 50 rounds merged
+      into the previous one (acceptance_by_position.py)
+    evidence: logs/20261013_2_qf_cases/20_full_saturation_chunk8k/profile_workload/vllm/qwen38_flash_next_nvfp4_b200_tp1_20_full_saturation_chunk8k_workload_metrics.jsonl
   attn_gpu_memory_gb:
     value: 79.1992
     status: measured
