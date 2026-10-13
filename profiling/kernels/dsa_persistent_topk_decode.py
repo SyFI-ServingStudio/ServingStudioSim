@@ -28,7 +28,10 @@ class DsaPersistentTopkDecodeArgs(KernelArgs):
     logits_row_stride: int = arg(unit="elements", doc="Physical spacing between logit rows.")
     logits_dtype: DType = arg(doc="Element type of the indexer logits.")
     index_dtype: str = arg(doc="Element type of the selected positions.")
-    context_mode: str = arg(doc="Pattern of valid prefix lengths across requests.")
+    context_mode: str = arg(
+        doc="Pattern of valid prefix lengths across requests; uniform_random also "
+        "draws the scores at random instead of an increasing sequence."
+    )
 
 
 DOC = KernelDoc(
@@ -158,10 +161,12 @@ register(
 )
 
 
-# The same indexer call sites dispatch here for at most 64 rows (SM90+, not
-# SM12x): vLLM model_executor/layers/indexer_topk.py:215-254 and the QSA
-# indexer models/qwen4_exp/nvidia/ops/qsa_indexer.py:471-499. The op picks this
-# backend by row count, as the framework does; it is never a min over backends.
+# The same indexer call sites dispatch here for at most 64 rows: vLLM
+# model_executor/layers/indexer_topk.py:215-254 and the QSA indexer
+# models/qwen4_exp/nvidia/ops/qsa_indexer.py:471-499. The op picks this backend
+# by row count, as the framework does; it is never a min over backends. The
+# kernel is built for SM90 and newer (CMakeLists.txt COOPERATIVE_TOPK_ARCHS,
+# SM12x included); only vLLM's dispatch skips it on the SM12x family.
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,

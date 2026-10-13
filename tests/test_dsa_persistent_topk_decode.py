@@ -501,7 +501,7 @@ def test_native_rejects_unsupported_args_before_import_or_allocation(
         reached_worker_path = True
         raise AssertionError("native worker path must not run")
 
-    monkeypatch.setattr(runner, "_build_native_operands", fail_worker_path)
+    monkeypatch.setattr(runner, "build_native_operands", fail_worker_path)
     monkeypatch.setattr(runner, "_load_native_op", fail_worker_path)
     kwargs = dict(_BASE_SPEC)
     kwargs.update(overrides)
@@ -511,10 +511,10 @@ def test_native_rejects_unsupported_args_before_import_or_allocation(
 
 
 def test_validate_accepts_ordinary_speculative_and_zero_context() -> None:
-    from profiling.runners.attention.dsa_persistent_topk_decode import _validate_args
+    from profiling.runners.attention.dsa_persistent_topk_decode import validate_args
 
-    ordinary = _validate_args(**(_BASE_SPEC | {"batch_size": 1, "context_len": 0, "next_n": 1}))
-    speculative = _validate_args(**_BASE_SPEC)
+    ordinary = validate_args(**(_BASE_SPEC | {"batch_size": 1, "context_len": 0, "next_n": 1}))
+    speculative = validate_args(**_BASE_SPEC)
     assert ordinary[:3] == (1, 0, 1)
     assert speculative[:3] == (16, 8192, 2)
 
@@ -531,10 +531,10 @@ def test_path_choice_follows_compute_capability_not_gpu_name() -> None:
 
 
 def test_large_batches_are_accepted() -> None:
-    from profiling.runners.attention.dsa_persistent_topk_decode import _validate_args
+    from profiling.runners.attention.dsa_persistent_topk_decode import validate_args
 
-    assert _validate_args(**(_BASE_SPEC | {"batch_size": 257}))[0] == 257
-    assert _validate_args(**(_BASE_SPEC | {"batch_size": 4096}))[0] == 4096
+    assert validate_args(**(_BASE_SPEC | {"batch_size": 257}))[0] == 257
+    assert validate_args(**(_BASE_SPEC | {"batch_size": 4096}))[0] == 4096
 
 
 def test_operand_layout_and_rank_two_length_ramp() -> None:
@@ -606,10 +606,10 @@ def test_operand_layout_for_ordinary_and_fully_padded_rows() -> None:
 def test_native_operand_layout_has_exact_workspace_without_composite_intermediates() -> None:
     from profiling.runners.attention.dsa_persistent_topk_decode import (
         WORKSPACE_BYTES,
-        _build_native_operands,
+        build_native_operands,
     )
 
-    operands = _build_native_operands(
+    operands = build_native_operands(
         torch,
         batch_size=3,
         context_len=5,
@@ -776,8 +776,8 @@ def test_both_backends_accept_every_kernel_top_k() -> None:
     # GLM-5.3-Flash kpool: 2048 pools of an 8192-token request, token-wide rows.
     kpool = _BASE_SPEC | {"context_len": 2048, "max_model_len": 8192, "top_k": 512}
     kpool["logits_row_stride"] = 8192
-    assert runner._validate_args(**kpool)[4] == 512
-    assert runner._validate_args(**(kpool | {"top_k": 1024}))[4] == 1024
+    assert runner.validate_args(**kpool)[4] == 512
+    assert runner.validate_args(**(kpool | {"top_k": 1024}))[4] == 1024
     for profile in (
         runner.profile_dsa_persistent_topk_decode_torch,
         runner.profile_dsa_persistent_topk_decode_vllm_cuda,
@@ -820,17 +820,17 @@ def test_overflow_exemption_follows_the_path_each_row_takes() -> None:
 
 
 def test_logical_bytes_accounts_only_valid_prefixes_lengths_and_output() -> None:
-    from profiling.runners.attention.dsa_persistent_topk_decode import _logical_bytes
+    from profiling.runners.attention.dsa_persistent_topk_decode import logical_bytes
 
     # B=3, next_n=2 yields lengths [4, 5] for each request.
-    assert _logical_bytes(batch_size=3, context_len=5, next_n=2, top_k=4) == (
+    assert logical_bytes(batch_size=3, context_len=5, next_n=2, top_k=4) == (
         4 * 3 * (4 + 5) + 4 * 6 + 4 * 6 * 4
     )
-    assert _logical_bytes(batch_size=2, context_len=0, next_n=1, top_k=4) == (4 * 2 + 4 * 2 * 4)
+    assert logical_bytes(batch_size=2, context_len=0, next_n=1, top_k=4) == (4 * 2 + 4 * 2 * 4)
     with pytest.raises(ValueError, match="batch_size must be > 0"):
-        _logical_bytes(batch_size=0, context_len=5, next_n=2, top_k=4)
+        logical_bytes(batch_size=0, context_len=5, next_n=2, top_k=4)
     with pytest.raises(ValueError, match="context_len must be >= next_n - 1"):
-        _logical_bytes(batch_size=1, context_len=0, next_n=2, top_k=4)
+        logical_bytes(batch_size=1, context_len=0, next_n=2, top_k=4)
 
 
 def test_profile_uses_cuda_event_total_and_returns_compute_metrics(monkeypatch) -> None:
@@ -903,11 +903,11 @@ def test_profile_translates_runtime_failure(monkeypatch) -> None:
 
 def test_native_call_forwards_exact_operands_and_metadata() -> None:
     from profiling.runners.attention.dsa_persistent_topk_decode import (
-        _build_native_operands,
-        _native_call,
+        build_native_operands,
+        native_call,
     )
 
-    operands = _build_native_operands(
+    operands = build_native_operands(
         torch,
         batch_size=2,
         context_len=7,
@@ -923,7 +923,7 @@ def test_native_call_forwards_exact_operands_and_metadata() -> None:
         calls.append(args)
         return None
 
-    returned = _native_call(fake_op, operands, top_k=4, max_seq_len=7)
+    returned = native_call(fake_op, operands, top_k=4, max_seq_len=7)
     assert returned is None
     assert calls == [
         (
@@ -939,11 +939,11 @@ def test_native_call_forwards_exact_operands_and_metadata() -> None:
 
 def test_native_semantic_validation_matches_reference_and_preserves_storage() -> None:
     from profiling.runners.attention.dsa_persistent_topk_decode import (
-        _build_native_operands,
-        _validate_native_semantics,
+        build_native_operands,
+        validate_native_semantics,
     )
 
-    operands = _build_native_operands(
+    operands = build_native_operands(
         torch,
         batch_size=2,
         context_len=513,
@@ -965,7 +965,7 @@ def test_native_semantic_validation_matches_reference_and_preserves_storage() ->
         )
         return None
 
-    _validate_native_semantics(
+    validate_native_semantics(
         torch,
         reference_op,
         operands,
@@ -1004,7 +1004,7 @@ def test_native_loader_failures_translate_to_typed_profiler_errors(
 def test_native_profile_times_only_complete_op_and_returns_metrics(monkeypatch, next_n) -> None:
     from profiling.runners.attention import dsa_persistent_topk_decode as runner
 
-    operands = runner._build_native_operands(
+    operands = runner.build_native_operands(
         torch,
         batch_size=1,
         context_len=7,
@@ -1022,8 +1022,8 @@ def test_native_profile_times_only_complete_op_and_returns_metrics(monkeypatch, 
 
     monkeypatch.setattr(runner, "_uses_native_extension", lambda _torch: True)
     monkeypatch.setattr(runner, "_load_native_op", lambda _torch: fake_op)
-    monkeypatch.setattr(runner, "_build_native_operands", lambda *args, **kwargs: operands)
-    monkeypatch.setattr(runner, "_validate_native_semantics", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "build_native_operands", lambda *args, **kwargs: operands)
+    monkeypatch.setattr(runner, "validate_native_semantics", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append(("sync",)))
 
     def fake_cupti(kernel, *, warmup):
@@ -1053,7 +1053,7 @@ def test_native_profile_times_only_complete_op_and_returns_metrics(monkeypatch, 
 def test_native_profile_translates_op_runtime_failure(monkeypatch) -> None:
     from profiling.runners.attention import dsa_persistent_topk_decode as runner
 
-    operands = runner._build_native_operands(
+    operands = runner.build_native_operands(
         torch,
         batch_size=1,
         context_len=3,
@@ -1069,8 +1069,8 @@ def test_native_profile_translates_op_runtime_failure(monkeypatch) -> None:
 
     monkeypatch.setattr(runner, "_uses_native_extension", lambda _torch: True)
     monkeypatch.setattr(runner, "_load_native_op", lambda _torch: fail_op)
-    monkeypatch.setattr(runner, "_build_native_operands", lambda *args, **kwargs: operands)
-    monkeypatch.setattr(runner, "_validate_native_semantics", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "build_native_operands", lambda *args, **kwargs: operands)
+    monkeypatch.setattr(runner, "validate_native_semantics", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(runner.Timer, "cupti", lambda kernel, **kwargs: kernel())
     with pytest.raises(KernelLaunchFailed, match="synthetic pinned op failure"):
