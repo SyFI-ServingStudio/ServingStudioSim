@@ -35,6 +35,10 @@ nvidia/Qwen3.8-27B-NVFP4:
   name: Qwen3.8 27B NVFP4
   family: Qwen
   config: qwen3_8_27b_nvfp4
+nvidia/Qwen3.8-Flash-Next-NVFP4:
+  name: Qwen3.8 Flash Next NVFP4
+  family: Qwen
+  config: qwen3_8_flash_next_nvfp4
 deepseek-ai/DeepSeek-V4-Flash-0731:
   name: DeepSeek V4 Flash 0731
   family: DeepSeek

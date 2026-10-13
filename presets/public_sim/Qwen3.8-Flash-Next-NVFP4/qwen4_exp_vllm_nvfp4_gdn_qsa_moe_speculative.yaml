@@ -1,0 +1,32 @@
+# vLLM nvidia/Qwen3.8-Flash-Next-NVFP4 on one B200, MTP drafting 3 tokens, chunked
+# prefill at 2048 tokens, as the diverse_100 capture's server ran (vLLM fork,
+# --max-model-len 131072, --max-num-batched-tokens 2048, --max-num-seqs 256,
+# --gpu-memory-utilization 0.9, prefix caching on, PLE table on the host).
+# The worker is the alignment pack's (presets/alignment/qwen38_flash_next_nvfp4_b200_tp1,
+# vLLM's KV discipline). attn_gpu_memory_gb is the KV pool, measured from
+# `Available KV cache memory: 79.8 GiB` in the capture's server logs (x 1.073741824).
+# Acceptance comes from the capture's trace.csv (per-request accept_rate).
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative
+        worker:
+          type: speculative
+          max_batch_tokens: 2048
+          batch_policy: mix
+          draft_tokens: 3
+          acceptance_seed: 73
+          kv_admission_policy: bounded-future
+          kv_page_size: 1
+          kv_max_future_tokens: 4
+          kv_initial_new_token_ratio: 0.0
+          kv_minimum_new_token_ratio: 0.0
+          kv_new_token_ratio_decay_steps: 1
+          kv_retract_decode_steps: 1
+          decode_retraction_policy: fcfs
+          attn_gpu_memory_gb: 85.6846
+sweep:
+  replicas: [1, 2]
