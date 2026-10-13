@@ -28,7 +28,9 @@
 //! scores every request over the padded page-table row, `logits_width` columns:
 //! `ceil(max_model_len / kv_block_size) · kv_block_size / compress_ratio`
 //! (32800 at 131072 tokens and 3200-token blocks). Its key count is the mean
-//! complete-group count of the requests. The prefill selection is one call over
+//! complete-group count of the requests. The decode selection is priced at that
+//! mean on the persistent kernel and at the longest request on the cooperative
+//! kernel, which runs all rows in one wave and finishes with its longest row. The prefill selection is one call over
 //! all prefill rows; its rows split at `block_topk` visible groups: a row with
 //! no more candidates than it keeps selects trivially, so the short rows are
 //! priced as one cell at their own mean context and the rest as another
@@ -544,23 +546,27 @@ pub fn plan(
     let (logits_decode, decode_topk) = if input.decode_requests == 0 {
         (None, None)
     } else {
-        let groups: u64 = input
-            .decode_kv_lens
-            .iter()
-            .map(|&kv| u64::from(kv / r.compress_ratio))
-            .sum();
+        let request_groups = input.decode_kv_lens.iter().map(|&kv| kv / r.compress_ratio);
+        let groups: u64 = request_groups.clone().map(u64::from).sum();
         let keys = if real_decodes == 0 {
             0
         } else {
             rounded_mean(groups, u64::from(real_decodes))
         };
-        // The top-k template needs every row of a request non-negative.
-        let context = keys.max(q - 1);
         let backend = topk_backend(
             input.decode_requests * q,
             r.logits_width,
             cooperative_available,
         );
+        // The cooperative kernel runs every row in one wave of CTA clusters
+        // (`cooperative_topk.cu`), so the call lasts as long as its longest row;
+        // the persistent kernel streams rows, so it follows the mean.
+        let selected = match backend {
+            TopkBackend::Cooperative => request_groups.max().unwrap_or(0),
+            TopkBackend::Persistent => keys,
+        };
+        // The top-k template needs every row of a request non-negative.
+        let context = selected.max(q - 1);
         (
             Some((input.decode_requests, keys)),
             Some((
@@ -683,6 +689,27 @@ mod tests {
             plan(&r, &verify(1), false).decode_topk.unwrap().0,
             TopkBackend::Persistent
         );
+    }
+
+    /// One cooperative wave lasts as long as its longest row; the persistent
+    /// kernel and the logits launch follow the mean.
+    #[test]
+    fn cooperative_decode_topk_is_priced_at_the_longest_request() {
+        let r = SparseGqaIndexerOp::resolve_config(&config());
+        let mixed = |requests: u32| SparseGqaIndexerOpInput {
+            num_rows: 4 * requests,
+            decode_requests: requests,
+            decode_kv_lens: (0..requests)
+                .map(|i| if i == 0 { 32768 } else { 4096 })
+                .collect(),
+            prefill_chunks: vec![],
+        };
+        let coop = plan(&r, &mixed(4), true);
+        assert_eq!(coop.decode_topk.unwrap().1.context, 8192);
+        assert_eq!(coop.logits_decode, Some((4, 2816)));
+        let persistent = plan(&r, &mixed(20), true);
+        assert_eq!(persistent.decode_topk.unwrap().0, TopkBackend::Persistent);
+        assert_eq!(persistent.decode_topk.unwrap().1.context, 1382);
     }
 
     #[test]
