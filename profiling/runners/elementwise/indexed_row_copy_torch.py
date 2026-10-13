@@ -39,8 +39,9 @@ def slot_indices(num_rows: int) -> list[int]:
 
 
 def token_indices(num_rows: int) -> list[int]:
-    """Consecutive token rows after one leading row: the sorted, int64 token
-    indices a mixed step selects (``argsort`` of the spec-token mask)."""
+    """Contiguous token rows after one leading row, standing in for the sorted
+    int64 token indices a mixed step selects (``argsort`` of the spec-token
+    mask), which need not be contiguous."""
     return list(range(1, num_rows + 1))
 
 
