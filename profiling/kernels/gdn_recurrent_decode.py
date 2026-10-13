@@ -53,7 +53,7 @@ DOC = KernelDoc(
             "q, k = L2Norm(q, k); q = q·key_head_dim⁻¹ᐟ²; "
             "decay = exp(−exp(A_log)·softplus(a + dt_bias))"
         ),
-        "beta = FP32(BF16(sigmoid(b)))",
+        "beta = sigmoid(b) in FP32",
         "S′ = decay·S + k·(beta·(v − kᵀ(decay·S)))ᵀ; y = qᵀS′",
         "E = batch_size·num_value_heads·key_head_dim·value_head_dim",
         (
@@ -74,13 +74,16 @@ DOC = KernelDoc(
     method=(
         f"{CUPTI_METHOD} "
         "torch counts every launch of its recurrent reference; vllm_triton "
-        "counts only fused_recurrent_gated_delta_rule_packed_decode_kernel. "
+        "counts only fused_recurrent_gated_delta_rule_packed_decode_kernel and "
+        "vllm_triton_sigmoid_gating only fused_sigmoid_gating_delta_rule_update_kernel. "
         "Input packing and the vLLM output check run before timing."
     ),
     caveats=(
-        "torch takes separate Q, K and V tensors; vllm_triton takes packed QKV "
-        "and indexes into a state pool.",
-        "Both backends update the states in place on every timed call.",
+        "torch and vllm_triton_sigmoid_gating take separate Q, K and V tensors; "
+        "vllm_triton takes packed QKV. Both vLLM backends index into a state pool.",
+        "vLLM uses vllm_triton for decode-only steps and vllm_triton_sigmoid_gating "
+        "for the decode requests of a step that also carries a prefill.",
+        "All backends update the states in place on every timed call.",
         "FLOPs and bytes count the operation itself, not the torch backend's intermediates.",
     ),
     reference="profiling.runners.attention.gdn_recurrent_decode_reference",
@@ -130,6 +133,35 @@ register(
                 "QKV and indexed FP32 state."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py",
+        ),
+        subprocess_env="vllm_env",
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_triton_sigmoid_gating",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+        ),
+        runner_ref=RunnerRef(
+            module_name=(
+                "profiling.runners.attention.gdn_recurrent_decode_vllm_triton_sigmoid_gating"
+            ),
+            function_name="profile_gdn_recurrent_decode_vllm_triton_sigmoid_gating",
+        ),
+        table_name=KIND,
+        args_schema=GdnRecurrentDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "vLLM's fused_sigmoid_gating_delta_rule_update Triton call, which "
+                "updates the decode requests of a step that also carries a prefill: "
+                "separate Q/K/V, one-token varlen batch, indexed FP32 state."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py",
         ),
         subprocess_env="vllm_env",
     )

@@ -41,3 +41,33 @@ def load_required_callable(
         message = missing_message or f"{backend} requires {module_name}.{callable_name}"
         raise ProfilerNotImplemented(message)
     return required_callable
+
+
+def conv_state_dim_first() -> bool:
+    """Whether the installed vLLM stores conv state dim-first (``DS``)."""
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+
+    return bool(is_conv_state_dim_first())
+
+
+def conv_state_pool(
+    torch: Any,
+    shape: tuple[int, int, int],
+    *,
+    dtype: Any,
+    device: Any,
+    dim_first: bool = False,
+) -> Any:
+    """Allocate a ``[slots, channels, width - 1]`` conv-state pool in vLLM's layout.
+
+    vLLM stores each slot either dim-first (``DS``: ``[channels, width - 1]``) or
+    state-first (``SD``: ``[width - 1, channels]``, its default) and hands the
+    conv kernels a ``[slots, channels, width - 1]`` view of it, transposed for
+    ``SD``. The kernels' state reads and writes are strided accordingly, which
+    moves their time by 12-25% at decode and long-prefill shapes, so runners
+    pass the layout the installed vLLM selects (``conv_state_dim_first``).
+    """
+    slots, channels, state_len = shape
+    if dim_first:
+        return torch.empty((slots, channels, state_len), dtype=dtype, device=device)
+    return torch.empty((slots, state_len, channels), dtype=dtype, device=device).transpose(-1, -2)
