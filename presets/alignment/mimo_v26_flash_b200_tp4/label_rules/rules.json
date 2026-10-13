@@ -53,6 +53,31 @@
    "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
   },
   {
+   "operation": "prologue.embed_ar_norm_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum",
+   "type": "collective",
+   "role": "unfused all-reduce above the fused cap (NCCL)",
+   "slot_suffixes": [
+    "embed.ar_norm_all_reduce"
+   ],
+   "phase": "forward",
+   "after": "prologue.embed",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "prologue.embed_ar_norm_residual_norm",
+   "name": "rms_norm",
+   "type": "model",
+   "role": "unfused residual add + RMSNorm above the fused cap (Inductor Triton)",
+   "slot_suffixes": [
+    "embed.ar_norm_residual_norm"
+   ],
+   "phase": "forward",
+   "after": "prologue.embed_ar_norm_all_reduce",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
    "operation": "attn.qkv_input_quant",
    "name": "per_token_group_quant_8bit_packed_register_kernel",
    "type": "attention",
@@ -62,6 +87,18 @@
    ],
    "phase": "forward",
    "after": "prologue.embed_ar_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.qkv_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "attention",
+   "role": "FP8 per-token-group activation quant of the QKV input",
+   "slot_suffixes": [
+    "attn.qkv_proj.input_quant"
+   ],
+   "phase": "forward",
+   "after": "prologue.embed_ar_norm_residual_norm",
    "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
   },
   {
@@ -85,7 +122,31 @@
     "attn.qkv_proj.input_quant"
    ],
    "phase": "forward",
+   "after": "ffn.ar_norm_residual_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.qkv_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "attention",
+   "role": "FP8 per-token-group activation quant of the QKV input",
+   "slot_suffixes": [
+    "attn.qkv_proj.input_quant"
+   ],
+   "phase": "forward",
    "after": "moe.ar_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.qkv_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "attention",
+   "role": "FP8 per-token-group activation quant of the QKV input",
+   "slot_suffixes": [
+    "attn.qkv_proj.input_quant"
+   ],
+   "phase": "forward",
+   "after": "moe.ar_norm_residual_norm",
    "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
   },
   {
@@ -115,6 +176,30 @@
   {
    "operation": "attn.rope",
    "name": "triton_poi_fused_1",
+   "type": "attention",
+   "role": "partial rotary + v scale (Inductor Triton)",
+   "slot_suffixes": [
+    "attn.rope"
+   ],
+   "phase": "forward",
+   "after": "attn.qkv_proj",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.rope",
+   "name": "triton_poi_fused_2",
+   "type": "attention",
+   "role": "partial rotary + v scale (Inductor Triton)",
+   "slot_suffixes": [
+    "attn.rope"
+   ],
+   "phase": "forward",
+   "after": "attn.qkv_proj",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.rope",
+   "name": "triton_poi_fused_3",
    "type": "attention",
    "role": "partial rotary + v scale (Inductor Triton)",
    "slot_suffixes": [
@@ -220,6 +305,31 @@
    "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
   },
   {
+   "operation": "attn.ar_norm_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum",
+   "type": "collective",
+   "role": "unfused all-reduce above the fused cap (NCCL)",
+   "slot_suffixes": [
+    "attn.ar_norm_all_reduce"
+   ],
+   "phase": "forward",
+   "after": "attn.o_proj",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.ar_norm_residual_norm",
+   "name": "rms_norm",
+   "type": "model",
+   "role": "unfused residual add + RMSNorm above the fused cap (Inductor Triton)",
+   "slot_suffixes": [
+    "attn.ar_norm_residual_norm"
+   ],
+   "phase": "forward",
+   "after": "attn.ar_norm_all_reduce",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
    "operation": "moe.router",
    "name": "nvjet_sm100_tss",
    "type": "moe",
@@ -229,6 +339,18 @@
    ],
    "phase": "forward",
    "after": "attn.ar_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.router",
+   "name": "nvjet_sm100_tss",
+   "type": "moe",
+   "role": "router GEMM with FP32 output (cuBLAS)",
+   "slot_suffixes": [
+    "moe.router"
+   ],
+   "phase": "forward",
+   "after": "attn.ar_norm_residual_norm",
    "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
   },
   {
@@ -316,6 +438,31 @@
    "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
   },
   {
+   "operation": "moe.ar_norm_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum",
+   "type": "collective",
+   "role": "unfused all-reduce above the fused cap (NCCL)",
+   "slot_suffixes": [
+    "moe.ar_norm_all_reduce"
+   ],
+   "phase": "forward",
+   "after": "moe.routed",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.ar_norm_residual_norm",
+   "name": "rms_norm",
+   "type": "model",
+   "role": "unfused residual add + RMSNorm above the fused cap (Inductor Triton)",
+   "slot_suffixes": [
+    "moe.ar_norm_residual_norm"
+   ],
+   "phase": "forward",
+   "after": "moe.ar_norm_all_reduce",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
    "operation": "moe.ar_norm",
    "name": "oneshotAllreduceFusionKernel",
    "type": "collective",
@@ -342,6 +489,19 @@
    "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
   },
   {
+   "operation": "moe.ar_norm_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum",
+   "type": "collective",
+   "role": "unfused all-reduce above the fused cap (NCCL)",
+   "slot_suffixes": [
+    "moe.ar_norm_all_reduce"
+   ],
+   "phase": "forward",
+   "after_name": "<none>",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
    "operation": "ffn.gate_up_input_quant",
    "name": "per_token_group_quant_8bit_packed_register_kernel",
    "type": "ffn",
@@ -351,6 +511,18 @@
    ],
    "phase": "forward",
    "after": "attn.ar_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.gate_up_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "ffn",
+   "role": "FP8 quant of the dense FFN input",
+   "slot_suffixes": [
+    "ffn.gate_up_input_quant"
+   ],
+   "phase": "forward",
+   "after": "attn.ar_norm_residual_norm",
    "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
   },
   {
@@ -367,7 +539,7 @@
   },
   {
    "operation": "ffn.act_and_mul",
-   "name": "triton_poi_fused_mul_per_token_group_fp8_quant_packed_silu_slice_0",
+   "name": "triton_poi_fused_mul_per_token_group_fp8_quant_packed_silu_slice",
    "type": "ffn",
    "role": "dense SiLU-and-mul (Inductor Triton)",
    "slot_suffixes": [
@@ -437,6 +609,31 @@
    "phase": "forward",
    "after": "ffn.ar_norm",
    "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.ar_norm_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum",
+   "type": "collective",
+   "role": "unfused all-reduce above the fused cap (NCCL)",
+   "slot_suffixes": [
+    "ffn.ar_norm_all_reduce"
+   ],
+   "phase": "forward",
+   "after": "ffn.down",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.ar_norm_residual_norm",
+   "name": "rms_norm",
+   "type": "model",
+   "role": "unfused residual add + RMSNorm above the fused cap (Inductor Triton)",
+   "slot_suffixes": [
+    "ffn.ar_norm_residual_norm"
+   ],
+   "phase": "forward",
+   "after": "ffn.ar_norm_all_reduce",
    "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
   },
   {
