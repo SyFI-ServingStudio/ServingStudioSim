@@ -33,6 +33,6 @@ pub use sparse_gqa::{
     SparseGqaAttentionOpResolved,
 };
 pub use sparse_gqa_indexer::{
-    SparseGqaIndexerOp, SparseGqaIndexerOpConfig, SparseGqaIndexerOpInput,
+    ring_tokens, SparseGqaIndexerOp, SparseGqaIndexerOpConfig, SparseGqaIndexerOpInput,
     SparseGqaIndexerOpResolved,
 };

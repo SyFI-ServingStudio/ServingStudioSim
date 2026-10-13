@@ -8,9 +8,9 @@
 //!
 //! * `act_and_mul` is `SiluAndMul.forward_cuda`, vLLM's `act_and_mul_kernel`
 //!   custom op, priced on the `silu_and_mul` kind at the intermediate width.
-//! * The gate multiply is a strided broadcast `MulFunctor`; it is priced at its
-//!   output bytes on the realization the arch passes (`glue_map.md` D2: the
-//!   strided copy matched it to 0.98-1.05, the plain torch pass did not).
+//! * The gate multiply is a strided broadcast `MulFunctor`, priced at its
+//!   output bytes on the strided-copy realization the arch passes, the launch
+//!   shape of a broadcast multiply.
 //!
 //! Every dimension comes from the config; routing, routed experts, the
 //! shared + routed add and stream placement belong to the consumer.

@@ -59,7 +59,7 @@ pub(super) fn shared_copies_off(num_tokens: u32) -> (bool, bool) {
 }
 
 #[derive(Clone, Debug)]
-pub struct VllmMoeSharedStreamLocalWorkletConfig {
+pub struct VllmNvfp4MoeSharedStreamLocalWorkletConfig {
     pub hidden: Dim,
     pub num_experts: Dim,
     pub activation_dtype: DType,
@@ -70,14 +70,14 @@ pub struct VllmMoeSharedStreamLocalWorkletConfig {
     /// elementwise, fan-in 1 at the output bytes).
     pub add_backends: Vec<&'static str>,
     pub shared: Bf16GatedSharedExpertLocalWorkletConfig,
-    /// The routed callable. Its `expert_demand` is the corpus when the
-    /// deployment supplies one, otherwise a synthetic (uniform) marginal.
+    /// The routed callable. Its `expert_demand` is whatever the arch resolves
+    /// from `routing` (uniform/random, popularity or corpus).
     pub routed: Nvfp4MoeLocalWorkletConfig,
 }
 
 #[derive(Clone, Debug)]
-pub struct VllmMoeSharedStreamLocalWorkletResolved {
-    pub raw_cfg: VllmMoeSharedStreamLocalWorkletConfig,
+pub struct VllmNvfp4MoeSharedStreamLocalWorkletResolved {
+    pub raw_cfg: VllmNvfp4MoeSharedStreamLocalWorkletConfig,
     pub router: SingleGemmKernelConfig,
     pub shared: Bf16GatedSharedExpertLocalWorkletResolved,
     pub routed: Nvfp4MoeLocalWorkletResolved,
@@ -85,25 +85,25 @@ pub struct VllmMoeSharedStreamLocalWorkletResolved {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct VllmMoeSharedStreamLocalWorkletInput {
+pub struct VllmNvfp4MoeSharedStreamLocalWorkletInput {
     /// Rows the block runs at: the padded size under a CUDA graph.
     pub num_tokens: u32,
 }
 
-pub struct VllmMoeSharedStreamLocalWorklet {
+pub struct VllmNvfp4MoeSharedStreamLocalWorklet {
     pub name: String,
     pub router: Op<SingleGemmKernel>,
     pub routed: Nvfp4MoeLocalWorklet,
     pub shared: Bf16GatedSharedExpertLocalWorklet,
     pub shared_serial: Bf16GatedSharedExpertLocalWorklet,
     pub add: Op<ElementwiseKernel>,
-    resolved: VllmMoeSharedStreamLocalWorkletResolved,
+    resolved: VllmNvfp4MoeSharedStreamLocalWorkletResolved,
 }
 
-impl VllmMoeSharedStreamLocalWorklet {
+impl VllmNvfp4MoeSharedStreamLocalWorklet {
     pub fn resolve_config(
-        cfg: &VllmMoeSharedStreamLocalWorkletConfig,
-    ) -> VllmMoeSharedStreamLocalWorkletResolved {
+        cfg: &VllmNvfp4MoeSharedStreamLocalWorkletConfig,
+    ) -> VllmNvfp4MoeSharedStreamLocalWorkletResolved {
         assert_eq!(
             cfg.routed.hidden.get(),
             cfg.hidden.get(),
@@ -119,8 +119,14 @@ impl VllmMoeSharedStreamLocalWorklet {
             (1, 1),
             "a local block holds every expert whole"
         );
-        VllmMoeSharedStreamLocalWorkletResolved {
-            router: router_config(cfg.hidden.clone(), cfg.num_experts.clone(), cfg),
+        VllmNvfp4MoeSharedStreamLocalWorkletResolved {
+            router: router_gemm(
+                &cfg.router_backends,
+                &cfg.gpu_name,
+                cfg.hidden.clone(),
+                cfg.num_experts.clone(),
+                cfg.activation_dtype,
+            ),
             shared: resolve_shared(&cfg.shared, &cfg.hidden),
             routed: Nvfp4MoeLocalWorklet::resolve_config(&cfg.routed),
             add: add_config(
@@ -135,7 +141,7 @@ impl VllmMoeSharedStreamLocalWorklet {
 
     pub fn build(
         name: String,
-        resolved: VllmMoeSharedStreamLocalWorkletResolved,
+        resolved: VllmNvfp4MoeSharedStreamLocalWorkletResolved,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
         let r = resolved.clone();
@@ -163,7 +169,7 @@ impl VllmMoeSharedStreamLocalWorklet {
         let cfg = &self.resolved.raw_cfg;
         compose_block(
             format!(
-                "{} (VllmMoeSharedStreamLocalWorklet) [local (1 GPU); NVFP4 routed, {} experts \
+                "{} (VllmNvfp4MoeSharedStreamLocalWorklet) [local (1 GPU); NVFP4 routed, {} experts \
                  top-{}; BF16 shared on aux stream at <= {} rows]",
                 self.name, cfg.num_experts, cfg.routed.top_k, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
             ),
@@ -175,7 +181,7 @@ impl VllmMoeSharedStreamLocalWorklet {
         )
     }
 
-    pub fn eval(&self, input: &VllmMoeSharedStreamLocalWorkletInput, ev: &mut Evaluator) {
+    pub fn eval(&self, input: &VllmNvfp4MoeSharedStreamLocalWorkletInput, ev: &mut Evaluator) {
         let rows = input.num_tokens;
         let zero = rows == 0;
         push_or_zero(&self.router, SingleGemmKernelInput { m: rows }, zero, ev);
@@ -183,20 +189,6 @@ impl VllmMoeSharedStreamLocalWorklet {
             .eval_or_zero(&Nvfp4MoeLocalWorkletInput { num_tokens: rows }, zero, ev);
         eval_shared_and_add(rows, &self.shared, &self.shared_serial, &self.add, ev);
     }
-}
-
-pub(super) fn router_config(
-    hidden: Dim,
-    num_experts: Dim,
-    cfg: &VllmMoeSharedStreamLocalWorkletConfig,
-) -> SingleGemmKernelConfig {
-    router_gemm(
-        &cfg.router_backends,
-        &cfg.gpu_name,
-        hidden,
-        num_experts,
-        cfg.activation_dtype,
-    )
 }
 
 /// The router `GateLinear`: `[T, hidden] x [hidden, num_experts]`, BF16 out.
@@ -230,8 +222,7 @@ pub(super) fn resolve_shared(
 }
 
 /// `shared_out + routed_out`, priced as the fan-in-1 byte pass at the add's
-/// output bytes (`glue_map.md` D3: 0.95-1.39 against the real add; the
-/// two-rows-in pass measured 1.6-9.4x).
+/// output bytes.
 pub(super) fn add_config(
     backends: &[&'static str],
     gpu_name: &str,
@@ -349,8 +340,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn cfg() -> VllmMoeSharedStreamLocalWorkletConfig {
-        VllmMoeSharedStreamLocalWorkletConfig {
+    fn cfg() -> VllmNvfp4MoeSharedStreamLocalWorkletConfig {
+        VllmNvfp4MoeSharedStreamLocalWorkletConfig {
             hidden: 2560.into(),
             num_experts: 512.into(),
             activation_dtype: DType::Bf16,
@@ -362,12 +353,12 @@ pub(crate) mod tests {
         }
     }
 
-    fn enumerate_worklet() -> VllmMoeSharedStreamLocalWorklet {
+    fn enumerate_worklet() -> VllmNvfp4MoeSharedStreamLocalWorklet {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
-        VllmMoeSharedStreamLocalWorklet::build(
+        VllmNvfp4MoeSharedStreamLocalWorklet::build(
             "model.mlp".into(),
-            VllmMoeSharedStreamLocalWorklet::resolve_config(&cfg()),
+            VllmNvfp4MoeSharedStreamLocalWorklet::resolve_config(&cfg()),
             &bridge,
         )
         .unwrap()
@@ -375,7 +366,7 @@ pub(crate) mod tests {
 
     #[test]
     fn router_routed_and_add_shapes_derive_from_the_config() {
-        let r = VllmMoeSharedStreamLocalWorklet::resolve_config(&cfg());
+        let r = VllmNvfp4MoeSharedStreamLocalWorklet::resolve_config(&cfg());
         assert_eq!((r.router.n.get(), r.router.k.get()), (512, 2560));
         assert_eq!(r.router.dtype, DType::Bf16);
         assert_eq!(r.routed.fused_moe.routing_method, "renormalize_naive");
@@ -468,7 +459,7 @@ pub(crate) mod tests {
         let mut inputs: Vec<SlotInput> = Vec::new();
         let mut ev = Evaluator::with_inputs(&mut metrics, &mut inputs);
         worklet.eval(
-            &VllmMoeSharedStreamLocalWorkletInput { num_tokens: 0 },
+            &VllmNvfp4MoeSharedStreamLocalWorkletInput { num_tokens: 0 },
             &mut ev,
         );
         assert_eq!(ev.filled(), tree.n_slots());
@@ -480,6 +471,6 @@ pub(crate) mod tests {
     fn rejects_a_sharded_routed_callable() {
         let mut bad = cfg();
         bad.routed.ep_size = 2;
-        let _ = VllmMoeSharedStreamLocalWorklet::resolve_config(&bad);
+        let _ = VllmNvfp4MoeSharedStreamLocalWorklet::resolve_config(&bad);
     }
 }

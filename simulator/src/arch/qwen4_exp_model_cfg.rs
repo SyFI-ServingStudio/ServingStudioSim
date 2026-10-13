@@ -12,20 +12,23 @@
 //!   hyper-connection streams.
 //! - QSA: RoPE rotates `head_dim * partial_rotary_factor` channels; the indexer
 //!   keeps one key per `indexer_compress_ratio` tokens and selects
-//!   `indexer_budget` tokens (`indexer_budget / ratio` groups, which the fork
-//!   accepts only at 512 or 2048, `config.py:163-168`).
+//!   `indexer_budget` tokens (`indexer_budget / ratio` groups). The check
+//!   that this is 512 or 2048 mirrors the fork's own config assert
+//!   (`config.py:163-168`), not a modeling limit.
 //! - PLE: `ple_layer_ids` are 1-based. Each holds `(ngram_size - 1) *
 //!   heads_per_ngram` n-gram heads; head `h` of dense PLE layer `d` has the
 //!   `(d * heads + h + 1)`-th prime after `ngram_vocab_size_base - 1` rows,
 //!   and the summed table is padded to `make_ngram_vocab_size_divisible_by`
 //!   (`ngram_embedding.py:614-694`). The short conv's dilation is `ngram_size`
-//!   (`ple_layer.py:92`).
+//!   (`ple_layer.py:92`). The arches price one table, so at most one PLE
+//!   layer is accepted (a second would bring its own, larger table).
 //! - MTP: `mtp_num_hidden_layers` QSA layers. With
 //!   `mtp_use_dedicated_embeddings = false` the drafter reuses the target's
 //!   embedding and lm_head.
 //! - `quantization_config` (ModelOpt `MIXED_PRECISION`): the modeled mix is
 //!   NVFP4 (group 16) body experts, W8A8 FP8 block-128 MTP experts, an FP8
-//!   per-tensor PLE table and BF16 everywhere else. Any other mix is refused.
+//!   per-tensor PLE table (BF16 when the map leaves it out) and BF16
+//!   everywhere else. Any other mix is refused.
 //!
 //! The vision tower is not modeled (`--language-model-only`, which also strips
 //! the multimodal RoPE sections).
@@ -33,6 +36,7 @@
 use std::path::Path;
 
 use anyhow::{bail, ensure, Context, Result};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::timing::bridge::DType;
@@ -44,6 +48,47 @@ pub enum Qwen4ExpMixer {
     Gdn,
     /// Sparse gated GQA with an indexer (`full_attention`).
     Qsa,
+}
+
+/// vLLM `--kv-cache-dtype` / the QSA indexer's `indexer_kv_dtype`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Qwen4ExpCacheDtype {
+    #[default]
+    Fp8,
+    Bf16,
+}
+
+impl Qwen4ExpCacheDtype {
+    pub const CHOICES: [&'static str; 2] = ["fp8", "bf16"];
+
+    pub fn dtype(self) -> DType {
+        match self {
+            Self::Fp8 => DType::Fp8E4m3,
+            Self::Bf16 => DType::Bf16,
+        }
+    }
+}
+
+/// Where the PLE n-gram table lives: pinned host memory read over UVA
+/// (`--engram-config '{"cpu_offload": true}'`, the fork's default) or HBM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PleTableResidency {
+    #[default]
+    HostUva,
+    Device,
+}
+
+impl PleTableResidency {
+    pub const CHOICES: [&'static str; 2] = ["host_uva", "device"];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HostUva => "host_uva",
+            Self::Device => "device",
+        }
+    }
 }
 
 /// The checkpoint's text-model dimensions, read strictly from its config.
@@ -81,7 +126,7 @@ pub struct Qwen4ExpModelCfg {
     pub heads_per_ngram: u32,
     pub ple_embed_dim: u32,
     pub ple_conv_kernel: u32,
-    /// Rows of the first PLE layer's (padded) n-gram table.
+    /// Rows of the PLE layer's (padded) n-gram table.
     pub ple_table_rows: u64,
     pub ple_table_dtype: DType,
     // MoE.
@@ -205,6 +250,11 @@ impl Qwen4ExpModelCfg {
                 _ => bail!("ple_layer_ids entry {id} is not a 1-based decoder layer"),
             })
             .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            ple_layers.len() <= 1,
+            "Qwen4Exp arches price one PLE table; ple_layer_ids lists {} layers",
+            ple_layers.len()
+        );
         let ngram_size = u("ngram_size")?;
         ensure!(
             ngram_size >= 2,
@@ -220,7 +270,6 @@ impl Qwen4ExpModelCfg {
         let ple_table_rows = ngram_table_rows(
             u64::from(u("ngram_vocab_size_base")?),
             ple_heads,
-            0,
             u64::from(u("make_ngram_vocab_size_divisible_by")?),
         );
 
@@ -272,7 +321,7 @@ impl Qwen4ExpModelCfg {
         self.mixers.len() as u32
     }
 
-    pub fn count(&self, mixer: Qwen4ExpMixer) -> u32 {
+    pub fn layer_count(&self, mixer: Qwen4ExpMixer) -> u32 {
         self.mixers.iter().filter(|&&m| m == mixer).count() as u32
     }
 
@@ -293,27 +342,30 @@ impl Qwen4ExpModelCfg {
     }
 }
 
-/// Rows of dense PLE layer `dense_layer`'s n-gram table: the sum of its heads'
-/// prime vocabularies, padded to `divisor` (`_make_vocab_layout`).
-fn ngram_table_rows(base: u64, heads: u32, dense_layer: u32, divisor: u64) -> u64 {
-    let is_prime = |n: u64| n >= 2 && (2..).take_while(|d| d * d <= n).all(|d| !n.is_multiple_of(d));
-    let skip = u64::from(dense_layer * heads);
+/// Rows of the first (dense layer 0) PLE layer's n-gram table: the sum of its
+/// heads' prime vocabularies, padded to `divisor` (`_make_vocab_layout`).
+fn ngram_table_rows(base: u64, heads: u32, divisor: u64) -> u64 {
+    let is_prime = |n: u64| {
+        n >= 2
+            && (2..)
+                .take_while(|d| d * d <= n)
+                .all(|d| !n.is_multiple_of(d))
+    };
     let mut prime = base.saturating_sub(1);
     let mut total = 0;
-    for index in 0..skip + u64::from(heads) {
+    for _ in 0..heads {
         prime += 1;
         while !is_prime(prime) {
             prime += 1;
         }
-        if index >= skip {
-            total += prime;
-        }
+        total += prime;
     }
     total.div_ceil(divisor.max(1)) * divisor.max(1)
 }
 
 /// Check the ModelOpt mix this arch models and return the MTP experts' block
-/// width and the PLE table dtype.
+/// width and the PLE table dtype: FP8 when every PLE table is in the map,
+/// BF16 (unquantized) when none is.
 fn check_quantization(quant: &Value, num_layers: u32, ple_layers: &[u32]) -> Result<(u32, DType)> {
     ensure!(
         quant.get("quant_method").and_then(Value::as_str) == Some("modelopt"),
@@ -333,6 +385,7 @@ fn check_quantization(quant: &Value, num_layers: u32, ple_layers: &[u32]) -> Res
         )
     }
     let mut mtp_block = None;
+    let mut fp8_ple_tables = 0;
     for (module, entry) in layers {
         let body_expert = (0..num_layers)
             .any(|l| module == &format!("model.language_model.layers.{l}.mlp.experts"));
@@ -341,7 +394,7 @@ fn check_quantization(quant: &Value, num_layers: u32, ple_layers: &[u32]) -> Res
         });
         match algo(entry) {
             ("NVFP4", Some(16)) if body_expert => {}
-            ("FP8", None) if ple_table => {}
+            ("FP8", None) if ple_table => fp8_ple_tables += 1,
             ("FP8_PB_WO", Some(block))
                 if module.starts_with("mtp.layers.") && module.ends_with(".mlp.experts") =>
             {
@@ -386,7 +439,15 @@ fn check_quantization(quant: &Value, num_layers: u32, ple_layers: &[u32]) -> Res
         w8a8,
         "Qwen4Exp config: MTP experts must quantize activations per {block}-block"
     );
-    Ok((block, DType::Fp8E4m3))
+    let ple_table_dtype = match fp8_ple_tables {
+        0 => DType::Bf16,
+        n if n == ple_layers.len() => DType::Fp8E4m3,
+        n => bail!(
+            "Qwen4Exp config: {n} of {} PLE tables are FP8; a mixed set is not modeled",
+            ple_layers.len()
+        ),
+    };
+    Ok((block, ple_table_dtype))
 }
 
 #[cfg(test)]
@@ -404,7 +465,7 @@ mod tests {
         let cfg = flash_next();
         assert_eq!((cfg.hidden, cfg.vocab_size), (2560, 248320));
         assert_eq!(cfg.num_layers(), 48);
-        assert_eq!(cfg.count(Qwen4ExpMixer::Gdn), 36);
+        assert_eq!(cfg.layer_count(Qwen4ExpMixer::Gdn), 36);
         let qsa: Vec<usize> = (0..48)
             .filter(|&l| cfg.mixers[l] == Qwen4ExpMixer::Qsa)
             .collect();
@@ -442,12 +503,15 @@ mod tests {
         assert_eq!((cfg.mtp_layers, cfg.mtp_expert_block), (1, 128));
     }
 
-    #[test]
-    fn another_precision_mix_is_refused() {
+    fn flash_next_json() -> Value {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("model/config/qwen3_8_flash_next_nvfp4.json");
-        let mut root: Value =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn another_precision_mix_is_refused() {
+        let mut root = flash_next_json();
         root["quantization_config"]["quantized_layers"]
             ["model.language_model.layers.3.mlp.experts"]["quant_algo"] = "FP8".into();
         assert!(Qwen4ExpModelCfg::from_value(&root).is_err());
@@ -455,6 +519,27 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("model.language_model.layers.3.mlp.experts");
+        assert!(Qwen4ExpModelCfg::from_value(&root).is_err());
+    }
+
+    /// The PLE table dtype follows the quantization map: FP8 when the table
+    /// is listed, BF16 when it is not.
+    #[test]
+    fn an_unlisted_ple_table_is_bf16() {
+        let mut root = flash_next_json();
+        root["quantization_config"]["quantized_layers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model.language_model.layers.1.ple.ple_embedding.ngram_embedding")
+            .unwrap();
+        let cfg = Qwen4ExpModelCfg::from_value(&root).unwrap();
+        assert_eq!(cfg.ple_table_dtype, DType::Bf16);
+    }
+
+    #[test]
+    fn a_second_ple_layer_is_refused() {
+        let mut root = flash_next_json();
+        root["text_config"]["ple_layer_ids"] = serde_json::json!([2, 5]);
         assert!(Qwen4ExpModelCfg::from_value(&root).is_err());
     }
 }

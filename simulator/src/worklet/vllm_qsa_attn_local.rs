@@ -1,7 +1,7 @@
 //! One sparse-GQA (QSA) attention mixer on one GPU, in vLLM's launch
 //! granularity: a gated GQA whose rows attend only the token groups a
-//! weight-free indexer selected (`models/qwen4_exp/nvidia/qsa.py`, BF16
-//! projections, FP8 KV cache and FP8 compressed-key cache).
+//! weight-free indexer selected (`models/qwen4_exp/nvidia/qsa.py`; projection,
+//! KV and index-key dtypes from the config).
 //!
 //! The section starts after the arch's pre-attention norm and ends at the
 //! `o_proj` output.
@@ -24,7 +24,7 @@
 //! mixed step runs both the decode and the prefill selection.
 
 use crate::op::attention::{
-    SparseGqaAttentionOp, SparseGqaAttentionOpConfig, SparseGqaAttentionOpInput,
+    ring_tokens, SparseGqaAttentionOp, SparseGqaAttentionOpConfig, SparseGqaAttentionOpInput,
     SparseGqaAttentionOpResolved, SparseGqaIndexerOp, SparseGqaIndexerOpConfig,
     SparseGqaIndexerOpInput, SparseGqaIndexerOpResolved,
 };
@@ -171,9 +171,7 @@ impl VllmQsaAttnLocalWorklet {
                 head_dim: cfg.indexer_head_dim,
                 compress_ratio: ratio,
                 token_topk: cfg.indexer_token_topk,
-                // The open group plus every speculative row, in whole groups
-                // (`common/qsa_cache.py` `QSAKeyStateCache.get_kv_cache_spec`).
-                ring_size: ratio * (ratio + cfg.num_speculative_tokens).div_ceil(ratio),
+                ring_size: ring_tokens(ratio, cfg.num_speculative_tokens),
                 decode_query_len: cfg.decode_query_len,
                 max_position_embeddings: cfg.max_position_embeddings,
                 max_model_len: cfg.max_model_len,
@@ -321,6 +319,7 @@ pub fn step(
         },
         attention: SparseGqaAttentionOpInput {
             output_rows: input.padded_tokens,
+            append_rows: launch_rows,
             attention_rows: launch_rows,
             prefill_chunks: input.prefill_chunks.clone(),
             decode_kv_lens: input.decode_kv_lens.clone(),
@@ -408,7 +407,7 @@ mod tests {
         assert!(idx.prefill_topk.is_none() && idx.prefill_chunks.is_empty());
         let attn = sparse_gqa::plan(&r.attention, &s.attention);
         assert!(!attn.prefill_config);
-        assert_eq!(attn.append_tokens, 20);
+        assert_eq!(attn.append_rows, 24);
     }
 
     /// Mixed under a piecewise graph: `_run_qsa` at the real rows, both
@@ -428,8 +427,12 @@ mod tests {
         assert_eq!(s.padded_rows, 2048);
         assert_eq!((s.indexer.num_rows, s.indexer.decode_requests), (2016, 120));
         assert_eq!(
-            (s.attention.attention_rows, s.attention.output_rows),
-            (2016, 2048)
+            (
+                s.attention.attention_rows,
+                s.attention.append_rows,
+                s.attention.output_rows
+            ),
+            (2016, 2016, 2048)
         );
         let idx = sparse_gqa_indexer::plan(&r.indexer, &s.indexer, true);
         assert!(idx.logits_decode.is_some() && idx.prefill_topk.is_some());

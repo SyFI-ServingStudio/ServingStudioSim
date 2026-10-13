@@ -25,17 +25,17 @@
 //!
 //! A step of at most the largest capture size replays a CUDA graph: the graph
 //! pieces run on the token count padded to the next captured size. A uniform
-//! verify step (no prefill) replays a FULL graph, so its eager breaks (QSA's
-//! `_run_qsa`, the GDN core, the PLE lookup and conv) run padded too; a step
-//! with a prefill runs them over the real rows. Larger steps run eagerly.
-//! The draft recurrent pass replays the drafter's FULL graph at the padded
-//! request count.
+//! verify step (no prefill, no clipped verify) replays a FULL graph, so
+//! `_run_qsa`, the n-gram ids, the PLE lookup and its finalize copy run at the
+//! padded rows; the GDN verify kernels and the PLE short conv skip padded
+//! requests, so they cost only the real ones. A step with a prefill runs the
+//! eager breaks over the real rows. Larger steps run eagerly. The draft
+//! recurrent pass replays the drafter's FULL graph at the padded request count.
 //!
-//! Not modeled: the post-step bookkeeping launches (decision D8) and host
-//! overhead.
+//! Not modeled: the post-step bookkeeping launches (`_post_update_kernel`,
+//! `postprocess_mamba_fused_kernel`) and host overhead.
 
 use anyhow::Result;
-use serde::Deserialize;
 
 use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::graph_padded_tokens;
@@ -43,7 +43,9 @@ use crate::arch::kv_layout::{
     gqa_kv_bytes_per_token, hybrid_attention_block_tokens, EngineOverhead, KvCacheLayout,
     KvCachePart,
 };
+pub use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use crate::arch::qwen4_exp_model_cfg::{Qwen4ExpMixer, Qwen4ExpModelCfg};
+use crate::op::attention::ring_tokens;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
@@ -90,9 +92,9 @@ use crate::worklet::vllm_fp8_moe_shared_stream_local::{
     VllmFp8MoeSharedStreamLocalWorklet, VllmFp8MoeSharedStreamLocalWorkletConfig,
     VllmFp8MoeSharedStreamLocalWorkletInput, VllmFp8MoeSharedStreamLocalWorkletResolved,
 };
-use crate::worklet::vllm_moe_shared_stream_local::{
-    VllmMoeSharedStreamLocalWorklet, VllmMoeSharedStreamLocalWorkletConfig,
-    VllmMoeSharedStreamLocalWorkletInput, VllmMoeSharedStreamLocalWorkletResolved,
+use crate::worklet::vllm_nvfp4_moe_shared_stream_local::{
+    VllmNvfp4MoeSharedStreamLocalWorklet, VllmNvfp4MoeSharedStreamLocalWorkletConfig,
+    VllmNvfp4MoeSharedStreamLocalWorkletInput, VllmNvfp4MoeSharedStreamLocalWorkletResolved,
 };
 use crate::worklet::vllm_qsa_attn_local::{
     VllmQsaAttnLocalWorklet, VllmQsaAttnLocalWorkletConfig, VllmQsaAttnLocalWorkletInput,
@@ -111,11 +113,12 @@ const DEVICE: &str = "device";
 const GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
 /// The fork's Triton kernels (HC, PLE, QSA, GDN conv / post-conv / norm).
 const VLLM_TRITON_BACKENDS: &[&str] = &["vllm_triton"];
-/// Eager torch launches, measured in the serving fork's venv (glue_map.md).
+/// Eager torch launches, measured in the serving fork's venv.
 const TORCH_BACKENDS: &[&str] = &["torch_vllm"];
 const STRIDED_COPY_BACKENDS: &[&str] = &["torch_strided_copy_vllm"];
 const CAT_BACKENDS: &[&str] = &["torch_cat_vllm"];
-const INDEXED_ROW_COPY_BACKENDS: &[&str] = &["torch_vllm"];
+/// `index_select` / `index_copy_` / state gather-scatter: eager torch too.
+const INDEXED_ROW_COPY_BACKENDS: &[&str] = TORCH_BACKENDS;
 /// Triton launches priced as byte placeholders (sampler, engine prep).
 const TRITON_ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 /// `F.embedding` over the BF16 vocabulary.
@@ -141,47 +144,6 @@ const ROUTING_METHOD: &str = "renormalize_naive";
 const INT32_BYTES: u32 = 4;
 const INT64_BYTES: u32 = 8;
 
-/// vLLM `--kv-cache-dtype` / the QSA indexer's `indexer_kv_dtype`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Qwen4ExpCacheDtype {
-    #[default]
-    Fp8,
-    Bf16,
-}
-
-impl Qwen4ExpCacheDtype {
-    pub const CHOICES: [&'static str; 2] = ["fp8", "bf16"];
-
-    pub fn dtype(self) -> DType {
-        match self {
-            Self::Fp8 => DType::Fp8E4m3,
-            Self::Bf16 => DType::Bf16,
-        }
-    }
-}
-
-/// Where the PLE n-gram table lives: pinned host memory read over UVA
-/// (`--engram-config '{"cpu_offload": true}'`, the fork's default) or HBM.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PleTableResidency {
-    #[default]
-    HostUva,
-    Device,
-}
-
-impl PleTableResidency {
-    pub const CHOICES: [&'static str; 2] = ["host_uva", "device"];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::HostUva => "host_uva",
-            Self::Device => DEVICE,
-        }
-    }
-}
-
 /// Deployment layout: one GPU, MTP drafting.
 #[derive(Clone, Debug)]
 pub struct Qwen4ExpVllmParallel {
@@ -204,16 +166,30 @@ pub struct Qwen4ExpLayerGroup {
     mixer: Qwen4ExpMixer,
     /// `GroupedNorm` where no combine is pending: layer 0 and a PLE layer.
     attn_entry: HcMixEntry,
-    /// The layer starts with a PLE block; `Some(pending combine)`.
-    ple: Option<bool>,
+    ple: PleSlot,
+}
+
+/// Whether a layer starts with a PLE block, and whether a hyper-connection
+/// combine is pending when it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PleSlot {
+    None,
+    /// PLE in layer 0: no combine is pending.
+    First,
+    /// PLE after layer 0: the pending combine runs standalone first.
+    AfterCombine,
 }
 
 pub fn layer_groups(model: &Qwen4ExpModelCfg) -> Vec<Qwen4ExpLayerGroup> {
     let mut groups: Vec<Qwen4ExpLayerGroup> = Vec::new();
     for (layer, &mixer) in model.mixers.iter().enumerate() {
         let layer = layer as u32;
-        let ple = model.ple_layers.contains(&layer).then_some(layer > 0);
-        let attn_entry = if layer == 0 || ple.is_some() {
+        let ple = match (model.ple_layers.contains(&layer), layer) {
+            (false, _) => PleSlot::None,
+            (true, 0) => PleSlot::First,
+            (true, _) => PleSlot::AfterCombine,
+        };
+        let attn_entry = if layer == 0 || ple != PleSlot::None {
             HcMixEntry::GroupedNorm
         } else {
             HcMixEntry::CombineNorm
@@ -230,8 +206,8 @@ pub fn layer_groups(model: &Qwen4ExpModelCfg) -> Vec<Qwen4ExpLayerGroup> {
             Qwen4ExpMixer::Qsa => "qsa",
         };
         let label = match (layer, ple) {
-            (_, Some(_)) => format!("{kind}_ple"),
-            (0, None) => format!("{kind}_first"),
+            (_, PleSlot::First | PleSlot::AfterCombine) => format!("{kind}_ple"),
+            (0, PleSlot::None) => format!("{kind}_first"),
             _ => kind.to_string(),
         };
         groups.push(Qwen4ExpLayerGroup {
@@ -266,11 +242,13 @@ pub struct Qwen4ExpVllmConfigs {
     /// PLE after layer 0 (a combine is pending) and in layer 0.
     pub ple: PleLocalWorkletConfig,
     pub ple_first: PleLocalWorkletConfig,
-    pub moe: VllmMoeSharedStreamLocalWorkletConfig,
+    pub moe: VllmNvfp4MoeSharedStreamLocalWorkletConfig,
     /// `_mtp_hidden_buffer[:T].copy_(multi_hidden)`.
     pub mtp_hidden_copy: ElementwiseKernelConfig,
-    /// The target's lm_head, which the drafter reuses.
+    /// The target's lm_head; the drafter reuses it as `draft_head`, which
+    /// also takes the greedy argmax.
     pub head: SpecHeadLocalWorkletConfig,
+    pub draft_head: SpecHeadLocalWorkletConfig,
     pub sample: SpecSampleLocalWorkletConfig,
     pub mtp_prelude: MtpFcPreludeLocalWorkletConfig,
     pub mtp_moe: VllmFp8MoeSharedStreamLocalWorkletConfig,
@@ -408,6 +386,18 @@ pub fn build_configs(
         },
     };
     let blocks_per_request = parallel.max_model_len.div_ceil(kv_block_size);
+    let head = |greedy_argmax| SpecHeadLocalWorkletConfig {
+        gpu_name: gpu.clone(),
+        hidden: model.hidden.into(),
+        vocab_size: model.vocab_size.into(),
+        activation_dtype: ACTIVATION_DTYPE,
+        lm_head_dtype: ACTIVATION_DTYPE,
+        // `compute_logits` returns BF16 (the capture's `ArgMaxOps<BFloat16>`).
+        logits_dtype: ACTIVATION_DTYPE,
+        greedy_argmax,
+        elementwise_backends: TORCH_BACKENDS.to_vec(),
+        gemm_backends: GEMM_BACKENDS.to_vec(),
+    };
     Ok(Qwen4ExpVllmConfigs {
         groups: layer_groups(model),
         embedding: EmbeddingRowGatherKernelConfig {
@@ -419,7 +409,7 @@ pub fn build_configs(
             residency: DEVICE.to_string(),
             weight_dtype: ACTIVATION_DTYPE,
         },
-        // A strided copy priced at its output bytes (glue_map.md A3).
+        // `hidden.repeat` is a strided copy, priced at its output bytes.
         hidden_repeat: elementwise(STRIDED_COPY_BACKENDS, &gpu, streams * act, streams * act),
         hc_grouped: hc(HcMixEntry::GroupedNorm, true),
         hc_combine: hc(HcMixEntry::CombineNorm, true),
@@ -453,7 +443,7 @@ pub fn build_configs(
         qsa_recurrent: qsa(1),
         ple: ple(true),
         ple_first: ple(false),
-        moe: VllmMoeSharedStreamLocalWorkletConfig {
+        moe: VllmNvfp4MoeSharedStreamLocalWorkletConfig {
             hidden: model.hidden.into(),
             num_experts: model.num_experts.into(),
             activation_dtype: ACTIVATION_DTYPE,
@@ -485,17 +475,8 @@ pub fn build_configs(
             },
         },
         mtp_hidden_copy: elementwise(TORCH_BACKENDS, &gpu, streams * act, streams * act),
-        head: SpecHeadLocalWorkletConfig {
-            gpu_name: gpu.clone(),
-            hidden: model.hidden.into(),
-            vocab_size: model.vocab_size.into(),
-            activation_dtype: ACTIVATION_DTYPE,
-            lm_head_dtype: ACTIVATION_DTYPE,
-            // `compute_logits` returns BF16 (the capture's `ArgMaxOps<BFloat16>`).
-            logits_dtype: ACTIVATION_DTYPE,
-            elementwise_backends: TORCH_BACKENDS.to_vec(),
-            gemm_backends: GEMM_BACKENDS.to_vec(),
-        },
+        head: head(false),
+        draft_head: head(true),
         sample: SpecSampleLocalWorkletConfig {
             gpu_name: gpu.clone(),
             vocab_size: model.vocab_size.into(),
@@ -553,16 +534,15 @@ pub fn build_configs(
 /// take a stride each. A recurrent state keeps `1 + k` blocks (the running
 /// state and one per speculative token); L5 adds align mode's previous-step
 /// block to vLLM's concurrency estimate only, since a running request frees
-/// it the step after it crosses a block. For Flash-Next at FP8: a 3200-token
-/// block and a 43,929,600 B stride.
+/// it the step after it crosses a block.
 fn kv_cache_layout(
     model: &Qwen4ExpModelCfg,
     parallel: &Qwen4ExpVllmParallel,
 ) -> (KvCacheLayout, u32) {
     let act = u64::from(ACTIVATION_DTYPE.size_bytes());
     let k = u64::from(parallel.draft_tokens);
-    let attn_layers = u64::from(model.count(Qwen4ExpMixer::Qsa) + model.mtp_layers);
-    let gdn_layers = u64::from(model.count(Qwen4ExpMixer::Gdn));
+    let attn_layers = u64::from(model.layer_count(Qwen4ExpMixer::Qsa) + model.mtp_layers);
+    let gdn_layers = u64::from(model.layer_count(Qwen4ExpMixer::Gdn));
     let ple_layers = model.ple_layers.len() as u64;
     let ratio = u64::from(model.indexer_compress_ratio);
     let kv_page = gqa_kv_bytes_per_token(
@@ -587,9 +567,12 @@ fn kv_cache_layout(
         hybrid_attention_block_tokens(KERNEL_BLOCK_TOKENS, gdn_state.max(ple_state), kv_page);
     let block = u64::from(block_tokens);
     let stride = attn_layers * (block * kv_page + block.div_ceil(ratio) * index_entry);
-    // The raw-key ring holds the open group plus every speculative row in
-    // whole groups, BF16 (`common/qsa_cache.py` `CircularBufferSpec`).
-    let ring = ratio * (ratio + k).div_ceil(ratio) * u64::from(model.indexer_head_dim) * act;
+    // The raw-key ring, BF16 (`common/qsa_cache.py` `CircularBufferSpec`).
+    let ring = u64::from(ring_tokens(
+        model.indexer_compress_ratio,
+        parallel.draft_tokens,
+    )) * u64::from(model.indexer_head_dim)
+        * act;
     let copies = 1 + parallel.draft_tokens;
     let mut layout = KvCacheLayout::new()
         .with_part(KvCachePart::per_token("qsa_kv", attn_layers * kv_page))
@@ -633,8 +616,9 @@ pub struct Qwen4ExpVllmResolved {
     pub qsa_recurrent: VllmQsaAttnLocalWorkletResolved,
     pub ple: PleLocalWorkletResolved,
     pub ple_first: PleLocalWorkletResolved,
-    pub moe: VllmMoeSharedStreamLocalWorkletResolved,
+    pub moe: VllmNvfp4MoeSharedStreamLocalWorkletResolved,
     pub head: SpecHeadLocalWorkletResolved,
+    pub draft_head: SpecHeadLocalWorkletResolved,
     pub sample: SpecSampleLocalWorkletResolved,
     pub mtp_prelude: MtpFcPreludeLocalWorkletResolved,
     pub mtp_moe: VllmFp8MoeSharedStreamLocalWorkletResolved,
@@ -652,8 +636,9 @@ pub fn resolve_configs(cfgs: &Qwen4ExpVllmConfigs) -> Qwen4ExpVllmResolved {
         qsa_recurrent: VllmQsaAttnLocalWorklet::resolve_config(&cfgs.qsa_recurrent),
         ple: PleLocalWorklet::resolve_config(&cfgs.ple),
         ple_first: PleLocalWorklet::resolve_config(&cfgs.ple_first),
-        moe: VllmMoeSharedStreamLocalWorklet::resolve_config(&cfgs.moe),
+        moe: VllmNvfp4MoeSharedStreamLocalWorklet::resolve_config(&cfgs.moe),
         head: SpecHeadLocalWorklet::resolve_config(&cfgs.head),
+        draft_head: SpecHeadLocalWorklet::resolve_config(&cfgs.draft_head),
         sample: SpecSampleLocalWorklet::resolve_config(&cfgs.sample),
         mtp_prelude: MtpFcPreludeLocalWorklet::resolve_config(&cfgs.mtp_prelude),
         mtp_moe: VllmFp8MoeSharedStreamLocalWorklet::resolve_config(&cfgs.mtp_moe),
@@ -676,10 +661,15 @@ struct Pass {
     full_graph: bool,
     /// `(cached prefix, new tokens)` of each prefill request.
     prefills: Vec<(u32, u32)>,
-    /// Final context of each verify (or recurrent decode) request.
+    /// Final context of each full-width verify (or recurrent decode) request.
     decode_kv_lens: Vec<u32>,
-    /// Query rows of each decode request.
+    /// Query rows of each full-width decode request.
     query_len: u32,
+    /// `(resident prefix, rows)` of each verify the scheduler clipped at
+    /// `max_model_len`. QSA's uniform-decode split makes it a prefill; the GDN
+    /// and PLE conv metadata keep it a spec decode while it carries a draft
+    /// (one row: a non-spec decode).
+    clipped: Vec<(u32, u32)>,
 }
 
 impl Pass {
@@ -688,11 +678,15 @@ impl Pass {
         prefills: Vec<(u32, u32)>,
         decode_kv_lens: Vec<u32>,
         query_len: u32,
+        clipped: Vec<(u32, u32)>,
     ) -> Self {
         let tokens = prefills.iter().map(|&(_, new)| new).sum::<u32>()
-            + query_len * decode_kv_lens.len() as u32;
+            + query_len * decode_kv_lens.len() as u32
+            + clipped.iter().map(|&(_, rows)| rows).sum::<u32>();
         let padded = graph_padded_tokens(sizes, tokens);
+        // A clipped row breaks the uniform verify batch the FULL graph needs.
         let full_graph = prefills.is_empty()
+            && clipped.is_empty()
             && sizes.last().is_some_and(|&largest| padded <= largest)
             && padded.is_multiple_of(query_len);
         Self {
@@ -701,15 +695,35 @@ impl Pass {
             prefills,
             decode_kv_lens,
             query_len,
+            clipped,
         }
     }
 
     fn tokens(&self) -> u32 {
-        self.prefill_tokens() + self.query_len * self.decode_kv_lens.len() as u32
+        self.prefill_tokens()
+            + self.query_len * self.decode_kv_lens.len() as u32
+            + self.clipped.iter().map(|&(_, rows)| rows).sum::<u32>()
     }
 
     fn prefill_tokens(&self) -> u32 {
         self.prefills.iter().map(|&(_, new)| new).sum()
+    }
+
+    /// The step as the GDN and PLE conv metadata class it: `(spec requests,
+    /// spec rows, one-row non-spec decodes)`. A clipped verify that still
+    /// carries a draft is a spec request at its real rows.
+    fn mamba_decodes(&self) -> (u32, u32, u32) {
+        let full = self.decode_kv_lens.len() as u32;
+        let (mut spec, mut spec_rows, mut single) = (full, self.query_len * full, 0);
+        for &(_, rows) in &self.clipped {
+            if rows > 1 {
+                spec += 1;
+                spec_rows += rows;
+            } else {
+                single += 1;
+            }
+        }
+        (spec, spec_rows, single)
     }
 
     /// Rows of an eager break.
@@ -725,8 +739,43 @@ impl Pass {
         VllmQsaAttnLocalWorkletInput {
             padded_tokens: self.padded,
             full_graph: self.full_graph,
-            prefill_chunks: self.prefills.clone(),
+            prefill_chunks: self.prefills.iter().chain(&self.clipped).copied().collect(),
             decode_kv_lens: self.decode_kv_lens.clone(),
+        }
+    }
+
+    fn gdn_input(&self) -> VllmBf16GdnSpecLocalWorkletInput {
+        let (spec_decodes, spec_tokens, single) = self.mamba_decodes();
+        let mut prefill_lengths: Vec<u32> = self.prefills.iter().map(|&(_, new)| new).collect();
+        // Beside spec decodes a one-row decode is a one-token prefill
+        // (`gdn_attn.py`); alone it takes the plain decode path, which the
+        // worklet does not model, so it is priced as that one-token prefill.
+        let non_spec_decodes = if spec_decodes > 0 {
+            single
+        } else {
+            prefill_lengths.extend(std::iter::repeat_n(1, single as usize));
+            0
+        };
+        VllmBf16GdnSpecLocalWorkletInput {
+            padded_tokens: self.padded,
+            prefill_lengths,
+            spec_decodes,
+            spec_tokens,
+            non_spec_decodes,
+        }
+    }
+
+    fn ple_input(&self) -> PleLocalWorkletInput {
+        let (spec_requests, spec_tokens, decode_requests) = self.mamba_decodes();
+        PleLocalWorkletInput {
+            graph_rows: self.padded,
+            eager_rows: self.eager_rows(),
+            decode_requests,
+            spec_requests,
+            spec_query_len: self.query_len,
+            spec_tokens,
+            prefill_requests: self.prefills.len() as u32,
+            prefill_tokens: self.prefill_tokens(),
         }
     }
 }
@@ -744,7 +793,7 @@ struct LayerGroup {
     attn_mix: HcMixLocalWorklet,
     mixer: Mixer,
     mlp_mix: HcMixLocalWorklet,
-    moe: VllmMoeSharedStreamLocalWorklet,
+    moe: VllmNvfp4MoeSharedStreamLocalWorklet,
 }
 
 impl LayerGroup {
@@ -758,13 +807,13 @@ impl LayerGroup {
         Ok(Self {
             label: group.label.clone(),
             layers: group.layers.clone(),
-            ple: group
-                .ple
-                .map(|pending| {
-                    let resolved = if pending { &r.ple } else { &r.ple_first };
-                    PleLocalWorklet::build(format!("{p}.ple"), resolved.clone(), bridge)
-                })
-                .transpose()?,
+            ple: match group.ple {
+                PleSlot::None => None,
+                PleSlot::First => Some(&r.ple_first),
+                PleSlot::AfterCombine => Some(&r.ple),
+            }
+            .map(|resolved| PleLocalWorklet::build(format!("{p}.ple"), resolved.clone(), bridge))
+            .transpose()?,
             attn_mix: HcMixLocalWorklet::build(
                 format!("{p}.attn_hc"),
                 match group.attn_entry {
@@ -786,7 +835,7 @@ impl LayerGroup {
                 )?),
             },
             mlp_mix: HcMixLocalWorklet::build(format!("{p}.mlp_hc"), r.hc_combine.clone(), bridge)?,
-            moe: VllmMoeSharedStreamLocalWorklet::build(format!("{p}.moe"), r.moe.clone(), bridge)?,
+            moe: VllmNvfp4MoeSharedStreamLocalWorklet::build(format!("{p}.moe"), r.moe.clone(), bridge)?,
         })
     }
 
@@ -815,37 +864,17 @@ impl LayerGroup {
         let rows = HcMixLocalWorkletInput {
             num_tokens: pass.padded,
         };
-        let spec_requests = pass.decode_kv_lens.len() as u32;
         if let Some(ple) = &self.ple {
-            ple.eval(
-                &PleLocalWorkletInput {
-                    graph_rows: pass.padded,
-                    eager_rows: pass.eager_rows(),
-                    decode_requests: 0,
-                    spec_requests,
-                    spec_query_len: pass.query_len,
-                    prefill_requests: pass.prefills.len() as u32,
-                    prefill_tokens: pass.prefill_tokens(),
-                },
-                ev,
-            );
+            ple.eval(&pass.ple_input(), ev);
         }
         self.attn_mix.eval(&rows, ev);
         match &self.mixer {
-            Mixer::Gdn(gdn) => gdn.eval(
-                &VllmBf16GdnSpecLocalWorkletInput {
-                    padded_tokens: pass.padded,
-                    prefill_lengths: pass.prefills.iter().map(|&(_, new)| new).collect(),
-                    spec_decodes: spec_requests,
-                    non_spec_decodes: 0,
-                },
-                ev,
-            ),
+            Mixer::Gdn(gdn) => gdn.eval(&pass.gdn_input(), ev),
             Mixer::Qsa(qsa) => qsa.eval(&pass.qsa_input(), ev),
         }
         self.mlp_mix.eval(&rows, ev);
         self.moe.eval(
-            &VllmMoeSharedStreamLocalWorkletInput {
+            &VllmNvfp4MoeSharedStreamLocalWorkletInput {
                 num_tokens: pass.padded,
             },
             ev,
@@ -853,10 +882,9 @@ impl LayerGroup {
     }
 }
 
-/// The 48 target layers plus their head and sampler: the forward pass every
-/// Qwen4Exp vLLM deployment runs, speculating or not. Its own struct so an
-/// ordinary (non-MTP) model can share it by composition.
-pub(crate) struct Qwen4ExpTargetForward {
+/// The target forward pass: every decoder layer, the final mixer, the MTP
+/// hidden copy, the head and the rejection sampler.
+struct Qwen4ExpTargetForward {
     embedding: Op<EmbeddingRowGatherKernel>,
     hidden_repeat: Op<ElementwiseKernel>,
     groups: Vec<LayerGroup>,
@@ -957,7 +985,6 @@ impl Qwen4ExpTargetForward {
         self.head.eval(
             &SpecHeadLocalWorkletInput {
                 rows: batch.logits_rows,
-                greedy_argmax: false,
             },
             ev,
         );
@@ -1016,7 +1043,7 @@ impl MtpPass {
                 r.final_mixer.clone(),
                 bridge,
             )?,
-            head: SpecHeadLocalWorklet::build(format!("{p}.head"), r.head.clone(), bridge)?,
+            head: SpecHeadLocalWorklet::build(format!("{p}.head"), r.draft_head.clone(), bridge)?,
         })
     }
 
@@ -1045,19 +1072,14 @@ impl MtpPass {
             ev,
         );
         self.final_mixer.eval(&mix, ev);
-        self.head.eval(
-            &SpecHeadLocalWorkletInput {
-                rows: endpoints,
-                greedy_argmax: true,
-            },
-            ev,
-        );
+        self.head
+            .eval(&SpecHeadLocalWorkletInput { rows: endpoints }, ev);
     }
 }
 
 /// The MTP proposer: one pass over the target's whole scheduled batch, then
 /// one pass per further drafted position over the request endpoints, compiled
-/// once and folded `draft_tokens - 1` times (the capture's `REPEAT x2`).
+/// once and folded `draft_tokens - 1` times.
 struct MtpDraftStage {
     step_0: MtpPass,
     recurrent: Option<MtpPass>,
@@ -1234,12 +1256,6 @@ impl SpeculativeUnifiedModel for Qwen4ExpVllmSpeculativeModel {
         self.normalize(batch).map(|_| ())
     }
 
-    /// vLLM's MTP drafter reads target hidden states, so its prefix lookup
-    /// prunes the last matching block (`use_eagle_block_drop`).
-    fn prunes_last_prefix_block(&self) -> bool {
-        true
-    }
-
     fn kv_cache_layout(&self) -> KvCacheLayout {
         self.kv_cache_layout.clone()
     }
@@ -1292,7 +1308,7 @@ struct NormalizedBatch {
     /// Rows the target head scores: one per prefill request and every verify row.
     logits_rows: u32,
     /// The recurrent passes' shape: one row per request at its context
-    /// advanced by the mean drafted position of the folded passes.
+    /// advanced by the mean advance of the folded passes, rounded up.
     recurrent: Pass,
 }
 
@@ -1343,15 +1359,16 @@ fn normalize_speculative_input(
         ));
     }
     let mut decode_kv_lens = Vec::with_capacity(group.decode_requests.len());
-    let mut target_prefills = group.prefill_chunk_pairs.clone();
+    let mut clipped_verifies = Vec::new();
     let mut decode_tokens = 0_u32;
     for (request, decode) in group.decode_requests.iter().enumerate() {
         // A full verify window runs the uniform-width decode kernels;
         // acceptance truncates the output after this compute, not the compute.
         // Only a request at max_model_len verifies fewer rows. That ragged row
-        // leaves the uniform-decode graph and kernels, so it is priced on the
-        // varlen prefill path as `(resident, rows)`, a profiled shape. Such
-        // steps are rare (the last verifies of a request ending within
+        // leaves the uniform-decode graph; QSA prices it on its varlen prefill
+        // path as `(resident, rows)`, the GDN and PLE conv layers as the spec
+        // (or one-row decode) request vLLM classes it as ([`Pass::clipped`]).
+        // Such steps are rare (the last verifies of a request ending within
         // `draft_tokens` of the limit).
         let clipped = decode
             .check_verify_row(draft_tokens, max_model_len)
@@ -1361,7 +1378,7 @@ fn normalize_speculative_input(
             .ok_or("decode token sum overflows u32")?;
         endpoints.push(decode.kv_len);
         if clipped {
-            target_prefills.push((decode.kv_len - decode.query_len, decode.query_len));
+            clipped_verifies.push((decode.kv_len - decode.query_len, decode.query_len));
         } else {
             decode_kv_lens.push(decode.kv_len);
         }
@@ -1386,7 +1403,7 @@ fn normalize_speculative_input(
     }
     let request_count = group.request_count();
     // Recurrent pass i runs after i drafted positions; the fold bills one
-    // evaluation at the mean advance of passes 1..=draft_tokens-1.
+    // evaluation at the mean advance of passes 1..=draft_tokens-1, rounded up.
     let mean_advance = draft_tokens.div_ceil(2);
     let recurrent_contexts = endpoints
         .iter()
@@ -1395,13 +1412,20 @@ fn normalize_speculative_input(
     Ok(NormalizedBatch {
         target: Pass::new(
             sorted_capture_sizes,
-            target_prefills,
+            group.prefill_chunk_pairs.clone(),
             decode_kv_lens,
             verify_width,
+            clipped_verifies,
         ),
         request_count,
         logits_rows: group.prefill_chunk_pairs.len() as u32 + decode_tokens,
-        recurrent: Pass::new(sorted_capture_sizes, Vec::new(), recurrent_contexts, 1),
+        recurrent: Pass::new(
+            sorted_capture_sizes,
+            Vec::new(),
+            recurrent_contexts,
+            1,
+            Vec::new(),
+        ),
     })
 }
 
@@ -1493,7 +1517,7 @@ mod tests {
     #[test]
     fn layers_fold_one_one_thirty_four_twelve() {
         let groups = layer_groups(&model_cfg());
-        let summary: Vec<(String, usize, HcMixEntry, Option<bool>)> = groups
+        let summary: Vec<(String, usize, HcMixEntry, PleSlot)> = groups
             .into_iter()
             .map(|g| (g.label, g.layers.len(), g.attn_entry, g.ple))
             .collect();
@@ -1501,10 +1525,10 @@ mod tests {
         assert_eq!(
             summary,
             [
-                ("gdn_first".to_string(), 1, GroupedNorm, None),
-                ("gdn_ple".to_string(), 1, GroupedNorm, Some(true)),
-                ("gdn".to_string(), 34, CombineNorm, None),
-                ("qsa".to_string(), 12, CombineNorm, None),
+                ("gdn_first".to_string(), 1, GroupedNorm, PleSlot::None),
+                ("gdn_ple".to_string(), 1, GroupedNorm, PleSlot::AfterCombine),
+                ("gdn".to_string(), 34, CombineNorm, PleSlot::None),
+                ("qsa".to_string(), 12, CombineNorm, PleSlot::None),
             ]
         );
     }
@@ -1569,7 +1593,7 @@ mod tests {
     fn a_verify_clipped_at_the_model_limit_runs_as_a_varlen_row() {
         // Two rows of a request at 131069 resident keys leave its sampled
         // position at 131071. They cannot join the uniform 4-row verify graph:
-        // the step runs piecewise and prices them on the prefill path.
+        // the step runs piecewise.
         let mut input = step(vec![], vec![4096; 5]);
         let group = &mut input.groups[0];
         group.decode_requests.push(SpeculativeDecodeInput {
@@ -1579,12 +1603,51 @@ mod tests {
         group.decode_tokens += 2;
         group.batch_tokens += 2;
         let b = normalize(&input).unwrap();
-        assert_eq!(b.target.prefills, [(131069, 2)]);
+        assert!(b.target.prefills.is_empty());
+        assert_eq!(b.target.clipped, [(131069, 2)]);
         assert_eq!(b.target.decode_kv_lens, [4096; 5]);
         assert_eq!(b.target.tokens(), 22);
         assert!(!b.target.full_graph);
+        // QSA sees a prefill; GDN and the PLE conv a sixth, shorter spec decode.
+        assert_eq!(b.target.qsa_input().prefill_chunks, [(131069, 2)]);
+        let gdn = b.target.gdn_input();
+        assert!(gdn.prefill_lengths.is_empty());
+        assert_eq!((gdn.spec_decodes, gdn.spec_tokens), (6, 22));
+        let ple = b.target.ple_input();
+        assert_eq!(
+            (ple.spec_requests, ple.spec_tokens, ple.prefill_requests),
+            (6, 22, 0)
+        );
         assert_eq!((b.request_count, b.logits_rows), (6, 22));
         assert_eq!(b.recurrent.decode_kv_lens.len(), 6);
+        built().check_input(&input).unwrap();
+    }
+
+    /// A lone one-row verify carries no draft: the PLE conv's plain decode,
+    /// and on GDN the one-token chunk standing in for the unmodeled plain
+    /// decode path.
+    #[test]
+    fn a_lone_one_row_verify_is_a_plain_decode() {
+        let mut input = step(vec![], vec![]);
+        let group = &mut input.groups[0];
+        group.decode_requests.push(SpeculativeDecodeInput {
+            kv_len: 131071,
+            query_len: 1,
+        });
+        group.decode_tokens += 1;
+        group.batch_tokens += 1;
+        let b = normalize(&input).unwrap();
+        let gdn = b.target.gdn_input();
+        assert_eq!(
+            (
+                gdn.prefill_lengths.as_slice(),
+                gdn.spec_decodes,
+                gdn.non_spec_decodes
+            ),
+            (&[1][..], 0, 0)
+        );
+        let ple = b.target.ple_input();
+        assert_eq!((ple.decode_requests, ple.spec_requests), (1, 0));
         built().check_input(&input).unwrap();
     }
 

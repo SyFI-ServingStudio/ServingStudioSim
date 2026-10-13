@@ -5,7 +5,7 @@
 //! `_run_qsa` / `forward_qsa`):
 //!
 //! ```text
-//! kv_append         kv_cache_append            the step's new tokens (slot_mapping)
+//! kv_append         kv_cache_append            one program per slot_mapping row
 //! out_zero          elementwise memset         output.zero_() over the output tensor rows
 //! attn_uniform      sparse_gqa_paged_attention prefill_config = false
 //! attn_prefill_cfg  sparse_gqa_paged_attention prefill_config = true
@@ -19,9 +19,8 @@
 //! (`context < token_topk`) attend their whole context, rows at or above it
 //! attend the budget. Each group is priced at its own mean context, so a step
 //! that mixes a fresh chunk with long requests is not priced as if every row
-//! read the full budget (a single row-weighted mean context over-priced such
-//! steps by up to 1.6x on the B200 capture, logs/20261013_8_qf_probe). The
-//! framework switches its launch table to the prefill one when the longest
+//! read the full budget. The leaf logs both groups ([`SparseGqaAttentionLog`]).
+//! The framework switches its launch table to the prefill one when the longest
 //! query of the step exceeds the verify length `1 + num_speculative_tokens`;
 //! exactly one of the two attention leaves is non-zero.
 
@@ -33,6 +32,7 @@ use crate::timing::kernels::{
     KvCacheAppendKernelConfig, KvCacheAppendKernelInput, SparseGqaPagedAttentionKernel,
     SparseGqaPagedAttentionKernelConfig, SparseGqaPagedAttentionKernelInput,
 };
+use crate::timing::slot_input::SparseGqaAttentionLog;
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge, Probe,
 };
@@ -80,6 +80,10 @@ pub struct SparseGqaAttentionOpResolved {
 pub struct SparseGqaAttentionOpInput {
     /// Rows of the output tensor the memset clears (the graph-padded rows).
     pub output_rows: u32,
+    /// Rows the cache write launches over: `slot_mapping`'s length, the padded
+    /// rows under a FULL graph (a padded row's slot is -1, so its program
+    /// returns without writing).
+    pub append_rows: u32,
     /// Rows the attention launch covers (graph-padded under a FULL graph).
     pub attention_rows: u32,
     /// `(cached prefix, new tokens)` of each prefill chunk.
@@ -91,11 +95,9 @@ pub struct SparseGqaAttentionOpInput {
 /// The leaf inputs of one step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SparseGqaAttentionPlan {
-    pub append_tokens: u32,
+    pub append_rows: u32,
     pub output_rows: u32,
     pub attention_rows: u32,
-    /// Row-weighted mean context of all rows: the logged cell.
-    pub context_len: u32,
     /// `(rows, mean context)` of the rows below the selection budget and of the
     /// rows at or above it; a group with no rows has zero rows.
     pub context_groups: [(u32, u32); 2],
@@ -214,9 +216,9 @@ impl SparseGqaAttentionOp {
         let p = plan(&self.resolved, input);
 
         let append = KvCacheAppendKernelInput {
-            num_tokens: p.append_tokens,
+            num_tokens: p.append_rows,
         };
-        let metrics = if p.append_tokens == 0 {
+        let metrics = if p.append_rows == 0 {
             LeafMetrics::ZERO
         } else {
             self.kv_append.eval(&append)
@@ -233,9 +235,9 @@ impl SparseGqaAttentionOp {
         };
         ev.push(metrics, || zero.clone().into());
 
-        let cell = SparseGqaPagedAttentionKernelInput {
+        let log = SparseGqaAttentionLog {
             num_rows: p.attention_rows,
-            context_len: p.context_len,
+            context_groups: p.context_groups,
         };
         for (kernel, prefill_config) in
             [(&self.attn_uniform, false), (&self.attn_prefill_cfg, true)]
@@ -250,7 +252,7 @@ impl SparseGqaAttentionOp {
                     })
                 })
             };
-            ev.push(metrics, || cell.clone().into());
+            ev.push(metrics, || log.clone().into());
         }
     }
 }
@@ -327,12 +329,10 @@ pub fn plan(
             ((sum + n / 2) / n) as u32
         }
     };
-    let rows = groups[0].0 + groups[1].0;
     SparseGqaAttentionPlan {
-        append_tokens: rows as u32,
+        append_rows: input.append_rows,
         output_rows: input.output_rows,
         attention_rows: input.attention_rows,
-        context_len: mean((rows, groups[0].1 + groups[1].1)),
         context_groups: groups.map(|g| (g.0 as u32, mean(g))),
         prefill_config: longest_query > r.max_decode_query_len,
     }
@@ -377,15 +377,16 @@ mod tests {
         let r = resolved();
         let verify = SparseGqaAttentionOpInput {
             output_rows: 16,
+            append_rows: 16,
             attention_rows: 16,
             prefill_chunks: vec![],
             decode_kv_lens: vec![100, 200, 300, 400],
         };
         let p = plan(&r, &verify);
         assert!(!p.prefill_config);
-        assert_eq!(p.append_tokens, 16);
-        // Mean over rows 97..=100, 197..=200, ...: 248.5 rounds to 249.
-        assert_eq!(p.context_len, 249);
+        // Every row is below the budget; the mean over rows 97..=100,
+        // 197..=200, ...: 248.5 rounds to 249.
+        assert_eq!(p.context_groups, [(16, 249), (0, 0)]);
 
         let short_prefill = SparseGqaAttentionOpInput {
             prefill_chunks: vec![(0, 4)],
@@ -396,9 +397,7 @@ mod tests {
             prefill_chunks: vec![(0, 5)],
             ..verify
         };
-        let p = plan(&r, &mixed);
-        assert!(p.prefill_config);
-        assert_eq!(p.append_tokens, 21);
+        assert!(plan(&r, &mixed).prefill_config);
     }
 
     #[test]
@@ -407,13 +406,13 @@ mod tests {
             &resolved(),
             &SparseGqaAttentionOpInput {
                 output_rows: 2048,
+                append_rows: 2048,
                 attention_rows: 2048,
                 prefill_chunks: vec![(126976, 2048)],
                 decode_kv_lens: vec![],
             },
         );
         assert!(p.prefill_config);
-        assert_eq!(p.context_len, 126976 + 1025);
         assert_eq!(p.context_groups, [(0, 0), (2048, 126976 + 1025)]);
     }
 
@@ -425,6 +424,7 @@ mod tests {
             &resolved(),
             &SparseGqaAttentionOpInput {
                 output_rows: 3008,
+                append_rows: 3008,
                 attention_rows: 3008,
                 prefill_chunks: vec![(1000, 3000)],
                 decode_kv_lens: vec![50_000, 8],
@@ -439,16 +439,14 @@ mod tests {
             p.context_groups,
             [(1051, mean((1051, below.1))), (1957, mean((1957, above.1)))]
         );
-        assert_eq!(p.append_tokens, 3008);
     }
 
     #[test]
     fn the_step_time_is_the_row_weighted_group_mean() {
         let p = SparseGqaAttentionPlan {
-            append_tokens: 4,
+            append_rows: 4,
             output_rows: 4,
             attention_rows: 4,
-            context_len: 0,
             context_groups: [(1, 100), (3, 9000)],
             prefill_config: true,
         };

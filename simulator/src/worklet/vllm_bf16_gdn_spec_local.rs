@@ -144,8 +144,13 @@ pub struct VllmBf16GdnSpecLocalWorkletInput {
     pub padded_tokens: u32,
     /// Prefill chunk lengths of the step's prefill requests.
     pub prefill_lengths: Vec<u32>,
-    /// Verify requests, each `tokens_per_request` rows.
+    /// Verify requests: every decode request with at least one draft.
     pub spec_decodes: u32,
+    /// Their rows: `tokens_per_request` each, fewer for a verify the scheduler
+    /// clipped at `max_model_len` (it keeps the spec path while it carries a
+    /// draft, `mamba_hybrid.py` `num_decode_draft_tokens`). The verify kernels
+    /// price every request at the full width.
+    pub spec_tokens: u32,
     /// One-token decodes without drafts. Beside spec decodes they run as
     /// one-token prefills; without spec decodes they take the plain decode path,
     /// which this worklet does not model.
@@ -586,9 +591,15 @@ struct Work {
 
 impl Work {
     fn of(input: &VllmBf16GdnSpecLocalWorkletInput, q: u32, fused_verify: bool) -> Self {
-        debug_assert!(
+        assert!(
             input.non_spec_decodes == 0 || input.spec_decodes > 0,
             "non-spec decodes without spec decodes take the plain decode path, not modeled here"
+        );
+        assert!(
+            (input.spec_decodes..=input.spec_decodes * q).contains(&input.spec_tokens),
+            "{} spec tokens for {} verify requests of at most {q} rows",
+            input.spec_tokens,
+            input.spec_decodes
         );
         let mut prefill_lengths = input.prefill_lengths.clone();
         // gdn_attn.py:307-314: with spec decodes present, non-spec decodes are
@@ -598,7 +609,7 @@ impl Work {
         }
         let prefills = prefill_lengths.len() as u32;
         let prefill_tokens: u32 = prefill_lengths.iter().sum();
-        let spec_tokens = input.spec_decodes * q;
+        let spec_tokens = input.spec_tokens;
         let path = match (input.spec_decodes > 0, prefills > 0) {
             (false, false) => Path::Empty,
             (true, false) if fused_verify => Path::FusedVerify,
@@ -656,6 +667,7 @@ mod tests {
             padded_tokens: prefills.iter().sum::<u32>() + 4 * spec + non_spec,
             prefill_lengths: prefills.to_vec(),
             spec_decodes: spec,
+            spec_tokens: 4 * spec,
             non_spec_decodes: non_spec,
         }
     }
@@ -722,6 +734,23 @@ mod tests {
         assert_eq!(w.path, Path::Mixed);
         assert_eq!(w.prefill_lengths, [1, 1, 1]);
         assert_eq!((w.prefills, w.prefill_tokens, w.real), (3, 3, 11));
+    }
+
+    /// A verify clipped at the model limit keeps the fused spec path with its
+    /// real rows.
+    #[test]
+    fn a_clipped_verify_stays_a_spec_decode() {
+        let mut step = input(&[], 3, 0);
+        step.spec_tokens = 10;
+        let w = Work::of(&step, 4, true);
+        assert_eq!(w.path, Path::FusedVerify);
+        assert_eq!((w.spec_decodes, w.spec_tokens, w.real), (3, 10, 10));
+    }
+
+    #[test]
+    #[should_panic(expected = "plain decode path")]
+    fn non_spec_decodes_alone_are_refused() {
+        Work::of(&input(&[], 0, 2), 4, true);
     }
 
     #[test]

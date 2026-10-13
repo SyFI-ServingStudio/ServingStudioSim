@@ -30,12 +30,12 @@
 //! (32800 at 131072 tokens and 3200-token blocks). Its key count is the mean
 //! complete-group count of the requests. The decode selection is priced at that
 //! mean on the persistent kernel and at the longest request on the cooperative
-//! kernel, which runs all rows in one wave and finishes with its longest row. The prefill selection is one call over
-//! all prefill rows; its rows split at `block_topk` visible groups: a row with
-//! no more candidates than it keeps selects trivially, so the short rows are
-//! priced as one cell at their own mean context and the rest as another
-//! (decision D5 of the Flash-Next design; geometry only, no new rows). The
-//! framework further cuts a prefill call at `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`
+//! kernel, which runs all rows in one wave and finishes with its longest row.
+//! The prefill selection is one call over all prefill rows; its rows split at
+//! `block_topk` visible groups: a row with no more candidates than it keeps
+//! selects trivially, so the short rows are priced as one cell at their own
+//! mean context and the rest as another (geometry only, no new profiled rows).
+//! The framework further cuts a prefill call at `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`
 //! (at least 4096 rows at the widest row); the persistent kernel is linear in
 //! rows there, so that cut is not modeled.
 
@@ -52,7 +52,7 @@ use crate::timing::kernels::{
     SparseIndexerPrepareKernel, SparseIndexerPrepareKernelConfig, SparseIndexerPrepareKernelInput,
     SparseIndexerTopkKernel,
 };
-use crate::timing::slot_input::DsaIndexerPrefillLog;
+use crate::timing::slot_input::SparseIndexerTopkLog;
 use crate::timing::{
     AttnPrefillLog, BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge,
     Probe,
@@ -60,6 +60,9 @@ use crate::timing::{
 
 /// The top-k selection scores and indices, as the framework allocates them.
 const LOGITS_DTYPE: DType = DType::Fp32;
+/// The prefill logits row is padded to 64 columns
+/// (`models/qwen4_exp/nvidia/ops/qsa_indexer.py:607-610`).
+const PREFILL_LOGITS_ROW_ALIGN: u32 = 64;
 const INDEX_DTYPE: &str = "int32";
 /// Independent normal scores, like a live indexer's (see `sparse_indexer_topk`).
 const TOPK_CONTEXT_MODE: &str = "uniform_random";
@@ -419,27 +422,25 @@ impl SparseGqaIndexerOp {
         ev: &mut Evaluator,
     ) {
         let mut metrics = LeafMetrics::ZERO;
-        let mut cells = Vec::new();
+        let mut log = SparseIndexerTopkLog {
+            decode: None,
+            prefill: Vec::new(),
+        };
         if let Some((chosen, cell)) = plan.decode_topk {
             if chosen == backend {
                 metrics.add_fanin(decode.eval(&topk_input(cell)));
-                cells.push((cell.batch, cell.context));
+                log.decode = Some((cell.batch, cell.context));
             }
         }
         if let Some((chosen, prefill_cells)) = &plan.prefill_topk {
             if *chosen == backend {
                 for &cell in prefill_cells {
                     metrics.add_fanin(prefill.eval(&topk_input(cell)));
-                    cells.push((cell.batch, cell.context));
+                    log.prefill.push((cell.batch, cell.context));
                 }
             }
         }
-        ev.push(metrics, || {
-            DsaIndexerPrefillLog {
-                prefill_query_key_pairs: cells,
-            }
-            .into()
-        });
+        ev.push(metrics, || log.into());
     }
 }
 
@@ -521,6 +522,13 @@ pub fn prefill_topk_cells(
 }
 
 /// The framework's top-k dispatch for one call of `rows` rows.
+/// Raw keys each request's ring keeps between steps: the open group plus every
+/// speculative row, in whole groups (`common/qsa_cache.py`
+/// `QSAKeyStateCache.get_kv_cache_spec`).
+pub fn ring_tokens(compress_ratio: u32, num_speculative_tokens: u32) -> u32 {
+    compress_ratio * (compress_ratio + num_speculative_tokens).div_ceil(compress_ratio)
+}
+
 pub fn topk_backend(rows: u32, row_stride: u32, cooperative_available: bool) -> TopkBackend {
     if cooperative_available && rows <= COOPERATIVE_MAX_ROWS && row_stride.is_multiple_of(4) {
         TopkBackend::Cooperative
@@ -586,10 +594,13 @@ pub fn plan(
         .collect();
     let prefill_rows: u32 = prefill_chunks.iter().map(|&(_, new)| new).sum();
     let prefill_topk = (prefill_rows > 0).then(|| {
-        // The prefill logits row is rounded up to 64 columns, so its stride
-        // always admits the cooperative kernel.
+        // The padded row always admits the cooperative kernel's stride.
         (
-            topk_backend(prefill_rows, 64, cooperative_available),
+            topk_backend(
+                prefill_rows,
+                PREFILL_LOGITS_ROW_ALIGN,
+                cooperative_available,
+            ),
             prefill_topk_cells(&prefill_chunks, r.compress_ratio, r.block_topk),
         )
     });
@@ -729,7 +740,8 @@ mod tests {
         assert!(split.logits_decode.is_none() && split.decode_topk.is_none());
     }
 
-    /// D5: rows with at most 512 visible groups form their own cell.
+    /// Rows with at most 512 visible groups form their own cell (geometry
+    /// only: a row with no more candidates than it keeps selects trivially).
     #[test]
     fn prefill_rows_split_at_block_topk() {
         // 2048@0: every row sees at most 512 groups.

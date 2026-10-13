@@ -11,10 +11,14 @@
 //! `v1/worker/mamba_utils.py:1212`, gridded over `(requests, states)`, copying a
 //! state only when its request crosses a state block).
 //!
-//! Decision D8 prices this as one placeholder group of three elementwise
+//! This worklet prices it as one placeholder group of three elementwise
 //! leaves: `input_prep` (per request), `qsa_metadata` (per token) and
 //! `mamba_align_precopy` (per request). Their byte rates are geometry the arch
 //! derives from the config and the KV layout; this worklet only carries them.
+//! `mamba_align_precopy` assumes prefix caching is on: vLLM runs the pre-copy
+//! only in Mamba align mode, which it selects exactly when prefix caching is
+//! enabled for a hybrid model (`model_executor/models/config.py:640-653`), and
+//! the deployment's prefix-caching setting does not reach the arch.
 //! For scale (documentation only, not a calibration input): the capture's
 //! preprocess phase was 0.78% of kernel time, ~230 us/iter of 29.2 ms, of which
 //! the pre-copy was ~12 us and the metadata build ~7 us; the rest is the

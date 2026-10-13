@@ -31,7 +31,7 @@ use serde::Deserialize;
 use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::glm52_model_cfg::Glm52MtpMode;
-use super::qwen4_exp_vllm_nvfp4_gdn_qsa_moe::{PleTableResidency, Qwen4ExpCacheDtype};
+use super::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
 /// carries no `deny_unknown_fields` (the flattened struct must let the arch's
@@ -122,6 +122,11 @@ const fn default_mimo_v2_max_model_len() -> u32 {
 
 /// The Qwen3.8-27B capture's `--max-model-len`.
 const fn default_qwen35_max_model_len() -> u32 {
+    131_072
+}
+
+/// The Qwen3.8-Flash-Next capture's `--max-model-len`.
+const fn default_qwen4_exp_max_model_len() -> u32 {
     131_072
 }
 
@@ -1140,7 +1145,7 @@ pub enum IterArchSel {
         model: ModelSpec,
         /// Configured context cap; each request's context is validated
         /// against it, and it sizes the QSA top-k and block-table rows.
-        #[serde(default = "default_qwen35_max_model_len")]
+        #[serde(default = "default_qwen4_exp_max_model_len")]
         #[param(default = 131072, cache_key)]
         max_model_len: u32,
         /// MTP `num_speculative_tokens`: fixes the verify width at
@@ -1172,7 +1177,7 @@ pub enum IterArchSel {
         expert_popularity_file: Option<String>,
         /// Recorded per-token expert routes from a `token_corpus` pass, as a
         /// manifest path. Requires `routing = corpus`. Its layer axis is the
-        /// 48 body MoE layers then the MTP layer.
+        /// body's MoE layers, then the MTP layer.
         #[serde(default)]
         #[param(cache_key)]
         token_corpus_file: Option<String>,

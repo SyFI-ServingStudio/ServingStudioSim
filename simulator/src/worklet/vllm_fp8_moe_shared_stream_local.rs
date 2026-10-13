@@ -1,4 +1,4 @@
-//! FP8-block sibling of [`super::vllm_moe_shared_stream_local`]: the same
+//! FP8-block sibling of [`super::vllm_nvfp4_moe_shared_stream_local`]: the same
 //! router, aux-stream shared expert and add, around a TRT-LLM FP8 block-scale
 //! routed MoE (a checkpoint whose experts are W8A8 FP8 with 128-wide blocks,
 //! e.g. an MTP layer next to NVFP4 target layers).
@@ -12,7 +12,9 @@
 //! `fused_moe/experts/trtllm_fp8_moe.py:469`), which is one strided copy of
 //! `hidden / group` FP32 values per row. That copy is not in the reused
 //! callable, so it is this worklet's `scale_transpose` leaf, at the end of the
-//! routed branch.
+//! routed branch. It launches between the quant and the fused call; the
+//! branch is a serial `Sum`, so the manifest position does not change the
+//! cost.
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -34,7 +36,7 @@ use super::glm53_moe_local::{
     Glm53RoutedMoeLocalWorklet, Glm53RoutedMoeLocalWorkletConfig, Glm53RoutedMoeLocalWorkletInput,
     Glm53RoutedMoeLocalWorkletResolved,
 };
-use super::vllm_moe_shared_stream_local::{
+use super::vllm_nvfp4_moe_shared_stream_local::{
     add_config, build_shared_pair, compose_block, eval_shared_and_add, resolve_shared, router_gemm,
 };
 

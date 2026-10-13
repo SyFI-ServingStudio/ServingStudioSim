@@ -111,6 +111,9 @@ reimplement model assembly.
 - `InklingModelCfg` (`inkling_model_cfg.rs`) reads Inkling's `text_config` and
   its ModelOpt NVFP4 exclusions: the sliding-window/global attention schedule,
   the dense-FFN layers, the sink experts and each MoE layer's expert precision.
+- `Qwen4ExpModelCfg` (`qwen4_exp_model_cfg.rs`) reads Qwen4Exp's `text_config`:
+  the GDN/QSA layer schedule, hyper-connections, PLE tables and the ModelOpt
+  mixed-precision map.
 - `ParallelCfg` and the family-specific parallel structs resolve TP, EP,
   attention-DP/HP, NVLink-domain, and GPU facts.
 - `num_layers` / `sim_num_layers` truncation is applied before
@@ -146,6 +149,8 @@ schema; no second hand-maintained config union belongs here.
   - GLM-5.2/5.3 vLLM NVFP4 DP attention + EP (`glm52_vllm_nvfp4_dp_attn_dsa_moe`)
     → `hp_unified` or `chunked_prefill`, one KV partition per DP rank
   - GLM-5.2 SGLang NVFP4 pure TP → `chunked_prefill`
+  - Qwen4Exp vLLM NVFP4 MTP (`qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative`) →
+    `speculative`
 - pp:
   - GLM-5.2/5.3 vLLM NVFP4 pipeline stages (`glm52_vllm_nvfp4_pp_dsa_moe`) →
     pipeline stage workers; `unified` rejects it. Each stage is its own

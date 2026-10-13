@@ -20,9 +20,8 @@
 //! 4. the up GEMM, N = `hc_count * hidden_size`, K = `hc_lowrank`;
 //! 5. `hc_gate_mix`: the gated mean over the normalized streams.
 //!
-//! The GEMMs are BF16 `F.linear` (B200 never takes the SM90/SM103 skinny
-//! low-latency plans). Plain `Sum`: every launch is on the main stream and
-//! depends on the previous one.
+//! The GEMMs are BF16 `F.linear`. Plain `Sum`: every launch is on the main
+//! stream and depends on the previous one.
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -81,12 +80,12 @@ pub struct HcMixLocalWorkletInput {
 
 pub struct HcMixLocalWorklet {
     pub name: String,
-    pub combine_norm: Option<Op<HcCombineNormKernel>>,
-    pub grouped_norm: Option<Op<GroupedRmsNormKernel>>,
-    pub down: Op<SingleGemmKernel>,
-    pub silu: Op<ScaledSiluKernel>,
-    pub up: Op<SingleGemmKernel>,
-    pub gate_mix: Op<HcGateMixKernel>,
+    combine_norm: Option<Op<HcCombineNormKernel>>,
+    grouped_norm: Option<Op<GroupedRmsNormKernel>>,
+    down: Op<SingleGemmKernel>,
+    silu: Op<ScaledSiluKernel>,
+    up: Op<SingleGemmKernel>,
+    gate_mix: Op<HcGateMixKernel>,
     resolved: HcMixLocalWorkletResolved,
 }
 
