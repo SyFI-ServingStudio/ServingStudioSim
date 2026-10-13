@@ -59,8 +59,8 @@ def gdn_causal_conv_spec_decode_reference(
     ``num_accepted`` ``[B]`` int32. Request ``b`` reads history columns
     ``a-1 .. a+W-3`` of slot ``state_indices[b, 0]`` (``a`` its accepted
     count), convolves its ``q`` tokens, and rewrites that slot as history
-    columns ``a .. a+W-3`` followed by its raw tokens. Returns the BF16 output
-    and ``state`` (mutated in place).
+    columns ``a .. a+W-3`` followed by its raw tokens. Returns the output (in
+    ``x``'s dtype) and ``state`` (mutated in place).
     """
     per_request = _check_uniform(x.shape[0], state_indices, num_accepted)
     channels, width = weight.shape
@@ -103,8 +103,8 @@ def gdn_recurrent_spec_decode_reference(
     Q/K are ``[B*q, Hq, Dk]``, V ``[B*q, Hv, Dv]``, raw gates ``[B*q, Hv]``,
     ``state`` an FP32 slot pool ``[S, Hv, Dv, Dk]``. Each request starts from
     slot ``state_indices[b, a-1]`` and writes its state after token ``t`` to
-    slot ``state_indices[b, t]``. Returns the BF16 ``[B*q, Hv, Dv]`` output and
-    the pool (mutated in place).
+    slot ``state_indices[b, t]``. Returns the ``[B*q, Hv, Dv]`` output (in the
+    input dtype) and the pool (mutated in place).
     """
     per_request = _check_uniform(query.shape[0], state_indices, num_accepted)
     batch = state_indices.shape[0]

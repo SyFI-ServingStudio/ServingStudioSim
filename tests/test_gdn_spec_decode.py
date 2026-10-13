@@ -10,7 +10,7 @@ from profiling.db.batch import coerce_args
 from profiling.db.registry import find_kernel_profiler_spec, known_backends
 from profiling.kernels.gdn_causal_conv_decode import GdnCausalConvDecodeArgs
 from profiling.kernels.gdn_recurrent_decode_gated_norm import KIND as GATED_NORM_KIND
-from profiling.runners.attention import gdn_causal_conv_verify_vllm_triton as conv_verify
+from profiling.runners.attention import _gdn_conv_verify as conv_verify
 from profiling.runners.attention._gdn_common import tokens_per_request
 from profiling.runners.attention._gdn_verify import build_verify_recurrence_operands
 from profiling.runners.attention.gdn_causal_conv_decode_reference import (

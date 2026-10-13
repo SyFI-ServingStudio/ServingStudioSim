@@ -1,4 +1,4 @@
-"""vLLM's causal_conv1d_update on a speculative (MTP verify) step.
+"""Operands, call and check of vLLM's causal_conv1d_update on a verify step.
 
 ``gdn_causal_conv_decode`` with ``num_tokens = q · batch_size``, q > 1. vLLM
 calls the same ``_causal_conv1d_update_kernel`` as one-token decode, but in its
@@ -6,8 +6,9 @@ varlen speculative form (``qwen_gdn_linear_attn.py`` ``_forward_core`` and
 ``_forward_core_decode_spec_fused_norm``): request-major tokens described by
 ``query_start_loc``, ``num_accepted_tokens``, the first column of the ``[B, q]``
 checkpoint indices, and a history row of ``kernel_size − 2 + q`` samples. The
-operands are built the same way here; the correctness check and its operand
-restoration stay outside CUPTI, which counts only ``_causal_conv1d_update_kernel``.
+operands are built the same way here. This is a helper, not a runner: the
+caller (``gdn_causal_conv_decode_vllm_triton``) runs ``check_correctness``
+outside its timed closure and does the timing.
 """
 
 from __future__ import annotations
@@ -15,9 +16,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from profiling.runners.attention._gdn_common import conv_state_pool
+from profiling.runners.attention._gdn_common import (
+    accepted_counts,
+    checkpoint_indices,
+    conv_state_pool,
+)
 
-KERNEL_NAME = "_causal_conv1d_update_kernel"
 _OUTPUT_ATOL = 1e-2
 _OUTPUT_RTOL = 1e-2
 
@@ -31,19 +35,6 @@ class VerifyOperands:
     num_accepted: Any
     query_start_loc: Any
     per_request: int
-
-
-def accepted_counts(batch_size: int, per_request: int) -> tuple[int, ...]:
-    """Deterministic accepted counts covering 1..q (the kernel reads from ``a − 1``)."""
-    return tuple(request % per_request + 1 for request in range(batch_size))
-
-
-def checkpoint_indices(batch_size: int, per_request: int) -> tuple[tuple[int, ...], ...]:
-    """vLLM's ``[B, q]`` per-token checkpoint slots; slot zero stays reserved."""
-    return tuple(
-        tuple(request * per_request + token + 1 for token in range(per_request))
-        for request in range(batch_size)
-    )
 
 
 def build_operands(

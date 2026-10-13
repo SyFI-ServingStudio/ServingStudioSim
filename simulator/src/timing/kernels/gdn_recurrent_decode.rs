@@ -36,14 +36,25 @@ pub struct GdnRecurrentDecodeKernelInput {
     pub batch_size: u32,
 }
 
-/// Decode batch axis of the GDN decode kinds. One-token decode keeps the frozen
-/// pow2 axis. A verify step (q > 1 tokens per request) is also dense over 1..8:
-/// its kernels launch one CTA per (request, value head), so small batches cross
-/// SM-wave boundaries that pow2 points straddle.
+/// Tokens per request of a verify step (q > 1), or `None` for one-token decode
+/// (unset or 1), which keeps the keys it had before the field existed.
+pub(crate) fn verify_tokens_per_request(tokens_per_request: Option<&Dim>) -> Option<u32> {
+    tokens_per_request.map(Dim::get).filter(|&q| q != 1)
+}
+
+/// Batch axis of a verify step: dense over 1..8, then pow2 to 256. Its kernels
+/// launch a fixed CTA count per request, so small batches cross SM-wave
+/// boundaries that pow2 points straddle.
+pub(crate) fn verify_batch_axis() -> Vec<f64> {
+    Axis::chain([Axis::arithmetic(1, 8, 1), Axis::pow2(4, 8)])
+}
+
+/// Decode batch axis of the GDN decode kinds: the verify axis for q > 1, the
+/// frozen pow2 axis for one-token decode.
 pub(crate) fn decode_batch_axis(tokens_per_request: Option<&Dim>) -> Vec<f64> {
-    match tokens_per_request.map(Dim::get) {
-        Some(q) if q != 1 => Axis::chain([Axis::arithmetic(1, 8, 1), Axis::pow2(4, 8)]),
-        _ => Axis::pow2(0, 8),
+    match verify_tokens_per_request(tokens_per_request) {
+        Some(_) => verify_batch_axis(),
+        None => Axis::pow2(0, 8),
     }
 }
 
@@ -68,11 +79,7 @@ impl KernelSpec for GdnRecurrentDecodeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
-        let per_request = config
-            .tokens_per_request
-            .as_ref()
-            .map(Dim::get)
-            .filter(|&q| q != 1);
+        let per_request = verify_tokens_per_request(config.tokens_per_request.as_ref());
         grid.expand_1d(|batch_size| {
             let payload = ArgsPayload::new()
                 .with("backend", backend)

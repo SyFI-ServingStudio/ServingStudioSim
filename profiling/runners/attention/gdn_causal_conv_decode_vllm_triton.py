@@ -15,7 +15,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention import gdn_causal_conv_verify_vllm_triton as verify
+from profiling.runners.attention import _gdn_conv_verify as verify
 from profiling.runners.attention._gdn_common import (
     conv_state_dim_first,
     conv_state_pool,
