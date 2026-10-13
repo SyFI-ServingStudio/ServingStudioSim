@@ -404,6 +404,7 @@ fn push_conv_per_sequence(
     ev.push(metrics, || {
         GdnCausalConvPrefillLog {
             sequence_lengths: sequence_lengths.to_vec(),
+            decode_rows: 0,
         }
         .into()
     });

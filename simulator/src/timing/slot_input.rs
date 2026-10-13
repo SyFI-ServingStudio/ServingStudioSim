@@ -44,6 +44,7 @@ use crate::timing::kernels::{
 
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
+use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
@@ -75,6 +76,14 @@ pub struct Dflash2DraftAttnLog {
 #[derive(Clone, Serialize)]
 pub struct GdnCausalConvPrefillLog {
     pub sequence_lengths: Vec<u32>,
+    /// Single-token decode rows the same varlen launch convolves ahead of the
+    /// prefills (a mixed step); absent when there are none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub decode_rows: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Sparse-MLA prefill aggregating leaf input: every request-local `(Q, S)` cell
@@ -198,6 +207,7 @@ log_inputs! {
     MultiAddRmsNorm => MultiAddRmsNormKernelInput,
     SiluAndMul => SiluAndMulKernelInput,
     StaticFp8Quant => StaticFp8QuantKernelInput,
+    IndexedRowCopy => IndexedRowCopyKernelInput,
     QkRmsNormRopeGate => QkRmsNormRopeGateKernelInput,
     AllReduce   => AllReduceKernelInput,
     AllReduceFusion => AllReduceFusionKernelInput,
