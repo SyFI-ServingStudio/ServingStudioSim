@@ -199,3 +199,27 @@ def test_dflash2_geometry_needs_its_arch(tmp_path):
     write_params(tmp_path, arch={**DFLASH2_ARCH, "type": "glm52_vllm_nvfp4_dsa_moe"})
     result = floors.compute_floors(tmp_path, {"main": totals(depth=7, decode=((4104, 8),))})
     assert "requires a speculative architecture" in result["main"]["error"]
+
+
+def test_default_draft_depths_match_the_simulator_serde_defaults():
+    """params.json omits a defaulted ``draft_tokens``; floors must resolve it to
+    the depth the simulator ran, so the hand copy tracks ``arch/config.rs``."""
+    import re
+
+    source = (ROOT / "simulator/src/arch/config.rs").read_text()
+    defaults = {
+        name: int(value.replace("_", ""))
+        for name, value in re.findall(r"const fn (\w+)\(\) -> u32 \{\s*([\d_]+)\s*\}", source)
+    }
+    rust = {}
+    # A variant opens at four-space indentation; its fields follow until the next one.
+    for variant, body in re.findall(r"\n    (\w+) \{\n(.*?)\n    \}", source, re.S):
+        default = re.search(
+            r'#\[serde\(default = "(\w+)"\)\][^\n]*\n(?:\s*#\[[^\n]*\n)*\s*draft_tokens: u32',
+            body,
+        )
+        if default:
+            arch_type = re.sub(r"(?<!^)(?=[A-Z])", "_", variant).lower()
+            rust[arch_type] = defaults[default.group(1)]
+    assert rust == floors._DEFAULT_DRAFT_TOKENS
+    assert set(rust) == floors._SPECULATIVE_ARCHS

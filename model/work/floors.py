@@ -173,6 +173,24 @@ _DRAFT_CONFIGS = {"glm53_vllm_nvfp4_dsa_moe_dflash2": "model/config/glm53_dflash
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _replace_attention(model, rewrite):
+    """``model`` with ``rewrite`` applied to every stack's attention spec.
+
+    A wrapper that carries extra per-layer work beside its attention (Qwen4Exp's
+    n-gram embedding layer) exposes the wrapped spec as ``attn``; the rewrite
+    reaches it there.
+    """
+    from dataclasses import replace
+
+    def apply(attn):
+        inner = getattr(attn, "attn", None)
+        if inner is not None:
+            return replace(attn, attn=rewrite(inner))
+        return rewrite(attn)
+
+    return replace(model, layers=[replace(stack, attn=apply(stack.attn)) for stack in model.layers])
+
+
 def _with_fp8_kv_cache(model):
     """Serve every attention spec's persistent KV cache at one byte per element.
 
@@ -193,8 +211,7 @@ def _with_fp8_kv_cache(model):
             return replace(attn, **fields)
         return attn
 
-    layers = [replace(stack, attn=fp8_cache(stack.attn)) for stack in model.layers]
-    return replace(model, layers=layers)
+    return _replace_attention(model, fp8_cache)
 
 
 def _with_fp8_index_cache(model):
@@ -207,8 +224,7 @@ def _with_fp8_index_cache(model):
             return replace(attn, index_cache_dtype_bytes=1.0)
         return attn
 
-    layers = [replace(stack, attn=fp8_index(stack.attn)) for stack in model.layers]
-    return replace(model, layers=layers)
+    return _replace_attention(model, fp8_index)
 
 
 @cache
@@ -238,14 +254,10 @@ def _model_for_spec(spec: dict):
             spec.get("draft_sliding_window"),
         )
     model = _model(spec["config"])
-    if arch_type in _FP8_INDEX_CACHE_ARCHS:
-        if spec.get("kv_cache_dtype", "fp8") == "fp8":
-            model = _with_fp8_kv_cache(model)
-        if spec.get("indexer_kv_dtype", "fp8") == "fp8":
-            model = _with_fp8_index_cache(model)
-        return model
-    if arch_type in _FP8_KV_CACHE_ARCHS:
-        return _with_fp8_kv_cache(model)
+    if arch_type in _FP8_KV_CACHE_ARCHS and spec.get("kv_cache_dtype", "fp8") == "fp8":
+        model = _with_fp8_kv_cache(model)
+    if arch_type in _FP8_INDEX_CACHE_ARCHS and spec.get("indexer_kv_dtype", "fp8") == "fp8":
+        model = _with_fp8_index_cache(model)
     if arch_type != "glm52_vllm_nvfp4_dsa_moe_speculative":
         return model
     mode = spec.get("mtp_mode", "index_share")
@@ -388,6 +400,8 @@ def _spec_for_level(level_key: str, pool_specs: dict[str, dict]) -> dict:
                 s.get("mtp_mode"),
                 s.get("draft_tokens"),
                 s.get("draft_sliding_window"),
+                s.get("kv_cache_dtype"),
+                s.get("indexer_kv_dtype"),
             )
             for s in pool_specs.values()
         }
