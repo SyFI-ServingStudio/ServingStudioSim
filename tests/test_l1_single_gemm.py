@@ -139,6 +139,7 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "sglang_bf16_auto",
         "sglang_fused_a_auto",
         "deepgemm",
+        "flashinfer_fp8_tensor",
         "flashinfer_cutedsl",
         "flashinfer_mxfp8",
     }

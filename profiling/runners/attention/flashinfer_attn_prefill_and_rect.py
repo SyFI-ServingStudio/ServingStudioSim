@@ -116,18 +116,6 @@ def _run_ragged(
     measures. The wire-schema -> (q_len, kv_len) mapping is the caller's job
     (``_run_prefill`` for prefill; rect passes them directly).
     """
-    if backend == "trt":
-        # trtllm-gen has no variable-length/ragged prefill kernel, and on sm90
-        # (H200) even the paged path errors with "Unsupported architecture" —
-        # trtllm-gen FMHA is B200/sm100-only in this build, and ref only ever
-        # profiled trt as paged on B200. Until the paged path lands (B200), trt
-        # is cleanly unsupported here rather than a launch failure.
-        raise ProfilerNotImplemented(
-            "trt (trtllm-gen) prefill/rect is unavailable on the ragged path: it "
-            "has no variable-length kernel and is B200/sm100-only; the paged path "
-            "on B200 is not yet implemented"
-        )
-
     q_len = int(q_len)
     kv_len = int(kv_len)
 
@@ -168,7 +156,7 @@ def _run_ragged(
         wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             _common.make_workspace(),
             kv_layout="NHD",
-            backend=_common.flashinfer_backend_name(backend),
+            backend=backend,
         )
         plan_kwargs = dict(
             qo_indptr=inp.qo_indptr,
@@ -312,10 +300,6 @@ def profile_flashinfer_attn_prefill_fa3(**kwargs) -> ComputeMetrics:
     return _run_prefill(backend="fa3", **kwargs)
 
 
-def profile_flashinfer_attn_prefill_trt(**kwargs) -> ComputeMetrics:
-    return _run_prefill(backend="trt", **kwargs)
-
-
 def profile_flashinfer_attn_prefill_cudnn(**kwargs) -> ComputeMetrics:
     return _run_prefill(backend="cudnn", **kwargs)
 
@@ -331,10 +315,6 @@ def profile_flashinfer_attn_rect_fa2(**kwargs) -> ComputeMetrics:
 
 def profile_flashinfer_attn_rect_fa3(**kwargs) -> ComputeMetrics:
     return _run_ragged(backend="fa3", causal=False, **kwargs)
-
-
-def profile_flashinfer_attn_rect_trt(**kwargs) -> ComputeMetrics:
-    return _run_ragged(backend="trt", causal=False, **kwargs)
 
 
 def profile_flashinfer_attn_rect_cudnn(**kwargs) -> ComputeMetrics:

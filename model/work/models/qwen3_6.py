@@ -8,14 +8,29 @@ paired with the same dense SwiGLU MLP. This is the first model here to use the h
 
 The 27B checkpoint ships as a ``Qwen3_5ForConditionalGeneration`` (VL wrapper), so the
 text fields live under ``text_config``; this builder reads whichever is present.
+
+Every layer carries input and post-attention RMSNorm scales, a full-attention layer
+also its per-head q/k norms, and the body a final norm. A quantized checkpoint (Qwen3.8's
+ModelOpt ``MIXED_PRECISION``) names its HF shards, which vLLM packs into the fused
+matrices the specs carry.
 """
 
 from __future__ import annotations
 
 from ..attention.gqa import GQA
 from ..attention.linear import GatedDeltaNet
-from ..core import LayerStack, Model, dtype_bytes
+from ..core import LayerStack, Model, NormWeightGroup, dtype_bytes
 from ..ffn.dense import DenseSwiGLU
+from ..quantization import parse_quantization_config
+
+#: vLLM ``Qwen3_5ForConditionalGeneration.packed_modules_mapping``
+#: (vllm/model_executor/models/qwen3_5.py:301-311 at 892da082).
+_PACKED_MODULES = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+    "in_proj_ba": ("in_proj_b", "in_proj_a"),
+}
 
 
 def _layer_types(text: dict) -> list[str]:
@@ -34,7 +49,8 @@ def _layer_types(text: dict) -> list[str]:
 def build(raw_config: dict) -> Model:
     text = raw_config.get("text_config", raw_config)
     hidden = text["hidden_size"]
-    weight_bytes = dtype_bytes(text.get("torch_dtype") or text.get("dtype") or "bfloat16")
+    master_dtype = text.get("torch_dtype") or text.get("dtype") or "bfloat16"
+    weight_bytes = dtype_bytes(master_dtype)
     state_bytes = dtype_bytes(text.get("mamba_ssm_dtype", "float32"))
 
     full_attn = GQA(
@@ -63,6 +79,16 @@ def build(raw_config: dict) -> Model:
         LayerStack(attn=linear_attn, ffn=ffn, count=num_linear, tag="linear"),
         LayerStack(attn=full_attn, ffn=ffn, count=num_full, tag="full"),
     ]
+    head_dim = text["head_dim"]
+    norm_weights = [
+        NormWeightGroup("linear.input_norm", hidden, num_linear, stack="linear"),
+        NormWeightGroup("linear.post_norm", hidden, num_linear, stack="linear"),
+        NormWeightGroup("full.input_norm", hidden, num_full, stack="full"),
+        NormWeightGroup("full.q_norm", head_dim, num_full, stack="full"),
+        NormWeightGroup("full.k_norm", head_dim, num_full, stack="full"),
+        NormWeightGroup("full.post_norm", hidden, num_full, stack="full"),
+        NormWeightGroup("final_norm", hidden, 1),
+    ]
     return Model(
         name=raw_config["architectures"][0],
         hidden=hidden,
@@ -72,4 +98,9 @@ def build(raw_config: dict) -> Model:
             "tie_word_embeddings", raw_config.get("tie_word_embeddings", False)
         ),
         layers=layers,
+        norm_weights=norm_weights,
+        master_dtype=master_dtype,
+        quant=parse_quantization_config(
+            raw_config, layer_types=layer_types, packed_modules=_PACKED_MODULES
+        ),
     )

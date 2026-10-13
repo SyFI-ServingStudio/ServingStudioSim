@@ -170,6 +170,37 @@ def test_structured_vllm_iteration_record_is_the_only_metrics_contract(tmp_path)
     assert json.loads(output.read_text()) == {**record, "dp_rank": 0}
 
 
+def test_iteration_record_split_by_another_process_line_is_rejoined(tmp_path):
+    record = {
+        "schema_version": 1,
+        "input_adapter": "vllm_text",
+        "iteration_index": 6,
+        "prefill_tokens": 8,
+        "decode_requests": 2,
+        "decode_tokens_scheduled": 2,
+        "prefill_chunk_pairs": [[4, 8]],
+        "decode_kv_lens": [100, 120],
+    }
+    text = f"(EngineCore pid=11) INFO [core.py:632] VibeSimAlignmentIteration {json.dumps(record)}"
+    api_line = '(APIServer pid=10) INFO [serving.py:633] VibeSimAlignmentApiRequestTiming {"schema_version":3}'
+    first, second = text.index("[[4"), text.index("120")
+    # A record longer than one flush reaches the shared log in pieces, and other processes' whole
+    # lines can land between the pieces; here it is split twice.
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        f"{text[:first]}{api_line}\n{text[first:second]}(APIServer pid=10) INFO GET /health\n"
+        f"{text[second:]}\n(EngineCore pid=11) INFO plain line (APIServer pid=10) quoted\nunprefixed\n"
+    )
+
+    lines = list(record_extraction.iter_log_lines(server_log))
+    assert text in lines and api_line in lines and "(APIServer pid=10) INFO GET /health" in lines
+    # A line without a structured record is never joined, even when an unprefixed line follows.
+    assert lines[-2:] == ["(EngineCore pid=11) INFO plain line (APIServer pid=10) quoted", "unprefixed"]
+    output = tmp_path / "metrics.jsonl"
+    assert record_extraction.extract_metrics_jsonl(server_log, output) == 1
+    assert json.loads(output.read_text()) == {**record, "dp_rank": 0}
+
+
 def test_structured_vllm_iteration_v2_requires_observed_timing(tmp_path):
     record = {
         "schema_version": 2,

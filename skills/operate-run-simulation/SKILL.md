@@ -142,8 +142,8 @@ at eval. The default set is the arch's const-default. To tailor it per kernel:
    ```
    (omit the FILE arg to print to stdout instead.)
    `options` is already dtype- AND GPU-filtered (from each kernel's declared
-   `BackendSupport`), so it lists only the backends legal for this run (e.g. `trt`
-   is dropped off a non-Blackwell GPU).
+   `BackendSupport`), so it lists only the backends legal for this run (e.g. an
+   sm_100f-only backend is dropped off a non-Blackwell GPU).
 
 2. **Edit `backends.yaml`** — set each role to a subset (`[fa3]` forces one,
    `[fa2, fa3]` is best-of-N), keep the default, or point it at a `${var}` declared

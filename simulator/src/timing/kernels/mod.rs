@@ -41,6 +41,7 @@ pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod indexed_row_copy;
 pub mod inv_rope_fp8_quant;
 pub mod kda_chunk_prefill;
 pub mod kda_recurrent_decode;
@@ -64,21 +65,27 @@ pub mod moe_fused_topk;
 pub mod moe_sink_gate_select;
 pub mod moe_sum;
 pub mod moe_topk_softplus_sqrt;
+pub mod multi_add_rms_norm;
 pub mod mxfp4_marlin_moe_gemm;
 pub mod nvfp4_fused_moe;
 pub mod nvfp4_quant;
 pub mod p2p_inter;
 pub mod p2p_intra;
 pub mod packed_kv_cache_gather;
+pub mod paged_attn_batch_decode;
+pub mod paged_attn_batch_prefill;
 pub mod q_kv_rms_norm;
 pub mod q_pad_kv_rope_mxfp8_insert;
+pub mod qk_rms_norm_rope_gate;
 pub mod qnorm_rope_kv_insert;
 pub mod rel_bias_attention;
 pub mod residual_rms_norm;
 pub mod rms_norm;
 pub mod rs_sconv_ag_residual_rms_norm;
 pub mod sconv_qkvr_prep;
+pub mod silu_and_mul;
 pub mod single_gemm;
+pub mod static_fp8_quant;
 pub mod vllm_fused_moe;
 pub mod vllm_mla_rope;
 
@@ -223,6 +230,10 @@ pub use gemm_fp32_output::{
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
 };
+pub use indexed_row_copy::{
+    IndexedRowCopyKernel, IndexedRowCopyKernelConfig, IndexedRowCopyKernelInput,
+    IndexedRowCopySpec,
+};
 pub use inv_rope_fp8_quant::{
     InvRopeFp8QuantKernel, InvRopeFp8QuantKernelConfig, InvRopeFp8QuantKernelInput,
     InvRopeFp8QuantSpec,
@@ -299,6 +310,10 @@ pub use moe_topk_softplus_sqrt::{
     MoeTopkSoftplusSqrtKernel, MoeTopkSoftplusSqrtKernelConfig, MoeTopkSoftplusSqrtKernelInput,
     MoeTopkSoftplusSqrtSpec,
 };
+pub use multi_add_rms_norm::{
+    MultiAddRmsNormKernel, MultiAddRmsNormKernelConfig, MultiAddRmsNormKernelInput,
+    MultiAddRmsNormSpec,
+};
 pub use mxfp4_marlin_moe_gemm::{
     Mxfp4MarlinMoeFcRole, Mxfp4MarlinMoeGemmKernel, Mxfp4MarlinMoeGemmKernelConfig,
     Mxfp4MarlinMoeGemmKernelInput, Mxfp4MarlinMoeGemmSpec,
@@ -315,12 +330,24 @@ pub use packed_kv_cache_gather::{
     PackedKvCacheGatherKernel, PackedKvCacheGatherKernelConfig, PackedKvCacheGatherKernelInput,
     PackedKvCacheGatherMode, PackedKvCacheGatherSpec,
 };
+pub use paged_attn_batch_decode::{
+    PagedAttnBatchDecodeKernel, PagedAttnBatchDecodeKernelConfig, PagedAttnBatchDecodeKernelInput,
+    PagedAttnBatchDecodeSpec,
+};
+pub use paged_attn_batch_prefill::{
+    PagedAttnBatchPrefillKernel, PagedAttnBatchPrefillKernelConfig,
+    PagedAttnBatchPrefillKernelInput, PagedAttnBatchPrefillSpec,
+};
 pub use q_kv_rms_norm::{
     QKvRmsNormKernel, QKvRmsNormKernelConfig, QKvRmsNormKernelInput, QKvRmsNormSpec,
 };
 pub use q_pad_kv_rope_mxfp8_insert::{
     QPadKvRopeMxfp8InsertKernel, QPadKvRopeMxfp8InsertKernelConfig,
     QPadKvRopeMxfp8InsertKernelInput, QPadKvRopeMxfp8InsertSpec,
+};
+pub use qk_rms_norm_rope_gate::{
+    QkRmsNormRopeGateKernel, QkRmsNormRopeGateKernelConfig, QkRmsNormRopeGateKernelInput,
+    QkRmsNormRopeGateSpec,
 };
 pub use qnorm_rope_kv_insert::{
     QnormRopeKvInsertKernel, QnormRopeKvInsertKernelConfig, QnormRopeKvInsertKernelInput,
@@ -342,8 +369,14 @@ pub use rs_sconv_ag_residual_rms_norm::{
 pub use sconv_qkvr_prep::{
     SconvQkvrPrepKernel, SconvQkvrPrepKernelConfig, SconvQkvrPrepKernelInput, SconvQkvrPrepSpec,
 };
+pub use silu_and_mul::{
+    SiluAndMulKernel, SiluAndMulKernelConfig, SiluAndMulKernelInput, SiluAndMulSpec,
+};
 pub use single_gemm::{
     SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput, SingleGemmSpec,
+};
+pub use static_fp8_quant::{
+    StaticFp8QuantKernel, StaticFp8QuantKernelConfig, StaticFp8QuantKernelInput, StaticFp8QuantSpec,
 };
 pub use vllm_fused_moe::{
     VllmFusedMoeKernel, VllmFusedMoeKernelConfig, VllmFusedMoeKernelInput, VllmFusedMoeSpec,

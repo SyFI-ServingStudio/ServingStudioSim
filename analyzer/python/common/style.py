@@ -26,7 +26,7 @@ _BACKEND_STYLE = {
     "fa3": ("#F58518", "^"),          # flashinfer attn v3 — orange triangle
     "torch": ("#54A24B", "s"),        # torch reference — green square
     "torch_linear": ("#B279A2", "D"),  # torch linear — purple diamond
-    "trt": ("#E45756", "v"),          # trtllm-gen — red down-triangle
+    "flashinfer_trtllm_gen": ("#E45756", "v"),  # trtllm-gen — red down-triangle
     "deepgemm": ("#72B7B2", "P"),     # deep_gemm — teal plus
 }
 _FALLBACK_COLORS = ["#9D755D", "#BAB0AC", "#EECA3B", "#FF9DA6", "#79706E", "#D37295"]

@@ -105,7 +105,10 @@ def test_pack_check_reports_no_errors(pack):
 def test_campaign_rejects_measured_routing_files_under_synthetic_routing(pack, routing):
     original = pack.variant_of(pack.cases[0])
     arch = dict(original.arch)
-    # Each pack carries one measured artifact: a marginal or a token corpus.
+    # Each MoE pack carries one measured artifact: a marginal or a token corpus.
+    # A dense model routes nothing, so there is no artifact to misuse.
+    if not {"expert_popularity_file", "token_corpus_file"} & arch.keys():
+        pytest.skip(f"{pack.name}: no measured routing artifact (dense arch)")
     kind = "popularity" if "expert_popularity_file" in arch else "corpus"
     if routing is None:
         arch.pop("routing", None)
@@ -134,6 +137,9 @@ def test_pack_declares_provisional_inputs_explicitly(pack):
     accepted run — but it must be named, so `--record` can refuse by default."""
     for name in pack.provisional_fields:
         slug, _, field = name.partition(".")
+        if slug == "pack":
+            assert getattr(pack, field).derived_from.strip()
+            continue
         case = pack.case_named(slug)
         assert case is not None
         assert case.calibrated_fields[field].derived_from.strip(), (
@@ -366,6 +372,68 @@ def test_render_rejects_a_variant_that_sets_a_per_case_field(pack, tmp_path):
         from launcher.alignment_campaign.render import case_documents
 
         case_documents(patched, case, host, tmp_path, REPO_ROOT)
+
+
+def _simulated_worker(pack, case, tmp_path):
+    from launcher.alignment_campaign.render import case_documents
+
+    host = check_module.host_for(pack, None)
+    documents = case_documents(pack, case, host, tmp_path, REPO_ROOT)
+    return documents[f"{PHASE_CONFIG_STEMS['simulation']}.yaml"]["pools"]["main"]["groups"][0]["worker"]
+
+
+def test_render_defaults_the_multiplier_to_neutral_without_a_pack_declaration(pack, tmp_path):
+    bare = dataclasses.replace(pack, gpu_time_multiplier=None)
+    assert _simulated_worker(bare, bare.cases[0], tmp_path)["gpu_time_multiplier"] == 1.0
+
+
+def test_render_applies_the_pack_multiplier_to_every_case(pack, tmp_path):
+    """One calibrated multiplier, measured outside the matrix, reaches every
+    case's simulated worker unchanged."""
+    declared = pack_module.Calibrated(
+        value=1.0625, status="measured", derived_from="reference kernel-align",
+        evidence="logs/reference/analysis_kernel",
+    )
+    patched = dataclasses.replace(pack, gpu_time_multiplier=declared)
+    for case in patched.cases[:3]:
+        worker = _simulated_worker(patched, case, tmp_path / case.slug)
+        assert worker["gpu_time_multiplier"] == 1.0625
+
+
+def test_a_variant_cannot_set_the_multiplier_the_pack_owns(pack, tmp_path):
+    case = pack.cases[0]
+    variant = pack.variant_of(case)
+    poisoned = dataclasses.replace(variant, worker={**variant.worker, "gpu_time_multiplier": 1.2})
+    patched = dataclasses.replace(pack, variants={**pack.variants, variant.name: poisoned})
+    with pytest.raises(PackError, match="gpu_time_multiplier"):
+        _simulated_worker(patched, case, tmp_path)
+
+
+def _pack_with_multiplier(pack, tmp_path, multiplier):
+    import yaml
+
+    root = tmp_path / pack.root.name
+    shutil.copytree(pack.root, root)
+    document = yaml.safe_load((root / "campaign.yaml").read_text())
+    document["gpu_time_multiplier"] = multiplier
+    (root / "campaign.yaml").write_text(yaml.safe_dump(document, sort_keys=False))
+    return root
+
+
+def test_pack_multiplier_is_a_calibrated_value_with_provenance(pack, tmp_path):
+    root = _pack_with_multiplier(pack, tmp_path, {
+        "value": 1.08, "status": "provisional", "derived_from": "reference kernel-align",
+    })
+    loaded = load_pack(root)
+    assert loaded.gpu_time_multiplier.value == 1.08
+    assert loaded.provisional_fields[0] == "pack.gpu_time_multiplier"
+
+
+@pytest.mark.parametrize("multiplier", [1.08, {"value": 0, "status": "measured", "derived_from": "x"}])
+def test_pack_multiplier_rejects_a_bare_or_non_positive_value(pack, tmp_path, multiplier):
+    root = _pack_with_multiplier(pack, tmp_path, multiplier)
+    with pytest.raises(PackError, match="gpu_time_multiplier"):
+        load_pack(root)
 
 
 @pytest.mark.parametrize(

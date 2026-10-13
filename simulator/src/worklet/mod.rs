@@ -70,6 +70,9 @@ pub mod vllm_fp8_moe_router_local;
 pub mod vllm_glm52_dense_ffn_local;
 pub mod vllm_glm52_dsa_attn_local;
 pub mod vllm_glm52_shared_expert_local;
+pub mod vllm_nvfp4_swiglu_mlp_local;
+pub mod vllm_qwen35_gated_gqa_local;
+pub mod vllm_qwen35_gdn_local;
 
 pub use attn_block_tp::{
     AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWorkletInput,
@@ -300,4 +303,16 @@ pub use vllm_glm52_dsa_attn_local::{
 pub use vllm_glm52_shared_expert_local::{
     VllmGlm52SharedExpertLocalWorklet, VllmGlm52SharedExpertLocalWorkletConfig,
     VllmGlm52SharedExpertLocalWorkletInput, VllmGlm52SharedExpertLocalWorkletResolved,
+};
+pub use vllm_nvfp4_swiglu_mlp_local::{
+    VllmNvfp4SwigluMlpLocalWorklet, VllmNvfp4SwigluMlpLocalWorkletConfig,
+    VllmNvfp4SwigluMlpLocalWorkletInput, VllmNvfp4SwigluMlpLocalWorkletResolved,
+};
+pub use vllm_qwen35_gated_gqa_local::{
+    VllmQwen35GatedGqaLocalWorklet, VllmQwen35GatedGqaLocalWorkletConfig,
+    VllmQwen35GatedGqaLocalWorkletInput, VllmQwen35GatedGqaLocalWorkletResolved,
+};
+pub use vllm_qwen35_gdn_local::{
+    VllmQwen35GdnLocalWorklet, VllmQwen35GdnLocalWorkletConfig, VllmQwen35GdnLocalWorkletInput,
+    VllmQwen35GdnLocalWorkletResolved,
 };

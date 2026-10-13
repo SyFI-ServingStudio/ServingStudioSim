@@ -21,13 +21,12 @@ per-request mean length ``avg_len = max(1, total_tokens // batch_size)`` (which
 approximates a heterogeneous batch by its mean kv length; error tracked
 separately), then sets ``q_len = 1`` per request, ``kv_len = avg_len``, non-causal.
 
-Backends ``{fa2, fa2_cudagraph, fa3, trt, cudnn}``: each registers its own spec
+Backends ``{fa2, fa2_cudagraph, fa3, cudnn}``: each registers its own spec
 -> the same ``args_schema`` and table, routing to
 ``profile_flashinfer_attn_decode_<backend>``. ``fa2_cudagraph`` keeps FA2 math
 but enables FlashInfer's CUDA-graph plan, matching vLLM pure decode's split main
-+ merge launch sequence. ``trt`` is SM10x-only and raises
-``ProfilerNotImplemented`` here (kept registered for a future SM10x path); ``cudnn``
-raises for fp8.
++ merge launch sequence. ``cudnn`` raises for fp8. FlashInfer's trtllm-gen decode
+is the ``flashinfer_trtllm_gen`` backend of ``paged_attn_batch_decode``.
 
 Shape split: static Config = ``(num_qo_heads, num_kv_heads, head_dim, q_dtype,
 kv_dtype, o_dtype)``; runtime 2D sweep Input = ``(batch_size, total_tokens)``.
@@ -55,7 +54,7 @@ from profiling.db.registry import (
 KIND: str = "flashinfer_attn_decode"
 
 _RUNNER_MODULE = "profiling.runners.attention.flashinfer_decode"
-_BACKENDS = ("fa2", "fa2_cudagraph", "fa3", "trt", "cudnn")
+_BACKENDS = ("fa2", "fa2_cudagraph", "fa3", "cudnn")
 
 # Per-backend capability on compute (q_dtype) and kv-cache (kv_dtype) axes; fa2
 # runs bf16-q / fp8-kv. See flashinfer_attn_prefill for the rationale.
@@ -74,11 +73,6 @@ _SUPPORTS = {
     ),
     "cudnn": BackendSupport(
         compute=frozenset({DType.BF16}), kv=frozenset({DType.BF16})
-    ),
-    "trt": BackendSupport(
-        compute=frozenset({DType.FP8_E4M3}),
-        kv=frozenset({DType.FP8_E4M3}),
-        sm_targets=frozenset({"sm_100f"}),
     ),
 }
 
@@ -156,13 +150,6 @@ _BACKEND_DOCS = {
     ),
     "fa3": BackendDoc(
         summary="FlashInfer BatchDecodeWithPagedKVCacheWrapper with FA3 kernels.",
-        url=_DECODE_DOCS_URL,
-    ),
-    "trt": BackendDoc(
-        summary=(
-            "FlashInfer's trtllm-gen kernels, for Blackwell. Registered but not "
-            "measured yet: the runner raises on every GPU."
-        ),
         url=_DECODE_DOCS_URL,
     ),
     "cudnn": BackendDoc(

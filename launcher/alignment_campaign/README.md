@@ -88,10 +88,14 @@ named input. Planning is a pure function (`execute.plan_phase`), which is what
 makes it testable on CPU.
 
 For `--phase simulation`, worker settings come from `simulation.yaml`, including
-`gpu_time_multiplier` (default 1.0). Kernel analysis is an independent phase, not
-a prerequisite for simulation. To adopt a reported multiplier, set it explicitly
-in the experiment preset and record the source and approximation in experiment
-notes. The campaign does not read calibration reports or inject worker overrides.
+`gpu_time_multiplier`. Kernel analysis is an independent phase, not a
+prerequisite for simulation. The campaign never reads a case's own calibration
+report back into that case. A pack may instead declare one top-level, calibrated
+`gpu_time_multiplier` (`value`, `status`, `derived_from`, `evidence`) measured on
+a workload outside the matrix, for example the `recommended_gpu_time_multiplier`
+of a reference trace's kernel-align. Rendering writes that value into every
+case's simulated worker. Without the declaration it renders the neutral 1.0. A
+variant may not set it. Each case's own recommendation stays a reported metric.
 
 `extract` also includes `provenance.request_population_audit` for E2E results.
 Independent CSV traces resolve simulator IDs by input row order, then validate

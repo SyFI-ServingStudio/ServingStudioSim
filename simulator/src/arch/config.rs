@@ -119,6 +119,11 @@ const fn default_mimo_v2_max_model_len() -> u32 {
     131_072
 }
 
+/// The Qwen3.8-27B capture's `--max-model-len`.
+const fn default_qwen35_max_model_len() -> u32 {
+    131_072
+}
+
 /// The captured GLM-5.3-Flash deployment ran `--enable-expert-parallel`.
 const fn default_glm53_flash_enable_expert_parallel() -> bool {
     true
@@ -1091,6 +1096,27 @@ pub enum IterArchSel {
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },
+    /// Qwen3.5-family hybrid decoders (`Qwen3_5ForConditionalGeneration`,
+    /// text only) with ModelOpt mixed-precision weights (FP8 per-tensor
+    /// attention projections, NVFP4 MLP and lm_head) on one GPU under vLLM:
+    /// Gated DeltaNet and gated-GQA layers (FlashInfer trtllm-gen, FP8 KV),
+    /// each with a dense SwiGLU MLP. Precisions come from the checkpoint's
+    /// `quantization_config`; `fp8` is not read.
+    Qwen35VllmNvfp4GdnDense {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Configured context cap; each request's context is validated
+        /// against it.
+        #[serde(default = "default_qwen35_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). The compiled
+        /// pieces run on the token count padded up to the next captured size;
+        /// a uniform decode replays a FULL graph, so the GDN core and decode
+        /// attention run padded too. Empty: no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
 }
 
 impl IterArchSel {
@@ -1122,7 +1148,8 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. }
             | Self::InklingVllmNvfp4RelAttnMoe { model, .. }
-            | Self::MimoV2VllmFp8SwaMoe { model, .. } => model,
+            | Self::MimoV2VllmFp8SwaMoe { model, .. }
+            | Self::Qwen35VllmNvfp4GdnDense { model, .. } => model,
         }
     }
 
@@ -1145,7 +1172,8 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { max_model_len, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. }
             | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. }
-            | Self::MimoV2VllmFp8SwaMoe { max_model_len, .. } => Ok(*max_model_len),
+            | Self::MimoV2VllmFp8SwaMoe { max_model_len, .. }
+            | Self::Qwen35VllmNvfp4GdnDense { max_model_len, .. } => Ok(*max_model_len),
             Self::DeepseekV41Vllm {
                 model,
                 max_model_len,

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
 from .engine_records import (
@@ -42,6 +43,46 @@ _VLLM_HUMAN_ITERATION_RE = re.compile(
     r"\[core\.py:434\]\s+Iteration\((\d+)\):.*"
     r"iteration elapsed time:\s+([0-9]+(?:\.[0-9]+)?)\s+ms\s*$"
 )
+
+
+# One engine process's log prefix, `(EngineCore_DP0 pid=7) `, possibly colored.
+_PROCESS_PREFIX_RE = re.compile(r"(?:\x1b\[[\d;]*m)?\([A-Za-z][\w-]* pid=\d+\)")
+_RECORD_START_RE = re.compile(r"VibeSimAlignment\w+\s+\{")
+
+
+def _splice_point(line: str) -> int | None:
+    """Where another process's line was written into the middle of a structured record, if it was."""
+    record = _RECORD_START_RE.search(line)
+    if record is None:
+        return None
+    spliced = _PROCESS_PREFIX_RE.search(line, record.end())
+    return None if spliced is None else spliced.start()
+
+
+def iter_log_lines(server_log: Path) -> Iterator[str]:
+    """Yield a server log's lines with structured records that another process split rejoined.
+
+    The engine processes share one log, and a line longer than the writer's flush size (64 KiB in
+    practice) reaches it as several writes. Another process's whole line can land between them:
+    the record's head then ends in that line, and the record's tail follows as the next physical
+    line, the only kind of line without a process prefix. Each such tail is joined back onto its
+    record (repeatedly, for a record split more than once) and the interleaved line is kept as
+    its own line. Lines without a structured record are never touched.
+    """
+    with Path(server_log).open(errors="replace") as source:
+        held: str | None = None
+        for raw in source:
+            line = raw.rstrip("\n")
+            if held is not None:
+                splice = _splice_point(held)
+                if splice is not None and _PROCESS_PREFIX_RE.match(line) is None:
+                    yield held[splice:]
+                    held = held[:splice] + line
+                    continue
+                yield held
+            held = line
+        if held is not None:
+            yield held
 
 
 def _vllm_engine_core_prefixes(line: str) -> list[int]:
@@ -121,7 +162,7 @@ def extract_metrics_jsonl(
         "prefill_chunk_pairs",
         "decode_kv_lens",
     }
-    lines = Path(server_log).read_text(errors="replace").splitlines()
+    lines = list(iter_log_lines(server_log))
     candidates_by_line: dict[int, frozenset[int]] = {}
     framed_rank_by_line: dict[int, int] = {}
     human_iterations: list[tuple[int, float, frozenset[int]]] = []
@@ -363,7 +404,7 @@ def extract_request_timings_jsonl(
     # Which of these an engine can actually report differs; see engine_records.
     del api_duration_fields, api_v2_duration_fields, api_v3_duration_fields
     required = {"schema_version", *ttft_duration_fields}
-    log_lines = Path(server_log).read_text(errors="replace").splitlines()
+    log_lines = list(iter_log_lines(server_log))
     api_rows: dict[str, dict] = {}
     for line in log_lines:
         api_match = _ALIGNMENT_API_REQUEST_TIMING_RE.search(line)
@@ -696,11 +737,8 @@ def extract_expert_popularity(
     discarded_outside_window = 0
     aggregate_counts: list[list[int]] | None = None
     seen_owner_steps: set[tuple[int, int]] = set()
-    with (
-        Path(server_log).open(errors="replace") as source,
-        Path(out_jsonl).open("w") as output_file,
-    ):
-        for line in source:
+    with Path(out_jsonl).open("w") as output_file:
+        for line in iter_log_lines(server_log):
             match = _ALIGNMENT_EXPERT_LOAD_RE.search(line)
             if match is None:
                 continue
@@ -935,7 +973,7 @@ def extract_dp_rank_by_device(
     if not records.emits_worker_records:
         return None
     rows = []
-    for line in Path(server_log).read_text(errors="replace").splitlines():
+    for line in iter_log_lines(server_log):
         match = _ALIGNMENT_WORKER_RE.search(line)
         if match is None:
             continue

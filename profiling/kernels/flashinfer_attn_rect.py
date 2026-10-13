@@ -19,12 +19,10 @@ encoding (``kv_len = prefix_len + append_len`` >= ``q_len``) cannot. The runner
 ``profiling.runners.attention.flashinfer_attn_prefill_and_rect``) passes these
 straight to the ragged wrapper.
 
-Backends ``{fa2, fa3, trt, cudnn}`` are ServingStudioSim backend strings, not kinds: each
+Backends ``{fa2, fa3, cudnn}`` are ServingStudioSim backend strings, not kinds: each
 registers its own spec -> the same ``args_schema`` and table, routing to its own
 ``profile_flashinfer_attn_rect_<backend>`` entry. Unsupported combos raise
-``ProfilerNotImplemented`` at profile time: ``cudnn+fp8``, and ``trt`` entirely
-(trtllm-gen has no ragged kernel and is SM10x-only — kept registered for a future
-paged SM10x path).
+``ProfilerNotImplemented`` at profile time: ``cudnn+fp8``.
 
 Shape split: static Config = ``(num_qo_heads, num_kv_heads, head_dim, q_dtype,
 kv_dtype, o_dtype)``; runtime 2D sweep Input = ``(q_len, kv_len)``.
@@ -53,7 +51,7 @@ from profiling.db.registry import (
 KIND: str = "flashinfer_attn_rect"
 
 _RUNNER_MODULE = "profiling.runners.attention.flashinfer_attn_prefill_and_rect"
-_BACKENDS = ("fa2", "fa3", "trt", "cudnn")
+_BACKENDS = ("fa2", "fa3", "cudnn")
 
 # Per-backend capability on compute (q_dtype) and kv-cache (kv_dtype) axes; fa2
 # runs bf16-q / fp8-kv. See flashinfer_attn_prefill for the rationale.
@@ -67,11 +65,6 @@ _SUPPORTS = {
     ),
     "cudnn": BackendSupport(
         compute=frozenset({DType.BF16}), kv=frozenset({DType.BF16})
-    ),
-    "trt": BackendSupport(
-        compute=frozenset({DType.FP8_E4M3}),
-        kv=frozenset({DType.FP8_E4M3}),
-        sm_targets=frozenset({"sm_100f"}),
     ),
 }
 
@@ -120,7 +113,7 @@ DOC = KernelDoc(
         "requests of different lengths.",
         "The fp8 path needs fp8 queries and KV with a non-fp8 output, so bf16 "
         "queries over fp8 KV are not measured.",
-        "cudnn measures no fp8; trt has no ragged kernel and records no rows.",
+        "cudnn measures no fp8.",
     ),
     # No separate PyTorch reference implementation exists for this attention kind.
     reference=None,
@@ -131,9 +124,6 @@ _BACKEND_DOCS = {
         summary="FlashInfer FA2 non-causal ragged attention with a measured KV split search."
     ),
     "fa3": BackendDoc(summary="FlashInfer's non-causal ragged wrapper with FA3 kernels."),
-    "trt": BackendDoc(
-        summary="FlashInfer trtllm-gen is registered but has no ragged rect kernel to measure."
-    ),
     "cudnn": BackendDoc(
         summary="PyTorch scaled_dot_product_attention pinned to cuDNN for non-causal attention."
     ),

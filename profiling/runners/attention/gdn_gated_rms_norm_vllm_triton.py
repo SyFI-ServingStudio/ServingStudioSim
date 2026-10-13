@@ -28,7 +28,7 @@ from profiling.runners.exceptions import (
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "gdn_gated_rms_norm:vllm_triton"
-_CALLABLE_MODULE = "vllm.model_executor.layers.fla.ops.layernorm_guard"
+_CALLABLE_MODULE = "vllm.third_party.flash_linear_attention.ops.layernorm_guard"
 _CALLABLE_NAME = "rmsnorm_fn"
 _KERNEL_NAME = "layer_norm_fwd_kernel"
 _MAX_BF16_HIDDEN = 32768

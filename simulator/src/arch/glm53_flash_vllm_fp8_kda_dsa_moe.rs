@@ -1415,9 +1415,11 @@ pub(crate) fn kda_layer_state_bytes_per_request(resolved: &Glm53FlashVllmResolve
 /// 2176 tokens") and 1152 at TP8.
 pub(crate) fn hybrid_block_tokens(kda_state_page_bytes: u64, mla_bytes_per_token: u64) -> u32 {
     const KERNEL_ALIGNMENT_TOKENS: u64 = 128;
-    let aligned_page = KERNEL_ALIGNMENT_TOKENS * mla_bytes_per_token.max(1);
-    let blocks = kda_state_page_bytes.div_ceil(aligned_page).max(1);
-    u32::try_from(KERNEL_ALIGNMENT_TOKENS * blocks).expect("hybrid block size exceeds u32")
+    crate::arch::kv_layout::hybrid_attention_block_tokens(
+        KERNEL_ALIGNMENT_TOKENS,
+        kda_state_page_bytes,
+        mla_bytes_per_token,
+    )
 }
 
 impl Glm53FlashVllmModel {

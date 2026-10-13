@@ -44,9 +44,15 @@ use crate::timing::kernels::{
 
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
+use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
+use crate::timing::kernels::{
+    MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput, SiluAndMulKernelInput,
+    StaticFp8QuantKernelInput,
+};
+use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
 /// fan-out the attention op summed into one slot (many prefill requests fold to a
@@ -70,6 +76,14 @@ pub struct Dflash2DraftAttnLog {
 #[derive(Clone, Serialize)]
 pub struct GdnCausalConvPrefillLog {
     pub sequence_lengths: Vec<u32>,
+    /// Single-token decode rows the same varlen launch convolves ahead of the
+    /// prefills (a mixed step); absent when there are none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub decode_rows: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Sparse-MLA prefill aggregating leaf input: every request-local `(Q, S)` cell
@@ -164,6 +178,8 @@ log_inputs! {
     GemmFp32Output => GemmFp32OutputKernelInput,
     RelBiasAttention => RelBiasAttentionKernelInput,
     Fa4VarlenAttention => Fa4VarlenAttentionKernelInput,
+    PagedAttnBatchDecode => PagedAttnBatchDecodeKernelInput,
+    PagedAttnBatchPrefill => PagedAttnBatchPrefillKernelInput,
     MlaRopeQuantizeFp8 => MlaRopeQuantizeFp8KernelInput,
     MoeFinalizeFuseShared => MoeFinalizeFuseSharedKernelInput,
     MhcRmsNorm => MhcRmsNormKernelInput,
@@ -188,6 +204,11 @@ log_inputs! {
     DsaTopkPrefill => DsaTopkPrefillKernelInput,
     VllmFusedMoe => VllmFusedMoeKernelInput,
     VllmMlaRope => VllmMlaRopeKernelInput,
+    MultiAddRmsNorm => MultiAddRmsNormKernelInput,
+    SiluAndMul => SiluAndMulKernelInput,
+    StaticFp8Quant => StaticFp8QuantKernelInput,
+    IndexedRowCopy => IndexedRowCopyKernelInput,
+    QkRmsNormRopeGate => QkRmsNormRopeGateKernelInput,
     AllReduce   => AllReduceKernelInput,
     AllReduceFusion => AllReduceFusionKernelInput,
     AllReduceResidualRmsNorm => AllReduceResidualRmsNormKernelInput,

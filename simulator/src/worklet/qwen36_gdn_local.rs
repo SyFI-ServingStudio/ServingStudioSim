@@ -527,6 +527,7 @@ fn derive_work(input: &Qwen36GdnLocalWorkletInput) -> Result<WorkInputs, String>
         },
         prefill: GdnPrefillOpInput {
             sequence_lengths: input.prefill_sequence_lengths.clone(),
+            decode_rows: 0,
         },
         state_scatter: ElementwiseKernelInput {
             num_tokens: prefill_state_units,

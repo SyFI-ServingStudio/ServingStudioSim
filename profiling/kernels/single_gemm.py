@@ -9,12 +9,13 @@ Wire string: ``"single_gemm"`` — matches Rust ``KernelSpec::KIND`` in
 by ``profiling.facade`` to generate ``get_single_gemm_times`` /
 ``count_missing_single_gemm``.
 
-Eight backends share this kind/table/schema: ``torch`` (contiguous-RHS
+Nine backends share this kind/table/schema: ``torch`` (contiguous-RHS
 ``torch.mm``), ``torch_linear`` (model-weight-layout ``F.linear`` in the main
 environment), ``torch_linear_vllm`` (the same expression in vLLM's pinned
 environment), ``sglang_bf16_auto`` and ``sglang_fused_a_auto`` (SGLang's
 production BF16 dispatches, SM100 only), ``deepgemm`` (FP8 dense GEMM,
-``dtype = fp8_e4m3``), ``flashinfer_cutedsl`` (vLLM's default NVFP4 W4A4
+``dtype = fp8_e4m3``), ``flashinfer_fp8_tensor`` (vLLM's static per-tensor FP8
+linear on SM10x, ``dtype = fp8_e4m3``), ``flashinfer_cutedsl`` (vLLM's default NVFP4 W4A4
 linear on SM10x, ``dtype = nvfp4_e2m1``), and ``flashinfer_mxfp8`` (MXFP8 dense
 linear: activation quant + FlashInfer CuTe-DSL block-scaled GEMM,
 ``dtype = mxfp8_e4m3``).
@@ -70,13 +71,15 @@ DOC = KernelDoc(
         "C[m, n] = A[m, k] · B[k, n]",
         "TFLOPS = 2·m·n·k / time",
         "GB/s = (m·k + k·n + m·n) · bytes per element / time",
-        "deepgemm (fp8 in, bf16 out): GB/s = (m·k + k·n + 2·m·n) / time",
+        "deepgemm, flashinfer_fp8_tensor (fp8 in, bf16 out): GB/s = (m·k + k·n + 2·m·n) / time",
         "flashinfer_cutedsl (nvfp4 in, bf16 out): GB/s = ((m·k + k·n)·(1/2 + 1/16) + 2·m·n) / time",
     ),
     default_metric="tflops",
     caveats=(
         "Inputs are random normal tensors, so data-dependent effects such as "
         "sparsity are not measured.",
+        "deepgemm scales fp8_e4m3 operands per 128-element block; "
+        "flashinfer_fp8_tensor scales each operand by one FP32 scalar.",
         "torch and torch_linear compute the same product. They are separate rows "
         "because the weight layout changes which cuBLAS kernel runs.",
         "flashinfer_mxfp8 takes bf16 activations and includes their MXFP8 "
@@ -86,10 +89,12 @@ DOC = KernelDoc(
     method=(
         f"{CUPTI_METHOD} The torch and SGLang backends count overlapping launches "
         "once, by the time the GPU is busy, because Blackwell can split one logical "
-        "GEMM into several; deepgemm, flashinfer_cutedsl and flashinfer_mxfp8 sum "
-        "their launches. flashinfer_cutedsl times only the GEMM: the activation "
-        "quantization before it is the nvfp4_quant kind. flashinfer_mxfp8 includes "
-        "its activation quantization and autotunes the call once before timing."
+        "GEMM into several; deepgemm, flashinfer_fp8_tensor, flashinfer_cutedsl and "
+        "flashinfer_mxfp8 sum their launches. flashinfer_cutedsl times only the GEMM: "
+        "the activation quantization before it is the nvfp4_quant kind. flashinfer_mxfp8 includes "
+        "its activation quantization and autotunes the call once before timing. "
+        "flashinfer_fp8_tensor times only the GEMM on already-quantized fp8 input, "
+        "after autotuning FlashInfer's hybrid token buckets as vLLM's warmup does."
     ),
     # torch.mm is its own reference: the torch backend measures exactly it.
     reference=None,
@@ -244,6 +249,39 @@ register(
                 "before timing, as vLLM passes them."
             ),
             url="https://github.com/deepseek-ai/DeepGEMM",
+        ),
+    )
+)
+
+# vLLM's static per-tensor FP8 linear (ModelOpt FP8) on SM10x:
+# FlashInferFP8ScaledMMLinearKernel heads _POSSIBLE_FP8_KERNELS and its
+# is_supported requires compute capability 100+; flashinfer.bmm_fp8's common
+# check (_check_bmm_fp8_problem_size) admits 100/103/107, the sm_100f family.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_fp8_tensor",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.flashinfer_fp8_tensor",
+            function_name="profile_single_gemm_flashinfer_fp8_tensor",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's FlashInferFP8ScaledMMLinearKernel after its activation "
+                "quantization: flashinfer bmm_fp8(backend='auto') on fp8 A and the "
+                "column-major fp8 weight, one FP32 scale each, bf16 output, tactic "
+                "autotuned per hybrid token bucket. SM10x only."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py",
         ),
     )
 )

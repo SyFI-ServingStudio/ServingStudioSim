@@ -103,13 +103,15 @@ def _model(config_path: str):
     return load_model(config_path)
 
 
-#: Arch types whose served deployment fixes the MLA latent cache at FP8
-#: (``--kv-cache-dtype fp8_e4m3``), a serving choice the checkpoint config omits.
-_FP8_MLA_CACHE_ARCHS = frozenset(
+#: Arch types whose served deployment fixes the attention KV cache at FP8
+#: (``--kv-cache-dtype fp8``/``fp8_e4m3``), a serving choice the checkpoint config
+#: omits: the MLA latent cache of a DSA arch, the K/V cache of a GQA one.
+_FP8_KV_CACHE_ARCHS = frozenset(
     {
         "glm53_flash_vllm_fp8_kda_dsa_moe",
         "glm53_flash_vllm_fp8_pp_kda_dsa_moe",
         "glm53_flash_vllm_fp8_dp_attn_ep_moe",
+        "qwen35_vllm_nvfp4_gdn_dense",
     }
 )
 
@@ -130,6 +132,9 @@ _FP4_ARCHS = frozenset(
         "glm53_flash_vllm_nvfp4_dp_attn_ep_moe",
         # Inkling NVFP4 (routed experts only; layer 2's stay BF16).
         "inkling_vllm_nvfp4_rel_attn_moe",
+        # Qwen3.8-27B ModelOpt MIXED_PRECISION: NVFP4 MLPs and lm_head, FP8 attention
+        # projections; the scheme's headline is its lowest precision, FP4.
+        "qwen35_vllm_nvfp4_gdn_dense",
     }
 )
 
@@ -145,15 +150,27 @@ _DRAFT_CONFIGS = {"glm53_vllm_nvfp4_dsa_moe_dflash2": "model/config/glm53_dflash
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _with_fp8_mla_cache(model):
+def _with_fp8_kv_cache(model):
+    """Serve every attention spec's persistent KV cache at one byte per element.
+
+    An MLA spec stores its latent in ``mla_cache_dtype_bytes``; a GQA-like spec
+    stores K/V in ``kv_dtype_bytes`` and, given an FP8 cache, runs its prefill
+    math on FP8 queries and keys (``prefill_compute_dtype``). Recurrent state
+    (GDN/KDA) is not KV cache and keeps its own dtype.
+    """
     from dataclasses import replace
 
-    layers = [
-        replace(stack, attn=replace(stack.attn, mla_cache_dtype_bytes=1.0))
-        if hasattr(stack.attn, "mla_cache_dtype_bytes")
-        else stack
-        for stack in model.layers
-    ]
+    def fp8_cache(attn):
+        if hasattr(attn, "mla_cache_dtype_bytes"):
+            return replace(attn, mla_cache_dtype_bytes=1.0)
+        if hasattr(attn, "kv_dtype_bytes"):
+            fields = {"kv_dtype_bytes": 1.0}
+            if hasattr(attn, "prefill_compute_dtype"):
+                fields["prefill_compute_dtype"] = "fp8"
+            return replace(attn, **fields)
+        return attn
+
+    layers = [replace(stack, attn=fp8_cache(stack.attn)) for stack in model.layers]
     return replace(model, layers=layers)
 
 
@@ -184,8 +201,8 @@ def _model_for_spec(spec: dict):
             spec.get("draft_sliding_window"),
         )
     model = _model(spec["config"])
-    if arch_type in _FP8_MLA_CACHE_ARCHS:
-        return _with_fp8_mla_cache(model)
+    if arch_type in _FP8_KV_CACHE_ARCHS:
+        return _with_fp8_kv_cache(model)
     if arch_type != "glm52_vllm_nvfp4_dsa_moe_speculative":
         return model
     mode = spec.get("mtp_mode", "index_share")
@@ -274,8 +291,17 @@ def _check_precision(model, spec: dict) -> None:
     reports weight bytes at 2x the traffic that actually moved — a "minimum"
     larger than the measured value, which silently turns redundancy into a number
     below 1. It is not detectable downstream, so it is rejected here.
+
+    A mixed-precision checkpoint (ModelOpt ``MIXED_PRECISION``) is matched by its
+    headline, lowest-precision compute dtype: an FP4 arch serving NVFP4 MLPs beside
+    FP8 attention projections declares ``fp4`` and needs no ``fp8`` flag, since the
+    config already says which module runs at which precision. An ``fp8`` flag on
+    such an arch would claim the whole model is FP8 and is refused.
     """
     config_quant_dtype = model.quant.compute_dtype if model.quant is not None else None
+    config_dtypes = (
+        "+".join(sorted(model.quant.compute_dtypes)) if model.quant is not None else None
+    )
     arch_quant_dtype = spec.get("arch_quant_dtype", "fp8" if spec["arch_fp8"] else None)
     if arch_quant_dtype is not None and config_quant_dtype is None:
         raise ValueError(
@@ -289,13 +315,13 @@ def _check_precision(model, spec: dict) -> None:
             else "does not declare a matching quantized path"
         )
         raise ValueError(
-            f"{spec['config']} declares a {model.quant.compute_dtype} quantization_config "
+            f"{spec['config']} declares a {config_dtypes} quantization_config "
             f"but the arch {declaration}; "
             "the run and the accountant disagree on precision"
         )
     if config_quant_dtype != arch_quant_dtype:
         raise ValueError(
-            f"{spec['config']} declares {config_quant_dtype} quantized compute but the arch "
+            f"{spec['config']} declares {config_dtypes} quantized compute but the arch "
             f"declares {arch_quant_dtype}; the run and the accountant disagree on precision"
         )
 
