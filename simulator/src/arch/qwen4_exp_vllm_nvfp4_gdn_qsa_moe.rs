@@ -550,7 +550,9 @@ pub fn build_configs(
 /// per block; the PLE conv state and the raw-key ring (never prefix-cached)
 /// take a stride each. A recurrent state keeps `1 + k` blocks (the running
 /// state and one per speculative token); L5 adds align mode's previous-step
-/// block. For Flash-Next at FP8: a 3200-token block and a 43,929,600 B stride.
+/// block to vLLM's concurrency estimate only, since a running request frees
+/// it the step after it crosses a block. For Flash-Next at FP8: a 3200-token
+/// block and a 43,929,600 B stride.
 fn kv_cache_layout(
     model: &Qwen4ExpModelCfg,
     parallel: &Qwen4ExpVllmParallel,
@@ -1678,8 +1680,9 @@ mod tests {
 
     /// vLLM's logged pools at chunk 2048, prefix caching on: 79.80 GiB gives
     /// 1950 blocks and "31.45x" (4,122,425 tokens) at 131,072 tokens; the
-    /// smoke's 78.57 GiB gives 30.97x. One request holds 41 KV blocks, 3 x 5
-    /// GDN, 5 PLE and 1 ring block.
+    /// smoke's 78.57 GiB gives 30.97x. The estimate charges one request 41 KV
+    /// blocks, 3 x 5 GDN, 5 PLE and 1 ring block (62); a running request holds
+    /// 3 x 4 GDN and 4 PLE, so a short one holds 18 of the 1950.
     #[test]
     fn kv_cache_layout_reproduces_vllms_logged_concurrency() {
         use crate::worker::kv::{KvAccounting, KvAccountingOptions};
@@ -1698,5 +1701,19 @@ mod tests {
                 "{gib} GiB: {concurrency} vs {logged}"
             );
         }
+        // At 79.80 GiB the pool is 1950 strides, and a running request under
+        // one block holds 18 of them: 108 at once, the captures' peak.
+        let stride = 43_929_600;
+        let budget = (79.80 * f64::from(1u32 << 30)) as u64;
+        let options = KvAccountingOptions {
+            max_in_flight_tokens: Some(2 * 2048),
+            prefix_caching: true,
+            ..Default::default()
+        };
+        let accounting = KvAccounting::resolve(&layout, options, budget).unwrap();
+        let unit = accounting.bytes_per_unit();
+        assert_eq!(accounting.capacity_units() * unit / stride, 1950);
+        assert_eq!(accounting.held_while_running(256, 1) * unit, 18 * stride);
+        assert_eq!(accounting.needed_to_admit(256) * unit, 18 * stride);
     }
 }

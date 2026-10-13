@@ -59,9 +59,10 @@ often not the weight dtype.
    rank (MLA latent, recurrent state).
 3. **vLLM's overhead on top.** Add page padding (hybrid models unify page
    sizes), the block size, and extra state copies (one more per speculative
-   block). With prefix caching on, `mamba_cache_mode: align` also holds the
-   previous step's state, so a per-request part costs one extra copy. Count the
-   null block as well.
+   block). With prefix caching on, `mamba_cache_mode: align` adds one more
+   copy (the previous step's state) to vLLM's max-concurrency estimate only: a
+   running request holds `1 + num_speculative_blocks` and frees that block the
+   step after crossing a block boundary. Count the null block as well.
 4. **One request at `max_model_len` L, and capacity.** Charge each part by its
    growth:
    - per token: L rounded up to whole blocks;
@@ -70,7 +71,8 @@ often not the weight dtype.
    - per request: bytes × copies.
 
    vLLM's "Maximum concurrency for L tokens per request" is the budget over this
-   one-request charge. Its "GPU KV cache size: N tokens" is a token pool only
+   one-request charge (with the align copy); the requests it actually runs at
+   once are bounded by the held charge (without it). Its "GPU KV cache size: N tokens" is a token pool only
    when every part grows per token.
 5. **Hand off.** Implement the parts as the arch's `kv_cache_layout`
    (`impl-compose-arch`), pin it against the capture's logged concurrency, and
