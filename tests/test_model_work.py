@@ -4600,9 +4600,12 @@ QF_GDN_PROJ = 2 * QF_GDN_MM  # 115,916,800
 QF_QSA_PROJ = 2 * QF_QSA_MM  # 102,891,520
 QF_FFN = 2 * (10 * QF_EXPERT + QF_SHARED)  # 108,139,520
 QF_ROUTER_MM = 2 * QF_ROUTER  # 2,621,440
-# HC: 48 layers x 2 modules of projections, the final mixer's two, plus 2 x 10240
-# per mix and per injected combine: layer 0's attention module has no combine.
-QF_HC = 48 * 2 * 2 * QF_HC_MM + 2 * QF_FINAL_MM + (48 * 4 - 1 + 2) * 2 * QF_W
+# HC at every token: 48 layers x 2 modules of projections, plus 2 x 10240 per mix
+# and per injected combine (layer 0's attention module has no combine; the final
+# mixer's combine counts). The final mixer's down/up and mix feed only lm_head, so
+# they run at the sampled positions.
+QF_HC = 48 * 2 * 2 * QF_HC_MM + (48 * 4 - 1 + 1) * 2 * QF_W
+QF_HC_SAMPLED = 2 * QF_FINAL_MM + 2 * QF_W
 QF_PLE = 2 * QF_PLE_MM + 2 * QF_W  # kv_proj + conv + per-stream key/query dot
 QF_GDN_CORE = 6 * 48 * 128 * 128  # per token per GDN layer
 QF_INDEX_PAIR = 2 * 4 * 128  # per (query, complete group)
@@ -4618,14 +4621,14 @@ def _qf_flops(tokens: int, groups: int, selected: int, sampled: int) -> dict:
         "ffn": 48 * tokens * QF_FFN,
         "router": 48 * tokens * QF_ROUTER_MM,
         "lm_head": sampled * QF_LM_HEAD,
-        "residual_mix": tokens * QF_HC,
+        "residual_mix": tokens * QF_HC + sampled * QF_HC_SAMPLED,
         "engram": tokens * QF_PLE,
     }
 
 
 @requires_qf
 def test_qf_prefill_and_decode_flop_goldens(qf):
-    assert QF_HC == 1_283_215_360 and QF_PLE == 65_638_400
+    assert QF_HC == 1_270_087_680 and QF_HC_SAMPLED == 13_127_680 and QF_PLE == 65_638_400
     # 8192 tokens from an empty cache: the query at context k scores floor(k / 4)
     # complete groups and attends min(k, 2048 + k mod 4) keys (brute-force sums).
     groups = sum(k // 4 for k in range(1, 8193))

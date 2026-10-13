@@ -15,7 +15,11 @@ The residual is ``S = hc_count`` streams of ``hidden`` each. Around every sublay
 The fork fuses each combine with the following module's norm; a combine consumes
 the injection of the module that fed the finished sublayer. The final mixer has no
 inject projection: it combines the last FFN output and mixes the streams into the
-single sampled stream. This is not GLM's Sinkhorn mHC (:mod:`.mhc`).
+single sampled stream. That mixed stream feeds only ``lm_head`` at the sampled
+positions; the MTP drafter reads the combined streams (the fork's
+``_mtp_hidden_buffer``, and ``multi_hidden`` between draft steps). So a final
+mixer's combine is necessary at every token and its down/up/mix only at
+``head_positions``. This is not GLM's Sinkhorn mHC (:mod:`.mhc`).
 
 Necessary FLOPs per token, in the same convention as :mod:`.mhc`:
 
@@ -55,6 +59,9 @@ class GatedHcModule:
     inject: bool
     #: The pending combine this module consumes before mixing (:data:`COMBINES`).
     combine: str
+    #: The mix output feeds only the sampled positions (a final mixer), so its
+    #: down/up/mix run at ``head_positions`` rather than every token.
+    mix_sampled_only: bool = False
 
     def __post_init__(self) -> None:
         if self.combine not in COMBINES:
@@ -64,6 +71,9 @@ class GatedHcModule:
     def width(self) -> int:
         return self.streams * self.hidden
 
+    def mix_rows(self, wl: Workload) -> float:
+        return wl.head_positions if self.mix_sampled_only else wl.matmul_tokens
+
     def matmul_groups(self) -> list[MatmulGroup]:
         def group(name: str, n: int, k: int, weight: str) -> MatmulGroup:
             return MatmulGroup(
@@ -72,6 +82,7 @@ class GatedHcModule:
                 k=k,
                 bucket="residual_mix",
                 module=f"{self.path}.{weight}",
+                rows=self.mix_rows if self.mix_sampled_only else None,
             )
 
         groups = [group("down", self.lowrank, self.width, "input_mix_weight_down")]
@@ -94,7 +105,7 @@ class GatedHcModule:
             )
         rows.append(
             AttentionSemantic(
-                f"{self.tag}.mix", bucket="residual_mix", flops=wl.matmul_tokens * per_token
+                f"{self.tag}.mix", bucket="residual_mix", flops=self.mix_rows(wl) * per_token
             )
         )
         return rows
@@ -139,10 +150,18 @@ def decoder_layer_modules(
 
 
 def final_mixer_module(hidden: int, streams: int, lowrank: int, prefix: str = "") -> GatedHcModule:
-    """The mixer after the last layer: combine the last FFN output, mix, no inject."""
+    """The mixer after the last layer: combine the last FFN output at every token,
+    then mix (no inject) at the sampled positions only."""
     path = f"{prefix}." if prefix else ""
     return GatedHcModule(
-        f"{path}hyper_connection_mixer", "hc.final", hidden, streams, lowrank, False, "injected"
+        f"{path}hyper_connection_mixer",
+        "hc.final",
+        hidden,
+        streams,
+        lowrank,
+        False,
+        "injected",
+        mix_sampled_only=True,
     )
 
 
@@ -177,13 +196,12 @@ class GatedHcFinalMixer:
         return [*groups, LearnedWeightGroup(f"{self.name}.norm", self.module.width, 1)]
 
     def semantic_segments(self, wl: Workload) -> list[AttentionSemantic]:
-        tokens = wl.matmul_tokens
         rows = [
             AttentionSemantic(
                 f"{self.name}.{short}",
                 bucket="residual_mix",
                 byte_kind="weights",
-                flops=2.0 * tokens * group.n * group.k,
+                flops=2.0 * group.matmul_rows(wl) * group.n * group.k,
                 bytes=group.n * group.k * self.weight_dtype_bytes,
             )
             for short, group in self._projections()
