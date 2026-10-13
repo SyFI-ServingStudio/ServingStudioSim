@@ -4067,9 +4067,10 @@ def test_mimo_location_map_consumes_every_semantic_once(mimo):
     assert location_map["arch_types"] == ["mimo_v2_vllm_fp8_swa_moe"]
     locations = [row["location"] for row in location_map["locations"]]
     mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
-    # 44 compiled leaves at TP4 = EP4 less 7 fused all-reduce + residual + RMSNorm
-    # leaves and the logits all-gather, which are communication.
-    assert len(locations) == len(set(locations)) == 36
+    # 58 compiled leaves at TP4 = EP4 less the 7 fused all-reduce + residual +
+    # RMSNorm leaves, their 7 unfused all-reduces and the logits all-gather, which
+    # are communication.
+    assert len(locations) == len(set(locations)) == 43
     for workload in (
         Workload.causal_lm(decode=[4096] * 3, sampled=3),
         Workload.causal_lm(prefill=[(2048, 0)], decode=[300], sampled=2),
@@ -4077,8 +4078,9 @@ def test_mimo_location_map_consumes_every_semantic_once(mimo):
         names = [segment.name for segment in mimo.label(workload).segments]
         assert sorted(mapped) == sorted(names)
     semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
-    # The RMSNorms run inside the communication leaves, so each learned scale sits
-    # at the GEMM its output feeds; the final norm feeds the head.
+    # The RMSNorms run inside the fused communication leaves (or, above the fused
+    # cap, the residual-norm leaves), so each learned scale sits at the GEMM its
+    # output feeds; the final norm feeds the head.
     assert semantics["unified.swa_moe.attn.qkv_proj.gemm"] == ["swa_moe.qkv", "swa_moe.input_norm"]
     assert semantics["unified.lm_head"] == ["lm_head", "final_norm"]
     assert semantics["unified.swa_moe.attn.attention"][-1] == "swa_moe.attention_sinks"
@@ -4089,5 +4091,6 @@ def test_mimo_location_map_consumes_every_semantic_once(mimo):
         for rank in (1, 2, 3):
             assert semantics[f"unified.{tag}.moe.routed_rank{rank}.fused_moe"] == []
     # Zero-minimum leaves: three qkv input quants, three RoPEs, the dense FFN's two
-    # input quants and activation, six routed ranks past rank 0, the logits select.
-    assert sum(not row["semantics"] for row in location_map["locations"]) == 3 + 3 + 3 + 6 + 1
+    # input quants and activation, six routed ranks past rank 0, the logits select,
+    # and the seven unfused residual norms.
+    assert sum(not row["semantics"] for row in location_map["locations"]) == 3 + 3 + 3 + 6 + 1 + 7

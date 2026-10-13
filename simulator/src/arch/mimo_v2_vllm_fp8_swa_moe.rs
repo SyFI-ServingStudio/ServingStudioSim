@@ -11,7 +11,9 @@
 //! with the residual add and the next RMSNorm into one FlashInfer call
 //! (`all_reduce_residual_rms_norm`), 2 per layer plus the embedding's (whose
 //! residual is zero and whose norm is layer 0's input norm); the last layer's
-//! applies the final norm.
+//! applies the final norm. A step above the fusion's token cap, or a TP it does
+//! not fuse at, runs the unfused all-reduce and residual RMSNorm instead
+//! ([`TpAllReduceRmsNormOp`]).
 //!
 //! ```text
 //! prologue       embedding gather, all-reduce + layer 0's input norm
@@ -41,14 +43,14 @@ use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::graph_padded_tokens;
 use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
 use crate::arch::mimo_v2_model_cfg::{MimoV2AttnShape, MimoV2ModelCfg};
 use crate::common::Fabric;
+use crate::op::comm::{TpAllReduceRmsNormConfig, TpAllReduceRmsNormOp};
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::all_reduce_fusion::fused_all_reduce_refusal;
 use crate::timing::kernels::{
-    AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, AllReduceResidualRmsNormKernel,
-    AllReduceResidualRmsNormKernelConfig, AllReduceResidualRmsNormKernelInput,
-    AllReduceResidualRmsNormSpec, ElementwiseKernel, ElementwiseKernelConfig,
+    AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
+    AllReduceResidualRmsNormKernelConfig, ElementwiseKernel, ElementwiseKernelConfig,
     ElementwiseKernelInput, GemmFp32OutputKernel, GemmFp32OutputKernelConfig,
     GemmFp32OutputKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
@@ -94,6 +96,10 @@ const ROUTING_METHOD: &str = "deepseek_v3";
 /// server log: `backend=mnnvl`).
 const AR_NORM_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
 const AR_NORM_STRATEGY: &str = "auto";
+/// The unfused all-reduce above the fused cap: pynccl at TP 4 on SM100, and
+/// the NCCL curve standing in for torch symmetric memory at TP 8
+/// ([`TpAllReduceRmsNormOp`]).
+const UNFUSED_ALL_REDUCE_BACKENDS: &[&str] = &["nccl"];
 const LOGITS_ALL_GATHER_BACKENDS: &[&str] = &["nccl"];
 /// `vocab_parallel_embedding` reads one int32 token id per row.
 const INT32_TOKEN_ID_BYTES: u32 = 4;
@@ -229,12 +235,16 @@ pub struct MimoV2VllmConfigs {
     pub router: GemmFp32OutputKernelConfig,
     /// One per ranked EP workload.
     pub routed: Vec<Nvfp4MoeLocalWorkletConfig>,
-    /// Every TP all-reduce: embedding, post-attention and post-FFN.
-    pub ar_norm: AllReduceResidualRmsNormKernelConfig,
+    /// The post-attention and post-FFN boundaries.
+    pub ar_norm: TpAllReduceRmsNormConfig,
+    /// The embedding's boundary: no residual yet, so its unfused norm reads
+    /// and writes one row.
+    pub embed_ar_norm: TpAllReduceRmsNormConfig,
     pub embed: ElementwiseKernelConfig,
     pub logits_select: ElementwiseKernelConfig,
     pub lm_head: SingleGemmKernelConfig,
-    pub logits_all_gather: AllReduceKernelConfig,
+    /// `None` on one GPU, which gathers nothing.
+    pub logits_all_gather: Option<AllReduceKernelConfig>,
 }
 
 pub fn build_configs(
@@ -244,12 +254,6 @@ pub fn build_configs(
 ) -> std::result::Result<MimoV2VllmConfigs, BuildError> {
     let tp = u32::from(parallel.tp_size);
     let gpu = parallel.gpu_name.clone();
-    if let Some(reason) = fused_all_reduce_refusal(AR_NORM_BACKENDS, &gpu, tp) {
-        // Every sublayer boundary is the fused all-reduce + RMSNorm; the
-        // unfused fallback (all-reduce, then a residual RMSNorm) is not
-        // modeled.
-        return Err(fit_failed(reason));
-    }
     let divide = |what: &str, value: u32| -> std::result::Result<u32, BuildError> {
         if !value.is_multiple_of(tp) {
             return Err(fit_failed(format!("{what} {value} must divide by TP {tp}")));
@@ -265,6 +269,31 @@ pub fn build_configs(
         output_bytes_per_token: output.into(),
     };
     let cuda_graph = !parallel.cudagraph_capture_sizes.is_empty();
+    // vLLM fuses only at a TP FlashInfer has a budget for (none at TP 1, where
+    // nothing is reduced either).
+    let fused = fused_all_reduce_refusal(AR_NORM_BACKENDS, &gpu, tp).is_none();
+    let tp_boundary = |norm: ElementwiseKernelConfig| TpAllReduceRmsNormConfig {
+        fused: fused.then(|| AllReduceResidualRmsNormKernelConfig {
+            backends: AR_NORM_BACKENDS.to_vec(),
+            gpu_name: gpu.clone(),
+            num_gpus: tp,
+            hidden_dim: model.hidden,
+            dtype: ACTIVATION_DTYPE,
+            fabric: Fabric::Nvlink,
+            strategy: AR_NORM_STRATEGY.to_string(),
+            launch_with_pdl: true,
+            fp32_acc: true,
+            fused_token_limit: None,
+        }),
+        all_reduce: (tp > 1).then(|| AllReduceKernelConfig {
+            backends: UNFUSED_ALL_REDUCE_BACKENDS.to_vec(),
+            gpu_name: gpu.clone(),
+            num_gpus: tp,
+            fabric: Fabric::Nvlink,
+        }),
+        norm,
+        all_reduce_bytes_per_token: u64::from(hidden_bytes),
+    };
     let attention = |shape: &MimoV2AttnShape,
                      window: u32,
                      page_size: u32|
@@ -340,18 +369,10 @@ pub fn build_configs(
             input_dtype: ACTIVATION_DTYPE,
         },
         routed,
-        ar_norm: AllReduceResidualRmsNormKernelConfig {
-            backends: AR_NORM_BACKENDS.to_vec(),
-            gpu_name: gpu.clone(),
-            num_gpus: tp,
-            hidden_dim: model.hidden,
-            dtype: ACTIVATION_DTYPE,
-            fabric: Fabric::Nvlink,
-            strategy: AR_NORM_STRATEGY.to_string(),
-            launch_with_pdl: true,
-            fp32_acc: true,
-            fused_token_limit: None,
-        },
+        // The add + RMSNorm reads the all-reduced row and the residual and
+        // writes both back.
+        ar_norm: tp_boundary(ew(2 * hidden_bytes, 2 * hidden_bytes)),
+        embed_ar_norm: tp_boundary(ew(hidden_bytes, hidden_bytes)),
         // `vocab_parallel_embedding`: an int32 id and the gathered row in, the
         // masked row out.
         embed: ew(hidden_bytes + INT32_TOKEN_ID_BYTES, hidden_bytes),
@@ -366,12 +387,12 @@ pub fn build_configs(
         },
         // `tensor_model_parallel_all_gather` of the bf16 logits; the NCCL
         // all-reduce curve stands in (as Inkling's and DeepSeek V4.1's heads).
-        logits_all_gather: AllReduceKernelConfig {
+        logits_all_gather: (tp > 1).then(|| AllReduceKernelConfig {
             backends: LOGITS_ALL_GATHER_BACKENDS.to_vec(),
             gpu_name: gpu,
             num_gpus: tp,
             fabric: Fabric::Nvlink,
-        },
+        }),
         model: model.clone(),
         parallel: parallel.clone(),
     })
@@ -454,9 +475,9 @@ struct LayerGroup {
     label: String,
     layers: Vec<u32>,
     attn: MimoV2AttnLocalWorklet,
-    attn_ar_norm: Op<AllReduceResidualRmsNormKernel>,
+    attn_ar_norm: TpAllReduceRmsNormOp,
     ffn: Ffn,
-    ffn_ar_norm: Op<AllReduceResidualRmsNormKernel>,
+    ffn_ar_norm: TpAllReduceRmsNormOp,
 }
 
 impl LayerGroup {
@@ -488,28 +509,21 @@ impl LayerGroup {
             },
             ev,
         );
-        let ar_norm = AllReduceResidualRmsNormKernelInput { num_tokens: tokens };
-        push_or_zero(&self.attn_ar_norm, ar_norm.clone(), false, ev);
+        self.attn_ar_norm.eval(tokens, ev);
         match &self.ffn {
             Ffn::Dense(mlp) => mlp.eval(&Glm53MlpLocalWorkletInput { num_tokens: tokens }, ev),
             Ffn::Moe(block) => block.eval(tokens, ev),
         }
-        push_or_zero(&self.ffn_ar_norm, ar_norm, false, ev);
+        self.ffn_ar_norm.eval(tokens, ev);
     }
 }
 
 fn build_ar_norm(
     prefix: &str,
-    config: &AllReduceResidualRmsNormKernelConfig,
+    config: &TpAllReduceRmsNormConfig,
     bridge: &PerfApiBridge,
-) -> std::result::Result<Op<AllReduceResidualRmsNormKernel>, BuildError> {
-    atomic(
-        prefix,
-        "ar_norm",
-        config.clone(),
-        AllReduceResidualRmsNormKernel::build,
-        bridge,
-    )
+) -> std::result::Result<TpAllReduceRmsNormOp, BuildError> {
+    TpAllReduceRmsNormOp::build(&format!("{prefix}.ar_norm"), config.clone(), bridge)
 }
 
 fn build_layer_group(
@@ -588,15 +602,12 @@ pub struct MimoV2VllmModel {
     pub max_model_len: u32,
     /// Sorted, deduplicated capture sizes.
     cudagraph_capture_sizes: Vec<u32>,
-    /// Largest step the fused all-reduce + RMSNorm takes (vLLM's workspace
-    /// cap); a larger step would fall back to the unfused path.
-    max_fused_tokens: u32,
     embed: Op<ElementwiseKernel>,
-    embed_ar_norm: Op<AllReduceResidualRmsNormKernel>,
+    embed_ar_norm: TpAllReduceRmsNormOp,
     groups: Vec<LayerGroup>,
     logits_select: Op<ElementwiseKernel>,
     lm_head: Op<SingleGemmKernel>,
-    logits_all_gather: Op<AllReduceKernel>,
+    logits_all_gather: Option<Op<AllReduceKernel>>,
     vocab_size: u32,
     kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
@@ -623,7 +634,7 @@ pub fn build(
             ElementwiseKernel::build,
             bridge,
         )?,
-        embed_ar_norm: build_ar_norm(&format!("{n}.embed"), &cfg.ar_norm, bridge)?,
+        embed_ar_norm: build_ar_norm(&format!("{n}.embed"), &cfg.embed_ar_norm, bridge)?,
         groups,
         logits_select: atomic(
             n,
@@ -639,13 +650,19 @@ pub fn build(
             SingleGemmKernel::build,
             bridge,
         )?,
-        logits_all_gather: atomic(
-            n,
-            "logits_all_gather",
-            cfg.logits_all_gather.clone(),
-            AllReduceKernel::build,
-            bridge,
-        )?,
+        logits_all_gather: cfg
+            .logits_all_gather
+            .clone()
+            .map(|config| {
+                atomic(
+                    n,
+                    "logits_all_gather",
+                    config,
+                    AllReduceKernel::build,
+                    bridge,
+                )
+            })
+            .transpose()?,
         vocab_size: cfg.model.vocab_size,
         kv_cache_layout: kv_cache_layout(&cfg.model, cfg.parallel.tp_size)?,
         tp_size: cfg.parallel.tp_size,
@@ -656,7 +673,6 @@ pub fn build(
             sizes.dedup();
             sizes
         },
-        max_fused_tokens: AllReduceResidualRmsNormSpec::max_fused_tokens(&cfg.ar_norm),
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -751,7 +767,9 @@ impl MimoV2VllmModel {
         }
         children.push(self.logits_select.compile(&mut builder));
         children.push(self.lm_head.compile(&mut builder));
-        children.push(self.logits_all_gather.compile(&mut builder));
+        if let Some(all_gather) = &self.logits_all_gather {
+            children.push(all_gather.compile(&mut builder));
+        }
         let root = CostNode::Labeled {
             label: format!(
                 "{} (MimoV2VllmModel) [TP=EP{}; timing_context<={}]",
@@ -773,12 +791,7 @@ impl MimoV2VllmModel {
             false,
             ev,
         );
-        push_or_zero(
-            &self.embed_ar_norm,
-            AllReduceResidualRmsNormKernelInput { num_tokens: tokens },
-            false,
-            ev,
-        );
+        self.embed_ar_norm.eval(tokens, ev);
         for group in &self.groups {
             group.eval(&batch, tokens, ev);
         }
@@ -795,28 +808,21 @@ impl MimoV2VllmModel {
             false,
             ev,
         );
-        let gathered = u64::from(logits) * u64::from(self.vocab_size) * 2;
-        push_or_zero(
-            &self.logits_all_gather,
-            AllReduceKernelInput {
-                message_size_bytes: all_gather_as_all_reduce_bytes(gathered),
-            },
-            false,
-            ev,
-        );
+        if let Some(all_gather) = &self.logits_all_gather {
+            let gathered = u64::from(logits) * u64::from(self.vocab_size) * 2;
+            push_or_zero(
+                all_gather,
+                AllReduceKernelInput {
+                    message_size_bytes: all_gather_as_all_reduce_bytes(gathered),
+                },
+                false,
+                ev,
+            );
+        }
     }
 
     fn normalize(&self, input: &UnifiedArchInput) -> std::result::Result<NormalizedBatch, String> {
-        let batch = normalize_input(input, self.max_model_len)?;
-        let padded = graph_padded_tokens(&self.cudagraph_capture_sizes, batch.total_tokens);
-        if padded > self.max_fused_tokens {
-            return Err(format!(
-                "a step of {padded} tokens exceeds the fused all-reduce + RMSNorm cap of {} \
-                 tokens; the unfused fallback is not modeled",
-                self.max_fused_tokens
-            ));
-        }
-        Ok(batch)
+        normalize_input(input, self.max_model_len)
     }
 
     fn eval_checked(
@@ -1006,6 +1012,7 @@ fn fit_failed(reason: impl Into<String>) -> BuildError {
 mod tests {
     use super::*;
     use crate::arch::contract::ArchGroupInput;
+    use crate::timing::kernels::AllReduceResidualRmsNormSpec;
     use crate::timing::routing::RoutingDistribution;
     use std::path::Path;
 
@@ -1137,8 +1144,15 @@ mod tests {
             (8196, 8200)
         );
         assert_eq!(
-            AllReduceResidualRmsNormSpec::max_fused_tokens(&configs.ar_norm),
+            AllReduceResidualRmsNormSpec::max_fused_tokens(configs.ar_norm.fused.as_ref().unwrap()),
             4096
+        );
+        assert_eq!(
+            (
+                configs.ar_norm.norm.input_bytes_per_token.get(),
+                configs.embed_ar_norm.norm.input_bytes_per_token.get()
+            ),
+            (16384, 8192)
         );
     }
 
@@ -1205,24 +1219,43 @@ mod tests {
         assert_eq!(padded(step(vec![], vec![400; 201])), 201);
     }
 
+    /// Up to the fused cap every boundary is the one FlashInfer call; above it
+    /// (vLLM's unfused compile range) each is an all-reduce and a residual
+    /// RMSNorm.
     #[test]
-    fn a_step_past_the_fused_all_reduce_cap_is_refused() {
+    fn a_step_past_the_fused_all_reduce_cap_runs_the_unfused_boundary() {
         let model = built();
-        assert!(model.check_input(&step(vec![(0, 2048)], vec![])).is_ok());
-        assert!(model.check_input(&step(vec![(0, 4097)], vec![])).is_err());
+        assert!(model.check_input(&step(vec![(0, 8192)], vec![])).is_ok());
         assert!(model.check_input(&step(vec![], vec![131073])).is_err());
+        assert!(model.embed_ar_norm.takes_fused(4096));
+        assert!(!model.embed_ar_norm.takes_fused(4097));
+        let names: Vec<String> = model
+            .cost_log_manifest()
+            .slots
+            .into_iter()
+            .map(|slot| slot.name)
+            .collect();
+        for suffix in ["ar_norm", "ar_norm_all_reduce", "ar_norm_residual_norm"] {
+            assert!(
+                names.contains(&format!("unified.swa_moe.moe.{suffix}")),
+                "{suffix}"
+            );
+        }
     }
 
+    /// vLLM does not fuse at TP 1 and reduces nothing there: each boundary is
+    /// only the residual RMSNorm, and the head gathers nothing.
     #[test]
-    fn tp_sizes_without_a_fused_all_reduce_are_refused() {
+    fn one_gpu_builds_without_collectives() {
         let mut layout = parallel();
         layout.tp_size = 1;
-        let error = build_configs(&model_cfg(), &layout, &demand()).unwrap_err();
-        assert!(error.to_string().contains("fused all-reduce"), "{error}");
+        let configs = build_configs(&model_cfg(), &layout, &demand()).unwrap();
+        assert!(configs.ar_norm.fused.is_none() && configs.ar_norm.all_reduce.is_none());
+        assert!(configs.logits_all_gather.is_none());
     }
 
     /// Every compiled location that is not a collective (the fused all-reduce
-    /// + RMSNorm sites and the logits all-gather) has a row in the
+    /// + RMSNorm sites, the unfused all-reduces and the logits all-gather) has a row in the
     /// necessary-work map, and the map names nothing the arch does not compile.
     #[test]
     fn necessary_work_map_covers_the_compiled_locations() {
@@ -1240,7 +1273,7 @@ mod tests {
             })
             .map(|slot| slot.name)
             .collect();
-        assert_eq!(actual.len(), 36);
+        assert_eq!(actual.len(), 43);
         let map: serde_json::Value = serde_json::from_str(include_str!(
             "../../../model/work/location_maps/mimo_v2_vllm_fp8_swa_moe_tp4_ep4_unified.json"
         ))

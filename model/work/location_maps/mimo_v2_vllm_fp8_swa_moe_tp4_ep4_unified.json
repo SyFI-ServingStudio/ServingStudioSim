@@ -12,6 +12,10 @@
       ]
     },
     {
+      "location": "unified.embed.ar_norm_residual_norm",
+      "semantics": []
+    },
+    {
       "location": "unified.global_dense.attn.qkv_proj.input_quant",
       "semantics": []
     },
@@ -46,6 +50,10 @@
       ]
     },
     {
+      "location": "unified.global_dense.attn.ar_norm_residual_norm",
+      "semantics": []
+    },
+    {
       "location": "unified.global_dense.ffn.gate_up_input_quant",
       "semantics": []
     },
@@ -69,6 +77,10 @@
       "semantics": [
         "global_dense.down"
       ]
+    },
+    {
+      "location": "unified.global_dense.ffn.ar_norm_residual_norm",
+      "semantics": []
     },
     {
       "location": "unified.swa_moe.attn.qkv_proj.input_quant",
@@ -106,6 +118,10 @@
       ]
     },
     {
+      "location": "unified.swa_moe.attn.ar_norm_residual_norm",
+      "semantics": []
+    },
+    {
       "location": "unified.swa_moe.moe.router",
       "semantics": [
         "swa_moe.router",
@@ -130,6 +146,10 @@
     },
     {
       "location": "unified.swa_moe.moe.routed_rank3.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.swa_moe.moe.ar_norm_residual_norm",
       "semantics": []
     },
     {
@@ -167,6 +187,10 @@
       ]
     },
     {
+      "location": "unified.global_moe.attn.ar_norm_residual_norm",
+      "semantics": []
+    },
+    {
       "location": "unified.global_moe.moe.router",
       "semantics": [
         "global_moe.router",
@@ -191,6 +215,10 @@
     },
     {
       "location": "unified.global_moe.moe.routed_rank3.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_moe.moe.ar_norm_residual_norm",
       "semantics": []
     },
     {
