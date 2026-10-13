@@ -2178,8 +2178,13 @@ def test_every_public_arch_on_an_fp4_checkpoint_is_labeled_fp4():
         config = root / "model" / "config" / f"{catalog[preset['checkpoint']]['config']}.json"
         raw = json.loads(config.read_text())
         # Only the compute dtype matters here, so per-layer ModelOpt exclusions
-        # (GLM-5.3-Flash NVFP4) need no layer resolution.
-        quant = parse_quantization_config(raw, layer_qualified_exclusions=True)
+        # (GLM-5.3-Flash NVFP4) need no layer resolution. A checkpoint whose
+        # per-layer schedule only its own builder can read (Qwen3.8-Flash-Next's
+        # PLE table and MTP experts) reports the scheme that builder resolved.
+        try:
+            quant = parse_quantization_config(raw, layer_qualified_exclusions=True)
+        except ValueError:
+            quant = build_model(raw).quant
         # Inkling keeps ModelOpt's hf_quant_config.json verbatim instead of a
         # quantization_config; model/work/models/inkling.py reads it from there.
         hf_quant = (raw.get("hf_quant_config") or {}).get("quantization") or {}
