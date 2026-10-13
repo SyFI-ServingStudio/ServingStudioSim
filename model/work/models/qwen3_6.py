@@ -8,13 +8,16 @@ paired with the same dense SwiGLU MLP. This is the first model here to use the h
 
 The 27B checkpoint ships as a ``Qwen3_5ForConditionalGeneration`` (VL wrapper), so the
 text fields live under ``text_config``; this builder reads whichever is present.
+
+Every layer carries input and post-attention RMSNorm scales, a full-attention layer
+also its per-head q/k norms, and the body a final norm.
 """
 
 from __future__ import annotations
 
 from ..attention.gqa import GQA
 from ..attention.linear import GatedDeltaNet
-from ..core import LayerStack, Model, dtype_bytes
+from ..core import LayerStack, Model, NormWeightGroup, dtype_bytes
 from ..ffn.dense import DenseSwiGLU
 
 
@@ -34,7 +37,8 @@ def _layer_types(text: dict) -> list[str]:
 def build(raw_config: dict) -> Model:
     text = raw_config.get("text_config", raw_config)
     hidden = text["hidden_size"]
-    weight_bytes = dtype_bytes(text.get("torch_dtype") or text.get("dtype") or "bfloat16")
+    master_dtype = text.get("torch_dtype") or text.get("dtype") or "bfloat16"
+    weight_bytes = dtype_bytes(master_dtype)
     state_bytes = dtype_bytes(text.get("mamba_ssm_dtype", "float32"))
 
     full_attn = GQA(
@@ -63,6 +67,16 @@ def build(raw_config: dict) -> Model:
         LayerStack(attn=linear_attn, ffn=ffn, count=num_linear, tag="linear"),
         LayerStack(attn=full_attn, ffn=ffn, count=num_full, tag="full"),
     ]
+    head_dim = text["head_dim"]
+    norm_weights = [
+        NormWeightGroup("linear.input_norm", hidden, num_linear, stack="linear"),
+        NormWeightGroup("linear.post_norm", hidden, num_linear, stack="linear"),
+        NormWeightGroup("full.input_norm", hidden, num_full, stack="full"),
+        NormWeightGroup("full.q_norm", head_dim, num_full, stack="full"),
+        NormWeightGroup("full.k_norm", head_dim, num_full, stack="full"),
+        NormWeightGroup("full.post_norm", hidden, num_full, stack="full"),
+        NormWeightGroup("final_norm", hidden, 1),
+    ]
     return Model(
         name=raw_config["architectures"][0],
         hidden=hidden,
@@ -72,4 +86,6 @@ def build(raw_config: dict) -> Model:
             "tie_word_embeddings", raw_config.get("tie_word_embeddings", False)
         ),
         layers=layers,
+        norm_weights=norm_weights,
+        master_dtype=master_dtype,
     )

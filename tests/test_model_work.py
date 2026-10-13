@@ -746,6 +746,10 @@ Q36_FULL_ATTN = 104_857_600
 Q36_LINEAR_ATTN = 115_875_840 + 48 + 48
 Q36_MLP = 267_386_880
 VOCAB_Q36 = 248320
+# RMSNorm scales: input + post-attention on every layer (2 * 5120), q/k norm on the
+# 16 full layers (2 * 256), the GDN gated norm (128) on the 48 linear ones, and the
+# final norm (5120): 655_360 + 8_192 + 6_144 + 5_120.
+Q36_NORMS = 64 * 2 * 5120 + 16 * 2 * 256 + 48 * 128 + 5120  # 674_816
 
 
 def test_qwen3_6_hybrid_stack():
@@ -760,13 +764,15 @@ def test_qwen3_6_hybrid_stack():
 
 def test_qwen3_6_params_exact():
     label = load_model(QWEN36).label(Workload.causal_lm(decode=[4096], sampled=1))
-    assert label.params["total"] == 26_895_329_792  # "27B"
+    # Equals the text path of the checkpoint's safetensors headers:
+    # 2 * 1_271_398_400 + 7_239_766_528 + 17_112_760_320 + 674_816.
+    assert label.params["total"] == 26_895_998_464  # "27B"
     # dense model: every layer param is activated, so activated == total minus embed/head.
-    assert label.params["activated"]["layers"] == 24_352_532_992
+    assert label.params["activated"]["layers"] == 24_353_201_664
     assert label.params["activated"]["with_embed_head"] == label.params["total"]
     breakdown = label.params["breakdown"]
     assert breakdown["attn"] == 48 * Q36_LINEAR_ATTN + 16 * Q36_FULL_ATTN  # 7_239_766_528
-    assert breakdown["norm"] == 48 * 128
+    assert breakdown["norm"] == Q36_NORMS
     assert breakdown["ffn"] == 64 * Q36_MLP  # 17_112_760_320
     assert breakdown["experts"] == 0 and breakdown["router"] == 0  # dense, not MoE
     assert breakdown["embedding"] == breakdown["lm_head"] == VOCAB_Q36 * 5120

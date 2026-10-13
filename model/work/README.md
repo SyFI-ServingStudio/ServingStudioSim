@@ -351,7 +351,7 @@ convention, so `params["activated"]` exposes **all** of them rather than picking
 - **Golden** — hand-computed FLOP buckets + `total`/`activated` params for a reference
   model, asserted in `tests/test_model_work.py`. (Llama3-8B: total 8.030 B, activated
   6.979 B; Qwen3-235B-A22B MoE: total ≈ 235 B, activated ≈ 22 B; Qwen3.6-27B hybrid:
-  total 26.895 B over 48 GDN + 16 gated-full layers, dense so activated == total.)
+  total 26.896 B over 48 GDN + 16 gated-full layers, dense so activated == total.)
 - **Oracle** (Phase 3) — cross-check against the sim's *unsharded* per-op `slot_flops`:
   for a sharded, non-replicated matmul, `Σ achieved == labeler F_min` bucket (ratio ≈ 1).
 
