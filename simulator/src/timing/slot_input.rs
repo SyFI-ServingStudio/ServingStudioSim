@@ -50,7 +50,9 @@ use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
 use crate::timing::kernels::{
     MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput, SiluAndMulKernelInput,
-    StaticFp8QuantKernelInput,
+    SparseGqaPagedAttentionKernelInput, SparseIndexExpandKernelInput,
+    SparseIndexerLogitsDecodeKernelInput, SparseIndexerLogitsPrefillKernelInput,
+    SparseIndexerPrepareKernelInput, StaticFp8QuantKernelInput,
 };
 use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
 
@@ -209,6 +211,11 @@ log_inputs! {
     StaticFp8Quant => StaticFp8QuantKernelInput,
     IndexedRowCopy => IndexedRowCopyKernelInput,
     QkRmsNormRopeGate => QkRmsNormRopeGateKernelInput,
+    SparseGqaPagedAttention => SparseGqaPagedAttentionKernelInput,
+    SparseIndexExpand => SparseIndexExpandKernelInput,
+    SparseIndexerLogitsDecode => SparseIndexerLogitsDecodeKernelInput,
+    SparseIndexerLogitsPrefill => SparseIndexerLogitsPrefillKernelInput,
+    SparseIndexerPrepare => SparseIndexerPrepareKernelInput,
     AllReduce   => AllReduceKernelInput,
     AllReduceFusion => AllReduceFusionKernelInput,
     AllReduceResidualRmsNorm => AllReduceResidualRmsNormKernelInput,
