@@ -1,0 +1,18 @@
+{
+ "schema_version": 2,
+ "rule_files": [
+  "rules.json"
+ ],
+ "note": "Qwen3.8-27B-NVFP4 on one B200, vLLM fork 892da082 TP1. One order-independent rule set (rules.json), written by gen_rules.py. DRAFT: the kernel-side families are read from the diverse_100 capture (job 6443); rules are emitted once the clean arch's CostTree slots exist.",
+ "source": {
+  "capture": "logs/20261012_2_q38_diverse100/profile_nsys (Slurm job 6443)",
+  "cost_manifest": "TODO: the clean arch's timing_predict cost manifest",
+  "arch": "TODO"
+ },
+ "unmapped_decisions": {
+  "forward": "TODO: zeros/copy/index/cat/fill helpers around the GDN core once the CostTree is known",
+  "preprocess": "input preparation, slot mapping, mamba align copies; no CostTree leaf",
+  "sample": "sampling kernels are not modelled; the LM head quant + GEMM are mapped (head.*)",
+  "bookkeep": "scheduler bookkeeping and mamba state postprocess"
+ }
+}
