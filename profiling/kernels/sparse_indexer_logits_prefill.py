@@ -51,6 +51,7 @@ DOC = KernelDoc(
         "logit[i, c] = Σₕ ReLU(q[i, h] · key[c]) for c < (prefix_len + i + 1) // ratio",
         "K = Σᵢ (prefix_len + i + 1) // ratio: scored keys",
         "TFLOPS = 2 · num_heads · head_dim · K / time",
+        "GB/s = 4 · K / time",
     ),
     default_metric="time_ms",
     method=(
@@ -60,7 +61,8 @@ DOC = KernelDoc(
     ),
     caveats=(
         "One sequence per call; a step with several prefill sequences is several calls.",
-        "GB/s counts each visible key once per row tile of 32 rows and the scores written.",
+        "GB/s counts only the FP32 scores written (4 bytes per scored key); key "
+        "reads are left out.",
     ),
     reference="profiling.runners.attention.sparse_indexer_logits_reference",
 )

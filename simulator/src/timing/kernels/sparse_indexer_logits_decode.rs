@@ -3,10 +3,11 @@
 //! heads) into a padded logits row. The top-k that follows is its own kind.
 //!
 //! `logits_width` is the padded row the framework allocates, about
-//! `max_model_len / compress_ratio` columns. It is an input, not a key: the
-//! kernel fills the padding too, which measured 1.7x at 256 requests from
-//! 4800 to 32800 columns on B200, and the width is a deployment value, so the
-//! grid sweeps it and any deployment interpolates.
+//! `max_model_len / compress_ratio` columns. It is a swept `Input` axis (and so
+//! a DB key column) rather than `Config` identity: the kernel fills the
+//! padding too, which measured 1.7x at 256 requests from 4800 to 32800 columns
+//! on B200, and the width is a deployment value, so the grid sweeps it and any
+//! deployment interpolates.
 //!
 //! Time is a sawtooth in the batch: the launch packs 1, 2, 4 or 8 column tiles
 //! per program once `batch · ⌈width/64⌉` programs reach 16384, 32768 or 131072
