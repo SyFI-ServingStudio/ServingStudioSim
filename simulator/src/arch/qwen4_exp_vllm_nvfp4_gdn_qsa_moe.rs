@@ -1343,27 +1343,29 @@ fn normalize_speculative_input(
         ));
     }
     let mut decode_kv_lens = Vec::with_capacity(group.decode_requests.len());
+    let mut target_prefills = group.prefill_chunk_pairs.clone();
+    let mut decode_tokens = 0_u32;
     for (request, decode) in group.decode_requests.iter().enumerate() {
-        // The scheduler only submits whole verify groups; acceptance truncates
-        // the output after this compute, not the compute.
-        if decode.query_len != verify_width {
-            return Err(format!(
-                "decode request {request} query_len {} must equal verify width {verify_width}",
-                decode.query_len
-            ));
-        }
-        if !(verify_width..=max_model_len).contains(&decode.kv_len) {
-            return Err(format!(
-                "decode request {request} kv_len {} must be in {verify_width}..={max_model_len}",
-                decode.kv_len
-            ));
-        }
-        decode_kv_lens.push(decode.kv_len);
+        // A full verify window runs the uniform-width decode kernels;
+        // acceptance truncates the output after this compute, not the compute.
+        // Only a request at max_model_len verifies fewer rows. That ragged row
+        // leaves the uniform-decode graph and kernels, so it is priced on the
+        // varlen prefill path as `(resident, rows)`, a profiled shape. Such
+        // steps are rare (the last verifies of a request ending within
+        // `draft_tokens` of the limit).
+        let clipped = decode
+            .check_verify_row(draft_tokens, max_model_len)
+            .map_err(|reason| format!("decode request {request}: {reason}"))?;
+        decode_tokens = decode_tokens
+            .checked_add(decode.query_len)
+            .ok_or("decode token sum overflows u32")?;
         endpoints.push(decode.kv_len);
+        if clipped {
+            target_prefills.push((decode.kv_len - decode.query_len, decode.query_len));
+        } else {
+            decode_kv_lens.push(decode.kv_len);
+        }
     }
-    let decode_tokens = verify_width
-        .checked_mul(decode_kv_lens.len() as u32)
-        .ok_or("decode token sum overflows u32")?;
     if group.decode_tokens != decode_tokens {
         return Err(format!(
             "decode_tokens {} must equal query_len sum {decode_tokens}",
@@ -1393,7 +1395,7 @@ fn normalize_speculative_input(
     Ok(NormalizedBatch {
         target: Pass::new(
             sorted_capture_sizes,
-            group.prefill_chunk_pairs.clone(),
+            target_prefills,
             decode_kv_lens,
             verify_width,
         ),
@@ -1561,6 +1563,29 @@ mod tests {
         let b = normalize(&step(vec![(100, 28)], vec![131072, 64])).unwrap();
         assert_eq!(b.recurrent.decode_kv_lens, [130, 131072, 66]);
         assert_eq!((b.request_count, b.logits_rows), (3, 9));
+    }
+
+    #[test]
+    fn a_verify_clipped_at_the_model_limit_runs_as_a_varlen_row() {
+        // Two rows of a request at 131069 resident keys leave its sampled
+        // position at 131071. They cannot join the uniform 4-row verify graph:
+        // the step runs piecewise and prices them on the prefill path.
+        let mut input = step(vec![], vec![4096; 5]);
+        let group = &mut input.groups[0];
+        group.decode_requests.push(SpeculativeDecodeInput {
+            kv_len: 131071,
+            query_len: 2,
+        });
+        group.decode_tokens += 2;
+        group.batch_tokens += 2;
+        let b = normalize(&input).unwrap();
+        assert_eq!(b.target.prefills, [(131069, 2)]);
+        assert_eq!(b.target.decode_kv_lens, [4096; 5]);
+        assert_eq!(b.target.tokens(), 22);
+        assert!(!b.target.full_graph);
+        assert_eq!((b.request_count, b.logits_rows), (6, 22));
+        assert_eq!(b.recurrent.decode_kv_lens.len(), 6);
+        built().check_input(&input).unwrap();
     }
 
     #[test]

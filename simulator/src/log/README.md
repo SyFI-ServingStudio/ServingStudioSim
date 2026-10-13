@@ -54,7 +54,9 @@ formulas. Geometry is encoded on the writer thread.
 
 `request_slo.speculative_progress` independently persists admission/completion
 observations: verify width, completed prefill chunks and decode rounds, resident
-KV sum, emitted tokens, and an optional pending prefill/decode. This bounded
+KV sum, the verify rows and causal query-key pairs those rounds ran (fewer rows
+in a round clipped at `max_model_len`), emitted tokens, and an optional pending
+prefill or `(resident, rows)` decode. This bounded
 per-request record survives optional timing logs being disabled. Pending work
 lets conservation account exactly for a sim-end stop before completion. Rejected
 candidates remain part of executed work; only committed output advances KV.

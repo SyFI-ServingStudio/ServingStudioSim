@@ -18,9 +18,11 @@ struct Progress {
     prefill_chunks: u64,
     decode_rounds: u64,
     resident_kv_sum: u64,
+    query_rows: u64,
+    verify_pairs: u64,
     emitted_tokens: u64,
     pending_prefill: Option<(u64, u64)>,
-    pending_decode: Option<u64>,
+    pending_decode: Option<(u64, u64)>,
 }
 
 #[derive(Default)]
@@ -59,8 +61,11 @@ pub(super) async fn checks(
                 * (geometry.draft_tokens - 1) as f64
                 * count;
             for (final_context, query) in geometry.decode {
+                // Full width, or clipped by vLLM's boundary rule so the sampled
+                // position is the model's last.
                 ensure!(
-                    query == width
+                    (1..=width).contains(&query)
+                        && (query == width || final_context + 1 == geometry.max_model_len)
                         && final_context >= query
                         && final_context <= geometry.max_model_len,
                     "invalid logged verify geometry"
@@ -105,15 +110,21 @@ pub(super) async fn checks(
             let q = progress.query_width as f64;
             let rounds =
                 progress.decode_rounds as f64 + f64::from(progress.pending_decode.is_some());
-            let resident =
-                progress.resident_kv_sum as f64 + progress.pending_decode.unwrap_or(0) as f64;
+            let (pending_resident, pending_rows) = progress
+                .pending_decode
+                .map_or((0.0, 0.0), |(resident, rows)| {
+                    (resident as f64, rows as f64)
+                });
             let chunks =
                 progress.prefill_chunks as f64 + f64::from(progress.pending_prefill.is_some());
             committed.prefill_chunks += chunks;
             committed.decode_rounds += rounds;
-            committed.query_rows += rounds * q;
-            committed.resident_kv += resident;
-            committed.verify_pairs += q * resident + rounds * q * (q + 1.0) / 2.0;
+            committed.query_rows += progress.query_rows as f64 + pending_rows;
+            committed.resident_kv += progress.resident_kv_sum as f64 + pending_resident;
+            committed.verify_pairs += progress.verify_pairs as f64
+                + pending_rows * pending_resident
+                + pending_rows * (pending_rows + 1.0) / 2.0;
+            // Every endpoint drafts the full depth, clipped verify or not.
             committed.recurrent_rows += (chunks + rounds) * (q - 2.0);
             if let Some((prefix, append)) = progress.pending_prefill {
                 let (p, a) = (prefix as f64, append as f64);
@@ -133,7 +144,8 @@ pub(super) async fn checks(
                 violations += 1.0;
             }
             if progress.emitted_tokens < progress.decode_rounds
-                || progress.emitted_tokens > progress.decode_rounds * progress.query_width
+                || progress.emitted_tokens > progress.query_rows
+                || progress.query_rows > progress.decode_rounds * progress.query_width
             {
                 violations += 1.0;
             }
@@ -261,6 +273,18 @@ mod tests {
         final_context: u64,
         output: u64,
     ) -> (SessionContext, Actual, Expected) {
+        verify_fixture(pending, final_context, 6, 8192, output)
+    }
+
+    /// One 8-token prefill and, unless `pending` is "prefill", one verify of
+    /// `query` rows at 8 resident keys under a depth-5 drafter.
+    fn verify_fixture(
+        pending: &str,
+        final_context: u64,
+        query: u64,
+        max_model_len: u64,
+        output: u64,
+    ) -> (SessionContext, Actual, Expected) {
         let ctx = SessionContext::new();
         let u32_list = || DataType::List(Arc::new(Field::new("item", DataType::UInt32, false)));
         let group_fields = vec![
@@ -273,8 +297,8 @@ mod tests {
             Field::new("speculative_geometry", DataType::Utf8, true),
         ];
         let decode = pending != "prefill";
-        let geometry = json!({"draft_tokens": 5, "max_model_len": 8192,
-            "prefill": [[0,8]], "decode": if decode { vec![(final_context,6)] } else { vec![] }});
+        let geometry = json!({"draft_tokens": 5, "max_model_len": max_model_len,
+            "prefill": [[0,8]], "decode": if decode { vec![(final_context,query)] } else { vec![] }});
         register(
             &ctx,
             "cost_log",
@@ -292,7 +316,7 @@ mod tests {
                 ),
             ]),
             json!({"pool_tag":"main", "worker_id":0, "groups":[{
-                "batch_tokens": if decode {14} else {8}, "prefill_tokens":8,
+                "batch_tokens": if decode {8 + query} else {8}, "prefill_tokens":8,
                 "decode_request_count":u32::from(decode), "decode_kv_total":if decode {8} else {0},
                 "prefill_prefix_lens":[0],"prefill_append_lens":[8],"speculative_geometry":geometry.to_string()
             }]}),
@@ -300,9 +324,11 @@ mod tests {
         let progress = json!({"query_width":6,"prefill_chunks":u32::from(pending != "prefill"),
             "decode_rounds":u32::from(pending.is_empty()),
             "resident_kv_sum":if pending.is_empty() {8} else {0},
-            "emitted_tokens":if pending.is_empty() {6} else {0},
+            "query_rows":if pending.is_empty() {query} else {0},
+            "verify_pairs":if pending.is_empty() {query * 8 + query * (query + 1) / 2} else {0},
+            "emitted_tokens":if pending.is_empty() {query} else {0},
             "pending_prefill":if pending == "prefill" {Some((0,8))} else {None},
-            "pending_decode":if pending == "decode" {Some(8)} else {None}});
+            "pending_decode":if pending == "decode" {Some((8,query))} else {None}});
         register(
             &ctx,
             "slo",
@@ -324,7 +350,7 @@ mod tests {
         let actual = Actual {
             prefill_tokens: 8.0,
             causal: 36.0,
-            batch_tokens: if decode { 14.0 } else { 8.0 },
+            batch_tokens: if decode { (8 + query) as f64 } else { 8.0 },
             ..Actual::default()
         };
         let expected = Expected {
@@ -349,6 +375,24 @@ mod tests {
                 .iter()
                 .all(|row| row.get("positive_boundary_allowance").is_none()));
         }
+    }
+
+    #[tokio::test]
+    async fn a_verify_clipped_at_the_model_limit_conserves_its_own_rows() {
+        // Two rows at 8 resident keys end at 10, one below the 11-token limit:
+        // vLLM's clip. Its rows, pairs and its at-most-two tokens conserve.
+        for pending in ["", "decode"] {
+            let output = if pending.is_empty() { 3 } else { 1 };
+            let (ctx, actual, mut expected) = verify_fixture(pending, 10, 2, 11, output);
+            let checks = checks(&ctx, &actual, &mut expected).await.unwrap();
+            assert!(
+                checks.iter().all(|row| row["status"] == "OK"),
+                "{pending}: {checks:#?}"
+            );
+        }
+        // A short verify anywhere else is not a shape the scheduler produces.
+        let (ctx, actual, mut expected) = verify_fixture("", 10, 2, 12, 3);
+        assert!(checks(&ctx, &actual, &mut expected).await.is_err());
     }
 
     #[tokio::test]

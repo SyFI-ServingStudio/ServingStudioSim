@@ -130,6 +130,13 @@ def test_geometry_cannot_silently_replace_missing_or_different_work():
         aggregate_workload(totals(decode=((100, 1),)))
 
 
+def test_a_verify_clipped_at_the_model_limit_counts_only_its_rows():
+    """vLLM verifies two rows of a request whose sampled position is 8191."""
+    workload = aggregate_workload(totals(decode=((106, 6), (8191, 2))))
+    assert workload.matmul_tokens == 2 + 6 + 2
+    assert workload.head_positions == 1 + 6 + 2
+
+
 def test_logged_depth_must_match_deployment(tmp_path):
     write_params(tmp_path, depth=3)
     result = floors.compute_floors(tmp_path, {"main": totals()})["main"]

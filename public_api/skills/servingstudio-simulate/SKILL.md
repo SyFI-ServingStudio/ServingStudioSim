@@ -248,9 +248,7 @@ echo "$S" | jq '{status, error, routing, workload, gpus, summary}'
 `status` is `queued` (with `queue_position`), `running`, `done`, `failed`
 (with `error`) or `timed_out`. The record repeats the request: `preset`,
 `params`, `workload` (with the `capture` used, `trace`, its facts as
-recorded, before any `load` rescales its rate, and
-`shortened`, how many requests lost their last tokens to fit a speculative
-pool's draft window), `routing` and `gpus`. Once done, `summary` has:
+recorded, before any `load` rescales its rate), `routing` and `gpus`. Once done, `summary` has:
 
 - `cause`: why the run stopped;
 - `requests`: `total` and `finished`;

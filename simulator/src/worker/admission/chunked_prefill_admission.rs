@@ -647,6 +647,7 @@ where
             }
         }
         if has_batch && query_width > 1 {
+            let decode_completion = &self.decode_completion;
             let mut store = context.requests.borrow_mut();
             for partition in 0..kv_store.num_partitions() as u16 {
                 kv_store.visit_prefill_admits(partition, |request| {
@@ -665,7 +666,8 @@ where
                             .speculative
                             .get_or_insert_with(Default::default);
                         observation.query_width = query_width;
-                        observation.pending_decode = Some(resident as u64);
+                        observation.pending_decode =
+                            Some((resident, decode_completion.query_tokens_at(resident)));
                     });
                 }
             }

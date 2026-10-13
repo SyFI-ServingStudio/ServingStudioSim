@@ -189,24 +189,23 @@ def test_a_request_past_the_checkpoints_positions_is_refused(bound, tmp_path):
 
 @pytest.mark.presets
 @pytest.mark.needs_binary
-def test_a_speculative_trace_must_fit_the_draft_and_its_width(bound, tmp_path):
-    """GLM-5.2 NVFP4 MTP at ctx8k drafts 5 tokens past every output, and a
-    per-position acceptance needs one probability for each of them."""
+def test_a_speculative_trace_fits_as_vllm_admits_it_and_matches_its_width(bound, tmp_path):
+    """GLM-5.2 NVFP4 MTP at ctx8k drafts 5 tokens; a request may end at
+    max_model_len (vLLM clips its last verifies), and a per-position acceptance
+    needs one probability for each draft."""
     spec = (
         "GLM-5.2-NVFP4/glm52_vllm_nvfp4_dsa_moe_speculative",
         {"replicas": 1, "server": "ctx8k"},
     )
     header = "id,arrival_time,input_len,output_len,accept_rate\n"
     with pytest.raises(workloads.BadWorkload) as error:
-        _plan_run(bound, tmp_path, *spec, header + "a,0.0,8000,190,0.7\n", ["speculative"])
-    assert "max_model_len 8192 (prefix_len + input_len + output_len + 5 draft tokens)" in str(
-        error.value
-    )
+        _plan_run(bound, tmp_path, *spec, header + "a,0.0,8000,193,0.7\n", ["speculative"])
+    assert "max_model_len 8192 (prefix_len + input_len + output_len)" in str(error.value)
     vectors = header + 'a,0.0,100,10,"[0.9,0.8,0.7,0.6,0.5]"\nb,0.0,100,10,"[0.9,0.8]"\n'
     with pytest.raises(workloads.BadWorkload) as error:
         _plan_run(bound, tmp_path, *spec, vectors, ["speculative"])
     assert "1 of 2 requests give pool main's speculative worker, which drafts 5 tokens" in str(
         error.value
     )
-    fits = header + 'a,0.0,100,10,"[0.9,0.8,0.7,0.6,0.5]"\nb,0.0,8000,187,0.6\n'
+    fits = header + 'a,0.0,100,10,"[0.9,0.8,0.7,0.6,0.5]"\nb,0.0,8000,192,0.6\n'
     assert len(_plan_run(bound, tmp_path, *spec, fits, ["speculative"])) == 2

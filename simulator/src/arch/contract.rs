@@ -209,14 +209,66 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
 /// verify step may present more than one query row for one request. Keeping the
 /// pair together prevents callers from recovering request count from the
 /// query-row count.
+///
+/// The width is `draft_tokens + 1` except at the context limit, where vLLM's
+/// scheduler clips it ([`Self::verify_query_len`]); such a boundary row ends
+/// exactly at `max_model_len - 1`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpeculativeDecodeInput {
     /// Timing context visible to the final query row of this request's verify
-    /// group. It includes all resident keys and every query row; a full-width
-    /// window must fit the model limit. Durable KV advances by accepted tokens.
+    /// group. It includes all resident keys and every query row. Durable KV
+    /// advances by accepted tokens.
     pub kv_len: u32,
     /// Query rows emitted for this request in the current verify group.
     pub query_len: u32,
+}
+
+impl SpeculativeDecodeInput {
+    /// Query rows a resident request verifies this step: the full
+    /// `draft_tokens + 1` window, clipped so the position after its last row,
+    /// where the step samples, stays inside `max_model_len`.
+    ///
+    /// This is vLLM's scheduler rule, `num_new_tokens = min(num_new_tokens,
+    /// max_model_len - num_computed_tokens - num_sampled_tokens_per_step)` with
+    /// one sampled token per step; the drafts past the clip are not verified.
+    /// `resident_kv` is that `num_computed_tokens`: the context before the
+    /// pending target token. Zero means no room for even that token.
+    pub fn verify_query_len(resident_kv: u64, draft_tokens: u32, max_model_len: u32) -> u32 {
+        let room = u64::from(max_model_len).saturating_sub(resident_kv.saturating_add(1));
+        u64::from(draft_tokens + 1).min(room) as u32
+    }
+
+    /// Validate this row against the verify width and the model limit, and
+    /// return whether it is a clipped boundary row (fewer than
+    /// `draft_tokens + 1` queries). A full-width row may end at
+    /// `max_model_len`; a clipped one must end exactly at `max_model_len - 1`,
+    /// the only place [`Self::verify_query_len`] produces it.
+    pub fn check_verify_row(&self, draft_tokens: u32, max_model_len: u32) -> Result<bool, String> {
+        let width = draft_tokens + 1;
+        if !(1..=width).contains(&self.query_len) {
+            return Err(format!(
+                "query_len {} must be in 1..={width} (draft_tokens + 1)",
+                self.query_len
+            ));
+        }
+        if !(self.query_len..=max_model_len).contains(&self.kv_len) {
+            return Err(format!(
+                "kv_len {} must be in {}..={max_model_len}",
+                self.kv_len, self.query_len
+            ));
+        }
+        let clipped = self.query_len < width;
+        if clipped && self.kv_len + 1 != max_model_len {
+            return Err(format!(
+                "a clipped verify row ({} of {width} queries) must end at max_model_len - 1 \
+                 ({}), not kv_len {}",
+                self.query_len,
+                max_model_len - 1,
+                self.kv_len
+            ));
+        }
+        Ok(clipped)
+    }
 }
 
 /// One attention/FFN group view for a speculative iter-wise batch.
@@ -333,8 +385,9 @@ pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
     /// [`IterwiseUnifiedModel::kv_cache_layout`].
     fn kv_cache_layout(&self) -> KvCacheLayout;
 
-    /// Maximum context accepted by the model's timing kernels. A complete
-    /// fixed-width verify window must fit within this bound.
+    /// Maximum context accepted by the model's timing kernels. A verify
+    /// window that would pass it is clipped
+    /// ([`SpeculativeDecodeInput::verify_query_len`]).
     fn max_model_len(&self) -> u32;
 
     /// See [`IterwiseUnifiedModel::gpus_per_replica`].
