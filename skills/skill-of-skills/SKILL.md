@@ -59,6 +59,7 @@ completion condition should be obvious.
 
 ```text
 top-add-new-arch - add a whole model architecture end to end (capture → split → build L1–L4, largest kernel first)
+├── dev-parallelize-arch-addition - single-agent mode only: run the phases as parallel lanes: capture beside the build, one lane per kernel family and per worklet, one serial arch lane
 ├── operate-run-alignment - Phase 0: capture the real vLLM/SGLang kernel sequence that drives the split (profile phase only; needs no arch)
 ├── top-split-model-into-kernels - explore + break the forward into the kernel/op sequence
 ├── top-add-kernel - create each new L1 kernel (L1-Python impl-register-kernel + L1-Rust impl-wire-kernel-to-rust)
