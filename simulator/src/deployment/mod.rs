@@ -110,8 +110,12 @@ pub fn pool_bounds(cfg: &RunConfig) -> anyhow::Result<Vec<PoolBound>> {
 ///   carries (the tag makes the column required on every row); an untagged
 ///   trace's standard requests would panic the worker at its first decode;
 /// - every request's whole context (its declared prefix, its input and its
-///   output; a speculative worker's last verify reads `draft_tokens` beyond
-///   that) must fit each pool's [`IterArchSel::max_model_len`];
+///   output, at least one token) must fit each pool's
+///   [`IterArchSel::max_model_len`]. That is vLLM's own admission: the engine
+///   refuses a prompt with no room for one output token and the server one
+///   whose `max_tokens` does not fit. A speculative worker needs no draft
+///   room: vLLM clips the verify of a request at the limit
+///   ([`SpeculativeDecodeInput::verify_query_len`](crate::arch::contract::SpeculativeDecodeInput::verify_query_len));
 /// - a per-position `accept_rate` must have one probability per draft
 ///   position of each speculative worker (a single probability fits any).
 ///
@@ -134,14 +138,12 @@ pub fn check_trace(cfg: &RunConfig, trace: &TraceFrontend) -> anyhow::Result<()>
             "pool {role}: the speculative worker needs each request's accept_rate; tag the \
              trace `speculative` (workload.input_file_tags) and give every row an accept_rate"
         );
-        let draft = pool.draft_tokens.unwrap_or(0);
         let (mut long, mut long_ids) = (0usize, Vec::new());
         let (mut misfit, mut misfit_ids) = (0usize, Vec::new());
         for (id, request) in trace.source_requests() {
             let context = u64::from(request.session.declared_prefix_tokens())
                 + u64::from(request.prompt_tokens)
-                + u64::from(request.target_output_tokens)
-                + u64::from(draft);
+                + u64::from(request.target_output_tokens.max(1));
             if context > u64::from(pool.max_model_len) {
                 long += 1;
                 if long_ids.len() < SHOWN {
@@ -164,25 +166,21 @@ pub fn check_trace(cfg: &RunConfig, trace: &TraceFrontend) -> anyhow::Result<()>
             }
         }
         if long > 0 {
-            let fit = if draft > 0 {
-                format!("prefix_len + input_len + output_len + {draft} draft tokens")
-            } else {
-                "prefix_len + input_len + output_len".to_string()
-            };
             return Err(TooLong {
                 max_model_len: pool.max_model_len,
                 pool: Some(role),
                 requests: Some(long),
                 total: Some(total),
                 message: format!(
-                    "{long} of {total} requests exceed pool {role}'s max_model_len {} ({fit}), \
-                     first ids {long_ids:?}",
+                    "{long} of {total} requests exceed pool {role}'s max_model_len {} \
+                     (prefix_len + input_len + max(output_len, 1)), first ids {long_ids:?}",
                     pool.max_model_len
                 ),
             }
             .into());
         }
         if misfit > 0 {
+            let draft = pool.draft_tokens.unwrap_or(0);
             bail!(
                 "{misfit} of {total} requests give pool {role}'s speculative worker, which \
                  drafts {draft} tokens, an accept_rate vector that is not {draft} \
@@ -334,7 +332,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "2 of 4 requests exceed pool main's max_model_len 131072 \
-             (prefix_len + input_len + output_len), first ids [\"b\", \"c\"]"
+             (prefix_len + input_len + max(output_len, 1)), first ids [\"b\", \"c\"]"
         );
         let too_long = error.downcast_ref::<TooLong>().expect("a TooLong refusal");
         assert_eq!(
@@ -349,18 +347,21 @@ mod tests {
     }
 
     #[test]
-    fn a_speculative_worker_counts_its_draft_tokens_and_its_acceptance_width() {
+    fn a_speculative_worker_admits_what_vllm_admits_and_checks_its_acceptance_width() {
         let dir = tempfile::tempdir().unwrap();
         let speculative = llama_config("speculative", SPECULATIVE);
-        // 131069 + 3 draft tokens fits; one more does not.
-        let fits = trace(dir.path(), &["speculative"], "a,131000,69,0.0,0.7\n");
-        check_trace(&speculative, &fits).expect("fits with its draft tokens");
-        let long = trace(dir.path(), &["speculative"], "a,131000,70,0.0,0.7\n");
+        // No draft room: vLLM clips the last verifies of a request ending at
+        // the limit, so prompt + output may reach max_model_len exactly.
+        let fits = trace(
+            dir.path(),
+            &["speculative"],
+            "a,131000,72,0.0,0.7\nb,122879,8192,0.0,0.7\nc,131070,1,0.0,0.7\n",
+        );
+        check_trace(&speculative, &fits).expect("prompt + output fits max_model_len");
+        let long = trace(dir.path(), &["speculative"], "a,131000,73,0.0,0.7\n");
         let error = check_trace(&speculative, &long).unwrap_err().to_string();
         assert!(
-            error.contains(
-                "max_model_len 131072 (prefix_len + input_len + output_len + 3 draft tokens)"
-            ),
+            error.contains("max_model_len 131072 (prefix_len + input_len + max(output_len, 1))"),
             "{error}"
         );
 

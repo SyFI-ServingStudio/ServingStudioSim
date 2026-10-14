@@ -194,10 +194,9 @@ the simulator loads the trace as the run will and checks it against the run's
 pools (`simulator workload-plan --config` on the run config, the check `run`
 makes before its first tick: format, tags, every row, the replay settings, so
 chaining a trace without sessions is refused; every request's `prefix_len +
-input_len + output_len`, plus the draft tokens for a speculative worker, fits
-each pool's `max_model_len`, which is the arch's own or else its checkpoint's
-`max_position_embeddings`; and a per-position `accept_rate` has one probability
-per draft position) (400 for each; a request that does not fit answers
+input_len + output_len` fits each pool's `max_model_len`, which is the arch's
+own or else its checkpoint's `max_position_embeddings`; and a per-position
+`accept_rate` has one probability per draft position) (400 for each; a request that does not fit answers
 `detail: {message, too_long: {pool, max_model_len, requests, total}}` (`pool` the refusing pool's role), the counts
 of the simulator's own check). The run's directory holds the trace
 it replays (`workload.csv`: the source's rows, with the `accept_rate`

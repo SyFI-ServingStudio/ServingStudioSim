@@ -2,9 +2,11 @@
 
 The timed statements are the ones vLLM writes around a recurrent-state prefill
 (``qwen_gdn_linear_attn.py``): ``pool[indices]``, ``rows[~mask, ...] = 0`` and
-``pool[indices] = rows``. Torch is the production callable here, so the runner
-times it directly and checks the result against plain per-row copies outside
-the capture. Every launch of a statement is counted.
+``pool[indices] = rows``, plus the token-row split and merge of a step that mixes
+speculative and plain rows: ``x.index_select(0, indices)`` and
+``out.index_copy_(0, indices, rows)``. Torch is the production callable here, so
+the runner times it directly and checks the result against plain per-row copies
+outside the capture. Every launch of a statement is counted.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "indexed_row_copy:torch"
-_OPERATIONS = ("gather", "scatter", "masked_zero")
+_OPERATIONS = ("gather", "scatter", "masked_zero", "index_select", "index_copy")
 
 
 def _validate(num_rows: int, row_elements: int, dtype: DType | str, operation: str):
@@ -36,6 +38,13 @@ def slot_indices(num_rows: int) -> list[int]:
     return list(range(2, 2 * num_rows + 2, 2))
 
 
+def token_indices(num_rows: int) -> list[int]:
+    """Contiguous token rows after one leading row, standing in for the sorted
+    int64 token indices a mixed step selects (``argsort`` of the spec-token
+    mask), which need not be contiguous."""
+    return list(range(1, num_rows + 1))
+
+
 def logical_bytes(num_rows: int, row_elements: int, dtype: DType, operation: str) -> int:
     row_bytes = int(num_rows * row_elements * dtype.size_bytes())
     return row_bytes if operation == "masked_zero" else 2 * row_bytes
@@ -47,6 +56,10 @@ def _build(
     generator = torch.Generator(device=device)
     generator.manual_seed(42)
     torch_dtype = dtype.torch()
+    if operation in ("index_select", "index_copy"):
+        return _build_token_rows(
+            torch, num_rows, row_elements, torch_dtype, operation, generator, device
+        )
     indices = torch.tensor(slot_indices(num_rows), dtype=torch.int32, device=device)
     if operation == "masked_zero":
         rows = torch.empty(num_rows, row_elements, dtype=torch_dtype, device=device)
@@ -87,6 +100,44 @@ def _build(
         for row, slot in enumerate(slot_indices(num_rows)):
             if not torch.equal(pool[slot], rows[row]):
                 raise AssertionError("scatter wrote the wrong slot")
+
+    return run, check
+
+
+def _build_token_rows(
+    torch: Any,
+    num_rows: int,
+    row_elements: int,
+    torch_dtype: Any,
+    operation: str,
+    generator: Any,
+    device: Any,
+):
+    tokens = torch.tensor(token_indices(num_rows), dtype=torch.int64, device=device)
+    if operation == "index_select":
+        source = torch.empty(num_rows + 1, row_elements, dtype=torch_dtype, device=device)
+        source.normal_(generator=generator)
+        out: list[Any] = []
+
+        def run() -> None:
+            out[:] = [source.index_select(0, tokens)]
+
+        def check() -> None:
+            if not torch.equal(out[0], source[1:]):
+                raise AssertionError("index_select returned the wrong rows")
+
+        return run, check
+
+    destination = torch.zeros(num_rows + 1, row_elements, dtype=torch_dtype, device=device)
+    rows = torch.empty(num_rows, row_elements, dtype=torch_dtype, device=device)
+    rows.normal_(generator=generator)
+
+    def run() -> None:
+        destination.index_copy_(0, tokens, rows)
+
+    def check() -> None:
+        if not torch.equal(destination[1:], rows):
+            raise AssertionError("index_copy_ wrote the wrong rows")
 
     return run, check
 

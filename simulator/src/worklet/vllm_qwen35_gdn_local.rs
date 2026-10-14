@@ -203,6 +203,7 @@ impl VllmQwen35GdnLocalWorklet {
             value_head_dim: cfg.value_head_dim.into(),
             dtype: cfg.activation_dtype,
             state_dtype: cfg.ssm_state_dtype,
+            tokens_per_request: None,
         };
         let value_row = value_width * act;
         VllmQwen35GdnLocalWorkletResolved {
@@ -228,6 +229,7 @@ impl VllmQwen35GdnLocalWorklet {
                     kernel_size: cfg.conv_kernel_size.into(),
                     dtype: cfg.activation_dtype,
                     state_dtype: cfg.conv_state_dtype,
+                    tokens_per_request: None,
                 },
                 recurrent: recurrent(&cfg.packed_decode_backends),
             },

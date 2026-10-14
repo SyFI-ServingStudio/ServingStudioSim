@@ -224,8 +224,9 @@ def _glm_ep4_spec(**overrides: object) -> dict:
 
 
 def test_routing_methods_map_to_flashinfer_routing_method_types() -> None:
-    # flashinfer.fused_moe.RoutingMethodType: DeepSeekV3 = 2, MiniMax2 = 7.
-    assert ROUTING_METHODS == {"minimax2": 7, "deepseek_v3": 2}
+    # flashinfer.fused_moe.RoutingMethodType: DeepSeekV3 = 2,
+    # RenormalizeNaive = 4, MiniMax2 = 7.
+    assert ROUTING_METHODS == {"minimax2": 7, "deepseek_v3": 2, "renormalize_naive": 4}
 
 
 def test_vllm_backends_accept_ungrouped_deepseek_v3_routing() -> None:
@@ -239,6 +240,8 @@ def test_vllm_backends_accept_ungrouped_deepseek_v3_routing() -> None:
         ({"n_group": 8, "topk_group": 4}, "vllm", "ungrouped"),
         ({}, "sglang", "SGLang"),
         ({"routing_method": "renormalize"}, "vllm", "routing method"),
+        ({"routing_method": "renormalize_naive"}, "vllm", "n_group=topk_group=0"),
+        ({"routing_method": "minimax2", "n_group": 0, "topk_group": 0}, "vllm", "n_group and"),
     ],
 )
 def test_validation_rejects_routing_the_measured_call_would_not_honor(
@@ -282,6 +285,33 @@ def test_forced_minimax2_routing_keeps_bf16_logits_and_bias() -> None:
     assert [set(row) for row in chosen] == [set(row) for row in ids]
 
 
+def _renormalize_spec() -> dict:
+    return _glm_ep4_spec(
+        routing_method="renormalize_naive",
+        n_group=0,
+        topk_group=0,
+        routed_scaling_numerator=1,
+        routed_scaling_denominator=1,
+    )
+
+
+def test_forced_renormalize_naive_routing_realizes_the_histogram_without_bias() -> None:
+    """vLLM passes BF16 logits and no bias for softmax + renormalize routing;
+    softmax top-k over the forced logits must pick exactly the row's experts."""
+    torch = pytest.importorskip("torch")
+    from profiling.runners.moe.fp8_block_fused_moe_reference import renormalize_naive_routing
+
+    args = _validate_args(**_renormalize_spec())
+    ids = exact_topk_ids(
+        num_tokens=args["num_tokens"], top_k=8, per_expert_batches=args["per_expert_batches"]
+    )
+    logits, bias = forced_routing(torch, ids, args, device="cpu")
+    assert logits.dtype is torch.bfloat16 and bias is None
+    chosen, _ = renormalize_naive_routing(torch, logits, top_k=8)
+    counts = torch.bincount(chosen.flatten(), minlength=288).tolist()
+    assert counts == list(args["per_expert_batches"])
+
+
 def test_logical_bytes_charge_routing_at_the_router_element_size() -> None:
     """DeepSeekV3 rows read FP32 logits and bias, MiniMax2 rows BF16; the routed
     backend reads the same pre-selected IDs and weights for both."""
@@ -291,6 +321,10 @@ def test_logical_bytes_charge_routing_at_the_router_element_size() -> None:
     assert _logical_bytes(deepseek, do_finalize=True) - _logical_bytes(
         minimax, do_finalize=True
     ) == 2 * (tokens * experts + experts)
+    renormalize = _validate_args(**_renormalize_spec())
+    assert _logical_bytes(minimax, do_finalize=True) - _logical_bytes(
+        renormalize, do_finalize=True
+    ) == 2 * experts
     assert _logical_bytes(deepseek, do_finalize=True, precomputed_routing=True) == _logical_bytes(
         minimax, do_finalize=True, precomputed_routing=True
     )

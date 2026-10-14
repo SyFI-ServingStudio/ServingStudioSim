@@ -130,6 +130,13 @@ def test_geometry_cannot_silently_replace_missing_or_different_work():
         aggregate_workload(totals(decode=((100, 1),)))
 
 
+def test_a_verify_clipped_at_the_model_limit_counts_only_its_rows():
+    """vLLM verifies two rows of a request whose sampled position is 8191."""
+    workload = aggregate_workload(totals(decode=((106, 6), (8191, 2))))
+    assert workload.matmul_tokens == 2 + 6 + 2
+    assert workload.head_positions == 1 + 6 + 2
+
+
 def test_logged_depth_must_match_deployment(tmp_path):
     write_params(tmp_path, depth=3)
     result = floors.compute_floors(tmp_path, {"main": totals()})["main"]
@@ -192,3 +199,27 @@ def test_dflash2_geometry_needs_its_arch(tmp_path):
     write_params(tmp_path, arch={**DFLASH2_ARCH, "type": "glm52_vllm_nvfp4_dsa_moe"})
     result = floors.compute_floors(tmp_path, {"main": totals(depth=7, decode=((4104, 8),))})
     assert "requires a speculative architecture" in result["main"]["error"]
+
+
+def test_default_draft_depths_match_the_simulator_serde_defaults():
+    """params.json omits a defaulted ``draft_tokens``; floors must resolve it to
+    the depth the simulator ran, so the hand copy tracks ``arch/config.rs``."""
+    import re
+
+    source = (ROOT / "simulator/src/arch/config.rs").read_text()
+    defaults = {
+        name: int(value.replace("_", ""))
+        for name, value in re.findall(r"const fn (\w+)\(\) -> u32 \{\s*([\d_]+)\s*\}", source)
+    }
+    rust = {}
+    # A variant opens at four-space indentation; its fields follow until the next one.
+    for variant, body in re.findall(r"\n    (\w+) \{\n(.*?)\n    \}", source, re.S):
+        default = re.search(
+            r'#\[serde\(default = "(\w+)"\)\][^\n]*\n(?:\s*#\[[^\n]*\n)*\s*draft_tokens: u32',
+            body,
+        )
+        if default:
+            arch_type = re.sub(r"(?<!^)(?=[A-Z])", "_", variant).lower()
+            rust[arch_type] = defaults[default.group(1)]
+    assert rust == floors._DEFAULT_DRAFT_TOKENS
+    assert set(rust) == floors._SPECULATIVE_ARCHS

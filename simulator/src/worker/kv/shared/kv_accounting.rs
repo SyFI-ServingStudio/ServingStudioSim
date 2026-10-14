@@ -11,6 +11,11 @@
 //! - [`KvAccounting::entry_charge`]: what a finished request's retained prefix
 //!   keeps, given the positions a later request can resume from.
 //!
+//! [`KvAccounting::concurrency_at`] answers a fourth, for the report only:
+//! vLLM's logged "Maximum concurrency", whose estimate charges a recurrent
+//! state one more copy than a running request holds (see
+//! [`state_copies`]).
+//!
 //! `kv_overhead` picks the byte counts. `vllm` charges what vLLM allocates:
 //! padded entries, extra state copies, whole engine blocks, and a sliding window
 //! that holds `W - 1` tokens plus the tokens in flight. `none` charges only what
@@ -110,14 +115,16 @@ pub struct KvAccountingOptions {
     /// admission charges a sliding window; `None` charges the whole prompt.
     pub max_in_flight_tokens: Option<u32>,
     /// Whether finished requests are retained for prefix reuse. vLLM then runs
-    /// a recurrent state in align mode, which keeps the previous step's state
-    /// block beside the running one: one more copy per request.
+    /// a recurrent state in align mode, whose concurrency estimate counts the
+    /// previous step's state block beside the running one: one more copy per
+    /// request in [`KvAccounting::concurrency_at`], none in what a running
+    /// request holds.
     pub prefix_caching: bool,
 }
 
-/// One part's share of [`KvAccounting::needed_to_admit`].
+/// One part's share of [`KvAccounting::estimated_request_units`] (vLLM's concurrency estimate).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PartAtAdmission {
+pub(super) struct PartInEstimate {
     /// Context tokens the part holds: the block-rounded prompt for a per-token
     /// part, the kept window for a sliding window; `None` for per-request state.
     pub tokens_held: Option<u64>,
@@ -156,8 +163,10 @@ pub(crate) struct KvAccounting {
     capacity_units: u64,
     per_token: Vec<PerTokenCharge>,
     windows: Vec<WindowCharge>,
-    /// All per-request state, with its copies.
+    /// All per-request state, with the copies a running request holds.
     state_units: u64,
+    /// The align copies vLLM's concurrency estimate adds on top.
+    align_estimate_units: u64,
     /// One copy of the per-request state a later request can resume from.
     reusable_state_units: u64,
     /// Allocation and resume granularity; 1 when blocks are not modeled.
@@ -201,6 +210,7 @@ impl KvAccounting {
         let mut per_token = Vec::new();
         let mut windows = Vec::new();
         let mut state_units = 0;
+        let mut align_estimate_units = 0;
         let mut reusable_state_units = 0;
         for part in &layout.parts {
             let units = charged_bytes_per_entry(part, options.overhead) / bytes_per_unit;
@@ -215,8 +225,9 @@ impl KvAccounting {
                     prefix_reusable: part.prefix_reusable,
                 }),
                 KvGrowth::PerRequest => {
-                    let (copies, _) = charged_state_copies(part, layout, options);
+                    let (copies, aligns) = state_copies(part, layout, options);
                     state_units += units * u64::from(copies);
+                    align_estimate_units += units * u64::from(aligns);
                     if part.prefix_reusable {
                         reusable_state_units += units;
                     }
@@ -264,6 +275,7 @@ impl KvAccounting {
             per_token,
             windows,
             state_units,
+            align_estimate_units,
             reusable_state_units,
             block_tokens,
             checkpoint_block_tokens: layout.engine.block_tokens,
@@ -283,9 +295,15 @@ impl KvAccounting {
     }
 
     /// Requests of `max_model_len` tokens the pool admits at once, as vLLM's
-    /// "Maximum concurrency for N tokens per request" log line counts them.
+    /// "Maximum concurrency for N tokens per request" log line counts them:
+    /// the admission charge plus the align copies its estimate adds.
     pub(crate) fn concurrency_at(&self, max_model_len: u64) -> f64 {
-        self.capacity_units as f64 / self.needed_to_admit(max_model_len) as f64
+        self.capacity_units as f64 / self.estimated_request_units(max_model_len) as f64
+    }
+
+    /// Units vLLM's concurrency estimate charges a `prompt_tokens` request.
+    pub(super) fn estimated_request_units(&self, prompt_tokens: u64) -> u64 {
+        self.needed_to_admit(prompt_tokens) + self.align_estimate_units
     }
 
     /// The same accounting with `units` of capacity set aside, as PD decode
@@ -423,10 +441,10 @@ impl KvAccounting {
         self.per_token_units(prompt_tokens) + window + self.state_units
     }
 
-    /// [`Self::needed_to_admit`] split over the layout's parts, in their
-    /// order: what each part holds for the waiting request and its units.
-    /// Built for the report only; the parts sum to `needed_to_admit`.
-    pub(super) fn needed_to_admit_by_part(&self, prompt_tokens: u64) -> Vec<PartAtAdmission> {
+    /// [`Self::estimated_request_units`] split over the layout's parts, in
+    /// their order: what each part holds for the request and its units.
+    /// Built for the report only; the parts sum to `estimated_request_units`.
+    pub(super) fn estimated_request_by_part(&self, prompt_tokens: u64) -> Vec<PartInEstimate> {
         let in_flight = self.max_in_flight_tokens.unwrap_or(prompt_tokens);
         let allocated = prompt_tokens.div_ceil(self.block_tokens) * self.block_tokens;
         self.layout
@@ -450,11 +468,11 @@ impl KvAccounting {
                         (Some(tokens), tokens)
                     }
                     KvGrowth::PerRequest => {
-                        let (copies, _) = charged_state_copies(part, &self.layout, self.options);
-                        (None, u64::from(copies))
+                        let (copies, aligns) = state_copies(part, &self.layout, self.options);
+                        (None, u64::from(copies + u32::from(aligns)))
                     }
                 };
-                PartAtAdmission {
+                PartInEstimate {
                     tokens_held,
                     entries,
                     units: units_per_entry * entries,
@@ -712,11 +730,18 @@ pub(super) fn charged_bytes_per_entry(part: &KvCachePart, overhead: KvOverhead) 
     }
 }
 
-/// Copies of a per-request `part` charged per request, and whether one of them
-/// is align mode's previous-step copy: under `vllm`, the declared copies plus
-/// that one when prefix caching is on, the state is reusable and the engine has
-/// a block; under `none`, one.
-pub(super) fn charged_state_copies(
+/// Copies of a per-request `part` a running request holds, and whether vLLM's
+/// concurrency estimate adds align mode's previous-step copy on top: under
+/// `vllm`, the declared copies, plus that one when prefix caching is on, the
+/// state is reusable and the engine has a block; under `none`, one copy.
+///
+/// vLLM's `MambaSpec.max_memory_usage_bytes` charges align mode
+/// `2 + num_speculative_blocks` pages, but `MambaManager` keeps `1 +
+/// num_speculative_blocks` per running request: blocks before the running
+/// state are null, and the previous step's state block is freed the step
+/// after a block boundary is crossed (`remove_skipped_blocks`). That one-step
+/// copy is left out of what a request holds.
+pub(super) fn state_copies(
     part: &KvCachePart,
     layout: &KvCacheLayout,
     options: KvAccountingOptions,
@@ -726,10 +751,7 @@ pub(super) fn charged_state_copies(
     }
     let aligns =
         options.prefix_caching && part.prefix_reusable && layout.engine.block_tokens.is_some();
-    (
-        part.overhead.copies.unwrap_or(1) + u32::from(aligns),
-        aligns,
-    )
+    (part.overhead.copies.unwrap_or(1), aligns)
 }
 
 fn gcd(a: u64, b: u64) -> u64 {
@@ -849,17 +871,28 @@ mod tests {
         };
         let vllm = cached(&gdn_layout());
         assert_eq!(vllm.bytes_per_unit(), 100);
-        // 2000 tokens occupy two 1056-token blocks; the 3168-unit state is
-        // kept twice, since align mode holds the previous step's state too.
-        assert_eq!(vllm.held_while_running(2_000, 1), 2_112 + 2 * 3_168);
+        // 2000 tokens occupy two 1056-token blocks; a running request keeps
+        // the 3168-unit state once. Align mode's previous-step copy enters
+        // only vLLM's concurrency estimate.
+        assert_eq!(vllm.held_while_running(2_000, 1), 2_112 + 3_168);
+        assert_eq!(vllm.needed_to_admit(2_000), 2_112 + 3_168);
+        assert_eq!(vllm.estimated_request_units(2_000), 2_112 + 2 * 3_168);
         let no_prefix_cache =
             KvAccounting::resolve(&gdn_layout(), options(KvOverhead::Vllm), 1 << 40).unwrap();
         assert_eq!(no_prefix_cache.held_while_running(2_000, 1), 2_112 + 3_168);
-        // A speculative block per draft adds to the align copy.
+        assert_eq!(
+            no_prefix_cache.estimated_request_units(2_000),
+            2_112 + 3_168
+        );
+        // A speculative block per draft is held; the estimate adds the align copy.
         let mut speculative = gdn_layout();
         speculative.parts[1] = speculative.parts[1].with_copies(2);
         assert_eq!(
             cached(&speculative).held_while_running(2_000, 1),
+            2_112 + 2 * 3_168
+        );
+        assert_eq!(
+            cached(&speculative).estimated_request_units(2_000),
             2_112 + 3 * 3_168
         );
         assert_eq!(

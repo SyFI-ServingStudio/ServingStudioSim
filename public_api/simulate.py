@@ -240,10 +240,10 @@ def check_capture(
     with tempfile.TemporaryDirectory(prefix="public-sim-check-") as directory:
         scratch = Path(directory)
         path = scratch / _TRACE
-        # The build gives the pools' bounds, which decide the trace's
-        # shortening: written once for the build, again with them.
+        # The build gives the pools' bounds, which decide the acceptance's
+        # depth: written once for the build, again with them.
         bounds = None if build else member.bounds
-        tags, _ = write_trace(member, source, workload, path, bounds)
+        tags = write_trace(member, source, workload, path, bounds)
         trace = TraceSource(path, source.input_file_format, tuple(tags), source.name)
         config = concrete(run_tree(index, member, capture, read_block(trace), scratch), registry)
         missing = kv_cache = None
@@ -317,62 +317,21 @@ def _accept_rate(
     return json.dumps(rate) if isinstance(rate, list) else repr(float(rate))
 
 
-def _fit_draft_window(bounds: list[dict] | None, rows: list[dict]) -> int:
-    """Shorten, in place, each request a speculative worker could not finish
-    only because its last verify reads ``draft_tokens`` past the request: the
-    simulator verifies a fixed width, where vLLM drafts fewer tokens near
-    ``max_model_len`` and serves it. ``bounds`` are the simulator's (the pools'
-    ``max_model_len`` and ``draft_tokens``, :attr:`SimMember.bounds`). Such a
-    request loses at most ``draft_tokens`` tokens, from its output while it
-    keeps one, then its input. A request longer than ``max_model_len`` itself, or
-    one with too little input to lose, is left for the simulator to refuse.
-    Returns how many requests were shortened."""
-    drafting = [b for b in bounds or [] if b["draft_tokens"]]
-    if not drafting:
-        return 0
-    pool = min(drafting, key=lambda b: b["max_model_len"] - b["draft_tokens"])
-    bound, draft = pool["max_model_len"], pool["draft_tokens"]
-    shortened = 0
-    for row in rows:
-        output, given = int(row["output_len"]), int(row["input_len"])
-        over = _prefix(row) + given + output + draft - bound
-        cut = min(over, output - 1)
-        if not 0 < over <= draft or over - cut >= given:
-            continue
-        row["output_len"] = str(output - cut)
-        row["input_len"] = str(given - (over - cut))
-        shortened += 1
-    return shortened
-
-
-def _prefix(row: dict) -> int:
-    """The prefix the simulator counts toward a request's length, as its trace
-    reader takes it (``sim/frontend/schema.rs``): a chained round's
-    ``prefix_len``, or an independent row's ``prefix_kv`` when it names a
-    session."""
-    if row.get("prefix_len"):
-        return int(row["prefix_len"])
-    if row.get("session_id") and row.get("prefix_kv"):
-        return int(row["prefix_kv"])
-    return 0
-
-
 def write_trace(
     member: SimMember,
     source: TraceSource,
     workload: Workload,
     out: Path,
     bounds: list[dict] | None,
-) -> tuple[list[str], int]:
+) -> list[str]:
     """Write the trace this run replays to ``out``: the source's rows, every
     column kept, with an ``accept_rate`` column for a speculative worker. A
     worker that drafts nothing runs a speculative trace (a speculative
     capture's, which records its acceptance) without that column and tag: the
     acceptance belongs to the capture's proposer, not to the requests.
-    A request that misses a speculative worker's draft window by a few tokens
-    is shortened to fit the pools' ``bounds`` (:func:`_fit_draft_window`). Returns the trace's tags
-    and how many requests were shortened; raises :class:`BadWorkload` on a
-    trace the member cannot serve."""
+    ``bounds`` (:attr:`SimMember.bounds`) give the drafting pool's depth an
+    acceptance vector must match. Returns the trace's tags; raises
+    :class:`BadWorkload` on a trace the member cannot serve."""
     with open(source.path, newline="") as stream:
         reader = csv.DictReader(stream)
         fields = list(reader.fieldnames or [])
@@ -384,7 +343,6 @@ def write_trace(
         tags.remove(SPECULATIVE_TAG)
         fields.remove("accept_rate")
         rows = [{k: v for k, v in row.items() if k != "accept_rate"} for row in rows]
-    shortened = _fit_draft_window(bounds, rows)
     if accept:
         fields.append("accept_rate")
         tags.append(SPECULATIVE_TAG)
@@ -393,7 +351,7 @@ def write_trace(
         writer.writeheader()
         for row in rows:
             writer.writerow(row | ({"accept_rate": accept} if accept else {}))
-    return tags, shortened
+    return tags
 
 
 def workload_block(workload: Workload, trace: TraceSource, facts: dict) -> dict:
@@ -854,7 +812,7 @@ class SimulationService:
         try:
             source = self._source(workload, capture, directory)
             path = directory / _TRACE
-            tags, shortened = write_trace(member, source, workload, path, member.bounds)
+            tags = write_trace(member, source, workload, path, member.bounds)
             trace = TraceSource(path, source.input_file_format, tuple(tags), source.name)
             facts = trace_facts(plan(read_block(trace), self.queue.build_type))
             block = workload_block(workload, trace, facts)
@@ -869,8 +827,7 @@ class SimulationService:
             request = {
                 "preset": preset,
                 "params": member.params,
-                "workload": workload.model_dump()
-                | {"capture": used, "trace": facts, "shortened": shortened},
+                "workload": workload.model_dump() | {"capture": used, "trace": facts},
                 "routing": routed,
                 "gpus": member.summary(index)["gpus"],
             }

@@ -802,6 +802,46 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
+                max_model_len,
+                draft_tokens,
+                kv_cache_dtype,
+                indexer_kv_dtype,
+                ple_table_residency,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative(
+                    model_spec,
+                    *max_model_len,
+                    *draft_tokens,
+                    *kv_cache_dtype,
+                    *indexer_kv_dtype,
+                    *ple_table_residency,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
             IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 {
                 ep_size,
                 nvl_num_gpu,
@@ -1388,6 +1428,7 @@ pools:
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             kv_accounting: Default::default(),
+            prefill_chunk_alignment: None,
         }
     }
 

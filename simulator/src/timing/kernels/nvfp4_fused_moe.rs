@@ -9,9 +9,15 @@
 //! `nvfp4_e2m1` / group 16. The FP8 block-scale
 //! backend `flashinfer_trtllm_fp8_block_sm100` (`trtllm_fp8_block_scale_moe`,
 //! DeepSeek-FP8) takes `fp8_e4m3` / group 128 (128x128 weight blocks,
-//! per-token-group-128 activations) with `deepseek_v3` routing,
-//! `n_group = topk_group = 1`, and routed scaling 5/2. Its autotuner stops at
-//! 8192 tokens, so larger grid points reuse the top tactic bucket.
+//! per-token-group-128 activations) with ungrouped `deepseek_v3` routing
+//! (`n_group = topk_group = 1`) or `renormalize_naive` routing
+//! (`n_group = topk_group = 0`). Its autotuner stops at 8192 tokens, so larger
+//! grid points reuse the top tactic bucket.
+//!
+//! The monolithic NVFP4 backend routes inside the call with `minimax2`,
+//! `deepseek_v3` or `renormalize_naive` (softmax top-k renormalized over BF16
+//! logits, no bias, `n_group = topk_group = 0`). `routing_method` is a plain
+//! profiler key, so a new method needs no Rust change.
 //!
 //! `flashinfer_trtllm_routed_sm100` is vLLM's modular call under data plus
 //! expert parallelism (`trtllm_fp4_block_scale_routed_moe`): the top-k IDs and

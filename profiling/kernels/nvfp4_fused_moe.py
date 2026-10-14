@@ -75,9 +75,12 @@ class Nvfp4FusedMoeArgs(KernelArgs):
         doc=(
             "Router selection rule. minimax2: sigmoid + bias top-k over BF16 logits."
             " deepseek_v3: DeepSeekV3 sigmoid + bias top-k with the routed scale, over"
-            " FP32 logits and bias. precomputed_dsv4: finished top-k ids and weights."
-            " The vLLM NVFP4 backends take minimax2 or deepseek_v3, the SGLang backend"
-            " minimax2, the FP8 block-scale and MXFP4/BF16 backends deepseek_v3, the"
+            " FP32 logits and bias. renormalize_naive: softmax top-k renormalized,"
+            " over BF16 logits with no bias and no groups (n_group = topk_group = 0)."
+            " precomputed_dsv4: finished top-k ids and weights."
+            " The vLLM NVFP4 backends take minimax2, deepseek_v3 or renormalize_naive,"
+            " the SGLang backend minimax2, the FP8 block-scale backend deepseek_v3 or"
+            " renormalize_naive, the MXFP4/BF16 backend deepseek_v3, the"
             " MXFP4 backend precomputed_dsv4."
         )
     )
@@ -123,7 +126,8 @@ DOC = KernelDoc(
         "+ intermediate_size·hidden_size) / time",
         "output_rows = num_tokens for vLLM; local_rows for SGLang",
         "routing_bytes = b·(num_tokens·num_experts + num_experts); "
-        "b = 2 for minimax2 (BF16 logits and bias), 4 for deepseek_v3 (FP32)",
+        "b = 2 for minimax2 (BF16 logits and bias), 4 for deepseek_v3 (FP32); "
+        "renormalize_naive: routing_bytes = 2·num_tokens·num_experts (BF16 logits, no bias)",
         "routed backend: routing_bytes = 8·num_tokens·top_k",
         "activation_bytes = local_rows·(hidden_size/2 + hidden_size/group_size)",
         "weight_bytes = active_experts·(intermediate_size·hidden_size "
@@ -131,7 +135,8 @@ DOC = KernelDoc(
         "+ hidden_size·intermediate_size/group_size)",
         "GB/s = (routing_bytes + activation_bytes + weight_bytes "
         "+ 12·active_experts + 2·hidden_size·output_rows) / time",
-        "FP8 block-scale: routing_bytes = 4·num_tokens·num_experts + 4·num_experts; "
+        "FP8 block-scale: routing_bytes = 4·num_tokens·num_experts + 4·num_experts "
+        "(deepseek_v3), 2·num_tokens·num_experts (renormalize_naive); "
         "activation_bytes = local_rows·(hidden_size + 4·hidden_size/128); "
         "weight_bytes = active_experts·(3·intermediate_size·hidden_size "
         "+ 4·3·intermediate_size·hidden_size/128²); "
@@ -175,7 +180,11 @@ DOC = KernelDoc(
         "vLLM tunes up to max_num_batched_tokens·dp_size, which picks the same "
         "bucket for every shape it serves.",
         "The NVFP4 backends pass no SwiGLU clamp (gemm1_clamp_limit is None); vLLM "
-        "passes the model's swiglu_limit when it has one.",
+        "passes the model's swiglu_limit when it has one. FP8 block-scale "
+        "deepseek_v3 rows were measured with SwiGLU clamp 10, renormalize_naive rows "
+        "without; the clamp is not a key axis.",
+        "renormalize_naive routing takes n_group = topk_group = 0 and no correction "
+        "bias, and does not apply the routed scale.",
         "GB/s counts logical traffic for the local rows and the experts that "
         "have rows; small side outputs are left out.",
     ),

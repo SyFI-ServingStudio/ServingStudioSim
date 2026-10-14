@@ -48,7 +48,8 @@ DOC = KernelDoc(
         f"{CUPTI_METHOD} The block is compiled once with a symbolic token count, "
         "and its first call, at 8192 tokens or at the row's token count when larger, "
         "picks the launch config the row then uses, as vLLM's profile run at "
-        "max_num_batched_tokens does. Every launch of the compiled block is counted."
+        "max_num_batched_tokens does. Every launch of the compiled block is counted. "
+        "vllm_cuda: the CUDA custom op writes into a preallocated output and is one launch."
     ),
     caveats=("GB/s counts the two input halves and the output once each.",),
     reference="profiling.runners.elementwise.silu_and_mul_reference",
@@ -76,6 +77,33 @@ register(
         doc=BackendDoc(
             summary="vLLM's SiluAndMul.forward_native compiled by Inductor into one Triton kernel.",
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/activation.py",
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cuda",
+        # csrc/libtorch_stable/activation_kernels.cu act_and_mul_kernel: a plain vectorized
+        # elementwise CUDA kernel with no architecture-specific path; vLLM itself
+        # serves bf16 only on SM80+ (platforms/cuda.py check_if_supports_dtype).
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            min_compute_capability=(8, 0),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.elementwise.silu_and_mul_vllm_cuda",
+            function_name="profile_silu_and_mul_vllm_cuda",
+        ),
+        table_name=KIND,
+        args_schema=SiluAndMulArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary="vLLM's SiluAndMul.forward_cuda: the torch.ops._C.silu_and_mul custom op.",
+            url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/activation_kernels.cu",
         ),
     )
 )

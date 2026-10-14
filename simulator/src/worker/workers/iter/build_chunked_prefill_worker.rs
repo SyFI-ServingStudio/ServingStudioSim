@@ -12,7 +12,9 @@ use std::sync::Arc;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
-use crate::worker::admission::{ChunkedPrefillAdmission, LoadBalance, PendingOrder};
+use crate::worker::admission::{
+    ChunkEndAlignment, ChunkedPrefillAdmission, LoadBalance, PendingOrder,
+};
 use crate::worker::config::DpPlacement;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -89,7 +91,7 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         balance,
     );
     let admission = match chunk_end_quantum {
-        Some(quantum) => admission.with_chunk_end_quantum(quantum),
+        Some(quantum) => admission.with_chunk_end_alignment(ChunkEndAlignment::on_blocks(quantum)),
         None => admission,
     };
 

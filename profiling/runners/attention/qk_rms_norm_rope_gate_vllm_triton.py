@@ -23,6 +23,8 @@ _BACKEND = "qk_rms_norm_rope_gate:vllm_triton"
 # neither the cos/sin table length nor the position values moved the time.
 _EPS = 1e-6
 _COS_SIN_ROWS = 4096
+# Qwen3-Next's rope_theta; any base gives a real cos/sin table in [-1, 1].
+_ROPE_THETA = 10_000_000.0
 
 
 def _validate_args(
@@ -55,6 +57,15 @@ def _mrope_section(rotary_dim: int) -> tuple[int, int, int]:
     return half - 2 * (half // 3), half // 3, half // 3
 
 
+def _cos_sin_cache(torch: Any, rotary_dim: int, device: Any) -> Any:
+    """vLLM's ``RotaryEmbedding`` table: ``[rows, rotary_dim]``, cos half then sin half."""
+    exponents = torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim
+    inv_freq = 1.0 / (_ROPE_THETA**exponents)
+    rows = torch.arange(_COS_SIN_ROWS, dtype=torch.float32, device=device)
+    freqs = torch.outer(rows, inv_freq)
+    return torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(torch.bfloat16)
+
+
 def profile_qk_rms_norm_rope_gate_vllm_triton(
     num_tokens: int,
     num_q_heads: int,
@@ -83,7 +94,7 @@ def profile_qk_rms_norm_rope_gate_vllm_triton(
         q_gate, k, _ = qkv.split([2 * q_size, kv_size, kv_size], dim=-1)
         q_weight = 1.0 + 0.1 * randn(head_dim)
         k_weight = 1.0 + 0.1 * randn(head_dim)
-        cos_sin_cache = randn(_COS_SIN_ROWS, rotary_dim)
+        cos_sin_cache = _cos_sin_cache(torch, rotary_dim, device)
         token_positions = torch.arange(num_tokens, device=device) % _COS_SIN_ROWS
         if mrope:
             # Text tokens carry the same position in all three rows; vLLM slices

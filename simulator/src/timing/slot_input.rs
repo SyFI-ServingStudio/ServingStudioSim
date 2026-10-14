@@ -27,32 +27,36 @@ use crate::timing::kernels::{
     FlashinferAttnRectKernelInput, Fp8BlockQuantKernelInput, Fp8BlockscaleGroupedGemmKernelInput,
     Fp8PerTokenGroupQuantKernelInput, GdnCausalConvDecodeKernelInput,
     GdnCausalConvPrefillKernelInput, GdnChunkDeltaRuleKernelInput, GdnGatedRmsNormKernelInput,
-    GdnPrefillPostConvKernelInput, GdnRecurrentDecodeKernelInput, GemmFp32OutputKernelInput,
-    GroupedGemmKernelInput, InvRopeFp8QuantKernelInput, KdaChunkPrefillKernelInput,
-    KdaRecurrentDecodeKernelInput, KvCacheAppendKernelInput, KvCompressStoreKernelInput,
-    LogitsTopkKernelInput, MhcRmsNormKernelInput, MlaCacheAppendKernelInput,
-    MlaRopeQuantizeFp8KernelInput, MoeAlignBlockSizeKernelInput, MoeAlltoallKernelInput,
-    MoeAlltoallPrepareKernelInput, MoeEpCollectiveKernelInput, MoeFinalizeFuseSharedKernelInput,
-    MoeFinalizeRoutingKernelInput, MoeFusedTopkKernelInput, MoeSumKernelInput,
-    MoeTopkSoftplusSqrtKernelInput, Mxfp4MarlinMoeGemmKernelInput, Nvfp4FusedMoeKernelInput,
-    Nvfp4QuantKernelInput, P2pInterKernelInput, P2pIntraKernelInput,
-    PackedKvCacheGatherKernelInput, QKvRmsNormKernelInput, QnormRopeKvInsertKernelInput,
-    RelBiasAttentionKernelInput, ResidualRmsNormKernelInput, RmsNormKernelInput,
-    RsSconvAgResidualRmsNormKernelInput, SingleGemmKernelInput, VllmFusedMoeKernelInput,
-    VllmMlaRopeKernelInput,
+    GdnPrefillPostConvKernelInput, GdnRecurrentDecodeGatedNormKernelInput,
+    GdnRecurrentDecodeKernelInput, GemmFp32OutputKernelInput, GroupedGemmKernelInput,
+    InvRopeFp8QuantKernelInput, KdaChunkPrefillKernelInput, KdaRecurrentDecodeKernelInput,
+    KvCacheAppendKernelInput, KvCompressStoreKernelInput, LogitsTopkKernelInput,
+    MhcRmsNormKernelInput, MlaCacheAppendKernelInput, MlaRopeQuantizeFp8KernelInput,
+    MoeAlignBlockSizeKernelInput, MoeAlltoallKernelInput, MoeAlltoallPrepareKernelInput,
+    MoeEpCollectiveKernelInput, MoeFinalizeFuseSharedKernelInput, MoeFinalizeRoutingKernelInput,
+    MoeFusedTopkKernelInput, MoeSumKernelInput, MoeTopkSoftplusSqrtKernelInput,
+    Mxfp4MarlinMoeGemmKernelInput, Nvfp4FusedMoeKernelInput, Nvfp4QuantKernelInput,
+    P2pInterKernelInput, P2pIntraKernelInput, PackedKvCacheGatherKernelInput,
+    QKvRmsNormKernelInput, QnormRopeKvInsertKernelInput, RelBiasAttentionKernelInput,
+    ResidualRmsNormKernelInput, RmsNormKernelInput, RsSconvAgResidualRmsNormKernelInput,
+    SingleGemmKernelInput, VllmFusedMoeKernelInput, VllmMlaRopeKernelInput,
 };
 
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
+use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
 use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
 use crate::timing::kernels::{
-    MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput, SiluAndMulKernelInput,
-    StaticFp8QuantKernelInput,
+    GroupedRmsNormKernelInput, MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput,
+    ScaledSiluKernelInput, SiluAndMulKernelInput, SparseIndexExpandKernelInput,
+    SparseIndexerLogitsDecodeKernelInput, SparseIndexerLogitsPrefillKernelInput,
+    SparseIndexerPrepareKernelInput, StaticFp8QuantKernelInput,
 };
 use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
+use crate::timing::kernels::{PleGateKernelInput, PleNgramIdsKernelInput, PleShortConvKernelInput};
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
 /// fan-out the attention op summed into one slot (many prefill requests fold to a
@@ -103,6 +107,26 @@ pub struct DsaSparseMlaDecodeLog {
     pub projected_context: u32,
 }
 
+/// Sparse GQA paged attention as the op prices it: one launch over `num_rows`
+/// rows, the row-weighted mean of its two context groups' times, each
+/// evaluated at `num_rows`. `context_groups` is `(rows, mean context)` of the
+/// rows below the selection budget, then of the rows at or above it.
+#[derive(Clone, Serialize)]
+pub struct SparseGqaAttentionLog {
+    pub num_rows: u32,
+    pub context_groups: [(u32, u32); 2],
+}
+
+/// Sparse-indexer top-k leaf: the cells of the decode call and of the prefill
+/// call that chose this leaf's backend, each `(rows, context)`. A call that ran
+/// on the other backend is absent.
+#[derive(Clone, Serialize)]
+pub struct SparseIndexerTopkLog {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode: Option<(u32, u32)>,
+    pub prefill: Vec<(u32, u32)>,
+}
+
 /// DSA indexer prefill fan-in: every request-local `(Q, N)` cell aggregated by
 /// cache gather, logits, or top-k into its corresponding fixed leaf slot.
 #[derive(Clone, Serialize)]
@@ -149,6 +173,7 @@ log_inputs! {
     GdnGatedRmsNorm => GdnGatedRmsNormKernelInput,
     GdnPrefillPostConv => GdnPrefillPostConvKernelInput,
     GdnRecurrentDecode => GdnRecurrentDecodeKernelInput,
+    GdnRecurrentDecodeGatedNorm => GdnRecurrentDecodeGatedNormKernelInput,
     KdaChunkPrefill => KdaChunkPrefillKernelInput,
     KdaRecurrentDecode => KdaRecurrentDecodeKernelInput,
     MoeFinalizeRouting => MoeFinalizeRoutingKernelInput,
@@ -172,6 +197,10 @@ log_inputs! {
     CompressedSparseMlaRopeCast => CompressedSparseMlaRopeCastKernelInput,
     QPadKvRopeMxfp8Insert => QPadKvRopeMxfp8InsertKernelInput,
     EngramLookup => EngramLookupKernelInput,
+    EmbeddingRowGather => EmbeddingRowGatherKernelInput,
+    PleNgramIds => PleNgramIdsKernelInput,
+    PleGate => PleGateKernelInput,
+    PleShortConv => PleShortConvKernelInput,
     SconvQkvrPrep => SconvQkvrPrepKernelInput,
     MoeTopkSoftplusSqrt => MoeTopkSoftplusSqrtKernelInput,
     MoeSinkGateSelect => MoeSinkGateSelectKernelInput,
@@ -206,9 +235,17 @@ log_inputs! {
     VllmMlaRope => VllmMlaRopeKernelInput,
     MultiAddRmsNorm => MultiAddRmsNormKernelInput,
     SiluAndMul => SiluAndMulKernelInput,
+    GroupedRmsNorm => GroupedRmsNormKernelInput,
+    ScaledSilu => ScaledSiluKernelInput,
     StaticFp8Quant => StaticFp8QuantKernelInput,
     IndexedRowCopy => IndexedRowCopyKernelInput,
     QkRmsNormRopeGate => QkRmsNormRopeGateKernelInput,
+    SparseGqaPagedAttention => SparseGqaAttentionLog,
+    SparseIndexerTopk => SparseIndexerTopkLog,
+    SparseIndexExpand => SparseIndexExpandKernelInput,
+    SparseIndexerLogitsDecode => SparseIndexerLogitsDecodeKernelInput,
+    SparseIndexerLogitsPrefill => SparseIndexerLogitsPrefillKernelInput,
+    SparseIndexerPrepare => SparseIndexerPrepareKernelInput,
     AllReduce   => AllReduceKernelInput,
     AllReduceFusion => AllReduceFusionKernelInput,
     AllReduceResidualRmsNorm => AllReduceResidualRmsNormKernelInput,

@@ -2017,8 +2017,8 @@ mod tests {
     }
 
     /// The fork's "Maximum concurrency for N tokens per request" at TP4 with
-    /// prefix caching on, so the KDA state runs in align mode (one more state
-    /// block per request).
+    /// prefix caching on, so the KDA state runs in align mode (the estimate
+    /// counts one more state block per request).
     #[test]
     fn kv_cache_layout_reproduces_vllms_logged_concurrency() {
         use crate::worker::kv::{KvAccounting, KvAccountingOptions};

@@ -36,6 +36,7 @@ def test_args_field_order_and_coercion() -> None:
         "kernel_size",
         "dtype",
         "state_dtype",
+        "num_tokens",
     ]
     args = coerce_args(
         GdnCausalConvDecodeArgs,
@@ -505,6 +506,7 @@ def test_generated_facades_and_read_only_missing_query(tmp_path, monkeypatch) ->
         "kernel_size",
         "dtype",
         "state_dtype",
+        "num_tokens",
     ]
 
 
