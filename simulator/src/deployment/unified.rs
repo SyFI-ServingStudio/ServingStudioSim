@@ -41,7 +41,7 @@ use crate::timing::PerfApiBridge;
 use crate::worker::config::{check_read_wait, resolve_load_budget, PrefixTierReadWaitPolicy};
 use crate::worker::LoadBudget;
 use crate::worker::{
-    build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
+    build_barebone_worker, build_chunked_prefill_tier_worker, build_hp_worker,
     build_hybrid_chunked_prefill_worker, build_qwen36_hybrid_worker, build_speculative_worker,
     resolve_prefix_cache_config, BatchPolicy, DpPlacement, IterWorker, IterWorkerSel,
     KvAdmissionConfig, PendingOrderKind, PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy,
@@ -1157,22 +1157,15 @@ where
             dp_cfg,
             build_hp_worker,
         )),
-        IterWorkerSel::ChunkedPrefill { .. } => {
-            ensure!(
-                worker_config.prefix_tiers == [None, None] && !worker_config.external_decode,
-                "unified: {arch_name}: prefix tiers and external_decode need a hybrid arch's \
-                 chunked_prefill"
-            );
-            Ok(assemble_flow(
-                model,
-                store,
-                worker_config,
-                log_dir,
-                gpu_name,
-                dp_cfg,
-                build_chunked_prefill_worker,
-            ))
-        }
+        IterWorkerSel::ChunkedPrefill { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_chunked_prefill_tier_worker,
+        )),
         other => bail!("unified: unsupported {arch_name} worker {other:?}"),
     }
 }
@@ -1226,7 +1219,9 @@ mod tests {
         Glm53FlashVllmModel, Qwen36LocalModel,
     };
     use crate::common::RequestId;
-    use crate::worker::{ChunkedPrefillWorker, HpUnifiedWorker, WorkerEventCommon};
+    use crate::worker::{
+        ChunkedPrefillTierWorker, ChunkedPrefillWorker, HpUnifiedWorker, WorkerEventCommon,
+    };
 
     fn hp_worker() -> IterWorkerSel {
         IterWorkerSel::HpUnified {
@@ -1299,6 +1294,7 @@ mod tests {
     #[test]
     fn glm52_nvfp4_chunked_prefill_pair_satisfies_the_iter_worker_contract() {
         assert_iter_worker_contract::<ChunkedPrefillWorker<Glm52VllmNvfp4DsaMoeModel>>();
+        assert_iter_worker_contract::<ChunkedPrefillTierWorker<Glm52VllmNvfp4DsaMoeModel>>();
         ensure_hp_or_chunked_worker("GLM-4.5 NVFP4", &chunked_prefill_worker())
             .expect("GLM NVFP4 accepts the dedicated chunked-prefill worker");
     }

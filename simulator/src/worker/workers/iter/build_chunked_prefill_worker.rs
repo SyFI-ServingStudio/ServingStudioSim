@@ -1,4 +1,11 @@
 //! Multi-partition hard-capped chunked-prefill worker recipe.
+//!
+//! The selector's DRAM/SSD tiers go to the admission exactly as in
+//! `build_hybrid_chunked_prefill_worker` (one set per attention DP rank, read
+//! at the head of the rank's queue, sessions sticky to their rank).
+//! `build_chunked_prefill_tier_worker` wraps the shell in `SessionTierWorker`,
+//! which writes finished contexts through and runs `external_decode`; without
+//! either it passes every message straight to the shell.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,14 +13,17 @@ use std::sync::Arc;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
-use crate::worker::admission::{ChunkedPrefillAdmission, LoadBalance, PendingOrder};
+use crate::worker::admission::{
+    ChunkedPrefillAdmission, LoadBalance, PendingOrder, PrefixFetch, SessionPrefixTiers,
+};
 use crate::worker::config::DpPlacement;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::FullAttnKv;
 use crate::worker::types::WorkerConfig;
 
-use super::iter_batch_worker::{ChunkedPrefillWorker, IterBatchWorker};
+use super::iter_batch_worker::{ChunkedPrefillTierWorker, ChunkedPrefillWorker, IterBatchWorker};
+use super::session_tier_worker::SessionTierWorker;
 use crate::worker::workers::iter_build_essentials::{
     full_attention_token_capacity, prepare_iter_build_essentials,
 };
@@ -40,6 +50,30 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         model.total_kv_bytes_per_token(),
         &config,
     );
+    // One tier set per DP rank, sized and read per GPU of the rank. A
+    // full-attention request has no recurrent state, and hits reuse exactly.
+    let tier_specs: Vec<_> = config.prefix_tiers.iter().flatten().copied().collect();
+    let tiers: Vec<SessionPrefixTiers> = if tier_specs.is_empty() {
+        Vec::new()
+    } else {
+        let bytes_per_gpu = model
+            .total_kv_bytes_per_token()
+            .div_ceil(u64::from(model.num_attn_shards().max(1)));
+        (0..num_partitions)
+            .map(|rank| {
+                SessionPrefixTiers::new(
+                    &tier_specs,
+                    bytes_per_gpu,
+                    0,
+                    1,
+                    cost_log_dir.as_deref(),
+                    &format!("w{}_p{rank}", id.0),
+                )
+            })
+            .collect()
+    };
+    let sticky_sessions = !tiers.is_empty() || config.external_decode;
+
     let prefix_cache = config.prefix_cache.resolve_tokens(
         kv_capacity,
         model.total_kv_bytes_per_token(),
@@ -84,6 +118,11 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         Some(threshold) => admission.with_long_prefill_threshold(threshold),
         None => admission,
     };
+    let admission = if sticky_sessions {
+        admission.with_sticky_sessions()
+    } else {
+        admission
+    };
     let admission = if config.force_schedule_after_ms > 0.0 {
         admission.with_force_after(config.force_schedule_after_ms)
     } else {
@@ -98,6 +137,16 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     } else {
         admission
     };
+    let admission = if tiers.is_empty() {
+        admission
+    } else {
+        admission.with_prefix_fetch(
+            PrefixFetch::new(tiers, config.prefix_tier_warm_start).with_max_read_wait_ms(
+                config.prefix_tier_max_read_wait_ms,
+                config.prefix_tier_read_wait_policy,
+            ),
+        )
+    };
 
     IterBatchWorker::from_components(
         essentials.context,
@@ -105,4 +154,35 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         admission,
         UnifiedIterExecution::new(model, essentials.cost),
     )
+}
+
+/// `build_chunked_prefill_worker` wrapped in `SessionTierWorker`: what a
+/// deployment builds, so a full-attention arch takes DRAM/SSD tiers and
+/// `external_decode` like a hybrid one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_chunked_prefill_tier_worker<M: IterwiseUnifiedModel>(
+    id: WorkerId,
+    pool_tag: &'static str,
+    model: Arc<M>,
+    requests: SharedRequests,
+    config: WorkerConfig,
+    cost_log_dir: Option<PathBuf>,
+    pool: PoolId,
+    gpu_name: &str,
+    cluster: SharedGpuCluster,
+) -> ChunkedPrefillTierWorker<M> {
+    let tiers = config.prefix_tiers.iter().any(Option::is_some);
+    let external_decode = config.external_decode;
+    let shell = build_chunked_prefill_worker(
+        id,
+        pool_tag,
+        model,
+        requests,
+        config,
+        cost_log_dir,
+        pool,
+        gpu_name,
+        cluster,
+    );
+    SessionTierWorker::new(shell, tiers, external_decode)
 }

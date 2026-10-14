@@ -554,7 +554,7 @@ pub enum IterWorkerSel {
         #[param(string, default = "fifo", choices = PENDING_ORDER_CHOICES)]
         pending_order: PendingOrderKind,
         /// Host DRAM behind each attention DP rank's HBM prefix cache, per GPU
-        /// (GB; `0`: none), as `pipeline_chunked_prefill`'s; hybrid archs only.
+        /// (GB; `0`: none), as `pipeline_chunked_prefill`'s.
         /// Sessions then stick to the rank they last ran on. Not vLLM.
         #[serde(default)]
         #[param(default = 0.0)]
@@ -569,8 +569,7 @@ pub enum IterWorkerSel {
         #[serde(default = "default_ssd_tier_gb_per_s")]
         #[param(default = 10.0)]
         ssd_tier_gb_per_s: f64,
-        /// Decode runs elsewhere, as `pipeline_chunked_prefill`'s; hybrid archs
-        /// only. Not vLLM.
+        /// Decode runs elsewhere, as `pipeline_chunked_prefill`'s. Not vLLM.
         /// With a tier: a session request whose declared prefix exceeds every
         /// context the run stored for that session is a conversation that began
         /// before the run, and its context is read from the slowest tier, as a

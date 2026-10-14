@@ -1,5 +1,6 @@
-//! `SessionTierWorker` — the hybrid chunked-prefill worker with DRAM/SSD prefix
-//! tiers behind each attention DP rank's HBM cache, and decode run elsewhere.
+//! `SessionTierWorker` — a chunked-prefill worker with DRAM/SSD prefix tiers
+//! behind each attention DP rank's HBM cache, and decode run elsewhere. The KV
+//! store is the shell's: `HybridGdnKv` for a hybrid arch, `FullAttnKv` otherwise.
 //!
 //! It wraps the whole-iteration shell and acts only between its messages:
 //!
@@ -20,15 +21,21 @@ use std::collections::HashMap;
 
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{RequestId, Time, WorkerId};
+use crate::worker::admission::{ChunkedPrefillAdmission, PendingOrder};
+use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::iter_worker::IterWorker;
-use crate::worker::kv::PrefixKv;
+use crate::worker::kv::{ChunkedPrefillKv, HybridGdnKv};
 use crate::worker::types::WorkerStatus;
 use crate::worker::{WorkerEventCommon, WorkerMsgCommon};
 
-use super::iter_batch_worker::HybridChunkedPrefillShell;
+use super::iter_batch_worker::IterBatchWorker;
 
-pub struct SessionTierWorker<M: IterwiseUnifiedModel> {
-    inner: HybridChunkedPrefillShell<M>,
+/// The chunked-prefill shell `SessionTierWorker` wraps, over KV store `K`.
+pub type ChunkedPrefillShell<M, K> =
+    IterBatchWorker<K, ChunkedPrefillAdmission<PendingOrder>, UnifiedIterExecution<M>>;
+
+pub struct SessionTierWorker<M: IterwiseUnifiedModel, K: ChunkedPrefillKv = HybridGdnKv> {
+    inner: ChunkedPrefillShell<M, K>,
     /// Whether the admission reads from DRAM/SSD tiers (finished contexts are
     /// then written through).
     tiers: bool,
@@ -37,9 +44,9 @@ pub struct SessionTierWorker<M: IterwiseUnifiedModel> {
     external_outputs: Option<HashMap<RequestId, u32>>,
 }
 
-impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
+impl<M: IterwiseUnifiedModel, K: ChunkedPrefillKv> SessionTierWorker<M, K> {
     pub(super) fn new(
-        inner: HybridChunkedPrefillShell<M>,
+        inner: ChunkedPrefillShell<M, K>,
         tiers: bool,
         external_decode: bool,
     ) -> Self {
@@ -51,7 +58,7 @@ impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
     }
 
     #[cfg(test)]
-    pub(super) fn shell_mut(&mut self) -> &mut HybridChunkedPrefillShell<M> {
+    pub(super) fn shell_mut(&mut self) -> &mut ChunkedPrefillShell<M, K> {
         &mut self.inner
     }
 
@@ -102,7 +109,7 @@ impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
     }
 }
 
-impl<M: IterwiseUnifiedModel> IterWorker for SessionTierWorker<M> {
+impl<M: IterwiseUnifiedModel, K: ChunkedPrefillKv> IterWorker for SessionTierWorker<M, K> {
     type Msg = WorkerMsgCommon;
     type Event = WorkerEventCommon;
 
@@ -150,7 +157,9 @@ mod tests {
     use crate::worker::config::PrefixTierReadWaitPolicy;
     use crate::worker::kv::PrefixTierSpec;
     use crate::worker::types::WorkerConfig;
-    use crate::worker::workers::iter::build_hybrid_chunked_prefill_worker;
+    use crate::worker::workers::iter::{
+        build_chunked_prefill_tier_worker, build_hybrid_chunked_prefill_worker,
+    };
 
     fn as_session(
         store: &SharedRequests,
@@ -202,8 +211,8 @@ mod tests {
         )
     }
 
-    fn run_until(
-        worker: &mut SessionTierWorker<FakeModel>,
+    fn run_until<K: ChunkedPrefillKv>(
+        worker: &mut SessionTierWorker<FakeModel, K>,
         from: Time,
         until: Time,
         events: &mut Vec<WorkerEventCommon>,
@@ -303,6 +312,67 @@ mod tests {
         as_session(&store, 0, 7, 0, 0.0);
         as_session(&store, 2, 7, 51, 10.0);
         let mut worker = worker(store.clone(), 1, false);
+        let mut events = Vec::new();
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(4.0), &mut events);
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        run_until(
+            &mut worker,
+            Time::from_ms(4.0),
+            Time::from_ms(9.0),
+            &mut events,
+        );
+        assert_eq!(events.len(), 2);
+
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
+        assert_eq!(worker.status().queued_requests, 1);
+        assert_eq!(
+            worker.tick(Time::from_ms(10.0), &mut events),
+            Some(Time::from_ms(10.5))
+        );
+        run_until(
+            &mut worker,
+            Time::from_ms(10.5),
+            Time::from_ms(20.0),
+            &mut events,
+        );
+        assert_eq!(events.len(), 3);
+        assert_eq!(hit(&store, 2), Some(50));
+    }
+
+    #[test]
+    fn a_full_attention_rank_reads_an_evicted_session_back_from_its_dram() {
+        // `a_rank_reads_an_evicted_session_back_from_its_dram` over the
+        // full-attention store: no recurrent state rides along with the read.
+        let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
+        as_session(&store, 0, 7, 0, 0.0);
+        as_session(&store, 2, 7, 51, 10.0);
+        let mut worker = build_chunked_prefill_tier_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel {
+                ms: 1.0,
+                dp_groups: 1,
+            }),
+            store.clone(),
+            WorkerConfig {
+                max_batch_tokens: Some(256),
+                attn_kv_bytes: 120,
+                prefix_tiers: [
+                    Some(PrefixTierSpec {
+                        name: "dram",
+                        capacity_gb_per_gpu: 1e-6,
+                        read_gb_per_s_per_gpu: 1e-4,
+                    }),
+                    None,
+                ],
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
         let mut events = Vec::new();
         worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
         run_until(&mut worker, Time::ZERO, Time::from_ms(4.0), &mut events);

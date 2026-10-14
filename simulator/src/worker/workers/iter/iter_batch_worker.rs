@@ -81,13 +81,13 @@ pub type Qwen36HybridWorker<M> = IterBatchWorker<
     LocalPrefillDecodeAdmission<PendingOrder>,
     UnifiedIterExecution<M>,
 >;
-/// `ChunkedPrefillWorker` on every axis but KV: the hybrid store charges each
-/// request's recurrent state against the attention capacity.
-pub type HybridChunkedPrefillShell<M> =
-    IterBatchWorker<HybridGdnKv, ChunkedPrefillAdmission<PendingOrder>, UnifiedIterExecution<M>>;
-/// The hybrid chunked-prefill shell, with optional DRAM/SSD prefix tiers per
-/// DP rank and decode run elsewhere (`SessionTierWorker`).
+/// `ChunkedPrefillWorker` on every axis but KV (the hybrid store charges each
+/// request's recurrent state against the attention capacity), with optional
+/// DRAM/SSD prefix tiers per DP rank and decode run elsewhere (`SessionTierWorker`).
 pub type HybridChunkedPrefillWorker<M> = super::session_tier_worker::SessionTierWorker<M>;
+/// `ChunkedPrefillWorker` with the same optional DRAM/SSD prefix tiers and
+/// external decode, over the full-attention store.
+pub type ChunkedPrefillTierWorker<M> = super::session_tier_worker::SessionTierWorker<M, FullAttnKv>;
 pub type PdPrefillWorker<M> =
     IterBatchWorker<FullAttnKv, PrefillHandoffAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 
