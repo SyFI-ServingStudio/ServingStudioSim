@@ -34,6 +34,4 @@ compound:
   workload:
     diverse_100:
       routing: corpus
-      # PLACEHOLDER: not uploaded yet (finalize step 3). Replace PENDING_UPLOAD with the
-      # 40-hex commit sha of the UW-SyFI/servingstudio-workload upload.
-      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@PENDING_UPLOAD/qwen38_flash_next_nvfp4/vllm_mtp_k3/diverse_100/capture/20261013/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@b4b749dc7f3fe4a8f2db45b76cfbabdba59515e0/qwen38_flash_next_nvfp4/vllm_mtp_k3/diverse_100/capture/20261013/manifest.json

@@ -1,4 +1,4 @@
-"""Write campaign.yaml for Qwen3.8-Flash-Next-NVFP4 (MTP k=3) on one B200 (TP1) under the vLLM fork 892da082.
+"""Write campaign.yaml for Qwen3.8-Flash-Next-NVFP4 (MTP k=3) on one B200 (TP1) under the vLLM fork e1423a4d.
 
 The twenty operating points of `qwen38_27b_nvfp4_b200_tp1` keep their index, purpose and coverage: the fifteen
 GLM-5.2 points plus cases 04/07 at chunk 4096 and 8192 and case 10 at chunk 8192. Concurrency and lengths are
@@ -218,8 +218,11 @@ PYTHON_RUNTIME = {
 # per case.
 ARCH_TYPE = "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative"
 # Recorded routes of the diverse_100 token_corpus pass (Slurm job 6682, fork e1423a4d): 135144 accepted tokens x 49
-# layers (48 body + the MTP layer), top-10 of 512. Not yet on the workload dataset, so the path is the capture's.
-TOKEN_CORPUS = "../../../logs/20261013_1_qf_diverse100/profile_corpus/token_corpus/manifest.json"
+# layers (48 body + the MTP layer), top-10 of 512.
+TOKEN_CORPUS = (
+    "hf://datasets/UW-SyFI/servingstudio-workload@b4b749dc7f3fe4a8f2db45b76cfbabdba59515e0/"
+    "qwen38_flash_next_nvfp4/vllm_mtp_k3/diverse_100/capture/20261013/manifest.json"
+)
 ARCH = {
     "type": ARCH_TYPE,
     "model_config": "model/config/qwen3_8_flash_next_nvfp4.json",
@@ -573,7 +576,7 @@ document = {
     "schema_version": 1,
     "pack": "qwen38_flash_next_nvfp4_b200_tp1",
     "description": "Qwen3.8-Flash-Next-NVFP4 (nvidia/Qwen3.8-Flash-Next-NVFP4 fc694b54, qwen4_exp) on one B200, TP1, "
-                   "native MTP with 3 draft tokens, under the vLLM fork 892da082: FP8 KV and QSA indexer cache, FP32 "
+                   "native MTP with 3 draft tokens, under the vLLM fork e1423a4d: FP8 KV and QSA indexer cache, FP32 "
                    "GDN state, PLE n-gram table on the host, prefix caching, max_num_seqs 256. The twenty operating "
                    "points of qwen38_27b_nvfp4_b200_tp1 re-derived for this model's limits; see make_pack.py.",
     "recorded_on": {
@@ -584,6 +587,16 @@ document = {
         },
         "nsys_version": "2025.5.2",
         "device_roles": {"primary": "0"},
+    },
+    # One duty-cycle multiplier for every case: the median of the kernel-align `recommended_gpu_time_multiplier`
+    # (sum of measured GPU cycle / sum of measured critical path) over the 21 captures, the 20 cases and diverse_100.
+    # The per-capture values span 1.030-1.482 because the mixed-step host launch time depends on the step's shape.
+    "gpu_time_multiplier": {
+        "value": 1.0881,
+        "status": "measured",
+        "derived_from": "median recommended_gpu_time_multiplier of 21 kernel-align reports (cases 01-20 and "
+                        "diverse_100 job 6613), range 1.030-1.482",
+        "evidence": "logs/20261013_15_qf_campaign_final/*/analysis_kernel/reports/alignment_iteration_report.json",
     },
     "variants": {
         "tp1": variant(),

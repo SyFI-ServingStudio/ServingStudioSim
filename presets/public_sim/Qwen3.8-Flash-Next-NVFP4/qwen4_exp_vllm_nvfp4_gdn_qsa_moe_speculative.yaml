@@ -6,6 +6,8 @@
 # vLLM's KV discipline). attn_gpu_memory_gb is the KV pool, measured from
 # `Available KV cache memory: 79.8 GiB` in the capture's server logs (x 1.073741824).
 # Acceptance comes from the capture's trace.csv (per-request accept_rate).
+# gpu_time_multiplier is the median kernel-alignment recommendation over the pack's 20 cases and
+# diverse_100 (recommended_gpu_time_multiplier, range 1.030-1.482), as the alignment pack declares it.
 deployment: unified
 pools:
   main:
@@ -28,5 +30,6 @@ pools:
           kv_retract_decode_steps: 1
           decode_retraction_policy: fcfs
           attn_gpu_memory_gb: 85.6846
+          gpu_time_multiplier: 1.0881
 sweep:
   replicas: [1, 2]

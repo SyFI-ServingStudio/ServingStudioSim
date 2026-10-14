@@ -2,7 +2,7 @@
 schema_version: 1
 pack: qwen38_flash_next_nvfp4_b200_tp1
 description: 'Qwen3.8-Flash-Next-NVFP4 (nvidia/Qwen3.8-Flash-Next-NVFP4 fc694b54, qwen4_exp) on one B200, TP1, native
-  MTP with 3 draft tokens, under the vLLM fork 892da082: FP8 KV and QSA indexer cache, FP32 GDN state, PLE n-gram
+  MTP with 3 draft tokens, under the vLLM fork e1423a4d: FP8 KV and QSA indexer cache, FP32 GDN state, PLE n-gram
   table on the host, prefix caching, max_num_seqs 256. The twenty operating points of qwen38_27b_nvfp4_b200_tp1
   re-derived for this model''s limits; see make_pack.py.'
 recorded_on:
@@ -13,6 +13,12 @@ recorded_on:
   nsys_version: 2025.5.2
   device_roles:
     primary: '0'
+gpu_time_multiplier:
+  value: 1.0881
+  status: measured
+  derived_from: median recommended_gpu_time_multiplier of 21 kernel-align reports (cases 01-20 and diverse_100 job
+    6613), range 1.030-1.482
+  evidence: logs/20261013_15_qf_campaign_final/*/analysis_kernel/reports/alignment_iteration_report.json
 variants:
   tp1:
     deployment: unified
@@ -72,7 +78,7 @@ variants:
       model_config: model/config/qwen3_8_flash_next_nvfp4.json
       draft_tokens: 3
       routing: corpus
-      token_corpus_file: ../../../logs/20261013_1_qf_diverse100/profile_corpus/token_corpus/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@b4b749dc7f3fe4a8f2db45b76cfbabdba59515e0/qwen38_flash_next_nvfp4/vllm_mtp_k3/diverse_100/capture/20261013/manifest.json
       cudagraph_capture_sizes:
       - 1
       - 2
@@ -298,7 +304,7 @@ variants:
       model_config: model/config/qwen3_8_flash_next_nvfp4.json
       draft_tokens: 3
       routing: corpus
-      token_corpus_file: ../../../logs/20261013_1_qf_diverse100/profile_corpus/token_corpus/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@b4b749dc7f3fe4a8f2db45b76cfbabdba59515e0/qwen38_flash_next_nvfp4/vllm_mtp_k3/diverse_100/capture/20261013/manifest.json
       cudagraph_capture_sizes:
       - 1
       - 2
@@ -524,7 +530,7 @@ variants:
       model_config: model/config/qwen3_8_flash_next_nvfp4.json
       draft_tokens: 3
       routing: corpus
-      token_corpus_file: ../../../logs/20261013_1_qf_diverse100/profile_corpus/token_corpus/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@b4b749dc7f3fe4a8f2db45b76cfbabdba59515e0/qwen38_flash_next_nvfp4/vllm_mtp_k3/diverse_100/capture/20261013/manifest.json
       cudagraph_capture_sizes:
       - 1
       - 2
@@ -748,7 +754,7 @@ variants:
       model_config: model/config/qwen3_8_flash_next_nvfp4.json
       draft_tokens: 3
       routing: corpus
-      token_corpus_file: ../../../logs/20261013_1_qf_diverse100/profile_corpus/token_corpus/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@b4b749dc7f3fe4a8f2db45b76cfbabdba59515e0/qwen38_flash_next_nvfp4/vllm_mtp_k3/diverse_100/capture/20261013/manifest.json
       cudagraph_capture_sizes:
       - 1
       - 2
@@ -988,7 +994,7 @@ variants:
       model_config: model/config/qwen3_8_flash_next_nvfp4.json
       draft_tokens: 3
       routing: corpus
-      token_corpus_file: ../../../logs/20261013_1_qf_diverse100/profile_corpus/token_corpus/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@b4b749dc7f3fe4a8f2db45b76cfbabdba59515e0/qwen38_flash_next_nvfp4/vllm_mtp_k3/diverse_100/capture/20261013/manifest.json
       cudagraph_capture_sizes:
       - 1
       - 2
