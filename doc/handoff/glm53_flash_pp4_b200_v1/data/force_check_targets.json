@@ -1,0 +1,57 @@
+{
+ "plain": {
+  "long_ttft_s": 0.397,
+  "short_ttft_s": {
+   "p50": 15.261,
+   "p90": 27.131,
+   "p99": 29.802,
+   "max": 30.109
+  },
+  "last_token_s": 110.069,
+  "microbatches": 2004
+ },
+ "srpt8k": {
+  "long_ttft_s": 110.075,
+  "short_ttft_s": {
+   "p50": 15.079,
+   "p90": 26.948,
+   "p99": 29.618,
+   "max": 29.933
+  },
+  "last_token_s": 110.075,
+  "microbatches": 2004
+ },
+ "budget": {
+  "long_ttft_s": 107.506,
+  "short_ttft_s": {
+   "p50": 14.77,
+   "p90": 23.9,
+   "p99": 26.891,
+   "max": 27.303
+  },
+  "last_token_s": 107.506,
+  "microbatches": 1429
+ },
+ "even": {
+  "long_ttft_s": 107.506,
+  "short_ttft_s": {
+   "p50": 14.77,
+   "p90": 23.9,
+   "p99": 26.891,
+   "max": 27.303
+  },
+  "last_token_s": 107.506,
+  "microbatches": 1429
+ },
+ "good": {
+  "long_ttft_s": 61.033,
+  "short_ttft_s": {
+   "p50": 14.77,
+   "p90": 24.093,
+   "p99": 27.122,
+   "max": 27.519
+  },
+  "last_token_s": 107.504,
+  "microbatches": 1429
+ }
+}

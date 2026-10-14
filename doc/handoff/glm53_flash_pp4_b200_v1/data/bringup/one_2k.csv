@@ -1,0 +1,6 @@
+id,input_len,output_len,arrival_time
+one_2k_0,2048,1,0
+one_2k_1,2048,1,10000
+one_2k_2,2048,1,20000
+one_2k_3,2048,1,30000
+one_2k_4,2048,1,40000
