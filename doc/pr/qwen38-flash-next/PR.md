@@ -75,7 +75,7 @@ The model is checked against vLLM captures: `diverse_100` and 20 operating point
 
 ## Test Plan
 
-Test tiers at the branch head. `origin/main` (3df15294) is merged; it has no newer commits:
+Test tiers at the branch head. `origin/main` (176ab0a3) is merged; since the tested 3df15294 it adds only skills:
 
 ```bash
 just test-cpu      # CUDA_VISIBLE_DEVICES=""
