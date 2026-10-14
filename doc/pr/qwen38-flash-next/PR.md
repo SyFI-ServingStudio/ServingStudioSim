@@ -103,7 +103,7 @@ Also run:
   - the Flash-Next public preset test, which reads the `PENDING_UPLOAD` corpus path until the Hugging Face upload.
 - `just test-presets`: <<FINAL: passes once the Hugging Face sha replaces `PENDING_UPLOAD`>>.
   `test_every_member_is_measured` passes: every public member is fully measured in the committed profile.db.
-- `just test-gpu`: <<FINAL: Slurm job 6756 result at HEAD>>.
+- `just test-gpu` at 7a289808 (one B200, through Slurm): 14 passed, 3 skipped.
 - **Kernel alignment on `diverse_100`** (1710 iterations). The signed error of the simulated critical path against
   the measured one, per iteration. Source: `logs/20261013_15_qf_campaign_final/d100/summary.md`:
 
