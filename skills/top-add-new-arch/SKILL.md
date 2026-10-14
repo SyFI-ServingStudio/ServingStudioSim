@@ -297,8 +297,10 @@ deployment — you do not need a workload / pools / trace to check the cost mode
 ## Delegation boundary
 
 You are the umbrella, not an implementer. Issue each phase to the named skill and
-verify its closeout before moving up a layer. Stop and return to the user between
-phases whenever a design decision surfaces — a new args schema, a boundary call,
+verify its closeout before moving up a layer. In single-agent mode, to run the
+phases with parallel subagents (capture beside the build, one lane per kernel
+family and per worklet), follow `dev-parallelize-arch-addition`. Stop and return
+to the user between phases whenever a design decision surfaces — a new args schema, a boundary call,
 or a deviation from the design docs — rather than deciding it silently. The build
 is complete only when every element from the Phase 1 table has a home at its
 correct layer, the arch is wired (Phase 3), `model.work` support and the intended

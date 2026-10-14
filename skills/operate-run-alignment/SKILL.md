@@ -121,12 +121,13 @@ wrong cost a full recapture:
   against the list the server logs.
 
 **Run passes concurrently and warm.** Give each Slurm job its own GPU, port
-and scratch, and stagger the starts by about 90 s (`--begin=now+<k*90>s`).
-Never chain passes with `afterany`, because that leaves GPUs idle. A new chunk
-size or capture list brings new GEMM shapes, so its first pass runs on a cold
-autotune cache. Let one pass per new configuration finish its startup before
-the rest start. Discard any pass that logs "No tuned config" or a smaller KV
-pool, and rerun it.
+and scratch, and submit them together. Never delay a start with `--begin` and
+never chain passes with `afterany`; both leave GPUs idle. A new chunk size or
+capture list brings new GEMM shapes, so its first pass runs on a cold autotune
+cache. Submit one pass per new configuration first, and submit the rest once
+its log shows the server is ready. Discard any pass that logs "No tuned config"
+or a smaller KV pool, and rerun it. Compare the KV pool by the token count the
+server logs, not the rounded GiB, which varies slightly between starts.
 
 `launcher/alignment_campaign/README.md` owns the pack schema. Reach for the
 single-config path below when there is one workload and no matrix.
