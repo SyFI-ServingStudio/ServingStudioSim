@@ -1,0 +1,86 @@
+# GLM-5.2 NVFP4 PP8 on 8 B200 (one GPU per stage, EP1), TraceLab monotonic closed loop with DRAM/SSD prefix tiers.
+# Template: wt-pp-study logs/20261009_4_blog_rerun/cl_main_pp8.yaml (GLM-5.3-Flash) with the arch, KV budget and routing
+# swapped for GLM-5.2; scheduler and tier settings unchanged. Compare logs/20261009_0 (DP8, 150 GB) and _4 (DP8, 750 GB).
+deployment: pp
+
+workload:
+  trace_files: ${trace}
+  input_file_format: text-generation-session-execution-v2
+  # A closed loop of `conc` sessions (trace/session_closed_loop.py): the file's first `conc` sessions start in the
+  # renewal equilibrium (length-biased, joined mid-life with a cold context), and each finished session lets in the
+  # next. Rounds follow their predecessor by its tool wait plus its decode time (trace/session_decode_wait.py).
+  arrival_mode: saturated
+  max_concurrency: ${conc}
+  run_to_end: false
+  duration_ms: ${duration_ms}
+
+io:
+  log_dir: logs/20261009_6_glm52_pp8_tiers/{tiers}/{load}
+
+pools:
+  stage:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: glm52_vllm_nvfp4_pp_dsa_moe
+          model_config: model/config/glm52_nvfp4.json
+          fp8: false
+          pp_size: 8
+          max_model_len: 1048576
+          # EP1 measured marginal from the SGLang TP4 capture (as old-wt/wt-glm53-pp-prefill logs/20261003_4_pp_depth); the c32_long
+          # marginal the DP runs use lacks 66 EP1 nvfp4_fused_moe rows.
+          routing: popularity
+          routing_seed: null
+          expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm52_nvfp4/sglang/diverse_100/capture/20260829/popularity.json
+        worker:
+          type: pipeline_chunked_prefill
+          max_batch_tokens: ${max_batch_tokens}
+          gpu_time_multiplier: 1.0
+          # The GLM-5.2 DP rule (old-wt/wt-glm52-dp-attn-ep/notes.md): KV = 45.1405 - (W_stage - W_tp4 113.58 GB).
+          # vLLM get_pp_indices puts 10 of the 78 layers on stages 1-6; 10 sparse layers = 58.64 GB -> 100.08 GB.
+          attn_gpu_memory_gb: 100.08
+          # Decode runs elsewhere; its time is in the trace's tool waits.
+          external_decode: true
+          dram_tier_gb: ${dram_tier_gb}
+          dram_tier_gb_per_s: 50.0
+          ssd_tier_gb: ${ssd_tier_gb}
+          ssd_tier_gb_per_s: ${ssd_gb_per_s}
+          # A joining session's pre-run context sits in the slowest tier (closed-loop traces2/, placeholder round 0).
+          prefix_tier_warm_start: ${warm_start}
+          prefix_tier_max_read_wait_ms: ${rw_ms}
+          prefix_tier_balanced_load: ${balanced}
+          # Not vLLM: a request waiting 1 min since arrival goes before every other one.
+          force_schedule_after_ms: ${force_ms}
+          # The recommended scheduler (logs/20261007_4_pp_hol/TRIALS.md, m16_bl1m6m).
+          microbatch_split: even
+          min_microbatch_tokens: 512
+          long_prefill_token_threshold: 0
+          pending_order: shortest-prefill-first
+          load_budget_backlog_hi_tokens: ${bl_hi}
+          load_budget_backlog_lo_tokens: ${bl_lo}
+          load_budget_low_tokens: ${bl_low}
+          srpt: true
+
+
+
+
+# Closed loop at fixed concurrency; 8 h runs (about 40 min to settle). Read arrivals in [1 h, 8 h) and check flatness
+# with buckets.py.
+sweep:
+  duration_ms: [28800000.0]
+  force_ms: [60000.0]
+compound:
+  tiers:
+    main: {dram_tier_gb: 150.0, ssd_tier_gb: 8000.0, ssd_gb_per_s: 10.0, warm_start: true, rw_ms: 1000.0, balanced: true}
+    dram750: {dram_tier_gb: 750.0, ssd_tier_gb: 8000.0, ssd_gb_per_s: 10.0, warm_start: true, rw_ms: 1000.0, balanced: true}
+  load:
+    c500: {trace: [logs/glm52_tiers_traces/closed_c500_s0.csv], conc: 500}
+    c750: {trace: [logs/glm52_tiers_traces/closed_c750_s0.csv], conc: 750}
+    c1000: {trace: [logs/glm52_tiers_traces/closed_c1000_s0.csv], conc: 1000}
+    c1500: {trace: [logs/glm52_tiers_traces/closed_c1500_s0.csv], conc: 1500}
+    c2000: {trace: [logs/glm52_tiers_traces/closed_c2000_s0.csv], conc: 2000}
+  mbt:
+    m32k: {max_batch_tokens: 32768}
+  budget:
+    bl1m3m: {bl_low: 4096, bl_lo: 1000000, bl_hi: 3000000}

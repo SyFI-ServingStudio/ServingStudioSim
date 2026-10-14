@@ -1,0 +1,493 @@
+<title>GLM-5.2 Prefix Tier Study</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;800&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column (~74ch) with full-width figures; findings first, evidence sections after, sources last. */
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --ink: #17202b;
+  --muted: #5b6676;
+  --rule: #d9dee6;
+  --dp: #2f62b8;
+  --pp: #c4650f;
+  --ref: #7a8594;
+  --good: #1f7a4d;
+  --bad: #b3261e;
+  --tint: #eef2f8;
+  --f-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --f-body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11161d; --surface: #182029; --ink: #e5e9ef; --muted: #9aa5b4; --rule: #2c3743;
+    --dp: #6b93dc; --pp: #c47732; --ref: #8d97a5; --good: #5cc494; --bad: #f07a70; --tint: #1d2834;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #11161d; --surface: #182029; --ink: #e5e9ef; --muted: #9aa5b4; --rule: #2c3743;
+  --dp: #6b93dc; --pp: #c47732; --ref: #8d97a5; --good: #5cc494; --bad: #f07a70; --tint: #1d2834;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 16px/1.6 var(--f-body); }
+.wrap { max-width: 980px; margin: 0 auto; padding-inline: 20px; padding-block: 40px 64px; display: grid; gap: 48px; }
+.prose { max-width: 74ch; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; line-height: 1.2; margin: 0; }
+h1 { font-size: clamp(30px, 5vw, 44px); font-weight: 800; letter-spacing: -0.01em; }
+h2 { font-size: 24px; font-weight: 700; }
+h3 { font-size: 17px; font-weight: 700; }
+p { margin: 0; }
+section { display: grid; gap: 16px; }
+.eyebrow { font: 600 12px/1 var(--f-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.lede { font-size: 18px; color: var(--muted); max-width: 70ch; }
+header { display: grid; gap: 14px; }
+.specs { display: flex; flex-wrap: wrap; gap: 8px; }
+.spec { font: 13px/1 var(--f-mono); padding: 7px 10px; border: 1px solid var(--rule); border-radius: 4px; background: var(--surface); }
+.spec b { color: var(--muted); font-weight: 400; margin-right: 6px; }
+
+.findings { display: grid; gap: 0; border-top: 2px solid var(--ink); }
+.finding { display: grid; grid-template-columns: 9rem 1fr; gap: 20px; padding-block: 16px; border-bottom: 1px solid var(--rule); }
+.finding .num { font: 800 26px/1.1 var(--f-display); font-variant-numeric: tabular-nums; }
+.finding .num small { display: block; font: 12px/1.3 var(--f-mono); color: var(--muted); margin-top: 4px; font-weight: 400; }
+.finding p { min-width: 0; }
+.finding strong { font-weight: 600; }
+.c-dp { color: var(--dp); } .c-pp { color: var(--pp); } .c-good { color: var(--good); } .c-bad { color: var(--bad); }
+
+.tbl { overflow-x: auto; border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14.5px; font-variant-numeric: tabular-nums; }
+th, td { padding: 8px 12px; text-align: right; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+thead th { font: 600 12px/1.3 var(--f-mono); color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; background: var(--tint); }
+tbody tr:last-child td { border-bottom: 0; }
+tr.hl td { background: var(--tint); font-weight: 600; }
+td.l { text-align: left; white-space: normal; }
+.tag { display: inline-block; font: 600 11px/1 var(--f-mono); padding: 3px 6px; border-radius: 3px; color: var(--surface); vertical-align: 1px; }
+.tag.dp { background: var(--dp); } .tag.pp { background: var(--pp); } .tag.ref { background: var(--ref); }
+.bar { display: inline-block; height: 9px; border-radius: 2px; vertical-align: middle; margin-left: 8px; }
+
+figure { margin: 0; display: grid; gap: 10px; }
+figcaption { font-size: 14px; color: var(--muted); }
+.chart { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 12px 8px 4px; overflow-x: auto; }
+.chart svg { display: block; width: 100%; min-width: 560px; height: auto; }
+.chart text { fill: var(--muted); font: 12px var(--f-mono); }
+.chart .lbl { fill: var(--ink); font-weight: 600; }
+.chart .grid { stroke: var(--rule); stroke-width: 1; }
+.chart .axis { stroke: var(--muted); stroke-width: 1; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font: 13px var(--f-mono); color: var(--muted); padding-inline: 8px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend svg { width: 28px; height: 10px; }
+
+ul.notes { margin: 0; padding-left: 1.2em; display: grid; gap: 8px; max-width: 74ch; }
+code { font: 13.5px var(--f-mono); background: var(--tint); padding: 1px 5px; border-radius: 3px; overflow-wrap: anywhere; }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+.two > * { min-width: 0; }
+.callout { border-left: 3px solid var(--pp); padding: 10px 14px; background: var(--surface); border-radius: 0 6px 6px 0; max-width: 74ch; }
+.seg { display: inline-flex; gap: 0; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; width: max-content; }
+.seg button { font: 600 13px var(--f-mono); padding: 6px 14px; border: 0; background: var(--surface); color: var(--muted); cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--rule); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+.seg button:focus-visible { outline: 2px solid var(--dp); outline-offset: -2px; }
+#tradewrap { position: relative; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px; font: 12.5px/1.5 var(--f-mono); box-shadow: 0 4px 14px rgba(0,0,0,.12); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tip b { font-weight: 600; }
+footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--rule); padding-top: 16px; }
+@media (max-width: 560px) {
+  .wrap { padding-inline: 16px; }
+  .finding { grid-template-columns: 1fr; gap: 6px; }
+}
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">ServingStudio Sim · 2026-10-09 → 10-11 · 分支 glm52-tiers</div>
+  <h1>GLM-5.2 前缀分级存储：DP8 与 PP8</h1>
+  <p class="lede">8 张 B200 跑 TraceLab monotonic 闭环 agent 会话（每轮平均 166k 上下文，新算约 1.7k token），前缀放在 HBM、DRAM、SSD 三级。对比 DP8EP8 和 PP8，看峰值吞吐、DRAM 需要多大、HBM 够不够，以及每 1M token 的成本。</p>
+  <div class="specs">
+    <span class="spec"><b>模型</b>GLM-5.2 NVFP4 · 78 层全 DSA</span>
+    <span class="spec"><b>GPU</b>8 × B200 · $6.5/h</span>
+    <span class="spec"><b>DRAM</b>50 GB/s/GPU</span>
+    <span class="spec"><b>SSD</b>8 TB · 10 GB/s/GPU</span>
+    <span class="spec"><b>窗口</b>8 h 仿真，取 2–7 h 稳态</span>
+    <span class="spec"><b>调度</b>SPF · SRPT · load budget · 读等待 1 s</span>
+  </div>
+</header>
+
+<section>
+  <h2>结论</h2>
+  <div class="findings">
+    <div class="finding">
+      <div class="num c-pp">41–42<small>r/s · PP8 + 750 GB</small></div>
+      <p><strong>PP8 配 750 GB DRAM 是最好的配置。</strong>峰值是 DP8 同 DRAM 时（28.9）的 1.45 倍，c1000 时 p90 TTFT 1.7 s，DP8 是 21 s。</p>
+    </div>
+    <div class="finding">
+      <div class="num">750 GB<small>DRAM / GPU</small></div>
+      <p><strong>DRAM 要大到装下活跃会话的工作集。</strong>150 GB 时两种部署都被 SSD 10 GB/s 卡住（DP8 21.3、PP8 26.5 r/s）。750 GB 时 DP8 已经与 DRAM 无限相同（28.9 对 29.3）。</p>
+    </div>
+    <div class="finding">
+      <div class="num c-dp">0.70<small>DP rank 均衡度</small></div>
+      <p><strong>DP8 的上限来自 rank 失衡。</strong>EP 要求 8 个 rank 每步同步，每步都要等最忙的 rank。放宽 load budget 反而更慢（不限额度时 18.0 r/s），因为失衡更严重。</p>
+    </div>
+    <div class="finding">
+      <div class="num c-bad">4–15%<small>DP8 HBM 占满时间</small></div>
+      <p><strong>DP8 会撞上 HBM 下限，PP8 不会。</strong>DP8 每个 rank 只有 128 万 token 的 KV，从 c750 起就有 4–15% 的时间被进行中的请求占满。PP8 共用 1410 万 token 的池子，最高只用到 89%。</p>
+    </div>
+    <div class="finding">
+      <div class="num c-pp">c1125<small>PP8 崩溃点</small></div>
+      <p><strong>PP8 过了峰值会崩，原因是缓存被挤掉，HBM 并没有满。</strong>等读的请求占住 HBM，缓存的旧前缀从 71% 降到 33%，HBM 命中从 19% 降到约 1%，更多请求要去 DRAM 读。部署时要把并发限制在约 c1000。</p>
+    </div>
+    <div class="finding">
+      <div class="num c-good">$0.20<small>/1M 新 token · PP8</small></div>
+      <p><strong>自建成本比在线厂商低 18–82 倍。</strong>DP8 是 $0.28。同样的流量按厂商的「新 token + cache read」价计费，94–99% 的账单是 cache read，因为每轮有 148k 缓存 token、只新算 1.76k。</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>1 · 吞吐随并发的变化</h2>
+  <figure>
+    <div class="legend" id="legend"></div>
+    <div class="chart"><svg id="tput" viewBox="0 0 900 380" role="img" aria-label="rounds per second vs concurrency"></svg></div>
+    <figcaption>闭环会话数（并发）对应的稳态 rounds/s。颜色区分部署，线型区分 DRAM 容量。DRAM 无限的 DP8 一直到 c4000 都保持在 29.5–30.0。</figcaption>
+  </figure>
+  <div class="tbl"><table>
+    <thead><tr><th>配置</th><th>峰值 r/s</th><th>并发</th><th>p50 / p90 TTFT</th><th>新 token/s</th><th>瓶颈</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag dp">DP8</span> 150 GB + SSD</td><td>21.3</td><td>c750</td><td>1.7 s / 24 s</td><td>37.8k</td><td class="l">SSD：每个 rank 读 9.5–9.8 GB/s，上限 10</td></tr>
+      <tr><td><span class="tag dp">DP8</span> 750 GB + SSD</td><td>28.9</td><td>c1000</td><td>2.6 s / 21 s</td><td>50.9k</td><td class="l">算力 + rank 失衡 + HBM 下限</td></tr>
+      <tr><td><span class="tag dp">DP8</span> DRAM 无限</td><td>29.3–30.0</td><td>c1000+</td><td>2.6 s / 19 s</td><td>51.5k</td><td class="l">GPU 利用率 0.9999</td></tr>
+      <tr><td><span class="tag pp">PP8</span> 150 GB + SSD</td><td>26.5</td><td>c750</td><td>0.50 s / 2.6 s</td><td>46.8k</td><td class="l">SSD：每卡 10.0 GB/s</td></tr>
+      <tr class="hl"><td><span class="tag pp">PP8</span> 750 GB + SSD</td><td>40.9</td><td>c1000</td><td>0.64 s / 1.7 s</td><td>71.9k</td><td class="l">建议的工作点</td></tr>
+      <tr><td><span class="tag pp">PP8</span> 750 GB + SSD</td><td>42.0</td><td>c1125</td><td>1.7 s / 4.3 s</td><td>73.1k</td><td class="l">再往上崩溃：c1250 32.0，c1500 28.8</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>2 · TTFT 与吞吐的权衡</h2>
+  <p class="prose">每个点是一个并发，按并发从小到大连线。越靠右下越好：吞吐高，TTFT 短。线往左上折回，说明过了峰值、系统开始崩：吞吐下降，TTFT 继续上升。</p>
+  <figure>
+    <div class="seg" role="group" aria-label="TTFT 分位">
+      <button type="button" id="q-p50" data-q="p50">p50</button>
+      <button type="button" id="q-p90" data-q="p90" aria-pressed="true">p90</button>
+      <button type="button" id="q-p99" data-q="p99">p99</button>
+    </div>
+    <div class="legend" id="legend2"></div>
+    <div class="chart" id="tradewrap"><svg id="trade" viewBox="0 0 900 420" role="img" aria-label="TTFT vs rounds per second"></svg><div class="tip" id="tip" hidden></div></div>
+    <figcaption>横轴是稳态 rounds/s，纵轴是 TTFT（对数刻度），取 2–7 h 窗口。很多点停在 60 s 附近，和配置里 force_schedule_after_ms = 60 s 相符。鼠标悬停可以看每个点的并发和三个分位。</figcaption>
+  </figure>
+  <div class="tbl"><table>
+    <thead><tr><th>配置</th><th>p90 ≤ 2 s 时最高 r/s</th><th>p90 ≤ 5 s 时最高 r/s</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag dp">DP8</span> 150 GB + SSD</td><td>14.1（c375，1.9 s）</td><td>18.6（c500，3.5 s）</td></tr>
+      <tr><td><span class="tag dp">DP8</span> 750 GB + SSD</td><td>没有测到（c750 已是 3.1 s）</td><td>28.1（c750，3.1 s）</td></tr>
+      <tr><td><span class="tag dp">DP8</span> DRAM 无限</td><td>19.3（c500，1.8 s）</td><td>28.2（c750，3.0 s）</td></tr>
+      <tr><td><span class="tag pp">PP8</span> 150 GB + SSD</td><td>20.2（c500，0.55 s）</td><td>26.5（c750，2.6 s）</td></tr>
+      <tr class="hl"><td><span class="tag pp">PP8</span> 750 GB + SSD</td><td>40.9（c1000，1.7 s）</td><td>42.0（c1125，4.3 s）</td></tr>
+    </tbody>
+  </table></div>
+  <p class="prose">表中只取实际跑过的并发点，没有插值。在 p90 ≤ 2 s 的要求下，PP8 + 750 GB 的吞吐大约是 DP8 的 2 倍。DP8 c500 到 c750 之间没有测点，所以它满足 2 s 的真实上限在 19–28 之间。</p>
+</section>
+
+<section>
+  <h2>3 · DRAM 需要多大</h2>
+  <p class="prose">闭环里每个活跃会话都要留着上下文等下一轮回来。工作集约为 并发 × 166k token × 55 KB ÷ 8 卡，c750 时约 860 GB/GPU。先用 DRAM 无限那组的逐请求读日志做 LRU 重放估算，再用 500 GB 和 750 GB 实跑验证（150 GB 时重放 44%，实测 45.4%）。</p>
+  <div class="two">
+    <div class="tbl"><table>
+      <thead><tr><th>DRAM / GPU</th><th>c750 DRAM 命中</th><th>c1000 DRAM 命中</th></tr></thead>
+      <tbody>
+        <tr><td>150 GB</td><td>44%</td><td>20%</td></tr>
+        <tr><td>300 GB</td><td>83%</td><td>61%</td></tr>
+        <tr><td>500 GB</td><td>97%</td><td>87%</td></tr>
+        <tr class="hl"><td>750 GB</td><td>99.5%</td><td>98%</td></tr>
+        <tr><td>1 TB</td><td>99.7%</td><td>99.5%</td></tr>
+      </tbody>
+    </table></div>
+    <div class="tbl"><table>
+      <thead><tr><th>DP8 实跑</th><th>c750 r/s</th><th>c1000 r/s</th><th>c1000 SSD 占比</th></tr></thead>
+      <tbody>
+        <tr><td>150 GB</td><td>21.3</td><td>21.2</td><td>47%</td></tr>
+        <tr><td>500 GB</td><td>28.1</td><td>26.8</td><td>14.7%</td></tr>
+        <tr class="hl"><td>750 GB</td><td>28.1</td><td>28.9</td><td>2.3%</td></tr>
+        <tr><td>无限</td><td>28.1</td><td>29.3</td><td>0</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+  <p class="prose">左表是 LRU 重放的估算，右表是实跑结果。只跑到 c750 的话 500 GB 就够；c1000 需要 750 GB（每台 8 卡机器 6 TB）。剩下约 0.2–0.3% 是新会话第一次读，无论 DRAM 多大都要从 SSD 读。</p>
+</section>
+
+<section>
+  <h2>4 · DP8 的上限：rank 失衡</h2>
+  <p class="prose">load budget 让每个 DP rank 每步最多处理 4096 个新 token（每个 rank 单独计算额度）。把额度放大后，单个 rank 的效率确实变高，但每个 rank 手上平均只有 1–2 个请求。一旦某个 rank 拿到大 chunk（比如新会话第一轮约 28k token），其余 7 个 rank 这一步就基本闲着。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>每 rank 额度</th><th>c750 r/s</th><th>c1000 r/s</th><th>c1000 p50 TTFT</th><th>每步耗时</th><th>均衡度（平均 ÷ 最忙）</th><th>8 rank 合计 tok/ms</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td>4096</td><td>28.1</td><td>28.9</td><td>2.6 s</td><td>449 ms</td><td>0.70</td><td>50.9</td></tr>
+      <tr><td>8192</td><td>26.3</td><td>26.3</td><td>3.2 s</td><td>768 ms</td><td>0.55</td><td>46.3</td></tr>
+      <tr><td>16384</td><td>21.7</td><td>21.6</td><td>4.6 s</td><td>1172 ms</td><td>0.37</td><td>37.9</td></tr>
+      <tr><td>不限（32768）</td><td>17.3</td><td>18.0</td><td>7.6 s</td><td>1435 ms</td><td>0.28</td><td>32.0</td></tr>
+    </tbody>
+  </table></div>
+  <p class="prose">所以在 DP 上，load budget 主要的作用是限住掉队的 rank。PP 的 8 个 stage 处理同一批 token，只是层数差一点（9 或 10 层），stage 利用率在 0.72–0.85，没有这个问题。</p>
+</section>
+
+<section>
+  <h2>5 · HBM 够不够</h2>
+  <p class="prose">不能被挤掉的 KV 包括两部分：正在算的请求，和正在从 tier 读的请求。按 vLLM 的做法，开始读之前就要分配好整个请求的 KV 空间，一直占到读完、被调度为止。表中是这部分占 KV 池的比例（750 GB DRAM，2–7 h）。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>部署 · 并发</th><th>不可挤占：平均 / p99 / 最大</th><th>其中等读</th><th>缓存的旧前缀</th><th>超过 95% 的时间</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag pp">PP8</span> c750</td><td>2% / 11% / 56%</td><td>1.5%</td><td>90%</td><td>0%</td></tr>
+      <tr><td><span class="tag pp">PP8</span> c1000</td><td>11% / 55% / 66%</td><td>10%</td><td>71%</td><td>0%</td></tr>
+      <tr><td><span class="tag pp">PP8</span> c1125（峰值）</td><td>33% / 60% / 71%</td><td>33%</td><td>41%</td><td>0%</td></tr>
+      <tr><td><span class="tag pp">PP8</span> c1250–2000</td><td>30–34% / 66–69% / 80–89%</td><td>27–29%</td><td>31–34%</td><td>0%</td></tr>
+      <tr><td><span class="tag dp">DP8</span> c750</td><td>40% / 99% / 100%</td><td>28%</td><td>56%</td><td><span class="c-bad">4.1%</span><span class="bar" style="width:20px;background:var(--bad)"></span></td></tr>
+      <tr><td><span class="tag dp">DP8</span> c1000</td><td>64% / 99% / 100%</td><td>44%</td><td>31%</td><td><span class="c-bad">7.9%</span><span class="bar" style="width:40px;background:var(--bad)"></span></td></tr>
+      <tr><td><span class="tag dp">DP8</span> c1500</td><td>73% / 99.7% / 100%</td><td>57%</td><td>25%</td><td><span class="c-bad">14.5%</span><span class="bar" style="width:73px;background:var(--bad)"></span></td></tr>
+      <tr><td><span class="tag dp">DP8</span> c2000–4000（DRAM 无限）</td><td>67% / 99.5% / 100%</td><td>52–59%</td><td>30%</td><td><span class="c-bad">8.5–11%</span><span class="bar" style="width:50px;background:var(--bad)"></span></td></tr>
+    </tbody>
+  </table></div>
+  <ul class="notes">
+    <li><strong>DP8：</strong>每个 rank 的 KV 约 128 万 token，只放得下 7–8 个 166k 的请求。HBM 占满时新的读开始不了，调度就停住。c1000 时每卡 70.6 GB 的分布是：正在算 14.1 GB，等读 31.1 GB，旧前缀 21.8 GB，空闲 3.5 GB。</li>
+    <li><strong>PP8：</strong>过峰后旧前缀被等读的请求挤掉，HBM 命中跌到约 1%，GPU 利用率从 0.85 降到 0.55，形成恶性循环。不可挤占的部分从来没有接近满。</li>
+    <li><strong>两种部署都一样：</strong>等读的部分比正在算的部分大。读完立刻调度、边读边算，或者给旧前缀留一个最低配额，都可能改善。这些改进都还没有仿真过。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>6 · 每张 GPU 的前缀读带宽</h2>
+  <p class="prose">按负载完全均衡计算（全集群总量 ÷ 8），取整个 8 h 的平均。GLM-5.2 在 DP8 下每卡每 token 的 KV 是 55,224 B，PP8 是其 1/8，约 6.9 KB。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>配置</th><th>HBM 命中</th><th>从 DRAM 读</th><th>从 SSD 读</th><th>tier 读合计</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag dp">DP8</span> 150 GB，c750</td><td>9.3%</td><td>9.6 GB/s</td><td class="c-bad">9.6 GB/s</td><td>19.1 GB/s</td></tr>
+      <tr><td><span class="tag dp">DP8</span> DRAM 无限，c1000</td><td>1.1%</td><td>30.1 GB/s</td><td>—</td><td>30.1 GB/s</td></tr>
+      <tr><td><span class="tag pp">PP8</span> 150 GB，c750</td><td>38.6%</td><td>6.3 GB/s</td><td class="c-bad">10.0 GB/s</td><td>16.2 GB/s</td></tr>
+      <tr class="hl"><td><span class="tag pp">PP8</span> 750 GB，c1000</td><td>19.1%</td><td>33.0 GB/s</td><td>0.7 GB/s</td><td>33.7 GB/s</td></tr>
+      <tr><td><span class="tag pp">PP8</span> 750 GB，c1125</td><td>6.8%</td><td>38.9 GB/s</td><td>1.2 GB/s</td><td>40.1 GB/s</td></tr>
+    </tbody>
+  </table></div>
+  <p class="prose">峰值时 DRAM 带宽用掉 60–80%（上限 50 GB/s）。每轮要用的前缀约是新算 token 的 100 倍，所以读带宽很高。</p>
+</section>
+
+<section>
+  <h2>7 · 成本与在线厂商对比</h2>
+  <p class="prose">8 × B200 × $6.5/h，按峰值时 GPU 全忙计算，只算 prefill。每轮平均新算 1,761 个 token，命中缓存 148.2k 个。厂商的成本是同样每轮用量按「新 token 价 + cache read 价」计费，再折算成每 1M 新 token。</p>
+  <figure>
+    <div class="chart"><svg id="cost" viewBox="0 0 900 330" role="img" aria-label="cost per 1M fresh tokens"></svg></div>
+    <figcaption>每 1M 新 token 的等效成本（美元）。厂商价格取自 Z.ai 官方和 OpenRouter 各 endpoint，2026-10-09 查询。</figcaption>
+  </figure>
+  <div class="tbl"><table>
+    <thead><tr><th>方案</th><th>新 token $/1M</th><th>cache read $/1M</th><th>每轮</th><th>等效 $/1M 新 token</th><th>倍数</th><th>cache read 占账单</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td><span class="tag pp">PP8</span> 750 GB，c1000</td><td>—</td><td>计入 GPU 时间</td><td>$0.00035</td><td>$0.20</td><td>—</td><td>—</td></tr>
+      <tr class="hl"><td><span class="tag dp">DP8</span> 750 GB，c1000</td><td>—</td><td>计入 GPU 时间</td><td>$0.00050</td><td>$0.28</td><td>1×</td><td>—</td></tr>
+      <tr><td>Wafer（OpenRouter 最便宜）</td><td>$0.06</td><td>$0.059</td><td>$0.0088</td><td>$5.02</td><td>18×</td><td>99%</td></tr>
+      <tr><td>Decart（mxfp4）</td><td>$0.273</td><td>$0.105</td><td>$0.016</td><td>$9.11</td><td>32×</td><td>97%</td></tr>
+      <tr><td>DeepInfra（fp4）</td><td>$0.562</td><td>$0.105</td><td>$0.017</td><td>$9.40</td><td>33×</td><td>94%</td></tr>
+      <tr><td>InferenceNet（fp4）</td><td>$0.18</td><td>$0.12</td><td>$0.018</td><td>$10.3</td><td>36×</td><td>98%</td></tr>
+      <tr><td>Z.ai 官方</td><td>$1.40</td><td>$0.26</td><td>$0.041</td><td>$23.3</td><td>82×</td><td>94%</td></tr>
+    </tbody>
+  </table></div>
+  <p class="prose">倍数是相对 DP8 的 $0.28。我们的成本没有包含 DRAM 和 SSD 硬件、decode、空闲时段和运维；实际利用率低于 100% 时，单位成本按比例上升。</p>
+</section>
+
+<section>
+  <h2>8 · 单次 burst：100k 前缀 + 8192 新 token</h2>
+  <p class="prose">128 个请求在 t=0 同时到达，每个请求的 100k 前缀已经在 KV 里，只需新算 8,192 个 token、输出 1 个。每个 rank 的 chunk 是 8192。吞吐只算新 token。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>配置</th><th>新 token prefill tok/s</th><th>每 GPU</th><th>128 个请求全部完成</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag dp">DP4EP4</span></td><td>46,042</td><td>11,512</td><td>约 22.8 s</td></tr>
+      <tr><td><span class="tag dp">DP8EP8</span></td><td>83,369</td><td>10,422</td><td>约 12.6 s</td></tr>
+    </tbody>
+  </table></div>
+  <p class="prose">从头 prefill 64k 的旧结果是 DP4 53k、DP8 95k tok/s，这次低 12–14%，因为每个新 token 要对 100k 以上的上下文做 attention。闭环里 DP8 的算力上限只有约 51k 新 tok/s，因为每轮新算的 token 少、批次小。</p>
+</section>
+
+<section>
+  <h2>参考：GLM-5.3-Flash 在同一工作负载下</h2>
+  <p class="prose">pp-study 里所有的 PP/DP 研究都用 GLM-5.3-Flash（45 层，11 层 DSA + 34 层 KDA 线性 attention）。数据来自 <code>wt-pp-study/logs/20261008_1_pp_kv_tiers</code>，用的是旧 kernel，150 GB DRAM + SSD。</p>
+  <div class="tbl"><table>
+    <thead><tr><th></th><th>GLM-5.2</th><th>GLM-5.3-Flash</th></tr></thead>
+    <tbody>
+      <tr><td>每 token 前缀 KV（整模型）</td><td>55,224 B（约 9 倍）</td><td>5,995 B，另外每次读搬约 56 MB KDA state</td></tr>
+      <tr><td>DP8 峰值，150 GB + SSD</td><td>21.3 r/s</td><td>98.4 r/s</td></tr>
+      <tr><td>PP8 峰值，150 GB + SSD</td><td>26.5 r/s</td><td>110.1 r/s（读等待 ≤ 1 s）</td></tr>
+      <tr><td>峰值时每 GPU tier 读</td><td>16–19 GB/s，SSD 已满</td><td>7.35 GB/s，SSD 用了约 31%</td></tr>
+      <tr><td>峰值时 HBM 命中</td><td>9%（DP8）/ 39%（PP8）</td><td>48%（PP8）</td></tr>
+    </tbody>
+  </table></div>
+  <p class="prose">Flash 每 token 的 KV 小得多，HBM 能留更多会话，150 GB DRAM 就够用。GLM-5.2 要靠大 DRAM 才能摆脱 SSD 瓶颈。</p>
+</section>
+
+<section>
+  <h2>注意事项</h2>
+  <ul class="notes">
+    <li><strong>闭环 run 用的都是 pp-study 的自定义调度，不是原版 vLLM 调度。</strong>包括：SPF（新 prefill 短的先算）、SRPT、load budget（每 rank 4096，backlog 1M–3M）、tier 读最多等 1 s（等不到就先跳过）、60 s 强制调度、warm start、会话粘在同一 rank。PP8 另外有 tier 读在 stage 间均摊和 even microbatch 切分。单次 burst（第 8 节）用的是默认的 chunked prefill，没有这些策略。</li>
+    <li><strong>PP8 和 DP8 的专家路由不完全一致。</strong>DP8 用 vLLM c32_long 的实测分布。PP8 是 EP1，用这个分布会缺 66 行 MoE profile 数据，所以改用 SGLang TP4 的实测分布。两者的 MoE 时间会略有出入；补齐数据需要上 GPU。</li>
+    <li><strong>KV 预算是推算值，没有实测。</strong>DP8 每卡 70.56 GB 取自 public preset；PP8 每卡 100.08 GB 按同一规则推出。</li>
+    <li><strong>每个点只跑了一个 seed</strong>，没有做方差。</li>
+    <li><strong>decode 不在这几张卡上</strong>（external decode），只体现为每轮之间的 tool wait 时间。</li>
+    <li><strong>代码改动还没提交。</strong>改动让全注意力架构（如 GLM-5.2）也能用分级前缀存储，共 7 个文件。不开 tier 时结果与改动前逐位一致；<code>just test-cpu</code>：Rust 1383 个全部通过，pytest 4081 个通过，另有 14 个 error，原因是这个 worktree 没有初始化 vllm 子模块。</li>
+  </ul>
+</section>
+
+<footer>
+  数据：<code>wt-glm52-tiers/logs/20261009_{0,3,4,5,6,7}_*</code>（RESULTS.md、steady.py 2–7 h、hbm_split.py、hbm_need.py、lru_need.py），burst 结果 <code>wt-sim-split/logs/20261009_0_glm52_dp_prefix100k</code>。
+</footer>
+</div>
+
+<script>
+(function () {
+  const NS = "http://www.w3.org/2000/svg";
+  const el = (tag, attrs, parent, text) => {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    if (parent) parent.appendChild(e);
+    return e;
+  };
+
+  // Steady state, 2-7 h window (steady.py): [concurrency, rounds/s, p50 ms, p90 ms, p99 ms].
+  const series = [
+    { name: "DP8 150 GB + SSD", color: "var(--dp)", dash: "6 4", rows: [[100,3.61,186,738,2638],[200,7.52,459,1248,3900],[250,9.58,555,1470,4328],[375,14.12,757,1949,6339],[500,18.57,1077,3544,14725],[750,21.33,1699,23987,65309],[1000,21.2,1802,64132,69840]] },
+    { name: "DP8 750 GB + SSD", color: "var(--dp)", dash: "", rows: [[750,28.08,1402,3054,10912],[1000,28.91,2607,21110,64631],[1500,23.71,8401,74584,101999]] },
+    { name: "DP8 DRAM 无限", color: "var(--dp)", dash: "1.5 4", rows: [[500,19.35,963,1799,4563],[750,28.15,1403,3008,10060],[1000,29.29,2583,19431,64196],[1500,29.15,4471,62214,73376],[2000,29.26,24730,63766,79690],[2500,29.86,61463,67033,91749],[3000,30.0,62870,73875,103887],[4000,29.49,81627,109741,154351]] },
+    { name: "PP8 150 GB + SSD", color: "var(--pp)", dash: "6 4", rows: [[500,20.22,241,552,1072],[750,26.48,502,2582,61700],[1000,26.44,508,61543,62149],[1500,25.28,494,80710,85805],[2000,24.13,893,131893,137062]] },
+    { name: "PP8 750 GB + SSD", color: "var(--pp)", dash: "", rows: [[500,20.25,216,488,888],[750,30.35,394,637,1223],[1000,40.92,637,1701,6156],[1125,41.99,1675,4275,23954],[1250,32.03,3587,54898,63939],[1375,29.57,4462,62916,64947],[1500,28.79,5171,63846,66198],[2000,25.16,6536,115219,124989]] },
+  ];
+  series.forEach(s => { s.pts = s.rows.filter(r => r[0] <= 2000).map(r => [r[0], r[1]]); });
+
+  const fillLegend = id => {
+    const lg = document.getElementById(id);
+    series.forEach(s => {
+      const span = document.createElement("span");
+      const sv = el("svg", { viewBox: "0 0 28 10" }, span);
+      el("line", { x1: 1, y1: 5, x2: 27, y2: 5, stroke: s.color, "stroke-width": 2.5, "stroke-dasharray": s.dash, "stroke-linecap": "round" }, sv);
+      span.appendChild(document.createTextNode(s.name));
+      lg.appendChild(span);
+    });
+  };
+  fillLegend("legend");
+  fillLegend("legend2");
+
+  // TTFT vs throughput: x = rounds/s, y = TTFT on a log scale; one polyline per config in concurrency order.
+  (function () {
+    const ts = document.getElementById("trade");
+    const wrap = document.getElementById("tradewrap");
+    const tip = document.getElementById("tip");
+    const W = 900, H = 420, L = 64, R = 24, T = 16, B = 46;
+    const xMax = 45, yLo = 0.1, yHi = 200;
+    const X = v => L + (v / xMax) * (W - L - R);
+    const Y = s => T + (1 - (Math.log10(s) - Math.log10(yLo)) / (Math.log10(yHi) - Math.log10(yLo))) * (H - T - B);
+    const qi = { p50: 2, p90: 3, p99: 4 };
+    const fmt = ms => ms >= 10000 ? (ms / 1000).toFixed(0) + " s" : (ms / 1000).toFixed(ms >= 1000 ? 1 : 2) + " s";
+    let q = "p90";
+    try { const saved = localStorage.getItem("ttftQ"); if (saved && qi[saved]) q = saved; } catch (e) {}
+
+    function draw() {
+      while (ts.firstChild) ts.removeChild(ts.firstChild);
+      [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200].forEach(v => {
+        el("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), class: "grid" }, ts);
+        el("text", { x: L - 8, y: Y(v) + 4, "text-anchor": "end" }, ts, v < 1 ? v + " s" : v + " s");
+      });
+      for (let x = 0; x <= xMax; x += 5) {
+        el("line", { x1: X(x), x2: X(x), y1: H - B, y2: H - B + 5, class: "axis" }, ts);
+        el("text", { x: X(x), y: H - B + 20, "text-anchor": "middle" }, ts, x);
+      }
+      el("line", { x1: L, x2: W - R, y1: H - B, y2: H - B, class: "axis" }, ts);
+      el("text", { x: (L + W - R) / 2, y: H - 6, "text-anchor": "middle" }, ts, "吞吐 rounds/s");
+      el("text", { x: 14, y: T + (H - T - B) / 2, "text-anchor": "middle", transform: `rotate(-90 14 ${T + (H - T - B) / 2})` }, ts, q + " TTFT");
+      const k = qi[q];
+      series.forEach(s => {
+        el("polyline", { points: s.rows.map(r => `${X(r[1])},${Y(r[k] / 1000)}`).join(" "), fill: "none", stroke: s.color, "stroke-width": 2, "stroke-dasharray": s.dash, "stroke-linejoin": "round", "stroke-linecap": "round" }, ts);
+      });
+      series.forEach(s => s.rows.forEach(r => {
+        const cx = X(r[1]), cy = Y(r[k] / 1000);
+        el("circle", { cx, cy, r: 4, fill: s.color, stroke: "var(--surface)", "stroke-width": 1.5 }, ts);
+        const hit = el("circle", { cx, cy, r: 11, fill: "transparent", tabindex: 0 }, ts);
+        const show = () => {
+          tip.innerHTML = `<b>${s.name}</b><br>c${r[0]} · ${r[1].toFixed(1)} r/s<br>p50 ${fmt(r[2])} · p90 ${fmt(r[3])} · p99 ${fmt(r[4])}`;
+          tip.hidden = false;
+          const box = wrap.getBoundingClientRect(), sv = ts.getBoundingClientRect();
+          const px = sv.left - box.left + cx * sv.width / W + wrap.scrollLeft, py = sv.top - box.top + cy * sv.height / H;
+          tip.style.left = Math.min(px + 12, wrap.scrollWidth - tip.offsetWidth - 4) + "px";
+          tip.style.top = Math.max(4, py - tip.offsetHeight - 10) + "px";
+        };
+        hit.addEventListener("mouseenter", show); hit.addEventListener("focus", show);
+        hit.addEventListener("mouseleave", () => { tip.hidden = true; }); hit.addEventListener("blur", () => { tip.hidden = true; });
+      }));
+      // Label the points the text cites.
+      const pp = series[4].rows, dp = series[1].rows;
+      el("text", { x: X(pp[2][1]) + 8, y: Y(pp[2][k] / 1000) + 16, class: "lbl" }, ts, "PP8 c1000");
+      el("text", { x: X(pp[3][1]) - 6, y: Y(pp[3][k] / 1000) - 10, class: "lbl", "text-anchor": "end" }, ts, "c1125 峰值");
+      el("text", { x: X(dp[0][1]) - 8, y: Y(dp[0][k] / 1000) + 16, class: "lbl", "text-anchor": "end" }, ts, "DP8 c750");
+    }
+    document.querySelectorAll(".seg button").forEach(b => b.addEventListener("click", () => {
+      q = b.dataset.q;
+      document.querySelectorAll(".seg button").forEach(o => o.setAttribute("aria-pressed", o === b ? "true" : "false"));
+      try { localStorage.setItem("ttftQ", q); } catch (e) {}
+      tip.hidden = true;
+      draw();
+    }));
+    document.querySelectorAll(".seg button").forEach(o => o.setAttribute("aria-pressed", o.dataset.q === q ? "true" : "false"));
+    draw();
+  })();
+
+  const svg = document.getElementById("tput");
+  const W = 900, H = 380, L = 56, R = 24, T = 16, B = 46;
+  const xMax = 2000, yMax = 45;
+  const X = v => L + (v / xMax) * (W - L - R);
+  const Y = v => T + (1 - v / yMax) * (H - T - B);
+  for (let y = 0; y <= yMax; y += 5) {
+    el("line", { x1: L, x2: W - R, y1: Y(y), y2: Y(y), class: y === 0 ? "axis" : "grid" }, svg);
+    el("text", { x: L - 8, y: Y(y) + 4, "text-anchor": "end" }, svg, y);
+  }
+  for (let x = 0; x <= xMax; x += 250) {
+    el("line", { x1: X(x), x2: X(x), y1: Y(0), y2: Y(0) + 5, class: "axis" }, svg);
+    el("text", { x: X(x), y: Y(0) + 20, "text-anchor": "middle" }, svg, x);
+  }
+  el("text", { x: (L + W - R) / 2, y: H - 6, "text-anchor": "middle" }, svg, "并发（闭环会话数）");
+  el("text", { x: 14, y: T + (H - T - B) / 2, "text-anchor": "middle", transform: `rotate(-90 14 ${T + (H - T - B) / 2})` }, svg, "rounds/s");
+
+  series.forEach(s => {
+    el("polyline", { points: s.pts.map(p => `${X(p[0])},${Y(p[1])}`).join(" "), fill: "none", stroke: s.color, "stroke-width": 2.5, "stroke-dasharray": s.dash, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+    s.pts.forEach(p => el("circle", { cx: X(p[0]), cy: Y(p[1]), r: 3.2, fill: s.color }, svg));
+  });
+  // Annotate the peaks that the text cites.
+  const note = (x, y, txt, dx, dy, anchor) => {
+    el("text", { x: X(x) + dx, y: Y(y) + dy, "text-anchor": anchor || "start", class: "lbl" }, svg, txt);
+  };
+  note(1125, 42.0, "PP8 峰值 42.0", 8, -6);
+  note(1000, 28.9, "DP8 28.9", -8, -10, "end");
+  note(750, 26.5, "26.5", 6, 18);
+  note(750, 21.3, "21.3", 6, 18);
+
+  // Cost per 1M fresh tokens.
+  const cost = [
+    ["PP8（我们）", 0.20, "var(--pp)"],
+    ["DP8（我们）", 0.28, "var(--dp)"],
+    ["Wafer", 5.02, "var(--ref)"],
+    ["Decart", 9.11, "var(--ref)"],
+    ["DeepInfra", 9.40, "var(--ref)"],
+    ["InferenceNet", 10.3, "var(--ref)"],
+    ["Z.ai 官方", 23.3, "var(--ref)"],
+  ];
+  const cs = document.getElementById("cost");
+  const CL = 130, CR = 70, CT = 10, rowH = 40, cMax = 25;
+  const CX = v => CL + (v / cMax) * (900 - CL - CR);
+  for (let v = 0; v <= cMax; v += 5) {
+    el("line", { x1: CX(v), x2: CX(v), y1: CT, y2: CT + rowH * cost.length, class: v === 0 ? "axis" : "grid" }, cs);
+    el("text", { x: CX(v), y: CT + rowH * cost.length + 18, "text-anchor": "middle" }, cs, "$" + v);
+  }
+  cost.forEach((c, i) => {
+    const y = CT + i * rowH + 9;
+    el("text", { x: CL - 10, y: y + 15, "text-anchor": "end", class: "lbl" }, cs, c[0]);
+    el("rect", { x: CX(0), y: y, width: Math.max(3, CX(c[1]) - CX(0)), height: 22, rx: 2, fill: c[2] }, cs);
+    el("text", { x: CX(c[1]) + 8, y: y + 15 }, cs, "$" + c[1].toFixed(2));
+  });
+})();
+</script>
