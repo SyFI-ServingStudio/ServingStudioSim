@@ -171,6 +171,12 @@ def _list_params(argv: list[str]) -> int:
     return list_params(argv)
 
 
+def _mstar_experiment(argv: list[str]) -> int:
+    from .mstar_experiment.cli import main
+
+    return main(argv)
+
+
 SUBCOMMANDS: dict[str, Subcommand] = {
     # The offline per-building-block timing predictor. Its config is a minimal
     # arch+cases file, not a deployment RunConfig, so it bypasses sweeps.
@@ -192,6 +198,10 @@ SUBCOMMANDS: dict[str, Subcommand] = {
     ),
     "migrate-artifact-kinds": Subcommand(
         "migrate-artifact-kinds (--check|--apply) [--registry PATH]", _migrate_artifact_kinds
+    ),
+    # POC: shared M*-Sim experiment manifests via external lab (MSTAR_EXPERIMENT_LAB).
+    "mstar-experiment": Subcommand(
+        "mstar-experiment {run-experiment,run-campaign,evaluate} ...", _mstar_experiment
     ),
     "list-params": Subcommand("list-params [--human] [--build-type PROFILE]", _list_params),
 }
