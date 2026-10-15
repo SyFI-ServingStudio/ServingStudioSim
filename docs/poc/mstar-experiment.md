@@ -14,4 +14,4 @@
 
 **What is out of scope for this PR:** Qwen3-TTS arch in vibesim, merged DES, cross-backend throughput comparison.
 
-**Lab:** https://github.com/sheetal104/mstar-sim-tier-a-qwen3tts — `docs/qwen3-tts-tier-a-results.md`, `docs/shared-experiment-layer.md`. Set `MSTAR_EXPERIMENT_LAB` to a clone to reproduce acceptance on captured artifacts.
+**Evidence (M\* fork):** https://github.com/sheetal104/mstar/tree/fix/simulate-cli-json-asdict/docs/sim — Tier A results + shared experiment layer. Harness scripts stay local; set `MSTAR_EXPERIMENT_LAB` to that tree to re-run acceptance.

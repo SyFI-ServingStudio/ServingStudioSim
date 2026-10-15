@@ -10,4 +10,4 @@ uv run python -m launcher mstar-experiment --help
 
 Subcommands: `run-experiment`, `run-campaign`, `evaluate` — see lab `docs/shared-experiment-layer.md`.
 
-**Evidence:** https://github.com/sheetal104/mstar-sim-tier-a-qwen3tts/blob/feat/qwen3-tts-tier-a-integration-lab/docs/qwen3-tts-tier-a-results.md
+**Evidence:** https://github.com/sheetal104/mstar/blob/fix/simulate-cli-json-asdict/docs/sim/qwen3-tts-tier-a-results.md
