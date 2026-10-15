@@ -220,6 +220,9 @@ class KernelProfilerSpec:
     # appended to the row's ``backend_version`` so worker-process state that
     # changes the number (e.g. the pinned autotune configs) is recorded with it.
     row_provenance_ref: RunnerRef | None = None
+    # Optional cache-free device capture, called only by the ``ops`` diagnostic.
+    # It returns a capture manifest, never a Metrics value or a database row.
+    ops_runner_ref: RunnerRef | None = None
     # Reader-facing description of this backend for the Kernel Library. None
     # until the kind is documented; see profiling/db/doc.py.
     doc: BackendDoc | None = None

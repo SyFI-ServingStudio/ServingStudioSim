@@ -69,6 +69,22 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
     elif execution is not None:
         raise ValueError("a Neuron reservation cannot execute a CUDA backend")
 
+    if worker_request.get("ops") is not None:
+        if profiler_spec.ops_runner_ref is None or observed_neuron is None:
+            raise ValueError("ops requires a registered capture runner and a Neuron reservation")
+        if len(chunk_specs) != 1 or worker_request.get("measure") is not None:
+            raise ValueError("ops requires exactly one spec and no CUPTI measure request")
+        device_error = unsupported_device(profiler_spec.supports, f"{kernel_kind} {backend}")
+        if device_error is not None:
+            raise ValueError(device_error)
+        shape = args_to_spec(coerce_args(profiler_spec.args_schema, _strip_backend(chunk_specs[0])))
+        result = profiler_spec.ops_runner_ref.load()(shape, worker_request["ops"])
+        result.update(
+            observed_gpu_name=observed_neuron.gpu_name, runtime_versions=_neuron_versions()
+        )
+        output_path.write_text(json.dumps({"ops": result}), encoding="utf-8")
+        return
+
     # An optional `measure` block turns this run into the trend+telemetry probe:
     # the context makes the shared Timer.cupti seam capture per-launch durations
     # instead of a single mean, without touching the runner. Absent block → the

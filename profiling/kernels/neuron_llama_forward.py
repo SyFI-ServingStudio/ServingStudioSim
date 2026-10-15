@@ -89,6 +89,7 @@ register(
         ),
         runner_ref=RunnerRef("profiling.runners.neuron.vllm_forward", "profile_forward_batch"),
         row_provenance_ref=RunnerRef("profiling.runners.neuron.vllm_forward", "row_provenance"),
+        ops_runner_ref=RunnerRef("profiling.runners.neuron.vllm_ops", "capture_ops"),
         table_name=KIND,
         args_schema=NeuronLlamaForwardArgs,
         metric_family=MetricFamily.COMPUTE,

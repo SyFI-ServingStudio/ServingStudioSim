@@ -209,7 +209,7 @@ def build_measurement_metadata(
     requested_gpu_name: str | None,
     observed_gpu_name: str | None,
     gpu_count: int,
-    duration_s: float,
+    duration_s: float | None,
     telemetry: bool,
     created_at: str,
     summary_file: str,

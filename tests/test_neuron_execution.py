@@ -346,6 +346,33 @@ def test_neuron_timeline_is_writable_without_source_or_data_writes(container_set
     assert f"{trace.parent}:{trace.parent}" in command
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_ops_container_limits_memory_and_mounts_validation_readonly(container_setup, nested):
+    setup = container_setup
+    validation = (setup.cache if nested else setup.source.parent) / "validation"
+    validation.mkdir(parents=True)
+    command, _ = neuron._neuron_container_worker_command(
+        setup.container, DEVICE, setup.exchange, image_id=IMAGE,
+        memory_limit_gb=40, extra_readonly=(validation,),
+    )
+    assert {"--memory=40g", "--memory-swap=40g"} <= set(command)
+    assert f"{validation}:{validation}:ro" in command
+    if nested:
+        assert command.index(f"{setup.cache}:{setup.cache}") < command.index(
+            f"{validation}:{validation}:ro"
+        )
+
+
+def test_validation_mount_cannot_make_the_entire_cache_readonly(container_setup):
+    setup = container_setup
+    setup.cache.mkdir()
+    with pytest.raises(ValueError, match="overlap"):
+        neuron._neuron_container_worker_command(
+            setup.container, DEVICE, setup.exchange, image_id=IMAGE,
+            memory_limit_gb=40, extra_readonly=(setup.cache,),
+        )
+
+
 def test_image_inspection_binds_immutable_local_content(container_setup, monkeypatch):
     calls = []
 
@@ -502,6 +529,61 @@ def test_container_chunk_holds_and_releases_lock_through_result_parsing(
     else:
         with pytest.raises((ValueError, RuntimeError)):
             chunk.run("test_kind", [{"backend": "test"}])
+    assert lock.closed
+
+
+@pytest.mark.parametrize("outcome", ["success", "wrong-observation", "nonzero"])
+def test_ops_chunk_preserves_request_reservation_and_provenance(
+    container_setup, monkeypatch, outcome
+):
+    from profiling.profilers import energy
+
+    setup = container_setup
+    monkeypatch.delenv("SERVINGSTUDIO_NO_GPU", raising=False)
+    monkeypatch.setattr(energy, "energy_enabled", lambda: False)
+    monkeypatch.setattr(neuron, "resolve_chunk_backend", lambda *a: "test")
+    monkeypatch.setattr(
+        neuron, "find_kernel_profiler_spec",
+        lambda *a: SimpleNamespace(
+            supports=SimpleNamespace(device_family="neuron"),
+            subprocess_env="vllm_neuron_env", worker_env=(),
+            neuron_logical_cores=4, ops_runner_ref=object(),
+        ),
+    )
+    monkeypatch.setattr(neuron, "_inspect_neuron_image", lambda container: IMAGE)
+    monkeypatch.setattr(neuron, "_host_driver_version", lambda: "2.34.10")
+    validation = setup.cache / "validation"
+    validation.mkdir(parents=True)
+    request = {"memory_limit_gb": 40, "validated_run": str(validation), "forwards": 2}
+    shape = {"phase": "decode", "token_bucket": 16, "backend": "test"}
+    lock = (setup.source.parent / "ops-reservation.lock").open("a")
+    chunk = neuron.LocalNeuronChunk(DEVICE, lock)
+
+    def run(command, **kwargs):
+        assert not lock.closed
+        payload = json.loads((Path(kwargs["cwd"]) / "input.json").read_text())
+        assert payload["specs"] == [shape]
+        assert payload["ops"] == request
+        assert payload["execution"] == neuron._reservation_payload(DEVICE, 4)
+        assert "--memory=40g" in command and f"{validation}:{validation}:ro" in command
+        response = {
+            "manifest_path": "/capture/manifest.json",
+            "observed_gpu_name": "wrong" if outcome == "wrong-observation" else DEVICE.gpu_name,
+        }
+        (Path(kwargs["cwd"]) / "output.json").write_text(json.dumps({"ops": response}))
+        return SimpleNamespace(
+            returncode=17 if outcome == "nonzero" else 0, stderr="capture failed", stdout=""
+        )
+
+    monkeypatch.setattr(neuron.subprocess, "run", run)
+    if outcome == "success":
+        result = chunk.run_ops("test_kind", shape, request)
+        assert result["manifest_path"] == "/capture/manifest.json"
+        assert result["container_image_id"] == IMAGE
+        assert result["host_driver_package"] == "2.34.10"
+    else:
+        with pytest.raises(RuntimeError, match="observation|exited 17"):
+            chunk.run_ops("test_kind", shape, request)
     assert lock.closed
 
 

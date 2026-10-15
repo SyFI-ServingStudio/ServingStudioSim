@@ -304,6 +304,8 @@ def _neuron_container_worker_command(
     image_id: str,
     worker_env: Mapping[str, str] | None = None,
     logical_cores: int = 1,
+    memory_limit_gb: int | None = None,
+    extra_readonly: tuple[Path, ...] = (),
 ) -> tuple[list[str], dict[str, str]]:
     """Run the JSON worker in the image as the invoking user, offline, on one chip."""
     if os.getuid() == 0:
@@ -314,6 +316,9 @@ def _neuron_container_worker_command(
     policy.update(worker_env or {})
     policy = {name: value for name, value in policy.items() if name not in _IMAGE_ABI_ENV}
     readonly = [_PROJECT_ROOT / name for name in _SOURCE_DIRS]
+    validated_dirs = tuple(
+        _absolute_directory(str(path), "ops validated run") for path in extra_readonly
+    )
     for path in readonly:
         if not path.is_dir():
             raise FileNotFoundError(f"worker source directory does not exist: {path}")
@@ -329,6 +334,11 @@ def _neuron_container_worker_command(
     if not cache.is_absolute():
         raise ValueError(f"{CACHE_DIR_ENV} must be absolute")
     cache = cache.resolve()
+    # Keep reused numerical evidence read-only even inside the writable cache.
+    nested_readonly = tuple(
+        path for path in validated_dirs if path != cache and path.is_relative_to(cache)
+    )
+    readonly.extend(path for path in validated_dirs if path not in nested_readonly)
     writable = [exchange_dir.resolve(), cache]
     if policy.get(TIMELINE_ENV):
         timeline = Path(policy[TIMELINE_ENV])
@@ -338,7 +348,11 @@ def _neuron_container_worker_command(
     for rw in writable:
         if any(rw.is_relative_to(ro) or ro.is_relative_to(rw) for ro in readonly):
             raise ValueError("Neuron writable mounts overlap read-only source or data")
-    if any(container.socket.is_relative_to(path) for path in [*readonly, *writable]):
+        if rw != cache and any(
+            rw.is_relative_to(ro) or ro.is_relative_to(rw) for ro in nested_readonly
+        ):
+            raise ValueError("Neuron writable output overlaps read-only numerical evidence")
+    if any(container.socket.is_relative_to(path) for path in [*readonly, *nested_readonly, *writable]):
         raise ValueError("Neuron worker mounts must not expose the Docker socket")
     for path in writable:
         path.mkdir(parents=True, exist_ok=True)
@@ -381,6 +395,10 @@ def _neuron_container_worker_command(
         f"--device=/dev/neuron{device.device_id}:/dev/neuron{device.device_id}",
         f"--entrypoint={container.python}",
     ]
+    if memory_limit_gb is not None:
+        if not 1 <= memory_limit_gb <= 60:
+            raise ValueError("Neuron ops memory limit must be between 1 and 60 GiB")
+        command.extend((f"--memory={memory_limit_gb}g", f"--memory-swap={memory_limit_gb}g"))
     for name, value in sorted(policy.items()):
         command.extend(("--env", f"{name}={value}"))
     for path in dict.fromkeys(readonly):
@@ -388,6 +406,8 @@ def _neuron_container_worker_command(
     command.extend(("--volume", f"{exchange_dir.resolve()}:/io"))
     for path in dict.fromkeys(writable[1:]):
         command.extend(("--volume", f"{path}:{path}"))
+    for path in dict.fromkeys(nested_readonly):
+        command.extend(("--volume", f"{path}:{path}:ro"))
     command.extend(("--volume", f"{neuron_ls.resolve()}:/opt/aws/neuron/bin/neuron-ls:ro"))
     command.extend(
         (
@@ -462,7 +482,15 @@ class LocalNeuronChunk(GpuChunk):
         finally:
             self.lock.close()
 
-    def _run(self, kernel_kind: str, specs: list[dict]) -> list[ChunkResult]:
+    def run_ops(self, kernel_kind: str, spec: dict, request: dict) -> dict:
+        try:
+            return self._run(kernel_kind, [spec], ops_request=request)
+        finally:
+            self.lock.close()
+
+    def _run(
+        self, kernel_kind: str, specs: list[dict], *, ops_request: dict | None = None
+    ) -> list[ChunkResult] | dict:
         require_gpu("executing a Neuron profiling chunk")
         from profiling.profilers.energy import energy_enabled
 
@@ -472,6 +500,8 @@ class LocalNeuronChunk(GpuChunk):
             return []
         backend = resolve_chunk_backend(kernel_kind, specs)
         spec = find_kernel_profiler_spec(kernel_kind, backend)
+        if ops_request is not None and spec.ops_runner_ref is None:
+            raise ValueError(f"{kernel_kind}/{backend} does not support per-op capture")
         if spec.supports.device_family != "neuron":
             raise ValueError(f"{kernel_kind}/{backend} is not a Neuron backend")
         container = neuron_container(spec.subprocess_env)
@@ -487,6 +517,7 @@ class LocalNeuronChunk(GpuChunk):
                         "specs": specs,
                         "energy": False,
                         "execution": _reservation_payload(self.device, spec.neuron_logical_cores),
+                        **({"ops": ops_request} if ops_request is not None else {}),
                     }
                 )
             )
@@ -497,11 +528,23 @@ class LocalNeuronChunk(GpuChunk):
                 image_id=image_id,
                 worker_env=dict(spec.worker_env),
                 logical_cores=spec.neuron_logical_cores,
+                memory_limit_gb=ops_request["memory_limit_gb"] if ops_request else None,
+                extra_readonly=(Path(ops_request["validated_run"]),)
+                if ops_request and ops_request.get("validated_run") else (),
             )
             completed = subprocess.run(cmd, cwd=scratch, env=env, capture_output=True, text=True)
             if completed.returncode:
+                if ops_request is not None:
+                    raise RuntimeError(_worker_failure_message(completed))
                 return [ChunkResult(None, error=_worker_failure_message(completed)) for _ in specs]
-            results = json.loads(output_path.read_text())["results"]
+            response = json.loads(output_path.read_text())
+            if ops_request is not None:
+                result = response["ops"]
+                if result.get("observed_gpu_name") != self.device.gpu_name:
+                    raise RuntimeError("ops worker physical observation differs from reservation")
+                result.update(container_image_id=image_id, host_driver_package=host_driver)
+                return result
+            results = response["results"]
             if len(results) != len(specs):
                 raise RuntimeError("Neuron worker returned a different number of results")
             annotation = (

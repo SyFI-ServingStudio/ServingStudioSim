@@ -159,6 +159,151 @@ everywhere in this codebase; see `launcher/README.md` for the `energy:` key and
 the `VIBESIM_REQUIRE_ENERGY` guard that stops such a row reaching a run that
 asked for energy.
 
+## Per-operation Neuron diagnostics
+
+`launcher kernel-profile ops` captures the registered stock
+`neuron_llama_forward/vllm_neuron` Llama 3.1 8B BF16 TP4 execution and analyzes
+instruction and DMA activity. It does not read or write `profile.db`.
+Use the existing Neuron container/model/cache setup above:
+
+Validation status (2026-10-15): fresh public capture-and-analyze runs passed for
+the following pinned Llama 3.1 8B BF16 TP4 shapes, capturing rank 0 and both of
+that rank's physical cores. Passed runs verify accepted numerical receipts,
+stock NEFF bytes, complete native execution geometry, zero notification loss,
+and instruction/elapsed-time accounting.
+
+| Context | Selected forward | Fresh public command |
+| --- | --- | --- |
+| 512 | Prefill512 | Passed |
+| 1024 | Prefill1024 | Passed |
+| 1024 | Decode16 | Passed |
+| 512 | Decode16 | Passed |
+
+These checks validate capture correctness and accounting, not unchanged production
+timing. No controlled warmed unprofiled/controller-only/profiled comparison has
+been performed. Added output-completion waits and profiling can perturb execution;
+zero overhead is unverified. Source labels identify operation types, not verified
+transformer layer instances. Activity durations are not isolated operation costs
+or marginal speedup estimates.
+
+The development branch's focused CPU regression suite passes 317 tests. The accepted context512
+prefill run contained zero interleaved decodes before capture; that controller
+branch has pinned-source and unit-test coverage but has not yet been exercised
+in an accepted hardware capture. Older research manifests without numerical
+receipts remain diagnostic. Other ranks, contexts and models have not been
+validated by this per-op workflow.
+
+```bash
+uv run python -m launcher kernel-profile ops neuron_llama_forward \
+  --backend vllm_neuron \
+  --spec '{"phase":"decode","token_bucket":16,"max_model_len":1024,"kv_blocks":6782,"block_size":32,"tp_size":4,"dtype":"bf16"}' \
+  --debug-labels --forwards 2 --output-dir /absolute/new-output
+```
+
+For one selected prefill with an audited trailing decode guard:
+
+```bash
+uv run python -m launcher kernel-profile ops neuron_llama_forward \
+  --backend vllm_neuron \
+  --spec '{"phase":"prefill","token_bucket":512,"max_model_len":512,"kv_blocks":6782,"block_size":32,"tp_size":4,"dtype":"bf16"}' \
+  --debug-labels --forwards 1 --output-dir /absolute/new-prefill-output
+```
+
+Use `token_bucket:1024` and `max_model_len:1024` for the validated larger prefill.
+
+The command validates full logits against the existing reference and seals the
+stock executable before capture. Decode supports one or two selected forwards
+(default two); prefill supports one selected forward (default one). Reuse a prior
+numerical run with `--validated-run /absolute/run`; checkpoint, package/source
+identity, context, accepted shape and current cached NEFF bytes must still match.
+Prefill capture uses a public `worker_cls` adapter around the pinned stock worker.
+It checks the actual canonical 16-request prompt multiset and padded geometry,
+auditing any naturally interleaved decodes before capture against each admitted
+request's exact token-position progression and the unchanged compiled buckets.
+Those decodes remain unprofiled; the control receipt records their full sequence.
+The adapter drains the previous sampled output before starting the stock profiler for the
+last prefill, then drains the first decode16 output before stopping. Both drains
+use the stock, idempotent asynchronous output API; model and sampling calls,
+compiled NEFFs, and asynchronous scheduling configuration remain unchanged.
+These synchronized capture boundaries are recorded in a source-hash-bound control
+receipt for all four workers. Exactly two complete, ordered, loss-free native
+executions must still match prefill–decode16, bound to the numerical receipt;
+the controller receipt cannot override native trace evidence.
+The full raw stream remains intact. Detailed rows retain both executions with
+their roles, while reported per-op/runtime/coverage metrics use the selected
+prefill only. This scope does not characterize the first prefill's transient
+activity or establish that every configured capture will pass the loss gates.
+Decode capture selects a later window in the canonical eight-token generation,
+at worker delay `B + 3`, allowing queued prefill work to drain. The manifest and
+summary record the selected window and profiler limits. Worker counts are not
+device request ordinals: exported executions must match the declared selected
+phase/bucket/count and any explicitly declared guard; all other mixed-phase or
+lossy captures fail.
+On a cold cache, a successful first numerical pass is retained as compile warmup
+and repeated once warm to bind the loaded executable bytes. Numerical failure
+is never retried.
+The executor reserves the whole chip, checks physical identity, mounts a reused
+run read-only, and applies `--memory-limit-gb` (default 60, maximum 60). Stock
+compiler caches stay under `SERVINGSTUDIO_NEURON_PROFILE_CACHE_DIR`. The default
+capture covers rank 0 and both physical cores; `--ranks 0,1,2,3` selects all ranks.
+Rank exports and analysis run serially. `--dma-buffer-mb` (default 256) and
+`--instruction-buffer-mb` (default 512) independently select 64, 128, 256, 512
+or 1024 MiB. The driver requires power-of-two notification queues. Event buffers
+are 64 MiB. Dropped notifications fail the capture
+and preserve logs. Larger buffers can fail device allocation and are never
+silently retried.
+
+`--debug-labels` compiles the same public configuration with debug metadata in
+an isolated cache, checks its sampled outputs, and transfers labels only through
+verified instruction identities. All timing evidence remains from the stock
+NEFF. The decoder and semantic source adapter require pinned compiler/source
+identities; ambiguous or unmatched instruction parents remain explicit. Debug
+label evidence distinguishes exact whole-function matches from conservative
+context-based inference. Debug compile timings are never used. Debug labels are
+recovered only for selected NEFFs; a guard with a different NEFF retains its stock
+instruction map.
+A previously generated map can be supplied via
+`--labels-map`: schema 1, `graphs` keyed by graph ID, with `neff_sha256`,
+`static_instructions`, `static_instructions_sha256`, plus
+`semantic_source_identity` for source-line labels. Paths are relative to the
+receipt unless absolute; every stock NEFF and static-map digest is checked.
+
+Saved captures need no accelerator:
+
+```bash
+uv run python -m launcher kernel-profile ops \
+  --from-capture /absolute/capture-manifest.json --output-dir /absolute/new-analysis
+```
+
+Offline replay checks every declared numerical/binary receipt digest and binds
+the captured NEFFs to those receipts. Missing or changed declared evidence fails.
+Older research manifests without receipts remain usable for diagnostics, with
+`quality.numerical_provenance.validated=false`; they do not establish numerical
+validation. Receipt verification does not rerun the numerical reference.
+
+Each result is a `km_` measurement with `summary.json`, per-execution/core
+`operations.csv`, the relocated capture manifest, and declared `neuron_ops.png`
+and `neuron_ops_coverage.png` plots. The coverage plot shows each engine's
+active-time fractions for model operation labels, compiler primitives with unknown
+model owners, and unresolved instructions as separate bars; those fractions may
+overlap. Compiler primitives do not count as known model operations.
+Legacy reports without engine coverage omit
+the second plot. The existing Analyzer displays runtime statistics and declared plots;
+the full per-op table remains in the JSON report and local CSV. Operation busy unions,
+exclusive/overlapping activity, engine wait and DMA completion latency retain
+their distinct meanings. Busy times overlap and cannot be summed into model
+latency; DMA completion latency includes queuing/dependencies and is not memory
+bus occupancy. Neither is registered as an additive `time_ms` cache row. The
+summary reports unresolved identities, inference evidence, and accounting/coverage
+gates. Without dynamic DGE metadata, DMA packets cannot be assigned to individual
+transfers; completion estimates use the declared semaphore/counter evidence and
+report unmatched transfers. The reports do not establish per-op critical-path or
+marginal speedup predictions. Preserve the original capture/cache and any reused
+numerical receipt directories alongside
+the result: the copied manifest uses absolute references to the raw evidence.
+These reports describe captured shapes; prediction for held-out or unseen shapes
+has not been validated.
+
 ## First-class Analyzer resources
 
 `python -m profiling run ... --output-dir X` and `... measure ... --output-dir X`

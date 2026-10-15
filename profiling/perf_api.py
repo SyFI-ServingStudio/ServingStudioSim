@@ -187,6 +187,13 @@ def measure_kernel(
     )
 
 
+def profile_ops(*args, **kwargs) -> dict:
+    """Capture or re-analyze per-op device evidence without accessing profile.db."""
+    from profiling.ops import profile_ops as run
+
+    return run(*args, **kwargs)
+
+
 def get_current_gpu_name() -> str:
     return _get_current_gpu_name()
 

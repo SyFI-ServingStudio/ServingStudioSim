@@ -50,6 +50,33 @@ A profiling run per context:
    its requested decode graph at least seven times, allowing one early decode
    at a smaller bucket that stock async scheduling can produce.
 
+## Per-operation diagnostics
+
+`launcher kernel-profile ops neuron_llama_forward --backend vllm_neuron` captures
+native instruction/DMA activity in the stock executable and emits operation
+JSON/CSV, detailed Parquet evidence, and Analyzer-compatible plots. See the
+[profiling guide](../profiling/README.md#per-operation-neuron-diagnostics) for
+capture commands, offline analysis, executable checks, and metric definitions.
+
+Hardware validation covers prefill512/decode16 at context512 and
+prefill1024/decode16 at context1024, on rank0 and both of its physical cores,
+for Llama 3.1 8B BF16 TP4. Accepted captures pass numerical/executable checks,
+native execution selection, trace-loss checks, and elapsed-time accounting.
+
+Compiler source metadata supplies operation labels. An isolated debug build
+recovers missing labels through checked instruction-byte matches; timestamps
+always come from the stock executable. Reports distinguish exact, inferred,
+compiler-primitive, and unresolved attribution. Source locations identify
+operation types; specific transformer layer-instance ownership is not verified.
+
+Per-op activity overlaps, so operation durations are not additive latency costs.
+Prefill capture adds output-completion waits around a selected prefill and a
+trailing decode guard, which is excluded from prefill aggregates. A controlled
+unprofiled/controller-only/profiled comparison has not been performed:
+zero overhead and fidelity to production timing remain unverified. Unseen-shape,
+critical-path and marginal-speedup prediction are unsupported. No timing database
+rows are read or written by this diagnostic path.
+
 ## Context ladder (C512-C8192)
 
 `presets/unified_llama3_8b_vllm_neuron_ladder.yaml` costs contexts 512..8192.

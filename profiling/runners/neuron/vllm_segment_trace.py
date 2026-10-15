@@ -441,20 +441,24 @@ def _stage_rank(profiles: Path, rank_dir: Path, stage: Path) -> None:
                 os.link(path, target)
 
 
-def export_device_sessions(profiles: Path, output: Path) -> list[Path]:
+def export_device_sessions(
+    profiles: Path, output: Path, *, include_ops: bool = False
+) -> list[Path]:
     """Export each rank's device session under ``profiles`` to Parquet, one per rank.
 
     A multi-rank directory can export every session into one flat directory,
     each overwriting the last, so every rank is staged and exported alone.
     Ranks run one after another: each export ingests a multi-GB raw trace, and
-    four concurrent exports exhausted host memory. Event and DMA traces are not
-    used by the rule and are skipped; this leaves ExecutionInfo, CcOp, Warning
-    and Instruction rows unchanged.
+    four concurrent exports exhausted host memory. The default segment rule
+    skips event, DMA and instruction hierarchy data. ``include_ops`` retains
+    those tables for per-operation attribution; the caller owns the process
+    memory bound and stricter dropped-notification checks.
     """
     ranks = sorted(path for path in profiles.glob("*_pid_*") if path.is_dir())
     if not ranks:
         raise SegmentTraceError(f"no rank device profile under {profiles}")
     sessions = []
+    output.mkdir(parents=True, exist_ok=True)
     for rank in ranks:
         stage = output / "staging" / rank.name
         _stage_rank(profiles, rank, stage)
@@ -463,10 +467,13 @@ def export_device_sessions(profiles: Path, output: Path) -> list[Path]:
         command = [
             "/opt/aws/neuron/bin/neuron-explorer", "view", "-d", str(stage),
             "--output-format", "parquet", "--output-file", str(parquet), "--ingest-only",
-            "--disable-ui", "--force", "--ignore-system-profile", "--ignore-event-trace",
-            "--ignore-dma-trace", "--ignore-nc-buf-usage", "--ignore-instruction-hierarchy",
+            "--disable-ui", "--force", "--ignore-system-profile", "--ignore-nc-buf-usage",
             "--processing-status-file", str(status),
         ]  # fmt: skip
+        if not include_ops:
+            command.extend(
+                ("--ignore-event-trace", "--ignore-dma-trace", "--ignore-instruction-hierarchy")
+            )
         with (output / f"{rank.name}.log").open("w") as log:
             code = subprocess.run(command, stdout=log, stderr=log).returncode
         report = json.loads(status.read_text()) if status.exists() else {"status_code": code}
