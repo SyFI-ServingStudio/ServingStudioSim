@@ -34,16 +34,15 @@ use std::path::{Path, PathBuf};
 
 use crate::common::{RequestId, SessionInput, Time};
 use crate::worker::config::PrefixTierReadWaitPolicy;
-use crate::worker::kv::{PrefixKv, PrefixTierHit, PrefixTierSpec, PrefixTiers};
+use crate::worker::kv::{PrefixKv, PrefixTierHit, PrefixTierSpec, PrefixTiers, ResumePoint};
 
 use super::AdmissionCandidate;
 
 /// One partition's tiers and log.
 pub(crate) struct SessionPrefixTiers {
     tiers: PrefixTiers,
-    /// HBM resumes a session only at multiples of this (a hybrid model's
-    /// state block; 1 for full attention), so a tier hit counts in it too.
-    hit_quantum: u32,
+    /// Where a context can be resumed from, the same in HBM and the tiers.
+    resume: ResumePoint,
     /// The longest context the run stored for each session, so `warm_start`
     /// can tell a pre-run context from an evicted one.
     stored: HashMap<u32, u64>,
@@ -69,7 +68,7 @@ impl SessionPrefixTiers {
         specs: &[PrefixTierSpec],
         kv_bytes_per_token: u64,
         state_tokens: u64,
-        hit_quantum: u32,
+        resume: ResumePoint,
         log_dir: Option<&Path>,
         tag: &str,
     ) -> Self {
@@ -86,8 +85,8 @@ impl SessionPrefixTiers {
             file
         });
         Self {
-            tiers: PrefixTiers::new(specs, kv_bytes_per_token, state_tokens),
-            hit_quantum: hit_quantum.max(1),
+            tiers: PrefixTiers::new(specs, kv_bytes_per_token, state_tokens, resume),
+            resume,
             stored: HashMap::new(),
             rows,
             summary_path: log_dir.map(|dir| dir.join(format!("prefix_tiers_{tag}.json"))),
@@ -103,19 +102,18 @@ impl SessionPrefixTiers {
         }
     }
 
-    /// Where a read of the session's declared prefix would come from, floored
-    /// to the HBM hit quantum; `seeded` when it is a pre-run context.
+    /// Where a read of the session's declared prefix would come from, and how
+    /// much of it resumes; `seeded` when it is a pre-run context.
     fn lookup(
         &self,
         session_id: u32,
         declared_tokens: u32,
         warm_start: bool,
     ) -> Option<(PrefixTierHit, bool)> {
-        let quantum = self.hit_quantum;
-        let floor = |tokens: u32| tokens / quantum * quantum;
         let stored = self.stored.get(&session_id).copied().unwrap_or(0);
         if warm_start && u64::from(declared_tokens) > stored + 1 && self.tiers.len() > 0 {
-            let tokens = floor(declared_tokens);
+            let declared = u64::from(declared_tokens);
+            let tokens = self.resume.reusable_tokens(declared, declared) as u32;
             return (tokens > 0).then_some((
                 PrefixTierHit {
                     tier: self.tiers.len() - 1,
@@ -126,16 +124,7 @@ impl SessionPrefixTiers {
         }
         self.tiers
             .lookup(session_id, declared_tokens)
-            .map(|hit| {
-                (
-                    PrefixTierHit {
-                        tokens: floor(hit.tokens),
-                        ..hit
-                    },
-                    false,
-                )
-            })
-            .filter(|(hit, _)| hit.tokens > 0)
+            .map(|hit| (hit, false))
     }
 
     pub(crate) fn store(&mut self, session_id: u32, tokens: u64) {
@@ -613,7 +602,7 @@ mod tests {
             ],
             1,
             0,
-            1,
+            ResumePoint::AnyToken,
             None,
             "test",
         )

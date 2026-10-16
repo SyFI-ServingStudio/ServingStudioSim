@@ -17,11 +17,14 @@
 //! Units are KV tokens of the most loaded GPU (the pipeline's
 //! `kv_bytes_per_token`). A hybrid model's entry also charges one recurrent
 //! state: a tier keeps the state at the context's end, the only one a session
-//! resumes from, not the per-block snapshots the HBM tier holds.
+//! resumes from, not the per-block snapshots the HBM tier holds. How much of an
+//! entry a lookup reuses follows the HBM tier's [`ResumePoint`].
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::common::Time;
+
+use super::prefix_cache::ResumePoint;
 
 /// One tier's size and read bandwidth, per GPU.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -117,15 +120,19 @@ pub(crate) struct PrefixTiers {
     tiers: Vec<PrefixTier>,
     /// One recurrent state in KV tokens (0 for a full-attention model).
     state_tokens: u64,
+    /// Where an entry can be resumed from.
+    resume: ResumePoint,
 }
 
 impl PrefixTiers {
     /// `kv_bytes_per_token`: one GPU's bytes per token; `state_tokens`: one
-    /// recurrent state in those tokens.
+    /// recurrent state in those tokens; `resume`: where an entry can be
+    /// resumed from.
     pub(crate) fn new(
         specs: &[PrefixTierSpec],
         kv_bytes_per_token: u64,
         state_tokens: u64,
+        resume: ResumePoint,
     ) -> Self {
         let bytes = kv_bytes_per_token.max(1) as f64;
         let tiers = specs
@@ -153,6 +160,7 @@ impl PrefixTiers {
         Self {
             tiers,
             state_tokens,
+            resume,
         }
     }
 
@@ -164,12 +172,13 @@ impl PrefixTiers {
         self.tiers.len()
     }
 
-    /// The fastest tier holding the most of `requested` tokens of the session.
+    /// The fastest tier whose entry for the session a prompt sharing
+    /// `requested` tokens with it reuses the most of.
     pub(crate) fn lookup(&self, session_id: u32, requested: u32) -> Option<PrefixTierHit> {
         let mut best: Option<PrefixTierHit> = None;
         for (tier, state) in self.tiers.iter().enumerate() {
             if let Some(&(tokens, _)) = state.entries.get(&session_id) {
-                let tokens = tokens.min(u64::from(requested)) as u32;
+                let tokens = self.resume.reusable_tokens(tokens, u64::from(requested)) as u32;
                 if tokens > 0 && best.is_none_or(|hit| tokens > hit.tokens) {
                     best = Some(PrefixTierHit { tier, tokens });
                 }
@@ -265,6 +274,7 @@ mod tests {
             ],
             1000,
             0,
+            ResumePoint::AnyToken,
         )
     }
 
@@ -346,6 +356,7 @@ mod tests {
             }],
             1000,
             50_000,
+            ResumePoint::ContextEnd,
         );
         t.store(1, 100_000);
         assert_eq!(t.used_tokens(0), 150_000);
@@ -361,5 +372,24 @@ mod tests {
         let ready = t.load(1, t.lookup(1, 400_000).unwrap(), 300_000, Time::ZERO);
         assert_eq!(ready, Time::from_ms(10.0));
         assert_eq!(t.counters(0).loaded_tokens, 100_000);
+    }
+
+    #[test]
+    fn a_hybrid_entry_serves_only_a_prompt_that_extends_it() {
+        let mut t = PrefixTiers::new(
+            &[PrefixTierSpec {
+                name: "dram",
+                capacity_gb_per_gpu: 1.0,
+                read_gb_per_s_per_gpu: 1.0,
+            }],
+            1000,
+            50_000,
+            ResumePoint::ContextEnd,
+        );
+        t.store(1, 100_000);
+        assert_eq!(t.lookup(1, 100_001).map(|hit| hit.tokens), Some(100_000));
+        // The state is at token 100_000 only: a prompt sharing fewer tokens
+        // computes from the start.
+        assert_eq!(t.lookup(1, 99_000), None);
     }
 }

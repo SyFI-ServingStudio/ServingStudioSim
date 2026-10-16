@@ -1,0 +1,31 @@
+# kda_dense: one layer (layers 1, 2)
+# Cost tree of one-request bring-up prefill, ms per prompt length. Sum adds its children, Scale{n} runs
+# its child n times, Max/Parallel{overlap} take the slowest child over the overlap. A zero row is a
+# branch this workload never takes (decode, or the shared-expert overlap at <= 256 tokens).
+# Scale{n=0} is an op the chosen backends do not need: the KDA beta sigmoid, which FlashInfer's KDA
+# prefill applies itself because it takes beta logits.
+
+                                                                                                     1k       2k       4k       8k      16k      32k      64k     128k
+Sum                                                                                               0.527    0.962    1.879    3.733    7.558   15.321   30.602   61.151
+  - pp.kda_dense.attn_mhc_post_pre  [mhc_fused_post_pre_rms_norm / deepgemm_mega_nonshifted]      0.027    0.048    0.090    0.178    0.350    0.685    1.387    2.792
+  Sum  pp.kda_dense.kda [TP rank; H=64, D=128]                                                    0.388    0.715    1.398    2.758    5.507   11.013   21.499   42.460
+    - pp.kda_dense.kda.in_proj  [single_gemm / torch_linear_vllm]                                 0.163    0.298    0.603    1.205    2.430    4.878    9.389   18.410
+    - pp.kda_dense.kda.f_b_proj  [single_gemm / torch_linear_vllm]                                0.007    0.012    0.015    0.030    0.056    0.116    0.238    0.483
+    - pp.kda_dense.kda.g_b_proj  [single_gemm / torch_linear_vllm]                                0.007    0.012    0.015    0.030    0.056    0.116    0.238    0.483
+    - pp.kda_dense.kda.short_conv_prefill  [gdn_causal_conv_prefill / dao_channellast]            0.025    0.047    0.091    0.180    0.357    0.715    1.423    2.826
+    - pp.kda_dense.kda.short_conv_decode  [gdn_causal_conv_decode / vllm_triton]                      -        -        -        -        -        -        -        -
+    Scale{n=0}  not launched with these backends                                                      -        -        -        -        -        -        -        -
+      - pp.kda_dense.kda.prefill_glue  [elementwise]                                              0.002    0.002    0.002    0.002    0.004    0.004    0.006    0.011
+    - pp.kda_dense.kda.state_gather  [elementwise]                                                0.004    0.004    0.004    0.004    0.004    0.004    0.004    0.004
+    - pp.kda_dense.kda.chunk_prefill  [kda_chunk_prefill / flashinfer_cute_persistent]            0.121    0.224    0.430    0.839    1.657    3.292    6.564   13.106
+    - pp.kda_dense.kda.recurrent_decode  [kda_recurrent_decode / vllm_triton]                         -        -        -        -        -        -        -        -
+    - pp.kda_dense.kda.state_scatter  [elementwise]                                               0.004    0.004    0.004    0.004    0.004    0.004    0.004    0.004
+    - pp.kda_dense.kda.gated_norm  [elementwise]                                                  0.008    0.014    0.029    0.057    0.112    0.226    0.444    0.881
+    - pp.kda_dense.kda.o_proj  [single_gemm / torch_linear_vllm]                                  0.049    0.100    0.209    0.410    0.831    1.663    3.196    6.263
+  - pp.kda_dense.ffn_mhc_post_pre  [mhc_fused_post_pre_rms_norm / deepgemm_mega_nonshifted]       0.027    0.048    0.090    0.178    0.350    0.685    1.387    2.792
+  Sum  pp.kda_dense.dense_ffn [TP rank; Nvfp4; H=4096, I=12288]                                   0.085    0.151    0.300    0.620    1.350    2.938    6.328   13.107
+    - pp.kda_dense.dense_ffn.gate_up_input_quant  [nvfp4_quant / vllm_cuda]                       0.003    0.005    0.009    0.016    0.030    0.059    0.115    0.228
+    - pp.kda_dense.dense_ffn.gate_up  [single_gemm / flashinfer_cutedsl]                          0.042    0.076    0.162    0.324    0.676    1.540    3.507    7.440
+    - pp.kda_dense.dense_ffn.act_and_mul  [elementwise]                                           0.012    0.022    0.041    0.084    0.167    0.337    0.669    1.332
+    - pp.kda_dense.dense_ffn.down_input_quant  [nvfp4_quant / vllm_cuda]                          0.007    0.012    0.021    0.040    0.079    0.159    0.318    0.637
+    - pp.kda_dense.dense_ffn.down  [single_gemm / flashinfer_cutedsl]                             0.021    0.037    0.068    0.156    0.398    0.843    1.719    3.470

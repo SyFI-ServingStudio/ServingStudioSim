@@ -53,7 +53,9 @@ pub enum PrefillChunkAlignment {
     /// (`Scheduler._mamba_block_aligned_split`).
     #[default]
     Checkpoint,
-    /// `min(remaining prompt, token budget)`: no checkpoint alignment.
+    /// `min(remaining prompt, token budget)`: no checkpoint alignment. A
+    /// retained context then keeps its recurrent state at its end only, so it is
+    /// reused whole by a prompt that extends it, or not at all.
     Plain,
 }
 

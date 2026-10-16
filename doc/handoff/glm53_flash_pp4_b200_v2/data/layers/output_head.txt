@@ -1,0 +1,13 @@
+# output_head: one layer
+# Cost tree of one-request bring-up prefill, ms per prompt length. Sum adds its children, Scale{n} runs
+# its child n times, Max/Parallel{overlap} take the slowest child over the overlap. A zero row is a
+# branch this workload never takes (decode, or the shared-expert overlap at <= 256 tokens).
+# Scale{n=0} is an op the chosen backends do not need: the KDA beta sigmoid, which FlashInfer's KDA
+# prefill applies itself because it takes beta logits.
+
+                                                                                                                1k       2k       4k       8k      16k      32k      64k     128k
+Sum  pp.main output head [terminal mHC post -> hc_contract mean -> final RMSNorm -> full-vocab lm_head]      0.227    0.247    0.289    0.373    0.538    0.863    1.481    2.716
+  - pp.final_mhc_post  [mhc_fused_post_pre_rms_norm / vllm_tilelang]                                         0.013    0.022    0.046    0.092    0.182    0.358    0.674    1.307
+  - pp.hc_contract_mean  [elementwise]                                                                       0.009    0.016    0.026    0.050    0.097    0.190    0.379    0.756
+  - pp.final_norm  [rms_norm / vllm_cuda]                                                                    0.005    0.009    0.018    0.031    0.060    0.116    0.228    0.454
+  - pp.lm_head  [single_gemm / torch_linear_vllm]                                                            0.199    0.199    0.199    0.199    0.199    0.199    0.199    0.199

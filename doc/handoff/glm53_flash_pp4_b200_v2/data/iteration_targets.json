@@ -1,0 +1,890 @@
+[
+ {
+  "prompt_tokens": 1024,
+  "ttft_ms": 51.94142150878906,
+  "stages": [
+   {
+    "stage": 0,
+    "start_ms": 0.0,
+    "compute_ms": 12.326406478881836,
+    "layers": {
+     "input_head": {
+      "count": 1,
+      "layer_ms": 0.014390284661203623,
+      "total_ms": 0.014390284661203623
+     },
+     "first_kda_dense": {
+      "count": 1,
+      "layer_ms": 0.5230142488144338,
+      "total_ms": 0.5230142488144338
+     },
+     "kda_dense": {
+      "count": 2,
+      "layer_ms": 0.526937201153487,
+      "total_ms": 1.053874402306974
+     },
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 1.23217142757494,
+      "total_ms": 3.69651428272482
+     },
+     "kda_moe": {
+      "count": 6,
+      "layer_ms": 1.173102162545547,
+      "total_ms": 7.038612975273281
+     }
+    }
+   },
+   {
+    "stage": 1,
+    "start_ms": 12.394217,
+    "compute_ms": 13.022262573242188,
+    "layers": {
+     "dsa_moe": {
+      "count": 2,
+      "layer_ms": 1.23217142757494,
+      "total_ms": 2.46434285514988
+     },
+     "kda_moe": {
+      "count": 9,
+      "layer_ms": 1.173102162545547,
+      "total_ms": 10.557919462909922
+     }
+    }
+   },
+   {
+    "stage": 2,
+    "start_ms": 25.48429,
+    "compute_ms": 13.081331253051758,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 1.23217142757494,
+      "total_ms": 3.69651428272482
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 1.173102162545547,
+      "total_ms": 9.384817300364375
+     }
+    }
+   },
+   {
+    "stage": 3,
+    "start_ms": 38.633432,
+    "compute_ms": 13.307990074157715,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 1.23217142757494,
+      "total_ms": 3.69651428272482
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 1.173102162545547,
+      "total_ms": 9.384817300364375
+     },
+     "output_head": {
+      "count": 1,
+      "layer_ms": 0.2266585249453783,
+      "total_ms": 0.2266585249453783
+     }
+    }
+   }
+  ],
+  "sends": [
+   {
+    "after_stage": 0,
+    "bytes": 33554432,
+    "ms": 0.06781052111816344
+   },
+   {
+    "after_stage": 1,
+    "bytes": 33554432,
+    "ms": 0.06781042675781457
+   },
+   {
+    "after_stage": 2,
+    "bytes": 33554432,
+    "ms": 0.06781074694823985
+   }
+  ]
+ },
+ {
+  "prompt_tokens": 2048,
+  "ttft_ms": 73.70185089111328,
+  "stages": [
+   {
+    "stage": 0,
+    "start_ms": 0.0,
+    "compute_ms": 18.029359817504883,
+    "layers": {
+     "input_head": {
+      "count": 1,
+      "layer_ms": 0.022730193100869656,
+      "total_ms": 0.022730193100869656
+     },
+     "first_kda_dense": {
+      "count": 1,
+      "layer_ms": 0.948853119276464,
+      "total_ms": 0.948853119276464
+     },
+     "kda_dense": {
+      "count": 2,
+      "layer_ms": 0.9623254155740142,
+      "total_ms": 1.9246508311480284
+     },
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 1.7760043832240626,
+      "total_ms": 5.328013149672188
+     },
+     "kda_moe": {
+      "count": 6,
+      "layer_ms": 1.6341853882186115,
+      "total_ms": 9.805112329311669
+     }
+    }
+   },
+   {
+    "stage": 1,
+    "start_ms": 18.150238,
+    "compute_ms": 18.25967788696289,
+    "layers": {
+     "dsa_moe": {
+      "count": 2,
+      "layer_ms": 1.7760043832240626,
+      "total_ms": 3.5520087664481252
+     },
+     "kda_moe": {
+      "count": 9,
+      "layer_ms": 1.6341853882186115,
+      "total_ms": 14.707668493967503
+     }
+    }
+   },
+   {
+    "stage": 2,
+    "start_ms": 36.530794,
+    "compute_ms": 18.40149688720703,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 1.7760043832240626,
+      "total_ms": 5.328013149672188
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 1.6341853882186115,
+      "total_ms": 13.073483105748892
+     }
+    }
+   },
+   {
+    "stage": 3,
+    "start_ms": 55.053169,
+    "compute_ms": 18.648685455322266,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 1.7760043832240626,
+      "total_ms": 5.328013149672188
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 1.6341853882186115,
+      "total_ms": 13.073483105748892
+     },
+     "output_head": {
+      "count": 1,
+      "layer_ms": 0.24718825612217188,
+      "total_ms": 0.24718825612217188
+     }
+    }
+   }
+  ],
+  "sends": [
+   {
+    "after_stage": 0,
+    "bytes": 67108864,
+    "ms": 0.12087818249511884
+   },
+   {
+    "after_stage": 1,
+    "bytes": 67108864,
+    "ms": 0.12087811303710794
+   },
+   {
+    "after_stage": 2,
+    "bytes": 67108864,
+    "ms": 0.12087811279296545
+   }
+  ]
+ },
+ {
+  "prompt_tokens": 4096,
+  "ttft_ms": 123.27771759033203,
+  "stages": [
+   {
+    "stage": 0,
+    "start_ms": 0.0,
+    "compute_ms": 30.944576263427734,
+    "layers": {
+     "input_head": {
+      "count": 1,
+      "layer_ms": 0.04439806658774614,
+      "total_ms": 0.04439806658774614
+     },
+     "first_kda_dense": {
+      "count": 1,
+      "layer_ms": 1.8518714560195804,
+      "total_ms": 1.8518714560195804
+     },
+     "kda_dense": {
+      "count": 2,
+      "layer_ms": 1.8786364300176501,
+      "total_ms": 3.7572728600353003
+     },
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 3.1277644066140056,
+      "total_ms": 9.383293219842017
+     },
+     "kda_moe": {
+      "count": 6,
+      "layer_ms": 2.651290163397789,
+      "total_ms": 15.907740980386734
+     }
+    }
+   },
+   {
+    "stage": 1,
+    "start_ms": 31.191103,
+    "compute_ms": 30.117141723632812,
+    "layers": {
+     "dsa_moe": {
+      "count": 2,
+      "layer_ms": 3.1277644066140056,
+      "total_ms": 6.255528813228011
+     },
+     "kda_moe": {
+      "count": 9,
+      "layer_ms": 2.651290163397789,
+      "total_ms": 23.8616114705801
+     }
+    }
+   },
+   {
+    "stage": 2,
+    "start_ms": 61.554771,
+    "compute_ms": 30.59361457824707,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 3.1277644066140056,
+      "total_ms": 9.383293219842017
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 2.651290163397789,
+      "total_ms": 21.210321307182312
+     }
+    }
+   },
+   {
+    "stage": 3,
+    "start_ms": 92.394912,
+    "compute_ms": 30.882802963256836,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 3.1277644066140056,
+      "total_ms": 9.383293219842017
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 2.651290163397789,
+      "total_ms": 21.210321307182312
+     },
+     "output_head": {
+      "count": 1,
+      "layer_ms": 0.28918835148215294,
+      "total_ms": 0.28918835148215294
+     }
+    }
+   }
+  ],
+  "sends": [
+   {
+    "after_stage": 0,
+    "bytes": 134217728,
+    "ms": 0.24652673657226387
+   },
+   {
+    "after_stage": 1,
+    "bytes": 134217728,
+    "ms": 0.2465262763671916
+   },
+   {
+    "after_stage": 2,
+    "bytes": 134217728,
+    "ms": 0.24652642175293238
+   }
+  ]
+ },
+ {
+  "prompt_tokens": 8192,
+  "ttft_ms": 223.59902954101562,
+  "stages": [
+   {
+    "stage": 0,
+    "start_ms": 0.0,
+    "compute_ms": 57.086483001708984,
+    "layers": {
+     "input_head": {
+      "count": 1,
+      "layer_ms": 0.08988559059798717,
+      "total_ms": 0.08988559059798717
+     },
+     "first_kda_dense": {
+      "count": 1,
+      "layer_ms": 3.6710411505773664,
+      "total_ms": 3.6710411505773664
+     },
+     "kda_dense": {
+      "count": 2,
+      "layer_ms": 3.73329493124038,
+      "total_ms": 7.46658986248076
+     },
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 5.863226294168271,
+      "total_ms": 17.589678882504813
+     },
+     "kda_moe": {
+      "count": 6,
+      "layer_ms": 4.711547910235822,
+      "total_ms": 28.269287461414933
+     }
+    }
+   },
+   {
+    "stage": 1,
+    "start_ms": 57.568145,
+    "compute_ms": 54.1303825378418,
+    "layers": {
+     "dsa_moe": {
+      "count": 2,
+      "layer_ms": 5.863226294168271,
+      "total_ms": 11.726452588336542
+     },
+     "kda_moe": {
+      "count": 9,
+      "layer_ms": 4.711547910235822,
+      "total_ms": 42.4039311921224
+     }
+    }
+   },
+   {
+    "stage": 2,
+    "start_ms": 112.180189,
+    "compute_ms": 55.28205871582031,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 5.863226294168271,
+      "total_ms": 17.589678882504813
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 4.711547910235822,
+      "total_ms": 37.69238328188658
+     }
+    }
+   },
+   {
+    "stage": 3,
+    "start_ms": 167.943909,
+    "compute_ms": 55.655113220214844,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 5.863226294168271,
+      "total_ms": 17.589678882504813
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 4.711547910235822,
+      "total_ms": 37.69238328188658
+     },
+     "output_head": {
+      "count": 1,
+      "layer_ms": 0.3730542063713074,
+      "total_ms": 0.3730542063713074
+     }
+    }
+   }
+  ],
+  "sends": [
+   {
+    "after_stage": 0,
+    "bytes": 268435456,
+    "ms": 0.48166199829101686
+   },
+   {
+    "after_stage": 1,
+    "bytes": 268435456,
+    "ms": 0.4816614621582005
+   },
+   {
+    "after_stage": 2,
+    "bytes": 268435456,
+    "ms": 0.4816612841796797
+   }
+  ]
+ },
+ {
+  "prompt_tokens": 16384,
+  "ttft_ms": 432.7367858886719,
+  "stages": [
+   {
+    "stage": 0,
+    "start_ms": 0.0,
+    "compute_ms": 111.72709655761719,
+    "layers": {
+     "input_head": {
+      "count": 1,
+      "layer_ms": 0.1847129724919796,
+      "total_ms": 0.1847129724919796
+     },
+     "first_kda_dense": {
+      "count": 1,
+      "layer_ms": 7.433395926840603,
+      "total_ms": 7.433395926840603
+     },
+     "kda_dense": {
+      "count": 2,
+      "layer_ms": 7.557530720718205,
+      "total_ms": 15.11506144143641
+     },
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 11.820563373854384,
+      "total_ms": 35.46169012156315
+     },
+     "kda_moe": {
+      "count": 6,
+      "layer_ms": 8.922039926983416,
+      "total_ms": 53.5322395619005
+     }
+    }
+   },
+   {
+    "stage": 1,
+    "start_ms": 112.679027,
+    "compute_ms": 103.93948364257812,
+    "layers": {
+     "dsa_moe": {
+      "count": 2,
+      "layer_ms": 11.820563373854384,
+      "total_ms": 23.641126747708768
+     },
+     "kda_moe": {
+      "count": 9,
+      "layer_ms": 8.922039926983416,
+      "total_ms": 80.29835934285074
+     }
+    }
+   },
+   {
+    "stage": 2,
+    "start_ms": 217.570441,
+    "compute_ms": 106.83800506591797,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 11.820563373854384,
+      "total_ms": 35.46169012156315
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 8.922039926983416,
+      "total_ms": 71.37631941586733
+     }
+    }
+   },
+   {
+    "stage": 3,
+    "start_ms": 325.360377,
+    "compute_ms": 107.37641906738281,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 11.820563373854384,
+      "total_ms": 35.46169012156315
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 8.922039926983416,
+      "total_ms": 71.37631941586733
+     },
+     "output_head": {
+      "count": 1,
+      "layer_ms": 0.5384126268327236,
+      "total_ms": 0.5384126268327236
+     }
+    }
+   }
+  ],
+  "sends": [
+   {
+    "after_stage": 0,
+    "bytes": 536870912,
+    "ms": 0.9519304423828174
+   },
+   {
+    "after_stage": 1,
+    "bytes": 536870912,
+    "ms": 0.9519303574218583
+   },
+   {
+    "after_stage": 2,
+    "bytes": 536870912,
+    "ms": 0.9519309340820712
+   }
+  ]
+ },
+ {
+  "prompt_tokens": 32768,
+  "ttft_ms": 848.1036987304688,
+  "stages": [
+   {
+    "stage": 0,
+    "start_ms": 0.0,
+    "compute_ms": 220.37457275390625,
+    "layers": {
+     "input_head": {
+      "count": 1,
+      "layer_ms": 0.37651753425598145,
+      "total_ms": 0.37651753425598145
+     },
+     "first_kda_dense": {
+      "count": 1,
+      "layer_ms": 15.080361080355942,
+      "total_ms": 15.080361080355942
+     },
+     "kda_dense": {
+      "count": 2,
+      "layer_ms": 15.321407032199204,
+      "total_ms": 30.642814064398408
+     },
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 23.323744828929193,
+      "total_ms": 69.97123448678758
+     },
+     "kda_moe": {
+      "count": 6,
+      "layer_ms": 17.38394692633301,
+      "total_ms": 104.30368155799806
+     }
+    }
+   },
+   {
+    "stage": 1,
+    "start_ms": 222.267042,
+    "compute_ms": 203.10299682617188,
+    "layers": {
+     "dsa_moe": {
+      "count": 2,
+      "layer_ms": 23.323744828929193,
+      "total_ms": 46.64748965785839
+     },
+     "kda_moe": {
+      "count": 9,
+      "layer_ms": 17.38394692633301,
+      "total_ms": 156.4555223369971
+     }
+    }
+   },
+   {
+    "stage": 2,
+    "start_ms": 427.262508,
+    "compute_ms": 209.04278564453125,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 23.323744828929193,
+      "total_ms": 69.97123448678758
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 17.38394692633301,
+      "total_ms": 139.07157541066408
+     }
+    }
+   },
+   {
+    "stage": 3,
+    "start_ms": 638.197763,
+    "compute_ms": 209.90591430664062,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 23.323744828929193,
+      "total_ms": 69.97123448678758
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 17.38394692633301,
+      "total_ms": 139.07157541066408
+     },
+     "output_head": {
+      "count": 1,
+      "layer_ms": 0.8631309270858765,
+      "total_ms": 0.8631309270858765
+     }
+    }
+   }
+  ],
+  "sends": [
+   {
+    "after_stage": 0,
+    "bytes": 1073741824,
+    "ms": 1.8924692460937536
+   },
+   {
+    "after_stage": 1,
+    "bytes": 1073741824,
+    "ms": 1.8924691738281467
+   },
+   {
+    "after_stage": 2,
+    "bytes": 1073741824,
+    "ms": 1.8924693554687337
+   }
+  ]
+ },
+ {
+  "prompt_tokens": 65536,
+  "ttft_ms": 1653.3076171875,
+  "stages": [
+   {
+    "stage": 0,
+    "start_ms": 0.0,
+    "compute_ms": 431.2196044921875,
+    "layers": {
+     "input_head": {
+      "count": 1,
+      "layer_ms": 0.7610142976045609,
+      "total_ms": 0.7610142976045609
+     },
+     "first_kda_dense": {
+      "count": 1,
+      "layer_ms": 30.11235608626157,
+      "total_ms": 30.11235608626157
+     },
+     "kda_dense": {
+      "count": 2,
+      "layer_ms": 30.601757128722966,
+      "total_ms": 61.20351425744593
+     },
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 45.29069044312928,
+      "total_ms": 135.87207132938784
+     },
+     "kda_moe": {
+      "count": 6,
+      "layer_ms": 33.87844768632203,
+      "total_ms": 203.2706861179322
+     }
+    }
+   },
+   {
+    "stage": 1,
+    "start_ms": 434.993152,
+    "compute_ms": 395.4873962402344,
+    "layers": {
+     "dsa_moe": {
+      "count": 2,
+      "layer_ms": 45.29069044312928,
+      "total_ms": 90.58138088625856
+     },
+     "kda_moe": {
+      "count": 9,
+      "layer_ms": 33.87844768632203,
+      "total_ms": 304.9060291768983
+     }
+    }
+   },
+   {
+    "stage": 2,
+    "start_ms": 834.254096,
+    "compute_ms": 406.8996276855469,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 45.29069044312928,
+      "total_ms": 135.87207132938784
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 33.87844768632203,
+      "total_ms": 271.02758149057627
+     }
+    }
+   },
+   {
+    "stage": 3,
+    "start_ms": 1244.927271,
+    "compute_ms": 408.3804016113281,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 45.29069044312928,
+      "total_ms": 135.87207132938784
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 33.87844768632203,
+      "total_ms": 271.02758149057627
+     },
+     "output_head": {
+      "count": 1,
+      "layer_ms": 1.4807841330766678,
+      "total_ms": 1.4807841330766678
+     }
+    }
+   }
+  ],
+  "sends": [
+   {
+    "after_stage": 0,
+    "bytes": 2147483648,
+    "ms": 3.773547507812509
+   },
+   {
+    "after_stage": 1,
+    "bytes": 2147483648,
+    "ms": 3.77354775976562
+   },
+   {
+    "after_stage": 2,
+    "bytes": 2147483648,
+    "ms": 3.7735473144531397
+   }
+  ]
+ },
+ {
+  "prompt_tokens": 131072,
+  "ttft_ms": 3331.796875,
+  "stages": [
+   {
+    "stage": 0,
+    "start_ms": 0.0,
+    "compute_ms": 871.4802856445312,
+    "layers": {
+     "input_head": {
+      "count": 1,
+      "layer_ms": 1.5300078392028809,
+      "total_ms": 1.5300078392028809
+     },
+     "first_kda_dense": {
+      "count": 1,
+      "layer_ms": 60.16533457208425,
+      "total_ms": 60.16533457208425
+     },
+     "kda_dense": {
+      "count": 2,
+      "layer_ms": 61.151445974595845,
+      "total_ms": 122.30289194919169
+     },
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 95.44782069895882,
+      "total_ms": 286.34346209687646
+     },
+     "kda_moe": {
+      "count": 6,
+      "layer_ms": 66.85643704701215,
+      "total_ms": 401.1386222820729
+     }
+    }
+   },
+   {
+    "stage": 1,
+    "start_ms": 879.015989,
+    "compute_ms": 792.603515625,
+    "layers": {
+     "dsa_moe": {
+      "count": 2,
+      "layer_ms": 95.44782069895882,
+      "total_ms": 190.89564139791764
+     },
+     "kda_moe": {
+      "count": 9,
+      "layer_ms": 66.85643704701215,
+      "total_ms": 601.7079334231094
+     }
+    }
+   },
+   {
+    "stage": 2,
+    "start_ms": 1679.155208,
+    "compute_ms": 821.1949462890625,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 95.44782069895882,
+      "total_ms": 286.34346209687646
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 66.85643704701215,
+      "total_ms": 534.8514963760972
+     }
+    }
+   },
+   {
+    "stage": 3,
+    "start_ms": 2507.885858,
+    "compute_ms": 823.9110107421875,
+    "layers": {
+     "dsa_moe": {
+      "count": 3,
+      "layer_ms": 95.44782069895882,
+      "total_ms": 286.34346209687646
+     },
+     "kda_moe": {
+      "count": 8,
+      "layer_ms": 66.85643704701215,
+      "total_ms": 534.8514963760972
+     },
+     "output_head": {
+      "count": 1,
+      "layer_ms": 2.716090589761734,
+      "total_ms": 2.716090589761734
+     }
+    }
+   }
+  ],
+  "sends": [
+   {
+    "after_stage": 0,
+    "bytes": 4294967296,
+    "ms": 7.5357033554687405
+   },
+   {
+    "after_stage": 1,
+    "bytes": 4294967296,
+    "ms": 7.535703374999912
+   },
+   {
+    "after_stage": 2,
+    "bytes": 4294967296,
+    "ms": 7.535703710937696
+   }
+  ]
+ }
+]
