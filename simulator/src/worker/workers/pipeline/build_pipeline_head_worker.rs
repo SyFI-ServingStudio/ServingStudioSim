@@ -12,7 +12,7 @@ use crate::worker::admission::{
 use crate::worker::config::MicrobatchSizing;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::{FullAttnKv, HybridGdnKv, PrefixCacheConfig};
+use crate::worker::kv::{FullAttnKv, HybridGdnKv, PrefixCacheConfig, ResumePoint};
 use crate::worker::types::WorkerConfig;
 use crate::worker::workers::iter_build_essentials::{
     full_attention_token_capacity, prepare_iter_build_essentials,
@@ -46,7 +46,13 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         "a pipeline stage runs on one GPU"
     );
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
-    let prefix_tiers = head_prefix_tiers(&config, &layout, 1, cost_log_dir.as_deref(), id);
+    let prefix_tiers = head_prefix_tiers(
+        &config,
+        &layout,
+        ResumePoint::AnyToken,
+        cost_log_dir.as_deref(),
+        id,
+    );
     let kv_capacity = full_attention_token_capacity(1, layout.kv_bytes_per_token, &config);
     let prefix_cache =
         config
@@ -140,8 +146,8 @@ pub struct PipelineHybridState {
     /// vLLM's Mamba `align` mode: with prefix caching on, every non-final
     /// chunk ends on a `block_tokens` boundary, and a retained prefix keeps one
     /// state per block and resumes at the last one. `false` chunks plainly and
-    /// reuses exactly: a retained prefix keeps the state at its end and resumes
-    /// at any token.
+    /// keeps one state at a retained prefix's end: a hit is the whole prefix
+    /// when the prompt extends it, else nothing.
     pub align_mode: bool,
 }
 
@@ -163,7 +169,8 @@ impl PipelineHybridState {
 /// each request its fixed state blocks on top of its context. With prefix
 /// caching on and `hybrid.align_mode` set (vLLM's Mamba `align`
 /// mode), every non-final chunk ends on a `block_tokens` boundary and prefix
-/// hits floor to it; otherwise chunks are plain and reuse is exact.
+/// hits floor to it; otherwise chunks are plain and a hit is a whole retained
+/// context, resumed from the state at its end.
 ///
 /// Context is charged by the token, not rounded up to whole blocks, so a
 /// request's charge is low by less than one block.
@@ -200,9 +207,11 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         &config,
         &layout,
         if hybrid.align_mode {
-            hybrid.block_tokens
+            ResumePoint::EveryInterval {
+                tokens: hybrid.block_tokens,
+            }
         } else {
-            1
+            ResumePoint::ContextEnd
         },
         cost_log_dir.as_deref(),
         id,
@@ -255,7 +264,7 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     let kv_store = if hybrid.align_mode {
         kv_store
     } else {
-        kv_store.with_exact_prefix_reuse()
+        kv_store.with_end_state_reuse()
     };
     let admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
@@ -314,7 +323,7 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
 fn head_prefix_tiers(
     config: &WorkerConfig,
     layout: &PipelineLayout,
-    hit_quantum: u32,
+    resume: ResumePoint,
     log_dir: Option<&std::path::Path>,
     id: WorkerId,
 ) -> Option<SessionPrefixTiers> {
@@ -326,7 +335,7 @@ fn head_prefix_tiers(
             layout
                 .tier_state_bytes_per_request
                 .div_ceil(layout.tier_kv_bytes_per_token.max(1)),
-            hit_quantum,
+            resume,
             log_dir,
             &format!("w{}", id.0),
         )

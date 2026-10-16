@@ -335,8 +335,10 @@ leave a long prompt waiting for hours under a saturated closed loop
 
 A hybrid head (`HybridGdnKv`) follows `prefill_chunk_alignment`. `checkpoint` is
 vLLM's Mamba `align` mode: non-final chunks end on the KV block and prefix hits
-floor to it, one state per block. `plain` chunks plainly and reuses exactly: a
-retained session keeps its context and the state at its end.
+floor to it, one state per block. `plain` chunks plainly and keeps one state per
+retained session, at its context's end: a hit is the whole context when the
+prompt extends it, and nothing when the prompt ends inside it. The tiers follow
+the same rule (`ResumePoint` in `kv/shared/prefix_cache.rs`).
 
 Behind HBM's retained tier a head can keep host DRAM and SSD tiers
 (`dram_tier_gb`, `ssd_tier_gb`, per GPU, with read bandwidths). They are
@@ -382,7 +384,7 @@ The hybrid `chunked_prefill` worker (DP attention included) takes the same
 session on the rank it last ran on (`ChunkedPrefillAdmission::with_sticky_sessions`);
 `SessionTierWorker` (`workers/iter/session_tier_worker.rs`) wraps the shell to
 write finished contexts through and run `external_decode`. There `plain` alignment also
-means exact prefix reuse.
+means one state at a retained context's end, reused whole or not at all.
 
 `PipelineStageWorker` has no KV/admission axes. It runs microbatches FIFO,
 double-buffering one activation pull against one compute, at exact times derived

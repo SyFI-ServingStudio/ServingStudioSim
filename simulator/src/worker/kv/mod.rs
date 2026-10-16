@@ -16,8 +16,8 @@ mod shared;
 
 pub use full_attn::FullAttnKv;
 pub use hybrid_gdn::HybridGdnKv;
-pub(crate) use shared::prefix_cache::PrefixCacheTokenConfig;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
+pub(crate) use shared::prefix_cache::{PrefixCacheTokenConfig, ResumePoint};
 pub use shared::prefix_tiers::PrefixTierSpec;
 pub(crate) use shared::prefix_tiers::{PrefixTierHit, PrefixTiers};
 

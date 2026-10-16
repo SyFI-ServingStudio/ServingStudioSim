@@ -38,8 +38,9 @@
 //! per-snapshot charge, so a retained prefix pays for the snapshots that make it
 //! resumable.
 //!
-//! [`HybridGdnKv::with_exact_prefix_reuse`] leaves that engine limitation out:
-//! a retained entry keeps the state at its end and resumes at any token.
+//! [`HybridGdnKv::with_end_state_reuse`] keeps one state per retained entry
+//! instead, at its end, and no snapshots inside it: the entry is reused whole by
+//! a prompt that extends it, and not at all by one that ends inside it.
 //!
 //! ## Not modeled
 //!
@@ -670,16 +671,16 @@ impl HybridGdnKv {
         }
     }
 
-    /// Exact prefix reuse, the engine vLLM's `align` mode works around: a
-    /// retained session keeps its context and the state at its end, so a hit
-    /// resumes at any token instead of the last checkpoint, and costs one state
-    /// instead of one per checkpoint. Live decodes then leave no snapshots
-    /// behind either.
-    pub(crate) fn with_exact_prefix_reuse(mut self) -> Self {
+    /// One state per retained session, at its context's end: a hit is the
+    /// whole context when the prompt extends it, and nothing when the prompt
+    /// ends inside it (no snapshot exists there). It costs one state instead
+    /// of one per checkpoint, and live decodes leave no snapshots behind
+    /// either.
+    pub(crate) fn with_end_state_reuse(mut self) -> Self {
         let state_tokens = self.state_tokens_per_request;
         self.prefix_caches = std::mem::take(&mut self.prefix_caches)
             .into_iter()
-            .map(|cache| cache.with_entry_charge(state_tokens))
+            .map(|cache| cache.with_end_state(state_tokens))
             .collect();
         self.checkpoint_interval_tokens = 0;
         self
@@ -1134,5 +1135,23 @@ mod tests {
         assert_eq!(kv_store.prefix_caches[0].peek(7, 137), 137);
         assert_eq!(kv_store.prefix_caches[0].used_charge(), 137);
         assert_eq!(kv_store.clamped_live_checkpoint_charge(0), 0);
+    }
+
+    #[test]
+    fn end_state_reuse_hits_a_whole_context_or_nothing() {
+        let mut kv_store =
+            store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL).with_end_state_reuse();
+        kv_store.prefix_caches[0].insert(7, 5_000, 10_000_000, None);
+        assert_eq!(
+            kv_store.prefix_caches[0].used_charge(),
+            5_000 + STATE_TOKENS,
+            "one state at the end, no snapshots inside"
+        );
+        assert_eq!(kv_store.prefix_caches[0].peek(7, 5_001), 5_000);
+        assert_eq!(
+            kv_store.prefix_caches[0].peek(7, 4_999),
+            0,
+            "no state inside the context to resume from"
+        );
     }
 }

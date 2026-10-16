@@ -13,13 +13,46 @@
 //! `charge_per_checkpoint` for every snapshot it keeps. Both knobs are
 //! constructor parameters; `(1, 0)` is exactly the pre-hybrid behavior.
 //!
-//! An engine that keeps the state at a context's end instead (exact reuse,
-//! [`PrefixCache::with_entry_charge`]) resumes at any token: quantum one, and
-//! each entry pays one `charge_per_entry` for its final state.
+//! An engine that keeps the state only at a context's end instead
+//! ([`PrefixCache::with_end_state`]) can resume only there: a later prompt
+//! reuses the whole retained context when it extends it, and nothing when it
+//! shares less, since no state exists inside the context. Each entry pays one
+//! `charge_per_entry` for that final state. [`ResumePoint`] states the three
+//! rules.
 
 use std::collections::{BTreeSet, HashMap};
 
 use serde::Deserialize;
+
+/// Where a retained context can be resumed from, which decides how much of it a
+/// later prompt that shares `declared` tokens with it reuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResumePoint {
+    /// Per-token KV only (full attention): any prefix of the context.
+    AnyToken,
+    /// Recurrent state saved every `tokens` tokens (vLLM's Mamba `align`
+    /// mode): the longest shared multiple of `tokens`.
+    EveryInterval { tokens: u32 },
+    /// Recurrent state saved only at the context's end: the whole context when
+    /// the prompt extends it, and nothing when the prompt ends inside it.
+    ContextEnd,
+}
+
+impl ResumePoint {
+    /// Tokens of a `kept`-token context a prompt sharing `declared` tokens with
+    /// it resumes from.
+    pub(crate) fn reusable_tokens(self, kept: u64, declared: u64) -> u64 {
+        match self {
+            Self::AnyToken => kept.min(declared),
+            Self::EveryInterval { tokens } => {
+                let interval = u64::from(tokens.max(1));
+                kept.min(declared) / interval * interval
+            }
+            Self::ContextEnd if kept <= declared => kept,
+            Self::ContextEnd => 0,
+        }
+    }
+}
 
 /// Whether completed-session KV may be retained after a request finishes.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -174,11 +207,14 @@ pub(crate) struct PrefixCache {
     /// stays O(1) inside the eviction loops.
     used_checkpoints: u64,
     policy: PrefixCachePolicy,
-    /// Reuse granularity in context tokens. `1` = any prefix length is reusable.
+    /// Retention granularity in context tokens: an entry keeps whole quanta.
     quantum_tokens: u64,
+    /// Where a retained entry can be resumed from.
+    resume: ResumePoint,
     /// Extra occupancy every retained snapshot costs on top of its context KV.
     charge_per_checkpoint: u64,
-    /// Extra occupancy every entry costs: the one state at its end (exact reuse).
+    /// Extra occupancy every entry costs: the one state at its end
+    /// ([`Self::with_end_state`]).
     charge_per_entry: u64,
     entries: HashMap<u32, PrefixEntry>,
     /// `entries` ordered by the policy's eviction key, session id last, so the
@@ -201,6 +237,13 @@ impl PrefixCache {
             used_checkpoints: 0,
             policy,
             quantum_tokens: u64::from(quantum_tokens.max(1)),
+            resume: if quantum_tokens > 1 {
+                ResumePoint::EveryInterval {
+                    tokens: quantum_tokens,
+                }
+            } else {
+                ResumePoint::AnyToken
+            },
             charge_per_checkpoint,
             charge_per_entry: 0,
             entries: HashMap::new(),
@@ -209,11 +252,13 @@ impl PrefixCache {
         }
     }
 
-    /// Exact reuse: every entry keeps one `charge` state at its end, so any
-    /// prefix length is resumable. Replaces the snapshot quantum and charge.
-    pub(crate) fn with_entry_charge(mut self, charge: u64) -> Self {
-        assert!(self.entries.is_empty(), "set the entry charge before use");
+    /// State only at a context's end: every entry keeps one `charge` state at
+    /// its end and nothing inside, so it is reused whole by a prompt that
+    /// extends it, or not at all. Replaces the snapshot quantum and charge.
+    pub(crate) fn with_end_state(mut self, charge: u64) -> Self {
+        assert!(self.entries.is_empty(), "set the end state before use");
         self.quantum_tokens = 1;
+        self.resume = ResumePoint::ContextEnd;
         self.charge_per_checkpoint = 0;
         self.charge_per_entry = charge;
         self
@@ -236,11 +281,6 @@ impl PrefixCache {
             + self.entries.len() as u64 * self.charge_per_entry
     }
 
-    /// Round a length down to the coarsest boundary this cache can resume from.
-    fn floor_to_quantum(&self, tokens: u64) -> u64 {
-        tokens / self.quantum_tokens * self.quantum_tokens
-    }
-
     /// Occupancy a quantized `tokens` would add: the context KV plus one charge
     /// for each snapshot inside it.
     fn charge_of(&self, tokens: u64) -> u64 {
@@ -251,10 +291,15 @@ impl PrefixCache {
     /// The largest quantized length not exceeding `tokens` whose charge fits
     /// `capacity`. Each retained snapshot costs `quantum + charge_per_checkpoint`,
     /// so the count is a plain division; at quantum one with no charge this is
-    /// `min(tokens, capacity)`, the pre-hybrid rule.
+    /// `min(tokens, capacity)`, the pre-hybrid rule. A context resumable only
+    /// at its end is kept whole or not at all: a cut-off part has no state.
     fn largest_fitting_length(&self, tokens: u64, capacity: u64) -> u64 {
-        if self.charge_per_entry > 0 {
-            return tokens.min(capacity.saturating_sub(self.charge_per_entry));
+        if self.resume == ResumePoint::ContextEnd {
+            return if self.charge_of(tokens) <= capacity {
+                tokens
+            } else {
+                0
+            };
         }
         let per_checkpoint = self.quantum_tokens + self.charge_per_checkpoint;
         let checkpoints = (tokens / self.quantum_tokens).min(capacity / per_checkpoint);
@@ -263,16 +308,15 @@ impl PrefixCache {
 
     /// Pure preview used by admission's token-budget and capacity gates.
     ///
-    /// A request declaring `requested_tokens` can only resume at a boundary it
-    /// shares with the retained entry, so the hit is the smaller of the two
-    /// quantized lengths. At quantum one this is the plain `min`.
+    /// A request declaring `requested_tokens` can only resume at a point it
+    /// shares with the retained entry ([`ResumePoint::reusable_tokens`]).
     pub(crate) fn peek(&self, session_id: u32, requested_tokens: u32) -> u32 {
         self.entries
             .get(&session_id)
             .map(|entry| {
-                entry
-                    .tokens
-                    .min(self.floor_to_quantum(u64::from(requested_tokens))) as u32
+                self.resume
+                    .reusable_tokens(entry.tokens, u64::from(requested_tokens))
+                    as u32
             })
             .unwrap_or(0)
     }
@@ -599,16 +643,55 @@ mod tests {
     }
 
     #[test]
-    fn exact_reuse_resumes_at_any_token_and_charges_one_state_per_entry() {
+    fn end_state_reuses_the_whole_context_or_nothing() {
         let mut cache =
-            PrefixCache::new(10_000, PrefixCachePolicy::Lru, 1_000, 500).with_entry_charge(500);
+            PrefixCache::new(10_000, PrefixCachePolicy::Lru, 1_000, 500).with_end_state(500);
         cache.insert(1, 2_345, 10_000, None);
-        assert_eq!(cache.peek(1, 2_340), 2_340);
         assert_eq!(cache.used_charge(), 2_845);
+        // A prompt that extends the kept context resumes from its end state.
+        assert_eq!(cache.peek(1, 2_345), 2_345);
+        assert_eq!(cache.peek(1, 2_346), 2_345);
+        // One that ends inside it has no state to resume from.
+        assert_eq!(cache.peek(1, 2_344), 0);
+        assert_eq!(cache.take(1, 1_000).hit_tokens, 0);
+        assert_eq!(cache.used_charge(), 0, "the unusable entry is consumed");
+    }
+
+    #[test]
+    fn end_state_charges_one_state_per_entry_and_keeps_entries_whole() {
+        let mut cache =
+            PrefixCache::new(10_000, PrefixCachePolicy::Lru, 1_000, 500).with_end_state(500);
+        cache.insert(1, 2_345, 10_000, None);
         // A second entry needs its own state: 6_000 + 500 does not fit beside
         // 2_845, so session 1 is evicted.
         cache.insert(2, 6_000, 9_000, None);
         assert_eq!(cache.peek(1, 2_345), 0);
         assert_eq!(cache.used_charge(), 6_500);
+        // A context larger than the room left is not cut to fit: a cut-off part
+        // has no state at its end.
+        let result = cache.insert(3, 8_000, 8_000, None);
+        assert_eq!(result.retained_tokens, 0);
+        assert_eq!(cache.peek(3, 8_000), 0);
+    }
+
+    #[test]
+    fn resume_points_bound_what_a_shorter_prompt_reuses() {
+        assert_eq!(ResumePoint::AnyToken.reusable_tokens(5_000, 3_210), 3_210);
+        assert_eq!(
+            ResumePoint::EveryInterval { tokens: 1_000 }.reusable_tokens(5_000, 3_210),
+            3_000
+        );
+        assert_eq!(ResumePoint::ContextEnd.reusable_tokens(5_000, 3_210), 0);
+        for rule in [
+            ResumePoint::AnyToken,
+            ResumePoint::EveryInterval { tokens: 1_000 },
+            ResumePoint::ContextEnd,
+        ] {
+            assert_eq!(
+                rule.reusable_tokens(5_000, 5_001),
+                5_000,
+                "{rule:?}: a prompt extending the context reuses all of it"
+            );
+        }
     }
 }

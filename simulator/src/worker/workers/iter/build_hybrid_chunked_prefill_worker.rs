@@ -7,8 +7,9 @@
 //! Mamba `align` cache mode, which only checkpoints state at block boundaries and
 //! therefore ends every non-final prefill chunk on one; the lifecycle gets the
 //! arch's checkpoint interval as its chunk-end quantum to match, unless the
-//! selector asks for `plain` chunking. `plain` also reuses prefixes exactly
-//! (one state at a retained entry's end, `HybridGdnKv::with_exact_prefix_reuse`).
+//! selector asks for `plain` chunking. `plain` keeps one state at a retained
+//! entry's end instead (`HybridGdnKv::with_end_state_reuse`): a hit is the whole
+//! entry when the prompt extends it, else nothing.
 //!
 //! The selector's DRAM/SSD tiers go to the admission (one set per attention DP
 //! rank, read when a request reaches the head of its rank's queue, bounded by
@@ -29,7 +30,7 @@ use crate::worker::config::DpPlacement;
 use crate::worker::config::PrefillChunkAlignment;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::{HybridGdnKv, PrefixCacheConfig};
+use crate::worker::kv::{HybridGdnKv, PrefixCacheConfig, ResumePoint};
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{HybridChunkedPrefillWorker, IterBatchWorker};
@@ -82,8 +83,17 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         "hybrid chunked prefill: recurrent state shares the attention capacity"
     );
 
-    let exact_reuse = checkpoint_interval_tokens > 0
+    let end_state_reuse = checkpoint_interval_tokens > 0
         && config.prefill_chunk_alignment == PrefillChunkAlignment::Plain;
+    let resume = if checkpoint_interval_tokens == 0 {
+        ResumePoint::AnyToken
+    } else if end_state_reuse {
+        ResumePoint::ContextEnd
+    } else {
+        ResumePoint::EveryInterval {
+            tokens: checkpoint_interval_tokens,
+        }
+    };
     // One tier set per DP rank, sized and read per GPU of the rank.
     let tier_specs: Vec<_> = config.prefix_tiers.iter().flatten().copied().collect();
     let tiers: Vec<SessionPrefixTiers> = if tier_specs.is_empty() {
@@ -92,18 +102,13 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         let bytes_per_gpu = model
             .total_kv_bytes_per_token()
             .div_ceil(u64::from(model.num_attn_shards().max(1)));
-        let hit_quantum = if exact_reuse || checkpoint_interval_tokens == 0 {
-            1
-        } else {
-            checkpoint_interval_tokens
-        };
         (0..num_partitions)
             .map(|rank| {
                 SessionPrefixTiers::new(
                     &tier_specs,
                     bytes_per_gpu,
                     state_tokens_per_request,
-                    hit_quantum,
+                    resume,
                     cost_log_dir.as_deref(),
                     &format!("w{}_p{rank}", id.0),
                 )
@@ -140,8 +145,8 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
-    let kv_store = if exact_reuse {
-        kv_store.with_exact_prefix_reuse()
+    let kv_store = if end_state_reuse {
+        kv_store.with_end_state_reuse()
     } else {
         kv_store
     };
