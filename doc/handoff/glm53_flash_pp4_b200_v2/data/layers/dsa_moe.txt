@@ -1,0 +1,70 @@
+# dsa_moe: one layer (layers 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43)
+# Cost tree of one-request bring-up prefill, ms per prompt length. Sum adds its children, Scale{n} runs
+# its child n times, Max/Parallel{overlap} take the slowest child over the overlap. A zero row is a
+# branch this workload never takes (decode, or the shared-expert overlap at <= 256 tokens).
+# Scale{n=0} is an op the chosen backends do not need: the KDA beta sigmoid, which FlashInfer's KDA
+# prefill applies itself because it takes beta logits.
+
+                                                                                                         1k       2k       4k       8k      16k      32k      64k     128k
+Sum                                                                                                   1.232    1.776    3.128    5.863   11.821   23.324   45.291   95.448
+  - pp.dsa_moe.attn_mhc_post_pre  [mhc_fused_post_pre_rms_norm / deepgemm_mega_nonshifted]            0.027    0.048    0.090    0.178    0.350    0.685    1.387    2.792
+  Sum  pp.dsa_moe.dsa [TP rank; H=64, index heads=32 replicated, kpool top-2048 x 4]                  0.448    0.857    1.875    3.910    8.406   16.953   32.911   71.051
+    - pp.dsa_moe.dsa.fused_qkv_a  [single_gemm / torch_linear_vllm]                                   0.014    0.024    0.048    0.099    0.189    0.385    0.765    1.527
+    - pp.dsa_moe.dsa.q_kv_a_norm  [q_kv_rms_norm / vllm_triton]                                       0.004    0.007    0.012    0.023    0.044    0.087    0.172    0.342
+    - pp.dsa_moe.dsa.q_b_proj  [single_gemm / torch_linear_vllm]                                      0.035    0.070    0.144    0.297    0.605    1.225    2.353    4.608
+    - pp.dsa_moe.dsa.indexer.wq_b  [single_gemm / torch_linear_vllm]                                  0.012    0.020    0.035    0.068    0.140    0.285    0.570    1.142
+    - pp.dsa_moe.dsa.indexer.wk_weights  [single_gemm / torch_linear_vllm]                            0.007    0.012    0.009    0.015    0.026    0.049    0.101    0.206
+    - pp.dsa_moe.dsa.indexer.head_weights  [gemm_fp32_output / torch_cublas]                          0.020    0.033    0.061    0.103    0.128    0.198    0.403    0.813
+    - pp.dsa_moe.dsa.indexer.k_norm  [elementwise]                                                    0.002    0.002    0.002    0.004    0.004    0.004    0.006    0.011
+    - pp.dsa_moe.dsa.indexer.q_fwht_quant  [elementwise]                                              0.010    0.017    0.034    0.072    0.144    0.291    0.575    1.143
+    - pp.dsa_moe.dsa.indexer.weight_scale  [elementwise]                                              0.002    0.002    0.002    0.002    0.002    0.003    0.004    0.007
+    - pp.dsa_moe.dsa.indexer.kpool_gate_score  [single_gemm / torch_linear_vllm]                      0.007    0.008    0.009    0.014    0.024    0.049    0.092    0.179
+    Scale{n=2}                                                                                        0.005    0.007    0.008    0.008    0.012    0.018    0.032    0.061
+      - pp.dsa_moe.dsa.indexer.prefill_gather  [elementwise]                                          0.002    0.004    0.004    0.004    0.006    0.009    0.016    0.030
+    - pp.dsa_moe.dsa.indexer.kpool_decode_update  [elementwise]                                           -        -        -        -        -        -        -        -
+    - pp.dsa_moe.dsa.indexer.kpool_prefill_write  [elementwise]                                       0.002    0.002    0.002    0.002    0.003    0.004    0.007    0.013
+    - pp.dsa_moe.dsa.indexer.kpool_tail_seed  [elementwise]                                           0.001    0.001    0.002    0.002    0.002    0.002    0.002    0.002
+    - pp.dsa_moe.dsa.indexer.mqa_logits_decode  [dsa_paged_mqa_logits_decode / deepgemm_fp8]              -        -        -        -        -        -        -        -
+    - pp.dsa_moe.dsa.indexer.topk_decode  [dsa_persistent_topk_decode / vllm_cuda]                        -        -        -        -        -        -        -        -
+    - pp.dsa_moe.dsa.indexer.mqa_logits_prefill  [dsa_mqa_logits_prefill / deepgemm_fp8]                  -        -    0.045    0.146    0.571    1.141    2.374    8.801
+    - pp.dsa_moe.dsa.indexer.topk_prefill  [dsa_topk_prefill / deep_select|vllm_cuda]                     -        -    0.050    0.129    0.549    1.098    1.523    4.635
+    - pp.dsa_moe.dsa.indexer.expand_pools  [elementwise]                                                  -        -    0.010    0.020    0.035    0.074    0.151    0.304
+    - pp.dsa_moe.dsa.q_absorb  [batched_gemm / torch_mla_q_absorb_no_rope]                            0.020    0.038    0.078    0.162    0.340    0.695    1.370    2.719
+    - pp.dsa_moe.dsa.q_concat  [elementwise]                                                              -        -        -        -        -        -        -        -
+    - pp.dsa_moe.dsa.q_fp8_quant  [elementwise]                                                       0.015    0.029    0.057    0.114    0.227    0.450    0.898    1.794
+    Sum                                                                                               0.106    0.272    0.684    1.504    3.147    6.454   12.900   25.793
+      - pp.dsa_moe.dsa.sparse_mla.mla_cache_append  [mla_cache_append / vllm_cuda]                    0.004    0.006    0.009    0.017    0.040    0.086    0.170    0.338
+      - pp.dsa_moe.dsa.sparse_mla.index_remap  [dsa_sparse_index_remap / vllm_triton]                 0.020    0.036    0.070    0.137    0.268    0.530    1.054    2.103
+      - pp.dsa_moe.dsa.sparse_mla.prefill  [dsa_sparse_mla_attention / flashinfer_trtllm_fp8]         0.082    0.230    0.605    1.350    2.839    5.838   11.676   23.353
+      - pp.dsa_moe.dsa.sparse_mla.decode  [dsa_sparse_mla_attention / flashinfer_trtllm_fp8]              -        -        -        -        -        -        -        -
+    - pp.dsa_moe.dsa.output_copy  [elementwise]                                                           -        -        -        -        -        -        -        -
+    - pp.dsa_moe.dsa.v_up  [batched_gemm / torch_mla_v_up_unpadded]                                   0.022    0.038    0.071    0.143    0.290    0.591    1.095    2.104
+    - pp.dsa_moe.dsa.o_proj  [single_gemm / torch_linear_vllm]                                        0.101    0.196    0.399    0.807    1.584    3.163    6.173   12.193
+    Scale{n=17}                                                                                       0.034    0.035    0.038    0.038    0.038    0.061    0.065    0.072
+      - pp.dsa_moe.dsa.glue  [elementwise]                                                            0.002    0.002    0.002    0.002    0.002    0.004    0.004    0.004
+    Scale{n=8}                                                                                        0.031    0.046    0.076    0.140    0.302    0.628    1.280    2.583
+      - pp.dsa_moe.dsa.prefill_glue  [elementwise]                                                    0.004    0.006    0.010    0.018    0.038    0.079    0.160    0.323
+  - pp.dsa_moe.ffn_mhc_post_pre  [mhc_fused_post_pre_rms_norm / deepgemm_mega_nonshifted]             0.027    0.048    0.090    0.178    0.350    0.685    1.387    2.792
+  Sum  pp.dsa_moe.moe (MoE) [EP1 ranked ranks; shared expert overlaps routed at T<=256]               0.732    0.823    1.072    1.598    2.714    5.001    9.605   18.812
+    Sum  pp.dsa_moe.moe.router [gate computed twice]                                                  0.016    0.017    0.022    0.041    0.067    0.136    0.277    0.559
+      - pp.dsa_moe.moe.router.gate  [gemm_fp32_output / torch_cublas]                                 0.008    0.009    0.011    0.020    0.034    0.068    0.139    0.280
+      - pp.dsa_moe.moe.router.gate_recompute  [gemm_fp32_output / torch_cublas]                       0.008    0.009    0.011    0.020    0.034    0.068    0.139    0.280
+    - pp.dsa_moe.moe.input_glue  [elementwise]                                                        0.004    0.006    0.009    0.016    0.034    0.073    0.150    0.305
+    Max{overlap=1.0}  pp.dsa_moe.moe.ep_ranks (max over EP ranks)                                     0.707    0.791    1.027    1.513    2.556    4.679    8.951   17.494
+      Sum                                                                                             0.707    0.791    1.027    1.513    2.556    4.679    8.951   17.494
+        Parallel{overlap=0.9}                                                                             -        -        -        -        -        -        -        -
+          Sum  pp.dsa_moe.moe.shared_expert [TP rank; Bf16; H=4096, I=2048]                               -        -        -        -        -        -        -        -
+            - pp.dsa_moe.moe.shared_expert.gate_up  [single_gemm / torch_linear_vllm]                     -        -        -        -        -        -        -        -
+            - pp.dsa_moe.moe.shared_expert.act_and_mul  [elementwise]                                     -        -        -        -        -        -        -        -
+            - pp.dsa_moe.moe.shared_expert.down  [single_gemm / torch_linear_vllm]                        -        -        -        -        -        -        -        -
+          Sum  pp.dsa_moe.moe.routed_rank0 [EP1 ranked rank 0; 288 local experts, top-8]                  -        -        -        -        -        -        -        -
+            - pp.dsa_moe.moe.routed_rank0.input_quant  [nvfp4_quant / vllm_cuda]                          -        -        -        -        -        -        -        -
+            - pp.dsa_moe.moe.routed_rank0.fused_moe  [nvfp4_fused_moe / flashinfer_trtllm_sm100]          -        -        -        -        -        -        -        -
+        Sum  pp.dsa_moe.moe.routed_rank0 [EP1 ranked rank 0; 288 local experts, top-8]                0.666    0.713    0.877    1.220    1.961    3.511    6.578   12.712
+          - pp.dsa_moe.moe.routed_rank0.input_quant  [nvfp4_quant / vllm_cuda]                        0.003    0.004    0.009    0.015    0.030    0.058    0.114    0.225
+          - pp.dsa_moe.moe.routed_rank0.fused_moe  [nvfp4_fused_moe / flashinfer_trtllm_sm100]        0.663    0.709    0.868    1.205    1.931    3.453    6.464   12.487
+        Sum  pp.dsa_moe.moe.shared_expert [TP rank; Bf16; H=4096, I=2048]                             0.042    0.077    0.150    0.292    0.595    1.169    2.373    4.782
+          - pp.dsa_moe.moe.shared_expert.gate_up  [single_gemm / torch_linear_vllm]                   0.024    0.048    0.098    0.186    0.378    0.721    1.499    3.056
+          - pp.dsa_moe.moe.shared_expert.act_and_mul  [elementwise]                                   0.003    0.004    0.008    0.014    0.029    0.057    0.112    0.222
+          - pp.dsa_moe.moe.shared_expert.down  [single_gemm / torch_linear_vllm]                      0.015    0.025    0.044    0.092    0.188    0.391    0.761    1.503
+    - pp.dsa_moe.moe.combine_glue  [elementwise]                                                      0.004    0.008    0.014    0.029    0.057    0.112    0.226    0.454
