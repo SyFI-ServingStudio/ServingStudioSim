@@ -82,6 +82,34 @@ pub(crate) struct PrefixTierCounters {
     pub(crate) loaded_tokens: u64,
 }
 
+/// What happened to a tier's entry for a session, for the optional event log
+/// ([`PrefixTiers::record_events`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrefixTierEventKind {
+    /// The entry now holds `tokens`; it held `prev_tokens` before.
+    Write,
+    /// LRU eviction of the entry's `tokens`.
+    Evict,
+    /// A context larger than the tier: the entry's `prev_tokens` are dropped
+    /// and nothing is written.
+    TooLarge,
+    /// The session's next round cut the entry from `prev_tokens` to `tokens`
+    /// (`0`: dropped); it shares `declared` tokens with the context.
+    Cut,
+    /// A read of the entry's first `tokens`; `prev_tokens` of them HBM held.
+    Read,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrefixTierEvent {
+    pub(crate) at: Time,
+    pub(crate) kind: PrefixTierEventKind,
+    pub(crate) session_id: u32,
+    pub(crate) tokens: u64,
+    pub(crate) prev_tokens: u64,
+    pub(crate) declared: u64,
+}
+
 /// The window of [`PrefixTier::window_writes`].
 pub(crate) const WRITE_WINDOW: Time = Time::from_ms_u64(10_000);
 
@@ -102,9 +130,30 @@ struct PrefixTier {
     /// Per [`WRITE_WINDOW`] of the clock: (entries stored, tokens written).
     window_writes: Vec<(u64, u64)>,
     clock: Time,
+    events: Option<Vec<PrefixTierEvent>>,
 }
 
 impl PrefixTier {
+    fn log(
+        &mut self,
+        kind: PrefixTierEventKind,
+        session_id: u32,
+        tokens: u64,
+        prev_tokens: u64,
+        declared: u64,
+    ) {
+        if let Some(events) = &mut self.events {
+            events.push(PrefixTierEvent {
+                at: self.clock,
+                kind,
+                session_id,
+                tokens,
+                prev_tokens,
+                declared,
+            });
+        }
+    }
+
     fn charge(&self, tokens: u64, state_tokens: u64) -> u64 {
         tokens + state_tokens
     }
@@ -149,6 +198,7 @@ impl PrefixTier {
         let previous = self.remove(session_id, state_tokens).unwrap_or(0);
         let charge = self.charge(tokens, state_tokens);
         if charge > self.capacity {
+            self.log(PrefixTierEventKind::TooLarge, session_id, 0, previous, 0);
             return vec![(session_id, tokens)];
         }
         let mut left = Vec::new();
@@ -161,6 +211,7 @@ impl PrefixTier {
             let evicted = self.remove(victim, state_tokens).unwrap();
             self.counters.evicted_entries += 1;
             self.counters.evicted_tokens += evicted;
+            self.log(PrefixTierEventKind::Evict, victim, evicted, evicted, 0);
             left.push((victim, evicted));
         }
         self.entries.insert(session_id, (tokens, self.next_stamp));
@@ -175,6 +226,7 @@ impl PrefixTier {
         }
         self.window_writes[window].0 += 1;
         self.window_writes[window].1 += tokens.saturating_sub(previous);
+        self.log(PrefixTierEventKind::Write, session_id, tokens, previous, 0);
         left
     }
 }
@@ -220,6 +272,7 @@ impl PrefixTiers {
                     counters: PrefixTierCounters::default(),
                     window_writes: Vec::new(),
                     clock: Time::ZERO,
+                    events: None,
                 }
             })
             .collect();
@@ -279,6 +332,13 @@ impl PrefixTiers {
         tier.counters.loads += 1;
         tier.counters.loaded_tokens += u64::from(hit.tokens.saturating_sub(resident_tokens));
         tier.touch(session_id);
+        tier.log(
+            PrefixTierEventKind::Read,
+            session_id,
+            u64::from(hit.tokens),
+            u64::from(resident_tokens),
+            0,
+        );
         for faster in 0..hit.tier {
             if self.tiers[faster].spec.writes == PrefixTierWrites::EveryContext {
                 self.store_in(faster, session_id, u64::from(hit.tokens));
@@ -371,6 +431,22 @@ impl PrefixTiers {
         &self.tiers[tier].window_writes
     }
 
+    /// Keep every write, eviction, cut and read of each tier from now on.
+    pub(crate) fn record_events(&mut self) {
+        for tier in &mut self.tiers {
+            tier.events.get_or_insert_with(Vec::new);
+        }
+    }
+
+    /// The events `tier` kept since the last call.
+    pub(crate) fn take_events(&mut self, tier: usize) -> Vec<PrefixTierEvent> {
+        self.tiers[tier]
+            .events
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
     /// The session's next round shares `declared` tokens with its previous
     /// context: cut a victim tier's older entry to what that round can resume
     /// from, so it stays a prefix of the session's latest context.
@@ -382,11 +458,11 @@ impl PrefixTiers {
                 continue;
             }
             if let Some(&(tokens, _)) = tier.entries.get(&session_id) {
-                tier.truncate(
-                    session_id,
-                    resume.reusable_tokens(tokens, declared),
-                    state_tokens,
-                );
+                let kept = resume.reusable_tokens(tokens, declared);
+                if kept < tokens {
+                    tier.log(PrefixTierEventKind::Cut, session_id, kept, tokens, declared);
+                }
+                tier.truncate(session_id, kept, state_tokens);
             }
         }
     }
@@ -777,5 +853,41 @@ mod tests {
         t.store_evicted(3, 300_000); // pushes 1 down to SSD
         assert_eq!(t.window_writes(0), [(1, 400_000), (0, 0), (2, 700_000)]);
         assert_eq!(t.window_writes(1), [(0, 0), (0, 0), (1, 400_000)]);
+    }
+
+    #[test]
+    fn the_event_log_keeps_writes_evictions_cuts_and_reads() {
+        use PrefixTierEventKind::*;
+        let mut t = chain(1.0, 10.0);
+        t.record_events();
+        t.store_evicted(1, 400_000);
+        t.store_evicted(2, 400_000);
+        t.store_evicted(3, 400_000); // 1 goes to SSD
+        t.load(1, t.lookup(1, 400_000).unwrap(), 100, Time::ZERO);
+        t.drop_stale(1, 300_000);
+        let kinds = |events: Vec<PrefixTierEvent>| {
+            events
+                .iter()
+                .map(|e| (e.kind, e.session_id, e.tokens, e.prev_tokens))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds(t.take_events(0)),
+            [
+                (Write, 1, 400_000, 0),
+                (Write, 2, 400_000, 0),
+                (Evict, 1, 400_000, 400_000),
+                (Write, 3, 400_000, 0)
+            ]
+        );
+        assert_eq!(
+            kinds(t.take_events(1)),
+            [
+                (Write, 1, 400_000, 0),
+                (Read, 1, 400_000, 100),
+                (Cut, 1, 300_000, 400_000)
+            ]
+        );
+        assert!(t.take_events(1).is_empty());
     }
 }

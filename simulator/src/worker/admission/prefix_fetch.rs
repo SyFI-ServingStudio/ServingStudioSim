@@ -56,6 +56,8 @@ pub(crate) struct SessionPrefixTiers {
     /// can tell a pre-run context from an evicted one.
     stored: HashMap<u32, u64>,
     rows: Option<BufWriter<File>>,
+    /// Every write, eviction, cut and read of each tier.
+    events: Option<BufWriter<File>>,
     summary_path: Option<PathBuf>,
     /// Session requests admitted, their declared prefix tokens, and where
     /// those were found: HBM, each tier, or nowhere.
@@ -93,11 +95,28 @@ impl SessionPrefixTiers {
             .expect("write the prefix tier log");
             file
         });
+        let events = log_dir.map(|dir| {
+            let mut file = BufWriter::new(
+                File::create(dir.join(format!("prefix_tier_events_{tag}.csv")))
+                    .expect("create the prefix tier event log"),
+            );
+            writeln!(
+                file,
+                "time_ms,tier,event,session_id,tokens,prev_tokens,declared"
+            )
+            .expect("write the prefix tier event log");
+            file
+        });
+        let mut tiers = PrefixTiers::new(specs, kv_bytes_per_token, state_tokens, resume);
+        if events.is_some() {
+            tiers.record_events();
+        }
         Self {
-            tiers: PrefixTiers::new(specs, kv_bytes_per_token, state_tokens, resume),
+            tiers,
             resume,
             stored: HashMap::new(),
             rows,
+            events,
             summary_path: log_dir.map(|dir| dir.join(format!("prefix_tiers_{tag}.json"))),
             requests: 0,
             declared_tokens: 0,
@@ -166,7 +185,32 @@ impl SessionPrefixTiers {
         self.tiers.queue_wait(hit.tier, now)
     }
 
+    /// Append the tiers' events since the last call to the event log.
+    fn write_events(&mut self) {
+        let Some(file) = &mut self.events else {
+            return;
+        };
+        for tier in 0..self.tiers.len() {
+            let name = self.tiers.tier_name(tier);
+            for e in self.tiers.take_events(tier) {
+                writeln!(
+                    file,
+                    "{:.3},{},{},{},{},{},{}",
+                    e.at.as_ms(),
+                    name,
+                    format!("{:?}", e.kind).to_lowercase(),
+                    e.session_id,
+                    e.tokens,
+                    e.prev_tokens,
+                    e.declared,
+                )
+                .expect("write the prefix tier event log");
+            }
+        }
+    }
+
     fn record_admission(&mut self, request: RequestId, session_id: u32, admission: Admitted) {
+        self.write_events();
         self.requests += 1;
         self.declared_tokens += u64::from(admission.declared_tokens);
         self.resident_tokens += u64::from(admission.resident_tokens);
@@ -219,6 +263,10 @@ impl Drop for SessionPrefixTiers {
     fn drop(&mut self) {
         if let Some(rows) = &mut self.rows {
             let _ = rows.flush();
+        }
+        self.write_events();
+        if let Some(events) = &mut self.events {
+            let _ = events.flush();
         }
         let Some(path) = &self.summary_path else {
             return;
