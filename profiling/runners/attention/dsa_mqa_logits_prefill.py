@@ -34,6 +34,8 @@ _KEY_TILE = 256
 # on Hopper, sm100_mqa_logits on Blackwell (the fp8/fp4 kernel vLLM's
 # fp8_fp4_mqa_logits launches). This call launches no other *_mqa_logits kernel.
 _DEEPGEMM_KERNEL_NAME = "_mqa_logits"
+_FP8_E4M3_MAX = 448.0
+_OPERAND_SEED = 0
 
 
 @dataclass(frozen=True)
@@ -168,14 +170,16 @@ def _mqa_logits_entry_point(deep_gemm: Any) -> Any:
     return None
 
 
-def _stable_values(torch: Any, shape: tuple[int, ...], *, phase: int, device: str) -> Any:
-    """Create deterministic, finite FP32 values with both signs."""
-    total = 1
-    for dimension in shape:
-        total *= dimension
-    values = torch.arange(total, dtype=torch.int64, device=device)
-    values = ((values + phase) % 17 - 8).to(torch.float32) / 16.0
-    return values.reshape(shape)
+def _fp8_quantized(torch: Any, values: Any) -> tuple[Any, Any]:
+    """FP8-quantize the last dimension with a power-of-two scale per row.
+
+    This is vLLM's indexer quantization (`indexer_k_quant_and_cache` with
+    ue8m0 scales, and the query's per-token-head scale in
+    `fused_indexer_q_rope_quant`): scale = 2^ceil(log2(amax / 448)).
+    """
+    amax = values.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / _FP8_E4M3_MAX)))
+    return (values / scale).to(torch.float8_e4m3fn), scale.squeeze(-1)
 
 
 def _build_operands(
@@ -187,29 +191,21 @@ def _build_operands(
     head_dim: int,
     device: str,
 ) -> _DsaMqaLogitsPrefillOperands:
-    """Build exact contiguous GLM tensors and causal-tail span metadata."""
-    q = _stable_values(
-        torch,
-        (num_queries, num_heads, head_dim),
-        phase=1,
-        device=device,
-    ).to(torch.float8_e4m3fn)
-    k = _stable_values(
-        torch,
-        (num_keys, head_dim),
-        phase=5,
-        device=device,
-    ).to(torch.float8_e4m3fn)
-    k_scale = 0.75 + (torch.arange(num_keys, dtype=torch.float32, device=device) % 7) / 16.0
-    weights = (
-        _stable_values(
-            torch,
-            (num_queries, num_heads),
-            phase=9,
-            device=device,
-        )
-        / 4.0
-    )
+    """Build exact contiguous GLM tensors and causal-tail span metadata.
+
+    Seeded standard-normal q, k and head weights, quantized as vLLM's indexer
+    quantizes them; the query scale is folded into the weights as
+    `fused_indexer_q_rope_quant` does. The FP8 codes span the whole E4M3 range,
+    as in serving.
+    """
+    generator = torch.Generator(device=device).manual_seed(_OPERAND_SEED)
+
+    def standard_normal(shape: tuple[int, ...]) -> Any:
+        return torch.randn(shape, generator=generator, dtype=torch.float32, device=device)
+
+    q, q_scale = _fp8_quantized(torch, standard_normal((num_queries, num_heads, head_dim)))
+    k, k_scale = _fp8_quantized(torch, standard_normal((num_keys, head_dim)))
+    weights = standard_normal((num_queries, num_heads)) * q_scale * (num_heads * head_dim) ** -0.5
     k_start = torch.zeros(num_queries, dtype=torch.int32, device=device)
     k_end = torch.arange(
         num_keys - num_queries + 1,
