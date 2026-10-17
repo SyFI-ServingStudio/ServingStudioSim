@@ -315,6 +315,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         prefix_tier_loading,
         force_schedule_after_ms,
         force_schedule_hits_first,
+        force_schedule_hits_first_when_at_risk,
         external_decode,
         recurrent_state_checkpoints,
         recurrent_state_anchors,
@@ -388,6 +389,9 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
     if *force_schedule_hits_first && !(*force_schedule_after_ms > 0.0 && *srpt) {
         bail!("pp: force_schedule_hits_first needs force_schedule_after_ms > 0 and srpt");
     }
+    if *force_schedule_hits_first_when_at_risk && !*force_schedule_hits_first {
+        bail!("pp: force_schedule_hits_first_when_at_risk needs force_schedule_hits_first");
+    }
     crate::worker::config::check_read_wait(
         "pp",
         *prefix_tier_max_read_wait_ms,
@@ -416,6 +420,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         prefix_tier_loading: *prefix_tier_loading,
         force_schedule_after_ms: *force_schedule_after_ms,
         force_schedule_hits_first: *force_schedule_hits_first,
+        force_schedule_hits_first_when_at_risk: *force_schedule_hits_first_when_at_risk,
         external_decode: *external_decode,
         recurrent_state_checkpoints: *recurrent_state_checkpoints,
         recurrent_state_anchors: *recurrent_state_anchors,

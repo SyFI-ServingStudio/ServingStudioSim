@@ -1521,7 +1521,9 @@ mod tests {
         // prompt, whose footprint evicts session 7, so round 1 recomputes;
         // hits first admits round 1 on its context first.
         use crate::worker::admission::PendingOrderKind;
-        for (hits_first, hit) in [(false, 0), (true, 50)] {
+        // Gated on an at-risk tier context, hits first stays off without
+        // tiers: oldest first.
+        for (hits_first, gated, hit) in [(false, false, 0), (true, false, 50), (true, true, 0)] {
             let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
             as_session(&store, 0, 7, 0, 0.0);
             as_session(&store, 1, 8, 0, 4.0);
@@ -1535,6 +1537,7 @@ mod tests {
                     srpt: true,
                     force_schedule_after_ms: 2.0,
                     force_schedule_hits_first: hits_first,
+                    force_schedule_hits_first_when_at_risk: gated,
                     ..WorkerConfig::default()
                 },
             );
@@ -1549,13 +1552,13 @@ mod tests {
                 Time::from_ms(80.0),
                 &mut events,
             );
-            assert_eq!(completed(&events).len(), 3, "hits_first={hits_first}");
+            assert_eq!(completed(&events).len(), 3, "hits_first={hits_first} gated={gated}");
             assert_eq!(
                 store.borrow()[RequestId(2)]
                     .telemetry
                     .prefix_cache_hit_tokens,
                 Some(hit),
-                "hits_first={hits_first}"
+                "hits_first={hits_first} gated={gated}"
             );
         }
     }

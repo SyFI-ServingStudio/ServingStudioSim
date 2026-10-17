@@ -1008,6 +1008,16 @@ impl PrefixFetch {
         self
     }
 
+    /// Sessions of `partition` whose tier context `horizon` more written
+    /// tokens would evict everywhere (`PrefixTiers::at_risk_sessions`), and
+    /// whether HBM's evictions go to a victim tier (an HBM-resident context
+    /// then survives HBM's own evictions).
+    pub(crate) fn at_risk_sessions(&mut self, partition: u16, horizon: u64) -> (Vec<u32>, bool) {
+        self.take_hbm_evictions();
+        let tiers = &self.partitions[usize::from(partition)].tiers;
+        (tiers.at_risk_sessions(horizon), tiers.takes_hbm_evictions())
+    }
+
     /// What a cache-aware order ranks the request by: the longer of HBM's
     /// `hbm_tokens` and what a tier would read back.
     pub(crate) fn rank_tokens(

@@ -9,7 +9,7 @@
 //! or chunked-prefill DP rank with srpt also runs overdue started prompts
 //! before the others (`srpt.rs`).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use crate::common::{RequestId, Time};
 
@@ -29,6 +29,11 @@ pub(crate) struct OverdueQueue {
     /// first; `overdue` then holds the other overdue requests.
     overdue_hits: Vec<VecDeque<AdmissionCandidate>>,
     hits_first: bool,
+    /// With [`Self::with_compute_tracking`]: the requests in `overdue`, and
+    /// per partition the prefill tokens they compute (prompt less the prefix
+    /// held when they became overdue).
+    tracked: Option<HashSet<RequestId>>,
+    overdue_compute_tokens: Vec<u64>,
 }
 
 impl OverdueQueue {
@@ -41,7 +46,53 @@ impl OverdueQueue {
             overdue_prompt_tokens: Vec::new(),
             overdue_hits: Vec::new(),
             hits_first: false,
+            tracked: None,
+            overdue_compute_tokens: Vec::new(),
         }
+    }
+
+    /// Track which requests wait in the oldest-first overdue queue and the
+    /// prefill tokens they will compute ([`Self::compute_tokens`]).
+    pub(crate) fn with_compute_tracking(mut self) -> Self {
+        self.tracked = Some(HashSet::new());
+        self
+    }
+
+    /// Prefill tokens `partition`'s oldest-first overdue requests compute.
+    pub(crate) fn compute_tokens(&self, partition: u16) -> u64 {
+        self.overdue_compute_tokens
+            .get(usize::from(partition))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn track_in(&mut self, partition: usize, candidate: &AdmissionCandidate) {
+        if let Some(tracked) = self.tracked.as_mut() {
+            tracked.insert(candidate.request_id);
+            self.overdue_compute_tokens[partition] += u64::from(
+                candidate
+                    .fresh_prompt_tokens
+                    .saturating_sub(candidate.resident_prefix_tokens),
+            );
+        }
+    }
+
+    fn track_out(&mut self, partition: usize, candidate: &AdmissionCandidate) {
+        if let Some(tracked) = self.tracked.as_mut() {
+            tracked.remove(&candidate.request_id);
+            self.overdue_compute_tokens[partition] -= u64::from(
+                candidate
+                    .fresh_prompt_tokens
+                    .saturating_sub(candidate.resident_prefix_tokens),
+            );
+        }
+    }
+
+    /// Whether `request` waits in the oldest-first overdue queue (tracked).
+    pub(crate) fn is_tracked(&self, request: RequestId) -> bool {
+        self.tracked
+            .as_ref()
+            .is_some_and(|tracked| tracked.contains(&request))
     }
 
     /// Split the overdue requests by cost class: a request whose session's
@@ -57,12 +108,19 @@ impl OverdueQueue {
         self.hits_first
     }
 
+    /// Turn the hits-first split on or off from now on; requests already in
+    /// the hits queue keep going first.
+    pub(crate) fn set_hits_first(&mut self, on: bool) {
+        self.hits_first = on;
+    }
+
     fn ensure(&mut self, partition: usize) {
         if self.arrivals.len() <= partition {
             self.arrivals.resize_with(partition + 1, VecDeque::new);
             self.overdue.resize_with(partition + 1, VecDeque::new);
             self.overdue_hits.resize_with(partition + 1, VecDeque::new);
             self.overdue_prompt_tokens.resize(partition + 1, 0);
+            self.overdue_compute_tokens.resize(partition + 1, 0);
         }
     }
 
@@ -90,17 +148,18 @@ impl OverdueQueue {
         policy: &mut P,
         now: Time,
     ) {
-        self.promote_classified(partition, policy, now, |_| false);
+        self.promote_classified(partition, policy, now, |_| 0);
     }
 
-    /// [`Self::promote`], putting the requests `is_hit` accepts in the hits
-    /// queue when hits go first.
+    /// [`Self::promote`], given the prefix tokens `held` finds in HBM or a
+    /// tier for a request: with hits first, a request with some goes in the
+    /// hits queue; with compute tracking, they are what it does not compute.
     pub(crate) fn promote_classified<P: PendingOrderPolicy>(
         &mut self,
         partition: u16,
         policy: &mut P,
         now: Time,
-        mut is_hit: impl FnMut(&AdmissionCandidate) -> bool,
+        mut held: impl FnMut(&AdmissionCandidate) -> u32,
     ) {
         let partition = usize::from(partition);
         self.ensure(partition);
@@ -109,11 +168,15 @@ impl OverdueQueue {
                 break;
             }
             self.arrivals[partition].pop_front();
-            if let Some(candidate) = policy.remove(request) {
+            if let Some(mut candidate) = policy.remove(request) {
                 self.overdue_prompt_tokens[partition] += u64::from(candidate.fresh_prompt_tokens);
-                if self.hits_first && is_hit(&candidate) {
+                if self.tracked.is_some() {
+                    candidate.resident_prefix_tokens = held(&candidate);
+                }
+                if self.hits_first && held(&candidate) > 0 {
                     self.overdue_hits[partition].push_back(candidate);
                 } else {
+                    self.track_in(partition, &candidate);
                     self.overdue[partition].push_back(candidate);
                 }
             }
@@ -149,7 +212,11 @@ impl OverdueQueue {
             .filter(|queue| !queue.is_empty());
         let candidate = match hits {
             Some(queue) => queue.pop_front()?,
-            None => self.overdue.get_mut(index)?.pop_front()?,
+            None => {
+                let candidate = self.overdue.get_mut(index)?.pop_front()?;
+                self.track_out(index, &candidate);
+                candidate
+            }
         };
         self.overdue_prompt_tokens[usize::from(partition)] -=
             u64::from(candidate.fresh_prompt_tokens);
@@ -164,17 +231,27 @@ impl OverdueQueue {
         if hit {
             self.overdue_hits[partition].push_front(candidate);
         } else {
+            self.track_in(partition, &candidate);
             self.overdue[partition].push_front(candidate);
         }
     }
 
     /// Drop `request` from the overdue queue, if it is there.
     pub(crate) fn remove(&mut self, request: RequestId) -> bool {
-        for queues in [&mut self.overdue, &mut self.overdue_hits] {
-            for (queue, tokens) in queues.iter_mut().zip(&mut self.overdue_prompt_tokens) {
+        for hits in [false, true] {
+            for partition in 0..self.overdue.len() {
+                let queue = if hits {
+                    &mut self.overdue_hits[partition]
+                } else {
+                    &mut self.overdue[partition]
+                };
                 if let Some(index) = queue.iter().position(|c| c.request_id == request) {
                     let candidate = queue.remove(index).expect("index is in range");
-                    *tokens -= u64::from(candidate.fresh_prompt_tokens);
+                    self.overdue_prompt_tokens[partition] -=
+                        u64::from(candidate.fresh_prompt_tokens);
+                    if !hits {
+                        self.track_out(partition, &candidate);
+                    }
                     return true;
                 }
             }
@@ -258,9 +335,7 @@ mod tests {
             overdue.arrived(0, RequestId(id), Time::from_ms(f64::from(id)));
         }
         // Odd requests are hits.
-        overdue.promote_classified(0, &mut policy, Time::from_ms(20.0), |c| {
-            c.request_id.0 % 2 == 1
-        });
+        overdue.promote_classified(0, &mut policy, Time::from_ms(20.0), |c| c.request_id.0 % 2);
         (overdue, policy)
     }
 
@@ -304,5 +379,44 @@ mod tests {
         assert_eq!(overdue.peek(0, true), None);
         let order: Vec<_> = std::iter::from_fn(|| overdue.pop(0).map(|c| c.request_id.0)).collect();
         assert_eq!(order, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn compute_tracking_counts_what_oldest_first_requests_compute() {
+        let mut sequence = EnqueueSequence::default();
+        let mut policy = FifoOrder::default();
+        let mut overdue = OverdueQueue::new(10.0).with_compute_tracking();
+        for id in 0..3 {
+            let candidate = sequence.freeze(
+                RequestId(id),
+                100,
+                1,
+                SessionInput::Standalone,
+                Time::ZERO,
+                0,
+            );
+            policy.push(candidate, &mut ());
+            overdue.arrived(0, RequestId(id), Time::ZERO);
+        }
+        // Request 1 holds 80 of its 100 prompt tokens.
+        overdue.promote_classified(0, &mut policy, Time::from_ms(10.0), |c| {
+            if c.request_id == RequestId(1) {
+                80
+            } else {
+                0
+            }
+        });
+        assert_eq!(overdue.compute_tokens(0), 220);
+        assert!(overdue.is_tracked(RequestId(2)));
+        assert!(overdue.remove(RequestId(2)));
+        assert!(!overdue.is_tracked(RequestId(2)));
+        assert_eq!(overdue.compute_tokens(0), 120);
+        let first = overdue.pop(0).unwrap();
+        assert_eq!(overdue.compute_tokens(0), 20);
+        overdue.push_front(0, first, false);
+        assert_eq!(overdue.compute_tokens(0), 120);
+        let order: Vec<_> = std::iter::from_fn(|| overdue.pop(0).map(|c| c.request_id.0)).collect();
+        assert_eq!(order, [0, 1]);
+        assert_eq!((overdue.compute_tokens(0), overdue.prompt_tokens()), (0, 0));
     }
 }

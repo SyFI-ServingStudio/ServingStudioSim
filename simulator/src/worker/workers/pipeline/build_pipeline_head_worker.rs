@@ -114,7 +114,9 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     }
     if config.force_schedule_after_ms > 0.0 {
         admission = admission.with_force_after(config.force_schedule_after_ms);
-        if config.force_schedule_hits_first {
+        if config.force_schedule_hits_first && config.force_schedule_hits_first_when_at_risk {
+            admission = admission.with_overdue_hits_first_when_at_risk();
+        } else if config.force_schedule_hits_first {
             admission = admission.with_overdue_hits_first();
         }
     }
@@ -341,7 +343,9 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     }
     if config.force_schedule_after_ms > 0.0 {
         admission = admission.with_force_after(config.force_schedule_after_ms);
-        if config.force_schedule_hits_first {
+        if config.force_schedule_hits_first && config.force_schedule_hits_first_when_at_risk {
+            admission = admission.with_overdue_hits_first_when_at_risk();
+        } else if config.force_schedule_hits_first {
             admission = admission.with_overdue_hits_first();
         }
     }

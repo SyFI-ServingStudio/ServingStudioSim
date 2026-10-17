@@ -59,9 +59,9 @@
 //! request that has waited `ms` since arrival before every other one
 //! (`overdue.rs`), so shortest-first cannot starve a long prompt.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::common::{RequestId, Time, UnifiedStage};
+use crate::common::{RequestId, SessionInput, Time, UnifiedStage};
 use crate::worker::kv::{ChunkedPrefillKv, RoundContext};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
@@ -114,6 +114,9 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     prefix_fetch: Option<PrefixFetch>,
     /// Requests that waited past the force-schedule bound; `None`: no bound.
     overdue: Option<OverdueQueue>,
+    /// With [`Self::with_overdue_hits_first_when_at_risk`]: each session's
+    /// latest queued request, its prompt tokens and session input.
+    hits_first_gate: Option<HashMap<u32, (RequestId, u32, SessionInput)>>,
 }
 
 /// Prefill sizing of [`PipelinedChunkedPrefillAdmission::with_even_split`].
@@ -173,6 +176,7 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             srpt: false,
             prefix_fetch: None,
             overdue: None,
+            hits_first_gate: None,
         }
     }
 
@@ -194,6 +198,55 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             .expect("overdue hits first needs the force-schedule bound");
         self.overdue = Some(overdue.with_hits_first());
         self
+    }
+
+    /// With the force-schedule bound, srpt and prefix tiers: the hits-first
+    /// order (`with_overdue_hits_first`) holds only while some queued
+    /// request's held context is at risk ([`Self::gate_hits_first`]);
+    /// otherwise the oldest-first order runs unchanged. Not vLLM.
+    pub(crate) fn with_overdue_hits_first_when_at_risk(self) -> Self {
+        let mut admission = self.with_overdue_hits_first();
+        let overdue = admission.overdue.take().expect("set above");
+        let mut overdue = overdue.with_compute_tracking();
+        overdue.set_hits_first(false);
+        admission.overdue = Some(overdue);
+        admission.hits_first_gate = Some(HashMap::new());
+        admission
+    }
+
+    /// Turn hits first on while serving the overdue requests oldest first
+    /// would evict a queued request's held context, off otherwise. Those
+    /// requests compute `B` prefill tokens ahead of everything else, and each
+    /// computed context is written to the tiers (write-through as it
+    /// finishes, or into the victim tier as the HBM cache makes room for it),
+    /// so `B` written tokens is the horizon: an LRU tier evicts an entry once
+    /// its writes exceed the entry's free space plus the older entries (its
+    /// stack distance to eviction). A context is at risk if that horizon
+    /// evicts it from every tier holding it, its session's queued request
+    /// resumes from it, and HBM does not hold it for a victim tier to take.
+    fn gate_hits_first<K: ChunkedPrefillKv>(&mut self, kv_store: &K) {
+        let (Some(queued), Some(overdue), Some(fetch)) = (
+            self.hits_first_gate.as_ref(),
+            self.overdue.as_mut(),
+            self.prefix_fetch.as_mut(),
+        ) else {
+            return;
+        };
+        let horizon = overdue.compute_tokens(PARTITION);
+        let at_risk = horizon > 0 && {
+            let (sessions, victim_tier) = fetch.at_risk_sessions(PARTITION, horizon);
+            sessions.into_iter().any(|session_id| {
+                let Some(&(request, prompt_tokens, session_input)) = queued.get(&session_id) else {
+                    return false;
+                };
+                if !self.policy.contains(request) && !overdue.is_tracked(request) {
+                    return false;
+                }
+                let hbm = kv_store.resident_prefix_tokens(prompt_tokens, session_input);
+                !(hbm > 0 && victim_tier) && fetch.rank_tokens(PARTITION, session_input, hbm) > hbm
+            })
+        };
+        overdue.set_hits_first(at_risk);
     }
 
     /// Read session contexts back from DRAM/SSD tiers when a request reaches
@@ -471,6 +524,11 @@ where
             }),
         );
         debug_assert!(!self.policy.contains(request));
+        if let (Some(queued), SessionInput::Session { session_id, .. }) =
+            (self.hits_first_gate.as_mut(), session_input)
+        {
+            queued.insert(session_id, (request, fresh_prompt_tokens, session_input));
+        }
         self.policy.push(candidate, &mut self.policy_context);
         if let Some(overdue) = &mut self.overdue {
             let arrival = context.requests.borrow()[request].request.core.arrival_time;
@@ -494,8 +552,11 @@ where
                     .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input);
                 fetch.as_mut().map_or(hbm, |fetch| {
                     fetch.rank_tokens(PARTITION, candidate.session_input, hbm)
-                }) > 0
+                })
             });
+        }
+        if self.hits_first_gate.is_some() {
+            self.gate_hits_first(kv_store);
         }
         let max_batch_tokens = self.max_batch_tokens;
         let chunk_end_quantum = self.chunk_end_quantum;

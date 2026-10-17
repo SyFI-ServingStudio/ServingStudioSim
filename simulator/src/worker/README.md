@@ -339,6 +339,13 @@ recompute it. Under the oldest-first rule, once the retained contexts exceed
 HBM plus DRAM, every round waits behind overdue recomputes longer than a
 context stays retained, so hits vanish and throughput collapses for good; hits
 first keeps them, at the price of a longer wait for the recomputing rounds.
+`force_schedule_hits_first_when_at_risk` (with tiers) applies that split only
+while it is needed: while the prefill tokens the overdue requests compute, all
+written to the tiers, would evict some queued request's held context from every
+tier holding it (an LRU entry goes once the writes exceed its tier's free
+space plus the older entries). Otherwise the oldest-first order runs unchanged,
+so a deployment whose tiers hold the working set keeps the bound for every
+request.
 
 A hybrid head (`HybridGdnKv`) follows `prefill_chunk_alignment`. `checkpoint` is
 vLLM's Mamba `align` mode: non-final chunks end on the KV block and prefix hits

@@ -1106,6 +1106,46 @@ impl PrefixTiers {
         tier.channel_free = ready;
         ready
     }
+
+    /// Sessions whose context `horizon` more tokens written into the tiers
+    /// would evict from every tier holding it, the next victims first. An LRU
+    /// tier evicts an entry once the writes exceed its free space plus the
+    /// entries older than it (its LRU stack distance to eviction).
+    pub(crate) fn at_risk_sessions(&self, horizon: u64) -> Vec<u32> {
+        let state_tokens = self.state_tokens;
+        // Per tier: entries with an older stamp than this are at risk there.
+        let frontiers: Vec<u64> = self
+            .tiers
+            .iter()
+            .map(|tier| {
+                let mut slack = tier.capacity.saturating_sub(tier.used);
+                for (&stamp, session_id) in &tier.lru {
+                    if slack >= horizon {
+                        return stamp;
+                    }
+                    let entry = &tier.entries[session_id];
+                    slack += tier.charge(entry.tokens, 1 + entry.earlier.len(), state_tokens);
+                }
+                u64::MAX
+            })
+            .collect();
+        let mut sessions = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (tier, &frontier) in self.tiers.iter().zip(&frontiers) {
+            for (_, &session_id) in tier.lru.range(..frontier) {
+                let safe_elsewhere = self.tiers.iter().zip(&frontiers).any(|(other, &f)| {
+                    other
+                        .entries
+                        .get(&session_id)
+                        .is_some_and(|entry| entry.stamp >= f)
+                });
+                if !safe_elsewhere && seen.insert(session_id) {
+                    sessions.push(session_id);
+                }
+            }
+        }
+        sessions
+    }
 }
 
 #[cfg(test)]
@@ -2052,5 +2092,21 @@ mod tests {
         );
         assert_eq!(t.counters(1).written_states, 3 + 2);
         assert_eq!(t.used_tokens(1), 6_010_000 + 3 * 50_000);
+    }
+
+    #[test]
+    fn at_risk_sessions_are_those_the_horizon_evicts_from_every_tier_holding_them() {
+        // DRAM 1M tokens holds 2 and 3 (1 was evicted); SSD 2M holds all three
+        // with 800k free.
+        let mut t = tiers(1.0, 2.0);
+        for session in 1..=3 {
+            t.store(session, 400_000);
+        }
+        // 300k more: DRAM would drop 2, which SSD still keeps.
+        assert!(t.at_risk_sessions(300_000).is_empty());
+        // 1M more: SSD drops 1 (no DRAM copy); 2 and 3 keep their SSD copies.
+        assert_eq!(t.at_risk_sessions(1_000_000), [1]);
+        // 2M more evicts everything, DRAM's next victims first.
+        assert_eq!(t.at_risk_sessions(2_000_000), [2, 3, 1]);
     }
 }

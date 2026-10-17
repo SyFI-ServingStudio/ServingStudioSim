@@ -983,6 +983,14 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         force_schedule_hits_first: bool,
+        /// With `force_schedule_hits_first` and prefix tiers: split by cost
+        /// class only while serving the overdue requests oldest first would
+        /// evict some queued request's held context from every tier holding
+        /// it (its LRU distance to eviction against the prefill tokens those
+        /// requests compute); otherwise the oldest-first order. Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        force_schedule_hits_first_when_at_risk: bool,
         #[serde(default)]
         #[param(default = false)]
         external_decode: bool,
