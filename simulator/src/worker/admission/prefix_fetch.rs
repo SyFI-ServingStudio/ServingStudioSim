@@ -21,6 +21,12 @@
 //! context lacks its last output token, whose KV the next round computes, so
 //! the next round may declare one token more.)
 //!
+//! With a victim DRAM tier (`dram_tier_writes: hbm-evictions`), the KV store
+//! logs every context its HBM prefix cache lets go of, and the tiers take
+//! them before any lookup, read, or write, in the order they left HBM. A
+//! session request's admission cuts the victim entry to what it shares with
+//! it.
+//!
 //! One tier set per KV partition (a pipeline head's one, or each attention DP
 //! rank's). `prefix_tiers_<tag>.csv` records, per admitted session request,
 //! where its declared prefix was found; `prefix_tiers_<tag>.json` the totals.
@@ -34,7 +40,9 @@ use std::path::{Path, PathBuf};
 
 use crate::common::{RequestId, SessionInput, Time};
 use crate::worker::config::PrefixTierReadWaitPolicy;
-use crate::worker::kv::{PrefixKv, PrefixTierHit, PrefixTierSpec, PrefixTiers, ResumePoint};
+use crate::worker::kv::{
+    HbmEvictionLog, PrefixKv, PrefixTierHit, PrefixTierSpec, PrefixTiers, ResumePoint,
+};
 
 use super::AdmissionCandidate;
 
@@ -314,6 +322,8 @@ pub(crate) struct PrefixFetch {
     restored: HashMap<RequestId, Fetch>,
     /// Cancelled requests whose holds the next [`Self::land`] gives back.
     cancelled: Vec<RequestId>,
+    /// What the KV store's HBM prefix cache let go of, for a victim tier.
+    hbm_evictions: Option<HbmEvictionLog>,
 }
 
 impl PrefixFetch {
@@ -334,6 +344,32 @@ impl PrefixFetch {
             landed_order,
             restored: HashMap::new(),
             cancelled: Vec::new(),
+            hbm_evictions: None,
+        }
+    }
+
+    /// The log the KV store reports HBM evictions to, when the fastest tier
+    /// is HBM's victim tier; `None` otherwise.
+    pub(crate) fn hbm_eviction_log(&mut self) -> Option<HbmEvictionLog> {
+        if !self.partitions[0].tiers.takes_hbm_evictions() {
+            return None;
+        }
+        Some(
+            self.hbm_evictions
+                .get_or_insert_with(Default::default)
+                .clone(),
+        )
+    }
+
+    /// Write what HBM let go of since the last call to the victim tiers.
+    fn take_hbm_evictions(&mut self) {
+        let Some(log) = &self.hbm_evictions else {
+            return;
+        };
+        for eviction in log.borrow_mut().drain(..) {
+            self.partitions[usize::from(eviction.partition)]
+                .tiers
+                .store_evicted(eviction.session_id, eviction.tokens);
         }
     }
 
@@ -358,11 +394,12 @@ impl PrefixFetch {
     /// What a cache-aware order ranks the request by: the longer of HBM's
     /// `hbm_tokens` and what a tier would read back.
     pub(crate) fn rank_tokens(
-        &self,
+        &mut self,
         partition: u16,
         session_input: SessionInput,
         hbm_tokens: u32,
     ) -> u32 {
+        self.take_hbm_evictions();
         let SessionInput::Session {
             session_id,
             declared_prefix_tokens,
@@ -387,6 +424,7 @@ impl PrefixFetch {
         candidate: AdmissionCandidate,
         now: Time,
     ) -> AtHead {
+        self.take_hbm_evictions();
         let SessionInput::Session {
             session_id,
             declared_prefix_tokens,
@@ -523,6 +561,10 @@ impl PrefixFetch {
             .restored
             .remove(&candidate.request_id)
             .map(|fetch| fetch.read);
+        self.take_hbm_evictions();
+        self.partitions[usize::from(partition)]
+            .tiers
+            .drop_stale(session_id, u64::from(declared_prefix_tokens));
         self.partitions[usize::from(partition)].record_admission(
             candidate.request_id,
             session_id,
@@ -537,6 +579,7 @@ impl PrefixFetch {
 
     /// Write a finished session context through to its partition's tiers.
     pub(crate) fn store(&mut self, partition: u16, session_id: u32, tokens: u64) {
+        self.take_hbm_evictions();
         self.partitions[usize::from(partition)].store(session_id, tokens);
     }
 
@@ -593,11 +636,13 @@ mod tests {
                     name: "dram",
                     capacity_gb_per_gpu: 1e-6,
                     read_gb_per_s_per_gpu: 1e-4,
+                    writes: crate::worker::kv::PrefixTierWrites::EveryContext,
                 },
                 PrefixTierSpec {
                     name: "ssd",
                     capacity_gb_per_gpu: 1e-5,
                     read_gb_per_s_per_gpu: 1e-5,
+                    writes: crate::worker::kv::PrefixTierWrites::EveryContext,
                 },
             ],
             1,

@@ -58,7 +58,7 @@ use crate::log::{
 use crate::worker::kv::shared::prefix_cache::{
     PrefixCache, PrefixCacheMutation, PrefixCacheReturnMetadata,
 };
-use crate::worker::kv::shared::prefix_cache_journal::PrefixCacheJournal;
+use crate::worker::kv::shared::prefix_cache_journal::{HbmEvictionLog, PrefixCacheJournal};
 use crate::worker::kv::shared::request_ledger::RequestLedger;
 use crate::worker::kv::shared::resident_partition::ResidentPartitionState;
 use crate::worker::kv::{
@@ -671,6 +671,13 @@ impl HybridGdnKv {
         }
     }
 
+    /// Report every context the prefix cache evicts, or cannot keep, to
+    /// `log`, for a victim tier behind HBM.
+    pub(crate) fn with_hbm_eviction_log(mut self, log: HbmEvictionLog) -> Self {
+        self.journal.set_eviction_log(log);
+        self
+    }
+
     /// One state per retained session, at its context's end: a hit is the
     /// whole context when the prompt extends it, and nothing when the prompt
     /// ends inside it (no snapshot exists there). It costs one state instead
@@ -754,6 +761,11 @@ impl HybridGdnKv {
             let event_kind = PrefixCacheJournal::retain_event_kind(mutation.kind, retain_reason);
             self.journal
                 .record_mutation(request, partition, now, mutation, event_kind, tokens);
+        }
+        if insert_result.retained_tokens
+            < self.prefix_caches[partition as usize].retainable_tokens(tokens)
+        {
+            self.journal.record_unkept(partition, session_id, tokens);
         }
         if insert_result.retained_tokens == 0 {
             let cache_used = self.prefix_caches[partition as usize].used_charge();

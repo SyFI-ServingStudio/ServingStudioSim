@@ -449,7 +449,7 @@ where
             target_output_tokens,
             session_input,
             conversation_start_time,
-            self.prefix_fetch.as_ref().map_or(hbm_tokens, |fetch| {
+            self.prefix_fetch.as_mut().map_or(hbm_tokens, |fetch| {
                 fetch.rank_tokens(PARTITION, session_input, hbm_tokens)
             }),
         );

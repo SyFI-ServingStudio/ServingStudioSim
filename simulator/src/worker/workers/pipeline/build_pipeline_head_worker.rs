@@ -46,7 +46,7 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         "a pipeline stage runs on one GPU"
     );
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
-    let prefix_tiers = head_prefix_tiers(
+    let mut prefix_fetch = head_prefix_fetch(
         &config,
         &layout,
         ResumePoint::AnyToken,
@@ -83,6 +83,13 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
+    let kv_store = match prefix_fetch
+        .as_mut()
+        .and_then(PrefixFetch::hbm_eviction_log)
+    {
+        Some(log) => kv_store.with_hbm_eviction_log(log),
+        None => kv_store,
+    };
     let mut admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
         (),
@@ -106,14 +113,9 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     if config.force_schedule_after_ms > 0.0 {
         admission = admission.with_force_after(config.force_schedule_after_ms);
     }
-    let has_tiers = prefix_tiers.is_some();
-    if let Some(tiers) = prefix_tiers {
-        admission = admission.with_prefix_fetch(
-            PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start).with_max_read_wait_ms(
-                config.prefix_tier_max_read_wait_ms,
-                config.prefix_tier_read_wait_policy,
-            ),
-        );
+    let has_tiers = prefix_fetch.is_some();
+    if let Some(fetch) = prefix_fetch {
+        admission = admission.with_prefix_fetch(fetch);
     }
 
     with_head_options(
@@ -203,7 +205,7 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let kv_capacity = hybrid.capacity_tokens(&layout, config.attn_kv_bytes);
     let state_tokens_per_request = hybrid.state_tokens_per_request();
-    let prefix_tiers = head_prefix_tiers(
+    let mut prefix_fetch = head_prefix_fetch(
         &config,
         &layout,
         if hybrid.align_mode {
@@ -266,6 +268,13 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     } else {
         kv_store.with_end_state_reuse()
     };
+    let kv_store = match prefix_fetch
+        .as_mut()
+        .and_then(PrefixFetch::hbm_eviction_log)
+    {
+        Some(log) => kv_store.with_hbm_eviction_log(log),
+        None => kv_store,
+    };
     let admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
         (),
@@ -293,14 +302,9 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     if config.force_schedule_after_ms > 0.0 {
         admission = admission.with_force_after(config.force_schedule_after_ms);
     }
-    let has_tiers = prefix_tiers.is_some();
-    if let Some(tiers) = prefix_tiers {
-        admission = admission.with_prefix_fetch(
-            PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start).with_max_read_wait_ms(
-                config.prefix_tier_max_read_wait_ms,
-                config.prefix_tier_read_wait_policy,
-            ),
-        );
+    let has_tiers = prefix_fetch.is_some();
+    if let Some(fetch) = prefix_fetch {
+        admission = admission.with_prefix_fetch(fetch);
     }
 
     with_head_options(
@@ -317,19 +321,19 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     )
 }
 
-/// The DRAM/SSD tiers `config` asks for, in the pipeline's per-GPU token units.
-/// A context's recurrent state is charged as `layout.tier_state_bytes_per_request`
-/// in those units.
-fn head_prefix_tiers(
+/// Reads from the DRAM/SSD tiers `config` asks for, in the pipeline's per-GPU
+/// token units. A context's recurrent state is charged as
+/// `layout.tier_state_bytes_per_request` in those units.
+fn head_prefix_fetch(
     config: &WorkerConfig,
     layout: &PipelineLayout,
     resume: ResumePoint,
     log_dir: Option<&std::path::Path>,
     id: WorkerId,
-) -> Option<SessionPrefixTiers> {
+) -> Option<PrefixFetch> {
     let specs: Vec<_> = config.prefix_tiers.iter().flatten().copied().collect();
     (!specs.is_empty()).then(|| {
-        SessionPrefixTiers::new(
+        let tiers = SessionPrefixTiers::new(
             &specs,
             layout.tier_kv_bytes_per_token,
             layout
@@ -338,6 +342,10 @@ fn head_prefix_tiers(
             resume,
             log_dir,
             &format!("w{}", id.0),
+        );
+        PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start).with_max_read_wait_ms(
+            config.prefix_tier_max_read_wait_ms,
+            config.prefix_tier_read_wait_policy,
         )
     })
 }

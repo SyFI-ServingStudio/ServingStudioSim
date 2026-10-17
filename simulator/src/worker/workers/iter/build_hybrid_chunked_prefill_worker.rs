@@ -116,6 +116,12 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
             .collect()
     };
     let sticky_sessions = !tiers.is_empty() || config.external_decode;
+    let mut prefix_fetch = (!tiers.is_empty()).then(|| {
+        PrefixFetch::new(tiers, config.prefix_tier_warm_start).with_max_read_wait_ms(
+            config.prefix_tier_max_read_wait_ms,
+            config.prefix_tier_read_wait_policy,
+        )
+    });
 
     let prefix_cache = config.prefix_cache.resolve_tokens(
         kv_capacity,
@@ -149,6 +155,13 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         kv_store.with_end_state_reuse()
     } else {
         kv_store
+    };
+    let kv_store = match prefix_fetch
+        .as_mut()
+        .and_then(PrefixFetch::hbm_eviction_log)
+    {
+        Some(log) => kv_store.with_hbm_eviction_log(log),
+        None => kv_store,
     };
     let balance = match (num_partitions, config.dp_placement) {
         (1, _) => LoadBalance::Single,
@@ -191,16 +204,10 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     } else {
         admission
     };
-    let has_tiers = !tiers.is_empty();
-    let admission = if has_tiers {
-        admission.with_prefix_fetch(
-            PrefixFetch::new(tiers, config.prefix_tier_warm_start).with_max_read_wait_ms(
-                config.prefix_tier_max_read_wait_ms,
-                config.prefix_tier_read_wait_policy,
-            ),
-        )
-    } else {
-        admission
+    let has_tiers = prefix_fetch.is_some();
+    let admission = match prefix_fetch {
+        Some(fetch) => admission.with_prefix_fetch(fetch),
+        None => admission,
     };
     let shell = IterBatchWorker::from_components(
         essentials.context,

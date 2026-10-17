@@ -61,11 +61,11 @@ impl<P: PendingOrderPolicy> FreshQueues<'_, P> {
         if overdue_only {
             return None;
         }
-        let fetch = &*self.prefix_fetch;
+        let fetch = &mut *self.prefix_fetch;
         self.policy.refresh_head(&mut |candidate| {
             let hbm = kv_store
                 .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input);
-            fetch.as_ref().map_or(hbm, |fetch| {
+            fetch.as_mut().map_or(hbm, |fetch| {
                 fetch.rank_tokens(partition, candidate.session_input, hbm)
             })
         });

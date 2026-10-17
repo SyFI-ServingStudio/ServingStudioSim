@@ -306,6 +306,11 @@ impl PrefixCache {
         checkpoints * self.quantum_tokens
     }
 
+    /// What a retention of `tokens` keeps given room: whole resumable quanta.
+    pub(crate) fn retainable_tokens(&self, tokens: u64) -> u64 {
+        self.largest_fitting_length(tokens, u64::MAX)
+    }
+
     /// Pure preview used by admission's token-budget and capacity gates.
     ///
     /// A request declaring `requested_tokens` can only resume at a point it

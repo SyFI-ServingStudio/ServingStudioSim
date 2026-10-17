@@ -18,8 +18,9 @@ pub use full_attn::FullAttnKv;
 pub use hybrid_gdn::HybridGdnKv;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub(crate) use shared::prefix_cache::{PrefixCacheTokenConfig, ResumePoint};
-pub use shared::prefix_tiers::PrefixTierSpec;
+pub(crate) use shared::prefix_cache_journal::HbmEvictionLog;
 pub(crate) use shared::prefix_tiers::{PrefixTierHit, PrefixTiers};
+pub use shared::prefix_tiers::{PrefixTierSpec, PrefixTierWrites};
 
 /// KV-owned runtime facts for one request's prefill on one partition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

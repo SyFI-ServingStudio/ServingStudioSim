@@ -5,10 +5,19 @@
 //! its layers' KV), so capacity and load time are one GPU's bytes over one
 //! GPU's capacity and link, and all GPUs load their slices in parallel.
 //!
-//! Writes are write-through, as LMCache and vLLM's offloading connector store
-//! a request's KV when it finishes: every tier receives the session's latest
-//! context, and each evicts on its own. A tier never holds an older context
-//! than a faster one, so a lookup takes the fastest tier with the longest hit.
+//! By default writes are write-through, as LMCache and vLLM's offloading
+//! connector store a request's KV when it finishes: every tier receives the
+//! session's latest context, and each evicts on its own. A tier never holds an
+//! older context than a faster one, so a lookup takes the fastest tier with the
+//! longest hit.
+//!
+//! The fastest tier may instead be HBM's victim tier
+//! ([`PrefixTierWrites::FasterTierEvictions`]): it receives a session's
+//! context only when the HBM prefix cache evicts it (or cannot keep it), as
+//! what its entry for the session lacks. A read back into HBM leaves its entry
+//! in place, a clean copy, and an entry the session's next round does not
+//! extend is cut to what that round shares with it. Write-through tiers behind
+//! it are unchanged.
 //!
 //! Loads queue FIFO on one channel per tier (its read bandwidth), from the
 //! moment admission reaches the request (`admission/prefix_fetch.rs`). Writes
@@ -26,12 +35,27 @@ use crate::common::Time;
 
 use super::prefix_cache::ResumePoint;
 
-/// One tier's size and read bandwidth, per GPU.
+/// One tier's size and read bandwidth, per GPU, and what it is written.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PrefixTierSpec {
     pub name: &'static str,
     pub capacity_gb_per_gpu: f64,
     pub read_gb_per_s_per_gpu: f64,
+    pub writes: PrefixTierWrites,
+}
+
+/// What a tier is written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefixTierWrites {
+    /// Every finished context, as it finishes (write-through).
+    #[default]
+    EveryContext,
+    /// Only the contexts the HBM prefix cache evicts, or cannot keep, as they
+    /// leave it (a victim tier); the fastest tier only. Configured as
+    /// `hbm-evictions` (`dram_tier_writes`).
+    #[serde(rename = "hbm-evictions")]
+    FasterTierEvictions,
 }
 
 /// Where a lookup found a session's context.
@@ -81,6 +105,23 @@ impl PrefixTier {
             self.lru.insert(self.next_stamp, session_id);
             self.next_stamp += 1;
         }
+    }
+
+    /// Cut the session's entry to its first `tokens`, or drop it if that
+    /// leaves none.
+    fn truncate(&mut self, session_id: u32, tokens: u64, state_tokens: u64) {
+        let Some(entry) = self.entries.get_mut(&session_id) else {
+            return;
+        };
+        if tokens >= entry.0 {
+            return;
+        }
+        if tokens == 0 {
+            self.remove(session_id, state_tokens);
+            return;
+        }
+        self.used -= entry.0 - tokens;
+        entry.0 = tokens;
     }
 
     fn remove(&mut self, session_id: u32, state_tokens: u64) -> Option<u64> {
@@ -190,8 +231,9 @@ impl PrefixTiers {
     /// Queue a read of `hit` behind the tier's earlier reads and return when
     /// it lands. Only the tokens past `resident_tokens` (what HBM still holds)
     /// cross the link, plus the state at the hit's end. The entry stays (the
-    /// tiers are inclusive); every faster tier receives a copy, since the read
-    /// passes through it.
+    /// tiers are inclusive); every faster write-through tier receives a copy,
+    /// since the read passes through it. A victim tier receives it only when
+    /// HBM evicts it.
     pub(crate) fn load(
         &mut self,
         session_id: u32,
@@ -213,7 +255,9 @@ impl PrefixTiers {
         tier.counters.loaded_tokens += u64::from(hit.tokens.saturating_sub(resident_tokens));
         tier.touch(session_id);
         for faster in &mut self.tiers[..hit.tier] {
-            faster.store(session_id, u64::from(hit.tokens), state_tokens);
+            if faster.spec.writes == PrefixTierWrites::EveryContext {
+                faster.store(session_id, u64::from(hit.tokens), state_tokens);
+            }
         }
         ready
     }
@@ -232,11 +276,60 @@ impl PrefixTiers {
         }
     }
 
-    /// Write-through of a finished request's context to every tier.
+    /// Write-through of a finished request's context to every tier but a
+    /// victim tier.
     pub(crate) fn store(&mut self, session_id: u32, tokens: u64) {
         let state_tokens = self.state_tokens;
         for tier in &mut self.tiers {
+            if tier.spec.writes == PrefixTierWrites::EveryContext {
+                tier.store(session_id, tokens, state_tokens);
+            }
+        }
+    }
+
+    /// Whether the fastest tier is HBM's victim tier.
+    pub(crate) fn takes_hbm_evictions(&self) -> bool {
+        self.tiers
+            .first()
+            .is_some_and(|tier| tier.spec.writes == PrefixTierWrites::FasterTierEvictions)
+    }
+
+    /// HBM evicted the session's `tokens`-token context, or could not keep it:
+    /// a victim tier writes what its entry lacks, or only refreshes an entry
+    /// that already holds it all.
+    pub(crate) fn store_evicted(&mut self, session_id: u32, tokens: u64) {
+        let state_tokens = self.state_tokens;
+        let Some(tier) = self
+            .tiers
+            .first_mut()
+            .filter(|tier| tier.spec.writes == PrefixTierWrites::FasterTierEvictions)
+        else {
+            return;
+        };
+        if tier.entries.get(&session_id).is_some_and(|e| e.0 >= tokens) {
+            tier.touch(session_id);
+        } else {
             tier.store(session_id, tokens, state_tokens);
+        }
+    }
+
+    /// The session's next round shares `declared` tokens with its previous
+    /// context: cut a victim tier's older entry to what that round can resume
+    /// from, so it stays a prefix of the session's latest context.
+    pub(crate) fn drop_stale(&mut self, session_id: u32, declared: u64) {
+        let state_tokens = self.state_tokens;
+        let resume = self.resume;
+        for tier in &mut self.tiers {
+            if tier.spec.writes != PrefixTierWrites::FasterTierEvictions {
+                continue;
+            }
+            if let Some(&(tokens, _)) = tier.entries.get(&session_id) {
+                tier.truncate(
+                    session_id,
+                    resume.reusable_tokens(tokens, declared),
+                    state_tokens,
+                );
+            }
         }
     }
 
@@ -257,7 +350,7 @@ impl PrefixTiers {
 mod tests {
     use super::*;
 
-    fn tiers(dram_gb: f64, ssd_gb: f64) -> PrefixTiers {
+    fn tiers_writing(dram_gb: f64, ssd_gb: f64, dram_writes: PrefixTierWrites) -> PrefixTiers {
         // 1000 B/token: 1 GB = 1M tokens; 1 GB/s reads 1M tokens per second.
         PrefixTiers::new(
             &[
@@ -265,17 +358,27 @@ mod tests {
                     name: "dram",
                     capacity_gb_per_gpu: dram_gb,
                     read_gb_per_s_per_gpu: 10.0,
+                    writes: dram_writes,
                 },
                 PrefixTierSpec {
                     name: "ssd",
                     capacity_gb_per_gpu: ssd_gb,
                     read_gb_per_s_per_gpu: 1.0,
+                    writes: PrefixTierWrites::EveryContext,
                 },
             ],
             1000,
             0,
             ResumePoint::AnyToken,
         )
+    }
+
+    fn tiers(dram_gb: f64, ssd_gb: f64) -> PrefixTiers {
+        tiers_writing(dram_gb, ssd_gb, PrefixTierWrites::EveryContext)
+    }
+
+    fn victim_tiers(dram_gb: f64, ssd_gb: f64) -> PrefixTiers {
+        tiers_writing(dram_gb, ssd_gb, PrefixTierWrites::FasterTierEvictions)
     }
 
     #[test]
@@ -353,6 +456,7 @@ mod tests {
                 name: "dram",
                 capacity_gb_per_gpu: 1.0,
                 read_gb_per_s_per_gpu: 1.0,
+                writes: PrefixTierWrites::EveryContext,
             }],
             1000,
             50_000,
@@ -381,6 +485,7 @@ mod tests {
                 name: "dram",
                 capacity_gb_per_gpu: 1.0,
                 read_gb_per_s_per_gpu: 1.0,
+                writes: PrefixTierWrites::EveryContext,
             }],
             1000,
             50_000,
@@ -391,5 +496,92 @@ mod tests {
         // The state is at token 100_000 only: a prompt sharing fewer tokens
         // computes from the start.
         assert_eq!(t.lookup(1, 99_000), None);
+    }
+
+    #[test]
+    fn a_victim_tier_takes_only_what_hbm_evicts() {
+        let mut t = victim_tiers(1.0, 10.0);
+        t.store(1, 400_000);
+        // A finished context reaches the write-through SSD, not DRAM.
+        assert_eq!(t.counters(0).stored_entries, 0);
+        assert_eq!(t.lookup(1, 400_000).unwrap().tier, 1);
+        t.store_evicted(1, 400_000);
+        assert_eq!(
+            t.lookup(1, 400_000),
+            Some(PrefixTierHit {
+                tier: 0,
+                tokens: 400_000
+            })
+        );
+        assert_eq!(t.counters(0).written_tokens, 400_000);
+    }
+
+    #[test]
+    fn a_victim_tier_writes_only_what_its_entry_lacks() {
+        let mut t = victim_tiers(1.0, 10.0);
+        t.store_evicted(1, 400_000);
+        // The next round extends the entry; HBM then evicts the longer context.
+        t.drop_stale(1, 400_001);
+        t.store_evicted(1, 500_000);
+        assert_eq!(t.counters(0).written_tokens, 500_000);
+        assert_eq!(t.used_tokens(0), 500_000);
+        // An eviction of what the entry already holds writes nothing.
+        let entries = t.counters(0).stored_entries;
+        t.store_evicted(1, 500_000);
+        assert_eq!(t.counters(0).stored_entries, entries);
+        assert_eq!(t.counters(0).written_tokens, 500_000);
+    }
+
+    #[test]
+    fn a_read_back_keeps_the_victim_entry_and_refreshes_it() {
+        let mut t = victim_tiers(1.0, 10.0);
+        t.store_evicted(1, 400_000);
+        t.store_evicted(2, 400_000);
+        // Reading 1 back into HBM keeps its DRAM copy and makes 2 the LRU.
+        t.load(1, t.lookup(1, 400_000).unwrap(), 0, Time::ZERO);
+        assert_eq!(t.lookup(1, 400_000).unwrap().tier, 0);
+        // HBM evicts 1 again unchanged: no write; then 3 pushes out 2.
+        t.store_evicted(1, 400_000);
+        t.store_evicted(3, 400_000);
+        assert_eq!(t.lookup(1, 400_000).unwrap().tier, 0);
+        assert_eq!(t.lookup(2, 400_000), None);
+        assert_eq!(t.counters(0).written_tokens, 1_200_000);
+    }
+
+    #[test]
+    fn an_ssd_read_does_not_copy_into_a_victim_tier() {
+        let mut t = victim_tiers(1.0, 10.0);
+        t.store(1, 400_000);
+        t.load(1, t.lookup(1, 400_000).unwrap(), 0, Time::ZERO);
+        assert_eq!(t.counters(0).stored_entries, 0);
+        assert_eq!(t.lookup(1, 400_000).unwrap().tier, 1);
+    }
+
+    #[test]
+    fn a_round_that_does_not_extend_the_entry_cuts_it() {
+        let mut t = victim_tiers(1.0, 10.0);
+        t.store_evicted(1, 600_000);
+        // The next round shares only 300k tokens with the entry.
+        t.drop_stale(1, 300_000);
+        assert_eq!(t.used_tokens(0), 300_000);
+        assert_eq!(t.lookup(1, 600_000).unwrap().tokens, 300_000);
+        // A context resumable only at its end is dropped instead.
+        let mut t = PrefixTiers::new(
+            &[PrefixTierSpec {
+                name: "dram",
+                capacity_gb_per_gpu: 1.0,
+                read_gb_per_s_per_gpu: 1.0,
+                writes: PrefixTierWrites::FasterTierEvictions,
+            }],
+            1000,
+            50_000,
+            ResumePoint::ContextEnd,
+        );
+        t.store_evicted(1, 100_000);
+        t.drop_stale(1, 100_001);
+        assert_eq!(t.used_tokens(0), 150_000);
+        t.drop_stale(1, 99_000);
+        assert_eq!(t.used_tokens(0), 0);
+        assert_eq!(t.lookup(1, 200_000), None);
     }
 }

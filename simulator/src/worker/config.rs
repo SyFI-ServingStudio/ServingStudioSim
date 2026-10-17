@@ -373,8 +373,14 @@ pub(crate) fn prefix_tier_specs(
     dram_gb_per_s: f64,
     ssd_gb: f64,
     ssd_gb_per_s: f64,
+    dram_writes: crate::worker::kv::PrefixTierWrites,
 ) -> anyhow::Result<[Option<crate::worker::kv::PrefixTierSpec>; 2]> {
-    let tier = |name, gb: f64, gb_per_s: f64| {
+    use crate::worker::kv::PrefixTierWrites;
+    anyhow::ensure!(
+        dram_writes == PrefixTierWrites::EveryContext || dram_gb > 0.0,
+        "{deployment}: dram_tier_writes: hbm-evictions needs dram_tier_gb > 0"
+    );
+    let tier = |name, gb: f64, gb_per_s: f64, writes| {
         anyhow::ensure!(
             gb >= 0.0 && (gb == 0.0 || gb_per_s > 0.0),
             "{deployment}: {name}_tier_gb must be >= 0 and its bandwidth positive"
@@ -383,13 +389,16 @@ pub(crate) fn prefix_tier_specs(
             name,
             capacity_gb_per_gpu: gb,
             read_gb_per_s_per_gpu: gb_per_s,
+            writes,
         }))
     };
     Ok([
-        tier("dram", dram_gb, dram_gb_per_s)?,
-        tier("ssd", ssd_gb, ssd_gb_per_s)?,
+        tier("dram", dram_gb, dram_gb_per_s, dram_writes)?,
+        tier("ssd", ssd_gb, ssd_gb_per_s, PrefixTierWrites::EveryContext)?,
     ])
 }
+
+const DRAM_TIER_WRITES_CHOICES: [&str; 2] = ["every-context", "hbm-evictions"];
 
 fn default_dram_tier_gb_per_s() -> f64 {
     50.0
@@ -564,6 +573,15 @@ pub enum IterWorkerSel {
         #[serde(default = "default_dram_tier_gb_per_s")]
         #[param(default = 50.0)]
         dram_tier_gb_per_s: f64,
+        /// What the DRAM tier is written: `every-context`, each finished
+        /// context (write-through); `hbm-evictions`, only the contexts the HBM
+        /// prefix cache evicts or cannot keep, as what DRAM's entry for the
+        /// session lacks (a victim tier: DRAM then adds to what HBM holds
+        /// instead of duplicating it). An SSD tier stays write-through. Not
+        /// vLLM.
+        #[serde(default)]
+        #[param(string, default = "every-context", choices = DRAM_TIER_WRITES_CHOICES)]
+        dram_tier_writes: crate::worker::kv::PrefixTierWrites,
         /// Local SSD behind DRAM, per GPU (GB; `0`: none).
         #[serde(default)]
         #[param(default = 0.0)]
@@ -754,7 +772,8 @@ pub enum IterWorkerSel {
         #[param(default = false)]
         srpt: bool,
         /// Host DRAM behind the HBM prefix cache, per GPU (GB; `0`: none).
-        /// Every finished context is written through to each tier; a session
+        /// Every finished context is written through to each tier (unless
+        /// `dram_tier_writes`); a session
         /// whose context is here but not in HBM is read back at
         /// `dram_tier_gb_per_s` per GPU when admission reaches it, as vLLM's
         /// KV connector does. Not vLLM.
@@ -764,6 +783,15 @@ pub enum IterWorkerSel {
         #[serde(default = "default_dram_tier_gb_per_s")]
         #[param(default = 50.0)]
         dram_tier_gb_per_s: f64,
+        /// What the DRAM tier is written: `every-context`, each finished
+        /// context (write-through); `hbm-evictions`, only the contexts the HBM
+        /// prefix cache evicts or cannot keep, as what DRAM's entry for the
+        /// session lacks (a victim tier: DRAM then adds to what HBM holds
+        /// instead of duplicating it). An SSD tier stays write-through. Not
+        /// vLLM.
+        #[serde(default)]
+        #[param(string, default = "every-context", choices = DRAM_TIER_WRITES_CHOICES)]
+        dram_tier_writes: crate::worker::kv::PrefixTierWrites,
         /// Local SSD behind DRAM, per GPU (GB; `0`: none), read at
         /// `ssd_tier_gb_per_s` per GPU.
         #[serde(default)]

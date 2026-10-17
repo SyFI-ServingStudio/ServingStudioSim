@@ -19,7 +19,7 @@ use crate::log::{
 use crate::worker::kv::shared::prefix_cache::{
     PrefixCache, PrefixCacheMutation, PrefixCacheReturnMetadata,
 };
-use crate::worker::kv::shared::prefix_cache_journal::PrefixCacheJournal;
+use crate::worker::kv::shared::prefix_cache_journal::{HbmEvictionLog, PrefixCacheJournal};
 use crate::worker::kv::shared::request_ledger::RequestLedger;
 use crate::worker::kv::shared::resident_partition::ResidentPartitionState;
 use crate::worker::kv::{
@@ -548,6 +548,13 @@ impl FullAttnKv {
         }
     }
 
+    /// Report every context the prefix cache evicts, or cannot keep, to
+    /// `log`, for a victim tier behind HBM.
+    pub(crate) fn with_hbm_eviction_log(mut self, log: HbmEvictionLog) -> Self {
+        self.journal.set_eviction_log(log);
+        self
+    }
+
     #[inline]
     pub(crate) fn num_partitions(&self) -> usize {
         self.partitions.len()
@@ -883,6 +890,11 @@ impl FullAttnKv {
             self.journal
                 .record_mutation(request, partition, now, mutation, event_kind, tokens);
         }
+        if insert_result.retained_tokens
+            < self.prefix_caches[partition as usize].retainable_tokens(tokens)
+        {
+            self.journal.record_unkept(partition, session_id, tokens);
+        }
         if insert_result.retained_tokens == 0 {
             let cache_used = self.prefix_caches[partition as usize].used_charge();
             self.journal.record(PrefixCacheEvent {
@@ -1005,6 +1017,47 @@ mod tests {
         assert_eq!(kv_store.ledger.partition_promised(0), 90);
         assert_eq!(kv_store.prefix_caches[0].used_tokens(), 0);
         assert!(kv_store.non_cache_peak(0) + kv_store.prefix_caches[0].used_tokens() <= 100);
+    }
+
+    #[test]
+    fn the_eviction_log_receives_what_hbm_evicts_or_cannot_keep() {
+        use crate::worker::kv::shared::prefix_cache_journal::HbmEviction;
+        let log = HbmEvictionLog::default();
+        let mut kv_store = FullAttnKv::with_prefix_cache(
+            1,
+            100,
+            capped_prefix_cache(100, PrefixCachePolicy::Lru),
+            None,
+            None,
+        )
+        .with_hbm_eviction_log(log.clone());
+        kv_store.restore_prefix(RequestId(0), 0, 1, 80, Time::ZERO);
+        assert!(log.borrow().is_empty());
+        // Session 2's context pushes session 1 out. Session 3's is larger
+        // than HBM: it pushes 2 out, HBM keeps only its first 100 tokens, and
+        // the whole context leaves HBM.
+        kv_store.restore_prefix(RequestId(1), 0, 2, 60, Time::ZERO);
+        kv_store.restore_prefix(RequestId(2), 0, 3, 120, Time::ZERO);
+        assert_eq!(
+            log.borrow().as_slice(),
+            [
+                HbmEviction {
+                    partition: 0,
+                    session_id: 1,
+                    tokens: 80
+                },
+                HbmEviction {
+                    partition: 0,
+                    session_id: 2,
+                    tokens: 60
+                },
+                HbmEviction {
+                    partition: 0,
+                    session_id: 3,
+                    tokens: 120
+                },
+            ]
+        );
     }
 
     #[test]
