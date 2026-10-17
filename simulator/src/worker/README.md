@@ -339,6 +339,15 @@ floor to it, one state per block. `plain` chunks plainly and keeps one state per
 retained session, at its context's end: a hit is the whole context when the
 prompt extends it, and nothing when the prompt ends inside it. The tiers follow
 the same rule (`ResumePoint` in `kv/shared/prefix_cache.rs`).
+`recurrent_state_checkpoints: k` (not vLLM; default 1, needs `plain`) keeps up
+to k round-end states per retained context: its end plus earlier prompt ends and
+handed-back decode ends (a hand-back keeps the prompt-end state its prefill
+wrote). Invariant: every kept state sits at a prefix of the entry's context, so
+only states within a new round's declared prefix carry over. A prompt ending
+inside the context resumes at the latest state at or below it. Earlier states
+only fill slack: under pressure the LRU entry's oldest earlier state goes before
+any whole context, and a taken entry leaves its states up to the resume point
+behind as a states-only entry. A read moves one state.
 
 Behind HBM's retained tier a head can keep host DRAM and SSD tiers
 (`dram_tier_gb`, `ssd_tier_gb`, per GPU, with read bandwidths). They are
@@ -374,7 +383,10 @@ passed-over request goes back to the front of the queue it came from.
 A tier is sized and read in the most loaded stage's bytes per token;
 `prefix_tier_balanced_load` (not vLLM) uses the stages' mean instead. A hybrid
 pipeline's entry adds one recurrent state on that same GPU, in real bytes (the
-stage's own, or the stages' mean), not the HBM pool's padded state blocks. A shortest-prefill-first order ranks a request by what HBM or a tier
+stage's own, or the stages' mean), not the HBM pool's padded state blocks; its
+earlier round-end states are charged the same bytes each and yield first. A
+victim tier keeps a state HBM or DRAM dropped (state only, no KV) only beside
+the session's own KV up to it, in room freed from other earlier states. A shortest-prefill-first order ranks a request by what HBM or a tier
 holds. With `prefix_tier_warm_start`, a session request whose declared prefix
 exceeds every context the run stored for it is a pre-run conversation, read
 from the slowest tier (closed-loop traces that join sessions mid-life).

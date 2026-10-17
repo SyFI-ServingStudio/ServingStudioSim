@@ -1,7 +1,7 @@
 //! Request lifecycle and selection axis.
 
 use crate::common::{RequestId, Time};
-use crate::worker::kv::KvStore;
+use crate::worker::kv::{KvStore, RoundContext};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
 
@@ -109,7 +109,7 @@ pub trait MicrobatchAdmission<K: KvStore> {
         0
     }
     /// Write a finished session context through to `partition`'s tiers.
-    fn store_session_context(&mut self, _partition: u16, _session_id: u32, _tokens: u64) {}
+    fn store_session_context(&mut self, _partition: u16, _session_id: u32, _round: RoundContext) {}
 }
 
 pub trait SlotPipelineAdmission<K: KvStore> {

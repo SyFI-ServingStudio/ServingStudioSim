@@ -437,6 +437,7 @@ impl PrefixKv for HybridGdnKv {
         partition: PartitionId,
         session_id: u32,
         tokens: u64,
+        shared: u64,
         now: Time,
     ) {
         self.retain_prefix(
@@ -444,6 +445,7 @@ impl PrefixKv for HybridGdnKv {
             partition,
             session_id,
             tokens,
+            shared,
             None,
             now,
             PrefixCacheRetentionReason::Restore,
@@ -459,6 +461,9 @@ impl PrefixKv for HybridGdnKv {
             })
             .unwrap_or(0);
         let session_id = resolved_prefill.and_then(ResolvedPrefillContext::session_id);
+        // The context extends what the request declared it shares with the
+        // session's previous one.
+        let shared = resolved_prefill.map_or(0, |value| u64::from(value.declared_prefix_tokens()));
         let cache_return_metadata =
             resolved_prefill.and_then(ResolvedPrefillContext::cache_return_metadata);
         self.release(request, partition);
@@ -468,6 +473,7 @@ impl PrefixKv for HybridGdnKv {
                 partition,
                 session_id,
                 retained_tokens,
+                shared,
                 cache_return_metadata,
                 now,
                 PrefixCacheRetentionReason::RequestComplete,
@@ -682,12 +688,14 @@ impl HybridGdnKv {
     /// whole context when the prompt extends it, and nothing when the prompt
     /// ends inside it (no snapshot exists there). It costs one state instead
     /// of one per checkpoint, and live decodes leave no snapshots behind
-    /// either.
-    pub(crate) fn with_end_state_reuse(mut self) -> Self {
+    /// either. `states` > 1 also keeps that many earlier round-end states per
+    /// session, one state each, which yield before any context
+    /// (`PrefixCache::with_end_state`).
+    pub(crate) fn with_end_state_reuse(mut self, states: u32) -> Self {
         let state_tokens = self.state_tokens_per_request;
         self.prefix_caches = std::mem::take(&mut self.prefix_caches)
             .into_iter()
-            .map(|cache| cache.with_end_state(state_tokens))
+            .map(|cache| cache.with_end_state(state_tokens, states))
             .collect();
         self.checkpoint_interval_tokens = 0;
         self
@@ -746,14 +754,16 @@ impl HybridGdnKv {
         partition: PartitionId,
         session_id: u32,
         tokens: u64,
+        shared: u64,
         cache_return_metadata: Option<PrefixCacheReturnMetadata>,
         now: Time,
         retain_reason: PrefixCacheRetentionReason,
     ) {
         let physical_limit = self.prefix_cache_physical_limit(partition);
-        let insert_result = self.prefix_caches[partition as usize].insert(
+        let insert_result = self.prefix_caches[partition as usize].insert_sharing(
             session_id,
             tokens,
+            shared,
             physical_limit,
             cache_return_metadata,
         );
@@ -1152,7 +1162,7 @@ mod tests {
     #[test]
     fn end_state_reuse_hits_a_whole_context_or_nothing() {
         let mut kv_store =
-            store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL).with_end_state_reuse();
+            store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL).with_end_state_reuse(1);
         kv_store.prefix_caches[0].insert(7, 5_000, 10_000_000, None);
         assert_eq!(
             kv_store.prefix_caches[0].used_charge(),
@@ -1165,5 +1175,24 @@ mod tests {
             0,
             "no state inside the context to resume from"
         );
+    }
+
+    #[test]
+    fn a_handed_back_context_keeps_its_prompt_end_state_when_asked() {
+        for (states, inside_hit) in [(1, 0), (2, 5_000)] {
+            let mut kv_store =
+                store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL).with_end_state_reuse(states);
+            // The prompt's context at completion, then the decode's hand-back,
+            // which extends it.
+            kv_store.restore_prefix(RequestId(0), 0, 7, 5_000, 0, Time::ZERO);
+            kv_store.restore_prefix(RequestId(0), 0, 7, 5_400, 5_000, Time::ZERO);
+            assert_eq!(
+                kv_store.prefix_caches[0].used_charge(),
+                5_400 + u64::from(states) * STATE_TOKENS
+            );
+            assert_eq!(kv_store.prefix_caches[0].peek(7, 5_401), 5_400);
+            // A prompt keeping only part of the output.
+            assert_eq!(kv_store.prefix_caches[0].peek(7, 5_200), inside_hit);
+        }
     }
 }

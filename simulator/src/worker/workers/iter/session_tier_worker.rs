@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::iter_worker::IterWorker;
-use crate::worker::kv::PrefixKv;
+use crate::worker::kv::{PrefixKv, RoundContext};
 use crate::worker::types::WorkerStatus;
 use crate::worker::{WorkerEventCommon, WorkerMsgCommon};
 
@@ -74,16 +74,20 @@ impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
         if !self.tiers && external_outputs.is_none_or(|outputs| outputs <= 1) {
             return;
         }
-        let (session_input, context_tokens) = {
+        let (session_input, round) = {
             let store = self.inner.requests().borrow();
             let definition = &store[request].request.definition;
             let outputs = external_outputs.unwrap_or(definition.target_output_tokens);
+            let shared = u64::from(definition.session.declared_prefix_tokens());
+            let prompt_end = shared + u64::from(definition.prompt_tokens);
             // The last output token has no KV yet: the next round computes it.
             (
                 definition.session,
-                u64::from(definition.session.declared_prefix_tokens())
-                    + u64::from(definition.prompt_tokens)
-                    + u64::from(outputs.saturating_sub(1)),
+                RoundContext {
+                    tokens: prompt_end + u64::from(outputs.saturating_sub(1)),
+                    prompt_end,
+                    shared,
+                },
             )
         };
         let Some(session_id) = session_input.session_id() else {
@@ -94,10 +98,11 @@ impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
             .session_partition(session_id)
             .expect("a session worker with tiers or external decode keeps sessions sticky");
         if external_outputs.is_some_and(|outputs| outputs > 1) {
-            kv_store.restore_prefix(request, rank, session_id, context_tokens, at);
+            // It extends the prompt's context HBM retained at completion.
+            kv_store.restore_prefix(request, rank, session_id, round.tokens, round.prompt_end, at);
         }
         if self.tiers {
-            admission.store_session_context(rank, session_id, context_tokens);
+            admission.store_session_context(rank, session_id, round);
         }
     }
 }

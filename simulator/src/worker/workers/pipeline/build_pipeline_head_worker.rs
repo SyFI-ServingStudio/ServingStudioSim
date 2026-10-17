@@ -263,10 +263,14 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
+    assert!(
+        config.recurrent_state_checkpoints == 1 || !hybrid.align_mode,
+        "recurrent_state_checkpoints > 1 needs a state-at-end hybrid (plain chunking)"
+    );
     let kv_store = if hybrid.align_mode {
         kv_store
     } else {
-        kv_store.with_end_state_reuse()
+        kv_store.with_end_state_reuse(config.recurrent_state_checkpoints)
     };
     let kv_store = match prefix_fetch
         .as_mut()
@@ -340,6 +344,11 @@ fn head_prefix_fetch(
                 .tier_state_bytes_per_request
                 .div_ceil(layout.tier_kv_bytes_per_token.max(1)),
             resume,
+            if resume == ResumePoint::ContextEnd {
+                config.recurrent_state_checkpoints
+            } else {
+                1
+            },
             log_dir,
             &format!("w{}", id.0),
         );

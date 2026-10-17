@@ -42,7 +42,8 @@ use std::path::{Path, PathBuf};
 use crate::common::{RequestId, SessionInput, Time};
 use crate::worker::config::PrefixTierReadWaitPolicy;
 use crate::worker::kv::{
-    HbmEvictionLog, PrefixKv, PrefixTierHit, PrefixTierSpec, PrefixTiers, ResumePoint, WRITE_WINDOW,
+    HbmEvictionLog, PrefixKv, PrefixTierHit, PrefixTierSpec, PrefixTiers, ResumePoint, RoundContext,
+    WRITE_WINDOW,
 };
 
 use super::AdmissionCandidate;
@@ -80,6 +81,7 @@ impl SessionPrefixTiers {
         kv_bytes_per_token: u64,
         state_tokens: u64,
         resume: ResumePoint,
+        round_end_states: u32,
         log_dir: Option<&Path>,
         tag: &str,
     ) -> Self {
@@ -107,7 +109,8 @@ impl SessionPrefixTiers {
             .expect("write the prefix tier event log");
             file
         });
-        let mut tiers = PrefixTiers::new(specs, kv_bytes_per_token, state_tokens, resume);
+        let mut tiers = PrefixTiers::new(specs, kv_bytes_per_token, state_tokens, resume)
+            .with_round_end_states(round_end_states);
         if events.is_some() {
             tiers.record_events();
         }
@@ -155,10 +158,10 @@ impl SessionPrefixTiers {
             .map(|hit| (hit, false))
     }
 
-    pub(crate) fn store(&mut self, session_id: u32, tokens: u64) {
+    pub(crate) fn store(&mut self, session_id: u32, round: RoundContext) {
         let stored = self.stored.entry(session_id).or_insert(0);
-        *stored = (*stored).max(tokens);
-        self.tiers.store(session_id, tokens);
+        *stored = (*stored).max(round.tokens);
+        self.tiers.store_round(session_id, round);
     }
 
     /// Start a read of `hit`, of what HBM's `hbm_tokens` lack; returns when it
@@ -286,6 +289,9 @@ impl Drop for SessionPrefixTiers {
                     "evicted_tokens": counters.evicted_tokens,
                     "loads": counters.loads,
                     "loaded_tokens": counters.loaded_tokens,
+                    "written_states": counters.written_states,
+                    "earlier_state_drops": counters.earlier_state_drops,
+                    "earlier_states": self.tiers.earlier_states(tier),
                     "write_window_ms": WRITE_WINDOW.as_ms(),
                     "window_writes": self.tiers.window_writes(tier),
                 })
@@ -425,9 +431,12 @@ impl PrefixFetch {
             return;
         };
         for eviction in log.borrow_mut().drain(..) {
-            self.partitions[usize::from(eviction.partition)]
-                .tiers
-                .store_evicted(eviction.session_id, eviction.tokens);
+            let tiers = &mut self.partitions[usize::from(eviction.partition)].tiers;
+            if eviction.state_only {
+                tiers.store_evicted_state(eviction.session_id, eviction.tokens);
+            } else {
+                tiers.store_evicted(eviction.session_id, eviction.tokens);
+            }
         }
     }
 
@@ -496,11 +505,15 @@ impl PrefixFetch {
             // Its blocks were held since the read started: the context fills
             // them and the admission that follows takes them over.
             kv_store.release_read_hold(candidate.request_id);
+            // The read is a prefix of the session's latest context, as HBM's
+            // entry is.
+            let tokens = u64::from(fetch.read.hit.tokens);
             kv_store.restore_prefix(
                 candidate.request_id,
                 partition,
                 session_id,
-                u64::from(fetch.read.hit.tokens),
+                tokens,
+                tokens,
                 now,
             );
             self.restored.insert(candidate.request_id, fetch);
@@ -639,9 +652,9 @@ impl PrefixFetch {
     }
 
     /// Write a finished session context through to its partition's tiers.
-    pub(crate) fn store(&mut self, partition: u16, session_id: u32, tokens: u64) {
+    pub(crate) fn store(&mut self, partition: u16, session_id: u32, round: RoundContext) {
         self.take_hbm_evictions();
-        self.partitions[usize::from(partition)].store(session_id, tokens);
+        self.partitions[usize::from(partition)].store(session_id, round);
     }
 
     pub(crate) fn next_landing(&self) -> Option<Time> {
@@ -709,6 +722,7 @@ mod tests {
             1,
             0,
             ResumePoint::AnyToken,
+            1,
             None,
             "test",
         )
@@ -723,12 +737,26 @@ mod tests {
         assert_eq!(t.lookup(7, 500, false), None);
         // The next round declares one token more than the stored context (the
         // last output's KV): an ordinary hit from the fastest tier, not a seed.
-        t.store(7, 554);
+        t.store(
+            7,
+            RoundContext {
+                tokens: 554,
+                prompt_end: 554,
+                shared: 0,
+            },
+        );
         let (hit, seeded) = t.lookup(7, 555, true).unwrap();
         assert_eq!((hit.tier, hit.tokens, seeded), (0, 554, false));
         // A placeholder round's one-token context does not cover a joining
         // round's context.
-        t.store(8, 1);
+        t.store(
+            8,
+            RoundContext {
+                tokens: 1,
+                prompt_end: 1,
+                shared: 0,
+            },
+        );
         assert!(t.lookup(8, 300, true).unwrap().1);
     }
 }

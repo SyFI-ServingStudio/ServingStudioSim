@@ -312,6 +312,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         prefix_tier_read_wait_policy,
         force_schedule_after_ms,
         external_decode,
+        recurrent_state_checkpoints,
         ..
     } = worker
     else {
@@ -344,6 +345,10 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         *load_budget_backlog_hi_tokens,
         *max_batch_tokens,
     )?;
+    ensure!(
+        *recurrent_state_checkpoints >= 1,
+        "pp: recurrent_state_checkpoints must be >= 1"
+    );
     crate::worker::config::check_read_wait(
         "pp",
         *prefix_tier_max_read_wait_ms,
@@ -370,6 +375,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         prefix_tier_read_wait_policy: *prefix_tier_read_wait_policy,
         force_schedule_after_ms: *force_schedule_after_ms,
         external_decode: *external_decode,
+        recurrent_state_checkpoints: *recurrent_state_checkpoints,
         ..WorkerConfig::default()
     })
 }

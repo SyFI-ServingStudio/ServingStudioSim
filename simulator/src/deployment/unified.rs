@@ -245,8 +245,19 @@ impl Deployment for UnifiedDeployment {
             srpt,
             prefix_tier_max_read_wait_ms,
             prefix_tier_read_wait_policy,
+            recurrent_state_checkpoints: match &g.worker {
+                IterWorkerSel::ChunkedPrefill {
+                    recurrent_state_checkpoints,
+                    ..
+                } => *recurrent_state_checkpoints,
+                _ => 1,
+            },
             ..WorkerConfig::default()
         };
+        ensure!(
+            worker_config.recurrent_state_checkpoints >= 1,
+            "unified: recurrent_state_checkpoints must be >= 1"
+        );
         ensure!(
             prefix_tier_max_read_wait_ms == 0.0 || worker_config.prefix_tiers != [None, None],
             "unified: prefix_tier_max_read_wait_ms needs a DRAM or SSD tier"
@@ -1286,6 +1297,7 @@ mod tests {
             load_budget_backlog_hi_tokens: 0,
             srpt: false,
             external_decode: false,
+            recurrent_state_checkpoints: 1,
         }
     }
 

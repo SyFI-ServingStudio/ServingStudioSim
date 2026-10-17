@@ -45,7 +45,7 @@ use crate::common::{RequestId, SessionInput, Time, UnifiedStage};
 use crate::worker::config::{
     BatchPolicy, BoundedFutureKvAdmissionConfig, DecodeRetractionPolicy, KvAdmissionConfig,
 };
-use crate::worker::kv::{ChunkedPrefillKv, ResolvedPrefillContext};
+use crate::worker::kv::{ChunkedPrefillKv, ResolvedPrefillContext, RoundContext};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{IterBatchPlan, LoadBudget, WorkerEventCommon, WorkerMsgCommon};
 
@@ -260,9 +260,14 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
     }
 
     /// Write a finished session context through to `partition`'s tiers.
-    pub(crate) fn store_session_context(&mut self, partition: u16, session_id: u32, tokens: u64) {
+    pub(crate) fn store_session_context(
+        &mut self,
+        partition: u16,
+        session_id: u32,
+        round: RoundContext,
+    ) {
         if let Some(fetch) = &mut self.prefix_fetch {
-            fetch.store(partition, session_id, tokens);
+            fetch.store(partition, session_id, round);
         }
     }
 

@@ -94,6 +94,11 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
             tokens: checkpoint_interval_tokens,
         }
     };
+    assert!(
+        config.recurrent_state_checkpoints == 1 || end_state_reuse,
+        "recurrent_state_checkpoints > 1 needs a state-at-end hybrid (plain chunking)"
+    );
+    let round_end_states = config.recurrent_state_checkpoints;
     // One tier set per DP rank, sized and read per GPU of the rank.
     let tier_specs: Vec<_> = config.prefix_tiers.iter().flatten().copied().collect();
     let tiers: Vec<SessionPrefixTiers> = if tier_specs.is_empty() {
@@ -109,6 +114,7 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
                     bytes_per_gpu,
                     state_tokens_per_request,
                     resume,
+                    round_end_states,
                     cost_log_dir.as_deref(),
                     &format!("w{}_p{rank}", id.0),
                 )
@@ -152,7 +158,7 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         prefix_cache_logger,
     );
     let kv_store = if end_state_reuse {
-        kv_store.with_end_state_reuse()
+        kv_store.with_end_state_reuse(config.recurrent_state_checkpoints)
     } else {
         kv_store
     };

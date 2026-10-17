@@ -445,6 +445,9 @@ pub enum SsdTierWrites {
 const DRAM_TIER_WRITES_CHOICES: [&str; 2] = ["every-context", "hbm-evictions"];
 const SSD_TIER_WRITES_CHOICES: [&str; 2] = ["every-context", "dram-evictions"];
 
+fn default_recurrent_state_checkpoints() -> u32 {
+    1
+}
 fn default_dram_tier_gb_per_s() -> f64 {
     50.0
 }
@@ -697,6 +700,16 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         external_decode: bool,
+        /// Recurrent states each retained context keeps, in HBM and every tier,
+        /// for a state-at-end hybrid (plain chunking): the one at its end and
+        /// up to `n - 1` earlier round-end ones (where an earlier prefill, or a
+        /// decode handed back, ended), so a prompt that ends inside the context
+        /// resumes from the latest one at or before its end. Each costs one
+        /// state in the tier holding it; earlier states give way before any
+        /// context does. `1`: the end only. Not vLLM.
+        #[serde(default = "default_recurrent_state_checkpoints")]
+        #[param(default = 1)]
+        recurrent_state_checkpoints: u32,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode and retires
@@ -902,6 +915,16 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         external_decode: bool,
+        /// Recurrent states each retained context keeps, in HBM and every tier,
+        /// for a state-at-end hybrid (plain chunking): the one at its end and
+        /// up to `n - 1` earlier round-end ones (where an earlier prefill, or a
+        /// decode handed back, ended), so a prompt that ends inside the context
+        /// resumes from the latest one at or before its end. Each costs one
+        /// state in the tier holding it; earlier states give way before any
+        /// context does. `1`: the end only. Not vLLM.
+        #[serde(default = "default_recurrent_state_checkpoints")]
+        #[param(default = 1)]
+        recurrent_state_checkpoints: u32,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {

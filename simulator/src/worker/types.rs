@@ -658,6 +658,11 @@ pub struct WorkerConfig {
     /// requests complete at their first token and retain their whole target
     /// context.
     pub external_decode: bool,
+    /// Pipeline head and hybrid chunked prefill, a state-at-end hybrid
+    /// (plain chunking): recurrent states each retained context keeps in HBM
+    /// and every tier, its end's and up to `n - 1` earlier round-end ones
+    /// (`prefix_cache.rs`). 1: the end only.
+    pub recurrent_state_checkpoints: u32,
     /// Candidate positions the drafter proposes per request per iteration (from
     /// the worker selector). The verify width is one more than this. Only the
     /// speculative recipe reads it, and it must match the width the model was
@@ -701,6 +706,7 @@ impl Default for WorkerConfig {
             prefix_tier_read_wait_policy: crate::worker::config::PrefixTierReadWaitPolicy::PassOver,
             force_schedule_after_ms: 0.0,
             external_decode: false,
+            recurrent_state_checkpoints: 1,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,

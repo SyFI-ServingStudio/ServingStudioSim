@@ -62,7 +62,7 @@
 use std::collections::HashSet;
 
 use crate::common::{RequestId, Time, UnifiedStage};
-use crate::worker::kv::ChunkedPrefillKv;
+use crate::worker::kv::{ChunkedPrefillKv, RoundContext};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
@@ -655,9 +655,9 @@ where
         self.prefix_fetch.as_ref().map_or(0, PrefixFetch::reading)
     }
 
-    fn store_session_context(&mut self, _partition: u16, session_id: u32, tokens: u64) {
+    fn store_session_context(&mut self, _partition: u16, session_id: u32, round: RoundContext) {
         if let Some(fetch) = &mut self.prefix_fetch {
-            fetch.store(PARTITION, session_id, tokens);
+            fetch.store(PARTITION, session_id, round);
         }
     }
 }

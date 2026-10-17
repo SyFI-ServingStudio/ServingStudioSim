@@ -20,7 +20,7 @@ pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePo
 pub(crate) use shared::prefix_cache::{PrefixCacheTokenConfig, ResumePoint};
 pub(crate) use shared::prefix_cache_journal::HbmEvictionLog;
 pub(crate) use shared::prefix_tiers::{PrefixTierHit, PrefixTiers, WRITE_WINDOW};
-pub use shared::prefix_tiers::{PrefixTierSpec, PrefixTierWrites};
+pub use shared::prefix_tiers::{PrefixTierSpec, PrefixTierWrites, RoundContext};
 
 /// KV-owned runtime facts for one request's prefill on one partition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -196,14 +196,16 @@ pub trait PrefixKv: KvStore {
 
     /// Put `tokens` of `session_id`'s context into the retained tier, as a
     /// read from a slower tier or a decode run elsewhere hands them back. It
-    /// replaces the session's entry and is clamped to the slack like any
-    /// retention.
+    /// replaces the session's entry, whose first `shared` tokens it shares
+    /// (an entry keeping earlier round-end states keeps those within them),
+    /// and is clamped to the slack like any retention.
     fn restore_prefix(
         &mut self,
         request: RequestId,
         partition: PartitionId,
         session_id: u32,
         tokens: u64,
+        shared: u64,
         now: Time,
     );
 
