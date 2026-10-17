@@ -306,6 +306,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         ssd_tier_gb,
         ssd_tier_gb_per_s,
         dram_tier_writes,
+        ssd_tier_writes,
         prefix_tier_warm_start,
         prefix_tier_max_read_wait_ms,
         prefix_tier_read_wait_policy,
@@ -323,6 +324,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         *ssd_tier_gb,
         *ssd_tier_gb_per_s,
         *dram_tier_writes,
+        *ssd_tier_writes,
     )?;
     // Same defaults as unified `chunked_prefill`: FIFO and opportunistic reuse.
     let prefix_cache = resolve_prefix_cache_config(

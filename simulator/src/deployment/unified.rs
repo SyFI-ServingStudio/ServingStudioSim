@@ -207,6 +207,7 @@ impl Deployment for UnifiedDeployment {
                     ssd_tier_gb,
                     ssd_tier_gb_per_s,
                     dram_tier_writes,
+                    ssd_tier_writes,
                     ..
                 } => crate::worker::config::prefix_tier_specs(
                     "unified",
@@ -215,6 +216,7 @@ impl Deployment for UnifiedDeployment {
                     *ssd_tier_gb,
                     *ssd_tier_gb_per_s,
                     *dram_tier_writes,
+                    *ssd_tier_writes,
                 )?,
                 _ => [None, None],
             },
@@ -1274,6 +1276,7 @@ mod tests {
             ssd_tier_gb: 0.0,
             ssd_tier_gb_per_s: 10.0,
             dram_tier_writes: Default::default(),
+            ssd_tier_writes: Default::default(),
             prefix_tier_warm_start: false,
             prefix_tier_max_read_wait_ms: 0.0,
             prefix_tier_read_wait_policy: PrefixTierReadWaitPolicy::PassOver,

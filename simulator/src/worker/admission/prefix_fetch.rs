@@ -24,8 +24,9 @@
 //! With a victim DRAM tier (`dram_tier_writes: hbm-evictions`), the KV store
 //! logs every context its HBM prefix cache lets go of, and the tiers take
 //! them before any lookup, read, or write, in the order they left HBM. A
-//! session request's admission cuts the victim entry to what it shares with
-//! it.
+//! victim SSD tier (`ssd_tier_writes: dram-evictions`) takes what DRAM lets go
+//! of. A session request's admission cuts each victim entry to what it shares
+//! with it.
 //!
 //! One tier set per KV partition (a pipeline head's one, or each attention DP
 //! rank's). `prefix_tiers_<tag>.csv` records, per admitted session request,
@@ -41,7 +42,7 @@ use std::path::{Path, PathBuf};
 use crate::common::{RequestId, SessionInput, Time};
 use crate::worker::config::PrefixTierReadWaitPolicy;
 use crate::worker::kv::{
-    HbmEvictionLog, PrefixKv, PrefixTierHit, PrefixTierSpec, PrefixTiers, ResumePoint,
+    HbmEvictionLog, PrefixKv, PrefixTierHit, PrefixTierSpec, PrefixTiers, ResumePoint, WRITE_WINDOW,
 };
 
 use super::AdmissionCandidate;
@@ -237,6 +238,8 @@ impl Drop for SessionPrefixTiers {
                     "evicted_tokens": counters.evicted_tokens,
                     "loads": counters.loads,
                     "loaded_tokens": counters.loaded_tokens,
+                    "write_window_ms": WRITE_WINDOW.as_ms(),
+                    "window_writes": self.tiers.window_writes(tier),
                 })
             })
             .collect();
@@ -361,6 +364,13 @@ impl PrefixFetch {
         )
     }
 
+    /// Count the writes from here on at `now`.
+    fn set_clock(&mut self, now: Time) {
+        for partition in &mut self.partitions {
+            partition.tiers.set_clock(now);
+        }
+    }
+
     /// Write what HBM let go of since the last call to the victim tiers.
     fn take_hbm_evictions(&mut self) {
         let Some(log) = &self.hbm_evictions else {
@@ -424,6 +434,7 @@ impl PrefixFetch {
         candidate: AdmissionCandidate,
         now: Time,
     ) -> AtHead {
+        self.set_clock(now);
         self.take_hbm_evictions();
         let SessionInput::Session {
             session_id,
@@ -521,6 +532,7 @@ impl PrefixFetch {
     /// waits for admission in its partition's landed queue. Returns the latest
     /// landing time, if any landed.
     pub(crate) fn land<K: PrefixKv>(&mut self, kv_store: &mut K, now: Time) -> Option<Time> {
+        self.set_clock(now);
         for request in self.cancelled.drain(..) {
             kv_store.release_read_hold(request);
         }
@@ -549,6 +561,7 @@ impl PrefixFetch {
         resident_tokens: u32,
         now: Time,
     ) {
+        self.set_clock(now);
         let SessionInput::Session {
             session_id,
             declared_prefix_tokens,

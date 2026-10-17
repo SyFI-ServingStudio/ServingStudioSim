@@ -373,13 +373,25 @@ pub(crate) fn prefix_tier_specs(
     dram_gb_per_s: f64,
     ssd_gb: f64,
     ssd_gb_per_s: f64,
-    dram_writes: crate::worker::kv::PrefixTierWrites,
+    dram_writes: DramTierWrites,
+    ssd_writes: SsdTierWrites,
 ) -> anyhow::Result<[Option<crate::worker::kv::PrefixTierSpec>; 2]> {
     use crate::worker::kv::PrefixTierWrites;
     anyhow::ensure!(
-        dram_writes == PrefixTierWrites::EveryContext || dram_gb > 0.0,
+        dram_writes == DramTierWrites::EveryContext || dram_gb > 0.0,
         "{deployment}: dram_tier_writes: hbm-evictions needs dram_tier_gb > 0"
     );
+    anyhow::ensure!(
+        ssd_writes == SsdTierWrites::EveryContext || (dram_gb > 0.0 && ssd_gb > 0.0),
+        "{deployment}: ssd_tier_writes: dram-evictions needs dram_tier_gb > 0 and ssd_tier_gb > 0"
+    );
+    let victim = |is_victim: bool| {
+        if is_victim {
+            PrefixTierWrites::FasterTierEvictions
+        } else {
+            PrefixTierWrites::EveryContext
+        }
+    };
     let tier = |name, gb: f64, gb_per_s: f64, writes| {
         anyhow::ensure!(
             gb >= 0.0 && (gb == 0.0 || gb_per_s > 0.0),
@@ -393,12 +405,45 @@ pub(crate) fn prefix_tier_specs(
         }))
     };
     Ok([
-        tier("dram", dram_gb, dram_gb_per_s, dram_writes)?,
-        tier("ssd", ssd_gb, ssd_gb_per_s, PrefixTierWrites::EveryContext)?,
+        tier(
+            "dram",
+            dram_gb,
+            dram_gb_per_s,
+            victim(dram_writes == DramTierWrites::HbmEvictions),
+        )?,
+        tier(
+            "ssd",
+            ssd_gb,
+            ssd_gb_per_s,
+            victim(ssd_writes == SsdTierWrites::DramEvictions),
+        )?,
     ])
 }
 
+/// What the DRAM tier is written (`dram_tier_writes`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DramTierWrites {
+    /// Each finished context (write-through).
+    #[default]
+    EveryContext,
+    /// Only what the HBM prefix cache evicts or cannot keep (HBM's victim tier).
+    HbmEvictions,
+}
+
+/// What the SSD tier is written (`ssd_tier_writes`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SsdTierWrites {
+    /// Each finished context (write-through).
+    #[default]
+    EveryContext,
+    /// Only what DRAM evicts or cannot hold (DRAM's victim tier).
+    DramEvictions,
+}
+
 const DRAM_TIER_WRITES_CHOICES: [&str; 2] = ["every-context", "hbm-evictions"];
+const SSD_TIER_WRITES_CHOICES: [&str; 2] = ["every-context", "dram-evictions"];
 
 fn default_dram_tier_gb_per_s() -> f64 {
     50.0
@@ -577,11 +622,10 @@ pub enum IterWorkerSel {
         /// context (write-through); `hbm-evictions`, only the contexts the HBM
         /// prefix cache evicts or cannot keep, as what DRAM's entry for the
         /// session lacks (a victim tier: DRAM then adds to what HBM holds
-        /// instead of duplicating it). An SSD tier stays write-through. Not
-        /// vLLM.
+        /// instead of duplicating it). Not vLLM.
         #[serde(default)]
         #[param(string, default = "every-context", choices = DRAM_TIER_WRITES_CHOICES)]
-        dram_tier_writes: crate::worker::kv::PrefixTierWrites,
+        dram_tier_writes: DramTierWrites,
         /// Local SSD behind DRAM, per GPU (GB; `0`: none).
         #[serde(default)]
         #[param(default = 0.0)]
@@ -589,6 +633,14 @@ pub enum IterWorkerSel {
         #[serde(default = "default_ssd_tier_gb_per_s")]
         #[param(default = 10.0)]
         ssd_tier_gb_per_s: f64,
+        /// What the SSD tier is written: `every-context`, each finished
+        /// context (write-through); `dram-evictions`, only the contexts DRAM
+        /// evicts or cannot hold, as what SSD's entry for the session lacks (a
+        /// victim tier, written back; with `dram_tier_writes: hbm-evictions`
+        /// the chain HBM -> DRAM -> SSD). Needs both tiers. Not vLLM.
+        #[serde(default)]
+        #[param(string, default = "every-context", choices = SSD_TIER_WRITES_CHOICES)]
+        ssd_tier_writes: SsdTierWrites,
         /// Decode runs elsewhere, as `pipeline_chunked_prefill`'s; hybrid archs
         /// only. Not vLLM.
         /// With a tier: a session request whose declared prefix exceeds every
@@ -787,11 +839,10 @@ pub enum IterWorkerSel {
         /// context (write-through); `hbm-evictions`, only the contexts the HBM
         /// prefix cache evicts or cannot keep, as what DRAM's entry for the
         /// session lacks (a victim tier: DRAM then adds to what HBM holds
-        /// instead of duplicating it). An SSD tier stays write-through. Not
-        /// vLLM.
+        /// instead of duplicating it). Not vLLM.
         #[serde(default)]
         #[param(string, default = "every-context", choices = DRAM_TIER_WRITES_CHOICES)]
-        dram_tier_writes: crate::worker::kv::PrefixTierWrites,
+        dram_tier_writes: DramTierWrites,
         /// Local SSD behind DRAM, per GPU (GB; `0`: none), read at
         /// `ssd_tier_gb_per_s` per GPU.
         #[serde(default)]
@@ -800,6 +851,14 @@ pub enum IterWorkerSel {
         #[serde(default = "default_ssd_tier_gb_per_s")]
         #[param(default = 10.0)]
         ssd_tier_gb_per_s: f64,
+        /// What the SSD tier is written: `every-context`, each finished
+        /// context (write-through); `dram-evictions`, only the contexts DRAM
+        /// evicts or cannot hold, as what SSD's entry for the session lacks (a
+        /// victim tier, written back; with `dram_tier_writes: hbm-evictions`
+        /// the chain HBM -> DRAM -> SSD). Needs both tiers. Not vLLM.
+        #[serde(default)]
+        #[param(string, default = "every-context", choices = SSD_TIER_WRITES_CHOICES)]
+        ssd_tier_writes: SsdTierWrites,
         /// Decode runs elsewhere: a request completes at its first token and
         /// its context, every target output token but the last (whose KV the
         /// next round computes), is retained as a decode instance would hand
@@ -1222,5 +1281,57 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn tier_writes_build_the_victim_chain_and_need_their_tiers() {
+        use crate::worker::kv::PrefixTierWrites::{EveryContext, FasterTierEvictions};
+        let worker: IterWorkerSel = serde_yaml::from_str(
+            "type: pipeline_chunked_prefill\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\n\
+             dram_tier_gb: 50.0\nssd_tier_gb: 128.0\n\
+             dram_tier_writes: hbm-evictions\nssd_tier_writes: dram-evictions\n",
+        )
+        .expect("parse pipeline worker");
+        let IterWorkerSel::PipelineChunkedPrefill {
+            dram_tier_writes,
+            ssd_tier_writes,
+            ..
+        } = worker
+        else {
+            panic!("expected pipeline_chunked_prefill");
+        };
+        let specs = prefix_tier_specs(
+            "pp",
+            50.0,
+            50.0,
+            128.0,
+            10.0,
+            dram_tier_writes,
+            ssd_tier_writes,
+        )
+        .unwrap();
+        assert_eq!(specs.map(|s| s.unwrap().writes), [FasterTierEvictions; 2]);
+        let defaults = prefix_tier_specs(
+            "pp",
+            50.0,
+            50.0,
+            128.0,
+            10.0,
+            DramTierWrites::default(),
+            SsdTierWrites::default(),
+        )
+        .unwrap();
+        assert_eq!(defaults.map(|s| s.unwrap().writes), [EveryContext; 2]);
+        // A victim SSD needs a DRAM tier above it.
+        assert!(prefix_tier_specs(
+            "pp",
+            0.0,
+            50.0,
+            128.0,
+            10.0,
+            DramTierWrites::EveryContext,
+            SsdTierWrites::DramEvictions
+        )
+        .is_err());
     }
 }

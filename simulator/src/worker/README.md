@@ -347,8 +347,11 @@ model (`kv/shared/prefix_tiers.rs`). With `dram_tier_writes: hbm-evictions`
 (not vLLM) DRAM is instead HBM's victim tier: the KV store logs each context its
 prefix cache evicts or cannot keep (`HbmEvictionLog`), DRAM writes what its entry
 lacks before the next tier lookup, a read back keeps the DRAM copy, and a
-session's next admitted round cuts that copy to what it shares; SSD stays
-write-through. The admission owns them
+session's next admitted round cuts that copy to what it shares. With
+`ssd_tier_writes: dram-evictions` (not vLLM) SSD is likewise DRAM's victim tier
+(written back): it takes what DRAM evicts or cannot hold, as what its entry
+lacks, and only refreshes an entry that already holds it; an SSD read keeps the
+SSD copy and copies into DRAM only if DRAM is write-through. The admission owns them
 (`admission/prefix_fetch.rs`) and looks a session up when its request reaches the
 head of the queue, as vLLM's KV connector does at scheduling. If a tier holds
 more than HBM does, floored to HBM's hit quantum, the request leaves the queue
@@ -383,7 +386,7 @@ decode time in its tool waits (`trace/session_decode_wait.py`). The `pp` flow
 keeps each session on the replica its first round went to.
 
 The hybrid `chunked_prefill` worker (DP attention included) takes the same
-`dram_tier_gb` / `dram_tier_writes` / `ssd_tier_gb` / `prefix_tier_warm_start` /
+`dram_tier_gb` / `dram_tier_writes` / `ssd_tier_gb` / `ssd_tier_writes` / `prefix_tier_warm_start` /
 `prefix_tier_max_read_wait_ms` / `prefix_tier_read_wait_policy` /
 `external_decode` knobs (a read-wait bound needs a tier there). Its admission reads from one tier set per attention DP rank and keeps a
 session on the rank it last ran on (`ChunkedPrefillAdmission::with_sticky_sessions`);
