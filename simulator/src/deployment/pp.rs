@@ -314,6 +314,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         prefix_tier_loading_area,
         prefix_tier_loading,
         force_schedule_after_ms,
+        force_schedule_hits_first,
         external_decode,
         recurrent_state_checkpoints,
         recurrent_state_anchors,
@@ -384,6 +385,9 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         "pp: prefix_tier_loading: bounded needs a prefix tier and prefix_tier_loading_area: 0 \
          (its areas are derived)"
     );
+    if *force_schedule_hits_first && !(*force_schedule_after_ms > 0.0 && *srpt) {
+        bail!("pp: force_schedule_hits_first needs force_schedule_after_ms > 0 and srpt");
+    }
     crate::worker::config::check_read_wait(
         "pp",
         *prefix_tier_max_read_wait_ms,
@@ -411,6 +415,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         prefix_tier_loading_area: *prefix_tier_loading_area,
         prefix_tier_loading: *prefix_tier_loading,
         force_schedule_after_ms: *force_schedule_after_ms,
+        force_schedule_hits_first: *force_schedule_hits_first,
         external_decode: *external_decode,
         recurrent_state_checkpoints: *recurrent_state_checkpoints,
         recurrent_state_anchors: *recurrent_state_anchors,

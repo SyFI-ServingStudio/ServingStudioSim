@@ -18,11 +18,29 @@ use super::overdue::OverdueQueue;
 use super::prefix_fetch::PrefixFetch;
 use super::{AdmissionCandidate, PendingOrderPolicy};
 
+/// Which requests an admission pass may take from the overdue queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OverdueAccess {
+    /// Overdue requests alone, hits first.
+    Only,
+    /// Overdue hits alone (`OverdueQueue::with_hits_first`).
+    OnlyHits,
+    /// Landed reads, overdue requests, then the pending order.
+    Include,
+    /// Landed reads and the pending order, not the overdue queue.
+    Skip,
+    /// Landed reads and the pending order's hits (a request that finds its
+    /// context held: it computes only its new tokens), not the overdue queue;
+    /// the pending requests it passes keep their places.
+    SkipHitsOnly,
+}
+
 /// Which queue [`FreshQueues::peek`] found its candidate in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FreshSource {
     Landed,
-    Overdue,
+    /// The overdue queue; `true`: its hits queue.
+    Overdue(bool),
     Policy,
 }
 
@@ -34,34 +52,37 @@ pub(super) struct FreshQueues<'a, P: PendingOrderPolicy> {
     pub(super) policy_context: &'a mut P::Context,
     pub(super) prefix_fetch: &'a mut Option<PrefixFetch>,
     pub(super) overdue: &'a mut Option<OverdueQueue>,
+    /// Pending requests [`OverdueAccess::SkipHitsOnly`] passed, in order.
+    pub(super) set_aside: Vec<AdmissionCandidate>,
 }
 
 impl<P: PendingOrderPolicy> FreshQueues<'_, P> {
     /// The next candidate: a landed read, else an overdue request, else the
     /// pending order's head, re-ranked by what HBM or a tier now holds.
-    /// `overdue_only` offers overdue requests alone.
+    /// `access` says whether overdue requests are offered, alone, or not.
     pub(super) fn peek<K: ChunkedPrefillKv>(
         &mut self,
         kv_store: &K,
-        overdue_only: bool,
+        access: OverdueAccess,
     ) -> Option<(FreshSource, AdmissionCandidate)> {
         let partition = self.partition;
         let landed = self
             .prefix_fetch
             .as_ref()
-            .filter(|_| !overdue_only)
+            .filter(|_| !matches!(access, OverdueAccess::Only | OverdueAccess::OnlyHits))
             .and_then(|fetch| fetch.peek_landed(partition));
         if let Some(candidate) = landed {
             return Some((FreshSource::Landed, candidate));
         }
-        if let Some(candidate) = self
+        if let Some((candidate, hit)) = self
             .overdue
             .as_ref()
-            .and_then(|overdue| overdue.peek(partition))
+            .filter(|_| !matches!(access, OverdueAccess::Skip | OverdueAccess::SkipHitsOnly))
+            .and_then(|overdue| overdue.peek(partition, access == OverdueAccess::OnlyHits))
         {
-            return Some((FreshSource::Overdue, candidate));
+            return Some((FreshSource::Overdue(hit), candidate));
         }
-        if overdue_only {
+        if matches!(access, OverdueAccess::Only | OverdueAccess::OnlyHits) {
             return None;
         }
         let fetch = &mut *self.prefix_fetch;
@@ -72,9 +93,22 @@ impl<P: PendingOrderPolicy> FreshQueues<'_, P> {
                 fetch.rank_tokens(partition, candidate.session_input, hbm)
             })
         });
-        self.policy
-            .peek()
-            .map(|candidate| (FreshSource::Policy, candidate))
+        loop {
+            let candidate = self.policy.peek()?;
+            if access != OverdueAccess::SkipHitsOnly || candidate.resident_prefix_tokens > 0 {
+                return Some((FreshSource::Policy, candidate));
+            }
+            self.policy.pop(self.policy_context);
+            self.set_aside.push(candidate);
+            let fetch = &mut *self.prefix_fetch;
+            self.policy.refresh_head(&mut |candidate| {
+                let hbm = kv_store
+                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input);
+                fetch.as_mut().map_or(hbm, |fetch| {
+                    fetch.rank_tokens(partition, candidate.session_input, hbm)
+                })
+            });
+        }
     }
 
     /// Take `candidate` out of the queue [`Self::peek`] found it in.
@@ -85,7 +119,7 @@ impl<P: PendingOrderPolicy> FreshQueues<'_, P> {
                 .as_mut()
                 .expect("a landed request implies prefix fetch")
                 .pop_landed(self.partition),
-            FreshSource::Overdue => {
+            FreshSource::Overdue(_) => {
                 let popped = self
                     .overdue
                     .as_mut()
@@ -111,12 +145,14 @@ impl<P: PendingOrderPolicy> FreshQueues<'_, P> {
         let mut gate = fetch.load_gate(partition);
         let mut kept = Vec::new();
         while !gate.closed() {
-            let Some(candidate) = self.overdue.as_ref().and_then(|o| o.peek(partition)) else {
+            let Some((candidate, hit)) =
+                self.overdue.as_ref().and_then(|o| o.peek(partition, false))
+            else {
                 break;
             };
             self.overdue.as_mut().expect("peeked").pop(partition);
             if !fetch.stage(kv_store, partition, candidate, &mut gate, now) {
-                kept.push((FreshSource::Overdue, candidate));
+                kept.push((FreshSource::Overdue(hit), candidate));
             }
         }
         while !gate.closed() {
@@ -142,14 +178,17 @@ impl<P: PendingOrderPolicy> FreshQueues<'_, P> {
         passed_over: Vec<(FreshSource, AdmissionCandidate)>,
     ) {
         // Newest first, so each queue gets its order back.
+        for candidate in std::mem::take(&mut self.set_aside).into_iter().rev() {
+            self.policy.push_front(candidate, self.policy_context);
+        }
         for (source, candidate) in passed_over.into_iter().rev() {
             match source {
                 FreshSource::Policy => self.policy.push_front(candidate, self.policy_context),
-                FreshSource::Overdue => self
+                FreshSource::Overdue(hit) => self
                     .overdue
                     .as_mut()
                     .expect("an overdue request implies the bound")
-                    .push_front(self.partition, candidate),
+                    .push_front(self.partition, candidate, hit),
                 // Staged loading: a landed context evicted before admission
                 // goes back to pending, to be read again.
                 FreshSource::Landed => self.policy.push_front(candidate, self.policy_context),

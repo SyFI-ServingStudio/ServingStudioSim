@@ -659,6 +659,9 @@ pub struct WorkerConfig {
     /// Pipeline head and chunked prefill: serve a request that has waited
     /// this many ms since arrival before the others (0: off).
     pub force_schedule_after_ms: f64,
+    /// Pipeline head, with the force-schedule bound and srpt: overdue requests
+    /// whose context is held go first, those that compute it last.
+    pub force_schedule_hits_first: bool,
     /// Pipeline head and hybrid chunked prefill: decode runs elsewhere;
     /// requests complete at their first token and retain their whole target
     /// context.
@@ -727,6 +730,7 @@ impl Default for WorkerConfig {
             prefix_tier_loading_area: 0.0,
             prefix_tier_loading: crate::worker::config::PrefixTierLoading::Held,
             force_schedule_after_ms: 0.0,
+            force_schedule_hits_first: false,
             external_decode: false,
             recurrent_state_checkpoints: 1,
             recurrent_state_anchors: 0,

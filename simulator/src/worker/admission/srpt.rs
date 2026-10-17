@@ -19,6 +19,7 @@ use crate::common::Time;
 use crate::worker::kv::ChunkedPrefillKv;
 use crate::worker::shared::context::WorkerContext;
 
+use super::fresh_source::OverdueAccess;
 use super::overdue::OverdueQueue;
 use super::AdmissionCandidate;
 
@@ -35,10 +36,10 @@ pub(super) trait SrptFill<K: ChunkedPrefillKv> {
     fn started_prefills_mut(&mut self, partition: u16) -> &mut Vec<AdmissionCandidate>;
 
     /// Admit fresh prompts into `budget` (landed reads, overdue requests, then
-    /// the pending order), stopping at the first pending one with more than
-    /// `no_longer_than` prefill tokens (`overdue_only`: no pending ones). An
-    /// admitted prompt that does not finish joins the started list. Returns
-    /// the budget the admitted prompts took.
+    /// the pending order, as `access` allows), stopping at the first pending
+    /// one with more than `no_longer_than` prefill tokens. An admitted prompt
+    /// that does not finish joins the started list. Returns the budget the
+    /// admitted prompts took.
     #[allow(clippy::too_many_arguments)]
     fn admit_fresh_prompts(
         &mut self,
@@ -49,7 +50,7 @@ pub(super) trait SrptFill<K: ChunkedPrefillKv> {
         budget: u32,
         now: Time,
         no_longer_than: Option<u32>,
-        overdue_only: bool,
+        access: OverdueAccess,
     ) -> u32;
 
     /// Schedule `candidate`'s next chunk within `budget`; returns the chunk's
@@ -74,6 +75,10 @@ pub(super) trait SrptFill<K: ChunkedPrefillKv> {
         mut budget: u32,
         now: Time,
     ) {
+        if self.force_bound().is_some_and(OverdueQueue::hits_first) {
+            self.form_prefill_srpt_hits_first(kv_store, context, partition, step, budget, now);
+            return;
+        }
         let remaining_of = |kv_store: &K, candidate: &AdmissionCandidate| {
             kv_store
                 .resolved_prefill_context(candidate.request_id)
@@ -99,8 +104,16 @@ pub(super) trait SrptFill<K: ChunkedPrefillKv> {
         };
         started.sort_by_key(|&(not_overdue, key, _)| (not_overdue, key));
         if self.force_bound().is_some() && budget > 0 {
-            budget -= self
-                .admit_fresh_prompts(kv_store, context, partition, step, budget, now, None, true);
+            budget -= self.admit_fresh_prompts(
+                kv_store,
+                context,
+                partition,
+                step,
+                budget,
+                now,
+                None,
+                OverdueAccess::Only,
+            );
         }
         let mut still_started = Vec::with_capacity(started.len());
         for (not_overdue, _, candidate) in started {
@@ -114,7 +127,7 @@ pub(super) trait SrptFill<K: ChunkedPrefillKv> {
                     budget,
                     now,
                     Some(remaining),
-                    false,
+                    OverdueAccess::Include,
                 );
             }
             let (chunk_tokens, charged) =
@@ -125,9 +138,130 @@ pub(super) trait SrptFill<K: ChunkedPrefillKv> {
             }
         }
         if budget > 0 {
-            self.admit_fresh_prompts(kv_store, context, partition, step, budget, now, None, false);
+            self.admit_fresh_prompts(
+                kv_store,
+                context,
+                partition,
+                step,
+                budget,
+                now,
+                None,
+                OverdueAccess::Include,
+            );
         }
         // Prompts admitted now and not finished join after the ones already started.
+        let admitted_now = self.started_prefills_mut(partition);
+        still_started.append(admitted_now);
+        *admitted_now = still_started;
+    }
+
+    /// [`Self::form_prefill_srpt`] in two cost classes
+    /// (`OverdueQueue::with_hits_first`). A hit finds its session's context
+    /// held (HBM or a tier) and computes only its new tokens; a miss computes
+    /// its context (a new session, an evicted one, a prompt ending inside it).
+    /// Hits go first, then misses, each class in the design's order: overdue
+    /// queued, overdue started (oldest first), then shortest remaining first.
+    /// A started prompt's class is whether it found its context held.
+    fn form_prefill_srpt_hits_first(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        partition: u16,
+        step: &mut Self::Step,
+        mut budget: u32,
+        now: Time,
+    ) {
+        let remaining_of = |kv_store: &K, candidate: &AdmissionCandidate| {
+            kv_store
+                .resolved_prefill_context(candidate.request_id)
+                .remaining_prefill_tokens()
+        };
+        // Per class (hits, misses): overdue started by arrival, the rest by
+        // remaining tokens.
+        let mut classes: [(
+            Vec<(u64, AdmissionCandidate)>,
+            Vec<(u64, AdmissionCandidate)>,
+        ); 2] = Default::default();
+        let started_prefills = std::mem::take(self.started_prefills_mut(partition));
+        {
+            let force_bound = self.force_bound().expect("hits first needs the bound");
+            let store = context.requests.borrow();
+            for candidate in started_prefills {
+                let arrival = store[candidate.request_id].request.core.arrival_time;
+                let hit = kv_store
+                    .resolved_prefill_context(candidate.request_id)
+                    .resident_prefix_tokens()
+                    > 0;
+                let class = &mut classes[usize::from(!hit)];
+                if force_bound.is_overdue(arrival, now) {
+                    class.0.push((arrival.0, candidate));
+                } else {
+                    class
+                        .1
+                        .push((u64::from(remaining_of(kv_store, &candidate)), candidate));
+                }
+            }
+        }
+        let mut still_started = Vec::new();
+        for (class_index, (mut overdue, mut started)) in classes.into_iter().enumerate() {
+            let hits = class_index == 0;
+            overdue.sort_by_key(|&(arrival, _)| arrival);
+            started.sort_by_key(|&(remaining, _)| remaining);
+            let (overdue_access, pending_access) = if hits {
+                (OverdueAccess::OnlyHits, OverdueAccess::SkipHitsOnly)
+            } else {
+                (OverdueAccess::Only, OverdueAccess::Skip)
+            };
+            if budget > 0 {
+                budget -= self.admit_fresh_prompts(
+                    kv_store,
+                    context,
+                    partition,
+                    step,
+                    budget,
+                    now,
+                    None,
+                    overdue_access,
+                );
+            }
+            for (is_overdue, (_, candidate)) in overdue
+                .into_iter()
+                .map(|entry| (true, entry))
+                .chain(started.into_iter().map(|entry| (false, entry)))
+            {
+                let remaining = remaining_of(kv_store, &candidate);
+                if !is_overdue && budget > 0 {
+                    budget -= self.admit_fresh_prompts(
+                        kv_store,
+                        context,
+                        partition,
+                        step,
+                        budget,
+                        now,
+                        Some(remaining),
+                        pending_access,
+                    );
+                }
+                let (chunk_tokens, charged) =
+                    self.schedule_started_chunk(kv_store, partition, candidate, budget);
+                budget -= charged;
+                if chunk_tokens < remaining {
+                    still_started.push(candidate);
+                }
+            }
+            if budget > 0 {
+                budget -= self.admit_fresh_prompts(
+                    kv_store,
+                    context,
+                    partition,
+                    step,
+                    budget,
+                    now,
+                    None,
+                    pending_access,
+                );
+            }
+        }
         let admitted_now = self.started_prefills_mut(partition);
         still_started.append(admitted_now);
         *admitted_now = still_started;

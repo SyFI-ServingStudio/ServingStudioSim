@@ -49,7 +49,7 @@ use crate::worker::kv::{ChunkedPrefillKv, ResolvedPrefillContext, RoundContext};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{IterBatchPlan, LoadBudget, WorkerEventCommon, WorkerMsgCommon};
 
-use super::fresh_source::{FreshQueues, FreshSource};
+use super::fresh_source::{FreshQueues, FreshSource, OverdueAccess};
 use super::overdue::OverdueQueue;
 use super::prefix_fetch::{AtHead, PrefixFetch};
 use super::srpt::SrptFill;
@@ -565,7 +565,7 @@ where
         budget: u32,
         now: Time,
         no_longer_than: Option<u32>,
-        overdue_only: bool,
+        access: OverdueAccess,
     ) -> u32 {
         let bounded_config = self.bounded_config();
         let mixes_prefill_with_decode = self.batch_policy == BatchPolicy::Mix;
@@ -581,9 +581,10 @@ where
             policy_context,
             prefix_fetch: &mut self.prefix_fetch,
             overdue: &mut self.overdue,
+            set_aside: Vec::new(),
         };
         while step.admits && remaining_budget > drafting_slots {
-            let Some((source, candidate)) = queues.peek(kv_store, overdue_only) else {
+            let Some((source, candidate)) = queues.peek(kv_store, access) else {
                 break;
             };
             if let Some(fetch) = queues.prefix_fetch.as_mut() {
@@ -929,7 +930,7 @@ where
                     remaining_budgets[partition_index],
                     now,
                     None,
-                    false,
+                    OverdueAccess::Include,
                 );
             }
         }

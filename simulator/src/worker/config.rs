@@ -973,6 +973,16 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = 0.0)]
         force_schedule_after_ms: f64,
+        /// With `force_schedule_after_ms` and `srpt`: requests split by cost
+        /// class. Those whose session's context is held (HBM or a tier), so
+        /// they compute only their new tokens, go first (overdue ones oldest
+        /// first, then shortest first); those that compute their context (a
+        /// new session, an evicted one, a prompt ending inside its context)
+        /// follow in the same order. Waiting behind recomputes cannot then
+        /// turn a held context into one. Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        force_schedule_hits_first: bool,
         #[serde(default)]
         #[param(default = false)]
         external_decode: bool,

@@ -70,7 +70,7 @@ use crate::worker::types::IterBatchPlan;
 use crate::worker::types::LoadBudget;
 
 use super::chunked_prefill_admission::next_chunk_tokens;
-use super::fresh_source::{FreshQueues, FreshSource};
+use super::fresh_source::{FreshQueues, FreshSource, OverdueAccess};
 use super::overdue::OverdueQueue;
 use super::prefix_fetch::{AtHead, PrefixFetch};
 use super::srpt::SrptFill;
@@ -180,6 +180,19 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
     /// other one, queued or started (`overdue.rs`). Not vLLM.
     pub(crate) fn with_force_after(mut self, after_ms: f64) -> Self {
         self.overdue = Some(OverdueQueue::new(after_ms));
+        self
+    }
+
+    /// With the force-schedule bound and srpt: overdue requests whose context
+    /// is held go first, and those that compute it after the shortest-first
+    /// order (`OverdueQueue::with_hits_first`).
+    pub(crate) fn with_overdue_hits_first(mut self) -> Self {
+        assert!(self.srpt, "overdue hits first needs srpt");
+        let overdue = self
+            .overdue
+            .take()
+            .expect("overdue hits first needs the force-schedule bound");
+        self.overdue = Some(overdue.with_hits_first());
         self
     }
 
@@ -304,7 +317,7 @@ where
         budget: u32,
         now: Time,
         no_longer_than: Option<u32>,
-        overdue_only: bool,
+        access: OverdueAccess,
     ) -> u32 {
         let mut remaining_budget = budget;
         let mut passed_over = Vec::new();
@@ -314,12 +327,13 @@ where
             policy_context: &mut self.policy_context,
             prefix_fetch: &mut self.prefix_fetch,
             overdue: &mut self.overdue,
+            set_aside: Vec::new(),
         };
-        if !overdue_only {
+        if !matches!(access, OverdueAccess::Only | OverdueAccess::OnlyHits) {
             queues.stage_loads(kv_store, now);
         }
         while remaining_budget > 0 {
-            let Some((source, candidate)) = queues.peek(kv_store, overdue_only) else {
+            let Some((source, candidate)) = queues.peek(kv_store, access) else {
                 break;
             };
             if let Some(fetch) = queues.prefix_fetch.as_mut() {
@@ -473,7 +487,15 @@ where
     ) -> bool {
         self.land_prefix_reads(kv_store, now);
         if let Some(overdue) = &mut self.overdue {
-            overdue.promote(PARTITION, &mut self.policy, now);
+            // A hit computes only its new tokens: its context is in HBM or a tier.
+            let fetch = &mut self.prefix_fetch;
+            overdue.promote_classified(PARTITION, &mut self.policy, now, |candidate| {
+                let hbm = kv_store
+                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input);
+                fetch.as_mut().map_or(hbm, |fetch| {
+                    fetch.rank_tokens(PARTITION, candidate.session_input, hbm)
+                }) > 0
+            });
         }
         let max_batch_tokens = self.max_batch_tokens;
         let chunk_end_quantum = self.chunk_end_quantum;
@@ -532,7 +554,7 @@ where
                 remaining_budget,
                 now,
                 None,
-                false,
+                OverdueAccess::Include,
             );
         }
         kv_store.has_prefill_admit(PARTITION) || !self.scheduled_decodes.is_empty()
@@ -658,6 +680,7 @@ where
                 policy_context: &mut self.policy_context,
                 prefix_fetch: &mut self.prefix_fetch,
                 overdue: &mut self.overdue,
+                set_aside: Vec::new(),
             }
             .stage_loads(kv_store, now);
         }

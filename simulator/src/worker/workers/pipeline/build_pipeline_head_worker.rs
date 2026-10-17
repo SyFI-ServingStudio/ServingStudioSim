@@ -114,6 +114,9 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     }
     if config.force_schedule_after_ms > 0.0 {
         admission = admission.with_force_after(config.force_schedule_after_ms);
+        if config.force_schedule_hits_first {
+            admission = admission.with_overdue_hits_first();
+        }
     }
     let has_tiers = prefix_fetch.is_some();
     if let Some(fetch) = prefix_fetch {
@@ -338,6 +341,9 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     }
     if config.force_schedule_after_ms > 0.0 {
         admission = admission.with_force_after(config.force_schedule_after_ms);
+        if config.force_schedule_hits_first {
+            admission = admission.with_overdue_hits_first();
+        }
     }
     let has_tiers = prefix_fetch.is_some();
     if let Some(fetch) = prefix_fetch {

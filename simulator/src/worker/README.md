@@ -331,7 +331,14 @@ that has waited that long since arrival before every other one, oldest first:
 queued ones leave the pending order for an overdue queue admission takes first,
 and with `srpt` overdue started prompts also go first. Shortest-first alone can
 leave a long prompt waiting for hours under a saturated closed loop
-(`admission/overdue.rs`).
+(`admission/overdue.rs`). `force_schedule_hits_first` (pipeline head, with
+`srpt`; not vLLM) splits that order by cost class, as cache-aware schedulers
+(SGLang's longest-prefix-match) do: overdue and started prompts whose session's
+context is held (HBM or a tier) go first, oldest first, then the ones that
+recompute it. Under the oldest-first rule, once the retained contexts exceed
+HBM plus DRAM, every round waits behind overdue recomputes longer than a
+context stays retained, so hits vanish and throughput collapses for good; hits
+first keeps them, at the price of a longer wait for the recomputing rounds.
 
 A hybrid head (`HybridGdnKv`) follows `prefill_chunk_alignment`. `checkpoint` is
 vLLM's Mamba `align` mode: non-final chunks end on the KV block and prefix hits

@@ -1514,6 +1514,53 @@ mod tests {
     }
 
     #[test]
+    fn hits_first_admits_an_overdue_hit_before_an_older_overdue_miss() {
+        // HBM holds 120 tokens and session 7's 50. A 100-token prompt of
+        // session 8 (arrived 4 ms) and session 7's round 1 (5 ms) are both
+        // overdue when the head first looks at 10 ms. Oldest first admits the
+        // prompt, whose footprint evicts session 7, so round 1 recomputes;
+        // hits first admits round 1 on its context first.
+        use crate::worker::admission::PendingOrderKind;
+        for (hits_first, hit) in [(false, 0), (true, 50)] {
+            let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
+            as_session(&store, 0, 7, 0, 0.0);
+            as_session(&store, 1, 8, 0, 4.0);
+            as_session(&store, 2, 7, 51, 5.0);
+            let mut worker = head_with(
+                Rc::clone(&store),
+                WorkerConfig {
+                    max_batch_tokens: Some(64),
+                    attn_kv_bytes: 240,
+                    pending_order: PendingOrderKind::ShortestPrefillFirst,
+                    srpt: true,
+                    force_schedule_after_ms: 2.0,
+                    force_schedule_hits_first: hits_first,
+                    ..WorkerConfig::default()
+                },
+            );
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(3.0), &mut events);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+            run_until(
+                &mut worker,
+                Time::from_ms(10.0),
+                Time::from_ms(80.0),
+                &mut events,
+            );
+            assert_eq!(completed(&events).len(), 3, "hits_first={hits_first}");
+            assert_eq!(
+                store.borrow()[RequestId(2)]
+                    .telemetry
+                    .prefix_cache_hit_tokens,
+                Some(hit),
+                "hits_first={hits_first}"
+            );
+        }
+    }
+
+    #[test]
     fn a_read_waits_until_its_request_fits_in_hbm_and_holds_it() {
         // HBM holds 120 tokens. A 60-token prompt runs while session 7 (70
         // pre-run tokens in the tier, 4 fresh) reaches the head with budget
