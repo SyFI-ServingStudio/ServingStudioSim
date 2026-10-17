@@ -2,8 +2,9 @@
 
 The sixth and last milestone, after `6_scheduler.md` passes. The pipeline, the kernels, the HBM prefix cache of
 `5_prefix_cache.md` and the scheduler of `6_scheduler.md` stay as they are. Each GPU now also keeps session contexts
-in host DRAM and on local SSD. A session evicted from HBM is then read back instead of computed again. The targets
-of this file at full memory and at the two memory limits of `1_contract.md` §2.3 are the final targets of the README.
+in host DRAM and on local SSD, each tier holding what the tier above it evicts. A session evicted from HBM is then
+read back instead of computed again. The targets of this file at full memory and at the two memory limits of
+`1_contract.md` §2.3 are the final targets of the README.
 
 ## 1. The workloads
 
@@ -25,38 +26,46 @@ round 1. Each session has two rounds:
 
 | Memory | KV pool in HBM | DRAM per GPU | SSD per GPU |
 |---|---|---|---|
-| Full | 61,258,368 tokens (100.18 GB) | 150 GB | 256 GB |
-| Tiers | 15,273,856 tokens (25 GB) | 37.5 GB | 256 GB |
-| SSD-heavy | 7,632,640 tokens (12.5 GB) | 18.75 GB | 256 GB |
+| Full | 61,258,368 tokens (100.18 GB) | 50 GB | 128 GB |
+| Tiers | 12,220,800 tokens (20 GB) | 20 GB | 128 GB |
+| SSD-heavy | 7,632,640 tokens (12.5 GB) | 12.5 GB | 128 GB |
 
 ## 2. What runs
 
 **Unchanged:** the pipeline, the scheduler of `6_scheduler.md` §2, and the HBM prefix cache of
 `5_prefix_cache.md` §2 (what a session keeps, exact hits, LRU eviction of whole sessions).
 
-**The tiers.** Each GPU has host DRAM (150 GB, read at 50 GB/s) and a local SSD (256 GB, read at 10 GB/s) for prefix
+**The tiers.** Each GPU has host DRAM (50 GB, read at 50 GB/s) and a local SSD (128 GB, read at 10 GB/s) for prefix
 KV (`1_contract.md` §1).
 
-**What a tier keeps.** One entry per session: its latest context, the same as HBM keeps (`5_prefix_cache.md` §2):
+**What a tier keeps.** One entry per session: a context of the session as it was when it left the tier above, in
+the form HBM keeps it (`5_prefix_cache.md` §2):
 - the KV of every DSA layer for the prompt's tokens;
 - the KDA state at the prompt's last token, only that one.
 
-A tier hit follows the rule of `5_prefix_cache.md` §2: the whole kept context, or nothing for a round whose prompt
-ends inside it.
+An entry is always a prefix of the session's latest context, but it may be older than the context HBM or a faster
+tier holds. A tier hit follows the rule of `5_prefix_cache.md` §2: the whole kept context, or nothing for a round
+whose prompt ends inside it. A round whose prompt ends inside its latest context can therefore still resume from an
+older entry that it extends.
 
-**Writes.**
-- **Write-through.** When a round ends, its context is written to DRAM and to SSD. A later round's write replaces
-  the session's entry.
-- **Only what is new.** A write moves only what the entry did not already hold: the KV of the round's new tokens,
-  plus the new KDA state.
-- **In the background.** Writes never stall compute, and a session's write is done before HBM can evict it.
+**Writes: each tier is the victim tier of the one above (HBM -> DRAM -> SSD).**
+- **DRAM takes what HBM evicts.** A finished round's context stays in HBM. When HBM evicts a session, or cannot keep
+  its context, the context is written to DRAM.
+- **SSD takes what DRAM evicts (write-back).** When DRAM evicts a session, or a context is larger than DRAM, the
+  context is written to SSD. Nothing is written to SSD when a round ends.
+- **Only what is new.** A write moves only what the tier's entry for the session lacks: the KV of the tokens past
+  the entry, plus the new KDA state. A context the tier already holds whole is not written again; it only refreshes
+  the session's place in the order.
+- **Cut at the next round.** When a session's next round is admitted, each tier cuts its entry to what that round
+  can resume from: it keeps an entry the round extends and drops one the round's prompt ends inside.
+- **In the background.** Writes never stall compute. An evicted context is written before its blocks are reused.
 - **Eviction.** Each tier evicts on its own: least recently used first, a whole session at a time. A read refreshes
   its session's place in the order.
 
 **Reads.**
 - **When.** A read starts when the scheduler's order (`6_scheduler.md` §2) reaches a waiting round that DRAM or SSD
-  holds more of than HBM does. It reads from the fastest tier that holds the longest prefix; since writes go to both
-  tiers, that is DRAM whenever DRAM still holds the session.
+  holds more of than HBM does. It reads from the tier whose entry gives the round the longest prefix, DRAM on a tie.
+  A session that left HBM is in DRAM until DRAM evicts it, then on SSD; after a read, both may hold it (below).
 - **What it moves.** Only the tokens HBM lacks, plus the KDA state.
 - **HBM first.** A read starts only if the round's whole footprint fits the pool. It reserves that footprint when it
   starts and holds it until the round is admitted. If the footprint does not fit, admission stops for this
@@ -68,7 +77,9 @@ ends inside it.
   tokens.
 - **One at a time per tier.** Each GPU's DRAM reads queue one after another at 50 GB/s, and its SSD reads at 10 GB/s.
   The two tiers read at the same time.
-- **Copy up.** A read from SSD also puts the session back in DRAM.
+- **Clean copies.** A read leaves the entry it read in its tier and refreshes it; it writes nothing to a faster tier.
+  The context is in HBM now. When HBM evicts it again, DRAM writes what it lacks; when DRAM evicts it, SSD, which
+  may still hold it, writes only what it lacks, or nothing.
 - **Read-wait bound.** If a round's read would wait more than 1 s for its tier, the round is passed over: it stays in
   the queue, holds nothing, and the rounds behind it go ahead. The order reaches it again at the next microbatch.
 - **Size for the order.** A waiting round's size (`6_scheduler.md` §2) treats what HBM or a tier holds as cached.
@@ -90,7 +101,7 @@ ends inside it.
   store, a context is striped over the 4 SSDs, and every GPU's link moves a quarter of each read. Each GPU then stores
   and reads the mean: 1,499 B per token plus 36.9 MB per context. A GPU that reads bytes of another stage's layers
   passes them to that stage over NVLink.
-- **What it changes.** The tiers hold 9% more tokens: DRAM's 150 GB holds 100.1M tokens' worth instead of 91.7M.
+- **What it changes.** The tiers hold 9% more tokens: DRAM's 50 GB holds 33.4M tokens' worth instead of 30.6M.
   A read takes 7–8% less time.
 
 **Read time.** For a read of P tokens, on each GPU (balanced):
@@ -153,96 +164,103 @@ with more than 500 rounds over 60 s does not keep up: its queue grows to the end
 | Step | N | Rounds/s | New tokens/s | Prefix hit share | TTFT p50 / p90 / p99 / max (s) | Over 60 s | Prefix reads HBM / DRAM / SSD | Stage busy 0 / 1 / 2 / 3 |
 |---|---|---|---|---|---|---|---|---|
 | 0 | 400 | 25.6 | 89.4k | 98.55% | 0.15 / 0.81 / 9.85 / 63.7 | 165 | 98 / 0 / 0% | 90 / 87 / 89 / 90% |
-| 1 | 400 | 26.8 | 92.7k | 98.92% | 0.15 / 0.50 / 3.93 / 62.7 | 71 | 98 / 1 / 0% | 89 / 86 / 88 / 89% |
-| **2** | **400** | **26.8** | **92.8k** | 98.92% | **0.15 / 0.48 / 4.03** / 62.7 | 67 | 98 / 1 / 0% | 89 / 86 / 88 / 89% |
-| own stage | 400 | 26.8 | 92.7k | 98.92% | 0.15 / 0.49 / 4.00 / 63.0 | 68 | 98 / 1 / 0% | 89 / 86 / 88 / 89% |
+| 1 | 400 | 26.7 | 92.5k | 98.90% | 0.15 / 0.53 / 4.60 / 62.9 | 81 | 98 / 1 / 0% | 89 / 86 / 88 / 89% |
+| **2** | **400** | **26.8** | **92.9k** | 98.93% | **0.15 / 0.50 / 3.80** / 62.7 | 67 | 98 / 1 / 0% | 89 / 86 / 88 / 89% |
+| own stage | 400 | 26.8 | 92.9k | 98.94% | 0.15 / 0.49 / 3.82 / 62.7 | 65 | 98 / 1 / 0% | 89 / 86 / 88 / 89% |
 | 0 | 500 | 25.8 | 92.6k | 97.82% | 0.29 / 4.22 / 61.55 / 68.4 | 979 | — | 93 / 88 / 91 / 92% |
-| 1 | 500 | 29.0 | 103.3k | 98.89% | 0.23 / 1.96 / 60.78 / 67.1 | 681 | — | 93 / 88 / 91 / 92% |
-| 2 | 500 | 29.1 | 103.6k | 98.91% | 0.23 / 1.82 / 60.77 / 66.0 | 683 | — | 93 / 88 / 91 / 92% |
-| own stage | 500 | 29.1 | 103.6k | 98.90% | 0.23 / 1.74 / 60.74 / 64.5 | 665 | — | 93 / 88 / 91 / 92% |
+| 1 | 500 | 29.0 | 102.9k | 98.86% | 0.24 / 2.05 / 60.83 / 67.2 | 707 | — | 93 / 88 / 91 / 92% |
+| 2 | 500 | 29.6 | 104.8k | 99.01% | 0.23 / 1.55 / 60.69 / 65.6 | 628 | — | 93 / 88 / 91 / 92% |
+| own stage | 500 | 29.5 | 104.9k | 99.01% | 0.23 / 1.72 / 60.67 / 65.7 | 625 | — | 93 / 88 / 91 / 92% |
 
-**Tiers (15.3M-token pool, 37.5 GB DRAM):**
+**Tiers (12.2M-token pool, 20 GB DRAM):**
 
 | Step | N | Rounds/s | New tokens/s | Prefix hit share | TTFT p50 / p90 / p99 / max (s) | Over 60 s | Prefix reads HBM / DRAM / SSD | Stage busy 0 / 1 / 2 / 3 |
 |---|---|---|---|---|---|---|---|---|
-| 0 | 400 | 9.0 | 42.6k | 75.31% | 0.94 / 110.96 / 125.81 / 132.5 | 2,477 | — | 97 / 90 / 93 / 93% |
-| 1 | 400 | 15.7 | 59.3k | 91.49% | 0.19 / 3.09 / 124.30 / 372.4 | 916 | — | 96 / 91 / 94 / 94% |
-| **2** | **400** | **26.7** | **92.7k** | 98.92% | **0.17 / 0.50 / 3.95** / 62.6 | 67 | 48 / 36 / 15% | 89 / 86 / 88 / 89% |
-| own stage | 400 | 26.7 | 92.7k | 98.93% | 0.17 / 0.50 / 3.85 / 62.8 | 65 | 48 / 33 / 18% | 89 / 86 / 88 / 89% |
-| 0 | 500 | 9.1 | 44.0k | 73.99% | 1.05 / 134.61 / 151.23 / 155.9 | 2,879 | — | 97 / 90 / 93 / 93% |
-| 1 | 500 | 13.4 | 56.0k | 87.09% | 0.24 / 10.13 / 145.21 / 158.5 | 1,372 | — | 96 / 90 / 93 / 94% |
-| 2 | 500 | 28.9 | 103.3k | 98.92% | 0.26 / 2.20 / 60.75 / 66.9 | 630 | — | 93 / 88 / 91 / 92% |
-| own stage | 500 | 28.9 | 102.9k | 98.90% | 0.26 / 2.35 / 60.79 / 66.4 | 655 | — | 93 / 88 / 91 / 92% |
+| 0 | 400 | 6.3 | 36.2k | 60.02% | 1.45 / 116.00 / 120.52 / 123.8 | 3,035 | — | 97 / 90 / 93 / 93% |
+| 1 | 400 | 12.3 | 50.3k | 85.24% | 0.35 / 60.69 / 131.75 / 143.2 | 1,553 | — | 97 / 91 / 94 / 94% |
+| **2** | **400** | **27.3** | **94.4k** | 99.18% | **0.17 / 0.39 / 2.72** / 62.6 | 29 | 39 / 31 / 28% | 88 / 85 / 87 / 88% |
+| own stage | 400 | 27.2 | 94.2k | 99.15% | 0.17 / 0.40 / 2.74 / 62.6 | 33 | 39 / 30 / 30% | 88 / 85 / 87 / 88% |
+| 0 | 500 | 6.5 | 38.2k | 60.50% | 1.81 / 135.35 / 141.87 / 145.0 | 3,334 | — | 97 / 90 / 93 / 93% |
+| 1 | 500 | 11.4 | 50.6k | 82.47% | 0.39 / 100.94 / 161.76 / 166.3 | 1,992 | — | 97 / 91 / 93 / 94% |
+| 2 | 500 | 29.4 | 104.5k | 99.03% | 0.26 / 1.99 / 60.69 / 65.6 | 590 | — | 92 / 88 / 91 / 92% |
+| own stage | 500 | 29.4 | 104.6k | 99.02% | 0.27 / 2.22 / 60.68 / 64.5 | 589 | — | 92 / 88 / 91 / 92% |
 
-**SSD-heavy (7.6M-token pool, 18.75 GB DRAM):**
+**SSD-heavy (7.6M-token pool, 12.5 GB DRAM):**
 
 | Step | N | Rounds/s | New tokens/s | Prefix hit share | TTFT p50 / p90 / p99 / max (s) | Over 60 s | Prefix reads HBM / DRAM / SSD | Stage busy 0 / 1 / 2 / 3 |
 |---|---|---|---|---|---|---|---|---|
 | 0 | 400 | 5.3 | 33.2k | 47.83% | 6.55 / 113.98 / 119.25 / 120.7 | 3,061 | — | 98 / 90 / 93 / 94% |
-| 1 | 400 | 10.1 | 45.0k | 78.67% | 0.88 / 86.89 / 121.80 / 125.9 | 2,241 | — | 97 / 90 / 93 / 93% |
-| **2** | **400** | **26.7** | **92.6k** | 98.91% | **0.18 / 0.53 / 4.15** / 62.6 | 66 | 20 / 29 / 49% | 89 / 86 / 88 / 89% |
-| own stage | 400 | 26.7 | 92.5k | 98.92% | 0.18 / 0.54 / 3.89 / 62.6 | 64 | 20 / 26 / 53% | 89 / 86 / 88 / 89% |
+| 1 | 400 | 7.5 | 39.2k | 68.79% | 1.25 / 105.88 / 118.79 / 121.9 | 2,754 | — | 97 / 90 / 93 / 93% |
+| **2** | **400** | **26.9** | **93.2k** | 99.03% | **0.18 / 0.47 / 3.39** / 63.1 | 48 | 20 / 28 / 50% | 88 / 86 / 88 / 89% |
+| own stage | 400 | 26.8 | 92.9k | 99.00% | 0.18 / 0.51 / 4.10 / 62.7 | 57 | 20 / 27 / 52% | 88 / 86 / 88 / 89% |
 | 0 | 500 | 5.5 | 35.3k | 48.31% | 61.23 / 134.92 / 139.30 / 141.8 | 3,349 | — | 98 / 90 / 93 / 94% |
-| 1 | 500 | 9.8 | 46.0k | 76.40% | 1.03 / 120.72 / 149.27 / 153.9 | 2,620 | — | 97 / 90 / 93 / 93% |
-| 2 | 500 | 28.7 | 102.4k | 98.91% | 0.29 / 2.55 / 60.77 / 67.7 | 619 | — | 92 / 88 / 91 / 91% |
-| own stage | 500 | 28.6 | 102.2k | 98.91% | 0.29 / 2.72 / 60.77 / 68.2 | 636 | — | 92 / 88 / 90 / 91% |
+| 1 | 500 | 7.6 | 40.6k | 67.90% | 1.40 / 124.89 / 135.31 / 138.5 | 3,156 | — | 97 / 90 / 93 / 93% |
+| 2 | 500 | 28.9 | 102.9k | 98.95% | 0.29 / 2.56 / 60.79 / 66.5 | 635 | — | 92 / 88 / 90 / 91% |
+| own stage | 500 | 28.8 | 102.4k | 98.92% | 0.29 / 2.60 / 60.78 / 65.6 | 624 | — | 92 / 88 / 90 / 91% |
+
+The two memory limits split the prefix reads at N = 400 about evenly over HBM, DRAM and SSD (Tiers) and put half
+of them on SSD (SSD-heavy). At N = 500 more sessions share the same HBM, and the reads move down a tier: HBM / DRAM /
+SSD 26 / 34 / 38% (Tiers) and 8 / 31 / 60% (SSD-heavy).
 
 **Step by step:**
 - **DRAM (step 1).** At full memory and N = 400 it brings the HBM-only system of `6_scheduler.md` back within the
-  SLO: 89.4k → 92.7k new tokens/s, TTFT p50 / p90 / p99 0.15 / 0.81 / 9.85 → 0.15 / 0.50 / 3.93 s. Evicted sessions
+  SLO: 89.4k → 92.5k new tokens/s, TTFT p50 / p90 / p99 0.15 / 0.81 / 9.85 → 0.15 / 0.53 / 4.60 s. Evicted sessions
   are read back instead of computed again. With the memory limits, DRAM is too small on its own, and the pipeline
   stays overloaded.
-- **SSD (step 2).** Every kept context is found in every memory setting: the 1.08% of prefix tokens that miss belong
-  to the rounds whose prompt ends inside the previous one, computed again whole (`5_prefix_cache.md` §2). N = 400
-  meets the SLO: TTFT p50 / p90 / p99 0.15 / 0.48 / 4.03 s at full memory, 0.17 / 0.50 / 3.95 s and
-  0.18 / 0.53 / 4.15 s with the limits. With the limits, throughput stays within 0.2% of full memory: SSD serves up to
-  49% of the prefix tokens, and the reads cost no compute.
-- **N = 500 does not keep up at any step:** 619–683 rounds wait more than 60 s at step 2. The rounds whose prompt
-  ends inside the previous one still add about 21k computed tokens/s, and the stages are 93% busy. The SLO holds up
-  to N = 410 at full memory (p99 5.23 s); at N = 420, p99 is 7.79 s.
-- **Own stage instead of balanced.** With the memory limits, the DRAM share falls by 3.0–3.6 points, because DRAM
-  holds 8% fewer tokens. TTFT changes by −6% to −1% at p99 and by at most 0.02 s at p50 and p90. On these runs the
-  tier links stay far from full (below), so faster reads gain little.
-- **The read-wait bound** never acts in these runs: no read waits more than 0.6 s for its tier. It is there for a tier
-  that falls behind.
-- **Over 60 s.** In every run that keeps up at N = 400, about 65 rounds (0.2%) wait about 60 s. About 11 are the
-  first rounds of the sessions with the largest prompts, with no prefix; about 55 are rounds whose prompt ends inside
-  the previous one, computed again whole, a median of 129k tokens. Shortest first serves them last, and
-  force-schedule serves them at 60 s (`6_scheduler.md` §5).
+- **SSD (step 2).** A context that left HBM is found again in DRAM or SSD; the sessions SSD evicts have almost all
+  ended. N = 400 meets the SLO in every memory
+  setting: TTFT p50 / p90 / p99 0.15 / 0.50 / 3.80 s at full memory, 0.17 / 0.39 / 2.72 s (Tiers) and
+  0.18 / 0.47 / 3.39 s (SSD-heavy). SSD serves up to half of the prefix tokens, and the reads cost no compute.
+- **Older entries serve shrunk prompts.** With the limits, a session's context moves down through DRAM and SSD, and
+  a tier keeps it as it was when it left the tier above. A round whose prompt ends inside its latest context finds
+  nothing in HBM (`5_prefix_cache.md` §2) but can resume from such an older entry when its prompt extends it. The
+  prefix hit share therefore rises above full memory's (99.18% and 99.03% against 98.93%), and Tiers beats full
+  memory at N = 400: 94.4k against 92.9k new tokens/s, p99 2.72 against 3.80 s, 29 against 67 rounds over 60 s.
+- **N = 500 does not keep up at any step:** 590–635 rounds wait more than 60 s at step 2, and the stages are 92–93%
+  busy. The SLO holds up to N = 410 at full memory (p99 4.95 s) and with SSD-heavy (4.90 s), and up to N = 420 with
+  Tiers (5.89 s); one step of 10 further, p99 is 7.72, 7.22 and 7.97 s.
+- **Own stage instead of balanced.** The DRAM share falls by 1–2 points, because DRAM holds 8% fewer tokens. TTFT
+  changes by at most 0.04 s at p50 and p90; p99 rises by under 1% at full memory and with Tiers and by 21% with SSD-heavy
+  (3.39 → 4.10 s).
+- **The read-wait bound** never acts at N = 400: no read waits more than 0.6 s for its tier. At N = 500 with Tiers,
+  SSD reads wait up to 0.99 s and the bound passes a few rounds over (p90 1.99 s against 1.95 s without it). It is
+  there for a tier that falls behind.
+- **Over 60 s.** At N = 400, 29–67 rounds (0.1–0.2%) wait about 60 s: the first rounds of the sessions with the
+  largest prompts, with no prefix, and rounds whose prompt ends inside the previous one with no older entry to
+  resume from, computed again whole. Shortest first serves them last, and force-schedule serves them at 60 s
+  (`6_scheduler.md` §5).
 
 **Tier traffic** of the design (step 2) at N = 400, per GPU, averaged over the 20 minutes:
 
 | Memory | DRAM writes | DRAM reads | SSD writes | SSD reads | DRAM used | SSD used |
 |---|---|---|---|---|---|---|
-| Full | 1.13 GB/s | 0.02 GB/s | 1.13 GB/s | 0.00 GB/s | 150 GB (full) | 207 GB |
-| Tiers | 1.52 GB/s | 1.04 GB/s | 1.12 GB/s | 0.38 GB/s | 37.5 GB (full) | 207 GB |
-| SSD-heavy | 2.50 GB/s | 1.06 GB/s | 1.12 GB/s | 1.35 GB/s | 18.75 GB (full) | 206 GB |
+| Full | 0.13 GB/s | 0.02 GB/s | 0.08 GB/s | 0.00 GB/s | 50 GB (full) | 100 GB |
+| Tiers | 1.35 GB/s | 1.02 GB/s | 0.41 GB/s | 0.78 GB/s | 20 GB (full) | 128 GB (full) |
+| SSD-heavy | 1.99 GB/s | 1.02 GB/s | 0.58 GB/s | 1.42 GB/s | 12.5 GB (full) | 128 GB (full) |
 
-- **Writes are mostly KDA states.** Each round writes a new 36.9 MB state, 0.99 GB/s at 26.8 rounds/s. The KV of the
-  new tokens adds only 0.14 GB/s.
-- **DRAM writes** also include the copies of SSD reads.
+- **DRAM writes** are what HBM evicts: mostly the KV of contexts DRAM did not hold (65–72% of the bytes), the rest
+  KDA states. **SSD writes** are what DRAM evicts; a context SSD still holds from an earlier eviction adds only its
+  new tokens, so with the limits 62–72% of SSD's bytes are KDA states. At full memory HBM evicts little, and SSD receives 0.08 GB/s.
 - **Reads** use at most 2% of DRAM's bandwidth and 14% of SSD's on average. Over 10-s windows SSD reads peak at
-  3.3 GB/s and writes at 1.7 GB/s (SSD-heavy). A read waits at most 0.6 s for the SSD, under the 1 s bound.
-- **SSD space.** After 20 minutes it holds 206–207 GB per GPU at N = 400 (231 GB at full memory and N = 500): every
-  context the run wrote, with no eviction. With less, SSD evicts and those sessions are computed again. TTFT p50 / p90
-  / p99 (s) at N = 400:
+  3.4 GB/s, DRAM writes at 4.1 GB/s and SSD writes at 1.0 GB/s (SSD-heavy). A read waits at most 0.6 s for its tier.
+- **SSD space.** With the limits, SSD fills its 128 GB per GPU and evicts (about 650 sessions at N = 400). With
+  256 GB it would hold 204–206 GB at N = 400 and 230–231 GB at N = 500; at full memory it holds 100 GB at N = 400.
+  TTFT p50 / p90 / p99 (s) at N = 400:
 
 | SSD per GPU | Full | Tiers | SSD-heavy |
 |---|---|---|---|
-| 256 GB | 0.15 / 0.48 / 4.03 | 0.17 / 0.50 / 3.95 | 0.18 / 0.53 / 4.15 |
-| 192 GB | 0.15 / 0.48 / 4.03 | 0.17 / 0.50 / 3.95 | 0.18 / 0.53 / 4.15 |
-| 128 GB | 0.15 / 0.50 / 3.93 | 0.17 / 0.52 / 3.88 | 0.18 / 0.55 / 4.50 |
-| 64 GB | 0.15 / 0.50 / 3.93 | 0.18 / 1.50 / 60.35 | 0.19 / 1.83 / 57.12 |
+| 256 GB | 0.15 / 0.50 / 3.80 | 0.17 / 0.39 / 2.72 | 0.18 / 0.46 / 3.03 |
+| 128 GB | 0.15 / 0.50 / 3.80 | 0.17 / 0.39 / 2.72 | 0.18 / 0.47 / 3.39 |
+| 64 GB | 0.15 / 0.50 / 3.80 | 0.18 / 1.08 / 14.69 | 0.19 / 1.30 / 29.19 |
 
-  The SLO holds down to 128 GB; at 64 GB the two memory limits miss it by far (p99 57–60 s). At full memory, an SSD
-  no larger than DRAM's 150 GB holds nothing DRAM does not, so 128 GB and 64 GB give the DRAM-only numbers.
+  The SLO holds at 128 GB; at 64 GB the two memory limits miss it (p99 15–29 s), since the evicted sessions are
+  computed again. At full memory SSD is hardly read, and its size does not change N = 400.
 
-`data/session_targets.json` holds every run (settings `<memory>_<variant>` with memory `full`, `h25d37`, `h12d19`
-(Tiers is `h25d37`, SSD-heavy `h12d19`) and variant `hbm` = step 0, `dram` = step 1, `design` = step 2, `unbal` = own
+`data/session_targets.json` holds every run (settings `<memory>_<variant>` with memory `full`, `h20d20`, `h12d12`
+(Tiers is `h20d20`, SSD-heavy `h12d12`) and variant `hbm` = step 0, `dram` = step 1, `design` = step 2, `unbal` = own
 stage; also `dram_unbal`, DRAM only with own-stage storage, `nobound`, the design without the read-wait bound, and
-`ssd192`, `ssd128`, `ssd64`, `ssd32`, the design with that SSD per GPU). The `design` settings also hold N = 410 to
-490 in steps of 10. To regenerate: `data/session_targets.py`; the tier traffic: `data/tier_traffic.py` (usage in each
-docstring).
+`ssd256`, `ssd64`, the design with that SSD per GPU). The `design` settings also hold N = 410 to 490 in steps of 10.
+To regenerate: `data/session_targets.py`; the tier traffic: `data/tier_traffic.py` (usage in each docstring).
 The microbatch check of `5_prefix_cache.md` §4 applies unchanged.
 
 ## 5. How to run
@@ -253,8 +271,8 @@ The microbatch check of `5_prefix_cache.md` §4 applies unchanged.
   from an earlier run makes hits that the targets do not have.
 - **Memory.** Limit the KV pool by its token count (`1_contract.md` §2.3), and DRAM and SSD by their bytes per GPU.
 - **Tier bring-up.** For each step, replay `data/bringup/tier_sessions.csv` on a freshly started server with the
-  1,234,944-token pool and no `max_concurrency`. Run it once with DRAM only (150 GB), and from step 2 on once with SSD
-  only (256 GB, the DRAM tier off). For the two reference columns of §3, run it once at step 0 (no tier: round 1
+  1,234,944-token pool and no `max_concurrency`. Run it once with DRAM only (50 GB), and from step 2 on once with SSD
+  only (128 GB, the DRAM tier off). For the two reference columns of §3, run it once at step 0 (no tier: round 1
   computes again) and once at step 0 with the full 61.3M-token pool (round 1 hits HBM). Log every read: its round, its
   tier, its tokens, when it starts and when it lands.
 - **Sessions.** For each step, N = 400 and 500 at each memory setting, each on a freshly started server, with the
@@ -288,9 +306,14 @@ which read, how long the reads took, and whether writes delayed them.
 
 ## 7. Where these targets may be off
 
-- **Writes are free in the target.** A real write of 1.1 GB/s per GPU (§4) shares the host links and the SSD with
-  the reads. Writes that slow the reads, or a session evicted from HBM before its write is done, miss the target.
-- **The KDA state's size.** It is most of the write traffic and a fixed part of every read. A state stored larger
+- **Writes are free in the target.** With the memory limits at N = 400, DRAM takes 1.35–1.99 GB/s per GPU of what
+  HBM evicts and SSD 0.41–0.58 GB/s of what DRAM evicts, in 10-s bursts of up to 4.1 and 1.0 GB/s (§4). They share
+  the host links and the SSD with the reads. Writes that slow the reads, or HBM blocks reused before the evicted
+  context is written to DRAM, miss the target.
+- **Victim writes sit on the eviction path.** An eviction from HBM must copy the context out before its blocks take
+  new KV, and an eviction from DRAM before its pages are reused. A system that makes room only after the copy
+  lands admits later than the target.
+- **The KDA state's size.** It is most of SSD's write traffic and a fixed part of every read. A state stored larger
   than 36.9 MB per GPU per context (padded to blocks, or one per block) costs bandwidth and tier space in proportion.
 - **Read bandwidth from the first byte.** The target reads a 32k context (86 MB) at full speed. A real SSD read that
   size may not reach 10 GB/s, so short reads take longer than the formula; record the measured read time per size.
@@ -298,9 +321,12 @@ which read, how long the reads took, and whether writes delayed them.
   later reads, not as lost throughput. Check the read times before the link bandwidth.
 - **Balanced storage passes bytes over NVLink.** The target counts no time for it. It is a few tens of MB per read,
   next to an NVLink of hundreds of GB/s.
-- **SSD space.** The run fills up to 207 of 256 GB per GPU at N = 400, and 231 GB at full memory and N = 500. A
-  context stored larger than the target's (the KDA state above, or per-block overhead) fills the SSD sooner; once it
-  evicts, the evicted sessions are computed again (§4: at 64 GB the memory limits miss the SLO).
+- **SSD space.** With the memory limits SSD fills its 128 GB per GPU and evicts, almost only sessions that have
+  ended. A context stored larger than the target's (the KDA state above, or per-block overhead) fills the SSD sooner
+  and evicts sessions still in use, which are then computed again (§4: at 64 GB the memory limits miss the SLO).
+- **Older entries.** A tier keeps a session's context as it was when it left the tier above, and a round whose prompt
+  ends inside the latest context can resume from it (§4). A system that overwrites or drops a tier's entry whenever
+  the session's context changes loses these hits and moves toward the full-memory hit share.
 - **Eviction.** The target evicts whole sessions from each tier, least recently used first. Keeping parts of a
   session, or another order, changes the read shares and moves the Tiers and SSD-heavy numbers.
 - **Host time.** Lookups and starting and landing reads take host time on every microbatch; the target has none.

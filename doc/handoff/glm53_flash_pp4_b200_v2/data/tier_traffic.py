@@ -1,14 +1,13 @@
 """Tier traffic of a session run with DRAM and SSD (7_offloading.md §4), per GPU.
 
 For each <name>=<sim run dir>: each tier's write and read rate averaged over the 20 minutes, its space used at the
-end, the busiest 10-s window of SSD reads and of SSD writes, and the longest wait of a read for its tier's channel.
+end, the busiest 10-s window of SSD reads and of each tier's writes, and the longest wait of a read for its tier's channel.
 Bytes per GPU are the balanced store's: `tier_kv_bytes_per_token` per token (the tier's capacity in tokens over its
 bytes) plus one KDA state per stored or read context (`tier_state_bytes_per_request` in the run's stdout).
-- Writes: the tokens each store adds to the session's entry, plus one state per store; copies of reads into DRAM
-  count as DRAM writes.
+- Writes: the tokens each store adds to the session's entry, plus one state per store (DRAM: what HBM evicts; SSD:
+  what DRAM evicts).
 - Reads: the tokens a read moves (what HBM lacks), plus one state; a read's window is the one it lands in.
-- SSD write windows: a round's write lands when its token comes out, and adds what its context has beyond the
-  session's previous one (evictions ignored), plus one state.
+- Write windows: the run's own count of each tier's writes per 10 s (`window_writes` in prefix_tiers_w0.json).
 - Read wait: from when the read is issued to when it lands, minus its transfer time.
 
 usage (ServingStudioSim root):
@@ -18,10 +17,8 @@ import csv, json, math, re, sys
 from collections import defaultdict
 from pathlib import Path
 
-import pyarrow.parquet as pq
 
 SECONDS = 1200.0
-trace = list(csv.DictReader(open(Path(__file__).parent / "sessions_2ps.csv")))
 BW = {"dram": 50e9, "ssd": 10e9}
 
 for arg in sys.argv[1:]:
@@ -52,18 +49,11 @@ for arg in sys.argv[1:]:
         max_wait = max(max_wait, (ready - float(row["read_ms"])) / 1e3 - nbytes / BW[row["tier"]])
         if row["tier"] == "ssd":
             reads[int(ready // 10e3)] += nbytes / 10.0
-    slo = pq.read_table(run / "raw/request_slo.parquet", columns=["request_id", "arrival_time_ms", "ttft_ms"])
-    done = sorted((r["arrival_time_ms"] + r["ttft_ms"], r["request_id"]) for r in slo.to_pylist()
-                  if r["ttft_ms"] is not None)
-    last = {}
-    writes = defaultdict(float)
-    for at, request in done:
-        row = trace[request]
-        context = int(row["prefix_len"]) + int(row["input_len"])
-        new = max(0, context - last.get(row["session_id"], 0))
-        last[row["session_id"]] = context
-        writes[int(at // 10e3)] += (new * per_token + state_bytes) / 10.0
+    for tier, t in tiers.items():
+        # Each tier's writes per 10-s window of the run: (entries stored, tokens written).
+        peak = max(((n * state_bytes + tokens * per_token) / 10.0 for n, tokens in t["window_writes"][:120]),
+                   default=0.0)
+        out[f"{tier}_write_peak_10s_gb_s"] = peak / 1e9
     out["ssd_read_peak_10s_gb_s"] = max(reads.values(), default=0.0) / 1e9
-    out["ssd_write_peak_10s_gb_s"] = max(writes.values(), default=0.0) / 1e9
     out["max_read_wait_s"] = max_wait
     print(name, json.dumps(out, default=lambda x: round(x, 3)))

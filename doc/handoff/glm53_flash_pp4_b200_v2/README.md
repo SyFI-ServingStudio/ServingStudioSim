@@ -14,8 +14,8 @@ instead of 500.
 One four-stage pipeline (4 × B200, layers split [12,11,11,11]) serves the prefill of coding-agent sessions on
 GLM-5.3-Flash NVFP4. It keeps every session's context in HBM, host DRAM and local SSD, and forms microbatches
 shortest-remaining-first under a budget that follows the prefill backlog. On a 20-minute benchmark of 2 new sessions/s
-with at most 400 active, it computes 92.8k new prompt tokens/s (26.8 rounds/s) at TTFT p50 / p90 / p99 0.15 / 0.48 /
-4.03 s.
+with at most 400 active, it computes 92.9k new prompt tokens/s (26.8 rounds/s) at TTFT p50 / p90 / p99 0.15 / 0.50 /
+3.80 s.
 
 ## Design
 
@@ -98,8 +98,9 @@ parallelism inside it. The split is [12,11,11,11]:
 - **Hits.** A session's next round resumes from its whole previous prompt: the KV of its DSA layers and the KDA state
   at its last token. A prompt that ends inside the previous one finds no KDA state there and is computed again from
   its first token. In the benchmark, 1.1% of the rounds do so, after the agent dropped the end of its context.
-- **Tiers.** Each GPU has HBM, plus host DRAM (150 GB, 50 GB/s) and local SSD (256 GB, 10 GB/s), all write-through
-  LRU. In the 20-minute benchmark the active contexts still fit in HBM (98% of prefix tokens at 400 sessions); the
+- **Tiers.** Each GPU has HBM, plus host DRAM (50 GB, 50 GB/s) and local SSD (128 GB, 10 GB/s), each LRU and each
+  the victim tier of the one above: DRAM is written with what HBM evicts, SSD with what DRAM evicts (write-back), only
+  what the tier's entry lacks. A read keeps the tier's copy. In the 20-minute benchmark the active contexts still fit in HBM (98% of prefix tokens at 400 sessions); the
   cache-tier benchmark limits HBM and DRAM so that DRAM and SSD carry their share within minutes.
 - **Reads.** A tier read is asynchronous and holds its HBM blocks. A request whose read would wait more than 1 s for
   its tier is passed over: it starts no read and stays queued.
@@ -142,23 +143,24 @@ The SLO is p99 ≤ 6 s.
 
 | Point | Max sessions | Rounds/s | New tokens/s | TTFT p50 / p90 / p99 | Stage busy 0 / 1 / 2 / 3 |
 |---|---|---|---|---|---|
-| **SLO** | **400** | **26.8** | **92.8k** | **0.15 / 0.48 / 4.03** | 89% / 86% / 88% / 89% |
-| Overloaded | 500 | 29.1 | 103.6k | 0.23 / 1.82 / 60.77 | 93% / 88% / 91% / 92% |
+| **SLO** | **400** | **26.8** | **92.9k** | **0.15 / 0.50 / 3.80** | 89% / 86% / 88% / 89% |
+| Overloaded | 500 | 29.6 | 104.8k | 0.23 / 1.55 / 60.69 | 93% / 88% / 91% / 92% |
 
-The SLO holds up to 410 sessions (p99 5.23 s); at 420, p99 is 7.79 s. At 500 the pipeline does not keep up: 683
+The SLO holds up to 410 sessions (p99 4.95 s); at 420, p99 is 7.72 s. At 500 the pipeline does not keep up: 628
 rounds wait more than 60 s, and the queue grows to the end (`7_offloading.md` §4).
 
 **Final: cache tiers, 20 minutes** (`1_contract.md` §2.3). The same workload with the KV pool and DRAM limited.
-At 400 sessions, throughput stays within 0.2% of the full-memory run. Prefix read share over the rounds that arrive
+At 400 sessions, both meet the SLO and match or beat the full-memory run: DRAM and SSD keep older contexts of a
+session, from which some rounds whose prompt ends inside the latest context resume. Prefix read share over the rounds that arrive
 in [10, 20 min); the rest of the prefix tokens are computed again. At 500 sessions no setting keeps up, so its read
 share is left out (—).
 
 | Memory (KV pool / DRAM per GPU) | Max sessions | New tokens/s | TTFT p50 / p90 / p99 | Prefix reads HBM / DRAM / SSD |
 |---|---|---|---|---|
-| 15.3M tokens / 37.5 GB | **400** | **92.7k** | **0.17 / 0.50 / 3.95** | 48% / 36% / 15% |
-| 15.3M tokens / 37.5 GB | 500 | 103.3k | 0.26 / 2.20 / 60.75 | — |
-| 7.6M tokens / 18.75 GB | **400** | **92.6k** | **0.18 / 0.53 / 4.15** | 20% / 29% / 49% |
-| 7.6M tokens / 18.75 GB | 500 | 102.4k | 0.29 / 2.55 / 60.77 | — |
+| 12.2M tokens / 20 GB | **400** | **94.4k** | **0.17 / 0.39 / 2.72** | 39% / 31% / 28% |
+| 12.2M tokens / 20 GB | 500 | 104.5k | 0.26 / 1.99 / 60.69 | — |
+| 7.6M tokens / 12.5 GB | **400** | **93.2k** | **0.18 / 0.47 / 3.39** | 20% / 28% / 50% |
+| 7.6M tokens / 12.5 GB | 500 | 102.9k | 0.29 / 2.56 / 60.79 | — |
 
 The targets are not a hardware ceiling: a faster kernel or schedule is welcome.
 

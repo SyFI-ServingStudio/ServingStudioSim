@@ -146,7 +146,7 @@ rounds whose TTFT exceeds 60 s.
   prompt ends inside the previous one and 46 whose session was evicted from the pool. Shortest first keeps passing
   them over; force-schedule serves them at 60 s, and the rounds behind them wait.
 - **With DRAM and SSD,** evicted sessions are read back instead, and the same scheduler holds N = 400 within the SLO
-  (`7_offloading.md`; README: 92.8k new tokens/s, TTFT 0.15 / 0.48 / 4.03 s).
+  (`7_offloading.md`; README: 92.9k new tokens/s, TTFT 0.15 / 0.50 / 3.80 s).
 
 **At N = 500, with HBM only, no step keeps up:**
 - **Without force-schedule (steps 1–3).** TTFT p50 / p90 / p99 look fine: 0.16–0.26 / 0.36–0.60 / 3.39–4.61 s. But

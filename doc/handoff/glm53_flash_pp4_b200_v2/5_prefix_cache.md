@@ -126,7 +126,7 @@ trace's prefix tokens.
 - **N = 500 does not.** The pool no longer holds every session between its rounds. 2.99% of prefix tokens miss, and
   computing them again adds 46% to the computed tokens. The stages run close to their limit, rounds/s falls below
   N = 400, and the queue grows: TTFT p50 / p90 / p99 3.01 / 13.03 / 23.93 s.
-- The full design serves N = 400 at 92.8k new tokens/s and TTFT 0.15 / 0.48 / 4.03 s (README). The design's
+- The full design serves N = 400 at 92.9k new tokens/s and TTFT 0.15 / 0.50 / 3.80 s (README). The design's
   scheduler (`6_scheduler.md`) does not reach it alone: with HBM only, its force-schedule step misses the SLO at
   N = 400. Keeping evicted sessions in DRAM and SSD (`7_offloading.md`) does reach it.
 

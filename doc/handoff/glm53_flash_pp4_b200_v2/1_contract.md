@@ -11,8 +11,8 @@ match, record it in `issues.md` before comparing, and say which target it affect
 | Context length | `max_model_len` 1,048,576 tokens. |
 | GPUs | 4 × NVIDIA B200 (180 GB) in one NVLink domain. |
 | HBM per GPU | 149.84 GB for weights and KV: 85% of the B200's 183,359 MiB (163.4 GB), less about 13.6 GB of activations and CUDA-graph workspace, as measured on a B200 serving process. The largest stage's weights take 49.66 GB; 100.18 GB is left for KV. |
-| Host DRAM for prefix KV | 150 GB per GPU at 50 GB/s (600 GB for the node). |
-| Local SSD for prefix KV | 256 GB per GPU at 10 GB/s (1 TB and 40 GB/s for the node). |
+| Host DRAM for prefix KV | 50 GB per GPU at 50 GB/s (200 GB for the node). |
+| Local SSD for prefix KV | 128 GB per GPU at 10 GB/s (512 GB and 40 GB/s for the node). |
 | Decode | Not on these GPUs. Every request asks for one output token (§2.2). |
 
 **KV pool.** The target pool is 61.3M tokens (61,258,368). It is allocated in blocks of 8,576 tokens. A block holds
@@ -126,9 +126,11 @@ sessions after 20 minutes (about 40–50M tokens) still fits in HBM, so DRAM and
 
 | Variant | KV pool in HBM | DRAM per GPU | SSD per GPU |
 |---|---|---|---|
-| Tiers | 15,273,856 tokens (25 GB per GPU) | 37.5 GB | 256 GB, unchanged |
-| SSD-heavy | 7,632,640 tokens (12.5 GB per GPU) | 18.75 GB | 256 GB, unchanged |
+| Tiers | 12,220,800 tokens (20 GB per GPU) | 20 GB | 128 GB, unchanged |
+| SSD-heavy | 7,632,640 tokens (12.5 GB per GPU) | 12.5 GB | 128 GB, unchanged |
 
+- Tiers splits the prefix reads at N = 400 about evenly over HBM, DRAM and SSD; SSD-heavy serves half of them from
+  SSD (`7_offloading.md` §4).
 - Limit the pool by its token count, not by a memory fraction: the count is what the targets depend on.
 - Bandwidths stay as in §1.
 - Leave the freed HBM unused. Do not hand it to larger batches or other buffers.
