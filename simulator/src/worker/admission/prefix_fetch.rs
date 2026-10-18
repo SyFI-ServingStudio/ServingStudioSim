@@ -294,6 +294,7 @@ impl Drop for SessionPrefixTiers {
                     "earlier_states": self.tiers.earlier_states(tier),
                     "write_window_ms": WRITE_WINDOW.as_ms(),
                     "window_writes": self.tiers.window_writes(tier),
+                    "window_state_writes": self.tiers.window_states(tier),
                 })
             })
             .collect();

@@ -347,7 +347,10 @@ only states within a new round's declared prefix carry over. A prompt ending
 inside the context resumes at the latest state at or below it. Earlier states
 only fill slack: under pressure the LRU entry's oldest earlier state goes before
 any whole context, and a taken entry leaves its states up to the resume point
-behind as a states-only entry. A read moves one state.
+behind as a states-only entry. A read moves one state. HBM keeps this order even
+with a victim DRAM behind it, where a state costs its padded blocks (measured:
+evicting whole HBM entries instead held fewer contexts and lost throughput at
+small k, with no gain at k = all).
 
 Behind HBM's retained tier a head can keep host DRAM and SSD tiers
 (`dram_tier_gb`, `ssd_tier_gb`, per GPU, with read bandwidths). They are
@@ -384,9 +387,11 @@ A tier is sized and read in the most loaded stage's bytes per token;
 `prefix_tier_balanced_load` (not vLLM) uses the stages' mean instead. A hybrid
 pipeline's entry adds one recurrent state on that same GPU, in real bytes (the
 stage's own, or the stages' mean), not the HBM pool's padded state blocks; its
-earlier round-end states are charged the same bytes each and yield first. A
-victim tier keeps a state HBM or DRAM dropped (state only, no KV) only beside
-the session's own KV up to it, in room freed from other earlier states. A shortest-prefill-first order ranks a request by what HBM or a tier
+earlier round-end states are charged the same bytes each and yield first, except
+in a tier with a victim tier behind it, which demotes whole entries (states with
+their KV); the victim tier merges them into its entry for the session, writing
+only what it lacks. A state that arrives alone is kept only beside the session's
+own KV up to it. A shortest-prefill-first order ranks a request by what HBM or a tier
 holds. With `prefix_tier_warm_start`, a session request whose declared prefix
 exceeds every context the run stored for it is a pre-run conversation, read
 from the slowest tier (closed-loop traces that join sessions mid-life).

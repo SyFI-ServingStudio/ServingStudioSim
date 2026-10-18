@@ -41,12 +41,16 @@
 //! one state, and a lookup resumes from the latest kept state at or before the
 //! prompt's end; a read still moves one state. As in the HBM prefix cache
 //! (`prefix_cache.rs`), every kept state sits at a prefix of the entry's
-//! context, and earlier states never displace a context: a tier that needs
-//! room drops the least recently used entry's oldest earlier state first, and
-//! evicts a whole entry only when no entry has an earlier state left. A victim
-//! tier behind it keeps a dropped state only beside KV of the session it
-//! already holds up to that state, and only in room other earlier states give
-//! up: the KV stays in the tier above, which a victim tier never duplicates.
+//! context. Where leaving a tier loses a state, earlier states never displace
+//! a context: a tier with no victim tier behind it drops the least recently
+//! used entry's oldest earlier state first, and evicts a whole entry only when
+//! no entry has an earlier state left. A tier with a victim tier behind it
+//! loses nothing by evicting, so it evicts whole least recently used entries,
+//! each with its earlier states, which the victim tier merges into its own
+//! entry for the session (both are prefixes of the session's latest context).
+//! A victim tier keeps a state the tier above let go of alone only beside KV
+//! of the session it already holds up to that state: the KV stays in the tier
+//! above, which a victim tier never duplicates.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -151,20 +155,22 @@ pub(crate) struct PrefixTierEvent {
 pub(crate) const WRITE_WINDOW: Time = Time::from_ms_u64(10_000);
 
 /// What leaves a tier for the one behind it: a session's context of
-/// `tokens` with its state at the end, or only an earlier state at `tokens`
-/// whose context stays.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `tokens` with its state at the end and its `earlier` round-end states, or
+/// only an earlier state at `tokens` whose context stays.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Leaving {
     session_id: u32,
     tokens: u64,
+    earlier: Vec<u64>,
     state_only: bool,
 }
 
 impl Leaving {
-    fn context(session_id: u32, tokens: u64) -> Self {
+    fn context(session_id: u32, tokens: u64, earlier: Vec<u64>) -> Self {
         Self {
             session_id,
             tokens,
+            earlier,
             state_only: false,
         }
     }
@@ -173,6 +179,7 @@ impl Leaving {
         Self {
             session_id,
             tokens,
+            earlier: Vec::new(),
             state_only: true,
         }
     }
@@ -211,6 +218,8 @@ struct PrefixTier {
     counters: PrefixTierCounters,
     /// Per [`WRITE_WINDOW`] of the clock: (entries stored, tokens written).
     window_writes: Vec<(u64, u64)>,
+    /// Per [`WRITE_WINDOW`] of the clock: states written.
+    window_states: Vec<u64>,
     clock: Time,
     events: Option<Vec<PrefixTierEvent>>,
 }
@@ -234,6 +243,14 @@ impl PrefixTier {
                 declared,
             });
         }
+    }
+
+    fn count_window_states(&mut self, states: u64) {
+        let window = (self.clock.0 / WRITE_WINDOW.0) as usize;
+        if self.window_states.len() <= window {
+            self.window_states.resize(window + 1, 0);
+        }
+        self.window_states[window] += states;
     }
 
     /// `tokens` of KV and `states` states.
@@ -310,16 +327,33 @@ impl PrefixTier {
         Some(Leaving::state(session_id, at))
     }
 
+    /// Evict the least recently used entry (other than `except`'s) whole, its
+    /// earlier states with it, and return it as a context that leaves the tier.
+    fn evict_lru(&mut self, state_tokens: u64, except: Option<u32>) -> Option<Leaving> {
+        let victim = self
+            .lru
+            .values()
+            .copied()
+            .find(|&session| Some(session) != except)?;
+        let entry = self.remove(victim, state_tokens).expect("indexed entry");
+        self.counters.evicted_entries += 1;
+        self.counters.evicted_tokens += entry.tokens;
+        self.log(PrefixTierEventKind::Evict, victim, entry.tokens, entry.tokens, 0);
+        Some(Leaving::context(victim, entry.tokens, entry.earlier))
+    }
+
     /// Keep the state at `at` the tier above dropped beside the session's
-    /// entry, if the entry holds the KV up to it and lacks it, making room
-    /// only from other entries' earlier states; returns the states that leave
-    /// for it.
+    /// entry, if the entry holds the KV up to it and lacks it; returns what
+    /// leaves for it. Room comes only from other entries' earlier states, or,
+    /// in a tier that `demotes` (a victim tier is behind it), from whole
+    /// least recently used entries, which lose nothing.
     fn add_earlier_state(
         &mut self,
         session_id: u32,
         at: u64,
         max_earlier: usize,
         state_tokens: u64,
+        demotes: bool,
     ) -> Vec<Leaving> {
         let mut left = Vec::new();
         let Some(entry) = self.entries.get(&session_id) else {
@@ -332,7 +366,12 @@ impl PrefixTier {
             return left; // older than every state it keeps
         }
         while self.used + state_tokens > self.capacity {
-            match self.drop_earlier_state(state_tokens, Some(session_id)) {
+            let room = if demotes {
+                self.evict_lru(state_tokens, Some(session_id))
+            } else {
+                self.drop_earlier_state(state_tokens, Some(session_id))
+            };
+            match room {
                 Some(dropped) => left.push(dropped),
                 None => return left,
             }
@@ -346,6 +385,8 @@ impl PrefixTier {
         self.used += state_tokens;
         self.earlier_states += 1;
         self.counters.written_states += 1;
+        self.count_window_states(1);
+        let entry = self.entries.get_mut(&session_id).expect("checked above");
         let tokens = entry.tokens;
         if entry.earlier.len() > max_earlier {
             let oldest = entry.earlier.remove(0);
@@ -361,16 +402,25 @@ impl PrefixTier {
     /// Store the session's context with its `earlier` round-end states and
     /// return what leaves the tier for it: dropped earlier states, the LRU
     /// victims, or the context itself when it is larger than the whole tier.
+    /// A tier that `demotes` (a victim tier is behind it) loses nothing by
+    /// evicting, so it evicts whole LRU entries, their states with their KV,
+    /// and drops no earlier state first.
     fn store(
         &mut self,
         session_id: u32,
         tokens: u64,
         mut earlier: Vec<u64>,
         state_tokens: u64,
+        demotes: bool,
     ) -> Vec<Leaving> {
         let previous = self.remove(session_id, state_tokens);
         let previous_tokens = previous.as_ref().map_or(0, |e| e.tokens);
         let mut left = Vec::new();
+        if demotes && self.charge(tokens, 1, state_tokens) > self.capacity {
+            self.log(PrefixTierEventKind::TooLarge, session_id, 0, previous_tokens, 0);
+            left.push(Leaving::context(session_id, tokens, earlier));
+            return left;
+        }
         // Its own earlier states go first if the context alone barely fits.
         while self.charge(tokens, 1 + earlier.len(), state_tokens) > self.capacity
             && !earlier.is_empty()
@@ -380,31 +430,28 @@ impl PrefixTier {
         }
         if self.charge(tokens, 1, state_tokens) > self.capacity {
             self.log(PrefixTierEventKind::TooLarge, session_id, 0, previous_tokens, 0);
-            left.push(Leaving::context(session_id, tokens));
+            left.push(Leaving::context(session_id, tokens, Vec::new()));
             return left;
         }
         while self.used + self.charge(tokens, 1 + earlier.len(), state_tokens) > self.capacity {
-            // Earlier states never displace a context: other entries' go
-            // first, then this one's, then whole entries.
-            if let Some(dropped) = self.drop_earlier_state(state_tokens, None) {
-                left.push(dropped);
-                continue;
+            // Where leaving loses them, earlier states never displace a
+            // context: other entries' go first, then this one's, then whole
+            // entries.
+            if !demotes {
+                if let Some(dropped) = self.drop_earlier_state(state_tokens, None) {
+                    left.push(dropped);
+                    continue;
+                }
+                if !earlier.is_empty() {
+                    left.push(Leaving::state(session_id, earlier.remove(0)));
+                    self.counters.earlier_state_drops += 1;
+                    continue;
+                }
             }
-            if !earlier.is_empty() {
-                left.push(Leaving::state(session_id, earlier.remove(0)));
-                self.counters.earlier_state_drops += 1;
-                continue;
-            }
-            let (_, &victim) = self
-                .lru
-                .iter()
-                .next()
-                .expect("a full tier has an entry to evict");
-            let evicted = self.remove(victim, state_tokens).unwrap().tokens;
-            self.counters.evicted_entries += 1;
-            self.counters.evicted_tokens += evicted;
-            self.log(PrefixTierEventKind::Evict, victim, evicted, evicted, 0);
-            left.push(Leaving::context(victim, evicted));
+            left.push(
+                self.evict_lru(state_tokens, None)
+                    .expect("a full tier has an entry to evict"),
+            );
         }
         let written_states = std::iter::once(tokens)
             .chain(earlier.iter().copied())
@@ -434,6 +481,7 @@ impl PrefixTier {
         }
         self.window_writes[window].0 += 1;
         self.window_writes[window].1 += tokens.saturating_sub(previous_tokens);
+        self.count_window_states(written_states);
         self.log(PrefixTierEventKind::Write, session_id, tokens, previous_tokens, 0);
         left
     }
@@ -483,6 +531,7 @@ impl PrefixTiers {
                     read_bytes_per_s: spec.read_gb_per_s_per_gpu * 1e9,
                     counters: PrefixTierCounters::default(),
                     window_writes: Vec::new(),
+                    window_states: Vec::new(),
                     clock: Time::ZERO,
                     events: None,
                 }
@@ -524,9 +573,15 @@ impl PrefixTiers {
     }
 
     /// The earlier states a new entry for the session in `tier` keeps below
-    /// its end: the old entry's states (its end's included) and `extra`, those
+    /// its end: the old entry's states (its end's included) and `extra`'s, those
     /// at or before `limit`, the latest `max_states - 1` of them, ascending.
-    fn earlier_for(&self, tier: usize, session_id: u32, limit: u64, extra: Option<u64>) -> Vec<u64> {
+    fn earlier_for(
+        &self,
+        tier: usize,
+        session_id: u32,
+        limit: u64,
+        extra: impl IntoIterator<Item = u64>,
+    ) -> Vec<u64> {
         if self.max_states <= 1 {
             return Vec::new();
         }
@@ -624,7 +679,7 @@ impl PrefixTiers {
         let state_tokens = self.state_tokens;
         if let Some(tier) = self.tiers.last_mut() {
             // The slowest tier has no victim tier behind it.
-            let _ = tier.store(session_id, tokens, Vec::new(), state_tokens);
+            let _ = tier.store(session_id, tokens, Vec::new(), state_tokens, false);
         }
     }
 
@@ -667,8 +722,16 @@ impl PrefixTiers {
     /// that one is its victim tier.
     fn store_in(&mut self, tier: usize, session_id: u32, tokens: u64, earlier: Vec<u64>) {
         let state_tokens = self.state_tokens;
-        let left = self.tiers[tier].store(session_id, tokens, earlier, state_tokens);
+        let demotes = self.demotes(tier);
+        let left = self.tiers[tier].store(session_id, tokens, earlier, state_tokens, demotes);
         self.pass_down(tier, left);
+    }
+
+    /// Whether what leaves `tier` goes to a victim tier behind it.
+    fn demotes(&self, tier: usize) -> bool {
+        self.tiers
+            .get(tier + 1)
+            .is_some_and(|behind| behind.spec.writes == PrefixTierWrites::FasterTierEvictions)
     }
 
     /// Hand what left `tier` to the tier behind it, if that is its victim tier.
@@ -677,7 +740,7 @@ impl PrefixTiers {
             if leaving.state_only {
                 self.take_victim_state(tier + 1, leaving.session_id, leaving.tokens);
             } else {
-                self.take_victim(tier + 1, leaving.session_id, leaving.tokens);
+                self.take_victim(tier + 1, leaving.session_id, leaving.tokens, &leaving.earlier);
             }
         }
     }
@@ -689,6 +752,7 @@ impl PrefixTiers {
     fn take_victim_state(&mut self, tier: usize, session_id: u32, at: u64) {
         let state_tokens = self.state_tokens;
         let max_earlier = self.max_states - 1;
+        let demotes = self.demotes(tier);
         let Some(state) = self
             .tiers
             .get_mut(tier)
@@ -696,16 +760,17 @@ impl PrefixTiers {
         else {
             return;
         };
-        let left = state.add_earlier_state(session_id, at, max_earlier, state_tokens);
+        let left = state.add_earlier_state(session_id, at, max_earlier, state_tokens, demotes);
         self.pass_down(tier, left);
     }
 
     /// The tier above `tier` let go of the session's `tokens`-token context
-    /// (with its state at the end): if `tier` is its victim tier, write what
-    /// its entry lacks, or only refresh an entry that already holds it all.
-    /// Both are prefixes of the session's latest context (a victim entry is
-    /// cut at each round's admission), so their states merge.
-    fn take_victim(&mut self, tier: usize, session_id: u32, tokens: u64) {
+    /// (with its state at the end and its `earlier` states): if `tier` is its
+    /// victim tier, write what its entry lacks, or only refresh an entry that
+    /// already holds it all. Both are prefixes of the session's latest
+    /// context (a victim entry is cut at each round's admission), so their
+    /// states merge.
+    fn take_victim(&mut self, tier: usize, session_id: u32, tokens: u64, earlier: &[u64]) {
         let Some(state) = self
             .tiers
             .get(tier)
@@ -715,8 +780,8 @@ impl PrefixTiers {
         };
         let held = state.entries.get(&session_id);
         let end = held.map_or(tokens, |e| e.tokens.max(tokens));
-        let earlier =
-            self.earlier_for(tier, session_id, end.saturating_sub(1), (tokens < end).then_some(tokens));
+        let incoming = earlier.iter().copied().chain(std::iter::once(tokens));
+        let earlier = self.earlier_for(tier, session_id, end.saturating_sub(1), incoming);
         if held.is_some_and(|e| e.tokens == end && e.earlier == earlier) {
             self.tiers[tier].touch(session_id);
         } else {
@@ -735,7 +800,7 @@ impl PrefixTiers {
     /// a victim fastest tier writes what its entry lacks, or only refreshes an
     /// entry that already holds it all.
     pub(crate) fn store_evicted(&mut self, session_id: u32, tokens: u64) {
-        self.take_victim(0, session_id, tokens);
+        self.take_victim(0, session_id, tokens, &[]);
     }
 
     /// HBM dropped the session's earlier round-end state at `at` and keeps
@@ -755,6 +820,11 @@ impl PrefixTiers {
     /// Per [`WRITE_WINDOW`]: (entries stored, tokens written).
     pub(crate) fn window_writes(&self, tier: usize) -> &[(u64, u64)] {
         &self.tiers[tier].window_writes
+    }
+
+    /// Per [`WRITE_WINDOW`]: states written.
+    pub(crate) fn window_states(&self, tier: usize) -> &[u64] {
+        &self.tiers[tier].window_states
     }
 
     /// Keep every write, eviction, cut and read of each tier from now on.
@@ -1184,6 +1254,71 @@ mod tests {
         assert_eq!(t.lookup(1, 75_000).unwrap().tokens, 60_000);
         assert_eq!(t.counters(0).evicted_entries, 0);
         assert_eq!(t.used_tokens(0), 500_000);
+    }
+
+    /// HBM -> DRAM -> SSD victim chain (1000 B/token, a state 50k tokens),
+    /// resumable only at states, up to `states` per entry.
+    fn round_end_chain(dram_gb: f64, ssd_gb: f64, states: u32) -> PrefixTiers {
+        let spec = |name, gb| PrefixTierSpec {
+            name,
+            capacity_gb_per_gpu: gb,
+            read_gb_per_s_per_gpu: 1.0,
+            writes: PrefixTierWrites::FasterTierEvictions,
+        };
+        PrefixTiers::new(
+            &[spec("dram", dram_gb), spec("ssd", ssd_gb)],
+            1000,
+            50_000,
+            ResumePoint::ContextEnd,
+        )
+        .with_round_end_states(states)
+    }
+
+    #[test]
+    fn a_victim_chain_demotes_states_with_their_kv() {
+        let mut t = round_end_chain(0.5, 10.0, 4);
+        // HBM evicts session 1's context; earlier states HBM drops alone later
+        // are kept beside it, since DRAM holds the KV up to them.
+        t.store_evicted(1, 200_000);
+        t.store_evicted_state(1, 100_000);
+        t.store_evicted_state(1, 150_000);
+        assert_eq!(t.used_tokens(0), 200_000 + 3 * 50_000);
+        assert_eq!(t.lookup(1, 160_000).unwrap(), PrefixTierHit { tier: 0, tokens: 150_000 });
+        // DRAM needs room for session 2: with SSD behind it, it drops no state
+        // alone but demotes 1 whole, its states with its KV.
+        t.store_evicted(2, 150_000);
+        assert_eq!(t.counters(0).earlier_state_drops, 0);
+        assert_eq!(t.counters(0).evicted_entries, 1);
+        assert_eq!(t.lookup(1, 160_000).unwrap(), PrefixTierHit { tier: 1, tokens: 150_000 });
+        assert_eq!(t.lookup(1, 120_000).unwrap().tokens, 100_000);
+        assert_eq!(t.used_tokens(1), 200_000 + 3 * 50_000);
+        assert_eq!(t.counters(1).written_tokens, 200_000);
+        assert_eq!(t.counters(1).written_states, 3);
+        // Session 1 resumes at 150k from SSD and extends to 250k; HBM later
+        // evicts that context alone. DRAM holds none of 1, so it writes the
+        // whole context (DRAM and SSD are exclusive only as they are written).
+        t.load(1, t.lookup(1, 160_000).unwrap(), 0, Time::ZERO);
+        t.drop_stale(1, 160_000);
+        assert_eq!(t.used_tokens(1), 150_000 + 2 * 50_000);
+        t.store_evicted(1, 250_000);
+        assert_eq!(t.lookup(1, 250_000).unwrap(), PrefixTierHit { tier: 0, tokens: 250_000 });
+        // DRAM demotes 2 and then 1: SSD merges 1, writing only the 100k
+        // tokens it lacks and the new end state, and keeps its own states.
+        t.store_evicted(3, 300_000);
+        assert_eq!(t.counters(0).evicted_entries, 3);
+        assert_eq!(t.counters(1).written_tokens, 200_000 + 150_000 + 100_000);
+        assert_eq!(t.lookup(1, 250_000).unwrap(), PrefixTierHit { tier: 1, tokens: 250_000 });
+        assert_eq!(t.lookup(1, 200_000).unwrap().tokens, 150_000);
+        assert_eq!(t.lookup(1, 140_000).unwrap().tokens, 100_000);
+        // The last tier still drops earlier states before any context.
+        let mut t = round_end_chain(0.3, 0.5, 4);
+        t.store_evicted(1, 150_000);
+        t.store_evicted_state(1, 100_000);
+        t.store_evicted(2, 150_000); // DRAM demotes 1 whole to SSD (250k)
+        t.store_evicted(3, 150_000); // and 2 (200k): SSD full at 450k
+        t.store_evicted(4, 150_000); // 3 to SSD: 1's earlier state goes first
+        assert_eq!(t.counters(1).earlier_state_drops, 1);
+        assert_eq!(t.counters(1).evicted_entries, 1);
     }
 
     use PrefixTierWrites::{EveryContext, FasterTierEvictions};
