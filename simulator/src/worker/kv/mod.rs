@@ -224,6 +224,13 @@ pub trait PrefixKv: KvStore {
     /// Drop a read's hold, if it has one.
     fn release_read_hold(&mut self, request: RequestId);
 
+    /// Keep `tokens` of `partition` free for reads: holds count as at least
+    /// this much, so admission and the retained-prefix tier never use it.
+    fn set_loading_area(&mut self, partition: PartitionId, tokens: u64);
+
+    /// The partition's KV capacity, in the store's tokens.
+    fn capacity_tokens(&self, partition: PartitionId) -> u64;
+
     /// How much of `session_input`'s declared prefix is resident *right now*,
     /// wherever it lives. This is what a cache-aware pending order ranks by;
     /// `declared_prefix_tokens` is only its upper bound. A session with no

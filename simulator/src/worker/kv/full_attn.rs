@@ -451,6 +451,14 @@ impl PrefixKv for FullAttnKv {
         self.ledger.take_held(request);
     }
 
+    fn set_loading_area(&mut self, partition: PartitionId, tokens: u64) {
+        self.ledger.set_loading_area(partition, tokens);
+    }
+
+    fn capacity_tokens(&self, partition: PartitionId) -> u64 {
+        self.partitions[partition as usize].capacity_tokens()
+    }
+
     fn restore_prefix(
         &mut self,
         request: RequestId,

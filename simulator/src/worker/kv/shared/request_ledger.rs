@@ -42,6 +42,10 @@ pub(crate) struct RequestLedger {
     /// Prefilled KV awaiting a decode-side pull acknowledgement.
     held: HashMap<RequestId, (PartitionId, u64)>,
     held_by_partition: Vec<u64>,
+    /// A loading area kept free for reads per partition: holds count against
+    /// capacity as at least this much, so admission and the retained-prefix
+    /// tier leave it free whether or not a read uses it.
+    loading_area_by_partition: Vec<u64>,
     /// Sticky placement. Outlives `promised`; cleared on release.
     placement: HashMap<RequestId, PartitionId>,
     /// Runtime prefill facts stay beside placement; the shared request record
@@ -58,6 +62,7 @@ impl RequestLedger {
             reserved_by_partition: vec![(0, 0); num_partitions],
             held: HashMap::new(),
             held_by_partition: vec![0; num_partitions],
+            loading_area_by_partition: vec![0; num_partitions],
             placement: HashMap::new(),
             resolved_prefill_contexts: HashMap::new(),
         }
@@ -202,9 +207,16 @@ impl RequestLedger {
         Some((partition, kv_tokens))
     }
 
+    /// Held charge, at least the partition's loading area.
     #[inline]
     pub(crate) fn partition_held(&self, partition: PartitionId) -> u64 {
         self.held_by_partition[partition as usize]
+            .max(self.loading_area_by_partition[partition as usize])
+    }
+
+    /// Keep `tokens` of the partition free for reads (see `partition_held`).
+    pub(crate) fn set_loading_area(&mut self, partition: PartitionId, tokens: u64) {
+        self.loading_area_by_partition[partition as usize] = tokens;
     }
 
     // ── resolved prefill context ─────────────────────────────────────────────
@@ -335,5 +347,19 @@ mod tests {
         assert_eq!(ledger.take_held(RequestId(0)), Some((1, 64)));
         assert_eq!(ledger.partition_held(1), 0);
         assert_eq!(ledger.take_held(RequestId(0)), None);
+    }
+
+    #[test]
+    fn a_loading_area_counts_as_held_until_reads_hold_more() {
+        let mut ledger = RequestLedger::new(1);
+        ledger.set_loading_area(0, 100);
+        assert_eq!(ledger.partition_held(0), 100);
+        ledger.hold(RequestId(0), 0, 60);
+        assert_eq!(ledger.partition_held(0), 100);
+        ledger.hold(RequestId(1), 0, 60);
+        assert_eq!(ledger.partition_held(0), 120);
+        ledger.take_held(RequestId(0));
+        ledger.take_held(RequestId(1));
+        assert_eq!(ledger.partition_held(0), 100);
     }
 }
