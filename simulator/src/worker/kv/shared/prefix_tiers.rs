@@ -41,14 +41,22 @@
 //! one state, and a lookup resumes from the latest kept state at or before the
 //! prompt's end. The rule is HBM's (`prefix_cache.rs`): an entry is one unit,
 //! its KV and all its states. A tier evicts only whole least recently used
-//! entries and drops no state alone; whatever moves an entry moves all its
-//! states: an eviction into a victim tier, a read into HBM (it moves the
-//! states at or before the hit), an exclusive tier's release (the states are
-//! in HBM with the context), and every write counts each state it adds. A
-//! victim tier merges what it receives into its own entry for the session
-//! (both are prefixes of the session's latest context): the longer context
-//! with the latest `k` states among both. A cut keeps the states at or before
-//! it.
+//! entries and drops no state alone; whatever moves an entry between tiers
+//! moves all its states: an eviction into a victim tier, and every write
+//! counts each state it adds. A victim tier merges what it receives into its
+//! own entry for the session (both are prefixes of the session's latest
+//! context): the longer context with the latest `k` states among both. A cut
+//! keeps the states at or before it.
+//!
+//! A read into HBM moves only the states that will survive the round it
+//! serves: the state at the hit, which the round resumes from, and the latest
+//! earlier ones that will still be among the session's latest `k` after the
+//! round adds its own (`added` per round: its prefill's end, and a handed-back
+//! decode's end; [`PrefixTiers::with_round_end_states`]). So it moves
+//! `max(k - added, 1)` states: with a hand-back (`added` = 2), `k` = 2 moves
+//! the resume state alone and `k` = 4 one earlier state beside it. The states
+//! it does not move stay in an inclusive tier's entry, and leave with the
+//! entry an exclusive tier releases.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -367,6 +375,9 @@ pub(crate) struct PrefixTiers {
     resume: ResumePoint,
     /// Round-end states an entry keeps, its end's included.
     max_states: usize,
+    /// States a read moves into HBM, the one at the hit included: those that
+    /// survive the round the read serves (module docs).
+    moved_states: usize,
 }
 
 impl PrefixTiers {
@@ -412,18 +423,23 @@ impl PrefixTiers {
             state_tokens,
             resume,
             max_states: 1,
+            moved_states: 1,
         }
     }
 
     /// Keep up to `states` round-end states per entry, its end's included
-    /// (module docs); only for a context resumable only at a state.
-    pub(crate) fn with_round_end_states(mut self, states: u32) -> Self {
+    /// (module docs); only for a context resumable only at a state. Each
+    /// round adds `added` states (its prefill's end, and a handed-back
+    /// decode's end), so a read moves `max(states - added, 1)`.
+    pub(crate) fn with_round_end_states(mut self, states: u32, added: u32) -> Self {
         assert!(states >= 1, "an entry keeps at least its end state");
+        assert!(added >= 1, "a round leaves at least its end state");
         assert!(
             states == 1 || self.resume == ResumePoint::ContextEnd,
             "earlier round-end states need a state-at-end context"
         );
         self.max_states = states as usize;
+        self.moved_states = states.saturating_sub(added).max(1) as usize;
         self
     }
 
@@ -492,24 +508,24 @@ impl PrefixTiers {
         best
     }
 
-    /// The states a read of `hit` moves below its end: the entry's states
-    /// before the hit, ascending (the state at the hit itself moves too).
+    /// The states a read of `hit` moves below its end: the latest
+    /// `moved_states - 1` of the entry's states before the hit, ascending
+    /// (the state at the hit itself moves too; module docs).
     pub(crate) fn read_states(&self, session_id: u32, hit: PrefixTierHit) -> Vec<u64> {
-        self.tiers[hit.tier]
-            .entries
-            .get(&session_id)
-            .map(|entry| {
-                entry
-                    .states()
-                    .filter(|&at| at < u64::from(hit.tokens))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Some(entry) = self.tiers[hit.tier].entries.get(&session_id) else {
+            return Vec::new();
+        };
+        let mut states: Vec<u64> = entry
+            .states()
+            .filter(|&at| at < u64::from(hit.tokens))
+            .collect();
+        states.drain(..states.len().saturating_sub(self.moved_states - 1));
+        states
     }
 
     /// What a read of `hit` moves, in tier tokens: the KV past
     /// `resident_tokens` (what HBM still holds), the state at the hit and
-    /// every state of the entry before it.
+    /// the earlier states [`Self::read_states`] moves.
     pub(crate) fn read_charge(
         &self,
         session_id: u32,
@@ -523,7 +539,8 @@ impl PrefixTiers {
     /// Queue a read of `hit` behind the tier's earlier reads; returns when it
     /// lands and the states it moves below the hit ([`Self::read_charge`]).
     /// The entry stays (the tiers are inclusive), or an exclusive tier
-    /// releases it whole; every faster write-through tier receives a copy,
+    /// releases it whole, dropping the states the read does not move; every
+    /// faster write-through tier receives a copy,
     /// since the read passes through it. A faster victim tier receives it
     /// only when the tier above it evicts it.
     pub(crate) fn load(
@@ -554,7 +571,7 @@ impl PrefixTiers {
         );
         if self.tiers[hit.tier].spec.writes == PrefixTierWrites::FasterTierEvictionsMoved {
             let tier = &mut self.tiers[hit.tier];
-            // The read moved the context and its states into HBM.
+            // The read moved the context and its surviving states into HBM.
             let entry = tier.remove(session_id, state_tokens).expect("a hit has an entry");
             tier.counters.released_entries += 1;
             tier.log(PrefixTierEventKind::Release, session_id, entry.tokens, entry.tokens, 0);
@@ -1077,7 +1094,7 @@ mod tests {
             50_000,
             ResumePoint::ContextEnd,
         )
-        .with_round_end_states(states)
+        .with_round_end_states(states, 1)
     }
 
     fn round(tokens: u64, prompt_end: u64, shared: u64) -> RoundContext {
@@ -1102,24 +1119,41 @@ mod tests {
     }
 
     #[test]
-    fn a_read_moves_every_state_at_or_before_the_hit() {
-        let mut t = round_end_tier(10.0, PrefixTierWrites::EveryContext, 3);
-        t.store_round(1, round(100_000, 100_000, 0));
-        t.store_round(1, round(120_000, 120_000, 100_000));
-        t.store_round(1, round(150_000, 150_000, 120_000));
-        // A hit at the end moves its KV and all three states: 300k tokens
-        // at 1M tokens/s.
-        let hit = t.lookup(1, 150_001).unwrap();
-        assert_eq!(t.read_charge(1, hit, 0), 150_000 + 3 * 50_000);
-        let (ready, states) = t.load(1, hit, 0, Time::ZERO);
-        assert_eq!(ready, Time::from_ms(300.0));
-        assert_eq!(states, [100_000, 120_000]);
-        // A hit at an earlier state moves the states up to it.
-        let hit = t.lookup(1, 130_000).unwrap();
-        assert_eq!(hit.tokens, 120_000);
-        let (_, states) = t.load(1, hit, 0, Time::ZERO);
-        assert_eq!(states, [100_000]);
-        assert_eq!(t.counters(0).loaded_states, 3 + 2);
+    fn a_read_moves_only_the_states_that_survive_its_round() {
+        // Four rounds leave states at 100k, 120k, 150k and 180k.
+        let entry = |states, added| {
+            let mut t = round_end_tier(10.0, PrefixTierWrites::EveryContext, states)
+                .with_round_end_states(states, added);
+            t.store_round(1, round(100_000, 100_000, 0));
+            t.store_round(1, round(120_000, 120_000, 100_000));
+            t.store_round(1, round(150_000, 150_000, 120_000));
+            t.store_round(1, round(180_000, 180_000, 150_000));
+            t
+        };
+        // (k, states a round adds) -> earlier states a hit at the end moves.
+        for (k, added, earlier) in [
+            (1, 2, vec![]),
+            (2, 2, vec![]),
+            (4, 2, vec![150_000]),
+            (2, 1, vec![]),
+            (4, 1, vec![120_000, 150_000]),
+        ] {
+            let mut t = entry(k, added);
+            let hit = t.lookup(1, 180_001).unwrap();
+            assert_eq!(hit.tokens, 180_000);
+            let moved = 1 + earlier.len() as u64;
+            assert_eq!(t.read_charge(1, hit, 0), 180_000 + moved * 50_000, "k {k}");
+            // 1M tokens/s.
+            let (ready, states) = t.load(1, hit, 0, Time::ZERO);
+            assert_eq!(states, earlier, "k {k} added {added}");
+            assert_eq!(ready, Time::from_ms((180 + moved * 50) as f64));
+            assert_eq!(t.counters(0).loaded_states, moved);
+        }
+        // A hit at an earlier state moves the survivors below it.
+        let mut t = entry(4, 1);
+        let hit = t.lookup(1, 160_000).unwrap();
+        assert_eq!(hit.tokens, 150_000);
+        assert_eq!(t.load(1, hit, 0, Time::ZERO).1, [100_000, 120_000]);
     }
 
     #[test]
@@ -1192,7 +1226,7 @@ mod tests {
             50_000,
             ResumePoint::ContextEnd,
         )
-        .with_round_end_states(states)
+        .with_round_end_states(states, 1)
     }
 
     #[test]
@@ -1244,12 +1278,13 @@ mod tests {
             50_000,
             ResumePoint::ContextEnd,
         )
-        .with_round_end_states(3);
+        .with_round_end_states(3, 1);
         t.store_evicted(1, 150_000, &[100_000, 120_000]);
         let (_, states) = t.load(1, t.lookup(1, 150_001).unwrap(), 0, Time::ZERO);
-        // The states went to HBM with the context: none is left behind or
-        // handed down to SSD.
-        assert_eq!(states, [100_000, 120_000]);
+        // The surviving states went to HBM with the context; 100k, which the
+        // round would push out, is dropped with the entry. None is left
+        // behind or handed down to SSD.
+        assert_eq!(states, [120_000]);
         assert_eq!(t.used_tokens(0), 0);
         assert_eq!(t.used_tokens(1), 0);
         assert_eq!(t.counters(1).stored_entries, 0);

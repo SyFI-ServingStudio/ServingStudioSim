@@ -349,9 +349,14 @@ context cuts it there, keeping the states at or before the cut). A prompt ending
 inside the context resumes at the latest state at or below it. One rule holds in
 HBM, DRAM and SSD: a retained context is one unit, its KV plus its states,
 charged `tokens + states x state` and evicted whole by LRU, never a state alone.
-Whatever moves it moves all its states: an HBM eviction into a victim tier, a
-DRAM -> SSD demotion, a read into HBM (it moves the KV and every state at or
-before the hit), an exclusive DRAM release. A request that takes an HBM entry
+Whatever moves it between tiers moves all its states: an HBM eviction into a
+victim tier, a DRAM -> SSD demotion. A read into HBM moves the KV and only the
+states that survive its round: the state it resumes from and the latest earlier
+ones still among the session's latest k after the round adds its own (its
+prefill's end, and with `external_decode` the hand-back's end), i.e.
+`max(k - added, 1)` states; k = 2 with a hand-back moves the resume state
+alone, k = 4 one earlier state beside it. The rest stay in an inclusive tier's
+entry and are dropped with the entry an exclusive DRAM releases. A request that takes an HBM entry
 carries its states (still charged to HBM's retained tier, not evictable) and
 hands them back with its context, which appends its new end state and drops the
 oldest beyond k.

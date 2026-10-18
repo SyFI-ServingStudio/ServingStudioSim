@@ -717,3 +717,12 @@ impl Default for WorkerConfig {
         }
     }
 }
+
+impl WorkerConfig {
+    /// Round-end states a session round adds to its retained context: its
+    /// prefill's end, and with `external_decode` the handed-back decode's end
+    /// (the head restores the decode's context on top of the prompt's).
+    pub(crate) fn states_added_per_round(&self) -> u32 {
+        1 + u32::from(self.external_decode)
+    }
+}

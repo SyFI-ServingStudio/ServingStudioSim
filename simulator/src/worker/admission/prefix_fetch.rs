@@ -28,6 +28,12 @@
 //! of. A session request's admission cuts each victim entry to what it shares
 //! with it.
 //!
+//! A read moves the KV HBM lacks and, of a context keeping `k` round-end
+//! states, only those that survive the round it serves: the state it resumes
+//! from and the latest earlier ones still among the session's latest `k` once
+//! the round adds its own (`kv/shared/prefix_tiers.rs`). Its time, its holds
+//! and `loaded_states` count only what moves.
+//!
 //! With a loading area ([`PrefixFetch::with_loading_area`], not vLLM), loads
 //! are staged instead: pending -> loading -> ready -> batch. Before each
 //! admission pass, the pending queues are walked in admission order and every
@@ -97,6 +103,7 @@ impl SessionPrefixTiers {
         state_tokens: u64,
         resume: ResumePoint,
         round_end_states: u32,
+        states_added_per_round: u32,
         log_dir: Option<&Path>,
         tag: &str,
     ) -> Self {
@@ -125,7 +132,7 @@ impl SessionPrefixTiers {
             file
         });
         let mut tiers = PrefixTiers::new(specs, kv_bytes_per_token, state_tokens, resume)
-            .with_round_end_states(round_end_states);
+            .with_round_end_states(round_end_states, states_added_per_round);
         if events.is_some() {
             tiers.record_events();
         }
@@ -180,8 +187,8 @@ impl SessionPrefixTiers {
     }
 
     /// What a read of `hit` moves into HBM, in tier tokens: the KV HBM's
-    /// `hbm_tokens` lack and every state at or before the hit (a pre-run
-    /// context has one).
+    /// `hbm_tokens` lack and the states that survive the round
+    /// ([`PrefixTiers::read_states`]; a pre-run context has one).
     fn read_charge(
         &self,
         session_id: u32,
@@ -994,6 +1001,7 @@ mod tests {
             1,
             0,
             ResumePoint::AnyToken,
+            1,
             1,
             None,
             "test",

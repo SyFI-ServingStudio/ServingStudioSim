@@ -713,7 +713,10 @@ pub enum IterWorkerSel {
         /// decode handed back, ended), so a prompt that ends inside the context
         /// resumes from the latest one at or before its end. Each costs one
         /// state in the tier holding it; a context and its states are one
-        /// unit, evicted and moved whole. `1`: the end only. Not vLLM.
+        /// unit, evicted and demoted whole. A read into HBM moves only the
+        /// states that survive its round: `max(n - added, 1)`, where a round
+        /// adds its prefill's end and, with `external_decode`, the
+        /// hand-back's. `1`: the end only. Not vLLM.
         #[serde(default = "default_recurrent_state_checkpoints")]
         #[param(default = 1)]
         recurrent_state_checkpoints: u32,
@@ -937,7 +940,10 @@ pub enum IterWorkerSel {
         /// decode handed back, ended), so a prompt that ends inside the context
         /// resumes from the latest one at or before its end. Each costs one
         /// state in the tier holding it; a context and its states are one
-        /// unit, evicted and moved whole. `1`: the end only. Not vLLM.
+        /// unit, evicted and demoted whole. A read into HBM moves only the
+        /// states that survive its round: `max(n - added, 1)`, where a round
+        /// adds its prefill's end and, with `external_decode`, the
+        /// hand-back's. `1`: the end only. Not vLLM.
         #[serde(default = "default_recurrent_state_checkpoints")]
         #[param(default = 1)]
         recurrent_state_checkpoints: u32,

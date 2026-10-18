@@ -359,6 +359,7 @@ fn head_prefix_fetch(
             } else {
                 1
             },
+            config.states_added_per_round(),
             log_dir,
             &format!("w{}", id.0),
         );

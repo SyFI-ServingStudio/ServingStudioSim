@@ -115,6 +115,7 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
                     state_tokens_per_request,
                     resume,
                     round_end_states,
+                    config.states_added_per_round(),
                     cost_log_dir.as_deref(),
                     &format!("w{}_p{rank}", id.0),
                 )
