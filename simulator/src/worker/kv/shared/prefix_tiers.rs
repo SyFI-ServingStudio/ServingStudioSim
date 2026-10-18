@@ -78,6 +78,20 @@ pub enum PrefixTierWrites {
     /// cache. Configured as `dram_tier_writes: hbm-evictions` and
     /// `ssd_tier_writes: dram-evictions`.
     FasterTierEvictions,
+    /// A victim tier that moves a read back into HBM instead of keeping a
+    /// clean copy: the read releases the entry, so the tier holds only what
+    /// HBM lacks (strictly exclusive), and HBM evicting the context again
+    /// writes it whole. Earlier round-end states the entry kept go to the
+    /// tier behind it, as states the tier above let go of. Configured as
+    /// `dram_tier_writes: hbm-evictions-exclusive`.
+    FasterTierEvictionsMoved,
+}
+
+impl PrefixTierWrites {
+    /// Whether the tier is the victim tier of the one above it.
+    pub fn is_victim(self) -> bool {
+        self != Self::EveryContext
+    }
 }
 
 /// A finished round's context, as a write-through tier stores it.
@@ -115,6 +129,8 @@ pub(crate) struct PrefixTierCounters {
     pub(crate) written_states: u64,
     /// Earlier round-end states dropped for room.
     pub(crate) earlier_state_drops: u64,
+    /// Entries a read moved into HBM ([`PrefixTierWrites::FasterTierEvictionsMoved`]).
+    pub(crate) released_entries: u64,
 }
 
 /// What happened to a tier's entry for a session, for the optional event log
@@ -139,6 +155,8 @@ pub(crate) enum PrefixTierEventKind {
     /// A state at `tokens` the tier above dropped, kept beside the entry's
     /// `prev_tokens` of KV.
     WriteState,
+    /// A read moved the entry's `tokens` into HBM and released it.
+    Release,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -656,6 +674,18 @@ impl PrefixTiers {
             u64::from(resident_tokens),
             0,
         );
+        if self.tiers[hit.tier].spec.writes == PrefixTierWrites::FasterTierEvictionsMoved {
+            let tier = &mut self.tiers[hit.tier];
+            let entry = tier.remove(session_id, state_tokens).expect("a hit has an entry");
+            tier.counters.released_entries += 1;
+            tier.log(PrefixTierEventKind::Release, session_id, entry.tokens, entry.tokens, 0);
+            let left = entry
+                .earlier
+                .into_iter()
+                .map(|at| Leaving::state(session_id, at))
+                .collect();
+            self.pass_down(hit.tier, left);
+        }
         for faster in 0..hit.tier {
             if self.tiers[faster].spec.writes == PrefixTierWrites::EveryContext {
                 // The copy is a prefix of the session's latest context, as is
@@ -731,7 +761,7 @@ impl PrefixTiers {
     fn demotes(&self, tier: usize) -> bool {
         self.tiers
             .get(tier + 1)
-            .is_some_and(|behind| behind.spec.writes == PrefixTierWrites::FasterTierEvictions)
+            .is_some_and(|behind| behind.spec.writes.is_victim())
     }
 
     /// Hand what left `tier` to the tier behind it, if that is its victim tier.
@@ -756,7 +786,7 @@ impl PrefixTiers {
         let Some(state) = self
             .tiers
             .get_mut(tier)
-            .filter(|state| state.spec.writes == PrefixTierWrites::FasterTierEvictions)
+            .filter(|state| state.spec.writes.is_victim())
         else {
             return;
         };
@@ -774,7 +804,7 @@ impl PrefixTiers {
         let Some(state) = self
             .tiers
             .get(tier)
-            .filter(|state| state.spec.writes == PrefixTierWrites::FasterTierEvictions)
+            .filter(|state| state.spec.writes.is_victim())
         else {
             return;
         };
@@ -793,7 +823,7 @@ impl PrefixTiers {
     pub(crate) fn takes_hbm_evictions(&self) -> bool {
         self.tiers
             .first()
-            .is_some_and(|tier| tier.spec.writes == PrefixTierWrites::FasterTierEvictions)
+            .is_some_and(|tier| tier.spec.writes.is_victim())
     }
 
     /// HBM evicted the session's `tokens`-token context, or could not keep it:
@@ -849,7 +879,7 @@ impl PrefixTiers {
     pub(crate) fn drop_stale(&mut self, session_id: u32, declared: u64) {
         let state_tokens = self.state_tokens;
         for tier in 0..self.tiers.len() {
-            if self.tiers[tier].spec.writes != PrefixTierWrites::FasterTierEvictions {
+            if !self.tiers[tier].spec.writes.is_victim() {
                 continue;
             }
             if let Some(entry) = self.tiers[tier].entries.get(&session_id) {
@@ -1100,6 +1130,29 @@ mod tests {
         t.load(1, t.lookup(1, 400_000).unwrap(), 0, Time::ZERO);
         assert_eq!(t.counters(0).stored_entries, 0);
         assert_eq!(t.lookup(1, 400_000).unwrap().tier, 1);
+    }
+
+    #[test]
+    fn an_exclusive_victim_tier_releases_what_a_read_moves_into_hbm() {
+        let mut t = PrefixTiers::new(
+            &[PrefixTierSpec {
+                name: "dram",
+                capacity_gb_per_gpu: 1.0,
+                read_gb_per_s_per_gpu: 1.0,
+                writes: PrefixTierWrites::FasterTierEvictionsMoved,
+            }],
+            1000,
+            0,
+            ResumePoint::AnyToken,
+        );
+        t.store_evicted(1, 400_000);
+        t.load(1, t.lookup(1, 400_000).unwrap(), 0, Time::ZERO);
+        assert_eq!(t.used_tokens(0), 0);
+        assert_eq!(t.lookup(1, 400_000), None);
+        assert_eq!(t.counters(0).released_entries, 1);
+        // HBM evicting it again writes it whole.
+        t.store_evicted(1, 500_000);
+        assert_eq!(t.counters(0).written_tokens, 900_000);
     }
 
     #[test]

@@ -359,7 +359,9 @@ model (`kv/shared/prefix_tiers.rs`). With `dram_tier_writes: hbm-evictions`
 (not vLLM) DRAM is instead HBM's victim tier: the KV store logs each context its
 prefix cache evicts or cannot keep (`HbmEvictionLog`), DRAM writes what its entry
 lacks before the next tier lookup, a read back keeps the DRAM copy, and a
-session's next admitted round cuts that copy to what it shares. With
+session's next admitted round cuts that copy to what it shares;
+`hbm-evictions-exclusive` instead releases the entry a read moves into HBM, so
+DRAM never duplicates HBM and HBM evicting the context again writes it whole. With
 `ssd_tier_writes: dram-evictions` (not vLLM) SSD is likewise DRAM's victim tier
 (written back): it takes what DRAM evicts or cannot hold, as what its entry
 lacks, and only refreshes an entry that already holds it; an SSD read keeps the

@@ -291,6 +291,7 @@ impl Drop for SessionPrefixTiers {
                     "loaded_tokens": counters.loaded_tokens,
                     "written_states": counters.written_states,
                     "earlier_state_drops": counters.earlier_state_drops,
+                    "released_entries": counters.released_entries,
                     "earlier_states": self.tiers.earlier_states(tier),
                     "write_window_ms": WRITE_WINDOW.as_ms(),
                     "window_writes": self.tiers.window_writes(tier),

@@ -379,7 +379,7 @@ pub(crate) fn prefix_tier_specs(
     use crate::worker::kv::PrefixTierWrites;
     anyhow::ensure!(
         dram_writes == DramTierWrites::EveryContext || dram_gb > 0.0,
-        "{deployment}: dram_tier_writes: hbm-evictions needs dram_tier_gb > 0"
+        "{deployment}: dram_tier_writes: hbm-evictions(-exclusive) needs dram_tier_gb > 0"
     );
     anyhow::ensure!(
         ssd_writes == SsdTierWrites::EveryContext || (dram_gb > 0.0 && ssd_gb > 0.0),
@@ -409,7 +409,11 @@ pub(crate) fn prefix_tier_specs(
             "dram",
             dram_gb,
             dram_gb_per_s,
-            victim(dram_writes == DramTierWrites::HbmEvictions),
+            match dram_writes {
+                DramTierWrites::EveryContext => PrefixTierWrites::EveryContext,
+                DramTierWrites::HbmEvictions => PrefixTierWrites::FasterTierEvictions,
+                DramTierWrites::HbmEvictionsExclusive => PrefixTierWrites::FasterTierEvictionsMoved,
+            },
         )?,
         tier(
             "ssd",
@@ -429,6 +433,9 @@ pub enum DramTierWrites {
     EveryContext,
     /// Only what the HBM prefix cache evicts or cannot keep (HBM's victim tier).
     HbmEvictions,
+    /// As `HbmEvictions`, and a read moves the entry into HBM instead of
+    /// keeping a clean copy (strictly exclusive).
+    HbmEvictionsExclusive,
 }
 
 /// What the SSD tier is written (`ssd_tier_writes`).
@@ -442,7 +449,7 @@ pub enum SsdTierWrites {
     DramEvictions,
 }
 
-const DRAM_TIER_WRITES_CHOICES: [&str; 2] = ["every-context", "hbm-evictions"];
+const DRAM_TIER_WRITES_CHOICES: [&str; 3] = ["every-context", "hbm-evictions", "hbm-evictions-exclusive"];
 const SSD_TIER_WRITES_CHOICES: [&str; 2] = ["every-context", "dram-evictions"];
 
 fn default_recurrent_state_checkpoints() -> u32 {
