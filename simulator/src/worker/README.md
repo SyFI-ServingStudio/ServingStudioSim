@@ -385,6 +385,17 @@ admission at it instead, so the queue behind waits too. Both admission
 lifecycles take fresh prompts from the same sources in the same order (landed
 reads, overdue requests, the pending order; `admission/fresh_source.rs`), and a
 passed-over request goes back to the front of the queue it came from.
+`prefix_tier_loading_area` (pipeline head, not vLLM) stages loads instead:
+pending -> loading -> ready -> batch. That fraction of HBM's KV capacity is a
+loading area the ledger always counts as held, so admission and retained
+prefixes leave it free; before each admission a loading pass walks the overdue
+and pending queues in order and starts reads while the area has room (a read
+larger than the area starts once it is empty), and admission takes only
+requests whose context is in HBM, passing over the rest. With an SSD behind
+DRAM, the same fraction of the DRAM tier is carved out as a DRAM area: an SSD
+read lands there, then hops to HBM on DRAM's channel once the HBM area has
+room. A request holds its area until admission. Little's law sizes it: area =
+tier-read bytes/s x one batch period (`max_batch_tokens` / prefill tokens/s).
 A tier is sized and read in the most loaded stage's bytes per token;
 `prefix_tier_balanced_load` (not vLLM) uses the stages' mean instead. A hybrid
 pipeline's entry adds one recurrent state on that same GPU, in real bytes (the

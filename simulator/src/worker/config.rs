@@ -913,6 +913,15 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         prefix_tier_balanced_load: bool,
+        /// With a tier: stage loads through loading areas, this fraction of
+        /// HBM's KV capacity and of a DRAM tier with SSD behind it
+        /// (`admission/prefix_fetch.rs`): pending -> loading -> ready -> batch;
+        /// reads start in admission order while their area has room and never
+        /// wait on compute admission; an SSD read stages through DRAM's area.
+        /// `0`: off. Not vLLM.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        prefix_tier_loading_area: f64,
         /// Serve a request that has waited this many ms since arrival before
         /// every other one, queued or started, so srpt / shortest-first cannot
         /// starve it (`0`: off). Not vLLM.

@@ -651,6 +651,9 @@ pub struct WorkerConfig {
     pub prefix_tier_max_read_wait_ms: f64,
     /// With a read-wait bound: pass a request past it over, or stop admitting.
     pub prefix_tier_read_wait_policy: crate::worker::config::PrefixTierReadWaitPolicy,
+    /// Pipeline head with tiers: the loading-area fraction of staged loads
+    /// (0: off).
+    pub prefix_tier_loading_area: f64,
     /// Pipeline head and chunked prefill: serve a request that has waited
     /// this many ms since arrival before the others (0: off).
     pub force_schedule_after_ms: f64,
@@ -704,6 +707,7 @@ impl Default for WorkerConfig {
             prefix_tier_warm_start: false,
             prefix_tier_max_read_wait_ms: 0.0,
             prefix_tier_read_wait_policy: crate::worker::config::PrefixTierReadWaitPolicy::PassOver,
+            prefix_tier_loading_area: 0.0,
             force_schedule_after_ms: 0.0,
             external_decode: false,
             recurrent_state_checkpoints: 1,

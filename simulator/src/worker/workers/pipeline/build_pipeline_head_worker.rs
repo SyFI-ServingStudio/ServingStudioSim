@@ -12,7 +12,7 @@ use crate::worker::admission::{
 use crate::worker::config::MicrobatchSizing;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::{FullAttnKv, HybridGdnKv, PrefixCacheConfig, ResumePoint};
+use crate::worker::kv::{FullAttnKv, HybridGdnKv, PrefixCacheConfig, PrefixKv, ResumePoint};
 use crate::worker::types::WorkerConfig;
 use crate::worker::workers::iter_build_essentials::{
     full_attention_token_capacity, prepare_iter_build_essentials,
@@ -272,13 +272,23 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     } else {
         kv_store.with_end_state_reuse(config.recurrent_state_checkpoints)
     };
-    let kv_store = match prefix_fetch
+    let mut kv_store = match prefix_fetch
         .as_mut()
         .and_then(PrefixFetch::hbm_eviction_log)
     {
         Some(log) => kv_store.with_hbm_eviction_log(log),
         None => kv_store,
     };
+    if config.prefix_tier_loading_area > 0.0 {
+        // HBM's loading area in the store's tokens, and in the tiers' for the
+        // reads that fill it.
+        let fraction = config.prefix_tier_loading_area;
+        let area = (kv_store.capacity_tokens(0) as f64 * fraction) as u64;
+        kv_store.set_loading_area(0, area);
+        let tier_area = (area as f64 * layout.kv_bytes_per_token as f64
+            / layout.tier_kv_bytes_per_token.max(1) as f64) as u64;
+        prefix_fetch = prefix_fetch.map(|fetch| fetch.with_loading_area(tier_area, fraction));
+    }
     let admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
         (),

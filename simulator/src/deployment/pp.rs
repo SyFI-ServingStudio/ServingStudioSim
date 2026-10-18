@@ -310,6 +310,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         prefix_tier_warm_start,
         prefix_tier_max_read_wait_ms,
         prefix_tier_read_wait_policy,
+        prefix_tier_loading_area,
         force_schedule_after_ms,
         external_decode,
         recurrent_state_checkpoints,
@@ -349,6 +350,14 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         *recurrent_state_checkpoints >= 1,
         "pp: recurrent_state_checkpoints must be >= 1"
     );
+    ensure!(
+        (0.0..0.5).contains(prefix_tier_loading_area),
+        "pp: prefix_tier_loading_area must be in [0, 0.5)"
+    );
+    ensure!(
+        *prefix_tier_loading_area == 0.0 || prefix_tiers.iter().any(Option::is_some),
+        "pp: prefix_tier_loading_area needs a prefix tier"
+    );
     crate::worker::config::check_read_wait(
         "pp",
         *prefix_tier_max_read_wait_ms,
@@ -373,6 +382,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         prefix_tier_warm_start: *prefix_tier_warm_start,
         prefix_tier_max_read_wait_ms: *prefix_tier_max_read_wait_ms,
         prefix_tier_read_wait_policy: *prefix_tier_read_wait_policy,
+        prefix_tier_loading_area: *prefix_tier_loading_area,
         force_schedule_after_ms: *force_schedule_after_ms,
         external_decode: *external_decode,
         recurrent_state_checkpoints: *recurrent_state_checkpoints,
