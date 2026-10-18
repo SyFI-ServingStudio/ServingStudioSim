@@ -184,6 +184,25 @@ impl SessionPrefixTiers {
         }
     }
 
+    /// What of a read of `hit` HBM already holds: its `hbm_tokens` (where a
+    /// prompt can resume in HBM) or, with anchors in place, the KV of HBM's
+    /// entry for the session up to the hit (`retained_kv`), so a round
+    /// resuming from an anchor a tier holds moves only that state.
+    fn resident_for(&self, hit: PrefixTierHit, seeded: bool, hbm_tokens: u32, retained_kv: u64) -> u32 {
+        if self.tiers.anchors_in_place() && !seeded {
+            hbm_tokens.max(retained_kv.min(u64::from(hit.tokens)) as u32)
+        } else {
+            hbm_tokens
+        }
+    }
+
+    /// Keep each anchor in the tier it first lands in
+    /// ([`PrefixTiers::set_anchors_in_place`]).
+    pub(crate) fn with_anchors_in_place(mut self) -> Self {
+        self.tiers.set_anchors_in_place();
+        self
+    }
+
     /// The tiers store each state as `stored` tokens, compressed
     /// ([`PrefixTiers::set_stored_state_tokens`]).
     pub(crate) fn with_stored_state_tokens(mut self, stored: u64) -> Self {
@@ -824,6 +843,8 @@ impl PrefixFetch {
         else {
             return false;
         };
+        let hbm_tokens =
+            tiers.resident_for(hit, seeded, hbm_tokens, kv_store.retained_kv_tokens(partition, session_id));
         let charge = tiers.landed_charge(session_id, hit, seeded, hbm_tokens);
         let dram_charge = tiers.read_charge(session_id, hit, seeded, hbm_tokens);
         let earlier = tiers.earlier_read_states(session_id, hit, seeded);
@@ -1089,6 +1110,8 @@ impl PrefixFetch {
                 candidate.session_input,
             )
             .post_prefill_context_tokens();
+        let hbm_tokens =
+            tiers.resident_for(hit, seeded, hbm_tokens, kv_store.retained_kv_tokens(partition, session_id));
         let earlier = tiers.earlier_read_states(session_id, hit, seeded);
         let footprint = kv_store.footprint(
             candidate.request_id,

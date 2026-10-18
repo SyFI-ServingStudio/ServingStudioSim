@@ -185,6 +185,23 @@ impl StateRetention {
         }
     }
 
+    /// Whether each of `states` (ascending, one per position, as an entry
+    /// keeps them, its end last) is an anchor: neither the latest
+    /// handed-back decode's end nor the latest pass's end. `Latest` keeps
+    /// none.
+    pub(crate) fn anchors(self, states: &[RoundState]) -> Vec<bool> {
+        match self {
+            Self::Latest(_) => vec![false; states.len()],
+            Self::Anchors { .. } => {
+                let handback = states.iter().rposition(|s| s.tag.handback);
+                let pass = states.iter().rposition(|s| !s.tag.handback);
+                (0..states.len())
+                    .map(|index| Some(index) != handback && Some(index) != pass)
+                    .collect()
+            }
+        }
+    }
+
     /// Of `states` (ascending, at or before a resume point whose state is
     /// `resume`), those still kept after the round resuming there adds its
     /// `added` states: its pass's end, and with 2 a handed-back decode's end.
@@ -569,6 +586,12 @@ impl PrefixCache {
             .get(&session_id)
             .map(|entry| self.resume_tokens(entry, u64::from(requested_tokens)) as u32)
             .unwrap_or(0)
+    }
+
+    /// Context tokens of the session's retained entry, whether or not a
+    /// prompt can resume inside it (0: none).
+    pub(crate) fn entry_tokens(&self, session_id: u32) -> u64 {
+        self.entries.get(&session_id).map_or(0, |entry| entry.tokens)
     }
 
     /// Move one retained session into an active request.

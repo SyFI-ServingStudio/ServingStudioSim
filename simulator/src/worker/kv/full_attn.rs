@@ -447,6 +447,10 @@ impl PrefixKv for FullAttnKv {
         }
     }
 
+    fn retained_kv_tokens(&self, partition: PartitionId, session_id: u32) -> u64 {
+        self.prefix_caches[partition as usize].entry_tokens(session_id)
+    }
+
     fn release_read_hold(&mut self, request: RequestId) {
         self.ledger.take_held(request);
     }

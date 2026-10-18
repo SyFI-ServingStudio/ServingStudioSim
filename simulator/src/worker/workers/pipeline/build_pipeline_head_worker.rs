@@ -397,7 +397,7 @@ fn head_prefix_fetch(
     let specs: Vec<_> = config.prefix_tiers.iter().flatten().copied().collect();
     let token_bytes = layout.tier_kv_bytes_per_token.max(1);
     (!specs.is_empty()).then(|| {
-        let tiers = SessionPrefixTiers::new(
+        let mut tiers = SessionPrefixTiers::new(
             &specs,
             layout.tier_kv_bytes_per_token,
             layout.tier_state_bytes_per_request.div_ceil(token_bytes),
@@ -416,6 +416,9 @@ fn head_prefix_fetch(
                 .tier_stored_state_bytes(layout.tier_state_bytes_per_request)
                 .div_ceil(token_bytes),
         );
+        if config.recurrent_state_anchors_in_place && resume == ResumePoint::ContextEnd {
+            tiers = tiers.with_anchors_in_place();
+        }
         PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start).with_max_read_wait_ms(
             config.prefix_tier_max_read_wait_ms,
             config.prefix_tier_read_wait_policy,

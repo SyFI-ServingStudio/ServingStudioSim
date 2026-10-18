@@ -1006,6 +1006,18 @@ pub enum IterWorkerSel {
         #[serde(default = "default_recurrent_state_anchor_stride")]
         #[param(default = 1)]
         recurrent_state_anchor_stride: u32,
+        /// With `recurrent_state_anchors` and a tier: an anchor, immutable once
+        /// written, is written once, to the tier its context first lands in
+        /// below HBM, and stays there: a read moves only the state its round
+        /// resumes from (an anchor only when an inside round resumes from it,
+        /// with the KV HBM's entry for the session still holds counted as
+        /// resident), an exclusive DRAM keeps a read entry cut to its latest
+        /// surviving anchor, and a demotion does not rewrite it (a tier
+        /// evicting the context drops its anchors). It is dropped once the
+        /// anchor rule no longer keeps it. Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        recurrent_state_anchors_in_place: bool,
         /// With a tier, a state-at-end hybrid: the DRAM and SSD tiers store
         /// each recurrent state compressed by this ratio (>= 1), encoded and
         /// decoded by the host CPU; HBM keeps it whole. A state then costs

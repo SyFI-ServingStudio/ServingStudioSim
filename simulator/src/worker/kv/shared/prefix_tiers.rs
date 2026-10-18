@@ -68,6 +68,20 @@
 //! the resume state alone and `k` = 4 one earlier state beside it. The states
 //! it does not move stay in an inclusive tier's entry, and leave with the
 //! entry an exclusive tier releases.
+//!
+//! With anchors kept in place ([`PrefixTiers::set_anchors_in_place`]), an
+//! anchor (a kept state that is neither the latest handed-back decode's end
+//! nor the latest pass's end, [`StateRetention::anchors`]) is immutable and
+//! is written once, to the tier its entry first lands in below HBM, and stays
+//! there: a read moves only the state it resumes from (an anchor only when an
+//! inside round resumes from it), so the anchors that survive the round stay
+//! in the read tier, an exclusive tier's included, which then keeps the
+//! entry cut to its latest surviving anchor (that anchor's KV prefix with
+//! it) instead of releasing it whole; states that no longer survive leave the
+//! read tier's entry. A demotion does not rewrite an anchor: a tier evicting
+//! an entry drops its anchors with it, and a victim tier is not written an
+//! anchor that another tier already holds for the session. A tier counts an
+//! anchor's bytes while it holds it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -190,6 +204,10 @@ struct Leaving {
     tokens: u64,
     end: StateTag,
     earlier: Vec<RoundState>,
+    /// Evicted from the tier (it held the entry), rather than larger than it.
+    evicted: bool,
+    /// Every state it has is an anchor ([`TierEntry::anchors_only`]).
+    anchors_only: bool,
 }
 
 struct TierEntry {
@@ -200,6 +218,9 @@ struct TierEntry {
     stamp: u64,
     /// Earlier round-end states, ascending, each below `tokens`.
     earlier: Vec<RoundState>,
+    /// What an exclusive tier keeps of an entry a read moved into HBM when
+    /// anchors stay in place: the surviving anchors, the latest at `tokens`.
+    anchors_only: bool,
 }
 
 impl TierEntry {
@@ -325,7 +346,40 @@ impl PrefixTier {
             tokens: entry.tokens,
             end: entry.end,
             earlier: entry.earlier,
+            evicted: true,
+            anchors_only: entry.anchors_only,
         })
+    }
+
+    /// Keep the session's entry as `states` (ascending, the last its end):
+    /// its context cut to the last, with only these states (all anchors when
+    /// `anchors_only`). Writes nothing; the entry takes the most recent LRU
+    /// position.
+    fn keep_only(
+        &mut self,
+        session_id: u32,
+        mut states: Vec<RoundState>,
+        anchors_only: bool,
+        state_tokens: u64,
+    ) {
+        self.remove(session_id, state_tokens);
+        let Some(end) = states.pop() else {
+            return;
+        };
+        self.used += self.charge(end.at, 1 + states.len(), state_tokens);
+        self.earlier_states += states.len() as u64;
+        self.entries.insert(
+            session_id,
+            TierEntry {
+                tokens: end.at,
+                end: end.tag,
+                stamp: self.next_stamp,
+                earlier: states,
+                anchors_only,
+            },
+        );
+        self.lru.insert(self.next_stamp, session_id);
+        self.next_stamp += 1;
     }
 
     /// Store the session's context with its `earlier` round-end states, one
@@ -349,6 +403,8 @@ impl PrefixTier {
                 tokens,
                 end,
                 earlier,
+                evicted: false,
+                anchors_only: false,
             }];
         }
         let mut left = Vec::new();
@@ -371,6 +427,7 @@ impl PrefixTier {
                 end,
                 stamp: self.next_stamp,
                 earlier,
+                anchors_only: false,
             },
         );
         self.lru.insert(self.next_stamp, session_id);
@@ -404,6 +461,8 @@ pub(crate) struct PrefixTiers {
     retention: StateRetention,
     /// States a round adds: its pass's end, and a handed-back decode's end.
     added: u32,
+    /// Anchors stay in the tier they first land in (module docs).
+    anchors_in_place: bool,
 }
 
 impl PrefixTiers {
@@ -451,6 +510,7 @@ impl PrefixTiers {
             resume,
             retention: StateRetention::Latest(1),
             added: 1,
+            anchors_in_place: false,
         }
     }
 
@@ -500,6 +560,28 @@ impl PrefixTiers {
     /// One state decoded, as it lands in HBM.
     pub(crate) fn landed_state_tokens(&self) -> u64 {
         self.landed_state_tokens
+    }
+
+    /// Keep each anchor in the tier it first lands in (module docs); only
+    /// with anchor retention.
+    pub(crate) fn set_anchors_in_place(&mut self) {
+        assert!(
+            matches!(self.retention, StateRetention::Anchors { .. }),
+            "anchors in place need anchor retention"
+        );
+        self.anchors_in_place = true;
+    }
+
+    /// [`Self::set_anchors_in_place`], as a builder.
+    #[cfg(test)]
+    pub(crate) fn with_anchors_in_place(mut self) -> Self {
+        self.set_anchors_in_place();
+        self
+    }
+
+    /// Whether anchors stay in the tier they first land in.
+    pub(crate) fn anchors_in_place(&self) -> bool {
+        self.anchors_in_place
     }
 
     /// Where a prompt sharing `declared` tokens with `entry` resumes.
@@ -594,6 +676,16 @@ impl PrefixTiers {
     /// before the hit, those that survive the round it serves, ascending (the
     /// state at the hit itself moves too; module docs).
     pub(crate) fn read_states(&self, session_id: u32, hit: PrefixTierHit) -> Vec<RoundState> {
+        if self.anchors_in_place {
+            // The surviving states below the hit are anchors, which stay.
+            return Vec::new();
+        }
+        self.surviving_states(session_id, hit)
+    }
+
+    /// Of the entry's states before `hit`, those that survive the round it
+    /// serves, ascending.
+    fn surviving_states(&self, session_id: u32, hit: PrefixTierHit) -> Vec<RoundState> {
         let Some(entry) = self.tiers[hit.tier].entries.get(&session_id) else {
             return Vec::new();
         };
@@ -654,6 +746,16 @@ impl PrefixTiers {
         let hit_tag = self.hit_state(session_id, hit);
         let charge = self.read_charge(session_id, hit, resident_tokens);
         let state_tokens = self.state_tokens;
+        // Anchors in place: what the read tier's entry keeps below the hit,
+        // the surviving anchors and the hit's state when it is an anchor.
+        let in_place = self.anchors_in_place.then(|| {
+            let entry = &self.tiers[hit.tier].entries[&session_id];
+            let mut kept = self.surviving_states(session_id, hit);
+            if u64::from(hit.tokens) < entry.tokens {
+                kept.push(RoundState::new(u64::from(hit.tokens), hit_tag));
+            }
+            kept
+        });
         let tier = &mut self.tiers[hit.tier];
         let start = tier.channel_free.max(now);
         let ready =
@@ -676,6 +778,24 @@ impl PrefixTiers {
             let entry = tier.remove(session_id, state_tokens).expect("a hit has an entry");
             tier.counters.released_entries += 1;
             tier.log(PrefixTierEventKind::Release, session_id, entry.tokens, entry.tokens, 0);
+            if let Some(kept) = in_place.filter(|kept| !kept.is_empty()) {
+                // Exclusivity does not apply to anchors: the entry stays,
+                // cut to its latest surviving anchor.
+                tier.keep_only(session_id, kept, true, state_tokens);
+            }
+        } else if let Some(kept) = in_place {
+            // States below the hit that no longer survive leave the entry.
+            let tier = &mut self.tiers[hit.tier];
+            let entry = &tier.entries[&session_id];
+            let below = u64::from(hit.tokens);
+            let states: Vec<RoundState> = entry
+                .states()
+                .filter(|state| state.at >= below || kept.contains(state))
+                .collect();
+            if states.len() < 1 + entry.earlier.len() {
+                let anchors_only = entry.anchors_only;
+                tier.keep_only(session_id, states, anchors_only, state_tokens);
+            }
         }
         for faster in 0..hit.tier {
             if self.tiers[faster].spec.writes == PrefixTierWrites::EveryContext {
@@ -773,7 +893,22 @@ impl PrefixTiers {
 
     /// Hand what left `tier` to the tier behind it, if that is its victim tier.
     fn pass_down(&mut self, tier: usize, left: Vec<Leaving>) {
-        for leaving in left {
+        for mut leaving in left {
+            if self.anchors_in_place && leaving.evicted {
+                // Anchors leave with the entry that held them; an entry of
+                // anchors alone leaves whole.
+                if leaving.anchors_only {
+                    continue;
+                }
+                let mut states = leaving.earlier.clone();
+                states.push(RoundState::new(leaving.tokens, leaving.end));
+                let anchors = self.retention.anchors(&states);
+                let mut index = 0;
+                leaving.earlier.retain(|_| {
+                    index += 1;
+                    !anchors[index - 1]
+                });
+            }
             self.take_victim(
                 tier + 1,
                 leaving.session_id,
@@ -806,13 +941,31 @@ impl PrefixTiers {
             return;
         };
         let held = state.entries.get(&session_id);
+        let mut incoming: Vec<RoundState> = earlier.to_vec();
+        if self.anchors_in_place {
+            // An anchor another tier already holds is not written again.
+            let mut states = incoming.clone();
+            states.push(RoundState::new(tokens, end_tag));
+            let anchors = self.retention.anchors(&states);
+            let mut index = 0;
+            incoming.retain(|state| {
+                index += 1;
+                !(anchors[index - 1]
+                    && self.tiers.iter().enumerate().any(|(t, other)| {
+                        t != tier
+                            && other
+                                .entries
+                                .get(&session_id)
+                                .is_some_and(|e| e.states().any(|x| x.at == state.at))
+                    }))
+            });
+        }
         let (end, end_tag) = match held {
             Some(e) if e.tokens > tokens => (e.tokens, e.end),
             _ => (tokens, end_tag),
         };
-        let incoming = earlier
-            .iter()
-            .copied()
+        let incoming = incoming
+            .into_iter()
             .chain(std::iter::once(RoundState::new(tokens, end_tag)));
         let earlier = self.earlier_for(
             tier,
@@ -1766,5 +1919,138 @@ mod tests {
         assert!(moved.is_empty());
         assert_eq!(at, tag(2, false));
         assert_eq!(t.counters(0).loaded_states, 1);
+    }
+
+    /// m1s2 with a hand-back per round, anchors in place, over an exclusive
+    /// DRAM of `dram_gb` and a victim SSD: session 1's DRAM entry ends at
+    /// round 4's decode (5_010k), with round 4's prefill end and round 2's
+    /// anchor.
+    fn in_place_chain(dram_gb: f64) -> PrefixTiers {
+        let spec = |name, gb, writes| PrefixTierSpec {
+            name,
+            capacity_gb_per_gpu: gb,
+            read_gb_per_s_per_gpu: 1.0,
+            writes,
+        };
+        let mut t = PrefixTiers::new(
+            &[
+                spec("dram", dram_gb, PrefixTierWrites::FasterTierEvictionsMoved),
+                spec("ssd", 100.0, PrefixTierWrites::FasterTierEvictions),
+            ],
+            1000,
+            50_000,
+            ResumePoint::ContextEnd,
+        )
+        .with_round_end_states(StateRetention::Anchors { count: 1, stride: 2 }, 2)
+        .with_anchors_in_place();
+        let earlier = [
+            RoundState::new(3_000_000, tag(2, false)),
+            RoundState::new(5_000_000, tag(4, false)),
+        ];
+        t.store_evicted(1, 5_010_000, tag(4, true), &earlier);
+        t
+    }
+
+    fn tag(round: u32, handback: bool) -> StateTag {
+        StateTag { round, handback }
+    }
+
+    #[test]
+    fn an_anchor_in_place_is_written_once_and_never_moved_by_a_read() {
+        let mut t = in_place_chain(10.0);
+        assert_eq!(t.counters(0).written_states, 3);
+        // An extending round moves only the decode end it resumes from.
+        let hit = t.lookup(1, 5_010_001).unwrap();
+        assert!(t.read_states(1, hit).is_empty());
+        assert_eq!(t.read_charge(1, hit, 0), 5_010_000 + 50_000);
+        let (_, moved, at) = t.load(1, hit, 0, Time::ZERO);
+        assert!(moved.is_empty());
+        assert_eq!(at, tag(4, true));
+        assert_eq!(t.counters(0).loaded_states, 1);
+        // Exclusive DRAM keeps round 4's prefill end, the next anchor, with
+        // its KV; round 2's, which the round pushes out, is dropped.
+        assert_eq!(t.used_tokens(0), 5_000_000 + 50_000);
+        assert_eq!(t.earlier_states(0), 0);
+        // HBM evicting round 5's context writes only its new KV and states.
+        t.store_evicted(
+            1,
+            6_010_000,
+            tag(5, true),
+            &[RoundState::new(6_000_000, tag(5, false))],
+        );
+        assert_eq!(t.counters(0).written_states, 3 + 2);
+        assert_eq!(t.counters(0).written_tokens, 5_010_000 + 1_010_000);
+        assert_eq!(t.used_tokens(0), 6_010_000 + 3 * 50_000);
+        // DRAM evicting it drops the anchor: SSD gets round 5's two states.
+        t.store_evicted(2, 9_000_000, tag(0, true), &[]);
+        assert_eq!(t.used_tokens(1), 6_010_000 + 2 * 50_000);
+        assert_eq!(t.counters(1).written_states, 2);
+        assert_eq!(t.earlier_states(1), 1);
+    }
+
+    #[test]
+    fn an_inside_round_moves_the_anchor_it_resumes_from_and_leaves_it_in_place() {
+        let mut t = in_place_chain(10.0);
+        let hit = t.lookup(1, 4_000_000).unwrap();
+        assert_eq!(hit.tokens, 3_000_000);
+        // HBM still holds the context's KV: only the anchor moves.
+        assert_eq!(t.read_charge(1, hit, 3_000_000), 50_000);
+        let (_, moved, at) = t.load(1, hit, 3_000_000, Time::ZERO);
+        assert!(moved.is_empty());
+        assert_eq!(at, tag(2, false));
+        // The anchor stays in DRAM with its KV prefix; nothing else does.
+        assert_eq!(t.used_tokens(0), 3_000_000 + 50_000);
+        // An entry of anchors alone leaves DRAM whole, writing SSD nothing.
+        t.store_evicted(2, 9_900_000, tag(0, true), &[]);
+        assert_eq!(t.used_tokens(0), 9_900_000 + 50_000);
+        assert_eq!(t.used_tokens(1), 0);
+        assert_eq!(t.counters(1).stored_entries, 0);
+    }
+
+    #[test]
+    fn a_demotion_does_not_rewrite_an_anchor_another_tier_holds() {
+        // DRAM too small for the entry: it lands in SSD with its anchor.
+        let mut t = in_place_chain(5.1);
+        assert_eq!(t.used_tokens(1), 5_010_000 + 3 * 50_000);
+        // An inside round resumes from round 2's anchor in SSD, and HBM
+        // later evicts its context (round 3, carrying the anchor) into DRAM:
+        // DRAM is written its KV and new states, not the anchor.
+        let hit = t.lookup(1, 3_500_000).unwrap();
+        assert_eq!((hit.tier, hit.tokens), (1, 3_000_000));
+        t.load(1, hit, 0, Time::ZERO);
+        t.store_evicted(
+            1,
+            4_000_000,
+            tag(3, true),
+            &[
+                RoundState::new(3_000_000, tag(2, false)),
+                RoundState::new(3_900_000, tag(3, false)),
+            ],
+        );
+        assert_eq!(t.counters(0).written_states, 2);
+        assert_eq!(t.used_tokens(0), 4_000_000 + 2 * 50_000);
+    }
+
+    #[test]
+    fn an_ssd_entry_drops_the_anchors_a_read_round_pushes_out() {
+        // DRAM too small for the entry: it lands in SSD with its anchor.
+        let mut t = in_place_chain(1.0);
+        assert_eq!(t.used_tokens(0), 0);
+        assert_eq!(t.counters(1).written_states, 3);
+        // A read moves the decode end alone; SSD keeps the entry.
+        let hit = t.lookup(1, 5_010_001).unwrap();
+        t.load(1, hit, 0, Time::ZERO);
+        // SSD drops round 2's anchor, which the round pushes out.
+        assert_eq!(t.used_tokens(1), 5_010_000 + 2 * 50_000);
+        // HBM evicts round 5's context, whose round-4 anchor SSD holds: DRAM
+        // (too small) passes it to SSD, which writes only the new states.
+        t.store_evicted(
+            1,
+            6_010_000,
+            tag(5, true),
+            &[RoundState::new(6_000_000, tag(5, false))],
+        );
+        assert_eq!(t.counters(1).written_states, 3 + 2);
+        assert_eq!(t.used_tokens(1), 6_010_000 + 3 * 50_000);
     }
 }

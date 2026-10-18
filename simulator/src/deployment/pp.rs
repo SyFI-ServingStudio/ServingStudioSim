@@ -319,6 +319,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         recurrent_state_anchors,
         recurrent_state_anchor_stride,
         tier_state_compression_ratio,
+        recurrent_state_anchors_in_place,
         ..
     } = worker
     else {
@@ -360,6 +361,10 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
             || (*recurrent_state_checkpoints == 1 && *recurrent_state_anchor_stride >= 1),
         "pp: recurrent_state_anchors needs recurrent_state_checkpoints: 1 and \
          recurrent_state_anchor_stride >= 1"
+    );
+    ensure!(
+        !*recurrent_state_anchors_in_place || *recurrent_state_anchors > 0,
+        "pp: recurrent_state_anchors_in_place needs recurrent_state_anchors > 0"
     );
     ensure!(
         tier_state_compression_ratio.is_finite() && *tier_state_compression_ratio >= 1.0,
@@ -411,6 +416,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         recurrent_state_anchors: *recurrent_state_anchors,
         recurrent_state_anchor_stride: *recurrent_state_anchor_stride,
         tier_state_compression_ratio: *tier_state_compression_ratio,
+        recurrent_state_anchors_in_place: *recurrent_state_anchors_in_place,
         ..WorkerConfig::default()
     })
 }

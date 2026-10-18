@@ -676,6 +676,9 @@ pub struct WorkerConfig {
     pub recurrent_state_anchors: u32,
     /// Round stride of the anchors (`recurrent_state_anchors`), >= 1.
     pub recurrent_state_anchor_stride: u32,
+    /// Pipeline head, anchor retention with tiers: each anchor stays in the
+    /// tier it first lands in below HBM (`PrefixTiers::set_anchors_in_place`).
+    pub recurrent_state_anchors_in_place: bool,
     /// Pipeline head, a state-at-end hybrid with tiers: the DRAM/SSD tiers
     /// store each recurrent state compressed by this ratio (host CPU encode
     /// and decode; HBM keeps it whole). 1: uncompressed.
@@ -728,6 +731,7 @@ impl Default for WorkerConfig {
             recurrent_state_checkpoints: 1,
             recurrent_state_anchors: 0,
             recurrent_state_anchor_stride: 1,
+            recurrent_state_anchors_in_place: false,
             tier_state_compression_ratio: 1.0,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,

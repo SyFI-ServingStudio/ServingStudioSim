@@ -229,6 +229,10 @@ pub trait PrefixKv: KvStore {
     /// Drop a read's hold, if it has one.
     fn release_read_hold(&mut self, request: RequestId);
 
+    /// KV tokens of `session_id`'s entry in `partition`'s retained tier,
+    /// whether or not a prompt can resume inside it.
+    fn retained_kv_tokens(&self, partition: PartitionId, session_id: u32) -> u64;
+
     /// What one retained recurrent state costs, in the store's tokens (0
     /// without recurrent state). A read that moves earlier round-end states
     /// holds this much more per state, so its context goes back into HBM
