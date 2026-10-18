@@ -23,8 +23,8 @@ use crate::worker::kv::shared::prefix_cache_journal::{HbmEvictionLog, PrefixCach
 use crate::worker::kv::shared::request_ledger::RequestLedger;
 use crate::worker::kv::shared::resident_partition::ResidentPartitionState;
 use crate::worker::kv::{
-    ChunkedPrefillKv, HandoffKv, IterWorkerKv, KvStore, PrefixCachePolicy, PrefixCacheTokenConfig,
-    PrefixKv, ResolvedPrefillContext, SlotPipelineKv,
+    ChunkedPrefillKv, EndState, HandoffKv, IterWorkerKv, KvStore, PrefixCachePolicy,
+    PrefixCacheTokenConfig, PrefixKv, ResolvedPrefillContext, RoundState, SlotPipelineKv,
 };
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
 
@@ -470,7 +470,8 @@ impl PrefixKv for FullAttnKv {
         session_id: u32,
         tokens: u64,
         _shared: u64,
-        _states: &[u64],
+        _states: &[RoundState],
+        _end: EndState,
         now: Time,
     ) {
         self.retain_prefix(
@@ -907,8 +908,13 @@ impl FullAttnKv {
         if insert_result.retained_tokens
             < self.prefix_caches[partition as usize].retainable_tokens(tokens)
         {
-            self.journal
-                .record_unkept(partition, session_id, tokens, insert_result.earlier_states);
+            self.journal.record_unkept(
+                partition,
+                session_id,
+                tokens,
+                insert_result.end,
+                insert_result.earlier_states,
+            );
         }
         if insert_result.retained_tokens == 0 {
             let cache_used = self.prefix_caches[partition as usize].used_charge();
@@ -1046,13 +1052,13 @@ mod tests {
             None,
         )
         .with_hbm_eviction_log(log.clone());
-        kv_store.restore_prefix(RequestId(0), 0, 1, 80, 0, &[], Time::ZERO);
+        kv_store.restore_prefix(RequestId(0), 0, 1, 80, 0, &[], EndState::Pass, Time::ZERO);
         assert!(log.borrow().is_empty());
         // Session 2's context pushes session 1 out. Session 3's is larger
         // than HBM: it pushes 2 out, HBM keeps only its first 100 tokens, and
         // the whole context leaves HBM.
-        kv_store.restore_prefix(RequestId(1), 0, 2, 60, 0, &[], Time::ZERO);
-        kv_store.restore_prefix(RequestId(2), 0, 3, 120, 0, &[], Time::ZERO);
+        kv_store.restore_prefix(RequestId(1), 0, 2, 60, 0, &[], EndState::Pass, Time::ZERO);
+        kv_store.restore_prefix(RequestId(2), 0, 3, 120, 0, &[], EndState::Pass, Time::ZERO);
         assert_eq!(
             log.borrow().as_slice(),
             [
@@ -1061,18 +1067,21 @@ mod tests {
                     session_id: 1,
                     tokens: 80,
                     earlier_states: vec![],
+                    end: Default::default(),
                 },
                 HbmEviction {
                     partition: 0,
                     session_id: 2,
                     tokens: 60,
                     earlier_states: vec![],
+                    end: Default::default(),
                 },
                 HbmEviction {
                     partition: 0,
                     session_id: 3,
                     tokens: 120,
                     earlier_states: vec![],
+                    end: Default::default(),
                 },
             ]
         );

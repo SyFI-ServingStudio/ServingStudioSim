@@ -89,8 +89,8 @@ use std::path::{Path, PathBuf};
 use crate::common::{RequestId, SessionInput, Time};
 use crate::worker::config::PrefixTierReadWaitPolicy;
 use crate::worker::kv::{
-    HbmEvictionLog, PrefixKv, PrefixTierHit, PrefixTierSpec, PrefixTiers, ResumePoint, RoundContext,
-    WRITE_WINDOW,
+    EndState, HbmEvictionLog, PrefixKv, PrefixTierHit, PrefixTierSpec, PrefixTiers, ResumePoint,
+    RoundContext, RoundState, StateRetention, StateTag, WRITE_WINDOW,
 };
 
 use super::AdmissionCandidate;
@@ -130,7 +130,7 @@ impl SessionPrefixTiers {
         kv_bytes_per_token: u64,
         state_tokens: u64,
         resume: ResumePoint,
-        round_end_states: u32,
+        retention: StateRetention,
         states_added_per_round: u32,
         log_dir: Option<&Path>,
         tag: &str,
@@ -160,7 +160,7 @@ impl SessionPrefixTiers {
             file
         });
         let mut tiers = PrefixTiers::new(specs, kv_bytes_per_token, state_tokens, resume)
-            .with_round_end_states(round_end_states, states_added_per_round);
+            .with_round_end_states(retention, states_added_per_round);
         if events.is_some() {
             tiers.record_events();
         }
@@ -251,7 +251,7 @@ impl SessionPrefixTiers {
         seeded: bool,
         hbm_tokens: u32,
         now: Time,
-    ) -> (Time, Vec<u64>) {
+    ) -> (Time, Vec<RoundState>, StateTag) {
         if seeded {
             self.tiers.seed(session_id, u64::from(hit.tokens));
             let stored = self.stored.entry(session_id).or_insert(0);
@@ -431,7 +431,9 @@ struct Fetch {
     /// Tokens (KV and its states) the read holds in each loading area.
     charge: u64,
     /// The round-end states below the hit the read moves into HBM.
-    states: Vec<u64>,
+    states: Vec<RoundState>,
+    /// The state at the hit.
+    hit_tag: StateTag,
 }
 
 impl Fetch {
@@ -836,7 +838,7 @@ impl PrefixFetch {
             Phase::Hbm
         };
         self.restored.remove(&candidate.request_id);
-        let (ready, states) = tiers.read(session_id, hit, seeded, hbm_tokens, now);
+        let (ready, states, hit_tag) = tiers.read(session_id, hit, seeded, hbm_tokens, now);
         self.reads.push(Reverse((ready, candidate.request_id)));
         self.reading.insert(
             candidate.request_id,
@@ -852,6 +854,7 @@ impl PrefixFetch {
                 phase,
                 charge,
                 states,
+                hit_tag,
             },
         );
         true
@@ -933,6 +936,7 @@ impl PrefixFetch {
             self.partitions[usize::from(eviction.partition)].tiers.store_evicted(
                 eviction.session_id,
                 eviction.tokens,
+                eviction.end,
                 &eviction.earlier_states,
             );
         }
@@ -1015,6 +1019,7 @@ impl PrefixFetch {
                 tokens,
                 tokens,
                 &fetch.states,
+                EndState::Read(fetch.hit_tag),
                 now,
             );
             self.restored.insert(candidate.request_id, fetch);
@@ -1081,7 +1086,7 @@ impl PrefixFetch {
             tiers.rereads += 1;
             self.restored.remove(&candidate.request_id);
         }
-        let (ready, states) = tiers.read(session_id, hit, seeded, hbm_tokens, now);
+        let (ready, states, hit_tag) = tiers.read(session_id, hit, seeded, hbm_tokens, now);
         self.reads.push(Reverse((ready, candidate.request_id)));
         self.reading.insert(
             candidate.request_id,
@@ -1097,6 +1102,7 @@ impl PrefixFetch {
                 phase: Phase::Hbm,
                 charge: 0,
                 states,
+                hit_tag,
             },
         );
         AtHead::Read
@@ -1268,7 +1274,7 @@ mod tests {
             1,
             0,
             ResumePoint::AnyToken,
-            1,
+            StateRetention::Latest(1),
             1,
             None,
             "test",
@@ -1291,7 +1297,7 @@ mod tests {
             1000,
             0,
             ResumePoint::AnyToken,
-            1,
+            StateRetention::Latest(1),
             1,
             None,
             "test",
@@ -1516,7 +1522,7 @@ mod tests {
         // not fit beside the running requests and stays.
         assert_eq!(fetch.at_head(&mut kv, 0, a, at), AtHead::Admit);
         // Another session's context fills HBM's retained tier, evicting it.
-        kv.restore_prefix(RequestId(9), 0, 9, 1_000_000, 0, &[], at);
+        kv.restore_prefix(RequestId(9), 0, 9, 1_000_000, 0, &[], EndState::Pass, at);
         assert_eq!(fetch.at_head(&mut kv, 0, a, at), AtHead::PassedOver);
         assert_eq!(fetch.partitions[0].rereads, 1);
         fetch.pop_landed(0);

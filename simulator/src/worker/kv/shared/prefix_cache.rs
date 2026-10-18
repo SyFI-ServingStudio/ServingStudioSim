@@ -73,6 +73,161 @@ impl ResumePoint {
     }
 }
 
+/// What a round-end state is, beside where it sits: the round that computed
+/// it, counted along the context's lineage (a round is one past the round of
+/// the state it resumed from, 0 when it resumed from none), and whether it is
+/// a handed-back decode's end rather than the end of a pass this engine ran
+/// (a prefill's, or a local decode's).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StateTag {
+    pub round: u32,
+    pub handback: bool,
+}
+
+/// One round-end state: where it sits in the context, and what it is.
+/// Ordered by position first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RoundState {
+    pub at: u64,
+    pub tag: StateTag,
+}
+
+impl RoundState {
+    pub(crate) fn new(at: u64, tag: StateTag) -> Self {
+        Self { at, tag }
+    }
+}
+
+/// Positions of `states`, ascending.
+#[cfg(test)]
+pub(crate) fn positions(states: &[RoundState]) -> Vec<u64> {
+    states.iter().map(|state| state.at).collect()
+}
+
+/// Sort `states` by position and keep one per position, the latest round's.
+pub(crate) fn normalize_states(states: &mut Vec<RoundState>) {
+    states.sort_unstable();
+    states.reverse();
+    states.dedup_by_key(|state| state.at);
+    states.reverse();
+}
+
+/// Which round-end states of a context resumable only at a state stay with
+/// it, in HBM and every tier. Rule-based: its only parameters are its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateRetention {
+    /// The latest `n` round-end states (`recurrent_state_checkpoints`).
+    Latest(u32),
+    /// The latest handed-back decode's end, the latest pass's end (a
+    /// prefill's), and `count` anchors: the latest earlier passes' ends from
+    /// rounds that are a multiple of `stride`. `stride` 2 records an anchor
+    /// every other round, so the kept anchor is one to two rounds back at a
+    /// constant state count; `stride` 1 is the latest earlier pass ends.
+    Anchors { count: u32, stride: u32 },
+}
+
+impl Default for StateRetention {
+    fn default() -> Self {
+        Self::Latest(1)
+    }
+}
+
+impl StateRetention {
+    /// The most states an entry keeps, its end's included.
+    pub(crate) fn max_states(self) -> usize {
+        match self {
+            Self::Latest(n) => n as usize,
+            Self::Anchors { count, .. } => 2 + count as usize,
+        }
+    }
+
+    /// Whether an entry keeps only the state at its end.
+    pub(crate) fn end_only(self) -> bool {
+        self == Self::Latest(1)
+    }
+
+    /// The states of `states` (ascending, one per position, the entry's end
+    /// last) that stay.
+    pub(crate) fn keep(self, mut states: Vec<RoundState>) -> Vec<RoundState> {
+        match self {
+            Self::Latest(n) => {
+                states.drain(..states.len().saturating_sub(n as usize));
+                states
+            }
+            Self::Anchors { count, stride } => {
+                let handback = states.iter().rposition(|s| s.tag.handback);
+                let pass = states.iter().rposition(|s| !s.tag.handback);
+                let mut keep = vec![false; states.len()];
+                for index in handback.into_iter().chain(pass) {
+                    keep[index] = true;
+                }
+                if let Some(pass) = pass {
+                    let current = states[pass].tag.round;
+                    let mut anchors = 0;
+                    for index in (0..pass).rev() {
+                        let tag = states[index].tag;
+                        if anchors == count {
+                            break;
+                        }
+                        if !tag.handback && tag.round < current && tag.round % stride.max(1) == 0 {
+                            keep[index] = true;
+                            anchors += 1;
+                        }
+                    }
+                }
+                let mut index = 0;
+                states.retain(|_| {
+                    index += 1;
+                    keep[index - 1]
+                });
+                states
+            }
+        }
+    }
+
+    /// Of `states` (ascending, at or before a resume point whose state is
+    /// `resume`), those still kept after the round resuming there adds its
+    /// `added` states: its pass's end, and with 2 a handed-back decode's end.
+    pub(crate) fn survivors(
+        self,
+        states: &[RoundState],
+        resume: StateTag,
+        added: u32,
+    ) -> Vec<RoundState> {
+        let round = StateTag {
+            round: resume.round + 1,
+            handback: false,
+        };
+        let mut all = states.to_vec();
+        all.push(RoundState::new(u64::MAX - 1, round));
+        if added >= 2 {
+            all.push(RoundState::new(
+                u64::MAX,
+                StateTag {
+                    handback: true,
+                    ..round
+                },
+            ));
+        }
+        let mut kept = self.keep(all);
+        kept.retain(|state| state.at < u64::MAX - 1);
+        kept
+    }
+}
+
+/// Which state a retained context's end is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndState {
+    /// The end of a pass this engine ran, one round past the state its
+    /// request resumed from.
+    Pass,
+    /// A decode run elsewhere handed the context back: the end of the round
+    /// whose pass ended at the shared tokens.
+    HandBack,
+    /// A slower tier's state, read back with its tag.
+    Read(StateTag),
+}
+
 /// Whether completed-session KV may be retained after a request finishes.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -170,10 +325,22 @@ struct PrefixEntry {
     insertion_sequence: u64,
     last_access_sequence: u64,
     frequency: u64,
+    /// The state at `tokens`.
+    end: StateTag,
     /// Round-end states kept beside the one at `tokens`, ascending, each
     /// below `tokens`. Empty unless the cache keeps more than one state per
     /// entry.
-    earlier_states: Vec<u64>,
+    earlier_states: Vec<RoundState>,
+}
+
+impl PrefixEntry {
+    /// Its states, the end's last.
+    fn states(&self) -> impl Iterator<Item = RoundState> + '_ {
+        self.earlier_states
+            .iter()
+            .copied()
+            .chain(std::iter::once(RoundState::new(self.tokens, self.end)))
+    }
 }
 
 /// Replacement metadata that follows a destructively consumed session until
@@ -199,7 +366,9 @@ pub(crate) struct PrefixCacheMutation {
     pub(crate) cache_used_after: u64,
     /// An evicted entry's states below `entry_tokens_before`, which leave
     /// with it; empty otherwise.
-    pub(crate) earlier_states: Vec<u64>,
+    pub(crate) earlier_states: Vec<RoundState>,
+    /// An evicted entry's state at `entry_tokens_before`.
+    pub(crate) end: StateTag,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,7 +394,18 @@ pub(crate) struct PrefixCacheInsertResult {
     pub(crate) retained_tokens: u64,
     /// The states below the context's end the entry keeps, or would have
     /// kept had it fit.
-    pub(crate) earlier_states: Vec<u64>,
+    pub(crate) earlier_states: Vec<RoundState>,
+    /// The state at the context's end.
+    pub(crate) end: StateTag,
+}
+
+/// The states a running request carries from the session's entry it took
+/// ([`PrefixCache::take`]), and the tag of the state it resumed from (`None`:
+/// it resumed from none).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Carried {
+    pub(crate) states: Vec<RoundState>,
+    pub(crate) resume: Option<StateTag>,
 }
 
 /// One attention partition's evictable retained-session tier.
@@ -245,15 +425,15 @@ pub(crate) struct PrefixCache {
     /// Extra occupancy every kept state costs: the one at an entry's end and
     /// each earlier one ([`Self::with_end_state`]).
     charge_per_entry: u64,
-    /// Round-end states an entry keeps, its end's included (1: the end only).
-    max_states: usize,
+    /// Which round-end states an entry keeps (`Latest(1)`: the end only).
+    retention: StateRetention,
     /// States kept: one at each entry's end, every entry's earlier ones, and
     /// those requests carry ([`Self::take`]).
     states: u64,
     entries: HashMap<u32, PrefixEntry>,
     /// The states a running request of the session carries from the entry it
     /// took, until its context returns ([`Self::take_carried`]).
-    carried: HashMap<u32, Vec<u64>>,
+    carried: HashMap<u32, Carried>,
     /// `entries` ordered by the policy's eviction key, session id last, so the
     /// victim is the first element. A retained entry's key never changes (a
     /// hit removes it), so only insert and remove touch this.
@@ -283,7 +463,7 @@ impl PrefixCache {
             },
             charge_per_checkpoint,
             charge_per_entry: 0,
-            max_states: 1,
+            retention: StateRetention::Latest(1),
             states: 0,
             entries: HashMap::new(),
             carried: HashMap::new(),
@@ -298,30 +478,35 @@ impl PrefixCache {
     /// keeps up to `states - 1` earlier round-end states, all of them one
     /// unit with the context (module docs).
     /// Replaces the snapshot quantum and charge.
-    pub(crate) fn with_end_state(mut self, charge: u64, states: u32) -> Self {
+    pub(crate) fn with_end_state(mut self, charge: u64, retention: StateRetention) -> Self {
         assert!(self.entries.is_empty(), "set the end state before use");
-        assert!(states >= 1, "an entry keeps at least its end state");
+        assert!(retention.max_states() >= 1, "an entry keeps at least its end state");
         self.quantum_tokens = 1;
         self.resume = ResumePoint::ContextEnd;
         self.charge_per_checkpoint = 0;
         self.charge_per_entry = charge;
-        self.max_states = states as usize;
+        self.retention = retention;
         self
     }
 
     /// Where a prompt sharing `declared` tokens with `entry` resumes.
     fn resume_tokens(&self, entry: &PrefixEntry, declared: u64) -> u64 {
+        self.resume_state(entry, declared).map_or(0, |state| state.at)
+    }
+
+    /// The state a prompt sharing `declared` tokens with `entry` resumes
+    /// from (the end's tag for a resume that is not at a state).
+    fn resume_state(&self, entry: &PrefixEntry, declared: u64) -> Option<RoundState> {
         let end = self.resume.reusable_tokens(entry.tokens, declared);
         if end > 0 {
-            return end;
+            return Some(RoundState::new(end, entry.end));
         }
         entry
             .earlier_states
             .iter()
             .rev()
             .copied()
-            .find(|&at| at <= declared)
-            .unwrap_or(0)
+            .find(|state| state.at <= declared)
     }
 
     /// Context tokens held. Deliberately test-only: every production decision
@@ -402,12 +587,24 @@ impl PrefixCache {
             insertion_sequence: entry.insertion_sequence,
             frequency: entry.frequency.saturating_add(1),
         });
-        if let Some(entry) = removed_entry.filter(|_| self.max_states > 1 && hit_tokens > 0) {
+        if let Some(entry) = removed_entry.filter(|_| !self.retention.end_only() && hit_tokens > 0)
+        {
             // The request leaves a state at its own end, so these keep room for it.
-            let states = self.states_up_to(&entry, u64::from(hit_tokens), self.max_states - 1);
+            let resume = self
+                .resume_state(&entry, u64::from(requested_tokens))
+                .expect("a hit resumes from a state");
+            let below: Vec<RoundState> = entry
+                .states()
+                .filter(|state| state.at > 0 && state.at <= u64::from(hit_tokens))
+                .collect();
+            let states = self.retention.survivors(&below, resume.tag, 1);
             self.states += states.len() as u64;
-            if let Some(old) = self.carried.insert(session_id, states) {
-                self.states -= old.len() as u64;
+            let carried = Carried {
+                states,
+                resume: Some(resume.tag),
+            };
+            if let Some(old) = self.carried.insert(session_id, carried) {
+                self.states -= old.states.len() as u64;
             }
         }
         PrefixCacheTakeResult {
@@ -422,10 +619,10 @@ impl PrefixCache {
     /// The states a running request of the session carries ([`Self::take`]),
     /// out of this cache's charge: they return with its context
     /// ([`Self::insert_sharing`]'s `incoming`). Empty when it carries none.
-    pub(crate) fn take_carried(&mut self, session_id: u32) -> Vec<u64> {
-        let states = self.carried.remove(&session_id).unwrap_or_default();
-        self.states -= states.len() as u64;
-        states
+    pub(crate) fn take_carried(&mut self, session_id: u32) -> Carried {
+        let carried = self.carried.remove(&session_id).unwrap_or_default();
+        self.states -= carried.states.len() as u64;
+        carried
     }
 
     /// Retain a completed request's physically resident KV.
@@ -440,39 +637,60 @@ impl PrefixCache {
         physical_limit: u64,
         return_metadata: Option<PrefixCacheReturnMetadata>,
     ) -> PrefixCacheInsertResult {
-        self.insert_sharing(session_id, tokens, 0, &[], physical_limit, return_metadata)
+        self.insert_sharing(
+            session_id,
+            tokens,
+            0,
+            &Carried::default(),
+            EndState::Pass,
+            physical_limit,
+            return_metadata,
+        )
     }
 
     /// [`Self::insert`] of a context that shares its first `shared` tokens
     /// with the session's entry and arrives with `incoming` states of its
-    /// own (carried by its request, or read from a slower tier): the latest
-    /// `k - 1` of the entry's and the incoming states within the shared
-    /// tokens stay, below the new end state. The entry is one unit: kept with
-    /// all of them, or not at all.
+    /// own (carried by its request, or read from a slower tier), its end
+    /// being the `end` state: the entry's and the incoming states within the
+    /// shared tokens that the retention keeps stay, below the new end state.
+    /// The entry is one unit: kept with all of them, or not at all.
     pub(crate) fn insert_sharing(
         &mut self,
         session_id: u32,
         tokens: u64,
         shared: u64,
-        incoming: &[u64],
+        incoming: &Carried,
+        end: EndState,
         physical_limit: u64,
         return_metadata: Option<PrefixCacheReturnMetadata>,
     ) -> PrefixCacheInsertResult {
         let mut mutations = Vec::new();
-        let earlier = if self.max_states > 1 {
-            let limit = shared.min(tokens.saturating_sub(1));
-            let mut states: Vec<u64> = self
+        let limit = shared.min(tokens.saturating_sub(1));
+        let (earlier, end) = if self.retention.end_only() {
+            (Vec::new(), StateTag::default())
+        } else {
+            let mut states: Vec<RoundState> = self
                 .entries
                 .get(&session_id)
-                .map(|entry| self.states_up_to(entry, limit, self.max_states))
+                .map(|entry| entry.states().filter(|s| s.at > 0 && s.at <= limit).collect())
                 .unwrap_or_default();
-            states.extend(incoming.iter().copied().filter(|&at| at > 0 && at <= limit));
-            states.sort_unstable();
-            states.dedup();
-            states.drain(..states.len().saturating_sub(self.max_states - 1));
-            states
-        } else {
-            Vec::new()
+            states.extend(incoming.states.iter().copied().filter(|s| s.at > 0 && s.at <= limit));
+            normalize_states(&mut states);
+            let end = match end {
+                EndState::Pass => StateTag {
+                    round: incoming.resume.map_or(0, |tag| tag.round + 1),
+                    handback: false,
+                },
+                EndState::HandBack => StateTag {
+                    round: states.last().map_or(0, |s| s.tag.round),
+                    handback: true,
+                },
+                EndState::Read(tag) => tag,
+            };
+            states.push(RoundState::new(tokens, end));
+            let mut kept = self.retention.keep(states);
+            kept.pop();
+            (kept, end)
         };
         if let Some(mutation) =
             self.remove_with_receipt(session_id, PrefixCacheMutationKind::SameSessionReplacement)
@@ -490,6 +708,7 @@ impl PrefixCache {
                 mutations,
                 retained_tokens,
                 earlier_states: earlier,
+                end,
             };
         }
         let retained_charge = self.charge_of(retained_tokens, earlier.len());
@@ -516,6 +735,7 @@ impl PrefixCache {
                 insertion_sequence,
                 last_access_sequence: sequence,
                 frequency,
+                end,
                 earlier_states: earlier.clone(),
             },
         );
@@ -527,11 +747,13 @@ impl PrefixCache {
             cache_used_before,
             cache_used_after: self.used_tokens,
             earlier_states: Vec::new(),
+            end,
         });
         PrefixCacheInsertResult {
             mutations,
             retained_tokens,
             earlier_states: earlier,
+            end,
         }
     }
 
@@ -594,20 +816,6 @@ impl PrefixCache {
         Some(entry)
     }
 
-    /// The entry's round-end states (its end's included) at or before `limit`,
-    /// the latest `count` of them, ascending.
-    fn states_up_to(&self, entry: &PrefixEntry, limit: u64, count: usize) -> Vec<u64> {
-        let mut states: Vec<u64> = entry
-            .earlier_states
-            .iter()
-            .copied()
-            .chain(std::iter::once(entry.tokens))
-            .filter(|&at| at > 0 && at <= limit)
-            .collect();
-        states.drain(..states.len().saturating_sub(count));
-        states
-    }
-
     fn remove_with_receipt(
         &mut self,
         session_id: u32,
@@ -623,6 +831,7 @@ impl PrefixCache {
             cache_used_before,
             cache_used_after: self.used_tokens,
             earlier_states: entry.earlier_states,
+            end: entry.end,
         })
     }
 
@@ -642,6 +851,37 @@ mod tests {
     /// covered by the hybrid store's own tests.
     const TOKEN_QUANTUM: u32 = 1;
     const NO_EXTRA_CHARGE: u64 = 0;
+
+    impl PrefixCache {
+        /// [`Self::insert_sharing`] of a pass's context arriving with
+        /// untagged `incoming` states.
+        fn share(
+            &mut self,
+            session_id: u32,
+            tokens: u64,
+            shared: u64,
+            incoming: &[u64],
+            physical_limit: u64,
+            return_metadata: Option<PrefixCacheReturnMetadata>,
+        ) -> PrefixCacheInsertResult {
+            let incoming = Carried {
+                states: incoming
+                    .iter()
+                    .map(|&at| RoundState::new(at, StateTag::default()))
+                    .collect(),
+                resume: None,
+            };
+            self.insert_sharing(
+                session_id,
+                tokens,
+                shared,
+                &incoming,
+                EndState::Pass,
+                physical_limit,
+                return_metadata,
+            )
+        }
+    }
 
     #[test]
     fn runtime_config_resolves_disabled_uncapped_and_bounded_token_limits() {
@@ -790,7 +1030,7 @@ mod tests {
     #[test]
     fn end_state_reuses_the_whole_context_or_nothing() {
         let mut cache =
-            PrefixCache::new(10_000, PrefixCachePolicy::Lru, 1_000, 500).with_end_state(500, 1);
+            PrefixCache::new(10_000, PrefixCachePolicy::Lru, 1_000, 500).with_end_state(500, StateRetention::Latest(1));
         cache.insert(1, 2_345, 10_000, None);
         assert_eq!(cache.used_charge(), 2_845);
         // A prompt that extends the kept context resumes from its end state.
@@ -805,7 +1045,7 @@ mod tests {
     #[test]
     fn end_state_charges_one_state_per_entry_and_keeps_entries_whole() {
         let mut cache =
-            PrefixCache::new(10_000, PrefixCachePolicy::Lru, 1_000, 500).with_end_state(500, 1);
+            PrefixCache::new(10_000, PrefixCachePolicy::Lru, 1_000, 500).with_end_state(500, StateRetention::Latest(1));
         cache.insert(1, 2_345, 10_000, None);
         // A second entry needs its own state: 6_000 + 500 does not fit beside
         // 2_845, so session 1 is evicted.
@@ -822,7 +1062,7 @@ mod tests {
     /// State-at-end entries keeping up to `states` round-end states, a state
     /// costing 500 tokens.
     fn round_end_cache(capacity: u64, states: u32) -> PrefixCache {
-        PrefixCache::new(capacity, PrefixCachePolicy::Lru, 1, 0).with_end_state(500, states)
+        PrefixCache::new(capacity, PrefixCachePolicy::Lru, 1, 0).with_end_state(500, StateRetention::Latest(states))
     }
 
     #[test]
@@ -830,15 +1070,15 @@ mod tests {
         let mut cache = round_end_cache(100_000, 3);
         cache.insert(1, 1_000, 100_000, None);
         // The next round extends it (shares 1_000); a decode hands back more.
-        cache.insert_sharing(1, 1_500, 1_000, &[], 100_000, None);
-        cache.insert_sharing(1, 2_000, 1_500, &[], 100_000, None);
+        cache.share(1, 1_500, 1_000, &[], 100_000, None);
+        cache.share(1, 2_000, 1_500, &[], 100_000, None);
         assert_eq!(cache.used_charge(), 2_000 + 3 * 500);
         assert_eq!(cache.peek(1, 2_001), 2_000);
         assert_eq!(cache.peek(1, 1_999), 1_500);
         assert_eq!(cache.peek(1, 1_200), 1_000);
         assert_eq!(cache.peek(1, 999), 0);
         // A fourth state pushes the oldest out.
-        cache.insert_sharing(1, 2_500, 2_000, &[], 100_000, None);
+        cache.share(1, 2_500, 2_000, &[], 100_000, None);
         assert_eq!(cache.peek(1, 1_200), 0);
         assert_eq!(cache.used_charge(), 2_500 + 3 * 500);
     }
@@ -847,10 +1087,10 @@ mod tests {
     fn a_truncating_round_keeps_only_the_states_before_the_cut() {
         let mut cache = round_end_cache(100_000, 4);
         cache.insert(1, 1_000, 100_000, None);
-        cache.insert_sharing(1, 2_000, 1_000, &[], 100_000, None);
+        cache.share(1, 2_000, 1_000, &[], 100_000, None);
         // A context that shares only 1_500 tokens: the state at 2_000 is on
         // another branch.
-        cache.insert_sharing(1, 1_800, 1_500, &[], 100_000, None);
+        cache.share(1, 1_800, 1_500, &[], 100_000, None);
         assert_eq!(cache.peek(1, 1_799), 1_000);
         assert_eq!(cache.used_charge(), 1_800 + 2 * 500);
     }
@@ -859,7 +1099,7 @@ mod tests {
     fn a_taken_entry_carries_its_states_back_with_its_context() {
         let mut cache = round_end_cache(100_000, 3);
         cache.insert(1, 1_000, 100_000, None);
-        cache.insert_sharing(1, 2_000, 1_000, &[], 100_000, None);
+        cache.share(1, 2_000, 1_000, &[], 100_000, None);
         // The round resumes at 1_000 (its prompt ends at 1_200): the request
         // takes the KV and carries the state at 1_000, still charged here
         // but not an entry.
@@ -870,18 +1110,18 @@ mod tests {
         assert_eq!(cache.peek(1, 1_200), 0, "no entry while the request runs");
         assert!(cache.shrink_to(0).is_empty(), "a carried state is not evictable");
         // Its context returns with the carried state below its own end.
-        let carried = cache.take_carried(1);
+        let carried = positions(&cache.take_carried(1).states);
         assert_eq!(carried, [1_000]);
         assert_eq!(cache.used_charge(), 0);
-        cache.insert_sharing(1, 1_300, 1_200, &carried, 100_000, take.return_metadata);
+        cache.share(1, 1_300, 1_200, &carried, 100_000, take.return_metadata);
         assert_eq!(cache.used_charge(), 1_300 + 2 * 500);
         assert_eq!(cache.peek(1, 1_100), 1_000);
         // Resuming at the end carries the latest k - 1 states, the end's
         // included; the returning context appends its own and keeps 3.
         cache.take(1, 1_301);
-        let carried = cache.take_carried(1);
+        let carried = positions(&cache.take_carried(1).states);
         assert_eq!(carried, [1_000, 1_300]);
-        cache.insert_sharing(1, 1_600, 1_301, &carried, 100_000, None);
+        cache.share(1, 1_600, 1_301, &carried, 100_000, None);
         assert_eq!(cache.peek(1, 1_350), 1_300);
         assert_eq!(cache.peek(1, 1_100), 1_000);
         assert_eq!(cache.used_charge(), 1_600 + 3 * 500);
@@ -891,7 +1131,7 @@ mod tests {
     fn eviction_takes_whole_entries_with_all_their_states() {
         let mut cache = round_end_cache(4_000, 2);
         cache.insert(1, 1_000, 4_000, None);
-        cache.insert_sharing(1, 1_200, 1_000, &[], 4_000, None); // 1_200 + 2 x 500
+        cache.share(1, 1_200, 1_000, &[], 4_000, None); // 1_200 + 2 x 500
         cache.insert(2, 1_000, 4_000, None); // 1_000 + 500
         assert_eq!(cache.used_charge(), 3_700);
         // Session 3 needs 800: the LRU entry, session 1, goes whole, its
@@ -900,7 +1140,7 @@ mod tests {
         let evicted: Vec<_> = result
             .mutations
             .iter()
-            .map(|m| (m.kind, m.session_id, m.entry_tokens_before, m.earlier_states.clone()))
+            .map(|m| (m.kind, m.session_id, m.entry_tokens_before, positions(&m.earlier_states)))
             .collect();
         assert_eq!(
             evicted,
@@ -920,10 +1160,10 @@ mod tests {
         cache.insert(1, 1_000, 2_500, None);
         // 1_200 + 2 x 500 = 2_200 fits; 1_400 + 3 x 500 does not, and no
         // state is dropped to make it fit.
-        cache.insert_sharing(1, 1_200, 1_000, &[], 2_500, None);
-        let result = cache.insert_sharing(1, 1_400, 1_200, &[], 2_500, None);
+        cache.share(1, 1_200, 1_000, &[], 2_500, None);
+        let result = cache.share(1, 1_400, 1_200, &[], 2_500, None);
         assert_eq!(result.retained_tokens, 0);
-        assert_eq!(result.earlier_states, [1_000, 1_200]);
+        assert_eq!(positions(&result.earlier_states), [1_000, 1_200]);
         assert_eq!(cache.used_charge(), 0);
     }
 
@@ -931,12 +1171,12 @@ mod tests {
     fn one_state_per_entry_keeps_no_earlier_state() {
         let mut cache = round_end_cache(100_000, 1);
         cache.insert(1, 1_000, 100_000, None);
-        cache.insert_sharing(1, 2_000, 1_000, &[1_000], 100_000, None);
+        cache.share(1, 2_000, 1_000, &[1_000], 100_000, None);
         assert_eq!(cache.peek(1, 1_500), 0);
         assert_eq!(cache.used_charge(), 2_500);
         cache.take(1, 2_001);
         assert_eq!(cache.used_charge(), 0);
-        assert!(cache.take_carried(1).is_empty());
+        assert!(cache.take_carried(1).states.is_empty());
     }
 
     #[test]
@@ -958,5 +1198,109 @@ mod tests {
                 "{rule:?}: a prompt extending the context reuses all of it"
             );
         }
+    }
+
+    /// State-at-end entries under anchor retention, a state costing 500.
+    fn anchor_cache(count: u32, stride: u32) -> PrefixCache {
+        PrefixCache::new(1_000_000, PrefixCachePolicy::Lru, 1, 0)
+            .with_end_state(500, StateRetention::Anchors { count, stride })
+    }
+
+    /// One pipeline round with a hand-back: the request takes the entry
+    /// (sharing `declared`), retains its prompt's context to `prompt_end`,
+    /// and the decode run elsewhere hands back 10 more tokens.
+    fn hand_back_round(cache: &mut PrefixCache, declared: u64, prompt_end: u64) {
+        cache.take(1, declared as u32);
+        let carried = cache.take_carried(1);
+        cache.insert_sharing(1, prompt_end, declared, &carried, EndState::Pass, 1_000_000, None);
+        let none = Carried::default();
+        cache.insert_sharing(1, prompt_end + 10, prompt_end, &none, EndState::HandBack, 1_000_000, None);
+    }
+
+    /// The session's entry's states: (position, round, hand-back).
+    fn entry_states(cache: &PrefixCache) -> Vec<(u64, u32, bool)> {
+        cache.entries[&1]
+            .states()
+            .map(|s| (s.at, s.tag.round, s.tag.handback))
+            .collect()
+    }
+
+    #[test]
+    fn stride_two_anchors_keep_a_prefill_end_one_to_two_rounds_back() {
+        // Round r's prompt ends at 1_000 (r + 1), its decode at 10 later; the
+        // next round extends it.
+        let mut cache = anchor_cache(1, 2);
+        let mut after = Vec::new();
+        for round in 0..6u64 {
+            let declared = if round == 0 { 0 } else { 1_000 * round + 11 };
+            hand_back_round(&mut cache, declared, 1_000 * (round + 1));
+            after.push(entry_states(&cache));
+        }
+        assert_eq!(
+            after,
+            [
+                vec![(1_000, 0, false), (1_010, 0, true)],
+                // The current prefill end and round 0's ("-2" is round 0 here).
+                vec![(1_000, 0, false), (2_000, 1, false), (2_010, 1, true)],
+                vec![(1_000, 0, false), (3_000, 2, false), (3_010, 2, true)],
+                // Round 2 is recorded once round 3 runs: one round back.
+                vec![(3_000, 2, false), (4_000, 3, false), (4_010, 3, true)],
+                vec![(3_000, 2, false), (5_000, 4, false), (5_010, 4, true)],
+                vec![(5_000, 4, false), (6_000, 5, false), (6_010, 5, true)],
+            ]
+        );
+        // Two anchors at stride 2 keep rounds 2 and 4; stride 1 is the latest
+        // earlier prefill ends.
+        for (count, stride, anchors) in [(2, 2, [3_000, 5_000]), (2, 1, [4_000, 5_000])] {
+            let mut cache = anchor_cache(count, stride);
+            for round in 0..6u64 {
+                let declared = if round == 0 { 0 } else { 1_000 * round + 11 };
+                hand_back_round(&mut cache, declared, 1_000 * (round + 1));
+            }
+            let at: Vec<u64> = entry_states(&cache).iter().map(|s| s.0).collect();
+            assert_eq!(at, [anchors[0], anchors[1], 6_000, 6_010], "m{count}s{stride}");
+        }
+    }
+
+    #[test]
+    fn an_inside_round_resumes_from_the_deepest_anchor_at_or_before_its_prefix() {
+        let mut cache = anchor_cache(1, 2);
+        for round in 0..6u64 {
+            let declared = if round == 0 { 0 } else { 1_000 * round + 11 };
+            hand_back_round(&mut cache, declared, 1_000 * (round + 1));
+        }
+        // States at 5_000 (round 4), 6_000 and 6_010.
+        assert_eq!(cache.peek(1, 6_011), 6_010);
+        assert_eq!(cache.peek(1, 6_005), 6_000);
+        assert_eq!(cache.peek(1, 5_500), 5_000);
+        assert_eq!(cache.peek(1, 4_999), 0, "older states were not kept");
+        // The inside round resumes at round 4's state, so it is round 5 of
+        // its lineage: the states past its prefix go, round 4 stays its anchor.
+        hand_back_round(&mut cache, 5_500, 5_800);
+        assert_eq!(
+            entry_states(&cache),
+            [(5_000, 4, false), (5_800, 5, false), (5_810, 5, true)]
+        );
+    }
+
+    #[test]
+    fn every_kept_anchor_state_is_charged_and_carried_states_stay_charged() {
+        let mut cache = anchor_cache(1, 2);
+        for round in 0..3u64 {
+            let declared = if round == 0 { 0 } else { 1_000 * round + 11 };
+            hand_back_round(&mut cache, declared, 1_000 * (round + 1));
+        }
+        // 3_010 tokens and states at 1_000, 3_000 and 3_010.
+        assert_eq!(cache.used_charge(), 3_010 + 3 * 500);
+        // Round 3 takes the entry: it carries the states that survive its
+        // prefill (the decode end at 3_010 and the round-2 anchor at
+        // 3_000), still charged, while its own state is live.
+        cache.take(1, 3_011);
+        assert_eq!(cache.used_charge(), 2 * 500);
+        let carried = cache.take_carried(1);
+        assert_eq!(positions(&carried.states), [3_000, 3_010]);
+        assert_eq!(carried.resume.map(|tag| tag.round), Some(2));
+        cache.insert_sharing(1, 4_000, 3_011, &carried, EndState::Pass, 1_000_000, None);
+        assert_eq!(cache.used_charge(), 4_000 + 3 * 500);
     }
 }

@@ -316,6 +316,8 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         force_schedule_after_ms,
         external_decode,
         recurrent_state_checkpoints,
+        recurrent_state_anchors,
+        recurrent_state_anchor_stride,
         ..
     } = worker
     else {
@@ -351,6 +353,12 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
     ensure!(
         *recurrent_state_checkpoints >= 1,
         "pp: recurrent_state_checkpoints must be >= 1"
+    );
+    ensure!(
+        *recurrent_state_anchors == 0
+            || (*recurrent_state_checkpoints == 1 && *recurrent_state_anchor_stride >= 1),
+        "pp: recurrent_state_anchors needs recurrent_state_checkpoints: 1 and \
+         recurrent_state_anchor_stride >= 1"
     );
     ensure!(
         (0.0..0.5).contains(prefix_tier_loading_area),
@@ -395,6 +403,8 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         force_schedule_after_ms: *force_schedule_after_ms,
         external_decode: *external_decode,
         recurrent_state_checkpoints: *recurrent_state_checkpoints,
+        recurrent_state_anchors: *recurrent_state_anchors,
+        recurrent_state_anchor_stride: *recurrent_state_anchor_stride,
         ..WorkerConfig::default()
     })
 }

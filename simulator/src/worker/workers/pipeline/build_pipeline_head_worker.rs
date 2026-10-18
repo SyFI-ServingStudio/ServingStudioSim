@@ -12,7 +12,9 @@ use crate::worker::admission::{
 use crate::worker::config::{MicrobatchSizing, PrefixTierLoading};
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::{FullAttnKv, HybridGdnKv, PrefixCacheConfig, PrefixKv, ResumePoint};
+use crate::worker::kv::{
+    FullAttnKv, HybridGdnKv, PrefixCacheConfig, PrefixKv, ResumePoint, StateRetention,
+};
 use crate::worker::types::WorkerConfig;
 use crate::worker::workers::iter_build_essentials::{
     full_attention_token_capacity, prepare_iter_build_essentials,
@@ -264,13 +266,13 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         prefix_cache_logger,
     );
     assert!(
-        config.recurrent_state_checkpoints == 1 || !hybrid.align_mode,
-        "recurrent_state_checkpoints > 1 needs a state-at-end hybrid (plain chunking)"
+        config.state_retention().end_only() || !hybrid.align_mode,
+        "recurrent_state_checkpoints > 1 or anchors need a state-at-end hybrid (plain chunking)"
     );
     let kv_store = if hybrid.align_mode {
         kv_store
     } else {
-        kv_store.with_end_state_reuse(config.recurrent_state_checkpoints)
+        kv_store.with_end_state_reuse(config.state_retention())
     };
     let mut kv_store = match prefix_fetch
         .as_mut()
@@ -399,9 +401,9 @@ fn head_prefix_fetch(
                 .div_ceil(layout.tier_kv_bytes_per_token.max(1)),
             resume,
             if resume == ResumePoint::ContextEnd {
-                config.recurrent_state_checkpoints
+                config.state_retention()
             } else {
-                1
+                StateRetention::Latest(1)
             },
             config.states_added_per_round(),
             log_dir,

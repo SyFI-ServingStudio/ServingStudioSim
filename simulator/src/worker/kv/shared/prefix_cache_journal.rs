@@ -18,7 +18,7 @@ use crate::log::{
 };
 use crate::worker::shared::advance_scope::PartitionId;
 
-use super::prefix_cache::{PrefixCacheMutation, PrefixCacheMutationKind};
+use super::prefix_cache::{PrefixCacheMutation, PrefixCacheMutationKind, RoundState, StateTag};
 
 /// A session context that left the HBM prefix cache whole: evicted, or not
 /// kept when it was retained.
@@ -28,7 +28,9 @@ pub(crate) struct HbmEviction {
     pub(crate) session_id: u32,
     pub(crate) tokens: u64,
     /// Its round-end states below `tokens`, which leave with it.
-    pub(crate) earlier_states: Vec<u64>,
+    pub(crate) earlier_states: Vec<RoundState>,
+    /// The state at `tokens`.
+    pub(crate) end: StateTag,
 }
 
 /// The contexts the KV store's prefix cache let go of, in order, until the
@@ -61,7 +63,8 @@ impl PrefixCacheJournal {
         partition: PartitionId,
         session_id: u32,
         tokens: u64,
-        earlier_states: Vec<u64>,
+        end: StateTag,
+        earlier_states: Vec<RoundState>,
     ) {
         if let Some(log) = &self.evictions {
             log.borrow_mut().push(HbmEviction {
@@ -69,6 +72,7 @@ impl PrefixCacheJournal {
                 session_id,
                 tokens,
                 earlier_states,
+                end,
             });
         }
     }
@@ -102,6 +106,7 @@ impl PrefixCacheJournal {
                     session_id: mutation.session_id,
                     tokens: mutation.entry_tokens_before,
                     earlier_states: mutation.earlier_states.clone(),
+                    end: mutation.end,
                 });
             }
         }

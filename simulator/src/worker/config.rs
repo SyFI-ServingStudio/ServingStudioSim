@@ -482,6 +482,9 @@ const SSD_TIER_WRITES_CHOICES: [&str; 2] = ["every-context", "dram-evictions"];
 fn default_recurrent_state_checkpoints() -> u32 {
     1
 }
+fn default_recurrent_state_anchor_stride() -> u32 {
+    1
+}
 fn default_dram_tier_gb_per_s() -> f64 {
     50.0
 }
@@ -983,6 +986,23 @@ pub enum IterWorkerSel {
         #[serde(default = "default_recurrent_state_checkpoints")]
         #[param(default = 1)]
         recurrent_state_checkpoints: u32,
+        /// When > 0, each retained context of a state-at-end hybrid keeps,
+        /// instead of the latest `recurrent_state_checkpoints`: the latest
+        /// handed-back decode's end, the latest prefill's end, and this many
+        /// anchors, the latest earlier prefill ends of rounds (counted along
+        /// the context's lineage) that are a multiple of
+        /// `recurrent_state_anchor_stride`. Stride 2 records an anchor every
+        /// other round, so the kept anchor is one to two rounds back at a
+        /// constant state count. Each state costs its bytes in every tier, and
+        /// a read moves only the states that survive its round. Needs
+        /// `recurrent_state_checkpoints: 1`. Not vLLM.
+        #[serde(default)]
+        #[param(default = 0)]
+        recurrent_state_anchors: u32,
+        /// Round stride of `recurrent_state_anchors` (>= 1). Not vLLM.
+        #[serde(default = "default_recurrent_state_anchor_stride")]
+        #[param(default = 1)]
+        recurrent_state_anchor_stride: u32,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {

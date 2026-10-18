@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::iter_worker::IterWorker;
-use crate::worker::kv::{PrefixKv, RoundContext};
+use crate::worker::kv::{EndState, PrefixKv, RoundContext};
 use crate::worker::types::WorkerStatus;
 use crate::worker::{WorkerEventCommon, WorkerMsgCommon};
 
@@ -106,6 +106,7 @@ impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
                 round.tokens,
                 round.prompt_end,
                 &[],
+                EndState::HandBack,
                 at,
             );
         }

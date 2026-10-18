@@ -56,7 +56,8 @@ use crate::log::{
     PrefixCacheEvictionReason, PrefixCacheLogger, PrefixCacheRetentionReason,
 };
 use crate::worker::kv::shared::prefix_cache::{
-    PrefixCache, PrefixCacheMutation, PrefixCacheReturnMetadata,
+    Carried, EndState, PrefixCache, PrefixCacheMutation, PrefixCacheReturnMetadata, RoundState,
+    StateRetention,
 };
 use crate::worker::kv::shared::prefix_cache_journal::{HbmEvictionLog, PrefixCacheJournal};
 use crate::worker::kv::shared::request_ledger::RequestLedger;
@@ -458,16 +459,22 @@ impl PrefixKv for HybridGdnKv {
         session_id: u32,
         tokens: u64,
         shared: u64,
-        states: &[u64],
+        states: &[RoundState],
+        end: EndState,
         now: Time,
     ) {
+        let incoming = Carried {
+            states: states.to_vec(),
+            resume: None,
+        };
         self.retain_prefix(
             request,
             partition,
             session_id,
             tokens,
             shared,
-            states,
+            &incoming,
+            end,
             None,
             now,
             PrefixCacheRetentionReason::Restore,
@@ -502,6 +509,7 @@ impl PrefixKv for HybridGdnKv {
                 retained_tokens,
                 shared,
                 &carried,
+                EndState::Pass,
                 cache_return_metadata,
                 now,
                 PrefixCacheRetentionReason::RequestComplete,
@@ -719,11 +727,11 @@ impl HybridGdnKv {
     /// either. `states` > 1 keeps that many round-end states per session,
     /// one state each, kept, evicted and moved with the context as one unit
     /// (`PrefixCache::with_end_state`).
-    pub(crate) fn with_end_state_reuse(mut self, states: u32) -> Self {
+    pub(crate) fn with_end_state_reuse(mut self, retention: StateRetention) -> Self {
         let state_tokens = self.state_tokens_per_request;
         self.prefix_caches = std::mem::take(&mut self.prefix_caches)
             .into_iter()
-            .map(|cache| cache.with_end_state(state_tokens, states))
+            .map(|cache| cache.with_end_state(state_tokens, retention))
             .collect();
         self.checkpoint_interval_tokens = 0;
         self
@@ -783,7 +791,8 @@ impl HybridGdnKv {
         session_id: u32,
         tokens: u64,
         shared: u64,
-        incoming_states: &[u64],
+        incoming_states: &Carried,
+        end: EndState,
         cache_return_metadata: Option<PrefixCacheReturnMetadata>,
         now: Time,
         retain_reason: PrefixCacheRetentionReason,
@@ -794,6 +803,7 @@ impl HybridGdnKv {
             tokens,
             shared,
             incoming_states,
+            end,
             physical_limit,
             cache_return_metadata,
         );
@@ -805,8 +815,13 @@ impl HybridGdnKv {
         if insert_result.retained_tokens
             < self.prefix_caches[partition as usize].retainable_tokens(tokens)
         {
-            self.journal
-                .record_unkept(partition, session_id, tokens, insert_result.earlier_states);
+            self.journal.record_unkept(
+                partition,
+                session_id,
+                tokens,
+                insert_result.end,
+                insert_result.earlier_states,
+            );
         }
         if insert_result.retained_tokens == 0 {
             let cache_used = self.prefix_caches[partition as usize].used_charge();
@@ -1192,8 +1207,8 @@ mod tests {
 
     #[test]
     fn end_state_reuse_hits_a_whole_context_or_nothing() {
-        let mut kv_store =
-            store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL).with_end_state_reuse(1);
+        let mut kv_store = store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL)
+            .with_end_state_reuse(StateRetention::Latest(1));
         kv_store.prefix_caches[0].insert(7, 5_000, 10_000_000, None);
         assert_eq!(
             kv_store.prefix_caches[0].used_charge(),
@@ -1211,12 +1226,30 @@ mod tests {
     #[test]
     fn a_handed_back_context_keeps_its_prompt_end_state_when_asked() {
         for (states, inside_hit) in [(1, 0), (2, 5_000)] {
-            let mut kv_store =
-                store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL).with_end_state_reuse(states);
+            let mut kv_store = store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL)
+                .with_end_state_reuse(StateRetention::Latest(states));
             // The prompt's context at completion, then the decode's hand-back,
             // which extends it.
-            kv_store.restore_prefix(RequestId(0), 0, 7, 5_000, 0, &[], Time::ZERO);
-            kv_store.restore_prefix(RequestId(0), 0, 7, 5_400, 5_000, &[], Time::ZERO);
+            kv_store.restore_prefix(
+                RequestId(0),
+                0,
+                7,
+                5_000,
+                0,
+                &[],
+                EndState::Pass,
+                Time::ZERO,
+            );
+            kv_store.restore_prefix(
+                RequestId(0),
+                0,
+                7,
+                5_400,
+                5_000,
+                &[],
+                EndState::Pass,
+                Time::ZERO,
+            );
             assert_eq!(
                 kv_store.prefix_caches[0].used_charge(),
                 5_400 + u64::from(states) * STATE_TOKENS
@@ -1229,8 +1262,8 @@ mod tests {
 
     #[test]
     fn a_read_restores_the_context_with_every_state_it_moved() {
-        let mut kv_store =
-            store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL).with_end_state_reuse(3);
+        let mut kv_store = store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL)
+            .with_end_state_reuse(StateRetention::Latest(3));
         // A tier read lands 5_000 tokens with the states at 3_000 and 4_000.
         kv_store.restore_prefix(
             RequestId(0),
@@ -1238,7 +1271,8 @@ mod tests {
             7,
             5_000,
             5_000,
-            &[3_000, 4_000],
+            &[3_000, 4_000].map(|at| RoundState::new(at, Default::default())),
+            EndState::Read(Default::default()),
             Time::ZERO,
         );
         assert_eq!(

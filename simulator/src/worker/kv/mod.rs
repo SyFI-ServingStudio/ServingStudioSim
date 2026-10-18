@@ -16,8 +16,8 @@ mod shared;
 
 pub use full_attn::FullAttnKv;
 pub use hybrid_gdn::HybridGdnKv;
-pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
-pub(crate) use shared::prefix_cache::{PrefixCacheTokenConfig, ResumePoint};
+pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy, StateRetention};
+pub(crate) use shared::prefix_cache::{EndState, PrefixCacheTokenConfig, ResumePoint, RoundState, StateTag};
 pub(crate) use shared::prefix_cache_journal::HbmEvictionLog;
 pub(crate) use shared::prefix_tiers::{PrefixTierHit, PrefixTiers, WRITE_WINDOW};
 pub use shared::prefix_tiers::{PrefixTierSpec, PrefixTierWrites, RoundContext};
@@ -197,7 +197,8 @@ pub trait PrefixKv: KvStore {
     /// Put `tokens` of `session_id`'s context into the retained tier, as a
     /// read from a slower tier or a decode run elsewhere hands them back,
     /// with `states`: the round-end states below `tokens` the read moves
-    /// along (empty for a hand-back). It replaces the session's entry, whose
+    /// along (empty for a hand-back), its end being the `end` state. It
+    /// replaces the session's entry, whose
     /// first `shared` tokens it shares (an entry keeping round-end states
     /// keeps the latest of its own and `states` within them), and is clamped
     /// to the slack like any retention.
@@ -208,7 +209,8 @@ pub trait PrefixKv: KvStore {
         session_id: u32,
         tokens: u64,
         shared: u64,
-        states: &[u64],
+        states: &[RoundState],
+        end: EndState,
         now: Time,
     );
 

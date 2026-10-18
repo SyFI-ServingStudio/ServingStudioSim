@@ -668,6 +668,14 @@ pub struct WorkerConfig {
     /// and every tier, its end's and the latest `n - 1` earlier round-end
     /// ones, one unit with the context (`prefix_cache.rs`). 1: the end only.
     pub recurrent_state_checkpoints: u32,
+    /// Pipeline head, a state-at-end hybrid: when > 0, each retained context
+    /// keeps instead the latest handed-back decode's end, the latest
+    /// prefill's end and this many anchors, the latest earlier prefill ends
+    /// of rounds that are a multiple of `recurrent_state_anchor_stride`
+    /// (`StateRetention::Anchors`). Needs `recurrent_state_checkpoints` 1.
+    pub recurrent_state_anchors: u32,
+    /// Round stride of the anchors (`recurrent_state_anchors`), >= 1.
+    pub recurrent_state_anchor_stride: u32,
     /// Candidate positions the drafter proposes per request per iteration (from
     /// the worker selector). The verify width is one more than this. Only the
     /// speculative recipe reads it, and it must match the width the model was
@@ -714,6 +722,8 @@ impl Default for WorkerConfig {
             force_schedule_after_ms: 0.0,
             external_decode: false,
             recurrent_state_checkpoints: 1,
+            recurrent_state_anchors: 0,
+            recurrent_state_anchor_stride: 1,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,
@@ -727,5 +737,17 @@ impl WorkerConfig {
     /// (the head restores the decode's context on top of the prompt's).
     pub(crate) fn states_added_per_round(&self) -> u32 {
         1 + u32::from(self.external_decode)
+    }
+
+    /// Which round-end states each retained context keeps.
+    pub(crate) fn state_retention(&self) -> crate::worker::kv::StateRetention {
+        if self.recurrent_state_anchors > 0 {
+            crate::worker::kv::StateRetention::Anchors {
+                count: self.recurrent_state_anchors,
+                stride: self.recurrent_state_anchor_stride,
+            }
+        } else {
+            crate::worker::kv::StateRetention::Latest(self.recurrent_state_checkpoints)
+        }
     }
 }
