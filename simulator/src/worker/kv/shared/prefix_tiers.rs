@@ -910,6 +910,32 @@ impl PrefixTiers {
     pub(crate) fn capacity_tokens(&self, tier: usize) -> u64 {
         self.tiers[tier].capacity
     }
+
+    /// One recurrent state, in tier tokens.
+    pub(crate) fn state_tokens(&self) -> u64 {
+        self.state_tokens
+    }
+
+    /// Take `fraction` of `tier`'s capacity out of what its entries may use,
+    /// as a loading area reads stage through; returns the area in tokens.
+    pub(crate) fn carve_loading_area(&mut self, tier: usize, fraction: f64) -> u64 {
+        assert!((0.0..1.0).contains(&fraction), "a loading area is a fraction below 1");
+        let tier = &mut self.tiers[tier];
+        let area = (tier.capacity as f64 * fraction) as u64;
+        tier.capacity -= area;
+        area
+    }
+
+    /// Queue a move of `charge` tokens (KV and states) on `tier`'s channel,
+    /// behind its earlier reads, and return when it lands: the second hop of
+    /// a read staged through `tier`'s loading area. Counts no tier access.
+    pub(crate) fn transfer(&mut self, tier: usize, charge: u64, now: Time) -> Time {
+        let tier = &mut self.tiers[tier];
+        let start = tier.channel_free.max(now);
+        let ready = start + Time::from_s(charge as f64 * tier.bytes_per_token / tier.read_bytes_per_s);
+        tier.channel_free = ready;
+        ready
+    }
 }
 
 #[cfg(test)]
@@ -1130,6 +1156,20 @@ mod tests {
         t.load(1, t.lookup(1, 400_000).unwrap(), 0, Time::ZERO);
         assert_eq!(t.counters(0).stored_entries, 0);
         assert_eq!(t.lookup(1, 400_000).unwrap().tier, 1);
+    }
+
+    #[test]
+    fn a_loading_area_shrinks_the_tier_and_hops_queue_on_its_channel() {
+        let mut t = victim_tiers(1.0, 10.0);
+        let capacity = t.capacity_tokens(0);
+        let area = t.carve_loading_area(0, 0.05);
+        assert_eq!(area, capacity / 20);
+        assert_eq!(t.capacity_tokens(0), capacity - area);
+        // 1000 B/token at 10 GB/s: 1M tokens take 100 ms, back to back.
+        let first = t.transfer(0, 1_000_000, Time::ZERO);
+        let second = t.transfer(0, 1_000_000, Time::ZERO);
+        assert!((first.as_ms() - 100.0).abs() < 1e-6);
+        assert!((second.as_ms() - 200.0).abs() < 1e-6);
     }
 
     #[test]
