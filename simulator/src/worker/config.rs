@@ -131,6 +131,32 @@ pub enum PrefixTierReadWaitPolicy {
 
 const PREFIX_TIER_READ_WAIT_POLICY_CHOICES: [&str; 2] = ["pass-over", "block"];
 
+/// How a pipeline head with tiers stages its reads
+/// (`admission/prefix_fetch.rs`). Not vLLM.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefixTierLoading {
+    /// A loading area of `prefix_tier_loading_area` x HBM (and of a DRAM
+    /// tier with SSD behind it), which a read holds from its start until its
+    /// request is admitted. `prefix_tier_loading_area: 0` stages nothing: a
+    /// read starts when admission reaches its request, as vLLM's connector
+    /// loads.
+    #[default]
+    Held,
+    /// Two derived bounds. An in-flight area per landing tier (HBM, and DRAM
+    /// for SSD reads) bounds the bytes of reads in progress to what the
+    /// channel feeding it moves in one batch period (the stage time of one
+    /// `max_batch_tokens` prefill microbatch, from the cost model); a read
+    /// gives it back when it lands. A read holds its HBM blocks from its
+    /// start, like a running request, starts only if they fit, and keeps
+    /// them until admission. New reads start only while the landed
+    /// requests' prefill work is below `pp_size x max_batch_tokens`, what
+    /// fills the pipeline.
+    Bounded,
+}
+
+const PREFIX_TIER_LOADING_CHOICES: [&str; 2] = ["held", "bounded"];
+
 /// Lower the `load_budget_*` selector triple (the floor `0`: off). The floor
 /// must lie in `1..=max_batch_tokens` and needs `lo < hi`; the bounds alone
 /// are rejected.
@@ -916,15 +942,23 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         prefix_tier_balanced_load: bool,
-        /// With a tier: stage loads through loading areas, this fraction of
-        /// HBM's KV capacity and of a DRAM tier with SSD behind it
-        /// (`admission/prefix_fetch.rs`): pending -> loading -> ready -> batch;
-        /// reads start in admission order while their area has room and never
-        /// wait on compute admission; an SSD read stages through DRAM's area.
-        /// `0`: off. Not vLLM.
+        /// `prefix_tier_loading: held`: stage loads through loading areas,
+        /// this fraction of HBM's KV capacity and of a DRAM tier with SSD
+        /// behind it (`admission/prefix_fetch.rs`): pending -> loading ->
+        /// ready -> batch; reads start in admission order while their area
+        /// has room, and a read holds its area until its request is admitted;
+        /// an SSD read stages through DRAM's area. `0`: off. Not vLLM.
         #[serde(default)]
         #[param(default = 0.0)]
         prefix_tier_loading_area: f64,
+        /// With a tier: `held` (the `prefix_tier_loading_area` rule, off at
+        /// 0) or `bounded` (in-flight areas sized channel rate x one batch
+        /// period, released at landing, and new reads only while landed work
+        /// is below `pp_size x max_batch_tokens`; needs
+        /// `prefix_tier_loading_area: 0`). See [`PrefixTierLoading`]. Not vLLM.
+        #[serde(default)]
+        #[param(string, default = "held", choices = PREFIX_TIER_LOADING_CHOICES)]
+        prefix_tier_loading: PrefixTierLoading,
         /// Serve a request that has waited this many ms since arrival before
         /// every other one, queued or started, so srpt / shortest-first cannot
         /// starve it (`0`: off). Not vLLM.

@@ -30,6 +30,7 @@ use crate::worker::{
     PipelineHeadEvent, PipelineHeadMsg, PipelineHybridState, PipelineLayout, PrefillChunkAlignment,
     PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
+use crate::worker::config::PrefixTierLoading;
 
 use super::Deployment;
 
@@ -311,6 +312,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         prefix_tier_max_read_wait_ms,
         prefix_tier_read_wait_policy,
         prefix_tier_loading_area,
+        prefix_tier_loading,
         force_schedule_after_ms,
         external_decode,
         recurrent_state_checkpoints,
@@ -358,6 +360,12 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         *prefix_tier_loading_area == 0.0 || prefix_tiers.iter().any(Option::is_some),
         "pp: prefix_tier_loading_area needs a prefix tier"
     );
+    ensure!(
+        *prefix_tier_loading == PrefixTierLoading::Held
+            || (prefix_tiers.iter().any(Option::is_some) && *prefix_tier_loading_area == 0.0),
+        "pp: prefix_tier_loading: bounded needs a prefix tier and prefix_tier_loading_area: 0 \
+         (its areas are derived)"
+    );
     crate::worker::config::check_read_wait(
         "pp",
         *prefix_tier_max_read_wait_ms,
@@ -383,6 +391,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         prefix_tier_max_read_wait_ms: *prefix_tier_max_read_wait_ms,
         prefix_tier_read_wait_policy: *prefix_tier_read_wait_policy,
         prefix_tier_loading_area: *prefix_tier_loading_area,
+        prefix_tier_loading: *prefix_tier_loading,
         force_schedule_after_ms: *force_schedule_after_ms,
         external_decode: *external_decode,
         recurrent_state_checkpoints: *recurrent_state_checkpoints,

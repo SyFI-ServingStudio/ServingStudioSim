@@ -34,20 +34,40 @@
 //! the round adds its own (`kv/shared/prefix_tiers.rs`). Its time, its holds
 //! and `loaded_states` count only what moves.
 //!
-//! With a loading area ([`PrefixFetch::with_loading_area`], not vLLM), loads
-//! are staged instead: pending -> loading -> ready -> batch. Before each
-//! admission pass, the pending queues are walked in admission order and every
-//! request whose context a tier holds beyond HBM starts its read while the
-//! loading area has room; requests needing no read stay where they are. A DRAM
-//! read lands in HBM's loading area (a fixed fraction of HBM that admission
-//! and the retained-prefix tier never use); an SSD read lands in DRAM's
-//! loading area (the same fraction carved out of the DRAM tier) and moves on
-//! to HBM's when that has room. A read holds its area until its request is
-//! admitted. Admission takes only ready requests: landed ones, then those
-//! HBM already holds; a request still needing a read is passed over. The two
-//! loading queues stop at the first read that does not fit their area (a read
-//! larger than the whole area starts when the area is empty), so loads keep
-//! the admission order and never wait on compute admission.
+//! With staged loading (not vLLM), loads go pending -> loading -> ready ->
+//! batch instead. Before each admission pass, the overdue and pending queues
+//! are walked in admission order and every request whose context a tier
+//! holds beyond HBM starts its read while its loading area has room; requests
+//! needing no read stay where they are. A DRAM read lands in HBM's loading
+//! area (kept free of admission and the retained-prefix tier); an SSD read
+//! lands in DRAM's loading area (carved out of the DRAM tier) and moves on to
+//! HBM's, on DRAM's channel, when that has room. Each loading queue stops at
+//! the first read that does not fit its area (head of line: a later read
+//! never jumps it; a read larger than the whole area starts when the area is
+//! empty), so loads keep the admission order and never wait on compute
+//! admission. Admission takes only ready requests: landed ones, then those
+//! HBM already holds; a request still needing a read is passed over, and one
+//! whose landed context HBM evicted before admission goes back to pending and
+//! is read again (`rereads`). Two rules size and release the areas:
+//!
+//! - held ([`PrefixFetch::with_loading_area`]): each area is a fixed fraction
+//!   of its tier, and a read holds it from its start until its request is
+//!   admitted. Large reads that land but wait for admission fill it.
+//! - bounded ([`PrefixFetch::with_bounded_loading`]): each area bounds the
+//!   reads in flight into it: what the channel feeding it moves in one batch
+//!   period (HBM's: the fastest tier's channel, DRAM's: SSD's), the period
+//!   being one `max_batch_tokens` prefill microbatch's stage time, so the
+//!   channel never idles for want of area while a queue of at most one
+//!   period builds behind it (Little's law). DRAM's area is carved out of the
+//!   DRAM tier, where SSD data lands. HBM's reserves nothing: a read holds its
+//!   blocks from its start, counted against HBM like a running request's
+//!   (retained prefixes make room), and starts only if they fit. A read gives
+//!   its area back when it lands (an SSD read's DRAM area when its hop
+//!   lands); its data stays held in HBM until admission. New reads start
+//!   only while the landed requests' prefill work (new tokens plus any
+//!   declared prefix past the hit) is below `pp_size x max_batch_tokens`,
+//!   what fills the pipeline; so the scheduler stays fed without pinning HBM
+//!   for reads it cannot use yet. A landing starts a loading pass at once.
 //!
 //! One tier set per KV partition (a pipeline head's one, or each attention DP
 //! rank's). `prefix_tiers_<tag>.csv` records, per admitted session request,
@@ -94,6 +114,8 @@ pub(crate) struct SessionPrefixTiers {
     /// Reads of a request whose context an earlier read put back into HBM but
     /// which was evicted before admission.
     rereads: u64,
+    /// The staged-loading rule and the sizes it derived, for the summary.
+    loading: Option<serde_json::Value>,
 }
 
 impl SessionPrefixTiers {
@@ -152,6 +174,7 @@ impl SessionPrefixTiers {
             warm_start_reads: 0,
             warm_start_tokens: 0,
             rereads: 0,
+            loading: None,
         }
     }
 
@@ -346,6 +369,7 @@ impl Drop for SessionPrefixTiers {
             "warm_start_reads": self.warm_start_reads,
             "warm_start_tokens": self.warm_start_tokens,
             "rereads": self.rereads,
+            "loading": self.loading,
             "tiers": tiers,
         });
         if let Ok(file) = File::create(path) {
@@ -394,8 +418,35 @@ struct Fetch {
     states: Vec<u64>,
 }
 
+impl Fetch {
+    /// Tokens its prefill computes: the prompt's new tokens and any declared
+    /// prefix past the hit.
+    fn prefill_work(&self) -> u64 {
+        let declared = match self.candidate.session_input {
+            SessionInput::Session {
+                declared_prefix_tokens,
+                ..
+            } => declared_prefix_tokens,
+            _ => 0,
+        };
+        u64::from(self.candidate.fresh_prompt_tokens)
+            + u64::from(declared.saturating_sub(self.read.hit.tokens))
+    }
+}
+
+/// When a staged read gives its HBM loading area back (module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagedRule {
+    /// At its request's admission.
+    Held,
+    /// When it lands; new reads start only while the landed requests'
+    /// prefill work is below `ready_bound` tokens.
+    Bounded { ready_bound: u64 },
+}
+
 /// Loading areas of the staged mode, per partition, in tier tokens.
 struct Staged {
+    rule: StagedRule,
     hbm_area: Vec<u64>,
     hbm_used: Vec<u64>,
     dram_area: Vec<u64>,
@@ -470,6 +521,9 @@ pub(crate) struct PrefixFetch {
     hbm_evictions: Option<HbmEvictionLog>,
     /// Staged loading ([`Self::with_loading_area`]).
     staged: Option<Staged>,
+    /// The bounded rule's batch period, until its first loading pass
+    /// ([`Self::with_bounded_loading`]).
+    batch_period: Option<Box<dyn FnOnce() -> Time>>,
 }
 
 impl PrefixFetch {
@@ -492,16 +546,17 @@ impl PrefixFetch {
             cancelled: Vec::new(),
             hbm_evictions: None,
             staged: None,
+            batch_period: None,
         }
     }
 
-    /// Stage loads through loading areas (module docs): `hbm_area` tokens of
-    /// each partition's HBM, and `fraction` of a DRAM tier with an SSD tier
-    /// behind it. The KV store must keep `hbm_area` free
-    /// ([`PrefixKv::set_loading_area`]).
+    /// Stage loads through loading areas held until admission (module docs):
+    /// `hbm_area` tokens of each partition's HBM, and `fraction` of a DRAM
+    /// tier with an SSD tier behind it. The KV store must keep `hbm_area`
+    /// free ([`PrefixKv::set_loading_area`]).
     pub(crate) fn with_loading_area(mut self, hbm_area: u64, fraction: f64) -> Self {
         let n = self.partitions.len();
-        let dram_area = self
+        let dram_area: Vec<u64> = self
             .partitions
             .iter_mut()
             .map(|p| {
@@ -512,7 +567,16 @@ impl PrefixFetch {
                 }
             })
             .collect();
+        for (p, dram) in self.partitions.iter_mut().zip(&dram_area) {
+            p.loading = Some(serde_json::json!({
+                "rule": "held",
+                "fraction": fraction,
+                "hbm_area_tokens": hbm_area,
+                "dram_area_tokens": dram,
+            }));
+        }
         self.staged = Some(Staged {
+            rule: StagedRule::Held,
             hbm_area: vec![hbm_area; n],
             hbm_used: vec![0; n],
             dram_area,
@@ -520,6 +584,103 @@ impl PrefixFetch {
             waiting_hop: vec![VecDeque::new(); n],
         });
         self
+    }
+
+    /// Stage loads under the bounded rule (module docs): each partition's HBM
+    /// in-flight area, a bound on the reads in progress into HBM, is what its
+    /// fastest tier's channel reads in one batch period; a DRAM tier with
+    /// SSD behind it gives up what the SSD channel reads in that time as
+    /// DRAM's landing area. New reads start only while the landed requests'
+    /// prefill work is below `ready_bound` tokens. `batch_period` evaluates
+    /// the cost model, which is ready only once the run starts, so the areas
+    /// are sized at the first loading pass.
+    pub(crate) fn with_bounded_loading(
+        mut self,
+        batch_period: impl FnOnce() -> Time + 'static,
+        ready_bound: u64,
+    ) -> Self {
+        let n = self.partitions.len();
+        self.staged = Some(Staged {
+            rule: StagedRule::Bounded { ready_bound },
+            hbm_area: vec![0; n],
+            hbm_used: vec![0; n],
+            dram_area: vec![0; n],
+            dram_used: vec![0; n],
+            waiting_hop: vec![VecDeque::new(); n],
+        });
+        self.batch_period = Some(Box::new(batch_period));
+        self
+    }
+
+    /// Size the bounded rule's areas from the batch period, once.
+    fn size_bounded_areas(&mut self) {
+        let Some(batch_period) = self.batch_period.take() else {
+            return;
+        };
+        let batch_period = batch_period();
+        let staged = self.staged.as_mut().expect("bounded staging");
+        let StagedRule::Bounded { ready_bound } = staged.rule else {
+            unreachable!("a batch period belongs to the bounded rule");
+        };
+        for (i, p) in self.partitions.iter_mut().enumerate() {
+            let hbm = p.tiers.read_tokens_in(0, batch_period);
+            let dram = if p.tiers.len() == 2 {
+                let tokens = p.tiers.read_tokens_in(1, batch_period);
+                p.tiers.carve_tokens(0, tokens)
+            } else {
+                0
+            };
+            tracing::info!(
+                partition = i,
+                batch_period_ms = batch_period.as_ms(),
+                hbm_inflight_tier_tokens = hbm,
+                dram_inflight_tier_tokens = dram,
+                ready_bound,
+                "bounded staged loading: in-flight areas and ready bound"
+            );
+            p.loading = Some(serde_json::json!({
+                "rule": "bounded",
+                "batch_period_ms": batch_period.as_ms(),
+                "hbm_area_tokens": hbm,
+                "dram_area_tokens": dram,
+                "ready_bound_tokens": ready_bound,
+            }));
+            staged.hbm_area[i] = hbm;
+            staged.dram_area[i] = dram;
+        }
+    }
+
+    /// Bounded staging: a read gives its HBM in-flight area back when it
+    /// lands, and a loading pass may start the reads behind it then.
+    pub(crate) fn releases_at_landing(&self) -> bool {
+        self.staged
+            .as_ref()
+            .is_some_and(|staged| matches!(staged.rule, StagedRule::Bounded { .. }))
+    }
+
+    /// The gate a loading pass of `partition` starts with: closed when the
+    /// bounded rule's landed work already fills the pipeline.
+    pub(crate) fn load_gate(&mut self, partition: u16) -> LoadGate {
+        self.size_bounded_areas();
+        let full = match self.staged.as_ref().map(|staged| staged.rule) {
+            Some(StagedRule::Bounded { ready_bound }) => {
+                self.ready_work(partition) >= ready_bound
+            }
+            _ => false,
+        };
+        LoadGate {
+            hbm_full: full,
+            dram_full: full,
+        }
+    }
+
+    /// Prefill work of `partition`'s landed requests not yet admitted.
+    fn ready_work(&self, partition: u16) -> u64 {
+        self.landed_order[usize::from(partition)]
+            .iter()
+            .filter_map(|request| self.landed.get(request).or_else(|| self.restored.get(request)))
+            .map(Fetch::prefill_work)
+            .sum()
     }
 
     pub(crate) fn is_staged(&self) -> bool {
@@ -574,12 +735,15 @@ impl PrefixFetch {
             staged.dram_used[p] += charge;
             Phase::Ssd
         } else {
-            if gate.hbm_full || !area_fits(staged.hbm_used[p], staged.hbm_area[p], charge) {
+            let footprint = kv_store.footprint(candidate.request_id, hit.tokens - hbm_tokens, 0);
+            if gate.hbm_full
+                || !area_fits(staged.hbm_used[p], staged.hbm_area[p], charge)
+                || (staged.rule != StagedRule::Held && !kv_store.fits(partition, &footprint))
+            {
                 gate.hbm_full = true;
                 return false;
             }
             staged.hbm_used[p] += charge;
-            let footprint = kv_store.footprint(candidate.request_id, hit.tokens - hbm_tokens, 0);
             kv_store.hold_for_read(candidate.request_id, partition, &footprint, now);
             Phase::Hbm
         };
@@ -614,13 +778,15 @@ impl PrefixFetch {
         for p in 0..self.partitions.len() {
             while let Some(&request) = staged.waiting_hop[p].front() {
                 let fetch = self.reading.get_mut(&request).expect("a waiting hop is reading");
-                if !area_fits(staged.hbm_used[p], staged.hbm_area[p], fetch.charge) {
+                let tokens = fetch.read.hit.tokens - fetch.read.hbm_tokens;
+                let footprint = kv_store.footprint(request, tokens, 0);
+                if !area_fits(staged.hbm_used[p], staged.hbm_area[p], fetch.charge)
+                    || (staged.rule != StagedRule::Held && !kv_store.fits(p as u16, &footprint))
+                {
                     break;
                 }
                 staged.waiting_hop[p].pop_front();
                 staged.hbm_used[p] += fetch.charge;
-                let tokens = fetch.read.hit.tokens - fetch.read.hbm_tokens;
-                let footprint = kv_store.footprint(request, tokens, 0);
                 kv_store.hold_for_read(request, p as u16, &footprint, now);
                 let ready = self.partitions[p].tiers.transfer(0, fetch.charge, now);
                 fetch.phase = Phase::Hop;
@@ -743,7 +909,8 @@ impl PrefixFetch {
             // Its blocks were held since the read started: the context fills
             // them and the admission that follows takes them over.
             kv_store.release_read_hold(candidate.request_id);
-            self.release_area(&fetch, false, true);
+            let held_area = !self.releases_at_landing();
+            self.release_area(&fetch, false, held_area);
             // The read is a prefix of the session's latest context, as HBM's
             // entry is; its states come with it.
             let tokens = u64::from(fetch.read.hit.tokens);
@@ -869,6 +1036,10 @@ impl PrefixFetch {
                 Phase::Hop => self.release_area(&fetch, true, false),
                 Phase::Hbm => {}
             }
+            if self.releases_at_landing() {
+                // Its data stays held in HBM until admission.
+                self.release_area(&fetch, false, true);
+            }
             self.reading.remove(&request);
             self.landed_order[usize::from(fetch.partition)].push_back(request);
             self.landed.insert(request, fetch);
@@ -962,7 +1133,8 @@ impl PrefixFetch {
             }
         }
         if let Some(fetch) = self.landed.remove(&request) {
-            self.release_area(&fetch, false, true);
+            let held_area = !self.releases_at_landing();
+            self.release_area(&fetch, false, held_area);
             self.cancelled.push(request);
             out_of_queue = true;
         } else if let Some(fetch) = self.reading.remove(&request) {
@@ -1006,6 +1178,205 @@ mod tests {
             None,
             "test",
         )
+    }
+
+    use crate::worker::kv::{FullAttnKv, PrefixCachePolicy, PrefixCacheTokenConfig};
+
+    /// One DRAM tier of 1M tokens read at 1000 tokens/ms (1000 B/token, 1
+    /// GB/s), and an empty 1M-token HBM; sessions 1..=4 each hold a context
+    /// of `tokens[i]` in DRAM.
+    fn fetch_with(tokens: &[u64]) -> (PrefixFetch, FullAttnKv) {
+        let tiers = SessionPrefixTiers::new(
+            &[PrefixTierSpec {
+                name: "dram",
+                capacity_gb_per_gpu: 1.0,
+                read_gb_per_s_per_gpu: 1.0,
+                writes: crate::worker::kv::PrefixTierWrites::EveryContext,
+            }],
+            1000,
+            0,
+            ResumePoint::AnyToken,
+            1,
+            1,
+            None,
+            "test",
+        );
+        let mut fetch = PrefixFetch::new(vec![tiers], false);
+        for (i, &context) in tokens.iter().enumerate() {
+            fetch.store(
+                0,
+                i as u32 + 1,
+                RoundContext {
+                    tokens: context,
+                    prompt_end: context,
+                    shared: 0,
+                },
+            );
+        }
+        let kv = FullAttnKv::with_prefix_cache(
+            1,
+            1_000_000,
+            PrefixCacheTokenConfig {
+                max_retained_tokens: 1_000_000,
+                policy: PrefixCachePolicy::Lru,
+            },
+            None,
+            None,
+        );
+        (fetch, kv)
+    }
+
+    /// Request `id` of session `id`, declaring its whole stored context.
+    fn candidate(id: u64, declared: u32, fresh: u32) -> AdmissionCandidate {
+        AdmissionCandidate {
+            request_id: RequestId(id as u32),
+            enqueue_sequence: id,
+            fresh_prompt_tokens: fresh,
+            remaining_output_tokens: 1,
+            session_input: SessionInput::Session {
+                session_id: id as u32,
+                session_start_time: Time::ZERO,
+                declared_prefix_tokens: declared,
+            },
+            conversation_start_time: Time::ZERO,
+            resident_prefix_tokens: 0,
+            retracted: false,
+        }
+    }
+
+    fn hbm_used(fetch: &PrefixFetch) -> u64 {
+        fetch.staged.as_ref().unwrap().hbm_used[0]
+    }
+
+    /// Admit the landed request at the head of the landed queue.
+    fn admit_landed(fetch: &mut PrefixFetch, kv: &mut FullAttnKv, now: Time) {
+        let c = fetch.peek_landed(0).expect("a landed request");
+        assert_eq!(fetch.at_head(kv, 0, c, now), AtHead::Admit);
+        fetch.pop_landed(0);
+        fetch.admitted(0, c, 0, now);
+    }
+
+    #[test]
+    fn bounded_areas_are_what_each_channel_reads_in_a_batch_period() {
+        let (fetch, _) = fetch_with(&[]);
+        let mut fetch = fetch.with_bounded_loading(|| Time::from_ms(10.0), 5_000);
+        fetch.load_gate(0);
+        assert_eq!(fetch.staged.as_ref().unwrap().hbm_area[0], 10_000);
+        assert!(fetch.releases_at_landing());
+    }
+
+    #[test]
+    fn a_bounded_read_gives_its_area_back_when_it_lands() {
+        for bounded in [false, true] {
+            let (fetch, mut kv) = fetch_with(&[6_000, 6_000]);
+            let mut fetch = if bounded {
+                fetch.with_bounded_loading(|| Time::from_ms(10.0), 1_000_000)
+            } else {
+                fetch.with_loading_area(10_000, 0.0)
+            };
+            let mut gate = fetch.load_gate(0);
+            assert!(fetch.stage(&mut kv, 0, candidate(1, 6_000, 10), &mut gate, Time::ZERO));
+            assert!(!fetch.stage(&mut kv, 0, candidate(2, 6_000, 10), &mut gate, Time::ZERO));
+            assert_eq!(hbm_used(&fetch), 6_000);
+            // 6000 tokens at 1000 tokens/ms land at 6 ms.
+            let at = Time::from_ms(6.0);
+            assert_eq!(fetch.land(&mut kv, at), Some(at));
+            assert_eq!(hbm_used(&fetch), if bounded { 0 } else { 6_000 });
+            let mut gate = fetch.load_gate(0);
+            assert_eq!(
+                fetch.stage(&mut kv, 0, candidate(2, 6_000, 10), &mut gate, at),
+                bounded
+            );
+            // The held rule gives it back at admission.
+            admit_landed(&mut fetch, &mut kv, at);
+            assert_eq!(hbm_used(&fetch), if bounded { 6_000 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn landed_work_past_the_ready_bound_stops_new_reads() {
+        let (fetch, mut kv) = fetch_with(&[1_000, 1_000]);
+        let mut fetch = fetch.with_bounded_loading(|| Time::from_ms(10.0), 5_000);
+        let mut gate = fetch.load_gate(0);
+        // Session 1's round computes 5000 new tokens.
+        assert!(fetch.stage(&mut kv, 0, candidate(1, 1_000, 5_000), &mut gate, Time::ZERO));
+        let at = Time::from_ms(1.0);
+        fetch.land(&mut kv, at);
+        let mut gate = fetch.load_gate(0);
+        assert!(gate.closed());
+        assert!(!fetch.stage(&mut kv, 0, candidate(2, 1_000, 10), &mut gate, at));
+        // Once admitted, the pipeline needs more.
+        admit_landed(&mut fetch, &mut kv, at);
+        let mut gate = fetch.load_gate(0);
+        assert!(fetch.stage(&mut kv, 0, candidate(2, 1_000, 10), &mut gate, at));
+    }
+
+    #[test]
+    fn reads_start_in_order_and_a_later_one_never_jumps_the_head() {
+        let (fetch, mut kv) = fetch_with(&[6_000, 6_000, 1_000]);
+        let mut fetch = fetch.with_bounded_loading(|| Time::from_ms(10.0), 1_000_000);
+        let mut gate = fetch.load_gate(0);
+        assert!(fetch.stage(&mut kv, 0, candidate(1, 6_000, 10), &mut gate, Time::ZERO));
+        assert!(!fetch.stage(&mut kv, 0, candidate(2, 6_000, 10), &mut gate, Time::ZERO));
+        // Session 3's read would fit, but the head (2) did not.
+        assert!(!fetch.stage(&mut kv, 0, candidate(3, 1_000, 10), &mut gate, Time::ZERO));
+        assert_eq!(hbm_used(&fetch), 6_000);
+    }
+
+    #[test]
+    fn a_read_larger_than_the_area_starts_when_it_is_empty() {
+        let (fetch, mut kv) = fetch_with(&[25_000, 100]);
+        let mut fetch = fetch.with_bounded_loading(|| Time::from_ms(10.0), 1_000_000);
+        let mut gate = fetch.load_gate(0);
+        assert!(fetch.stage(&mut kv, 0, candidate(1, 25_000, 10), &mut gate, Time::ZERO));
+        assert!(!fetch.stage(&mut kv, 0, candidate(2, 100, 10), &mut gate, Time::ZERO));
+        let at = Time::from_ms(25.0);
+        fetch.land(&mut kv, at);
+        let mut gate = fetch.load_gate(0);
+        assert!(fetch.stage(&mut kv, 0, candidate(2, 100, 10), &mut gate, at));
+    }
+
+    #[test]
+    fn a_bounded_read_starts_only_if_its_blocks_fit_in_hbm() {
+        let (fetch, _) = fetch_with(&[6_000, 100]);
+        let mut fetch = fetch.with_bounded_loading(|| Time::from_ms(10.0), 1_000_000);
+        let mut kv = FullAttnKv::with_prefix_cache(
+            1,
+            5_000,
+            PrefixCacheTokenConfig {
+                max_retained_tokens: 5_000,
+                policy: PrefixCachePolicy::Lru,
+            },
+            None,
+            None,
+        );
+        let mut gate = fetch.load_gate(0);
+        // 6000 tokens fit the in-flight area but not HBM: it waits, and the
+        // read behind it does not jump it.
+        assert!(!fetch.stage(&mut kv, 0, candidate(1, 6_000, 10), &mut gate, Time::ZERO));
+        assert!(!fetch.stage(&mut kv, 0, candidate(2, 100, 10), &mut gate, Time::ZERO));
+        assert_eq!(hbm_used(&fetch), 0);
+    }
+
+    #[test]
+    fn a_landed_context_evicted_before_admission_is_read_again() {
+        let (fetch, mut kv) = fetch_with(&[6_000]);
+        let mut fetch = fetch.with_bounded_loading(|| Time::from_ms(10.0), 1_000_000);
+        let a = candidate(1, 6_000, 10);
+        let mut gate = fetch.load_gate(0);
+        assert!(fetch.stage(&mut kv, 0, a, &mut gate, Time::ZERO));
+        let at = Time::from_ms(6.0);
+        fetch.land(&mut kv, at);
+        // Admission reaches it and puts the context back in HBM, but it does
+        // not fit beside the running requests and stays.
+        assert_eq!(fetch.at_head(&mut kv, 0, a, at), AtHead::Admit);
+        // Another session's context fills HBM's retained tier, evicting it.
+        kv.restore_prefix(RequestId(9), 0, 9, 1_000_000, 0, &[], at);
+        assert_eq!(fetch.at_head(&mut kv, 0, a, at), AtHead::PassedOver);
+        assert_eq!(fetch.partitions[0].rereads, 1);
+        fetch.pop_landed(0);
+        let mut gate = fetch.load_gate(0);
+        assert!(fetch.stage(&mut kv, 0, a, &mut gate, at));
     }
 
     #[test]

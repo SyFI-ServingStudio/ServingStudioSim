@@ -15,7 +15,7 @@ use crate::common::Time;
 use crate::worker::kv::ChunkedPrefillKv;
 
 use super::overdue::OverdueQueue;
-use super::prefix_fetch::{LoadGate, PrefixFetch};
+use super::prefix_fetch::PrefixFetch;
 use super::{AdmissionCandidate, PendingOrderPolicy};
 
 /// Which queue [`FreshQueues::peek`] found its candidate in.
@@ -108,7 +108,7 @@ impl<P: PendingOrderPolicy> FreshQueues<'_, P> {
         let Some(fetch) = self.prefix_fetch.as_mut().filter(|f| f.is_staged()) else {
             return;
         };
-        let mut gate = LoadGate::default();
+        let mut gate = fetch.load_gate(partition);
         let mut kept = Vec::new();
         while !gate.closed() {
             let Some(candidate) = self.overdue.as_ref().and_then(|o| o.peek(partition)) else {

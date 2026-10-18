@@ -28,6 +28,11 @@
 //! moment admission reaches the request (`admission/prefix_fetch.rs`). Writes
 //! are free: their bandwidth is not modeled, only counted, also per 10-s
 //! window of the last time admission passed the tiers ([`PrefixTiers::set_clock`]).
+//! Staged loading (`admission/prefix_fetch.rs`) may carve a loading area out
+//! of a tier's capacity, where SSD reads land before they hop on to HBM on the
+//! tier's channel: a fixed fraction of the tier (the `held` rule), or what the
+//! channel behind it reads in one batch period
+//! ([`PrefixTiers::read_tokens_in`], the `bounded` rule).
 //!
 //! Units are KV tokens of the most loaded GPU (the pipeline's
 //! `kv_bytes_per_token`). A hybrid model's entry also charges one recurrent
@@ -777,10 +782,23 @@ impl PrefixTiers {
     /// as a loading area reads stage through; returns the area in tokens.
     pub(crate) fn carve_loading_area(&mut self, tier: usize, fraction: f64) -> u64 {
         assert!((0.0..1.0).contains(&fraction), "a loading area is a fraction below 1");
+        let area = (self.tiers[tier].capacity as f64 * fraction) as u64;
+        self.carve_tokens(tier, area)
+    }
+
+    /// Take `tokens` of `tier`'s capacity out of what its entries may use, as
+    /// a loading area; returns them.
+    pub(crate) fn carve_tokens(&mut self, tier: usize, tokens: u64) -> u64 {
         let tier = &mut self.tiers[tier];
-        let area = (tier.capacity as f64 * fraction) as u64;
-        tier.capacity -= area;
-        area
+        assert!(tokens < tier.capacity, "a loading area is smaller than its tier");
+        tier.capacity -= tokens;
+        tokens
+    }
+
+    /// Tokens (KV or state) `tier`'s channel reads in `period`.
+    pub(crate) fn read_tokens_in(&self, tier: usize, period: Time) -> u64 {
+        let tier = &self.tiers[tier];
+        (tier.read_bytes_per_s * period.as_ms() / 1e3 / tier.bytes_per_token) as u64
     }
 
     /// Queue a move of `charge` tokens (KV and states) on `tier`'s channel,
@@ -1027,6 +1045,12 @@ mod tests {
         let second = t.transfer(0, 1_000_000, Time::ZERO);
         assert!((first.as_ms() - 100.0).abs() < 1e-6);
         assert!((second.as_ms() - 200.0).abs() < 1e-6);
+        // What each channel reads in 250 ms: an in-flight area's size.
+        assert_eq!(t.read_tokens_in(0, Time::from_ms(250.0)), 2_500_000);
+        assert_eq!(t.read_tokens_in(1, Time::from_ms(250.0)), 250_000);
+        let capacity = t.capacity_tokens(0);
+        assert_eq!(t.carve_tokens(0, 1_000), 1_000);
+        assert_eq!(t.capacity_tokens(0), capacity - 1_000);
     }
 
     #[test]

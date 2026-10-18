@@ -646,8 +646,22 @@ where
         (self.policy.len() + self.overdue.as_ref().map_or(0, OverdueQueue::len)) as u32
     }
 
+    /// Under bounded staging a landing frees in-flight area, so a loading
+    /// pass starts the reads behind it at once, not at the next formation.
     fn land_prefix_reads(&mut self, kv_store: &mut K, now: Time) -> Option<Time> {
-        self.prefix_fetch.as_mut()?.land(kv_store, now)
+        let fetch = self.prefix_fetch.as_mut()?;
+        let landed = fetch.land(kv_store, now);
+        if landed.is_some() && fetch.releases_at_landing() {
+            FreshQueues {
+                partition: PARTITION,
+                policy: &mut self.policy,
+                policy_context: &mut self.policy_context,
+                prefix_fetch: &mut self.prefix_fetch,
+                overdue: &mut self.overdue,
+            }
+            .stage_loads(kv_store, now);
+        }
+        landed
     }
 
     fn next_prefix_read(&self) -> Option<Time> {

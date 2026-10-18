@@ -3,13 +3,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::arch::contract::IterwiseUnifiedModel;
-use crate::common::{PoolId, SharedRequests, WorkerId};
+use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
+use crate::common::{PoolId, SharedRequests, Time, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{
     PendingOrder, PipelinedChunkedPrefillAdmission, PrefixFetch, SessionPrefixTiers,
 };
-use crate::worker::config::MicrobatchSizing;
+use crate::worker::config::{MicrobatchSizing, PrefixTierLoading};
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::{FullAttnKv, HybridGdnKv, PrefixCacheConfig, PrefixKv, ResumePoint};
@@ -279,15 +279,34 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         Some(log) => kv_store.with_hbm_eviction_log(log),
         None => kv_store,
     };
-    if config.prefix_tier_loading_area > 0.0 {
-        // HBM's loading area in the store's tokens, and in the tiers' for the
-        // reads that fill it.
-        let fraction = config.prefix_tier_loading_area;
-        let area = (kv_store.capacity_tokens(0) as f64 * fraction) as u64;
-        kv_store.set_loading_area(0, area);
-        let tier_area = (area as f64 * layout.kv_bytes_per_token as f64
-            / layout.tier_kv_bytes_per_token.max(1) as f64) as u64;
-        prefix_fetch = prefix_fetch.map(|fetch| fetch.with_loading_area(tier_area, fraction));
+    match config.prefix_tier_loading {
+        PrefixTierLoading::Held if config.prefix_tier_loading_area > 0.0 => {
+            // HBM's loading area in the store's tokens, and in the tiers' for
+            // the reads that fill it.
+            let fraction = config.prefix_tier_loading_area;
+            let area = (kv_store.capacity_tokens(0) as f64 * fraction) as u64;
+            kv_store.set_loading_area(0, area);
+            let tier_area = (area as f64 * layout.kv_bytes_per_token as f64
+                / layout.tier_kv_bytes_per_token.max(1) as f64) as u64;
+            prefix_fetch = prefix_fetch.map(|fetch| fetch.with_loading_area(tier_area, fraction));
+        }
+        PrefixTierLoading::Held => {}
+        PrefixTierLoading::Bounded => {
+            // pp_size microbatches of max_batch_tokens fill the pipeline.
+            let ready_bound = u64::from(layout.depth) * u64::from(max_batch_tokens);
+            let model = Arc::clone(&stage_model);
+            let multiplier = config
+                .prefill_gpu_time_multiplier
+                .unwrap_or(config.gpu_time_multiplier);
+            // Reads hold their HBM blocks like running requests; the
+            // in-flight area only bounds the bytes in progress.
+            prefix_fetch = prefix_fetch.map(|fetch| {
+                fetch.with_bounded_loading(
+                    move || prefill_batch_period(model.as_ref(), max_batch_tokens, multiplier),
+                    ready_bound,
+                )
+            });
+        }
     }
     let admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
@@ -333,6 +352,31 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         has_tiers,
         config.external_decode,
     )
+}
+
+/// One batch period of the pipeline: the stage time of a `max_batch_tokens`
+/// prefill microbatch from an empty context, from `stage_model`'s cost model
+/// with the prefill time multiplier. Stages are balanced and each holds one
+/// microbatch, so the pipeline prefills `max_batch_tokens` per period.
+fn prefill_batch_period<M: IterwiseUnifiedModel>(
+    stage_model: &M,
+    max_batch_tokens: u32,
+    multiplier: f64,
+) -> Time {
+    let input = UnifiedArchInput {
+        groups: vec![ArchGroupInput {
+            batch_tokens: max_batch_tokens,
+            prefill_tokens: max_batch_tokens,
+            prefill_chunk_pairs: vec![(0, max_batch_tokens)],
+            ..ArchGroupInput::default()
+        }],
+        tokens_per_source_rank: Vec::new(),
+    };
+    let ms = stage_model
+        .eval_iter(&input, &mut Vec::new(), &mut Vec::new())
+        .m
+        .time_ms;
+    Time::from_ms(f64::from(ms) * multiplier)
 }
 
 /// Reads from the DRAM/SSD tiers `config` asks for, in the pipeline's per-GPU

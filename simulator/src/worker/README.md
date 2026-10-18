@@ -399,12 +399,34 @@ pending -> loading -> ready -> batch. That fraction of HBM's KV capacity is a
 loading area the ledger always counts as held, so admission and retained
 prefixes leave it free; before each admission a loading pass walks the overdue
 and pending queues in order and starts reads while the area has room (a read
-larger than the area starts once it is empty), and admission takes only
-requests whose context is in HBM, passing over the rest. With an SSD behind
-DRAM, the same fraction of the DRAM tier is carved out as a DRAM area: an SSD
-read lands there, then hops to HBM on DRAM's channel once the HBM area has
-room. A request holds its area until admission. Little's law sizes it: area =
-tier-read bytes/s x one batch period (`max_batch_tokens` / prefill tokens/s).
+larger than the area starts once it is empty; a read that does not fit stops
+its queue, so none jumps it), and admission takes only requests whose context
+is in HBM, passing over the rest. With an SSD behind DRAM, the same fraction of
+the DRAM tier is carved out as a DRAM area: an SSD read lands there, then hops
+to HBM on DRAM's channel once the HBM area has room. Under this `held` rule
+(`prefix_tier_loading: held`, the default) a request holds its area until
+admission, so large reads that landed and wait for admission fill it and stall
+the reads behind them.
+`prefix_tier_loading: bounded` derives two separate bounds instead. (1) An
+in-flight area per landing tier bounds the reads in progress: HBM's is what the
+fastest tier's channel reads in one batch period, DRAM's (for SSD reads) what
+the SSD channel reads in it, by Little's law (bytes in flight = channel rate x
+residency, and a read waits at most one period behind the channel). The batch
+period is the cost model's stage time of one `max_batch_tokens` prefill
+microbatch from an empty context: stages are balanced and each holds one
+microbatch, so the pipeline prefills `max_batch_tokens` per period. DRAM's
+area is carved out of the DRAM tier; HBM's reserves nothing: a read holds its
+blocks from its start, counted against HBM like a running request's (retained
+prefixes make room), and starts only if they fit. A read gives its area back
+when it lands (an SSD read's DRAM area when its hop lands) and a loading pass
+starts the next reads at once; its data stays held in HBM until admission.
+(2) New reads start only while the landed,
+unadmitted requests' prefill work (their new tokens plus any declared prefix
+past the hit) is below `pp_size x max_batch_tokens`, what fills the pipeline.
+A landed request evicted before admission goes back to pending and is read
+again (`rereads`); `force_schedule_after_ms` puts overdue requests first in the
+loading pass too. `prefix_tiers_<tag>.json`'s `loading` records the rule and
+the sizes it derived.
 A tier is sized and read in the most loaded stage's bytes per token;
 `prefix_tier_balanced_load` (not vLLM) uses the stages' mean instead. A hybrid
 pipeline's entry adds one recurrent state on that same GPU, in real bytes (the
