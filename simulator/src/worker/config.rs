@@ -147,11 +147,12 @@ pub enum PrefixTierLoading {
     /// for SSD reads) bounds the bytes of reads in progress to what the
     /// channel feeding it moves in one batch period (the stage time of one
     /// `max_batch_tokens` prefill microbatch, from the cost model); a read
-    /// gives it back when it lands. A read holds its HBM blocks from its
-    /// start, like a running request, starts only if they fit, and keeps
-    /// them until admission. New reads start only while the landed
-    /// requests' prefill work is below `pp_size x max_batch_tokens`, what
-    /// fills the pipeline.
+    /// gives it back when it lands. A read holds its request's whole HBM
+    /// footprint from its start, like an unstaged read, starts only if it
+    /// fits, and keeps it until admission, so landed data cannot deadlock
+    /// admission. New reads start only while the landed requests' data plus
+    /// the read fits one in-flight area and their prefill work is below
+    /// `pp_size x max_batch_tokens`, what fills the pipeline.
     Bounded,
 }
 
@@ -953,8 +954,9 @@ pub enum IterWorkerSel {
         prefix_tier_loading_area: f64,
         /// With a tier: `held` (the `prefix_tier_loading_area` rule, off at
         /// 0) or `bounded` (in-flight areas sized channel rate x one batch
-        /// period, released at landing, and new reads only while landed work
-        /// is below `pp_size x max_batch_tokens`; needs
+        /// period, released at landing; reads hold their whole request; new
+        /// reads only while landed data fits one area and landed work is
+        /// below `pp_size x max_batch_tokens`; needs
         /// `prefix_tier_loading_area: 0`). See [`PrefixTierLoading`]. Not vLLM.
         #[serde(default)]
         #[param(string, default = "held", choices = PREFIX_TIER_LOADING_CHOICES)]

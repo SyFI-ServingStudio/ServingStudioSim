@@ -416,11 +416,15 @@ period is the cost model's stage time of one `max_batch_tokens` prefill
 microbatch from an empty context: stages are balanced and each holds one
 microbatch, so the pipeline prefills `max_batch_tokens` per period. DRAM's
 area is carved out of the DRAM tier; HBM's reserves nothing: a read holds its
-blocks from its start, counted against HBM like a running request's (retained
-prefixes make room), and starts only if they fit. A read gives its area back
-when it lands (an SSD read's DRAM area when its hop lands) and a loading pass
-starts the next reads at once; its data stays held in HBM until admission.
-(2) New reads start only while the landed,
+request's whole footprint from its start (like an unstaged read), counted
+against HBM like a running request's (retained prefixes make room), and starts
+only if it fits, so any landed request can be admitted and landed data cannot
+deadlock admission. A read gives its area back when it lands (an SSD read's
+DRAM area when its hop lands) and a loading pass starts the next reads at once;
+its data stays held in HBM until admission. (2) New reads start only while the
+landed, unadmitted data plus the new read fits one in-flight area (a read
+larger than the area starts when nothing has landed), so landed data stays
+below two areas, and while the landed,
 unadmitted requests' prefill work (their new tokens plus any declared prefix
 past the hit) is below `pp_size x max_batch_tokens`, what fills the pipeline.
 A landed request evicted before admission goes back to pending and is read

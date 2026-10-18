@@ -227,6 +227,12 @@ pub trait PrefixKv: KvStore {
     /// Drop a read's hold, if it has one.
     fn release_read_hold(&mut self, request: RequestId);
 
+    /// What one retained recurrent state costs, in the store's tokens (0
+    /// without recurrent state). A read that moves earlier round-end states
+    /// holds this much more per state, so its context goes back into HBM
+    /// with all of them.
+    fn retained_state_tokens(&self) -> u64;
+
     /// Keep `tokens` of `partition` free for reads: holds count as at least
     /// this much, so admission and the retained-prefix tier never use it.
     fn set_loading_area(&mut self, partition: PartitionId, tokens: u64);

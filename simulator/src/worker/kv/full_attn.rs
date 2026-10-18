@@ -451,6 +451,10 @@ impl PrefixKv for FullAttnKv {
         self.ledger.take_held(request);
     }
 
+    fn retained_state_tokens(&self) -> u64 {
+        0
+    }
+
     fn set_loading_area(&mut self, partition: PartitionId, tokens: u64) {
         self.ledger.set_loading_area(partition, tokens);
     }
