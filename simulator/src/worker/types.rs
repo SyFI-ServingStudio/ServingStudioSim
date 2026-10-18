@@ -663,8 +663,8 @@ pub struct WorkerConfig {
     pub external_decode: bool,
     /// Pipeline head and hybrid chunked prefill, a state-at-end hybrid
     /// (plain chunking): recurrent states each retained context keeps in HBM
-    /// and every tier, its end's and up to `n - 1` earlier round-end ones
-    /// (`prefix_cache.rs`). 1: the end only.
+    /// and every tier, its end's and the latest `n - 1` earlier round-end
+    /// ones, one unit with the context (`prefix_cache.rs`). 1: the end only.
     pub recurrent_state_checkpoints: u32,
     /// Candidate positions the drafter proposes per request per iteration (from
     /// the worker selector). The verify width is one more than this. Only the

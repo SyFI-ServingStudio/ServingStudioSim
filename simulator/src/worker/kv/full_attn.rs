@@ -466,6 +466,7 @@ impl PrefixKv for FullAttnKv {
         session_id: u32,
         tokens: u64,
         _shared: u64,
+        _states: &[u64],
         now: Time,
     ) {
         self.retain_prefix(
@@ -902,7 +903,8 @@ impl FullAttnKv {
         if insert_result.retained_tokens
             < self.prefix_caches[partition as usize].retainable_tokens(tokens)
         {
-            self.journal.record_unkept(partition, session_id, tokens);
+            self.journal
+                .record_unkept(partition, session_id, tokens, insert_result.earlier_states);
         }
         if insert_result.retained_tokens == 0 {
             let cache_used = self.prefix_caches[partition as usize].used_charge();
@@ -1040,13 +1042,13 @@ mod tests {
             None,
         )
         .with_hbm_eviction_log(log.clone());
-        kv_store.restore_prefix(RequestId(0), 0, 1, 80, 0, Time::ZERO);
+        kv_store.restore_prefix(RequestId(0), 0, 1, 80, 0, &[], Time::ZERO);
         assert!(log.borrow().is_empty());
         // Session 2's context pushes session 1 out. Session 3's is larger
         // than HBM: it pushes 2 out, HBM keeps only its first 100 tokens, and
         // the whole context leaves HBM.
-        kv_store.restore_prefix(RequestId(1), 0, 2, 60, 0, Time::ZERO);
-        kv_store.restore_prefix(RequestId(2), 0, 3, 120, 0, Time::ZERO);
+        kv_store.restore_prefix(RequestId(1), 0, 2, 60, 0, &[], Time::ZERO);
+        kv_store.restore_prefix(RequestId(2), 0, 3, 120, 0, &[], Time::ZERO);
         assert_eq!(
             log.borrow().as_slice(),
             [
@@ -1054,19 +1056,19 @@ mod tests {
                     partition: 0,
                     session_id: 1,
                     tokens: 80,
-                    state_only: false,
+                    earlier_states: vec![],
                 },
                 HbmEviction {
                     partition: 0,
                     session_id: 2,
                     tokens: 60,
-                    state_only: false,
+                    earlier_states: vec![],
                 },
                 HbmEviction {
                     partition: 0,
                     session_id: 3,
                     tokens: 120,
-                    state_only: false,
+                    earlier_states: vec![],
                 },
             ]
         );

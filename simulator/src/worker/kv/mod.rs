@@ -195,10 +195,12 @@ pub trait PrefixKv: KvStore {
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time);
 
     /// Put `tokens` of `session_id`'s context into the retained tier, as a
-    /// read from a slower tier or a decode run elsewhere hands them back. It
-    /// replaces the session's entry, whose first `shared` tokens it shares
-    /// (an entry keeping earlier round-end states keeps those within them),
-    /// and is clamped to the slack like any retention.
+    /// read from a slower tier or a decode run elsewhere hands them back,
+    /// with `states`: the round-end states below `tokens` the read moves
+    /// along (empty for a hand-back). It replaces the session's entry, whose
+    /// first `shared` tokens it shares (an entry keeping round-end states
+    /// keeps the latest of its own and `states` within them), and is clamped
+    /// to the slack like any retention.
     fn restore_prefix(
         &mut self,
         request: RequestId,
@@ -206,6 +208,7 @@ pub trait PrefixKv: KvStore {
         session_id: u32,
         tokens: u64,
         shared: u64,
+        states: &[u64],
         now: Time,
     );
 

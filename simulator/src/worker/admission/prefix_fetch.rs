@@ -179,8 +179,25 @@ impl SessionPrefixTiers {
         self.tiers.store_round(session_id, round);
     }
 
+    /// What a read of `hit` moves into HBM, in tier tokens: the KV HBM's
+    /// `hbm_tokens` lack and every state at or before the hit (a pre-run
+    /// context has one).
+    fn read_charge(
+        &self,
+        session_id: u32,
+        hit: PrefixTierHit,
+        seeded: bool,
+        hbm_tokens: u32,
+    ) -> u64 {
+        if seeded {
+            u64::from(hit.tokens - hbm_tokens) + self.tiers.state_tokens()
+        } else {
+            self.tiers.read_charge(session_id, hit, hbm_tokens)
+        }
+    }
+
     /// Start a read of `hit`, of what HBM's `hbm_tokens` lack; returns when it
-    /// lands.
+    /// lands and the states it moves below the hit.
     fn read(
         &mut self,
         session_id: u32,
@@ -188,7 +205,7 @@ impl SessionPrefixTiers {
         seeded: bool,
         hbm_tokens: u32,
         now: Time,
-    ) -> Time {
+    ) -> (Time, Vec<u64>) {
         if seeded {
             self.tiers.seed(session_id, u64::from(hit.tokens));
             let stored = self.stored.entry(session_id).or_insert(0);
@@ -305,7 +322,7 @@ impl Drop for SessionPrefixTiers {
                     "loads": counters.loads,
                     "loaded_tokens": counters.loaded_tokens,
                     "written_states": counters.written_states,
-                    "earlier_state_drops": counters.earlier_state_drops,
+                    "loaded_states": counters.loaded_states,
                     "released_entries": counters.released_entries,
                     "earlier_states": self.tiers.earlier_states(tier),
                     "write_window_ms": WRITE_WINDOW.as_ms(),
@@ -358,14 +375,16 @@ enum Phase {
     Hop,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Fetch {
     candidate: AdmissionCandidate,
     partition: u16,
     read: Read,
     phase: Phase,
-    /// Tokens (KV and its state) the read holds in each loading area.
+    /// Tokens (KV and its states) the read holds in each loading area.
     charge: u64,
+    /// The round-end states below the hit the read moves into HBM.
+    states: Vec<u64>,
 }
 
 /// Loading areas of the staged mode, per partition, in tier tokens.
@@ -537,7 +556,7 @@ impl PrefixFetch {
         else {
             return false;
         };
-        let charge = u64::from(hit.tokens - hbm_tokens) + tiers.tiers.state_tokens();
+        let charge = tiers.read_charge(session_id, hit, seeded, hbm_tokens);
         let staged = self.staged.as_mut().expect("staged mode");
         let through_dram = staged.dram_area[p] > 0 && hit.tier == 1;
         let phase = if through_dram {
@@ -558,7 +577,7 @@ impl PrefixFetch {
             Phase::Hbm
         };
         self.restored.remove(&candidate.request_id);
-        let ready = tiers.read(session_id, hit, seeded, hbm_tokens, now);
+        let (ready, states) = tiers.read(session_id, hit, seeded, hbm_tokens, now);
         self.reads.push(Reverse((ready, candidate.request_id)));
         self.reading.insert(
             candidate.request_id,
@@ -573,6 +592,7 @@ impl PrefixFetch {
                 },
                 phase,
                 charge,
+                states,
             },
         );
         true
@@ -643,12 +663,11 @@ impl PrefixFetch {
             return;
         };
         for eviction in log.borrow_mut().drain(..) {
-            let tiers = &mut self.partitions[usize::from(eviction.partition)].tiers;
-            if eviction.state_only {
-                tiers.store_evicted_state(eviction.session_id, eviction.tokens);
-            } else {
-                tiers.store_evicted(eviction.session_id, eviction.tokens);
-            }
+            self.partitions[usize::from(eviction.partition)].tiers.store_evicted(
+                eviction.session_id,
+                eviction.tokens,
+                &eviction.earlier_states,
+            );
         }
     }
 
@@ -719,7 +738,7 @@ impl PrefixFetch {
             kv_store.release_read_hold(candidate.request_id);
             self.release_area(&fetch, false, true);
             // The read is a prefix of the session's latest context, as HBM's
-            // entry is.
+            // entry is; its states come with it.
             let tokens = u64::from(fetch.read.hit.tokens);
             kv_store.restore_prefix(
                 candidate.request_id,
@@ -727,6 +746,7 @@ impl PrefixFetch {
                 session_id,
                 tokens,
                 tokens,
+                &fetch.states,
                 now,
             );
             self.restored.insert(candidate.request_id, fetch);
@@ -792,7 +812,7 @@ impl PrefixFetch {
             tiers.rereads += 1;
             self.restored.remove(&candidate.request_id);
         }
-        let ready = tiers.read(session_id, hit, seeded, hbm_tokens, now);
+        let (ready, states) = tiers.read(session_id, hit, seeded, hbm_tokens, now);
         self.reads.push(Reverse((ready, candidate.request_id)));
         self.reading.insert(
             candidate.request_id,
@@ -807,6 +827,7 @@ impl PrefixFetch {
                 },
                 phase: Phase::Hbm,
                 charge: 0,
+                states,
             },
         );
         AtHead::Read
@@ -826,7 +847,7 @@ impl PrefixFetch {
                 break;
             }
             self.reads.pop();
-            let Some(&fetch) = self.reading.get(&request) else {
+            let Some(fetch) = self.reading.get(&request).cloned() else {
                 continue;
             };
             if fetch.read.ready != ready {

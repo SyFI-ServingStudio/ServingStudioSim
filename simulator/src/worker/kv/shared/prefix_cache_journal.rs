@@ -20,16 +20,15 @@ use crate::worker::shared::advance_scope::PartitionId;
 
 use super::prefix_cache::{PrefixCacheMutation, PrefixCacheMutationKind};
 
-/// A session context that left the HBM prefix cache: evicted, or not kept
-/// when it was retained.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A session context that left the HBM prefix cache whole: evicted, or not
+/// kept when it was retained.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HbmEviction {
     pub(crate) partition: PartitionId,
     pub(crate) session_id: u32,
     pub(crate) tokens: u64,
-    /// Only the state at `tokens` left (an earlier round-end state); the
-    /// context's KV stays in HBM.
-    pub(crate) state_only: bool,
+    /// Its round-end states below `tokens`, which leave with it.
+    pub(crate) earlier_states: Vec<u64>,
 }
 
 /// The contexts the KV store's prefix cache let go of, in order, until the
@@ -54,15 +53,22 @@ impl PrefixCacheJournal {
         self.evictions = Some(log);
     }
 
-    /// A retention kept less of the session's `tokens` than the cache keeps
-    /// with room: the context leaves HBM at once.
-    pub(crate) fn record_unkept(&mut self, partition: PartitionId, session_id: u32, tokens: u64) {
+    /// A retention kept less of the session's `tokens` (with its
+    /// `earlier_states`) than the cache keeps with room: the context leaves
+    /// HBM at once.
+    pub(crate) fn record_unkept(
+        &mut self,
+        partition: PartitionId,
+        session_id: u32,
+        tokens: u64,
+        earlier_states: Vec<u64>,
+    ) {
         if let Some(log) = &self.evictions {
             log.borrow_mut().push(HbmEviction {
                 partition,
                 session_id,
                 tokens,
-                state_only: false,
+                earlier_states,
             });
         }
     }
@@ -85,20 +91,6 @@ impl PrefixCacheJournal {
         event_kind: PrefixCacheEventKind,
         retain_requested_tokens: u64,
     ) {
-        if mutation.kind == PrefixCacheMutationKind::EarlierStateEviction {
-            // The context stays in HBM; a victim tier gets the state alone, to
-            // keep beside the session's KV if it holds it. Not a token-level
-            // cache event.
-            if let Some(log) = &self.evictions {
-                log.borrow_mut().push(HbmEviction {
-                    partition,
-                    session_id: mutation.session_id,
-                    tokens: mutation.state_at,
-                    state_only: true,
-                });
-            }
-            return;
-        }
         if let Some(log) = &self.evictions {
             if matches!(
                 mutation.kind,
@@ -109,7 +101,7 @@ impl PrefixCacheJournal {
                     partition,
                     session_id: mutation.session_id,
                     tokens: mutation.entry_tokens_before,
-                    state_only: false,
+                    earlier_states: mutation.earlier_states.clone(),
                 });
             }
         }
@@ -150,10 +142,6 @@ impl PrefixCacheJournal {
                 PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ReplacementPolicy)
             }
             PrefixCacheMutationKind::Retain => PrefixCacheEventKind::Retain(retain_reason),
-            // Never logged (`record_mutation` returns first); its context stays.
-            PrefixCacheMutationKind::EarlierStateEviction => {
-                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::RetentionCapacity)
-            }
         }
     }
 }

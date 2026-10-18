@@ -339,18 +339,22 @@ floor to it, one state per block. `plain` chunks plainly and keeps one state per
 retained session, at its context's end: a hit is the whole context when the
 prompt extends it, and nothing when the prompt ends inside it. The tiers follow
 the same rule (`ResumePoint` in `kv/shared/prefix_cache.rs`).
-`recurrent_state_checkpoints: k` (not vLLM; default 1, needs `plain`) keeps up
-to k round-end states per retained context: its end plus earlier prompt ends and
-handed-back decode ends (a hand-back keeps the prompt-end state its prefill
-wrote). Invariant: every kept state sits at a prefix of the entry's context, so
-only states within a new round's declared prefix carry over. A prompt ending
-inside the context resumes at the latest state at or below it. Earlier states
-only fill slack: under pressure the LRU entry's oldest earlier state goes before
-any whole context, and a taken entry leaves its states up to the resume point
-behind as a states-only entry. A read moves one state. HBM keeps this order even
-with a victim DRAM behind it, where a state costs its padded blocks (measured:
-evicting whole HBM entries instead held fewer contexts and lost throughput at
-small k, with no gain at k = all).
+`recurrent_state_checkpoints: k` (not vLLM; default 1, needs `plain`) keeps the
+latest k round-end states per retained context: its end plus earlier prompt ends
+and handed-back decode ends (a hand-back keeps the prompt-end state its prefill
+wrote); fewer only when the session has had fewer passes or a cut removed some.
+Every kept state sits at a prefix of the entry's context, so only states within
+a new round's declared prefix carry over (a round that does not extend the
+context cuts it there, keeping the states at or before the cut). A prompt ending
+inside the context resumes at the latest state at or below it. One rule holds in
+HBM, DRAM and SSD: a retained context is one unit, its KV plus its states,
+charged `tokens + states x state` and evicted whole by LRU, never a state alone.
+Whatever moves it moves all its states: an HBM eviction into a victim tier, a
+DRAM -> SSD demotion, a read into HBM (it moves the KV and every state at or
+before the hit), an exclusive DRAM release. A request that takes an HBM entry
+carries its states (still charged to HBM's retained tier, not evictable) and
+hands them back with its context, which appends its new end state and drops the
+oldest beyond k.
 
 Behind HBM's retained tier a head can keep host DRAM and SSD tiers
 (`dram_tier_gb`, `ssd_tier_gb`, per GPU, with read bandwidths). They are
@@ -400,11 +404,9 @@ A tier is sized and read in the most loaded stage's bytes per token;
 `prefix_tier_balanced_load` (not vLLM) uses the stages' mean instead. A hybrid
 pipeline's entry adds one recurrent state on that same GPU, in real bytes (the
 stage's own, or the stages' mean), not the HBM pool's padded state blocks; its
-earlier round-end states are charged the same bytes each and yield first, except
-in a tier with a victim tier behind it, which demotes whole entries (states with
-their KV); the victim tier merges them into its entry for the session, writing
-only what it lacks. A state that arrives alone is kept only beside the session's
-own KV up to it. A shortest-prefill-first order ranks a request by what HBM or a tier
+earlier round-end states are charged the same bytes each. A victim tier merges
+an entry it receives into its own for the session (the longer context with the
+latest k states of both), writing only what it lacks. A shortest-prefill-first order ranks a request by what HBM or a tier
 holds. With `prefix_tier_warm_start`, a session request whose declared prefix
 exceeds every context the run stored for it is a pre-run conversation, read
 from the slowest tier (closed-loop traces that join sessions mid-life).

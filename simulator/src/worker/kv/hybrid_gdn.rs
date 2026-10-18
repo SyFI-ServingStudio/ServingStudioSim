@@ -200,7 +200,15 @@ impl KvStore for HybridGdnKv {
             .unwrap_or(0);
         self.partitions[partition as usize].release_decode(request, current_kv);
         self.ledger.forget_placement(request);
-        self.ledger.take_prefill_context(request);
+        // A context released without retention drops the states its request
+        // carried from the session's entry.
+        if let Some(session_id) = self
+            .ledger
+            .take_prefill_context(request)
+            .and_then(|context| context.session_id())
+        {
+            self.prefix_caches[partition as usize].take_carried(session_id);
+        }
     }
 
     fn sample_submit(&mut self, partition: PartitionId, now: Time) {
@@ -446,6 +454,7 @@ impl PrefixKv for HybridGdnKv {
         session_id: u32,
         tokens: u64,
         shared: u64,
+        states: &[u64],
         now: Time,
     ) {
         self.retain_prefix(
@@ -454,6 +463,7 @@ impl PrefixKv for HybridGdnKv {
             session_id,
             tokens,
             shared,
+            states,
             None,
             now,
             PrefixCacheRetentionReason::Restore,
@@ -474,6 +484,11 @@ impl PrefixKv for HybridGdnKv {
         let shared = resolved_prefill.map_or(0, |value| u64::from(value.declared_prefix_tokens()));
         let cache_return_metadata =
             resolved_prefill.and_then(ResolvedPrefillContext::cache_return_metadata);
+        // The states the request carried from the entry it took return with
+        // its context.
+        let carried = session_id
+            .map(|session_id| self.prefix_caches[partition as usize].take_carried(session_id))
+            .unwrap_or_default();
         self.release(request, partition);
         if let Some(session_id) = session_id {
             self.retain_prefix(
@@ -482,6 +497,7 @@ impl PrefixKv for HybridGdnKv {
                 session_id,
                 retained_tokens,
                 shared,
+                &carried,
                 cache_return_metadata,
                 now,
                 PrefixCacheRetentionReason::RequestComplete,
@@ -696,8 +712,8 @@ impl HybridGdnKv {
     /// whole context when the prompt extends it, and nothing when the prompt
     /// ends inside it (no snapshot exists there). It costs one state instead
     /// of one per checkpoint, and live decodes leave no snapshots behind
-    /// either. `states` > 1 also keeps that many earlier round-end states per
-    /// session, one state each, which yield before any context
+    /// either. `states` > 1 keeps that many round-end states per session,
+    /// one state each, kept, evicted and moved with the context as one unit
     /// (`PrefixCache::with_end_state`).
     pub(crate) fn with_end_state_reuse(mut self, states: u32) -> Self {
         let state_tokens = self.state_tokens_per_request;
@@ -763,6 +779,7 @@ impl HybridGdnKv {
         session_id: u32,
         tokens: u64,
         shared: u64,
+        incoming_states: &[u64],
         cache_return_metadata: Option<PrefixCacheReturnMetadata>,
         now: Time,
         retain_reason: PrefixCacheRetentionReason,
@@ -772,6 +789,7 @@ impl HybridGdnKv {
             session_id,
             tokens,
             shared,
+            incoming_states,
             physical_limit,
             cache_return_metadata,
         );
@@ -783,7 +801,8 @@ impl HybridGdnKv {
         if insert_result.retained_tokens
             < self.prefix_caches[partition as usize].retainable_tokens(tokens)
         {
-            self.journal.record_unkept(partition, session_id, tokens);
+            self.journal
+                .record_unkept(partition, session_id, tokens, insert_result.earlier_states);
         }
         if insert_result.retained_tokens == 0 {
             let cache_used = self.prefix_caches[partition as usize].used_charge();
@@ -1192,8 +1211,8 @@ mod tests {
                 store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL).with_end_state_reuse(states);
             // The prompt's context at completion, then the decode's hand-back,
             // which extends it.
-            kv_store.restore_prefix(RequestId(0), 0, 7, 5_000, 0, Time::ZERO);
-            kv_store.restore_prefix(RequestId(0), 0, 7, 5_400, 5_000, Time::ZERO);
+            kv_store.restore_prefix(RequestId(0), 0, 7, 5_000, 0, &[], Time::ZERO);
+            kv_store.restore_prefix(RequestId(0), 0, 7, 5_400, 5_000, &[], Time::ZERO);
             assert_eq!(
                 kv_store.prefix_caches[0].used_charge(),
                 5_400 + u64::from(states) * STATE_TOKENS
@@ -1202,5 +1221,27 @@ mod tests {
             // A prompt keeping only part of the output.
             assert_eq!(kv_store.prefix_caches[0].peek(7, 5_200), inside_hit);
         }
+    }
+
+    #[test]
+    fn a_read_restores_the_context_with_every_state_it_moved() {
+        let mut kv_store =
+            store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL).with_end_state_reuse(3);
+        // A tier read lands 5_000 tokens with the states at 3_000 and 4_000.
+        kv_store.restore_prefix(
+            RequestId(0),
+            0,
+            7,
+            5_000,
+            5_000,
+            &[3_000, 4_000],
+            Time::ZERO,
+        );
+        assert_eq!(
+            kv_store.prefix_caches[0].used_charge(),
+            5_000 + 3 * STATE_TOKENS
+        );
+        assert_eq!(kv_store.prefix_caches[0].peek(7, 4_500), 4_000);
+        assert_eq!(kv_store.prefix_caches[0].peek(7, 3_500), 3_000);
     }
 }

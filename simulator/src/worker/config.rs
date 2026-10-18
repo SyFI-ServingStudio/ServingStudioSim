@@ -709,11 +709,11 @@ pub enum IterWorkerSel {
         external_decode: bool,
         /// Recurrent states each retained context keeps, in HBM and every tier,
         /// for a state-at-end hybrid (plain chunking): the one at its end and
-        /// up to `n - 1` earlier round-end ones (where an earlier prefill, or a
+        /// the latest `n - 1` earlier round-end ones (where an earlier prefill, or a
         /// decode handed back, ended), so a prompt that ends inside the context
         /// resumes from the latest one at or before its end. Each costs one
-        /// state in the tier holding it; earlier states give way before any
-        /// context does. `1`: the end only. Not vLLM.
+        /// state in the tier holding it; a context and its states are one
+        /// unit, evicted and moved whole. `1`: the end only. Not vLLM.
         #[serde(default = "default_recurrent_state_checkpoints")]
         #[param(default = 1)]
         recurrent_state_checkpoints: u32,
@@ -933,11 +933,11 @@ pub enum IterWorkerSel {
         external_decode: bool,
         /// Recurrent states each retained context keeps, in HBM and every tier,
         /// for a state-at-end hybrid (plain chunking): the one at its end and
-        /// up to `n - 1` earlier round-end ones (where an earlier prefill, or a
+        /// the latest `n - 1` earlier round-end ones (where an earlier prefill, or a
         /// decode handed back, ended), so a prompt that ends inside the context
         /// resumes from the latest one at or before its end. Each costs one
-        /// state in the tier holding it; earlier states give way before any
-        /// context does. `1`: the end only. Not vLLM.
+        /// state in the tier holding it; a context and its states are one
+        /// unit, evicted and moved whole. `1`: the end only. Not vLLM.
         #[serde(default = "default_recurrent_state_checkpoints")]
         #[param(default = 1)]
         recurrent_state_checkpoints: u32,

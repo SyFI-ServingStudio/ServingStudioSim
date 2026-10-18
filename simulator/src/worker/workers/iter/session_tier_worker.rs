@@ -99,7 +99,15 @@ impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
             .expect("a session worker with tiers or external decode keeps sessions sticky");
         if external_outputs.is_some_and(|outputs| outputs > 1) {
             // It extends the prompt's context HBM retained at completion.
-            kv_store.restore_prefix(request, rank, session_id, round.tokens, round.prompt_end, at);
+            kv_store.restore_prefix(
+                request,
+                rank,
+                session_id,
+                round.tokens,
+                round.prompt_end,
+                &[],
+                at,
+            );
         }
         if self.tiers {
             admission.store_session_context(rank, session_id, round);

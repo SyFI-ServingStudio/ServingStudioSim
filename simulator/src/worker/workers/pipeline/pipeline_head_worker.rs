@@ -260,7 +260,7 @@ where
         if external_outputs.is_some_and(|outputs| outputs > 1) {
             // It extends the prompt's context HBM retained at completion.
             self.kv_store
-                .restore_prefix(request, 0, session_id, round.tokens, round.prompt_end, at);
+                .restore_prefix(request, 0, session_id, round.tokens, round.prompt_end, &[], at);
         }
         if self.prefix_tiers {
             self.admission.store_session_context(0, session_id, round);

@@ -35,22 +35,20 @@
 //! resumes from, not the per-block snapshots the HBM tier holds. How much of an
 //! entry a lookup reuses follows the HBM tier's [`ResumePoint`].
 //!
-//! With [`PrefixTiers::with_round_end_states`] > 1, an entry of a context
-//! resumable only at a state also keeps earlier round-end states of the same
-//! context (where an earlier prefill or handed-back decode ended), each charged
+//! With [`PrefixTiers::with_round_end_states`] `k` > 1, an entry of a context
+//! resumable only at a state keeps the latest `k` round-end states of the
+//! context (where its prefills and handed-back decodes ended), each charged
 //! one state, and a lookup resumes from the latest kept state at or before the
-//! prompt's end; a read still moves one state. As in the HBM prefix cache
-//! (`prefix_cache.rs`), every kept state sits at a prefix of the entry's
-//! context. Where leaving a tier loses a state, earlier states never displace
-//! a context: a tier with no victim tier behind it drops the least recently
-//! used entry's oldest earlier state first, and evicts a whole entry only when
-//! no entry has an earlier state left. A tier with a victim tier behind it
-//! loses nothing by evicting, so it evicts whole least recently used entries,
-//! each with its earlier states, which the victim tier merges into its own
-//! entry for the session (both are prefixes of the session's latest context).
-//! A victim tier keeps a state the tier above let go of alone only beside KV
-//! of the session it already holds up to that state: the KV stays in the tier
-//! above, which a victim tier never duplicates.
+//! prompt's end. The rule is HBM's (`prefix_cache.rs`): an entry is one unit,
+//! its KV and all its states. A tier evicts only whole least recently used
+//! entries and drops no state alone; whatever moves an entry moves all its
+//! states: an eviction into a victim tier, a read into HBM (it moves the
+//! states at or before the hit), an exclusive tier's release (the states are
+//! in HBM with the context), and every write counts each state it adds. A
+//! victim tier merges what it receives into its own entry for the session
+//! (both are prefixes of the session's latest context): the longer context
+//! with the latest `k` states among both. A cut keeps the states at or before
+//! it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -81,9 +79,8 @@ pub enum PrefixTierWrites {
     /// A victim tier that moves a read back into HBM instead of keeping a
     /// clean copy: the read releases the entry, so the tier holds only what
     /// HBM lacks (strictly exclusive), and HBM evicting the context again
-    /// writes it whole. Earlier round-end states the entry kept go to the
-    /// tier behind it, as states the tier above let go of. Configured as
-    /// `dram_tier_writes: hbm-evictions-exclusive`.
+    /// writes it whole. The read moved the entry's states into HBM with its
+    /// context. Configured as `dram_tier_writes: hbm-evictions-exclusive`.
     FasterTierEvictionsMoved,
 }
 
@@ -127,8 +124,8 @@ pub(crate) struct PrefixTierCounters {
     /// States newly written (an entry's end or an earlier round-end state it
     /// did not hold).
     pub(crate) written_states: u64,
-    /// Earlier round-end states dropped for room.
-    pub(crate) earlier_state_drops: u64,
+    /// States reads moved into HBM.
+    pub(crate) loaded_states: u64,
     /// Entries a read moved into HBM ([`PrefixTierWrites::FasterTierEvictionsMoved`]).
     pub(crate) released_entries: u64,
 }
@@ -149,12 +146,6 @@ pub(crate) enum PrefixTierEventKind {
     Cut,
     /// A read of the entry's first `tokens`; `prev_tokens` of them HBM held.
     Read,
-    /// The entry's earlier round-end state at `tokens` dropped for room; the
-    /// entry holds `prev_tokens`.
-    DropState,
-    /// A state at `tokens` the tier above dropped, kept beside the entry's
-    /// `prev_tokens` of KV.
-    WriteState,
     /// A read moved the entry's `tokens` into HBM and released it.
     Release,
 }
@@ -173,34 +164,12 @@ pub(crate) struct PrefixTierEvent {
 pub(crate) const WRITE_WINDOW: Time = Time::from_ms_u64(10_000);
 
 /// What leaves a tier for the one behind it: a session's context of
-/// `tokens` with its state at the end and its `earlier` round-end states, or
-/// only an earlier state at `tokens` whose context stays.
+/// `tokens` with its state at the end and its `earlier` round-end states.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Leaving {
     session_id: u32,
     tokens: u64,
     earlier: Vec<u64>,
-    state_only: bool,
-}
-
-impl Leaving {
-    fn context(session_id: u32, tokens: u64, earlier: Vec<u64>) -> Self {
-        Self {
-            session_id,
-            tokens,
-            earlier,
-            state_only: false,
-        }
-    }
-
-    fn state(session_id: u32, tokens: u64) -> Self {
-        Self {
-            session_id,
-            tokens,
-            earlier: Vec::new(),
-            state_only: true,
-        }
-    }
 }
 
 struct TierEntry {
@@ -224,8 +193,6 @@ struct PrefixTier {
     used: u64,
     entries: HashMap<u32, TierEntry>,
     lru: BTreeMap<u64, u32>,
-    /// The LRU stamps of the entries with earlier states.
-    with_earlier: BTreeMap<u64, u32>,
     earlier_states: u64,
     next_stamp: u64,
     /// When the read channel is next free.
@@ -279,9 +246,6 @@ impl PrefixTier {
     fn touch(&mut self, session_id: u32) {
         if let Some(entry) = self.entries.get_mut(&session_id) {
             self.lru.remove(&entry.stamp);
-            if self.with_earlier.remove(&entry.stamp).is_some() {
-                self.with_earlier.insert(self.next_stamp, session_id);
-            }
             entry.stamp = self.next_stamp;
             self.lru.insert(self.next_stamp, session_id);
             self.next_stamp += 1;
@@ -310,164 +274,56 @@ impl PrefixTier {
         self.used -= (entry.tokens - tokens) + dropped as u64 * state_tokens;
         self.earlier_states -= dropped as u64;
         entry.tokens = tokens;
-        if entry.earlier.is_empty() {
-            self.with_earlier.remove(&entry.stamp);
-        }
     }
 
     fn remove(&mut self, session_id: u32, state_tokens: u64) -> Option<TierEntry> {
         let entry = self.entries.remove(&session_id)?;
         self.lru.remove(&entry.stamp);
-        self.with_earlier.remove(&entry.stamp);
         self.earlier_states -= entry.earlier.len() as u64;
         self.used -= self.charge(entry.tokens, 1 + entry.earlier.len(), state_tokens);
         Some(entry)
     }
 
-    /// Drop the oldest earlier state of the least recently used entry that
-    /// has one (other than `except`'s), and return it as a state that leaves
-    /// the tier.
-    fn drop_earlier_state(&mut self, state_tokens: u64, except: Option<u32>) -> Option<Leaving> {
-        let (&stamp, &session_id) = self
-            .with_earlier
-            .iter()
-            .find(|(_, &session)| Some(session) != except)?;
-        let entry = self.entries.get_mut(&session_id).expect("indexed entry");
-        let at = entry.earlier.remove(0);
-        let tokens = entry.tokens;
-        if entry.earlier.is_empty() {
-            self.with_earlier.remove(&stamp);
-        }
-        self.used -= state_tokens;
-        self.earlier_states -= 1;
-        self.counters.earlier_state_drops += 1;
-        self.log(PrefixTierEventKind::DropState, session_id, at, tokens, 0);
-        Some(Leaving::state(session_id, at))
-    }
-
-    /// Evict the least recently used entry (other than `except`'s) whole, its
-    /// earlier states with it, and return it as a context that leaves the tier.
-    fn evict_lru(&mut self, state_tokens: u64, except: Option<u32>) -> Option<Leaving> {
-        let victim = self
-            .lru
-            .values()
-            .copied()
-            .find(|&session| Some(session) != except)?;
+    /// Evict the least recently used entry whole, its earlier states with it,
+    /// and return it as a context that leaves the tier.
+    fn evict_lru(&mut self, state_tokens: u64) -> Option<Leaving> {
+        let victim = *self.lru.values().next()?;
         let entry = self.remove(victim, state_tokens).expect("indexed entry");
         self.counters.evicted_entries += 1;
         self.counters.evicted_tokens += entry.tokens;
         self.log(PrefixTierEventKind::Evict, victim, entry.tokens, entry.tokens, 0);
-        Some(Leaving::context(victim, entry.tokens, entry.earlier))
+        Some(Leaving {
+            session_id: victim,
+            tokens: entry.tokens,
+            earlier: entry.earlier,
+        })
     }
 
-    /// Keep the state at `at` the tier above dropped beside the session's
-    /// entry, if the entry holds the KV up to it and lacks it; returns what
-    /// leaves for it. Room comes only from other entries' earlier states, or,
-    /// in a tier that `demotes` (a victim tier is behind it), from whole
-    /// least recently used entries, which lose nothing.
-    fn add_earlier_state(
-        &mut self,
-        session_id: u32,
-        at: u64,
-        max_earlier: usize,
-        state_tokens: u64,
-        demotes: bool,
-    ) -> Vec<Leaving> {
-        let mut left = Vec::new();
-        let Some(entry) = self.entries.get(&session_id) else {
-            return left;
-        };
-        if max_earlier == 0 || at == 0 || at >= entry.tokens || entry.earlier.contains(&at) {
-            return left;
-        }
-        if entry.earlier.len() >= max_earlier && entry.earlier[0] > at {
-            return left; // older than every state it keeps
-        }
-        while self.used + state_tokens > self.capacity {
-            let room = if demotes {
-                self.evict_lru(state_tokens, Some(session_id))
-            } else {
-                self.drop_earlier_state(state_tokens, Some(session_id))
-            };
-            match room {
-                Some(dropped) => left.push(dropped),
-                None => return left,
-            }
-        }
-        let entry = self.entries.get_mut(&session_id).expect("checked above");
-        let at_index = entry.earlier.partition_point(|&x| x < at);
-        entry.earlier.insert(at_index, at);
-        if entry.earlier.len() == 1 {
-            self.with_earlier.insert(entry.stamp, session_id);
-        }
-        self.used += state_tokens;
-        self.earlier_states += 1;
-        self.counters.written_states += 1;
-        self.count_window_states(1);
-        let entry = self.entries.get_mut(&session_id).expect("checked above");
-        let tokens = entry.tokens;
-        if entry.earlier.len() > max_earlier {
-            let oldest = entry.earlier.remove(0);
-            self.used -= state_tokens;
-            self.earlier_states -= 1;
-            self.counters.earlier_state_drops += 1;
-            left.push(Leaving::state(session_id, oldest));
-        }
-        self.log(PrefixTierEventKind::WriteState, session_id, at, tokens, 0);
-        left
-    }
-
-    /// Store the session's context with its `earlier` round-end states and
-    /// return what leaves the tier for it: dropped earlier states, the LRU
-    /// victims, or the context itself when it is larger than the whole tier.
-    /// A tier that `demotes` (a victim tier is behind it) loses nothing by
-    /// evicting, so it evicts whole LRU entries, their states with their KV,
-    /// and drops no earlier state first.
+    /// Store the session's context with its `earlier` round-end states, one
+    /// unit, and return what leaves the tier for it: the whole LRU entries it
+    /// evicts, or the context itself when it is larger than the whole tier.
     fn store(
         &mut self,
         session_id: u32,
         tokens: u64,
-        mut earlier: Vec<u64>,
+        earlier: Vec<u64>,
         state_tokens: u64,
-        demotes: bool,
     ) -> Vec<Leaving> {
         let previous = self.remove(session_id, state_tokens);
         let previous_tokens = previous.as_ref().map_or(0, |e| e.tokens);
+        let charge = self.charge(tokens, 1 + earlier.len(), state_tokens);
+        if charge > self.capacity {
+            self.log(PrefixTierEventKind::TooLarge, session_id, 0, previous_tokens, 0);
+            return vec![Leaving {
+                session_id,
+                tokens,
+                earlier,
+            }];
+        }
         let mut left = Vec::new();
-        if demotes && self.charge(tokens, 1, state_tokens) > self.capacity {
-            self.log(PrefixTierEventKind::TooLarge, session_id, 0, previous_tokens, 0);
-            left.push(Leaving::context(session_id, tokens, earlier));
-            return left;
-        }
-        // Its own earlier states go first if the context alone barely fits.
-        while self.charge(tokens, 1 + earlier.len(), state_tokens) > self.capacity
-            && !earlier.is_empty()
-        {
-            left.push(Leaving::state(session_id, earlier.remove(0)));
-            self.counters.earlier_state_drops += 1;
-        }
-        if self.charge(tokens, 1, state_tokens) > self.capacity {
-            self.log(PrefixTierEventKind::TooLarge, session_id, 0, previous_tokens, 0);
-            left.push(Leaving::context(session_id, tokens, Vec::new()));
-            return left;
-        }
-        while self.used + self.charge(tokens, 1 + earlier.len(), state_tokens) > self.capacity {
-            // Where leaving loses them, earlier states never displace a
-            // context: other entries' go first, then this one's, then whole
-            // entries.
-            if !demotes {
-                if let Some(dropped) = self.drop_earlier_state(state_tokens, None) {
-                    left.push(dropped);
-                    continue;
-                }
-                if !earlier.is_empty() {
-                    left.push(Leaving::state(session_id, earlier.remove(0)));
-                    self.counters.earlier_state_drops += 1;
-                    continue;
-                }
-            }
+        while self.used + charge > self.capacity {
             left.push(
-                self.evict_lru(state_tokens, None)
+                self.evict_lru(state_tokens)
                     .expect("a full tier has an entry to evict"),
             );
         }
@@ -475,11 +331,8 @@ impl PrefixTier {
             .chain(earlier.iter().copied())
             .filter(|at| !previous.as_ref().is_some_and(|e| e.states().any(|x| x == *at)))
             .count() as u64;
-        self.used += self.charge(tokens, 1 + earlier.len(), state_tokens);
+        self.used += charge;
         self.earlier_states += earlier.len() as u64;
-        if !earlier.is_empty() {
-            self.with_earlier.insert(self.next_stamp, session_id);
-        }
         self.entries.insert(
             session_id,
             TierEntry {
@@ -541,7 +394,6 @@ impl PrefixTiers {
                     used: 0,
                     entries: HashMap::new(),
                     lru: BTreeMap::new(),
-                    with_earlier: BTreeMap::new(),
                     earlier_states: 0,
                     next_stamp: 0,
                     channel_free: Time::ZERO,
@@ -640,10 +492,38 @@ impl PrefixTiers {
         best
     }
 
-    /// Queue a read of `hit` behind the tier's earlier reads and return when
-    /// it lands. Only the tokens past `resident_tokens` (what HBM still holds)
-    /// cross the link, plus the state at the hit's end. The entry stays (the
-    /// tiers are inclusive); every faster write-through tier receives a copy,
+    /// The states a read of `hit` moves below its end: the entry's states
+    /// before the hit, ascending (the state at the hit itself moves too).
+    pub(crate) fn read_states(&self, session_id: u32, hit: PrefixTierHit) -> Vec<u64> {
+        self.tiers[hit.tier]
+            .entries
+            .get(&session_id)
+            .map(|entry| {
+                entry
+                    .states()
+                    .filter(|&at| at < u64::from(hit.tokens))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// What a read of `hit` moves, in tier tokens: the KV past
+    /// `resident_tokens` (what HBM still holds), the state at the hit and
+    /// every state of the entry before it.
+    pub(crate) fn read_charge(
+        &self,
+        session_id: u32,
+        hit: PrefixTierHit,
+        resident_tokens: u32,
+    ) -> u64 {
+        let states = 1 + self.read_states(session_id, hit).len();
+        u64::from(hit.tokens.saturating_sub(resident_tokens)) + states as u64 * self.state_tokens
+    }
+
+    /// Queue a read of `hit` behind the tier's earlier reads; returns when it
+    /// lands and the states it moves below the hit ([`Self::read_charge`]).
+    /// The entry stays (the tiers are inclusive), or an exclusive tier
+    /// releases it whole; every faster write-through tier receives a copy,
     /// since the read passes through it. A faster victim tier receives it
     /// only when the tier above it evicts it.
     pub(crate) fn load(
@@ -652,20 +532,18 @@ impl PrefixTiers {
         hit: PrefixTierHit,
         resident_tokens: u32,
         now: Time,
-    ) -> Time {
+    ) -> (Time, Vec<u64>) {
+        let states = self.read_states(session_id, hit);
+        let charge = self.read_charge(session_id, hit, resident_tokens);
         let state_tokens = self.state_tokens;
         let tier = &mut self.tiers[hit.tier];
-        let charge = tier.charge(
-            u64::from(hit.tokens.saturating_sub(resident_tokens)),
-            1,
-            state_tokens,
-        );
         let start = tier.channel_free.max(now);
         let ready =
             start + Time::from_s(charge as f64 * tier.bytes_per_token / tier.read_bytes_per_s);
         tier.channel_free = ready;
         tier.counters.loads += 1;
         tier.counters.loaded_tokens += u64::from(hit.tokens.saturating_sub(resident_tokens));
+        tier.counters.loaded_states += 1 + states.len() as u64;
         tier.touch(session_id);
         tier.log(
             PrefixTierEventKind::Read,
@@ -676,26 +554,26 @@ impl PrefixTiers {
         );
         if self.tiers[hit.tier].spec.writes == PrefixTierWrites::FasterTierEvictionsMoved {
             let tier = &mut self.tiers[hit.tier];
+            // The read moved the context and its states into HBM.
             let entry = tier.remove(session_id, state_tokens).expect("a hit has an entry");
             tier.counters.released_entries += 1;
             tier.log(PrefixTierEventKind::Release, session_id, entry.tokens, entry.tokens, 0);
-            let left = entry
-                .earlier
-                .into_iter()
-                .map(|at| Leaving::state(session_id, at))
-                .collect();
-            self.pass_down(hit.tier, left);
         }
         for faster in 0..hit.tier {
             if self.tiers[faster].spec.writes == PrefixTierWrites::EveryContext {
                 // The copy is a prefix of the session's latest context, as is
-                // the faster tier's own entry: its states below it stay.
+                // the faster tier's own entry: the latest states of both stay.
                 let tokens = u64::from(hit.tokens);
-                let earlier = self.earlier_for(faster, session_id, tokens.saturating_sub(1), None);
+                let earlier = self.earlier_for(
+                    faster,
+                    session_id,
+                    tokens.saturating_sub(1),
+                    states.iter().copied(),
+                );
                 self.store_in(faster, session_id, tokens, earlier);
             }
         }
-        ready
+        (ready, states)
     }
 
     /// How long a read queued on `tier` now would wait for its channel.
@@ -708,8 +586,8 @@ impl PrefixTiers {
     pub(crate) fn seed(&mut self, session_id: u32, tokens: u64) {
         let state_tokens = self.state_tokens;
         if let Some(tier) = self.tiers.last_mut() {
-            // The slowest tier has no victim tier behind it.
-            let _ = tier.store(session_id, tokens, Vec::new(), state_tokens, false);
+            // The slowest tier has no tier behind it.
+            let _ = tier.store(session_id, tokens, Vec::new(), state_tokens);
         }
     }
 
@@ -752,54 +630,23 @@ impl PrefixTiers {
     /// that one is its victim tier.
     fn store_in(&mut self, tier: usize, session_id: u32, tokens: u64, earlier: Vec<u64>) {
         let state_tokens = self.state_tokens;
-        let demotes = self.demotes(tier);
-        let left = self.tiers[tier].store(session_id, tokens, earlier, state_tokens, demotes);
+        let left = self.tiers[tier].store(session_id, tokens, earlier, state_tokens);
         self.pass_down(tier, left);
-    }
-
-    /// Whether what leaves `tier` goes to a victim tier behind it.
-    fn demotes(&self, tier: usize) -> bool {
-        self.tiers
-            .get(tier + 1)
-            .is_some_and(|behind| behind.spec.writes.is_victim())
     }
 
     /// Hand what left `tier` to the tier behind it, if that is its victim tier.
     fn pass_down(&mut self, tier: usize, left: Vec<Leaving>) {
         for leaving in left {
-            if leaving.state_only {
-                self.take_victim_state(tier + 1, leaving.session_id, leaving.tokens);
-            } else {
-                self.take_victim(tier + 1, leaving.session_id, leaving.tokens, &leaving.earlier);
-            }
+            self.take_victim(tier + 1, leaving.session_id, leaving.tokens, &leaving.earlier);
         }
-    }
-
-    /// The tier above `tier` dropped the session's earlier state at `at` and
-    /// keeps the context: if `tier` is its victim tier and holds the KV up to
-    /// it, keep the state there (a victim tier holds no KV the tier above
-    /// already has, so a state without its KV goes).
-    fn take_victim_state(&mut self, tier: usize, session_id: u32, at: u64) {
-        let state_tokens = self.state_tokens;
-        let max_earlier = self.max_states - 1;
-        let demotes = self.demotes(tier);
-        let Some(state) = self
-            .tiers
-            .get_mut(tier)
-            .filter(|state| state.spec.writes.is_victim())
-        else {
-            return;
-        };
-        let left = state.add_earlier_state(session_id, at, max_earlier, state_tokens, demotes);
-        self.pass_down(tier, left);
     }
 
     /// The tier above `tier` let go of the session's `tokens`-token context
     /// (with its state at the end and its `earlier` states): if `tier` is its
     /// victim tier, write what its entry lacks, or only refresh an entry that
     /// already holds it all. Both are prefixes of the session's latest
-    /// context (a victim entry is cut at each round's admission), so their
-    /// states merge.
+    /// context (a victim entry is cut at each round's admission), so they
+    /// merge into the longer context with the latest `k` states of both.
     fn take_victim(&mut self, tier: usize, session_id: u32, tokens: u64, earlier: &[u64]) {
         let Some(state) = self
             .tiers
@@ -826,18 +673,11 @@ impl PrefixTiers {
             .is_some_and(|tier| tier.spec.writes.is_victim())
     }
 
-    /// HBM evicted the session's `tokens`-token context, or could not keep it:
-    /// a victim fastest tier writes what its entry lacks, or only refreshes an
-    /// entry that already holds it all.
-    pub(crate) fn store_evicted(&mut self, session_id: u32, tokens: u64) {
-        self.take_victim(0, session_id, tokens, &[]);
-    }
-
-    /// HBM dropped the session's earlier round-end state at `at` and keeps
-    /// the context: a victim fastest tier keeps the state beside the KV it
-    /// holds up to it, if any.
-    pub(crate) fn store_evicted_state(&mut self, session_id: u32, at: u64) {
-        self.take_victim_state(0, session_id, at);
+    /// HBM evicted the session's `tokens`-token context with its `earlier`
+    /// states, or could not keep it: a victim fastest tier writes what its
+    /// entry lacks, or only refreshes an entry that already holds it all.
+    pub(crate) fn store_evicted(&mut self, session_id: u32, tokens: u64, earlier: &[u64]) {
+        self.take_victim(0, session_id, tokens, earlier);
     }
 
     /// The time the next writes are counted at, per [`WRITE_WINDOW`].
@@ -1030,12 +870,12 @@ mod tests {
         t.store(3, 400_000); // DRAM holds 2 and 3; SSD holds all three.
         let hit = t.lookup(1, 400_000).unwrap();
         assert_eq!(hit.tier, 1);
-        let first = t.load(1, hit, 0, Time::ZERO);
+        let first = t.load(1, hit, 0, Time::ZERO).0;
         assert_eq!(first, Time::from_ms(400.0));
         // A second SSD read waits for the first.
         t.store(4, 400_000);
         t.store(5, 400_000);
-        let second = t.load(2, t.lookup(2, 400_000).unwrap(), 0, Time::from_ms(100.0));
+        let second = t.load(2, t.lookup(2, 400_000).unwrap(), 0, Time::from_ms(100.0)).0;
         assert_eq!(second, Time::from_ms(800.0));
         // The read put session 1 back in DRAM.
         assert_eq!(t.counters(1).loads, 2);
@@ -1065,7 +905,7 @@ mod tests {
         );
         t.store(1, 100_000);
         assert_eq!(t.used_tokens(0), 150_000);
-        let ready = t.load(1, t.lookup(1, 100_000).unwrap(), 0, Time::ZERO);
+        let ready = t.load(1, t.lookup(1, 100_000).unwrap(), 0, Time::ZERO).0;
         assert_eq!(ready, Time::from_ms(150.0));
     }
 
@@ -1074,7 +914,7 @@ mod tests {
         let mut t = tiers(1.0, 10.0);
         t.store(1, 400_000);
         // HBM still holds 300k: 100k cross the 10 GB/s DRAM link.
-        let ready = t.load(1, t.lookup(1, 400_000).unwrap(), 300_000, Time::ZERO);
+        let ready = t.load(1, t.lookup(1, 400_000).unwrap(), 300_000, Time::ZERO).0;
         assert_eq!(ready, Time::from_ms(10.0));
         assert_eq!(t.counters(0).loaded_tokens, 100_000);
     }
@@ -1106,7 +946,7 @@ mod tests {
         // A finished context reaches the write-through SSD, not DRAM.
         assert_eq!(t.counters(0).stored_entries, 0);
         assert_eq!(t.lookup(1, 400_000).unwrap().tier, 1);
-        t.store_evicted(1, 400_000);
+        t.store_evicted(1, 400_000, &[]);
         assert_eq!(
             t.lookup(1, 400_000),
             Some(PrefixTierHit {
@@ -1120,15 +960,15 @@ mod tests {
     #[test]
     fn a_victim_tier_writes_only_what_its_entry_lacks() {
         let mut t = victim_tiers(1.0, 10.0);
-        t.store_evicted(1, 400_000);
+        t.store_evicted(1, 400_000, &[]);
         // The next round extends the entry; HBM then evicts the longer context.
         t.drop_stale(1, 400_001);
-        t.store_evicted(1, 500_000);
+        t.store_evicted(1, 500_000, &[]);
         assert_eq!(t.counters(0).written_tokens, 500_000);
         assert_eq!(t.used_tokens(0), 500_000);
         // An eviction of what the entry already holds writes nothing.
         let entries = t.counters(0).stored_entries;
-        t.store_evicted(1, 500_000);
+        t.store_evicted(1, 500_000, &[]);
         assert_eq!(t.counters(0).stored_entries, entries);
         assert_eq!(t.counters(0).written_tokens, 500_000);
     }
@@ -1136,14 +976,14 @@ mod tests {
     #[test]
     fn a_read_back_keeps_the_victim_entry_and_refreshes_it() {
         let mut t = victim_tiers(1.0, 10.0);
-        t.store_evicted(1, 400_000);
-        t.store_evicted(2, 400_000);
+        t.store_evicted(1, 400_000, &[]);
+        t.store_evicted(2, 400_000, &[]);
         // Reading 1 back into HBM keeps its DRAM copy and makes 2 the LRU.
         t.load(1, t.lookup(1, 400_000).unwrap(), 0, Time::ZERO);
         assert_eq!(t.lookup(1, 400_000).unwrap().tier, 0);
         // HBM evicts 1 again unchanged: no write; then 3 pushes out 2.
-        t.store_evicted(1, 400_000);
-        t.store_evicted(3, 400_000);
+        t.store_evicted(1, 400_000, &[]);
+        t.store_evicted(3, 400_000, &[]);
         assert_eq!(t.lookup(1, 400_000).unwrap().tier, 0);
         assert_eq!(t.lookup(2, 400_000), None);
         assert_eq!(t.counters(0).written_tokens, 1_200_000);
@@ -1185,20 +1025,20 @@ mod tests {
             0,
             ResumePoint::AnyToken,
         );
-        t.store_evicted(1, 400_000);
+        t.store_evicted(1, 400_000, &[]);
         t.load(1, t.lookup(1, 400_000).unwrap(), 0, Time::ZERO);
         assert_eq!(t.used_tokens(0), 0);
         assert_eq!(t.lookup(1, 400_000), None);
         assert_eq!(t.counters(0).released_entries, 1);
         // HBM evicting it again writes it whole.
-        t.store_evicted(1, 500_000);
+        t.store_evicted(1, 500_000, &[]);
         assert_eq!(t.counters(0).written_tokens, 900_000);
     }
 
     #[test]
     fn a_round_that_does_not_extend_the_entry_cuts_it() {
         let mut t = victim_tiers(1.0, 10.0);
-        t.store_evicted(1, 600_000);
+        t.store_evicted(1, 600_000, &[]);
         // The next round shares only 300k tokens with the entry.
         t.drop_stale(1, 300_000);
         assert_eq!(t.used_tokens(0), 300_000);
@@ -1215,7 +1055,7 @@ mod tests {
             50_000,
             ResumePoint::ContextEnd,
         );
-        t.store_evicted(1, 100_000);
+        t.store_evicted(1, 100_000, &[]);
         t.drop_stale(1, 100_001);
         assert_eq!(t.used_tokens(0), 150_000);
         t.drop_stale(1, 99_000);
@@ -1259,9 +1099,45 @@ mod tests {
         assert_eq!(t.lookup(1, 100_500).unwrap().tokens, 100_000);
         assert_eq!(t.lookup(1, 101_001).unwrap().tokens, 101_000);
         assert_eq!(t.lookup(1, 99_999), None);
-        // A read moves one state.
-        let ready = t.load(1, t.lookup(1, 100_500).unwrap(), 0, Time::ZERO);
-        assert_eq!(ready, Time::from_ms(150.0));
+    }
+
+    #[test]
+    fn a_read_moves_every_state_at_or_before_the_hit() {
+        let mut t = round_end_tier(10.0, PrefixTierWrites::EveryContext, 3);
+        t.store_round(1, round(100_000, 100_000, 0));
+        t.store_round(1, round(120_000, 120_000, 100_000));
+        t.store_round(1, round(150_000, 150_000, 120_000));
+        // A hit at the end moves its KV and all three states: 300k tokens
+        // at 1M tokens/s.
+        let hit = t.lookup(1, 150_001).unwrap();
+        assert_eq!(t.read_charge(1, hit, 0), 150_000 + 3 * 50_000);
+        let (ready, states) = t.load(1, hit, 0, Time::ZERO);
+        assert_eq!(ready, Time::from_ms(300.0));
+        assert_eq!(states, [100_000, 120_000]);
+        // A hit at an earlier state moves the states up to it.
+        let hit = t.lookup(1, 130_000).unwrap();
+        assert_eq!(hit.tokens, 120_000);
+        let (_, states) = t.load(1, hit, 0, Time::ZERO);
+        assert_eq!(states, [100_000]);
+        assert_eq!(t.counters(0).loaded_states, 3 + 2);
+    }
+
+    #[test]
+    fn a_full_tier_evicts_whole_entries_with_all_their_states() {
+        let mut t = round_end_tier(0.5, PrefixTierWrites::EveryContext, 2);
+        t.store_round(1, round(101_000, 100_000, 0)); // 201k
+        t.store_round(2, round(101_000, 100_000, 0)); // 201k
+        // 3 needs 151k: session 1 goes whole; no state is dropped alone.
+        t.store_round(3, round(101_000, 101_000, 0));
+        assert_eq!(t.counters(0).evicted_entries, 1);
+        assert_eq!(t.lookup(1, 101_001), None);
+        assert_eq!(t.lookup(2, 100_500).unwrap().tokens, 100_000);
+        assert_eq!(t.used_tokens(0), 201_000 + 151_000);
+        assert_eq!(t.earlier_states(0), 1);
+        // A context that does not fit with all its states is not stored.
+        t.store_round(4, round(420_000, 300_000, 0));
+        assert_eq!(t.lookup(4, 420_001), None);
+        assert_eq!(t.lookup(2, 100_500).unwrap().tokens, 100_000);
     }
 
     #[test]
@@ -1285,68 +1161,20 @@ mod tests {
     }
 
     #[test]
-    fn a_tier_drops_earlier_states_before_any_context() {
-        let mut t = round_end_tier(0.5, PrefixTierWrites::EveryContext, 2);
-        t.store_round(1, round(101_000, 100_000, 0)); // 201k
-        t.store_round(2, round(101_000, 100_000, 0)); // 201k
-        // 3 needs 151k: 1's and then 2's earlier state go, no context.
-        t.store_round(3, round(101_000, 101_000, 0));
-        assert_eq!(t.counters(0).evicted_entries, 0);
-        assert_eq!(t.counters(0).earlier_state_drops, 2);
-        assert_eq!(t.lookup(1, 101_001).unwrap().tokens, 101_000);
-        assert_eq!(t.lookup(1, 100_500), None);
-        t.store_round(4, round(101_000, 101_000, 0));
-        assert_eq!(t.counters(0).evicted_entries, 1);
-        assert_eq!(t.lookup(1, 101_001), None);
-    }
-
-    #[test]
     fn a_victim_tier_merges_states_and_cuts_at_one() {
         let mut t = round_end_tier(10.0, PrefixTierWrites::FasterTierEvictions, 3);
-        t.store_evicted(1, 100_000);
+        t.store_evicted(1, 100_000, &[]);
         t.drop_stale(1, 100_001);
-        t.store_evicted(1, 120_000);
+        t.store_evicted(1, 120_000, &[]);
         assert_eq!(t.used_tokens(0), 120_000 + 2 * 50_000);
         assert_eq!(t.counters(0).written_states, 2);
         // An eviction of a state it holds writes nothing.
-        t.store_evicted(1, 100_000);
+        t.store_evicted(1, 100_000, &[]);
         assert_eq!(t.counters(0).written_states, 2);
         // A round ending inside the context cuts the entry at 100k.
         t.drop_stale(1, 110_000);
         assert_eq!(t.used_tokens(0), 100_000 + 50_000);
         assert_eq!(t.lookup(1, 110_000).unwrap().tokens, 100_000);
-    }
-
-    #[test]
-    fn a_victim_tier_keeps_a_dropped_state_only_beside_its_own_kv() {
-        let mut t = round_end_tier(0.5, PrefixTierWrites::FasterTierEvictions, 3);
-        // No KV of the session below: the state goes.
-        t.store_evicted_state(1, 50_000);
-        assert_eq!(t.used_tokens(0), 0);
-        t.store_evicted(1, 100_000);
-        t.store_evicted_state(1, 50_000);
-        assert_eq!(t.lookup(1, 60_000).unwrap().tokens, 50_000);
-        assert_eq!(t.used_tokens(0), 100_000 + 2 * 50_000);
-        assert_eq!(t.counters(0).written_states, 2);
-        // A state past its KV, or one it holds, adds nothing.
-        t.store_evicted_state(1, 120_000);
-        t.store_evicted_state(1, 50_000);
-        assert_eq!(t.counters(0).written_states, 2);
-        // Room comes only from other entries' earlier states, never contexts.
-        t.store_evicted(2, 250_000); // 300k: full (500k)
-        t.store_evicted_state(2, 40_000);
-        assert_eq!(t.lookup(2, 45_000).unwrap().tokens, 40_000);
-        assert_eq!(t.lookup(1, 60_000), None, "1's earlier state gave way");
-        assert_eq!(t.lookup(1, 100_001).unwrap().tokens, 100_000);
-        // 1's next state takes the room of 2's; a further one finds none
-        // without evicting a context.
-        t.store_evicted_state(1, 60_000);
-        assert_eq!(t.lookup(2, 45_000), None);
-        assert_eq!(t.lookup(1, 65_000).unwrap().tokens, 60_000);
-        t.store_evicted_state(1, 70_000);
-        assert_eq!(t.lookup(1, 75_000).unwrap().tokens, 60_000);
-        assert_eq!(t.counters(0).evicted_entries, 0);
-        assert_eq!(t.used_tokens(0), 500_000);
     }
 
     /// HBM -> DRAM -> SSD victim chain (1000 B/token, a state 50k tokens),
@@ -1368,50 +1196,110 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_keeps_the_states_at_or_before_it() {
+        let mut t = round_end_tier(10.0, PrefixTierWrites::FasterTierEvictions, 3);
+        t.store_evicted(1, 150_000, &[100_000, 120_000]);
+        assert_eq!(t.used_tokens(0), 150_000 + 3 * 50_000);
+        // The next round shares 130k: the entry is cut at 120k, keeping 100k.
+        t.drop_stale(1, 130_000);
+        assert_eq!(t.used_tokens(0), 120_000 + 2 * 50_000);
+        assert_eq!(t.lookup(1, 125_000).unwrap().tokens, 120_000);
+        assert_eq!(t.lookup(1, 110_000).unwrap().tokens, 100_000);
+    }
+
+    #[test]
+    fn a_victim_merge_keeps_the_longer_context_and_the_latest_k_states() {
+        let mut t = round_end_tier(10.0, PrefixTierWrites::FasterTierEvictions, 3);
+        t.store_evicted(1, 120_000, &[100_000]);
+        // HBM evicts a longer context of the session with its own states.
+        t.store_evicted(1, 160_000, &[130_000, 150_000]);
+        assert_eq!(t.used_tokens(0), 160_000 + 3 * 50_000);
+        assert_eq!(t.lookup(1, 140_000).unwrap().tokens, 130_000);
+        assert_eq!(t.lookup(1, 125_000), None, "120k is older than the latest 3");
+        assert_eq!(t.counters(0).written_states, 2 + 3);
+        // A shorter context with an older state merges into the longer one.
+        let mut t = round_end_tier(10.0, PrefixTierWrites::FasterTierEvictions, 3);
+        t.store_evicted(1, 200_000, &[150_000]);
+        t.store_evicted(1, 120_000, &[100_000]);
+        assert_eq!(t.lookup(1, 200_001).unwrap().tokens, 200_000);
+        assert_eq!(t.lookup(1, 140_000).unwrap().tokens, 120_000);
+        assert_eq!(t.lookup(1, 110_000), None);
+        assert_eq!(t.used_tokens(0), 200_000 + 3 * 50_000);
+    }
+
+    #[test]
+    fn an_exclusive_tier_moves_an_entry_and_its_states_into_hbm() {
+        let spec = |name, writes| PrefixTierSpec {
+            name,
+            capacity_gb_per_gpu: 10.0,
+            read_gb_per_s_per_gpu: 1.0,
+            writes,
+        };
+        let mut t = PrefixTiers::new(
+            &[
+                spec("dram", PrefixTierWrites::FasterTierEvictionsMoved),
+                spec("ssd", PrefixTierWrites::FasterTierEvictions),
+            ],
+            1000,
+            50_000,
+            ResumePoint::ContextEnd,
+        )
+        .with_round_end_states(3);
+        t.store_evicted(1, 150_000, &[100_000, 120_000]);
+        let (_, states) = t.load(1, t.lookup(1, 150_001).unwrap(), 0, Time::ZERO);
+        // The states went to HBM with the context: none is left behind or
+        // handed down to SSD.
+        assert_eq!(states, [100_000, 120_000]);
+        assert_eq!(t.used_tokens(0), 0);
+        assert_eq!(t.used_tokens(1), 0);
+        assert_eq!(t.counters(1).stored_entries, 0);
+        // HBM evicting it again writes it whole, all its states included.
+        t.store_evicted(1, 170_000, &[120_000, 150_000]);
+        assert_eq!(t.used_tokens(0), 170_000 + 3 * 50_000);
+        assert_eq!(t.counters(0).written_states, 3 + 3);
+    }
+
+    #[test]
     fn a_victim_chain_demotes_states_with_their_kv() {
         let mut t = round_end_chain(0.5, 10.0, 4);
-        // HBM evicts session 1's context; earlier states HBM drops alone later
-        // are kept beside it, since DRAM holds the KV up to them.
-        t.store_evicted(1, 200_000);
-        t.store_evicted_state(1, 100_000);
-        t.store_evicted_state(1, 150_000);
+        t.store_evicted(1, 200_000, &[100_000, 150_000]);
         assert_eq!(t.used_tokens(0), 200_000 + 3 * 50_000);
         assert_eq!(t.lookup(1, 160_000).unwrap(), PrefixTierHit { tier: 0, tokens: 150_000 });
-        // DRAM needs room for session 2: with SSD behind it, it drops no state
-        // alone but demotes 1 whole, its states with its KV.
-        t.store_evicted(2, 150_000);
-        assert_eq!(t.counters(0).earlier_state_drops, 0);
+        // DRAM needs room for session 2: it demotes 1 whole, its states with
+        // its KV.
+        t.store_evicted(2, 150_000, &[]);
         assert_eq!(t.counters(0).evicted_entries, 1);
         assert_eq!(t.lookup(1, 160_000).unwrap(), PrefixTierHit { tier: 1, tokens: 150_000 });
         assert_eq!(t.lookup(1, 120_000).unwrap().tokens, 100_000);
         assert_eq!(t.used_tokens(1), 200_000 + 3 * 50_000);
         assert_eq!(t.counters(1).written_tokens, 200_000);
         assert_eq!(t.counters(1).written_states, 3);
-        // Session 1 resumes at 150k from SSD and extends to 250k; HBM later
-        // evicts that context alone. DRAM holds none of 1, so it writes the
-        // whole context (DRAM and SSD are exclusive only as they are written).
-        t.load(1, t.lookup(1, 160_000).unwrap(), 0, Time::ZERO);
+        // Session 1 resumes at 150k from SSD (the read moves 100k and 150k)
+        // and extends to 250k, which HBM later evicts into DRAM, pushing 2
+        // down to SSD.
+        let (_, states) = t.load(1, t.lookup(1, 160_000).unwrap(), 0, Time::ZERO);
+        assert_eq!(states, [100_000]);
         t.drop_stale(1, 160_000);
         assert_eq!(t.used_tokens(1), 150_000 + 2 * 50_000);
-        t.store_evicted(1, 250_000);
+        t.store_evicted(1, 250_000, &[100_000, 150_000]);
         assert_eq!(t.lookup(1, 250_000).unwrap(), PrefixTierHit { tier: 0, tokens: 250_000 });
-        // DRAM demotes 2 and then 1: SSD merges 1, writing only the 100k
-        // tokens it lacks and the new end state, and keeps its own states.
-        t.store_evicted(3, 300_000);
-        assert_eq!(t.counters(0).evicted_entries, 3);
+        // DRAM demotes 1: SSD merges it, writing only the 100k tokens and the
+        // one state it lacks.
+        t.store_evicted(3, 300_000, &[]);
         assert_eq!(t.counters(1).written_tokens, 200_000 + 150_000 + 100_000);
+        assert_eq!(t.counters(1).written_states, 3 + 1 + 1);
         assert_eq!(t.lookup(1, 250_000).unwrap(), PrefixTierHit { tier: 1, tokens: 250_000 });
         assert_eq!(t.lookup(1, 200_000).unwrap().tokens, 150_000);
         assert_eq!(t.lookup(1, 140_000).unwrap().tokens, 100_000);
-        // The last tier still drops earlier states before any context.
+        // The last tier also evicts whole entries.
         let mut t = round_end_chain(0.3, 0.5, 4);
-        t.store_evicted(1, 150_000);
-        t.store_evicted_state(1, 100_000);
-        t.store_evicted(2, 150_000); // DRAM demotes 1 whole to SSD (250k)
-        t.store_evicted(3, 150_000); // and 2 (200k): SSD full at 450k
-        t.store_evicted(4, 150_000); // 3 to SSD: 1's earlier state goes first
-        assert_eq!(t.counters(1).earlier_state_drops, 1);
+        t.store_evicted(1, 150_000, &[100_000]); // 250k
+        t.store_evicted(2, 150_000, &[]); // DRAM demotes 1 whole to SSD (250k)
+        t.store_evicted(3, 150_000, &[]); // and 2 (200k): SSD holds 450k
+        t.store_evicted(4, 150_000, &[]); // 3 to SSD: 1 goes whole
         assert_eq!(t.counters(1).evicted_entries, 1);
+        assert_eq!(t.lookup(1, 150_001), None);
+        assert_eq!(t.earlier_states(1), 0);
     }
 
     use PrefixTierWrites::{EveryContext, FasterTierEvictions};
@@ -1427,11 +1315,11 @@ mod tests {
         // A finished context stays in HBM: neither tier is written.
         t.store(1, 400_000);
         assert_eq!(t.lookup(1, 400_000), None);
-        t.store_evicted(1, 400_000);
-        t.store_evicted(2, 400_000);
+        t.store_evicted(1, 400_000, &[]);
+        t.store_evicted(2, 400_000, &[]);
         assert_eq!(t.counters(1).stored_entries, 0);
         // A third eviction from HBM pushes session 1 out of DRAM into SSD.
-        t.store_evicted(3, 400_000);
+        t.store_evicted(3, 400_000, &[]);
         assert_eq!(
             t.lookup(1, 400_000),
             Some(PrefixTierHit {
@@ -1447,10 +1335,10 @@ mod tests {
     #[test]
     fn an_ssd_read_keeps_the_ssd_copy_and_skips_a_victim_dram() {
         let mut t = chain(1.0, 10.0);
-        t.store_evicted(1, 400_000);
-        t.store_evicted(2, 400_000);
-        t.store_evicted(3, 400_000); // 1 goes to SSD
-        t.store_evicted(4, 400_000); // 2 goes to SSD; SSD's LRU: 1, 2
+        t.store_evicted(1, 400_000, &[]);
+        t.store_evicted(2, 400_000, &[]);
+        t.store_evicted(3, 400_000, &[]); // 1 goes to SSD
+        t.store_evicted(4, 400_000, &[]); // 2 goes to SSD; SSD's LRU: 1, 2
         t.load(1, t.lookup(1, 400_000).unwrap(), 0, Time::ZERO);
         // The read neither copies 1 into DRAM nor drops SSD's copy, and it
         // refreshes 1 in SSD's order.
@@ -1458,12 +1346,12 @@ mod tests {
         assert_eq!(t.lookup(1, 400_000).unwrap().tier, 1);
         assert_eq!(t.tiers[1].lru.values().copied().collect::<Vec<_>>(), [2, 1]);
         // HBM evicts 1 unchanged: it lands in DRAM and pushes 3 down to SSD.
-        t.store_evicted(1, 400_000);
+        t.store_evicted(1, 400_000, &[]);
         assert_eq!(t.lookup(1, 400_000).unwrap().tier, 0);
         let ssd = t.counters(1);
         // DRAM later evicts 1, which SSD holds whole: SSD is only refreshed.
-        t.store_evicted(5, 400_000); // pushes out 4
-        t.store_evicted(6, 400_000); // pushes out 1
+        t.store_evicted(5, 400_000, &[]); // pushes out 4
+        t.store_evicted(6, 400_000, &[]); // pushes out 1
         assert_eq!(t.counters(1).stored_entries, ssd.stored_entries + 1);
         assert_eq!(t.counters(1).written_tokens, ssd.written_tokens + 400_000);
         assert_eq!(t.lookup(1, 400_000).unwrap().tier, 1);
@@ -1473,14 +1361,14 @@ mod tests {
     #[test]
     fn dram_evicting_a_longer_context_writes_ssd_only_what_it_lacks() {
         let mut t = chain(1.0, 10.0);
-        t.store_evicted(1, 400_000);
-        t.store_evicted(2, 400_000);
-        t.store_evicted(3, 400_000); // 1 goes to SSD at 400k
+        t.store_evicted(1, 400_000, &[]);
+        t.store_evicted(2, 400_000, &[]);
+        t.store_evicted(3, 400_000, &[]); // 1 goes to SSD at 400k
                                      // Session 1's next round extends it; HBM later evicts 500k.
         t.drop_stale(1, 400_001);
-        t.store_evicted(1, 500_000); // pushes 2 down
-        t.store_evicted(4, 400_000); // pushes 3 down
-        t.store_evicted(5, 400_000); // pushes 1 down: SSD adds its 100k new tokens
+        t.store_evicted(1, 500_000, &[]); // pushes 2 down
+        t.store_evicted(4, 400_000, &[]); // pushes 3 down
+        t.store_evicted(5, 400_000, &[]); // pushes 1 down: SSD adds its 100k new tokens
         assert_eq!(t.counters(1).written_tokens, 400_000 * 3 + 100_000);
         assert_eq!(
             t.lookup(1, 500_000).unwrap(),
@@ -1494,9 +1382,9 @@ mod tests {
     #[test]
     fn a_round_that_shares_less_cuts_every_victim_tier() {
         let mut t = chain(1.0, 10.0);
-        t.store_evicted(1, 600_000);
-        t.store_evicted(2, 600_000); // 1 goes to SSD at 600k
-        t.store_evicted(1, 700_000); // HBM evicts a longer context into DRAM
+        t.store_evicted(1, 600_000, &[]);
+        t.store_evicted(2, 600_000, &[]); // 1 goes to SSD at 600k
+        t.store_evicted(1, 700_000, &[]); // HBM evicts a longer context into DRAM
         t.drop_stale(1, 300_000);
         assert_eq!(t.lookup(1, 700_000).unwrap().tokens, 300_000);
         assert_eq!(t.tiers[1].entries[&1].tokens, 300_000);
@@ -1533,10 +1421,10 @@ mod tests {
     #[test]
     fn writes_are_counted_per_window_of_the_clock() {
         let mut t = chain(1.0, 10.0);
-        t.store_evicted(1, 400_000);
+        t.store_evicted(1, 400_000, &[]);
         t.set_clock(Time::from_ms(25_000.0));
-        t.store_evicted(2, 400_000);
-        t.store_evicted(3, 300_000); // pushes 1 down to SSD
+        t.store_evicted(2, 400_000, &[]);
+        t.store_evicted(3, 300_000, &[]); // pushes 1 down to SSD
         assert_eq!(t.window_writes(0), [(1, 400_000), (0, 0), (2, 700_000)]);
         assert_eq!(t.window_writes(1), [(0, 0), (0, 0), (1, 400_000)]);
     }
@@ -1546,9 +1434,9 @@ mod tests {
         use PrefixTierEventKind::*;
         let mut t = chain(1.0, 10.0);
         t.record_events();
-        t.store_evicted(1, 400_000);
-        t.store_evicted(2, 400_000);
-        t.store_evicted(3, 400_000); // 1 goes to SSD
+        t.store_evicted(1, 400_000, &[]);
+        t.store_evicted(2, 400_000, &[]);
+        t.store_evicted(3, 400_000, &[]); // 1 goes to SSD
         t.load(1, t.lookup(1, 400_000).unwrap(), 100, Time::ZERO);
         t.drop_stale(1, 300_000);
         let kinds = |events: Vec<PrefixTierEvent>| {
