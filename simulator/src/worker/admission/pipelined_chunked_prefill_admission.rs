@@ -315,6 +315,9 @@ where
             prefix_fetch: &mut self.prefix_fetch,
             overdue: &mut self.overdue,
         };
+        if !overdue_only {
+            queues.stage_loads(kv_store, now);
+        }
         while remaining_budget > 0 {
             let Some((source, candidate)) = queues.peek(kv_store, overdue_only) else {
                 break;

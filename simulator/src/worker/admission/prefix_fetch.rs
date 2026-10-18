@@ -28,6 +28,21 @@
 //! of. A session request's admission cuts each victim entry to what it shares
 //! with it.
 //!
+//! With a loading area ([`PrefixFetch::with_loading_area`], not vLLM), loads
+//! are staged instead: pending -> loading -> ready -> batch. Before each
+//! admission pass, the pending queues are walked in admission order and every
+//! request whose context a tier holds beyond HBM starts its read while the
+//! loading area has room; requests needing no read stay where they are. A DRAM
+//! read lands in HBM's loading area (a fixed fraction of HBM that admission
+//! and the retained-prefix tier never use); an SSD read lands in DRAM's
+//! loading area (the same fraction carved out of the DRAM tier) and moves on
+//! to HBM's when that has room. A read holds its area until its request is
+//! admitted. Admission takes only ready requests: landed ones, then those
+//! HBM already holds; a request still needing a read is passed over. The two
+//! loading queues stop at the first read that does not fit their area (a read
+//! larger than the whole area starts when the area is empty), so loads keep
+//! the admission order and never wait on compute admission.
+//!
 //! One tier set per KV partition (a pipeline head's one, or each attention DP
 //! rank's). `prefix_tiers_<tag>.csv` records, per admitted session request,
 //! where its declared prefix was found; `prefix_tiers_<tag>.json` the totals.
@@ -332,11 +347,55 @@ struct Admitted {
     at: Time,
 }
 
+/// Where a staged read is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Into HBM's loading area (unstaged reads too).
+    Hbm,
+    /// From SSD into DRAM's loading area.
+    Ssd,
+    /// From DRAM's loading area on to HBM's.
+    Hop,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Fetch {
     candidate: AdmissionCandidate,
     partition: u16,
     read: Read,
+    phase: Phase,
+    /// Tokens (KV and its state) the read holds in each loading area.
+    charge: u64,
+}
+
+/// Loading areas of the staged mode, per partition, in tier tokens.
+struct Staged {
+    hbm_area: Vec<u64>,
+    hbm_used: Vec<u64>,
+    dram_area: Vec<u64>,
+    dram_used: Vec<u64>,
+    /// SSD reads landed in DRAM's area, waiting for room in HBM's.
+    waiting_hop: Vec<VecDeque<RequestId>>,
+}
+
+/// Whether a read of `charge` may start in an area holding `used` of `area`:
+/// it fits, or the area is empty (a read larger than the whole area).
+fn area_fits(used: u64, area: u64, charge: u64) -> bool {
+    used == 0 || used + charge <= area
+}
+
+/// Which loading queues stopped this pass (staged mode).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LoadGate {
+    hbm_full: bool,
+    dram_full: bool,
+}
+
+impl LoadGate {
+    /// Both queues stopped: nothing more can start this pass.
+    pub(crate) fn closed(&self) -> bool {
+        self.hbm_full && self.dram_full
+    }
 }
 
 /// What admission does with the request at its queue's head.
@@ -383,6 +442,8 @@ pub(crate) struct PrefixFetch {
     cancelled: Vec<RequestId>,
     /// What the KV store's HBM prefix cache let go of, for a victim tier.
     hbm_evictions: Option<HbmEvictionLog>,
+    /// Staged loading ([`Self::with_loading_area`]).
+    staged: Option<Staged>,
 }
 
 impl PrefixFetch {
@@ -404,6 +465,155 @@ impl PrefixFetch {
             restored: HashMap::new(),
             cancelled: Vec::new(),
             hbm_evictions: None,
+            staged: None,
+        }
+    }
+
+    /// Stage loads through loading areas (module docs): `hbm_area` tokens of
+    /// each partition's HBM, and `fraction` of a DRAM tier with an SSD tier
+    /// behind it. The KV store must keep `hbm_area` free
+    /// ([`PrefixKv::set_loading_area`]).
+    pub(crate) fn with_loading_area(mut self, hbm_area: u64, fraction: f64) -> Self {
+        let n = self.partitions.len();
+        let dram_area = self
+            .partitions
+            .iter_mut()
+            .map(|p| {
+                if p.tiers.len() == 2 {
+                    p.tiers.carve_loading_area(0, fraction)
+                } else {
+                    0
+                }
+            })
+            .collect();
+        self.staged = Some(Staged {
+            hbm_area: vec![hbm_area; n],
+            hbm_used: vec![0; n],
+            dram_area,
+            dram_used: vec![0; n],
+            waiting_hop: vec![VecDeque::new(); n],
+        });
+        self
+    }
+
+    pub(crate) fn is_staged(&self) -> bool {
+        self.staged.is_some()
+    }
+
+    /// Staged mode: start the read of a pending request whose context a tier
+    /// holds beyond HBM, if its loading queue has not stopped and its area has
+    /// room; true when it started (the request leaves its queue). A request
+    /// needing no read, or whose queue stopped, stays.
+    pub(crate) fn stage<K: PrefixKv>(
+        &mut self,
+        kv_store: &mut K,
+        partition: u16,
+        candidate: AdmissionCandidate,
+        gate: &mut LoadGate,
+        now: Time,
+    ) -> bool {
+        self.set_clock(now);
+        self.take_hbm_evictions();
+        let SessionInput::Session {
+            session_id,
+            declared_prefix_tokens,
+            ..
+        } = candidate.session_input
+        else {
+            return false;
+        };
+        let p = usize::from(partition);
+        let hbm_tokens = kv_store
+            .preview_prefill_context(
+                partition,
+                candidate.fresh_prompt_tokens,
+                candidate.session_input,
+            )
+            .resident_prefix_tokens();
+        let tiers = &mut self.partitions[p];
+        let Some((hit, seeded)) = tiers
+            .lookup(session_id, declared_prefix_tokens, self.warm_start)
+            .filter(|(hit, _)| hit.tokens > hbm_tokens)
+        else {
+            return false;
+        };
+        let charge = u64::from(hit.tokens - hbm_tokens) + tiers.tiers.state_tokens();
+        let staged = self.staged.as_mut().expect("staged mode");
+        let through_dram = staged.dram_area[p] > 0 && hit.tier == 1;
+        let phase = if through_dram {
+            if gate.dram_full || !area_fits(staged.dram_used[p], staged.dram_area[p], charge) {
+                gate.dram_full = true;
+                return false;
+            }
+            staged.dram_used[p] += charge;
+            Phase::Ssd
+        } else {
+            if gate.hbm_full || !area_fits(staged.hbm_used[p], staged.hbm_area[p], charge) {
+                gate.hbm_full = true;
+                return false;
+            }
+            staged.hbm_used[p] += charge;
+            let footprint = kv_store.footprint(candidate.request_id, hit.tokens - hbm_tokens, 0);
+            kv_store.hold_for_read(candidate.request_id, partition, &footprint, now);
+            Phase::Hbm
+        };
+        self.restored.remove(&candidate.request_id);
+        let ready = tiers.read(session_id, hit, seeded, hbm_tokens, now);
+        self.reads.push(Reverse((ready, candidate.request_id)));
+        self.reading.insert(
+            candidate.request_id,
+            Fetch {
+                candidate,
+                partition,
+                read: Read {
+                    hit,
+                    hbm_tokens,
+                    started: now,
+                    ready,
+                },
+                phase,
+                charge,
+            },
+        );
+        true
+    }
+
+    /// Staged mode: move SSD reads waiting in DRAM's loading area on to HBM's,
+    /// in landing order, while it has room.
+    fn start_hops<K: PrefixKv>(&mut self, kv_store: &mut K, now: Time) {
+        let Some(staged) = self.staged.as_mut() else {
+            return;
+        };
+        for p in 0..self.partitions.len() {
+            while let Some(&request) = staged.waiting_hop[p].front() {
+                let fetch = self.reading.get_mut(&request).expect("a waiting hop is reading");
+                if !area_fits(staged.hbm_used[p], staged.hbm_area[p], fetch.charge) {
+                    break;
+                }
+                staged.waiting_hop[p].pop_front();
+                staged.hbm_used[p] += fetch.charge;
+                let tokens = fetch.read.hit.tokens - fetch.read.hbm_tokens;
+                let footprint = kv_store.footprint(request, tokens, 0);
+                kv_store.hold_for_read(request, p as u16, &footprint, now);
+                let ready = self.partitions[p].tiers.transfer(0, fetch.charge, now);
+                fetch.phase = Phase::Hop;
+                fetch.read.ready = ready;
+                self.reads.push(Reverse((ready, request)));
+            }
+        }
+    }
+
+    /// Give back what `fetch` holds in the loading areas.
+    fn release_area(&mut self, fetch: &Fetch, dram: bool, hbm: bool) {
+        let Some(staged) = self.staged.as_mut() else {
+            return;
+        };
+        let p = usize::from(fetch.partition);
+        if dram {
+            staged.dram_used[p] -= fetch.charge;
+        }
+        if hbm {
+            staged.hbm_used[p] -= fetch.charge;
         }
     }
 
@@ -507,6 +717,7 @@ impl PrefixFetch {
             // Its blocks were held since the read started: the context fills
             // them and the admission that follows takes them over.
             kv_store.release_read_hold(candidate.request_id);
+            self.release_area(&fetch, false, true);
             // The read is a prefix of the session's latest context, as HBM's
             // entry is.
             let tokens = u64::from(fetch.read.hit.tokens);
@@ -540,6 +751,14 @@ impl PrefixFetch {
         else {
             return AtHead::Admit;
         };
+        if self.staged.is_some() {
+            // Not ready: the loading pass reads it when its area has room.
+            if reread {
+                tiers.rereads += 1;
+                self.restored.remove(&candidate.request_id);
+            }
+            return AtHead::PassedOver;
+        }
         // The whole request must fit before its load starts; its blocks stay
         // held until the read lands (the pinned fork reserves every block the
         // request still needs, `_inflight_prefill_reserved_blocks`).
@@ -586,6 +805,8 @@ impl PrefixFetch {
                     started: now,
                     ready,
                 },
+                phase: Phase::Hbm,
+                charge: 0,
             },
         );
         AtHead::Read
@@ -605,13 +826,27 @@ impl PrefixFetch {
                 break;
             }
             self.reads.pop();
-            let Some(fetch) = self.reading.remove(&request) else {
+            let Some(&fetch) = self.reading.get(&request) else {
                 continue;
             };
+            if fetch.read.ready != ready {
+                continue; // a hop re-queued it at a later time
+            }
+            match fetch.phase {
+                Phase::Ssd => {
+                    let staged = self.staged.as_mut().expect("staged mode");
+                    staged.waiting_hop[usize::from(fetch.partition)].push_back(request);
+                    continue;
+                }
+                Phase::Hop => self.release_area(&fetch, true, false),
+                Phase::Hbm => {}
+            }
+            self.reading.remove(&request);
             self.landed_order[usize::from(fetch.partition)].push_back(request);
             self.landed.insert(request, fetch);
             latest = Some(ready);
         }
+        self.start_hops(kv_store, now);
         latest
     }
 
@@ -693,7 +928,21 @@ impl PrefixFetch {
             }
         }
         self.restored.remove(&request);
-        if self.landed.remove(&request).is_some() || self.reading.remove(&request).is_some() {
+        if let Some(staged) = self.staged.as_mut() {
+            for waiting in &mut staged.waiting_hop {
+                waiting.retain(|&r| r != request);
+            }
+        }
+        if let Some(fetch) = self.landed.remove(&request) {
+            self.release_area(&fetch, false, true);
+            self.cancelled.push(request);
+            out_of_queue = true;
+        } else if let Some(fetch) = self.reading.remove(&request) {
+            match fetch.phase {
+                Phase::Hbm => self.release_area(&fetch, false, true),
+                Phase::Ssd => self.release_area(&fetch, true, false),
+                Phase::Hop => self.release_area(&fetch, true, true),
+            }
             self.cancelled.push(request);
             out_of_queue = true;
         }
@@ -728,6 +977,13 @@ mod tests {
             None,
             "test",
         )
+    }
+
+    #[test]
+    fn a_read_starts_if_it_fits_its_area_or_the_area_is_empty() {
+        assert!(area_fits(0, 100, 500));
+        assert!(area_fits(40, 100, 60));
+        assert!(!area_fits(41, 100, 60));
     }
 
     #[test]

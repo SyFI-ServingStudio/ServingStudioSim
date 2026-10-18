@@ -7,12 +7,15 @@
 //! skipped-waiting queue), requests past the force-schedule bound
 //! (`overdue.rs`), then the pending order. A request passed over for its tier
 //! read wait (`prefix_fetch.rs`) leaves its source for the rest of the pass and
-//! goes back where it was afterwards.
+//! goes back where it was afterwards. In staged mode a loading pass walks the
+//! overdue and pending queues first and starts their reads
+//! ([`FreshQueues::stage_loads`]).
 
+use crate::common::Time;
 use crate::worker::kv::ChunkedPrefillKv;
 
 use super::overdue::OverdueQueue;
-use super::prefix_fetch::PrefixFetch;
+use super::prefix_fetch::{LoadGate, PrefixFetch};
 use super::{AdmissionCandidate, PendingOrderPolicy};
 
 /// Which queue [`FreshQueues::peek`] found its candidate in.
@@ -97,6 +100,41 @@ impl<P: PendingOrderPolicy> FreshQueues<'_, P> {
         }
     }
 
+    /// Staged mode: walk the overdue queue, then the pending order, in
+    /// admission order, starting the read of every request a tier holds
+    /// beyond HBM until both loading queues stop; the rest go back in order.
+    pub(super) fn stage_loads<K: ChunkedPrefillKv>(&mut self, kv_store: &mut K, now: Time) {
+        let partition = self.partition;
+        let Some(fetch) = self.prefix_fetch.as_mut().filter(|f| f.is_staged()) else {
+            return;
+        };
+        let mut gate = LoadGate::default();
+        let mut kept = Vec::new();
+        while !gate.closed() {
+            let Some(candidate) = self.overdue.as_ref().and_then(|o| o.peek(partition)) else {
+                break;
+            };
+            self.overdue.as_mut().expect("peeked").pop(partition);
+            if !fetch.stage(kv_store, partition, candidate, &mut gate, now) {
+                kept.push((FreshSource::Overdue, candidate));
+            }
+        }
+        while !gate.closed() {
+            self.policy.refresh_head(&mut |candidate| {
+                let hbm = kv_store
+                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input);
+                fetch.rank_tokens(partition, candidate.session_input, hbm)
+            });
+            let Some(candidate) = self.policy.pop(self.policy_context) else {
+                break;
+            };
+            if !fetch.stage(kv_store, partition, candidate, &mut gate, now) {
+                kept.push((FreshSource::Policy, candidate));
+            }
+        }
+        self.return_passed_over(kept);
+    }
+
     /// Put the requests passed over this pass back at the front of the queues
     /// they came from, in their order.
     pub(super) fn return_passed_over(
@@ -112,7 +150,9 @@ impl<P: PendingOrderPolicy> FreshQueues<'_, P> {
                     .as_mut()
                     .expect("an overdue request implies the bound")
                     .push_front(self.partition, candidate),
-                FreshSource::Landed => unreachable!("a landed read is never passed over"),
+                // Staged loading: a landed context evicted before admission
+                // goes back to pending, to be read again.
+                FreshSource::Landed => self.policy.push_front(candidate, self.policy_context),
             }
         }
     }
