@@ -12,6 +12,7 @@ metadata, and the sweep aggregator contract.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sys
 
@@ -1579,6 +1580,20 @@ def test_write_shared_and_run_metadata(tmp_path):
     saved = json.loads((log_dir / "raw" / "params.json").read_text())
     assert "_sweep_labels" not in saved  # launcher-internal stripped
     assert "start_ts" in saved
+
+
+def test_run_manifest_records_binary_and_profile_db(tmp_path, monkeypatch):
+    binary = tmp_path / "sim"
+    binary.write_bytes(b"binary")
+    db = tmp_path / "profile.db"
+    db.write_bytes(b"rows")
+    monkeypatch.setenv("VIBESIM_PROFILE_DB", str(db))
+    log_dir = tmp_path / "run"
+    metadata.write_run_metadata(log_dir, {"io": {"log_dir": str(log_dir)}}, [str(binary), "run", "cfg.json"])
+
+    manifest = json.loads((log_dir / "manifest.json").read_text())
+    assert manifest["binary"] == {"path": str(binary.resolve()), "sha256": hashlib.sha256(b"binary").hexdigest()}
+    assert manifest["profile_db"] == {"path": str(db.resolve()), "sha256": hashlib.sha256(b"rows").hexdigest()}
 
 
 # ── experiment-root (sweep base_dir) ─────────────────────────────────────────

@@ -12,7 +12,10 @@ are written separately by ``launcher.process.journal``.
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -29,8 +32,8 @@ PAYLOADS_DIR = "payloads"
 TRACES_DIR = "traces"
 RUN_OUTPUT_DIRS = (RAW_DIR, PLOTS_DIR, REPORTS_DIR, PAYLOADS_DIR, TRACES_DIR)
 
-# Sidecar the rust binary writes (design §2.3.1 step 16) with the real
-# profile.db hash + root seed. Absent until L7-β lands.
+# Sidecar the rust binary writes (design §2.3.1 step 16) with the root seed.
+# Absent until L7-β lands.
 MANIFEST_SIDECAR = "manifest_sidecar.json"
 
 
@@ -138,9 +141,34 @@ def save_git_snapshot(log_dir: Path, timestamp: datetime) -> None:
 # ── manifest (★ repro-gap fix) ──────────────────────────────────────────────
 
 
+@functools.lru_cache(maxsize=None)
+def _sha256(path: Path, size: int, mtime_ns: int) -> str:
+    """SHA-256 of a file; size and mtime key the cache, so a sweep hashes each
+    unchanged file once."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 24), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def file_identity(path: str | Path) -> dict[str, Any]:
+    """Resolved path and SHA-256 of an input the run reads (None if missing)."""
+    resolved = Path(path).resolve()
+    if not resolved.is_file():
+        return {"path": str(resolved), "sha256": None}
+    st = resolved.stat()
+    return {"path": str(resolved), "sha256": _sha256(resolved, st.st_size, st.st_mtime_ns)}
+
+
+def profile_db_path() -> Path:
+    """The profile.db the binary reads: `VIBESIM_PROFILE_DB`, else the repo's."""
+    return Path(os.environ.get("VIBESIM_PROFILE_DB", REPO_ROOT / "profiling" / "profile.db"))
+
+
 def read_manifest_sidecar(log_dir: Path) -> dict[str, Any] | None:
-    """Read the rust binary's manifest sidecar if present (profile.db hash +
-    seed chain). Returns None until L7-β writes it."""
+    """Read the rust binary's manifest sidecar if present (seed chain).
+    Returns None until L7-β writes it."""
     sidecar = log_dir / MANIFEST_SIDECAR
     if not sidecar.is_file():
         return None
@@ -149,27 +177,28 @@ def read_manifest_sidecar(log_dir: Path) -> dict[str, Any] | None:
 
 def save_manifest_json(
     log_dir: Path,
-    profile_db_hash: str | None = None,
+    binary: str | Path | None = None,
     seed_chain: dict[str, Any] | None = None,
 ) -> None:
-    """Write `manifest.json`. The real `profile.db` SHA + seed chain come from
-    the binary sidecar (L7-β); until that exists, write a partial manifest
-    flagged `pending_l7_beta` so the gap is explicit rather than silently
-    missing."""
+    """Write `manifest.json`: the binary and the profile.db the run reads, each
+    as resolved path + SHA-256 at launch (the git snapshot names the source,
+    not what was built or which kernel table it read). The seed chain comes
+    from the binary sidecar (L7-β); until that exists it is flagged
+    `pending_l7_beta` so the gap is explicit rather than silently missing."""
     sidecar = read_manifest_sidecar(log_dir)
     if sidecar:
-        profile_db_hash = profile_db_hash or sidecar.get("profile_db_sha256")
         seed_chain = seed_chain or sidecar.get("seed_chain")
 
     manifest: dict[str, Any] = {
-        "profile_db_sha256": profile_db_hash,
+        "binary": file_identity(binary) if binary is not None else None,
+        "profile_db": file_identity(profile_db_path()),
         "seed_chain": seed_chain,
     }
-    if profile_db_hash is None and seed_chain is None:
+    if seed_chain is None:
         manifest["pending_l7_beta"] = True
         manifest["note"] = (
-            "profile.db hash + seed chain are produced by the rust binary "
-            "(L7-β), which is not implemented yet."
+            "the seed chain is produced by the rust binary (L7-β), which is "
+            "not implemented yet."
         )
     (log_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
 
@@ -189,4 +218,4 @@ def write_run_metadata(log_dir: Path, params: dict, cmd: list[str]) -> None:
     now = datetime.now(UTC)
     save_params_json(log_dir, params, now)
     save_command_log(log_dir, cmd)
-    save_manifest_json(log_dir)
+    save_manifest_json(log_dir, binary=cmd[0])
