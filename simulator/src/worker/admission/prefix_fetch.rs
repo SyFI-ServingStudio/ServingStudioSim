@@ -184,6 +184,13 @@ impl SessionPrefixTiers {
         }
     }
 
+    /// The tiers store each state as `stored` tokens, compressed
+    /// ([`PrefixTiers::set_stored_state_tokens`]).
+    pub(crate) fn with_stored_state_tokens(mut self, stored: u64) -> Self {
+        self.tiers.set_stored_state_tokens(stored);
+        self
+    }
+
     /// Where a read of the session's declared prefix would come from, and how
     /// much of it resumes; `seeded` when it is a pre-run context.
     fn lookup(
@@ -215,8 +222,8 @@ impl SessionPrefixTiers {
         self.tiers.store_round(session_id, round);
     }
 
-    /// What a read of `hit` moves into HBM, in tier tokens: the KV HBM's
-    /// `hbm_tokens` lack and the states that survive the round
+    /// What a read of `hit` moves on its tier's channel, in tier tokens: the
+    /// KV HBM's `hbm_tokens` lack and the states that survive the round
     /// ([`PrefixTiers::read_states`]; a pre-run context has one).
     fn read_charge(
         &self,
@@ -226,9 +233,24 @@ impl SessionPrefixTiers {
         hbm_tokens: u32,
     ) -> u64 {
         if seeded {
-            u64::from(hit.tokens - hbm_tokens) + self.tiers.state_tokens()
+            u64::from(hit.tokens - hbm_tokens) + self.tiers.read_state_tokens(hit.tier)
         } else {
             self.tiers.read_charge(session_id, hit, hbm_tokens)
+        }
+    }
+
+    /// What that read lands in HBM, its states decoded.
+    fn landed_charge(
+        &self,
+        session_id: u32,
+        hit: PrefixTierHit,
+        seeded: bool,
+        hbm_tokens: u32,
+    ) -> u64 {
+        if seeded {
+            u64::from(hit.tokens - hbm_tokens) + self.tiers.landed_state_tokens()
+        } else {
+            self.tiers.landed_charge(session_id, hit, hbm_tokens)
         }
     }
 
@@ -428,8 +450,11 @@ struct Fetch {
     partition: u16,
     read: Read,
     phase: Phase,
-    /// Tokens (KV and its states) the read holds in each loading area.
+    /// Tokens (KV and its decoded states) the read holds in HBM's loading
+    /// area, and its hop moves on DRAM's channel.
     charge: u64,
+    /// Tokens (KV and its stored states) an SSD read holds in DRAM's.
+    dram_charge: u64,
     /// The round-end states below the hit the read moves into HBM.
     states: Vec<RoundState>,
     /// The state at the hit.
@@ -799,7 +824,8 @@ impl PrefixFetch {
         else {
             return false;
         };
-        let charge = tiers.read_charge(session_id, hit, seeded, hbm_tokens);
+        let charge = tiers.landed_charge(session_id, hit, seeded, hbm_tokens);
+        let dram_charge = tiers.read_charge(session_id, hit, seeded, hbm_tokens);
         let earlier = tiers.earlier_read_states(session_id, hit, seeded);
         let staged = self.staged.as_mut().expect("staged mode");
         if staged.rule != StagedRule::Held && !area_fits(gate.landed, staged.hbm_area[p], charge) {
@@ -811,11 +837,11 @@ impl PrefixFetch {
         }
         let through_dram = staged.dram_area[p] > 0 && hit.tier == 1;
         let phase = if through_dram {
-            if gate.dram_full || !area_fits(staged.dram_used[p], staged.dram_area[p], charge) {
+            if gate.dram_full || !area_fits(staged.dram_used[p], staged.dram_area[p], dram_charge) {
                 gate.dram_full = true;
                 return false;
             }
-            staged.dram_used[p] += charge;
+            staged.dram_used[p] += dram_charge;
             Phase::Ssd
         } else {
             let footprint = hold_footprint(
@@ -853,6 +879,7 @@ impl PrefixFetch {
                 },
                 phase,
                 charge,
+                dram_charge,
                 states,
                 hit_tag,
             },
@@ -900,7 +927,7 @@ impl PrefixFetch {
         };
         let p = usize::from(fetch.partition);
         if dram {
-            staged.dram_used[p] -= fetch.charge;
+            staged.dram_used[p] -= fetch.dram_charge;
         }
         if hbm {
             staged.hbm_used[p] -= fetch.charge;
@@ -1101,6 +1128,7 @@ impl PrefixFetch {
                 },
                 phase: Phase::Hbm,
                 charge: 0,
+                dram_charge: 0,
                 states,
                 hit_tag,
             },

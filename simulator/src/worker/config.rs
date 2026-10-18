@@ -485,6 +485,9 @@ fn default_recurrent_state_checkpoints() -> u32 {
 fn default_recurrent_state_anchor_stride() -> u32 {
     1
 }
+fn default_tier_state_compression_ratio() -> f64 {
+    1.0
+}
 fn default_dram_tier_gb_per_s() -> f64 {
     50.0
 }
@@ -1003,6 +1006,16 @@ pub enum IterWorkerSel {
         #[serde(default = "default_recurrent_state_anchor_stride")]
         #[param(default = 1)]
         recurrent_state_anchor_stride: u32,
+        /// With a tier, a state-at-end hybrid: the DRAM and SSD tiers store
+        /// each recurrent state compressed by this ratio (>= 1), encoded and
+        /// decoded by the host CPU; HBM keeps it whole. A state then costs
+        /// its bytes over the ratio in each tier's capacity and writes and on
+        /// the SSD channel; DRAM's channel, the host-to-GPU copy, carries the
+        /// decoded state, as do HBM's loading areas. The host's encode and
+        /// decode time is not modeled. `1`: uncompressed. Not vLLM.
+        #[serde(default = "default_tier_state_compression_ratio")]
+        #[param(default = 1.0)]
+        tier_state_compression_ratio: f64,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {

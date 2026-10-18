@@ -53,6 +53,12 @@
 //! context): the longer context with the latest `k` states among both. A cut
 //! keeps the states at or before it.
 //!
+//! A tier may store states compressed ([`PrefixTiers::set_stored_state_tokens`]),
+//! encoded and decoded by the host CPU while HBM keeps them whole: a state
+//! then costs its stored size in each tier's capacity and writes and on the
+//! SSD channel, and its decoded size on DRAM's channel, the host-to-GPU copy
+//! (and in HBM's loading areas, [`PrefixTiers::landed_charge`]).
+//!
 //! A read into HBM moves only the states that will survive the round it
 //! serves: the state at the hit, which the round resumes from, and the latest
 //! earlier ones that will still be among the session's latest `k` after the
@@ -387,8 +393,11 @@ impl PrefixTier {
 /// The DRAM/SSD tiers of one replica, fastest first.
 pub(crate) struct PrefixTiers {
     tiers: Vec<PrefixTier>,
-    /// One recurrent state in KV tokens (0 for a full-attention model).
+    /// One recurrent state in KV tokens as the tiers store it (0 for a
+    /// full-attention model).
     state_tokens: u64,
+    /// One recurrent state in KV tokens decoded, as HBM holds it.
+    landed_state_tokens: u64,
     /// Where an entry can be resumed from.
     resume: ResumePoint,
     /// Which round-end states an entry keeps.
@@ -438,6 +447,7 @@ impl PrefixTiers {
         Self {
             tiers,
             state_tokens,
+            landed_state_tokens: state_tokens,
             resume,
             retention: StateRetention::Latest(1),
             added: 1,
@@ -458,6 +468,38 @@ impl PrefixTiers {
         self.retention = retention;
         self.added = added;
         self
+    }
+
+    /// [`Self::set_stored_state_tokens`], as a builder.
+    #[cfg(test)]
+    pub(crate) fn with_stored_state_tokens(mut self, stored: u64) -> Self {
+        self.set_stored_state_tokens(stored);
+        self
+    }
+
+    /// Store each state as `stored` tokens (compressed; the decoded state,
+    /// `new`'s `state_tokens`, is what lands in HBM). Module docs.
+    pub(crate) fn set_stored_state_tokens(&mut self, stored: u64) {
+        assert!(
+            stored <= self.landed_state_tokens,
+            "a stored state is not larger than its decoded one"
+        );
+        self.state_tokens = stored;
+    }
+
+    /// One state on `tier`'s read channel: DRAM's is the host-to-GPU copy
+    /// after the host decodes it; any other reads the stored state.
+    pub(crate) fn read_state_tokens(&self, tier: usize) -> u64 {
+        if self.tiers[tier].spec.name == "dram" {
+            self.landed_state_tokens
+        } else {
+            self.state_tokens
+        }
+    }
+
+    /// One state decoded, as it lands in HBM.
+    pub(crate) fn landed_state_tokens(&self) -> u64 {
+        self.landed_state_tokens
     }
 
     /// Where a prompt sharing `declared` tokens with `entry` resumes.
@@ -566,9 +608,10 @@ impl PrefixTiers {
         moved
     }
 
-    /// What a read of `hit` moves, in tier tokens: the KV past
-    /// `resident_tokens` (what HBM still holds), the state at the hit and
-    /// the earlier states [`Self::read_states`] moves.
+    /// What a read of `hit` moves on its tier's channel, in tier tokens: the
+    /// KV past `resident_tokens` (what HBM still holds), the state at the
+    /// hit and the earlier states [`Self::read_states`] moves, each at
+    /// [`Self::read_state_tokens`].
     pub(crate) fn read_charge(
         &self,
         session_id: u32,
@@ -576,7 +619,21 @@ impl PrefixTiers {
         resident_tokens: u32,
     ) -> u64 {
         let states = 1 + self.read_states(session_id, hit).len();
-        u64::from(hit.tokens.saturating_sub(resident_tokens)) + states as u64 * self.state_tokens
+        u64::from(hit.tokens.saturating_sub(resident_tokens))
+            + states as u64 * self.read_state_tokens(hit.tier)
+    }
+
+    /// What the read of `hit` lands in HBM, in tier tokens: as
+    /// [`Self::read_charge`], each state decoded.
+    pub(crate) fn landed_charge(
+        &self,
+        session_id: u32,
+        hit: PrefixTierHit,
+        resident_tokens: u32,
+    ) -> u64 {
+        let states = 1 + self.read_states(session_id, hit).len();
+        u64::from(hit.tokens.saturating_sub(resident_tokens))
+            + states as u64 * self.landed_state_tokens
     }
 
     /// Queue a read of `hit` behind the tier's earlier reads; returns when it
@@ -862,10 +919,6 @@ impl PrefixTiers {
         self.tiers[tier].capacity
     }
 
-    /// One recurrent state, in tier tokens.
-    pub(crate) fn state_tokens(&self) -> u64 {
-        self.state_tokens
-    }
 
     /// Take `fraction` of `tier`'s capacity out of what its entries may use,
     /// as a loading area reads stage through; returns the area in tokens.
@@ -1365,6 +1418,42 @@ mod tests {
             ResumePoint::ContextEnd,
         )
         .with_round_end_states(StateRetention::Latest(states), 1)
+    }
+
+    #[test]
+    fn a_compressed_state_costs_its_stored_size_except_on_the_host_to_gpu_copy() {
+        // 1000 B/token, 1 GB/s: 1M tokens per second. A 50k-token state is
+        // stored as 25k (ratio 2).
+        let mut t = round_end_chain(1.0, 10.0, 2).with_stored_state_tokens(25_000);
+        t.evict(1, 100_000, &[60_000]);
+        assert_eq!(t.used_tokens(0), 100_000 + 2 * 25_000, "DRAM stores both states compressed");
+        assert_eq!(t.counters(0).written_states, 2);
+        let hit = t.lookup(1, 100_000).unwrap();
+        assert_eq!(hit.tier, 0);
+        // With k = 2 and one state added per round, the read moves the end
+        // state only, decoded on the host before the copy.
+        assert_eq!(t.read_charge(1, hit, 0), 100_000 + 50_000);
+        assert_eq!(t.landed_charge(1, hit, 0), 100_000 + 50_000);
+        assert_eq!(t.read(1, hit, 0, Time::ZERO).0, Time::from_ms(150.0));
+
+        // A DRAM too small for the entry passes it to SSD, compressed.
+        let mut t = round_end_chain(0.1, 10.0, 2).with_stored_state_tokens(25_000);
+        t.evict(2, 100_000, &[60_000]);
+        assert_eq!(t.used_tokens(0), 0);
+        assert_eq!(t.used_tokens(1), 100_000 + 2 * 25_000);
+        let hit = t.lookup(2, 100_000).unwrap();
+        assert_eq!(hit.tier, 1);
+        assert_eq!(t.read_charge(2, hit, 0), 100_000 + 25_000, "SSD reads the stored state");
+        assert_eq!(t.landed_charge(2, hit, 0), 100_000 + 50_000, "HBM lands it decoded");
+        assert_eq!(t.read(2, hit, 0, Time::ZERO).0, Time::from_ms(125.0));
+    }
+
+    #[test]
+    fn uncompressed_states_cost_the_same_everywhere() {
+        let t = round_end_chain(1.0, 10.0, 2);
+        assert_eq!(t.read_state_tokens(0), 50_000);
+        assert_eq!(t.read_state_tokens(1), 50_000);
+        assert_eq!(t.landed_state_tokens(), 50_000);
     }
 
     #[test]

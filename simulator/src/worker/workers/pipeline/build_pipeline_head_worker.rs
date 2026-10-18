@@ -230,6 +230,8 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         block_tokens = hybrid.block_tokens,
         state_tokens_per_request,
         tier_state_bytes_per_request = layout.tier_state_bytes_per_request,
+        tier_stored_state_bytes_per_request =
+            config.tier_stored_state_bytes(layout.tier_state_bytes_per_request),
         chunk_end_quantum,
         max_batch_tokens,
         "hybrid pipeline head: one block pool sized by the most constrained stage"
@@ -383,7 +385,8 @@ fn prefill_batch_period<M: IterwiseUnifiedModel>(
 
 /// Reads from the DRAM/SSD tiers `config` asks for, in the pipeline's per-GPU
 /// token units. A context's recurrent state is charged as
-/// `layout.tier_state_bytes_per_request` in those units.
+/// `layout.tier_state_bytes_per_request` in those units, stored compressed by
+/// `config.tier_state_compression_ratio`.
 fn head_prefix_fetch(
     config: &WorkerConfig,
     layout: &PipelineLayout,
@@ -392,13 +395,12 @@ fn head_prefix_fetch(
     id: WorkerId,
 ) -> Option<PrefixFetch> {
     let specs: Vec<_> = config.prefix_tiers.iter().flatten().copied().collect();
+    let token_bytes = layout.tier_kv_bytes_per_token.max(1);
     (!specs.is_empty()).then(|| {
         let tiers = SessionPrefixTiers::new(
             &specs,
             layout.tier_kv_bytes_per_token,
-            layout
-                .tier_state_bytes_per_request
-                .div_ceil(layout.tier_kv_bytes_per_token.max(1)),
+            layout.tier_state_bytes_per_request.div_ceil(token_bytes),
             resume,
             if resume == ResumePoint::ContextEnd {
                 config.state_retention()
@@ -408,6 +410,11 @@ fn head_prefix_fetch(
             config.states_added_per_round(),
             log_dir,
             &format!("w{}", id.0),
+        )
+        .with_stored_state_tokens(
+            config
+                .tier_stored_state_bytes(layout.tier_state_bytes_per_request)
+                .div_ceil(token_bytes),
         );
         PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start).with_max_read_wait_ms(
             config.prefix_tier_max_read_wait_ms,

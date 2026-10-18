@@ -318,6 +318,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         recurrent_state_checkpoints,
         recurrent_state_anchors,
         recurrent_state_anchor_stride,
+        tier_state_compression_ratio,
         ..
     } = worker
     else {
@@ -359,6 +360,10 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
             || (*recurrent_state_checkpoints == 1 && *recurrent_state_anchor_stride >= 1),
         "pp: recurrent_state_anchors needs recurrent_state_checkpoints: 1 and \
          recurrent_state_anchor_stride >= 1"
+    );
+    ensure!(
+        tier_state_compression_ratio.is_finite() && *tier_state_compression_ratio >= 1.0,
+        "pp: tier_state_compression_ratio must be a finite ratio >= 1"
     );
     ensure!(
         (0.0..0.5).contains(prefix_tier_loading_area),
@@ -405,6 +410,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         recurrent_state_checkpoints: *recurrent_state_checkpoints,
         recurrent_state_anchors: *recurrent_state_anchors,
         recurrent_state_anchor_stride: *recurrent_state_anchor_stride,
+        tier_state_compression_ratio: *tier_state_compression_ratio,
         ..WorkerConfig::default()
     })
 }
@@ -493,6 +499,15 @@ mod tests {
             750,
             "5995 B over 8 stages, rounded up"
         );
+    }
+
+    #[test]
+    fn tiers_store_a_state_over_the_compression_ratio_rounded_up() {
+        let mut config = WorkerConfig::default();
+        assert_eq!(config.tier_stored_state_bytes(36_904_960), 36_904_960);
+        config.tier_state_compression_ratio = 1.86;
+        // 36904960 / 1.86 = 19841376.34
+        assert_eq!(config.tier_stored_state_bytes(36_904_960), 19_841_377);
     }
 
     #[test]

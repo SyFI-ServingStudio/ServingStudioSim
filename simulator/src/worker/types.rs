@@ -676,6 +676,10 @@ pub struct WorkerConfig {
     pub recurrent_state_anchors: u32,
     /// Round stride of the anchors (`recurrent_state_anchors`), >= 1.
     pub recurrent_state_anchor_stride: u32,
+    /// Pipeline head, a state-at-end hybrid with tiers: the DRAM/SSD tiers
+    /// store each recurrent state compressed by this ratio (host CPU encode
+    /// and decode; HBM keeps it whole). 1: uncompressed.
+    pub tier_state_compression_ratio: f64,
     /// Candidate positions the drafter proposes per request per iteration (from
     /// the worker selector). The verify width is one more than this. Only the
     /// speculative recipe reads it, and it must match the width the model was
@@ -724,6 +728,7 @@ impl Default for WorkerConfig {
             recurrent_state_checkpoints: 1,
             recurrent_state_anchors: 0,
             recurrent_state_anchor_stride: 1,
+            tier_state_compression_ratio: 1.0,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,
@@ -737,6 +742,17 @@ impl WorkerConfig {
     /// (the head restores the decode's context on top of the prompt's).
     pub(crate) fn states_added_per_round(&self) -> u32 {
         1 + u32::from(self.external_decode)
+    }
+
+    /// One recurrent state's bytes as the DRAM/SSD tiers store it, given its
+    /// decoded `bytes`: over [`Self::tier_state_compression_ratio`], rounded
+    /// up (`bytes` itself when uncompressed).
+    pub(crate) fn tier_stored_state_bytes(&self, bytes: u64) -> u64 {
+        if self.tier_state_compression_ratio == 1.0 {
+            bytes
+        } else {
+            (bytes as f64 / self.tier_state_compression_ratio).ceil() as u64
+        }
     }
 
     /// Which round-end states each retained context keeps.
