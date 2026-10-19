@@ -26,7 +26,10 @@ Host configuration for profiling (not checked in): `SERVINGSTUDIO_NEURON_DOCKER_
 (the local Docker socket, required), `SERVINGSTUDIO_NEURON_DOCKER_COMMAND` (CLI
 argv, default `docker`), `SERVINGSTUDIO_VLLM_NEURON_MODEL_DIR` (checkpoint,
 required) and `SERVINGSTUDIO_NEURON_PROFILE_CACHE_DIR` (compile cache). Measured
-rows live in private databases; the shared `profiling/profile.db` holds none.
+stock-model rows are checked into the shared `profiling/profile.db`: 122 rows
+cover whole-forward, region, collective-segment and segmented-forward timings.
+See [database publication](pr/trainium2-profile-db/README.md) for coverage and
+provenance. Standalone NKI leaf measurements remain outside the shared database.
 
 ## Whole-forward kernel
 
