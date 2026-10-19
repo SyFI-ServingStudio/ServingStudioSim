@@ -16,6 +16,7 @@ and `simulator/src/timing/kernels/neuron_llama_forward.rs`
 | --- | --- | --- |
 | L1 execution | Neuron backends (`device_family: neuron`) run in the vendor image on a reserved whole chip | `profiling/exec/neuron.py`, `profiling/README.md` |
 | L1 kinds | `neuron_llama_forward/vllm_neuron` (whole forward), `neuron_llama_region/vllm_neuron_fx_regions`, `neuron_llama_segment/vllm_neuron_collective_segments`, `neuron_llama_segmented_forward/vllm_neuron_segmented` | `profiling/kernels/neuron_llama_*.py`, `profiling/runners/neuron/`, `simulator/src/timing/kernels/neuron_llama_*.rs` |
+| L1 per-op leaves | `neuron_nki_{qkv,attention_cte,output_projection,mlp,attention_tkg}/vllm_neuron_nki` and `neuron_glue/vllm_neuron_nki`: one NKI launch unit each, timed alone | `profiling/kernels/neuron_nki_*.py`, `profiling/kernels/neuron_glue.py`, `profiling/runners/neuron/nki_{units,bench}.py`, `simulator/src/timing/kernels/neuron_nki*.rs`, `neuron_glue.rs` |
 | L4 arch | `llama3_vllm_neuron`: `composition` and `prefill_segment_size` | `simulator/src/arch/llama3_vllm_neuron.rs` |
 | L5/L6 | generic `chunked_prefill` configured as the stock scheduler | `deployment/unified.rs::ensure_stock_neuron_worker` |
 | Work maps | `llama3-vllm-neuron-{unified,regions,segments}-v1` | `model/work/location_maps/` |
@@ -69,8 +70,11 @@ always come from the stock executable. Reports distinguish exact, inferred,
 compiler-primitive, and unresolved attribution. Source locations identify
 operation types; specific transformer layer-instance ownership is not verified.
 
-Per-op activity overlaps, so operation durations are not additive latency costs.
-Prefill capture adds output-completion waits around a selected prefill and a
+Engine activity inside one compiler-generated region overlaps (Tensor, Vector
+and GpSimd run concurrently), so per-engine busy times of a region are not
+additive latency costs. Launch units are additive: the NKI custom calls of a
+layer are disjoint spans in the same trace, and their standalone times sum to
+the in-model layer (see "Standalone NKI per-op leaves"). Prefill capture adds output-completion waits around a selected prefill and a
 trailing decode guard, which is excluded from prefill aggregates. A controlled
 unprofiled/controller-only/profiled comparison has not been performed:
 zero overhead and fidelity to production timing remain unverified. Unseen-shape,
@@ -134,8 +138,69 @@ executables exist; rows of either are validated only where recorded.
   traces, interior layers 1-30 within 10% of the layer mean, and the composed
   forward within 5% of the whole forward. Validated at C512 `[1,16]`.
 
-Below these blocks, QKV, attention and O-projection share one synchronization
-interval; standalone probes of them were not additive, so no finer rows exist.
+Below these blocks the leaves are the NKI launch units of the "Standalone NKI
+per-op leaves" section. The one unit that is not additive is the stock decode
+attention: at TP4 Llama3 passes a 2-D block table with 2 KV heads per rank, so
+`attention_decode` routes it to the torch fallback, which neuronx-cc lowers
+differently inside the whole graph (GpSimd-bound paged gather, about 1.5 ms per
+layer) than standalone (0.56 ms). That region has no stable boundary and stays
+inside the `attention_block` segment row; the `neuron_nki_attention_tkg` leaf
+models the per-head-table decode path instead.
+
+## Standalone NKI per-op leaves
+
+Terms: a *launch unit* is one NKI custom call of the forward, or the torch
+glue of a layer; a *kind* is its registry entry; a *leaf* is the Rust cost
+leaf that reads the kind's rows. The *shape-only decode kinds* are mlp and
+glue: they read no block table, so no context of their own caps their
+buckets. The *empty-NEFF floor* is the device time of a near-empty NEFF, the
+fixed cost one standalone execution pays (0.026 ms).
+
+Six kinds share backend `vllm_neuron_nki`. `profiling/runners/neuron/nki_bench.py`
+measures them on one reserved LNC2 logical core inside the vendor image. Each
+unit is one launch of the stock forward at the per-rank shapes of TP4. The
+runner compiles it through the production path (Dynamo full graph,
+`neuron_libtorch`, the serving compiler flags), warms it, then executes it 50
+times under the NRT system profile. `time_ms` is the median device execution
+(`nc_exec_running`, union of the core's two physical cores), raw. The floor is
+measured once per batch and kept in the row's provenance, not subtracted: the
+decode glue at B1 (0.0215 ms) runs below it, and the in-model kernels pay a
+part of it themselves, so what to charge per launch is the composition's
+decision, not the leaf's.
+
+| Kind | Unit | Phase | Args |
+| --- | --- | --- | --- |
+| `neuron_nki_qkv` | `nkilib` `qkv` + RoPE, `[1,T,4096] @ [4096,1536]` | prefill | `token_bucket, tp_size, dtype` |
+| `neuron_nki_attention_cte` | `attention_cte`, 8 heads x 128, causal over T | prefill | same |
+| `neuron_nki_output_projection` | `output_projection_cte`, `[1,8,128,T] @ [1024,4096]` | prefill | same |
+| `neuron_nki_mlp` | `mlp`, gate/up `[4096,3584]`, down `[3584,4096]` | both | `phase, token_bucket, tp_size, dtype` |
+| `neuron_nki_attention_tkg` | `attention_block_tkg` with a per-head block table over `max_model_len` | decode | `token_bucket, max_model_len, kv_blocks, block_size, tp_size, dtype` |
+| `neuron_glue` | the layer's torch ops (norms, residuals, layouts, prefill KV write) | both | `phase, token_bucket, tp_size, dtype` |
+
+Rows exist for compiled variants only. Prefill token buckets are contexts of
+the stock ladder. Decode buckets are powers of two. The context's KV-resident
+capacity caps decode attention; the ladder's largest bucket (512) caps the
+shape-only decode kinds. The Rust kinds share one config
+(`simulator/src/timing/kernels/neuron_nki.rs`). `prefill_buckets` and
+`decode_buckets` name the inventory. The cache is `Cache1DDirect` over its
+index. An inventory needs at least two variants. A prefill-only kind leaves
+`decode_buckets` empty; a decode-only kind leaves `prefill_buckets` empty.
+
+Evidence (C512, TP4/LNC2, Llama 3.1 8B BF16, 2026-10-18; the grid is in
+`doc/pr/trainium2-nki-ops/`). Prefill: the raw standalone sum of the four
+kernels plus the KV write that `neuron_glue` carries (0.091 + 0.077 + 0.050 +
+0.612 + 0.035 = 0.865 ms) equals the kernel spans of one in-model layer
+(0.847 ms) within 2%; with the floor removed per unit it is 13% under. Decode
+B16 on the per-head block table path: the raw standalone units (attention
+0.135, mlp 0.170, glue 0.044) plus two all_reduce (0.022) are 0.371 ms against
+the in-model layer span of 0.328 ms, 13% over; with the floor removed per
+unit, 0.293 ms, 11% under (the decode mask, 0.022 ms, is once per forward, not
+per layer). The in-model per-kernel fixed cost is therefore about half the
+standalone floor, which is why the leaf keeps the raw time and the composition
+decides the charge. Collectives (nccom-test, TP4):
+all_reduce 128 KiB 11 us; all_gather and reduce_scatter 4 MiB 23 and 27 us.
+The composition that assembles these leaves into a layer is not part of this
+record yet.
 
 ## Segmented prefill (C16384/C32768)
 

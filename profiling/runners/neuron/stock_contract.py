@@ -38,3 +38,14 @@ def prefill_validation_bucket(context: int) -> int:
     """Decode bucket of the frozen full-logit workload that accepts a prefill row:
     16, or the context's largest bucket when that is smaller."""
     return min(16, largest_decode_bucket(context))
+
+
+# Per-rank geometry of Llama 3.1 8B at TP4: hidden 4096; 32 query and 8 KV heads of
+# 128 split four ways; MLP intermediate 14336 split four ways. The standalone NKI
+# leaves (nki_units, nki_bench) build and account their launch units from these.
+HIDDEN = 4096
+HEAD_DIM = 128
+Q_HEADS_PER_RANK = 32 // TP_SIZE
+KV_HEADS_PER_RANK = 8 // TP_SIZE
+INTERMEDIATE_PER_RANK = 14336 // TP_SIZE
+QKV_OUT_PER_RANK = (Q_HEADS_PER_RANK + 2 * KV_HEADS_PER_RANK) * HEAD_DIM  # 1536

@@ -49,6 +49,7 @@ use crate::timing::kernels::NeuronLlamaForwardKernelInput;
 use crate::timing::kernels::NeuronLlamaRegionKernelInput;
 use crate::timing::kernels::NeuronLlamaSegmentKernelInput;
 use crate::timing::kernels::NeuronLlamaSegmentedForwardKernelInput;
+use crate::timing::kernels::NeuronNkiKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
 
@@ -125,6 +126,7 @@ log_inputs! {
     NeuronLlamaRegion => NeuronLlamaRegionKernelInput,
     NeuronLlamaSegment => NeuronLlamaSegmentKernelInput,
     NeuronLlamaSegmentedForward => NeuronLlamaSegmentedForwardKernelInput,
+    NeuronNki => NeuronNkiKernelInput,
     BatchedGemm => BatchedGemmKernelInput,
     GroupedGemm => GroupedGemmKernelInput,
     RmsNorm     => RmsNormKernelInput,
