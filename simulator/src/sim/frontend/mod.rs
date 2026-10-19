@@ -7,6 +7,7 @@
 //! families cannot leak into the current text-only L5 workers.
 
 mod arrival;
+mod handoff;
 mod pinned_prefix;
 mod release;
 mod schema;
@@ -21,12 +22,14 @@ use crate::common::{
     SpeechGenerationDefinition, TextGenerationDefinition, Time, VideoGenerationDefinition,
     VideoTextGenerationDefinition,
 };
+use handoff::FrontendHandoff;
 use release::{ReplayScheduler, SessionDependency};
 use schema::TraceDefinition;
 
 pub use arrival::{
     ReleaseMetadata, ScheduledRequest, SchedulingDeclaration, SessionReleaseMetadata,
 };
+pub use handoff::FrontendHandoffConfig;
 pub use release::{ArrivalMode, ArrivalSchedule, CapacityLimit};
 pub use schema::{InputFileFormat, InputFileSchema, RequestFamily, SourceIdentities, TraceTag};
 
@@ -38,6 +41,9 @@ pub struct TraceFrontend<Definition: RequestDefinition = TextGenerationDefinitio
     emitted: usize,
     completed: u64,
     replay_scheduler: ReplayScheduler,
+    /// Opt-in serial hand-off between release and engine visibility. `None`
+    /// emits each request the moment the replay scheduler releases it.
+    handoff: Option<FrontendHandoff>,
     /// Source-to-dense identifier mapping, kept so a run can be reported in the
     /// trace's own names rather than in this simulator's storage ordinals.
     source_identities: SourceIdentities,
@@ -154,6 +160,16 @@ impl<Definition: RequestDefinition> TraceFrontend<Definition> {
         self.emitted >= self.scheduled_requests.len()
     }
 
+    /// Select the serial hand-off model (`None` keeps immediate emission).
+    pub fn with_frontend_handoff(mut self, config: Option<FrontendHandoffConfig>) -> Self {
+        self.handoff = config.map(FrontendHandoff::new);
+        self
+    }
+
+    /// Emit every request visible by `now`. Without a hand-off model a
+    /// released request is visible at once; with one, it enters the hand-off
+    /// stage and is emitted when that stage makes it visible. Either way it
+    /// keeps its release instant as its arrival time.
     pub fn drain_due(&mut self, now: Time, mut emit: impl FnMut(Request<Definition>)) {
         loop {
             let in_flight = self.in_flight();
@@ -163,6 +179,20 @@ impl<Definition: RequestDefinition> TraceFrontend<Definition> {
             else {
                 break;
             };
+            match &mut self.handoff {
+                None => {
+                    self.emitted += 1;
+                    emit(self.scheduled_requests[index].realize_at(arrival_time));
+                }
+                Some(handoff) => {
+                    handoff.accept(index, self.releases[index].request_id, arrival_time)
+                }
+            }
+        }
+        let Some(handoff) = &mut self.handoff else {
+            return;
+        };
+        while let Some((index, arrival_time)) = handoff.pop_visible(now) {
             self.emitted += 1;
             emit(self.scheduled_requests[index].realize_at(arrival_time));
         }
@@ -174,8 +204,11 @@ impl<Definition: RequestDefinition> TraceFrontend<Definition> {
             .on_completion(&self.releases, request, now);
     }
 
+    /// Released and not completed, including requests still in hand-off: the
+    /// measured client holds a concurrency permit from the moment it sends.
     pub fn in_flight(&self) -> u64 {
-        self.emitted as u64 - self.completed
+        let in_handoff = self.handoff.as_ref().map_or(0, FrontendHandoff::in_handoff);
+        self.emitted as u64 + in_handoff - self.completed
     }
 
     pub fn submitted(&self) -> u64 {
@@ -342,6 +375,7 @@ fn load_typed<Definition: TraceDefinition>(
         emitted: 0,
         completed: 0,
         replay_scheduler,
+        handoff: None,
         source_identities,
     })
 }
@@ -664,6 +698,51 @@ mod tests {
     }
 
     // ---- open / closed loop replay -----------------------------------------
+
+    #[test]
+    fn frontend_handoff_serializes_a_burst_and_keeps_trace_arrivals() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = std::iter::once("id,input_len,output_len,arrival_time\n".to_string())
+            .chain((0..16).map(|id| format!("{id},8,8,0.0\n")))
+            .collect();
+        let path = write_csv(dir.path(), "burst.csv", &body);
+        let handoff = |seed| {
+            FrontendHandoffConfig::parse(
+                Some(FrontendHandoffConfig::VLLM_NEURON),
+                Some(seed),
+                Some(512),
+            )
+            .unwrap()
+        };
+        // Visibility instant of each request on a 10 µs clock.
+        let emissions = |config: Option<FrontendHandoffConfig>| {
+            let mut fe = load_text(std::slice::from_ref(&path), 1.0)
+                .unwrap()
+                .with_frontend_handoff(config);
+            let mut emitted = Vec::new();
+            for tick in 0..20_000_u64 {
+                let now = Time::from_us(tick * 10);
+                fe.drain_due(now, |request| {
+                    assert_eq!(request.core.arrival_time, Time::ZERO);
+                    emitted.push((request.core.id, now));
+                });
+                assert_eq!(fe.in_flight(), 16, "hand-off requests are in flight");
+            }
+            assert!(fe.exhausted());
+            emitted
+        };
+        let immediate = emissions(None);
+        assert!(immediate.iter().all(|&(_, at)| at == Time::ZERO));
+        let serialized = emissions(handoff(4));
+        assert_eq!(serialized.len(), 16);
+        assert!(serialized.windows(2).all(|pair| pair[0].1 <= pair[1].1));
+        assert!(
+            serialized[0].1 >= Time::from_ms(18.0),
+            "the first request pays the measured ingest and transport delays"
+        );
+        assert_eq!(serialized, emissions(handoff(4)));
+        assert_ne!(serialized, emissions(handoff(5)));
+    }
 
     #[test]
     fn drains_due_in_arrival_order() {

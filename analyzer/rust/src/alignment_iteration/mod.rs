@@ -199,6 +199,12 @@ const PREDICT_COLUMNS: &[&str] = &["iter_id", "total_time_ms", "slot_time_ms", "
 
 #[derive(Deserialize)]
 struct ParsedTrace {
+    #[serde(default)]
+    trace_provider: Option<String>,
+    #[serde(default)]
+    measurement_granularity: Option<String>,
+    #[serde(default)]
+    physical_core_ids: Option<Vec<u64>>,
     kernel_names: BTreeMap<String, String>,
     iteration_details: Vec<MeasuredIteration>,
     /// Schema 6: the kernel rows live in a parquet sibling instead of inline
@@ -1058,6 +1064,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "profile_log_dir": input.profile_log_dir.display().to_string(),
             "predict_log_dir": input.predict_log_dir.display().to_string(),
             "measured_phases": inventory.phases.keys().collect::<Vec<_>>(),
+            "trace_provider": measured.trace_provider,
+            "measurement_granularity": measured.measurement_granularity,
+            "physical_core_ids": measured.physical_core_ids,
             "measured_device_ids": inventory.device_ids,
             "representative_device_id": inventory.representative_device_id,
             "iterations": iteration_rows.len(),

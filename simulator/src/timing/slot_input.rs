@@ -47,6 +47,11 @@ use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
 use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
+use crate::timing::kernels::NeuronLlamaForwardKernelInput;
+use crate::timing::kernels::NeuronLlamaRegionKernelInput;
+use crate::timing::kernels::NeuronLlamaSegmentKernelInput;
+use crate::timing::kernels::NeuronLlamaSegmentedForwardKernelInput;
+use crate::timing::kernels::NeuronNkiKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
 use crate::timing::kernels::{
@@ -155,6 +160,11 @@ macro_rules! log_inputs {
 
 log_inputs! {
     Gemm        => SingleGemmKernelInput,
+    NeuronLlamaForward => NeuronLlamaForwardKernelInput,
+    NeuronLlamaRegion => NeuronLlamaRegionKernelInput,
+    NeuronLlamaSegment => NeuronLlamaSegmentKernelInput,
+    NeuronLlamaSegmentedForward => NeuronLlamaSegmentedForwardKernelInput,
+    NeuronNki => NeuronNkiKernelInput,
     BatchedGemm => BatchedGemmKernelInput,
     GroupedGemm => GroupedGemmKernelInput,
     RmsNorm     => RmsNormKernelInput,

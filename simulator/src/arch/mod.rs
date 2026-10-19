@@ -25,6 +25,7 @@ pub mod kv_layout;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;
 pub mod llama3_dp_attn_tp_ffn;
+pub mod llama3_vllm_neuron;
 pub mod mimo_v2_model_cfg;
 pub mod mimo_v2_vllm_fp8_swa_moe;
 pub mod model_cfg;
@@ -93,6 +94,7 @@ pub use inkling_vllm_nvfp4_rel_attn_moe::{
 pub use llama3_dense::{DenseParallel, Llama3DenseModel};
 pub use llama3_dense_tp::{DenseTpParallel, Llama3DenseTpModel};
 pub use llama3_dp_attn_tp_ffn::{DpAttnTpFfnParallel, Llama3DpAttnTpFfnModel};
+pub use llama3_vllm_neuron::{Llama3VllmNeuronModel, VllmNeuronParallel};
 pub use mimo_v2_model_cfg::{MimoV2AttnShape, MimoV2ModelCfg};
 pub use mimo_v2_vllm_fp8_swa_moe::{
     MimoV2VllmConfigs, MimoV2VllmModel, MimoV2VllmParallel, MimoV2VllmResolved,

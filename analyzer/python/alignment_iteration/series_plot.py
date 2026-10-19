@@ -573,7 +573,7 @@ def _render_stream_breakdown(
     comparison_rows = _operation_comparison_rows(semantic_names, measured_path, simulated_path)
 
     labels = [f"GPU {device_id} {label}" for label, _rows in displayed_streams]
-    labels.extend(["Nsight barrier critical path", "Timing-predict critical path"])
+    labels.extend(["Measured barrier critical path", "Timing-predict critical path"])
     rows_to_draw = [rows for _label, rows in displayed_streams]
     rows_to_draw.extend([measured_path, simulated_path])
     table_blocks = min(BREAKDOWN_TABLE_BLOCKS, max(1, len(semantic_names)))
@@ -610,7 +610,7 @@ def _render_stream_breakdown(
     axis.set_title(
         f"{run_label}\nIteration {breakdown['iteration_id']} · {breakdown['stage']} · "
         f"streams of GPU {device_id}{switches_title}\n"
-        f"Nsight {measured_ms:.3f} ms · "
+        f"Measured {measured_ms:.3f} ms · "
         f"Timing-predict {simulated_ms:.3f} ms · "
         f"delta {delta_ms:+.3f} ms ({relative_pct:+.2f}%)",
         fontweight="bold",
@@ -723,7 +723,7 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
         shared_path_limit_ms = 1.0
     ax.set_xlim(0.0, shared_path_limit_ms)
     cumulative_ax.set_xlim(0.0, shared_path_limit_ms)
-    measured_label = f"Nsight measured\n{measured_sum:.3f} ms barrier critical path"
+    measured_label = f"Measured\n{measured_sum:.3f} ms barrier critical path"
     ax.set_yticks([1.0, 0.0])
     ax.set_yticklabels(
         [

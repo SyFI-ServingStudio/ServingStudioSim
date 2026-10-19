@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import uuid
 from collections.abc import Mapping, Sequence
@@ -182,6 +183,53 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
     measure_parser.set_defaults(
         command_fn=_cmd_measure, clear_l2=True, telemetry=True, energy=None
     )
+
+    ops_parser = subparsers.add_parser(
+        "ops", help="Capture and analyze per-op Neuron execution without timing DB writes."
+    )
+    ops_parser.add_argument("table", nargs="?", help="Registered whole-forward kernel kind.")
+    ops_parser.add_argument("--backend")
+    ops_parser.add_argument("--spec", action="append", default=[])
+    ops_parser.add_argument("--specs", type=Path)
+    ops_parser.add_argument(
+        "--from-capture", type=Path, help="Re-analyze a saved capture manifest offline."
+    )
+    ops_parser.add_argument(
+        "--validated-run", type=Path, help="Reuse a fully verified numerical-run receipt."
+    )
+    ops_parser.add_argument("--output-dir", type=Path, required=True)
+    ops_parser.add_argument("--gpu-name")
+    ops_parser.add_argument(
+        "--forwards", type=int, choices=(1, 2),
+        help="Selected forwards: prefill supports/defaults to 1; decode defaults to 2.",
+    )
+    ops_parser.add_argument(
+        "--ranks", default="0", help="Comma-separated captured TP ranks; default 0."
+    )
+    ops_parser.add_argument("--memory-limit-gb", type=int, default=60)
+    ops_parser.add_argument(
+        "--instruction-buffer-mb", type=int, choices=(64, 128, 256, 512, 1024), default=512,
+        help="Runtime instruction trace buffer in MiB; loss fails capture.",
+    )
+    ops_parser.add_argument(
+        "--dma-buffer-mb",
+        type=int,
+        choices=(64, 128, 256, 512, 1024),
+        default=256,
+        help="Runtime DMA trace buffer in MiB; loss fails capture.",
+    )
+    ops_parser.add_argument("--json", action="store_true")
+    ops_parser.add_argument(
+        "--debug-labels",
+        action="store_true",
+        help="Recover source labels in a separate debug cache; time the stock NEFF.",
+    )
+    ops_parser.add_argument(
+        "--labels-map",
+        type=Path,
+        help="Attach a verified static-label receipt to saved or new capture data.",
+    )
+    ops_parser.set_defaults(command_fn=_cmd_ops)
 
     merge_parser = subparsers.add_parser(
         "merge-db",
@@ -534,6 +582,110 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if managed_job is not None:
             managed_job.report("failed")
         raise
+
+
+def _cmd_ops(args: argparse.Namespace) -> int:
+    if args.from_capture is not None:
+        manifest = json.loads(args.from_capture.read_text())
+        kernel = manifest.get("kernel", {})
+        table, backend = kernel.get("kind"), kernel.get("backend")
+        if (args.table and args.table != table) or (args.backend and args.backend != backend):
+            raise ValueError("explicit kernel identity differs from the capture manifest")
+        if args.spec or args.specs:
+            raise ValueError("--from-capture takes its shape from the capture manifest")
+        shape = manifest["shape"]
+    else:
+        table, backend = args.table, args.backend
+        if not table or not backend:
+            raise ValueError("a new ops capture requires a table and --backend")
+        specs = _load_specs(args.spec, args.specs)
+        if len(specs) != 1:
+            raise ValueError("ops takes exactly one spec")
+        shape = specs[0]
+    profiler_spec = _resolve_profiler_spec(table, backend)
+    output_dir = args.output_dir.resolve()
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise ValueError("ops requires a new or empty output directory")
+    measurement_id = _measurement_id(output_dir)
+    created_at = _utc_now()
+    descriptor = {
+        "table": table,
+        "backend": backend,
+        "pointCount": 1,
+        "mode": "per_op",
+        "fromCapture": args.from_capture is not None,
+    }
+    managed_job = ManagedJob.from_environment("kernel_measure")
+    if managed_job is not None:
+        managed_job.register(output_dir, descriptor=descriptor, analyzer_resource_id=measurement_id)
+        managed_job.report("running")
+    try:
+        write_artifact_kind(output_dir, ArtifactKind.KERNEL_MEASUREMENT)
+        result = perf_api.profile_ops(
+            table,
+            shape,
+            backend=backend,
+            output_dir=output_dir,
+            from_capture=args.from_capture,
+            validated_run=args.validated_run,
+            forwards=args.forwards,
+            ranks=tuple(int(value) for value in args.ranks.split(",")),
+            memory_limit_gb=args.memory_limit_gb,
+            debug_labels=args.debug_labels,
+            labels_map=args.labels_map,
+            dma_buffer_mb=args.dma_buffer_mb,
+            instruction_buffer_mb=args.instruction_buffer_mb,
+        )
+        observed = result.get("observed_gpu_name")
+        if not observed:
+            raise ValueError("ops capture has no observed physical hardware identity")
+        _validate_measured_gpu_identity(args.gpu_name, observed)
+        artifacts = measurement_artifact_names(output_dir, result["artifacts"])
+        plots = measurement_artifact_names(output_dir, result.get("plots", []))
+        if "summary.json" not in artifacts or not set(plots) <= set(artifacts):
+            raise ValueError("ops did not declare its summary and plots")
+        summary = json.loads((output_dir / "summary.json").read_text())
+        if summary.get("schema_version") != 1 or not summary.get("per_op"):
+            raise ValueError("ops did not produce a versioned per-operation result")
+        runtime = summary.get("runtime_ms")
+        if (
+            not isinstance(runtime, dict)
+            or "median" not in runtime
+            or any(type(value) not in (int, float) or not math.isfinite(value)
+                   for value in runtime.values())
+        ):
+            raise ValueError("ops runtime_ms must contain finite statistics including median")
+        write_measurement_metadata(
+            output_dir,
+            measurement_id=measurement_id,
+            profiler_spec=profiler_spec,
+            shape=result["shape"],
+            requested_gpu_name=args.gpu_name,
+            observed_gpu_name=observed,
+            gpu_count=result.get("gpu_count", 1),
+            duration_s=None,
+            telemetry=False,
+            created_at=created_at,
+            summary_file="summary.json",
+            plots=plots,
+            artifacts=artifacts,
+        )
+        if managed_job is not None:
+            managed_job.report("ready", summary={**descriptor, "resourceId": measurement_id})
+    except KeyboardInterrupt:
+        if managed_job is not None:
+            managed_job.report("interrupted")
+        raise
+    except Exception:
+        if managed_job is not None:
+            managed_job.report("failed")
+        raise
+    if args.json:
+        print(json.dumps({"ok": True, **result, "resource_id": measurement_id}, indent=2))
+    else:
+        print(f"per-op measurement: {output_dir / MEASUREMENT_METADATA_FILENAME}")
+        print(f"operations: {output_dir / 'operations.csv'}")
+    return 0
 
 
 def _cmd_measure(args: argparse.Namespace) -> int:

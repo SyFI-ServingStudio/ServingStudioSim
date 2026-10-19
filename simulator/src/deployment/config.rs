@@ -103,6 +103,20 @@ pub struct WorkloadSpec {
     #[serde(default = "default_tick_dt_us")]
     #[param(default = 100)]
     pub tick_dt_us: u64,
+    /// Opt-in frontend hand-off model: the API server makes released requests
+    /// visible to the engine one at a time. The first request into an idle
+    /// server pays a measured ingest delay; requests arriving while earlier ones
+    /// are still being handed off follow at measured inter-arrival gaps. Both
+    /// are resampled from the named empirical distribution. Omit for immediate
+    /// visibility.
+    #[serde(default)]
+    #[param(choices = simulator::sim::FrontendHandoffConfig::CONFIG_CHOICES)]
+    pub frontend_handoff: Option<String>,
+    /// Seed of the hand-off draws; each request's delays are a deterministic
+    /// function of this seed and its id. Requires `frontend_handoff`; absent
+    /// means 0.
+    #[serde(default)]
+    pub frontend_handoff_seed: Option<u64>,
 }
 
 /// serde fallback for `tick_dt_us`: 100 µs matches the historical hardcoded tick,

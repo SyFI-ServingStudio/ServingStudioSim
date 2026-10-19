@@ -169,7 +169,11 @@ def acceptance_chain(case: Case, output_len: int) -> list[float]:
 
 
 def trace_text(
-    case: Case, spec: TraceSpec, *, speculative_acceptance: Callable[[int], list[float]] | None = None
+    case: Case,
+    spec: TraceSpec,
+    *,
+    speculative_acceptance: Callable[[int], list[float]] | None = None,
+    simultaneous: bool = False,
 ) -> str:
     """Regenerate one trace from its shapes.
 
@@ -177,6 +181,8 @@ def trace_text(
     never confused, and arrival times are a deterministic 1 req/s baseline that
     `saturated` discards and `trace-timed` rescales by `rate`.
     `speculative_acceptance` maps a request's output length to its chain.
+    `simultaneous` (an engine's `EngineContract.simultaneous_trace`) puts every
+    arrival at 0 and admits a request that fills the context exactly.
     """
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
@@ -187,12 +193,14 @@ def trace_text(
     rows = [shape for _ in range(spec.repeats) for shape in spec.shapes]
     prefix = case.slug if spec.id_suffix is None else f"{case.slug}-{spec.id_suffix}"
     for index, (input_len, output_len) in enumerate(rows):
-        if input_len + output_len >= case.max_model_len:
+        total = input_len + output_len
+        if total > case.max_model_len or (total == case.max_model_len and not simultaneous):
             raise PackError(
                 f"{case.slug} trace row {index} reaches max_model_len: "
                 f"{input_len}+{output_len} >= {case.max_model_len}"
             )
-        row = [f"{prefix}-{index:04d}", input_len, output_len, float(index * 1000)]
+        arrival = 0.0 if simultaneous else float(index * 1000)
+        row = [f"{prefix}-{index:04d}", input_len, output_len, arrival]
         if speculative_acceptance is not None:
             row.append(json.dumps(speculative_acceptance(output_len), separators=(",", ":")))
         writer.writerow(row)
@@ -274,7 +282,37 @@ def _extra_args(variant: Variant, case: Case) -> list[str]:
     return args + [flag, str(case.max_model_len)]
 
 
+def _native_server_block(variant: Variant, case: Case, host: HostProfile) -> dict[str, Any]:
+    """An engine-owned server block: the pack's portable fields, the host's
+    machine fields (`neuron_server`), and the one whole-chip device."""
+    contract = variant.contract
+    allowed = contract.host_server_required | contract.host_server_optional
+    unknown = set(host.neuron_server) - allowed
+    missing = contract.host_server_required - set(host.neuron_server)
+    if unknown or missing:
+        raise PackError(
+            f"{variant.engine} host neuron_server fields: missing {sorted(missing)}, "
+            f"unknown {sorted(unknown)}"
+        )
+    if set(variant.server) & allowed:
+        raise PackError(f"{variant.engine} runtime paths and image must come from the host profile")
+    devices = host.devices(case.device_role).split(",")
+    if len(devices) != 1 or not devices[0].isdigit():
+        raise PackError(f"{variant.engine} requires one whole-chip device role")
+    return {
+        **variant.server,
+        **host.neuron_server,
+        "model_path": host.checkpoint_path(variant.checkpoint),
+        "port": host.port,
+        "startup_timeout": host.startup_timeout,
+        "neuron_device": int(devices[0]),
+        "max_model_len": case.max_model_len,
+    }
+
+
 def _server_block(pack: Pack, variant: Variant, case: Case, host: HostProfile) -> dict[str, Any]:
+    if variant.contract.native_server:
+        return _native_server_block(variant, case, host)
     body = {
         "model_path": host.checkpoint_path(variant.checkpoint),
         "port": host.port,
@@ -310,6 +348,10 @@ def _workload_block(
     if case.rate is not None:
         body["rate"] = case.rate.value
     body["max_model_len"] = case.max_model_len
+    if variant.contract.simultaneous_trace:
+        # The whole replay is one simultaneous burst of max_concurrency requests.
+        body["max_items"] = case.max_concurrency
+    body.update(variant.contract.workload)
     return body
 
 
@@ -337,10 +379,11 @@ def profile_document(
         "name": f"{prefix}_{case.slug}_{short}",
         "log_dir": f"./{pass_name}",
         "gpu": variant.gpu,
-        "cuda_visible_devices": host.devices(case.device_role),
         "profile_kind": profile_pass.kind,
         "engine": variant.engine,
     }
+    if not variant.contract.native_server:
+        document["cuda_visible_devices"] = host.devices(case.device_role)
     if host.fork_python:
         document["fork_python"] = _absolute(host.fork_python, repo_root)
     if variant.python_runtime is not None:
@@ -362,6 +405,14 @@ def profile_document(
             nsys["analyze_iteration_end"] = end
         document["nsys"] = nsys
     document["workload"] = _workload_block(variant, case, host, trace_name, profile_pass.kind)
+    if variant.contract.native_server:
+        # Host-profile filesystem paths are repository-relative, independent
+        # of where the campaign is rendered. Image/socket URIs and the image's
+        # interpreter keep their declared spelling.
+        for key in ("model_path", "cache_path", "req_frontend_binary", "accepted_forward_path"):
+            document["server"][key] = _absolute(document["server"][key], repo_root)
+        for key in ("tokenizer", "text_file"):
+            document["workload"][key] = _absolute(document["workload"][key], repo_root)
     if profile_pass.warmup:
         document["workload"]["warmup"] = True
     return document
@@ -502,6 +553,7 @@ def simulation_document(
             }
         },
     }
+    document["io"].update(variant.contract.simulation_io)
     for key, value in variant.raw_overrides.items():
         document[key] = value
     return document
@@ -509,10 +561,10 @@ def simulation_document(
 
 def _kernel_pass(variant: Variant):
     for item in variant.profile_passes:
-        if item.kind == "nsys":
+        if item.kind in {"nsys", "neuron"}:
             return item
     raise PackError(
-        f"variants.{variant.name} has no nsys profile pass; kernel alignment needs one"
+        f"variants.{variant.name} has no native kernel capture pass; kernel alignment needs one"
     )
 
 
@@ -571,7 +623,7 @@ def case_documents(
 
 def case_traces(pack: Pack, case: Case) -> dict[str, str]:
     """Trace file name → contents for one rendered case directory."""
-    traces = {WORKLOAD_TRACE_NAME: trace_text(case, case.workload_trace)}
+    traces = {WORKLOAD_TRACE_NAME: case_trace_text(pack, case, case.workload_trace)}
     if case.speculative_acceptance is not None:
         traces[SPECULATIVE_TRACE_NAME] = trace_text(
             case,
@@ -579,8 +631,14 @@ def case_traces(pack: Pack, case: Case) -> dict[str, str]:
             speculative_acceptance=lambda output_len: acceptance_chain(case, output_len),
         )
     if case.kernel_trace is not None:
-        traces[KERNEL_TRACE_NAME] = trace_text(case, case.kernel_trace)
+        traces[KERNEL_TRACE_NAME] = case_trace_text(pack, case, case.kernel_trace)
     return traces
+
+
+def case_trace_text(pack: Pack, case: Case, spec: TraceSpec) -> str:
+    """One case trace under its engine's arrival contract."""
+    simultaneous = pack.variant_of(case).contract.simultaneous_trace
+    return trace_text(case, spec, simultaneous=simultaneous)
 
 
 def render_case(

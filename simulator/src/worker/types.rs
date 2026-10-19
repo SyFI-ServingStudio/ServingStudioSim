@@ -559,6 +559,12 @@ pub struct WorkerConfig {
     /// budget is applied per DP group. See
     /// [`crate::worker::admission::prefill_fits_budget`].
     pub max_batch_tokens: Option<u32>,
+    /// Chunked prefill: prefill requests scheduled per partition per iteration,
+    /// continued chunks and fresh prompts alike. None is unlimited.
+    pub max_prefill_requests_per_iteration: Option<u32>,
+    /// Chunked prefill: resident requests per partition, started prompts and
+    /// decodes alike. None is unlimited; KV stays the physical capacity owner.
+    pub max_resident_requests_per_partition: Option<u32>,
     /// Queue discipline the admission lifecycle uses to pick the head it gates
     /// (from the worker selector). Only the iter-wise local-prefill/decode and
     /// prefill-handoff lifecycles read it today.
@@ -610,6 +616,17 @@ pub struct WorkerConfig {
     /// Attention-DP partition placement (from the chunked-prefill selector).
     /// Only multi-partition chunked-prefill workers read it.
     pub dp_placement: crate::worker::config::DpPlacement,
+    /// Async one-step lookahead plan offset (from the chunked-prefill
+    /// selector's `async_lookahead_us`). `Some(w)` plans each next step `w`
+    /// after the current one starts, from the messages visible by then; `None`
+    /// is the synchronous cadence. Only the chunked-prefill recipe reads it.
+    pub async_lookahead: Option<Time>,
+    /// Plan offset of the step after one that started from an idle engine
+    /// (nothing in flight, so no predecessor's output gates its successor's
+    /// plan). `None` uses `async_lookahead` for every step. The deployment sets
+    /// it from the frontend hand-off model's per-seed draw of the measured
+    /// first-step offsets; it has no effect without `async_lookahead`.
+    pub async_lookahead_from_idle: Option<Time>,
 }
 
 impl Default for WorkerConfig {
@@ -623,6 +640,8 @@ impl Default for WorkerConfig {
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             max_batch_tokens: None,
+            max_prefill_requests_per_iteration: None,
+            max_resident_requests_per_partition: None,
             pending_order: crate::worker::admission::PendingOrderKind::default(),
             batch_policy: crate::worker::config::BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
@@ -637,6 +656,8 @@ impl Default for WorkerConfig {
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,
+            async_lookahead: None,
+            async_lookahead_from_idle: None,
         }
     }
 }
