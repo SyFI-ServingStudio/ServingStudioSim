@@ -611,8 +611,8 @@ mod tests {
     #[test]
     fn a_hybrid_head_sizes_one_pool_and_charges_the_state() {
         // (80 - 8 null-block bytes) / 2 = 36 units. A 12-token prompt holds
-        // 12 tokens of KV plus its state twice (align mode keeps the previous
-        // step's): 28 units, so one fits and two do not.
+        // 12 tokens of KV plus its 8-unit state once (align mode's previous-step
+        // copy is not held): 20 units, so one fits and two do not.
         let store = shared_with(&[(0, 12, 1), (1, 12, 1)]);
         let mut worker = hybrid_head(Rc::clone(&store), 16, 80, true);
         worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));

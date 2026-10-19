@@ -238,7 +238,7 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
     };
     let _ = writeln!(
         out,
-        "\n  One request at max_model_len {}, per GPU",
+        "\n  One request at max_model_len {} in vLLM's estimate, per GPU",
         grouped(u64::from(max_model_len))
     );
     let total: u64 = result.request_parts.iter().map(|part| part.bytes).sum();
@@ -275,20 +275,20 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
             (KvGrowth::PerToken { .. }, Some(tokens)) if tokens > u64::from(max_model_len) => {
                 let block = accounting.charged_block_tokens;
                 format!(
-                    "{} tokens ({} blocks of {})",
+                    "{} tokens ({} of {})",
                     grouped(tokens),
-                    grouped(tokens / block),
+                    plural(tokens / block, "block"),
                     grouped(block)
                 )
             }
             (_, Some(tokens)) => format!("{} tokens", grouped(tokens)),
             (_, None) => {
-                let copies = charge.charged_copies;
+                let copies = charge.held_copies;
                 if charge.align_copy == Some(true) {
                     format!(
-                        "{} ({} + align)",
-                        plural(u64::from(copies), "copy"),
-                        copies - 1
+                        "{} ({} held + align)",
+                        plural(u64::from(copies) + 1, "copy"),
+                        copies
                     )
                 } else {
                     plural(u64::from(copies), "copy")
@@ -324,6 +324,19 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
     );
     if let Some(tokens) = result.capacity_tokens {
         let _ = writeln!(out, "  GPU KV cache size: {} tokens", grouped(tokens));
+    }
+    if let (Some(held), Some(estimated)) = (
+        result.admission_units_at_max_model_len,
+        result.units_per_request_at_max_model_len,
+    ) {
+        if held < estimated {
+            let _ = writeln!(
+                out,
+                "  A running request holds {} of the estimate's {}: the align copy is not held",
+                human_bytes(per_gpu(held * accounting.bytes_per_unit)),
+                human_bytes(per_gpu(estimated * accounting.bytes_per_unit)),
+            );
+        }
     }
 }
 

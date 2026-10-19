@@ -13,6 +13,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.attention._gdn_common import reject_verify_tokens
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
@@ -155,17 +156,20 @@ def _semantic_flops(
     num_value_heads: int,
     key_head_dim: int,
     value_head_dim: int,
+    per_request: int = 1,
 ) -> int:
     """Nominal semantic FLOPs, not a sum of physical Torch instructions.
 
     Transcendentals count as one operation. Copies, casts, and head expansion
     count as zero. The dominant recurrence counts decay plus memory/update/
-    readout arithmetic over the semantic FP32 state.
+    readout arithmetic over the semantic FP32 state, once per token
+    (``per_request`` tokens per request in a verify step).
     """
-    state_elements = batch_size * num_value_heads * key_head_dim * value_head_dim
-    qk_norm = 2 * batch_size * num_qk_heads * (3 * key_head_dim + 1)
-    query_scale = batch_size * num_value_heads * key_head_dim
-    gates = 4 * batch_size * num_value_heads + num_value_heads
+    tokens = batch_size * per_request
+    state_elements = tokens * num_value_heads * key_head_dim * value_head_dim
+    qk_norm = 2 * tokens * num_qk_heads * (3 * key_head_dim + 1)
+    query_scale = tokens * num_value_heads * key_head_dim
+    gates = 4 * tokens * num_value_heads + num_value_heads
     recurrence = 7 * state_elements
     return qk_norm + query_scale + gates + recurrence
 
@@ -179,15 +183,21 @@ def _logical_bytes(
     value_head_dim: int,
     dtype: DType,
     state_dtype: DType,
+    per_request: int = 1,
 ) -> float:
-    """Logical boundary traffic, excluding all Torch intermediate tensors."""
+    """Logical boundary traffic, excluding all Torch intermediate tensors.
+
+    A verify step (``per_request`` tokens per request) reads one state per
+    request and writes one checkpoint per token.
+    """
+    tokens = batch_size * per_request
     activation_elements = (
-        2 * batch_size * num_qk_heads * key_head_dim
-        + 2 * batch_size * num_value_heads * value_head_dim
-        + 2 * batch_size * num_value_heads
+        2 * tokens * num_qk_heads * key_head_dim
+        + 2 * tokens * num_value_heads * value_head_dim
+        + 2 * tokens * num_value_heads
     )
-    state_elements = batch_size * num_value_heads * key_head_dim * value_head_dim
-    fp32_elements = 2 * num_value_heads + 2 * state_elements
+    state_elements = num_value_heads * key_head_dim * value_head_dim
+    fp32_elements = 2 * num_value_heads + (batch_size + tokens) * state_elements
     return activation_elements * dtype.size_bytes() + fp32_elements * state_dtype.size_bytes()
 
 
@@ -199,8 +209,10 @@ def profile_gdn_recurrent_decode(
     value_head_dim: int,
     dtype: DType | str,
     state_dtype: DType | str,
+    num_tokens: int | None = None,
 ) -> ComputeMetrics:
     """Profile the complete multi-launch Torch GDN decode reference."""
+    reject_verify_tokens("gdn_recurrent_decode:torch", int(batch_size), num_tokens)
     (
         batch_size,
         num_qk_heads,

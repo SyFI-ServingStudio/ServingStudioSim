@@ -11,21 +11,29 @@ from profiling.runners.autotune_cache import autotune_cached
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.moe.exact_topk import exact_topk_ids
-from profiling.runners.moe.fp8_block_fused_moe import forced_routing_logits
+from profiling.runners.moe.routing_methods import (
+    UNBIASED_ROUTING_METHODS,
+    forced_routing_logits,
+    validate_routing_groups,
+)
 
 WEIGHT_FORMAT = DType.NVFP4_E2M1
 GROUP_SIZE = 16
-# flashinfer.fused_moe.RoutingMethodType. Both are sigmoid + correction-bias
-# top-k with renormalized weights; DeepSeekV3 also applies the routed scale.
-# Ungrouped DeepSeekV3 runs the same routingCustom kernel as MiniMax2
-# (trtllm_fused_moe_runner.cu, `DeepSeekV3 && nGroup <= 1`).
-ROUTING_METHODS = {"minimax2": 7, "deepseek_v3": 2}
+# flashinfer.fused_moe.RoutingMethodType. MiniMax2 and DeepSeekV3 are sigmoid +
+# correction-bias top-k with renormalized weights; DeepSeekV3 also applies the
+# routed scale. Ungrouped DeepSeekV3 runs the same routingCustom kernel as
+# MiniMax2 (trtllm_fused_moe_runner.cu, `DeepSeekV3 && nGroup <= 1`).
+# RenormalizeNaive is softmax -> top-k -> renormalize with no bias and no
+# groups: vLLM picks it for softmax scoring with renormalize
+# (fused_moe/config.py:get_routing_method_type), e.g. Qwen3-Next's norm_topk_prob.
+ROUTING_METHODS = {"minimax2": 7, "deepseek_v3": 2, "renormalize_naive": 4}
 # Bytes per router logit and per correction-bias element that vLLM passes.
 # MiniMax2 rows keep the BF16 router of their model. DeepSeekV3 rows are for a
 # model with `moe_router_dtype: float32`: GateLinear emits FP32 logits
 # (router_logits_dtype = gate.out_dtype) and e_score_correction_bias is an FP32
-# parameter, both passed to the kernel unchanged.
-ROUTING_ELEMENT_BYTES = {"minimax2": 2, "deepseek_v3": 4}
+# parameter, both passed to the kernel unchanged. RenormalizeNaive rows are for
+# a GateLinear without out_dtype, whose F.linear emits BF16 logits.
+ROUTING_ELEMENT_BYTES = {"minimax2": 2, "deepseek_v3": 4, "renormalize_naive": 2}
 # The SGLang deferred-finalize backend is only measured for MiniMax2.
 SGLANG_ROUTING_METHODS = frozenset({"minimax2"})
 _PREPARED_WEIGHT_CACHE: dict[tuple[str, int, int, int, int], tuple[Any, Any, Any, Any]] = {}
@@ -222,29 +230,23 @@ def tuning_label(args: dict[str, Any], stack: str, precomputed_routing: bool) ->
     )
 
 
-def _forced_routing(
+def forced_routing(
     torch: Any, ids: list[list[int]], args: dict[str, Any], device: Any = "cuda"
 ) -> tuple[Any, Any]:
-    """Router logits and zero correction bias whose top-k is exactly ``ids``.
+    """Router logits and correction bias whose top-k is exactly ``ids``.
 
     Both are in the dtype vLLM passes for the routing method (see
-    ``ROUTING_ELEMENT_BYTES``). With a zero bias, sigmoid + top-k picks the
-    distinct high logits regardless of the routed scale.
+    ``ROUTING_ELEMENT_BYTES``): FP32 for DeepSeekV3, BF16 otherwise. Biased
+    methods get a zero bias, so sigmoid + top-k picks the distinct high logits
+    regardless of the routed scale; softmax + top-k picks them too. Unbiased
+    methods get ``None`` for the bias, as vLLM passes.
     """
 
-    if args["routing_method"] == "deepseek_v3":
-        logits = forced_routing_logits(torch, ids, args["num_experts"], device)
-        return logits, torch.zeros(args["num_experts"], dtype=torch.float32, device=device)
-    logits = torch.full(
-        (args["num_tokens"], args["num_experts"]),
-        -16.0,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    selected = torch.tensor(ids, dtype=torch.int64, device=device)
-    priorities = torch.arange(args["top_k"], dtype=torch.bfloat16, device=device)
-    logits.scatter_(1, selected, (16.0 - priorities).expand_as(selected).contiguous())
-    return logits, torch.zeros(args["num_experts"], dtype=torch.bfloat16, device=device)
+    dtype = torch.float32 if args["routing_method"] == "deepseek_v3" else torch.bfloat16
+    logits = forced_routing_logits(torch, ids, args["num_experts"], device, dtype)
+    if args["routing_method"] in UNBIASED_ROUTING_METHODS:
+        return logits, None
+    return logits, torch.zeros(args["num_experts"], dtype=dtype, device=device)
 
 
 def _validate_args(*, stack: str = "vllm", **kwargs: Any) -> dict[str, Any]:
@@ -263,8 +265,10 @@ def _validate_args(*, stack: str = "vllm", **kwargs: Any) -> dict[str, Any]:
         "routed_scaling_denominator",
     ):
         args[name] = int(args[name])
-        if args[name] <= 0:
-            raise ValueError(f"{name} must be positive")
+        # Ungrouped routers pass n_group = topk_group = 0.
+        floor = 0 if name in ("n_group", "topk_group") else 1
+        if args[name] < floor:
+            raise ValueError(f"{name} must be at least {floor}")
     args["per_expert_batches"] = tuple(int(value) for value in args["per_expert_batches"])
     if DType.from_value(args["input_dtype"]) is not DType.BF16:
         raise ValueError("NVFP4 fused MoE requires BF16 router/output precision")
@@ -274,14 +278,18 @@ def _validate_args(*, stack: str = "vllm", **kwargs: Any) -> dict[str, Any]:
         raise ValueError(f"unsupported routing method: {args['routing_method']}")
     if stack == "sglang" and args["routing_method"] not in SGLANG_ROUTING_METHODS:
         raise ValueError(f"unsupported routing method for SGLang: {args['routing_method']}")
-    # Grouped DeepSeekV3 routing only admits experts from the best topk_group
-    # groups, so forced logits could not realize an arbitrary histogram.
-    if args["routing_method"] == "deepseek_v3" and (
-        args["n_group"] != 1 or args["topk_group"] != 1
-    ):
-        raise ValueError("only ungrouped deepseek_v3 routing (n_group=topk_group=1) is supported")
-    if args["hidden_size"] % 256 or args["intermediate_size"] % 256:
-        raise ValueError("TRT-LLM NVFP4 dimensions must be divisible by 256")
+    validate_routing_groups(args["routing_method"], args["n_group"], args["topk_group"])
+    # vLLM pads checkpoint weights to these alignments before the shuffle
+    # (flashinfer_fp4_moe.py: align_trtllm_fp4_moe_hidden_dim_for_fi to 256,
+    # align_fp4_moe_weights_for_fi to 64 for the gated gate/up), so the kernel
+    # only ever sees aligned dimensions. The SGLang path keeps the 256 rule for
+    # both: no SGLang source was checked for a finer intermediate alignment.
+    intermediate_alignment = 256 if stack == "sglang" else 64
+    if args["hidden_size"] % 256 or args["intermediate_size"] % intermediate_alignment:
+        raise ValueError(
+            "TRT-LLM NVFP4 needs hidden_size divisible by 256 and intermediate_size by "
+            f"{intermediate_alignment}"
+        )
     if len(args["per_expert_batches"]) != args["num_experts"]:
         raise ValueError("per_expert_batches must contain one count per global expert")
     if args["num_experts"] % args["num_local_experts"]:
@@ -324,10 +332,11 @@ def _logical_bytes(
     # Router logits + correction bias at the router's element size, or fp32
     # weights + int32 IDs already selected.
     routing_element = ROUTING_ELEMENT_BYTES[args["routing_method"]]
+    bias_elements = 0 if args["routing_method"] in UNBIASED_ROUTING_METHODS else experts
     routing = (
         8 * tokens * args["top_k"]
         if precomputed_routing
-        else routing_element * (tokens * experts + experts)
+        else routing_element * (tokens * experts + bias_elements)
     )
     # Packed FP4 routed activations + one FP8 scale per group of GROUP_SIZE.
     activations = local_rows * (hidden // 2 + hidden // GROUP_SIZE)
@@ -381,7 +390,7 @@ def _profile_nvfp4_fused_moe_sm100(
             top_k=args["top_k"],
             per_expert_batches=args["per_expert_batches"],
         )
-        routing_logits, routing_bias = _forced_routing(torch, ids, args)
+        routing_logits, routing_bias = forced_routing(torch, ids, args)
         hidden, hidden_scale, per_token_scale = _quantized_hidden(
             torch, quantize, args["num_tokens"], args["hidden_size"]
         )

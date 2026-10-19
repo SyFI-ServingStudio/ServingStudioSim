@@ -37,8 +37,8 @@ CAPTURE_DIR = f"{HF}/glm/vllm/capa/capture/20260101"
 # A dense member names a capture by its workload label.
 DENSE_TRACE = "capa"
 DRAFT = 3
-# The speculative pool's bound: request 2 (900 + 200 tokens) fits it only
-# without the draft window.
+# The speculative pool's bound: request 2 (900 + 200 tokens) ends exactly at
+# it, inside the last draft window, which vLLM clips.
 MAX_MODEL_LEN = 1100
 # id, input_len, output_len.
 TRACE_ROWS = [(0, 100, 50), (1, 200, 60), (2, 900, 200), (3, 50, 10)]
@@ -179,8 +179,8 @@ def sims(tmp_path: Path, arch_presets: Path) -> SimIndex:
             for role, pool in member.pools.items()
         ]
         if not build:
-            return None, None, member.bounds
-        return {"layer.qkv": 1} if lacks else {}, None, bounds
+            return None, None, member.bounds, None
+        return {"layer.qkv": 1} if lacks else {}, None, bounds, None
 
     sims.check(check, jobs=2)
     return sims
@@ -444,7 +444,7 @@ def test_a_capture_too_long_for_a_member_is_that_captures_misfit(sims) -> None:
 
     def check(member, capture, build):
         fits = member is not spec or capture.name != names[0]
-        return {} if build else None, None if fits else too_long, member.bounds
+        return {} if build else None, None if fits else too_long, member.bounds, None
 
     sims.check(check, jobs=2)
     assert spec.summary(sims.index)["unavailable"] == {names[0]: {"misfit": too_long}}
@@ -482,8 +482,8 @@ def test_rows_a_capture_lacks_block_it_before_its_misfit(sims) -> None:
     def check(member, capture, build):
         mine = member is spec and capture.name == first
         if build:
-            return ({"moe": 2} if mine else {}), None, member.bounds
-        return None, too_long if mine else None, member.bounds
+            return ({"moe": 2} if mine else {}), None, member.bounds, None
+        return None, too_long if mine else None, member.bounds, None
 
     sims.check(check, jobs=2)
     assert spec.summary(sims.index)["unavailable"] == {first: {"missing": {"moe": 2}}}
@@ -734,41 +734,15 @@ def test_the_requests_of_a_trace_digest_without_a_tags_columns(trace, rows_plan,
     assert workloads.requests_digest(lengths) != workloads.requests_digest(plain)
 
 
-def test_a_request_that_misses_the_draft_window_by_a_few_tokens_is_shortened(client, tmp_path):
+def test_a_request_ending_inside_the_draft_window_is_served_whole(client, tmp_path):
     started = _post(client, *SPEC, accept_rate=0.5)
     assert started.status_code == 202, started.json()
     sim_id = started.json()["simulation_id"]
     with (tmp_path / "sims" / sim_id / "workload.csv").open() as stream:
         rows = [(row["input_len"], row["output_len"]) for row in csv.DictReader(stream)]
-    # 900 + 200 + 3 drafted tokens is 3 past 1100: its output loses those 3.
-    assert rows == [("100", "50"), ("200", "60"), ("900", "197"), ("50", "10")]
-    assert _wait(client, sim_id)["workload"]["shortened"] == 1
-
-    # A worker that drafts nothing serves it whole.
-    dense = _post(client, *DENSE).json()["simulation_id"]
-    with (tmp_path / "sims" / dense / "workload.csv").open() as stream:
-        assert [row["output_len"] for row in csv.DictReader(stream)][2] == "200"
-
-
-def test_the_draft_window_counts_the_prefix_the_simulator_counts() -> None:
-    """A session row's ``prefix_kv`` (independent format) and a round's
-    ``prefix_len`` (chained) count as the simulator's reader counts them; a
-    ``prefix_kv`` without a session does not, and a request with too little to
-    lose is left for the simulator to refuse."""
-    bounds = [{"max_model_len": 100, "draft_tokens": 3}]
-    rows = [
-        {"input_len": "40", "output_len": "50", "session_id": "s", "prefix_kv": "10"},
-        {"input_len": "40", "output_len": "50", "session_id": "", "prefix_kv": "10"},
-        {"input_len": "40", "output_len": "50", "prefix_len": "10"},
-        {"input_len": "2", "output_len": "1", "prefix_len": "97"},
-    ]
-    assert simulate._fit_draft_window(bounds, rows) == 2
-    assert [(r["input_len"], r["output_len"]) for r in rows] == [
-        ("40", "47"),
-        ("40", "50"),
-        ("40", "47"),
-        ("2", "1"),
-    ]
+    # 900 + 200 ends at max_model_len: the simulator clips its last verifies
+    # as vLLM does, so the trace keeps every token.
+    assert rows == [("100", "50"), ("200", "60"), ("900", "200"), ("50", "10")]
 
 
 def test_a_failed_run_reports_its_cause(client, runner) -> None:

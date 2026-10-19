@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
-from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg, optional_arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -31,6 +31,15 @@ class GdnCausalConvDecodeArgs(KernelArgs):
     kernel_size: int = arg(unit="tokens", doc="Width of each causal filter.")
     dtype: DType = arg(doc="Element type of the input, filter and output.")
     state_dtype: DType = arg(doc="Element type of the convolution state.")
+    num_tokens: int | None = optional_arg(
+        unit="tokens",
+        same_as="batch_size",
+        doc=(
+            "Tokens across the batch, an equal number per request: a speculative "
+            "(MTP verify) step's accepted token plus drafts. Absent when each request "
+            "decodes one token."
+        ),
+    )
 
 
 DOC = KernelDoc(
@@ -51,10 +60,11 @@ DOC = KernelDoc(
     subcategory="Gated DeltaNet",
     formula=(
         "y[b, c] = SiLU(Σᵢ window[b, c, i] · weight[c, i]); state shifts by one sample",
-        "FLOPs = batch_size · channels · (2·kernel_size + 1)",
+        "T = num_tokens (batch_size when absent); L = kernel_size − 2 + T / batch_size",
+        "FLOPs = T · channels · (2·kernel_size + 1)",
         (
-            "bytes = (2·batch_size·channels + channels·kernel_size)·bytes(dtype) + "
-            "2·batch_size·channels·(kernel_size − 1)·bytes(state_dtype) + 4·batch_size"
+            "bytes = (2·T·channels + channels·kernel_size)·bytes(dtype) + "
+            "batch_size·channels·(kernel_size − 1 + L)·bytes(state_dtype) + 4·batch_size"
         ),
         "TFLOPS = FLOPs / time",
         "GB/s = bytes / time",
@@ -67,11 +77,19 @@ DOC = KernelDoc(
         "Allocation and the vLLM output check run before timing."
     ),
     caveats=(
+        "num_tokens > batch_size is a speculative verify step (vllm_triton only): "
+        "each request convolves num_tokens / batch_size tokens from the history at its "
+        "last accepted position, and its state row holds kernel_size − 2 + q samples "
+        "(gdn_spec_decode_reference). Bytes count the kernel_size − 1 history "
+        "samples read plus the kernel_size − 2 + q history row written.",
         "torch writes a new output tensor, while vllm_triton overwrites the "
         "input token; both update the state in place.",
         "The torch reference checks request indices on the GPU inside each timed call.",
         "FLOPs and bytes count the operation itself, not the torch backend's "
         "extra tensors and launches.",
+        "vllm_triton stores the state pool in the layout the installed vLLM "
+        "selects (state-first by default) and passes the transposed view, as "
+        "vLLM does; the layout moves the kernel time by up to a quarter.",
     ),
     reference="profiling.runners.attention.gdn_causal_conv_decode_reference",
 )
@@ -114,7 +132,9 @@ register(
         doc=BackendDoc(
             summary=(
                 "vLLM's causal_conv1d_update Triton call: convolution, SiLU and "
-                "in-place state update in one kernel."
+                "in-place state update in one kernel. Verify steps use its varlen "
+                "speculative form (query_start_loc, num_accepted_tokens, checkpoint "
+                "indices)."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
         ),

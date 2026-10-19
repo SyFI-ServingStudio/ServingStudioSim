@@ -274,7 +274,7 @@ def build_tml_fa4(torch: Any, shape: _Shape, device: Any) -> tuple[_Workload, An
         )
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{KIND}:tml_fa4 requires the alignment vLLM fork (vllm_upstream_fork_env)"
+            f"{KIND}:tml_fa4 requires the alignment vLLM fork (vllm_env)"
         ) from exc
 
     work = _build_workload(torch, shape, device)

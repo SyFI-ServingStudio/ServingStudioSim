@@ -334,6 +334,14 @@ def _write_provenance(
         "formulas": extraction.get("formulas", {}),
         "provisional_inputs": provisional,
     }
+    if pack.gpu_time_multiplier is not None:
+        multiplier = pack.gpu_time_multiplier
+        document["gpu_time_multiplier"] = {
+            "value": multiplier.value,
+            "status": multiplier.status,
+            "derived_from": multiplier.derived_from,
+            "evidence": multiplier.evidence,
+        }
     path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
     return path
 

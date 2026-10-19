@@ -752,6 +752,66 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
+            IterArchSel::MimoV2VllmFp8SwaMoe {
+                tp_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("MiMo-V2 FP8 vLLM", &g.worker)?;
+                let model = Arc::new(arch_build::mimo_v2_vllm_fp8_swa_moe(
+                    model_spec,
+                    *tp_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "MiMo-V2 FP8 vLLM",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            IterArchSel::Qwen35VllmNvfp4GdnDense {
+                max_model_len,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("Qwen3.5 NVFP4 vLLM", &g.worker)?;
+                let model = Arc::new(arch_build::qwen35_vllm_nvfp4_gdn_dense(
+                    model_spec,
+                    *max_model_len,
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "Qwen3.5 NVFP4 vLLM",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
             IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative {
                 ep_size,
                 nvl_num_gpu,
@@ -781,6 +841,46 @@ impl Deployment for UnifiedDeployment {
                     expert_popularity_file.as_deref(),
                     token_corpus_file.as_deref(),
                     *draft_tokens,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
+            IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
+                max_model_len,
+                draft_tokens,
+                kv_cache_dtype,
+                indexer_kv_dtype,
+                ple_table_residency,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative(
+                    model_spec,
+                    *max_model_len,
+                    *draft_tokens,
+                    *kv_cache_dtype,
+                    *indexer_kv_dtype,
+                    *ple_table_residency,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
@@ -1685,6 +1785,7 @@ pools:
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             kv_accounting: Default::default(),
+            prefill_chunk_alignment: None,
         }
     }
 

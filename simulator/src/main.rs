@@ -164,7 +164,8 @@ struct DryRunArgs {
     /// "kernels": [{name, kind, missing, total}], "missing", "total",
     /// "pools": [{role, max_model_len, draft_tokens}]}`, one `pools` entry per
     /// request-serving pool group (`deployment::pool_bounds`; `draft_tokens`
-    /// is null for a non-speculative worker).
+    /// is null for a non-speculative worker), and "kv_cache", the run's
+    /// `raw/kv_cache.json` document.
     #[arg(long, value_name = "FILE")]
     report_json: Option<PathBuf>,
 }
@@ -498,7 +499,7 @@ fn cmd_dry_run(config: &Path, report_json: Option<&Path>) -> anyhow::Result<()> 
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     bridge.enable_dry_run();
     let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
-    let _flow = build_flow(&cfg, &bridge, store)?;
+    let flow = build_flow(&cfg, &bridge, store)?;
 
     let report = bridge.take_dry_run_report();
     println!("dry run: {} kernels", report.len());
@@ -506,6 +507,7 @@ fn cmd_dry_run(config: &Path, report_json: Option<&Path>) -> anyhow::Result<()> 
     if let Some(path) = report_json {
         let mut document = dry_run_document(&report);
         document["pools"] = serde_json::to_value(pool_bounds(&cfg)?)?;
+        document["kv_cache"] = simulator::log::kv_cache_document(&flow.cluster().borrow());
         write_dry_run_report(path, &document)?;
     }
     Ok(())

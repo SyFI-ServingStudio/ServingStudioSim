@@ -14,7 +14,7 @@ import os
 import sqlite3
 import tempfile
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -201,8 +201,8 @@ def _merge_tables(
 
         left_contract = _table_contract(left_conn, table_name)
         right_contract = _table_contract(right_conn, table_name)
-        _validate_matching_contracts(left_contract, right_contract)
-        table_stats, table_conflicts = _merge_common_table(right_conn, output_conn, left_contract)
+        contract = _widened_contract(left_contract, right_contract, output_conn)
+        table_stats, table_conflicts = _merge_common_table(right_conn, output_conn, contract)
         stats.append(table_stats)
         conflicts.extend(table_conflicts)
 
@@ -230,7 +230,9 @@ def _merge_common_table(
             continue
 
         differing = tuple(
-            column for column in contract.equality_columns if existing[column] != right_row[column]
+            column
+            for column in contract.equality_columns
+            if _value(existing, column) != _value(right_row, column)
         )
         if not differing:
             duplicates += 1
@@ -377,6 +379,41 @@ def _semantic_key(conn: sqlite3.Connection, table_name: str) -> tuple[str, ...]:
     return candidates[0]
 
 
+def _widened_contract(
+    left: _TableContract, right: _TableContract, output_conn: sqlite3.Connection
+) -> _TableContract:
+    """The contract both sides merge under.
+
+    Equal schemas merge as they are. A side may also hold extra trailing
+    nullable columns without a default: optional args columns
+    (``profiling.db.doc.optional_arg``), which a table gains only once a row
+    sets one. The output gains them too, and the other side's rows read NULL
+    there, which is what their unset arg is stored as.
+    """
+    if left.column_schema == right.column_schema:
+        _validate_matching_contracts(left, right)
+        return left
+    narrow, wide = sorted((left, right), key=lambda contract: len(contract.column_schema))
+    extra = wide.column_schema[len(narrow.column_schema) :]
+    if wide.column_schema[: len(narrow.column_schema)] != narrow.column_schema or any(
+        notnull or default is not None or pk for _, _, notnull, default, pk, _ in extra
+    ):
+        raise ValueError(f"profile table {left.name!r} has incompatible column schemas")
+    _validate_matching_contracts(left, replace(right, column_schema=left.column_schema))
+    if wide is right:
+        for name, declared, *_ in extra:
+            output_conn.execute(
+                f"ALTER TABLE {_quote_identifier(left.name)} "
+                f"ADD COLUMN {_quote_identifier(name)} {declared}"
+            )
+    return wide
+
+
+def _value(row: sqlite3.Row, column: str) -> Any:
+    """``row[column]``, or NULL when ``row``'s table lacks the optional column."""
+    return row[column] if column in row.keys() else None
+
+
 def _validate_matching_contracts(left: _TableContract, right: _TableContract) -> None:
     if left.column_schema != right.column_schema:
         raise ValueError(f"profile table {left.name!r} has incompatible column schemas")
@@ -400,7 +437,7 @@ def _find_by_key(
 
 
 def _insert_row(conn: sqlite3.Connection, contract: _TableContract, row: sqlite3.Row) -> None:
-    columns = contract.insert_columns
+    columns = tuple(column for column in contract.insert_columns if column in row.keys())
     column_sql = ", ".join(_quote_identifier(column) for column in columns)
     placeholders = ", ".join("?" for _ in columns)
     conn.execute(
@@ -412,7 +449,7 @@ def _insert_row(conn: sqlite3.Connection, contract: _TableContract, row: sqlite3
 def _report_row(
     conn: sqlite3.Connection, row: sqlite3.Row, contract: _TableContract
 ) -> dict[str, Any]:
-    out = {column: _json_value(row[column]) for column in contract.insert_columns}
+    out = {column: _json_value(_value(row, column)) for column in contract.insert_columns}
     if "run_key" in out:
         # A run key means nothing to whoever resolves the conflict.
         run = conn.execute(

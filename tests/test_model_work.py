@@ -861,6 +861,10 @@ Q36_FULL_ATTN = 104_857_600
 Q36_LINEAR_ATTN = 115_875_840 + 48 + 48
 Q36_MLP = 267_386_880
 VOCAB_Q36 = 248320
+# RMSNorm scales: input + post-attention on every layer (2 * 5120), q/k norm on the
+# 16 full layers (2 * 256), the GDN gated norm (128) on the 48 linear ones, and the
+# final norm (5120): 655_360 + 8_192 + 6_144 + 5_120.
+Q36_NORMS = 64 * 2 * 5120 + 16 * 2 * 256 + 48 * 128 + 5120  # 674_816
 
 
 def test_qwen3_6_hybrid_stack():
@@ -875,13 +879,15 @@ def test_qwen3_6_hybrid_stack():
 
 def test_qwen3_6_params_exact():
     label = load_model(QWEN36).label(Workload.causal_lm(decode=[4096], sampled=1))
-    assert label.params["total"] == 26_895_329_792  # "27B"
+    # Equals the text path of the Qwen3.8-27B checkpoint's safetensors headers, whose
+    # text_config is the same: 2 * 1_271_398_400 + 7_239_766_528 + 17_112_760_320 + 674_816.
+    assert label.params["total"] == 26_895_998_464  # "27B"
     # dense model: every layer param is activated, so activated == total minus embed/head.
-    assert label.params["activated"]["layers"] == 24_352_532_992
+    assert label.params["activated"]["layers"] == 24_353_201_664
     assert label.params["activated"]["with_embed_head"] == label.params["total"]
     breakdown = label.params["breakdown"]
     assert breakdown["attn"] == 48 * Q36_LINEAR_ATTN + 16 * Q36_FULL_ATTN  # 7_239_766_528
-    assert breakdown["norm"] == 48 * 128
+    assert breakdown["norm"] == Q36_NORMS
     assert breakdown["ffn"] == 64 * Q36_MLP  # 17_112_760_320
     assert breakdown["experts"] == 0 and breakdown["router"] == 0  # dense, not MoE
     assert breakdown["embedding"] == breakdown["lm_head"] == VOCAB_Q36 * 5120
@@ -1137,6 +1143,259 @@ def _qwen36_expected_weight_bytes(tokens: int) -> float:
         + 2 * 2048 * 248_320
         + 4096
     )
+
+
+# Qwen3.8-27B-NVFP4: the Qwen3.6-27B text model under ModelOpt MIXED_PRECISION.
+# Its checkpoint's `quantized_layers` stores the GDN in_proj_qkv / in_proj_z /
+# out_proj and the full-attention q/k/v/o_proj as FP8 E4M3 with one FP32 scale per
+# tensor, the MLP gate/up/down_proj and lm_head as NVFP4 (E2M1 + one E4M3 scale per
+# 16 weights), and leaves in_proj_b/a, conv1d, the norms and the embedding BF16.
+QWEN38 = Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_8_27b_nvfp4.json"
+
+
+def _fp8_tensor_bytes(n: int, k: int) -> int:
+    return n * k + 4
+
+
+def _nvfp4_bytes(n: int, k: int) -> int:
+    return n * k // 2 + n * k // 16
+
+
+# Per-layer compulsory weight bytes (hidden 5120; GDN q/k 2048, v/z 6144, 48 heads;
+# gated GQA q+gate 12288, k/v 1024, o input 6144; MLP 17408):
+Q38_GDN_BYTES = (
+    _fp8_tensor_bytes(2 * 2048 + 2 * 6144, 5120)  # in_proj_qkvz      83_886_084
+    + 2 * 96 * 5120  # in_proj_ba, BF16                                  983_040
+    + 2 * 10240 * 4  # conv1d, BF16                                       81_920
+    + _fp8_tensor_bytes(5120, 6144)  # out_proj                       31_457_284
+    + 2 * (48 + 48 + 128)  # A_log, dt_bias, gated norm                      448
+    + 2 * 2 * 5120  # input + post-attention norms                        20_480
+)  # 116_429_256
+Q38_GQA_BYTES = (
+    _fp8_tensor_bytes(12288 + 1024 + 1024, 5120)  # qkv_proj          73_400_324
+    + _fp8_tensor_bytes(5120, 6144)  # o_proj                         31_457_284
+    + 2 * 2 * 256  # q/k norms                                             1_024
+    + 2 * 2 * 5120  # input + post-attention norms                        20_480
+)  # 104_879_112
+Q38_MLP_BYTES = _nvfp4_bytes(2 * 17408, 5120) + _nvfp4_bytes(5120, 17408)  # 150_405_120
+Q38_LM_HEAD_BYTES = _nvfp4_bytes(248_320, 5120)  # 715_161_600
+# Per-token matmul FLOPs by precision (2 * n * k per weight, summed over layers):
+Q38_FP8_FLOPS = 2 * 48 * (16384 * 5120 + 5120 * 6144) + 2 * 16 * (14336 * 5120 + 5120 * 6144)
+Q38_FP4_FLOPS = 2 * 64 * 3 * 17408 * 5120
+Q38_BF16_MATMUL_FLOPS = 2 * 48 * (96 * 5120 + 10240 * 4)
+Q38_LM_HEAD_FLOPS = 2 * 248_320 * 5120
+
+
+@pytest.fixture(scope="module")
+def qwen38():
+    return load_model(QWEN38)
+
+
+def test_qwen38_is_the_qwen36_text_model_under_a_quantization_config(qwen38):
+    raw, twin = json.loads(QWEN38.read_text()), json.loads(QWEN36.read_text())
+    assert raw["architectures"] == ["Qwen3_5ForConditionalGeneration"]
+    assert raw["text_config"] == twin["text_config"]
+    assert raw["quantization_config"]["quant_algo"] == "MIXED_PRECISION"
+    wl = Workload.causal_lm(prefill=[(512, 1024)], decode=[4096] * 8, sampled=9)
+    quantized, bf16 = qwen38.label(wl), load_model(QWEN36).label(wl)
+    # Precision changes what a weight costs to read and where it computes, not how
+    # many parameters or FLOPs the model has.
+    assert quantized.params == bf16.params
+    assert quantized.params["total"] == 26_895_998_464
+    assert quantized.flops == bf16.flops
+    assert quantized.bytes["kv"] == bf16.bytes["kv"]
+
+
+def test_qwen38_mixed_precision_follows_the_checkpoint_module_by_module(qwen38):
+    label = qwen38.label(Workload.causal_lm(decode=[4096], sampled=1))
+    dtypes = {segment.name: segment.compute_dtype for segment in label.segments}
+    for name in ("linear.qkvz", "linear.out_proj", "full.qkv", "full.o"):
+        assert dtypes[name] == "fp8"
+    for name in ("linear.gate_up", "linear.down", "full.gate_up", "full.down", "lm_head"):
+        assert dtypes[name] == "fp4"
+    for name in ("linear.ba", "linear.conv1d", "embedding", "full.attn.decode"):
+        assert dtypes[name] == "bf16"
+    # The checkpoint's MTP layer (`mtp.*`, ignored and unlisted) is not part of the label.
+    assert not any(module.startswith("mtp") for module in qwen38.quant.converted_prefixes)
+
+
+def test_mixed_precision_resolves_per_layer_type_and_fused_shards():
+    def config(layers: dict, ignore=()):
+        return {
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "ignore": list(ignore),
+                "quantized_layers": layers,
+            }
+        }
+
+    fp8, nvfp4 = {"quant_algo": "FP8"}, {"quant_algo": "NVFP4", "group_size": 16}
+    kinds = ["linear", "full"]
+    layers = {
+        "model.language_model.layers.0.linear_attn.out_proj": fp8,
+        "model.language_model.layers.0.mlp.up_proj": nvfp4,
+        "model.language_model.layers.0.mlp.gate_proj": nvfp4,
+        "model.language_model.layers.1.self_attn.q_proj": fp8,
+        "model.language_model.layers.1.self_attn.k_proj": fp8,
+        "model.language_model.layers.1.mlp.up_proj": nvfp4,
+        "model.language_model.layers.1.mlp.gate_proj": nvfp4,
+        "model.language_model.layers.2.mlp.up_proj": fp8,  # past the body: an MTP layer
+        "mtp.layers.0.mlp.up_proj": fp8,  # excluded by `ignore`
+    }
+    packed = {"qkv_proj": ("q_proj", "k_proj"), "gate_up_proj": ("gate_proj", "up_proj")}
+    with pytest.raises(ValueError, match="layer schedule"):
+        parse_quantization_config(config(layers))
+    quant = parse_quantization_config(
+        config(layers, ignore=["mtp*"]), layer_types=kinds, packed_modules=packed
+    )
+    assert quant.converted_prefixes == {
+        "linear_attn.out_proj",
+        "self_attn.qkv_proj",
+        "mlp.gate_up_proj",
+    }
+    assert quant.compute_dtype == "fp4"
+    assert quant.scheme_for("mlp.gate_up_proj").scale_bytes(32, 64) == 32 * 4
+    assert quant.scheme_for("self_attn.qkv_proj").compute_dtype == "fp8"
+    assert quant.scheme_for("self_attn.qkv_proj").scale_bytes(32, 64) == 4
+    assert not quant.is_converted("linear_attn.in_proj_ba")
+
+    def refused(entries: dict, match: str, layer_types=kinds) -> None:
+        with pytest.raises(ValueError, match=match):
+            parse_quantization_config(
+                config(entries), layer_types=layer_types, packed_modules=packed
+            )
+
+    prefix = "model.language_model.layers"
+    # One q/k shard listed, or the two stored differently: no single fused matrix.
+    refused({f"{prefix}.1.self_attn.q_proj": fp8}, "one algorithm")
+    refused(
+        {f"{prefix}.1.self_attn.q_proj": fp8, f"{prefix}.1.self_attn.k_proj": nvfp4},
+        "one algorithm",
+    )
+    # Two layers of one kind, or two kinds sharing the MLP, quantized differently.
+    refused({f"{prefix}.0.mlp.down_proj": fp8}, "layer 1 differently", ["linear", "linear"])
+    refused({f"{prefix}.0.mlp.down_proj": fp8, f"{prefix}.1.mlp.down_proj": nvfp4}, "across")
+    refused({"lm_head": {"quant_algo": "W4A16_NVFP4"}}, "W4A16_NVFP4")
+
+
+def test_qwen38_decode_weight_bytes_and_precision_split(qwen38):
+    label = qwen38.label(Workload.causal_lm(decode=[4096] * 256, sampled=256))
+    embedding_rows = 256 * 5120 * 2
+    final_norm = 5120 * 2
+    assert label.bytes["weights"] == (
+        48 * Q38_GDN_BYTES
+        + 16 * Q38_GQA_BYTES
+        + 64 * Q38_MLP_BYTES
+        + final_norm
+        + embedding_rows
+        + Q38_LM_HEAD_BYTES
+    )  # 17_610_391_040
+    flops_by_dtype: dict[str, float] = {}
+    for segment in label.segments:
+        if segment.bucket != "attn_internal":
+            flops_by_dtype[segment.compute_dtype] = (
+                flops_by_dtype.get(segment.compute_dtype, 0.0) + segment.flops_total
+            )
+    assert flops_by_dtype == {
+        "fp8": 256 * Q38_FP8_FLOPS,
+        "fp4": 256 * (Q38_FP4_FLOPS + Q38_LM_HEAD_FLOPS),
+        "bf16": 256 * Q38_BF16_MATMUL_FLOPS,
+    }
+
+
+def test_qwen38_prefill_work_goldens(qwen38):
+    tokens = 8192
+    label = qwen38.label(Workload.causal_lm(prefill=[(tokens, 0)], sampled=1))
+    assert label.flops["attn_proj"] == tokens * (Q38_FP8_FLOPS + Q38_BF16_MATMUL_FLOPS)
+    assert label.flops["ffn"] == tokens * Q38_FP4_FLOPS
+    assert label.flops["lm_head"] == Q38_LM_HEAD_FLOPS
+    causal_pairs = tokens * (tokens + 1) // 2
+    assert label.flops["attn_internal"] == (
+        16 * 2 * 24 * (256 + 256) * causal_pairs  # gated GQA, QK^T + PV per pair
+        + 48 * 6 * 48 * 128 * 128 * tokens  # GDN delta rule, O(T)
+    )
+    # A fresh request reads no state; it writes its GQA K/V (config-declared BF16)
+    # and each GDN layer's FP32 recurrent and BF16 conv state once.
+    assert label.bytes["kv"] == (
+        16 * tokens * 4 * (256 + 256) * 2 + 48 * (48 * 128 * 128 * 4 + 10240 * 4 * 2)
+    )
+
+
+def test_qwen38_floors_label_the_served_fp8_kv_cache_under_the_fp4_arch(qwen38, tmp_path):
+    """vLLM serves the checkpoint with `--kv-cache-dtype fp8`, which config.json does
+    not state: the arch fixes it, so the floors halve the GQA K/V bytes and run the
+    prefill attention math on FP8 queries and keys. GDN state keeps its own dtype."""
+    arch = "qwen35_vllm_nvfp4_gdn_dense"
+    raw = json.loads(QWEN38.read_text())
+    group = {
+        "gpu": "NVIDIA B200",
+        "arch": {"type": arch, "model_config": str(QWEN38), "fp8": False},
+    }
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw" / "params.json").write_text(
+        json.dumps({"pools": {"main": {"groups": [group]}}})
+    )
+    spec = work_floors._pool_specs(tmp_path)["main"]
+    assert spec["arch_quant_dtype"] == "fp4"
+    served = work_floors._model_for_spec(spec)
+    # The mixed scheme (NVFP4 MLPs + lm_head, FP8 projections) matches the FP4 arch
+    # without an `fp8` flag; an `fp8` flag would claim a uniformly FP8 model.
+    assert served.quant.compute_dtypes == {"fp4", "fp8"}
+    work_floors._check_precision(served, spec)
+    with pytest.raises(ValueError, match="declares fp4\\+fp8 quantized compute"):
+        work_floors._check_precision(served, {**spec, "arch_fp8": True, "arch_quant_dtype": "fp8"})
+    # The compute dtype alone needs no builder: the config states its layer_types.
+    assert parse_quantization_config(raw).compute_dtype == "fp4"
+
+    linear, full = (stack.attn for stack in served.layers)
+    assert linear == qwen38.layers[0].attn
+    assert (full.kv_dtype_bytes, full.prefill_compute_dtype) == (1.0, "fp8")
+    wl = Workload.causal_lm(prefill=[(512, 0)], decode=[4096], sampled=2)
+    rows = {segment.name: segment for segment in served.label(wl).segments}
+    base = {segment.name: segment for segment in qwen38.label(wl).segments}
+    kv_entry = 4 * (256 + 256)  # one token at one layer, FP8
+    assert rows["full.attn.decode"].bytes_total == 16 * 4095 * kv_entry
+    assert rows["full.kv_cache_append"].bytes_total == 16 * (512 + 1) * kv_entry
+    assert rows["full.attn.prefill"].compute_dtype == "fp8"
+    assert rows["full.attn.decode"].compute_dtype == "bf16"
+    for name in base:
+        if not name.startswith("full.attn") and name != "full.kv_cache_append":
+            assert rows[name] == base[name], name
+
+
+def test_qwen38_location_map_consumes_every_semantic_once(qwen38):
+    location_map = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "model/work/location_maps/qwen35_vllm_nvfp4_gdn_dense_unified.json"
+        ).read_text()
+    )
+    assert location_map["schema_version"] == 1
+    assert location_map["mapping_id"] == "qwen35-vllm-nvfp4-gdn-dense-unified-v1"
+    assert location_map["arch_types"] == ["qwen35_vllm_nvfp4_gdn_dense"]
+    locations = [row["location"] for row in location_map["locations"]]
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    # 30 leaves for vLLM's first GDN layer (its input norm adds no residual), 30
+    # for the other 47, 15 per gated-GQA layer and 4 in the head; none communicate.
+    assert len(locations) == len(set(locations)) == 79
+    for workload in (
+        Workload.causal_lm(decode=[4096] * 3, sampled=3),
+        Workload.causal_lm(prefill=[(2048, 0)], decode=[300], sampled=2),
+    ):
+        names = [segment.name for segment in qwen38.label(workload).segments]
+        assert sorted(mapped) == sorted(names)
+    semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    # One semantic row covers all 48 GDN layers, so it sits on the 47-layer stack's
+    # leaf; the first layer's leaves carry none, except that its input norm is the
+    # embedding gather's consumer (the arch has no embedding leaf).
+    first = [location for location in locations if location.startswith("unified.gdn_first.")]
+    assert len(first) == 30
+    assert semantics["unified.gdn_first.input_norm"] == ["embedding"]
+    assert all(semantics[location] == [] for location in first[1:])
+    assert semantics["unified.gdn.gdn.qkvz"] == ["linear.qkvz"]
+    assert semantics["unified.gqa.gqa.kv_append"] == ["full.kv_cache_append"]
+    assert semantics["unified.lm_head"] == ["lm_head"]
 
 
 @pytest.fixture(scope="module")
@@ -2034,8 +2293,13 @@ def test_every_public_arch_on_an_fp4_checkpoint_is_labeled_fp4():
         config = root / "model" / "config" / f"{catalog[preset['checkpoint']]['config']}.json"
         raw = json.loads(config.read_text())
         # Only the compute dtype matters here, so per-layer ModelOpt exclusions
-        # (GLM-5.3-Flash NVFP4) need no layer resolution.
-        quant = parse_quantization_config(raw, layer_qualified_exclusions=True)
+        # (GLM-5.3-Flash NVFP4) need no layer resolution. Qwen3.8-Flash-Next's
+        # per-layer list (PLE table, MTP experts) only its own builder reads, so
+        # it reports the scheme that builder resolved.
+        if raw["architectures"][0] == "Qwen4ExpForConditionalGeneration":
+            quant = build_model(raw).quant
+        else:
+            quant = parse_quantization_config(raw, layer_qualified_exclusions=True)
         # Inkling keeps ModelOpt's hf_quant_config.json verbatim instead of a
         # quantization_config; model/work/models/inkling.py reads it from there.
         hf_quant = (raw.get("hf_quant_config") or {}).get("quantization") or {}
@@ -2367,7 +2631,7 @@ def test_modelopt_exclusions_need_a_per_layer_reader():
 
 
 def test_glm53_kpool_closed_forms_match_brute_force():
-    from model.work.attention.glm53_kpool_dsa import (
+    from model.work.attention.pooled_topk import (
         pooled_prefix_sum,
         selected_keys,
         selected_prefix_sum,
@@ -2571,7 +2835,7 @@ def test_glm53_geometry_rows_and_the_rest_partition_the_label(glm53):
 def test_glm53_kpool_batch_and_array_paths_match_the_per_request_sums(glm53):
     """`semantic_segments_batch`, and the numpy path a long interaction list takes,
     equal the per-request Python-int sums."""
-    from model.work.attention.glm53_kpool_dsa import _VECTORIZE_FROM
+    from model.work.attention.pooled_topk import _VECTORIZE_FROM
 
     attn = next(stack.attn for stack in glm53.layers if stack.tag == "dsa_moe")
     small = work_floors._aggregate_workload(_g53_geometry_totals([(2019, 29)], [3000, 10, 70000]))
@@ -3863,3 +4127,959 @@ def test_inkling_location_map_consumes_every_semantic_once(
     # the two NVFP4 groups.
     zero = 1 + 1 + 3 * (2 + ranks - 1) + 2 * ranks
     assert sum(not row["semantics"] for row in location_map["locations"]) == zero
+
+
+# ---------------------------------------------------------------------------
+# MiMo-V2.6-Flash (MiMoV2ForCausalLM): GA/SWA hybrid with asymmetric QK/V heads and
+# SWA sinks, dense layer 0 then MXFP4 MoE, FP8 block-quantized Linear weights.
+# ---------------------------------------------------------------------------
+
+MIMO = Path(__file__).resolve().parents[1] / "model" / "config" / "mimo_v2_6_flash_rl.json"
+# Read off config.json (XiaomiMiMo/MiMo-V2.6-Flash-RL @ 5711b268) and its safetensors.
+MIMO_H, MIMO_V, MIMO_Q, MIMO_DQK, MIMO_DV = 4096, 152_576, 64, 192, 128
+MIMO_KV_GA, MIMO_KV_SWA, MIMO_WINDOW = 4, 8, 128
+MIMO_DENSE_I, MIMO_I, MIMO_E, MIMO_TOPK = 16_384, 2048, 256, 8
+MIMO_GA = (0, 5, 11, 17, 23, 29, 35, 41, 47)
+MIMO_STACKS = {
+    "global_dense": (0,),
+    "swa_moe": tuple(layer for layer in range(48) if layer not in MIMO_GA),
+    "global_moe": MIMO_GA[1:],
+}
+# Per-layer matrices (n x k), by hand:
+#   GA  qkv_proj: (64*192 + 4*(192 + 128)) x 4096 = 13568 x 4096 = 55,574,528
+#   SWA qkv_proj: (64*192 + 8*(192 + 128)) x 4096 = 14848 x 4096 = 60,817,408
+#   o_proj: 4096 x (64*128 = 8192) = 33,554,432
+#   layer-0 dense SwiGLU: 3 x 16384 x 4096 = 201,326,592
+#   one routed expert: 3 x 2048 x 4096 = 25,165,824; router: 256 x 4096 = 1,048,576
+MIMO_GA_QKV = 13_568 * 4096
+MIMO_SWA_QKV = 14_848 * 4096
+MIMO_O = 4096 * 8192
+MIMO_DENSE = 3 * 16_384 * 4096
+MIMO_EXPERT = 3 * 2048 * 4096
+MIMO_ROUTER = 256 * 4096
+# 2 RMSNorms x 48 layers + final norm, 64 SWA sinks x 39 layers, 256 FP32 router
+# biases x 47 MoE layers: 397,312 + 2,496 + 12,032 = 411,840.
+MIMO_LEARNED = 97 * 4096 + 39 * 64 + 47 * 256
+MIMO_TABLE = 152_576 * 4096  # embed_tokens and (untied) lm_head, each 624,951,296
+# Text-path parameters of the safetensors headers (model.layers.*, embed_tokens,
+# norm, lm_head): BF16 1,660,291,520 + FP32 router biases 12,032 + FP8
+# 3,073,376,256 + 2 x 151,397,597,184 packed E2M1 bytes + 2 x 624,951,296 + 4,096.
+# Weight scales are not parameters; vision, audio and MTP tensors are not labelled.
+MIMO_TEXT_PARAMS = 308_778_780_864
+
+
+@pytest.fixture(scope="module")
+def mimo():
+    return load_model(MIMO)
+
+
+def test_mimo_registry_schedule_and_geometry(mimo):
+    from model.work.attention.sliding_window import SlidingWindowGQA
+    from model.work.models import mimo_v2
+
+    assert REGISTRY["MiMoV2ForCausalLM"] is mimo_v2.build
+    assert mimo.name == "MiMoV2ForCausalLM" and mimo.num_layers == 48
+    assert {stack.tag: stack.layers for stack in mimo.layers} == MIMO_STACKS
+    by_tag = {stack.tag: stack for stack in mimo.layers}
+    for tag, kv_heads in (("global_dense", 4), ("global_moe", 4), ("swa_moe", 8)):
+        attn = by_tag[tag].attn
+        assert (attn.num_qo_heads, attn.num_kv_heads) == (MIMO_Q, kv_heads)
+        assert (attn.head_dim, attn.v_dim) == (MIMO_DQK, MIMO_DV)
+        assert attn.attention_sinks == (tag == "swa_moe")
+    assert isinstance(by_tag["swa_moe"].attn, SlidingWindowGQA)
+    assert by_tag["swa_moe"].attn.window == MIMO_WINDOW
+    assert not isinstance(by_tag["global_moe"].attn, SlidingWindowGQA)
+    assert by_tag["global_dense"].ffn.intermediate == MIMO_DENSE_I
+    moe = by_tag["swa_moe"].ffn
+    assert (moe.num_experts, moe.top_k, moe.moe_intermediate) == (MIMO_E, MIMO_TOPK, MIMO_I)
+    assert moe.shared_intermediate == 0
+
+
+def test_mimo_params_reconcile_with_the_safetensors_headers(mimo):
+    params = mimo.label(Workload(matmul_tokens=0, head_positions=0)).params
+    attn = 9 * (MIMO_GA_QKV + MIMO_O) + 39 * (MIMO_SWA_QKV + MIMO_O)  # 4,482,662,400
+    routed = 47 * MIMO_E * MIMO_EXPERT  # 302,795,194,368
+    total = attn + MIMO_DENSE + routed + 47 * MIMO_ROUTER + MIMO_LEARNED + 2 * MIMO_TABLE
+    assert total == params["total"] == MIMO_TEXT_PARAMS
+    # Activated: 8 of 256 experts per MoE layer -> 14.20 B, 15.45 B with the tables
+    # (the model card's "A15B").
+    activated = attn + MIMO_DENSE + 47 * 8 * MIMO_EXPERT + 47 * MIMO_ROUTER + MIMO_LEARNED
+    assert params["activated"]["layers"] == activated == 14_196_033_728
+    assert params["activated"]["with_embed_head"] == 15_445_936_320
+    breakdown = params["breakdown"]
+    assert breakdown["attn"] == attn + 39 * 64
+    assert breakdown["ffn"] == MIMO_DENSE
+    assert breakdown["experts"] == routed
+    assert breakdown["router"] == 47 * (MIMO_ROUTER + 256)
+    assert breakdown["norm"] == 97 * 4096
+    assert breakdown["embedding"] == breakdown["lm_head"] == MIMO_TABLE
+    assert compute_parameter_counts(MIMO)["total"] == MIMO_TEXT_PARAMS
+
+
+# Per-token matmul FLOPs (2·n·k) per layer kind.
+MIMO_GA_ATTN_MM = 2 * (MIMO_GA_QKV + MIMO_O)  # 178,257,920
+MIMO_SWA_ATTN_MM = 2 * (MIMO_SWA_QKV + MIMO_O)  # 188,743,680
+MIMO_MOE_MM = 2 * MIMO_TOPK * MIMO_EXPERT  # 402,653,184
+MIMO_DENSE_MM = 2 * MIMO_DENSE  # 402,653,184
+MIMO_ROUTER_MM = 2 * MIMO_ROUTER  # 2,097,152
+# QK^T (2 x 192) + P·V (2 x 128) per (query head, key): 2 x 64 x 320 = 40,960.
+MIMO_PAIR = 2 * MIMO_Q * (MIMO_DQK + MIMO_DV)
+MIMO_LM_HEAD = 2 * MIMO_H * MIMO_V  # 1,249,902,592
+
+
+def _mimo_requests(prefill, decode):
+    """(append, prefix) per request; a decode kv_len counts its own new token."""
+    return [*prefill, *((1, kv_len - 1) for kv_len in decode)]
+
+
+def _mimo_window_counts(prefill, decode):
+    """Brute-force key loops, independent of the spec: global pairs, window pairs,
+    cached keys read (global, window) and window-cache rows kept."""
+    ga = swa = ga_cached = swa_cached = swa_kept = 0
+    for append, prefix in _mimo_requests(prefill, decode):
+        old_window_keys = set()
+        for position in range(prefix, prefix + append):
+            visible = range(max(0, position - MIMO_WINDOW + 1), position + 1)
+            ga += position + 1
+            swa += len(visible)
+            old_window_keys.update(key for key in visible if key < prefix)
+        ga_cached += prefix
+        swa_cached += len(old_window_keys)
+        # Only the newest W - 1 rows of a chunk are ever read by a later query.
+        newest = prefix + append - (MIMO_WINDOW - 1)
+        swa_kept += sum(1 for key in range(prefix, prefix + append) if key >= newest)
+    return ga, swa, ga_cached, swa_cached, swa_kept
+
+
+@pytest.mark.parametrize(
+    ("prefill", "decode", "sampled"),
+    [
+        ([(8192, 0)], [], 1),
+        ([], [4096] * 4, 4),
+        ([(3, 126), (130, 0), (2, 127)], [1, 127, 128, 129, 8192], 4),
+    ],
+)
+def test_mimo_flop_and_byte_goldens(mimo, prefill, decode, sampled):
+    label = mimo.label(Workload.causal_lm(prefill=prefill, decode=decode, sampled=sampled))
+    tokens = sum(append for append, _ in prefill) + len(decode)
+    ga, swa, ga_cached, swa_cached, swa_kept = _mimo_window_counts(prefill, decode)
+    assert label.flops == {
+        "attn_proj": tokens * (9 * MIMO_GA_ATTN_MM + 39 * MIMO_SWA_ATTN_MM),
+        "attn_internal": MIMO_PAIR * (9 * ga + 39 * swa),
+        "ffn": tokens * (MIMO_DENSE_MM + 47 * MIMO_MOE_MM),
+        "router": tokens * 47 * MIMO_ROUTER_MM,
+        "lm_head": sampled * MIMO_LM_HEAD,
+    }
+    # KV entry: K (192) + V (128) per KV head, BF16 -> 2,560 B GA, 5,120 B SWA.
+    ga_entry, swa_entry = 4 * 320 * 2, 8 * 320 * 2
+    assert label.bytes["kv"] == (
+        9 * ga_entry * (ga_cached + tokens) + 39 * swa_entry * (swa_cached + swa_kept)
+    )
+    # Weights at their stored precision, each read once:
+    # FP8 matrices add one FP32 scale per 128x128 block (ceil(n/128)·ceil(k/128)·4 B).
+    ga_qkv = MIMO_GA_QKV + 106 * 32 * 4
+    swa_qkv = MIMO_SWA_QKV + 116 * 32 * 4
+    dense = MIMO_DENSE + (256 * 32 + 32 * 128) * 4  # gate|up 32768x4096, down 4096x16384
+    # MXFP4 experts: half a byte per weight + one E8M0 byte per 32, only hit experts
+    # (uniform balls-in-bins over tokens·top_k draws).
+    hit = 256 * (1 - (255 / 256) ** (8 * tokens))
+    experts = 47 * hit * MIMO_EXPERT * (1 / 2 + 1 / 32)
+    expected_weights = (
+        9 * ga_qkv + 39 * swa_qkv + 48 * 2 * MIMO_O  # BF16 o_proj (ignored_layers)
+        + dense + experts
+        + 47 * (2 * MIMO_ROUTER + 4 * 256)  # BF16 router, FP32 selection bias
+        + 2 * (97 * 4096 + 39 * 64)  # BF16 norms and SWA sinks
+        + 2 * 4096 * min(tokens, MIMO_V)  # embedding rows gathered
+        + 2 * MIMO_TABLE  # BF16 lm_head
+    )
+    assert label.bytes["weights"] == pytest.approx(expected_weights, rel=1e-12)
+    assert sum(segment.flops_total for segment in label.segments) == sum(label.flops.values())
+
+
+def test_mimo_8k_prefill_and_4k_decode_totals(mimo):
+    """The two reference workloads, written out to the last FLOP."""
+    # 8192-token prefill from 0: global triangle 8192·8193/2 = 33,558,528 pairs; a
+    # window layer sees 128·129/2 + (8192 - 128)·128 = 1,040,448 pairs.
+    prefill = mimo.label(Workload.causal_lm(prefill=[(8192, 0)]))
+    assert prefill.flops == {
+        # 8192 x (9 x 178,257,920 + 39 x 188,743,680) = 8192 x 8,965,324,800
+        "attn_proj": 73_443_940_761_600,
+        # 40,960 x (9 x 33,558,528 + 39 x 1,040,448) = 40,960 x 342,604,224
+        "attn_internal": 14_033_069_015_040,
+        # 8192 x (dense 402,653,184 + 47 x top-8 402,653,184) = 8192 x 19,327,352,832
+        "ffn": 158_329_674_399_744,
+        "router": 807_453_851_648,  # 8192 x 47 x 2,097,152
+        "lm_head": 1_249_902_592,  # one sampled position
+    }
+    assert sum(prefill.flops.values()) == 246_615_387_930_624
+    # 4 decodes at kv_len 4096: 4 x 4096 global keys, 4 x 128 window keys.
+    decode = mimo.label(Workload.causal_lm(decode=[4096] * 4))
+    assert decode.flops == {
+        "attn_proj": 35_861_299_200,  # 4 x 8,965,324,800
+        "attn_internal": 6_857_687_040,  # 40,960 x 4 x (9 x 4096 + 39 x 128)
+        "ffn": 77_309_411_328,  # 4 x 19,327,352,832
+        "router": 394_264_576,  # 4 x 47 x 2,097,152
+        "lm_head": 4_999_610_368,  # 4 x 1,249,902,592
+    }
+    assert sum(decode.flops.values()) == 125_422_272_512
+    rows = {segment.name: segment.bytes_total for segment in decode.segments}
+    assert rows["global_moe.attn.decode"] == 8 * 4 * 4095 * 2560
+    assert rows["swa_moe.attn.decode"] == 39 * 4 * 127 * 5120
+    assert rows["swa_moe.kv_cache_append"] == 39 * 4 * 5120
+
+
+def test_mimo_precision_follows_the_checkpoint(mimo):
+    label = mimo.label(Workload.causal_lm(decode=[256]))
+    dtypes = {segment.name: segment.compute_dtype for segment in label.segments}
+    for tag in MIMO_STACKS:
+        assert dtypes[f"{tag}.qkv"] == "fp8"
+        assert dtypes[f"{tag}.o"] == "bf16"  # every layer's o_proj is in ignored_layers
+    assert dtypes["global_dense.gate_up"] == dtypes["global_dense.down"] == "fp8"
+    for tag in ("global_moe", "swa_moe"):
+        assert dtypes[f"{tag}.router"] == "bf16"
+        # MXFP4 storage, BF16 activations.
+        assert dtypes[f"{tag}.expert_gate_up"] == dtypes[f"{tag}.expert_down"] == "bf16"
+    assert dtypes["lm_head"] == "bf16"
+    assert mimo.quant.compute_dtype == "fp8"
+    spec = {"config": str(MIMO), "arch_fp8": True, "arch_quant_dtype": "fp8"}
+    work_floors._check_precision(mimo, spec)
+
+
+def test_mimo_rejects_layer_specific_exclusions_and_unmodeled_configs():
+    raw = json.loads(MIMO.read_text())
+    quant = raw["quantization_config"]
+    # One layer's o_proj converted while the others stay BF16 is not one stack.
+    partial = [
+        entry for entry in quant["ignored_layers"] if entry != "model.layers.7.self_attn.o_proj"
+    ]
+    with pytest.raises(ValueError, match="layer 7"):
+        build_model({**raw, "quantization_config": {**quant, "ignored_layers": partial}})
+    with pytest.raises(ValueError, match="layers"):
+        parse_quantization_config(raw)  # per-layer ignored_layers need the builder
+    with pytest.raises(ValueError, match="store_dtype"):
+        build_model({**raw, "quantization_config": {**quant, "store_dtype": "nvfp4"}})
+    for key, value in (
+        ("n_shared_experts", 1),
+        ("tie_word_embeddings", True),
+        ("hybrid_layer_pattern", [0] * 47),
+        ("attention_projection_layout", "split"),
+    ):
+        with pytest.raises(ValueError, match=key):
+            build_model({**raw, key: value})
+    with pytest.raises(UnknownArchitecture):
+        build_model({**raw, "architectures": ["MiMoV3ForCausalLM"]})
+
+
+@pytest.mark.parametrize(("append", "prefix"), [(1, 0), (3, 126), (129, 0), (8, 127), (1, 131_071)])
+def test_sliding_window_gqa_matches_brute_force_key_loops(append, prefix):
+    from model.work.attention.sliding_window import SlidingWindowGQA
+
+    spec = SlidingWindowGQA(
+        hidden=8, num_qo_heads=4, num_kv_heads=2, head_dim=6, v_head_dim=2,
+        kv_dtype_bytes=2, window=128,
+    )
+    rows = {row.name: row for row in spec.semantic_segments(
+        Workload.causal_lm(prefill=[(append, prefix)])
+    )}
+    pairs = sum(
+        len(range(max(0, position - 127), position + 1))
+        for position in range(prefix, prefix + append)
+    )
+    entry = 2 * (6 + 2) * 2  # 2 KV heads x (QK 6 + V 2) x 2 B
+    assert rows["attn.prefill"].flops == 2 * 4 * (6 + 2) * pairs
+    assert rows["attn.prefill"].bytes == entry * min(prefix, 127)
+    assert rows["kv_cache_append"].bytes == entry * min(append, 127)
+    # Sinks join the softmax denominator only: no key, no FLOP, one vector read.
+    assert SlidingWindowGQA(
+        hidden=8, num_qo_heads=4, num_kv_heads=2, head_dim=6, kv_dtype_bytes=2,
+        attention_sinks=True, window=128,
+    ).learned_weight_groups()[0].elements == 4
+
+
+@pytest.mark.parametrize(
+    "interaction",
+    [
+        AttnInteraction(1, 5000, 5000, "full", "decode"),  # analyzer-collapsed decode
+        AttnInteraction(2, 129, 128, "causal", "prefill"),  # key != prefix + append
+    ],
+)
+def test_sliding_window_gqa_refuses_inexact_geometry(interaction):
+    from model.work.attention.sliding_window import SlidingWindowGQA
+
+    spec = SlidingWindowGQA(
+        hidden=8, num_qo_heads=4, num_kv_heads=2, head_dim=6, kv_dtype_bytes=2, window=128
+    )
+    with pytest.raises(ValueError, match="exact per-request"):
+        spec.semantic_segments(Workload(2, 1, [interaction]))
+
+
+def test_mimo_floors_label_logged_request_geometry_exactly(mimo):
+    exact = mimo.label(Workload.causal_lm(prefill=[(300, 50)], decode=[100, 600, 5000], sampled=4))
+    totals = {
+        "matmul_tokens": 303, "prefill_tokens": 300, "decode_passes": 3,
+        "prefill_pairs": 300 * 50 + 300 * 301 // 2, "prefill_cached": 50,
+        "decode_kv": 100 + 600 + 5000, "prefill_requests": 1,
+        "request_geometry": {"prefill:50:300": 1, "decode:100": 1, "decode:600": 1,
+                             "decode:5000": 1},
+    }
+    logged = mimo.label(work_floors._aggregate_workload(totals))
+    expected = {s.name: (s.flops_total, s.bytes_total) for s in exact.segments}
+    assert {s.name: (s.flops_total, s.bytes_total) for s in logged.segments} == expected
+    # Without per-request geometry the window rows cannot be labelled.
+    with pytest.raises(ValueError, match="exact per-request"):
+        mimo.label(work_floors._aggregate_workload(
+            {key: value for key, value in totals.items() if key != "request_geometry"}
+        ))
+    # The scalar rows remain available for the analyzer's split labelling.
+    scalar = mimo.label(work_floors._aggregate_workload(
+        {key: value for key, value in totals.items() if key != "request_geometry"}
+    ), geometry_attention=False)
+    assert not any(segment.name.startswith("swa_moe.attn") for segment in scalar.segments)
+
+
+def test_mimo_location_map_consumes_every_semantic_once(mimo):
+    location_map = json.loads(
+        (INKLING_MAPS / "mimo_v2_vllm_fp8_swa_moe_tp4_ep4_unified.json").read_text()
+    )
+    assert location_map["schema_version"] == 1
+    assert location_map["mapping_id"] == "mimo-v2-vllm-fp8-swa-moe-tp4-ep4-unified-v1"
+    assert location_map["arch_types"] == ["mimo_v2_vllm_fp8_swa_moe"]
+    locations = [row["location"] for row in location_map["locations"]]
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    # 58 compiled leaves at TP4 = EP4 less the 7 fused all-reduce + residual +
+    # RMSNorm leaves, their 7 unfused all-reduces and the logits all-gather, which
+    # are communication.
+    assert len(locations) == len(set(locations)) == 43
+    for workload in (
+        Workload.causal_lm(decode=[4096] * 3, sampled=3),
+        Workload.causal_lm(prefill=[(2048, 0)], decode=[300], sampled=2),
+    ):
+        names = [segment.name for segment in mimo.label(workload).segments]
+        assert sorted(mapped) == sorted(names)
+    semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    # The RMSNorms run inside the fused communication leaves (or, above the fused
+    # cap, the residual-norm leaves), so each learned scale sits at the GEMM its
+    # output feeds; the final norm feeds the head.
+    assert semantics["unified.swa_moe.attn.qkv_proj.gemm"] == ["swa_moe.qkv", "swa_moe.input_norm"]
+    assert semantics["unified.lm_head"] == ["lm_head", "final_norm"]
+    assert semantics["unified.swa_moe.attn.attention"][-1] == "swa_moe.attention_sinks"
+    for tag in ("swa_moe", "global_moe"):
+        assert semantics[f"unified.{tag}.moe.routed_rank0.fused_moe"] == [
+            f"{tag}.expert_gate_up", f"{tag}.expert_down", f"{tag}.router_bias"
+        ]
+        for rank in (1, 2, 3):
+            assert semantics[f"unified.{tag}.moe.routed_rank{rank}.fused_moe"] == []
+    # Zero-minimum leaves: three qkv input quants, three RoPEs, the dense FFN's two
+    # input quants and activation, six routed ranks past rank 0, the logits select,
+    # and the seven unfused residual norms.
+    assert sum(not row["semantics"] for row in location_map["locations"]) == 3 + 3 + 3 + 6 + 1 + 7
+
+
+# ---------------------------------------------------------------------------
+# Qwen3.8-Flash-Next (Qwen4ExpForConditionalGeneration), language model only: 36
+# Gated DeltaNet + 12 QSA layers ([G, G, G, Q] x 12) over a 4-stream gated
+# hyper-connection residual, a per-layer n-gram embedding (PLE) at layer 1, a
+# 512-expert top-10 MoE with a sigmoid-gated shared expert on every layer, and one
+# QSA MTP layer. Every number below is read off config.json and the safetensors
+# header of nvidia/Qwen3.8-Flash-Next-NVFP4 @ fc694b54 by hand.
+# ---------------------------------------------------------------------------
+
+QF_SNAPSHOT = Path(
+    "/raid/hf/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/"
+    "fc694b54fb0174e0913e6adf86691ef85a4ead47"
+)
+QF_CONFIG = Path(__file__).resolve().parents[1] / "model/config/qwen3_8_flash_next_nvfp4.json"
+
+QF_H, QF_V, QF_S, QF_R = 2560, 248_320, 4, 320  # hidden, vocab, HC streams, HC rank
+QF_W = QF_S * QF_H  # 10,240-wide multi-stream state
+QF_QSA_LAYERS = tuple(range(3, 48, 4))
+# GDN, per layer (BF16): in_proj_qkv 10240x2560 + in_proj_z 6144x2560, in_proj_b/a
+# 48x2560 each, conv1d 10240x4, out_proj 2560x6144; A_log 48, dt_bias 48, norm 128.
+QF_GDN_MM = 16_384 * QF_H + 96 * QF_H + 10_240 * 4 + QF_H * 6144  # 57,958,400
+QF_GDN_VEC = 48 + 48 + 128
+# QSA, per layer (BF16): q_proj 12288x2560 (24 heads of Q and of the output gate),
+# k/v_proj 512x2560 each, o_proj 2560x6144, indexer index_qk_proj 640x2560; q/k
+# norms 256 each, indexer q/k layernorms 128 each.
+QF_QSA_MM = 13_312 * QF_H + QF_H * 6144 + 640 * QF_H  # 51,445,760
+QF_QSA_VEC = 2 * 256 + 2 * 128
+# One HC module: down 320x10240, block_inject 4x10240, up 10240x320, hc_norm 10240.
+QF_HC_MM = QF_R * QF_W + QF_S * QF_W + QF_W * QF_R  # 6,594,560
+QF_FINAL_MM = 2 * QF_R * QF_W  # final mixer: no block_inject
+# MoE, per layer: router 512x2560; an expert's gate/up 640x2560 and down 2560x640;
+# shared expert of the same shape and shared_expert_gate 1x2560.
+QF_EXPERT = 3 * 640 * QF_H  # 4,915,200
+QF_ROUTER = 512 * QF_H
+QF_SHARED = QF_EXPERT + QF_H
+# PLE at layer 1: key_proj 10240x2560 + value_proj 2560x2560, conv1d 10240x4, three
+# 10240 norms; table 128 shards x 2,500,012 rows x 160 (FP8). The rows are the 16
+# primes from 20,000,003 to 20,000,171 (320,001,446) padded to a multiple of 128.
+QF_PLE_ROWS = 320_001_536
+QF_PLE_MM = (QF_W + QF_H) * QF_H + QF_W * 4
+QF_PLE_TABLE = QF_PLE_ROWS * 160
+QF_TABLE = QF_V * QF_H  # embed_tokens and (untied) lm_head
+QF_BODY_PARAMS = (
+    36 * (QF_GDN_MM + QF_GDN_VEC)
+    + 12 * (QF_QSA_MM + QF_QSA_VEC)
+    + 48 * 2 * (QF_HC_MM + QF_W)
+    + 48 * (QF_ROUTER + 512 * QF_EXPERT + QF_SHARED)
+    + QF_PLE_MM
+    + 3 * QF_W
+    + QF_PLE_TABLE
+    + QF_FINAL_MM
+    + QF_W
+    + 2 * QF_TABLE
+)
+# MTP: fc_embedding/fc_hidden 2560x2560, pre_fc norms 2560 + 10240, one QSA layer
+# with its two HC modules and MoE, and its own final mixer; no head or embedding.
+QF_MTP_PARAMS = (
+    2 * QF_H * QF_H
+    + QF_H
+    + QF_W
+    + QF_QSA_MM
+    + QF_QSA_VEC
+    + 2 * (QF_HC_MM + QF_W)
+    + QF_ROUTER
+    + 512 * QF_EXPERT
+    + QF_SHARED
+    + QF_FINAL_MM
+    + QF_W
+)
+
+
+@pytest.fixture(scope="module")
+def qf():
+    return load_model(QF_CONFIG)
+
+
+def test_qf_registry_schedule_and_geometry(qf):
+    from model.work.attention.qsa import QuerySparseAttention
+    from model.work.models import qwen4_exp
+
+    assert REGISTRY["Qwen4ExpForConditionalGeneration"] is qwen4_exp.build
+    assert qf.name == "Qwen4ExpForConditionalGeneration" and qf.num_layers == 48
+    body = {stack.tag: stack.layers for stack in qf.layers if stack.stage is None}
+    assert body == {
+        "gdn_first": (0,),
+        "gdn_ple": (1,),
+        "gdn": tuple(layer for layer in range(2, 48) if layer not in QF_QSA_LAYERS),
+        "qsa": QF_QSA_LAYERS,
+    }
+    staged = {stack.tag: (stack.stage, stack.param_count) for stack in qf.layers if stack.stage}
+    assert staged == {"mtp_first": ("mtp_first", None), "mtp_recurrent": ("mtp_recurrent", 0)}
+    by_tag = {stack.tag: stack for stack in qf.layers}
+    qsa = by_tag["qsa"].attn
+    assert isinstance(qsa, QuerySparseAttention)
+    assert (qsa.num_heads, qsa.num_kv_heads, qsa.head_dim) == (24, 2, 256)
+    assert (qsa.index_n_heads, qsa.index_head_dim, qsa.budget, qsa.ratio) == (4, 128, 2048, 4)
+    ple = by_tag["gdn_ple"].attn.ple
+    assert (ple.ngram_heads, ple.head_dim, ple.table_rows, ple.history) == (16, 160, QF_PLE_ROWS, 9)
+    moe = by_tag["gdn"].ffn
+    assert (moe.num_experts, moe.top_k, moe.moe_intermediate, moe.shared_intermediate) == (
+        512,
+        10,
+        640,
+        640,
+    )
+    combines = {
+        tag: [module.combine for module in by_tag[tag].mixer.modules]
+        for tag in ("gdn_first", "gdn", "mtp_first")
+    }
+    assert combines == {
+        "gdn_first": ["none", "injected"],
+        "gdn": ["injected", "injected"],
+        "mtp_first": ["unit", "injected", "injected"],
+    }
+
+
+def test_qf_ple_table_rows_follow_the_prime_vocabulary_layout():
+    from model.work.mixers.ngram_embedding import ngram_table_rows
+
+    # 20,000,003 + ... + 20,000,171 = 320,001,446, padded to a multiple of 128.
+    assert ngram_table_rows(20_000_000, 16, 128) == QF_PLE_ROWS
+    assert ngram_table_rows(20_000_000, 16, 1) == 320_001_446
+    # A second PLE layer takes the next 16 primes.
+    assert ngram_table_rows(20_000_000, 16, 1, dense_layer_id=1) > 320_001_446
+
+
+def test_qf_hand_derived_params(qf):
+    assert QF_BODY_PARAMS == 176_943_899_520
+    assert QF_MTP_PARAMS == 2_607_150_848
+    params = qf.label(Workload(matmul_tokens=0, head_positions=0)).params
+    assert params["total"] == QF_BODY_PARAMS
+    # Activated: 10 of 512 experts and 16 of the table's 320,001,536 rows (2,560
+    # elements) per token.
+    activated = QF_BODY_PARAMS - 2 * QF_TABLE - 48 * 502 * QF_EXPERT - (QF_PLE_TABLE - 2560)
+    assert params["activated"]["layers"] == activated == 6_035_598_720
+    assert params["activated"]["with_embed_head"] == activated + 2 * QF_TABLE
+    breakdown = params["breakdown"]
+    assert breakdown["experts"] == 48 * 512 * QF_EXPERT
+    assert breakdown["engram"] == QF_PLE_MM + QF_PLE_TABLE
+    assert breakdown["embedding"] == breakdown["lm_head"] == QF_TABLE
+    assert compute_parameter_counts(QF_CONFIG)["total"] == QF_BODY_PARAMS
+    # A draft stage adds the MTP layer's parameters, once for both stages.
+    from model.work.speculative import DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE
+
+    draft = Workload(
+        0, 0, stages={DRAFT_FIRST_STAGE: Workload(0, 0), DRAFT_RECURRENT_STAGE: Workload(0, 0)}
+    )
+    assert qf.label(draft).params["total"] == QF_BODY_PARAMS + QF_MTP_PARAMS
+
+
+@pytest.mark.skipif(not QF_SNAPSHOT.exists(), reason="Qwen3.8-Flash-Next checkpoint not present")
+def test_qf_params_and_expert_bytes_reconcile_with_the_safetensors_header(qf):
+    """The checkpoint is the oracle. Parameters: every text tensor (packed E2M1
+    bytes count two elements) except weight scales and the PLE hashing buffers
+    (I64 multipliers, head offsets and vocabulary sizes). The vision tower is out."""
+    import struct
+
+    index = json.loads((QF_SNAPSHOT / "model.safetensors.index.json").read_text())
+    body = mtp = ple_rows = 0
+    expert_bytes = {"body": 0, "mtp": 0}
+    for shard in sorted(set(index["weight_map"].values())):
+        with open(QF_SNAPSHOT / shard, "rb") as handle:
+            header = json.loads(handle.read(struct.unpack("<Q", handle.read(8))[0]))
+        for name, tensor in header.items():
+            if name == "__metadata__" or "visual" in name:
+                continue
+            count = math.prod(tensor["shape"])
+            part = "mtp" if name.startswith("mtp.") else "body"
+            size = count * {"BF16": 2, "F32": 4, "F8_E4M3": 1, "U8": 1, "I64": 8}[tensor["dtype"]]
+            if ".mlp.experts." in name and "input_scale" not in name and "scale_2" not in name:
+                expert_bytes[part] += size  # weights and their block scales
+            if "scale" in name or tensor["dtype"] == "I64":
+                continue
+            count *= 2 if tensor["dtype"] == "U8" else 1
+            if part == "mtp":
+                mtp += count
+            else:
+                body += count
+            if "ngram_embedding.shard_" in name:
+                ple_rows += tensor["shape"][0]
+    assert (body, mtp, ple_rows) == (QF_BODY_PARAMS, QF_MTP_PARAMS, QF_PLE_ROWS)
+    # Routed-expert weight bytes per instance at the checkpoint's stored precision:
+    # NVFP4 (half a byte, one FP8 scale per 16) in the body, FP8 with one BF16
+    # scale per 128x128 block in the MTP layer.
+    for tag, part in (("gdn", "body"), ("mtp_first", "mtp")):
+        stack = next(stack for stack in qf.layers if stack.tag == tag)
+        groups = [group for group in stack.ffn.matmul_groups() if group.routed]
+        per_layer = sum(group.total_count * qf.weight_bytes_per_instance(group) for group in groups)
+        assert per_layer * (48 if part == "body" else 1) == expert_bytes[part]
+
+
+def test_qf_precision_follows_the_checkpoint(qf):
+    quant = qf.quant
+    assert quant.is_converted("mlp.experts.gate_up_proj")
+    assert quant.is_converted("mtp.mlp.experts.down_proj")
+    for module in (
+        "mlp.gate",
+        "mlp.shared_expert.gate_up_proj",
+        "mlp.shared_expert_gate",
+        "self_attn.qkv_proj",
+        "self_attn.indexer.index_qk_proj",
+        "linear_attn.in_proj_qkvz",
+        "attn_hyper_connection.input_mix_weight_down",
+        "ple.kv_proj",
+        "mtp.fc_hidden",
+        "mtp.self_attn.o_proj",
+        "lm_head",
+    ):
+        assert not quant.is_converted(module), module
+    by_tag = {stack.tag: stack for stack in qf.layers}
+    for tag, dtype in (("gdn", "fp4"), ("mtp_first", "fp8")):
+        routed = [group for group in by_tag[tag].ffn.matmul_groups() if group.routed]
+        assert {qf.matmul_compute_dtype(group) for group in routed} == {dtype}
+    assert {
+        qf.matmul_compute_dtype(group)
+        for stack in qf.layers
+        for group in (*stack.attn.matmul_groups(), *stack.mixer.matmul_groups())
+    } == {"bf16"}
+    # NVFP4: 0.5 B + one FP8 scale per 16; FP8 block: 1 B + a BF16 scale per 128x128.
+    gate_up = next(g for g in by_tag["gdn"].ffn.matmul_groups() if g.name == "expert_gate_up")
+    assert qf.weight_bytes_per_instance(gate_up) == 1280 * QF_H * (0.5 + 1 / 16)
+    mtp_up = next(g for g in by_tag["mtp_first"].ffn.matmul_groups() if g.name == "expert_gate_up")
+    assert qf.weight_bytes_per_instance(mtp_up) == 1280 * QF_H + 10 * 20 * 2
+    assert by_tag["gdn_ple"].attn.ple.table_dtype_bytes == 1.0
+
+
+# Per-token FLOPs (2 x elements of every matrix a token passes).
+QF_GDN_PROJ = 2 * QF_GDN_MM  # 115,916,800
+QF_QSA_PROJ = 2 * QF_QSA_MM  # 102,891,520
+QF_FFN = 2 * (10 * QF_EXPERT + QF_SHARED)  # 108,139,520
+QF_ROUTER_MM = 2 * QF_ROUTER  # 2,621,440
+# HC at every token: 48 layers x 2 modules of projections, plus 2 x 10240 per mix
+# and per injected combine (layer 0's attention module has no combine; the final
+# mixer's combine counts). The final mixer's down/up and mix feed only lm_head, so
+# they run at the sampled positions.
+QF_HC = 48 * 2 * 2 * QF_HC_MM + (48 * 4 - 1 + 1) * 2 * QF_W
+QF_HC_SAMPLED = 2 * QF_FINAL_MM + 2 * QF_W
+QF_PLE = 2 * QF_PLE_MM + 2 * QF_W  # kv_proj + conv + per-stream key/query dot
+QF_GDN_CORE = 6 * 48 * 128 * 128  # per token per GDN layer
+QF_INDEX_PAIR = 2 * 4 * 128  # per (query, complete group)
+QF_ATTN_PAIR = 4 * 24 * 256  # QK + PV per (query, attended key)
+QF_LM_HEAD = 2 * QF_H * QF_V
+
+
+def _qf_flops(tokens: int, groups: int, selected: int, sampled: int) -> dict:
+    return {
+        "attn_proj": tokens * (36 * QF_GDN_PROJ + 12 * QF_QSA_PROJ),
+        "attn_internal": 36 * tokens * QF_GDN_CORE
+        + 12 * (QF_INDEX_PAIR * groups + QF_ATTN_PAIR * selected),
+        "ffn": 48 * tokens * QF_FFN,
+        "router": 48 * tokens * QF_ROUTER_MM,
+        "lm_head": sampled * QF_LM_HEAD,
+        "residual_mix": tokens * QF_HC + sampled * QF_HC_SAMPLED,
+        "engram": tokens * QF_PLE,
+    }
+
+
+def test_qf_prefill_and_decode_flop_goldens(qf):
+    assert QF_HC == 1_270_087_680 and QF_HC_SAMPLED == 13_127_680 and QF_PLE == 65_638_400
+    # 8192 tokens from an empty cache: the query at context k scores floor(k / 4)
+    # complete groups and attends min(k, 2048 + k mod 4) keys (brute-force sums).
+    groups = sum(k // 4 for k in range(1, 8193))
+    selected = sum(min(k, 2048 + k % 4) for k in range(1, 8193))
+    # 4 x (0 + ... + 2047) + 2048; and 2051 x 2052 / 2 dense, then 6141 x 2048 + the
+    # 1535 full cycles of k mod 4 (6 each).
+    assert (groups, selected) == (8_386_560, 2_104_326 + 12_576_768 + 9_210)
+    prefill = qf.label(Workload.causal_lm(prefill=[(8192, 0)]))
+    assert prefill.flops == _qf_flops(8192, groups, selected, 1)
+    # 256 decodes at kv_len 4096: 1024 complete groups, 512 of them selected.
+    decode = qf.label(Workload.causal_lm(decode=[4096] * 256))
+    assert decode.flops == _qf_flops(256, 256 * 1024, 256 * 2048, 256)
+    for label in (prefill, decode):
+        assert sum(s.flops_total for s in label.segments) == pytest.approx(
+            sum(label.flops.values()), rel=1e-15
+        )
+
+
+def test_qf_decode_byte_goldens(qf):
+    label = qf.label(Workload.causal_lm(decode=[4096] * 256))
+    tokens = 256
+    # Weights read once: every BF16 matrix and vector of the body except the
+    # experts, the PLE table, embedding and head; the hit experts (balls in bins
+    # over 2,560 draws into 512) in NVFP4; the gathered embedding and PLE rows; the
+    # BF16 head.
+    dense = QF_BODY_PARAMS - 48 * 512 * QF_EXPERT - QF_PLE_TABLE - 2 * QF_TABLE
+    assert dense == 3_676_300_160
+    hit = 512 * (1 - (511 / 512) ** (10 * tokens))
+    expected_weights = (
+        2 * dense
+        + 48 * hit * QF_EXPERT * (0.5 + 1 / 16)
+        + 2 * QF_H * tokens
+        + tokens * 16 * 160  # FP8 PLE rows
+        + 2 * QF_TABLE
+    )
+    assert label.bytes["weights"] == pytest.approx(expected_weights, rel=1e-12)
+    # State and caches per request (BF16 KV and index cache as the config states):
+    # GDN FP32 recurrent state 48x128x128 and conv state 10240x4 read and written;
+    # QSA reads 2047 selected keys (K+V, 2 heads x 256) and 1023 index entries
+    # (128 wide), appends one token and completes one group; the PLE conv history
+    # reads 9 cached rows and writes 1 (10240 wide).
+    gdn = 2 * (48 * 128 * 128 * 4 + 10_240 * 4 * 2)
+    qsa = 2047 * 2048 + 1023 * 256 + 2048 + 256
+    ple = (9 + 1) * QF_W * 2
+    assert label.bytes["kv"] == tokens * (36 * gdn + 12 * qsa + ple)
+    rows = {s.name: s.bytes_total for s in label.segments}
+    assert rows["gdn_ple.ple.lookup"] == tokens * 16 * 160
+    assert rows["qsa.attn.decode"] == 12 * tokens * 2047 * 2048
+
+
+def test_qf_prefill_byte_goldens(qf):
+    tokens = 8192
+    label = qf.label(Workload.causal_lm(prefill=[(tokens, 0)]))
+    # Weights read once, as for decode, but 81,920 routed draws hit all 512 experts
+    # of every layer; one embedding row, 16 FP8 PLE rows (160 wide) per token.
+    dense = QF_BODY_PARAMS - 48 * 512 * QF_EXPERT - QF_PLE_TABLE - 2 * QF_TABLE
+    expected_weights = (
+        2 * dense
+        + 48 * 512 * QF_EXPERT * (0.5 + 1 / 16)
+        + 2 * QF_H * tokens
+        + tokens * 16 * 160
+        + 2 * QF_TABLE
+    )
+    assert expected_weights == 76_634_638_080
+    assert label.bytes["weights"] == pytest.approx(expected_weights, rel=1e-12)
+    # A fresh request reads no state and no cached keys. GDN writes its FP32 state
+    # (48x128x128) and BF16 conv state (10240x4) once; QSA appends every token's
+    # K/V (2 heads x 256 x 2, BF16) and one 128-wide BF16 index entry per completed
+    # group of 4; the PLE convolution keeps its last 9 rows (10240 wide, BF16).
+    gdn = 48 * 128 * 128 * 4 + 10_240 * 4 * 2
+    qsa = tokens * 2048 + tokens // 4 * 256
+    ple = 9 * QF_W * 2
+    assert label.bytes == {"weights": label.bytes["weights"], "kv": 36 * gdn + 12 * qsa + ple}
+    rows = {s.name: s.bytes_total for s in label.segments}
+    assert rows["qsa.kv_cache_append"] == 12 * tokens * 2048
+    assert rows["qsa.index_cache_append"] == 12 * 2048 * 256
+    assert rows["gdn_ple.ple.conv_state"] == ple
+
+
+def test_qf_mtp_stages_follow_the_draft_geometry(qf):
+    from model.work.speculative import (
+        DRAFT_FIRST_STAGE,
+        DRAFT_RECURRENT_STAGE,
+        aggregate_workload,
+        proposer_for,
+    )
+
+    assert proposer_for({stack.stage for stack in qf.layers if stack.stage}) == "mtp"
+    # One 2048-token prefill and two verifies of 4 rows, 3 draft tokens.
+    geometry = {
+        "draft_tokens": 3,
+        "max_model_len": 131_072,
+        "prefill": [[0, 2048]],
+        "decode": [[4100, 4], [8000, 4]],
+    }
+    workload = aggregate_workload(
+        {
+            "speculative_geometry": {json.dumps(geometry): 1},
+            "matmul_tokens": 2056,
+            "prefill_tokens": 2048,
+            "decode_passes": 2,
+            "prefill_requests": 1,
+            "prefill_pairs": 2048 * 2049 / 2,
+            "prefill_cached": 0,
+        },
+        "mtp",
+    )
+    label = qf.label(workload)
+    rows = {s.name: s for s in label.segments}
+    first, recurrent = workload.stages[DRAFT_FIRST_STAGE], workload.stages[DRAFT_RECURRENT_STAGE]
+    assert (first.matmul_tokens, recurrent.matmul_tokens) == (2056, 6)
+    # fc_hidden is shared by the four carried streams: one row per (token, stream).
+    assert rows["mtp_first.fc_hidden"].flops_total == 2 * 4 * 2056 * QF_H * QF_H
+    assert rows["mtp_first.fc_embedding"].flops_total == 2 * 2056 * QF_H * QF_H
+    # The attention module merges the projected embedding with unit weight.
+    assert "mtp_first.hc.attn.combine" not in rows
+    assert rows["mtp_first.hc.final.combine"].flops_total == 2056 * 2 * QF_W
+    # Each request advances twice past its final context (2048, 4100, 8000); each
+    # endpoint attends min(k, 2048 + k mod 4) keys at its own context k.
+    endpoints = [2049, 2050, 4101, 4102, 8001, 8002]
+    assert rows["mtp_recurrent.attn.decode"].flops_total == QF_ATTN_PAIR * sum(
+        min(k, 2048 + k % 4) for k in endpoints
+    )
+    # No index_share_for_mtp_iteration: every draft step projects, scores its own
+    # floor(k / 4) complete groups, and writes the index cache.
+    assert rows["mtp_recurrent.indexer.decode"].flops_total == 2 * 4 * 128 * sum(
+        k // 4 for k in endpoints
+    )
+    assert rows["mtp_recurrent.indexer.index_qk_proj"].flops_total == 2 * 6 * QF_H * 5 * 128
+    assert "mtp_recurrent.index_cache_append" in rows
+    # Draft heads share the target lm_head: FLOPs at the endpoints, no second read.
+    assert rows["mtp_first.lm_head"].flops_total == 3 * QF_LM_HEAD
+    assert rows["mtp_recurrent.lm_head"].bytes_total == 0
+    assert label.params["total"] == QF_BODY_PARAMS + QF_MTP_PARAMS
+
+
+def test_qsa_closed_forms_match_brute_force_key_loops():
+    from model.work.attention.qsa import QuerySparseAttention
+
+    spec = QuerySparseAttention(
+        hidden=64,
+        num_heads=3,
+        num_kv_heads=1,
+        head_dim=8,
+        index_n_heads=2,
+        index_head_dim=4,
+        budget=8,
+        ratio=4,
+    )
+    for append, prefix in ((1, 0), (5, 0), (3, 6), (17, 3), (1, 30), (4, 41), (40, 9)):
+        groups = selected = 0
+        for position in range(prefix, prefix + append):
+            k = position + 1
+            complete = k // 4
+            groups += complete
+            # top 2 complete groups (8 tokens) plus the open group's tokens.
+            selected += 4 * min(complete, 2) + k % 4
+        # First query: its selected keys other than itself; cached groups scored.
+        first = prefix + 1
+        first_cached = 4 * min(first // 4, 2) + first % 4 - 1
+        completed = (prefix + append) // 4 - prefix // 4
+        rows = {
+            row.name: row
+            for row in spec.semantic_segments(Workload.causal_lm(prefill=[(append, prefix)]))
+        }
+        assert rows["indexer.prefill"].flops == 2 * 2 * 4 * groups
+        assert rows["attn.prefill"].flops == 4 * 3 * 8 * selected
+        assert rows["indexer.prefill"].bytes == (prefix // 4) * 4 * 2
+        assert rows["attn.prefill"].bytes == first_cached * 2 * 8 * 2
+        assert rows["index_cache_append"].bytes == completed * 4 * 2
+        assert rows["kv_cache_append"].bytes == append * 2 * 8 * 2
+    # Many requests take the array path; it agrees with the per-request sums.
+    many = Workload.causal_lm(decode=list(range(1, 200)))
+    single = [
+        {row.name: row.flops for row in spec.semantic_segments(Workload.causal_lm(decode=[k]))}
+        for k in range(1, 200)
+    ]
+    vector = {row.name: row.flops for row in spec.semantic_segments(many)}
+    assert vector["attn.decode"] == sum(rows["attn.decode"] for rows in single) > 0
+    assert spec.semantic_segments_batch([many])[0] == spec.semantic_segments(many)
+    with pytest.raises(ValueError, match="causal"):
+        spec.semantic_segments(Workload(4, 1, [AttnInteraction(4, 400, 396, "full")]))
+
+
+def test_ple_conv_history_matches_per_request_rows():
+    from model.work.mixers.ngram_embedding import NgramEmbeddingInjection
+
+    ple = NgramEmbeddingInjection(
+        hidden=8,
+        streams=2,
+        embed_dim=12,
+        ngram_heads=4,
+        table_rows=10,
+        table_dtype_bytes=1.0,
+        conv_kernel=4,
+        conv_dilation=3,
+        state_dtype_bytes=2.0,
+    )
+    workload = Workload.causal_lm(prefill=[(2, 0), (20, 5), (4, 30)], decode=[100])
+    rows = {row.name: row for row in ple.semantic_segments(workload)}
+    # history (4 - 1) x 3 = 9: reads min(prefix, 9), writes min(append, 9).
+    state_rows = (0 + 2) + (5 + 9) + (9 + 4) + (9 + 1)
+    assert rows["ple.conv_state"].bytes == state_rows * 16 * 2
+    # 27 tokens x 4 heads = 108 lookups, capped at the 10-row table; 3-wide heads.
+    assert rows["ple.lookup"].bytes == 10 * 3 * 1
+    assert rows["ple.gate"].flops == 2 * 16 * 27
+    with pytest.raises(ValueError, match="causal"):
+        ple.semantic_segments(Workload(4, 1, [AttnInteraction(4, 400, 396, "full")]))
+
+
+def test_qf_geometry_rows_and_the_rest_partition_the_label(qf):
+    workload = Workload.causal_lm(prefill=[(2019, 29), (512, 0)], decode=[3000, 10, 70000])
+    whole = {s.name: (s.flops_total, s.bytes_total) for s in qf.label(workload).segments}
+    rest = {
+        s.name: (s.flops_total, s.bytes_total)
+        for s in qf.label(workload, geometry_attention=False).segments
+    }
+    geometry = {s.name: (s.flops_total, s.bytes_total) for s in qf.geometry_segments(workload)}
+    assert {name.split(".")[0] for name in geometry} == {"gdn_ple", "qsa"}
+    assert "gdn_ple.ple.conv_state" in geometry
+    assert not rest.keys() & geometry.keys()
+    assert rest | geometry == whole
+
+
+QF_ARCH = "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative"
+
+
+def _qf_served(tmp_path, **arch_fields):
+    """The floors' pool spec and served model for a params.json written as a preset
+    states it: omitted arch fields stay omitted."""
+    arch = {"type": QF_ARCH, "model_config": str(QF_CONFIG), **arch_fields}
+    (tmp_path / "raw").mkdir(exist_ok=True)
+    (tmp_path / "raw" / "params.json").write_text(
+        json.dumps({"pools": {"main": {"groups": [{"gpu": "NVIDIA B200", "arch": arch}]}}})
+    )
+    spec = work_floors._pool_specs(tmp_path)["main"]
+    return spec, work_floors._model_for_spec(spec)
+
+
+def _qf_speculative_label(model, depth, prefill, decode):
+    from model.work.speculative import aggregate_workload
+
+    geometry = {
+        "draft_tokens": depth,
+        "max_model_len": 131_072,
+        "prefill": prefill,
+        "decode": decode,
+    }
+    tokens = sum(q for _, q in prefill)
+    workload = aggregate_workload(
+        {
+            "speculative_geometry": {json.dumps(geometry): 1},
+            "matmul_tokens": tokens + len(decode) * (depth + 1),
+            "prefill_tokens": tokens,
+            "decode_passes": len(decode),
+            "prefill_requests": len(prefill),
+            "prefill_pairs": sum(q * (q + 1) / 2 + c * q for c, q in prefill),
+            "prefill_cached": sum(c for c, _ in prefill),
+        },
+        "mtp",
+    )
+    return model.label(workload)
+
+
+def test_qf_floors_resolve_the_arch_defaults(qf, tmp_path):
+    """A preset that omits the arch's knobs ran the simulator's serde defaults:
+    three draft tokens, FP8 KV and FP8 index caches. The floors resolve the same."""
+    spec, served = _qf_served(tmp_path)
+    assert spec["draft_tokens"] == 3
+    assert spec["arch_quant_dtype"] == "fp4"
+    work_floors._check_precision(served, spec)
+    work_floors._validate_speculative_totals(
+        spec, {"speculative_geometry": {json.dumps({"draft_tokens": 3}): 1}}
+    )
+    qsa = {stack.tag: stack.attn for stack in served.layers}
+    for tag in ("qsa", "mtp_first", "mtp_recurrent"):
+        assert (qsa[tag].kv_dtype_bytes, qsa[tag].index_cache_dtype_bytes) == (1.0, 1.0)
+
+    # One verify of 4 rows at context 4100: 2047 selected keys of 2 K/V heads x 256
+    # and 1023 complete 128-wide index groups per QSA layer row, now one byte each.
+    def bytes_by_row(model):
+        label = _qf_speculative_label(model, 3, [], [[4100, 4]])
+        return {s.name: s.bytes_total for s in label.segments}
+
+    rows, base = bytes_by_row(served), bytes_by_row(qf)
+    for name in (
+        "qsa.attn.decode",
+        "qsa.indexer.decode",
+        "qsa.kv_cache_append",
+        "qsa.index_cache_append",
+        "mtp_recurrent.attn.decode",
+    ):
+        assert rows[name] == base[name] / 2 > 0, name
+    # GDN and PLE state are not KV cache.
+    assert rows["gdn.recurrent_state.decode_read"] == base["gdn.recurrent_state.decode_read"]
+    assert rows["gdn_ple.ple.conv_state"] == base["gdn_ple.ple.conv_state"]
+    # Each cache follows its own knob.
+    _, bf16_index = _qf_served(tmp_path, indexer_kv_dtype="bf16", draft_tokens=2)
+    stack = next(stack.attn for stack in bf16_index.layers if stack.tag == "qsa")
+    assert (stack.kv_dtype_bytes, stack.index_cache_dtype_bytes) == (1.0, 2.0)
+    assert work_floors._pool_specs(tmp_path)["main"]["draft_tokens"] == 2
+
+
+@pytest.mark.parametrize(
+    ("depth", "mapping"),
+    [
+        (3, "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_unified"),
+        (5, "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_unified"),
+        (1, "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_single_draft_unified"),
+    ],
+)
+def test_qf_location_maps_consume_every_semantic_once(qf, depth, mapping):
+    maps = Path(__file__).resolve().parents[1] / "model/work/location_maps"
+    location_map = json.loads((maps / f"{mapping}.json").read_text())
+    assert location_map["schema_version"] == 1
+    assert location_map["mapping_id"] == mapping.replace("_", "-") + "-v1"
+    assert location_map["arch_types"] == [QF_ARCH]
+    locations = [row["location"] for row in location_map["locations"]]
+    # 340 single-GPU leaves; a one-token draft compiles no recurrent MTP pass (54).
+    assert len(locations) == len(set(locations)) == (286 if depth == 1 else 340)
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    for prefill, decode in (
+        ([[0, 2048]], [[4100, depth + 1]]),
+        ([], [[4100, depth + 1], [900, depth + 1]]),
+        ([[100, 500]], []),
+    ):
+        names = [s.name for s in _qf_speculative_label(qf, depth, prefill, decode).segments]
+        assert sorted(mapped) == sorted(names)
+    semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    # Layer 0 mixes the repeated embedding: no combine is pending.
+    assert semantics["unified.gdn_first.attn_hc.grouped_norm"] == ["gdn_first.hc.attn.norm"]
+    # The PLE layer runs its pending combine standalone before adding the n-gram
+    # embedding, so its attention module's entry is a plain norm.
+    assert semantics["unified.gdn_ple.ple.hc_combine"] == ["gdn_ple.hc.attn.combine"]
+    assert semantics["unified.gdn_ple.attn_hc.grouped_norm"] == ["gdn_ple.hc.attn.norm"]
+    assert semantics["unified.qsa.attn_hc.combine_norm"] == [
+        "qsa.hc.attn.combine",
+        "qsa.hc.attn.norm",
+    ]
+    # The merged down GEMM also emits the next combine's injection weights.
+    assert semantics["unified.gdn.mlp_hc.down"] == ["gdn.hc.mlp.down", "gdn.hc.mlp.inject"]
+    # A pure verify step takes the fused GDN verify kernels.
+    assert semantics["unified.gdn.gdn.verify_recurrent_norm"][0] == "gdn.attn.decode"
+    assert semantics["unified.qsa.qsa.indexer.prepare"][-1] == "qsa.index_cache_append"
+    # The MTP attention module merges the projected embedding with unit weight.
+    assert semantics["unified.mtp.step_0.attn_hc.combine_norm"] == ["mtp_first.hc.attn.norm"]
+    assert semantics["unified.mtp.step_0.head.lm_head"] == ["mtp_first.lm_head"]
+    assert semantics["unified.head.lm_head"] == ["lm_head"]
+    assert semantics["unified.sample.rejection_resample"] == []

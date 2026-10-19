@@ -28,7 +28,7 @@ from profiling.runners.exceptions import (
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "gdn_prefill_post_conv:vllm_triton"
-_CALLABLE_MODULE = "vllm.model_executor.layers.fla.ops.fused_gdn_prefill_post_conv"
+_CALLABLE_MODULE = "vllm.third_party.flash_linear_attention.ops.fused_gdn_prefill_post_conv"
 _CALLABLE_NAME = "fused_post_conv_prep"
 _KERNEL_NAME = "_fused_post_conv_kernel"
 _MAX_GUARD_PACKED_ELEMENTS = 1_048_576

@@ -1,8 +1,8 @@
 //! Gated DeltaNet fused gated RMS normalization kernel.
 //!
 //! Hidden width and compute dtype are static config identity. The flattened row
-//! count `m` is the sole physical runtime interpolation axis: Qwen maps it from
-//! tokens as `m = num_tokens * 32` for its 32 value heads.
+//! count `m` is the sole physical runtime interpolation axis, mapped from
+//! tokens as `m = num_tokens * num_value_heads`.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -34,8 +34,9 @@ impl KernelSpec for GdnGatedRmsNormSpec {
     const KIND: KernelKind = "gdn_gated_rms_norm";
 
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        // One to 8192 power-of-two tokens after flattening 32 value heads.
-        SweepGrid::new(vec![Axis::pow2(5, 18)])
+        // Power-of-two flattened rows (tokens x value heads): 2^19 covers an
+        // 8192-token step at up to 64 value heads.
+        SweepGrid::new(vec![Axis::pow2(5, 19)])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -138,10 +139,10 @@ mod tests {
             grid.axes()[0],
             [
                 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0,
-                65536.0, 131072.0, 262144.0,
+                65536.0, 131072.0, 262144.0, 524288.0,
             ]
         );
-        assert_eq!(grid.axes()[0].len(), 14);
+        assert_eq!(grid.axes()[0].len(), 15);
         assert!(GdnGatedRmsNormSpec::infeasible_mask(&cfg, &grid).is_empty());
     }
 
@@ -161,7 +162,7 @@ mod tests {
         let grid = GdnGatedRmsNormSpec::sweep_grid(&cfg);
         let payloads = GdnGatedRmsNormSpec::enumerate(&cfg, &grid, "vllm_triton");
 
-        assert_eq!(payloads.len(), 14);
+        assert_eq!(payloads.len(), 15);
         for payload in &payloads {
             let names: Vec<&str> = payload.fields().keys().map(String::as_str).collect();
             assert_eq!(names, ["backend", "dtype", "hidden", "m"]);
@@ -174,6 +175,6 @@ mod tests {
         assert_eq!(first.get("m"), Some(&Value::from(32_u32)));
         assert_eq!(first.get("hidden"), Some(&Value::from(128_u32)));
         assert_eq!(first.get("dtype"), Some(&Value::from("bf16")));
-        assert_eq!(payloads[13].fields()["m"], Value::from(262144_u32));
+        assert_eq!(payloads[14].fields()["m"], Value::from(524288_u32));
     }
 }

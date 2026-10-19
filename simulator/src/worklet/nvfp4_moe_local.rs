@@ -1,10 +1,12 @@
 //! Device-local NVFP4 routed-MoE callable section on B200.
 //!
 //! The input activation quantization precedes one whole-callable fused-MoE L1
-//! leaf. The fused leaf owns routing, both expert GEMMs, SwiGLU, and whatever
-//! finalize boundary the selected backend actually measures. A deferred-
-//! finalize backend deliberately stops before reduction; its provider-specific
-//! consumer composes a separate finalize worklet after this neutral callable.
+//! leaf, except on a weight-only backend (`activation_format` set), whose GEMMs
+//! take the activations as they are, so it has no quant leaf. The fused leaf
+//! owns routing, both expert GEMMs, SwiGLU, and whatever finalize boundary the
+//! selected backend actually measures. A deferred-finalize backend deliberately
+//! stops before reduction; its provider-specific consumer composes a separate
+//! finalize worklet after this neutral callable.
 //!
 //! With `tp_size > 1` this callable produces one rank's partial hidden output.
 //! The L4 consumer owns the later TP all-reduce; this local worklet does not
@@ -38,6 +40,11 @@ pub struct Nvfp4MoeLocalWorkletConfig {
     pub quant_backends: Vec<&'static str>,
     pub moe_backends: Vec<&'static str>,
     pub weight_format: DType,
+    /// The precision the activations reach the expert GEMMs in when the
+    /// backend does not quantize them to `weight_format` (the MXFP4 x BF16
+    /// backend: `activation_dtype`). Set, the input quant is not built; unset,
+    /// the activations are quantized first. Forwarded to the fused-MoE config.
+    pub activation_format: Option<DType>,
     pub group_size: u32,
     pub routing_method: String,
     pub n_group: u32,
@@ -97,7 +104,8 @@ impl Nvfp4MoeLocalWorkletConfig {
 #[derive(Clone, Debug)]
 pub struct Nvfp4MoeLocalWorkletResolved {
     pub raw_cfg: Nvfp4MoeLocalWorkletConfig,
-    pub quant: Nvfp4QuantKernelConfig,
+    /// `None` on a weight-only backend.
+    pub quant: Option<Nvfp4QuantKernelConfig>,
     pub fused_moe: Nvfp4FusedMoeKernelConfig,
     pub experts_per_device: Dim,
     pub intermediate_per_rank: Dim,
@@ -110,7 +118,7 @@ pub struct Nvfp4MoeLocalWorkletInput {
 
 pub struct Nvfp4MoeLocalWorklet {
     pub name: String,
-    pub quant: Op<Nvfp4QuantKernel>,
+    pub quant: Option<Op<Nvfp4QuantKernel>>,
     pub fused_moe: Op<Nvfp4FusedMoeKernel>,
     resolved: Nvfp4MoeLocalWorkletResolved,
 }
@@ -148,15 +156,24 @@ impl Nvfp4MoeLocalWorklet {
         let experts_per_device = cfg.num_experts.clone() / Dim::param("ep", u32::from(cfg.ep_size));
         let intermediate_per_rank =
             cfg.moe_intermediate.clone() / Dim::param("moe_tp", u32::from(cfg.tp_size));
+        if let Some(format) = cfg.activation_format {
+            assert_eq!(
+                format, cfg.activation_dtype,
+                "unquantized activations reach the expert GEMMs in their own precision"
+            );
+        }
         Nvfp4MoeLocalWorkletResolved {
-            quant: Nvfp4QuantKernelConfig {
-                backends: cfg.quant_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                hidden_size: cfg.hidden.clone(),
-                group_size: cfg.group_size,
-                input_dtype: cfg.activation_dtype,
-                scale_format: "linear_e4m3".to_string(),
-            },
+            quant: cfg
+                .activation_format
+                .is_none()
+                .then(|| Nvfp4QuantKernelConfig {
+                    backends: cfg.quant_backends.clone(),
+                    gpu_name: cfg.gpu_name.clone(),
+                    hidden_size: cfg.hidden.clone(),
+                    group_size: cfg.group_size,
+                    input_dtype: cfg.activation_dtype,
+                    scale_format: "linear_e4m3".to_string(),
+                }),
             fused_moe: Nvfp4FusedMoeKernelConfig {
                 backends: cfg.moe_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -167,6 +184,7 @@ impl Nvfp4MoeLocalWorklet {
                 top_k: cfg.top_k,
                 input_dtype: cfg.activation_dtype,
                 weight_format: cfg.weight_format,
+                activation_format: cfg.activation_format,
                 group_size: cfg.group_size,
                 routing_method: cfg.routing_method.clone(),
                 n_group: cfg.n_group,
@@ -187,16 +205,18 @@ impl Nvfp4MoeLocalWorklet {
         resolved: Nvfp4MoeLocalWorkletResolved,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
-        let quant_name = format!("{name}.input_quant");
+        let quant = resolved
+            .quant
+            .clone()
+            .map(|config| -> Result<_, BuildError> {
+                let quant_name = format!("{name}.input_quant");
+                Ok(Op::new(
+                    quant_name.clone(),
+                    Arc::new(Nvfp4QuantKernel::build(quant_name, config, bridge)?),
+                ))
+            })
+            .transpose()?;
         let fused_moe_name = format!("{name}.fused_moe");
-        let quant = Op::new(
-            quant_name.clone(),
-            Arc::new(Nvfp4QuantKernel::build(
-                quant_name,
-                resolved.quant.clone(),
-                bridge,
-            )?),
-        );
         let fused_moe = Op::new(
             fused_moe_name.clone(),
             Arc::new(Nvfp4FusedMoeKernel::build(
@@ -223,33 +243,29 @@ impl Nvfp4MoeLocalWorklet {
                 self.resolved.experts_per_device,
                 self.resolved.intermediate_per_rank,
             ),
-            child: Box::new(CostNode::Sum(vec![
-                self.quant.compile(builder),
-                self.fused_moe.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum({
+                let mut children: Vec<CostNode> = self
+                    .quant
+                    .iter()
+                    .map(|quant| quant.compile(builder))
+                    .collect();
+                children.push(self.fused_moe.compile(builder));
+                children
+            })),
         }
     }
 
     pub fn eval(&self, input: &Nvfp4MoeLocalWorkletInput, ev: &mut Evaluator) {
-        self.quant.eval(
-            &Nvfp4QuantKernelInput {
-                num_tokens: input.num_tokens,
-            },
-            ev,
-        );
-        self.fused_moe.eval(
-            &Nvfp4FusedMoeKernelInput {
-                num_tokens: input.num_tokens,
-            },
-            ev,
-        );
+        self.eval_or_zero(input, false, ev);
     }
 
     /// Push zeros instead when this copy of the call does not run (a consumer
     /// that compiles a concurrent and a serial copy, of which one runs).
     pub fn eval_or_zero(&self, input: &Nvfp4MoeLocalWorkletInput, zero: bool, ev: &mut Evaluator) {
         let num_tokens = input.num_tokens;
-        push_or_zero(&self.quant, Nvfp4QuantKernelInput { num_tokens }, zero, ev);
+        if let Some(quant) = &self.quant {
+            push_or_zero(quant, Nvfp4QuantKernelInput { num_tokens }, zero, ev);
+        }
         push_or_zero(
             &self.fused_moe,
             Nvfp4FusedMoeKernelInput { num_tokens },
@@ -277,6 +293,7 @@ mod tests {
             quant_backends: vec!["vllm_cuda"],
             moe_backends: vec!["flashinfer_trtllm_sm100"],
             weight_format: DType::Nvfp4E2m1,
+            activation_format: None,
             group_size: 16,
             routing_method: "minimax2".to_string(),
             n_group: 1,
@@ -316,7 +333,7 @@ mod tests {
 
         let resolved = Nvfp4MoeLocalWorklet::resolve_config(&configs[3]);
         assert_eq!(resolved.experts_per_device, 64);
-        assert_eq!(resolved.quant.scale_format, "linear_e4m3");
+        assert_eq!(resolved.quant.unwrap().scale_format, "linear_e4m3");
         assert_eq!(resolved.fused_moe.folded_rank_position, 3);
     }
 

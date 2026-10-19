@@ -103,15 +103,24 @@ def _model(config_path: str):
     return load_model(config_path)
 
 
-#: Arch types whose served deployment fixes the MLA latent cache at FP8
-#: (``--kv-cache-dtype fp8_e4m3``), a serving choice the checkpoint config omits.
-_FP8_MLA_CACHE_ARCHS = frozenset(
+#: Arch types whose served deployment fixes the attention KV cache at FP8
+#: (``--kv-cache-dtype fp8``/``fp8_e4m3``), a serving choice the checkpoint config
+#: omits: the MLA latent cache of a DSA arch, the K/V cache of a GQA one.
+_FP8_KV_CACHE_ARCHS = frozenset(
     {
         "glm53_flash_vllm_fp8_kda_dsa_moe",
         "glm53_flash_vllm_fp8_pp_kda_dsa_moe",
         "glm53_flash_vllm_fp8_dp_attn_ep_moe",
+        "qwen35_vllm_nvfp4_gdn_dense",
+        # Qwen3.8-Flash-Next: its arch's `kv_cache_dtype` (default fp8) decides.
+        "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative",
     }
 )
+
+#: Arch types whose QSA indexer key cache is FP8 by its arch's
+#: ``indexer_kv_dtype`` (default fp8), a serving choice the checkpoint omits.
+#: The GLM DSA specs already default their index cache to one byte.
+_FP8_INDEX_CACHE_ARCHS = frozenset({"qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative"})
 
 #: Arch types that run an NVFP4 checkpoint's FP4 path; their model config must
 #: declare the matching quantization scheme (``quantization_config``, or
@@ -130,13 +139,32 @@ _FP4_ARCHS = frozenset(
         "glm53_flash_vllm_nvfp4_dp_attn_ep_moe",
         # Inkling NVFP4 (routed experts only; layer 2's stay BF16).
         "inkling_vllm_nvfp4_rel_attn_moe",
+        # Qwen3.8-27B ModelOpt MIXED_PRECISION: NVFP4 MLPs and lm_head, FP8 attention
+        # projections; the scheme's headline is its lowest precision, FP4.
+        "qwen35_vllm_nvfp4_gdn_dense",
+        # Qwen3.8-Flash-Next ModelOpt mix: NVFP4 body experts, FP8-block MTP
+        # experts and PLE table, BF16 elsewhere.
+        "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative",
     }
 )
 
 #: Speculative arch types: their cost log carries per-stage request geometry.
 _SPECULATIVE_ARCHS = frozenset(
-    {"glm52_vllm_nvfp4_dsa_moe_speculative", "glm53_vllm_nvfp4_dsa_moe_dflash2"}
+    {
+        "glm52_vllm_nvfp4_dsa_moe_speculative",
+        "glm53_vllm_nvfp4_dsa_moe_dflash2",
+        "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative",
+    }
 )
+
+#: Each speculative arch's ``draft_tokens`` serde default (``simulator/src/arch/
+#: config.rs``): params.json records the run config as written, so an omitted
+#: depth must resolve to what the simulator ran, not another arch's default.
+_DEFAULT_DRAFT_TOKENS = {
+    "glm52_vllm_nvfp4_dsa_moe_speculative": 5,
+    "glm53_vllm_nvfp4_dsa_moe_dflash2": 7,
+    "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative": 3,
+}
 
 #: The proposer of a speculative arch that ships as its own checkpoint, by the
 #: draft's ``config.json`` under the repo root. The run's params name only the
@@ -145,16 +173,58 @@ _DRAFT_CONFIGS = {"glm53_vllm_nvfp4_dsa_moe_dflash2": "model/config/glm53_dflash
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _with_fp8_mla_cache(model):
+def _replace_attention(model, rewrite):
+    """``model`` with ``rewrite`` applied to every stack's attention spec.
+
+    A wrapper that carries extra per-layer work beside its attention (Qwen4Exp's
+    n-gram embedding layer) exposes the wrapped spec as ``attn``; the rewrite
+    reaches it there.
+    """
     from dataclasses import replace
 
-    layers = [
-        replace(stack, attn=replace(stack.attn, mla_cache_dtype_bytes=1.0))
-        if hasattr(stack.attn, "mla_cache_dtype_bytes")
-        else stack
-        for stack in model.layers
-    ]
-    return replace(model, layers=layers)
+    def apply(attn):
+        inner = getattr(attn, "attn", None)
+        if inner is not None:
+            return replace(attn, attn=rewrite(inner))
+        return rewrite(attn)
+
+    return replace(model, layers=[replace(stack, attn=apply(stack.attn)) for stack in model.layers])
+
+
+def _with_fp8_kv_cache(model):
+    """Serve every attention spec's persistent KV cache at one byte per element.
+
+    An MLA spec stores its latent in ``mla_cache_dtype_bytes``; a GQA-like spec
+    stores K/V in ``kv_dtype_bytes`` and, given an FP8 cache, runs its prefill
+    math on FP8 queries and keys (``prefill_compute_dtype``). Recurrent state
+    (GDN/KDA) is not KV cache and keeps its own dtype.
+    """
+    from dataclasses import replace
+
+    def fp8_cache(attn):
+        if hasattr(attn, "mla_cache_dtype_bytes"):
+            return replace(attn, mla_cache_dtype_bytes=1.0)
+        if hasattr(attn, "kv_dtype_bytes"):
+            fields = {"kv_dtype_bytes": 1.0}
+            if hasattr(attn, "prefill_compute_dtype"):
+                fields["prefill_compute_dtype"] = "fp8"
+            return replace(attn, **fields)
+        return attn
+
+    return _replace_attention(model, fp8_cache)
+
+
+def _with_fp8_index_cache(model):
+    """Serve every sparse-attention spec's indexer key cache at one byte per
+    element (``index_cache_dtype_bytes``); specs without one are unchanged."""
+    from dataclasses import replace
+
+    def fp8_index(attn):
+        if hasattr(attn, "index_cache_dtype_bytes"):
+            return replace(attn, index_cache_dtype_bytes=1.0)
+        return attn
+
+    return _replace_attention(model, fp8_index)
 
 
 @cache
@@ -184,8 +254,10 @@ def _model_for_spec(spec: dict):
             spec.get("draft_sliding_window"),
         )
     model = _model(spec["config"])
-    if arch_type in _FP8_MLA_CACHE_ARCHS:
-        return _with_fp8_mla_cache(model)
+    if arch_type in _FP8_KV_CACHE_ARCHS and spec.get("kv_cache_dtype", "fp8") == "fp8":
+        model = _with_fp8_kv_cache(model)
+    if arch_type in _FP8_INDEX_CACHE_ARCHS and spec.get("indexer_kv_dtype", "fp8") == "fp8":
+        model = _with_fp8_index_cache(model)
     if arch_type != "glm52_vllm_nvfp4_dsa_moe_speculative":
         return model
     mode = spec.get("mtp_mode", "index_share")
@@ -255,8 +327,10 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
         specs[pool_tag] = {
             "arch_type": arch_type,
             "mtp_mode": arch.get("mtp_mode", "index_share"),
-            "draft_tokens": arch.get("draft_tokens", 5),
+            "draft_tokens": arch.get("draft_tokens", _DEFAULT_DRAFT_TOKENS.get(arch_type)),
             "draft_sliding_window": arch.get("draft_sliding_window"),
+            "kv_cache_dtype": arch.get("kv_cache_dtype", "fp8"),
+            "indexer_kv_dtype": arch.get("indexer_kv_dtype", "fp8"),
             "config": arch["model_config"],
             # `gpu` is a group-level field (the arch block carries model/tp/fp8).
             "gpu": group["gpu"],
@@ -274,8 +348,17 @@ def _check_precision(model, spec: dict) -> None:
     reports weight bytes at 2x the traffic that actually moved — a "minimum"
     larger than the measured value, which silently turns redundancy into a number
     below 1. It is not detectable downstream, so it is rejected here.
+
+    A mixed-precision checkpoint (ModelOpt ``MIXED_PRECISION``) is matched by its
+    headline, lowest-precision compute dtype: an FP4 arch serving NVFP4 MLPs beside
+    FP8 attention projections declares ``fp4`` and needs no ``fp8`` flag, since the
+    config already says which module runs at which precision. An ``fp8`` flag on
+    such an arch would claim the whole model is FP8 and is refused.
     """
     config_quant_dtype = model.quant.compute_dtype if model.quant is not None else None
+    config_dtypes = (
+        "+".join(sorted(model.quant.compute_dtypes)) if model.quant is not None else None
+    )
     arch_quant_dtype = spec.get("arch_quant_dtype", "fp8" if spec["arch_fp8"] else None)
     if arch_quant_dtype is not None and config_quant_dtype is None:
         raise ValueError(
@@ -289,13 +372,13 @@ def _check_precision(model, spec: dict) -> None:
             else "does not declare a matching quantized path"
         )
         raise ValueError(
-            f"{spec['config']} declares a {model.quant.compute_dtype} quantization_config "
+            f"{spec['config']} declares a {config_dtypes} quantization_config "
             f"but the arch {declaration}; "
             "the run and the accountant disagree on precision"
         )
     if config_quant_dtype != arch_quant_dtype:
         raise ValueError(
-            f"{spec['config']} declares {config_quant_dtype} quantized compute but the arch "
+            f"{spec['config']} declares {config_dtypes} quantized compute but the arch "
             f"declares {arch_quant_dtype}; the run and the accountant disagree on precision"
         )
 
@@ -317,6 +400,8 @@ def _spec_for_level(level_key: str, pool_specs: dict[str, dict]) -> dict:
                 s.get("mtp_mode"),
                 s.get("draft_tokens"),
                 s.get("draft_sliding_window"),
+                s.get("kv_cache_dtype"),
+                s.get("indexer_kv_dtype"),
             )
             for s in pool_specs.values()
         }

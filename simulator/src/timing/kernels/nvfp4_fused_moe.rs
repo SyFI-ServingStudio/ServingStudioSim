@@ -9,9 +9,15 @@
 //! `nvfp4_e2m1` / group 16. The FP8 block-scale
 //! backend `flashinfer_trtllm_fp8_block_sm100` (`trtllm_fp8_block_scale_moe`,
 //! DeepSeek-FP8) takes `fp8_e4m3` / group 128 (128x128 weight blocks,
-//! per-token-group-128 activations) with `deepseek_v3` routing,
-//! `n_group = topk_group = 1`, and routed scaling 5/2. Its autotuner stops at
-//! 8192 tokens, so larger grid points reuse the top tactic bucket.
+//! per-token-group-128 activations) with ungrouped `deepseek_v3` routing
+//! (`n_group = topk_group = 1`) or `renormalize_naive` routing
+//! (`n_group = topk_group = 0`). Its autotuner stops at 8192 tokens, so larger
+//! grid points reuse the top tactic bucket.
+//!
+//! The monolithic NVFP4 backend routes inside the call with `minimax2`,
+//! `deepseek_v3` or `renormalize_naive` (softmax top-k renormalized over BF16
+//! logits, no bias, `n_group = topk_group = 0`). `routing_method` is a plain
+//! profiler key, so a new method needs no Rust change.
 //!
 //! `flashinfer_trtllm_routed_sm100` is vLLM's modular call under data plus
 //! expert parallelism (`trtllm_fp4_block_scale_routed_moe`): the top-k IDs and
@@ -26,6 +32,14 @@
 //! as much as the token count, which the folded histogram carries: the
 //! profiler reads the first `num_local_experts` entries as the rank it times,
 //! and `folded_rank_position = 0` puts the fold's critical rank there.
+//!
+//! The MXFP4/BF16 backend `flashinfer_trtllm_sm100_mxfp4_bf16`
+//! (`trtllm_fp4_block_scale_moe`, vLLM's `FLASHINFER_TRTLLM_MXFP4_BF16`
+//! monolithic experts) takes the same `mxfp4_e2m1` / group 32 weights but never
+//! quantizes the activations: its GEMMs cast the weights and run BF16 MMA. It
+//! routes inside the call with ungrouped `deepseek_v3` over FP32 logits. A
+//! config for it sets `activation_format = bf16`, which makes the compute dtype
+//! bf16; no profiler arg changes, so its rows key exactly like the others'.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -44,13 +58,26 @@ pub struct Nvfp4FusedMoeKernelConfig {
     pub num_experts: Dim,
     pub num_local_experts: Dim,
     pub top_k: u32,
-    /// Router and output precision, and the activation's element type before
-    /// the kernel quantizes it. Not the tensor-core precision.
+    /// Output precision, and the activation's element type before any
+    /// quantization. Not the tensor-core precision unless `activation_format`
+    /// says the activations stay in it.
     pub input_dtype: DType,
-    /// Packed expert weight format. Activations are quantized to it inside the
-    /// call, so both GEMM operands reach the tensor cores in this format.
+    /// Packed expert weight format. It is the tensor-core precision when the
+    /// activations are quantized to it (every backend but the weight-only one),
+    /// so both GEMM operands reach the tensor cores in this format.
     #[compute_dtype]
     pub weight_format: DType,
+    /// The precision the activations reach the tensor cores in when they are
+    /// *not* quantized to `weight_format`: `bf16` (= `input_dtype`) for the
+    /// weight-only MXFP4/BF16 backend, whose GEMMs run BF16 MMA over cast
+    /// weights. It then is the compute dtype the launcher gates backends on and
+    /// the analyzer takes its peak from. Unset (the default, and absent from
+    /// the serialized config, so existing identities are unchanged): the
+    /// activations are quantized to `weight_format`. Not a profiler arg: the
+    /// backend string already keys rows of the two activation paths apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[compute_dtype_override]
+    pub activation_format: Option<DType>,
     pub group_size: u32,
     pub routing_method: String,
     pub n_group: u32,
@@ -92,6 +119,15 @@ impl KernelSpec for Nvfp4FusedMoeSpec {
     /// The corpus arm names a payload on disk, and `enumerate` has no way to
     /// report that it moved.
     fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
+        if let Some(activation) = config.activation_format {
+            anyhow::ensure!(
+                activation == config.input_dtype,
+                "activation_format {} must equal input_dtype {}: unquantized activations \
+                 reach the tensor cores in their own precision",
+                activation.as_str(),
+                config.input_dtype.as_str()
+            );
+        }
         config.expert_demand.prepare().map(|_| ())
     }
 
@@ -162,6 +198,7 @@ mod tests {
             top_k: 2,
             input_dtype: DType::Bf16,
             weight_format: DType::Nvfp4E2m1,
+            activation_format: None,
             group_size: 16,
             routing_method: "minimax2".to_string(),
             n_group: 1,
@@ -220,6 +257,7 @@ mod tests {
             top_k: 8,
             input_dtype: DType::Bf16,
             weight_format: DType::Fp8E4m3,
+            activation_format: None,
             group_size: 128,
             routing_method: "deepseek_v3".to_string(),
             n_group: 1,
@@ -358,6 +396,10 @@ mod tests {
         let described = cfg.describe_config();
         assert_eq!(described["weight_format"], Value::from("nvfp4_e2m1"));
         assert_eq!(described["input_dtype"], Value::from("bf16"));
+        // An unset override leaves no trace, so pre-existing kernel-config
+        // records keep their identity.
+        assert!(described.get("activation_format").is_none());
+        assert!(cfg.identity().get("activation_format").is_none());
         let payloads = Nvfp4FusedMoeSpec::enumerate(
             &cfg,
             &SweepGrid::new(vec![Axis::values([16])]),
@@ -421,6 +463,7 @@ mod tests {
             top_k: 6,
             input_dtype: DType::Bf16,
             weight_format: DType::Mxfp4E2m1,
+            activation_format: None,
             group_size: 32,
             routing_method: "precomputed_dsv4".to_string(),
             n_group: 1,
@@ -511,5 +554,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A weight-only MXFP4 config: 256 experts, 64 local (EP4), top-8,
+    /// ungrouped DeepSeek-V3 routing.
+    fn mxfp4_bf16_ep4() -> Nvfp4FusedMoeKernelConfig {
+        Nvfp4FusedMoeKernelConfig {
+            backends: vec!["flashinfer_trtllm_sm100_mxfp4_bf16"],
+            gpu_name: "NVIDIA B200".to_string(),
+            hidden_size: 4096.into(),
+            intermediate_size: 2048.into(),
+            num_experts: 256.into(),
+            num_local_experts: 64.into(),
+            top_k: 8,
+            input_dtype: DType::Bf16,
+            weight_format: DType::Mxfp4E2m1,
+            activation_format: Some(DType::Bf16),
+            group_size: 32,
+            routing_method: "deepseek_v3".to_string(),
+            n_group: 1,
+            topk_group: 1,
+            routed_scaling_numerator: 1,
+            routed_scaling_denominator: 1,
+            expert_demand: ExpertDemand::popularity(
+                &crate::timing::routing::RoutingDistribution::uniform(256),
+                1,
+            ),
+            folded_rank_position: 0,
+        }
+    }
+
+    /// The weight-only backend runs BF16 MMA: a compute dtype read off
+    /// `weight_format` would gate it out of the launcher (it declares bf16)
+    /// and give the analyzer the FP4 peak, 4x the BF16 one.
+    #[test]
+    fn activation_format_is_the_compute_dtype_of_the_weight_only_backend() {
+        let config = mxfp4_bf16_ep4();
+        assert_eq!(config.compute_dtype(), Some(DType::Bf16));
+        assert_eq!(
+            Nvfp4FusedMoeKernelConfig::COMPUTE_DTYPE_OVERRIDE_FIELD,
+            Some("activation_format")
+        );
+        assert_eq!(
+            config.describe_config()["activation_format"],
+            Value::from("bf16")
+        );
+        let mut quantized = config.clone();
+        quantized.activation_format = None;
+        assert_eq!(quantized.compute_dtype(), Some(DType::Mxfp4E2m1));
+    }
+
+    /// The override is Rust-side identity, not a profiler arg: a payload that
+    /// carried it would key a row the Python schema cannot store.
+    #[test]
+    fn mxfp4_bf16_backend_forwards_exactly_the_python_args() {
+        let config = mxfp4_bf16_ep4();
+        Nvfp4FusedMoeSpec::validate_config(&config).expect("valid config");
+        let grid = SweepGrid::new(vec![Axis::values([1, 512])]);
+        let payloads =
+            Nvfp4FusedMoeSpec::enumerate(&config, &grid, "flashinfer_trtllm_sm100_mxfp4_bf16");
+        for (payload, tokens) in payloads.iter().zip([1_u64, 512]) {
+            let fields = payload.fields();
+            assert_eq!(fields.len(), 16, "Python Args fields plus backend");
+            assert!(!fields.contains_key("activation_format"));
+            assert_eq!(fields["weight_format"], Value::from("mxfp4_e2m1"));
+            assert_eq!(fields["input_dtype"], Value::from("bf16"));
+            assert_eq!(fields["routing_method"], Value::from("deepseek_v3"));
+            let batches = fields["per_expert_batches"].as_array().unwrap();
+            assert_eq!(batches.len(), 256);
+            assert_eq!(
+                batches.iter().map(|v| v.as_u64().unwrap()).sum::<u64>(),
+                tokens * 8
+            );
+        }
+    }
+
+    #[test]
+    fn an_activation_format_other_than_the_input_dtype_is_rejected() {
+        // Unquantized activations reach the MMA in their own precision, so a
+        // differing value describes no call.
+        let mut config = mxfp4_bf16_ep4();
+        config.activation_format = Some(DType::Fp8E4m3);
+        let error = Nvfp4FusedMoeSpec::validate_config(&config).expect_err("mismatch");
+        assert!(format!("{error:#}").contains("must equal input_dtype"));
     }
 }

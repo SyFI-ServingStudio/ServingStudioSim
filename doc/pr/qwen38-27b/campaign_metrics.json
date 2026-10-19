@@ -1,0 +1,1086 @@
+{
+  "cases": {
+    "tp1/01_micro_throughput_c256": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/01_micro_throughput_c256",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 2.304147465437789,
+        "e2e_mean_pct": -0.49664795391596295,
+        "gpu_time_multiplier": 1.2048315203279791,
+        "iteration_cycle_mean_pct": 3.104603300676123,
+        "iterations_pct": -2.2522522522522515,
+        "kernel_abs_pct": 3.7146036926553,
+        "kernel_signed_pct": 0.7454083118721432,
+        "map_coverage_pct": 97.7944176326438,
+        "output_tps_pct": 0.4870995684593815,
+        "prefill_tokens_mean_pct": 2.304147465437789,
+        "scheduled_kv_mean_pct": 2.304147465437789,
+        "server_tpot_mean_pct": 2.488702539749199,
+        "server_ttft_mean_pct": 26.89747900003652
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/01_micro_throughput_c256/analysis_kernel",
+        "iteration_count": 222,
+        "predict_log_dir": "logs/20261013_1_q38_align/01_micro_throughput_c256/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 1024,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/01_micro_throughput_c256/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/01_micro_throughput_c256/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/01_micro_throughput_c256/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/01_micro_throughput_c256/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/01_micro_throughput_c256/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/02_graph_boundaries_c128": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/02_graph_boundaries_c128",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 2.5751072961373467,
+        "e2e_mean_pct": -6.641908388885753,
+        "gpu_time_multiplier": 1.1788373940794272,
+        "iteration_cycle_mean_pct": -2.380653268381383,
+        "iterations_pct": -2.5104602510460206,
+        "kernel_abs_pct": 3.7393512501299275,
+        "kernel_signed_pct": -1.130925438521426,
+        "map_coverage_pct": 97.98264175998229,
+        "output_tps_pct": 7.21835118046803,
+        "prefill_tokens_mean_pct": 2.5751072961373467,
+        "scheduled_kv_mean_pct": 2.5751072961373467,
+        "server_tpot_mean_pct": -2.3263764270355036,
+        "server_ttft_mean_pct": 4.113608046835959
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/02_graph_boundaries_c128/analysis_kernel",
+        "iteration_count": 239,
+        "predict_log_dir": "logs/20261013_1_q38_align/02_graph_boundaries_c128/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/02_graph_boundaries_c128/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 528,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/02_graph_boundaries_c128/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/02_graph_boundaries_c128/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/02_graph_boundaries_c128/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/02_graph_boundaries_c128/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/02_graph_boundaries_c128/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/03_balanced_anchor_c32": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/03_balanced_anchor_c32",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.5364806866952732,
+        "e2e_mean_pct": -4.378430836522195,
+        "gpu_time_multiplier": 1.2115542077811057,
+        "iteration_cycle_mean_pct": -2.559182491993417,
+        "iterations_pct": -0.5336179295624355,
+        "kernel_abs_pct": 2.489797960122049,
+        "kernel_signed_pct": -1.852676914929143,
+        "map_coverage_pct": 98.19904358713327,
+        "output_tps_pct": 3.784198636580949,
+        "prefill_tokens_mean_pct": 0.5364806866952732,
+        "scheduled_kv_mean_pct": 0.5364806866952954,
+        "server_tpot_mean_pct": -2.774950176508695,
+        "server_ttft_mean_pct": -10.652286247076493
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/03_balanced_anchor_c32/analysis_kernel",
+        "iteration_count": 871,
+        "predict_log_dir": "logs/20261013_1_q38_align/03_balanced_anchor_c32/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/03_balanced_anchor_c32/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 128,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/03_balanced_anchor_c32/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/03_balanced_anchor_c32/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/03_balanced_anchor_c32/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/03_balanced_anchor_c32/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/03_balanced_anchor_c32/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/04_prefill_spectrum_c32": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/04_prefill_spectrum_c32",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 2.083333333333326,
+        "e2e_mean_pct": -7.145674321575801,
+        "gpu_time_multiplier": 1.2749868543520544,
+        "iteration_cycle_mean_pct": -4.487596901909674,
+        "iterations_pct": -2.0408163265306145,
+        "kernel_abs_pct": 1.1816177834535382,
+        "kernel_signed_pct": 0.21187850669786404,
+        "map_coverage_pct": 98.98517654986438,
+        "output_tps_pct": 7.725177687469609,
+        "prefill_tokens_mean_pct": 2.083333333333348,
+        "scheduled_kv_mean_pct": 2.083333333333348,
+        "server_tpot_mean_pct": -4.6640603274568875,
+        "server_ttft_mean_pct": -10.622123191377753
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/04_prefill_spectrum_c32/analysis_kernel",
+        "iteration_count": 341,
+        "predict_log_dir": "logs/20261013_1_q38_align/04_prefill_spectrum_c32/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/04_prefill_spectrum_c32/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 128,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/04_prefill_spectrum_c32/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/04_prefill_spectrum_c32/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/04_prefill_spectrum_c32/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/04_prefill_spectrum_c32/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/04_prefill_spectrum_c32/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/05_decode_spectrum_c64": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/05_decode_spectrum_c64",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.03253619651861772,
+        "e2e_mean_pct": -5.688728189515702,
+        "gpu_time_multiplier": 1.126817388190614,
+        "iteration_cycle_mean_pct": -4.391330804652426,
+        "iterations_pct": -0.03252561392096398,
+        "kernel_abs_pct": 5.608333399808995,
+        "kernel_signed_pct": -5.54551486499215,
+        "map_coverage_pct": 97.48373080400073,
+        "output_tps_pct": 4.773000807783578,
+        "prefill_tokens_mean_pct": 0.032536196518639926,
+        "scheduled_kv_mean_pct": 0.032536196518639926,
+        "server_tpot_mean_pct": -6.7885945487091925,
+        "server_ttft_mean_pct": -12.59897698127348
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/05_decode_spectrum_c64/analysis_kernel",
+        "iteration_count": 1191,
+        "predict_log_dir": "logs/20261013_1_q38_align/05_decode_spectrum_c64/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/05_decode_spectrum_c64/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 128,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/05_decode_spectrum_c64/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/05_decode_spectrum_c64/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/05_decode_spectrum_c64/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/05_decode_spectrum_c64/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/05_decode_spectrum_c64/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/06_long_long_c8": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/06_long_long_c8",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.037285607755399575,
+        "e2e_mean_pct": 3.853526055555556,
+        "gpu_time_multiplier": 1.053418582292819,
+        "iteration_cycle_mean_pct": 4.444058906424275,
+        "iterations_pct": -0.0372717107715248,
+        "kernel_abs_pct": 3.853120200468823,
+        "kernel_signed_pct": -3.8473957869042987,
+        "map_coverage_pct": 99.37469970506521,
+        "output_tps_pct": -4.1645664555783775,
+        "prefill_tokens_mean_pct": 0.037285607755399575,
+        "scheduled_kv_mean_pct": 0.037285607755399575,
+        "server_tpot_mean_pct": 4.871983873626395,
+        "server_ttft_mean_pct": -3.8256545274446108
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/06_long_long_c8/analysis_kernel",
+        "iteration_count": 274,
+        "predict_log_dir": "logs/20261013_1_q38_align/06_long_long_c8/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/06_long_long_c8/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 35,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/06_long_long_c8/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/06_long_long_c8/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/06_long_long_c8/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/06_long_long_c8/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/06_long_long_c8/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/07_quadrant_interference_c48": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/07_quadrant_interference_c48",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.1054185114906181,
+        "e2e_mean_pct": -5.880600949190262,
+        "gpu_time_multiplier": 1.1267225632473297,
+        "iteration_cycle_mean_pct": -4.957394427577255,
+        "iterations_pct": -0.1053074978938473,
+        "kernel_abs_pct": 3.7115003634675743,
+        "kernel_signed_pct": -3.259209780124264,
+        "map_coverage_pct": 98.03492609663624,
+        "output_tps_pct": 5.558488768042502,
+        "prefill_tokens_mean_pct": 0.1054185114906181,
+        "scheduled_kv_mean_pct": 0.1054185114906181,
+        "server_tpot_mean_pct": -6.634360078639279,
+        "server_ttft_mean_pct": -19.349195139312624
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/07_quadrant_interference_c48/analysis_kernel",
+        "iteration_count": 947,
+        "predict_log_dir": "logs/20261013_1_q38_align/07_quadrant_interference_c48/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/07_quadrant_interference_c48/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 96,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/07_quadrant_interference_c48/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/07_quadrant_interference_c48/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/07_quadrant_interference_c48/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/07_quadrant_interference_c48/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/07_quadrant_interference_c48/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/08_completion_churn_c96": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/08_completion_churn_c96",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.16132749481447828,
+        "e2e_mean_pct": -5.52039335253971,
+        "gpu_time_multiplier": 1.1409221910639982,
+        "iteration_cycle_mean_pct": -4.303244700860787,
+        "iterations_pct": -0.16106764841233856,
+        "kernel_abs_pct": 4.711429754428157,
+        "kernel_signed_pct": -3.9317523400910264,
+        "map_coverage_pct": 97.94279400801685,
+        "output_tps_pct": 4.8533978361225305,
+        "prefill_tokens_mean_pct": 0.16132749481447828,
+        "scheduled_kv_mean_pct": 0.16132749481447828,
+        "server_tpot_mean_pct": -9.298821163006066,
+        "server_ttft_mean_pct": -0.019390493744808612
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/08_completion_churn_c96/analysis_kernel",
+        "iteration_count": 1008,
+        "predict_log_dir": "logs/20261013_1_q38_align/08_completion_churn_c96/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/08_completion_churn_c96/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 192,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/08_completion_churn_c96/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/08_completion_churn_c96/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/08_completion_churn_c96/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/08_completion_churn_c96/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/08_completion_churn_c96/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/09_rate_knee": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/09_rate_knee",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": -1.4922097871406526,
+        "e2e_mean_pct": -2.4656729846554315,
+        "gpu_time_multiplier": 1.0598721013053485,
+        "iteration_cycle_mean_pct": -1.14181117574238,
+        "iterations_pct": 1.514813989752728,
+        "kernel_abs_pct": 2.7101448989058654,
+        "kernel_signed_pct": -2.1931241334557905,
+        "map_coverage_pct": 98.30418694040868,
+        "output_tps_pct": -0.33953358799659883,
+        "prefill_tokens_mean_pct": -1.4922097871406637,
+        "scheduled_kv_mean_pct": -1.4922097871406748,
+        "server_tpot_mean_pct": -2.6213422233997807,
+        "server_ttft_mean_pct": -13.676655028119189
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/09_rate_knee/analysis_kernel",
+        "iteration_count": 2059,
+        "predict_log_dir": "logs/20261013_1_q38_align/09_rate_knee/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/09_rate_knee/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 0.33670033670033667,
+          "available": true,
+          "checks": {
+            "arrival_time_scale_matches": true,
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 512,
+          "simulated_arrival_time_scale": 0.33670033669863014
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/09_rate_knee/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/09_rate_knee/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/09_rate_knee/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/09_rate_knee/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/09_rate_knee/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/10_full_saturation_rate": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/10_full_saturation_rate",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.07380073800740128,
+        "e2e_mean_pct": -0.7885446734091195,
+        "gpu_time_multiplier": 1.202617633677057,
+        "iteration_cycle_mean_pct": -0.2608624608518073,
+        "iterations_pct": -0.07374631268436405,
+        "kernel_abs_pct": 1.543149149244188,
+        "kernel_signed_pct": -0.547834061232234,
+        "map_coverage_pct": 98.94862320992117,
+        "output_tps_pct": 0.40731470677601855,
+        "prefill_tokens_mean_pct": 0.07380073800737907,
+        "scheduled_kv_mean_pct": 0.07380073800737907,
+        "server_tpot_mean_pct": -1.0186185809421655,
+        "server_ttft_mean_pct": -2.2916331931416956
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/10_full_saturation_rate/analysis_kernel",
+        "iteration_count": 386,
+        "predict_log_dir": "logs/20261013_1_q38_align/10_full_saturation_rate/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/10_full_saturation_rate/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 512,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/10_full_saturation_rate/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/10_full_saturation_rate/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/10_full_saturation_rate/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/10_full_saturation_rate/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/10_full_saturation_rate/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/11_long_prefill_ladder_c1": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/11_long_prefill_ladder_c1",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.0,
+        "e2e_mean_pct": -2.3139107053253727,
+        "gpu_time_multiplier": 1.0664932127397537,
+        "iteration_cycle_mean_pct": -2.1985336385076826,
+        "iterations_pct": 0.0,
+        "kernel_abs_pct": 3.341444499876775,
+        "kernel_signed_pct": -2.2366494988422594,
+        "map_coverage_pct": 99.04283566957672,
+        "output_tps_pct": 2.384687283095488,
+        "prefill_tokens_mean_pct": 0.0,
+        "scheduled_kv_mean_pct": 0.0,
+        "server_tpot_mean_pct": 11.09243022195987,
+        "server_ttft_mean_pct": -3.4627035068703793
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/11_long_prefill_ladder_c1/analysis_kernel",
+        "iteration_count": 380,
+        "predict_log_dir": "logs/20261013_1_q38_align/11_long_prefill_ladder_c1/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/11_long_prefill_ladder_c1/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 20,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/11_long_prefill_ladder_c1/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/11_long_prefill_ladder_c1/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/11_long_prefill_ladder_c1/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/11_long_prefill_ladder_c1/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/11_long_prefill_ladder_c1/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/12_ultra_context_decode_c1": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/12_ultra_context_decode_c1",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.0,
+        "e2e_mean_pct": 9.759769584769273,
+        "gpu_time_multiplier": 1.0579575433076636,
+        "iteration_cycle_mean_pct": 9.81324165290356,
+        "iterations_pct": 0.0,
+        "kernel_abs_pct": 3.148412691904049,
+        "kernel_signed_pct": -2.004605953199959,
+        "map_coverage_pct": 99.03422166051276,
+        "output_tps_pct": -8.890257534434543,
+        "prefill_tokens_mean_pct": 0.0,
+        "scheduled_kv_mean_pct": 0.0,
+        "server_tpot_mean_pct": 11.512813324079008,
+        "server_ttft_mean_pct": -3.6696646464853266
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/12_ultra_context_decode_c1/analysis_kernel",
+        "iteration_count": 459,
+        "predict_log_dir": "logs/20261013_1_q38_align/12_ultra_context_decode_c1/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/12_ultra_context_decode_c1/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 15,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/12_ultra_context_decode_c1/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/12_ultra_context_decode_c1/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/12_ultra_context_decode_c1/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/12_ultra_context_decode_c1/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/12_ultra_context_decode_c1/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/13_generation_length_matrix_c8": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/13_generation_length_matrix_c8",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.003049803287691333,
+        "e2e_mean_pct": 7.663080909497189,
+        "gpu_time_multiplier": 1.164229464175651,
+        "iteration_cycle_mean_pct": 8.432862754852554,
+        "iterations_pct": -0.0030497102775250973,
+        "kernel_abs_pct": 1.7446316436816434,
+        "kernel_signed_pct": -1.0370965492899333,
+        "map_coverage_pct": 98.75472477688247,
+        "output_tps_pct": -7.759575668664331,
+        "prefill_tokens_mean_pct": 0.003049803287691333,
+        "scheduled_kv_mean_pct": 0.003049803287691333,
+        "server_tpot_mean_pct": 7.5442793603010205,
+        "server_ttft_mean_pct": -6.429921941602624
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/13_generation_length_matrix_c8/analysis_kernel",
+        "iteration_count": 315,
+        "predict_log_dir": "logs/20261013_1_q38_align/13_generation_length_matrix_c8/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/13_generation_length_matrix_c8/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 24,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/13_generation_length_matrix_c8/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/13_generation_length_matrix_c8/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/13_generation_length_matrix_c8/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/13_generation_length_matrix_c8/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/13_generation_length_matrix_c8/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1_chunk4k/16_prefill_spectrum_chunk4k_c32": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/16_prefill_spectrum_chunk4k_c32",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 1.2084592145015005,
+        "e2e_mean_pct": -3.49900264990356,
+        "gpu_time_multiplier": 1.0505339791138062,
+        "iteration_cycle_mean_pct": -1.7713263418950076,
+        "iterations_pct": -1.1940298507462699,
+        "kernel_abs_pct": 3.7807986975002748,
+        "kernel_signed_pct": -3.5502055164249464,
+        "map_coverage_pct": 99.45238778217012,
+        "output_tps_pct": 3.5748981362175414,
+        "prefill_tokens_mean_pct": 1.2084592145015005,
+        "scheduled_kv_mean_pct": 1.2991809211672312,
+        "server_tpot_mean_pct": -1.7518806182850066,
+        "server_ttft_mean_pct": -4.063544251250184
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/16_prefill_spectrum_chunk4k_c32/analysis_kernel",
+        "iteration_count": 217,
+        "predict_log_dir": "logs/20261013_1_q38_align/16_prefill_spectrum_chunk4k_c32/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/16_prefill_spectrum_chunk4k_c32/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 128,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/16_prefill_spectrum_chunk4k_c32/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/16_prefill_spectrum_chunk4k_c32/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/16_prefill_spectrum_chunk4k_c32/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/16_prefill_spectrum_chunk4k_c32/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/16_prefill_spectrum_chunk4k_c32/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1_chunk4k/18_quadrant_interference_chunk4k_c48": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/18_quadrant_interference_chunk4k_c48",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.10539629005057449,
+        "e2e_mean_pct": -4.145286321155906,
+        "gpu_time_multiplier": 1.0634350208741914,
+        "iteration_cycle_mean_pct": -3.3806508974853156,
+        "iterations_pct": -0.10528532322594542,
+        "kernel_abs_pct": 4.399214507183644,
+        "kernel_signed_pct": -3.8048189225936184,
+        "map_coverage_pct": 98.7575704863076,
+        "output_tps_pct": 3.786791076750151,
+        "prefill_tokens_mean_pct": 0.1053962900505967,
+        "scheduled_kv_mean_pct": 0.1053962900505967,
+        "server_tpot_mean_pct": -3.4076410241365873,
+        "server_ttft_mean_pct": -3.367071917067166
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/18_quadrant_interference_chunk4k_c48/analysis_kernel",
+        "iteration_count": 650,
+        "predict_log_dir": "logs/20261013_1_q38_align/18_quadrant_interference_chunk4k_c48/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/18_quadrant_interference_chunk4k_c48/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 96,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/18_quadrant_interference_chunk4k_c48/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/18_quadrant_interference_chunk4k_c48/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/18_quadrant_interference_chunk4k_c48/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/18_quadrant_interference_chunk4k_c48/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/18_quadrant_interference_chunk4k_c48/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1_chunk8k/17_prefill_spectrum_chunk8k_c32": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/17_prefill_spectrum_chunk8k_c32",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 1.2422360248447228,
+        "e2e_mean_pct": -0.590305875362207,
+        "gpu_time_multiplier": 1.026515774133768,
+        "iteration_cycle_mean_pct": 0.9727781348963127,
+        "iterations_pct": -1.2269938650306789,
+        "kernel_abs_pct": 2.765307515470204,
+        "kernel_signed_pct": -2.699527413729719,
+        "map_coverage_pct": 99.64715721665267,
+        "output_tps_pct": 0.5844443010211142,
+        "prefill_tokens_mean_pct": 1.2422360248447228,
+        "scheduled_kv_mean_pct": 1.259595810206915,
+        "server_tpot_mean_pct": 1.1582061675827537,
+        "server_ttft_mean_pct": -0.6053029933565934
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/17_prefill_spectrum_chunk8k_c32/analysis_kernel",
+        "iteration_count": 105,
+        "predict_log_dir": "logs/20261013_1_q38_align/17_prefill_spectrum_chunk8k_c32/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/17_prefill_spectrum_chunk8k_c32/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 128,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/17_prefill_spectrum_chunk8k_c32/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/17_prefill_spectrum_chunk8k_c32/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/17_prefill_spectrum_chunk8k_c32/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/17_prefill_spectrum_chunk8k_c32/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/17_prefill_spectrum_chunk8k_c32/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1_chunk8k/19_quadrant_interference_chunk8k_c48": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/19_quadrant_interference_chunk8k_c48",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.1054185114906181,
+        "e2e_mean_pct": -2.2493928307098288,
+        "gpu_time_multiplier": 1.0336364272790992,
+        "iteration_cycle_mean_pct": -1.6544110738900386,
+        "iterations_pct": -0.1053074978938473,
+        "kernel_abs_pct": 2.858672496213113,
+        "kernel_signed_pct": -2.7721913839970345,
+        "map_coverage_pct": 99.45308302265119,
+        "output_tps_pct": 1.9647057830209036,
+        "prefill_tokens_mean_pct": 0.1054185114906181,
+        "scheduled_kv_mean_pct": 0.1054185114906181,
+        "server_tpot_mean_pct": -0.5102646763440299,
+        "server_ttft_mean_pct": 1.1646701404114168
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/19_quadrant_interference_chunk8k_c48/analysis_kernel",
+        "iteration_count": 274,
+        "predict_log_dir": "logs/20261013_1_q38_align/19_quadrant_interference_chunk8k_c48/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/19_quadrant_interference_chunk8k_c48/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 96,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/19_quadrant_interference_chunk8k_c48/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/19_quadrant_interference_chunk8k_c48/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/19_quadrant_interference_chunk8k_c48/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/19_quadrant_interference_chunk8k_c48/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/19_quadrant_interference_chunk8k_c48/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1_chunk8k/20_full_saturation_chunk8k": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/20_full_saturation_chunk8k",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.057926240586980704,
+        "e2e_mean_pct": -1.498114061635225,
+        "gpu_time_multiplier": 1.033417578400413,
+        "iteration_cycle_mean_pct": -1.3945448079745626,
+        "iterations_pct": -0.05789270551910253,
+        "kernel_abs_pct": 3.6422300139079717,
+        "kernel_signed_pct": -3.5204911315601106,
+        "map_coverage_pct": 99.08652881781607,
+        "output_tps_pct": 1.5918392142175941,
+        "prefill_tokens_mean_pct": 0.057926240586980704,
+        "scheduled_kv_mean_pct": 0.05792624058700291,
+        "server_tpot_mean_pct": -1.2808697913602396,
+        "server_ttft_mean_pct": 1.3489288267707344
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/20_full_saturation_chunk8k/analysis_kernel",
+        "iteration_count": 236,
+        "predict_log_dir": "logs/20261013_1_q38_align/20_full_saturation_chunk8k/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/20_full_saturation_chunk8k/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 512,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/20_full_saturation_chunk8k/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/20_full_saturation_chunk8k/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/20_full_saturation_chunk8k/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/20_full_saturation_chunk8k/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/20_full_saturation_chunk8k/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1_kv14/14_near_full_long_decode_c64": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/14_near_full_long_decode_c64",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.03530450132391838,
+        "e2e_mean_pct": -0.8451099623571379,
+        "gpu_time_multiplier": 1.0701159960747273,
+        "iteration_cycle_mean_pct": -0.2048753437570494,
+        "iterations_pct": -0.03529204164460786,
+        "kernel_abs_pct": 4.207223753865559,
+        "kernel_signed_pct": -4.07499577509227,
+        "map_coverage_pct": 99.22998994161917,
+        "output_tps_pct": 0.2705861512033003,
+        "prefill_tokens_mean_pct": 0.03530450132391838,
+        "scheduled_kv_mean_pct": 0.035304501323940585,
+        "server_tpot_mean_pct": -0.8271623994069666,
+        "server_ttft_mean_pct": -2.754031468335727
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/14_near_full_long_decode_c64/analysis_kernel",
+        "iteration_count": 1467,
+        "predict_log_dir": "logs/20261013_1_q38_align/14_near_full_long_decode_c64/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/14_near_full_long_decode_c64/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 192,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/14_near_full_long_decode_c64/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/14_near_full_long_decode_c64/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/14_near_full_long_decode_c64/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/14_near_full_long_decode_c64/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/14_near_full_long_decode_c64/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1_kv15/15_kv_overcommit_mixed_churn_c32": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261013_1_q38_align/15_kv_overcommit_mixed_churn_c32",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.15670201744160117,
+        "e2e_mean_pct": 3.0615534926248023,
+        "gpu_time_multiplier": 1.052964964323626,
+        "iteration_cycle_mean_pct": 4.256182858312507,
+        "iterations_pct": -0.1565729316715725,
+        "kernel_abs_pct": 3.907648243504779,
+        "kernel_signed_pct": -3.675577364181896,
+        "map_coverage_pct": 99.36443711411307,
+        "output_tps_pct": -3.913496648396819,
+        "prefill_tokens_mean_pct": 2.1857458888588477,
+        "scheduled_kv_mean_pct": 0.16089007307920067,
+        "server_tpot_mean_pct": 3.062819455830712,
+        "server_ttft_mean_pct": -0.26398025340386155
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261013_1_q38_align/15_kv_overcommit_mixed_churn_c32/analysis_kernel",
+        "iteration_count": 1416,
+        "predict_log_dir": "logs/20261013_1_q38_align/15_kv_overcommit_mixed_churn_c32/timing_predict",
+        "profile_log_dir": "logs/20261012_1_q38_align_campaign/15_kv_overcommit_mixed_churn_c32/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 72,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261013_1_q38_align/15_kv_overcommit_mixed_churn_c32/simulation",
+        "workload_profile_log_dir": "logs/20261012_1_q38_align_campaign/15_kv_overcommit_mixed_churn_c32/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261013_1_q38_align/15_kv_overcommit_mixed_churn_c32/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261013_1_q38_align/15_kv_overcommit_mixed_churn_c32/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261013_1_q38_align/15_kv_overcommit_mixed_churn_c32/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    }
+  },
+  "formulas": {
+    "decode_batch_mean_pct": "ratio(workload.metrics.decode_batch_size.{simulated,measured}.mean)",
+    "e2e_mean_pct": "ratio(e2e.latency.e2e.{simulated,measured}_ms.mean)",
+    "gpu_time_multiplier": "iteration.meta.recommended_gpu_time_multiplier",
+    "iteration_cycle_mean_pct": "ratio(workload.metrics.iteration_cycle_ms.{simulated,measured}.mean)",
+    "iterations_pct": "ratio(workload.meta.{simulated,measured}_iterations)",
+    "kernel_abs_pct": "iteration.comparison.all.absolute_error_pct",
+    "kernel_signed_pct": "iteration.comparison.all.signed_error_pct",
+    "map_coverage_pct": "iteration.mapping.coverage.measured_duration_fraction * 100",
+    "output_tps_pct": "ratio(e2e.throughput.simulated_completion_tps, e2e.throughput.measured_client_completion_tps)",
+    "prefill_tokens_mean_pct": "ratio(workload.metrics.prefill_tokens.{simulated,measured}.mean)",
+    "scheduled_kv_mean_pct": "ratio(workload.metrics.scheduled_kv_tokens.{simulated,measured}.mean)",
+    "server_tpot_mean_pct": "ratio(e2e.latency.server_tpot.{simulated,measured}_ms.mean)",
+    "server_ttft_mean_pct": "ratio(e2e.latency.server_ttft.{simulated,measured}_ms.mean)"
+  },
+  "generated_by": "python -m launcher alignment-campaign extract",
+  "pack": "qwen38_27b_nvfp4_b200_tp1",
+  "roots": [
+    "logs/20261013_1_q38_align"
+  ],
+  "schema_version": 1
+}

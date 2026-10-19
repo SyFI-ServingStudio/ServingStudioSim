@@ -505,20 +505,22 @@ def _check_acceptance(pack: Pack, metric_names: tuple[str, ...]) -> list[Finding
 
 def _check_calibration(pack: Pack) -> list[Finding]:
     findings: list[Finding] = []
-    for case in pack.cases:
-        for name, value in case.calibrated_fields.items():
-            where = f"cases[{case.slug}].{name}"
-            if value.provisional:
-                findings.append(
-                    Finding("warn", where,
-                            f"still provisional ({value.value!r}); {value.derived_from}")
-                )
-            elif not value.evidence:
-                findings.append(
-                    Finding("warn", where,
-                            "measured but cites no evidence path; the run that produced "
-                            "it cannot be found later")
-                )
+    fields = [(f"cases[{case.slug}].{name}", value)
+              for case in pack.cases for name, value in case.calibrated_fields.items()]
+    if pack.gpu_time_multiplier is not None:
+        fields.insert(0, ("gpu_time_multiplier", pack.gpu_time_multiplier))
+    for where, value in fields:
+        if value.provisional:
+            findings.append(
+                Finding("warn", where,
+                        f"still provisional ({value.value!r}); {value.derived_from}")
+            )
+        elif not value.evidence:
+            findings.append(
+                Finding("warn", where,
+                        "measured but cites no evidence path; the run that produced "
+                        "it cannot be found later")
+            )
     return findings
 
 

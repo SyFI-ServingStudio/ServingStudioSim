@@ -192,6 +192,22 @@ percentages unresolved without a controlled A/B. Mixed-region occupancy is not
 attribution. Backend, scale strategy, and other numeric differences qualify the
 conclusion but do not prove a throughput cause.
 
+## Judging a result and choosing a fix
+
+- **Coverage first.** A result counts only for the deployment settings its
+  cases ran. If the pack covers one chunk size or one concurrency regime, report
+  the rest as unvalidated. `operate-run-alignment` lists what a pack must span.
+- **Prefer the simplest fix.** Before proposing a new mechanism, measure its
+  effect in the regime where it applies. If the effect is within
+  repeat-measurement noise, do not propose it.
+- **Never close a gap with a limit.** Do not cap batch size, tokens, or context,
+  and do not refuse a shape the framework runs. Model the path the framework
+  takes there.
+- **Report honestly.** Name a checked cause for every out-of-tolerance item.
+  Retract an earlier claim explicitly when new evidence contradicts it.
+
+The full rule list is in `top-add-new-arch` "Modeling rules".
+
 ## Delegation boundary
 
 You judge; you do not run or fix from here. Diagnose in the tight → loose order:

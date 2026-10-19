@@ -36,6 +36,7 @@ def test_args_field_order_and_coercion() -> None:
         "kernel_size",
         "dtype",
         "state_dtype",
+        "num_tokens",
     ]
     args = coerce_args(
         GdnCausalConvDecodeArgs,
@@ -290,7 +291,7 @@ def test_runner_derived_shapes_slots_and_bounded_cpu_operands() -> None:
     assert torch.isfinite(operands.state).all()
 
 
-def test_vllm_runner_derived_shapes_slots_and_contiguous_cpu_operands() -> None:
+def test_vllm_runner_derived_shapes_slots_and_state_first_cpu_operands() -> None:
     import torch
 
     from profiling.runners.attention.gdn_causal_conv_decode_vllm_triton import (
@@ -317,7 +318,11 @@ def test_vllm_runner_derived_shapes_slots_and_contiguous_cpu_operands() -> None:
     assert operands.x.is_contiguous()
     assert operands.x.stride(1) == 1
     assert operands.weight.is_contiguous()
-    assert operands.state.is_contiguous()
+    # vLLM's default state-first (SD) pool, handed over as a transposed view:
+    # a contiguous dim-first pool would time a layout production never uses.
+    assert not operands.state.is_contiguous()
+    assert operands.state.stride(1) == 1
+    assert operands.state.transpose(-1, -2).is_contiguous()
     assert operands.slot_indices.dtype is torch.int32
     assert operands.slot_indices.tolist() == [1, 2, 3]
     assert torch.isfinite(operands.x).all()
@@ -433,6 +438,7 @@ def test_vllm_profile_timed_callable_is_one_fused_call(
         return 0.25
 
     monkeypatch.setattr(runner, "_load_fused_callable", lambda: fake_fused)
+    monkeypatch.setattr(runner, "conv_state_dim_first", lambda: False)
     monkeypatch.setattr(runner, "_build_operands", lambda *_args, **_kwargs: operands)
     monkeypatch.setattr(runner, "_check_correctness", fake_guard)
     monkeypatch.setattr(runner.Timer, "cupti", staticmethod(fake_timer))
@@ -500,6 +506,7 @@ def test_generated_facades_and_read_only_missing_query(tmp_path, monkeypatch) ->
         "kernel_size",
         "dtype",
         "state_dtype",
+        "num_tokens",
     ]
 
 

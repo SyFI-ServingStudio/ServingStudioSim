@@ -463,8 +463,9 @@ pub enum IterWorkerSel {
         async_lookahead_us: Option<u32>,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
-    /// iteration submits `draft_tokens + 1` rows per resident decode and retires
-    /// the target's own token plus the leading run of accepted drafts.
+    /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a
+    /// request clipped at `max_model_len`, and retires the target's own token
+    /// plus the leading run of accepted drafts.
     ///
     /// A separate selector from `chunked_prefill` rather than a flag on it: the
     /// arch must also be the speculative one (a different model type, not the
@@ -510,6 +511,13 @@ pub enum IterWorkerSel {
         /// See [`IterWorkerSel::ChunkedPrefill`]'s field of the same name.
         #[serde(default)]
         prefill_gpu_time_multiplier: Option<f64>,
+        /// Chunk-end alignment for archs whose KV layout keeps a resumable
+        /// recurrent state. See [`IterWorkerSel::ChunkedPrefill`]'s field of the
+        /// same name; the arch's drafter additionally decides whether the
+        /// prompt's last checkpoint sits one block early.
+        #[serde(default)]
+        #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
+        prefill_chunk_alignment: Option<PrefillChunkAlignment>,
     },
     /// Pipeline-parallel stage worker for the `pp` deployment: stage 0 admits
     /// requests and owns the pipeline's KV, later stages pull activations and
@@ -611,6 +619,10 @@ impl IterWorkerSel {
     pub(crate) fn prefill_chunk_alignment(&self) -> Option<PrefillChunkAlignment> {
         match self {
             Self::ChunkedPrefill {
+                prefill_chunk_alignment,
+                ..
+            }
+            | Self::Speculative {
                 prefill_chunk_alignment,
                 ..
             }

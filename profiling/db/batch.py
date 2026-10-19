@@ -15,7 +15,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, get_args, get_origin
 
-from profiling.db.args import DType, KernelArgs, field_types
+from profiling.db.args import DType, KernelArgs, canonical_args, field_types, optional_fields
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec, resolve_spec_backend
 from profiling.db.table import ProfileRow, Table
@@ -433,23 +433,29 @@ def coerce_args(args_schema: type[KernelArgs], spec: dict[str, Any]) -> KernelAr
     """
 
     schema_types = field_types(args_schema)
+    optional = optional_fields(args_schema)
     values = {}
     for name, field_type in schema_types.items():
+        if name in optional and spec.get(name) is None:
+            continue
         if name not in spec:
             raise ValueError(f"missing required spec field {name!r}")
         values[name] = _coerce_value(field_type, spec[name])
     extra = set(spec) - schema_types.keys()
     if extra:
         raise ValueError(f"unexpected spec fields for {args_schema.__name__}: {sorted(extra)}")
-    return args_schema(**values)
+    return canonical_args(args_schema(**values))
 
 
 def args_to_spec(args: KernelArgs) -> dict[str, Any]:
     """Convert typed args back to the JSON-friendly runner spec shape."""
 
     values = {}
+    optional = optional_fields(type(args))
     for field in fields(args):
         value = getattr(args, field.name)
+        if value is None and field.name in optional:
+            continue  # absent: the runner takes its `same_as` field
         values[field.name] = value.value if hasattr(value, "value") else value
     return values
 

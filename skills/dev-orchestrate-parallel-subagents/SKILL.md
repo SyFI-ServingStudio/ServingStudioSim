@@ -9,6 +9,10 @@ When you fan out **2+ subagents that each write to the same repo**, give each it
 own **git worktree**. Do NOT run concurrent writing agents in one shared working
 tree.
 
+For how to split a whole arch addition into lanes, see
+`dev-parallelize-arch-addition`; this skill covers one writing agent's
+isolation.
+
 This is an *orchestration* concern, not a task concern: keep it out of the
 task-specific skills (they should describe the normal single-agent flow). The
 isolation lives here.
@@ -33,8 +37,9 @@ isolation lives here.
 2. Tell each agent it OWNS its worktree: it MAY edit shared barrels and run full
    validation freely — no sibling can stomp it. (Drop any "defer barrels / don't
    run cargo" constraints — those were only needed for shared-tree runs.)
-3. Each agent writes a report at `agent-trace/<topic>.md` (see
-   [[agent-trace-workflow]]); pass the path in the brief.
+3. Each agent keeps its notes in its worktree's `progress.md` (not committed)
+   and ends with a report to you: commit, files, tests, and anything that
+   departs from its brief.
 
 ## Reuse the heavy envs (don't rebuild per worktree)
 
@@ -54,16 +59,20 @@ multi-GB rebuilds:
 
 ## Integration (orchestrator, after agents finish)
 
-1. Review each worktree's diff + its `agent-trace` report.
+1. Review each worktree's diff and its report.
 2. Merge: new files are disjoint; the shared barrels get a one-line addition per
    agent → take the **union** of those lines (a trivial conflict to resolve).
+   Fold each agent's `profiling/profile.db` rows in with
+   `launcher kernel-profile merge-db`, never by choosing one side, and commit
+   the database separately (`dev-finalize-model-addition` step 5).
 3. Run **one** consolidated validation on the merged tree: whole-repo build +
    tests + any **cross-agent invariant** that only holds on the union (e.g. a
    registry validator that sees all agents' entries only after merge — each
    isolated worktree validated against just its own + baseline).
-4. Fill the Review + Feedback sections of each `agent-trace` file.
-5. Clean up worktrees (Agent `isolation: "worktree"` auto-removes ones with no
-   changes; remove the rest once merged).
+4. Stop each finished agent once it has no Slurm job or tmux session left.
+5. Retire merged worktrees by archiving them under `old-wt/`, as the root
+   `CLAUDE.md` describes; never `git worktree remove`. Keep the root
+   `worktree.md` current.
 
 ## When NOT to isolate
 

@@ -26,9 +26,15 @@ pub mod llama3_dense;
 pub mod llama3_dense_tp;
 pub mod llama3_dp_attn_tp_ffn;
 pub mod llama3_vllm_neuron;
+pub mod mimo_v2_model_cfg;
+pub mod mimo_v2_vllm_fp8_swa_moe;
 pub mod model_cfg;
 pub mod moe_model_cfg;
+pub mod qwen35_model_cfg;
+pub mod qwen35_vllm_nvfp4_gdn_dense;
 pub mod qwen36_local;
+pub mod qwen4_exp_model_cfg;
+pub mod qwen4_exp_vllm_nvfp4_gdn_qsa_moe;
 pub mod qwen3_attn_layerwise;
 pub mod qwen3_ffn_moe_layerwise;
 pub mod qwen3_fp8_ffn_moe_layerwise;
@@ -89,10 +95,22 @@ pub use llama3_dense::{DenseParallel, Llama3DenseModel};
 pub use llama3_dense_tp::{DenseTpParallel, Llama3DenseTpModel};
 pub use llama3_dp_attn_tp_ffn::{DpAttnTpFfnParallel, Llama3DpAttnTpFfnModel};
 pub use llama3_vllm_neuron::{Llama3VllmNeuronModel, VllmNeuronParallel};
+pub use mimo_v2_model_cfg::{MimoV2AttnShape, MimoV2ModelCfg};
+pub use mimo_v2_vllm_fp8_swa_moe::{
+    MimoV2VllmConfigs, MimoV2VllmModel, MimoV2VllmParallel, MimoV2VllmResolved,
+};
 pub use model_cfg::ModelCfg;
 pub use moe_model_cfg::MoeModelCfg;
+pub use qwen35_model_cfg::{Qwen35LinearPrecision, Qwen35Mixer, Qwen35ModelCfg, Qwen35Precisions};
+pub use qwen35_vllm_nvfp4_gdn_dense::{
+    Qwen35VllmConfigs, Qwen35VllmModel, Qwen35VllmParallel, Qwen35VllmResolved,
+};
 pub use qwen36_local::{
     Qwen36LocalConfigs, Qwen36LocalModel, Qwen36LocalParallel, Qwen36LocalResolved, Qwen36ModelCfg,
+};
+pub use qwen4_exp_model_cfg::{Qwen4ExpMixer, Qwen4ExpModelCfg};
+pub use qwen4_exp_vllm_nvfp4_gdn_qsa_moe::{
+    Qwen4ExpVllmConfigs, Qwen4ExpVllmParallel, Qwen4ExpVllmResolved, Qwen4ExpVllmSpeculativeModel,
 };
 pub use qwen3_attn_layerwise::{Qwen3AttnLayerwiseModel, Qwen3AttnParallel};
 pub use qwen3_ffn_moe_layerwise::{Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel};

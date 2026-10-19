@@ -21,8 +21,10 @@ copy of; configs are built as dicts and dumped, so a malformed nesting is a
 | `--speculative-config` `model`       | host `checkpoints[variant.draft_checkpoint]` |
 | `arch.max_model_len`                 | case                                    |
 | `worker.attn_gpu_memory_gb`          | case (calibrated)                       |
-| `worker.gpu_time_multiplier`         | always 1.0; kernel-align only reports a |
-|                                      | recommendation, nothing injects it      |
+| `worker.gpu_time_multiplier`         | pack `gpu_time_multiplier` (calibrated  |
+|                                      | on a workload outside the matrix), else |
+|                                      | 1.0; a case's own recommendation is     |
+|                                      | only reported, never injected           |
 | `worker.prefill_gpu_time_multiplier` | variant, verbatim (a pack-declared      |
 |                                      | calibration, never the recommendation)  |
 | `workload.arrival_mode` / `rate`     | case                                    |
@@ -522,15 +524,17 @@ def simulation_document(
             raise PackError(
                 f"variants.{variant.name}.worker must not set {derived}; "
                 "attn_gpu_memory_gb is per-case calibrated and gpu_time_multiplier "
-                "is fixed at 1.0 (kernel-align reports the measured duty cycle)"
+                "is the pack's one calibrated multiplier (default 1.0)"
             )
     worker["attn_gpu_memory_gb"] = case.attn_gpu_memory_gb.value
     if case.chunk_size is not None:
         worker["max_batch_tokens"] = case.chunk_size
-    # Rendered as the neutral 1.0 on purpose: the E2E checks judge the model
-    # without a duty-cycle correction, and kernel-align reports the measured
-    # multiplier as its own metric. Nothing reads that report back into the sim.
-    worker["gpu_time_multiplier"] = 1.0
+    # One pack-wide multiplier, calibrated on a workload outside the matrix and
+    # declared with its provenance, or the neutral 1.0. A case's own kernel-align
+    # recommendation stays a reported metric: reading it back would fit each case
+    # to itself.
+    multiplier = pack.gpu_time_multiplier
+    worker["gpu_time_multiplier"] = 1.0 if multiplier is None else float(multiplier.value)
 
     document = {
         "deployment": variant.deployment,

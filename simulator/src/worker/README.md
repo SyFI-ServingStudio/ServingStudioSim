@@ -199,12 +199,13 @@ one stable head through `peek`/`pop`:
 `DecodeCompletion` is a sub-axis of the chunked-prefill lifecycle, not a second
 lifecycle: it owns only how far one resident decode moves per iteration.
 `SingleTokenDecodeCompletion` is the ordinary one-row-in/one-token-out engine.
-`SpeculativeDecodeCompletion` submits a fixed `draft_tokens + 1` verify window
-per resident request and retires the target's own token plus the leading run of
-accepted drafts, so its requests advance by different distances in the same
-iteration. Membership, capacity, and batch composition stay with the lifecycle;
-the query width it publishes is what sizes the mixed-iteration token budget and
-what the execution adapter lowers into the L4 input.
+`SpeculativeDecodeCompletion` submits a `draft_tokens + 1` verify window per
+resident request (clipped at `max_model_len`, below) and retires the target's
+own token plus the leading run of accepted drafts, so its requests advance by
+different distances in the same iteration. Membership, capacity, and batch
+composition stay with the lifecycle; the query width it publishes is what sizes
+the mixed-iteration token budget and what the execution adapter lowers into the
+L4 input.
 
 Its acceptance draw is keyed by `(seed, request, tokens already emitted, draft
 position)` rather than drawn from one stream, so a request accepts the same
@@ -240,11 +241,15 @@ Execution owns the model, reusable input buffer shape, and `CostBuffers`:
   constant because it selects a profiled kernel shape; how far a request actually
   advances after the verify belongs to the lifecycle's `DecodeCompletion`, not
   here.
-  The complete verify window must fit within `max_model_len`. A boundary batch
-  that requires fewer query rows fails explicitly; clipping only the context
-  would discard resident keys and invalidate necessary-work conservation.
-  vLLM can shorten these boundary batches, which this fixed-width model does
-  not yet represent.
+  At the context limit the width follows vLLM's scheduler: a request with
+  `resident` keys verifies `min(draft_tokens + 1, max_model_len - resident - 1)`
+  rows (`SpeculativeDecodeInput::verify_query_len`), so the position it samples
+  stays inside `max_model_len`. Its `kv_len` and `query_len` shrink together,
+  keeping necessary-work conservation, and `DecodeCompletion` retires no more
+  tokens than those rows. Arch models whose decode kernels take one uniform
+  width price that rare ragged row on their prefill (varlen) path, which is
+  also how vLLM leaves the uniform-decode graph. The mixed-iteration token
+  budget still reserves the full width for it.
 - `AttentionLayerExecutionAdapter` builds one slot's `AttnArchInput` and costs
   one attention layer.
 - `FfnSectionExecutionAdapter` splits token counts across FFN DP groups and
@@ -380,13 +385,19 @@ shell-owned iteration plan expresses whether resident decode shares that
 iteration (`mix`) or waits behind a runnable prefill
 (`separate-prefill-priority`); KV membership is unchanged in both cases. It
 does not replay an observed DP rank or rewrite request shapes. An optional
-chunk-end quantum (`with_chunk_end_quantum`) ports vLLM's Mamba `align` split:
-non-final chunks end on recurrent-state checkpoint boundaries, and the budget
-a clipped chunk leaves may start further prompts. `prefill_chunk_end_quantum`
-sets it to the layout's engine block when the layout keeps a resumable
-per-request state, prefix caching is on, and `prefill_chunk_alignment` resolves
-to `checkpoint`; unset follows `kv_overhead` (`vllm` aligns, `none` does not),
-and `plain` gives `min(remaining, budget)` chunks.
+chunk-end alignment (`with_chunk_end_alignment`) ports vLLM's Mamba `align`
+split: non-final chunks end on recurrent-state checkpoint boundaries, and the
+budget a clipped chunk leaves may start further prompts.
+`prefill_chunk_end_quantum` sets its block to the layout's engine block when
+the layout keeps a resumable per-request state, prefix caching is on, and
+`prefill_chunk_alignment` resolves to `checkpoint`; unset follows
+`kv_overhead` (`vllm` aligns, `none` does not), and `plain` gives
+`min(remaining, budget)` chunks. The `speculative` recipe applies the same
+block; when its arch's drafter prunes the last matching prefix block
+(`SpeculativeUnifiedModel::prunes_last_prefix_block`, vLLM's
+`use_eagle_block_drop` for MTP/EAGLE/DFlash), the prompt's last checkpoint, and
+therefore the stop no chunk may run past, sits one block earlier. Only that
+chunk-end stop reads the hook; prefix-hit lengths do not yet drop the block.
 
 Two optional request-count limits bound each partition independently of the
 token budget: `max_prefill_requests_per_iteration` (prefill requests scheduled

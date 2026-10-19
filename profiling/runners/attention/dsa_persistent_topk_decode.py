@@ -1,4 +1,12 @@
-"""Profilers for GLM-5.2 persistent decode DSA top-k.
+"""Profilers for persistent decode top-k: the DSA indexer (GLM-5.x) and the QSA
+indexer (Qwen4Exp) alike.
+
+Logits come in two context modes: ``uniform`` (every row holds the same
+increasing sequence) and ``uniform_random`` (same lengths, seeded random
+scores); the fork backend's ``max_ragged`` lives in
+``dsa_persistent_topk_decode_fork``. The helpers here (operands, reference check, logical bytes,
+the call) are shared with ``dsa_persistent_topk_decode_cooperative``, which
+times vLLM's ``cooperative_topk`` on the same operands.
 
 The Torch backend times the complete vectorized semantic composite. The
 production backend packages a corrected vLLM v0.23-derived
@@ -28,6 +36,13 @@ _MIN_BATCH_SIZE = 1
 _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _CONTEXT_MODE = "uniform"
+# Uniform lengths over seeded normal logits. The radix select's work follows
+# the score distribution: on B200, 1024 rows of 8192 cost 42.2 µs on the
+# increasing template padded to 65536 columns, 30.6 µs on the same template
+# spanning only the valid columns, and 35.1 µs on normal scores, which is what
+# a live indexer's continuous scores look like.
+_RANDOM_CONTEXT_MODE = "uniform_random"
+_CONTEXT_MODES = (_CONTEXT_MODE, _RANDOM_CONTEXT_MODE)
 # The callable's K instantiations (vLLM csrc/libtorch_stable/topk.cu dispatch);
 # an indexer over 4-token key pools selects 2048 / 4. Every backend, the fork's and
 # the Torch reference's included, shares this bound and the workspace below.
@@ -71,7 +86,7 @@ class _DsaPersistentTopkDecodeNativeOperands:
     workspace: Any
 
 
-def _validate_args(
+def validate_args(
     batch_size: int,
     context_len: int,
     next_n: int,
@@ -130,9 +145,10 @@ def _validate_args(
         raise ValueError(
             f"dsa_persistent_topk_decode requires index_dtype='int32', got {index_dtype!r}"
         )
-    if context_mode != _CONTEXT_MODE:
+    if context_mode not in _CONTEXT_MODES:
         raise ValueError(
-            f"dsa_persistent_topk_decode requires context_mode='uniform', got {context_mode!r}"
+            "dsa_persistent_topk_decode requires context_mode='uniform' or "
+            f"'uniform_random', got {context_mode!r}"
         )
     return (
         batch_size,
@@ -163,6 +179,7 @@ def _build_common_operands(
     top_k: int,
     logits_row_stride: int,
     device: str,
+    context_mode: str = _CONTEXT_MODE,
 ) -> tuple[Any, Any, Any, Any, Any]:
     """Build exact logits/length/output storage without row-scaled sources."""
     num_rows = batch_size * next_n
@@ -171,16 +188,21 @@ def _build_common_operands(
         dtype=torch.float32,
         device=device,
     )
-    # One row-sized template broadcasts into the exact padded production
-    # allocation. Never materialize a second [B*next_n, row_stride] source.
-    column_template = torch.linspace(
-        -1.0,
-        1.0,
-        logits_row_stride,
-        dtype=torch.float32,
-        device=device,
-    )
-    logits_backing.copy_(column_template)
+    if context_mode == _RANDOM_CONTEXT_MODE:
+        # Filled in place: no second [B*next_n, row_stride] source.
+        generator = torch.Generator(device=device).manual_seed(0)
+        logits_backing.normal_(generator=generator)
+    else:
+        # One row-sized template broadcasts into the exact padded production
+        # allocation. Never materialize a second [B*next_n, row_stride] source.
+        column_template = torch.linspace(
+            -1.0,
+            1.0,
+            logits_row_stride,
+            dtype=torch.float32,
+            device=device,
+        )
+        logits_backing.copy_(column_template)
     logits = logits_backing[:, :max_model_len]
 
     per_request_lengths = torch.arange(
@@ -205,6 +227,7 @@ def _build_operands(
     top_k: int,
     logits_row_stride: int,
     device: str,
+    context_mode: str = _CONTEXT_MODE,
 ) -> _DsaPersistentTopkDecodeOperands:
     """Build exact padded logits and pinned row-major decode lengths."""
     logits_backing, logits, lengths, flat_lengths, out = _build_common_operands(
@@ -216,6 +239,7 @@ def _build_operands(
         top_k=top_k,
         logits_row_stride=logits_row_stride,
         device=device,
+        context_mode=context_mode,
     )
 
     key_positions = torch.arange(max_model_len, dtype=torch.int32, device=device)
@@ -239,7 +263,7 @@ def _build_operands(
     )
 
 
-def _build_native_operands(
+def build_native_operands(
     torch: Any,
     *,
     batch_size: int,
@@ -249,6 +273,7 @@ def _build_native_operands(
     top_k: int,
     logits_row_stride: int,
     device: str,
+    context_mode: str = _CONTEXT_MODE,
 ) -> _DsaPersistentTopkDecodeNativeOperands:
     """Build production operands without Torch-composite mask/top-k tensors."""
     logits_backing, logits, lengths, flat_lengths, out = _build_common_operands(
@@ -260,6 +285,7 @@ def _build_native_operands(
         top_k=top_k,
         logits_row_stride=logits_row_stride,
         device=device,
+        context_mode=context_mode,
     )
     workspace = torch.empty((WORKSPACE_BYTES,), dtype=torch.uint8, device=device)
     return _DsaPersistentTopkDecodeNativeOperands(
@@ -356,14 +382,16 @@ def _validate_semantics(
             raise RuntimeError("Torch composite output aliases an input")
 
 
-def _native_call(
+def native_call(
     op: Any,
     operands: _DsaPersistentTopkDecodeNativeOperands,
     *,
     top_k: int,
     max_seq_len: int,
 ) -> None:
-    """Invoke only the private corrected v0.23-derived callable."""
+    """Call a persistent or cooperative top-k op on the shared operands: the
+    corrected extension, the image vLLM's ``persistent_topk`` or its
+    ``cooperative_topk`` (same signature)."""
     return op(
         operands.logits,
         operands.lengths,
@@ -427,7 +455,7 @@ def _medium_overflow_explains(
     return int((selected_bins > threshold).sum()) == int((bins > threshold).sum())
 
 
-def _validate_native_semantics(
+def validate_native_semantics(
     torch: Any,
     op: Any,
     operands: _DsaPersistentTopkDecodeNativeOperands,
@@ -450,7 +478,7 @@ def _validate_native_semantics(
     expected = torch.empty_like(operands.out)
     out_storage = operands.out.untyped_storage().data_ptr()
     workspace_storage = operands.workspace.untyped_storage().data_ptr()
-    returned = _native_call(
+    returned = native_call(
         op,
         operands,
         top_k=top_k,
@@ -519,7 +547,7 @@ def _validate_native_semantics(
             raise RuntimeError("pinned CUDA output aliases another operand")
 
 
-def _logical_bytes(
+def logical_bytes(
     *,
     batch_size: int,
     context_len: int,
@@ -561,8 +589,8 @@ def profile_dsa_persistent_topk_decode_torch(
         logits_row_stride,
         _logits_dtype,
         _index_dtype,
-        _context_mode,
-    ) = _validate_args(
+        context_mode,
+    ) = validate_args(
         batch_size,
         context_len,
         next_n,
@@ -590,6 +618,7 @@ def profile_dsa_persistent_topk_decode_torch(
             top_k=top_k,
             logits_row_stride=logits_row_stride,
             device="cuda",
+            context_mode=context_mode,
         )
         _validate_semantics(
             torch,
@@ -606,13 +635,13 @@ def profile_dsa_persistent_topk_decode_torch(
         # Logical traffic counts valid FP32 logits, one int32 length per row,
         # and all int32 output slots. It excludes padded columns, persistent
         # scratch workspace, Torch intermediates, and physical transactions.
-        logical_bytes = _logical_bytes(
+        num_bytes = logical_bytes(
             batch_size=batch_size,
             context_len=context_len,
             next_n=next_n,
             top_k=top_k,
         )
-        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+        bandwidth_gbps = num_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
             tflops=0.0,
@@ -676,8 +705,8 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         logits_row_stride,
         _logits_dtype,
         _index_dtype,
-        _context_mode,
-    ) = _validate_args(
+        context_mode,
+    ) = validate_args(
         batch_size,
         context_len,
         next_n,
@@ -701,7 +730,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
     op = _load_native_op(torch)
 
     try:
-        operands = _build_native_operands(
+        operands = build_native_operands(
             torch,
             batch_size=batch_size,
             context_len=context_len,
@@ -710,8 +739,9 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             top_k=top_k,
             logits_row_stride=logits_row_stride,
             device="cuda",
+            context_mode=context_mode,
         )
-        _validate_native_semantics(
+        validate_native_semantics(
             torch,
             op,
             operands,
@@ -721,7 +751,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         )
 
         def kernel() -> None:
-            return _native_call(
+            return native_call(
                 op,
                 operands,
                 top_k=top_k,
@@ -748,13 +778,13 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         # Logical traffic counts valid FP32 logits, one int32 length per row,
         # and all int32 output slots. It excludes the 1 MiB scratch workspace,
         # padded logits, intermediates, and physical memory transactions.
-        logical_bytes = _logical_bytes(
+        num_bytes = logical_bytes(
             batch_size=batch_size,
             context_len=context_len,
             next_n=next_n,
             top_k=top_k,
         )
-        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+        bandwidth_gbps = num_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
             tflops=0.0,

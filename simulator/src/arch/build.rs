@@ -21,31 +21,34 @@ use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
+use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use crate::arch::{
     deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
     glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
     glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
     glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2,
-    inkling_vllm_nvfp4_rel_attn_moe, llama3_dense,
-    llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
+    inkling_vllm_nvfp4_rel_attn_moe, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
+    mimo_v2_vllm_fp8_swa_moe, qwen35_vllm_nvfp4_gdn_dense, qwen36_local, qwen3_attn_layerwise,
     qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
-    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
-    DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV4ModelCfg,
-    DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel, DenseTpParallel,
-    Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode,
-    Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
-    Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel,
-    Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
-    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashKernelPath,
-    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel,
-    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
-    InklingExpertDemand, InklingExpertPrecision, InklingModelCfg, InklingVllmModel,
-    InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
-    Llama3DpAttnTpFfnModel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
-    Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
-    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
-    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
-    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, qwen4_exp_vllm_nvfp4_gdn_qsa_moe,
+    AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel,
+    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
+    DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg,
+    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
+    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel,
+    Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
+    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel,
+    Glm53FlashKernelPath, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel,
+    Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel, Glm53FlashVllmParallel,
+    Glm53VllmNvfp4DsaMoeDflash2Model, InklingExpertDemand, InklingExpertPrecision, InklingModelCfg,
+    InklingVllmModel, InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel,
+    Llama3DenseTpModel, Llama3DpAttnTpFfnModel, MimoV2ModelCfg, MimoV2VllmModel,
+    MimoV2VllmParallel, Qwen35ModelCfg, Qwen35VllmModel, Qwen35VllmParallel, Qwen36LocalModel,
+    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
+    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
+    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
+    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    Qwen4ExpModelCfg, Qwen4ExpVllmParallel, Qwen4ExpVllmSpeculativeModel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -1550,6 +1553,164 @@ pub fn inkling_vllm_nvfp4_rel_attn_moe(
         .context("building Inkling model (often a missing profile.db row)")
 }
 
+/// Build a MiMo-V2 FP8 checkpoint's graph under one vLLM TP group with the
+/// routed experts EP = TP.
+///
+/// The checkpoint's global / sliding-window and dense / MoE layer schedule is
+/// exact, so layer-count overrides are rejected. Routing is resolved over the
+/// MoE layers (a corpus captured with MTP off records exactly those).
+#[allow(clippy::too_many_arguments)]
+pub fn mimo_v2_vllm_fp8_swa_moe(
+    model_spec: &ModelSpec,
+    tp_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<MimoV2VllmModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "MiMo-V2 architecture rejects num_layers/sim_num_layers overrides; the exact \
+             global/sliding-window and dense/MoE layer schedule is required"
+        );
+    }
+    anyhow::ensure!(
+        model_spec.fp8,
+        "MiMo-V2: set fp8: true (the checkpoint's linears are block FP8)"
+    );
+    let model_cfg = MimoV2ModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading MiMo-V2 config")?;
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.n_routed_experts,
+        experts_per_token: model_cfg.num_experts_per_tok,
+        ep_size: tp_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_moe_layers(),
+    };
+    // Ordinary decode: one row per request, so a verify block is one token.
+    let demand = source.demand(0..model_cfg.num_moe_layers() as usize, 1)?;
+    let parallel = MimoV2VllmParallel {
+        tp_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let configs = mimo_v2_vllm_fp8_swa_moe::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding MiMo-V2 architecture configs")?;
+    let resolved = mimo_v2_vllm_fp8_swa_moe::resolve_configs(&configs);
+    mimo_v2_vllm_fp8_swa_moe::build(name.to_string(), resolved, bridge)
+        .context("building MiMo-V2 model (often a missing profile.db row)")
+}
+
+/// Build a Qwen3.5-family ModelOpt mixed-precision checkpoint on one GPU under
+/// vLLM. The exact GDN / GQA layer schedule is the checkpoint's, so
+/// layer-count overrides are rejected; the linears' precisions come from its
+/// `quantization_config`.
+pub fn qwen35_vllm_nvfp4_gdn_dense(
+    model_spec: &ModelSpec,
+    max_model_len: u32,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen35VllmModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "Qwen3.5 GDN architecture rejects num_layers/sim_num_layers overrides; the exact \
+             GDN/GQA layer schedule is required"
+        );
+    }
+    let model_cfg = Qwen35ModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading Qwen3.5 config")?;
+    let parallel = Qwen35VllmParallel {
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let configs = qwen35_vllm_nvfp4_gdn_dense::build_configs(&model_cfg, &parallel)
+        .context("expanding Qwen3.5 architecture configs")?;
+    let resolved = qwen35_vllm_nvfp4_gdn_dense::resolve_configs(&configs);
+    qwen35_vllm_nvfp4_gdn_dense::build(name.to_string(), resolved, bridge)
+        .context("building Qwen3.5 model (often a missing profile.db row)")
+}
+
+/// Build the one-GPU Qwen4Exp (Qwen3.8-Flash-Next) NVFP4 model with its MTP
+/// layer drafting `draft_tokens` per request.
+///
+/// The checkpoint's layer schedule is exact, so layer-count overrides are
+/// rejected. Routing is resolved over the body's routed layers; a corpus
+/// captured with MTP on records the MTP layer as one more.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative(
+    model_spec: &ModelSpec,
+    max_model_len: u32,
+    draft_tokens: u32,
+    kv_cache_dtype: Qwen4ExpCacheDtype,
+    indexer_kv_dtype: Qwen4ExpCacheDtype,
+    ple_table_residency: PleTableResidency,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen4ExpVllmSpeculativeModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "Qwen4Exp architecture rejects num_layers/sim_num_layers overrides; the exact \
+             GDN/QSA layer schedule is required"
+        );
+    }
+    let model_cfg = Qwen4ExpModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading Qwen4Exp config")?;
+    let routed_layers = model_cfg.num_layers();
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.experts_per_token,
+        ep_size: 1,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: routed_layers,
+    };
+    // A verify step carries `draft_tokens + 1` rows per request, as does the
+    // MTP's first pass; its later passes carry one.
+    let verify_width = draft_tokens
+        .checked_add(1)
+        .context("speculative draft_tokens + 1 overflows u32")?;
+    let body = routed_layers as usize;
+    let demand = qwen4_exp_vllm_nvfp4_gdn_qsa_moe::Qwen4ExpDemand {
+        body: source.demand(0..body, verify_width)?,
+        mtp: source.demand(body..body + 1, verify_width)?,
+        mtp_recurrent: source.demand(body..body + 1, 1)?,
+    };
+    let parallel = Qwen4ExpVllmParallel {
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        draft_tokens,
+        kv_cache_dtype,
+        indexer_kv_dtype,
+        ple_table_residency,
+    };
+    let configs = qwen4_exp_vllm_nvfp4_gdn_qsa_moe::build_configs(&model_cfg, &parallel, demand)
+        .context("expanding Qwen4Exp architecture configs")?;
+    let resolved = qwen4_exp_vllm_nvfp4_gdn_qsa_moe::resolve_configs(&configs);
+    qwen4_exp_vllm_nvfp4_gdn_qsa_moe::build(name.to_string(), resolved, bridge)
+        .context("building Qwen4Exp model (often a missing profile.db row)")
+}
+
 /// Build the B200 GLM-5.3-Flash FP8 graph under pure pipeline parallelism:
 /// `pp_size` one-GPU stages at TP1 / EP1, as the whole-pipeline view over them.
 ///
@@ -2358,6 +2519,40 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
+        IterArchSel::MimoV2VllmFp8SwaMoe {
+            model,
+            tp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Box::new(mimo_v2_vllm_fp8_swa_moe(
+            model,
+            *tp_size,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Qwen35VllmNvfp4GdnDense {
+            model,
+            max_model_len,
+            cudagraph_capture_sizes,
+        } => Box::new(qwen35_vllm_nvfp4_gdn_dense(
+            model,
+            *max_model_len,
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
         IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe {
             model,
             pp_size,
@@ -2434,7 +2629,8 @@ pub fn build_iter_model(
             bridge,
         )?),
         IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
-        | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
+        | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+        | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
         }
     })
@@ -2500,6 +2696,37 @@ pub fn build_speculative_iter_model(
                 token_corpus_file.as_deref(),
                 *draft_tokens,
                 *draft_sliding_window,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
+            model,
+            max_model_len,
+            draft_tokens,
+            kv_cache_dtype,
+            indexer_kv_dtype,
+            ple_table_residency,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Ok((
+            Box::new(qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative(
+                model,
+                *max_model_len,
+                *draft_tokens,
+                *kv_cache_dtype,
+                *indexer_kv_dtype,
+                *ple_table_residency,
+                *routing,
+                *routing_seed,
+                expert_popularity_file.as_deref(),
+                token_corpus_file.as_deref(),
+                cudagraph_capture_sizes,
                 gpu,
                 name,
                 bridge,
@@ -2768,7 +2995,8 @@ fn build_arch(
                 // own tree: the verify pass plus its draft passes.
                 let (gpus, shape, manifest, kv_cache) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
-                    | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
+                    | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+                    | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
                         let (model, draft_tokens) = build_speculative_iter_model(
                             selector,
                             gpu,

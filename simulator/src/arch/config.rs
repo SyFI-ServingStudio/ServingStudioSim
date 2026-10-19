@@ -31,6 +31,7 @@ use serde::Deserialize;
 use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::glm52_model_cfg::Glm52MtpMode;
+use super::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
 /// carries no `deny_unknown_fields` (the flattened struct must let the arch's
@@ -112,6 +113,32 @@ const fn default_glm52_nvfp4_max_model_len() -> u32 {
 const fn default_glm53_flash_max_model_len() -> u32 {
     8192
 }
+
+/// The MiMo-V2.6-Flash capture's `--max-model-len` (its attention rows'
+/// FA4 split count).
+const fn default_mimo_v2_max_model_len() -> u32 {
+    131_072
+}
+
+/// The Qwen3.8-27B capture's `--max-model-len`.
+const fn default_qwen35_max_model_len() -> u32 {
+    131_072
+}
+
+/// The Qwen3.8-Flash-Next capture's `--max-model-len`.
+const fn default_qwen4_exp_max_model_len() -> u32 {
+    131_072
+}
+
+/// The Qwen3.8-Flash-Next capture's MTP `num_speculative_tokens`.
+const fn default_qwen4_exp_draft_tokens() -> u32 {
+    3
+}
+
+/// [`Qwen4ExpCacheDtype`]'s serde representation.
+const QWEN4_EXP_CACHE_DTYPES: [&str; 2] = Qwen4ExpCacheDtype::CHOICES;
+/// [`PleTableResidency`]'s serde representation.
+const PLE_TABLE_RESIDENCIES: [&str; 2] = PleTableResidency::CHOICES;
 
 /// The captured GLM-5.3-Flash deployment ran `--enable-expert-parallel`.
 const fn default_glm53_flash_enable_expert_parallel() -> bool {
@@ -1098,6 +1125,124 @@ pub enum IterArchSel {
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },
+    /// MiMo-V2's FP8 checkpoints (`XiaomiMiMo/MiMo-V2.6-Flash-RL`) under
+    /// vLLM's TP group: TP attention over global and sliding-window layers
+    /// (FA4 DiffKV), replicated router, routed MXFP4 experts EP = TP with BF16
+    /// activations, and every TP all-reduce fused with the residual add and
+    /// RMSNorm (FlashInfer MNNVL).
+    MimoV2VllmFp8SwaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count; the routed experts are expert-parallel
+        /// over the same ranks (`--enable-expert-parallel`).
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// Configured context cap: FA4's split count on a FULL-graph decode
+        /// and the context axis top of every attention layer's config. Each
+        /// request's context is validated against it.
+        #[serde(default = "default_mimo_v2_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Its layer axis is the
+        /// MoE layers (layer 0's dense MLP has none).
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). Every kernel
+        /// but attention runs on the token count padded up to the next
+        /// captured size; attention on a uniform-decode step runs at the
+        /// padded request count from a FULL graph. Empty: no padding, no graphs
+        /// (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// Qwen3.5-family hybrid decoders (`Qwen3_5ForConditionalGeneration`,
+    /// text only) with ModelOpt mixed-precision weights (FP8 per-tensor
+    /// attention projections, NVFP4 MLP and lm_head) on one GPU under vLLM:
+    /// Gated DeltaNet and gated-GQA layers (FlashInfer trtllm-gen, FP8 KV),
+    /// each with a dense SwiGLU MLP. Precisions come from the checkpoint's
+    /// `quantization_config`; `fp8` is not read.
+    Qwen35VllmNvfp4GdnDense {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Configured context cap; each request's context is validated
+        /// against it.
+        #[serde(default = "default_qwen35_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). The compiled
+        /// pieces run on the token count padded up to the next captured size;
+        /// a uniform decode replays a FULL graph, so the GDN core and decode
+        /// attention run padded too. Empty: no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// Qwen4Exp hybrid decoders (`Qwen4ExpForConditionalGeneration`, text
+    /// only; Qwen3.8-Flash-Next) with ModelOpt mixed-precision weights on one
+    /// GPU under the vLLM fork, drafting with the checkpoint's MTP layer:
+    /// Gated DeltaNet and QSA (sparse GQA with a compressed indexer) layers
+    /// joined by hyper-connections, PLE n-gram blocks, NVFP4 routed experts
+    /// with a BF16 shared expert, and an FP8-block MTP layer. Precisions come
+    /// from the checkpoint's `quantization_config`; `fp8` is not read.
+    Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Configured context cap; each request's context is validated
+        /// against it, and it sizes the QSA top-k and block-table rows.
+        #[serde(default = "default_qwen4_exp_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        /// MTP `num_speculative_tokens`: fixes the verify width at
+        /// `draft_tokens + 1`, a profiled kernel shape.
+        #[serde(default = "default_qwen4_exp_draft_tokens")]
+        #[param(default = 3, cache_key)]
+        draft_tokens: u32,
+        /// vLLM `--kv-cache-dtype` of the QSA KV.
+        #[serde(default)]
+        #[param(string, default = "fp8", choices = QWEN4_EXP_CACHE_DTYPES, cache_key)]
+        kv_cache_dtype: Qwen4ExpCacheDtype,
+        /// The QSA indexer's key-cache dtype.
+        #[serde(default)]
+        #[param(string, default = "fp8", choices = QWEN4_EXP_CACHE_DTYPES, cache_key)]
+        indexer_kv_dtype: Qwen4ExpCacheDtype,
+        /// Where the PLE n-gram table lives: pinned host memory over UVA
+        /// (the fork's CPU offload) or HBM.
+        #[serde(default)]
+        #[param(string, default = "host_uva", choices = PLE_TABLE_RESIDENCIES, cache_key)]
+        ple_table_residency: PleTableResidency,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Its layer axis is the
+        /// body's MoE layers, then the MTP layer.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). The graph
+        /// pieces run on the token count padded up to the next captured size;
+        /// a uniform verify step replays a FULL graph, so its eager breaks run
+        /// padded too. Empty: no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
 }
 
 impl IterArchSel {
@@ -1129,7 +1274,10 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { model, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. }
-            | Self::InklingVllmNvfp4RelAttnMoe { model, .. } => model,
+            | Self::InklingVllmNvfp4RelAttnMoe { model, .. }
+            | Self::MimoV2VllmFp8SwaMoe { model, .. }
+            | Self::Qwen35VllmNvfp4GdnDense { model, .. }
+            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { model, .. } => model,
         }
     }
 
@@ -1152,7 +1300,12 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { max_model_len, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. }
             | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. }
-            | Self::Llama3VllmNeuron { max_model_len, .. } => Ok(*max_model_len),
+            | Self::Llama3VllmNeuron { max_model_len, .. }
+            | Self::MimoV2VllmFp8SwaMoe { max_model_len, .. }
+            | Self::Qwen35VllmNvfp4GdnDense { max_model_len, .. }
+            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { max_model_len, .. } => {
+                Ok(*max_model_len)
+            }
             Self::DeepseekV41Vllm {
                 model,
                 max_model_len,

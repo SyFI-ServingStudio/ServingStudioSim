@@ -130,7 +130,7 @@ def _imports():
         from vllm.models.inkling.nvidia.ops.lamport import LamportRSConv
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            "the alignment vLLM checkout (vllm_upstream_fork_env) is required"
+            "the alignment vLLM checkout (vllm_env) is required"
         ) from exc
     return torch, dist, get_tp_group, LamportRSConv
 

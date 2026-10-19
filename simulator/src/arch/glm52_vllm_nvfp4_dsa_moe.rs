@@ -591,6 +591,7 @@ fn build_configs_for_decode(
             quant_backends: NVFP4_QUANT_BACKENDS.to_vec(),
             moe_backends: NVFP4_FUSED_MOE_BACKENDS.to_vec(),
             weight_format: DType::Nvfp4E2m1,
+            activation_format: None,
             group_size: 16,
             routing_method: "minimax2".to_string(),
             n_group: 1,
@@ -2448,9 +2449,6 @@ pub(crate) fn normalize_speculative_input(
             input.groups.len()
         ));
     }
-    let verify_width = draft_tokens
-        .checked_add(1)
-        .ok_or_else(|| "draft_tokens + 1 overflows u32".to_string())?;
     let mut groups = Vec::with_capacity(input.groups.len());
     let mut total_tokens = 0_u32;
     for (group_index, group) in input.groups.iter().enumerate() {
@@ -2490,31 +2488,33 @@ pub(crate) fn normalize_speculative_input(
         let mut decode_tokens = 0_u32;
         let mut decode_context = None;
         let mut decode_context_lens = Vec::with_capacity(group.decode_requests.len());
+        let mut uniform_decode_count = 0_u32;
         for (request_index, decode) in group.decode_requests.iter().enumerate() {
-            // The scheduler does not admit partial verify groups, because a
-            // ragged one would leave the uniform decode kernels behind. The
-            // accepted count truncates the output after this compute, not the
-            // compute itself -- the pass is `k + 1` rows either way.
-            if decode.query_len != verify_width {
-                return Err(format!(
-                    "group {group_index} decode request {request_index} query_len {} must equal verify width {verify_width}",
-                    decode.query_len
-                ));
-            }
-            if !(verify_width..=max_model_len).contains(&decode.kv_len) {
-                return Err(format!(
-                    "group {group_index} decode request {request_index} kv_len {} must be in {verify_width}..={max_model_len}",
-                    decode.kv_len
-                ));
-            }
+            // A full verify window runs the uniform `k + 1`-row decode kernels;
+            // acceptance truncates the output after this compute, not the
+            // compute. Only a request at max_model_len verifies fewer rows, and
+            // that ragged row cannot share the uniform launch: price it on the
+            // prefill-shaped `(query, cache)` path, a profiled shape. Such
+            // steps are rare (the last verifies of a request ending within
+            // `k` of the limit).
+            let clipped = decode
+                .check_verify_row(draft_tokens, max_model_len)
+                .map_err(|reason| {
+                    format!("group {group_index} decode request {request_index}: {reason}")
+                })?;
             decode_tokens = decode_tokens
                 .checked_add(decode.query_len)
                 .ok_or_else(|| format!("group {group_index} decode token sum overflows u32"))?;
+            endpoint_context_lens.push(decode.kv_len);
+            if clipped {
+                prefill_query_cache_pairs.push((decode.query_len, decode.kv_len));
+                continue;
+            }
+            uniform_decode_count += 1;
             decode_context = Some(
                 decode_context.map_or(decode.kv_len, |current: u32| current.max(decode.kv_len)),
             );
             decode_context_lens.push(decode.kv_len);
-            endpoint_context_lens.push(decode.kv_len);
         }
         if group.decode_tokens != decode_tokens {
             return Err(format!(
@@ -2554,7 +2554,7 @@ pub(crate) fn normalize_speculative_input(
                 num_new_tokens: batch_tokens,
                 prefill_query_cache_pairs,
                 decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
-                    batch_size: decode_request_count,
+                    batch_size: uniform_decode_count,
                     context_len,
                     context_lens: Some(decode_context_lens),
                     requires_padding: false,
@@ -3527,6 +3527,38 @@ mod tests {
     }
 
     #[test]
+    fn a_verify_clipped_at_the_model_limit_runs_its_rows_on_the_prefill_path() {
+        // vLLM clips a request at the context limit to the rows that leave its
+        // sampled position inside max_model_len. The ragged row bills exactly
+        // its queries and every one is scored, but it leaves the uniform
+        // decode launch to the full-width requests.
+        let mut input = speculative_input(5, vec![], vec![64, 91]);
+        let group = &mut input.groups[0];
+        group.decode_requests.push(SpeculativeDecodeInput {
+            kv_len: 8_191,
+            query_len: 2,
+        });
+        group.decode_tokens += 2;
+        group.batch_tokens += 2;
+        group.total_kv_len += 8_189;
+        let normalized = normalize_speculative_input(&input, 5, 8_192).unwrap();
+        let group = &normalized.groups[0];
+
+        assert_eq!(group.batch_tokens, 14);
+        assert_eq!(group.request_count, 3);
+        assert_eq!(group.logits_rows, 14);
+        assert_eq!(group.endpoint_context_lens, vec![64, 91, 8_191]);
+        assert_eq!(
+            group.attention_input.prefill_query_cache_pairs,
+            vec![(2, 8_191)]
+        );
+        let decode = group.attention_input.decode.as_ref().unwrap();
+        assert_eq!(decode.batch_size, 2);
+        assert_eq!(decode.context_lens.as_deref(), Some(&[64, 91][..]));
+        assert_eq!(group.attention_input.num_new_tokens, 14);
+    }
+
+    #[test]
     fn a_recurrent_draft_pass_forwards_one_row_per_request_at_an_advanced_context() {
         let input = speculative_input(5, vec![(3, 2)], vec![64]);
         let normalized = normalize_speculative_input(&input, 5, 8_192).unwrap();
@@ -3556,7 +3588,8 @@ mod tests {
         let input = speculative_input(5, vec![], vec![64]);
         assert!(normalize_speculative_input(&input, 3, 8_192).is_err());
 
-        // A ragged verify group is not a shape the scheduler admits.
+        // A ragged verify row away from max_model_len is not a shape the
+        // scheduler produces.
         let mut ragged = speculative_input(5, vec![], vec![64, 91]);
         ragged.groups[0].decode_requests[1].query_len = 4;
         ragged.groups[0].decode_tokens = 10;

@@ -45,7 +45,7 @@ def test_gemm_backend_is_locked_to_dtype():
 
 
 def test_attention_backend_dtype_matrix():
-    # Two axes — compute (q) and kv-cache. fp8 *compute* needs fa3/trt; fp8 *KV*
+    # Two axes — compute (q) and kv-cache. fp8 *compute* needs fa3; fp8 *KV*
     # alone is fine on fa2 (a current production config), but not on cudnn.
     for kind in (
         "flashinfer_attn_prefill",
@@ -58,9 +58,8 @@ def test_attention_backend_dtype_matrix():
         assert backend_supports(kind, "fa2", DType.BF16, DType.FP8_E4M3)
         # fp8 compute (query) is NOT supported by fa2.
         assert not backend_supports(kind, "fa2", DType.FP8_E4M3, DType.FP8_E4M3)
-        # fp8 compute needs fa3 (or trt).
+        # fp8 compute needs fa3.
         assert backend_supports(kind, "fa3", DType.FP8_E4M3, DType.FP8_E4M3)
-        assert backend_supports(kind, "trt", DType.FP8_E4M3, DType.FP8_E4M3)
         # cudnn is bf16-only on BOTH axes — fp8 KV is not allowed even with bf16 q.
         assert backend_supports(kind, "cudnn", DType.BF16, DType.BF16)
         assert not backend_supports(kind, "cudnn", DType.BF16, DType.FP8_E4M3)
@@ -77,7 +76,17 @@ def test_comm_and_elementwise_are_dtype_agnostic():
 
 def test_supported_backends_filters_options_by_dtype():
     # The dry-run `options` column: filter registered backends to a dtype.
-    assert supported_backends("single_gemm", DType.FP8_E4M3) == ["deepgemm"]
+    assert supported_backends("single_gemm", DType.FP8_E4M3) == [
+        "deepgemm",
+        "flashinfer_fp8_tensor",
+    ]
+    # bmm_fp8's SM10x runners: per-tensor FP8 is not offered on Hopper.
+    assert "flashinfer_fp8_tensor" not in supported_backends(
+        "single_gemm", DType.FP8_E4M3, gpu="NVIDIA H200"
+    )
+    assert "flashinfer_fp8_tensor" in supported_backends(
+        "single_gemm", DType.FP8_E4M3, gpu="NVIDIA B200"
+    )
     assert supported_backends("single_gemm", DType.BF16) == [
         "torch",
         "torch_linear_vllm",
@@ -85,10 +94,7 @@ def test_supported_backends_filters_options_by_dtype():
         "sglang_bf16_auto",
         "sglang_fused_a_auto",
     ]
-    assert set(supported_backends("flashinfer_attn_prefill", DType.FP8_E4M3)) == {
-        "fa3",
-        "trt",
-    }
+    assert supported_backends("flashinfer_attn_prefill", DType.FP8_E4M3) == ["fa3"]
     assert set(supported_backends("flashinfer_attn_prefill", DType.BF16)) == {
         "fa2",
         "fa3",
@@ -96,27 +102,18 @@ def test_supported_backends_filters_options_by_dtype():
     }
 
 
-def test_trt_attention_is_blackwell_gated():
-    # The real trt declaration is arch-gated: trtllm-gen kernels exist for the
-    # SM10x family (sm_100f), so fp8 is legal on B200/B300 but NOT on H200. An
-    # unknown GPU (None) skips the axis.
-    for kind in (
-        "flashinfer_attn_prefill",
-        "flashinfer_attn_decode",
-        "flashinfer_attn_rect",
-    ):
-        assert backend_supports(kind, "trt", DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA B200")
-        assert backend_supports(kind, "trt", DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA B300")
-        assert not backend_supports(kind, "trt", DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200")
-        assert backend_supports(kind, "trt", DType.FP8_E4M3, DType.FP8_E4M3)  # gpu=None → skip
-        # options at fp8: trt drops on H200 (keeps fa3), returns on B200.
-        assert supported_backends(kind, DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200") == [
-            "fa3"
-        ]
-        assert set(supported_backends(kind, DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA B200")) == {
-            "fa3",
-            "trt",
-        }
+def test_trtllm_gen_paged_attention_is_blackwell_gated():
+    # trtllm-gen cubins ship for the SM10x family (sm_100f), so fp8 is legal on
+    # B200/B300 but NOT on H200. An unknown GPU (None) skips the axis.
+    backend = "flashinfer_trtllm_gen"
+    fp8 = DType.FP8_E4M3
+    for kind in ("paged_attn_batch_prefill", "paged_attn_batch_decode"):
+        assert backend_supports(kind, backend, fp8, fp8, gpu="NVIDIA B200")
+        assert backend_supports(kind, backend, fp8, fp8, gpu="NVIDIA B300")
+        assert not backend_supports(kind, backend, fp8, fp8, gpu="NVIDIA H200")
+        assert backend_supports(kind, backend, fp8, fp8)  # gpu=None → skip
+        assert supported_backends(kind, fp8, fp8, gpu="NVIDIA H200") == []
+        assert supported_backends(kind, fp8, fp8, gpu="NVIDIA B200") == [backend]
 
 
 def test_vllm_mla_rope_is_bf16_on_sm80_and_newer():

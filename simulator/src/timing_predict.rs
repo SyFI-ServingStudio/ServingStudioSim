@@ -295,8 +295,9 @@ pub(crate) struct SpeculativePredictGroup {
     #[serde(default)]
     prefill_chunk_pairs: Vec<[u32; 2]>,
     /// Decode (verify) requests, one `[kv_len, query_len]` each: the KV length
-    /// once the verify step has run, and its query width, which is
-    /// `draft_tokens + 1`.
+    /// once the verify step has run, and its query width, `draft_tokens + 1`,
+    /// or fewer for a row clipped at `max_model_len` (which then ends at
+    /// `max_model_len - 1`).
     #[serde(default)]
     decode_requests: Vec<[u32; 2]>,
 }
@@ -304,7 +305,7 @@ pub(crate) struct SpeculativePredictGroup {
 impl SpeculativePredictGroup {
     fn into_arch_group(
         self,
-        query_width: u32,
+        draft_tokens: u32,
         max_model_len: u32,
     ) -> Result<SpeculativeArchGroupInput> {
         let mut group = SpeculativeArchGroupInput::default();
@@ -318,15 +319,10 @@ impl SpeculativePredictGroup {
             group.prefill_chunk_pairs.push((prefix, append));
         }
         for [kv_len, query_len] in self.decode_requests {
-            ensure!(
-                query_len == query_width,
-                "query_len must equal draft_tokens + 1 ({query_width})"
-            );
-            ensure!(
-                kv_len >= query_width,
-                "final verify KV length {kv_len} is shorter than the query width {query_width}"
-            );
             ensure_fits("final verify KV length", kv_len, max_model_len)?;
+            let row = SpeculativeDecodeInput { kv_len, query_len };
+            row.check_verify_row(draft_tokens, max_model_len)
+                .map_err(|reason| anyhow!(reason))?;
             group.decode_tokens = group
                 .decode_tokens
                 .checked_add(query_len)
@@ -335,9 +331,7 @@ impl SpeculativePredictGroup {
                 .total_kv_len
                 .checked_add(kv_len - query_len)
                 .context("decode KV sum overflows u32")?;
-            group
-                .decode_requests
-                .push(SpeculativeDecodeInput { kv_len, query_len });
+            group.decode_requests.push(row);
         }
         group.batch_tokens = group
             .prefill_tokens
@@ -615,9 +609,7 @@ fn speculative_iter_inputs(
     max_model_len: u32,
     cases: Vec<SpeculativePredictCase>,
 ) -> Result<Vec<SpeculativeArchInput>> {
-    let query_width = draft_tokens
-        .checked_add(1)
-        .context("verify width overflows u32")?;
+    ensure!(draft_tokens < u32::MAX, "verify width overflows u32");
     cases
         .into_iter()
         .enumerate()
@@ -629,7 +621,7 @@ fn speculative_iter_inputs(
             let groups: Vec<_> = case
                 .groups
                 .into_iter()
-                .map(|group| group.into_arch_group(query_width, max_model_len))
+                .map(|group| group.into_arch_group(draft_tokens, max_model_len))
                 .collect::<Result<_>>()
                 .with_context(|| format!("case {index}"))?;
             let tokens_per_source_rank = if groups.len() > 1 {
@@ -906,7 +898,7 @@ mod tests {
             r#"{"prefill_chunk_pairs": [[32, 8]], "decode_requests": [[106, 6], [206, 6]]}"#,
         )
         .unwrap();
-        let lowered = group.into_arch_group(6, 8192).unwrap();
+        let lowered = group.into_arch_group(5, 8192).unwrap();
         assert_eq!(lowered.request_count(), 3);
         assert_eq!(lowered.decode_tokens, 12);
         assert_eq!(lowered.batch_tokens, 20);
@@ -931,13 +923,42 @@ mod tests {
                 prefill_chunk_pairs: vec![],
                 decode_requests: vec![pair],
             };
-            assert!(group.into_arch_group(6, 8192).is_err());
+            assert!(group.into_arch_group(5, 8192).is_err());
         }
         let group = SpeculativePredictGroup {
             prefill_chunk_pairs: vec![[u32::MAX, 1]],
             decode_requests: vec![],
         };
-        assert!(group.into_arch_group(6, 8192).is_err());
+        assert!(group.into_arch_group(5, 8192).is_err());
+    }
+
+    #[test]
+    fn speculative_prediction_takes_a_verify_row_clipped_at_max_model_len() {
+        // vLLM clips the last verifies so the sampled position stays inside
+        // max_model_len: a clipped row ends at max_model_len - 1.
+        for pair in [[8191, 1], [8191, 5]] {
+            let group = SpeculativePredictGroup {
+                prefill_chunk_pairs: vec![],
+                decode_requests: vec![pair],
+            };
+            let lowered = group.into_arch_group(5, 8192).unwrap();
+            assert_eq!(lowered.decode_tokens, pair[1]);
+            assert_eq!(lowered.total_kv_len, pair[0] - pair[1]);
+        }
+        // A full-width row may end at the limit itself.
+        let full = SpeculativePredictGroup {
+            prefill_chunk_pairs: vec![],
+            decode_requests: vec![[8192, 6]],
+        };
+        assert_eq!(full.into_arch_group(5, 8192).unwrap().decode_tokens, 6);
+        // Clipped anywhere else, empty, or wider than the window is refused.
+        for pair in [[8190, 5], [8192, 5], [8191, 0], [8191, 7]] {
+            let group = SpeculativePredictGroup {
+                prefill_chunk_pairs: vec![],
+                decode_requests: vec![pair],
+            };
+            assert!(group.into_arch_group(5, 8192).is_err(), "{pair:?}");
+        }
     }
 
     #[test]
@@ -966,7 +987,7 @@ mod tests {
         };
         assert_eq!(
             speculative
-                .into_arch_group(6, 8192)
+                .into_arch_group(5, 8192)
                 .unwrap_err()
                 .to_string(),
             prefill

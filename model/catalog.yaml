@@ -31,6 +31,14 @@ Qwen/Qwen3.6-35B-A3B-FP8:
   name: Qwen3.6 35B-A3B FP8
   family: Qwen
   config: qwen3_6_35b_a3b_fp8
+nvidia/Qwen3.8-27B-NVFP4:
+  name: Qwen3.8 27B NVFP4
+  family: Qwen
+  config: qwen3_8_27b_nvfp4
+nvidia/Qwen3.8-Flash-Next-NVFP4:
+  name: Qwen3.8 Flash Next NVFP4
+  family: Qwen
+  config: qwen3_8_flash_next_nvfp4
 deepseek-ai/DeepSeek-V4-Flash-0731:
   name: DeepSeek V4 Flash 0731
   family: DeepSeek
@@ -75,3 +83,7 @@ thinkingmachines/Inkling-Small-NVFP4:
   name: Inkling Small NVFP4
   family: Inkling
   config: inkling_small_nvfp4
+XiaomiMiMo/MiMo-V2.6-Flash-RL:
+  name: MiMo V2.6 Flash RL
+  family: MiMo
+  config: mimo_v2_6_flash_rl

@@ -106,8 +106,8 @@ class Role:
     @property
     def options(self) -> list[str]:
         """Registered backends compatible with this role's dtype AND GPU — the
-        dry-run `options` column, already dtype- and gpu-filtered (so e.g. trt is
-        dropped on a non-Blackwell run)."""
+        dry-run `options` column, already dtype- and gpu-filtered (so e.g. an sm_100f-only
+        backend is dropped on a non-Blackwell run)."""
         return supported_backends(self.kind, self.compute, self.kv, self.gpu)
 
 

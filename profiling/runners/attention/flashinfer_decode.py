@@ -107,13 +107,6 @@ def _run_decode(
     batch_size = int(batch_size)
     seq_len = max(1, int(total_tokens) // batch_size)
 
-    if backend == "trt":
-        # Same B200/sm100-only limitation as prefill: trtllm-gen FMHA errors with
-        # "Unsupported architecture" on H200. Ref trt decode rows are all B200.
-        raise ProfilerNotImplemented(
-            "trt (trtllm-gen) decode is B200/sm100-only; unsupported on this GPU"
-        )
-
     try:
         import torch
     except ImportError as exc:
@@ -150,7 +143,7 @@ def _run_decode(
         )
         wrapper_kwargs = {
             "kv_layout": "NHD",
-            "backend": _common.flashinfer_backend_name(backend),
+            "backend": backend,
             "use_tensor_cores": True,
         }
         if use_cuda_graph_plan:
@@ -237,10 +230,6 @@ def profile_flashinfer_attn_decode_fa2_cudagraph(**kwargs) -> ComputeMetrics:
 
 def profile_flashinfer_attn_decode_fa3(**kwargs) -> ComputeMetrics:
     return _run_decode(backend="fa3", **kwargs)
-
-
-def profile_flashinfer_attn_decode_trt(**kwargs) -> ComputeMetrics:
-    return _run_decode(backend="trt", **kwargs)
 
 
 def profile_flashinfer_attn_decode_cudnn(**kwargs) -> ComputeMetrics:

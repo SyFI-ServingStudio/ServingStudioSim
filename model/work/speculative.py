@@ -18,7 +18,14 @@ from dataclasses import replace
 
 from .core import AttnInteraction, Workload
 from .models import dflash2
-from .models.glm52 import DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE
+
+#: :attr:`Workload.stages` key for the proposer's first draft pass. It forwards
+#: the target's whole scheduled batch, because it is the pass that fills the MTP
+#: layer's own attention state.
+DRAFT_FIRST_STAGE = "mtp_first"
+#: …and for every drafted position after the first: one row per request, over a
+#: context the first pass already indexed.
+DRAFT_RECURRENT_STAGE = "mtp_recurrent"
 
 #: Proposer -> the stages its stacks run against.
 PROPOSER_STAGES = {
@@ -76,8 +83,13 @@ def aggregate_workload(totals: dict, proposer: str = "mtp") -> Workload:
                 else:
                     final = _integer(left, "decode context", k + 1)
                     q = _integer(right, "decode query", 1)
-                    if q != k + 1:
-                        raise ValueError("decode query must equal draft_tokens + 1")
+                    # Full width, or clipped by vLLM at the context limit so
+                    # the sampled position is the model's last.
+                    if q > k + 1 or (q < k + 1 and final != maximum - 1):
+                        raise ValueError(
+                            "decode query must equal draft_tokens + 1 "
+                            "except a verify clipped to end at max_model_len - 1"
+                        )
                     cached = final - q
                 if final > maximum:
                     raise ValueError("request context exceeds max_model_len")

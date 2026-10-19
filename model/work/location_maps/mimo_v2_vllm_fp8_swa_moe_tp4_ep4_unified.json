@@ -1,0 +1,236 @@
+{
+  "schema_version": 1,
+  "mapping_id": "mimo-v2-vllm-fp8-swa-moe-tp4-ep4-unified-v1",
+  "arch_types": [
+    "mimo_v2_vllm_fp8_swa_moe"
+  ],
+  "locations": [
+    {
+      "location": "unified.embed",
+      "semantics": [
+        "embedding"
+      ]
+    },
+    {
+      "location": "unified.embed.ar_norm_residual_norm",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_dense.attn.qkv_proj.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_dense.attn.qkv_proj.gemm",
+      "semantics": [
+        "global_dense.qkv",
+        "global_dense.input_norm"
+      ]
+    },
+    {
+      "location": "unified.global_dense.attn.rope",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_dense.attn.kv_append",
+      "semantics": [
+        "global_dense.kv_cache_append"
+      ]
+    },
+    {
+      "location": "unified.global_dense.attn.attention",
+      "semantics": [
+        "global_dense.attn.prefill",
+        "global_dense.attn.decode"
+      ]
+    },
+    {
+      "location": "unified.global_dense.attn.o_proj",
+      "semantics": [
+        "global_dense.o"
+      ]
+    },
+    {
+      "location": "unified.global_dense.attn.ar_norm_residual_norm",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_dense.ffn.gate_up_input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_dense.ffn.gate_up",
+      "semantics": [
+        "global_dense.gate_up",
+        "global_dense.post_attention_norm"
+      ]
+    },
+    {
+      "location": "unified.global_dense.ffn.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_dense.ffn.down_input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_dense.ffn.down",
+      "semantics": [
+        "global_dense.down"
+      ]
+    },
+    {
+      "location": "unified.global_dense.ffn.ar_norm_residual_norm",
+      "semantics": []
+    },
+    {
+      "location": "unified.swa_moe.attn.qkv_proj.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.swa_moe.attn.qkv_proj.gemm",
+      "semantics": [
+        "swa_moe.qkv",
+        "swa_moe.input_norm"
+      ]
+    },
+    {
+      "location": "unified.swa_moe.attn.rope",
+      "semantics": []
+    },
+    {
+      "location": "unified.swa_moe.attn.kv_append",
+      "semantics": [
+        "swa_moe.kv_cache_append"
+      ]
+    },
+    {
+      "location": "unified.swa_moe.attn.attention",
+      "semantics": [
+        "swa_moe.attn.prefill",
+        "swa_moe.attn.decode",
+        "swa_moe.attention_sinks"
+      ]
+    },
+    {
+      "location": "unified.swa_moe.attn.o_proj",
+      "semantics": [
+        "swa_moe.o"
+      ]
+    },
+    {
+      "location": "unified.swa_moe.attn.ar_norm_residual_norm",
+      "semantics": []
+    },
+    {
+      "location": "unified.swa_moe.moe.router",
+      "semantics": [
+        "swa_moe.router",
+        "swa_moe.post_attention_norm"
+      ]
+    },
+    {
+      "location": "unified.swa_moe.moe.routed_rank0.fused_moe",
+      "semantics": [
+        "swa_moe.expert_gate_up",
+        "swa_moe.expert_down",
+        "swa_moe.router_bias"
+      ]
+    },
+    {
+      "location": "unified.swa_moe.moe.routed_rank1.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.swa_moe.moe.routed_rank2.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.swa_moe.moe.routed_rank3.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.swa_moe.moe.ar_norm_residual_norm",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_moe.attn.qkv_proj.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_moe.attn.qkv_proj.gemm",
+      "semantics": [
+        "global_moe.qkv",
+        "global_moe.input_norm"
+      ]
+    },
+    {
+      "location": "unified.global_moe.attn.rope",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_moe.attn.kv_append",
+      "semantics": [
+        "global_moe.kv_cache_append"
+      ]
+    },
+    {
+      "location": "unified.global_moe.attn.attention",
+      "semantics": [
+        "global_moe.attn.prefill",
+        "global_moe.attn.decode"
+      ]
+    },
+    {
+      "location": "unified.global_moe.attn.o_proj",
+      "semantics": [
+        "global_moe.o"
+      ]
+    },
+    {
+      "location": "unified.global_moe.attn.ar_norm_residual_norm",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_moe.moe.router",
+      "semantics": [
+        "global_moe.router",
+        "global_moe.post_attention_norm"
+      ]
+    },
+    {
+      "location": "unified.global_moe.moe.routed_rank0.fused_moe",
+      "semantics": [
+        "global_moe.expert_gate_up",
+        "global_moe.expert_down",
+        "global_moe.router_bias"
+      ]
+    },
+    {
+      "location": "unified.global_moe.moe.routed_rank1.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_moe.moe.routed_rank2.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_moe.moe.routed_rank3.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.global_moe.moe.ar_norm_residual_norm",
+      "semantics": []
+    },
+    {
+      "location": "unified.logits_select",
+      "semantics": []
+    },
+    {
+      "location": "unified.lm_head",
+      "semantics": [
+        "lm_head",
+        "final_norm"
+      ]
+    }
+  ]
+}

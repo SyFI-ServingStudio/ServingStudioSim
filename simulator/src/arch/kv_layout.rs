@@ -71,9 +71,9 @@ pub struct PartOverhead {
     /// such as a head size padded to a power of two or a mamba page padded to
     /// the attention page.
     pub padded_bytes_per_entry: Option<u64>,
-    /// State copies the engine keeps per request whatever the cache mode: one
-    /// plus vLLM's speculative blocks. `None` means one. L5 adds align mode's
-    /// previous-step copy itself when prefix caching is on.
+    /// State copies the engine keeps per running request whatever the cache
+    /// mode: one plus vLLM's speculative blocks. `None` means one. L5 adds
+    /// align mode's previous-step copy to vLLM's concurrency estimate only.
     pub copies: Option<u32>,
 }
 
@@ -260,6 +260,60 @@ pub fn gqa_kv_bytes_per_token(
     attn_tp: u64,
 ) -> u64 {
     layers * num_kv_heads.max(attn_tp.max(1)) * (k_head_dim + v_head_dim) * dtype_bytes
+}
+
+/// vLLM's hybrid attention block (`_align_hybrid_block_size`): the smallest
+/// multiple of the attention kernel's `kernel_block_tokens` whose per-layer
+/// attention page (`attn_page_bytes_per_token` per token) holds one layer's
+/// recurrent-state page. The state page is then padded up to that attention
+/// page. Both operands are per layer and per rank.
+pub fn hybrid_attention_block_tokens(
+    kernel_block_tokens: u64,
+    state_page_bytes: u64,
+    attn_page_bytes_per_token: u64,
+) -> u32 {
+    let aligned_page = kernel_block_tokens * attn_page_bytes_per_token.max(1);
+    let blocks = state_page_bytes.div_ceil(aligned_page).max(1);
+    u32::try_from(kernel_block_tokens * blocks).expect("hybrid block size exceeds u32")
+}
+
+/// One request's cache in vLLM's hybrid allocator for a model of
+/// `attn_layers` per-token attention layers and `state_layers` recurrent
+/// layers (GDN): the attention KV per token, and one state page per
+/// recurrent layer padded to the attention page of one hybrid block
+/// ([`hybrid_attention_block_tokens`]). One null block of every attention
+/// layer's page leaves the pool. With no recurrent layer it is plain
+/// per-token attention.
+pub fn hybrid_attention_state_layout(
+    kernel_block_tokens: u64,
+    attn_page_bytes_per_token: u64,
+    attn_layers: u64,
+    state_page_bytes: u64,
+    state_layers: u64,
+) -> KvCacheLayout {
+    let kv_bytes_per_token = attn_page_bytes_per_token * attn_layers;
+    let mut layout = KvCacheLayout::new();
+    if kv_bytes_per_token > 0 {
+        layout = layout.with_part(KvCachePart::per_token("gqa", kv_bytes_per_token));
+    }
+    if state_layers == 0 {
+        return layout;
+    }
+    let block_tokens = hybrid_attention_block_tokens(
+        kernel_block_tokens,
+        state_page_bytes,
+        attn_page_bytes_per_token,
+    );
+    let padded_state_page = u64::from(block_tokens) * attn_page_bytes_per_token;
+    layout
+        .with_part(
+            KvCachePart::per_request("gdn", state_page_bytes * state_layers)
+                .padded_to(padded_state_page * state_layers),
+        )
+        .with_engine(EngineOverhead {
+            block_tokens: Some(block_tokens),
+            fixed_device_bytes: u64::from(block_tokens) * kv_bytes_per_token,
+        })
 }
 
 #[cfg(test)]

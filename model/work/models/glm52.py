@@ -20,14 +20,7 @@ from ..core import LayerStack, MatmulGroup, Model, NormWeightGroup, dtype_bytes
 from ..ffn.dense import DenseSwiGLU
 from ..ffn.moe import MoE
 from ..quantization import parse_quantization_config
-
-#: :attr:`Workload.stages` key for the proposer's first draft pass. It forwards
-#: the target's whole scheduled batch, because it is the pass that fills the MTP
-#: layer's own attention state.
-DRAFT_FIRST_STAGE = "mtp_first"
-#: …and for every drafted position after the first: one row per request, over a
-#: context the first pass already indexed.
-DRAFT_RECURRENT_STAGE = "mtp_recurrent"
+from ..speculative import DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE
 
 
 def _require_schedule(raw_config: dict) -> tuple[tuple[int, ...], ...]:
