@@ -22,9 +22,11 @@ from profiling.runners.neuron.stock_contract import (
     BLOCK_SIZE,
     CONTEXTS,
     KV_BLOCKS,
+    PREFILL_BUCKET_STEP,
     TP_SIZE,
     largest_decode_bucket,
     prefill_validation_bucket,
+    prompt_length,
     resident_capacity,
 )
 from profiling.runners.neuron.vllm_identity import seal_accuracy_binaries, verify_checkpoint
@@ -57,8 +59,13 @@ def validate_shape(phase, token_bucket, max_model_len, kv_blocks, block_size, tp
     if max_model_len not in CONTEXTS:
         raise ValueError(f"stock max_model_len must be one of {CONTEXTS}")
     if phase == "prefill":
-        if token_bucket != max_model_len:
-            raise ValueError("prefill measurements require the full context bucket")
+        # A prefill row is one compiled graph of T tokens. T is a multiple of
+        # PREFILL_BUCKET_STEP and is not more than the context, because the stock
+        # engine sets max_num_batched_tokens to the context.
+        if token_bucket % PREFILL_BUCKET_STEP or not 0 < token_bucket <= max_model_len:
+            raise ValueError(
+                f"prefill buckets are multiples of {PREFILL_BUCKET_STEP} up to the context"
+            )
     elif phase == "decode":
         if token_bucket < 1 or token_bucket & (token_bucket - 1):
             raise ValueError("decode buckets are powers of two")
@@ -66,6 +73,18 @@ def validate_shape(phase, token_bucket, max_model_len, kv_blocks, block_size, tp
             raise ValueError("decode bucket exceeds the context's KV-resident capacity")
     else:
         raise ValueError("phase must be prefill or decode")
+
+
+def validate_whole_context_shape(
+    phase, token_bucket, max_model_len, kv_blocks, block_size, tp_size, dtype
+):
+    """``validate_shape``, but prefill accepts only the whole-context graph.
+
+    Region, segment and per-operation captures measure only that graph.
+    """
+    validate_shape(phase, token_bucket, max_model_len, kv_blocks, block_size, tp_size, dtype)
+    if phase == "prefill" and token_bucket != max_model_len:
+        raise ValueError("this capture measures the whole-context prefill graph only")
 
 
 def verify_identity(model):
@@ -124,7 +143,11 @@ def precision_shape(spec, context):
         prefill_validation_bucket(context) if spec["phase"] == "prefill" else spec["token_bucket"]
     )
     batch = min(bucket, resident_capacity(context))
-    return f"b{batch}-s{context - 8}"
+    # A prefill graph below the context validates on its own shorter prompts; a
+    # segmented prefill row (``segment_size``) uses the canonical C-8 prompts.
+    own_prompts = spec["phase"] == "prefill" and "segment_size" not in spec
+    tokens = spec["token_bucket"] if own_prompts else context
+    return f"b{batch}-s{prompt_length(tokens)}"
 
 
 def profile_forward_batch(kwargs_list):

@@ -260,6 +260,14 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         prefill_segment_size: Option<u32>,
+        /// The compiled prefill buckets (`num_batched_tokens_buckets`). They are
+        /// ascending multiples of 128, and the last one is `max_model_len`. A
+        /// prompt pads to the smallest bucket that holds it. Empty (the default)
+        /// keeps one whole-context graph. A list other than `[max_model_len]`
+        /// requires `composition: whole_forward` and no `prefill_segment_size`.
+        #[serde(default)]
+        #[param(cache_key)]
+        prefill_buckets: Vec<u32>,
     },
     /// Megatron TP over dense Llama 3. `tp_size` must divide the KV heads (8).
     Llama3DenseTp {

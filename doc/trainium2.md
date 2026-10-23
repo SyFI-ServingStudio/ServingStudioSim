@@ -36,14 +36,45 @@ provenance. Standalone NKI leaf measurements remain outside the shared database.
 `neuron_llama_forward/vllm_neuron` measures the complete compiled forward (32
 layers, TP collectives, KV updates and greedy sampling) as one leaf. Its args
 are `phase, token_bucket, max_model_len, kv_blocks, block_size, tp_size, dtype`;
-the Rust config adds the compiled `decode_buckets`. The cache is categorical
-(`Cache1DDirect` over the compiled-variant index: prefill, then each decode
-bucket), with no interpolation.
+the Rust config adds the compiled `decode_buckets` and `prefill_buckets`. The
+cache is categorical (`Cache1DDirect` over the compiled-variant index: each
+prefill bucket, then each decode bucket), with no interpolation.
+
+Terms: a *bucket* is the token or batch count of one compiled graph; an
+*inventory* is the ordered list of buckets an engine compiles; a *row* is one
+measured `profile.db` entry.
+
+- Prefill inventory (`prefill_buckets`, vllm-neuron `num_batched_tokens_buckets`).
+  vllm-neuron requires ascending positive buckets, and the last one must equal
+  `max_num_batched_tokens` (`vllm_neuron/utils/bucket_utils.py`). The stock
+  engine sets that value to the context C. This repository also requires
+  multiples of 128 (`PREFILL_BUCKET_STEP`), the grid it measures. A prompt pads
+  to the smallest bucket that holds it. Empty means the single whole-context
+  graph `[C]`, the stock default of this repository.
+  vllm-neuron's own default is the powers of two from 128, then C.
+- Decode inventory (`decode_buckets`, vllm-neuron `num_seqs_buckets`).
+  Ascending powers of two up to `largest_decode_bucket(C)`. That bucket is the
+  KV-resident capacity, rounded up to a power of two, and not more than C.
+  vllm-neuron accepts any ascending batch sizes; its default is the powers of
+  two from 1.
+- Prefill buckets below C exist as whole-forward rows only. The region, segment
+  and per-operation captures keep the whole-context prefill bucket
+  (`vllm_forward.validate_whole_context_shape`). The alignment pipeline
+  (`alignment/neuron/`) serves `[C]` only, so an inventory below C is checked
+  against hardware with a directly started server.
+- A smaller prefill graph runs its own prompts of T-8 tokens. Those requests
+  time the prefill graph only (`prefill_only`); their decodes hold fewer KV
+  tokens than a decode row and are not decode samples. A row assumes that its
+  compiled graph does not depend on the other buckets in the same engine.
 
 A profiling run per context:
 
-1. compiles the context's prefill graph and the requested decode graphs (bucket
-   1 only when the inventory asks for it);
+1. compiles the requested prefill and decode graphs. The context graph is
+   always included, because vllm-neuron requires it as the last bucket (a
+   segmented run compiles its S-token graph instead). Decode
+   bucket 1 is compiled only when the inventory asks for it. A prefill graph of
+   T < C tokens is validated and timed with T-8-token prompts of the same eight
+   subjects;
 2. checks full native logits of eight museum subjects against independent CPU
    FP32/BF16 references with the unmodified vendor criterion (eager attention up
    to 8192 tokens, eager over 1024-row query blocks above, the choice being part

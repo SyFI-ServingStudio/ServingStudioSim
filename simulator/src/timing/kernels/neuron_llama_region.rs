@@ -63,6 +63,8 @@ impl NeuronLlamaRegionKernelConfig {
             tp_size: self.tp_size.clone(),
             dtype: self.dtype,
             decode_buckets: self.decode_buckets.clone(),
+            // Region rows exist for the whole-context prefill graph only.
+            prefill_buckets: Vec::new(),
         }
     }
 }

@@ -85,6 +85,15 @@ def numeric_run(tmp_path):
     return root, cache, snapshot
 
 
+def test_seal_requires_every_compiled_prefill_graph(numeric_run):
+    root, _, _ = numeric_run
+    plan = json.loads((root / "plan.json").read_text())
+    plan["specs"] = [{"phase": "prefill", "token_bucket": 256}]
+    write(root, "plan.json", plan)
+    with pytest.raises(ValueError, match="lacks complete"):
+        identity.seal_accuracy_binaries(root)
+
+
 def test_same_key_neff_replacement_rejected(numeric_run):
     root, cache, _ = numeric_run
     identity.seal_accuracy_binaries(root)
