@@ -177,7 +177,10 @@ def measure_trace(events, requests, model_info, physical_cores):
     for execution in group_executions(events, requests, physical_cores):
         phase, bucket = model_info[execution["model_hash"]]
         duration = union_duration(execution["spans"]) / 1e6
-        measured[(phase, bucket)].append(duration)
+        # prefill_only requests time their prefill graph only; their decodes
+        # hold fewer KV tokens than a decode row.
+        if phase == "prefill" or not requests[execution["request_index"]].get("prefill_only"):
+            measured[(phase, bucket)].append(duration)
         records.append(
             {
                 "request_index": execution["request_index"],

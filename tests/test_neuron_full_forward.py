@@ -1,10 +1,12 @@
 """Whole-forward boundaries: rank union, graph geometry, shape refusal and the
 stock context ladder shared with the Rust kernel."""
 
+from pathlib import Path
+
 import pytest
 
 from profiling.exec import neuron
-from profiling.runners.neuron.vllm_forward import validate_shape
+from profiling.runners.neuron.vllm_forward import validate_shape, validate_whole_context_shape
 from profiling.runners.neuron.vllm_forward_engine import cases_for_plan, validate_greedy_tokens
 from profiling.runners.neuron.vllm_forward_trace import measure_trace, model_geometry
 from profiling.runners.neuron.vllm_forward_work import estimate_work
@@ -63,10 +65,55 @@ def test_context_ladder_caps_decode_buckets_at_kv_resident_capacity(context, lar
         dtype="bf16",
     )
     validate_shape(token_bucket=largest, **args)
-    validate_shape(**(args | {"phase": "prefill"}), token_bucket=context)
     for bucket in (largest * 2, 3):
         with pytest.raises(ValueError):
             validate_shape(token_bucket=bucket, **args)
+    # Prefill graphs: multiples of 128 up to the context.
+    prefill = args | {"phase": "prefill"}
+    for bucket in range(128, context + 1, 128):
+        validate_shape(**prefill, token_bucket=bucket)
+    for bucket in (context + 128, 100, 0):
+        with pytest.raises(ValueError):
+            validate_shape(**prefill, token_bucket=bucket)
+    # Region, segment and per-operation captures keep the whole-context graph.
+    validate_whole_context_shape(**prefill, token_bucket=context)
+    if context > 128:
+        with pytest.raises(ValueError, match="whole-context"):
+            validate_whole_context_shape(**prefill, token_bucket=128)
+
+
+def test_smaller_prefill_graphs_get_their_own_prompts_and_engine_buckets():
+    from profiling.runners.neuron.vllm_forward import precision_shape
+    from profiling.runners.neuron.vllm_forward_engine import (
+        cases_for_plan,
+        engine_config,
+        prefill_buckets_of,
+    )
+
+    class Tokenizer:
+        def encode(self, text):
+            return list(range(len(text.split()) * 2))
+
+    spec = dict(max_model_len=512, kv_blocks=6782, block_size=32, tp_size=4, dtype="bf16")
+    specs = [dict(spec, phase="prefill", token_bucket=t) for t in (128, 384, 512)]
+    specs.append(dict(spec, phase="decode", token_bucket=32))
+    plan = {"context": 512, "specs": specs, "model": "/model"}
+    assert prefill_buckets_of(plan) == [128, 384, 512]
+    cases = cases_for_plan(plan, Tokenizer())
+    shapes = {case["shape_id"]: case for case in cases}
+    assert {"b16-s120", "b16-s376", "b16-s504", "b32-s504"} <= set(shapes)
+    assert all(len(p) == 120 for p in shapes["b16-s120"]["prompts"])
+    assert shapes["b16-s120"]["bucket"] == 16
+    assert shapes["b16-s120"]["prefill_only"] and "prefill_only" not in shapes["b16-s504"]
+    for s in specs[:3]:
+        assert precision_shape(s, 512) in shapes
+    config = engine_config(plan, cases, Path("/run"), "profile")
+    nc = config["additional_config"]["neuron_config"]
+    assert nc["num_batched_tokens_buckets"] == [128, 384, 512]
+    assert config["max_num_batched_tokens"] == 512
+    # A decode-only plan keeps the single whole-context graph.
+    decode_only = {"context": 512, "specs": specs[3:], "model": "/model"}
+    assert prefill_buckets_of(decode_only) == [512]
 
 
 def test_native_timing_unions_rank_overlap_and_requires_every_rank():
@@ -94,6 +141,20 @@ def test_native_timing_unions_rank_overlap_and_requires_every_rank():
         measure_trace(events[:-1], requests, models, set(range(8)))
     with pytest.raises(ValueError, match="missing output"):
         measure_trace(events[:-8], requests, models, set(range(8)))
+    # A prefill_only request times its prefill graph only; a normal request
+    # beside it at the same decode bucket still adds its decodes.
+    shifted = [dict(e, timestamp=e["timestamp"] + 1000) for e in events]
+    measured, records = measure_trace(
+        events + shifted,
+        [
+            requests[0] | {"prefill_only": True},
+            requests[0] | {"start_epoch_ns": 1000, "stop_epoch_ns": 2000},
+        ],
+        models,
+        set(range(8)),
+    )
+    assert measured == {("prefill", 512): [27 / 1e6] * 2, ("decode", 16): [27 / 1e6] * 7}
+    assert len(records) == 16
 
 
 def test_compiled_input_geometry_refuses_changed_pool():
@@ -263,15 +324,16 @@ def test_coverage_allows_exactly_one_early_async_decode():
 
 @pytest.mark.needs_binary
 def test_python_and_rust_share_the_stock_context_ladder(sim_bin):
-    """The Rust kernel config accepts exactly the decode inventories the Python
-    profiler measures: every context's largest bucket, never the next one."""
+    """The Rust kernel config accepts exactly the inventories the Python profiler
+    measures: every context's largest decode bucket, never the next one, and
+    prefill buckets on the same PREFILL_BUCKET_STEP grid."""
     import json
     import subprocess
 
     from launcher.exec import _build_subprocess_env
     from profiling.runners.neuron import stock_contract
 
-    def rust_rows(context, buckets):
+    def rust_rows(context, buckets, prefill=()):
         request = {
             "op": "rows",
             "kind": "neuron_llama_forward",
@@ -284,6 +346,7 @@ def test_python_and_rust_share_the_stock_context_ladder(sim_bin):
                 "tp_size": stock_contract.TP_SIZE,
                 "dtype": "bf16",
                 "decode_buckets": buckets,
+                "prefill_buckets": list(prefill),
             },
         }
         result = subprocess.run(
@@ -303,3 +366,13 @@ def test_python_and_rust_share_the_stock_context_ladder(sim_bin):
             validate_shape(**{k: v for k, v in row["args"].items() if k != "backend"})
         assert rust_rows(context, [1, largest * 2]) is None, context
     assert rust_rows(3072, [1]) is None
+    # Prefill inventories: the Rust and Python step rules agree.
+    step = stock_contract.PREFILL_BUCKET_STEP
+    rows = rust_rows(512, [1, 16], range(step, 513, step))
+    assert rows is not None
+    assert [r["args"]["token_bucket"] for r in rows if r["args"]["phase"] == "prefill"] == list(
+        range(step, 513, step)
+    )
+    for row in rows:
+        validate_shape(**{k: v for k, v in row["args"].items() if k != "backend"})
+    assert rust_rows(512, [1, 16], [step // 2, 512]) is None

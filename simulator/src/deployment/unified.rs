@@ -388,6 +388,7 @@ impl Deployment for UnifiedDeployment {
                 tp_size,
                 composition,
                 prefill_segment_size,
+                prefill_buckets,
                 ..
             } => {
                 let model = Arc::new(arch_build::llama3_vllm_neuron(
@@ -397,6 +398,7 @@ impl Deployment for UnifiedDeployment {
                     *tp_size,
                     *composition,
                     *prefill_segment_size,
+                    prefill_buckets,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
@@ -1124,8 +1126,8 @@ fn prefill_gpu_time_multiplier(worker: &IterWorkerSel) -> anyhow::Result<Option<
 }
 
 /// Stock vLLM Neuron's scheduler on the generic chunked-prefill worker: one
-/// replica, a token budget equal to its one compiled prefill graph (the whole
-/// context, or one S-token segment when prefill is segmented), one prefill
+/// replica, a token budget equal to its largest compiled prefill graph (the
+/// whole context, or one S-token segment when prefill is segmented), one prefill
 /// request per iteration that never shares it with decode, FIFO, no prefix
 /// reuse, and at most as many residents as both its largest compiled decode
 /// bucket and the paged pool hold. Its KV budget is exactly that pool,

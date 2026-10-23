@@ -34,7 +34,9 @@ VLLM_NEURON_WORKER_ENV = (
 class NeuronLlamaForwardArgs(KernelArgs):
     phase: str = arg(doc="prefill or decode; whole 32-layer model including greedy sampling.")
     token_bucket: int = arg(
-        unit="tokens", doc="Compiled prefill token bucket or decode batch bucket."
+        unit="tokens",
+        doc="Compiled prefill token bucket (a multiple of 128 up to max_model_len) "
+        "or decode batch bucket.",
     )
     max_model_len: int = arg(
         unit="tokens", doc="Allocated per-request context and decode block-table width."
@@ -66,7 +68,9 @@ DOC = KernelDoc(
         "the fused MLP remains inside the whole graph.",
         "Contexts are 128 through 8192 tokens (stock_contract.CONTEXTS). Each run "
         "independently checks full logits using the unmodified vendor FP32/BF16 criterion.",
-        "Inputs use homogeneous prompts ending eight tokens below context capacity. "
+        "Inputs use homogeneous prompts eight tokens below their prefill bucket: C-8 "
+        "for decode rows and the C prefill row, T-8 for a prefill bucket T below C. "
+        "The T-8 requests time their prefill graph only. "
         "Context occupancy generalization requires separate validation.",
         "FLOPs and bytes estimate per-rank graph contractions and persistent operands; "
         "they omit nonmatmul arithmetic, temporaries, communication, spills and rereads. "

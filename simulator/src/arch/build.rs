@@ -794,6 +794,7 @@ pub fn llama3_vllm_neuron(
     tp_size: u16,
     composition: crate::arch::config::VllmNeuronComposition,
     prefill_segment_size: Option<u32>,
+    prefill_buckets: &[u32],
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -817,6 +818,7 @@ pub fn llama3_vllm_neuron(
         tp_size,
         composition,
         prefill_segment_size,
+        prefill_buckets: prefill_buckets.to_vec(),
     };
     let resolved = stock::resolve_configs(&stock::build_configs(&model_cfg, &parallel));
     stock::build(name.to_string(), resolved, bridge).context(
@@ -2180,6 +2182,7 @@ pub fn build_iter_model(
             tp_size,
             composition,
             prefill_segment_size,
+            prefill_buckets,
         } => Box::new(llama3_vllm_neuron(
             model,
             *max_model_len,
@@ -2187,6 +2190,7 @@ pub fn build_iter_model(
             *tp_size,
             *composition,
             *prefill_segment_size,
+            prefill_buckets,
             gpu,
             name,
             bridge,

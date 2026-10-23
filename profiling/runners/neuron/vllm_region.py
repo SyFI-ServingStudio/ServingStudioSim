@@ -29,7 +29,7 @@ from profiling.runners.neuron.vllm_forward import (
     key,
     precision_shape,
     run_stage,
-    validate_shape,
+    validate_whole_context_shape,
     verify_identity,
     write_plan,
 )
@@ -53,7 +53,7 @@ def validate_region_shape(region, **forward):
     """
     if region not in REGIONS:
         raise ValueError("region must be model or head")
-    validate_shape(**forward)
+    validate_whole_context_shape(**forward)
 
 
 def _rms(values) -> float:

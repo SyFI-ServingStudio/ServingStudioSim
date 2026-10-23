@@ -62,6 +62,9 @@ pub struct VllmNeuronParallel {
     pub composition: VllmNeuronComposition,
     /// Compiled prefill segment S; `None` keeps the whole-context prefill graph.
     pub prefill_segment_size: Option<u32>,
+    /// The compiled prefill inventory (`num_batched_tokens_buckets`). A prompt
+    /// pads to the smallest bucket that holds it. Empty means `[max_model_len]`.
+    pub prefill_buckets: Vec<u32>,
 }
 
 /// The whole-forward kernel config (the runtime identity every composition
@@ -102,6 +105,8 @@ pub struct Llama3VllmNeuronModel {
     pub name: String,
     pub max_model_len: u32,
     pub decode_buckets: Vec<u32>,
+    /// The prefill inventory, ascending; the last bucket is the context.
+    pub prefill_buckets: Vec<u32>,
     pub tp_size: u16,
     pub leaves: VllmNeuronLeaves,
     /// Segment geometry when prefill is segmented: (S, largest measured prior).
@@ -162,6 +167,13 @@ pub fn build_configs(model: &ModelCfg, parallel: &VllmNeuronParallel) -> Llama3V
         tp_size: Dim::param("tp_size", u32::from(parallel.tp_size)),
         dtype: model.dtype,
         decode_buckets: parallel.decode_buckets.clone(),
+        // `[C]` is the default inventory; store it as empty so both spellings
+        // build the same kernel config.
+        prefill_buckets: if parallel.prefill_buckets == [parallel.max_model_len] {
+            Vec::new()
+        } else {
+            parallel.prefill_buckets.clone()
+        },
     };
     let segmented = parallel
         .prefill_segment_size
@@ -253,6 +265,14 @@ pub fn validate_selected(
     composition: VllmNeuronComposition,
     segmented: Option<&NeuronLlamaSegmentedForwardKernelConfig>,
 ) -> Result<()> {
+    // Region, segment and segmented-prefill rows exist for the whole-context
+    // prefill graph only; smaller prefill graphs are whole-forward rows.
+    ensure!(
+        *forward.prefill_inventory() == [forward.max_model_len.get()]
+            || (composition == VllmNeuronComposition::WholeForward && segmented.is_none()),
+        "a prefill inventory other than [max_model_len] requires composition whole_forward \
+         and no prefill_segment_size"
+    );
     match segmented {
         None => NeuronLlamaForwardSpec::validate_config(forward),
         Some(cfg) => {
@@ -347,6 +367,7 @@ pub fn build(
     let mut model = Llama3VllmNeuronModel {
         max_model_len: resolved.forward.max_model_len.get(),
         decode_buckets: resolved.forward.decode_buckets.clone(),
+        prefill_buckets: resolved.forward.prefill_inventory().into_owned(),
         tp_size: resolved.forward.tp_size.get() as u16,
         leaves,
         segmented,
@@ -369,9 +390,13 @@ pub fn build(
 /// Lower one iteration's logical batch onto the compiled executable it runs.
 /// Only the graph identity enters the leaf input; request histories stay in
 /// the ordinary request log (paged KV contents are runtime data, not a graph).
+/// A prompt of `q` tokens runs the smallest compiled prefill graph that holds
+/// it, as the stock scheduler pads it (`NeuronScheduler._calculate_padded_count`,
+/// `vllm_neuron/vllm/core/scheduler.py`).
 fn lower_input(
     batch: &UnifiedArchInput,
     context: u32,
+    prefill_buckets: &[u32],
     buckets: &[u32],
 ) -> Result<NeuronLlamaForwardKernelInput, String> {
     if batch.groups.len() != 1 || !batch.tokens_per_source_rank.is_empty() {
@@ -386,9 +411,16 @@ fn lower_input(
             && g.prefill_tokens == *q
             && g.batch_tokens == *q
         {
+            let token_bucket = prefill_buckets
+                .iter()
+                .copied()
+                .find(|&bucket| bucket >= *q)
+                .ok_or_else(|| {
+                    "vLLM Neuron prompt exceeds the largest prefill bucket".to_string()
+                })?;
             return Ok(NeuronLlamaForwardKernelInput {
                 phase: NeuronLlamaForwardPhase::Prefill,
-                token_bucket: context,
+                token_bucket,
             });
         }
         return Err(
@@ -519,8 +551,13 @@ impl Llama3VllmNeuronModel {
             forward.eval(&input, ev);
             return;
         }
-        let input = lower_input(batch, self.max_model_len, &self.decode_buckets)
-            .expect("unsupported vLLM Neuron iteration");
+        let input = lower_input(
+            batch,
+            self.max_model_len,
+            &self.prefill_buckets,
+            &self.decode_buckets,
+        )
+        .expect("unsupported vLLM Neuron iteration");
         match &self.leaves {
             VllmNeuronLeaves::WholeForward(forward) => forward.eval(&input, ev),
             VllmNeuronLeaves::SegmentedForward(_) => {
@@ -559,7 +596,13 @@ impl IterwiseUnifiedModel for Llama3VllmNeuronModel {
                 lower_segmented_input(batch, self.max_model_len, &self.decode_buckets, geometry)
                     .map(|_| ())
             }
-            None => lower_input(batch, self.max_model_len, &self.decode_buckets).map(|_| ()),
+            None => lower_input(
+                batch,
+                self.max_model_len,
+                &self.prefill_buckets,
+                &self.decode_buckets,
+            )
+            .map(|_| ()),
         }
     }
 
@@ -627,7 +670,8 @@ mod tests {
     }
 
     fn bucket(n: usize, context: u32, buckets: &[u32]) -> Result<u32, String> {
-        lower_input(&decode(n, context), context, buckets).map(|input| input.token_bucket)
+        lower_input(&decode(n, context), context, &[context], buckets)
+            .map(|input| input.token_bucket)
     }
 
     #[test]
@@ -644,14 +688,14 @@ mod tests {
         assert_eq!(bucket(423, 512, &[1, 512]), Ok(512));
         assert!(bucket(424, 512, &[1, 512]).is_err());
         for (n, kv) in [(0, 512), (17, 512), (1, 0), (1, 513)] {
-            assert!(lower_input(&decode(n, kv), 512, &[1, 16]).is_err());
+            assert!(lower_input(&decode(n, kv), 512, &[512], &[1, 16]).is_err());
         }
         let mut bad = decode(1, 512);
         bad.groups[0].batch_tokens = 2;
-        assert!(lower_input(&bad, 512, &[1, 16]).is_err());
+        assert!(lower_input(&bad, 512, &[512], &[1, 16]).is_err());
         bad = decode(1, 512);
         bad.tokens_per_source_rank.push(1);
-        assert!(lower_input(&bad, 512, &[1, 16]).is_err());
+        assert!(lower_input(&bad, 512, &[512], &[1, 16]).is_err());
     }
 
     #[test]
@@ -665,19 +709,84 @@ mod tests {
             }],
             ..Default::default()
         };
-        let input = lower_input(&b, 512, &[1, 16]).unwrap();
+        let input = lower_input(&b, 512, &[512], &[1, 16]).unwrap();
         assert_eq!(input.phase, NeuronLlamaForwardPhase::Prefill);
         assert_eq!(input.token_bucket, 512);
         b.groups[0].prefill_chunk_pairs[0].0 = 1;
-        assert!(lower_input(&b, 512, &[1, 16]).is_err());
+        assert!(lower_input(&b, 512, &[512], &[1, 16]).is_err());
         b.groups[0].prefill_chunk_pairs[0] = (0, 513);
-        assert!(lower_input(&b, 512, &[1, 16]).is_err());
+        assert!(lower_input(&b, 512, &[512], &[1, 16]).is_err());
         b.groups[0].prefill_chunk_pairs[0] = (0, 504);
         b.groups[0].decode_kv_lens.push(10);
-        assert!(lower_input(&b, 512, &[1, 16]).is_err());
+        assert!(lower_input(&b, 512, &[512], &[1, 16]).is_err());
         b.groups[0].decode_kv_lens.clear();
         b.groups[0].prefill_chunk_pairs.push((0, 504));
-        assert!(lower_input(&b, 512, &[1, 16]).is_err());
+        assert!(lower_input(&b, 512, &[512], &[1, 16]).is_err());
+    }
+
+    #[test]
+    fn prefill_pads_to_the_smallest_compiled_prefill_graph() {
+        let prompt = |q: u32| UnifiedArchInput {
+            groups: vec![ArchGroupInput {
+                prefill_chunk_pairs: vec![(0, q)],
+                prefill_tokens: q,
+                batch_tokens: q,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let inventory = [128, 256, 384, 512];
+        for (q, bucket) in [(1, 128), (128, 128), (129, 256), (300, 384), (512, 512)] {
+            let input = lower_input(&prompt(q), 512, &inventory, &[1, 16]).unwrap();
+            assert_eq!(
+                (input.phase, input.token_bucket),
+                (NeuronLlamaForwardPhase::Prefill, bucket)
+            );
+        }
+        assert!(lower_input(&prompt(513), 512, &inventory, &[1, 16]).is_err());
+        // Smaller prefill graphs are whole-forward rows only.
+        let mut parallel = VllmNeuronParallel {
+            gpu_name: "AWS Trainium2 LNC2".into(),
+            max_model_len: 512,
+            decode_buckets: vec![1, 16],
+            tp_size: 4,
+            composition: VllmNeuronComposition::WholeForward,
+            prefill_segment_size: None,
+            prefill_buckets: inventory.to_vec(),
+        };
+        let cfgs = build_configs(&ModelCfg::llama3_8b(), &parallel);
+        validate_selected(&cfgs.forward, cfgs.composition, cfgs.segmented.as_ref()).unwrap();
+        for composition in [
+            VllmNeuronComposition::ModelHeadRegions,
+            VllmNeuronComposition::LayerSegments,
+        ] {
+            parallel.composition = composition;
+            let cfgs = build_configs(&ModelCfg::llama3_8b(), &parallel);
+            assert!(
+                validate_selected(&cfgs.forward, cfgs.composition, cfgs.segmented.as_ref())
+                    .is_err()
+            );
+        }
+        parallel.composition = VllmNeuronComposition::WholeForward;
+        parallel.max_model_len = 16384;
+        parallel.prefill_buckets = vec![2048, 16384];
+        parallel.prefill_segment_size = Some(2048);
+        let cfgs = build_configs(&ModelCfg::llama3_8b(), &parallel);
+        assert!(
+            validate_selected(&cfgs.forward, cfgs.composition, cfgs.segmented.as_ref()).is_err()
+        );
+        parallel.max_model_len = 512;
+        parallel.prefill_buckets = inventory.to_vec();
+        parallel.prefill_segment_size = None;
+        // `[C]` spells the default inventory and builds the default config.
+        parallel.prefill_buckets = vec![512];
+        let spelled = build_configs(&ModelCfg::llama3_8b(), &parallel).forward;
+        parallel.prefill_buckets = vec![];
+        assert_eq!(
+            spelled,
+            build_configs(&ModelCfg::llama3_8b(), &parallel).forward
+        );
+        validate_selected(&spelled, parallel.composition, None).unwrap();
     }
 
     #[test]
@@ -690,6 +799,7 @@ mod tests {
             tp_size: 4,
             composition: VllmNeuronComposition::WholeForward,
             prefill_segment_size: None,
+            prefill_buckets: vec![],
         };
         let resolved = resolve_configs(&build_configs(&model, &parallel));
         assert_eq!(resolved.kv_bytes_per_token, 131_072);
@@ -739,6 +849,7 @@ mod tests {
             tp_size: 4,
             composition: VllmNeuronComposition::ModelHeadRegions,
             prefill_segment_size: None,
+            prefill_buckets: vec![],
         };
         let resolved = resolve_configs(&build_configs(&ModelCfg::llama3_8b(), &parallel));
         assert_eq!(
@@ -763,6 +874,7 @@ mod tests {
             tp_size: 4,
             composition: VllmNeuronComposition::LayerSegments,
             prefill_segment_size: None,
+            prefill_buckets: vec![],
         };
         let resolved = resolve_configs(&build_configs(&ModelCfg::llama3_8b(), &parallel));
         for segment in [
@@ -851,6 +963,7 @@ mod tests {
             tp_size: 4,
             composition: VllmNeuronComposition::WholeForward,
             prefill_segment_size: Some(2048),
+            prefill_buckets: vec![],
         };
         let cfgs = build_configs(&ModelCfg::llama3_8b(), &parallel);
         let segmented = cfgs.segmented.as_ref().unwrap();

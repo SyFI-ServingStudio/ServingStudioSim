@@ -42,7 +42,32 @@ pub struct NeuronLlamaForwardKernelConfig {
     pub dtype: DType,
     /// Exact compiled variants to profile/cache; not an interpolation grid.
     pub decode_buckets: Vec<u32>,
+    /// Compiled prefill buckets (`num_batched_tokens_buckets`). They are
+    /// ascending multiples of `PREFILL_BUCKET_STEP`, and the last one is the
+    /// context. Empty means the single whole-context graph `[max_model_len]`,
+    /// the stock default of this repository.
+    #[serde(default)]
+    pub prefill_buckets: Vec<u32>,
 }
+
+impl NeuronLlamaForwardKernelConfig {
+    /// The prefill inventory this engine compiles; `[max_model_len]` when unset.
+    pub fn prefill_inventory(&self) -> std::borrow::Cow<'_, [u32]> {
+        if self.prefill_buckets.is_empty() {
+            std::borrow::Cow::Owned(vec![self.max_model_len.get()])
+        } else {
+            std::borrow::Cow::Borrowed(&self.prefill_buckets)
+        }
+    }
+}
+
+/// Token step of a compiled prefill bucket. vllm-neuron accepts any ascending
+/// positive buckets (`vllm_neuron/utils/bucket_utils.py`,
+/// `validate_num_batched_tokens_buckets`). This repository also requires
+/// multiples of 128: vllm-neuron's default buckets start at 128 and double,
+/// and only multiples of 128 are measured. `stock_contract.PREFILL_BUCKET_STEP`
+/// mirrors this value.
+pub const PREFILL_BUCKET_STEP: u32 = 128;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NeuronLlamaForwardKernelInput {
@@ -136,12 +161,25 @@ impl KernelSpec for NeuronLlamaForwardSpec {
                     .all(|pair| pair[0] < pair[1]),
             "decode buckets must be sorted unique powers of two within the verified context limit"
         );
+        // vllm-neuron requires the last prefill bucket to equal
+        // max_num_batched_tokens, which the stock engine sets to the context.
+        let prefill = config.prefill_inventory();
+        anyhow::ensure!(
+            prefill.last() == Some(&context)
+                && prefill
+                    .iter()
+                    .all(|&t| t > 0 && t % PREFILL_BUCKET_STEP == 0)
+                && prefill.windows(2).all(|pair| pair[0] < pair[1]),
+            "prefill buckets must be sorted unique multiples of {PREFILL_BUCKET_STEP} ending at \
+             the context {context}"
+        );
         Ok(())
     }
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
-        // At most 11 feasible entries, including the one prefill executable.
-        SweepGrid::new(vec![Axis::values(0..=config.decode_buckets.len() as u32)])
+        // Index: each prefill bucket, then each decode bucket.
+        let variants = config.prefill_inventory().len() + config.decode_buckets.len();
+        SweepGrid::new(vec![Axis::values(0..variants as u32)])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -149,21 +187,17 @@ impl KernelSpec for NeuronLlamaForwardSpec {
     }
 
     fn cache_coords(config: &Self::Config, input: &Self::Input) -> Coords {
+        let prefill = config.prefill_inventory();
         let index = match input.phase {
-            NeuronLlamaForwardPhase::Prefill => {
-                assert_eq!(
-                    input.token_bucket,
-                    config.max_model_len.get(),
-                    "prefill input must name the configured compiled context bucket"
-                );
-                0
-            }
+            NeuronLlamaForwardPhase::Prefill => prefill
+                .binary_search(&input.token_bucket)
+                .expect("prefill input must name a configured compiled prefill bucket"),
             NeuronLlamaForwardPhase::Decode => {
                 config
                     .decode_buckets
                     .binary_search(&input.token_bucket)
                     .expect("decode input must name a configured compiled bucket")
-                    + 1
+                    + prefill.len()
             }
         };
         Coords::new([index as f64])
@@ -180,14 +214,15 @@ impl KernelSpec for NeuronLlamaForwardSpec {
                 "compiled variant index must be a nonnegative integer"
             );
             let index = coordinate as usize;
-            let (phase, token_bucket) = if index == 0 {
-                (NeuronLlamaForwardPhase::Prefill, config.max_model_len.get())
+            let prefill = config.prefill_inventory();
+            let (phase, token_bucket) = if index < prefill.len() {
+                (NeuronLlamaForwardPhase::Prefill, prefill[index])
             } else {
                 (
                     NeuronLlamaForwardPhase::Decode,
                     *config
                         .decode_buckets
-                        .get(index - 1)
+                        .get(index - prefill.len())
                         .expect("compiled variant index exceeds inventory"),
                 )
             };
@@ -221,6 +256,57 @@ mod tests {
             tp_size: 4.into(),
             dtype: DType::Bf16,
             decode_buckets: vec![1, 16],
+            prefill_buckets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prefill_inventory_defaults_to_the_context_and_indexes_before_decode() {
+        let mut config = config();
+        assert_eq!(*config.prefill_inventory(), [512]);
+        config.prefill_buckets = vec![128, 256, 384, 512];
+        NeuronLlamaForwardSpec::validate_config(&config).unwrap();
+        let grid = NeuronLlamaForwardSpec::sweep_grid(&config);
+        assert_eq!(grid.axes()[0], [0., 1., 2., 3., 4., 5.]);
+        let rows = NeuronLlamaForwardSpec::enumerate(&config, &grid, "vllm_neuron");
+        let fields: Vec<_> = rows
+            .iter()
+            .map(|r| serde_json::to_value(r.fields()).unwrap())
+            .collect();
+        assert_eq!(
+            (
+                fields[1]["phase"].as_str(),
+                fields[1]["token_bucket"].as_u64()
+            ),
+            (Some("prefill"), Some(256))
+        );
+        assert_eq!(
+            (
+                fields[4]["phase"].as_str(),
+                fields[4]["token_bucket"].as_u64()
+            ),
+            (Some("decode"), Some(1))
+        );
+        let at = |phase, token_bucket| {
+            NeuronLlamaForwardSpec::cache_coords(
+                &config,
+                &NeuronLlamaForwardKernelInput {
+                    phase,
+                    token_bucket,
+                },
+            )
+        };
+        assert_eq!(&*at(NeuronLlamaForwardPhase::Prefill, 384), &[2.]);
+        assert_eq!(&*at(NeuronLlamaForwardPhase::Decode, 16), &[5.]);
+        assert!(std::panic::catch_unwind(|| at(NeuronLlamaForwardPhase::Prefill, 300)).is_err());
+        for bad in [
+            vec![128, 256],
+            vec![100, 512],
+            vec![256, 128, 512],
+            vec![512, 1024],
+        ] {
+            config.prefill_buckets = bad;
+            assert!(NeuronLlamaForwardSpec::validate_config(&config).is_err());
         }
     }
 

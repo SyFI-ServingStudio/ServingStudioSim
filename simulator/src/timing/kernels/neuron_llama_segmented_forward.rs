@@ -34,6 +34,7 @@ pub const SEGMENT_SIZES: [u32; 4] = [512, 1024, 2048, 4096];
 
 /// Output tokens every profiled prompt leaves room for: the grid covers
 /// prompts of up to `max_model_len - PROMPT_TAIL` tokens.
+/// `stock_contract.VALIDATION_OUTPUT_TOKENS` mirrors this value.
 pub const PROMPT_TAIL: u32 = 8;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -77,6 +78,9 @@ impl NeuronLlamaSegmentedForwardKernelConfig {
             tp_size: self.tp_size.clone(),
             dtype: self.dtype,
             decode_buckets: self.decode_buckets.clone(),
+            // Empty: the shared layout checks need only the runtime identity.
+            // This engine compiles its own S-token prefill graph.
+            prefill_buckets: Vec::new(),
         }
     }
 }
