@@ -152,4 +152,30 @@ register(
     )
 )
 
+# TensorFold perf-study 6469730a `glue.embedding` on its bf16 token table:
+# `q.weight[ids.to(torch.int64)]`, an id cast and Torch's row gather in
+# TensorFold's own Torch 2.14.1+cu130. No capability rule.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="tensorfold_torch",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.embedding.embedding_row_gather",
+            function_name="profile_embedding_row_gather_tensorfold_torch",
+        ),
+        table_name=KIND,
+        args_schema=EmbeddingRowGatherArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        supports=BackendSupport(compute=frozenset({DType.BF16})),
+        subprocess_env="tensorfold_env",
+        doc=BackendDoc(
+            summary=(
+                "TensorFold's token embedding (glue.embedding on a bf16 table): the int32 id "
+                "cast and the row gather, one head, device only."
+            ),
+        ),
+    )
+)
+
 __all__ = ["EmbeddingRowGatherArgs", "KIND"]

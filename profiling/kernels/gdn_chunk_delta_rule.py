@@ -110,7 +110,11 @@ DOC = KernelDoc(
         "boundaries are allocated before the capture."
     ),
     caveats=(
-        "Each call starts from an all-zero state.",
+        "flashinfer: each call starts from an all-zero state.",
+        "tensorfold_chain: one launch per sequence (TensorFold loops its "
+        "prefill chain per stream), so N sequences are N back-to-back "
+        "launches, each from its own nonzero fp32 state; key and value head "
+        "dims of 128 only.",
         "The 64-token width appears only in the FLOP estimate; bytes count "
         "minimum logical traffic, not physical traffic.",
     ),
@@ -146,5 +150,43 @@ register(
             url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/gdn_prefill.py",
         ),
         subprocess_env="vllm_env",
+    )
+)
+
+
+# TensorFold's prefill chain (perf-study 6469730a, tensorfold/cuda/kernels/
+# gdn.py `chain` -> gdn_prefill.cu `chain_kernel`): the same operation as above
+# (L2-normalized q/k, exponentiated decay and beta in fp32 from a separate
+# `_gdn_pre` launch; per-row bf16 output and the fp32 final state out), but one
+# sequence per launch, so the runner realizes the kind's canonical partition as
+# one call per sequence. bf16 q/k/v (production `_gdn_pre` writes bf16; gdn.cpp
+# `prefill` hard-codes 128-wide heads). TensorFold's `cuda.build.load` refuses
+# a GPU below compute capability 8.9 (MIN_CAPABILITY). It runs in TensorFold's
+# own venv (Torch cu130 it JITs against).
+TENSORFOLD_CHAIN = "tensorfold_chain"
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend=TENSORFOLD_CHAIN,
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            min_compute_capability=(8, 9),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.gdn_chunk_delta_rule_tensorfold",
+            function_name="profile_gdn_chunk_delta_rule_tensorfold_chain",
+        ),
+        table_name=KIND,
+        args_schema=GdnChunkDeltaRuleArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "TensorFold's CUDA prefill chain (chain_kernel): a serial fp32 "
+                "delta-rule walk, one launch per sequence."
+            ),
+        ),
+        subprocess_env="tensorfold_env",
     )
 )

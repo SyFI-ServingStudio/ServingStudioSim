@@ -117,6 +117,7 @@ DOC = KernelDoc(
         "The fp8 path needs fp8 queries and KV with a non-fp8 output, so bf16 "
         "queries over an fp8 cache are not measured.",
         "cudnn measures only prefix_len = 0 and no fp8.",
+        "tensorfold_pattn measures bf16 with head_dim 64, 128 or 256 only.",
     ),
     # No separate PyTorch reference implementation exists for this attention kind.
     reference=None,
@@ -149,3 +150,40 @@ for _backend in _BACKENDS:
             doc=_BACKEND_DOCS[_backend],
         )
     )
+
+
+# TensorFold's prompt attention (perf-study 6469730a,
+# tensorfold/cuda/kernels/prefill_attention.py `attention`): one stream's causal
+# chunk over its contiguous bf16 cache, the same contract as above with
+# p0 = prefix_len and W = append_len. bf16 q/kv/o only (the CUDA kernel is bf16
+# mma.sync; `_check` takes head_dim 64/128/256). TensorFold's `cuda.build.load`
+# refuses a GPU below compute capability 8.9 (MIN_CAPABILITY), so that is the
+# device floor. It runs in TensorFold's own venv (Torch cu130 it JITs against).
+TENSORFOLD_PATTN = "tensorfold_pattn"
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend=TENSORFOLD_PATTN,
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            min_compute_capability=(8, 9),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.flashinfer_attn_prefill_tensorfold",
+            function_name="profile_flashinfer_attn_prefill_tensorfold_pattn",
+        ),
+        table_name=KIND,
+        args_schema=FlashinferAttnPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="tensorfold_env",
+        doc=BackendDoc(
+            summary=(
+                "TensorFold's CUDA prompt attention (pattn_kernel), one stream's "
+                "chunk over its contiguous bf16 cache."
+            )
+        ),
+    )
+)

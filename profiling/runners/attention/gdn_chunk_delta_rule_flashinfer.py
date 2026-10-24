@@ -30,9 +30,16 @@ from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.attention._gdn_common import (
+    canonical_sequence_boundaries as _canonical_sequence_boundaries,
+)
+from profiling.runners.attention._gdn_common import (
+    chunk_delta_rule_logical_bytes,
+    chunk_delta_rule_semantic_flops,
+    load_required_callable,
+)
+from profiling.runners.attention._gdn_common import (
     exact_int as _exact_int,
 )
-from profiling.runners.attention._gdn_common import load_required_callable
 from profiling.runners.exceptions import (
     KernelLaunchFailed,
     OOMError,
@@ -43,9 +50,6 @@ from profiling.runners.metrics import ComputeMetrics
 _BACKEND = "gdn_chunk_delta_rule:flashinfer"
 _CALLABLE_MODULE = "flashinfer.gdn_prefill"
 _CALLABLE_NAME = "chunk_gated_delta_rule"
-# FlashInfer chooses its own chunk width internally; this constant only sizes
-# the semantic FLOP estimate below, never the launch.
-_SEMANTIC_CHUNK = 64
 
 
 @dataclass(frozen=True)
@@ -84,28 +88,6 @@ def _validate_args(
     if args.dtype is not DType.BF16:
         raise ProfilerNotImplemented(f"{_BACKEND} supports bf16 only, got {args.dtype}")
     return args
-
-
-def _canonical_sequence_boundaries(
-    num_tokens: int, max_sequence_length: int
-) -> list[int]:
-    """`num_tokens // max` full-length sequences, then the remainder.
-
-    This is the realization chunked prefill produces, not a modelling
-    convenience: vLLM fills its token budget with whole chunks and leaves one
-    short tail, so a capture iteration of 8185 tokens arrives as 8163 + 22. A
-    *balanced* partition of the same two numbers would halve the sequential
-    inter-chunk critical path and under-measure the kernel by ~2x, which is why
-    the second axis is a length rather than a sequence count.
-    """
-    full_count, remainder = divmod(num_tokens, max_sequence_length)
-    lengths = [max_sequence_length] * full_count
-    if remainder:
-        lengths.append(remainder)
-    boundaries = [0]
-    for length in lengths:
-        boundaries.append(boundaries[-1] + length)
-    return boundaries
 
 
 def profile_gdn_chunk_delta_rule_flashinfer(
@@ -199,8 +181,8 @@ def profile_gdn_chunk_delta_rule_flashinfer(
     except Exception as exc:
         raise KernelLaunchFailed(f"{_BACKEND} failed") from exc
 
-    flops = _semantic_flops(args)
-    logical_bytes = _logical_bytes(args)
+    flops = chunk_delta_rule_semantic_flops(args)
+    logical_bytes = chunk_delta_rule_logical_bytes(args)
     return ComputeMetrics(
         time_ms=float(time_ms),
         tflops=float(flops / (time_ms / 1000.0) / 1e12) if time_ms > 0 else 0.0,
@@ -209,36 +191,3 @@ def profile_gdn_chunk_delta_rule_flashinfer(
         ),
         energy_j=float(energy_j),
     )
-
-
-def _semantic_flops(args: _Args) -> float:
-    """Logical MACs×2 of the chunked delta rule, at the canonical chunk width.
-
-    Per token the recurrence touches the whole `key_head_dim × value_head_dim`
-    state twice (scan-in and read-out); the intra-chunk terms (K·Kᵀ, the
-    triangular solve, and the attention-like output) each scale with the chunk
-    width rather than the sequence, which is exactly why chunking exists.
-    """
-    tokens = float(args.num_tokens)
-    state = 2.0 * args.key_head_dim * args.value_head_dim * args.num_heads
-    intra = 2.0 * _SEMANTIC_CHUNK * (
-        args.num_key_heads * args.key_head_dim + args.num_heads * args.value_head_dim
-    )
-    return tokens * 2.0 * (state + intra)
-
-
-def _logical_bytes(args: _Args) -> float:
-    """Minimum traffic the operation implies: operands in, output and state out."""
-    qk = 2.0 * args.num_tokens * args.num_key_heads * args.key_head_dim * 2
-    value_and_output = 2.0 * args.num_tokens * args.num_heads * args.value_head_dim * 2
-    gates = 2.0 * args.num_tokens * args.num_heads * 4
-    sequence_count = -(-args.num_tokens // args.max_sequence_length)
-    states = (
-        2.0
-        * sequence_count
-        * args.num_heads
-        * args.key_head_dim
-        * args.value_head_dim
-        * 4
-    )
-    return qk + value_and_output + gates + states

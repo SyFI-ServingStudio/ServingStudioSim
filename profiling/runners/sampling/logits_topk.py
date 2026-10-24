@@ -5,6 +5,18 @@ Both entry points time exactly what vLLM's `logits_processor._topk` runs —
 imports, `torch.topk(scores, k, dim=-1)` otherwise. Neither is a rewrite: the
 runner only allocates the operand and calls the public function.
 
+The `tensorfold_torch` entry times TensorFold's call (perf-study 6469730a),
+`torch.topk(scores, k, dim=-1, sorted=False)` on fp32 scores, in TensorFold's
+own Torch (2.14.1+cu130). Two call sites make it: the DFlash2 drafter head
+(`families/qwen3_5/cuda/dflash2.py` `launch_blocks`, k = 16 over the
+98,592-column vocabulary subset, one row per drafted position) and target
+sampling (`cuda/sampling.py` `sample_streams`, k = top_k + MARGIN over the full
+vocabulary, one row per verify-window row). Both pass `logits.float()`: the
+bf16-to-fp32 cast (and `sample_streams`' row `cat`) are separate launches
+before the call and are not part of this kind. Torch's multi-block radix select
+(`computeBlockDigitCounts` per radix digit, `gatherTopK`, the CUB scans) is a
+fixed launch sequence, so CUPTI counts every launch (`kernel_name=None`).
+
 `flashinfer.top_k` is a fixed multi-launch sequence, not a single kernel: the
 selection pass (`RadixTopKKernel_Unified` for a wide matrix,
 `FilteredTopKUnifiedKernel` + `FinalizeTopKIndicesKernel` for a narrow one)
@@ -25,6 +37,8 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _SEED = 0
+# Rows of the tensorfold_torch selection checked against a full sort.
+_CHECK_ROWS = 16
 
 
 @dataclass(frozen=True)
@@ -189,5 +203,65 @@ def profile_logits_topk_flashinfer(
         return _metrics(args, time_ms, energy_j)
     except torch.OutOfMemoryError as exc:
         raise OOMError("flashinfer logits_topk ran out of CUDA memory") from exc
+    except (RuntimeError, AssertionError) as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
+def _check_unsorted_selection(torch: Any, scores: Any, top_k: int, values: Any, indices: Any) -> None:
+    """``sorted=False`` returns the top-k set in an unspecified order: compare it as a set.
+
+    The reference is an independent full sort of each checked row, so a
+    selection bug in the radix path (a wrong k-th boundary) moves a value and
+    fails here. Rows are selected independently, so the first
+    ``_CHECK_ROWS`` rows stand for all of them without sorting a 4 GB matrix.
+    """
+    scores, values, indices = scores[:_CHECK_ROWS], values[:_CHECK_ROWS], indices[:_CHECK_ROWS]
+    expected = torch.sort(scores.float(), dim=-1, descending=True).values[:, :top_k]
+    got = torch.sort(values.float(), dim=-1, descending=True).values
+    if got.shape != expected.shape or indices.shape != expected.shape:
+        raise RuntimeError(
+            f"torch.topk(sorted=False) returned {tuple(got.shape)} / {tuple(indices.shape)}, "
+            f"expected {tuple(expected.shape)}"
+        )
+    if not torch.equal(got, expected):
+        raise RuntimeError("torch.topk(sorted=False) selected a different set than a full sort")
+    if not torch.equal(scores.gather(1, indices.long()), values):
+        raise RuntimeError("torch.topk(sorted=False) indices do not point at its values")
+
+
+def profile_logits_topk_tensorfold_torch(
+    num_rows: int,
+    num_columns: int,
+    top_k: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    args = _validate_args(num_rows, num_columns, top_k, dtype)
+    if args.dtype is not DType.FP32:
+        # TensorFold always selects over `logits.float()`; a bf16 select is a
+        # call it never makes.
+        raise ProfilerNotImplemented(
+            f"logits_topk:tensorfold_torch selects over fp32 scores only, got {args.dtype.value}"
+        )
+    try:
+        import torch
+    except ImportError as exc:
+        raise ProfilerNotImplemented("torch is required for logits_topk") from exc
+
+    try:
+        scores = _build_scores(torch, args)
+
+        def kernel():
+            # The exact call dflash2.launch_blocks and sampling.sample_streams make.
+            return torch.topk(scores, args.top_k, dim=-1, sorted=False)
+
+        values, indices = kernel()
+        torch.cuda.synchronize()
+        _check_unsorted_selection(torch, scores, args.top_k, values, indices)
+
+        time_ms = Timer.cupti(kernel)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+        return _metrics(args, time_ms, energy_j)
+    except torch.OutOfMemoryError as exc:
+        raise OOMError("tensorfold_torch logits_topk ran out of CUDA memory") from exc
     except (RuntimeError, AssertionError) as exc:
         raise KernelLaunchFailed(str(exc)) from exc

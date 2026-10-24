@@ -13,6 +13,11 @@ kernel on an HBM table.
 path (``Qwen4ExpPLEDeviceEmbedding`` -> ``VocabParallelEmbedding`` at TP1 ->
 ``F.embedding``); ``residency=device`` only.
 
+``tensorfold_torch`` times TensorFold's token embedding,
+``tensorfold.families.qwen3_5.cuda.glue.embedding(ids, q)`` on a bf16 (``b16``)
+table (perf-study 6469730a): ``q.weight[ids.to(torch.int64)]`` of int32 ids, two
+launches (the id cast and the row gather), both counted. One head, bf16, HBM.
+
 The table is ``table_rows`` long, so the random gather sees the production
 footprint (51.2 GB on the 320M-row PLE table). It is filled once per worker
 process and reused across specs with the same key; a new key releases the old
@@ -42,10 +47,15 @@ from profiling.runners.metrics import ComputeMetrics
 
 KIND = "embedding_row_gather"
 _TRITON_KERNEL = "_lookup_ple_embedding_from_pinned_kernel"
-_BACKEND_RESIDENCY = {"vllm_triton": "host_uva", "torch": "device"}
+_BACKEND_RESIDENCY = {"vllm_triton": "host_uva", "torch": "device", "tensorfold_torch": "device"}
 # Table element dtype -> (bytes per element, torch dtype attribute).
 _DTYPES = {"fp8_e4m3": (1, "float8_e4m3fn"), "bf16": (2, "bfloat16")}
-_BACKEND_DTYPES = {"vllm_triton": ("fp8_e4m3",), "torch": ("fp8_e4m3", "bf16")}
+_BACKEND_DTYPES = {
+    "vllm_triton": ("fp8_e4m3",),
+    "torch": ("fp8_e4m3", "bf16"),
+    "tensorfold_torch": ("bf16",),
+}
+_GLUE = "tensorfold.families.qwen3_5.cuda.glue"
 _RESIDENCIES = ("host_uva", "device")
 # 400M rows x 160 B = 64 GB: above the 51.2 GB PLE table, inside what one
 # profiling job can pin or keep in HBM.
@@ -83,6 +93,8 @@ def validate_args(
         raise ProfilerNotImplemented(f"tables above {_MAX_TABLE_BYTES >> 30} GiB are not pinned")
     if residency not in _RESIDENCIES:
         raise ValueError(f"residency must be one of {_RESIDENCIES}")
+    if backend == "tensorfold_torch" and num_heads != 1:
+        raise ProfilerNotImplemented(f"{KIND}:{backend} gathers one token row an id (num_heads=1)")
     if residency != _BACKEND_RESIDENCY[backend]:
         raise ProfilerNotImplemented(
             f"{KIND}:{backend} runs only with residency={_BACKEND_RESIDENCY[backend]}"
@@ -223,6 +235,24 @@ def _profile(backend: str, **args: Any) -> ComputeMetrics:
             if int(raw[0, 0].sum()) or int(raw[0, -1].sum()):
                 raise KernelLaunchFailed(f"{KIND}:{backend} out-of-table ids must give zero rows")
             kernel_name = _TRITON_KERNEL
+        elif backend == "tensorfold_torch":
+            try:
+                import importlib
+
+                embedding = importlib.import_module(_GLUE).embedding
+            except (ImportError, AttributeError) as exc:
+                raise ProfilerNotImplemented(f"{KIND}:{backend} needs {_GLUE}.embedding") from exc
+            # TensorFold's ids arrive as int32 (verify's packed plan, prefill's chunk).
+            pool = pool.reshape(pool.shape[0], -1).to(torch.int32)
+            q = SimpleNamespace(layout="b16", weight=table["table"].view(table_rows, head_dim))
+            got = embedding(pool[0], q)
+            torch.cuda.synchronize()
+            check_rows(torch, table, pool[0].long(), got)
+
+            def lookup(ids: Any, _out: None) -> None:
+                embedding(ids, q)
+
+            kernel_name = None
         else:
             weight = table["table"]
             torch.nn.functional.embedding(pool[0], weight)  # warm the dispatch
@@ -263,6 +293,11 @@ def profile_embedding_row_gather_vllm_triton(**args: Any) -> ComputeMetrics:
     return _profile("vllm_triton", **args)
 
 
+def profile_embedding_row_gather_tensorfold_torch(**args: Any) -> ComputeMetrics:
+    """Time TensorFold's bf16 token embedding (id cast plus row gather)."""
+    return _profile("tensorfold_torch", **args)
+
+
 def profile_embedding_row_gather_torch(**args: Any) -> ComputeMetrics:
     """Time one HBM ``F.embedding`` row gather."""
     return _profile("torch", **args)
@@ -272,6 +307,7 @@ __all__ = [
     "build_id_pool",
     "head_ranges",
     "logical_bytes",
+    "profile_embedding_row_gather_tensorfold_torch",
     "profile_embedding_row_gather_torch",
     "profile_embedding_row_gather_vllm_triton",
     "validate_args",

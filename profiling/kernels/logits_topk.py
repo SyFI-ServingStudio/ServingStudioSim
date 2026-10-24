@@ -12,6 +12,13 @@ rules out the cluster path and selects the `DET_FLAG` kernel specialization,
 sorted adds the on-device stable value sort), so profiling any other
 combination would measure a code path production never runs.
 
+The `tensorfold_torch` backend is TensorFold's own selection:
+`torch.topk(scores.float(), k, dim=-1, sorted=False)`, in the DFlash2 drafter
+head (k = 16 over a vocabulary subset) and in target sampling (k = top_k + 8
+over the full vocabulary). Its values come back unsorted; on GB10 the sort a
+`sorted=True` call adds is within 3% at k <= 28, and the selected set is the
+same. The bf16-to-fp32 cast before the call is a separate launch.
+
 The `torch` backend is the documented fallback `torch.topk(scores, k, dim=-1)`
 that `_topk` takes when flashinfer is missing; vLLM's own log line puts it at
 "roughly half the speed". It is also the numerical oracle the flashinfer runner
@@ -120,6 +127,34 @@ register(
                 "call vLLM's logits processor makes."
             ),
             url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/topk.py",
+        ),
+    )
+)
+
+# TensorFold (perf-study 6469730a) selects with plain torch.topk in its own
+# Torch 2.14.1+cu130, so the backend runs in tensorfold_env. Both call sites
+# pass fp32 (`logits.float()`) and sorted=False; Torch's radix select has no
+# capability floor of its own.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="tensorfold_torch",
+        supports=BackendSupport(compute=frozenset({DType.FP32})),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.sampling.logits_topk",
+            function_name="profile_logits_topk_tensorfold_torch",
+        ),
+        table_name=KIND,
+        args_schema=LogitsTopkArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="tensorfold_env",
+        doc=BackendDoc(
+            summary=(
+                "torch.topk(scores, k, dim=-1, sorted=False) over fp32 scores, as "
+                "TensorFold's DFlash2 drafter head and target sampling call it."
+            ),
+            url="https://github.com/efeslab/TensorFold",
         ),
     )
 )

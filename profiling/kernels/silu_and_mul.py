@@ -49,9 +49,16 @@ DOC = KernelDoc(
         "and its first call, at 8192 tokens or at the row's token count when larger, "
         "picks the launch config the row then uses, as vLLM's profile run at "
         "max_num_batched_tokens does. Every launch of the compiled block is counted. "
-        "vllm_cuda: the CUDA custom op writes into a preallocated output and is one launch."
+        "vllm_cuda: the CUDA custom op writes into a preallocated output and is one launch. "
+        "tensorfold_triton counts its one _swiglu launch."
     ),
-    caveats=("GB/s counts the two input halves and the output once each.",),
+    caveats=(
+        "GB/s counts the two input halves and the output once each.",
+        "tensorfold_triton reads both halves in place from the stacked [gate | up] "
+        "projection output and also writes fp32 sums of the output over each 64-element "
+        "group (hidden_dim / 64 floats a row, about 3% more bytes than the output row), "
+        "which GB/s does not count.",
+    ),
     reference="profiling.runners.elementwise.silu_and_mul_reference",
 )
 
@@ -104,6 +111,39 @@ register(
         doc=BackendDoc(
             summary="vLLM's SiluAndMul.forward_cuda: the torch.ops._C.silu_and_mul custom op.",
             url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/activation_kernels.cu",
+        ),
+    )
+)
+
+# TensorFold perf-study 6469730a, tensorfold/families/qwen3_5/cuda/glue.py
+# `swiglu_stacked(gu)`: the Triton `_swiglu` on grid (tokens, cdiv(hidden_dim,
+# 1024)), four warps a program, reading gate and up from one [gate | up] row
+# (LD = 2 * hidden_dim). It casts to tl.bfloat16, so bf16 only; plain Triton,
+# so Triton's sm_80 bf16 floor. It runs in TensorFold's own venv.
+TENSORFOLD_TRITON = "tensorfold_triton"
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend=TENSORFOLD_TRITON,
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            min_compute_capability=(8, 0),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.elementwise.silu_and_mul_tensorfold_triton",
+            function_name="profile_silu_and_mul_tensorfold_triton",
+        ),
+        table_name=KIND,
+        args_schema=SiluAndMulArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="tensorfold_env",
+        doc=BackendDoc(
+            summary=(
+                "TensorFold's Triton _swiglu on the stacked [gate | up] projection output "
+                "(swiglu_stacked), which also writes 64-element group sums of the output."
+            ),
         ),
     )
 )

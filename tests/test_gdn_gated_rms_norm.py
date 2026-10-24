@@ -42,7 +42,7 @@ def test_registration_table_kind_runner_and_support_contract() -> None:
     spec = find_kernel_profiler_spec(KIND, "torch")
 
     assert KIND == "gdn_gated_rms_norm"
-    assert known_backends(KIND) == ["torch", "vllm_triton"]
+    assert known_backends(KIND) == ["torch", "vllm_triton", "tensorfold_triton"]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.backend == "torch"
     assert spec.args_schema is GdnGatedRmsNormArgs
@@ -437,3 +437,37 @@ def test_db_round_trip_uses_exact_schema_and_compute_metrics(
         perf_api.count_missing_gdn_gated_rms_norm([_SPEC], backend="torch", gpu_name="NVIDIA H200")
         == 0
     )
+
+
+def test_tensorfold_triton_runs_in_tensorfold_env_and_is_bf16_only() -> None:
+    # Catches the row landing on the project venv (no TensorFold) or advertising
+    # fp16, which the Triton kernel's hard tl.bfloat16 casts would miscompute.
+    spec = find_kernel_profiler_spec(KIND, "tensorfold_triton")
+    assert spec.subprocess_env == "tensorfold_env"
+    assert spec.args_schema is GdnGatedRmsNormArgs
+    assert spec.table_name == KIND
+    assert spec.supports.allows(DType.BF16, gpu="NVIDIA GB10")
+    assert not spec.supports.allows(DType.FP16, gpu="NVIDIA GB10")
+
+
+@pytest.mark.parametrize(("hidden", "dtype"), [(128, "fp16"), (192, "bf16"), (32, "bf16")])
+def test_tensorfold_triton_refuses_shapes_the_kernel_cannot_run(hidden: int, dtype: str) -> None:
+    # Catches fp16 (cast to bf16 in the kernel) or a width that is not a power
+    # of two multiple of 64 (tl.arange / group-sum reshape) reaching a launch.
+    from profiling.runners.attention.gdn_gated_rms_norm_tensorfold_triton import validate_args
+    from profiling.runners.exceptions import ProfilerNotImplemented
+
+    with pytest.raises(ProfilerNotImplemented):
+        validate_args(64, hidden, dtype)
+
+
+@pytest.mark.parametrize(
+    ("m", "heads"), [(1, 1), (48, 16), (96, 32), (768, 64), (1152, 64), (32, 32), (524288, 64)]
+)
+def test_tensorfold_triton_head_split_keeps_production_head_strided_order(m: int, heads: int) -> None:
+    # Catches a regression to a flat (m, 1, hidden) launch, which runs up to
+    # ~15% faster than TensorFold's (tokens, heads) grid once traffic leaves L2.
+    from profiling.runners.attention.gdn_gated_rms_norm_tensorfold_triton import heads_per_row
+
+    assert heads_per_row(m) == heads
+    assert m % heads_per_row(m) == 0

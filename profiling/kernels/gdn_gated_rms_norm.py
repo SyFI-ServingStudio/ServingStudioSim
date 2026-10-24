@@ -54,12 +54,18 @@ DOC = KernelDoc(
     method=(
         f"{CUPTI_METHOD} "
         "torch counts every launch of the reference; vllm_triton counts only "
-        "layer_norm_fwd_kernel. Allocation and the vLLM output check run before"
-        " timing."
+        "layer_norm_fwd_kernel and tensorfold_triton only _gated_norm. Allocation "
+        "and the output checks run before timing."
     ),
     caveats=(
         "torch uses several launches; vllm_triton fuses normalization and gating in one.",
         "GB/s counts logical input and output bytes, not the torch backend's FP32 intermediates.",
+        "tensorfold_triton also writes fp32 sums of the output over each 64-element group, "
+        "hidden/64 floats a row (about 3% more bytes than one bf16 output row), which GB/s "
+        "does not count. TensorFold launches one program per (token, value head) with heads on "
+        "the slow grid axis; the kind has no head count, so the runner splits m into token rows "
+        "of 64 heads (the largest power of two up to 64 dividing m) to keep that head-strided "
+        "order, which runs slower than a flat launch once traffic leaves L2.",
     ),
     reference="profiling.runners.attention.gdn_gated_rms_norm_reference",
 )
@@ -106,5 +112,40 @@ register(
             url="https://github.com/vllm-project/vllm/blob/main/vllm/third_party/flash_linear_attention/ops/layernorm_guard.py",
         ),
         subprocess_env="vllm_env",
+    )
+)
+
+# TensorFold perf-study 6469730a, tensorfold/families/qwen3_5/cuda/glue.py
+# `gated_norm(y, z, w, eps)`: the Triton `_gated_norm`, one single-warp program
+# per (token, value head), bf16(silu(z) * rmsnorm(y) * w) plus fp32 64-group
+# sums. Called by forward.py (verify) and, via prefill_bf16, prefill.py. The
+# kernel casts to tl.bfloat16, so bf16 only. It is plain Triton (no TensorFold
+# CUDA extension); Triton's bf16 needs sm_80, so that is the device floor. It
+# runs in TensorFold's own venv.
+TENSORFOLD_TRITON = "tensorfold_triton"
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend=TENSORFOLD_TRITON,
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            min_compute_capability=(8, 0),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.gdn_gated_rms_norm_tensorfold_triton",
+            function_name="profile_gdn_gated_rms_norm_tensorfold_triton",
+        ),
+        table_name=KIND,
+        args_schema=GdnGatedRmsNormArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="tensorfold_env",
+        doc=BackendDoc(
+            summary=(
+                "TensorFold's Triton _gated_norm: one launch, a program per token and value "
+                "head, that also writes 64-element group sums of the output."
+            ),
+        ),
     )
 )

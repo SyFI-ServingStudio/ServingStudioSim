@@ -92,8 +92,17 @@ DOC = KernelDoc(
 
 # `torch` runs in the main environment; `torch_vllm` is the same runner in
 # vLLM's pinned environment, for a model whose rows must come from the
-# serving build.
-for _backend, _env in (("torch", None), ("torch_vllm", "vllm_env")):
+# serving build; `tensorfold_torch` the same in TensorFold's (Torch
+# 2.14.1+cu130), for its commit gathers (`forward.py` `_commit`: conv picks,
+# KV takes, and the multi-stream engine's tap rows). TensorFold's few-row
+# commit gathers every GDN layer's window at once with index_select(1, pick)
+# on [layers, rows, C]; on GB10 that times as index_select(0) of the same
+# picks with layers * C elements a row (within 4% at 3 and 6 picks).
+for _backend, _env in (
+    ("torch", None),
+    ("torch_vllm", "vllm_env"),
+    ("tensorfold_torch", "tensorfold_env"),
+):
     register(
         KernelProfilerSpec(
             kernel_kind=KIND,

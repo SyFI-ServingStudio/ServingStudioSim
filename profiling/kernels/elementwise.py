@@ -61,7 +61,10 @@ DOC = KernelDoc(
         "reads kN, a copy reads N, and a zero fill reads nothing. The byte counts "
         "cover the whole batch. The triton and torch backends work on uint8 "
         "buffers and round the input-to-output ratio to a whole fan-in; the "
-        "torch_strided_copy and torch_cat backends price one-input bf16 copies only."
+        "torch_strided_copy and torch_cat backends price one-input bf16 copies only. "
+        "The tensorfold_* backends each time one fixed TensorFold statement, so the "
+        "statement fixes the input-to-output ratio (a bf16 -> fp32 cast reads half its "
+        "output, rotary tables read nothing) and other ratios are refused."
     ),
     category="Other",
     formula=(
@@ -152,5 +155,96 @@ for _backend, _runner_module, _function, _env in (
                 summary=_summary,
             ),
             subprocess_env=_env,
+        )
+    )
+
+
+# TensorFold (perf-study 6469730a) byte passes, all in TensorFold's own Torch
+# 2.14.1+cu130 (tensorfold_env). The first three reuse the eager runners above
+# because the production statement is the same Torch call; the rest each time
+# one fixed TensorFold statement (profiling/runners/elementwise/tensorfold.py).
+# Torch's kernels have no capability floor; `_paths` is plain Triton (sm_80).
+_TENSORFOLD = (
+    (
+        "tensorfold_torch",
+        "profiling.runners.elementwise.torch",
+        "profile_elementwise",
+        "Eager PyTorch byte map (bitwise_not, amax, zero_) for TensorFold's small "
+        "index and position launches (arange, int adds).",
+    ),
+    (
+        "tensorfold_torch_cat",
+        "profiling.runners.elementwise.torch",
+        "profile_elementwise_cat",
+        "torch.cat of contiguous bf16 inputs (CatArrayBatchedCopy_vectorized): conv-state, "
+        "commit, tap and sampling-row cats. GB10 A/B: 2, 8 or 48 inputs and any cat dim "
+        "time the same at equal bytes.",
+    ),
+    (
+        "tensorfold_torch_strided_copy",
+        "profiling.runners.elementwise.torch",
+        "profile_elementwise_strided_copy",
+        "copy_ from a non-contiguous bf16 view (elementwise_kernel direct_copy): the "
+        "drafter's window trims kc[:, -window:].contiguous() and reshape copies.",
+    ),
+    (
+        "tensorfold_torch_cast",
+        "profiling.runners.elementwise.tensorfold",
+        "profile_elementwise_cast",
+        "x.float() of bf16 (input:output 1:2, unrolled_elementwise_kernel) or "
+        "x.to(torch.bfloat16) of fp32 (2:1): logits and index casts.",
+    ),
+    (
+        "tensorfold_torch_fp32_add",
+        "profiling.runners.elementwise.tensorfold",
+        "profile_elementwise_fp32_add",
+        "(x.float() + y.float()).to(torch.bfloat16) of two bf16 tensors (2:1, four "
+        "launches): the DFlash2 tap at each tapped target layer.",
+    ),
+    (
+        "tensorfold_torch_foreach_copy",
+        "profiling.runners.elementwise.tensorfold",
+        "profile_elementwise_foreach_copy",
+        "torch._foreach_copy_ of bf16 tensors (one multi_tensor_apply_kernel): the "
+        "commit's conv-window and KV-row copies.",
+    ),
+    (
+        "tensorfold_torch_cat_strided",
+        "profiling.runners.elementwise.tensorfold",
+        "profile_elementwise_cat_strided",
+        "torch.cat of the DFlash2 head's [rows, 98304] span and a strided [rows, 288] "
+        "column slice (unvectorized CatArrayBatchedCopy); whole 98592-element rows only.",
+    ),
+    (
+        "tensorfold_torch_rotary",
+        "profiling.runners.elementwise.tensorfold",
+        "profile_elementwise_rotary",
+        "The DFlash2 drafter's _rotary(start, rows): arange, broadcast multiply, cos and "
+        "sin into fp32 [rows, 64] tables (input 0, output 512 bytes a row).",
+    ),
+    (
+        "tensorfold_triton_paths",
+        "profiling.runners.elementwise.tensorfold",
+        "profile_elementwise_paths",
+        "The tree-attention plan's Triton _paths: one int32 parent a verify row in, its "
+        "128-entry root path and depth out.",
+    ),
+)
+for _backend, _runner_module, _function, _summary in _TENSORFOLD:
+    register(
+        KernelProfilerSpec(
+            kernel_kind=KIND,
+            backend=_backend,
+            supports=BackendSupport(
+                compute=None,
+                min_compute_capability=(8, 0) if _backend == "tensorfold_triton_paths" else None,
+            ),
+            runner_ref=RunnerRef(module_name=_runner_module, function_name=_function),
+            table_name=KIND,
+            args_schema=ElementwiseArgs,
+            metric_family=MetricFamily.COMPUTE,
+            batch_outlier_policy=BatchOutlierPolicy(),
+            doc=BackendDoc(summary=_summary + " Runs in TensorFold's environment."),
+            subprocess_env="tensorfold_env",
         )
     )

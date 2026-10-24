@@ -79,7 +79,20 @@ def test_supported_backends_filters_options_by_dtype():
     assert supported_backends("single_gemm", DType.FP8_E4M3) == [
         "deepgemm",
         "flashinfer_fp8_tensor",
+        "tensorfold_lane",
+        "tensorfold_ck",
     ]
+    # TensorFold's checkpoint-math GEMMs are SM12x builds: GB10, not B200.
+    gb10 = supported_backends("single_gemm", DType.NVFP4_E2M1, gpu="NVIDIA GB10")
+    assert gb10 == ["tensorfold_lane", "tensorfold_ck"]
+    assert "tensorfold_lane" not in supported_backends(
+        "single_gemm", DType.NVFP4_E2M1, gpu="NVIDIA B200"
+    )
+    # The drafter's affine 4-bit lane matmul is the only w4a16_affine_g64 backend, SM12x only.
+    assert supported_backends("single_gemm", DType.W4A16_AFFINE_G64, gpu="NVIDIA GB10") == [
+        "tensorfold_qmm"
+    ]
+    assert supported_backends("single_gemm", DType.W4A16_AFFINE_G64, gpu="NVIDIA B200") == []
     # bmm_fp8's SM10x runners: per-tensor FP8 is not offered on Hopper.
     assert "flashinfer_fp8_tensor" not in supported_backends(
         "single_gemm", DType.FP8_E4M3, gpu="NVIDIA H200"
@@ -93,12 +106,15 @@ def test_supported_backends_filters_options_by_dtype():
         "torch_linear",
         "sglang_bf16_auto",
         "sglang_fused_a_auto",
+        "tensorfold_b16",
+        "tensorfold_b16_prompt",
     ]
     assert supported_backends("flashinfer_attn_prefill", DType.FP8_E4M3) == ["fa3"]
     assert set(supported_backends("flashinfer_attn_prefill", DType.BF16)) == {
         "fa2",
         "fa3",
         "cudnn",
+        "tensorfold_pattn",
     }
 
 

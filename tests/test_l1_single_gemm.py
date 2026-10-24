@@ -142,6 +142,11 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "flashinfer_fp8_tensor",
         "flashinfer_cutedsl",
         "flashinfer_mxfp8",
+        "tensorfold_lane",
+        "tensorfold_ck",
+        "tensorfold_qmm",
+        "tensorfold_b16",
+        "tensorfold_b16_prompt",
     }
 
 
@@ -1298,6 +1303,33 @@ def test_find_idle_gpus_respects_parent_cuda_visible_devices(
     assert find_idle_gpus() == [3, 1]
 
 
+def test_find_idle_gpus_reads_process_memory_on_unified_memory(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # GB10: the framebuffer reads N/A; only per-process usage is reported.
+    def gpu(*used_mib: int) -> str:
+        processes = "".join(
+            f"<process_info><used_memory>{mib} MiB</used_memory></process_info>"
+            for mib in used_mib
+        )
+        return (
+            "<gpu><fb_memory_usage><used>N/A</used></fb_memory_usage>"
+            "<utilization><gpu_util>0 %</gpu_util></utilization>"
+            f"<processes>{processes}</processes></gpu>"
+        )
+
+    xml = f"<nvidia_smi_log>{gpu(18, 60)}{gpu(18, 27580)}</nvidia_smi_log>"
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(
+        "profiling.exec.local.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=xml, stderr=""
+        ),
+    )
+
+    assert find_idle_gpus() == [0]
+
+
 def test_run_profile_batch_validates_specs_before_gpu_work():
     with pytest.raises(ValueError, match="missing required spec field 'k'"):
         run_profile_batch(
@@ -1583,6 +1615,7 @@ def test_documented_profile_env_registry_complete():
         "flashinfer_pip_env",
         "flashinfer_kda_env",
         "sglang_env",
+        "tensorfold_env",
         "vllm_env",
     }
     assert set(ENV_REGISTRY) == expected_envs

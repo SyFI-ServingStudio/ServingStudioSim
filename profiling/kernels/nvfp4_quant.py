@@ -25,7 +25,10 @@ class Nvfp4QuantArgs(KernelArgs):
     group_size: int = arg(unit="elements", doc="Elements sharing one FP4 scale.")
     input_dtype: DType = arg(doc="Element type of the input activations.")
     scale_format: str = arg(
-        doc="Encoding and layout of the output scales: linear_e4m3 or swizzled_e4m3."
+        doc=(
+            "Encoding and layout of the output scales: linear_e4m3, swizzled_e4m3 "
+            "or kslice_e4m3."
+        )
     )
 
 
@@ -41,12 +44,17 @@ DOC = KernelDoc(
         "128-row by 4-group tile layout that vLLM's default B200 NVFP4 linear "
         "GEMM reads, padded with zero scales to whole tiles. vLLM's MoE path "
         "uses a global scale of 1 and its linear path the calibrated input "
-        "scale; FlashInfer, on SGLang's path, also writes a per-token FP32 scale."
+        "scale; FlashInfer, on SGLang's path, also writes a per-token FP32 scale. "
+        "kslice_e4m3, tensorfold_cuda only, writes them as [hidden_size/64, "
+        "ceil(num_tokens/64)·64, 4]: for each 64-element slice of the row, every "
+        "row's four group scales together, the layout TensorFold's checkpoint-math "
+        "NVFP4 GEMMs read; it always uses the checkpoint's static input scale."
     ),
     category="Quantization",
     formula=(
         "GB/s = (num_tokens · hidden_size · (2 input + 1/2 packed FP4) + scale bytes) / time",
         "scale bytes = num_tokens · hidden_size/16 for linear_e4m3; "
+        "ceil(num_tokens/64)·64 · hidden_size/16 for kslice_e4m3; "
         "ceil(num_tokens/128)·128 · ceil(hidden_size/64)·4 for swizzled_e4m3",
     ),
     default_metric="memory_bandwidth_gbps",
@@ -54,7 +62,9 @@ DOC = KernelDoc(
         f"{CUPTI_METHOD} "
         "vllm_cuda counts cvt_fp16_to_fp4_sf_major for linear_e4m3 and "
         "cvt_fp16_to_fp4 (not _sf_major) for swizzled_e4m3; flashinfer_cutedsl counts "
-        "nvfp4_quantize, after one call that builds the kernel."
+        "nvfp4_quantize, after one call that builds the kernel; tensorfold_cuda counts "
+        "every launch of checkpoint.quant4: the torch.zeros fill of its scale buffer "
+        "and quant4_kernel."
     ),
     caveats=(
         "The two backends scale differently, so their outputs are not interchangeable.",
@@ -63,6 +73,9 @@ DOC = KernelDoc(
         "per-token scales are excluded.",
         "swizzled_e4m3 walks ceil(num_tokens/128)·128 rows, so below 128 tokens "
         "the padded rows still cost scale writes.",
+        "tensorfold_cuda's time includes the zero fill of the whole kslice_e4m3 "
+        "scale buffer (a separate launch inside checkpoint.quant4, issued every "
+        "call), and its GB/s counts that padded buffer once.",
     ),
     # No separate PyTorch reference implementation exists for this kind.
     reference=None,
@@ -121,6 +134,43 @@ register(
                 "FlashInfer nvfp4_quantize, CuTe DSL backend with per-token activation "
                 "scales, as SGLang calls it."
             ),
+        ),
+    )
+)
+
+# TensorFold perf-study 6469730a, tensorfold/cuda/nvfp4/checkpoint.py
+# `quant4(x, act)`: a torch.zeros fill of its scale buffer, then one
+# quant4_kernel launch (act.cu), one thread a 16-input
+# block, scale e4m3(g·amax/6) under the checkpoint's static g = 1/act. It is
+# built into the same extension as the SM12x block-scaled FP4 GEMMs it feeds
+# (precision.own_math: NVFP4 checkpoint math only at major 12), so it takes the
+# SM12x family the single_gemm tensorfold_* rows declare.
+TENSORFOLD_CUDA = "tensorfold_cuda"
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend=TENSORFOLD_CUDA,
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_120f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.elementwise.tensorfold_quant",
+            function_name="profile_nvfp4_quant_tensorfold_cuda",
+        ),
+        table_name=KIND,
+        args_schema=Nvfp4QuantArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="tensorfold_env",
+        doc=BackendDoc(
+            summary=(
+                "TensorFold's checkpoint.quant4: the scale buffer's zero fill plus "
+                "quant4_kernel under the checkpoint's static input scale, kslice_e4m3 "
+                "scales for its checkpoint-math NVFP4 GEMMs. SM12x."
+            ),
+            url="https://github.com/efeslab/TensorFold",
         ),
     )
 )

@@ -111,3 +111,58 @@ def checkpoint_indices(batch_size: int, per_request: int) -> tuple[tuple[int, ..
         tuple(request * per_request + token + 1 for token in range(per_request))
         for request in range(batch_size)
     )
+
+
+def canonical_sequence_boundaries(num_tokens: int, max_sequence_length: int) -> list[int]:
+    """`num_tokens // max` full-length sequences, then the remainder.
+
+    This is the realization chunked prefill produces, not a modelling
+    convenience: vLLM fills its token budget with whole chunks and leaves one
+    short tail, so a capture iteration of 8185 tokens arrives as 8163 + 22. A
+    *balanced* partition of the same two numbers would halve the sequential
+    inter-chunk critical path and under-measure the kernel by ~2x, which is why
+    the second axis of ``gdn_chunk_delta_rule`` is a length rather than a
+    sequence count.
+    """
+    full_count, remainder = divmod(num_tokens, max_sequence_length)
+    lengths = [max_sequence_length] * full_count
+    if remainder:
+        lengths.append(remainder)
+    boundaries = [0]
+    for length in lengths:
+        boundaries.append(boundaries[-1] + length)
+    return boundaries
+
+
+# ``gdn_chunk_delta_rule``'s documented FLOP estimate uses a 64-token chunk
+# width whatever the backend launches; it only sizes the estimate.
+_SEMANTIC_CHUNK = 64
+
+
+def chunk_delta_rule_semantic_flops(args: Any) -> float:
+    """Logical MACs×2 of the chunked delta rule, at the canonical chunk width.
+
+    Per token the recurrence touches the whole `key_head_dim × value_head_dim`
+    state twice (scan-in and read-out); the intra-chunk terms (K·Kᵀ, the
+    triangular solve, and the attention-like output) each scale with the chunk
+    width rather than the sequence, which is exactly why chunking exists. The
+    kind's DOC formula; every backend reports it so their TFLOPS compare.
+    """
+    tokens = float(args.num_tokens)
+    state = 2.0 * args.key_head_dim * args.value_head_dim * args.num_heads
+    intra = (
+        2.0
+        * _SEMANTIC_CHUNK
+        * (args.num_key_heads * args.key_head_dim + args.num_heads * args.value_head_dim)
+    )
+    return tokens * 2.0 * (state + intra)
+
+
+def chunk_delta_rule_logical_bytes(args: Any) -> float:
+    """Minimum traffic the operation implies: operands in, output and state out."""
+    qk = 2.0 * args.num_tokens * args.num_key_heads * args.key_head_dim * 2
+    value_and_output = 2.0 * args.num_tokens * args.num_heads * args.value_head_dim * 2
+    gates = 2.0 * args.num_tokens * args.num_heads * 4
+    sequence_count = -(-args.num_tokens // args.max_sequence_length)
+    states = 2.0 * sequence_count * args.num_heads * args.key_head_dim * args.value_head_dim * 4
+    return qk + value_and_output + gates + states

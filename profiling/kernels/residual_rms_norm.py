@@ -1,8 +1,8 @@
 """Residual-add RMSNorm kernel kind.
 
 This module owns the ``residual_rms_norm`` wire string, its Args schema, the
-multi-launch Torch semantic backend, and the production-aligned fused vLLM CUDA
-backend.
+multi-launch Torch semantic backend, the production-aligned fused vLLM CUDA
+backend, and TensorFold's Triton kernel.
 
 Both runners are referenced lazily so importing the registry does not import
 Torch, vLLM, or CUDA runtime code.
@@ -60,10 +60,15 @@ DOC = KernelDoc(
         "vllm_cuda works in place, so it is timed on zero inputs with a weight of "
         "ones: repeated calls then cannot overflow fp16, and the launch and memory "
         "access are unchanged.",
+        "tensorfold_triton is out of place (h and y are new tensors) and also writes "
+        "fp32 sums of y over each 64-element group, hidden/64 floats a row (about 3% "
+        "more bytes than one bf16 row), which GB/s does not count. It is timed with "
+        "TensorFold's eps of 1e-6; eps does not change the launch.",
     ),
     method=(
-        f"{CUPTI_METHOD} vllm_cuda counts only its fused_add_rms_norm_kernel launch; torch counts "
-        "every launch of the reference."
+        f"{CUPTI_METHOD} vllm_cuda counts only its fused_add_rms_norm_kernel launch and "
+        "tensorfold_triton only its _add_rmsnorm launch; torch counts every launch of the "
+        "reference."
     ),
     reference="profiling.runners.norm.residual_rms_norm_reference",
 )
@@ -108,5 +113,39 @@ register(
             url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/layernorm_kernels.cu",
         ),
         subprocess_env="vllm_env",
+    )
+)
+
+# TensorFold perf-study 6469730a, tensorfold/families/qwen3_5/cuda/glue.py
+# `add_rmsnorm(x, r, w, eps)`: the Triton `_add_rmsnorm`, one program a row,
+# h = bf16(x + r), y = bf16(rmsnorm(h) * w), plus fp32 64-group sums of y. The
+# kernel casts to tl.bfloat16, so bf16 only. It is plain Triton (no TensorFold
+# CUDA extension and its 8.9 floor); Triton's bf16 needs sm_80, so that is the
+# device floor. It runs in TensorFold's own venv.
+TENSORFOLD_TRITON = "tensorfold_triton"
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend=TENSORFOLD_TRITON,
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            min_compute_capability=(8, 0),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.norm.residual_rms_norm_tensorfold_triton",
+            function_name="profile_residual_rms_norm_tensorfold_triton",
+        ),
+        table_name=KIND,
+        args_schema=ResidualRmsNormArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="tensorfold_env",
+        doc=BackendDoc(
+            summary=(
+                "TensorFold's Triton _add_rmsnorm: one out-of-place launch that also "
+                "writes 64-element group sums of the output."
+            ),
+        ),
     )
 )

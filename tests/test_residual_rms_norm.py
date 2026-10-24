@@ -63,7 +63,7 @@ def test_torch_backend_support_is_16_bit_only():
 def test_vllm_cuda_registration_reuses_kind_table_and_args():
     spec = find_kernel_profiler_spec(KIND, "vllm_cuda")
 
-    assert known_backends(KIND) == ["torch", "vllm_cuda"]
+    assert known_backends(KIND) == ["torch", "vllm_cuda", "tensorfold_triton"]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND
     assert spec.args_schema is ResidualRmsNormArgs
@@ -184,3 +184,28 @@ def test_vllm_cuda_runner_rejects_invalid_args_before_importing_frameworks():
 def test_generated_facades_are_available():
     assert hasattr(perf_api, "get_residual_rms_norm_times")
     assert hasattr(perf_api, "count_missing_residual_rms_norm")
+
+
+def test_tensorfold_triton_runs_in_tensorfold_env_and_is_bf16_only():
+    # Catches the row landing on the project venv (no TensorFold) or advertising
+    # fp16, which the Triton kernel's hard tl.bfloat16 casts would silently miscompute.
+    spec = find_kernel_profiler_spec(KIND, "tensorfold_triton")
+    assert spec.subprocess_env == "tensorfold_env"
+    assert spec.args_schema is ResidualRmsNormArgs
+    assert spec.supports.allows(DType.BF16, gpu="NVIDIA GB10")
+    assert not spec.supports.allows(DType.FP16, gpu="NVIDIA GB10")
+
+
+@pytest.mark.parametrize(
+    ("hidden", "dtype"),
+    [(5120, DType.FP16), (5000, DType.BF16)],
+)
+def test_tensorfold_triton_refuses_shapes_the_kernel_cannot_run(hidden, dtype):
+    # Catches fp16 (cast to bf16 inside the kernel) or a hidden size off the
+    # 64-element group grid (the group-sum store would drop the tail) reaching
+    # a launch and recording a time for a call TensorFold never makes.
+    from profiling.runners.exceptions import ProfilerNotImplemented
+    from profiling.runners.norm.residual_rms_norm_tensorfold_triton import validate_args
+
+    with pytest.raises(ProfilerNotImplemented):
+        validate_args(16, hidden, dtype)

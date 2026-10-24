@@ -14,6 +14,7 @@ from profiling.kernels import (
     all_reduce,  # noqa: F401
     all_reduce_fusion,  # noqa: F401
     all_reduce_residual_rms_norm,  # noqa: F401
+    attn_output_gate,  # noqa: F401
     batched_gemm,  # noqa: F401
     bf16_fused_moe,  # noqa: F401
     clamped_swiglu,  # noqa: F401
@@ -32,6 +33,7 @@ from profiling.kernels import (
     dsa_sparse_mla_attention,  # noqa: F401
     dsa_sparse_mla_prefill,  # noqa: F401
     dsa_topk_prefill,  # noqa: F401
+    dynamic_causal_conv,  # noqa: F401
     elementwise,  # noqa: F401
     embedding_row_gather,  # noqa: F401
     engram_lookup,  # noqa: F401
@@ -42,19 +44,25 @@ from profiling.kernels import (
     fp8_block_quant,  # noqa: F401
     fp8_blockscale_grouped_gemm,  # noqa: F401
     fp8_per_token_group_quant,  # noqa: F401
+    gated_qk_rms_norm_rope,  # noqa: F401
     gdn_causal_conv_decode,  # noqa: F401
     gdn_causal_conv_prefill,  # noqa: F401
     gdn_chunk_delta_rule,  # noqa: F401
+    gdn_conv_norm_gates,  # noqa: F401
     gdn_gated_rms_norm,  # noqa: F401
     gdn_prefill_post_conv,  # noqa: F401
     gdn_recurrent_decode,  # noqa: F401
     gdn_recurrent_decode_gated_norm,  # noqa: F401
+    gdn_state_replay,  # noqa: F401
+    gdn_tree_verify_recurrence,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
+    gemm_swiglu_quant,  # noqa: F401
     grouped_gemm,  # noqa: F401
     grouped_rms_norm,  # noqa: F401
     hc_combine,  # noqa: F401
     hc_combine_norm,  # noqa: F401
     hc_gate_mix,  # noqa: F401
+    head_major_qk_norm_rope,  # noqa: F401
     indexed_row_copy,  # noqa: F401
     inv_rope_fp8_quant,  # noqa: F401
     kda_chunk_prefill,  # noqa: F401
@@ -98,17 +106,21 @@ from profiling.kernels import (
     rel_bias_attention,  # noqa: F401
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
+    row_group_sums,  # noqa: F401
     rs_sconv_ag_residual_rms_norm,  # noqa: F401
     scaled_silu,  # noqa: F401
     sconv_qkvr_prep,  # noqa: F401
     silu_and_mul,  # noqa: F401
     single_gemm,  # noqa: F401
+    sliding_block_attention,  # noqa: F401
+    sliding_window_kv_append,  # noqa: F401
     sparse_gqa_paged_attention,  # noqa: F401
     sparse_index_expand,  # noqa: F401
     sparse_indexer_logits_decode,  # noqa: F401
     sparse_indexer_logits_prefill,  # noqa: F401
     sparse_indexer_prepare,  # noqa: F401
     static_fp8_quant,  # noqa: F401
+    tree_verify_attention,  # noqa: F401
     vllm_fused_moe,  # noqa: F401
     vllm_mla_rope,  # noqa: F401
 )

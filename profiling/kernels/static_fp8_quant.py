@@ -48,12 +48,19 @@ DOC = KernelDoc(
     ),
     default_metric="memory_bandwidth_gbps",
     method=(
-        f"{CUPTI_METHOD} The block is compiled once with a symbolic token count, "
-        "and its first call, at 8192 tokens or at the row's token count when larger, "
-        "picks the launch config the row then uses, as vLLM's profile run at "
-        "max_num_batched_tokens does. Every launch of the compiled block is counted."
+        f"{CUPTI_METHOD} vllm_inductor: the block is compiled once with a symbolic "
+        "token count, and its first call, at 8192 tokens or at the row's token count "
+        "when larger, picks the launch config the row then uses, as vLLM's profile run "
+        "at max_num_batched_tokens does. Every launch of the compiled block is counted. "
+        "tensorfold_cuda counts its one quant8_kernel launch."
     ),
-    caveats=("GB/s counts the input, the gate and the output once each.",),
+    caveats=(
+        "GB/s counts the input, the gate and the output once each.",
+        "tensorfold_cuda multiplies by the fp32 reciprocal of the scale and writes each "
+        "16-byte group in its FP8 GEMM's fragment order (a permutation within the "
+        "group); it has no gated form, since TensorFold applies the attention gate "
+        "in a separate launch.",
+    ),
     reference="profiling.runners.elementwise.static_fp8_quant_reference",
 )
 
@@ -82,6 +89,40 @@ register(
                 "Inductor into one Triton kernel."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/input_quant_fp8.py",
+        ),
+    )
+)
+
+# TensorFold perf-study 6469730a, tensorfold/cuda/nvfp4/checkpoint.py
+# `quant8(x, act)`: one quant8_kernel launch (act.cu), e4m3(x · (1/act))
+# saturating, under the projection's static per-tensor input scale. It lives in
+# the extension that also builds the SM12x FP4 GEMMs, and feeds the
+# single_gemm tensorfold_* rows, so it declares their SM12x family.
+TENSORFOLD_CUDA = "tensorfold_cuda"
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend=TENSORFOLD_CUDA,
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_120f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.elementwise.tensorfold_quant",
+            function_name="profile_static_fp8_quant_tensorfold_cuda",
+        ),
+        table_name=KIND,
+        args_schema=StaticFp8QuantArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="tensorfold_env",
+        doc=BackendDoc(
+            summary=(
+                "TensorFold's checkpoint.quant8: quant8_kernel, e4m3 under the static "
+                "per-tensor input scale in its FP8 GEMM's fragment order, ungated. SM12x."
+            ),
+            url="https://github.com/efeslab/TensorFold",
         ),
     )
 )

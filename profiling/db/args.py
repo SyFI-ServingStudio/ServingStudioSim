@@ -37,6 +37,10 @@ class DType(StrEnum):
     # OCP MX block format: packed e2m1 elements with one ue8m0 scale per 32
     # elements. No torch dtype holds it unpacked.
     MXFP4_E2M1 = "mxfp4_e2m1"
+    # Weight-only affine 4-bit (MLX style): unsigned 4-bit codes with one bf16
+    # scale and one bf16 bias per 64 inputs along K (w = q * scale + bias),
+    # multiplied by bf16 activations on bf16 tensor cores, bf16 output.
+    W4A16_AFFINE_G64 = "w4a16_affine_g64"
 
     @classmethod
     def from_value(cls, value: Any) -> DType:
@@ -70,6 +74,8 @@ class DType(StrEnum):
             DType.INT4: 0.5,
             DType.NVFP4_E2M1: 0.5,
             DType.MXFP4_E2M1: 0.5,
+            # Weight codes only; the bf16 scale and bias add 1/16 byte per element.
+            DType.W4A16_AFFINE_G64: 0.5,
         }[self]
 
     # Keep framework conversions lazy so importing DB schemas does not import
