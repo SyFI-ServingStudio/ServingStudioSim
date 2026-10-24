@@ -38,6 +38,10 @@ pub enum DType {
     /// OCP MXFP4: packed e2m1 elements with one ue8m0 scale per 32-element
     /// group. Distinct from `Nvfp4E2m1` (fp8 scale per 16 elements).
     Mxfp4E2m1,
+    /// Weight-only affine 4-bit (MLX style): 4-bit codes with one bf16 scale
+    /// and one bf16 bias per 64 inputs along K, times bf16 activations on bf16
+    /// tensor cores (TensorFold's lane matmul for the DFlash2 drafter).
+    W4a16AffineG64,
 }
 
 impl DType {
@@ -53,12 +57,13 @@ impl DType {
             DType::Int4 => "int4",
             DType::Nvfp4E2m1 => "nvfp4_e2m1",
             DType::Mxfp4E2m1 => "mxfp4_e2m1",
+            DType::W4a16AffineG64 => "w4a16_affine_g64",
         }
     }
 
     /// Bytes per element. Used by L3 worklets to size byte-keyed kernels (e.g.
-    /// the elementwise activation's per-token I/O footprint). Int4, NVFP4 and MXFP4 are
-    /// sub-byte; they round up to 1 (no current model uses either on a
+    /// the elementwise activation's per-token I/O footprint). Int4, NVFP4, MXFP4 and
+    /// W4A16 affine are sub-byte; they round up to 1 (no current model uses any on a
     /// byte-keyed path). Mxfp8E4m3 counts data bytes only (the 1/32 ue8m0
     /// scale is excluded), matching Python `DType.MXFP8_E4M3.size_bytes`.
     pub fn size_bytes(self) -> u32 {
@@ -71,7 +76,8 @@ impl DType {
             | DType::Int8
             | DType::Int4
             | DType::Nvfp4E2m1
-            | DType::Mxfp4E2m1 => 1,
+            | DType::Mxfp4E2m1
+            | DType::W4a16AffineG64 => 1,
         }
     }
 
@@ -90,6 +96,7 @@ impl DType {
             "int4" => DType::Int4,
             "nvfp4_e2m1" => DType::Nvfp4E2m1,
             "mxfp4_e2m1" => DType::Mxfp4E2m1,
+            "w4a16_affine_g64" => DType::W4a16AffineG64,
             _ => return None,
         })
     }
@@ -106,7 +113,7 @@ impl<'de> Deserialize<'de> for DType {
         let s = String::deserialize(d)?;
         DType::from_wire(&s).ok_or_else(|| {
             serde::de::Error::custom(format!(
-                "unknown dtype {s:?} (expected fp16/bf16/fp32/fp8_e4m3/fp8_e5m2/mxfp8_e4m3/int8/int4/nvfp4_e2m1/mxfp4_e2m1)"
+                "unknown dtype {s:?} (expected fp16/bf16/fp32/fp8_e4m3/fp8_e5m2/mxfp8_e4m3/int8/int4/nvfp4_e2m1/mxfp4_e2m1/w4a16_affine_g64)"
             ))
         })
     }
@@ -316,6 +323,7 @@ mod tests {
             DType::Int4,
             DType::Nvfp4E2m1,
             DType::Mxfp4E2m1,
+            DType::W4a16AffineG64,
         ] {
             assert_eq!(DType::from_wire(dt.as_str()), Some(dt));
             // serde goes through the same path: "bf16" not "Bf16".

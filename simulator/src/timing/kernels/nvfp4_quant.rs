@@ -1,4 +1,8 @@
-//! vLLM BF16-to-NVFP4 activation quantization on Blackwell.
+//! BF16-to-NVFP4 activation quantization: vLLM's and FlashInfer's on
+//! Blackwell, and TensorFold's `quant4_kernel` (`tensorfold_cuda`, SM12x,
+//! `scale_format = "kslice_e4m3"`: scales `[hidden/64, ceil(m/64)*64, 4]`
+//! under the checkpoint's static input scale). Every backend shares the token
+//! grid and the linear 1-D cache; `scale_format` is static identity.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -25,6 +29,10 @@ pub struct Nvfp4QuantKernelInput {
 
 pub struct Nvfp4QuantSpec;
 
+/// TensorFold's quantizer backend and the most rows one launch can take.
+const TENSORFOLD_CUDA: &str = "tensorfold_cuda";
+const TENSORFOLD_MAX_ROWS: f64 = 65535.0;
+
 impl KernelSpec for Nvfp4QuantSpec {
     type Config = Nvfp4QuantKernelConfig;
     type Input = Nvfp4QuantKernelInput;
@@ -40,6 +48,21 @@ impl KernelSpec for Nvfp4QuantSpec {
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
         CacheKind::Cache1DLinear
+    }
+
+    /// TensorFold's quantizer launches one block row per token row
+    /// (`gridDim.y = num_tokens`), so it cannot run past CUDA's 65535 limit;
+    /// its prefill chunks stay at or under 4096 rows. A config that names
+    /// `tensorfold_cuda` drops those grid rows; queries past the last row
+    /// extrapolate the linear cache.
+    fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
+        if !config.backends.contains(&TENSORFOLD_CUDA) {
+            return Vec::new();
+        }
+        grid.axes()[0]
+            .iter()
+            .map(|&num_tokens| num_tokens > TENSORFOLD_MAX_ROWS)
+            .collect()
     }
 
     fn enumerate(
@@ -90,5 +113,49 @@ mod tests {
             fields.get("scale_format"),
             Some(&Value::from("linear_e4m3"))
         );
+    }
+
+    #[test]
+    fn tensorfold_cuda_payload_carries_its_kslice_scale_format() {
+        // The tensorfold_cuda runner accepts only kslice_e4m3; a payload that
+        // dropped or rewrote the config's scale_format would miss its rows.
+        let config = Nvfp4QuantKernelConfig {
+            backends: vec!["tensorfold_cuda"],
+            gpu_name: "NVIDIA GB10".to_string(),
+            hidden_size: 17408.into(),
+            group_size: 16,
+            input_dtype: DType::Bf16,
+            scale_format: "kslice_e4m3".to_string(),
+        };
+        let grid = Nvfp4QuantSpec::sweep_grid(&config);
+        let payloads = Nvfp4QuantSpec::enumerate(&config, &grid, "tensorfold_cuda");
+        assert_eq!(payloads.len(), grid.axes()[0].len());
+        for payload in &payloads {
+            let fields = payload.fields();
+            assert_eq!(fields.get("backend"), Some(&Value::from("tensorfold_cuda")));
+            assert_eq!(
+                fields.get("scale_format"),
+                Some(&Value::from("kslice_e4m3"))
+            );
+            assert_eq!(fields.get("hidden_size"), Some(&Value::from(17408_u32)));
+        }
+        assert_eq!(
+            Nvfp4QuantSpec::cache_kind("tensorfold_cuda"),
+            CacheKind::Cache1DLinear
+        );
+        // Only the 65536-row point is past the launch's 65535-row limit; a
+        // mask that kept it would fail the build on a row that cannot exist.
+        let mask = Nvfp4QuantSpec::infeasible_mask(&config, &grid);
+        let dropped: Vec<f64> = grid.axes()[0]
+            .iter()
+            .zip(&mask)
+            .filter_map(|(&m, &drop)| drop.then_some(m))
+            .collect();
+        assert_eq!(dropped, vec![65536.0]);
+        let vllm = Nvfp4QuantKernelConfig {
+            backends: vec!["vllm_cuda"],
+            ..config
+        };
+        assert!(Nvfp4QuantSpec::infeasible_mask(&vllm, &grid).is_empty());
     }
 }

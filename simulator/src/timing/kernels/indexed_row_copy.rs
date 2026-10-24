@@ -33,6 +33,9 @@ pub struct IndexedRowCopyKernelInput {
     pub num_rows: u32,
 }
 
+/// Largest selected bytes one `tensorfold_torch` token-row grid point moves.
+const TENSORFOLD_MAX_BYTES: u64 = 1 << 30;
+
 /// Row counts for the state-row operations, which index one slot per request.
 const STATE_ROWS: [u32; 14] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128];
 
@@ -49,10 +52,24 @@ impl KernelSpec for IndexedRowCopySpec {
             // Token rows run to a whole step. PyTorch's index_select takes a
             // per-index path up to 16 indices and a vectorized gather from 17, a
             // step down in time, so both sides of that boundary are grid points.
-            return SweepGrid::new(vec![Axis::values([
+            let rows = Axis::values([
                 1, 2, 4, 8, 12, 16, 17, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
                 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384,
-            ])]);
+            ]);
+            if config.backends.iter().all(|b| b.starts_with("tensorfold_")) {
+                // TensorFold's commit gathers go up to whole-layer-stack rows
+                // (48 x 10240 elements, ~1 MB): stop where the selected rows
+                // pass 1 GiB, past which the gather is a flat byte rate.
+                let row_bytes = config.row_elements.get() as u64 * config.dtype.size_bytes() as u64;
+                let kept = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, &r)| i < 2 || r as u64 * row_bytes <= TENSORFOLD_MAX_BYTES)
+                    .map(|(_, &r)| r)
+                    .collect();
+                return SweepGrid::new(vec![kept]);
+            }
+            return SweepGrid::new(vec![rows]);
         }
         SweepGrid::new(vec![Axis::values(STATE_ROWS)])
     }
@@ -142,5 +159,21 @@ mod tests {
             IndexedRowCopySpec::enumerate(&config("scatter"), &grid, "torch").len(),
             STATE_ROWS.len()
         );
+    }
+
+    #[test]
+    fn tensorfold_token_rows_stop_at_a_gib() {
+        // Catches a grid point that would allocate 16 GB of 1 MB rows (the
+        // few-row commit's layer-stack gather) on a 128 GB unified-memory box.
+        let cfg = IndexedRowCopyKernelConfig {
+            backends: vec!["tensorfold_torch"],
+            gpu_name: "NVIDIA GB10".to_string(),
+            row_elements: 491_520.into(),
+            dtype: DType::Bf16,
+            operation: "index_select".to_string(),
+        };
+        let rows = IndexedRowCopySpec::sweep_grid(&cfg).axes()[0].clone();
+        assert_eq!(rows[..4], [1.0, 2.0, 4.0, 8.0]);
+        assert_eq!(*rows.last().unwrap(), 1024.0);
     }
 }

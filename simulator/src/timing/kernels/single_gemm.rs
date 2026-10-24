@@ -82,6 +82,113 @@ fn fp8_tensor_m_axis() -> Vec<f64> {
     Axis::values(m)
 }
 
+/// Rows TensorFold's decode/verify lane GEMM serves: 16 streams of 16 verify
+/// rows (single-stream copy chains reach 128). Beyond it the cache extrapolates.
+const TENSORFOLD_LANE_M_MAX: u32 = 256;
+/// TensorFold's prefill chunk ceiling (`families/qwen3_5/cuda/prefill.py` `CHUNK`).
+const TENSORFOLD_CK_M_MAX: u32 = 4096;
+
+/// `m` axis for `tensorfold_lane` (`lane_kernel`, `checkpoint.lane_tile`).
+///
+/// A block covers 16 rows up to m = 16, 32 rows up to 32, then 64-row blocks
+/// side by side (128-row blocks only from 96 SMs), and a partly filled last
+/// block runs the row-guarded variant. Time is a staircase over row blocks, so
+/// the axis measures each block edge `b` and `b + 1` plus the block's middle,
+/// and linear interpolation never spans a step.
+fn tensorfold_lane_m_axis() -> Vec<f64> {
+    let mut m: Vec<u32> = [1, 2, 4, 8, 12, 16, 17, 24, 32, 33, 48]
+        .into_iter()
+        .chain((64..=TENSORFOLD_LANE_M_MAX).step_by(32))
+        .chain((64..TENSORFOLD_LANE_M_MAX).step_by(64).map(|b| b + 1))
+        .collect();
+    m.sort_unstable();
+    m.dedup();
+    Axis::values(m)
+}
+
+/// Rows TensorFold's affine 4-bit lane matmul serves: the DFlash2 drafter's
+/// block rows and decode taps stay within 16 streams x 16 rows, but a prefill
+/// feeds the drafter up to its 2047-row sliding window of taps at once.
+const TENSORFOLD_QMM_M_MAX: u32 = 2048;
+
+/// `m` axis for `tensorfold_qmm` (`group_kernel`, `qmm_group.cu` `dispatch`).
+///
+/// On a GB10 the block covers 16 rows up to m = 16, 32 up to 32, then 64-row
+/// blocks side by side (tile 4 to m = 64, tile 5 with 128-column blocks
+/// past it), so the row-block edges are those of `tensorfold_lane`: its axis
+/// to 256, then every 64-row edge `b` and `b + 1` up to the drafter's window.
+fn tensorfold_qmm_m_axis() -> Vec<f64> {
+    let top = TENSORFOLD_LANE_M_MAX;
+    let mut m: Vec<u32> = tensorfold_lane_m_axis()
+        .into_iter()
+        .map(|v| v as u32)
+        .chain((top + 64..=TENSORFOLD_QMM_M_MAX).step_by(64))
+        .chain((top..TENSORFOLD_QMM_M_MAX).step_by(64).map(|b| b + 1))
+        .collect();
+    m.sort_unstable();
+    m.dedup();
+    Axis::values(m)
+}
+
+/// `m` axis for `tensorfold_ck` (`gemm_kernel`, `gemm_ck.cu` `by_tile`).
+///
+/// The prompt GEMM tiles rows by 128 on a GB10 (`tile = 1`), so time steps at
+/// every multiple of 128; the axis measures each edge `b` and `b + 1` and the
+/// tile's middle, with powers of two below the first tile.
+fn tensorfold_ck_m_axis() -> Vec<f64> {
+    let mut m: Vec<u32> = [1, 2, 4, 8, 16, 32]
+        .into_iter()
+        .chain((64..=TENSORFOLD_CK_M_MAX).step_by(64))
+        .chain((128..TENSORFOLD_CK_M_MAX).step_by(128).map(|b| b + 1))
+        .collect();
+    m.sort_unstable();
+    m.dedup();
+    Axis::values(m)
+}
+
+/// `m` axis for `tensorfold_b16` (`b16_kernel`, `b16.cu` `by_rows`).
+///
+/// A warp computes one output column for R rows: R = 1 below 64 rows, 4 below
+/// 512, 16 from 512, so the block count grows every R rows and time is a
+/// staircase of waves. On a GB10 a wave is 24 rows at R = 1 and 96 rows at
+/// R = 4 (verify: 12 us to 24 rows, 17 us at 28; 32 us at 96, 43 us at 100).
+/// The axis measures every 4 rows to the verify ceiling of 256, the first row
+/// past each wave edge, both sides of the R switches at 64 and 512, then
+/// coarser points to 512 and one beyond it for extrapolation.
+fn tensorfold_b16_m_axis() -> Vec<f64> {
+    let top = TENSORFOLD_LANE_M_MAX;
+    let mut m: Vec<u32> = [1, 2, 3, 25, 49, 63, 97, 193, 289, 385, 481]
+        .into_iter()
+        .chain((4..=top).step_by(4))
+        .chain((top + 32..512).step_by(32))
+        .chain([511, 512, 1024])
+        .collect();
+    m.sort_unstable();
+    m.dedup();
+    Axis::values(m)
+}
+
+/// `m` axis for `tensorfold_b16_prompt` (`b16_prompt_kernel`, `b16.cu`
+/// `prompt_bm`).
+///
+/// Rows tile by BM = 32 (64 past about 3000 rows of a 96-wide pair on a GB10,
+/// 128 past about 6000), each tile running the whole K chain, so time is a
+/// staircase over tiles and waves. The axis measures both sides of every
+/// 32-row tile edge up to TensorFold's 4096-row prefill chunk, then two
+/// points past it: the pair slows sharply once the rows leave L2 (0.27 ms at
+/// 4096 rows, 0.78 ms at 8192), which the last tile segment cannot extrapolate.
+fn tensorfold_b16_prompt_m_axis() -> Vec<f64> {
+    let mut m: Vec<u32> = [1, 2, 4, 8, 16]
+        .into_iter()
+        .chain((32..=TENSORFOLD_CK_M_MAX).step_by(32))
+        .chain((32..TENSORFOLD_CK_M_MAX).step_by(32).map(|b| b + 1))
+        .chain([6144, 8192])
+        .collect();
+    m.sort_unstable();
+    m.dedup();
+    Axis::values(m)
+}
+
 impl KernelSpec for SingleGemmSpec {
     type Config = SingleGemmKernelConfig;
     type Input = SingleGemmKernelInput;
@@ -93,8 +200,16 @@ impl KernelSpec for SingleGemmSpec {
             return SweepGrid::new(vec![hybrid_bucket_m_axis()]);
         }
         // A mixed backend list keeps the generic axis below.
-        if config.backends.as_slice() == ["flashinfer_fp8_tensor"] {
-            return SweepGrid::new(vec![fp8_tensor_m_axis()]);
+        match config.backends.as_slice() {
+            ["flashinfer_fp8_tensor"] => return SweepGrid::new(vec![fp8_tensor_m_axis()]),
+            ["tensorfold_lane"] => return SweepGrid::new(vec![tensorfold_lane_m_axis()]),
+            ["tensorfold_ck"] => return SweepGrid::new(vec![tensorfold_ck_m_axis()]),
+            ["tensorfold_qmm"] => return SweepGrid::new(vec![tensorfold_qmm_m_axis()]),
+            ["tensorfold_b16"] => return SweepGrid::new(vec![tensorfold_b16_m_axis()]),
+            ["tensorfold_b16_prompt"] => {
+                return SweepGrid::new(vec![tensorfold_b16_prompt_m_axis()]);
+            }
+            _ => {}
         }
         // Dense decode routinely evaluates GEMMs below the shared token axis'
         // m=32 floor. Keep those points measured instead of extrapolating the
@@ -334,5 +449,139 @@ mod tests {
         assert_eq!(fields.len(), 5);
         assert_eq!(fields.get("dtype"), Some(&Value::from("mxfp8_e4m3")));
         assert_eq!(fields.get("backend"), Some(&Value::from("flashinfer_mxfp8")));
+    }
+
+    fn tensorfold_cfg(backend: &'static str, dtype: DType) -> SingleGemmKernelConfig {
+        SingleGemmKernelConfig {
+            backends: vec![backend],
+            gpu_name: "NVIDIA GB10".to_string(),
+            n: 5120.into(),
+            k: 17408.into(),
+            dtype,
+        }
+    }
+
+    /// TensorFold's GEMM times step at each row block (16 / 32 / 64 rows for
+    /// `lane_kernel`, 128 for the prompt `gemm_kernel` on a GB10). An axis
+    /// missing either side of an edge would interpolate across a step.
+    #[test]
+    fn tensorfold_axes_bracket_every_row_block_edge() {
+        for (backend, edges, top) in [
+            ("tensorfold_lane", vec![16, 32, 64, 128, 192], 256.0),
+            ("tensorfold_ck", (1..32).map(|j| 128 * j).collect::<Vec<u32>>(), 4096.0),
+        ] {
+            let grid = SingleGemmSpec::sweep_grid(&tensorfold_cfg(backend, DType::Nvfp4E2m1));
+            let axis = &grid.axes()[0];
+            for b in edges {
+                assert!(axis.contains(&(b as f64)), "{backend}: edge {b} missing");
+                assert!(axis.contains(&(b as f64 + 1.0)), "{backend}: {b} + 1 missing");
+            }
+            assert_eq!(axis.first(), Some(&1.0));
+            assert_eq!(axis.last(), Some(&top));
+            assert!(axis.windows(2).all(|w| w[0] < w[1]));
+            assert!(axis.len() <= 500);
+        }
+        // The axis follows the backend, not the dtype: fp8 and nvfp4 share it.
+        assert_eq!(
+            SingleGemmSpec::sweep_grid(&tensorfold_cfg("tensorfold_lane", DType::Fp8E4m3)).axes(),
+            SingleGemmSpec::sweep_grid(&tensorfold_cfg("tensorfold_lane", DType::Nvfp4E2m1)).axes(),
+        );
+    }
+
+    /// The drafter's lane matmul steps at the same row blocks as `lane_kernel`
+    /// and must reach the 2047-row tap window a prefill feeds it.
+    #[test]
+    fn tensorfold_qmm_axis_brackets_row_blocks_to_the_drafter_window() {
+        let cfg = SingleGemmKernelConfig {
+            backends: vec!["tensorfold_qmm"],
+            gpu_name: "NVIDIA GB10".to_string(),
+            n: 5120.into(),
+            k: 25600.into(),
+            dtype: DType::W4a16AffineG64,
+        };
+        let grid = SingleGemmSpec::sweep_grid(&cfg);
+        let axis = &grid.axes()[0];
+        let edges = [16, 32].into_iter().chain((1..32).map(|j| 64 * j));
+        for b in edges {
+            assert!(axis.contains(&(b as f64)), "edge {b} missing");
+            assert!(axis.contains(&(b as f64 + 1.0)), "{b} + 1 missing");
+        }
+        assert_eq!(axis.first(), Some(&1.0));
+        assert_eq!(axis.last(), Some(&2048.0));
+        assert!(axis.windows(2).all(|w| w[0] < w[1]));
+        assert!(axis.len() <= 500);
+        let payloads = SingleGemmSpec::enumerate(&cfg, &grid, "tensorfold_qmm");
+        assert_eq!(payloads.len(), axis.len());
+        let fields = payloads[0].fields();
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields.get("dtype"), Some(&Value::from("w4a16_affine_g64")));
+        assert_eq!(fields.get("backend"), Some(&Value::from("tensorfold_qmm")));
+    }
+
+    #[test]
+    fn tensorfold_enumerate_forwards_the_python_wire_schema() {
+        let cfg = tensorfold_cfg("tensorfold_ck", DType::Fp8E4m3);
+        let grid = SingleGemmSpec::sweep_grid(&cfg);
+        let payloads = SingleGemmSpec::enumerate(&cfg, &grid, "tensorfold_ck");
+        assert_eq!(payloads.len(), grid.axes()[0].len());
+        let fields = payloads[0].fields();
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields.get("dtype"), Some(&Value::from("fp8_e4m3")));
+        assert_eq!(fields.get("backend"), Some(&Value::from("tensorfold_ck")));
+        assert_eq!(fields.get("k"), Some(&Value::from(17408_u32)));
+    }
+
+    /// `b16_kernel` adds a row block every 1 / 4 rows (R = 1 below 64, 4 to 512):
+    /// the axis must step at most 4 rows through the verify range and keep both
+    /// sides of the R switch at 64, or interpolation smooths over a wave step.
+    #[test]
+    fn tensorfold_b16_axis_steps_every_row_block_through_verify() {
+        let cfg = SingleGemmKernelConfig {
+            backends: vec!["tensorfold_b16"],
+            gpu_name: "NVIDIA GB10".to_string(),
+            n: 96.into(),
+            k: 5120.into(),
+            dtype: DType::Bf16,
+        };
+        let grid = SingleGemmSpec::sweep_grid(&cfg);
+        let axis = &grid.axes()[0];
+        let verify: Vec<f64> = axis.iter().copied().filter(|&m| m <= 256.0).collect();
+        assert!(verify.windows(2).all(|w| w[1] - w[0] <= 4.0));
+        for m in [
+            1.0, 25.0, 63.0, 64.0, 97.0, 193.0, 256.0, 511.0, 512.0, 1024.0,
+        ] {
+            assert!(axis.contains(&m), "m = {m} missing");
+        }
+        assert!(axis.windows(2).all(|w| w[0] < w[1]));
+        assert!(axis.len() <= 500);
+        let payloads = SingleGemmSpec::enumerate(&cfg, &grid, "tensorfold_b16");
+        let fields = payloads[0].fields();
+        assert_eq!(fields.get("n"), Some(&Value::from(96_u32)));
+        assert_eq!(fields.get("dtype"), Some(&Value::from("bf16")));
+        assert_eq!(fields.get("backend"), Some(&Value::from("tensorfold_b16")));
+    }
+
+    /// `b16_prompt_kernel` tiles rows by 32 below ~3000 rows: the axis must
+    /// bracket every 32-row edge to the 4096-row prefill chunk.
+    #[test]
+    fn tensorfold_b16_prompt_axis_brackets_every_tile_edge() {
+        let cfg = SingleGemmKernelConfig {
+            backends: vec!["tensorfold_b16_prompt"],
+            gpu_name: "NVIDIA GB10".to_string(),
+            n: 96.into(),
+            k: 5120.into(),
+            dtype: DType::Bf16,
+        };
+        let grid = SingleGemmSpec::sweep_grid(&cfg);
+        let axis = &grid.axes()[0];
+        for b in (1..128).map(|j| 32 * j) {
+            assert!(axis.contains(&(b as f64)), "edge {b} missing");
+            assert!(axis.contains(&(b as f64 + 1.0)), "{b} + 1 missing");
+        }
+        assert_eq!(axis.first(), Some(&1.0));
+        assert!(axis.contains(&4096.0));
+        assert_eq!(axis.last(), Some(&8192.0));
+        assert!(axis.windows(2).all(|w| w[0] < w[1]));
+        assert!(axis.len() <= 500);
     }
 }

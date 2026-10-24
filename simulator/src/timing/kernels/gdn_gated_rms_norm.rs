@@ -3,6 +3,10 @@
 //! Hidden width and compute dtype are static config identity. The flattened row
 //! count `m` is the sole physical runtime interpolation axis, mapped from
 //! tokens as `m = num_tokens * num_value_heads`.
+//!
+//! Backends: `torch`, `vllm_triton`, and `tensorfold_triton` (TensorFold's
+//! Triton `_gated_norm`, bf16 only, one program per token and value head).
+//! All share the grid and the linear 1-D cache.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -148,7 +152,7 @@ mod tests {
 
     #[test]
     fn every_backend_uses_linear_1d_cache() {
-        for backend in ["torch", "vllm_triton"] {
+        for backend in ["torch", "vllm_triton", "tensorfold_triton"] {
             assert_eq!(
                 GdnGatedRmsNormSpec::cache_kind(backend),
                 CacheKind::Cache1DLinear
@@ -176,5 +180,21 @@ mod tests {
         assert_eq!(first.get("hidden"), Some(&Value::from(128_u32)));
         assert_eq!(first.get("dtype"), Some(&Value::from("bf16")));
         assert_eq!(payloads[14].fields()["m"], Value::from(524288_u32));
+    }
+
+    #[test]
+    fn tensorfold_triton_payloads_carry_the_backend_and_python_fields() {
+        // Catches the TensorFold rows being requested under another backend
+        // or with fields its Python args schema does not have.
+        let cfg = config();
+        let grid = GdnGatedRmsNormSpec::sweep_grid(&cfg);
+        let payloads = GdnGatedRmsNormSpec::enumerate(&cfg, &grid, "tensorfold_triton");
+
+        assert_eq!(payloads.len(), 15);
+        for payload in &payloads {
+            let names: Vec<&str> = payload.fields().keys().map(String::as_str).collect();
+            assert_eq!(names, ["backend", "dtype", "hidden", "m"]);
+            assert_eq!(payload.backend(), Some("tensorfold_triton"));
+        }
     }
 }

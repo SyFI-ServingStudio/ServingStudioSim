@@ -5,6 +5,11 @@
 //! it intentionally does not reuse `rms_norm` through `profile_kind()`.
 //! `hidden` and `dtype` are static identity, while token count `m` is the
 //! runtime one-dimensional interpolation axis.
+//!
+//! Backends: `torch`, `vllm_cuda`, and `tensorfold_triton` (TensorFold's
+//! Triton `_add_rmsnorm`, bf16 only, one program a row). All share the grid
+//! and the linear 1-D cache: time is a row-count staircase of waves fine
+//! enough that linear interpolation between grid rows holds.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -124,7 +129,11 @@ mod tests {
     }
 
     #[test]
-    fn both_backends_use_linear_1d_cache() {
+    fn every_backend_uses_linear_1d_cache() {
+        assert_eq!(
+            ResidualRmsNormSpec::cache_kind("tensorfold_triton"),
+            CacheKind::Cache1DLinear
+        );
         assert_eq!(
             ResidualRmsNormSpec::cache_kind("torch"),
             CacheKind::Cache1DLinear
@@ -140,7 +149,7 @@ mod tests {
         let cfg = config();
         let grid = ResidualRmsNormSpec::sweep_grid(&cfg);
 
-        for backend in ["torch", "vllm_cuda"] {
+        for backend in ["torch", "vllm_cuda", "tensorfold_triton"] {
             let payloads = ResidualRmsNormSpec::enumerate(&cfg, &grid, backend);
             assert_eq!(payloads.len(), 68);
             let first = &payloads[0];

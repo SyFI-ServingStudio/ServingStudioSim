@@ -26,7 +26,12 @@ use crate::timing::{KernelConfig, SweepCoords};
 const RESIDENCIES: [&str; 2] = ["host_uva", "device"];
 /// The one residency each backend runs on: the fork's pinned lookup reads a
 /// host table over UVA, `F.embedding` an HBM one.
-const BACKEND_RESIDENCY: [(&str, &str); 2] = [("vllm_triton", "host_uva"), ("torch", "device")];
+const BACKEND_RESIDENCY: [(&str, &str); 3] = [
+    ("vllm_triton", "host_uva"),
+    ("torch", "device"),
+    // TensorFold's token embedding (`glue.embedding`) on its HBM bf16 table.
+    ("tensorfold_torch", "device"),
+];
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EmbeddingRowGatherKernelConfig {

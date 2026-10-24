@@ -75,13 +75,38 @@ impl SweepCoords for GdnChunkDeltaRuleKernelInput {
 
 pub struct GdnChunkDeltaRuleSpec;
 
+/// TensorFold's CUDA prefill chain (`chain_kernel`), one launch per sequence.
+pub const TENSORFOLD_CHAIN: &str = "tensorfold_chain";
+
+/// The `(L, N)` grid for `tensorfold_chain`, sized to TensorFold's range: one
+/// stream's prefill chunk is 1..=4096 rows and a step holds up to 16 streams.
+///
+/// - `L`: pow2 1..=1024, then 512-steps to 4096. One launch is a block per
+///   (value head, 128 value rows) walking the rows serially, so time is an
+///   fp32 state read/write (~25 us cold on GB10) plus ~0.47 us a row: affine in
+///   `L`, which the doubling steps interpolate; the 512-steps guard the top of
+///   the range, where the operands outgrow L2.
+/// - `N`: 1..=16 streams on pow2. A batched step loops the call per stream, so
+///   time is `N` launches, linear in `N`.
+///
+/// 17 x 5 = 85 cells, none above the 65,536-token ceiling.
+fn tensorfold_chain_grid() -> SweepGrid {
+    let length = Axis::chain([Axis::pow2(0, 10), Axis::arithmetic(1536, 4096, 512)]);
+    SweepGrid::new(vec![length, Axis::pow2(0, 4)])
+}
+
 impl KernelSpec for GdnChunkDeltaRuleSpec {
     type Config = GdnChunkDeltaRuleKernelConfig;
     type Input = GdnChunkDeltaRuleKernelInput;
 
     const KIND: KernelKind = "gdn_chunk_delta_rule";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        // TensorFold's chain gets its own grid; keeping it off the FlashInfer
+        // grid avoids resampling that backend's existing rows.
+        if config.backends.contains(&TENSORFOLD_CHAIN) {
+            return tensorfold_chain_grid();
+        }
         // L from one chunk (64) to the 16,384-token chunked-prefill budget;
         // N up to 16, which is where the SM-saturation knee has been passed.
         SweepGrid::new(vec![Axis::pow2(6, 14), Axis::pow2(0, 4)])
@@ -140,7 +165,7 @@ mod tests {
 
     use super::{
         GdnChunkDeltaRuleKernelConfig, GdnChunkDeltaRuleKernelInput, GdnChunkDeltaRuleSpec,
-        MAX_TOKENS,
+        MAX_TOKENS, TENSORFOLD_CHAIN,
     };
     use crate::timing::bridge::DType;
     use crate::timing::cache::{CacheKind, Extrapolation};
@@ -299,5 +324,39 @@ mod tests {
             GdnChunkDeltaRuleSpec::cache_kind("flashinfer"),
             CacheKind::Cache2DLinear(Extrapolation::Product)
         );
+    }
+
+    fn tensorfold_config() -> GdnChunkDeltaRuleKernelConfig {
+        GdnChunkDeltaRuleKernelConfig {
+            backends: vec![TENSORFOLD_CHAIN],
+            gpu_name: "NVIDIA GB10".to_string(),
+            num_heads: 48.into(),
+            ..config()
+        }
+    }
+
+    #[test]
+    fn tensorfold_grid_spans_one_row_to_4096_rows_and_16_streams() {
+        // Catches a grid that leaves 1-row chunks or 4096-row steps to
+        // extrapolation, or that moves the FlashInfer rows.
+        let cfg = tensorfold_config();
+        let grid = GdnChunkDeltaRuleSpec::sweep_grid(&cfg);
+        let (length, streams) = (&grid.axes()[0], &grid.axes()[1]);
+        assert_eq!((length[0], *length.last().unwrap()), (1.0, 4096.0));
+        assert!(length.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(streams, &vec![1.0, 2.0, 4.0, 8.0, 16.0]);
+        let mask = GdnChunkDeltaRuleSpec::infeasible_mask(&cfg, &grid);
+        assert_eq!(mask.iter().filter(|&&m| !m).count(), 85);
+        assert_eq!(
+            GdnChunkDeltaRuleSpec::sweep_grid(&config()).axes()[0][0],
+            64.0
+        );
+
+        let payloads = GdnChunkDeltaRuleSpec::enumerate(&cfg, &grid, TENSORFOLD_CHAIN);
+        let one_row = payloads[0].fields();
+        assert_eq!(one_row["num_tokens"], 1);
+        assert_eq!(one_row["max_sequence_length"], 1);
+        assert_eq!(one_row["backend"], TENSORFOLD_CHAIN);
+        assert_eq!(one_row["num_heads"], 48);
     }
 }

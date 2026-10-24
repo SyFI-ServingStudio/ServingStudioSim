@@ -6,6 +6,13 @@
 //! kernel plus the on-device stable value sort — because `sorted=True` is part
 //! of the call, not an option the caller varies.
 //!
+//! Backend `tensorfold_torch` is TensorFold's own select on GB10,
+//! `torch.topk(logits.float(), k, sorted=False)`, in the DFlash2 drafter head
+//! (k = 16 over a 98,592-column vocabulary subset) and in target sampling
+//! (k = top_k + 8 over the full vocabulary): fp32 scores, every launch of
+//! Torch's radix select counted. It shares this Config; alone in a config's
+//! backend list it takes its own row axis (`TENSORFOLD_TORCH_ROWS`).
+//!
 //! Matrix width, top-k width, and score dtype identify the call site and so
 //! live in the Config; only the row count moves with the batch, so the cache is
 //! a single interpolated curve over `num_rows`. That split matters here: the
@@ -18,6 +25,16 @@ use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
+
+/// Rows for TensorFold's fp32 `torch.topk` on GB10. Torch's radix select turns
+/// from a few blocks a row to many between 16 and 32 rows (248,320 columns,
+/// k = 28: 0.18 ms at 16 rows, 0.37 at 24, 0.66 at 32), so the axis is dense
+/// there, then follows the drafter (15 rows a stream) and sampling (up to 256
+/// verify rows) ranges, and stays on the kind's 4096-row ceiling.
+const TENSORFOLD_TORCH_ROWS: [u32; 24] = [
+    1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048,
+    3072, 4096,
+];
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LogitsTopkKernelConfig {
@@ -45,7 +62,10 @@ impl KernelSpec for LogitsTopkSpec {
 
     const KIND: KernelKind = "logits_topk";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if config.backends.as_slice() == ["tensorfold_torch"] {
+            return SweepGrid::new(vec![Axis::values(TENSORFOLD_TORCH_ROWS)]);
+        }
         // Powers through 4096 with the halfway points that matter in between.
         // A speculative head scores `requests * draft_tokens` rows, which a
         // 2048-token batch bounds well below 4096; the landmarks stay dense
@@ -148,7 +168,7 @@ mod tests {
         let grid = LogitsTopkSpec::sweep_grid(&cfg);
         assert!(LogitsTopkSpec::infeasible_mask(&cfg, &grid).is_empty());
 
-        for backend in ["torch", "flashinfer"] {
+        for backend in ["torch", "flashinfer", "tensorfold_torch"] {
             assert_eq!(
                 LogitsTopkSpec::cache_kind(backend),
                 CacheKind::Cache1DLinear
@@ -167,6 +187,12 @@ mod tests {
                 assert_eq!(payload.fields()["dtype"], Value::from("bf16"));
             }
         }
+
+        let mut tf = config();
+        tf.backends = vec!["tensorfold_torch"];
+        let tf_rows = LogitsTopkSpec::sweep_grid(&tf).axes()[0].clone();
+        assert!(tf_rows.contains(&24.0) && tf_rows.contains(&96.0));
+        assert_eq!(tf_rows.last(), Some(&4096.0));
 
         let rows: Vec<u64> = LogitsTopkSpec::enumerate(&cfg, &grid, "flashinfer")
             .iter()

@@ -26,7 +26,7 @@ use crate::timing::kernels::{
     ElementwiseKernelInput, Fa4VarlenAttentionKernelInput, FlashinferAttnDecodeKernelInput,
     FlashinferAttnRectKernelInput, Fp8BlockQuantKernelInput, Fp8BlockscaleGroupedGemmKernelInput,
     Fp8PerTokenGroupQuantKernelInput, GdnCausalConvDecodeKernelInput,
-    GdnCausalConvPrefillKernelInput, GdnChunkDeltaRuleKernelInput, GdnGatedRmsNormKernelInput,
+    GdnCausalConvPrefillKernelInput, GdnChunkDeltaRuleKernelInput, GdnConvNormGatesKernelInput, GdnGatedRmsNormKernelInput,
     GdnPrefillPostConvKernelInput, GdnRecurrentDecodeGatedNormKernelInput,
     GdnRecurrentDecodeKernelInput, GemmFp32OutputKernelInput, GroupedGemmKernelInput,
     InvRopeFp8QuantKernelInput, KdaChunkPrefillKernelInput, KdaRecurrentDecodeKernelInput,
@@ -45,10 +45,18 @@ use crate::timing::kernels::{
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
 use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
+use crate::timing::kernels::GdnStateReplayKernelInput;
+use crate::timing::kernels::GemmSwigluQuantKernelInput;
 use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
+use crate::timing::kernels::GdnTreeVerifyRecurrenceKernelInput;
+use crate::timing::kernels::TreeVerifyAttentionKernelInput;
+use crate::timing::kernels::{AttnOutputGateKernelInput, GatedQkRmsNormRopeKernelInput};
+use crate::timing::kernels::{
+    DynamicCausalConvKernelInput, HeadMajorQkNormRopeKernelInput, RowGroupSumsKernelInput,
+};
 use crate::timing::kernels::{
     GroupedRmsNormKernelInput, MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput,
     ScaledSiluKernelInput, SiluAndMulKernelInput, SparseIndexExpandKernelInput,
@@ -57,6 +65,7 @@ use crate::timing::kernels::{
 };
 use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
 use crate::timing::kernels::{PleGateKernelInput, PleNgramIdsKernelInput, PleShortConvKernelInput};
+use crate::timing::kernels::{SlidingBlockAttentionKernelInput, SlidingWindowKvAppendKernelInput};
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
 /// fan-out the attention op summed into one slot (many prefill requests fold to a
@@ -134,6 +143,13 @@ pub struct DsaIndexerPrefillLog {
     pub prefill_query_key_pairs: Vec<(u32, u32)>,
 }
 
+/// Several launches of one kernel summed into one fixed slot (a per-piece or
+/// per-chunk fan-out, INV-1): each launch's own typed input, in launch order.
+#[derive(Clone, Serialize)]
+pub struct FanInLog {
+    pub launches: Vec<SlotInput>,
+}
+
 /// Declare the `SlotInput` enum + a `From<Input>` per variant from one central
 /// list. `#[serde(untagged)]` so each variant serializes as just its inner input
 /// object (e.g. `{"m":512}`) — the slot's kernel kind is recovered from the
@@ -155,6 +171,7 @@ macro_rules! log_inputs {
 
 log_inputs! {
     Gemm        => SingleGemmKernelInput,
+    GemmSwigluQuant => GemmSwigluQuantKernelInput,
     BatchedGemm => BatchedGemmKernelInput,
     GroupedGemm => GroupedGemmKernelInput,
     RmsNorm     => RmsNormKernelInput,
@@ -170,10 +187,13 @@ log_inputs! {
     GdnCausalConvPrefill => GdnCausalConvPrefillKernelInput,
     GdnCausalConvPrefillFanIn => GdnCausalConvPrefillLog,
     GdnChunkDeltaRule => GdnChunkDeltaRuleKernelInput,
+    GdnConvNormGates => GdnConvNormGatesKernelInput,
     GdnGatedRmsNorm => GdnGatedRmsNormKernelInput,
     GdnPrefillPostConv => GdnPrefillPostConvKernelInput,
     GdnRecurrentDecode => GdnRecurrentDecodeKernelInput,
     GdnRecurrentDecodeGatedNorm => GdnRecurrentDecodeGatedNormKernelInput,
+    GdnStateReplay => GdnStateReplayKernelInput,
+    GdnTreeVerifyRecurrence => GdnTreeVerifyRecurrenceKernelInput,
     KdaChunkPrefill => KdaChunkPrefillKernelInput,
     KdaRecurrentDecode => KdaRecurrentDecodeKernelInput,
     MoeFinalizeRouting => MoeFinalizeRoutingKernelInput,
@@ -207,6 +227,9 @@ log_inputs! {
     GemmFp32Output => GemmFp32OutputKernelInput,
     RelBiasAttention => RelBiasAttentionKernelInput,
     Fa4VarlenAttention => Fa4VarlenAttentionKernelInput,
+    TreeVerifyAttention => TreeVerifyAttentionKernelInput,
+    SlidingBlockAttention => SlidingBlockAttentionKernelInput,
+    SlidingWindowKvAppend => SlidingWindowKvAppendKernelInput,
     PagedAttnBatchDecode => PagedAttnBatchDecodeKernelInput,
     PagedAttnBatchPrefill => PagedAttnBatchPrefillKernelInput,
     MlaRopeQuantizeFp8 => MlaRopeQuantizeFp8KernelInput,
@@ -221,6 +244,7 @@ log_inputs! {
     AttnDecode  => FlashinferAttnDecodeKernelInput,
     AttnRect    => FlashinferAttnRectKernelInput,
     Dflash2DraftAttn => Dflash2DraftAttnLog,
+    FanIn => FanInLog,
     KvCacheAppend => KvCacheAppendKernelInput,
     MlaCacheAppend => MlaCacheAppendKernelInput,
     DsaIndexCacheAppend => DsaIndexCacheAppendKernelInput,
@@ -240,6 +264,11 @@ log_inputs! {
     StaticFp8Quant => StaticFp8QuantKernelInput,
     IndexedRowCopy => IndexedRowCopyKernelInput,
     QkRmsNormRopeGate => QkRmsNormRopeGateKernelInput,
+    GatedQkRmsNormRope => GatedQkRmsNormRopeKernelInput,
+    AttnOutputGate => AttnOutputGateKernelInput,
+    RowGroupSums => RowGroupSumsKernelInput,
+    DynamicCausalConv => DynamicCausalConvKernelInput,
+    HeadMajorQkNormRope => HeadMajorQkNormRopeKernelInput,
     SparseGqaPagedAttention => SparseGqaAttentionLog,
     SparseIndexerTopk => SparseIndexerTopkLog,
     SparseIndexExpand => SparseIndexExpandKernelInput,

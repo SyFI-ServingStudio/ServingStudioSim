@@ -73,13 +73,54 @@ impl SweepCoords for FlashinferAttnPrefillKernelInput {
 
 pub struct FlashinferAttnPrefillSpec;
 
+/// TensorFold's CUDA prompt attention (`pattn_kernel`), one stream's chunk.
+pub const TENSORFOLD_PATTN: &str = "tensorfold_pattn";
+
+/// The `(A, B)` grid for `tensorfold_pattn`, sized to its deployment range:
+/// prefill steps of 1..=4096 rows over a cached prefix of up to a 131072-token
+/// context, so `B = append_len` in 1..=4096 and `A = k + q/2` up to 131072.
+///
+/// - `B` follows the launch's waves. A CTA takes 64 rows of two query heads, so
+///   24/4 heads launch 12 CTAs per 64 rows and 48 SMs hold 256 rows a wave; at
+///   a long prefix the time is `ceil(rows / 256)` waves of one CTA's key loop, a
+///   staircase. Every wave edge up to 2560 rows is two nodes, `256n` (the last
+///   row of a wave) and `256n + 1` (the first of the next), so a query between
+///   them stays on one stair; past 2560 a missed step is under 1/11 of the time
+///   and only `256n` is kept. Below one wave: 1, 64 (one block) and 128.
+/// - `A`: the fresh-prefill diagonal (`k = 0`) of every `B` within half a token
+///   (`B/2` for 1, 64, 128, then `128n + 0.5`, the diagonal of `256n + 1` and
+///   `k = 0` for `256n` after `enumerate` floors), so a `k = 0` query
+///   interpolates between measured diagonal cells instead of renormalizing over
+///   the feasible corners of a cell the diagonal cuts; then pow2 4096..131072,
+///   where time is affine in `A` at fixed `B` (the key loop).
+///
+/// 25 x 29 cells, 246 of them `A < B/2` and masked: 479 feasible.
+fn tensorfold_pattn_grid() -> SweepGrid {
+    let mut append = Axis::values([1, 64, 128]);
+    for wave in 1..=16_u32 {
+        append.push(f64::from(256 * wave));
+        if wave <= 10 {
+            append.push(f64::from(256 * wave + 1));
+        }
+    }
+    let mut effective = vec![0.5, 32.0, 64.0];
+    effective.extend((1..=16_u32).map(|n| f64::from(128 * n) + 0.5));
+    effective.extend(Axis::pow2(12, 17));
+    SweepGrid::new(vec![effective, append])
+}
+
 impl KernelSpec for FlashinferAttnPrefillSpec {
     type Config = FlashinferAttnPrefillKernelConfig;
     type Input = FlashinferAttnPrefillKernelInput;
 
     const KIND: KernelKind = "flashinfer_attn_prefill";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        // TensorFold's prompt attention gets its own grid; keeping it off the
+        // FlashInfer/cuDNN grid avoids resampling those backends' existing rows.
+        if config.backends.contains(&TENSORFOLD_PATTN) {
+            return tensorfold_pattn_grid();
+        }
         // Cache axes are (A, B), NOT physical (prefix, append):
         //   A = prefix_len + append_len/2 — spans the feasible range (min q/2=64
         //     at k=0, up to k_max + q_max/2) with headroom: pow2(6,16) = 64..65536.
@@ -125,8 +166,11 @@ impl KernelSpec for FlashinferAttnPrefillSpec {
             // append = B, prefix = A - B/2. Feasible cells have A >= B/2 so this
             // is non-negative; the `.max(0.0)` is a guard for the infeasible
             // A < B/2 cells, which `infeasible_mask` strips before profiling.
+            // Floor, not round: `tensorfold_pattn`'s half-token diagonal nodes
+            // (A = 128n + 0.5 at B = 256n) are fresh prefill. Integer A with even
+            // B, as on the other grid, is exact either way.
             let append_len = b.round() as u32;
-            let prefix_len = (a - b / 2.0).max(0.0).round() as u32;
+            let prefix_len = (a - b / 2.0).max(0.0).floor() as u32;
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("num_qo_heads", config.num_qo_heads.get())
@@ -147,7 +191,7 @@ register_kernel!(FlashinferAttnPrefillKernel, FlashinferAttnPrefillSpec);
 mod tests {
     use super::{
         FlashinferAttnPrefillKernelConfig, FlashinferAttnPrefillKernelInput,
-        FlashinferAttnPrefillSpec,
+        FlashinferAttnPrefillSpec, TENSORFOLD_PATTN,
     };
     use crate::timing::bridge::DType;
     use crate::timing::cache::{CacheKind, Extrapolation};
@@ -316,5 +360,65 @@ mod tests {
         assert_eq!(fields.get("prefix_len"), Some(&Value::from(0_u32)));
         assert_eq!(fields.get("append_len"), Some(&Value::from(128_u32)));
         assert_eq!(first.backend(), Some("fa2"));
+    }
+
+    fn tensorfold_config() -> FlashinferAttnPrefillKernelConfig {
+        FlashinferAttnPrefillKernelConfig {
+            backends: vec![TENSORFOLD_PATTN],
+            gpu_name: "NVIDIA GB10".to_string(),
+            num_qo_heads: 24.into(),
+            num_kv_heads: 4.into(),
+            head_dim: 256.into(),
+            ..config()
+        }
+    }
+
+    #[test]
+    fn tensorfold_grid_spans_its_deployment_range_within_the_ceiling() {
+        // Catches a grid that leaves 1-row chunks, 4096-row steps or a
+        // 131072-token context to extrapolation, or outgrows 500 cells.
+        let cfg = tensorfold_config();
+        let grid = FlashinferAttnPrefillSpec::sweep_grid(&cfg);
+        let (a_ax, b_ax) = (&grid.axes()[0], &grid.axes()[1]);
+        assert_eq!((b_ax[0], *b_ax.last().unwrap()), (1.0, 4096.0));
+        assert_eq!((a_ax[0], *a_ax.last().unwrap()), (0.5, 131072.0));
+        let mask = FlashinferAttnPrefillSpec::infeasible_mask(&cfg, &grid);
+        assert_eq!(mask.iter().filter(|&&m| !m).count(), 479);
+        // Every k = 0 diagonal point has a feasible node within half a token.
+        for &b in b_ax {
+            assert!(
+                a_ax.iter().any(|&a| a >= b / 2.0 && a - b / 2.0 <= 0.5),
+                "A axis needs a node at B/2 = {}",
+                b / 2.0
+            );
+        }
+        // Both sides of each wave edge up to 2560 rows are nodes.
+        for wave in 1..=10 {
+            let edge = f64::from(256 * wave);
+            assert!(b_ax.contains(&edge) && b_ax.contains(&(edge + 1.0)));
+        }
+        // The FlashInfer backends keep their grid (and their existing rows).
+        assert_eq!(
+            FlashinferAttnPrefillSpec::sweep_grid(&config()).axes()[0][0],
+            64.0
+        );
+    }
+
+    #[test]
+    fn tensorfold_diagonal_cells_profile_fresh_prefill() {
+        // The (A = B/2, B) cells must reach the runner as prefix_len = 0.
+        let cfg = tensorfold_config();
+        let grid = FlashinferAttnPrefillSpec::sweep_grid(&cfg);
+        let payloads = FlashinferAttnPrefillSpec::enumerate(&cfg, &grid, TENSORFOLD_PATTN);
+        let b_ax = &grid.axes()[1];
+        // B = 256n sits at A = 128n + 0.5 and B = 256n + 1 at the same A.
+        for (a, append) in [(2048.5, 4096_u32), (1280.5, 2560), (1280.5, 2561)] {
+            let i = grid.axes()[0].iter().position(|&x| x == a).unwrap();
+            let j = b_ax.iter().position(|&b| b == f64::from(append)).unwrap();
+            let fields = payloads[i * b_ax.len() + j].fields();
+            assert_eq!(fields.get("prefix_len"), Some(&Value::from(0_u32)));
+            assert_eq!(fields.get("append_len"), Some(&Value::from(append)));
+            assert_eq!(fields.get("backend"), Some(&Value::from(TENSORFOLD_PATTN)));
+        }
     }
 }
