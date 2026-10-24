@@ -71,6 +71,15 @@ pub mod sglang_glm52_moe_router_local;
 pub mod sglang_moe_finalize_local;
 pub mod spec_head_local;
 pub mod spec_sample_local;
+pub mod tensorfold_common;
+pub mod tensorfold_dflash2_draft_local;
+pub mod tensorfold_head_local;
+pub mod tensorfold_nvfp4_mlp_local;
+pub mod tensorfold_qwen35_gated_gqa_prefill_local;
+pub mod tensorfold_qwen35_gated_gqa_verify_local;
+pub mod tensorfold_qwen35_gdn_prefill_local;
+pub mod tensorfold_qwen35_gdn_verify_local;
+pub mod tensorfold_round_commit_local;
 pub mod vllm_bf16_gdn_spec_local;
 pub mod vllm_fp8_attn_block_tp;
 pub mod vllm_fp8_moe_expert_compute_local;
@@ -315,6 +324,15 @@ pub use spec_head_local::{
 pub use spec_sample_local::{
     SpecSampleLocalWorklet, SpecSampleLocalWorkletConfig, SpecSampleLocalWorkletInput,
     SpecSampleLocalWorkletResolved,
+};
+pub use tensorfold_qwen35_gated_gqa_prefill_local::{
+    TensorfoldQwen35GatedGqaPrefillCopies, TensorfoldQwen35GatedGqaPrefillLocalWorklet,
+    TensorfoldQwen35GatedGqaPrefillLocalWorkletConfig,
+    TensorfoldQwen35GatedGqaPrefillLocalWorkletResolved,
+};
+pub use tensorfold_qwen35_gated_gqa_verify_local::{
+    TensorfoldQwen35GatedGqaConfig, TensorfoldQwen35GatedGqaVerifyLocalWorklet,
+    TensorfoldQwen35GatedGqaVerifyLocalWorkletResolved,
 };
 pub use vllm_bf16_gdn_spec_local::{
     VllmBf16GdnSpecLocalWorklet, VllmBf16GdnSpecLocalWorkletConfig,

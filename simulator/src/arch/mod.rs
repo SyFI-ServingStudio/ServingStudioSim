@@ -29,6 +29,7 @@ pub mod mimo_v2_model_cfg;
 pub mod mimo_v2_vllm_fp8_swa_moe;
 pub mod model_cfg;
 pub mod moe_model_cfg;
+pub mod qwen35_dflash2_draft_cfg;
 pub mod qwen35_model_cfg;
 pub mod qwen35_vllm_nvfp4_gdn_dense;
 pub mod qwen36_local;

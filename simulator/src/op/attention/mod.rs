@@ -8,6 +8,7 @@ pub mod flashinfer;
 pub mod glm53_kpool_sparse_mla;
 pub mod sparse_gqa;
 pub mod sparse_gqa_indexer;
+pub mod tensorfold_prefill_attention;
 
 pub use deepseek_v41_indexer::{
     byte_rate_placeholder_shape, DeepseekV41CandidateRole, DeepseekV41IndexerOp,
@@ -35,4 +36,8 @@ pub use sparse_gqa::{
 pub use sparse_gqa_indexer::{
     ring_tokens, SparseGqaIndexerOp, SparseGqaIndexerOpConfig, SparseGqaIndexerOpInput,
     SparseGqaIndexerOpResolved,
+};
+pub use tensorfold_prefill_attention::{
+    TensorfoldPrefillAttentionOp, TensorfoldPrefillAttentionOpConfig,
+    TensorfoldPrefillAttentionOpInput,
 };
