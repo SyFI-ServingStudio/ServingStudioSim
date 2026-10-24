@@ -21,7 +21,7 @@ from profiling.db import storage
 from profiling.db.args import KernelArgs, canonical_args, field_types, optional_fields
 from profiling.db.kind import KernelKind
 from profiling.db.migrate import SCHEMA_HASH, migrate_connection, require_current
-from profiling.db.registry import KernelProfilerSpec, MetricFamily
+from profiling.db.registry import KernelProfilerSpec, MetricFamily, find_kernel_profiler_spec
 from profiling.runners.metrics import CommMetrics, ComputeMetrics, Metrics
 
 STANDARD_COLUMNS = [
@@ -517,6 +517,13 @@ class Table:
             if column not in present:
                 conn.execute(f"ALTER TABLE {self.name} ADD COLUMN {column} {declared[column]}")
 
+    def _row_device_family(self, backend: str) -> str:
+        if backend == self.profiler_spec.backend:
+            return self.profiler_spec.supports.device_family
+        return find_kernel_profiler_spec(
+            self.profiler_spec.kernel_kind, backend
+        ).supports.device_family
+
     def _row_values(
         self,
         conn: sqlite3.Connection,
@@ -527,10 +534,17 @@ class Table:
     ) -> list[Any]:
         key = self.db_key(row.args)
         metric_values = _metrics_to_db(row.metrics)
+        cuda_version, driver_version = row.cuda_version, row.driver_version
+        # The controller's CUDA and NVIDIA driver describe only a CUDA row. A
+        # table can hold both families, so the row's own backend decides; a
+        # Neuron row keeps NULL rather than borrowing the controller's.
+        if self._row_device_family(row.backend) == "cuda":
+            cuda_version = cuda_version or _cuda_version()
+            driver_version = driver_version or _driver_version()
         provenance = (
             row.profiler_git_hash or default_git_hash,
-            row.cuda_version or _cuda_version(),
-            row.driver_version or _driver_version(),
+            cuda_version,
+            driver_version,
             row.backend_version or _backend_version(row.backend),
         )
         return [
