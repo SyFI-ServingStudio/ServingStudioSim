@@ -1,0 +1,66 @@
+# GLM-5.3-Flash NVFP4 prefill on one B200 PP4 pipeline as SSEngine runs it (engine choices: README.md): the v3 M6
+# sessions, N = 300, HBM 100.18 GB + DRAM 128 GB + SSD 8 TB per GPU, 20 minutes: the full setting's tiers
+# (v3_m6_full.yaml, DRAM 50 GB + SSD 128 GB) at the host's capacities.
+#
+# Workload: TraceLab v3 coding-agent sessions arriving at 2 per second (2,457 sessions, 260,801 rounds). The
+# trace CSV is not committed (~19 MB); provision it per the create-worktree skill. Its committed manifest gives
+# the source and the sha256.
+deployment: pp
+
+workload:
+  trace_files:
+    - trace/sessions_2ps_v3.csv
+  input_file_format: text-generation-session-execution-v2
+  arrival_mode: trace_timed
+  request_rate: 1.0
+  max_concurrency: 300
+  run_to_end: false
+  duration_ms: 1200000.0
+
+io:
+  log_dir: logs/glm53_flash_prefill/v3_m6_dram128_ssd8t
+
+pools:
+  stage:
+    groups:
+      - gpu: NVIDIA B200
+        replicas: 1
+        arch:
+          type: glm53_flash_vllm_nvfp4_pp_kda_dsa_moe
+          model_config: model/config/glm53_flash_nvfp4.json
+          fp8: false
+          pp_size: 4
+          layer_partition: [12, 11, 11, 11]
+          max_model_len: 1048576
+          mla_layout_copies: false
+          indexer_max_logits_mb: 512
+          routing: corpus
+          token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm53_flash_fp8/vllm/balanced_c32/capture/20260924/manifest.json
+        worker:
+          type: pipeline_chunked_prefill
+          max_batch_tokens: 32768
+          gpu_time_multiplier: 1.0
+          prefill_chunk_alignment: plain
+          attn_gpu_memory_gb: 100.18
+          external_decode: true
+          dram_tier_gb: 128.0
+          dram_tier_gb_per_s: 50.0
+          dram_tier_writes: hbm-evictions-exclusive
+          ssd_tier_gb: 8000.0
+          ssd_tier_gb_per_s: 10.0
+          ssd_tier_writes: dram-evictions
+          prefix_tier_warm_start: false
+          prefix_tier_max_read_wait_ms: 1000.0
+          prefix_tier_balanced_load: true
+          prefix_tier_loading_area: 0.1
+          force_schedule_after_ms: 60000.0
+          microbatch_split: even
+          min_microbatch_tokens: 512
+          long_prefill_token_threshold: 0
+          pending_order: shortest-prefill-first
+          load_budget_low_tokens: 4096
+          load_budget_backlog_lo_tokens: 1000000
+          load_budget_backlog_hi_tokens: 3000000
+          srpt: true
+
+backends_file: backends_ssengine.yaml

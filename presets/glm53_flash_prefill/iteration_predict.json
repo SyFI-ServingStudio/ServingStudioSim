@@ -32,6 +32,6 @@
       "unified.kda_moe.kda.chunk_prefill": ["flashinfer_cute_persistent"]
     }
   },
-  "log_dir": "logs/predict_glm53_flash_nvfp4_b200_pp4_ssengine",
-  "cases_file": "predict_glm53_flash_nvfp4_b200_pp4_ssengine_cases.json"
+  "log_dir": "logs/glm53_flash_prefill/iteration_predict",
+  "cases_file": "iteration_predict_cases.json"
 }
