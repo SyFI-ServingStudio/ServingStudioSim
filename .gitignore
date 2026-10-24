@@ -23,6 +23,9 @@ trace/aime_long.csv
 # a run checks itself against.
 trace/tracelab_*
 !trace/tracelab_*.manifest.json
+# TraceLab v3 session traces (presets/glm53_flash_prefill/); the manifests stay tracked.
+trace/sessions_2ps_v3.csv
+trace/closed_c2000_v3.csv
 
 # Editor / OS
 .vscode/

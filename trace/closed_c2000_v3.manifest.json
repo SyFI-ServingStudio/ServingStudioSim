@@ -1,0 +1,11 @@
+{
+  "source": "mono_sessions_d80.csv",
+  "source_sha256": "9d74c7491bd1db57f58be13991cc782fa6936531fed1427054733aca7e078ee4",
+  "generator": "trace/session_closed_loop.py --concurrency 2000 --after 40000 --seed 0",
+  "concurrency": 2000,
+  "after": 40000,
+  "seed": 0,
+  "sessions": 42000,
+  "rows": 7547561,
+  "sha256": "e4b5c43a668d79ad685959d550afaafb457f12d7cc1c4a6be083bd9e26549a21"
+}
