@@ -1515,6 +1515,7 @@ mod tests {
                         query_len: 4,
                     })
                     .collect(),
+                decode_outcomes: Vec::new(),
                 total_kv_len: 0,
             }],
             tokens_per_source_rank: Vec::new(),

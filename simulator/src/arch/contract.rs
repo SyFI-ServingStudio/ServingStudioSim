@@ -271,6 +271,77 @@ impl SpeculativeDecodeInput {
         }
         Ok(clipped)
     }
+
+    /// Validate this row for a model that takes ragged verify windows
+    /// ([`SpeculativeUnifiedModel::ragged_verify_windows`]): any width of at
+    /// least one row, inside `max_model_len`. The width is not tied to
+    /// `draft_tokens + 1`, and a short row may end anywhere; the model's own
+    /// `check_input` bounds the width if its kernels need it.
+    pub fn check_ragged_verify_row(&self, max_model_len: u32) -> Result<(), String> {
+        if self.query_len == 0 {
+            return Err("query_len must be at least 1".into());
+        }
+        if !(self.query_len..=max_model_len).contains(&self.kv_len) {
+            return Err(format!(
+                "kv_len {} must be in {}..={max_model_len}",
+                self.kv_len, self.query_len
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// How a decode request's verify window was proposed this step. The wire form
+/// is the snake_case name (`"copy"`, `"tree"`, `"one"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculativeWindowMode {
+    /// A chain copied from earlier context (prompt lookup); no drafter pass.
+    Copy,
+    /// A tree from the draft model.
+    Tree,
+    /// The pending token alone: nothing proposed, one query row.
+    One,
+}
+
+/// What one decode request's verify step produced, for a model whose cost
+/// depends on it (commit copies, recurrent-state replay, the draft pass).
+///
+/// Carried beside [`SpeculativeDecodeInput`] rather than inside it, so the
+/// row stays a two-`u32` `Copy` value for the models that ignore outcomes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpeculativeDecodeOutcome {
+    /// Draft rows accepted, excluding the root (pending) token: at most
+    /// `query_len - 1`.
+    pub accepted: u32,
+    /// The scheduler's slot count for this request's tree; 0 for a chain.
+    pub tree_slots: u32,
+    pub mode: SpeculativeWindowMode,
+}
+
+impl SpeculativeDecodeOutcome {
+    /// Check this outcome against the verify row it belongs to.
+    pub fn check_against(&self, row: &SpeculativeDecodeInput) -> Result<(), String> {
+        if self.accepted >= row.query_len {
+            return Err(format!(
+                "accepted {} must be below query_len {} (the root row is not counted)",
+                self.accepted, row.query_len
+            ));
+        }
+        if self.mode != SpeculativeWindowMode::Tree && self.tree_slots != 0 {
+            return Err(format!(
+                "a {:?} window is a chain, so tree_slots must be 0, not {}",
+                self.mode, self.tree_slots
+            ));
+        }
+        if self.mode == SpeculativeWindowMode::One && row.query_len != 1 {
+            return Err(format!(
+                "a One window has one query row, not {}",
+                row.query_len
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One attention/FFN group view for a speculative iter-wise batch.
@@ -286,6 +357,11 @@ pub struct SpeculativeArchGroupInput {
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
     /// Per speculative decode request: final KV length plus verify query rows.
     pub decode_requests: Vec<SpeculativeDecodeInput>,
+    /// Per decode request, what its verify step produced, parallel to
+    /// `decode_requests`; empty when the caller supplied none. Most models
+    /// ignore it. A model that needs it rejects, in `check_input`, a group
+    /// whose `decode_outcomes.len() != decode_requests.len()`.
+    pub decode_outcomes: Vec<SpeculativeDecodeOutcome>,
     /// Cumulative resident KV before this verify pass (KV-cache pressure).
     /// `decode_requests[*].kv_len` is the final verify-row length instead.
     pub total_kv_len: u32,
@@ -308,6 +384,7 @@ impl SpeculativeArchGroupInput {
         self.total_kv_len = 0;
         self.prefill_chunk_pairs.clear();
         self.decode_requests.clear();
+        self.decode_outcomes.clear();
     }
 }
 
@@ -427,6 +504,16 @@ pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
     fn prunes_last_prefix_block(&self) -> bool {
         true
     }
+
+    /// Whether this model takes verify windows of any width. By default a
+    /// row is `draft_tokens + 1` wide unless clipped at `max_model_len`
+    /// ([`SpeculativeDecodeInput::check_verify_row`]). A model whose
+    /// scheduler trims or grows each window (a cost-sized tree, a copied
+    /// chain) returns true, and offline lowering then only checks
+    /// [`SpeculativeDecodeInput::check_ragged_verify_row`].
+    fn ragged_verify_windows(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -453,6 +540,7 @@ mod speculative_arch_input_tests {
                     query_len: 6,
                 },
             ],
+            decode_outcomes: Vec::new(),
             total_kv_len: 155,
         };
 

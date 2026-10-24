@@ -3496,6 +3496,7 @@ mod tests {
                         query_len: verify_width,
                     })
                     .collect(),
+                decode_outcomes: Vec::new(),
                 total_kv_len: decode_kv_lens
                     .iter()
                     .map(|length| length.saturating_sub(verify_width))

@@ -45,7 +45,7 @@ pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 pub use contract::{
     ArchGroupInput, AttnArchInput, AttnLayerwiseModel, FfnArchInput, FfnLayerwiseModel,
     IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput, SpeculativeDecodeInput,
-    SpeculativeUnifiedModel, UnifiedArchInput,
+    SpeculativeDecodeOutcome, SpeculativeUnifiedModel, SpeculativeWindowMode, UnifiedArchInput,
 };
 pub use deepseek_v41_vllm::{
     DeepseekV41ModelCfg, DeepseekV41VllmConfigs, DeepseekV41VllmModel, DeepseekV41VllmParallel,

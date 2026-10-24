@@ -62,6 +62,9 @@ pub enum ParamType {
     PathList,
     /// A list of two-int pairs (`Vec<[u32; 2]>`), e.g. `[[prefix_len, append_len], ...]`.
     IntPairList,
+    /// One `[accepted, tree_slots, mode]` per speculative decode request:
+    /// two ints and a mode string (`"copy"`, `"tree"` or `"one"`).
+    DecodeOutcomeList,
 }
 
 /// Default value carried inline on a `ParamDef`. Serializes as a **bare**
@@ -183,6 +186,10 @@ impl ParamDef {
 
     pub const fn int_pair_list(name: &'static str) -> Self {
         Self::bare(name, ParamType::IntPairList)
+    }
+
+    pub const fn decode_outcome_list(name: &'static str) -> Self {
+        Self::bare(name, ParamType::DecodeOutcomeList)
     }
 
     pub const fn default_int(mut self, v: i64) -> Self {

@@ -154,6 +154,7 @@ mod tests {
             [
                 pair("prefill_chunk_pairs", "int_pair_list"),
                 pair("decode_requests", "int_pair_list"),
+                pair("decode_outcomes", "decode_outcome_list"),
             ]
         );
         assert_eq!(
@@ -164,6 +165,19 @@ mod tests {
 
     /// The group's GPU and an arch's routing pick kernels, so the launcher's
     /// cache-key dedup must tell configs apart by them.
+    /// The speculative outcomes are optional: a case without them stays valid.
+    #[test]
+    fn speculative_decode_outcomes_are_optional() {
+        let groups = &list_params()["predict_cases"]["speculative_iter"]["groups"];
+        let outcomes = groups
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "decode_outcomes")
+            .expect("decode_outcomes published");
+        assert_eq!(outcomes["required"], false);
+    }
+
     #[test]
     fn gpu_and_routing_affect_the_kernel_cache() {
         let schema = list_params();

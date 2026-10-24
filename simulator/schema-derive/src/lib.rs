@@ -21,6 +21,11 @@
 //!   - `#[param(string)]`           → treat the field as a `string` param even
 //!                                     though its Rust type is a foreign enum
 //!                                     (`placement`, `log_level`, `batch_policy`).
+//!   - `#[param(ty = CTOR)]`        → build the param with `ParamDef::CTOR`, for
+//!                                     a list whose elements no scalar inference
+//!                                     covers (`decode_outcome_list`). Optional
+//!                                     when the field is an `Option` or carries
+//!                                     `#[serde(default)]`.
 //!
 //! `#[serde(flatten)]` fields are skipped automatically (the flattened struct
 //! contributes its own `PARAMS` block). A `bool` with no explicit default gets an
@@ -61,6 +66,8 @@ struct Classified {
 struct ParamAttr {
     skip: bool,
     force_string: bool,
+    /// `ParamDef` constructor named by `#[param(ty = ...)]`.
+    ty: Option<syn::Ident>,
     cache_key: bool,
     default: Option<Lit>,
     choices: Option<Expr>,
@@ -166,7 +173,16 @@ fn param_defs<'a>(
 
         // `#[param(string)]` overrides type inference (the Rust field is a
         // foreign enum but the schema treats it as a `string` with `choices`).
-        let mut cls = if attr.force_string {
+        let mut ctor_override = None;
+        let mut cls = if let Some(ty) = &attr.ty {
+            ctor_override = Some(ty.clone());
+            Classified {
+                ctor: "",
+                default_method: "",
+                optional: generic_inner(&f.ty, "Option").is_some(),
+                is_bool: false,
+            }
+        } else if attr.force_string {
             Classified {
                 ctor: "string",
                 default_method: "default_string",
@@ -191,7 +207,7 @@ fn param_defs<'a>(
             cls.optional = true;
         }
 
-        let ctor = syn::Ident::new(cls.ctor, f.span());
+        let ctor = ctor_override.unwrap_or_else(|| syn::Ident::new(cls.ctor, f.span()));
         let mut chain = quote! { ::simulator::schema::ParamDef::#ctor(#name_str) };
 
         if let Some(lit) = attr.default {
@@ -400,6 +416,17 @@ fn parse_param_attr(attrs: &[Attribute]) -> syn::Result<ParamAttr> {
                     }
                 }
                 Meta::NameValue(nv) if nv.path.is_ident("choices") => out.choices = Some(nv.value),
+                Meta::NameValue(nv) if nv.path.is_ident("ty") => match nv.value {
+                    Expr::Path(p) if p.path.get_ident().is_some() => {
+                        out.ty = p.path.get_ident().cloned();
+                    }
+                    other => {
+                        return Err(syn::Error::new(
+                            other.span(),
+                            "param: ty names a ParamDef constructor, e.g. `ty = int_pair_list`",
+                        ))
+                    }
+                },
                 other => return Err(syn::Error::new(other.span(), "param: unknown key")),
             }
         }

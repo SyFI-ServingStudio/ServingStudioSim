@@ -50,7 +50,7 @@ use crate::arch::build::{
 use crate::arch::contract::{
     ArchGroupInput, AttnArchInput, AttnLayerwiseModel, FfnArchInput, FfnLayerwiseModel,
     IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput, SpeculativeDecodeInput,
-    SpeculativeUnifiedModel, UnifiedArchInput,
+    SpeculativeDecodeOutcome, SpeculativeUnifiedModel, SpeculativeWindowMode, UnifiedArchInput,
 };
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, TooLong, WorkerId};
@@ -297,18 +297,42 @@ pub(crate) struct SpeculativePredictGroup {
     /// Decode (verify) requests, one `[kv_len, query_len]` each: the KV length
     /// once the verify step has run, and its query width, `draft_tokens + 1`,
     /// or fewer for a row clipped at `max_model_len` (which then ends at
-    /// `max_model_len - 1`).
+    /// `max_model_len - 1`). An arch with ragged verify windows takes any
+    /// width of at least 1.
     #[serde(default)]
     decode_requests: Vec<[u32; 2]>,
+    /// Optional, parallel to `decode_requests`: one `[accepted, tree_slots,
+    /// mode]` per decode request. `accepted` counts accepted draft rows, not the
+    /// root; `tree_slots` is the scheduler's slot count for the request's tree,
+    /// 0 for a chain; `mode` is "copy", "tree" or "one". Most archs ignore it;
+    /// an arch that needs it refuses a case without it.
+    #[serde(default)]
+    #[param(ty = decode_outcome_list)]
+    decode_outcomes: Option<Vec<DecodeOutcomeWire>>,
 }
 
+/// One `decode_outcomes` entry on the wire: `[accepted, tree_slots, mode]`.
+#[derive(Debug, Deserialize)]
+struct DecodeOutcomeWire(u32, u32, SpeculativeWindowMode);
+
 impl SpeculativePredictGroup {
+    /// `ragged_verify_windows` is the model's
+    /// [`SpeculativeUnifiedModel::ragged_verify_windows`].
     fn into_arch_group(
         self,
         draft_tokens: u32,
         max_model_len: u32,
+        ragged_verify_windows: bool,
     ) -> Result<SpeculativeArchGroupInput> {
         let mut group = SpeculativeArchGroupInput::default();
+        if let Some(outcomes) = &self.decode_outcomes {
+            ensure!(
+                outcomes.len() == self.decode_requests.len(),
+                "decode_outcomes has {} entries but decode_requests has {}",
+                outcomes.len(),
+                self.decode_requests.len()
+            );
+        }
         for [prefix, append] in self.prefill_chunk_pairs {
             ensure!(append > 0, "prefill append must be positive");
             ensure_prefill_fits(prefix, append, max_model_len)?;
@@ -321,8 +345,12 @@ impl SpeculativePredictGroup {
         for [kv_len, query_len] in self.decode_requests {
             ensure_fits("final verify KV length", kv_len, max_model_len)?;
             let row = SpeculativeDecodeInput { kv_len, query_len };
-            row.check_verify_row(draft_tokens, max_model_len)
-                .map_err(|reason| anyhow!(reason))?;
+            if ragged_verify_windows {
+                row.check_ragged_verify_row(max_model_len)
+            } else {
+                row.check_verify_row(draft_tokens, max_model_len).map(drop)
+            }
+            .map_err(|reason| anyhow!(reason))?;
             group.decode_tokens = group
                 .decode_tokens
                 .checked_add(query_len)
@@ -332,6 +360,19 @@ impl SpeculativePredictGroup {
                 .checked_add(kv_len - query_len)
                 .context("decode KV sum overflows u32")?;
             group.decode_requests.push(row);
+        }
+        for (index, DecodeOutcomeWire(accepted, tree_slots, mode)) in
+            self.decode_outcomes.into_iter().flatten().enumerate()
+        {
+            let outcome = SpeculativeDecodeOutcome {
+                accepted,
+                tree_slots,
+                mode,
+            };
+            outcome
+                .check_against(&group.decode_requests[index])
+                .map_err(|reason| anyhow!("decode_outcomes[{index}]: {reason}"))?;
+            group.decode_outcomes.push(outcome);
         }
         group.batch_tokens = group
             .prefill_tokens
@@ -610,6 +651,7 @@ fn speculative_iter_inputs(
     cases: Vec<SpeculativePredictCase>,
 ) -> Result<Vec<SpeculativeArchInput>> {
     ensure!(draft_tokens < u32::MAX, "verify width overflows u32");
+    let ragged_verify_windows = model.ragged_verify_windows();
     cases
         .into_iter()
         .enumerate()
@@ -621,7 +663,9 @@ fn speculative_iter_inputs(
             let groups: Vec<_> = case
                 .groups
                 .into_iter()
-                .map(|group| group.into_arch_group(draft_tokens, max_model_len))
+                .map(|group| {
+                    group.into_arch_group(draft_tokens, max_model_len, ragged_verify_windows)
+                })
                 .collect::<Result<_>>()
                 .with_context(|| format!("case {index}"))?;
             let tokens_per_source_rank = if groups.len() > 1 {
@@ -898,7 +942,7 @@ mod tests {
             r#"{"prefill_chunk_pairs": [[32, 8]], "decode_requests": [[106, 6], [206, 6]]}"#,
         )
         .unwrap();
-        let lowered = group.into_arch_group(5, 8192).unwrap();
+        let lowered = group.into_arch_group(5, 8192, false).unwrap();
         assert_eq!(lowered.request_count(), 3);
         assert_eq!(lowered.decode_tokens, 12);
         assert_eq!(lowered.batch_tokens, 20);
@@ -922,14 +966,16 @@ mod tests {
             let group = SpeculativePredictGroup {
                 prefill_chunk_pairs: vec![],
                 decode_requests: vec![pair],
+                decode_outcomes: None,
             };
-            assert!(group.into_arch_group(5, 8192).is_err());
+            assert!(group.into_arch_group(5, 8192, false).is_err());
         }
         let group = SpeculativePredictGroup {
             prefill_chunk_pairs: vec![[u32::MAX, 1]],
             decode_requests: vec![],
+            decode_outcomes: None,
         };
-        assert!(group.into_arch_group(5, 8192).is_err());
+        assert!(group.into_arch_group(5, 8192, false).is_err());
     }
 
     #[test]
@@ -940,8 +986,9 @@ mod tests {
             let group = SpeculativePredictGroup {
                 prefill_chunk_pairs: vec![],
                 decode_requests: vec![pair],
+                decode_outcomes: None,
             };
-            let lowered = group.into_arch_group(5, 8192).unwrap();
+            let lowered = group.into_arch_group(5, 8192, false).unwrap();
             assert_eq!(lowered.decode_tokens, pair[1]);
             assert_eq!(lowered.total_kv_len, pair[0] - pair[1]);
         }
@@ -949,16 +996,200 @@ mod tests {
         let full = SpeculativePredictGroup {
             prefill_chunk_pairs: vec![],
             decode_requests: vec![[8192, 6]],
+            decode_outcomes: None,
         };
-        assert_eq!(full.into_arch_group(5, 8192).unwrap().decode_tokens, 6);
+        assert_eq!(
+            full.into_arch_group(5, 8192, false).unwrap().decode_tokens,
+            6
+        );
         // Clipped anywhere else, empty, or wider than the window is refused.
         for pair in [[8190, 5], [8192, 5], [8191, 0], [8191, 7]] {
             let group = SpeculativePredictGroup {
                 prefill_chunk_pairs: vec![],
                 decode_requests: vec![pair],
+                decode_outcomes: None,
             };
-            assert!(group.into_arch_group(5, 8192).is_err(), "{pair:?}");
+            assert!(group.into_arch_group(5, 8192, false).is_err(), "{pair:?}");
         }
+    }
+
+    /// A speculative test double whose only behaviour is the ragged-window
+    /// capability; costing it is a bug.
+    struct RaggedDouble {
+        ragged: bool,
+        inner: crate::test_helpers::FakeModel,
+    }
+
+    impl RaggedDouble {
+        fn new(ragged: bool) -> Self {
+            Self {
+                ragged,
+                inner: crate::test_helpers::FakeModel::for_ms(1.0),
+            }
+        }
+    }
+
+    impl SpeculativeUnifiedModel for RaggedDouble {
+        fn eval_speculative_iter(
+            &self,
+            _batch: &SpeculativeArchInput,
+            _slots: &mut Vec<crate::timing::LeafMetrics>,
+            _scratch: &mut Vec<crate::timing::LeafMetrics>,
+        ) -> crate::timing::LeafMetrics {
+            unreachable!("lowering tests never cost a case")
+        }
+        fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+            IterwiseUnifiedModel::kv_cache_layout(&self.inner)
+        }
+        fn max_model_len(&self) -> u32 {
+            8192
+        }
+        fn gpus_per_replica(&self) -> u16 {
+            1
+        }
+        fn ragged_verify_windows(&self) -> bool {
+            self.ragged
+        }
+    }
+
+    fn speculative_cases(json: &str) -> Vec<SpeculativePredictCase> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn decode_outcomes_lower_parallel_to_decode_requests() {
+        let group: SpeculativePredictGroup = serde_json::from_str(
+            r#"{"prefill_chunk_pairs": [[0, 64]],
+                "decode_requests": [[1006, 6], [2001, 1]],
+                "decode_outcomes": [[3, 4, "tree"], [0, 0, "one"]]}"#,
+        )
+        .unwrap();
+        let lowered = group.into_arch_group(5, 8192, true).unwrap();
+        assert_eq!(
+            lowered.decode_outcomes,
+            [
+                SpeculativeDecodeOutcome {
+                    accepted: 3,
+                    tree_slots: 4,
+                    mode: SpeculativeWindowMode::Tree,
+                },
+                SpeculativeDecodeOutcome {
+                    accepted: 0,
+                    tree_slots: 0,
+                    mode: SpeculativeWindowMode::One,
+                },
+            ]
+        );
+        // The rows and the bookkeeping are what they are without outcomes.
+        assert_eq!(lowered.decode_tokens, 7);
+        assert_eq!(lowered.total_kv_len, 1000 + 2000);
+
+        // Absent, the lowered group carries none, and nothing else changes.
+        let bare: SpeculativePredictGroup =
+            serde_json::from_str(r#"{"decode_requests": [[1006, 6], [2001, 1]]}"#).unwrap();
+        let bare = bare.into_arch_group(5, 8192, true).unwrap();
+        assert!(bare.decode_outcomes.is_empty());
+        assert_eq!(bare.decode_requests, lowered.decode_requests);
+    }
+
+    #[test]
+    fn decode_outcomes_must_match_decode_requests_one_for_one() {
+        let group: SpeculativePredictGroup = serde_json::from_str(
+            r#"{"decode_requests": [[106, 6], [206, 6]], "decode_outcomes": [[1, 0, "copy"]]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            group
+                .into_arch_group(5, 8192, false)
+                .unwrap_err()
+                .to_string(),
+            "decode_outcomes has 1 entries but decode_requests has 2"
+        );
+        // Present but empty is a mismatch too, unless there are no decodes.
+        let empty: SpeculativePredictGroup =
+            serde_json::from_str(r#"{"decode_requests": [[106, 6]], "decode_outcomes": []}"#)
+                .unwrap();
+        assert!(empty.into_arch_group(5, 8192, false).is_err());
+        let none: SpeculativePredictGroup =
+            serde_json::from_str(r#"{"prefill_chunk_pairs": [[0, 8]], "decode_outcomes": []}"#)
+                .unwrap();
+        assert!(none.into_arch_group(5, 8192, false).is_ok());
+    }
+
+    #[test]
+    fn decode_outcomes_are_checked_against_their_rows() {
+        for (outcome, reason) in [
+            (r#"[6, 0, "copy"]"#, "accepted 6 must be below query_len 6"),
+            (r#"[2, 3, "copy"]"#, "tree_slots must be 0"),
+            (r#"[0, 0, "one"]"#, "a One window has one query row, not 6"),
+        ] {
+            let group: SpeculativePredictGroup = serde_json::from_str(&format!(
+                r#"{{"decode_requests": [[106, 6]], "decode_outcomes": [{outcome}]}}"#
+            ))
+            .unwrap();
+            let err = group
+                .into_arch_group(5, 8192, false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("decode_outcomes[0]: "), "{err}");
+            assert!(err.contains(reason), "{outcome}: {err}");
+        }
+        // The wire form is exactly [int, int, mode name].
+        for bad in [
+            r#"[1, 0, "chain"]"#,
+            r#"[1, 0]"#,
+            r#"[1, 0, 1]"#,
+            r#"[1, 0, "copy", 2]"#,
+        ] {
+            let json = format!(r#"{{"decode_requests": [[106, 6]], "decode_outcomes": [{bad}]}}"#);
+            assert!(
+                serde_json::from_str::<SpeculativePredictGroup>(&json).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn ragged_verify_windows_are_taken_only_by_a_model_that_opts_in() {
+        // A 3-row window mid-context: neither full width (6) nor clipped at
+        // max_model_len - 1.
+        let json = r#"[{"groups": [{"decode_requests": [[503, 3], [900, 6]],
+                                    "decode_outcomes": [[1, 2, "tree"], [5, 0, "copy"]]}]}]"#;
+        let fixed =
+            speculative_iter_inputs(&RaggedDouble::new(false), 5, 8192, speculative_cases(json))
+                .unwrap_err();
+        let fixed = format!("{fixed:#}");
+        assert!(
+            fixed.starts_with("case 0: a clipped verify row (3 of 6 queries)"),
+            "{fixed}"
+        );
+        let inputs =
+            speculative_iter_inputs(&RaggedDouble::new(true), 5, 8192, speculative_cases(json))
+                .unwrap();
+        let group = &inputs[0].groups[0];
+        assert_eq!(group.decode_tokens, 9);
+        assert_eq!(group.decode_outcomes.len(), 2);
+
+        // Ragged still means inside the model: at least one row, kv_len covers
+        // the rows, and no longer than max_model_len. Wider than the draft
+        // budget is the model's own check_input to refuse.
+        for pair in [[100, 0], [2, 3], [8193, 3]] {
+            let group = SpeculativePredictGroup {
+                prefill_chunk_pairs: vec![],
+                decode_requests: vec![pair],
+                decode_outcomes: None,
+            };
+            assert!(group.into_arch_group(5, 8192, true).is_err(), "{pair:?}");
+        }
+        let wide = SpeculativePredictGroup {
+            prefill_chunk_pairs: vec![],
+            decode_requests: vec![[500, 9]],
+            decode_outcomes: None,
+        };
+        assert_eq!(
+            wide.into_arch_group(5, 8192, true).unwrap().decode_tokens,
+            9
+        );
     }
 
     #[test]
@@ -984,10 +1215,11 @@ mod tests {
         let speculative = SpeculativePredictGroup {
             prefill_chunk_pairs: vec![[8000, 193]],
             decode_requests: vec![],
+            decode_outcomes: None,
         };
         assert_eq!(
             speculative
-                .into_arch_group(5, 8192)
+                .into_arch_group(5, 8192, false)
                 .unwrap_err()
                 .to_string(),
             prefill
