@@ -1,0 +1,72 @@
+# GLM-5.3-Flash NVFP4 prefill on one B200 PP4 pipeline as SSEngine runs it (engine choices: README.md): 40
+# bring-up sessions whose later rounds extend the earlier ones (bring-up prefix_sessions.csv), prefix cache in HBM
+# only. `plain` is vLLM's greedy 8,192-token chunking; `good` is the scheduler.
+deployment: pp
+
+workload:
+  trace_files: ${trace}
+  input_file_format: text-generation-session-execution-v2
+  arrival_mode: trace_timed
+  request_rate: 1.0
+  max_concurrency: 1000
+  run_to_end: true
+  duration_ms: 1500000.0
+
+io:
+  log_dir: logs/glm53_flash_prefill/check_prefix_hit/{sched}
+
+pools:
+  stage:
+    groups:
+      - gpu: NVIDIA B200
+        replicas: 1
+        arch:
+          type: glm53_flash_vllm_nvfp4_pp_kda_dsa_moe
+          model_config: model/config/glm53_flash_nvfp4.json
+          fp8: false
+          pp_size: 4
+          layer_partition: [12, 11, 11, 11]
+          max_model_len: 1048576
+          mla_layout_copies: false
+          indexer_max_logits_mb: 512
+          routing: corpus
+          token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm53_flash_fp8/vllm/balanced_c32/capture/20260924/manifest.json
+        worker:
+          type: pipeline_chunked_prefill
+          max_batch_tokens: ${max_batch_tokens}
+          gpu_time_multiplier: 1.0
+          prefill_chunk_alignment: plain
+          attn_gpu_memory_gb: ${hbm}
+          external_decode: true
+          dram_tier_gb: ${dram}
+          dram_tier_gb_per_s: 50.0
+          dram_tier_writes: ${dram_writes}
+          ssd_tier_gb: ${ssd}
+          ssd_tier_gb_per_s: 10.0
+          ssd_tier_writes: ${ssd_writes}
+          prefix_tier_warm_start: false
+          prefix_tier_max_read_wait_ms: 1000.0
+          prefix_tier_balanced_load: ${balanced}
+          prefix_tier_loading_area: ${area}
+          force_schedule_after_ms: ${force_ms}
+          microbatch_split: ${split}
+          min_microbatch_tokens: ${min_mb}
+          long_prefill_token_threshold: 0
+          pending_order: ${order}
+          load_budget_low_tokens: ${bl_low}
+          load_budget_backlog_lo_tokens: ${bl_lo}
+          load_budget_backlog_hi_tokens: ${bl_hi}
+          srpt: ${srpt}
+
+sweep:
+  trace: [[doc/handoff/glm53_flash_pp4_b200_v2/data/bringup/prefix_sessions.csv]]
+compound:
+  sched:
+    plain: {max_batch_tokens: 8192, split: greedy, min_mb: 0, order: fifo, bl_low: null, bl_lo: null, bl_hi: null, srpt: null, force_ms: 0.0}
+    good: {max_batch_tokens: 32768, split: even, min_mb: 512, order: shortest-prefill-first, bl_low: 4096, bl_lo: 1000000, bl_hi: 3000000, srpt: true, force_ms: 60000.0}
+  tiers:
+    hbm: {hbm: 100.18, dram: 0.0, ssd: 0.0, balanced: true}
+  mode:
+    none: {dram_writes: every-context, ssd_writes: every-context, area: 0.0}
+
+backends_file: backends_ssengine.yaml
