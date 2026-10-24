@@ -11,6 +11,10 @@ names their tags:
 | `sglang` | `sglang_env` | CUDA 13.0, the alignment SGLang checkout at its gitlink with the `sglang-kernel` and FlashInfer 0.6.15.post1 builds it pins |
 | `flashinfer-kda` | `flashinfer_kda_env` | FlashInfer's KDA nightly, Torch 2.11 cu130, TVM/TIRx (`requirements/flashinfer_kda.txt`) |
 
+A Neuron env runs a vendor image instead (`VENDOR_IMAGES`): an AWS release named
+by its content digest, which is never built or pulled here (`profiling/README.md`,
+"Neuron execution").
+
 ```bash
 just profile-container-build              # every image
 just profile-container-build vllm sglang  # some of them
