@@ -1,0 +1,15 @@
+{
+  "arch": {
+    "speculative_iter": {
+      "type": "qwen35_tensorfold_nvfp4_gdn_dense_dflash2",
+      "model_config": "model/config/qwen3_8_27b_nvfp4.json",
+      "fp8": false,
+      "max_model_len": 131072,
+      "draft_tokens": 15,
+      "sample_top_k": 20
+    }
+  },
+  "gpu": "NVIDIA GB10",
+  "log_dir": "logs/predict_qwen38_27b_tensorfold_gb10",
+  "cases_file": "predict_qwen38_27b_tensorfold_gb10_cases.json"
+}

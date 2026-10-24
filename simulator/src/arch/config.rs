@@ -167,6 +167,18 @@ const fn default_glm52_draft_tokens() -> u32 {
 
 /// The DFlash2 checkpoint's own block size is 8: one bonus token plus seven
 /// drafted positions.
+const fn default_tensorfold_draft_tokens() -> u32 {
+    15
+}
+
+const fn default_tensorfold_sample_top_k() -> u32 {
+    20
+}
+
+const fn default_tensorfold_prefill_finish_max_rows() -> u32 {
+    16
+}
+
 const fn default_dflash2_draft_tokens() -> u32 {
     7
 }
@@ -1133,6 +1145,42 @@ pub enum IterArchSel {
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },
+    /// Qwen3.8-27B-NVFP4 served by TensorFold on one GB10 (DGX Spark),
+    /// drafting with DFlash2: one case is one TensorFold round (prefill step,
+    /// drafter pass over TREE streams, one batched verify over ragged
+    /// windows, commit). Cases need `decode_outcomes`. Precisions come from
+    /// the checkpoint's `quantization_config`; `fp8` is not read. Only
+    /// `speculative_iter` timing-predict; no DES worker yet.
+    Qwen35TensorfoldNvfp4GdnDenseDflash2 {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Configured context cap; each request's context is validated
+        /// against it.
+        #[serde(default = "default_qwen35_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        /// The drafter's candidate budget (DFlash2 block of 16 rows minus the
+        /// root). Windows are ragged, so it does not fix a verify width.
+        #[serde(default = "default_tensorfold_draft_tokens")]
+        #[param(default = 15, cache_key)]
+        draft_tokens: u32,
+        /// The requests' sampling `top_k`; the sampling top-k selects
+        /// `top_k + 8` candidates.
+        #[serde(default = "default_tensorfold_sample_top_k")]
+        #[param(default = 20, cache_key)]
+        sample_top_k: u32,
+        /// A prefill piece of at most this many rows is taken to finish its
+        /// prompt (and runs the first token's m = 1 lm_head and sampling);
+        /// cases do not carry the prompt end.
+        #[serde(default = "default_tensorfold_prefill_finish_max_rows")]
+        #[param(default = 16)]
+        prefill_finish_max_rows: u32,
+        /// The DFlash2 drafter config.json (default
+        /// `model/config/qwen3_8_27b_dflash2.json`).
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_model_config: Option<String>,
+    },
     /// Qwen4Exp hybrid decoders (`Qwen4ExpForConditionalGeneration`, text
     /// only; Qwen3.8-Flash-Next) with ModelOpt mixed-precision weights on one
     /// GPU under the vLLM fork, drafting with the checkpoint's MTP layer:
@@ -1221,6 +1269,7 @@ impl IterArchSel {
             | Self::InklingVllmNvfp4RelAttnMoe { model, .. }
             | Self::MimoV2VllmFp8SwaMoe { model, .. }
             | Self::Qwen35VllmNvfp4GdnDense { model, .. }
+            | Self::Qwen35TensorfoldNvfp4GdnDenseDflash2 { model, .. }
             | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { model, .. } => model,
         }
     }
@@ -1246,6 +1295,7 @@ impl IterArchSel {
             | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. }
             | Self::MimoV2VllmFp8SwaMoe { max_model_len, .. }
             | Self::Qwen35VllmNvfp4GdnDense { max_model_len, .. }
+            | Self::Qwen35TensorfoldNvfp4GdnDenseDflash2 { max_model_len, .. }
             | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { max_model_len, .. } => {
                 Ok(*max_model_len)
             }

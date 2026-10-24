@@ -842,6 +842,10 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::Qwen35TensorfoldNvfp4GdnDenseDflash2 { .. } => bail!(
+                "unified: qwen35_tensorfold_nvfp4_gdn_dense_dflash2 requires a TensorFold round \
+                 worker, not wired yet (timing-predict it with arch.speculative_iter)"
+            ),
             IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 {
                 ep_size,
                 nvl_num_gpu,

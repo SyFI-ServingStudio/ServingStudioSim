@@ -64,6 +64,12 @@ carries its final verify-row KV length and query width separately. The compiled
 tree includes target verification and draft passes. Offline prediction selects
 `arch.speculative_iter` with the same speculative architecture selector used by
 deployment; its cases contain `decode_requests: [[final_kv_len, query_len], ...]`.
+A case may add `decode_outcomes: [[accepted, tree_slots, mode], ...]`, one per
+decode request (`mode` is `"copy"`, `"tree"` or `"one"`); it lowers to
+`SpeculativeArchGroupInput::decode_outcomes`, which most models ignore and a
+model that needs it requires in `check_input`. A model whose windows vary in
+width returns true from `ragged_verify_windows`, and lowering then drops the
+`draft_tokens + 1` width rule.
 `build_speculative_iter_model` constructs this contract without a worker.
 
 ### Layer-wise AFD
@@ -130,7 +136,7 @@ variant's parameters.
 
 | Contract | Wired selectors |
 |---|---|
-| `IterArchSel` | `qwen36_local`, `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `deepseek_v4_vllm`, `deepseek_v4_vllm_serial_streams`, `deepseek_v41_vllm`, `deepseek_v41_vllm_serial_streams`, `glm52_vllm_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe_speculative`, `glm52_vllm_nvfp4_pp_dsa_moe`, `glm52_vllm_nvfp4_dp_attn_dsa_moe`, `glm53_vllm_nvfp4_dsa_moe_dflash2`, `glm52_sglang_nvfp4_tp_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_pp_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_dp_attn_ep_moe`, `inkling_vllm_nvfp4_rel_attn_moe`, `mimo_v2_vllm_fp8_swa_moe`, `qwen35_vllm_nvfp4_gdn_dense`, `qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative` |
+| `IterArchSel` | `qwen36_local`, `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `deepseek_v4_vllm`, `deepseek_v4_vllm_serial_streams`, `deepseek_v41_vllm`, `deepseek_v41_vllm_serial_streams`, `glm52_vllm_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe_speculative`, `glm52_vllm_nvfp4_pp_dsa_moe`, `glm52_vllm_nvfp4_dp_attn_dsa_moe`, `glm53_vllm_nvfp4_dsa_moe_dflash2`, `glm52_sglang_nvfp4_tp_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_pp_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_dp_attn_ep_moe`, `inkling_vllm_nvfp4_rel_attn_moe`, `mimo_v2_vllm_fp8_swa_moe`, `qwen35_vllm_nvfp4_gdn_dense`, `qwen35_tensorfold_nvfp4_gdn_dense_dflash2`, `qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative` |
 | `AttnArchSel` | `qwen3_attn_tp` |
 | `FfnArchSel` | `qwen3_ffn_moe`, `qwen3_fp8_ffn_moe` |
 
@@ -151,6 +157,12 @@ schema; no second hand-maintained config union belongs here.
   - GLM-5.2 SGLang NVFP4 pure TP → `chunked_prefill`
   - Qwen4Exp vLLM NVFP4 MTP (`qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative`) →
     `speculative`
+- Qwen3.8-27B NVFP4 under TensorFold with DFlash2 on GB10
+  (`qwen35_tensorfold_nvfp4_gdn_dense_dflash2`) → `speculative_iter`
+  timing-predict only; `unified` bails until a TensorFold round worker exists.
+  One case is one TensorFold round (prefill step, drafter pass, ragged verify,
+  commit) and needs `decode_outcomes`; its tf-copies slots are filled from
+  `TensorfoldCopyBackends`.
 - pp:
   - GLM-5.2/5.3 vLLM NVFP4 pipeline stages (`glm52_vllm_nvfp4_pp_dsa_moe`) →
     pipeline stage workers; `unified` rejects it. Each stage is its own

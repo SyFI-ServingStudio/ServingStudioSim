@@ -28,27 +28,29 @@ use crate::arch::{
     glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
     glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2,
     inkling_vllm_nvfp4_rel_attn_moe, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
-    mimo_v2_vllm_fp8_swa_moe, qwen35_vllm_nvfp4_gdn_dense, qwen36_local, qwen3_attn_layerwise,
-    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
-    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, qwen4_exp_vllm_nvfp4_gdn_qsa_moe,
-    AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel,
-    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
-    DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg,
-    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
-    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel,
-    Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel,
-    Glm53FlashKernelPath, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel,
-    Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel, Glm53FlashVllmParallel,
-    Glm53VllmNvfp4DsaMoeDflash2Model, InklingExpertDemand, InklingExpertPrecision, InklingModelCfg,
-    InklingVllmModel, InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel,
-    Llama3DenseTpModel, Llama3DpAttnTpFfnModel, MimoV2ModelCfg, MimoV2VllmModel,
-    MimoV2VllmParallel, Qwen35ModelCfg, Qwen35VllmModel, Qwen35VllmParallel, Qwen36LocalModel,
-    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
-    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
-    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
-    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
-    Qwen4ExpModelCfg, Qwen4ExpVllmParallel, Qwen4ExpVllmSpeculativeModel,
+    mimo_v2_vllm_fp8_swa_moe, qwen35_tensorfold_nvfp4_gdn_dense_dflash2,
+    qwen35_vllm_nvfp4_gdn_dense, qwen36_local, qwen3_attn_layerwise, qwen3_ffn_moe_layerwise,
+    qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn,
+    qwen3_vllm_moe_dp_attn_ep_ffn, qwen4_exp_vllm_nvfp4_gdn_qsa_moe, AttnLayerwiseModel,
+    DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV4ModelCfg,
+    DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel, DenseTpParallel,
+    Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode,
+    Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
+    Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel,
+    Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashKernelPath,
+    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel,
+    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
+    InklingExpertDemand, InklingExpertPrecision, InklingModelCfg, InklingVllmModel,
+    InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
+    Llama3DpAttnTpFfnModel, MimoV2ModelCfg, MimoV2VllmModel, MimoV2VllmParallel, Qwen35ModelCfg,
+    Qwen35TensorfoldNvfp4GdnDenseDflash2Model, Qwen35VllmModel, Qwen35VllmParallel,
+    Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel,
+    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
+    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel, Qwen4ExpModelCfg, Qwen4ExpVllmParallel,
+    Qwen4ExpVllmSpeculativeModel, TensorfoldCopyBackends, TensorfoldParallel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -1568,6 +1570,60 @@ pub fn mimo_v2_vllm_fp8_swa_moe(
         .context("building MiMo-V2 model (often a missing profile.db row)")
 }
 
+/// The DFlash2 drafter config TensorFold pairs with Qwen3.8-27B, beside the
+/// target config unless `draft_model_config` names one.
+pub const TENSORFOLD_DFLASH2_CONFIG: &str = "qwen3_8_27b_dflash2.json";
+
+/// Build Qwen3.8-27B-NVFP4 under TensorFold with its DFlash2 drafter on one
+/// GPU (GB10). The checkpoint's layer schedule is exact, so layer-count
+/// overrides are rejected. Every tf-copies slot is wired from
+/// [`TensorfoldCopyBackends::measured`].
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_tensorfold_nvfp4_gdn_dense_dflash2(
+    model_spec: &ModelSpec,
+    max_model_len: u32,
+    draft_tokens: u32,
+    sample_top_k: u32,
+    prefill_finish_max_rows: u32,
+    draft_model_config: Option<&str>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen35TensorfoldNvfp4GdnDenseDflash2Model> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "TensorFold Qwen3.8 architecture rejects num_layers/sim_num_layers overrides; the \
+             exact GDN/GQA layer schedule is required"
+        );
+    }
+    let target_path = Path::new(&model_spec.model_config);
+    let model_cfg = Qwen35ModelCfg::from_json(target_path).context("loading Qwen3.8 config")?;
+    let draft_path = match draft_model_config {
+        Some(path) => Path::new(path).to_path_buf(),
+        None => target_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(TENSORFOLD_DFLASH2_CONFIG),
+    };
+    let draft_cfg =
+        crate::arch::qwen35_dflash2_draft_cfg::Qwen35Dflash2DraftCfg::from_json(&draft_path)
+            .context("loading the DFlash2 drafter config")?;
+    let parallel = TensorfoldParallel {
+        gpu_name: gpu.to_string(),
+        max_model_len,
+        draft_tokens,
+        sample_top_k,
+        prefill_finish_max_rows,
+    };
+    let mut configs =
+        qwen35_tensorfold_nvfp4_gdn_dense_dflash2::build_configs(&model_cfg, &draft_cfg, &parallel)
+            .context("expanding TensorFold Qwen3.8 configs")?;
+    TensorfoldCopyBackends::measured().apply(&mut configs);
+    let resolved = qwen35_tensorfold_nvfp4_gdn_dense_dflash2::resolve_configs(&configs);
+    qwen35_tensorfold_nvfp4_gdn_dense_dflash2::build(name.to_string(), resolved, bridge)
+        .context("building TensorFold Qwen3.8 + DFlash2 (often a missing profile.db row)")
+}
+
 /// Build a Qwen3.5-family ModelOpt mixed-precision checkpoint on one GPU under
 /// vLLM. The exact GDN / GQA layer schedule is the checkpoint's, so
 /// layer-count overrides are rejected; the linears' precisions come from its
@@ -2570,6 +2626,7 @@ pub fn build_iter_model(
         )?),
         IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
         | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+        | IterArchSel::Qwen35TensorfoldNvfp4GdnDenseDflash2 { .. }
         | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
         }
@@ -2667,6 +2724,27 @@ pub fn build_speculative_iter_model(
                 expert_popularity_file.as_deref(),
                 token_corpus_file.as_deref(),
                 cudagraph_capture_sizes,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Qwen35TensorfoldNvfp4GdnDenseDflash2 {
+            model,
+            max_model_len,
+            draft_tokens,
+            sample_top_k,
+            prefill_finish_max_rows,
+            draft_model_config,
+        } => Ok((
+            Box::new(qwen35_tensorfold_nvfp4_gdn_dense_dflash2(
+                model,
+                *max_model_len,
+                *draft_tokens,
+                *sample_top_k,
+                *prefill_finish_max_rows,
+                draft_model_config.as_deref(),
                 gpu,
                 name,
                 bridge,
@@ -2936,6 +3014,7 @@ fn build_arch(
                 let (gpus, shape, manifest, kv_cache) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
                     | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+                    | IterArchSel::Qwen35TensorfoldNvfp4GdnDenseDflash2 { .. }
                     | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
                         let (model, draft_tokens) = build_speculative_iter_model(
                             selector,
