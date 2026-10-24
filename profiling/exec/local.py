@@ -410,6 +410,12 @@ def gpu_uuids_for_indices(gpu_indices: Sequence[int]) -> list[str]:
     return [uuid_by_index[gpu_index] for gpu_index in gpu_indices]
 
 
+def _mib(text: str) -> int | None:
+    """``"1234 MiB"`` as 1234; None for ``"N/A"`` and other non-numbers."""
+    head = text.split()[0] if text.split() else ""
+    return int(head) if head.isdigit() else None
+
+
 def find_idle_gpus(memory_threshold_mb: int = 1000, util_threshold_pct: int = 10) -> list[int]:
     root = _nvidia_smi_xml()
     if root is None:
@@ -421,9 +427,17 @@ def find_idle_gpus(memory_threshold_mb: int = 1000, util_threshold_pct: int = 10
     for gpu_index, gpu in enumerate(root.findall("gpu")):
         if visible_gpu_set is not None and gpu_index not in visible_gpu_set:
             continue
-        mem_used = gpu.findtext("fb_memory_usage/used", "999999 MiB")
+        mem_used_mb = _mib(gpu.findtext("fb_memory_usage/used", "999999 MiB"))
+        if mem_used_mb is None:
+            # A unified-memory GPU (GB10) reports no framebuffer use, only each
+            # process's own; their sum is what the device holds.
+            mem_used_mb = sum(
+                _mib(text) or 0 for text in (
+                    process.findtext("used_memory", "")
+                    for process in gpu.iterfind("processes/process_info")
+                )
+            )
         util = gpu.findtext("utilization/gpu_util", "100 %")
-        mem_used_mb = int(mem_used.split()[0])
         util_pct = int(util.split()[0])
         if mem_used_mb < memory_threshold_mb and util_pct < util_threshold_pct:
             idle_by_index[gpu_index] = gpu_index

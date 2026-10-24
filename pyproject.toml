@@ -24,6 +24,15 @@ default-groups = ["dev", "profiling", "launcher", "analyze", "public-api"]
 # already-synced env torch instead. (Reproducible: the commit is pinned below.)
 no-build-isolation-package = ["deep-gemm"]
 
+# aarch64 only: PyPI's aarch64 Torch wheel is a CPU build. x86 keeps PyPI.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "platform_machine == 'aarch64'" }]
+
 [dependency-groups]
 dev = [
     "duckdb>=1.5.3",
@@ -75,7 +84,10 @@ profiling = [
     # alias to default_env). Pinned to the reference profiling stack (0.6.6).
     "flashinfer-python>=0.6.4,<0.7; sys_platform == 'linux'",
     "flashinfer-cubin>=0.6.4,<0.7; sys_platform == 'linux'",
-    "nvshmem4py-cu12>=0.3.0",
+    # PyPI's aarch64 Torch is CPU-only, so aarch64 (GB10 / DGX Spark) takes Torch
+    # from the cu130 index below and the matching CUDA 13 NVSHMEM.
+    "nvshmem4py-cu12>=0.3.0; platform_machine != 'aarch64'",
+    "nvshmem4py-cu13>=0.3.0; platform_machine == 'aarch64'",
     # DeepGEMM FP8 grouped-GEMM kernel (grouped_gemm `deepgemm` backend) and the
     # DSA MQA-logits kernels. The commit is the one the instrumented vLLM fork
     # pins in cmake/external_projects/deepgemm.cmake, so this package and the

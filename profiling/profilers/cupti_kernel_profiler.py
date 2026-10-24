@@ -110,10 +110,14 @@ def _site_roots() -> list[Path]:
 def _resolve_cupti_paths() -> tuple[Path, Path]:
     candidates: list[tuple[Path, Path]] = []
     for root in _site_roots():
-        include_dir = root / "nvidia" / "cuda_cupti" / "include"
-        lib_dir = root / "nvidia" / "cuda_cupti" / "lib"
-        if (include_dir / "cupti.h").exists() and any(lib_dir.glob("libcupti.so*")):
-            candidates.append((include_dir, lib_dir))
+        # CUDA 12 wheels install CUPTI as `nvidia/cuda_cupti`; CUDA 13 wheels
+        # share one `nvidia/cu13` tree. Either beats Triton's bundled copy,
+        # which can predate the GPU (CUPTI_ERROR_INVALID_DEVICE on a GB10).
+        for package in ("cuda_cupti", "cu13"):
+            include_dir = root / "nvidia" / package / "include"
+            lib_dir = root / "nvidia" / package / "lib"
+            if (include_dir / "cupti.h").exists() and any(lib_dir.glob("libcupti.so*")):
+                candidates.append((include_dir, lib_dir))
 
         triton_include = root / "triton" / "backends" / "nvidia" / "include"
         triton_lib = root / "triton" / "backends" / "nvidia" / "lib" / "cupti"

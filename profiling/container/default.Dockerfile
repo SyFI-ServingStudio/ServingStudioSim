@@ -2,15 +2,33 @@
 #
 # `default_env` and the envs that share its interpreter (`flashinfer_pip_env`,
 # `causal_conv1d_env`): the project's own `profiling` dependency group --
-# Torch 2.10 cu128, FlashInfer 0.6, Triton, NVSHMEM, DeepGEMM -- installed from
+# Torch 2.10, FlashInfer 0.6, Triton, NVSHMEM, DeepGEMM -- installed from
 # uv.lock exactly as `just sync` installs it on a host. Built and tagged by
 # `profiling/container/images.py`; see profiling/container/README.md.
+#
+# The build host's architecture picks the base: x86-64 runs Torch cu128 from
+# PyPI for Hopper/Blackwell datacenter parts; aarch64 (GB10 / DGX Spark) runs the
+# cu130 Torch that uv.lock takes from the PyTorch index there, so it needs a
+# CUDA 13 toolkit for the JIT builds and targets sm_121.
 
 ARG CUDA_VERSION=12.8.1
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+ARG CUDA_VERSION_ARM64=13.0.2
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS base-amd64
+ENV VIBESIM_TORCH_CUDA=12.8 \
+    TORCH_CUDA_ARCH_LIST="9.0;10.0" \
+    CAUSAL_CONV1D_WHEEL=https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/causal_conv1d-1.7.0+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+
+FROM nvidia/cuda:${CUDA_VERSION_ARM64}-devel-ubuntu22.04 AS base-arm64
+ENV VIBESIM_TORCH_CUDA=13.0 \
+    TORCH_CUDA_ARCH_LIST="12.1" \
+    CAUSAL_CONV1D_WHEEL=https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/causal_conv1d-1.7.0+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_aarch64.whl
+
+FROM base-${TARGETARCH}
 
 ARG CUDA_VERSION
-ARG CAUSAL_CONV1D_WHEEL=https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/causal_conv1d-1.7.0+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+ARG CUDA_VERSION_ARM64
+ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_INSTALL_DIR=/usr/local/bin \
@@ -19,7 +37,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_COMPILE_BYTECODE=1 \
     DG_USE_LOCAL_VERSION=0 \
-    TORCH_CUDA_ARCH_LIST="9.0;10.0" \
     PYTHONPATH=/opt/vibesim:/opt/causal_conv1d \
     TORCH_EXTENSIONS_DIR=/cache/torch-extensions \
     TRITON_CACHE_DIR=/cache/triton \
@@ -54,7 +71,7 @@ COPY gpu /opt/vibesim/gpu
 
 # The envs images.py assigns this image (`selfcheck` loads their runners).
 ARG VIBESIM_PROFILE_ENVS
-RUN python -c "import torch, flashinfer, deep_gemm, causal_conv1d; assert torch.version.cuda == '12.8'; print(torch.__version__, flashinfer.__version__)" \
+RUN python -c "import os, torch, flashinfer, deep_gemm, causal_conv1d; assert torch.version.cuda == os.environ['VIBESIM_TORCH_CUDA'], torch.version.cuda; print(torch.__version__, flashinfer.__version__)" \
     && python -m profiling.container.selfcheck ${VIBESIM_PROFILE_ENVS}
 
 # Last, so a new commit only rewrites the labels, not the dependency layers.
@@ -67,6 +84,8 @@ LABEL org.opencontainers.image.title="VibeSim default kernel profiler" \
       org.opencontainers.image.revision="${VIBESIM_REVISION}" \
       ai.vibesim.image.inputs="${VIBESIM_IMAGE_INPUTS}" \
       ai.vibesim.cuda.version="${CUDA_VERSION}" \
+      ai.vibesim.cuda.version-arm64="${CUDA_VERSION_ARM64}" \
+      ai.vibesim.arch="${TARGETARCH}" \
       ai.vibesim.profile-envs="${VIBESIM_PROFILE_ENVS}" \
       ai.vibesim.python="/opt/venv/bin/python"
 

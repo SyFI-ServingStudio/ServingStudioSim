@@ -10,3 +10,7 @@
 	path = alignment/load_generator/req-frontend
 	url = https://github.com/uw-syfi/request-factory.git
 	branch = glm52-tp4-streaming-fix
+[submodule "alignment/profiler/tensorfold"]
+	path = alignment/profiler/tensorfold
+	url = https://github.com/efeslab/TensorFold.git
+	branch = perf-study

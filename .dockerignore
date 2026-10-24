@@ -16,3 +16,4 @@ profiling/profile.db
 trace
 alignment/load_generator
 alignment/profiler/sglang
+alignment/profiler/tensorfold

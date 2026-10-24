@@ -40,6 +40,17 @@ def test_an_image_tag_follows_its_dependency_inputs_only(tmp_path):
     assert image.tag(tmp_path) != tag
 
 
+def test_an_image_tag_names_a_non_x86_machine(tmp_path, monkeypatch):
+    _inputs(tmp_path)
+    image = images.IMAGES["default"]
+    monkeypatch.setattr(images.platform, "machine", lambda: "x86_64")
+    x86 = image.tag(tmp_path)
+    monkeypatch.setattr(images.platform, "machine", lambda: "AMD64")
+    assert image.tag(tmp_path) == x86
+    monkeypatch.setattr(images.platform, "machine", lambda: "aarch64")
+    assert image.tag(tmp_path) != x86
+
+
 def test_every_imaged_env_is_a_registered_host_env():
     for image in images.IMAGES.values():
         for name in image.envs:

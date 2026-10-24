@@ -532,6 +532,33 @@
       "nvl_domain_size": null,
       "dollar_per_hour": null,
       "notes": "BF16 and FP8 have same peak TFLOPS by design. Not listed on getdeploying at the as_of date."
+    },
+    {
+      "name": "GB10-128GB",
+      "aliases": [
+        "NVIDIA GB10",
+        "GB10",
+        "DGX Spark"
+      ],
+      "vendor": "NVIDIA",
+      "architecture": "Blackwell",
+      "compute_capability": "12.1",
+      "year": 2025,
+      "mem_size_gb": 128,
+      "mem_type": "LPDDR5x",
+      "mem_bandwidth_gbps": 273,
+      "fp16_tflops": null,
+      "fp8_tflops": null,
+      "bf16_tflops": null,
+      "fp32_tflops": 31,
+      "fp4_tflops": 500,
+      "int8_tops": null,
+      "tdp_watts": 140,
+      "interconnect": "ConnectX-7 200GbE",
+      "interconnect_bandwidth_gbps": 50,
+      "nvl_domain_size": 1,
+      "dollar_per_hour": null,
+      "notes": "DGX Spark SoC: memory is unified with the 20-core Grace CPU (128 GB shared, not GPU-only). fp4_tflops is NVIDIA's 1 PFLOP sparse NVFP4 halved; dense FP16/BF16/FP8 peaks are not published. interconnect is the ConnectX-7 link between two Sparks (200 Gb/s each way). Not rented by the hour."
     }
   ]
 }

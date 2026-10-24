@@ -91,6 +91,22 @@ builds it from a pinned, hash-checked FlashInfer nightly. TIRx compiles its
 kernels with the CUDA 13 `nvcc` on `CUDA_PATH`/`PATH`; FlashInfer's JIT cache
 follows `FLASHINFER_WORKSPACE_BASE` (default `$HOME`).
 
+`tensorfold_env` on the host is the TensorFold checkout `alignment/profiler/tensorfold`
+(the GB10 study's serving engine, efeslab/TensorFold perf-study) and its own
+`.venv` with Torch 2.14.1 cu130:
+
+```bash
+cd alignment/profiler/tensorfold
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cu130 \
+  --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match torch==2.14.1
+uv pip install --python .venv/bin/python -e . numpy nvidia-ml-py ninja
+```
+
+Its CUDA extensions JIT-compile for the GPU present on first use, so the first
+run of a backend takes minutes. As with `vllm_env`, the worker drops inherited
+site-packages.
+
 `causal_conv1d_env` serves the `gdn_causal_conv_prefill` `dao_channellast`
 backend. It runs the project interpreter with one extra import directory,
 `~/profile_envs/causal_conv1d` (a symlink to a disk with room is fine), that

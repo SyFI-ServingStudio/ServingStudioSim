@@ -6,9 +6,10 @@ names their tags:
 
 | Image | Profile envs | Holds |
 | --- | --- | --- |
-| `default` | `default_env`, `flashinfer_pip_env`, `causal_conv1d_env` | the project's `profiling` group from `uv.lock` (Torch 2.10 cu128, FlashInfer 0.6, Triton, NVSHMEM, DeepGEMM), plus the causal-conv1d wheel |
+| `default` | `default_env`, `flashinfer_pip_env`, `causal_conv1d_env` | the project's `profiling` group from `uv.lock` (Torch 2.10 cu128, FlashInfer 0.6, Triton, NVSHMEM, DeepGEMM), plus the causal-conv1d wheel. On aarch64 (GB10 / DGX Spark) it is Torch 2.10 cu130 on a CUDA 13 base, built for sm_121 |
 | `vllm` | `vllm_env` | CUDA 13.0, the alignment vLLM checkout at its gitlink on the precompiled wheel of its upstream base (with the FlashKDA build it vendors as `_flashkda_C`), every FlashInfer cubin |
 | `sglang` | `sglang_env` | CUDA 13.0, the alignment SGLang checkout at its gitlink with the `sglang-kernel` and FlashInfer 0.6.15.post1 builds it pins |
+| `tensorfold` | `tensorfold_env` | CUDA 13.0, the TensorFold checkout at its gitlink on Torch 2.14.1 cu130; its CUDA extensions JIT-compile on first use into `/cache` |
 | `flashinfer-kda` | `flashinfer_kda_env` | FlashInfer's KDA nightly, Torch 2.11 cu130, TVM/TIRx (`requirements/flashinfer_kda.txt`) |
 
 ```bash
@@ -19,7 +20,10 @@ uv run python -m profiling.container.images env vllm_env   # the tag one env use
 ```
 
 A tag is a hash of the Dockerfile, the files it copies into its dependency
-layers, and the gitlink of each alignment checkout it installs. A checkout with
+layers, and the gitlink of each alignment checkout it installs. On a non-x86
+host it also hashes the machine (`platform.machine()`), so an aarch64 image
+never shares a tag with the x86 image of the same inputs. Only `default` has
+been built and checked on aarch64; the other images have only been built on x86. A checkout with
 the same inputs names the same image, and a host that has the tag has the
 image. The build refuses an alignment checkout that is not at its gitlink or has
 uncommitted changes, so the tag never names something else. The commit that

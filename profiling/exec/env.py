@@ -116,6 +116,11 @@ _VLLM_FORK_TORCH_LIB = (
     _VLLM_FORK_CHECKOUT / ".venv" / "lib" / "python3.12" / "site-packages" / "torch" / "lib"
 )
 _SGLANG_PYTHON_ROOT = _SGLANG_CHECKOUT / "python"
+# The TensorFold checkout (alignment/profiler/tensorfold, the perf-study branch
+# a GB10 study serves from) and its own `.venv` holding the Torch cu130 stack
+# its JIT CUDA extensions build against.
+_TENSORFOLD_CHECKOUT = _PROJECT_ROOT / "alignment" / "profiler" / "tensorfold"
+_TENSORFOLD_PYTHON = _TENSORFOLD_CHECKOUT / ".venv" / "bin" / "python"
 _SGLANG_PYTHON = _SGLANG_PYTHON_ROOT / ".venv-sglang" / "bin" / "python"
 
 
@@ -183,6 +188,17 @@ ENV_REGISTRY: dict[str, ProfileEnv] = {
         _VLLM_FORK_PYTHON,
         additional_python_paths=(_VLLM_FORK_CHECKOUT,),
         additional_library_paths=(_VLLM_FORK_TORCH_LIB,),
+        isolated_site_packages=True,
+    ),
+    # TensorFold's own CUDA/Triton kernels (NVFP4/FP8 `lane` and `gemm_ck`
+    # GEMMs, tree and prefill attention, GDN chain/tree). They JIT-compile
+    # against the checkout's Torch on first use, so the interpreter and the
+    # source come from the same checkout. Its image installs the checkout at the
+    # gitlink (profiling/container/tensorfold.Dockerfile).
+    "tensorfold_env": ProfileEnv(
+        "tensorfold_env",
+        _TENSORFOLD_PYTHON,
+        additional_python_paths=(_TENSORFOLD_CHECKOUT / "src",),
         isolated_site_packages=True,
     ),
 }

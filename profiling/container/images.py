@@ -23,6 +23,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import subprocess
 import sys
 from collections.abc import Callable
@@ -102,6 +103,11 @@ def _vllm_args(root: Path) -> dict[str, str]:
     }
 
 
+def _tensorfold_args(root: Path) -> dict[str, str]:
+    checkout = root / "alignment" / "profiler" / "tensorfold"
+    return {"TENSORFOLD_REVISION": _git(checkout, "rev-parse", "HEAD")}
+
+
 def _sglang_args(root: Path) -> dict[str, str]:
     checkout = root / "alignment" / "profiler" / "sglang"
     return {
@@ -129,6 +135,10 @@ class Image:
             digest.update((root / relative).read_bytes() + b"\0")
         for path in self.submodules:
             digest.update(f"{path}\0{gitlink(root, path)}\0".encode())
+        # The same inputs build a different image on another CPU architecture.
+        # x86-64 adds nothing, so the tags of existing x86 images are unchanged.
+        if (machine := platform.machine()) not in ("x86_64", "AMD64"):
+            digest.update(f"machine\0{machine}\0".encode())
         return f"vibesim-profiler-{self.name}:{digest.hexdigest()[:16]}"
 
 
@@ -155,6 +165,14 @@ IMAGES = {
             inputs=("profiling/container/sglang.Dockerfile.dockerignore",),
             submodules=("alignment/profiler/sglang",),
             build_args=_sglang_args,
+        ),
+        Image(
+            "tensorfold",
+            "profiling/container/tensorfold.Dockerfile",
+            ("tensorfold_env",),
+            inputs=("profiling/container/tensorfold.Dockerfile.dockerignore",),
+            submodules=("alignment/profiler/tensorfold",),
+            build_args=_tensorfold_args,
         ),
         Image(
             "flashinfer-kda",
