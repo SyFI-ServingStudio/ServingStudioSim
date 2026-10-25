@@ -1,0 +1,16 @@
+# Stage 3a: combine the stage-2 winners (layer regions, RS/AG, all-to-all
+# MoE, default impls) over the five best layouts, chunk 2048 / 4096 and the
+# default vs a finer context-bucket inventory.
+name: s3_unified
+family: unified
+workloads_file: tools/trn2-config-search/stages/workloads.yaml
+base:
+  region_granularity: layer
+  tp_collective: reduce_scatter_all_gather
+  moe_dispatch: all_to_all
+layouts: [dp4-tp8-g8-ep32-mt1, dp4-tp4-g8-ep32-mt1, dp4-tp8-g4-ep32-mt1, dp8-tp4-g4-ep32-mt1, dp2-tp8-g16-ep32-mt1]
+grid:
+  max_batch_tokens: [2048, 4096]
+  context_buckets:
+    - [4096, 8192, 16384, 32768, 65536, 131072]
+    - [4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072]

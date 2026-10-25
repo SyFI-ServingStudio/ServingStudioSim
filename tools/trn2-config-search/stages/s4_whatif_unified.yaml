@@ -1,0 +1,26 @@
+# Stage 4a: how the stage-1 ranking moves under the uncertain constants.
+# The stage-1 grid again, under four scenarios:
+#   base           the loaded-host wall constants and measured kernels;
+#   launch_half    launch_coll_ms, launch_plain_ms, step_overhead_ms halved;
+#   moe_prefill_3x the MoE kernel 3x faster on calls of >= 256 rows (the
+#                  moe_cte static-block path: auto's rows switch to it there);
+#   both.
+name: s4_whatif_unified
+family: unified
+workloads_file: tools/trn2-config-search/stages/workloads.yaml
+base: {max_batch_tokens: 2048}
+layouts: auto
+layout_ranks: [32]
+grid:
+  tp_collective: [all_reduce, reduce_scatter_all_gather]
+  moe_dispatch: [all_gather, all_to_all]
+  region_granularity: [mixer, layer]
+scenarios: &scenarios
+  base: {}
+  launch_half: {launch_coll_ms: 0.625, launch_plain_ms: 0.0375, step_overhead_ms: 2.0}
+  moe_prefill_3x: {kind_time_scale: ["moe_block@256=0.3333", "moe_routed_experts@256=0.3333"]}
+  both:
+    launch_coll_ms: 0.625
+    launch_plain_ms: 0.0375
+    step_overhead_ms: 2.0
+    kind_time_scale: ["moe_block@256=0.3333", "moe_routed_experts@256=0.3333"]
