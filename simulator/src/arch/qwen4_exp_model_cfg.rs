@@ -91,6 +91,15 @@ impl PleTableResidency {
     }
 }
 
+/// Which checkpoint precision a config is read as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Precision {
+    /// `nvidia/Qwen3.8-Flash-Next-NVFP4`: the ModelOpt mixed-precision map.
+    ModelOptMixed,
+    /// `Qwen/Qwen3.8-Flash-Next`: BF16 throughout.
+    Bf16,
+}
+
 /// The checkpoint's text-model dimensions, read strictly from its config.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen4ExpModelCfg {
@@ -150,6 +159,27 @@ impl Qwen4ExpModelCfg {
     }
 
     pub fn from_value(root: &Value) -> Result<Self> {
+        Self::parse(root, Precision::ModelOptMixed)
+    }
+
+    /// The BF16 checkpoint (`Qwen/Qwen3.8-Flash-Next`): no
+    /// `quantization_config`, every weight BF16 (the PLE table and the MTP
+    /// experts included, so `mtp_expert_block` is 0). Its config omits
+    /// `norm_topk_prob`; absent is read as renormalized top-k, as the
+    /// reference implementation routes.
+    pub fn from_bf16_json(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading Qwen4Exp config {}", path.display()))?;
+        let root: Value = serde_json::from_str(&text)
+            .with_context(|| format!("parsing Qwen4Exp config {}", path.display()))?;
+        Self::from_bf16_value(&root)
+    }
+
+    pub fn from_bf16_value(root: &Value) -> Result<Self> {
+        Self::parse(root, Precision::Bf16)
+    }
+
+    fn parse(root: &Value, precision: Precision) -> Result<Self> {
         let cfg = root
             .get("text_config")
             .context("Qwen4Exp config has no text_config")?;
@@ -175,8 +205,12 @@ impl Qwen4ExpModelCfg {
             text("hidden_act") == "silu",
             "Qwen4Exp arches model SiLU experts"
         );
+        let renormalized = match precision {
+            Precision::ModelOptMixed => flag("norm_topk_prob") == Some(true),
+            Precision::Bf16 => flag("norm_topk_prob").unwrap_or(true),
+        };
         ensure!(
-            flag("norm_topk_prob") == Some(true),
+            renormalized,
             "Qwen4Exp arches model renormalized top-k routing"
         );
         ensure!(
@@ -273,11 +307,26 @@ impl Qwen4ExpModelCfg {
             u64::from(u("make_ngram_vocab_size_divisible_by")?),
         );
 
-        let quant = root
-            .get("quantization_config")
-            .context("Qwen4Exp arches model the ModelOpt mixed-precision checkpoint")?;
-        let (mtp_expert_block, ple_table_dtype) =
-            check_quantization(quant, num_layers, &ple_layers)?;
+        let (mtp_expert_block, ple_table_dtype) = match precision {
+            Precision::ModelOptMixed => {
+                let quant = root
+                    .get("quantization_config")
+                    .context("Qwen4Exp arches model the ModelOpt mixed-precision checkpoint")?;
+                check_quantization(quant, num_layers, &ple_layers)?
+            }
+            Precision::Bf16 => {
+                ensure!(
+                    root.get("quantization_config").is_none(),
+                    "the BF16 Qwen4Exp reader got a quantized checkpoint config"
+                );
+                ensure!(
+                    text("dtype") == "bfloat16",
+                    "the BF16 Qwen4Exp reader needs text_config.dtype bfloat16, got {:?}",
+                    text("dtype")
+                );
+                (0, DType::Bf16)
+            }
+        };
 
         Ok(Self {
             hidden: u("hidden_size")?,
@@ -458,6 +507,27 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("model/config/qwen3_8_flash_next_nvfp4.json");
         Qwen4ExpModelCfg::from_json(&path).unwrap()
+    }
+
+    /// The BF16 checkpoint reads the same shape as the NVFP4 one, with every
+    /// weight BF16; a quantized config is refused by the BF16 reader.
+    #[test]
+    fn bf16_checkpoint_reads_the_same_shape_in_bf16() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("model/config/qwen3_8_flash_next_bf16.json");
+        let bf16 = Qwen4ExpModelCfg::from_bf16_json(&path).unwrap();
+        let nvfp4 = flash_next();
+        assert_eq!(bf16.ple_table_dtype, DType::Bf16);
+        assert_eq!(bf16.mtp_expert_block, 0);
+        assert_eq!(
+            Qwen4ExpModelCfg {
+                ple_table_dtype: nvfp4.ple_table_dtype,
+                mtp_expert_block: nvfp4.mtp_expert_block,
+                ..bf16.clone()
+            },
+            nvfp4
+        );
+        assert!(Qwen4ExpModelCfg::from_bf16_value(&flash_next_json()).is_err());
     }
 
     #[test]
