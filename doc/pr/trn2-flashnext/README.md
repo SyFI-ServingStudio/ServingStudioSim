@@ -184,6 +184,16 @@ configs per workload, knob sensitivity, the headroom ladder, and what-if scenari
 the launch constants and the MoE prefill kernel. Tool: `tools/trn2-config-search/`;
 skill: `operate-search-trn2-configs`.
 
+## Tune loop (engine in the loop)
+
+`TUNE_LOOP.md` holds blind predictions for engine-unmeasured configs, then the engine
+runs and predicted vs measured results. On W64, the Sim's ranking of four configs held
+once first-use stalls are removed. The best measured config is dp4-tp8-g8 block +
+RS/AG + EP32, k = 1, budget 4096: 62.8 s, 1.37x the engine's previous best. The loop
+also found a2a mis-modeled at dp8 and a dp8 block prefill that does not fit HBM. It
+gives the headroom of the best config. Tool: `tools/trn2-tune-loop/`; skill:
+`operate-tune-trn2-with-engine`.
+
 ## Preset results (aligned, 2026-10-25)
 
 The presets replay the W64 trace (64 requests, 2048 in / 512 out, 50 ms apart) at its
