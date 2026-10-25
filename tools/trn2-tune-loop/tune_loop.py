@@ -410,12 +410,32 @@ def _family(cfg: dict) -> str:
 
 
 # ------------------------------------------------------------------------------ predict
-def write_trace(path: Path, wl: dict, accept_rate: float | None) -> Path:
-    lines = ["id,input_len,output_len,arrival_time" + (",accept_rate" if accept_rate else "")]
+def accept_draw(files: list[str], k: int, logs: Path | None = None) -> list[list[float]]:
+    """Per-request MTP acceptance (per draft position) of a previous engine run, in rid
+    order: an empirical draw of the acceptance distribution. On the seeded random
+    prompts the per-request values do not carry over between runs (correlation <= 0.26
+    over the W64 k=1 runs), but their spread does, and duration follows the slowest
+    requests: a uniform mean predicts W64 k=1 ~13% short."""
+    _, reqs = ea.measured(files, logs or ENGINE_ROOT / "logs" / "engine")
+    return [ea.acceptance(r, k) for r in sorted(reqs, key=lambda r: r["rid"])]
+
+
+def _accept_cell(a) -> str:
+    if isinstance(a, list):
+        return f"{a[0]:.4f}" if len(a) == 1 else '"' + json.dumps([round(x, 4) for x in a]) + '"'
+    return f"{a}"
+
+
+def write_trace(path: Path, wl: dict, accept) -> Path:
+    """The workload's trace; `accept` is one rate for every request, a per-request list
+    (cycled), or None (no MTP)."""
+    lines = ["id,input_len,output_len,arrival_time" + (",accept_rate" if accept else "")]
     for i in range(wl["requests"]):
         line = f"{i},{wl['input_len']},{wl['output_len']},{i * wl['interval_s'] * 1e3:.6f}"
-        if accept_rate:
-            line += f",{accept_rate}"
+        if accept:
+            line += "," + _accept_cell(
+                accept[i % len(accept)] if isinstance(accept, list) else accept
+            )
         lines.append(line)
     path.write_text("\n".join(lines) + "\n")
     return path
@@ -430,7 +450,7 @@ def render_preset(cand: dict, out_dir: Path) -> Path:
     trace = write_trace(
         out_dir / "trace.csv",
         WORKLOADS[cand["engine_workload"]],
-        cand["accept_rate"] if spec else None,
+        (cand.get("accept_draw") or cand["accept_rate"]) if spec else None,
     )
     replicas = k.pop("replicas")
     worker_keys = {
@@ -516,17 +536,33 @@ def ladder(run_dir: Path) -> dict | None:
     )
 
 
-def predict(loop: Loop, analyze: bool = True, force: bool = False, simulate=None) -> dict:
-    """Simulate every proposed candidate; write predictions.json (resumable per candidate)."""
+def pred_file(tag: str | None) -> str:
+    return f"predictions_{tag}.json" if tag else "predictions.json"
+
+
+def predict(
+    loop: Loop,
+    analyze: bool = True,
+    force: bool = False,
+    simulate=None,
+    tag: str | None = None,
+    accept_from: list[str] | None = None,
+    logs: Path | None = None,
+) -> dict:
+    """Simulate every proposed candidate; write predictions[_<tag>].json (resumable per
+    candidate). `accept_from` replaces each MTP candidate's uniform acceptance by the
+    per-request draw of those earlier engine runs (`accept_draw`)."""
     simulate = simulate or run_sim
     prop = loop.read("proposal.json")
-    pf = loop.path("predictions.json")
+    pf = loop.path(pred_file(tag))
     preds = json.loads(pf.read_text()) if pf.is_file() and not force else {}
     preds.setdefault("candidates", {})
     for c in prop["candidates"]:
         if c["label"] in preds["candidates"]:
             continue
-        d = loop.path("sim", c["label"])
+        d = loop.path(f"sim_{tag}" if tag else "sim", c["label"])
+        if accept_from and c["knobs"]["draft_tokens"]:
+            c = dict(c, accept_draw=accept_draw(accept_from, c["knobs"]["draft_tokens"], logs))
         preset = render_preset(c, d)
         loop.log(f"predict {c['label']}: simulating {_rel(preset)}")
         simulate(preset, analyze)
@@ -536,11 +572,15 @@ def predict(loop: Loop, analyze: bool = True, force: bool = False, simulate=None
             family=c["family"],
             knobs=c["knobs"],
             accept_rate=c["accept_rate"],
+            accept_from=accept_from if c.get("accept_draw") else None,
             predicted=m,
             ladder=ladder(d / "run"),
         )
-        loop.write("predictions.json", preds)
-        loop.log(f"predict {c['label']}: " + ", ".join(f"{k} {v:.2f}" for k, v in m.items()))
+        loop.write(pred_file(tag), preds)
+        loop.log(
+            f"predict{'[' + tag + ']' if tag else ''} {c['label']}: "
+            + ", ".join(f"{k} {v:.2f}" for k, v in m.items())
+        )
     preds["inputs"] = dict(
         workload=prop["candidates"][0]["engine_workload"] if prop["candidates"] else None,
         sim_commit=_git_head(),
@@ -549,10 +589,11 @@ def predict(loop: Loop, analyze: bool = True, force: bool = False, simulate=None
             "moe_a2a_pack_us_per_row 0.8 is fitted on one engine run (all_to_all candidates)",
             "the engine's first-use stalls (2-7 s per run) are not modeled",
         ],
+        accept_from=accept_from,
         made=dt.datetime.now().isoformat(timespec="seconds"),
     )
-    loop.write("predictions.json", preds)
-    loop.mark("predict", n=len(preds["candidates"]))
+    loop.write(pred_file(tag), preds)
+    loop.mark("predict" + (f"_{tag}" if tag else ""), n=len(preds["candidates"]))
     return preds
 
 
@@ -704,27 +745,58 @@ def discordant_pairs(
     return out
 
 
+STALL_STEPS = 3  # the engine's first executions after warm-up (ALIGNMENT.md: steps 0-2)
+
+
+def first_use_stall_s(files: list[str], logs: Path) -> float:
+    """The engine's first-use stalls, read off the timeline alone: each of the first
+    `STALL_STEPS` steps' wall above the median wall of the later steps with the same
+    shape (kind, padded batch, chunk, contexts). The max over replicas (the run's
+    duration is the last replica's finish). The Sim does not model them."""
+    worst = 0.0
+    for f in files:
+        steps = [r for r in ea.load(f, logs) if r["type"] == "step"]
+
+        def shape(st):
+            ctx = tuple(fw.get("C") for fw in st["forwards"])
+            return (st["kind"], st.get("decode_B"), st.get("prefill_T"), ctx)
+
+        stall = 0.0
+        for st in steps[:STALL_STEPS]:
+            same = [x["wall_ms"] for x in steps[STALL_STEPS:] if shape(x) == shape(st)]
+            if same:
+                stall += max(0.0, st["wall_ms"] - sorted(same)[len(same) // 2])
+        worst = max(worst, stall / 1e3)
+    return worst
+
+
 def compare(
     loop: Loop,
     threshold: float = 15.0,
     logs: Path | None = None,
     resim: bool = False,
     resim_fn=None,
+    tag: str | None = None,
 ) -> dict:
     """Predicted vs measured for every finished candidate, ranking agreement, verdict.
 
+    Duration and out tok/s are compared against the measured run without its
+    first-use stalls (`first_use_stall_s`; the raw errors are kept as `err_raw`).
     `resim` re-simulates each measured run from its own header and per-request
     acceptance (`engine_align.e2e_run`): the error left once the inputs are the
     measured ones."""
     logs = logs or ENGINE_ROOT / "logs" / "engine"
-    preds = loop.read("predictions.json")["candidates"]
+    preds = loop.read(pred_file(tag))["candidates"]
     prop = {c["label"]: c for c in loop.read("proposal.json")["candidates"]}
     rows = []
     for label, p in preds.items():
         files = engine_files(loop, prop[label])
         if not engine_finished(files, logs):
             continue
-        meas, reqs = ea.measured(files, logs)
+        raw, reqs = ea.measured(files, logs)
+        stall = first_use_stall_s(files, logs)
+        meas = dict(raw, duration_s=raw["duration_s"] - stall)
+        meas["out_tok_s"] = raw["out_tok_s"] * raw["duration_s"] / meas["duration_s"]
         acc = None
         if p["knobs"]["draft_tokens"]:
             vals = [ea.acceptance(r, p["knobs"]["draft_tokens"])[0] for r in reqs if r["itl_ms"]]
@@ -734,7 +806,10 @@ def compare(
             role=p["role"],
             predicted=p["predicted"],
             measured=meas,
+            measured_raw=raw,
+            stall_s=stall,
             err={m: ea.error_pct(p["predicted"][m], meas[m]) for m in METRICS},
+            err_raw={m: ea.error_pct(p["predicted"][m], raw[m]) for m in METRICS},
             accept_pred=p["accept_rate"],
             accept_meas=acc,
         )
@@ -742,6 +817,7 @@ def compare(
             fn = resim_fn or (lambda lab, fs: ea.e2e_run(lab, fs, {}, {}, loop.path("resim"), logs))
             row["resim"] = fn(label, files)["simulated"]
             row["resim_err"] = {m: ea.error_pct(row["resim"][m], meas[m]) for m in METRICS}
+            row["resim_err_raw"] = {m: ea.error_pct(row["resim"][m], raw[m]) for m in METRICS}
         rows.append(row)
     labels = [r["label"] for r in rows]
     rank = {}
@@ -778,9 +854,10 @@ def compare(
         verdict="realign" if realign else "trust",
         pending=[lab for lab in preds if lab not in labels],
     )
-    loop.write("comparison.json", result)
-    loop.path("comparison.md").write_text(markdown(result) + "\n")
-    loop.mark("compare", verdict=result["verdict"], n=len(rows))
+    sfx = f"_{tag}" if tag else ""
+    loop.write(f"comparison{sfx}.json", result)
+    loop.path(f"comparison{sfx}.md").write_text(markdown(result) + "\n")
+    loop.mark("compare" + sfx, verdict=result["verdict"], n=len(rows))
     loop.log(
         f"compare: {len(rows)} measured, verdict {result['verdict']}"
         + (f"; over {threshold}%: {over}" if over else "")
@@ -789,12 +866,13 @@ def compare(
 
 
 def markdown(res: dict) -> str:
-    cols = (
-        ["candidate", "role"] + [f"{m} pred / meas (err)" for m in METRICS] + ["accept pred / meas"]
-    )
+    cols = ["candidate", "role", "duration raw (err)", "stalls (s)"]
+    cols += [f"{m} pred / meas (err)" for m in METRICS] + ["accept pred / meas"]
     lines = ["| " + " | ".join(cols) + " |", "|---" * len(cols) + "|"]
     for r in res["rows"]:
-        cells = [r["label"], r["role"]]
+        raw = r.get("measured_raw", r["measured"])["duration_s"]
+        e_raw = r.get("err_raw", r["err"])["duration_s"]
+        cells = [r["label"], r["role"], f"{raw:.1f} ({e_raw:+.1f}%)", f"{r.get('stall_s', 0):.1f}"]
         for m in METRICS:
             cells.append(f"{r['predicted'][m]:.1f} / {r['measured'][m]:.1f} ({r['err'][m]:+.1f}%)")
         a = r["accept_pred"]
@@ -805,7 +883,8 @@ def markdown(res: dict) -> str:
     if any("resim" in r for r in res["rows"]):
         lines += [
             "",
-            "Re-simulated with each run's measured acceptance and arrivals:",
+            "Re-simulated with each run's measured acceptance and arrivals (errors against "
+            "the run without stalls):",
             "",
             "| candidate | " + " | ".join(f"{m} resim (err)" for m in METRICS) + " |",
             "|---" * (len(METRICS) + 1) + "|",
@@ -826,7 +905,8 @@ def markdown(res: dict) -> str:
         )
     lines.append(
         f"- verdict: **{res['verdict']}** (threshold {res['threshold_pct']}% on "
-        f"{', '.join(GATED)}; TTFT warns only)"
+        f"{', '.join(GATED)}; TTFT warns only; duration and out tok/s without the engine's "
+        "first-use stalls)"
     )
     if res["over_threshold"]:
         lines.append(f"- over threshold: {res['over_threshold']}")

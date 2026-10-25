@@ -58,6 +58,13 @@ def main(argv=None) -> int:
     p.add_argument("name")
     p.add_argument("--no-analyze", action="store_true", help="skip the R0-R7 ladder")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--tag", help="a second prediction set: predictions_<tag>.json")
+    p.add_argument(
+        "--accept-from",
+        nargs="*",
+        help="engine runs (serve_<name>.jsonl names) whose per-request acceptance "
+        "replaces the uniform rate",
+    )
     p = sub.add_parser("run")
     p.add_argument("name")
     p.add_argument("--execute", action="store_true", help="run on the device (blocking; use tmux)")
@@ -96,14 +103,16 @@ def main(argv=None) -> int:
             a.engine_workload,
         )
     elif a.step == "predict":
-        preds = tl.predict(loop, analyze=not a.no_analyze, force=a.force)
+        preds = tl.predict(
+            loop, analyze=not a.no_analyze, force=a.force, tag=a.tag, accept_from=a.accept_from
+        )
         for lab, p in preds["candidates"].items():
             print(lab, json.dumps({k: round(v, 2) for k, v in p["predicted"].items()}))
     elif a.step == "run":
         for r in tl.run(loop, a.execute, a.only):
             print(f"{r['label']}: {r['status']}  bash {r['script']}")
     elif a.step == "compare":
-        res = tl.compare(loop, a.threshold, resim=a.resim)
+        res = tl.compare(loop, a.threshold, resim=a.resim, tag=a.tag)
         print(tl.markdown(res))
     elif a.step == "headroom":
         sc = {k: tl.SCENARIOS[k] for k in a.scenario} if a.scenario else None
