@@ -184,6 +184,7 @@ impl Deployment for UnifiedDeployment {
             kv_admission,
             prefix_cache,
             prefill_chunk_alignment: g.worker.prefill_chunk_alignment(),
+            max_prefill_chunks_per_partition: g.worker.max_prefill_chunks_per_partition(),
             max_model_len: g.arch.max_model_len().ok(),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
@@ -1302,6 +1303,7 @@ mod tests {
             prefill_gpu_time_multiplier: None,
             dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: None,
+            max_prefill_chunks_per_partition: None,
             kv_accounting: Default::default(),
         }
     }
@@ -1469,6 +1471,7 @@ pools:
             prefill_gpu_time_multiplier: None,
             kv_accounting: Default::default(),
             prefill_chunk_alignment: None,
+            max_prefill_chunks_per_partition: None,
         }
     }
 
