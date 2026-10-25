@@ -9,6 +9,7 @@ workload:
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
   run_to_end: true
+  request_rate: 1.0
 
 io:
   log_dir: logs/trn2/qwen38_flash_next_bf16_trn2_pd_8x8chip

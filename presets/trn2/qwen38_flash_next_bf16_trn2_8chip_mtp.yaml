@@ -1,7 +1,8 @@
 # As qwen38_flash_next_bf16_trn2_8chip.yaml with the checkpoint's MTP layer drafting
-# 3 tokens. Acceptance is the trace's accept_rate column (0.71: the MTP top-1
-# acceptance of the flashnext CPU reference, logs/mtp_acceptance.json); regenerate
-# the trace with `trace/generate_fixed_shape.py --accept-rate <p>` to vary it.
+# 1 token (the engine's serve_w64_2048_512_layer_k1). Acceptance is the trace's
+# accept_rate column (0.67: the engine's serving acceptance on these random-token
+# prompts, 0.65-0.69); regenerate the trace with
+# `trace/generate_fixed_shape.py --accept-rate <p>` to vary it.
 deployment: unified
 
 workload:
@@ -11,6 +12,7 @@ workload:
   input_file_tags: [speculative]
   arrival_mode: trace_timed
   run_to_end: true
+  request_rate: 1.0
 
 io:
   log_dir: logs/trn2/qwen38_flash_next_bf16_trn2_8chip_mtp
@@ -27,9 +29,14 @@ pools:
           attn_dp: 4
           attn_tp: 8
           moe_ep: 32
-          draft_tokens: 3
+          draft_tokens: 1
+          region_granularity: layer
+          prefill_buckets: [128, 512, 2048]
+          decode_buckets: [1, 2, 4, 8, 16]
+          context_buckets: [2048, 4096]
         worker:
           type: speculative
           attn_gpu_memory_gb: 25.769803776
           max_batch_tokens: 2048
-          draft_tokens: 3
+          draft_tokens: 1
+          max_prefill_chunks_per_partition: 1
