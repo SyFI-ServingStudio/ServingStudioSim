@@ -1,23 +1,21 @@
-# Stage 4b: the stage-3b MTP configs (acceptance 0.71) under the stage-4a scenarios.
+# Stage 4b: the stage-3b MTP configs (engine acceptance 0.67) under the
+# stage-4a scenarios.
 name: s4_whatif_mtp
 family: mtp
 workloads_file: tools/trn2-config-search/stages/workloads.yaml
-accept_rates: [0.71]
+accept_rates: [0.67]
 base:
-  region_granularity: layer
   tp_collective: reduce_scatter_all_gather
-  moe_dispatch: all_to_all
-  max_batch_tokens: 2048
-  context_buckets: [4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072]
-layouts: [dp4-tp8-g8-ep32-mt1, dp8-tp4-g4-ep32-mt1, dp2-tp8-g16-ep32-mt1]
+  moe_dispatch: all_gather
+  region_granularity: block
+layouts: [dp8-tp4-g4-ep32-mt1, dp4-tp8-g8-ep32-mt1, dp2-tp4-g16-ep32-mt1]
 grid:
   draft_tokens: [1, 2, 3]
+  max_batch_tokens: [512, 2048]
 scenarios:
   base: {}
-  launch_half: {launch_coll_ms: 0.625, launch_plain_ms: 0.0375, step_overhead_ms: 2.0}
+  fused: {step_forwards: fused}
+  no_pad: {spmd_padding: false}
+  multi_chunk: {max_prefill_chunks_per_partition: 16}
   moe_prefill_3x: {kind_time_scale: ["moe_block@256=0.3333", "moe_routed_experts@256=0.3333"]}
-  both:
-    launch_coll_ms: 0.625
-    launch_plain_ms: 0.0375
-    step_overhead_ms: 2.0
-    kind_time_scale: ["moe_block@256=0.3333", "moe_routed_experts@256=0.3333"]
+  host_half: {host_time_scale: 0.5}

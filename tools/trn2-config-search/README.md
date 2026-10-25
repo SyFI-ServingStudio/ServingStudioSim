@@ -50,7 +50,8 @@ oat: {max_batch_tokens: [1024, 4096]}  # each varied alone from every point
 seeds_file: tools/trn2-config-search/stages/s1_top.yaml          # replaces the bare base
 scenarios:                 # what-if overrides applied to every config
   base: {}
-  launch_half: {launch_coll_ms: 0.625, launch_plain_ms: 0.0375, step_overhead_ms: 2.0}
+  host_half: {host_time_scale: 0.5}
+  no_pad: {spmd_padding: false}
   moe_prefill_3x: {kind_time_scale: ["moe_block@256=0.3333", "moe_routed_experts@256=0.3333"]}
 ```
 
@@ -59,6 +60,8 @@ Knobs are the arch and worker parameter names (`list-params`, and the knob table
 
 - `layout`: `dp<attn_dp>-tp<attn_tp>-g<gdn_tp>-ep<moe_ep>-mt<moe_tp>`;
 - `replicas`: defaults to as many replicas as fit the 64 cores;
+- unified / MTP workers default to the flashnext scheduler:
+  `max_prefill_chunks_per_partition: 1` and (unified) `dp_placement: vllm-least-loaded`;
 - P/D: prefix with `prefill.` / `decode.`. A scenario's unprefixed knobs apply to both
   pools.
 

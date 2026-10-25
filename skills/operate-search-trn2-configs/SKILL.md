@@ -37,7 +37,11 @@ before planning a new stage.
 7. `$S report <exp> [<exp> ...] --out <file>` gives frontiers, best configs,
    sensitivity, what-if rank agreement and ladders.
 8. Update `CONFIG_SEARCH.md` with the new numbers. Name the constants a conclusion
-   depends on (the wall launch constants, the MoE prefill kernel).
+   depends on (the fitted host constants, the MoE prefill kernel, the all-to-all
+   capacity model), and keep "today's engine knobs" apart from what-ifs the engine
+   would have to build (`step_forwards`, `spmd_padding`, `moe_a2a_capacity_factor`).
+   After an arch change that moves costs, check `tools/trn2-engine-align` first
+   (`doc/pr/trn2-flashnext/ALIGNMENT.md`).
 
 ## Done when
 

@@ -34,7 +34,12 @@ FAMILIES = ("unified", "mtp", "pd")
 POOLS = ("prefill", "decode")
 
 # Knobs that live on the worker, not the arch.
-WORKER_KNOBS = {"max_batch_tokens", "attn_gpu_memory_gb"}
+WORKER_KNOBS = {
+    "max_batch_tokens",
+    "attn_gpu_memory_gb",
+    "max_prefill_chunks_per_partition",
+    "dp_placement",
+}
 # Knobs on the pool group.
 GROUP_KNOBS = {"replicas"}
 LAYOUT_KNOBS = ("attn_dp", "attn_tp", "gdn_tp", "moe_ep", "moe_tp")

@@ -355,7 +355,13 @@ def cmd_top(args) -> int:
                 if r["cfg.core_id"] in seen:
                     continue
                 seen.add(r["cfg.core_id"])
-                cfg = {k[4:]: v for k, v in r.items() if k.startswith("cfg.")}
+                # `accept_rate` belongs to the workload (an MTP trace), and a
+                # knob a row lacks is null in the results table.
+                cfg = {
+                    k[4:]: v
+                    for k, v in r.items()
+                    if k.startswith("cfg.") and v is not None and k != "cfg.accept_rate"
+                }
                 seeds.append(knobs(cfg))
     Path(args.out).write_text(yaml.safe_dump({"seeds": seeds}, sort_keys=False))
     print(f"[top] {len(seeds)} seeds -> {args.out}")

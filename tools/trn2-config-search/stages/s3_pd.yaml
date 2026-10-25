@@ -4,12 +4,12 @@ name: s3_pd
 family: pd
 workloads_file: tools/trn2-config-search/stages/workloads.yaml
 base:
-  prefill.region_granularity: layer
+  prefill.region_granularity: block
   prefill.tp_collective: reduce_scatter_all_gather
-  prefill.moe_dispatch: all_to_all
-  decode.region_granularity: layer
+  prefill.moe_dispatch: all_gather
+  decode.region_granularity: block
   decode.tp_collective: reduce_scatter_all_gather
-  decode.moe_dispatch: all_to_all
+  decode.moe_dispatch: all_gather
 grid:
   prefill.layout: [dp4-tp8-g8-ep32-mt1, dp8-tp4-g4-ep32-mt1, dp2-tp8-g16-ep32-mt1]
   decode.layout: [dp4-tp8-g8-ep32-mt1, dp8-tp4-g4-ep32-mt1, dp2-tp8-g16-ep32-mt1]

@@ -52,6 +52,11 @@ def _group(family: str, pool: str | None, knobs: dict) -> dict:
     if pool is None:
         # Required by chunked_prefill / speculative; the step-4 presets' chunk.
         worker.setdefault("max_batch_tokens", 2048)
+        # The flashnext scheduler: one prefill chunk per DP group per step, a
+        # new request to the least-loaded group (chunked_prefill only).
+        worker.setdefault("max_prefill_chunks_per_partition", 1)
+        if family == "unified":
+            worker.setdefault("dp_placement", "vllm-least-loaded")
     if family == "mtp":
         arch.setdefault("draft_tokens", 3)
         worker.setdefault("draft_tokens", arch["draft_tokens"])
