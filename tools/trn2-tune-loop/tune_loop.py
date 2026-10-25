@@ -105,6 +105,10 @@ GATED = ("duration_s", "out_tok_s", "tpot_p50_ms")
 TIE_PCT = 3.0
 
 
+def _rel(p: Path) -> str:
+    return str(p.relative_to(SIM)) if p.is_relative_to(SIM) else str(p)
+
+
 # ------------------------------------------------------------------------- loop state
 class Loop:
     def __init__(self, name: str, root: Path = TUNE_ROOT):
@@ -524,7 +528,7 @@ def predict(loop: Loop, analyze: bool = True, force: bool = False, simulate=None
             continue
         d = loop.path("sim", c["label"])
         preset = render_preset(c, d)
-        loop.log(f"predict {c['label']}: simulating {preset.relative_to(SIM)}")
+        loop.log(f"predict {c['label']}: simulating {_rel(preset)}")
         simulate(preset, analyze)
         m = ea.simulated(d / "run")
         preds["candidates"][c["label"]] = dict(
@@ -658,14 +662,18 @@ def run(
             busy = check_device()
             if busy:
                 raise RuntimeError(f"engine containers running: {busy}; stop them or wait")
-            loop.log(f"run {c['label']}: {script.relative_to(SIM)}")
+            loop.log(f"run {c['label']}: {_rel(script)}")
             r = subprocess.run(["bash", str(script)], capture_output=True, text=True)
             status = "finished" if engine_finished(files, logs) else f"failed (exit {r.returncode})"
             loop.log(f"run {c['label']}: {status}")
         out.append(dict(label=c["label"], script=str(script), files=files, status=status))
-    loop.write("runs.json", out)
-    if all(r["status"] == "finished" for r in out):
-        loop.mark("run", n=len(out))
+    has = loop.path("runs.json").is_file()
+    prev = {r["label"]: r for r in loop.read("runs.json")} if has else {}
+    prev.update({r["label"]: r for r in out})
+    every = [prev[c["label"]] for c in prop["candidates"] if c["label"] in prev]
+    loop.write("runs.json", every)
+    if len(every) == len(prop["candidates"]) and all(r["status"] == "finished" for r in every):
+        loop.mark("run", n=len(every))
     return out
 
 
