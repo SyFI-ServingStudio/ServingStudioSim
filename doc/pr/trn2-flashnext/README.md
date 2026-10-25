@@ -163,10 +163,18 @@ Status of the ladder pieces:
   removes it as "batching", because it bounds the leaf by its rate. Read the R2 − R3 gap as launch-bound
   regions plus genuinely small batches.
 
+## Config search
+
+`CONFIG_SEARCH.md` holds the simulator-only config search over these knobs: the best
+configs per workload, knob sensitivity, the headroom ladder, and what-if scenarios for
+the launch constants and the MoE prefill kernel. Tool: `tools/trn2-config-search/`;
+skill: `operate-search-trn2-configs`.
+
 ## First results (2026-10-25)
 
 All three presets run end to end with the calibrated composition and 0 missing rows. The trace is 64 requests,
-2048 in / 512 out, 50 ms apart.
+2048 in / 512 out, 50 ms apart in the file. The presets leave `workload.request_rate` at its default of 10,
+and `trace_timed` divides arrival times by it, so these runs replayed the requests 5 ms apart.
 
 | Preset | Ranks | tok/s | tok/s/rank |
 |---|---|---|---|
