@@ -13,15 +13,21 @@
 use std::fs::File;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 
-use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
+use crate::arch::config::{
+    AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, NeuronFlashNextSpec, RoutingKind,
+};
 use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
+use crate::arch::qwen4_exp_neuron_bf16::{
+    NeuronFlashNextCore, NeuronFlashNextImpls, NeuronFlashNextParallel, Qwen4ExpNeuronBf16Model,
+    Qwen4ExpNeuronBf16SpeculativeModel,
+};
 use crate::arch::{
     deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
     glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
@@ -1669,6 +1675,104 @@ pub fn qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative(
         .context("building Qwen4Exp model (often a missing profile.db row)")
 }
 
+/// The flashnext-neuron layout and knobs a `qwen4_exp_neuron_bf16*` selector names.
+fn neuron_flash_next_parallel(
+    model: &Qwen4ExpModelCfg,
+    spec: &NeuronFlashNextSpec,
+    draft_tokens: u32,
+    gpu: &str,
+) -> NeuronFlashNextParallel {
+    let gdn_tp = spec.gdn_tp.unwrap_or(spec.attn_tp);
+    let ranks = spec.attn_dp * spec.attn_tp.max(gdn_tp);
+    let _ = model;
+    NeuronFlashNextParallel {
+        gpu_name: gpu.to_string(),
+        max_model_len: spec.max_model_len,
+        lnc: spec.lnc,
+        attn_dp: spec.attn_dp,
+        attn_tp: spec.attn_tp,
+        gdn_tp,
+        moe_ep: spec.moe_ep.unwrap_or(ranks / spec.moe_tp.max(1)),
+        moe_tp: spec.moe_tp,
+        draft_tokens,
+        tp_collective: spec.tp_collective,
+        moe_dispatch: spec.moe_dispatch,
+        region_granularity: spec.region_granularity,
+        coarse_region_calibration: spec.coarse_region_calibration as f32,
+        prefill_buckets: spec.prefill_buckets.clone(),
+        decode_buckets: spec.decode_buckets.clone(),
+        context_buckets: spec.context_buckets.clone(),
+        ple_table_shards: spec.ple_table_shards,
+        hbm_per_core_gb: spec.hbm_per_core_gb,
+        hbm_reserve_gb: spec.hbm_reserve_gb,
+        impls: NeuronFlashNextImpls {
+            gdn_prefill: spec.gdn_prefill_impls.clone(),
+            gdn_decode: spec.gdn_decode_impls.clone(),
+            qsa_prefill: spec.qsa_prefill_impls.clone(),
+            qsa_decode: spec.qsa_decode_impls.clone(),
+            qsa_select: spec.qsa_select_impls.clone(),
+            qsa_scores: spec.qsa_scores_impls.clone(),
+            moe_routed: spec.moe_routed_impls.clone(),
+            moe_router: spec.moe_router_impls.clone(),
+            moe_shared: spec.moe_shared_impls.clone(),
+            hc_mix: spec.hc_mix_impls.clone(),
+            head: spec.head_impls.clone(),
+        },
+    }
+}
+
+fn neuron_flash_next_core(
+    model_spec: &ModelSpec,
+    spec: &NeuronFlashNextSpec,
+    draft_tokens: u32,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<NeuronFlashNextCore> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "qwen4_exp_neuron_bf16 rejects num_layers/sim_num_layers overrides; the exact \
+             GDN/QSA layer schedule is required"
+        );
+    }
+    let model_cfg = Qwen4ExpModelCfg::from_bf16_json(Path::new(&model_spec.model_config))
+        .context("loading the Qwen4Exp BF16 config")?;
+    let parallel = neuron_flash_next_parallel(&model_cfg, spec, draft_tokens, gpu);
+    NeuronFlashNextCore::build(name.to_string(), &model_cfg, parallel, bridge)
+        .context("building Qwen4Exp BF16 on Trainium2 (often a missing Neuron profile.db row)")
+}
+
+/// Qwen4Exp BF16 on Trainium2 (flashnext-neuron), no MTP.
+pub fn qwen4_exp_neuron_bf16(
+    model_spec: &ModelSpec,
+    spec: &NeuronFlashNextSpec,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen4ExpNeuronBf16Model> {
+    Ok(Qwen4ExpNeuronBf16Model {
+        core: neuron_flash_next_core(model_spec, spec, 0, gpu, name, bridge)?,
+    })
+}
+
+/// Qwen4Exp BF16 on Trainium2 (flashnext-neuron) with MTP drafting.
+pub fn qwen4_exp_neuron_bf16_speculative(
+    model_spec: &ModelSpec,
+    spec: &NeuronFlashNextSpec,
+    draft_tokens: u32,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen4ExpNeuronBf16SpeculativeModel> {
+    ensure!(
+        draft_tokens > 0,
+        "qwen4_exp_neuron_bf16_speculative needs draft_tokens >= 1"
+    );
+    Ok(Qwen4ExpNeuronBf16SpeculativeModel {
+        core: neuron_flash_next_core(model_spec, spec, draft_tokens, gpu, name, bridge)?,
+    })
+}
+
 /// Build the B200 GLM-5.3-Flash FP8 graph under pure pipeline parallelism:
 /// `pp_size` one-GPU stages at TP1 / EP1, as the whole-pipeline view over them.
 ///
@@ -2568,9 +2672,13 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
+        IterArchSel::Qwen4ExpNeuronBf16 { model, neuron } => {
+            Box::new(qwen4_exp_neuron_bf16(model, neuron, gpu, name, bridge)?)
+        }
         IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
         | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
-        | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
+        | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. }
+        | IterArchSel::Qwen4ExpNeuronBf16Speculative { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
         }
     })
@@ -2667,6 +2775,21 @@ pub fn build_speculative_iter_model(
                 expert_popularity_file.as_deref(),
                 token_corpus_file.as_deref(),
                 cudagraph_capture_sizes,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Qwen4ExpNeuronBf16Speculative {
+            model,
+            neuron,
+            draft_tokens,
+        } => Ok((
+            Box::new(qwen4_exp_neuron_bf16_speculative(
+                model,
+                neuron,
+                *draft_tokens,
                 gpu,
                 name,
                 bridge,
@@ -2936,7 +3059,8 @@ fn build_arch(
                 let (gpus, shape, manifest, kv_cache) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
                     | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
-                    | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
+                    | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. }
+                    | IterArchSel::Qwen4ExpNeuronBf16Speculative { .. } => {
                         let (model, draft_tokens) = build_speculative_iter_model(
                             selector,
                             gpu,
