@@ -11,8 +11,8 @@ over 30 calls, summed over the NEFFs one call launches.
 
 Every registered Neuron backend is named ``neuron_<impl>``, where ``<impl>`` is
 the op module's ``IMPLS`` key. The worker strips ``backend`` before it calls a
-runner, so each (kind, impl) pair gets its own entry point, generated below as
-``profile_<kind>__<impl>``.
+runner, so each (kind, impl) pair gets its own entry point,
+``profile_<kind>__<impl>``, resolved by the module ``__getattr__`` below.
 """
 
 from __future__ import annotations
@@ -21,12 +21,6 @@ from collections.abc import Callable
 
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.neuron.entry import entry_name
-
-# kind -> impls with an entry point. A registry row's RunnerRef names
-# `profile_<kind>__<impl>`; `entry_name` builds that name.
-ENTRY_POINTS: dict[str, tuple[str, ...]] = {
-    "grouped_rms_norm": ("torch",),
-}
 
 
 def _run(kind: str, impl: str, kwargs: dict) -> ComputeMetrics:
@@ -51,6 +45,11 @@ def _make(kind: str, impl: str) -> Callable[..., ComputeMetrics]:
     return run
 
 
-for _kind, _impls in ENTRY_POINTS.items():
-    for _impl in _impls:
-        globals()[entry_name(_kind, _impl)] = _make(_kind, _impl)
+def __getattr__(name: str) -> Callable[..., ComputeMetrics]:
+    """Resolve ``profile_<kind>__<impl>`` on demand (PEP 562), so a new
+    registry row needs no edit here: the adapter rejects an unknown pair."""
+    if name.startswith("profile_") and "__" in name[len("profile_") :]:
+        kind, impl = name[len("profile_") :].rsplit("__", 1)
+        if kind and impl:
+            return _make(kind, impl)
+    raise AttributeError(name)

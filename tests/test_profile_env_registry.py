@@ -26,7 +26,9 @@ def test_backend_env_is_registered_and_served_by_an_image(spec) -> None:
     env = _env(spec)
     if spec.supports.device_family == "neuron":
         # A Neuron env is only a pinned vendor image; it never runs on a host interpreter.
-        assert any(env in image.envs for image in VENDOR_IMAGES.values()), f"no vendor image serves {env!r}"
+        assert any(env in image.envs for image in VENDOR_IMAGES.values()), (
+            f"no vendor image serves {env!r}"
+        )
         return
     assert env in ENV_REGISTRY, f"{spec.kernel_kind}:{spec.backend} names unknown env {env!r}"
     assert any(env in image.envs for image in IMAGES.values()), f"no image serves {env!r}"

@@ -144,7 +144,9 @@ def test_host_chip_allowlist_limits_the_default_pool(monkeypatch):
     monkeypatch.delenv("NEURON_RT_VISIBLE_CORES", raising=False)
     monkeypatch.delenv("NEURON_VISIBLE_DEVICES", raising=False)
     chips = [
-        neuron.NeuronDevice(i, tuple(range(4 * i, 4 * i + 4)), 2, 96 * 1024**3, False, "trn2.48xlarge")
+        neuron.NeuronDevice(
+            i, tuple(range(4 * i, 4 * i + 4)), 2, 96 * 1024**3, False, "trn2.48xlarge"
+        )
         for i in range(16)
     ]
     monkeypatch.setattr(neuron, "neuron_devices", lambda: chips)

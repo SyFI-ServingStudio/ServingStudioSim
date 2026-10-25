@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from profiling.db.args import DType, KernelArgs
 from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
-from profiling.kernels.neuron_common import neuron_spec
 from profiling.db.registry import (
     BackendSupport,
     KernelProfilerSpec,
@@ -15,6 +14,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.neuron_common import neuron_spec
 
 KIND = "grouped_rms_norm"
 
