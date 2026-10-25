@@ -629,6 +629,10 @@ struct StepViews {
     /// token-wise regions run at exactly the group's rows. Otherwise (fused)
     /// token-wise regions pad to the union of the token buckets.
     exact: bool,
+    /// A group batch that does not split over its TP ranks is world-gathered
+    /// from each of them (the engine's separate forwards; a fused forward
+    /// would pad its mixed rows to a TP multiple instead).
+    dup: bool,
 }
 
 impl StepViews {
@@ -2897,6 +2901,9 @@ struct LeafOut {
 struct RowCtx {
     /// Shapes are padded already: token-wise leaves take them as they are.
     exact: bool,
+    /// World gathers count the whole batch of each TP rank when it does not
+    /// split (`StepViews::dup`).
+    dup: bool,
     /// Sequence parallelism is active in this pass.
     sp: bool,
     /// Ranks per DP group and in the replica.
@@ -2958,7 +2965,7 @@ fn rows_of(src: RowSrc, groups: &[GroupStep], bk: &Buckets, c: RowCtx) -> u32 {
                 let n = rows(g);
                 // "dup": a group batch that does not split over its TP ranks
                 // is gathered from every one of them.
-                if c.exact && !c.sp && n % c.g != 0 {
+                if c.dup && !c.sp && n % c.g != 0 {
                     n * c.g
                 } else {
                     n
@@ -3452,6 +3459,7 @@ impl NeuronFlashNextCore {
                 StepViews {
                     groups,
                     exact: true,
+                    dup: false,
                 }
             }
             StepForwards::Separate => {
@@ -3506,6 +3514,7 @@ impl NeuronFlashNextCore {
                 StepViews {
                     groups,
                     exact: true,
+                    dup: true,
                 }
             }
         }
@@ -3571,6 +3580,7 @@ impl NeuronFlashNextCore {
                 };
             let rc = RowCtx {
                 exact: views.exact,
+                dup: views.dup,
                 sp: sp[vi],
                 g,
                 ranks: par.ranks(),
