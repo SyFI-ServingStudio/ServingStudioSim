@@ -402,7 +402,12 @@ def _neuron_container_worker_command(
             "TMPDIR": str(cache / "tmp"),
             "TEMP": str(cache / "tmp"),
             "TMP": str(cache / "tmp"),
-            "NKI_ARTIFACTS_DIR": str(cache / "artifacts"),
+            # neuronx-cc writes fixed file names into the NKI artifacts
+            # directory and needs it clean per compilation, so concurrent
+            # workers sharing the cache each get their own.
+            "NKI_ARTIFACTS_DIR": str(
+                Path(tempfile.mkdtemp(prefix=f"chip{device.device_id}-", dir=cache / "artifacts"))
+            ),
             CACHE_DIR_ENV: str(cache),
             "NEURON_COMPILE_CACHE_URL": str(cache / "compile"),
             "XDG_CACHE_HOME": str(cache / "cache"),

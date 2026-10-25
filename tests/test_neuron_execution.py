@@ -298,6 +298,21 @@ def test_container_rejects_mutable_images_and_a_missing_socket(tmp_path, monkeyp
         missing.validate()
 
 
+def test_concurrent_workers_get_their_own_nki_artifacts_dir(container_setup):
+    """neuronx-cc writes fixed names there and needs it clean per compile:
+    a shared directory made parallel NKI compiles fail (NCC_EVRF059)."""
+    setup = container_setup
+    dirs = []
+    for _ in range(2):
+        command, _ = neuron._neuron_container_worker_command(
+            setup.container, DEVICE, setup.exchange, image_id=IMAGE
+        )
+        dirs.append(worker_environment(command)["NKI_ARTIFACTS_DIR"])
+    assert dirs[0] != dirs[1]
+    cache = Path(worker_environment(command)[neuron.CACHE_DIR_ENV])
+    assert all(Path(d).parent == cache / "artifacts" for d in dirs)
+
+
 def test_neuron_argv_and_mounts_preserve_identity_and_image_abi(container_setup, monkeypatch):
     setup = container_setup
     monkeypatch.setenv("PJRT_DEVICE", "NEURON")
