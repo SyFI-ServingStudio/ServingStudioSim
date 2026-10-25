@@ -125,7 +125,8 @@
     "achievable_limit": 932.0151417379818,
     "hardware_limit": 617.1281896523778,
     "segmented_necessary": 22.097123546186197
-   }
+   },
+   "engine": "did not run: the dp8 x 2048 block prefill NEFF fails to load (NRT Allocation Failure)"
   },
   "tp8": {
    "role": "variant",
@@ -238,9 +239,71 @@
     "hardware_limit": 555.3718950058623,
     "segmented_necessary": 22.139612144780347
    }
+  },
+  "tp8_chunk4096": {
+   "role": "variant",
+   "knobs": {
+    "tp_collective": "reduce_scatter_all_gather",
+    "moe_dispatch": "all_gather",
+    "region_granularity": "block",
+    "attn_dp": 4,
+    "attn_tp": 8,
+    "gdn_tp": 8,
+    "moe_ep": 32,
+    "moe_tp": 1,
+    "draft_tokens": 1,
+    "max_batch_tokens": 4096,
+    "replicas": 2,
+    "decode_buckets": [
+     1,
+     2,
+     4,
+     8,
+     16
+    ],
+    "context_buckets": [
+     2048,
+     4096
+    ],
+    "prefill_buckets": [
+     128,
+     512,
+     2048
+    ]
+   },
+   "accept_rate": 0.67,
+   "search": {
+    "base": "mtp_dp8-tp4-g4-ep32-mt1_94b1bdff",
+    "override": {
+     "attn_dp": 4,
+     "attn_tp": 8,
+     "gdn_tp": 8,
+     "max_batch_tokens": 4096
+    },
+    "note": "added after chunk4096 failed to load on the engine (dp8 x 2048 block prefill)"
+   },
+   "predicted": {
+    "duration_s": 50.8554,
+    "out_tok_s": 644.3366879426767,
+    "ttft_p50_s": 12.5822998046875,
+    "tpot_p50_ms": 70.41095733642578
+   },
+   "ladder_ms": {
+    "real": 3252.0960002929687,
+    "busy": 3252.015814697266,
+    "balanced": 3252.0157851019985,
+    "per_config_best": 2267.691876584489,
+    "ignore_network": 2234.755181584727,
+    "sustained_limit": 843.7573006008965,
+    "achievable_limit": 843.7573006008965,
+    "hardware_limit": 545.3106988693503,
+    "segmented_necessary": 22.097123546186197
+   },
+   "added": "2026-10-25T16:52 (after chunk4096 failed to load; before tp8_chunk4096 ran)"
   }
  },
  "predicted_rank_by_duration": [
+  "tp8_chunk4096",
   "top1",
   "chunk4096",
   "tp8",
