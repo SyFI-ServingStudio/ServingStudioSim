@@ -47,14 +47,29 @@ evidence are in `doc/pr/trn2-flashnext/TUNE_LOOP.md`; the alignment it rests on 
   longer than that bucket (the engine caps chunks at the bucket, the Sim does not).
   `propose` refuses it; a budget above the bucket with prompts that fit one bucket
   (W64 at 4096 with a 2048 bucket) is fine.
-- **Uncertain inputs.** MTP acceptance is an input (`--accept-rate`; engine k=1: 0.65-0.72
-  on random prompts, 0.87 on chat prompts); `compare --resim` re-simulates with each
-  run's measured acceptance, which separates input error from model error. The
-  all-to-all packing cost (`moe_a2a_pack_us_per_row` 0.8) is fitted on one run: trust
-  a2a predictions less. A new layout (attn_tp 4, dp8) changes per-rank shapes; its L1
-  rows exist but its composition was first checked in `TUNE_LOOP.md`.
+- **Engine HBM**: block prefill over 8192 gathered MoE rows (attn_dp x largest prefill
+  bucket) fails NEFF load with `Allocation Failure`. The Sim's HBM check does not see
+  it, and `propose` refuses it.
+- **Uncertain inputs.**
+  - **MTP acceptance** is an input.
+    - Engine k=1 rates: 0.65-0.72 on random prompts, 0.87 on chat prompts.
+    - A uniform `--accept-rate` predicts W64 10-15% short, because duration follows the
+      slowest requests.
+    - Also predict a second set with `--tag <t> --accept-from <earlier k-matched engine
+      runs>` (per-request draws; use the median of ~3 draws).
+    - `compare --resim` re-simulates with each run's own acceptance, which separates
+      input error from model error.
+  - **The all-to-all cost** (`moe_a2a_pack_us_per_row` 0.8) fits dp4 x T=2048 but is
+    ~3.4x too low at dp8 x T=512 (`TUNE_LOOP.md`). Treat every a2a prediction as
+    untrusted until it is re-fitted.
+- **First-use stalls**: the engine's first 3 steps after warm-up stall 3 s at TP8 and
+  10 s at TP4, which the Sim does not model. `compare` gates on durations without them
+  and reports the raw ranking beside it; say so when the two differ.
 - Run-to-run noise on the engine is ~3-5% (host load); differences below that are
-  ties, not rankings.
+  ties, not rankings. Two replicas of one run differ by 2-5% in duration.
+- Do not run Sim batches or tests while an engine run is in its timed phase (after
+  `warm-up` in the serve log): host load moves decode steps 5-10%.
+- tmux `has-session -t name` matches prefixes; use `-t "=name"` in wait loops.
 
 ## Steps
 
@@ -68,14 +83,17 @@ From the Sim worktree root:
    'label:knob=v,...'] [--contrast 'label:knob=v,...'] [--accept-rate A]`. Use the MTP
    workload label (`fixed_2k_512-a0.67`) for MTP rows. Include one contrast the Sim
    predicts to lose, so the ranking is tested, not only the winner.
-4. `$T predict <name>`; read `predictions.json`; commit the predictions.
+4. `$T predict <name>` and `$T predict <name> --tag acc --accept-from <earlier runs>`;
+   read both `predictions*.json`; commit them (copy under `doc/pr/trn2-flashnext/tune/`).
 5. `$T run <name>` and read `engine/<label>.sh`; then in tmux `tune-<name>`:
    `$T run <name> --execute` (one candidate at a time; rerun resumes).
-6. `$T compare <name> --resim`; read `comparison.md`.
+6. `$T compare <name> --resim` and `$T compare <name> --tag acc`; read `comparison*.md`.
+   A failed candidate (see its `logs/engine/serve_<run>_r0.log`) is a finding: add a
+   guard to `engine_blockers` when it is an engine limit.
 7. Record the table, the verdict and the ranking in `TUNE_LOOP.md` (or a new dated
    section), and the best measured config's R0-R7 ladder from `predictions.json`
-   (`ladder`) with the top optimization targets (`CONFIG_SEARCH.md` stage 4 what-ifs
-   re-run on that config).
+   with the top optimization targets: `$T headroom <name> <best> --accept-from <its own
+   run files> --tag meas` (R0-R7 ladder + stage-4 what-ifs on its exact knobs).
 
 ## Done when
 

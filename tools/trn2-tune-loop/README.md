@@ -14,9 +14,11 @@ $T propose blind_w64 --exp logs/trn2/search_v2/s3_mtp --workload fixed_2k_512-a0
     --variant 'chunk4096:max_batch_tokens=4096' --variant 'tp8:attn_dp=4,attn_tp=8,gdn_tp=8' \
     --contrast 'a2a:moe_dispatch=all_to_all'
 $T predict blind_w64                 # Sim only (--no-gpu), ~5 s per candidate with the ladder
+$T predict blind_w64 --tag accdist --accept-from w64_2048_512_block_k1   # drawn acceptance
 $T run blind_w64                     # writes logs/trn2/tune/blind_w64/engine/<label>.sh
 $T run blind_w64 --execute           # on the device, blocking: inside a tmux session tune-*
 $T compare blind_w64 --resim         # comparison.md; --resim re-simulates with measured acceptance
+$T compare blind_w64 --tag accdist   # comparison_accdist.md
 $T headroom blind_w64 top1          # R0-R7 ladder + what-ifs on one candidate's knobs (Sim only)
 $T status blind_w64
 ```
@@ -33,6 +35,20 @@ search (`SCENARIOS`: a 3x faster MoE prefill kernel, idle-DP padding skip, 2x fa
 host, fused decode + prefill forward, 16 chunks per group, all-to-all at capacity
 factor 1.25, and the first two together) and writes `headroom_<label>.{json,md}` with
 the base run's R0-R7 cluster ladder (GPU-seconds over every rank) and gap buckets.
+
+**Acceptance draws.** `--accept-from` gives each request the per-request MTP acceptance
+of earlier engine runs (`accept_draw`, cycled in rid order). On W64, a uniform rate
+predicts 10-15% short because duration follows the slowest requests. Per-request values
+do not carry over between runs (correlation <= 0.26); their spread does.
+
+**First-use stalls.** `compare` subtracts the engine's first-use stalls
+(`first_use_stall_s`). Each of the first 3 steps is compared with its expected wall:
+the medians of later forwards of the same shape, plus the later steps' median host
+time. It reports the raw errors (`err_raw`) and the raw-duration ranking beside the
+gated ones.
+
+**Engine HBM.** `engine_blockers` refuses block prefill over 8192 gathered MoE rows.
+The engine failed to load dp8 x 2048 with `Allocation Failure`.
 
 **Verdict.** `realign` when any of duration, out tok/s or TPOT p50 is off by more than
 `--threshold` (15%) or the duration ranking flips on a pair more than 3% apart measured;
