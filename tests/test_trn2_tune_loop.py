@@ -84,6 +84,7 @@ def test_engine_knobs_fill_the_engines_defaults():
         ({"moe_ep": 16, "moe_tp": 2}, "EP32"),
         ({"moe_routed_impls": ["nki"]}, "moe_routed_impls"),
         ({"attn_dp": 4}, "32 cores"),
+        ({"max_batch_tokens": 4096}, "Allocation Failure"),
     ],
 )
 def test_sim_only_and_unsupported_knobs_are_refused(over, needle):
@@ -112,7 +113,7 @@ def test_propose_picks_runnable_top_variants_and_contrast(tmp_path, search_exp):
         [search_exp],
         "fixed_2k_512-a0.67",
         top=2,
-        variants=["c4096:max_batch_tokens=4096"],
+        variants=["c4096:max_batch_tokens=4096,attn_dp=4,attn_tp=8,gdn_tp=8"],
         contrasts=["a2a:moe_dispatch=all_to_all"],
         explicit=[],
     )
@@ -383,3 +384,16 @@ def test_accept_draw_and_trace_cycle_per_request_rates(tmp_path):
     trace = tl.write_trace(tmp_path / "t.csv", tl.WORKLOADS["w64"], draw).read_text().splitlines()
     assert trace[1].endswith(",0.5000") and trace[2].endswith(",0.0000")
     assert trace[3].endswith(",0.5000")  # cycled over 64 requests
+
+
+def test_cli_runs_every_step(tmp_path, search_exp, fake_engine, monkeypatch, capsys):
+    import tune
+
+    monkeypatch.setattr(tl, "TUNE_ROOT", tmp_path / "tune")
+    loop, _, _ = _loop_with_predictions(tmp_path, search_exp)
+    monkeypatch.setattr(tl, "busy_containers", lambda: [])
+    assert tune.main(["run", "t"]) == 0
+    assert tune.main(["compare", "t", "--threshold", "10"]) == 0
+    assert tune.main(["status", "t"]) == 0
+    out = capsys.readouterr().out
+    assert "top1: pending" in out and '"propose"' in out

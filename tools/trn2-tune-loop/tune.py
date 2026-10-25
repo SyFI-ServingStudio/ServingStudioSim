@@ -71,6 +71,7 @@ def main(argv=None) -> int:
     p.add_argument("--only", nargs="*")
     p = sub.add_parser("compare")
     p.add_argument("name")
+    p.add_argument("--tag", help="compare predictions_<tag>.json")
     p.add_argument("--threshold", type=float, default=15.0)
     p.add_argument(
         "--resim",

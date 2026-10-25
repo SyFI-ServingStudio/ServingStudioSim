@@ -63,6 +63,11 @@ ENGINE_DEFAULTS = dict(
 )
 ENGINE_PREFILL_BUCKETS = (128, 512, 2048)
 REPLICA_CORES = 32
+# The largest block-granularity prefill the engine loads: attn_dp x T gathered MoE rows
+# per rank. 4 x 2048 = 8192 runs (w64 block k1); 8 x 2048 = 16384 fails at NEFF load
+# with "Allocation Failure" (tune loop blind_w64, chunk4096). Layer granularity at
+# 16384 rows is unmeasured.
+BLOCK_PREFILL_ROWS_MAX = 8192
 
 # Sim knobs the engine does not have, with the only value the engine implements
 # (None: no engine equivalent at all; any value other than the arch default is a
@@ -111,9 +116,9 @@ def _rel(p: Path) -> str:
 
 # ------------------------------------------------------------------------- loop state
 class Loop:
-    def __init__(self, name: str, root: Path = TUNE_ROOT):
+    def __init__(self, name: str, root: Path | None = None):
         self.name = name
-        self.dir = root / name
+        self.dir = (root or TUNE_ROOT) / name
         self.dir.mkdir(parents=True, exist_ok=True)
 
     def path(self, *parts) -> Path:
@@ -194,6 +199,13 @@ def engine_blockers(k: dict) -> list[str]:
         out.append("moe_a2a_capacity_factor needs moe_dispatch all_to_all")
     if not 0 <= k["draft_tokens"] <= 3:
         out.append("draft_tokens 0..3")
+    rows = k["attn_dp"] * max(k["prefill_buckets"])
+    if k["region_granularity"] == "block" and rows > BLOCK_PREFILL_ROWS_MAX:
+        out.append(
+            f"block prefill over {rows} gathered MoE rows (attn_dp x largest prefill bucket) "
+            f"does not load on the engine (NRT Allocation Failure at dp8 x 2048; "
+            f"{BLOCK_PREFILL_ROWS_MAX} loads); the Sim's HBM check has no activation memory"
+        )
     if max(k["context_buckets"]) < 2560:
         out.append("context buckets must reach 2048 + 512")
     return out
