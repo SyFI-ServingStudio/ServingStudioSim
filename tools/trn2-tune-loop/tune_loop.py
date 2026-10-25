@@ -857,10 +857,20 @@ def compare(
         if m not in GATED and abs(r["err"][m]) > threshold
     ]
     realign = bool(over or rank["duration_s"]["discordant"])
+    # The same ranking on raw durations (first-use stalls included): it can differ when
+    # layouts stall differently after warm-up; reported, not gated.
+    raw_v = [r["measured_raw"]["duration_s"] for r in rows]
+    pred_v = [r["predicted"]["duration_s"] for r in rows]
+    raw_rank = dict(
+        measured=[labels[i] for i in sorted(range(len(rows)), key=lambda i: raw_v[i])],
+        kendall_tau=kendall_tau(raw_v, pred_v),
+        discordant=discordant_pairs(labels, raw_v, pred_v),
+    )
     result = dict(
         threshold_pct=threshold,
         rows=rows,
         ranking=rank,
+        ranking_raw_duration=raw_rank,
         over_threshold=over,
         warnings=warn,
         verdict="realign" if realign else "trust",
@@ -914,6 +924,13 @@ def markdown(res: dict) -> str:
             f"- {m}: measured {' < '.join(rk['measured'])}; predicted "
             f"{' < '.join(rk['predicted'])}; tau {tau if tau is None else round(tau, 2)}; "
             f"best agrees {rk['best_agrees']}; discordant {rk['discordant'] or 'none'}"
+        )
+    rr = res.get("ranking_raw_duration")
+    if rr:
+        tau = rr["kendall_tau"]
+        lines.append(
+            f"- duration_s with stalls (raw): measured {' < '.join(rr['measured'])}; tau "
+            f"{tau if tau is None else round(tau, 2)}; discordant {rr['discordant'] or 'none'}"
         )
     lines.append(
         f"- verdict: **{res['verdict']}** (threshold {res['threshold_pct']}% on "
