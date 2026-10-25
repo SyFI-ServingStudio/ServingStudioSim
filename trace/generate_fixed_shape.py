@@ -4,7 +4,9 @@ Use this for load-generator capacity tests where shape variance would obscure
 the offered-load boundary. Arrival times are milliseconds, matching the L7 and
 req-frontend `independent` frontend contract. `--prefix-len` adds the optional
 `prefix_len` column: that many context tokens already resident (a pinned prefix
-hit) ahead of the `input_len` fresh tokens.
+hit) ahead of the `input_len` fresh tokens. `--accept-rate` adds the
+`accept_rate` column a `speculative`-tagged trace needs: the per-position
+conditional draft acceptance of every request.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ def write_fixed_shape_trace(
     output_len: int,
     interarrival_ms: float,
     prefix_len: int = 0,
+    accept_rate: float | None = None,
 ) -> None:
     if requests <= 0:
         raise ValueError("requests must be positive")
@@ -30,12 +33,19 @@ def write_fixed_shape_trace(
         raise ValueError("interarrival_ms must be nonnegative")
     if prefix_len < 0:
         raise ValueError("prefix_len must be nonnegative")
+    if accept_rate is not None and not 0.0 <= accept_rate <= 1.0:
+        raise ValueError("accept_rate must be in [0, 1]")
 
     prefix_column = f",{prefix_len}" if prefix_len else ""
-    lines = ["id,input_len,output_len,arrival_time" + (",prefix_len" if prefix_len else "")]
+    accept_column = f",{accept_rate}" if accept_rate is not None else ""
+    lines = [
+        "id,input_len,output_len,arrival_time"
+        + (",prefix_len" if prefix_len else "")
+        + (",accept_rate" if accept_rate is not None else "")
+    ]
     lines.extend(
         f"{request_index},{input_len},{output_len},{request_index * interarrival_ms:.6f}"
-        f"{prefix_column}"
+        f"{prefix_column}{accept_column}"
         for request_index in range(requests)
     )
     output_path.write_text("\n".join(lines) + "\n")
@@ -49,6 +59,7 @@ def main() -> None:
     parser.add_argument("--output-len", type=int, required=True)
     parser.add_argument("--interarrival-ms", type=float, default=0.0)
     parser.add_argument("--prefix-len", type=int, default=0)
+    parser.add_argument("--accept-rate", type=float, default=None)
     arguments = parser.parse_args()
     write_fixed_shape_trace(
         arguments.output,
@@ -57,6 +68,7 @@ def main() -> None:
         output_len=arguments.output_len,
         interarrival_ms=arguments.interarrival_ms,
         prefix_len=arguments.prefix_len,
+        accept_rate=arguments.accept_rate,
     )
 
 

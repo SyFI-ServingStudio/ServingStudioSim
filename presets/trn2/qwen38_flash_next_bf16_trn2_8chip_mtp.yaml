@@ -1,0 +1,35 @@
+# As qwen38_flash_next_bf16_trn2_8chip.yaml with the checkpoint's MTP layer drafting
+# 3 tokens. Acceptance is the trace's accept_rate column (0.71: the MTP top-1
+# acceptance of the flashnext CPU reference, logs/mtp_acceptance.json); regenerate
+# the trace with `trace/generate_fixed_shape.py --accept-rate <p>` to vary it.
+deployment: unified
+
+workload:
+  trace_files:
+    - presets/trn2/trn2_fixed_2k_512_c64_mtp.csv
+  input_file_format: text-generation-independent
+  input_file_tags: [speculative]
+  arrival_mode: trace_timed
+  run_to_end: true
+
+io:
+  log_dir: logs/trn2/qwen38_flash_next_bf16_trn2_8chip_mtp
+
+pools:
+  main:
+    groups:
+      - gpu: "AWS Trainium2 LNC2"
+        replicas: 1
+        arch:
+          type: qwen4_exp_neuron_bf16_speculative
+          model_config: model/config/qwen3_8_flash_next_bf16.json
+          fp8: false
+          attn_dp: 4
+          attn_tp: 8
+          moe_ep: 32
+          draft_tokens: 3
+        worker:
+          type: speculative
+          attn_gpu_memory_gb: 25.769803776
+          max_batch_tokens: 2048
+          draft_tokens: 3
