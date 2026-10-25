@@ -327,3 +327,59 @@ def test_headroom_runs_each_what_if_on_the_candidates_knobs(tmp_path, search_exp
     md = loop.path("headroom_top1.md").read_text()
     assert md.index("moe_prefill_3x") < md.index("no_pad")  # ranked by gain
     tl.headroom(loop, "top1", sc, simulate=lambda p, a: pytest.fail("resumed runs re-simulated"))
+
+
+def _timeline(path: Path, walls: list[tuple[str, float]], itls=None):
+    rows = [{"type": "header", "attn_dp": 8, "draft_tokens": 1}]
+    for i, (kind, w) in enumerate(walls):
+        rows.append(
+            dict(
+                type="step",
+                step=i,
+                kind=kind,
+                wall_ms=w,
+                decode_B=1,
+                prefill_T=512,
+                forwards=[{"phase": kind, "C": 2048, "wall_ms": w}],
+            )
+        )
+    for i, itl in enumerate(itls or [[5.0, 0.0, 5.0, 5.0]]):
+        rows.append(
+            dict(
+                type="request",
+                rid=i,
+                group=0,
+                arrival_s=0.0,
+                prompt_len=2048,
+                output_len=len(itl) + 1,
+                finish_s=10.0,
+                ttft_ms=1.0,
+                tpot_ms=1.0,
+                itl_ms=itl,
+            )
+        )
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+
+def test_first_use_stalls_come_off_the_timeline(tmp_path):
+    # Steps 0-1 stall 8 s and 2 s over their shape's median; step 2 does not.
+    walls = [("prefill", 9400.0), ("prefill", 3400.0), ("prefill", 1400.0)]
+    walls += [("prefill", 1400.0)] * 5 + [("decode", 75.0)] * 5
+    _timeline(tmp_path / "serve_a_r0.jsonl", walls)
+    _timeline(tmp_path / "serve_a_r1.jsonl", [("prefill", 2400.0)] + walls[1:])
+    assert tl.first_use_stall_s(["a_r0"], tmp_path) == pytest.approx(10.0)
+    assert tl.first_use_stall_s(["a_r0", "a_r1"], tmp_path) == pytest.approx(10.0)  # max
+
+
+def test_accept_draw_and_trace_cycle_per_request_rates(tmp_path):
+    # rid 0: steps of 2, 2, 1, 1 tokens between the dropped first and last groups.
+    _timeline(
+        tmp_path / "serve_ref.jsonl",
+        [("decode", 75.0)],
+        itls=[[5.0, 0.0, 5.0, 0.0, 5.0, 5.0, 5.0], [5.0, 5.0, 5.0, 5.0]],
+    )
+    draw = tl.accept_draw(["ref"], 1, tmp_path)
+    assert draw[0][0] == pytest.approx(0.5) and draw[1] == [0.0]
+    trace = tl.write_trace(tmp_path / "t.csv", tl.WORKLOADS["w64"], draw).read_text().splitlines()
+    assert trace[1].endswith(",0.5000") and trace[2].endswith(",0.0000")
+    assert trace[3].endswith(",0.5000")  # cycled over 64 requests
