@@ -17,6 +17,7 @@ $T predict blind_w64                 # Sim only (--no-gpu), ~5 s per candidate w
 $T run blind_w64                     # writes logs/trn2/tune/blind_w64/engine/<label>.sh
 $T run blind_w64 --execute           # on the device, blocking: inside a tmux session tune-*
 $T compare blind_w64 --resim         # comparison.md; --resim re-simulates with measured acceptance
+$T headroom blind_w64 top1          # R0-R7 ladder + what-ifs on one candidate's knobs (Sim only)
 $T status blind_w64
 ```
 
@@ -26,6 +27,12 @@ $T status blind_w64
 | `predict` | `proposal.json` | `sim/<label>/` (preset, trace, run), `predictions.json` | One simulation per candidate, on the engine workload's trace (W64: 64 x 2048/512, 50 ms apart, uniform `accept_rate` for MTP), 2 replicas round-robin (the engine's rid parity). Records the R0-R7 ladder and the uncertain inputs. Resumes per candidate |
 | `run` | `predictions.json` (required: the loop is blind) | `engine/<label>.sh`, `runs.json` | `serve.py` on cores 0-31 and 32-63, comm ports 61000 / 63000, every shape warmed first, a profiled window at steps 150-190. `--execute` runs unfinished candidates one at a time and refuses while a `slice-*` container is up. A candidate is finished when every replica's `serve_<run>.jsonl` ends with its summary row |
 | `compare` | predictions + `logs/engine/serve_tune_<name>_<label>_r*.jsonl` | `comparison.{json,md}` | Error per metric (duration, out tok/s, TTFT p50, TPOT p50; the engine's nearest-rank percentiles), measured MTP acceptance, ranking per metric (Kendall tau, best agrees, pairs that flip beyond a 3% measured tie), verdict |
+
+`headroom <name> <label>` reruns one candidate under the stage-4 what-ifs of the config
+search (`SCENARIOS`: a 3x faster MoE prefill kernel, idle-DP padding skip, 2x faster
+host, fused decode + prefill forward, 16 chunks per group, all-to-all at capacity
+factor 1.25, and the first two together) and writes `headroom_<label>.{json,md}` with
+the base run's R0-R7 cluster ladder (GPU-seconds over every rank) and gap buckets.
 
 **Verdict.** `realign` when any of duration, out tok/s or TPOT p50 is off by more than
 `--threshold` (15%) or the duration ranking flips on a pair more than 3% apart measured;

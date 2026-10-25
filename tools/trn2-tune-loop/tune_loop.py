@@ -835,3 +835,95 @@ def markdown(res: dict) -> str:
     if res["pending"]:
         lines.append(f"- not measured yet: {', '.join(res['pending'])}")
     return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------- headroom
+# What-ifs the engine would have to build (CONFIG_SEARCH.md stage 4), applied to one
+# candidate's exact knobs. Each is Sim-only by construction.
+SCENARIOS = {
+    "moe_prefill_3x": {
+        "kind_time_scale": ["moe_block@256=0.3333", "moe_routed_experts@256=0.3333"]
+    },
+    "no_pad": {"spmd_padding": False},
+    "host_half": {"host_time_scale": 0.5},
+    "fused": {"step_forwards": "fused"},
+    "multi_chunk": {"max_prefill_chunks_per_partition": 16},
+    "a2a_cf125": {"moe_dispatch": "all_to_all", "moe_a2a_capacity_factor": 1.25},
+    "moe_prefill_3x+no_pad": {
+        "kind_time_scale": ["moe_block@256=0.3333", "moe_routed_experts@256=0.3333"],
+        "spmd_padding": False,
+    },
+}
+# R0-R7 rungs of the analyzer's cluster ladder (GPU-seconds summed over ranks).
+RUNGS = (
+    ("R0 real", "real"),
+    ("R1 busy", "busy"),
+    ("R2 balanced", "balanced"),
+    ("R3 per-config best", "per_config_best"),
+    ("R4 ignore network", "ignore_network"),
+    ("R4a/b sustained / achievable", "achievable_limit"),
+    ("R5 hardware limit", "hardware_limit"),
+    ("R6/R7 necessary work", "segmented_necessary"),
+)
+
+
+def headroom(
+    loop: Loop, label: str, scenarios: dict | None = None, simulate=None, analyze: bool = True
+) -> dict:
+    """The candidate's R0-R7 ladder and its predicted gain under each what-if."""
+    simulate = simulate or run_sim
+    scenarios = scenarios or SCENARIOS
+    cand = next(c for c in loop.read("proposal.json")["candidates"] if c["label"] == label)
+    base = loop.read("predictions.json")["candidates"][label]
+    out = dict(label=label, base=base["predicted"], ladder=base["ladder"], scenarios={})
+    for name, over in scenarios.items():
+        d = loop.path("headroom", label, name)
+        if (d / "run" / "summary.json").is_file():
+            m = ea.simulated(d / "run")
+        else:
+            c = dict(cand, knobs=dict(cand["knobs"], **over))
+            simulate(render_preset(c, d), False)
+            m = ea.simulated(d / "run")
+        gain = {k: ea.error_pct(m[k], base["predicted"][k]) for k in METRICS}
+        out["scenarios"][name] = dict(override=over, predicted=m, change_pct=gain)
+        loop.log(f"headroom {label} {name}: out tok/s {gain['out_tok_s']:+.1f}%")
+    loop.write(f"headroom_{label}.json", out)
+    loop.path(f"headroom_{label}.md").write_text(headroom_markdown(out) + "\n")
+    loop.mark(f"headroom_{label}", n=len(scenarios))
+    return out
+
+
+def headroom_markdown(h: dict) -> str:
+    lines = []
+    lad = (h.get("ladder") or {}).get("ladder")
+    if lad:
+        r0 = lad["real"]
+        lines += ["| Rung | GPU-s (all ranks) | of R0 |", "|---|---|---|"]
+        for name, key in RUNGS:
+            v = lad.get(key)
+            if v is not None:
+                lines.append(f"| {name} | {v:.0f} | {v / r0:.1%} |")
+        b = h["ladder"]["buckets"]
+        lines += ["", "| Gap bucket | share of R0 |", "|---|---|"]
+        for k, v in sorted(b.items(), key=lambda kv: -((kv[1] or {}).get("frac") or 0)):
+            if v and v.get("frac"):
+                lines.append(f"| {k} | {v['frac']:.1%} |")
+        lines.append("")
+    lines += [
+        "| What-if | duration (s) | out tok/s | TTFT p50 (s) | TPOT p50 (ms) |",
+        "|---|---|---|---|---|",
+    ]
+    b = h["base"]
+    lines.append(
+        f"| base | {b['duration_s']:.1f} | {b['out_tok_s']:.0f} | {b['ttft_p50_s']:.1f} | "
+        f"{b['tpot_p50_ms']:.1f} |"
+    )
+    ranked = sorted(h["scenarios"].items(), key=lambda kv: -kv[1]["change_pct"]["out_tok_s"])
+    for name, s in ranked:
+        m, g = s["predicted"], s["change_pct"]
+        lines.append(
+            f"| {name} | {m['duration_s']:.1f} ({g['duration_s']:+.0f}%) | {m['out_tok_s']:.0f} "
+            f"({g['out_tok_s']:+.0f}%) | {m['ttft_p50_s']:.1f} ({g['ttft_p50_s']:+.0f}%) | "
+            f"{m['tpot_p50_ms']:.1f} ({g['tpot_p50_ms']:+.0f}%) |"
+        )
+    return "\n".join(lines)

@@ -308,3 +308,22 @@ def test_ranking_flip_beyond_noise_is_flagged():
     assert tl.discordant_pairs(labels, meas, pred) == [("a", "b"), ("b", "c")]
     assert tl.kendall_tau([1, 2, 3], [1, 2, 3]) == 1.0
     assert tl.kendall_tau([1, 2, 3], [3, 2, 1]) == -1.0
+
+
+def test_headroom_runs_each_what_if_on_the_candidates_knobs(tmp_path, search_exp):
+    loop, _, _ = _loop_with_predictions(tmp_path, search_exp)
+    seen = {}
+
+    def simulate(preset: Path, analyze: bool):
+        arch = json.loads(preset.read_text())["pools"]["main"]["groups"][0]["arch"]
+        seen[preset.parent.name] = arch
+        _fake_sim_run(preset.parent / "run", 40.0 if "kind_time_scale" in arch else 50.0, 1e4, 60)
+
+    sc = {k: tl.SCENARIOS[k] for k in ("moe_prefill_3x", "no_pad")}
+    h = tl.headroom(loop, "top1", sc, simulate=simulate)
+    assert seen["no_pad"]["spmd_padding"] is False and seen["no_pad"]["attn_tp"] == 4
+    assert h["scenarios"]["moe_prefill_3x"]["change_pct"]["duration_s"] == pytest.approx(-20.0)
+    assert h["scenarios"]["no_pad"]["change_pct"]["duration_s"] == pytest.approx(0.0)
+    md = loop.path("headroom_top1.md").read_text()
+    assert md.index("moe_prefill_3x") < md.index("no_pad")  # ranked by gain
+    tl.headroom(loop, "top1", sc, simulate=lambda p, a: pytest.fail("resumed runs re-simulated"))

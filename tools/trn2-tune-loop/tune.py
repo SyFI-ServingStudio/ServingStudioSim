@@ -5,6 +5,7 @@
     tune.py predict <name> [--no-analyze] [--force]
     tune.py run     <name> [--execute] [--only LABEL ...]
     tune.py compare <name> [--threshold 15] [--resim]
+    tune.py headroom <name> <label> [--scenario S ...]
     tune.py status  <name>
 
 State and logs: logs/trn2/tune/<name>/ (tune.log, state.json, proposal.json,
@@ -69,6 +70,10 @@ def main(argv=None) -> int:
         action="store_true",
         help="also re-simulate each run with its measured acceptance",
     )
+    p = sub.add_parser("headroom")
+    p.add_argument("name")
+    p.add_argument("label", help="candidate (usually the best measured)")
+    p.add_argument("--scenario", nargs="*", help=f"subset of {sorted(tl.SCENARIOS)}")
     p = sub.add_parser("status")
     p.add_argument("name")
     a = ap.parse_args(argv)
@@ -100,6 +105,9 @@ def main(argv=None) -> int:
     elif a.step == "compare":
         res = tl.compare(loop, a.threshold, resim=a.resim)
         print(tl.markdown(res))
+    elif a.step == "headroom":
+        sc = {k: tl.SCENARIOS[k] for k in a.scenario} if a.scenario else None
+        print(tl.headroom_markdown(tl.headroom(loop, a.label, sc)))
     else:
         print(json.dumps(loop.state(), indent=1))
         if loop.path("runs.json").is_file():
