@@ -32,11 +32,10 @@ collective rows, the fabric names how many of a group's ranks share each chip:
 | `neuron_c2` | 2 |
 | `neuron_c1` | 1 (ranks strided across chips) |
 
-**Every leaf time is NRT device time** from the engine's op modules. The exception is
-`region_launch_overhead`, which is the wall time of back-to-back trivial regions: the
-host launch and the inter-region gap. Only `launch_model = l1_additive` uses it, once per
-step at the step's region count. The default prices launch with the calibrated per-region
-floors instead.
+**Every leaf time is NRT device time** from the engine's op modules. Host time (region
+dispatch, per-forward input work) lives in each forward's launch leaf
+(`launch_model = pipelined`, below). The composition is aligned with the full engine's
+serving runs: `ALIGNMENT.md`.
 
 ## What one step costs
 
@@ -66,10 +65,18 @@ The cost structure is the doc comment of `qwen4_exp_neuron_bf16.rs`. In outline:
   1. Pass 0 runs over every target row, verify rows and prefill tokens alike.
   2. `draft_tokens - 1` more passes run, one row per decode request.
   3. Each pass is embed, fc GEMM, HC, the QSA layer, MoE and the head.
-- **Composition.** Every compute leaf is scaled by f_g. Under `launch_model = calibrated`, each region (each
-  leaf call) is floored by its launch, `max(f_g x device, L_r)`, and the step adds `step_overhead_ms`. These
-  constants come from the engine-slice calibration (`flashnext-neuron/flashnext/neuron/engine/README.md`). A
-  region traces a collective when its mixer, MoE block, embed or head runs on more than one rank.
+- **Step.** A decode forward (+ its MTP passes) then a prefill forward (+ its MTP
+  passes), separate programs (`step_forwards: separate`); at most one prefill chunk per
+  DP group per step (worker `max_prefill_chunks_per_partition: 1`).
+- **SPMD.** Every DP group runs the forward's padded shape, idle groups included
+  (`spmd_padding`); world gathers count the "dup" rows of a batch that does not split
+  over its TP ranks.
+- **Composition** (`launch_model = pipelined`). Every compute leaf is its L1 row (f_g
+  1.0). A forward costs `max(Σ_r max(device_r + region_gap_ms, region_host_ms), regions x
+  region_host_ms + forward_overhead_ms)`, and the step adds `step_overhead_ms`: the
+  host dispatches each region and does its per-forward work while the device runs; a
+  region shorter than its dispatch waits for the next launch. Constants fitted on the
+  engine (`ALIGNMENT.md`).
 - **Padding.** Every shape is padded to its bucket, and the padding costs kernel time.
   If a shape exceeds the largest bucket, it runs as several calls.
 - **KV and state per DP partition:**
@@ -96,17 +103,24 @@ The cost structure is the doc comment of `qwen4_exp_neuron_bf16.rs`. In outline:
 | `lnc` | 2 | the LNC axis. Only LNC2 rows exist; other values are refused |
 | `prefill_buckets` | 128 .. 8192 | compiled prefill chunk sizes |
 | `decode_buckets` | 1 .. 256 | compiled decode batch sizes |
-| `context_buckets` | 4096 .. 131072 | compiled QSA context (block-table) sizes |
+| `context_buckets` | 2048 .. 131072 | compiled QSA context (block-table) sizes; a prefill within the 2048-token selection budget runs QSA's dense path |
 | worker `max_batch_tokens` | (2048 in the presets) | chunked-prefill chunk size (worker knob) |
 | `draft_tokens` (speculative tag) and worker `draft_tokens` | 3 | MTP k |
 | trace `accept_rate` | per request | MTP acceptance input (`trace/generate_fixed_shape.py --accept-rate`) |
-| `region_granularity` | per_op, mixer, layer (mixer) | op-level leaves (one region each); the engine's fused regions; or one region per layer (per mixer call) |
-| `region_device_factor` | (per_op 1.10, mixer 0.94, layer 0.88) | f_g on every compute leaf: step device time over the sum of isolated L1 rows (engine-slice fit, `flashnext-neuron/logs/engine/calib_summary.md`) |
-| `launch_model` | calibrated, l1_additive (calibrated) | calibrated: each region costs max(f_g x device, L_r) and the step adds `step_overhead_ms`; l1_additive: device time plus the measured `region_launch_overhead` row at the step's region count |
-| `launch_coll_ms`, `launch_plain_ms`, `step_overhead_ms` | 1.25, 0.075, 4.0 | L_r of a region tracing a collective / a plain region, and the per-step host constant. Fitted on a loaded host; re-fit on a quiet one |
+| `region_granularity` | per_op, mixer, layer, block (mixer) | op-level leaves (one region each); the engine's fused regions; one region per layer (QSA front \| back); or cut only at QSA front \| back (14 regions) |
+| `step_forwards` | separate, fused (separate) | the engine's decode forward then prefill forward, or one fused forward (what-if) |
+| `spmd_padding` | bool (true) | every DP group runs the padded shape; false = each group pays its own (what-if) |
+| `region_device_factor` | (1.0) | f_g on every compute leaf |
+| `launch_model` | pipelined, calibrated, l1_additive (pipelined) | pipelined: above; calibrated: per region max(device, L_r) + `step_overhead_ms`; l1_additive: the `region_launch_overhead` row per forward |
+| `region_host_ms` | (per_op 0.3, mixer 1.0, layer 1.3, block 3.7) | host dispatch per region and its device floor |
+| `forward_overhead_ms`, `mtp_forward_overhead_ms`, `region_gap_ms`, `step_overhead_ms` | 19, 2, 0.17, 2.5 | host work per target / MTP forward (overlaps the device), device per region launch, host per step |
+| `host_time_scale` | (1.0) | what-if: scales every host constant |
+| `launch_coll_ms`, `launch_plain_ms` | 0.15, 0.15 | calibrated only: L_r of a region with / without a collective (barrier-off dispatch) |
 | `*_impls` lists | op IMPLS keys | per-op implementation. Several keys = the best measured row per shape. Per-role `backends_file` overrides also apply |
-| `tp_collective` | all_reduce, reduce_scatter_all_gather | the latter runs HC and MoE dispatch sequence-parallel on 1/G of the tokens |
-| `moe_dispatch` | all_gather, all_to_all | fused block over all tokens, or A2A dispatch/combine with routed experts at T_all/ep equivalent tokens and the shared expert local |
+| `tp_collective` | all_reduce, reduce_scatter_all_gather | the latter runs HC and MoE dispatch sequence-parallel on 1/G of the tokens, in a forward whose rows split over the TP group |
+| `moe_dispatch` | all_gather, all_to_all | fused block over every group's rows, or the engine's A2A: each destination gets the S-row slice (exact capacity: the experts see the all-gather's rows), the shared expert local |
+| `moe_a2a_capacity_factor`, `moe_a2a_pack_us_per_row` | 0 (exact), 0.8 | A2A rows per destination `min(S, ceil(cf S top_k / ranks))`; the engine's packing per received row (fitted) |
+| worker `max_prefill_chunks_per_partition` | (unbounded; presets 1) | prefill chunks per DP group per step |
 | `ple_table_shards` | replica, dp_group, host | row-sharded over all ranks or one group's ranks. host is refused: a compiled region cannot read host memory |
 | `hbm_per_core_gb`, `hbm_reserve_gb` | 25.77, 2.0 | the HBM check and the runtime reserve |
 | `kind_time_scale` | list of `kind=factor` or `kind@min_rows=factor` (none) | what-if only: multiplies the device time of every compute leaf of that L1 kind, at calls of at least `min_rows` rows, before f_g and the launch floor. `moe_block@256=0.333` is "MoE prefill 3x faster". Collectives and the launch leaf are never scaled |
@@ -170,31 +184,17 @@ configs per workload, knob sensitivity, the headroom ladder, and what-if scenari
 the launch constants and the MoE prefill kernel. Tool: `tools/trn2-config-search/`;
 skill: `operate-search-trn2-configs`.
 
-## First results (2026-10-25)
+## Preset results (aligned, 2026-10-25)
 
-All three presets run end to end with the calibrated composition and 0 missing rows. The trace is 64 requests,
-2048 in / 512 out, 50 ms apart in the file. The presets leave `workload.request_rate` at its default of 10,
-and `trace_timed` divides arrival times by it, so these runs replayed the requests 5 ms apart.
+The presets replay the W64 trace (64 requests, 2048 in / 512 out, 50 ms apart) at its
+own arrival times with the engine's knobs (layer regions, its compiled buckets, one
+chunk per DP group).
 
-| Preset | Ranks | tok/s | tok/s/rank |
-|---|---|---|---|
-| 8-chip DP4 x TP8 EP32 | 32 | 1326 | 41.4 |
-| same + MTP k=3 at 0.71 acceptance | 32 | 1917 | 59.9 |
-| P/D, 8 + 8 chips | 64 | 1239 | 19.4 |
+| Preset | Ranks | Duration (s) | Out tok/s | Engine |
+|---|---|---|---|---|
+| 8-chip DP4 x TP8 EP32, layer, chunk 2048 | 32 | 163.7 | 200 | 169.3 s, 194 tok/s (`serve_w64_2048_512_layer_k0`) |
+| same + MTP k=1, uniform 0.67 acceptance | 32 | 152.4 | 215 | 183.4 s at per-request acceptance 0.01-0.97 (mean 0.65); with those per-request rates the Sim gives 170.8 s (`ALIGNMENT.md`) |
+| P/D, 8 + 8 chips (mixer regions, default buckets) | 64 | 190.8 | 172 | not in the engine |
 
-**Where the time goes.**
-
-- **Prefill.** The MoE block dominates: about 51 ms per layer at 8192 tokens over EP32. The cause is moe_cte's
-  static per-block cost (flashnext-neuron `ops/moe.md`).
-- **Decode.** Mostly launch-bound under the loaded-host constants.
-
-**R0-R7 waterfall** (8-chip preset, GPU-seconds):
-
-| Rung or gap | GPU-s |
-|---|---|
-| Real (R0) | 3954 |
-| Batching and launch gap | 2173 |
-| Kernel gap | 1061 |
-| Hardware gap | 357 |
-| Excess over necessary work | 305 |
-| Segmented necessary (R6) | 26 |
+The first results of step 4 (1326 tok/s on 8 chips) replayed the trace 10x compressed
+(`request_rate` default 10) under the barrier-on launch constants; they are superseded.

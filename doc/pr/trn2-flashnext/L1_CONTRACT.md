@@ -19,6 +19,8 @@ Conventions:
   - `CHUNK`   = [16, 128, 256, 512, 1024, 2048, 4096, 8192]  (one prefill request chunk)
   - `QSA_PREFILL_ROWS` = [128, 512, 2048, 8192], `QSA_PRIOR` = [0, 32768]
   - `QSA_DECODE_ROWS` = [1, 8, 64, 256], `QSA_CONTEXT` = [4096, 32768, 131072]
+  - `qsa_mixer2` only: `QSA_MIXER2_SPARSE_EXCESS` = [0, 32, 2048, 6144, 30720] (prefill context past the
+    2048-token selection budget), `QSA_MIXER2_CONTEXT` = [2048, 4096, 32768, 131072]
   - `COMM_BYTES` = [16384, 262144, 1048576, 4194304, 16777216]
   - `REGIONS` = [1, 2, 4, 8, 16, 32, 64]
 - Model geometry (from `/scratch/models/Qwen3.8-Flash-Next/config.json`): H=2560; GDN 16 K heads / 48 V heads,
@@ -81,7 +83,7 @@ fits no slope and holds the boundary, i.e. behaves as Clamp (pinned by `neuron_g
 
 | kind | shape args | backends | notes |
 |---|---|---|---|
-| `qsa_mixer2` | num_rows, context_len | neuron_torch_sparse, neuron_nki | two regions (front: project..select, back: attention+o_proj), select = nki; bench `qsa_mixer2_{prefill,decode}` with `select_impl == "nki"` |
+| `qsa_mixer2` | num_rows, context_len | neuron_torch_sparse, neuron_nki | two regions (front: project..select, back: attention+o_proj), select = nki; bench `qsa_mixer2_{prefill,decode}` with `select_impl == "nki"`. Its own grid: prefill rows QSA_PREFILL_ROWS x excess QSA_MIXER2_SPARSE_EXCESS (cache axis `max(0, context_len - index_topk_tokens)`, payload `context_len = max(rows, budget + excess)`), because the mixer steps up ~15x once the context passes the budget (2048 rows: 2.4 ms at 2048, 36 ms at 4096, 42 ms at 2080) and the prior axis put that step between grid points; decode rows QSA_DECODE_ROWS x QSA_MIXER2_CONTEXT |
 | `qsa_project` | num_rows | neuron_torch | |
 | `qsa_indexer_project` | num_rows | neuron_torch | bench `indexer_project` |
 | `qsa_cache_write` | num_rows | neuron_torch | |
