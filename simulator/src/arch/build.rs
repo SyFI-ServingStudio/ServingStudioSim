@@ -1703,13 +1703,25 @@ fn neuron_flash_next_parallel(
         tp_collective: spec.tp_collective,
         moe_dispatch: spec.moe_dispatch,
         region_granularity: spec.region_granularity,
+        step_forwards: spec.step_forwards,
+        spmd_padding: spec.spmd_padding,
         region_device_factor: spec
             .region_device_factor
-            .map_or(spec.region_granularity.calibrated_device_factor(), |f| f as f32),
+            .map_or(spec.region_granularity.calibrated_device_factor(), |f| {
+                f as f32
+            }),
         launch_model: spec.launch_model,
         launch_coll_ms: spec.launch_coll_ms as f32,
         launch_plain_ms: spec.launch_plain_ms as f32,
+        region_host_ms: spec
+            .region_host_ms
+            .map_or(spec.region_granularity.region_host_ms(), |x| x as f32),
+        region_gap_ms: spec.region_gap_ms as f32,
+        forward_overhead_ms: spec.forward_overhead_ms as f32,
+        mtp_forward_overhead_ms: spec.mtp_forward_overhead_ms as f32,
         step_overhead_ms: spec.step_overhead_ms as f32,
+        moe_a2a_capacity_factor: spec.moe_a2a_capacity_factor as f32,
+        moe_a2a_pack_us_per_row: spec.moe_a2a_pack_us_per_row as f32,
         prefill_buckets: spec.prefill_buckets.clone(),
         decode_buckets: spec.decode_buckets.clone(),
         context_buckets: spec.context_buckets.clone(),

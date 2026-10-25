@@ -14,38 +14,54 @@
 //! per layer    attn HC module, GDN or QSA mixer (+ TP collective), mlp HC
 //!              module, MoE block over every DP group's tokens (+ dispatch
 //!              collectives); PLE block before layer 1's attention module
-//! epilogue     final HC combine + mixer, lm_head + greedy argmax (vocab-parallel)
-//! mtp          (speculative) the MTP layer, k passes: the first over every
-//!              target row, the rest over one row per decode request
-//! launch       one leaf: the host launch and inter-region gap of every region
-//!              the step launches (`region_launch_overhead`)
+//! epilogue     final HC combine + mixer, lm_head + greedy argmax (vocab-parallel),
+//!              the (value, index) gather in its own region
+//! mtp          (speculative) the MTP layer, k passes per side: the first over
+//!              the target rows, the rest over one row per request
+//! launch       one leaf per forward: its host and launch time beyond its leaves
 //! ```
 //!
-//! Shapes are bucketed: a prefill chunk runs at the next `prefill_buckets`
-//! size, a decode batch at the next `decode_buckets` size, a token-wise
-//! region (HC, MoE, PLE, embed) at the next size of their union, and QSA
-//! context at the next `context_buckets` size; padding costs its kernel time.
-//! A mixer runs once per prefill chunk (one request chunk per region) and once
-//! for the decode batch.
+//! Step structure (`step_forwards`, default `separate`, the engine's): a step
+//! is a decode forward (+ the MTP catch-up over the verify rows and `k - 1`
+//! draft passes) then a prefill forward (+ the MTP over the chunk and `k - 1`
+//! first-draft passes), separate compiled programs; either may be absent.
+//! `fused` runs one forward over every row instead (not in the engine).
 //!
-//! Region granularity (`region_granularity`):
+//! Shapes are bucketed and SPMD (`spmd_padding`, default on): every DP group
+//! runs the forward's padded shape, idle groups included. The decode forward
+//! runs every group at the bucket of the largest group batch x the verify
+//! width; the prefill forward at the bucket of the longest chunk, from the
+//! furthest chunk start (its context bucket is that of the longest start +
+//! T). Token-wise regions run at exactly those rows. The MoE block and PLE
+//! all-gather every group's rows over the replica and reduce-scatter them
+//! back; a group batch that does not split over its TP ranks is gathered from
+//! each of them ("dup", 8x the rows). Under `reduce_scatter_all_gather` a
+//! forward runs sequence-parallel only when its rows split over the TP group,
+//! else the all-reduce form. All-to-all dispatch sends each destination S
+//! rows (S = a rank's token slice; exact capacity, so the experts see the
+//! all-gather's rows) or `min(S, ceil(cf S top_k / ranks))` with a capacity
+//! factor, and pays the engine's packing per received row.
+//!
+//! Region granularity (`region_granularity`), cut as `program._keys`:
 //! - `per_op`: every op is its own region (op-level L1 leaves).
-//! - `mixer`: the engine's fused regions (whole GDN mixer, the two-region QSA
-//!   mixer, the fused MoE block, the fused HC combine+mix and PLE post).
-//! - `layer`: the mixer-level leaves inside one region per layer (one per
-//!   mixer call).
+//! - `mixer`: [embed], [PLE], per block [HC mix + mixer + collective +
+//!   combine], [HC mix + MoE + collectives + combine], QSA front | back.
+//! - `layer`: one region per layer, QSA layers split front | back: 63 per
+//!   target forward with the head and its gather.
+//! - `block`: cut only at QSA front | back and the head gather: 14.
 //!
-//! Composition (the engine-slice calibration, flashnext-neuron
-//! `engine/README.md` "Composition rule for the simulator"): every compute
-//! leaf is scaled by the granularity's device factor f_g (op 1.10, mixer 0.94,
-//! layer 0.88: fused regions are cheaper than their isolated ops). With
-//! `launch_model = calibrated` (default) each region costs
-//! `max(f_g * device, L_r)`, `L_r` = `launch_coll_ms` for a region holding a
-//! collective and `launch_plain_ms` otherwise, and the step adds
-//! `step_overhead_ms` (input H2D, next-id readback, collective skew). With
-//! `l1_additive` the measured `region_launch_overhead` row prices the step's
-//! region count instead. The wall constants were fitted on a loaded host and
-//! are parameters.
+//! Composition (`launch_model = pipelined`, default; flashnext-neuron
+//! `engine/README.md` with the NRT execution barrier off): every compute leaf
+//! is its L1 row times f_g (1.0). A forward costs `max(sum over regions of
+//! max(device_r, region_host_ms) + regions x region_gap_ms, regions x
+//! region_host_ms + forward_overhead_ms)`: the host dispatches each region in
+//! `region_host_ms` and does its per-forward work (`forward_overhead_ms`;
+//! `mtp_forward_overhead_ms` for an MTP pass) while the device runs; a region
+//! shorter than its dispatch waits for the next launch, and each launch costs
+//! the device `region_gap_ms` outside the regions. The step adds
+//! `step_overhead_ms`. Each forward's launch leaf holds everything beyond the
+//! sum of its leaves. `calibrated` (per region `max(device, L_r)`) and
+//! `l1_additive` (the `region_launch_overhead` row per forward) remain.
 //!
 //! What-if scaling (`kind_time_scale`): entries `kind=factor` or
 //! `kind@min_rows=factor` multiply the device time of every compute leaf of
@@ -55,7 +71,8 @@
 //! calibration; collectives and the launch leaf are never scaled.
 //!
 //! Not modeled: the host scheduler and sampling bookkeeping, KV block-table
-//! upload, the vision tower.
+//! upload, the engine's first execution of a shape after warm-up (1-3 s per
+//! run), its 16-request cap per DP group, the vision tower.
 
 use std::sync::Arc;
 
@@ -92,20 +109,56 @@ pub enum RegionGranularity {
     #[default]
     Mixer,
     Layer,
+    /// Cut only at the QSA front | back boundary: [embed .. L3 front],
+    /// [L3 back .. L7 front], ..., [L47 back .. head] and the head gather.
+    Block,
 }
 
 impl RegionGranularity {
-    pub const CHOICES: [&'static str; 3] = ["per_op", "mixer", "layer"];
+    pub const CHOICES: [&'static str; 4] = ["per_op", "mixer", "layer", "block"];
 
-    /// The engine-slice device factor f_g: step device time over the sum of
-    /// the isolated L1 rows of its ops (`logs/engine/calib_summary.md`).
+    /// f_g: step device time over the sum of the isolated L1 rows of its
+    /// ops. On the full 48-layer engine the prefill forward at layer and block
+    /// granularity is the sum of its rows within -5% (T = 512) .. +3%
+    /// (T = 2048), so 1.0 (`logs/engine/full_prefill_bench.jsonl`, serving
+    /// prefill forwards); decode is set by the region floors instead.
     pub fn calibrated_device_factor(self) -> f32 {
+        1.0
+    }
+
+    /// Host time to dispatch one region (input assembly + NRT launch) on the
+    /// 32-rank engine with the NRT execution barrier off: op granularity is
+    /// host-bound at 0.55 ms per region (`logs/engine/full_decode_bench.jsonl`);
+    /// larger regions take more inputs. The device of a region holding a
+    /// replica-wide collective is floored at it, because that collective waits
+    /// for the slowest rank's launch.
+    pub fn region_host_ms(self) -> f32 {
         match self {
-            Self::PerOp => 1.10,
-            Self::Mixer => 0.94,
-            Self::Layer => 0.88,
+            // 0.55 ms per engine op region (457 per decode step); the Sim's
+            // per_op leaves split the engine's ops further (~820 regions).
+            Self::PerOp => 0.3,
+            Self::Mixer => 1.0,
+            Self::Layer => 1.3,
+            Self::Block => 3.7,
         }
     }
+}
+
+/// How one engine step runs its decode rows and prefill chunks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepForwards {
+    /// The flashnext engine: a decode forward (+ its MTP passes), then a
+    /// prefill forward (+ its MTP passes), as separate compiled programs.
+    #[default]
+    Separate,
+    /// One fused forward over the decode rows and prefill chunks (not in the
+    /// engine; a what-if that shares the weight streaming).
+    Fused,
+}
+
+impl StepForwards {
+    pub const CHOICES: [&'static str; 2] = ["separate", "fused"];
 }
 
 /// The collective after a tensor-parallel mixer.
@@ -146,17 +199,24 @@ impl MoeDispatch {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchModel {
-    /// Per region `max(f_g * device, L_r)` plus a per-step constant (the
-    /// engine-slice fit).
+    /// The engine with the NRT execution barrier off: a forward costs
+    /// `max(sum of region device, regions x region_host_ms +
+    /// forward_overhead_ms)` (the host's dispatch and per-forward work overlap
+    /// the device), where a region holding a collective across DP groups has
+    /// device time of at least `region_host_ms`; the step adds
+    /// `step_overhead_ms`.
     #[default]
+    Pipelined,
+    /// Per region `max(f_g * device, L_r)` plus a per-step constant (the
+    /// barrier-on engine-slice fit).
     Calibrated,
-    /// The measured `region_launch_overhead` row at the step's region count,
-    /// added to the device time.
+    /// The measured `region_launch_overhead` row at each forward's region
+    /// count, added to the device time.
     L1Additive,
 }
 
 impl LaunchModel {
-    pub const CHOICES: [&'static str; 2] = ["calibrated", "l1_additive"];
+    pub const CHOICES: [&'static str; 3] = ["pipelined", "calibrated", "l1_additive"];
 }
 
 /// Where the PLE n-gram table lives.
@@ -279,12 +339,34 @@ pub struct NeuronFlashNextParallel {
     pub tp_collective: TpCollective,
     pub moe_dispatch: MoeDispatch,
     pub region_granularity: RegionGranularity,
+    /// Separate decode and prefill forwards (the engine) or one fused forward.
+    pub step_forwards: StepForwards,
+    /// Every DP group runs the forward's padded shape (SPMD), idle or not.
+    pub spmd_padding: bool,
     /// Device factor applied to every compute leaf (f_g).
     pub region_device_factor: f32,
     pub launch_model: LaunchModel,
     pub launch_coll_ms: f32,
     pub launch_plain_ms: f32,
+    /// Pipelined launch: host dispatch per region and the device floor of a
+    /// region holding a replica-wide collective (ms).
+    pub region_host_ms: f32,
+    /// Pipelined launch: device time per region launch outside the regions'
+    /// own executions (NEFF switch, launch skew, helper copies; ms).
+    pub region_gap_ms: f32,
+    /// Pipelined launch: host work per target forward (input assembly, H2D,
+    /// id readback, helper executions), overlapping the device, and the same
+    /// per MTP forward (ms).
+    pub forward_overhead_ms: f32,
+    pub mtp_forward_overhead_ms: f32,
     pub step_overhead_ms: f32,
+    /// All-to-all dispatch: rows each rank sends each destination are
+    /// `min(S, ceil(cf * S * top_k / ranks))`; 0 = exact (S, no drops).
+    pub moe_a2a_capacity_factor: f32,
+    /// All-to-all: the engine's slot packing (dispatch) and scatter-add
+    /// (combine) per received row, on each of the two all-to-all leaves (µs).
+    /// Fitted, not an L1 row.
+    pub moe_a2a_pack_us_per_row: f32,
     pub prefill_buckets: Vec<u32>,
     pub decode_buckets: Vec<u32>,
     pub context_buckets: Vec<u32>,
@@ -378,8 +460,20 @@ impl NeuronFlashNextParallel {
             self.region_device_factor > 0.0
                 && self.launch_coll_ms >= 0.0
                 && self.launch_plain_ms >= 0.0
+                && self.region_host_ms >= 0.0
+                && self.region_gap_ms >= 0.0
+                && self.forward_overhead_ms >= 0.0
+                && self.mtp_forward_overhead_ms >= 0.0
                 && self.step_overhead_ms >= 0.0,
             "region_device_factor must be positive and the launch constants nonnegative"
+        );
+        ensure!(
+            self.moe_a2a_capacity_factor >= 0.0 && self.moe_a2a_capacity_factor.is_finite(),
+            "moe_a2a_capacity_factor must be >= 0 (0 = exact capacity)"
+        );
+        ensure!(
+            self.moe_a2a_pack_us_per_row >= 0.0,
+            "moe_a2a_pack_us_per_row must be nonnegative"
         );
         Ok(())
     }
@@ -467,9 +561,8 @@ where
 
 // ── the step, seen per DP group ──────────────────────────────────────────────
 
-/// One attention-DP group's share of a step, in one view (target pass, MTP
-/// first pass, or an MTP recurrent pass).
-#[derive(Clone, Debug, Default)]
+/// One attention-DP group's share of one pass of a forward.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct GroupStep {
     /// Decode requests and the rows each presents (1, or k + 1 when verifying).
     decode_reqs: u32,
@@ -493,26 +586,53 @@ impl GroupStep {
     fn sample_rows(&self) -> u32 {
         self.decode_rows() + self.chunks.len() as u32
     }
+    fn is_empty(&self) -> bool {
+        self.decode_reqs == 0 && self.chunks.is_empty()
+    }
 }
 
+/// The pass a leaf belongs to. `Fused*` are the one-forward step; the rest
+/// are the engine's decode forward and prefill forward and their MTP passes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
-    Target,
-    MtpFirst,
+    /// The fused forward's target pass: decode rows and prefill chunks.
+    Fused,
+    /// MTP pass 0 over every target row of the fused forward.
+    MtpFused,
+    /// The decode forward's target pass (the verify rows under MTP).
+    Decode,
+    /// MTP catch-up over the decode forward's verify rows.
+    MtpDecode,
+    /// An MTP draft pass: one row per decode request.
     MtpRecurrent,
+    /// The prefill forward's target pass.
+    Prefill,
+    /// MTP over the prefill chunks.
+    MtpPrefill,
+    /// A first-draft pass after a prompt's last chunk: one row per group.
+    MtpPrefillDraft,
 }
 
+const N_VIEWS: usize = 8;
+
+impl View {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The group shapes of every pass of one step.
 struct StepViews {
-    target: Vec<GroupStep>,
-    recurrent: Vec<GroupStep>,
+    groups: [Vec<GroupStep>; N_VIEWS],
+    /// Shapes are already padded to their buckets (the separate forwards):
+    /// token-wise regions run at exactly the group's rows. Otherwise (fused)
+    /// token-wise regions pad to the union of the token buckets.
+    exact: bool,
 }
 
 impl StepViews {
     fn get(&self, view: View) -> &[GroupStep] {
-        match view {
-            View::Target | View::MtpFirst => &self.target,
-            View::MtpRecurrent => &self.recurrent,
-        }
+        &self.groups[view.index()]
     }
 }
 
@@ -521,24 +641,49 @@ impl StepViews {
 /// Which rows a token-wise leaf or a collective sees.
 #[derive(Clone, Copy, Debug)]
 enum RowSrc {
-    /// The group's tokens, padded to the token buckets.
+    /// The group's tokens.
     Group(usize),
-    /// Every group's padded tokens.
+    /// Every group's tokens (a replicated, dp = 1 MoE block sees its group's).
     All,
-    /// The largest group's padded tokens.
+    /// The rows a replica-wide all-gather delivers to each rank: every group's
+    /// tokens, each group's whole batch per rank when its rows do not split
+    /// over its TP ranks (flashnext `world_gather_rows`, "dup").
+    WorldGather,
+    /// The largest group's tokens.
     MaxGroup,
-    /// The group's lm_head rows, padded to the token buckets.
+    /// The group's lm_head rows.
     Sample(usize),
-    /// Every group's padded tokens over `moe_ep`: the routed rows one expert
-    /// rank receives under all-to-all dispatch, as an equivalent token count
-    /// (each with `top_k` assignments).
-    MoeEquivalent,
+    /// All-to-all: the token slice a rank routes (S), or under the
+    /// all-gather fallback every rank's rows.
+    A2aRouter,
+    /// All-to-all: the rows a rank's experts receive (ranks x capacity).
+    A2aRecv,
+    /// All-to-all: the rows the local shared expert runs (S, or the group's
+    /// rows under the fallback).
+    A2aShared,
+}
+
+/// When a leaf runs under `reduce_scatter_all_gather`: the engine applies
+/// sequence parallelism only to a forward whose rows split over the TP group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpCond {
+    Always,
+    /// Only with sequence parallelism active.
+    Sp,
+    /// Only without it (the all-reduce form).
+    NoSp,
 }
 
 #[derive(Clone)]
 enum LeafEval {
-    /// A token-wise op at `rows / div` rows.
-    Tokens { k: Rows, src: RowSrc, div: u32 },
+    /// A token-wise op at `rows / div` rows; `sp` divides by the group size
+    /// when sequence parallelism is active.
+    Tokens {
+        k: Rows,
+        src: RowSrc,
+        div: u32,
+        sp: bool,
+    },
     /// The decode batch at `ceil(B / sub)` requests (`rows`: times query_len).
     Decode {
         k: Rows,
@@ -565,22 +710,28 @@ enum LeafEval {
         bytes_per_row: u64,
         div: u32,
     },
-    /// The step's region launches.
-    Launch { k: Rows },
+    /// The launch and host cost of forward `forward`, or (None) the
+    /// per-step host constant.
+    Launch { k: Rows, forward: Option<usize> },
 }
 
 #[derive(Clone)]
 struct LeafPlan {
     eval: LeafEval,
     view: View,
-    /// Compiled regions per call this leaf stands for.
-    regions_per_call: u32,
-    /// Product of the enclosing `Scale` folds (for the region count).
+    /// The forward this leaf runs in.
+    forward: usize,
+    /// The compiled region (one per forward-local cut) this leaf runs in.
+    region: usize,
+    /// The DP group whose per-group part minted this leaf (None: the MoE
+    /// block and the launch leaves, outside the per-group Max).
+    group: Option<usize>,
+    /// Product of the enclosing `Scale` folds (region instances).
     fold: u32,
-    /// A compute leaf: scaled by f_g and, per region, floored by its launch.
+    /// A compute leaf: scaled by f_g.
     compute: bool,
-    /// The leaf's region traces a collective (launch `launch_coll_ms`).
-    coll: bool,
+    /// Runs only with / without sequence parallelism.
+    sp_cond: SpCond,
     /// What-if `(min_rows, factor)` scales of this leaf's kind.
     scales: Vec<(u32, f32)>,
 }
@@ -596,23 +747,16 @@ impl LeafPlan {
     }
 }
 
-impl LeafEval {
-    fn group(&self) -> Option<usize> {
-        match self {
-            LeafEval::Tokens { src, .. } | LeafEval::Comm { src, .. } => match src {
-                RowSrc::Group(d) | RowSrc::Sample(d) => Some(*d),
-                _ => None,
-            },
-            LeafEval::Decode { d, .. }
-            | LeafEval::Chunks { d, .. }
-            | LeafEval::QsaDecode { d, .. }
-            | LeafEval::QsaChunks { d, .. }
-            | LeafEval::Ngram { d, .. }
-            | LeafEval::ConvDecode { d, .. }
-            | LeafEval::ConvChunks { d, .. } => Some(*d),
-            LeafEval::Launch { .. } => None,
-        }
-    }
+/// One forward of the step: its passes' views and its regions.
+#[derive(Clone, Debug)]
+struct ForwardPlan {
+    /// The pass whose shapes decide whether the forward runs.
+    view: View,
+    mtp: bool,
+    /// Region launches of one instance of the forward.
+    regions: u32,
+    /// Instances of the forward per step (its Scale fold).
+    fold: u32,
 }
 
 // ── kernels ──────────────────────────────────────────────────────────────────
@@ -669,7 +813,6 @@ struct Kernels {
     embed: Rows,
     hc_mix: Rows,
     hc_combine: Rows,
-    hc_combine_mix: Option<Rows>,
     hc_mix_final: Rows,
     // GDN, fused.
     gdn_prefill_mixer: Option<Rows>,
@@ -886,23 +1029,6 @@ impl Kernels {
             |num_tokens| MhcRmsNormKernelInput { num_tokens },
             bridge,
         )?;
-        let hc_combine_mix = if per_op {
-            None
-        } else {
-            Some(shaped::<HcCombineMixSpec, u32>(
-                &n("hc_combine_mix"),
-                HcCombineMixKernelConfig {
-                    backends: hb.clone(),
-                    gpu_name: hg.clone(),
-                    hidden_size: hh,
-                    hc_mult: hm,
-                    lowrank: hr,
-                    dtype: bf16(),
-                },
-                |num_tokens| HcCombineMixKernelInput { num_tokens },
-                bridge,
-            )?)
-        };
         let hc_mix_final = shaped::<HcMixFinalSpec, u32>(
             &n("hc_mix_final"),
             HcMixFinalKernelConfig {
@@ -1378,7 +1504,6 @@ impl Kernels {
             embed,
             hc_mix,
             hc_combine,
-            hc_combine_mix,
             hc_mix_final,
             gdn_prefill_mixer,
             gdn_decode_mixer,
@@ -1589,25 +1714,45 @@ impl QsaCommon {
 
 // ── tree construction ────────────────────────────────────────────────────────
 
-/// What a leaf counts toward the step's region launches.
+/// A point where the engine's granularity may start a new compiled region
+/// (flashnext `program._keys`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RegionRole {
-    /// A mixer call: `regions` per call at every granularity but `layer`,
-    /// where the layer's single region is charged here, once per call.
-    Mixer(u32),
-    /// A token-wise op inside a layer: one region per call, folded into the
-    /// layer's region (no launch) at `layer` granularity.
-    InLayer(u32),
-    /// Outside the layers (embed, head): its own region at every granularity.
-    Standalone(u32),
-    /// Fused into a neighbouring region, or a collective traced into one.
-    None,
+enum Cut {
+    /// The embedding.
+    Embed,
+    /// A decoder layer (its first leaf: the previous mlp module's combine).
+    Layer,
+    /// The PLE block before layer 1's attention module.
+    Ple,
+    /// An attention module: HC mix + mixer (+ TP collective + combine).
+    Attn,
+    /// A QSA layer's back region: attention + o_proj onward.
+    QsaBack,
+    /// An mlp module: HC mix + MoE (+ collectives + combine).
+    Mlp,
+    /// The final HC mixer and lm_head.
+    Head,
+    /// The head's gather + argmax combine (its own region in the engine).
+    HeadGather,
+}
+
+/// Which pass a view's leaves run: its target phase rows.
+fn has_decode(view: View) -> bool {
+    !matches!(view, View::Prefill | View::MtpPrefill)
+}
+
+fn has_prefill(view: View) -> bool {
+    matches!(
+        view,
+        View::Fused | View::MtpFused | View::Prefill | View::MtpPrefill
+    )
 }
 
 struct PlanBuilder<'a> {
     name: String,
     b: CostTreeBuilder,
     leaves: Vec<LeafPlan>,
+    forwards: Vec<ForwardPlan>,
     k: &'a mut Kernels,
     p: &'a NeuronFlashNextParallel,
     model: &'a Qwen4ExpModelCfg,
@@ -1618,6 +1763,17 @@ struct PlanBuilder<'a> {
     /// The location prefix of the leaves being minted (`gdn_first`, `qsa`,
     /// `mtp.final_mixer`, ...); empty at the root.
     scope: String,
+    /// The forward being built, its own fold and whether it is an MTP pass.
+    forward: usize,
+    forward_fold: u32,
+    in_mtp: bool,
+    /// The region the next leaf joins, and whether a cut is pending.
+    region: usize,
+    pending_cut: bool,
+    /// Stamped on minted leaves.
+    sp_cond: SpCond,
+    /// The DP group being minted inside `per_group`.
+    group: Option<usize>,
 }
 
 fn join(base: &str, leaf: &str) -> String {
@@ -1638,12 +1794,44 @@ impl PlanBuilder<'_> {
         out
     }
 
-    fn leaf(&mut self, label: &str, eval: LeafEval, role: RegionRole) -> CostNode {
+    /// Run `f` with leaves stamped `cond`.
+    fn when<T>(&mut self, cond: SpCond, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = self.sp_cond;
+        self.sp_cond = cond;
+        let out = f(self);
+        self.sp_cond = saved;
+        out
+    }
+
+    /// Request a region boundary if the granularity cuts at `cut`.
+    fn cut(&mut self, cut: Cut) {
+        let cuts = match self.p.region_granularity {
+            RegionGranularity::PerOp => false, // every leaf is a region
+            RegionGranularity::Mixer => cut != Cut::Layer,
+            RegionGranularity::Layer => matches!(
+                cut,
+                Cut::Embed | Cut::Layer | Cut::QsaBack | Cut::Head | Cut::HeadGather
+            ),
+            RegionGranularity::Block => {
+                cut == Cut::QsaBack || (cut == Cut::HeadGather && !self.in_mtp)
+            }
+        };
+        self.pending_cut |= cuts;
+    }
+
+    fn new_region(&mut self) {
+        self.region += 1;
+        self.pending_cut = false;
+        let instances = self.fold / self.forward_fold.max(1);
+        self.forwards[self.forward].regions += instances;
+    }
+
+    fn leaf(&mut self, label: &str, eval: LeafEval) -> CostNode {
         let (kind, config) = match &eval {
             LeafEval::Tokens { k, .. }
             | LeafEval::Decode { k, .. }
             | LeafEval::Chunks { k, .. }
-            | LeafEval::Launch { k } => (k.kind(), k.config()),
+            | LeafEval::Launch { k, .. } => (k.kind(), k.config()),
             LeafEval::QsaDecode { k, .. }
             | LeafEval::QsaChunks { k, .. }
             | LeafEval::Ngram { k, .. }
@@ -1651,25 +1839,10 @@ impl PlanBuilder<'_> {
             | LeafEval::ConvChunks { k, .. } => (k.kind(), k.config()),
             LeafEval::Comm { k, .. } => (k.kind(), k.config()),
         };
-        let layer = self.p.region_granularity == RegionGranularity::Layer;
-        let regions_per_call = match role {
-            RegionRole::Mixer(n) => {
-                if layer {
-                    1
-                } else {
-                    n
-                }
-            }
-            RegionRole::InLayer(n) => {
-                if layer {
-                    0
-                } else {
-                    n
-                }
-            }
-            RegionRole::Standalone(n) => n,
-            RegionRole::None => 0,
-        };
+        let launch = matches!(eval, LeafEval::Launch { .. });
+        if !launch && (self.pending_cut || self.p.region_granularity == RegionGranularity::PerOp) {
+            self.new_region();
+        }
         let compute = !matches!(eval, LeafEval::Comm { .. } | LeafEval::Launch { .. });
         let scales = if compute {
             self.p
@@ -1684,10 +1857,12 @@ impl PlanBuilder<'_> {
         self.leaves.push(LeafPlan {
             eval,
             view: self.view,
-            regions_per_call,
+            forward: self.forward,
+            region: self.region,
+            group: self.group,
             fold: self.fold,
             compute,
-            coll: false,
+            sp_cond: self.sp_cond,
             scales,
         });
         self.b.leaf(
@@ -1697,6 +1872,7 @@ impl PlanBuilder<'_> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn comm_leaf(
         &mut self,
         label: &str,
@@ -1722,88 +1898,35 @@ impl PlanBuilder<'_> {
                 bytes_per_row,
                 div,
             },
-            RegionRole::None,
         )))
-    }
-
-    /// Mark the compute regions minted since `start` as tracing a collective.
-    fn mark_coll(&mut self, start: usize, coll: bool) {
-        for l in &mut self.leaves[start..] {
-            if l.compute && l.regions_per_call > 0 {
-                l.coll |= coll;
-            }
-        }
     }
 
     fn g(&self) -> u32 {
         self.p.group_size()
     }
 
-    fn hc_div(&self) -> u32 {
-        if self.p.sequence_parallel() {
-            self.g()
-        } else {
-            1
-        }
-    }
-
     fn h2(&self) -> u64 {
         u64::from(self.model.hidden) * BF16_BYTES
     }
 
-    /// The combine of the previous block fused with this block's mix (`mixer`
-    /// granularity), or both as separate regions (`per_op`).
-    fn combine_mix(&mut self, d: usize, label: &str, out: &mut Vec<CostNode>) {
-        let div = self.hc_div();
-        let src = RowSrc::Group(d);
-        if let Some(k) = self.k.hc_combine_mix.clone() {
-            out.push(self.leaf(
-                label,
-                LeafEval::Tokens { k, src, div },
-                RegionRole::InLayer(1),
-            ));
-        } else {
-            let k = self.k.hc_combine.clone();
-            out.push(self.leaf(
-                &format!("{label}.combine"),
-                LeafEval::Tokens { k, src, div },
-                RegionRole::InLayer(1),
-            ));
-            let k = self.k.hc_mix.clone();
-            out.push(self.leaf(
-                &format!("{label}.mix"),
-                LeafEval::Tokens { k, src, div },
-                RegionRole::InLayer(1),
-            ));
-        }
+    fn tokens(&mut self, label: &str, k: Rows, src: RowSrc, div: u32, sp: bool) -> CostNode {
+        self.leaf(label, LeafEval::Tokens { k, src, div, sp })
     }
 
-    fn tokens(
-        &mut self,
-        label: &str,
-        k: Rows,
-        src: RowSrc,
-        div: u32,
-        role: RegionRole,
-    ) -> CostNode {
-        self.leaf(label, LeafEval::Tokens { k, src, div }, role)
+    /// The previous module's HC combine, a cut, then this module's HC mix
+    /// (the engine's stage list: `*_combine`, then `*_mix`).
+    fn combine_mix(&mut self, d: usize, label: &str, cut: Cut, out: &mut Vec<CostNode>) {
+        let src = RowSrc::Group(d);
+        let k = self.k.hc_combine.clone();
+        out.push(self.tokens(&format!("{label}.combine"), k, src, 1, true));
+        self.cut(cut);
+        let k = self.k.hc_mix.clone();
+        out.push(self.tokens(&format!("{label}.mix"), k, src, 1, true));
     }
 
     /// A mixer's compute leaves for group `d`, its TP collectives around it.
+    #[allow(clippy::too_many_lines)]
     fn mixer(&mut self, d: usize, mixer: Qwen4ExpMixer, out: &mut Vec<CostNode>) -> Result<()> {
-        let start = self.leaves.len();
-        self.mixer_leaves(d, mixer, out)?;
-        let coll = self.g() > 1;
-        self.mark_coll(start, coll);
-        Ok(())
-    }
-
-    fn mixer_leaves(
-        &mut self,
-        d: usize,
-        mixer: Qwen4ExpMixer,
-        out: &mut Vec<CostNode>,
-    ) -> Result<()> {
         let g = self.g();
         let m = match mixer {
             Qwen4ExpMixer::Gdn => self.p.gdn_tp,
@@ -1817,18 +1940,22 @@ impl PlanBuilder<'_> {
             Qwen4ExpMixer::Qsa => "qsa",
         };
         let src = RowSrc::Group(d);
+        let (dec_v, pre_v) = (has_decode(self.view), has_prefill(self.view));
         if sp {
-            if let Some(n) = self.comm_leaf(
-                &format!("{tag}.all_gather"),
-                CommOp::AllGather,
-                m,
-                1,
-                src,
-                h2,
-                g,
-            )? {
-                out.push(n);
-            }
+            self.when(SpCond::Sp, |s| -> Result<()> {
+                if let Some(n) = s.comm_leaf(
+                    &format!("{tag}.all_gather"),
+                    CommOp::AllGather,
+                    m,
+                    1,
+                    src,
+                    h2,
+                    g,
+                )? {
+                    out.push(n);
+                }
+                Ok(())
+            })?;
         }
         match mixer {
             Qwen4ExpMixer::Gdn => {
@@ -1836,22 +1963,21 @@ impl PlanBuilder<'_> {
                     self.k.gdn_decode_mixer.clone(),
                     self.k.gdn_prefill_mixer.clone(),
                 ) {
-                    out.push(self.leaf(
-                        "gdn.decode_mixer",
-                        LeafEval::Decode {
-                            k: dec,
-                            d,
-                            sub,
-                            rows: false,
-                        },
-                        RegionRole::Mixer(1),
-                    ));
-                    if self.view != View::MtpRecurrent {
+                    if dec_v {
                         out.push(self.leaf(
-                            "gdn.prefill_mixer",
-                            LeafEval::Chunks { k: pre, d, sub },
-                            RegionRole::Mixer(1),
+                            "gdn.decode_mixer",
+                            LeafEval::Decode {
+                                k: dec,
+                                d,
+                                sub,
+                                rows: false,
+                            },
                         ));
+                    }
+                    if pre_v {
+                        out.push(
+                            self.leaf("gdn.prefill_mixer", LeafEval::Chunks { k: pre, d, sub }),
+                        );
                     }
                 } else {
                     let ops = self.k.gdn_ops.as_ref().expect("per-op GDN kernels built");
@@ -1867,42 +1993,30 @@ impl PlanBuilder<'_> {
                         ops.split_gating.clone(),
                         ops.prefill_core.clone(),
                     );
-                    let dec = |k: Rows, rows: bool| LeafEval::Decode { k, d, sub, rows };
-                    out.push(self.leaf(
-                        "gdn.decode.in_proj",
-                        dec(in_proj.clone(), true),
-                        RegionRole::Mixer(1),
-                    ));
-                    out.push(self.leaf(
-                        "gdn.decode.conv1d",
-                        dec(conv_d, false),
-                        RegionRole::InLayer(1),
-                    ));
-                    out.push(self.leaf(
-                        "gdn.decode.core",
-                        dec(core_d, false),
-                        RegionRole::InLayer(1),
-                    ));
-                    out.push(self.leaf(
-                        "gdn.decode.output",
-                        dec(output.clone(), true),
-                        RegionRole::InLayer(1),
-                    ));
-                    out.push(self.leaf(
-                        "gdn.decode.state_io",
-                        dec(state_io, false),
-                        RegionRole::InLayer(1),
-                    ));
-                    let ch = |k: Rows| LeafEval::Chunks { k, d, sub };
-                    out.push(self.leaf("gdn.prefill.in_proj", ch(in_proj), RegionRole::Mixer(1)));
-                    out.push(self.leaf("gdn.prefill.conv1d", ch(conv_p), RegionRole::InLayer(1)));
-                    out.push(self.leaf(
-                        "gdn.prefill.split_gating",
-                        ch(split),
-                        RegionRole::InLayer(1),
-                    ));
-                    out.push(self.leaf("gdn.prefill.core", ch(core_p), RegionRole::InLayer(1)));
-                    out.push(self.leaf("gdn.prefill.output", ch(output), RegionRole::InLayer(1)));
+                    if dec_v {
+                        let dec = |k: Rows, rows: bool| LeafEval::Decode { k, d, sub, rows };
+                        for (op, k, rows) in [
+                            ("in_proj", in_proj.clone(), true),
+                            ("conv1d", conv_d, false),
+                            ("core", core_d, false),
+                            ("output", output.clone(), true),
+                            ("state_io", state_io, false),
+                        ] {
+                            out.push(self.leaf(&format!("gdn.decode.{op}"), dec(k, rows)));
+                        }
+                    }
+                    if pre_v {
+                        let ch = |k: Rows| LeafEval::Chunks { k, d, sub };
+                        for (op, k) in [
+                            ("in_proj", in_proj),
+                            ("conv1d", conv_p),
+                            ("split_gating", split),
+                            ("core", core_p),
+                            ("output", output),
+                        ] {
+                            out.push(self.leaf(&format!("gdn.prefill.{op}"), ch(k)));
+                        }
+                    }
                 }
             }
             Qwen4ExpMixer::Qsa => {
@@ -1910,43 +2024,42 @@ impl PlanBuilder<'_> {
                     self.k.qsa_mixer2_decode.clone(),
                     self.k.qsa_mixer2_prefill.clone(),
                 ) {
-                    out.push(self.leaf(
-                        "qsa.decode_mixer2",
-                        LeafEval::QsaDecode { k: dec, d, sub },
-                        RegionRole::Mixer(2),
-                    ));
-                    if self.view != View::MtpRecurrent {
-                        out.push(self.leaf(
-                            "qsa.prefill_mixer2",
-                            LeafEval::QsaChunks { k: pre, d, sub },
-                            RegionRole::Mixer(2),
-                        ));
+                    // The two-region mixer: its leaf stands for front + back,
+                    // charged to the front region.
+                    if dec_v {
+                        out.push(
+                            self.leaf("qsa.decode_mixer2", LeafEval::QsaDecode { k: dec, d, sub }),
+                        );
                     }
+                    if pre_v {
+                        out.push(
+                            self.leaf("qsa.prefill_mixer2", LeafEval::QsaChunks { k: pre, d, sub }),
+                        );
+                    }
+                    self.cut(Cut::QsaBack);
                 } else {
                     let modes = [
-                        ("decode", self.k.qsa_ops_decode.clone()),
-                        ("prefill", self.k.qsa_ops_prefill.clone()),
+                        ("decode", self.k.qsa_ops_decode.clone(), dec_v),
+                        ("prefill", self.k.qsa_ops_prefill.clone(), pre_v),
                     ];
-                    for (mode, ops) in modes {
-                        if mode == "prefill" && self.view == View::MtpRecurrent {
+                    for (mode, ops, run) in modes {
+                        if !run {
                             continue;
                         }
                         let ops = ops.expect("per-op QSA kernels built");
-                        let rows: [(&str, Rows); 5] = [
+                        let rows: [(&str, Rows); 4] = [
                             ("project", ops.project.clone()),
                             ("indexer_project", ops.indexer_project.clone()),
                             ("cache_write", ops.cache_write.clone()),
                             ("indexer_compress", ops.indexer_compress.clone()),
-                            ("output", ops.output.clone()),
                         ];
                         let ctx: [(&str, Pair); 3] = [
                             ("indexer_scores", ops.indexer_scores.clone()),
                             ("indexer_select", ops.indexer_select.clone()),
                             ("attention", ops.attention.clone()),
                         ];
-                        let mut first = true;
-                        for (op, k) in rows.into_iter().take(4) {
-                            let eval = if mode == "decode" {
+                        let row_eval = |k: Rows| {
+                            if mode == "decode" {
                                 LeafEval::Decode {
                                     k,
                                     d,
@@ -1955,174 +2068,146 @@ impl PlanBuilder<'_> {
                                 }
                             } else {
                                 LeafEval::Chunks { k, d, sub }
-                            };
-                            let role = if first {
-                                RegionRole::Mixer(1)
-                            } else {
-                                RegionRole::InLayer(1)
-                            };
-                            first = false;
-                            out.push(self.leaf(&format!("qsa.{mode}.{op}"), eval, role));
+                            }
+                        };
+                        for (op, k) in rows {
+                            out.push(self.leaf(&format!("qsa.{mode}.{op}"), row_eval(k)));
                         }
                         for (op, k) in ctx {
+                            if op == "attention" {
+                                self.cut(Cut::QsaBack);
+                            }
                             let eval = if mode == "decode" {
                                 LeafEval::QsaDecode { k, d, sub }
                             } else {
                                 LeafEval::QsaChunks { k, d, sub }
                             };
-                            out.push(self.leaf(
-                                &format!("qsa.{mode}.{op}"),
-                                eval,
-                                RegionRole::InLayer(1),
-                            ));
+                            out.push(self.leaf(&format!("qsa.{mode}.{op}"), eval));
                         }
                         let k = ops.output.clone();
-                        let eval = if mode == "decode" {
-                            LeafEval::Decode {
-                                k,
-                                d,
-                                sub,
-                                rows: true,
-                            }
-                        } else {
-                            LeafEval::Chunks { k, d, sub }
-                        };
-                        out.push(self.leaf(
-                            &format!("qsa.{mode}.output"),
-                            eval,
-                            RegionRole::InLayer(1),
-                        ));
+                        out.push(self.leaf(&format!("qsa.{mode}.output"), row_eval(k)));
                     }
                 }
             }
         }
         // The row-parallel output: per sub-replica partial sums.
         if sp {
-            if let Some(n) = self.comm_leaf(
-                &format!("{tag}.reduce_scatter"),
-                CommOp::ReduceScatter,
-                m,
-                1,
-                src,
-                h2,
-                sub,
-            )? {
-                out.push(n);
-            }
-        } else {
-            if let Some(n) = self.comm_leaf(
-                &format!("{tag}.all_reduce"),
-                CommOp::AllReduce,
-                m,
-                1,
-                src,
-                h2,
-                sub,
-            )? {
-                out.push(n);
-            }
-            // Sub-replicas exchange their tokens so every rank of the group
-            // holds the group's residual stream.
-            if let Some(n) = self.comm_leaf(
-                &format!("{tag}.sub_all_gather"),
-                CommOp::AllGather,
-                sub,
-                m,
-                src,
-                h2,
-                sub,
-            )? {
-                out.push(n);
-            }
+            self.when(SpCond::Sp, |s| -> Result<()> {
+                if let Some(n) = s.comm_leaf(
+                    &format!("{tag}.reduce_scatter"),
+                    CommOp::ReduceScatter,
+                    m,
+                    1,
+                    src,
+                    h2,
+                    sub,
+                )? {
+                    out.push(n);
+                }
+                Ok(())
+            })?;
         }
-        Ok(())
+        self.when(
+            if sp { SpCond::NoSp } else { SpCond::Always },
+            |s| -> Result<()> {
+                if let Some(n) = s.comm_leaf(
+                    &format!("{tag}.all_reduce"),
+                    CommOp::AllReduce,
+                    m,
+                    1,
+                    src,
+                    h2,
+                    sub,
+                )? {
+                    out.push(n);
+                }
+                // Sub-replicas exchange their tokens so every rank of the group
+                // holds the group's residual stream.
+                if let Some(n) = s.comm_leaf(
+                    &format!("{tag}.sub_all_gather"),
+                    CommOp::AllGather,
+                    sub,
+                    m,
+                    src,
+                    h2,
+                    sub,
+                )? {
+                    out.push(n);
+                }
+                Ok(())
+            },
+        )
     }
 
     /// The MoE block over every group's tokens, with its dispatch collectives.
+    #[allow(clippy::too_many_lines)]
     fn moe(&mut self, out: &mut Vec<CostNode>) -> Result<()> {
-        let start = self.leaves.len();
-        self.moe_leaves(out)?;
-        let coll = self.p.ranks() > 1;
-        self.mark_coll(start, coll);
-        Ok(())
-    }
-
-    fn moe_leaves(&mut self, out: &mut Vec<CostNode>) -> Result<()> {
         let r = self.p.ranks();
         let g = self.g();
         let h2 = self.h2();
         let sp = self.p.sequence_parallel();
         let dp = self.p.attn_dp;
+        let no_sp = if sp { SpCond::NoSp } else { SpCond::Always };
         match self.p.moe_dispatch {
             MoeDispatch::AllGather => {
-                let replicated = dp == 1 && !sp;
-                if !replicated {
-                    if let Some(n) = self.comm_leaf(
-                        "moe.all_gather",
-                        CommOp::AllGather,
-                        r,
-                        1,
-                        RowSrc::All,
-                        h2,
-                        r,
-                    )? {
-                        out.push(n);
-                    }
+                let rows = if dp == 1 {
+                    RowSrc::All
+                } else {
+                    RowSrc::WorldGather
+                };
+                // dp = 1 without sequence parallelism: replicated tokens, the
+                // partials all-reduce. Otherwise all-gather the (sliced) rows.
+                if dp > 1 || sp {
+                    let cond = if dp > 1 { SpCond::Always } else { SpCond::Sp };
+                    self.when(cond, |s| -> Result<()> {
+                        if let Some(n) =
+                            s.comm_leaf("moe.all_gather", CommOp::AllGather, r, 1, rows, h2, r)?
+                        {
+                            out.push(n);
+                        }
+                        Ok(())
+                    })?;
                 }
                 if let Some(k) = self.k.moe_block.clone() {
-                    out.push(self.tokens("moe.block", k, RowSrc::All, 1, RegionRole::InLayer(1)));
+                    out.push(self.tokens("moe.block", k, rows, 1, false));
                 } else {
                     let router = self.k.moe_router.clone().expect("router");
                     let routed = self.k.moe_routed.clone().expect("routed");
                     let shared = self.k.moe_shared.clone().expect("shared");
-                    out.push(self.tokens(
-                        "moe.router",
-                        router,
-                        RowSrc::All,
-                        1,
-                        RegionRole::InLayer(1),
-                    ));
-                    out.push(self.tokens(
-                        "moe.routed_experts",
-                        routed,
-                        RowSrc::All,
-                        1,
-                        RegionRole::InLayer(1),
-                    ));
-                    out.push(self.tokens(
-                        "moe.shared_expert",
-                        shared,
-                        RowSrc::All,
-                        1,
-                        RegionRole::InLayer(1),
-                    ));
+                    out.push(self.tokens("moe.router", router, rows, 1, false));
+                    out.push(self.tokens("moe.routed_experts", routed, rows, 1, false));
+                    out.push(self.tokens("moe.shared_expert", shared, rows, 1, false));
                 }
-                if replicated {
-                    if let Some(n) = self.comm_leaf(
-                        "moe.all_reduce",
-                        CommOp::AllReduce,
-                        r,
-                        1,
-                        RowSrc::All,
-                        h2,
-                        1,
-                    )? {
-                        out.push(n);
-                    }
-                } else {
-                    if let Some(n) = self.comm_leaf(
-                        "moe.reduce_scatter",
-                        CommOp::ReduceScatter,
-                        r,
-                        1,
-                        RowSrc::All,
-                        h2,
-                        1,
-                    )? {
-                        out.push(n);
-                    }
-                    if !sp {
-                        if let Some(n) = self.comm_leaf(
+                if dp == 1 {
+                    self.when(no_sp, |s| -> Result<()> {
+                        if let Some(n) =
+                            s.comm_leaf("moe.all_reduce", CommOp::AllReduce, r, 1, rows, h2, 1)?
+                        {
+                            out.push(n);
+                        }
+                        Ok(())
+                    })?;
+                }
+                if dp > 1 || sp {
+                    let cond = if dp > 1 { SpCond::Always } else { SpCond::Sp };
+                    self.when(cond, |s| -> Result<()> {
+                        if let Some(n) = s.comm_leaf(
+                            "moe.reduce_scatter",
+                            CommOp::ReduceScatter,
+                            r,
+                            1,
+                            rows,
+                            h2,
+                            1,
+                        )? {
+                            out.push(n);
+                        }
+                        Ok(())
+                    })?;
+                }
+                if dp > 1 {
+                    self.when(no_sp, |s| -> Result<()> {
+                        if let Some(n) = s.comm_leaf(
                             "moe.group_all_gather",
                             CommOp::AllGather,
                             g,
@@ -2133,59 +2218,47 @@ impl PlanBuilder<'_> {
                         )? {
                             out.push(n);
                         }
-                    }
+                        Ok(())
+                    })?;
                 }
             }
             MoeDispatch::AllToAll => {
+                // flashnext `moe_a2a`: route the own token slice, send each
+                // destination its rows (capacity per destination), experts on
+                // every received row, send back, add the full shared expert.
                 let k = u64::from(self.model.experts_per_token);
                 let router = self.k.moe_router.clone().expect("router");
                 let routed = self.k.moe_routed.clone().expect("routed");
                 let shared = self.k.moe_shared.clone().expect("shared");
-                out.push(self.tokens(
-                    "moe.router",
-                    router,
-                    RowSrc::MaxGroup,
-                    g,
-                    RegionRole::InLayer(1),
-                ));
+                out.push(self.tokens("moe.router", router, RowSrc::A2aRouter, 1, false));
+                // Each received row carries its hidden state and its routing
+                // (top-k weights and ids as fp32).
                 if let Some(n) = self.comm_leaf(
                     "moe.dispatch",
                     CommOp::AllToAll,
                     r,
                     1,
-                    RowSrc::MaxGroup,
-                    k * h2,
-                    g,
+                    RowSrc::A2aRecv,
+                    h2 + 2 * k * FP32_BYTES,
+                    1,
                 )? {
                     out.push(n);
                 }
-                out.push(self.tokens(
-                    "moe.routed_experts",
-                    routed,
-                    RowSrc::MoeEquivalent,
-                    1,
-                    RegionRole::InLayer(1),
-                ));
+                out.push(self.tokens("moe.routed_experts", routed, RowSrc::A2aRecv, 1, false));
                 if let Some(n) = self.comm_leaf(
                     "moe.combine",
                     CommOp::AllToAll,
                     r,
                     1,
-                    RowSrc::MaxGroup,
-                    k * h2,
-                    g,
+                    RowSrc::A2aRecv,
+                    h2,
+                    1,
                 )? {
                     out.push(n);
                 }
-                out.push(self.tokens(
-                    "moe.shared_expert",
-                    shared,
-                    RowSrc::MaxGroup,
-                    g,
-                    RegionRole::None,
-                ));
-                if !sp {
-                    if let Some(n) = self.comm_leaf(
+                out.push(self.tokens("moe.shared_expert", shared, RowSrc::A2aShared, 1, false));
+                self.when(no_sp, |s| -> Result<()> {
+                    if let Some(n) = s.comm_leaf(
                         "moe.group_all_gather",
                         CommOp::AllGather,
                         g,
@@ -2196,63 +2269,59 @@ impl PlanBuilder<'_> {
                     )? {
                         out.push(n);
                     }
-                }
+                    Ok(())
+                })?;
             }
         }
         Ok(())
     }
 
     /// The PLE block of group `d` (before its layer's attention module).
+    /// Under sequence parallelism it still runs on the group's full rows.
+    #[allow(clippy::too_many_lines)]
     fn ple(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
-        let start = self.leaves.len();
-        self.ple_leaves(d, out)?;
-        let coll = self.p.ranks() > 1;
-        self.mark_coll(start, coll);
-        Ok(())
-    }
-
-    fn ple_leaves(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
         let r = self.p.ranks();
         let g = self.g();
         let sp = self.p.sequence_parallel();
-        let div = self.hc_div();
+        let no_sp = if sp { SpCond::NoSp } else { SpCond::Always };
         let ple_bytes = u64::from(self.model.ple_embed_dim) * BF16_BYTES;
         let ids_bytes =
             u64::from((self.model.ngram_size - 1) * self.model.heads_per_ngram) * FP32_BYTES;
         let ngram = self.k.ple_ngram.clone().expect("ple kernels");
         let gather = self.k.ple_gather.clone().expect("ple kernels");
-        out.push(self.leaf(
-            "ple.ngram_ids",
-            LeafEval::Ngram { k: ngram, d },
-            RegionRole::InLayer(1),
-        ));
+        out.push(self.leaf("ple.ngram_ids", LeafEval::Ngram { k: ngram, d }));
         match self.p.ple_table_shards {
             PleTableShards::Replica => {
+                let rows = if self.p.attn_dp == 1 {
+                    RowSrc::All
+                } else {
+                    RowSrc::WorldGather
+                };
                 if let Some(n) = self.comm_leaf(
                     "ple.ids_all_gather",
                     CommOp::AllGather,
                     r,
                     1,
-                    RowSrc::All,
+                    rows,
                     ids_bytes,
                     r,
                 )? {
                     out.push(n);
                 }
-                out.push(self.tokens("ple.gather", gather, RowSrc::All, 1, RegionRole::None));
+                out.push(self.tokens("ple.gather", gather, rows, 1, false));
                 if let Some(n) = self.comm_leaf(
                     "ple.reduce_scatter",
                     CommOp::ReduceScatter,
                     r,
                     1,
-                    RowSrc::All,
+                    rows,
                     ple_bytes,
                     1,
                 )? {
                     out.push(n);
                 }
-                if !sp {
-                    if let Some(n) = self.comm_leaf(
+                self.when(no_sp, |s| -> Result<()> {
+                    if let Some(n) = s.comm_leaf(
                         "ple.group_all_gather",
                         CommOp::AllGather,
                         g,
@@ -2263,162 +2332,153 @@ impl PlanBuilder<'_> {
                     )? {
                         out.push(n);
                     }
-                }
+                    Ok(())
+                })?;
             }
             PleTableShards::DpGroup | PleTableShards::Host => {
-                out.push(self.tokens("ple.gather", gather, RowSrc::Group(d), 1, RegionRole::None));
-                let op = if sp {
-                    CommOp::ReduceScatter
-                } else {
-                    CommOp::AllReduce
-                };
-                if let Some(n) =
-                    self.comm_leaf("ple.group_reduce", op, g, 1, RowSrc::Group(d), ple_bytes, 1)?
-                {
-                    out.push(n);
+                out.push(self.tokens("ple.gather", gather, RowSrc::Group(d), 1, false));
+                if sp {
+                    self.when(SpCond::Sp, |s| -> Result<()> {
+                        if let Some(n) = s.comm_leaf(
+                            "ple.group_reduce_scatter",
+                            CommOp::ReduceScatter,
+                            g,
+                            1,
+                            RowSrc::Group(d),
+                            ple_bytes,
+                            1,
+                        )? {
+                            out.push(n);
+                        }
+                        Ok(())
+                    })?;
                 }
+                self.when(no_sp, |s| -> Result<()> {
+                    if let Some(n) = s.comm_leaf(
+                        "ple.group_reduce",
+                        CommOp::AllReduce,
+                        g,
+                        1,
+                        RowSrc::Group(d),
+                        ple_bytes,
+                        1,
+                    )? {
+                        out.push(n);
+                    }
+                    Ok(())
+                })?;
             }
         }
+        let src = RowSrc::Group(d);
         if let Some(k) = self.k.ple_post.clone() {
-            out.push(self.tokens("ple.post", k, RowSrc::Group(d), div, RegionRole::InLayer(1)));
+            out.push(self.tokens("ple.post", k, src, 1, false));
         } else {
             let project = self.k.ple_project.clone().expect("ple per-op");
             let gate = self.k.ple_gate.clone().expect("ple per-op");
             let residual = self.k.ple_residual.clone().expect("ple per-op");
             let conv_d = self.k.ple_conv_decode.clone().expect("ple per-op");
             let conv_p = self.k.ple_conv_prefill.clone().expect("ple per-op");
-            out.push(self.tokens(
-                "ple.project",
-                project,
-                RowSrc::Group(d),
-                div,
-                RegionRole::InLayer(1),
-            ));
-            out.push(self.tokens(
-                "ple.gate",
-                gate,
-                RowSrc::Group(d),
-                div,
-                RegionRole::InLayer(1),
-            ));
-            out.push(self.leaf(
-                "ple.short_conv_decode",
-                LeafEval::ConvDecode { k: conv_d, d },
-                RegionRole::InLayer(1),
-            ));
-            out.push(self.leaf(
-                "ple.short_conv_prefill",
-                LeafEval::ConvChunks { k: conv_p, d },
-                RegionRole::InLayer(1),
-            ));
-            out.push(self.tokens(
-                "ple.residual",
-                residual,
-                RowSrc::Group(d),
-                div,
-                RegionRole::InLayer(1),
-            ));
+            out.push(self.tokens("ple.project", project, src, 1, false));
+            out.push(self.tokens("ple.gate", gate, src, 1, false));
+            if has_decode(self.view) {
+                out.push(self.leaf(
+                    "ple.short_conv_decode",
+                    LeafEval::ConvDecode { k: conv_d, d },
+                ));
+            }
+            if has_prefill(self.view) {
+                out.push(self.leaf(
+                    "ple.short_conv_prefill",
+                    LeafEval::ConvChunks { k: conv_p, d },
+                ));
+            }
+            out.push(self.tokens("ple.residual", residual, src, 1, false));
         }
         Ok(())
     }
 
     /// Embedding for group `d`: vocab-parallel gather + the group reduction.
     fn embed(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
-        let start = self.leaves.len();
-        self.embed_leaves(d, out)?;
-        let coll = self.g() > 1;
-        self.mark_coll(start, coll);
-        Ok(())
-    }
-
-    fn embed_leaves(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
+        self.cut(Cut::Embed);
         let k = self.k.embed.clone();
-        out.push(self.tokens(
-            "embedding",
-            k,
-            RowSrc::Group(d),
-            1,
-            RegionRole::Standalone(1),
-        ));
-        let op = if self.p.sequence_parallel() {
-            CommOp::ReduceScatter
-        } else {
-            CommOp::AllReduce
-        };
+        out.push(self.tokens("embedding", k, RowSrc::Group(d), 1, false));
         let (g, h2) = (self.g(), self.h2());
-        if let Some(n) = self.comm_leaf("embedding.reduce", op, g, 1, RowSrc::Group(d), h2, 1)? {
-            out.push(n);
+        if self.p.sequence_parallel() {
+            self.when(SpCond::Sp, |s| -> Result<()> {
+                if let Some(n) = s.comm_leaf(
+                    "embedding.reduce_scatter",
+                    CommOp::ReduceScatter,
+                    g,
+                    1,
+                    RowSrc::Group(d),
+                    h2,
+                    1,
+                )? {
+                    out.push(n);
+                }
+                Ok(())
+            })?;
         }
-        Ok(())
+        let cond = if self.p.sequence_parallel() {
+            SpCond::NoSp
+        } else {
+            SpCond::Always
+        };
+        self.when(cond, |s| -> Result<()> {
+            if let Some(n) = s.comm_leaf(
+                "embedding.reduce",
+                CommOp::AllReduce,
+                g,
+                1,
+                RowSrc::Group(d),
+                h2,
+                1,
+            )? {
+                out.push(n);
+            }
+            Ok(())
+        })
     }
 
     /// Final HC combine and mixer, lm_head and greedy argmax for group `d`.
     fn head(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
         self.scoped("final_mixer", |s| {
-            let div = s.hc_div();
             let k = s.k.hc_combine.clone();
-            out.push(s.tokens(
-                "combine",
-                k,
-                RowSrc::Group(d),
-                div,
-                RegionRole::Standalone(1),
-            ));
+            out.push(s.tokens("combine", k, RowSrc::Group(d), 1, true));
+            s.cut(Cut::Head);
             let k = s.k.hc_mix_final.clone();
-            out.push(s.tokens("mix", k, RowSrc::Group(d), div, RegionRole::Standalone(1)));
+            out.push(s.tokens("mix", k, RowSrc::Group(d), 1, true));
         });
         self.scoped("head", |s| s.head_rows(d, out))
     }
 
     fn head_rows(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
-        let start = self.leaves.len();
-        self.head_rows_leaves(d, out)?;
-        let coll = self.g() > 1;
-        self.mark_coll(start, coll);
-        Ok(())
-    }
-
-    fn head_rows_leaves(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
         let (g, h2) = (self.g(), self.h2());
         if self.p.sequence_parallel() {
-            if let Some(n) = self.comm_leaf(
-                "rows_all_gather",
-                CommOp::AllGather,
-                g,
-                1,
-                RowSrc::Sample(d),
-                h2,
-                g,
-            )? {
-                out.push(n);
-            }
+            self.when(SpCond::Sp, |s| -> Result<()> {
+                if let Some(n) = s.comm_leaf(
+                    "rows_all_gather",
+                    CommOp::AllGather,
+                    g,
+                    1,
+                    RowSrc::Sample(d),
+                    h2,
+                    g,
+                )? {
+                    out.push(n);
+                }
+                Ok(())
+            })?;
         }
         if let Some(k) = self.k.lm_head_argmax.clone() {
-            out.push(self.tokens(
-                "lm_head_argmax",
-                k,
-                RowSrc::Sample(d),
-                1,
-                RegionRole::Standalone(1),
-            ));
+            out.push(self.tokens("lm_head_argmax", k, RowSrc::Sample(d), 1, false));
         } else {
             let gemm = self.k.lm_head_gemm.clone().expect("per-op head");
             let argmax = self.k.vocab_argmax.clone().expect("per-op head");
-            out.push(self.tokens(
-                "lm_head",
-                gemm,
-                RowSrc::Sample(d),
-                1,
-                RegionRole::Standalone(1),
-            ));
-            out.push(self.tokens(
-                "argmax",
-                argmax,
-                RowSrc::Sample(d),
-                1,
-                RegionRole::Standalone(1),
-            ));
+            out.push(self.tokens("lm_head", gemm, RowSrc::Sample(d), 1, false));
+            out.push(self.tokens("argmax", argmax, RowSrc::Sample(d), 1, false));
         }
+        self.cut(Cut::HeadGather);
         if let Some(n) = self.comm_leaf(
             "argmax_all_gather",
             CommOp::AllGather,
@@ -2433,16 +2493,35 @@ impl PlanBuilder<'_> {
         Ok(())
     }
 
+    /// `f` once per DP group (SPMD: each group's leaves join the same
+    /// regions), composed as the slowest group.
     fn per_group<F>(&mut self, mut f: F) -> Result<CostNode>
     where
         F: FnMut(&mut Self, usize, &mut Vec<CostNode>) -> Result<()>,
     {
+        let saved = (
+            self.region,
+            self.pending_cut,
+            self.forwards[self.forward].regions,
+        );
+        let mut end = saved;
         let mut groups = Vec::new();
         for d in 0..self.p.attn_dp as usize {
+            (self.region, self.pending_cut) = (saved.0, saved.1);
+            self.forwards[self.forward].regions = saved.2;
             let mut out = Vec::new();
+            self.group = Some(d);
             f(self, d, &mut out)?;
+            self.group = None;
             groups.push(CostNode::Sum(out));
+            end = (
+                self.region,
+                self.pending_cut,
+                self.forwards[self.forward].regions,
+            );
         }
+        (self.region, self.pending_cut) = (end.0, end.1);
+        self.forwards[self.forward].regions = end.2;
         Ok(CostNode::Max {
             overlap: 1.0,
             children: groups,
@@ -2453,41 +2532,26 @@ impl PlanBuilder<'_> {
     /// group), then the MoE block over every group.
     fn layer(&mut self, mixer: Qwen4ExpMixer, first: bool, ple: bool) -> Result<CostNode> {
         let attn = self.per_group(|s, d, out| {
-            let div = s.hc_div();
+            s.cut(Cut::Layer);
             if ple {
                 if !first {
                     let k = s.k.hc_combine.clone();
-                    out.push(s.tokens(
-                        "attn_hc.pending_combine",
-                        k,
-                        RowSrc::Group(d),
-                        div,
-                        RegionRole::InLayer(1),
-                    ));
+                    out.push(s.tokens("attn_hc.pending_combine", k, RowSrc::Group(d), 1, true));
                 }
+                s.cut(Cut::Ple);
                 s.ple(d, out)?;
+                s.cut(Cut::Attn);
                 let k = s.k.hc_mix.clone();
-                out.push(s.tokens(
-                    "attn_hc.mix",
-                    k,
-                    RowSrc::Group(d),
-                    div,
-                    RegionRole::InLayer(1),
-                ));
+                out.push(s.tokens("attn_hc.mix", k, RowSrc::Group(d), 1, true));
             } else if first {
+                s.cut(Cut::Attn);
                 let k = s.k.hc_mix.clone();
-                out.push(s.tokens(
-                    "attn_hc.mix",
-                    k,
-                    RowSrc::Group(d),
-                    div,
-                    RegionRole::InLayer(1),
-                ));
+                out.push(s.tokens("attn_hc.mix", k, RowSrc::Group(d), 1, true));
             } else {
-                s.combine_mix(d, "attn_hc", out);
+                s.combine_mix(d, "attn_hc", Cut::Attn, out);
             }
             s.mixer(d, mixer, out)?;
-            s.combine_mix(d, "mlp_hc", out);
+            s.combine_mix(d, "mlp_hc", Cut::Mlp, out);
             Ok(())
         })?;
         let mut moe = Vec::new();
@@ -2495,29 +2559,112 @@ impl PlanBuilder<'_> {
         Ok(CostNode::Sum(vec![attn, CostNode::Sum(moe)]))
     }
 
-    /// One MTP pass in `view`.
+    /// One MTP pass in the current view.
     fn mtp_pass(&mut self) -> Result<CostNode> {
         let pre = self.per_group(|s, d, out| {
             s.embed(d, out)?;
             let fc = s.k.mtp_fc.clone().expect("mtp fc");
-            out.push(s.tokens("fc", fc, RowSrc::Group(d), 1, RegionRole::InLayer(1)));
+            out.push(s.tokens("fc", fc, RowSrc::Group(d), 1, false));
+            s.cut(Cut::Attn);
             let k = s.k.hc_mix.clone();
-            let div = s.hc_div();
-            out.push(s.tokens(
-                "attn_hc.mix",
-                k,
-                RowSrc::Group(d),
-                div,
-                RegionRole::InLayer(1),
-            ));
+            out.push(s.tokens("attn_hc.mix", k, RowSrc::Group(d), 1, true));
             s.mixer(d, Qwen4ExpMixer::Qsa, out)?;
-            s.combine_mix(d, "mlp_hc", out);
+            s.combine_mix(d, "mlp_hc", Cut::Mlp, out);
             Ok(())
         })?;
         let mut moe = Vec::new();
         self.moe(&mut moe)?;
         let post = self.per_group(|s, d, out| s.head(d, out))?;
         Ok(CostNode::Sum(vec![pre, CostNode::Sum(moe), post]))
+    }
+
+    /// The target pass of the current view: prologue, every layer, epilogue.
+    fn target_pass(&mut self) -> Result<Vec<CostNode>> {
+        let mut root = Vec::new();
+        root.push(CostNode::Labeled {
+            label: "prologue".to_string(),
+            child: Box::new(self.per_group(|s, d, out| s.embed(d, out))?),
+        });
+        let outer = self.fold;
+        for (mixer, first, ple, n) in layer_groups(self.model) {
+            self.fold = outer * n;
+            let scope = match (mixer, first, ple) {
+                (Qwen4ExpMixer::Gdn, _, true) => "gdn_ple",
+                (Qwen4ExpMixer::Gdn, true, false) => "gdn_first",
+                (Qwen4ExpMixer::Gdn, false, false) => "gdn",
+                (Qwen4ExpMixer::Qsa, _, true) => "qsa_ple",
+                (Qwen4ExpMixer::Qsa, true, false) => "qsa_first",
+                (Qwen4ExpMixer::Qsa, false, false) => "qsa",
+            };
+            let layer = self.scoped(scope, |pb| pb.layer(mixer, first, ple))?;
+            let label = format!(
+                "{n} x {}{}{}",
+                mixer_name(mixer),
+                if first { " (first)" } else { "" },
+                if ple { " + ple" } else { "" }
+            );
+            root.push(CostNode::Labeled {
+                label,
+                child: Box::new(CostNode::Scale {
+                    n,
+                    child: Box::new(layer),
+                }),
+            });
+        }
+        self.fold = outer;
+        root.push(CostNode::Labeled {
+            label: "epilogue".to_string(),
+            child: Box::new(self.per_group(|s, d, out| s.head(d, out))?),
+        });
+        Ok(root)
+    }
+
+    /// One forward: `body` in `view`, closed by its launch leaf, `n` times.
+    fn forward<F>(
+        &mut self,
+        label: &str,
+        scope: &str,
+        view: View,
+        mtp: bool,
+        n: u32,
+        body: F,
+    ) -> Result<CostNode>
+    where
+        F: FnOnce(&mut Self) -> Result<Vec<CostNode>>,
+    {
+        self.forwards.push(ForwardPlan {
+            view,
+            mtp,
+            regions: 0,
+            fold: self.fold * n,
+        });
+        self.forward = self.forwards.len() - 1;
+        let outer = self.fold;
+        self.fold = outer * n;
+        self.forward_fold = self.fold;
+        self.view = view;
+        self.in_mtp = mtp;
+        self.pending_cut = true;
+        let node = self.scoped(scope, |s| -> Result<CostNode> {
+            let mut parts = body(s)?;
+            let launch = s.k.launch.clone();
+            let forward = Some(s.forward);
+            parts.push(s.leaf("launch", LeafEval::Launch { k: launch, forward }));
+            Ok(CostNode::Sum(parts))
+        })?;
+        self.fold = outer;
+        let node = if n > 1 {
+            CostNode::Scale {
+                n,
+                child: Box::new(node),
+            }
+        } else {
+            node
+        };
+        Ok(CostNode::Labeled {
+            label: label.to_string(),
+            child: Box::new(node),
+        })
     }
 }
 
@@ -2548,95 +2695,148 @@ fn build_plan(
     p: &NeuronFlashNextParallel,
     kernels: &mut Kernels,
     bridge: &PerfApiBridge,
-) -> Result<(CostTree, Vec<LeafPlan>)> {
+) -> Result<(CostTree, Vec<LeafPlan>, Vec<ForwardPlan>)> {
     let mut pb = PlanBuilder {
         name: name.to_string(),
         b: CostTreeBuilder::new(),
         leaves: Vec::new(),
+        forwards: Vec::new(),
         k: kernels,
         p,
         model,
         bridge,
         fold: 1,
-        view: View::Target,
+        view: View::Fused,
         scope: String::new(),
+        forward: 0,
+        forward_fold: 1,
+        in_mtp: false,
+        region: 0,
+        pending_cut: true,
+        sp_cond: SpCond::Always,
+        group: None,
     };
-    let mut root = Vec::new();
-    root.push(CostNode::Labeled {
-        label: "prologue".to_string(),
-        child: Box::new(pb.per_group(|s, d, out| s.embed(d, out))?),
-    });
-    for (mixer, first, ple, n) in layer_groups(model) {
-        pb.fold = n;
-        let scope = match (mixer, first, ple) {
-            (Qwen4ExpMixer::Gdn, _, true) => "gdn_ple",
-            (Qwen4ExpMixer::Gdn, true, false) => "gdn_first",
-            (Qwen4ExpMixer::Gdn, false, false) => "gdn",
-            (Qwen4ExpMixer::Qsa, _, true) => "qsa_ple",
-            (Qwen4ExpMixer::Qsa, true, false) => "qsa_first",
-            (Qwen4ExpMixer::Qsa, false, false) => "qsa",
-        };
-        let layer = pb.scoped(scope, |pb| pb.layer(mixer, first, ple))?;
-        let label = format!(
-            "{n} x {}{}{}",
-            mixer_name(mixer),
-            if first { " (first)" } else { "" },
-            if ple { " + ple" } else { "" }
-        );
-        root.push(CostNode::Labeled {
-            label,
-            child: Box::new(CostNode::Scale {
-                n,
-                child: Box::new(layer),
-            }),
-        });
-    }
-    pb.fold = 1;
-    root.push(CostNode::Labeled {
-        label: "epilogue".to_string(),
-        child: Box::new(pb.per_group(|s, d, out| s.head(d, out))?),
-    });
-    if p.draft_tokens > 0 {
+    let k = p.draft_tokens;
+    if k > 0 {
         ensure!(
             model.mtp_layers == 1,
             "the MTP pass models one QSA MTP layer; the checkpoint has {}",
             model.mtp_layers
         );
-        pb.view = View::MtpFirst;
-        let first = pb.scoped("mtp", |pb| pb.mtp_pass())?;
-        let mut mtp = vec![CostNode::Labeled {
-            label: "mtp pass 0".to_string(),
-            child: Box::new(first),
-        }];
-        if p.draft_tokens > 1 {
-            pb.view = View::MtpRecurrent;
-            pb.fold = p.draft_tokens - 1;
-            let rec = pb.scoped("mtp_recurrent", |pb| pb.mtp_pass())?;
-            mtp.push(CostNode::Labeled {
-                label: "mtp recurrent pass".to_string(),
-                child: Box::new(CostNode::Scale {
-                    n: p.draft_tokens - 1,
-                    child: Box::new(rec),
-                }),
-            });
-            pb.fold = 1;
-        }
-        pb.view = View::Target;
-        root.push(CostNode::Labeled {
-            label: "mtp".to_string(),
-            child: Box::new(CostNode::Sum(mtp)),
-        });
     }
-    let launch = pb.k.launch.clone();
-    root.push(pb.leaf("launch", LeafEval::Launch { k: launch }, RegionRole::None));
+    let mut root = Vec::new();
+    match p.step_forwards {
+        StepForwards::Fused => {
+            // One forward: the target pass over every row, then the MTP
+            // passes (pass 0 over every target row, k - 1 over one row per
+            // decode request), one launch leaf with the step constant.
+            let node = pb.forward("fused forward", "", View::Fused, false, 1, |s| {
+                let mut parts = s.target_pass()?;
+                if k > 0 {
+                    s.view = View::MtpFused;
+                    s.in_mtp = true;
+                    let first = s.scoped("mtp", |s| s.mtp_pass())?;
+                    parts.push(CostNode::Labeled {
+                        label: "mtp pass 0".to_string(),
+                        child: Box::new(first),
+                    });
+                    if k > 1 {
+                        s.view = View::MtpRecurrent;
+                        let outer = s.fold;
+                        s.fold = outer * (k - 1);
+                        let rec = s.scoped("mtp_recurrent", |s| s.mtp_pass())?;
+                        s.fold = outer;
+                        parts.push(CostNode::Labeled {
+                            label: "mtp recurrent pass".to_string(),
+                            child: Box::new(CostNode::Scale {
+                                n: k - 1,
+                                child: Box::new(rec),
+                            }),
+                        });
+                    }
+                    s.view = View::Fused;
+                    s.in_mtp = false;
+                }
+                Ok(parts)
+            })?;
+            root.push(node);
+        }
+        StepForwards::Separate => {
+            root.push(
+                pb.forward("decode forward", "decode", View::Decode, false, 1, |s| {
+                    s.target_pass()
+                })?,
+            );
+            if k > 0 {
+                root.push(pb.forward(
+                    "decode mtp",
+                    "decode.mtp",
+                    View::MtpDecode,
+                    true,
+                    1,
+                    |s| Ok(vec![s.mtp_pass()?]),
+                )?);
+                if k > 1 {
+                    root.push(pb.forward(
+                        "decode mtp drafts",
+                        "decode.mtp_recurrent",
+                        View::MtpRecurrent,
+                        true,
+                        k - 1,
+                        |s| Ok(vec![s.mtp_pass()?]),
+                    )?);
+                }
+            }
+            root.push(
+                pb.forward("prefill forward", "prefill", View::Prefill, false, 1, |s| {
+                    s.target_pass()
+                })?,
+            );
+            if k > 0 {
+                root.push(pb.forward(
+                    "prefill mtp",
+                    "prefill.mtp",
+                    View::MtpPrefill,
+                    true,
+                    1,
+                    |s| Ok(vec![s.mtp_pass()?]),
+                )?);
+                if k > 1 {
+                    root.push(pb.forward(
+                        "prefill mtp drafts",
+                        "prefill.mtp_draft",
+                        View::MtpPrefillDraft,
+                        true,
+                        k - 1,
+                        |s| Ok(vec![s.mtp_pass()?]),
+                    )?);
+                }
+            }
+            let launch = pb.k.launch.clone();
+            root.push(pb.leaf(
+                "step",
+                LeafEval::Launch {
+                    k: launch,
+                    forward: None,
+                },
+            ));
+        }
+    }
     let tree = pb.b.finish(CostNode::Labeled {
         label: format!(
-            "{name} [Trainium2 LNC{}, dp{} x (attn tp{}, gdn tp{}), moe ep{} x tp{}, {:?}]",
-            p.lnc, p.attn_dp, p.attn_tp, p.gdn_tp, p.moe_ep, p.moe_tp, p.region_granularity
+            "{name} [Trainium2 LNC{}, dp{} x (attn tp{}, gdn tp{}), moe ep{} x tp{}, {:?}, {:?}]",
+            p.lnc,
+            p.attn_dp,
+            p.attn_tp,
+            p.gdn_tp,
+            p.moe_ep,
+            p.moe_tp,
+            p.region_granularity,
+            p.step_forwards
         ),
         child: Box::new(CostNode::Sum(root)),
     });
-    Ok((tree, pb.leaves))
+    Ok((tree, pb.leaves, pb.forwards))
 }
 
 // ── evaluation ───────────────────────────────────────────────────────────────
@@ -2646,7 +2846,8 @@ struct Buckets {
     prefill: Vec<u32>,
     decode: Vec<u32>,
     context: Vec<u32>,
-    /// Token-wise regions: the union of the prefill and decode buckets.
+    /// Token-wise regions of the fused forward: the union of the prefill and
+    /// decode buckets.
     tokens: Vec<u32>,
 }
 
@@ -2677,24 +2878,122 @@ impl Buckets {
     }
 }
 
-/// One leaf's evaluated work: metrics and the calls (regions) it launched.
+/// `n` padded to its bucket calls (several largest-bucket calls above it).
+fn padded(n: u32, buckets: &[u32]) -> u32 {
+    let mut out = Vec::new();
+    bucket_calls(n, buckets, &mut out);
+    out.iter().sum()
+}
+
+/// One leaf's evaluated work and its recorded input.
 struct LeafOut {
     m: LeafMetrics,
-    calls: u32,
     input: Option<SlotInput>,
 }
 
-fn rows_of(src: RowSrc, groups: &[GroupStep], bk: &Buckets, ep: u32) -> u32 {
+/// What row counts depend on besides the group shapes.
+#[derive(Clone, Copy)]
+struct RowCtx {
+    /// Shapes are padded already: token-wise leaves take them as they are.
+    exact: bool,
+    /// Sequence parallelism is active in this pass.
+    sp: bool,
+    /// Ranks per DP group and in the replica.
+    g: u32,
+    ranks: u32,
+    top_k: u32,
+    a2a_cf: f32,
+    /// ms per received row added to each all-to-all leaf (packing).
+    a2a_pack_ms: f32,
+}
+
+impl RowCtx {
+    /// All-to-all: the slice a rank routes, or None when the engine falls
+    /// back to the all-gather form (fewer than 2 rows per rank, or rows that
+    /// do not split over the TP group).
+    fn a2a_slice(&self, n: u32) -> Option<u32> {
+        let s = if self.sp || n % self.g == 0 {
+            n / self.g
+        } else {
+            0
+        };
+        (s >= 2).then_some(s)
+    }
+
+    /// Rows each rank sends each destination (flashnext `a2a_capacity`).
+    fn a2a_capacity(&self, s: u32) -> u32 {
+        if self.a2a_cf <= 0.0 {
+            return s;
+        }
+        let want = (self.a2a_cf * s as f32 * self.top_k as f32 / self.ranks as f32).ceil() as u32;
+        want.clamp(1, s)
+    }
+
+    /// Rows one rank holds before the fallback all-gather.
+    fn local_rows(&self, n: u32) -> u32 {
+        if self.sp {
+            n / self.g
+        } else {
+            n
+        }
+    }
+}
+
+fn rows_of(src: RowSrc, groups: &[GroupStep], bk: &Buckets, c: RowCtx) -> u32 {
+    let rows = |g: &GroupStep| {
+        if c.exact {
+            g.tokens()
+        } else {
+            bk.tok(g.tokens())
+        }
+    };
+    let max = || groups.iter().map(rows).max().unwrap_or(0);
     match src {
-        RowSrc::Group(d) => bk.tok(groups[d].tokens()),
-        RowSrc::All => groups.iter().map(|g| bk.tok(g.tokens())).sum(),
-        RowSrc::MaxGroup => groups.iter().map(|g| bk.tok(g.tokens())).max().unwrap_or(0),
-        RowSrc::Sample(d) => bk.tok(groups[d].sample_rows()),
-        RowSrc::MoeEquivalent => groups
+        RowSrc::Group(d) => rows(&groups[d]),
+        RowSrc::All => groups.iter().map(rows).sum(),
+        RowSrc::WorldGather => groups
             .iter()
-            .map(|g| bk.tok(g.tokens()))
-            .sum::<u32>()
-            .div_ceil(ep.max(1)),
+            .map(|g| {
+                let n = rows(g);
+                // "dup": a group batch that does not split over its TP ranks
+                // is gathered from every one of them.
+                if c.exact && !c.sp && n % c.g != 0 {
+                    n * c.g
+                } else {
+                    n
+                }
+            })
+            .sum(),
+        RowSrc::MaxGroup => max(),
+        RowSrc::Sample(d) => {
+            let n = groups[d].sample_rows();
+            if c.exact {
+                n
+            } else {
+                bk.tok(n)
+            }
+        }
+        RowSrc::A2aRouter => {
+            let n = max();
+            match c.a2a_slice(n) {
+                Some(s) => s,
+                None => c.ranks * c.local_rows(n),
+            }
+        }
+        RowSrc::A2aRecv => {
+            let n = max();
+            match c.a2a_slice(n) {
+                Some(s) => c.ranks * c.a2a_capacity(s),
+                None => c.ranks * c.local_rows(n),
+            }
+        }
+        RowSrc::A2aShared => {
+            let n = max();
+            match c.a2a_slice(n) {
+                Some(s) => s,
+                None => c.local_rows(n),
+            }
+        }
     }
 }
 
@@ -2720,25 +3019,28 @@ fn spread(mut calls: Vec<LeafMetrics>, sub: u32) -> LeafMetrics {
     total
 }
 
+#[allow(clippy::too_many_lines)]
 fn eval_leaf(
     plan: &LeafPlan,
-    views: &StepViews,
+    groups: &[GroupStep],
     bk: &Buckets,
-    ep: u32,
-    regions: u32,
+    rc: RowCtx,
     record: bool,
     adj: &dyn Fn(LeafMetrics, u32) -> LeafMetrics,
 ) -> LeafOut {
-    let groups = views.get(plan.view);
     let mut m = LeafMetrics::ZERO;
-    let mut calls = 0u32;
     let mut input = None;
     let mut sizes = Vec::new();
     match &plan.eval {
-        LeafEval::Tokens { k, src, div } => {
-            let rows = rows_of(*src, groups, bk, ep).div_ceil((*div).max(1));
+        LeafEval::Tokens { k, src, div, sp } => {
+            let div = (*div).max(1) * if *sp && rc.sp { rc.g } else { 1 };
+            let rows = rows_of(*src, groups, bk, rc).div_ceil(div);
             if rows > 0 {
-                let max = *bk.tokens.last().expect("buckets");
+                let max = if rc.exact {
+                    u32::MAX
+                } else {
+                    *bk.tokens.last().expect("buckets")
+                };
                 let mut rest = rows;
                 while rest > 0 {
                     let n = rest.min(max);
@@ -2746,7 +3048,6 @@ fn eval_leaf(
                     if record && input.is_none() {
                         input = Some(k.input_at(n));
                     }
-                    calls += 1;
                     rest -= n;
                 }
             }
@@ -2761,7 +3062,6 @@ fn eval_leaf(
                 for &b in &sizes {
                     let n = if *rows { b * g.query_len } else { b };
                     m.add(adj(k.eval_at(n), n));
-                    calls += 1;
                     if record && input.is_none() {
                         input = Some(k.input_at(n));
                     }
@@ -2778,7 +3078,6 @@ fn eval_leaf(
                 bucket_calls(append, &bk.prefill, &mut sizes);
                 for &c in &sizes {
                     per.push(adj(k.eval_at(c), c));
-                    calls += 1;
                     if record && input.is_none() {
                         input = Some(k.input_at(c));
                     }
@@ -2797,7 +3096,6 @@ fn eval_leaf(
                 for &b in &sizes {
                     let x = (b * g.query_len, ctx);
                     m.add(adj(k.eval_at(x), x.0));
-                    calls += 1;
                     if record && input.is_none() {
                         input = Some(k.input_at(x));
                     }
@@ -2816,7 +3114,6 @@ fn eval_leaf(
                 for &c in &sizes {
                     let ctx = bucket(done + c, &bk.context).max(c);
                     per.push(adj(k.eval_at((c, ctx)), c));
-                    calls += 1;
                     if record && input.is_none() {
                         input = Some(k.input_at((c, ctx)));
                     }
@@ -2830,11 +3127,14 @@ fn eval_leaf(
         }
         LeafEval::Ngram { k, d } => {
             let g = &groups[*d];
-            let tokens = bk.tok(g.tokens());
+            let tokens = if rc.exact {
+                g.tokens()
+            } else {
+                bk.tok(g.tokens())
+            };
             let x = (tokens, g.requests.clamp(1, tokens.max(1)));
             if tokens > 0 {
                 m = adj(k.eval_at(x), x.0);
-                calls = 1;
             }
             if record {
                 input = Some(k.input_at(x));
@@ -2846,7 +3146,6 @@ fn eval_leaf(
                 bucket_calls(g.decode_reqs, &bk.decode, &mut sizes);
                 for &b in &sizes {
                     m.add(adj(k.eval_at((b, g.query_len)), b * g.query_len));
-                    calls += 1;
                 }
             }
             if record {
@@ -2859,7 +3158,6 @@ fn eval_leaf(
                 bucket_calls(append, &bk.prefill, &mut sizes);
                 for &c in &sizes {
                     m.add(adj(k.eval_at((1, c)), c));
-                    calls += 1;
                 }
             }
             if record {
@@ -2872,23 +3170,23 @@ fn eval_leaf(
             bytes_per_row,
             div,
         } => {
-            let rows = u64::from(rows_of(*src, groups, bk, ep));
+            let rows = u64::from(rows_of(*src, groups, bk, rc));
             let bytes = (rows * bytes_per_row).div_ceil(u64::from((*div).max(1)));
             if bytes > 0 {
                 m = k.eval_at(bytes);
+                if matches!(src, RowSrc::A2aRecv) {
+                    // flashnext `a2a_dispatch` / `a2a_combine`: slot packing
+                    // and the scatter-add back, traced into the same stage.
+                    m.m.time_ms += rows as f32 * rc.a2a_pack_ms;
+                }
             }
             if record {
                 input = Some(k.input_at(bytes));
             }
         }
-        LeafEval::Launch { k } => {
-            m = k.eval_at(regions);
-            if record {
-                input = Some(k.input_at(regions));
-            }
-        }
+        LeafEval::Launch { .. } => unreachable!("launch leaves are priced per forward"),
     }
-    LeafOut { m, calls, input }
+    LeafOut { m, input }
 }
 
 // ── weights and KV ───────────────────────────────────────────────────────────
@@ -3024,11 +3322,32 @@ pub struct NeuronFlashNextCore {
     pub fixed_bytes_per_rank: u64,
     pub weight_bytes_per_rank: u64,
     leaves: Vec<LeafPlan>,
+    forwards: Vec<ForwardPlan>,
     buckets: Buckets,
     cost_flat: Vec<FlatCostNode>,
     manifest: CostManifest,
     n_slots: usize,
     kv: KvCacheLayout,
+    top_k: u32,
+}
+
+/// One forward's region bookkeeping during an evaluation.
+#[derive(Clone, Default)]
+struct RegionSum {
+    /// Device per step (all instances) per DP group, and outside the
+    /// per-group part (MoE, shared).
+    per_group: Vec<f32>,
+    shared: f32,
+    instances: u32,
+    coll: bool,
+}
+
+impl RegionSum {
+    /// Device time of one instance of the region.
+    fn device(&self) -> f32 {
+        let total = self.per_group.iter().copied().fold(0.0, f32::max) + self.shared;
+        total / self.instances.max(1) as f32
+    }
 }
 
 impl NeuronFlashNextCore {
@@ -3059,12 +3378,13 @@ impl NeuronFlashNextCore {
             );
         }
         let mut kernels = Kernels::build(&name, model, &parallel, bridge)?;
-        let (tree, leaves) = build_plan(&name, model, &parallel, &mut kernels, bridge)?;
+        let (tree, leaves, forwards) = build_plan(&name, model, &parallel, &mut kernels, bridge)?;
         let kv = kv_layout(model, &parallel, fixed_bytes_per_rank);
         tracing::info!(
-            "[build] {name}: {} leaf slots, {:.2} GB weights/rank\n{}",
+            "[build] {name}: {} leaf slots, {:.2} GB weights/rank, regions per forward {:?}\n{}",
             tree.n_slots(),
             weight_bytes_per_rank as f64 / 1e9,
+            forwards.iter().map(|f| f.regions).collect::<Vec<_>>(),
             tree.describe()
         );
         Ok(Self {
@@ -3074,10 +3394,12 @@ impl NeuronFlashNextCore {
             fixed_bytes_per_rank,
             weight_bytes_per_rank,
             leaves,
+            forwards,
             cost_flat: tree.flatten(),
             manifest: tree.manifest(),
             n_slots: tree.n_slots(),
             kv,
+            top_k: model.experts_per_token,
         })
     }
 
@@ -3091,6 +3413,104 @@ impl NeuronFlashNextCore {
         Ok(())
     }
 
+    /// The step's passes from each DP group's own decode rows and chunks.
+    fn views(&self, mut target: Vec<GroupStep>) -> StepViews {
+        let p = &self.parallel;
+        let bk = &self.buckets;
+        let dp = p.attn_dp as usize;
+        // A worker without DP partitions (the PD prefill worker) hands one
+        // group, one prompt per iteration: padding the idle groups would charge
+        // each prompt four groups' work, where the engine runs one prompt per
+        // group per step. Its spread groups pay their own shapes instead.
+        let mut spmd = p.spmd_padding;
+        if target.len() == 1 && dp > 1 {
+            target = spread_over_groups(&target[0], dp);
+            spmd = false;
+        }
+        let mut groups: [Vec<GroupStep>; N_VIEWS] = Default::default();
+        let recurrent = |pass: &[GroupStep]| -> Vec<GroupStep> {
+            pass.iter()
+                .map(|g| GroupStep {
+                    decode_reqs: g.decode_reqs,
+                    query_len: 1,
+                    decode_max_kv: g.decode_max_kv + 1,
+                    chunks: Vec::new(),
+                    requests: g.decode_reqs,
+                })
+                .collect()
+        };
+        match p.step_forwards {
+            StepForwards::Fused => {
+                if spmd {
+                    pad_decode(&mut target, true, bk);
+                    pad_prefill(&mut target, true, bk);
+                }
+                groups[View::MtpRecurrent.index()] = recurrent(&target);
+                groups[View::MtpFused.index()] = target.clone();
+                groups[View::Fused.index()] = target;
+                StepViews {
+                    groups,
+                    exact: false,
+                }
+            }
+            StepForwards::Separate => {
+                let mut dec: Vec<GroupStep> = target
+                    .iter()
+                    .map(|g| GroupStep {
+                        decode_reqs: g.decode_reqs,
+                        query_len: g.query_len,
+                        decode_max_kv: g.decode_max_kv,
+                        chunks: Vec::new(),
+                        requests: g.decode_reqs,
+                    })
+                    .collect();
+                let mut pre: Vec<GroupStep> = target
+                    .iter()
+                    .map(|g| GroupStep {
+                        query_len: 1,
+                        chunks: g.chunks.clone(),
+                        requests: g.chunks.len() as u32,
+                        ..Default::default()
+                    })
+                    .collect();
+                pad_decode(&mut dec, spmd, bk);
+                pad_prefill(&mut pre, spmd, bk);
+                // The first drafts after a prompt's last chunk: one row per
+                // group (every group under SPMD).
+                let any_pre = pre.iter().any(|g| !g.chunks.is_empty());
+                let draft: Vec<GroupStep> = pre
+                    .iter()
+                    .map(|g| {
+                        let run = if spmd { any_pre } else { !g.chunks.is_empty() };
+                        let end = g.chunks.iter().map(|c| c.0 + c.1).max().unwrap_or(0);
+                        if run {
+                            GroupStep {
+                                decode_reqs: 1,
+                                query_len: 1,
+                                decode_max_kv: end + 1,
+                                chunks: Vec::new(),
+                                requests: 1,
+                            }
+                        } else {
+                            GroupStep::default()
+                        }
+                    })
+                    .collect();
+                groups[View::MtpRecurrent.index()] = recurrent(&dec);
+                groups[View::MtpDecode.index()] = dec.clone();
+                groups[View::Decode.index()] = dec;
+                groups[View::MtpPrefill.index()] = pre.clone();
+                groups[View::Prefill.index()] = pre;
+                groups[View::MtpPrefillDraft.index()] = draft;
+                StepViews {
+                    groups,
+                    exact: true,
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn eval(
         &self,
         views: &StepViews,
@@ -3104,60 +3524,240 @@ impl NeuronFlashNextCore {
         if let Some(v) = inputs.as_deref_mut() {
             v.clear();
         }
-        let ep = self.parallel.moe_ep;
         let par = &self.parallel;
         let factor = par.region_device_factor;
-        let calibrated_launch = par.launch_model == LaunchModel::Calibrated;
-        let mut group_regions = vec![0u64; self.parallel.attn_dp as usize];
-        let mut shared_regions = 0u64;
+        let dp = par.attn_dp as usize;
+        let g = par.group_size();
+        // Per view: does sequence parallelism apply (rows split over the TP
+        // group, flashnext `Layout.sliced`)?
+        let mut sp = [false; N_VIEWS];
+        for (i, groups) in views.groups.iter().enumerate() {
+            sp[i] = par.sequence_parallel()
+                && (!views.exact || groups.iter().all(|x| x.tokens() > 0 && x.tokens() % g == 0));
+        }
+        let runs: Vec<bool> = self
+            .forwards
+            .iter()
+            .map(|f| views.get(f.view).iter().any(|x| !x.is_empty()))
+            .collect();
+        let mut regions: Vec<std::collections::BTreeMap<usize, RegionSum>> =
+            vec![Default::default(); self.forwards.len()];
+        let mut step_slot = None;
+        let idle = vec![GroupStep::default(); dp];
         for (slot, plan) in self.leaves.iter().enumerate() {
-            let regions = if matches!(plan.eval, LeafEval::Launch { .. }) {
-                let total = group_regions.iter().copied().max().unwrap_or(0) + shared_regions;
-                u32::try_from(total).unwrap_or(u32::MAX)
-            } else {
-                0
-            };
-            // Per call: f_g x device, floored by the region's launch.
-            let floor = if calibrated_launch && plan.compute {
-                plan.regions_per_call as f32
-                    * if plan.coll {
-                        par.launch_coll_ms
-                    } else {
-                        par.launch_plain_ms
+            if let LeafEval::Launch { k, forward } = &plan.eval {
+                let value = match forward {
+                    Some(f) => self.forward_launch(*f, runs[*f], &regions[*f], k),
+                    None => {
+                        step_slot = Some(slot);
+                        0.0
                     }
-            } else {
-                0.0
+                };
+                slots[slot] = LeafMetrics::ZERO;
+                slots[slot].m.time_ms = value;
+                if let Some(v) = inputs.as_deref_mut() {
+                    let n = forward.map_or(0, |f| self.forwards[f].regions);
+                    v.push(k.input_at(n));
+                }
+                continue;
+            }
+            let vi = plan.view.index();
+            let active = runs[plan.forward]
+                && match plan.sp_cond {
+                    SpCond::Always => true,
+                    SpCond::Sp => sp[vi],
+                    SpCond::NoSp => !sp[vi],
+                };
+            let rc = RowCtx {
+                exact: views.exact,
+                sp: sp[vi],
+                g,
+                ranks: par.ranks(),
+                top_k: self.top_k(),
+                a2a_cf: par.moe_a2a_capacity_factor,
+                a2a_pack_ms: par.moe_a2a_pack_us_per_row * 1e-3,
             };
             let compute = plan.compute;
             let adj = move |mut x: LeafMetrics, rows: u32| {
                 if compute {
-                    x.m.time_ms = (x.m.time_ms * plan.scale_at(rows) * factor).max(floor);
+                    x.m.time_ms *= plan.scale_at(rows) * factor;
                 }
                 x
             };
-            let mut out = eval_leaf(plan, views, &self.buckets, ep, regions, record, &adj);
-            if calibrated_launch && matches!(plan.eval, LeafEval::Launch { .. }) {
-                // The per-step constant; the regions already carry their launch.
-                out.m = LeafMetrics::ZERO;
-                out.m.m.time_ms = par.step_overhead_ms;
-            }
-            let launched =
-                u64::from(out.calls) * u64::from(plan.regions_per_call) * u64::from(plan.fold);
-            match plan.eval.group() {
-                Some(d) => group_regions[d] += launched,
-                None => shared_regions += launched,
+            // An inactive leaf sees empty groups: no work, only its input.
+            let groups = if active {
+                views.get(plan.view)
+            } else {
+                &idle[..]
+            };
+            let out = eval_leaf(plan, groups, &self.buckets, rc, record, &adj);
+            let r = regions[plan.forward]
+                .entry(plan.region)
+                .or_insert_with(|| RegionSum {
+                    per_group: vec![0.0; dp],
+                    ..Default::default()
+                });
+            // A region may take one leaf from outside its layers' Scale (the
+            // last layer's combine): sums are per step, instances the most.
+            let instances = plan.fold / self.forwards[plan.forward].fold.max(1);
+            r.instances = r.instances.max(instances);
+            r.coll |= !compute && active;
+            let total = instances as f32 * out.m.m.time_ms;
+            match plan.group {
+                Some(d) => r.per_group[d] += total,
+                None => r.shared += total,
             }
             slots[slot] = out.m;
             if let (Some(v), Some(input)) = (inputs.as_deref_mut(), out.input) {
                 v.push(input);
             }
         }
+        if let Some(slot) = step_slot {
+            let any = runs.iter().any(|&r| r);
+            slots[slot].m.time_ms = match par.launch_model {
+                LaunchModel::Pipelined | LaunchModel::Calibrated if any => par.step_overhead_ms,
+                _ => 0.0,
+            };
+        }
         CostTree::aggregate(&self.cost_flat, slots, scratch)
+    }
+
+    fn top_k(&self) -> u32 {
+        self.top_k
+    }
+
+    #[cfg(test)]
+    fn k_launch(&self) -> Rows {
+        self.leaves
+            .iter()
+            .find_map(|l| match &l.eval {
+                LeafEval::Launch { k, .. } => Some(k.clone()),
+                _ => None,
+            })
+            .expect("a launch leaf")
+    }
+
+    /// The launch leaf of forward `f`: host and launch time beyond the sum of
+    /// its leaves, per instance of the forward.
+    fn forward_launch(
+        &self,
+        f: usize,
+        runs: bool,
+        regions: &std::collections::BTreeMap<usize, RegionSum>,
+        k: &Rows,
+    ) -> f32 {
+        if !runs {
+            return 0.0;
+        }
+        let par = &self.parallel;
+        let fw = &self.forwards[f];
+        let fused_step = if par.step_forwards == StepForwards::Fused {
+            par.step_overhead_ms
+        } else {
+            0.0
+        };
+        match par.launch_model {
+            LaunchModel::Pipelined => {
+                let h = par.region_host_ms;
+                let (mut device, mut floored) = (0f32, 0f32);
+                for r in regions.values() {
+                    let n = r.instances as f32;
+                    let dev = r.device();
+                    device += n * dev;
+                    // A region shorter than its dispatch leaves the device
+                    // waiting for the next launch (idle, or inside a
+                    // cross-group collective for the slowest rank's launch).
+                    floored += n * dev.max(h);
+                }
+                if par.region_granularity == RegionGranularity::Block {
+                    // Block regions span layers of differently folded groups:
+                    // floor the forward's regions as equal shares of it.
+                    floored = device.max(fw.regions as f32 * h);
+                }
+                floored += fw.regions as f32 * par.region_gap_ms;
+                // The forward's host work (dispatch + its per-forward input
+                // assembly, H2D and readback) overlaps the device; whichever
+                // is longer sets the forward.
+                let overhead = if fw.mtp {
+                    par.mtp_forward_overhead_ms
+                } else {
+                    par.forward_overhead_ms
+                };
+                let host = fw.regions as f32 * h + overhead;
+                fused_step + (floored - device) + (host - floored).max(0.0)
+            }
+            LaunchModel::Calibrated => {
+                let slack: f32 = regions
+                    .values()
+                    .map(|r| {
+                        let floor = if r.coll {
+                            par.launch_coll_ms
+                        } else {
+                            par.launch_plain_ms
+                        };
+                        r.instances as f32 * (floor - r.device()).max(0.0)
+                    })
+                    .sum();
+                slack + fused_step
+            }
+            LaunchModel::L1Additive => k.eval_at(fw.regions).m.time_ms,
+        }
     }
 }
 
-fn iter_views(batch: &UnifiedArchInput, attn_dp: usize) -> StepViews {
-    let mut target: Vec<GroupStep> = batch
+/// Pad every group's decode batch to its bucket; under SPMD every group runs
+/// the largest group's padded batch, the longest query and the longest KV.
+fn pad_decode(groups: &mut [GroupStep], spmd: bool, bk: &Buckets) {
+    if spmd {
+        let b = groups.iter().map(|g| g.decode_reqs).max().unwrap_or(0);
+        if b == 0 {
+            return;
+        }
+        let b = padded(b, &bk.decode);
+        let q = groups.iter().map(|g| g.query_len).max().unwrap_or(1).max(1);
+        let kv = groups.iter().map(|g| g.decode_max_kv).max().unwrap_or(0);
+        for g in groups {
+            g.decode_reqs = b;
+            g.query_len = q;
+            g.decode_max_kv = kv;
+            g.requests = g.requests.max(b);
+        }
+    } else {
+        for g in groups.iter_mut().filter(|g| g.decode_reqs > 0) {
+            g.decode_reqs = padded(g.decode_reqs, &bk.decode);
+        }
+    }
+}
+
+/// Pad every prefill chunk to its bucket; under SPMD every group runs the
+/// longest chunk's bucket from the furthest prefix (the engine's context
+/// bucket is that of the longest `start + T`), idle groups included.
+fn pad_prefill(groups: &mut [GroupStep], spmd: bool, bk: &Buckets) {
+    if spmd {
+        let n = groups.iter().map(|g| g.chunks.len()).max().unwrap_or(0);
+        if n == 0 {
+            return;
+        }
+        let all = groups.iter().flat_map(|g| g.chunks.iter());
+        let t = all.clone().map(|c| c.1).max().unwrap_or(0);
+        let prefix = all.map(|c| c.0).max().unwrap_or(0);
+        let chunk = (prefix, padded(t, &bk.prefill));
+        for g in groups {
+            g.chunks = vec![chunk; n];
+            g.requests = g.requests.max(n as u32);
+        }
+    } else {
+        for g in groups.iter_mut() {
+            for c in &mut g.chunks {
+                c.1 = padded(c.1, &bk.prefill);
+            }
+        }
+    }
+}
+
+/// Each DP group's own decode rows and chunks of a unified batch.
+fn unified_targets(batch: &UnifiedArchInput) -> Vec<GroupStep> {
+    batch
         .groups
         .iter()
         .map(|g| GroupStep {
@@ -3167,14 +3767,7 @@ fn iter_views(batch: &UnifiedArchInput, attn_dp: usize) -> StepViews {
             chunks: g.prefill_chunk_pairs.clone(),
             requests: g.request_count(),
         })
-        .collect();
-    if target.len() == 1 && attn_dp > 1 {
-        target = spread_over_groups(&target[0], attn_dp);
-    }
-    StepViews {
-        recurrent: Vec::new(),
-        target,
-    }
+        .collect()
 }
 
 /// A worker without attention-DP partitions (the PD prefill worker) hands one
@@ -3206,8 +3799,9 @@ fn spread_over_groups(one: &GroupStep, attn_dp: usize) -> Vec<GroupStep> {
     groups
 }
 
-fn speculative_views(batch: &SpeculativeArchInput) -> StepViews {
-    let target: Vec<GroupStep> = batch
+/// Each DP group's verify rows and chunks of a speculative batch.
+fn speculative_targets(batch: &SpeculativeArchInput) -> Vec<GroupStep> {
+    batch
         .groups
         .iter()
         .map(|g| GroupStep {
@@ -3228,18 +3822,7 @@ fn speculative_views(batch: &SpeculativeArchInput) -> StepViews {
             chunks: g.prefill_chunk_pairs.clone(),
             requests: g.request_count(),
         })
-        .collect();
-    let recurrent = target
-        .iter()
-        .map(|g| GroupStep {
-            decode_reqs: g.decode_reqs,
-            query_len: 1,
-            decode_max_kv: g.decode_max_kv + 1,
-            chunks: Vec::new(),
-            requests: g.decode_reqs,
-        })
-        .collect();
-    StepViews { target, recurrent }
+        .collect()
 }
 
 /// Qwen4Exp BF16 on Trainium2 without MTP drafting.
@@ -3269,7 +3852,7 @@ impl IterwiseUnifiedModel for Qwen4ExpNeuronBf16Model {
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics {
         self.core.eval(
-            &iter_views(batch, self.core.parallel.attn_dp as usize),
+            &self.core.views(unified_targets(batch)),
             slots,
             scratch,
             None,
@@ -3284,7 +3867,7 @@ impl IterwiseUnifiedModel for Qwen4ExpNeuronBf16Model {
         inputs: &mut Vec<SlotInput>,
     ) -> LeafMetrics {
         self.core.eval(
-            &iter_views(batch, self.core.parallel.attn_dp as usize),
+            &self.core.views(unified_targets(batch)),
             slots,
             scratch,
             Some(inputs),
@@ -3330,8 +3913,12 @@ impl SpeculativeUnifiedModel for Qwen4ExpNeuronBf16SpeculativeModel {
         slots: &mut Vec<LeafMetrics>,
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics {
-        self.core
-            .eval(&speculative_views(batch), slots, scratch, None)
+        self.core.eval(
+            &self.core.views(speculative_targets(batch)),
+            slots,
+            scratch,
+            None,
+        )
     }
 
     fn eval_speculative_iter_with_inputs(
@@ -3341,8 +3928,12 @@ impl SpeculativeUnifiedModel for Qwen4ExpNeuronBf16SpeculativeModel {
         scratch: &mut Vec<LeafMetrics>,
         inputs: &mut Vec<SlotInput>,
     ) -> LeafMetrics {
-        self.core
-            .eval(&speculative_views(batch), slots, scratch, Some(inputs))
+        self.core.eval(
+            &self.core.views(speculative_targets(batch)),
+            slots,
+            scratch,
+            Some(inputs),
+        )
     }
 
     fn cost_log_manifest(&self) -> CostManifest {
@@ -3396,11 +3987,19 @@ mod tests {
             tp_collective: TpCollective::AllReduce,
             moe_dispatch: MoeDispatch::AllGather,
             region_granularity: RegionGranularity::Mixer,
+            step_forwards: StepForwards::Separate,
+            spmd_padding: true,
             region_device_factor: 1.0,
-            launch_model: LaunchModel::L1Additive,
+            launch_model: LaunchModel::Pipelined,
             launch_coll_ms: 1.25,
             launch_plain_ms: 0.075,
-            step_overhead_ms: 4.0,
+            region_host_ms: 1.0,
+            region_gap_ms: 0.0,
+            forward_overhead_ms: 12.0,
+            mtp_forward_overhead_ms: 3.0,
+            step_overhead_ms: 1.0,
+            moe_a2a_capacity_factor: 0.0,
+            moe_a2a_pack_us_per_row: 0.0,
             prefill_buckets: vec![128, 256, 512, 1024, 2048, 4096, 8192],
             decode_buckets: vec![1, 2, 4, 8, 16, 32, 64, 128, 256],
             context_buckets: vec![4096, 8192, 16384, 32768, 65536, 131072],
@@ -3431,29 +4030,65 @@ mod tests {
         }
     }
 
-    /// The region count the launch leaf is evaluated at (its slot input).
-    fn launched_regions(
-        core: &NeuronFlashNextCore,
-        groups: Vec<ArchGroupInput>,
-    ) -> serde_json::Value {
-        let model = Qwen4ExpNeuronBf16Model {
-            core: built_like(core),
-        };
-        let (mut slots, mut scratch, mut inputs) = (Vec::new(), Vec::new(), Vec::new());
-        model.eval_iter_with_inputs(
-            &UnifiedArchInput {
-                groups,
-                tokens_per_source_rank: Vec::new(),
-            },
-            &mut slots,
-            &mut scratch,
-            &mut inputs,
-        );
-        assert_eq!(inputs.len(), model.core.n_slots, "one input per slot");
-        serde_json::to_value(inputs.last().unwrap()).unwrap()
+    fn unified(groups: Vec<ArchGroupInput>) -> UnifiedArchInput {
+        UnifiedArchInput {
+            groups,
+            tokens_per_source_rank: Vec::new(),
+        }
     }
 
-    /// A probe that costs 1 ms per call and records its shape.
+    /// Evaluate `batch` and return (slot names, slot times, slot inputs, total).
+    fn eval_unified(
+        core: &NeuronFlashNextCore,
+        batch: &UnifiedArchInput,
+    ) -> (Vec<String>, Vec<f32>, Vec<serde_json::Value>, f32) {
+        let (mut slots, mut scratch, mut inputs) = (Vec::new(), Vec::new(), Vec::new());
+        let total = core.eval(
+            &core.views(unified_targets(batch)),
+            &mut slots,
+            &mut scratch,
+            Some(&mut inputs),
+        );
+        assert_eq!(inputs.len(), core.n_slots, "one input per slot");
+        (
+            core.manifest.slots.iter().map(|s| s.name.clone()).collect(),
+            slots.iter().map(|m| m.m.time_ms).collect(),
+            inputs
+                .iter()
+                .map(|i| serde_json::to_value(i).unwrap())
+                .collect(),
+            total.m.time_ms,
+        )
+    }
+
+    fn slot<'a, T>(names: &[String], values: &'a [T], suffix: &str) -> &'a T {
+        let i = names
+            .iter()
+            .position(|n| n.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no slot ending in {suffix}"));
+        &values[i]
+    }
+
+    /// A row probe that costs 1 ms per call and records its row count.
+    struct FakeRows;
+    impl ShapeProbe<u32> for FakeRows {
+        fn kind(&self) -> &'static str {
+            "fake"
+        }
+        fn config(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+        fn eval_at(&self, _: u32) -> LeafMetrics {
+            let mut m = LeafMetrics::ZERO;
+            m.m.time_ms = 1.0;
+            m
+        }
+        fn input_at(&self, num_tokens: u32) -> SlotInput {
+            SlotInput::from(crate::timing::kernels::HcMixKernelInput { num_tokens })
+        }
+    }
+
+    /// A probe that costs 1 ms per call.
     struct Fake;
     impl<X: Copy + Send + Sync + serde::Serialize> ShapeProbe<X> for Fake {
         fn kind(&self) -> &'static str {
@@ -3495,7 +4130,7 @@ mod tests {
             }
         }
         let mut c = built(core.parallel.clone());
-        let rows: Rows = Arc::new(Fake);
+        let rows: Rows = Arc::new(FakeRows);
         let pair: Pair = Arc::new(Fake);
         let comm: Comm = Arc::new(Fake);
         for leaf in &mut c.leaves {
@@ -3509,32 +4144,30 @@ mod tests {
                 | LeafEval::ConvDecode { k, .. }
                 | LeafEval::ConvChunks { k, .. } => *k = pair.clone(),
                 LeafEval::Comm { k, .. } => *k = comm.clone(),
-                LeafEval::Launch { k } => *k = Arc::new(Regions),
+                LeafEval::Launch { k, .. } => *k = Arc::new(Regions),
             }
         }
         c
     }
 
-    /// Catches a region miscount: a decode step at mixer granularity launches
-    /// embed, 48 layers of (attn HC, mixer regions, mlp HC, MoE block), PLE's
-    /// ids + post + its pending combine, and the three epilogue regions.
+    /// Catches a region miscount against the engine (`engine/README.md`
+    /// "Region granularity", plus the head gather region): layer 63, block 14,
+    /// mixer 112 per target forward; the MTP pass is 4 regions at layer and 2
+    /// at block.
     #[test]
-    fn decode_step_launches_the_engines_regions() {
-        let core = built(parallel(1, 8, 8));
-        // 1 embed + layer 0 (4) + layer 1 with PLE (7) + 34 GDN (4 each)
-        // + 12 QSA (5 each: mixer2 is two regions) + 3 epilogue.
-        let expected = 1 + 4 + 7 + 34 * 4 + 12 * 5 + 3;
-        assert_eq!(
-            launched_regions(&core, vec![decode_group(4, 4096)]),
-            serde_json::json!({ "num_regions": expected })
-        );
-        let mut p = parallel(1, 8, 8);
-        p.region_granularity = RegionGranularity::Layer;
-        // One region per mixer call per layer, plus embed and three epilogue.
-        assert_eq!(
-            launched_regions(&built(p), vec![decode_group(4, 4096)]),
-            serde_json::json!({ "num_regions": 1 + 48 + 3 })
-        );
+    fn forwards_launch_the_engines_regions() {
+        let regions = |gran: RegionGranularity, k: u32| -> Vec<u32> {
+            let mut p = parallel(4, 8, 32);
+            p.region_granularity = gran;
+            p.draft_tokens = k;
+            built(p).forwards.iter().map(|f| f.regions).collect()
+        };
+        // [decode, decode mtp, prefill, prefill mtp]
+        assert_eq!(regions(RegionGranularity::Layer, 1), [63, 4, 63, 4]);
+        assert_eq!(regions(RegionGranularity::Block, 1), [14, 2, 14, 2]);
+        assert_eq!(regions(RegionGranularity::Mixer, 0), [112, 112]);
+        // k = 2 adds one draft pass per side, each its own forward.
+        assert_eq!(regions(RegionGranularity::Layer, 2), [63, 4, 4, 63, 4, 4]);
     }
 
     /// Catches a granularity that keeps fused leaves (or the reverse).
@@ -3669,9 +4302,11 @@ mod tests {
         };
         let mut p = parallel(4, 8, 32);
         p.tp_collective = TpCollective::ReduceScatterAllGather;
+        // Both forms: sequence parallelism applies only to a forward whose
+        // rows split over the TP group (`sequence_parallelism_needs_rows_that_split`).
         let names = kinds(p);
         assert!(names.iter().any(|n| n.ends_with("gdn.reduce_scatter")));
-        assert!(!names.iter().any(|n| n.ends_with("gdn.all_reduce")));
+        assert!(names.iter().any(|n| n.ends_with("gdn.all_reduce")));
         let mut p = parallel(4, 8, 32);
         p.moe_dispatch = MoeDispatch::AllToAll;
         let names = kinds(p);
@@ -3718,7 +4353,7 @@ mod tests {
     /// (`model/work/location_maps/qwen4_exp_neuron_bf16_unified.json`) misses:
     /// the analyzer attributes R6 per location only on an exact cover.
     #[test]
-    fn necessary_work_map_covers_the_default_layout() {
+    fn necessary_work_map_covers_the_fused_mixer_layout() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("model/work/location_maps/qwen4_exp_neuron_bf16_unified.json");
         let map: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -3733,15 +4368,19 @@ mod tests {
             .map(|row| row["location"].as_str().unwrap().to_string())
             .collect();
         let comm = ["all_reduce", "all_gather", "reduce_scatter", "all_to_all"];
+        // The map covers the one-forward step (`step_forwards: fused`); the
+        // engine's separate forwards split each semantic row's tokens over two
+        // locations, which a static map cannot attribute.
         for attn_dp in [1, 4] {
-            let locations: std::collections::BTreeSet<String> =
-                built(parallel(attn_dp, 8, 8 * attn_dp))
-                    .manifest
-                    .slots
-                    .into_iter()
-                    .filter(|slot| !comm.contains(&slot.kind.as_str()))
-                    .map(|slot| slot.name)
-                    .collect();
+            let mut p = parallel(attn_dp, 8, 8 * attn_dp);
+            p.step_forwards = StepForwards::Fused;
+            let locations: std::collections::BTreeSet<String> = built(p)
+                .manifest
+                .slots
+                .into_iter()
+                .filter(|slot| !comm.contains(&slot.kind.as_str()))
+                .map(|slot| slot.name)
+                .collect();
             assert_eq!(mapped, locations, "attn_dp {attn_dp}");
         }
     }
@@ -3767,52 +4406,190 @@ mod tests {
         assert_eq!(groups.iter().map(|g| g.requests).sum::<u32>(), 8);
     }
 
-    /// Catches the calibrated launch model not flooring a region by its launch
-    /// or not adding the per-step constant: with every fake region at 1 ms
-    /// device and f_g = 0.5, a region costs max(0.5, L_r).
-    #[test]
-    fn calibrated_launch_floors_each_region_and_adds_the_step_constant() {
-        let mut p = parallel(1, 8, 8);
-        p.launch_model = LaunchModel::Calibrated;
-        p.region_device_factor = 0.5;
-        p.launch_coll_ms = 2.0;
-        p.launch_plain_ms = 0.1;
-        p.step_overhead_ms = 4.0;
-        let core = built_like(&built(p));
-        let views = iter_views(
-            &UnifiedArchInput {
-                groups: vec![decode_group(4, 4096)],
-                tokens_per_source_rank: Vec::new(),
-            },
-            1,
-        );
-        let (mut slots, mut scratch) = (Vec::new(), Vec::new());
-        core.eval(&views, &mut slots, &mut scratch, None);
-        for (plan, slot) in core.leaves.iter().zip(&slots) {
-            if matches!(plan.eval, LeafEval::Launch { .. }) {
-                assert_eq!(slot.m.time_ms, 4.0);
-            } else if plan.compute && plan.regions_per_call > 0 && slot.m.time_ms > 0.0 {
-                let floor = plan.regions_per_call as f32 * if plan.coll { 2.0 } else { 0.1 };
-                assert!(
-                    slot.m.time_ms >= floor.max(0.5) - 1e-6,
-                    "{}",
-                    slot.m.time_ms
-                );
-            }
+    fn prefill_group(chunks: Vec<(u32, u32)>) -> ArchGroupInput {
+        let tokens = chunks.iter().map(|c| c.1).sum();
+        ArchGroupInput {
+            batch_tokens: tokens,
+            prefill_tokens: tokens,
+            prefill_chunk_pairs: chunks,
+            ..Default::default()
         }
-        // The decode mixer and the MoE block trace collectives, the HC modules do not.
-        let names = &core.manifest.slots;
-        let coll = |suffix: &str| {
-            core.leaves
-                .iter()
-                .zip(names)
-                .find(|(_, s)| s.name.ends_with(suffix))
-                .map(|(l, _)| l.coll)
-                .unwrap()
-        };
-        assert!(coll("gdn.gdn.decode_mixer") && coll("gdn.moe.block"));
-        assert!(!coll("gdn.attn_hc"));
     }
+
+    /// Catches the pipelined launch model mispricing a forward: with every
+    /// fake leaf at 1 ms, a host cost per region far above the device makes
+    /// the decode forward host-bound (regions x region_host_ms + the forward
+    /// constant), and one far below leaves the leaves' sum + the constant.
+    #[test]
+    fn pipelined_launch_prices_a_forward_as_max_of_device_and_host() {
+        let mut p = parallel(4, 8, 32);
+        p.region_granularity = RegionGranularity::Layer;
+        let batch = unified(vec![decode_group(4, 4096); 4]);
+        p.region_host_ms = 100.0;
+        let core = built_like(&built(p.clone()));
+        let (_, _, _, total) = eval_unified(&core, &batch);
+        let host = 63.0 * 100.0 + 12.0 + 1.0;
+        assert!((total - host).abs() < 1e-2, "{total} vs {host}");
+        // The host's 63 x 0.001 + 12 ms hides under the device.
+        p.region_host_ms = 1e-3;
+        let core = built_like(&built(p));
+        let (names, times, _, total) = eval_unified(&core, &batch);
+        assert_eq!(*slot(&names, &times, "decode.launch"), 0.0);
+        assert_eq!(
+            *slot(&names, &times, "prefill.launch"),
+            0.0,
+            "no prefill forward"
+        );
+        assert_eq!(*slot(&names, &times, ".step"), 1.0);
+        assert!(total > 1.0 + 48.0, "{total}");
+    }
+
+    /// Catches a forward's launch leaf mispricing the regions shorter than
+    /// their host dispatch (floored), or the host work exceeding the device.
+    #[test]
+    fn regions_are_floored_at_their_dispatch() {
+        let mut p = parallel(4, 8, 32);
+        p.region_granularity = RegionGranularity::Layer;
+        p.region_host_ms = 0.1;
+        let core = built_like(&built(p));
+        // 10 instances at 0.05 ms floor to 0.1 ms each; a 20 ms region does
+        // not; the host (63 x 0.1 + 12 ms) stays under the device.
+        let region = |device: f32, instances: u32| RegionSum {
+            per_group: vec![device * instances as f32, 0.0, 0.0, 0.0],
+            shared: 0.0,
+            instances,
+            coll: false,
+        };
+        let regions = [(0, region(0.05, 10)), (1, region(20.0, 1))]
+            .into_iter()
+            .collect();
+        let k = core.k_launch();
+        let launch = core.forward_launch(0, true, &regions, &k);
+        assert!((launch - 0.5).abs() < 1e-4, "{launch}");
+        assert_eq!(core.forward_launch(0, false, &regions, &k), 0.0);
+        // A 1 ms region: the host's 63 x 0.1 + 12 = 18.3 ms sets the forward.
+        let regions = [(0, region(1.0, 1))].into_iter().collect();
+        let launch = core.forward_launch(0, true, &regions, &k);
+        assert!((launch - 17.3).abs() < 1e-4, "{launch}");
+    }
+
+    /// Catches an idle DP group running free under SPMD, or an engine-padded
+    /// shape leaking into `spmd_padding: false`.
+    #[test]
+    fn idle_groups_pay_the_padded_shape_under_spmd() {
+        let p = parallel(4, 8, 32);
+        let batch = vec![
+            prefill_group(vec![(0, 1500)]),
+            prefill_group(vec![(2000, 48)]),
+            ArchGroupInput::default(),
+            ArchGroupInput::default(),
+        ];
+        let core = built(p.clone());
+        let views = core.views(unified_targets(&unified(batch.clone())));
+        for g in views.get(View::Prefill) {
+            // The longest chunk's bucket from the furthest prefix: context
+            // bucket of 2000 + 2048.
+            assert_eq!(g.chunks, [(2000, 2048)]);
+        }
+        assert!(views.get(View::Decode).iter().all(GroupStep::is_empty));
+        let mut q = p;
+        q.spmd_padding = false;
+        let core = built(q);
+        let views = core.views(unified_targets(&unified(batch)));
+        let pre = views.get(View::Prefill);
+        assert_eq!(pre[0].chunks, [(0, 2048)]);
+        assert_eq!(pre[1].chunks, [(2000, 128)]);
+        assert!(pre[2].is_empty() && pre[3].is_empty());
+    }
+
+    /// Catches decode and prefill sharing one forward under `separate`: a
+    /// mixed step costs its decode-only and prefill-only steps minus one step
+    /// constant, and the fused forward costs less than that.
+    #[test]
+    fn separate_forwards_add_and_fused_shares_one_forward() {
+        let mut p = parallel(4, 8, 32);
+        p.region_granularity = RegionGranularity::Layer;
+        let core = built_like(&built(p.clone()));
+        let dec = vec![decode_group(4, 4096); 4];
+        let pre = vec![prefill_group(vec![(0, 512)]); 4];
+        let mixed: Vec<ArchGroupInput> = (0..4)
+            .map(|_| ArchGroupInput {
+                batch_tokens: 516,
+                decode_tokens: 4,
+                prefill_tokens: 512,
+                decode_kv_lens: vec![4096; 4],
+                total_kv_len: 4 * 4096,
+                prefill_chunk_pairs: vec![(0, 512)],
+                ..Default::default()
+            })
+            .collect();
+        let t = |b: Vec<ArchGroupInput>| eval_unified(&core, &unified(b)).3;
+        let (d, f, m) = (t(dec), t(pre), t(mixed.clone()));
+        assert!((m - (d + f - 1.0)).abs() < 1e-2, "{m} vs {d} + {f} - 1");
+        p.step_forwards = StepForwards::Fused;
+        let fused = built_like(&built(p));
+        let one = eval_unified(&fused, &unified(mixed)).3;
+        assert!(one < m, "fused {one} vs separate {m}");
+    }
+
+    /// Catches the world all-gather row count: a decode batch that does not
+    /// split over the 8 TP ranks is gathered from every rank (flashnext
+    /// `world_gather_rows` "dup"), one that does is sliced.
+    #[test]
+    fn moe_gathers_whole_group_batches_that_do_not_split() {
+        let core = built_like(&built(parallel(4, 8, 32)));
+        let rows = |b: usize| {
+            let (names, _, inputs, _) =
+                eval_unified(&core, &unified(vec![decode_group(b, 4096); 4]));
+            slot(&names, &inputs, "decode.gdn.moe.block")["num_tokens"].clone()
+        };
+        assert_eq!(rows(1), 32, "1 row x 32 ranks");
+        assert_eq!(rows(8), 32, "8 rows x 4 groups");
+        assert_eq!(rows(16), 64);
+    }
+
+    /// Catches sequence parallelism applied to a forward whose rows do not
+    /// split over the TP group (the engine falls back to all-reduce there).
+    #[test]
+    fn sequence_parallelism_needs_rows_that_split() {
+        let mut p = parallel(4, 8, 32);
+        p.tp_collective = TpCollective::ReduceScatterAllGather;
+        let core = built_like(&built(p));
+        for (b, sp) in [(4usize, false), (16, true)] {
+            let (names, times, _, _) =
+                eval_unified(&core, &unified(vec![decode_group(b, 4096); 4]));
+            let rs = *slot(&names, &times, "decode.gdn.gdn.reduce_scatter");
+            let ar = *slot(&names, &times, "decode.gdn.gdn.all_reduce");
+            assert_eq!((rs > 0.0, ar > 0.0), (sp, !sp), "B={b}");
+        }
+    }
+
+    /// Catches the all-to-all experts seeing fewer rows than the engine's
+    /// exact capacity (every rank receives S rows from each of 32 ranks, the
+    /// all-gather's 4N), or the capacity factor not cutting them.
+    #[test]
+    fn all_to_all_exact_capacity_matches_all_gather_rows() {
+        let mut p = parallel(4, 8, 32);
+        p.moe_dispatch = MoeDispatch::AllToAll;
+        let core = built_like(&built(p.clone()));
+        let rows = |core: &NeuronFlashNextCore| {
+            let (names, _, inputs, _) =
+                eval_unified(core, &unified(vec![prefill_group(vec![(0, 512)]); 4]));
+            (
+                slot(&names, &inputs, "prefill.gdn.moe.routed_experts")["num_tokens"].clone(),
+                slot(&names, &inputs, "prefill.gdn.moe.router")["num_tokens"].clone(),
+            )
+        };
+        assert_eq!(
+            rows(&core),
+            (serde_json::json!(4 * 512), serde_json::json!(64))
+        );
+        p.moe_a2a_capacity_factor = 1.0;
+        let core = built_like(&built(p));
+        // cap = ceil(1.0 x 64 x 10 / 32) = 20 rows from each of 32 ranks.
+        assert_eq!(rows(&core).0, 32 * 20);
+    }
+
     #[test]
     fn kind_time_scale_parses_and_rejects_bad_entries() {
         assert_eq!(
@@ -3845,13 +4622,7 @@ mod tests {
         scaled.kind_time_scale = vec![KindTimeScale::parse("moe_block@256=0.25").unwrap()];
         let eval = |p: &NeuronFlashNextParallel, group: ArchGroupInput| {
             let core = built_like(&built(p.clone()));
-            let views = iter_views(
-                &UnifiedArchInput {
-                    groups: vec![group],
-                    tokens_per_source_rank: Vec::new(),
-                },
-                1,
-            );
+            let views = core.views(unified_targets(&unified(vec![group])));
             let (mut slots, mut scratch) = (Vec::new(), Vec::new());
             core.eval(&views, &mut slots, &mut scratch, None);
             let names: Vec<String> = core.manifest.slots.iter().map(|s| s.name.clone()).collect();

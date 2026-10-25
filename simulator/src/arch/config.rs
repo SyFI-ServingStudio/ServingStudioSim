@@ -33,7 +33,7 @@ use schema_derive::{ParamStruct, ProviderSchema};
 use super::glm52_model_cfg::Glm52MtpMode;
 use super::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use super::qwen4_exp_neuron_bf16::{
-    LaunchModel, MoeDispatch, PleTableShards, RegionGranularity, TpCollective,
+    LaunchModel, MoeDispatch, PleTableShards, RegionGranularity, StepForwards, TpCollective,
 };
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
@@ -145,7 +145,8 @@ const PLE_TABLE_RESIDENCIES: [&str; 2] = PleTableResidency::CHOICES;
 
 // ── Qwen4Exp BF16 on Trainium2 (flashnext-neuron) ───────────────────────────
 
-const NEURON_REGION_GRANULARITIES: [&str; 3] = RegionGranularity::CHOICES;
+const NEURON_REGION_GRANULARITIES: [&str; 4] = RegionGranularity::CHOICES;
+const NEURON_STEP_FORWARDS: [&str; 2] = StepForwards::CHOICES;
 const NEURON_TP_COLLECTIVES: [&str; 2] = TpCollective::CHOICES;
 const NEURON_MOE_DISPATCHES: [&str; 2] = MoeDispatch::CHOICES;
 const NEURON_PLE_TABLE_SHARDS: [&str; 3] = PleTableShards::CHOICES;
@@ -159,16 +160,41 @@ const fn default_one() -> u32 {
 const fn default_neuron_attn_tp() -> u32 {
     8
 }
+/// NRT dispatch of a NEFF with the execution barrier off, collective or not
+/// (flashnext `logs/engine/probe_groups_nobarrier.jsonl`).
 const fn default_neuron_launch_coll_ms() -> f64 {
-    1.25
+    0.15
 }
 const fn default_neuron_launch_plain_ms() -> f64 {
-    0.075
+    0.15
 }
+/// Host time per engine step outside its forwards (scheduling, emission):
+/// step wall minus the forwards' walls in `logs/engine/serve_*.jsonl`.
 const fn default_neuron_step_overhead_ms() -> f64 {
-    4.0
+    STEP_OVERHEAD_MS
 }
-const NEURON_LAUNCH_MODELS: [&str; 2] = LaunchModel::CHOICES;
+const fn default_neuron_forward_overhead_ms() -> f64 {
+    FORWARD_OVERHEAD_MS
+}
+const fn default_neuron_mtp_forward_overhead_ms() -> f64 {
+    MTP_FORWARD_OVERHEAD_MS
+}
+/// Fitted on the full engine's serving steps (doc/pr/trn2-flashnext/ALIGNMENT.md).
+const STEP_OVERHEAD_MS: f64 = 2.5;
+const FORWARD_OVERHEAD_MS: f64 = 19.0;
+const MTP_FORWARD_OVERHEAD_MS: f64 = 2.0;
+const fn default_neuron_region_gap_ms() -> f64 {
+    REGION_GAP_MS
+}
+const REGION_GAP_MS: f64 = 0.17;
+const fn default_neuron_a2a_pack_us_per_row() -> f64 {
+    A2A_PACK_US_PER_ROW
+}
+const A2A_PACK_US_PER_ROW: f64 = 0.8;
+const fn default_true() -> bool {
+    true
+}
+const NEURON_LAUNCH_MODELS: [&str; 3] = LaunchModel::CHOICES;
 /// One Trainium2 LNC2 core's HBM bank: 96 GiB per chip / 4 cores.
 const fn default_neuron_hbm_per_core_gb() -> f64 {
     25.769_803_776
@@ -255,27 +281,70 @@ pub struct NeuronFlashNextSpec {
     #[serde(default)]
     #[param(string, default = "mixer", choices = NEURON_REGION_GRANULARITIES, cache_key)]
     pub region_granularity: RegionGranularity,
-    /// Device factor f_g on every compute leaf; omitted = the engine-slice
-    /// fit for the granularity (per_op 1.10, mixer 0.94, layer 0.88).
+    /// How a step runs decode rows and prefill chunks: separate (the engine:
+    /// a decode forward, then a prefill forward) or fused (one forward).
+    #[serde(default)]
+    #[param(string, default = "separate", choices = NEURON_STEP_FORWARDS, cache_key)]
+    pub step_forwards: StepForwards,
+    /// Every DP group runs the forward's padded shape (SPMD), idle groups
+    /// included. false = each group pays only its own shape.
+    #[serde(default = "default_true")]
+    #[param(default = true, cache_key)]
+    pub spmd_padding: bool,
+    /// Device factor f_g on every compute leaf; omitted = the full-engine fit
+    /// (1.0 at every granularity).
     #[serde(default)]
     pub region_device_factor: Option<f64>,
-    /// Host launch: calibrated (per region max(f_g x device, L_r) + a per-step
-    /// constant) or l1_additive (the measured region_launch_overhead row).
+    /// Host launch: pipelined (the barrier-off engine: max(device, host) per
+    /// forward + a forward constant), calibrated (per region max(f_g x
+    /// device, L_r)) or l1_additive (the region_launch_overhead row).
     #[serde(default)]
-    #[param(string, default = "calibrated", choices = NEURON_LAUNCH_MODELS)]
+    #[param(string, default = "pipelined", choices = NEURON_LAUNCH_MODELS)]
     pub launch_model: LaunchModel,
-    /// Launch floor of a region that traces a collective (ms; loaded-host fit).
+    /// Calibrated only: launch floor of a region that traces a collective (ms).
     #[serde(default = "default_neuron_launch_coll_ms")]
-    #[param(default = 1.25)]
+    #[param(default = 0.15)]
     pub launch_coll_ms: f64,
-    /// Launch floor of a plain region (ms).
+    /// Calibrated only: launch floor of a plain region (ms).
     #[serde(default = "default_neuron_launch_plain_ms")]
-    #[param(default = 0.075)]
+    #[param(default = 0.15)]
     pub launch_plain_ms: f64,
-    /// Per-step host constant: input H2D, next-id readback, collective skew (ms).
+    /// Pipelined: host dispatch per region, also the device floor of a region
+    /// holding a collective across DP groups; omitted = the granularity's
+    /// fit (per_op 0.3, mixer 1.0, layer 1.3, block 3.7 ms).
+    #[serde(default)]
+    pub region_host_ms: Option<f64>,
+    /// Pipelined: device time per region launch outside the regions' own
+    /// executions (step device minus the region sum in
+    /// `logs/engine/full_decode_bench.jsonl`: ~11 ms over 63 layer regions).
+    #[serde(default = "default_neuron_region_gap_ms")]
+    #[param(default = 0.17)]
+    pub region_gap_ms: f64,
+    /// Pipelined: host work per target forward besides region dispatch
+    /// (input assembly, H2D, id readback); it overlaps the device (ms).
+    #[serde(default = "default_neuron_forward_overhead_ms")]
+    #[param(default = 19.0)]
+    pub forward_overhead_ms: f64,
+    /// Pipelined: the same per MTP forward (ms).
+    #[serde(default = "default_neuron_mtp_forward_overhead_ms")]
+    #[param(default = 2.0)]
+    pub mtp_forward_overhead_ms: f64,
+    /// Per-step host constant outside the forwards (scheduling, emission; ms).
     #[serde(default = "default_neuron_step_overhead_ms")]
-    #[param(default = 4.0)]
+    #[param(default = 2.5)]
     pub step_overhead_ms: f64,
+    /// All-to-all dispatch capacity factor: each rank sends each destination
+    /// min(S, ceil(cf x S x top_k / ranks)) rows (tokens beyond it are
+    /// dropped). 0 = exact capacity S (the engine default; no drops).
+    #[serde(default)]
+    #[param(default = 0.0, cache_key)]
+    pub moe_a2a_capacity_factor: f64,
+    /// All-to-all: the engine's slot packing and scatter-add per received
+    /// row, on each all-to-all leaf (µs; fitted on the engine's W64 a2a run,
+    /// not an L1 row).
+    #[serde(default = "default_neuron_a2a_pack_us_per_row")]
+    #[param(default = 0.8)]
+    pub moe_a2a_pack_us_per_row: f64,
     /// Compiled prefill chunk sizes; a chunk pads to the next one.
     #[serde(default = "default_neuron_prefill_buckets")]
     pub prefill_buckets: Vec<u32>,
