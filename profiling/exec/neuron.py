@@ -387,7 +387,7 @@ def _neuron_container_worker_command(
         raise FileNotFoundError(f"the reserved chip's /dev/neuron{device.device_id} is missing")
     for path in writable:
         path.mkdir(parents=True, exist_ok=True)
-    for directory in ("home", "tmp", "artifacts"):
+    for directory in ("home", "tmp", "artifacts", "nki-cache"):
         (cache / directory).mkdir(exist_ok=True)
     policy.update(_reservation_environment(device, logical_cores))
     policy.update(
@@ -410,6 +410,11 @@ def _neuron_container_worker_command(
             ),
             CACHE_DIR_ENV: str(cache),
             "NEURON_COMPILE_CACHE_URL": str(cache / "compile"),
+            # libtorch_neuronx_lite caches each NKI compile under HOME, and the
+            # record names the kernel binary in NKI's own BIR cache. Its default,
+            # /var/tmp, dies with the container, so a later worker would hit the
+            # record without the binary (NCC_EVRF059): keep both persistent.
+            "NKI_COMPILE_CACHE_URL": str(cache / "nki-cache"),
             "XDG_CACHE_HOME": str(cache / "cache"),
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",

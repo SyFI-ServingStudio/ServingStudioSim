@@ -311,6 +311,8 @@ def test_concurrent_workers_get_their_own_nki_artifacts_dir(container_setup):
     assert dirs[0] != dirs[1]
     cache = Path(worker_environment(command)[neuron.CACHE_DIR_ENV])
     assert all(Path(d).parent == cache / "artifacts" for d in dirs)
+    # The NKI binary cache outlives the container, like the HOME record naming it.
+    assert worker_environment(command)["NKI_COMPILE_CACHE_URL"] == str(cache / "nki-cache")
 
 
 def test_neuron_argv_and_mounts_preserve_identity_and_image_abi(container_setup, monkeypatch):
