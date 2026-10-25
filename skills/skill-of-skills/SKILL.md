@@ -112,6 +112,7 @@ top-compose-real-framework-from-sim - actively build a real serving framework fr
 operate-run-simulation - run deployment simulations from presets (DES, workload trace)
 operate-run-timing-predict - offline per-building-block cost prediction (no DES; iter=PD, attn+ffn=AFD)
 operate-search-trn2-configs - simulator-only config search (Pareto, sensitivity, headroom, what-ifs) for Qwen3.8-Flash-Next BF16 on trn2.48xlarge
+operate-tune-trn2-with-engine - propose / predict / run / compare loop between the trn2 config search and the real flashnext-neuron engine (blind predictions, re-align guard)
 operate-use-analyzer - select, read, interpret, and cite Analyzer-owned simulation, prediction, profile, and measurement results
 operate-run-alignment - produce one shared ServingStudioSim↔framework comparison for vLLM or SGLang; Align ServingStudioSim to framework through top-align-with-framework, or Align framework to ServingStudioSim through top-compose-real-framework-from-sim
 operate-align-moe-kernel - diagnose one existing fused MoE kernel with exact-input, iteration-popularity, and full-run comparisons
