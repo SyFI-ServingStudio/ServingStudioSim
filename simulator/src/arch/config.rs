@@ -191,6 +191,9 @@ const fn default_neuron_a2a_pack_us_per_row() -> f64 {
     A2A_PACK_US_PER_ROW
 }
 const A2A_PACK_US_PER_ROW: f64 = 0.8;
+const fn default_neuron_host_time_scale() -> f64 {
+    1.0
+}
 const fn default_true() -> bool {
     true
 }
@@ -208,8 +211,10 @@ fn default_neuron_prefill_buckets() -> Vec<u32> {
 fn default_neuron_decode_buckets() -> Vec<u32> {
     vec![1, 2, 4, 8, 16, 32, 64, 128, 256]
 }
+/// The engine compiles a 2048 bucket: a prompt chunk within the indexer's
+/// 2048-token budget runs QSA's dense path (15x cheaper than sparse at 2048).
 fn default_neuron_context_buckets() -> Vec<u32> {
-    vec![4096, 8192, 16384, 32768, 65536, 131072]
+    vec![2048, 4096, 8192, 16384, 32768, 65536, 131072]
 }
 fn strings(xs: &[&str]) -> Vec<String> {
     xs.iter().map(|x| x.to_string()).collect()
@@ -333,6 +338,12 @@ pub struct NeuronFlashNextSpec {
     #[serde(default = "default_neuron_step_overhead_ms")]
     #[param(default = 2.5)]
     pub step_overhead_ms: f64,
+    /// What-if only: multiplies every host constant (region_host_ms,
+    /// forward_overhead_ms, mtp_forward_overhead_ms, step_overhead_ms; 0.5 =
+    /// a host twice as fast). Default 1.
+    #[serde(default = "default_neuron_host_time_scale")]
+    #[param(default = 1.0)]
+    pub host_time_scale: f64,
     /// All-to-all dispatch capacity factor: each rank sends each destination
     /// min(S, ceil(cf x S x top_k / ranks)) rows (tokens beyond it are
     /// dropped). 0 = exact capacity S (the engine default; no drops).

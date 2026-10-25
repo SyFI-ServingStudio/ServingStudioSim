@@ -53,12 +53,12 @@
 //! Composition (`launch_model = pipelined`, default; flashnext-neuron
 //! `engine/README.md` with the NRT execution barrier off): every compute leaf
 //! is its L1 row times f_g (1.0). A forward costs `max(sum over regions of
-//! max(device_r, region_host_ms) + regions x region_gap_ms, regions x
-//! region_host_ms + forward_overhead_ms)`: the host dispatches each region in
+//! max(device_r + region_gap_ms, region_host_ms), regions x region_host_ms +
+//! forward_overhead_ms)`: the host dispatches each region in
 //! `region_host_ms` and does its per-forward work (`forward_overhead_ms`;
-//! `mtp_forward_overhead_ms` for an MTP pass) while the device runs; a region
-//! shorter than its dispatch waits for the next launch, and each launch costs
-//! the device `region_gap_ms` outside the regions. The step adds
+//! `mtp_forward_overhead_ms` for an MTP pass) while the device runs; each
+//! launch costs the device `region_gap_ms` outside the region, and a region
+//! shorter than its dispatch waits for the next launch. The step adds
 //! `step_overhead_ms`. Each forward's launch leaf holds everything beyond the
 //! sum of its leaves. `calibrated` (per region `max(device, L_r)`) and
 //! `l1_additive` (the `region_launch_overhead` row per forward) remain.
@@ -3597,10 +3597,13 @@ impl NeuronFlashNextCore {
                     per_group: vec![0.0; dp],
                     ..Default::default()
                 });
-            // A region may take one leaf from outside its layers' Scale (the
-            // last layer's combine): sums are per step, instances the most.
+            // A region may take a leaf from outside its layers' Scale (the
+            // next layer group's leading combine): sums are per step, and the
+            // instances are those of the leaf that opened the region.
             let instances = plan.fold / self.forwards[plan.forward].fold.max(1);
-            r.instances = r.instances.max(instances);
+            if r.instances == 0 {
+                r.instances = instances;
+            }
             r.coll |= !compute && active;
             let total = instances as f32 * out.m.m.time_ms;
             match plan.group {
@@ -3660,21 +3663,23 @@ impl NeuronFlashNextCore {
             LaunchModel::Pipelined => {
                 let h = par.region_host_ms;
                 let (mut device, mut floored) = (0f32, 0f32);
+                let gap = par.region_gap_ms;
                 for r in regions.values() {
                     let n = r.instances as f32;
                     let dev = r.device();
                     device += n * dev;
-                    // A region shorter than its dispatch leaves the device
+                    // Each launch costs the device `gap` outside the region;
+                    // a region shorter than its dispatch leaves the device
                     // waiting for the next launch (idle, or inside a
                     // cross-group collective for the slowest rank's launch).
-                    floored += n * dev.max(h);
+                    floored += n * (dev + gap).max(h);
                 }
                 if par.region_granularity == RegionGranularity::Block {
                     // Block regions span layers of differently folded groups:
                     // floor the forward's regions as equal shares of it.
-                    floored = device.max(fw.regions as f32 * h);
+                    let n = fw.regions as f32;
+                    floored = (device + n * gap).max(n * h);
                 }
-                floored += fw.regions as f32 * par.region_gap_ms;
                 // The forward's host work (dispatch + its per-forward input
                 // assembly, H2D and readback) overlaps the device; whichever
                 // is longer sets the forward.
@@ -4430,6 +4435,15 @@ mod tests {
         let (_, _, _, total) = eval_unified(&core, &batch);
         let host = 63.0 * 100.0 + 12.0 + 1.0;
         assert!((total - host).abs() < 1e-2, "{total} vs {host}");
+        // At mixer granularity the floored regions must count each region
+        // once: a region that takes the next layer group's leading combine
+        // keeps its own instances (112 regions, not 112 + 33).
+        let mut m = p.clone();
+        m.region_granularity = RegionGranularity::Mixer;
+        let core = built_like(&built(m));
+        let (_, _, _, total) = eval_unified(&core, &batch);
+        let host = 112.0 * 100.0 + 12.0 + 1.0;
+        assert!((total - host).abs() < 1e-1, "{total} vs {host}");
         // The host's 63 x 0.001 + 12 ms hides under the device.
         p.region_host_ms = 1e-3;
         let core = built_like(&built(p));

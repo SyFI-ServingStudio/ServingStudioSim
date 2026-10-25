@@ -1685,6 +1685,11 @@ fn neuron_flash_next_parallel(
     let gdn_tp = spec.gdn_tp.unwrap_or(spec.attn_tp);
     let ranks = spec.attn_dp * spec.attn_tp.max(gdn_tp);
     let _ = model;
+    ensure!(
+        spec.host_time_scale > 0.0 && spec.host_time_scale.is_finite(),
+        "host_time_scale must be positive"
+    );
+    let host = spec.host_time_scale as f32;
     let kind_time_scale = spec
         .kind_time_scale
         .iter()
@@ -1713,13 +1718,14 @@ fn neuron_flash_next_parallel(
         launch_model: spec.launch_model,
         launch_coll_ms: spec.launch_coll_ms as f32,
         launch_plain_ms: spec.launch_plain_ms as f32,
-        region_host_ms: spec
-            .region_host_ms
-            .map_or(spec.region_granularity.region_host_ms(), |x| x as f32),
+        region_host_ms: host
+            * spec
+                .region_host_ms
+                .map_or(spec.region_granularity.region_host_ms(), |x| x as f32),
         region_gap_ms: spec.region_gap_ms as f32,
-        forward_overhead_ms: spec.forward_overhead_ms as f32,
-        mtp_forward_overhead_ms: spec.mtp_forward_overhead_ms as f32,
-        step_overhead_ms: spec.step_overhead_ms as f32,
+        forward_overhead_ms: host * spec.forward_overhead_ms as f32,
+        mtp_forward_overhead_ms: host * spec.mtp_forward_overhead_ms as f32,
+        step_overhead_ms: host * spec.step_overhead_ms as f32,
         moe_a2a_capacity_factor: spec.moe_a2a_capacity_factor as f32,
         moe_a2a_pack_us_per_row: spec.moe_a2a_pack_us_per_row as f32,
         prefill_buckets: spec.prefill_buckets.clone(),
