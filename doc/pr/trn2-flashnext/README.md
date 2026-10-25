@@ -109,6 +109,7 @@ The cost structure is the doc comment of `qwen4_exp_neuron_bf16.rs`. In outline:
 | `moe_dispatch` | all_gather, all_to_all | fused block over all tokens, or A2A dispatch/combine with routed experts at T_all/ep equivalent tokens and the shared expert local |
 | `ple_table_shards` | replica, dp_group, host | row-sharded over all ranks or one group's ranks. host is refused: a compiled region cannot read host memory |
 | `hbm_per_core_gb`, `hbm_reserve_gb` | 25.77, 2.0 | the HBM check and the runtime reserve |
+| `kind_time_scale` | list of `kind=factor` or `kind@min_rows=factor` (none) | what-if only: multiplies the device time of every compute leaf of that L1 kind, at calls of at least `min_rows` rows, before f_g and the launch floor. `moe_block@256=0.333` is "MoE prefill 3x faster". Collectives and the launch leaf are never scaled |
 | deployment `pd` | | separate prefill and decode instances, each with its own layout and core set; the KV handoff is a 2-rank `neuron_c1` all-gather |
 
 ## Running it

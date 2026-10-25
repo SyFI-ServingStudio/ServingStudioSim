@@ -47,6 +47,13 @@
 //! region count instead. The wall constants were fitted on a loaded host and
 //! are parameters.
 //!
+//! What-if scaling (`kind_time_scale`): entries `kind=factor` or
+//! `kind@min_rows=factor` multiply the device time of every compute leaf of
+//! that L1 kind (at calls of at least `min_rows` rows: tokens, chunk tokens or
+//! decode rows) before f_g and the launch floor. Default none. It is for
+//! sensitivity studies ("MoE prefill 3x faster" = `moe_block@256=0.333`), not
+//! calibration; collectives and the launch leaf are never scaled.
+//!
 //! Not modeled: the host scheduler and sampling bookkeeping, KV block-table
 //! upload, the vision tower.
 
@@ -170,6 +177,52 @@ impl PleTableShards {
     pub const CHOICES: [&'static str; 3] = ["replica", "dp_group", "host"];
 }
 
+/// One what-if time scale: compute leaves of L1 `kind` at calls of at least
+/// `min_rows` rows run `factor` times their measured device time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KindTimeScale {
+    pub kind: String,
+    pub min_rows: u32,
+    pub factor: f32,
+}
+
+impl KindTimeScale {
+    /// Parse `kind=factor` or `kind@min_rows=factor`.
+    pub fn parse(entry: &str) -> Result<Self> {
+        let Some((lhs, factor)) = entry.split_once('=') else {
+            bail!("kind_time_scale entry {entry:?} is not `kind=factor` or `kind@min_rows=factor`");
+        };
+        let (kind, min_rows) = match lhs.split_once('@') {
+            Some((kind, rows)) => (
+                kind,
+                rows.trim().parse::<u32>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "kind_time_scale entry {entry:?}: min_rows {rows:?} is not an integer"
+                    )
+                })?,
+            ),
+            None => (lhs, 0),
+        };
+        let factor: f32 = factor.trim().parse().map_err(|_| {
+            anyhow::anyhow!("kind_time_scale entry {entry:?}: factor {factor:?} is not a number")
+        })?;
+        let kind = kind.trim();
+        ensure!(
+            !kind.is_empty(),
+            "kind_time_scale entry {entry:?} names no kind"
+        );
+        ensure!(
+            factor.is_finite() && factor > 0.0,
+            "kind_time_scale entry {entry:?}: factor must be positive"
+        );
+        Ok(Self {
+            kind: kind.to_string(),
+            min_rows,
+            factor,
+        })
+    }
+}
+
 /// Per-op implementation choice: the op module `IMPLS` keys each role may
 /// use. More than one key lets the kernel pick the fastest measured row per
 /// shape (best-of-N), as an engine that picks its implementation per bucket
@@ -241,6 +294,8 @@ pub struct NeuronFlashNextParallel {
     /// Per-core runtime and activation scratch kept out of the KV budget (GB).
     pub hbm_reserve_gb: f64,
     pub impls: NeuronFlashNextImpls,
+    /// What-if device-time scales per L1 kind (empty = as measured).
+    pub kind_time_scale: Vec<KindTimeScale>,
 }
 
 impl NeuronFlashNextParallel {
@@ -526,6 +581,19 @@ struct LeafPlan {
     compute: bool,
     /// The leaf's region traces a collective (launch `launch_coll_ms`).
     coll: bool,
+    /// What-if `(min_rows, factor)` scales of this leaf's kind.
+    scales: Vec<(u32, f32)>,
+}
+
+impl LeafPlan {
+    /// The what-if scale of one call of `rows` rows.
+    fn scale_at(&self, rows: u32) -> f32 {
+        self.scales
+            .iter()
+            .filter(|(min_rows, _)| rows >= *min_rows)
+            .map(|(_, f)| f)
+            .product()
+    }
 }
 
 impl LeafEval {
@@ -1603,6 +1671,16 @@ impl PlanBuilder<'_> {
             RegionRole::None => 0,
         };
         let compute = !matches!(eval, LeafEval::Comm { .. } | LeafEval::Launch { .. });
+        let scales = if compute {
+            self.p
+                .kind_time_scale
+                .iter()
+                .filter(|s| s.kind == kind)
+                .map(|s| (s.min_rows, s.factor))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.leaves.push(LeafPlan {
             eval,
             view: self.view,
@@ -1610,6 +1688,7 @@ impl PlanBuilder<'_> {
             fold: self.fold,
             compute,
             coll: false,
+            scales,
         });
         self.b.leaf(
             format!("{}.{}", self.name, join(&self.scope, label)),
@@ -2648,7 +2727,7 @@ fn eval_leaf(
     ep: u32,
     regions: u32,
     record: bool,
-    adj: &dyn Fn(LeafMetrics) -> LeafMetrics,
+    adj: &dyn Fn(LeafMetrics, u32) -> LeafMetrics,
 ) -> LeafOut {
     let groups = views.get(plan.view);
     let mut m = LeafMetrics::ZERO;
@@ -2663,7 +2742,7 @@ fn eval_leaf(
                 let mut rest = rows;
                 while rest > 0 {
                     let n = rest.min(max);
-                    m.add(adj(k.eval_at(n)));
+                    m.add(adj(k.eval_at(n), n));
                     if record && input.is_none() {
                         input = Some(k.input_at(n));
                     }
@@ -2681,7 +2760,7 @@ fn eval_leaf(
                 bucket_calls(g.decode_reqs.div_ceil(*sub), &bk.decode, &mut sizes);
                 for &b in &sizes {
                     let n = if *rows { b * g.query_len } else { b };
-                    m.add(adj(k.eval_at(n)));
+                    m.add(adj(k.eval_at(n), n));
                     calls += 1;
                     if record && input.is_none() {
                         input = Some(k.input_at(n));
@@ -2698,7 +2777,7 @@ fn eval_leaf(
                 sizes.clear();
                 bucket_calls(append, &bk.prefill, &mut sizes);
                 for &c in &sizes {
-                    per.push(adj(k.eval_at(c)));
+                    per.push(adj(k.eval_at(c), c));
                     calls += 1;
                     if record && input.is_none() {
                         input = Some(k.input_at(c));
@@ -2717,7 +2796,7 @@ fn eval_leaf(
                 bucket_calls(g.decode_reqs.div_ceil(*sub), &bk.decode, &mut sizes);
                 for &b in &sizes {
                     let x = (b * g.query_len, ctx);
-                    m.add(adj(k.eval_at(x)));
+                    m.add(adj(k.eval_at(x), x.0));
                     calls += 1;
                     if record && input.is_none() {
                         input = Some(k.input_at(x));
@@ -2736,7 +2815,7 @@ fn eval_leaf(
                 let mut done = prefix;
                 for &c in &sizes {
                     let ctx = bucket(done + c, &bk.context).max(c);
-                    per.push(adj(k.eval_at((c, ctx))));
+                    per.push(adj(k.eval_at((c, ctx)), c));
                     calls += 1;
                     if record && input.is_none() {
                         input = Some(k.input_at((c, ctx)));
@@ -2754,7 +2833,7 @@ fn eval_leaf(
             let tokens = bk.tok(g.tokens());
             let x = (tokens, g.requests.clamp(1, tokens.max(1)));
             if tokens > 0 {
-                m = adj(k.eval_at(x));
+                m = adj(k.eval_at(x), x.0);
                 calls = 1;
             }
             if record {
@@ -2766,7 +2845,7 @@ fn eval_leaf(
             if g.decode_reqs > 0 {
                 bucket_calls(g.decode_reqs, &bk.decode, &mut sizes);
                 for &b in &sizes {
-                    m.add(adj(k.eval_at((b, g.query_len))));
+                    m.add(adj(k.eval_at((b, g.query_len)), b * g.query_len));
                     calls += 1;
                 }
             }
@@ -2779,7 +2858,7 @@ fn eval_leaf(
                 sizes.clear();
                 bucket_calls(append, &bk.prefill, &mut sizes);
                 for &c in &sizes {
-                    m.add(adj(k.eval_at((1, c))));
+                    m.add(adj(k.eval_at((1, c)), c));
                     calls += 1;
                 }
             }
@@ -3050,9 +3129,9 @@ impl NeuronFlashNextCore {
                 0.0
             };
             let compute = plan.compute;
-            let adj = move |mut x: LeafMetrics| {
+            let adj = move |mut x: LeafMetrics, rows: u32| {
                 if compute {
-                    x.m.time_ms = (x.m.time_ms * factor).max(floor);
+                    x.m.time_ms = (x.m.time_ms * plan.scale_at(rows) * factor).max(floor);
                 }
                 x
             };
@@ -3329,6 +3408,7 @@ mod tests {
             hbm_per_core_gb: 25.769_803_776,
             hbm_reserve_gb: 2.0,
             impls: NeuronFlashNextImpls::default(),
+            kind_time_scale: Vec::new(),
         }
     }
 
@@ -3732,5 +3812,71 @@ mod tests {
         };
         assert!(coll("gdn.gdn.decode_mixer") && coll("gdn.moe.block"));
         assert!(!coll("gdn.attn_hc"));
+    }
+    #[test]
+    fn kind_time_scale_parses_and_rejects_bad_entries() {
+        assert_eq!(
+            KindTimeScale::parse("moe_block@256=0.5").unwrap(),
+            KindTimeScale {
+                kind: "moe_block".into(),
+                min_rows: 256,
+                factor: 0.5
+            }
+        );
+        assert_eq!(KindTimeScale::parse("hc_mix=2").unwrap().min_rows, 0);
+        for bad in [
+            "moe_block",
+            "moe_block=0",
+            "moe_block=-1",
+            "=0.5",
+            "moe_block@x=0.5",
+        ] {
+            assert!(KindTimeScale::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Catches the what-if scale leaking onto other kinds or onto calls below
+    /// its row threshold: `moe_block@256=0.25` quarters the MoE block of a
+    /// 2048-token prefill chunk and leaves a 4-request decode batch alone.
+    #[test]
+    fn kind_time_scale_scales_only_its_kind_above_the_threshold() {
+        let base = parallel(1, 8, 8);
+        let mut scaled = base.clone();
+        scaled.kind_time_scale = vec![KindTimeScale::parse("moe_block@256=0.25").unwrap()];
+        let eval = |p: &NeuronFlashNextParallel, group: ArchGroupInput| {
+            let core = built_like(&built(p.clone()));
+            let views = iter_views(
+                &UnifiedArchInput {
+                    groups: vec![group],
+                    tokens_per_source_rank: Vec::new(),
+                },
+                1,
+            );
+            let (mut slots, mut scratch) = (Vec::new(), Vec::new());
+            core.eval(&views, &mut slots, &mut scratch, None);
+            let names: Vec<String> = core.manifest.slots.iter().map(|s| s.name.clone()).collect();
+            (names, slots.iter().map(|m| m.m.time_ms).collect::<Vec<_>>())
+        };
+        let prefill = ArchGroupInput {
+            batch_tokens: 2048,
+            prefill_tokens: 2048,
+            prefill_chunk_pairs: vec![(0, 2048)],
+            ..Default::default()
+        };
+        for (group, moe_ratio) in [(prefill, 0.25f32), (decode_group(4, 4096), 1.0)] {
+            let (names, a) = eval(&base, group.clone());
+            let (_, b) = eval(&scaled, group);
+            let mut moe_seen = false;
+            for ((name, x), y) in names.iter().zip(&a).zip(&b) {
+                let want = if name.ends_with("moe.block") {
+                    moe_seen |= *x > 0.0;
+                    x * moe_ratio
+                } else {
+                    *x
+                };
+                assert!((y - want).abs() < 1e-5, "{name}: {y} vs {want}");
+            }
+            assert!(moe_seen);
+        }
     }
 }

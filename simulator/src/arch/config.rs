@@ -331,6 +331,11 @@ pub struct NeuronFlashNextSpec {
     /// lm_head + argmax impls (torch, nki).
     #[serde(default = "default_neuron_torch_impls")]
     pub head_impls: Vec<String>,
+    /// What-if device-time scales for sensitivity studies: `kind=factor` or
+    /// `kind@min_rows=factor` multiplies every compute leaf of that L1 kind (at
+    /// calls of >= min_rows rows) before f_g and the launch floor. Default none.
+    #[serde(default)]
+    pub kind_time_scale: Vec<String>,
 }
 
 /// The captured GLM-5.3-Flash deployment ran `--enable-expert-parallel`.

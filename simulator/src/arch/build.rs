@@ -25,8 +25,8 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use crate::arch::qwen4_exp_neuron_bf16::{
-    NeuronFlashNextCore, NeuronFlashNextImpls, NeuronFlashNextParallel, Qwen4ExpNeuronBf16Model,
-    Qwen4ExpNeuronBf16SpeculativeModel,
+    KindTimeScale, NeuronFlashNextCore, NeuronFlashNextImpls, NeuronFlashNextParallel,
+    Qwen4ExpNeuronBf16Model, Qwen4ExpNeuronBf16SpeculativeModel,
 };
 use crate::arch::{
     deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
@@ -1681,11 +1681,16 @@ fn neuron_flash_next_parallel(
     spec: &NeuronFlashNextSpec,
     draft_tokens: u32,
     gpu: &str,
-) -> NeuronFlashNextParallel {
+) -> Result<NeuronFlashNextParallel> {
     let gdn_tp = spec.gdn_tp.unwrap_or(spec.attn_tp);
     let ranks = spec.attn_dp * spec.attn_tp.max(gdn_tp);
     let _ = model;
-    NeuronFlashNextParallel {
+    let kind_time_scale = spec
+        .kind_time_scale
+        .iter()
+        .map(|e| KindTimeScale::parse(e))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(NeuronFlashNextParallel {
         gpu_name: gpu.to_string(),
         max_model_len: spec.max_model_len,
         lnc: spec.lnc,
@@ -1724,7 +1729,8 @@ fn neuron_flash_next_parallel(
             hc_mix: spec.hc_mix_impls.clone(),
             head: spec.head_impls.clone(),
         },
-    }
+        kind_time_scale,
+    })
 }
 
 fn neuron_flash_next_core(
@@ -1743,7 +1749,7 @@ fn neuron_flash_next_core(
     }
     let model_cfg = Qwen4ExpModelCfg::from_bf16_json(Path::new(&model_spec.model_config))
         .context("loading the Qwen4Exp BF16 config")?;
-    let parallel = neuron_flash_next_parallel(&model_cfg, spec, draft_tokens, gpu);
+    let parallel = neuron_flash_next_parallel(&model_cfg, spec, draft_tokens, gpu)?;
     NeuronFlashNextCore::build(name.to_string(), &model_cfg, parallel, bridge)
         .context("building Qwen4Exp BF16 on Trainium2 (often a missing Neuron profile.db row)")
 }
