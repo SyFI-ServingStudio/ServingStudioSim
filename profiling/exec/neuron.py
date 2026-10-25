@@ -62,6 +62,10 @@ EXTRA_SOURCE_DIRS_ENV = "SERVINGSTUDIO_NEURON_EXTRA_SOURCE_DIRS"
 # Colon-separated host data directories (e.g. checkpoints), mounted read-only at
 # their own paths and passed to the worker under the same variable.
 DATA_DIRS_ENV = "SERVINGSTUDIO_NEURON_DATA_DIRS"
+# Chips this host's profiling may reserve, as device IDs or ranges ("8-15" or
+# "8,9,12-15"). Unset: every chip. A host shared with other Neuron jobs names
+# its own chips here; the busy check and chip lock still apply inside the set.
+DEVICES_ENV = "SERVINGSTUDIO_NEURON_DEVICES"
 # Measurement policy a worker inherits from the caller.
 _CALLER_POLICY_ENV = (TIMELINE_ENV, "PJRT_DEVICE", "NEURON_CC_FLAGS", "XLA_FLAGS")
 # Runtime defaults every NEFF launch in the image needs; a row's worker_env may
@@ -448,6 +452,28 @@ def _neuron_container_worker_command(
         )
     )
     return command, docker_cli_environment()
+
+
+def allowed_neuron_devices() -> list[int] | None:
+    """The chip IDs ``SERVINGSTUDIO_NEURON_DEVICES`` allows, or ``None`` (all)."""
+    raw = os.environ.get(DEVICES_ENV, "").strip()
+    if not raw:
+        return None
+    devices: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, sep, hi = part.partition("-")
+        if not lo.isdigit() or (sep and not hi.isdigit()):
+            raise ValueError(f"{DEVICES_ENV} entry {part!r} is not a chip ID or ID range")
+        first, last = int(lo), int(hi) if sep else int(lo)
+        if last < first:
+            raise ValueError(f"{DEVICES_ENV} range {part!r} is empty")
+        devices.extend(range(first, last + 1))
+    if not devices:
+        raise ValueError(f"{DEVICES_ENV} names no chip")
+    return sorted(set(devices))
 
 
 class LocalNeuronPool(GpuPool):

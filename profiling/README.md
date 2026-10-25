@@ -346,6 +346,7 @@ the controller appends the inspected image ID and the host
 | `SERVINGSTUDIO_NEURON_EXTRA_SOURCE_DIRS` | Colon-separated absolute directories of out-of-tree op source a runner imports (e.g. `/home/ec2-user/ServingStudio/framework/flashnext-neuron` for package `flashnext`). Mounted read-only and appended to `PYTHONPATH`. |
 | `SERVINGSTUDIO_NEURON_DATA_DIRS` | Colon-separated absolute data directories (e.g. checkpoints). Mounted read-only and passed to the worker under the same name. |
 | `SERVINGSTUDIO_NEURON_PROFILE_CACHE_DIR` | Writable compile/runtime cache (`HOME`, `TMPDIR`, `NEURON_COMPILE_CACHE_URL`, NKI artifacts), mounted at its own path. Default `$TMPDIR/servingstudio-neuron-cache`. Must not overlap a read-only mount. |
+| `SERVINGSTUDIO_NEURON_DEVICES` | Chip IDs the pool may reserve, as IDs or ranges (`8-15`, `8,9,12-15`). Unset: every chip. The busy check and chip lock still apply inside the set. |
 
 Caller policy that passes through: `VIBESIM_PROFILE_TIMELINE` (its directory is
 mounted writable), `PJRT_DEVICE`, `NEURON_CC_FLAGS` and `XLA_FLAGS`.

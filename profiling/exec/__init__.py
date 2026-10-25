@@ -32,9 +32,9 @@ def get_default_pool(device_family: str = "cuda") -> GpuPool:
     if _default_pool is not None:
         return _default_pool
     if device_family == "neuron":
-        from profiling.exec.neuron import LocalNeuronPool
+        from profiling.exec.neuron import LocalNeuronPool, allowed_neuron_devices
 
-        return LocalNeuronPool()
+        return LocalNeuronPool(devices=allowed_neuron_devices())
     if device_family != "cuda":
         raise ValueError(f"unknown profiling device family {device_family!r}")
     # Escape hatch: VIBESIM_PROFILE_GPUS=0,1,2,3 forces profiling onto an explicit

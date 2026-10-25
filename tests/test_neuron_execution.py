@@ -137,6 +137,28 @@ def test_the_sdk_env_names_a_pinned_vendor_image_that_is_never_built():
 # --- chip reservation --------------------------------------------------------
 
 
+def test_host_chip_allowlist_limits_the_default_pool(monkeypatch):
+    """A shared host names its own chips; the pool must never reserve one outside them."""
+    from profiling.exec import get_default_pool
+
+    monkeypatch.delenv("NEURON_RT_VISIBLE_CORES", raising=False)
+    monkeypatch.delenv("NEURON_VISIBLE_DEVICES", raising=False)
+    chips = [
+        neuron.NeuronDevice(i, tuple(range(4 * i, 4 * i + 4)), 2, 96 * 1024**3, False, "trn2.48xlarge")
+        for i in range(16)
+    ]
+    monkeypatch.setattr(neuron, "neuron_devices", lambda: chips)
+    monkeypatch.setenv(neuron.DEVICES_ENV, "8-10,15")
+    pool = get_default_pool("neuron")
+    assert [d.device_id for d in pool.idle_devices()] == [8, 9, 10, 15]
+    monkeypatch.setenv(neuron.DEVICES_ENV, "9-8")
+    with pytest.raises(ValueError, match="empty"):
+        neuron.allowed_neuron_devices()
+    monkeypatch.setenv(neuron.DEVICES_ENV, "x")
+    with pytest.raises(ValueError, match="chip ID"):
+        neuron.allowed_neuron_devices()
+
+
 def test_busy_chip_is_never_reserved(monkeypatch):
     monkeypatch.delenv("NEURON_RT_VISIBLE_CORES", raising=False)
     busy = neuron.NeuronDevice(0, (0, 1, 2, 3), 2, 96 * 1024**3, True, "trn2.3xlarge")
