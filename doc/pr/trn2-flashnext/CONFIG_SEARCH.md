@@ -1,302 +1,198 @@
 # Config search: Qwen3.8-Flash-Next BF16 on one trn2.48xlarge
 
-This file reports simulator-only results (2026-10-25). It covers the best serving
-configurations for three workload families on 16 Trainium2 chips (64 LNC2 cores), which
-knobs matter, where the remaining time goes, and how far the conclusions move if the
-uncertain constants change. The tool is `tools/trn2-config-search/` (its README has the
-stage grammar), and the agent workflow is skill `operate-search-trn2-configs`. Every
-number comes from `qwen4_exp_neuron_bf16[_speculative]` over `profiling/profile.db` at
-commit `7d8ac4a2`, with the loaded-host launch constants unless a what-if row says
-otherwise. Nothing was profiled for this search.
+Simulator-only results (2026-10-25) on the arch **after its alignment with the
+flashnext-neuron engine** (`ALIGNMENT.md`: end-to-end median error 6.0% over 16 serving
+runs, the measured W64 ranking reproduced). The best serving configurations for three
+workload families on 16 Trainium2 chips (64 LNC2 cores), which knobs matter, what
+the engine would gain from changes it does not have yet, and how this differs from the
+first search (before the alignment). Tool: `tools/trn2-config-search/`; skill:
+`operate-search-trn2-configs`. Runs: `logs/trn2/search_v2/` (reports `report_*.md`).
+The only rows profiled for this work are the `qsa_mixer2` grid rows of the alignment.
 
 ## Method
 
-| Stage | Configs | What it varies | Runs |
+| Stage | Configs run | Varies | Runs |
 |---|---|---|---|
-| `s1_layout` | 1200 planned, 114 buildable | every 32- and 64-core layout x {all_reduce, RS/AG} x {all_gather, all_to_all} x {mixer, layer} | 1026 |
-| `s2_knobs` | 280 planned, 238 buildable | one knob at a time around the 8 stage-1 winners: chunk size, granularity, collectives, PLE residency, three bucket inventories, every per-op impl list | 2142 |
-| `s3_unified` | 20 | the 5 best layouts x chunk {2048, 4096} x context buckets {default, fine} | 180 |
-| `s3_mtp` | 12 planned, 9 buildable | MTP k = 1..4 on 3 layouts, acceptance 0.5 / 0.71 / 0.85 | 243 |
-| `s3_pd` | 9 | P/D, 8 + 8 chips, prefill layout x decode layout | 81 |
-| `s4_whatif_*` | 456 + 36 + 36 | the s1 grid, the MTP and the P/D configs under 4 scenarios | 4752 |
+| `s1_layout` | 240 of 2400 (the rest are 64-core layouts without world-64 rows, or refused) | every 32- and 64-core layout x {all_reduce, RS/AG} x {all_gather, all_to_all} x {layer, block} x chunk {512, 2048} | 2160 |
+| `s2_knobs` | 482 | one knob at a time around the 14 stage-1 winners: chunk 256..8192, granularity incl. mixer, collectives, dispatch, a2a capacity factor, PLE residency, bucket inventories (incl. the engine's), every per-op impl list | 4338 |
+| `s3_unified` | 60 | 5 best layouts x {layer, block} x chunk {512, 1024, 2048} x context buckets {default, fine} | 540 |
+| `s3_mtp` | 18 | k = 1..3 x 3 layouts x chunk {512, 2048}, acceptance 0.67 (the engine's on random prompts) and 0.87 (its chat prompts) | 324 |
+| `s3_pd` | 9 | P/D 8 + 8 chips, prefill x decode layout | 81 |
+| `s4_whatif_*` | 840 + 108 + 36 | stage-1 grid (32-core, chunk 512), MTP and P/D configs under 7 scenarios (below) | 8856 |
 
-Every run uses 2 replicas of 32 cores. Each P/D run uses one 32-core prefill instance and
-one 32-core decode instance. Every unified config therefore uses all 16 chips, and
-`tok/s` compares directly across configs (divide by 16 for tok/s/chip).
-
-**Workloads** (`tools/trn2-config-search/stages/workloads.yaml`, seeded):
-
-| Name | Requests | Input / output | Arrivals |
-|---|---|---|---|
-| `fixed_2k_512` | 64 | 2048 / 512 | 50 ms apart (the step-4 trace, `presets/trn2/trn2_fixed_2k_512_c64.csv`) |
-| `agentic_lo`, `agentic_hi` | 48 | 16-32k / 200-500 | bursts of Poisson(6) requests within 2 s, one burst per ~90 s / ~30 s |
-| `chat_r{0.25,0.5,1,2,4,8}` | 96-256 | 1-2k / 200-400 | Poisson at 0.25 to 8 req/s |
-
-The engine has no prefix cache, so the agentic prompts are fully prefilled.
-
-**SLOs** (parameters; `collect --slo name=TTFT_ms,TPOT_ms` recomputes without
-re-simulating):
-
-| SLO | TTFT | Mean TPOT |
-|---|---|---|
-| `chat` | 2 s | 100 ms |
-| `chat_strict` | 1 s | 60 ms |
-| `agentic` | 30 s | 150 ms |
-| `agentic_relaxed` | 60 s | 250 ms |
-
-Goodput is the number of requests that meet both limits per second of simulated span.
-
-> **Arrival-time note.** Under `trace_timed` the simulator divides trace arrival times by
-> `workload.request_rate`, whose default is 10. The step-4 presets do not set it, so the
-> README's "First results" replayed the 50 ms trace at 5 ms spacing. This search sets
-> `request_rate: 1.0`.
+Every config uses all 16 chips (two 32-core replicas, or 8 + 8 for P/D), with the
+engine's scheduler: one prefill chunk per DP group per step, separate decode and
+prefill forwards, SPMD padding, new requests to the least-loaded DP group. Workloads
+(`stages/workloads.yaml`) and SLOs are unchanged from the first search: `fixed_2k_512`
+(the W64 trace), `agentic_lo/hi` (16-32k prompts in bursts), `chat_r{0.25..8}`
+(1-2k / 200-400, Poisson); SLOs `chat` 2 s / 100 ms, `chat_strict` 1 s / 60 ms,
+`agentic` 30 s / 150 ms, `agentic_relaxed` 60 s / 250 ms. `tok/s` is prefill +
+decode tokens over the span on 16 chips.
 
 ## Results
 
 ### Best configuration per workload
 
-All of the best configs share four settings:
-
-- `region_granularity: layer`;
-- `tp_collective: reduce_scatter_all_gather`;
-- `moe_dispatch: all_to_all`;
-- MoE EP32 (`moe_tp: 1`).
-
-Other knobs are at their defaults unless noted. "ctx fine" means context buckets
-`[4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072]`. The MTP rows use
-acceptance 0.71.
+Every winner shares the switches **block regions, RS/AG (sequence-parallel HC),
+all-gather MoE, EP32**. "ctx fine" is context buckets
+`[2048, 4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072]`.
 
 | Workload | Objective | Config | tok/s | TTFT p50 / p90 (s) | TPOT p50 / p90 (ms) | Goodput (req/s) |
 |---|---|---|---|---|---|---|
-| fixed_2k_512 | max tok/s, chat goodput | MTP k=3, dp4-tp8-g8, ctx fine | 5660 | 0.98 / 1.18 | 48 / 52 | 2.21 @chat, 1.21 @strict |
-| fixed_2k_512 | no MTP | dp4-tp8-g4 (any dp4/dp8 layout within 0.5%) | 3326 | 0.84 / 1.02 | 91 / 93 | 1.30 @chat |
-| agentic_hi | max tok/s | MTP k=3, dp2-tp8-g16, ctx fine | 3118 | 8.1 / 16.4 | 50 / 87 | 0.131 @agentic |
-| agentic_hi | TTFT | MTP k=3 or k=1, dp4-tp8-g8 / dp8-tp4-g4 | 3055-3114 | 6.5 / 10.2-10.8 | 44-61 | 0.131 |
-| agentic_hi | no MTP | dp4-tp8-g8, ctx fine | 2987 | 6.2 / 10.2 | 100 / 129 | 0.126 |
-| agentic_lo | max tok/s, goodput | MTP k=3, dp8-tp4-g4, ctx fine | 2665 | 8.5 / 11.0 | 49 / 92 | 0.108 |
-| chat_r1 | chat_strict goodput | MTP k=3, dp4-tp8-g8 | 1863 | 0.36 / 0.41 | 47 / 52 | 1.04 (all requests) |
-| chat_r8 (saturated) | max tok/s | MTP k=2, dp8-tp4-g4 | 8394 | 0.63 / 0.81 | 98 / 130 | 2.46 @chat |
-| chat_r8 | no MTP | dp2-tp8-g16, fine decode buckets | 6377 | 0.35 / 0.49 | 131 / 155 | 0.04 @chat |
+| fixed_2k_512 | max tok/s, no MTP | dp2-tp8-g16, chunk 4096 | 2668 | 11.0 / 18.2 | 94 / 110 | |
+| fixed_2k_512 | no MTP, chunk <= 2048 | dp8-tp4-g4, chunk 512 | 2555 | 15.1 / 23.8 | 92 / 110 | |
+| fixed_2k_512 | MTP @0.67 | k=1, dp8-tp4-g4, chunk 512 | 3082 | 15.5 / 24.6 | 68 / 88 | |
+| fixed_2k_512 | MTP @0.87 | k=3, dp8-tp4-g4, chunk 512 | 3409 | 15.9 / 25.4 | 57 / 76 | |
+| agentic_hi | max tok/s | MTP k=3 @0.87, dp2-tp4-g16, chunk 2048 | 2558 | 43.9 / 87.5 | 149 / 364 | 0.016 @agentic |
+| agentic_hi | no MTP | dp4-tp8-g8, chunk 1024, ctx fine | 2459 | 44.0 / 78.9 | 196 / 353 | 0.002 |
+| agentic_lo | max tok/s | MTP k=1 @0.87, dp4-tp8-g8, chunk 2048 | 2328 | 51.6 / 97.8 | 199 / 522 | 0.002 |
+| chat_r0.25 | chat goodput | MTP k=1 @0.87, dp2-tp4-g16, chunk 512 | 489 | 1.44 / 1.90 | 51 / 66 | 0.26 @chat (all) |
+| chat_r0.25 | no MTP | dp2-tp8-g16, chunk 512 | 477 | 1.38 / 1.81 | 84 / 94 | 0.25 @chat |
+| chat_r1 | chat goodput | MTP k=3 @0.87, dp2-tp4-g16, chunk 512 | 1847 | 1.95 / 2.83 | 68 / 88 | 0.55 @chat |
+| chat_r1 | MTP @0.67 | k=1, dp2-tp4-g16, chunk 512 | 1767 | 1.8 / 2.5 | 97 / 122 | 0.36 @chat |
+| chat_r1 | no MTP | dp2-tp8-g16, chunk 512 | 1647 | 1.75 / 2.50 | 137 / 175 | 0.07 @chat |
+| chat_r8 (saturated) | max tok/s | dp8-tp2-g4, chunk 512 | 4019 | 27.1 / 43.0 | 206 / 322 | 0 |
 
-**Against the step-4 layout.** The step-4 layout is dp4-tp8-g8-ep32 with mixer regions,
-all_reduce and all_gather, run as 2 replicas.
+No configuration meets `chat_strict` (1 s TTFT): a 1-2k prompt costs at least one T =
+2048 prefill forward (~3 s) or four T = 512 forwards (~0.8 s each) on a SPMD engine
+whose MoE runs on every group's padded rows.
 
-| Workload | step-4 layout tok/s, TTFT p50, TPOT p50 | best unified | best MTP (0.71) |
+**Against the engine's measured W64 baseline layout** (dp4-tp8-g8, layer, all_reduce,
+all_gather, chunk 2048, two replicas, k = 0):
+
+| Workload | Baseline layout (Sim) | Best, today's engine knobs | Best MTP @0.67 |
 |---|---|---|---|
-| fixed_2k_512 | 1617, 13.1 s, 169 ms | 3329 (2.06x), 1.3 s, 90 ms | 5660 (3.5x), 1.0 s, 48 ms |
-| agentic_hi | 2468, 29.7 s, 250 ms | 2987, 6.2 s, 100 ms | 3118, 8.1 s, 50 ms |
-| chat_r1 | 1341, 1.0 s, 228 ms | 1633, 0.36 s, 100 ms | 1863, 0.36 s, 47 ms |
-| chat_r8 | 3541, 21.8 s, 254 ms | 6377 (1.8x), 0.35 s, 131 ms | 8394 (2.4x), 0.63 s, 98 ms |
+| fixed_2k_512 | 1542 tok/s, TTFT 28.2 s, TPOT 148 ms | 2553-2668 (1.7x), 11-15 s, 92-94 ms | 3082 (2.0x), 68 ms |
+| agentic_hi | 2276, TTFT p90 108 s, TPOT 353 ms | 2459 (1.08x), 79 s, 196 ms | 2520, 158 ms |
+| chat_r1 | 1450, 5.0 s, 264 ms | 1647 (1.14x), 1.75 s, 137 ms | 1767, 97 ms |
+| chat_r8 | 3099, 39 s, 270 ms | 4019 (1.30x), 27 s, 206 ms | 3563 |
 
-### Throughput-latency frontier
-
-The fixed and agentic traces fix the offered load, so their frontier collapses to one or
-two points, and MTP dominates both. The useful frontier is the chat rate sweep: one line
-per config, with throughput rising with offered load until it saturates.
-
-Each row lists tok/s, TTFT p50 / p90 (s), TPOT p50 / p90 (ms), and goodput @chat /
-@chat_strict (req/s).
-
-| Rate (req/s) | unified dp4-tp8-g8 (ctx fine) | MTP k=2 (0.71) | MTP k=3 (0.71) | P/D: P dp2-tp8-g16, D dp4-tp8-g8 | step-4 layout |
-|---|---|---|---|---|---|
-| 0.25 | 472, 0.30/0.37, 91/92, 0.26/0 | 491, 0.29/0.33, 45/48, 0.27/0.27 | 492, 0.29/0.34, 41/43, 0.27/0.27 | 472, 0.19/0.19, 89/90, 0.26/0 | 444, 0.96/1.04, 171/177, 0/0 |
-| 1 | 1629, 0.34/0.37, 98/102, 0.56/0 | 1832, 0.35/0.40, 53/57, 1.02/1.02 | 1863, 0.36/0.41, 47/51, 1.04/1.04 | 1622, 0.19/0.33, 94/97, 0.91/0 | 1341, 1.03/1.77, 228/253, 0/0 |
-| 2 | 2525, 0.34/0.39, 112/120, 0.23/0 | 2843, 0.36/0.45, 59/63, 1.58/0.96 | 2871, 0.38/0.46, 53/58, 1.60/1.57 | 2505, 0.19/0.33, 99/100, 1.37/0 | 2064, 1.33/2.09, 271/377, 0/0 |
-| 4 | 4688, 0.37/0.54, 140/155, 0.04/0 | 5681, 0.41/0.59, 78/92, 3.12/0.25 | 5130, 0.44/0.66, 85/116, 1.93/0 | 4604, 0.51/1.57, 109/113, 0.09/0 | 3434, 6.8/12.9, 261/359, 0/0 |
-| 8 | 6322, 0.42/0.56, 135/163, 0/0 | 8204, 0.48/0.64, 96/118, 2.69/0.09 | 5367, 0.65/1.35, 186/212, 0/0 | 5221, 9.6/14.6, 113/117, 0.03/0 | 3541, 21.8/33.5, 254/354, 0/0 |
-
-How to read it:
-
-- Without MTP, decode TPOT has a floor of about 90 ms at layer granularity. That floor
-  is launch, not kernels: 48 collective-bearing regions per step at `launch_coll_ms`
-  1.25, plus `step_overhead_ms`. No non-MTP config meets the 60 ms strict SLO.
-- MTP roughly halves TPOT at every load below saturation, and adds 30% to 70% throughput
-  where decode dominates.
-- At high load, k=3 collapses (chat_r8: 5367 tok/s, TPOT 186 ms) while k=2 keeps scaling.
-  Use k=2 above about 4 req/s and k=3 below. This is not root-caused; see open issues.
-- P/D gives the lowest TTFT at light and medium load (0.19 s). It loses capacity once
-  prefill saturates the 8 prefill chips: chat_r8 at 5221 tok/s with 9.6 s TTFT,
-  fixed_2k_512 at 2647 tok/s, agentic TTFT 20-29 s. With two 32-core units, 8 + 8 is the
-  only split: one replica needs at least 32 cores for its weights, and 64-core replicas
-  lack world-64 rows.
-
-`report_main.md` (below) has the full per-workload frontiers.
+The engine's best measured W64 run (two replicas, layer, RS/AG, k = 2, chunk 512) is
+1910 tok/s in + out (86 s); the Sim's best configuration with knobs the engine has is
+3082 tok/s (block regions instead of layer, dp8-tp4-g4 instead of dp4-tp8-g8, k = 1).
 
 ### Which knobs matter
 
-These are one-at-a-time changes from the stage-1 winners (`s2_knobs`), averaged over the
-seeds. Each cell is tok/s / TTFT p90 / TPOT p50 relative to the seed.
+Stage 1, every pair of configs that differ in one switch only (median over layouts),
+as tok/s / TTFT p90 / TPOT p50 change:
 
-| Knob = value (seed: layer, RS/AG, a2a, chunk 2048, defaults) | fixed_2k_512 | agentic_hi | chat_r1 | chat_r8 |
+| Switch (all else equal) | fixed_2k_512 | agentic_hi | chat_r1 | chat_r8 |
 |---|---|---|---|---|
-| region_granularity = mixer | -57% / +41% / +139% | -12% / +15% / +142% | -27% / +56% / +139% | -39% / +38% / +76% |
-| region_granularity = per_op (tp8 layouts only) | -81% / +533% / +443% | -36% / +140% / +486% | -54% / +313% / +445% | -70% / +2544% / +298% |
-| moe_dispatch = all_gather | -30% / +1153% / +20% | -11% / +362% / +52% | -4% / +225% / +43% | -32% / +3949% / +44% |
-| moe_routed_impls = [nki] (instead of auto) | -10% / +96% / +11% | -4% / +68% / +22% | -4% / +185% / +35% | -9% / +596% / +20% |
-| ple_table_shards = dp_group (where it fits) | -32% / +1343% / 0% | -30% / +127% / -4% | 0 / 0 / 0 | -33% / +7484% / -8% |
-| tp_collective = all_reduce | -1% / +34% / 0% | 0% / +15% / +3% | -1% / +25% / +5% | -1% / +31% / +5% |
-| max_batch_tokens = 512 / 1024 | -5% / +182% / +1% ; -2% / +42% / +1% | -1% / +45% ; 0 / +18% | 0 / +90% ; 0 / +27% | -1% / +275% ; 0 / +19% |
-| max_batch_tokens = 4096 / 8192 | 0 / -7% ; +1% / +11% | 0 / +15% / +3% ; -1% / +27% / +8% | 0 | 0 |
-| context_buckets = [32768, 131072] (coarse) | -5% / +239% / +2% | -1% / +31% / +4% | -2% / +196% / +29% | -6% / +364% / +15% |
-| context_buckets = fine (10 sizes) | 0 | 0 / -8% / -2% | 0 | 0 |
-| hc_mix_impls = [torch_cat] | -6% / +3% / +7% | -1% / +3% / +11% | -2% / +6% / +8% | -4% / +3% / +5% |
-| gdn_decode_impls = [nki] | -1% / 0 / +1% | 0 | 0 | -25% / +15% / +51% |
-| gdn_prefill_impls = [torch] | -3% / +11% / +2% | 0 / +5% / +2% | 0 / +11% / +2% | 0 / +10% / +1% |
-| qsa_prefill_impls = [nki] | 0 | 0 / +14% / +4% | 0 | 0 / +2% / 0 |
-| decode_buckets = [8, 32, 128, 256] | -3% / 0 / +4% | 0 / 0 / +1% | -1% / 0 / +4% | -1% / +1% / +1% |
-| decode_buckets fine, prefill_buckets coarse or fine, router / shared / QSA-decode impls, best-of-N impl lists | within 1% | within 1% | within 1% | within 1% |
+| region_granularity layer -> block | +19% / -2% / -22% | +3% / -2% / -15% | +7% / -1% / -9% | +5% / -2% / -5% |
+| tp_collective all_reduce -> RS/AG | +6% / -11% / -5% | +4% / -10% / -19% | +1% / -10% / -3% | +10% / -14% / -9% |
+| moe_dispatch all_gather -> all_to_all (exact) | -11% / +25% / +8% | -8% / +28% / +37% | -2% / +25% / +5% | -17% / +36% / +20% |
+| max_batch_tokens 2048 -> 512 | +21% / -35% / -11% | -1% / +3% / -3% | +2% / -32% / -9% | +2% / -6% / -3% |
+| moe_ep 32 -> 16 (moe_tp 2) | -8% | -7% | -1% | -14% |
 
-**Layout** matters much less once the switches above are set. With layer regions,
-RS/AG and a2a fixed, every buildable EP32 layout is within 1% to 4% on tok/s:
+Stage 2 (one knob around the winners):
 
-| Workload | tok/s across layouts | Best layout | Worst layout |
-|---|---|---|---|
-| fixed_2k_512 | 2945 to 3326 | dp4-tp8-g4 | dp2-tp8-g16 (-11%) |
-| agentic_hi | 2953 to 2981 | | |
-| chat_r8 | 6259 to 6354 | dp2-tp8-g16 | |
+- **Chunk size.** fixed_2k_512: 256 / 512 / 1024 / 2048 / 4096 / 8192 = 2519 / 2555 /
+  2385 / 1953 / 2668 / 2668 tok/s. A 2048 budget is the worst: the decode rows take
+  16-32 tokens of it, so each prompt runs a 2016-token chunk and then a 32-token tail
+  that SPMD pads to a full T = 2048 forward at context 4096 (the engine's W64 runs show
+  exactly this: 29 of 31 prefill forwards at C = 4096). A budget above the largest
+  bucket plus the decode rows (4096) runs each prompt in one chunk. chat: 512 best
+  (TTFT p90 2.2 s vs 2.5 at 2048); agentic: flat in tok/s, 512 has the best TTFT p90
+  on the best layout (33.7 s).
+- **Granularity:** block > layer (-7..-16%) > mixer (-10..-30%).
+- **Layouts** at the winning switches spread 5-25% (they spread 1-4% before):
+  fixed_2k_512 and chat_r4/r8 want dp8 (tp4/tp2, g4): 2553 vs 2400 for dp4-tp8-g8 and
+  2150 for dp2; light chat wants dp2-tp4-g16 (fewer groups pay the padded shape: TTFT
+  p90 2.4 vs 6.5 s at dp8); agentic is flat (2359-2410). gdn_tp 1 costs 2-10%.
+- **moe_routed_impls [nki]** -26..-72% (as before, keep `auto`); `ple_table_shards
+  dp_group` -8..-30%.
+- Within ±5%: context-bucket inventories (keep a 2048 bucket: without it every short
+  chunk runs QSA's sparse path), decode/prefill bucket inventories, every other impl.
 
-The layout mostly moves TTFT. GDN TP 1 is the worst, and TTFT p90 is up to 2x worse
-with gdn_tp 1 than with gdn_tp 4 to 8. EP16 x TP2 is 5% to 15% slower than EP32 in every
-case. The layout knob ranking is:
+**Knob ranking:** block regions; chunk budget (512, or above the largest bucket); layout
+(DP width); RS/AG; all-gather MoE (not all-to-all); EP32; `auto` MoE; everything else
+within a few percent.
 
-1. region granularity;
-2. MoE dispatch;
-3. MoE routed impl (`auto`);
-4. PLE residency (keep `replica`);
-5. context-bucket coverage and chunk size (TTFT only);
-6. TP collective (TTFT);
-7. GDN TP >= 4;
-8. everything else (within a few percent).
+### MTP
 
-### Headroom ladder
+At the engine's acceptance on random prompts (0.67) **k = 1 is best** (fixed_2k_512:
+k = 1 / 2 / 3 = 3082 / 3043 / 2939 tok/s, TPOT 68 / 68 / 71 ms): each extra draft adds
+an MTP forward of ~7 ms host + device, which 0.67 per draft does not repay. At 0.87
+(the chat prompts) k = 3 is best (3409, TPOT 57 ms). MTP adds 15-21% on fixed_2k_512,
+4-12% on chat and agentic, and loses at chat_r8 (3563 vs 4019: verify rows widen
+every decode forward at saturation).
 
-These are the analyzer's cluster buckets for the R0 GPU-time of the best configs, as
-fractions of R0.
+### P/D
 
-| Workload | Config | R0 GPU-s | idle + imbalance | launch + batching (R2-R3) | comm | kernel gap | hardware gap | excess over necessary |
-|---|---|---|---|---|---|---|---|---|
-| fixed_2k_512 | step-4 layout | 6483 | 0% | 69% | 0% | 16% | 8% | 7% |
-| fixed_2k_512 | best unified | 3147 | 1% | 65% | 1% | 2% | 17% | 14% |
-| fixed_2k_512 | best MTP | 1845 | 2% | 60% | 3% | 3% | 22% | 8% |
-| agentic_hi | step-4 layout | 29326 | 11% | 49% | 1% | 27% | 5% | 7% |
-| agentic_hi | best unified | 24277 | 46% | 39% | 2% | 2% | 4% | 5% |
-| chat_r8 | step-4 layout | 8263 | 1% | 35% | 1% | 43% | 9% | 10% |
-| chat_r8 | best unified | 4527 | 6% | 60% | 5% | 5% | 14% | 10% |
-| chat_r8 | best MTP | 3464 | 23% | 27% | 17% | 6% | 18% | 8% |
+8 + 8 chips lose everywhere on throughput (1206-1437 tok/s on the long-prompt
+workloads) and on TTFT except at the lightest load (chat_r0.25: TTFT p50 1.19 s vs
+1.38 unified). The prefill instance is prefill-bound on 8 chips, and the Sim's P/D
+prefill worker runs one prompt per iteration (its DP groups pay their own shapes, not
+padded ones; the engine has no P/D).
 
-What this says:
+### What the engine would gain (stage 4)
 
-- **The kernel gap mostly closes by choosing the right path.** In the step-4 layout,
-  16% to 43% of time is kernel gap: the all-gather MoE block runs `moe_cte` at 256 to
-  8192 tokens, well below its bandwidth bound. All-to-all dispatch sends each expert
-  rank about T_all/ep rows, so the routed experts stay at 256 rows or fewer, and the
-  kernel gap drops to 2% to 6%.
-- **What remains is mostly the launch + batching rung (R2 to R3), 40% to 65%.** Under
-  the calibrated launch model, each region's launch floor is part of its leaf, and R3
-  removes it. So this rung is chiefly the 1.25 ms floor of collective-bearing regions
-  at decode. It is the biggest lever, and it rests on the least certain constant.
-- **The hardware gap (best measured kernel against spec) is 14% to 22%**, and excess over
-  necessary work is 8% to 14%. Necessary work itself (R6) is under 1% of R0.
-- **For agentic, idle is 46%.** Bursts arrive every ~30 s and the host drains each burst
-  well before the next one. More hardware would not help this workload; lower TTFT
-  would.
+Each cell: best tok/s under the scenario (median change over the configs in tok/s /
+TTFT p90 / TPOT p50).
 
-## Sensitivity to the uncertain constants
-
-Stage 4 re-runs the 114 stage-1 configs (32-core layouts), the MTP configs and the P/D
-grid under four scenarios:
-
-- `base`;
-- `launch_half`: `launch_coll_ms` 0.625, `launch_plain_ms` 0.0375, `step_overhead_ms` 2.0;
-- `moe_prefill_3x`: `kind_time_scale: [moe_block@256=0.3333, moe_routed_experts@256=0.3333]`.
-  MoE calls of 256 rows or more, the cte path, run 3x faster;
-- `both`.
-
-`kind_time_scale` is a new what-if arch knob (`qwen4_exp_neuron_bf16.rs`). It never
-changes the measured rows.
-
-The table gives the best tok/s per family and scenario, written as tok/s / TPOT p50 (ms)
-/ TTFT p50 (s).
-
-| Workload | Family | base | launch_half | moe_prefill_3x | both |
-|---|---|---|---|---|---|
-| fixed_2k_512 | unified | 3326 / 91 / 0.8 | 5107 / 58 / 0.7 | 3338 / 90 / 1.3 | 5107 / 58 / 0.7 |
-| fixed_2k_512 | MTP | 5660 / 48 / 1.0 | 7775 / 34 / 0.9 | 5666 / 48 / 0.9 | 7827 / 34 / 0.8 |
-| fixed_2k_512 | P/D | 2647 / 97 / 4.7 | 3804 / 64 / 3.8 | 2647 / 97 / 4.7 | 3804 / 64 / 3.8 |
-| agentic_hi | unified | 2981 / 102 / 6.9 | 3071 / 61 / 6.9 | 2981 / 102 / 6.7 | 3075 / 64 / 6.2 |
-| agentic_hi | MTP | 3118 / 50 / 8.0 | 3163 / 35 / 7.4 | 3118 / 50 / 8.0 | 3163 / 35 / 7.4 |
-| chat_r1 | unified | 1631 / 99 / 0.3 | 1793 / 61 / 0.2 | 1631 / 99 / 0.3 | 1793 / 61 / 0.2 |
-| chat_r8 | unified | 6354 / 131 / 0.4 | 7763 / 99 / 0.3 | 6354 / 131 / 0.4 | 7763 / 99 / 0.3 |
-| chat_r8 | MTP | 8394 / 98 / 0.6 | 8989 / 93 / 0.6 | 8394 / 98 / 0.6 | 8989 / 93 / 0.6 |
-| chat_r8 | P/D | 5288 / 108 / 9.6 | 6722 / 78 / 6.3 | 5288 / 108 / 9.6 | 6722 / 78 / 6.3 |
-
-The next table gives the best tok/s per switch combination (granularity, dispatch,
-collective), across the four scenarios (base / launch_half / moe_prefill_3x / both).
-
-| Workload | layer + a2a + RS/AG | layer + all_gather + RS/AG | mixer + all_gather + RS/AG | mixer + a2a + RS/AG |
+| Scenario (engine change) | fixed_2k_512 | agentic_hi | chat_r1 | chat_r8 |
 |---|---|---|---|---|
-| fixed_2k_512 | 3326 / 5107 / 3338 / 5107 | 2332 / 3087 / 2783 / 3942 | 1649 / 2646 / 1874 / 3283 | 1424 / 2640 / 1427 / 2640 |
-| agentic_hi | 2981 / 3071 / 2981 / 3075 | 2724 / 2837 / 2950 / 3051 | 2522 / 2708 / 2784 / 2969 | 2624 / 2919 / 2626 / 2919 |
-| chat_r8 | 6354 / 7763 / 6354 / 7763 | 4439 / 5076 / 5909 / 7066 | 3686 / 4662 / 4811 / 6609 | 3849 / 5839 / 3849 / 5839 |
+| base | 2553 | 2410 | 1638 | 3981 |
+| `moe_prefill_3x`: MoE kernel 3x faster on >= 256 rows (moe_cte static per-block cost) | 3284 (+26% / -48% / -12%) | 2870 (+18% / -51% / -49%) | 1682 (+3% / -51% / -19%) | 6608 (+51% / -65% / -31%) |
+| `a2a_cf125`: all-to-all at capacity factor 1.25 (all-to-all configs) | 3020 (+25% / -52% / -11%) | 2706 (+20% / -53% / -55%) | 1659 (+2% / -51% / -15%) | 5419 (+57% / -68% / -35%) |
+| `no_pad`: idle DP groups skip the padded shape | 2675 (+5% / -13% / -2%) | 2604 (+4% / -7% / -21%) | 1661 (+2% / -26% / -22%) | 4366 (+6% / -9% / -5%) |
+| `host_half`: host 2x faster (dispatch + per-forward work) | 2948 (+13% / -1% / -15%) | 2439 (+2% / -2% / -9%) | 1701 (+3% / -1% / -5%) | 4028 (+2% / -1% / -1%) |
+| `fused`: one decode + prefill forward | 2551 (+0% / -0% / -1%) | 2385 (-1% / +3% / +5%) | 1661 (+0% / -1% / -2%) | 4067 (+1% / -3% / -1%) |
+| `multi_chunk`: up to 16 chunks per DP group per step | 2621 (+5% / -11% / -3%) | 2405 (-0% / +1% / -0%) | 1633 (+0% / +1% / +0%) | 3343 (-10% / +15% / +9%) |
 
-Kendall tau of the 114-config ranking against `base`:
+With MTP (@0.67) the same picture: MoE prefill 3x +6..+67%, no_pad +4..+22% (fixed
++22%), fused +0..+6%, host_half +1..+5%, multi_chunk -16..+14%.
 
-| Scenario | tau |
-|---|---|
-| launch_half | 0.68-0.90 |
-| moe_prefill_3x | 0.53-0.94 |
-| both | 0.51-0.93 |
+The headroom ladder of the best configs agrees: the **kernel gap is now the largest
+bucket** (29% of R0 GPU-time on fixed_2k_512, 43-60% on chat and agentic: `moe_cte` at
+2048-8192 gathered rows), then launch + batching (19-38%: region floors and padded
+idle groups), excess over necessary work 13-24%, communication 1%.
 
-**Robust conclusions.** These hold under every scenario:
+## Old vs new conclusions
 
-- Layer granularity beats mixer and per_op.
-- MTP beats non-MTP on throughput and TPOT.
-- EP32 beats EP16 x TP2.
-- PLE `replica` beats `dp_group`.
-- P/D trails unified on throughput, but wins TTFT at light load.
-- The best layout changes only within a ~1% band. For example, dp4-tp8-g8 gives way to
-  dp4-tp8-g4 or dp2-tp4-g16. The base winner stays in the top 3 to 16 of 114.
+The first search (`git show 811d2d48:doc/pr/trn2-flashnext/CONFIG_SEARCH.md`) used the
+barrier-on, loaded-host launch constants (1.25 ms per collective region), one fused
+forward per step without SPMD padding, the prior-axis QSA grid, the fused HC row, and
+an all-to-all priced at T_all/ep rows.
 
-**Conclusions that hinge on the constants.**
+| Question | First search | Now |
+|---|---|---|
+| Granularity | layer (mixer -57%) | **block** (+3..+19% over layer; the engine measured +13% on W64) |
+| MoE dispatch | **all-to-all** (+30% fixed, closes the kernel gap) | **all-gather**: exact-capacity all-to-all computes the same rows and adds packing (-2..-17%, TTFT +25..36%; engine: W64 duration +8%). A capacity factor would help (+20..57%) only if the expert kernel scales with received rows and the dropped tokens are acceptable |
+| TP collective | RS/AG, TTFT only (-1% tok/s) | RS/AG, +1..+10% tok/s and -10..-14% TTFT p90 |
+| Chunk size | 2048; 512 costs TTFT (+182%) | **512** (+21% tok/s, -35% TTFT p90 on fixed) or a budget above the largest bucket (4096: +4% more); 2048 is the worst |
+| What bounds decode | launch: 48 collective regions x 1.25 ms, TPOT floor ~90 ms | layer decode is host-bound at ~101 ms (63 regions x 1.3 ms + 19 ms per forward); block is device-bound (70-110 ms); best unified TPOT p50 84-94 ms |
+| Biggest lever | launch constants (halving: +54%) | the MoE prefill kernel (3x: +3..+67% tok/s, TTFT -48..-80%); a 2x faster host gives +1..+13% |
+| MTP | k = 3 everywhere below saturation (+70% on fixed @0.71) | k = 1 at the engine's 0.67 (+15..21% on fixed); k = 3 only at 0.87; loses at saturation |
+| Layout | within 1-4%; dp4-tp8-g8 | 5-25%: dp8-tp4-g4 for prompt-heavy and saturated loads, dp2-tp4-g16 for light chat |
+| P/D | wins TTFT at light load | loses throughput everywhere, wins TTFT only at 0.25 req/s |
+| fixed_2k_512 best | 3326 unified, 5660 MTP (k=3 @0.71) | 2553-2668 unified, 3082 MTP (k=1 @0.67) |
+| chat_r8 best | 6377 unified, 8394 MTP | 4019 unified, 3726 MTP |
+| Robust either way | EP32 > EP16, `auto` MoE, PLE `replica`, MTP lowers TPOT | same |
 
-1. **Absolute throughput and TPOT hinge on the launch constants.** Halving them gives
-   +54% on fixed_2k_512 (3326 to 5107), +22% at chat_r8 and +10% at chat_r1, and cuts
-   TPOT from 91 ms to 58 ms. The non-MTP strict-TPOT SLO (60 ms) becomes nearly
-   reachable. The MTP gain shrinks from +70% to +52% on fixed_2k_512, and from +32% to
-   +16% at chat_r8. MTP's advantage is partly launch amortization. Every TPOT number in
-   this file inherits the loaded-host fit; re-fit `launch_coll_ms` and `step_overhead_ms`
-   on a quiet host before quoting absolute numbers.
-2. **The all-to-all advantage on prefill-heavy work hinges on the MoE prefill kernel.**
-   With a 3x faster `moe_cte`:
-   - all_gather at layer granularity ties with a2a on agentic_hi (3051 against 3075
-     under `both`);
-   - it narrows the gap to 7% at chat_r8 and 16% on fixed_2k_512.
+## Predicted wins the engine still needs to implement
 
-   Mixer + all_gather gains 10% to 30%. If the engine ships only all-gather dispatch,
-   fixing `moe_cte`'s static block cost is the second-largest lever after launch.
-3. **The a2a result also depends on how the arch models a2a.** The model assumes routed
-   experts at T_all/ep equivalent tokens on the critical-path rank, with real layer-0
-   routing, and it uses the c4 all_to_all rows. The engine has no all-to-all dispatch
-   yet (`flashnext/neuron/engine/program.py` traces all_reduce, all_gather and
-   reduce_scatter only), and RS/AG sequence parallelism is not in the engine either.
-   Treat both as design targets that need an engine measurement.
+Ordered by predicted gain on these workloads; each is a Sim prediction the engine has
+not measured.
 
-## Configs not evaluated (need profiling)
-
-`probe` lists these, with the missing kernels, in each stage's `probe.jsonl`. They were
-not profiled.
-
-| Configs | Missing rows |
-|---|---|
-| 64-core replicas (1 replica over 16 chips), every layout | world-64 `all_gather` / `reduce_scatter`, `moe_block` at 8 local experts, PLE gather at 64 shards |
-| `attn_tp` 1 | `qsa_mixer2` at 24 heads, `lm_head_argmax` vocab rows |
-| `attn_tp` 2 | `qsa_mixer2` torch_sparse prefill at (2048, 34816) / (8192, 40960); some also `all_gather` c1 |
-| MoE EP <= 8 (moe_tp >= 4) | `moe_block` shapes |
-| per_op granularity at tp 2/4 | GDN / QSA per-op rows |
-| MTP k=4 | `gdn_decode_mixer` at query_len 5 |
-| `head_impls` with nki | `lm_head_argmax` nki rows (5 of 14) |
-| `moe_routed_impls` best-of-N lists | `moe_routed_experts` rows for nki_tkg / cte variants at the a2a shapes |
-| `ple_table_shards: dp_group` at G <= 8 | invalid: the per-rank table does not fit HBM. It runs only at G = 16 (dp2) and costs ~30% |
+1. **A faster MoE prefill kernel** (`moe_cte`'s static per-block cost at 2048-8192
+   gathered rows): +3..+67% tok/s (most on prompt-heavy and saturated loads), TTFT
+   -48..-80% at 3x. The largest remaining gap.
+2. **Block regions with RS/AG and dp8-tp4-g4** (each knob exists; the combination and
+   the dp8 x tp4 layout have not been run): 2553 tok/s on fixed_2k_512 vs the Sim's 1542
+   for the engine's baseline layout.
+3. **A chunk budget above the largest prefill bucket** (`max_batch_tokens` 4096 with
+   buckets up to 2048), or 512: avoids the padded tail chunk at context 4096 (+21..+37%
+   over 2048 on fixed_2k_512). A configuration change, no code.
+4. **MTP k = 1 by default**; k >= 2 only for workloads with acceptance >= ~0.85.
+5. **Skip the padded shape on idle DP groups** (a group without a chunk or decode rows
+   does not run the forward's work): +2..+22% tok/s, TTFT -9..-36%.
+6. **All-to-all with a capacity factor and drop-safe routing** (or variable-size
+   all-to-all that sends only routed rows): +20..+57% in the model, which assumes the
+   expert kernel's time follows the received rows; at exact capacity keep all-gather.
+7. **A faster host path** (input assembly, H2D, id readback): +2..+13%.
+8. Not worth it here: a fused decode + prefill forward (0..+6%) and several chunks per
+   DP group per step (-16..+14%).
 
 ## How to rerun
 
@@ -304,38 +200,27 @@ not profiled.
 cd wt-trn2-flashnext/ServingStudioSim
 source ../neuron_env.sh; export PATH=$HOME/.cargo/bin:$PATH SERVINGSTUDIO_NO_GPU=1
 S="uv run --no-sync python tools/trn2-config-search/search.py"
-for s in s1_layout s2_knobs s3_unified s3_mtp s3_pd s4_whatif_unified s4_whatif_mtp s4_whatif_pd; do
-  $S plan tools/trn2-config-search/stages/$s.yaml logs/trn2/search/$s && $S probe logs/trn2/search/$s
-done
-tmux new -s search-all "bash logs/trn2/search/run_all.sh s1_layout s2_knobs s3_unified s3_mtp s3_pd s4_whatif_unified s4_whatif_mtp s4_whatif_pd"
-$S report logs/trn2/search/s1_layout logs/trn2/search/s2_knobs logs/trn2/search/s3_unified \
-  logs/trn2/search/s3_mtp logs/trn2/search/s3_pd --out logs/trn2/search/report_main.md
-$S report logs/trn2/search/s4_whatif_unified --out logs/trn2/search/report_whatif_unified.md
+bash logs/trn2/search_v2/run_all.sh s1_layout                     # tmux: align-search
+$S top logs/trn2/search_v2/s1_layout tools/trn2-config-search/stages/s1_top.yaml \
+  --n 2 --metric total_tok_s --metric goodput_req_s@agentic
+bash logs/trn2/search_v2/run_all.sh s2_knobs s3_unified s3_mtp s3_pd s4_whatif_unified s4_whatif_mtp s4_whatif_pd
+R=logs/trn2/search_v2
+$S report $R/s1_layout $R/s2_knobs $R/s3_unified $R/s3_mtp $R/s3_pd --out $R/report_main.md
+$S report $R/s4_whatif_unified --out $R/report_s4_whatif_unified.md
 ```
 
-Notes on the run:
-
-- The loop runs `run` then `collect` per stage, at `--parallelism 48`.
-- `s2_knobs` seeds from `stages/s1_top.yaml`, written by
-  `$S top logs/trn2/search/s1_layout tools/trn2-config-search/stages/s1_top.yaml --n 2 --metric total_tok_s --metric goodput_req_s@chat`.
-- The whole search took about 40 minutes of wall time on this host (simulations are
-  ~0.03 to 1 s each; analysis dominates).
-- Generated reports are in `logs/trn2/search/report_*.md`. Those files are ignored by
-  git, like all of `logs/`.
+`run_all.sh` plans, probes, runs (`--parallelism 48`) and collects each stage; the
+whole search is ~16.3k runs and took about 50 minutes here. Generated reports are
+under `logs/` (not tracked).
 
 ## Open issues
 
-- **Launch constants.** They are fitted on a loaded host. The ranking is robust to them,
-  but absolute TPOT and throughput are not. Re-fit them on a quiet host. That is
-  engine-side work and needs devices.
-- **MTP k=3 at high load.** It degrades sharply at chat_r8 (TPOT 186 ms against 96 ms for
-  k=2), with no retractions. A suspect is verify rows (B x 4) overflowing the 256-row
-  decode bucket or the token buckets. Not root-caused.
-- **a2a and RS/AG are not in the engine.** The two biggest knob wins after layer
-  granularity are modeled but not implemented in flashnext-neuron.
-- **No Analyzer MCP.** The numbers come straight from the run directories
-  (`summary.json`, `raw/request_slo.parquet`, `reports/optimality_report.json`), not
-  through the Analyzer service the `operate-use-analyzer` skill prefers. That service is
-  not available in this session.
-- **Agentic workload.** It has no prefix reuse, because the engine has no prefix cache.
-  If one lands, add `prefix_len` to the agentic traces (`trace/README.md`).
+- **Engine-unmeasured combinations.** Block + RS/AG, dp8-tp4-g4 and dp2-tp4-g16
+  layouts, chunk budgets above the largest bucket: predicted, not run on the engine.
+- **All-to-all with a capacity factor** is a model (row-driven expert cost, packing
+  fitted on one run); dropped tokens are not accounted for.
+- **Workload acceptance.** MTP conclusions hinge on acceptance: 0.65-0.69 measured on
+  random-token prompts, 0.87 on chat prompts; real traffic is in between.
+- **64-core replicas, attn_tp 1/2, EP <= 8, MTP k = 4** still need rows (`probe.jsonl`).
+- **P/D** runs one prompt per prefill iteration; it is not an engine path.
+- **No Analyzer MCP**: numbers come from the run directories.
