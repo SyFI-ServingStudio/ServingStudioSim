@@ -1,0 +1,249 @@
+{
+ "note": "Blind predictions, recorded before any of these configs ran on the engine. W64: 64 requests, 2048 in / 512 out, 50 ms apart, 2 replicas x 32 LNC2 cores (16 chips), requests split by rid parity. Engine knobs pinned: decode buckets 1-16, context 2048/4096. MTP acceptance input 0.67 per request (engine k=1 on random prompts: 0.65-0.72).",
+ "made": "2026-10-25T15:55:10",
+ "sim_commit": "691917e9",
+ "uncertain": [
+  "MTP acceptance is an input (per candidate accept_rate), not predicted",
+  "moe_a2a_pack_us_per_row 0.8 is fitted on one engine run (all_to_all candidates)",
+  "the engine's first-use stalls (2-7 s per run) are not modeled"
+ ],
+ "search": {
+  "exps": [
+   "logs/trn2/search_v2/s3_mtp"
+  ],
+  "workload": "fixed_2k_512-a0.67"
+ },
+ "candidates": {
+  "top1": {
+   "role": "top",
+   "knobs": {
+    "tp_collective": "reduce_scatter_all_gather",
+    "moe_dispatch": "all_gather",
+    "region_granularity": "block",
+    "attn_dp": 8,
+    "attn_tp": 4,
+    "gdn_tp": 4,
+    "moe_ep": 32,
+    "moe_tp": 1,
+    "draft_tokens": 1,
+    "max_batch_tokens": 512,
+    "replicas": 2,
+    "decode_buckets": [
+     1,
+     2,
+     4,
+     8,
+     16
+    ],
+    "context_buckets": [
+     2048,
+     4096
+    ],
+    "prefill_buckets": [
+     128,
+     512
+    ]
+   },
+   "accept_rate": 0.67,
+   "search": {
+    "exp": "logs/trn2/search_v2/s3_mtp",
+    "label": "mtp_dp8-tp4-g4-ep32-mt1_94b1bdff",
+    "workload": "fixed_2k_512-a0.67",
+    "total_tok_s": 3081.5122431054365,
+    "ttft_p50": 15537.9501953125,
+    "tpot_p50": 68.34275817871094
+   },
+   "predicted": {
+    "duration_s": 53.168699999999994,
+    "out_tok_s": 616.3024486210873,
+    "ttft_p50_s": 18.048900390625,
+    "tpot_p50_ms": 72.48316955566406
+   },
+   "ladder_ms": {
+    "real": 3396.9408002929686,
+    "busy": 3394.852914794922,
+    "balanced": 3394.852914794922,
+    "per_config_best": 2446.1735343658365,
+    "ignore_network": 2414.133488258513,
+    "sustained_limit": 932.8615064458344,
+    "achievable_limit": 932.8615064458344,
+    "hardware_limit": 624.4562389690477,
+    "segmented_necessary": 22.139612144780347
+   }
+  },
+  "chunk4096": {
+   "role": "variant",
+   "knobs": {
+    "tp_collective": "reduce_scatter_all_gather",
+    "moe_dispatch": "all_gather",
+    "region_granularity": "block",
+    "attn_dp": 8,
+    "attn_tp": 4,
+    "gdn_tp": 4,
+    "moe_ep": 32,
+    "moe_tp": 1,
+    "draft_tokens": 1,
+    "max_batch_tokens": 4096,
+    "replicas": 2,
+    "decode_buckets": [
+     1,
+     2,
+     4,
+     8,
+     16
+    ],
+    "context_buckets": [
+     2048,
+     4096
+    ],
+    "prefill_buckets": [
+     128,
+     512,
+     2048
+    ]
+   },
+   "accept_rate": 0.67,
+   "search": {
+    "base": "mtp_dp8-tp4-g4-ep32-mt1_94b1bdff",
+    "override": {
+     "max_batch_tokens": 4096
+    }
+   },
+   "predicted": {
+    "duration_s": 53.7596,
+    "out_tok_s": 609.5283447049458,
+    "ttft_p50_s": 15.6247998046875,
+    "tpot_p50_ms": 70.43600463867188
+   },
+   "ladder_ms": {
+    "real": 3430.0096002929686,
+    "busy": 3427.9871044921874,
+    "balanced": 3427.9868230660327,
+    "per_config_best": 2426.4961373850565,
+    "ignore_network": 2398.8999380537243,
+    "sustained_limit": 932.0151417379818,
+    "achievable_limit": 932.0151417379818,
+    "hardware_limit": 617.1281896523778,
+    "segmented_necessary": 22.097123546186197
+   }
+  },
+  "tp8": {
+   "role": "variant",
+   "knobs": {
+    "tp_collective": "reduce_scatter_all_gather",
+    "moe_dispatch": "all_gather",
+    "region_granularity": "block",
+    "attn_dp": 4,
+    "attn_tp": 8,
+    "gdn_tp": 8,
+    "moe_ep": 32,
+    "moe_tp": 1,
+    "draft_tokens": 1,
+    "max_batch_tokens": 512,
+    "replicas": 2,
+    "decode_buckets": [
+     1,
+     2,
+     4,
+     8,
+     16
+    ],
+    "context_buckets": [
+     2048,
+     4096
+    ],
+    "prefill_buckets": [
+     128,
+     512
+    ]
+   },
+   "accept_rate": 0.67,
+   "search": {
+    "base": "mtp_dp8-tp4-g4-ep32-mt1_94b1bdff",
+    "override": {
+     "attn_dp": 4,
+     "attn_tp": 8,
+     "gdn_tp": 8
+    }
+   },
+   "predicted": {
+    "duration_s": 57.321400000000004,
+    "out_tok_s": 571.6538674910242,
+    "ttft_p50_s": 17.535,
+    "tpot_p50_ms": 76.82661437988281
+   },
+   "ladder_ms": {
+    "real": 3660.6176002929687,
+    "busy": 3660.295482421875,
+    "balanced": 3660.2953522339276,
+    "per_config_best": 2519.1324896958654,
+    "ignore_network": 2478.1171690028796,
+    "sustained_limit": 924.060893191399,
+    "achievable_limit": 924.060893191399,
+    "hardware_limit": 614.7186986195121,
+    "segmented_necessary": 22.141028672452105
+   }
+  },
+  "a2a": {
+   "role": "contrast",
+   "knobs": {
+    "tp_collective": "reduce_scatter_all_gather",
+    "moe_dispatch": "all_to_all",
+    "region_granularity": "block",
+    "attn_dp": 8,
+    "attn_tp": 4,
+    "gdn_tp": 4,
+    "moe_ep": 32,
+    "moe_tp": 1,
+    "draft_tokens": 1,
+    "max_batch_tokens": 512,
+    "replicas": 2,
+    "decode_buckets": [
+     1,
+     2,
+     4,
+     8,
+     16
+    ],
+    "context_buckets": [
+     2048,
+     4096
+    ],
+    "prefill_buckets": [
+     128,
+     512
+    ]
+   },
+   "accept_rate": 0.67,
+   "search": {
+    "base": "mtp_dp8-tp4-g4-ep32-mt1_94b1bdff",
+    "override": {
+     "moe_dispatch": "all_to_all"
+    }
+   },
+   "predicted": {
+    "duration_s": 62.033,
+    "out_tok_s": 528.2349717086067,
+    "ttft_p50_s": 23.13080078125,
+    "tpot_p50_ms": 82.53307342529297
+   },
+   "ladder_ms": {
+    "real": 3964.2562037109374,
+    "busy": 3963.8636789550783,
+    "balanced": 3963.8636752576435,
+    "per_config_best": 2531.284183182267,
+    "ignore_network": 2395.3335983809548,
+    "sustained_limit": 863.7293670247456,
+    "achievable_limit": 863.7293670247456,
+    "hardware_limit": 555.3718950058623,
+    "segmented_necessary": 22.139612144780347
+   }
+  }
+ },
+ "predicted_rank_by_duration": [
+  "top1",
+  "chunk4096",
+  "tp8",
+  "a2a"
+ ]
+}
