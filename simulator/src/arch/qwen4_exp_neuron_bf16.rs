@@ -25,7 +25,8 @@
 //! is a decode forward (+ the MTP catch-up over the verify rows and `k - 1`
 //! draft passes) then a prefill forward (+ the MTP over the chunk and `k - 1`
 //! first-draft passes), separate compiled programs; either may be absent.
-//! `fused` runs one forward over every row instead (not in the engine).
+//! `fused` runs one forward over every row instead (not in the engine), its
+//! decode batch and chunks each padded to their own buckets.
 //!
 //! Shapes are bucketed and SPMD (`spmd_padding`, default on): every DP group
 //! runs the forward's padded shape, idle groups included. The decode forward
@@ -3441,16 +3442,16 @@ impl NeuronFlashNextCore {
         };
         match p.step_forwards {
             StepForwards::Fused => {
-                if spmd {
-                    pad_decode(&mut target, true, bk);
-                    pad_prefill(&mut target, true, bk);
-                }
+                // One compiled (decode batch, chunk) shape per bucket pair: the
+                // decode part and the chunks pad to their own buckets.
+                pad_decode(&mut target, spmd, bk);
+                pad_prefill(&mut target, spmd, bk);
                 groups[View::MtpRecurrent.index()] = recurrent(&target);
                 groups[View::MtpFused.index()] = target.clone();
                 groups[View::Fused.index()] = target;
                 StepViews {
                     groups,
-                    exact: false,
+                    exact: true,
                 }
             }
             StepForwards::Separate => {
@@ -3736,19 +3737,33 @@ fn pad_decode(groups: &mut [GroupStep], spmd: bool, bk: &Buckets) {
 
 /// Pad every prefill chunk to its bucket; under SPMD every group runs the
 /// longest chunk's bucket from the furthest prefix (the engine's context
-/// bucket is that of the longest `start + T`), idle groups included.
+/// bucket is that of the longest `start + T`), idle groups included, and
+/// with several chunks per group each position pads to its longest chunk.
 fn pad_prefill(groups: &mut [GroupStep], spmd: bool, bk: &Buckets) {
     if spmd {
         let n = groups.iter().map(|g| g.chunks.len()).max().unwrap_or(0);
         if n == 0 {
             return;
         }
-        let all = groups.iter().flat_map(|g| g.chunks.iter());
-        let t = all.clone().map(|c| c.1).max().unwrap_or(0);
-        let prefix = all.map(|c| c.0).max().unwrap_or(0);
-        let chunk = (prefix, padded(t, &bk.prefill));
+        // Position-wise: every group's i-th longest chunk pads to the longest
+        // i-th chunk of any group (one chunk per group in the engine).
+        let mut sorted: Vec<Vec<(u32, u32)>> = groups
+            .iter()
+            .map(|g| {
+                let mut c = g.chunks.clone();
+                c.sort_by(|a, b| b.1.cmp(&a.1));
+                c
+            })
+            .collect();
+        let chunks: Vec<(u32, u32)> = (0..n)
+            .map(|i| {
+                let at = sorted.iter_mut().filter_map(|c| c.get(i).copied());
+                let (t, prefix) = at.fold((0, 0), |(t, p), c| (t.max(c.1), p.max(c.0)));
+                (prefix, padded(t, &bk.prefill))
+            })
+            .collect();
         for g in groups {
-            g.chunks = vec![chunk; n];
+            g.chunks = chunks.clone();
             g.requests = g.requests.max(n as u32);
         }
     } else {
@@ -4506,6 +4521,17 @@ mod tests {
             assert_eq!(g.chunks, [(2000, 2048)]);
         }
         assert!(views.get(View::Decode).iter().all(GroupStep::is_empty));
+        // Several chunks per group pad position-wise, not to the longest one.
+        let multi = vec![
+            prefill_group(vec![(0, 100), (0, 1500)]),
+            prefill_group(vec![(0, 200)]),
+            ArchGroupInput::default(),
+            ArchGroupInput::default(),
+        ];
+        let views = core.views(unified_targets(&unified(multi)));
+        for g in views.get(View::Prefill) {
+            assert_eq!(g.chunks, [(0, 2048), (0, 128)]);
+        }
         let mut q = p;
         q.spmd_padding = false;
         let core = built(q);
