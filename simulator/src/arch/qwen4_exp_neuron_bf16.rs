@@ -2939,8 +2939,8 @@ impl NeuronFlashNextCore {
     }
 }
 
-fn iter_views(batch: &UnifiedArchInput) -> StepViews {
-    let target: Vec<GroupStep> = batch
+fn iter_views(batch: &UnifiedArchInput, attn_dp: usize) -> StepViews {
+    let mut target: Vec<GroupStep> = batch
         .groups
         .iter()
         .map(|g| GroupStep {
@@ -2951,10 +2951,42 @@ fn iter_views(batch: &UnifiedArchInput) -> StepViews {
             requests: g.request_count(),
         })
         .collect();
+    if target.len() == 1 && attn_dp > 1 {
+        target = spread_over_groups(&target[0], attn_dp);
+    }
     StepViews {
         recurrent: Vec::new(),
         target,
     }
+}
+
+/// A worker without attention-DP partitions (the PD prefill worker) hands one
+/// group; its requests are dealt round-robin over the DP groups, prefill
+/// chunks largest first, as the engine's DP placement would.
+fn spread_over_groups(one: &GroupStep, attn_dp: usize) -> Vec<GroupStep> {
+    let mut groups = vec![
+        GroupStep {
+            query_len: one.query_len,
+            decode_max_kv: one.decode_max_kv,
+            ..Default::default()
+        };
+        attn_dp
+    ];
+    for i in 0..one.decode_reqs as usize {
+        groups[i % attn_dp].decode_reqs += 1;
+    }
+    let mut chunks = one.chunks.clone();
+    chunks.sort_by(|a, b| b.1.cmp(&a.1));
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        groups[i % attn_dp].chunks.push(chunk);
+    }
+    for g in &mut groups {
+        g.requests = g.decode_reqs + g.chunks.len() as u32;
+        if g.decode_reqs == 0 {
+            g.decode_max_kv = 0;
+        }
+    }
+    groups
 }
 
 fn speculative_views(batch: &SpeculativeArchInput) -> StepViews {
@@ -3007,6 +3039,9 @@ impl IterwiseUnifiedModel for Qwen4ExpNeuronBf16Model {
     }
 
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        if batch.groups.len() == 1 {
+            return Ok(()); // spread over the DP groups (spread_over_groups)
+        }
         self.core.check_groups(batch.groups.len())
     }
 
@@ -3016,7 +3051,12 @@ impl IterwiseUnifiedModel for Qwen4ExpNeuronBf16Model {
         slots: &mut Vec<LeafMetrics>,
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics {
-        self.core.eval(&iter_views(batch), slots, scratch, None)
+        self.core.eval(
+            &iter_views(batch, self.core.parallel.attn_dp as usize),
+            slots,
+            scratch,
+            None,
+        )
     }
 
     fn eval_iter_with_inputs(
@@ -3026,8 +3066,12 @@ impl IterwiseUnifiedModel for Qwen4ExpNeuronBf16Model {
         scratch: &mut Vec<LeafMetrics>,
         inputs: &mut Vec<SlotInput>,
     ) -> LeafMetrics {
-        self.core
-            .eval(&iter_views(batch), slots, scratch, Some(inputs))
+        self.core.eval(
+            &iter_views(batch, self.core.parallel.attn_dp as usize),
+            slots,
+            scratch,
+            Some(inputs),
+        )
     }
 
     fn cost_log_manifest(&self) -> CostManifest {
@@ -3478,5 +3522,26 @@ mod tests {
                     .collect();
             assert_eq!(mapped, locations, "attn_dp {attn_dp}");
         }
+    }
+
+    /// Catches a one-group batch (the PD prefill worker) costing every request
+    /// on DP group 0 while the other groups idle.
+    #[test]
+    fn a_one_group_batch_is_spread_over_the_dp_groups() {
+        let one = GroupStep {
+            decode_reqs: 5,
+            query_len: 1,
+            decode_max_kv: 900,
+            chunks: vec![(0, 100), (0, 2048), (0, 512)],
+            requests: 8,
+        };
+        let groups = spread_over_groups(&one, 4);
+        assert_eq!(
+            groups.iter().map(|g| g.decode_reqs).collect::<Vec<_>>(),
+            [2, 1, 1, 1]
+        );
+        assert_eq!(groups[0].chunks, [(0, 2048)]);
+        assert_eq!(groups[3].chunks, []);
+        assert_eq!(groups.iter().map(|g| g.requests).sum::<u32>(), 8);
     }
 }

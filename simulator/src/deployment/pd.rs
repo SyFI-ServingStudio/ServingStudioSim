@@ -88,10 +88,10 @@ impl Deployment for PdDeployment {
         )?;
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
 
-        // The KV-transfer cost source: the profiled inter-node p2p curve, keyed
-        // on the decode GPU (receiver). Built once here (the bridge lives at L7)
-        // and handed to the flow's shared `GpuCluster`.
-        let cost = build_transfer_cost(&dg.gpu, bridge)?;
+        // The KV-transfer cost source is built per arm (the bridge lives at
+        // L7) and handed to the flow's shared `GpuCluster`: the profiled
+        // inter-node p2p curve keyed on the decode GPU (receiver) for GPUs, a
+        // cross-chip all-gather for Trainium.
 
         // Only the pairs actually exercised are wired (add a new arm when a new
         // pairing is needed). Each arm builds both pools' concrete models (own
@@ -123,6 +123,7 @@ impl Deployment for PdDeployment {
                         bridge,
                     )?)
                 };
+                let cost = build_transfer_cost(&dg.gpu, bridge)?;
                 Ok(assemble_pd_flow(
                     prefill_model,
                     decode_model,
@@ -171,6 +172,7 @@ impl Deployment for PdDeployment {
                         bridge,
                     )?)
                 };
+                let cost = build_transfer_cost(&dg.gpu, bridge)?;
                 Ok(assemble_pd_flow(
                     prefill_model,
                     decode_model,
