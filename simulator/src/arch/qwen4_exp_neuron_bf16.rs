@@ -1499,9 +1499,29 @@ struct PlanBuilder<'a> {
     /// Product of the enclosing Scale folds.
     fold: u32,
     view: View,
+    /// The location prefix of the leaves being minted (`gdn_first`, `qsa`,
+    /// `mtp.final_mixer`, ...); empty at the root.
+    scope: String,
+}
+
+fn join(base: &str, leaf: &str) -> String {
+    if base.is_empty() {
+        leaf.to_string()
+    } else {
+        format!("{base}.{leaf}")
+    }
 }
 
 impl PlanBuilder<'_> {
+    /// Run `f` with the scope extended by `sub`.
+    fn scoped<T>(&mut self, sub: &str, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = std::mem::take(&mut self.scope);
+        self.scope = join(&saved, sub);
+        let out = f(self);
+        self.scope = saved;
+        out
+    }
+
     fn leaf(&mut self, label: &str, eval: LeafEval, role: RegionRole) -> CostNode {
         let (kind, config) = match &eval {
             LeafEval::Tokens { k, .. }
@@ -1530,7 +1550,11 @@ impl PlanBuilder<'_> {
             fold: self.fold,
             calibrated,
         });
-        self.b.leaf(format!("{}.{label}", self.name), kind, config)
+        self.b.leaf(
+            format!("{}.{}", self.name, join(&self.scope, label)),
+            kind,
+            config,
+        )
     }
 
     fn comm_leaf(
@@ -2123,14 +2147,20 @@ impl PlanBuilder<'_> {
     /// Embedding for group `d`: vocab-parallel gather + the group reduction.
     fn embed(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
         let k = self.k.embed.clone();
-        out.push(self.tokens("embed", k, RowSrc::Group(d), 1, RegionRole::Standalone(1)));
+        out.push(self.tokens(
+            "embedding",
+            k,
+            RowSrc::Group(d),
+            1,
+            RegionRole::Standalone(1),
+        ));
         let op = if self.p.sequence_parallel() {
             CommOp::ReduceScatter
         } else {
             CommOp::AllReduce
         };
         let (g, h2) = (self.g(), self.h2());
-        if let Some(n) = self.comm_leaf("embed.reduce", op, g, 1, RowSrc::Group(d), h2, 1)? {
+        if let Some(n) = self.comm_leaf("embedding.reduce", op, g, 1, RowSrc::Group(d), h2, 1)? {
             out.push(n);
         }
         Ok(())
@@ -2138,27 +2168,27 @@ impl PlanBuilder<'_> {
 
     /// Final HC combine and mixer, lm_head and greedy argmax for group `d`.
     fn head(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
-        let div = self.hc_div();
+        self.scoped("final_mixer", |s| {
+            let div = s.hc_div();
+            let k = s.k.hc_combine.clone();
+            out.push(s.tokens(
+                "combine",
+                k,
+                RowSrc::Group(d),
+                div,
+                RegionRole::Standalone(1),
+            ));
+            let k = s.k.hc_mix_final.clone();
+            out.push(s.tokens("mix", k, RowSrc::Group(d), div, RegionRole::Standalone(1)));
+        });
+        self.scoped("head", |s| s.head_rows(d, out))
+    }
+
+    fn head_rows(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
         let (g, h2) = (self.g(), self.h2());
-        let k = self.k.hc_combine.clone();
-        out.push(self.tokens(
-            "final.combine",
-            k,
-            RowSrc::Group(d),
-            div,
-            RegionRole::Standalone(1),
-        ));
-        let k = self.k.hc_mix_final.clone();
-        out.push(self.tokens(
-            "final.mix",
-            k,
-            RowSrc::Group(d),
-            div,
-            RegionRole::Standalone(1),
-        ));
         if self.p.sequence_parallel() {
             if let Some(n) = self.comm_leaf(
-                "head.rows_all_gather",
+                "rows_all_gather",
                 CommOp::AllGather,
                 g,
                 1,
@@ -2171,7 +2201,7 @@ impl PlanBuilder<'_> {
         }
         if let Some(k) = self.k.lm_head_argmax.clone() {
             out.push(self.tokens(
-                "head.lm_head_argmax",
+                "lm_head_argmax",
                 k,
                 RowSrc::Sample(d),
                 1,
@@ -2181,14 +2211,14 @@ impl PlanBuilder<'_> {
             let gemm = self.k.lm_head_gemm.clone().expect("per-op head");
             let argmax = self.k.vocab_argmax.clone().expect("per-op head");
             out.push(self.tokens(
-                "head.lm_head",
+                "lm_head",
                 gemm,
                 RowSrc::Sample(d),
                 1,
                 RegionRole::Standalone(1),
             ));
             out.push(self.tokens(
-                "head.argmax",
+                "argmax",
                 argmax,
                 RowSrc::Sample(d),
                 1,
@@ -2196,7 +2226,7 @@ impl PlanBuilder<'_> {
             ));
         }
         if let Some(n) = self.comm_leaf(
-            "head.argmax_all_gather",
+            "argmax_all_gather",
             CommOp::AllGather,
             g,
             1,
@@ -2276,18 +2306,18 @@ impl PlanBuilder<'_> {
         let pre = self.per_group(|s, d, out| {
             s.embed(d, out)?;
             let fc = s.k.mtp_fc.clone().expect("mtp fc");
-            out.push(s.tokens("mtp.fc", fc, RowSrc::Group(d), 1, RegionRole::InLayer(1)));
+            out.push(s.tokens("fc", fc, RowSrc::Group(d), 1, RegionRole::InLayer(1)));
             let k = s.k.hc_mix.clone();
             let div = s.hc_div();
             out.push(s.tokens(
-                "mtp.attn_hc.mix",
+                "attn_hc.mix",
                 k,
                 RowSrc::Group(d),
                 div,
                 RegionRole::InLayer(1),
             ));
             s.mixer(d, Qwen4ExpMixer::Qsa, out)?;
-            s.combine_mix(d, "mtp.mlp_hc", out);
+            s.combine_mix(d, "mlp_hc", out);
             Ok(())
         })?;
         let mut moe = Vec::new();
@@ -2335,6 +2365,7 @@ fn build_plan(
         bridge,
         fold: 1,
         view: View::Target,
+        scope: String::new(),
     };
     let mut root = Vec::new();
     root.push(CostNode::Labeled {
@@ -2343,7 +2374,15 @@ fn build_plan(
     });
     for (mixer, first, ple, n) in layer_groups(model) {
         pb.fold = n;
-        let layer = pb.layer(mixer, first, ple)?;
+        let scope = match (mixer, first, ple) {
+            (Qwen4ExpMixer::Gdn, _, true) => "gdn_ple",
+            (Qwen4ExpMixer::Gdn, true, false) => "gdn_first",
+            (Qwen4ExpMixer::Gdn, false, false) => "gdn",
+            (Qwen4ExpMixer::Qsa, _, true) => "qsa_ple",
+            (Qwen4ExpMixer::Qsa, true, false) => "qsa_first",
+            (Qwen4ExpMixer::Qsa, false, false) => "qsa",
+        };
+        let layer = pb.scoped(scope, |pb| pb.layer(mixer, first, ple))?;
         let label = format!(
             "{n} x {}{}{}",
             mixer_name(mixer),
@@ -2370,7 +2409,7 @@ fn build_plan(
             model.mtp_layers
         );
         pb.view = View::MtpFirst;
-        let first = pb.mtp_pass()?;
+        let first = pb.scoped("mtp", |pb| pb.mtp_pass())?;
         let mut mtp = vec![CostNode::Labeled {
             label: "mtp pass 0".to_string(),
             child: Box::new(first),
@@ -2378,7 +2417,7 @@ fn build_plan(
         if p.draft_tokens > 1 {
             pb.view = View::MtpRecurrent;
             pb.fold = p.draft_tokens - 1;
-            let rec = pb.mtp_pass()?;
+            let rec = pb.scoped("mtp_recurrent", |pb| pb.mtp_pass())?;
             mtp.push(CostNode::Labeled {
                 label: "mtp recurrent pass".to_string(),
                 child: Box::new(CostNode::Scale {
@@ -3400,5 +3439,37 @@ mod tests {
         let (mut slots, mut scratch) = (Vec::new(), Vec::new());
         model.eval_speculative_iter(&batch, &mut slots, &mut scratch);
         assert_eq!(slots.len(), model.core.n_slots);
+    }
+
+    /// Catches a location rename or a new leaf that the necessary-work map
+    /// (`model/work/location_maps/qwen4_exp_neuron_bf16_unified.json`) misses:
+    /// the analyzer attributes R6 per location only on an exact cover.
+    #[test]
+    fn necessary_work_map_covers_the_default_layout() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("model/work/location_maps/qwen4_exp_neuron_bf16_unified.json");
+        let map: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            map["arch_types"],
+            serde_json::json!(["qwen4_exp_neuron_bf16"])
+        );
+        let mapped: std::collections::BTreeSet<String> = map["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["location"].as_str().unwrap().to_string())
+            .collect();
+        let comm = ["all_reduce", "all_gather", "reduce_scatter", "all_to_all"];
+        for attn_dp in [1, 4] {
+            let locations: std::collections::BTreeSet<String> =
+                built(parallel(attn_dp, 8, 8 * attn_dp))
+                    .manifest
+                    .slots
+                    .into_iter()
+                    .filter(|slot| !comm.contains(&slot.kind.as_str()))
+                    .map(|slot| slot.name)
+                    .collect();
+            assert_eq!(mapped, locations, "attn_dp {attn_dp}");
+        }
     }
 }

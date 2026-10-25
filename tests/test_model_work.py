@@ -4968,3 +4968,20 @@ def test_qf_location_maps_consume_every_semantic_once(qf, depth, mapping):
     assert semantics["unified.mtp.step_0.head.lm_head"] == ["mtp_first.lm_head"]
     assert semantics["unified.head.lm_head"] == ["lm_head"]
     assert semantics["unified.sample.rejection_resample"] == []
+
+
+def test_neuron_bf16_location_map_consumes_every_semantic_once():
+    """The Trainium arch fuses each GDN/QSA mixer, HC module and MoE block into one
+    leaf; its map must still hand every semantic row of the BF16 checkpoint to
+    exactly one location (the Rust test pins the location set)."""
+    maps = Path(__file__).resolve().parents[1] / "model/work/location_maps"
+    location_map = json.loads((maps / "qwen4_exp_neuron_bf16_unified.json").read_text())
+    assert location_map["arch_types"] == ["qwen4_exp_neuron_bf16"]
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    model = load_model(Path(__file__).resolve().parents[1] / "model/config/qwen3_8_flash_next_bf16.json")
+    for wl in (
+        Workload.causal_lm(prefill=[(0, 2048)], decode=[4100], sampled=2),
+        Workload.causal_lm(decode=[4100, 900], sampled=2),
+        Workload.causal_lm(prefill=[(100, 500)], sampled=1),
+    ):
+        assert sorted(mapped) == sorted(s.name for s in model.label(wl).segments)
