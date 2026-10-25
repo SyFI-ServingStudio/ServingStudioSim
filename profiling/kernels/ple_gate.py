@@ -32,6 +32,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.neuron_common import neuron_spec
 
 KIND = "ple_gate"
 
@@ -92,6 +93,18 @@ register(
         supports=BackendSupport(compute=frozenset({DType.BF16})),
         subprocess_env="vllm_env",
         doc=BackendDoc(summary="The fork's ple_gate custom op (_ple_gate_kernel)."),
+    )
+)
+
+
+# The Flash-Next Trainium engine's PLE gate (`flashnext/neuron/ops/ple.py::ple_gate_torch`),
+# real layer-1 norms, one region, NRT device time.
+register(
+    neuron_spec(
+        KIND,
+        "torch",
+        PleGateArgs,
+        "The Flash-Next Trainium engine's PLE similarity gate, plain torch, one region.",
     )
 )
 

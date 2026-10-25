@@ -45,6 +45,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.neuron_common import neuron_spec
 
 KIND = "embedding_row_gather"
 
@@ -149,6 +150,20 @@ register(
                 "cpu_offload=False path (Qwen4ExpPLEDeviceEmbedding); device only."
             ),
         ),
+    )
+)
+
+
+# The Flash-Next Trainium engine's masked local gathers, one region, NRT device time:
+# 16 x 160 -> the PLE gather from the rank's real table slice
+# (`flashnext/neuron/ops/ple.py::ple_gather_torch`), 1 x 2560 -> the vocab-parallel token
+# embed (`flashnext/neuron/ops/head.py::embed_torch`). Device-resident tables only.
+register(
+    neuron_spec(
+        KIND,
+        "torch",
+        EmbeddingRowGatherArgs,
+        "The Flash-Next Trainium engine's masked index_select of local table rows, one region.",
     )
 )
 

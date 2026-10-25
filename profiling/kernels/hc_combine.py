@@ -14,6 +14,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.neuron_common import neuron_spec
 
 KIND = "hc_combine"
 
@@ -77,6 +78,19 @@ register(
             summary="The fork's hc_combine Triton op (learned injection logits).",
             url="https://github.com/serendipity-zk/vllm/blob/892da0822f7e866cec8e519727f014c45a5ad792/vllm/models/qwen4_exp/nvidia/ops/hc.py",
         ),
+    )
+)
+
+
+# The Flash-Next Trainium engine's standalone HC combine
+# (`flashnext/neuron/ops/hyperconnection.py::hc_combine_torch`), one compiled region,
+# timed by NRT device time.
+register(
+    neuron_spec(
+        KIND,
+        "torch",
+        HcCombineArgs,
+        "The Flash-Next Trainium engine's HC combine, plain torch compiled as one region.",
     )
 )
 

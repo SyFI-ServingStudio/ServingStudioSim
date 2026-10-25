@@ -30,6 +30,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.neuron_common import neuron_spec
 
 KIND: str = "all_reduce"
 
@@ -123,3 +124,24 @@ def _spec(backend: str, module_name: str) -> KernelProfilerSpec:
 
 register(_spec("nccl", "profiling.runners.comm.nccl"))
 register(_spec("nvshmem", "profiling.runners.comm.nvshmem"))
+
+# In-graph all-reduce on Trainium2 logical cores (num_gpus = ranks = logical cores): torch
+# functional all_reduce traced into a compiled region, timed by the NRT device-time slope of
+# 33 vs 1 chained collectives (`flashnext/neuron/sim_l1/collectives.py`). The live runner
+# measures one-chip groups only (fabric neuron_c2 with 2 ranks, neuron_c4 with 4); multi-chip
+# rows come from the standalone sweep through tools/neuron-bench-import.
+register(
+    neuron_spec(
+        KIND,
+        "cc",
+        AllReduceArgs,
+        "torch functional all_reduce traced into a compiled region (gloo world, one process per "
+        "Trainium2 logical core).",
+        compute=None,
+        metric_family=MetricFamily.COMM,
+        module="profiling.runners.neuron.collectives",
+        function="profile_all_reduce_batch",
+        list_native=True,
+        logical_cores=4,
+    )
+)

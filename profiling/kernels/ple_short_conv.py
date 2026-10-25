@@ -39,6 +39,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.neuron_common import neuron_spec
 
 KIND = "ple_short_conv"
 
@@ -107,6 +108,20 @@ register(
         supports=BackendSupport(compute=frozenset({DType.BF16})),
         subprocess_env="vllm_env",
         doc=BackendDoc(summary="The fork's ple_conv (_ple_conv_kernel + writeback)."),
+    )
+)
+
+
+# The Flash-Next Trainium engine's PLE short conv (`flashnext/neuron/ops/ple.py::
+# ple_short_conv_torch`): x [batch, query_len, channels] with a zero conv state, one region,
+# NRT device time. The op has no rollback path, so `spec` times the same conv over
+# query_len rows; the residual add is the separate kind ple_residual.
+register(
+    neuron_spec(
+        KIND,
+        "torch",
+        PleShortConvArgs,
+        "The Flash-Next Trainium engine's dilated depthwise conv + SiLU, plain torch, one region.",
     )
 )
 
