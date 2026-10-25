@@ -9,6 +9,7 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::neuron_grid;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -89,6 +90,9 @@ impl KernelSpec for SingleGemmSpec {
     const KIND: KernelKind = "single_gemm";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if neuron_grid::is_neuron(&config.backends) {
+            return neuron_grid::grid_1d(neuron_grid::TOKENS);
+        }
         if config.dtype == DType::Mxfp8E4m3 {
             return SweepGrid::new(vec![hybrid_bucket_m_axis()]);
         }
@@ -290,7 +294,10 @@ mod tests {
                 assert!(has(b + 1), "first m past bucket {b} missing");
             }
         }
-        assert!(axis.windows(2).all(|w| w[0] < w[1]), "axis must be strictly increasing");
+        assert!(
+            axis.windows(2).all(|w| w[0] < w[1]),
+            "axis must be strictly increasing"
+        );
         assert_eq!(axis.first(), Some(&1.0));
         assert_eq!(axis.last(), Some(&8192.0));
         assert_eq!(axis.len(), 58);
@@ -333,6 +340,35 @@ mod tests {
         let fields = payloads[0].fields();
         assert_eq!(fields.len(), 5);
         assert_eq!(fields.get("dtype"), Some(&Value::from("mxfp8_e4m3")));
-        assert_eq!(fields.get("backend"), Some(&Value::from("flashinfer_mxfp8")));
+        assert_eq!(
+            fields.get("backend"),
+            Some(&Value::from("flashinfer_mxfp8"))
+        );
+    }
+
+    /// Catches the Neuron branch leaking into a GPU or mixed config (which would
+    /// resample every GPU row) or a Neuron config missing the contract grid.
+    #[test]
+    fn neuron_backends_take_the_tokens_grid_and_gpu_grid_is_unchanged() {
+        use crate::timing::kernels::neuron_grid;
+        use crate::timing::sweep::Axis;
+        let grid = |backends: Vec<&'static str>| {
+            SingleGemmSpec::sweep_grid(&SingleGemmKernelConfig {
+                backends,
+                gpu_name: "AWS Trainium2 LNC2".to_string(),
+                n: 2560.into(),
+                k: 5120.into(),
+                dtype: DType::Bf16,
+            })
+            .axes()
+            .to_vec()
+        };
+        assert_eq!(
+            grid(vec!["neuron_torch"]),
+            [neuron_grid::axis(neuron_grid::TOKENS)]
+        );
+        let gpu = [Axis::chain([Axis::pow2(0, 4), Axis::token_axis()])];
+        assert_eq!(grid(vec!["torch"]), gpu);
+        assert_eq!(grid(vec!["neuron_torch", "torch"]), gpu);
     }
 }

@@ -125,6 +125,7 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         Some(alignment) => admission.with_chunk_end_alignment(alignment),
         None => admission,
     };
+    let admission = admission.with_max_prefill_chunks(config.max_prefill_chunks_per_partition);
 
     IterBatchWorker::from_components(
         essentials.context,

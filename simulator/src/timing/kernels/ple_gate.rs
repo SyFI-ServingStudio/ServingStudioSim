@@ -7,6 +7,7 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::neuron_grid;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
@@ -46,6 +47,9 @@ impl KernelSpec for PleGateSpec {
             config.hidden_size > 0 && config.hc_mult > 0,
             "ple_gate needs a positive shape"
         );
+        if neuron_grid::is_neuron(&config.backends) {
+            return neuron_grid::grid_1d(neuron_grid::TOKENS);
+        }
         SweepGrid::new(vec![Axis::values(TOKEN_AXIS)])
     }
 
@@ -95,5 +99,32 @@ mod tests {
             ["backend", "dtype", "hc_mult", "hidden_size", "num_tokens"]
         );
         assert_eq!(fields["num_tokens"], 8);
+    }
+
+    /// Catches the Neuron branch leaking into a GPU or mixed config (which would
+    /// resample every GPU row) or a Neuron config missing the contract grid.
+    #[test]
+    fn neuron_backends_take_the_tokens_grid_and_gpu_grid_is_unchanged() {
+        use crate::timing::kernels::neuron_grid;
+        let grid = |backends: Vec<&'static str>| {
+            PleGateSpec::sweep_grid(&PleGateKernelConfig {
+                backends,
+                gpu_name: "AWS Trainium2 LNC2".to_string(),
+                hidden_size: 2560,
+                hc_mult: 4,
+                dtype: DType::Bf16,
+            })
+            .axes()
+            .to_vec()
+        };
+        assert_eq!(
+            grid(vec!["neuron_torch"]),
+            [neuron_grid::axis(neuron_grid::TOKENS)]
+        );
+        assert_eq!(grid(vec!["vllm_triton"]), [Axis::values(TOKEN_AXIS)]);
+        assert_eq!(
+            grid(vec!["neuron_torch", "vllm_triton"]),
+            [Axis::values(TOKEN_AXIS)]
+        );
     }
 }

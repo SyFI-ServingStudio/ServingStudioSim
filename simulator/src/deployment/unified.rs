@@ -184,6 +184,7 @@ impl Deployment for UnifiedDeployment {
             kv_admission,
             prefix_cache,
             prefill_chunk_alignment: g.worker.prefill_chunk_alignment(),
+            max_prefill_chunks_per_partition: g.worker.max_prefill_chunks_per_partition(),
             max_model_len: g.arch.max_model_len().ok(),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
@@ -802,6 +803,46 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::Qwen4ExpNeuronBf16 { neuron, .. } => {
+                ensure_hp_or_chunked_worker("Qwen4Exp BF16 on Trainium2", &g.worker)?;
+                let model = Arc::new(arch_build::qwen4_exp_neuron_bf16(
+                    model_spec, neuron, &gpu_name, MODEL_NAME, bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "Qwen4Exp BF16 on Trainium2",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            IterArchSel::Qwen4ExpNeuronBf16Speculative {
+                neuron,
+                draft_tokens,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::qwen4_exp_neuron_bf16_speculative(
+                    model_spec,
+                    neuron,
+                    *draft_tokens,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
             IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
                 max_model_len,
                 draft_tokens,
@@ -1262,6 +1303,7 @@ mod tests {
             prefill_gpu_time_multiplier: None,
             dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: None,
+            max_prefill_chunks_per_partition: None,
             kv_accounting: Default::default(),
         }
     }
@@ -1429,6 +1471,7 @@ pools:
             prefill_gpu_time_multiplier: None,
             kv_accounting: Default::default(),
             prefill_chunk_alignment: None,
+            max_prefill_chunks_per_partition: None,
         }
     }
 

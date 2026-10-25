@@ -1,0 +1,45 @@
+# P/D disaggregation on one trn2.48xlarge: a prefill instance and a decode instance,
+# each 8 chips (32 cores: attention DP4 x TP8, MoE EP32), each with its own layout
+# knobs. The KV handoff is a measured two-rank cross-chip all-gather.
+deployment: pd
+
+workload:
+  trace_files:
+    - presets/trn2/trn2_fixed_2k_512_c64.csv
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  run_to_end: true
+  request_rate: 1.0
+
+io:
+  log_dir: logs/trn2/qwen38_flash_next_bf16_trn2_pd_8x8chip
+
+pools:
+  prefill:
+    groups:
+      - gpu: "AWS Trainium2 LNC2"
+        replicas: 1
+        arch:
+          type: qwen4_exp_neuron_bf16
+          model_config: model/config/qwen3_8_flash_next_bf16.json
+          fp8: false
+          attn_dp: 4
+          attn_tp: 8
+          moe_ep: 32
+        worker:
+          type: pd_prefill
+          attn_gpu_memory_gb: 25.769803776
+  decode:
+    groups:
+      - gpu: "AWS Trainium2 LNC2"
+        replicas: 1
+        arch:
+          type: qwen4_exp_neuron_bf16
+          model_config: model/config/qwen3_8_flash_next_bf16.json
+          fp8: false
+          attn_dp: 4
+          attn_tp: 8
+          moe_ep: 32
+        worker:
+          type: pd_decode
+          attn_gpu_memory_gb: 25.769803776

@@ -1,0 +1,158 @@
+{
+ "note": "Second prediction set, made after top1 had run and before chunk4096 / tp8 / a2a finished (their logs unread). Same Sim (691917e9) and knobs as blind_w64_predictions.json; only the MTP acceptance input changes: each request takes the per-request acceptance of an earlier engine W64 k=1 run (three draws, below) instead of a uniform 0.67. Motivated by top1: the uniform rate predicted it 13% short; with its own measured per-request rates the Sim gives 61.4 s.",
+ "draws": {
+  "accdist": "w64_2048_512_block_k1",
+  "acc_rsag": "w64_2048_512_layer_rsag_k1",
+  "acc_2rep": "w64_2048_512_layer_k1_2rep_r0+r1"
+ },
+ "candidates": {
+  "top1": {
+   "per_draw": {
+    "accdist": {
+     "duration_s": 65.7543,
+     "out_tok_s": 498.3400325149838,
+     "ttft_p50_s": 18.048900390625,
+     "tpot_p50_ms": 68.91839599609375
+    },
+    "acc_rsag": {
+     "duration_s": 61.3659,
+     "out_tok_s": 533.9773392063018,
+     "ttft_p50_s": 18.048900390625,
+     "tpot_p50_ms": 69.89060974121094
+    },
+    "acc_2rep": {
+     "duration_s": 65.8371,
+     "out_tok_s": 497.71329539120035,
+     "ttft_p50_s": 18.048900390625,
+     "tpot_p50_ms": 69.08042907714844
+    }
+   },
+   "median": {
+    "duration_s": 65.7543,
+    "out_tok_s": 498.3400325149838,
+    "ttft_p50_s": 18.048900390625,
+    "tpot_p50_ms": 69.08042907714844
+   }
+  },
+  "chunk4096": {
+   "per_draw": {
+    "accdist": {
+     "duration_s": 65.9812,
+     "out_tok_s": 496.6263117372827,
+     "ttft_p50_s": 15.6247998046875,
+     "tpot_p50_ms": 66.0610580444336
+    },
+    "acc_rsag": {
+     "duration_s": 62.255199999999995,
+     "out_tok_s": 526.3496061373187,
+     "ttft_p50_s": 15.6247998046875,
+     "tpot_p50_ms": 67.03327178955078
+    },
+    "acc_2rep": {
+     "duration_s": 66.064,
+     "out_tok_s": 496.0038750302737,
+     "ttft_p50_s": 15.6247998046875,
+     "tpot_p50_ms": 66.87123107910156
+    }
+   },
+   "median": {
+    "duration_s": 65.9812,
+    "out_tok_s": 496.6263117372827,
+    "ttft_p50_s": 15.6247998046875,
+    "tpot_p50_ms": 66.87123107910156
+   }
+  },
+  "tp8": {
+   "per_draw": {
+    "accdist": {
+     "duration_s": 70.0408,
+     "out_tok_s": 467.84160089547805,
+     "ttft_p50_s": 17.535,
+     "tpot_p50_ms": 72.61878967285156
+    },
+    "acc_rsag": {
+     "duration_s": 64.4926,
+     "out_tok_s": 508.0893001677712,
+     "ttft_p50_s": 17.535,
+     "tpot_p50_ms": 74.52035522460938
+    },
+    "acc_2rep": {
+     "duration_s": 70.123,
+     "out_tok_s": 467.29318483236597,
+     "ttft_p50_s": 17.535,
+     "tpot_p50_ms": 73.26614379882812
+    }
+   },
+   "median": {
+    "duration_s": 70.0408,
+    "out_tok_s": 467.84160089547805,
+    "ttft_p50_s": 17.535,
+    "tpot_p50_ms": 73.26614379882812
+   }
+  },
+  "a2a": {
+   "per_draw": {
+    "accdist": {
+     "duration_s": 74.60310000000001,
+     "out_tok_s": 439.2310775289498,
+     "ttft_p50_s": 23.13080078125,
+     "tpot_p50_ms": 78.58708190917969
+    },
+    "acc_rsag": {
+     "duration_s": 70.1988,
+     "out_tok_s": 466.78860607303824,
+     "ttft_p50_s": 23.13080078125,
+     "tpot_p50_ms": 79.74951171875
+    },
+    "acc_2rep": {
+     "duration_s": 74.6819,
+     "out_tok_s": 438.7676264262157,
+     "ttft_p50_s": 23.13080078125,
+     "tpot_p50_ms": 78.87964630126953
+    }
+   },
+   "median": {
+    "duration_s": 74.60310000000001,
+    "out_tok_s": 439.2310775289498,
+    "ttft_p50_s": 23.13080078125,
+    "tpot_p50_ms": 78.87964630126953
+   }
+  },
+  "tp8_chunk4096": {
+   "per_draw": {
+    "accdist": {
+     "duration_s": 63.326699999999995,
+     "out_tok_s": 517.4436691000794,
+     "ttft_p50_s": 12.5822998046875,
+     "tpot_p50_ms": 67.82152557373047
+    },
+    "acc_rsag": {
+     "duration_s": 59.434599999999996,
+     "out_tok_s": 551.3286873302757,
+     "ttft_p50_s": 12.5822998046875,
+     "tpot_p50_ms": 71.38414764404297
+    },
+    "acc_2rep": {
+     "duration_s": 63.4092,
+     "out_tok_s": 516.7704370974559,
+     "ttft_p50_s": 12.5822998046875,
+     "tpot_p50_ms": 68.46927642822266
+    }
+   },
+   "median": {
+    "duration_s": 63.326699999999995,
+    "out_tok_s": 517.4436691000794,
+    "ttft_p50_s": 12.5822998046875,
+    "tpot_p50_ms": 68.46927642822266
+   },
+   "added": "2026-10-25T16:52, before it ran"
+  }
+ },
+ "predicted_rank_by_duration": [
+  "tp8_chunk4096",
+  "top1",
+  "chunk4096",
+  "tp8",
+  "a2a"
+ ]
+}

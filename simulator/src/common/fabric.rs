@@ -20,6 +20,15 @@ pub enum Fabric {
     Roce,
     #[serde(rename = "ethernet")]
     Ethernet,
+    /// Neuron collective group with one rank per Trainium2 chip (chips strided).
+    #[serde(rename = "neuron_c1")]
+    NeuronC1,
+    /// Neuron collective group with two ranks (logical cores) per chip.
+    #[serde(rename = "neuron_c2")]
+    NeuronC2,
+    /// Neuron collective group spanning all four logical cores of each chip.
+    #[serde(rename = "neuron_c4")]
+    NeuronC4,
 }
 
 impl Fabric {
@@ -34,6 +43,35 @@ impl Fabric {
             Fabric::Infiniband => "infiniband",
             Fabric::Roce => "roce",
             Fabric::Ethernet => "ethernet",
+            Fabric::NeuronC1 => "neuron_c1",
+            Fabric::NeuronC2 => "neuron_c2",
+            Fabric::NeuronC4 => "neuron_c4",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Fabric;
+
+    /// Catches `as_str` drifting from the serde wire name (the comm cache key).
+    #[test]
+    fn as_str_matches_serde_name() {
+        for fabric in [
+            Fabric::Nvlink,
+            Fabric::InfinityFabric,
+            Fabric::Pcie,
+            Fabric::Infiniband,
+            Fabric::Roce,
+            Fabric::Ethernet,
+            Fabric::NeuronC1,
+            Fabric::NeuronC2,
+            Fabric::NeuronC4,
+        ] {
+            assert_eq!(
+                serde_json::to_value(fabric).unwrap(),
+                serde_json::Value::from(fabric.as_str())
+            );
         }
     }
 }

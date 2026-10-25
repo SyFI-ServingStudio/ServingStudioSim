@@ -71,6 +71,9 @@ datacenter driver: the CUDA base image carries the forward-compatibility
 libraries (`/usr/local/cuda/compat`), which the NVIDIA container runtime uses
 when the host driver predates the image's CUDA (seen on driver 570, CUDA 12.8).
 
+A Neuron backend is measured on an AWS Trainium chip instead; see
+[Neuron execution](#neuron-execution).
+
 `VIBESIM_PROFILE_RUNTIME=host` runs each env on the host interpreter its
 registry entry names instead, for debugging against a local build. Those rows
 carry the same DB key as the image's, so compare them against the image before
@@ -275,6 +278,78 @@ historical results and record the selected database with the experiment.
 The main/simulator process therefore **never imports torch or a runner**: the
 registry holds lazy `RunnerRef`s, and the heavy import only happens in the worker
 subprocess after a GPU has been reserved.
+
+## Neuron execution
+
+A backend whose `BackendSupport.device_family` is `"neuron"` runs on an AWS
+Trainium chip through `exec/neuron.py`, never on a host interpreter.
+`get_default_pool(device_family)`, `plan.issue` and `perf_api.issue_collected`
+route by the backend's family, and one fill measures one family.
+
+**What a Neuron backend declares.**
+
+- `BackendSupport(device_family="neuron", architectures=frozenset({"Trainium2"}))`.
+  `architectures` matches the catalog `architecture` of the device; a Neuron
+  backend may not declare `min_compute_capability`/`sm_targets`, a CUDA
+  backend may not declare `architectures` (the registry validator enforces it).
+  The device is matched by catalog vendor (`AWS` → `neuron`), so a Neuron
+  backend never runs on a device the catalog does not know.
+- `subprocess_env`: a vendor-image env from `VENDOR_IMAGES` in
+  `container/images.py`. That selects the SDK. Today it is `neuron_sdk233_env`:
+  `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx@sha256:b9a9015b…`
+  (Neuron SDK 2.33, vLLM Neuron 0.29, Python 3.14 at `/opt/conda/bin/python`,
+  torch 2.13, `libtorch_neuronx_lite`). This checkout never builds or pulls it
+  (`docker pull` it yourself), and it accepts only an immutable digest. Add a
+  later SDK as a new `VendorImage` with a new env name beside this one.
+- `neuron_logical_cores` on the `KernelProfilerSpec` (default 1): the
+  contiguous span of logical cores the worker's ranks use. One core gets
+  `NEURON_RT_VISIBLE_CORES=<core>`; a span gets `NEURON_VISIBLE_DEVICES=<a>-<b>`
+  so that each rank sets its own runtime visibility.
+
+**Reservation.** The device's DB key comes from `neuron-ls` (`trn2.*` in LNC2
+mode → `AWS Trainium2 LNC2`, catalog `Trainium2-LNC2`), never from the requested
+label. The pool reserves a whole chip, even for a one-core backend, so two
+measurements never share its HBM or engines: it skips chips `neuron-ls` reports
+as having processes and takes a nonblocking lock at
+`/tmp/servingstudio-neuron-<chip>.lock`, shared by every checkout whatever its
+`TMPDIR`. It refuses an inherited `NEURON_RT_VISIBLE_CORES` or
+`NEURON_VISIBLE_DEVICES`. Inside the container the worker compares its own
+`neuron-ls` observation and environment with the reservation before it loads the
+runner. Energy and CUPTI `measure` requests are refused.
+
+**Container.** `docker run --rm --pull=never --ipc=host --network=host
+--entrypoint ""`, as the invoking (nonroot) uid, with every `/dev/neuron*` node
+mapped. The Neuron runtime's collectives bootstrap needs all of them and the
+host network even on one core; the boundary between jobs is core visibility
+and the chip lock. The image's ENTRYPOINT is a vLLM wrapper, so it is cleared
+and the image's Python runs `profiling.exec.local_worker`. The worker gets:
+
+- `NEURON_RT_ROOT_COMM_ID=127.0.0.1:<free port>`, one port per worker. Without
+  it every NEFF load fails with `NRT_INVALID`.
+- `NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS=256`. Without it, back-to-back
+  launches fail with "Execution Queue Full". A row's `worker_env` may override
+  this value. It cannot override the reservation, the collectives root or the
+  image ABI (`PATH`, `PYTHONPATH`, `LD_LIBRARY_PATH`, `PYTHONHOME`).
+- `profiling/` and `gpu/` mounted read-only at their host paths, with this
+  checkout on `PYTHONPATH`. HF and transformers run offline.
+
+Row provenance: the worker records the image's SDK/runtime package versions;
+the controller appends the inspected image ID and the host
+`aws-neuronx-dkms` version. Neuron rows keep NULL CUDA and driver versions.
+
+**Host configuration.**
+
+| Variable | Meaning |
+| --- | --- |
+| `SERVINGSTUDIO_NEURON_DOCKER_COMMAND` | Docker CLI argv (default `docker`). On a host where only root can open the socket, `sudo -n docker`. |
+| `SERVINGSTUDIO_NEURON_DOCKER_HOST` | Local `unix://` socket (default `unix:///var/run/docker.sock`). |
+| `SERVINGSTUDIO_NEURON_EXTRA_SOURCE_DIRS` | Colon-separated absolute directories of out-of-tree op source a runner imports (e.g. `/home/ec2-user/ServingStudio/framework/flashnext-neuron` for package `flashnext`). Mounted read-only and appended to `PYTHONPATH`. |
+| `SERVINGSTUDIO_NEURON_DATA_DIRS` | Colon-separated absolute data directories (e.g. checkpoints). Mounted read-only and passed to the worker under the same name. |
+| `SERVINGSTUDIO_NEURON_PROFILE_CACHE_DIR` | Writable compile/runtime cache (`HOME`, `TMPDIR`, `NEURON_COMPILE_CACHE_URL`, NKI artifacts), mounted at its own path. Default `$TMPDIR/servingstudio-neuron-cache`. Must not overlap a read-only mount. |
+| `SERVINGSTUDIO_NEURON_DEVICES` | Chip IDs the pool may reserve, as IDs or ranges (`8-15`, `8,9,12-15`). Unset: every chip. The busy check and chip lock still apply inside the set. |
+
+Caller policy that passes through: `VIBESIM_PROFILE_TIMELINE` (its directory is
+mounted writable), `PJRT_DEVICE`, `NEURON_CC_FLAGS` and `XLA_FLAGS`.
 
 ## The registry contract (the spine)
 

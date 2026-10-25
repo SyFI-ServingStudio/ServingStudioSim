@@ -441,6 +441,12 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
         prefill_chunk_alignment: Option<PrefillChunkAlignment>,
+        /// Prefill chunks one attention-DP partition may schedule per
+        /// iteration; further prompts wait for a later iteration. Absent is
+        /// unbounded. The flashnext-neuron engine runs one chunk per DP group
+        /// per step (`1`).
+        #[serde(default)]
+        max_prefill_chunks_per_partition: Option<u32>,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a
@@ -498,6 +504,12 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
         prefill_chunk_alignment: Option<PrefillChunkAlignment>,
+        /// Prefill chunks one attention-DP partition may schedule per
+        /// iteration; further prompts wait for a later iteration. Absent is
+        /// unbounded. The flashnext-neuron engine runs one chunk per DP group
+        /// per step (`1`).
+        #[serde(default)]
+        max_prefill_chunks_per_partition: Option<u32>,
     },
     /// Pipeline-parallel stage worker for the `pp` deployment: stage 0 admits
     /// requests and owns the pipeline's KV, later stages pull activations and
@@ -596,6 +608,20 @@ impl IterWorkerSel {
 
     /// The chunk alignment a chunked selector asks for; `None` follows the
     /// worker's `kv_overhead`.
+    pub(crate) fn max_prefill_chunks_per_partition(&self) -> Option<u32> {
+        match self {
+            Self::ChunkedPrefill {
+                max_prefill_chunks_per_partition,
+                ..
+            }
+            | Self::Speculative {
+                max_prefill_chunks_per_partition,
+                ..
+            } => *max_prefill_chunks_per_partition,
+            _ => None,
+        }
+    }
+
     pub(crate) fn prefill_chunk_alignment(&self) -> Option<PrefillChunkAlignment> {
         match self {
             Self::ChunkedPrefill {

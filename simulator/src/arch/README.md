@@ -130,7 +130,7 @@ variant's parameters.
 
 | Contract | Wired selectors |
 |---|---|
-| `IterArchSel` | `qwen36_local`, `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `deepseek_v4_vllm`, `deepseek_v4_vllm_serial_streams`, `deepseek_v41_vllm`, `deepseek_v41_vllm_serial_streams`, `glm52_vllm_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe_speculative`, `glm52_vllm_nvfp4_pp_dsa_moe`, `glm52_vllm_nvfp4_dp_attn_dsa_moe`, `glm53_vllm_nvfp4_dsa_moe_dflash2`, `glm52_sglang_nvfp4_tp_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_pp_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_dp_attn_ep_moe`, `inkling_vllm_nvfp4_rel_attn_moe`, `mimo_v2_vllm_fp8_swa_moe`, `qwen35_vllm_nvfp4_gdn_dense`, `qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative` |
+| `IterArchSel` | `qwen36_local`, `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `deepseek_v4_vllm`, `deepseek_v4_vllm_serial_streams`, `deepseek_v41_vllm`, `deepseek_v41_vllm_serial_streams`, `glm52_vllm_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe_speculative`, `glm52_vllm_nvfp4_pp_dsa_moe`, `glm52_vllm_nvfp4_dp_attn_dsa_moe`, `glm53_vllm_nvfp4_dsa_moe_dflash2`, `glm52_sglang_nvfp4_tp_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_pp_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_dp_attn_ep_moe`, `inkling_vllm_nvfp4_rel_attn_moe`, `mimo_v2_vllm_fp8_swa_moe`, `qwen35_vllm_nvfp4_gdn_dense`, `qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative`, `qwen4_exp_neuron_bf16`, `qwen4_exp_neuron_bf16_speculative` |
 | `AttnArchSel` | `qwen3_attn_tp` |
 | `FfnArchSel` | `qwen3_ffn_moe`, `qwen3_fp8_ffn_moe` |
 
@@ -149,6 +149,9 @@ schema; no second hand-maintained config union belongs here.
   - GLM-5.2/5.3 vLLM NVFP4 DP attention + EP (`glm52_vllm_nvfp4_dp_attn_dsa_moe`)
     → `hp_unified` or `chunked_prefill`, one KV partition per DP rank
   - GLM-5.2 SGLang NVFP4 pure TP → `chunked_prefill`
+  - Qwen4Exp BF16 on Trainium2 (`qwen4_exp_neuron_bf16`) → `hp_unified` or
+    `chunked_prefill`; `qwen4_exp_neuron_bf16_speculative` → `speculative`;
+    one KV partition per attention-DP group
   - Qwen4Exp vLLM NVFP4 MTP (`qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative`) →
     `speculative`
 - pp:
@@ -163,6 +166,8 @@ schema; no second hand-maintained config union belongs here.
     layers they hold, which `tools/pp-layer-balance/pp_layer_balance.py` reads
     to pick a balanced split from a finished run.
 - PD:
+  - Qwen4Exp BF16 on Trainium2 prefill → Qwen4Exp BF16 on Trainium2 decode
+    (KV handoff priced by a two-rank cross-chip all-gather)
   - Llama3 TP prefill → Llama3 TP decode
   - Llama3 TP prefill → Llama3 DP-attention/TP-FFN decode
 - AFD:

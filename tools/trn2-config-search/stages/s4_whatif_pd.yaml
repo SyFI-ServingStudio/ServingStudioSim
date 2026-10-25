@@ -1,0 +1,20 @@
+# Stage 4c: the stage-3c P/D grid under the stage-4a scenarios that apply to
+# P/D (unprefixed scenario knobs apply to both pools).
+name: s4_whatif_pd
+family: pd
+workloads_file: tools/trn2-config-search/stages/workloads.yaml
+base:
+  prefill.region_granularity: block
+  prefill.tp_collective: reduce_scatter_all_gather
+  prefill.moe_dispatch: all_gather
+  decode.region_granularity: block
+  decode.tp_collective: reduce_scatter_all_gather
+  decode.moe_dispatch: all_gather
+grid:
+  prefill.layout: [dp4-tp8-g8-ep32-mt1, dp8-tp4-g4-ep32-mt1, dp2-tp8-g16-ep32-mt1]
+  decode.layout: [dp4-tp8-g8-ep32-mt1, dp8-tp4-g4-ep32-mt1, dp2-tp8-g16-ep32-mt1]
+scenarios:
+  base: {}
+  no_pad: {spmd_padding: false}
+  moe_prefill_3x: {kind_time_scale: ["moe_block@256=0.3333", "moe_routed_experts@256=0.3333"]}
+  host_half: {host_time_scale: 0.5}

@@ -1,0 +1,15 @@
+# Stage 3c: P/D disaggregation, 8 prefill + 8 decode chips (the only split:
+# a replica needs >= 32 cores for its weights), each pool with its own layout.
+name: s3_pd
+family: pd
+workloads_file: tools/trn2-config-search/stages/workloads.yaml
+base:
+  prefill.region_granularity: block
+  prefill.tp_collective: reduce_scatter_all_gather
+  prefill.moe_dispatch: all_gather
+  decode.region_granularity: block
+  decode.tp_collective: reduce_scatter_all_gather
+  decode.moe_dispatch: all_gather
+grid:
+  prefill.layout: [dp4-tp8-g8-ep32-mt1, dp8-tp4-g4-ep32-mt1, dp2-tp8-g16-ep32-mt1]
+  decode.layout: [dp4-tp8-g8-ep32-mt1, dp8-tp4-g4-ep32-mt1, dp2-tp8-g16-ep32-mt1]

@@ -166,6 +166,42 @@ IMAGES = {
 }
 
 
+@dataclass(frozen=True)
+class VendorImage:
+    """An image this checkout runs but never builds: a vendor release, named by
+    its immutable content digest, whose own interpreter runs the worker."""
+
+    name: str
+    image: str
+    envs: tuple[str, ...]
+    python: str
+
+
+# A Neuron backend selects its SDK by naming one of these envs as its
+# ``subprocess_env``. A later SDK is added beside the existing one, under a new
+# env name, so rows measured on the old SDK keep their own image identity.
+VENDOR_IMAGES = {
+    image.name: image
+    for image in (
+        # Neuron SDK 2.33 with vLLM Neuron 0.29 (Python 3.14, torch 2.13,
+        # `libtorch_neuronx_lite`, neuronx-cc 2.28, nki 0.7). Tag
+        # 0.29.0.1.2.0-neuronx-py314-sdk2.33.0-ubuntu26.04. Its ENTRYPOINT is a
+        # vLLM wrapper; `exec/neuron.py` overrides it.
+        VendorImage(
+            "neuron-sdk233",
+            "public.ecr.aws/neuron/pytorch-inference-vllm-neuronx@sha256:"
+            "b9a9015b75a0fe6a2e46cce4c355f032979f507054ba33716e10b945d971e49b",
+            ("neuron_sdk233_env",),
+            "/opt/conda/bin/python",
+        ),
+    )
+}
+
+
+def vendor_image_for_env(env_name: str) -> VendorImage | None:
+    return next((image for image in VENDOR_IMAGES.values() if env_name in image.envs), None)
+
+
 def _overrides() -> dict[str, str]:
     raw = os.environ.get(IMAGES_ENV, "").strip()
     if not raw:
@@ -190,7 +226,8 @@ def image_for_env(env_name: str, root: Path = REPO_ROOT) -> str | None:
     for image in IMAGES.values():
         if env_name in image.envs:
             return image.tag(root)
-    return None
+    vendor = vendor_image_for_env(env_name)
+    return vendor.image if vendor is not None else None
 
 
 # Directory names `.dockerignore` keeps out of every build context.
@@ -252,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "list":
             for image in IMAGES.values():
                 print(f"{image.tag()}  {' '.join(image.envs)}")
+            for vendor in VENDOR_IMAGES.values():
+                print(f"{vendor.image}  {' '.join(vendor.envs)}  (vendor, not built)")
         elif args.command == "tag":
             print(IMAGES[args.image].tag())
         elif args.command == "build":

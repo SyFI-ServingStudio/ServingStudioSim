@@ -14,6 +14,7 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::neuron_grid;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
@@ -64,6 +65,17 @@ impl KernelSpec for PleShortConvSpec {
             config.kernel_size >= 2,
             "ple_short_conv needs kernel_size >= 2"
         );
+        if neuron_grid::is_neuron(&config.backends) {
+            let decode = || neuron_grid::axis(neuron_grid::DECODE);
+            return match config.mode.as_str() {
+                "decode" => SweepGrid::new(vec![decode(), Axis::values([1])]),
+                "spec" => SweepGrid::new(vec![decode(), Axis::values([2, 3, 4])]),
+                _ => SweepGrid::new(vec![
+                    Axis::values([1]),
+                    neuron_grid::axis(neuron_grid::TOKENS),
+                ]),
+            };
+        }
         let batch = || {
             Axis::values([
                 1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024,
@@ -168,5 +180,51 @@ mod tests {
     #[should_panic(expected = "mode")]
     fn rejects_unknown_mode() {
         PleShortConvSpec::sweep_grid(&config("mixed"));
+    }
+
+    /// Catches the Neuron branch leaking into a GPU or mixed config (which would
+    /// resample every GPU row) or a Neuron config missing the contract grid.
+    #[test]
+    fn neuron_backends_take_the_contract_grids_and_gpu_grid_is_unchanged() {
+        use crate::timing::kernels::neuron_grid::{axis, DECODE, TOKENS};
+        let grid = |mode: &str, backends: Vec<&'static str>| {
+            let mut cfg = config(mode);
+            cfg.backends = backends;
+            PleShortConvSpec::sweep_grid(&cfg).axes().to_vec()
+        };
+        let neuron = || vec!["neuron_torch"];
+        assert_eq!(grid("decode", neuron()), [axis(DECODE), Axis::values([1])]);
+        assert_eq!(
+            grid("spec", neuron()),
+            [axis(DECODE), Axis::values([2, 3, 4])]
+        );
+        assert_eq!(grid("prefill", neuron()), [Axis::values([1]), axis(TOKENS)]);
+        let mut cfg = config("prefill");
+        cfg.backends = neuron();
+        let mask = PleShortConvSpec::infeasible_mask(&cfg, &PleShortConvSpec::sweep_grid(&cfg));
+        assert!(mask.iter().all(|m| !*m));
+
+        let batch = Axis::values([
+            1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024,
+        ]);
+        for backends in [vec!["vllm_triton"], vec!["neuron_torch", "vllm_triton"]] {
+            assert_eq!(
+                grid("decode", backends.clone()),
+                [batch.clone(), Axis::values([1])]
+            );
+            assert_eq!(
+                grid("spec", backends.clone()),
+                [batch.clone(), Axis::values([1, 2, 3, 4, 6, 8])]
+            );
+            assert_eq!(
+                grid("prefill", backends),
+                [
+                    Axis::values([1, 2, 4, 8, 16, 32, 64, 128, 256]),
+                    Axis::values([
+                        1, 4, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+                    ]),
+                ]
+            );
+        }
     }
 }

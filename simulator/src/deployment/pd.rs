@@ -26,7 +26,7 @@ use crate::orchestrator::{
     DpPlacementPolicy, Flow, PdFlow, PlacementPolicy, SimpleDpPoolConfig, UnifiedWorkerFactory,
     PD_DECODE_POOL, PD_PREFILL_POOL,
 };
-use crate::timing::kernels::{P2pInterKernel, P2pInterKernelConfig};
+use crate::timing::kernels::{AllGatherKernel, AllGatherKernelConfig, P2pInterKernel, P2pInterKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_pd_decode_worker, build_pd_prefill_worker, resolve_prefix_cache_config, CostSource,
@@ -88,10 +88,10 @@ impl Deployment for PdDeployment {
         )?;
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
 
-        // The KV-transfer cost source: the profiled inter-node p2p curve, keyed
-        // on the decode GPU (receiver). Built once here (the bridge lives at L7)
-        // and handed to the flow's shared `GpuCluster`.
-        let cost = build_transfer_cost(&dg.gpu, bridge)?;
+        // The KV-transfer cost source is built per arm (the bridge lives at
+        // L7) and handed to the flow's shared `GpuCluster`: the profiled
+        // inter-node p2p curve keyed on the decode GPU (receiver) for GPUs, a
+        // cross-chip all-gather for Trainium.
 
         // Only the pairs actually exercised are wired (add a new arm when a new
         // pairing is needed). Each arm builds both pools' concrete models (own
@@ -123,6 +123,7 @@ impl Deployment for PdDeployment {
                         bridge,
                     )?)
                 };
+                let cost = build_transfer_cost(&dg.gpu, bridge)?;
                 Ok(assemble_pd_flow(
                     prefill_model,
                     decode_model,
@@ -171,6 +172,50 @@ impl Deployment for PdDeployment {
                         bridge,
                     )?)
                 };
+                let cost = build_transfer_cost(&dg.gpu, bridge)?;
+                Ok(assemble_pd_flow(
+                    prefill_model,
+                    decode_model,
+                    store,
+                    prefill_wc,
+                    decode_wc,
+                    log_dir,
+                    pg.gpu.clone(),
+                    dg.gpu.clone(),
+                    prefill_cfg,
+                    decode_cfg,
+                    cost,
+                ))
+            }
+            // flashnext-neuron on Trainium2: separate prefill and decode
+            // instances, each its own core set and layout, on one host.
+            (
+                IterArchSel::Qwen4ExpNeuronBf16 { neuron: pn, .. },
+                IterArchSel::Qwen4ExpNeuronBf16 { neuron: dn, .. },
+            ) => {
+                let prefill_model = {
+                    let _scope =
+                        bridge.with_backend_overrides("prefill", cfg.backends.get("prefill"));
+                    Arc::new(arch_build::qwen4_exp_neuron_bf16(
+                        pg.arch.model(),
+                        pn,
+                        &pg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
+                };
+                let decode_model = {
+                    let _scope =
+                        bridge.with_backend_overrides("decode", cfg.backends.get("decode"));
+                    Arc::new(arch_build::qwen4_exp_neuron_bf16(
+                        dg.arch.model(),
+                        dn,
+                        &dg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
+                };
+                let cost = build_neuron_transfer_cost(&dg.gpu, bridge)?;
                 Ok(assemble_pd_flow(
                     prefill_model,
                     decode_model,
@@ -188,7 +233,8 @@ impl Deployment for PdDeployment {
             (p, d) => bail!(
                 "pd: unsupported prefill/decode arch pairing \
                  (got prefill={p:?}, decode={d:?}); wired pairs: \
-                 dense_tp→dense_tp, dense_tp→dp_attn_tp_ffn"
+                 dense_tp→dense_tp, dense_tp→dp_attn_tp_ffn, \
+                 qwen4_exp_neuron_bf16→qwen4_exp_neuron_bf16"
             ),
         }
     }
@@ -378,6 +424,23 @@ fn build_transfer_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result
     )
     .with_context(|| format!("building p2p_inter kernel for PD KV transfer on {gpu_name}"))?;
     Ok(CostSource::Kernel(kernel))
+}
+
+/// The Trainium KV handoff: a two-rank all-gather between chips, one rank on
+/// each side (see `CostSource::NeuronAllGather`).
+fn build_neuron_transfer_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result<CostSource> {
+    let kernel = AllGatherKernel::build(
+        "pd_kv_transfer".to_string(),
+        AllGatherKernelConfig {
+            backends: vec!["neuron_cc"],
+            gpu_name: gpu_name.to_string(),
+            num_gpus: 2,
+            fabric: Fabric::NeuronC1,
+        },
+        bridge,
+    )
+    .with_context(|| format!("building the Neuron KV-transfer all-gather on {gpu_name}"))?;
+    Ok(CostSource::NeuronAllGather(kernel))
 }
 
 fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {

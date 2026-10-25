@@ -32,6 +32,7 @@ use crate::common::Fabric;
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::neuron_grid;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
@@ -65,7 +66,10 @@ impl KernelSpec for AllReduceSpec {
 
     const KIND: KernelKind = "all_reduce";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if neuron_grid::is_neuron(&config.backends) {
+            return neuron_grid::comm_bytes_grid();
+        }
         // 4 KB .. 1 GB byte ladder (2^12 .. 2^30).
         SweepGrid::new(vec![Axis::pow2(12, 30)])
     }
@@ -179,5 +183,40 @@ mod tests {
             .and_then(Value::as_u64)
             .is_some());
         assert_eq!(first.backend(), Some("nccl"));
+    }
+
+    /// Catches the Neuron branch leaking into a GPU or mixed config (which would
+    /// resample every GPU row) or a Neuron config missing the contract grid.
+    #[test]
+    fn neuron_backends_take_the_comm_bytes_grid_and_gpu_grid_is_unchanged() {
+        use crate::timing::kernels::neuron_grid::COMM_BYTES;
+        use crate::timing::sweep::Axis;
+        let grid = |backends: Vec<&'static str>, fabric: Fabric| {
+            AllReduceSpec::sweep_grid(&AllReduceKernelConfig {
+                backends,
+                gpu_name: "AWS Trainium2 LNC2".to_string(),
+                num_gpus: 4,
+                fabric,
+            })
+            .axes()
+            .to_vec()
+        };
+        let neuron: Vec<f64> = COMM_BYTES.iter().map(|&b| b as f64).collect();
+        assert_eq!(grid(vec!["neuron_cc"], Fabric::NeuronC4), [neuron]);
+        assert_eq!(grid(vec!["nccl"], Fabric::Nvlink), [Axis::pow2(12, 30)]);
+        assert_eq!(
+            grid(vec!["neuron_cc", "nccl"], Fabric::Nvlink),
+            [Axis::pow2(12, 30)]
+        );
+        let cfg = AllReduceKernelConfig {
+            backends: vec!["neuron_cc"],
+            gpu_name: "AWS Trainium2 LNC2".to_string(),
+            num_gpus: 4,
+            fabric: Fabric::NeuronC1,
+        };
+        let payloads =
+            AllReduceSpec::enumerate(&cfg, &AllReduceSpec::sweep_grid(&cfg), "neuron_cc");
+        assert_eq!(payloads[0].fields()["fabric"], "neuron_c1");
+        assert_eq!(payloads[4].fields()["message_size_bytes"], 16_777_216u64);
     }
 }

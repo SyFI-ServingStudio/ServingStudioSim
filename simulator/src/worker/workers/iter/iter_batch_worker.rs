@@ -960,6 +960,41 @@ mod tests {
         );
     }
 
+    /// Catches the per-partition chunk cap admitting a second prompt into the
+    /// same iteration: two 4-token prompts fit an 8-token budget, but the
+    /// flashnext engine schedules one prefill chunk per DP group per step.
+    #[test]
+    fn prefill_chunk_cap_defers_a_second_prompt_to_the_next_iteration() {
+        for (cap, chunks) in [(None, vec![(0, 4), (0, 4)]), (Some(1), vec![(0, 4)])] {
+            let store = shared_with(&[(0, 4, 3), (1, 4, 3)]);
+            let mut worker = build_chunked_prefill_worker(
+                WorkerId(0),
+                "main",
+                Arc::new(FakeModel::for_ms(1.0)),
+                Rc::clone(&store),
+                WorkerConfig {
+                    max_batch_tokens: Some(8),
+                    max_prefill_chunks_per_partition: cap,
+                    ..WorkerConfig::default()
+                },
+                None,
+                PoolId(0),
+                "test-gpu",
+                test_cluster(),
+            );
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+            let first = form_chunked_input(&mut worker, Time::ZERO);
+            assert_eq!(first.groups[0].prefill_chunk_pairs, chunks, "cap {cap:?}");
+            if cap.is_some() {
+                complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
+                let second = form_chunked_input(&mut worker, Time::from_ms(1.0));
+                assert_eq!(second.groups[0].prefill_chunk_pairs, [(0, 4)]);
+                assert_eq!(second.groups[0].decode_tokens, 1, "request 0 decodes");
+            }
+        }
+    }
+
     #[test]
     fn fcfs_retraction_resumes_the_most_recent_preemption_first() {
         // Three requests fit the bounded estimate, then decode growth retracts

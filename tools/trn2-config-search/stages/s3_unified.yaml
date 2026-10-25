@@ -1,0 +1,16 @@
+# Stage 3a: the stage-2 winners' switches over the best layouts, chunk 512 /
+# 1024 / 2048, layer vs block regions and the default vs a finer
+# context-bucket inventory. Knob values are set from the s2 report.
+name: s3_unified
+family: unified
+workloads_file: tools/trn2-config-search/stages/workloads.yaml
+base:
+  tp_collective: reduce_scatter_all_gather
+  moe_dispatch: all_gather
+layouts: [dp8-tp4-g4-ep32-mt1, dp8-tp2-g4-ep32-mt1, dp4-tp4-g8-ep32-mt1, dp4-tp8-g8-ep32-mt1, dp2-tp4-g16-ep32-mt1]
+grid:
+  region_granularity: [layer, block]
+  max_batch_tokens: [512, 1024, 2048]
+  context_buckets:
+    - [2048, 4096, 8192, 16384, 32768, 65536, 131072]
+    - [2048, 4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072]

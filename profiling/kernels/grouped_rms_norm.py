@@ -14,6 +14,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.neuron_common import neuron_spec
 
 KIND = "grouped_rms_norm"
 
@@ -77,6 +78,19 @@ register(
             summary="The fork's grouped_gemma_rmsnorm Triton op.",
             url="https://github.com/serendipity-zk/vllm/blob/892da0822f7e866cec8e519727f014c45a5ad792/vllm/models/qwen4_exp/nvidia/ops/hc.py",
         ),
+    )
+)
+
+# The Flash-Next Trainium engine's hyper-connection entry norm
+# (`flashnext/neuron/ops/hyperconnection.py::grouped_gemma_rms_norm`), one
+# compiled region, timed by NRT device time.
+register(
+    neuron_spec(
+        KIND,
+        "torch",
+        GroupedRmsNormArgs,
+        "The Flash-Next Trainium engine's grouped Gemma RMSNorm, plain torch "
+        "compiled by neuronx-cc as one region.",
     )
 )
 

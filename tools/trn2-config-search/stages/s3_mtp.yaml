@@ -1,0 +1,15 @@
+# Stage 3b: MTP (speculative) on the stage-3a style config, k = 1..3, at the
+# engine's serving acceptance on random-token prompts (0.67) and on the
+# correctness test's chat prompts (0.87), chunk 512 / 2048.
+name: s3_mtp
+family: mtp
+workloads_file: tools/trn2-config-search/stages/workloads.yaml
+accept_rates: [0.67, 0.87]
+base:
+  tp_collective: reduce_scatter_all_gather
+  moe_dispatch: all_gather
+  region_granularity: block
+layouts: [dp8-tp4-g4-ep32-mt1, dp4-tp8-g8-ep32-mt1, dp2-tp4-g16-ep32-mt1]
+grid:
+  draft_tokens: [1, 2, 3]
+  max_batch_tokens: [512, 2048]

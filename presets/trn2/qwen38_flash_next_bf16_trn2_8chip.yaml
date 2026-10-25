@@ -1,0 +1,47 @@
+# Qwen3.8-Flash-Next BF16 on 8 Trainium2 chips (32 LNC2 cores) of a trn2.48xlarge,
+# served by the flashnext-neuron engine (simulator/src/arch/qwen4_exp_neuron_bf16.rs):
+# 4 attention-DP groups of TP8 (GDN TP8 too), MoE EP32 over all 32 ranks, PLE table
+# row-sharded 32 ways, layer-granularity regions, chunked prefill at 2048 tokens, one
+# prefill chunk per DP group per step. This is the engine's measured W64 baseline
+# (serve_w64_2048_512_layer_k0: 169 s, 194 out tok/s; doc/pr/trn2-flashnext/ALIGNMENT.md),
+# with its compiled buckets. Arrival times are the trace's own (request_rate 1).
+# `--override pools.main.groups.0.replicas=2` fills all 16 chips with two replicas.
+#
+# Ranks are logical cores (4 per chip). One core has 24 GiB of HBM; the arch charges
+# its BF16 weights (~12.5 GB/rank here) + hbm_reserve_gb against attn_gpu_memory_gb,
+# so attn_gpu_memory_gb is the whole core. 16 ranks (EP16) do not fit the weights.
+deployment: unified
+
+workload:
+  trace_files:
+    - presets/trn2/trn2_fixed_2k_512_c64.csv
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  run_to_end: true
+  request_rate: 1.0
+
+io:
+  log_dir: logs/trn2/qwen38_flash_next_bf16_trn2_8chip
+
+pools:
+  main:
+    groups:
+      - gpu: "AWS Trainium2 LNC2"
+        replicas: 1
+        arch:
+          type: qwen4_exp_neuron_bf16
+          model_config: model/config/qwen3_8_flash_next_bf16.json
+          fp8: false
+          attn_dp: 4
+          attn_tp: 8
+          moe_ep: 32
+          region_granularity: layer
+          prefill_buckets: [128, 512, 2048]
+          decode_buckets: [1, 2, 4, 8, 16]
+          context_buckets: [2048, 4096]
+        worker:
+          type: chunked_prefill
+          attn_gpu_memory_gb: 25.769803776
+          max_batch_tokens: 2048
+          max_prefill_chunks_per_partition: 1
+          dp_placement: vllm-least-loaded

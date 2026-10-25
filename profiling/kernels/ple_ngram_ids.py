@@ -34,6 +34,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.neuron_common import neuron_spec
 
 KIND = "ple_ngram_ids"
 
@@ -87,6 +88,20 @@ register(
         supports=BackendSupport(compute=None),
         subprocess_env="vllm_env",
         doc=BackendDoc(summary="The fork's ple_ngram_ids (_ple_ngram_ids_kernel)."),
+    )
+)
+
+
+# The Flash-Next Trainium engine's exact int32-limb n-gram hash
+# (`flashnext/neuron/ops/ple.py::ple_ngram_ids_torch`), equal-length requests
+# [num_reqs, num_tokens / num_reqs], one region, NRT device time.
+register(
+    neuron_spec(
+        KIND,
+        "torch",
+        PleNgramIdsArgs,
+        "The Flash-Next Trainium engine's int32-limb n-gram hash, plain torch, one region.",
+        compute=None,
     )
 )
 

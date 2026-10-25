@@ -1,0 +1,8 @@
+# Smoke: the step-4 preset layout on all 16 chips, two workloads.
+name: s0_smoke
+family: unified
+workloads_file: tools/trn2-config-search/stages/workloads.yaml
+workloads: [fixed_2k_512, chat_r0.5]
+base: {layout: dp4-tp8-g8-ep32-mt1, max_batch_tokens: 2048}
+oat:
+  region_granularity: [layer]

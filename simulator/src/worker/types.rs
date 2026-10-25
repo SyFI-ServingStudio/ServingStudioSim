@@ -610,6 +610,9 @@ pub struct WorkerConfig {
     /// Attention-DP partition placement (from the chunked-prefill selector).
     /// Only multi-partition chunked-prefill workers read it.
     pub dp_placement: crate::worker::config::DpPlacement,
+    /// Prefill chunks one attention-DP partition may schedule per iteration
+    /// (chunked-prefill and speculative selectors). `None` is unbounded.
+    pub max_prefill_chunks_per_partition: Option<u32>,
 }
 
 impl Default for WorkerConfig {
@@ -637,6 +640,7 @@ impl Default for WorkerConfig {
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,
+            max_prefill_chunks_per_partition: None,
         }
     }
 }

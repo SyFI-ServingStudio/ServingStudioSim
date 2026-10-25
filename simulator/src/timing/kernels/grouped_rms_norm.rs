@@ -7,6 +7,7 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::neuron_grid;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -34,7 +35,10 @@ impl KernelSpec for GroupedRmsNormSpec {
 
     const KIND: KernelKind = "grouped_rms_norm";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if neuron_grid::is_neuron(&config.backends) {
+            return neuron_grid::grid_1d(neuron_grid::TOKENS);
+        }
         SweepGrid::new(vec![Axis::chain([Axis::pow2(0, 4), Axis::token_axis()])])
     }
 
@@ -95,5 +99,31 @@ mod tests {
             ]
         );
         assert_eq!(payloads[0].fields()["num_tokens"], 1);
+    }
+
+    /// Catches the Neuron branch leaking into a GPU or mixed config (which would
+    /// resample every GPU row) or a Neuron config missing the contract grid.
+    #[test]
+    fn neuron_backends_take_the_tokens_grid_and_gpu_grid_is_unchanged() {
+        use crate::timing::kernels::neuron_grid;
+        use crate::timing::sweep::Axis;
+        let grid = |backends: Vec<&'static str>| {
+            GroupedRmsNormSpec::sweep_grid(&GroupedRmsNormKernelConfig {
+                backends,
+                gpu_name: "AWS Trainium2 LNC2".to_string(),
+                hidden_size: 2560.into(),
+                num_groups: 4,
+                hidden_dtype: DType::Bf16,
+            })
+            .axes()
+            .to_vec()
+        };
+        assert_eq!(
+            grid(vec!["neuron_torch"]),
+            [neuron_grid::axis(neuron_grid::TOKENS)]
+        );
+        let gpu = [Axis::chain([Axis::pow2(0, 4), Axis::token_axis()])];
+        assert_eq!(grid(vec!["vllm_triton"]), gpu);
+        assert_eq!(grid(vec!["neuron_torch", "vllm_triton"]), gpu);
     }
 }

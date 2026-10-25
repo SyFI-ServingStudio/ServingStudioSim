@@ -1,0 +1,31 @@
+# Workloads of the trn2 config search (trn2_search/workloads.py).
+workloads:
+  # (a) the step-4 trace: 64 requests, 2048 in / 512 out, 50 ms apart.
+  - name: fixed_2k_512
+    file: presets/trn2/trn2_fixed_2k_512_c64.csv
+  # (b) agentic: 16-32k fresh prompts, 200-500 out, bursts of ~6 requests.
+  #     The engine has no prefix cache, so the long prompts are all prefilled.
+  - name: agentic_lo
+    kind: agentic
+    requests: 48
+    input_len: [16000, 32000]
+    output_len: [200, 500]
+    burst_rate: 0.0111   # one burst per ~90 s
+    burst_mean: 6
+    burst_spread_ms: 2000
+  - name: agentic_hi
+    kind: agentic
+    requests: 48
+    input_len: [16000, 32000]
+    output_len: [200, 500]
+    burst_rate: 0.0333   # one burst per ~30 s
+    burst_mean: 6
+    burst_spread_ms: 2000
+  # (c) chat: 1-2k in, 200-400 out, Poisson at several rates (req/s).
+  - {name: chat_r0.25, kind: chat, requests: 96, input_len: [1000, 2000], output_len: [200, 400], rate: 0.25}
+  - {name: chat_r0.5, kind: chat, requests: 128, input_len: [1000, 2000], output_len: [200, 400], rate: 0.5}
+  - {name: chat_r1, kind: chat, requests: 128, input_len: [1000, 2000], output_len: [200, 400], rate: 1.0}
+  - {name: chat_r2, kind: chat, requests: 192, input_len: [1000, 2000], output_len: [200, 400], rate: 2.0}
+  # Higher chat rates to find where the host saturates.
+  - {name: chat_r4, kind: chat, requests: 256, input_len: [1000, 2000], output_len: [200, 400], rate: 4.0}
+  - {name: chat_r8, kind: chat, requests: 256, input_len: [1000, 2000], output_len: [200, 400], rate: 8.0}

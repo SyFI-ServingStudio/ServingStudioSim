@@ -1,0 +1,29 @@
+# Stage 4a: what the engine would gain from changes it does not have yet, and
+# how the ranking moves under the least certain constants. The stage-1 grid at
+# 32-core layouts and 512-token chunks (stage 1's best chunk), under:
+#   base          the aligned engine;
+#   fused         one fused decode + prefill forward per step;
+#   no_pad        idle DP groups skip the forward's padded shape;
+#   multi_chunk   several prefill chunks per DP group per step;
+#   a2a_cf125     (on the all-to-all configs) a 1.25 capacity factor;
+#   moe_prefill_3x the MoE kernel 3x faster on calls of >= 256 rows;
+#   host_half     half the host time per region and per forward.
+name: s4_whatif_unified
+family: unified
+workloads_file: tools/trn2-config-search/stages/workloads.yaml
+base: {}
+layouts: auto
+layout_ranks: [32]
+grid:
+  tp_collective: [all_reduce, reduce_scatter_all_gather]
+  moe_dispatch: [all_gather, all_to_all]
+  region_granularity: [layer, block]
+  max_batch_tokens: [512]
+scenarios: &scenarios
+  base: {}
+  fused: {step_forwards: fused}
+  no_pad: {spmd_padding: false}
+  multi_chunk: {max_prefill_chunks_per_partition: 16}
+  a2a_cf125: {moe_a2a_capacity_factor: 1.25}
+  moe_prefill_3x: {kind_time_scale: ["moe_block@256=0.3333", "moe_routed_experts@256=0.3333"]}
+  host_half: {host_time_scale: 0.5}

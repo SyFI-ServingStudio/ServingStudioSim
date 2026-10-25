@@ -11,9 +11,11 @@ kernel kind owns its Python wire format and registry presence.
 """
 
 from profiling.kernels import (
+    all_gather,  # noqa: F401
     all_reduce,  # noqa: F401
     all_reduce_fusion,  # noqa: F401
     all_reduce_residual_rms_norm,  # noqa: F401
+    all_to_all,  # noqa: F401
     batched_gemm,  # noqa: F401
     bf16_fused_moe,  # noqa: F401
     clamped_swiglu,  # noqa: F401
@@ -45,22 +47,36 @@ from profiling.kernels import (
     gdn_causal_conv_decode,  # noqa: F401
     gdn_causal_conv_prefill,  # noqa: F401
     gdn_chunk_delta_rule,  # noqa: F401
+    gdn_conv1d_decode,  # noqa: F401
+    gdn_conv1d_prefill,  # noqa: F401
+    gdn_decode_core,  # noqa: F401
+    gdn_decode_mixer,  # noqa: F401
     gdn_gated_rms_norm,  # noqa: F401
+    gdn_in_proj,  # noqa: F401
+    gdn_output,  # noqa: F401
+    gdn_prefill_core,  # noqa: F401
+    gdn_prefill_mixer,  # noqa: F401
     gdn_prefill_post_conv,  # noqa: F401
     gdn_recurrent_decode,  # noqa: F401
     gdn_recurrent_decode_gated_norm,  # noqa: F401
+    gdn_split_gating,  # noqa: F401
+    gdn_state_io,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
     grouped_gemm,  # noqa: F401
     grouped_rms_norm,  # noqa: F401
     hc_combine,  # noqa: F401
+    hc_combine_mix,  # noqa: F401
     hc_combine_norm,  # noqa: F401
     hc_gate_mix,  # noqa: F401
+    hc_mix,  # noqa: F401
+    hc_mix_final,  # noqa: F401
     indexed_row_copy,  # noqa: F401
     inv_rope_fp8_quant,  # noqa: F401
     kda_chunk_prefill,  # noqa: F401
     kda_recurrent_decode,  # noqa: F401
     kv_cache_append,  # noqa: F401
     kv_compress_store,  # noqa: F401
+    lm_head_argmax,  # noqa: F401
     logits_topk,  # noqa: F401
     mhc_fused_post_pre_rms_norm,  # noqa: F401
     mhc_pre_rms_norm,  # noqa: F401
@@ -70,12 +86,16 @@ from profiling.kernels import (
     moe_align_block_size,  # noqa: F401
     moe_alltoall,  # noqa: F401
     moe_alltoall_prepare,  # noqa: F401
+    moe_block,  # noqa: F401
     moe_ep_all_gather,  # noqa: F401
     moe_ep_quantized_all_gather,  # noqa: F401
     moe_ep_reduce_scatter,  # noqa: F401
     moe_finalize_fuse_shared,  # noqa: F401
     moe_finalize_routing,  # noqa: F401
     moe_fused_topk,  # noqa: F401
+    moe_routed_experts,  # noqa: F401
+    moe_router,  # noqa: F401
+    moe_shared_expert,  # noqa: F401
     moe_sink_gate_select,  # noqa: F401
     moe_sum,  # noqa: F401
     moe_topk_softplus_sqrt,  # noqa: F401
@@ -88,13 +108,28 @@ from profiling.kernels import (
     packed_kv_cache_gather,  # noqa: F401
     paged_attn_batch_decode,  # noqa: F401
     paged_attn_batch_prefill,  # noqa: F401
+    ple_block,  # noqa: F401
     ple_gate,  # noqa: F401
     ple_ngram_ids,  # noqa: F401
+    ple_post,  # noqa: F401
+    ple_project,  # noqa: F401
+    ple_residual,  # noqa: F401
     ple_short_conv,  # noqa: F401
     q_kv_rms_norm,  # noqa: F401
     q_pad_kv_rope_mxfp8_insert,  # noqa: F401
     qk_rms_norm_rope_gate,  # noqa: F401
     qnorm_rope_kv_insert,  # noqa: F401
+    qsa_attention,  # noqa: F401
+    qsa_cache_write,  # noqa: F401
+    qsa_indexer_compress,  # noqa: F401
+    qsa_indexer_project,  # noqa: F401
+    qsa_indexer_scores,  # noqa: F401
+    qsa_indexer_select,  # noqa: F401
+    qsa_mixer2,  # noqa: F401
+    qsa_output,  # noqa: F401
+    qsa_project,  # noqa: F401
+    reduce_scatter,  # noqa: F401
+    region_launch_overhead,  # noqa: F401
     rel_bias_attention,  # noqa: F401
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
@@ -111,4 +146,5 @@ from profiling.kernels import (
     static_fp8_quant,  # noqa: F401
     vllm_fused_moe,  # noqa: F401
     vllm_mla_rope,  # noqa: F401
+    vocab_argmax,  # noqa: F401
 )

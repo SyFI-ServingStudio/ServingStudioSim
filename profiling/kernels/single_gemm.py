@@ -42,6 +42,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.neuron_common import neuron_spec
 
 KIND: str = "single_gemm"
 
@@ -349,5 +350,16 @@ register(
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py",
         ),
+    )
+)
+
+# A bf16 F.linear compiled by neuronx-cc as one region (the Flash-Next MTP fc), NRT device
+# time.
+register(
+    neuron_spec(
+        KIND,
+        "torch",
+        SingleGemmArgs,
+        "A bf16 torch F.linear compiled by neuronx-cc as one region (the Flash-Next MTP fc).",
     )
 )

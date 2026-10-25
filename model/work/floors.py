@@ -154,6 +154,7 @@ _SPECULATIVE_ARCHS = frozenset(
         "glm52_vllm_nvfp4_dsa_moe_speculative",
         "glm53_vllm_nvfp4_dsa_moe_dflash2",
         "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative",
+        "qwen4_exp_neuron_bf16_speculative",
     }
 )
 
@@ -164,6 +165,7 @@ _DEFAULT_DRAFT_TOKENS = {
     "glm52_vllm_nvfp4_dsa_moe_speculative": 5,
     "glm53_vllm_nvfp4_dsa_moe_dflash2": 7,
     "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative": 3,
+    "qwen4_exp_neuron_bf16_speculative": 3,
 }
 
 #: The proposer of a speculative arch that ships as its own checkpoint, by the

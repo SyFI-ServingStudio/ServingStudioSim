@@ -13,6 +13,8 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -52,6 +54,21 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
     if "energy" in worker_request:
         set_energy_enabled(bool(worker_request["energy"]))
 
+    # A Neuron worker first checks the chip it can see against the controller's
+    # reservation; neither the energy window nor the CUPTI probe exists there.
+    neuron = profiler_spec.supports.device_family == "neuron"
+    execution = worker_request.get("execution")
+    observed_neuron = None
+    if neuron:
+        if worker_request.get("energy") or worker_request.get("measure") is not None:
+            raise ValueError("Neuron workers do not support energy or CUPTI measure requests")
+        if execution is not None:
+            from profiling.exec.neuron import observe_neuron_reservation
+
+            observed_neuron = observe_neuron_reservation(execution)
+    elif execution is not None:
+        raise ValueError("a Neuron reservation cannot execute a CUDA backend")
+
     # An optional `measure` block turns this run into the trend+telemetry probe:
     # the context makes the shared Timer.cupti seam capture per-launch durations
     # instead of a single mean, without touching the runner. Absent block → the
@@ -88,8 +105,14 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
     finally:
         if measure_context is not None:
             clear_measure_context()
-    gpu_name = _current_gpu_name()
-    runtime_versions = _runtime_versions(backend)
+    if neuron:
+        from profiling.exec.neuron import current_neuron_name
+
+        gpu_name = observed_neuron.gpu_name if observed_neuron else current_neuron_name()
+        runtime_versions = _neuron_versions()
+    else:
+        gpu_name = _current_gpu_name()
+        runtime_versions = _runtime_versions(backend)
     row_provenance = profiler_spec.load_row_provenance()
     worker_results = [
         _to_payload(
@@ -197,6 +220,58 @@ def _runtime_versions(backend: str) -> dict[str, str | None]:
         "cuda_version": str(torch.version.cuda) if torch.version.cuda else None,
         "backend_version": backend_version,
     }
+
+
+# The image's Python stack and native runtime; every package that changes a
+# compiled Neuron graph or how it executes. Absent packages are skipped, so one
+# list covers the full `torch-neuronx` SDKs and the native "lite" route of SDK
+# 2.33 (`libtorch-neuronx-lite`, no `torch-neuronx`).
+_NEURON_PACKAGES = (
+    "torch",
+    "numpy",
+    "ml-dtypes",
+    "nki",
+    "nki-library",
+    "neuronx-cc",
+    "torch-neuronx",
+    "libtorch-neuronx-lite",
+    "torch-xla",
+    "islpy",
+    "neuronx-distributed",
+    "neuronx-distributed-inference",
+    "vllm",
+    "vllm-neuron",
+)
+_NEURON_RUNTIME_RPMS = (
+    "aws-neuronx-dkms",
+    "aws-neuronx-runtime-lib",
+    "aws-neuronx-collectives",
+    "aws-neuronx-tools",
+)
+_NEURON_RUNTIME_DEBS = ("aws-neuronx-runtime-lib", "aws-neuronx-collectives")
+
+
+def _neuron_versions() -> dict[str, str | None]:
+    """Worker-observed Neuron provenance. A Neuron row has no CUDA version."""
+    versions = []
+    for package in _NEURON_PACKAGES:
+        try:
+            versions.append(f"{package}={importlib.metadata.version(package)}")
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    if shutil.which("rpm"):
+        query = ["rpm", "-q", "--queryformat", "%{NAME}=%{VERSION}-%{RELEASE}\\n"]
+        query += _NEURON_RUNTIME_RPMS
+    elif shutil.which("dpkg-query"):
+        query = ["dpkg-query", "--show", "--showformat=${binary:Package}=${Version}\n"]
+        query += _NEURON_RUNTIME_DEBS
+    else:
+        query = None
+    if query is not None:
+        result = subprocess.run(query, capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            versions.extend(result.stdout.splitlines())
+    return {"cuda_version": None, "backend_version": "; ".join(versions) or None}
 
 
 def main(argv: list[str] | None = None) -> int:

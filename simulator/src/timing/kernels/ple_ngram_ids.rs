@@ -6,8 +6,12 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::neuron_grid;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
+
+/// Requests per call on the Neuron grid.
+const NEURON_REQS: [u32; 4] = [1, 8, 64, 256];
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PleNgramIdsKernelConfig {
@@ -37,6 +41,12 @@ impl KernelSpec for PleNgramIdsSpec {
             config.ngram_context_len > 0 && config.heads_per_ngram > 0,
             "ple_ngram_ids needs a positive n-gram geometry"
         );
+        if neuron_grid::is_neuron(&config.backends) {
+            return SweepGrid::new(vec![
+                neuron_grid::axis(neuron_grid::TOKENS),
+                Axis::values(NEURON_REQS),
+            ]);
+        }
         SweepGrid::new(vec![
             Axis::values([1, 16, 64, 256, 1024, 2048, 4096, 8192, 16384, 32768]),
             Axis::values([1, 16, 64, 256, 1024]),
@@ -105,6 +115,45 @@ mod tests {
                 "num_reqs",
                 "num_tokens"
             ]
+        );
+    }
+
+    /// Catches the Neuron branch leaking into a GPU or mixed config (which would
+    /// resample every GPU row) or a Neuron config missing the contract grid.
+    #[test]
+    fn neuron_backends_take_the_tokens_by_reqs_grid_and_gpu_grid_is_unchanged() {
+        let cfg = |backends: Vec<&'static str>| PleNgramIdsKernelConfig {
+            backends,
+            gpu_name: "AWS Trainium2 LNC2".to_string(),
+            ngram_context_len: 2,
+            heads_per_ngram: 8,
+        };
+        let neuron = cfg(vec!["neuron_torch"]);
+        let grid = PleNgramIdsSpec::sweep_grid(&neuron);
+        assert_eq!(
+            grid.axes(),
+            [
+                crate::timing::kernels::neuron_grid::axis(
+                    crate::timing::kernels::neuron_grid::TOKENS
+                ),
+                Axis::values([1, 8, 64, 256]),
+            ]
+        );
+        let mask = PleNgramIdsSpec::infeasible_mask(&neuron, &grid);
+        // 14 x 4 cells minus the 17 with reqs > tokens (tokens 1..4: 3 each,
+        // 8..32: 2 each, 64 and 128: 1 each).
+        assert_eq!(mask.iter().filter(|m| !**m).count(), 39);
+        let gpu = [
+            Axis::values([1, 16, 64, 256, 1024, 2048, 4096, 8192, 16384, 32768]),
+            Axis::values([1, 16, 64, 256, 1024]),
+        ];
+        assert_eq!(
+            PleNgramIdsSpec::sweep_grid(&cfg(vec!["vllm_triton"])).axes(),
+            gpu
+        );
+        assert_eq!(
+            PleNgramIdsSpec::sweep_grid(&cfg(vec!["neuron_torch", "vllm_triton"])).axes(),
+            gpu
         );
     }
 }

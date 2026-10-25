@@ -14,6 +14,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.neuron_common import neuron_spec
 
 KIND = "gemm_fp32_output"
 
@@ -152,6 +153,18 @@ register(
             ),
             url=None,
         ),
+    )
+)
+
+
+# The Flash-Next Trainium engine's LM head (`flashnext/neuron/ops/head.py::lm_head_torch`):
+# bf16 GEMM with fp32 logits, one region, NRT device time.
+register(
+    neuron_spec(
+        KIND,
+        "torch",
+        GemmFp32OutputArgs,
+        "The Flash-Next Trainium engine's LM-head F.linear with fp32 logits, one region.",
     )
 )
 

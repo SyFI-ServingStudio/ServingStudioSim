@@ -1,0 +1,17 @@
+# Stage 1: layout screen on the engine-aligned arch (doc/pr/trn2-flashnext/
+# ALIGNMENT.md). Every structurally valid layout of a 32- or 64-core replica,
+# crossed with the two TP collectives, the two MoE dispatches (all-to-all at
+# the engine's exact capacity), layer / block regions and 512 / 2048-token
+# chunks; the engine's scheduler (one chunk per DP group per step). probe
+# drops what the HBM check refuses or lacks rows.
+name: s1_layout
+family: unified
+workloads_file: tools/trn2-config-search/stages/workloads.yaml
+base: {}
+layouts: auto
+layout_ranks: [32, 64]
+grid:
+  tp_collective: [all_reduce, reduce_scatter_all_gather]
+  moe_dispatch: [all_gather, all_to_all]
+  region_granularity: [layer, block]
+  max_batch_tokens: [512, 2048]

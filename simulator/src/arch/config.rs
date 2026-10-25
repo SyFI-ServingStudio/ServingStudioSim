@@ -32,6 +32,9 @@ use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::glm52_model_cfg::Glm52MtpMode;
 use super::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
+use super::qwen4_exp_neuron_bf16::{
+    LaunchModel, MoeDispatch, PleTableShards, RegionGranularity, StepForwards, TpCollective,
+};
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
 /// carries no `deny_unknown_fields` (the flattened struct must let the arch's
@@ -139,6 +142,281 @@ const fn default_qwen4_exp_draft_tokens() -> u32 {
 const QWEN4_EXP_CACHE_DTYPES: [&str; 2] = Qwen4ExpCacheDtype::CHOICES;
 /// [`PleTableResidency`]'s serde representation.
 const PLE_TABLE_RESIDENCIES: [&str; 2] = PleTableResidency::CHOICES;
+
+// ── Qwen4Exp BF16 on Trainium2 (flashnext-neuron) ───────────────────────────
+
+const NEURON_REGION_GRANULARITIES: [&str; 4] = RegionGranularity::CHOICES;
+const NEURON_STEP_FORWARDS: [&str; 2] = StepForwards::CHOICES;
+const NEURON_TP_COLLECTIVES: [&str; 2] = TpCollective::CHOICES;
+const NEURON_MOE_DISPATCHES: [&str; 2] = MoeDispatch::CHOICES;
+const NEURON_PLE_TABLE_SHARDS: [&str; 3] = PleTableShards::CHOICES;
+
+const fn default_neuron_lnc() -> u32 {
+    2
+}
+const fn default_one() -> u32 {
+    1
+}
+const fn default_neuron_attn_tp() -> u32 {
+    8
+}
+/// NRT dispatch of a NEFF with the execution barrier off, collective or not
+/// (flashnext `logs/engine/probe_groups_nobarrier.jsonl`).
+const fn default_neuron_launch_coll_ms() -> f64 {
+    0.15
+}
+const fn default_neuron_launch_plain_ms() -> f64 {
+    0.15
+}
+/// Host time per engine step outside its forwards (scheduling, emission):
+/// step wall minus the forwards' walls in `logs/engine/serve_*.jsonl`.
+const fn default_neuron_step_overhead_ms() -> f64 {
+    STEP_OVERHEAD_MS
+}
+const fn default_neuron_forward_overhead_ms() -> f64 {
+    FORWARD_OVERHEAD_MS
+}
+const fn default_neuron_mtp_forward_overhead_ms() -> f64 {
+    MTP_FORWARD_OVERHEAD_MS
+}
+/// Fitted on the full engine's serving steps (doc/pr/trn2-flashnext/ALIGNMENT.md).
+const STEP_OVERHEAD_MS: f64 = 2.5;
+const FORWARD_OVERHEAD_MS: f64 = 19.0;
+const MTP_FORWARD_OVERHEAD_MS: f64 = 2.0;
+const fn default_neuron_region_gap_ms() -> f64 {
+    REGION_GAP_MS
+}
+const REGION_GAP_MS: f64 = 0.17;
+const fn default_neuron_a2a_pack_us_per_row() -> f64 {
+    A2A_PACK_US_PER_ROW
+}
+const A2A_PACK_US_PER_ROW: f64 = 0.8;
+const fn default_neuron_host_time_scale() -> f64 {
+    1.0
+}
+const fn default_true() -> bool {
+    true
+}
+const NEURON_LAUNCH_MODELS: [&str; 3] = LaunchModel::CHOICES;
+/// One Trainium2 LNC2 core's HBM bank: 96 GiB per chip / 4 cores.
+const fn default_neuron_hbm_per_core_gb() -> f64 {
+    25.769_803_776
+}
+const fn default_neuron_hbm_reserve_gb() -> f64 {
+    2.0
+}
+fn default_neuron_prefill_buckets() -> Vec<u32> {
+    vec![128, 256, 512, 1024, 2048, 4096, 8192]
+}
+fn default_neuron_decode_buckets() -> Vec<u32> {
+    vec![1, 2, 4, 8, 16, 32, 64, 128, 256]
+}
+/// The engine compiles a 2048 bucket: a prompt chunk within the indexer's
+/// 2048-token budget runs QSA's dense path (15x cheaper than sparse at 2048).
+fn default_neuron_context_buckets() -> Vec<u32> {
+    vec![2048, 4096, 8192, 16384, 32768, 65536, 131072]
+}
+fn strings(xs: &[&str]) -> Vec<String> {
+    xs.iter().map(|x| x.to_string()).collect()
+}
+fn default_neuron_gdn_prefill_impls() -> Vec<String> {
+    strings(&["nki"])
+}
+fn default_neuron_torch_impls() -> Vec<String> {
+    strings(&["torch"])
+}
+fn default_neuron_qsa_attn_impls() -> Vec<String> {
+    strings(&["torch_sparse"])
+}
+fn default_neuron_nki_impls() -> Vec<String> {
+    strings(&["nki"])
+}
+fn default_neuron_moe_impls() -> Vec<String> {
+    strings(&["auto"])
+}
+fn default_neuron_router_impls() -> Vec<String> {
+    strings(&["torch_topk_first"])
+}
+
+/// The serving knobs of the flashnext-neuron engine for Qwen4Exp BF16 on
+/// Trainium2, flattened into both `qwen4_exp_neuron_bf16` tags. Ranks are
+/// LNC2 logical cores (4 per chip). See `arch/qwen4_exp_neuron_bf16.rs`.
+#[derive(Debug, Clone, Deserialize, ParamStruct)]
+pub struct NeuronFlashNextSpec {
+    /// Context cap; sizes the QSA context buckets a request may reach.
+    #[serde(default = "default_qwen4_exp_max_model_len")]
+    #[param(default = 131072, cache_key)]
+    pub max_model_len: u32,
+    /// Logical NeuronCore config (physical cores per rank). Only LNC2 rows exist.
+    #[serde(default = "default_neuron_lnc")]
+    #[param(default = 2, cache_key)]
+    pub lnc: u32,
+    /// Attention data-parallel groups per replica (one KV partition each).
+    #[serde(default = "default_one")]
+    #[param(default = 1, cache_key)]
+    pub attn_dp: u32,
+    /// QSA tensor parallelism (1, 2, 4 or 8).
+    #[serde(default = "default_neuron_attn_tp")]
+    #[param(default = 8, cache_key)]
+    pub attn_tp: u32,
+    /// GDN tensor parallelism (1..16); omitted = attn_tp. A DP group spans
+    /// max(attn_tp, gdn_tp) ranks.
+    #[serde(default)]
+    #[param(cache_key)]
+    pub gdn_tp: Option<u32>,
+    /// MoE expert parallelism; omitted = every rank of the replica / moe_tp.
+    #[serde(default)]
+    #[param(cache_key)]
+    pub moe_ep: Option<u32>,
+    /// MoE tensor parallelism over the expert intermediate.
+    #[serde(default = "default_one")]
+    #[param(default = 1, cache_key)]
+    pub moe_tp: u32,
+    /// Collective after a TP mixer: all_reduce, or reduce_scatter_all_gather
+    /// (sequence-parallel token-wise regions).
+    #[serde(default)]
+    #[param(string, default = "all_reduce", choices = NEURON_TP_COLLECTIVES, cache_key)]
+    pub tp_collective: TpCollective,
+    /// MoE token dispatch: all_gather (fused block over all tokens) or all_to_all.
+    #[serde(default)]
+    #[param(string, default = "all_gather", choices = NEURON_MOE_DISPATCHES, cache_key)]
+    pub moe_dispatch: MoeDispatch,
+    /// Compiled-region granularity: per_op, mixer (the engine's fused
+    /// regions) or layer (one region per layer).
+    #[serde(default)]
+    #[param(string, default = "mixer", choices = NEURON_REGION_GRANULARITIES, cache_key)]
+    pub region_granularity: RegionGranularity,
+    /// How a step runs decode rows and prefill chunks: separate (the engine:
+    /// a decode forward, then a prefill forward) or fused (one forward).
+    #[serde(default)]
+    #[param(string, default = "separate", choices = NEURON_STEP_FORWARDS, cache_key)]
+    pub step_forwards: StepForwards,
+    /// Every DP group runs the forward's padded shape (SPMD), idle groups
+    /// included. false = each group pays only its own shape.
+    #[serde(default = "default_true")]
+    #[param(default = true, cache_key)]
+    pub spmd_padding: bool,
+    /// Device factor f_g on every compute leaf; omitted = the full-engine fit
+    /// (1.0 at every granularity).
+    #[serde(default)]
+    pub region_device_factor: Option<f64>,
+    /// Host launch: pipelined (the barrier-off engine: max(device, host) per
+    /// forward + a forward constant), calibrated (per region max(f_g x
+    /// device, L_r)) or l1_additive (the region_launch_overhead row).
+    #[serde(default)]
+    #[param(string, default = "pipelined", choices = NEURON_LAUNCH_MODELS)]
+    pub launch_model: LaunchModel,
+    /// Calibrated only: launch floor of a region that traces a collective (ms).
+    #[serde(default = "default_neuron_launch_coll_ms")]
+    #[param(default = 0.15)]
+    pub launch_coll_ms: f64,
+    /// Calibrated only: launch floor of a plain region (ms).
+    #[serde(default = "default_neuron_launch_plain_ms")]
+    #[param(default = 0.15)]
+    pub launch_plain_ms: f64,
+    /// Pipelined: host dispatch per region, also the device floor of a region
+    /// holding a collective across DP groups; omitted = the granularity's
+    /// fit (per_op 0.3, mixer 1.0, layer 1.3, block 3.7 ms).
+    #[serde(default)]
+    pub region_host_ms: Option<f64>,
+    /// Pipelined: device time per region launch outside the regions' own
+    /// executions (step device minus the region sum in
+    /// `logs/engine/full_decode_bench.jsonl`: ~11 ms over 63 layer regions).
+    #[serde(default = "default_neuron_region_gap_ms")]
+    #[param(default = 0.17)]
+    pub region_gap_ms: f64,
+    /// Pipelined: host work per target forward besides region dispatch
+    /// (input assembly, H2D, id readback); it overlaps the device (ms).
+    #[serde(default = "default_neuron_forward_overhead_ms")]
+    #[param(default = 19.0)]
+    pub forward_overhead_ms: f64,
+    /// Pipelined: the same per MTP forward (ms).
+    #[serde(default = "default_neuron_mtp_forward_overhead_ms")]
+    #[param(default = 2.0)]
+    pub mtp_forward_overhead_ms: f64,
+    /// Per-step host constant outside the forwards (scheduling, emission; ms).
+    #[serde(default = "default_neuron_step_overhead_ms")]
+    #[param(default = 2.5)]
+    pub step_overhead_ms: f64,
+    /// What-if only: multiplies every host constant (region_host_ms,
+    /// forward_overhead_ms, mtp_forward_overhead_ms, step_overhead_ms; 0.5 =
+    /// a host twice as fast). Default 1.
+    #[serde(default = "default_neuron_host_time_scale")]
+    #[param(default = 1.0)]
+    pub host_time_scale: f64,
+    /// All-to-all dispatch capacity factor: each rank sends each destination
+    /// min(S, ceil(cf x S x top_k / ranks)) rows (tokens beyond it are
+    /// dropped). 0 = exact capacity S (the engine default; no drops).
+    #[serde(default)]
+    #[param(default = 0.0, cache_key)]
+    pub moe_a2a_capacity_factor: f64,
+    /// All-to-all: the engine's slot packing and scatter-add per received
+    /// row, on each all-to-all leaf (µs; fitted on the engine's W64 a2a run,
+    /// not an L1 row).
+    #[serde(default = "default_neuron_a2a_pack_us_per_row")]
+    #[param(default = 0.8)]
+    pub moe_a2a_pack_us_per_row: f64,
+    /// Compiled prefill chunk sizes; a chunk pads to the next one.
+    #[serde(default = "default_neuron_prefill_buckets")]
+    pub prefill_buckets: Vec<u32>,
+    /// Compiled decode batch sizes; a batch pads to the next one.
+    #[serde(default = "default_neuron_decode_buckets")]
+    pub decode_buckets: Vec<u32>,
+    /// Compiled QSA context sizes (block-table length); context pads to the next one.
+    #[serde(default = "default_neuron_context_buckets")]
+    pub context_buckets: Vec<u32>,
+    /// PLE n-gram table residency: replica (row-sharded over every rank),
+    /// dp_group (over one DP group's ranks) or host (unsupported on Neuron).
+    #[serde(default)]
+    #[param(string, default = "replica", choices = NEURON_PLE_TABLE_SHARDS, cache_key)]
+    pub ple_table_shards: PleTableShards,
+    /// HBM of one logical core (GB); weights + reserve must fit.
+    #[serde(default = "default_neuron_hbm_per_core_gb")]
+    #[param(default = 25.769803776)]
+    pub hbm_per_core_gb: f64,
+    /// Per-core runtime/activation reserve kept out of the KV budget (GB).
+    #[serde(default = "default_neuron_hbm_reserve_gb")]
+    #[param(default = 2.0)]
+    pub hbm_reserve_gb: f64,
+    /// GDN prefill mixer impls (op IMPLS keys; several = best measured per shape).
+    #[serde(default = "default_neuron_gdn_prefill_impls")]
+    pub gdn_prefill_impls: Vec<String>,
+    /// GDN decode mixer impls.
+    #[serde(default = "default_neuron_torch_impls")]
+    pub gdn_decode_impls: Vec<String>,
+    /// QSA prefill attention impls (torch_sparse, nki; torch_dense per-op only).
+    #[serde(default = "default_neuron_qsa_attn_impls")]
+    pub qsa_prefill_impls: Vec<String>,
+    /// QSA decode attention impls.
+    #[serde(default = "default_neuron_qsa_attn_impls")]
+    pub qsa_decode_impls: Vec<String>,
+    /// QSA indexer top-k impls (per-op granularity).
+    #[serde(default = "default_neuron_nki_impls")]
+    pub qsa_select_impls: Vec<String>,
+    /// QSA indexer score impls (per-op granularity).
+    #[serde(default = "default_neuron_torch_impls")]
+    pub qsa_scores_impls: Vec<String>,
+    /// Routed-expert impls (moe_block / moe_routed_experts).
+    #[serde(default = "default_neuron_moe_impls")]
+    pub moe_routed_impls: Vec<String>,
+    /// Router impls (per-op / all-to-all).
+    #[serde(default = "default_neuron_router_impls")]
+    pub moe_router_impls: Vec<String>,
+    /// Shared-expert impls (per-op / all-to-all).
+    #[serde(default = "default_neuron_torch_impls")]
+    pub moe_shared_impls: Vec<String>,
+    /// HC mix impls (torch, torch_cat).
+    #[serde(default = "default_neuron_torch_impls")]
+    pub hc_mix_impls: Vec<String>,
+    /// lm_head + argmax impls (torch, nki).
+    #[serde(default = "default_neuron_torch_impls")]
+    pub head_impls: Vec<String>,
+    /// What-if device-time scales for sensitivity studies: `kind=factor` or
+    /// `kind@min_rows=factor` multiplies every compute leaf of that L1 kind (at
+    /// calls of >= min_rows rows) before f_g and the launch floor. Default none.
+    #[serde(default)]
+    pub kind_time_scale: Vec<String>,
+}
 
 /// The captured GLM-5.3-Flash deployment ran `--enable-expert-parallel`.
 const fn default_glm53_flash_enable_expert_parallel() -> bool {
@@ -1188,6 +1466,28 @@ pub enum IterArchSel {
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },
+    /// Qwen4Exp BF16 (`Qwen/Qwen3.8-Flash-Next`, text only) served by the
+    /// flashnext-neuron engine on AWS Trainium2 LNC2 cores: GDN and QSA
+    /// mixers, hyper-connections, the PLE block, BF16 routed + shared experts,
+    /// bucketed static-shape compiled regions. No MTP drafting. Knobs:
+    /// [`NeuronFlashNextSpec`].
+    Qwen4ExpNeuronBf16 {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(flatten)]
+        neuron: NeuronFlashNextSpec,
+    },
+    /// The same with the checkpoint's MTP layer drafting `draft_tokens`.
+    Qwen4ExpNeuronBf16Speculative {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(flatten)]
+        neuron: NeuronFlashNextSpec,
+        /// MTP drafts per step: the verify width is draft_tokens + 1.
+        #[serde(default = "default_qwen4_exp_draft_tokens")]
+        #[param(default = 3, cache_key)]
+        draft_tokens: u32,
+    },
 }
 
 impl IterArchSel {
@@ -1221,7 +1521,9 @@ impl IterArchSel {
             | Self::InklingVllmNvfp4RelAttnMoe { model, .. }
             | Self::MimoV2VllmFp8SwaMoe { model, .. }
             | Self::Qwen35VllmNvfp4GdnDense { model, .. }
-            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { model, .. } => model,
+            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { model, .. }
+            | Self::Qwen4ExpNeuronBf16 { model, .. }
+            | Self::Qwen4ExpNeuronBf16Speculative { model, .. } => model,
         }
     }
 
@@ -1249,6 +1551,8 @@ impl IterArchSel {
             | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { max_model_len, .. } => {
                 Ok(*max_model_len)
             }
+            Self::Qwen4ExpNeuronBf16 { neuron, .. }
+            | Self::Qwen4ExpNeuronBf16Speculative { neuron, .. } => Ok(neuron.max_model_len),
             Self::DeepseekV41Vllm {
                 model,
                 max_model_len,

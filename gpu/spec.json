@@ -532,6 +532,30 @@
       "nvl_domain_size": null,
       "dollar_per_hour": null,
       "notes": "BF16 and FP8 have same peak TFLOPS by design. Not listed on getdeploying at the as_of date."
+    },
+    {
+      "name": "Trainium2-LNC2",
+      "aliases": [
+        "AWS Trainium2 LNC2"
+      ],
+      "vendor": "AWS",
+      "architecture": "Trainium2",
+      "compute_capability": null,
+      "year": 2024,
+      "mem_size_gb": 24,
+      "mem_type": "HBM3",
+      "mem_bandwidth_gbps": 725,
+      "fp16_tflops": 158,
+      "fp8_tflops": 316,
+      "bf16_tflops": 158,
+      "fp32_tflops": null,
+      "int8_tops": null,
+      "tdp_watts": null,
+      "interconnect": "NeuronLink",
+      "interconnect_bandwidth_gbps": null,
+      "nvl_domain_size": null,
+      "dollar_per_hour": null,
+      "notes": "One LNC2 logical NeuronCore = 2 physical NeuronCore-v3 (a Trainium2 chip has 8 physical cores, exposed as 4 LNC2 cores, https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-features/logical-neuroncore-config.html). bf16/fp16 = 2 x 79 = 158 TFLOPS and fp8 = 2 x 158 = 316 TFLOPS are the dense Tensor Engine peaks of the two physical cores (https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/neuron-core-v3.html); the chip-level figures, 667 dense BF16/FP16/TF32 TFLOPS and 1299 dense FP8 TFLOPS, divide to 166.75 / 324.75 per LNC2 core (https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/trainium2.html). mem_size_gb 24 is one of the chip's four 24 GB HBM banks (96 GiB per chip), each shared by the core pair that forms one LNC2 core (inferred from the bank layout; AWS does not state a per-LNC2 capacity). mem_bandwidth_gbps 725 is an ESTIMATE: the published 2.9 TB/s chip bandwidth divided equally among the four banks; AWS does not publish or guarantee a per-LNC2 rate. NeuronLink-v3 is 1.28 TB/s per chip and is not assigned to this unit. Price is per instance, not per core, so it is not assigned. Roofline results depend on the bandwidth estimate; it is not measured timing."
     }
   ]
 }

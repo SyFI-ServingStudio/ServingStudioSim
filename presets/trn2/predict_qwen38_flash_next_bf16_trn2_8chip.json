@@ -1,0 +1,15 @@
+{
+  "arch": {
+    "iter": {
+      "type": "qwen4_exp_neuron_bf16",
+      "model_config": "model/config/qwen3_8_flash_next_bf16.json",
+      "fp8": false,
+      "attn_dp": 4,
+      "attn_tp": 8,
+      "moe_ep": 32
+    }
+  },
+  "gpu": "AWS Trainium2 LNC2",
+  "log_dir": "logs/predict_qwen38_flash_next_bf16_trn2_8chip",
+  "cases_file": "predict_qwen38_flash_next_bf16_trn2_cases_dp4.json"
+}
