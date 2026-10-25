@@ -40,7 +40,7 @@ below replaces the GPU grid (the GPU grid stays unchanged for every other config
 | `hc_combine` | num_tokens, hidden_size, hc_mult, hidden_dtype | neuron_torch | num_tokens TOKENS | standalone HC combine |
 | `ple_ngram_ids` | num_tokens, num_reqs, ngram_context_len, heads_per_ngram | neuron_torch | num_tokens TOKENS x num_reqs [1, 8, 64, 256], mask num_reqs > num_tokens | PLE hash ids (ctx 2, heads 8) |
 | `ple_gate` | num_tokens, hidden_size, hc_mult, dtype | neuron_torch | num_tokens TOKENS | PLE gate |
-| `ple_short_conv` | batch_size, query_len, channels, kernel_size, dilation, mode, dtype | neuron_torch | decode: batch DECODE x query_len [1]; spec: batch DECODE x query_len [2, 3, 4]; prefill: batch [1] x query_len TOKENS | PLE conv (channels 2560, k 4, dilation 3) |
+| `ple_short_conv` | batch_size, query_len, channels, kernel_size, dilation, mode, dtype | neuron_torch | decode: batch DECODE x query_len [1]; spec: batch DECODE x query_len [2, 3, 4]; prefill: batch [1] x query_len TOKENS | PLE conv (channels = hc_mult x hidden = 10240, k 4, dilation 3) |
 | `embedding_row_gather` | num_tokens, num_heads, head_dim, table_rows, residency, weight_dtype | neuron_torch | num_tokens TOKENS | PLE local gather (16 x 160, rows = 320001536/shards, residency "device") and token embed (1 x 2560, rows = 248320/tp) |
 | `gemm_fp32_output` | m, n, k, input_dtype | neuron_torch | m TOKENS | lm_head logits (n = 248320/tp, k = 2560) |
 | `single_gemm` | m, n, k, dtype | neuron_torch | m TOKENS | MTP fc (n 2560, k 5120) |
@@ -73,9 +73,11 @@ index_head_dim, index_topk_tokens, compress_ratio, dtype`. Every QSA kind has `m
 its FIRST arg (a Config field in Rust). Shape args: `num_rows` (prefill: tokens of the one request chunk;
 decode: requests, one row each) and, for context-dependent kinds, `context_len` (prefill: prior + num_rows,
 the total visible context of the chunk's last row; decode: the KV length including the new token).
-Rust grids: prefill rows QSA_PREFILL_ROWS x prior QSA_PRIOR (Input field `prior_len`, payload
-`context_len = prior_len + num_rows`; `Extrapolation::Clamp`); decode rows QSA_DECODE_ROWS x context
-QSA_CONTEXT (`Extrapolation::Weighted`). Row-only kinds: prefill QSA_PREFILL_ROWS, decode QSA_DECODE_ROWS.
+Rust grids: prefill rows QSA_PREFILL_ROWS x prior QSA_PRIOR (Input stays `{num_rows, context_len}`;
+`cache_coords` re-axes prefill to `(num_rows, context_len - num_rows)` and `enumerate` emits
+`context_len = prior + num_rows`); decode rows QSA_DECODE_ROWS x context QSA_CONTEXT. Both modes use
+`Cache2DLinear(Extrapolation::Weighted)` (`cache_kind` cannot see `mode`); on the two-point prior axis Weighted
+fits no slope and holds the boundary, i.e. behaves as Clamp (pinned by `neuron_grid::qsa_cache_tests`). Row-only kinds: prefill QSA_PREFILL_ROWS, decode QSA_DECODE_ROWS.
 
 | kind | shape args | backends | notes |
 |---|---|---|---|
@@ -130,3 +132,19 @@ per-rank full input), `all_to_all` (message = per-rank buffer). Bench source
 Launch: `region_launch_overhead` args `num_regions, dtype`; backend `neuron_torch`; grid REGIONS; time =
 pipelined wall per step of `num_regions` back-to-back trivial compiled regions (host launch + inter-region
 gap). Seed: `logs/probe_overhead.json` (`trivial_add` = 1 region, `chain_k_regions` k=8 at tokens=1).
+
+## Implementation notes (deviations settled during the build)
+
+- Multi-region rows: on the lite route every NEFF's system-trace `model_name` is None, so
+  `runtime.device_exec_ms` merges a two-region call's NEFFs and `total_median_ms` is the median over all
+  executions, not the per-call sum. The bench's `qsa_mixer2_*` rows are therefore not imported;
+  `sim_l1/qsa.py` sums consecutive executions per call itself and `qsa_mixer2` is live-profiled.
+- PLE ops keyed by `num_tokens` alone use one layout rule (builder and importer): `num_tokens <= 256` is a
+  decode step (N requests x 1 token), larger is one prefill chunk (1 x N).
+- `ple_short_conv` mode `spec` times the same conv over `query_len` rows (the op has no rollback path).
+- `moe_block` splits the shared expert over all ep x tp ranks (`shared_intermediate_size = 640/(ep*tp)`).
+- `region_launch_overhead` is wall time of N distinct trivial regions back to back (minimum of two runs on a
+  loaded host); re-measure on a quiet host.
+- Collectives: multi-chip groups come from `flashnext/neuron/sim_l1/collectives.py` (v2 sweep, chip locks held)
+  and are imported; the Sim's `neuron_cc` runner measures one-chip groups only. one-core-per-chip (`neuron_c1`)
+  all_to_all fails on this runtime at every size ("Failed to schedule neff execution"), so it has no rows.
