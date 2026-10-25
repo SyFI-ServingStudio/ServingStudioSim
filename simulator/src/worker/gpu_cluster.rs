@@ -63,6 +63,7 @@ use serde::Serialize;
 use crate::common::Time;
 use crate::log::{GpuClusterEntry, NetworkLogger};
 use crate::timing::kernels::{
+    AllGatherKernel, AllGatherKernelInput,
     P2pInterKernel, P2pInterKernelInput, P2pIntraKernel, P2pIntraKernelInput,
 };
 use crate::worker::kv::{KvAccounting, KvCacheReport, KvOverhead};
@@ -93,6 +94,11 @@ pub struct GpuInfo {
 pub enum CostSource {
     Kernel(P2pInterKernel),
     IntraKernel(P2pIntraKernel),
+    /// A Neuron engine moves device data between processes only through the
+    /// runtime's collectives, so a KV handoff between two Trainium instances
+    /// on one host is priced as a two-rank all-gather across chips (each rank
+    /// contributes the message; the receiver's half is the transfer).
+    NeuronAllGather(AllGatherKernel),
     Analytic { bytes_per_ms: f64 },
 }
 
@@ -115,6 +121,10 @@ impl CostSource {
                 let leaf = k.eval(&P2pIntraKernelInput { message_size_bytes });
                 Time::from_ms(leaf.m.time_ms.max(0.0) as f64)
             }
+            CostSource::NeuronAllGather(k) => {
+                let leaf = k.eval(&AllGatherKernelInput { message_size_bytes });
+                Time::from_ms(leaf.m.time_ms.max(0.0) as f64)
+            }
             CostSource::Analytic { bytes_per_ms } => {
                 Time::from_ms(message_size_bytes as f64 / bytes_per_ms)
             }
@@ -130,6 +140,13 @@ impl CostSource {
     fn latency(&self) -> Time {
         match self {
             CostSource::Analytic { .. } => Time::ZERO,
+            // The Neuron collective curve's smallest point is 16 KiB.
+            CostSource::NeuronAllGather(_) => {
+                let b0 = 16384u64;
+                let t0 = self.link_time(b0).as_ms();
+                let t1 = self.link_time(2 * b0).as_ms();
+                Time::from_ms((2.0 * t0 - t1).max(0.0))
+            }
             CostSource::Kernel(_) | CostSource::IntraKernel(_) => {
                 // 2^10 = the p2p sweep floor (see p2p_inter.rs / p2p_intra.rs
                 // sweep_grid).
