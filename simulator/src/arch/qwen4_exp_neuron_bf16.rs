@@ -2999,6 +2999,13 @@ pub struct Qwen4ExpNeuronBf16Model {
 }
 
 impl IterwiseUnifiedModel for Qwen4ExpNeuronBf16Model {
+    /// QSA's per-row top-k budget and the PLE short conv's history make the
+    /// necessary work per-request in context, which a decode KV total cannot
+    /// recover.
+    fn logs_decode_kv_lens(&self) -> bool {
+        true
+    }
+
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
         self.core.check_groups(batch.groups.len())
     }
