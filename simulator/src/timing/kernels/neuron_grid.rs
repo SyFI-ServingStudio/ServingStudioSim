@@ -102,6 +102,46 @@ pub fn qsa_context_grid(kind: &str, mode: &str) -> SweepGrid {
     }
 }
 
+/// `qsa_mixer2` prefill axis 1: context beyond the indexer's selection budget
+/// (0 = the dense path, context <= budget). The mixer's cost steps up once the
+/// context exceeds the budget (sparse selection), which a prior axis cannot
+/// place for every chunk size; 32 sits just past the step.
+pub const QSA_MIXER2_SPARSE_EXCESS: [u32; 5] = [0, 32, 2048, 6144, 30720];
+/// `qsa_mixer2` decode KV length (adds the 2048 bucket below `QSA_CONTEXT`).
+pub const QSA_MIXER2_CONTEXT: [u32; 4] = [2048, 4096, 32768, 131072];
+
+/// `qsa_mixer2` grid: prefill `QSA_PREFILL_ROWS x QSA_MIXER2_SPARSE_EXCESS`,
+/// decode `QSA_DECODE_ROWS x QSA_MIXER2_CONTEXT`.
+pub fn qsa_mixer2_grid(kind: &str, mode: &str) -> SweepGrid {
+    if qsa_is_prefill(kind, mode) {
+        SweepGrid::new(vec![axis(QSA_PREFILL_ROWS), axis(QSA_MIXER2_SPARSE_EXCESS)])
+    } else {
+        SweepGrid::new(vec![axis(QSA_DECODE_ROWS), axis(QSA_MIXER2_CONTEXT)])
+    }
+}
+
+/// `qsa_mixer2` cache axis 1: prefill `max(0, context - budget)`, decode the
+/// KV length.
+pub fn qsa_mixer2_axis1(prefill: bool, context_len: u32, budget: u32) -> f64 {
+    if prefill {
+        f64::from(context_len.saturating_sub(budget))
+    } else {
+        f64::from(context_len)
+    }
+}
+
+/// The `qsa_mixer2` payload `context_len` of a grid cell: prefill
+/// `max(rows, budget + excess)` (a chunk sees at least itself), decode the KV
+/// length.
+pub fn qsa_mixer2_payload_context_len(prefill: bool, rows: f64, axis1: f64, budget: u32) -> u32 {
+    let (rows, axis1) = (rows.round() as u32, axis1.round() as u32);
+    if prefill {
+        rows.max(budget + axis1)
+    } else {
+        axis1
+    }
+}
+
 /// The QSA payload `context_len` of a grid cell `(rows, axis1)`: prefill
 /// `prior + rows`, decode `axis1` itself.
 pub fn qsa_payload_context_len(prefill: bool, rows: f64, axis1: f64) -> u32 {

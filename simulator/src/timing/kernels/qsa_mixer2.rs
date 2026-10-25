@@ -4,13 +4,13 @@
 //! Neuron backends: `neuron_torch_sparse`, `neuron_nki`. Contract:
 //! `doc/pr/trn2-flashnext/L1_CONTRACT.md`; shapes are per rank.
 //!
-//! Cache axes depend on `mode`: prefill `(num_rows, prior = context_len -
-//! num_rows)` over `QSA_PREFILL_ROWS x QSA_PRIOR`, decode `(num_rows,
-//! context_len)` over `QSA_DECODE_ROWS x QSA_CONTEXT` (`cache_coords`).
-//! `cache_kind` cannot see `mode`, so both use `Extrapolation::Weighted`; on
-//! the two-point prior axis its slope fit has too few top-band cells and it
-//! holds the boundary, which is the contract's prefill `Clamp`
-//! (`neuron_grid::qsa_cache_tests` pins that).
+//! Cache axes depend on `mode`: prefill `(num_rows, excess = max(0,
+//! context_len - index_topk_tokens))` over `QSA_PREFILL_ROWS x
+//! QSA_MIXER2_SPARSE_EXCESS`, decode `(num_rows, context_len)` over
+//! `QSA_DECODE_ROWS x QSA_MIXER2_CONTEXT` (`cache_coords`). The prefill mixer
+//! steps up ~15x once the context passes the selection budget (2048, 2048
+//! rows: 2.4 ms at context 2048, 36 ms at 4096), which the excess axis places
+//! for every chunk size. Both modes extrapolate `Weighted`.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -76,7 +76,7 @@ impl KernelSpec for QsaMixer2Spec {
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         neuron_grid::assert_neuron(Self::KIND, &config.backends);
-        neuron_grid::qsa_context_grid(Self::KIND, &config.mode)
+        neuron_grid::qsa_mixer2_grid(Self::KIND, &config.mode)
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -87,7 +87,7 @@ impl KernelSpec for QsaMixer2Spec {
         let prefill = neuron_grid::qsa_is_prefill(Self::KIND, &config.mode);
         Coords::new([
             f64::from(input.num_rows),
-            neuron_grid::qsa_cache_axis1(prefill, input.num_rows, input.context_len),
+            neuron_grid::qsa_mixer2_axis1(prefill, input.context_len, config.index_topk_tokens),
         ])
     }
 
@@ -103,7 +103,12 @@ impl KernelSpec for QsaMixer2Spec {
                 .with("num_rows", rows.round() as u32)
                 .with(
                     "context_len",
-                    neuron_grid::qsa_payload_context_len(prefill, rows, axis1),
+                    neuron_grid::qsa_mixer2_payload_context_len(
+                        prefill,
+                        rows,
+                        axis1,
+                        config.index_topk_tokens,
+                    ),
                 )
                 .with("mode", config.mode.clone())
                 .with("hidden_size", config.hidden_size)
@@ -149,7 +154,7 @@ mod tests {
         let cfg = config("prefill", vec!["neuron_torch_sparse"]);
         let grid = QsaMixer2Spec::sweep_grid(&cfg);
         let payloads = QsaMixer2Spec::enumerate(&cfg, &grid, "neuron_torch_sparse");
-        assert_eq!(payloads.len(), 8);
+        assert_eq!(payloads.len(), 20);
         let keys: Vec<_> = payloads[0].fields().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
@@ -169,27 +174,40 @@ mod tests {
                 "num_rows",
             ]
         );
-        // Prefill cells carry context = prior + rows; decode cells the KV length.
+        // Prefill cells carry context = max(rows, budget + excess); decode
+        // cells the KV length.
+        let at = |i: usize| payloads[i].fields()["context_len"].clone();
+        assert_eq!(at(0), 2048); // 128 rows, dense
+        assert_eq!(at(1), 2048 + 32); // just past the budget
+        assert_eq!(at(15), 8192); // 8192 rows see at least themselves
         let last = payloads.last().unwrap().fields();
         assert_eq!(last["num_rows"], 8192);
-        assert_eq!(last["context_len"], 8192 + 32768);
+        assert_eq!(last["context_len"], 2048 + 30720);
         let cfg = config("decode", vec!["neuron_torch_sparse"]);
         let grid = QsaMixer2Spec::sweep_grid(&cfg);
         let payloads = QsaMixer2Spec::enumerate(&cfg, &grid, "neuron_torch_sparse");
-        assert_eq!(payloads.len(), 12);
-        assert_eq!(payloads[1].fields()["context_len"], 32768);
+        assert_eq!(payloads.len(), 16);
+        assert_eq!(payloads[1].fields()["context_len"], 4096);
     }
 
-    /// Catches a prefill input whose cache coordinate is not its prior.
+    /// Catches a prefill input whose cache coordinate is not its context
+    /// beyond the selection budget.
     #[test]
-    fn prefill_caches_on_prior_and_decode_on_context() {
+    fn prefill_caches_on_sparse_excess_and_decode_on_context() {
         let input = QsaMixer2KernelInput {
             num_rows: 512,
             context_len: 4608,
         };
         let prefill =
             QsaMixer2Spec::cache_coords(&config("prefill", vec!["neuron_torch_sparse"]), &input);
-        assert_eq!(&*prefill, &[512.0, 4096.0]);
+        assert_eq!(&*prefill, &[512.0, 2560.0]);
+        let dense = QsaMixer2KernelInput {
+            num_rows: 512,
+            context_len: 2048,
+        };
+        let dense =
+            QsaMixer2Spec::cache_coords(&config("prefill", vec!["neuron_torch_sparse"]), &dense);
+        assert_eq!(&*dense, &[512.0, 0.0]);
         let decode =
             QsaMixer2Spec::cache_coords(&config("decode", vec!["neuron_torch_sparse"]), &input);
         assert_eq!(&*decode, &[512.0, 4608.0]);
