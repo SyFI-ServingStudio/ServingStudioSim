@@ -38,7 +38,7 @@ def pareto(rows: list[dict], x: str, y: str) -> list[dict]:
 def by_workload(rows: list[dict]) -> dict[str, list[dict]]:
     g: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
-        g[r["workload"]].append(r)
+        g[r.get("workload_base", r["workload"])].append(r)
     return dict(sorted(g.items()))
 
 
@@ -52,7 +52,7 @@ def best(rows: list[dict], metric: str, tiebreak: str = "total_tok_s") -> dict |
 def knob_columns(rows: list[dict]) -> list[str]:
     """The `cfg.*` columns that take more than one value across `rows`."""
     cols = sorted({k for r in rows for k in r if k.startswith("cfg.")})
-    skip = {"cfg.family", "cfg.core_id", "cfg.scenario"}
+    skip = {"cfg.family", "cfg.core_id", "cfg.scenario", "cfg.accept_rate"}
     return [c for c in cols if c not in skip and len({repr(r.get(c)) for r in rows}) > 1]
 
 
@@ -94,8 +94,10 @@ def scenario_ranks(rows: list[dict], metric: str, base: str = "base") -> list[di
         v = _num(r.get(metric))
         if math.isnan(v):
             continue
-        per[r.get("cfg.scenario", "base")][r["cfg.core_id"]] = v
-        rep.setdefault(r["cfg.core_id"], r)
+        key = f"{r['cfg.core_id']}@{r.get('cfg.accept_rate')}"
+        scen = r.get("cfg.scenario", "base")
+        per[scen][key] = v
+        rep[(scen, key)] = r
     if base not in per:
         return []
     out = []
@@ -110,7 +112,7 @@ def scenario_ranks(rows: list[dict], metric: str, base: str = "base") -> list[di
                     [per[base][c] for c in common], [vals[c] for c in common]
                 ),
                 "best_core": top,
-                "best_desc": describe(rep[top]),
+                "best_desc": describe(rep[(scen, top)]),
                 "best_value": vals[top],
                 "base_best_rank_here": _rank_of(vals, max(per[base], key=per[base].get)),
             }
@@ -168,6 +170,7 @@ def describe(r: dict) -> str:
         "family",
         "scenario",
         "core_id",
+        "accept_rate",
         "attn_dp",
         "attn_tp",
         "gdn_tp",
@@ -185,6 +188,8 @@ def describe(r: dict) -> str:
     else:
         lay = f"{cfg.get('replicas', 1)}x {layout_name(cfg)}"
     rest = ", ".join(f"{k}={_short(v)}" for k, v in sorted(cfg.items()) if k not in skip)
+    if cfg.get("accept_rate") is not None:
+        lay += f" @accept {cfg['accept_rate']}"
     return f"{fam} {lay}" + (f" ({rest})" if rest else "")
 
 

@@ -135,10 +135,16 @@ def collect(
         r = run_row(run_dir, slos)
         if r is None:
             continue
+        base, _, rate = workload.rpartition("-a")
+        if not base:
+            base, rate = workload, None
         rows.append(
             {
                 "label": label,
                 "workload": workload,
+                # The trace without its MTP acceptance suffix, and that rate.
+                "workload_base": base,
+                "cfg.accept_rate": float(rate) if rate else None,
                 **{f"cfg.{k}": v for k, v in cfg.items() if k != "label"},
                 **r,
             }
