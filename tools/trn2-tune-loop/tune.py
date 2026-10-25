@@ -82,6 +82,8 @@ def main(argv=None) -> int:
     p.add_argument("name")
     p.add_argument("label", help="candidate (usually the best measured)")
     p.add_argument("--scenario", nargs="*", help=f"subset of {sorted(tl.SCENARIOS)}")
+    p.add_argument("--accept-from", nargs="*", help="per-request acceptance draw (engine runs)")
+    p.add_argument("--tag", help="names the draw's outputs (headroom_<label>_<tag>.*)")
     p = sub.add_parser("status")
     p.add_argument("name")
     a = ap.parse_args(argv)
@@ -117,7 +119,8 @@ def main(argv=None) -> int:
         print(tl.markdown(res))
     elif a.step == "headroom":
         sc = {k: tl.SCENARIOS[k] for k in a.scenario} if a.scenario else None
-        print(tl.headroom_markdown(tl.headroom(loop, a.label, sc)))
+        h = tl.headroom(loop, a.label, sc, accept_from=a.accept_from, tag=a.tag)
+        print(tl.headroom_markdown(h))
     else:
         print(json.dumps(loop.state(), indent=1))
         if loop.path("runs.json").is_file():

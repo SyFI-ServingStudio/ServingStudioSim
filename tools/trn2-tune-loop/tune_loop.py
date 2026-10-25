@@ -960,28 +960,53 @@ RUNGS = (
 
 
 def headroom(
-    loop: Loop, label: str, scenarios: dict | None = None, simulate=None, analyze: bool = True
+    loop: Loop,
+    label: str,
+    scenarios: dict | None = None,
+    simulate=None,
+    accept_from: list[str] | None = None,
+    tag: str | None = None,
+    logs: Path | None = None,
 ) -> dict:
-    """The candidate's R0-R7 ladder and its predicted gain under each what-if."""
+    """The candidate's R0-R7 ladder and its predicted gain under each what-if.
+
+    With `accept_from` (and a `tag` naming it) the base and every what-if use that
+    per-request acceptance draw (`accept_draw`), and the base is re-simulated with
+    the analyzer for its ladder."""
     simulate = simulate or run_sim
     scenarios = scenarios or SCENARIOS
     cand = next(c for c in loop.read("proposal.json")["candidates"] if c["label"] == label)
-    base = loop.read("predictions.json")["candidates"][label]
-    out = dict(label=label, base=base["predicted"], ladder=base["ladder"], scenarios={})
+    if accept_from and cand["knobs"]["draft_tokens"]:
+        cand = dict(cand, accept_draw=accept_draw(accept_from, cand["knobs"]["draft_tokens"], logs))
+    root = loop.path("headroom" + (f"_{tag}" if tag else ""), label)
+    if accept_from:
+        if not (root / "base" / "run" / "summary.json").is_file():
+            simulate(render_preset(cand, root / "base"), True)
+        base = dict(
+            predicted=ea.simulated(root / "base" / "run"), ladder=ladder(root / "base" / "run")
+        )
+    else:
+        base = loop.read("predictions.json")["candidates"][label]
+    out = dict(
+        label=label,
+        accept_from=accept_from,
+        base=base["predicted"],
+        ladder=base["ladder"],
+        scenarios={},
+    )
     for name, over in scenarios.items():
-        d = loop.path("headroom", label, name)
-        if (d / "run" / "summary.json").is_file():
-            m = ea.simulated(d / "run")
-        else:
+        d = root / name
+        if not (d / "run" / "summary.json").is_file():
             c = dict(cand, knobs=dict(cand["knobs"], **over))
             simulate(render_preset(c, d), False)
-            m = ea.simulated(d / "run")
+        m = ea.simulated(d / "run")
         gain = {k: ea.error_pct(m[k], base["predicted"][k]) for k in METRICS}
         out["scenarios"][name] = dict(override=over, predicted=m, change_pct=gain)
         loop.log(f"headroom {label} {name}: out tok/s {gain['out_tok_s']:+.1f}%")
-    loop.write(f"headroom_{label}.json", out)
-    loop.path(f"headroom_{label}.md").write_text(headroom_markdown(out) + "\n")
-    loop.mark(f"headroom_{label}", n=len(scenarios))
+    sfx = f"{label}_{tag}" if tag else label
+    loop.write(f"headroom_{sfx}.json", out)
+    loop.path(f"headroom_{sfx}.md").write_text(headroom_markdown(out) + "\n")
+    loop.mark(f"headroom_{sfx}", n=len(scenarios))
     return out
 
 
