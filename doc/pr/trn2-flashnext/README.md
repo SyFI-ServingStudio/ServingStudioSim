@@ -148,3 +148,44 @@ chip per chunk. They come from the project's standalone sweep
 | R4b | Needs `single_gemm` / `elementwise` copy rows on the device. There are none for Neuron yet (only m <= 8192 GEMMs), so R4b falls back as documented. |
 | R6/R7 scope bounds | `model.work` already builds `Qwen4ExpForConditionalGeneration` from the config. |
 | Per-location R6 | Needs a location map for this arch's manifest, `model/work/location_maps/qwen4_exp_neuron_bf16*_unified.json`. It does not exist yet. |
+
+Run the launcher with `UV_NO_SYNC=1` (set in `wt-trn2-flashnext/neuron_env.sh`). The analyzer shells out to
+`uv run`, and a sync attempt fails on deep-gemm. Without it, R3 (grid peaks), R4b and R6/R7 drop out with a
+caveat.
+
+Status of the ladder pieces:
+
+- **Location maps.** The location map covers the ordinary unified layout at mixer granularity. The other layouts
+  run, but without per-location R6. Those are the speculative tag, PD (leaf prefix `pd.`), per_op, layer, and
+  the RS/AG or A2A variants. Scope R6/R7 still evaluates for all of them.
+- **Launch floors.** Under `launch_model = calibrated`, a region's launch floor is part of its leaf time. R3
+  removes it as "batching", because it bounds the leaf by its rate. Read the R2 − R3 gap as launch-bound
+  regions plus genuinely small batches.
+
+## First results (2026-10-25)
+
+All three presets run end to end with the calibrated composition and 0 missing rows. The trace is 64 requests,
+2048 in / 512 out, 50 ms apart.
+
+| Preset | Ranks | tok/s | tok/s/rank |
+|---|---|---|---|
+| 8-chip DP4 x TP8 EP32 | 32 | 1326 | 41.4 |
+| same + MTP k=3 at 0.71 acceptance | 32 | 1917 | 59.9 |
+| P/D, 8 + 8 chips | 64 | 1239 | 19.4 |
+
+**Where the time goes.**
+
+- **Prefill.** The MoE block dominates: about 51 ms per layer at 8192 tokens over EP32. The cause is moe_cte's
+  static per-block cost (flashnext-neuron `ops/moe.md`).
+- **Decode.** Mostly launch-bound under the loaded-host constants.
+
+**R0-R7 waterfall** (8-chip preset, GPU-seconds):
+
+| Rung or gap | GPU-s |
+|---|---|
+| Real (R0) | 3954 |
+| Batching and launch gap | 2173 |
+| Kernel gap | 1061 |
+| Hardware gap | 357 |
+| Excess over necessary work | 305 |
+| Segmented necessary (R6) | 26 |
