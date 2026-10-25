@@ -15,6 +15,7 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::neuron_grid;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -60,6 +61,9 @@ impl KernelSpec for GemmFp32OutputSpec {
     const KIND: KernelKind = "gemm_fp32_output";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if neuron_grid::is_neuron(&config.backends) {
+            return neuron_grid::grid_1d(neuron_grid::TOKENS);
+        }
         let mut m = Axis::chain([Axis::pow2(0, 4), Axis::token_axis()]);
         // Only the ll_bf16 dispatch has the in-call switches; keeping its extra
         // points off the other backends avoids resampling their existing rows.
@@ -146,5 +150,20 @@ mod tests {
         assert!(!shared.contains(&65.0));
         assert!(shared.iter().all(|v| m.contains(v)));
         assert!(m.len() <= 500);
+    }
+
+    /// Catches the Neuron branch leaking into a GPU or mixed config (which would
+    /// resample every GPU row) or a Neuron config missing the contract grid.
+    #[test]
+    fn neuron_backends_take_the_tokens_grid_and_gpu_grid_is_unchanged() {
+        use crate::timing::kernels::neuron_grid;
+        use crate::timing::sweep::Axis;
+        assert_eq!(
+            m_axis(vec!["neuron_torch"]),
+            neuron_grid::axis(neuron_grid::TOKENS)
+        );
+        let gpu = Axis::chain([Axis::pow2(0, 4), Axis::token_axis()]);
+        assert_eq!(m_axis(vec!["torch_cublas"]), gpu);
+        assert_eq!(m_axis(vec!["neuron_torch", "torch_cublas"]), gpu);
     }
 }

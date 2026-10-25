@@ -58,6 +58,20 @@ use crate::timing::kernels::{
 use crate::timing::kernels::{PagedAttnBatchDecodeKernelInput, PagedAttnBatchPrefillKernelInput};
 use crate::timing::kernels::{PleGateKernelInput, PleNgramIdsKernelInput, PleShortConvKernelInput};
 
+use crate::timing::kernels::{
+    AllGatherKernelInput, AllToAllKernelInput, GdnConv1dDecodeKernelInput,
+    GdnConv1dPrefillKernelInput, GdnDecodeCoreKernelInput, GdnDecodeMixerKernelInput,
+    GdnInProjKernelInput, GdnOutputKernelInput, GdnPrefillCoreKernelInput,
+    GdnPrefillMixerKernelInput, GdnSplitGatingKernelInput, GdnStateIoKernelInput,
+    HcCombineMixKernelInput, HcMixFinalKernelInput, HcMixKernelInput, LmHeadArgmaxKernelInput,
+    MoeBlockKernelInput, MoeRoutedExpertsKernelInput, MoeRouterKernelInput,
+    MoeSharedExpertKernelInput, PleBlockKernelInput, PlePostKernelInput, PleProjectKernelInput,
+    PleResidualKernelInput, QsaAttentionKernelInput, QsaCacheWriteKernelInput,
+    QsaIndexerCompressKernelInput, QsaIndexerProjectKernelInput, QsaIndexerScoresKernelInput,
+    QsaIndexerSelectKernelInput, QsaMixer2KernelInput, QsaOutputKernelInput, QsaProjectKernelInput,
+    ReduceScatterKernelInput, RegionLaunchOverheadKernelInput, VocabArgmaxKernelInput,
+};
+
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
 /// fan-out the attention op summed into one slot (many prefill requests fold to a
 /// single leaf).
@@ -252,4 +266,40 @@ log_inputs! {
     RsSconvAgResidualRmsNorm => RsSconvAgResidualRmsNormKernelInput,
     P2pIntra    => P2pIntraKernelInput,
     P2pInter    => P2pInterKernelInput,
+    GdnPrefillMixer => GdnPrefillMixerKernelInput,
+    GdnDecodeMixer => GdnDecodeMixerKernelInput,
+    GdnInProj => GdnInProjKernelInput,
+    GdnConv1dPrefill => GdnConv1dPrefillKernelInput,
+    GdnConv1dDecode => GdnConv1dDecodeKernelInput,
+    GdnSplitGating => GdnSplitGatingKernelInput,
+    GdnPrefillCore => GdnPrefillCoreKernelInput,
+    GdnDecodeCore => GdnDecodeCoreKernelInput,
+    GdnOutput => GdnOutputKernelInput,
+    GdnStateIo => GdnStateIoKernelInput,
+    QsaProject => QsaProjectKernelInput,
+    QsaIndexerProject => QsaIndexerProjectKernelInput,
+    QsaCacheWrite => QsaCacheWriteKernelInput,
+    QsaIndexerCompress => QsaIndexerCompressKernelInput,
+    QsaOutput => QsaOutputKernelInput,
+    QsaMixer2 => QsaMixer2KernelInput,
+    QsaIndexerScores => QsaIndexerScoresKernelInput,
+    QsaIndexerSelect => QsaIndexerSelectKernelInput,
+    QsaAttention => QsaAttentionKernelInput,
+    MoeRouter => MoeRouterKernelInput,
+    MoeRoutedExperts => MoeRoutedExpertsKernelInput,
+    MoeSharedExpert => MoeSharedExpertKernelInput,
+    MoeBlock => MoeBlockKernelInput,
+    HcMix => HcMixKernelInput,
+    HcMixFinal => HcMixFinalKernelInput,
+    HcCombineMix => HcCombineMixKernelInput,
+    PleProject => PleProjectKernelInput,
+    PleResidual => PleResidualKernelInput,
+    PlePost => PlePostKernelInput,
+    PleBlock => PleBlockKernelInput,
+    VocabArgmax => VocabArgmaxKernelInput,
+    LmHeadArgmax => LmHeadArgmaxKernelInput,
+    AllGather => AllGatherKernelInput,
+    ReduceScatter => ReduceScatterKernelInput,
+    AllToAll => AllToAllKernelInput,
+    RegionLaunchOverhead => RegionLaunchOverheadKernelInput,
 }

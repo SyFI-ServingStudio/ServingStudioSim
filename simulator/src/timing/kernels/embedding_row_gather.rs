@@ -20,13 +20,19 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::neuron_grid;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
 const RESIDENCIES: [&str; 2] = ["host_uva", "device"];
 /// The one residency each backend runs on: the fork's pinned lookup reads a
 /// host table over UVA, `F.embedding` an HBM one.
-const BACKEND_RESIDENCY: [(&str, &str); 2] = [("vllm_triton", "host_uva"), ("torch", "device")];
+/// `neuron_torch` gathers from a device-resident (HBM) table slice.
+const BACKEND_RESIDENCY: [(&str, &str); 3] = [
+    ("vllm_triton", "host_uva"),
+    ("torch", "device"),
+    ("neuron_torch", "device"),
+];
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EmbeddingRowGatherKernelConfig {
@@ -86,6 +92,9 @@ impl KernelSpec for EmbeddingRowGatherSpec {
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         validate_config(config);
+        if neuron_grid::is_neuron(&config.backends) {
+            return neuron_grid::grid_1d(neuron_grid::TOKENS);
+        }
         // PyTorch's `F.embedding` (index_select) takes a slower small-index
         // path for at most 16 ids, i.e. num_tokens * num_heads <= 16. The
         // power-of-two points bracket that switch for power-of-two head
@@ -175,5 +184,32 @@ mod tests {
     #[should_panic(expected = "does not run with residency device")]
     fn rejects_a_backend_on_the_other_residency() {
         EmbeddingRowGatherSpec::sweep_grid(&config("device"));
+    }
+
+    /// Catches the Neuron branch leaking into a GPU or mixed config (which would
+    /// resample every GPU row) or a Neuron config missing the contract grid.
+    #[test]
+    fn neuron_backends_take_the_tokens_grid_and_gpu_grid_is_unchanged() {
+        use crate::timing::kernels::neuron_grid;
+        let mut neuron = config("device");
+        neuron.backends = vec!["neuron_torch"];
+        neuron.table_rows = 320_001_536 / 4;
+        neuron.weight_dtype = DType::Bf16;
+        let grid = EmbeddingRowGatherSpec::sweep_grid(&neuron);
+        assert_eq!(grid.axes(), [neuron_grid::axis(neuron_grid::TOKENS)]);
+        let payloads = EmbeddingRowGatherSpec::enumerate(&neuron, &grid, "neuron_torch");
+        assert_eq!(payloads[0].fields()["residency"], "device");
+
+        let gpu = [Axis::values([
+            1, 2, 4, 8, 16, 17, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048,
+            3072, 4096, 6144, 8192, 12288, 16384, 32768,
+        ])];
+        assert_eq!(
+            EmbeddingRowGatherSpec::sweep_grid(&config("host_uva")).axes(),
+            gpu
+        );
+        let mut mixed = config("device");
+        mixed.backends = vec!["neuron_torch", "torch"];
+        assert_eq!(EmbeddingRowGatherSpec::sweep_grid(&mixed).axes(), gpu);
     }
 }
