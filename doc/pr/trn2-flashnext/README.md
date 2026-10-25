@@ -34,8 +34,9 @@ collective rows, the fabric names how many of a group's ranks share each chip:
 
 **Every leaf time is NRT device time** from the engine's op modules. The exception is
 `region_launch_overhead`, which is the wall time of back-to-back trivial regions: the
-host launch and the inter-region gap. The arch charges it once per step, for the
-step's region count.
+host launch and the inter-region gap. Only `launch_model = l1_additive` uses it, once per
+step at the step's region count. The default prices launch with the calibrated per-region
+floors instead.
 
 ## What one step costs
 
@@ -65,6 +66,10 @@ The cost structure is the doc comment of `qwen4_exp_neuron_bf16.rs`. In outline:
   1. Pass 0 runs over every target row, verify rows and prefill tokens alike.
   2. `draft_tokens - 1` more passes run, one row per decode request.
   3. Each pass is embed, fc GEMM, HC, the QSA layer, MoE and the head.
+- **Composition.** Every compute leaf is scaled by f_g. Under `launch_model = calibrated`, each region (each
+  leaf call) is floored by its launch, `max(f_g x device, L_r)`, and the step adds `step_overhead_ms`. These
+  constants come from the engine-slice calibration (`flashnext-neuron/flashnext/neuron/engine/README.md`). A
+  region traces a collective when its mixer, MoE block, embed or head runs on more than one rank.
 - **Padding.** Every shape is padded to its bucket, and the padding costs kernel time.
   If a shape exceeds the largest bucket, it runs as several calls.
 - **KV and state per DP partition:**
@@ -95,8 +100,10 @@ The cost structure is the doc comment of `qwen4_exp_neuron_bf16.rs`. In outline:
 | worker `max_batch_tokens` | (2048 in the presets) | chunked-prefill chunk size (worker knob) |
 | `draft_tokens` (speculative tag) and worker `draft_tokens` | 3 | MTP k |
 | trace `accept_rate` | per request | MTP acceptance input (`trace/generate_fixed_shape.py --accept-rate`) |
-| `region_granularity` | per_op, mixer, layer (mixer) | op-level leaves (one region each); the engine's fused regions; or mixer leaves x `coarse_region_calibration` with one region per mixer call |
-| `coarse_region_calibration` | (1.0) | the whole-layer-region / sum-of-regions ratio. Placeholder until `engine_slice.jsonl` lands |
+| `region_granularity` | per_op, mixer, layer (mixer) | op-level leaves (one region each); the engine's fused regions; or one region per layer (per mixer call) |
+| `region_device_factor` | (per_op 1.10, mixer 0.94, layer 0.88) | f_g on every compute leaf: step device time over the sum of isolated L1 rows (engine-slice fit, `flashnext-neuron/logs/engine/calib_summary.md`) |
+| `launch_model` | calibrated, l1_additive (calibrated) | calibrated: each region costs max(f_g x device, L_r) and the step adds `step_overhead_ms`; l1_additive: device time plus the measured `region_launch_overhead` row at the step's region count |
+| `launch_coll_ms`, `launch_plain_ms`, `step_overhead_ms` | 1.25, 0.075, 4.0 | L_r of a region tracing a collective / a plain region, and the per-step host constant. Fitted on a loaded host; re-fit on a quiet one |
 | `*_impls` lists | op IMPLS keys | per-op implementation. Several keys = the best measured row per shape. Per-role `backends_file` overrides also apply |
 | `tp_collective` | all_reduce, reduce_scatter_all_gather | the latter runs HC and MoE dispatch sequence-parallel on 1/G of the tokens |
 | `moe_dispatch` | all_gather, all_to_all | fused block over all tokens, or A2A dispatch/combine with routed experts at T_all/ep equivalent tokens and the shared expert local |

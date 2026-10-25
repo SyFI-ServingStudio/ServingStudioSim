@@ -32,7 +32,9 @@ use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::glm52_model_cfg::Glm52MtpMode;
 use super::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
-use super::qwen4_exp_neuron_bf16::{MoeDispatch, PleTableShards, RegionGranularity, TpCollective};
+use super::qwen4_exp_neuron_bf16::{
+    LaunchModel, MoeDispatch, PleTableShards, RegionGranularity, TpCollective,
+};
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
 /// carries no `deny_unknown_fields` (the flattened struct must let the arch's
@@ -157,9 +159,16 @@ const fn default_one() -> u32 {
 const fn default_neuron_attn_tp() -> u32 {
     8
 }
-const fn default_neuron_calibration() -> f64 {
-    1.0
+const fn default_neuron_launch_coll_ms() -> f64 {
+    1.25
 }
+const fn default_neuron_launch_plain_ms() -> f64 {
+    0.075
+}
+const fn default_neuron_step_overhead_ms() -> f64 {
+    4.0
+}
+const NEURON_LAUNCH_MODELS: [&str; 2] = LaunchModel::CHOICES;
 /// One Trainium2 LNC2 core's HBM bank: 96 GiB per chip / 4 cores.
 const fn default_neuron_hbm_per_core_gb() -> f64 {
     25.769_803_776
@@ -242,15 +251,31 @@ pub struct NeuronFlashNextSpec {
     #[param(string, default = "all_gather", choices = NEURON_MOE_DISPATCHES, cache_key)]
     pub moe_dispatch: MoeDispatch,
     /// Compiled-region granularity: per_op, mixer (the engine's fused
-    /// regions) or layer (mixer leaves x coarse_region_calibration).
+    /// regions) or layer (one region per layer).
     #[serde(default)]
     #[param(string, default = "mixer", choices = NEURON_REGION_GRANULARITIES, cache_key)]
     pub region_granularity: RegionGranularity,
-    /// Whole-layer-region / sum-of-regions time ratio applied at `layer`
-    /// granularity (1.0 until the engine-slice calibration lands).
-    #[serde(default = "default_neuron_calibration")]
-    #[param(default = 1.0)]
-    pub coarse_region_calibration: f64,
+    /// Device factor f_g on every compute leaf; omitted = the engine-slice
+    /// fit for the granularity (per_op 1.10, mixer 0.94, layer 0.88).
+    #[serde(default)]
+    pub region_device_factor: Option<f64>,
+    /// Host launch: calibrated (per region max(f_g x device, L_r) + a per-step
+    /// constant) or l1_additive (the measured region_launch_overhead row).
+    #[serde(default)]
+    #[param(string, default = "calibrated", choices = NEURON_LAUNCH_MODELS)]
+    pub launch_model: LaunchModel,
+    /// Launch floor of a region that traces a collective (ms; loaded-host fit).
+    #[serde(default = "default_neuron_launch_coll_ms")]
+    #[param(default = 1.25)]
+    pub launch_coll_ms: f64,
+    /// Launch floor of a plain region (ms).
+    #[serde(default = "default_neuron_launch_plain_ms")]
+    #[param(default = 0.075)]
+    pub launch_plain_ms: f64,
+    /// Per-step host constant: input H2D, next-id readback, collective skew (ms).
+    #[serde(default = "default_neuron_step_overhead_ms")]
+    #[param(default = 4.0)]
+    pub step_overhead_ms: f64,
     /// Compiled prefill chunk sizes; a chunk pads to the next one.
     #[serde(default = "default_neuron_prefill_buckets")]
     pub prefill_buckets: Vec<u32>,

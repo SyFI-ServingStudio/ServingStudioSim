@@ -32,9 +32,20 @@
 //! - `per_op`: every op is its own region (op-level L1 leaves).
 //! - `mixer`: the engine's fused regions (whole GDN mixer, the two-region QSA
 //!   mixer, the fused MoE block, the fused HC combine+mix and PLE post).
-//! - `layer`: the mixer-level leaves scaled by `coarse_region_calibration`
-//!   (whole-region vs sum-of-regions; 1.0 until the engine-slice calibration
-//!   lands), with one region per mixer call.
+//! - `layer`: the mixer-level leaves inside one region per layer (one per
+//!   mixer call).
+//!
+//! Composition (the engine-slice calibration, flashnext-neuron
+//! `engine/README.md` "Composition rule for the simulator"): every compute
+//! leaf is scaled by the granularity's device factor f_g (op 1.10, mixer 0.94,
+//! layer 0.88: fused regions are cheaper than their isolated ops). With
+//! `launch_model = calibrated` (default) each region costs
+//! `max(f_g * device, L_r)`, `L_r` = `launch_coll_ms` for a region holding a
+//! collective and `launch_plain_ms` otherwise, and the step adds
+//! `step_overhead_ms` (input H2D, next-id readback, collective skew). With
+//! `l1_additive` the measured `region_launch_overhead` row prices the step's
+//! region count instead. The wall constants were fitted on a loaded host and
+//! are parameters.
 //!
 //! Not modeled: the host scheduler and sampling bookkeeping, KV block-table
 //! upload, the vision tower.
@@ -78,6 +89,16 @@ pub enum RegionGranularity {
 
 impl RegionGranularity {
     pub const CHOICES: [&'static str; 3] = ["per_op", "mixer", "layer"];
+
+    /// The engine-slice device factor f_g: step device time over the sum of
+    /// the isolated L1 rows of its ops (`logs/engine/calib_summary.md`).
+    pub fn calibrated_device_factor(self) -> f32 {
+        match self {
+            Self::PerOp => 1.10,
+            Self::Mixer => 0.94,
+            Self::Layer => 0.88,
+        }
+    }
 }
 
 /// The collective after a tensor-parallel mixer.
@@ -112,6 +133,23 @@ pub enum MoeDispatch {
 
 impl MoeDispatch {
     pub const CHOICES: [&'static str; 2] = ["all_gather", "all_to_all"];
+}
+
+/// How host launch cost enters the step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchModel {
+    /// Per region `max(f_g * device, L_r)` plus a per-step constant (the
+    /// engine-slice fit).
+    #[default]
+    Calibrated,
+    /// The measured `region_launch_overhead` row at the step's region count,
+    /// added to the device time.
+    L1Additive,
+}
+
+impl LaunchModel {
+    pub const CHOICES: [&'static str; 2] = ["calibrated", "l1_additive"];
 }
 
 /// Where the PLE n-gram table lives.
@@ -188,7 +226,12 @@ pub struct NeuronFlashNextParallel {
     pub tp_collective: TpCollective,
     pub moe_dispatch: MoeDispatch,
     pub region_granularity: RegionGranularity,
-    pub coarse_region_calibration: f32,
+    /// Device factor applied to every compute leaf (f_g).
+    pub region_device_factor: f32,
+    pub launch_model: LaunchModel,
+    pub launch_coll_ms: f32,
+    pub launch_plain_ms: f32,
+    pub step_overhead_ms: f32,
     pub prefill_buckets: Vec<u32>,
     pub decode_buckets: Vec<u32>,
     pub context_buckets: Vec<u32>,
@@ -277,8 +320,11 @@ impl NeuronFlashNextParallel {
             );
         }
         ensure!(
-            self.coarse_region_calibration > 0.0,
-            "coarse_region_calibration must be positive"
+            self.region_device_factor > 0.0
+                && self.launch_coll_ms >= 0.0
+                && self.launch_plain_ms >= 0.0
+                && self.step_overhead_ms >= 0.0,
+            "region_device_factor must be positive and the launch constants nonnegative"
         );
         Ok(())
     }
@@ -476,8 +522,10 @@ struct LeafPlan {
     regions_per_call: u32,
     /// Product of the enclosing `Scale` folds (for the region count).
     fold: u32,
-    /// Scale the time by `coarse_region_calibration`.
-    calibrated: bool,
+    /// A compute leaf: scaled by f_g and, per region, floored by its launch.
+    compute: bool,
+    /// The leaf's region traces a collective (launch `launch_coll_ms`).
+    coll: bool,
 }
 
 impl LeafEval {
@@ -1536,19 +1584,32 @@ impl PlanBuilder<'_> {
             LeafEval::Comm { k, .. } => (k.kind(), k.config()),
         };
         let layer = self.p.region_granularity == RegionGranularity::Layer;
-        let (regions_per_call, calibrated) = match role {
-            RegionRole::Mixer(n) => (if layer { 1 } else { n }, layer),
-            RegionRole::InLayer(n) => (if layer { 0 } else { n }, layer),
-            RegionRole::Standalone(n) => (n, false),
-            RegionRole::None => (0, false),
+        let regions_per_call = match role {
+            RegionRole::Mixer(n) => {
+                if layer {
+                    1
+                } else {
+                    n
+                }
+            }
+            RegionRole::InLayer(n) => {
+                if layer {
+                    0
+                } else {
+                    n
+                }
+            }
+            RegionRole::Standalone(n) => n,
+            RegionRole::None => 0,
         };
-        let calibrated = calibrated && !matches!(eval, LeafEval::Comm { .. });
+        let compute = !matches!(eval, LeafEval::Comm { .. } | LeafEval::Launch { .. });
         self.leaves.push(LeafPlan {
             eval,
             view: self.view,
             regions_per_call,
             fold: self.fold,
-            calibrated,
+            compute,
+            coll: false,
         });
         self.b.leaf(
             format!("{}.{}", self.name, join(&self.scope, label)),
@@ -1584,6 +1645,15 @@ impl PlanBuilder<'_> {
             },
             RegionRole::None,
         )))
+    }
+
+    /// Mark the compute regions minted since `start` as tracing a collective.
+    fn mark_coll(&mut self, start: usize, coll: bool) {
+        for l in &mut self.leaves[start..] {
+            if l.compute && l.regions_per_call > 0 {
+                l.coll |= coll;
+            }
+        }
     }
 
     fn g(&self) -> u32 {
@@ -1642,6 +1712,19 @@ impl PlanBuilder<'_> {
 
     /// A mixer's compute leaves for group `d`, its TP collectives around it.
     fn mixer(&mut self, d: usize, mixer: Qwen4ExpMixer, out: &mut Vec<CostNode>) -> Result<()> {
+        let start = self.leaves.len();
+        self.mixer_leaves(d, mixer, out)?;
+        let coll = self.g() > 1;
+        self.mark_coll(start, coll);
+        Ok(())
+    }
+
+    fn mixer_leaves(
+        &mut self,
+        d: usize,
+        mixer: Qwen4ExpMixer,
+        out: &mut Vec<CostNode>,
+    ) -> Result<()> {
         let g = self.g();
         let m = match mixer {
             Qwen4ExpMixer::Gdn => self.p.gdn_tp,
@@ -1878,6 +1961,14 @@ impl PlanBuilder<'_> {
 
     /// The MoE block over every group's tokens, with its dispatch collectives.
     fn moe(&mut self, out: &mut Vec<CostNode>) -> Result<()> {
+        let start = self.leaves.len();
+        self.moe_leaves(out)?;
+        let coll = self.p.ranks() > 1;
+        self.mark_coll(start, coll);
+        Ok(())
+    }
+
+    fn moe_leaves(&mut self, out: &mut Vec<CostNode>) -> Result<()> {
         let r = self.p.ranks();
         let g = self.g();
         let h2 = self.h2();
@@ -2034,6 +2125,14 @@ impl PlanBuilder<'_> {
 
     /// The PLE block of group `d` (before its layer's attention module).
     fn ple(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
+        let start = self.leaves.len();
+        self.ple_leaves(d, out)?;
+        let coll = self.p.ranks() > 1;
+        self.mark_coll(start, coll);
+        Ok(())
+    }
+
+    fn ple_leaves(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
         let r = self.p.ranks();
         let g = self.g();
         let sp = self.p.sequence_parallel();
@@ -2146,6 +2245,14 @@ impl PlanBuilder<'_> {
 
     /// Embedding for group `d`: vocab-parallel gather + the group reduction.
     fn embed(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
+        let start = self.leaves.len();
+        self.embed_leaves(d, out)?;
+        let coll = self.g() > 1;
+        self.mark_coll(start, coll);
+        Ok(())
+    }
+
+    fn embed_leaves(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
         let k = self.k.embed.clone();
         out.push(self.tokens(
             "embedding",
@@ -2185,6 +2292,14 @@ impl PlanBuilder<'_> {
     }
 
     fn head_rows(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
+        let start = self.leaves.len();
+        self.head_rows_leaves(d, out)?;
+        let coll = self.g() > 1;
+        self.mark_coll(start, coll);
+        Ok(())
+    }
+
+    fn head_rows_leaves(&mut self, d: usize, out: &mut Vec<CostNode>) -> Result<()> {
         let (g, h2) = (self.g(), self.h2());
         if self.p.sequence_parallel() {
             if let Some(n) = self.comm_leaf(
@@ -2533,6 +2648,7 @@ fn eval_leaf(
     ep: u32,
     regions: u32,
     record: bool,
+    adj: &dyn Fn(LeafMetrics) -> LeafMetrics,
 ) -> LeafOut {
     let groups = views.get(plan.view);
     let mut m = LeafMetrics::ZERO;
@@ -2547,7 +2663,7 @@ fn eval_leaf(
                 let mut rest = rows;
                 while rest > 0 {
                     let n = rest.min(max);
-                    m.add(k.eval_at(n));
+                    m.add(adj(k.eval_at(n)));
                     if record && input.is_none() {
                         input = Some(k.input_at(n));
                     }
@@ -2565,7 +2681,7 @@ fn eval_leaf(
                 bucket_calls(g.decode_reqs.div_ceil(*sub), &bk.decode, &mut sizes);
                 for &b in &sizes {
                     let n = if *rows { b * g.query_len } else { b };
-                    m.add(k.eval_at(n));
+                    m.add(adj(k.eval_at(n)));
                     calls += 1;
                     if record && input.is_none() {
                         input = Some(k.input_at(n));
@@ -2582,7 +2698,7 @@ fn eval_leaf(
                 sizes.clear();
                 bucket_calls(append, &bk.prefill, &mut sizes);
                 for &c in &sizes {
-                    per.push(k.eval_at(c));
+                    per.push(adj(k.eval_at(c)));
                     calls += 1;
                     if record && input.is_none() {
                         input = Some(k.input_at(c));
@@ -2601,7 +2717,7 @@ fn eval_leaf(
                 bucket_calls(g.decode_reqs.div_ceil(*sub), &bk.decode, &mut sizes);
                 for &b in &sizes {
                     let x = (b * g.query_len, ctx);
-                    m.add(k.eval_at(x));
+                    m.add(adj(k.eval_at(x)));
                     calls += 1;
                     if record && input.is_none() {
                         input = Some(k.input_at(x));
@@ -2620,7 +2736,7 @@ fn eval_leaf(
                 let mut done = prefix;
                 for &c in &sizes {
                     let ctx = bucket(done + c, &bk.context).max(c);
-                    per.push(k.eval_at((c, ctx)));
+                    per.push(adj(k.eval_at((c, ctx))));
                     calls += 1;
                     if record && input.is_none() {
                         input = Some(k.input_at((c, ctx)));
@@ -2638,7 +2754,7 @@ fn eval_leaf(
             let tokens = bk.tok(g.tokens());
             let x = (tokens, g.requests.clamp(1, tokens.max(1)));
             if tokens > 0 {
-                m = k.eval_at(x);
+                m = adj(k.eval_at(x));
                 calls = 1;
             }
             if record {
@@ -2650,7 +2766,7 @@ fn eval_leaf(
             if g.decode_reqs > 0 {
                 bucket_calls(g.decode_reqs, &bk.decode, &mut sizes);
                 for &b in &sizes {
-                    m.add(k.eval_at((b, g.query_len)));
+                    m.add(adj(k.eval_at((b, g.query_len))));
                     calls += 1;
                 }
             }
@@ -2663,7 +2779,7 @@ fn eval_leaf(
                 sizes.clear();
                 bucket_calls(append, &bk.prefill, &mut sizes);
                 for &c in &sizes {
-                    m.add(k.eval_at((1, c)));
+                    m.add(adj(k.eval_at((1, c))));
                     calls += 1;
                 }
             }
@@ -2910,7 +3026,9 @@ impl NeuronFlashNextCore {
             v.clear();
         }
         let ep = self.parallel.moe_ep;
-        let factor = self.parallel.coarse_region_calibration;
+        let par = &self.parallel;
+        let factor = par.region_device_factor;
+        let calibrated_launch = par.launch_model == LaunchModel::Calibrated;
         let mut group_regions = vec![0u64; self.parallel.attn_dp as usize];
         let mut shared_regions = 0u64;
         for (slot, plan) in self.leaves.iter().enumerate() {
@@ -2920,9 +3038,29 @@ impl NeuronFlashNextCore {
             } else {
                 0
             };
-            let mut out = eval_leaf(plan, views, &self.buckets, ep, regions, record);
-            if plan.calibrated {
-                out.m.m.time_ms *= factor;
+            // Per call: f_g x device, floored by the region's launch.
+            let floor = if calibrated_launch && plan.compute {
+                plan.regions_per_call as f32
+                    * if plan.coll {
+                        par.launch_coll_ms
+                    } else {
+                        par.launch_plain_ms
+                    }
+            } else {
+                0.0
+            };
+            let compute = plan.compute;
+            let adj = move |mut x: LeafMetrics| {
+                if compute {
+                    x.m.time_ms = (x.m.time_ms * factor).max(floor);
+                }
+                x
+            };
+            let mut out = eval_leaf(plan, views, &self.buckets, ep, regions, record, &adj);
+            if calibrated_launch && matches!(plan.eval, LeafEval::Launch { .. }) {
+                // The per-step constant; the regions already carry their launch.
+                out.m = LeafMetrics::ZERO;
+                out.m.m.time_ms = par.step_overhead_ms;
             }
             let launched =
                 u64::from(out.calls) * u64::from(plan.regions_per_call) * u64::from(plan.fold);
@@ -3179,7 +3317,11 @@ mod tests {
             tp_collective: TpCollective::AllReduce,
             moe_dispatch: MoeDispatch::AllGather,
             region_granularity: RegionGranularity::Mixer,
-            coarse_region_calibration: 1.0,
+            region_device_factor: 1.0,
+            launch_model: LaunchModel::L1Additive,
+            launch_coll_ms: 1.25,
+            launch_plain_ms: 0.075,
+            step_overhead_ms: 4.0,
             prefill_buckets: vec![128, 256, 512, 1024, 2048, 4096, 8192],
             decode_buckets: vec![1, 2, 4, 8, 16, 32, 64, 128, 256],
             context_buckets: vec![4096, 8192, 16384, 32768, 65536, 131072],
@@ -3543,5 +3685,52 @@ mod tests {
         assert_eq!(groups[0].chunks, [(0, 2048)]);
         assert_eq!(groups[3].chunks, []);
         assert_eq!(groups.iter().map(|g| g.requests).sum::<u32>(), 8);
+    }
+
+    /// Catches the calibrated launch model not flooring a region by its launch
+    /// or not adding the per-step constant: with every fake region at 1 ms
+    /// device and f_g = 0.5, a region costs max(0.5, L_r).
+    #[test]
+    fn calibrated_launch_floors_each_region_and_adds_the_step_constant() {
+        let mut p = parallel(1, 8, 8);
+        p.launch_model = LaunchModel::Calibrated;
+        p.region_device_factor = 0.5;
+        p.launch_coll_ms = 2.0;
+        p.launch_plain_ms = 0.1;
+        p.step_overhead_ms = 4.0;
+        let core = built_like(&built(p));
+        let views = iter_views(
+            &UnifiedArchInput {
+                groups: vec![decode_group(4, 4096)],
+                tokens_per_source_rank: Vec::new(),
+            },
+            1,
+        );
+        let (mut slots, mut scratch) = (Vec::new(), Vec::new());
+        core.eval(&views, &mut slots, &mut scratch, None);
+        for (plan, slot) in core.leaves.iter().zip(&slots) {
+            if matches!(plan.eval, LeafEval::Launch { .. }) {
+                assert_eq!(slot.m.time_ms, 4.0);
+            } else if plan.compute && plan.regions_per_call > 0 && slot.m.time_ms > 0.0 {
+                let floor = plan.regions_per_call as f32 * if plan.coll { 2.0 } else { 0.1 };
+                assert!(
+                    slot.m.time_ms >= floor.max(0.5) - 1e-6,
+                    "{}",
+                    slot.m.time_ms
+                );
+            }
+        }
+        // The decode mixer and the MoE block trace collectives, the HC modules do not.
+        let names = &core.manifest.slots;
+        let coll = |suffix: &str| {
+            core.leaves
+                .iter()
+                .zip(names)
+                .find(|(_, s)| s.name.ends_with(suffix))
+                .map(|(l, _)| l.coll)
+                .unwrap()
+        };
+        assert!(coll("gdn.gdn.decode_mixer") && coll("gdn.moe.block"));
+        assert!(!coll("gdn.attn_hc"));
     }
 }

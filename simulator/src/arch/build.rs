@@ -1698,7 +1698,13 @@ fn neuron_flash_next_parallel(
         tp_collective: spec.tp_collective,
         moe_dispatch: spec.moe_dispatch,
         region_granularity: spec.region_granularity,
-        coarse_region_calibration: spec.coarse_region_calibration as f32,
+        region_device_factor: spec
+            .region_device_factor
+            .map_or(spec.region_granularity.calibrated_device_factor(), |f| f as f32),
+        launch_model: spec.launch_model,
+        launch_coll_ms: spec.launch_coll_ms as f32,
+        launch_plain_ms: spec.launch_plain_ms as f32,
+        step_overhead_ms: spec.step_overhead_ms as f32,
         prefill_buckets: spec.prefill_buckets.clone(),
         decode_buckets: spec.decode_buckets.clone(),
         context_buckets: spec.context_buckets.clone(),
