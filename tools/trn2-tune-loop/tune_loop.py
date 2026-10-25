@@ -762,22 +762,38 @@ STALL_STEPS = 3  # the engine's first executions after warm-up (ALIGNMENT.md: st
 
 def first_use_stall_s(files: list[str], logs: Path) -> float:
     """The engine's first-use stalls, read off the timeline alone: each of the first
-    `STALL_STEPS` steps' wall above the median wall of the later steps with the same
-    shape (kind, padded batch, chunk, contexts). The max over replicas (the run's
-    duration is the last replica's finish). The Sim does not model them."""
+    `STALL_STEPS` steps' wall above its expected wall, i.e. the median wall of the later
+    forwards with the same shape (phase, padded decode batch or prefill chunk, context
+    bucket) plus the median host time outside the forwards of the later steps. The max
+    over replicas (the run's duration is the last replica's finish). Not modeled by the
+    Sim."""
     worst = 0.0
     for f in files:
         steps = [r for r in ea.load(f, logs) if r["type"] == "step"]
 
-        def shape(st):
-            ctx = tuple(fw.get("C") for fw in st["forwards"])
-            return (st["kind"], st.get("decode_B"), st.get("prefill_T"), ctx)
+        def keyed(st):
+            for fw in st["forwards"]:
+                n = st.get("prefill_T") if "prefill" in fw["phase"] else st.get("decode_B")
+                yield (fw["phase"], n, fw.get("C")), fw["wall_ms"]
 
+        later: dict = {}
+        for st in steps[STALL_STEPS:]:
+            for k, w in keyed(st):
+                later.setdefault(k, []).append(w)
+
+        def med(v):
+            v = sorted(v)
+            return v[len(v) // 2] if v else 0.0
+
+        # Host time outside the forwards (inputs, id readback, scheduling) per later step.
+        overhead = med(
+            st["wall_ms"] - sum(fw["wall_ms"] for fw in st["forwards"])
+            for st in steps[STALL_STEPS:]
+        )
         stall = 0.0
         for st in steps[:STALL_STEPS]:
-            same = [x["wall_ms"] for x in steps[STALL_STEPS:] if shape(x) == shape(st)]
-            if same:
-                stall += max(0.0, st["wall_ms"] - sorted(same)[len(same) // 2])
+            expect = overhead + sum(med(later[k]) if k in later else w for k, w in keyed(st))
+            stall += max(0.0, st["wall_ms"] - expect)
         worst = max(worst, stall / 1e3)
     return worst
 
