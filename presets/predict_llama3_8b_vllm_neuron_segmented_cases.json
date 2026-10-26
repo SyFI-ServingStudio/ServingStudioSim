@@ -1,0 +1,75 @@
+[
+  {
+    "groups": [
+      {
+        "prefill_chunk_pairs": [
+          [
+            0,
+            2048
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "groups": [
+      {
+        "prefill_chunk_pairs": [
+          [
+            2048,
+            2048
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "groups": [
+      {
+        "prefill_chunk_pairs": [
+          [
+            3072,
+            2048
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "groups": [
+      {
+        "prefill_chunk_pairs": [
+          [
+            14336,
+            2040
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "groups": [
+      {
+        "decode_kv_lens": [
+          16377
+        ]
+      }
+    ]
+  },
+  {
+    "groups": [
+      {
+        "decode_count": 3,
+        "average_decode_length": 16380
+      }
+    ]
+  },
+  {
+    "groups": [
+      {
+        "decode_count": 13,
+        "average_decode_length": 16380
+      }
+    ]
+  }
+]

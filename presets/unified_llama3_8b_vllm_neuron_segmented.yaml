@@ -1,0 +1,60 @@
+# Stock vLLM Neuron TP4/LNC2 with segmented (chunked) prefill at long context.
+# The engine runs max_num_batched_tokens = S with one compiled S-token prefill
+# graph: a prompt executes as ceil(prompt / S) prefill calls, the k-th attending
+# k*S cached tokens, each in its own iteration (prefill limit 1,
+# separate-prefill-priority, prefix caching off). Prefill time interpolates over
+# the measured priors; decode buckets are exact. Residents =
+# min(largest bucket, 217024 // context).
+# Decode buckets are those that passed device gating (vendor logit check and
+# native trace coverage): C16384 [1,4,8,16], C32768 [1,4,8].
+# Full-model native device time; HTTP/host overhead is not calibrated here.
+deployment: unified
+workload:
+  trace_files: ["${trace}"]
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  run_to_end: true
+io:
+  log_dir: logs/unified_llama3_8b_vllm_neuron_segmented/{context}
+  log_output_token_times: true
+  log_stage_transitions: true
+  kv_log_stride: 1
+pools:
+  main:
+    groups:
+      - gpu: AWS Trainium2 LNC2
+        replicas: 1
+        arch:
+          type: llama3_vllm_neuron
+          model_config: model/config/llama3_8b.json
+          max_model_len: ${max_model_len}
+          decode_buckets: ${decode_buckets}
+          prefill_segment_size: ${segment}
+          tp_size: 4
+          fp8: false
+        worker:
+          type: chunked_prefill
+          # 6782 pages * 32 tokens * 32768 bytes/token per TP rank.
+          attn_gpu_memory_gb: 7.111442432
+          # The token budget is the segment, not the context.
+          max_batch_tokens: ${segment}
+          max_prefill_requests_per_iteration: 1
+          max_resident_requests_per_partition: ${resident}
+          batch_policy: separate-prefill-priority
+          kv_admission_policy: full-footprint
+          prefix_cache_mode: disabled
+          gpu_time_multiplier: 1.0
+compound:
+  context:
+    c16384:
+      max_model_len: 16384
+      segment: 2048
+      decode_buckets: [1, 4, 8, 16]
+      resident: 13
+      trace: trace/trainium_stock_segprefill_smoke_c16384.csv
+    c32768:
+      max_model_len: 32768
+      segment: 2048
+      decode_buckets: [1, 4, 8]
+      resident: 6
+      trace: trace/trainium_stock_segprefill_smoke_c32768.csv

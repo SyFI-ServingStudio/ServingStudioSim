@@ -128,6 +128,63 @@ class ProfilePass:
 
 
 @dataclass(frozen=True)
+class EngineContract:
+    """What an engine's captures need from the campaign that renders them.
+
+    The default is the CUDA serving contract (vLLM, SGLang): a launcher-shaped
+    server block plus `extra_args`, `cuda_visible_devices` naming `tp*dp`
+    devices, a host Python runtime, and staggered trace arrivals below the
+    context limit. An engine that departs from it declares how here, once.
+    """
+
+    #: Every request arrives at t=0, and a request may fill the context exactly.
+    simultaneous_trace: bool = False
+    #: The engine owns its server block and its ranks: a device role names one
+    #: whole accelerator, there is no `cuda_visible_devices` or `extra_args`,
+    #: and the context limit is `server.max_model_len`.
+    native_server: bool = False
+    #: Host-profile `neuron_server` fields the server block takes (required,
+    #: then optional), and a syntactically valid stub for static pack checks.
+    host_server_required: frozenset[str] = frozenset()
+    host_server_optional: frozenset[str] = frozenset()
+    host_server_stub: dict[str, Any] = field(default_factory=dict)
+    #: Fixed workload settings of the engine's replay contract.
+    workload: dict[str, Any] = field(default_factory=dict)
+    #: Request-timing logs the simulation keeps for the engine's evidence.
+    simulation_io: dict[str, Any] = field(default_factory=dict)
+
+
+#: Engines that depart from the CUDA serving contract.
+ENGINE_CONTRACTS: dict[str, EngineContract] = {
+    # Stock vLLM Neuron (alignment/neuron/README.md): one Trainium2 chip whose
+    # four LNC2 units serve the explicit TP4 ranks, replaying N simultaneous
+    # (C-8)+8 museum requests from eight 9973-token pool segments.
+    "vllm_neuron": EngineContract(
+        simultaneous_trace=True,
+        native_server=True,
+        host_server_required=frozenset(
+            {"cache_path", "image", "docker_host", "req_frontend_binary", "accepted_forward_path"}
+        ),
+        host_server_optional=frozenset({"docker_command", "python_executable"}),
+        host_server_stub={
+            "cache_path": "/nonexistent/neuron/cache",
+            "image": "sha256:" + "0" * 64,
+            "docker_host": "unix:///nonexistent/docker.sock",
+            "req_frontend_binary": "/nonexistent/session_runner",
+            "accepted_forward_path": "/nonexistent/accepted-forward",
+        },
+        workload={"token_pool_limit": 8 * 9973, "stream_idle_timeout_secs": 600},
+        simulation_io={
+            "log_output_token_times": True,
+            "log_stage_transitions": True,
+            "kv_log_stride": 1,
+        },
+    ),
+}
+_CUDA_CONTRACT = EngineContract()
+
+
+@dataclass(frozen=True)
 class Variant:
     """One topology. DP+EP adds a sibling entry; it is not a new pack."""
 
@@ -154,6 +211,10 @@ class Variant:
     #: own checkpoint. Rendering writes its path into `--speculative-config`, so
     #: the pack never carries a machine's HF cache path.
     draft_checkpoint: str | None = None
+
+    @property
+    def contract(self) -> EngineContract:
+        return ENGINE_CONTRACTS.get(self.engine, _CUDA_CONTRACT)
 
     def pass_named(self, name: str) -> ProfilePass | None:
         for item in self.profile_passes:
@@ -283,6 +344,9 @@ class HostProfile:
     device_roles: dict[str, str]
     port: int
     startup_timeout: float
+    #: Stock Neuron's image/socket/cache and evidence paths belong to the host,
+    #: while TP/LNC/context and workload policy remain in the portable pack.
+    neuron_server: dict[str, Any] = field(default_factory=dict)
 
     def checkpoint_path(self, key: str) -> str:
         try:
@@ -677,9 +741,7 @@ def load_host(path: Path) -> HostProfile:
         checkpoints=dict(_typed(_require(raw, "checkpoints", where), dict,
                                 f"{where}.checkpoints")),
         text_corpus=_typed(_require(raw, "text_corpus", where), str, f"{where}.text_corpus"),
-        nsys_executable=_typed(
-            _require(raw, "nsys_executable", where), str, f"{where}.nsys_executable"
-        ),
+        nsys_executable=_typed(raw.pop("nsys_executable", ""), str, f"{where}.nsys_executable"),
         fork_python=_typed(raw.pop("fork_python", ""), str, f"{where}.fork_python"),
         device_roles=dict(
             _typed(_require(raw, "device_roles", where), dict, f"{where}.device_roles")
@@ -688,6 +750,7 @@ def load_host(path: Path) -> HostProfile:
         startup_timeout=float(
             _typed(raw.pop("startup_timeout", 900.0), (int, float), f"{where}.startup_timeout")
         ),
+        neuron_server=dict(_typed(raw.pop("neuron_server", {}), dict, f"{where}.neuron_server")),
     )
     _reject_extra(raw, where)
     if not host.checkpoints:

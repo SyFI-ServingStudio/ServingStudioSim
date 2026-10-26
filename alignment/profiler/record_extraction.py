@@ -358,6 +358,105 @@ def _validate_decode_request_progress(row: dict, records: EngineRecords) -> None
         request["request_id"] = request_id
 
 
+#: Optional, additive arrival sub-record of a schema-v2 EngineCore timing row
+#: (`arrival_timing_schema_version` 1 or 2). Absolute stamps share one in-process
+#: monotonic clock; the frontend wall-clock arrival is converted at receive.
+_ARRIVAL_STAMP_FIELDS = (
+    "frontend_arrival_epoch_ns",
+    "frontend_arrival_monotonic_ns",
+    "engine_receive_monotonic_ns",
+)
+_ARRIVAL_DURATION_FIELDS = (
+    "frontend_arrival_to_engine_receive_ms",
+    "engine_arrival_to_queued_ms",
+    "server_ttft_from_arrival_ms",
+)
+#: Sub-version 2 adds the API server's send stamp (same monotonic clock), which
+#: splits arrival-to-receive into its API-side and EngineCore-side parts.
+_HANDOFF_STAMP_FIELDS = ("api_send_monotonic_ns",)
+_HANDOFF_DURATION_FIELDS = (
+    "frontend_arrival_to_api_send_ms",
+    "api_send_to_engine_receive_ms",
+)
+
+
+def _require_group(row: dict, stamps: tuple, durations: tuple) -> bool:
+    """True when a field group is complete, False when all-null; else raise."""
+    values = [row[field] for field in (*stamps, *durations)]
+    if all(value is None for value in values):
+        return False
+    for field in stamps:
+        value = row[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"alignment arrival timing {field} must be a positive integer")
+    for field in durations:
+        value = row[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"alignment arrival timing {field} must be nonnegative")
+    return True
+
+
+def validate_arrival_timing(row: dict) -> None:
+    """Pass arrival fields through, each group all-null or complete and ordered.
+
+    Rows without `arrival_timing_schema_version` predate the fields and are
+    left untouched; existing durations keep their meaning either way. Version 1
+    rows carry no hand-off fields (a reader may add them as nulls).
+    """
+    if "arrival_timing_schema_version" not in row:
+        return
+    version = row["arrival_timing_schema_version"]
+    if version not in {1, 2}:
+        raise ValueError(f"unsupported alignment arrival timing schema {version!r}")
+    if row["schema_version"] != 2:
+        raise ValueError("alignment arrival timing requires EngineCore request timing schema v2")
+    handoff = (*_HANDOFF_STAMP_FIELDS, *_HANDOFF_DURATION_FIELDS)
+    fields = (*_ARRIVAL_STAMP_FIELDS, *_ARRIVAL_DURATION_FIELDS)
+    if version == 2:
+        fields = (*fields, *handoff)
+    missing = [field for field in fields if field not in row]
+    if missing:
+        raise ValueError(f"alignment arrival timing record missing fields {missing}")
+    if version == 1 and any(row.get(field) is not None for field in handoff):
+        raise ValueError("alignment arrival timing schema 1 carries no hand-off stamps")
+    arrived = _require_group(row, _ARRIVAL_STAMP_FIELDS, _ARRIVAL_DURATION_FIELDS)
+    handed_off = version == 2 and _require_group(
+        row, _HANDOFF_STAMP_FIELDS, _HANDOFF_DURATION_FIELDS
+    )
+    if not arrived:
+        if handed_off:
+            raise ValueError("alignment arrival timing hand-off stamp lacks arrival stamps")
+        return
+    arrival = row["frontend_arrival_monotonic_ns"]
+    receive = row["engine_receive_monotonic_ns"]
+    receive_ms = (receive - arrival) / 1e6
+    if abs(row["frontend_arrival_to_engine_receive_ms"] - receive_ms) > 1e-6:
+        raise ValueError("alignment arrival timing disagrees with its receive stamps")
+    # Receive is sampled before the stock QUEUED event inside add_request.
+    if row["engine_arrival_to_queued_ms"] + 1e-3 < row["frontend_arrival_to_engine_receive_ms"]:
+        raise ValueError("alignment arrival timing QUEUED precedes EngineCore receive")
+    components_ms = row["engine_arrival_to_queued_ms"] + row["engine_core_ttft_ms"]
+    if abs(row["server_ttft_from_arrival_ms"] - components_ms) > 1e-6:
+        raise ValueError(
+            "alignment arrival timing components do not sum to server_ttft_from_arrival_ms"
+        )
+    if not handed_off:
+        return
+    send = row["api_send_monotonic_ns"]
+    if not arrival <= send <= receive:
+        raise ValueError("alignment arrival timing API send is outside arrival..receive")
+    if (
+        abs(row["frontend_arrival_to_api_send_ms"] - (send - arrival) / 1e6) > 1e-6
+        or abs(row["api_send_to_engine_receive_ms"] - (receive - send) / 1e6) > 1e-6
+    ):
+        raise ValueError("alignment arrival timing disagrees with its API send stamp")
+
+
 def extract_request_timings_jsonl(
     server_log: Path,
     out_jsonl: Path,
@@ -595,6 +694,7 @@ def extract_request_timings_jsonl(
                             "alignment request timing engine_core_tpot_ms does not equal "
                             "engine_core_decode_ms/(num_output_tokens-1)"
                         )
+            validate_arrival_timing(row)
             api_row = api_rows.pop(request_id, None)
             if api_row is not None:
                 if schema_version != 2:
