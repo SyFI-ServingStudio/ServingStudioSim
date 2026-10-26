@@ -19,6 +19,26 @@ KV_SLOTS = KV_BLOCKS * BLOCK_SIZE
 CONTEXTS = (128, 512, 1024, 2048, 4096, 8192)
 
 
+#: Token step of a compiled prefill bucket (``num_batched_tokens_buckets``).
+#: vllm-neuron accepts any ascending positive buckets; this repository measures
+#: multiples of 128 only. ``PREFILL_BUCKET_STEP`` in neuron_llama_forward.rs
+#: mirrors this value; tests/test_neuron_full_forward.py checks that they agree.
+PREFILL_BUCKET_STEP = 128
+#: Output tokens of each validation request. A validation prompt is
+#: ``bucket - VALIDATION_OUTPUT_TOKENS`` tokens long. ``PROMPT_TAIL`` in
+#: neuron_llama_segmented_forward.rs mirrors this value.
+VALIDATION_OUTPUT_TOKENS = 8
+
+
+def prompt_length(prefill_bucket: int) -> int:
+    """Prompt tokens of the validation requests that run one prefill graph.
+
+    The prompt fills the graph and keeps VALIDATION_OUTPUT_TOKENS slots for
+    output. At the context, this is the canonical C-8 prompt.
+    """
+    return prefill_bucket - VALIDATION_OUTPUT_TOKENS
+
+
 def resident_capacity(context: int) -> int:
     """Requests whose full context fits the KV pool at once."""
     return KV_SLOTS // context

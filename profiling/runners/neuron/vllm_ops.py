@@ -12,7 +12,7 @@ from pathlib import Path
 from profiling.runners.neuron.vllm_forward import (
     precision_shape,
     run_stage,
-    validate_shape,
+    validate_whole_context_shape,
     verify_identity,
     write_plan,
 )
@@ -285,7 +285,7 @@ def capture_ops(shape: dict, request: dict) -> dict:
     from profiling.profilers.neuron_ops_labels import collect_source_identity
     from profiling.runners.neuron.vllm_forward_engine import engine_config
 
-    validate_shape(**shape)
+    validate_whole_context_shape(**shape)
     cache = Path(os.environ["SERVINGSTUDIO_NEURON_PROFILE_CACHE_DIR"])
     model = Path(os.environ["SERVINGSTUDIO_VLLM_NEURON_MODEL_DIR"])
     identity = verify_identity(model)

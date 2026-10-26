@@ -130,6 +130,7 @@ def verify_cache_binaries(cache: Path, graphs: dict) -> dict:
 
 def _accuracy_graphs(root: Path) -> tuple[dict, dict]:
     """Reconstruct the receipt from acquisition files, including geometry and load scope."""
+    from profiling.runners.neuron.vllm_forward_engine import prefill_buckets_of
     from profiling.runners.neuron.vllm_forward_trace import plan_geometry
 
     plan = json.loads((root / "plan.json").read_text())
@@ -139,7 +140,8 @@ def _accuracy_graphs(root: Path) -> tuple[dict, dict]:
     before = json.loads((root / "accuracy-binaries-before.json").read_text())
     after = json.loads((root / "accuracy-binaries-after.json").read_text())
     log = (root / "accuracy.log").read_text()
-    expected = {("prefill", plan.get("segment_size", plan["context"]))} | {
+    # Seal every compiled prefill graph (``prefill_buckets_of``).
+    expected = {("prefill", bucket) for bucket in prefill_buckets_of(plan)} | {
         ("decode", case["bucket"]) for case in json.loads((root / "cases.json").read_text())
     }
     graphs = {}

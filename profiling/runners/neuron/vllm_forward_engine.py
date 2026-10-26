@@ -10,7 +10,9 @@ from pathlib import Path
 
 from profiling.runners.neuron.stock_contract import (
     KV_BLOCKS,
+    VALIDATION_OUTPUT_TOKENS,
     prefill_validation_bucket,
+    prompt_length,
     resident_capacity,
 )
 
@@ -50,12 +52,26 @@ def validate_greedy_tokens(logits, token_ids):
         raise RuntimeError("sampled token logit differs from the exact stored row maximum")
 
 
+def prefill_buckets_of(plan):
+    """The prefill inventory the plan's engine compiles: the requested prefill
+    buckets plus the context, which vllm-neuron requires as the last entry. A
+    segmented plan compiles its one S-token graph."""
+    if "segment_size" in plan:
+        return [plan["segment_size"]]
+    requested = {s["token_bucket"] for s in plan.get("specs", ()) if s["phase"] == "prefill"}
+    return sorted(requested | {plan["context"]})
+
+
 def cases_for_plan(plan, tokenizer):
     context = plan["context"]
     validation = prefill_validation_bucket(context)
     decode = {s["token_bucket"] for s in plan.get("specs", ()) if s["phase"] == "decode"}
     buckets = decode or {validation}
-    if any(spec["phase"] == "prefill" for spec in plan["specs"]):
+    prefill = {s["token_bucket"] for s in plan.get("specs", ()) if s["phase"] == "prefill"}
+    # Prefill graphs below the context get their own shorter prompts; a
+    # segmented plan's prefill rows keep the canonical prompts.
+    own_prompts = set() if "segment_size" in plan else {t for t in prefill if t < context}
+    if prefill - own_prompts:
         buckets.add(validation)  # Frozen full-logit validation workload for the prefill row.
     subjects = (
         "paintings",
@@ -74,14 +90,22 @@ def cases_for_plan(plan, tokenizer):
     ]
     # Truncated prefixes are unchanged by the repeat count; 1000 copies fill C8192
     # and context // 8 copies (about 19 tokens each) fill the longer contexts.
-    prompts = [tokenizer.encode(text * max(1000, context // 8))[: context - 8] for text in texts]
-    if any(len(ids) != context - 8 for ids in prompts):
-        raise ValueError("prompt generator did not fill declared context")
+    encoded = [tokenizer.encode(text * max(1000, context // 8)) for text in texts]
     capacity = resident_capacity(context)
+    # Each workload is (prompt length, decode bucket, prefill_only). Decode
+    # buckets run the canonical C-8 prompts. A prefill bucket T < C runs T-8
+    # prompts: they pad to T, because the buckets are 128 apart. Those requests
+    # time the prefill graph only, because their decodes hold fewer KV tokens
+    # than a decode row.
+    workloads = [(prompt_length(context), bucket, False) for bucket in sorted(buckets)]
+    workloads += [(prompt_length(t), validation, True) for t in sorted(own_prompts)]
     cases = []
-    for bucket in sorted(buckets):
+    for length, bucket, prefill_only in workloads:
+        prompts = [ids[:length] for ids in encoded]
+        if any(len(ids) != length for ids in prompts):
+            raise ValueError("prompt generator did not reach the declared prompt length")
         batch = min(bucket, capacity)
-        shape = f"b{batch}-s{context - 8}"
+        shape = f"b{batch}-s{length}"
         # Every bucket covers the same prespecified eight subjects. Small
         # batches require several public calls, aggregated by configuration.
         for start in range(0, max(8, batch), batch):
@@ -92,6 +116,7 @@ def cases_for_plan(plan, tokenizer):
                     "bucket": bucket,
                     "prompts": [prompts[i % len(prompts)] for i in range(start, start + batch)],
                 }
+                | ({"prefill_only": True} if prefill_only else {})
             )
     return cases
 
@@ -141,12 +166,13 @@ def segment_timing_cases(plan, cases):
 def engine_config(plan, cases, root, mode):
     """Public ``LLM`` arguments; ``cases`` is the full (unfiltered) canonical workload.
 
-    A plan with ``segment_size`` S serves the same context with the stock prefill
+    The prefill inventory is ``prefill_buckets_of(plan)``. A plan with
+    ``segment_size`` S serves the same context with the stock prefill
     segmentation: S-token budgets, S-token batched-token and KV-segment buckets.
     """
     tokens = plan.get("segment_size", plan["context"])
     nc = {
-        "num_batched_tokens_buckets": [tokens],
+        "num_batched_tokens_buckets": prefill_buckets_of(plan),
         "num_seqs_buckets": seqs_buckets(plan, cases),
     }
     if "segment_size" in plan:
@@ -230,7 +256,7 @@ def main(root, mode):
         start = time.time_ns()
         outputs = llm.generate(
             [{"prompt_token_ids": ids} for ids in case["prompts"]],
-            SamplingParams(temperature=0, max_tokens=8, ignore_eos=True),
+            SamplingParams(temperature=0, max_tokens=VALIDATION_OUTPUT_TOKENS, ignore_eos=True),
             use_tqdm=False,
         )
         result = {
@@ -241,11 +267,15 @@ def main(root, mode):
             "stop_epoch_ns": time.time_ns(),
             "requests": [],
         }
-        if case.get("segment_timing"):
-            result["segment_timing"] = True
+        for flag in ("segment_timing", "prefill_only"):
+            if case.get(flag):
+                result[flag] = True
         for slot, output in enumerate(outputs):
             tokens = output.outputs[0].token_ids
-            if output.prompt_token_ids != case["prompts"][slot] or len(tokens) != 8:
+            if (
+                output.prompt_token_ids != case["prompts"][slot]
+                or len(tokens) != VALIDATION_OUTPUT_TOKENS
+            ):
                 raise RuntimeError("public engine output violates requested history")
             result["requests"].append(
                 {

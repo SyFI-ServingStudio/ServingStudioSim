@@ -35,7 +35,7 @@ from profiling.runners.neuron.vllm_forward import (
     key,
     precision_shape,
     run_stage,
-    validate_shape,
+    validate_whole_context_shape,
     verify_identity,
     write_plan,
 )
@@ -71,7 +71,7 @@ def validate_segment_shape(segment, **forward):
     """
     if segment not in SEGMENTS:
         raise ValueError("segment must be embedding, attention_block, mlp_block or head")
-    validate_shape(**forward)
+    validate_whole_context_shape(**forward)
 
 
 def canonical_batch(bucket: int, context: int) -> int:
@@ -94,7 +94,9 @@ def capture_calls(specs, context: int) -> dict[str, int]:
     if any(spec["phase"] == "prefill" for spec in specs):
         buckets.add(PREFILL_CASE_BUCKET)
     for bucket in buckets:
-        validate_shape("decode", bucket, context, KV_BLOCKS, BLOCK_SIZE, TP_SIZE, "bf16")
+        validate_whole_context_shape(
+            "decode", bucket, context, KV_BLOCKS, BLOCK_SIZE, TP_SIZE, "bf16"
+        )
     return {
         str(bucket): 2 if canonical_batch(bucket, context) == 1 else 1 for bucket in sorted(buckets)
     }
