@@ -1,0 +1,17 @@
+{
+ "schema_version": 2,
+ "rule_files": [
+  "rules.json"
+ ],
+ "note": "Qwen3.8-27B-NVFP4 on one L40S (vLLM Recipes deployment, alignment fork e1423a4d7) TP1, labeled against the qwen35_vllm_nvfp4_gdn_dense CostTree on its SM89 kernel path. One order-independent rule set (rules.json), written by gen_rules.py. Inventories are initialized unfolded (literal-v1) so each Marlin launch of a multi-launch GEMM is named by its predecessor.",
+ "source": {
+  "capture": "logs/20261023_1_q38_l40s_campaign/*/profile_nsys",
+  "cost_manifest": "timing_predict/raw/cost_manifest/worker_predict_0.json of each case",
+  "arch": "qwen35_vllm_nvfp4_gdn_dense, model/config/qwen3_8_27b_nvfp4.json"
+ },
+ "unmapped_decisions": {
+  "preprocess": "input preparation, slot mapping, mamba align copies; no CostTree leaf",
+  "sample": "sampling kernels (gumbel sample, argmax reduce, scatter/gather, index, counters) are not modelled; the logits row select and the LM-head Marlin GEMM are mapped (head.*)",
+  "bookkeep": "scheduler bookkeeping and the mamba state postprocess; no CostTree leaf"
+ }
+}

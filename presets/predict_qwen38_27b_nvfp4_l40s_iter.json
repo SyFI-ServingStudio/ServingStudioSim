@@ -1,0 +1,20 @@
+{
+  "arch": {
+    "iter": {
+      "type": "qwen35_vllm_nvfp4_gdn_dense",
+      "model_config": "model/config/qwen3_8_27b_nvfp4.json",
+      "fp8": false,
+      "max_model_len": 262144,
+      "cudagraph_capture_sizes": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ]
+    }
+  },
+  "gpu": "NVIDIA L40S",
+  "log_dir": "logs/predict_qwen38_27b_nvfp4_l40s_iter",
+  "cases_file": "predict_qwen38_27b_nvfp4_l40s_iter_cases.json"
+}

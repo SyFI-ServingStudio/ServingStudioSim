@@ -1,0 +1,150 @@
+{
+  "note": "The traces themselves are not committed: they are `shapes` x `repeats` from campaign.yaml, and `alignment-campaign check` regenerates and compares against this record. Written by `check --update-invariants`, which only ever ADDS a trace. Re-recording an existing one means deleting its entry here first, on purpose, in a reviewable diff.",
+  "schema_version": 1,
+  "traces": {
+    "traces/03_balanced_anchor_c8.csv": {
+      "arrival_span_ms": 31000.0,
+      "distinct_request_ids": 32,
+      "distinct_shapes": 8,
+      "input_tokens": 59392,
+      "max_input_len": 4096,
+      "max_output_len": 256,
+      "max_total_len": 4352,
+      "output_tokens": 6144,
+      "request_count": 32,
+      "sha256": "86f0ef6d840e6da9ab6978fbacd2b287d366b16f71af4c47d74fe650aee0049b"
+    },
+    "traces/04_prefill_spectrum_c8.csv": {
+      "arrival_span_ms": 31000.0,
+      "distinct_request_ids": 32,
+      "distinct_shapes": 8,
+      "input_tokens": 379392,
+      "max_input_len": 28672,
+      "max_output_len": 64,
+      "max_total_len": 28736,
+      "output_tokens": 2048,
+      "request_count": 32,
+      "sha256": "f0adaa373977c9e0da38955fbfed9d63a8c3b96d7ad362a52310705e33498839"
+    },
+    "traces/05_decode_spectrum_c8.csv": {
+      "arrival_span_ms": 15000.0,
+      "distinct_request_ids": 16,
+      "distinct_shapes": 8,
+      "input_tokens": 4608,
+      "max_input_len": 1024,
+      "max_output_len": 4096,
+      "max_total_len": 5120,
+      "output_tokens": 27936,
+      "request_count": 16,
+      "sha256": "b487e4cb80b3353475fb564b63369ced27d345c5bd30d175d7ee6aef3ca180ea"
+    },
+    "traces/07_quadrant_interference_c8.csv": {
+      "arrival_span_ms": 15000.0,
+      "distinct_request_ids": 16,
+      "distinct_shapes": 4,
+      "input_tokens": 115712,
+      "max_input_len": 16384,
+      "max_output_len": 4096,
+      "max_total_len": 16512,
+      "output_tokens": 29696,
+      "request_count": 16,
+      "sha256": "03bb1183ab470c0adddf4a85437a2426e2d5478df1e654d76243ada363a8f094"
+    },
+    "traces/10_full_saturation_c8.csv": {
+      "arrival_span_ms": 31000.0,
+      "distinct_request_ids": 32,
+      "distinct_shapes": 8,
+      "input_tokens": 68608,
+      "max_input_len": 6144,
+      "max_output_len": 4096,
+      "max_total_len": 6656,
+      "output_tokens": 53248,
+      "request_count": 32,
+      "sha256": "450d8e4360947667b24dbf41b57ebc1f117bc88efe216559e933c8dd7c39c6e7"
+    },
+    "traces/11_long_prefill_ladder_c1.csv": {
+      "arrival_span_ms": 5000.0,
+      "distinct_request_ids": 6,
+      "distinct_shapes": 6,
+      "input_tokens": 483328,
+      "max_input_len": 229376,
+      "max_output_len": 64,
+      "max_total_len": 229440,
+      "output_tokens": 240,
+      "request_count": 6,
+      "sha256": "d4aaefc833f7501eb84906b05d47015a33062a9148a40a1ff5b03bd3658c7c93"
+    },
+    "traces/11_long_prefill_ladder_c1.nsys.csv": {
+      "arrival_span_ms": 3000.0,
+      "distinct_request_ids": 4,
+      "distinct_shapes": 4,
+      "input_tokens": 122880,
+      "max_input_len": 65536,
+      "max_output_len": 64,
+      "max_total_len": 65600,
+      "output_tokens": 160,
+      "request_count": 4,
+      "sha256": "2c79fe4ed2cf8158f057044852a08bfc1eb1bc5c87269951fdf87108908461b5"
+    },
+    "traces/16_prefill_spectrum_chunk2k_c8.csv": {
+      "arrival_span_ms": 31000.0,
+      "distinct_request_ids": 32,
+      "distinct_shapes": 8,
+      "input_tokens": 96768,
+      "max_input_len": 7168,
+      "max_output_len": 64,
+      "max_total_len": 7232,
+      "output_tokens": 2048,
+      "request_count": 32,
+      "sha256": "266d749116c0f2d7184f2a892a9fb6e46cc4d52189215492c0e45ed13ccc8ed3"
+    },
+    "traces/17_prefill_spectrum_chunk4k_c8.csv": {
+      "arrival_span_ms": 31000.0,
+      "distinct_request_ids": 32,
+      "distinct_shapes": 8,
+      "input_tokens": 190976,
+      "max_input_len": 14336,
+      "max_output_len": 64,
+      "max_total_len": 14400,
+      "output_tokens": 2048,
+      "request_count": 32,
+      "sha256": "159610ef82a24714f0726aabd9dc230b78221bf8f4b99d042f97a673101e8fec"
+    },
+    "traces/18_quadrant_interference_chunk2k_c8.csv": {
+      "arrival_span_ms": 15000.0,
+      "distinct_request_ids": 16,
+      "distinct_shapes": 4,
+      "input_tokens": 29696,
+      "max_input_len": 4096,
+      "max_output_len": 4096,
+      "max_total_len": 6144,
+      "output_tokens": 29696,
+      "request_count": 16,
+      "sha256": "06414e3a767db09ed91e6de9531e5952a7683647ddb622d50cdee29373d912b8"
+    },
+    "traces/21_balanced_anchor_graphs8k_c8.csv": {
+      "arrival_span_ms": 31000.0,
+      "distinct_request_ids": 32,
+      "distinct_shapes": 8,
+      "input_tokens": 59392,
+      "max_input_len": 4096,
+      "max_output_len": 256,
+      "max_total_len": 4352,
+      "output_tokens": 6144,
+      "request_count": 32,
+      "sha256": "bc9bc811b19d312cc9391475741daadd53f0169d5ea1df9d765332d5e1675fe0"
+    },
+    "traces/22_quadrant_interference_graphs8k_c8.csv": {
+      "arrival_span_ms": 15000.0,
+      "distinct_request_ids": 16,
+      "distinct_shapes": 4,
+      "input_tokens": 115712,
+      "max_input_len": 16384,
+      "max_output_len": 4096,
+      "max_total_len": 16512,
+      "output_tokens": 29696,
+      "request_count": 16,
+      "sha256": "5ec87645fb7aa6441e6f1741f1a486a33533483038dbb754f11ae02273784cc8"
+    }
+  }
+}
