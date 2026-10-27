@@ -1,34 +1,50 @@
-"""GDN prefill chunked delta rule as ONE fused launch.
+"""GDN prefill chunked delta rule: one call computing output and final states.
 
-FLA's Triton realization splits the chunked gated delta rule into six launches
-(local cumsum, scaled dot K·Kᵀ, triangular solve, w/u recompute, inter-chunk
-state scan, output). This kind models the realization vLLM actually selects on
-Hopper and Blackwell instead: FlashInfer's `flashinfer.gdn_prefill.
-chunk_gated_delta_rule`, a single kernel that keeps every intermediate on
-chip: a CUTLASS TMA warp-specialized kernel
-(`flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule`) on SM90 and a persistent
-CuTe DSL kernel (`GatedDeltaNetChunkedKernel`) on SM100. The simulator has no
-kinds for the six Triton launches.
+The operation is the chunked gated delta rule of Gated DeltaNet prefill, one
+call per layer and step: queries and keys already L2-normalized, grouped key
+heads, FP32 gate and beta, FP32 initial states, varlen sequences. It has two
+backends, which differ in implementation and in the form of the gate operand:
 
-The choice is not a tuning detail. `ChunkGatedDeltaRule._resolve_gdn_prefill_backend`
-picks `flashinfer` for the default `auto` request on any SM90 part, and on
-SM100 when the head dim is 128 and CUDA is 13+, so a measured H200 or B200 vLLM
-run never launches the six Triton kernels at all. Costing the six-launch path
-against it over-predicted the operation by 110% on a Qwen3.6-35B-A3B-FP8
-capture, because the split path
-round-trips h/w/u/A through HBM five extra times.
+- ``flashinfer`` -- `flashinfer.gdn_prefill.chunk_gated_delta_rule`, a single
+  kernel that keeps every intermediate on chip: a CUTLASS TMA warp-specialized
+  kernel (`flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule`) on SM90 and a
+  persistent CuTe DSL kernel (`GatedDeltaNetChunkedKernel`) on SM100. It takes
+  the decay already exponentiated, so vLLM's `fi_chunk_gated_delta_rule`
+  launches a separate `torch.exp(g)` before it; that launch is not in this
+  kind and the arch costs it as its own elementwise leaf.
+- ``fla_triton`` -- vLLM's vendored FLA `chunk_gated_delta_rule`
+  (`vllm.third_party.flash_linear_attention.ops`), a fixed chain of seven
+  launches: local cumsum, scaled K·Kᵀ, a BF16 zero fill and the 64x64
+  triangular solve, w/u recompute, inter-chunk state scan, output. It takes
+  the decay in log space (`chunk_local_cumsum` consumes it), so this path has
+  no exp(g) launch at all and an arch selecting it omits that leaf.
+
+The gate form is a backend difference, not a new kind: both backends compute
+the same recurrence over the same q/k/v/beta/state tensors from the same
+upstream `fused_post_conv_prep` output, and the args below mean the same thing
+for both. Only where `exp` is applied to g moves.
+
+`ChunkGatedDeltaRule._resolve_gdn_prefill_backend` picks `flashinfer` for the
+default `auto` request on any SM90 part, and on SM100/SM120 when the head dim
+is 128 and CUDA is 13+; every other CUDA device (A100, L40S, ...) runs
+`fla_triton`. Costing the split Triton chain on an H200 run over-predicted the
+operation by 110% on a Qwen3.6-35B-A3B-FP8 capture, because the split path
+round-trips h/w/u/A through HBM five extra times, so the backend must follow
+the deployment.
 
 Wire string: ``"gdn_chunk_delta_rule"`` — matches the Rust ``KernelSpec::KIND``
 in ``simulator/src/timing/kernels/gdn_chunk_delta_rule.rs`` and the facade stem
 ``get_gdn_chunk_delta_rule_times`` / ``count_missing_gdn_chunk_delta_rule``.
 
 Chunking is deliberately NOT in the args schema: FlashInfer owns its own chunk
-size internally, so unlike FLA's Triton path there is no `num_chunks` the
-caller can choose.
+size internally and FLA hard-codes 64, so there is no chunk count a caller can
+choose.
 
 The second axis is `max_sequence_length`, NOT a sequence count. The inter-chunk
 recurrence is sequential *within* a sequence and independent *across* sequences,
-so one CTA per (sequence, value head) walks its own chunks and the launch is
+so one CTA per (sequence, value head) walks its own chunks (FlashInfer's kernel,
+and FLA's `chunk_gated_delta_rule_fwd_kernel_h`, whose grid is (value blocks,
+sequences x heads); FLA's other launches are chunk-parallel over tokens) and the launch is
 work-conserving rather than wave-quantized. The profiled rows show it on an H200
 (16/32 heads, 128/128 dims): 4096x1 198.5 us, 4096x2 198.7 us, 4096x4 212.6 us —
 flat while 32*N CTAs still fit the 132 SMs — then 4096x8 425.3 us and 4096x16
@@ -80,14 +96,16 @@ DOC = KernelDoc(
     title="Fused chunked delta rule",
     summary="Compute Gated DeltaNet prefill output and final recurrent states in one launch.",
     description=(
-        "The chunked gated delta rule of Gated DeltaNet prefill, "
-        "which vLLM on H200 and B200 runs as one FlashInfer kernel: it writes "
-        "every token's output and each sequence's final state. The inputs are "
-        "prepared as vLLM prepares them: queries and keys already L2-normalized"
-        " outside the call, the decay passed already exponentiated, beta in "
-        "FP32. The measurement uses num_tokens / max_sequence_length full "
-        "sequences plus one shorter remainder; FlashInfer picks its chunk "
-        "width."
+        "The chunked gated delta rule of Gated DeltaNet prefill: one call "
+        "writes every token's output and each sequence's final state. vLLM "
+        "runs it as one FlashInfer kernel on H200 and B200 (flashinfer) and "
+        "as FLA's seven Triton launches elsewhere, e.g. on A100 and L40S "
+        "(fla_triton). The inputs are prepared as vLLM prepares them: queries "
+        "and keys already L2-normalized outside the call, beta in FP32, the "
+        "FP32 decay already exponentiated for flashinfer and in log space for "
+        "fla_triton. The measurement uses num_tokens / max_sequence_length "
+        "full sequences plus one shorter remainder; the chunk width is the "
+        "backend's own (64 in FLA)."
     ),
     category="Attention",
     subcategory="Gated DeltaNet",
@@ -106,16 +124,26 @@ DOC = KernelDoc(
     method=(
         f"{CUPTI_METHOD} "
         "Every launch of the call is counted: FlatKernel on SM90, "
-        "GatedDeltaNetChunkedKernel on SM100. Inputs, gates and sequence "
-        "boundaries are allocated before the capture."
+        "GatedDeltaNetChunkedKernel on SM100, and for fla_triton the seven "
+        "FLA launches including solve_tril's BF16 zero fill. Inputs, gates, "
+        "sequence boundaries and FLA's chunk indices are built before the "
+        "capture, as vLLM's metadata builder builds them once per step. "
+        "fla_triton's Triton autotuning runs once per worker at vLLM's own "
+        "warm-up shape, one 64-token sequence; its keys omit the token count, "
+        "so those configs serve every later shape. Before timing, fla_triton "
+        "checks the shape cut to 1024-token sequences, from random initial "
+        "states, against a per-token PyTorch reference."
     ),
     caveats=(
-        "Each call starts from an all-zero state.",
+        "Each timed call starts from an all-zero state.",
+        "The gate is exp(g) for flashinfer and g for fla_triton; the exp "
+        "launch vLLM issues before the FlashInfer call is not in this kind.",
+        "The state gather, the zeroing of fresh states and the final-state "
+        "scatter run outside the call.",
         "The 64-token width appears only in the FLOP estimate; bytes count "
         "minimum logical traffic, not physical traffic.",
     ),
-    # No separate PyTorch reference exists for this fused kind.
-    reference=None,
+    reference="profiling.runners.attention.gdn_chunk_delta_rule_reference",
 )
 
 
@@ -146,5 +174,46 @@ register(
             url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/gdn_prefill.py",
         ),
         subprocess_env="vllm_env",
+    )
+)
+
+
+# vLLM's FLA path: any CUDA device the FlashInfer gate above does not take.
+# The chain is plain Triton with BF16 tl.dot (mma.sync, SM80+); TMA is only
+# used on Hopper with FLA_USE_TMA=1, which vLLM leaves off.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="fla_triton",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            min_compute_capability=(8, 0),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.gdn_chunk_delta_rule_fla_triton",
+            function_name="profile_gdn_chunk_delta_rule_fla_triton",
+        ),
+        table_name=KIND,
+        args_schema=GdnChunkDeltaRuleArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's FLA chunk_gated_delta_rule: seven Triton launches (cumsum, "
+                "K·Kᵀ, zero fill + triangular solve, w/u, state scan, output), "
+                "decay taken in log space."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/third_party/flash_linear_attention/ops/chunk.py",
+        ),
+        # vLLM defaults TRITON_CACHE_AUTOTUNING=1, which would let the first
+        # shape tuned in a TRITON_CACHE_DIR fix the configs of every later row
+        # and process. The runner tunes at vLLM's warm-up shape per worker and
+        # records it through row_provenance.
+        worker_env=(("TRITON_CACHE_AUTOTUNING", "0"),),
+        row_provenance_ref=RunnerRef(
+            module_name="profiling.runners.attention.gdn_chunk_delta_rule_fla_triton",
+            function_name="row_provenance",
+        ),
     )
 )

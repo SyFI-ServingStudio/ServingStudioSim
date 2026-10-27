@@ -1,19 +1,29 @@
-//! Gated DeltaNet prefill chunked delta rule as ONE fused launch.
+//! Gated DeltaNet prefill chunked delta rule: one call writing every token's
+//! output and each sequence's final state.
 //!
-//! FLA's Triton realization splits the chunked gated delta rule into six
-//! launches (local cumsum, K.Kt, triangular solve, w/u recompute, inter-chunk
-//! state scan, output). This kind models the realization vLLM actually selects
-//! on Hopper instead: FlashInfer's `chunk_gated_delta_rule`, a single CUTLASS TMA
-//! warp-specialized kernel (`flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule`)
-//! that keeps every intermediate on chip. `_resolve_gdn_prefill_backend` picks
-//! it for the default `auto` request on any SM90 part, so an H200 capture never
-//! launches the six Triton kernels at all, and the simulator has no kinds for
-//! them.
+//! Two backends share the kind, its args and its `(L, N)` cache; they differ in
+//! implementation and in where `exp` is applied to the decay gate:
+//!
+//! - `flashinfer` -- FlashInfer's `chunk_gated_delta_rule`, a single CUTLASS
+//!   TMA warp-specialized kernel (`flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule`)
+//!   on SM90 and a persistent CuTe DSL kernel on SM100, every intermediate on
+//!   chip. It takes `exp(g)`, which vLLM computes in a separate elementwise
+//!   launch the arch costs as its own leaf. `_resolve_gdn_prefill_backend`
+//!   picks it for the default `auto` request on any SM90 part (and SM10x/SM12x
+//!   with head dim 128 on CUDA 13+), so an H200 capture never launches the
+//!   Triton chain below.
+//! - `fla_triton` -- vLLM's vendored FLA `chunk_gated_delta_rule`, every other
+//!   CUDA device (A100, L40S, ...): seven launches (local cumsum, K.Kt, a BF16
+//!   zero fill and the triangular solve, w/u recompute, inter-chunk state scan,
+//!   output). It takes the log-space `g` directly, so an arch selecting it has
+//!   no `exp(g)` leaf.
 //!
 //! The cache axes are `(L, N)` = longest sequence and `T/L`, NOT `(T, N)`.
 //! The inter-chunk recurrence is sequential *within* a sequence and independent
 //! *across* sequences, so one CTA per (sequence, value head) walks its own
-//! chunks: `L` is the critical path and `T` is the aggregate work. The profiled
+//! chunks (FlashInfer's kernel; FLA's `chunk_gated_delta_rule_fwd_kernel_h`,
+//! the largest of its launches, whose other launches are chunk-parallel over
+//! tokens): `L` is the critical path and `T` is the aggregate work. The profiled
 //! rows show it directly on an H200 (16/32 heads, 128/128 dims): 4096x1 /
 //! 4096x2 / 4096x4 are flat at 198.5 / 198.7 / 212.6 us while 32*N CTAs still
 //! fit the 132 SMs, then 4096x8 and 4096x16 rise to 425.3 / 868.2 us. A ragged
@@ -26,6 +36,18 @@
 //!
 //! `L` on a power-of-two axis and `N` on a small integer axis makes the sweep
 //! rectangular; only the `T = N*L` ceiling needs masking.
+//!
+//! `fla_triton` gets a wider grid. Its time at large `T` is nearly linear in
+//! `T` whatever `L` is (L40S, Qwen3.8-27B 16/48 heads: 16,384 tokens take
+//! 6.59-6.76 ms from 1x16384 to 16x1024), but every sequence costs at least a
+//! whole 64-token chunk, so many short prefills cost more per token than one
+//! long one (16x64 = 1,024 tokens: 346 us against 180 us for 1x1024). On the
+//! FlashInfer grid that region is reached only by extrapolation, which on the
+//! L40S under-predicted 128x64 by 18% and 75x8 by 93%. The FLA grid therefore
+//! adds `L` = 8/16/32 below one chunk, `L` = 1536/3072 where single-sequence
+//! time bends (1024: 180 us, 2048: 522 us), and `N` up to 256. A config whose
+//! backends include `fla_triton` uses it; FlashInfer-only configs keep the grid
+//! their H200/B200 rows were measured on.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -75,13 +97,25 @@ impl SweepCoords for GdnChunkDeltaRuleKernelInput {
 
 pub struct GdnChunkDeltaRuleSpec;
 
+const FLA_TRITON: &str = "fla_triton";
+
 impl KernelSpec for GdnChunkDeltaRuleSpec {
     type Config = GdnChunkDeltaRuleKernelConfig;
     type Input = GdnChunkDeltaRuleKernelInput;
 
     const KIND: KernelKind = "gdn_chunk_delta_rule";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if config.backends.contains(&FLA_TRITON) {
+            // Sub-chunk L, the 1-2K and 2-4K single-sequence bend, and N up to
+            // 256 for many short prefills (see the module docs).
+            return SweepGrid::new(vec![
+                Axis::values([
+                    8, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 3072, 4096, 8192, 16384,
+                ]),
+                Axis::pow2(0, 8),
+            ]);
+        }
         // L from one chunk (64) to the 16,384-token chunked-prefill budget;
         // N up to 16, which is where the SM-saturation knee has been passed.
         SweepGrid::new(vec![Axis::pow2(6, 14), Axis::pow2(0, 4)])
@@ -294,10 +328,77 @@ mod tests {
     }
 
     #[test]
-    fn the_single_backend_uses_product_extrapolated_cache2d() {
+    fn both_backends_use_product_extrapolated_cache2d() {
+        for backend in ["flashinfer", "fla_triton"] {
+            assert_eq!(
+                GdnChunkDeltaRuleSpec::cache_kind(backend),
+                CacheKind::Cache2DLinear(Extrapolation::Product)
+            );
+        }
+    }
+
+    #[test]
+    fn fla_triton_grid_reaches_sub_chunk_and_many_short_prefills() {
+        // Without these cells a batch of 75 8-token prefills was extrapolated
+        // to 7% of its measured L40S time; the FlashInfer grid must not grow,
+        // or its measured H200/B200 rows stop covering the build.
+        let mut cfg = config();
+        cfg.backends = vec!["fla_triton"];
+        let grid = GdnChunkDeltaRuleSpec::sweep_grid(&cfg);
         assert_eq!(
-            GdnChunkDeltaRuleSpec::cache_kind("flashinfer"),
-            CacheKind::Cache2DLinear(Extrapolation::Product)
+            grid.axes()[0],
+            vec![
+                8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 1536.0, 2048.0, 3072.0, 4096.0,
+                8192.0, 16384.0
+            ]
         );
+        assert_eq!(grid.axes()[1].last(), Some(&256.0));
+        let mask = GdnChunkDeltaRuleSpec::infeasible_mask(&cfg, &grid);
+        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 98);
+        assert_eq!(
+            &*GdnChunkDeltaRuleSpec::cache_coords(
+                &cfg,
+                &GdnChunkDeltaRuleKernelInput {
+                    num_tokens: 600,
+                    max_sequence_length: 8,
+                },
+            ),
+            &[8.0, 75.0]
+        );
+        let flashinfer = GdnChunkDeltaRuleSpec::sweep_grid(&config());
+        assert_eq!(flashinfer.axes()[0].first(), Some(&64.0));
+        assert_eq!(flashinfer.axes()[1].last(), Some(&16.0));
+    }
+
+    #[test]
+    fn fla_triton_on_l40s_deserializes_and_routes_the_same_args() {
+        // The arch switches backends by name alone: an L40S Qwen3.8-27B config
+        // (16 key / 48 value heads) must deserialize with `fla_triton` and emit
+        // the identical payload schema, only the backend string differing.
+        let cfg: GdnChunkDeltaRuleKernelConfig = serde_json::from_value(serde_json::json!({
+            "backends": ["fla_triton"],
+            "gpu_name": "NVIDIA L40S",
+            "num_key_heads": 16,
+            "num_heads": 48,
+            "key_head_dim": 128,
+            "value_head_dim": 128,
+            "dtype": "bf16",
+        }))
+        .unwrap();
+        assert_eq!(cfg.backends(), &["fla_triton"]);
+        assert_eq!(cfg.gpu_name(), "NVIDIA L40S");
+        assert_eq!(cfg.compute_dtype(), Some(DType::Bf16));
+        let grid = GdnChunkDeltaRuleSpec::sweep_grid(&cfg);
+        let fla = GdnChunkDeltaRuleSpec::enumerate(&cfg, &grid, "fla_triton");
+        let flashinfer = GdnChunkDeltaRuleSpec::enumerate(&cfg, &grid, "flashinfer");
+        assert_eq!(fla.len(), flashinfer.len());
+        for (fla, flashinfer) in fla.iter().zip(&flashinfer) {
+            let mut fla = fla.fields().clone();
+            let mut flashinfer = flashinfer.fields().clone();
+            assert_eq!(fla.remove("backend").unwrap(), "fla_triton");
+            assert_eq!(flashinfer.remove("backend").unwrap(), "flashinfer");
+            assert_eq!(fla, flashinfer);
+            assert_eq!(fla["num_heads"], 48);
+        }
     }
 }

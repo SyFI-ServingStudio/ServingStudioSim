@@ -38,6 +38,7 @@ _PINNED = {
     ("all_reduce_fusion", "flashinfer_mnnvl"): "---Y--",  # sm_100a
     ("nvfp4_fused_moe", "flashinfer_trtllm_sm100"): "---YY-",  # sm_100f
     ("gdn_chunk_delta_rule", "flashinfer"): "--YYY-",  # sm_90a, sm_100f
+    ("gdn_chunk_delta_rule", "fla_triton"): "YYYYYY",  # 8.0+
     ("dsa_sparse_mla_attention", "vllm_flashmla_bf16"): "--YYY-",  # sm_90a, sm_100f
     ("dsa_paged_mqa_logits_decode", "deepgemm_fp8"): "--YYYY",  # + sm_120f
 }
