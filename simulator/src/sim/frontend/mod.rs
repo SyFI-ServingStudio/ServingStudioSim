@@ -432,6 +432,43 @@ mod tests {
         .unwrap()
     }
 
+    /// The front-end latency delays when a request reaches the engine, not its
+    /// arrival stamp: TTFT is measured from the trace arrival.
+    #[test]
+    fn frontend_latency_delays_release_but_keeps_the_arrival_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_csv(
+            dir.path(),
+            "t.csv",
+            "id,input_len,output_len,arrival_time\n0,10,2,0.0\n1,10,2,100.0\n",
+        );
+        let mut fe = TraceFrontend::load(
+            &[path],
+            &InputFileSchema::text_generation_independent(),
+            open_loop(1.0)
+                .with_frontend_latency(Time::from_ms(8.0))
+                .unwrap(),
+            uncapped(),
+        )
+        .unwrap();
+        assert!(drain_pairs(&mut fe, 7.9).is_empty());
+        assert_eq!(drain_pairs(&mut fe, 8.0), vec![(RequestId(0), 0.0)]);
+        assert!(drain_pairs(&mut fe, 107.0).is_empty());
+        assert_eq!(drain_pairs(&mut fe, 108.5), vec![(RequestId(1), 100.0)]);
+    }
+
+    /// Saturated mode has no arrival to delay; a front-end latency there is
+    /// rejected, not ignored.
+    #[test]
+    fn frontend_latency_is_rejected_in_saturated_mode() {
+        assert!(ArrivalSchedule::saturated()
+            .with_frontend_latency(Time::from_ms(8.0))
+            .is_err());
+        assert!(ArrivalSchedule::saturated()
+            .with_frontend_latency(Time::ZERO)
+            .is_ok());
+    }
+
     #[test]
     fn execution_v2_maps_opaque_ids_to_dense_ids_in_row_order() {
         let dir = tempfile::tempdir().unwrap();

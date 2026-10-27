@@ -21,7 +21,7 @@ from profiling.db.args import DType, KernelArgs
 from profiling.db.doc import BackendDoc
 from profiling.db.kind import KernelKind
 from profiling.db.outlier import BatchOutlierPolicy
-from profiling.gpu_catalog import gpu_compute_capability
+from profiling.gpu_catalog import gpu_compute_capability, resolve_gpu_spec
 from profiling.runners.metrics import Metrics, RunnerResult
 
 ProfileFn = Callable[..., Metrics]
@@ -111,6 +111,12 @@ class BackendSupport:
     without a GPU, skips the device check — the worker still checks the real
     device when it profiles.
 
+    ``device_family`` is the accelerator family the backend executes on:
+    ``"cuda"`` (every backend unless it says otherwise) or ``"neuron"``. A
+    Neuron backend has no CUDA capability rules; it can name the catalog
+    ``architectures`` it runs on instead, and it never runs on a device the
+    catalog does not place in its family.
+
     The profile.db cache still keys on the full dtype tuple; this type only gates
     *which backends are legal*. Fine, per-request shape constraints (e.g. cudnn
     causal + prefix_len>0) are NOT modeled here — they stay a JIT/profile-time
@@ -121,6 +127,8 @@ class BackendSupport:
     kv: frozenset[DType] | None = None
     min_compute_capability: tuple[int, int] | None = None
     sm_targets: frozenset[str] | None = None
+    device_family: str = "cuda"
+    architectures: frozenset[str] | None = None
 
     def allows(
         self,
@@ -132,8 +140,19 @@ class BackendSupport:
             return False
         if self.kv is not None and kv_dtype is not None and kv_dtype not in self.kv:
             return False
-        if gpu is None:
-            return True
+        return gpu is None or self.allows_gpu(gpu)
+
+    def allows_gpu(self, gpu: str) -> bool:
+        """Whether the device named ``gpu`` can run the kernel, by family and
+        then by architecture (Neuron) or compute capability (CUDA)."""
+        spec = resolve_gpu_spec(gpu)
+        family = spec.device_family if spec is not None else None
+        if self.device_family == "neuron":
+            return family == "neuron" and (
+                self.architectures is None or spec.architecture in self.architectures
+            )
+        if family == "neuron":
+            return False
         return self.allows_compute_capability(gpu_compute_capability(gpu))
 
     def allows_compute_capability(self, capability: tuple[int, int] | None) -> bool:
@@ -185,6 +204,10 @@ class KernelProfilerSpec:
     # spec. When False (the default) the single-spec runner is wrapped by
     # ``batched`` to satisfy the same contract.
     list_native: bool = False
+    # Logical NeuronCores a Neuron backend's worker sees. The Neuron pool always
+    # reserves a whole chip; a tensor-parallel backend names the span its ranks
+    # run on here instead of counting ranks as GPUs in ``gpu_count_fn``.
+    neuron_logical_cores: int = 1
     # Environment variables the execution backend sets on this row's worker
     # process, on top of the inherited environment. For measurement policy that
     # must hold before the framework is imported and that a runner therefore
@@ -320,6 +343,7 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
                         f"unknown sm target {target!r}; expected e.g. 'sm_90a' or 'sm_100f'"
                     )
 
+        _validate_device_family(profiler_spec)
         _validate_worker_env(profiler_spec)
 
         expected_contract = table_contracts.get(profiler_spec.table_name)
@@ -341,6 +365,25 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
 # The execution backend composes these itself (GPU selection, the env's import
 # and library paths); a row overriding them would silently undo that.
 _BACKEND_OWNED_WORKER_ENV = frozenset({"CUDA_VISIBLE_DEVICES", "PYTHONPATH", "LD_LIBRARY_PATH"})
+
+
+def _validate_device_family(profiler_spec: KernelProfilerSpec) -> None:
+    label = f"{profiler_spec.kernel_kind}:{profiler_spec.backend}"
+    supports = profiler_spec.supports
+    if supports.device_family not in ("cuda", "neuron"):
+        raise ValueError(f"{label} declares unknown device family {supports.device_family!r}")
+    if supports.architectures is not None and not supports.architectures:
+        raise ValueError(f"{label} declares an empty architecture set")
+    if supports.device_family == "neuron":
+        if supports.min_compute_capability is not None or supports.sm_targets is not None:
+            raise ValueError(f"{label} is a Neuron backend; it cannot declare CUDA SM rules")
+    elif supports.architectures is not None:
+        raise ValueError(f"{label} is a CUDA backend; it declares SM rules, not architectures")
+    cores = profiler_spec.neuron_logical_cores
+    if type(cores) is not int or cores < 1:
+        raise ValueError(f"{label} neuron_logical_cores must be a positive integer")
+    if supports.device_family != "neuron" and cores != 1:
+        raise ValueError(f"{label} is not a Neuron backend; it cannot reserve NeuronCores")
 
 
 def _validate_worker_env(profiler_spec: KernelProfilerSpec) -> None:

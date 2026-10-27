@@ -73,6 +73,17 @@ pub mod moe_sum;
 pub mod moe_topk_softplus_sqrt;
 pub mod multi_add_rms_norm;
 pub mod mxfp4_marlin_moe_gemm;
+pub mod neuron_attention_decode;
+pub mod neuron_collective;
+pub mod neuron_decode_fixed;
+pub mod neuron_decoder_layer;
+pub mod neuron_glue;
+pub mod neuron_head;
+pub mod neuron_nki;
+pub mod neuron_nki_attention_cte;
+pub mod neuron_nki_mlp;
+pub mod neuron_nki_output_projection;
+pub mod neuron_nki_qkv;
 pub mod nvfp4_fused_moe;
 pub mod nvfp4_quant;
 pub mod p2p_inter;
@@ -348,6 +359,25 @@ pub use mxfp4_marlin_moe_gemm::{
     Mxfp4MarlinMoeFcRole, Mxfp4MarlinMoeGemmKernel, Mxfp4MarlinMoeGemmKernelConfig,
     Mxfp4MarlinMoeGemmKernelInput, Mxfp4MarlinMoeGemmSpec,
 };
+pub use neuron_attention_decode::{NeuronAttentionDecodeKernel, NeuronAttentionDecodeSpec};
+pub use neuron_collective::{
+    NeuronCollectiveKernel, NeuronCollectiveKernelConfig, NeuronCollectiveKernelInput,
+    NeuronCollectiveOp, NeuronCollectiveSpec, NEURON_COLLECTIVE_BACKEND,
+};
+pub use neuron_decode_fixed::{NeuronDecodeFixedKernel, NeuronDecodeFixedSpec};
+pub use neuron_decoder_layer::{NeuronDecoderLayerKernel, NeuronDecoderLayerSpec};
+pub use neuron_glue::{NeuronGlueKernel, NeuronGlueSpec};
+pub use neuron_head::{NeuronHeadKernel, NeuronHeadSpec};
+pub use neuron_nki::{
+    NeuronNkiKernelConfig, NeuronNkiKernelInput, NeuronPhase, NkiPhases, NEURON_TORCH_BACKEND,
+    NKI_BACKEND,
+};
+pub use neuron_nki_attention_cte::{NeuronNkiAttentionCteKernel, NeuronNkiAttentionCteSpec};
+pub use neuron_nki_mlp::{NeuronNkiMlpKernel, NeuronNkiMlpSpec};
+pub use neuron_nki_output_projection::{
+    NeuronNkiOutputProjectionKernel, NeuronNkiOutputProjectionSpec,
+};
+pub use neuron_nki_qkv::{NeuronNkiQkvKernel, NeuronNkiQkvSpec};
 pub use nvfp4_fused_moe::{
     Nvfp4FusedMoeKernel, Nvfp4FusedMoeKernelConfig, Nvfp4FusedMoeKernelInput, Nvfp4FusedMoeSpec,
 };

@@ -59,6 +59,21 @@ impl<K: Probe> Op<K> {
     {
         ev.push(self.kernel.eval(input), || input.clone().into());
     }
+
+    /// `eval` when `run`, else charge zero: the slot is still filled, in
+    /// `compile` order, and its input is still logged. For a tree that mints
+    /// every branch once and runs one branch per iteration (a phase-specific
+    /// graph, a conditional kernel).
+    pub fn eval_if(&self, input: &K::Input, run: bool, ev: &mut Evaluator)
+    where
+        K::Input: Clone + Into<SlotInput>,
+    {
+        if run {
+            self.eval(input, ev);
+        } else {
+            ev.push(crate::timing::LeafMetrics::ZERO, || input.clone().into());
+        }
+    }
 }
 
 #[cfg(test)]

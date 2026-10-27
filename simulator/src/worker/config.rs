@@ -401,6 +401,18 @@ pub enum IterWorkerSel {
         kv_accounting: KvAccountingSpec,
         /// Chunked-prefill cap: max tokens per batch.
         max_batch_tokens: u32,
+        /// Prefill requests scheduled per partition per iteration, continued
+        /// chunks included; absent is unlimited.
+        #[serde(default)]
+        max_prefill_requests_per_iteration: Option<u32>,
+        /// Resident requests per partition, started prompts and decodes alike;
+        /// absent is unlimited.
+        #[serde(default)]
+        max_resident_requests_per_partition: Option<u32>,
+        /// Completed-session prefix reuse; independent of the request limits.
+        #[serde(default)]
+        #[param(string, default = "opportunistic", choices = PREFIX_CACHE_MODE_CHOICES)]
+        prefix_cache_mode: PrefixCacheMode,
         /// How resident decode shares an iteration with chunked prefill.
         /// `mix` charges both to the same token budget. Under
         /// `separate-prefill-priority`, any runnable prefill makes that
@@ -441,6 +453,24 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
         prefill_chunk_alignment: Option<PrefillChunkAlignment>,
+        /// Async one-step lookahead plan offset (µs). When set, step N+1 is
+        /// planned this long after step N starts, from the requests visible by
+        /// then and treating N's work as done; it starts when N finishes. A
+        /// request arriving after the plan moment waits for the next plan.
+        /// Absent keeps the synchronous cadence. Validated only for stock
+        /// vLLM Neuron (`llama3_neuron_ops`).
+        #[serde(default)]
+        async_lookahead_us: Option<u32>,
+        /// Host time in µs per prefill request of an iteration. The device
+        /// step does not hide this time, so it is added to the device time.
+        /// Set it with `host_us_per_decode_request` and `gpu_time_multiplier:
+        /// 1.0`. Validated only for stock vLLM Neuron (`llama3_neuron_ops`).
+        #[serde(default)]
+        host_us_per_prefill_request: Option<u32>,
+        /// Host time in µs per decode request of an iteration; see
+        /// `host_us_per_prefill_request`.
+        #[serde(default)]
+        host_us_per_decode_request: Option<u32>,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a

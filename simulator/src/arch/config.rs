@@ -176,6 +176,56 @@ const fn default_dflash2_sliding_window() -> u32 {
     2048
 }
 
+const fn default_neuron_max_model_len() -> u32 {
+    512
+}
+
+fn default_neuron_decode_buckets() -> Vec<u32> {
+    vec![1, 16]
+}
+
+const fn default_neuron_tp_size() -> u16 {
+    4
+}
+
+/// The stock engine compiles one prefill graph, the whole context.
+fn default_neuron_ops_prefill_buckets() -> Vec<u32> {
+    vec![default_neuron_max_model_len()]
+}
+
+/// Which path the decode attention leaf of `llama3_neuron_ops` is costed on
+/// (`timing/kernels/neuron_attention_decode.rs`): the per-head block-table
+/// NKI kernel (a patched Llama3 `forward_decode`), or the stock call's torch
+/// fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecodeAttention {
+    #[default]
+    NkiKernel,
+    TorchFallback,
+}
+
+const DECODE_ATTENTION_PATHS: [&str; 2] = ["nki_kernel", "torch_fallback"];
+
+/// The decode leaves of `llama3_neuron_ops`. `layer` charges the step as
+/// `neuron_decode_fixed + num_layers x neuron_decoder_layer`. Both terms come
+/// from one reduced-depth TP4 decode forward on the whole chip. The engine's
+/// decode step is one compiled graph with its collectives inside, so only
+/// this carries the in-graph overlap. `per_op` adds up the standalone units
+/// (attention, MLP, glue, head, host-timed collectives). It is the
+/// attribution view: 12-17% high on the kernel path, +24% (B1) and -23% (B16)
+/// on the fallback at C512. Prefill is per op either way: its units add up
+/// within 1.3% (26.43 against 26.09 ms at T512).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecodeGranularity {
+    #[default]
+    Layer,
+    PerOp,
+}
+
+const DECODE_GRANULARITIES: [&str; 2] = ["layer", "per_op"];
+
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
 /// that consume them (provider-first: select the arch, then it exposes its own
 /// params).
@@ -205,6 +255,50 @@ pub enum IterArchSel {
     Llama3Dense {
         #[serde(flatten)]
         model: ModelSpec,
+    },
+    /// The original BF16 Llama 3.1 8B on stock vLLM Neuron, TP4 over the four
+    /// LNC2 cores of one Trainium2 chip. Prefill is costed per launch unit
+    /// (the NKI kernels, the torch glue, the head, the NeuronLink
+    /// collectives); decode from two leaves of a reduced-depth TP4 decode
+    /// forward by default (`decode_granularity`) (`arch/llama3_neuron_ops.rs`).
+    Llama3NeuronOps {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// The compiled context: the largest prefill bucket and the decode
+        /// block-table span.
+        #[serde(default = "default_neuron_max_model_len")]
+        #[param(default = 512, cache_key)]
+        max_model_len: u32,
+        /// The compiled prefill graphs (`num_batched_tokens_buckets`), ascending
+        /// and ending at `max_model_len`; a prompt pads to the smallest one that
+        /// holds it. The default, `[max_model_len]`, is the stock engine's one
+        /// prefill graph.
+        #[serde(default = "default_neuron_ops_prefill_buckets")]
+        #[param(cache_key)]
+        prefill_buckets: Vec<u32>,
+        /// The compiled decode graphs (`num_seqs_buckets`); a decode batch pads
+        /// to the smallest one that holds it.
+        #[serde(default = "default_neuron_decode_buckets")]
+        #[param(cache_key)]
+        decode_buckets: Vec<u32>,
+        /// The TP degree over the chip's LNC2 cores. The rows are measured at
+        /// TP4 only; the leaf validation rejects any other value.
+        #[serde(default = "default_neuron_tp_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// The decode attention leaf's path: `nki_kernel` (the per-head
+        /// block-table NKI kernel, what a patched Llama3 `forward_decode`
+        /// launches; the default) or `torch_fallback` (the stock engine's
+        /// call, which routes to the functional's torch fallback at TP4).
+        #[serde(default)]
+        #[param(string, default = "nki_kernel", choices = DECODE_ATTENTION_PATHS, cache_key)]
+        decode_attention: DecodeAttention,
+        /// The decode leaves: `layer` (the default; a TP4 reduced-depth forward's
+        /// per-layer and per-step terms) or `per_op` (the standalone units added
+        /// up). Both read `decode_attention` for the attention path.
+        #[serde(default)]
+        #[param(string, default = "layer", choices = DECODE_GRANULARITIES, cache_key)]
+        decode_granularity: DecodeGranularity,
     },
     /// Megatron TP over dense Llama 3. `tp_size` must divide the KV heads (8).
     Llama3DenseTp {
@@ -1196,6 +1290,7 @@ impl IterArchSel {
         match self {
             Self::Qwen36Local { model, .. }
             | Self::Llama3Dense { model }
+            | Self::Llama3NeuronOps { model, .. }
             | Self::Llama3DenseTp { model, .. }
             | Self::Llama3DpAttnTpFfn { model, .. }
             | Self::Qwen3MoeDpAttnEpFfn { model, .. }
@@ -1244,6 +1339,7 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { max_model_len, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. }
             | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. }
+            | Self::Llama3NeuronOps { max_model_len, .. }
             | Self::MimoV2VllmFp8SwaMoe { max_model_len, .. }
             | Self::Qwen35VllmNvfp4GdnDense { max_model_len, .. }
             | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { max_model_len, .. } => {

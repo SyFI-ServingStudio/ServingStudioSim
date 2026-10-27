@@ -1584,6 +1584,8 @@ def test_documented_profile_env_registry_complete():
         "flashinfer_kda_env",
         "sglang_env",
         "vllm_env",
+        # the Neuron vendor image's env (profiling/container/images.py)
+        "vllm_neuron_native_env",
     }
     assert set(ENV_REGISTRY) == expected_envs
     assert (

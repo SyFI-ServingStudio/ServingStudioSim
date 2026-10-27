@@ -15,10 +15,14 @@ A NeuronCore has **no eager / op-by-op mode** like a GPU. Everything runs
 through **XLA graph compilation**: the Neuron compiler (`neuronx-cc`) compiles a
 graph **for a fixed set of input shapes** into a **NEFF** that the runtime
 executes on-device. Your job is to get the hot path into a compiled graph and
-keep its shapes stable. (You may see "TorchNeuron Native" eager / `torch.compile`
-in the `/latest/` AWS docs — it is forward-looking and **not in the released SDK
-/ inference DLC**, so don't plan around it. Even "eager-looking" `torch_xla`
-code still traces and compiles a graph per shape.)
+keep its shapes stable. (Since Neuron SDK 2.33, 2026-10-19, **TorchNeuron** —
+the native PyTorch backend with a `neuron` device, eager mode and
+`torch.compile(backend="neuron")` — is released and is the default route of
+vLLM Neuron 0.29; the PyTorch/XLA route below is removed in SDK 2.34. New work
+should target TorchNeuron; the XLA notes below describe the SDK 2.32 stack. The
+pinned Trainium2 rows (`doc/pr/llama31-8b-trn2/README.md`) are measured on the TorchNeuron
+route of SDK 2.33. Even in eager mode every operator
+compiles to its own cached NEFF, so shape stability still matters.)
 
 The one practical front-end is **`torch-neuronx` (XLA-based)**:
 

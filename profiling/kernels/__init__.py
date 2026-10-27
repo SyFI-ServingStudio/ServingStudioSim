@@ -81,6 +81,16 @@ from profiling.kernels import (
     moe_topk_softplus_sqrt,  # noqa: F401
     multi_add_rms_norm,  # noqa: F401
     mxfp4_marlin_moe_gemm,  # noqa: F401
+    neuron_attention_decode,  # noqa: F401
+    neuron_collective,  # noqa: F401
+    neuron_decode_fixed,  # noqa: F401
+    neuron_decoder_layer,  # noqa: F401
+    neuron_glue,  # noqa: F401
+    neuron_head,  # noqa: F401
+    neuron_nki_attention_cte,  # noqa: F401
+    neuron_nki_mlp,  # noqa: F401
+    neuron_nki_output_projection,  # noqa: F401
+    neuron_nki_qkv,  # noqa: F401
     nvfp4_fused_moe,  # noqa: F401
     nvfp4_quant,  # noqa: F401
     p2p_inter,  # noqa: F401

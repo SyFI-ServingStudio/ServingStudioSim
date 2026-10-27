@@ -13,7 +13,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
@@ -781,6 +781,51 @@ pub fn dense_tp(
         llama3_dense_tp::resolve_configs(&llama3_dense_tp::build_configs(&model_cfg, &parallel));
     llama3_dense_tp::build(name.to_string(), resolved, bridge)
         .context("building Llama3-dense-TP model (often a missing profile.db row)")
+}
+
+/// Build Llama 3.1 8B on vLLM Neuron costed per launch unit (the standalone
+/// leaves plus the NeuronLink collectives): exactly the measured model, BF16,
+/// no layer overrides.
+#[allow(clippy::too_many_arguments)]
+pub fn llama3_neuron_ops(
+    model_spec: &ModelSpec,
+    max_model_len: u32,
+    prefill_buckets: &[u32],
+    decode_buckets: &[u32],
+    tp_size: u16,
+    decode_attention: crate::arch::config::DecodeAttention,
+    decode_granularity: crate::arch::config::DecodeGranularity,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<crate::arch::Llama3NeuronOpsModel> {
+    use crate::arch::llama3_neuron_ops as ops;
+    ensure!(
+        !model_spec.fp8 && model_spec.num_layers.is_none() && model_spec.sim_num_layers.is_none(),
+        "llama3_neuron_ops requires BF16 and the original model without layer overrides"
+    );
+    let raw: serde_json::Value = serde_json::from_reader(
+        File::open(&model_spec.model_config)
+            .with_context(|| format!("opening {}", model_spec.model_config))?,
+    )?;
+    ops::validate_checkpoint_math(&raw)?;
+    let model_cfg = dense_model_cfg(model_spec)?;
+    ops::validate_model(&model_cfg)?;
+    let parallel = crate::arch::NeuronOpsParallel {
+        gpu_name: gpu.to_string(),
+        max_model_len,
+        prefill_buckets: prefill_buckets.to_vec(),
+        decode_buckets: decode_buckets.to_vec(),
+        tp_size,
+        decode_attention,
+        decode_granularity,
+    };
+    ops::validate_parallel(&parallel)?;
+    let resolved = ops::resolve_configs(&ops::build_configs(&model_cfg, &parallel));
+    ops::build(name.to_string(), resolved, bridge).context(
+        "building the vLLM Neuron per-launch-unit forward (often a missing profile.db row: \
+         neuron_nki_*, neuron_decoder_layer, neuron_glue, neuron_head or neuron_collective)",
+    )
 }
 
 /// Build the exact local TP1/EP1 Qwen3.6 heterogeneous model. The nested
@@ -2131,6 +2176,26 @@ pub fn build_iter_model(
             bridge,
         )?),
         IterArchSel::Llama3Dense { model } => Box::new(dense(model, gpu, name, bridge)?),
+        IterArchSel::Llama3NeuronOps {
+            model,
+            max_model_len,
+            prefill_buckets,
+            decode_buckets,
+            tp_size,
+            decode_attention,
+            decode_granularity,
+        } => Box::new(llama3_neuron_ops(
+            model,
+            *max_model_len,
+            prefill_buckets,
+            decode_buckets,
+            *tp_size,
+            *decode_attention,
+            *decode_granularity,
+            gpu,
+            name,
+            bridge,
+        )?),
         IterArchSel::Llama3DenseTp { model, tp_size } => {
             Box::new(dense_tp(model, *tp_size, gpu, name, bridge)?)
         }

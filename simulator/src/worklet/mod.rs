@@ -9,6 +9,7 @@
 //! plus the two `TP` worklets (attn-block / mlp-block), used by
 //! `arch::llama3_dense_tp` and `arch::llama3_dp_attn_tp_ffn`.
 
+pub mod attn_block_neuron_tp;
 pub mod attn_block_tp;
 pub mod attn_local;
 pub mod bf16_gated_shared_expert_local;
@@ -48,6 +49,7 @@ pub mod hc_mix_local;
 pub mod inkling_attn_local;
 pub mod inkling_router_local;
 pub mod mimo_v2_attn_local;
+pub mod mlp_block_neuron_tp;
 pub mod mlp_block_tp;
 pub mod moe_expert_compute_local;
 pub mod mtp_fc_prelude_local;
@@ -85,6 +87,10 @@ pub mod vllm_qsa_attn_local;
 pub mod vllm_qwen35_gated_gqa_local;
 pub mod vllm_qwen35_gdn_local;
 
+pub use attn_block_neuron_tp::{
+    AttnBlockNeuronTpWorklet, AttnBlockNeuronTpWorkletConfig, AttnBlockNeuronTpWorkletInput,
+    AttnBlockNeuronTpWorkletResolved,
+};
 pub use attn_block_tp::{
     AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWorkletInput,
     AttnBlockTpWorkletResolved,
@@ -224,6 +230,10 @@ pub use inkling_router_local::{
 pub use mimo_v2_attn_local::{
     MimoV2AttnLocalWorklet, MimoV2AttnLocalWorkletConfig, MimoV2AttnLocalWorkletInput,
     MimoV2AttnLocalWorkletResolved,
+};
+pub use mlp_block_neuron_tp::{
+    MlpBlockNeuronTpWorklet, MlpBlockNeuronTpWorkletConfig, MlpBlockNeuronTpWorkletInput,
+    MlpBlockNeuronTpWorkletResolved,
 };
 pub use mlp_block_tp::{
     MlpBlockTpWorklet, MlpBlockTpWorkletConfig, MlpBlockTpWorkletInput, MlpBlockTpWorkletResolved,

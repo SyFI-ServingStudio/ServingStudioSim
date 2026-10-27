@@ -20,6 +20,10 @@ pub enum Fabric {
     Roce,
     #[serde(rename = "ethernet")]
     Ethernet,
+    /// AWS NeuronLink: the on-chip and chip-to-chip links of a Trainium
+    /// instance (the four LNC2 cores of one Trainium2 chip at TP4).
+    #[serde(rename = "neuron_link")]
+    NeuronLink,
 }
 
 impl Fabric {
@@ -34,6 +38,7 @@ impl Fabric {
             Fabric::Infiniband => "infiniband",
             Fabric::Roce => "roce",
             Fabric::Ethernet => "ethernet",
+            Fabric::NeuronLink => "neuron_link",
         }
     }
 }

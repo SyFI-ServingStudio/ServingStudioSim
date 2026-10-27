@@ -1,11 +1,11 @@
 """The device and runtime checks every runner shares.
 
-Every backend times a CUDA device, and a backend's capability requirement is
-declared once, as its ``BackendSupport`` (``min_compute_capability`` /
-``sm_targets``). The worker checks both against the real device before it
-loads the runner (``unsupported_device``). A runner therefore repeats neither;
-it keeps only checks that depend on the spec's shape, such as which head counts
-a kernel build has on this device.
+A backend's device requirement is declared once, as its ``BackendSupport``:
+its ``device_family``, then ``min_compute_capability`` / ``sm_targets`` (CUDA)
+or ``architectures`` (Neuron). The worker checks it against the real device
+before it loads the runner (``unsupported_device``). A runner therefore does not
+repeat it; it keeps only checks that depend on the spec's shape, such as which
+head counts a kernel build has on this device.
 
 Loaded only inside the worker subprocess; torch is imported lazily.
 """
@@ -49,12 +49,23 @@ def _major_minor(version: object) -> tuple[int, int] | None:
 
 
 def unsupported_device(supports: BackendSupport, label: str) -> str | None:
-    """Why this process's CUDA device 0 cannot run a backend declaring
-    ``supports``, or ``None`` when it can. No CUDA device runs any backend.
+    """Why this process's device cannot run a backend declaring ``supports``,
+    or ``None`` when it can: CUDA device 0, or for a Neuron backend the chip
+    ``neuron-ls`` reports. No CUDA device runs any backend.
 
     Reads the real device rather than resolving the requested GPU name through
     the catalog, so a GPU the catalog does not know is still checked.
     """
+    if supports.device_family == "neuron":
+        from profiling.exec.neuron import current_neuron_name
+
+        try:
+            name = current_neuron_name()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return f"Neuron is required for {label}: {exc}"
+        if supports.allows_gpu(name):
+            return None
+        return f"{label} does not run on {name}"
     try:
         import torch
     except ImportError:

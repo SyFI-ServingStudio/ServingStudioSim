@@ -24,7 +24,7 @@ use std::rc::Rc;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use simulator::common::{RequestStore, SharedRequests, TooLong};
+use simulator::common::{RequestStore, SharedRequests, Time, TooLong};
 use simulator::deployment::{build_flow, check_trace, pool_bounds, RunConfig, WorkloadSpec};
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
@@ -217,7 +217,8 @@ fn load_frontend(workload: &WorkloadSpec) -> Result<TraceFrontend> {
         .map(|tag| TraceTag::parse(tag))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let input_file_schema = InputFileSchema::new(input_file_format, input_file_tags)?;
-    let arrival = ArrivalSchedule::parse(&workload.arrival_mode, workload.request_rate)?;
+    let arrival = ArrivalSchedule::parse(&workload.arrival_mode, workload.request_rate)?
+        .with_frontend_latency(Time::from_us(u64::from(workload.frontend_latency_us)))?;
     let capacity = CapacityLimit::parse(workload.max_concurrency.map(|n| n as usize))?;
     LoadedTrace::load(&workload.trace_files, &input_file_schema, arrival, capacity)?
         .into_current_text_frontend()

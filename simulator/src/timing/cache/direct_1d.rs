@@ -36,12 +36,18 @@ impl Cache for Cache1DDirect {
             "sample count must match 1D sweep grid length"
         );
         assert!(
-            axis.len() >= 2,
-            "Cache1DDirect needs >=2 grid points to define a spacing"
+            !axis.is_empty(),
+            "Cache1DDirect needs at least one grid point"
         );
 
         let start = axis[0] as f32;
-        let spacing = (axis[1] - axis[0]) as f32;
+        // A one-point grid has no spacing: its only bucket is `start`, and the
+        // right-edge rule below extrapolates anything beyond it.
+        let spacing = if axis.len() == 1 {
+            1.0
+        } else {
+            (axis[1] - axis[0]) as f32
+        };
         assert!(
             spacing > 0.0,
             "Cache1DDirect grid must be strictly ascending"

@@ -34,6 +34,11 @@ pub use req_frontend::release::ArrivalMode;
 pub struct ArrivalSchedule {
     mode: ArrivalMode,
     request_rate: f64,
+    /// Time from a trace-timed request's arrival to its arrival at the
+    /// engine's scheduler (the serving front end: HTTP, tokenization, the hand-off
+    /// to the engine process). The request keeps its trace arrival as its
+    /// arrival stamp, so TTFT includes this time. Zero by default.
+    frontend_latency: Time,
 }
 
 impl ArrivalSchedule {
@@ -44,7 +49,23 @@ impl ArrivalSchedule {
         if mode == ArrivalMode::TraceTimed && !(request_rate.is_finite() && request_rate > 0.0) {
             bail!("request_rate must be finite and > 0 (got {request_rate})");
         }
-        Ok(Self { mode, request_rate })
+        Ok(Self {
+            mode,
+            request_rate,
+            frontend_latency: Time::ZERO,
+        })
+    }
+
+    /// Delay every trace-timed release by `latency` while keeping its arrival
+    /// stamp (see the field). Chained session rounds enter at once. Saturated
+    /// mode has no arrival time to delay, so a non-zero latency is an error
+    /// there.
+    pub fn with_frontend_latency(mut self, latency: Time) -> Result<Self> {
+        if self.mode == ArrivalMode::Saturated && latency > Time::ZERO {
+            bail!("frontend_latency_us applies to trace-timed arrivals only, not saturated");
+        }
+        self.frontend_latency = latency;
+        Ok(self)
     }
 
     pub fn trace_timed(request_rate: f64) -> Result<Self> {
@@ -57,6 +78,7 @@ impl ArrivalSchedule {
             // Unused in saturated mode; finite so debugging never shows a
             // sentinel value that resembles a real arithmetic failure.
             request_rate: 1.0,
+            frontend_latency: Time::ZERO,
         }
     }
 }
@@ -420,7 +442,7 @@ fn release_time(arrival: ArrivalSchedule, release: &ReleaseMetadata, now: Time) 
     match arrival.mode {
         ArrivalMode::TraceTimed => {
             let due = effective_arrival(release.trace_arrival_time_ms, arrival.request_rate);
-            (due <= now).then_some(due)
+            (due + arrival.frontend_latency <= now).then_some(due)
         }
         ArrivalMode::Saturated => Some(now),
     }
