@@ -1,6 +1,6 @@
 //! One Qwen3.5-family gated full-attention mixer on one GPU, in vLLM's launch
 //! granularity (`qwen3_5.py` attention, ModelOpt FP8 per-tensor projections,
-//! FP8 KV cache, FlashInfer trtllm-gen attention).
+//! FP8 KV cache, FlashInfer attention).
 //!
 //! The section starts after the input RMSNorm (the arch owns it; it already
 //! wrote the FP8 copy `qkv_proj` reads) and ends at the `o_proj` output.
@@ -8,10 +8,10 @@
 //! ```text
 //! compiled piece   qkv_proj GEMM (q with its gate half, k, v)
 //!                  fused q/k RMSNorm + partial (m)RoPE + gate split
-//!                  query FP8 quant
-//! attention        reshape_and_cache_flash (FP8 KV), trtllm-gen context
-//!                  attention of the prefill requests, trtllm-gen decode
-//!                  attention of the decode requests
+//!                  query FP8 quant (when the query runs FP8)
+//! attention        reshape_and_cache_flash (FP8 KV), context attention of
+//!                  the prefill requests, decode attention of the decode
+//!                  requests
 //! compiled piece   sigmoid gate x output, FP8 quant; o_proj GEMM
 //! ```
 //!
@@ -21,6 +21,11 @@
 //! padded request count. The KV append writes the real tokens
 //! (`slot_mapping`). The two `fmha` workspace memsets (about 1.2 us each) are
 //! not modeled.
+//!
+//! The query dtype is the attention backend's: trtllm-gen (SM100) reads an FP8
+//! query to match the FP8 cache, so a static quant runs before it; FlashInfer's
+//! native FA2 path (SM89) reads the BF16 query and no quant launches
+//! (`FlashInfer resolved query dtypes: prefill=bfloat16, decode=bfloat16`).
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -53,6 +58,8 @@ pub struct VllmQwen35GatedGqaLocalWorkletConfig {
     pub kv_block_size: u32,
     pub activation_dtype: DType,
     pub kv_dtype: DType,
+    /// The query the attention kernels read: FP8 adds the query quant.
+    pub query_dtype: DType,
     pub proj_dtype: DType,
     pub gpu_name: String,
     pub proj_gemm_backends: Vec<&'static str>,
@@ -67,7 +74,7 @@ pub struct VllmQwen35GatedGqaLocalWorkletResolved {
     pub raw_cfg: VllmQwen35GatedGqaLocalWorkletConfig,
     pub qkv_proj: SingleGemmKernelConfig,
     pub qk_norm_rope_gate: QkRmsNormRopeGateKernelConfig,
-    pub query_quant: StaticFp8QuantKernelConfig,
+    pub query_quant: Option<StaticFp8QuantKernelConfig>,
     pub kv_append: KvCacheAppendKernelConfig,
     pub prefill_attention: PagedAttnBatchPrefillKernelConfig,
     pub decode_attention: PagedAttnBatchDecodeKernelConfig,
@@ -94,7 +101,7 @@ pub struct VllmQwen35GatedGqaLocalWorklet {
     pub name: String,
     qkv_proj: Op<SingleGemmKernel>,
     qk_norm_rope_gate: Op<QkRmsNormRopeGateKernel>,
-    query_quant: Op<StaticFp8QuantKernel>,
+    query_quant: Option<Op<StaticFp8QuantKernel>>,
     kv_append: Op<KvCacheAppendKernel>,
     prefill_attention: Op<PagedAttnBatchPrefillKernel>,
     decode_attention: Op<PagedAttnBatchDecodeKernel>,
@@ -123,8 +130,7 @@ impl VllmQwen35GatedGqaLocalWorklet {
             gated,
             dtype: cfg.activation_dtype,
         };
-        // The query runs FP8 to match the FP8 KV cache.
-        let q_dtype = cfg.kv_dtype;
+        let q_dtype = cfg.query_dtype;
         VllmQwen35GatedGqaLocalWorkletResolved {
             // q and its gate half, then k and v.
             qkv_proj: gemm(
@@ -141,7 +147,7 @@ impl VllmQwen35GatedGqaLocalWorklet {
                 mrope: cfg.mrope,
                 dtype: cfg.activation_dtype,
             },
-            query_quant: quant(false),
+            query_quant: (q_dtype == DType::Fp8E4m3).then(|| quant(false)),
             kv_append: KvCacheAppendKernelConfig {
                 backends: cfg.kv_append_backends.clone(),
                 gpu_name: gpu.clone(),
@@ -196,13 +202,10 @@ impl VllmQwen35GatedGqaLocalWorklet {
                 QkRmsNormRopeGateKernel::build,
                 bridge,
             )?,
-            query_quant: atomic(
-                n,
-                "query_quant",
-                r.query_quant,
-                StaticFp8QuantKernel::build,
-                bridge,
-            )?,
+            query_quant: r
+                .query_quant
+                .map(|q| atomic(n, "query_quant", q, StaticFp8QuantKernel::build, bridge))
+                .transpose()?,
             kv_append: atomic(
                 n,
                 "kv_append",
@@ -244,16 +247,21 @@ impl VllmQwen35GatedGqaLocalWorklet {
                 "{} (VllmQwen35GatedGqaLocalWorklet) [local (1 GPU); Hq={}, Hkv={}, D={}]",
                 self.name, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim
             ),
-            child: Box::new(CostNode::Sum(vec![
-                self.qkv_proj.compile(builder),
-                self.qk_norm_rope_gate.compile(builder),
-                self.query_quant.compile(builder),
-                self.kv_append.compile(builder),
-                self.prefill_attention.compile(builder),
-                self.decode_attention.compile(builder),
-                self.gate_quant.compile(builder),
-                self.o_proj.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum(
+                [
+                    Some(self.qkv_proj.compile(builder)),
+                    Some(self.qk_norm_rope_gate.compile(builder)),
+                    self.query_quant.as_ref().map(|q| q.compile(builder)),
+                    Some(self.kv_append.compile(builder)),
+                    Some(self.prefill_attention.compile(builder)),
+                    Some(self.decode_attention.compile(builder)),
+                    Some(self.gate_quant.compile(builder)),
+                    Some(self.o_proj.compile(builder)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            )),
         }
     }
 
@@ -270,7 +278,9 @@ impl VllmQwen35GatedGqaLocalWorklet {
             false,
             ev,
         );
-        push_or_zero(&self.query_quant, quant.clone(), false, ev);
+        if let Some(query_quant) = &self.query_quant {
+            push_or_zero(query_quant, quant.clone(), false, ev);
+        }
         push_or_zero(
             &self.kv_append,
             KvCacheAppendKernelInput {
@@ -324,6 +334,7 @@ mod tests {
                 kv_block_size: 16,
                 activation_dtype: DType::Bf16,
                 kv_dtype: DType::Fp8E4m3,
+                query_dtype: DType::Fp8E4m3,
                 proj_dtype: DType::Fp8E4m3,
                 gpu_name: "NVIDIA B200".into(),
                 proj_gemm_backends: vec!["flashinfer_fp8_tensor"],
@@ -334,8 +345,9 @@ mod tests {
             });
         assert_eq!((r.qkv_proj.n.get(), r.qkv_proj.k.get()), (14336, 5120));
         assert_eq!((r.o_proj.n.get(), r.o_proj.k.get()), (5120, 6144));
-        assert_eq!(r.query_quant.hidden_dim.get(), 6144);
-        assert!(r.gate_quant.gated && !r.query_quant.gated);
+        let query_quant = r.query_quant.as_ref().expect("an FP8 query is quantized");
+        assert_eq!(query_quant.hidden_dim.get(), 6144);
+        assert!(r.gate_quant.gated && !query_quant.gated);
         assert_eq!(r.decode_attention.q_dtype, DType::Fp8E4m3);
     }
 }

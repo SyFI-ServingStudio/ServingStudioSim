@@ -3,6 +3,10 @@
 //! (`scaled_fp4_quant`, swizzled E4M3 group scales), gate/up GEMM, the
 //! Inductor SiLU-and-mul, NVFP4 quant of the intermediate, down GEMM.
 //!
+//! The quants exist only for a W4A4 GEMM backend (FlashInfer CuTe DSL on
+//! SM100). A W4A16 backend (Marlin, vLLM's NVFP4 linear below SM100) reads the
+//! BF16 activation, so the MLP is gate/up GEMM, SiLU-and-mul, down GEMM.
+//!
 //! The sibling of `glm53_mlp_local` for a recipe whose activation is the
 //! measured `silu_and_mul` kind instead of a byte placeholder. The norm in
 //! front and the residual add behind belong to the arch.
@@ -25,6 +29,9 @@ pub struct VllmNvfp4SwigluMlpLocalWorkletConfig {
     pub intermediate: u32,
     pub activation_dtype: DType,
     pub gpu_name: String,
+    /// Whether the GEMM backend reads an NVFP4 activation (W4A4), so each GEMM
+    /// is preceded by its input quant; false for a W4A16 backend.
+    pub activation_quant: bool,
     pub quant_backends: Vec<&'static str>,
     pub gemm_backends: Vec<&'static str>,
     pub activation_backends: Vec<&'static str>,
@@ -33,10 +40,10 @@ pub struct VllmNvfp4SwigluMlpLocalWorkletConfig {
 #[derive(Clone, Debug)]
 pub struct VllmNvfp4SwigluMlpLocalWorkletResolved {
     pub raw_cfg: VllmNvfp4SwigluMlpLocalWorkletConfig,
-    pub gate_up_quant: Nvfp4QuantKernelConfig,
+    pub gate_up_quant: Option<Nvfp4QuantKernelConfig>,
     pub gate_up: SingleGemmKernelConfig,
     pub silu_and_mul: SiluAndMulKernelConfig,
-    pub down_quant: Nvfp4QuantKernelConfig,
+    pub down_quant: Option<Nvfp4QuantKernelConfig>,
     pub down: SingleGemmKernelConfig,
 }
 
@@ -47,10 +54,10 @@ pub struct VllmNvfp4SwigluMlpLocalWorkletInput {
 
 pub struct VllmNvfp4SwigluMlpLocalWorklet {
     pub name: String,
-    gate_up_quant: Op<Nvfp4QuantKernel>,
+    gate_up_quant: Option<Op<Nvfp4QuantKernel>>,
     gate_up: Op<SingleGemmKernel>,
     silu_and_mul: Op<SiluAndMulKernel>,
-    down_quant: Op<Nvfp4QuantKernel>,
+    down_quant: Option<Op<Nvfp4QuantKernel>>,
     down: Op<SingleGemmKernel>,
     resolved: VllmNvfp4SwigluMlpLocalWorkletResolved,
 }
@@ -59,13 +66,15 @@ impl VllmNvfp4SwigluMlpLocalWorklet {
     pub fn resolve_config(
         cfg: &VllmNvfp4SwigluMlpLocalWorkletConfig,
     ) -> VllmNvfp4SwigluMlpLocalWorkletResolved {
-        let quant = |hidden_size: u32| Nvfp4QuantKernelConfig {
-            backends: cfg.quant_backends.clone(),
-            gpu_name: cfg.gpu_name.clone(),
-            hidden_size: hidden_size.into(),
-            group_size: NVFP4_GROUP_SIZE,
-            input_dtype: cfg.activation_dtype,
-            scale_format: NVFP4_SWIZZLED_SCALE_FORMAT.to_string(),
+        let quant = |hidden_size: u32| {
+            cfg.activation_quant.then(|| Nvfp4QuantKernelConfig {
+                backends: cfg.quant_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_size: hidden_size.into(),
+                group_size: NVFP4_GROUP_SIZE,
+                input_dtype: cfg.activation_dtype,
+                scale_format: NVFP4_SWIZZLED_SCALE_FORMAT.to_string(),
+            })
         };
         let gemm = |n: u32, k: u32| SingleGemmKernelConfig {
             backends: cfg.gemm_backends.clone(),
@@ -96,14 +105,12 @@ impl VllmNvfp4SwigluMlpLocalWorklet {
     ) -> Result<Self, BuildError> {
         let r = resolved.clone();
         let n = name.as_str();
+        let quant = |slot: &str, cfg: Option<Nvfp4QuantKernelConfig>| {
+            cfg.map(|c| atomic(n, slot, c, Nvfp4QuantKernel::build, bridge))
+                .transpose()
+        };
         Ok(Self {
-            gate_up_quant: atomic(
-                n,
-                "gate_up_input_quant",
-                r.gate_up_quant,
-                Nvfp4QuantKernel::build,
-                bridge,
-            )?,
+            gate_up_quant: quant("gate_up_input_quant", r.gate_up_quant)?,
             gate_up: atomic(n, "gate_up", r.gate_up, SingleGemmKernel::build, bridge)?,
             silu_and_mul: atomic(
                 n,
@@ -112,13 +119,7 @@ impl VllmNvfp4SwigluMlpLocalWorklet {
                 SiluAndMulKernel::build,
                 bridge,
             )?,
-            down_quant: atomic(
-                n,
-                "down_input_quant",
-                r.down_quant,
-                Nvfp4QuantKernel::build,
-                bridge,
-            )?,
+            down_quant: quant("down_input_quant", r.down_quant)?,
             down: atomic(n, "down", r.down, SingleGemmKernel::build, bridge)?,
             name,
             resolved,
@@ -132,13 +133,18 @@ impl VllmNvfp4SwigluMlpLocalWorklet {
                 "{} (VllmNvfp4SwigluMlpLocalWorklet) [local (1 GPU); H={}, I={}]",
                 self.name, cfg.hidden, cfg.intermediate
             ),
-            child: Box::new(CostNode::Sum(vec![
-                self.gate_up_quant.compile(builder),
-                self.gate_up.compile(builder),
-                self.silu_and_mul.compile(builder),
-                self.down_quant.compile(builder),
-                self.down.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum(
+                [
+                    self.gate_up_quant.as_ref().map(|q| q.compile(builder)),
+                    Some(self.gate_up.compile(builder)),
+                    Some(self.silu_and_mul.compile(builder)),
+                    self.down_quant.as_ref().map(|q| q.compile(builder)),
+                    Some(self.down.compile(builder)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            )),
         }
     }
 
@@ -146,7 +152,9 @@ impl VllmNvfp4SwigluMlpLocalWorklet {
         let num_tokens = input.num_tokens;
         let rows = SingleGemmKernelInput { m: num_tokens };
         let quant = Nvfp4QuantKernelInput { num_tokens };
-        push_or_zero(&self.gate_up_quant, quant.clone(), false, ev);
+        if let Some(gate_up_quant) = &self.gate_up_quant {
+            push_or_zero(gate_up_quant, quant.clone(), false, ev);
+        }
         push_or_zero(&self.gate_up, rows.clone(), false, ev);
         push_or_zero(
             &self.silu_and_mul,
@@ -154,7 +162,9 @@ impl VllmNvfp4SwigluMlpLocalWorklet {
             false,
             ev,
         );
-        push_or_zero(&self.down_quant, quant, false, ev);
+        if let Some(down_quant) = &self.down_quant {
+            push_or_zero(down_quant, quant, false, ev);
+        }
         push_or_zero(&self.down, rows, false, ev);
     }
 }
@@ -171,20 +181,19 @@ mod tests {
                 intermediate: 17408,
                 activation_dtype: DType::Bf16,
                 gpu_name: "NVIDIA B200".into(),
+                activation_quant: true,
                 quant_backends: vec!["vllm_cuda"],
                 gemm_backends: vec!["flashinfer_cutedsl"],
                 activation_backends: vec!["vllm_inductor"],
             });
         assert_eq!((r.gate_up.n.get(), r.gate_up.k.get()), (34816, 5120));
         assert_eq!((r.down.n.get(), r.down.k.get()), (5120, 17408));
+        let (gate_up_quant, down_quant) = (r.gate_up_quant.unwrap(), r.down_quant.unwrap());
         assert_eq!(
-            (
-                r.gate_up_quant.hidden_size.get(),
-                r.down_quant.hidden_size.get()
-            ),
+            (gate_up_quant.hidden_size.get(), down_quant.hidden_size.get()),
             (5120, 17408)
         );
-        assert_eq!(r.down_quant.scale_format, "swizzled_e4m3");
+        assert_eq!(down_quant.scale_format, "swizzled_e4m3");
         assert_eq!(r.silu_and_mul.hidden_dim.get(), 17408);
     }
 }

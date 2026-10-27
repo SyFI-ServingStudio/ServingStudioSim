@@ -82,6 +82,10 @@ pub struct VllmQwen35GdnLocalWorkletConfig {
     pub causal_conv_prefill_backends: Vec<&'static str>,
     pub prefill_post_conv_backends: Vec<&'static str>,
     pub chunk_delta_rule_backends: Vec<&'static str>,
+    /// Whether the chunked delta rule reads the exponentiated decay, so a
+    /// separate `g.exp()` launches before it (FlashInfer's CUTLASS rule); FLA's
+    /// Triton rule reads the log decay and cumsums it itself.
+    pub chunk_delta_rule_exp_gate: bool,
     pub causal_conv_decode_backends: Vec<&'static str>,
     /// `fused_recurrent_gated_delta_rule_packed_decode` (decode-only steps).
     pub packed_decode_backends: Vec<&'static str>,
@@ -111,8 +115,9 @@ pub struct VllmQwen35GdnLocalWorkletResolved {
     pub state_gather: IndexedRowCopyKernelConfig,
     pub state_zero: IndexedRowCopyKernelConfig,
     pub state_scatter: IndexedRowCopyKernelConfig,
-    /// `g.exp()` over the prefill tokens' FP32 decay.
-    pub g_exp: ElementwiseKernelConfig,
+    /// `g.exp()` over the prefill tokens' FP32 decay, when the chunked rule
+    /// reads it.
+    pub g_exp: Option<ElementwiseKernelConfig>,
     pub output_cat: ElementwiseKernelConfig,
     pub core_output_copy: ElementwiseKernelConfig,
     pub gated_norm: GdnGatedRmsNormKernelConfig,
@@ -149,7 +154,7 @@ pub struct VllmQwen35GdnLocalWorklet {
     state_gather: Op<IndexedRowCopyKernel>,
     state_zero: Op<IndexedRowCopyKernel>,
     state_scatter: Op<IndexedRowCopyKernel>,
-    g_exp: Op<ElementwiseKernel>,
+    g_exp: Option<Op<ElementwiseKernel>>,
     output_cat: Op<ElementwiseKernel>,
     core_output_copy: Op<ElementwiseKernel>,
     gated_norm: Op<GdnGatedRmsNormKernel>,
@@ -269,10 +274,12 @@ impl VllmQwen35GdnLocalWorklet {
             state_gather: state("gather"),
             state_zero: state("masked_zero"),
             state_scatter: state("scatter"),
-            g_exp: torch(
-                cfg.num_value_heads * DType::Fp32.size_bytes(),
-                cfg.num_value_heads * DType::Fp32.size_bytes(),
-            ),
+            g_exp: cfg.chunk_delta_rule_exp_gate.then(|| {
+                torch(
+                    cfg.num_value_heads * DType::Fp32.size_bytes(),
+                    cfg.num_value_heads * DType::Fp32.size_bytes(),
+                )
+            }),
             output_cat: cat(value_row),
             core_output_copy: strided_copy(value_row),
             gated_norm: GdnGatedRmsNormKernelConfig {
@@ -332,7 +339,7 @@ impl VllmQwen35GdnLocalWorklet {
             state_gather: state("state_gather", r.state_gather)?,
             state_zero: state("state_zero", r.state_zero)?,
             state_scatter: state("state_scatter", r.state_scatter)?,
-            g_exp: ew("g_exp", r.g_exp)?,
+            g_exp: r.g_exp.map(|c| ew("g_exp", c)).transpose()?,
             output_cat: ew("output_cat", r.output_cat)?,
             core_output_copy: ew("core_output_copy", r.core_output_copy)?,
             gated_norm: atomic(
@@ -357,7 +364,7 @@ impl VllmQwen35GdnLocalWorklet {
 
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let cfg = &self.resolved.raw_cfg;
-        let children = vec![
+        let mut children = vec![
             self.qkvz.compile(builder),
             self.ba.compile(builder),
             self.core_output_zero.compile(builder),
@@ -372,13 +379,15 @@ impl VllmQwen35GdnLocalWorklet {
             self.state_gather.compile(builder),
             self.state_zero.compile(builder),
             self.state_scatter.compile(builder),
-            self.g_exp.compile(builder),
+        ];
+        children.extend(self.g_exp.as_ref().map(|g| g.compile(builder)));
+        children.extend([
             self.output_cat.compile(builder),
             self.core_output_copy.compile(builder),
             self.gated_norm.compile(builder),
             self.out_quant.compile(builder),
             self.out_proj.compile(builder),
-        ];
+        ]);
         CostNode::Labeled {
             label: format!(
                 "{} (VllmQwen35GdnLocalWorklet) [local (1 GPU); Hk={}, Hv={}, K={}, V={}]",
@@ -429,7 +438,9 @@ impl VllmQwen35GdnLocalWorklet {
         push_or_zero(&self.state_gather, rows(w.prefills), decode_only, ev);
         push_or_zero(&self.state_zero, rows(w.prefills), decode_only, ev);
         push_or_zero(&self.state_scatter, rows(w.prefills), decode_only, ev);
-        push_or_zero(&self.g_exp, tokens(w.prefill_tokens), decode_only, ev);
+        if let Some(g_exp) = &self.g_exp {
+            push_or_zero(g_exp, tokens(w.prefill_tokens), decode_only, ev);
+        }
         push_or_zero(&self.output_cat, tokens(w.output_cat_rows), !mixed, ev);
         push_or_zero(&self.core_output_copy, tokens(w.core), false, ev);
         push_or_zero(
@@ -536,6 +547,7 @@ mod tests {
             causal_conv_prefill_backends: vec!["vllm_triton"],
             prefill_post_conv_backends: vec!["vllm_triton"],
             chunk_delta_rule_backends: vec!["flashinfer"],
+            chunk_delta_rule_exp_gate: true,
             causal_conv_decode_backends: vec!["vllm_triton"],
             packed_decode_backends: vec!["vllm_triton"],
             sigmoid_gating_decode_backends: vec!["vllm_triton_sigmoid_gating"],

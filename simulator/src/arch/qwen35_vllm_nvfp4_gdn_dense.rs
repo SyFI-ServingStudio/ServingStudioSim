@@ -2,8 +2,18 @@
 //! only) with ModelOpt mixed-precision weights on one GPU under vLLM: Gated
 //! DeltaNet and gated-GQA token mixers, each followed by a dense SwiGLU MLP.
 //! FP8 per-tensor attention projections, BF16 `in_proj_ba`, NVFP4 MLP and
-//! lm_head, FP8 KV cache. Measured against the vLLM capture of
-//! `nvidia/Qwen3.8-27B-NVFP4` at TP1 on B200 (diverse_100).
+//! lm_head, FP8 KV cache. Measured against the vLLM captures of
+//! `nvidia/Qwen3.8-27B-NVFP4` at TP1 on B200 (diverse_100) and on L40S (the
+//! vLLM Recipes deployment, `presets/alignment/qwen38_27b_nvfp4_l40s_tp1`).
+//!
+//! The launch sequence is the same on both; the kernels behind five of its
+//! operations are vLLM's per-capability choice (`KernelPath`). On SM100 the
+//! NVFP4 linears are W4A4 (FlashInfer CuTe DSL), so each is preceded by an
+//! NVFP4 activation quant, and trtllm-gen attention reads an FP8 query. On
+//! SM89 the NVFP4 linears are Marlin W4A16 over the BF16 row (no quant), FP8
+//! linears are CUTLASS `cutlass_scaled_mm`, attention is FlashInfer's FA2 path
+//! over a BF16 query (no query quant), and the GDN chunked delta rule is FLA's
+//! Triton kernel, which reads the log decay (no separate `exp(g)`).
 //!
 //! ```text
 //! per layer      input norm, GDN or gated GQA, post-attention norm, MLP
@@ -29,6 +39,8 @@
 //! overhead are not modeled.
 
 use anyhow::Result;
+
+use crate::common::gpu::compute_capability;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::graph_padded_tokens;
@@ -68,12 +80,8 @@ const KV_DTYPE: DType = DType::Fp8E4m3;
 const KV_BLOCK_SIZE: u32 = 16;
 
 const NORM_BACKENDS: &[&str] = &["vllm_inductor"];
-/// ModelOpt FP8 per-tensor linears: FlashInfer's FP8 GEMM over the FP8 row
-/// the producer already wrote (norm or static quant), no quant of its own.
-const FP8_GEMM_BACKENDS: &[&str] = &["flashinfer_fp8_tensor"];
 /// `F.linear` in vLLM's torch (`in_proj_ba`).
 const BF16_GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
-const NVFP4_GEMM_BACKENDS: &[&str] = &["flashinfer_cutedsl"];
 const NVFP4_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDUCTOR_BACKENDS: &[&str] = &["vllm_inductor"];
 const TRITON_ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
@@ -81,13 +89,64 @@ const TORCH_ELEMENTWISE_BACKENDS: &[&str] = &["torch"];
 const STRIDED_COPY_BACKENDS: &[&str] = &["torch_strided_copy"];
 const CAT_BACKENDS: &[&str] = &["torch_cat"];
 const VLLM_TRITON_BACKENDS: &[&str] = &["vllm_triton"];
-/// FlashInfer's CUTLASS chunked delta rule (`auto` on SM100).
-const CHUNK_DELTA_RULE_BACKENDS: &[&str] = &["flashinfer"];
 const SIGMOID_GATING_DECODE_BACKENDS: &[&str] = &["vllm_triton_sigmoid_gating"];
 /// `reshape_and_cache_flash`.
 const KV_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
-/// trtllm-gen: FA4 has no FP8-KV path at head dim 256.
-const ATTENTION_BACKENDS: &[&str] = &["flashinfer_trtllm_gen"];
+
+/// The kernels vLLM selects for this checkpoint's capability-dependent
+/// operations, from its server log on each GPU.
+#[derive(Debug)]
+struct KernelPath {
+    /// ModelOpt FP8 per-tensor linears over the FP8 row the producer already
+    /// wrote (norm or static quant), no quant of their own.
+    fp8_gemm: &'static [&'static str],
+    nvfp4_gemm: &'static [&'static str],
+    /// W4A4: each NVFP4 GEMM reads an NVFP4 activation, quantized before it.
+    nvfp4_activation_quant: bool,
+    chunk_delta_rule: &'static [&'static str],
+    /// The chunked rule reads `exp(g)`, launched separately before it.
+    chunk_delta_rule_exp_gate: bool,
+    attention: &'static [&'static str],
+    /// The query the attention kernels read.
+    query_dtype: DType,
+}
+
+/// SM100 (B200): FlashInferFP8ScaledMMLinearKernel, FlashInferCuteDslNvFp4
+/// LinearKernel, FlashInfer's CUTLASS chunked delta rule (`auto`), trtllm-gen
+/// attention (FA4 has no FP8-KV path at head dim 256).
+const SM100_PATH: KernelPath = KernelPath {
+    fp8_gemm: &["flashinfer_fp8_tensor"],
+    nvfp4_gemm: &["flashinfer_cutedsl"],
+    nvfp4_activation_quant: true,
+    chunk_delta_rule: &["flashinfer"],
+    chunk_delta_rule_exp_gate: true,
+    attention: &["flashinfer_trtllm_gen"],
+    query_dtype: DType::Fp8E4m3,
+};
+
+/// SM89 (L40S): CutlassFP8ScaledMMLinearKernel, MarlinNvFp4LinearKernel,
+/// "Triton/FLA GDN prefill kernel", FLASHINFER attention with "query dtypes:
+/// prefill=bfloat16, decode=bfloat16, decode_backend=flashinfer-native".
+const SM89_PATH: KernelPath = KernelPath {
+    fp8_gemm: &["vllm_cutlass_fp8"],
+    nvfp4_gemm: &["vllm_marlin_nvfp4"],
+    nvfp4_activation_quant: false,
+    chunk_delta_rule: &["fla_triton"],
+    chunk_delta_rule_exp_gate: false,
+    attention: &["flashinfer_fa2"],
+    query_dtype: DType::Bf16,
+};
+
+fn kernel_path(gpu: &str) -> std::result::Result<&'static KernelPath, BuildError> {
+    match compute_capability(gpu) {
+        Some((10, _)) => Ok(&SM100_PATH),
+        Some((8, 9)) => Ok(&SM89_PATH),
+        other => Err(fit_failed(format!(
+            "no measured vLLM kernel path for {gpu} (compute capability {other:?}); \
+             modeled: SM100, SM89"
+        ))),
+    }
+}
 /// `hidden_states[logits_indices]`: an int64 index per selected row.
 const INT64_INDEX_BYTES: u32 = 8;
 
@@ -166,7 +225,8 @@ pub struct Qwen35VllmConfigs {
     pub mlp: VllmNvfp4SwigluMlpLocalWorkletConfig,
     pub final_norm: MultiAddRmsNormKernelConfig,
     pub logits_select: ElementwiseKernelConfig,
-    pub lm_head_quant: Nvfp4QuantKernelConfig,
+    /// The lm_head's NVFP4 activation quant, for a W4A4 GEMM.
+    pub lm_head_quant: Option<Nvfp4QuantKernelConfig>,
     pub lm_head: SingleGemmKernelConfig,
 }
 
@@ -181,6 +241,7 @@ pub fn build_configs(
         )));
     }
     let gpu = parallel.gpu_name.clone();
+    let path = kernel_path(&gpu)?;
     let p = &model.precisions;
     // What the norm in front of a mixer writes: the BF16 row when a BF16
     // projection reads it, the FP8 row for the FP8 projection.
@@ -223,7 +284,7 @@ pub fn build_configs(
             ssm_state_dtype: model.gdn_state_dtype,
             proj_dtype: p.gdn_in_proj_qkvz.gemm_dtype(),
             gpu_name: gpu.clone(),
-            proj_gemm_backends: FP8_GEMM_BACKENDS.to_vec(),
+            proj_gemm_backends: path.fp8_gemm.to_vec(),
             ba_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
             static_quant_backends: INDUCTOR_BACKENDS.to_vec(),
             triton_elementwise_backends: TRITON_ELEMENTWISE_BACKENDS.to_vec(),
@@ -233,7 +294,8 @@ pub fn build_configs(
             state_copy_backends: TORCH_ELEMENTWISE_BACKENDS.to_vec(),
             causal_conv_prefill_backends: VLLM_TRITON_BACKENDS.to_vec(),
             prefill_post_conv_backends: VLLM_TRITON_BACKENDS.to_vec(),
-            chunk_delta_rule_backends: CHUNK_DELTA_RULE_BACKENDS.to_vec(),
+            chunk_delta_rule_backends: path.chunk_delta_rule.to_vec(),
+            chunk_delta_rule_exp_gate: path.chunk_delta_rule_exp_gate,
             causal_conv_decode_backends: VLLM_TRITON_BACKENDS.to_vec(),
             packed_decode_backends: VLLM_TRITON_BACKENDS.to_vec(),
             sigmoid_gating_decode_backends: SIGMOID_GATING_DECODE_BACKENDS.to_vec(),
@@ -249,23 +311,26 @@ pub fn build_configs(
             kv_block_size: KV_BLOCK_SIZE,
             activation_dtype: ACTIVATION_DTYPE,
             kv_dtype: KV_DTYPE,
+            query_dtype: path.query_dtype,
             proj_dtype: p.gqa_qkv_proj.gemm_dtype(),
             gpu_name: gpu.clone(),
-            proj_gemm_backends: FP8_GEMM_BACKENDS.to_vec(),
+            proj_gemm_backends: path.fp8_gemm.to_vec(),
             qk_norm_rope_backends: VLLM_TRITON_BACKENDS.to_vec(),
             static_quant_backends: INDUCTOR_BACKENDS.to_vec(),
             kv_append_backends: KV_APPEND_BACKENDS.to_vec(),
-            attention_backends: ATTENTION_BACKENDS.to_vec(),
+            attention_backends: path.attention.to_vec(),
         },
-        // The MLP's NVFP4 quant reads the BF16 normed row.
+        // The MLP's NVFP4 quant (W4A4) or its GEMM (W4A16) reads the BF16
+        // normed row.
         post_attention_norm: norm(&gpu, model.hidden, 2, false, true, false),
         mlp: VllmNvfp4SwigluMlpLocalWorkletConfig {
             hidden: model.hidden,
             intermediate: model.intermediate,
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
+            activation_quant: path.nvfp4_activation_quant,
             quant_backends: NVFP4_QUANT_BACKENDS.to_vec(),
-            gemm_backends: NVFP4_GEMM_BACKENDS.to_vec(),
+            gemm_backends: path.nvfp4_gemm.to_vec(),
             activation_backends: INDUCTOR_BACKENDS.to_vec(),
         },
         final_norm: norm(&gpu, model.hidden, 3, false, true, false),
@@ -276,16 +341,18 @@ pub fn build_configs(
             hidden_bytes + INT64_INDEX_BYTES,
             hidden_bytes,
         ),
-        lm_head_quant: Nvfp4QuantKernelConfig {
-            backends: NVFP4_QUANT_BACKENDS.to_vec(),
-            gpu_name: gpu.clone(),
-            hidden_size: model.hidden.into(),
-            group_size: NVFP4_GROUP_SIZE,
-            input_dtype: ACTIVATION_DTYPE,
-            scale_format: NVFP4_SWIZZLED_SCALE_FORMAT.to_string(),
-        },
+        lm_head_quant: path
+            .nvfp4_activation_quant
+            .then(|| Nvfp4QuantKernelConfig {
+                backends: NVFP4_QUANT_BACKENDS.to_vec(),
+                gpu_name: gpu.clone(),
+                hidden_size: model.hidden.into(),
+                group_size: NVFP4_GROUP_SIZE,
+                input_dtype: ACTIVATION_DTYPE,
+                scale_format: NVFP4_SWIZZLED_SCALE_FORMAT.to_string(),
+            }),
         lm_head: SingleGemmKernelConfig {
-            backends: NVFP4_GEMM_BACKENDS.to_vec(),
+            backends: path.nvfp4_gemm.to_vec(),
             gpu_name: gpu,
             n: model.vocab_size.into(),
             k: model.hidden.into(),
@@ -465,7 +532,7 @@ pub struct Qwen35VllmModel {
     groups: Vec<LayerGroup>,
     final_norm: Op<MultiAddRmsNormKernel>,
     logits_select: Op<ElementwiseKernel>,
-    lm_head_quant: Op<Nvfp4QuantKernel>,
+    lm_head_quant: Option<Op<Nvfp4QuantKernel>>,
     lm_head: Op<SingleGemmKernel>,
     kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
@@ -500,13 +567,11 @@ pub fn build(
             ElementwiseKernel::build,
             bridge,
         )?,
-        lm_head_quant: atomic(
-            n,
-            "lm_head_input_quant",
-            cfg.lm_head_quant.clone(),
-            Nvfp4QuantKernel::build,
-            bridge,
-        )?,
+        lm_head_quant: cfg
+            .lm_head_quant
+            .clone()
+            .map(|q| atomic(n, "lm_head_input_quant", q, Nvfp4QuantKernel::build, bridge))
+            .transpose()?,
         lm_head: atomic(
             n,
             "lm_head",
@@ -570,7 +635,7 @@ impl Qwen35VllmModel {
             .collect();
         children.push(self.final_norm.compile(&mut builder));
         children.push(self.logits_select.compile(&mut builder));
-        children.push(self.lm_head_quant.compile(&mut builder));
+        children.extend(self.lm_head_quant.as_ref().map(|q| q.compile(&mut builder)));
         children.push(self.lm_head.compile(&mut builder));
         let root = CostNode::Labeled {
             label: format!(
@@ -603,12 +668,14 @@ impl Qwen35VllmModel {
             false,
             ev,
         );
-        push_or_zero(
-            &self.lm_head_quant,
-            Nvfp4QuantKernelInput { num_tokens: logits },
-            false,
-            ev,
-        );
+        if let Some(lm_head_quant) = &self.lm_head_quant {
+            push_or_zero(
+                lm_head_quant,
+                Nvfp4QuantKernelInput { num_tokens: logits },
+                false,
+                ev,
+            );
+        }
         push_or_zero(
             &self.lm_head,
             SingleGemmKernelInput { m: logits },
@@ -869,6 +936,44 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("model/config/qwen3_6_27b.json");
         let bf16 = Qwen35ModelCfg::from_json(&path).unwrap();
         assert!(build_configs(&bf16, &parallel()).is_err());
+    }
+
+    #[test]
+    fn the_sm89_path_reads_bf16_activations_through_its_own_kernels() {
+        let l40s = Qwen35VllmParallel {
+            max_model_len: 262144,
+            gpu_name: "NVIDIA L40S".into(),
+            cudagraph_capture_sizes: vec![1, 2, 4, 8, 16],
+        };
+        let cfg = build_configs(&model_cfg(), &l40s).unwrap();
+        assert!(!cfg.mlp.activation_quant && cfg.lm_head_quant.is_none());
+        assert_eq!(cfg.mlp.gemm_backends, ["vllm_marlin_nvfp4"]);
+        assert_eq!(cfg.lm_head.backends, ["vllm_marlin_nvfp4"]);
+        assert_eq!(cfg.gdn.proj_gemm_backends, ["vllm_cutlass_fp8"]);
+        assert_eq!(cfg.gqa.proj_gemm_backends, ["vllm_cutlass_fp8"]);
+        assert_eq!(cfg.gdn.chunk_delta_rule_backends, ["fla_triton"]);
+        assert!(!cfg.gdn.chunk_delta_rule_exp_gate);
+        assert_eq!(cfg.gqa.attention_backends, ["flashinfer_fa2"]);
+        let resolved = resolve_configs(&cfg);
+        assert!(resolved.mlp.gate_up_quant.is_none() && resolved.mlp.down_quant.is_none());
+        assert!(resolved.gqa.query_quant.is_none());
+        assert_eq!(resolved.gqa.decode_attention.q_dtype, DType::Bf16);
+        assert!(resolved.gdn.g_exp.is_none());
+
+        let b200 = build_configs(&model_cfg(), &parallel()).unwrap();
+        assert!(b200.mlp.activation_quant && b200.lm_head_quant.is_some());
+        let resolved = resolve_configs(&b200);
+        assert_eq!(resolved.gqa.decode_attention.q_dtype, DType::Fp8E4m3);
+        assert!(resolved.gqa.query_quant.is_some() && resolved.gdn.g_exp.is_some());
+    }
+
+    #[test]
+    fn a_gpu_without_a_measured_kernel_path_is_refused() {
+        let h200 = Qwen35VllmParallel {
+            gpu_name: "NVIDIA H200".into(),
+            ..parallel()
+        };
+        assert!(build_configs(&model_cfg(), &h200).is_err());
     }
 
     #[test]
