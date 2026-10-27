@@ -41,11 +41,12 @@ def test_non_isolated_env_forwards_inherited_path_verbatim():
 
 
 def test_only_the_envs_with_their_own_torch_are_isolated():
-    # vllm_env (the fork's .venv) and flashinfer_kda_env carry their own Torch
-    # build; the project Torch on an inherited PYTHONPATH would shadow it.
+    # vllm_env (the fork's .venv), flashinfer_kda_env and the Neuron vendor
+    # image's env carry their own Torch build; the project Torch on an
+    # inherited PYTHONPATH would shadow it.
     isolated = {
         name
         for name, env in ENV_REGISTRY.items()
         if isinstance(env, ProfileEnv) and env.isolated_site_packages
     }
-    assert isolated == {"vllm_env", "flashinfer_kda_env"}
+    assert isolated == {"vllm_env", "flashinfer_kda_env", "vllm_neuron_native_env"}

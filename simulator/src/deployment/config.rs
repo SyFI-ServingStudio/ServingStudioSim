@@ -95,6 +95,15 @@ pub struct WorkloadSpec {
     /// session; without sessions a unit is a request.
     #[param(choices = simulator::sim::ArrivalMode::CONFIG_CHOICES)]
     pub arrival_mode: String,
+    /// Serving front-end latency (µs): a trace-timed request reaches the
+    /// engine's scheduler this long after it arrives (HTTP, tokenization, the
+    /// hand-off to the engine process); its TTFT still counts from arrival.
+    /// A property of the serving stack and its host, not of the model or the
+    /// chip; measure it on the target (doc/pr/llama31-8b-trn2/README.md,
+    /// "Simulation against the engine"). Omit for none.
+    #[serde(default)]
+    #[param(default = 0)]
+    pub frontend_latency_us: u32,
     /// Fixed simulation tick step (µs) — the time quantum the loop advances by
     /// each iteration. Finer ticks mean less TTFT/TPOT quantization (and smaller
     /// inter-slice gaps in the trace) at ~no throughput cost, since per-tick work

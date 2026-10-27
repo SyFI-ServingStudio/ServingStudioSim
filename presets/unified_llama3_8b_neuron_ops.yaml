@@ -1,0 +1,62 @@
+# Llama 3.1 8B on vLLM Neuron 0.29 (Neuron SDK 2.33), costed per launch unit
+# (arch llama3_neuron_ops): prefill from the standalone NKI kernels, glue,
+# head and NeuronLink collectives; decode from a TP4 reduced-depth decode
+# forward (per-layer and per-step terms) measured on the whole chip.
+# The stock engine contract and scheduler: doc/pr/llama31-8b-trn2/README.md,
+# "How the engine's behavior is modeled".
+deployment: unified
+workload:
+  trace_files: [trace/trainium_stock_smoke.csv]
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  run_to_end: true
+  # vLLM's front end (HTTP, tokenization, hand-off to the engine process):
+  # 8 ms from arrival to the scheduler, measured on isolated requests
+  # (doc/pr/llama31-8b-trn2/README.md, "Simulation against the engine").
+  frontend_latency_us: 8000
+io:
+  log_dir: logs/unified_llama3_8b_neuron_ops
+  log_output_token_times: true
+  log_stage_transitions: true
+  kv_log_stride: 1
+pools:
+  main:
+    groups:
+      - gpu: AWS Trainium2 LNC2
+        replicas: 1
+        arch:
+          type: llama3_neuron_ops
+          model_config: model/config/llama3_8b.json
+          max_model_len: 512
+          # num_batched_tokens_buckets: a prompt pads to the smallest one. The
+          # stock engine compiles one prefill graph, the whole context.
+          prefill_buckets: [512]
+          # num_seqs_buckets: a decode batch pads to the smallest one.
+          decode_buckets: [1, 16]
+          tp_size: 4
+          # decode attention path: nki_kernel (per-head block table, the default)
+          # or torch_fallback (the stock engine's call at TP4).
+          decode_attention: nki_kernel
+          # decode leaves: layer (a TP4 reduced-depth decode forward's per-layer
+          # and per-step terms, the default) or per_op (the standalone units).
+          decode_granularity: layer
+          fp8: false
+        worker:
+          type: chunked_prefill
+          # 6782 pages * 32 tokens * 32768 bytes/token per TP rank.
+          attn_gpu_memory_gb: 7.111442432
+          max_batch_tokens: 512
+          max_prefill_requests_per_iteration: 1
+          max_resident_requests_per_partition: 16
+          batch_policy: separate-prefill-priority
+          kv_admission_policy: full-footprint
+          prefix_cache_mode: disabled
+          gpu_time_multiplier: 1.0
+          # Host time the device does not hide, fitted on 0.29 replays of the
+          # patched engine (doc/pr/llama31-8b-trn2/README.md,
+          # "Simulation against the engine"): 2.9 ms per prefill
+          # step; none per decode request (the async scheduler hides it). The
+          # engine plans the next step about 4 ms after a step starts.
+          host_us_per_prefill_request: 2900
+          host_us_per_decode_request: 0
+          async_lookahead_us: 4000

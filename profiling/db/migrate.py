@@ -23,6 +23,12 @@ RETIRED_TABLES = (
     "_kernel_config_role",
     "_kernel_config_use",
     "_kernel_config_blob",
+    # The vLLM Neuron 0.24 whole-executable kinds: their route (PyTorch/XLA)
+    # left the Neuron SDK with 2.34 and the kinds left this checkout.
+    "neuron_llama_forward",
+    "neuron_llama_region",
+    "neuron_llama_segment",
+    "neuron_llama_segmented_forward",
 )
 
 

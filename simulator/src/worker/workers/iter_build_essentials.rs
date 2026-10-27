@@ -145,7 +145,8 @@ pub(super) fn prepare_iter_build_essentials(
         &CostManifestDoc::single("iter", cost_manifest),
         config.gpu_time_multiplier,
     )
-    .with_prefill_gpu_time_multiplier(config.prefill_gpu_time_multiplier);
+    .with_prefill_gpu_time_multiplier(config.prefill_gpu_time_multiplier)
+    .with_host_step(config.host_step);
     let context = WorkerContext {
         id,
         pool,

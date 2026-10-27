@@ -559,6 +559,12 @@ pub struct WorkerConfig {
     /// budget is applied per DP group. See
     /// [`crate::worker::admission::prefill_fits_budget`].
     pub max_batch_tokens: Option<u32>,
+    /// Chunked prefill: prefill requests scheduled per partition per iteration,
+    /// continued chunks and fresh prompts alike. None is unlimited.
+    pub max_prefill_requests_per_iteration: Option<u32>,
+    /// Chunked prefill: resident requests per partition, started prompts and
+    /// decodes alike. None is unlimited; KV stays the physical capacity owner.
+    pub max_resident_requests_per_partition: Option<u32>,
     /// Queue discipline the admission lifecycle uses to pick the head it gates
     /// (from the worker selector). Only the iter-wise local-prefill/decode and
     /// prefill-handoff lifecycles read it today.
@@ -610,6 +616,74 @@ pub struct WorkerConfig {
     /// Attention-DP partition placement (from the chunked-prefill selector).
     /// Only multi-partition chunked-prefill workers read it.
     pub dp_placement: crate::worker::config::DpPlacement,
+    /// Async one-step lookahead plan offset (from the chunked-prefill
+    /// selector's `async_lookahead_us`). `Some(w)` plans each next step `w`
+    /// after the current one starts, from the messages visible by then; `None`
+    /// is the synchronous cadence. Only the chunked-prefill recipe reads it.
+    pub async_lookahead: Option<Time>,
+    /// Host time per iteration added to the device time (from the
+    /// chunked-prefill selector's `host_us_per_*_request`). `None` adds nothing.
+    pub host_step: Option<HostStepTime>,
+}
+
+/// Host time per iteration that the device step does not hide: a fixed time
+/// per prefill request and per decode request of the iteration (input
+/// assembly, sampling bookkeeping, detokenization and streaming on the host).
+/// The preset sets the values; doc/pr/llama31-8b-trn2/README.md ("Simulation against the engine")
+/// records the fit on vLLM Neuron 0.29 replays of the patched engine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HostStepTime {
+    pub us_per_prefill_request: u32,
+    pub us_per_decode_request: u32,
+}
+
+impl HostStepTime {
+    /// The host time of one iteration over `input`. Each prefill chunk counts
+    /// as one prefill request. Groups add up; the one paired arch runs one
+    /// group.
+    pub fn of(&self, input: &UnifiedArchInput) -> Time {
+        let (prefill, decode) = input.groups.iter().fold((0u64, 0u64), |(p, d), g| {
+            (
+                p + g.prefill_chunk_pairs.len() as u64,
+                d + g.decode_kv_lens.len() as u64,
+            )
+        });
+        Time::from_us(
+            u64::from(self.us_per_prefill_request) * prefill
+                + u64::from(self.us_per_decode_request) * decode,
+        )
+    }
+}
+
+#[cfg(test)]
+mod host_step_time_tests {
+    use super::HostStepTime;
+    use crate::arch::contract::{ArchGroupInput, UnifiedArchInput};
+    use crate::common::Time;
+
+    #[test]
+    fn host_time_adds_a_fixed_time_per_prefill_and_decode_request() {
+        let host = HostStepTime {
+            us_per_prefill_request: 2250,
+            us_per_decode_request: 48,
+        };
+        let group = |prefills: usize, decodes: usize| ArchGroupInput {
+            prefill_chunk_pairs: vec![(0, 100); prefills],
+            decode_kv_lens: vec![10; decodes],
+            ..Default::default()
+        };
+        let input = |groups| UnifiedArchInput {
+            groups,
+            ..Default::default()
+        };
+        assert_eq!(host.of(&input(vec![])), Time::ZERO);
+        assert_eq!(host.of(&input(vec![group(1, 0)])), Time::from_us(2250));
+        assert_eq!(host.of(&input(vec![group(0, 100)])), Time::from_us(4800));
+        assert_eq!(
+            host.of(&input(vec![group(1, 2), group(0, 3)])),
+            Time::from_us(2250 + 5 * 48)
+        );
+    }
 }
 
 impl Default for WorkerConfig {
@@ -623,6 +697,8 @@ impl Default for WorkerConfig {
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             max_batch_tokens: None,
+            max_prefill_requests_per_iteration: None,
+            max_resident_requests_per_partition: None,
             pending_order: crate::worker::admission::PendingOrderKind::default(),
             batch_policy: crate::worker::config::BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
@@ -637,6 +713,8 @@ impl Default for WorkerConfig {
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,
+            async_lookahead: None,
+            host_step: None,
         }
     }
 }

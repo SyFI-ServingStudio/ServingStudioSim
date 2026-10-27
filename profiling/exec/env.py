@@ -11,6 +11,8 @@ from collections.abc import Iterable, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from profiling.container.images import VENDOR_IMAGES
+
 
 @dataclass(frozen=True)
 class ProfileEnv:
@@ -186,6 +188,14 @@ ENV_REGISTRY: dict[str, ProfileEnv] = {
         isolated_site_packages=True,
     ),
 }
+# A vendor image (profiling/container/images.py) serves its envs on its own
+# interpreter, and only in that image: `exec/neuron.py` refuses every other
+# runtime. The entry names the env and that interpreter.
+for _vendor in VENDOR_IMAGES.values():
+    for _vendor_env in _vendor.envs:
+        ENV_REGISTRY[_vendor_env] = ProfileEnv(
+            _vendor_env, Path(_vendor.python), isolated_site_packages=True
+        )
 
 
 def register_profile_env(

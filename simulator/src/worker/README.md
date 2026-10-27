@@ -272,6 +272,16 @@ Barebone, HP, and PD-prefill differ only in their build recipe. HP changes the
 number of KV partitions and placement; PD-prefill changes admission and adds a
 send comm group.
 
+`with_async_lookahead(Some(w))` selects the shell's opt-in async one-step
+lookahead planning cadence (only the chunked-prefill recipe passes it, from
+`async_lookahead_us`). Step N+1 is planned `w` after step N starts. A message
+enqueued while a step runs waits in a shell-owned engine inbox until that plan
+moment, then reaches admission. N+1 is formed after N completes and starts at
+`max(N end, plan moment)`. An idle engine, or a planned-empty step, sees the
+inbox at once. The inbox is transport state: admission and its policy still own
+every not-yet-started request they have seen. `None` keeps the synchronous
+cadence bit-identical.
+
 ### 2. Pull plus decode: `workers/pd_decode/`
 
 `PullDecodeWorker` coordinates two timelines:
@@ -386,6 +396,23 @@ block; when its arch's drafter prunes the last matching prefix block
 `use_eagle_block_drop` for MTP/EAGLE/DFlash), the prompt's last checkpoint, and
 therefore the stop no chunk may run past, sits one block earlier. Only that
 chunk-end stop reads the hook; prefix-hit lengths do not yet drop the block.
+
+Two optional request-count limits bound each partition independently of the
+token budget: `max_prefill_requests_per_iteration` (prefill requests scheduled
+per iteration, continued chunks and fresh prompts alike) and
+`max_resident_requests_per_partition` (started prompts plus resident decodes).
+Both default to unlimited and reject zero. The lifecycle counts them at batch
+formation from KV decode membership and its started-prompts list, with no second
+queue or ledger; a prompt that completes in an iteration keeps its resident slot
+until its request completes, even with a single output token. The selector's
+`prefix_cache_mode` defaults to `opportunistic`.
+
+Optional host time per iteration (`host_us_per_prefill_request`,
+`host_us_per_decode_request`, set together, chunked prefill only):
+`CostBuffers::run_iter` adds a fixed time per prefill chunk and per decode
+request to the iteration's wall time (`HostStepTime`). The `cost_log` row keeps
+the device time. It replaces the duty multiplier, so `gpu_time_multiplier` must
+be 1.0. It is validated only for `llama3_neuron_ops`.
 
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;

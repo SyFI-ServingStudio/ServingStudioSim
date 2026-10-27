@@ -71,6 +71,27 @@ datacenter driver: the CUDA base image carries the forward-compatibility
 libraries (`/usr/local/cuda/compat`), which the NVIDIA container runtime uses
 when the host driver predates the image's CUDA (seen on driver 570, CUDA 12.8).
 
+A Neuron backend (`BackendSupport.device_family = "neuron"`) is measured on an
+AWS Trainium chip instead (`exec/neuron.py`). Its env names a vendor image that
+this checkout never builds, pinned by content digest (`VENDOR_IMAGES` in
+`profiling/container/images.py`). The env runs only in that image:
+`exec/neuron.py` refuses the host runtime. The pool
+takes a nonblocking whole-chip lock under `/tmp`, so checkouts with different
+`TMPDIR`s never share a chip, and it refuses an inherited
+`NEURON_RT_VISIBLE_CORES`/`NEURON_VISIBLE_DEVICES`. A backend that runs several
+ranks names its logical-core span as `KernelProfilerSpec.neuron_logical_cores`.
+The worker runs offline as the invoking user with only `/dev/neuronN` mapped,
+compares its own `neuron-ls` observation with the reservation before it loads
+the runner, and records the image's SDK and runtime packages; the controller
+appends the inspected image ID and the host driver package. Neuron rows keep
+NULL CUDA and driver versions. Host configuration:
+
+- `SERVINGSTUDIO_NEURON_DOCKER_HOST` (required): the local `unix://` socket of
+  the Docker daemon that runs Neuron workers; `SERVINGSTUDIO_NEURON_DOCKER_COMMAND`
+  is its CLI argv (default `docker`, e.g. `sudo -n docker`).
+- `SERVINGSTUDIO_NEURON_PROFILE_CACHE_DIR`: the writable compile cache, mounted
+  at its own path (default `$TMPDIR/servingstudio-neuron-cache`).
+
 `VIBESIM_PROFILE_RUNTIME=host` runs each env on the host interpreter its
 registry entry names instead, for debugging against a local build. Those rows
 carry the same DB key as the image's, so compare them against the image before
@@ -136,6 +157,22 @@ measured without it record `energy_j = 0.0`, which means "not measured"
 everywhere in this codebase; see `launcher/README.md` for the `energy:` key and
 the `VIBESIM_REQUIRE_ENERGY` guard that stops such a row reaching a run that
 asked for energy.
+
+### The Neuron image
+
+Every Neuron kind of `arch llama3_neuron_ops` runs in the vLLM Neuron 0.29
+image (`vllm_neuron_native_env`, vendor image `vllm-neuron-native`, pinned by
+its inspected ID). Three runners measure them:
+
+- `runners/neuron/nki_bench.py` compiles one graph per launch unit on the
+  engine's compile backend. It captures the NRT trace through the engine's
+  runtime binding.
+- `runners/neuron/forward_bench.py` compiles a reduced-depth TP4 decode
+  forward on the chip's four cores for the two decode leaves.
+- `runners/neuron/collective_bench.py` times `torch.distributed` collectives
+  across the chip's four logical cores.
+
+See `doc/pr/llama31-8b-trn2/README.md` ("Engine image").
 
 ## First-class Analyzer resources
 

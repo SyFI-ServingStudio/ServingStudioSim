@@ -67,6 +67,11 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     partition_policies: Vec<(P, P::Context)>,
     enqueue_sequence: EnqueueSequence,
     max_batch_tokens: u32,
+    /// Per partition and iteration: scheduled prefill requests, continued
+    /// chunks and fresh prompts alike.
+    max_prefill_requests_per_iteration: Option<u32>,
+    /// Per partition: resident decodes plus started prompts.
+    max_resident_requests_per_partition: Option<u32>,
     batch_policy: BatchPolicy,
     kv_admission: KvAdmissionConfig,
     current_new_token_ratio: f64,
@@ -146,6 +151,8 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             partition_policies,
             enqueue_sequence: EnqueueSequence::default(),
             max_batch_tokens,
+            max_prefill_requests_per_iteration: None,
+            max_resident_requests_per_partition: None,
             batch_policy,
             kv_admission,
             current_new_token_ratio,
@@ -158,6 +165,24 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             decode_completion,
             drafting_slots,
         }
+    }
+
+    /// Bound request counts per partition independently of the token budget
+    /// (an engine with one compiled prefill lane and a fixed decode inventory,
+    /// such as stock vLLM Neuron). None leaves a count unlimited.
+    pub(crate) fn with_request_limits(
+        mut self,
+        max_prefill_requests_per_iteration: Option<u32>,
+        max_resident_requests_per_partition: Option<u32>,
+    ) -> Self {
+        assert!(
+            max_prefill_requests_per_iteration != Some(0)
+                && max_resident_requests_per_partition != Some(0),
+            "chunked-prefill request limits must be positive"
+        );
+        self.max_prefill_requests_per_iteration = max_prefill_requests_per_iteration;
+        self.max_resident_requests_per_partition = max_resident_requests_per_partition;
+        self
     }
 
     /// End every non-final chunk on a checkpoint boundary of `alignment`.
@@ -501,12 +526,29 @@ where
             })
             .collect();
 
+        // Request-count limits. Residents are counted before scheduling: a
+        // prompt that completes this iteration stays resident until its request
+        // completes, even when it emits its only output token. These counters
+        // are formation-local; they never own membership or KV capacity.
+        let prefill_limit = self.max_prefill_requests_per_iteration.unwrap_or(u32::MAX);
+        let resident_limit = self.max_resident_requests_per_partition.unwrap_or(u32::MAX);
+        let mut scheduled_prefills = vec![0u32; num_partitions];
+        let mut resident_requests: Vec<u32> = (0..num_partitions)
+            .map(|partition| {
+                kv_store.live_decode_count(partition as u16)
+                    + self.started_prefills[partition].len() as u32
+            })
+            .collect();
+
         // Started prompts keep partition-local priority, in start order, until
         // their prompt is complete, matching one EngineCore scheduler queue per
         // DP partition. One that cannot run this iteration keeps its place.
         for partition_index in 0..num_partitions {
             let mut started_prefills = std::mem::take(&mut self.started_prefills[partition_index]);
             started_prefills.retain(|candidate| {
+                if scheduled_prefills[partition_index] >= prefill_limit {
+                    return true;
+                }
                 let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
                 let chunk_tokens = next_chunk_tokens(
                     resolved_prefill,
@@ -523,6 +565,7 @@ where
                     chunk_tokens,
                 );
                 remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
+                scheduled_prefills[partition_index] += 1;
                 chunk_tokens < resolved_prefill.remaining_prefill_tokens()
             });
             self.started_prefills[partition_index] = started_prefills;
@@ -530,7 +573,10 @@ where
 
         for partition_index in 0..num_partitions {
             let partition = partition_index as u16;
-            while !retracted_before_admission && remaining_budgets[partition_index] > drafting_slots
+            while !retracted_before_admission
+                && remaining_budgets[partition_index] > drafting_slots
+                && scheduled_prefills[partition_index] < prefill_limit
+                && resident_requests[partition_index] < resident_limit
             {
                 let (policy, policy_context) = &mut self.partition_policies[partition_index];
                 policy.refresh_head(&mut |candidate| {
@@ -599,6 +645,8 @@ where
                 }
                 let popped = policy.pop(policy_context);
                 debug_assert_eq!(popped, Some(candidate));
+                scheduled_prefills[partition_index] += 1;
+                resident_requests[partition_index] += 1;
                 self.admission_order
                     .insert(candidate.request_id, self.next_admission);
                 self.next_admission += 1;

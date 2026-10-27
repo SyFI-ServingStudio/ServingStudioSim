@@ -30,6 +30,7 @@ use crate::arch::contract::{
 use crate::common::{Time, WorkerId};
 use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
+use crate::worker::types::HostStepTime;
 
 /// Upper bound on distinct cached section results per worker. AFD attn keys churn
 /// as KV grows (~a few new keys per iteration), so the table is cleared wholesale
@@ -123,6 +124,9 @@ pub struct CostBuffers {
     /// schedules any prefill tokens. Equals `gpu_time_multiplier` unless set by
     /// [`with_prefill_gpu_time_multiplier`](Self::with_prefill_gpu_time_multiplier).
     prefill_gpu_time_multiplier: f64,
+    /// Host time [`run_iter`](Self::run_iter) adds to the device time; set by
+    /// [`with_host_step`](Self::with_host_step).
+    host_step: Option<HostStepTime>,
 }
 
 impl CostBuffers {
@@ -159,7 +163,15 @@ impl CostBuffers {
             key_scratch: Vec::new(),
             gpu_time_multiplier,
             prefill_gpu_time_multiplier: gpu_time_multiplier,
+            host_step: None,
         }
+    }
+
+    /// Add `host_step` to the wall time of every [`run_iter`](Self::run_iter).
+    /// Only the chunked-prefill recipe sets it; `None` adds nothing.
+    pub fn with_host_step(mut self, host_step: Option<HostStepTime>) -> Self {
+        self.host_step = host_step;
+        self
     }
 
     /// Scale prefill-bearing iterations by `multiplier` instead of
@@ -368,8 +380,10 @@ impl CostBuffers {
     /// Iter-wise convenience over [`run_section`](Self::run_section): the whole
     /// iteration is one fused `eval_iter`, logged as a single `iter` section (no
     /// per-layer split, one batch → `batch_id = 0`). Returns the iter's wall time
-    /// (the worker adds it to `now` for `compute_end`). Picks `eval_iter_with_inputs`
-    /// vs `eval_iter` automatically based on whether a logger is attached.
+    /// (the worker adds it to `now` for `compute_end`): the device time × the
+    /// stage multiplier, plus the `host_step` time. The `cost_log` row keeps the
+    /// device time. Picks `eval_iter_with_inputs` vs `eval_iter` automatically
+    /// based on whether a logger is attached.
     pub fn run_iter<M: IterwiseUnifiedModel + ?Sized>(
         &mut self,
         model: &M,
@@ -389,7 +403,7 @@ impl CostBuffers {
             None => model.eval_iter(arch_input, slots, scratch),
         };
         // `None` cache key: one fused eval per iteration — nothing to memoize.
-        if model.logs_decode_kv_lens() {
+        let device = if model.logs_decode_kv_lens() {
             let groups = DecodeKvLensGroupLog {
                 groups: &arch_input.groups,
             };
@@ -406,6 +420,11 @@ impl CostBuffers {
                 multiplier,
                 eval,
             )
+        };
+        // Host time is wall time only; the cost_log row keeps the device time.
+        match self.host_step {
+            Some(host) => device + host.of(arch_input),
+            None => device,
         }
     }
 
@@ -773,6 +792,49 @@ mod tests {
             .with_prefill_gpu_time_multiplier(None);
         assert_eq!(single.run_iter(&model, &decode, 0, now).as_ms(), 2.5);
         assert_eq!(single.run_iter(&model, &mixed, 1, now).as_ms(), 2.5);
+    }
+
+    /// `host_step` adds a fixed time per request to the wall time of
+    /// `run_iter`; the `cost_log` row keeps the device time.
+    #[test]
+    fn host_step_adds_to_wall_time_but_not_to_cost_log() {
+        let model = crate::test_helpers::FakeModel::for_ms(2.0);
+        let decode = UnifiedArchInput {
+            groups: vec![grp(&[100, 200])],
+            tokens_per_source_rank: Vec::new(),
+        };
+        let dir = tempdir().unwrap();
+        let mut cost = CostBuffers::new(
+            Some(dir.path().to_path_buf()),
+            "iter",
+            WorkerId(0),
+            &trivial_manifest(),
+            1.0,
+        )
+        .with_host_step(Some(HostStepTime {
+            us_per_prefill_request: 2250,
+            us_per_decode_request: 48,
+        }));
+        let wall = cost.run_iter(&model, &decode, 0, Time::from_ms(0.0));
+        assert_eq!(wall, Time::from_ms(2.0) + Time::from_us(2 * 48));
+        drop(cost); // flush + join the writer thread
+
+        let path = dir.path().join("raw/cost_log/worker_iter_0.parquet");
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        // Schema column order: 5 = total_time_ms (see cost_log_schema).
+        let ttm = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(
+            (ttm.value(0) - 2.0).abs() < 1e-9,
+            "cost_log keeps device time"
+        );
     }
 
     /// The speculative face picks its multiplier by the same prefill test.

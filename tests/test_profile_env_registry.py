@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from profiling.container.images import IMAGES
+from profiling.container.images import IMAGES, VENDOR_IMAGES
 from profiling.db.registry import iter_kernel_profiler_specs
 from profiling.exec.env import ENV_REGISTRY, ProfileEnv, resolve_profile_env
 
@@ -25,7 +25,8 @@ def _env(spec) -> str:
 def test_backend_env_is_registered_and_served_by_an_image(spec) -> None:
     env = _env(spec)
     assert env in ENV_REGISTRY, f"{spec.kernel_kind}:{spec.backend} names unknown env {env!r}"
-    assert any(env in image.envs for image in IMAGES.values()), f"no image serves {env!r}"
+    images = (*IMAGES.values(), *VENDOR_IMAGES.values())
+    assert any(env in image.envs for image in images), f"no image serves {env!r}"
 
 
 @pytest.mark.parametrize("env", sorted({_env(spec) for spec in _SPECS}))
