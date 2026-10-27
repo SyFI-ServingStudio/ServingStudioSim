@@ -50,17 +50,22 @@ ARRIVAL_TIME_SCALE_TOLERANCE = 0.10
 def simulated_arrival_time_scale(rows: list[dict], simulated: dict) -> float | None:
     """The factor the simulator applied to the trace's arrival offsets.
 
-    Dense simulator IDs follow CSV row order. Read at the latest arrival, like
-    `arrival_time_scale`; `None` when that request is missing from the run.
+    Dense simulator IDs follow CSV row order. The simulator records a request's
+    arrival when it is admitted, so a client `max_concurrency` cap delays a
+    simulated arrival past its scaled offset but never advances it. A rate scale
+    applies to every offset, so it is read at the least-delayed request with a
+    positive offset; `None` when a request is missing from the run.
     """
-    index, anchor = max(enumerate(rows), key=lambda item: float(item[1]["arrival_time"]))
-    base = float(anchor["arrival_time"])
-    if base <= 0:
-        return 1.0
-    sim = simulated.get(index)
-    if sim is None or sim.get("arrival_time_ms") is None:
-        return None
-    return float(sim["arrival_time_ms"]) / base
+    scales = []
+    for index, row in enumerate(rows):
+        base = float(row["arrival_time"])
+        if base <= 0:
+            continue
+        sim = simulated.get(index)
+        if sim is None or sim.get("arrival_time_ms") is None:
+            return None
+        scales.append(float(sim["arrival_time_ms"]) / base)
+    return min(scales) if scales else 1.0
 
 
 def arrival_time_scales_agree(measured_scale: float, simulated_scale: float | None) -> bool:

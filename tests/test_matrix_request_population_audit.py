@@ -145,6 +145,17 @@ def test_a_trace_timed_simulation_must_replay_at_the_measured_arrival_scale(
     assert result["simulated_arrival_time_scale"] == pytest.approx(simulated_factor)
 
 
+def test_a_concurrency_capped_simulation_keeps_the_scale_of_its_least_delayed_arrival(tmp_path):
+    # A client cap admits later requests only as earlier ones finish, so their
+    # simulated arrivals trail the trace; the rate scale is still 1.
+    arrivals = [0.0, 1263.25, 3555.27, 114912.47]
+    simulated = [0.0, 1263.25, 6309.1, 1438080.2]
+    paths = _write_population(tmp_path, arrivals, arrivals, simulated)
+    result = audit_request_population(**paths, simulated_arrival_mode="trace_timed")
+    assert result["checks"]["arrival_time_scale_matches"]
+    assert result["simulated_arrival_time_scale"] == pytest.approx(1.0)
+
+
 def test_a_saturated_simulation_skips_the_arrival_scale_check(tmp_path):
     arrivals = [0.0, 1000.0, 2000.0]
     paths = _write_population(tmp_path, arrivals, arrivals, [0.0, 0.0, 0.0])
