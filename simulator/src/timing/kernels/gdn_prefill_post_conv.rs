@@ -30,6 +30,20 @@ pub struct GdnPrefillPostConvKernelInput {
     pub num_tokens: u32,
 }
 
+/// One past the largest element offset an int32 index reaches.
+const MAX_INT32_OFFSET: f64 = 2_147_483_648.0;
+
+impl GdnPrefillPostConvKernelConfig {
+    /// Elements of one packed `mixed_qkv` row: q and k of every key head, v of
+    /// every value head.
+    fn packed_qkv_width(&self) -> f64 {
+        f64::from(
+            2 * self.num_qk_heads.get() * self.key_head_dim.get()
+                + self.num_value_heads.get() * self.value_head_dim.get(),
+        )
+    }
+}
+
 pub struct GdnPrefillPostConvSpec;
 
 impl KernelSpec for GdnPrefillPostConvSpec {
@@ -48,6 +62,17 @@ impl KernelSpec for GdnPrefillPostConvSpec {
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
         CacheKind::Cache1DLinear
+    }
+
+    /// Token counts whose packed-row offset leaves int32. vLLM's
+    /// `_fused_post_conv_kernel` addresses `mixed_qkv` as
+    /// `offs_t * stride_x_tok + ...` in 32-bit arithmetic, so past
+    /// `2^31 / qkv_width` tokens the launch reads wrapped addresses (an illegal
+    /// access on L40S when a larger allocation precedes it). No vLLM step reaches
+    /// it: the kernel sees at most `max_num_batched_tokens` rows.
+    fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
+        let width = config.packed_qkv_width();
+        grid.expand_1d(|num_tokens| num_tokens * width >= MAX_INT32_OFFSET)
     }
 
     fn enumerate(
@@ -160,6 +185,29 @@ mod tests {
     }
 
     #[test]
+    fn rows_past_the_int32_packed_offset_are_infeasible() {
+        let cfg = GdnPrefillPostConvKernelConfig {
+            backends: vec!["vllm_triton"],
+            gpu_name: "NVIDIA L40S".into(),
+            num_qk_heads: 16.into(),
+            num_value_heads: 48.into(),
+            key_head_dim: 128.into(),
+            value_head_dim: 128.into(),
+            dtype: DType::Bf16,
+        };
+        let grid = GdnPrefillPostConvSpec::sweep_grid(&cfg);
+        let mask = GdnPrefillPostConvSpec::infeasible_mask(&cfg, &grid);
+        let tokens = grid.expand_1d(|n| n as u32);
+        // A 10240-wide row: 131072 tokens fit (1.34e9), 262144 do not (2.68e9).
+        let dropped: Vec<u32> = tokens
+            .iter()
+            .zip(&mask)
+            .filter_map(|(&n, &drop)| drop.then_some(n))
+            .collect();
+        assert_eq!(dropped, vec![262144]);
+    }
+
+    #[test]
     fn sweep_is_exact_ordered_unique_twenty_point_axis_with_l17_cliff() {
         let cfg = config();
         let grid = GdnPrefillPostConvSpec::sweep_grid(&cfg);
@@ -184,7 +232,10 @@ mod tests {
             1
         );
         assert_eq!(grid.axes()[0][4..7], [16.0, 17.0, 32.0]);
-        assert!(GdnPrefillPostConvSpec::infeasible_mask(&cfg, &grid).is_empty());
+        // An 8192-wide row reaches 2^31 elements exactly at the last point.
+        let mask = GdnPrefillPostConvSpec::infeasible_mask(&cfg, &grid);
+        assert_eq!(mask.iter().filter(|&&drop| drop).count(), 1);
+        assert_eq!(mask.last(), Some(&true));
     }
 
     #[test]

@@ -30,6 +30,8 @@ from profiling.runners.metrics import ComputeMetrics
 _BACKEND = "gdn_prefill_post_conv:vllm_triton"
 _CALLABLE_MODULE = "vllm.third_party.flash_linear_attention.ops.fused_gdn_prefill_post_conv"
 _CALLABLE_NAME = "fused_post_conv_prep"
+# One past the largest element offset the kernel's int32 indexing reaches.
+_MAX_INT32_OFFSET = 2**31
 _KERNEL_NAME = "_fused_post_conv_kernel"
 _MAX_GUARD_PACKED_ELEMENTS = 1_048_576
 _QK_ATOL = 1e-3
@@ -102,6 +104,16 @@ def _validate_args(
     if validated.dtype is not DType.BF16:
         raise ValueError(
             f"vllm_triton gdn_prefill_post_conv requires dtype=bf16, got {validated.dtype.value}"
+        )
+    # The kernel addresses the packed row as `offs_t * stride_x_tok` in int32;
+    # past this it reads wrapped addresses (an illegal access on L40S). vLLM
+    # never launches it on more than max_num_batched_tokens rows.
+    packed_elements = validated.num_tokens * _operand_shapes(validated).conv_output[1]
+    if packed_elements >= _MAX_INT32_OFFSET:
+        raise ValueError(
+            f"{_BACKEND} gdn_prefill_post_conv indexes mixed_qkv with int32 offsets; "
+            f"num_tokens={validated.num_tokens} gives {packed_elements} packed elements "
+            f"(limit {_MAX_INT32_OFFSET})"
         )
     return validated
 
