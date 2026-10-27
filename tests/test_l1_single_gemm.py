@@ -142,6 +142,8 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "flashinfer_fp8_tensor",
         "flashinfer_cutedsl",
         "flashinfer_mxfp8",
+        "vllm_cutlass_fp8",
+        "vllm_marlin_nvfp4",
     }
 
 

@@ -9,7 +9,7 @@ Wire string: ``"single_gemm"`` — matches Rust ``KernelSpec::KIND`` in
 by ``profiling.facade`` to generate ``get_single_gemm_times`` /
 ``count_missing_single_gemm``.
 
-Nine backends share this kind/table/schema: ``torch`` (contiguous-RHS
+Eleven backends share this kind/table/schema: ``torch`` (contiguous-RHS
 ``torch.mm``), ``torch_linear`` (model-weight-layout ``F.linear`` in the main
 environment), ``torch_linear_vllm`` (the same expression in vLLM's pinned
 environment), ``sglang_bf16_auto`` and ``sglang_fused_a_auto`` (SGLang's
@@ -18,7 +18,10 @@ production BF16 dispatches, SM100 only), ``deepgemm`` (FP8 dense GEMM,
 linear on SM10x, ``dtype = fp8_e4m3``), ``flashinfer_cutedsl`` (vLLM's default NVFP4 W4A4
 linear on SM10x, ``dtype = nvfp4_e2m1``), and ``flashinfer_mxfp8`` (MXFP8 dense
 linear: activation quant + FlashInfer CuTe-DSL block-scaled GEMM,
-``dtype = mxfp8_e4m3``).
+``dtype = mxfp8_e4m3``), ``vllm_cutlass_fp8`` (vLLM's static per-tensor FP8
+linear below SM10x through CUTLASS ``cutlass_scaled_mm``, ``dtype = fp8_e4m3``) and
+``vllm_marlin_nvfp4`` (vLLM's NVFP4 weight-only Marlin linear on GPUs without FP4
+tensor cores, ``dtype = nvfp4_e2m1`` naming the weight; the activation is bf16).
 BF16/FP16 model defaults offer both generic Torch variants and the timing cache
 selects the faster one per shape.
 
@@ -52,7 +55,11 @@ class SingleGemmArgs(KernelArgs):
     n: int = arg(unit="elements", doc="Output features of the weight.")
     k: int = arg(unit="elements", doc="Input features, the reduction dimension.")
     dtype: DType = arg(
-        doc="Element type of A and B. fp8_e4m3, nvfp4_e2m1 and mxfp8_e4m3 write bf16 output."
+        doc=(
+            "Element type of A and B. fp8_e4m3, nvfp4_e2m1 and mxfp8_e4m3 write bf16 "
+            "output. For vllm_marlin_nvfp4, nvfp4_e2m1 names the weight format only: "
+            "the activation stays bf16 (W4A16)."
+        )
     )
 
 
@@ -71,20 +78,26 @@ DOC = KernelDoc(
         "C[m, n] = A[m, k] · B[k, n]",
         "TFLOPS = 2·m·n·k / time",
         "GB/s = (m·k + k·n + m·n) · bytes per element / time",
-        "deepgemm, flashinfer_fp8_tensor (fp8 in, bf16 out): GB/s = (m·k + k·n + 2·m·n) / time",
+        "deepgemm, flashinfer_fp8_tensor, vllm_cutlass_fp8 (fp8 in, bf16 out): "
+        "GB/s = (m·k + k·n + 2·m·n) / time",
         "flashinfer_cutedsl (nvfp4 in, bf16 out): GB/s = ((m·k + k·n)·(1/2 + 1/16) + 2·m·n) / time",
+        "vllm_marlin_nvfp4 (bf16 A, nvfp4 B, bf16 out): "
+        "GB/s = (2·m·k + k·n·(1/2 + 1/16) + 2·m·n) / time",
     ),
     default_metric="tflops",
     caveats=(
         "Inputs are random normal tensors, so data-dependent effects such as "
         "sparsity are not measured.",
         "deepgemm scales fp8_e4m3 operands per 128-element block; "
-        "flashinfer_fp8_tensor scales each operand by one FP32 scalar.",
+        "flashinfer_fp8_tensor and vllm_cutlass_fp8 scale each operand by one FP32 scalar.",
         "torch and torch_linear compute the same product. They are separate rows "
         "because the weight layout changes which cuBLAS kernel runs.",
         "flashinfer_mxfp8 takes bf16 activations and includes their MXFP8 "
         "quantization in the time; its GB/s adds the bf16 read and the "
         "quantized write of the activation.",
+        "vllm_marlin_nvfp4 is weight-only: its dtype nvfp4_e2m1 is the weight "
+        "format and the activation is bf16, so the row has no activation "
+        "quantization to exclude or include.",
     ),
     method=(
         f"{CUPTI_METHOD} The torch and SGLang backends count overlapping launches "
@@ -94,7 +107,10 @@ DOC = KernelDoc(
         "the activation quantization before it is the nvfp4_quant kind. flashinfer_mxfp8 includes "
         "its activation quantization and autotunes the call once before timing. "
         "flashinfer_fp8_tensor times only the GEMM on already-quantized fp8 input, "
-        "after autotuning FlashInfer's hybrid token buckets as vLLM's warmup does."
+        "after autotuning FlashInfer's hybrid token buckets as vLLM's warmup does. "
+        "vllm_cutlass_fp8 likewise times only the GEMM on already-quantized fp8 "
+        "input. vllm_marlin_nvfp4 sums every launch of one apply call: Marlin "
+        "splits a large m into one launch per slice of up to 1024 rows when n > 4096."
     ),
     # torch.mm is its own reference: the torch backend measures exactly it.
     reference=None,
@@ -348,6 +364,74 @@ register(
                 "the CuTe-DSL block-scaled GEMM mm_mxfp8, bf16 output."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py",
+        ),
+    )
+)
+
+# vLLM's static per-tensor FP8 linear (ModelOpt FP8) below SM10x:
+# CutlassFP8ScaledMMLinearKernel follows FlashInferFP8ScaledMMLinearKernel in
+# _POSSIBLE_FP8_KERNELS; its is_supported is cutlass_fp8_supported(), i.e.
+# cutlass_scaled_mm_supports_fp8 in csrc/.../w8a8/cutlass/scaled_mm_entry.cu:
+# capability >= 89 (sm89 c2x kernels; sm90 / sm100 / sm120 c3x kernels).
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cutlass_fp8",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            min_compute_capability=(8, 9),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.vllm_cutlass_fp8",
+            function_name="profile_single_gemm_vllm_cutlass_fp8",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's CutlassFP8ScaledMMLinearKernel after its activation "
+                "quantization: cutlass_scaled_mm on fp8 A and the column-major fp8 "
+                "weight, one FP32 scale each, bf16 output. The vLLM FP8 linear "
+                "below SM10x."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py",
+        ),
+    )
+)
+
+# vLLM's NVFP4 linear on GPUs without FP4 tensor cores: MarlinNvFp4LinearKernel
+# (weight-only W4A16). is_fp4_marlin_supported() admits capability 7.5+, but
+# marlin.cu rejects a bf16 activation on 7.5 (fp16 or int8 only there), so a
+# bf16 model needs 8.0+.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_marlin_nvfp4",
+        supports=BackendSupport(
+            compute=frozenset({DType.NVFP4_E2M1}),
+            min_compute_capability=(8, 0),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.vllm_marlin_nvfp4",
+            function_name="profile_single_gemm_vllm_marlin_nvfp4",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's MarlinNvFp4LinearKernel: Marlin W4A16 GEMM of the bf16 "
+                "activation with the repacked NVFP4 weight (E2M1, E4M3 scale per 16 "
+                "k-elements, FP32 global scale), bf16 output. dtype nvfp4_e2m1 names "
+                "the weight; the activation is not quantized. Every launch of one "
+                "apply call is summed."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/nvfp4/marlin.py",
         ),
     )
 )

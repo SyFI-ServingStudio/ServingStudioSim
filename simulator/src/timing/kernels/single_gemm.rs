@@ -8,7 +8,7 @@
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
-use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -82,6 +82,62 @@ fn fp8_tensor_m_axis() -> Vec<f64> {
     Axis::values(m)
 }
 
+/// `m` axis for `vllm_cutlass_fp8` (`cutlass_scaled_mm` below SM10x).
+///
+/// The SM89 dispatch (`scaled_mm_c2x_sm89_fp8_dispatch.cuh`) switches tile
+/// config at `next_pow_2(m)` = 16, 32, 64, 128, 256, so a config switch sits
+/// between `b` and `b + 1` for each of those. Past 256 the default config tiles
+/// M by 128 or 256 rows, and each extra tile row is a step: on an L40S at
+/// n=16384, k=5120 time rises 15-22% between `128 j` and `128 j + 1` up to
+/// m=1024. The axis is the FP8-tensor one (every power of two to 256 and its
+/// `b + 1`, then every multiple of 64) plus every `128 j + 1`.
+fn cutlass_fp8_m_axis() -> Vec<f64> {
+    let mut m: Vec<u32> = fp8_tensor_m_axis()
+        .into_iter()
+        .map(|v| v as u32)
+        .chain((384..HYBRID_BUCKET_M_MAX).step_by(128).map(|b| b + 1))
+        .collect();
+    m.sort_unstable();
+    m.dedup();
+    Axis::values(m)
+}
+
+/// Largest `m` the Marlin and CUTLASS FP8 grids measure; past it the call is
+/// split (see `off_grid`).
+const ADA_M_MAX: u32 = HYBRID_BUCKET_M_MAX;
+
+/// Below this `m` the Marlin axis also brackets the 16-row tail step.
+const MARLIN_DENSE_M: u32 = 1024;
+
+/// `m` axis for `vllm_marlin_nvfp4` (vLLM `marlin_gemm`, W4A16).
+///
+/// `marlin.cu` walks `m` in slices: each launch takes the largest multiple of
+/// 64 rows up to `max_par * 64` (1024 when `n > 4096`, 8192 otherwise), and a
+/// remainder below 64 rows is one more launch. Every launch streams the whole
+/// weight, so time jumps by a weight pass at each `64 j + 1` and falls back at
+/// `64 (j + 1)`, where the remainder joins the full slice. The remainder
+/// launch itself steps again past 16 rows (one to two 16-row thread blocks):
+/// on an L40S at n=34816, k=5120, m=64 takes 0.148 ms, m=65..80 0.224-0.229 ms
+/// and m=81 0.297 ms. The axis measures `64 j`, `64 j + 1` and `64 j + 63` to
+/// the top, plus `64 j + 16` and `64 j + 17` below `MARLIN_DENSE_M`, where one
+/// such step is a large share of the call (under 4% past it). Below 64 rows it
+/// brackets the single launch's tile steps at 8, 16, 32 and 48 rows.
+fn marlin_m_axis() -> Vec<f64> {
+    let mut m: Vec<u32> = [1, 2, 4, 8, 9, 16, 17, 32, 33, 48, 49, 63]
+        .into_iter()
+        .chain((64..ADA_M_MAX).step_by(64).flat_map(|b| {
+            let dense = b < MARLIN_DENSE_M;
+            [b, b + 1, b + 63]
+                .into_iter()
+                .chain(dense.then_some([b + 16, b + 17]).into_iter().flatten())
+        }))
+        .chain([ADA_M_MAX])
+        .collect();
+    m.sort_unstable();
+    m.dedup();
+    Axis::values(m)
+}
+
 impl KernelSpec for SingleGemmSpec {
     type Config = SingleGemmKernelConfig;
     type Input = SingleGemmKernelInput;
@@ -93,8 +149,11 @@ impl KernelSpec for SingleGemmSpec {
             return SweepGrid::new(vec![hybrid_bucket_m_axis()]);
         }
         // A mixed backend list keeps the generic axis below.
-        if config.backends.as_slice() == ["flashinfer_fp8_tensor"] {
-            return SweepGrid::new(vec![fp8_tensor_m_axis()]);
+        match config.backends.as_slice() {
+            ["flashinfer_fp8_tensor"] => return SweepGrid::new(vec![fp8_tensor_m_axis()]),
+            ["vllm_cutlass_fp8"] => return SweepGrid::new(vec![cutlass_fp8_m_axis()]),
+            ["vllm_marlin_nvfp4"] => return SweepGrid::new(vec![marlin_m_axis()]),
+            _ => {}
         }
         // Dense decode routinely evaluates GEMMs below the shared token axis'
         // m=32 floor. Keep those points measured instead of extrapolating the
@@ -106,6 +165,34 @@ impl KernelSpec for SingleGemmSpec {
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
         CacheKind::Cache1DLinear
+    }
+
+    /// Past the grid, the two Ada backends answer as consecutive calls of at
+    /// most `ADA_M_MAX` rows. For Marlin that is the kernel's own structure:
+    /// `marlin.cu` already runs `m` as slice launches and `ADA_M_MAX` is a
+    /// whole number of slices for any `n`. CUTLASS FP8 is one launch, but at
+    /// the top of the grid it is compute bound with flat TFLOPS, so time is
+    /// additive in `m`: on an L40S at n=14336, k=5120, m=16384 takes 8.35 ms
+    /// against 2 x 4.14 ms at m=8192. The cache's own linear extension follows
+    /// the last 64-row segment, whose slope is tile-step noise (it predicted
+    /// 0.06 ms there), and holding the edge bandwidth undercounts the weight
+    /// term's share (-15%). Every other backend extends its cache.
+    fn off_grid(
+        _config: &Self::Config,
+        input: &Self::Input,
+        backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        if !matches!(backend, "vllm_marlin_nvfp4" | "vllm_cutlass_fp8") || input.m <= ADA_M_MAX {
+            return OffGrid::Cache;
+        }
+        let mut launches = Vec::new();
+        let mut rest = input.m;
+        while rest > 0 {
+            let piece = rest.min(ADA_M_MAX);
+            launches.push(SingleGemmKernelInput { m: piece });
+            rest -= piece;
+        }
+        OffGrid::Launches(launches)
     }
 
     fn enumerate(
@@ -290,7 +377,10 @@ mod tests {
                 assert!(has(b + 1), "first m past bucket {b} missing");
             }
         }
-        assert!(axis.windows(2).all(|w| w[0] < w[1]), "axis must be strictly increasing");
+        assert!(
+            axis.windows(2).all(|w| w[0] < w[1]),
+            "axis must be strictly increasing"
+        );
         assert_eq!(axis.first(), Some(&1.0));
         assert_eq!(axis.last(), Some(&8192.0));
         assert_eq!(axis.len(), 58);
@@ -333,6 +423,113 @@ mod tests {
         let fields = payloads[0].fields();
         assert_eq!(fields.len(), 5);
         assert_eq!(fields.get("dtype"), Some(&Value::from("mxfp8_e4m3")));
-        assert_eq!(fields.get("backend"), Some(&Value::from("flashinfer_mxfp8")));
+        assert_eq!(
+            fields.get("backend"),
+            Some(&Value::from("flashinfer_mxfp8"))
+        );
+    }
+
+    fn ada_cfg(backend: &'static str, n: u32, k: u32, dtype: DType) -> SingleGemmKernelConfig {
+        SingleGemmKernelConfig {
+            backends: vec![backend],
+            gpu_name: "NVIDIA L40S".to_string(),
+            n: n.into(),
+            k: k.into(),
+            dtype,
+        }
+    }
+
+    /// The SM89 CUTLASS FP8 dispatch switches tile config at m = 16, 32, 64,
+    /// 128, 256, and past 256 every extra 128-row tile is a step; both sides
+    /// of every switch and step must be measured.
+    #[test]
+    fn cutlass_fp8_axis_brackets_sm89_tile_switches() {
+        let cfg = ada_cfg("vllm_cutlass_fp8", 16384, 5120, DType::Fp8E4m3);
+        let grid = SingleGemmSpec::sweep_grid(&cfg);
+        let axis = &grid.axes()[0];
+        for b in [16.0, 32.0, 64.0, 128.0, 256.0] {
+            assert!(
+                axis.contains(&b) && axis.contains(&(b + 1.0)),
+                "switch at {b}"
+            );
+        }
+        for j in 3..64 {
+            assert!(
+                axis.contains(&(128.0 * j as f64 + 1.0)),
+                "M tile step {}",
+                128 * j
+            );
+        }
+        assert_eq!(axis.first(), Some(&1.0));
+        assert_eq!(axis.last(), Some(&8192.0));
+        assert!(axis.len() <= 500);
+    }
+
+    /// Marlin adds a whole weight pass at 64 j + 1 and drops it at 64 (j + 1):
+    /// a missing side makes the linear cache smear one launch across 64 rows.
+    #[test]
+    fn marlin_axis_brackets_every_remainder_launch() {
+        let cfg = ada_cfg("vllm_marlin_nvfp4", 34816, 5120, DType::Nvfp4E2m1);
+        let grid = SingleGemmSpec::sweep_grid(&cfg);
+        let axis = &grid.axes()[0];
+        let has = |v: u32| axis.contains(&(v as f64));
+        for j in 1..128 {
+            assert!(
+                has(64 * j) && has(64 * j + 1) && has(64 * j + 63),
+                "edge {}",
+                64 * j
+            );
+            if 64 * j < 1024 {
+                assert!(has(64 * j + 16) && has(64 * j + 17), "tail step {}", 64 * j);
+            }
+        }
+        assert!(axis.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(axis.first(), Some(&1.0));
+        assert_eq!(axis.last(), Some(&8192.0));
+        assert!(axis.len() <= 500, "{} points", axis.len());
+    }
+
+    /// Past the grid, both Ada backends split into whole measured calls; other
+    /// backends keep the cache's own extrapolation.
+    #[test]
+    fn ada_off_grid_splits_into_measured_calls() {
+        use crate::timing::kernels::engine::OffGrid;
+        let input = SingleGemmKernelInput { m: 20000 };
+        for (backend, dtype) in [
+            ("vllm_marlin_nvfp4", DType::Nvfp4E2m1),
+            ("vllm_cutlass_fp8", DType::Fp8E4m3),
+        ] {
+            let cfg = ada_cfg(backend, 34816, 5120, dtype);
+            let OffGrid::Launches(launches) = SingleGemmSpec::off_grid(&cfg, &input, backend)
+            else {
+                panic!("m past the {backend} grid must split");
+            };
+            let sizes: Vec<u32> = launches.iter().map(|l| l.m).collect();
+            assert_eq!(sizes, [8192, 8192, 3616]);
+        }
+        let torch = ada_cfg("torch", 16384, 5120, DType::Bf16);
+        assert!(matches!(
+            SingleGemmSpec::off_grid(&torch, &input, "torch"),
+            OffGrid::Cache
+        ));
+    }
+
+    #[test]
+    fn ada_backends_forward_the_python_wire_schema() {
+        for (backend, dtype, wire) in [
+            ("vllm_cutlass_fp8", DType::Fp8E4m3, "fp8_e4m3"),
+            ("vllm_marlin_nvfp4", DType::Nvfp4E2m1, "nvfp4_e2m1"),
+        ] {
+            let cfg = ada_cfg(backend, 5120, 6144, dtype);
+            let grid = SingleGemmSpec::sweep_grid(&cfg);
+            let payloads = SingleGemmSpec::enumerate(&cfg, &grid, backend);
+            assert_eq!(payloads.len(), grid.axes()[0].len());
+            let fields = payloads[0].fields();
+            assert_eq!(fields.len(), 5);
+            assert_eq!(fields.get("backend"), Some(&Value::from(backend)));
+            assert_eq!(fields.get("dtype"), Some(&Value::from(wire)));
+            assert_eq!(fields.get("n"), Some(&Value::from(5120_u32)));
+            assert_eq!(fields.get("k"), Some(&Value::from(6144_u32)));
+        }
     }
 }

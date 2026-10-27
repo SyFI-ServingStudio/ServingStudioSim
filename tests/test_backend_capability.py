@@ -79,6 +79,7 @@ def test_supported_backends_filters_options_by_dtype():
     assert supported_backends("single_gemm", DType.FP8_E4M3) == [
         "deepgemm",
         "flashinfer_fp8_tensor",
+        "vllm_cutlass_fp8",
     ]
     # bmm_fp8's SM10x runners: per-tensor FP8 is not offered on Hopper.
     assert "flashinfer_fp8_tensor" not in supported_backends(
