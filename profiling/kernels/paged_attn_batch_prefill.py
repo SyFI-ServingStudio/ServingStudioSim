@@ -17,6 +17,13 @@ The batch is keyed by its ``(cached prefix, new tokens)`` pairs. The kernel
 runs one CTA per 128-token query tile and query head, each reading every key up
 to its tile's last token; which batches the simulator profiles and how it maps
 a real step onto them is its own choice.
+
+``flashinfer_fa2`` is the same prefill call where TRTLLM attention is
+unavailable (sm_8x, e.g. L40S): ``FlashInferImpl.forward`` runs the prefill
+requests through the causal ``BatchPrefillWithPagedKVCacheWrapper`` with a
+BF16 query over the FP8 cache. Its CTAs tile the head-packed query rows (64
+rows, about 11 tokens of a 6-head group) and a merge kernel follows only when
+the plan splits the KV.
 """
 
 from __future__ import annotations
@@ -78,9 +85,9 @@ DOC = KernelDoc(
     ),
     caveats=(
         "Queries, keys and values are random; the quantization scales are 1.",
-        "Pages hold 32 tokens: 16, 32 and 64 measured within 1%, so the page size "
-        "is not part of the key.",
-        "The kernel tiles each request's new tokens by 128 and a partial tile costs "
+        "Pages hold 32 tokens: 16, 32 and 64 measured within 1% on trtllm-gen and "
+        "within 3% on fa2, so the page size is not part of the key.",
+        "trtllm-gen tiles each request's new tokens by 128 and a partial tile costs "
         "a full one, so many short requests cost more than one long request with "
         "the same query-key pairs.",
     ),
@@ -114,6 +121,44 @@ register(
             summary=(
                 "FlashInfer's trtllm_batch_context_with_kv_cache as vLLM's "
                 "FlashInferImpl.forward calls it for the prefill requests."
+            ),
+        ),
+    )
+)
+
+
+# FlashInfer's FA2 batch prefill kernel, which vLLM's native FlashInfer path runs
+# for the prefill requests where TRTLLM attention is unavailable (sm_8x, e.g.
+# L40S). FlashInfer JIT-builds it for sm_80 and newer and converts FP8 KV in
+# software below sm_89 (vec_dtypes.cuh FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED);
+# vLLM keeps the query in the model dtype on fa2-only architectures
+# (flashinfer.py get_q_data_type).
+_FA2_SUPPORT = BackendSupport(
+    compute=frozenset({DType.BF16}),
+    kv=frozenset({DType.FP8_E4M3}),
+    min_compute_capability=(8, 0),
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_fa2",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.paged_attn_batch_fa2",
+            function_name="profile_paged_attn_batch_prefill",
+        ),
+        table_name=KIND,
+        args_schema=PagedAttnBatchPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        supports=_FA2_SUPPORT,
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer's causal BatchPrefillWithPagedKVCacheWrapper on its fa2 "
+                "backend, as vLLM's FlashInferImpl.forward runs it for the prefill "
+                "requests off TRTLLM: a BF16 query over the FP8 cache in 32-token "
+                "pages, plus the split-KV merge when the plan splits."
             ),
         ),
     )

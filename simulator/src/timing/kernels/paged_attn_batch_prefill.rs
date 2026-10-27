@@ -22,11 +22,22 @@
 //! A step whose keys come mostly from one long request beside many short ones
 //! runs longer than the even batch: the long request's tiles all read its whole
 //! prefix while the short ones finish early.
+//!
+//! `flashinfer_fa2` is the same prefill call on a GPU without TRTLLM attention
+//! (sm_8x, e.g. L40S): vLLM's native causal `BatchPrefillWithPagedKVCacheWrapper`,
+//! a BF16 query over the FP8 cache. Its CTAs tile the head-packed query rows by
+//! 64 (about 11 tokens of a 6-head group), so tiles do not quantize a request
+//! the way trtllm-gen's 128-token tiles do: the projection counts tokens (a
+//! one-token tile) and the equivalent prefix is the common prefix that gives
+//! the canonical batch the batch's query-key pairs. The time is near linear in
+//! those pairs; the token axis doubles so the causal (quadratic) part
+//! interpolates within about 11%. A config names backends of one family.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::kernels::fa4_varlen_projection::B200_SMS;
+use crate::timing::kernels::paged_attn_batch_decode::is_fa2;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Coords, Dim, KernelConfig, SweepCoords};
 
@@ -42,6 +53,21 @@ const SEQ_KNOTS: [u32; 10] = [1, 2, 3, 4, 6, 8, 12, 16, 32, 64];
 const PREFIX_KNOTS: [u32; 6] = [0, 512, 2048, 8192, 32768, 131072];
 /// Profiling cap on one batch's KV bytes (the runner's `_MAX_KV_BYTES`).
 const MAX_KV_BYTES: f64 = (32u64 << 30) as f64;
+
+/// fa2 projects tokens, not tiles: a tile of one token.
+const FA2_QUERY_TILE: u64 = 1;
+/// Requests per call. At a fixed equivalent prefix the time falls as the same
+/// tokens split over more requests (each causal triangle shrinks), so the
+/// knots stay within a factor of two up to 32: 8 -> 32 alone over-priced 24
+/// fresh 500-token prompts by 1.5x.
+const FA2_SEQ_KNOTS: [u32; 6] = [1, 2, 4, 8, 16, 32];
+/// New tokens per call, doubling from 64 (where the causal part starts to
+/// matter) to 16384.
+const FA2_TOKEN_KNOTS: [u32; 11] = [1, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384];
+/// Equivalent prefix, to the deployment's 262144-token context.
+const FA2_PREFIX_KNOTS: [u32; 7] = [0, 512, 2048, 8192, 32768, 131072, 262144];
+/// The fa2 runner's `_MAX_KV_BYTES`: one layer's KV beside the model on 48 GB.
+const FA2_MAX_KV_BYTES: f64 = (8u64 << 30) as f64;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PagedAttnBatchPrefillKernelConfig {
@@ -81,6 +107,23 @@ impl PagedAttnBatchPrefillKernelConfig {
         2.0 * f64::from(self.num_kv_heads.get() * self.head_dim.get())
             * f64::from(self.kv_dtype.size_bytes())
     }
+
+    /// Query tokens per projected tile for this config's backend family.
+    fn query_tile(&self) -> u64 {
+        if is_fa2(&self.backends) {
+            FA2_QUERY_TILE
+        } else {
+            QUERY_TILE
+        }
+    }
+
+    fn max_kv_bytes(&self) -> f64 {
+        if is_fa2(&self.backends) {
+            FA2_MAX_KV_BYTES
+        } else {
+            MAX_KV_BYTES
+        }
+    }
 }
 
 /// The prefill requests of one step.
@@ -90,15 +133,16 @@ pub struct PagedAttnBatchPrefillKernelInput {
     pub requests: Vec<(u32, u32)>,
 }
 
-fn tiles_of(new: u32) -> u64 {
-    u64::from(new).div_ceil(QUERY_TILE)
+fn tiles_of(new: u32, tile: u64) -> u64 {
+    u64::from(new).div_ceil(tile)
 }
 
 /// Σ over a request's tiles of the keys each reads (prefix + last position).
-fn tile_keys(prefix: u32, new: u32) -> u64 {
-    let tiles = tiles_of(new);
+/// With a one-token tile this is the request's query-key pairs.
+fn tile_keys(prefix: u32, new: u32, tile: u64) -> u64 {
+    let tiles = tiles_of(new, tile);
     let full = tiles.saturating_sub(1);
-    tiles * u64::from(prefix) + QUERY_TILE * full * (full + 1) / 2 + u64::from(new)
+    tiles * u64::from(prefix) + tile * full * (full + 1) / 2 + u64::from(new)
 }
 
 /// Tiles per request of the canonical batch: `tiles` split evenly over
@@ -108,24 +152,29 @@ fn canonical_tiles(seqs: u64, tiles: u64) -> impl Iterator<Item = u64> {
     (0..seqs).map(move |i| base + u64::from(i < extra))
 }
 
+/// `(num_seqs, query_tiles, equivalent_prefix)` of a batch for `tile`-token tiles.
+fn project(requests: &[(u32, u32)], tile: u64) -> Coords {
+    let seqs = requests.len() as u64;
+    let tiles: u64 = requests.iter().map(|&(_, new)| tiles_of(new, tile)).sum();
+    if seqs == 0 || tiles == 0 {
+        return Coords::new([seqs as f64, tiles as f64, 0.0]);
+    }
+    let keys: u64 = requests
+        .iter()
+        .map(|&(p, new)| tile_keys(p, new, tile))
+        .sum();
+    // The canonical batch's tile keys with no prefix.
+    let own: u64 = canonical_tiles(seqs, tiles)
+        .map(|t| tile * t * (t + 1) / 2)
+        .sum();
+    let prefix = keys.saturating_sub(own) as f64 / tiles as f64;
+    Coords::new([seqs as f64, tiles as f64, prefix])
+}
+
 impl SweepCoords for PagedAttnBatchPrefillKernelInput {
+    /// The trtllm-gen projection; `cache_coords` picks the config's own.
     fn coords(&self) -> Coords {
-        let seqs = self.requests.len() as u64;
-        let tiles: u64 = self.requests.iter().map(|&(_, new)| tiles_of(new)).sum();
-        if seqs == 0 || tiles == 0 {
-            return Coords::new([seqs as f64, tiles as f64, 0.0]);
-        }
-        let keys: u64 = self
-            .requests
-            .iter()
-            .map(|&(p, new)| tile_keys(p, new))
-            .sum();
-        // The canonical batch's tile keys with no prefix.
-        let own: u64 = canonical_tiles(seqs, tiles)
-            .map(|t| QUERY_TILE * t * (t + 1) / 2)
-            .sum();
-        let prefix = keys.saturating_sub(own) as f64 / tiles as f64;
-        Coords::new([seqs as f64, tiles as f64, prefix])
+        project(&self.requests, QUERY_TILE)
     }
     fn coord_field_names() -> &'static [&'static str] {
         &["num_seqs", "query_tiles", "equivalent_prefix"]
@@ -133,9 +182,9 @@ impl SweepCoords for PagedAttnBatchPrefillKernelInput {
 }
 
 /// The canonical batch at a cell, as `(prefix, new tokens)` per request.
-fn canonical(seqs: f64, tiles: f64, prefix: f64) -> Vec<(u32, u32)> {
+fn canonical(seqs: f64, tiles: f64, prefix: f64, tile: u64) -> Vec<(u32, u32)> {
     canonical_tiles(seqs as u64, tiles as u64)
-        .map(|t| (prefix as u32, (t * QUERY_TILE) as u32))
+        .map(|t| (prefix as u32, (t * tile) as u32))
         .collect()
 }
 
@@ -152,11 +201,22 @@ impl KernelSpec for PagedAttnBatchPrefillSpec {
             config.num_qo_heads.get() % config.num_kv_heads.get() == 0,
             "num_qo_heads must be a multiple of num_kv_heads"
         );
+        if is_fa2(&config.backends) {
+            return SweepGrid::new(vec![
+                Axis::values(FA2_SEQ_KNOTS),
+                Axis::values(FA2_TOKEN_KNOTS),
+                Axis::values(FA2_PREFIX_KNOTS),
+            ]);
+        }
         SweepGrid::new(vec![
             Axis::values(SEQ_KNOTS),
             config.tile_axis(),
             Axis::values(PREFIX_KNOTS),
         ])
+    }
+
+    fn cache_coords(config: &Self::Config, input: &Self::Input) -> Coords {
+        project(&input.requests, config.query_tile())
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -166,10 +226,11 @@ impl KernelSpec for PagedAttnBatchPrefillSpec {
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         // The cap bounds the KV pool; a request count past the tiles is not
         // masked but holds the one-tile batch (see `enumerate`).
-        let per_token = config.kv_bytes_per_token();
+        let (per_token, cap) = (config.kv_bytes_per_token(), config.max_kv_bytes());
+        let tile = config.query_tile() as f64;
         grid.expand_3d(|seqs, tiles, prefix| {
-            let tokens = seqs.min(tiles) * prefix + tiles * QUERY_TILE as f64;
-            tokens * per_token > MAX_KV_BYTES
+            let tokens = seqs.min(tiles) * prefix + tiles * tile;
+            tokens * per_token > cap
         })
     }
 
@@ -184,7 +245,7 @@ impl KernelSpec for PagedAttnBatchPrefillSpec {
             // Masking it instead would leave a batch of short prompts, which
             // sits on the `seqs == tiles` edge, between a real and a dropped
             // corner.
-            let requests = canonical(seqs.min(tiles), tiles, prefix);
+            let requests = canonical(seqs.min(tiles), tiles, prefix, config.query_tile());
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("num_qo_heads", config.num_qo_heads.get())
@@ -231,8 +292,8 @@ mod tests {
         // Defect caught: a partial tile dropped, or a tile priced by its filled
         // rows instead of the keys up to its last token. 300 new tokens after
         // 1000 cached: tiles end at 128, 256 and 300.
-        assert_eq!(tile_keys(1000, 300), 3 * 1000 + 128 + 256 + 300);
-        assert_eq!(tile_keys(0, 16), 16);
+        assert_eq!(tile_keys(1000, 300, QUERY_TILE), 3 * 1000 + 128 + 256 + 300);
+        assert_eq!(tile_keys(0, 16, QUERY_TILE), 16);
     }
 
     #[test]
@@ -244,7 +305,7 @@ mod tests {
         let cells = grid.expand_3d(|n, t, p| (n, t, p));
         for ((seqs, tiles, prefix), masked) in cells.into_iter().zip(mask) {
             if !masked && seqs <= tiles {
-                let got = coords(&canonical(seqs, tiles, prefix));
+                let got = coords(&canonical(seqs, tiles, prefix, QUERY_TILE));
                 assert_eq!(
                     got,
                     vec![seqs, tiles, prefix],
@@ -323,6 +384,62 @@ mod tests {
             payloads[index].fields().get("requests"),
             Some(&serde_json::json!(vec![[512, 128]; 7]))
         );
+    }
+
+    fn fa2_config() -> PagedAttnBatchPrefillKernelConfig {
+        PagedAttnBatchPrefillKernelConfig {
+            backends: vec!["flashinfer_fa2"],
+            gpu_name: "NVIDIA L40S".to_string(),
+            q_dtype: DType::Bf16,
+            ..config()
+        }
+    }
+
+    fn fa2_coords(requests: &[(u32, u32)]) -> Vec<f64> {
+        let input = PagedAttnBatchPrefillKernelInput {
+            requests: requests.to_vec(),
+        };
+        PagedAttnBatchPrefillSpec::cache_coords(&fa2_config(), &input).to_vec()
+    }
+
+    #[test]
+    fn fa2_projects_tokens_and_their_query_key_pairs() {
+        // Defect caught: the fa2 call quantized by trtllm-gen's 128-token tile,
+        // which prices a 16-token chunk as 128 tokens. 16 tokens after 1000
+        // cached read 16 * 1000 + 136 keys: the canonical one-request batch
+        // with the same prefix.
+        assert_eq!(fa2_coords(&[(1000, 16)]), vec![1.0, 16.0, 1000.0]);
+        // Two requests keep their pairs: 2 * 3488 tokens of the canonical
+        // batch, the rest spread as a common prefix.
+        let got = fa2_coords(&[(0, 6272), (15680, 704)]);
+        let keys = 6272.0 * 6273.0 / 2.0 + 704.0 * 15680.0 + 704.0 * 705.0 / 2.0;
+        let own = 2.0 * 3488.0 * 3489.0 / 2.0;
+        assert_eq!(&got[..2], &[2.0, 6976.0]);
+        assert!((got[2] - (keys - own) / 6976.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fa2_grid_rows_land_on_their_cells_within_the_ceiling() {
+        // Defect caught: fa2 rows built from 128-token tiles (off their cell),
+        // a grid short of the deployment's 8192-token chunk and 262144-token
+        // prefix, or past the 500-cell ceiling.
+        let cfg = fa2_config();
+        let grid = PagedAttnBatchPrefillSpec::sweep_grid(&cfg);
+        let axes = grid.axes();
+        assert!(axes[1].contains(&8192.0) && axes[2].last() == Some(&262144.0));
+        let mask = PagedAttnBatchPrefillSpec::infeasible_mask(&cfg, &grid);
+        assert!(mask.iter().filter(|&&m| !m).count() <= 500);
+        let payloads = PagedAttnBatchPrefillSpec::enumerate(&cfg, &grid, "flashinfer_fa2");
+        let cells = grid.expand_3d(|n, t, p| (n, t, p));
+        for ((payload, (seqs, tokens, prefix)), masked) in payloads.iter().zip(cells).zip(mask) {
+            if masked || seqs > tokens {
+                continue;
+            }
+            let requests: Vec<(u32, u32)> =
+                serde_json::from_value(payload.fields()["requests"].clone()).unwrap();
+            assert_eq!(requests.iter().map(|r| r.1).sum::<u32>(), tokens as u32);
+            assert_eq!(fa2_coords(&requests), vec![seqs, tokens, prefix]);
+        }
     }
 
     #[test]

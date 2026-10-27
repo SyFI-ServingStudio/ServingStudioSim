@@ -42,8 +42,10 @@ import cache_fidelity as cf  # the generic core (sibling file)
 
 DECODE = "paged_attn_batch_decode"
 PREFILL = "paged_attn_batch_prefill"
-# The runners' cap on one batch's KV bytes.
+# The runners' cap on one batch's KV bytes (flashinfer_fa2 runs on 48 GB cards).
 MAX_KV_BYTES = 32 << 30
+FA2_MAX_KV_BYTES = 8 << 30
+FA2 = "flashinfer_fa2"
 
 # Off-grid knots, each between two grid knots of its axis.
 DECODE_BATCHES = (3, 11, 15, 21, 28, 45, 80, 150, 220)
@@ -52,6 +54,18 @@ DECODE_FILLS = (0.1, 0.7)
 PREFILL_SEQS = (1, 2, 5, 10, 24)
 PREFILL_TOKENS = (100, 700, 1300, 2500, 5000, 7000)
 PREFILL_PREFIXES = (0, 1000, 5000, 20000, 60000, 110000)
+# fa2's grids reach the 262144-token context and a 16384-token call.
+FA2_DECODE_CONTEXTS = DECODE_CONTEXTS + (200000,)
+FA2_PREFILL_TOKENS = PREFILL_TOKENS + (12000,)
+FA2_PREFILL_PREFIXES = PREFILL_PREFIXES + (200000,)
+
+
+def _fa2(cfg: dict) -> bool:
+    return FA2 in cfg["backends"]
+
+
+def _max_kv_bytes(cfg: dict) -> int:
+    return FA2_MAX_KV_BYTES if _fa2(cfg) else MAX_KV_BYTES
 
 
 def _kv_bytes_per_token(cfg: dict) -> int:
@@ -74,10 +88,10 @@ def _canonical_appends(seqs: int, tokens: int) -> list[int]:
 def decode_probes(cfg: dict) -> list[dict]:
     out = []
     for batch in DECODE_BATCHES:
-        for context in DECODE_CONTEXTS:
+        for context in FA2_DECODE_CONTEXTS if _fa2(cfg) else DECODE_CONTEXTS:
             for fill in DECODE_FILLS if batch > 1 else (0.0,):
                 total = context + round(fill * (batch - 1) * context)
-                if total * _kv_bytes_per_token(cfg) > MAX_KV_BYTES:
+                if total * _kv_bytes_per_token(cfg) > _max_kv_bytes(cfg):
                     continue
                 spec = {"batch_size": batch, "max_kv_len": context, "total_kv_len": total}
                 out.append({"spec": spec, "input": spec, "region": "decode_offgrid"})
@@ -89,11 +103,11 @@ def prefill_probes(cfg: dict) -> list[dict]:
     # Every other (tokens, prefix) pair per request count keeps the set small
     # while covering each knot interval.
     for i, seqs in enumerate(PREFILL_SEQS):
-        for j, tokens in enumerate(PREFILL_TOKENS):
-            for k, prefix in enumerate(PREFILL_PREFIXES):
+        for j, tokens in enumerate(FA2_PREFILL_TOKENS if _fa2(cfg) else PREFILL_TOKENS):
+            for k, prefix in enumerate(FA2_PREFILL_PREFIXES if _fa2(cfg) else PREFILL_PREFIXES):
                 if (i + j + k) % 2 or seqs > tokens:
                     continue
-                if (seqs * prefix + tokens) * _kv_bytes_per_token(cfg) > MAX_KV_BYTES:
+                if (seqs * prefix + tokens) * _kv_bytes_per_token(cfg) > _max_kv_bytes(cfg):
                     continue
                 appends = _canonical_appends(seqs, tokens)
                 point = _prefill_input([prefix] * seqs, appends)

@@ -20,6 +20,16 @@
 //! total_kv_len)`. The batch axis holds every batch
 //! where the split count steps and the edge of one CTA wave, so a step between
 //! knots is never smeared.
+//!
+//! `flashinfer_fa2` is the same decode call on a GPU without TRTLLM attention
+//! (sm_8x, e.g. L40S): vLLM's native `BatchDecodeWithPagedKVCacheWrapper` with
+//! tensor cores, i.e. FlashInfer's batch prefill kernel with a 16-row query tile
+//! plus `PersistentVariableLengthMergeStatesKernel`, a BF16 query over the FP8
+//! cache. Its planner (`PrefillSplitQOKVIndptr`, FlashInfer `scheduler.cuh`)
+//! splits the KV so that at most `2 * SMs / kv_heads` (request, chunk) items run
+//! per KV head; past that batch every request is one chunk. Its batch axis is
+//! generic plus both sides of that edge, and its context axis reaches 262144.
+//! A config names backends of one family: the two grids differ.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -37,6 +47,41 @@ const CONTEXT_KNOTS: [u32; 8] = [1, 256, 1024, 4096, 16384, 32768, 65536, 131072
 const FILL_KNOTS: [f64; 4] = [0.0, 0.25, 0.5, 1.0];
 /// Profiling cap on one batch's KV bytes (the runner's `_MAX_KV_BYTES`).
 const MAX_KV_BYTES: f64 = (32u64 << 30) as f64;
+
+/// vLLM's native FlashInfer decode on GPUs without TRTLLM attention.
+pub(crate) const FA2_BACKEND: &str = "flashinfer_fa2";
+/// fa2 batch knots: generic, plus both sides of the planner's split edge.
+const FA2_BATCH_KNOTS: [u32; 15] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 256];
+/// fa2 longest-context knots, up to the deployment's 262144-token context.
+const FA2_CONTEXT_KNOTS: [u32; 9] = [1, 256, 1024, 4096, 16384, 32768, 65536, 131072, 262144];
+/// The fa2 time is linear in the batch's KV bytes between these.
+const FA2_FILL_KNOTS: [f64; 3] = [0.0, 0.5, 1.0];
+/// The fa2 runner's `_MAX_KV_BYTES`: one layer's KV beside the model on 48 GB.
+const FA2_MAX_KV_BYTES: f64 = (8u64 << 30) as f64;
+/// CTAs per SM FlashInfer's prefill planner budgets for split KV (`PrefillPlan`).
+const FA2_CTAS_PER_SM: u32 = 2;
+
+/// SMs of the GPUs the fa2 path is profiled on; the split edge follows them.
+pub(crate) fn fa2_sms(gpu_name: &str) -> u32 {
+    match gpu_name {
+        "NVIDIA L40S" | "NVIDIA L40" => 142,
+        "NVIDIA A100" | "NVIDIA A100-SXM4-80GB" | "NVIDIA A100 80GB PCIe" => 108,
+        "NVIDIA A10" | "NVIDIA A10G" => 72,
+        "NVIDIA RTX 6000 Ada Generation" => 142,
+        _ => 132,
+    }
+}
+
+/// Whether a config's backends are the fa2 family. A config never mixes the
+/// two families: their grids differ.
+pub(crate) fn is_fa2(backends: &[&'static str]) -> bool {
+    let fa2 = backends.iter().filter(|&&b| b == FA2_BACKEND).count();
+    assert!(
+        fa2 == 0 || fa2 == backends.len(),
+        "flashinfer_fa2 cannot share a config with {backends:?}: their grids differ"
+    );
+    fa2 > 0
+}
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PagedAttnBatchDecodeKernelConfig {
@@ -82,6 +127,26 @@ impl PagedAttnBatchDecodeKernelConfig {
         knots.sort_unstable();
         knots.dedup();
         Axis::values(knots)
+    }
+
+    /// fa2 batch knots: the generic set plus both sides of the batch past which
+    /// the planner no longer splits a request (`2 * SMs / kv_heads` items).
+    fn fa2_batch_axis(&self) -> Vec<f64> {
+        let edge = FA2_CTAS_PER_SM * fa2_sms(&self.gpu_name) / self.num_kv_heads.get();
+        let mut knots: Vec<u32> = FA2_BATCH_KNOTS.to_vec();
+        knots.extend([edge.max(1), edge + 1]);
+        knots.retain(|&batch| batch <= *FA2_BATCH_KNOTS.last().unwrap());
+        knots.sort_unstable();
+        knots.dedup();
+        Axis::values(knots)
+    }
+
+    fn max_kv_bytes(&self) -> f64 {
+        if is_fa2(&self.backends) {
+            FA2_MAX_KV_BYTES
+        } else {
+            MAX_KV_BYTES
+        }
     }
 }
 
@@ -146,6 +211,13 @@ impl KernelSpec for PagedAttnBatchDecodeSpec {
             config.num_qo_heads.get() % config.num_kv_heads.get() == 0,
             "num_qo_heads must be a multiple of num_kv_heads"
         );
+        if is_fa2(&config.backends) {
+            return SweepGrid::new(vec![
+                config.fa2_batch_axis(),
+                Axis::values(FA2_CONTEXT_KNOTS),
+                FA2_FILL_KNOTS.to_vec(),
+            ]);
+        }
         SweepGrid::new(vec![
             config.batch_axis(),
             Axis::values(CONTEXT_KNOTS),
@@ -158,9 +230,9 @@ impl KernelSpec for PagedAttnBatchDecodeSpec {
     }
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
-        let per_token = config.kv_bytes_per_token();
+        let (per_token, cap) = (config.kv_bytes_per_token(), config.max_kv_bytes());
         grid.expand_3d(|batch, max_kv_len, fill| {
-            total_kv_len(batch, max_kv_len, fill) as f64 * per_token > MAX_KV_BYTES
+            total_kv_len(batch, max_kv_len, fill) as f64 * per_token > cap
         })
     }
 
@@ -307,6 +379,52 @@ mod tests {
         assert_eq!(fields.len(), 10);
         assert_eq!(fields.get("q_dtype"), Some(&Value::from("fp8_e4m3")));
         assert_eq!(fields.get("o_dtype"), Some(&Value::from("bf16")));
+    }
+
+    /// The L40S deployment: 24 query / 4 KV heads of dim 256, BF16 query over
+    /// an FP8 cache.
+    fn fa2_config() -> PagedAttnBatchDecodeKernelConfig {
+        PagedAttnBatchDecodeKernelConfig {
+            backends: vec![FA2_BACKEND],
+            gpu_name: "NVIDIA L40S".to_string(),
+            q_dtype: DType::Bf16,
+            ..config()
+        }
+    }
+
+    #[test]
+    fn fa2_grid_spans_the_deployment_and_brackets_the_split_edge() {
+        // Defect caught: the fa2 rows laid on the B200 trtllm-gen split knots,
+        // a context axis short of the 262144-token deployment, or a grid past
+        // the 500-cell ceiling. On L40S the planner stops splitting past
+        // 2 * 142 / 4 = 71 decode requests.
+        let cfg = fa2_config();
+        let grid = PagedAttnBatchDecodeSpec::sweep_grid(&cfg);
+        let axes = grid.axes();
+        for batch in [1.0, 16.0, 71.0, 72.0, 256.0] {
+            assert!(
+                axes[0].contains(&batch),
+                "batch axis {:?} misses {batch}",
+                axes[0]
+            );
+        }
+        assert_eq!(axes[1].last(), Some(&262144.0));
+        let mask = PagedAttnBatchDecodeSpec::infeasible_mask(&cfg, &grid);
+        let feasible = mask.iter().filter(|&&m| !m).count();
+        assert!(feasible <= 500, "{feasible} feasible cells");
+        // 16 requests at the full context fit the 8 GiB cap; 24 do not.
+        let cells = grid.expand_3d(|b, l, f| (b, l, f));
+        let at = |b: f64, l: f64, f: f64| mask[cells.iter().position(|&c| c == (b, l, f)).unwrap()];
+        assert!(!at(16.0, 262144.0, 1.0) && at(24.0, 262144.0, 1.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot share a config")]
+    fn fa2_and_trtllm_gen_never_share_one_grid() {
+        // Defect caught: one config caching both families on one family's grid.
+        let mut cfg = fa2_config();
+        cfg.backends = vec![FA2_BACKEND, "flashinfer_trtllm_gen"];
+        PagedAttnBatchDecodeSpec::sweep_grid(&cfg);
     }
 
     #[test]

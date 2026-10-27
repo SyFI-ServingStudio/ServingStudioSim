@@ -139,3 +139,89 @@ def test_prefill_check_places_rows_after_the_prefix():
     work.out[shape.appends[0] + 1] = 0
     with pytest.raises(KernelLaunchFailed):
         runner.check_prefill(torch, shape, work)
+
+
+# --- flashinfer_fa2 (vLLM's native FlashInfer path off TRTLLM, e.g. L40S) ---
+
+from profiling.runners.attention import paged_attn_batch_fa2 as fa2  # noqa: E402
+
+_FA2_GEOMETRY = dict(_GEOMETRY, q_dtype="bf16")
+
+
+def test_fa2_backend_runs_bf16_queries_over_fp8_kv_on_sm80_and_newer():
+    # Defect caught: the fa2 rows gated to the trtllm-gen dtypes/architecture,
+    # or run outside the env that pins vLLM's FlashInfer.
+    for kind in ("paged_attn_batch_decode", "paged_attn_batch_prefill"):
+        spec = find_kernel_profiler_spec(kind, "flashinfer_fa2")
+        assert spec.subprocess_env == "vllm_env"
+        assert spec.runner_ref.module_name == "profiling.runners.attention.paged_attn_batch_fa2"
+        assert spec.supports.allows("bf16", "fp8_e4m3", gpu="NVIDIA L40S")
+        assert not spec.supports.allows("fp8_e4m3", "fp8_e4m3")
+
+
+def test_fa2_validation_rejects_the_fp8_query_vllm_never_sends_it():
+    with pytest.raises(ProfilerNotImplemented):
+        fa2.validate_decode_args(**_GEOMETRY, batch_size=2, max_kv_len=10, total_kv_len=12)
+    with pytest.raises(ProfilerNotImplemented):
+        fa2.validate_prefill_args(**_GEOMETRY, requests=((0, 4),))
+    shape = fa2.validate_decode_args(
+        **_FA2_GEOMETRY, batch_size=4, max_kv_len=100, total_kv_len=250
+    )
+    assert shape.lengths == [100, 50, 50, 50]
+
+
+def test_fa2_page_table_keeps_each_cache_block_whole():
+    # Defect caught: kernel pages scattered one by one, unlike vLLM's view of a
+    # 1568-token block as 49 consecutive 32-token pages, or a last-page length
+    # / indptr that disagrees with the request lengths.
+    generator = torch.Generator().manual_seed(1)
+    lengths = [1, 32, 33, 49 * 32 + 5]
+    table = fa2.page_table(torch, lengths, generator)
+    assert table.page_counts == [1, 1, 2, 50]
+    assert table.indptr.tolist() == [0, 1, 2, 4, 54]
+    assert table.last_page_len.tolist() == [1, 32, 1, 5]
+    pages = table.indices.tolist()
+    assert min(pages) >= fa2._BLOCK_PAGES  # block 0 is the null block
+    long_request = pages[4:]
+    assert long_request[:49] == list(range(long_request[0], long_request[0] + 49))
+    assert long_request[0] % 49 == 0 and long_request[49] % 49 == 0
+    assert len(set(pages)) == len(pages) and max(pages) < table.num_pages
+
+
+def _fa2_reference_out(work, lengths, positions_per_request, row_starts, dim):
+    """Fill ``work.out`` from a direct read of the NHD cache through the CSR table."""
+    page = fa2._PAGE_SIZE
+    indptr = work.table.indptr.tolist()
+    for request, (positions, start) in enumerate(zip(positions_per_request, row_starts)):
+        context = lengths[request]
+        own = work.table.indices[indptr[request] : indptr[request + 1]].long()
+        pages = own[torch.arange(context) // page]
+        offsets = torch.arange(context) % page
+        keys = work.raw_cache[pages, offsets, :, :dim].float()
+        values = work.raw_cache[pages, offsets, :, dim:].float()
+        rows = torch.arange(start, start + len(positions))
+        out = varlen_attention_reference(
+            work.q[rows].float(),
+            torch.tensor(positions),
+            keys,
+            values,
+            softmax_scale=dim**-0.5,
+            window=0,
+        )
+        work.out[rows] = out.to(work.out.dtype)
+
+
+def test_fa2_checks_read_the_nhd_cache_after_each_prefix():
+    # Defect caught: the check reading the packed NHD cache as HND, the wrong
+    # half for V, or query rows placed without their request's prefix.
+    shape = fa2.validate_prefill_args(**_FA2_GEOMETRY, requests=((70, 5), (2, 4)))
+    work = fa2._build_workload(
+        torch, shape.geometry, shape.lengths, shape.query_tokens, torch.device("cpu")
+    )
+    positions = [list(range(p, p + a)) for p, a in shape.requests]
+    _fa2_reference_out(work, shape.lengths, positions, [0, shape.appends[0]], 64)
+    report = fa2.check_prefill(torch, shape, work)
+    assert report["rows_checked"] == 9 and report["max_rel_l2"] < 0.01
+    work.out[shape.appends[0] + 1] = work.out[shape.appends[0] + 1].flip(-1)
+    with pytest.raises(KernelLaunchFailed):
+        fa2.check_prefill(torch, shape, work)
