@@ -15,6 +15,9 @@ main attention kernel and ``PersistentVariableLengthMergeStatesKernel``. The
 profiler does not need to replay a captured graph: CUPTI sums the same two GPU
 kernels, and direct launch avoids folding graph-launch mechanics into L1 time.
 
+``sgl_fa3`` is not FlashInfer: it times SGLang's ``attention_backend=fa3`` decode
+call, sgl-kernel's vendored FlashAttention-3 (``_run_sgl_fa3_decode``).
+
 Cache identity is ``(batch_size, total_tokens)`` — batch is a real axis, and
 ``total_tokens`` is the total kv across the batch (so a flat cap keeps every
 grid corner feasible). The runner derives the per-request mean length
@@ -30,12 +33,20 @@ this module is only loaded inside the profiling worker subprocess via
 
 from __future__ import annotations
 
+import importlib.metadata
+
 from profiling.db.args import DType
 from profiling.runners.attention import _common
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _PAGE_SIZE = 16
+# SGLang's server default is page_size=1, and the slime deployment this backend
+# prices runs it. Page size is the framework's KV-pool geometry, not a free
+# knob, so each backend is measured at the one its own framework uses: the
+# sgl_fa3 row against fa2 compares two deployments, not two kernels at matched
+# inputs -- which is what the simulator needs.
+_SGL_PAGE_SIZE = 1
 
 
 def _run_cudnn_decode(
@@ -85,6 +96,97 @@ def _run_cudnn_decode(
     return _common.measure(benchmark_fn, flops=flops, bytes_accessed=bytes_accessed)
 
 
+def _run_sgl_fa3_decode(
+    *,
+    batch_size: int,
+    seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    q_dtype: DType | str,
+    kv_dtype: DType | str,
+    o_dtype: DType | str,
+) -> ComputeMetrics:
+    """SGLang's FA3 decode: ``sgl_kernel.flash_attn.flash_attn_with_kvcache``.
+
+    Not FlashInfer's ``backend="fa3"``. SGLang's ``attention_backend=fa3``
+    selects ``FlashAttentionBackend``, whose ``forward_decode`` calls sgl-kernel's
+    own vendored FlashAttention-3. The arguments mirror that call site's plain
+    (non-MLA, non-SWA, non-cascade, non-spec-decode) path: a varlen query with
+    one token per request, a dense ``page_table`` and ``causal=True`` -- a no-op
+    for one query token, but what production passes, so the kernel picks the
+    same tile schedule.
+
+    ``scheduler_metadata`` stays ``None``: sgl-kernel 0.3.17 accepts the argument
+    but exposes no ``get_scheduler_metadata`` to build it, matching the SGLang
+    release that does no precompute.
+    """
+    import torch
+
+    if any(_common.is_fp8(d) for d in (q_dtype, kv_dtype, o_dtype)):
+        # fp8 KV needs k_descale/v_descale this runner does not build; refuse
+        # rather than silently measure an unscaled kernel.
+        raise ProfilerNotImplemented("sgl_fa3 decode runner supports bf16 only")
+
+    try:
+        from sgl_kernel.flash_attn import flash_attn_with_kvcache
+    except ImportError as exc:
+        raise ProfilerNotImplemented(
+            "sgl-kernel is required for the sgl_fa3 backend (run under sgl_kernel_env)"
+        ) from exc
+
+    inp = _common.build_paged_decode_inputs(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        o_dtype=o_dtype,
+        page_size=_SGL_PAGE_SIZE,
+    )
+    # The same contiguous per-request page runs the FlashInfer rows use,
+    # reshaped from CSR indices into the dense (batch, pages) table FA3 takes.
+    page_table = inp.kv_indices.view(batch_size, -1)
+    cache_seqlens = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+
+    def benchmark_fn():
+        return flash_attn_with_kvcache(
+            q=inp.q,
+            k_cache=inp.k_cache,
+            v_cache=inp.v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=1,
+            softmax_scale=head_dim**-0.5,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=0.0,
+            scheduler_metadata=None,
+            num_splits=0,
+            ver=3,
+        )
+
+    # FA3's first call resolves its split heuristic and lazy op registration.
+    # Settle that before CUPTI learns the steady-state launch pattern, as the
+    # FlashInfer fa3 path does.
+    benchmark_fn()
+    torch.cuda.synchronize()
+
+    flops = _common.attention_flops(
+        q_len=1,
+        kv_len=seq_len,
+        num_qo_heads=num_qo_heads,
+        head_dim=head_dim,
+        causal=False,
+        batch_size=batch_size,
+    )
+    return _common.measure(benchmark_fn, flops=flops, bytes_accessed=inp.bytes_accessed)
+
+
 def _run_decode(
     *,
     backend: str,
@@ -111,6 +213,18 @@ def _run_decode(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for attention runners") from exc
+
+    if backend == "sgl_fa3":
+        return _run_sgl_fa3_decode(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            o_dtype=o_dtype,
+        )
 
     if backend == "cudnn":
         return _run_cudnn_decode(
@@ -234,3 +348,23 @@ def profile_flashinfer_attn_decode_fa3(**kwargs) -> ComputeMetrics:
 
 def profile_flashinfer_attn_decode_cudnn(**kwargs) -> ComputeMetrics:
     return _run_decode(backend="cudnn", **kwargs)
+
+
+def profile_flashinfer_attn_decode_sgl_fa3(**kwargs) -> ComputeMetrics:
+    """Profile SGLang's decode attention (sgl-kernel FA3, not FlashInfer's)."""
+
+    return _run_decode(backend="sgl_fa3", **kwargs)
+
+
+def sgl_fa3_row_provenance(**_kwargs) -> str | None:
+    """The sgl-kernel and Torch builds an sgl_fa3 row was measured with.
+
+    The backend name maps to no installed distribution, and sgl-kernel's
+    extension is ABI-bound to one Torch, so both versions identify the row.
+    """
+    try:
+        sgl_kernel = importlib.metadata.version("sgl-kernel")
+        torch = importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    return f"sgl-kernel {sgl_kernel} / torch {torch}"

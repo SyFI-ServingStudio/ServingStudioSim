@@ -1582,6 +1582,7 @@ def test_documented_profile_env_registry_complete():
         "default_env",
         "flashinfer_pip_env",
         "flashinfer_kda_env",
+        "sgl_kernel_env",
         "sglang_env",
         "vllm_env",
     }

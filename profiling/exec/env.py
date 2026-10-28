@@ -152,6 +152,16 @@ ENV_REGISTRY: dict[str, ProfileEnv] = {
         _profile_env_python("flashinfer_kda"),
         isolated_site_packages=True,
     ),
+    # sgl-kernel 0.3.17 for the flashinfer_attn_decode `sgl_fa3` backend. Its
+    # prebuilt extension is ABI-bound to Torch 2.8, which neither the project
+    # venv nor `sglang_env` holds, and the kernel is called directly, so the env
+    # is those two packages rather than the serving framework.
+    # Setup: profiling/README.md "sgl_kernel_env".
+    "sgl_kernel_env": ProfileEnv(
+        "sgl_kernel_env",
+        _profile_env_python("sgl_kernel"),
+        isolated_site_packages=True,
+    ),
     # SGLang's CUDA extensions are built against the checkout-local Torch and
     # FlashInfer stack. Keep the interpreter and source tree from the same
     # checkout so profiling cannot silently import a globally installed build.

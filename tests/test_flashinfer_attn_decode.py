@@ -273,3 +273,112 @@ def test_fa2_cudagraph_keeps_exactly_its_existing_warmup(monkeypatch):
         "synchronize",
         "measure",
     ]
+
+
+# --- sgl_fa3: SGLang's decode attention (sgl-kernel FA3) ----------------------
+
+
+def test_sgl_fa3_runs_in_its_own_env_and_only_on_hopper_bf16():
+    # A row measured under the project Torch would not import sgl-kernel at all,
+    # and a Blackwell or fp8 row would time a kernel SGLang's fa3 decode never runs.
+    spec = find_kernel_profiler_spec(KIND, "sgl_fa3")
+    assert spec.args_schema is FlashinferAttnDecodeArgs
+    assert spec.subprocess_env == "sgl_kernel_env"
+    assert spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA H200")
+    assert not spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA B200")
+    assert not spec.supports.allows(DType.BF16, DType.FP8_E4M3, gpu="NVIDIA H200")
+    # FlashInfer backends keep the project stack.
+    assert find_kernel_profiler_spec(KIND, "fa2").subprocess_env == "flashinfer_pip_env"
+
+
+def test_sgl_fa3_rows_record_the_sgl_kernel_and_torch_builds(monkeypatch):
+    # The backend name maps to no distribution, so without this note the rows
+    # would carry no backend_version, and sgl-kernel is ABI-bound to its Torch.
+    import importlib.metadata
+
+    versions = {"sgl-kernel": "0.3.17", "torch": "2.8.0+cu128"}
+    monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
+    provenance = find_kernel_profiler_spec(KIND, "sgl_fa3").load_row_provenance()
+    assert provenance(**_decode_args()) == "sgl-kernel 0.3.17 / torch 2.8.0+cu128"
+
+
+def test_sgl_fa3_refuses_fp8_instead_of_timing_an_unscaled_kernel(monkeypatch):
+    from profiling.runners.attention import flashinfer_decode as runner
+    from profiling.runners.exceptions import ProfilerNotImplemented
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    with pytest.raises(ProfilerNotImplemented, match="bf16 only"):
+        runner.profile_flashinfer_attn_decode_sgl_fa3(**(_decode_args() | {"kv_dtype": "fp8_e4m3"}))
+
+
+def test_sgl_fa3_calls_forward_decode_shape_with_one_token_pages(monkeypatch):
+    # The timed call must be SGLang's forward_decode call: 1-token pages in a
+    # dense (batch, pages) table, one query token per request, causal=True,
+    # ver=3, no scheduler metadata -- not FlashInfer and not a 16-token page.
+    from profiling.runners.attention import _common
+    from profiling.runners.attention import flashinfer_decode as runner
+
+    events = []
+
+    class Indices:
+        def view(self, *shape):
+            events.append(("page_table", shape))
+            return "page_table"
+
+    torch = SimpleNamespace(
+        int32="int32",
+        full=lambda shape, value, **kw: ("full", shape, value),
+        arange=lambda n, **kw: ("arange", n),
+        cuda=SimpleNamespace(synchronize=lambda: events.append(("synchronize",))),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+    def flash_attn_with_kvcache(**kwargs):
+        events.append(("call", kwargs))
+
+    monkeypatch.setitem(sys.modules, "sgl_kernel", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "sgl_kernel.flash_attn",
+        SimpleNamespace(flash_attn_with_kvcache=flash_attn_with_kvcache),
+    )
+    inp = SimpleNamespace(q="q", k_cache="k", v_cache="v", kv_indices=Indices(), bytes_accessed=7)
+
+    def build_inputs(**kwargs):
+        events.append(("build_inputs", kwargs))
+        return inp
+
+    monkeypatch.setattr(_common, "build_paged_decode_inputs", build_inputs)
+    monkeypatch.setattr(_common, "attention_flops", lambda **kwargs: 9)
+    metrics = ComputeMetrics(1.0, 2.0, 3.0, 4.0)
+    monkeypatch.setattr(
+        _common,
+        "measure",
+        lambda fn, *, flops, bytes_accessed: (
+            events.append(("measure", flops, bytes_accessed)) or metrics
+        ),
+    )
+
+    args = _decode_args() | {"batch_size": 4, "total_tokens": 4096}
+    assert runner.profile_flashinfer_attn_decode_sgl_fa3(**args) is metrics
+    assert [event[0] for event in events] == [
+        "build_inputs",
+        "page_table",
+        "call",
+        "synchronize",
+        "measure",
+    ]
+    assert events[0][1]["page_size"] == 1
+    assert events[0][1]["seq_len"] == 1024
+    assert events[1][1] == (4, -1)
+    call = events[2][1]
+    assert call["page_table"] == "page_table"
+    assert call["cache_seqlens"] == ("full", (4,), 1024)
+    assert call["cu_seqlens_q"] == ("arange", 5)
+    assert call["max_seqlen_q"] == 1
+    assert call["softmax_scale"] == 256**-0.5
+    assert call["causal"] is True
+    assert call["scheduler_metadata"] is None
+    assert call["num_splits"] == 0
+    assert call["ver"] == 3
+    assert events[-1][1:] == (9, 7)
