@@ -357,7 +357,7 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
         ),
         (
             "prefix_hit_bounds",
-            "requests whose prefix_cache_hit_tokens exceeds declared_prefix_tokens vs 0",
+            "requests whose prefix_cache_hit_tokens exceeds max(declared_prefix_tokens, pinned_prefix_tokens) vs 0",
             expected.prefix_hit_bound_violations as f64,
             0.0,
             0.0,
@@ -1366,6 +1366,9 @@ struct RequestSloWorkInput {
     completed: bool,
     fresh_prompt_tokens: f64,
     declared_prefix_tokens: f64,
+    /// Trace-forced resident tokens on first admission; a session row's pin may
+    /// exceed `declared_prefix_tokens`.
+    pinned_prefix_tokens: f64,
     prefix_cache_hit_tokens: Option<f64>,
     prefill_tokens_processed: f64,
     num_output_tokens: f64,
@@ -1382,10 +1385,9 @@ impl Expected {
             self.boundary_decode_requests += 1;
         }
 
-        if input
-            .prefix_cache_hit_tokens
-            .is_some_and(|hit_tokens| hit_tokens > input.declared_prefix_tokens)
-        {
+        if input.prefix_cache_hit_tokens.is_some_and(|hit_tokens| {
+            hit_tokens > input.declared_prefix_tokens.max(input.pinned_prefix_tokens)
+        }) {
             self.prefix_hit_bound_violations += 1;
         }
 
@@ -1482,18 +1484,27 @@ async fn collect_expected(
 ) -> Result<Expected> {
     let has_reprocessed =
         has_column(ctx, "slo", "reprocessed_prefill_output_tokens_before").await?;
-    let select = if has_reprocessed {
-        "SELECT completed, fresh_prompt_tokens, declared_prefix_tokens, \
-         prefix_cache_hit_tokens, prefill_processed, num_output_tokens, \
-         reprocessed_prefill_output_tokens_before, \
+    // Logs written before session rows could carry a pin have no column; their
+    // pins (standalone only) equal `declared_prefix_tokens`, so 0 is exact.
+    let pinned_select = if has_column(ctx, "slo", "pinned_prefix_tokens").await? {
+        "pinned_prefix_tokens"
+    } else {
+        "CAST(0 AS INT UNSIGNED) AS pinned_prefix_tokens"
+    };
+    let reprocessed_select = if has_reprocessed {
+        ", reprocessed_prefill_output_tokens_before, \
          reprocessed_prefill_prefix_hit_tokens, \
          reprocessed_prefill_processed_tokens, \
-         reprocessed_prefill_completed FROM slo"
+         reprocessed_prefill_completed"
     } else {
-        "SELECT completed, fresh_prompt_tokens, declared_prefix_tokens, \
-         prefix_cache_hit_tokens, prefill_processed, num_output_tokens FROM slo"
+        ""
     };
-    let batches = collect(ctx, select).await?;
+    let select = format!(
+        "SELECT completed, fresh_prompt_tokens, declared_prefix_tokens, \
+         prefix_cache_hit_tokens, prefill_processed, num_output_tokens, \
+         {pinned_select}{reprocessed_select} FROM slo"
+    );
+    let batches = collect(ctx, &select).await?;
     let mut expected = Expected::default();
     for batch in &batches {
         let completed = col(batch, "completed")?
@@ -1510,6 +1521,8 @@ async fn collect_expected(
             col(batch, "prefix_cache_hit_tokens")?,
             "prefix_cache_hit_tokens",
         )?;
+        let pinned_prefix_tokens =
+            u32_values(col(batch, "pinned_prefix_tokens")?, "pinned_prefix_tokens")?;
         let prefill_tokens_processed = col(batch, "prefill_processed")?;
         let num_output_tokens = col(batch, "num_output_tokens")?;
         for row in 0..batch.num_rows() {
@@ -1525,6 +1538,7 @@ async fn collect_expected(
                     completed: completed.value(row),
                     fresh_prompt_tokens: fresh_prompt_tokens.value(row) as f64,
                     declared_prefix_tokens: declared_prefix_tokens.value(row) as f64,
+                    pinned_prefix_tokens: pinned_prefix_tokens.value(row) as f64,
                     prefix_cache_hit_tokens: (!prefix_cache_hit_tokens.is_null(row))
                         .then(|| prefix_cache_hit_tokens.value(row) as f64),
                     prefill_tokens_processed: value_f64(prefill_tokens_processed, row)?,
@@ -1598,7 +1612,7 @@ fn definitions() -> Value {
         "scope": "whole run — cost_log actuals vs request_slo per-request expected",
         "fresh": "request_slo.fresh_prompt_tokens (immutable new suffix)",
         "declared": "request_slo.declared_prefix_tokens (immutable reusable-prefix requirement)",
-        "hit": "request_slo.prefix_cache_hit_tokens (nullable admission-time resident-prefix observation)",
+        "hit": "request_slo.prefix_cache_hit_tokens (nullable admission-time resident-prefix observation; bounded by max(declared, request_slo.pinned_prefix_tokens))",
         "p": "request_slo.prefill_processed (tokens actually computed by prefill)",
         "d": "request_slo.num_output_tokens (terminal decode length)",
         "rp": "request_slo reprocessed-prefill episode lists after decode retraction",
@@ -1760,6 +1774,7 @@ mod tests {
                 completed: true,
                 fresh_prompt_tokens: 32.0,
                 declared_prefix_tokens: 64.0,
+                pinned_prefix_tokens: 0.0,
                 prefix_cache_hit_tokens: Some(64.0),
                 prefill_tokens_processed: 32.0,
                 num_output_tokens: 4.0,
@@ -1817,6 +1832,7 @@ mod tests {
                 completed: true,
                 fresh_prompt_tokens: 100.0,
                 declared_prefix_tokens: 0.0,
+                pinned_prefix_tokens: 0.0,
                 prefix_cache_hit_tokens: Some(0.0),
                 prefill_tokens_processed: 100.0,
                 num_output_tokens: 1.0,
@@ -1859,6 +1875,7 @@ mod tests {
                 completed: true,
                 fresh_prompt_tokens: 32.0,
                 declared_prefix_tokens: 64.0,
+                pinned_prefix_tokens: 0.0,
                 prefix_cache_hit_tokens: Some(65.0),
                 prefill_tokens_processed: 32.0,
                 num_output_tokens: 1.0,
@@ -1872,6 +1889,7 @@ mod tests {
                 completed: true,
                 fresh_prompt_tokens: 16.0,
                 declared_prefix_tokens: 0.0,
+                pinned_prefix_tokens: 0.0,
                 prefix_cache_hit_tokens: None,
                 prefill_tokens_processed: 16.0,
                 num_output_tokens: 1.0,
@@ -1886,6 +1904,29 @@ mod tests {
     }
 
     #[test]
+    fn a_session_pin_above_the_declared_prefix_is_within_bounds() {
+        // Turn 0 of a session: prefix_kv = 0, input_len = 1106, prefix_len = 579.
+        let mut expected = Expected::default();
+        expected.add_request(
+            WorkloadMode::Iterwise,
+            0,
+            RequestSloWorkInput {
+                completed: true,
+                fresh_prompt_tokens: 1106.0,
+                declared_prefix_tokens: 0.0,
+                pinned_prefix_tokens: 579.0,
+                prefix_cache_hit_tokens: Some(579.0),
+                prefill_tokens_processed: 527.0,
+                num_output_tokens: 1.0,
+                reprocessed_prefills: Vec::new(),
+            },
+        );
+
+        assert_eq!(expected.prefix_hit_bound_violations, 0);
+        assert_eq!(expected.prefix_token_balance_violations, 0);
+    }
+
+    #[test]
     fn reprocessed_prefill_replaces_one_decode_pass_and_conserves_extra_work() {
         let mut expected = Expected::default();
         expected.add_request(
@@ -1895,6 +1936,7 @@ mod tests {
                 completed: true,
                 fresh_prompt_tokens: 10.0,
                 declared_prefix_tokens: 0.0,
+                pinned_prefix_tokens: 0.0,
                 prefix_cache_hit_tokens: Some(0.0),
                 prefill_tokens_processed: 10.0,
                 num_output_tokens: 5.0,
@@ -1926,6 +1968,7 @@ mod tests {
                 completed: false,
                 fresh_prompt_tokens: 32.0,
                 declared_prefix_tokens: 64.0,
+                pinned_prefix_tokens: 0.0,
                 prefix_cache_hit_tokens: Some(64.0),
                 prefill_tokens_processed: 8.0,
                 num_output_tokens: 0.0,

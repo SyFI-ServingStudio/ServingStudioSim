@@ -503,6 +503,7 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         stage_pool_ids,
         stage_worker_ids,
         declared_prefix_tokens: rec.request.definition.session.declared_prefix_tokens(),
+        pinned_prefix_tokens: rec.request.definition.session.pinned_prefix_tokens(),
         prefix_cache_hit_tokens: rec.telemetry.prefix_cache_hit_tokens,
         fresh_prompt_tokens: rec.request.definition.prompt_tokens,
         target_output_tokens: rec.request.definition.target_output_tokens,

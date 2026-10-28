@@ -114,9 +114,16 @@ the immutable new suffix, while `prefill_processed` records work actually done;
 Once a request has produced its first output token, conservation therefore has
 the exact request-level invariant
 `prefix_cache_hit_tokens + prefill_processed = fresh_prompt_tokens + declared_prefix_tokens`.
-A pinned prefix (the independent format's `prefix_len` column) is declared and
-always hit: `declared_prefix_tokens = prefix_cache_hit_tokens = prefix_len`. It
-writes no `prefix_cache_event` row because it never enters the shared cache.
+A pinned prefix (the independent format's `prefix_len` column) is recorded in
+`pinned_prefix_tokens` (0 without one) and is always hit on first admission. On a
+standalone row it extends the context before the fresh prompt:
+`declared_prefix_tokens = pinned_prefix_tokens = prefix_cache_hit_tokens = prefix_len`.
+On a session row it counts from the start of the round's context and does not
+extend it: `prefix_cache_hit_tokens = max(prefix_len, cache hit)`, which may exceed
+`declared_prefix_tokens` (`prefix_kv`) on a first turn; the invariant above still
+holds. A pin writes no `prefix_cache_event` row because it never enters the shared
+cache; a re-prefill after retraction recomputes it (its episode records hit 0
+unless retained session KV supplies some).
 
 The nullable `declared_ttft_slo_ms`, `declared_tpot_slo_ms`, and
 `declared_e2e_slo_ms` columns preserve the trace's per-request obligations.
