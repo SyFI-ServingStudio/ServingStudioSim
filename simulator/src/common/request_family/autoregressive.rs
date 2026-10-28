@@ -141,6 +141,40 @@ impl SessionInput {
             ),
         }
     }
+
+    /// The declaration a re-prefill on another worker resolves, and the
+    /// leading tokens it must now compute as prompt.
+    ///
+    /// A migrated request reaches a worker that holds none of its KV, so
+    /// nothing of its context counts as resident: the pin goes the way
+    /// [`Self::without_pinned_prefix`] takes it, and a session's declared
+    /// prefix also becomes prompt, which leaves no requirement for a cache to
+    /// satisfy. The session id stays, so the context it builds is retained for
+    /// the conversation's later rounds as usual.
+    pub const fn without_resident_prefix(self) -> (Self, u32) {
+        match self.without_pinned_prefix() {
+            (
+                Self::Session {
+                    session_id,
+                    session_start_time,
+                    declared_prefix_tokens,
+                    rounds_in_session,
+                    pinned_prefix_tokens,
+                },
+                unpinned_prefix_tokens,
+            ) => (
+                Self::Session {
+                    session_id,
+                    session_start_time,
+                    declared_prefix_tokens: 0,
+                    rounds_in_session,
+                    pinned_prefix_tokens,
+                },
+                unpinned_prefix_tokens + declared_prefix_tokens,
+            ),
+            unpinned => unpinned,
+        }
+    }
 }
 
 /// Decode behaviour requested by an autoregressive request.

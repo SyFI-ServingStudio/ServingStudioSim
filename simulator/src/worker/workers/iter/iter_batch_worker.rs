@@ -1821,6 +1821,93 @@ mod tests {
         );
     }
 
+    /// A migrated request lands on a worker that holds none of its KV: its
+    /// re-prefill computes the whole context, prompt plus emitted tokens, with
+    /// neither the trace's pin nor a cached session prefix counting as hit,
+    /// even when the destination retains that session's earlier round.
+    #[test]
+    fn a_migrated_request_reprefills_its_whole_context_with_no_hit() {
+        let session = |declared_prefix_tokens, pinned_prefix_tokens| SessionInput::Session {
+            session_id: 7,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens,
+            rounds_in_session: 2,
+            pinned_prefix_tokens,
+        };
+        // (prompt, declaration, context, warm the destination with round 1)
+        for (prompt_tokens, declared, context_tokens, warm_destination) in [
+            (4, SessionInput::PinnedPrefix { prefix_tokens: 2 }, 6, false),
+            (4, session(0, 3), 4, false),
+            (20, session(100, 110), 120, true),
+        ] {
+            let store = shared_with(&[(0, prompt_tokens, 20), (1, 20, 2)]);
+            store.borrow_mut()[RequestId(0)].request.definition.session = declared;
+            store.borrow_mut()[RequestId(1)].request.definition.session = session(100, 0);
+            let mut src = chunked_worker_named(WorkerId(0), Rc::clone(&store), 64);
+            let mut dst = chunked_worker_named(WorkerId(1), Rc::clone(&store), 64);
+            let mut events = Vec::new();
+            let mut now = Time::ZERO;
+            if warm_destination {
+                dst.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+                for _ in 0..100 {
+                    dst.tick(now, &mut events);
+                    now = now + Time::from_ms(1.0);
+                }
+                assert!(store.borrow()[RequestId(1)].lifecycle.completed);
+                assert_eq!(
+                    dst.kv_store.resident_prefix_tokens(prompt_tokens, declared),
+                    110,
+                    "the destination would serve this session's prefix to a fresh round"
+                );
+            }
+
+            src.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+            for _ in 0..200 {
+                src.tick(now, &mut events);
+                if store.borrow()[RequestId(0)].progress.output_tokens_emitted >= 5 {
+                    break;
+                }
+                now = now + Time::from_ms(1.0);
+            }
+            let first_hit = store.borrow()[RequestId(0)].telemetry.prefix_cache_hit_tokens;
+            assert_eq!(
+                first_hit,
+                Some(declared.pinned_prefix_tokens()),
+                "{declared:?}: the first admission honours the pin"
+            );
+            let mut drained = Vec::new();
+            src.drain_resident(now, &mut drained);
+            assert_eq!(drained, vec![RequestId(0)]);
+            dst.enqueue(WorkerMsgCommon::Resume {
+                req: RequestId(0),
+                at: now,
+            });
+            for _ in 0..400 {
+                dst.tick(now, &mut events);
+                if store.borrow()[RequestId(0)].lifecycle.completed {
+                    break;
+                }
+                now = now + Time::from_ms(1.0);
+            }
+
+            let requests = store.borrow();
+            let moved = &requests[RequestId(0)];
+            assert!(moved.lifecycle.completed, "{declared:?}");
+            let episode = moved.telemetry.reprocessed_prefills[0];
+            assert!(episode.completed, "{declared:?}");
+            assert_eq!(episode.output_tokens_before, 5, "{declared:?}");
+            assert_eq!(
+                episode.prefix_cache_hit_tokens, 0,
+                "{declared:?}: nothing on the destination counts as resident"
+            );
+            assert_eq!(
+                episode.prefill_tokens_processed,
+                context_tokens + 5,
+                "{declared:?}: the destination re-prefills the whole context"
+            );
+        }
+    }
+
     fn chunked_worker_named(
         id: WorkerId,
         store: SharedRequests,

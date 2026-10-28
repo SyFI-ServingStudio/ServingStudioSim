@@ -63,6 +63,18 @@ impl ChunkEndAlignment {
     }
 }
 
+/// Why a started request's context is being recomputed, which decides what
+/// of it may still count as resident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReprocessCause {
+    /// This worker ran out of KV and dropped the request's context. Its
+    /// session's retained prefix, a separate cache entry, may still serve.
+    Retraction,
+    /// Another worker handed the request over. This worker holds none of its
+    /// KV, so the whole context — prompt and emitted tokens — is prefilled.
+    Migration,
+}
+
 pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeCompletion> {
     partition_policies: Vec<(P, P::Context)>,
     enqueue_sequence: EnqueueSequence,
@@ -284,7 +296,13 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         retraction_policy: DecodeRetractionPolicy,
         now: Time,
     ) {
-        let candidate = self.freeze_reprocessed(kv_store, context, request, now);
+        let candidate = self.freeze_reprocessed(
+            kv_store,
+            context,
+            request,
+            ReprocessCause::Retraction,
+            now,
+        );
         self.admission_order.remove(&request);
         let (policy, policy_context) = &mut self.partition_policies[partition as usize];
         match retraction_policy {
@@ -342,12 +360,14 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
     /// ran out of KV) and migration (another worker handed the request over).
     /// Both mean the same physical thing — the context is gone and has to be
     /// recomputed — so they must not drift into two answers for how much work
-    /// is left. Only where the candidate queues differs, so callers push it.
+    /// is left. They differ in what may still be resident (see
+    /// [`ReprocessCause`]) and in where the candidate queues, so callers push it.
     fn freeze_reprocessed<K: ChunkedPrefillKv>(
         &mut self,
         kv_store: &K,
         context: &WorkerContext,
         request: RequestId,
+        cause: ReprocessCause,
         now: Time,
     ) -> AdmissionCandidate {
         let (
@@ -381,9 +401,13 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             )
         };
         // The trace's pinned hit holds for the first admission only: the
-        // re-prefill recomputes the whole context, leaving only what retained
-        // session KV can still supply.
-        let (session_input, unpinned_prefix_tokens) = session_input.without_pinned_prefix();
+        // re-prefill recomputes the whole context, leaving a local retraction
+        // only what retained session KV can still supply and a migrated
+        // request nothing at all.
+        let (session_input, unpinned_prefix_tokens) = match cause {
+            ReprocessCause::Retraction => session_input.without_pinned_prefix(),
+            ReprocessCause::Migration => session_input.without_resident_prefix(),
+        };
         let reprocessed_input_tokens = reprocessed_input_tokens
             .checked_add(unpinned_prefix_tokens)
             .expect("reprocessed input length overflow");
@@ -484,16 +508,24 @@ where
         };
         // Placement is frozen when the request enters the worker. Retained KV
         // has hard affinity; cold requests use the same generic balance policy
-        // as ordinary local admission.
-        let partition = self.choose_partition(kv_store, session_input);
+        // as ordinary local admission. A migrated request is placed by the
+        // declaration it will resolve, which claims no retained KV.
         if started {
             // A migrated request is new to this worker's queue, so it waits in
             // the ordinary order; only a local retraction jumps the line.
-            let candidate = self.freeze_reprocessed(kv_store, context, request, entered_at);
+            let candidate = self.freeze_reprocessed(
+                kv_store,
+                context,
+                request,
+                ReprocessCause::Migration,
+                entered_at,
+            );
+            let partition = self.choose_partition(kv_store, candidate.session_input);
             let (policy, policy_context) = &mut self.partition_policies[partition];
             debug_assert!(!policy.contains(request));
             policy.push(candidate, policy_context);
         } else {
+            let partition = self.choose_partition(kv_store, session_input);
             self.enqueue_fresh(kv_store, context, partition, request, entered_at);
         }
     }

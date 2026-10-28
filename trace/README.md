@@ -59,7 +59,9 @@ ordinary session KV. `request_slo` records `pinned_prefix_tokens = prefix_len`,
 
 On either kind of row the pin holds for the first admission only: a request
 that is retracted from decode and re-prefills recomputes its whole context
-(except what retained session KV can still supply).
+(except what retained session KV can still supply). A request migrated to
+another worker recomputes all of it, prompt and emitted tokens, with no pinned
+or cached hit.
 
 req-frontend does not declare `prefix_len` yet: its replay client rejects a file
 that carries the column (`header does not match ... unexpected: ["prefix_len"]`).
