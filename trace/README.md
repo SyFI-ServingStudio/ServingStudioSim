@@ -30,8 +30,36 @@ prefix KV is reserved with the request (it counts toward capacity), is released
 when the request completes, and is never retained as a shared cache entry.
 `request_slo` records `declared_prefix_tokens = prefix_cache_hit_tokens =
 prefix_len` and `prefill_processed = input_len`. A missing column, a blank cell,
-or `0` loads exactly as the four-column file does. A row that also declares a
-`session_id` through the `session` tag must use `prefix_kv` instead.
+or `0` loads exactly as the four-column file does.
+
+#### `prefix_len` on a session row
+
+A row that also declares a `session_id` through the `session` tag may carry
+`prefix_len` too. There it counts tokens from the start of the round's full
+context, `prefix_kv + input_len`, and does not extend it; it must not exceed
+`prefix_kv + input_len`, and may exceed `prefix_kv`. Use it when the source
+measured the hit: a system prompt shared across sessions is resident even on a
+first turn with no session history.
+
+```text
+id,input_len,output_len,arrival_time,session_id,prefix_kv,tool_wait_after_ms,prefix_len
+t0,1106,40,0,s0,0,0,579
+t1,78,40,9000,s0,1150,0,1175
+```
+
+`prefix_kv` keeps its meaning (the session KV this round may reuse, a
+requirement rather than a hit). On the request's first admission the resident
+prefix is `max(prefix_len, retained session hit)` on whichever partition it
+lands, so `t0` computes `1106 - 579 = 527` tokens and `t1` computes
+`1228 - 1175 = 53` even on a partition that holds none of `s0`'s KV. The pinned
+part is reserved with the request, adds no placement affinity, and writes no
+`prefix_cache_event` row; after the round completes, its context is retained as
+ordinary session KV. `request_slo` records `pinned_prefix_tokens = prefix_len`,
+`declared_prefix_tokens = prefix_kv`, and the resolved `prefix_cache_hit_tokens`.
+
+On either kind of row the pin holds for the first admission only: a request
+that is retracted from decode and re-prefills recomputes its whole context
+(except what retained session KV can still supply).
 
 req-frontend does not declare `prefix_len` yet: its replay client rejects a file
 that carries the column (`header does not match ... unexpected: ["prefix_len"]`).
