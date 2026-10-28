@@ -76,9 +76,15 @@ pub enum GroupBySel {
     /// many rounds each session has, which is what says when the last one has
     /// landed — a round finishing is not a conversation finishing.
     Session,
+    /// A block of `group_size` consecutive conversations: an RL prompt group
+    /// whose samples are multi-turn trajectories (Text2SQL GRPO). Sessions are
+    /// numbered in the order the trace first names them, so the trace must
+    /// list a group's sessions back to back; the group is finished when every
+    /// round of every one of them is.
+    SessionBlock,
 }
 
-const GROUP_BY_CHOICES: [&str; 2] = ["id-block", "session"];
+const GROUP_BY_CHOICES: [&str; 3] = ["id-block", "session", "session-block"];
 
 /// When a pool moves resident work between its own workers.
 ///
@@ -152,15 +158,17 @@ pub struct PoolSpec<Arch, Worker> {
     #[serde(default = "default_migration_threshold")]
     #[param(default = 32)]
     pub migration_threshold: u32,
-    /// What one group is: a block of consecutive request ids, or a whole
-    /// conversation. Read by the migration trigger and the trainer, which share
-    /// one ledger. `id-block` sizes itself by `group_size`; `session`
-    /// takes the round count the trace declares and ignores that field.
+    /// What one group is: a block of consecutive request ids, a whole
+    /// conversation, or a block of consecutive conversations. Read by the
+    /// migration trigger and the trainer, which share one ledger. `id-block`
+    /// and `session-block` size themselves by `group_size`; `session` takes the
+    /// round count the trace declares and ignores that field.
     #[serde(default)]
     #[param(string, default = "id-block", choices = GROUP_BY_CHOICES)]
     pub group_by: GroupBySel,
-    /// Requests per prompt group, numbered in consecutive id blocks. One means
-    /// "no grouping". Ignored under `group_by: session`.
+    /// Members per prompt group: requests in consecutive id blocks, or under
+    /// `group_by: session-block` sessions in consecutive blocks. One means "no
+    /// grouping". Ignored under `group_by: session`.
     ///
     /// Workload topology, read by both `train-group-samples-below` (which
     /// counts a group's full size until its slowest member lands) and the

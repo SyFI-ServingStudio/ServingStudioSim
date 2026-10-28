@@ -78,6 +78,8 @@ pub enum GroupBy {
     #[default]
     IdBlock,
     Session,
+    /// Blocks of consecutive sessions, sized like an id block.
+    SessionBlock,
 }
 
 // ── L6a: pool-local orchestration ─────────────────────────────────────────────
@@ -128,6 +130,11 @@ pub enum GroupKey {
     /// One conversation, identified by its session id and sized by the round
     /// count the trace declares.
     Session,
+    /// A block of `size` consecutive conversations: a GRPO prompt group whose
+    /// samples are multi-turn trajectories. Sessions are numbered in the order
+    /// the trace first names them, so the trace lists a group's sessions back
+    /// to back; the group is done when every round of all `size` of them is.
+    SessionBlock { size: u32 },
 }
 
 /// What the ledger is told about an arriving request: which group it joins and,
@@ -135,9 +142,25 @@ pub enum GroupKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GroupMembership {
     group: usize,
-    /// `None` = not declared, so the group counts as finished once its arrived
-    /// members have. `Some(n)` = finished only after `n` completions.
-    expected: Option<u32>,
+    expected: MemberCount,
+}
+
+/// How many members a group will ever have, as far as one arrival can say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemberCount {
+    /// Not declared: the group counts as finished once its arrived members
+    /// have.
+    Undeclared,
+    /// Finished only after this many completions.
+    Total(u32),
+    /// This arrival's session contributes `rounds` members to a group of
+    /// `sessions` sessions. The group's total is the sum over its sessions, and
+    /// it is not finished before all of them have been seen.
+    SessionShare {
+        session: u32,
+        rounds: u32,
+        sessions: u32,
+    },
 }
 
 /// Which worker holds each group, and how much of each group is left.
@@ -158,8 +181,21 @@ struct GroupLedger {
     unfinished: Vec<u32>,
     /// Members of each group already complete, by group id.
     finished: Vec<u32>,
-    /// Declared member count per group; see [`GroupMembership::expected`].
+    /// Declared member count per group; see [`MemberCount`].
     expected: Vec<Option<u32>>,
+    /// Sessions seen so far, and sessions the group will have, by group id.
+    /// Both zero for a group that is not a session block.
+    sessions_seen: Vec<u32>,
+    sessions_expected: Vec<u32>,
+    /// Whether each dense session id has contributed its rounds yet.
+    session_counted: Vec<bool>,
+    /// Whether a migration has moved each group. A moved group's later
+    /// arrivals follow it to its new host instead of the trace's target.
+    moved: Vec<bool>,
+    /// Groups not yet finished whose first member has arrived. A declared
+    /// group stays live between rounds -- a conversation waiting on a tool
+    /// still owns its worker -- so this is not `unfinished > 0`.
+    live: Vec<bool>,
     /// Groups with at least one unfinished member, by worker index.
     per_worker: Vec<u32>,
     /// Requests completed on each worker. A policy that fires on a drop in
@@ -180,6 +216,11 @@ impl GroupLedger {
             unfinished: Vec::new(),
             finished: Vec::new(),
             expected: Vec::new(),
+            sessions_seen: Vec::new(),
+            sessions_expected: Vec::new(),
+            session_counted: Vec::new(),
+            moved: Vec::new(),
+            live: Vec::new(),
             per_worker: vec![0; num_workers],
             completed_per_worker: vec![0; num_workers],
         }
@@ -204,26 +245,60 @@ impl GroupLedger {
             self.unfinished.resize(group + 1, 0);
             self.finished.resize(group + 1, 0);
             self.expected.resize(group + 1, None);
+            self.sessions_seen.resize(group + 1, 0);
+            self.sessions_expected.resize(group + 1, 0);
+            self.moved.resize(group + 1, false);
+            self.live.resize(group + 1, false);
             self.members.resize(group + 1, Vec::new());
             self.host.resize(group + 1, worker);
         }
-        if self.unfinished[group] == 0 {
+        if !self.live[group] {
+            self.live[group] = true;
             self.host[group] = worker;
             self.per_worker[worker.0 as usize] += 1;
-        } else {
+        } else if self.host[group] != worker {
+            // A live group with nothing resident (between a conversation's
+            // rounds) may be re-placed by the trace; one with work resident on
+            // its host may not.
             assert_eq!(
-                self.host[group], worker,
+                self.unfinished[group], 0,
                 "group {group} is split across workers {:?} and {worker:?}; \
                  a group-counting migration policy needs each group on one worker",
                 self.host[group],
             );
+            self.per_worker[self.host[group].0 as usize] -= 1;
+            self.per_worker[worker.0 as usize] += 1;
+            self.host[group] = worker;
         }
-        if let Some(declared) = expected {
-            let seen = self.expected[group].get_or_insert(declared);
-            assert_eq!(
-                *seen, declared,
-                "group {group} was declared {seen} members and then {declared}",
-            );
+        match expected {
+            MemberCount::Undeclared => {}
+            MemberCount::Total(declared) => {
+                let seen = self.expected[group].get_or_insert(declared);
+                assert_eq!(
+                    *seen, declared,
+                    "group {group} was declared {seen} members and then {declared}",
+                );
+            }
+            MemberCount::SessionShare {
+                session,
+                rounds,
+                sessions,
+            } => {
+                let session = session as usize;
+                if session >= self.session_counted.len() {
+                    self.session_counted.resize(session + 1, false);
+                }
+                if !self.session_counted[session] {
+                    self.session_counted[session] = true;
+                    *self.expected[group].get_or_insert(0) += rounds;
+                    self.sessions_seen[group] += 1;
+                    self.sessions_expected[group] = sessions;
+                    assert!(
+                        self.sessions_seen[group] <= sessions,
+                        "group {group} holds more than its {sessions} sessions",
+                    );
+                }
+            }
         }
         if request.0 as usize >= self.group_of.len() {
             self.group_of.resize(request.0 as usize + 1, NO_GROUP);
@@ -244,17 +319,28 @@ impl GroupLedger {
         *left -= 1;
         let emptied = *left == 0;
         self.finished[group] += 1;
-        if emptied {
-            self.per_worker[host] -= 1;
-        }
         self.completed_per_worker[host] += 1;
         // A declared count is the authority when there is one: a chained
         // conversation empties after every round, and only the declared total
         // distinguishes the last of those from the rest.
-        match self.expected[group] {
-            Some(declared) => (self.finished[group] == declared).then_some(group),
-            None => emptied.then_some(group),
+        let done = match self.expected[group] {
+            Some(declared) => {
+                self.finished[group] == declared
+                    && self.sessions_seen[group] >= self.sessions_expected[group]
+            }
+            None => emptied,
+        };
+        if done {
+            self.live[group] = false;
+            self.per_worker[host] -= 1;
         }
+        done.then_some(group)
+    }
+
+    /// The worker a moved group's later arrivals go to, or `None` when the
+    /// group is not live or no migration has touched it.
+    fn moved_host(&self, group: usize) -> Option<WorkerId> {
+        (self.live.get(group) == Some(&true) && self.moved[group]).then(|| self.host[group])
     }
 
     /// Groups still in flight on `worker`, lowest id first — the order a
@@ -263,7 +349,7 @@ impl GroupLedger {
         out.clear();
         out.extend(
             (0..self.unfinished.len())
-                .filter(|group| self.unfinished[*group] > 0 && self.host[*group] == worker),
+                .filter(|group| self.live[*group] && self.host[*group] == worker),
         );
     }
 
@@ -272,8 +358,7 @@ impl GroupLedger {
     /// its groups one at a time visits them in the order a `Scatter` would have
     /// dealt them out.
     fn first_resident(&self, worker: WorkerId) -> Option<usize> {
-        (0..self.unfinished.len())
-            .find(|group| self.unfinished[*group] > 0 && self.host[*group] == worker)
+        (0..self.unfinished.len()).find(|group| self.live[*group] && self.host[*group] == worker)
     }
 
     /// Every request id that has joined `group`, finished or not, in arrival
@@ -291,6 +376,7 @@ impl GroupLedger {
         self.per_worker[from.0 as usize] -= 1;
         self.per_worker[to.0 as usize] += 1;
         self.host[group] = to;
+        self.moved[group] = true;
     }
 }
 
@@ -355,6 +441,14 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
         self.groups
             .as_mut()
             .and_then(|groups| groups.completed(request))
+    }
+
+    /// Where a request of a group that a migration has moved must go instead
+    /// of its trace target: the group's current host. `None` when the pool
+    /// tracks no groups, the request has none, or its group was never moved.
+    pub fn moved_group_host(&self, membership: Option<GroupMembership>) -> Option<WorkerId> {
+        let (groups, membership) = (self.groups.as_ref()?, membership?);
+        groups.moved_host(membership.group)
     }
 
     /// Every request id of `group`. Panics if the pool tracks no groups — a
@@ -763,14 +857,15 @@ where
         // A group is counted when either side asks for one. `Session` is a
         // choice the preset makes; `IdBlock` takes its size from whichever of
         // the two is installed.
+        let block_size = cfg
+            .migration
+            .as_ref()
+            .map(MigrationTrigger::group_size)
+            .or(cfg.training.as_ref().map(|training| training.group_size));
         let group_key = match cfg.group_by {
             GroupBy::Session => Some(GroupKey::Session),
-            GroupBy::IdBlock => cfg
-                .migration
-                .as_ref()
-                .map(MigrationTrigger::group_size)
-                .or(cfg.training.as_ref().map(|training| training.group_size))
-                .map(|size| GroupKey::IdBlock { size }),
+            GroupBy::IdBlock => block_size.map(|size| GroupKey::IdBlock { size }),
+            GroupBy::SessionBlock => block_size.map(|size| GroupKey::SessionBlock { size }),
         };
         if group_key.is_some() {
             dp_pool.track_groups();
@@ -822,8 +917,24 @@ where
         match self.group_key? {
             GroupKey::IdBlock { size } => Some(GroupMembership {
                 group: rid.0 as usize / size as usize,
-                expected: None,
+                expected: MemberCount::Undeclared,
             }),
+            GroupKey::SessionBlock { size } => {
+                let session_id = session.session_id().unwrap_or_else(|| {
+                    panic!(
+                        "{rid:?} has no session id, but this pool groups by session block; \
+                         a session-block run needs a trace that declares sessions"
+                    )
+                });
+                Some(GroupMembership {
+                    group: session_id as usize / size as usize,
+                    expected: MemberCount::SessionShare {
+                        session: session_id,
+                        rounds: session.rounds_in_session(),
+                        sessions: size,
+                    },
+                })
+            }
             GroupKey::Session => {
                 let session_id = session.session_id().unwrap_or_else(|| {
                     panic!(
@@ -833,7 +944,7 @@ where
                 });
                 Some(GroupMembership {
                     group: session_id as usize,
-                    expected: Some(session.rounds_in_session()),
+                    expected: MemberCount::Total(session.rounds_in_session()),
                 })
             }
         }
@@ -858,7 +969,13 @@ where
                     target.0,
                     self.dp_pool.num_workers(),
                 );
-                let host = self.dp_pool.resolve(target);
+                // A group a migration moved keeps its later rounds where it
+                // went, as a router that re-dispatched the group would: the
+                // trace's target recorded where the group started.
+                let host = self
+                    .dp_pool
+                    .moved_group_host(membership)
+                    .unwrap_or_else(|| self.dp_pool.resolve(target));
                 self.dp_pool.admit_to(host, rid, membership);
             }
             // Both mismatches are configuration errors, and both are refused
@@ -949,6 +1066,31 @@ where
                                 + record.request.definition.prompt_tokens
                                 + record.progress.output_tokens_emitted,
                         ]
+                    }
+                    // A prompt group of conversations: each trajectory is one
+                    // sequence, read off its own last round as above.
+                    GroupKey::SessionBlock { .. } => {
+                        let mut last: Vec<(u32, RequestId)> = Vec::new();
+                        for member in members {
+                            let session = store[*member]
+                                .request
+                                .definition
+                                .session
+                                .session_id()
+                                .expect("a session-block member has a session");
+                            match last.iter_mut().find(|(s, _)| *s == session) {
+                                Some((_, id)) => *id = (*id).max(*member),
+                                None => last.push((session, *member)),
+                            }
+                        }
+                        last.iter()
+                            .map(|(_, id)| {
+                                let record = &store[*id];
+                                record.request.definition.session.declared_prefix_tokens()
+                                    + record.request.definition.prompt_tokens
+                                    + record.progress.output_tokens_emitted
+                            })
+                            .collect()
                     }
                 };
                 training.admit(samples);
@@ -1883,6 +2025,48 @@ mod tests {
         let training = flow.training.as_ref().expect("training on");
         let (start, end) = training.window().expect("one chunk ran");
         assert_eq!(end.as_ms() - start.as_ms(), 7.0, "0 + 5 + 2");
+    }
+
+    /// A session block is a GRPO prompt group of multi-turn trajectories: it is
+    /// done only when every round of every one of its sessions has landed, and
+    /// it trains one sequence per trajectory, each its own last round.
+    #[test]
+    fn a_session_block_finishes_with_its_last_trajectory_and_trains_each_once() {
+        let (mut flow, _store) = build_flow_grouped(
+            1,
+            DpPlacementPolicy::RoundRobin,
+            None,
+            Some(training_cfg(2, 1)),
+            GroupBy::SessionBlock,
+            false,
+        );
+        // Session 0 has two rounds, session 1 one. After session 1's only
+        // round lands the block has finished 2 of its 3 rounds and both of its
+        // sessions are known: still not done.
+        let rounds = vec![
+            session_round(RequestId(0), 0, 2, 0, 8, 2),
+            session_round(RequestId(1), 1, 1, 0, 6, 3),
+            session_round(RequestId(2), 0, 2, 0, 12, 2),
+        ];
+        drain_chained(&mut flow, rounds, |flow, landed| {
+            let training = flow.training.as_ref().expect("training on");
+            if landed < 2 {
+                assert!(
+                    !training.outstanding() && training.chunks_completed() == 0,
+                    "round {landed} of 3 handed the trainer an unfinished prompt group"
+                );
+            }
+        });
+        let training = flow.training.as_ref().expect("training on");
+        assert_eq!(
+            training.groups_per_block(),
+            [1],
+            "two trajectories, one prompt group"
+        );
+        // 1,000 tok/s, no overhead: session 0's last round (12 + 2) plus
+        // session 1's (6 + 3). Its first round is not trained twice.
+        let (start, end) = training.window().expect("one chunk ran");
+        assert_eq!(end.as_ms() - start.as_ms(), 23.0);
     }
 
     /// An id-block pool counts id blocks even when the trace carries session

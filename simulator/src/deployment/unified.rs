@@ -227,6 +227,7 @@ impl Deployment for UnifiedDeployment {
             group_by: match pool.group_by {
                 GroupBySel::IdBlock => GroupBy::IdBlock,
                 GroupBySel::Session => GroupBy::Session,
+                GroupBySel::SessionBlock => GroupBy::SessionBlock,
             },
             log_dir: Some(cfg.io.log_dir.clone()),
         };

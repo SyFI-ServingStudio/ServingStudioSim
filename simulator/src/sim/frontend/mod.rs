@@ -1190,6 +1190,35 @@ mod tests {
         assert_eq!(scheduled_request.slo, SloContract::default());
     }
 
+    /// Dense session ids follow the order the file first names each session,
+    /// so they are the same on every run and a block of consecutive ids is a
+    /// block of consecutive sessions in the file (`group_by: session-block`).
+    #[test]
+    fn sessions_are_numbered_in_first_appearance_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["zeta", "alpha", "mid", "beta", "omega", "a1", "k9", "q"];
+        let mut csv = String::from(
+            "id,input_len,output_len,arrival_time,session_id,prefix_kv,tool_wait_after_ms\n",
+        );
+        for (row, name) in names.iter().enumerate() {
+            csv.push_str(&format!("{row},8,2,0.0,{name},0,0.0\n"));
+        }
+        let path = write_csv(dir.path(), "order.csv", &csv);
+        let fe = TraceFrontend::load(
+            &[path],
+            &declare("text_generation", &["session"]),
+            open_loop(1.0),
+            uncapped(),
+        )
+        .unwrap();
+        let ids: Vec<u32> = fe
+            .scheduled_requests
+            .iter()
+            .map(|r| r.release.session.expect("session row").session_id)
+            .collect();
+        assert_eq!(ids, (0..names.len() as u32).collect::<Vec<_>>());
+    }
+
     /// Tags are declared as a set and stack: three disciplines, one file.
     #[test]
     fn declared_tags_stack_independently() {

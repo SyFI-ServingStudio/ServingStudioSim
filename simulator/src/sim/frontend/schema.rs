@@ -171,17 +171,27 @@ where
     // first round needs the same number as the last. Independent rows arrive in
     // no particular order, so this is a tally rather than a running max.
     let mut rounds_by_session: HashMap<String, u32> = HashMap::new();
+    // First-appearance order, which is the order sessions are interned in: a
+    // dense session id is then the session's rank in the file, the same on
+    // every run, and a `session-block` group is a run of consecutive sessions
+    // as the file lists them. Interning off the map's keys would number them
+    // in hash order.
+    let mut session_order: Vec<&str> = Vec::new();
     for parsed in &rows {
         if let Some(id) = parsed.session.session_id.as_deref() {
             if !id.is_empty() {
-                *rounds_by_session.entry(id.to_owned()).or_insert(0) += 1;
+                let rounds = rounds_by_session.entry(id.to_owned()).or_insert(0);
+                if *rounds == 0 {
+                    session_order.push(id);
+                }
+                *rounds += 1;
             }
         }
     }
     // A conversation split across trace files would be counted once per file.
     // Refused rather than mis-counted: `session_start_times` is the cross-file
     // record of which sessions this load has already opened.
-    for id in rounds_by_session.keys() {
+    for id in session_order {
         let session_id = source_identities.intern_session(id);
         if session_start_times.contains_key(&session_id) {
             bail!(
