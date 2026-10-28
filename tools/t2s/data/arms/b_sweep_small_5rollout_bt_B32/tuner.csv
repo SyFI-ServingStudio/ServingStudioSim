@@ -1,0 +1,6 @@
+rollout_id,tuner,applied,b_before,b_proposed,b_effective,idle_ratio,training_span_gpu_s,busy_gpu_s,interior_idle_gpu_s,trailing_idle_gpu_s,interior_idle_ratio,wall_s,timestamp,reason
+0,FixedTuner,False,32,32,32,0.04804,1492.966,1421.245,5.367,66.355,0.003595,367.741,1790745923.916449,fixed
+1,FixedTuner,False,32,32,32,0.034129,1652.013,1595.631,0.897,55.485,0.000543,368.3,1790746292.2196503,fixed
+2,FixedTuner,False,32,32,32,0.008238,1669.175,1655.425,0.915,12.835,0.000548,326.423,1790746618.6447804,fixed
+3,FixedTuner,False,32,32,32,0.029103,1687.373,1638.265,1.237,47.871,0.000733,383.92,1790747002.568109,fixed
+4,FixedTuner,False,32,32,32,0.024435,974.846,951.025,0.89,22.931,0.000913,275.134,1790747277.7055125,fixed

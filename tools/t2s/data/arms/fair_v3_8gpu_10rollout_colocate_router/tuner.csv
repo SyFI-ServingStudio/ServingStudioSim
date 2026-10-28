@@ -1,0 +1,1 @@
+rollout_id,tuner,applied,b_before,b_proposed,b_effective,idle_ratio,training_span_gpu_s,busy_gpu_s,interior_idle_gpu_s,trailing_idle_gpu_s,interior_idle_ratio,wall_s,timestamp,reason

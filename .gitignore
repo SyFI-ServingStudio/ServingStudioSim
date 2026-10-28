@@ -23,6 +23,12 @@ trace/aime_long.csv
 # a run checks itself against.
 trace/tracelab_*
 !trace/tracelab_*.manifest.json
+# Text2SQL per-rollout session traces (~10 MB per arm): regenerate with
+# tools/t2s/build_t2s_trace.py; the manifest.json in each arm directory stays.
+trace/t2s/*/r*.csv
+# Per-iteration SGLang records of the measured Text2SQL arms (13-17 MB each):
+# regenerate with tools/t2s/extract_engine_iters.py (see tools/t2s/README.md).
+tools/t2s/data/*_iters.csv.gz
 
 # Editor / OS
 .vscode/
