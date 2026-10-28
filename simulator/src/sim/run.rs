@@ -761,6 +761,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 100,
+                pinned_prefix_tokens: 0,
             };
             request.core.slo = SloContract {
                 ttft_slo: Some(Time::from_ms(300.0)),

@@ -384,18 +384,18 @@ impl PrefixKv for KvCacheStore {
         fresh_prompt_tokens: u32,
         session_input: SessionInput,
     ) -> ResolvedPrefillContext {
-        let resident_prefix_tokens = match session_input {
-            SessionInput::Standalone => 0,
-            // Declared resident on arrival: a hit regardless of this
-            // partition's cache. Admission reserves it with the request.
-            SessionInput::PinnedPrefix { prefix_tokens } => prefix_tokens,
+        // A pinned prefix (standalone, or a session row's pin) is resident
+        // regardless of this partition's cache: `ResolvedPrefillContext::new`
+        // applies it, and admission reserves it with the request.
+        let cache_hit_tokens = match session_input {
+            SessionInput::Standalone | SessionInput::PinnedPrefix { .. } => 0,
             SessionInput::Session {
                 session_id,
                 declared_prefix_tokens,
                 ..
             } => self.prefix_caches[partition as usize].peek(session_id, declared_prefix_tokens),
         };
-        ResolvedPrefillContext::new(session_input, resident_prefix_tokens, fresh_prompt_tokens)
+        ResolvedPrefillContext::new(session_input, cache_hit_tokens, fresh_prompt_tokens)
     }
 
     fn reserve_prefill_context(
@@ -412,10 +412,12 @@ impl PrefixKv for KvCacheStore {
             // `ResolvedPrefillContext::new` borrows one token back from a fully
             // resident prefix so that a zero-length prefill never reaches the
             // model. The entry's position still sits at the boundary, so the
-            // resume point is off by that one borrowed token.
+            // resume point is off by that one borrowed token. A pin above the
+            // cache hit is the resident prefix instead.
             debug_assert!(
                 take_result
                     .hit_tokens
+                    .max(resolved_prefill.pinned_prefix_tokens())
                     .abs_diff(resolved_prefill.resident_prefix_tokens())
                     <= 1,
                 "prefill context changed between preview and reservation"
@@ -956,6 +958,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 100,
+                pinned_prefix_tokens: 0,
             },
         );
         assert_eq!(resolved_prefill.resident_prefix_tokens(), 0);
@@ -980,6 +983,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 60,
+                pinned_prefix_tokens: 0,
             }),
             Some(2)
         );
@@ -988,6 +992,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 40,
+                pinned_prefix_tokens: 0,
             }),
             Some(1),
             "equal reusable lengths keep the lowest partition deterministic"
@@ -1036,6 +1041,7 @@ mod tests {
             session_id: 7,
             session_start_time: Time::ZERO,
             declared_prefix_tokens: 0,
+            pinned_prefix_tokens: 0,
         };
         let resolved_prefill = kv_store.preview_prefill_context(0, 80, session_input);
         let session_footprint = kv_store.footprint(RequestId(0), 80, 0);
@@ -1134,6 +1140,106 @@ mod tests {
         }
     }
 
+    fn pinned_session(declared_prefix_tokens: u32, pinned_prefix_tokens: u32) -> SessionInput {
+        SessionInput::Session {
+            session_id: 7,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens,
+            pinned_prefix_tokens,
+        }
+    }
+
+    /// A session row's pin counts from the start of the round's context, so on
+    /// a first turn it covers fresh prompt tokens no cache could hold.
+    #[test]
+    fn a_session_pin_beyond_the_declared_prefix_is_resident_on_a_cold_partition() {
+        let kv_store =
+            KvCacheStore::without_prefix_cache(2, KvAccounting::tokens_for_test(10_000), None);
+        // Turn 0: prefix_kv = 0, input_len = 1106, prefix_len = 579.
+        let first_turn = pinned_session(0, 579);
+        assert_eq!(kv_store.retained_prefix_partition(first_turn), None);
+        assert_eq!(kv_store.resident_prefix_tokens(1_106, first_turn), 579);
+        for partition in 0..2 {
+            let resolved = kv_store.preview_prefill_context(partition, 1_106, first_turn);
+            assert_eq!(resolved.declared_prefix_tokens(), 0);
+            assert_eq!(resolved.pinned_prefix_tokens(), 579);
+            assert_eq!(resolved.resident_prefix_tokens(), 579);
+            assert_eq!(resolved.prefill_tokens_to_compute(), 527);
+            assert_eq!(resolved.post_prefill_context_tokens(), 1_106);
+            assert_eq!(resolved.active_chunk(), (579, 527));
+        }
+
+        // A pin covering the whole context still computes the last token.
+        let resolved = kv_store.preview_prefill_context(0, 100, pinned_session(0, 100));
+        assert_eq!(resolved.resident_prefix_tokens(), 99);
+        assert_eq!(resolved.prefill_tokens_to_compute(), 1);
+        assert_eq!(resolved.post_prefill_context_tokens(), 100);
+    }
+
+    /// `resident = max(pin, retained hit)` on whichever partition admission picks.
+    #[test]
+    fn a_session_pin_and_the_retained_hit_resolve_to_the_larger() {
+        let mut kv_store = KvCacheStore::new(
+            2,
+            KvAccounting::tokens_for_test(10_000),
+            capped_prefix_cache(10_000, PrefixCachePolicy::Lru),
+            None,
+            None,
+        );
+        kv_store.prefix_caches[1].insert(7, 1_150, 1_150, 10_000, None);
+
+        // Turn 1: prefix_kv = 1150, input_len = 78, prefix_len = 1175.
+        let pin_above_hit = pinned_session(1_150, 1_175);
+        assert_eq!(kv_store.retained_prefix_partition(pin_above_hit), Some(1));
+        for partition in 0..2 {
+            let resolved = kv_store.preview_prefill_context(partition, 78, pin_above_hit);
+            assert_eq!(resolved.resident_prefix_tokens(), 1_175);
+            assert_eq!(resolved.prefill_tokens_to_compute(), 53);
+            assert_eq!(resolved.post_prefill_context_tokens(), 1_228);
+        }
+
+        // A pin below the retained hit only matters off the retaining partition.
+        let pin_below_hit = pinned_session(1_150, 579);
+        let warm = kv_store.preview_prefill_context(1, 78, pin_below_hit);
+        assert_eq!(warm.resident_prefix_tokens(), 1_150);
+        assert_eq!(warm.prefill_tokens_to_compute(), 78);
+        let cold = kv_store.preview_prefill_context(0, 78, pin_below_hit);
+        assert_eq!(cold.resident_prefix_tokens(), 579);
+        assert_eq!(cold.prefill_tokens_to_compute(), 649);
+        assert_eq!(kv_store.resident_prefix_tokens(78, pin_below_hit), 1_150);
+
+        // No pin: exactly the existing session resolution.
+        let unpinned = kv_store.preview_prefill_context(0, 78, pinned_session(1_150, 0));
+        assert_eq!(unpinned.resident_prefix_tokens(), 0);
+        assert_eq!(unpinned.prefill_tokens_to_compute(), 1_228);
+    }
+
+    /// The pinned part is reserved with the request like any active KV; on
+    /// completion the round's context is retained as ordinary session KV.
+    #[test]
+    fn a_pinned_session_round_is_reserved_whole_and_retained_as_session_kv() {
+        let mut kv_store = KvCacheStore::new(
+            1,
+            KvAccounting::tokens_for_test(2_000),
+            capped_prefix_cache(2_000, PrefixCachePolicy::Lru),
+            None,
+            None,
+        );
+        let first_turn = pinned_session(0, 579);
+        let resolved = kv_store.preview_prefill_context(0, 1_106, first_turn);
+        let footprint =
+            kv_store.footprint(RequestId(0), resolved.post_prefill_context_tokens(), 40);
+        kv_store.reserve_prefill_context(RequestId(0), 0, resolved, footprint, Time::ZERO);
+        assert_eq!(kv_store.ledger.partition_promised(0), 1_146);
+
+        kv_store.drain_ready();
+        kv_store.clear_prefill_admits(0);
+        kv_store.commit_resident(RequestId(0), 0, 1_106, 40);
+        kv_store.release_retaining_prefix(RequestId(0), 0, Time::from_ms(1.0));
+        assert_eq!(kv_store.partitions[0].resident_units(), 0);
+        assert_eq!(kv_store.prefix_caches[0].peek(7, 1_106), 1_106);
+    }
+
     #[test]
     fn pinned_prefix_is_reserved_with_the_request_and_released_without_retention() {
         let log_directory = tempdir().unwrap();
@@ -1222,6 +1328,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 50,
+                pinned_prefix_tokens: 0,
             },
         );
         assert_eq!(resolved_prefill.resident_prefix_tokens(), 50);
@@ -1467,6 +1574,7 @@ mod tests {
             session_id: 7,
             session_start_time: Time::ZERO,
             declared_prefix_tokens: 0,
+            pinned_prefix_tokens: 0,
         };
         let finish = |resume_points| {
             let mut kv_store = state_store(
@@ -1674,6 +1782,7 @@ mod tests {
             session_id: 7,
             session_start_time: Time::ZERO,
             declared_prefix_tokens: 0,
+            pinned_prefix_tokens: 0,
         };
         let resolved = kv_store.preview_prefill_context(0, 8_000, session);
         let footprint = kv_store.footprint(RequestId(0), 8_000, 500);
@@ -1693,6 +1802,7 @@ mod tests {
             session_id: 7,
             session_start_time: Time::ZERO,
             declared_prefix_tokens: 8_500,
+            pinned_prefix_tokens: 0,
         };
         let resolved = kv_store.preview_prefill_context(0, 100, next_turn);
         assert_eq!(resolved.resident_prefix_tokens(), 7_999);
