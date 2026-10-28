@@ -40,7 +40,14 @@ pools:
           kv_new_token_ratio_decay_steps: 600
           kv_retract_decode_steps: 20
           decode_retraction_policy: length
-          gpu_time_multiplier: 1.0
+          # Fitted, not measured: measured decode iterations (consecutive SGLang
+          # timestamps, colocated arm) run 7-16% longer than the modeled ones at
+          # every batch size; 1.105 is the sim-time-weighted ratio over all
+          # buckets (tools/t2s/align_colocated.py). Not attributed per op: no
+          # kernel capture of this run exists; ops the model leaves out (sampling
+          # and logprobs over the 152k vocab, QKV bias, RoPE) grow with batch
+          # as the gap does.
+          gpu_time_multiplier: 1.105
 backends:
   main/unified.embedding: [triton]
   main/unified.pre_attn.input_norm: [flashinfer]
