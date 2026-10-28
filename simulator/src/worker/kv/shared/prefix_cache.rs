@@ -18,6 +18,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde::Deserialize;
 
+use crate::common::RequestId;
 use crate::worker::kv::shared::kv_accounting::{KvAccounting, ResumePositions, SharedKvAccounting};
 
 /// Whether completed-session KV may be retained after a request finishes.
@@ -129,6 +130,10 @@ struct PrefixEntry {
     insertion_sequence: u64,
     last_access_sequence: u64,
     frequency: u64,
+    /// The request that left this entry behind. Carried only so a drop with
+    /// no triggering request of its own — a worker being retired — still has a
+    /// truthful `request_id` to log the eviction against.
+    retained_by: RequestId,
 }
 
 /// Replacement metadata that follows a destructively consumed session until
@@ -160,6 +165,9 @@ pub(crate) enum PrefixCacheMutationKind {
     CapacityEviction,
     ReplacementPolicyEviction,
     Retain,
+    /// The whole tier went away with its worker. Not a capacity decision: the
+    /// entries would still have fit, the GPU is simply no longer serving them.
+    WorkerRetired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,6 +276,7 @@ impl PrefixCache {
     pub(crate) fn insert(
         &mut self,
         session_id: u32,
+        retained_by: RequestId,
         prompt_tokens: u64,
         context_tokens: u64,
         physical_limit: u64,
@@ -319,6 +328,7 @@ impl PrefixCache {
             insertion_sequence,
             last_access_sequence: sequence,
             frequency,
+            retained_by,
         };
         self.eviction_order
             .insert(self.eviction_key(session_id, &entry));
@@ -375,6 +385,30 @@ impl PrefixCache {
                 session_id,
             ),
         }
+    }
+
+    /// Throw the whole tier away, returning one receipt per entry paired with
+    /// the request that left it there.
+    ///
+    /// Not `shrink_to(0)`: that would report capacity evictions, and capacity is
+    /// not why these went. A worker handed to the trainer stops holding KV for
+    /// sessions it will never see again, and the sessions themselves are alive
+    /// — they will miss on whichever worker takes them over, which is the cost
+    /// this models.
+    pub(crate) fn drop_all(&mut self) -> Vec<(RequestId, PrefixCacheMutation)> {
+        let mut sessions: Vec<u32> = self.entries.keys().copied().collect();
+        // HashMap order is not the sim's to depend on; the log is a replay.
+        sessions.sort_unstable();
+        let mut receipts = Vec::with_capacity(sessions.len());
+        for session_id in sessions {
+            let retained_by = self.entries[&session_id].retained_by;
+            if let Some(mutation) =
+                self.remove_with_receipt(session_id, PrefixCacheMutationKind::WorkerRetired)
+            {
+                receipts.push((retained_by, mutation));
+            }
+        }
+        receipts
     }
 
     fn remove(&mut self, session_id: u32) -> Option<PrefixEntry> {
@@ -465,7 +499,7 @@ mod tests {
     #[test]
     fn take_transfers_ownership_instead_of_sharing() {
         let mut cache = cache(100, PrefixCachePolicy::Lru);
-        cache.insert(7, 80, 80, 100, None);
+        cache.insert(7, RequestId(7), 80, 80, 100, None);
         assert_eq!(cache.take(7, 50).hit_tokens, 50);
         assert_eq!(cache.peek(7, 50), 0);
         assert_eq!(cache.used_tokens(), 0);
@@ -474,8 +508,8 @@ mod tests {
     #[test]
     fn lru_evicts_the_oldest_retained_session() {
         let mut cache = cache(100, PrefixCachePolicy::Lru);
-        cache.insert(1, 60, 60, 100, None);
-        cache.insert(2, 60, 60, 100, None);
+        cache.insert(1, RequestId(1), 60, 60, 100, None);
+        cache.insert(2, RequestId(2), 60, 60, 100, None);
         assert_eq!(cache.peek(1, 60), 0);
         assert_eq!(cache.peek(2, 60), 60);
     }
@@ -483,8 +517,8 @@ mod tests {
     #[test]
     fn physical_slack_can_shrink_below_the_configured_ceiling() {
         let mut cache = cache(100, PrefixCachePolicy::Fifo);
-        cache.insert(1, 40, 40, 100, None);
-        cache.insert(2, 40, 40, 100, None);
+        cache.insert(1, RequestId(1), 40, 40, 100, None);
+        cache.insert(2, RequestId(2), 40, 40, 100, None);
         cache.shrink_to(40);
         assert_eq!(cache.used_tokens(), 40);
         assert_eq!(cache.peek(1, 40), 0);
@@ -496,11 +530,11 @@ mod tests {
         for (policy, expected_victim) in [(PrefixCachePolicy::Lru, 2), (PrefixCachePolicy::Fifo, 1)]
         {
             let mut cache = cache(100, policy);
-            cache.insert(1, 40, 40, 100, None);
-            cache.insert(2, 40, 40, 100, None);
+            cache.insert(1, RequestId(1), 40, 40, 100, None);
+            cache.insert(2, RequestId(2), 40, 40, 100, None);
             let take_result = cache.take(1, 40);
-            cache.insert(1, 40, 40, 100, take_result.return_metadata);
-            cache.insert(3, 40, 40, 100, None);
+            cache.insert(1, RequestId(1), 40, 40, 100, take_result.return_metadata);
+            cache.insert(3, RequestId(3), 40, 40, 100, None);
             assert_eq!(cache.peek(expected_victim, 40), 0);
         }
     }
@@ -508,15 +542,15 @@ mod tests {
     #[test]
     fn lfu_evicts_the_least_consumed_session_then_the_oldest() {
         let mut cache = cache(100, PrefixCachePolicy::Lfu);
-        cache.insert(1, 30, 30, 100, None);
-        cache.insert(2, 30, 30, 100, None);
-        cache.insert(3, 30, 30, 100, None);
+        cache.insert(1, RequestId(1), 30, 30, 100, None);
+        cache.insert(2, RequestId(2), 30, 30, 100, None);
+        cache.insert(3, RequestId(3), 30, 30, 100, None);
         // Session 1 was consumed once, so 2 (older than 3) goes first, then 3.
         let take_result = cache.take(1, 30);
-        cache.insert(1, 30, 30, 100, take_result.return_metadata);
-        cache.insert(4, 30, 30, 100, None);
+        cache.insert(1, RequestId(1), 30, 30, 100, take_result.return_metadata);
+        cache.insert(4, RequestId(4), 30, 30, 100, None);
         assert_eq!(cache.peek(2, 30), 0);
-        cache.insert(5, 30, 30, 100, None);
+        cache.insert(5, RequestId(5), 30, 30, 100, None);
         assert_eq!(cache.peek(3, 30), 0);
         assert_eq!(cache.peek(1, 30), 30);
     }
@@ -524,9 +558,9 @@ mod tests {
     #[test]
     fn largest_first_evicts_the_biggest_retained_session() {
         let mut cache = cache(100, PrefixCachePolicy::LargestFirst);
-        cache.insert(1, 70, 70, 100, None);
-        cache.insert(2, 20, 20, 100, None);
-        cache.insert(3, 30, 30, 100, None);
+        cache.insert(1, RequestId(1), 70, 70, 100, None);
+        cache.insert(2, RequestId(2), 20, 20, 100, None);
+        cache.insert(3, RequestId(3), 30, 30, 100, None);
         assert_eq!(cache.peek(1, 70), 0);
         assert_eq!(cache.peek(2, 20), 20);
         assert_eq!(cache.peek(3, 30), 30);
@@ -535,8 +569,8 @@ mod tests {
     #[test]
     fn mutation_receipts_form_an_exact_occupancy_replay() {
         let mut cache = cache(100, PrefixCachePolicy::Lru);
-        let first_insert = cache.insert(1, 60, 60, 100, None);
-        let second_insert = cache.insert(2, 60, 60, 100, None);
+        let first_insert = cache.insert(1, RequestId(1), 60, 60, 100, None);
+        let second_insert = cache.insert(2, RequestId(2), 60, 60, 100, None);
         let take = cache.take(2, 40);
 
         let mutations: Vec<PrefixCacheMutation> = first_insert

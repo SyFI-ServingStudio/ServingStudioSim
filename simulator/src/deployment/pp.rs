@@ -49,6 +49,7 @@ impl Deployment for PpDeployment {
         store: SharedRequests,
     ) -> anyhow::Result<Box<dyn Flow>> {
         let pool = &cfg.pools.stage;
+        pool.ensure_static("pp stage pool")?;
         ensure!(
             pool.groups.len() == 1,
             "pp: only a single homogeneous group is supported (got {})",
@@ -61,6 +62,11 @@ impl Deployment for PpDeployment {
         let placement = match pool.placement {
             PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
             PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+            // The trace's `target_worker` names a unified-pool worker; a PP
+            // replica is a whole pipeline, which no trace column describes.
+            PlacementPolicy::TraceDirected => {
+                bail!("pp: placement `trace-directed` is supported only by the unified deployment")
+            }
         };
         let model_spec = g.arch.model();
         let _scope =

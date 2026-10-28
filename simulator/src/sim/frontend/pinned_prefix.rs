@@ -21,7 +21,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use req_frontend::schema::format::text_generation::independent::{self, TextGenerationRow};
 use req_frontend::schema::format::ParsedIndependentRow;
 use req_frontend::schema::{
-    InputFileSchema, RequestPriority, RequestSession, RequestSlo, RequestSpeculative, TraceTag,
+    InputFileSchema, RequestPlacement, RequestPriority, RequestSession, RequestSlo,
+    RequestSpeculative, TraceTag,
 };
 use serde::de::DeserializeOwned;
 
@@ -106,6 +107,14 @@ pub(super) fn load(
             &at,
         )?;
         speculative.validate(&at)?;
+        let placement: RequestPlacement = decode_tag(
+            &record,
+            &headers,
+            input_file_schema,
+            TraceTag::Placement,
+            &at,
+        )?;
+        placement.validate(&at)?;
 
         rows.push(ParsedIndependentRow {
             row: TextGenerationIndependentRow {
@@ -116,6 +125,7 @@ pub(super) fn load(
             slo,
             priority,
             speculative,
+            placement,
         });
     }
     Ok(rows)
@@ -134,6 +144,7 @@ fn with_row(
         slo: parsed.slo,
         priority: parsed.priority,
         speculative: parsed.speculative,
+        placement: parsed.placement,
     }
 }
 

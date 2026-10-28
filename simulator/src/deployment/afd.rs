@@ -52,6 +52,8 @@ impl Deployment for AfdDeployment {
         bridge: &PerfApiBridge,
         store: SharedRequests,
     ) -> anyhow::Result<Box<dyn Flow>> {
+        cfg.pools.attn.ensure_static("afd attn pool")?;
+        cfg.pools.ffn.ensure_static("afd ffn pool")?;
         let ag = single_group(&cfg.pools.attn, "attn")?;
         let fg = single_group(&cfg.pools.ffn, "ffn")?;
 

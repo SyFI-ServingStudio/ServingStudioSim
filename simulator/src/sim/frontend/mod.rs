@@ -1225,6 +1225,7 @@ mod tests {
                 session_id: 0,
                 session_start_time: Time::from_ms(4.0),
                 declared_prefix_tokens: 512,
+                rounds_in_session: 1,
             }
         );
         assert_eq!(
@@ -1854,7 +1855,7 @@ mod tests {
         // A session-execution file declares its own sessions: no `session` tag.
         assert_eq!(
             formats[1]["tags"],
-            serde_json::json!(["slo", "priority", "speculative"])
+            serde_json::json!(["slo", "priority", "speculative", "placement"])
         );
         let speculative = described["tags"]
             .as_array()

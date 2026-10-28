@@ -11,8 +11,9 @@ use crate::arch::contract::{
     AttnArchInput, AttnLayerwiseModel, FfnArchInput, IterwiseUnifiedModel, UnifiedArchInput,
 };
 use crate::common::{
-    DecodingStrategy, Request, RequestCore, RequestId, RequestStore, SchedulingContract,
-    SessionInput, SharedRequests, SloContract, TextGenerationDefinition, Time,
+    DecodingStrategy, PlacementDirective, Request, RequestCore, RequestId, RequestStore,
+    SchedulingContract, SessionInput, SharedRequests, SloContract, TextGenerationDefinition, Time,
+    WorkerId,
 };
 use crate::timing::cache::interp::{CoverageFlags, Metrics4};
 use crate::timing::LeafMetrics;
@@ -59,6 +60,7 @@ pub(crate) const fn text_request(
                 e2e_slo: None,
             },
             scheduling: SchedulingContract { priority: 0 },
+            placement: PlacementDirective { worker: None },
         },
         TextGenerationDefinition {
             prompt_tokens,
@@ -67,6 +69,48 @@ pub(crate) const fn text_request(
             decoding: DecodingStrategy::Standard,
         },
     )
+}
+
+/// [`text_request`] plus the trace-declared worker a `trace-directed` pool must
+/// obey. Separate helper so the common case keeps its four arguments.
+pub(crate) const fn text_request_on(
+    request_id: RequestId,
+    prompt_tokens: u32,
+    target_output_tokens: u32,
+    arrival_time: Time,
+    target_worker: WorkerId,
+) -> Request<TextGenerationDefinition> {
+    let mut request = text_request(
+        request_id,
+        prompt_tokens,
+        target_output_tokens,
+        arrival_time,
+    );
+    request.core.placement = PlacementDirective {
+        worker: Some(target_worker),
+    };
+    request
+}
+
+/// One round of a multi-round conversation. The round's own index is not a
+/// field anywhere — the loader emits rounds in order and the request id carries
+/// that order — so this takes what the round actually declares.
+pub(crate) const fn session_round(
+    request_id: RequestId,
+    session_id: u32,
+    rounds_in_session: u32,
+    declared_prefix_tokens: u32,
+    prompt_tokens: u32,
+    target_output_tokens: u32,
+) -> Request<TextGenerationDefinition> {
+    let mut request = text_request(request_id, prompt_tokens, target_output_tokens, Time::ZERO);
+    request.definition.session = SessionInput::Session {
+        session_id,
+        session_start_time: Time::ZERO,
+        declared_prefix_tokens,
+        rounds_in_session,
+    };
+    request
 }
 
 /// Fixed-cost stand-in for an L4 model. `eval_iter` returns `time_ms = ms`

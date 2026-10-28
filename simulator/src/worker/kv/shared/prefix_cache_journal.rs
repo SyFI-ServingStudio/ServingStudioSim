@@ -78,6 +78,9 @@ impl PrefixCacheJournal {
             PrefixCacheMutationKind::ReplacementPolicyEviction => {
                 PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ReplacementPolicy)
             }
+            PrefixCacheMutationKind::WorkerRetired => {
+                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::WorkerRetired)
+            }
             PrefixCacheMutationKind::Retain => PrefixCacheEventKind::Retain(retain_reason),
         }
     }

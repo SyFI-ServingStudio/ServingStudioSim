@@ -13,5 +13,6 @@ pub use afd_ffn_pool::AfdFfnPoolController;
 pub use pd::{PdFlow, PD_DECODE_POOL, PD_PREFILL_POOL};
 pub use pp::{PpFlow, PpStagePoolConfig, PpStagePoolController, PP_STAGE_POOL};
 pub use simple_dp::{
-    DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, SimpleDpPoolController,
+    DpPlacementPolicy, GroupBy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig,
+    SimpleDpPoolController,
 };

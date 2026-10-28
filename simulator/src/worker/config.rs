@@ -441,6 +441,20 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
         prefill_chunk_alignment: Option<PrefillChunkAlignment>,
+        /// Whether completed-session KV may reuse currently idle attention KV.
+        /// `disabled` is the no-reuse control arm — the only way to price what
+        /// prefix reuse is worth on a session workload.
+        #[serde(default)]
+        #[param(string, default = "opportunistic", choices = PREFIX_CACHE_MODE_CHOICES)]
+        prefix_cache_mode: PrefixCacheMode,
+        /// Victim policy used only when retained session KV is enabled.
+        #[serde(default)]
+        #[param(string, default = "lru", choices = PREFIX_CACHE_POLICY_CHOICES)]
+        prefix_cache_policy: PrefixCachePolicy,
+        /// Optional ceiling (GB) for retained session KV inside the same
+        /// attention budget. None uses all dynamically available slack.
+        #[serde(default)]
+        prefix_cache_max_gpu_memory_gb: Option<f64>,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a

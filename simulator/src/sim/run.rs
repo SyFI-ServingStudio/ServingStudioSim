@@ -235,7 +235,11 @@ pub fn run_sim(
         //    arrival/completion delta, exhaustion is a trace cursor compare.
         let in_flight = frontend.in_flight();
         let exhausted = frontend.exhausted();
-        if exhausted && in_flight == 0 {
+        // A flow may own work the request ledger cannot see — an RL deployment
+        // keeps training after its last sample lands — so "every request is
+        // done" is necessary but no longer sufficient.
+        let background = flow.background();
+        if exhausted && in_flight == 0 && !background.outstanding {
             break TerminationCause::DrainComplete;
         }
         if !cfg.run_to_end && clock >= cfg.duration {
@@ -243,14 +247,22 @@ pub fn run_sim(
         }
 
         // 3b. Stuck watchdog. Progress means a request completed, a new request
-        //     was admitted, or an admitted request processed a prefill or output
-        //     token since the last sample. A full sample window with none of
-        //     these (trace already drained, work still in flight) is a deadlock;
-        //     a long decode tail with nothing completing is not. Only checked
-        //     post-exhaustion, where Stuck can occur, and once per sample, so the
-        //     store scan stays off the hot loop.
-        if exhausted && in_flight > 0 && watchdog.fire() {
-            let progress = liveness(frontend.num_completed(), &store.borrow());
+        //     was admitted, an admitted request processed a prefill or output
+        //     token, or the flow finished a unit of background work since the
+        //     last sample. A full sample window with none of these (trace
+        //     already drained, work still outstanding) is a deadlock; a long
+        //     decode tail with nothing completing is not. Background work counts
+        //     on both sides: a training tail has an idle request ledger by
+        //     construction, and without its chunk count every healthy one would
+        //     read as a deadlock. Only checked post-exhaustion, where Stuck can
+        //     occur, and once per sample, so the store scan stays off the hot
+        //     loop.
+        if exhausted && (in_flight > 0 || background.outstanding) && watchdog.fire() {
+            let progress = liveness(
+                frontend.num_completed(),
+                background.completed,
+                &store.borrow(),
+            );
             if progress != prev_progress {
                 prev_progress = progress;
                 idle_for = Time::ZERO;
@@ -360,11 +372,13 @@ struct Liveness {
     completed: u64,
     admitted: u64,
     tokens: u64,
+    background_completed: u64,
 }
 
-fn liveness(completed: u64, store: &RequestStore) -> Liveness {
+fn liveness(completed: u64, background_completed: u64, store: &RequestStore) -> Liveness {
     Liveness {
         completed,
+        background_completed,
         admitted: store.num_admitted(),
         tokens: store
             .iter_admitted()
@@ -539,12 +553,13 @@ mod tests {
     use super::*;
     use crate::common::{PoolId, RequestStore, SessionInput, SloContract, UnifiedStage, WorkerId};
     use crate::orchestrator::{
-        DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
+        DpPlacementPolicy, GroupBy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig,
+        TrainingConfig, UnifiedWorkerFactory,
     };
     use crate::sim::frontend::TraceFrontend;
     use crate::sim::frontend::{ArrivalSchedule, CapacityLimit, InputFileSchema};
     use crate::test_helpers::{text_request, FakeModel};
-    use crate::worker::{build_barebone_worker, WorkerConfig};
+    use crate::worker::{build_barebone_worker, TrainChunkCost, WorkerConfig};
     use std::cell::RefCell;
     use std::io::Write;
     use std::path::PathBuf;
@@ -580,6 +595,76 @@ mod tests {
         assert_eq!(cfg.snapshot_dt, Time::from_ms(10_000.0));
     }
 
+    /// The run does not end with the last request when the flow still owes
+    /// training: the loop keeps ticking, and the clock lands on the last chunk.
+    #[test]
+    fn a_run_does_not_end_while_training_is_outstanding() {
+        let dir = tempfile::tempdir().unwrap();
+        let trace = write_trace(dir.path(), 4);
+
+        let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+        let factory = UnifiedWorkerFactory::new(
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig::default(),
+            None,
+            "test-gpu".to_string(),
+            "main",
+            build_barebone_worker::<FakeModel>,
+        );
+        let cfg = SimpleDpConfig {
+            dp_pool: SimpleDpPoolConfig {
+                pool: PoolId(0),
+                num_workers: 1,
+                placement: DpPlacementPolicy::RoundRobin,
+                ignore_trace_placement: false,
+            },
+            migration: None,
+            training: Some(TrainingConfig {
+                workers_per_block: 1,
+                group_size: 2,
+                cost: TrainChunkCost {
+                    tokens_per_s: 10.0,
+                    overhead: Time::ZERO,
+                },
+                bulk_grab: 1,
+                tail_threshold: 0,
+                expected_groups: 0,
+            }),
+            group_by: GroupBy::IdBlock,
+            log_dir: None,
+        };
+        let mut flow = SimpleDpFlow::new(cfg, factory);
+        let mut frontend = TraceFrontend::load(
+            &[trace],
+            &InputFileSchema::text_generation_independent(),
+            ArrivalSchedule::trace_timed(1.0).unwrap(),
+            CapacityLimit::unlimited(),
+        )
+        .unwrap();
+        let mut logger = LoggerSession::open(dir.path(), true, false).unwrap();
+
+        let summary = run_sim(
+            &mut flow,
+            &store,
+            &mut frontend,
+            &mut logger,
+            &TickCfg::new(60_000.0, true, 100),
+        )
+        .unwrap();
+        assert_eq!(summary.cause, TerminationCause::DrainComplete);
+        assert_eq!(summary.requests_finished, 4);
+        // 4 requests of 8 + 3 tokens, two groups of two, one group per chunk at
+        // 10 tok/s: 2.2 s per chunk, back to back on the single block. The
+        // generation itself is a few tens of ms, so a run that stopped with the
+        // last request would land two orders of magnitude short of this.
+        assert!(
+            (4_400.0..4_600.0).contains(&summary.sim_ms),
+            "expected the run to end on the last training chunk, got {} ms",
+            summary.sim_ms,
+        );
+    }
+
     #[test]
     fn a_decode_tail_longer_than_a_watchdog_sample_is_not_stuck() {
         // One request decoding 300 tokens at 500 ms per iteration: 150 s after
@@ -602,7 +687,12 @@ mod tests {
                 pool: PoolId(0),
                 num_workers: 1,
                 placement: DpPlacementPolicy::RoundRobin,
+                ignore_trace_placement: false,
             },
+            migration: None,
+            training: None,
+            group_by: GroupBy::IdBlock,
+            log_dir: None,
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
         let mut frontend = TraceFrontend::load(
@@ -651,7 +741,12 @@ mod tests {
                 pool: PoolId(0),
                 num_workers: 2,
                 placement: DpPlacementPolicy::RoundRobin,
+                ignore_trace_placement: false,
             },
+            migration: None,
+            training: None,
+            group_by: GroupBy::IdBlock,
+            log_dir: None,
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
         let mut frontend = TraceFrontend::load(
@@ -717,7 +812,12 @@ mod tests {
                 pool: PoolId(0),
                 num_workers: 1,
                 placement: DpPlacementPolicy::RoundRobin,
+                ignore_trace_placement: false,
             },
+            migration: None,
+            training: None,
+            group_by: GroupBy::IdBlock,
+            log_dir: None,
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
         let mut frontend = TraceFrontend::load(
@@ -761,6 +861,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 100,
+                rounds_in_session: 1,
             };
             request.core.slo = SloContract {
                 ttft_slo: Some(Time::from_ms(300.0)),

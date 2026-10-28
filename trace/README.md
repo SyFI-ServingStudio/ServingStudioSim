@@ -37,6 +37,16 @@ req-frontend does not declare `prefix_len` yet: its replay client rejects a file
 that carries the column (`header does not match ... unexpected: ["prefix_len"]`).
 Keep pinned-prefix traces to the simulator until the client models the hit.
 
+### Optional `placement` tag: `target_worker`
+
+A trace that lists `input_file_tags: [placement]` carries one more column,
+`target_worker`, in either text format: the pool-relative worker index each row
+must run on. A blank cell declares no target. The simulator reads it only in a
+unified pool: `placement: trace-directed` obeys it (and refuses a blank row);
+any other placement refuses a placed trace unless the pool sets
+`trace_placement: ignore`. A target whose worker a migration retired follows the
+work to where it moved. PD and PP refuse `trace-directed`.
+
 Generate a deterministic fixed-shape
 capacity workload with:
 
@@ -130,6 +140,29 @@ The `.manifest.json` beside each one **is** tracked. It pins the source SHA-256,
 the policy, the arrival synthesis, and the totals (sessions, rounds,
 prompt/prefix/output tokens, planned prefix hit rate) a run needs to confirm it
 is replaying the trace it thinks it is.
+
+### `session_execution_v2_placed_smoke.csv` — the placement column
+
+`session_execution_v2_example.csv` plus one column:
+
+```text
+...,tool_wait_after_ms,target_worker
+```
+
+Same column the independent format already carries (`slime_rollout*.csv`), read
+only when the preset lists `input_file_tags: [placement]`, and obeyed only under
+`placement: trace-directed`. It is what makes a placement SEQUENCE reproducible:
+a load policy can be re-run, but it cannot be replayed.
+
+**Synthetic, and derived rather than measured.** Sessions alternate between two
+engines by parity, and session 1 switches engine at round 60 so the file
+contains a placement no affinity rule would produce. Three conversations / 211
+rounds is enough to exercise the path and not enough to measure anything —
+`presets/session_placed_prefix_sweep.yaml` uses it that way.
+
+The real thing is a measured multi-worker replay that recorded the engine per
+round. When that lands it goes in the same column, on the full `tracelab_*`
+trace, and this file stays as the smoke fixture.
 
 ### Regenerating
 

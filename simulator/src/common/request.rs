@@ -36,6 +36,23 @@ pub struct SloContract {
     pub e2e_slo: Option<Time>,
 }
 
+/// Where the trace says this request must run.
+///
+/// Routing, not ranking: a [`SchedulingContract`] orders a queue, a directive
+/// names a machine. Separate from scheduling because they have different
+/// consumers — L5 admission reads the priority and would have to ignore this,
+/// while L6 routing reads this and never sees a queue.
+///
+/// `None` is a real third state, not worker 0: the trace declines to place this
+/// request and the pool's own placement policy chooses. A pool configured to
+/// obey the trace refuses the `None` rather than inventing a worker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlacementDirective {
+    /// Pool-relative worker index. Bounds-checked by L6, which owns the replica
+    /// list; nothing below L6 knows how many workers exist.
+    pub worker: Option<WorkerId>,
+}
+
 /// Stable facts carried by every live request.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RequestCore {
@@ -44,14 +61,15 @@ pub struct RequestCore {
     pub arrival_time: Time,
     pub slo: SloContract,
     pub scheduling: SchedulingContract,
+    pub placement: PlacementDirective,
 }
 
 /// One concrete request whose definition fixes its family at the type level.
 ///
 /// ```compile_fail
 /// use simulator::common::{
-///     ImageExtent, ImageGenerationDefinition, Request, RequestCore, RequestId,
-///     SchedulingContract, SloContract, TextGenerationDefinition, Time,
+///     ImageExtent, ImageGenerationDefinition, PlacementDirective, Request, RequestCore,
+///     RequestId, SchedulingContract, SloContract, TextGenerationDefinition, Time,
 /// };
 /// fn accepts_text(_: Request<TextGenerationDefinition>) {}
 /// let image = Request::new(
@@ -60,6 +78,7 @@ pub struct RequestCore {
 ///         arrival_time: Time::ZERO,
 ///         slo: SloContract::default(),
 ///         scheduling: SchedulingContract::default(),
+///         placement: PlacementDirective::default(),
 ///     },
 ///     ImageGenerationDefinition {
 ///         text_prompt_tokens: 8,
@@ -101,6 +120,13 @@ pub struct ReprocessedPrefillEpisode {
     pub prefix_cache_hit_tokens: u32,
     pub prefill_tokens_processed: u32,
     pub completed: bool,
+    /// The worker holding this recomputation gave the request away before
+    /// finishing it, so nothing will ever complete this episode. Kept in the
+    /// list rather than dropped: the tokens were really spent and really
+    /// wasted, which is the quantity a migration study is measuring. Not a
+    /// parquet column — the list already says it, since an incomplete episode
+    /// followed by another one is exactly an abandoned one.
+    pub abandoned: bool,
 }
 
 /// Observations collected without changing request-family semantics.
@@ -233,11 +259,14 @@ impl ActiveRequest<TextGenerationDefinition> {
     }
 
     pub fn begin_reprocessed_prefill(&mut self, prefix_cache_hit_tokens: u32) {
+        // The bar is "no episode in flight", not "the last one finished": a
+        // request handed to another worker mid-recomputation legitimately
+        // starts over there, and its abandoned episode is never completed.
         assert!(
             self.telemetry
                 .reprocessed_prefills
                 .last()
-                .is_none_or(|episode| episode.completed),
+                .is_none_or(|episode| episode.completed || episode.abandoned),
             "request {} began overlapping reprocessed-prefill episodes",
             self.request.core.id.0,
         );
@@ -248,7 +277,19 @@ impl ActiveRequest<TextGenerationDefinition> {
                 prefix_cache_hit_tokens,
                 prefill_tokens_processed: 0,
                 completed: false,
+                abandoned: false,
             });
+    }
+
+    /// Give up the recomputation in flight, if there is one. Idempotent, and a
+    /// no-op for a request that was not being recomputed — the caller is a
+    /// drain, which does not know or care which of its requests were.
+    pub fn abandon_reprocessed_prefill(&mut self) {
+        if let Some(episode) = self.telemetry.reprocessed_prefills.last_mut() {
+            if !episode.completed {
+                episode.abandoned = true;
+            }
+        }
     }
 
     pub fn record_reprocessed_prefill_tokens(&mut self, tokens: u32) {

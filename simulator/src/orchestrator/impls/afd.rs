@@ -262,6 +262,7 @@ mod tests {
             session_id: 7,
             session_start_time: Time::ZERO,
             declared_prefix_tokens: 12,
+            rounds_in_session: 1,
         };
         flow.on_arrival(first);
         let mut completed = Vec::new();
@@ -290,6 +291,7 @@ mod tests {
             session_id: 7,
             session_start_time: Time::ZERO,
             declared_prefix_tokens: 12,
+            rounds_in_session: 1,
         };
         flow.on_arrival(second);
         for step in 3_000..6_000 {

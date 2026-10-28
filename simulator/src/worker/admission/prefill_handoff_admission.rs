@@ -200,4 +200,10 @@ where
     fn cancel_pending(&mut self, request: RequestId) -> bool {
         self.policy.remove(request).is_some()
     }
+
+    fn drain_pending(&mut self, out: &mut Vec<RequestId>) {
+        while let Some(candidate) = self.policy.pop(&mut self.policy_context) {
+            out.push(candidate.request_id);
+        }
+    }
 }

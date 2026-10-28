@@ -76,6 +76,11 @@ pub enum UnifiedStage {
     Decode = 2,
     /// Completed.
     Done = 3,
+    /// Drained off this worker by a migration: its KV has been released here
+    /// and it is on its way to another worker, which stamps `Pending` when it
+    /// takes over. Appended after `Done` so the existing discriminants keep
+    /// their stored values.
+    Suspended = 4,
 }
 
 impl UnifiedStage {
@@ -84,6 +89,7 @@ impl UnifiedStage {
         "active:prefill",
         "active:decode",
         "done:request",
+        "suspended:migration",
     ];
     pub const VOCAB: StageVocab = StageVocab {
         deployment: "unified",

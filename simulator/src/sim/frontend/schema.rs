@@ -15,10 +15,13 @@ use req_frontend::schema::format::{
     audio_to_text, image_to_text, image_to_video, omni_generation, text_generation, text_to_image,
     text_to_speech, text_to_video, video_to_text, ParsedIndependentRow,
 };
-use req_frontend::schema::{RequestPriority, RequestSession, RequestSlo, RequestSpeculative};
+use req_frontend::schema::{
+    RequestPlacement, RequestPriority, RequestSession, RequestSlo, RequestSpeculative,
+};
 
 use super::arrival::{
-    ReleaseMetadata, ScheduledRequest, SchedulingDeclaration, SessionReleaseMetadata,
+    PlacementDeclaration, ReleaseMetadata, ScheduledRequest, SchedulingDeclaration,
+    SessionReleaseMetadata,
 };
 use super::pinned_prefix::{self, TextGenerationIndependentRow};
 use crate::common::{
@@ -26,7 +29,7 @@ use crate::common::{
     ImageGenerationDefinition, ImageTextGenerationDefinition, ImageToVideoDefinition,
     OmniGenerationDefinition, RequestDefinition, RequestId, SessionInput, SloContract,
     SpeechGenerationDefinition, TextGenerationDefinition, Time, VideoExtent,
-    VideoGenerationDefinition, VideoTextGenerationDefinition,
+    VideoGenerationDefinition, VideoTextGenerationDefinition, WorkerId,
 };
 
 pub use req_frontend::schema::{InputFileFormat, InputFileSchema, RequestFamily, TraceTag};
@@ -49,10 +52,12 @@ struct ParsedMetadata {
     release: ReleaseMetadata,
     slo: SloContract,
     scheduling: SchedulingDeclaration,
+    placement: PlacementDeclaration,
     session_input: SessionInput,
     decoding: DecodingStrategy,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_independent_metadata(
     source_request_id: &str,
     trace_arrival_time_ms: f64,
@@ -60,7 +65,9 @@ fn parse_independent_metadata(
     slo: RequestSlo,
     priority: RequestPriority,
     speculative: RequestSpeculative,
+    placement: RequestPlacement,
     session_start_times: &mut HashMap<u32, Time>,
+    rounds_by_session: &HashMap<String, u32>,
     source_identities: &mut SourceIdentities,
 ) -> Result<ParsedMetadata> {
     let request_id = source_identities.intern_request(source_request_id);
@@ -81,6 +88,7 @@ fn parse_independent_metadata(
                     session_id,
                     session_start_time,
                     declared_prefix_tokens,
+                    rounds_in_session: rounds_by_session[source_session_id],
                 },
             )
         }
@@ -99,6 +107,9 @@ fn parse_independent_metadata(
                     "request {source_request_id:?}: priority does not fit ServingStudioSim's i32 contract"
                 )
             })?,
+        },
+        placement: PlacementDeclaration {
+            target_worker: placement.target_worker.map(WorkerId),
         },
         session_input,
         decoding: speculative.strategy(),
@@ -154,6 +165,30 @@ where
     Row: IndependentSourceRow,
     Definition: RequestDefinition,
 {
+    // How many rounds each conversation declares, counted before any row is
+    // built: a row cannot know its own session's total from itself, and the
+    // first round needs the same number as the last. Independent rows arrive in
+    // no particular order, so this is a tally rather than a running max.
+    let mut rounds_by_session: HashMap<String, u32> = HashMap::new();
+    for parsed in &rows {
+        if let Some(id) = parsed.session.session_id.as_deref() {
+            if !id.is_empty() {
+                *rounds_by_session.entry(id.to_owned()).or_insert(0) += 1;
+            }
+        }
+    }
+    // A conversation split across trace files would be counted once per file.
+    // Refused rather than mis-counted: `session_start_times` is the cross-file
+    // record of which sessions this load has already opened.
+    for id in rounds_by_session.keys() {
+        let session_id = source_identities.intern_session(id);
+        if session_start_times.contains_key(&session_id) {
+            bail!(
+                "session {id:?} appears in more than one trace file; a conversation's \
+                 rounds must all live in the same file for its round count to be right"
+            );
+        }
+    }
     for parsed in rows {
         let metadata = parse_independent_metadata(
             parsed.row.source_request_id(),
@@ -162,7 +197,9 @@ where
             parsed.slo,
             parsed.priority,
             parsed.speculative,
+            parsed.placement,
             session_start_times,
+            &rounds_by_session,
             source_identities,
         )?;
         let definition = build_definition(parsed.row, metadata.session_input, metadata.decoding)?;
@@ -170,6 +207,7 @@ where
             release: metadata.release,
             slo: metadata.slo,
             scheduling: metadata.scheduling,
+            placement: metadata.placement,
             definition,
         });
     }
@@ -221,6 +259,9 @@ impl TraceDefinition for TextGenerationDefinition {
                     let session_start_time = *session_start_times
                         .entry(session_id)
                         .or_insert(declared_session_start_time);
+                    // This format hands over a whole conversation at a time, so
+                    // its round count needs no tally.
+                    let rounds_in_session = usize_to_u32(rounds.len(), "rounds per session")?;
                     for round in rounds {
                         let request_id = source_identities.intern_request(round.request_id);
                         let declared_prefix_tokens = usize_to_u32(round.prefix_len, "prefix_len")?;
@@ -238,6 +279,9 @@ impl TraceDefinition for TextGenerationDefinition {
                                 priority: i32::try_from(round.priority.priority_or_default())
                                     .context("session request priority does not fit i32")?,
                             },
+                            placement: PlacementDeclaration {
+                                target_worker: round.placement.target_worker.map(WorkerId),
+                            },
                             definition: Self {
                                 prompt_tokens: usize_to_u32(round.input_len, "input_len")?,
                                 target_output_tokens: usize_to_u32(round.output_len, "output_len")?,
@@ -245,6 +289,7 @@ impl TraceDefinition for TextGenerationDefinition {
                                     session_id,
                                     session_start_time,
                                     declared_prefix_tokens,
+                                    rounds_in_session,
                                 },
                                 decoding: round.speculative.strategy(),
                             },

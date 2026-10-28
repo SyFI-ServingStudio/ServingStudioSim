@@ -144,6 +144,10 @@ impl IterWorkerKv for KvCacheStore {
         KvCacheStore::drain_ready(self);
     }
 
+    fn drop_retained_prefixes(&mut self, now: Time) {
+        KvCacheStore::drop_retained_prefixes(self, now);
+    }
+
     fn clear_prefill_admits(&mut self, partition: PartitionId) {
         KvCacheStore::clear_prefill_admits(self, partition);
     }
@@ -865,6 +869,24 @@ impl KvCacheStore {
         self.prefix_caches[partition as usize].shrink_to(physical_limit)
     }
 
+    /// Throw away every retained prefix this worker holds, one journal row per
+    /// entry. Called when the pool retires the worker: the tier's sessions are
+    /// still alive, they just have to be re-prefilled wherever they land next.
+    pub(crate) fn drop_retained_prefixes(&mut self, now: Time) {
+        for partition in 0..self.prefix_caches.len() as PartitionId {
+            for (retained_by, mutation) in self.prefix_caches[partition as usize].drop_all() {
+                self.journal.record_mutation(
+                    retained_by,
+                    partition,
+                    now,
+                    mutation,
+                    PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::WorkerRetired),
+                    0,
+                );
+            }
+        }
+    }
+
     fn retain_prefix(
         &mut self,
         request: RequestId,
@@ -879,6 +901,7 @@ impl KvCacheStore {
         let physical_limit = self.prefix_cache_physical_limit(partition);
         let insert_result = self.prefix_caches[partition as usize].insert(
             session_id,
+            request,
             prompt_tokens,
             tokens,
             physical_limit,
@@ -956,6 +979,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 100,
+                rounds_in_session: 1,
             },
         );
         assert_eq!(resolved_prefill.resident_prefix_tokens(), 0);
@@ -972,14 +996,15 @@ mod tests {
             None,
             None,
         );
-        kv_store.prefix_caches[1].insert(7, 50, 50, 100, None);
-        kv_store.prefix_caches[2].insert(7, 80, 80, 100, None);
+        kv_store.prefix_caches[1].insert(7, RequestId(7), 50, 50, 100, None);
+        kv_store.prefix_caches[2].insert(7, RequestId(7), 80, 80, 100, None);
 
         assert_eq!(
             kv_store.retained_prefix_partition(SessionInput::Session {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 60,
+                rounds_in_session: 1,
             }),
             Some(2)
         );
@@ -988,6 +1013,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 40,
+                rounds_in_session: 1,
             }),
             Some(1),
             "equal reusable lengths keep the lowest partition deterministic"
@@ -1007,7 +1033,7 @@ mod tests {
             None,
             None,
         );
-        kv_store.prefix_caches[0].insert(1, 80, 80, 100, None);
+        kv_store.prefix_caches[0].insert(1, RequestId(1), 80, 80, 100, None);
         assert_eq!(kv_store.prefix_caches[0].used_tokens(), 80);
 
         let footprint = kv_store.footprint(RequestId(0), 60, 30);
@@ -1036,6 +1062,7 @@ mod tests {
             session_id: 7,
             session_start_time: Time::ZERO,
             declared_prefix_tokens: 0,
+            rounds_in_session: 1,
         };
         let resolved_prefill = kv_store.preview_prefill_context(0, 80, session_input);
         let session_footprint = kv_store.footprint(RequestId(0), 80, 0);
@@ -1114,7 +1141,7 @@ mod tests {
             None,
             None,
         );
-        warm.prefix_caches[1].insert(7, 500, 500, 1_000, None);
+        warm.prefix_caches[1].insert(7, RequestId(7), 500, 500, 1_000, None);
 
         for kv_store in [&disabled, &warm] {
             assert_eq!(
@@ -1147,7 +1174,7 @@ mod tests {
             None,
             Some(prefix_cache_logger),
         );
-        kv_store.prefix_caches[0].insert(7, 100, 100, 400, None);
+        kv_store.prefix_caches[0].insert(7, RequestId(7), 100, 100, 400, None);
         let pinned = SessionInput::PinnedPrefix { prefix_tokens: 300 };
         let resolved_prefill = kv_store.preview_prefill_context(0, 40, pinned);
 
@@ -1214,7 +1241,7 @@ mod tests {
             None,
             None,
         );
-        kv_store.prefix_caches[0].insert(7, 60, 60, 100, None);
+        kv_store.prefix_caches[0].insert(7, RequestId(7), 60, 60, 100, None);
         let resolved_prefill = kv_store.preview_prefill_context(
             0,
             10,
@@ -1222,6 +1249,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 50,
+                rounds_in_session: 1,
             },
         );
         assert_eq!(resolved_prefill.resident_prefix_tokens(), 50);
@@ -1447,7 +1475,7 @@ mod tests {
         for (prompt_tokens, expected_hit, measured_percent) in expected {
             let mut kv_store = state_store(10_000_000, STATE_TOKENS, Some(BLOCK), None);
             let prompt = u64::from(prompt_tokens);
-            kv_store.prefix_caches[0].insert(7, prompt, prompt, 10_000_000, None);
+            kv_store.prefix_caches[0].insert(7, RequestId(7), prompt, prompt, 10_000_000, None);
             let hit = kv_store.prefix_caches[0].peek(7, prompt_tokens);
             assert_eq!(
                 hit, expected_hit,
@@ -1467,6 +1495,7 @@ mod tests {
             session_id: 7,
             session_start_time: Time::ZERO,
             declared_prefix_tokens: 0,
+            rounds_in_session: 1,
         };
         let finish = |resume_points| {
             let mut kv_store = state_store(
@@ -1531,8 +1560,14 @@ mod tests {
 
         // Ask to retain five blocks; only two fit, and the entry is cut at a
         // position rather than at whatever the budget allowed.
-        let insert_result =
-            kv_store.prefix_caches[0].insert(7, 5 * interval, 5 * interval, capacity, None);
+        let insert_result = kv_store.prefix_caches[0].insert(
+            7,
+            RequestId(7),
+            5 * interval,
+            5 * interval,
+            capacity,
+            None,
+        );
         assert_eq!(insert_result.retained_tokens, 2 * interval);
         assert_eq!(
             kv_store.prefix_caches[0].used_units(),
@@ -1550,7 +1585,8 @@ mod tests {
     #[test]
     fn a_prefix_shorter_than_one_block_is_not_retained() {
         let mut kv_store = state_store(10_000_000, STATE_TOKENS, Some(CHECKPOINT_INTERVAL), None);
-        let insert_result = kv_store.prefix_caches[0].insert(7, 2_047, 2_047, 10_000_000, None);
+        let insert_result =
+            kv_store.prefix_caches[0].insert(7, RequestId(7), 2_047, 2_047, 10_000_000, None);
         assert_eq!(insert_result.retained_tokens, 0);
         assert_eq!(kv_store.prefix_caches[0].used_units(), 0);
     }
@@ -1559,7 +1595,7 @@ mod tests {
     fn the_soft_tier_yields_entirely_when_the_hard_tier_fills_the_partition() {
         let capacity = 40_000;
         let mut kv_store = state_store(capacity, STATE_TOKENS, Some(CHECKPOINT_INTERVAL), None);
-        kv_store.prefix_caches[0].insert(7, 4_097, 4_097, capacity, None);
+        kv_store.prefix_caches[0].insert(7, RequestId(7), 4_097, 4_097, capacity, None);
         assert!(kv_store.prefix_caches[0].used_units() > 0);
 
         // Fill the hard tier: 8 residents × (one 2048 block + 3168 state) ≈ 41k,
@@ -1674,6 +1710,7 @@ mod tests {
             session_id: 7,
             session_start_time: Time::ZERO,
             declared_prefix_tokens: 0,
+            rounds_in_session: 1,
         };
         let resolved = kv_store.preview_prefill_context(0, 8_000, session);
         let footprint = kv_store.footprint(RequestId(0), 8_000, 500);
@@ -1693,6 +1730,7 @@ mod tests {
             session_id: 7,
             session_start_time: Time::ZERO,
             declared_prefix_tokens: 8_500,
+            rounds_in_session: 1,
         };
         let resolved = kv_store.preview_prefill_context(0, 100, next_turn);
         assert_eq!(resolved.resident_prefix_tokens(), 7_999);

@@ -6,7 +6,8 @@
 //! prevents it from becoming a generated-media request.
 
 use crate::common::{
-    Request, RequestCore, RequestDefinition, RequestId, SchedulingContract, SloContract, Time,
+    PlacementDirective, Request, RequestCore, RequestDefinition, RequestId, SchedulingContract,
+    SloContract, Time, WorkerId,
 };
 
 /// Session facts used only to order releases. Prefix requirements live in the
@@ -32,12 +33,23 @@ pub struct SchedulingDeclaration {
     pub priority: i32,
 }
 
+/// Worker placement declared by the trace's `placement` tag.
+///
+/// Kept apart from [`SchedulingDeclaration`] for the same reason the contracts
+/// are split downstream: this is read by L6 routing, the priority by L5
+/// admission. `None` means the row left the cell blank.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlacementDeclaration {
+    pub target_worker: Option<WorkerId>,
+}
+
 /// One parsed row with a statically known request definition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScheduledRequest<Definition: RequestDefinition> {
     pub release: ReleaseMetadata,
     pub slo: SloContract,
     pub scheduling: SchedulingDeclaration,
+    pub placement: PlacementDeclaration,
     pub definition: Definition,
 }
 
@@ -51,6 +63,9 @@ impl<Definition: RequestDefinition> ScheduledRequest<Definition> {
                 slo: self.slo,
                 scheduling: SchedulingContract {
                     priority: self.scheduling.priority,
+                },
+                placement: PlacementDirective {
+                    worker: self.placement.target_worker,
                 },
             },
             self.definition.clone(),
