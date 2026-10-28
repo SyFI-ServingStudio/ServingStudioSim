@@ -234,13 +234,19 @@ impl ActiveRequest<TextGenerationDefinition> {
     /// Request progress remains compute-only; the immutable declaration stays
     /// in `definition.session` for comparison in request-level logs.
     pub fn record_prefix_cache_hit_tokens(&mut self, prefix_cache_hit_tokens: u32) {
-        let declared_prefix_tokens = self.request.definition.session.declared_prefix_tokens();
+        let session = self.request.definition.session;
+        // A trace pin may cover more than the declared prefix (a first turn's
+        // shared system prompt); nothing else can.
+        let resident_bound = session
+            .declared_prefix_tokens()
+            .max(session.pinned_prefix_tokens());
         assert!(
-            prefix_cache_hit_tokens <= declared_prefix_tokens,
-            "request {} hit {} prefix tokens but declared only {}",
+            prefix_cache_hit_tokens <= resident_bound,
+            "request {} hit {} prefix tokens but declared {} and pinned {}",
             self.request.core.id.0,
             prefix_cache_hit_tokens,
-            declared_prefix_tokens,
+            session.declared_prefix_tokens(),
+            session.pinned_prefix_tokens(),
         );
         assert!(
             self.telemetry.prefix_cache_hit_tokens.is_none(),

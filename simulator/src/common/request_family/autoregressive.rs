@@ -33,6 +33,13 @@ pub enum SessionInput {
         /// is-final flag because under independent release the rounds may
         /// complete out of order.
         rounds_in_session: u32,
+        /// Trace-declared tokens, counted from the start of this round's full
+        /// context (`declared_prefix_tokens` + fresh prompt), that are resident
+        /// on the request's first admission whatever the chosen partition's
+        /// cache holds; 0 when the row declares none. It may exceed
+        /// `declared_prefix_tokens` (a cross-session system prompt on a first
+        /// turn) and never extends the context. A re-prefill drops it.
+        pinned_prefix_tokens: u32,
     },
 }
 
@@ -86,6 +93,52 @@ impl SessionInput {
             Self::Session {
                 rounds_in_session, ..
             } => rounds_in_session,
+        }
+    }
+
+    /// Leading context tokens the trace forces resident on first admission,
+    /// whatever any cache holds: a standalone pinned prefix, or a session
+    /// row's `prefix_len`.
+    pub const fn pinned_prefix_tokens(self) -> u32 {
+        match self {
+            Self::Standalone => 0,
+            Self::PinnedPrefix { prefix_tokens } => prefix_tokens,
+            Self::Session {
+                pinned_prefix_tokens,
+                ..
+            } => pinned_prefix_tokens,
+        }
+    }
+
+    /// The declaration a re-prefill of this request resolves, and the
+    /// formerly pinned tokens it must now compute as prompt.
+    ///
+    /// The trace's pinned hit describes the request's first admission only. A
+    /// retracted request recomputes its whole context: a standalone pinned
+    /// prefix becomes leading prompt tokens of a plain standalone request
+    /// (returned so the caller adds them to the recomputed prompt), and a
+    /// session keeps its `declared_prefix_tokens` requirement, which only the
+    /// partition's retained session KV can satisfy, but loses its pin.
+    pub const fn without_pinned_prefix(self) -> (Self, u32) {
+        match self {
+            Self::Standalone => (Self::Standalone, 0),
+            Self::PinnedPrefix { prefix_tokens } => (Self::Standalone, prefix_tokens),
+            Self::Session {
+                session_id,
+                session_start_time,
+                declared_prefix_tokens,
+                rounds_in_session,
+                ..
+            } => (
+                Self::Session {
+                    session_id,
+                    session_start_time,
+                    declared_prefix_tokens,
+                    rounds_in_session,
+                    pinned_prefix_tokens: 0,
+                },
+                0,
+            ),
         }
     }
 }

@@ -380,6 +380,13 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
                     .session_start_or(record.request.core.arrival_time),
             )
         };
+        // The trace's pinned hit holds for the first admission only: the
+        // re-prefill recomputes the whole context, leaving only what retained
+        // session KV can still supply.
+        let (session_input, unpinned_prefix_tokens) = session_input.without_pinned_prefix();
+        let reprocessed_input_tokens = reprocessed_input_tokens
+            .checked_add(unpinned_prefix_tokens)
+            .expect("reprocessed input length overflow");
         let resident_prefix_tokens =
             kv_store.resident_prefix_tokens(reprocessed_input_tokens, session_input);
         self.enqueue_sequence.freeze_retracted(

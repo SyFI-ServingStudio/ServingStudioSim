@@ -89,6 +89,7 @@ fn parse_independent_metadata(
                     session_start_time,
                     declared_prefix_tokens,
                     rounds_in_session: rounds_by_session[source_session_id],
+                    pinned_prefix_tokens: 0,
                 },
             )
         }
@@ -240,7 +241,7 @@ impl TraceDefinition for TextGenerationDefinition {
                     Ok(Self {
                         prompt_tokens: usize_to_u32(row.input_len, "input_len")?,
                         target_output_tokens: usize_to_u32(row.output_len, "output_len")?,
-                        session: pin_prefix(session, pinned_prefix_tokens, &row.id)?,
+                        session: pin_prefix(session, pinned_prefix_tokens),
                         decoding,
                     })
                 },
@@ -290,6 +291,7 @@ impl TraceDefinition for TextGenerationDefinition {
                                     session_start_time,
                                     declared_prefix_tokens,
                                     rounds_in_session,
+                                    pinned_prefix_tokens: 0,
                                 },
                                 decoding: round.speculative.strategy(),
                             },
@@ -572,23 +574,33 @@ fn usize_to_u32(value: usize, column: &str) -> Result<u32> {
 
 /// Attach a row's `prefix_len` to the session declaration its tags produced.
 /// Zero keeps the declaration unchanged, so a trace without pinned prefixes
-/// loads exactly as before the column existed.
-fn pin_prefix(
-    session: SessionInput,
-    pinned_prefix_tokens: u32,
-    source_request_id: &str,
-) -> Result<SessionInput> {
+/// loads exactly as before the column existed. A standalone row's pin extends
+/// its context before the fresh prompt; a session row's pin counts from the
+/// start of the round's context and was bounded by it at load.
+fn pin_prefix(session: SessionInput, pinned_prefix_tokens: u32) -> SessionInput {
     if pinned_prefix_tokens == 0 {
-        return Ok(session);
+        return session;
     }
     match session {
-        SessionInput::Standalone => Ok(SessionInput::PinnedPrefix {
+        SessionInput::Standalone => SessionInput::PinnedPrefix {
             prefix_tokens: pinned_prefix_tokens,
-        }),
-        SessionInput::Session { .. } | SessionInput::PinnedPrefix { .. } => bail!(
-            "request {source_request_id:?}: prefix_len pins a standalone request's prefix; \
-             a session row declares its reusable prefix with prefix_kv"
-        ),
+        },
+        SessionInput::PinnedPrefix { .. } => {
+            unreachable!("session tags never produce a pinned prefix")
+        }
+        SessionInput::Session {
+            session_id,
+            session_start_time,
+            declared_prefix_tokens,
+            rounds_in_session,
+            ..
+        } => SessionInput::Session {
+            session_id,
+            session_start_time,
+            declared_prefix_tokens,
+            rounds_in_session,
+            pinned_prefix_tokens,
+        },
     }
 }
 

@@ -447,12 +447,14 @@ mod tests {
                 session_start_time: Time::from_ms_u64(10),
                 declared_prefix_tokens: 0,
                 rounds_in_session: 1,
+                pinned_prefix_tokens: 0,
             };
             requests[RequestId(1)].request.definition.session = SessionInput::Session {
                 session_id: 1,
                 session_start_time: Time::from_ms_u64(1),
                 declared_prefix_tokens: 0,
                 rounds_in_session: 1,
+                pinned_prefix_tokens: 0,
             };
         }
         let mut worker = worker_with(Rc::clone(&store), config_with_budget(8));
@@ -507,6 +509,7 @@ mod tests {
                     session_start_time: Time::ZERO,
                     declared_prefix_tokens: 100,
                     rounds_in_session: 1,
+                    pinned_prefix_tokens: 0,
                 };
             }
         }
@@ -568,6 +571,7 @@ mod tests {
                     session_start_time: Time::ZERO,
                     declared_prefix_tokens: 100,
                     rounds_in_session: 1,
+                    pinned_prefix_tokens: 0,
                 };
             }
         }
@@ -1199,6 +1203,67 @@ mod tests {
         );
     }
 
+    /// A trace pin is a first-admission fact: the re-prefill after retraction
+    /// recomputes the whole context, standalone or session alike.
+    #[test]
+    fn a_retracted_request_recomputes_its_pinned_prefix() {
+        let session_pin = SessionInput::Session {
+            session_id: 1,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens: 0,
+            rounds_in_session: 1,
+            pinned_prefix_tokens: 3,
+        };
+        // Both variants keep the 4-token context of the unpinned scenario above,
+        // so the same retraction happens.
+        for (prompt_tokens, pinned, first_hit) in [
+            (2, SessionInput::PinnedPrefix { prefix_tokens: 2 }, 2),
+            (4, session_pin, 3),
+        ] {
+            let store = shared_with(&[(0, 4, 20), (1, prompt_tokens, 20)]);
+            store.borrow_mut()[RequestId(1)].request.definition.session = pinned;
+            let mut worker = build_chunked_prefill_worker(
+                WorkerId(0),
+                "main",
+                Arc::new(FakeModel::for_ms(1.0)),
+                Rc::clone(&store),
+                bounded_future_config(64, 24),
+                None,
+                PoolId(0),
+                "test-gpu",
+                test_cluster(),
+            );
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+            let mut events = Vec::new();
+            for step in 0..100 {
+                worker.tick(Time::from_ms(step as f64), &mut events);
+                if events.len() == 2 && worker.status().active_requests == 0 {
+                    break;
+                }
+            }
+
+            let requests = store.borrow();
+            let retracted = &requests[RequestId(1)];
+            assert!(retracted.lifecycle.completed, "{pinned:?}");
+            assert_eq!(retracted.telemetry.retraction_count, 1, "{pinned:?}");
+            assert_eq!(
+                retracted.telemetry.prefix_cache_hit_tokens,
+                Some(first_hit),
+                "{pinned:?}: the first admission honours the pin"
+            );
+            assert_eq!(retracted.progress.prefill_tokens_processed, 4 - first_hit);
+            let episode = retracted.telemetry.reprocessed_prefills[0];
+            assert!(episode.completed, "{pinned:?}");
+            assert_eq!(episode.prefix_cache_hit_tokens, 0, "{pinned:?}");
+            assert_eq!(
+                episode.prefill_tokens_processed,
+                4 + episode.output_tokens_before,
+                "{pinned:?}: the re-prefill recomputes the whole context"
+            );
+        }
+    }
+
     #[test]
     fn bounded_future_ratio_resets_after_the_worker_becomes_fully_idle() {
         let store = shared_with(&[(0, 4, 3)]);
@@ -1343,6 +1408,7 @@ mod tests {
                         session_start_time: Time::ZERO,
                         declared_prefix_tokens: 100,
                         rounds_in_session: 1,
+                        pinned_prefix_tokens: 0,
                     };
                 }
             }

@@ -218,6 +218,7 @@ mod tests {
             stage_pool_ids: Vec::new(),
             stage_worker_ids: Vec::new(),
             declared_prefix_tokens: 0,
+            pinned_prefix_tokens: 0,
             prefix_cache_hit_tokens: Some(0),
             fresh_prompt_tokens: 0,
             target_output_tokens: 0,

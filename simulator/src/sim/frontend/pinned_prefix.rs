@@ -1,10 +1,17 @@
 //! The optional `prefix_len` column of `text-generation-independent`.
 //!
-//! `prefix_len` declares how many tokens before a request's fresh `input_len`
-//! prompt are already resident in KV when it arrives, which the request carries
-//! as [`SessionInput::PinnedPrefix`](crate::common::SessionInput::PinnedPrefix).
+//! On a standalone row `prefix_len` declares how many tokens before a request's
+//! fresh `input_len` prompt are already resident in KV when it arrives, which
+//! the request carries as
+//! [`SessionInput::PinnedPrefix`](crate::common::SessionInput::PinnedPrefix).
 //! `input_len` keeps meaning the fresh tokens to compute, as in the session
 //! format's `prefix_len,input_len` pair.
+//!
+//! On a row with a `session_id` it declares how many leading tokens of the
+//! round's full context (`prefix_kv + input_len`) are resident on the request's
+//! first admission, carried as `SessionInput::Session::pinned_prefix_tokens`.
+//! It does not extend the context, so it must not exceed `prefix_kv +
+//! input_len`; it may exceed `prefix_kv`.
 //!
 //! req-frontend verifies an exact header and does not declare this column, so
 //! its loader refuses a file that carries it. Until it does, this module is the
@@ -78,16 +85,20 @@ pub(super) fn load(
         let session: RequestSession =
             decode_tag(&record, &headers, input_file_schema, TraceTag::Session, &at)?;
         session.validate(&at)?;
-        if pinned_prefix_tokens != 0
-            && session
-                .session_id
-                .as_deref()
-                .is_some_and(|id| !id.is_empty())
+        if session
+            .session_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
         {
-            bail!(
-                "{at}: prefix_len pins a standalone request's prefix; a session row declares \
-                 its reusable prefix with prefix_kv"
-            );
+            // On a session row the pin counts from the start of the round's
+            // full context, so it must fit inside `prefix_kv + input_len`.
+            let context_tokens = u64::from(session.prefix_kv.unwrap_or(0)) + row.input_len as u64;
+            if u64::from(pinned_prefix_tokens) > context_tokens {
+                bail!(
+                    "{at}: prefix_len={pinned_prefix_tokens} exceeds the session round's \
+                     context prefix_kv + input_len = {context_tokens}"
+                );
+            }
         }
         let slo: RequestSlo = decode_tag(&record, &headers, input_file_schema, TraceTag::Slo, &at)?;
         slo.validate(&at)?;

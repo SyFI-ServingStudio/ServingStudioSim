@@ -109,6 +109,7 @@ pub(crate) const fn session_round(
         session_start_time: Time::ZERO,
         declared_prefix_tokens,
         rounds_in_session,
+        pinned_prefix_tokens: 0,
     };
     request
 }
