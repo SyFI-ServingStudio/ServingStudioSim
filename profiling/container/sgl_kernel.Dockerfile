@@ -29,6 +29,7 @@ RUN apt-get update \
         ca-certificates \
         curl \
         git \
+        libnuma1 \
         ninja-build \
     && rm -rf /var/lib/apt/lists/* \
     && curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -48,9 +49,17 @@ COPY launcher /opt/vibesim/launcher
 COPY gpu /opt/vibesim/gpu
 
 # The envs images.py assigns this image (`selfcheck` loads their runners).
+# `docker build` has no GPU and so no driver: sgl_kernel's extension links
+# libcuda.so.1, which the toolkit ships only as a link stub (its other system
+# dependency, libnuma.so.1, is installed above). The stub is put on the loader
+# path for these import checks alone; at run time the container runtime mounts
+# the real driver.
 ARG VIBESIM_PROFILE_ENVS
-RUN python -c "import torch, sgl_kernel.flash_attn; assert torch.version.cuda == '12.8'; print(torch.__version__)" \
-    && python -m profiling.container.selfcheck ${VIBESIM_PROFILE_ENVS}
+RUN mkdir -p /tmp/cuda-stub \
+    && ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-stub/libcuda.so.1 \
+    && LD_LIBRARY_PATH=/tmp/cuda-stub python -c "import torch, sgl_kernel.flash_attn; assert torch.version.cuda == '12.8'; print(torch.__version__)" \
+    && LD_LIBRARY_PATH=/tmp/cuda-stub python -m profiling.container.selfcheck ${VIBESIM_PROFILE_ENVS} \
+    && rm -rf /tmp/cuda-stub
 
 # Last, so a new commit only rewrites the labels, not the dependency layers.
 ARG VIBESIM_REVISION=unknown
