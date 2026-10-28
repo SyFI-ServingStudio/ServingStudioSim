@@ -1,0 +1,55 @@
+# llama3-8b, two replicas: trace pins on session rows meet worker migration.
+#
+# Same pool and migration trigger as unified_llama3_8b_migration.yaml, with a
+# trace whose rows are sessions carrying `prefix_len` pins:
+#   - worker 0: 40 one-round sessions with a pinned 256-token system prompt, and
+#     round 0 of 16 two-round sessions (context 512 + 8, retained on worker 0);
+#   - worker 1: round 1 of those 16 sessions (prefix_kv 520, prefix_len 560, so
+#     the first admission hits 560 and computes 24), plus 48 staggered one-round
+#     sessions that make its active batch decay past the threshold.
+# When worker 1 is drained onto worker 0, every moved request re-prefills its
+# whole context, prompt + emitted, with a hit of 0 -- neither the pin nor
+# worker 0's retained KV of the same session counts. In request_slo:
+# `pinned_prefix_tokens`, `declared_prefix_tokens`, `prefix_cache_hit_tokens`,
+# `prefill_processed` (first admission) and the `reprocessed_prefill_*` lists.
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/session_pinned_migration_smoke.csv
+  input_file_format: text-generation-independent
+  # Declares the `target_worker` column. Without it the header check refuses
+  # the trace, and with it every row must carry a target.
+  input_file_tags: [session, placement]
+  arrival_mode: trace_timed
+  # The trace's `arrival_time` column is rate-1 normalized, so pin the rate to
+  # 1 req/s and the CSV's milliseconds are the milliseconds the sim replays.
+  # The default (10) would compress this trace's timeline tenfold.
+  request_rate: 1.0
+  run_to_end: true
+
+io:
+  log_dir: logs/unified_llama3_8b_session_pin_migration
+  # The migration is only observable through the stage timeline.
+  log_stage_transitions: true
+
+pools:
+  main:
+    placement: trace-directed
+    migration: active-batch-below
+    migration_threshold: 32
+    migration_cooldown_ms: 50.0
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 2
+        arch:
+          type: llama3_dense
+          model_config: model/config/llama3_8b.json
+        worker:
+          # `chunked_prefill`, not `barebone`: only its admission lifecycle can
+          # take over a request whose KV another worker dropped.
+          type: chunked_prefill
+          attn_gpu_memory_gb: 120.0
+          max_batch_tokens: 2048
+          batch_policy: mix
+          gpu_time_multiplier: 1.0
