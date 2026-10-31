@@ -49,6 +49,7 @@ import yaml
 from launcher.corpus import ROUTING_FILES, resolve_reference
 from public_api import preset as public_preset
 from public_api.deployments import (
+    DEFAULT_JOBS,
     BadMember,
     DeploymentIndex,
     Member,
@@ -486,7 +487,7 @@ class SimIndex:
         self,
         check: Callable[[SimMember, Capture, bool], tuple],
         *,
-        jobs: int = 8,
+        jobs: int = DEFAULT_JOBS,
     ) -> None:
         """Check every member's captures as a run would (``check``:
         :func:`public_api.simulate.check_capture`), recording the profile.db

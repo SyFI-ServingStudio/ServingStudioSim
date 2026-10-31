@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 
 import pytest
 
@@ -16,8 +15,6 @@ from public_api.sources import Sources
 
 PRESETS = sim_preset.sim_preset_paths()
 
-# The checks run one simulator process per member; use the host's cores.
-JOBS = min(64, os.cpu_count() or 8)
 
 
 def _ids(paths):
@@ -56,7 +53,7 @@ def bound(sim_bin) -> tuple[sim_preset.SimIndex, object]:
         }
     )
     index = DeploymentIndex.build(
-        sources.cost_trees, sources.list_params(), sim_commit=None, paths=arch_paths, jobs=JOBS
+        sources.cost_trees, sources.list_params(), sim_commit=None, paths=arch_paths
     )
     return sim_preset.SimIndex.build(index), schema_from_dict(sources.list_params())
 
@@ -70,7 +67,6 @@ def sims(bound) -> sim_preset.SimIndex:
         lambda member, capture, build: simulate.check_capture(
             sims.index, member, capture, registry, build=build
         ),
-        jobs=JOBS,
     )
     return sims
 

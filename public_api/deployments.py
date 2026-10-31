@@ -18,6 +18,7 @@ config the same way, so a tree's leaf and the Kernels page name one config.
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -34,6 +35,9 @@ from public_api import preset as public_preset
 REPO_ROOT = public_preset.REPO_ROOT
 # Members built by one ``cost_trees`` call.
 _MEMBERS_PER_CALL = 4
+# Presets built, and members checked, at once: each worker runs one simulator
+# call, so startup scales with the host's cores (64 halves 8's two minutes).
+DEFAULT_JOBS = min(64, os.cpu_count() or 8)
 
 
 class UnknownDeployment(LookupError):
@@ -228,7 +232,7 @@ class DeploymentIndex:
         *,
         sim_commit: str | None,
         paths: list[Path] | None = None,
-        jobs: int = 8,
+        jobs: int = DEFAULT_JOBS,
     ) -> DeploymentIndex:
         """Load each preset, expand and complete its members against the schema,
         resolve their captures and build them, one ``cost_trees`` call per preset."""
@@ -279,7 +283,9 @@ class DeploymentIndex:
                     index._add(preset.id, position, member, result)
         return index
 
-    def check(self, missing_specs: Callable[[Member], dict[str, int]], *, jobs: int = 8) -> None:
+    def check(
+        self, missing_specs: Callable[[Member], dict[str, int]], *, jobs: int = DEFAULT_JOBS
+    ) -> None:
         """Ask profile.db, per built member, which rows its kernels lack.
         ``missing_specs`` counts them by the kernel's dotted role, the role its
         config lists in ``uses``."""

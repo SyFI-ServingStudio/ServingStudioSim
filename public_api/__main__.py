@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 from profiling.perf_api import DB_PATH
+from public_api.deployments import DEFAULT_JOBS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,7 +28,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     serve.add_argument("--build-type", default="release", help="Simulator build to introspect.")
     serve.add_argument(
-        "--jobs", type=int, default=8, help="Presets built, and members checked, at once."
+        "--jobs",
+        type=int,
+        default=DEFAULT_JOBS,
+        help="Presets built, and members checked, at once (default min(64, CPUs)).",
     )
     serve.add_argument(
         "--runs-dir",

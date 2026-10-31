@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 
@@ -19,8 +18,6 @@ from public_api.sources import Sources
 
 PRESETS = public_preset.preset_paths()
 
-# The checks run one simulator process per member; use the host's cores.
-JOBS = min(64, os.cpu_count() or 8)
 CAPTURE = re.compile(
     r"^hf://datasets/UW-SyFI/servingstudio-workload@[0-9a-f]{40}/"
     r"[a-z0-9_]+/[a-z0-9_]+/[a-z0-9_]+/capture/\d{8}/(popularity|manifest)\.json$"
@@ -116,9 +113,9 @@ def test_every_named_arch_is_one_the_simulator_has(sim_bin):
 def index(sim_bin) -> DeploymentIndex:
     sources = Sources(db_path=DB_PATH)
     index = DeploymentIndex.build(
-        sources.cost_trees, sources.list_params(), sim_commit=None, jobs=JOBS
+        sources.cost_trees, sources.list_params(), sim_commit=None
     )
-    index.check(lambda member: predict.missing_specs(member), jobs=JOBS)
+    index.check(lambda member: predict.missing_specs(member))
     return index
 
 
