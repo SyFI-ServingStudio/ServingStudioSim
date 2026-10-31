@@ -1086,3 +1086,30 @@ def test_trtllm_fp8_rope_free_operands_and_launch_match_vllm() -> None:
     assert calls[0]["qk_rope_head_dim"] == 0
     assert calls[0]["max_seq_len"] == calls[0]["sparse_mla_top_k"] == 8
     assert calls[0]["sparse_mla_top_k_lens"] is operands.top_k_lens
+
+
+def test_trtllm_fp8_operands_are_seeded_standard_normal_per_token_and_head() -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    validated = runner._ValidatedArgs(
+        num_queries=3,
+        num_cache_tokens=130,
+        valid_counts=(1, 2, 3),
+        index_distribution="recent_contiguous",
+    )
+
+    def build():
+        return runner._build_trtllm_fp8_operands(
+            torch, validated, num_heads=4, rope_dim=0, selected_k=8, device=torch.device("cpu")
+        )
+
+    first, second = build(), build()
+    assert torch.equal(first.query.view(torch.uint8), second.query.view(torch.uint8))
+    assert torch.equal(first.cache.view(torch.uint8), second.cache.view(torch.uint8))
+    query = first.query.float()
+    cache = first.cache.float()
+    # Every token and head holds its own values, not one broadcast row.
+    assert not torch.equal(query[0, 0, 0], query[1, 0, 1])
+    assert not torch.equal(cache[0, 0, 0], cache[1, 0, 5])
+    assert abs(float(cache.std()) - 1.0) < 0.05
+    assert abs(float(query.mean())) < 0.05
