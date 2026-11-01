@@ -52,3 +52,8 @@ model/work/examples/
 
 /tmp/
 .cache/
+
+# Local-only: stray smoke profile DB (untracked in 72b153f3) and a separate
+# TraceLab checkout (github.com/serendipity-zk/TraceLab) used by the load generator.
+/branch
+alignment/load_generator/tracelab/
