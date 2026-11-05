@@ -24,7 +24,7 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
-use crate::timing::kernels::fa4_varlen_projection::B200_SMS;
+use crate::timing::kernels::fa4_varlen_projection::{B200_SMS, HOPPER_SMS};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Coords, Dim, KernelConfig, SweepCoords};
 
@@ -34,6 +34,10 @@ const MAX_HEADS_PER_CTA: u32 = 8;
 const BATCH_TAIL: [u32; 9] = [16, 24, 32, 48, 64, 96, 128, 192, 256];
 /// Longest-context knots; the split is linear in the context between them.
 const CONTEXT_KNOTS: [u32; 8] = [1, 256, 1024, 4096, 16384, 32768, 65536, 131072];
+/// Hopper FA3 (`vllm_fa3`) serves the 1M-token context; its grid goes on to it.
+const LONG_CONTEXT_KNOTS: [u32; 3] = [262144, 524288, 1048576];
+/// The Hopper backend: vLLM's FLASH_ATTN (FA3) over the FP8 cache.
+pub(crate) const FA3_BACKEND: &str = "vllm_fa3";
 const FILL_KNOTS: [f64; 4] = [0.0, 0.25, 0.5, 1.0];
 /// Profiling cap on one batch's KV bytes (the runner's `_MAX_KV_BYTES`).
 const MAX_KV_BYTES: f64 = (32u64 << 30) as f64;
@@ -54,6 +58,22 @@ pub struct PagedAttnBatchDecodeKernelConfig {
 }
 
 impl PagedAttnBatchDecodeKernelConfig {
+    fn is_fa3(&self) -> bool {
+        self.backends.contains(&FA3_BACKEND)
+    }
+
+    fn sms(&self) -> f64 {
+        if self.is_fa3() { HOPPER_SMS } else { B200_SMS }
+    }
+
+    fn context_axis(&self) -> Vec<f64> {
+        let mut knots = CONTEXT_KNOTS.to_vec();
+        if self.is_fa3() {
+            knots.extend(LONG_CONTEXT_KNOTS);
+        }
+        Axis::values(knots)
+    }
+
     /// CTA columns per request: query heads over the heads one CTA covers.
     fn ctas_per_request(&self) -> u32 {
         let group = self.num_qo_heads.get() / self.num_kv_heads.get();
@@ -68,7 +88,7 @@ impl PagedAttnBatchDecodeKernelConfig {
     /// Batch knots: both sides of every step in the split count (each batch
     /// while it drops at every request) and of the one-wave edge, then the tail.
     fn batch_axis(&self) -> Vec<f64> {
-        let wave = (B200_SMS as u32 / self.ctas_per_request()).max(1);
+        let wave = (self.sms() as u32 / self.ctas_per_request()).max(1);
         let splits = |batch: u32| (wave / batch).max(1);
         let mut knots: Vec<u32> = (1..=wave + 1)
             .filter(|&batch| {
@@ -148,7 +168,7 @@ impl KernelSpec for PagedAttnBatchDecodeSpec {
         );
         SweepGrid::new(vec![
             config.batch_axis(),
-            Axis::values(CONTEXT_KNOTS),
+            config.context_axis(),
             FILL_KNOTS.to_vec(),
         ])
     }

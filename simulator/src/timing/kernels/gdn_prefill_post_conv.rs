@@ -50,6 +50,17 @@ impl KernelSpec for GdnPrefillPostConvSpec {
         CacheKind::Cache1DLinear
     }
 
+    /// The kernel indexes the mixed QKV rows as `token * stride + column` in
+    /// int32 (`fused_gdn_prefill_post_conv.py`), so a launch whose last offset
+    /// (`num_tokens * stride - 1`) passes `i32::MAX` reads out of bounds: for
+    /// Qwen3.8 (stride 10240) the 262144 knot faults with an illegal address on
+    /// H100. Such steps cannot run, so their cells are not profiled.
+    fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
+        let stride = 2 * u64::from(config.num_qk_heads.get() * config.key_head_dim.get())
+            + u64::from(config.num_value_heads.get() * config.value_head_dim.get());
+        grid.expand_1d(|num_tokens| num_tokens as u64 * stride > 1 << 31)
+    }
+
     fn enumerate(
         config: &Self::Config,
         grid: &SweepGrid,
@@ -184,7 +195,19 @@ mod tests {
             1
         );
         assert_eq!(grid.axes()[0][4..7], [16.0, 17.0, 32.0]);
-        assert!(GdnPrefillPostConvSpec::infeasible_mask(&cfg, &grid).is_empty());
+        // Stride 8192: 262144 rows end exactly at i32::MAX, so every cell runs.
+        assert!(!GdnPrefillPostConvSpec::infeasible_mask(&cfg, &grid).contains(&true));
+    }
+
+    /// Qwen3.8's 48 value heads (stride 10240) overflow the kernel's int32
+    /// offsets at the 262144 knot only.
+    #[test]
+    fn cells_past_the_int32_offsets_are_masked() {
+        let cfg = GdnPrefillPostConvKernelConfig { num_value_heads: 48.into(), ..config() };
+        let grid = GdnPrefillPostConvSpec::sweep_grid(&cfg);
+        let mask = GdnPrefillPostConvSpec::infeasible_mask(&cfg, &grid);
+        let masked: Vec<f64> = grid.axes()[0].iter().zip(&mask).filter(|(_, &m)| m).map(|(&t, _)| t).collect();
+        assert_eq!(masked, [262144.0]);
     }
 
     #[test]

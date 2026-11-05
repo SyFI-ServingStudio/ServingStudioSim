@@ -319,6 +319,71 @@ register(
     )
 )
 
+# vLLM's static per-tensor FP8 linear (ModelOpt FP8) on SM90: CutlassFP8ScaledMMLinearKernel
+# (the FlashInfer kernel above is SM10x-only); ops.cutlass_scaled_mm, seen as
+# cutlass_3x_gemm_sm90_fp8 in the Hopper alignment captures (2026-11-03).
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cutlass_fp8_tensor",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            sm_targets=frozenset({"sm_90a"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.vllm_cutlass_fp8_tensor",
+            function_name="profile_single_gemm_vllm_cutlass_fp8_tensor",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's CutlassFP8ScaledMMLinearKernel after its activation quantization: "
+                "ops.cutlass_scaled_mm on fp8 A and the column-major fp8 weight, one FP32 "
+                "scale each, bf16 output. Hopper path."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py",
+        ),
+    )
+)
+
+# vLLM's NVFP4 (ModelOpt) dense linear on GPUs without FP4 tensor cores (Hopper):
+# MarlinNvFp4LinearKernel, weight-only W4A16 -- the bf16 activation is not quantized,
+# Marlin dequantizes the packed E2M1 weight in-register. is_fp4_marlin_supported()
+# needs compute capability 75+; the Hopper alignment captures (2026-11-03, the
+# ServingStudio vLLM fork on H100/H200) select it for every NVFP4 linear.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_marlin_nvfp4",
+        supports=BackendSupport(
+            compute=frozenset({DType.NVFP4_E2M1}),
+            sm_targets=frozenset({"sm_90a"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.vllm_marlin_nvfp4",
+            function_name="profile_single_gemm_vllm_marlin_nvfp4",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's MarlinNvFp4LinearKernel: apply_fp4_marlin_linear on the bf16 "
+                "activation and the Marlin-repacked E2M1 weight (per-16 E4M3 scales, "
+                "FP32 global scale), bf16 output; no activation quantization (W4A16). "
+                "Hopper path for NVFP4 checkpoints."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/nvfp4/marlin.py",
+        ),
+    )
+)
+
 # MXFP8 dense linear: one slot = the swizzled MXFP8 activation quant +
 # FlashInfer CuTe-DSL block-scaled GEMM that
 # FlashInferCutedslMxfp8LinearKernel.apply_weights issues, bf16 out.

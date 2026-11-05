@@ -44,6 +44,8 @@
 
 /// SMs on the only supported GPU (NVIDIA B200).
 pub(crate) const B200_SMS: f64 = 148.0;
+/// SMs on H100 SXM and H200 (both GH100 with 132 enabled).
+pub(crate) const HOPPER_SMS: f64 = 132.0;
 /// The work unit: one KV tile of 128 keys.
 const TILE_N: f64 = 128.0;
 /// Per-CTA prologue/epilogue cost in KV-tile units.

@@ -27,6 +27,15 @@
 //!
 //! Sampling, the GDN state post-processing (`postprocess_mamba`) and host
 //! overhead are not modeled.
+//!
+//! Kernel path. The GPU selects it (`KernelPath::of`): SM10x is the captured B200
+//! graph above. Hopper (H100/H200; no FP4 tensor cores) is the graph vLLM runs
+//! there, from the ServingStudio-fork captures on H100 and H200 (2026-11-03):
+//! NVFP4 linears are Marlin W4A16 (`MarlinNvFp4LinearKernel`, no activation
+//! quant, so the MLP's two quants and the lm_head quant drop out), the FP8
+//! projections are `CutlassFP8ScaledMMLinearKernel`, and attention is the
+//! FLASH_ATTN backend (FlashAttention 3) over the FP8 cache. GDN, norms, KV
+//! append and the Inductor kernels are the same kinds and backends on both.
 
 use anyhow::Result;
 
@@ -88,6 +97,45 @@ const SIGMOID_GATING_DECODE_BACKENDS: &[&str] = &["vllm_triton_sigmoid_gating"];
 const KV_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 /// trtllm-gen: FA4 has no FP8-KV path at head dim 256.
 const ATTENTION_BACKENDS: &[&str] = &["flashinfer_trtllm_gen"];
+/// Hopper: Cutlass SM90 FP8 (`CutlassFP8ScaledMMLinearKernel`).
+const SM90_FP8_GEMM_BACKENDS: &[&str] = &["vllm_cutlass_fp8_tensor"];
+/// Hopper: Marlin W4A16 (`MarlinNvFp4LinearKernel`).
+const SM90_NVFP4_GEMM_BACKENDS: &[&str] = &["vllm_marlin_nvfp4"];
+/// Hopper: vLLM's FLASH_ATTN backend (FlashAttention 3) over the FP8 cache.
+const SM90_ATTENTION_BACKENDS: &[&str] = &["vllm_fa3"];
+
+/// Which captured execution graph the GPU runs (see the module doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelPath {
+    /// SM10x (B200/B300): FP4 tensor cores, trtllm-gen attention.
+    Sm100,
+    /// SM90 (H100/H200): Marlin W4A16, Cutlass FP8, FlashAttention 3.
+    Sm90,
+}
+
+impl KernelPath {
+    pub fn of(gpu_name: &str) -> Self {
+        let g = gpu_name.to_ascii_uppercase();
+        if ["H100", "H200", "H800", "H20", "GH200"].iter().any(|h| g.contains(h)) {
+            Self::Sm90
+        } else {
+            Self::Sm100
+        }
+    }
+    fn fp8_gemm(self) -> &'static [&'static str] {
+        match self { Self::Sm100 => FP8_GEMM_BACKENDS, Self::Sm90 => SM90_FP8_GEMM_BACKENDS }
+    }
+    fn nvfp4_gemm(self) -> &'static [&'static str] {
+        match self { Self::Sm100 => NVFP4_GEMM_BACKENDS, Self::Sm90 => SM90_NVFP4_GEMM_BACKENDS }
+    }
+    fn attention(self) -> &'static [&'static str] {
+        match self { Self::Sm100 => ATTENTION_BACKENDS, Self::Sm90 => SM90_ATTENTION_BACKENDS }
+    }
+    /// W4A16: the BF16 activation feeds the NVFP4 GEMM directly.
+    fn nvfp4_weight_only(self) -> bool {
+        self == Self::Sm90
+    }
+}
 /// `hidden_states[logits_indices]`: an int64 index per selected row.
 const INT64_INDEX_BYTES: u32 = 8;
 
@@ -166,7 +214,9 @@ pub struct Qwen35VllmConfigs {
     pub mlp: VllmNvfp4SwigluMlpLocalWorkletConfig,
     pub final_norm: MultiAddRmsNormKernelConfig,
     pub logits_select: ElementwiseKernelConfig,
-    pub lm_head_quant: Nvfp4QuantKernelConfig,
+    pub kernel_path: KernelPath,
+    /// `None` on the weight-only (Hopper) path.
+    pub lm_head_quant: Option<Nvfp4QuantKernelConfig>,
     pub lm_head: SingleGemmKernelConfig,
 }
 
@@ -181,6 +231,7 @@ pub fn build_configs(
         )));
     }
     let gpu = parallel.gpu_name.clone();
+    let path = KernelPath::of(&gpu);
     let p = &model.precisions;
     // What the norm in front of a mixer writes: the BF16 row when a BF16
     // projection reads it, the FP8 row for the FP8 projection.
@@ -223,7 +274,7 @@ pub fn build_configs(
             ssm_state_dtype: model.gdn_state_dtype,
             proj_dtype: p.gdn_in_proj_qkvz.gemm_dtype(),
             gpu_name: gpu.clone(),
-            proj_gemm_backends: FP8_GEMM_BACKENDS.to_vec(),
+            proj_gemm_backends: path.fp8_gemm().to_vec(),
             ba_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
             static_quant_backends: INDUCTOR_BACKENDS.to_vec(),
             triton_elementwise_backends: TRITON_ELEMENTWISE_BACKENDS.to_vec(),
@@ -251,11 +302,11 @@ pub fn build_configs(
             kv_dtype: KV_DTYPE,
             proj_dtype: p.gqa_qkv_proj.gemm_dtype(),
             gpu_name: gpu.clone(),
-            proj_gemm_backends: FP8_GEMM_BACKENDS.to_vec(),
+            proj_gemm_backends: path.fp8_gemm().to_vec(),
             qk_norm_rope_backends: VLLM_TRITON_BACKENDS.to_vec(),
             static_quant_backends: INDUCTOR_BACKENDS.to_vec(),
             kv_append_backends: KV_APPEND_BACKENDS.to_vec(),
-            attention_backends: ATTENTION_BACKENDS.to_vec(),
+            attention_backends: path.attention().to_vec(),
         },
         // The MLP's NVFP4 quant reads the BF16 normed row.
         post_attention_norm: norm(&gpu, model.hidden, 2, false, true, false),
@@ -265,8 +316,9 @@ pub fn build_configs(
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
             quant_backends: NVFP4_QUANT_BACKENDS.to_vec(),
-            gemm_backends: NVFP4_GEMM_BACKENDS.to_vec(),
+            gemm_backends: path.nvfp4_gemm().to_vec(),
             activation_backends: INDUCTOR_BACKENDS.to_vec(),
+            weight_only: path.nvfp4_weight_only(),
         },
         final_norm: norm(&gpu, model.hidden, 3, false, true, false),
         // One hidden row and its int64 index in, the row out.
@@ -276,16 +328,17 @@ pub fn build_configs(
             hidden_bytes + INT64_INDEX_BYTES,
             hidden_bytes,
         ),
-        lm_head_quant: Nvfp4QuantKernelConfig {
+        kernel_path: path,
+        lm_head_quant: (!path.nvfp4_weight_only()).then(|| Nvfp4QuantKernelConfig {
             backends: NVFP4_QUANT_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
             hidden_size: model.hidden.into(),
             group_size: NVFP4_GROUP_SIZE,
             input_dtype: ACTIVATION_DTYPE,
             scale_format: NVFP4_SWIZZLED_SCALE_FORMAT.to_string(),
-        },
+        }),
         lm_head: SingleGemmKernelConfig {
-            backends: NVFP4_GEMM_BACKENDS.to_vec(),
+            backends: path.nvfp4_gemm().to_vec(),
             gpu_name: gpu,
             n: model.vocab_size.into(),
             k: model.hidden.into(),
@@ -465,7 +518,7 @@ pub struct Qwen35VllmModel {
     groups: Vec<LayerGroup>,
     final_norm: Op<MultiAddRmsNormKernel>,
     logits_select: Op<ElementwiseKernel>,
-    lm_head_quant: Op<Nvfp4QuantKernel>,
+    lm_head_quant: Option<Op<Nvfp4QuantKernel>>,
     lm_head: Op<SingleGemmKernel>,
     kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
@@ -500,13 +553,11 @@ pub fn build(
             ElementwiseKernel::build,
             bridge,
         )?,
-        lm_head_quant: atomic(
-            n,
-            "lm_head_input_quant",
-            cfg.lm_head_quant.clone(),
-            Nvfp4QuantKernel::build,
-            bridge,
-        )?,
+        lm_head_quant: cfg
+            .lm_head_quant
+            .clone()
+            .map(|c| atomic(n, "lm_head_input_quant", c, Nvfp4QuantKernel::build, bridge))
+            .transpose()?,
         lm_head: atomic(
             n,
             "lm_head",
@@ -570,7 +621,9 @@ impl Qwen35VllmModel {
             .collect();
         children.push(self.final_norm.compile(&mut builder));
         children.push(self.logits_select.compile(&mut builder));
-        children.push(self.lm_head_quant.compile(&mut builder));
+        if let Some(q) = &self.lm_head_quant {
+            children.push(q.compile(&mut builder));
+        }
         children.push(self.lm_head.compile(&mut builder));
         let root = CostNode::Labeled {
             label: format!(
@@ -603,12 +656,9 @@ impl Qwen35VllmModel {
             false,
             ev,
         );
-        push_or_zero(
-            &self.lm_head_quant,
-            Nvfp4QuantKernelInput { num_tokens: logits },
-            false,
-            ev,
-        );
+        if let Some(q) = &self.lm_head_quant {
+            push_or_zero(q, Nvfp4QuantKernelInput { num_tokens: logits }, false, ev);
+        }
         push_or_zero(
             &self.lm_head,
             SingleGemmKernelInput { m: logits },
@@ -862,6 +912,37 @@ mod tests {
         assert_eq!(shape(&c.final_norm), (3, false, true, false));
         assert_eq!((c.lm_head.n.get(), c.lm_head.k.get()), (248320, 5120));
         assert_eq!(c.lm_head.dtype, DType::Nvfp4E2m1);
+    }
+
+    /// Hopper serves the NVFP4 linears weight-only (Marlin), the FP8 linears
+    /// with Cutlass and attention with FA3, and has no activation FP4 quants.
+    #[test]
+    fn hopper_takes_the_sm90_kernel_path() {
+        for gpu in ["NVIDIA H100 80GB HBM3", "NVIDIA H200"] {
+            let par = Qwen35VllmParallel {
+                gpu_name: gpu.into(),
+                ..parallel()
+            };
+            let c = build_configs(&model_cfg(), &par).unwrap();
+            assert_eq!(c.kernel_path, KernelPath::Sm90, "{gpu}");
+            assert_eq!(c.lm_head.backends, ["vllm_marlin_nvfp4"]);
+            assert_eq!(c.mlp.gemm_backends, ["vllm_marlin_nvfp4"]);
+            assert!(c.mlp.weight_only && c.lm_head_quant.is_none());
+            assert_eq!(c.gdn.proj_gemm_backends, ["vllm_cutlass_fp8_tensor"]);
+            assert_eq!(c.gqa.proj_gemm_backends, ["vllm_cutlass_fp8_tensor"]);
+            assert_eq!(c.gqa.attention_backends, ["vllm_fa3"]);
+
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let model = build("unified".into(), resolve_configs(&c), &bridge).unwrap();
+            model.check_input(&step(vec![(0, 629)], vec![400; 5])).unwrap();
+            let slots = model.cost_log_manifest().slots.len();
+            // Two quants fewer per MLP group and none before the head.
+            assert_eq!(slots, 2 * (2 + 23 + 3) + (2 + 8 + 3) + 3);
+        }
+        let b200 = build_configs(&model_cfg(), &parallel()).unwrap();
+        assert_eq!(b200.kernel_path, KernelPath::Sm100);
+        assert!(!b200.mlp.weight_only && b200.lm_head_quant.is_some());
     }
 
     #[test]
