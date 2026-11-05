@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from profiling.db.args import DType
@@ -36,8 +37,18 @@ ROUTING_METHODS = {"minimax2": 7, "deepseek_v3": 2, "renormalize_naive": 4}
 ROUTING_ELEMENT_BYTES = {"minimax2": 2, "deepseek_v3": 4, "renormalize_naive": 2}
 # The SGLang deferred-finalize backend is only measured for MiniMax2.
 SGLANG_ROUTING_METHODS = frozenset({"minimax2"})
-_PREPARED_WEIGHT_CACHE: dict[tuple[str, int, int, int, int], tuple[Any, Any, Any, Any]] = {}
+_PREPARED_WEIGHT_CACHE: dict[tuple[str, int, int, int, int], _PreparedExperts] = {}
 SGLANG_PDL_MAX_TOKENS = 8192
+FP4_E2M1_MAX = 6.0
+FP8_E4M3_MAX = 448.0
+# Synthetic expert weights: seeded so every worker process times the same bytes
+# for a shape. The kernel's work does not depend on the values, but its power
+# draw, and so its clock, does: all-zero weights (an uninitialized allocation)
+# ran FC1 7% faster than quantized Gaussian ones on B200.
+_WEIGHT_SEED = 0
+_HIDDEN_SEED = 1
+_WEIGHT_STD = 0.02
+_CALIBRATION_TOKENS = 256
 
 
 def _load_vllm_runtime() -> tuple[Any, Any, Any]:
@@ -51,8 +62,8 @@ def _load_vllm_runtime() -> tuple[Any, Any, Any]:
     except ImportError as exc:
         raise ProfilerNotImplemented("FlashInfer and instrumented vLLM are required") from exc
 
-    def quantize(source: Any, input_scale: Any) -> tuple[Any, Any, None]:
-        packed, scales = ops.scaled_fp4_quant(source, input_scale, is_sf_swizzled_layout=False)
+    def quantize(source: Any, global_scale: Any) -> tuple[Any, Any, None]:
+        packed, scales = ops.scaled_fp4_quant(source, global_scale, is_sf_swizzled_layout=False)
         return packed, scales.view(torch.float8_e4m3fn).reshape(*packed.shape[:-1], -1), None
 
     def prepare(w1: Any, w2: Any, s1: Any, s2: Any, **dims: Any) -> tuple[Any, ...]:
@@ -73,8 +84,8 @@ def _load_sglang_runtime() -> tuple[Any, Any, Any]:
     except ImportError as exc:
         raise ProfilerNotImplemented("the SGLang environment is required") from exc
 
-    def quantize(source: Any, input_scale: Any) -> tuple[Any, Any, Any]:
-        return _quantize_sglang_hidden(torch, fp4_quantize, source, input_scale)
+    def quantize(source: Any, global_scale: Any) -> tuple[Any, Any, Any]:
+        return _quantize_sglang_hidden(torch, fp4_quantize, source, global_scale)
 
     def prepare(w1: Any, w2: Any, s1: Any, s2: Any, **dims: Any) -> tuple[Any, ...]:
         return prepare_static_weights_for_trtllm_fp4_moe(w1, w2, s1, s2, **dims, is_gated=True)
@@ -108,44 +119,121 @@ def _load_runtime(stack: str) -> tuple[Any, Any, Any]:
     return loaders[stack]()
 
 
-def _packed_weight(torch: Any, experts: int, n: int, k: int) -> Any:
-    return torch.empty((experts, n, k // 2), dtype=torch.uint8, device="cuda")
+@dataclass(frozen=True)
+class _PreparedExperts:
+    """One shape's quantized expert weights and the scales a checkpoint pairs with them.
+
+    The scalars follow vLLM's TRT-LLM NVFP4 experts (trtllm_nvfp4_moe.py):
+    g1_alphas = a13_scale * w13_scale_2, g1_scale_c = g1_alphas / a2_scale and
+    g2_alphas = a2_scale * w2_scale_2, one value per local expert.
+    """
+
+    w1: Any
+    s1: Any
+    w2: Any
+    s2: Any
+    # 1 / a13_scale: the static global scale the hidden states are quantized with.
+    hidden_global_scale: Any
+    output1_scale: Any
+    output1_gate_scale: Any
+    output2_scale: Any
+
+
+def _global_scale(torch: Any, amax: Any) -> Any:
+    """ModelOpt's NVFP4 global scale: map the tensor's amax to FP8 max * FP4 max."""
+    return (FP8_E4M3_MAX * FP4_E2M1_MAX / amax.float().clamp(min=1e-12)).reshape(())
 
 
 def _prepared_weights(
     torch: Any,
+    quantize: Any,
     prepare: Any,
     *,
     stack: str,
     experts: int,
     hidden_size: int,
     intermediate_size: int,
-) -> tuple[Any, Any, Any, Any]:
+) -> _PreparedExperts:
+    """Quantize seeded Gaussian BF16 expert weights the way a checkpoint holds them.
+
+    Each expert's W13 and W2 get their own global scale from their amax, and the
+    block scales come out of the same NVFP4 quantizer the hidden states use, so
+    the FP4 codes and FP8 block scales are spread like a real checkpoint's
+    rather than constant. The static activation scales (a13 for the hidden
+    states, a2 for the SwiGLU output) are calibrated on seeded Gaussian tokens
+    through these weights, as ModelOpt calibrates its input scales; vLLM keeps
+    the maximum over experts. Generation is seeded, so every worker process
+    builds the same weights for a shape.
+    """
+
     key = (stack, torch.cuda.current_device(), experts, hidden_size, intermediate_size)
     cached = _PREPARED_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
 
-    w1 = _packed_weight(torch, experts, 2 * intermediate_size, hidden_size)
-    w2 = _packed_weight(torch, experts, hidden_size, intermediate_size)
-    s1 = torch.ones(
-        (experts, 2 * intermediate_size, hidden_size // GROUP_SIZE),
-        dtype=torch.float8_e4m3fn,
+    generator = torch.Generator(device="cuda").manual_seed(_WEIGHT_SEED)
+    calibration = torch.randn(
+        (_CALIBRATION_TOKENS, hidden_size),
+        generator=generator,
+        dtype=torch.float32,
         device="cuda",
-    )
-    s2 = torch.ones(
-        (experts, hidden_size, intermediate_size // GROUP_SIZE),
-        dtype=torch.float8_e4m3fn,
-        device="cuda",
-    )
-    cached = prepare(
-        w1,
-        w2,
-        s1,
-        s2,
+    ).to(torch.bfloat16)
+    a13_scale = 1.0 / _global_scale(torch, calibration.abs().amax())
+    w1_parts, s1_parts, w2_parts, s2_parts = [], [], [], []
+    w13_scale_2 = torch.empty(experts, dtype=torch.float32, device="cuda")
+    w2_scale_2 = torch.empty(experts, dtype=torch.float32, device="cuda")
+    a2_amax = torch.zeros((), dtype=torch.float32, device="cuda")
+    for expert in range(experts):
+        w13 = (
+            torch.randn(
+                (2 * intermediate_size, hidden_size),
+                generator=generator,
+                dtype=torch.float32,
+                device="cuda",
+            )
+            * _WEIGHT_STD
+        ).to(torch.bfloat16)
+        w2 = (
+            torch.randn(
+                (hidden_size, intermediate_size),
+                generator=generator,
+                dtype=torch.float32,
+                device="cuda",
+            )
+            * _WEIGHT_STD
+        ).to(torch.bfloat16)
+        gate_up = (calibration @ w13.T).float()
+        gate, up = gate_up.chunk(2, dim=-1)
+        a2_amax = torch.maximum(a2_amax, (torch.nn.functional.silu(gate) * up).abs().amax())
+        for weight, packed_parts, scale_parts, scale_2 in (
+            (w13, w1_parts, s1_parts, w13_scale_2),
+            (w2, w2_parts, s2_parts, w2_scale_2),
+        ):
+            global_scale = _global_scale(torch, weight.abs().amax())
+            packed, block_scale, _ = quantize(weight, global_scale)
+            packed_parts.append(packed)
+            scale_parts.append(block_scale)
+            scale_2[expert] = 1.0 / global_scale
+    a2_scale = 1.0 / _global_scale(torch, a2_amax)
+    w1, s1, w2, s2 = prepare(
+        torch.stack(w1_parts),
+        torch.stack(w2_parts),
+        torch.stack(s1_parts),
+        torch.stack(s2_parts),
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=experts,
+    )
+    g1_alphas = a13_scale * w13_scale_2
+    cached = _PreparedExperts(
+        w1=w1,
+        s1=s1,
+        w2=w2,
+        s2=s2,
+        hidden_global_scale=1.0 / a13_scale,
+        output1_scale=g1_alphas / a2_scale,
+        output1_gate_scale=g1_alphas,
+        output2_scale=a2_scale * w2_scale_2,
     )
     _PREPARED_WEIGHT_CACHE[key] = cached
     return cached
@@ -156,10 +244,13 @@ def _quantized_hidden(
     quantize: Any,
     num_tokens: int,
     hidden_size: int,
+    global_scale: Any,
 ) -> tuple[Any, Any, Any]:
-    source = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
-    input_scale = torch.ones((), dtype=torch.float32, device="cuda")
-    return quantize(source, input_scale)
+    generator = torch.Generator(device="cuda").manual_seed(_HIDDEN_SEED)
+    source = torch.randn(
+        (num_tokens, hidden_size), generator=generator, dtype=torch.float32, device="cuda"
+    ).to(torch.bfloat16)
+    return quantize(source, global_scale)
 
 
 def _call_trtllm_fp4_moe(
@@ -391,18 +482,22 @@ def _profile_nvfp4_fused_moe_sm100(
             per_expert_batches=args["per_expert_batches"],
         )
         routing_logits, routing_bias = forced_routing(torch, ids, args)
-        hidden, hidden_scale, per_token_scale = _quantized_hidden(
-            torch, quantize, args["num_tokens"], args["hidden_size"]
-        )
-        w1, s1, w2, s2 = _prepared_weights(
+        experts = _prepared_weights(
             torch,
+            quantize,
             prepare,
             stack=stack,
             experts=args["num_local_experts"],
             hidden_size=args["hidden_size"],
             intermediate_size=args["intermediate_size"],
         )
-        expert_scale = torch.ones(args["num_local_experts"], dtype=torch.float32, device="cuda")
+        hidden, hidden_scale, per_token_scale = _quantized_hidden(
+            torch,
+            quantize,
+            args["num_tokens"],
+            args["hidden_size"],
+            experts.hidden_global_scale,
+        )
         output = (
             torch.empty(
                 (args["num_tokens"], args["hidden_size"]),
@@ -449,18 +544,18 @@ def _profile_nvfp4_fused_moe_sm100(
                     **routing_kwargs,
                     "hidden_states": hidden,
                     "hidden_states_scale": hidden_scale,
-                    "gemm1_weights": w1,
-                    "gemm1_weights_scale": s1,
+                    "gemm1_weights": experts.w1,
+                    "gemm1_weights_scale": experts.s1,
                     "gemm1_bias": None,
                     "gemm1_alpha": None,
                     "gemm1_beta": None,
                     "gemm1_clamp_limit": None,
-                    "gemm2_weights": w2,
-                    "gemm2_weights_scale": s2,
+                    "gemm2_weights": experts.w2,
+                    "gemm2_weights_scale": experts.s2,
                     "gemm2_bias": None,
-                    "output1_scale_scalar": expert_scale,
-                    "output1_scale_gate_scalar": expert_scale,
-                    "output2_scale_scalar": expert_scale,
+                    "output1_scale_scalar": experts.output1_scale,
+                    "output1_scale_gate_scalar": experts.output1_gate_scale,
+                    "output2_scale_scalar": experts.output2_scale,
                     "num_experts": args["num_experts"],
                     "top_k": args["top_k"],
                     "intermediate_size": args["intermediate_size"],

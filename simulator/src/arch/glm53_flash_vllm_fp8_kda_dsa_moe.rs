@@ -152,12 +152,6 @@ const NVFP4_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 const NVFP4_GEMM_BACKENDS: &[&str] = &["flashinfer_cutedsl"];
 const NVFP4_FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_sm100"];
 const ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
-/// TP8 stand-in for MNNVL below the 128-token cap. The MNNVL workspace fails
-/// on the profiling host since 2026-10-03 (`cuMulticastAddDevice` returns
-/// CUDA_ERROR_ILLEGAL_STATE at 4 and 8 GPUs; jobs 3410, 3413), so the TP8 rows
-/// cannot be measured; TRT-LLM IPC is what vLLM's `auto` backend falls back to
-/// on a single node when that workspace fails (`flashinfer_all_reduce.py:137-160`).
-const TP8_ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_trtllm"];
 const LARGE_ALL_REDUCE_BACKENDS: &[&str] = &["nccl"];
 
 /// The checkpoint's dimensions, read strictly from its `config.json`.
@@ -609,7 +603,6 @@ pub fn build_configs(
     demand: &ExpertDemand,
 ) -> std::result::Result<Glm53FlashVllmConfigs, BuildError> {
     let tp = u32::from(parallel.tp_size);
-    let all_reduce_backends = tp_all_reduce_backends(tp);
     // TP1 has no TP boundary: it is the one-GPU pipeline stage or DP rank,
     // which builds its layers without the all-reduces. `build`, which always
     // builds them, refuses TP1 itself.
@@ -781,7 +774,7 @@ pub fn build_configs(
         mhc: mhc.clone(),
         mhc_fused: mhc,
         all_reduce: AllReduceFusionKernelConfig {
-            backends: all_reduce_backends.to_vec(),
+            backends: ALL_REDUCE_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
             num_gpus: tp,
             hidden_dim: model.hidden,
@@ -1684,21 +1677,13 @@ where
     ev.push(metrics, || input.clone().into());
 }
 
-fn tp_all_reduce_backends(tp: u32) -> &'static [&'static str] {
-    if tp == 8 {
-        TP8_ALL_REDUCE_BACKENDS
-    } else {
-        ALL_REDUCE_BACKENDS
-    }
-}
-
 /// A graph with TP boundaries needs vLLM's fused all-reduce workspace at
 /// `tp_size`; TP1 has none.
 fn refuse_unfused_all_reduce(
     parallel: &Glm53FlashVllmParallel,
 ) -> std::result::Result<(), BuildError> {
     let tp = u32::from(parallel.tp_size);
-    match fused_all_reduce_refusal(tp_all_reduce_backends(tp), &parallel.gpu_name, tp) {
+    match fused_all_reduce_refusal(ALL_REDUCE_BACKENDS, &parallel.gpu_name, tp) {
         Some(reason) => Err(fit_failed(format!("tp_size {tp}: {reason}"))),
         None => Ok(()),
     }
@@ -1910,16 +1895,18 @@ mod tests {
 
     #[test]
     fn all_reduce_leaves_flashinfer_at_its_workspace_cap() {
-        // 32 MiB at TP4 and 1 MiB at TP8 over 4096 bf16 hidden values per token.
+        // vLLM's `auto` backend is MNNVL at every single-node TP. SM100 has no
+        // tuned MNNVL standalone cap (`FI_MNNVL_ALLREDUCE_MAX_SIZE_MB`), so
+        // MNNVL keeps the fusion budget: 32 MiB at TP4 and 1 MiB at TP8 over
+        // 4096 bf16 hidden values per token.
         for (tp, cap) in [(4, 4096), (8, 128)] {
             let model = built_with(layout(tp, true));
-            let backend = if tp == 8 {
-                "flashinfer_trtllm"
-            } else {
-                "flashinfer_mnnvl"
-            };
             let configs = build_configs(&model_cfg(), &layout(tp, true), &demand()).unwrap();
-            assert_eq!(configs.all_reduce.backends, [backend]);
+            assert_eq!(configs.all_reduce.backends, ["flashinfer_mnnvl"]);
+            assert_eq!(
+                AllReduceFusionSpec::max_fused_tokens(&configs.all_reduce),
+                cap
+            );
             assert_eq!(configs.large_all_reduce.backends, ["nccl"]);
             assert_eq!(model.embedding_all_reduce.max_fused_tokens, cap);
             assert_eq!(model.embedding_all_reduce.bytes_per_token, 8192);
@@ -1931,6 +1918,35 @@ mod tests {
                 assert_eq!(group.ffn_all_reduce.as_ref().unwrap().max_fused_tokens, cap);
             }
         }
+    }
+
+    #[test]
+    fn tp8_measures_mnnvl_on_its_one_shot_switch_and_cap() {
+        use crate::timing::kernels::engine::KernelSpec;
+        // The runner measures MNNVL at TP 2/4/8 and vLLM budgets SM100 TP8.
+        for tp in [4, 8] {
+            assert!(
+                refuse_unfused_all_reduce(&layout(tp, true)).is_ok(),
+                "TP{tp}"
+            );
+        }
+        let configs = build_configs(&model_cfg(), &layout(8, true), &demand()).unwrap();
+        // One-shot while 4096 * 8 ranks * 2 B * T <= 1 MiB: T <= 16.
+        assert_eq!(
+            AllReduceFusionSpec::mnnvl_max_oneshot_tokens(&configs.all_reduce),
+            16
+        );
+        let grid = AllReduceFusionSpec::sweep_grid(&configs.all_reduce);
+        let tokens = &grid.axes()[0];
+        assert!(tokens.contains(&16.0) && tokens.contains(&17.0));
+        assert_eq!(tokens.last(), Some(&128.0));
+        // vLLM's TP16 MNNVL is multi-node; no runner measures it.
+        let tp16 = refuse_unfused_all_reduce(&layout(16, true)).unwrap_err();
+        assert!(
+            tp16.to_string()
+                .contains("flashinfer_mnnvl fused all-reduce is measured at TP [2, 4, 8]"),
+            "{tp16}"
+        );
     }
 
     #[test]
