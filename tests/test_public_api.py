@@ -236,16 +236,25 @@ _FP8_BLOCK_BACKEND = "flashinfer_trtllm_fp8_block_sm100"
 _MXFP4_BACKEND = "flashinfer_trtllm_sm100_mxfp4"
 # Weight-only: MXFP4 weights, BF16 activations and BF16 MMA.
 _MXFP4_BF16_BACKEND = "flashinfer_trtllm_sm100_mxfp4_bf16"
+# SM12x: SGLang's FlashInfer CUTLASS MXFP8 x MXFP4 experts.
+_MXFP4_SM120_BACKEND = "flashinfer_cutlass_sm120_mxfp4"
 _WEIGHT_FORMAT = {
     _FP8_BLOCK_BACKEND: DType.FP8_E4M3,
     _MXFP4_BACKEND: DType.MXFP4_E2M1,
     _MXFP4_BF16_BACKEND: DType.MXFP4_E2M1,
+    _MXFP4_SM120_BACKEND: DType.MXFP4_E2M1,
 }
-_GROUP_SIZE = {_FP8_BLOCK_BACKEND: 128, _MXFP4_BACKEND: 32, _MXFP4_BF16_BACKEND: 32}
+_GROUP_SIZE = {
+    _FP8_BLOCK_BACKEND: 128,
+    _MXFP4_BACKEND: 32,
+    _MXFP4_BF16_BACKEND: 32,
+    _MXFP4_SM120_BACKEND: 32,
+}
 _ROUTING = {
     _FP8_BLOCK_BACKEND: "deepseek_v3",
     _MXFP4_BACKEND: "precomputed_dsv4",
     _MXFP4_BF16_BACKEND: "deepseek_v3",
+    _MXFP4_SM120_BACKEND: "precomputed_dsv4",
 }
 # The tensor-core precision each backend declares; the weight format but for
 # the weight-only backend.
