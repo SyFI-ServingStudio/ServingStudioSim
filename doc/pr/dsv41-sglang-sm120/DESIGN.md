@@ -55,9 +55,9 @@ speculative only: DSpark draft (3 stages) + sampling chain
 | f1 | hc mix stats + sinkhorn | `mhc_mix_stats_sinkhorn` | as a1 | side stream |
 | f2 | hc combine + RMSNorm | `mhc_combine_rms_norm` | as a2 | |
 | f3 | router GEMM + top-k | `elementwise` placeholders (`tiny_n_gemm`, `_router_triton_kernel`) | | <= 1.2% |
-| f4 | shared expert gate-up | `single_gemm` / `sglang_triton_block32_fp8` | m = tokens, k = 5120, n = 2 x 2304 / TP? (check: shared expert TP-sharded or replicated) | includes act quant |
+| f4 | shared expert gate-up | `single_gemm` / `sglang_triton_block32_fp8` | m = tokens, k = 5120, n = 2 x 2304 / 4 = 1152 | TP-sharded (`DeepseekV2MLP(parallel_group="tp")`; replicated only with an all-to-all MoE backend or `SGLANG_SHARED_EXPERT_TP1`) |
 | f5 | SiLU-mul clamp | `elementwise` | | |
-| f6 | shared expert down | `single_gemm` / `sglang_triton_block32_fp8` | | |
+| f6 | shared expert down | `single_gemm` / `sglang_triton_block32_fp8` | m = tokens, k = 576, n = 5120 | `reduce_results=False`: its partial sum joins the f8 all-reduce |
 | f7 | routed experts | `nvfp4_fused_moe` / `flashinfer_cutlass_sm120_mxfp4` | tokens, 5120, 2304, 384 global / 96 local, top-6, mxfp4 group 32, `precomputed_dsv4`, per-expert demand from `token_corpus` | includes MXFP8 act quant; EP rank 0 |
 | f8 | TP all-reduce | `all_reduce` / `nccl` | tokens x 5120 bf16 | |
 | f9 | hc post | `mhc_post` | | |
@@ -102,8 +102,7 @@ speculative only: DSpark draft (3 stages) + sampling chain
 
 ## Open items before code
 
-1. **Shared-expert sharding under TP4/EP4 in SGLang.** Is the shared expert TP-sharded, or replicated per rank?
-   Decides f4/f6 n.
+1. **Shared-expert sharding:** resolved, TP-sharded (`models/deepseek_v2.py` `DeepseekV2MoE.__init__`).
 2. **Index layer, from the decode bs1 trace** (81 kernels between the two all-reduces; ratio-2 layer):
    1. hc pre;
    2. fused q/kv-a FP8 GEMM;
