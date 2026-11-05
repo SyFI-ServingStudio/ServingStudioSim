@@ -16,8 +16,13 @@ weights come in, so it only permutes (n_group = topk_group = 1, routed scale
 1/1; the router already applied the scale). The MXFP4/BF16 backend
 (`trtllm_fp4_block_scale_moe`) takes the same `mxfp4_e2m1` / group 32 weights
 but leaves the activations in BF16: the GEMMs cast the weights and run BF16
-MMA, and it routes inside the call (`deepseek_v3`, ungrouped). `input_dtype`
-is the unquantized activation and output precision in every backend.
+MMA, and it routes inside the call (`deepseek_v3`, ungrouped). The SM12x MXFP4 backend
+(`flashinfer_cutlass_sm120_mxfp4`, SGLang's FlashInfer CUTLASS `cutlass_fused_moe`
+with `use_mxfp8_act_scaling`) takes the same `mxfp4_e2m1` / group 32 weights and
+`precomputed_dsv4` routing, but its row starts from the BF16 hidden states: the
+MXFP8 activation quantization runs inside SGLang's fused func, so it is timed in
+the row. `input_dtype` is the unquantized activation and output precision in
+every backend.
 """
 
 from __future__ import annotations
@@ -175,7 +180,11 @@ DOC = KernelDoc(
         "too tunes up to 8192 tokens. Its tensor cores run BF16, not the weight format: "
         "the Rust config states that with activation_format, and the precision column "
         "still shows the weight format.",
-        "Activation quantization is outside the call, and the router logits are synthetic.",
+        "Activation quantization is outside the call, and the router logits are synthetic. "
+        "Exception: the SM12x MXFP4 backend (flashinfer_cutlass_sm120_mxfp4) times SGLang's "
+        "mxfp8_quantize inside its row, as SGLang's fused func runs it.",
+        "The SM12x MXFP4 backend tunes up to 2048 tokens, SGLang's "
+        "_cutlass_moe_tune_max_num_tokens for 2048-token prefill chunks at attention DP1.",
         "The vLLM NVFP4 backends tune up to max(8192, next power of two ≥ num_tokens); "
         "vLLM tunes up to max_num_batched_tokens·dp_size, which picks the same "
         "bucket for every shape it serves.",
@@ -401,6 +410,42 @@ register(
                 "final expert combination."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py",
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_cutlass_sm120_mxfp4",
+        # SGLang v0.5.23 Fp8Config.get_quant_method sends flashinfer_mxfp4 FP4
+        # experts on SM120 to Mxfp4FlashinferCutlassMoEMethod
+        # (srt/layers/quantization/fp8.py:459-466), which runs FlashInfer's
+        # CUTLASS MXFP8 x MXFP4 grouped GEMMs (SM12x builds).
+        supports=BackendSupport(
+            compute=frozenset({DType.MXFP4_E2M1}),
+            sm_targets=frozenset({"sm_120f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.mxfp4_cutlass_fused_moe_sm120",
+            function_name="profile_mxfp4_cutlass_fused_moe_sm120",
+        ),
+        table_name=KIND,
+        args_schema=Nvfp4FusedMoeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="sglang_env",
+        doc=BackendDoc(
+            summary=(
+                "SGLang's SM120 flashinfer_mxfp4 experts "
+                "(_fused_experts_flashinfer_mxfp4_cutlass, "
+                "srt/layers/moe/moe_runner/flashinfer_cutlass.py:482-619): "
+                "mxfp8_quantize of the BF16 hidden states, then FlashInfer "
+                "cutlass_fused_moe with MXFP4 weights, use_mxfp8_act_scaling, "
+                "precomputed global top-k ids under EP, the SwiGLU clamp and "
+                "final expert combination."
+            ),
+            url="https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py",
         ),
     )
 )
