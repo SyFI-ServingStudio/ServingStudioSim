@@ -3,5 +3,6 @@
  "rule_files": [
   "rules.json"
  ],
- "note": "Placeholder. These rules are written from this pack's own first nsys capture (B2 rental: the folded launch programs of SGLang v0.5.23 on SM120), not migrated from the B200 vLLM pack, whose kernel vocabulary differs. Until then this pack can render and profile but not label."
+ "note": "Seed rule set. One unambiguous rule (the token embedding) from the 2026-11-05 SM120 torch-profiler traces; the full set is written from this pack's first nsys capture (B2 rental), read off the folded launch programs of SGLang v0.5.23 on SM120, not migrated from the B200 vLLM pack whose kernel vocabulary differs.",
+ "rules": 1
 }

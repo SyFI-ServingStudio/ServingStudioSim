@@ -217,9 +217,9 @@ cases:
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
   attn_gpu_memory_gb:
-    value: 6.0606
+    value: 6.1476
     status: provisional
-    derived_from: 'Provisional: 6.0606 GB reproduces 2,928,896 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
+    derived_from: 'Provisional: 6.1476 GB (the full pool plus the DSpark draft''s 3 fixed SWA layers) reproduces 2,929,152 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
   provenance:
     reference_run: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000 (2026-11-05)
 - index: 2
@@ -253,9 +253,9 @@ cases:
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
   attn_gpu_memory_gb:
-    value: 6.0606
+    value: 6.1476
     status: provisional
-    derived_from: 'Provisional: 6.0606 GB reproduces 2,928,896 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
+    derived_from: 'Provisional: 6.1476 GB (the full pool plus the DSpark draft''s 3 fixed SWA layers) reproduces 2,929,152 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
   provenance:
     reference_run: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000 (2026-11-05)
 - index: 3
@@ -294,9 +294,9 @@ cases:
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
   attn_gpu_memory_gb:
-    value: 6.0606
+    value: 6.1476
     status: provisional
-    derived_from: 'Provisional: 6.0606 GB reproduces 2,928,896 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
+    derived_from: 'Provisional: 6.1476 GB (the full pool plus the DSpark draft''s 3 fixed SWA layers) reproduces 2,929,152 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
   provenance:
     reference_run: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000 (2026-11-05)
 - index: 4
@@ -329,9 +329,9 @@ cases:
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
   attn_gpu_memory_gb:
-    value: 6.0606
+    value: 6.1476
     status: provisional
-    derived_from: 'Provisional: 6.0606 GB reproduces 2,928,896 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
+    derived_from: 'Provisional: 6.1476 GB (the full pool plus the DSpark draft''s 3 fixed SWA layers) reproduces 2,929,152 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
   provenance:
     reference_run: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000 (2026-11-05)
 - index: 5
@@ -365,9 +365,9 @@ cases:
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
   attn_gpu_memory_gb:
-    value: 6.0606
+    value: 6.1476
     status: provisional
-    derived_from: 'Provisional: 6.0606 GB reproduces 2,928,896 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
+    derived_from: 'Provisional: 6.1476 GB (the full pool plus the DSpark draft''s 3 fixed SWA layers) reproduces 2,929,152 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
   provenance:
     reference_run: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000 (2026-11-05)
 - index: 6
@@ -398,9 +398,9 @@ cases:
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
   attn_gpu_memory_gb:
-    value: 6.0606
+    value: 6.1476
     status: provisional
-    derived_from: 'Provisional: 6.0606 GB reproduces 2,928,896 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
+    derived_from: 'Provisional: 6.1476 GB (the full pool plus the DSpark draft''s 3 fixed SWA layers) reproduces 2,929,152 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
   provenance:
     reference_run: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000 (2026-11-05)
 - index: 7
@@ -432,9 +432,9 @@ cases:
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
   attn_gpu_memory_gb:
-    value: 6.0606
+    value: 6.1476
     status: provisional
-    derived_from: 'Provisional: 6.0606 GB reproduces 2,928,896 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
+    derived_from: 'Provisional: 6.1476 GB (the full pool plus the DSpark draft''s 3 fixed SWA layers) reproduces 2,929,152 full-pool tokens at 1,673.31 B/token (SGLang printed max_total_num_tokens 2,929,152 at --mem-fraction-static 0.86 with DSpark on 2026-11-05). Read back per case from the workload-only server log on the B2 rental.'
   provenance:
     reference_run: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000 (2026-11-05)
 - index: 8

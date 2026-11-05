@@ -1,4 +1,16 @@
 {
- "schema_version": 2,
- "rules": []
+ "rules": [
+  {
+   "operation": "prologue.embedding",
+   "name": "_vocab_parallel_embedding_kernel",
+   "type": "model",
+   "role": "token embedding lookup",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "prologue.embedding"
+   ],
+   "note": "Seed rule: SGLang's vocab-parallel embedding, one launch per target forward (seen in the 2026-11-05 SM120 torch-profiler traces). The rest of the rule set is written from this pack's first nsys capture.",
+   "source_experiment": "airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000 (2026-11-05, torch profiler)"
+  }
+ ]
 }
