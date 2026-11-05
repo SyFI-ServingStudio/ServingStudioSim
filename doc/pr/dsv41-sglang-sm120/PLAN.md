@@ -43,7 +43,12 @@ reduce, Engram is read from a host table, and there is the DSpark draft and samp
      - head: hc collapse, norm, lm_head, logits all-gather;
      - DSpark: the draft forward plus the sampling chain, which is 6 x (`_markov_sample` + all-gather + broadcast);
    - SGLang DSV4 KV accounting: full, swa (cap mode), c4 and c128 pools;
-   - presets with `worker: speculative` and `batch_policy: separate-prefill-priority`.
+   - **Scheduler: reused, not new.** Presets use `worker: speculative` (`draft_tokens: 6`), `batch_policy:
+     separate-prefill-priority` (SGLang's default of no mixed chunk), `max_batch_tokens: 2048`, and the GLM-5.2
+     SGLang pack's `kv_admission_policy: bounded-future` fields.
+   - **One small worker addition:** a `max_running_requests` admission cap, which the worker lacks today. The
+     2026-11-05 run used `--max-running-requests 16`, and the busy day queued on it.
+   - DSpark's draft cost lives in the arch. The worker supplies only the verify width and the accept draws.
 
    Then run the Decycle and quadrant presets with `count_missing_*` (no GPU). **That dry run is the exact list of
    L1 rows to fill on the rental.**
