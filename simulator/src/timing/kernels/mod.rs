@@ -25,6 +25,7 @@ pub mod dsa_topk_prefill;
 pub mod elementwise;
 pub mod embedding_row_gather;
 pub mod engine;
+pub mod engram_gate;
 pub mod engram_lookup;
 pub mod fa4_varlen_attention;
 pub mod fa4_varlen_projection;
@@ -54,7 +55,10 @@ pub mod kda_recurrent_decode;
 pub mod kv_cache_append;
 pub mod kv_compress_store;
 pub mod logits_topk;
+pub mod mhc_combine_rms_norm;
 pub mod mhc_fused_post_pre_rms_norm;
+pub mod mhc_mix_stats_sinkhorn;
+pub mod mhc_post;
 pub mod mhc_pre_rms_norm;
 pub mod mhc_terminal_head;
 pub mod mla_cache_append;
@@ -80,6 +84,7 @@ pub mod p2p_intra;
 pub mod packed_kv_cache_gather;
 pub mod paged_attn_batch_decode;
 pub mod paged_attn_batch_prefill;
+pub mod paged_sparse_mla;
 pub mod ple_gate;
 pub mod ple_ngram_ids;
 pub mod ple_short_conv;
@@ -190,6 +195,7 @@ pub use embedding_row_gather::{
     EmbeddingRowGatherSpec,
 };
 pub use engine::{Kernel, KernelConfig, KernelSpec, OffGrid};
+pub use engram_gate::{EngramGateKernel, EngramGateSpec};
 pub use engram_lookup::{
     EngramLookupKernel, EngramLookupKernelConfig, EngramLookupKernelInput, EngramLookupSpec,
 };
@@ -261,8 +267,7 @@ pub use hc_combine::{HcCombineKernel, HcCombineSpec};
 pub use hc_combine_norm::{HcCombineNormKernel, HcCombineNormSpec};
 pub use hc_gate_mix::{HcGateMixKernel, HcGateMixSpec};
 pub use indexed_row_copy::{
-    IndexedRowCopyKernel, IndexedRowCopyKernelConfig, IndexedRowCopyKernelInput,
-    IndexedRowCopySpec,
+    IndexedRowCopyKernel, IndexedRowCopyKernelConfig, IndexedRowCopyKernelInput, IndexedRowCopySpec,
 };
 pub use inv_rope_fp8_quant::{
     InvRopeFp8QuantKernel, InvRopeFp8QuantKernelConfig, InvRopeFp8QuantKernelInput,
@@ -286,7 +291,12 @@ pub use kv_compress_store::{
 pub use logits_topk::{
     LogitsTopkKernel, LogitsTopkKernelConfig, LogitsTopkKernelInput, LogitsTopkSpec,
 };
+pub use mhc_combine_rms_norm::{MhcCombineRmsNormKernel, MhcCombineRmsNormSpec};
 pub use mhc_fused_post_pre_rms_norm::{MhcFusedPostPreRmsNormKernel, MhcFusedPostPreRmsNormSpec};
+pub use mhc_mix_stats_sinkhorn::{
+    MhcMixStatsSinkhornKernel, MhcMixStatsSinkhornKernelConfig, MhcMixStatsSinkhornSpec,
+};
+pub use mhc_post::{MhcPostKernel, MhcPostSpec};
 pub use mhc_pre_rms_norm::{
     MhcPreRmsNormKernel, MhcPreRmsNormSpec, MhcRmsNormKernelConfig, MhcRmsNormKernelInput,
 };
@@ -367,6 +377,9 @@ pub use paged_attn_batch_decode::{
 pub use paged_attn_batch_prefill::{
     PagedAttnBatchPrefillKernel, PagedAttnBatchPrefillKernelConfig,
     PagedAttnBatchPrefillKernelInput, PagedAttnBatchPrefillSpec,
+};
+pub use paged_sparse_mla::{
+    PagedSparseMlaKernel, PagedSparseMlaKernelConfig, PagedSparseMlaKernelInput, PagedSparseMlaSpec,
 };
 pub use ple_gate::{PleGateKernel, PleGateKernelConfig, PleGateKernelInput, PleGateSpec};
 pub use ple_ngram_ids::{
