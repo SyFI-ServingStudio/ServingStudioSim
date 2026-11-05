@@ -121,6 +121,7 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         ),
         drafting_slots,
     );
+    let admission = admission.with_max_running_requests(config.max_running_requests);
     let admission = match chunk_end_alignment {
         Some(alignment) => admission.with_chunk_end_alignment(alignment),
         None => admission,

@@ -90,6 +90,7 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         config.kv_admission,
         balance,
     );
+    let admission = admission.with_max_running_requests(config.max_running_requests);
     let admission = match chunk_end_quantum {
         Some(quantum) => admission.with_chunk_end_alignment(ChunkEndAlignment::on_blocks(quantum)),
         None => admission,

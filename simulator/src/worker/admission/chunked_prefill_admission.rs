@@ -89,6 +89,9 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// (see `SpeculativeUnifiedModel::drafting_slots_per_request`). Zero for
     /// ordinary decode and sequential drafters.
     drafting_slots: u32,
+    /// SGLang `--max-running-requests`: no waiting request is admitted while
+    /// this many are running (decoding or with prefill left). `None` = no cap.
+    max_running_requests: Option<u32>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -157,7 +160,16 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             next_admission: 0,
             decode_completion,
             drafting_slots,
+            max_running_requests: None,
         }
+    }
+
+    /// Stop admitting while `cap` requests are running (SGLang
+    /// `--max-running-requests`). `None` leaves admission uncapped.
+    pub(crate) fn with_max_running_requests(mut self, cap: Option<u32>) -> Self {
+        assert!(cap != Some(0), "max_running_requests must be positive");
+        self.max_running_requests = cap;
+        self
     }
 
     /// End every non-final chunk on a checkpoint boundary of `alignment`.
@@ -501,6 +513,17 @@ where
             })
             .collect();
 
+        // Requests already running per partition, before this step admits any:
+        // live decodes plus prompts with prefill left (SGLang's running batch and
+        // its chunked request). `max_running_requests` caps this plus new admits.
+        let mut running: Vec<u32> = (0..num_partitions)
+            .map(|partition| {
+                kv_store.live_decode_count(partition as u16)
+                    + self.started_prefills[partition].len() as u32
+            })
+            .collect();
+        let max_running_requests = self.max_running_requests;
+
         // Started prompts keep partition-local priority, in start order, until
         // their prompt is complete, matching one EngineCore scheduler queue per
         // DP partition. One that cannot run this iteration keeps its place.
@@ -542,6 +565,9 @@ where
                 let Some(candidate) = policy.peek() else {
                     break;
                 };
+                if max_running_requests.is_some_and(|cap| running[partition_index] >= cap) {
+                    break;
+                }
                 if candidate.remaining_output_tokens > 1
                     && future_decode_slots
                         .as_ref()
@@ -599,6 +625,7 @@ where
                 }
                 let popped = policy.pop(policy_context);
                 debug_assert_eq!(popped, Some(candidate));
+                running[partition_index] += 1;
                 self.admission_order
                     .insert(candidate.request_id, self.next_admission);
                 self.next_admission += 1;

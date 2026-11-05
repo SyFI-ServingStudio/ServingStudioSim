@@ -187,6 +187,7 @@ impl Deployment for UnifiedDeployment {
             max_model_len: g.arch.max_model_len().ok(),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
+            max_running_requests: g.worker.max_running_requests(),
             dp_placement: match &g.worker {
                 IterWorkerSel::ChunkedPrefill { dp_placement, .. } => *dp_placement,
                 _ => DpPlacement::RoundRobin,
@@ -1258,6 +1259,7 @@ mod tests {
             max_batch_tokens: 2048,
             batch_policy: BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionSpec::default(),
+            max_running_requests: None,
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             dp_placement: DpPlacement::RoundRobin,
@@ -1425,6 +1427,7 @@ pools:
             acceptance_seed: Some(7),
             batch_policy: BatchPolicy::Mix,
             kv_admission: Default::default(),
+            max_running_requests: None,
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             kv_accounting: Default::default(),

@@ -610,6 +610,9 @@ pub struct WorkerConfig {
     /// Attention-DP partition placement (from the chunked-prefill selector).
     /// Only multi-partition chunked-prefill workers read it.
     pub dp_placement: crate::worker::config::DpPlacement,
+    /// Cap on concurrently running requests (from the chunked-prefill and
+    /// speculative selectors; SGLang `--max-running-requests`). `None` = no cap.
+    pub max_running_requests: Option<u32>,
 }
 
 impl Default for WorkerConfig {
@@ -637,6 +640,7 @@ impl Default for WorkerConfig {
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,
+            max_running_requests: None,
         }
     }
 }
