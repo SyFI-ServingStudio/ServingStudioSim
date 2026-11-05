@@ -1,4 +1,4 @@
-# Acceptance policy for the Qwen3.8-27B-NVFP4 B200 TP1 matrix (default tolerances copied from glm52_nvfp4_b200_tp8, as mimo_v26_flash_b200_tp4 did).
+# Acceptance policy for the Qwen3.8-27B-NVFP4 H200 TP1 matrix (copied from qwen38_27b_nvfp4_b200_tp1, whose default tolerances come from glm52_nvfp4_b200_tp8).
 #
 # Tolerances only. The formulas that produce the numbers live in
 # `launcher/alignment_campaign/metrics.py`: they depend on the Analyzer report

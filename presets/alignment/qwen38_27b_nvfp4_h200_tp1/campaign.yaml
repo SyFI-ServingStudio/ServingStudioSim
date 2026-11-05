@@ -19,7 +19,7 @@ variants:
     checkpoint: qwen38_27b_nvfp4
     engine: vllm
     backend: vllm_tokens
-    run_name_prefix: qwen38_27b_nvfp4_b200_tp1
+    run_name_prefix: qwen38_27b_nvfp4_h200_tp1
     python_runtime:
       packages:
       - name: nvtx
