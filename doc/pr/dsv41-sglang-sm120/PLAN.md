@@ -27,9 +27,19 @@ reduce, Engram is read from a host table, and there is the DSpark draft and samp
    - Rebase its alignment commits onto v0.5.23 as `vibesim-alignment-v0.5.23`, and add the SM120 indexer fallback as
      a real code change. The commits provide the `sglang_iteration(N): <phase>` NVTX ranges, request timing,
      expert-load and worker-device records.
-   - Ship it as a thin layer over `lmsysorg/sglang:v0.5.23-cu130`: `pip install -e` of the fork's `python/` into the
-     image, then `docker commit`. Push the image or keep it as a tarball. **Pre-building it saves about 30 min of
-     rental time.**
+   - **Done (2026-11-05):** branch `vibesim-alignment-v0.5.23` in the fork repo (local worktree
+     `wt-sglang-alignment-v0523`, not pushed). It holds the 4 fork commits on top of v0.5.23 `297e54fd10`:
+     - `4fc5472fc`, `29c0c7e40` and `543f4fb99` cherry-picked; their conflicts were upstream renames, resolved
+       keeping both sides;
+     - the alignment parts of `449cb04a5` hand-ported (token-bearing API timing, `return_prompt_token_ids`, the
+       logger in Uvicorn workers), leaving out its serving-default changes;
+     - the SM120 indexer fix: `is_sm100_or_newer()` now means the SM10x family.
+
+     Every `vibesim_alignment` hook from the fork is present (same counts per file), and
+     `test/registered/unit/observability/test_vibesim_alignment.py` passes (15).
+   - **No image build needed:** the diff from v0.5.23 is pure Python. On the rental, mount the fork's
+     `python/sglang` over `/sgl-workspace/sglang/python/sglang` in `lmsysorg/sglang:v0.5.23-cu130`, after checking
+     that the image's checkout is `297e54fd10`.
    - Pin the runtime contract (`python_runtime`) as the GLM-5.2 SGLang pack does.
 2. **Write the arch skeleton `deepseek_v41_sglang`** with SM120 backends declared:
    - **reused:** `DeepseekV41ModelCfg`, layer typing / `fold_layers`, `ExpertDemand`, the TP/EP shape math;
