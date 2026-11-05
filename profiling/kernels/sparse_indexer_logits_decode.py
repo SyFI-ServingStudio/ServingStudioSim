@@ -99,4 +99,37 @@ register(
     )
 )
 
+# SGLang v0.5.23 DeepSeek-V4.1 decode indexer on SM12x: fp4_index_logits_decode
+# (kernels/ops/attention/dsv4/fp4_indexer.py:490), one _fp4_index_logits_kernel
+# launch over e2m1 + ue8m0 index keys in 64-slot pages, bf16 queries. Reached through
+# decode_scores (srt/layers/attention/dsv4/v41_indexer/scoring.py:477) on every
+# non-SM90 GPU; dtype names the key format, the queries are bf16.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="sglang_triton_fp4",
+        supports=BackendSupport(
+            compute=frozenset({DType.MXFP4_E2M1}),
+            sm_targets=frozenset({"sm_120f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.sparse_indexer_logits_sglang_fp4",
+            function_name="profile_sparse_indexer_logits_decode_sglang_triton_fp4",
+        ),
+        table_name=KIND,
+        args_schema=SparseIndexerLogitsDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="sglang_env",
+        doc=BackendDoc(
+            summary=(
+                "SGLang fp4_index_logits_decode: Triton _fp4_index_logits_kernel over the V4.1 FP4 "
+                "index-K pool (e2m1 + ue8m0 per 32, 64-slot pages), bf16 queries, fp32 logits; "
+                "tiles past each row's visible keys exit early."
+            ),
+            url="https://github.com/sgl-project/sglang",
+        ),
+    )
+)
+
 __all__ = ["KIND", "SparseIndexerLogitsDecodeArgs"]
