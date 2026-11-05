@@ -62,3 +62,37 @@ existing kind on SM120.
 **L1 stop set for the first round:** 1, 2, 4, 5, 7, 8, 11. Together they cover about 85-95% of GPU time in every
 window, excluding item 3. Items 6, 9 and 10 reuse existing runners, so they only need rows. Everything else starts
 as a placeholder.
+
+## Findings from reading the SGLang v0.5.23 SM120 paths (runner work, 2026-11-05)
+
+- **Attention switches by query-row count, not by phase.** `flash_mla_with_kvcache_sm120`
+  (`kernels/ops/attention/flash_mla_sm120.py:298`):
+  - up to 64 rows: FlashInfer `sparse_mla_decode_dsv4` + merge;
+  - above 64 rows: `sparse_mla_prefill_mg_dual`.
+
+  A DSpark verify of 16 requests x 7 rows (112) already takes the prefill kernel, which explains the bs16 trace. One
+  kind (`paged_sparse_mla`) covers decode, verify and prefill.
+- **The KV layout is V4's on SM12x** (`select_dsv4_kv_layout`, `deepseek_v4_memory_pool.py:200`): 584-byte rows,
+  256-token SWA pages, compressed pages of `256 // ratio`.
+- **Indexer.**
+  - Decode: one Triton launch (`fp4_index_logits_decode`) over a `[rows, lmax]` grid, where `lmax` is the
+    graph-stable capacity.
+  - Prefill: torch, per request; BF16 dequant of the visible index K, then `einsum` + ReLU + head weights. Its cost
+    grows with query rows x compressed context. That is likely the trace's BF16 GEMM and top-k share in prefill, and
+    it could be large on Decycle's long contexts.
+  - Index layers: 2, 8, 14, 20, 24, 28, 32, 36. 32 heads x 128, replicated (not TP-sharded).
+  - Candidate-block selection is not modeled yet (`select_candidate_block_ids`, `amax_topk_blocks`,
+    `topk_among_blocks`).
+- **mHC is unfused.** Two `mix_stats_sinkhorn` + `combine_rms_norm` per layer (before attention and before the
+  FFN) and one `mhc_post` after each sublayer. On SM12x, mix-stats runs on a side stream during decode/verify, so the
+  worklet must model that overlap. These are separate kinds for that reason.
+- **Engram** (layers 1 and 14), per layer:
+  - a host-table gather: a `torch.sort` of the ids, then `_engram_gather_kernel` over pinned host memory;
+  - `wkv` as an FP8 `single_gemm` (m = tokens, n = 25600, k = 6144);
+  - `engram_gate`.
+
+  The 2026-11-05 server ran **without huge pages** (`transparent_hugepage/shmem_enabled = never`), and SGLang warns
+  that lookups are then about 10x slower. Lookup rows record the page backing (`host_shared_4k` /
+  `host_shared_huge`).
+- **The dense FP8 linear includes its activation quant** (one row). The MoE row includes its MXFP8 activation
+  quant. Do not add separate quant ops for these.

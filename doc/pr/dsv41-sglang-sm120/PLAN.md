@@ -88,7 +88,7 @@ reduce, Engram is read from a host table, and there is the DSpark draft and samp
 
 ## Phase B: rentals
 
-**B1: one RTX PRO 6000, 2-3 h (about $2-5/h).** Runner bring-up and single-GPU L1 fills.
+**B1: one RTX PRO 6000, 2-3 h (about $2-5/h).** Runner bring-up and single-GPU L1 fills. The `engram_lookup` runner pins a whole layer table (about 101 GB), so the host needs about 110 GB of free RAM; set `shmem_enabled=advise` as root first.
 - Use RunPod or Massed Compute 1x. No model download is needed (L1 runners use synthetic tensors).
 - Run each new runner's reference check, then JIT-fill every non-comm row from the Phase A dry run.
 - Save `profile.db`, runner logs and versions (torch, flashinfer, sgl-kernel, CUDA, driver).
@@ -98,6 +98,7 @@ alignment captures, validation.
 
 | Step | Time | Output |
 |---|---|---|
+| **as root: `echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled`** (the Engram host table needs huge pages; it was `never` on 2026-11-05) | 1 min | Engram rows on `host_shared_huge` |
 | boot, `nvidia-smi topo -m`, P2P check (`p2pBandwidthLatencyTest` or NCCL `NCCL_P2P_LEVEL` probe) | 10 min | provenance, topology identity |
 | model download in the background (`snapshot_download`, `huggingface_hub<0.36`, about 200 MB/s, 45 min) **while** comm fills run | 45 min | 510 GB checkpoint |
 | comm L1 fills (`comm/nccl.py`: all_reduce, all_gather, broadcast; the dry-run shapes) | 15-20 min | comm rows keyed by topology |
