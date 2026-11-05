@@ -12,8 +12,9 @@
 //! head (hc collapse, final norm, lm_head, logits all-gather)
 //! ```
 //!
-//! Speculative decoding (DSpark) is not modeled yet: this arch prices the
-//! target model's one-token decode, and the speculative selector refuses it.
+//! This arch prices the target model's one-token decode. DSpark speculative
+//! decoding is `deepseek_v41_sglang_dspark`, which reuses this target graph at
+//! the verify width ([`DeepseekV41SglangSettings::verify_width`]).
 
 use anyhow::{ensure, Result};
 
@@ -52,7 +53,7 @@ const ENGRAM_TABLE_ROWS: [(u32, u64); 2] = [(1, 384_006_168), (14, 384_016_682)]
 /// Engram local heads, head dim and the `wkv` output width (runner report).
 const ENGRAM_LOCAL_HEADS: u32 = 24;
 const ENGRAM_WKV_OUT: u32 = 25_600;
-const HC_SINKHORN_ITERS: u32 = 20;
+pub(crate) const HC_SINKHORN_ITERS: u32 = 20;
 
 #[derive(Clone, Debug)]
 pub struct DeepseekV41SglangSettings {
@@ -63,6 +64,9 @@ pub struct DeepseekV41SglangSettings {
     /// `engram_lookup` residency (`host_shared_huge` with transparent huge
     /// pages on, `host_shared_4k` without).
     pub engram_residency: String,
+    /// Query rows per decoding request the target runs: 1 here, the DSpark
+    /// verify width (`draft_tokens + 1`) under speculative decoding.
+    pub verify_width: u32,
 }
 
 enum PlanNode {
@@ -127,36 +131,7 @@ pub fn build(
                         .find(|(l, _)| *l == first)
                         .map(|&(_, rows)| rows)
                         .unwrap_or(ENGRAM_TABLE_ROWS[0].1);
-                    let cfg = SglangDsv41LayerConfig {
-                        path,
-                        gpu_name: settings.gpu_name.clone(),
-                        layer: ty,
-                        tp_size: TP_SIZE,
-                        ep_size: EP_SIZE,
-                        hidden_size: model.hidden_size,
-                        hc_mult: model.hc_mult,
-                        hc_sinkhorn_iters: HC_SINKHORN_ITERS,
-                        num_attention_heads: model.num_attention_heads,
-                        head_dim: model.head_dim,
-                        q_lora_rank: model.q_lora_rank,
-                        o_lora_rank: model.o_lora_rank,
-                        o_groups: model.o_groups,
-                        sliding_window: model.sliding_window,
-                        index_num_heads: model.index_num_heads,
-                        index_head_dim: model.index_head_dim,
-                        index_topk: model.index_topk,
-                        num_experts: model.num_experts,
-                        top_k: model.top_k,
-                        moe_intermediate_size: model.moe_intermediate_size,
-                        shared_intermediate_size: model.moe_intermediate_size
-                            * model.num_shared_experts,
-                        expert_demand: demand.clone(),
-                        engram_local_heads: ENGRAM_LOCAL_HEADS,
-                        engram_head_dim: model.engram_head_dim,
-                        engram_table_rows: table_rows,
-                        engram_residency: settings.engram_residency.clone(),
-                        engram_wkv_n: ENGRAM_WKV_OUT,
-                    };
+                    let cfg = layer_config(model, settings, ty, demand, table_rows);
                     let label = if layers.len() == 1 {
                         format!("{name}.layer{first}")
                     } else {
@@ -220,6 +195,48 @@ pub fn build(
     Ok(out)
 }
 
+/// One body layer's config: the checkpoint geometry at TP4/EP4 with the
+/// deployment's kernel path. The DSpark draft stages reuse it with their own
+/// layer type and expert geometry.
+pub(crate) fn layer_config(
+    model: &DeepseekV41ModelCfg,
+    settings: &DeepseekV41SglangSettings,
+    ty: SglangDsv41LayerType,
+    demand: &ExpertDemand,
+    table_rows: u64,
+) -> SglangDsv41LayerConfig {
+    SglangDsv41LayerConfig {
+        path: settings.path,
+        gpu_name: settings.gpu_name.clone(),
+        layer: ty,
+        tp_size: TP_SIZE,
+        ep_size: EP_SIZE,
+        hidden_size: model.hidden_size,
+        hc_mult: model.hc_mult,
+        hc_sinkhorn_iters: HC_SINKHORN_ITERS,
+        num_attention_heads: model.num_attention_heads,
+        head_dim: model.head_dim,
+        q_lora_rank: model.q_lora_rank,
+        o_lora_rank: model.o_lora_rank,
+        o_groups: model.o_groups,
+        sliding_window: model.sliding_window,
+        index_num_heads: model.index_num_heads,
+        index_head_dim: model.index_head_dim,
+        index_topk: model.index_topk,
+        num_experts: model.num_experts,
+        top_k: model.top_k,
+        moe_intermediate_size: model.moe_intermediate_size,
+        shared_intermediate_size: model.moe_intermediate_size * model.num_shared_experts,
+        expert_demand: demand.clone(),
+        engram_local_heads: ENGRAM_LOCAL_HEADS,
+        engram_head_dim: model.engram_head_dim,
+        engram_table_rows: table_rows,
+        engram_residency: settings.engram_residency.clone(),
+        engram_wkv_n: ENGRAM_WKV_OUT,
+        verify_width: settings.verify_width.max(1),
+    }
+}
+
 fn layers_label(layers: &[u32]) -> String {
     let parts: Vec<String> = layers.iter().map(u32::to_string).collect();
     format!("[{}]", parts.join(","))
@@ -228,8 +245,18 @@ fn layers_label(layers: &[u32]) -> String {
 /// SGLang's DSV4 pools on SM12x, one rank, held on each of the TP ranks:
 /// the `full` pool at `bytes_per_full_token` per context token, and the SWA
 /// pool (`cap` mode) as a fixed allocation, 584-byte rows on every layer.
-fn kv_cache_layout(model: &DeepseekV41ModelCfg) -> KvCacheLayout {
-    let swa_layers = model.compress_ratios.len() as u64;
+pub(crate) fn kv_cache_layout(model: &DeepseekV41ModelCfg) -> KvCacheLayout {
+    kv_cache_layout_with_draft(model, 0)
+}
+
+/// [`kv_cache_layout`] plus `draft_swa_layers` window-only draft layers: the
+/// DSpark draft's own SWA pool, sized like the target's (`DSV4 SWA storage:
+/// worker=draft`).
+pub(crate) fn kv_cache_layout_with_draft(
+    model: &DeepseekV41ModelCfg,
+    draft_swa_layers: u64,
+) -> KvCacheLayout {
+    let swa_layers = model.compress_ratios.len() as u64 + draft_swa_layers;
     KvCacheLayout::new()
         .with_part(KvCachePart::per_token(
             "sglang_dsv4_full",
@@ -252,7 +279,7 @@ pub fn decode_graph_batch(requests: u32) -> u32 {
         .unwrap_or(requests)
 }
 
-fn normalize_input(
+pub(crate) fn normalize_input(
     input: &UnifiedArchInput,
     max_model_len: u32,
 ) -> std::result::Result<(SglangDsv41LayerInput, u32), String> {
@@ -306,9 +333,7 @@ fn normalize_input(
 impl DeepseekV41SglangModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
-        let mut sections = vec![self.prologue.compile(&mut b)];
-        sections.extend(self.compile_plan(&self.plan, &mut b));
-        sections.push(self.head.compile(&mut b));
+        let sections = self.compile_target(&mut b);
         let root = CostNode::Labeled {
             label: format!(
                 "{} (DeepseekV41SglangModel) [SGLang SM12x; TP4 attention, EP4 experts; {} unique bodies over 40 layers]",
@@ -351,9 +376,31 @@ impl DeepseekV41SglangModel {
     fn eval_into(&self, batch: &UnifiedArchInput, ev: &mut Evaluator) {
         let (input, logits_rows) = normalize_input(batch, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid {ARCH_KIND} input: {reason}"));
+        self.eval_target(&input, logits_rows, ev);
+    }
+
+    /// The target forward's sections, in mint order (prologue, layers, head).
+    pub(crate) fn compile_target(&self, b: &mut CostTreeBuilder) -> Vec<CostNode> {
+        let mut sections = vec![self.prologue.compile(b)];
+        sections.extend(self.compile_plan(&self.plan, b));
+        sections.push(self.head.compile(b));
+        sections
+    }
+
+    /// Evaluate [`Self::compile_target`]'s slots for one forward.
+    pub(crate) fn eval_target(
+        &self,
+        input: &SglangDsv41LayerInput,
+        logits_rows: u32,
+        ev: &mut Evaluator,
+    ) {
         self.prologue.eval(input.rows, ev);
-        self.eval_plan(&self.plan, &input, ev);
+        self.eval_plan(&self.plan, input, ev);
         self.head.eval(logits_rows, self.tp_size, ev);
+    }
+
+    pub(crate) fn unique_bodies(&self) -> usize {
+        self.bodies.len()
     }
 }
 

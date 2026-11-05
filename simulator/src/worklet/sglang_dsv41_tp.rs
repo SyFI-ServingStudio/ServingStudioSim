@@ -82,40 +82,40 @@ impl SglangDsv41KernelPath {
         }
     }
 
-    fn fp8_gemm(self) -> &'static str {
+    pub(crate) fn fp8_gemm(self) -> &'static str {
         "sglang_triton_block32_fp8"
     }
-    fn bf16_gemm(self) -> &'static str {
+    pub(crate) fn bf16_gemm(self) -> &'static str {
         "torch_linear"
     }
-    fn fp32_out_gemm(self) -> &'static str {
+    pub(crate) fn fp32_out_gemm(self) -> &'static str {
         "torch_cublas"
     }
-    fn mhc(self) -> &'static str {
+    pub(crate) fn mhc(self) -> &'static str {
         "sglang_triton"
     }
-    fn mhc_post(self) -> &'static str {
+    pub(crate) fn mhc_post(self) -> &'static str {
         "sglang_auto"
     }
-    fn attention(self) -> &'static str {
+    pub(crate) fn attention(self) -> &'static str {
         "sglang_flashinfer_sm120"
     }
-    fn index_decode(self) -> &'static str {
+    pub(crate) fn index_decode(self) -> &'static str {
         "sglang_triton_fp4"
     }
-    fn index_prefill(self) -> &'static str {
+    pub(crate) fn index_prefill(self) -> &'static str {
         "sglang_torch_fp4"
     }
-    fn moe(self) -> &'static str {
+    pub(crate) fn moe(self) -> &'static str {
         "flashinfer_cutlass_sm120_mxfp4"
     }
-    fn engram(self) -> &'static str {
+    pub(crate) fn engram(self) -> &'static str {
         "sglang_triton"
     }
-    fn comm(self) -> &'static str {
+    pub(crate) fn comm(self) -> &'static str {
         "nccl"
     }
-    fn elementwise(self) -> &'static str {
+    pub(crate) fn elementwise(self) -> &'static str {
         "triton"
     }
 }
@@ -162,6 +162,10 @@ pub struct SglangDsv41LayerConfig {
     pub engram_table_rows: u64,
     pub engram_residency: String,
     pub engram_wkv_n: u32,
+    /// Query rows per decoding request: 1, or the speculative verify width
+    /// (`speculative_num_draft_tokens`, 7 for DSpark block 6). The decode
+    /// indexer is captured per width (`next_n`).
+    pub verify_width: u32,
 }
 
 /// One forward's batch as every layer sees it.
@@ -253,7 +257,7 @@ pub struct SglangDsv41LayerWorklet {
     ffn_post: Op<MhcPostKernel>,
 }
 
-fn op<S: KernelSpec>(
+pub(super) fn op<S: KernelSpec>(
     name: &str,
     suffix: &str,
     cfg: S::Config,
@@ -495,7 +499,7 @@ impl SglangDsv41LayerWorklet {
                         SparseIndexerLogitsDecodeKernelConfig {
                             backends: vec![p.index_decode()],
                             gpu_name: c.gpu_name.clone(),
-                            next_n: 1,
+                            next_n: c.verify_width.max(1),
                             num_heads: c.index_num_heads.into(),
                             head_dim: c.index_head_dim.into(),
                             dtype: DType::Mxfp4E2m1,
@@ -771,9 +775,16 @@ impl SglangDsv41LayerWorklet {
                     let max_ctx = input.decode_kv_lens.iter().copied().max().unwrap_or(0);
                     let keys = (call.context_before / ratio).max(1);
                     let width = (max_ctx / ratio).max(1).div_ceil(64) * 64;
+                    // `next_n` rows per request are one indexer row each at
+                    // width 1; at the verify width the kind counts requests.
+                    let batch_size = if self.cfg.verify_width > 1 {
+                        call.num_requests
+                    } else {
+                        call.num_requests * call.rows_per_request
+                    };
                     op.eval(
                         &SparseIndexerLogitsDecodeKernelInput {
-                            batch_size: call.num_requests * call.rows_per_request,
+                            batch_size,
                             num_keys: keys,
                             logits_width: width,
                         },

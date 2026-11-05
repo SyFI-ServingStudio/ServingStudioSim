@@ -8,6 +8,7 @@ pub mod build;
 pub mod config;
 pub mod contract;
 pub mod deepseek_v41_sglang;
+pub mod deepseek_v41_sglang_dspark;
 pub mod deepseek_v41_vllm;
 pub mod deepseek_v4_vllm;
 pub mod glm52_model_cfg;

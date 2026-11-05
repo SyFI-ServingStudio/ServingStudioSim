@@ -1079,6 +1079,7 @@ pub fn deepseek_v41_sglang(
         path: crate::worklet::sglang_dsv41_tp::SglangDsv41KernelPath::of(gpu)?,
         max_model_len: sg::resolve_max_model_len(max_model_len, model_cfg.max_position_embeddings)?,
         engram_residency: engram_residency.to_string(),
+        verify_width: 1,
     };
     let source = ExpertDemandSource {
         kind: routing_kind,
@@ -1093,6 +1094,96 @@ pub fn deepseek_v41_sglang(
     let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
     sg::build(name.to_string(), &model_cfg, &settings, &demand, bridge)
         .context("building DeepSeek-V4.1-Flash SGLang model (often a missing profile.db row)")
+}
+
+/// DSpark draft geometry from the checkpoint config's `dspark_*` fields.
+fn dsv41_dspark_spec(model_config: &str) -> Result<super::deepseek_v41_sglang_dspark::DsparkSpec> {
+    let raw: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(model_config)
+            .with_context(|| format!("reading {model_config}"))?,
+    )
+    .with_context(|| format!("parsing {model_config}"))?;
+    let field = |key: &str| -> Result<u64> {
+        raw.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .with_context(|| format!("{model_config}: DSpark needs `{key}`"))
+    };
+    let stages = raw
+        .get("dspark_target_layer_ids")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .with_context(|| format!("{model_config}: DSpark needs `dspark_target_layer_ids`"))?;
+    Ok(super::deepseek_v41_sglang_dspark::DsparkSpec {
+        num_stages: u32::try_from(stages)?,
+        num_experts: u32::try_from(field("dspark_n_routed_experts")?)?,
+        top_k: u32::try_from(field("dspark_num_experts_per_tok")?)?,
+        markov_rank: u32::try_from(field("dspark_markov_rank")?)?,
+    })
+}
+
+/// DeepSeek-V4.1-Flash on SGLang SM12x with DSpark: the target at the verify
+/// width plus the DSpark draft. Target routing follows the selector; the draft
+/// experts have no measured routing yet and draw uniformly.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v41_sglang_dspark(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    max_model_len: Option<u32>,
+    engram_residency: &str,
+    draft_tokens: u32,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<super::deepseek_v41_sglang_dspark::DeepseekV41SglangDsparkModel> {
+    use super::deepseek_v41_sglang as sg;
+    anyhow::ensure!(draft_tokens > 0, "DSpark draft_tokens must be positive");
+    let model_cfg = DeepseekV41ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let dspark = dsv41_dspark_spec(&model_spec.model_config)?;
+    let settings = sg::DeepseekV41SglangSettings {
+        gpu_name: gpu.to_string(),
+        path: crate::worklet::sglang_dsv41_tp::SglangDsv41KernelPath::of(gpu)?,
+        max_model_len: sg::resolve_max_model_len(max_model_len, model_cfg.max_position_embeddings)?,
+        engram_residency: engram_residency.to_string(),
+        verify_width: draft_tokens + 1,
+    };
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.top_k,
+        ep_size: sg::EP_SIZE as u16,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_layers,
+    };
+    // A recorded corpus is sampled in groups of the verify block.
+    let demand = source.demand(0..model_cfg.num_layers as usize, draft_tokens + 1)?;
+    let draft_source = ExpertDemandSource {
+        kind: RoutingKind::Uniform,
+        seed: routing_seed,
+        num_experts: dspark.num_experts,
+        experts_per_token: dspark.top_k,
+        ep_size: sg::EP_SIZE as u16,
+        expert_popularity_file: None,
+        token_corpus_file: None,
+        num_routed_layers: dspark.num_stages,
+    };
+    let draft_demand = draft_source.demand(0..dspark.num_stages as usize, draft_tokens)?;
+    super::deepseek_v41_sglang_dspark::build(
+        name.to_string(),
+        &model_cfg,
+        &settings,
+        &demand,
+        &dspark,
+        &draft_demand,
+        draft_tokens,
+        bridge,
+    )
+    .context("building DeepSeek-V4.1-Flash SGLang DSpark model (often a missing profile.db row)")
 }
 
 /// Build the GLM-5.2 model in aligned vLLM kernel granularity.
@@ -2630,6 +2721,7 @@ pub fn build_iter_model(
         )?),
         IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
         | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+        | IterArchSel::DeepseekV41SglangDspark { .. }
         | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
         }
@@ -2727,6 +2819,31 @@ pub fn build_speculative_iter_model(
                 expert_popularity_file.as_deref(),
                 token_corpus_file.as_deref(),
                 cudagraph_capture_sizes,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::DeepseekV41SglangDspark {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            max_model_len,
+            engram_residency,
+            draft_tokens,
+        } => Ok((
+            Box::new(deepseek_v41_sglang_dspark(
+                model,
+                *routing,
+                *routing_seed,
+                expert_popularity_file.as_deref(),
+                token_corpus_file.as_deref(),
+                *max_model_len,
+                engram_residency,
+                *draft_tokens,
                 gpu,
                 name,
                 bridge,
@@ -2996,6 +3113,7 @@ fn build_arch(
                 let (gpus, shape, manifest, kv_cache) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
                     | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+                    | IterArchSel::DeepseekV41SglangDspark { .. }
                     | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
                         let (model, draft_tokens) = build_speculative_iter_model(
                             selector,

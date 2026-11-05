@@ -101,6 +101,10 @@ fn default_dsv41_engram_residency() -> String {
     "host_shared_huge".to_string()
 }
 
+const fn default_dsv41_dspark_draft_tokens() -> u32 {
+    6
+}
+
 const fn default_glm52_parallel_size() -> u16 {
     8
 }
@@ -448,6 +452,42 @@ pub enum IterArchSel {
         #[serde(default = "default_dsv41_engram_residency")]
         #[param(string, default = "host_shared_huge", cache_key)]
         engram_residency: String,
+    },
+    /// [`Self::DeepseekV41Sglang`] with DSpark speculative decoding: the target
+    /// forward at the verify width plus the DSpark draft (KV inject, 3 stages,
+    /// lm_head, per-position Markov sampling). Pairs with worker `speculative`.
+    DeepseekV41SglangDspark {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes (`token_corpus` pass manifest).
+        /// Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// SGLang `--context-length`. Omitted, the checkpoint's 1048576.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// Engram host-table page backing: `host_shared_huge` (transparent huge
+        /// pages on) or `host_shared_4k`.
+        #[serde(default = "default_dsv41_engram_residency")]
+        #[param(string, default = "host_shared_huge", cache_key)]
+        engram_residency: String,
+        /// DSpark block size (`--speculative-dspark-block-size`): draft
+        /// positions per request; the verify window is one more. Must equal the
+        /// speculative worker's `draft_tokens`.
+        #[serde(default = "default_dsv41_dspark_draft_tokens")]
+        #[param(default = 6, cache_key)]
+        draft_tokens: u32,
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.
@@ -1241,6 +1281,7 @@ impl IterArchSel {
             | Self::DeepseekV41Vllm { model, .. }
             | Self::DeepseekV41VllmSerialStreams { model, .. }
             | Self::DeepseekV41Sglang { model, .. }
+            | Self::DeepseekV41SglangDspark { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
             | Self::Glm52VllmNvfp4PpDsaMoe { model, .. }
@@ -1299,6 +1340,11 @@ impl IterArchSel {
                 model.max_position_embeddings()?,
             ),
             Self::DeepseekV41Sglang {
+                model,
+                max_model_len,
+                ..
+            }
+            | Self::DeepseekV41SglangDspark {
                 model,
                 max_model_len,
                 ..
