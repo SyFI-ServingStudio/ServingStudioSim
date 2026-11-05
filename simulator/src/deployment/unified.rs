@@ -547,6 +547,41 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
+            IterArchSel::DeepseekV41Sglang {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                max_model_len,
+                engram_residency,
+                ..
+            } => {
+                // Pure TP4 attention (one group, four replicated KV shards).
+                // DSpark is not modeled: the speculative worker is refused.
+                ensure_hp_or_chunked_worker("DeepSeek-V4.1 (SGLang)", &g.worker)?;
+                let model = Arc::new(arch_build::deepseek_v41_sglang(
+                    model_spec,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    *max_model_len,
+                    engram_residency,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "DeepSeek-V4.1 (SGLang)",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
             arch @ (IterArchSel::DeepseekV41Vllm {
                 routing,
                 routing_seed,

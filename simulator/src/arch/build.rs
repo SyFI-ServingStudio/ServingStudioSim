@@ -1055,6 +1055,46 @@ pub fn deepseek_v41_vllm(
         .context("building DeepSeek-V4.1-Flash vLLM model (often a missing profile.db row)")
 }
 
+/// Build DeepSeek-V4.1-Flash as SGLang serves it on SM12x (TP4 attention + EP4
+/// experts). Routed demand: one binding over all 40 routed layers, verify
+/// width 1 (DSpark is not modeled yet).
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v41_sglang(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    max_model_len: Option<u32>,
+    engram_residency: &str,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<super::deepseek_v41_sglang::DeepseekV41SglangModel> {
+    use super::deepseek_v41_sglang as sg;
+    let model_cfg = DeepseekV41ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let settings = sg::DeepseekV41SglangSettings {
+        gpu_name: gpu.to_string(),
+        path: crate::worklet::sglang_dsv41_tp::SglangDsv41KernelPath::of(gpu)?,
+        max_model_len: sg::resolve_max_model_len(max_model_len, model_cfg.max_position_embeddings)?,
+        engram_residency: engram_residency.to_string(),
+    };
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.top_k,
+        ep_size: sg::EP_SIZE as u16,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_layers,
+    };
+    let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
+    sg::build(name.to_string(), &model_cfg, &settings, &demand, bridge)
+        .context("building DeepSeek-V4.1-Flash SGLang model (often a missing profile.db row)")
+}
+
 /// Build the GLM-5.2 model in aligned vLLM kernel granularity.
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_vllm_dsa_moe(
@@ -2261,6 +2301,26 @@ pub fn build_iter_model(
             false,
             *decoder_swa_bounded_replay,
             *max_model_len,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::DeepseekV41Sglang {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            max_model_len,
+            engram_residency,
+        } => Box::new(deepseek_v41_sglang(
+            model,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            *max_model_len,
+            engram_residency,
             gpu,
             name,
             bridge,

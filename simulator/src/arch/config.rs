@@ -97,6 +97,10 @@ const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
 /// [`Glm52MtpMode`]'s serde representation.
 const GLM52_MTP_MODES: [&str; 3] = ["off", "full_index", "index_share"];
 
+fn default_dsv41_engram_residency() -> String {
+    "host_shared_huge".to_string()
+}
+
 const fn default_glm52_parallel_size() -> u16 {
     8
 }
@@ -413,6 +417,37 @@ pub enum IterArchSel {
         /// tokens. A counterfactual with no capture behind it; default off.
         #[serde(default)]
         decoder_swa_bounded_replay: bool,
+    },
+    /// DeepSeek-V4.1-Flash as SGLang v0.5.23 serves it on SM12x (RTX PRO 6000,
+    /// PCIe): TP4 attention + EP4 experts over the same four ranks, chunked
+    /// prefill, FP8 KV, Engram host tables. Target model only: DSpark
+    /// speculative decoding is not modeled yet.
+    DeepseekV41Sglang {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes (`token_corpus` pass manifest).
+        /// Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// SGLang `--context-length`. Omitted, the checkpoint's 1048576.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// Engram host-table page backing: `host_shared_huge` (transparent huge
+        /// pages on) or `host_shared_4k`.
+        #[serde(default = "default_dsv41_engram_residency")]
+        #[param(string, default = "host_shared_huge", cache_key)]
+        engram_residency: String,
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.
@@ -1205,6 +1240,7 @@ impl IterArchSel {
             | Self::DeepseekV4VllmSerialStreams { model, .. }
             | Self::DeepseekV41Vllm { model, .. }
             | Self::DeepseekV41VllmSerialStreams { model, .. }
+            | Self::DeepseekV41Sglang { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
             | Self::Glm52VllmNvfp4PpDsaMoe { model, .. }
@@ -1259,6 +1295,14 @@ impl IterArchSel {
                 max_model_len,
                 ..
             } => super::deepseek_v41_vllm::resolve_max_model_len(
+                *max_model_len,
+                model.max_position_embeddings()?,
+            ),
+            Self::DeepseekV41Sglang {
+                model,
+                max_model_len,
+                ..
+            } => super::deepseek_v41_sglang::resolve_max_model_len(
                 *max_model_len,
                 model.max_position_embeddings()?,
             ),

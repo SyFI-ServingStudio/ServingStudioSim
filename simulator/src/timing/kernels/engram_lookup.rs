@@ -33,9 +33,12 @@ const HEAD_DIM: u32 = 256;
 const QUANT_BLOCK_SIZE: u32 = 32;
 /// `(max_ngram - 1) * n_heads` on V4.1-Flash; a rank never owns more columns.
 const MAX_LOCAL_HEADS: u32 = 24;
-/// The runner's largest pinned table (49 GiB).
-const MAX_TABLE_ROWS: u64 = 200_000_000;
-const RESIDENCIES: [&str; 2] = ["host_uva", "device"];
+/// The runners' largest pinned table: SGLang's shared host table holds a whole
+/// layer (384M rows, about 101 GiB); vLLM's per-rank slices stay under 200M.
+const MAX_TABLE_ROWS: u64 = 400_000_000;
+/// `vllm_triton`: host_uva / device. `sglang_triton`: SGLang's shared host table
+/// on 4 KiB or huge shmem pages, or device.
+const RESIDENCIES: [&str; 4] = ["host_uva", "device", "host_shared_4k", "host_shared_huge"];
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EngramLookupKernelConfig {
