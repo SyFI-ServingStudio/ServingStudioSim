@@ -9,7 +9,7 @@ Wire string: ``"single_gemm"`` — matches Rust ``KernelSpec::KIND`` in
 by ``profiling.facade`` to generate ``get_single_gemm_times`` /
 ``count_missing_single_gemm``.
 
-Nine backends share this kind/table/schema: ``torch`` (contiguous-RHS
+Ten backends share this kind/table/schema: ``torch`` (contiguous-RHS
 ``torch.mm``), ``torch_linear`` (model-weight-layout ``F.linear`` in the main
 environment), ``torch_linear_vllm`` (the same expression in vLLM's pinned
 environment), ``sglang_bf16_auto`` and ``sglang_fused_a_auto`` (SGLang's
@@ -18,7 +18,8 @@ production BF16 dispatches, SM100 only), ``deepgemm`` (FP8 dense GEMM,
 linear on SM10x, ``dtype = fp8_e4m3``), ``flashinfer_cutedsl`` (vLLM's default NVFP4 W4A4
 linear on SM10x, ``dtype = nvfp4_e2m1``), and ``flashinfer_mxfp8`` (MXFP8 dense
 linear: activation quant + FlashInfer CuTe-DSL block-scaled GEMM,
-``dtype = mxfp8_e4m3``).
+``dtype = mxfp8_e4m3``), and ``sglang_triton_block32_fp8`` (SGLang's block-32 FP8
+linear on SM12x: per-32 UE8M0 activation quant + Triton GEMM, ``dtype = fp8_e4m3``).
 BF16/FP16 model defaults offer both generic Torch variants and the timing cache
 selects the faster one per shape.
 
@@ -218,6 +219,39 @@ register(
                 "n % 16 == 0 and k % 256 == 0; otherwise cutedsl_bf16_gemm when "
                 "use_cutedsl_bf16_gemm(m, n, k) accepts the shape; otherwise F.linear. "
                 "SM100 only."
+            ),
+            url="https://github.com/sgl-project/sglang",
+        ),
+        subprocess_env="sglang_env",
+    )
+)
+
+# SGLang's block-32 FP8 linear on SM12x (DeepSeek-V4.x dense layers): per-32 UE8M0
+# activation quant + Triton _w8a8_block_fp8_matmul, timed as one row
+# (profiling/runners/gemm/sglang_block32_fp8.py). dispatch_w8a8_block_fp8_linear
+# takes this path for weight_block_size [32, 32] whenever DeepGEMM does not serve
+# block-32, which on v0.5.23 is every SM12x device.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="sglang_triton_block32_fp8",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            sm_targets=frozenset({"sm_120f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.sglang_block32_fp8",
+            function_name="profile_single_gemm_sglang_triton_block32_fp8",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "SGLang triton_w8a8_block_fp8_linear with block [32, 32] and act_scale_ue8m0: "
+                "per-32 power-of-two FP8 activation quant, then the Triton block-FP8 GEMM, bf16 "
+                "output. Both launches in one row. SM12x, where DeepGEMM does not serve block-32."
             ),
             url="https://github.com/sgl-project/sglang",
         ),
