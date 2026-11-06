@@ -92,3 +92,27 @@ Markov gather/broadcast) need the 4-GPU B2 host.
 | `single_gemm` | `unified.dspark.markov.w2` | 68 |
 | `elementwise` | `unified.dspark.markov.sample_partial` | 63 |
 | `elementwise` | `unified.dspark.markov.sample_finish` | 63 |
+
+## B1 result (2026-11-06, Massed Compute 1x RTX PRO 6000 VM, $2.79)
+
+Filled **4,149 of 4,168** rows for the DSpark presets, and the non-speculative graph's extra configs (`next_n = 1`
+decode indexer, no-draft MoE). That is 4,653 RTX PRO 6000 rows in all, merged by row into this worktree's
+`profile.db` (4,656 inserted, 0 conflicts). Only the 19 `all_reduce` rows remain; they need the 4-GPU B2 host.
+
+Every runner passed its reference check on SM120. Fixes made during bring-up (commits `045dd716` and two follow-ups):
+- **`paged_sparse_mla`:** bound 5%. FlashInfer's SM120 decode kernel differs from SGLang's torch reference by a
+  steady 3.05-3.07%; the prefill path stays under 2%.
+- **`mhc_post`:** publish SGLang's default config (its TileLang path above 384 rows reads `get_parallel()`).
+- **Indexer prefill:** a shape with no visible compressed key is a measured zero.
+- **Compressor `kv_score`:** moved to `gemm_fp32_output/sglang_router_auto` (SGLang's `linear_bf16_fp32`). Its v0.5.23
+  import paths are fixed.
+
+Runtime used: `lmsysorg/sglang:v0.5.23-cu130` (checkout `297e54fd10`):
+- flashinfer-python / cubin / jit-cache 0.7.2 (cu130);
+- sglang-kernel 0.4.10;
+- torch 2.14.1+cu130;
+- triton 3.8.0.
+
+In the container, `sglang_env`'s `.venv-sglang` must be a symlink to `/opt/sglang` (a symlink only to `bin/python`
+loses the venv), and `mold` plus `binutils` must be installed for the simulator build. Logs and the rental's
+`profile.db`: airbox-cost-calculator `docs/clients/decycle/sim/kt_bench/results_b1_1xpro6000/`.

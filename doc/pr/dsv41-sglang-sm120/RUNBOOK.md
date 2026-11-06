@@ -14,13 +14,14 @@ sgl-kernel builds the server uses:
 
 ```bash
 # on the rental, after cloning/rsyncing the worktree to ~/ss and the fork's python/ to ~/ss/alignment/profiler/sglang/python
-mkdir -p ~/ss/alignment/profiler/sglang/python/.venv-sglang/bin
-ln -sf /usr/bin/python3 ~/ss/alignment/profiler/sglang/python/.venv-sglang/bin/python   # resolved inside the container
+ln -sfn /opt/sglang ~/ss/alignment/profiler/sglang/python/.venv-sglang   # the image's venv; resolved inside the container
 sudo docker run -d --name ss --gpus all --ipc=host --network host --shm-size 64g \
   -v ~/ss:/ss -v ~/models:/models -e VIBESIM_PROFILE_RUNTIME=host \
   --entrypoint sleep lmsysorg/sglang:v0.5.23-cu130 infinity
 sudo docker exec ss bash -lc 'git -C /sgl-workspace/sglang rev-parse HEAD'   # expect 297e54fd10...
-sudo docker exec ss bash -lc 'pip install -q uv && cd /ss && uv sync'        # project env for the launcher
+sudo docker exec ss bash -lc 'apt-get update -qq && apt-get install -y -qq mold binutils clang'   # simulator build
+sudo docker exec ss bash -lc 'curl -LsSf https://astral.sh/uv/install.sh | sh; curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
+sudo docker exec ss bash -lc 'cd /ss && ~/.local/bin/uv sync'                # project env for the launcher
 ```
 
 `sglang_env` (`profiling/exec/env.py`) puts the fork's `python/` first on the import path, so the fork's
@@ -32,7 +33,7 @@ Host settings, as root, **before** anything starts:
 - `swapoff -a`;
 - check `free -g` (B1 needs about 110 GB free for one Engram table).
 
-## B1: 1x RTX PRO 6000, about 2-3 h (RunPod / Massed Compute 1x, about $1.7-2.5/h, so about $5-8)
+## B1: 1x RTX PRO 6000 -- DONE 2026-11-06 (4,149/4,168 rows, $2.79; see ROWS_TO_FILL.md), about 2-3 h (RunPod / Massed Compute 1x, about $1.7-2.5/h, so about $5-8)
 
 No model download is needed.
 
