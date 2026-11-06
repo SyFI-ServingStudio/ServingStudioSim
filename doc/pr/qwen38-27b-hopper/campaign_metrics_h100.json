@@ -1,0 +1,1861 @@
+{
+  "cases": {
+    "tp1/03_balanced_anchor_c32": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261105_hopper_pr_campaign/gtm-h100/03_balanced_anchor_c32",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.21459227467812703,
+        "e2e_mean_pct": -1.1636860838989738,
+        "gpu_time_multiplier": 1.0186604343100523,
+        "iteration_cycle_mean_pct": -0.8849440852053192,
+        "iterations_pct": -0.21413276231263545,
+        "kernel_abs_pct": 1.590960348500254,
+        "kernel_signed_pct": -1.4221616152531698,
+        "map_coverage_pct": 99.73897068083375,
+        "output_tps_pct": 1.3357102237883778,
+        "prefill_tokens_mean_pct": 0.21459227467812703,
+        "scheduled_kv_mean_pct": 0.21459227467812703,
+        "server_tpot_mean_pct": -0.17926889084396436,
+        "server_ttft_mean_pct": -0.7356992209838098
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/03_balanced_anchor_c32/analysis_kernel",
+        "iteration_count": 185,
+        "predict_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/03_balanced_anchor_c32/timing_predict",
+        "profile_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/03_balanced_anchor_c32/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "identities": [
+            {
+              "request_id": 0,
+              "source_id": "03_balanced_anchor_c32-0000"
+            },
+            {
+              "request_id": 1,
+              "source_id": "03_balanced_anchor_c32-0001"
+            },
+            {
+              "request_id": 2,
+              "source_id": "03_balanced_anchor_c32-0002"
+            },
+            {
+              "request_id": 3,
+              "source_id": "03_balanced_anchor_c32-0003"
+            },
+            {
+              "request_id": 4,
+              "source_id": "03_balanced_anchor_c32-0004"
+            },
+            {
+              "request_id": 5,
+              "source_id": "03_balanced_anchor_c32-0005"
+            },
+            {
+              "request_id": 6,
+              "source_id": "03_balanced_anchor_c32-0006"
+            },
+            {
+              "request_id": 7,
+              "source_id": "03_balanced_anchor_c32-0007"
+            },
+            {
+              "request_id": 8,
+              "source_id": "03_balanced_anchor_c32-0008"
+            },
+            {
+              "request_id": 9,
+              "source_id": "03_balanced_anchor_c32-0009"
+            },
+            {
+              "request_id": 10,
+              "source_id": "03_balanced_anchor_c32-0010"
+            },
+            {
+              "request_id": 11,
+              "source_id": "03_balanced_anchor_c32-0011"
+            },
+            {
+              "request_id": 12,
+              "source_id": "03_balanced_anchor_c32-0012"
+            },
+            {
+              "request_id": 13,
+              "source_id": "03_balanced_anchor_c32-0013"
+            },
+            {
+              "request_id": 14,
+              "source_id": "03_balanced_anchor_c32-0014"
+            },
+            {
+              "request_id": 15,
+              "source_id": "03_balanced_anchor_c32-0015"
+            },
+            {
+              "request_id": 16,
+              "source_id": "03_balanced_anchor_c32-0016"
+            },
+            {
+              "request_id": 17,
+              "source_id": "03_balanced_anchor_c32-0017"
+            },
+            {
+              "request_id": 18,
+              "source_id": "03_balanced_anchor_c32-0018"
+            },
+            {
+              "request_id": 19,
+              "source_id": "03_balanced_anchor_c32-0019"
+            },
+            {
+              "request_id": 20,
+              "source_id": "03_balanced_anchor_c32-0020"
+            },
+            {
+              "request_id": 21,
+              "source_id": "03_balanced_anchor_c32-0021"
+            },
+            {
+              "request_id": 22,
+              "source_id": "03_balanced_anchor_c32-0022"
+            },
+            {
+              "request_id": 23,
+              "source_id": "03_balanced_anchor_c32-0023"
+            },
+            {
+              "request_id": 24,
+              "source_id": "03_balanced_anchor_c32-0024"
+            },
+            {
+              "request_id": 25,
+              "source_id": "03_balanced_anchor_c32-0025"
+            },
+            {
+              "request_id": 26,
+              "source_id": "03_balanced_anchor_c32-0026"
+            },
+            {
+              "request_id": 27,
+              "source_id": "03_balanced_anchor_c32-0027"
+            },
+            {
+              "request_id": 28,
+              "source_id": "03_balanced_anchor_c32-0028"
+            },
+            {
+              "request_id": 29,
+              "source_id": "03_balanced_anchor_c32-0029"
+            },
+            {
+              "request_id": 30,
+              "source_id": "03_balanced_anchor_c32-0030"
+            },
+            {
+              "request_id": 31,
+              "source_id": "03_balanced_anchor_c32-0031"
+            },
+            {
+              "request_id": 32,
+              "source_id": "03_balanced_anchor_c32-0032"
+            },
+            {
+              "request_id": 33,
+              "source_id": "03_balanced_anchor_c32-0033"
+            },
+            {
+              "request_id": 34,
+              "source_id": "03_balanced_anchor_c32-0034"
+            },
+            {
+              "request_id": 35,
+              "source_id": "03_balanced_anchor_c32-0035"
+            },
+            {
+              "request_id": 36,
+              "source_id": "03_balanced_anchor_c32-0036"
+            },
+            {
+              "request_id": 37,
+              "source_id": "03_balanced_anchor_c32-0037"
+            },
+            {
+              "request_id": 38,
+              "source_id": "03_balanced_anchor_c32-0038"
+            },
+            {
+              "request_id": 39,
+              "source_id": "03_balanced_anchor_c32-0039"
+            },
+            {
+              "request_id": 40,
+              "source_id": "03_balanced_anchor_c32-0040"
+            },
+            {
+              "request_id": 41,
+              "source_id": "03_balanced_anchor_c32-0041"
+            },
+            {
+              "request_id": 42,
+              "source_id": "03_balanced_anchor_c32-0042"
+            },
+            {
+              "request_id": 43,
+              "source_id": "03_balanced_anchor_c32-0043"
+            },
+            {
+              "request_id": 44,
+              "source_id": "03_balanced_anchor_c32-0044"
+            },
+            {
+              "request_id": 45,
+              "source_id": "03_balanced_anchor_c32-0045"
+            },
+            {
+              "request_id": 46,
+              "source_id": "03_balanced_anchor_c32-0046"
+            },
+            {
+              "request_id": 47,
+              "source_id": "03_balanced_anchor_c32-0047"
+            },
+            {
+              "request_id": 48,
+              "source_id": "03_balanced_anchor_c32-0048"
+            },
+            {
+              "request_id": 49,
+              "source_id": "03_balanced_anchor_c32-0049"
+            },
+            {
+              "request_id": 50,
+              "source_id": "03_balanced_anchor_c32-0050"
+            },
+            {
+              "request_id": 51,
+              "source_id": "03_balanced_anchor_c32-0051"
+            },
+            {
+              "request_id": 52,
+              "source_id": "03_balanced_anchor_c32-0052"
+            },
+            {
+              "request_id": 53,
+              "source_id": "03_balanced_anchor_c32-0053"
+            },
+            {
+              "request_id": 54,
+              "source_id": "03_balanced_anchor_c32-0054"
+            },
+            {
+              "request_id": 55,
+              "source_id": "03_balanced_anchor_c32-0055"
+            },
+            {
+              "request_id": 56,
+              "source_id": "03_balanced_anchor_c32-0056"
+            },
+            {
+              "request_id": 57,
+              "source_id": "03_balanced_anchor_c32-0057"
+            },
+            {
+              "request_id": 58,
+              "source_id": "03_balanced_anchor_c32-0058"
+            },
+            {
+              "request_id": 59,
+              "source_id": "03_balanced_anchor_c32-0059"
+            },
+            {
+              "request_id": 60,
+              "source_id": "03_balanced_anchor_c32-0060"
+            },
+            {
+              "request_id": 61,
+              "source_id": "03_balanced_anchor_c32-0061"
+            },
+            {
+              "request_id": 62,
+              "source_id": "03_balanced_anchor_c32-0062"
+            },
+            {
+              "request_id": 63,
+              "source_id": "03_balanced_anchor_c32-0063"
+            },
+            {
+              "request_id": 64,
+              "source_id": "03_balanced_anchor_c32-0064"
+            },
+            {
+              "request_id": 65,
+              "source_id": "03_balanced_anchor_c32-0065"
+            },
+            {
+              "request_id": 66,
+              "source_id": "03_balanced_anchor_c32-0066"
+            },
+            {
+              "request_id": 67,
+              "source_id": "03_balanced_anchor_c32-0067"
+            },
+            {
+              "request_id": 68,
+              "source_id": "03_balanced_anchor_c32-0068"
+            },
+            {
+              "request_id": 69,
+              "source_id": "03_balanced_anchor_c32-0069"
+            },
+            {
+              "request_id": 70,
+              "source_id": "03_balanced_anchor_c32-0070"
+            },
+            {
+              "request_id": 71,
+              "source_id": "03_balanced_anchor_c32-0071"
+            },
+            {
+              "request_id": 72,
+              "source_id": "03_balanced_anchor_c32-0072"
+            },
+            {
+              "request_id": 73,
+              "source_id": "03_balanced_anchor_c32-0073"
+            },
+            {
+              "request_id": 74,
+              "source_id": "03_balanced_anchor_c32-0074"
+            },
+            {
+              "request_id": 75,
+              "source_id": "03_balanced_anchor_c32-0075"
+            },
+            {
+              "request_id": 76,
+              "source_id": "03_balanced_anchor_c32-0076"
+            },
+            {
+              "request_id": 77,
+              "source_id": "03_balanced_anchor_c32-0077"
+            },
+            {
+              "request_id": 78,
+              "source_id": "03_balanced_anchor_c32-0078"
+            },
+            {
+              "request_id": 79,
+              "source_id": "03_balanced_anchor_c32-0079"
+            },
+            {
+              "request_id": 80,
+              "source_id": "03_balanced_anchor_c32-0080"
+            },
+            {
+              "request_id": 81,
+              "source_id": "03_balanced_anchor_c32-0081"
+            },
+            {
+              "request_id": 82,
+              "source_id": "03_balanced_anchor_c32-0082"
+            },
+            {
+              "request_id": 83,
+              "source_id": "03_balanced_anchor_c32-0083"
+            },
+            {
+              "request_id": 84,
+              "source_id": "03_balanced_anchor_c32-0084"
+            },
+            {
+              "request_id": 85,
+              "source_id": "03_balanced_anchor_c32-0085"
+            },
+            {
+              "request_id": 86,
+              "source_id": "03_balanced_anchor_c32-0086"
+            },
+            {
+              "request_id": 87,
+              "source_id": "03_balanced_anchor_c32-0087"
+            },
+            {
+              "request_id": 88,
+              "source_id": "03_balanced_anchor_c32-0088"
+            },
+            {
+              "request_id": 89,
+              "source_id": "03_balanced_anchor_c32-0089"
+            },
+            {
+              "request_id": 90,
+              "source_id": "03_balanced_anchor_c32-0090"
+            },
+            {
+              "request_id": 91,
+              "source_id": "03_balanced_anchor_c32-0091"
+            },
+            {
+              "request_id": 92,
+              "source_id": "03_balanced_anchor_c32-0092"
+            },
+            {
+              "request_id": 93,
+              "source_id": "03_balanced_anchor_c32-0093"
+            },
+            {
+              "request_id": 94,
+              "source_id": "03_balanced_anchor_c32-0094"
+            },
+            {
+              "request_id": 95,
+              "source_id": "03_balanced_anchor_c32-0095"
+            },
+            {
+              "request_id": 96,
+              "source_id": "03_balanced_anchor_c32-0096"
+            },
+            {
+              "request_id": 97,
+              "source_id": "03_balanced_anchor_c32-0097"
+            },
+            {
+              "request_id": 98,
+              "source_id": "03_balanced_anchor_c32-0098"
+            },
+            {
+              "request_id": 99,
+              "source_id": "03_balanced_anchor_c32-0099"
+            },
+            {
+              "request_id": 100,
+              "source_id": "03_balanced_anchor_c32-0100"
+            },
+            {
+              "request_id": 101,
+              "source_id": "03_balanced_anchor_c32-0101"
+            },
+            {
+              "request_id": 102,
+              "source_id": "03_balanced_anchor_c32-0102"
+            },
+            {
+              "request_id": 103,
+              "source_id": "03_balanced_anchor_c32-0103"
+            },
+            {
+              "request_id": 104,
+              "source_id": "03_balanced_anchor_c32-0104"
+            },
+            {
+              "request_id": 105,
+              "source_id": "03_balanced_anchor_c32-0105"
+            },
+            {
+              "request_id": 106,
+              "source_id": "03_balanced_anchor_c32-0106"
+            },
+            {
+              "request_id": 107,
+              "source_id": "03_balanced_anchor_c32-0107"
+            },
+            {
+              "request_id": 108,
+              "source_id": "03_balanced_anchor_c32-0108"
+            },
+            {
+              "request_id": 109,
+              "source_id": "03_balanced_anchor_c32-0109"
+            },
+            {
+              "request_id": 110,
+              "source_id": "03_balanced_anchor_c32-0110"
+            },
+            {
+              "request_id": 111,
+              "source_id": "03_balanced_anchor_c32-0111"
+            },
+            {
+              "request_id": 112,
+              "source_id": "03_balanced_anchor_c32-0112"
+            },
+            {
+              "request_id": 113,
+              "source_id": "03_balanced_anchor_c32-0113"
+            },
+            {
+              "request_id": 114,
+              "source_id": "03_balanced_anchor_c32-0114"
+            },
+            {
+              "request_id": 115,
+              "source_id": "03_balanced_anchor_c32-0115"
+            },
+            {
+              "request_id": 116,
+              "source_id": "03_balanced_anchor_c32-0116"
+            },
+            {
+              "request_id": 117,
+              "source_id": "03_balanced_anchor_c32-0117"
+            },
+            {
+              "request_id": 118,
+              "source_id": "03_balanced_anchor_c32-0118"
+            },
+            {
+              "request_id": 119,
+              "source_id": "03_balanced_anchor_c32-0119"
+            },
+            {
+              "request_id": 120,
+              "source_id": "03_balanced_anchor_c32-0120"
+            },
+            {
+              "request_id": 121,
+              "source_id": "03_balanced_anchor_c32-0121"
+            },
+            {
+              "request_id": 122,
+              "source_id": "03_balanced_anchor_c32-0122"
+            },
+            {
+              "request_id": 123,
+              "source_id": "03_balanced_anchor_c32-0123"
+            },
+            {
+              "request_id": 124,
+              "source_id": "03_balanced_anchor_c32-0124"
+            },
+            {
+              "request_id": 125,
+              "source_id": "03_balanced_anchor_c32-0125"
+            },
+            {
+              "request_id": 126,
+              "source_id": "03_balanced_anchor_c32-0126"
+            },
+            {
+              "request_id": 127,
+              "source_id": "03_balanced_anchor_c32-0127"
+            }
+          ],
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 128,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/03_balanced_anchor_c32/simulation",
+        "workload_profile_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/03_balanced_anchor_c32/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261105_hopper_pr_campaign/gtm-h100/03_balanced_anchor_c32/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261105_hopper_pr_campaign/gtm-h100/03_balanced_anchor_c32/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261105_hopper_pr_campaign/gtm-h100/03_balanced_anchor_c32/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/04_prefill_spectrum_c32": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261105_hopper_pr_campaign/gtm-h100/04_prefill_spectrum_c32",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 1.7857142857143016,
+        "e2e_mean_pct": 0.7630588997713517,
+        "gpu_time_multiplier": 1.0167927019378848,
+        "iteration_cycle_mean_pct": 2.6911916708558303,
+        "iterations_pct": -1.7543859649122862,
+        "kernel_abs_pct": 1.4643013488898606,
+        "kernel_signed_pct": -0.9701133105617059,
+        "map_coverage_pct": 99.86703363526011,
+        "output_tps_pct": -0.6787133508267651,
+        "prefill_tokens_mean_pct": 1.7857142857142794,
+        "scheduled_kv_mean_pct": 1.7857142857143016,
+        "server_tpot_mean_pct": 3.2389772423787377,
+        "server_ttft_mean_pct": -3.552965957480847
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/04_prefill_spectrum_c32/analysis_kernel",
+        "iteration_count": 74,
+        "predict_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/04_prefill_spectrum_c32/timing_predict",
+        "profile_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/04_prefill_spectrum_c32/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "identities": [
+            {
+              "request_id": 0,
+              "source_id": "04_prefill_spectrum_c32-0000"
+            },
+            {
+              "request_id": 1,
+              "source_id": "04_prefill_spectrum_c32-0001"
+            },
+            {
+              "request_id": 2,
+              "source_id": "04_prefill_spectrum_c32-0002"
+            },
+            {
+              "request_id": 3,
+              "source_id": "04_prefill_spectrum_c32-0003"
+            },
+            {
+              "request_id": 4,
+              "source_id": "04_prefill_spectrum_c32-0004"
+            },
+            {
+              "request_id": 5,
+              "source_id": "04_prefill_spectrum_c32-0005"
+            },
+            {
+              "request_id": 6,
+              "source_id": "04_prefill_spectrum_c32-0006"
+            },
+            {
+              "request_id": 7,
+              "source_id": "04_prefill_spectrum_c32-0007"
+            },
+            {
+              "request_id": 8,
+              "source_id": "04_prefill_spectrum_c32-0008"
+            },
+            {
+              "request_id": 9,
+              "source_id": "04_prefill_spectrum_c32-0009"
+            },
+            {
+              "request_id": 10,
+              "source_id": "04_prefill_spectrum_c32-0010"
+            },
+            {
+              "request_id": 11,
+              "source_id": "04_prefill_spectrum_c32-0011"
+            },
+            {
+              "request_id": 12,
+              "source_id": "04_prefill_spectrum_c32-0012"
+            },
+            {
+              "request_id": 13,
+              "source_id": "04_prefill_spectrum_c32-0013"
+            },
+            {
+              "request_id": 14,
+              "source_id": "04_prefill_spectrum_c32-0014"
+            },
+            {
+              "request_id": 15,
+              "source_id": "04_prefill_spectrum_c32-0015"
+            },
+            {
+              "request_id": 16,
+              "source_id": "04_prefill_spectrum_c32-0016"
+            },
+            {
+              "request_id": 17,
+              "source_id": "04_prefill_spectrum_c32-0017"
+            },
+            {
+              "request_id": 18,
+              "source_id": "04_prefill_spectrum_c32-0018"
+            },
+            {
+              "request_id": 19,
+              "source_id": "04_prefill_spectrum_c32-0019"
+            },
+            {
+              "request_id": 20,
+              "source_id": "04_prefill_spectrum_c32-0020"
+            },
+            {
+              "request_id": 21,
+              "source_id": "04_prefill_spectrum_c32-0021"
+            },
+            {
+              "request_id": 22,
+              "source_id": "04_prefill_spectrum_c32-0022"
+            },
+            {
+              "request_id": 23,
+              "source_id": "04_prefill_spectrum_c32-0023"
+            },
+            {
+              "request_id": 24,
+              "source_id": "04_prefill_spectrum_c32-0024"
+            },
+            {
+              "request_id": 25,
+              "source_id": "04_prefill_spectrum_c32-0025"
+            },
+            {
+              "request_id": 26,
+              "source_id": "04_prefill_spectrum_c32-0026"
+            },
+            {
+              "request_id": 27,
+              "source_id": "04_prefill_spectrum_c32-0027"
+            },
+            {
+              "request_id": 28,
+              "source_id": "04_prefill_spectrum_c32-0028"
+            },
+            {
+              "request_id": 29,
+              "source_id": "04_prefill_spectrum_c32-0029"
+            },
+            {
+              "request_id": 30,
+              "source_id": "04_prefill_spectrum_c32-0030"
+            },
+            {
+              "request_id": 31,
+              "source_id": "04_prefill_spectrum_c32-0031"
+            },
+            {
+              "request_id": 32,
+              "source_id": "04_prefill_spectrum_c32-0032"
+            },
+            {
+              "request_id": 33,
+              "source_id": "04_prefill_spectrum_c32-0033"
+            },
+            {
+              "request_id": 34,
+              "source_id": "04_prefill_spectrum_c32-0034"
+            },
+            {
+              "request_id": 35,
+              "source_id": "04_prefill_spectrum_c32-0035"
+            },
+            {
+              "request_id": 36,
+              "source_id": "04_prefill_spectrum_c32-0036"
+            },
+            {
+              "request_id": 37,
+              "source_id": "04_prefill_spectrum_c32-0037"
+            },
+            {
+              "request_id": 38,
+              "source_id": "04_prefill_spectrum_c32-0038"
+            },
+            {
+              "request_id": 39,
+              "source_id": "04_prefill_spectrum_c32-0039"
+            },
+            {
+              "request_id": 40,
+              "source_id": "04_prefill_spectrum_c32-0040"
+            },
+            {
+              "request_id": 41,
+              "source_id": "04_prefill_spectrum_c32-0041"
+            },
+            {
+              "request_id": 42,
+              "source_id": "04_prefill_spectrum_c32-0042"
+            },
+            {
+              "request_id": 43,
+              "source_id": "04_prefill_spectrum_c32-0043"
+            },
+            {
+              "request_id": 44,
+              "source_id": "04_prefill_spectrum_c32-0044"
+            },
+            {
+              "request_id": 45,
+              "source_id": "04_prefill_spectrum_c32-0045"
+            },
+            {
+              "request_id": 46,
+              "source_id": "04_prefill_spectrum_c32-0046"
+            },
+            {
+              "request_id": 47,
+              "source_id": "04_prefill_spectrum_c32-0047"
+            },
+            {
+              "request_id": 48,
+              "source_id": "04_prefill_spectrum_c32-0048"
+            },
+            {
+              "request_id": 49,
+              "source_id": "04_prefill_spectrum_c32-0049"
+            },
+            {
+              "request_id": 50,
+              "source_id": "04_prefill_spectrum_c32-0050"
+            },
+            {
+              "request_id": 51,
+              "source_id": "04_prefill_spectrum_c32-0051"
+            },
+            {
+              "request_id": 52,
+              "source_id": "04_prefill_spectrum_c32-0052"
+            },
+            {
+              "request_id": 53,
+              "source_id": "04_prefill_spectrum_c32-0053"
+            },
+            {
+              "request_id": 54,
+              "source_id": "04_prefill_spectrum_c32-0054"
+            },
+            {
+              "request_id": 55,
+              "source_id": "04_prefill_spectrum_c32-0055"
+            },
+            {
+              "request_id": 56,
+              "source_id": "04_prefill_spectrum_c32-0056"
+            },
+            {
+              "request_id": 57,
+              "source_id": "04_prefill_spectrum_c32-0057"
+            },
+            {
+              "request_id": 58,
+              "source_id": "04_prefill_spectrum_c32-0058"
+            },
+            {
+              "request_id": 59,
+              "source_id": "04_prefill_spectrum_c32-0059"
+            },
+            {
+              "request_id": 60,
+              "source_id": "04_prefill_spectrum_c32-0060"
+            },
+            {
+              "request_id": 61,
+              "source_id": "04_prefill_spectrum_c32-0061"
+            },
+            {
+              "request_id": 62,
+              "source_id": "04_prefill_spectrum_c32-0062"
+            },
+            {
+              "request_id": 63,
+              "source_id": "04_prefill_spectrum_c32-0063"
+            },
+            {
+              "request_id": 64,
+              "source_id": "04_prefill_spectrum_c32-0064"
+            },
+            {
+              "request_id": 65,
+              "source_id": "04_prefill_spectrum_c32-0065"
+            },
+            {
+              "request_id": 66,
+              "source_id": "04_prefill_spectrum_c32-0066"
+            },
+            {
+              "request_id": 67,
+              "source_id": "04_prefill_spectrum_c32-0067"
+            },
+            {
+              "request_id": 68,
+              "source_id": "04_prefill_spectrum_c32-0068"
+            },
+            {
+              "request_id": 69,
+              "source_id": "04_prefill_spectrum_c32-0069"
+            },
+            {
+              "request_id": 70,
+              "source_id": "04_prefill_spectrum_c32-0070"
+            },
+            {
+              "request_id": 71,
+              "source_id": "04_prefill_spectrum_c32-0071"
+            },
+            {
+              "request_id": 72,
+              "source_id": "04_prefill_spectrum_c32-0072"
+            },
+            {
+              "request_id": 73,
+              "source_id": "04_prefill_spectrum_c32-0073"
+            },
+            {
+              "request_id": 74,
+              "source_id": "04_prefill_spectrum_c32-0074"
+            },
+            {
+              "request_id": 75,
+              "source_id": "04_prefill_spectrum_c32-0075"
+            },
+            {
+              "request_id": 76,
+              "source_id": "04_prefill_spectrum_c32-0076"
+            },
+            {
+              "request_id": 77,
+              "source_id": "04_prefill_spectrum_c32-0077"
+            },
+            {
+              "request_id": 78,
+              "source_id": "04_prefill_spectrum_c32-0078"
+            },
+            {
+              "request_id": 79,
+              "source_id": "04_prefill_spectrum_c32-0079"
+            },
+            {
+              "request_id": 80,
+              "source_id": "04_prefill_spectrum_c32-0080"
+            },
+            {
+              "request_id": 81,
+              "source_id": "04_prefill_spectrum_c32-0081"
+            },
+            {
+              "request_id": 82,
+              "source_id": "04_prefill_spectrum_c32-0082"
+            },
+            {
+              "request_id": 83,
+              "source_id": "04_prefill_spectrum_c32-0083"
+            },
+            {
+              "request_id": 84,
+              "source_id": "04_prefill_spectrum_c32-0084"
+            },
+            {
+              "request_id": 85,
+              "source_id": "04_prefill_spectrum_c32-0085"
+            },
+            {
+              "request_id": 86,
+              "source_id": "04_prefill_spectrum_c32-0086"
+            },
+            {
+              "request_id": 87,
+              "source_id": "04_prefill_spectrum_c32-0087"
+            },
+            {
+              "request_id": 88,
+              "source_id": "04_prefill_spectrum_c32-0088"
+            },
+            {
+              "request_id": 89,
+              "source_id": "04_prefill_spectrum_c32-0089"
+            },
+            {
+              "request_id": 90,
+              "source_id": "04_prefill_spectrum_c32-0090"
+            },
+            {
+              "request_id": 91,
+              "source_id": "04_prefill_spectrum_c32-0091"
+            },
+            {
+              "request_id": 92,
+              "source_id": "04_prefill_spectrum_c32-0092"
+            },
+            {
+              "request_id": 93,
+              "source_id": "04_prefill_spectrum_c32-0093"
+            },
+            {
+              "request_id": 94,
+              "source_id": "04_prefill_spectrum_c32-0094"
+            },
+            {
+              "request_id": 95,
+              "source_id": "04_prefill_spectrum_c32-0095"
+            },
+            {
+              "request_id": 96,
+              "source_id": "04_prefill_spectrum_c32-0096"
+            },
+            {
+              "request_id": 97,
+              "source_id": "04_prefill_spectrum_c32-0097"
+            },
+            {
+              "request_id": 98,
+              "source_id": "04_prefill_spectrum_c32-0098"
+            },
+            {
+              "request_id": 99,
+              "source_id": "04_prefill_spectrum_c32-0099"
+            },
+            {
+              "request_id": 100,
+              "source_id": "04_prefill_spectrum_c32-0100"
+            },
+            {
+              "request_id": 101,
+              "source_id": "04_prefill_spectrum_c32-0101"
+            },
+            {
+              "request_id": 102,
+              "source_id": "04_prefill_spectrum_c32-0102"
+            },
+            {
+              "request_id": 103,
+              "source_id": "04_prefill_spectrum_c32-0103"
+            },
+            {
+              "request_id": 104,
+              "source_id": "04_prefill_spectrum_c32-0104"
+            },
+            {
+              "request_id": 105,
+              "source_id": "04_prefill_spectrum_c32-0105"
+            },
+            {
+              "request_id": 106,
+              "source_id": "04_prefill_spectrum_c32-0106"
+            },
+            {
+              "request_id": 107,
+              "source_id": "04_prefill_spectrum_c32-0107"
+            },
+            {
+              "request_id": 108,
+              "source_id": "04_prefill_spectrum_c32-0108"
+            },
+            {
+              "request_id": 109,
+              "source_id": "04_prefill_spectrum_c32-0109"
+            },
+            {
+              "request_id": 110,
+              "source_id": "04_prefill_spectrum_c32-0110"
+            },
+            {
+              "request_id": 111,
+              "source_id": "04_prefill_spectrum_c32-0111"
+            },
+            {
+              "request_id": 112,
+              "source_id": "04_prefill_spectrum_c32-0112"
+            },
+            {
+              "request_id": 113,
+              "source_id": "04_prefill_spectrum_c32-0113"
+            },
+            {
+              "request_id": 114,
+              "source_id": "04_prefill_spectrum_c32-0114"
+            },
+            {
+              "request_id": 115,
+              "source_id": "04_prefill_spectrum_c32-0115"
+            },
+            {
+              "request_id": 116,
+              "source_id": "04_prefill_spectrum_c32-0116"
+            },
+            {
+              "request_id": 117,
+              "source_id": "04_prefill_spectrum_c32-0117"
+            },
+            {
+              "request_id": 118,
+              "source_id": "04_prefill_spectrum_c32-0118"
+            },
+            {
+              "request_id": 119,
+              "source_id": "04_prefill_spectrum_c32-0119"
+            },
+            {
+              "request_id": 120,
+              "source_id": "04_prefill_spectrum_c32-0120"
+            },
+            {
+              "request_id": 121,
+              "source_id": "04_prefill_spectrum_c32-0121"
+            },
+            {
+              "request_id": 122,
+              "source_id": "04_prefill_spectrum_c32-0122"
+            },
+            {
+              "request_id": 123,
+              "source_id": "04_prefill_spectrum_c32-0123"
+            },
+            {
+              "request_id": 124,
+              "source_id": "04_prefill_spectrum_c32-0124"
+            },
+            {
+              "request_id": 125,
+              "source_id": "04_prefill_spectrum_c32-0125"
+            },
+            {
+              "request_id": 126,
+              "source_id": "04_prefill_spectrum_c32-0126"
+            },
+            {
+              "request_id": 127,
+              "source_id": "04_prefill_spectrum_c32-0127"
+            }
+          ],
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 128,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/04_prefill_spectrum_c32/simulation",
+        "workload_profile_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/04_prefill_spectrum_c32/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261105_hopper_pr_campaign/gtm-h100/04_prefill_spectrum_c32/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261105_hopper_pr_campaign/gtm-h100/04_prefill_spectrum_c32/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261105_hopper_pr_campaign/gtm-h100/04_prefill_spectrum_c32/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/05_decode_spectrum_c64": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261105_hopper_pr_campaign/gtm-h100/05_decode_spectrum_c64",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.03253619651861772,
+        "e2e_mean_pct": -2.6871094129817585,
+        "gpu_time_multiplier": 1.0334093055601885,
+        "iteration_cycle_mean_pct": -2.0673582057414652,
+        "iterations_pct": -0.03252561392096398,
+        "kernel_abs_pct": 3.033658798644153,
+        "kernel_signed_pct": -2.7316010738553924,
+        "map_coverage_pct": 99.16862065686043,
+        "output_tps_pct": 2.2439274806559606,
+        "prefill_tokens_mean_pct": 0.032536196518639926,
+        "scheduled_kv_mean_pct": 0.032536196518639926,
+        "server_tpot_mean_pct": -2.919265372080382,
+        "server_ttft_mean_pct": 0.09540654666493342
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/05_decode_spectrum_c64/analysis_kernel",
+        "iteration_count": 500,
+        "predict_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/05_decode_spectrum_c64/timing_predict",
+        "profile_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/05_decode_spectrum_c64/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "identities": [
+            {
+              "request_id": 0,
+              "source_id": "05_decode_spectrum_c64-0000"
+            },
+            {
+              "request_id": 1,
+              "source_id": "05_decode_spectrum_c64-0001"
+            },
+            {
+              "request_id": 2,
+              "source_id": "05_decode_spectrum_c64-0002"
+            },
+            {
+              "request_id": 3,
+              "source_id": "05_decode_spectrum_c64-0003"
+            },
+            {
+              "request_id": 4,
+              "source_id": "05_decode_spectrum_c64-0004"
+            },
+            {
+              "request_id": 5,
+              "source_id": "05_decode_spectrum_c64-0005"
+            },
+            {
+              "request_id": 6,
+              "source_id": "05_decode_spectrum_c64-0006"
+            },
+            {
+              "request_id": 7,
+              "source_id": "05_decode_spectrum_c64-0007"
+            },
+            {
+              "request_id": 8,
+              "source_id": "05_decode_spectrum_c64-0008"
+            },
+            {
+              "request_id": 9,
+              "source_id": "05_decode_spectrum_c64-0009"
+            },
+            {
+              "request_id": 10,
+              "source_id": "05_decode_spectrum_c64-0010"
+            },
+            {
+              "request_id": 11,
+              "source_id": "05_decode_spectrum_c64-0011"
+            },
+            {
+              "request_id": 12,
+              "source_id": "05_decode_spectrum_c64-0012"
+            },
+            {
+              "request_id": 13,
+              "source_id": "05_decode_spectrum_c64-0013"
+            },
+            {
+              "request_id": 14,
+              "source_id": "05_decode_spectrum_c64-0014"
+            },
+            {
+              "request_id": 15,
+              "source_id": "05_decode_spectrum_c64-0015"
+            },
+            {
+              "request_id": 16,
+              "source_id": "05_decode_spectrum_c64-0016"
+            },
+            {
+              "request_id": 17,
+              "source_id": "05_decode_spectrum_c64-0017"
+            },
+            {
+              "request_id": 18,
+              "source_id": "05_decode_spectrum_c64-0018"
+            },
+            {
+              "request_id": 19,
+              "source_id": "05_decode_spectrum_c64-0019"
+            },
+            {
+              "request_id": 20,
+              "source_id": "05_decode_spectrum_c64-0020"
+            },
+            {
+              "request_id": 21,
+              "source_id": "05_decode_spectrum_c64-0021"
+            },
+            {
+              "request_id": 22,
+              "source_id": "05_decode_spectrum_c64-0022"
+            },
+            {
+              "request_id": 23,
+              "source_id": "05_decode_spectrum_c64-0023"
+            },
+            {
+              "request_id": 24,
+              "source_id": "05_decode_spectrum_c64-0024"
+            },
+            {
+              "request_id": 25,
+              "source_id": "05_decode_spectrum_c64-0025"
+            },
+            {
+              "request_id": 26,
+              "source_id": "05_decode_spectrum_c64-0026"
+            },
+            {
+              "request_id": 27,
+              "source_id": "05_decode_spectrum_c64-0027"
+            },
+            {
+              "request_id": 28,
+              "source_id": "05_decode_spectrum_c64-0028"
+            },
+            {
+              "request_id": 29,
+              "source_id": "05_decode_spectrum_c64-0029"
+            },
+            {
+              "request_id": 30,
+              "source_id": "05_decode_spectrum_c64-0030"
+            },
+            {
+              "request_id": 31,
+              "source_id": "05_decode_spectrum_c64-0031"
+            },
+            {
+              "request_id": 32,
+              "source_id": "05_decode_spectrum_c64-0032"
+            },
+            {
+              "request_id": 33,
+              "source_id": "05_decode_spectrum_c64-0033"
+            },
+            {
+              "request_id": 34,
+              "source_id": "05_decode_spectrum_c64-0034"
+            },
+            {
+              "request_id": 35,
+              "source_id": "05_decode_spectrum_c64-0035"
+            },
+            {
+              "request_id": 36,
+              "source_id": "05_decode_spectrum_c64-0036"
+            },
+            {
+              "request_id": 37,
+              "source_id": "05_decode_spectrum_c64-0037"
+            },
+            {
+              "request_id": 38,
+              "source_id": "05_decode_spectrum_c64-0038"
+            },
+            {
+              "request_id": 39,
+              "source_id": "05_decode_spectrum_c64-0039"
+            },
+            {
+              "request_id": 40,
+              "source_id": "05_decode_spectrum_c64-0040"
+            },
+            {
+              "request_id": 41,
+              "source_id": "05_decode_spectrum_c64-0041"
+            },
+            {
+              "request_id": 42,
+              "source_id": "05_decode_spectrum_c64-0042"
+            },
+            {
+              "request_id": 43,
+              "source_id": "05_decode_spectrum_c64-0043"
+            },
+            {
+              "request_id": 44,
+              "source_id": "05_decode_spectrum_c64-0044"
+            },
+            {
+              "request_id": 45,
+              "source_id": "05_decode_spectrum_c64-0045"
+            },
+            {
+              "request_id": 46,
+              "source_id": "05_decode_spectrum_c64-0046"
+            },
+            {
+              "request_id": 47,
+              "source_id": "05_decode_spectrum_c64-0047"
+            },
+            {
+              "request_id": 48,
+              "source_id": "05_decode_spectrum_c64-0048"
+            },
+            {
+              "request_id": 49,
+              "source_id": "05_decode_spectrum_c64-0049"
+            },
+            {
+              "request_id": 50,
+              "source_id": "05_decode_spectrum_c64-0050"
+            },
+            {
+              "request_id": 51,
+              "source_id": "05_decode_spectrum_c64-0051"
+            },
+            {
+              "request_id": 52,
+              "source_id": "05_decode_spectrum_c64-0052"
+            },
+            {
+              "request_id": 53,
+              "source_id": "05_decode_spectrum_c64-0053"
+            },
+            {
+              "request_id": 54,
+              "source_id": "05_decode_spectrum_c64-0054"
+            },
+            {
+              "request_id": 55,
+              "source_id": "05_decode_spectrum_c64-0055"
+            },
+            {
+              "request_id": 56,
+              "source_id": "05_decode_spectrum_c64-0056"
+            },
+            {
+              "request_id": 57,
+              "source_id": "05_decode_spectrum_c64-0057"
+            },
+            {
+              "request_id": 58,
+              "source_id": "05_decode_spectrum_c64-0058"
+            },
+            {
+              "request_id": 59,
+              "source_id": "05_decode_spectrum_c64-0059"
+            },
+            {
+              "request_id": 60,
+              "source_id": "05_decode_spectrum_c64-0060"
+            },
+            {
+              "request_id": 61,
+              "source_id": "05_decode_spectrum_c64-0061"
+            },
+            {
+              "request_id": 62,
+              "source_id": "05_decode_spectrum_c64-0062"
+            },
+            {
+              "request_id": 63,
+              "source_id": "05_decode_spectrum_c64-0063"
+            },
+            {
+              "request_id": 64,
+              "source_id": "05_decode_spectrum_c64-0064"
+            },
+            {
+              "request_id": 65,
+              "source_id": "05_decode_spectrum_c64-0065"
+            },
+            {
+              "request_id": 66,
+              "source_id": "05_decode_spectrum_c64-0066"
+            },
+            {
+              "request_id": 67,
+              "source_id": "05_decode_spectrum_c64-0067"
+            },
+            {
+              "request_id": 68,
+              "source_id": "05_decode_spectrum_c64-0068"
+            },
+            {
+              "request_id": 69,
+              "source_id": "05_decode_spectrum_c64-0069"
+            },
+            {
+              "request_id": 70,
+              "source_id": "05_decode_spectrum_c64-0070"
+            },
+            {
+              "request_id": 71,
+              "source_id": "05_decode_spectrum_c64-0071"
+            },
+            {
+              "request_id": 72,
+              "source_id": "05_decode_spectrum_c64-0072"
+            },
+            {
+              "request_id": 73,
+              "source_id": "05_decode_spectrum_c64-0073"
+            },
+            {
+              "request_id": 74,
+              "source_id": "05_decode_spectrum_c64-0074"
+            },
+            {
+              "request_id": 75,
+              "source_id": "05_decode_spectrum_c64-0075"
+            },
+            {
+              "request_id": 76,
+              "source_id": "05_decode_spectrum_c64-0076"
+            },
+            {
+              "request_id": 77,
+              "source_id": "05_decode_spectrum_c64-0077"
+            },
+            {
+              "request_id": 78,
+              "source_id": "05_decode_spectrum_c64-0078"
+            },
+            {
+              "request_id": 79,
+              "source_id": "05_decode_spectrum_c64-0079"
+            },
+            {
+              "request_id": 80,
+              "source_id": "05_decode_spectrum_c64-0080"
+            },
+            {
+              "request_id": 81,
+              "source_id": "05_decode_spectrum_c64-0081"
+            },
+            {
+              "request_id": 82,
+              "source_id": "05_decode_spectrum_c64-0082"
+            },
+            {
+              "request_id": 83,
+              "source_id": "05_decode_spectrum_c64-0083"
+            },
+            {
+              "request_id": 84,
+              "source_id": "05_decode_spectrum_c64-0084"
+            },
+            {
+              "request_id": 85,
+              "source_id": "05_decode_spectrum_c64-0085"
+            },
+            {
+              "request_id": 86,
+              "source_id": "05_decode_spectrum_c64-0086"
+            },
+            {
+              "request_id": 87,
+              "source_id": "05_decode_spectrum_c64-0087"
+            },
+            {
+              "request_id": 88,
+              "source_id": "05_decode_spectrum_c64-0088"
+            },
+            {
+              "request_id": 89,
+              "source_id": "05_decode_spectrum_c64-0089"
+            },
+            {
+              "request_id": 90,
+              "source_id": "05_decode_spectrum_c64-0090"
+            },
+            {
+              "request_id": 91,
+              "source_id": "05_decode_spectrum_c64-0091"
+            },
+            {
+              "request_id": 92,
+              "source_id": "05_decode_spectrum_c64-0092"
+            },
+            {
+              "request_id": 93,
+              "source_id": "05_decode_spectrum_c64-0093"
+            },
+            {
+              "request_id": 94,
+              "source_id": "05_decode_spectrum_c64-0094"
+            },
+            {
+              "request_id": 95,
+              "source_id": "05_decode_spectrum_c64-0095"
+            },
+            {
+              "request_id": 96,
+              "source_id": "05_decode_spectrum_c64-0096"
+            },
+            {
+              "request_id": 97,
+              "source_id": "05_decode_spectrum_c64-0097"
+            },
+            {
+              "request_id": 98,
+              "source_id": "05_decode_spectrum_c64-0098"
+            },
+            {
+              "request_id": 99,
+              "source_id": "05_decode_spectrum_c64-0099"
+            },
+            {
+              "request_id": 100,
+              "source_id": "05_decode_spectrum_c64-0100"
+            },
+            {
+              "request_id": 101,
+              "source_id": "05_decode_spectrum_c64-0101"
+            },
+            {
+              "request_id": 102,
+              "source_id": "05_decode_spectrum_c64-0102"
+            },
+            {
+              "request_id": 103,
+              "source_id": "05_decode_spectrum_c64-0103"
+            },
+            {
+              "request_id": 104,
+              "source_id": "05_decode_spectrum_c64-0104"
+            },
+            {
+              "request_id": 105,
+              "source_id": "05_decode_spectrum_c64-0105"
+            },
+            {
+              "request_id": 106,
+              "source_id": "05_decode_spectrum_c64-0106"
+            },
+            {
+              "request_id": 107,
+              "source_id": "05_decode_spectrum_c64-0107"
+            },
+            {
+              "request_id": 108,
+              "source_id": "05_decode_spectrum_c64-0108"
+            },
+            {
+              "request_id": 109,
+              "source_id": "05_decode_spectrum_c64-0109"
+            },
+            {
+              "request_id": 110,
+              "source_id": "05_decode_spectrum_c64-0110"
+            },
+            {
+              "request_id": 111,
+              "source_id": "05_decode_spectrum_c64-0111"
+            },
+            {
+              "request_id": 112,
+              "source_id": "05_decode_spectrum_c64-0112"
+            },
+            {
+              "request_id": 113,
+              "source_id": "05_decode_spectrum_c64-0113"
+            },
+            {
+              "request_id": 114,
+              "source_id": "05_decode_spectrum_c64-0114"
+            },
+            {
+              "request_id": 115,
+              "source_id": "05_decode_spectrum_c64-0115"
+            },
+            {
+              "request_id": 116,
+              "source_id": "05_decode_spectrum_c64-0116"
+            },
+            {
+              "request_id": 117,
+              "source_id": "05_decode_spectrum_c64-0117"
+            },
+            {
+              "request_id": 118,
+              "source_id": "05_decode_spectrum_c64-0118"
+            },
+            {
+              "request_id": 119,
+              "source_id": "05_decode_spectrum_c64-0119"
+            },
+            {
+              "request_id": 120,
+              "source_id": "05_decode_spectrum_c64-0120"
+            },
+            {
+              "request_id": 121,
+              "source_id": "05_decode_spectrum_c64-0121"
+            },
+            {
+              "request_id": 122,
+              "source_id": "05_decode_spectrum_c64-0122"
+            },
+            {
+              "request_id": 123,
+              "source_id": "05_decode_spectrum_c64-0123"
+            },
+            {
+              "request_id": 124,
+              "source_id": "05_decode_spectrum_c64-0124"
+            },
+            {
+              "request_id": 125,
+              "source_id": "05_decode_spectrum_c64-0125"
+            },
+            {
+              "request_id": 126,
+              "source_id": "05_decode_spectrum_c64-0126"
+            },
+            {
+              "request_id": 127,
+              "source_id": "05_decode_spectrum_c64-0127"
+            }
+          ],
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 128,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/05_decode_spectrum_c64/simulation",
+        "workload_profile_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/05_decode_spectrum_c64/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261105_hopper_pr_campaign/gtm-h100/05_decode_spectrum_c64/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261105_hopper_pr_campaign/gtm-h100/05_decode_spectrum_c64/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261105_hopper_pr_campaign/gtm-h100/05_decode_spectrum_c64/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    },
+    "tp1/11_long_prefill_ladder_c1": {
+      "analyzer_schema": {
+        "e2e": 1,
+        "iteration": 3,
+        "workload": 1
+      },
+      "available": true,
+      "directory": "logs/20261105_hopper_pr_campaign/gtm-h100/11_long_prefill_ladder_c1",
+      "issues": [],
+      "metrics": {
+        "decode_batch_mean_pct": 0.0,
+        "e2e_mean_pct": 0.43145722722703894,
+        "gpu_time_multiplier": 1.0153826893667754,
+        "iteration_cycle_mean_pct": 0.5372078236689726,
+        "iterations_pct": 0.0,
+        "kernel_abs_pct": 0.8244826840905873,
+        "kernel_signed_pct": -0.2980907285452757,
+        "map_coverage_pct": 99.84599339520224,
+        "output_tps_pct": -0.42717756852241884,
+        "prefill_tokens_mean_pct": 0.0,
+        "scheduled_kv_mean_pct": 0.0,
+        "server_tpot_mean_pct": 0.9748630087091037,
+        "server_ttft_mean_pct": 0.5807014421042478
+      },
+      "provenance": {
+        "analysis_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/11_long_prefill_ladder_c1/analysis_kernel",
+        "iteration_count": 380,
+        "predict_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/11_long_prefill_ladder_c1/timing_predict",
+        "profile_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/11_long_prefill_ladder_c1/profile_nsys",
+        "request_population_audit": {
+          "all_ok": true,
+          "arrival_time_scale": 1.0,
+          "available": true,
+          "checks": {
+            "per_request_lengths_arrivals_and_completion": true,
+            "simulated_population": true,
+            "unique_simulated_ids": true
+          },
+          "identities": [
+            {
+              "request_id": 0,
+              "source_id": "11_long_prefill_ladder_c1-full-0000"
+            },
+            {
+              "request_id": 1,
+              "source_id": "11_long_prefill_ladder_c1-full-0001"
+            },
+            {
+              "request_id": 2,
+              "source_id": "11_long_prefill_ladder_c1-full-0002"
+            },
+            {
+              "request_id": 3,
+              "source_id": "11_long_prefill_ladder_c1-full-0003"
+            },
+            {
+              "request_id": 4,
+              "source_id": "11_long_prefill_ladder_c1-full-0004"
+            },
+            {
+              "request_id": 5,
+              "source_id": "11_long_prefill_ladder_c1-full-0005"
+            },
+            {
+              "request_id": 6,
+              "source_id": "11_long_prefill_ladder_c1-full-0006"
+            },
+            {
+              "request_id": 7,
+              "source_id": "11_long_prefill_ladder_c1-full-0007"
+            },
+            {
+              "request_id": 8,
+              "source_id": "11_long_prefill_ladder_c1-full-0008"
+            },
+            {
+              "request_id": 9,
+              "source_id": "11_long_prefill_ladder_c1-full-0009"
+            },
+            {
+              "request_id": 10,
+              "source_id": "11_long_prefill_ladder_c1-full-0010"
+            },
+            {
+              "request_id": 11,
+              "source_id": "11_long_prefill_ladder_c1-full-0011"
+            },
+            {
+              "request_id": 12,
+              "source_id": "11_long_prefill_ladder_c1-full-0012"
+            },
+            {
+              "request_id": 13,
+              "source_id": "11_long_prefill_ladder_c1-full-0013"
+            },
+            {
+              "request_id": 14,
+              "source_id": "11_long_prefill_ladder_c1-full-0014"
+            },
+            {
+              "request_id": 15,
+              "source_id": "11_long_prefill_ladder_c1-full-0015"
+            },
+            {
+              "request_id": 16,
+              "source_id": "11_long_prefill_ladder_c1-full-0016"
+            },
+            {
+              "request_id": 17,
+              "source_id": "11_long_prefill_ladder_c1-full-0017"
+            },
+            {
+              "request_id": 18,
+              "source_id": "11_long_prefill_ladder_c1-full-0018"
+            },
+            {
+              "request_id": 19,
+              "source_id": "11_long_prefill_ladder_c1-full-0019"
+            }
+          ],
+          "limitations": "Declared arrivals are checked; concurrency may delay actual release. Latency samples remain unpaired distributions.",
+          "mapping_basis": "independent CSV row order before scheduling",
+          "mismatched_source_ids": [],
+          "requests": 20,
+          "simulated_arrival_time_scale": null
+        },
+        "simulation_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/11_long_prefill_ladder_c1/simulation",
+        "workload_profile_log_dir": "logs/20261105_hopper_pr_campaign/gtm-h100/11_long_prefill_ladder_c1/profile_workload"
+      },
+      "reports": {
+        "e2e": "logs/20261105_hopper_pr_campaign/gtm-h100/11_long_prefill_ladder_c1/analysis_e2e/reports/alignment_e2e_report.json",
+        "iteration": "logs/20261105_hopper_pr_campaign/gtm-h100/11_long_prefill_ladder_c1/analysis_kernel/reports/alignment_iteration_report.json",
+        "workload": "logs/20261105_hopper_pr_campaign/gtm-h100/11_long_prefill_ladder_c1/analysis_e2e/reports/alignment_workload_report.json"
+      }
+    }
+  },
+  "formulas": {
+    "decode_batch_mean_pct": "ratio(workload.metrics.decode_batch_size.{simulated,measured}.mean)",
+    "e2e_mean_pct": "ratio(e2e.latency.e2e.{simulated,measured}_ms.mean)",
+    "gpu_time_multiplier": "iteration.meta.recommended_gpu_time_multiplier",
+    "iteration_cycle_mean_pct": "ratio(workload.metrics.iteration_cycle_ms.{simulated,measured}.mean)",
+    "iterations_pct": "ratio(workload.meta.{simulated,measured}_iterations)",
+    "kernel_abs_pct": "iteration.comparison.all.absolute_error_pct",
+    "kernel_signed_pct": "iteration.comparison.all.signed_error_pct",
+    "map_coverage_pct": "iteration.mapping.coverage.measured_duration_fraction * 100",
+    "output_tps_pct": "ratio(e2e.throughput.simulated_completion_tps, e2e.throughput.measured_client_completion_tps)",
+    "prefill_tokens_mean_pct": "ratio(workload.metrics.prefill_tokens.{simulated,measured}.mean)",
+    "scheduled_kv_mean_pct": "ratio(workload.metrics.scheduled_kv_tokens.{simulated,measured}.mean)",
+    "server_tpot_mean_pct": "ratio(e2e.latency.server_tpot.{simulated,measured}_ms.mean)",
+    "server_ttft_mean_pct": "ratio(e2e.latency.server_ttft.{simulated,measured}_ms.mean)"
+  },
+  "generated_by": "python -m launcher alignment-campaign extract",
+  "pack": "qwen38_27b_nvfp4_h100_tp1",
+  "roots": [
+    "logs/20261105_hopper_pr_campaign/gtm-h100"
+  ],
+  "schema_version": 1
+}
