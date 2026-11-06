@@ -337,10 +337,65 @@ fn project(pairs: &[(u32, u32)], config: &CompressedSparseMlaRopeCastKernelConfi
 /// `count` requests sharing `tokens` queries as evenly as possible, all at
 /// context `context`.
 fn uniform_pairs(tokens: u32, count: u32, context: u32) -> Vec<(u32, u32)> {
-    let (base, remainder) = (tokens / count, tokens % count);
+    let (base, remainder) = uniform_split(tokens, count);
     (0..count)
         .map(|request| (base + u32::from(request < remainder), context))
         .collect()
+}
+
+/// How [`uniform_pairs`] shares `tokens` queries over `count` requests:
+/// `(base, remainder)`, the first `remainder` requests one query longer. The
+/// closed forms below read the batch through this, so they cannot drift from
+/// the batch they stand in for.
+fn uniform_split(tokens: u32, count: u32) -> (u32, u32) {
+    (tokens / count, tokens % count)
+}
+
+/// [`uniform_split`] plus the longest query, checked as [`mean_keys`] checks
+/// each pair of the built batch.
+fn checked_uniform_split(tokens: u32, count: u32, context: u32) -> (u32, u32, u32) {
+    let (base, remainder) = uniform_split(tokens, count);
+    let longest = base + u32::from(remainder > 0);
+    assert!(
+        base > 0 && longest <= context,
+        "each pair needs 0 < query <= context"
+    );
+    (base, remainder, longest)
+}
+
+/// [`mean_keys`] of `uniform_pairs(tokens, count, context)`, without building
+/// it. The canonical searches evaluate this at every probe of a binary search
+/// over the context, for every request count, so the per-request sum dominated
+/// a DeepSeek V4 build. The batch has two query lengths at one context, so its
+/// key total is two prefix differences: the same integer total, hence the same
+/// mean to the bit.
+fn uniform_mean_keys(tokens: u32, count: u32, context: u32, ratio: u32) -> f64 {
+    let (base, remainder, longest) = checked_uniform_split(tokens, count, context);
+    let full = keys_prefix(context, ratio);
+    let keys = u64::from(remainder) * (full - keys_prefix(context - longest, ratio))
+        + u64::from(count - remainder) * (full - keys_prefix(context - base, ratio));
+    keys as f64 / f64::from(tokens)
+}
+
+/// [`wave_keys`]' mean of `uniform_pairs(tokens, count, context)`, without
+/// building or sorting the rows. Every request ends at `context` and a row's
+/// keys never fall as its position rises, so longest first is position
+/// `context` `count` times, then `context - 1` and so on, the extra rows of
+/// the `remainder` longer requests last. Wave maxima are read off that order
+/// and summed in it, so the mean matches to the bit.
+fn uniform_wave_keys(tokens: u32, count: u32, context: u32, ratio: u32, per_wave: usize) -> f64 {
+    let (base, _, _) = checked_uniform_split(tokens, count, context);
+    let shared_rows = (base * count) as usize;
+    let maxima = (0..tokens as usize).step_by(per_wave).map(|row| {
+        let back = if row < shared_rows {
+            row as u32 / count
+        } else {
+            base
+        };
+        f64::from(token_keys(context - back, ratio))
+    });
+    let waves = (tokens as usize).div_ceil(per_wave);
+    maxima.sum::<f64>() / waves as f64
 }
 
 fn key_tolerance(keys: f64) -> f64 {
@@ -366,19 +421,20 @@ fn lower_bound(lo: u32, hi: u32, target: f64, f: impl Fn(u32) -> f64) -> u32 {
 }
 
 /// The smallest shared context whose uniform batch comes closest to
-/// `target` keys under `keys_of`, or `None` if no context reaches it.
+/// `target` keys, or `None` if no context reaches it. `uniform_keys(tokens,
+/// count, context)` is the keys of `uniform_pairs(tokens, count, context)`.
 fn uniform_for_keys(
     tokens: u32,
     count: u32,
     target: f64,
     max_context: u32,
-    keys_of: &impl Fn(&[(u32, u32)]) -> f64,
+    uniform_keys: &impl Fn(u32, u32, u32) -> f64,
 ) -> Option<Vec<(u32, u32)>> {
     let lowest = tokens.div_ceil(count);
     if lowest > max_context {
         return None;
     }
-    let keys = |context| keys_of(&uniform_pairs(tokens, count, context));
+    let keys = |context| uniform_keys(tokens, count, context);
     let tolerance = key_tolerance(target);
     if keys(max_context) < target - tolerance || keys(lowest) > target + tolerance {
         return None;
@@ -421,13 +477,15 @@ fn canonical_decode(
         return None;
     }
     let per_wave = rows_per_wave(config) as usize;
-    let keys_of = |pairs: &[(u32, u32)]| wave_keys(pairs, config.compress_ratio, per_wave).1;
+    let uniform_keys = |tokens, count, context| {
+        uniform_wave_keys(tokens, count, context, config.compress_ratio, per_wave)
+    };
     let pairs = uniform_for_keys(
         rows,
         rows.min(MAX_REQUESTS),
         point[1],
         config.max_model_len,
-        &keys_of,
+        &uniform_keys,
     )?;
     on_point(&pairs, point, config).then_some(pairs)
 }
@@ -441,9 +499,9 @@ fn canonical_prefill(
 ) -> Option<Vec<(u32, u32)>> {
     let (tokens, keys) = (point[0] as u32, point[1]);
     let ratio = config.compress_ratio;
-    let keys_of = |pairs: &[(u32, u32)]| mean_keys(pairs, ratio).1;
+    let uniform_keys = |tokens, count, context| uniform_mean_keys(tokens, count, context, ratio);
     for count in 1..=tokens.min(MAX_REQUESTS - 1) {
-        let Some(base) = uniform_for_keys(tokens, count, keys, config.max_model_len, &keys_of)
+        let Some(base) = uniform_for_keys(tokens, count, keys, config.max_model_len, &uniform_keys)
         else {
             continue;
         };
@@ -484,13 +542,19 @@ fn with_filler(
         return None;
     }
     let ratio = config.compress_ratio;
-    let keys_of = |pairs: &[(u32, u32)]| mean_keys(pairs, ratio).1;
+    let uniform_keys = |tokens, count, context| uniform_mean_keys(tokens, count, context, ratio);
     let mut filler = 1_u32;
     let mut pairs = Vec::new();
     for _ in 0..4 {
         let filler_keys = f64::from(token_keys(filler, ratio));
         let base_keys = (f64::from(tokens) * keys - filler_keys) / f64::from(tokens - 1);
-        let base = uniform_for_keys(tokens - 1, count, base_keys, config.max_model_len, &keys_of)?;
+        let base = uniform_for_keys(
+            tokens - 1,
+            count,
+            base_keys,
+            config.max_model_len,
+            &uniform_keys,
+        )?;
         let with = |context| {
             let mut candidate = base.clone();
             candidate.push((1, context));
@@ -732,6 +796,28 @@ mod tests {
                     .map(|x| u64::from(token_keys(x, ratio)))
                     .sum::<u64>();
                 assert_eq!(keys_prefix(n, ratio), brute);
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_keys_match_the_built_batch() {
+        for ratio in 0..=2 {
+            for (tokens, count) in [(1_u32, 1_u32), (7, 3), (256, 255), (4096, 17), (8192, 255)] {
+                let lowest = tokens.div_ceil(count);
+                for context in [lowest, lowest + 1, 129, 1025, 70_000, 1_048_576] {
+                    if context < lowest {
+                        continue;
+                    }
+                    let pairs = uniform_pairs(tokens, count, context);
+                    let closed = uniform_mean_keys(tokens, count, context, ratio);
+                    assert_eq!(closed.to_bits(), mean_keys(&pairs, ratio).1.to_bits());
+                    for per_wave in [1, 74, 148, 1000] {
+                        let closed = uniform_wave_keys(tokens, count, context, ratio, per_wave);
+                        let built = wave_keys(&pairs, ratio, per_wave).1;
+                        assert_eq!(closed.to_bits(), built.to_bits());
+                    }
+                }
             }
         }
     }
