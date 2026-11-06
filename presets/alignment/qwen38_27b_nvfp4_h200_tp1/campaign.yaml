@@ -11,6 +11,14 @@ recorded_on:
   nsys_version: 2025.3.2
   device_roles:
     primary: '0'
+gpu_time_multiplier:
+  value: 1.02157
+  status: measured
+  derived_from: pooled recommended_gpu_time_multiplier of this pack's four kernel alignments (cases 03, 04, 05, 11;
+    sum of measured GPU cycle over sum of measured kernel time, i.e. each case's recommendation weighted by its kernel
+    time; per-case 1.015-1.034), labels from this pack's SM90 rules; H200 has no diverse_100 capture. Not fitted to any
+    E2E number.
+  evidence: logs/20261105_hopper_pr_campaign/run-h200/<case>/analysis_kernel/reports/alignment_iteration_report.json
 variants:
   tp1:
     deployment: unified

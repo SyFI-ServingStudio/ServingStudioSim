@@ -5,8 +5,10 @@ GPUs without FP4 tensor cores (Hopper, Ada, Ampere) serve ModelOpt NVFP4 linears
 with ``MarlinNvFp4LinearKernel`` (``model_executor/kernels/linear/nvfp4/marlin.py``):
 at load time ``prepare_fp4_layer_for_marlin`` repacks the packed E2M1 weight and
 its per-16 E4M3 scales into Marlin's tile layout, and every forward calls
-``apply_fp4_marlin_linear``, one Marlin launch on the BF16 activation (no
-activation quantization: the input stays BF16). Measured on the ServingStudio
+``apply_fp4_marlin_linear`` on the BF16 activation (no activation quantization:
+the input stays BF16). Marlin splits a large ``m`` over several launches (1 at
+decode sizes, 2-3 for mixed steps in the captures); the CUPTI timer sums every
+launch of the call, so a row is the whole linear. Measured on the ServingStudio
 vLLM fork on H100 and H200 (2026-11-03 captures), this is 50-77% of Qwen3.8-27B's
 GPU time on Hopper.
 
