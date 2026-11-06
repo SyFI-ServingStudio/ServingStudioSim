@@ -116,3 +116,32 @@ Runtime used: `lmsysorg/sglang:v0.5.23-cu130` (checkout `297e54fd10`):
 In the container, `sglang_env`'s `.venv-sglang` must be a symlink to `/opt/sglang` (a symlink only to `bin/python`
 loses the venv), and `mold` plus `binutils` must be installed for the simulator build. Logs and the rental's
 `profile.db`: airbox-cost-calculator `docs/clients/decycle/sim/kt_bench/results_b1_1xpro6000/`.
+
+## B2 result (2026-11-06, Massed Compute 4x RTX PRO 6000 VM without P2P, 1 h 21 m, $11.43)
+
+- **`all_reduce` / `nccl`:** the 19 rows are filled (4 ranks, SHM transport) and merged by row (0 conflicts). **Both
+  Decycle presets now resolve every row** (4,168 / 4,168 on RTX PRO 6000).
+- **Full-day simulations ran.** They are uncalibrated (`gpu_time_multiplier` 1.0, placeholder DSpark acceptance 0.8):
+  - typical: TTFT p50 / p90 / p99 0.68 / 3.6 / 13.6 s, TPOT p50 / p99 8.3 / 90 ms;
+  - peak: 0.79 / 7.1 / 23.1 s and 12.4 / 111 ms.
+
+  Outputs are in airbox-cost-calculator `docs/clients/decycle/sim/kt_bench/results_b2_4xpro6000/sim/`.
+- **Campaign (DSpark variant, trimmed to fit 2 h):** 2 nsys captures (`07_balanced_anchor_c16`, warm rerun;
+  `01_decode_graph_sizes_c16`, partial), and 1 workload-metrics pass (`07`). Every pass **stopped at extraction
+  validation**: "alignment API output_tokens does not match EngineCore num_output_tokens". The raw artifacts (nsys
+  reports, replay.jsonl, server logs with alignment records) are saved, so after the fix they re-extract with
+  `--resume` on kisnis, without a GPU.
+
+Blockers found, to fix before the next capture:
+1. **`FLASHINFER_DISABLE_JIT=1` (required by the SGLang alignment validator)** breaks SM120: the image's FlashInfer
+   JIT cache (0.7.2+cu130) has no SM120 build of `mxfp8_quantize` (the MoE path), so the server dies at its first
+   forward. Workaround used: a `fork_python` wrapper that unsets the variable for the engine only. Proper fix: either
+   add those modules to the pinned jit-cache contract, or let a pack opt out on SM12x.
+2. **Speculative token accounting in the ported fork.** The API-side `output_tokens` and the engine-side
+   `num_output_tokens` disagree under DSpark. Check the hand-ported `mark_vibesim_token_output` /
+   `_maybe_emit_vibesim_api_timing` against how the scheduler counts accepted draft tokens.
+3. **Non-fatal upstream SGLang error** during DSpark draft-block graph capture: `Cannot copy between CPU and CUDA
+   tensors during CUDA graph capture` (`deepseek_v4_backend.py:2215`, `init_forward_metadata_dspark_draft_block`).
+   The server still came up.
+4. **The first nsys capture after a cold start recorded JIT compilation,** not steady-state work. Warm the caches
+   (one throwaway server start) before capturing.
