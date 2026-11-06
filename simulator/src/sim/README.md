@@ -82,9 +82,10 @@ Each tick, in order:
    *admitted* set, so per-segment workload is a plain diff of consecutive
    snapshots. Plus a heartbeat log line.
 4. **Termination check**: `DrainComplete` (trace exhausted + zero
-   in-flight), `DurationReached` (`clock ≥ duration`, unless `run_to_end`), or
-   `Stuck` (a watchdog: trace drained but no completion, admission, or
-   processed prefill/output token for `stuck_threshold`). The first two are
+   in-flight + no outstanding `flow.background()` work), `DurationReached` (`clock ≥ duration`, unless `run_to_end`), or
+   `Stuck` (a watchdog: trace drained but no completion, admission,
+   processed prefill/output token, or finished background unit for
+   `stuck_threshold`). The first two are
    O(1); the watchdog sums the admitted requests' token progress once per
    100 s sample after the trace is exhausted, so a long decode tail with
    nothing completing is progress, not a stall.

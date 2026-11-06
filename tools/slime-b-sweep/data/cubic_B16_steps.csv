@@ -1,0 +1,28 @@
+# B threshold per rollout — cubic_B16
+# source: train_metrics tuner_decision records
+# step  = rollout index
+# B     = threshold IN EFFECT DURING that rollout  <-- the one to join on
+# B_proposed = what the tuner asked for at the END of the rollout
+# B_next = what was actually set for the next rollout (rails may clamp the proposal)
+# clamped = B_proposed != B_next
+step,B,B_proposed,B_next,clamped,applied,idle_ratio,interior_idle_ratio
+0,16,16,16,False,True,0.032358,0.000712
+1,16,32,32,False,True,0.040844,0.000838
+2,32,64,64,False,True,0.036635,0.000759
+3,64,128,128,False,True,0.041426,0.000763
+4,128,128,128,False,True,0.051994,0.000864
+5,128,128,128,False,True,0.034697,0.000945
+6,128,128,128,False,True,0.062208,0.000903
+7,128,88,88,False,True,0.090782,0.011435
+8,88,112,112,False,True,0.02923,0.000851
+9,112,128,128,False,True,0.029386,0.000554
+10,128,120,120,False,True,0.034625,0.000483
+11,120,128,128,False,True,0.036133,0.000521
+12,128,128,128,False,True,0.057162,0.000501
+13,128,128,128,False,True,0.049481,0.000662
+14,128,128,128,False,True,0.064298,0.00047
+15,128,88,88,False,True,0.079052,0.058165
+16,88,112,112,False,True,0.040705,0.000551
+17,112,80,80,False,True,0.126418,0.040742
+18,80,104,104,False,True,0.053882,0.000498
+19,104,112,112,False,True,0.025308,0.000514

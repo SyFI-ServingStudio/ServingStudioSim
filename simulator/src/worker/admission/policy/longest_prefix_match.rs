@@ -181,6 +181,8 @@ mod tests {
                 session_id,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens,
+                rounds_in_session: 1,
+                pinned_prefix_tokens: 0,
             },
             conversation_start_time: Time::ZERO,
             resident_prefix_tokens,

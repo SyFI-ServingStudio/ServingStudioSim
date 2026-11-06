@@ -24,6 +24,7 @@ pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePo
 pub struct ResolvedPrefillContext {
     session_id: Option<u32>,
     declared_prefix_tokens: u32,
+    pinned_prefix_tokens: u32,
     resident_prefix_tokens: u32,
     prefill_tokens_to_compute: u32,
     post_prefill_context_tokens: u32,
@@ -33,16 +34,32 @@ pub struct ResolvedPrefillContext {
 }
 
 impl ResolvedPrefillContext {
+    /// Resolve one prefill from the trace declaration and `cache_hit_tokens`,
+    /// the declared prefix the chosen partition physically retains
+    /// (`<= declared_prefix_tokens`; 0 for a request without a session).
+    ///
+    /// The trace's pinned tokens are resident whatever the cache holds, so
+    /// `resident = max(pinned, cache_hit)`; both count from the start of the
+    /// context, so the larger one is the resident prefix.
     pub(crate) fn new(
         session_input: SessionInput,
-        resident_prefix_tokens: u32,
+        cache_hit_tokens: u32,
         fresh_prompt_tokens: u32,
     ) -> Self {
         let declared_prefix_tokens = session_input.declared_prefix_tokens();
-        debug_assert!(resident_prefix_tokens <= declared_prefix_tokens);
-        let mut missing_prefix_tokens = declared_prefix_tokens - resident_prefix_tokens;
-        let mut resident_prefix_tokens = resident_prefix_tokens;
-        // A prompt whose prefix is entirely resident still has to run one token
+        debug_assert!(cache_hit_tokens <= declared_prefix_tokens);
+        // Cache hit/miss and pins change compute, never the logical context
+        // after prefill: the model sees the full declared prefix plus fresh prompt.
+        let post_prefill_context_tokens = fresh_prompt_tokens
+            .checked_add(declared_prefix_tokens)
+            .expect("post-prefill context token count overflow");
+        let pinned_prefix_tokens = session_input.pinned_prefix_tokens();
+        assert!(
+            pinned_prefix_tokens <= post_prefill_context_tokens,
+            "pinned prefix {pinned_prefix_tokens} exceeds the context {post_prefill_context_tokens}"
+        );
+        let mut resident_prefix_tokens = cache_hit_tokens.max(pinned_prefix_tokens);
+        // A prompt whose context is entirely resident still has to run one token
         // through the model: the last position is what produces the first output
         // logits, and no engine can emit a token it never computed. Real serving
         // stacks recompute that last token rather than serving a zero-length
@@ -50,21 +67,14 @@ impl ResolvedPrefillContext {
         // resumed turn that adds nothing new). Borrow the token from the
         // resident prefix instead of adding one on top, so
         // `hit + computed == fresh + declared` still holds exactly.
-        if fresh_prompt_tokens == 0 && missing_prefix_tokens == 0 && resident_prefix_tokens > 0 {
+        if resident_prefix_tokens == post_prefill_context_tokens && resident_prefix_tokens > 0 {
             resident_prefix_tokens -= 1;
-            missing_prefix_tokens = 1;
         }
-        let prefill_tokens_to_compute = fresh_prompt_tokens
-            .checked_add(missing_prefix_tokens)
-            .expect("resolved prefill token count overflow");
-        // Cache hit/miss changes compute, never the logical context after
-        // prefill: the model sees the full declared prefix plus fresh prompt.
-        let post_prefill_context_tokens = fresh_prompt_tokens
-            .checked_add(declared_prefix_tokens)
-            .expect("post-prefill context token count overflow");
+        let prefill_tokens_to_compute = post_prefill_context_tokens - resident_prefix_tokens;
         Self {
             session_id: session_input.session_id(),
             declared_prefix_tokens,
+            pinned_prefix_tokens,
             resident_prefix_tokens,
             prefill_tokens_to_compute,
             post_prefill_context_tokens,
@@ -85,6 +95,11 @@ impl ResolvedPrefillContext {
 
     pub fn declared_prefix_tokens(self) -> u32 {
         self.declared_prefix_tokens
+    }
+
+    /// The trace's pinned leading tokens this resolution honoured.
+    pub fn pinned_prefix_tokens(self) -> u32 {
+        self.pinned_prefix_tokens
     }
 
     pub fn prefill_tokens_to_compute(self) -> u32 {
@@ -191,11 +206,11 @@ pub trait PrefixKv: KvStore {
     fn resolved_prefill_context(&self, request: RequestId) -> ResolvedPrefillContext;
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time);
 
-    /// How much of `session_input`'s declared prefix is resident *right now*,
+    /// How much of `session_input`'s context is resident *right now*,
     /// wherever it lives. This is what a cache-aware pending order ranks by;
-    /// `declared_prefix_tokens` is only its upper bound. A session with no
-    /// retained partition has nothing to reuse and scores zero; a pinned prefix
-    /// is resident on every partition.
+    /// the larger of `declared_prefix_tokens` and the pinned tokens bounds it.
+    /// A session with no retained partition scores only its pinned tokens
+    /// (usually zero); a pinned prefix is resident on every partition.
     ///
     /// Two hash lookups, no mutation — cheap enough for the admission hot path.
     fn resident_prefix_tokens(&self, fresh_prompt_tokens: u32, session_input: SessionInput) -> u32 {
@@ -204,7 +219,9 @@ pub trait PrefixKv: KvStore {
             SessionInput::PinnedPrefix { .. } => 0,
             SessionInput::Session { .. } => {
                 let Some(partition) = self.retained_prefix_partition(session_input) else {
-                    return 0;
+                    // No retained KV anywhere: only the trace's pin is resident.
+                    return ResolvedPrefillContext::new(session_input, 0, fresh_prompt_tokens)
+                        .resident_prefix_tokens();
                 };
                 partition
             }
@@ -299,6 +316,14 @@ pub trait IterWorkerKv: KvStore {
     /// the analogue of vLLM's per-engine `kv_cache_usage`.
     fn kv_usage(&self, partition: PartitionId) -> f64;
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId>;
+
+    /// Throw away every retained prefix, on every partition.
+    ///
+    /// Separate from the drain methods on purpose: a drain hands *live*
+    /// requests to another worker, while this discards KV belonging to sessions
+    /// that have already finished a round. They are only ever called together
+    /// because a retired worker does both.
+    fn drop_retained_prefixes(&mut self, now: Time);
 
     /// Static-dispatch iteration over this iteration's fresh prefills.
     fn visit_prefill_admits(&self, partition: PartitionId, visitor: impl FnMut(RequestId));

@@ -11,13 +11,15 @@ production source-tree guide.
 
 1. `mod.rs` — the L7-facing `Flow` contract.
 2. `common.rs` — deployment actions and worker factory contracts.
-3. `config.rs` — pool/group topology types.
-4. `impls/simple_dp.rs` — reusable single-pool controller.
-5. `impls/pd.rs` — prefill/decode flow.
-6. `impls/afd_attn_pool.rs` — AFD placement, aggregation, scatter, barriers.
-7. `impls/afd_ffn_pool.rs` — AFD FFN task routing.
-8. `impls/afd.rs` — AFD flow ordering.
-9. `impls/pp.rs` — PP stage pool and flow.
+3. `config.rs` — pool/group topology types, placement/migration/training keys.
+4. `migration.rs` — the migration policy surface and built-in triggers.
+5. `training.rs` — the RL training side of a unified pool.
+6. `impls/simple_dp.rs` — reusable single-pool controller.
+7. `impls/pd.rs` — prefill/decode flow.
+8. `impls/afd_attn_pool.rs` — AFD placement, aggregation, scatter, barriers.
+9. `impls/afd_ffn_pool.rs` — AFD FFN task routing.
+10. `impls/afd.rs` — AFD flow ordering.
+11. `impls/pp.rs` — PP stage pool and flow.
 
 ## Topology vocabulary
 
@@ -41,13 +43,16 @@ pub trait Flow {
     fn on_arrival(&mut self, request: Request);
     fn tick(&mut self, now: Time) -> Vec<OrchAction>;
     fn cluster(&self) -> &SharedGpuCluster;
+    fn background(&self) -> BackgroundWork; // default: none
 }
 ```
 
 `Flow` is the only object L7 holds. `on_arrival` records request facts before
 routing the id. `tick` advances pool protocols and currently surfaces
 `OrchAction::Complete`. `cluster` exposes the shared GPU registry and transfer
-oracle for run metadata/logging.
+oracle for run metadata/logging. `background` (default none) reports flow-owned
+work outside the request ledger — the unified flow's RL training — which keeps
+the run alive and counts as watchdog progress.
 
 The concrete model/worker/controller stack is erased to `Box<dyn Flow>` only in
 the deployment layer. L5 cost paths remain statically dispatched.
@@ -76,11 +81,22 @@ same controller without teaching L6 a new L5 composition.
 ## Unified (`simple_dp.rs`)
 
 `SimpleDpPoolController` owns one pool's workers. `admit` selects by
-`DpPlacementPolicy` (`LeastQueued` or `RoundRobin`), while `tick_collect` enters
-only workers whose stored wakeup is due.
+`DpPlacementPolicy` (`LeastQueued`, `RoundRobin`, or `TraceDirected`, which
+obeys the trace's `target_worker` through the `redirect` chain), while
+`tick_collect` enters only workers whose stored wakeup is due.
 
 `SimpleDpFlow` inserts arrivals, admits them to the controller, and maps worker
-completion to `OrchAction::Complete`.
+completion to `OrchAction::Complete`. Optional, all off by default:
+
+- a `MigrationPolicy` (`migration.rs`) runs before the workers each tick; the
+  controller executes its orders with `MigratableWorker` drains and
+  `WorkerMsgCommon::Resume` re-admissions, retiring sources by redirect;
+- a `GroupLedger` counts prompt groups (`group_by: id-block | session`) for
+  migration and training;
+- a `TrainingPool` (`training.rs`) trains finished groups on freed blocks with
+  calibrated `TrainChunkWorker`s and reports itself through `Flow::background`.
+
+`doc/detailed_design/L6.md` §Unified describes the policies and keys.
 
 ## PD (`pd.rs`)
 

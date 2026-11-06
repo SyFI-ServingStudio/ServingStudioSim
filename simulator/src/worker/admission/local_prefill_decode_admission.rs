@@ -64,7 +64,20 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
         msg: WorkerMsgCommon,
         context: &WorkerContext,
     ) {
-        let WorkerMsgCommon::Request(request) = msg;
+        let request = match msg {
+            WorkerMsgCommon::Request(request) => request,
+            // This lifecycle has no recompute path: it accumulates prefill
+            // straight into `progress.prefill_tokens_processed` and calls
+            // `record_first_token` unconditionally, so re-admitting a request
+            // that already emitted tokens would silently reset its progress to
+            // one token and re-run its whole decode. Chunked prefill is the
+            // lifecycle that models retraction, and migration rides on that.
+            WorkerMsgCommon::Resume { req, .. } => unimplemented!(
+                "worker `barebone`/`hp_unified` cannot take over migrated {req:?}: \
+                 its admission has no reprocessed-prefill path. Use worker \
+                 `chunked_prefill` for a pool that migrates."
+            ),
+        };
         debug_assert!(
             !self.policy.contains(request),
             "local admission is once-per-request; duplicate pending request {request:?}"
@@ -349,5 +362,11 @@ where
 
     fn cancel_pending(&mut self, request: RequestId) -> bool {
         LocalPrefillDecodeAdmission::cancel_pending(self, request)
+    }
+
+    fn drain_pending(&mut self, out: &mut Vec<RequestId>) {
+        while let Some(candidate) = self.policy.pop(&mut self.policy_context) {
+            out.push(candidate.request_id);
+        }
     }
 }

@@ -116,6 +116,9 @@ where
                 self.rr_next = (self.rr_next + 1) % self.replicas.len();
                 replica
             }
+            DpPlacementPolicy::TraceDirected => {
+                unreachable!("the pp deployment refuses trace-directed placement at build")
+            }
         };
         self.route_to_head(replica, PipelineHeadMsg::Request(request));
     }

@@ -106,6 +106,23 @@ uv pip install --python .venv/bin/python --no-deps --target ~/profile_envs/causa
 
 Rows record `causal-conv1d <version>` as `backend_version`.
 
+`sgl_kernel_env` serves the `flashinfer_attn_decode` `sgl_fa3` backend,
+SGLang's own FlashAttention-3 (sgl-kernel), which SGLang's
+`attention_backend=fa3` calls instead of FlashInfer's FA3. sgl-kernel's prebuilt
+extension is linked against Torch 2.8, so importing it under the project Torch
+fails with an `undefined symbol` from `libc10_cuda`. The image installs
+`profiling/container/requirements/sgl_kernel.txt`; on the host it is a venv at
+`~/profile_envs/sgl_kernel` holding the same two packages:
+
+```bash
+uv venv --python 3.12 ~/profile_envs/sgl_kernel
+uv pip install --python ~/profile_envs/sgl_kernel/bin/python --torch-backend cu128 \
+    --no-deps -r profiling/container/requirements/sgl_kernel.txt
+```
+
+`numpy` and `ninja` in it are for the JIT-built CUPTI timing extension, not the
+kernel. Rows record `sgl-kernel <version> / torch <version>` as `backend_version`.
+
 `Timer.cupti`'s duration path is a two-pass GPU-active-time measurement. It
 first records 10 real callable launches, computes
 `ceil(min_duration_ms / estimate_mean_ms)`, then records exactly that many

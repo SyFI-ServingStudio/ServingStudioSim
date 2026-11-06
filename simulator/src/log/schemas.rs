@@ -390,6 +390,10 @@ pub fn request_slo_schema() -> Arc<Schema> {
         // The immutable output length the request asks for. Appended last to
         // keep the schema append-only.
         Field::new("target_output_tokens", DataType::UInt32, false),
+        // Leading context tokens the trace forced resident on first admission
+        // (a standalone or session `prefix_len`; 0 when none). Appended last
+        // to keep the schema append-only.
+        Field::new("pinned_prefix_tokens", DataType::UInt32, false),
     ]))
 }
 

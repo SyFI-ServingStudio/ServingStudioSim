@@ -40,13 +40,16 @@ positional convenience API。legacy 四列 text trace 的默认 prefix/decoding/
 
 Session-capable definition（当前 autoregressive directional families 与 omni）的
 `SessionInput` 在一个 enum variant 内同时保存
-`session_id`、该 session 第一条 trace-declared `arrival_time` 和
-`declared_prefix_tokens`。因此不存在“有 session start 但没有 session id/prefix
+`session_id`、该 session 第一条 trace-declared `arrival_time`、
+`declared_prefix_tokens` 和 `pinned_prefix_tokens`。因此不存在“有 session start 但没有 session id/prefix
 declaration”的半状态。L5 admission 将它归一化为 concrete
 `conversation_start_time`；standalone request 使用自己的实际 release time。
 `SessionInput::PinnedPrefix { prefix_tokens }` 是带 trace-declared resident prefix
 的 standalone request（independent CSV 的可选 `prefix_len` 列）：没有 session id，
-其 prefix 在任何 partition 上都按 forced hit 解析。
+其 prefix 在任何 partition 上都按 forced hit 解析。session 行也可带 `prefix_len`，
+存为 `Session.pinned_prefix_tokens`：它从本轮完整 context（`prefix_kv + input_len`）
+开头计数，可以大于 `prefix_kv`，但不延长 context。两种 pin 都只对首次 admission 生效，
+decode retraction 后的 re-prefill 重算整个 context。
 
 prompt/output token 数不在 core。它们属于 `TextGenerationDefinition`。directional
 family 使用 `ImageExtent`、`VideoExtent`、`AudioExtent` 具体类型，因此
@@ -213,10 +216,12 @@ resident 与 `prefill_tokens_to_compute`；`TextGenerationProgress` 仍只保存
 work 与 emitted output tokens。cache disabled/evicted/placement miss 都会重算缺失 prefix，
 不会把 declaration 当成 guaranteed hit；唯一例外是 `SessionInput::PinnedPrefix`，
 它的 prefix 由 trace 声明为已驻留，因此 `resident = declared = prefix_tokens`，随 request
-reserve/release，不进入 retained cache。admission 成功时会把实际 resident 数一次性复制到
+reserve/release，不进入 retained cache；session 的 pin 使
+`resident = max(pinned_prefix_tokens, cache hit)`（L5 §3.2），本轮结束后照常作为
+session KV retain。admission 成功时会把实际 resident 数一次性复制到
 `RequestTelemetry.prefix_cache_hit_tokens`，L7 再把 declaration 与这个 observation 一起写入
 `request_slo`。同一行还独立保留 immutable `fresh_prompt_tokens` 与 runtime
-`prefill_processed`：`NULL` hit 表示从未完成 prefix resolution，`0` 表示真实 miss；miss
+`prefill_processed`，以及 immutable `pinned_prefix_tokens`（`hit <= max(declared, pinned)`）：`NULL` hit 表示从未完成 prefix resolution，`0` 表示真实 miss；miss
 token 数与 hit rate 由 declaration/hit 推导。已经产出首 token 的 request 必须满足
 `hit + prefill_processed = fresh_prompt_tokens + declared_prefix_tokens`，使 Analyzer 能在
 动态 hit rate 下检查 token、causal-attention 与 decode-KV 三层守恒。

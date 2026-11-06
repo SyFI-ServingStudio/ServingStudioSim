@@ -1,0 +1,1 @@
+rollout_id,train_group,chunk_id,total_tokens,num_microbatches,fwd_bwd_s,chunk_total_s,timestamp

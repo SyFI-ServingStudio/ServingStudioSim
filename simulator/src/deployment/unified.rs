@@ -4,7 +4,8 @@
 //! `build` reads the structured `UnifiedConfig`: a single pool (`main`) with one
 //! homogeneous group. The arch is selected by its explicit tag (NO `tp_size`
 //! dispatch; see the L4/L6 design). Wired arms are
-//! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`,
+//! `llama3_dense` + either `barebone` or `chunked_prefill`, `llama3_dense_tp` +
+//! either of the same two,
 //! `llama3_dp_attn_tp_ffn` + `hp_unified`, and `qwen3_moe_dp_attn_ep_ffn` +
 //! `hp_unified`, `glm52_vllm_dsa_moe` + `hp_unified`, and
 //! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or `chunked_prefill`,
@@ -30,18 +31,20 @@ use anyhow::{bail, ensure};
 use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::arch::{Glm52MtpMode, IterArchSel};
-use crate::common::{PoolId, SharedRequests};
+use crate::common::{PoolId, SharedRequests, Time};
 use crate::deployment::UnifiedConfig;
 use crate::orchestrator::common::WorkerBuildFn;
 use crate::orchestrator::{
-    DpPlacementPolicy, Flow, PlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig,
-    UnifiedWorkerFactory,
+    DpPlacementPolicy, Flow, GroupBy, GroupBySel, MigrationPolicySel, MigrationTrigger,
+    PlacementPolicy, PoolSpec, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, TracePlacementSel,
+    TrainingConfig, TrainingSel, UnifiedWorkerFactory,
 };
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker, build_speculative_worker,
-    resolve_prefix_cache_config, BatchPolicy, DpPlacement, IterWorker, IterWorkerSel,
-    KvAdmissionConfig, PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    resolve_prefix_cache_config, BatchPolicy, DpPlacement, IterWorkerSel, KvAdmissionConfig,
+    MigratableWorker, PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, TrainChunkCost,
+    WorkerConfig, WorkerMsgCommon,
 };
 
 use super::Deployment;
@@ -124,6 +127,9 @@ impl Deployment for UnifiedDeployment {
                 batch_policy,
                 kv_admission,
                 gpu_time_multiplier,
+                prefix_cache_mode,
+                prefix_cache_policy,
+                prefix_cache_max_gpu_memory_gb,
                 // Read by `prefill_gpu_time_multiplier` below.
                 ..
             } => (
@@ -131,9 +137,9 @@ impl Deployment for UnifiedDeployment {
                 *gpu_time_multiplier,
                 Some(*max_batch_tokens),
                 PendingOrderKind::Fifo,
-                PrefixCacheMode::Opportunistic,
-                PrefixCachePolicy::Lru,
-                None,
+                *prefix_cache_mode,
+                *prefix_cache_policy,
+                *prefix_cache_max_gpu_memory_gb,
                 *batch_policy,
                 kv_admission.resolve()?,
             ),
@@ -197,12 +203,33 @@ impl Deployment for UnifiedDeployment {
             .kv_accounting()
             .apply("unified", &mut worker_config)?;
 
+        // Only the chunked-prefill lifecycle can re-prefill a request whose KV
+        // another worker dropped; refuse the pairing here rather than at the
+        // first migration.
+        ensure!(
+            pool.migration == MigrationPolicySel::Off
+                || matches!(
+                    g.worker,
+                    IterWorkerSel::ChunkedPrefill { .. } | IterWorkerSel::Speculative { .. }
+                ),
+            "unified: pool migration needs worker `chunked_prefill` or `speculative`; \
+             the other lifecycles have no recompute path for a migrated request"
+        );
         let dp_cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
                 pool: PoolId(0),
                 num_workers: g.replicas,
                 placement: placement_into(pool.placement),
+                ignore_trace_placement: matches!(pool.trace_placement, TracePlacementSel::Ignore),
             },
+            migration: migration_into(pool),
+            training: training_into(pool)?,
+            group_by: match pool.group_by {
+                GroupBySel::IdBlock => GroupBy::IdBlock,
+                GroupBySel::Session => GroupBy::Session,
+                GroupBySel::SessionBlock => GroupBy::SessionBlock,
+            },
+            log_dir: Some(cfg.io.log_dir.clone()),
         };
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
         let gpu_name = g.gpu.clone();
@@ -354,34 +381,36 @@ impl Deployment for UnifiedDeployment {
                 )
             }
             IterArchSel::Llama3Dense { .. } => {
-                ensure_barebone(&g.worker)?;
+                ensure_barebone_or_chunked_worker("llama3_dense", &g.worker)?;
                 let model = Arc::new(arch_build::dense(
                     model_spec, &gpu_name, MODEL_NAME, bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_barebone_or_chunked_flow(
+                    "llama3_dense",
                     model,
                     store,
                     worker_config,
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    build_barebone_worker,
-                ))
+                    &g.worker,
+                )
             }
             IterArchSel::Llama3DenseTp { tp_size, .. } => {
-                ensure_barebone(&g.worker)?;
+                ensure_barebone_or_chunked_worker("llama3_dense_tp", &g.worker)?;
                 let model = Arc::new(arch_build::dense_tp(
                     model_spec, *tp_size, &gpu_name, MODEL_NAME, bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_barebone_or_chunked_flow(
+                    "llama3_dense_tp",
                     model,
                     store,
                     worker_config,
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    build_barebone_worker,
-                ))
+                    &g.worker,
+                )
             }
             IterArchSel::Llama3DpAttnTpFfn {
                 attn_tp_size,
@@ -970,17 +999,11 @@ impl Deployment for UnifiedDeployment {
 /// The model's dotted-leaf prefix for this deployment (e.g. `unified.embedding`).
 const MODEL_NAME: &str = "unified";
 
-/// The dense / dense_tp archs run on the single-group barebone worker.
-fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
-    match worker {
-        IterWorkerSel::Barebone { .. } => Ok(()),
-        other => bail!("unified: this arch requires worker `barebone`, got {other:?}"),
-    }
-}
-
-/// Recurrent-state archs run under either lifecycle: barebone admission or
-/// hard-capped chunked prefill. Their KV layout, not the recipe, carries the
-/// state.
+/// Archs that run under either lifecycle: barebone admission or hard-capped
+/// chunked prefill. The recurrent-state archs keep their state in the KV
+/// layout, not the recipe; the dense llama3 archs differ only on the admission
+/// axis, and a pool that migrates needs `chunked_prefill`, the lifecycle that
+/// can re-prefill a request whose KV another worker dropped.
 fn ensure_barebone_or_chunked_worker(
     arch_name: &str,
     worker: &IterWorkerSel,
@@ -1192,8 +1215,11 @@ where
     // No L4 bound on `M`: `build_fn` already states the model contract its
     // recipe needs, and the speculative recipe's model implements
     // `SpeculativeUnifiedModel` rather than `IterwiseUnifiedModel`.
-    W: IterWorker<Event = crate::worker::WorkerEventCommon> + 'static,
-    W::Msg: From<crate::common::RequestId>,
+    // `MigratableWorker` is what lets this flow carry a migration hook. Every
+    // worker a unified deployment can build satisfies it; the families that
+    // cannot be drained (PD, AFD) never reach this function.
+    W: MigratableWorker<Event = crate::worker::WorkerEventCommon> + 'static,
+    W::Msg: From<crate::common::RequestId> + From<WorkerMsgCommon>,
 {
     let factory = UnifiedWorkerFactory::new(
         model,
@@ -1207,10 +1233,72 @@ where
     Box::new(SimpleDpFlow::new(dp_cfg, factory))
 }
 
+/// Build the pool's migration hook, or `None` for the default `off`.
+///
+/// `off` deliberately yields no policy object at all: the flow then skips the
+/// whole hook, so a preset that does not ask for migration runs the same tick
+/// path it ran before migration existed.
+fn migration_into<A, W>(pool: &PoolSpec<A, W>) -> Option<MigrationTrigger> {
+    match pool.migration {
+        MigrationPolicySel::Off => None,
+        MigrationPolicySel::ActiveBatchBelow => Some(MigrationTrigger::active_batch_below(
+            pool.migration_threshold,
+            Time::from_ms(pool.migration_cooldown_ms),
+        )),
+        MigrationPolicySel::TrainGroupSamplesBelow => {
+            Some(MigrationTrigger::train_group_samples_below(
+                pool.migration_threshold,
+                pool.group_size,
+                pool.workers_per_train_group,
+                Time::from_ms(pool.migration_group_latency_ms),
+            ))
+        }
+        MigrationPolicySel::TrainGroupActiveBelow => {
+            Some(MigrationTrigger::train_group_active_below(
+                pool.migration_threshold,
+                pool.group_size,
+                pool.workers_per_train_group,
+                Time::from_ms(pool.migration_group_latency_ms),
+            ))
+        }
+    }
+}
+
+/// Build the pool's training side, or `None` for the default `off` — which, as
+/// with `migration_into`, means no object at all rather than an idle one.
+///
+/// The rate is required: a training pool with no cost would train the whole
+/// rollout in an instant and report a finish time that looks like a result.
+fn training_into<A, W>(pool: &PoolSpec<A, W>) -> anyhow::Result<Option<TrainingConfig>> {
+    match pool.training {
+        TrainingSel::Off => Ok(None),
+        TrainingSel::StreamingWorkSteal => {
+            ensure!(
+                pool.train_tokens_per_s > 0.0,
+                "training is on but train_tokens_per_s is {}; the chunk cost is a \
+                 calibration and has no default worth using",
+                pool.train_tokens_per_s,
+            );
+            Ok(Some(TrainingConfig {
+                workers_per_block: pool.workers_per_train_group,
+                group_size: pool.group_size,
+                cost: TrainChunkCost {
+                    tokens_per_s: pool.train_tokens_per_s,
+                    overhead: Time::from_ms(pool.train_chunk_overhead_ms),
+                },
+                bulk_grab: pool.train_groups_per_grab,
+                tail_threshold: pool.train_tail_threshold,
+                expected_groups: pool.train_expected_groups,
+            }))
+        }
+    }
+}
+
 fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+        PlacementPolicy::TraceDirected => DpPlacementPolicy::TraceDirected,
     }
 }
 
@@ -1219,7 +1307,7 @@ mod tests {
     use super::*;
     use crate::arch::{
         Glm52VllmDsaMoeModel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
-        Glm53FlashVllmModel, Qwen36LocalModel,
+        Glm53FlashVllmModel, Llama3DenseModel, Qwen36LocalModel,
     };
     use crate::common::RequestId;
     use crate::worker::{BareboneWorker, ChunkedPrefillWorker, HpUnifiedWorker, WorkerEventCommon};
@@ -1263,13 +1351,18 @@ mod tests {
             dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: None,
             kv_accounting: Default::default(),
+            prefix_cache_mode: PrefixCacheMode::Opportunistic,
+            prefix_cache_policy: PrefixCachePolicy::Lru,
+            prefix_cache_max_gpu_memory_gb: None,
         }
     }
 
+    /// The contract `assemble_flow` demands: the `IterWorker` surface plus
+    /// drainability, since a unified flow can carry a migration hook.
     fn assert_iter_worker_contract<W>()
     where
-        W: IterWorker<Event = WorkerEventCommon> + 'static,
-        W::Msg: From<RequestId>,
+        W: MigratableWorker<Event = WorkerEventCommon> + 'static,
+        W::Msg: From<RequestId> + From<WorkerMsgCommon>,
     {
     }
 
@@ -1289,9 +1382,14 @@ mod tests {
     #[test]
     fn qwen36_local_barebone_pair_satisfies_the_iter_worker_contract() {
         assert_iter_worker_contract::<BareboneWorker<Qwen36LocalModel>>();
-        ensure_barebone(&barebone_worker()).expect("Qwen3.6 local accepts barebone");
-        let error = ensure_barebone(&hp_worker()).unwrap_err().to_string();
-        assert!(error.contains("requires worker `barebone`"));
+    }
+
+    /// The dense llama3 archs take either lifecycle; `chunked_prefill` is the
+    /// one a migrating pool needs.
+    #[test]
+    fn llama3_dense_pairs_with_barebone_or_chunked_prefill() {
+        assert_iter_worker_contract::<BareboneWorker<Llama3DenseModel>>();
+        assert_iter_worker_contract::<ChunkedPrefillWorker<Llama3DenseModel>>();
     }
 
     /// Both recurrent-state archs run under either lifecycle.

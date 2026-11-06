@@ -1,0 +1,91 @@
+rollout,ts_local,n_rids,src,dst,detail,pres_mean,pres_min,pres_max
+0,2026-09-30 21:36:04,5,6,1,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1531,861,1940
+0,2026-09-30 21:36:05,5,7,1,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1515,1193,1955
+0,2026-09-30 21:36:05,5,7,1,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1806,941,2384
+0,2026-09-30 21:36:08,5,3,1,batch_threshold: group=1 cumulative_samples=15<16 completed=61,1424,727,2327
+0,2026-09-30 21:36:09,5,4,1,batch_threshold: group=2 cumulative_samples=15<16 completed=61,2142,872,2913
+0,2026-09-30 21:36:12,5,4,1,batch_threshold: group=2 cumulative_samples=15<16 completed=61,2352,927,3839
+0,2026-09-30 21:38:12,-1,-1,-1,summary groups=6,,,
+1,2026-09-30 21:40:03,5,6,3,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1235,437,2014
+1,2026-09-30 21:40:03,5,6,4,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1637,976,1930
+1,2026-09-30 21:40:04,5,7,3,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1745,1034,2670
+1,2026-09-30 21:40:04,5,4,3,batch_threshold: group=2 cumulative_samples=15<16 completed=62,1631,1235,2124
+1,2026-09-30 21:40:06,5,0,5,batch_threshold: group=0 cumulative_samples=15<16 completed=61,1613,739,2542
+1,2026-09-30 21:40:06,5,2,5,batch_threshold: group=1 cumulative_samples=15<16 completed=64,2105,1175,4073
+1,2026-09-30 21:40:06,5,2,5,batch_threshold: group=1 cumulative_samples=15<16 completed=64,1596,730,3160
+1,2026-09-30 21:41:35,-1,-1,-1,summary groups=7,,,
+2,2026-09-30 21:43:06,5,6,4,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1462,832,2286
+2,2026-09-30 21:43:06,5,6,0,batch_threshold: group=3 cumulative_samples=15<16 completed=61,935,332,1392
+2,2026-09-30 21:43:06,5,7,4,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1365,795,2307
+2,2026-09-30 21:43:07,5,4,3,batch_threshold: group=2 cumulative_samples=15<16 completed=63,1148,700,1795
+2,2026-09-30 21:43:07,1,4,0,batch_threshold: group=2 cumulative_samples=15<16 completed=63,1484,832,2393
+2,2026-09-30 21:43:07,1,4,3,batch_threshold: group=2 cumulative_samples=15<16 completed=63,1375,795,2359
+2,2026-09-30 21:43:07,5,2,1,batch_threshold: group=1 cumulative_samples=15<16 completed=63,1587,731,2391
+2,2026-09-30 21:43:08,1,3,1,batch_threshold: group=1 cumulative_samples=15<16 completed=63,1180,700,1956
+2,2026-09-30 21:43:08,1,3,1,batch_threshold: group=1 cumulative_samples=15<16 completed=63,1379,795,2379
+2,2026-09-30 21:44:27,-1,-1,-1,summary groups=9,,,
+3,2026-09-30 21:46:01,5,5,1,batch_threshold: group=2 cumulative_samples=15<16 completed=61,2303,1934,2484
+3,2026-09-30 21:46:01,5,5,0,batch_threshold: group=2 cumulative_samples=15<16 completed=61,1481,1034,1888
+3,2026-09-30 21:46:02,5,6,0,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1448,835,2600
+3,2026-09-30 21:46:02,5,6,1,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1741,1193,2850
+3,2026-09-30 21:46:02,5,3,1,batch_threshold: group=1 cumulative_samples=15<16 completed=61,1821,1082,2552
+3,2026-09-30 21:47:57,-1,-1,-1,summary groups=5,,,
+4,2026-09-30 21:49:19,5,6,1,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1158,703,1711
+4,2026-09-30 21:49:20,5,7,4,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1289,463,1873
+4,2026-09-30 21:49:20,5,7,1,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1445,1095,1735
+4,2026-09-30 21:49:22,5,4,1,batch_threshold: group=2 cumulative_samples=15<16 completed=62,1117,570,2343
+4,2026-09-30 21:49:22,5,4,2,batch_threshold: group=2 cumulative_samples=15<16 completed=62,2564,1587,3783
+4,2026-09-30 21:49:22,1,4,1,batch_threshold: group=2 cumulative_samples=15<16 completed=62,1329,463,2075
+4,2026-09-30 21:49:24,2,2,0,batch_threshold: group=1 cumulative_samples=15<16 completed=62,2613,1587,3978
+4,2026-09-30 21:49:24,5,3,1,batch_threshold: group=1 cumulative_samples=15<16 completed=62,2387,1564,2876
+4,2026-09-30 21:49:24,5,3,0,batch_threshold: group=1 cumulative_samples=15<16 completed=62,2290,1418,2967
+4,2026-09-30 21:51:23,-1,-1,-1,summary groups=9,,,
+5,2026-09-30 21:52:29,5,1,7,batch_threshold: group=0 cumulative_samples=15<16 completed=61,1283,823,1710
+5,2026-09-30 21:52:29,5,1,6,batch_threshold: group=0 cumulative_samples=15<16 completed=61,1523,1094,2039
+5,2026-09-30 21:52:29,5,1,7,batch_threshold: group=0 cumulative_samples=15<16 completed=61,2010,1869,2144
+5,2026-09-30 21:52:32,5,4,6,batch_threshold: group=2 cumulative_samples=15<16 completed=61,2467,1308,2965
+5,2026-09-30 21:52:32,5,5,2,batch_threshold: group=2 cumulative_samples=15<16 completed=61,4590,303,12828
+5,2026-09-30 21:52:34,5,2,6,batch_threshold: group=1 cumulative_samples=15<16 completed=62,2314,1077,3450
+5,2026-09-30 21:52:35,2,2,7,batch_threshold: group=1 cumulative_samples=15<16 completed=62,4669,303,13083
+5,2026-09-30 21:52:35,5,3,6,batch_threshold: group=1 cumulative_samples=15<16 completed=62,2079,1614,2577
+5,2026-09-30 21:53:10,-1,-1,-1,summary groups=8,,,
+6,2026-09-30 21:55:25,5,0,3,batch_threshold: group=0 cumulative_samples=15<16 completed=61,979,461,2120
+6,2026-09-30 21:55:25,5,1,3,batch_threshold: group=0 cumulative_samples=15<16 completed=61,1224,777,2184
+6,2026-09-30 21:55:25,5,6,1,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1602,310,4062
+6,2026-09-30 21:55:25,5,6,1,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1631,1118,2564
+6,2026-09-30 21:55:26,5,2,1,batch_threshold: group=1 cumulative_samples=15<16 completed=63,1235,665,2347
+6,2026-09-30 21:55:26,5,3,4,batch_threshold: group=1 cumulative_samples=15<16 completed=63,2226,1158,2776
+6,2026-09-30 21:55:26,1,3,5,batch_threshold: group=1 cumulative_samples=15<16 completed=63,1262,777,2376
+6,2026-09-30 21:55:28,2,4,1,batch_threshold: group=2 cumulative_samples=15<16 completed=63,2339,1158,2843
+6,2026-09-30 21:55:28,5,5,1,batch_threshold: group=2 cumulative_samples=15<16 completed=63,2972,1215,4521
+6,2026-09-30 21:55:28,1,5,1,batch_threshold: group=2 cumulative_samples=15<16 completed=63,1333,777,2731
+6,2026-09-30 21:57:29,-1,-1,-1,summary groups=10,,,
+7,2026-09-30 21:58:41,5,0,5,batch_threshold: group=0 cumulative_samples=15<16 completed=61,1671,806,2282
+7,2026-09-30 21:58:41,5,0,6,batch_threshold: group=0 cumulative_samples=15<16 completed=61,1603,1170,2214
+7,2026-09-30 21:58:42,5,2,1,batch_threshold: group=1 cumulative_samples=15<16 completed=61,1546,935,2667
+7,2026-09-30 21:58:42,5,3,5,batch_threshold: group=1 cumulative_samples=15<16 completed=61,976,499,2164
+7,2026-09-30 21:58:43,5,6,1,batch_threshold: group=3 cumulative_samples=15<16 completed=62,1817,1329,2650
+7,2026-09-30 21:58:43,5,7,1,batch_threshold: group=3 cumulative_samples=15<16 completed=62,1691,1444,2191
+7,2026-09-30 21:58:43,5,7,5,batch_threshold: group=3 cumulative_samples=15<16 completed=62,1658,1000,2279
+7,2026-09-30 21:58:45,5,4,1,batch_threshold: group=2 cumulative_samples=15<16 completed=64,1990,1330,3235
+7,2026-09-30 21:58:45,5,4,1,batch_threshold: group=2 cumulative_samples=15<16 completed=64,1978,342,3854
+7,2026-09-30 21:58:51,-1,-1,-1,summary groups=9,,,
+8,2026-09-30 22:01:20,5,4,0,batch_threshold: group=2 cumulative_samples=15<16 completed=61,1451,895,2690
+8,2026-09-30 22:01:20,5,5,1,batch_threshold: group=2 cumulative_samples=15<16 completed=61,1380,687,2146
+8,2026-09-30 22:01:20,5,5,0,batch_threshold: group=2 cumulative_samples=15<16 completed=61,1489,1102,2718
+8,2026-09-30 22:01:21,5,2,1,batch_threshold: group=1 cumulative_samples=15<16 completed=61,1929,1030,2395
+8,2026-09-30 22:01:21,5,2,1,batch_threshold: group=1 cumulative_samples=15<16 completed=61,1953,1476,2589
+8,2026-09-30 22:01:21,5,3,6,batch_threshold: group=1 cumulative_samples=15<16 completed=61,2480,1236,3705
+8,2026-09-30 22:01:22,1,0,6,batch_threshold: group=0 cumulative_samples=15<16 completed=66,1490,895,2884
+8,2026-09-30 22:01:22,1,0,6,batch_threshold: group=0 cumulative_samples=15<16 completed=66,1524,1102,2896
+8,2026-09-30 22:03:16,-1,-1,-1,summary groups=8,,,
+9,2026-09-30 22:04:34,5,6,0,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1358,1013,1783
+9,2026-09-30 22:04:34,5,7,0,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1100,516,2207
+9,2026-09-30 22:04:35,5,7,5,batch_threshold: group=3 cumulative_samples=15<16 completed=61,1826,1335,2203
+9,2026-09-30 22:04:35,5,2,5,batch_threshold: group=1 cumulative_samples=15<16 completed=61,1710,1157,2175
+9,2026-09-30 22:04:36,5,3,5,batch_threshold: group=1 cumulative_samples=15<16 completed=61,1968,471,3122
+9,2026-09-30 22:04:36,5,3,0,batch_threshold: group=1 cumulative_samples=15<16 completed=61,2114,629,4479
+9,2026-09-30 22:04:37,1,0,5,batch_threshold: group=0 cumulative_samples=15<16 completed=64,1450,1013,2082
+9,2026-09-30 22:04:37,1,0,4,batch_threshold: group=0 cumulative_samples=15<16 completed=64,1184,516,2627
+9,2026-09-30 22:04:37,2,0,5,batch_threshold: group=0 cumulative_samples=15<16 completed=64,2184,629,4654
+9,2026-09-30 22:06:28,-1,-1,-1,summary groups=9,,,

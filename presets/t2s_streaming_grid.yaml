@@ -1,0 +1,118 @@
+# Text2SQL streaming arm (slime bt_tuner_B8_step8 layout): one rollout at one fixed
+# migration threshold B per cell, 35 rollouts x B in 8..256 step 8. Traces:
+# trace/t2s/streaming (tools/t2s/build_t2s_trace.py). Alignment:
+# tools/t2s/align_streaming.py; figure: tools/t2s/plot_t2s_vs_oracle.py.
+#
+# Worker as presets/t2s_colocated.yaml. Pool knobs and where they come from:
+#   group_by session-block / group_size 5   one GRPO prompt = 5 consecutive sessions
+#   workers_per_train_group 2               4 training blocks of 2 GPUs (slime layout)
+#   migration_group_latency_ms 460          measured abort+hand-over per group, pooled
+#   train_tokens_per_s 9137                 fit of report busy_gpu_s/2 = tokens/9137 +
+#   train_chunk_overhead_ms 506               53 chunks x 0.506 s, rollouts 1-34, |err| 0.97%
+#   train_groups_per_grab 6, train_tail_threshold 8, train_expected_groups 256
+#                                           slime's grab settings (max_items_per_grab,
+#                                           graduated tail, 256 groups per rollout)
+deployment: unified
+workload:
+  trace_files: ${rollout}
+  input_file_format: text-generation-independent
+  input_file_tags: [session, placement]
+  arrival_mode: trace_timed
+  request_rate: 1.0
+  run_to_end: true
+io:
+  log_dir: logs/t2s/runs/streaming_grid/{rollout}_{B}
+pools:
+  main:
+    placement: trace-directed
+    migration: train-group-samples-below
+    migration_threshold: ${B}
+    group_by: session-block
+    group_size: 5
+    workers_per_train_group: 2
+    migration_group_latency_ms: 460
+    training: streaming-work-steal
+    train_tokens_per_s: 9137
+    train_chunk_overhead_ms: 506
+    train_groups_per_grab: 6
+    train_tail_threshold: 8
+    train_expected_groups: 256
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 8
+        arch:
+          type: llama3_dense
+          model_config: model/config/qwen2_5_coder_7b_instruct.json
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: 8192
+          batch_policy: separate-prefill-priority
+          attn_gpu_memory_gb: 89.2041
+          kv_admission_policy: bounded-future
+          kv_page_size: 1
+          kv_max_future_tokens: 4096
+          kv_initial_new_token_ratio: 0.7
+          kv_minimum_new_token_ratio: 0.098
+          kv_new_token_ratio_decay_steps: 600
+          kv_retract_decode_steps: 20
+          decode_retraction_policy: length
+          # Fitted, not measured: measured decode iterations (consecutive SGLang
+          # timestamps, colocated arm) run 7-16% longer than the modeled ones at
+          # every batch size; 1.105 is the sim-time-weighted ratio over all
+          # buckets (tools/t2s/align_colocated.py). Not attributed per op: no
+          # kernel capture of this run exists; ops the model leaves out (sampling
+          # and logprobs over the 152k vocab, QKV bias, RoPE) grow with batch
+          # as the gap does.
+          gpu_time_multiplier: 1.105
+backends:
+  main/unified.embedding: [triton]
+  main/unified.pre_attn.input_norm: [flashinfer]
+  main/unified.pre_attn.qkv_proj: [torch, torch_linear]
+  main/unified.attn.attn.kv_cache_append: [vllm_cuda]
+  main/unified.attn.attn.prefill: [fa2]
+  main/unified.attn.attn.decode: [sgl_fa3]
+  main/unified.post_attn.o_proj: [torch, torch_linear]
+  main/unified.post_attn.post_norm: [flashinfer]
+  main/unified.post_attn.up_gate_proj: [torch, torch_linear]
+  main/unified.post_attn.activation: [triton]
+  main/unified.post_attn.down_proj: [torch, torch_linear]
+  main/unified.final_norm: [flashinfer]
+  main/unified.lm_head: [torch, torch_linear]
+sweep:
+  rollout:
+    r0: ["trace/t2s/streaming/r0.csv"]
+    r1: ["trace/t2s/streaming/r1.csv"]
+    r2: ["trace/t2s/streaming/r2.csv"]
+    r3: ["trace/t2s/streaming/r3.csv"]
+    r4: ["trace/t2s/streaming/r4.csv"]
+    r5: ["trace/t2s/streaming/r5.csv"]
+    r6: ["trace/t2s/streaming/r6.csv"]
+    r7: ["trace/t2s/streaming/r7.csv"]
+    r8: ["trace/t2s/streaming/r8.csv"]
+    r9: ["trace/t2s/streaming/r9.csv"]
+    r10: ["trace/t2s/streaming/r10.csv"]
+    r11: ["trace/t2s/streaming/r11.csv"]
+    r12: ["trace/t2s/streaming/r12.csv"]
+    r13: ["trace/t2s/streaming/r13.csv"]
+    r14: ["trace/t2s/streaming/r14.csv"]
+    r15: ["trace/t2s/streaming/r15.csv"]
+    r16: ["trace/t2s/streaming/r16.csv"]
+    r17: ["trace/t2s/streaming/r17.csv"]
+    r18: ["trace/t2s/streaming/r18.csv"]
+    r19: ["trace/t2s/streaming/r19.csv"]
+    r20: ["trace/t2s/streaming/r20.csv"]
+    r21: ["trace/t2s/streaming/r21.csv"]
+    r22: ["trace/t2s/streaming/r22.csv"]
+    r23: ["trace/t2s/streaming/r23.csv"]
+    r24: ["trace/t2s/streaming/r24.csv"]
+    r25: ["trace/t2s/streaming/r25.csv"]
+    r26: ["trace/t2s/streaming/r26.csv"]
+    r27: ["trace/t2s/streaming/r27.csv"]
+    r28: ["trace/t2s/streaming/r28.csv"]
+    r29: ["trace/t2s/streaming/r29.csv"]
+    r30: ["trace/t2s/streaming/r30.csv"]
+    r31: ["trace/t2s/streaming/r31.csv"]
+    r32: ["trace/t2s/streaming/r32.csv"]
+    r33: ["trace/t2s/streaming/r33.csv"]
+    r34: ["trace/t2s/streaming/r34.csv"]
+  B: [8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256]

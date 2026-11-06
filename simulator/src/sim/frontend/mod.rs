@@ -1190,6 +1190,35 @@ mod tests {
         assert_eq!(scheduled_request.slo, SloContract::default());
     }
 
+    /// Dense session ids follow the order the file first names each session,
+    /// so they are the same on every run and a block of consecutive ids is a
+    /// block of consecutive sessions in the file (`group_by: session-block`).
+    #[test]
+    fn sessions_are_numbered_in_first_appearance_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["zeta", "alpha", "mid", "beta", "omega", "a1", "k9", "q"];
+        let mut csv = String::from(
+            "id,input_len,output_len,arrival_time,session_id,prefix_kv,tool_wait_after_ms\n",
+        );
+        for (row, name) in names.iter().enumerate() {
+            csv.push_str(&format!("{row},8,2,0.0,{name},0,0.0\n"));
+        }
+        let path = write_csv(dir.path(), "order.csv", &csv);
+        let fe = TraceFrontend::load(
+            &[path],
+            &declare("text_generation", &["session"]),
+            open_loop(1.0),
+            uncapped(),
+        )
+        .unwrap();
+        let ids: Vec<u32> = fe
+            .scheduled_requests
+            .iter()
+            .map(|r| r.release.session.expect("session row").session_id)
+            .collect();
+        assert_eq!(ids, (0..names.len() as u32).collect::<Vec<_>>());
+    }
+
     /// Tags are declared as a set and stack: three disciplines, one file.
     #[test]
     fn declared_tags_stack_independently() {
@@ -1225,6 +1254,8 @@ mod tests {
                 session_id: 0,
                 session_start_time: Time::from_ms(4.0),
                 declared_prefix_tokens: 512,
+                rounds_in_session: 1,
+                pinned_prefix_tokens: 0,
             }
         );
         assert_eq!(
@@ -1349,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_len_column_rejects_bad_values_and_session_rows() {
+    fn prefix_len_column_rejects_bad_values() {
         let dir = tempfile::tempdir().unwrap();
         for (name, body, expected) in [
             (
@@ -1378,23 +1409,80 @@ mod tests {
             let error = format!("{:#}", load_text(&[path], 1.0).unwrap_err());
             assert!(error.contains(expected), "{name}: {error}");
         }
+    }
 
-        let session = write_csv(
+    /// On a session row `prefix_len` counts leading tokens of the round's full
+    /// context (`prefix_kv + input_len`): it may exceed `prefix_kv` (a shared
+    /// system prompt on a first turn), it never extends the context, and blank
+    /// leaves the row an ordinary session round.
+    #[test]
+    fn prefix_len_on_a_session_row_pins_leading_context_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_csv(
             dir.path(),
             "session.csv",
             "id,input_len,output_len,arrival_time,session_id,prefix_kv,tool_wait_after_ms,prefix_len
-             0,8,2,0.0,s,0,0,16
+             t0,1106,40,0.0,s,0,0,579
+             t1,78,40,10.0,s,1150,0,1175
+             t2,50,40,20.0,s,1268,0,
 ",
         );
-        let error = TraceFrontend::load(
-            &[session],
+        let fe = TraceFrontend::load(
+            &[path],
             &declare("text_generation", &["session"]),
             open_loop(1.0),
             uncapped(),
         )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("prefix_kv"), "{error}");
+        .unwrap();
+        let declared: Vec<_> = fe
+            .scheduled_requests
+            .iter()
+            .map(|scheduled| {
+                let SessionInput::Session {
+                    declared_prefix_tokens,
+                    pinned_prefix_tokens,
+                    ..
+                } = scheduled.definition.session
+                else {
+                    panic!("a session row stays a session round");
+                };
+                (
+                    scheduled.definition.prompt_tokens,
+                    declared_prefix_tokens,
+                    pinned_prefix_tokens,
+                )
+            })
+            .collect();
+        assert_eq!(declared, [(1106, 0, 579), (78, 1150, 1175), (50, 1268, 0)]);
+        assert!(fe.scheduled_requests[0].release.session.is_some());
+    }
+
+    #[test]
+    fn prefix_len_on_a_session_row_must_fit_the_rounds_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_csv(
+            dir.path(),
+            "session.csv",
+            "id,input_len,output_len,arrival_time,session_id,prefix_kv,tool_wait_after_ms,prefix_len
+             0,8,2,0.0,s,4,0,13
+",
+        );
+        let error = format!(
+            "{:#}",
+            TraceFrontend::load(
+                &[path],
+                &declare("text_generation", &["session"]),
+                open_loop(1.0),
+                uncapped(),
+            )
+            .unwrap_err()
+        );
+        assert!(
+            error.contains(
+                "prefix_len=13 exceeds the session round's context prefix_kv + input_len = 12"
+            ),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1854,7 +1942,7 @@ mod tests {
         // A session-execution file declares its own sessions: no `session` tag.
         assert_eq!(
             formats[1]["tags"],
-            serde_json::json!(["slo", "priority", "speculative"])
+            serde_json::json!(["slo", "priority", "speculative", "placement"])
         );
         let speculative = described["tags"]
             .as_array()

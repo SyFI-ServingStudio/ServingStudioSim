@@ -86,7 +86,12 @@ pub struct RequestSloEntry {
     pub stage_worker_ids: Vec<u16>,
     /// Immutable reusable-prefix requirement from the request definition.
     pub declared_prefix_tokens: u32,
-    /// Prefix tokens physically found at admission. `None` means the request
+    /// Immutable leading context tokens the trace forces resident on first
+    /// admission (`prefix_len`); 0 when none. On a session row it may exceed
+    /// `declared_prefix_tokens`, and it never extends the context.
+    pub pinned_prefix_tokens: u32,
+    /// Prefix tokens resident at first admission: the larger of the pin and
+    /// what the partition's cache physically held. `None` means the request
     /// never reached prefix resolution; `Some(0)` records an actual miss.
     pub prefix_cache_hit_tokens: Option<u32>,
     /// Immutable fresh suffix requested by this text-generation request. Kept
@@ -809,6 +814,7 @@ pub(crate) fn slo_to_record_batch(
     let prefix_cache_hit_tokens: Vec<Option<u32>> =
         entries.iter().map(|e| e.prefix_cache_hit_tokens).collect();
     let fresh_prompt_tokens: Vec<u32> = entries.iter().map(|e| e.fresh_prompt_tokens).collect();
+    let pinned_prefix_tokens: Vec<u32> = entries.iter().map(|e| e.pinned_prefix_tokens).collect();
     let target_output_tokens: Vec<u32> = entries.iter().map(|e| e.target_output_tokens).collect();
     let retraction_count: Vec<u32> = entries.iter().map(|e| e.retraction_count).collect();
     let ttft: Vec<Option<f32>> = entries.iter().map(|e| e.ttft_ms).collect();
@@ -961,6 +967,7 @@ pub(crate) fn slo_to_record_batch(
                     .collect::<Vec<_>>(),
             )),
             Arc::new(UInt32Array::from(target_output_tokens)),
+            Arc::new(UInt32Array::from(pinned_prefix_tokens)),
         ],
     )?)
 }
@@ -1072,6 +1079,7 @@ mod tests {
             stage_pool_ids: Vec::new(),
             stage_worker_ids: Vec::new(),
             declared_prefix_tokens: 0,
+            pinned_prefix_tokens: 0,
             prefix_cache_hit_tokens: Some(0),
             fresh_prompt_tokens: 0,
             target_output_tokens: 0,

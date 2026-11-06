@@ -12,11 +12,10 @@ pub mod time;
 pub mod too_long;
 
 pub use fabric::Fabric;
-pub use too_long::TooLong;
 pub use id::{BatchId, ExpertId, GroupId, IdMap, PoolId, RequestId, WorkerId};
 pub use request::{
-    ActiveRequest, Request, RequestCore, RequestLifecycle, RequestRecord, RequestStore,
-    RequestTelemetry, SchedulingContract, SharedRequests, SloContract,
+    ActiveRequest, PlacementDirective, Request, RequestCore, RequestLifecycle, RequestRecord,
+    RequestStore, RequestTelemetry, SchedulingContract, SharedRequests, SloContract,
 };
 pub use request_family::{
     AcceptanceProfile, AudioExtent, AudioTextGenerationDefinition, AudioTextGenerationRequest,
@@ -33,3 +32,4 @@ pub use request_family::{
 };
 pub use request_stage::{AfdStage, PdStage, PpStage, StageEvent, StageVocab, UnifiedStage};
 pub use time::Time;
+pub use too_long::TooLong;

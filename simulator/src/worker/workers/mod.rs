@@ -6,3 +6,4 @@ pub(crate) mod iter;
 mod iter_build_essentials;
 pub(crate) mod pd_decode;
 pub(crate) mod pipeline;
+pub(crate) mod train;

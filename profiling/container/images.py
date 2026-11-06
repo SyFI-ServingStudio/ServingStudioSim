@@ -157,6 +157,12 @@ IMAGES = {
             build_args=_sglang_args,
         ),
         Image(
+            "sgl-kernel",
+            "profiling/container/sgl_kernel.Dockerfile",
+            ("sgl_kernel_env",),
+            inputs=("profiling/container/requirements/sgl_kernel.txt",),
+        ),
+        Image(
             "flashinfer-kda",
             "profiling/container/flashinfer_kda.Dockerfile",
             ("flashinfer_kda_env",),

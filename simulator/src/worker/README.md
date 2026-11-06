@@ -78,6 +78,19 @@ AFD adds only protocol-specific views:
 - `AfdAttnWorker::estimated_peak_kv` for sticky least-KV placement.
 - `AfdFfnWorker` as a type-level guarantee of the FFN task/event pair.
 
+A migrating unified pool adds `MigratableWorker` (`iter_worker.rs`), implemented
+for every `IterBatchWorker` whose admission takes `WorkerMsgCommon` (so PD
+prefill is excluded by type): `drain_resident` / `drain_requests` release the
+KV of everything (or the named requests) the worker holds, drop their queue
+entries through `IterAdmission::drain_pending` / `cancel_pending` /
+`forget_admitted`, abandon an open recompute episode, and stamp
+`UnifiedStage::Suspended`; an in-flight iteration still finishes.
+`drop_retained_prefixes` drops the retained tier with one `worker-retired`
+eviction per entry. The destination receives `WorkerMsgCommon::Resume { req, at }`:
+`chunked_prefill` queues a started request as a recompute of `prompt + emitted`
+(the retraction arithmetic, TTFT kept, ordinary queue order) and a never-started
+one as fresh; `barebone`/`hp_unified` have no recompute path and refuse it.
+
 Construction remains outside these traits. L6 passes family-local
 `build_*_worker` recipes; it does not select KV/admission/execution components
 itself.
@@ -337,6 +350,14 @@ outside it.
 double-buffering one activation pull against one compute, at exact times derived
 from the previous stage's `ready_at`. It stamps no request stage, so requests stay
 located on their head.
+
+### 6. Training chunks: `workers/train/`
+
+`TrainChunkWorker` holds one RL train block for one chunk of finished prompt
+groups (`TrainWorkerMsg::Chunk`), reporting `TrainWorkerEvent::ChunkDone`. No KV,
+admission or CostTree: the cost is the calibrated
+`tokens / tokens_per_s + overhead` (`TrainChunkCost`), written to `cost_log` with
+a one-leaf `calibrated` `train` manifest. L6 `TrainingPool` decides what it runs.
 
 ## Construction and deployment wiring
 
