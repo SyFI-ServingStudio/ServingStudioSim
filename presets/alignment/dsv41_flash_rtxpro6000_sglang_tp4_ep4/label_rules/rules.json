@@ -4,13 +4,1223 @@
    "operation": "prologue.embedding",
    "name": "_vocab_parallel_embedding_kernel",
    "type": "model",
-   "role": "token embedding lookup",
-   "cross_rank": "independent",
+   "role": "token embedding lookup (target forward and DSpark draft)",
    "slot_suffixes": [
-    "prologue.embedding"
+    "prologue.embedding",
+    "dspark.embed"
    ],
-   "note": "Seed rule: SGLang's vocab-parallel embedding, one launch per target forward (seen in the 2026-11-05 SM120 torch-profiler traces). The rest of the rule set is written from this pack's first nsys capture.",
-   "source_experiment": "airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000 (2026-11-05, torch profiler)"
+   "phase": "forward",
+   "cross_rank": "independent",
+   "note": "One launch per forward; the DSpark draft re-embeds its block with the same kernel.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "prologue.embedding_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum_bf16",
+   "type": "collective",
+   "role": "vocab-parallel embedding all-reduce",
+   "slot_suffixes": [
+    "prologue.embedding_all_reduce"
+   ],
+   "phase": "forward",
+   "after_name": "_vocab_parallel_embedding_kernel",
+   "cross_rank": "synchronizing",
+   "note": "Both embeddings (target and draft) are followed by this all-reduce; the draft one has no separate slot, so the measured side carries two launches per speculative iteration.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "prologue.hc_broadcast",
+   "name": "_hc_broadcast_kernel",
+   "type": "model",
+   "role": "broadcast the embedding into the 4 hc streams",
+   "slot_suffixes": [
+    "prologue.hc_broadcast"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "prologue.engram_hash",
+   "name": "_engram_hash_kernel",
+   "type": "model",
+   "role": "Engram n-gram hash",
+   "slot_suffixes": [
+    "prologue.engram_hash"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "tp_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum_bf16",
+   "type": "collective",
+   "role": "TP4 all-reduce closing an attention or FFN sublayer (NCCL ring LL)",
+   "slot_suffixes": [
+    "attn.tp_all_reduce",
+    "ffn.tp_all_reduce"
+   ],
+   "phase": "forward",
+   "before_name": "_mhc_post_split_h_kernel",
+   "cross_rank": "synchronizing",
+   "note": "Decode graph: each sublayer's all-reduce opens a new stream/track, so attention vs FFN is not observable from neighbours. Both slots have the same tokens x 5120 bf16 shape.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "tp_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum_bf16",
+   "type": "collective",
+   "role": "TP4 all-reduce closing an attention or FFN sublayer (NCCL ring LL)",
+   "slot_suffixes": [
+    "attn.tp_all_reduce",
+    "ffn.tp_all_reduce"
+   ],
+   "phase": "forward",
+   "before_name": "_hc_mix_stats_partial_kernel",
+   "cross_rank": "synchronizing",
+   "note": "Eager prefill: mix stats run inline after the all-reduce.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "mhc_mix_stats",
+   "name": "_hc_mix_stats_partial_kernel",
+   "type": "model",
+   "role": "hc mix stats + sinkhorn (side stream in decode, inline in prefill)",
+   "slot_suffixes": [
+    "attn.mhc_mix_stats",
+    "attn.mhc_mix_stats.serial",
+    "ffn.mhc_mix_stats",
+    "ffn.mhc_mix_stats.serial"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "mhc_mix_stats",
+   "name": "_hc_mix_reduce_sinkhorn_kernel",
+   "type": "model",
+   "role": "hc mix stats + sinkhorn (side stream in decode, inline in prefill)",
+   "slot_suffixes": [
+    "attn.mhc_mix_stats",
+    "attn.mhc_mix_stats.serial",
+    "ffn.mhc_mix_stats",
+    "ffn.mhc_mix_stats.serial"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "mhc_combine_norm",
+   "name": "_hc_combine_norm",
+   "type": "model",
+   "role": "hc combine + RMSNorm before a sublayer",
+   "slot_suffixes": [
+    "attn.mhc_combine_norm",
+    "ffn.mhc_combine_norm"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "mhc_combine_norm",
+   "name": "gmemalign16oi645120i64",
+   "type": "model",
+   "role": "hc combine + RMSNorm before a sublayer",
+   "slot_suffixes": [
+    "attn.mhc_combine_norm",
+    "ffn.mhc_combine_norm"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "note": "Layer 0 (after hc_broadcast) and each DSpark stage's first sublayer: the hc copies are identical, so SGLang runs a plain RMSNorm instead of _hc_combine_norm.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "mhc_post",
+   "name": "_mhc_post_split_h_kernel",
+   "type": "model",
+   "role": "hc post (residual split back into 4 streams)",
+   "slot_suffixes": [
+    "attn.mhc_post",
+    "ffn.mhc_post"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "mhc_post",
+   "name": "mhc_post_tilelang_kernel",
+   "type": "model",
+   "role": "hc post (residual split back into 4 streams)",
+   "slot_suffixes": [
+    "attn.mhc_post",
+    "ffn.mhc_post"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "note": "The eager (prefill) spelling of the same op.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "_w8a8_block_fp8_matmul",
+   "type": "model",
+   "role": "fused q-a + kv-a projection (FP8 block-32)",
+   "slot_suffixes": [
+    "attn.fused_wqa_wkv"
+   ],
+   "phase": "forward",
+   "before_name": "oi641280",
+   "cross_rank": "independent",
+   "note": "The q-a RMSNorm follows it. Draft stages issue q-a and kv-a as two GEMMs on two streams; both are this operation.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "per_token_group_quant_8bit_v2_kernel",
+   "type": "model",
+   "role": "fused q-a + kv-a projection (FP8 block-32)",
+   "slot_suffixes": [
+    "attn.fused_wqa_wkv"
+   ],
+   "phase": "forward",
+   "before": "attn.fused_wqa_wkv",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "per_token_group_quant_8bit_v2_kernel",
+   "type": "model",
+   "role": "fused q-a + kv-a projection (FP8 block-32)",
+   "slot_suffixes": [
+    "attn.fused_wqa_wkv"
+   ],
+   "phase": "forward",
+   "after_name": "gmemalign16oi645120i64",
+   "cross_rank": "independent",
+   "note": "The q-a RMSNorm follows it. Draft stages issue q-a and kv-a as two GEMMs on two streams; both are this operation.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "_w8a8_block_fp8_matmul",
+   "type": "model",
+   "role": "fused q-a + kv-a projection (FP8 block-32)",
+   "slot_suffixes": [
+    "attn.fused_wqa_wkv"
+   ],
+   "phase": "forward",
+   "after": "attn.fused_wqa_wkv",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.qkv_rmsnorm",
+   "name": "oi641280",
+   "type": "model",
+   "role": "q-a latent RMSNorm",
+   "slot_suffixes": [
+    "attn.qkv_rmsnorm"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.wq_b",
+   "name": "_w8a8_block_fp8_matmul",
+   "type": "model",
+   "role": "q-b projection (FP8 block-32)",
+   "slot_suffixes": [
+    "attn.wq_b"
+   ],
+   "phase": "forward",
+   "before_name": "sglang::deepseek_rope_kernel",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.wq_b",
+   "name": "per_token_group_quant_8bit_v2_kernel",
+   "type": "model",
+   "role": "q-b projection (FP8 block-32)",
+   "slot_suffixes": [
+    "attn.wq_b"
+   ],
+   "phase": "forward",
+   "before": "attn.wq_b",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.rope_kv_store",
+   "name": "sglang::fused_k_norm_rope_flashmla",
+   "type": "model",
+   "role": "q RoPE, kv norm + RoPE + paged FP8 store",
+   "slot_suffixes": [
+    "attn.rope_kv_store",
+    "kv_inject.store"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "note": "Also the three DSpark kv-inject stores (one per stage), which the folded graph places in neighbour-less repeat bodies; one operation claims both slots.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.rope_kv_store",
+   "name": "sglang::deepseek_rope_kernel",
+   "type": "model",
+   "role": "q RoPE, kv norm + RoPE + paged FP8 store",
+   "slot_suffixes": [
+    "attn.rope_kv_store",
+    "kv_inject.store"
+   ],
+   "phase": "forward",
+   "after_name": "_w8a8_block_fp8_matmul",
+   "cross_rank": "independent",
+   "note": "q RoPE right after wq_b.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.inv_rope",
+   "name": "sglang::deepseek_rope_kernel",
+   "type": "model",
+   "role": "inverse RoPE on the attention output",
+   "slot_suffixes": [
+    "attn.inv_rope"
+   ],
+   "phase": "forward",
+   "before_name": "cutlass::Kernel2<cutlass_",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.page_metadata",
+   "name": "_page_mark_kernel",
+   "type": "model",
+   "role": "SWA / compressed page mark + split",
+   "slot_suffixes": [
+    "attn.page_metadata"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.page_metadata",
+   "name": "_page_split_kernel",
+   "type": "model",
+   "role": "SWA / compressed page mark + split",
+   "slot_suffixes": [
+    "attn.page_metadata"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.sparse_mla",
+   "name": "sparse_mla_",
+   "type": "attention",
+   "role": "FlashInfer SM120 sparse MLA (decode <=64 rows, prefill kernels above)",
+   "slot_suffixes": [
+    "attn.sparse_mla_decode",
+    "attn.sparse_mla_prefill"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "note": "sparse_mla_prefill_mg(_dual)_kernel / sparse_mla_decode_dsv4. The model picks one of its two slots per row count, so one operation claims both.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.wo_a",
+   "name": "cutlass::Kernel2<cutlass_",
+   "type": "model",
+   "role": "grouped o-a projection (BF16 CUTLASS bmm)",
+   "slot_suffixes": [
+    "attn.wo_a"
+   ],
+   "phase": "forward",
+   "after_name": "sglang::deepseek_rope_kernel",
+   "cross_rank": "independent",
+   "note": "The GEMM right after the inverse RoPE.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.wo_b",
+   "name": "_w8a8_block_fp8_matmul",
+   "type": "model",
+   "role": "o-b projection (FP8 block-32)",
+   "slot_suffixes": [
+    "attn.wo_b"
+   ],
+   "phase": "forward",
+   "before_name": "ncclDevKernel_AllReduce_Sum_bf16",
+   "cross_rank": "independent",
+   "note": "Prefill: the all-reduce follows it. Decode graph: it ends the attention track, so the quant is named by wo_a before it (`after`).",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.wo_b",
+   "name": "per_token_group_quant_8bit_v2_kernel",
+   "type": "model",
+   "role": "o-b projection (FP8 block-32)",
+   "slot_suffixes": [
+    "attn.wo_b"
+   ],
+   "phase": "forward",
+   "before": "attn.wo_b",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.wo_b",
+   "name": "_w8a8_block_fp8_matmul",
+   "type": "model",
+   "role": "o-b projection (FP8 block-32)",
+   "slot_suffixes": [
+    "attn.wo_b"
+   ],
+   "phase": "forward",
+   "after": "attn.wo_b",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.wo_b",
+   "name": "per_token_group_quant_8bit_v2_kernel",
+   "type": "model",
+   "role": "o-b projection (FP8 block-32)",
+   "slot_suffixes": [
+    "attn.wo_b"
+   ],
+   "phase": "forward",
+   "after": "attn.wo_a",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.compressor_kv_score",
+   "name": "cublasLt::splitKreduce_kernel",
+   "type": "model",
+   "role": "compressor kv/score projection (BF16 CUTLASS, split-K)",
+   "slot_suffixes": [
+    "attn.compressor_kv_score"
+   ],
+   "phase": "forward",
+   "before_name": "sglang::flash_c",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.compressor_kv_score",
+   "name": "cutlass::Kernel2<cutlass_",
+   "type": "model",
+   "role": "compressor kv/score projection (BF16 CUTLASS, split-K)",
+   "slot_suffixes": [
+    "attn.compressor_kv_score"
+   ],
+   "phase": "forward",
+   "before": "attn.compressor_kv_score",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.compressor_kv_score",
+   "name": "cutlass::Kernel2<cutlass_",
+   "type": "model",
+   "role": "compressor kv/score projection (BF16 CUTLASS, split-K)",
+   "slot_suffixes": [
+    "attn.compressor_kv_score"
+   ],
+   "phase": "forward",
+   "before_name": "sglang::flash_c",
+   "cross_rank": "independent",
+   "note": "Prefill: no split-K, the store follows the GEMM directly.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.compressor_store",
+   "name": "sglang::flash_c",
+   "type": "model",
+   "role": "compressor state update + compressed KV store",
+   "slot_suffixes": [
+    "attn.compressor_store"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "attn.compressor_store",
+   "name": "sglang::c2_prefill_store_kernel",
+   "type": "model",
+   "role": "compressor state update + compressed KV store",
+   "slot_suffixes": [
+    "attn.compressor_store"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.wk_store",
+   "name": "sglang::index_k_kernel",
+   "type": "model",
+   "role": "indexer k projection + FP4 k store",
+   "slot_suffixes": [
+    "indexer.wk_store"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.wk_store",
+   "name": "cutlass::Kernel2<cutlass_",
+   "type": "model",
+   "role": "indexer k projection + FP4 k store",
+   "slot_suffixes": [
+    "indexer.wk_store"
+   ],
+   "phase": "forward",
+   "before_name": "sglang::index_k_kernel",
+   "cross_rank": "independent",
+   "note": "The BF16 k projection runs right before index_k.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.wq_b",
+   "name": "_w8a8_block_fp8_matmul",
+   "type": "model",
+   "role": "indexer q-b projection (FP8 block-32)",
+   "slot_suffixes": [
+    "indexer.wq_b"
+   ],
+   "phase": "forward",
+   "before_name": "_rope_tail_fake_quant_fp4_kernel",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.wq_b",
+   "name": "per_token_group_quant_8bit_v2_kernel",
+   "type": "model",
+   "role": "indexer q-b projection (FP8 block-32)",
+   "slot_suffixes": [
+    "indexer.wq_b"
+   ],
+   "phase": "forward",
+   "before": "indexer.wq_b",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.q_rope_quant",
+   "name": "_rope_tail_fake_quant_fp4_kernel",
+   "type": "model",
+   "role": "indexer q RoPE + FP4 fake quant",
+   "slot_suffixes": [
+    "indexer.q_rope_quant"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.weights_proj",
+   "name": "cutlass::Kernel2<cutlass_",
+   "type": "model",
+   "role": "indexer head-weight projection (BF16 CUTLASS, split-K)",
+   "slot_suffixes": [
+    "indexer.weights_proj"
+   ],
+   "phase": "forward",
+   "after_name": "_rope_tail_fake_quant_fp4_kernel",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.weights_proj",
+   "name": "cublasLt::splitKreduce_kernel",
+   "type": "model",
+   "role": "indexer head-weight projection (BF16 CUTLASS, split-K)",
+   "slot_suffixes": [
+    "indexer.weights_proj"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_decode",
+   "name": "_fp4_index_logits_kernel",
+   "type": "model",
+   "role": "FP4 indexer logits (decode/verify)",
+   "slot_suffixes": [
+    "indexer.logits_decode"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "cutlass::Kernel2<cutlass_",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after_name": "at::native::vectorized_gather_kernel",
+   "before_name": "at::native::vectorized_elementwise_kernel",
+   "cross_rank": "independent",
+   "note": "The BF16 einsum over the gathered index K; the lm_head is the other GEMM after a gather and is followed by the logits all-gather instead.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_topk",
+   "name": "computeBlockDigitCounts",
+   "type": "model",
+   "role": "torch top-k (radix select) over the index logits",
+   "slot_suffixes": [
+    "indexer.torch_topk"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "note": "torch.topk internals; in this capture torch.topk runs only in the indexer.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_topk",
+   "name": "computeDigitCumSum",
+   "type": "model",
+   "role": "torch top-k (radix select) over the index logits",
+   "slot_suffixes": [
+    "indexer.torch_topk"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "note": "torch.topk internals; in this capture torch.topk runs only in the indexer.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_topk",
+   "name": "computeBlockwiseWithinKCounts",
+   "type": "model",
+   "role": "torch top-k (radix select) over the index logits",
+   "slot_suffixes": [
+    "indexer.torch_topk"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "note": "torch.topk internals; in this capture torch.topk runs only in the indexer.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_topk",
+   "name": "computeBlockwiseKthCounts",
+   "type": "model",
+   "role": "torch top-k (radix select) over the index logits",
+   "slot_suffixes": [
+    "indexer.torch_topk"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "note": "torch.topk internals; in this capture torch.topk runs only in the indexer.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_topk",
+   "name": "gatherTopK",
+   "type": "model",
+   "role": "torch top-k (radix select) over the index logits",
+   "slot_suffixes": [
+    "indexer.torch_topk"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "note": "torch.topk internals; in this capture torch.topk runs only in the indexer.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_topk",
+   "name": "DeviceScanByKeyInitKernel",
+   "type": "model",
+   "role": "torch top-k (radix select) over the index logits",
+   "slot_suffixes": [
+    "indexer.torch_topk"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "note": "torch.topk internals; in this capture torch.topk runs only in the indexer.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_topk",
+   "name": "DeviceScanByKeyKernel",
+   "type": "model",
+   "role": "torch top-k (radix select) over the index logits",
+   "slot_suffixes": [
+    "indexer.torch_topk"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "note": "torch.topk internals; in this capture torch.topk runs only in the indexer.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_topk",
+   "name": "radixSortKVInPlace",
+   "type": "model",
+   "role": "torch top-k (radix select) over the index logits",
+   "slot_suffixes": [
+    "indexer.torch_topk"
+   ],
+   "phase": "forward",
+   "before_name": "at::native::",
+   "cross_rank": "independent",
+   "note": "The sort of the selected indices (the Engram id sort is the one followed by the gather).",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "engram.lookup",
+   "name": "_engram_gather_kernel",
+   "type": "model",
+   "role": "Engram host-table gather (+ id sort)",
+   "slot_suffixes": [
+    "engram.lookup"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "engram.lookup",
+   "name": "radixSortKVInPlace",
+   "type": "model",
+   "role": "Engram host-table gather (+ id sort)",
+   "slot_suffixes": [
+    "engram.lookup"
+   ],
+   "phase": "forward",
+   "before_name": "_engram_gather_kernel",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "engram.wkv",
+   "name": "_w8a8_block_fp8_matmul",
+   "type": "model",
+   "role": "Engram wkv projection (FP8 block-32)",
+   "slot_suffixes": [
+    "engram.wkv"
+   ],
+   "phase": "forward",
+   "before_name": "_engram_gate_kernel",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "engram.wkv",
+   "name": "per_token_group_quant_8bit_v2_kernel",
+   "type": "model",
+   "role": "Engram wkv projection (FP8 block-32)",
+   "slot_suffixes": [
+    "engram.wkv"
+   ],
+   "phase": "forward",
+   "before": "engram.wkv",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "engram.gate",
+   "name": "_engram_gate_kernel",
+   "type": "model",
+   "role": "Engram gate",
+   "slot_suffixes": [
+    "engram.gate"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.router",
+   "name": "_router_triton_kernel",
+   "type": "model",
+   "role": "router GEMM (BF16 CUTLASS, split-K) + top-k",
+   "slot_suffixes": [
+    "ffn.router"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.router",
+   "name": "cublasLt::splitKreduce_kernel",
+   "type": "model",
+   "role": "router GEMM (BF16 CUTLASS, split-K) + top-k",
+   "slot_suffixes": [
+    "ffn.router"
+   ],
+   "phase": "forward",
+   "before_name": "_router_triton_kernel",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.router",
+   "name": "cutlass::Kernel2<cutlass_",
+   "type": "model",
+   "role": "router GEMM (BF16 CUTLASS, split-K) + top-k",
+   "slot_suffixes": [
+    "ffn.router"
+   ],
+   "phase": "forward",
+   "before": "ffn.router",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.shared_gate_up",
+   "name": "_w8a8_block_fp8_matmul",
+   "type": "model",
+   "role": "shared expert gate-up (FP8 block-32, TP-sharded)",
+   "slot_suffixes": [
+    "ffn.shared_gate_up"
+   ],
+   "phase": "forward",
+   "before_name": "sglang::silu_mul_clamp_kernel",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.shared_gate_up",
+   "name": "per_token_group_quant_8bit_v2_kernel",
+   "type": "model",
+   "role": "shared expert gate-up (FP8 block-32, TP-sharded)",
+   "slot_suffixes": [
+    "ffn.shared_gate_up"
+   ],
+   "phase": "forward",
+   "before": "ffn.shared_gate_up",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.shared_act",
+   "name": "sglang::silu_mul_clamp_kernel",
+   "type": "model",
+   "role": "shared expert SiLU-mul clamp",
+   "slot_suffixes": [
+    "ffn.shared_act"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.shared_down",
+   "name": "_w8a8_block_fp8_matmul",
+   "type": "model",
+   "role": "shared expert down (FP8 block-32)",
+   "slot_suffixes": [
+    "ffn.shared_down"
+   ],
+   "phase": "forward",
+   "before_name": "cutlass::Kernel2<cutlass_",
+   "cross_rank": "independent",
+   "note": "Prefill: the router GEMM follows it. Decode graph: it ends the shared-expert track, so it is named by the SiLU before its quant.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.shared_down",
+   "name": "per_token_group_quant_8bit_v2_kernel",
+   "type": "model",
+   "role": "shared expert down (FP8 block-32)",
+   "slot_suffixes": [
+    "ffn.shared_down"
+   ],
+   "phase": "forward",
+   "before": "ffn.shared_down",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.shared_down",
+   "name": "per_token_group_quant_8bit_v2_kernel",
+   "type": "model",
+   "role": "shared expert down (FP8 block-32)",
+   "slot_suffixes": [
+    "ffn.shared_down"
+   ],
+   "phase": "forward",
+   "after_name": "sglang::silu_mul_clamp_kernel",
+   "cross_rank": "independent",
+   "note": "Prefill: the router GEMM follows it. Decode graph: it ends the shared-expert track, so it is named by the SiLU before its quant.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.shared_down",
+   "name": "_w8a8_block_fp8_matmul",
+   "type": "model",
+   "role": "shared expert down (FP8 block-32)",
+   "slot_suffixes": [
+    "ffn.shared_down"
+   ],
+   "phase": "forward",
+   "after": "ffn.shared_down",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.routed_moe",
+   "name": "quantize_with_block_size",
+   "type": "moe",
+   "role": "EP4 routed experts: MXFP8 act quant + TRT-LLM CUTLASS MXFP4 grouped GEMM",
+   "slot_suffixes": [
+    "ffn.routed_moe"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.routed_moe",
+   "name": "ExpertPrefixSumKernel",
+   "type": "moe",
+   "role": "EP4 routed experts: MXFP8 act quant + TRT-LLM CUTLASS MXFP4 grouped GEMM",
+   "slot_suffixes": [
+    "ffn.routed_moe"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.routed_moe",
+   "name": "fusedBuildExpertMapsSortFirstTokenKernel",
+   "type": "moe",
+   "role": "EP4 routed experts: MXFP8 act quant + TRT-LLM CUTLASS MXFP4 grouped GEMM",
+   "slot_suffixes": [
+    "ffn.routed_moe"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.routed_moe",
+   "name": "expandInputRowsKernel",
+   "type": "moe",
+   "role": "EP4 routed experts: MXFP8 act quant + TRT-LLM CUTLASS MXFP4 grouped GEMM",
+   "slot_suffixes": [
+    "ffn.routed_moe"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.routed_moe",
+   "name": "computeStridesTmaWarpSpecializedKernel",
+   "type": "moe",
+   "role": "EP4 routed experts: MXFP8 act quant + TRT-LLM CUTLASS MXFP4 grouped GEMM",
+   "slot_suffixes": [
+    "ffn.routed_moe"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.routed_moe",
+   "name": "GroupProblemShape",
+   "type": "moe",
+   "role": "EP4 routed experts: MXFP8 act quant + TRT-LLM CUTLASS MXFP4 grouped GEMM",
+   "slot_suffixes": [
+    "ffn.routed_moe"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.routed_moe",
+   "name": "doActivationKernel",
+   "type": "moe",
+   "role": "EP4 routed experts: MXFP8 act quant + TRT-LLM CUTLASS MXFP4 grouped GEMM",
+   "slot_suffixes": [
+    "ffn.routed_moe"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "ffn.routed_moe",
+   "name": "finalizeMoeRoutingKernel",
+   "type": "moe",
+   "role": "EP4 routed experts: MXFP8 act quant + TRT-LLM CUTLASS MXFP4 grouped GEMM",
+   "slot_suffixes": [
+    "ffn.routed_moe"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "head.hc_collapse",
+   "name": "_mhc_combine_kernel",
+   "type": "model",
+   "role": "hc collapse before the final norm",
+   "slot_suffixes": [
+    "head.hc_collapse",
+    "dspark.hc_collapse"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "head.final_rmsnorm",
+   "name": "oi64512051201",
+   "type": "model",
+   "role": "final RMSNorm",
+   "slot_suffixes": [
+    "head.final_rmsnorm",
+    "dspark.final_rmsnorm"
+   ],
+   "phase": "forward",
+   "after_name": "_mhc_combine_kernel",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "head.lm_head",
+   "name": "cutlass::Kernel2<cutlass_",
+   "type": "model",
+   "role": "lm_head (BF16 CUTLASS, vocab / 4)",
+   "slot_suffixes": [
+    "head.lm_head",
+    "dspark.lm_head"
+   ],
+   "phase": "forward",
+   "after_name": "oi64512051201",
+   "cross_rank": "independent",
+   "note": "Decode: right after the final norm. Target and draft lm_head are the same GEMM; one operation claims both slots.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "head.lm_head",
+   "name": "cutlass::Kernel2<cutlass_",
+   "type": "model",
+   "role": "lm_head (BF16 CUTLASS, vocab / 4)",
+   "slot_suffixes": [
+    "head.lm_head",
+    "dspark.lm_head"
+   ],
+   "phase": "forward",
+   "before_name": "ncclDevKernel_AllGather",
+   "cross_rank": "independent",
+   "note": "Prefill: last-token gather, then the GEMM, then the logits all-gather.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "head.lm_head",
+   "name": "internal::gemvx::kernel",
+   "type": "model",
+   "role": "lm_head (BF16 CUTLASS, vocab / 4)",
+   "slot_suffixes": [
+    "head.lm_head",
+    "dspark.lm_head"
+   ],
+   "phase": "forward",
+   "before_name": "ncclDevKernel_AllGather",
+   "cross_rank": "independent",
+   "note": "cuBLAS gemv spelling for a one-row lm_head.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "head.logits_all_gather",
+   "name": "ncclDevKernel_AllGather",
+   "type": "collective",
+   "role": "logits all-gather",
+   "slot_suffixes": [
+    "head.logits_all_gather"
+   ],
+   "phase": "forward",
+   "after_name": "cutlass::Kernel2<cutlass_",
+   "cross_rank": "synchronizing",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "head.logits_all_gather",
+   "name": "ncclDevKernel_AllGather",
+   "type": "collective",
+   "role": "logits all-gather",
+   "slot_suffixes": [
+    "head.logits_all_gather"
+   ],
+   "phase": "forward",
+   "after_name": "internal::gemvx::kernel",
+   "cross_rank": "synchronizing",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "head.logits_all_gather",
+   "name": "ncclDevKernel_AllGather",
+   "type": "collective",
+   "role": "logits all-gather",
+   "slot_suffixes": [
+    "head.logits_all_gather"
+   ],
+   "phase": "forward",
+   "after_name": "sglang::deepseek_rope_kernel",
+   "cross_rank": "synchronizing",
+   "note": "graph track: in the decode graph the logits all-gather shares a stream with layer 0's q path, so its track-local predecessor is the q RoPE.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "dspark.kv_inject.kv_proj",
+   "name": "_w8a8_block_fp8_matmul",
+   "type": "model",
+   "role": "DSpark kv-inject projections of the target hidden states (FP8)",
+   "slot_suffixes": [
+    "kv_inject.kv_proj"
+   ],
+   "phase": "forward",
+   "before_name": "oi64512051201",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "dspark.kv_inject.kv_proj",
+   "name": "per_token_group_quant_8bit_v2_kernel",
+   "type": "model",
+   "role": "DSpark kv-inject projections of the target hidden states (FP8)",
+   "slot_suffixes": [
+    "kv_inject.kv_proj"
+   ],
+   "phase": "forward",
+   "before": "dspark.kv_inject.kv_proj",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "dspark.kv_inject.kv_proj",
+   "name": "per_token_group_quant_8bit_v2_kernel",
+   "type": "model",
+   "role": "DSpark kv-inject projections of the target hidden states (FP8)",
+   "slot_suffixes": [
+    "kv_inject.kv_proj"
+   ],
+   "phase": "forward",
+   "after_name": "oi64512051201",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "dspark.kv_inject.kv_proj",
+   "name": "_w8a8_block_fp8_matmul",
+   "type": "model",
+   "role": "DSpark kv-inject projections of the target hidden states (FP8)",
+   "slot_suffixes": [
+    "kv_inject.kv_proj"
+   ],
+   "phase": "forward",
+   "after": "dspark.kv_inject.kv_proj",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "dspark.markov.w",
+   "name": "cutlass::Kernel2<cutlass_",
+   "type": "model",
+   "role": "Markov head low-rank projection (BF16 CUTLASS)",
+   "slot_suffixes": [
+    "markov.w1",
+    "markov.w2"
+   ],
+   "phase": "forward",
+   "before_name": "_markov_sample_partial_kernel",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "dspark.markov.sample_partial",
+   "name": "_markov_sample_partial_kernel",
+   "type": "model",
+   "role": "Markov sampling, partial",
+   "slot_suffixes": [
+    "markov.sample_partial"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "dspark.markov.sample_finish",
+   "name": "_markov_sample_finish_kernel",
+   "type": "model",
+   "role": "Markov sampling, finish",
+   "slot_suffixes": [
+    "markov.sample_finish"
+   ],
+   "phase": "forward",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "dspark.markov.vocab_all_gather",
+   "name": "ncclDevKernel_AllGather",
+   "type": "collective",
+   "role": "Markov vocab all-gather",
+   "slot_suffixes": [
+    "markov.vocab_all_gather"
+   ],
+   "phase": "forward",
+   "after_name": "_markov_sample_partial_kernel",
+   "cross_rank": "synchronizing",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "dspark.markov.vocab_all_gather",
+   "name": "ncclDevKernel_AllGather",
+   "type": "collective",
+   "role": "Markov vocab all-gather",
+   "slot_suffixes": [
+    "markov.vocab_all_gather"
+   ],
+   "phase": "forward",
+   "after_name": "_w8a8_block_fp8_matmul",
+   "cross_rank": "synchronizing",
+   "note": "graph track: round 1's all-gather shares a stream with the last draft stage's wo_b, so that GEMM is its track-local predecessor.",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "dspark.markov.token_broadcast",
+   "name": "ncclDevKernel_Broadcast",
+   "type": "collective",
+   "role": "Markov token broadcast",
+   "slot_suffixes": [
+    "markov.token_broadcast"
+   ],
+   "phase": "forward",
+   "after_name": "_markov_sample_finish_kernel",
+   "cross_rank": "synchronizing",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
   }
  ]
 }

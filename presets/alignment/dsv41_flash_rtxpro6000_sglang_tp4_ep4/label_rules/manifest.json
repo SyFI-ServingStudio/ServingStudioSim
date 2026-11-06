@@ -3,6 +3,31 @@
  "rule_files": [
   "rules.json"
  ],
- "note": "Seed rule set. One unambiguous rule (the token embedding) from the 2026-11-05 SM120 torch-profiler traces; the full set is written from this pack's first nsys capture (B2 rental), read off the folded launch programs of SGLang v0.5.23 on SM120, not migrated from the B200 vLLM pack whose kernel vocabulary differs.",
- "rules": 1
+ "generator": "gen_rules.py (rules.json is its output; edit the generator, not the JSON)",
+ "note": "One order-independent rule set for DeepSeek-V4.1-Flash on SGLang v0.5.23 + the vibesim-alignment-v0.5.23 fork, 4x RTX PRO 6000 (SM120), TP4/EP4, DSpark block 6. Written from this pack's own first nsys capture, not migrated from the B200 vLLM pack (different kernel vocabulary).",
+ "provenance": "Capture: logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 rental 2026-11-06, nsys 2026.4.1 report re-exported with 2026.5.2; 94 iterations, 1.19 M kernel rows, 4 ranks). Read off the folded launch programs (`alignment label walk`) and cross-checked against the time-ordered per-stream timeline of one decode-graph iteration (sequence_7a28c257f810, 209 occurrences) and one eager 2048-token prefill (sequence_2aca2140666a).",
+ "how_rules_were_written": "Every dense FP8 linear is the same two launches (per_token_group_quant_8bit_v2 + Triton _w8a8_block_fp8_matmul), so a GEMM is named by the kernel after it (before_name) and its quant takes the GEMM's operation through `before`; where the GEMM ends a body the chain runs through after_name/after instead. The decode CUDA graph is captured on ~100 streams, so tracks are short and neighbours are track-local; the few rules that key on a track-local neighbour that is not the temporal predecessor say 'graph track' in their note.",
+ "one_to_many": "Operations that claim more than one slot because the measured program cannot separate them: tp_all_reduce (attn + ffn), mhc_mix_stats / mhc_combine_norm / mhc_post (attn + ffn), attn.sparse_mla (decode + prefill slots; every launch here took the prefill kernels, a 16x7-row verify is above the 64-row switch), attn.rope_kv_store (+ dspark.kv_inject.store), head.lm_head / final_rmsnorm / hc_collapse (target + dspark), prologue.embedding (+ dspark.embed), dspark.markov.w (w1 + w2). Target and DSpark-stage layer slots share suffixes, so each layer operation also covers the three draft stages.",
+ "unfired_note": "At the fixpoint four bootstrap rules (a quant named by its predecessor, for GEMMs that end a body) report 'matched nothing': they fire in the first sweep, after which the `before` rule for the same operation is tried first and confirms the same label. They are needed; removing them leaves those GEMMs unmapped.",
+ "measured_on": "2026-11-06",
+ "rules": 93,
+ "subsumptions": 0,
+ "windows": {
+  "note": "Duration-weighted coverage from `alignment label coverage` on the analysis_kernel report.",
+  "07_balanced_anchor_c16": {
+   "iterations": 94,
+   "disagreements": 0,
+   "measured_coverage_pct": 97.1,
+   "measured_critical_path_coverage_pct": 97.97,
+   "simulated_coverage_pct": 99.8
+  },
+  "01_decode_graph_sizes_c16": {
+   "iterations": 115,
+   "disagreements": 0,
+   "measured_coverage_pct": 97.44,
+   "measured_critical_path_coverage_pct": 98.09,
+   "simulated_coverage_pct": 99.69
+  }
+ },
+ "unmapped_note": "Left unmapped on purpose (no simulated slot): scheduler / page-table prologue kernels, the routed+shared residual add, _mhc_stream_mean_kernel (DSpark hidden capture, layers 37-39), verify/accept bookkeeping (argmax, softcap, accept-length broadcasts), the kv-inject RMSNorm, two folded `[2x: quant, GEMM]` draft side-stream bodies that fold a shared-down and a kv-a projection into one position, the prefill Engram id sort (cub radix sort, neighbour-less repeat bodies) and the torch elementwise/reduce bookkeeping around the indexer projections and the prefill indexer einsum. 1.6% of measured decode time, 2.1% of prefill."
 }
