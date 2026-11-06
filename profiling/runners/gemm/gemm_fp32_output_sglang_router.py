@@ -44,7 +44,6 @@ def profile_gemm_fp32_output_sglang_router(
 
     try:
         import torch
-        from sglang.kernels.ops.gemm import dsv3_router_gemm
 
         try:
             # v0.5.23+: where DeepSeek-V4's compressor and router import it from.
@@ -68,6 +67,12 @@ def profile_gemm_fp32_output_sglang_router(
             and sm >= _DEDICATED_MIN_SM
         )
         if use_dedicated:
+            # Only the dedicated router shapes need it; v0.5.23 no longer exports it from
+            # sglang.kernels.ops.gemm, so import it where it is used.
+            try:
+                from sglang.kernels.ops.gemm import dsv3_router_gemm
+            except ImportError as exc:
+                raise ProfilerNotImplemented(f"{_BACKEND}: dsv3_router_gemm is unavailable") from exc
 
             def launch():
                 return dsv3_router_gemm(hidden, weight, out_dtype=torch.float32)
