@@ -117,3 +117,23 @@ def engine_queues(cell: Path) -> np.ndarray:
             queued[0][workers[k]] += span
             queued[1 if codes[k - 1] == SUSPENDED else 2][workers[k]] += span
     return np.array([max(map(_peak, kind)) for kind in queued])
+
+
+def colocated_end(cell: Path) -> float:
+    """A colocated rollout's wall, composed from a migration-off cell (seconds).
+
+    Colocated generation is the same as migration off: every engine keeps its own
+    work to the end. Only the training differs -- it waits for the last engine,
+    then all blocks train from a full queue. So: the cell's inference end plus
+    its own chunks list-scheduled in dispatch order onto the blocks. The switch
+    between the two phases (offload, weight sync) is not modelled, as it is not
+    in the streaming cells.
+    """
+    chunks = []
+    for path in (cell / "raw" / "cost_log").glob("worker_main.train_*.parquet"):
+        start, end = _intervals(pq.read_table(path, columns=["wall_start_ms", "total_time_ms"]))
+        chunks += zip(start, end - start)
+    blocks = [0.0] * (GPUS // GPUS_PER_BLOCK)
+    for _, duration in sorted(chunks):
+        blocks[blocks.index(min(blocks))] += duration
+    return inference_end(cell) + max(blocks) / 1e3
