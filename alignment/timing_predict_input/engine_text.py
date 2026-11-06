@@ -61,8 +61,9 @@ def _validated_shape(
             )
         return pairs, decode_kv_lens, prefill_tokens + decode_requests
     queries = metric.get("decode_query_lens")
-    if metric["input_adapter"] == "sglang_text" and queries is None:
-        # The SGLang fork (schema 2) records one scheduled token per decoding request and no query widths.
+    if metric["input_adapter"] == "sglang_text" and not queries:
+        # The SGLang fork (schema 2) records one scheduled token per decoding request and no query widths
+        # (absent, or the empty list the parser fills in).
         # SGLang's speculative verify is static by default (SGLANG_RAGGED_VERIFY_MODE=static): every decoding
         # request runs exactly speculative_num_draft_tokens = draft_tokens + 1 query rows. Lower that
         # literally; a capture under ragged verify would need recorded widths and is rejected here.
