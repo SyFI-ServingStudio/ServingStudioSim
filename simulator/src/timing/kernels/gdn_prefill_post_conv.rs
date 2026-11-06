@@ -203,10 +203,18 @@ mod tests {
     /// offsets at the 262144 knot only.
     #[test]
     fn cells_past_the_int32_offsets_are_masked() {
-        let cfg = GdnPrefillPostConvKernelConfig { num_value_heads: 48.into(), ..config() };
+        let cfg = GdnPrefillPostConvKernelConfig {
+            num_value_heads: 48.into(),
+            ..config()
+        };
         let grid = GdnPrefillPostConvSpec::sweep_grid(&cfg);
         let mask = GdnPrefillPostConvSpec::infeasible_mask(&cfg, &grid);
-        let masked: Vec<f64> = grid.axes()[0].iter().zip(&mask).filter(|(_, &m)| m).map(|(&t, _)| t).collect();
+        let masked: Vec<f64> = grid.axes()[0]
+            .iter()
+            .zip(&mask)
+            .filter(|(_, &m)| m)
+            .map(|(&t, _)| t)
+            .collect();
         assert_eq!(masked, [262144.0]);
     }
 

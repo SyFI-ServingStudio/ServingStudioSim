@@ -63,7 +63,11 @@ impl PagedAttnBatchDecodeKernelConfig {
     }
 
     fn sms(&self) -> f64 {
-        if self.is_fa3() { HOPPER_SMS } else { B200_SMS }
+        if self.is_fa3() {
+            HOPPER_SMS
+        } else {
+            B200_SMS
+        }
     }
 
     fn context_axis(&self) -> Vec<f64> {

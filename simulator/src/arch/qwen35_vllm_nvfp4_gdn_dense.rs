@@ -116,20 +116,32 @@ pub enum KernelPath {
 impl KernelPath {
     pub fn of(gpu_name: &str) -> Self {
         let g = gpu_name.to_ascii_uppercase();
-        if ["H100", "H200", "H800", "H20", "GH200"].iter().any(|h| g.contains(h)) {
+        if ["H100", "H200", "H800", "H20", "GH200"]
+            .iter()
+            .any(|h| g.contains(h))
+        {
             Self::Sm90
         } else {
             Self::Sm100
         }
     }
     fn fp8_gemm(self) -> &'static [&'static str] {
-        match self { Self::Sm100 => FP8_GEMM_BACKENDS, Self::Sm90 => SM90_FP8_GEMM_BACKENDS }
+        match self {
+            Self::Sm100 => FP8_GEMM_BACKENDS,
+            Self::Sm90 => SM90_FP8_GEMM_BACKENDS,
+        }
     }
     fn nvfp4_gemm(self) -> &'static [&'static str] {
-        match self { Self::Sm100 => NVFP4_GEMM_BACKENDS, Self::Sm90 => SM90_NVFP4_GEMM_BACKENDS }
+        match self {
+            Self::Sm100 => NVFP4_GEMM_BACKENDS,
+            Self::Sm90 => SM90_NVFP4_GEMM_BACKENDS,
+        }
     }
     fn attention(self) -> &'static [&'static str] {
-        match self { Self::Sm100 => ATTENTION_BACKENDS, Self::Sm90 => SM90_ATTENTION_BACKENDS }
+        match self {
+            Self::Sm100 => ATTENTION_BACKENDS,
+            Self::Sm90 => SM90_ATTENTION_BACKENDS,
+        }
     }
     /// W4A16: the BF16 activation feeds the NVFP4 GEMM directly.
     fn nvfp4_weight_only(self) -> bool {
@@ -935,7 +947,9 @@ mod tests {
             let bridge = PerfApiBridge::new_uninit_for_test();
             bridge.enable_enumerate();
             let model = build("unified".into(), resolve_configs(&c), &bridge).unwrap();
-            model.check_input(&step(vec![(0, 629)], vec![400; 5])).unwrap();
+            model
+                .check_input(&step(vec![(0, 629)], vec![400; 5]))
+                .unwrap();
             let slots = model.cost_log_manifest().slots.len();
             // Two quants fewer per MLP group and none before the head.
             assert_eq!(slots, 2 * (2 + 23 + 3) + (2 + 8 + 3) + 3);
