@@ -18,6 +18,7 @@ config the same way, so a tree's leaf and the Kernels page name one config.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ from launcher.corpus import resolve_hf_references
 from launcher.schema.loader import schema_from_dict
 from profiling.db.storage import canonical_json
 from public_api import preset as public_preset
+from public_api.forked import forked_map
 
 REPO_ROOT = public_preset.REPO_ROOT
 # Members built by one ``cost_trees`` call.
@@ -178,6 +180,53 @@ def _section(section: dict, configs: list[str | None]) -> dict:
     return {"section": section["section"], "slots": slots}
 
 
+def _kept(built: list[dict]) -> dict:
+    """What the index keeps of one ``cost_trees`` call, ``built``: per member,
+    its fields, sections (:func:`_section`) and the roles it uses each config
+    for, ``{config id: sorted roles}``; and each config the call names, once,
+    by id, as the JSON text of its record. Runs in the worker that parsed
+    ``built``, so the main process neither parses a slot's whole kernel config
+    nor a config twice: a call's members share most of their configs, and the
+    configs repeat across calls (12,913 records, 1,072 distinct)."""
+    members, configs = [], {}
+    for member in built:
+        if member["error"]:
+            members.append({"contract": member["contract"] or None, "error": member["error"]})
+            continue
+        records = member["kernel_configs"]["configs"]
+        ids = [
+            config_id(record["kind"], record["gpu_name"], record["identity"]) for record in records
+        ]
+        roles: dict[str, set[str]] = {}
+        for cid, record in zip(ids, records, strict=True):
+            roles.setdefault(cid, set()).update(use["role"] for use in record["uses"])
+            if cid not in configs:
+                configs[cid] = json.dumps(
+                    {
+                        key: record[key]
+                        for key in ("kind", "profile_kind", "gpu_name", "identity", "grid")
+                    }
+                )
+        members.append(
+            {
+                "contract": member["contract"] or None,
+                "error": member["error"],
+                "gpus_per_replica": member["gpus_per_replica"],
+                "predict": member["predict"],
+                "kv_cache": member.get("kv_cache"),
+                # The simulator names the record each slot's kernel reads.
+                "sections": [
+                    _section(section, [None if i is None else ids[i] for i in slots])
+                    for section, slots in zip(
+                        member["cost_manifest"]["sections"], member["slot_configs"], strict=True
+                    )
+                ],
+                "uses": {cid: sorted(cid_roles) for cid, cid_roles in roles.items()},
+            }
+        )
+    return {"members": members, "configs": configs}
+
+
 def find_member(preset_id: str, axes: list[dict], members: list, params: dict[str, Any]):
     """``(position, member)`` of the one of ``members`` whose ``axes`` values are
     ``params``: each axis, no other name, compared as a query string spells
@@ -270,13 +319,17 @@ class DeploymentIndex:
             for preset in index.presets.values()
             for start in range(0, len(preset.members), _MEMBERS_PER_CALL)
         ]
-        with ThreadPoolExecutor(max_workers=jobs) as pool:
-            builds = pool.map(lambda chunk: cost_trees([m.block for m in chunk[2]]), chunks)
-            for (preset, start, members), built in zip(chunks, builds, strict=True):
-                for position, (member, result) in enumerate(
-                    zip(members, built, strict=True), start=start
-                ):
-                    index._add(preset.id, position, member, result)
+        # Each chunk is built and its JSON parsed in a forked worker
+        # (public_api.forked), which sends back only what the index keeps.
+        builds = forked_map(
+            lambda chunk: _kept(cost_trees([m.block for m in chunk[2]])), chunks, jobs
+        )
+        for (preset, start, members), kept in zip(chunks, builds, strict=True):
+            index._add_configs(kept["configs"])
+            for position, (member, result) in enumerate(
+                zip(members, kept["members"], strict=True), start=start
+            ):
+                index._add(preset.id, position, member, result)
         return index
 
     def check(self, missing_specs: Callable[[Member], dict[str, int]], *, jobs: int = 8) -> None:
@@ -307,40 +360,34 @@ class DeploymentIndex:
                         member.missing_configs.get(config.id, 0) + count
                     )
 
-    def _add(self, preset_id: str, position: int, member: Member, built: dict) -> None:
-        member.contract = built["contract"] or None
-        member.error = built["error"]
-        if member.error:
-            return
-        member.gpus_per_replica = built["gpus_per_replica"]
-        member.predict = built["predict"]
-        member.kv_cache = built.get("kv_cache")
-        ids = [
-            config_id(record["kind"], record["gpu_name"], record["identity"])
-            for record in built["kernel_configs"]["configs"]
-        ]
-        # The simulator names the record each slot's kernel reads.
-        member.sections = [
-            _section(section, [None if i is None else ids[i] for i in slots])
-            for section, slots in zip(
-                built["cost_manifest"]["sections"], built["slot_configs"], strict=True
-            )
-        ]
-        roles: dict[str, set[str]] = {}
-        for cid, record in zip(ids, built["kernel_configs"]["configs"], strict=True):
-            config = self.configs.setdefault(
-                cid,
-                Config(
+    def _add_configs(self, configs: dict[str, str]) -> None:
+        """Index the configs :func:`_kept` sent that are new here; the first
+        record of an id is the one kept, as members are added in order."""
+        for cid, text in configs.items():
+            if cid not in self.configs:
+                record = json.loads(text)
+                self.configs[cid] = Config(
                     id=cid,
                     kind=record["kind"],
                     profile_kind=record["profile_kind"],
                     gpu=record["gpu_name"],
                     identity=record["identity"],
                     grid=record["grid"],
-                ),
-            )
-            roles.setdefault(cid, set()).update(use["role"] for use in record["uses"])
-            config.uses[(preset_id, position)] = sorted(roles[cid])
+                )
+
+    def _add(self, preset_id: str, position: int, member: Member, kept: dict) -> None:
+        """Fill ``member`` from its :func:`_kept` entry; its configs are
+        already indexed (:meth:`_add_configs`)."""
+        member.contract = kept["contract"]
+        member.error = kept["error"]
+        if member.error:
+            return
+        member.gpus_per_replica = kept["gpus_per_replica"]
+        member.predict = kept["predict"]
+        member.kv_cache = kept["kv_cache"]
+        member.sections = kept["sections"]
+        for cid, roles in kept["uses"].items():
+            self.configs[cid].uses[(preset_id, position)] = roles
 
     # -- lookups -------------------------------------------------------------------
 

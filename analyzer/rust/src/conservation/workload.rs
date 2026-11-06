@@ -236,7 +236,8 @@ fn uses_speculative_worker(params: &Value) -> bool {
 pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let params_path = resolve_artifact_path(log_dir, "params.json");
     let params: Option<Value> = if params_path.is_file() {
-        Some(serde_json::from_reader(std::fs::File::open(params_path)?)?)
+        // Read whole: `from_reader` on an unbuffered `File` reads one byte per syscall.
+        Some(serde_json::from_slice(&std::fs::read(params_path)?)?)
     } else {
         None
     };
