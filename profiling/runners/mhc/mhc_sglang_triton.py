@@ -182,6 +182,12 @@ def profile_mhc_post_sglang_auto(
         raise ProfilerNotImplemented(f"{backend} requires the SGLang environment (sglang_env)") from exc
 
     def run() -> ComputeMetrics:
+        # post() above 384 rows takes the TileLang path, which reads the published `parallel` config
+        # namespace (get_parallel()). A server process publishes it at startup; publish the defaults here.
+        from sglang.srt.runtime_context import publish
+        from sglang.srt.server_args import ServerArgs
+
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
         g = torch.Generator(device="cuda").manual_seed(0)
         m, h = num_tokens, hidden_size
         # V4.1-Flash (configs/deepseek_v41.py): hc_pre_from_prev_sublayer = True; no prefill CP.

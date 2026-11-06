@@ -173,7 +173,10 @@ def profile_sparse_indexer_logits_prefill_sglang_torch_fp4(
         raise ValueError(f"{name}: need positive num_queries, num_heads and compress_ratio")
     lc = (p + t) // ratio
     if lc < 1:
-        raise ValueError(f"{name}: no compressed key is visible yet (prefix_len + num_queries < compress_ratio)")
+        # No compressed key is visible yet: SGLang's prefill_requests scores nothing for this request
+        # (no dequant, no einsum, no top-k), so the indexer costs no GPU time. The simulator's prefill grid
+        # does reach this corner (prefix 0, chunk < ratio), and a zero row is the measured truth there.
+        return ComputeMetrics(time_ms=0.0, tflops=0.0, memory_bandwidth_gbps=0.0, energy_j=0.0)
     try:
         import torch
     except ImportError as exc:

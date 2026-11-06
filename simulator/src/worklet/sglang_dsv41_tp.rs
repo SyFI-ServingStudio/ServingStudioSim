@@ -88,8 +88,12 @@ impl SglangDsv41KernelPath {
     pub(crate) fn bf16_gemm(self) -> &'static str {
         "torch_linear"
     }
+    /// The compressor's kv-score GEMM: SGLang's `linear_bf16_fp32`
+    /// (`layers/attention/dsv4/compressor.py:166`). The `sglang_router_auto`
+    /// backend times that same call for every n outside {256, 384}; the
+    /// compressor's n is head_dim x ratio (1024 or 512).
     pub(crate) fn fp32_out_gemm(self) -> &'static str {
-        "torch_cublas"
+        "sglang_router_auto"
     }
     pub(crate) fn mhc(self) -> &'static str {
         "sglang_triton"
@@ -414,7 +418,7 @@ impl SglangDsv41LayerWorklet {
                 ),
                 bridge,
             )?,
-            // Compressor kv-score GEMM (cuBLAS, fp32 out) and the C2 store
+            // Compressor kv-score GEMM (SGLang linear_bf16_fp32, fp32 out) and the C2 store
             // (`flash_c2_decode_kernel` / `c2_prefill_store_kernel`).
             compressor_proj: l
                 .kv_source
