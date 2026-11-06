@@ -102,7 +102,9 @@ variants:
       name: profile_nsys
       trace: kernel
     input_builder:
-      type: engine_text
+      # SGLang static verify: every decoding request runs draft_tokens + 1 = 7 query rows.
+      type: speculative_engine_text
+      draft_tokens: 6
       measured_phase: forward
       group_assignment: per_dp_rank
     label_rules: label_rules/manifest.json
