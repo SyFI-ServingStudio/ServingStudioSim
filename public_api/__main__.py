@@ -10,8 +10,8 @@ from pathlib import Path
 from profiling.perf_api import DB_PATH
 
 # Startup runs one simulator subprocess per preset chunk, member and capture,
-# so it scales with the CPUs it may use (on a 256-core host: 8 jobs 129 s,
-# 64 jobs 50 s). The cap keeps a shared host usable while it starts.
+# so it scales with the CPUs it may use (on a 256-core host: 8 jobs 120 s,
+# 64 jobs 27 s, 128 no faster). The cap keeps a shared host usable while it starts.
 MAX_DEFAULT_JOBS = 64
 
 
