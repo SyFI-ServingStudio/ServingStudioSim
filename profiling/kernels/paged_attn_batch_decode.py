@@ -138,4 +138,35 @@ register(
     )
 )
 
+# Hopper: vLLM's FLASH_ATTN backend (FlashAttention 3, FlashAttnFwdSm90) over the FP8 cache,
+# one flash_attn_varlen_func(fa_version=3) call as FlashAttentionImpl.forward makes it
+# for the step's decode requests (Hopper alignment captures, 2026-11-03).
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_fa3",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.paged_attn_batch_vllm_fa3",
+            function_name="profile_paged_attn_batch_decode",
+        ),
+        table_name=KIND,
+        args_schema=PagedAttnBatchDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            kv=frozenset({DType.FP8_E4M3}),
+            sm_targets=frozenset({"sm_90a"}),
+        ),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's FlashAttentionImpl.forward on SM90: flash_attn_varlen_func(fa_version=3) "
+                "with an FP8 query over the paged FP8 K/V caches (1568-token blocks), AOT "
+                "scheduler metadata, causal."
+            ),
+        ),
+    )
+)
+
 __all__ = ["KIND", "PagedAttnBatchDecodeArgs"]

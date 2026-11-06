@@ -26,7 +26,8 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
-use crate::timing::kernels::fa4_varlen_projection::B200_SMS;
+use crate::timing::kernels::fa4_varlen_projection::{B200_SMS, HOPPER_SMS};
+use crate::timing::kernels::paged_attn_batch_decode::FA3_BACKEND;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Coords, Dim, KernelConfig, SweepCoords};
 
@@ -40,6 +41,8 @@ const WAVE_KNOTS: u32 = 8;
 const TILE_TAIL: [u32; 3] = [64, 96, 128];
 const SEQ_KNOTS: [u32; 10] = [1, 2, 3, 4, 6, 8, 12, 16, 32, 64];
 const PREFIX_KNOTS: [u32; 6] = [0, 512, 2048, 8192, 32768, 131072];
+/// Prefix knots past 131072 for Hopper FA3 (`vllm_fa3`), up to the 1M context.
+const LONG_PREFIX_KNOTS: [u32; 3] = [262144, 524288, 1048576];
 /// Profiling cap on one batch's KV bytes (the runner's `_MAX_KV_BYTES`).
 const MAX_KV_BYTES: f64 = (32u64 << 30) as f64;
 
@@ -59,10 +62,23 @@ pub struct PagedAttnBatchPrefillKernelConfig {
 }
 
 impl PagedAttnBatchPrefillKernelConfig {
+    fn is_fa3(&self) -> bool {
+        self.backends.contains(&FA3_BACKEND)
+    }
+
+    fn prefix_axis(&self) -> Vec<f64> {
+        let mut knots = PREFIX_KNOTS.to_vec();
+        if self.is_fa3() {
+            knots.extend(LONG_PREFIX_KNOTS);
+        }
+        Axis::values(knots)
+    }
+
     /// Tile knots: both sides of each wave edge for the first waves, then the tail.
     fn tile_axis(&self) -> Vec<f64> {
         let heads = self.num_qo_heads.get();
-        let last_in_wave = |wave: u32| (f64::from(wave) * B200_SMS) as u32 / heads;
+        let sms = if self.is_fa3() { HOPPER_SMS } else { B200_SMS };
+        let last_in_wave = |wave: u32| (f64::from(wave) * sms) as u32 / heads;
         let mut knots: Vec<u32> = (1..=last_in_wave(1).clamp(1, 4)).collect();
         for wave in 1..=WAVE_KNOTS {
             let last = last_in_wave(wave);
@@ -155,7 +171,7 @@ impl KernelSpec for PagedAttnBatchPrefillSpec {
         SweepGrid::new(vec![
             Axis::values(SEQ_KNOTS),
             config.tile_axis(),
-            Axis::values(PREFIX_KNOTS),
+            config.prefix_axis(),
         ])
     }
 

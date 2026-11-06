@@ -79,6 +79,7 @@ def test_supported_backends_filters_options_by_dtype():
     assert supported_backends("single_gemm", DType.FP8_E4M3) == [
         "deepgemm",
         "flashinfer_fp8_tensor",
+        "vllm_cutlass_fp8_tensor",
     ]
     # bmm_fp8's SM10x runners: per-tensor FP8 is not offered on Hopper.
     assert "flashinfer_fp8_tensor" not in supported_backends(
@@ -112,7 +113,8 @@ def test_trtllm_gen_paged_attention_is_blackwell_gated():
         assert backend_supports(kind, backend, fp8, fp8, gpu="NVIDIA B300")
         assert not backend_supports(kind, backend, fp8, fp8, gpu="NVIDIA H200")
         assert backend_supports(kind, backend, fp8, fp8)  # gpu=None → skip
-        assert supported_backends(kind, fp8, fp8, gpu="NVIDIA H200") == []
+        # Hopper serves FP8-KV paged attention through FlashAttention 3 instead.
+        assert supported_backends(kind, fp8, fp8, gpu="NVIDIA H200") == ["vllm_fa3"]
         assert supported_backends(kind, fp8, fp8, gpu="NVIDIA B200") == [backend]
 
 

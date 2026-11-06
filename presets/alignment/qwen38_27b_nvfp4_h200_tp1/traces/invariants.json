@@ -1,0 +1,66 @@
+{
+  "note": "The traces themselves are not committed: they are `shapes` x `repeats` from campaign.yaml, and `alignment-campaign check` regenerates and compares against this record. Written by `check --update-invariants`, which only ever ADDS a trace. Re-recording an existing one means deleting its entry here first, on purpose, in a reviewable diff.",
+  "schema_version": 1,
+  "traces": {
+    "traces/03_balanced_anchor_c32.csv": {
+      "arrival_span_ms": 127000.0,
+      "distinct_request_ids": 128,
+      "distinct_shapes": 8,
+      "input_tokens": 237568,
+      "max_input_len": 4096,
+      "max_output_len": 256,
+      "max_total_len": 4352,
+      "output_tokens": 24576,
+      "request_count": 128,
+      "sha256": "e8b380b002603482d02ac0773dc61c10731e137b08a89346c4c24c020911fe4c"
+    },
+    "traces/04_prefill_spectrum_c32.csv": {
+      "arrival_span_ms": 127000.0,
+      "distinct_request_ids": 128,
+      "distinct_shapes": 8,
+      "input_tokens": 387072,
+      "max_input_len": 7168,
+      "max_output_len": 64,
+      "max_total_len": 7232,
+      "output_tokens": 8192,
+      "request_count": 128,
+      "sha256": "421d3ebbb6fe63372ac3acf256f9961f156d7c7ddd81e697ec51cf8472076912"
+    },
+    "traces/05_decode_spectrum_c64.csv": {
+      "arrival_span_ms": 127000.0,
+      "distinct_request_ids": 128,
+      "distinct_shapes": 8,
+      "input_tokens": 36864,
+      "max_input_len": 1024,
+      "max_output_len": 4096,
+      "max_total_len": 5120,
+      "output_tokens": 223488,
+      "request_count": 128,
+      "sha256": "631253c98ac0c7ad04a044ff536edbccfbc8e702342e6a4fe3f093623aceb223"
+    },
+    "traces/11_long_prefill_ladder_c1.csv": {
+      "arrival_span_ms": 19000.0,
+      "distinct_request_ids": 20,
+      "distinct_shapes": 10,
+      "input_tokens": 1073152,
+      "max_input_len": 122880,
+      "max_output_len": 64,
+      "max_total_len": 122944,
+      "output_tokens": 800,
+      "request_count": 20,
+      "sha256": "6226c5c02c98f5c847de1e73fd9124c5540e2aabe3110aba47dd57eaf775941c"
+    },
+    "traces/11_long_prefill_ladder_c1.nsys.csv": {
+      "arrival_span_ms": 6000.0,
+      "distinct_request_ids": 7,
+      "distinct_shapes": 7,
+      "input_tokens": 200704,
+      "max_input_len": 65536,
+      "max_output_len": 64,
+      "max_total_len": 65552,
+      "output_tokens": 256,
+      "request_count": 7,
+      "sha256": "00f9aae287d1e03913bd17b019ce93b1dc467fcc86e060bab6a13b9f9c460299"
+    }
+  }
+}
