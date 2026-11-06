@@ -99,6 +99,7 @@ markers = [
     "gpu: requires a CUDA device",
     "needs_binary: requires the built simulator binary (release)",
     "needs_db: requires warm profile.db rows for the config under test",
+    "needs_vllm_fork: requires the alignment/profiler/vllm submodule checkout",
     "agent: Codex runner+judge tier (opt-in: --run-agent)",
     "bench: perf/timing, non-deterministic (opt-in: -m bench)",
     "presets: builds every public member through the simulator (just test-presets)",

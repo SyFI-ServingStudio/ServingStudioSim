@@ -7,6 +7,8 @@ ones the host can't run, so bare ``uv run pytest`` "just works" anywhere:
   - ``needs_binary`` requires the built ``simulator`` binary (release).
   - ``gpu``         requires a CUDA device.
   - ``needs_db``    requires warm ``profile.db`` rows for the config under test.
+  - ``needs_vllm_fork`` requires the ``alignment/profiler/vllm`` submodule checkout
+                    (the pinned vLLM fork whose alignment records the tests consume).
   - ``agent``       Codex runner+judge runtime — opt-in only (``--run-agent``).
   - ``bench``       perf/timing, non-deterministic — opt-in only (``-m bench``).
 
@@ -69,6 +71,9 @@ _TIER_MARKERS = {
 # is shared rather than duplicated on either side.
 assert GOLDEN_ROOT == Path(__file__).resolve().parent / "golden"
 
+# The pinned vLLM fork is a submodule a plain worktree does not initialize.
+VLLM_FORK = Path(__file__).resolve().parents[1] / "alignment/profiler/vllm"
+
 
 # ── registration + CLI options ───────────────────────────────────────────────
 
@@ -108,10 +113,11 @@ def _detect_gpu_name() -> str | None:
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Skip tiers the host can't (or wasn't asked to) run. Capability tiers
-    (gpu/needs_binary/needs_db) auto-skip on absence; expensive tiers
+    (gpu/needs_binary/needs_db/needs_vllm_fork) auto-skip on absence; expensive tiers
     (agent/bench) are skipped unless explicitly opted in."""
     has_cuda = _cuda_available()
     has_binary = binary_path("release").is_file()
+    has_vllm_fork = (VLLM_FORK / "vllm").is_dir()
     markexpr = config.getoption("markexpr") or ""
     run_agent = config.getoption("--run-agent")
     bench_requested = "bench" in markexpr
@@ -121,6 +127,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         "needs_binary": None if has_binary else pytest.mark.skip(
             reason="release simulator not built (uv run cargo build --release -p simulator)"),
         "needs_db": None,  # presence is config-specific; the test asserts/skips itself
+        "needs_vllm_fork": None if has_vllm_fork else pytest.mark.skip(
+            reason="vLLM fork submodule not checked out "
+            "(git submodule update --init alignment/profiler/vllm)"),
         "agent": None if run_agent else pytest.mark.skip(reason="agent tier opt-in (--run-agent)"),
         "bench": None if bench_requested else pytest.mark.skip(reason="bench tier opt-in (-m bench)"),
     }

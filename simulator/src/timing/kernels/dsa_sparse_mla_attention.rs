@@ -1,13 +1,12 @@
 //! DSA sparse MLA attention kernel.
 //!
-//! The cache uses physical `(num_queries, num_cache_tokens)` coordinates. The
-//! static `valid_counts_pattern` deterministically derives Python's canonical
+//! The input is the physical `(num_queries, num_cache_tokens)` pair; every
+//! pattern but causal tail (below) caches on it directly. The static
+//! `valid_counts_pattern` deterministically derives Python's canonical
 //! flattened valid-slot-count RLE during enumeration; RLE text is never a cache
 //! coordinate. The first R.4 gate found pattern-specific interpolation defects:
-//! uniform adds S6/S11/S91, causal pins its domain boundary and scattered-cache
-//! misses, and speculative removes unsupported odd-Q grid holes while adding
-//! Q134/Q266 and S3/S23/S45/S182. Cache math and the public query contract are
-//! unchanged.
+//! uniform adds S6/S11/S91, and speculative removes unsupported odd-Q grid
+//! holes while adding Q134/Q266 and S3/S23/S45/S182.
 //!
 //! A speculative verify step submits one group of `next_n` query rows per
 //! request, so the group width is a physical property of the pattern rather than
@@ -21,12 +20,21 @@
 //! (`selected_k`). `ValidCountsPattern::PooledUniformFull` carries the pooling
 //! so decode derives `u:min(ctx, index_topk + index_kpool - 1)` instead of
 //! clipping at the page-table width, and sweeps its own smaller grid.
+//!
+//! A causal-tail (prefill) call caches over `(num_queries, prefix)`, where
+//! `prefix = num_cache_tokens - num_queries`, not over the physical pair. Row
+//! `i` of a chunk sees `min(prefix + 1 + i, k)` slots, so the gathered count
+//! bends where the ramp saturates at `prefix = k - 1` for every query count,
+//! and every cell is a real chunk. On the physical `(q, s)` grid that bend
+//! slides along `s = q + k - 1` and the `q > s` half is empty: B200 GLM-5.3 PP4
+//! chunks between grid rows read 6-14% fast against fresh measurements
+//! (`(4096, 5254)` 0.774 vs 0.866 ms, `(4585, 5683)` 0.837 vs 0.973 ms).
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
-use crate::timing::{Dim, KernelConfig, SweepCoords};
+use crate::timing::{Coords, Dim, KernelConfig, SweepCoords};
 
 const UNIFORM_QUERY_AXIS: [u32; 27] = [
     1, 2, 4, 8, 16, 32, 64, 127, 128, 129, 131, 132, 133, 255, 256, 257, 263, 264, 265, 512, 1024,
@@ -40,10 +48,16 @@ const CAUSAL_QUERY_AXIS: [u32; 37] = [
     1, 2, 3, 4, 6, 8, 11, 16, 23, 32, 45, 64, 90, 127, 128, 129, 130, 131, 132, 133, 200, 254, 255,
     256, 257, 258, 263, 264, 265, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
 ];
-const CAUSAL_CACHE_AXIS: [u32; 41] = [
-    1, 2, 3, 4, 6, 8, 11, 16, 23, 32, 45, 63, 64, 65, 90, 127, 128, 129, 130, 182, 200, 255, 256,
-    260, 511, 512, 513, 724, 1024, 2047, 2048, 2049, 4096, 8192, 16384, 32768, 65536, 131072,
-    262144, 524288, 1048576,
+/// Causal-tail prefix (`num_cache_tokens - num_queries`) points. Up to the
+/// `selected_k` cap the gathered count is linear in the prefix, then bends over
+/// the last `num_queries` tokens before the cap; 256-token steps keep that bend
+/// within a fraction of a percent. `causal_prefix_axis` adds the cap point
+/// `selected_k - 1`, past which only the gather footprint grows. The last point
+/// is the 1,048,576-token context domain minus the largest query count, so
+/// every cell is a context the arch can hold and none needs a mask.
+const CAUSAL_PREFIX_AXIS: [u32; 27] = [
+    0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768, 1024, 1280, 1536, 1792, 2048, 4096, 8192,
+    16384, 32768, 65536, 131072, 262144, 524288, 983040,
 ];
 const SPECULATIVE_QUERY_AXIS: [u32; 20] = [
     2, 4, 8, 16, 32, 64, 128, 132, 134, 256, 264, 266, 512, 1024, 2048, 4096, 8192, 16384, 32768,
@@ -179,9 +193,10 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
             ValidCountsPattern::UniformFull => {
                 (UNIFORM_QUERY_AXIS.to_vec(), UNIFORM_CACHE_AXIS.to_vec())
             }
-            ValidCountsPattern::CausalTail => {
-                (CAUSAL_QUERY_AXIS.to_vec(), CAUSAL_CACHE_AXIS.to_vec())
-            }
+            ValidCountsPattern::CausalTail => (
+                CAUSAL_QUERY_AXIS.to_vec(),
+                causal_prefix_axis(config.selected_k),
+            ),
             ValidCountsPattern::SpeculativeGroups { group_size } => (
                 speculative_query_axis(group_size),
                 speculative_cache_axis(group_size, config.selected_k),
@@ -210,6 +225,16 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
         CacheKind::Cache2DLinear(Extrapolation::Weighted)
     }
 
+    fn cache_coords(config: &Self::Config, input: &Self::Input) -> Coords {
+        match config.valid_counts_pattern {
+            ValidCountsPattern::CausalTail => Coords::new([
+                f64::from(input.num_queries),
+                f64::from(input.num_cache_tokens.saturating_sub(input.num_queries)),
+            ]),
+            _ => input.coords(),
+        }
+    }
+
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         // TRTLLM-gen rejects the 65,536-query launch on B200. Production caps
         // one iteration far below that, so 32,768 remains a generous measured
@@ -221,9 +246,9 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
             ValidCountsPattern::UniformFull | ValidCountsPattern::PooledUniformFull { .. } => {
                 grid.expand_2d(|num_queries, _| trtllm_query_too_large(num_queries))
             }
-            ValidCountsPattern::CausalTail => grid.expand_2d(|num_queries, num_cache_tokens| {
-                num_queries > num_cache_tokens || trtllm_query_too_large(num_queries)
-            }),
+            ValidCountsPattern::CausalTail => {
+                grid.expand_2d(|num_queries, _| trtllm_query_too_large(num_queries))
+            }
             ValidCountsPattern::SpeculativeGroups { group_size } => {
                 grid.expand_2d(|num_queries, _| {
                     num_queries as u32 % group_size != 0 || trtllm_query_too_large(num_queries)
@@ -241,9 +266,13 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
             config.softmax_scale_denominator > 0,
             "softmax_scale_denominator must be positive"
         );
-        grid.expand_2d(|num_queries, num_cache_tokens| {
+        grid.expand_2d(|num_queries, second| {
             let num_queries = num_queries as u32;
-            let num_cache_tokens = num_cache_tokens as u32;
+            // The causal-tail grid's second axis is the prefix before the chunk.
+            let num_cache_tokens = match config.valid_counts_pattern {
+                ValidCountsPattern::CausalTail => num_queries + second as u32,
+                _ => second as u32,
+            };
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("num_queries", num_queries)
@@ -469,6 +498,16 @@ fn canonical_speculative_counts(q: u32, s: u32, k: u32, group_size: u32) -> Stri
     format!("g:({counts})x{}", q / group_size)
 }
 
+/// Causal-tail prefix axis: the fixed points plus the saturation point
+/// `selected_k - 1`, where the last row first reaches the cap.
+fn causal_prefix_axis(selected_k: u32) -> Vec<u32> {
+    let mut axis = CAUSAL_PREFIX_AXIS.to_vec();
+    axis.push(selected_k.saturating_sub(1));
+    axis.sort_unstable();
+    axis.dedup();
+    axis
+}
+
 /// Pooled context axis: the fixed points plus `index_topk` (last unsaturated
 /// power-of-two anchor) and the saturating cap, so the linear cache never
 /// interpolates across the point where the count stops growing.
@@ -490,9 +529,9 @@ register_kernel!(DsaSparseMlaAttentionKernel, DsaSparseMlaAttentionSpec);
 mod tests {
     use super::ValidCountsPattern;
     use super::{
-        canonical_valid_counts, speculative_cache_axis, speculative_query_axis,
+        canonical_valid_counts, causal_prefix_axis, speculative_cache_axis, speculative_query_axis,
         DsaSparseMlaAttentionKernelConfig, DsaSparseMlaAttentionKernelInput,
-        DsaSparseMlaAttentionSpec, CAUSAL_CACHE_AXIS, CAUSAL_QUERY_AXIS, SPECULATIVE_CACHE_AXIS,
+        DsaSparseMlaAttentionSpec, CAUSAL_QUERY_AXIS, SPECULATIVE_CACHE_AXIS,
         SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS, UNIFORM_QUERY_AXIS,
     };
     use crate::timing::bridge::{ArgsPayload, DType};
@@ -604,8 +643,8 @@ mod tests {
         assert_grid(
             ValidCountsPattern::CausalTail,
             &CAUSAL_QUERY_AXIS,
-            &CAUSAL_CACHE_AXIS,
-            1_517,
+            &causal_prefix_axis(2048),
+            1_036,
         );
         assert_grid(
             ValidCountsPattern::SpeculativeGroups { group_size: 2 },
@@ -614,17 +653,23 @@ mod tests {
             620,
         );
 
-        // Every pattern's cache axis now reaches the arch's full 1,048,576-token
-        // timing domain, and every query axis reaches 65,536.
+        // Every pattern's cache axis reaches the arch's full 1,048,576-token
+        // timing domain, and every query axis reaches 65,536. Causal tail gets
+        // there as the largest chunk over the largest prefix.
         for pattern in [
             ValidCountsPattern::UniformFull,
-            ValidCountsPattern::CausalTail,
             ValidCountsPattern::SpeculativeGroups { group_size: 2 },
         ] {
             let grid = DsaSparseMlaAttentionSpec::sweep_grid(&config(pattern));
             assert_eq!(grid.axes()[0].last(), Some(&65536.0));
             assert_eq!(grid.axes()[1].last(), Some(&1_048_576.0));
         }
+        let causal = DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::CausalTail));
+        assert_eq!(
+            causal.axes()[0].last().unwrap() + causal.axes()[1].last().unwrap(),
+            1_048_576.0
+        );
+        assert_eq!(causal.axes()[1].first(), Some(&0.0));
 
         let uniform =
             DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::UniformFull));
@@ -635,13 +680,20 @@ mod tests {
         assert_contiguous(&uniform.axes()[1], &[65, 91, 127]);
         assert_contiguous(&uniform.axes()[1], &[2047, 2048, 2049]);
 
-        let causal = DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::CausalTail));
         assert_contiguous(&causal.axes()[0], &[1, 2, 3, 4, 6, 8, 11]);
         assert_contiguous(&causal.axes()[0], &[127, 128, 129, 130, 131, 132, 133]);
         assert_contiguous(&causal.axes()[0], &[254, 255, 256, 257, 258, 263, 264, 265]);
-        assert_contiguous(&causal.axes()[1], &[127, 128, 129, 130, 182, 200]);
-        assert_contiguous(&causal.axes()[1], &[255, 256, 260, 511, 512, 513, 724]);
-        assert_contiguous(&causal.axes()[1], &[2047, 2048, 2049]);
+        // The cap point sits between the 256-step bend points and the footprint tail.
+        assert_contiguous(&causal.axes()[1], &[1536, 1792, 2047, 2048, 4096]);
+        assert_eq!(
+            causal_prefix_axis(2176)
+                .iter()
+                .skip_while(|&&prefix| prefix < 2048)
+                .take(3)
+                .copied()
+                .collect::<Vec<_>>(),
+            [2048, 2175, 4096]
+        );
 
         let speculative =
             DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::SpeculativeGroups {
@@ -666,18 +718,9 @@ mod tests {
 
         let causal_grid =
             DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::CausalTail));
+        // Every (chunk, prefix) cell is a real call inside the context domain.
         let causal = mask_for(ValidCountsPattern::CausalTail, &causal_grid);
-        assert_mask_split(&causal, 858, 659);
-        assert!(!masked(&causal, &causal_grid, 3, 3));
-        assert!(!masked(&causal, &causal_grid, 3, 4));
-        assert!(masked(&causal, &causal_grid, 3, 2));
-        assert!(!masked(&causal, &causal_grid, 132, 182));
-        assert!(masked(&causal, &causal_grid, 200, 182));
-        assert!(!masked(&causal, &causal_grid, 255, 255));
-        assert!(masked(&causal, &causal_grid, 256, 255));
-        assert!(!masked(&causal, &causal_grid, 4096, 131072));
-        assert!(!masked(&causal, &causal_grid, 65536, 1_048_576));
-        assert!(masked(&causal, &causal_grid, 65536, 32768));
+        assert_mask_split(&causal, 1_036, 0);
 
         let speculative_grid =
             DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::SpeculativeGroups {
@@ -703,8 +746,46 @@ mod tests {
         let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
         let mask = DsaSparseMlaAttentionSpec::infeasible_mask(&cfg, &grid);
 
-        assert!(!masked(&mask, &grid, 32768, 1_048_576));
-        assert!(masked(&mask, &grid, 65536, 1_048_576));
+        // The causal grid's second axis is the prefix.
+        assert!(!masked(&mask, &grid, 32768, 983_040));
+        assert!(masked(&mask, &grid, 65536, 983_040));
+        assert!(masked(&mask, &grid, 65536, 0));
+    }
+
+    #[test]
+    fn causal_tail_caches_on_query_count_and_prefix() {
+        let causal = config(ValidCountsPattern::CausalTail);
+        let chunk = DsaSparseMlaAttentionKernelInput {
+            num_queries: 4096,
+            num_cache_tokens: 5254,
+        };
+        assert_eq!(
+            &*DsaSparseMlaAttentionSpec::cache_coords(&causal, &chunk),
+            &[4096.0, 1158.0]
+        );
+        // Other patterns keep the physical pair.
+        let uniform = config(ValidCountsPattern::UniformFull);
+        assert_eq!(
+            &*DsaSparseMlaAttentionSpec::cache_coords(&uniform, &chunk),
+            &[4096.0, 5254.0]
+        );
+
+        // Each (chunk, prefix) cell profiles the chunk over prefix + chunk tokens.
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&causal);
+        let payloads = DsaSparseMlaAttentionSpec::enumerate(&causal, &grid, FLASHMLA_BACKEND);
+        for (q, prefix, valid_counts) in [
+            (1, 0, "u:1x1"),
+            (3, 0, "r:1..3"),
+            (128, 1792, "r:1793..1920"),
+            (128, 2047, "u:2048x128"),
+            (4096, 0, "c:1..4096@2048"),
+            (4096, 1024, "c:1025..5120@2048"),
+            (4096, 2047, "u:2048x4096"),
+            (65536, 983_040, "u:2048x65536"),
+        ] {
+            let payload = payload_for(&payloads, &grid, q, prefix);
+            assert_payload(payload, q, q + prefix, valid_counts.to_string());
+        }
     }
 
     const TRTLLM_BACKEND: &str = "flashinfer_trtllm_fp8";
@@ -1103,9 +1184,9 @@ mod tests {
 
     #[test]
     fn enumeration_emits_backend_plus_the_exact_python_schema() {
+        // Causal tail's (chunk, prefix) payloads: causal_tail_caches_on_query_count_and_prefix.
         for (pattern, expected_payloads) in [
             (ValidCountsPattern::UniformFull, 810),
-            (ValidCountsPattern::CausalTail, 1_517),
             (ValidCountsPattern::SpeculativeGroups { group_size: 2 }, 620),
         ] {
             let cfg = config(pattern);
@@ -1173,20 +1254,6 @@ mod tests {
             &[(132, 6), (132, 11), (132, 91), (131, 8192), (133, 8192)],
         );
         assert_critical_payloads(
-            ValidCountsPattern::CausalTail,
-            &[
-                (3, 3),
-                (132, 182),
-                (32, 511),
-                (32, 513),
-                (255, 724),
-                (130, 130),
-                (254, 255),
-                (258, 260),
-                (4096, 1),
-            ],
-        );
-        assert_critical_payloads(
             ValidCountsPattern::SpeculativeGroups { group_size: 2 },
             &[
                 (32, 3),
@@ -1220,17 +1287,17 @@ mod tests {
             );
 
             assert_eq!(uniform.len(), 810);
-            assert_eq!(causal.len(), 858);
+            assert_eq!(causal.len(), 1_036);
             assert_eq!(speculative.len(), 620);
-            assert_eq!(uniform.intersection(&causal).count(), 249);
+            assert_eq!(uniform.intersection(&causal).count(), 14);
             assert_eq!(uniform.intersection(&speculative).count(), 180);
-            assert_eq!(causal.intersection(&speculative).count(), 168);
+            assert_eq!(causal.intersection(&speculative).count(), 11);
             assert_eq!(
                 uniform
                     .intersection(&causal)
                     .filter(|payload| speculative.contains(*payload))
                     .count(),
-                148
+                8
             );
 
             memberships += uniform.len() + causal.len() + speculative.len();
@@ -1239,12 +1306,12 @@ mod tests {
                 .chain(causal)
                 .chain(speculative)
                 .collect();
-            assert_eq!(per_distribution.len(), 1_839);
+            assert_eq!(per_distribution.len(), 2_269);
             all_distributions.extend(per_distribution);
         }
 
-        assert_eq!(memberships, 9_152);
-        assert_eq!(all_distributions.len(), 7_356);
+        assert_eq!(memberships, 9_864);
+        assert_eq!(all_distributions.len(), 9_076);
     }
 
     fn rich_dim(name: &str, value: u32) -> Value {

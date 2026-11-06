@@ -67,6 +67,7 @@ def extract(tmp_path, row):
     return json.loads(output.read_text())
 
 
+@pytest.mark.needs_vllm_fork
 def test_spec5_progress_round_trips_with_reordered_output(request_details, tmp_path):
     output = SimpleNamespace(
         req_id_to_index={"decode-b": 0, "decode-a": 1},
@@ -82,6 +83,7 @@ def test_spec5_progress_round_trips_with_reordered_output(request_details, tmp_p
     assert [request["request_id"] for request in progress] == ["decode-a", "decode-b"]
 
 
+@pytest.mark.needs_vllm_fork
 def test_zero_sampled_output_does_not_invent_a_bonus_token(request_details, tmp_path):
     output = SimpleNamespace(
         req_id_to_index={"decode-a": 0, "decode-b": 1}, sampled_token_ids=[[], []]
@@ -90,6 +92,7 @@ def test_zero_sampled_output_does_not_invent_a_bonus_token(request_details, tmp_
     assert [request["emitted_tokens"] for request in result["decode_request_progress"]] == [0, 0]
 
 
+@pytest.mark.needs_vllm_fork
 def test_async_placeholders_do_not_advance_confirmed_progress(request_details, tmp_path):
     batch = scheduled_batch()
     batch.scheduled_cached_reqs.num_output_tokens = [68, 0, 3, 15]
@@ -109,6 +112,7 @@ def test_async_placeholders_do_not_advance_confirmed_progress(request_details, t
     assert finished["emitted_tokens"] == 1
 
 
+@pytest.mark.needs_vllm_fork
 @pytest.mark.parametrize("randomized", [False, True])
 def test_internal_id_normalization_preserves_a_client_hex_suffix(
     request_details, tmp_path, randomized,
@@ -133,6 +137,7 @@ def test_internal_id_normalization_preserves_a_client_hex_suffix(
     assert result["decode_request_progress"][0]["request_id"] == "client-deadbeef"
 
 
+@pytest.mark.needs_vllm_fork
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -177,6 +182,7 @@ def test_speculative_input_rejects_missing_or_mismatched_arch_depth_before_io(tm
     assert not request.output_dir.exists()
 
 
+@pytest.mark.needs_vllm_fork
 def test_producer_rejects_missing_or_impossible_output(request_details):
     with pytest.raises(ValueError, match="requires model output"):
         request_details(scheduled_batch(), None)
@@ -187,6 +193,7 @@ def test_producer_rejects_missing_or_impossible_output(request_details):
         request_details(scheduled_batch(), output)
 
 
+@pytest.mark.needs_vllm_fork
 @pytest.mark.parametrize(
     "arch_type", ["glm52_vllm_nvfp4_dsa_moe_speculative", "another_chain_model"]
 )
