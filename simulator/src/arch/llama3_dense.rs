@@ -70,7 +70,7 @@ pub struct Llama3DenseResolved {
 pub struct Llama3DenseModel {
     pub name: String,
     pub num_layers: u32,
-    /// Per-token KV bytes over one KV partition, for the KV cache layout.
+    /// The attention KV as one cache part, placed on the KV partition's ranks.
     pub kv_cache_part: KvCachePart,
     pub pre_attn: PreAttnLocalWorklet,
     pub attn: AttnLocalWorklet,

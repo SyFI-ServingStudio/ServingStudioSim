@@ -27,7 +27,7 @@ The answer has two halves, and each comes from a different block of the config:
 | Intrinsic size, per-GPU size and amplification (replication across TP ranks, engine overhead) | the same `--kv-report`: the per-request table's `one copy` / `amplified` columns and the replication line; in JSON `result.one_copy_bytes_at_max_model_len` / `bytes_at_max_model_len` / `per_gpu_bytes_at_max_model_len`, `replication_at_max_model_len`, `amplification_at_max_model_len`, per part `request_parts[].one_copy_bytes` / `bytes` / `per_gpu_bytes`, and per entry `layout.parts[].one_copy_bytes_per_entry` / `bytes_per_entry` / `per_gpu_bytes_per_entry` with `placement`. Read these three sizes as given rather than dividing by `attention_shards`. |
 | A what-if (budget, context, overhead mode, chunk size) | the same, with `--override`, e.g. `pools.main.groups.0.worker.attn_gpu_memory_gb=100`, `pools.main.groups.0.arch.max_model_len=131072`, `pools.main.groups.0.worker.kv_overhead=none` |
 | What a finished run used | `<log_dir>/raw/kv_cache.json` (fields: `simulator/src/log/README.md`) |
-| The arch's layout alone | `simulator cost-trees <blocks.json>` (a JSON list of `{gpu, arch}`): each build's `kv_cache {attention_shards, layout}`. Bytes are over one partition; divide by `attention_shards` for one GPU. |
+| The arch's layout alone | `simulator cost-trees <blocks.json>` (a JSON list of `{gpu, arch}`): each build's `kv_cache {attention_shards, layout}`. Each part gives one entry's `one_copy_bytes_per_entry`, `per_gpu_bytes_per_entry` and `bytes_per_entry` (over the partition); read them as given. |
 
 Quote the printed numbers and the per-part split ("One request at max_model_len
 N in vLLM's estimate, per GPU"); do not re-derive them. The report prints the concurrency under both
@@ -49,15 +49,21 @@ often not the weight dtype.
    `gpu_memory_utilization`, minus the weights (mind their dtype), activations
    and CUDA graphs. Say which reserves you assumed.
 2. **Parts.** Classify each tensor that persists between decode steps into one
-   part, listing its layers and its bytes per entry on one GPU:
-   - per token: GQA K/V (`max(num_kv_heads, tp)` heads over the TP group, since
-     replicated heads are still stored), MLA latent plus RoPE key, a DSA indexer key or a
-     compressed cache (one entry per `tokens_per_entry` tokens);
+   part, listing its layers and its bytes per entry **stored once** (the whole
+   model, every head once):
+   - per token: GQA K/V (`num_kv_heads` heads), MLA latent plus RoPE key, a DSA
+     indexer key or a compressed cache (one entry per `tokens_per_entry` tokens);
    - sliding window: SWA layers, a short-convolution window;
    - per request: GDN/KDA/Mamba recurrent and conv state, ring buffers.
 
-   Note whether a part is split across ranks (KV heads) or held whole on each
-   rank (MLA latent, recurrent state).
+   Then give each part its placement on the TP group, as the arch's
+   `RankPlacement { shards, replicas }` would: split across ranks (KV heads,
+   recurrent-state heads), or held whole on each rank (MLA latent, DSA indexer,
+   a single-head cache). GQA splits its heads over `min(num_kv_heads, tp)`
+   ranks and repeats each on `tp / num_kv_heads` ranks past that, so TP above
+   the head count stores the heads more than once. One GPU holds
+   `one copy × replicas / (shards × replicas)` of the part; the partition holds
+   `one copy × replicas`.
 3. **vLLM's overhead on top.** Add page padding (hybrid models unify page
    sizes), the block size, and extra state copies (one more per speculative
    block). With prefix caching on, `mamba_cache_mode: align` adds one more

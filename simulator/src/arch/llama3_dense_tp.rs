@@ -77,7 +77,7 @@ pub struct Llama3DenseTpModel {
     pub name: String,
     pub num_layers: u32,
     pub tp_size: u16,
-    /// Per-token KV bytes over one KV partition, for the KV cache layout.
+    /// The attention KV as one cache part, placed on the KV partition's ranks.
     pub kv_cache_part: KvCachePart,
     pub attn_block: AttnBlockTpWorklet,
     pub mlp_block: MlpBlockTpWorklet,

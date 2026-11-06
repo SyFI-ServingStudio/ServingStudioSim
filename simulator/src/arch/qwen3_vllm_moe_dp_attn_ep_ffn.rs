@@ -182,7 +182,7 @@ pub struct Qwen3VllmMoeDpAttnEpFfnModel {
     pub nvl_num_gpu: u16,
     pub top_k: u32,
     pub num_experts: u32,
-    /// Per-token KV bytes over one KV partition, for the KV cache layout.
+    /// The attention KV as one cache part, placed on the KV partition's ranks.
     pub kv_cache_part: KvCachePart,
     pub attn_block: VllmFp8AttnBlockTpWorklet,
     pub moe_router: VllmFp8MoeRouterLocalWorklet,
