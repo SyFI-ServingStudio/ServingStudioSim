@@ -9,6 +9,16 @@ from pathlib import Path
 
 from profiling.perf_api import DB_PATH
 
+# Startup runs one simulator subprocess per preset chunk, member and capture,
+# so it scales with the CPUs it may use (on a 256-core host: 8 jobs 677 s,
+# 64 jobs 371 s). The cap keeps a shared host usable while it starts.
+MAX_DEFAULT_JOBS = 64
+
+
+def default_jobs() -> int:
+    return max(1, min(MAX_DEFAULT_JOBS, len(os.sched_getaffinity(0))))
+
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -27,7 +37,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     serve.add_argument("--build-type", default="release", help="Simulator build to introspect.")
     serve.add_argument(
-        "--jobs", type=int, default=8, help="Presets built, and members checked, at once."
+        "--jobs",
+        type=int,
+        default=default_jobs(),
+        help="Presets built, and members checked, at once. Defaults to the CPUs this "
+        f"process may use, at most {MAX_DEFAULT_JOBS}.",
     )
     serve.add_argument(
         "--runs-dir",
