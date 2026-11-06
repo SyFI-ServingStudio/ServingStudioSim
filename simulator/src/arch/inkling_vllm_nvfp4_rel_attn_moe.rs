@@ -47,7 +47,7 @@ use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
     graph_padded_tokens, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
 };
 use crate::arch::inkling_model_cfg::{InklingExpertPrecision, InklingModelCfg};
-use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
+use crate::arch::kv_layout::{gqa_kv_bytes_per_token, gqa_placement, KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -811,7 +811,13 @@ pub fn build(
     let model_cfg = &cfg.model;
     let has_global = (0..model_cfg.num_layers).any(|layer| !model_cfg.is_local(layer));
     let mut model = InklingVllmModel {
-        embed: atomic(n, "embed", cfg.embed.clone(), ElementwiseKernel::build, bridge)?,
+        embed: atomic(
+            n,
+            "embed",
+            cfg.embed.clone(),
+            ElementwiseKernel::build,
+            bridge,
+        )?,
         log_scaling_tau: has_global
             .then(|| {
                 atomic(
@@ -824,7 +830,13 @@ pub fn build(
             })
             .transpose()?,
         groups,
-        lm_head: atomic(n, "lm_head", cfg.lm_head.clone(), SingleGemmKernel::build, bridge)?,
+        lm_head: atomic(
+            n,
+            "lm_head",
+            cfg.lm_head.clone(),
+            SingleGemmKernel::build,
+            bridge,
+        )?,
         logits_all_gather: atomic(
             n,
             "logits_all_gather",
@@ -874,7 +886,7 @@ fn kv_cache_layout(model: &InklingModelCfg, tp_size: u16) -> KvCacheLayout {
             (model.num_key_value_heads, model.head_dim)
         };
         let (kv_heads, head_dim) = (u64::from(kv_heads), u64::from(head_dim));
-        let attn = gqa_kv_bytes_per_token(1, kv_heads, head_dim, head_dim, bf16, tp);
+        let attn = gqa_kv_bytes_per_token(1, kv_heads, head_dim, head_dim, bf16);
         if local {
             swa += attn;
         } else {
@@ -884,19 +896,32 @@ fn kv_cache_layout(model: &InklingModelCfg, tp_size: u16) -> KvCacheLayout {
         conv += kv_heads * conv_row * bf16;
         conv_padded += kv_heads * conv_row.next_power_of_two() * bf16;
     }
+    let global_placement = gqa_placement(u64::from(model.num_key_value_heads), tp);
+    let swa_placement = gqa_placement(u64::from(model.swa_num_key_value_heads), tp);
     let mut layout = KvCacheLayout::new();
     if global > 0 {
-        layout = layout.with_part(KvCachePart::per_token("global_attn", global));
+        layout = layout
+            .with_part(KvCachePart::per_token("global_attn", global).placed(global_placement));
     }
     if swa > 0 {
-        layout = layout.with_part(KvCachePart::sliding_window(
-            "swa_attn",
-            model.sliding_window_size,
-            swa,
-        ));
+        layout = layout.with_part(
+            KvCachePart::sliding_window("swa_attn", model.sliding_window_size, swa)
+                .placed(swa_placement),
+        );
     }
+    // The conv rows of both layer types share one part, so it takes the
+    // placement of the type with fewer KV heads. That is exact whenever TP does
+    // not exceed either head count (every shipped preset: 8/16 and 8/8 heads at
+    // TP <= 8); beyond it the global layers' conv repeat count is overstated.
+    let conv_placement = if global_placement.replicas >= swa_placement.replicas {
+        global_placement
+    } else {
+        swa_placement
+    };
     layout.with_part(
-        KvCachePart::sliding_window("sconv", model.sconv_kernel_size, conv).padded_to(conv_padded),
+        KvCachePart::sliding_window("sconv", model.sconv_kernel_size, conv)
+            .padded_to(conv_padded)
+            .placed(conv_placement),
     )
 }
 
@@ -942,7 +967,12 @@ impl InklingVllmModel {
             group.eval(&batch, tokens, sinks_overlap, ev);
         }
         let logits = batch.request_count;
-        push_or_zero(&self.lm_head, SingleGemmKernelInput { m: logits }, false, ev);
+        push_or_zero(
+            &self.lm_head,
+            SingleGemmKernelInput { m: logits },
+            false,
+            ev,
+        );
         let gathered = u64::from(logits) * u64::from(self.vocab_size) * 2;
         push_or_zero(
             &self.logits_all_gather,
@@ -1046,7 +1076,9 @@ impl IterwiseUnifiedModel for InklingVllmModel {
 /// breakable piecewise graph captured with the sinks inline, and a step above
 /// the largest captured size runs eagerly (aux stream again).
 fn sinks_on_aux_stream(batch: &NormalizedBatch, padded_tokens: u32, capture_sizes: &[u32]) -> bool {
-    let eager = capture_sizes.last().is_none_or(|&largest| batch.total_tokens > largest);
+    let eager = capture_sizes
+        .last()
+        .is_none_or(|&largest| batch.total_tokens > largest);
     padded_tokens <= SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD && (batch.is_uniform_decode() || eager)
 }
 
@@ -1093,7 +1125,8 @@ fn normalize_input(
             input.groups.len()
         ));
     };
-    let mut pairs = Vec::with_capacity(group.prefill_chunk_pairs.len() + group.decode_kv_lens.len());
+    let mut pairs =
+        Vec::with_capacity(group.prefill_chunk_pairs.len() + group.decode_kv_lens.len());
     let mut prefill_tokens = 0_u32;
     for (request, &(prefix, append)) in group.prefill_chunk_pairs.iter().enumerate() {
         if append == 0 {
@@ -1383,7 +1416,10 @@ mod tests {
     }
 
     fn step(prefill_chunk_pairs: Vec<(u32, u32)>, decode_kv_lens: Vec<u32>) -> NormalizedBatch {
-        let prefill_tokens = prefill_chunk_pairs.iter().map(|&(_, append)| append).sum::<u32>();
+        let prefill_tokens = prefill_chunk_pairs
+            .iter()
+            .map(|&(_, append)| append)
+            .sum::<u32>();
         let decode_tokens = decode_kv_lens.len() as u32;
         let input = UnifiedArchInput {
             groups: vec![ArchGroupInput {
@@ -1421,7 +1457,10 @@ mod tests {
         assert!(!sinks_overlap(&step(vec![(0, 2020)], vec![400; 8]), &sizes));
         // A step above the largest captured size runs eagerly: the aux stream
         // is back while it stays within the threshold.
-        assert!(sinks_overlap(&step(vec![(0, 40)], vec![]), &[1, 2, 4, 8, 16, 32]));
+        assert!(sinks_overlap(
+            &step(vec![(0, 40)], vec![]),
+            &[1, 2, 4, 8, 16, 32]
+        ));
     }
 
     #[test]
@@ -1457,10 +1496,16 @@ mod tests {
             ..Default::default()
         };
         let batch = normalize_input(&input, 8192).unwrap();
-        assert_eq!(batch.query_context_pairs, [(1990, 2502), (1, 3000), (1, 17)]);
+        assert_eq!(
+            batch.query_context_pairs,
+            [(1990, 2502), (1, 3000), (1, 17)]
+        );
         assert_eq!((batch.total_tokens, batch.request_count), (1992, 3));
         // Outside attention, the step runs on the next captured graph size.
-        assert_eq!(graph_padded_tokens(&parallel().cudagraph_capture_sizes, 25), 32);
+        assert_eq!(
+            graph_padded_tokens(&parallel().cudagraph_capture_sizes, 25),
+            32
+        );
         let too_long = UnifiedArchInput {
             groups: vec![ArchGroupInput {
                 batch_tokens: 1,

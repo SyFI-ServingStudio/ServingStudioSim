@@ -1410,8 +1410,7 @@ fn kv_cache_layout(tp_size: u16, mtp_mode: Glm52MtpMode) -> KvCacheLayout {
         Glm52MtpMode::FullIndex => (1, 1),
         Glm52MtpMode::IndexShare => (1, 0),
     };
-    mla_dsa_kv_cache_layout(NUM_LAYERS + mtp_mla, NUM_LAYERS + mtp_index)
-        .held_on_each_rank(u64::from(tp_size))
+    mla_dsa_kv_cache_layout(NUM_LAYERS + mtp_mla, NUM_LAYERS + mtp_index, tp_size)
 }
 
 #[cfg(test)]

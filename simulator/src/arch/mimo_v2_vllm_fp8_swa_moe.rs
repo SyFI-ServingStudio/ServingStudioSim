@@ -40,7 +40,7 @@ use anyhow::Result;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::graph_padded_tokens;
-use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
+use crate::arch::kv_layout::{gqa_kv_bytes_per_token, gqa_placement, KvCacheLayout, KvCachePart};
 use crate::arch::mimo_v2_model_cfg::{MimoV2AttnShape, MimoV2ModelCfg};
 use crate::common::Fabric;
 use crate::op::comm::{TpAllReduceRmsNormConfig, TpAllReduceRmsNormOp};
@@ -720,9 +720,10 @@ fn kv_cache_layout(
             u64::from(shape.head_dim),
             u64::from(shape.v_head_dim),
             elem,
-            tp,
         )
     };
+    let placement =
+        |shape: &MimoV2AttnShape| gqa_placement(u64::from(shape.num_key_value_heads), tp);
     let swa_layers = u64::from(model.swa_layer_ids.len() as u32);
     let global_layers = u64::from(model.num_layers) - swa_layers;
     let counts: Vec<u64> = [global_layers, swa_layers]
@@ -738,7 +739,7 @@ fn kv_cache_layout(
         if padded(global_layers) > global_layers {
             part = part.padded_to(padded(global_layers) * bytes);
         }
-        layout = layout.with_part(part);
+        layout = layout.with_part(part.placed(placement(&model.global_attn)));
     }
     if swa_layers > 0 {
         let bytes = layer_bytes(&model.swa_attn);
@@ -747,7 +748,7 @@ fn kv_cache_layout(
         if padded(swa_layers) > swa_layers {
             part = part.padded_to(padded(swa_layers) * bytes);
         }
-        layout = layout.with_part(part);
+        layout = layout.with_part(part.placed(placement(&model.swa_attn)));
     }
     if layout.parts.is_empty() {
         return Err(fit_failed("the model has no attention layers"));

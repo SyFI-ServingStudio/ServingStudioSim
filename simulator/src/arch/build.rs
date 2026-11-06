@@ -2824,6 +2824,18 @@ pub struct ArchKvCache {
     pub layout: KvCacheLayout,
 }
 
+impl ArchKvCache {
+    /// The arch's report half, rejecting a layout whose parts do not sit on
+    /// the partition's `attention_shards` ranks.
+    fn new(attention_shards: u16, layout: KvCacheLayout) -> Result<Self> {
+        layout.check_placement(attention_shards)?;
+        Ok(Self {
+            attention_shards,
+            layout,
+        })
+    }
+}
+
 /// What a structure-only build returns: the replica width, its prediction case
 /// shape, its cost tree and its KV cache.
 type Built = (
@@ -2948,10 +2960,8 @@ fn build_arch(
                             max_model_len: Some(selector.max_model_len()?),
                             ..PredictShape::new("speculative_iter", model.num_attn_dp_groups())
                         };
-                        let kv_cache = ArchKvCache {
-                            attention_shards: model.num_attn_shards(),
-                            layout: model.kv_cache_layout(),
-                        };
+                        let kv_cache =
+                            ArchKvCache::new(model.num_attn_shards(), model.kv_cache_layout())?;
                         (
                             model.gpus_per_replica(),
                             shape,
@@ -2965,10 +2975,8 @@ fn build_arch(
                             max_model_len: Some(selector.max_model_len()?),
                             ..PredictShape::new("iter", model.num_attn_dp_groups())
                         };
-                        let kv_cache = ArchKvCache {
-                            attention_shards: model.num_attn_shards(),
-                            layout: model.kv_cache_layout(),
-                        };
+                        let kv_cache =
+                            ArchKvCache::new(model.num_attn_shards(), model.kv_cache_layout())?;
                         (
                             model.gpus_per_replica(),
                             shape,
@@ -2995,10 +3003,7 @@ fn build_arch(
                     max_model_len: Some(selector.max_model_len()?),
                     ..PredictShape::new("attn", model.num_attn_dp_groups())
                 };
-                let kv_cache = ArchKvCache {
-                    attention_shards: model.num_attn_shards(),
-                    layout: model.kv_cache_layout(),
-                };
+                let kv_cache = ArchKvCache::new(model.num_attn_shards(), model.kv_cache_layout())?;
                 Ok((
                     model.gpus_per_replica(),
                     shape,
@@ -3858,7 +3863,7 @@ mod tests {
         );
         // total KV bytes: 2 (k+v) × kv_heads × head_dim × kv_dtype × layers.
         assert_eq!(
-            attn_cfgs.kv_bytes_per_token,
+            attn_cfgs.kv_cache_part.bytes_per_entry,
             2 * model.num_kv_heads.get() as u64
                 * model.head_dim.get() as u64
                 * model.kv_dtype.size_bytes() as u64
@@ -3904,7 +3909,7 @@ mod tests {
             q_dim * 1
         );
         assert_eq!(
-            attn_cfgs.kv_bytes_per_token,
+            attn_cfgs.kv_cache_part.bytes_per_entry,
             2 * model.num_kv_heads.get() as u64
                 * model.head_dim.get() as u64
                 * 1

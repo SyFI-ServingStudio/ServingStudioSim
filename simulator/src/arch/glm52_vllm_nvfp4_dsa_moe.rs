@@ -2669,19 +2669,27 @@ pub(crate) fn indexer_bytes_per_layer_token() -> u64 {
     u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes())
 }
 
-/// One rank's MLA latent and DSA index caches of `mla_layers` and
-/// `index_layers` layers. vLLM replicates both on every attention TP rank, so a
-/// TP group holds this layout on each rank.
-pub(crate) fn mla_dsa_kv_cache_layout(mla_layers: u32, index_layers: u32) -> KvCacheLayout {
+/// The MLA latent and DSA index caches of `mla_layers` and `index_layers`
+/// layers over an attention TP group of `attn_tp` ranks. vLLM and SGLang
+/// replicate both on every rank, so the group keeps `attn_tp` copies.
+pub(crate) fn mla_dsa_kv_cache_layout(
+    mla_layers: u32,
+    index_layers: u32,
+    attn_tp: u16,
+) -> KvCacheLayout {
+    let replicas = u32::from(attn_tp);
     KvCacheLayout::new()
-        .with_part(KvCachePart::per_token(
-            "mla",
-            u64::from(mla_layers) * mla_bytes_per_layer_token(),
-        ))
-        .with_part(KvCachePart::per_token(
-            "indexer",
-            u64::from(index_layers) * indexer_bytes_per_layer_token(),
-        ))
+        .with_part(
+            KvCachePart::per_token("mla", u64::from(mla_layers) * mla_bytes_per_layer_token())
+                .replicated(replicas),
+        )
+        .with_part(
+            KvCachePart::per_token(
+                "indexer",
+                u64::from(index_layers) * indexer_bytes_per_layer_token(),
+            )
+            .replicated(replicas),
+        )
 }
 
 /// The whole model's cache: the latent of all 78 body layers and the index key
@@ -2696,8 +2704,11 @@ pub(crate) fn kv_cache_layout(attn_tp: u16, mtp_mode: Glm52MtpMode) -> KvCacheLa
         Glm52MtpMode::Off => 0,
         Glm52MtpMode::FullIndex | Glm52MtpMode::IndexShare => NUM_MTP_LAYERS,
     };
-    mla_dsa_kv_cache_layout(NUM_LAYERS + mtp, FULL_INDEX_LAYERS.len() as u32 + mtp)
-        .held_on_each_rank(u64::from(attn_tp))
+    mla_dsa_kv_cache_layout(
+        NUM_LAYERS + mtp,
+        FULL_INDEX_LAYERS.len() as u32 + mtp,
+        attn_tp,
+    )
 }
 
 #[cfg(test)]

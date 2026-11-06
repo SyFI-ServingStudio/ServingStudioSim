@@ -15,7 +15,7 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::arch::kv_layout::KvGrowth;
+use crate::arch::kv_layout::{KvGrowth, RankPlacement};
 use crate::worker::kv::{KvCacheReport, KvOverhead};
 use crate::worker::GpuCluster;
 
@@ -193,6 +193,7 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
         "padded to",
         "copies",
         "prefix reuse",
+        "ranks",
     ])];
     for part in &layout.parts {
         rows.push(vec![
@@ -206,9 +207,10 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
                 .copies
                 .map_or(DASH.to_string(), |copies| copies.to_string()),
             if part.prefix_reusable { "yes" } else { "no" }.to_string(),
+            placement(part.placement),
         ]);
     }
-    write_table(out, &rows, &[L, L, R, R, R, L]);
+    write_table(out, &rows, &[L, L, R, R, R, L, L]);
     let _ = writeln!(
         out,
         "    engine: block {}, fixed {}",
@@ -242,7 +244,14 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
         grouped(u64::from(max_model_len))
     );
     let total: u64 = result.request_parts.iter().map(|part| part.bytes).sum();
-    let mut rows = vec![row(&["part", "holds", "bytes", "share"])];
+    let mut rows = vec![row(&[
+        "part",
+        "holds",
+        "bytes",
+        "share",
+        "one copy",
+        "amplified",
+    ])];
     for ((part, held), charge) in layout
         .parts
         .iter()
@@ -300,6 +309,8 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
             holds,
             human_bytes(per_gpu(held.bytes)),
             percent(held.bytes, total),
+            human_bytes(held.one_copy_bytes as f64),
+            amplified(held.bytes, held.one_copy_bytes),
         ]);
     }
     if result.request_parts.len() > 1 {
@@ -308,9 +319,30 @@ fn write_report(out: &mut String, report: &KvCacheReport, partitions: usize) {
             String::new(),
             human_bytes(per_gpu(total)),
             String::new(),
+            result
+                .one_copy_bytes_at_max_model_len
+                .map_or(DASH.to_string(), |bytes| human_bytes(bytes as f64)),
+            result
+                .amplification_at_max_model_len
+                .map_or(DASH.to_string(), |value| format!("{value:.2}x")),
         ]);
     }
-    write_table(out, &rows, &[L, L, R, R]);
+    write_table(out, &rows, &[L, L, R, R, R, R]);
+    if let (Some(replication), Some(amplification)) = (
+        result.replication_at_max_model_len,
+        result.amplification_at_max_model_len,
+    ) {
+        let _ = writeln!(
+            out,
+            "    one copy: the model's bytes stored once; amplified: bytes x {} over one copy",
+            plural(u64::from(report.attention_shards.max(1)), "GPU"),
+        );
+        let _ = writeln!(
+            out,
+            "    {replication:.2}x replication x {:.2}x engine overhead = {amplification:.2}x",
+            amplification / replication,
+        );
+    }
 
     // The result, in vLLM's words.
     let concurrency = |value: Option<f64>| value.map_or(DASH.to_string(), |x| format!("{x:.2}x"));
@@ -407,6 +439,24 @@ fn plural(count: u64, noun: &str) -> String {
         (_, "copy") => format!("{count} copies"),
         _ => format!("{} {noun}s", grouped(count)),
     }
+}
+
+/// How a part sits on the partition's ranks: "4 shards", "4 replicas" or
+/// "2 shards x 2 replicas".
+fn placement(placement: RankPlacement) -> String {
+    match (placement.shards, placement.replicas) {
+        (shards, 1) => plural(u64::from(shards), "shard"),
+        (1, replicas) => plural(u64::from(replicas), "replica"),
+        (shards, replicas) => format!("{shards} shards x {replicas} replicas"),
+    }
+}
+
+/// `bytes` (over a partition) as a multiple of the one-copy `one_copy` bytes.
+fn amplified(bytes: u64, one_copy: u64) -> String {
+    if one_copy == 0 {
+        return DASH.to_string();
+    }
+    format!("{:.2}x", bytes as f64 / one_copy as f64)
 }
 
 fn percent(part: u64, total: u64) -> String {

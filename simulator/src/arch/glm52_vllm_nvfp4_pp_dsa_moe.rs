@@ -383,7 +383,7 @@ impl Glm52VllmNvfp4PpStageModel {
         let head = (stage_index + 1 == num_stages).then(|| Arc::clone(&sections.head));
         // vLLM allocates cache only for the layers a stage owns: every
         // layer's latent, and an index key where the layer has an indexer.
-        let kv_cache_layout = mla_dsa_kv_cache_layout(counts.total(), counts.index_layers());
+        let kv_cache_layout = mla_dsa_kv_cache_layout(counts.total(), counts.index_layers(), 1);
         let mut stage = Self {
             name: name.to_string(),
             stage_index,
@@ -700,9 +700,10 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4PpDsaMoeModel {
     }
 
     /// The physical total over all stages: each stage caches only its own
-    /// layers, so the stages together hold one token's whole state.
+    /// layers, so the stages together hold one copy of each token's state,
+    /// cut over the `pp_size` stage GPUs.
     fn kv_cache_layout(&self) -> KvCacheLayout {
-        ep_graph::kv_cache_layout(1, Glm52MtpMode::Off)
+        ep_graph::kv_cache_layout(1, Glm52MtpMode::Off).sharded(u32::from(self.pp_size()))
     }
 
     fn gpus_per_replica(&self) -> u16 {
@@ -1011,10 +1012,11 @@ mod tests {
                 max = max.max(bytes);
                 sum += bytes;
             }
-            // The physical total is the EP1 graph's whole-model state.
+            // The physical total is the EP1 graph's whole-model state, cut over
+            // the stages.
             assert_eq!(
                 model.kv_cache_layout(),
-                kv_cache_layout(1, Glm52MtpMode::Off)
+                kv_cache_layout(1, Glm52MtpMode::Off).sharded(u32::from(model.pp_size()))
             );
             assert_eq!(model.kv_cache_layout().per_token_bytes(), sum);
             assert_eq!(model.pipeline_kv_cache_layout().per_token_bytes(), max);

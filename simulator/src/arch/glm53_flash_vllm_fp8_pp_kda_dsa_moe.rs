@@ -262,7 +262,10 @@ pub fn build(
             recipe.model.kda_layers.len() as u32,
             kda_groups,
             block_tokens,
-        ),
+            1,
+        )
+        // Each stage caches only its own layers: one copy over the stages.
+        .sharded(u32::from(pp_size)),
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -452,6 +455,7 @@ impl Glm53FlashVllmFp8PpStageModel {
             counts.kda,
             kda_groups,
             block_tokens,
+            1,
         );
         let mut sizes = cfg.parallel.cudagraph_capture_sizes.clone();
         sizes.sort_unstable();

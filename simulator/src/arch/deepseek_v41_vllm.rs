@@ -786,7 +786,8 @@ fn index_plan(
 
 /// One request's cache over the TP group, in vLLM's packed groups (fork
 /// `v1/kv_cache_interface.py`, BLHNC layout). Each rank holds the one KV head,
-/// so the TP group holds one rank's layout on each of its `tp_size` ranks.
+/// so every part is one rank's bytes replicated on each of the `tp_size` ranks,
+/// and so is the null block.
 ///
 /// Per 128-token block, the full-attention group packs every KV-source layer's
 /// NVFP4 compressed page (288 B per `ratio` tokens) and each owned indexer FP8
@@ -818,6 +819,7 @@ fn kv_cache_layout(model: &DeepseekV41ModelCfg, tp_size: u32) -> KvCacheLayout {
             .count() as u64
     };
 
+    let tp = tp_size;
     let mut layout = KvCacheLayout::new();
     let mut block = 0;
     for (ratio, kv_name, index_name) in [(2, "c2_kv", "c2_indexer"), (1, "c1_kv", "c1_indexer")] {
@@ -828,11 +830,13 @@ fn kv_cache_layout(model: &DeepseekV41ModelCfg, tp_size: u32) -> KvCacheLayout {
         layout = layout
             .with_part(
                 KvCachePart::compressed(kv_name, ratio, kv_layers * record)
-                    .padded_to(kv_layers * kv_page / entries),
+                    .padded_to(kv_layers * kv_page / entries)
+                    .replicated(tp),
             )
             .with_part(
                 KvCachePart::compressed(index_name, ratio, index_layers * index_row)
-                    .padded_to(index_layers * index_page / entries),
+                    .padded_to(index_layers * index_page / entries)
+                    .replicated(tp),
             );
     }
     // A kind whose layers' pages fill whole groups pays a block per group.
@@ -852,18 +856,19 @@ fn kv_cache_layout(model: &DeepseekV41ModelCfg, tp_size: u32) -> KvCacheLayout {
         .with_part(
             KvCachePart::sliding_window("swa", model.sliding_window, swa_layers * swa_row)
                 .padded_to(swa_groups * block / swa_block)
-                .not_prefix_reusable(),
+                .not_prefix_reusable()
+                .replicated(tp),
         )
         .with_part(
             KvCachePart::per_request("compressor_ring", ring_layers * ring_layer_bytes)
                 .padded_to(groups(ring_layers * page(1, ring_layer_bytes)) * block)
-                .not_prefix_reusable(),
+                .not_prefix_reusable()
+                .replicated(tp),
         )
         .with_engine(EngineOverhead {
             block_tokens: Some(KV_BLOCK_SIZE),
-            fixed_device_bytes: block,
+            fixed_device_bytes: block * u64::from(tp),
         })
-        .held_on_each_rank(u64::from(tp_size))
 }
 
 fn layer_config(
