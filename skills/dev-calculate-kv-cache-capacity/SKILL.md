@@ -24,6 +24,7 @@ The answer has two halves, and each comes from a different block of the config:
 | Question | Read it from |
 | --- | --- |
 | Max concurrency / KV tokens of a deployment | `uv run python -m launcher <preset> --kv-report` (`--kv-report-json` for the machine form). No profile.db, GPU or run. |
+| Intrinsic size, per-GPU size and amplification (replication across TP ranks, engine overhead) | the same `--kv-report`: the per-request table's `one copy` / `amplified` columns and the replication line; in JSON `result.one_copy_bytes_at_max_model_len`, `replication_at_max_model_len`, `amplification_at_max_model_len`, per part `request_parts[].one_copy_bytes` and `layout.parts[].placement`. Bytes are over the partition; divide by `attention_shards` for one GPU. |
 | A what-if (budget, context, overhead mode, chunk size) | the same, with `--override`, e.g. `pools.main.groups.0.worker.attn_gpu_memory_gb=100`, `pools.main.groups.0.arch.max_model_len=131072`, `pools.main.groups.0.worker.kv_overhead=none` |
 | What a finished run used | `<log_dir>/raw/kv_cache.json` (fields: `simulator/src/log/README.md`) |
 | The arch's layout alone | `simulator cost-trees <blocks.json>` (a JSON list of `{gpu, arch}`): each build's `kv_cache {attention_shards, layout}`. Bytes are over one partition; divide by `attention_shards` for one GPU. |
@@ -49,8 +50,8 @@ often not the weight dtype.
    and CUDA graphs. Say which reserves you assumed.
 2. **Parts.** Classify each tensor that persists between decode steps into one
    part, listing its layers and its bytes per entry on one GPU:
-   - per token: GQA K/V (`max(num_kv_heads, tp)` heads, since replicated heads
-     are still stored), MLA latent plus RoPE key, a DSA indexer key or a
+   - per token: GQA K/V (`max(num_kv_heads, tp)` heads over the TP group, since
+     replicated heads are still stored), MLA latent plus RoPE key, a DSA indexer key or a
      compressed cache (one entry per `tokens_per_entry` tokens);
    - sliding window: SWA layers, a short-convolution window;
    - per request: GDN/KDA/Mamba recurrent and conv state, ring buffers.

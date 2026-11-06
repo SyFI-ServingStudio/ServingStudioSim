@@ -56,6 +56,9 @@ pub(crate) fn resolve_kv_accounting(
         }),
         prefix_caching: config.prefix_cache.enabled(),
     };
+    layout
+        .check_placement(num_attn_shards)
+        .unwrap_or_else(|error| panic!("the arch's KV cache layout is misplaced: {error:#}"));
     let accounting = KvAccounting::resolve(layout, options, budget_bytes)
         .unwrap_or_else(|error| panic!("cannot account the arch's KV cache layout: {error:#}"));
     Arc::new(accounting.over_attention_shards(num_attn_shards))

@@ -1265,8 +1265,8 @@ pub fn build(
         kda_layers,
         kda_layers.div_ceil(dsa_layers.max(1)),
         hybrid_block_tokens(kda_state_bytes, u64::from(model_cfg.kv_lora_rank)),
-    )
-    .held_on_each_rank(u64::from(cfg.parallel.tp_size));
+        cfg.parallel.tp_size,
+    );
     let mut model = Glm53FlashVllmModel {
         embedding: atomic(
             n,
@@ -1334,9 +1334,14 @@ pub fn build(
     Ok(model)
 }
 
-/// One request's cache on one rank for `dsa_layers` DSA and `kda_layers` KDA
-/// layers, as vLLM's GLM-5.3 hybrid manager allocates it
-/// (`kv_cache_utils.py` `_get_kv_cache_groups_glm5_next`).
+/// One request's cache over an attention TP group of `attn_tp` ranks for
+/// `dsa_layers` DSA and `kda_layers` KDA layers, as vLLM's GLM-5.3 hybrid
+/// manager allocates it (`kv_cache_utils.py` `_get_kv_cache_groups_glm5_next`).
+/// `kda_state_bytes_per_layer` and the block are one rank's.
+///
+/// The ranks hold the parts differently: the FP8 MLA latent, the kpool index
+/// and its tail are replicated on every rank, while the KDA heads are split, so
+/// the TP group keeps one copy of the KDA state (padding included).
 ///
 /// One block id spans every DSA layer's MLA latent and kpool index pages for
 /// `block_tokens` tokens, so its bytes are the DSA layers' alone. Each KDA layer
@@ -1353,7 +1358,9 @@ pub(crate) fn hybrid_kv_cache_layout(
     kda_layers: u32,
     kda_groups: u32,
     block_tokens: u32,
+    attn_tp: u16,
 ) -> KvCacheLayout {
+    let tp = u32::from(attn_tp);
     let dsa = u64::from(dsa_layers);
     let index_entry_bytes = u64::from(model.index_head_dim + DType::Fp32.size_bytes());
     let block_bytes = dsa
@@ -1366,30 +1373,35 @@ pub(crate) fn hybrid_kv_cache_layout(
         * u64::from(model.index_head_dim)
         * u64::from(DType::Bf16.size_bytes());
     let mut layout = KvCacheLayout::new()
-        .with_part(KvCachePart::per_token(
-            "mla",
-            dsa * u64::from(model.kv_lora_rank),
-        ))
-        .with_part(KvCachePart::compressed(
-            "indexer",
-            model.index_kpool,
-            dsa * index_entry_bytes,
-        ));
+        .with_part(
+            KvCachePart::per_token("mla", dsa * u64::from(model.kv_lora_rank)).replicated(tp),
+        )
+        .with_part(
+            KvCachePart::compressed("indexer", model.index_kpool, dsa * index_entry_bytes)
+                .replicated(tp),
+        );
     if kda_layers > 0 {
+        // One rank's slice of every KDA layer's state, times the ranks.
+        let ranks = u64::from(tp);
         layout = layout.with_part(
-            KvCachePart::per_request("kda", u64::from(kda_layers) * kda_state_bytes_per_layer)
-                .padded_to(u64::from(kda_groups) * block_bytes),
+            KvCachePart::per_request(
+                "kda",
+                ranks * u64::from(kda_layers) * kda_state_bytes_per_layer,
+            )
+            .padded_to(ranks * u64::from(kda_groups) * block_bytes)
+            .sharded(tp),
         );
     }
     layout
         .with_part(
             KvCachePart::per_request("kpool_tail", tail_bytes)
                 .padded_to(block_bytes)
-                .not_prefix_reusable(),
+                .not_prefix_reusable()
+                .replicated(tp),
         )
         .with_engine(EngineOverhead {
             block_tokens: Some(block_tokens),
-            fixed_device_bytes: block_bytes,
+            fixed_device_bytes: u64::from(tp) * block_bytes,
         })
 }
 

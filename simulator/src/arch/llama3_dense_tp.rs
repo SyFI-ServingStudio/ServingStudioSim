@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
-use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
+use crate::arch::kv_layout::{gqa_kv_bytes_per_token, gqa_placement, KvCacheLayout, KvCachePart};
 use crate::arch::model_cfg::ModelCfg;
 use crate::common::Fabric;
 use crate::op::Op;
@@ -78,7 +78,7 @@ pub struct Llama3DenseTpModel {
     pub num_layers: u32,
     pub tp_size: u16,
     /// Per-token KV bytes over one KV partition, for the KV cache layout.
-    pub kv_bytes_per_token: u64,
+    pub kv_cache_part: KvCachePart,
     pub attn_block: AttnBlockTpWorklet,
     pub mlp_block: MlpBlockTpWorklet,
     pub embed: Op<ElementwiseKernel>,
@@ -168,16 +168,22 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseTpParallel) -> Llama3Dens
 /// (`2 × KV heads × head_dim × kv dtype × layers`, heads replicated when the TP
 /// degree exceeds them). Arch-specific: MLA's compressed latent or cross-layer
 /// sharing would compute it differently, so it lives in the model_arch.
-fn kv_bytes_per_token(resolved: &Llama3DenseTpResolved) -> u64 {
+fn gqa_kv_part(resolved: &Llama3DenseTpResolved) -> KvCachePart {
     let attn = &resolved.attn_block.raw_cfg;
-    gqa_kv_bytes_per_token(
-        u64::from(resolved.num_layers),
-        u64::from(attn.num_kv_heads.get()),
-        u64::from(attn.head_dim.get()),
-        u64::from(attn.head_dim.get()),
-        u64::from(attn.kv_dtype().size_bytes()),
-        u64::from(resolved.tp_size),
+    KvCachePart::per_token(
+        "gqa",
+        gqa_kv_bytes_per_token(
+            u64::from(resolved.num_layers),
+            u64::from(attn.num_kv_heads.get()),
+            u64::from(attn.head_dim.get()),
+            u64::from(attn.head_dim.get()),
+            u64::from(attn.kv_dtype().size_bytes()),
+        ),
     )
+    .placed(gqa_placement(
+        u64::from(attn.num_kv_heads.get()),
+        u64::from(resolved.tp_size),
+    ))
 }
 
 pub fn resolve_configs(cfgs: &Llama3DenseTpConfigs) -> Llama3DenseTpResolved {
@@ -199,7 +205,7 @@ pub fn build(
 ) -> Result<Llama3DenseTpModel, BuildError> {
     let num_layers = resolved.num_layers;
     let tp_size = resolved.tp_size;
-    let kv_bytes_per_token = kv_bytes_per_token(&resolved);
+    let kv_cache_part = gqa_kv_part(&resolved);
 
     let embed_name = format!("{model_name}.embedding");
     let final_norm_name = format!("{model_name}.final_norm");
@@ -253,7 +259,7 @@ pub fn build(
         name: model_name,
         num_layers,
         tp_size,
-        kv_bytes_per_token,
+        kv_cache_part,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -337,7 +343,7 @@ impl Llama3DenseTpModel {
 
 impl IterwiseUnifiedModel for Llama3DenseTpModel {
     fn kv_cache_layout(&self) -> KvCacheLayout {
-        KvCacheLayout::new().with_part(KvCachePart::per_token("gqa", self.kv_bytes_per_token))
+        KvCacheLayout::new().with_part(self.kv_cache_part)
     }
 
     /// One replica spans the `tp_size` ranks of the TP group (no HP/EP nesting in
@@ -450,7 +456,7 @@ mod tests {
         );
         let r = resolve_configs(&cfgs);
         // total kv heads = 8 (model-level, not per-rank); 2·8·128·2·32.
-        assert_eq!(kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
+        assert_eq!(gqa_kv_part(&r).bytes_per_entry, 2 * 8 * 128 * 2 * 32);
     }
 
     #[test]
@@ -464,7 +470,7 @@ mod tests {
             },
         );
         let r = resolve_configs(&cfgs);
-        assert_eq!(kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
+        assert_eq!(gqa_kv_part(&r).bytes_per_entry, 2 * 8 * 128 * 2 * 32);
         assert_eq!(r.tp_size, 1);
     }
 }

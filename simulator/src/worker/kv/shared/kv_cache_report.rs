@@ -81,6 +81,17 @@ pub struct KvCapacityReport {
     /// The estimate's units split over the layout's parts, in its order;
     /// empty when `max_model_len` is unknown.
     pub request_parts: Vec<KvRequestPartReport>,
+    /// The request's intrinsic size: every part's `one_copy_bytes`.
+    pub one_copy_bytes_at_max_model_len: Option<u64>,
+    /// How many times the partition stores the request's model bytes because
+    /// parts sit replicated on its ranks (MLA latent, MQA, GQA heads past the
+    /// TP width): each part's one copy times its `placement.replicas`, over
+    /// the intrinsic size. Engine overhead left out.
+    pub replication_at_max_model_len: Option<f64>,
+    /// The partition's bytes for the request over its intrinsic size:
+    /// replication times engine overhead (padding, state copies, block
+    /// rounding, in-flight window tokens). 1 means one copy, nothing added.
+    pub amplification_at_max_model_len: Option<f64>,
     /// vLLM's "Maximum concurrency for N tokens per request".
     pub max_concurrency_at_max_model_len: Option<f64>,
     pub other_kv_overhead: KvOverhead,
@@ -106,6 +117,11 @@ pub struct KvRequestPartReport {
     pub entries: u64,
     /// Bytes over one KV partition.
     pub bytes: u64,
+    /// The model's own bytes of this part for the request, stored once
+    /// ([`KvCachePart::one_copy_bytes_at`](crate::arch::kv_layout::KvCachePart::one_copy_bytes_at));
+    /// `bytes` over this is the part's
+    /// amplification.
+    pub one_copy_bytes: u64,
 }
 
 impl KvAccounting {
@@ -179,10 +195,24 @@ impl KvAccounting {
                         tokens_held: held.tokens_held,
                         entries: held.entries,
                         bytes: held.units * self.bytes_per_unit(),
+                        one_copy_bytes: part.one_copy_bytes_at(len),
                     })
                     .collect()
             })
             .unwrap_or_default();
+        // Intrinsic size and amplification; null with `request_parts` when
+        // `max_model_len` is unknown. Consumers read these rather than
+        // re-deriving them from the parts.
+        let one_copy_bytes: u64 = request_parts.iter().map(|part| part.one_copy_bytes).sum();
+        let partition_bytes: u64 = request_parts.iter().map(|part| part.bytes).sum();
+        let replicated_bytes: u64 = layout
+            .parts
+            .iter()
+            .zip(&request_parts)
+            .map(|(part, held)| held.one_copy_bytes * u64::from(part.placement.replicas.max(1)))
+            .sum();
+        let over_one_copy =
+            |bytes: u64| (one_copy_bytes > 0).then(|| bytes as f64 / one_copy_bytes as f64);
 
         KvCacheReport {
             attention_shards: self.attention_shards(),
@@ -209,6 +239,9 @@ impl KvAccounting {
                     .map(|len| self.estimated_request_units(len)),
                 admission_units_at_max_model_len: model_len.map(|len| self.needed_to_admit(len)),
                 request_parts,
+                one_copy_bytes_at_max_model_len: (one_copy_bytes > 0).then_some(one_copy_bytes),
+                replication_at_max_model_len: over_one_copy(replicated_bytes),
+                amplification_at_max_model_len: over_one_copy(partition_bytes),
                 max_concurrency_at_max_model_len: model_len.map(|len| self.concurrency_at(len)),
                 other_kv_overhead,
                 other_max_concurrency_at_max_model_len: other
