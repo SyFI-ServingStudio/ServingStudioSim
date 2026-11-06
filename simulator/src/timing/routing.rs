@@ -393,19 +393,20 @@ impl RoutingRng {
     }
 }
 
-#[derive(Debug)]
-struct SystematicCell {
-    upper_offset: u32,
-    experts: Vec<usize>,
-}
-
 /// One shuffled-systematic dependent-rounding law for a fixed expert
 /// distribution. Assignment shares `p[e]` become inclusion marginals
 /// `q[e] = top_k * p[e]`; each offset cell contains exactly `top_k` distinct
 /// experts, and its integer width is its exact probability mass in ppm units.
+///
+/// The cells are kept flat (`upper_offsets[cell]`, and the cell's experts at
+/// `experts[cell * top_k..][..top_k]`): a build constructs one law per layer
+/// per token count on its sampling threads, and a separate allocation per cell
+/// made those threads queue on the allocator's locks.
 #[derive(Debug)]
 struct SystematicCells {
-    cells: Vec<SystematicCell>,
+    upper_offsets: Vec<u32>,
+    experts: Vec<usize>,
+    top_k: usize,
     num_experts: usize,
 }
 
@@ -431,7 +432,8 @@ impl SystematicCells {
 
         let mut cumulative = 0u64;
         let mut ends = Vec::with_capacity(num_experts);
-        let mut boundaries = vec![0u32];
+        let mut boundaries = Vec::with_capacity(num_experts + 2);
+        boundaries.push(0u32);
         for &expert in &order {
             let inclusion_mass = u64::from(ppm[expert]) * u64::from(top_k);
             assert!(
@@ -451,61 +453,65 @@ impl SystematicCells {
         boundaries.dedup();
         boundaries.push(RoutingDistribution::TOTAL_PPM);
 
-        let mut cells = Vec::with_capacity(boundaries.len().saturating_sub(1));
+        // Residues lie strictly inside (0, TOTAL_PPM), so after the dedup the
+        // boundaries strictly increase and every window is a non-empty cell.
+        let mut experts = Vec::with_capacity((boundaries.len() - 1) * top_k as usize);
         for bounds in boundaries.windows(2) {
             let lower = bounds[0];
-            let upper = bounds[1];
-            if lower == upper {
-                continue;
-            }
-            let mut experts = Vec::with_capacity(top_k as usize);
             for copy in 0..top_k {
                 let point = u64::from(lower) + u64::from(copy) * total;
                 let interval = ends.partition_point(|&end| end <= point);
                 experts.push(order[interval]);
             }
-            debug_assert_eq!(experts.len(), top_k as usize);
             debug_assert!({
-                let mut unique = experts.clone();
-                unique.sort_unstable();
-                unique.dedup();
-                unique.len() == experts.len()
-            });
-            cells.push(SystematicCell {
-                upper_offset: upper,
-                experts,
+                let cell = &experts[experts.len() - top_k as usize..];
+                (0..cell.len()).all(|position| !cell[..position].contains(&cell[position]))
             });
         }
+        // Each cell's upper offset is the boundary after its lower one.
+        boundaries.remove(0);
+        let upper_offsets = boundaries;
         assert_eq!(
-            cells.last().map(|cell| cell.upper_offset),
+            upper_offsets.last().copied(),
             Some(RoutingDistribution::TOTAL_PPM)
         );
-        Self { cells, num_experts }
+        debug_assert_eq!(experts.len(), upper_offsets.len() * top_k as usize);
+        Self {
+            upper_offsets,
+            experts,
+            top_k: top_k as usize,
+            num_experts,
+        }
+    }
+
+    /// The `top_k` distinct experts of `cell`.
+    fn cell_experts(&self, cell: usize) -> &[usize] {
+        &self.experts[cell * self.top_k..(cell + 1) * self.top_k]
     }
 
     fn draw<'a>(&'a self, rng: &mut RoutingRng) -> &'a [usize] {
         let offset = rng.below(RoutingDistribution::TOTAL_PPM);
         let cell = self
-            .cells
-            .partition_point(|cell| cell.upper_offset <= offset);
-        &self.cells[cell].experts
+            .upper_offsets
+            .partition_point(|&upper_offset| upper_offset <= offset);
+        self.cell_experts(cell)
     }
 
     fn sample_counts(&self, n_tokens: u32, rng: &mut RoutingRng) -> Vec<u32> {
-        let mut occupancy = vec![0u32; self.cells.len()];
+        let mut occupancy = vec![0u32; self.upper_offsets.len()];
         for _ in 0..n_tokens {
             let offset = rng.below(RoutingDistribution::TOTAL_PPM);
             let cell = self
-                .cells
-                .partition_point(|cell| cell.upper_offset <= offset);
+                .upper_offsets
+                .partition_point(|&upper_offset| upper_offset <= offset);
             occupancy[cell] += 1;
         }
         let mut counts = vec![0u32; self.num_experts];
-        for (cell, count) in self.cells.iter().zip(occupancy) {
+        for (cell, count) in occupancy.into_iter().enumerate() {
             if count == 0 {
                 continue;
             }
-            for &expert in &cell.experts {
+            for &expert in self.cell_experts(cell) {
                 counts[expert] += count;
             }
         }
@@ -931,16 +937,16 @@ mod tests {
         let plan = SystematicCells::new(dist.ppm(), top_k, &mut rng);
         let mut marginal_mass = vec![0u64; dist.num_experts() as usize];
         let mut lower = 0u32;
-        for cell in &plan.cells {
-            let width = u64::from(cell.upper_offset - lower);
-            let mut unique = cell.experts.clone();
+        for (cell, &upper_offset) in plan.upper_offsets.iter().enumerate() {
+            let width = u64::from(upper_offset - lower);
+            let mut unique = plan.cell_experts(cell).to_vec();
             unique.sort_unstable();
             unique.dedup();
             assert_eq!(unique.len(), top_k as usize);
-            for &expert in &cell.experts {
+            for &expert in plan.cell_experts(cell) {
                 marginal_mass[expert] += width;
             }
-            lower = cell.upper_offset;
+            lower = upper_offset;
         }
         assert_eq!(lower, RoutingDistribution::TOTAL_PPM);
         for (expert, &mass) in marginal_mass.iter().enumerate() {
