@@ -145,3 +145,36 @@ Blockers found, to fix before the next capture:
    The server still came up.
 4. **The first nsys capture after a cold start recorded JIT compilation,** not steady-state work. Warm the caches
    (one throwaway server start) before capturing.
+
+## Re-extraction on kisnis (2026-11-06, after the token-count fix)
+
+**Root cause.** The ported fork's EngineCore record counted `len(req.output_ids)`. Under DSpark a verify step
+appends the whole accepted block, so that runs up to 6 tokens past the stop condition; the API record counts the
+delivered tokens (`finished_len`). 41 of 65 requests differed by 1-6.
+
+**Fix.** `vibesim-alignment-v0.5.23` `60104cb296`: `visible_output_tokens()` counts through `finished_len`, with
+3 unit tests (18 pass).
+
+**Saved logs.** These predate the fix. `kt_bench/correct_spec_token_counts.py` set the engine count to the API
+count in a copy and recomputed `engine_core_tpot_ms`; the originals are kept as `.orig`. Counts were changed only
+where the overshoot was 1-6 tokens; any other difference would abort the script.
+
+**Re-extraction with `--resume`, all OK:**
+- uses Nsight Systems 2026.5.2 unpacked to `/mnt/storage/yilegu/tools/` (kisnis's 2025.3.2 cannot read 2026.4.1
+  reports) and enwik9 at `/mnt/storage/yilegu/hf_stub/`;
+- `07_balanced_anchor_c16/profile_nsys`: 94 iterations, 1.20M kernel rows, 64 request timings;
+- `07_balanced_anchor_c16/profile_workload`: 488 iterations;
+- `01_decode_graph_sizes_c16/profile_nsys`: 116 iterations, 1.43M kernel rows;
+- artifacts in `logs/b2_reextract/` (local).
+
+**DSpark acceptance on real text** (enwik9 prompts): mean accept length **2.50 tokens per verify step**, about 1.5 of
+6 drafts accepted, which is a uniform per-position p of about 0.61. The placeholder 0.8 implies 3.95, and the random
+token-id prompts gave 4.3+. The SGLang fork records no per-position counts (vLLM's `spec_decode_metrics` has no
+SGLang counterpart yet), so only the mean is measured.
+
+**Next:**
+1. Write the label rules from `07_balanced_anchor_c16/profile_nsys/parsed.json` (the folded SM120 launch
+   programs).
+2. Run `alignment-campaign label` / `extract` / `analyze_kernel`, which gives `gpu_time_multiplier` and the
+   per-op errors.
+3. Re-simulate the 2026-11-05 windows with p of about 0.61 and the multiplier.
