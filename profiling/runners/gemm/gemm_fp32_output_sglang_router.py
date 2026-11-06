@@ -44,8 +44,13 @@ def profile_gemm_fp32_output_sglang_router(
 
     try:
         import torch
-        from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
         from sglang.kernels.ops.gemm import dsv3_router_gemm
+
+        try:
+            # v0.5.23+: where DeepSeek-V4's compressor and router import it from.
+            from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
+        except ImportError:
+            from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires the SGLang environment") from exc
 
