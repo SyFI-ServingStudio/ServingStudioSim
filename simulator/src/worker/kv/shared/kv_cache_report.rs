@@ -15,7 +15,8 @@ use crate::worker::kv::shared::kv_accounting::{
 };
 
 /// One KV pool's report. Bytes are over one KV partition, as in the layout;
-/// divide by `attention_shards` for one GPU's.
+/// what a request holds is also given stored once (`one_copy_*`) and on one
+/// GPU (`per_gpu_*`), so a reader never divides by `attention_shards` itself.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct KvCacheReport {
     /// GPUs one partition spans; each holds an equal share of its bytes.
@@ -83,6 +84,10 @@ pub struct KvCapacityReport {
     pub request_parts: Vec<KvRequestPartReport>,
     /// The request's intrinsic size: every part's `one_copy_bytes`.
     pub one_copy_bytes_at_max_model_len: Option<u64>,
+    /// What the partition holds for the request: every part's `bytes`.
+    pub bytes_at_max_model_len: Option<u64>,
+    /// One GPU's share of that: every part's `per_gpu_bytes`.
+    pub per_gpu_bytes_at_max_model_len: Option<f64>,
     /// How many times the partition stores the request's model bytes because
     /// parts sit replicated on its ranks (MLA latent, MQA, GQA heads past the
     /// TP width): each part's one copy times its `placement.replicas`, over
@@ -106,7 +111,7 @@ pub struct KvCapacityReport {
 
 /// What one part holds for a `max_model_len`-token request in vLLM's
 /// concurrency estimate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct KvRequestPartReport {
     pub name: &'static str,
     /// Context tokens held: the block-rounded request for a per-token part,
@@ -117,6 +122,8 @@ pub struct KvRequestPartReport {
     pub entries: u64,
     /// Bytes over one KV partition.
     pub bytes: u64,
+    /// One GPU's share of `bytes`.
+    pub per_gpu_bytes: f64,
     /// The model's own bytes of this part for the request, stored once
     /// ([`KvCachePart::one_copy_bytes_at`](crate::arch::kv_layout::KvCachePart::one_copy_bytes_at));
     /// `bytes` over this is the part's
@@ -178,6 +185,7 @@ impl KvAccounting {
             .iter()
             .all(|part| matches!(part.growth, KvGrowth::PerToken { .. }));
 
+        let shards = f64::from(self.attention_shards().max(1));
         let request_parts: Vec<KvRequestPartReport> = model_len
             .map(|len| {
                 let split = self.estimated_request_by_part(len);
@@ -195,6 +203,7 @@ impl KvAccounting {
                         tokens_held: held.tokens_held,
                         entries: held.entries,
                         bytes: held.units * self.bytes_per_unit(),
+                        per_gpu_bytes: (held.units * self.bytes_per_unit()) as f64 / shards,
                         one_copy_bytes: part.one_copy_bytes_at(len),
                     })
                     .collect()
@@ -211,6 +220,7 @@ impl KvAccounting {
             .zip(&request_parts)
             .map(|(part, held)| held.one_copy_bytes * u64::from(part.placement.replicas.max(1)))
             .sum();
+        let held_bytes = (!request_parts.is_empty()).then_some(partition_bytes);
         let over_one_copy =
             |bytes: u64| (one_copy_bytes > 0).then(|| bytes as f64 / one_copy_bytes as f64);
 
@@ -240,6 +250,8 @@ impl KvAccounting {
                 admission_units_at_max_model_len: model_len.map(|len| self.needed_to_admit(len)),
                 request_parts,
                 one_copy_bytes_at_max_model_len: (one_copy_bytes > 0).then_some(one_copy_bytes),
+                bytes_at_max_model_len: held_bytes,
+                per_gpu_bytes_at_max_model_len: held_bytes.map(|bytes| bytes as f64 / shards),
                 replication_at_max_model_len: over_one_copy(replicated_bytes),
                 amplification_at_max_model_len: over_one_copy(partition_bytes),
                 max_concurrency_at_max_model_len: model_len.map(|len| self.concurrency_at(len)),

@@ -169,3 +169,14 @@ def test_every_attention_member_declares_its_kv_cache(index):
                 preset.id,
                 member.params,
             )
+            # Each entry comes in three sizes the page reads as given: over the
+            # partition, stored once, and on one of the partition's GPUs.
+            for part in parts:
+                placement = part["placement"]
+                assert (
+                    part["one_copy_bytes_per_entry"] * placement["replicas"]
+                    == part["bytes_per_entry"]
+                ), (preset.id, member.params, part["name"])
+                assert part["per_gpu_bytes_per_entry"] * kv["attention_shards"] == pytest.approx(
+                    part["bytes_per_entry"]
+                ), (preset.id, member.params, part["name"])

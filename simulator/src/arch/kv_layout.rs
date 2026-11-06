@@ -24,9 +24,10 @@
 //! `shards × replicas` is the partition's rank count for every part
 //! ([`KvCacheLayout::check_placement`]). A part whose layers sit differently
 //! (some replicated, some split) is two parts. So `bytes_per_entry` is what the
-//! partition stores, [`KvCachePart::one_copy_bytes_at`] what the model
-//! stores once, and `bytes_per_entry / ranks` what one GPU stores; the replicas
-//! are the factor parallelism adds.
+//! partition stores, [`KvCachePart::one_copy_bytes_per_entry`] what the model
+//! stores once, and [`KvCachePart::per_gpu_bytes_per_entry`] what one GPU
+//! stores; the replicas are the factor parallelism adds. A part serializes all
+//! three, so a reader of the JSON never re-derives them from the placement.
 //!
 //! Each part carries two byte counts. `bytes_per_entry` is what the model must
 //! store. [`PartOverhead`] and [`EngineOverhead`] add what the serving engine
@@ -45,6 +46,7 @@ pub struct KvCacheLayout {
 /// One kind of cache in the layout, such as global attention, sliding-window
 /// attention, a short-conv window, a DSA indexer or a GDN state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(into = "KvCachePartJson")]
 pub struct KvCachePart {
     pub name: &'static str,
     pub growth: KvGrowth,
@@ -61,6 +63,42 @@ pub struct KvCachePart {
     pub overhead: PartOverhead,
     /// How the part's bytes sit on the partition's ranks.
     pub placement: RankPlacement,
+}
+
+/// A part as JSON: the declared fields plus the bytes of one entry stored once
+/// and on one GPU, so every consumer reads the three sizes the simulator
+/// derives rather than dividing by the placement itself.
+#[derive(Serialize)]
+struct KvCachePartJson {
+    name: &'static str,
+    growth: KvGrowth,
+    /// Over the whole KV partition, replicas included.
+    bytes_per_entry: u64,
+    /// The model's own bytes, stored once.
+    one_copy_bytes_per_entry: u64,
+    /// One GPU's share: the partition's bytes over its ranks. Fractional only
+    /// when a pipeline stage split leaves the layers uneven, where it is the
+    /// average GPU's.
+    per_gpu_bytes_per_entry: f64,
+    prefix_reusable: bool,
+    #[serde(flatten)]
+    overhead: PartOverhead,
+    placement: RankPlacement,
+}
+
+impl From<KvCachePart> for KvCachePartJson {
+    fn from(part: KvCachePart) -> Self {
+        Self {
+            name: part.name,
+            growth: part.growth,
+            bytes_per_entry: part.bytes_per_entry,
+            one_copy_bytes_per_entry: part.one_copy_bytes_per_entry(),
+            per_gpu_bytes_per_entry: part.per_gpu_bytes_per_entry(),
+            prefix_reusable: part.prefix_reusable,
+            overhead: part.overhead,
+            placement: part.placement,
+        }
+    }
 }
 
 /// How one part sits on the ranks of a KV partition: one copy of the part is
@@ -339,7 +377,18 @@ impl KvCachePart {
             }
             KvGrowth::PerRequest => 1,
         };
-        entries * self.bytes_per_entry / u64::from(self.placement.replicas.max(1))
+        entries * self.one_copy_bytes_per_entry()
+    }
+
+    /// One entry stored once: `bytes_per_entry` without the replicas.
+    pub fn one_copy_bytes_per_entry(&self) -> u64 {
+        self.bytes_per_entry / u64::from(self.placement.replicas.max(1))
+    }
+
+    /// One entry's bytes on one GPU of the partition: `bytes_per_entry` over
+    /// `shards × replicas` ranks.
+    pub fn per_gpu_bytes_per_entry(&self) -> f64 {
+        self.bytes_per_entry as f64 / f64::from(self.placement.ranks().max(1))
     }
 }
 
@@ -442,6 +491,23 @@ mod tests {
         let part = KvCachePart::per_token("gqa", one_copy).placed(tp16);
         assert_eq!(part.bytes_per_entry, 2 * one_copy);
         assert_eq!(part.one_copy_bytes_at(1), one_copy);
+    }
+
+    #[test]
+    fn a_part_serializes_its_entry_stored_once_over_the_partition_and_per_gpu() {
+        // GLM-5.2's MLA latent on attention TP4: each rank holds the whole copy.
+        let mla = KvCachePart::per_token("mla", 576).replicated(4);
+        let json = serde_json::to_value(mla).unwrap();
+        assert_eq!(json["bytes_per_entry"], 4 * 576);
+        assert_eq!(json["one_copy_bytes_per_entry"], 576);
+        assert_eq!(json["per_gpu_bytes_per_entry"], 576.0);
+        // GQA heads split over TP16, each head on two ranks.
+        let gqa = KvCachePart::per_token("gqa", 1024).placed(gqa_placement(8, 16));
+        let json = serde_json::to_value(gqa).unwrap();
+        assert_eq!(json["bytes_per_entry"], 2 * 1024);
+        assert_eq!(json["one_copy_bytes_per_entry"], 1024);
+        assert_eq!(json["per_gpu_bytes_per_entry"], 128.0);
+        assert_eq!(json["placement"]["replicas"], 2);
     }
 
     #[test]
