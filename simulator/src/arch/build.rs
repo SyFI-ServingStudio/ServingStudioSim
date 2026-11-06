@@ -10,7 +10,6 @@
 //! caller supplies `name` — the model's dotted-leaf prefix (`"unified"` / `"pd"`)
 //! — so each deployment's cost manifests read naturally.
 
-use std::fs::File;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -326,15 +325,17 @@ fn load_expert_popularity(
     expected_num_moe_layers: u32,
     expected_experts_per_token: u32,
 ) -> Result<RoutingDistribution> {
-    let profile_file =
-        File::open(path).with_context(|| format!("opening expert popularity profile {path}"))?;
-    let profile_value: serde_json::Value = serde_json::from_reader(profile_file)
-        .with_context(|| format!("parsing expert popularity profile {path}"))?;
-    let version: ExpertPopularityVersion = serde_json::from_value(profile_value.clone())
-        .with_context(|| format!("reading expert popularity schema_version from {path}"))?;
+    // Read whole, then parse the bytes: `serde_json::from_reader` on an
+    // unbuffered `File` issues one read syscall per byte. The version and the
+    // profile are each parsed from the bytes rather than through a `Value`
+    // tree, which would be cloned for the version alone.
+    let profile_bytes =
+        std::fs::read(path).with_context(|| format!("reading expert popularity profile {path}"))?;
+    let version: ExpertPopularityVersion = serde_json::from_slice(&profile_bytes)
+        .with_context(|| format!("parsing expert popularity schema_version from {path}"))?;
     let (num_logical_experts, counts_by_layer, legacy_ratios) = match version.schema_version {
         1 => {
-            let profile: ExpertPopularityProfileV1 = serde_json::from_value(profile_value)
+            let profile: ExpertPopularityProfileV1 = serde_json::from_slice(&profile_bytes)
                 .with_context(|| format!("parsing legacy expert popularity v1 profile {path}"))?;
             let ratios = if profile.counts_by_layer.is_empty()
                 && profile.probabilities_all_layers.len() == expected_num_experts as usize
@@ -370,7 +371,7 @@ fn load_expert_popularity(
             (profile.num_logical_experts, profile.counts_by_layer, ratios)
         }
         2 | 3 | 4 => {
-            let profile: ExpertPopularityProfile = serde_json::from_value(profile_value)
+            let profile: ExpertPopularityProfile = serde_json::from_slice(&profile_bytes)
                 .with_context(|| {
                     format!(
                         "parsing strict expert popularity v{} profile {path}",
