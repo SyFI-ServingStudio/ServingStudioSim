@@ -593,6 +593,41 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
+            // One KV partition and scheduler per DP rank, like the GLM DP arms.
+            IterArchSel::DeepseekV41VllmDpAttnEpMoe {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                max_model_len,
+                decoder_swa_bounded_replay,
+                ..
+            } => {
+                // Barebone holds one partition, not one per rank.
+                ensure_chunked_prefill_worker("DeepSeek-V4.1 vLLM DP4/EP4", &g.worker)?;
+                let model = Arc::new(arch_build::deepseek_v41_vllm_dp_attn_ep_moe(
+                    model_spec,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    *max_model_len,
+                    *decoder_swa_bounded_replay,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_barebone_or_chunked_flow(
+                    "DeepSeek-V4.1 vLLM DP4/EP4",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
             IterArchSel::Glm52VllmDsaMoe {
                 ep_size,
                 nvl_num_gpu,

@@ -1,4 +1,4 @@
-"""Grouped all-gatherv of NVFP4 activations and top-k routing used by naive DP/EP MoE."""
+"""Grouped all-gatherv of NVFP4 or MXFP8 activations and top-k routing used by naive DP/EP MoE."""
 
 from __future__ import annotations
 
@@ -27,26 +27,32 @@ class MoeEpQuantizedAllGatherArgs(KernelArgs):
     hidden_size: int = arg(unit="elements", doc="Elements in each token's hidden state.")
     top_k: int = arg(unit="experts", doc="Experts selected per token.")
     activation_dtype: DType = arg(
-        doc="Element type of the gathered activations; nvfp4_e2m1 is measured."
+        doc="Element type of the gathered activations: nvfp4_e2m1 or mxfp8_e4m3."
     )
     fabric: str = arg(doc="Interconnect label; this backend requires nvlink.")
 
 
 DOC = KernelDoc(
     title="MoE all-gather of quantized activations and top-k routing",
-    summary="Gather NVFP4 activations, scales and top-k routing from every data-parallel GPU.",
+    summary=(
+        "Gather NVFP4 or MXFP8 activations, scales and top-k routing from every "
+        "data-parallel GPU."
+    ),
     description=(
         "With data and expert parallelism, vLLM's allgather_reducescatter backend "
         "can quantize activations and select experts before dispatch. Each GPU then "
-        "gathers four tensors from every GPU: the packed NVFP4 activations "
-        "(hidden_size/2 bytes per token), their fp8 e4m3 block scales, one per 16 "
-        "elements, the fp32 top-k weights and the int32 top-k expert IDs. GPU r "
+        "gathers four tensors from every GPU: the quantized activations, either "
+        "packed NVFP4 (hidden_size/2 bytes per token, one fp8 e4m3 block scale per "
+        "16 elements) or MXFP8 (hidden_size bytes, one ue8m0 scale per 32 elements), "
+        "the fp32 top-k weights, the int32 top-k expert IDs and the block scales. "
+        "MXFP8 is DeepSeek-V4.1's TRT-LLM MXFP4 experts' dispatch. GPU r "
         "contributes per_rank_tokens[r] tokens. The four gathers run in one NCCL "
         "group: all_gather when the counts are equal, all_gatherv otherwise."
     ),
     category="Communication",
     formula=(
-        "token bytes = hidden_size/2 + hidden_size/16 + 8·top_k",
+        "token bytes = hidden_size/2 + hidden_size/16 + 8·top_k (NVFP4)",
+        "token bytes = hidden_size + hidden_size/32 + 8·top_k (MXFP8)",
         "total bytes = sum(per_rank_tokens) · token bytes",
         "algbw = (total bytes / num_gpus) / time",
         "busbw = (total bytes − min(per_rank_tokens) · token bytes) / time",
@@ -74,7 +80,7 @@ register(
         kernel_kind=KIND,
         backend="vllm_pynccl",
         supports=BackendSupport(
-            compute=frozenset({DType.NVFP4_E2M1}),
+            compute=frozenset({DType.NVFP4_E2M1, DType.MXFP8_E4M3}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.comm.moe_ep_collectives_vllm_pynccl",

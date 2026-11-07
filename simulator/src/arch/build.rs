@@ -22,33 +22,34 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use crate::arch::{
-    deepseek_v41_vllm, deepseek_v41_vllm_dspark, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe,
-    glm52_vllm_dsa_moe, glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe,
-    glm52_vllm_nvfp4_pp_dsa_moe, glm53_flash_vllm_fp8_dp_attn_ep_moe,
-    glm53_flash_vllm_fp8_kda_dsa_moe, glm53_flash_vllm_fp8_pp_kda_dsa_moe,
-    glm53_vllm_nvfp4_dsa_moe_dflash2, inkling_vllm_nvfp4_rel_attn_moe, llama3_dense,
-    llama3_dense_tp, llama3_dp_attn_tp_ffn, mimo_v2_vllm_fp8_swa_moe, qwen35_vllm_nvfp4_gdn_dense,
-    qwen36_local, qwen3_attn_layerwise, qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise,
-    qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn,
-    qwen4_exp_vllm_nvfp4_gdn_qsa_moe, AttnLayerwiseModel, DeepseekV41ModelCfg,
-    DeepseekV41VllmDsparkModel, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV4ModelCfg,
-    DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel, DenseTpParallel,
-    Dflash2DraftResolved, DpAttnTpFfnParallel, DsparkCfg, FfnLayerwiseModel, Glm52ModelCfg,
-    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
-    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel,
-    Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel,
-    Glm53FlashKernelPath, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel,
-    Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel, Glm53FlashVllmParallel,
-    Glm53VllmNvfp4DsaMoeDflash2Model, InklingExpertDemand, InklingExpertPrecision, InklingModelCfg,
-    InklingVllmModel, InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel,
-    Llama3DenseTpModel, Llama3DpAttnTpFfnModel, MimoV2ModelCfg, MimoV2VllmModel,
-    MimoV2VllmParallel, Qwen35ModelCfg, Qwen35VllmModel, Qwen35VllmParallel, Qwen36LocalModel,
-    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
-    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
-    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
-    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
-    Qwen4ExpModelCfg, Qwen4ExpVllmParallel, Qwen4ExpVllmSpeculativeModel,
+    deepseek_v41_vllm, deepseek_v41_vllm_dp_attn_ep_moe, deepseek_v41_vllm_dspark,
+    deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
+    glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
+    glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
+    glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2,
+    inkling_vllm_nvfp4_rel_attn_moe, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
+    mimo_v2_vllm_fp8_swa_moe, qwen35_vllm_nvfp4_gdn_dense, qwen36_local, qwen3_attn_layerwise,
+    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
+    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, qwen4_exp_vllm_nvfp4_gdn_qsa_moe,
+    AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmDsparkModel, DeepseekV41VllmModel,
+    DeepseekV41VllmParallel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
+    DenseParallel, DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, DsparkCfg,
+    FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel,
+    Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
+    Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel,
+    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashKernelPath,
+    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel,
+    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
+    InklingExpertDemand, InklingExpertPrecision, InklingModelCfg, InklingVllmModel,
+    InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
+    Llama3DpAttnTpFfnModel, MimoV2ModelCfg, MimoV2VllmModel, MimoV2VllmParallel, Qwen35ModelCfg,
+    Qwen35VllmModel, Qwen35VllmParallel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
+    Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
+    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel, Qwen4ExpModelCfg, Qwen4ExpVllmParallel,
+    Qwen4ExpVllmSpeculativeModel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -1138,6 +1139,49 @@ pub fn deepseek_v41_vllm_dspark(
     let resolved = deepseek_v41_vllm_dspark::resolve_configs(configs);
     deepseek_v41_vllm_dspark::build(name.to_string(), resolved, bridge)
         .context("building DeepSeek-V4.1-Flash + DSpark (often a missing profile.db row)")
+}
+
+/// Build DeepSeek-V4.1-Flash under vLLM DP4 attention + EP4 experts (B200,
+/// TP1 per rank). Routed demand resolves as for [`deepseek_v41_vllm`]: one
+/// binding over all 40 routed layers, verify width 1.
+pub fn deepseek_v41_vllm_dp_attn_ep_moe(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    max_model_len: Option<u32>,
+    decoder_swa_bounded_replay: bool,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<deepseek_v41_vllm_dp_attn_ep_moe::DeepseekV41VllmDpModel> {
+    let model_cfg = DeepseekV41ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let parallel = deepseek_v41_vllm_dp_attn_ep_moe::DeepseekV41VllmDpParallel {
+        gpu_name: gpu.to_string(),
+        max_model_len: deepseek_v41_vllm::resolve_max_model_len(
+            max_model_len,
+            model_cfg.max_position_embeddings,
+        )?,
+        decoder_swa_bounded_replay,
+    };
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.top_k,
+        ep_size: deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE as u16,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_layers,
+    };
+    let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
+    let configs = deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding DeepSeek-V4.1-Flash DP4/EP4 architecture configs")?;
+    let resolved = deepseek_v41_vllm_dp_attn_ep_moe::resolve_configs(&configs);
+    deepseek_v41_vllm_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash DP4/EP4 model (often a missing profile.db row)")
 }
 
 /// Build the GLM-5.2 model in aligned vLLM kernel granularity.
@@ -2367,6 +2411,26 @@ pub fn build_iter_model(
             true,
             *decoder_swa_bounded_replay,
             *max_model_len,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::DeepseekV41VllmDpAttnEpMoe {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            max_model_len,
+            decoder_swa_bounded_replay,
+        } => Box::new(deepseek_v41_vllm_dp_attn_ep_moe(
+            model,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            *max_model_len,
+            *decoder_swa_bounded_replay,
             gpu,
             name,
             bridge,
