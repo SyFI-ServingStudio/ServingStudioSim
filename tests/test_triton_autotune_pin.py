@@ -141,6 +141,7 @@ def test_container_worker_receives_the_row_env(monkeypatch, tmp_path) -> None:
     # persistence on while host workers beside it do not.
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(local_exec, "gpu_uuids_for_indices", lambda gpus: ["GPU-x"])
+    monkeypatch.setattr("profiling.exec.container_user.rootless_runtime", lambda: False)
     cmd, _env = local_exec._container_worker_command(
         ContainerProfileEnv("c", "image:tag"),
         [0],
