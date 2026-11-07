@@ -620,6 +620,14 @@ def build_flashmla_mega(
 
     if not is_workspace_manager_initialized():
         init_workspace_manager(device)
+    # The warmup dummy run's reservation (flash_mla_mega_attn.py
+    # `_reserve_prefill_workspace`): the largest KV chunk and the index scratch
+    # side by side. Without it the workspace is only as large as this shape
+    # needs, so the KV chunk's retained tail span overlaps the head views
+    # `combine_topk_swa_indices` writes, and those indices/lengths overwrite
+    # gathered keys (wrong or NaN outputs at the overlapped columns).
+    layer.max_model_len = shape.max_model_len
+    DeepseekV4MegaAttnAttention._reserve_prefill_workspace(layer, q_fused)
     num_prefills = len(shape.pairs)
     query_start = torch.zeros(num_prefills + 1, dtype=torch.int32)
     query_start[1:] = torch.cumsum(work.query_lens.cpu(), 0)
