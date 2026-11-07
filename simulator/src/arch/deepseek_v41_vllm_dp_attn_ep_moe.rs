@@ -52,10 +52,10 @@ use anyhow::Result;
 use crate::arch::config::ModelSpec;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::deepseek_v41_vllm::{
-    self as tp_arch, cudagraph_rows, fold_layers, full_decode_graph_requests, index_plan,
-    layer_config, layer_input, prefill_pairs, replay_graph_rows, replay_rows, step_graph,
-    BoundedReplay, DeepseekV41LayerConfig, DeepseekV41ModelCfg, DeepseekV41ReplayConfig,
-    DeepseekV41Step, DeepseekV41VllmParallel, GraphMode, LayerInput, LayerKind, PlanNode,
+    self as tp_arch, fold_layers, index_plan, layer_config, layer_input, prefill_pairs,
+    replay_rows, BoundedReplay, DeepseekV41CudaGraphs, DeepseekV41LayerConfig, DeepseekV41ModelCfg,
+    DeepseekV41ReplayConfig, DeepseekV41Step, DeepseekV41VllmParallel, GraphMode, LayerInput,
+    LayerKind, PlanNode,
 };
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::op::Op;
@@ -104,20 +104,11 @@ pub struct DeepseekV41VllmDpParallel {
     pub max_model_len: u32,
     /// vLLM's decoder SWA bounded replay ([`BoundedReplay`], on by default).
     pub decoder_swa_bounded_replay: bool,
-    /// `--cudagraph-capture-sizes` per rank; empty is the captured
-    /// deployment's list ([`captured_graph_sizes`]), the only one taken yet.
+    /// `--max-num-batched-tokens` per rank (the chunk size).
+    pub max_num_batched_tokens: u32,
+    /// `--cudagraph-capture-sizes` per rank (PIECEWISE token sizes; empty =
+    /// eager), as for the TP arch ([`DeepseekV41CudaGraphs`]).
     pub cudagraph_capture_sizes: Vec<u32>,
-}
-
-/// The captured deployment's `cudagraph_capture_sizes` (server log
-/// `prefill_cudagraph_capture_token_sizes`): 1, 2, 4, every 8 to 256, every
-/// 16 to 2048 -- the sizes the TP arch's graph helpers are written for.
-pub(crate) fn captured_graph_sizes() -> Vec<u32> {
-    [1, 2, 4]
-        .into_iter()
-        .chain((8..=256).step_by(8))
-        .chain((272..=2048).step_by(16))
-        .collect()
 }
 
 /// One body layer's configs: the TP arch's at TP1, with the DP FFN.
@@ -144,6 +135,8 @@ pub struct DeepseekV41VllmDpConfigs {
     pub replay: Option<DeepseekV41ReplayConfig>,
     /// Per body: evaluated on the replay batch.
     pub late_bodies: Vec<bool>,
+    /// Each rank's captured graphs, decode query length 1 (no speculation).
+    pub graphs: DeepseekV41CudaGraphs,
 }
 
 pub fn build_configs(
@@ -156,14 +149,6 @@ pub fn build_configs(
             "max_model_len must be 1..={} (max_position_embeddings), got {}",
             model.max_position_embeddings, parallel.max_model_len
         )));
-    }
-    if !parallel.cudagraph_capture_sizes.is_empty()
-        && parallel.cudagraph_capture_sizes != captured_graph_sizes()
-    {
-        return Err(fit_failed(
-            "cudagraph_capture_sizes other than the captured list (1, 2, 4, every 8 to 256, \
-             every 16 to 2048) need the TP arch's size-aware graph helpers",
-        ));
     }
     if model.num_experts % DP_SIZE != 0 {
         return Err(fit_failed(format!(
@@ -191,9 +176,21 @@ pub fn build_configs(
         serialize_streams: false,
         decoder_swa_bounded_replay: false,
         max_model_len: parallel.max_model_len,
+        max_num_batched_tokens: parallel.max_num_batched_tokens,
+        cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
     };
+    let graphs = DeepseekV41CudaGraphs::new(
+        &parallel.cudagraph_capture_sizes,
+        tp_arch::MAX_NUM_SEQS,
+        &[1],
+    );
+    // A rank's rows: its scheduled tokens, or the graph it pads to.
+    let max_rank_tokens = parallel.max_num_batched_tokens.max(graphs.max_tokens());
     let dp_layer = |kind: LayerKind, layers: Vec<u32>| {
-        dp_layer_config(layer_config(model, &local, demand, kind, layers))
+        dp_layer_config(
+            layer_config(model, &local, demand, kind, layers),
+            max_rank_tokens,
+        )
     };
     let tail: Vec<(u32, LayerKind)> = (1..model.num_layers)
         .map(|layer| (layer, model.layer_kind(layer)))
@@ -266,10 +263,16 @@ pub fn build_configs(
         kv_cache_layout: tp_arch::kv_cache_layout(model, 1, 0),
         replay,
         late_bodies,
+        graphs,
     })
 }
 
-pub(crate) fn dp_layer_config(tp1: DeepseekV41LayerConfig) -> DeepseekV41DpLayerConfig {
+/// `max_rank_tokens`: the most rows one rank sends to the all-gatherv (its
+/// token budget, or its largest graph when padded past it).
+pub(crate) fn dp_layer_config(
+    tp1: DeepseekV41LayerConfig,
+    max_rank_tokens: u32,
+) -> DeepseekV41DpLayerConfig {
     DeepseekV41DpLayerConfig {
         layers: tp1.layers,
         engram: tp1.engram,
@@ -277,7 +280,7 @@ pub(crate) fn dp_layer_config(tp1: DeepseekV41LayerConfig) -> DeepseekV41DpLayer
         ffn: DeepseekV41MoeFfnDpEpWorkletConfig {
             ffn: tp1.ffn,
             collective_backends: COLLECTIVE_BACKENDS.to_vec(),
-            max_rank_tokens: tp_arch::MAX_BATCHED_TOKENS,
+            max_rank_tokens,
         },
     }
 }
@@ -300,6 +303,7 @@ pub struct DeepseekV41VllmDpResolved {
     max_model_len: u32,
     replay: Option<DpReplayResolved>,
     late_bodies: Vec<bool>,
+    graphs: DeepseekV41CudaGraphs,
 }
 
 pub struct DpReplayResolved {
@@ -342,6 +346,7 @@ pub fn resolve_configs(configs: &DeepseekV41VllmDpConfigs) -> DeepseekV41VllmDpR
             scatter: replay.scatter.clone(),
         }),
         late_bodies: configs.late_bodies.clone(),
+        graphs: configs.graphs.clone(),
     }
 }
 
@@ -406,7 +411,11 @@ impl DpLayerBody {
 
     /// The whole layer; at the replay cut each rank's segment opens with the
     /// boundary's `write_kv` and gather.
-    pub(crate) fn compile(&self, boundary: Option<&DpReplayBoundary>, b: &mut CostTreeBuilder) -> CostNode {
+    pub(crate) fn compile(
+        &self,
+        boundary: Option<&DpReplayBoundary>,
+        b: &mut CostTreeBuilder,
+    ) -> CostNode {
         let ranks = (0..DP_SIZE)
             .map(|_| {
                 let mut leaves = Vec::new();
@@ -544,6 +553,7 @@ pub struct DeepseekV41VllmDpModel {
     replay_rule: Option<BoundedReplay>,
     replay: Option<DpReplayBoundary>,
     late_bodies: Vec<bool>,
+    graphs: DeepseekV41CudaGraphs,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -601,6 +611,7 @@ pub fn build(
         replay_rule,
         replay,
         late_bodies: resolved.late_bodies,
+        graphs: resolved.graphs,
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -640,8 +651,7 @@ impl DeepseekV41VllmDpModel {
             .map(|_| {
                 let mut main = vec![self.prologue.compile(b)];
                 main.extend(self.layer0.compile_rank(b));
-                self.engram_prefetch
-                    .compile_joined(b, CostNode::Sum(main))
+                self.engram_prefetch.compile_joined(b, CostNode::Sum(main))
             })
             .collect();
         let mut layer0 = vec![labeled_max(
@@ -691,6 +701,12 @@ impl DeepseekV41VllmDpModel {
         self.replay_rule.as_ref()
     }
 
+    /// Each rank's captured graphs (decode query length 1); a speculative
+    /// wrapper builds its own for its verify width.
+    pub fn graphs(&self) -> &DeepseekV41CudaGraphs {
+        &self.graphs
+    }
+
     fn boundary_at(&self, index: usize) -> Option<&DpReplayBoundary> {
         self.replay.as_ref().filter(|r| r.cut_body == index)
     }
@@ -733,8 +749,10 @@ impl DeepseekV41VllmDpModel {
     pub(crate) fn eval_step(&self, step: &DpStep, ev: &mut Evaluator) {
         for rank in &step.full.ranks {
             let tokens = rank.rows;
-            self.prologue
-                .eval(&DeepseekV41PrologueTpWorkletInput { num_tokens: tokens }, ev);
+            self.prologue.eval(
+                &DeepseekV41PrologueTpWorkletInput { num_tokens: tokens },
+                ev,
+            );
             self.layer0.eval_rank(rank, ev);
             self.engram_prefetch.eval(
                 &DeepseekV41EngramPrefetchLocalWorkletInput { num_tokens: tokens },
@@ -768,7 +786,12 @@ impl DeepseekV41VllmDpModel {
     }
 
     fn normalize(&self, batch: &UnifiedArchInput) -> std::result::Result<DpStep, String> {
-        normalize_input(batch, self.max_model_len, self.replay_rule.as_ref())
+        normalize_input(
+            &self.graphs,
+            batch,
+            self.max_model_len,
+            self.replay_rule.as_ref(),
+        )
     }
 
     fn eval_checked(
@@ -938,8 +961,9 @@ fn query_lens(step: &DeepseekV41Step) -> Vec<u32> {
 /// graph launch around the collectives), when any rank's step replays by the
 /// TP rule ([`replay_rows`]); every rank then keeps its requests' last
 /// `window` rows (a dummy keeps its one row) and pads to the busiest rank's
-/// replay graph ([`replay_graph_rows`]).
+/// replay graph ([`DeepseekV41CudaGraphs::replay_rows`]).
 pub(crate) fn normalize_dp_steps(
+    graphs: &DeepseekV41CudaGraphs,
     steps: &[DeepseekV41Step],
     uniform_query_len: u32,
     logits_rows: Vec<u32>,
@@ -953,12 +977,18 @@ pub(crate) fn normalize_dp_steps(
     };
     let steps: Vec<&DeepseekV41Step> = steps
         .iter()
-        .map(|step| if step.request_count() == 0 { &dummy } else { step })
+        .map(|step| {
+            if step.request_count() == 0 {
+                &dummy
+            } else {
+                step
+            }
+        })
         .collect();
     let lens: Vec<Vec<u32>> = steps.iter().map(|step| query_lens(step)).collect();
     let modes: Vec<GraphMode> = lens
         .iter()
-        .map(|lens| step_graph(lens, uniform_query_len).0)
+        .map(|lens| graphs.step_graph(lens, uniform_query_len).0)
         .collect();
     let tokens: Vec<u32> = lens.iter().map(|lens| lens.iter().sum()).collect();
     let mode = if modes.contains(&GraphMode::Eager) {
@@ -973,11 +1003,17 @@ pub(crate) fn normalize_dp_steps(
         GraphMode::Eager => tokens,
         GraphMode::Full => {
             let requests = steps.iter().map(|s| s.request_count()).max().unwrap_or(1);
-            let padded = full_decode_graph_requests(requests, uniform_query_len)
+            let padded = graphs
+                .full_decode_requests(requests, uniform_query_len)
                 .expect("every rank holds a FULL graph, so the busiest one does");
             vec![padded * uniform_query_len; steps.len()]
         }
-        GraphMode::Piecewise => vec![cudagraph_rows(busiest_tokens); steps.len()],
+        GraphMode::Piecewise => {
+            let padded = graphs
+                .piecewise_rows(busiest_tokens)
+                .expect("no rank runs eager, so the busiest one fits a graph");
+            vec![padded; steps.len()]
+        }
     };
     let full = DpLayerInput::new(
         steps
@@ -991,7 +1027,7 @@ pub(crate) fn normalize_dp_steps(
             steps
                 .iter()
                 .zip(&rows)
-                .any(|(step, &rows)| replay_rows(rule, mode, rows, step).is_some())
+                .any(|(step, &rows)| replay_rows(graphs, rule, mode, rows, step).is_some())
         })
         .map(|rule| {
             let trimmed: Vec<(Vec<(u32, u32)>, u32)> = steps
@@ -1012,7 +1048,7 @@ pub(crate) fn normalize_dp_steps(
                 })
                 .collect();
             let busiest = trimmed.iter().map(|&(_, kept)| kept).max().unwrap_or(0);
-            let late_rows = replay_graph_rows(busiest, rule.window);
+            let late_rows = graphs.replay_rows(busiest, rule.window);
             DpLayerInput::new(
                 steps
                     .iter()
@@ -1033,6 +1069,7 @@ pub(crate) fn normalize_dp_steps(
 
 /// A no-spec DP batch: one group per rank.
 fn normalize_input(
+    graphs: &DeepseekV41CudaGraphs,
     input: &UnifiedArchInput,
     max_model_len: u32,
     replay: Option<&BoundedReplay>,
@@ -1063,7 +1100,7 @@ fn normalize_input(
         return Err("an iteration must carry at least one token".into());
     }
     let logits_rows = steps.iter().map(DeepseekV41Step::request_count).collect();
-    Ok(normalize_dp_steps(&steps, 1, logits_rows, replay))
+    Ok(normalize_dp_steps(graphs, &steps, 1, logits_rows, replay))
 }
 
 /// Build from the checkpoint config (used by `arch::build`).
@@ -1096,8 +1133,14 @@ mod tests {
             gpu_name: GPU_NAME.into(),
             max_model_len: 131_072,
             decoder_swa_bounded_replay: true,
-            cudagraph_capture_sizes: Vec::new(),
+            max_num_batched_tokens: 2048,
+            cudagraph_capture_sizes: tp_arch::vllm_default_cudagraph_capture_sizes(2048),
         }
+    }
+
+    fn graphs() -> DeepseekV41CudaGraphs {
+        let p = parallel();
+        DeepseekV41CudaGraphs::new(&p.cudagraph_capture_sizes, tp_arch::MAX_NUM_SEQS, &[1])
     }
 
     fn uniform_demand() -> ExpertDemand {
@@ -1178,6 +1221,7 @@ mod tests {
     fn idle_ranks_join_with_a_dummy_token_and_graph_steps_pad_to_the_busiest() {
         // Decode-only: ranks of 12, 5, 0 and 1 requests pad to graph 16.
         let step = normalize_input(
+            &graphs(),
             &input(vec![
                 group(&[], &[100; 12]),
                 group(&[], &[200; 5]),
@@ -1198,6 +1242,7 @@ mod tests {
         assert!(step.full.exchange.ranks.iter().all(|r| r.mhc_overlap));
         // 17 requests on one rank: FULL graph 24 (no overlap above 16 rows).
         let wide = normalize_input(
+            &graphs(),
             &input(vec![
                 group(&[], &[100; 17]),
                 group(&[], &[200; 5]),
@@ -1214,6 +1259,7 @@ mod tests {
 
         // One prefill rank makes the step PIECEWISE: no aux stream, no overlap.
         let mixed = normalize_input(
+            &graphs(),
             &input(vec![
                 group(&[(0, 1000)], &[100; 3]),
                 group(&[], &[200; 5]),
@@ -1226,7 +1272,11 @@ mod tests {
         .unwrap();
         assert_eq!(mixed.mode, GraphMode::Piecewise);
         assert!(mixed.full.ranks.iter().all(|r| r.rows == 1008));
-        assert!(mixed.full.ranks.iter().all(|r| !r.attention.aux_stream_live));
+        assert!(mixed
+            .full
+            .ranks
+            .iter()
+            .all(|r| !r.attention.aux_stream_live));
         assert!(mixed.full.exchange.ranks.iter().all(|r| !r.mhc_overlap));
         assert!(mixed.replay.is_none());
     }
@@ -1238,6 +1288,7 @@ mod tests {
         // the step replays: rank 0 keeps 128 + 3 rows, the others their decode
         // rows (the dummy its one row); all pad to the 256-row replay graph.
         let step = normalize_input(
+            &graphs(),
             &input(vec![
                 group(&[(0, 1000)], &[100; 3]),
                 group(&[], &[200; 5]),
@@ -1258,6 +1309,7 @@ mod tests {
         assert_eq!(late.ranks[2].attention.decode_kv_lens, vec![1]);
         // A small PIECEWISE step does not replay on any rank.
         let small = normalize_input(
+            &graphs(),
             &input(vec![
                 group(&[(0, 500)], &[100; 3]),
                 group(&[], &[200; 5]),
@@ -1271,6 +1323,7 @@ mod tests {
         assert!(small.replay.is_none());
         // Eager: only rank 0 has a > 128-row prefill, yet every rank replays.
         let eager = normalize_input(
+            &graphs(),
             &input(vec![
                 group(&[(0, 2100)], &[]),
                 group(&[], &[200; 5]),
@@ -1290,22 +1343,40 @@ mod tests {
     }
 
     #[test]
+    fn no_captured_graphs_run_every_rank_eager() {
+        let eager = DeepseekV41CudaGraphs::new(&[], tp_arch::MAX_NUM_SEQS, &[1]);
+        let step = normalize_input(
+            &eager,
+            &input(vec![
+                group(&[], &[100; 12]),
+                group(&[], &[200; 5]),
+                group(&[], &[]),
+                group(&[], &[300]),
+            ]),
+            131_072,
+            None,
+        )
+        .unwrap();
+        assert_eq!(step.mode, GraphMode::Eager);
+        assert_eq!(step.full.exchange.collective_tokens, vec![12, 5, 1, 1]);
+        let mut parallel = parallel();
+        parallel.cudagraph_capture_sizes = Vec::new();
+        let configs = build_configs(&cfg(), &parallel, &uniform_demand()).unwrap();
+        assert_eq!(configs.graphs.max_tokens(), 0);
+    }
+
+    #[test]
     fn invalid_inputs_are_refused() {
-        let mut explicit = parallel();
-        explicit.cudagraph_capture_sizes = captured_graph_sizes();
-        assert!(build_configs(&cfg(), &explicit, &uniform_demand()).is_ok());
-        explicit.cudagraph_capture_sizes = vec![1, 2, 4, 8];
-        assert!(build_configs(&cfg(), &explicit, &uniform_demand()).is_err());
-        assert!(normalize_input(&input(vec![group(&[], &[1])]), 131_072, None).is_err());
+        assert!(normalize_input(&graphs(), &input(vec![group(&[], &[1])]), 131_072, None).is_err());
         let idle = vec![group(&[], &[]); 4];
-        assert!(normalize_input(&input(idle), 131_072, None).is_err());
+        assert!(normalize_input(&graphs(), &input(idle), 131_072, None).is_err());
         let too_long = vec![
             group(&[(131_000, 1000)], &[]),
             group(&[], &[1]),
             group(&[], &[1]),
             group(&[], &[1]),
         ];
-        assert!(normalize_input(&input(too_long), 131_072, None).is_err());
+        assert!(normalize_input(&graphs(), &input(too_long), 131_072, None).is_err());
     }
 
     #[test]
@@ -1328,7 +1399,9 @@ mod tests {
         assert_eq!(count(".replay.gather"), 4);
         assert_eq!(count(".replay.scatter"), 4);
         // No TP all-reduce or logits gather anywhere.
-        assert!(!names.iter().any(|n| n.contains("all_reduce") || n.contains("logits_all_gather")));
+        assert!(!names
+            .iter()
+            .any(|n| n.contains("all_reduce") || n.contains("logits_all_gather")));
     }
 
     #[test]
@@ -1354,6 +1427,7 @@ mod tests {
         }
         // An over-budget rank runs eager: every rank keeps its own rows.
         let eager = normalize_input(
+            &graphs(),
             &input(vec![
                 group(&[(0, 2040)], &[100; 40]),
                 group(&[], &[200; 5]),

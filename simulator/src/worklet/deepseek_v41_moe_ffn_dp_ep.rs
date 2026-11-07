@@ -41,9 +41,9 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     ElementwiseKernelInput, GemmFp32OutputKernelInput, MhcRmsNormKernelInput,
-    MoeEpCollectiveKernelInput, MoeEpQuantizedAllGatherKernel,
-    MoeEpQuantizedAllGatherKernelConfig, MoeEpReduceScatterKernel,
-    MoeEpReduceScatterKernelConfig, Nvfp4FusedMoeKernelInput, SingleGemmKernelInput,
+    MoeEpCollectiveKernelInput, MoeEpQuantizedAllGatherKernel, MoeEpQuantizedAllGatherKernelConfig,
+    MoeEpReduceScatterKernel, MoeEpReduceScatterKernelConfig, Nvfp4FusedMoeKernelInput,
+    SingleGemmKernelInput,
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
 
@@ -242,7 +242,12 @@ impl DeepseekV41MoeFfnDpEpWorklet {
             ev,
         );
         f.mhc_overlap.eval_entry(rows, mhc_overlap, ev);
-        eval_or_zero(&f.router_gate, GemmFp32OutputKernelInput { m: rows }, zero, ev);
+        eval_or_zero(
+            &f.router_gate,
+            GemmFp32OutputKernelInput { m: rows },
+            zero,
+            ev,
+        );
         eval_or_zero(&f.topk, ew.clone(), zero, ev);
         eval_or_zero(&f.moe_input_quant, ew.clone(), zero, ev);
         eval_or_zero(&f.shared_gate_up, gemm.clone(), inline_off, ev);
@@ -275,8 +280,18 @@ impl DeepseekV41MoeFfnDpEpWorklet {
         for rank in &input.ranks {
             let rows = rank.num_tokens;
             let off = !shared_on_aux_stream(rows, false);
-            eval_or_zero(&f.shared_gate_up, SingleGemmKernelInput { m: rows }, off, ev);
-            eval_or_zero(&f.shared_act, ElementwiseKernelInput { num_tokens: rows }, off, ev);
+            eval_or_zero(
+                &f.shared_gate_up,
+                SingleGemmKernelInput { m: rows },
+                off,
+                ev,
+            );
+            eval_or_zero(
+                &f.shared_act,
+                ElementwiseKernelInput { num_tokens: rows },
+                off,
+                ev,
+            );
             eval_or_zero(&f.shared_down, SingleGemmKernelInput { m: rows }, off, ev);
         }
         for rank in &input.ranks {

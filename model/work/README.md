@@ -131,6 +131,8 @@ models/qwen3_6.py    hybrid [GDN×3, GQA×1] + dense    registry.py  architectur
 models/glm52.py      dense/full-index + sparse/index-share stacks + shared MoE
 attention/deepseek_v41.py  DeepSeek-V4.1 window + compressed sparse attention
 models/deepseek_v41.py     10 role stacks + MXFP4 MoE + FP32 mHC mixing + engram
+attention/dspark.py        DSpark context K/V + non-causal block over the draft window
+models/dspark.py           staged DSpark proposer (context / draft / Markov stages)
 attention/inkling_rel.py   Inkling relative-position SWA/global attention + K/V short conv
 mixers/short_conv.py       sublayer-output short convolutions + their norms (Inkling)
 models/inkling.py          local/global x dense/BF16/NVFP4-expert stacks + sink-expert MoE
@@ -369,6 +371,35 @@ top-k and selector-walk math carry no row, by the same conventions as above.
 Every scheduled request drafts, prefilling or verifying. The simulator prices
 no separate draft final norm, so `glm53_vllm_nvfp4_dsa_moe_dflash2.json` maps
 that learned scale to the selector's `lm_head` location it feeds.
+
+### DSpark proposer
+
+DeepSeek-V4.1-Flash-1017 ships its proposer in the target checkpoint (`mtp.{0,1,2}`),
+so `models/deepseek_v41.py` always builds it as staged stacks (`models/dspark.py`)
+that run, and count, only when a workload carries the DSpark stages; a
+non-speculative label is unchanged. Sources: the reference `inference/model.py`
+(`DSparkBlock`, `DSparkAttention`, `DSparkMarkovHead`, `forward_spec`) and the
+safetensors headers (14,225,356,770 draft parameters: every `mtp.*` tensor less the
+never-run `confidence_head` and the image-only `bias_vl`). With `k =
+dspark_block_size` (= `draft_tokens`, verify width `k + 1`), `speculative.py` builds:
+
+- `dspark_context`, over every target row `C`: `main_proj` (FP8, the
+  `dspark_target_layer_ids` layers' hc-mean hidden states, `3·hidden -> hidden`),
+  `main_norm`, and per draft layer its `wkv`/`kv_norm` plus the surviving
+  window-cache appends (`min(rows, window)` per request, 528 B each).
+- `dspark_draft`, over `R · k` block rows (anchor first, then noise tokens): three
+  sliding-window DeepSeek-V4.1 layers (target attention projections, FP32 mHC
+  mixing, a 128-expert top-3 MXFP4 MoE with one FP8 shared expert), the block
+  attending `min(window, context)` cached entries plus its own `k` keys
+  non-causally (`k · (min(W, context) + k)` pairs per request; the block keys are
+  not cached), the final `norm`, and the target `lm_head` over every block row
+  (FLOPs only).
+- `dspark_markov`, `k` sequential steps of `R` rows: a gathered rank-256
+  `markov_head.embed` row and the BF16 `markov_head.head` (`2·rank·vocab` FLOPs per
+  drafted position, head read once).
+
+The draft's embedding (the target's table), hc expand/collapse, the logit-bias add
+and greedy argmax carry no row. Every scheduled request drafts.
 
 Request-side admission/completion telemetry separately records completed rounds,
 emitted outputs, resident KV, and pending work. Conservation uses those facts,
