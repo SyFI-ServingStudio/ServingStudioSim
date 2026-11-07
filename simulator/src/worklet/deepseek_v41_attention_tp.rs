@@ -226,6 +226,7 @@ pub struct DeepseekV41AttentionTpWorkletResolved {
     pub indexer_wq_b: Option<SingleGemmKernelConfig>,
     pub indexer_q_rope: Option<ElementwiseKernelConfig>,
     pub compressor_insert: Option<ElementwiseKernelConfig>,
+    pub global_topk_remap: Option<ElementwiseKernelConfig>,
     pub indexer: Option<DeepseekV41IndexerOpConfig>,
     pub mega_attn: DeepseekV41MegaAttnOpConfig,
     pub wo_a: BatchedGemmKernelConfig,
@@ -272,6 +273,7 @@ pub struct DeepseekV41AttentionTpWorklet {
     pub indexer_wq_b: Option<Op<SingleGemmKernel>>,
     pub indexer_q_rope: Option<Op<ElementwiseKernel>>,
     pub compressor_insert: Option<Op<ElementwiseKernel>>,
+    pub global_topk_remap: Option<Op<ElementwiseKernel>>,
     pub indexer: Option<DeepseekV41IndexerOp>,
     pub mega_attn: DeepseekV41MegaAttnOp,
     pub wo_a: Op<BatchedGemmKernel>,
@@ -436,6 +438,14 @@ impl DeepseekV41AttentionTpWorklet {
             // `_rope_quant_insert_nvfp4`: one 288-byte NVFP4 row per `ratio`
             // tokens.
             compressor_insert: layer.kv_source.then(|| ew(head_dim * 2, 288 / ratio.max(1))),
+            // flash_mla_mega_attn.py `_decode_compressed_kv_and_topk` ->
+            // cache_utils.py `compute_global_topk_indices_and_lens`: one Triton
+            // launch per compressed layer before the decode attention, one
+            // program per decode row. Reads the row's top-k local indices and
+            // their block-table entries (int32 each), writes the global slot
+            // ids plus one length.
+            global_topk_remap: (ratio > 0)
+                .then(|| ew(cfg.index_topk * 8, cfg.index_topk * 4 + 4)),
             indexer: index_source.then(|| DeepseekV41IndexerOpConfig {
                 gpu_name: cfg.gpu_name.clone(),
                 compress_ratio: ratio,
@@ -561,6 +571,11 @@ impl DeepseekV41AttentionTpWorklet {
                 r.compressor_insert,
                 "compressor.nvfp4_insert"
             ),
+            global_topk_remap: maybe!(
+                ElementwiseKernel,
+                r.global_topk_remap,
+                "attention.global_topk_remap"
+            ),
             indexer: match r.indexer {
                 Some(config) => Some(DeepseekV41IndexerOp::build(
                     format!("{name}.indexer.score"),
@@ -647,6 +662,9 @@ impl DeepseekV41AttentionTpWorklet {
 
         if let Some(indexer) = &self.indexer {
             children.push(indexer.compile(b));
+        }
+        if let Some(op) = &self.global_topk_remap {
+            children.push(op.compile(b));
         }
         children.push(self.mega_attn.compile(b));
         children.push(self.wo_a.compile(b));
@@ -759,11 +777,23 @@ impl DeepseekV41AttentionTpWorklet {
                 ev,
             );
         }
+        // The remap launches over the decode segment's rows (`q.shape[0]`):
+        // the padded rows inside a FULL graph, else the live decode rows.
+        let decode_launch_rows = input.full_graph.then_some(rows);
+        if let Some(op) = &self.global_topk_remap {
+            let launched = decode_launch_rows.unwrap_or(decode_kv_lens.len() as u32);
+            eval_or_zero(
+                op,
+                ElementwiseKernelInput { num_tokens: launched },
+                decode_kv_lens.is_empty(),
+                ev,
+            );
+        }
         self.mega_attn.eval(
             &DeepseekV41MegaAttnOpInput {
                 prefill_query_context_pairs: prefill_pairs,
                 decode_kv_lens,
-                decode_launch_rows: input.full_graph.then_some(rows),
+                decode_launch_rows,
             },
             ev,
         );
@@ -913,6 +943,21 @@ pub(crate) mod tests {
         );
         assert_eq!((r.kv_insert.num_heads, r.kv_insert.padded_heads), (16, 64));
         assert_eq!(r.indexer.as_ref().unwrap().page_block_size, 64);
+    }
+
+    /// Catches the decode top-k remap launch folded away at zero cost, or
+    /// priced on the ratio-0 layers that never launch it.
+    #[test]
+    fn global_topk_remap_is_priced_on_compressed_layers_only() {
+        let bytes = |layer: u32| {
+            DeepseekV41AttentionTpWorklet::resolve_config(&config(layer))
+                .global_topk_remap
+                .map(|c| (c.input_bytes_per_token.get(), c.output_bytes_per_token.get()))
+        };
+        assert_eq!(bytes(0), None);
+        assert_eq!(bytes(1), None);
+        assert_eq!(bytes(2), Some((4096, 2052)));
+        assert_eq!(bytes(3), Some((4096, 2052)));
     }
 
     #[test]

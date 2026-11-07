@@ -1112,16 +1112,16 @@
    "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
   },
   {
-   "operation": "attn.mega_attn.decode",
+   "operation": "attn.global_topk_remap",
    "name": "_compute_global_topk_indices_and_lens_kernel",
    "phase": "forward",
    "type": "attention",
-   "role": "FlashMLA mega attention, decode mode, with the global top-k remap folded in",
+   "role": "decode top-k local->global slot remap before the compressed-layer decode attention",
    "cross_rank": "independent",
    "slot_suffixes": [
-    "attn.attention.mega_attn.decode"
+    "attn.attention.global_topk_remap"
    ],
-   "note": "Global top-k remap, folded into the decode attention leaf by the arch.",
+   "note": "Triton launch per compressed layer and decode step; elementwise placeholder leaf in the arch.",
    "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
   },
   {

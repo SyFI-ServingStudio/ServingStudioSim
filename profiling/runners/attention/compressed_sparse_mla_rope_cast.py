@@ -602,8 +602,10 @@ def build_flashmla_mega(
             if shape.ratio
             else (None, None, None)
         )
-        # The remap kernel (compute_global_topk_indices_and_lens) is its own
-        # Sim slot; hand the method the slot ids it would have produced.
+        # The remap launch (compute_global_topk_indices_and_lens) is not part of
+        # this kind: the Sim prices it as its own elementwise placeholder leaf
+        # (`attention.global_topk_remap`). Hand the method the slot ids it
+        # would have produced.
         layer._decode_compressed_kv_and_topk = lambda *_args: extra
         swa_metadata = types.SimpleNamespace(
             decode_swa_indices=work.swa_slots, decode_swa_lens=work.swa_lens

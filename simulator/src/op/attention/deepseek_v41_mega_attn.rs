@@ -12,8 +12,9 @@
 //! The prefill leaf is the whole chunk loop of the fork (compressed-cache
 //! dequant/gather, SWA gather, `combine_topk_swa_indices`, one fused launch per
 //! chunk); the decode leaf is one launch over every decode row. The global
-//! top-k remap (`_compute_global_topk_indices_and_lens`) that precedes the
-//! decode launch has no L1 kind and folds into this op (plan decision).
+//! top-k remap (`compute_global_topk_indices_and_lens`) that precedes the
+//! decode launch on compressed layers is its own elementwise placeholder in
+//! the attention worklet (`attention.global_topk_remap`), not part of this op.
 //!
 //! Layers vLLM marks `_use_swapab` (`_swapab_decode_supported`: a compressed
 //! layer, 16 or 32 live heads, tiles that fit one cluster) get a third leaf,
