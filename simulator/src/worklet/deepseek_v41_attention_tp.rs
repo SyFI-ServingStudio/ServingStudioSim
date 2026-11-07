@@ -193,6 +193,9 @@ pub struct DeepseekV41AttentionTpWorkletConfig {
     pub fp32_gemm_backends: Vec<&'static str>,
     pub kv_insert_backends: Vec<&'static str>,
     pub mega_attn_backends: Vec<&'static str>,
+    /// The swap-AB decode backends of compressed layers at 16 or 32 live
+    /// heads; empty keeps every decode on the mega kernel.
+    pub swapab_attn_backends: Vec<&'static str>,
     pub wo_a_backends: Vec<&'static str>,
     pub all_reduce_backends: Vec<&'static str>,
     pub index_logits_prefill_backends: Vec<&'static str>,
@@ -240,6 +243,9 @@ pub struct DeepseekV41AttentionTpWorkletInput {
     pub decode_kv_lens: Vec<u32>,
     /// `attention_aux_stream_live(..)`: the stage-B aux stream exists.
     pub aux_stream_live: bool,
+    /// The forward replays a FULL CUDA graph (decode only): its attention
+    /// metadata, and so the decode segment's launch rows, are `num_tokens`.
+    pub full_graph: bool,
     /// `mhc_overlap_live(..)`: the entry takes the mHC overlap path.
     pub mhc_overlap: bool,
     /// Only the KV-writing launches run (the bounded-replay cut layer's
@@ -450,6 +456,8 @@ impl DeepseekV41AttentionTpWorklet {
                 window_size: cfg.window_size,
                 index_topk: cfg.index_topk,
                 padded_heads: cfg.padded_heads.clone(),
+                live_heads: heads_per_rank,
+                swapab_backends: cfg.swapab_attn_backends.clone(),
                 head_dim: cfg.head_dim.clone(),
                 rope_dim: cfg.rope_dim.clone(),
                 max_model_len: cfg.max_model_len,
@@ -755,6 +763,7 @@ impl DeepseekV41AttentionTpWorklet {
             &DeepseekV41MegaAttnOpInput {
                 prefill_query_context_pairs: prefill_pairs,
                 decode_kv_lens,
+                decode_launch_rows: input.full_graph.then_some(rows),
             },
             ev,
         );
@@ -856,6 +865,7 @@ pub(crate) mod tests {
             fp32_gemm_backends: vec!["torch_cublas"],
             kv_insert_backends: vec!["vllm_cuda"],
             mega_attn_backends: vec!["flashmla_mega"],
+            swapab_attn_backends: vec!["swapab_cutedsl"],
             wo_a_backends: vec!["deepgemm_mxfp8_einsum_grouped_o_proj"],
             all_reduce_backends: vec!["flashinfer_mnnvl"],
             index_logits_prefill_backends: vec!["deepgemm_fp8"],
@@ -963,6 +973,7 @@ pub(crate) mod tests {
             prefill_query_context_pairs: vec![(4, 16)],
             decode_kv_lens: vec![7; 48],
             aux_stream_live: false,
+            full_graph: false,
             mhc_overlap: false,
             write_kv_only: false,
         };

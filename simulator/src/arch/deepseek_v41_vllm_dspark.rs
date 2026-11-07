@@ -882,6 +882,7 @@ fn normalize_dspark_input(
             prefill_query_context_pairs: Vec::new(),
             decode_kv_lens,
             aux_stream_live: graph.is_some(),
+            full_graph: graph.is_some(),
             // Draft layers have no `mhc_stream` (`dspark.py:128-138`).
             mhc_overlap: false,
             write_kv_only: false,
@@ -1037,6 +1038,14 @@ mod tests {
         assert_eq!(resolved.rest_ffn.fused_moe.num_local_experts.get(), 32);
         assert!(resolved.rest_attention.indexer.is_none());
         assert!(resolved.rest_attention.compressor_proj.is_none());
+        // Ratio-0 draft layers never take the swap-AB decode kernel
+        // (`_swapab_decode_supported` requires a compressed layer).
+        for attention in [&resolved.first_attention, &resolved.rest_attention] {
+            assert!(crate::op::attention::deepseek_v41_mega_attn::swapab_config(
+                &attention.mega_attn
+            )
+            .is_none());
+        }
         // Draft lm_head is the target's vocab-sharded head.
         assert_eq!(resolved.head.lm_head.n.get(), 129_280 / 4);
     }
