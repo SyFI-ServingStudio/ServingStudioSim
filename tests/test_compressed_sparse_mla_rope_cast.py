@@ -28,7 +28,7 @@ _BASE = dict(
 )
 
 
-def _shape(**overrides):
+def _shape(swapab=False, **overrides):
     args = dict(
         _BASE,
         mode="decode",
@@ -37,7 +37,7 @@ def _shape(**overrides):
         compressed_cache_format="nvfp4",
     )
     args.update(overrides)
-    return runner._validate_args(**args)
+    return runner._validate_args(**args, swapab=swapab)
 
 
 def _cos_sin(max_pos):
@@ -179,6 +179,30 @@ def test_invalid_shapes_fail_closed():
         _shape(num_heads=16)
     with pytest.raises(ValueError, match="query <= context"):
         _shape(query_context_pairs=((9, 8),))
+
+
+def test_swapab_accepts_only_the_steps_vllm_routes_to_it():
+    # Defect caught: profiling swap-AB rows at shapes _forward_decode_mega
+    # would send to the mega kernel (prefill, ratio 0, > 16 rows, padded heads).
+    shape = _shape(num_heads=16, query_context_pairs=((1, 9),) * 16, swapab=True)
+    assert (shape.num_heads, shape.q_heads) == (16, 64)
+    for overrides, match in [
+        (dict(mode="prefill"), "decode on compressed layers"),
+        (dict(compress_ratio=0, compressed_cache_format="none"), "decode on compressed"),
+        (dict(query_context_pairs=((1, 9),) * 17), "at most 16 rows"),
+        (dict(num_heads=64), "live head count"),
+    ]:
+        with pytest.raises(runner.ProfilerNotImplemented, match=match):
+            _shape(**dict(dict(num_heads=16), **overrides), swapab=True)
+
+
+def test_swapab_workload_pads_q_with_zero_heads_past_the_live_ones():
+    # Defect caught: a Q buffer narrower than the production padded width, or
+    # nonzero padding heads, which _pad_interleaved_q never writes.
+    shape = _shape(num_heads=16, swapab=True)
+    work = runner._build_workload(torch, shape, torch.device("cpu"), runner._torch_writer)
+    assert work.q.shape[1] == work.sink.shape[0] == 64
+    assert bool((work.q[:, 16:] == 0).all()) and bool((work.q[:, :16] != 0).any())
 
 
 def test_record_bytes_match_the_simulators() -> None:

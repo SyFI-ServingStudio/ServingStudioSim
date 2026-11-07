@@ -14,6 +14,13 @@ compressed cache holding ``context // ratio`` rows per request, with up to
   compressed gather (ratio > 0), the MXFP8 SWA gather,
   ``combine_topk_swa_indices`` and one ``fused_norm_rope_attn_rope_cast_fwd``.
   Outside the timed region, the output is checked against the Torch reference.
+- ``swapab_cutedsl`` times the same ``_forward_decode_mega`` with the layer's
+  ``_use_swapab`` set, so the fork's own dispatch routes the call to
+  ``SwapABDecodeKernel`` (one CuTe DSL launch). Only the steps vLLM routes there
+  are accepted: decode, ratio 1 or 2, 16 or 32 live heads (``num_heads``), at
+  most ``_SWAPAB_MAX_TOKENS`` rows. Q is padded to the mega kernel's 64 heads
+  with zeros past the live ones, as ``_pad_interleaved_q`` writes it, and only
+  the live heads' output groups are checked.
 - ``torch`` times the independent Torch composite from
   ``compressed_sparse_mla_rope_cast_reference``: cache decode, RoPE, sparse attention
   with sink, inverse RoPE and FP8 cast.
@@ -43,6 +50,14 @@ _WINDOW = 128
 _INDEX_TOPK = 512
 _PREFILL_CHUNK_SIZE = 4
 _SUPPORTED_HEADS = (64, 128)
+# Live heads the swap-AB kernel takes, its token ceiling (the fork's
+# flash_mla_mega_attn._SWAPAB_MAX_TOKENS, asserted equal at run time) and the
+# padded Q width those heads sit in.
+_SWAPAB_HEADS = (16, 32)
+_SWAPAB_MAX_TOKENS = 16
+_SWAPAB_Q_HEADS = 64
+# Byte pattern in the padding heads' output groups before a swap-AB run.
+_SENTINEL = 0x5A
 # Production page sizes: the SWA cache is always 32-token pages, and the
 # compressed cache splits the 128-token vLLM block by the ratio.
 _SWA_BLOCK = 32
@@ -60,6 +75,8 @@ class _Shape:
     pairs: tuple[tuple[int, int], ...]
     ratio: int
     num_heads: int
+    # Heads of the Q buffer: num_heads, or the padded width under swap-AB.
+    q_heads: int
     max_model_len: int
     max_num_batched_tokens: int
     extra_format: str | None
@@ -89,6 +106,8 @@ def _validate_args(
     swa_cache_format: str,
     compressed_cache_format: str,
     output_dtype: object,
+    *,
+    swapab: bool = False,
 ) -> _Shape:
     if mode not in _MODES:
         raise ValueError(f"mode must be one of {_MODES}, got {mode!r}")
@@ -118,7 +137,17 @@ def _validate_args(
             f"{KIND} supports (window, index_topk, head_dim, rope_dim, prefill_chunk_size)="
             f"{expected}, got {model}"
         )
-    if num_heads not in _SUPPORTED_HEADS:
+    if swapab:
+        if mode != "decode" or compress_ratio == 0 or total > _SWAPAB_MAX_TOKENS:
+            raise ProfilerNotImplemented(
+                f"{KIND}:swapab_cutedsl serves decode on compressed layers with at most "
+                f"{_SWAPAB_MAX_TOKENS} rows"
+            )
+        if num_heads not in _SWAPAB_HEADS:
+            raise ProfilerNotImplemented(
+                f"{KIND}:swapab_cutedsl takes the live head count {_SWAPAB_HEADS}, got {num_heads}"
+            )
+    elif num_heads not in _SUPPORTED_HEADS:
         raise ProfilerNotImplemented(
             f"{KIND} takes the kernel's padded head count {_SUPPORTED_HEADS}, got {num_heads}"
         )
@@ -141,6 +170,7 @@ def _validate_args(
         query_context_pairs,
         compress_ratio,
         num_heads,
+        _SWAPAB_Q_HEADS if swapab else num_heads,
         max_model_len,
         max_num_batched_tokens,
         extra_format,
@@ -306,8 +336,10 @@ def _build_workload(torch: Any, shape: _Shape, device: Any, writer: Any) -> _Wor
     if extra_cache is not None:
         fill(extra_cache, "compressed", shape.extra_format, extra_live)
 
-    q = torch.randn((positions.shape[0], num_heads, _HEAD_DIM), generator=generator)
-    sink = torch.randn((num_heads,), generator=generator)
+    q = torch.randn((positions.shape[0], shape.q_heads, _HEAD_DIM), generator=generator)
+    # Heads past the live ones are the zero padding _pad_interleaved_q writes.
+    q[:, num_heads:] = 0
+    sink = torch.randn((shape.q_heads,), generator=generator)
     return _Workload(
         q=q.to(device=device, dtype=torch.bfloat16),
         positions=positions.to(device),
@@ -463,10 +495,13 @@ def _check_rows(torch: Any, num_tokens: int) -> Any:
     return torch.linspace(0, num_tokens - 1, _CHECK_ROWS).round().long().unique()
 
 
-def check_against_reference(torch: Any, shape: _Shape, work: _Workload, out: Any) -> dict:
+def check_against_reference(
+    torch: Any, shape: _Shape, work: _Workload, out: Any, backend: str = "flashmla_mega"
+) -> dict:
     """Compare the kernel's FP8 output to the Torch reference on sampled rows.
 
-    The kernel output is dequantized from its fused layout. Tolerances: each
+    The kernel output is dequantized from its fused layout; only the heads the
+    kernel runs (``num_heads``) are compared. Tolerances: each
     UE8M0 exponent within 1 of the reference's, and each (row, head)
     relative L2 error within ``_REL_TOL``. The FP8 cast alone gives about
     0.03 (a 3-bit mantissa).
@@ -479,8 +514,9 @@ def check_against_reference(torch: Any, shape: _Shape, work: _Workload, out: Any
 
     rows = _check_rows(torch, shape.num_tokens).to(work.q.device)
     values, exponents = output_from_fused_layout(out.data[rows], out.scale[rows])
-    got = dequantize_output(values, exponents)
-    expected = _reference(torch, shape, work, rows)
+    heads = shape.num_heads
+    got = dequantize_output(values[:, :heads], exponents[:, :heads])
+    expected = _reference(torch, shape, work, rows)[:, :heads]
     _ref_values, ref_exponents = quantize_output(expected)
     exponent_gap = int((exponents.int() - ref_exponents.int()).abs().max().item())
     rel = (got - expected).norm(dim=-1) / expected.norm(dim=-1).clamp(min=1e-6)
@@ -492,12 +528,18 @@ def check_against_reference(torch: Any, shape: _Shape, work: _Workload, out: Any
         "max_exponent_gap": exponent_gap,
     }
     if not torch.isfinite(got).all() or exponent_gap > 1 or report["max_rel_l2"] > _REL_TOL:
-        raise KernelLaunchFailed(f"{KIND}:flashmla_mega mismatches the Torch reference: {report}")
+        raise KernelLaunchFailed(f"{KIND}:{backend} mismatches the Torch reference: {report}")
     return report
 
 
-def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Workload, Any, Any]:
-    """Build the workload and a closure running the production segment method."""
+def build_flashmla_mega(
+    torch: Any, shape: _Shape, device: Any, *, swapab: bool = False
+) -> tuple[_Workload, Any, Any]:
+    """Build the workload and a closure running the production segment method.
+
+    With ``swapab`` the layer carries ``_use_swapab`` and its live head count,
+    so ``_forward_decode_mega``'s own dispatch launches the swap-AB kernel.
+    """
     try:
         from vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn import (
             DeepseekV4MegaAttnAttention,
@@ -517,11 +559,15 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
     if not supported:
         raise ProfilerNotImplemented(f"{KIND}:flashmla_mega unavailable: {reason}")
 
+    if swapab:
+        _check_swapab_route(shape)
     work = _build_workload(torch, shape, device, _production_writer)
     num_tokens = shape.num_tokens
-    out = alloc_mega_attn_output(num_tokens, shape.num_heads // 8, device)
+    out = alloc_mega_attn_output(num_tokens, shape.q_heads // 8, device)
     q_fused = _q_fused(work.q)
-    positions32 = work.positions.to(torch.int32)
+    # The swap-AB kernel is compiled for int64 positions (SwapABDecodeKernel
+    # __call__); the mega kernel takes int32.
+    positions = work.positions if swapab else work.positions.to(torch.int32)
     layer = types.SimpleNamespace(
         compress_ratio=shape.ratio,
         PREFILL_CHUNK_SIZE=_PREFILL_CHUNK_SIZE,
@@ -532,7 +578,9 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
         scale=_HEAD_DIM**-0.5,
         attn_sink=work.sink,
         rotary_emb=types.SimpleNamespace(cos_sin_cache=work.cos_sin),
-        n_wv_group=shape.num_heads // 8,
+        n_wv_group=shape.q_heads // 8,
+        n_local_heads=shape.num_heads,
+        _use_swapab=swapab,
         _compressed_kv_cache=lambda: work.extra_cache,
     )
     flashmla_metadata = (
@@ -556,7 +604,7 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
 
         def run() -> None:
             DeepseekV4MegaAttnAttention._forward_decode_mega(
-                layer, q_fused, positions32, flashmla_metadata, swa_metadata, out
+                layer, q_fused, positions, flashmla_metadata, swa_metadata, out
             )
 
         return work, run, out
@@ -593,10 +641,26 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
 
     def run() -> None:
         DeepseekV4MegaAttnAttention._forward_prefill_mega(
-            layer, q_fused, positions32, flashmla_metadata, swa_metadata, out, 0
+            layer, q_fused, positions, flashmla_metadata, swa_metadata, out, 0
         )
 
     return work, run, out
+
+
+def _check_swapab_route(shape: _Shape) -> None:
+    """Fail unless ``_forward_decode_mega`` would route this shape to swap-AB."""
+    from vllm.models.deepseek_v41.nvidia import flash_mla_mega_attn as mega
+    from vllm.models.deepseek_v41.nvidia.ops.swapab_decode_attn import swapab_decode_supported
+
+    if mega._SWAPAB_MAX_TOKENS != _SWAPAB_MAX_TOKENS:
+        raise ProfilerNotImplemented(
+            f"{KIND}:swapab_cutedsl expects _SWAPAB_MAX_TOKENS={_SWAPAB_MAX_TOKENS}, "
+            f"the fork has {mega._SWAPAB_MAX_TOKENS}"
+        )
+    if not swapab_decode_supported(shape.num_heads, _WINDOW, _INDEX_TOPK):
+        raise ProfilerNotImplemented(
+            f"{KIND}:swapab_cutedsl unsupported here (heads, cluster tiles or CuTe DSL < 13.2)"
+        )
 
 
 def _q_fused(q: Any) -> Any:
@@ -621,7 +685,30 @@ def profile_compressed_sparse_mla_rope_cast_flashmla_mega(**kwargs: Any) -> Comp
     return _profile(shape, "flashmla_mega", build)
 
 
+def profile_compressed_sparse_mla_rope_cast_swapab_cutedsl(**kwargs: Any) -> ComputeMetrics:
+    """Time the fork's decode segment routed to the swap-AB kernel."""
+    shape = _validate_args(**kwargs, swapab=True)
+
+    def build(torch: Any, device: Any) -> tuple[_Workload, Any]:
+        work, run, out = build_flashmla_mega(torch, shape, device, swapab=True)
+        # The mega kernel writes every padded head's output group; swap-AB only
+        # the live ones. Untouched padding groups prove the dispatch took it.
+        padding = out.data[:, shape.num_heads // 8 :].view(torch.uint8)
+        padding.fill_(_SENTINEL)
+        run()
+        torch.cuda.synchronize(device)
+        if not bool((padding == _SENTINEL).all()):
+            raise KernelLaunchFailed(
+                f"{KIND}:swapab_cutedsl: the decode segment did not take the swap-AB kernel"
+            )
+        check_against_reference(torch, shape, work, out, "swapab_cutedsl")
+        return work, run
+
+    return _profile(shape, "swapab_cutedsl", build)
+
+
 __all__ = [
     "profile_compressed_sparse_mla_rope_cast_flashmla_mega",
+    "profile_compressed_sparse_mla_rope_cast_swapab_cutedsl",
     "profile_compressed_sparse_mla_rope_cast_torch",
 ]
