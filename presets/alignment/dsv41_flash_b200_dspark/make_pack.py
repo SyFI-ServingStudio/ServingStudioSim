@@ -79,6 +79,7 @@ TOPOLOGIES = {
     "tp4": {"tp_size": 4, "dp_size": 1},
     "dp4": {"tp_size": 1, "dp_size": 4},
 }
+ARCH_TYPES = {"tp4": "deepseek_v41_vllm_dspark", "dp4": "deepseek_v41_vllm_dp_attn_ep_moe_dspark"}
 # chunk -> max_num_seqs
 CHUNKS = {2048: 64, 4096: 32, 8192: 128}
 
@@ -142,12 +143,10 @@ def variant(topo: str, chunk: int) -> dict:
         ],
     }
     arch = {
-        # Lane C's DSpark wrapper (design D4) over the TP4 or the DP4 target; the tag and its DP field
-        # follow that lane's merge.
-        "type": "deepseek_v41_vllm_dspark",
+        # The DSpark wrapper (design D4) over the TP4 target or the DP4 target.
+        "type": ARCH_TYPES[topo],
         "model_config": "model/config/deepseek_v41_flash.json",
         "fp8": True,
-        "num_attn_dp_groups": TOPOLOGIES[topo]["dp_size"],
         "routing": "corpus",
         # Old-vLLM diverse_100 routes; replaced by this pack's token_corpus capture once uploaded.
         "token_corpus_file": "hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/"

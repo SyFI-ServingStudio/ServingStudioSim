@@ -213,7 +213,6 @@ variants:
       type: deepseek_v41_vllm_dspark
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
-      num_attn_dp_groups: 1
       routing: corpus
       token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
       draft_tokens: 5
@@ -604,7 +603,6 @@ variants:
       type: deepseek_v41_vllm_dspark
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
-      num_attn_dp_groups: 1
       routing: corpus
       token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
       draft_tokens: 5
@@ -1043,7 +1041,6 @@ variants:
       type: deepseek_v41_vllm_dspark
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
-      num_attn_dp_groups: 1
       routing: corpus
       token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
       draft_tokens: 5
@@ -1463,10 +1460,9 @@ variants:
       - --speculative-config
       - '{"method":"dspark","num_speculative_tokens":5}'
     arch:
-      type: deepseek_v41_vllm_dspark
+      type: deepseek_v41_vllm_dp_attn_ep_moe_dspark
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
-      num_attn_dp_groups: 4
       routing: corpus
       token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
       draft_tokens: 5
@@ -1854,10 +1850,9 @@ variants:
       - --speculative-config
       - '{"method":"dspark","num_speculative_tokens":5}'
     arch:
-      type: deepseek_v41_vllm_dspark
+      type: deepseek_v41_vllm_dp_attn_ep_moe_dspark
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
-      num_attn_dp_groups: 4
       routing: corpus
       token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
       draft_tokens: 5
@@ -2293,10 +2288,9 @@ variants:
       - --speculative-config
       - '{"method":"dspark","num_speculative_tokens":5}'
     arch:
-      type: deepseek_v41_vllm_dspark
+      type: deepseek_v41_vllm_dp_attn_ep_moe_dspark
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
-      num_attn_dp_groups: 4
       routing: corpus
       token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
       draft_tokens: 5
