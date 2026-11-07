@@ -97,6 +97,10 @@ const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
 /// [`Glm52MtpMode`]'s serde representation.
 const GLM52_MTP_MODES: [&str; 3] = ["off", "full_index", "index_share"];
 
+const fn default_decoder_swa_bounded_replay() -> bool {
+    true
+}
+
 const fn default_glm52_parallel_size() -> u16 {
     8
 }
@@ -374,11 +378,11 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         max_model_len: Option<u32>,
-        /// Decoder SWA bounded replay what-if (vLLM PR #58132 / SGLang
-        /// `--enable-decoder-swa-bounded-replay`): layers past the last KV
-        /// source run only each prefill chunk's last `sliding_window` extend
-        /// tokens. A counterfactual with no capture behind it; default off.
-        #[serde(default)]
+        /// vLLM's decoder SWA bounded replay (`swa_bounded_replay`, on by
+        /// default): on eager steps and large PIECEWISE steps the layers from
+        /// the last KV source on run only each request's last
+        /// `sliding_window` rows. `false` is the counterfactual without it.
+        #[serde(default = "default_decoder_swa_bounded_replay")]
         decoder_swa_bounded_replay: bool,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
@@ -407,11 +411,11 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         max_model_len: Option<u32>,
-        /// Decoder SWA bounded replay what-if (vLLM PR #58132 / SGLang
-        /// `--enable-decoder-swa-bounded-replay`): layers past the last KV
-        /// source run only each prefill chunk's last `sliding_window` extend
-        /// tokens. A counterfactual with no capture behind it; default off.
-        #[serde(default)]
+        /// vLLM's decoder SWA bounded replay (`swa_bounded_replay`, on by
+        /// default): on eager steps and large PIECEWISE steps the layers from
+        /// the last KV source on run only each request's last
+        /// `sliding_window` rows. `false` is the counterfactual without it.
+        #[serde(default = "default_decoder_swa_bounded_replay")]
         decoder_swa_bounded_replay: bool,
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and

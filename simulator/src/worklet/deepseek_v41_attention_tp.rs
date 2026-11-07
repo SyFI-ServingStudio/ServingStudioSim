@@ -40,12 +40,25 @@
 //!
 //! Folded, no leaf: the position cast before attention, the global top-k remap
 //! (into the mega-attention op) and the per-layer attention metadata.
+//!
+//! Two per-call modes change which slots carry time (the tree is fixed):
+//!
+//! - `mhc_overlap`: FULL-graph forwards of at most 16 rows replace the fused
+//!   `mega_mhc` entry with [`MhcOverlapBoundary`] (caller-stream post + input
+//!   epilogue, side-stream coefficients beside the rest of the block). Only a
+//!   `FusedPostPre` entry has the boundary; the layer-0 and Engram entries
+//!   keep their unfused launches.
+//! - `write_kv_only`: the bounded-replay cut layer's KV write over every row
+//!   (`DeepseekV4DecoderLayer.write_kv` -> `attention.py` `forward_kv`): the
+//!   entry mHC, the input projections, the q/kv norm, the SWA KV insert, the
+//!   compressor and the index-K store run; `wq_b`, the indexer Q path and
+//!   scoring, attention, `wo_a`, `wo_b` and the all-reduce do not.
 
 use std::sync::Arc;
 
 use super::deepseek_v41_common::{
-    compile_serial_copy, eval_or_zero, gated_fanout, placeholder,
-    MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+    compile_serial_copy, eval_or_zero, gated_fanout, placeholder, MhcOverlapBoundary,
+    MhcOverlapBoundaryConfig, MhcOverlapBoundaryResolved, MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
 };
 use crate::common::Fabric;
 use crate::op::attention::{
@@ -174,6 +187,8 @@ pub struct DeepseekV41AttentionTpWorkletConfig {
     pub prefill_chunk_size: u32,
     pub gpu_name: String,
     pub mhc_backends: Vec<&'static str>,
+    /// The unfused TileLang mHC kinds of the overlap path.
+    pub mhc_tilelang_backends: Vec<&'static str>,
     pub gemm_backends: Vec<&'static str>,
     pub fp32_gemm_backends: Vec<&'static str>,
     pub kv_insert_backends: Vec<&'static str>,
@@ -194,6 +209,8 @@ pub struct DeepseekV41AttentionTpWorkletResolved {
     pub entry_hc_prenorm: Option<ElementwiseKernelConfig>,
     pub entry_pre_fuse: Option<ElementwiseKernelConfig>,
     pub entry_fused: Option<MhcRmsNormKernelConfig>,
+    /// `Some` exactly when `entry_fused` is.
+    pub mhc_overlap: Option<MhcOverlapBoundaryResolved>,
     pub fused_wqa_wkv: SingleGemmKernelConfig,
     pub compressor_proj: Option<GemmFp32OutputKernelConfig>,
     pub indexer_weights_proj: Option<ElementwiseKernelConfig>,
@@ -223,6 +240,11 @@ pub struct DeepseekV41AttentionTpWorkletInput {
     pub decode_kv_lens: Vec<u32>,
     /// `attention_aux_stream_live(..)`: the stage-B aux stream exists.
     pub aux_stream_live: bool,
+    /// `mhc_overlap_live(..)`: the entry takes the mHC overlap path.
+    pub mhc_overlap: bool,
+    /// Only the KV-writing launches run (the bounded-replay cut layer's
+    /// `write_kv` over every row).
+    pub write_kv_only: bool,
 }
 
 pub struct DeepseekV41AttentionTpWorklet {
@@ -231,6 +253,7 @@ pub struct DeepseekV41AttentionTpWorklet {
     pub entry_hc_prenorm: Option<Op<ElementwiseKernel>>,
     pub entry_pre_fuse: Option<Op<ElementwiseKernel>>,
     pub entry_fused: Option<Op<MhcFusedPostPreRmsNormKernel>>,
+    pub mhc_overlap: Option<MhcOverlapBoundary>,
     pub fused_wqa_wkv: Op<SingleGemmKernel>,
     pub compressor_proj: Option<Op<GemmFp32OutputKernel>>,
     pub indexer_weights_proj: Option<Op<ElementwiseKernel>>,
@@ -320,6 +343,15 @@ impl DeepseekV41AttentionTpWorklet {
             // nvidia/model.py:435 -> `mhc_pre_big_fuse_with_norm`: streams and
             // mixes in, the normalized attention input out.
             entry_pre_fuse: layer0.then(|| ew(hc_hidden_bytes + mix_bytes, hidden * 2)),
+            mhc_overlap: (layer.entry == DeepseekV41AttentionEntry::FusedPostPre).then(|| {
+                MhcOverlapBoundary::resolve(&MhcOverlapBoundaryConfig {
+                    hidden_size: cfg.hidden_size.clone(),
+                    hc_mult: cfg.hc_mult,
+                    gpu_name: cfg.gpu_name.clone(),
+                    mhc_tilelang_backends: cfg.mhc_tilelang_backends.clone(),
+                    elementwise_backends: cfg.elementwise_backends.clone(),
+                })
+            }),
             entry_fused: (layer.entry == DeepseekV41AttentionEntry::FusedPostPre).then(|| {
                 MhcRmsNormKernelConfig {
                     backends: cfg.mhc_backends.clone(),
@@ -485,6 +517,14 @@ impl DeepseekV41AttentionTpWorklet {
                 r.entry_fused,
                 "entry.mega_mhc_post_pre"
             ),
+            mhc_overlap: match r.mhc_overlap {
+                Some(config) => Some(MhcOverlapBoundary::build(
+                    &format!("{name}.entry"),
+                    config,
+                    bridge,
+                )?),
+                None => None,
+            },
             fused_wqa_wkv: op!(SingleGemmKernel, r.fused_wqa_wkv, "input.fused_wqa_wkv"),
             compressor_proj: maybe!(
                 GemmFp32OutputKernel,
@@ -545,6 +585,10 @@ impl DeepseekV41AttentionTpWorklet {
         if let Some(entry) = &self.entry_fused {
             children.push(entry.compile(b));
         }
+        if let Some(overlap) = &self.mhc_overlap {
+            children.extend(overlap.compile_entry(b));
+        }
+        let entries = children.len();
 
         // Stage A: fused_wqa_wkv | compressor kv_score | indexer weights_proj.
         let main = vec![self.fused_wqa_wkv.compile(b)];
@@ -602,6 +646,10 @@ impl DeepseekV41AttentionTpWorklet {
         if let Some(all_reduce) = &self.all_reduce {
             children.push(all_reduce.compile(b));
         }
+        if let Some(overlap) = &self.mhc_overlap {
+            let body = children.split_off(entries);
+            children.push(overlap.compile_beside(body, b));
+        }
 
         let layer = self.resolved.raw_cfg.layer;
         CostNode::Labeled {
@@ -626,6 +674,9 @@ impl DeepseekV41AttentionTpWorklet {
             .unwrap_or_else(|reason| panic!("invalid DeepseekV41AttentionTpWorkletInput: {reason}"));
         let rows = input.num_tokens;
         let zero = rows == 0;
+        // Launches `write_kv` skips.
+        let skip = zero || input.write_kv_only;
+        let overlap = !zero && input.mhc_overlap && self.mhc_overlap.is_some();
         let gates = stream_gates(input, &self.resolved.raw_cfg);
         let ew = ElementwiseKernelInput { num_tokens: rows };
         let gemm = SingleGemmKernelInput { m: rows };
@@ -637,7 +688,10 @@ impl DeepseekV41AttentionTpWorklet {
             eval_or_zero(entry, ew.clone(), zero, ev);
         }
         if let Some(entry) = &self.entry_fused {
-            eval_or_zero(entry, MhcRmsNormKernelInput { num_tokens: rows }, zero, ev);
+            eval_or_zero(entry, MhcRmsNormKernelInput { num_tokens: rows }, zero || overlap, ev);
+        }
+        if let Some(boundary) = &self.mhc_overlap {
+            boundary.eval_entry(rows, overlap, ev);
         }
 
         eval_or_zero(&self.fused_wqa_wkv, gemm.clone(), zero, ev);
@@ -653,7 +707,7 @@ impl DeepseekV41AttentionTpWorklet {
 
         eval_or_zero(&self.qk_rmsnorm, ew.clone(), zero, ev);
 
-        eval_or_zero(&self.wq_b, gemm.clone(), zero, ev);
+        eval_or_zero(&self.wq_b, gemm.clone(), skip, ev);
         eval_or_zero(
             &self.kv_insert,
             QPadKvRopeMxfp8InsertKernelInput { num_tokens: rows },
@@ -669,41 +723,53 @@ impl DeepseekV41AttentionTpWorklet {
             eval_or_zero(op, ew.clone(), zero, ev);
         }
         if let Some(op) = &self.indexer_wq_b {
-            eval_or_zero(op, gemm.clone(), zero, ev);
+            eval_or_zero(op, gemm.clone(), skip, ev);
         }
         if let Some(op) = &self.indexer_q_rope {
-            eval_or_zero(op, ew.clone(), zero, ev);
+            eval_or_zero(op, ew.clone(), skip, ev);
         }
         if let Some(op) = &self.compressor_insert {
             eval_or_zero(op, ew.clone(), zero || !gates.aux_stream, ev);
             eval_or_zero(op, ew.clone(), zero || gates.aux_stream, ev);
         }
 
+        // `write_kv` scores nothing and attends nothing.
+        let (prefill_pairs, decode_kv_lens) = if input.write_kv_only {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                input.prefill_query_context_pairs.clone(),
+                input.decode_kv_lens.clone(),
+            )
+        };
         if let Some(indexer) = &self.indexer {
             indexer.eval(
                 &DeepseekV41IndexerOpInput {
-                    prefill_query_context_pairs: input.prefill_query_context_pairs.clone(),
-                    decode_kv_lens: input.decode_kv_lens.clone(),
+                    prefill_query_context_pairs: prefill_pairs.clone(),
+                    decode_kv_lens: decode_kv_lens.clone(),
                 },
                 ev,
             );
         }
         self.mega_attn.eval(
             &DeepseekV41MegaAttnOpInput {
-                prefill_query_context_pairs: input.prefill_query_context_pairs.clone(),
-                decode_kv_lens: input.decode_kv_lens.clone(),
+                prefill_query_context_pairs: prefill_pairs,
+                decode_kv_lens,
             },
             ev,
         );
-        eval_or_zero(&self.wo_a, BatchedGemmKernelInput { m: rows }, zero, ev);
-        eval_or_zero(&self.wo_b, gemm, zero, ev);
+        eval_or_zero(&self.wo_a, BatchedGemmKernelInput { m: rows }, skip, ev);
+        eval_or_zero(&self.wo_b, gemm, skip, ev);
         if let Some(all_reduce) = &self.all_reduce {
             eval_or_zero(
                 all_reduce,
                 AllReduceFusionKernelInput { num_tokens: rows },
-                zero,
+                skip,
                 ev,
             );
+        }
+        if let Some(boundary) = &self.mhc_overlap {
+            boundary.eval_side(rows, overlap, self.resolved.raw_cfg.serialize_streams, ev);
         }
     }
 }
@@ -785,6 +851,7 @@ pub(crate) mod tests {
             prefill_chunk_size: 4,
             gpu_name: "NVIDIA B200".into(),
             mhc_backends: vec!["deepgemm_mega"],
+            mhc_tilelang_backends: vec!["vllm_tilelang"],
             gemm_backends: vec!["flashinfer_mxfp8"],
             fp32_gemm_backends: vec!["torch_cublas"],
             kv_insert_backends: vec!["vllm_cuda"],
@@ -896,6 +963,8 @@ pub(crate) mod tests {
             prefill_query_context_pairs: vec![(4, 16)],
             decode_kv_lens: vec![7; 48],
             aux_stream_live: false,
+            mhc_overlap: false,
+            write_kv_only: false,
         };
         assert!(validate_input(&ok, &cfg).is_ok());
         let bad = DeepseekV41AttentionTpWorkletInput {

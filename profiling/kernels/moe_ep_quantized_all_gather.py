@@ -1,4 +1,4 @@
-"""Grouped all-gatherv of quantized activations and top-k routing used by naive DP/EP MoE."""
+"""Grouped all-gatherv of NVFP4 or MXFP8 activations and top-k routing used by naive DP/EP MoE."""
 
 from __future__ import annotations
 
@@ -35,16 +35,17 @@ class MoeEpQuantizedAllGatherArgs(KernelArgs):
 DOC = KernelDoc(
     title="MoE all-gather of quantized activations and top-k routing",
     summary=(
-        "Gather NVFP4 or MXFP8 activations, scales and top-k routing from every data-parallel GPU."
+        "Gather NVFP4 or MXFP8 activations, scales and top-k routing from every "
+        "data-parallel GPU."
     ),
     description=(
         "With data and expert parallelism, vLLM's allgather_reducescatter backend "
         "can quantize activations and select experts before dispatch. Each GPU then "
-        "gathers four tensors from every GPU: the quantized activations, their "
-        "block scales, the fp32 top-k weights and the int32 top-k expert IDs. "
-        "NVFP4 packs hidden_size/2 bytes per token with one fp8 e4m3 scale per 16 "
-        "elements; MXFP8 (DeepSeek-V4.1's mxfp4_mxfp8 MoE) sends hidden_size e4m3 "
-        "bytes with one ue8m0 exponent per 32 elements. GPU r "
+        "gathers four tensors from every GPU: the quantized activations, either "
+        "packed NVFP4 (hidden_size/2 bytes per token, one fp8 e4m3 block scale per "
+        "16 elements) or MXFP8 (hidden_size bytes, one ue8m0 scale per 32 elements), "
+        "the fp32 top-k weights, the int32 top-k expert IDs and the block scales. "
+        "MXFP8 is DeepSeek-V4.1's TRT-LLM MXFP4 experts' dispatch. GPU r "
         "contributes per_rank_tokens[r] tokens. The four gathers run in one NCCL "
         "group: all_gather when the counts are equal, all_gatherv otherwise."
     ),
