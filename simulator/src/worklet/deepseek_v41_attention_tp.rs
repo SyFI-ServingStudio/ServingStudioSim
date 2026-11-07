@@ -422,7 +422,15 @@ impl DeepseekV41AttentionTpWorklet {
                 backends: cfg.kv_insert_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_heads: heads_per_rank,
-                padded_heads: cfg.padded_heads.get(),
+                // attention.py `_fused_qnorm_rope_kv_insert`: the mega-attention
+                // layer takes an unnormed, unroped Q, so the launch only zero-pads
+                // Q to `padded_heads`; a shard already that wide passes
+                // `q_head_padded = 0` and runs the KV-only instance.
+                padded_heads: if heads_per_rank == cfg.padded_heads.get() {
+                    0
+                } else {
+                    cfg.padded_heads.get()
+                },
                 block_size: cfg.swa_block_size,
                 input_dtype: DType::Bf16,
                 swa_cache_format: "mxfp8".to_string(),
@@ -976,6 +984,16 @@ pub(crate) mod tests {
         assert_eq!(r.indexer_wq_b.as_ref().unwrap().backends, prequantized);
         assert_eq!(r.wo_b.backends, prequantized);
         assert_eq!(r.fused_wqa_wkv.backends, ["flashinfer_mxfp8"]);
+    }
+
+    /// Catches a full-width shard (TP1 / DP attention) priced with the Q-pad
+    /// instance: production passes `q_head_padded = 0` and runs KV-only.
+    #[test]
+    fn kv_insert_is_kv_only_when_the_shard_is_already_padded_width() {
+        let mut cfg = config(2);
+        cfg.tp_size = 1;
+        let r = DeepseekV41AttentionTpWorklet::resolve_config(&cfg);
+        assert_eq!((r.kv_insert.num_heads, r.kv_insert.padded_heads), (64, 0));
     }
 
     /// Catches the decode top-k remap launch folded away at zero cost, or
