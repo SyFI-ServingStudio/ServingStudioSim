@@ -56,15 +56,16 @@ def _config(tmp_path: Path, **overrides) -> Path:
     return path
 
 
-def test_align_image_tag_names_its_base_and_load_generator():
-    align = images.IMAGES["vllm-align"]
-    assert align.base == "vllm"
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
+def test_align_image_tag_names_its_base_and_load_generator(engine):
+    name = image_runtime.ENGINE_IMAGES[engine].image
+    align = images.IMAGES[name]
+    assert align.base == engine
     assert align.envs == ()
     assert "alignment/load_generator/req-frontend" in align.submodules
-    # A new vLLM image (another fork gitlink) is a new alignment image.
-    vllm = images.IMAGES["vllm"]
+    # A new engine image (another fork gitlink) is a new alignment image.
     other = images.Image(
-        "vllm-align",
+        name,
         align.dockerfile,
         align.envs,
         align.inputs,
@@ -73,7 +74,8 @@ def test_align_image_tag_names_its_base_and_load_generator():
         base="default",
     )
     assert other.tag(REPO_ROOT) != align.tag(REPO_ROOT)
-    assert vllm.tag(REPO_ROOT).startswith("vibesim-profiler-vllm:")
+    assert image_runtime.image_tag(engine, REPO_ROOT) == align.tag(REPO_ROOT)
+    assert align.tag(REPO_ROOT).startswith(f"vibesim-profiler-{name}:")
 
 
 def test_container_config_uses_fixed_paths(tmp_path):
@@ -85,7 +87,7 @@ def test_container_config_uses_fixed_paths(tmp_path):
     assert document["log_dir"] == "/out"
     assert document["cuda_visible_devices"] == "0,1"
     assert info["host_devices"] == ["2", "3"]
-    assert document["fork_python"] == str(image_runtime.FORK_PYTHON)
+    assert document["fork_python"] == str(image_runtime.ENGINE_IMAGES["vllm"].fork_python)
     assert document["nsys"]["executable"] == str(image_runtime.NSYS)
     assert document["server"]["model_path"] == snapshot
     assert json.loads(document["server"]["extra_args"][1]) == {"model": snapshot}
@@ -121,6 +123,18 @@ def test_model_mount_follows_relative_links_into_a_shared_blob_store(tmp_path):
     (snapshot / "gone.safetensors").symlink_to("../../blobs/missing")
     with pytest.raises(image_runtime.ImageRunError, match="broken link|outside"):
         image_runtime._model_mount(snapshot, image_runtime.Mounts())
+
+
+def test_container_config_serves_sglang_from_its_image_venv(tmp_path):
+    runtime = {
+        "packages": [{"name": "nvtx", "version": "0.2.16", "index_url": "https://pypi.org/simple"}],
+        "environment": {"FLASHINFER_DISABLE_JIT": "1"},
+    }
+    config = _config(tmp_path, engine="sglang", python_runtime=runtime)
+    document, _, _ = image_runtime.container_config(config, tmp_path / "out")
+    assert document["fork_python"] == "/opt/sglang-venv/bin/python"
+    # The prebuilt-artifact contract travels unchanged; the image must satisfy it.
+    assert document["python_runtime"] == runtime
 
 
 def test_container_config_refuses_what_the_image_cannot_honour(tmp_path):

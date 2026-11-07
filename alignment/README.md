@@ -527,15 +527,19 @@ uv run python -m launcher alignment analyze logs/<experiment>/analyze_e2e.yaml
 ### In-image capture
 
 `alignment profile --runtime image <profile.yaml>` runs the same capture inside
-the `vllm-align` profiler image (`profiling/container/README.md`) instead of on
-the checkout's fork venv and the host's Nsight Systems. The image fixes
+the engine's alignment profiler image, `vllm-align` or `sglang-align`
+(`profiling/container/README.md`), instead of on the checkout's fork venv and
+the host's Nsight Systems. The vLLM image fixes
 everything that decides what is measured: the vLLM fork at its gitlink on the
 precompiled wheel of its upstream base, every FlashInfer cubin, Nsight Systems
 2025.5.2 (the apt package, at the same `/opt/nvidia/...` path as the hosts), the
 req-frontend `session_runner` at its gitlink, and the capture runner's own
 interpreter. This checkout's `alignment/` (minus its three submodules),
 `launcher/`, `profiling/` and `gpu/` are overlaid read-only, so a code change
-needs no rebuild. `alignment/image_runtime.py` owns the mapping:
+needs no rebuild. `sglang-align` is the same over the SGLang profiler image: its
+server runs `/opt/sglang-venv/bin/python` on the fork source the image carries,
+and the config's `python_runtime` contract is checked against that venv as on a
+host; with `--network none` a wheel the image lacks is refused, not installed. `alignment/image_runtime.py` owns the mapping:
 
 | Container path | Mount | Holds |
 | --- | --- | --- |

@@ -178,6 +178,20 @@ IMAGES = {
             },
             base="vllm",
         ),
+        # The same for the SGLang image (`sglang_align.Dockerfile`).
+        Image(
+            "sglang-align",
+            "profiling/container/sglang_align.Dockerfile",
+            (),
+            inputs=("profiling/container/requirements/capture.txt",),
+            submodules=("alignment/load_generator/req-frontend",),
+            build_args=lambda root: {
+                "VIBESIM_REQ_FRONTEND_REVISION": gitlink(
+                    root, "alignment/load_generator/req-frontend"
+                )
+            },
+            base="sglang",
+        ),
         Image(
             "flashinfer-kda",
             "profiling/container/flashinfer_kda.Dockerfile",
