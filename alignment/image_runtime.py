@@ -1,11 +1,12 @@
-"""Run one `alignment profile` pass inside the vLLM alignment image.
+"""Run one `alignment profile` pass inside the engine's alignment image.
 
 The host keeps what belongs to the machine: Slurm, which GPUs, where the
 outputs go. The image owns everything that decides what the capture measures:
 the engine venv and its native extensions, Nsight Systems, the req-frontend
 binary, and the capture runner's interpreter (`profiling/container/images.py`,
-image `vllm-align`). The capture code itself is not baked in: this checkout's
-`alignment/` (minus its submodules, which the image carries), `launcher/`,
+image `vllm-align` or `sglang-align`, chosen by the config's `engine`). The
+capture code itself is not baked in: this checkout's `alignment/` (minus its
+submodules, which the image carries), `launcher/`,
 `profiling/` and `gpu/` are overlaid read-only, exactly as L1 profiler workers
 overlay theirs.
 
@@ -22,7 +23,7 @@ config wherever it runs:
   (`HOME=/cache/home`).
 
 The container runs with `--network none` (every artifact is in the image or a
-mount), `--ipc host` (vLLM's shared-memory queues and CUDA IPC), unlimited
+mount), `--ipc host` (the engines' shared-memory queues and CUDA IPC), unlimited
 memlock, the job's GPUs by UUID and IMEX channel 0 (fabric-handle all-reduce
 workspaces). When it exits, `profile_result.json` names container paths;
 `rebind_result` rewrites them to this host's, keeping the originals beside, so
@@ -45,9 +46,8 @@ from profiling.exec.container_user import container_user
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-IMAGE_NAME = "vllm-align"
-#: Set by the image (`vllm_align.Dockerfile`); the code that behaves differently
-#: in it reads this, never the filesystem.
+#: Set by the image (`vllm_align.Dockerfile`, `sglang_align.Dockerfile`); the
+#: code that behaves differently in it reads this, never the filesystem.
 RUNTIME_ENV = "VIBESIM_CAPTURE_RUNTIME"
 IN_IMAGE = "in-image"
 
@@ -56,7 +56,6 @@ MODELS = PurePosixPath("/models")
 WORK = PurePosixPath("/work")
 OUT = PurePosixPath("/out")
 CACHE = PurePosixPath("/cache")
-FORK_PYTHON = CONTAINER_ROOT / "alignment/profiler/vllm/.venv/bin/python"
 NSYS = PurePosixPath("/opt/nvidia/nsight-systems/2025.5.2/bin/nsys")
 
 #: Written into the pass's `log_dir`: the config the container ran, and how.
@@ -65,6 +64,20 @@ CONTAINER_RUN_NAME = "container_run.json"
 
 _SOURCE_DIRS = ("profiling", "launcher", "gpu")
 _IMEX_CHANNEL_CDI_DEVICE = "nvidia.com/imex-channel=0"
+
+
+@dataclass(frozen=True)
+class EngineImage:
+    """The alignment image that serves one engine, and its server interpreter."""
+
+    image: str
+    fork_python: PurePosixPath
+
+
+ENGINE_IMAGES = {
+    "vllm": EngineImage("vllm-align", CONTAINER_ROOT / "alignment/profiler/vllm/.venv/bin/python"),
+    "sglang": EngineImage("sglang-align", PurePosixPath("/opt/sglang-venv/bin/python")),
+}
 
 
 def in_image() -> bool:
@@ -195,8 +208,9 @@ def container_config(config_path: Path, log_dir: Path) -> tuple[dict[str, Any], 
 
     config_path = config_path.resolve()
     cfg = load_profile_config(config_path)
-    if cfg.engine != "vllm":
-        raise ImageRunError(f"the {IMAGE_NAME} image runs vLLM, not {cfg.engine!r}")
+    engine = ENGINE_IMAGES.get(cfg.engine)
+    if engine is None:
+        raise ImageRunError(f"no alignment image runs engine {cfg.engine!r}")
     if cfg.driver_compat_lib_dir:
         raise ImageRunError(
             "driver_compat_lib_dir names a host library; the image carries its own CUDA "
@@ -226,7 +240,7 @@ def container_config(config_path: Path, log_dir: Path) -> tuple[dict[str, Any], 
     devices = [token.strip() for token in cfg.cuda_visible_devices.split(",") if token.strip()]
     document["cuda_visible_devices"] = ",".join(str(index) for index in range(len(devices)))
     document["log_dir"] = str(OUT)
-    document["fork_python"] = str(FORK_PYTHON)
+    document["fork_python"] = str(engine.fork_python)
     document.pop("driver_compat_lib_dir", None)
     if cfg.profile_kind == "nsys":
         document.setdefault("nsys", {})["executable"] = str(NSYS)
@@ -238,7 +252,7 @@ def container_config(config_path: Path, log_dir: Path) -> tuple[dict[str, Any], 
 def overlay_mounts(root: Path = REPO_ROOT) -> Mounts:
     """This checkout's capture code over the image, read-only.
 
-    `alignment/` is mounted entry by entry around its submodules, so the vLLM
+    `alignment/` is mounted entry by entry around its submodules, so the engine
     fork and the req-frontend binary stay the image's own.
     """
     mounts = Mounts()
@@ -268,10 +282,10 @@ def overlay_mounts(root: Path = REPO_ROOT) -> Mounts:
     return mounts
 
 
-def image_tag(root: Path = REPO_ROOT) -> str:
+def image_tag(engine: str, root: Path = REPO_ROOT) -> str:
     from profiling.container.images import IMAGES
 
-    return IMAGES[IMAGE_NAME].tag(root)
+    return IMAGES[ENGINE_IMAGES[engine].image].tag(root)
 
 
 def docker_argv(
@@ -364,11 +378,11 @@ def run_profile_in_image(config_path: Path, *, image: str | None = None) -> int:
     log_dir = Path(cfg.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     document, mounts, path_info = container_config(config_path, log_dir)
-    tag = image or image_tag()
+    tag = image or image_tag(cfg.engine)
     if subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode:
         raise ImageRunError(
             f"image {tag} is not on this host; build it with "
-            f"`just profile-container-build {IMAGE_NAME}`"
+            f"`just profile-container-build {ENGINE_IMAGES[cfg.engine].image}`"
         )
     container_config_path = log_dir / CONTAINER_CONFIG_NAME
     container_config_path.write_text(yaml.safe_dump(document, sort_keys=False))

@@ -89,7 +89,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default="host",
         help=(
             "host: the checkout's fork venv and the configured nsys. image: the "
-            "vllm-align profiler image with this checkout's capture code overlaid "
+            "engine's alignment profiler image (vllm-align, sglang-align) with this "
+            "checkout's capture code overlaid "
             "(alignment/image_runtime.py); the host keeps GPU choice and outputs."
         ),
     )

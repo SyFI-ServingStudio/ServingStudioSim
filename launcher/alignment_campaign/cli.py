@@ -321,7 +321,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--runtime",
         choices=("host", "image"),
         default="host",
-        help="forwarded to `alignment profile`: capture in the vllm-align image "
+        help="forwarded to `alignment profile`: capture in the engine's alignment image "
         "(profile passes only; other phases always run on the host)",
     )
     run.set_defaults(handler=_run)

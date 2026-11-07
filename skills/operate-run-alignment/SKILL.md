@@ -140,8 +140,10 @@ single-config path below when there is one workload and no matrix.
    `alignment-campaign run --runtime image` (`alignment/README.md`, "In-image
    capture"). The pinned `vllm-align` image replaces the checkout's fork venv,
    host nsys and cargo build, so the capture does not depend on how one
-   worktree's venv was provisioned. Build it once per fork/req-frontend gitlink
-   with `just profile-container-build vllm-align`, inside a Slurm job where docker
+   worktree's venv was provisioned; `sglang-align` does the same for SGLang (not
+   yet GPU-validated against a host capture). Build it once per fork/req-frontend
+   gitlink with `just profile-container-build vllm-align` (or `sglang-align`),
+   inside a Slurm job where docker
    is a job-scoped rootless Podman (unset the workspace `.env`'s `DOCKER_HOST`
    there, or docker reaches the host daemon instead). Run the capture inside a
    GPU job with the same CPU/memory share a host capture gets (a 4-GPU job's
