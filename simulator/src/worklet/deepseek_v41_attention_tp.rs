@@ -192,6 +192,15 @@ pub struct DeepseekV41AttentionTpWorkletConfig {
     /// The unfused TileLang mHC kinds of the overlap path.
     pub mhc_tilelang_backends: Vec<&'static str>,
     pub gemm_backends: Vec<&'static str>,
+    /// The same MXFP8 linear fed an activation its producer already quantized
+    /// (GEMM only). Used where production hands the linear a
+    /// `QuantizedActivation`: `wq_b` / indexer `wq_b` after
+    /// `fused_q_kv_rmsnorm_quant` (`attention.py` `_split_qkv_and_norm`, taken
+    /// when `q_lora_rank % 32 == 0`) and `wo_b` after the `wo_a` einsum
+    /// (`flash_mla_mega_attn.py` `_o_proj`, taken when `o_lora_rank % 128 == 0`
+    /// and no GEMM-RS is bound -- GEMM-RS needs sequence parallel, which this
+    /// worklet never runs).
+    pub prequantized_gemm_backends: Vec<&'static str>,
     pub fp32_gemm_backends: Vec<&'static str>,
     pub kv_insert_backends: Vec<&'static str>,
     pub mega_attn_backends: Vec<&'static str>,
@@ -324,13 +333,25 @@ impl DeepseekV41AttentionTpWorklet {
 
         let gpu = cfg.gpu_name.as_str();
         let ew = |input: u32, output: u32| placeholder(&cfg.elementwise_backends, gpu, input, output);
-        let mxfp8 = |n: Dim, k: Dim| SingleGemmKernelConfig {
-            backends: cfg.gemm_backends.clone(),
+        let mxfp8_from = |backends: &Vec<&'static str>, n: Dim, k: Dim| SingleGemmKernelConfig {
+            backends: backends.clone(),
             gpu_name: cfg.gpu_name.clone(),
             n,
             k,
             dtype: DType::Mxfp8E4m3,
         };
+        let mxfp8 = |n: Dim, k: Dim| mxfp8_from(&cfg.gemm_backends, n, k);
+        let prequantized_if = |fused: bool| {
+            if fused {
+                &cfg.prequantized_gemm_backends
+            } else {
+                &cfg.gemm_backends
+            }
+        };
+        // `_split_qkv_and_norm`: the fused norm writes MXFP8 Q for every wq_b.
+        let query_backends = prequantized_if(cfg.q_lora_rank.get() % 32 == 0);
+        // `_can_quantize_o_proj`: wo_a writes wo_b's MXFP8 input.
+        let o_backends = prequantized_if(cfg.o_lora_rank.get() % 128 == 0);
         let hidden = cfg.hidden_size.get();
         let hc_hidden_bytes = cfg.hc_mult * hidden * 2;
         let mix_bytes = (2 + cfg.hc_mult) * cfg.hc_mult * 4;
@@ -392,7 +413,8 @@ impl DeepseekV41AttentionTpWorklet {
                 (cfg.q_lora_rank.get() + head_dim) * 2,
                 (cfg.q_lora_rank.get() + head_dim) * 2,
             ),
-            wq_b: mxfp8(
+            wq_b: mxfp8_from(
+                query_backends,
                 cfg.head_dim.clone() * heads_per_rank,
                 cfg.q_lora_rank.clone(),
             ),
@@ -422,7 +444,8 @@ impl DeepseekV41AttentionTpWorklet {
                 )
             }),
             indexer_wq_b: index_source.then(|| {
-                mxfp8(
+                mxfp8_from(
+                    query_backends,
                     cfg.index_num_heads.clone() * cfg.index_head_dim.clone(),
                     cfg.q_lora_rank.clone(),
                 )
@@ -488,7 +511,8 @@ impl DeepseekV41AttentionTpWorklet {
                 k: cfg.num_attention_heads.clone() * cfg.head_dim.clone() / cfg.o_groups.clone(),
                 dtype: DType::Mxfp8E4m3,
             },
-            wo_b: mxfp8(
+            wo_b: mxfp8_from(
+                o_backends,
                 cfg.hidden_size.clone(),
                 cfg.o_lora_rank.clone() * o_groups_per_rank,
             ),
@@ -894,6 +918,7 @@ pub(crate) mod tests {
             mhc_backends: vec!["deepgemm_mega"],
             mhc_tilelang_backends: vec!["vllm_tilelang"],
             gemm_backends: vec!["flashinfer_mxfp8"],
+            prequantized_gemm_backends: vec!["flashinfer_mxfp8_prequantized"],
             fp32_gemm_backends: vec!["torch_cublas"],
             kv_insert_backends: vec!["vllm_cuda"],
             mega_attn_backends: vec!["flashmla_mega"],
@@ -945,6 +970,12 @@ pub(crate) mod tests {
         );
         assert_eq!((r.kv_insert.num_heads, r.kv_insert.padded_heads), (16, 64));
         assert_eq!(r.indexer.as_ref().unwrap().page_block_size, 64);
+        // Producers that already write MXFP8 leave these linears the GEMM alone.
+        let prequantized = ["flashinfer_mxfp8_prequantized"];
+        assert_eq!(r.wq_b.backends, prequantized);
+        assert_eq!(r.indexer_wq_b.as_ref().unwrap().backends, prequantized);
+        assert_eq!(r.wo_b.backends, prequantized);
+        assert_eq!(r.fused_wqa_wkv.backends, ["flashinfer_mxfp8"]);
     }
 
     /// Catches the decode top-k remap launch folded away at zero cost, or

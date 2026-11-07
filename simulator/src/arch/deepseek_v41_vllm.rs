@@ -135,6 +135,8 @@ const ENGRAM_WKV_OUT: u32 = 25_600;
 pub(crate) const MHC_BACKENDS: &[&str] = &["deepgemm_mega"];
 pub(crate) const MHC_TILELANG_BACKENDS: &[&str] = &["vllm_tilelang"];
 pub(crate) const MXFP8_GEMM_BACKENDS: &[&str] = &["flashinfer_mxfp8"];
+/// The MXFP8 linear on an activation its producer already quantized.
+pub(crate) const MXFP8_PREQUANTIZED_GEMM_BACKENDS: &[&str] = &["flashinfer_mxfp8_prequantized"];
 pub(crate) const FP32_GEMM_BACKENDS: &[&str] = &["torch_cublas"];
 pub(crate) const KV_INSERT_BACKENDS: &[&str] = &["vllm_cuda"];
 pub(crate) const MEGA_ATTN_BACKENDS: &[&str] = &["flashmla_mega"];
@@ -1067,6 +1069,7 @@ pub(crate) fn layer_config(
             mhc_backends: MHC_BACKENDS.to_vec(),
             mhc_tilelang_backends: MHC_TILELANG_BACKENDS.to_vec(),
             gemm_backends: MXFP8_GEMM_BACKENDS.to_vec(),
+            prequantized_gemm_backends: MXFP8_PREQUANTIZED_GEMM_BACKENDS.to_vec(),
             fp32_gemm_backends: FP32_GEMM_BACKENDS.to_vec(),
             kv_insert_backends: KV_INSERT_BACKENDS.to_vec(),
             mega_attn_backends: MEGA_ATTN_BACKENDS.to_vec(),
