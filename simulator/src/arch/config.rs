@@ -500,6 +500,50 @@ pub enum IterArchSel {
         #[param(cache_key)]
         cudagraph_capture_sizes: Vec<u32>,
     },
+    /// [`DeepseekV41VllmDspark`] over the DP4 target
+    /// (`deepseek_v41_vllm_dp_attn_ep_moe`): rank-local sampler and proposer
+    /// edges, draft layers as DP layers with the EP-sharded draft MoE.
+    /// The DeepSeek-V4.1 target driven by its **DSpark** proposer
+    /// (`--speculative-config {"method":"dspark"}`): three SWA-only draft
+    /// layers drafting a `draft_tokens` block in one pass, then that many
+    /// sequential Markov steps. TP4 attention + EP4 experts as the target.
+    DeepseekV41VllmDpAttnEpMoeDspark {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Target routing; the draft MoE routes uniformly (no capture).
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Target per-token routes (`routing = corpus`), recorded at the
+        /// verify width when available.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--max-model-len`, as for `deepseek_v41_vllm`.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// Positions drafted per request: must equal `dspark_block_size`.
+        #[serde(default = "default_dspark_draft_tokens")]
+        #[param(default = 5, cache_key)]
+        draft_tokens: u32,
+        /// Decoder SWA bounded replay of the target, as for `deepseek_v41_vllm`.
+        #[serde(default = "default_decoder_swa_bounded_replay")]
+        #[param(default = true, cache_key)]
+        decoder_swa_bounded_replay: bool,
+        /// vLLM `--cudagraph-capture-sizes`, passed to the target: the
+        /// PIECEWISE token sizes, from which MRV2 derives the FULL decode
+        /// (and draft) request-count graphs at the verify width.
+        #[serde(default)]
+        #[param(cache_key)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.
     Glm52VllmDsaMoe {
@@ -1292,6 +1336,7 @@ impl IterArchSel {
             | Self::DeepseekV41Vllm { model, .. }
             | Self::DeepseekV41VllmSerialStreams { model, .. }
             | Self::DeepseekV41VllmDspark { model, .. }
+            | Self::DeepseekV41VllmDpAttnEpMoeDspark { model, .. }
             | Self::DeepseekV41VllmDpAttnEpMoe { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
@@ -1348,6 +1393,11 @@ impl IterArchSel {
                 ..
             }
             | Self::DeepseekV41VllmDspark {
+                model,
+                max_model_len,
+                ..
+            }
+            | Self::DeepseekV41VllmDpAttnEpMoeDspark {
                 model,
                 max_model_len,
                 ..

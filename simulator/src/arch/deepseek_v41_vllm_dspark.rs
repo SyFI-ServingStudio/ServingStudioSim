@@ -56,10 +56,10 @@ use serde::Deserialize;
 use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
 use crate::arch::deepseek_v41_vllm::{
     self, full_decode_graph_requests, kv_cache_layout, layer_config, normalize_step, prefill_pairs,
-    BoundedReplay, DeepseekV41LayerConfig, DeepseekV41ModelCfg, DeepseekV41Step,
-    DeepseekV41VllmConfigs, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV41VllmResolved,
-    LayerKind, NormalizedInput, ELEMENTWISE_BACKENDS, KV_INSERT_BACKENDS, LM_HEAD_BACKENDS,
-    MXFP8_GEMM_BACKENDS,
+    BoundedReplay, DeepseekV41LayerConfig, DeepseekV41ModelCfg, DeepseekV41ReplayConfig,
+    DeepseekV41Step, DeepseekV41VllmConfigs, DeepseekV41VllmModel, DeepseekV41VllmParallel,
+    DeepseekV41VllmResolved, LayerKind, NormalizedInput, ELEMENTWISE_BACKENDS, KV_INSERT_BACKENDS,
+    LM_HEAD_BACKENDS, MXFP8_GEMM_BACKENDS,
 };
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::op::attention::DeepseekV41CandidateRole;
@@ -77,10 +77,11 @@ use crate::timing::{
 use crate::worklet::deepseek_v41_common::{eval_or_zero, placeholder};
 use crate::worklet::{
     DeepseekV41AttentionEntry, DeepseekV41AttentionLayer, DeepseekV41AttentionTpWorklet,
-    DeepseekV41AttentionTpWorkletInput, DeepseekV41AttentionTpWorkletResolved,
-    DeepseekV41DsparkContextKvLocalWorklet, DeepseekV41DsparkContextKvLocalWorkletConfig,
-    DeepseekV41DsparkContextKvLocalWorkletInput, DeepseekV41DsparkContextKvLocalWorkletResolved,
-    DeepseekV41HeadTpWorklet, DeepseekV41HeadTpWorkletConfig, DeepseekV41HeadTpWorkletInput,
+    DeepseekV41AttentionTpWorkletConfig, DeepseekV41AttentionTpWorkletInput,
+    DeepseekV41AttentionTpWorkletResolved, DeepseekV41DsparkContextKvLocalWorklet,
+    DeepseekV41DsparkContextKvLocalWorkletConfig, DeepseekV41DsparkContextKvLocalWorkletInput,
+    DeepseekV41DsparkContextKvLocalWorkletResolved, DeepseekV41HeadTpWorklet,
+    DeepseekV41HeadTpWorkletConfig, DeepseekV41HeadTpWorkletInput,
     DeepseekV41HeadTpWorkletResolved, DeepseekV41IndexRole, DeepseekV41MoeFfnEpWorklet,
     DeepseekV41MoeFfnEpWorkletInput, DeepseekV41MoeFfnEpWorkletResolved,
     DeepseekV41PrologueTpWorklet,
@@ -196,16 +197,13 @@ pub struct DeepseekV41DsparkResolved {
     rest_attention: DeepseekV41AttentionTpWorkletResolved,
     rest_ffn: DeepseekV41MoeFfnEpWorkletResolved,
     head: DeepseekV41HeadTpWorkletResolved,
-    draft_logits_cast: ElementwiseKernelConfig,
     markov: DsparkMarkovStepConfig,
-    sample_logits_cast: ElementwiseKernelConfig,
-    sample_logits_stats: ElementwiseKernelConfig,
-    sample_resample: ElementwiseKernelConfig,
+    logits: LogitsPlaceholders,
     kv_cache_layout: KvCacheLayout,
 }
 
 /// The draft MoE geometry over the target's checkpoint facts.
-fn draft_model(model: &DeepseekV41ModelCfg, dspark: &DsparkCfg) -> DeepseekV41ModelCfg {
+pub(crate) fn draft_model(model: &DeepseekV41ModelCfg, dspark: &DsparkCfg) -> DeepseekV41ModelCfg {
     DeepseekV41ModelCfg {
         num_experts: dspark.num_experts,
         top_k: dspark.top_k,
@@ -213,7 +211,7 @@ fn draft_model(model: &DeepseekV41ModelCfg, dspark: &DsparkCfg) -> DeepseekV41Mo
     }
 }
 
-fn draft_kind(entry: DeepseekV41AttentionEntry) -> LayerKind {
+pub(crate) fn draft_kind(entry: DeepseekV41AttentionEntry) -> LayerKind {
     LayerKind {
         attention: DeepseekV41AttentionLayer {
             entry,
@@ -226,16 +224,12 @@ fn draft_kind(entry: DeepseekV41AttentionEntry) -> LayerKind {
     }
 }
 
-/// `target` is the target's expansion (lane A's `build_configs`, priced at
-/// verify width 6); `draft_demand` covers the draft MoE's `dspark_n_routed_experts`.
-pub fn build_configs(
-    model: &DeepseekV41ModelCfg,
+/// Checks shared by the TP and DP proposers.
+pub(crate) fn check_draft(
     dspark: &DsparkCfg,
-    parallel: &DeepseekV41VllmParallel,
-    mut target: DeepseekV41VllmConfigs,
     draft_demand: &ExpertDemand,
     draft_tokens: u32,
-) -> std::result::Result<DeepseekV41DsparkConfigs, BuildError> {
+) -> std::result::Result<(), BuildError> {
     if draft_tokens != dspark.block_size {
         return Err(fit_failed(format!(
             "DSpark drafts dspark_block_size = {} positions per proposal, got draft_tokens {draft_tokens}",
@@ -249,62 +243,138 @@ pub fn build_configs(
             dspark.num_experts
         )));
     }
-    // The `dspark_target_layer_ids` hidden states are produced inside the
-    // replay batch (all past the cut) and scattered back to batch rows with
-    // the hc streams: one bf16 hidden row per captured layer.
-    if let Some(replay) = target.replay.as_mut() {
+    Ok(())
+}
+
+/// The `dspark_target_layer_ids` hidden states are produced inside the
+/// replay batch (all past the cut) and scattered back to batch rows with the
+/// hc streams: one bf16 hidden row per captured layer.
+pub(crate) fn widen_replay_scatter(
+    replay: Option<&mut DeepseekV41ReplayConfig>,
+    model: &DeepseekV41ModelCfg,
+    dspark: &DsparkCfg,
+) {
+    if let Some(replay) = replay {
         let aux = dspark.target_layer_ids.len() as u32 * model.hidden_size * 2;
         replay.scatter.input_bytes_per_token =
             (replay.scatter.input_bytes_per_token.get() + aux).into();
         replay.scatter.output_bytes_per_token =
             (replay.scatter.output_bytes_per_token.get() + aux).into();
     }
+}
+
+/// Draft layer 0 (layer-0 mHC entry) and the shared body of the rest, at
+/// `parallel`'s rank shape.
+pub(crate) fn draft_layer_configs(
+    model: &DeepseekV41ModelCfg,
+    dspark: &DsparkCfg,
+    parallel: &DeepseekV41VllmParallel,
+    draft_demand: &ExpertDemand,
+) -> (DeepseekV41LayerConfig, DeepseekV41LayerConfig) {
     let draft = draft_model(model, dspark);
     let first_layer = model.num_layers;
-    let draft_first = layer_config(
+    let first = layer_config(
         &draft,
         parallel,
         draft_demand,
         draft_kind(DeepseekV41AttentionEntry::Layer0Pre),
         vec![first_layer],
     );
-    let draft_rest = layer_config(
+    let rest = layer_config(
         &draft,
         parallel,
         draft_demand,
         draft_kind(DeepseekV41AttentionEntry::FusedPostPre),
         (first_layer + 1..first_layer + dspark.num_draft_layers).collect(),
     );
-    let gpu = parallel.gpu_name.clone();
+    (first, rest)
+}
+
+/// The context-KV section; `attention` is a draft layer's attention config
+/// (its padded Q width and SWA page size).
+pub(crate) fn context_kv_config(
+    model: &DeepseekV41ModelCfg,
+    dspark: &DsparkCfg,
+    attention: &DeepseekV41AttentionTpWorkletConfig,
+) -> DeepseekV41DsparkContextKvLocalWorkletConfig {
+    DeepseekV41DsparkContextKvLocalWorkletConfig {
+        hidden_size: model.hidden_size.into(),
+        hc_mult: model.hc_mult,
+        num_target_layers: dspark.target_layer_ids.len() as u32,
+        num_draft_layers: dspark.num_draft_layers,
+        head_dim: model.head_dim.into(),
+        // The KV-only insert launches at the Q width it would pad to.
+        insert_num_heads: attention.padded_heads.get(),
+        swa_block_size: attention.swa_block_size,
+        gpu_name: attention.gpu_name.clone(),
+        gemm_backends: MXFP8_GEMM_BACKENDS.to_vec(),
+        kv_insert_backends: KV_INSERT_BACKENDS.to_vec(),
+        elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+    }
+}
+
+pub(crate) fn markov_config(
+    model: &DeepseekV41ModelCfg,
+    dspark: &DsparkCfg,
+    gpu: &str,
+) -> DsparkMarkovStepConfig {
+    DsparkMarkovStepConfig {
+        gpu_name: gpu.to_string(),
+        vocab_size: model.vocab_size,
+        markov_rank: dspark.markov_rank,
+        gemm_backends: LM_HEAD_BACKENDS.to_vec(),
+        elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+    }
+}
+
+/// The placeholder launches around the logits: the draft head's fp32 cast
+/// and the sampler's cast, rejection statistics and resample.
+#[derive(Clone)]
+pub(crate) struct LogitsPlaceholders {
+    pub draft_logits_cast: ElementwiseKernelConfig,
+    pub sample_logits_cast: ElementwiseKernelConfig,
+    pub sample_logits_stats: ElementwiseKernelConfig,
+    pub sample_resample: ElementwiseKernelConfig,
+}
+
+pub(crate) fn logits_placeholders(vocab: u32, gpu: &str) -> LogitsPlaceholders {
+    let ew = |input: u32, output: u32| placeholder(ELEMENTWISE_BACKENDS, gpu, input, output);
+    LogitsPlaceholders {
+        // `LogitsProcessor` upcasts the bf16 logits to fp32.
+        draft_logits_cast: ew(vocab * 2, vocab * 4),
+        sample_logits_cast: ew(vocab * 2, vocab * 4),
+        // Rejection sampler (fork `rejection_sampler_utils.py`), no L1 kind
+        // (design D7): `_compute_local_logits_stats` and `_rejection_kernel`
+        // read each verified row's fp32 target and draft logits ...
+        sample_logits_stats: ew(2 * vocab * 4, 8),
+        // ... and `_resample_kernel` re-reads one row per request.
+        sample_resample: ew(vocab * 4, 4),
+    }
+}
+
+/// `target` is the target's expansion (lane A's `build_configs`, priced at
+/// verify width 6); `draft_demand` covers the draft MoE's `dspark_n_routed_experts`.
+pub fn build_configs(
+    model: &DeepseekV41ModelCfg,
+    dspark: &DsparkCfg,
+    parallel: &DeepseekV41VllmParallel,
+    mut target: DeepseekV41VllmConfigs,
+    draft_demand: &ExpertDemand,
+    draft_tokens: u32,
+) -> std::result::Result<DeepseekV41DsparkConfigs, BuildError> {
+    check_draft(dspark, draft_demand, draft_tokens)?;
+    widen_replay_scatter(target.replay.as_mut(), model, dspark);
+    let (draft_first, draft_rest) = draft_layer_configs(model, dspark, parallel, draft_demand);
     Ok(DeepseekV41DsparkConfigs {
         draft_tokens,
         num_draft_layers: dspark.num_draft_layers,
-        context_kv: DeepseekV41DsparkContextKvLocalWorkletConfig {
-            hidden_size: model.hidden_size.into(),
-            hc_mult: model.hc_mult,
-            num_target_layers: dspark.target_layer_ids.len() as u32,
-            num_draft_layers: dspark.num_draft_layers,
-            head_dim: model.head_dim.into(),
-            // The KV-only insert launches at the Q width it would pad to.
-            insert_num_heads: draft_first.attention.padded_heads.get(),
-            swa_block_size: draft_first.attention.swa_block_size,
-            gpu_name: gpu.clone(),
-            gemm_backends: MXFP8_GEMM_BACKENDS.to_vec(),
-            kv_insert_backends: KV_INSERT_BACKENDS.to_vec(),
-            elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
-        },
+        context_kv: context_kv_config(model, dspark, &draft_first.attention),
         draft_first,
         draft_rest,
         // The draft head is the target's: `ParallelLMHead` aliased from the
         // target (`has_own_lm_head = False`), vocab-sharded under TP.
         head: target.head.clone(),
-        markov: DsparkMarkovStepConfig {
-            gpu_name: gpu,
-            vocab_size: model.vocab_size,
-            markov_rank: dspark.markov_rank,
-            gemm_backends: LM_HEAD_BACKENDS.to_vec(),
-            elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
-        },
+        markov: markov_config(model, dspark, &parallel.gpu_name),
         vocab_size: model.vocab_size,
         kv_cache_layout: kv_cache_layout(model, parallel.tp_size, dspark.num_draft_layers),
         target,
@@ -313,9 +383,7 @@ pub fn build_configs(
 
 pub fn resolve_configs(configs: DeepseekV41DsparkConfigs) -> DeepseekV41DsparkResolved {
     let prologue = DeepseekV41PrologueTpWorklet::resolve_config(&configs.target.prologue);
-    let gpu = configs.markov.gpu_name.clone();
-    let ew = |input: u32, output: u32| placeholder(ELEMENTWISE_BACKENDS, &gpu, input, output);
-    let vocab = configs.vocab_size;
+    let logits = logits_placeholders(configs.vocab_size, &configs.markov.gpu_name);
     DeepseekV41DsparkResolved {
         draft_tokens: configs.draft_tokens,
         num_draft_layers: configs.num_draft_layers,
@@ -333,16 +401,8 @@ pub fn resolve_configs(configs: DeepseekV41DsparkConfigs) -> DeepseekV41DsparkRe
         ),
         rest_ffn: DeepseekV41MoeFfnEpWorklet::resolve_config(&configs.draft_rest.ffn),
         head: DeepseekV41HeadTpWorklet::resolve_config(&configs.head),
-        // `LogitsProcessor` upcasts the gathered bf16 logits to fp32.
-        draft_logits_cast: ew(vocab * 2, vocab * 4),
         markov: configs.markov,
-        sample_logits_cast: ew(vocab * 2, vocab * 4),
-        // Rejection sampler (fork `rejection_sampler_utils.py`), no L1 kind
-        // (design D7): `_compute_local_logits_stats` and `_rejection_kernel`
-        // read each verified row's fp32 target and draft logits ...
-        sample_logits_stats: ew(2 * vocab * 4, 8),
-        // ... and `_resample_kernel` re-reads one row per request.
-        sample_resample: ew(vocab * 4, 4),
+        logits,
         kv_cache_layout: configs.kv_cache_layout,
         target: deepseek_v41_vllm::resolve_configs(&configs.target),
     }
@@ -412,7 +472,7 @@ struct DsparkDraftStage {
     markov: DsparkMarkovStepOp,
 }
 
-fn atomic_elementwise(
+pub(crate) fn atomic_elementwise(
     name: String,
     config: ElementwiseKernelConfig,
     bridge: &PerfApiBridge,
@@ -471,7 +531,7 @@ impl DsparkDraftStage {
             head: DeepseekV41HeadTpWorklet::build(format!("{name}.head"), r.head.clone(), bridge)?,
             logits_cast: atomic_elementwise(
                 format!("{name}.head.logits_fp32_cast"),
-                r.draft_logits_cast.clone(),
+                r.logits.draft_logits_cast.clone(),
                 bridge,
             )?,
             markov: DsparkMarkovStepOp::build(format!("{name}.markov"), r.markov.clone(), bridge)?,
@@ -571,14 +631,38 @@ impl DsparkDraftStage {
 }
 
 /// The rejection sampler between the verify forward and the draft.
-struct SampleStage {
+pub(crate) struct SampleStage {
     logits_cast: Op<ElementwiseKernel>,
     logits_stats: Op<ElementwiseKernel>,
     resample: Op<ElementwiseKernel>,
 }
 
 impl SampleStage {
-    fn compile(&self, b: &mut CostTreeBuilder) -> CostNode {
+    pub(crate) fn build(
+        name: &str,
+        logits: &LogitsPlaceholders,
+        bridge: &PerfApiBridge,
+    ) -> std::result::Result<Self, BuildError> {
+        Ok(Self {
+            logits_cast: atomic_elementwise(
+                format!("{name}.logits_fp32_cast"),
+                logits.sample_logits_cast.clone(),
+                bridge,
+            )?,
+            logits_stats: atomic_elementwise(
+                format!("{name}.rejection_logits_stats"),
+                logits.sample_logits_stats.clone(),
+                bridge,
+            )?,
+            resample: atomic_elementwise(
+                format!("{name}.resample"),
+                logits.sample_resample.clone(),
+                bridge,
+            )?,
+        })
+    }
+
+    pub(crate) fn compile(&self, b: &mut CostTreeBuilder) -> CostNode {
         CostNode::Sum(vec![
             self.logits_cast.compile(b),
             self.logits_stats.compile(b),
@@ -586,7 +670,7 @@ impl SampleStage {
         ])
     }
 
-    fn eval(&self, logits_rows: u32, decode_requests: u32, ev: &mut Evaluator) {
+    pub(crate) fn eval(&self, logits_rows: u32, decode_requests: u32, ev: &mut Evaluator) {
         let rows = ElementwiseKernelInput {
             num_tokens: logits_rows,
         };
@@ -626,23 +710,7 @@ pub fn build(
     let max_model_len = resolved.first_attention.raw_cfg.max_model_len;
     let tp_size = resolved.first_attention.raw_cfg.tp_size as u16;
     let draft = DsparkDraftStage::build(format!("{name}.dspark"), &resolved, bridge)?;
-    let sample = SampleStage {
-        logits_cast: atomic_elementwise(
-            format!("{name}.sample.logits_fp32_cast"),
-            resolved.sample_logits_cast.clone(),
-            bridge,
-        )?,
-        logits_stats: atomic_elementwise(
-            format!("{name}.sample.rejection_logits_stats"),
-            resolved.sample_logits_stats.clone(),
-            bridge,
-        )?,
-        resample: atomic_elementwise(
-            format!("{name}.sample.resample"),
-            resolved.sample_resample.clone(),
-            bridge,
-        )?,
-    };
+    let sample = SampleStage::build(&format!("{name}.sample"), &resolved.logits, bridge)?;
     let draft_tokens = resolved.draft_tokens;
     let kv_cache_layout = resolved.kv_cache_layout.clone();
     let target = deepseek_v41_vllm::build(name.clone(), resolved.target, bridge)?;

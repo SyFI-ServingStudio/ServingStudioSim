@@ -953,6 +953,42 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                max_model_len,
+                draft_tokens,
+                decoder_swa_bounded_replay,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::deepseek_v41_vllm_dp_attn_ep_moe_dspark(
+                    model_spec,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    *max_model_len,
+                    *draft_tokens,
+                    *decoder_swa_bounded_replay,
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
             IterArchSel::Glm52VllmNvfp4DpAttnDsaMoe {
                 ep_size,
                 nvl_num_gpu,
