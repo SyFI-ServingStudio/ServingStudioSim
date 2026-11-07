@@ -521,7 +521,7 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
     num_tokens = shape.num_tokens
     out = alloc_mega_attn_output(num_tokens, shape.num_heads // 8, device)
     q_fused = _q_fused(work.q)
-    positions32 = work.positions.to(torch.int32)
+    positions = work.positions  # int64, as the model passes them
     layer = types.SimpleNamespace(
         compress_ratio=shape.ratio,
         PREFILL_CHUNK_SIZE=_PREFILL_CHUNK_SIZE,
@@ -565,7 +565,7 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
 
         def run() -> None:
             DeepseekV4MegaAttnAttention._forward_decode_mega(
-                layer, q_fused, positions32, flashmla_metadata, swa_metadata, out
+                layer, q_fused, positions, flashmla_metadata, swa_metadata, out
             )
 
         return work, run, out
@@ -602,7 +602,7 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
 
     def run() -> None:
         DeepseekV4MegaAttnAttention._forward_prefill_mega(
-            layer, q_fused, positions32, flashmla_metadata, swa_metadata, out, 0
+            layer, q_fused, positions, flashmla_metadata, swa_metadata, out, 0
         )
 
     return work, run, out
