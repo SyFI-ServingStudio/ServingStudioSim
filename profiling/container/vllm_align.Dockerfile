@@ -54,6 +54,17 @@ RUN uv pip install --python /opt/vibesim/alignment/profiler/vllm/.venv/bin/pytho
         "nvtx==${NVTX_VERSION}" \
     && uv pip check --python /opt/vibesim/alignment/profiler/vllm/.venv/bin/python
 
+# Hang diagnostics: `py-spy dump --native` for the server's Python processes and
+# gdb for native ones (nsys). A job's watchdog runs them through `docker exec`
+# when the engine stops iterating; the container has no network to fetch them.
+ARG PY_SPY_VERSION=0.4.2
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gdb procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && uv pip install --python /opt/vibesim-capture/.venv/bin/python "py-spy==${PY_SPY_VERSION}" \
+    && /opt/vibesim-capture/.venv/bin/py-spy --version \
+    && gdb --version | head -1
+
 # Where `alignment/load_generator/runner.py` looks for it.
 COPY --from=req-frontend /src/req-frontend/target/release/session_runner \
     /opt/vibesim/alignment/load_generator/req-frontend/target/release/session_runner
