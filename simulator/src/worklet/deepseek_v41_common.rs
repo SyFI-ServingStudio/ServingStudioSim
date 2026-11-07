@@ -288,7 +288,9 @@ pub(crate) fn compile_serial_copy<K: Probe>(op: &Op<K>, builder: &mut CostTreeBu
 /// `main` with its gated side branches: `Sum[Parallel{main, side...}, serial...]`.
 ///
 /// Each element of `concurrent` is one side stream's branch; `serial` holds
-/// the same branches' serial copies. With no side branch this is just `main`.
+/// the same branches' serial copies. With no side branch this is just `main`;
+/// with an empty `main` (a side branch beside no caller-stream work) the
+/// Parallel holds only the side branches, so no empty Sum reaches the tree.
 pub(crate) fn gated_fanout(
     main: Vec<CostNode>,
     concurrent: Vec<CostNode>,
@@ -297,7 +299,10 @@ pub(crate) fn gated_fanout(
     if concurrent.is_empty() {
         return CostNode::Sum(main);
     }
-    let mut children = vec![CostNode::Sum(main)];
+    let mut children = Vec::with_capacity(1 + concurrent.len());
+    if !main.is_empty() {
+        children.push(CostNode::Sum(main));
+    }
     children.extend(concurrent);
     CostNode::Sum(vec![
         CostNode::Parallel {
@@ -311,6 +316,21 @@ pub(crate) fn gated_fanout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gated_fanout_without_main_has_no_empty_sum() {
+        use crate::timing::cost_tree::{CostTreeBuilder, FlatCostNode};
+        let mut b = CostTreeBuilder::new();
+        let side = b.leaf("side", "test", serde_json::json!({}));
+        let serial = b.leaf("side.serial", "test", serde_json::json!({}));
+        let tree = b.finish(gated_fanout(Vec::new(), vec![side], vec![serial]));
+        assert!(tree.flatten().iter().all(|node| match node {
+            FlatCostNode::Sum { children }
+            | FlatCostNode::Max { children, .. }
+            | FlatCostNode::Parallel { children, .. } => !children.is_empty(),
+            FlatCostNode::Leaf(_) | FlatCostNode::Scale { .. } => true,
+        }));
+    }
 
     #[test]
     fn aux_stream_is_live_only_for_full_graph_decode() {
