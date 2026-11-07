@@ -8,7 +8,7 @@ names their tags:
 | --- | --- | --- |
 | `default` | `default_env`, `flashinfer_pip_env`, `causal_conv1d_env` | the project's `profiling` group from `uv.lock` (Torch 2.10 cu128, FlashInfer 0.6, Triton, NVSHMEM, DeepGEMM), plus the causal-conv1d wheel |
 | `vllm` | `vllm_env` | CUDA 13.0, the alignment vLLM checkout at its gitlink on the precompiled wheel of its upstream base (with the FlashKDA build it vendors as `_flashkda_C`), every FlashInfer cubin |
-| `sglang` | `sglang_env` | CUDA 13.0, the alignment SGLang checkout at its gitlink with the `sglang-kernel` and FlashInfer 0.6.15.post1 builds it pins |
+| `sglang` | `sglang_env` | CUDA 13.0, the alignment SGLang checkout at its gitlink with the `sglang-kernel` and FlashInfer 0.7.3 builds it pins |
 | `flashinfer-kda` | `flashinfer_kda_env` | FlashInfer's KDA nightly, Torch 2.11 cu130, TVM/TIRx (`requirements/flashinfer_kda.txt`) |
 
 ```bash

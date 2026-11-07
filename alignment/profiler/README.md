@@ -7,7 +7,7 @@ analysis stay shared. The parent repository pins the exact fork commits:
 
 ```text
 alignment/profiler/vllm    # branch: servingstudio-alignment
-alignment/profiler/sglang  # branch: vibesim-alignment
+alignment/profiler/sglang  # branch: vibesim-alignment-20261107
 ```
 
 Initialize both from the ServingStudio Sim checkout:
@@ -178,10 +178,26 @@ alone, since a corpus holds logical expert ids and needs no topology.
 ```bash
 cd alignment/profiler/sglang/python
 uv venv --python 3.12 .venv-sglang
-uv pip install --python .venv-sglang/bin/python -e .
+uv pip install --python .venv-sglang/bin/python \
+  --extra-index-url https://download.pytorch.org/whl/cu130 \
+  --index-strategy unsafe-best-match -e .
 uv run --python .venv-sglang/bin/python python -c \
   "import sglang; print(sglang.__version__, sglang.__file__)"
 ```
+
+### SGLang fork line
+
+`vibesim-alignment-20261107` is the maintained line, on upstream SGLang main
+`ba59064` (2026-11-07). The fork's `ALIGNMENT.md` records the base, the four
+carried commits, and how each was adapted. The previous line,
+`vibesim-alignment` on main `9d4be40` (2026-08-10), stays on the remote at
+`449cb04` (tag `vibesim-alignment-base-449cb04a5`) because recorded captures
+name it.
+
+To move to a newer upstream, rebase onto it as a new dated branch in an
+isolated checkout, tag the old head, update `ALIGNMENT.md`, rebuild
+`.venv-sglang`, run the fork's focused tests listed there, and run a GPU
+capture through `alignment-campaign` before bumping the Sim gitlink.
 
 Every SGLang alignment profile must also declare its binary runtime contract.
 The launcher owns this step; there is no separate warm-up command to remember.
@@ -203,27 +219,33 @@ python_runtime:
       version: 0.2.16
       index_url: https://pypi.org/simple
     - name: flashinfer-python
-      version: 0.6.15.post1
+      version: 0.7.3
       index_url: https://pypi.org/simple
     - name: flashinfer-cubin
-      version: 0.6.15.post1
+      version: 0.7.3
       index_url: https://flashinfer.ai/whl
     - name: flashinfer-jit-cache
-      version: 0.6.15.post1
+      version: 0.7.3
+      local_version: cu130
+      index_url: https://flashinfer.ai/whl/cu130
+    - name: flashinfer-jit-cache-sm100a
+      version: 0.7.3
       local_version: cu130
       index_url: https://flashinfer.ai/whl/cu130
       required_files:
-        - flashinfer_jit_cache/jit_cache/fp4_quantization_100/fp4_quantization_100.so
-        - flashinfer_jit_cache/jit_cache/trtllm_comm/trtllm_comm.so
-        - flashinfer_jit_cache/jit_cache/rope/rope.so
-        - flashinfer_jit_cache/jit_cache/fmha_gen/fmha_gen.so
-        - flashinfer_jit_cache/jit_cache/fused_moe_trtllm_sm100/fused_moe_trtllm_sm100.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/fp4_quantization_100/fp4_quantization_100.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/trtllm_comm/trtllm_comm.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/rope/rope.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/fmha_gen/fmha_gen.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/fused_moe_trtllm_sm100/fused_moe_trtllm_sm100.so
   environment:
     FLASHINFER_DISABLE_JIT: "1"
 ```
 
-The three FlashInfer entries mirror SGLang's pinned cu130 Dockerfile package
-trio; `nvtx` satisfies the separate NSYS iteration-range preflight. The
+The FlashInfer entries mirror SGLang's pinned cu130 Dockerfile packages.
+Since FlashInfer 0.7, `flashinfer-jit-cache` is a metapackage and the shared
+objects live in per-architecture providers; the contract names the B200
+(`sm100a`) provider that holds them. `nvtx` satisfies the separate NSYS iteration-range preflight. The
 prebuilt cache wheel, rather than a worktree-specific Ninja directory under
 `~/.cache`, owns the shared objects. If the declared wheel does not contain a
 required module, the profile fails before loading model weights instead of

@@ -2,9 +2,11 @@
 #
 # `sglang_env`: the alignment SGLang fork at the superproject's gitlink, installed
 # editable as alignment/profiler/README.md "SGLang environment" installs it
-# (Torch 2.13 cu130, sglang-kernel, FlashInfer 0.6.15.post1 cu13), plus the
+# (Torch 2.14.1 cu130, sglang-kernel, FlashInfer 0.7.3 cu13), plus the
 # FlashInfer cubin and cu130 JIT-cache wheels the README's runtime contract pins,
-# since workers run with --network none. Its Rust extensions need a Rust
+# since workers run with --network none. Since 0.7, flashinfer-jit-cache is a
+# metapackage whose dependencies are the per-architecture provider wheels
+# (flashinfer-jit-cache-sm100a, ...) holding the .so files, so it installs with them. Its Rust extensions need a Rust
 # toolchain at build time. Built and tagged by `profiling/container/images.py`;
 # `sglang.Dockerfile.dockerignore` lets the checkout into the build context.
 
@@ -14,7 +16,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 ARG CUDA_VERSION
 ARG SGLANG_REVISION
 ARG SGLANG_VERSION
-ARG FLASHINFER_VERSION=0.6.15.post1
+ARG FLASHINFER_VERSION=0.7.3
 
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_INSTALL_DIR=/usr/local/bin \
@@ -57,7 +59,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         nvtx==0.2.16 numpy nvidia-ml-py \
     && uv pip install --python /opt/sglang-venv/bin/python --no-deps \
         --index-url https://flashinfer.ai/whl "flashinfer-cubin==${FLASHINFER_VERSION}" \
-    && uv pip install --python /opt/sglang-venv/bin/python --no-deps \
+    && uv pip install --python /opt/sglang-venv/bin/python \
         --index-url https://flashinfer.ai/whl/cu130 "flashinfer-jit-cache==${FLASHINFER_VERSION}+cu130" \
     && uv pip check --python /opt/sglang-venv/bin/python \
     && rm -rf /opt/vibesim/alignment/profiler/sglang/rust/target

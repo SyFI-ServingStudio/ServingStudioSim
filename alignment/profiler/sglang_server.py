@@ -30,7 +30,7 @@ file exists rather than a flag on the vLLM one:
   `extract_worker_device_ranks`.
 
 The CUDA forward-compatibility hook is not SGLang-specific in principle, but is
-in practice: SGLang HEAD pins a CUDA 13 stack (`torch==2.13`, `flashinfer[cu13]`)
+in practice: SGLang HEAD pins a CUDA 13 stack (`torch==2.14.1`, `flashinfer[cu13]`)
 whose user-mode driver a CUDA 12.8 host driver cannot satisfy. Pointing
 `driver_compat_lib_dir` at an unpacked `cuda-compat-13-x` gives the process a
 newer `libcuda.so.1` that still talks to the installed kernel module -- the
