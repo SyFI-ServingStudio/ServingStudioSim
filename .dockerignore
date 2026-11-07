@@ -15,4 +15,8 @@ profiling/profile.db
 *.pftrace
 trace
 alignment/load_generator
-alignment/profiler/sglang
+# The SGLang checkout stays in the context: sglang.Dockerfile copies it, and the
+# cluster's builder is the classic one, which reads no per-Dockerfile ignore file.
+# Its host install (alignment/profiler/README.md) stays out.
+**/.venv-sglang
+**/*.egg-info

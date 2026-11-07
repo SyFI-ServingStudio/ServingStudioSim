@@ -7,8 +7,7 @@
 # since workers run with --network none. Since 0.7, flashinfer-jit-cache is a
 # metapackage whose dependencies are the per-architecture provider wheels
 # (flashinfer-jit-cache-sm100a, ...) holding the .so files, so it installs with them. Its Rust extensions need a Rust
-# toolchain at build time. Built and tagged by `profiling/container/images.py`;
-# `sglang.Dockerfile.dockerignore` lets the checkout into the build context.
+# toolchain at build time. Built and tagged by `profiling/container/images.py`.
 
 ARG CUDA_VERSION=13.0.2
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04

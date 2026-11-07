@@ -152,7 +152,6 @@ IMAGES = {
             "sglang",
             "profiling/container/sglang.Dockerfile",
             ("sglang_env",),
-            inputs=("profiling/container/sglang.Dockerfile.dockerignore",),
             submodules=("alignment/profiler/sglang",),
             build_args=_sglang_args,
         ),
