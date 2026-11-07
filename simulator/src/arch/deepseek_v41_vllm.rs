@@ -108,7 +108,7 @@ const ENGRAM_LAYERS: [u32; 2] = [1, 14];
 // `--max-model-len 131072` is the selector's `max_model_len`, which the
 // capture presets pin; see [`resolve_max_model_len`].
 /// `max_num_batched_tokens` (= `chunk_size` 2048).
-const MAX_BATCHED_TOKENS: u32 = 2048;
+pub(crate) const MAX_BATCHED_TOKENS: u32 = 2048;
 /// `--block-size 128`: one KV page; an index page holds `128 / ratio` keys.
 const KV_BLOCK_SIZE: u32 = 128;
 /// Index-cache page used to price ratio-1 index layers. Production pages hold
@@ -621,7 +621,7 @@ impl BoundedReplay {
     }
 
     /// Whether a body runs on the replay batch. A body may not straddle the cut.
-    fn is_late(&self, layers: &[u32]) -> std::result::Result<bool, BuildError> {
+    pub(crate) fn is_late(&self, layers: &[u32]) -> std::result::Result<bool, BuildError> {
         let late = layers.iter().filter(|&&l| l >= self.cut_layer).count();
         match late {
             0 => Ok(false),
@@ -645,7 +645,7 @@ pub struct DeepseekV41LayerConfig {
 
 /// Fold plan with each body replaced by its index into the body list.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum PlanNode {
+pub(crate) enum PlanNode {
     Body(usize),
     Repeat { n: u32, body: Vec<PlanNode> },
 }
@@ -684,7 +684,7 @@ pub struct DeepseekV41ReplayConfig {
 }
 
 impl DeepseekV41ReplayConfig {
-    fn new(
+    pub(crate) fn new(
         rule: BoundedReplay,
         cut_body: usize,
         write_kv: DeepseekV41AttentionTpWorkletConfig,
@@ -854,7 +854,7 @@ pub fn build_configs(
     })
 }
 
-fn index_plan(
+pub(crate) fn index_plan(
     fold: &[FoldPlan],
     push: &mut impl FnMut(LayerKind, &[u32]) -> usize,
 ) -> Vec<PlanNode> {
@@ -1712,7 +1712,7 @@ fn decode_rows(decode: &[(u32, u32)]) -> Vec<u32> {
         .collect()
 }
 
-fn layer_input(
+pub(crate) fn layer_input(
     mode: GraphMode,
     rows: u32,
     prefill: Vec<(u32, u32)>,

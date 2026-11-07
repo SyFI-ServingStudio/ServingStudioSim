@@ -385,6 +385,37 @@ pub enum IterArchSel {
         #[serde(default = "default_decoder_swa_bounded_replay")]
         decoder_swa_bounded_replay: bool,
     },
+    /// DeepSeek-V4.1-Flash under vLLM DP4 attention + EP4 experts on B200
+    /// (`--data-parallel-size 4 --enable-expert-parallel`, TP1): every rank
+    /// its own engine with its own batch and KV; attention, Engram, shared
+    /// expert and the full-vocabulary lm_head at TP1, the routed experts
+    /// behind an MXFP8 all-gatherv and a bf16 reduce-scatterv.
+    DeepseekV41VllmDpAttnEpMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--max-model-len`, as for `deepseek_v41_vllm`.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// vLLM's decoder SWA bounded replay, as for `deepseek_v41_vllm`;
+        /// the DP ranks replay together.
+        #[serde(default = "default_decoder_swa_bounded_replay")]
+        decoder_swa_bounded_replay: bool,
+    },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)
     /// serialized; the Engram lookups keep racing the main path. An explicit
@@ -1209,6 +1240,7 @@ impl IterArchSel {
             | Self::DeepseekV4VllmSerialStreams { model, .. }
             | Self::DeepseekV41Vllm { model, .. }
             | Self::DeepseekV41VllmSerialStreams { model, .. }
+            | Self::DeepseekV41VllmDpAttnEpMoe { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
             | Self::Glm52VllmNvfp4PpDsaMoe { model, .. }
@@ -1259,6 +1291,11 @@ impl IterArchSel {
                 ..
             }
             | Self::DeepseekV41VllmSerialStreams {
+                model,
+                max_model_len,
+                ..
+            }
+            | Self::DeepseekV41VllmDpAttnEpMoe {
                 model,
                 max_model_len,
                 ..
@@ -1728,7 +1765,11 @@ mod iter_tests {
         );
         // DeepSeek-V4.1 defaults to the checkpoint's 1M positions; the
         // capture presets pin their 131072.
-        for arch in ["deepseek_v41_vllm", "deepseek_v41_vllm_serial_streams"] {
+        for arch in [
+            "deepseek_v41_vllm",
+            "deepseek_v41_vllm_serial_streams",
+            "deepseek_v41_vllm_dp_attn_ep_moe",
+        ] {
             assert_eq!(limit(arch, "deepseek_v41_flash", ""), 1_048_576);
             assert_eq!(
                 limit(arch, "deepseek_v41_flash", r#","max_model_len":131072"#),
