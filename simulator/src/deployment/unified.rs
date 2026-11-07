@@ -888,6 +888,7 @@ impl Deployment for UnifiedDeployment {
                 max_model_len,
                 draft_tokens,
                 decoder_swa_bounded_replay,
+                cudagraph_capture_sizes,
                 ..
             } => {
                 ensure_speculative(&g.worker, *draft_tokens)?;
@@ -900,6 +901,7 @@ impl Deployment for UnifiedDeployment {
                     *max_model_len,
                     *draft_tokens,
                     *decoder_swa_bounded_replay,
+                    cudagraph_capture_sizes,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

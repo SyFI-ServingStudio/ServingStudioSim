@@ -1070,6 +1070,7 @@ pub fn deepseek_v41_vllm_dspark(
     max_model_len: Option<u32>,
     draft_tokens: u32,
     decoder_swa_bounded_replay: bool,
+    cudagraph_capture_sizes: &[u32],
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1078,6 +1079,14 @@ pub fn deepseek_v41_vllm_dspark(
     let model_cfg = DeepseekV41ModelCfg::from_json(config_path, model_spec)
         .context("loading exact DeepSeek-V4.1-Flash model config")?;
     let dspark = DsparkCfg::from_json(config_path).context("loading the DSpark config")?;
+    // TODO(lane A): pass the list to the target once it takes one; until
+    // then only its built-in sizes are modeled, so a list is refused rather
+    // than ignored.
+    anyhow::ensure!(
+        cudagraph_capture_sizes.is_empty(),
+        "deepseek_v41_vllm_dspark: cudagraph_capture_sizes needs the target's capture-size \
+         parameter (pending)"
+    );
     let parallel = DeepseekV41VllmParallel {
         tp_size: deepseek_v41_vllm::TP_SIZE,
         ep_size: deepseek_v41_vllm::EP_SIZE,
@@ -2728,6 +2737,7 @@ pub fn build_speculative_iter_model(
             max_model_len,
             draft_tokens,
             decoder_swa_bounded_replay,
+            cudagraph_capture_sizes,
         } => Ok((
             Box::new(deepseek_v41_vllm_dspark(
                 model,
@@ -2738,6 +2748,7 @@ pub fn build_speculative_iter_model(
                 *max_model_len,
                 *draft_tokens,
                 *decoder_swa_bounded_replay,
+                cudagraph_capture_sizes,
                 gpu,
                 name,
                 bridge,

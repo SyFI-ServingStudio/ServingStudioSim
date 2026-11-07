@@ -457,6 +457,12 @@ pub enum IterArchSel {
         #[serde(default = "default_decoder_swa_bounded_replay")]
         #[param(default = true, cache_key)]
         decoder_swa_bounded_replay: bool,
+        /// vLLM `--cudagraph-capture-sizes`, passed to the target: the
+        /// PIECEWISE token sizes, from which MRV2 derives the FULL decode
+        /// (and draft) request-count graphs at the verify width.
+        #[serde(default)]
+        #[param(cache_key)]
+        cudagraph_capture_sizes: Vec<u32>,
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.
