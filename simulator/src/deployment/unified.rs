@@ -601,6 +601,7 @@ impl Deployment for UnifiedDeployment {
                 token_corpus_file,
                 max_model_len,
                 decoder_swa_bounded_replay,
+                cudagraph_capture_sizes,
                 ..
             } => {
                 // Barebone holds one partition, not one per rank.
@@ -613,6 +614,7 @@ impl Deployment for UnifiedDeployment {
                     token_corpus_file.as_deref(),
                     *max_model_len,
                     *decoder_swa_bounded_replay,
+                    cudagraph_capture_sizes,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

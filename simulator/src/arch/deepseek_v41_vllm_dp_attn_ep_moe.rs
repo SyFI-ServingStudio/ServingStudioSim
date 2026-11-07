@@ -104,6 +104,20 @@ pub struct DeepseekV41VllmDpParallel {
     pub max_model_len: u32,
     /// vLLM's decoder SWA bounded replay ([`BoundedReplay`], on by default).
     pub decoder_swa_bounded_replay: bool,
+    /// `--cudagraph-capture-sizes` per rank; empty is the captured
+    /// deployment's list ([`captured_graph_sizes`]), the only one taken yet.
+    pub cudagraph_capture_sizes: Vec<u32>,
+}
+
+/// The captured deployment's `cudagraph_capture_sizes` (server log
+/// `prefill_cudagraph_capture_token_sizes`): 1, 2, 4, every 8 to 256, every
+/// 16 to 2048 -- the sizes the TP arch's graph helpers are written for.
+pub(crate) fn captured_graph_sizes() -> Vec<u32> {
+    [1, 2, 4]
+        .into_iter()
+        .chain((8..=256).step_by(8))
+        .chain((272..=2048).step_by(16))
+        .collect()
 }
 
 /// One body layer's configs: the TP arch's at TP1, with the DP FFN.
@@ -142,6 +156,14 @@ pub fn build_configs(
             "max_model_len must be 1..={} (max_position_embeddings), got {}",
             model.max_position_embeddings, parallel.max_model_len
         )));
+    }
+    if !parallel.cudagraph_capture_sizes.is_empty()
+        && parallel.cudagraph_capture_sizes != captured_graph_sizes()
+    {
+        return Err(fit_failed(
+            "cudagraph_capture_sizes other than the captured list (1, 2, 4, every 8 to 256, \
+             every 16 to 2048) need the TP arch's size-aware graph helpers",
+        ));
     }
     if model.num_experts % DP_SIZE != 0 {
         return Err(fit_failed(format!(
@@ -247,7 +269,7 @@ pub fn build_configs(
     })
 }
 
-fn dp_layer_config(tp1: DeepseekV41LayerConfig) -> DeepseekV41DpLayerConfig {
+pub(crate) fn dp_layer_config(tp1: DeepseekV41LayerConfig) -> DeepseekV41DpLayerConfig {
     DeepseekV41DpLayerConfig {
         layers: tp1.layers,
         engram: tp1.engram,
@@ -261,10 +283,10 @@ fn dp_layer_config(tp1: DeepseekV41LayerConfig) -> DeepseekV41DpLayerConfig {
 }
 
 pub struct DeepseekV41DpLayerResolved {
-    layers: Vec<u32>,
-    engram: Option<DeepseekV41EngramTpWorkletResolved>,
-    attention: DeepseekV41AttentionTpWorkletResolved,
-    ffn: DeepseekV41MoeFfnDpEpWorkletResolved,
+    pub(crate) layers: Vec<u32>,
+    pub(crate) engram: Option<DeepseekV41EngramTpWorkletResolved>,
+    pub(crate) attention: DeepseekV41AttentionTpWorkletResolved,
+    pub(crate) ffn: DeepseekV41MoeFfnDpEpWorkletResolved,
 }
 
 pub struct DeepseekV41VllmDpResolved {
@@ -288,7 +310,7 @@ pub struct DpReplayResolved {
     scatter: ElementwiseKernelConfig,
 }
 
-fn resolve_layer(config: &DeepseekV41DpLayerConfig) -> DeepseekV41DpLayerResolved {
+pub(crate) fn resolve_layer(config: &DeepseekV41DpLayerConfig) -> DeepseekV41DpLayerResolved {
     DeepseekV41DpLayerResolved {
         layers: config.layers.clone(),
         engram: config
@@ -324,7 +346,7 @@ pub fn resolve_configs(configs: &DeepseekV41VllmDpConfigs) -> DeepseekV41VllmDpR
 }
 
 /// One built body layer: optional Engram block, TP1 attention, DP MoE FFN.
-struct DpLayerBody {
+pub(crate) struct DpLayerBody {
     name: String,
     layers: Vec<u32>,
     engram: Option<DeepseekV41EngramTpWorklet>,
@@ -333,7 +355,7 @@ struct DpLayerBody {
 }
 
 impl DpLayerBody {
-    fn build(
+    pub(crate) fn build(
         model_name: &str,
         resolved: DeepseekV41DpLayerResolved,
         bridge: &PerfApiBridge,
@@ -384,7 +406,7 @@ impl DpLayerBody {
 
     /// The whole layer; at the replay cut each rank's segment opens with the
     /// boundary's `write_kv` and gather.
-    fn compile(&self, boundary: Option<&DpReplayBoundary>, b: &mut CostTreeBuilder) -> CostNode {
+    pub(crate) fn compile(&self, boundary: Option<&DpReplayBoundary>, b: &mut CostTreeBuilder) -> CostNode {
         let ranks = (0..DP_SIZE)
             .map(|_| {
                 let mut leaves = Vec::new();
@@ -437,7 +459,7 @@ impl DpLayerBody {
 
     /// `input` is the batch this body runs (the replay batch for a late
     /// body); `boundary` is set on the cut body.
-    fn eval(
+    pub(crate) fn eval(
         &self,
         input: &DpLayerInput,
         boundary: Option<(&DpReplayBoundary, &DpStep)>,
@@ -460,7 +482,7 @@ fn ffn_rank_input(rank: &LayerInput) -> DeepseekV41MoeFfnDpRankInput {
     }
 }
 
-fn labeled_max(label: String, children: Vec<CostNode>) -> CostNode {
+pub(crate) fn labeled_max(label: String, children: Vec<CostNode>) -> CostNode {
     CostNode::Labeled {
         label,
         child: Box::new(CostNode::Max {
@@ -471,7 +493,7 @@ fn labeled_max(label: String, children: Vec<CostNode>) -> CostNode {
 }
 
 /// The built bounded-replay boundary, run by every rank on its own rows.
-struct DpReplayBoundary {
+pub(crate) struct DpReplayBoundary {
     cut_body: usize,
     write_kv: DeepseekV41AttentionTpWorklet,
     gather: Op<ElementwiseKernel>,
@@ -592,15 +614,34 @@ pub fn build(
 impl DeepseekV41VllmDpModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
+        let sections = self.compile_sections(&mut b);
+        let root = CostNode::Labeled {
+            label: format!(
+                "{} (DeepseekV41VllmDpModel) [DP{DP_SIZE} attention at TP1, EP{DP_SIZE} experts \
+                 behind MXFP8 all_gatherv / bf16 reduce_scatterv; {} unique bodies over 40 \
+                 layers; bounded_replay={}]",
+                self.name,
+                self.bodies.len() + 1,
+                self.replay.is_some(),
+            ),
+            child: Box::new(CostNode::Sum(sections)),
+        };
+        b.finish(root)
+    }
+
+    /// The target forward, prologue to head, in evaluation order
+    /// ([`Self::eval_step`]); a wrapper (the DSpark drafter) sums these with
+    /// its own sections.
+    pub(crate) fn compile_sections(&self, b: &mut CostTreeBuilder) -> Vec<CostNode> {
         // Layer 0's rank segment opens with the prologue and closes with the
         // two Engram lookups, which contend with it on the same device
         // (`compile_joined`) and finish before the first dispatch.
         let layer0_ranks = (0..DP_SIZE)
             .map(|_| {
-                let mut main = vec![self.prologue.compile(&mut b)];
-                main.extend(self.layer0.compile_rank(&mut b));
+                let mut main = vec![self.prologue.compile(b)];
+                main.extend(self.layer0.compile_rank(b));
                 self.engram_prefetch
-                    .compile_joined(&mut b, CostNode::Sum(main))
+                    .compile_joined(b, CostNode::Sum(main))
             })
             .collect();
         let mut layer0 = vec![labeled_max(
@@ -611,19 +652,19 @@ impl DeepseekV41VllmDpModel {
             ),
             layer0_ranks,
         )];
-        layer0.extend(self.layer0.compile_tail(&mut b));
+        layer0.extend(self.layer0.compile_tail(b));
         let mut sections = vec![CostNode::Labeled {
             label: format!("{} [layers [0]]", self.layer0.name),
             child: Box::new(CostNode::Sum(layer0)),
         }];
-        sections.extend(self.compile_plan(&self.plan, &mut b));
+        sections.extend(self.compile_plan(&self.plan, b));
         let heads = (0..DP_SIZE)
             .map(|_| {
                 let mut leaves = Vec::new();
                 if let Some(replay) = &self.replay {
-                    leaves.push(replay.scatter.compile(&mut b));
+                    leaves.push(replay.scatter.compile(b));
                 }
-                leaves.push(self.head.compile(&mut b));
+                leaves.push(self.head.compile(b));
                 CostNode::Sum(leaves)
             })
             .collect();
@@ -639,18 +680,15 @@ impl DeepseekV41VllmDpModel {
             ),
             heads,
         ));
-        let root = CostNode::Labeled {
-            label: format!(
-                "{} (DeepseekV41VllmDpModel) [DP{DP_SIZE} attention at TP1, EP{DP_SIZE} experts \
-                 behind MXFP8 all_gatherv / bf16 reduce_scatterv; {} unique bodies over 40 \
-                 layers; bounded_replay={}]",
-                self.name,
-                self.bodies.len() + 1,
-                self.replay.is_some(),
-            ),
-            child: Box::new(CostNode::Sum(sections)),
-        };
-        b.finish(root)
+        sections
+    }
+
+    pub fn max_model_len(&self) -> u32 {
+        self.max_model_len
+    }
+
+    pub fn replay_rule(&self) -> Option<&BoundedReplay> {
+        self.replay_rule.as_ref()
     }
 
     fn boundary_at(&self, index: usize) -> Option<&DpReplayBoundary> {
@@ -692,7 +730,7 @@ impl DeepseekV41VllmDpModel {
         }
     }
 
-    fn eval_step(&self, step: &DpStep, ev: &mut Evaluator) {
+    pub(crate) fn eval_step(&self, step: &DpStep, ev: &mut Evaluator) {
         for rank in &step.full.ranks {
             let tokens = rank.rows;
             self.prologue
@@ -818,7 +856,7 @@ pub(crate) struct DpLayerInput {
 }
 
 impl DpLayerInput {
-    fn new(ranks: Vec<LayerInput>) -> Self {
+    pub(crate) fn new(ranks: Vec<LayerInput>) -> Self {
         let ffn: Vec<_> = ranks.iter().map(ffn_rank_input).collect();
         Self {
             exchange: DeepseekV41MoeFfnDpEpWorkletInput {
@@ -1058,6 +1096,7 @@ mod tests {
             gpu_name: GPU_NAME.into(),
             max_model_len: 131_072,
             decoder_swa_bounded_replay: true,
+            cudagraph_capture_sizes: Vec::new(),
         }
     }
 
@@ -1252,6 +1291,11 @@ mod tests {
 
     #[test]
     fn invalid_inputs_are_refused() {
+        let mut explicit = parallel();
+        explicit.cudagraph_capture_sizes = captured_graph_sizes();
+        assert!(build_configs(&cfg(), &explicit, &uniform_demand()).is_ok());
+        explicit.cudagraph_capture_sizes = vec![1, 2, 4, 8];
+        assert!(build_configs(&cfg(), &explicit, &uniform_demand()).is_err());
         assert!(normalize_input(&input(vec![group(&[], &[1])]), 131_072, None).is_err());
         let idle = vec![group(&[], &[]); 4];
         assert!(normalize_input(&input(idle), 131_072, None).is_err());
