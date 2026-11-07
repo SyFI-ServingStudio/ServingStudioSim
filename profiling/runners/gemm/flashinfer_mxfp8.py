@@ -80,8 +80,11 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
     supported, reason = FlashInferCutedslMxfp8LinearKernel.is_supported()
     if not supported:
         raise ProfilerNotImplemented(f"FlashInfer CuTe-DSL MXFP8 linear unavailable: {reason}")
-    kernel = FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearLayerConfig())
-    return torch, autotune, kernel, mxfp8_e4m3_quantize
+
+    def make_kernel(n: int, k: int) -> Any:
+        return FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearLayerConfig(weight_shape=(n, k)))
+
+    return torch, autotune, make_kernel, mxfp8_e4m3_quantize
 
 
 def _dequantize(torch: Any, data: Any, scale_2d: Any) -> Any:
@@ -124,7 +127,8 @@ def profile_single_gemm_flashinfer_mxfp8(
     dtype: DType | str,
 ) -> ComputeMetrics:
     m, n, k = _validate(m, n, k, dtype)
-    torch, autotune, kernel, quantize = _load_runtime()
+    torch, autotune, make_kernel, quantize = _load_runtime()
+    kernel = make_kernel(n, k)
     try:
         torch.manual_seed(0)
         weight_q, weight_scale_2d = quantize(
