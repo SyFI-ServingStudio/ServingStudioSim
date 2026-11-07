@@ -1,0 +1,48 @@
+# DeepSeek-V4.1-Flash-1017 with its DSpark proposer on one four-GPU B200 NVLink
+# domain: TP4 attention and EP4 experts, vLLM model runner V2,
+# `--speculative-config {"method":"dspark","num_speculative_tokens":5}`.
+# Mirrors the DSpark capture's TP4 diverse workload pass
+# (logs/20261106_0_dsv41_dspark_capture/profile_tp4ep4_diverse_workload.yaml).
+#
+# `accept_rate` is the per-position conditional chain of that pass: its
+# unconditional per-position acceptance 0.795682 / 0.63812 / 0.536145 /
+# 0.464337 / 0.408834 (mean acceptance length 3.843 with the bonus token),
+# each divided by the one before it.
+deployment: unified
+
+workload:
+  trace_files:
+    - presets/deepseek_v41_dspark_diverse_100.csv
+  input_file_format: text-generation-independent
+  input_file_tags: [speculative]
+  arrival_mode: trace_timed
+  max_concurrency: 64
+  run_to_end: true
+
+io:
+  log_dir: logs/deepseek_v41_flash_b200_vllm_tp4_ep4_dspark
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: deepseek_v41_vllm_dspark
+          model_config: model/config/deepseek_v41_flash.json
+          fp8: true
+          max_model_len: 131072
+          # Recorded target routes of this deployment (TP4 EP4, DSpark k=5),
+          # sampled in verify-width groups. The draft MoE routes uniformly.
+          # TODO(publish): local capture path until the corpus is on the hub.
+          routing: corpus
+          token_corpus_file: /raid/kanzhu/ServingStudio/wt-dsv41-dspark/logs/20261106_0_dsv41_dspark_capture/profile_tp4ep4_corpus/token_corpus/manifest.json
+          draft_tokens: 5
+        worker:
+          type: speculative
+          # Decode spends the 2048-token budget in verify rows (6 per request).
+          max_batch_tokens: 2048
+          draft_tokens: 5
+          # vLLM KV pool per GPU in the capture: 566,723 blocks x 152,064 B
+          # ("GPU KV cache size: 40,746,855 tokens").
+          attn_gpu_memory_gb: 86.178166272

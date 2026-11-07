@@ -1,0 +1,49 @@
+# DeepSeek-V4.1-Flash-1017 with its DSpark proposer under vLLM DP4 attention +
+# EP4 experts on one four-GPU B200 NVLink domain (TP1 per rank, model runner
+# V2, `--speculative-config {"method":"dspark","num_speculative_tokens":5}`).
+# Mirrors the DSpark capture's DP4 diverse workload pass
+# (logs/20261106_0_dsv41_dspark_capture/profile_dp4ep4_diverse_workload.yaml).
+#
+# `accept_rate` is that pass's per-position conditional chain: unconditional
+# 0.773213 / 0.605448 / 0.491355 / 0.412998 / 0.355401 (mean acceptance
+# length 3.638 with the bonus token), each divided by the one before it.
+deployment: unified
+
+workload:
+  trace_files:
+    - presets/deepseek_v41_dspark_dp4_diverse_100.csv
+  input_file_format: text-generation-independent
+  input_file_tags: [speculative]
+  arrival_mode: trace_timed
+  max_concurrency: 64
+  run_to_end: true
+
+io:
+  log_dir: logs/deepseek_v41_flash_b200_vllm_dp4_ep4_dspark
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: deepseek_v41_vllm_dp_attn_ep_moe_dspark
+          model_config: model/config/deepseek_v41_flash.json
+          fp8: true
+          max_model_len: 131072
+          # Recorded target routes of this deployment (DP4 EP4, DSpark k=5),
+          # sampled in verify-width groups. The draft MoE routes uniformly.
+          # TODO(publish): local capture path until the corpus is on the hub.
+          routing: corpus
+          token_corpus_file: /raid/kanzhu/ServingStudio/wt-dsv41-dspark/logs/20261106_0_dsv41_dspark_capture/profile_dp4ep4_corpus/token_corpus/manifest.json
+          draft_tokens: 5
+        worker:
+          type: speculative
+          # Per DP rank: the 2048-token budget spent in verify rows (6 per request).
+          max_batch_tokens: 2048
+          draft_tokens: 5
+          # vLLM's DP coordinator places each request on the least-loaded engine.
+          dp_placement: vllm-least-loaded
+          # Per-rank vLLM KV pool of the DSpark DP4 capture: 493,892 blocks
+          # (76.68 GiB, "GPU KV cache size: 35,510,374 tokens").
+          attn_gpu_memory_gb: 82.334

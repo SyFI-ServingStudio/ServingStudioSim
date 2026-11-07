@@ -22,7 +22,8 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use crate::arch::{
-    deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
+    deepseek_v41_vllm, deepseek_v41_vllm_dp_attn_ep_moe, deepseek_v41_vllm_dp_attn_ep_moe_dspark, deepseek_v41_vllm_dspark,
+    deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
     glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
     glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
     glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2,
@@ -30,24 +31,25 @@ use crate::arch::{
     mimo_v2_vllm_fp8_swa_moe, qwen35_vllm_nvfp4_gdn_dense, qwen36_local, qwen3_attn_layerwise,
     qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
     qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, qwen4_exp_vllm_nvfp4_gdn_qsa_moe,
-    AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel,
-    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
-    DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg,
-    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
-    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel,
-    Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel,
-    Glm53FlashKernelPath, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel,
-    Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel, Glm53FlashVllmParallel,
-    Glm53VllmNvfp4DsaMoeDflash2Model, InklingExpertDemand, InklingExpertPrecision, InklingModelCfg,
-    InklingVllmModel, InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel,
-    Llama3DenseTpModel, Llama3DpAttnTpFfnModel, MimoV2ModelCfg, MimoV2VllmModel,
-    MimoV2VllmParallel, Qwen35ModelCfg, Qwen35VllmModel, Qwen35VllmParallel, Qwen36LocalModel,
-    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
-    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
-    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
-    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
-    Qwen4ExpModelCfg, Qwen4ExpVllmParallel, Qwen4ExpVllmSpeculativeModel,
+    AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmDpDsparkModel, DeepseekV41VllmDsparkModel, DeepseekV41VllmModel,
+    DeepseekV41VllmParallel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
+    DenseParallel, DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, DsparkCfg,
+    FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel,
+    Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
+    Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel,
+    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashKernelPath,
+    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel,
+    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
+    InklingExpertDemand, InklingExpertPrecision, InklingModelCfg, InklingVllmModel,
+    InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
+    Llama3DpAttnTpFfnModel, MimoV2ModelCfg, MimoV2VllmModel, MimoV2VllmParallel, Qwen35ModelCfg,
+    Qwen35VllmModel, Qwen35VllmParallel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
+    Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
+    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel, Qwen4ExpModelCfg, Qwen4ExpVllmParallel,
+    Qwen4ExpVllmSpeculativeModel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -1059,6 +1061,216 @@ pub fn deepseek_v41_vllm(
     let resolved = deepseek_v41_vllm::resolve_configs(&configs);
     deepseek_v41_vllm::build(name.to_string(), resolved, bridge)
         .context("building DeepSeek-V4.1-Flash vLLM model (often a missing profile.db row)")
+}
+
+/// Build DeepSeek-V4.1-Flash + DSpark: the TP4/EP4 target priced at verify
+/// width `draft_tokens + 1`, plus the DSpark proposer.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v41_vllm_dspark(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    max_model_len: Option<u32>,
+    draft_tokens: u32,
+    decoder_swa_bounded_replay: bool,
+    max_num_batched_tokens: u32,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<DeepseekV41VllmDsparkModel> {
+    let config_path = Path::new(&model_spec.model_config);
+    let model_cfg = DeepseekV41ModelCfg::from_json(config_path, model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let dspark = DsparkCfg::from_json(config_path).context("loading the DSpark config")?;
+    let parallel = DeepseekV41VllmParallel {
+        tp_size: deepseek_v41_vllm::TP_SIZE,
+        ep_size: deepseek_v41_vllm::EP_SIZE,
+        gpu_name: gpu.to_string(),
+        serialize_streams: false,
+        decoder_swa_bounded_replay,
+        max_model_len: deepseek_v41_vllm::resolve_max_model_len(
+            max_model_len,
+            model_cfg.max_position_embeddings,
+        )?,
+        max_num_batched_tokens,
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let (target_demand, draft_demand) = dspark_demands(
+        &model_cfg,
+        &dspark,
+        parallel.ep_size as u16,
+        routing_kind,
+        routing_seed,
+        expert_popularity_file,
+        token_corpus_file,
+        draft_tokens,
+    )?;
+    let target = deepseek_v41_vllm::build_configs(&model_cfg, &parallel, &target_demand)
+        .context("expanding DeepSeek-V4.1-Flash target configs")?;
+    let configs = deepseek_v41_vllm_dspark::build_configs(
+        &model_cfg,
+        &dspark,
+        &parallel,
+        target,
+        &draft_demand,
+        draft_tokens,
+    )
+    .context("expanding the DSpark proposer configs")?;
+    let resolved = deepseek_v41_vllm_dspark::resolve_configs(configs);
+    deepseek_v41_vllm_dspark::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash + DSpark (often a missing profile.db row)")
+}
+
+/// Build DeepSeek-V4.1-Flash under vLLM DP4 attention + EP4 experts (B200,
+/// TP1 per rank). Routed demand resolves as for [`deepseek_v41_vllm`]: one
+/// binding over all 40 routed layers, verify width 1.
+pub fn deepseek_v41_vllm_dp_attn_ep_moe(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    max_model_len: Option<u32>,
+    decoder_swa_bounded_replay: bool,
+    max_num_batched_tokens: u32,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<deepseek_v41_vllm_dp_attn_ep_moe::DeepseekV41VllmDpModel> {
+    let model_cfg = DeepseekV41ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let parallel = deepseek_v41_vllm_dp_attn_ep_moe::DeepseekV41VllmDpParallel {
+        gpu_name: gpu.to_string(),
+        max_model_len: deepseek_v41_vllm::resolve_max_model_len(
+            max_model_len,
+            model_cfg.max_position_embeddings,
+        )?,
+        decoder_swa_bounded_replay,
+        max_num_batched_tokens,
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.top_k,
+        ep_size: deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE as u16,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_layers,
+    };
+    let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
+    let configs = deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding DeepSeek-V4.1-Flash DP4/EP4 architecture configs")?;
+    let resolved = deepseek_v41_vllm_dp_attn_ep_moe::resolve_configs(&configs);
+    deepseek_v41_vllm_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash DP4/EP4 model (often a missing profile.db row)")
+}
+
+/// Build DeepSeek-V4.1-Flash + DSpark under DP4 attention + EP4 experts: the
+/// DP target priced at verify width `draft_tokens + 1`, plus the proposer with
+/// its EP-sharded draft MoE.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v41_vllm_dp_attn_ep_moe_dspark(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    max_model_len: Option<u32>,
+    draft_tokens: u32,
+    decoder_swa_bounded_replay: bool,
+    max_num_batched_tokens: u32,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<DeepseekV41VllmDpDsparkModel> {
+    let config_path = Path::new(&model_spec.model_config);
+    let model_cfg = DeepseekV41ModelCfg::from_json(config_path, model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let dspark = DsparkCfg::from_json(config_path).context("loading the DSpark config")?;
+    let parallel = deepseek_v41_vllm_dp_attn_ep_moe::DeepseekV41VllmDpParallel {
+        gpu_name: gpu.to_string(),
+        max_model_len: deepseek_v41_vllm::resolve_max_model_len(
+            max_model_len,
+            model_cfg.max_position_embeddings,
+        )?,
+        decoder_swa_bounded_replay,
+        max_num_batched_tokens,
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let ep_size = deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE as u16;
+    let (target_demand, draft_demand) = dspark_demands(
+        &model_cfg,
+        &dspark,
+        ep_size,
+        routing_kind,
+        routing_seed,
+        expert_popularity_file,
+        token_corpus_file,
+        draft_tokens,
+    )?;
+    let target =
+        deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &target_demand)
+            .context("expanding DeepSeek-V4.1-Flash DP4/EP4 target configs")?;
+    let configs = deepseek_v41_vllm_dp_attn_ep_moe_dspark::build_configs(
+        &model_cfg,
+        &dspark,
+        &parallel,
+        target,
+        &draft_demand,
+        draft_tokens,
+    )
+    .context("expanding the DP DSpark proposer configs")?;
+    let resolved = deepseek_v41_vllm_dp_attn_ep_moe_dspark::resolve_configs(configs);
+    deepseek_v41_vllm_dp_attn_ep_moe_dspark::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash DP4 + DSpark (often a missing profile.db row)")
+}
+
+/// The target's routed demand at the verify width and the draft MoE's
+/// uniform demand (draft routes are not captured, design D1).
+#[allow(clippy::too_many_arguments)]
+fn dspark_demands(
+    model_cfg: &DeepseekV41ModelCfg,
+    dspark: &DsparkCfg,
+    ep_size: u16,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    draft_tokens: u32,
+) -> Result<(ExpertDemand, ExpertDemand)> {
+    let verify_width = draft_tokens
+        .checked_add(1)
+        .context("speculative draft_tokens + 1 overflows u32")?;
+    let target = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.top_k,
+        ep_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_layers,
+    }
+    .demand(0..model_cfg.num_layers as usize, verify_width)?;
+    let draft = ExpertDemandSource {
+        kind: RoutingKind::Uniform,
+        seed: None,
+        num_experts: dspark.num_experts,
+        experts_per_token: dspark.top_k,
+        ep_size,
+        expert_popularity_file: None,
+        token_corpus_file: None,
+        num_routed_layers: 1,
+    }
+    .demand(0..1, 1)?;
+    Ok((target, draft))
 }
 
 /// Build the GLM-5.2 model in aligned vLLM kernel granularity.
@@ -2300,6 +2512,30 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
+        IterArchSel::DeepseekV41VllmDpAttnEpMoe {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            max_model_len,
+            decoder_swa_bounded_replay,
+            max_num_batched_tokens,
+            cudagraph_capture_sizes,
+        } => Box::new(deepseek_v41_vllm_dp_attn_ep_moe(
+            model,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            *max_model_len,
+            *decoder_swa_bounded_replay,
+            *max_num_batched_tokens,
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
         IterArchSel::Glm52VllmDsaMoe {
             model,
             ep_size,
@@ -2584,6 +2820,8 @@ pub fn build_iter_model(
         )?),
         IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
         | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+        | IterArchSel::DeepseekV41VllmDspark { .. }
+        | IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark { .. }
         | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
         }
@@ -2650,6 +2888,64 @@ pub fn build_speculative_iter_model(
                 token_corpus_file.as_deref(),
                 *draft_tokens,
                 *draft_sliding_window,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::DeepseekV41VllmDspark {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            max_model_len,
+            draft_tokens,
+            decoder_swa_bounded_replay,
+            max_num_batched_tokens,
+            cudagraph_capture_sizes,
+        } => Ok((
+            Box::new(deepseek_v41_vllm_dspark(
+                model,
+                *routing,
+                *routing_seed,
+                expert_popularity_file.as_deref(),
+                token_corpus_file.as_deref(),
+                *max_model_len,
+                *draft_tokens,
+                *decoder_swa_bounded_replay,
+                *max_num_batched_tokens,
+                cudagraph_capture_sizes,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            max_model_len,
+            draft_tokens,
+            decoder_swa_bounded_replay,
+            max_num_batched_tokens,
+            cudagraph_capture_sizes,
+        } => Ok((
+            Box::new(deepseek_v41_vllm_dp_attn_ep_moe_dspark(
+                model,
+                *routing,
+                *routing_seed,
+                expert_popularity_file.as_deref(),
+                token_corpus_file.as_deref(),
+                *max_model_len,
+                *draft_tokens,
+                *decoder_swa_bounded_replay,
+                *max_num_batched_tokens,
+                cudagraph_capture_sizes,
                 gpu,
                 name,
                 bridge,
@@ -2962,6 +3258,8 @@ fn build_arch(
                 let (gpus, shape, manifest, kv_cache) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
                     | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+                    | IterArchSel::DeepseekV41VllmDspark { .. }
+                    | IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark { .. }
                     | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
                         let (model, draft_tokens) = build_speculative_iter_model(
                             selector,

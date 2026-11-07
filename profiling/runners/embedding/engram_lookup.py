@@ -52,9 +52,9 @@ _RESIDENCIES = ("host_uva", "device")
 _MAX_TOKENS = 65_536
 # (max_ngram - 1) * n_heads on V4.1-Flash; a rank never owns more columns.
 _MAX_LOCAL_HEADS = 24
-# 200M rows x 264 B = 49 GiB: above the TP1 slice of one V4.1-Flash layer
-# (384M rows would be TP1; its 94 GiB table is outside what a profiling job pins).
-_MAX_TABLE_ROWS = 200_000_000
+# 400M rows x 264 B = 98 GiB pinned: above the TP1 (DP-attention) tables of
+# V4.1-Flash, 384,006,168 / 384,016,682 rows (94 GiB) for layers 1 / 14.
+_MAX_TABLE_ROWS = 400_000_000
 # Distinct rows the timing pool spans (~1 GB of rows at 264 B), well past L2.
 _POOL_ROWS = 4 << 20
 _MAX_POOL = 4096
