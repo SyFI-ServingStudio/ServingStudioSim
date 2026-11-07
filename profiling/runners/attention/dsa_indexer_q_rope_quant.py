@@ -141,7 +141,7 @@ def profile_dsa_indexer_q_rope_quant_sglang_cuda(
     )
     try:
         import torch
-        from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
+        from sglang.kernels.ops.attention.dsa.indexer_q import fused_q_indexer_rope_first_quant
     except (ImportError, OSError) as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires the SGLang environment") from exc
 

@@ -114,12 +114,11 @@ register(
         subprocess_env="sglang_env",
         doc=BackendDoc(
             summary=(
-                "SGLang's router dispatch: dsv3_router_gemm when m ≤ 16 (m ≤ 4 on "
-                "SM100/103), k % 1024 == 0 and n is 256 or 384; otherwise "
-                "linear_bf16_fp32."
+                "SGLang's router dispatch (MoEGate.forward): tiny_gemm_bf16 when m is "
+                "at most tiny_router_gemm_max_tokens (16 on SM90+ for a BF16 weight "
+                "can_use_tiny_gemm accepts, else never); otherwise linear_bf16_fp32."
             ),
-            # SGLang main replaced dsv3_router_gemm (#34693); pin the last upstream revision.
-            url="https://github.com/sgl-project/sglang/blob/ee462b5899c02db4e9d250f43c4c54d81253c4c6/python/sglang/kernels/ops/gemm/dsv3_router_gemm.py",
+            url="https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/deepseek_v2.py",
         ),
     )
 )

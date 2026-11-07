@@ -92,7 +92,7 @@ register(
                 "SGLang fused_q_indexer_rope_first_quant: RoPE, FP8 query quantization "
                 "and FP32 weights in one call."
             ),
-            url="https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/ops/attention/dsv4/elementwise.py",
+            url="https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/ops/attention/dsa/indexer_q.py",
         ),
     )
 )
