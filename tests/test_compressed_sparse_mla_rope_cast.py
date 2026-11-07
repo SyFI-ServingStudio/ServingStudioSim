@@ -111,17 +111,18 @@ def test_reference_attends_swa_and_compressed_keys_as_one_softmax():
     torch.testing.assert_close(out[0, 0], weights @ keys, rtol=1e-5, atol=1e-5)
 
 
-def test_record_layouts_put_the_page_scale_region_after_all_data():
-    # Defect caught: interleaving per-token scales with values inside a page.
+def test_record_layouts_put_each_token_scales_after_its_data():
+    # Defect caught: the pre-2026.09.30 FlashMLA layout (a page's scale region
+    # after all of its data), which the fork's V4.1 kernels no longer write.
     mx = torch.zeros((1, 32, 528), dtype=torch.uint8)
     flat = mx.view(-1)
-    flat[3 * 512 : 4 * 512] = 0x38  # fp8 e4m3 1.0 for token 3
-    flat[32 * 512 + 3 * 16 : 32 * 512 + 4 * 16] = 128  # ue8m0 2**1
+    flat[3 * 528 : 3 * 528 + 512] = 0x38  # fp8 e4m3 1.0 for token 3
+    flat[3 * 528 + 512 : 4 * 528] = 128  # ue8m0 2**1
     assert torch.all(decode_records(mx, torch.tensor([3]), "mxfp8") == 2.0)
     fp4 = torch.zeros((1, 64, 288), dtype=torch.uint8)
     flat = fp4.view(-1)
-    flat[5 * 256] = 0x2A  # low nibble 0xA = -1.0 (even), high 0x2 = 1.0 (odd)
-    flat[64 * 256 + 5 * 32] = 0x40  # e4m3 2.0 for dims 0..15
+    flat[5 * 288] = 0x2A  # low nibble 0xA = -1.0 (even), high 0x2 = 1.0 (odd)
+    flat[5 * 288 + 256] = 0x40  # e4m3 2.0 for dims 0..15
     row = decode_records(fp4, torch.tensor([5]), "nvfp4")[0]
     assert row[:2].tolist() == [-2.0, 2.0]
 
