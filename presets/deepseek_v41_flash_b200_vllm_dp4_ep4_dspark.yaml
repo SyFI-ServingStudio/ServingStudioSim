@@ -42,8 +42,8 @@ pools:
           # Per DP rank: the 2048-token budget spent in verify rows (6 per request).
           max_batch_tokens: 2048
           draft_tokens: 5
-          # The speculative worker places DP requests round-robin (no
-          # vllm-least-loaded option yet).
+          # vLLM's DP coordinator places each request on the least-loaded engine.
+          dp_placement: vllm-least-loaded
           # Per-rank vLLM KV pool of the DSpark DP4 capture: 493,892 blocks
           # (76.68 GiB, "GPU KV cache size: 35,510,374 tokens").
           attn_gpu_memory_gb: 82.334

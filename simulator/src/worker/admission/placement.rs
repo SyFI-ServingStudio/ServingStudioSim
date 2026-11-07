@@ -16,6 +16,19 @@ pub enum LoadBalance {
     },
 }
 
+impl LoadBalance {
+    /// The balancer a recipe with `partitions` attention-DP partitions uses
+    /// for the selector's `dp_placement`.
+    pub(crate) fn for_dp(partitions: usize, placement: crate::worker::config::DpPlacement) -> Self {
+        use crate::worker::config::DpPlacement;
+        match (partitions, placement) {
+            (1, _) => Self::Single,
+            (_, DpPlacement::RoundRobin) => Self::RoundRobin { next: 0 },
+            (_, DpPlacement::VllmLeastLoaded) => Self::LeastLoaded { next: 0 },
+        }
+    }
+}
+
 /// One partition's load as vLLM's DP coordinator reports it per engine.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct PartitionLoad {
@@ -95,6 +108,23 @@ mod tests {
             running,
             kv_usage,
         }
+    }
+
+    #[test]
+    fn the_selector_placement_picks_the_balancer() {
+        use crate::worker::config::DpPlacement;
+        assert!(matches!(
+            LoadBalance::for_dp(1, DpPlacement::VllmLeastLoaded),
+            LoadBalance::Single
+        ));
+        assert!(matches!(
+            LoadBalance::for_dp(4, DpPlacement::RoundRobin),
+            LoadBalance::RoundRobin { next: 0 }
+        ));
+        assert!(matches!(
+            LoadBalance::for_dp(4, DpPlacement::VllmLeastLoaded),
+            LoadBalance::LeastLoaded { next: 0 }
+        ));
     }
 
     #[test]

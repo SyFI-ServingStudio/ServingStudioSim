@@ -188,7 +188,8 @@ impl Deployment for UnifiedDeployment {
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
             dp_placement: match &g.worker {
-                IterWorkerSel::ChunkedPrefill { dp_placement, .. } => *dp_placement,
+                IterWorkerSel::ChunkedPrefill { dp_placement, .. }
+                | IterWorkerSel::Speculative { dp_placement, .. } => *dp_placement,
                 _ => DpPlacement::RoundRobin,
             },
             ..WorkerConfig::default()
@@ -1550,6 +1551,7 @@ pools:
             prefill_gpu_time_multiplier: None,
             kv_accounting: Default::default(),
             prefill_chunk_alignment: None,
+            dp_placement: DpPlacement::RoundRobin,
         }
     }
 
