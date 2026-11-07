@@ -583,6 +583,15 @@ def build_flashmla_mega(
         n_local_heads=shape.num_heads,
         _use_swapab=swapab,
         _compressed_kv_cache=lambda: work.extra_cache,
+        # The swap-AB small-decode kernel (16/32 live heads) is not this backend.
+        _use_swapab=False,
+        # A KV-source layer gathers its compressed columns every step; the
+        # layers after it may reuse them from the retained workspace span.
+        is_kv_source=True,
+        compressed_cache_prefix=f"{KIND}.profile",
+    )
+    layer._prefill_index_workspace_specs = types.MethodType(
+        DeepseekV4MegaAttnAttention._prefill_index_workspace_specs, layer
     )
     flashmla_metadata = (
         types.SimpleNamespace(block_table=work.extra_block_table, block_size=_KV_BLOCK)

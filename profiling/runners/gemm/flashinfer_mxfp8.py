@@ -137,6 +137,8 @@ def profile_single_gemm_flashinfer_mxfp8(
         )
         weight_scale_2d = weight_scale_2d.view(n, -1)
         layer = torch.nn.Module()
+        # apply_weights casts a bf16 activation's output to the layer dtype.
+        layer.params_dtype = torch.bfloat16
         layer.weight = torch.nn.Parameter(weight_q.clone(), requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(weight_scale_2d.clone(), requires_grad=False)
         kernel.process_weights_after_loading(layer)
