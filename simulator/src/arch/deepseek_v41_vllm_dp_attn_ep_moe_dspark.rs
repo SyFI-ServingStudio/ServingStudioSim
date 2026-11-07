@@ -118,12 +118,20 @@ pub fn build_configs(
         cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
     };
     let (first, rest) = draft_layer_configs(model, dspark, &local, draft_demand);
+    // The draft exchange's all-gatherv per-rank cap, the target's rule: a
+    // rank's rows are its scheduled tokens or the graph it pads to.
+    let graphs = DeepseekV41CudaGraphs::new(
+        &parallel.cudagraph_capture_sizes,
+        MAX_NUM_SEQS,
+        &[draft_tokens + 1],
+    );
+    let max_rank_tokens = parallel.max_num_batched_tokens.max(graphs.max_tokens());
     Ok(DeepseekV41DpDsparkConfigs {
         draft_tokens,
         num_draft_layers: dspark.num_draft_layers,
         context_kv: context_kv_config(model, dspark, &first.attention),
-        draft_first: dp_layer_config(first, parallel.max_num_batched_tokens),
-        draft_rest: dp_layer_config(rest, parallel.max_num_batched_tokens),
+        draft_first: dp_layer_config(first, max_rank_tokens),
+        draft_rest: dp_layer_config(rest, max_rank_tokens),
         head: target.head.clone(),
         markov: markov_config(model, dspark, &parallel.gpu_name),
         vocab_size: model.vocab_size,
@@ -574,6 +582,7 @@ impl SpeculativeUnifiedModel for DeepseekV41VllmDpDsparkModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arch::deepseek_v41_vllm::GraphMode;
     use std::path::Path;
 
     use crate::arch::config::ModelSpec;
@@ -694,9 +703,10 @@ mod tests {
             None,
         )
         .unwrap();
-        // The target: the idle rank's one-row dummy is not a verify-width
-        // decode, so every rank pads to the busiest rank's PIECEWISE size.
-        assert!(target.full.ranks.iter().all(|rank| rank.rows == 32));
+        // The target: the idle rank's dummy is one verify-width request, so
+        // the step stays a FULL graph at the busiest rank's six requests.
+        assert_eq!(target.mode, GraphMode::Full);
+        assert!(target.full.ranks.iter().all(|rank| rank.rows == 36));
         // The draft: every rank at the six-request graph, 30 rows.
         assert!(ranks
             .iter()
