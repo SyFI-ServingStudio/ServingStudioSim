@@ -87,6 +87,12 @@ commands plus, for every excluded case, *why* — already complete, or missing a
 named input. Planning is a pure function (`execute.plan_phase`), which is what
 makes it testable on CPU.
 
+`--runtime image` runs each new capture of a profile pass in the `vllm-align`
+image (`alignment/README.md`, "In-image capture"); the host keeps scheduling,
+markers and journal, GPU choice and outputs. Every other phase, and `--resume`,
+runs on the host from the capture's files, so a matrix can mix host and image
+captures case by case.
+
 For `--phase simulation`, worker settings come from `simulation.yaml`, including
 `gpu_time_multiplier`. Kernel analysis is an independent phase, not a
 prerequisite for simulation. The campaign never reads a case's own calibration
@@ -170,6 +176,12 @@ Each pass can also set `warmup: true` (default false). This renders
 `workload.warmup: true` for that pass, using req-frontend's bounded warmup,
 drain, prefix-cache reset and measurement boundary. vLLM variants must enable
 server load tracking. Warmup does not alter either materialized trace.
+
+A variant may set `prewarm` (`prompt_lengths`, optional `max_tokens`, `seed`,
+`timeout`), rendered into its `nsys` and `workload_metrics` passes as the
+profile's `prewarm` block: requests that compile per-shape kernels before
+measurement. Its lengths are the variant's, e.g. its kernels' M buckets up to the
+variant's chunk size.
 
 A **case** is one operating point: `max_model_len`, `max_concurrency`, the two
 arrival modes, `gpu_memory_utilization`, `capture_seconds`, `device_role`, its

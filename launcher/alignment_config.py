@@ -21,6 +21,7 @@ from alignment.profiler.config import (
     ROUTING_PROFILE_KINDS,
     IdleWaitConfig,
     NsysConfig,
+    PrewarmConfig,
     ProfileConfig,
     PythonPackageArtifact,
     PythonRuntimeConfig,
@@ -122,6 +123,7 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
         idle_raw = _pop_optional_mapping(raw, "idle", "profile")
         nsys_raw = _pop_optional_mapping(raw, "nsys", "profile")
         python_runtime_raw = _pop_optional_mapping(raw, "python_runtime", "profile")
+        prewarm_raw = _pop_optional_mapping(raw, "prewarm", "profile")
         server = ServerConfig(**server_raw)
         workload = LoadGeneratorConfig.from_mapping(workload_raw)
         workload = replace(
@@ -135,6 +137,10 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
         idle = IdleWaitConfig(**idle_raw)
         nsys = NsysConfig(**nsys_raw)
         nsys.validate()
+        prewarm = None
+        if prewarm_raw:
+            prewarm = PrewarmConfig(**prewarm_raw)
+            prewarm.validate()
         python_runtime = None
         if python_runtime_raw:
             packages_raw = python_runtime_raw.pop("packages", None)
@@ -167,6 +173,7 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
             fork_python=fork_python,
             driver_compat_lib_dir=driver_compat_lib_dir,
             python_runtime=python_runtime,
+            prewarm=prewarm,
             **raw,
         )
     except (KeyError, TypeError, ValueError) as exc:

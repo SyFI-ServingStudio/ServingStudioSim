@@ -154,6 +154,11 @@ class Variant:
     #: own checkpoint. Rendering writes its path into `--speculative-config`, so
     #: the pack never carries a machine's HF cache path.
     draft_checkpoint: str | None = None
+    #: `alignment profile`'s `prewarm` block, rendered into the timed passes
+    #: (nsys, workload_metrics): requests that compile per-shape kernels before
+    #: measurement. Lengths are this variant's choice, e.g. its kernels' M buckets
+    #: up to its chunk size.
+    prewarm: dict[str, Any] | None = None
 
     def pass_named(self, name: str) -> ProfilePass | None:
         for item in self.profile_passes:
@@ -474,6 +479,11 @@ def _variant(name: str, raw: Any) -> Variant:
             None
             if (draft_checkpoint := body.pop("draft_checkpoint", None)) is None
             else _typed(draft_checkpoint, str, f"{where}.draft_checkpoint")
+        ),
+        prewarm=(
+            None
+            if (prewarm := body.pop("prewarm", None)) is None
+            else dict(_typed(prewarm, dict, f"{where}.prewarm"))
         ),
     )
     _reject_extra(body, where)

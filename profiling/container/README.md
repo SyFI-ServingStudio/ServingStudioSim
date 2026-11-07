@@ -10,6 +10,7 @@ names their tags:
 | `vllm` | `vllm_env` | CUDA 13.0, the alignment vLLM checkout at its gitlink on the precompiled wheel of its upstream base (with the FlashKDA build it vendors as `_flashkda_C`), every FlashInfer cubin |
 | `sglang` | `sglang_env` | CUDA 13.0, the alignment SGLang checkout at its gitlink with the `sglang-kernel` and FlashInfer 0.6.15.post1 builds it pins |
 | `flashinfer-kda` | `flashinfer_kda_env` | FlashInfer's KDA nightly, Torch 2.11 cu130, TVM/TIRx (`requirements/flashinfer_kda.txt`) |
+| `vllm-align` | none | `FROM` the `vllm` image: Nsight Systems 2025.5.2 (apt, pinned version), the req-frontend `session_runner` built at its gitlink on the same userland, the capture runner's venv (`requirements/capture.txt`), `nvtx==0.2.15` in the vLLM venv. Runs alignment captures (`alignment profile --runtime image`, `alignment/README.md`) |
 
 ```bash
 just profile-container-build              # every image
@@ -52,6 +53,17 @@ uv run python -m profiling run nvfp4_quant \
   --spec '{"num_tokens":32,"hidden_size":6144,"group_size":16,"input_dtype":"bf16","scale_format":"linear_e4m3"}' \
   --json
 ```
+
+An image built `FROM` another (`Image.base`) gets the base's tag as its
+`BASE_IMAGE` build argument, and that tag is one of its own inputs, so a new
+base is a new derived image. Building it builds a missing base first.
+`vllm-align` adds the req-frontend checkout to the context (`.dockerignore`
+keeps every `target/` out, and a checkout with one is not refused for it).
+Inside it, `VIBESIM_CAPTURE_RUNTIME=in-image` makes the runner use the baked
+`session_runner` instead of calling cargo, and the image's entrypoint is
+`python -m launcher` on the capture venv. The overlay rule is the workers' one,
+applied around submodules: `alignment/`'s own files are mounted one by one, so
+the fork and the req-frontend binary stay the image's.
 
 The vLLM image builds the fork on the precompiled wheel of the upstream commit
 it is rebased on (the parent of its first `feat(alignment):` commit,

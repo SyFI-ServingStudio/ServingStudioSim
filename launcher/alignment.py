@@ -83,6 +83,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "failure so the GPU capture is never repeated."
         ),
     )
+    profile.add_argument(
+        "--runtime",
+        choices=("host", "image"),
+        default="host",
+        help=(
+            "host: the checkout's fork venv and the configured nsys. image: the "
+            "vllm-align profiler image with this checkout's capture code overlaid "
+            "(alignment/image_runtime.py); the host keeps GPU choice and outputs."
+        ),
+    )
 
     predict = commands.add_parser(
         "timing-predict",
@@ -473,11 +483,29 @@ def _run_profile(args: argparse.Namespace) -> int:
         args.config,
         require_python_runtime=not args.resume,
     )
+    from alignment.image_runtime import container_config, in_image, run_profile_in_image
+
+    if args.runtime == "image" and (args.resume or in_image()):
+        raise ValueError(
+            "--runtime image starts a container from the host; resume an image "
+            "capture on the host with --resume, and run nothing nested"
+        )
     if args.dry_run:
+        if args.runtime == "image":
+            # Every path the container would need, mapped and checked.
+            container_config(args.config, Path(config.log_dir))
         print(f"[alignment] profile validated: {args.config} (log_dir={config.log_dir})")
         return 0
-    write_artifact_kind(Path(config.log_dir).parent, ArtifactKind.ALIGNMENT_BUNDLE)
-    _snapshot_config(args.config, Path(config.log_dir), "profile")
+    if not in_image():
+        # In an image the host already did both, against the host paths.
+        write_artifact_kind(Path(config.log_dir).parent, ArtifactKind.ALIGNMENT_BUNDLE)
+        _snapshot_config(args.config, Path(config.log_dir), "profile")
+    if args.runtime == "image":
+        print(f"[alignment] profiling in image: {args.config}")
+        returncode = run_profile_in_image(args.config)
+        if returncode == 0:
+            print(f"[alignment] profiling complete: {config.log_dir}/profile_result.json")
+        return returncode
     print(f"[alignment] {'resuming' if args.resume else 'profiling'}: {args.config}")
     result = run_profile(config, resume=args.resume)
     if result.get("profile_kind", "nsys") == "nsys":

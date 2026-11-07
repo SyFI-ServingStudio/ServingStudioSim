@@ -34,7 +34,17 @@ def _repo_path(value: str) -> Path:
 
 
 def build_session_runner() -> Path:
-    """Build req-frontend before starting vLLM so compilation is outside nsys."""
+    """Build req-frontend before starting vLLM so compilation is outside nsys.
+
+    In the alignment image the binary was built at the gitlink when the image
+    was (`profiling/container/vllm_align.Dockerfile`) and there is no toolchain.
+    """
+    from ..image_runtime import in_image
+
+    if in_image():
+        if not SESSION_RUNNER.is_file():
+            raise FileNotFoundError(f"the image carries no req-frontend binary at {SESSION_RUNNER}")
+        return SESSION_RUNNER
     subprocess.run(
         [
             "cargo",

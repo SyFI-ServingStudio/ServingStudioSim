@@ -15,4 +15,6 @@ profiling/profile.db
 *.pftrace
 trace
 alignment/load_generator
+!alignment/load_generator/req-frontend
+**/target
 alignment/profiler/sglang

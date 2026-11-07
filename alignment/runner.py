@@ -32,6 +32,7 @@ from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
 from .nsys.parsed_io import kernel_rows_path, write_parsed
 from .profiler import (
+    capture_facts,
     nsys_capture,
     record_extraction,
     runtime_artifacts,
@@ -369,6 +370,8 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         or (cfg.profile_kind == "nsys" and cfg.nsys.capture_mode != "cuda_profiler_api")
     ):
         raise ValueError("warmup requires vLLM and cuda_profiler_api for NSYS captures")
+    if cfg.prewarm is not None and cfg.engine != "vllm":
+        raise ValueError("prewarm addresses DP ranks through vLLM's X-data-parallel-rank header")
     if (
         cfg.workload is not None and cfg.workload.warmup
         and not cfg.server.enable_server_load_tracking
@@ -449,6 +452,8 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         profile_kind=cfg.profile_kind,
         resume=resume,
     )
+    if not resume:
+        capture_facts.record(cfg, env, log_dir)
     # Only the timing pass runs under NSYS. The other passes launch the same
     # server argv bare so profiler lifecycle work cannot enter their evidence.
     out_rep = nsys_dir / cfg.name
@@ -537,6 +542,17 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         try:
             driver.wait_for_ready(base_url, proc, cfg.server.startup_timeout)
             driver.verify_server_started(server_log, cfg.server)
+            prewarm_results = None
+            if cfg.prewarm is not None:
+                started = time.monotonic()
+                prewarm_results = driver.send_prewarm(
+                    base_url, model, cfg.prewarm, cfg.server.dp_size
+                )
+                print(
+                    f"[profile] prewarm: {len(prewarm_results)} request(s) in "
+                    f"{time.monotonic() - started:.1f} s",
+                    flush=True,
+                )
             speculative = driver.speculative_decode_enabled(cfg.server)
             counters_before = None
             replay_start_monotonic_ns = None
@@ -585,6 +601,8 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
                 routed_experts_dir=_prepared_routes_dir(cfg, log_dir),
             )
             replay_end_monotonic_ns = time.monotonic_ns()
+            if prewarm_results is not None:
+                drive_summary["prewarm"] = prewarm_results
             # EngineCore metrics use the same host CLOCK_MONOTONIC domain. The
             # explicit window lets workload alignment exclude server-startup
             # and prefix-cache preflight iterations without consulting NSYS.
