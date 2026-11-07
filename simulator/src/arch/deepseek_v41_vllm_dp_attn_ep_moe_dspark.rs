@@ -508,6 +508,7 @@ fn normalize_dp_dspark_input(
                         prefill_query_context_pairs: Vec::new(),
                         decode_kv_lens,
                         aux_stream_live: graph.is_some(),
+                        full_graph: graph.is_some(),
                         // Draft layers have no `mhc_stream` (`dspark.py:128-138`).
                         mhc_overlap: false,
                         write_kv_only: false,

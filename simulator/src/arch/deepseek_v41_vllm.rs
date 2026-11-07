@@ -138,6 +138,9 @@ pub(crate) const MXFP8_GEMM_BACKENDS: &[&str] = &["flashinfer_mxfp8"];
 pub(crate) const FP32_GEMM_BACKENDS: &[&str] = &["torch_cublas"];
 pub(crate) const KV_INSERT_BACKENDS: &[&str] = &["vllm_cuda"];
 pub(crate) const MEGA_ATTN_BACKENDS: &[&str] = &["flashmla_mega"];
+/// vLLM's swap-AB decode kernel, which takes small decode steps of compressed
+/// layers at 16 or 32 live heads (TP4 / TP2 of the 64-head checkpoint).
+pub(crate) const SWAPAB_ATTN_BACKENDS: &[&str] = &["swapab_cutedsl"];
 pub(crate) const WO_A_BACKENDS: &[&str] = &["deepgemm_mxfp8_einsum_grouped_o_proj"];
 pub(crate) const ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
 pub(crate) const ALL_GATHER_PROXY_BACKENDS: &[&str] = &["nccl"];
@@ -1067,6 +1070,7 @@ pub(crate) fn layer_config(
             fp32_gemm_backends: FP32_GEMM_BACKENDS.to_vec(),
             kv_insert_backends: KV_INSERT_BACKENDS.to_vec(),
             mega_attn_backends: MEGA_ATTN_BACKENDS.to_vec(),
+            swapab_attn_backends: SWAPAB_ATTN_BACKENDS.to_vec(),
             wo_a_backends: WO_A_BACKENDS.to_vec(),
             all_reduce_backends: ALL_REDUCE_BACKENDS.to_vec(),
             index_logits_prefill_backends: INDEX_LOGITS_BACKENDS.to_vec(),
@@ -1387,6 +1391,7 @@ impl DeepseekV41VllmModel {
                                 prefill_query_context_pairs: Vec::new(),
                                 decode_kv_lens: Vec::new(),
                                 aux_stream_live: false,
+                                full_graph: false,
                                 mhc_overlap: false,
                                 write_kv_only: true,
                             }
@@ -1815,6 +1820,7 @@ pub(crate) fn layer_input(
             // The attention aux stream exists only outside breakable capture
             // (`utils/multi_stream_utils.py`), i.e. in FULL graphs.
             aux_stream_live: full_graph && rows > 0,
+            full_graph,
             mhc_overlap: mhc_overlap_live(full_graph, rows),
             write_kv_only: false,
         },
@@ -2241,6 +2247,9 @@ mod tests {
         assert_eq!(count("q_pad_kv_rope_mxfp8_insert"), 40);
         assert_eq!(named("mega_attn.decode"), 40);
         assert_eq!(named("mega_attn.prefill"), 40);
+        // TP4 leaves 16 live heads: every compressed layer (2-39) has the
+        // swap-AB decode leaf, the two ratio-0 layers do not.
+        assert_eq!(named("mega_attn.decode_swapab"), 38);
         assert_eq!(count("nvfp4_fused_moe"), 40);
         assert_eq!(count("batched_gemm"), 40);
         assert_eq!(count("all_reduce"), 3);
@@ -2324,7 +2333,7 @@ mod tests {
         let decode = normalize(vec![], vec![1000; 48]).unwrap();
         assert_eq!(decode.mode, GraphMode::Full);
         assert_eq!((decode.full.rows, decode.logits_rows), (48, 48));
-        assert!(decode.full.attention.aux_stream_live);
+        assert!(decode.full.attention.aux_stream_live && decode.full.attention.full_graph);
         assert!(!decode.full.attention.mhc_overlap);
         // The decode segment sees each row's resident KV.
         assert_eq!(decode.full.attention.decode_kv_lens, vec![1000; 48]);
@@ -2332,7 +2341,7 @@ mod tests {
         let mixed = normalize(vec![(512, 126)], vec![900; 48]).unwrap();
         assert_eq!(mixed.mode, GraphMode::Piecewise);
         assert_eq!((mixed.full.rows, mixed.logits_rows), (176, 49));
-        assert!(!mixed.full.attention.aux_stream_live);
+        assert!(!mixed.full.attention.aux_stream_live && !mixed.full.attention.full_graph);
         assert_eq!(
             mixed.full.attention.prefill_query_context_pairs,
             [(126, 638)]

@@ -523,6 +523,7 @@ impl DpReplayBoundary {
                 prefill_query_context_pairs: Vec::new(),
                 decode_kv_lens: Vec::new(),
                 aux_stream_live: false,
+                full_graph: false,
                 mhc_overlap: false,
                 write_kv_only: true,
             },

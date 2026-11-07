@@ -31,6 +31,16 @@
 //!   `get_prefill_chunk_plan` workspace budget. Chunks can hold more than
 //!   `prefill_chunk_size` short requests.
 //!
+//! Decode at 16 or 32 heads is vLLM's swap-AB kernel (backend
+//! `swapab_cutedsl`, fork `nvidia/ops/swapab_decode_attn.py`), which
+//! `_forward_decode_mega` takes instead of the mega kernel for decode segments
+//! of at most `_SWAPAB_MAX_TOKENS` rows on compressed layers with 16 or 32
+//! live heads (`flash_mla_mega_attn.py` `_swapab_decode_supported`). It runs
+//! only the live heads, so `num_heads` is the live count there. Each row is one
+//! thread-block cluster of [`swapab_tiles`] CTAs (64-slot SWA tiles, 128-slot
+//! compressed tiles; tiles past a row's length exit early), so at <= 16 rows
+//! the launch is one wave and its time follows the longest row.
+//!
 //! Measured B200 behaviour behind the axes: at 2048 prefill tokens (ratio 2),
 //! mean keys 240 -> 640 moves time 116 -> 183 us. The gather alone costs about
 //! 80 us for 100000 rows (ratio 1). Decode steps at every 148 rows (148 SMs).
@@ -59,6 +69,32 @@ const MAX_REQUESTS: u32 = 256;
 const MAX_DECODE_ROWS: u32 = 2048;
 /// SMs on the only supported GPU (NVIDIA B200); the decode wave width at 64 heads.
 const B200_SMS: u32 = 148;
+/// `_SWAPAB_MAX_TOKENS` (fork `flash_mla_mega_attn.py`): the most decode rows
+/// the swap-AB kernel takes.
+pub const SWAPAB_MAX_TOKENS: u32 = 16;
+/// KV slots per swap-AB CTA: SWA tiles (`_SWA_ROWS`) and compressed tiles
+/// (`_TILE`), and the portable cluster bound on a row's tiles (`_MAX_CLUSTER`).
+const SWAPAB_SWA_ROWS: u32 = 64;
+const SWAPAB_EXTRA_ROWS: u32 = 128;
+const SWAPAB_MAX_CLUSTER: u32 = 8;
+
+/// CTAs in one swap-AB row's cluster (`swapab_decode_supported`).
+pub fn swapab_tiles(window_size: u32, index_topk: u32) -> u32 {
+    window_size.div_ceil(SWAPAB_SWA_ROWS) + index_topk.div_ceil(SWAPAB_EXTRA_ROWS)
+}
+
+/// Whether vLLM gives a layer's small decode steps to the swap-AB kernel:
+/// a compressed layer with 16 or 32 live heads whose tiles fit one cluster
+/// (`_swapab_decode_supported` + `swapab_decode_supported`).
+pub fn swapab_layer(
+    compress_ratio: u32,
+    live_heads: u32,
+    window_size: u32,
+    index_topk: u32,
+) -> bool {
+    let tiles = swapab_tiles(window_size, index_topk);
+    compress_ratio > 0 && matches!(live_heads, 16 | 32) && (1..=SWAPAB_MAX_CLUSTER).contains(&tiles)
+}
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CompressedSparseMlaRopeCastKernelConfig {
@@ -71,7 +107,9 @@ pub struct CompressedSparseMlaRopeCastKernelConfig {
     pub compress_ratio: u32,
     pub window_size: u32,
     pub index_topk: u32,
-    /// The kernel's padded Q head count (64 or 128), not the live TP heads.
+    /// Q heads the kernel runs: the mega kernel's padded count (64 or 128),
+    /// or the swap-AB kernel's live count (16 or 32, decode on compressed
+    /// layers only).
     pub num_heads: Dim,
     pub head_dim: Dim,
     pub rope_dim: Dim,
@@ -205,7 +243,14 @@ fn validate_config(config: &CompressedSparseMlaRopeCastKernelConfig) {
         (WINDOW, INDEX_TOPK, 512, 64, 4),
         "unsupported (window, index_topk, head_dim, rope_dim, prefill_chunk_size)"
     );
-    assert!(matches!(config.num_heads.get(), 64 | 128));
+    match config.num_heads.get() {
+        64 | 128 => {}
+        16 | 32 => assert!(
+            is_decode(config) && config.compress_ratio > 0,
+            "16 or 32 heads (swap-AB) is decode on a compressed layer only"
+        ),
+        other => panic!("num_heads must be 64 or 128 (padded) or 16 or 32 (live), got {other}"),
+    }
     assert_eq!(
         config.compressed_cache_format == "none",
         config.compress_ratio == 0,
@@ -218,8 +263,17 @@ fn is_decode(config: &CompressedSparseMlaRopeCastKernelConfig) -> bool {
     config.mode == "decode"
 }
 
-/// Decode rows per CTA wave: one CTA per row and 64 heads.
+/// Whether the config is the swap-AB kernel's: it alone runs live heads.
+fn is_swapab(config: &CompressedSparseMlaRopeCastKernelConfig) -> bool {
+    config.num_heads.get() < 64
+}
+
+/// Decode rows per CTA wave: one CTA per row and 64 heads for the mega
+/// kernel, one cluster of [`swapab_tiles`] CTAs per row for swap-AB.
 fn rows_per_wave(config: &CompressedSparseMlaRopeCastKernelConfig) -> u32 {
+    if is_swapab(config) {
+        return B200_SMS / swapab_tiles(config.window_size, config.index_topk);
+    }
     B200_SMS * 64 / config.num_heads.get()
 }
 
@@ -473,7 +527,7 @@ fn canonical_decode(
     config: &CompressedSparseMlaRopeCastKernelConfig,
 ) -> Option<Vec<(u32, u32)>> {
     let rows = point[0] as u32;
-    if rows > MAX_DECODE_ROWS {
+    if rows > MAX_DECODE_ROWS || (is_swapab(config) && rows > SWAPAB_MAX_TOKENS) {
         return None;
     }
     let per_wave = rows_per_wave(config) as usize;
@@ -569,6 +623,10 @@ fn with_filler(
 }
 
 fn token_axis(config: &CompressedSparseMlaRopeCastKernelConfig) -> Vec<f64> {
+    if is_swapab(config) {
+        // Every step vLLM sends here: 1..=16 rows, one wave.
+        return Axis::values([1, 2, 4, 6, 8, 10, 12, 14, 16]);
+    }
     if is_decode(config) {
         // The decode time steps one wave at a time: bracket every wave edge.
         let wave = rows_per_wave(config);
@@ -907,6 +965,51 @@ mod tests {
             [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 522752.0, 1047040.0]
         );
         assert_eq!(excess_axis(&config_at("decode", 2, 64, 1_048_576)), [0.0]);
+    }
+
+    /// Catches a swap-AB grid that leaves the steps vLLM routes there (more
+    /// than 16 rows) or whose canonical batches miss their grid points.
+    #[test]
+    fn swapab_grid_spans_one_to_sixteen_rows_in_one_wave() {
+        assert_eq!(swapab_tiles(128, 512), 6);
+        assert!(swapab_layer(1, 16, 128, 512) && swapab_layer(2, 32, 128, 512));
+        assert!(!swapab_layer(0, 16, 128, 512) && !swapab_layer(2, 64, 128, 512));
+        assert!(
+            !swapab_layer(2, 16, 128, 1024),
+            "10 tiles exceed one cluster"
+        );
+        for ratio in 1..=2 {
+            for heads in [16, 32] {
+                for max_model_len in [131072, 1_048_576] {
+                    let config = config_at("decode", ratio, heads, max_model_len);
+                    assert_eq!(rows_per_wave(&config), 24);
+                    let grid = CompressedSparseMlaRopeCastSpec::sweep_grid(&config);
+                    assert_eq!(grid.axes()[0].last(), Some(&16.0));
+                    let mask = CompressedSparseMlaRopeCastSpec::infeasible_mask(&config, &grid);
+                    let feasible = mask.iter().filter(|&&drop| !drop).count();
+                    assert!(
+                        feasible > 40 && feasible <= 500,
+                        "r{ratio} h{heads}: {feasible}"
+                    );
+                }
+            }
+        }
+        // One wave: a single long row sets the keys of the whole step.
+        let config = config_at("decode", 1, 16, 131072);
+        let input = CompressedSparseMlaRopeCastKernelInput {
+            query_context_pairs: [vec![(1, 5000)], vec![(1, 64); 15]].concat(),
+        };
+        assert_eq!(
+            CompressedSparseMlaRopeCastSpec::cache_coords(&config, &input)[1],
+            640.0
+        );
+    }
+
+    /// Catches swap-AB heads configured for a step the mega kernel serves.
+    #[test]
+    #[should_panic(expected = "swap-AB")]
+    fn live_heads_are_decode_on_compressed_layers_only() {
+        CompressedSparseMlaRopeCastSpec::sweep_grid(&config_at("prefill", 2, 16, 131072));
     }
 
     /// Catches a ratio-0 layer configured with a compressed cache.
