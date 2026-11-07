@@ -95,6 +95,33 @@ class ServerConfig:
 
 
 @dataclass
+class PrewarmConfig:
+    """Requests that compile per-shape kernels before the measurement starts.
+
+    Some engines JIT a kernel the first time a shape bucket appears in a
+    process (the DSpark drafter's eager MXFP8 GEMMs compile one CuTe DSL kernel
+    per M bucket, 0.4-1.3 s each, every server start). A capture that meets one
+    inside its window measures the compile. These prompts -- random token ids,
+    so they share no prefix with each other or the trace -- run on every DP rank
+    once the server is up and before the load generator starts; the lengths are
+    the workload's choice, stated in the config, never derived here.
+    """
+
+    prompt_lengths: list[int] = field(default_factory=list)
+    max_tokens: int = 4
+    seed: int = 0
+    timeout: float = 600.0
+
+    def validate(self) -> None:
+        if not self.prompt_lengths or any(
+            type(n) is not int or n <= 0 for n in self.prompt_lengths
+        ):
+            raise ValueError("prewarm.prompt_lengths must be a non-empty list of positive ints")
+        if type(self.max_tokens) is not int or self.max_tokens <= 0:
+            raise ValueError("prewarm.max_tokens must be a positive int")
+
+
+@dataclass
 class IdleWaitConfig:
     """Poll vLLM's /load endpoint until in-flight requests drain to zero."""
 
@@ -220,6 +247,7 @@ class ProfileConfig:
     server: ServerConfig = None  # type: ignore[assignment]
     idle: IdleWaitConfig = field(default_factory=IdleWaitConfig)
     nsys: NsysConfig = field(default_factory=NsysConfig)
+    prewarm: PrewarmConfig | None = None
 
     # --- workload: req-frontend consumes the same source trace as the simulator ---
     workload: LoadGeneratorConfig = None  # type: ignore[assignment]

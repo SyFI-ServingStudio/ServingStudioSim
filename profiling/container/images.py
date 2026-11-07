@@ -121,9 +121,14 @@ class Image:
     # Alignment checkouts the image installs; named by their gitlink.
     submodules: tuple[str, ...] = ()
     build_args: Callable[[Path], dict[str, str]] = field(default=lambda root: {})
+    # The image this one is built `FROM` (a key of IMAGES), passed as the
+    # `BASE_IMAGE` build argument. Its tag is an input of this one's.
+    base: str | None = None
 
     def tag(self, root: Path = REPO_ROOT) -> str:
         digest = hashlib.sha256(f"{' '.join(self.envs)}\0".encode())
+        if self.base is not None:
+            digest.update(f"FROM {IMAGES[self.base].tag(root)}\0".encode())
         for relative in (self.dockerfile, *self.inputs):
             digest.update(relative.encode() + b"\0")
             digest.update((root / relative).read_bytes() + b"\0")
@@ -155,6 +160,23 @@ IMAGES = {
             inputs=("profiling/container/sglang.Dockerfile.dockerignore",),
             submodules=("alignment/profiler/sglang",),
             build_args=_sglang_args,
+        ),
+        # The vLLM image plus what an alignment capture runs beside the server:
+        # Nsight Systems, the req-frontend load generator at its gitlink, and the
+        # capture runner's own interpreter (`alignment/image_runtime.py`). It
+        # serves no profile env.
+        Image(
+            "vllm-align",
+            "profiling/container/vllm_align.Dockerfile",
+            (),
+            inputs=("profiling/container/requirements/capture.txt",),
+            submodules=("alignment/load_generator/req-frontend",),
+            build_args=lambda root: {
+                "VIBESIM_REQ_FRONTEND_REVISION": gitlink(
+                    root, "alignment/load_generator/req-frontend"
+                )
+            },
+            base="vllm",
         ),
         Image(
             "flashinfer-kda",
@@ -194,7 +216,7 @@ def image_for_env(env_name: str, root: Path = REPO_ROOT) -> str | None:
 
 
 # Directory names `.dockerignore` keeps out of every build context.
-_DOCKER_IGNORED = frozenset({".git", ".venv", "__pycache__"})
+_DOCKER_IGNORED = frozenset({".git", ".venv", "__pycache__", "target"})
 
 
 def _require_pinned_checkouts(image: Image, root: Path) -> None:
@@ -221,11 +243,28 @@ def _require_pinned_checkouts(image: Image, root: Path) -> None:
             )
 
 
+def _image_exists(tag: str) -> bool:
+    return (
+        subprocess.run(
+            ["docker", "image", "inspect", tag], capture_output=True, check=False
+        ).returncode
+        == 0
+    )
+
+
 def build(name: str, root: Path = REPO_ROOT) -> str:
     image = IMAGES[name]
     _require_pinned_checkouts(image, root)
     tag = image.tag(root)
+    base_args = {}
+    if image.base is not None:
+        # Never pulled (module docstring): a missing base is built here first.
+        base_tag = IMAGES[image.base].tag(root)
+        if not _image_exists(base_tag):
+            build(image.base, root)
+        base_args = {"BASE_IMAGE": base_tag}
     args = {
+        **base_args,
         **image.build_args(root),
         "VIBESIM_PROFILE_ENVS": " ".join(image.envs),
         "VIBESIM_REVISION": _git(root, "rev-parse", "HEAD"),

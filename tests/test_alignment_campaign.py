@@ -1431,3 +1431,24 @@ def test_variant_arch_tag_and_params_exist_in_the_exported_schema(pack):
         known |= {item["name"] for item in schema.arch_common}
         unknown = set(variant.arch) - known - {"type", "max_model_len"}
         assert not unknown, f"variants.{name}.arch has unknown params {sorted(unknown)}"
+
+
+def test_image_runtime_reaches_only_new_profile_captures(pack, tmp_path):
+    """`run --runtime image` moves the capture into the alignment image; every
+    later phase, and a resume of a capture, reads artifacts on the host."""
+    case = pack.cases[0]
+    variant = pack.variant_of(case)
+    host = check_module.host_for(pack, None)
+    render_case(pack, case, host, tmp_path, REPO_ROOT)
+    for phase in phase_names(variant):
+        (plan,) = execute.plan_phase(pack, tmp_path, phase, cases=[case], runtime="image")
+        if not plan.command:
+            continue
+        is_profile = variant.pass_named(phase) is not None
+        assert (plan.command[-2:] == ("--runtime", "image")) is is_profile
+        if is_profile:
+            (resumed,) = execute.plan_phase(
+                pack, tmp_path, phase, cases=[case], runtime="image", resume=True
+            )
+            assert "--runtime" not in resumed.command
+            assert resumed.command[-1] == "--resume"

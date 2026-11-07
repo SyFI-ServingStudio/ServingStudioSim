@@ -227,12 +227,22 @@ def phase_command(
     *,
     resume: bool,
     refresh: bool,
+    runtime: str = "host",
 ) -> tuple[str, ...]:
-    """The `python -m launcher alignment ...` invocation for one case's phase."""
+    """The `python -m launcher alignment ...` invocation for one case's phase.
+
+    `runtime` reaches only the profile passes: a capture can run in the
+    alignment image, and everything after it reads artifacts on the host.
+    A resume re-derives artifacts from an existing capture, on the host.
+    """
     config = case_dir / f"{config_stem(variant, phase)}.yaml"
     base = (sys.executable, "-m", "launcher", "alignment")
     if variant.pass_named(phase) is not None:
-        return base + ("profile", str(config)) + (("--resume",) if resume else ())
+        if resume:
+            return base + ("profile", str(config), "--resume")
+        return base + ("profile", str(config)) + (
+            ("--runtime", runtime) if runtime != "host" else ()
+        )
     if phase == TIMING_PREDICT_PHASE:
         return base + ("timing-predict", str(config))
     if phase in (ANALYSIS_KERNEL_PHASE, ANALYSIS_E2E_PHASE):
@@ -250,6 +260,7 @@ def plan_phase(
     cases: list[Case] | None = None,
     refresh: bool = False,
     resume: bool = False,
+    runtime: str = "host",
 ) -> tuple[PhasePlan, ...]:
     """Decide each case's disposition. Pure: no process is started, nothing is
     written, so the CPU tier tests this directly against a faked artifact tree."""
@@ -299,6 +310,7 @@ def plan_phase(
                     phase,
                     resume=resume,
                     refresh=refresh,
+                    runtime=runtime,
                 ),
             )
         )
@@ -435,6 +447,7 @@ def run_phase(
     refresh: bool = False,
     resume: bool = False,
     parallelism: int = 1,
+    runtime: str = "host",
 ) -> RunReport:
     """Fan one phase across every ready case and collect exit codes separately.
 
@@ -449,6 +462,7 @@ def run_phase(
         cases=cases,
         refresh=refresh,
         resume=resume,
+        runtime=runtime,
     )
     report = RunReport(phase=phase, plans=plans)
     report.results = asyncio.run(_run_all(pack, plans, parallelism=parallelism, refresh=refresh))

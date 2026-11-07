@@ -136,6 +136,25 @@ single-config path below when there is one workload and no matrix.
    model cache, and fork venv (`fork_python` must import `torch` and the
    selected engine).
 
+   Prefer capturing vLLM in the image: `alignment profile --runtime image` or
+   `alignment-campaign run --runtime image` (`alignment/README.md`, "In-image
+   capture"). The pinned `vllm-align` image replaces the checkout's fork venv,
+   host nsys and cargo build, so the capture does not depend on how one
+   worktree's venv was provisioned. Build it once per fork/req-frontend gitlink
+   with `just profile-container-build vllm-align`, inside a Slurm job where docker
+   is a job-scoped rootless Podman (unset the workspace `.env`'s `DOCKER_HOST`
+   there, or docker reaches the host daemon instead). Run the capture inside a
+   GPU job with the same CPU/memory share a host capture gets (a 4-GPU job's
+   default, not a trimmed `-c`): the workers' shared memory and the checkpoint's
+   page cache count against the job's memory cgroup, and a 285 GiB job thrashed
+   for minutes loading DeepSeek-V4.1-Flash that a ~1 TB job loads in under one.
+   The job's GPUs reach the container by UUID. Read the pass's
+   `capture_facts.json` (GPUs, driver, topology, multicast, memlock, shm) before
+   comparing captures from different machines. When a kernel JIT-compiles per
+   shape on first use inside the window (vLLM's jit_monitor logs
+   "JIT compilation during inference"), declare a `prewarm` block with those
+   shapes' prompt lengths instead of a side script.
+
    `profile_kind` selects one of four passes, and they are not
    interchangeable — each buys one kind of evidence at the cost of another, so
    pick by which check will consume it (see `alignment/README.md` for the

@@ -31,6 +31,7 @@ from pathlib import Path
 from .config import IdleWaitConfig, ProfileConfig, ServerConfig
 
 VLLM_SOURCE_ROOT = Path(__file__).resolve().parent / "vllm"
+_IMAGE_MANIFEST = Path("/etc/vibesim-profiler-image.json")
 
 HEALTH_ENDPOINTS = ("/health", "/v1/models")
 
@@ -253,8 +254,62 @@ def write_launch_metadata(
         "python_runtime": runtime_provenance,
         "fork_python": fork_python,
         "fork_git": _git_info(VLLM_SOURCE_ROOT),
+        # An image carries no .git; its manifest names the inputs it was built from.
+        "image": (
+            json.loads(_IMAGE_MANIFEST.read_text()) if _IMAGE_MANIFEST.is_file() else None
+        ),
     }
     Path(path).write_text(json.dumps(metadata, indent=2))
+
+
+def send_prewarm(base_url: str, model: str, prewarm, dp_size: int) -> list[dict]:
+    """Send `prewarm.prompt_lengths`, one wave per length, to every DP rank.
+
+    The rank is chosen with vLLM's `X-data-parallel-rank` header, so each
+    engine core compiles its own kernels. Prompts are random token ids from a
+    seeded generator: reproducible, and never a prefix of anything else.
+    """
+    import random
+    import threading
+
+    rng = random.Random(prewarm.seed)
+    results: list[dict] = []
+    for length in prewarm.prompt_lengths:
+        wave: list[dict] = []
+        threads = []
+        for rank in range(dp_size):
+            prompt = [rng.randrange(1000, 100000) for _ in range(length)]
+
+            def post(rank=rank, prompt=prompt) -> None:
+                body = json.dumps(
+                    {"model": model, "prompt": prompt, "max_tokens": prewarm.max_tokens,
+                     "temperature": 0.0}
+                ).encode()
+                request = urllib.request.Request(
+                    f"{base_url}/v1/completions", data=body, method="POST",
+                    headers={"Content-Type": "application/json",
+                             "X-data-parallel-rank": str(rank)},
+                )
+                start = time.monotonic()
+                try:
+                    with urllib.request.urlopen(request, timeout=prewarm.timeout) as response:
+                        response.read()
+                        status = response.status
+                except (urllib.error.URLError, OSError) as error:
+                    status = f"{type(error).__name__}: {error}"
+                wave.append({"rank": rank, "prompt_tokens": length, "status": status,
+                             "seconds": round(time.monotonic() - start, 3)})
+
+            thread = threading.Thread(target=post)
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join()
+        failed = [item for item in wave if item["status"] != 200]
+        if failed:
+            raise RuntimeError(f"prewarm request(s) failed: {failed}")
+        results += sorted(wave, key=lambda item: item["rank"])
+    return results
 
 
 def speculative_decode_enabled(cfg: ServerConfig) -> bool:
