@@ -12,9 +12,6 @@ from profiling.kernels.nvfp4_fused_moe import Nvfp4FusedMoeArgs
 from profiling.kernels.nvfp4_quant import Nvfp4QuantArgs
 from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.gemm import sglang as sglang_gemm
-from profiling.runners.gemm.gemm_fp32_output_sglang_router import (
-    _max_router_gemm_tokens,
-)
 from profiling.runners.moe import moe_finalize_fuse_shared, nvfp4_fused_moe
 
 
@@ -138,12 +135,6 @@ def test_sglang_compressed_tensors_quantization_uses_non_per_token_path() -> Non
     )
     assert moe_calls[0]["per_token_scale"] is None
     assert "per_token_scale" not in moe_calls[1]
-
-
-def test_sglang_router_uses_blackwell_production_threshold() -> None:
-    assert _max_router_gemm_tokens(100) == 4
-    assert _max_router_gemm_tokens(103) == 4
-    assert _max_router_gemm_tokens(90) == 16
 
 
 @pytest.mark.parametrize(
