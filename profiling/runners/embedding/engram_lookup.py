@@ -198,8 +198,14 @@ def build_id_pool(
     return (raw % size + lo).to(torch.int32)
 
 
-def _lookup_module(torch: Any, device: Any, views: tuple[Any, Any], local_heads: int, rows: int):
-    """The attributes ``ParallelEngramEmbedding.lookup`` reads, for rank 0's slice."""
+def _lookup_module(
+    torch: Any, device: Any, views: tuple[Any, Any], local_heads: int, rows: int, host: bool
+):
+    """The attributes ``ParallelEngramEmbedding.lookup`` reads, for rank 0's slice.
+
+    A host table is pinned with ordinary pages, as production's private
+    cpu_offload table (no THP, no DP-shared storage), so lookup sorts large
+    batches the same way."""
     return SimpleNamespace(
         part_n_hash_cols=local_heads,
         n_hash_cols=local_heads,
@@ -210,6 +216,9 @@ def _lookup_module(torch: Any, device: Any, views: tuple[Any, Any], local_heads:
         block_size=_QUANT_BLOCK,
         _num_sms=torch.cuda.get_device_properties(device).multi_processor_count,
         _storage=lambda: views,
+        _uses_small_host_pages=host,
+        peer_rows=0,
+        peer_ptrs=None,
     )
 
 
@@ -260,7 +269,9 @@ def profile_engram_lookup_vllm_triton(
     try:
         device = torch.device("cuda", torch.cuda.current_device())
         table = _get_table(torch, device, table_rows, residency)
-        module = _lookup_module(torch, device, table["views"], local_heads, table_rows)
+        module = _lookup_module(
+            torch, device, table["views"], local_heads, table_rows, residency == "host_uva"
+        )
         background = residency == "host_uva"
 
         def lookup(ids: Any, out: Any) -> None:
