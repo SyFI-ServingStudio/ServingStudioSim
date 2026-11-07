@@ -112,14 +112,14 @@ const ENGRAM_LAYERS: [u32; 2] = [1, 14];
 /// captures); the selector's `max_num_batched_tokens` overrides it.
 pub(crate) const MAX_BATCHED_TOKENS: u32 = 2048;
 /// `--block-size 128`: one KV page; an index page holds `128 / ratio` keys.
-const KV_BLOCK_SIZE: u32 = 128;
+pub(crate) const KV_BLOCK_SIZE: u32 = 128;
 /// Index-cache page used to price ratio-1 index layers. Production pages hold
 /// `128 / ratio` keys (128 at ratio 1), but the `dsa_paged_mqa_logits_decode`
 /// DeepGEMM runner only builds 64-key pages (`_BLOCK_SIZE = 64`), so ratio-1
 /// scoring is priced on 64-key pages: the same keys in twice the pages.
 const RATIO1_INDEX_PAGE_FALLBACK: u32 = 64;
 /// SWA page of the fused q-norm/rope/KV insert (the profiled kernel identity).
-const SWA_BLOCK_SIZE: u32 = 32;
+pub(crate) const SWA_BLOCK_SIZE: u32 = 32;
 /// FlashMLA's padded per-rank Q width.
 const PADDED_HEADS: u32 = 64;
 /// Mega-attention prefill chunking (the profiled op identity).
@@ -188,6 +188,9 @@ pub struct DeepseekV41ModelCfg {
     pub engram_layer_ids: Vec<u32>,
     /// Hash columns = `(engram_max_ngram_size - 1) * engram_n_heads` (24).
     pub engram_hash_heads: u32,
+    /// Prior tokens each request's n-gram hash looks back on:
+    /// `engram_max_ngram_size - 1` (fork `common/engram.py:444`).
+    pub engram_lookback_depth: u32,
     pub engram_head_dim: u32,
 }
 
@@ -374,6 +377,7 @@ impl DeepseekV41ModelCfg {
             candidate_source_layer_id: raw.candidate_source_layer_id,
             engram_layer_ids: raw.engram_layer_ids,
             engram_hash_heads: (raw.engram_max_ngram_size - 1) * raw.engram_n_heads,
+            engram_lookback_depth: raw.engram_max_ngram_size - 1,
             engram_head_dim: raw.engram_head_dim,
         })
     }
@@ -910,16 +914,10 @@ pub(crate) fn index_plan(
 /// instead of reusing it. Each ratio-2 source's compressor keeps a ring of
 /// eight fp32 [kv, score] rows, one block per request, also never reused.
 /// vLLM reserves one null block.
-pub(crate) fn kv_cache_layout(
-    model: &DeepseekV41ModelCfg,
-    tp_size: u32,
-    extra_swa_layers: u32,
-) -> KvCacheLayout {
+/// The packed full-attention block every KV group's page matches (bytes),
+/// and its per-ratio parts `(name, ratio, bytes per entry, padded bytes)`.
+fn packed_full_block(model: &DeepseekV41ModelCfg) -> (u64, Vec<(&'static str, u32, u64, u64)>) {
     const BLOCK_TOKENS: u64 = KV_BLOCK_SIZE as u64;
-    const PAGE_ALIGN: u64 = 512;
-    const RING_ROWS: u64 = 8;
-    const FP32: u64 = 4;
-    let page = |entries: u64, bytes: u64| (entries * bytes).div_ceil(PAGE_ALIGN) * PAGE_ALIGN;
     let (record, index_row, swa_row) = (
         u64::from(NVFP4_RECORD_BYTES),
         u64::from(FP8_INDEXER_ROW_BYTES),
@@ -940,7 +938,10 @@ pub(crate) fn kv_cache_layout(
     for (ratio, kv_name, index_name) in [(2, "c2_kv", "c2_indexer"), (1, "c1_kv", "c1_indexer")] {
         let entries = BLOCK_TOKENS / u64::from(ratio);
         let (kv_layers, index_layers) = (sources_at(ratio, false), sources_at(ratio, true));
-        let (kv_page, index_page) = (page(entries, record), page(entries, index_row));
+        let (kv_page, index_page) = (
+            kv_page_bytes(entries, record),
+            kv_page_bytes(entries, index_row),
+        );
         block += kv_layers * kv_page + index_layers * index_page;
         full_parts.push((
             kv_name,
@@ -955,7 +956,7 @@ pub(crate) fn kv_cache_layout(
             index_layers * index_page / entries,
         ));
     }
-    let stride_align = lcm(PAGE_ALIGN, lcm(swa_row, record));
+    let stride_align = lcm(KV_PAGE_ALIGN, lcm(swa_row, record));
     let stride = block.div_ceil(stride_align) * stride_align;
     // The stride rounding, per token, carried by the last ratio-1 part.
     let rounding = stride - block;
@@ -967,6 +968,71 @@ pub(crate) fn kv_cache_layout(
     if let Some(last) = full_parts.last_mut() {
         last.3 += rounding / BLOCK_TOKENS;
     }
+    (block, full_parts)
+}
+
+const KV_PAGE_ALIGN: u64 = 512;
+
+fn kv_page_bytes(entries: u64, bytes: u64) -> u64 {
+    (entries * bytes).div_ceil(KV_PAGE_ALIGN) * KV_PAGE_ALIGN
+}
+
+/// SWA layers (body plus `extra_swa_layers` draft layers) whose 32-token pages
+/// pack into page-size-matched KV cache groups: vLLM's
+/// `kv cache group sizes (32 x6, 128, 8)` for DSpark.
+fn swa_kv_groups(model: &DeepseekV41ModelCfg, extra_swa_layers: u32) -> u32 {
+    let (block, _) = packed_full_block(model);
+    let swa_layers = model.compress_ratios.len() as u64 + u64::from(extra_swa_layers);
+    let pages = swa_layers
+        * kv_page_bytes(
+            u64::from(SWA_BLOCK_SIZE),
+            u64::from(MXFP8_RECORD_BYTES),
+        );
+    pages.div_ceil(block) as u32
+}
+
+/// Compressed (ratio > 1) KV sources and the bytes of one layer's compressor
+/// ring state (8 rows of `2 x head_dim` fp32).
+fn compressor_ring(model: &DeepseekV41ModelCfg) -> (u64, u64) {
+    const RING_ROWS: u64 = 8;
+    const FP32: u64 = 4;
+    let ring_layers = model
+        .kv_source_layer_ids
+        .iter()
+        .filter(|&&layer| model.compress_ratios[layer as usize] > 1)
+        .count() as u64;
+    (ring_layers, RING_ROWS * 2 * u64::from(model.head_dim) * FP32)
+}
+
+/// KV cache groups by kind: the SWA groups (32-token blocks), the one packed
+/// full-attention group (128-token blocks) and the compressor-ring groups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeepseekV41KvGroups {
+    pub swa: u32,
+    pub full: u32,
+    pub ring: u32,
+}
+
+pub(crate) fn kv_groups(model: &DeepseekV41ModelCfg, extra_swa_layers: u32) -> DeepseekV41KvGroups {
+    let (block, _) = packed_full_block(model);
+    let (ring_layers, ring_layer_bytes) = compressor_ring(model);
+    DeepseekV41KvGroups {
+        swa: swa_kv_groups(model, extra_swa_layers),
+        full: 1,
+        ring: (ring_layers * kv_page_bytes(1, ring_layer_bytes)).div_ceil(block) as u32,
+    }
+}
+
+pub(crate) fn kv_cache_layout(
+    model: &DeepseekV41ModelCfg,
+    tp_size: u32,
+    extra_swa_layers: u32,
+) -> KvCacheLayout {
+    let page = kv_page_bytes;
+    let swa_row = u64::from(MXFP8_RECORD_BYTES);
+    let (block, full_parts) = packed_full_block(model);
+    let stride_align = lcm(KV_PAGE_ALIGN, lcm(swa_row, u64::from(NVFP4_RECORD_BYTES)));
+    let stride = block.div_ceil(stride_align) * stride_align;
 
     let tp = tp_size;
     let mut layout = KvCacheLayout::new();
@@ -982,13 +1048,8 @@ pub(crate) fn kv_cache_layout(
 
     let swa_layers = model.compress_ratios.len() as u64 + u64::from(extra_swa_layers);
     let swa_block = u64::from(SWA_BLOCK_SIZE);
-    let swa_groups = groups(swa_layers * page(swa_block, swa_row));
-    let ring_layers = model
-        .kv_source_layer_ids
-        .iter()
-        .filter(|&&layer| model.compress_ratios[layer as usize] > 1)
-        .count() as u64;
-    let ring_layer_bytes = RING_ROWS * 2 * u64::from(model.head_dim) * FP32;
+    let swa_groups = u64::from(swa_kv_groups(model, extra_swa_layers));
+    let (ring_layers, ring_layer_bytes) = compressor_ring(model);
     layout
         .with_part(
             KvCachePart::sliding_window("swa", model.sliding_window, swa_layers * swa_row)

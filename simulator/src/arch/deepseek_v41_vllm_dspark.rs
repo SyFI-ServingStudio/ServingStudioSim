@@ -10,11 +10,11 @@
 //! ```text
 //! target forward over 6R + P rows (verify width 6 per decode request)
 //!   ... its head runs lm_head + logits AllGather over every verified row
-//! sample: logits fp32 cast, rejection statistics, per-request resample
+//! sample: rejection statistics, per-request resample
 //! draft (FULL graph keyed by request count):
 //!   context KV over all target rows (main_proj over layers 37/38/39)
 //!   embedding (+ TP all-reduce), 3 reduced target layers on 5R rows
-//!   head: mhc_post -> hc collapse -> norm -> lm_head (+ AllGather) -> cast
+//!   head: mhc_post -> hc collapse -> norm -> lm_head (+ AllGather)
 //!   5 sequential Markov steps on R rows
 //! ```
 //!
@@ -42,10 +42,9 @@
 //!
 //! # What is not modeled
 //!
-//! The confidence head (off: `enable_adaptive_verification`), the fused
-//! Markov sampler (off), and the per-layer draft metadata
-//! (`_prepare_dflash_inputs`, `_token_request_mapping`, `CombineTopkSwaIndices`:
-//! launch-bound plumbing, like the target's attention metadata).
+//! The confidence head (off: `enable_adaptive_verification`) and the fused
+//! Markov sampler (off). The step's metadata, input prep and sampler/draft
+//! bookkeeping launches are [`StepPlumbing`] placeholders.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -54,6 +53,9 @@ use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 
 use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
+use crate::arch::deepseek_v41_dspark_plumbing::{
+    PlumbingShape, StepPlumbing, StepPlumbingConfig,
+};
 use crate::arch::deepseek_v41_vllm::{
     self, kv_cache_layout, layer_config, normalize_step, prefill_pairs, BoundedReplay,
     DeepseekV41CudaGraphs, DeepseekV41LayerConfig, DeepseekV41ModelCfg, DeepseekV41ReplayConfig,
@@ -186,6 +188,7 @@ pub struct DeepseekV41DsparkConfigs {
     /// `--cudagraph-capture-sizes`: the verify (and draft) FULL graphs'
     /// request counts derive from it at the verify width.
     pub cudagraph_capture_sizes: Vec<u32>,
+    pub plumbing: StepPlumbingConfig,
 }
 
 pub struct DeepseekV41DsparkResolved {
@@ -204,6 +207,7 @@ pub struct DeepseekV41DsparkResolved {
     logits: LogitsPlaceholders,
     kv_cache_layout: KvCacheLayout,
     cudagraph_capture_sizes: Vec<u32>,
+    plumbing: StepPlumbingConfig,
 }
 
 /// The draft MoE geometry over the target's checkpoint facts.
@@ -331,28 +335,30 @@ pub(crate) fn markov_config(
     }
 }
 
-/// The placeholder launches around the logits: the draft head's fp32 cast
-/// and the sampler's cast, rejection statistics and resample.
+/// The rejection sampler's placeholder launches. The logits stay bf16: the
+/// sampler's fp32 copy (`sample/sampler.py:239`) runs only for requests that
+/// need logits processing, which the captured workload (temperature 1, greedy
+/// draft) has none of; the all-gather's reorder copies are step plumbing.
 #[derive(Clone)]
 pub(crate) struct LogitsPlaceholders {
-    pub draft_logits_cast: ElementwiseKernelConfig,
-    pub sample_logits_cast: ElementwiseKernelConfig,
     pub sample_logits_stats: ElementwiseKernelConfig,
     pub sample_resample: ElementwiseKernelConfig,
 }
 
 pub(crate) fn logits_placeholders(vocab: u32, gpu: &str) -> LogitsPlaceholders {
     let ew = |input: u32, output: u32| placeholder(ELEMENTWISE_BACKENDS, gpu, input, output);
+    // Rejection sampler (fork `rejection_sampler_utils.py`), no L1 kind
+    // (design D7). The draft is greedy (`draft_sample_method` default), so no
+    // draft logits are cached and only the bf16 target logits are read.
+    // `_compute_local_logits_stats` reads each verified row and writes a
+    // max/sum-exp pair per 8192-wide vocab block ...
+    const STATS_BLOCK: u32 = 8192;
+    const RESAMPLE_BLOCK: u32 = 1024;
     LogitsPlaceholders {
-        // `LogitsProcessor` upcasts the bf16 logits to fp32.
-        draft_logits_cast: ew(vocab * 2, vocab * 4),
-        sample_logits_cast: ew(vocab * 2, vocab * 4),
-        // Rejection sampler (fork `rejection_sampler_utils.py`), no L1 kind
-        // (design D7): `_compute_local_logits_stats` and `_rejection_kernel`
-        // read each verified row's fp32 target and draft logits ...
-        sample_logits_stats: ew(2 * vocab * 4, 8),
-        // ... and `_resample_kernel` re-reads one row per request.
-        sample_resample: ew(vocab * 4, 4),
+        sample_logits_stats: ew(2 * vocab, 2 * 4 * vocab.div_ceil(STATS_BLOCK)),
+        // ... and `_resample_kernel` re-reads one row per request, writing an
+        // i64 argmax and an fp32 max per 1024-wide block.
+        sample_resample: ew(2 * vocab, (8 + 4) * vocab.div_ceil(RESAMPLE_BLOCK)),
     }
 }
 
@@ -382,6 +388,15 @@ pub fn build_configs(
         vocab_size: model.vocab_size,
         kv_cache_layout: kv_cache_layout(model, parallel.tp_size, dspark.num_draft_layers),
         cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
+        plumbing: StepPlumbingConfig::new(
+            model,
+            dspark.num_draft_layers,
+            draft_tokens,
+            parallel.tp_size,
+            &parallel.gpu_name,
+            parallel.max_model_len,
+            parallel.max_num_batched_tokens,
+        ),
         target,
     })
 }
@@ -410,6 +425,7 @@ pub fn resolve_configs(configs: DeepseekV41DsparkConfigs) -> DeepseekV41DsparkRe
         logits,
         kv_cache_layout: configs.kv_cache_layout,
         cudagraph_capture_sizes: configs.cudagraph_capture_sizes,
+        plumbing: configs.plumbing,
         target: deepseek_v41_vllm::resolve_configs(&configs.target),
     }
 }
@@ -479,7 +495,6 @@ struct DsparkDraftStage {
     first: DraftLayer,
     rest: DraftLayer,
     head: DeepseekV41HeadTpWorklet,
-    logits_cast: Op<ElementwiseKernel>,
     markov: DsparkMarkovStepOp,
 }
 
@@ -540,11 +555,6 @@ impl DsparkDraftStage {
                 bridge,
             )?,
             head: DeepseekV41HeadTpWorklet::build(format!("{name}.head"), r.head.clone(), bridge)?,
-            logits_cast: atomic_elementwise(
-                format!("{name}.head.logits_fp32_cast"),
-                r.logits.draft_logits_cast.clone(),
-                bridge,
-            )?,
             markov: DsparkMarkovStepOp::build(format!("{name}.markov"), r.markov.clone(), bridge)?,
             name,
         })
@@ -578,10 +588,7 @@ impl DsparkDraftStage {
             },
             CostNode::Labeled {
                 label: format!("{}.head [base logits of every drafted position]", self.name),
-                child: Box::new(CostNode::Sum(vec![
-                    self.head.compile(b),
-                    self.logits_cast.compile(b),
-                ])),
+                child: Box::new(self.head.compile(b)),
             },
             CostNode::Labeled {
                 label: format!("{}.markov [{draft_tokens} sequential steps]", self.name),
@@ -626,12 +633,6 @@ impl DsparkDraftStage {
             },
             ev,
         );
-        eval_or_zero(
-            &self.logits_cast,
-            ElementwiseKernelInput { num_tokens: rows },
-            zero,
-            ev,
-        );
         self.markov.eval(
             &DsparkMarkovStepInput {
                 num_requests: step.requests,
@@ -643,7 +644,6 @@ impl DsparkDraftStage {
 
 /// The rejection sampler between the verify forward and the draft.
 pub(crate) struct SampleStage {
-    logits_cast: Op<ElementwiseKernel>,
     logits_stats: Op<ElementwiseKernel>,
     resample: Op<ElementwiseKernel>,
 }
@@ -655,11 +655,6 @@ impl SampleStage {
         bridge: &PerfApiBridge,
     ) -> std::result::Result<Self, BuildError> {
         Ok(Self {
-            logits_cast: atomic_elementwise(
-                format!("{name}.logits_fp32_cast"),
-                logits.sample_logits_cast.clone(),
-                bridge,
-            )?,
             logits_stats: atomic_elementwise(
                 format!("{name}.rejection_logits_stats"),
                 logits.sample_logits_stats.clone(),
@@ -675,7 +670,6 @@ impl SampleStage {
 
     pub(crate) fn compile(&self, b: &mut CostTreeBuilder) -> CostNode {
         CostNode::Sum(vec![
-            self.logits_cast.compile(b),
             self.logits_stats.compile(b),
             self.resample.compile(b),
         ])
@@ -685,7 +679,6 @@ impl SampleStage {
         let rows = ElementwiseKernelInput {
             num_tokens: logits_rows,
         };
-        eval_or_zero(&self.logits_cast, rows.clone(), logits_rows == 0, ev);
         eval_or_zero(&self.logits_stats, rows, decode_requests == 0, ev);
         eval_or_zero(
             &self.resample,
@@ -704,6 +697,7 @@ pub struct DeepseekV41VllmDsparkModel {
     target: DeepseekV41VllmModel,
     sample: SampleStage,
     draft: DsparkDraftStage,
+    plumbing: StepPlumbing,
     /// Positions drafted per request (5); the verify width is one more.
     draft_tokens: u32,
     max_model_len: u32,
@@ -724,6 +718,7 @@ pub fn build(
     let tp_size = resolved.first_attention.raw_cfg.tp_size as u16;
     let draft = DsparkDraftStage::build(format!("{name}.dspark"), &resolved, bridge)?;
     let sample = SampleStage::build(&format!("{name}.sample"), &resolved.logits, bridge)?;
+    let plumbing = StepPlumbing::build(&format!("{name}.plumbing"), &resolved.plumbing, bridge)?;
     let draft_tokens = resolved.draft_tokens;
     let kv_cache_layout = resolved.kv_cache_layout.clone();
     let target = deepseek_v41_vllm::build(name.clone(), resolved.target, bridge)?;
@@ -732,6 +727,7 @@ pub fn build(
         target,
         sample,
         draft,
+        plumbing,
         draft_tokens,
         max_model_len,
         graphs: DeepseekV41CudaGraphs::new(
@@ -768,6 +764,13 @@ impl DeepseekV41VllmDsparkModel {
             ),
             child: Box::new(self.draft.compile(&mut b, self.draft_tokens)),
         });
+        sections.push(CostNode::Labeled {
+            label: format!(
+                "{}.plumbing [step metadata, input prep, sampler and draft bookkeeping]",
+                self.name
+            ),
+            child: Box::new(self.plumbing.compile(&mut b)),
+        });
         b.finish(CostNode::Labeled {
             label: format!(
                 "{} (DeepseekV41VllmDsparkModel) [TP{} attention, EP{} experts; verify_width={}; \
@@ -785,7 +788,7 @@ impl DeepseekV41VllmDsparkModel {
     fn normalize(
         &self,
         input: &SpeculativeArchInput,
-    ) -> std::result::Result<(NormalizedInput, u32, DraftStep), String> {
+    ) -> std::result::Result<(NormalizedInput, u32, DraftStep, PlumbingShape), String> {
         normalize_dspark_input(
             &self.graphs,
             input,
@@ -796,12 +799,13 @@ impl DeepseekV41VllmDsparkModel {
     }
 
     fn eval_into(&self, input: &SpeculativeArchInput, ev: &mut Evaluator) {
-        let (target, decode_requests, draft) = self
+        let (target, decode_requests, draft, plumbing) = self
             .normalize(input)
             .unwrap_or_else(|reason| panic!("invalid DeepseekV41VllmDsparkModel input: {reason}"));
         self.target.eval_sections(&target, ev);
         self.sample.eval(target.logits_rows, decode_requests, ev);
         self.draft.eval(&draft, ev);
+        self.plumbing.eval(&plumbing, ev);
     }
 
     fn eval_checked(&self, input: &SpeculativeArchInput, ev: &mut Evaluator) {
@@ -822,7 +826,7 @@ fn normalize_dspark_input(
     draft_tokens: u32,
     max_model_len: u32,
     replay: Option<&BoundedReplay>,
-) -> std::result::Result<(NormalizedInput, u32, DraftStep), String> {
+) -> std::result::Result<(NormalizedInput, u32, DraftStep, PlumbingShape), String> {
     if input.draft_tokens != draft_tokens {
         return Err(format!(
             "input draft_tokens {} must match model draft_tokens {draft_tokens}",
@@ -878,6 +882,19 @@ fn normalize_dspark_input(
             })
         })
         .collect();
+    let plumbing = PlumbingShape {
+        padded_tokens: target.full.rows,
+        requests: live,
+        contexts: step
+            .prefill
+            .iter()
+            .map(|&(_, context)| context)
+            .chain(step.decode.iter().map(|&(_, kv)| kv))
+            .collect(),
+        logits_rows: target.logits_rows,
+        draft_requests: requests,
+        draft_rows: rows,
+    };
     let draft = DraftStep {
         context_tokens: group.batch_tokens,
         requests,
@@ -894,7 +911,7 @@ fn normalize_dspark_input(
             write_kv_only: false,
         },
     };
-    Ok((target, step.decode.len() as u32, draft))
+    Ok((target, step.decode.len() as u32, draft, plumbing))
 }
 
 impl SpeculativeUnifiedModel for DeepseekV41VllmDsparkModel {
@@ -1071,6 +1088,33 @@ mod tests {
     /// concurrency for 131,072 tokens per request: 310.87x". The draft adds three SWA layers
     /// to the target's 40 (six 32-token SWA groups instead of five).
     #[test]
+    fn plumbing_counts_follow_the_captured_groups_and_builders() {
+        // vLLM logs `kv cache group sizes (32 x6, 128, 8)`: six SWA groups,
+        // one packed full group, one compressor-ring group.
+        let groups = deepseek_v41_vllm::kv_groups(&model_cfg(), dspark().num_draft_layers);
+        assert_eq!((groups.swa, groups.full, groups.ring), (6, 1, 1));
+        let cfg = StepPlumbingConfig::new(
+            &model_cfg(),
+            dspark().num_draft_layers,
+            5,
+            4,
+            "NVIDIA B200",
+            131_072,
+            2048,
+        );
+        let debug = format!("{cfg:?}");
+        for field in [
+            "index_specs: 2",
+            "compressed_builders: 2",
+            "draft_kv_groups: 3",
+            "index_source_layers: 8",
+            "lookback_depth: 3",
+        ] {
+            assert!(debug.contains(field), "{field} not in {debug}");
+        }
+    }
+
+    #[test]
     fn kv_cache_layout_reproduces_the_dspark_capture_pool() {
         use crate::worker::kv::{KvAccounting, KvAccountingOptions};
         let layout = configs().kv_cache_layout;
@@ -1117,7 +1161,7 @@ mod tests {
 
     #[test]
     fn draft_runs_five_rows_per_padded_request_and_context_kv_every_target_row() {
-        let (target, decode, draft) = normalize_dspark_input(
+        let (target, decode, draft, plumbing) = normalize_dspark_input(
             &graphs(),
             &step(&[(1000, 6); 3], &[(0, 200)]),
             5,
@@ -1131,8 +1175,14 @@ mod tests {
         // Four requests run the four-request draft graph.
         assert_eq!((draft.requests, draft.rows), (4, 20));
         assert_eq!(draft.attention.decode_kv_lens.len(), 20);
+        // The plumbing sees the live requests, the padded verify rows and the
+        // draft graph's shapes.
+        assert_eq!(plumbing.requests, 4);
+        assert_eq!(plumbing.contexts, vec![200, 1000, 1000, 1000]);
+        assert_eq!(plumbing.padded_tokens, target.full.rows);
+        assert_eq!((plumbing.draft_requests, plumbing.draft_rows), (4, 20));
         // Five requests pad to the six-request graph (no 5 at q = 6).
-        let (target, _, draft) =
+        let (target, _, draft, _) =
             normalize_dspark_input(&graphs(), &step(&[(1000, 6); 5], &[]), 5, 131_072, None)
                 .unwrap();
         assert_eq!(target.full.rows, 36);

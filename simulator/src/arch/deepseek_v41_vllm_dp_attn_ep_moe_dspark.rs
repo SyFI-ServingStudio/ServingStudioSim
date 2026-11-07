@@ -31,6 +31,9 @@
 //! its own requests. A rank with nothing scheduled runs the one-request dummy.
 
 use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
+use crate::arch::deepseek_v41_dspark_plumbing::{
+    PlumbingShape, StepPlumbing, StepPlumbingConfig,
+};
 use crate::arch::deepseek_v41_vllm::{
     kv_cache_layout, prefill_pairs, BoundedReplay, DeepseekV41CudaGraphs, DeepseekV41ModelCfg,
     DeepseekV41Step, DeepseekV41VllmParallel, LayerInput, MAX_NUM_SEQS,
@@ -78,6 +81,7 @@ pub struct DeepseekV41DpDsparkConfigs {
     pub kv_cache_layout: KvCacheLayout,
     /// `--cudagraph-capture-sizes` per rank (verify/draft FULL graphs).
     pub cudagraph_capture_sizes: Vec<u32>,
+    pub plumbing: StepPlumbingConfig,
 }
 
 pub struct DeepseekV41DpDsparkResolved {
@@ -93,6 +97,7 @@ pub struct DeepseekV41DpDsparkResolved {
     logits: LogitsPlaceholders,
     kv_cache_layout: KvCacheLayout,
     cudagraph_capture_sizes: Vec<u32>,
+    plumbing: StepPlumbingConfig,
 }
 
 /// `target` is lane B's DP expansion; `draft_demand` covers the draft MoE.
@@ -137,6 +142,16 @@ pub fn build_configs(
         vocab_size: model.vocab_size,
         kv_cache_layout: kv_cache_layout(model, 1, dspark.num_draft_layers),
         cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
+        // Each rank runs its own engine core at TP1.
+        plumbing: StepPlumbingConfig::new(
+            model,
+            dspark.num_draft_layers,
+            draft_tokens,
+            1,
+            &parallel.gpu_name,
+            parallel.max_model_len,
+            parallel.max_num_batched_tokens,
+        ),
         target,
     })
 }
@@ -159,6 +174,7 @@ pub fn resolve_configs(configs: DeepseekV41DpDsparkConfigs) -> DeepseekV41DpDspa
         markov: configs.markov,
         kv_cache_layout: configs.kv_cache_layout,
         cudagraph_capture_sizes: configs.cudagraph_capture_sizes,
+        plumbing: configs.plumbing,
         target: dp_arch::resolve_configs(&configs.target),
     }
 }
@@ -170,8 +186,8 @@ struct RankEdges {
     context_kv: DeepseekV41DsparkContextKvLocalWorklet,
     embedding: Op<ElementwiseKernel>,
     head: DeepseekV41HeadTpWorklet,
-    logits_cast: Op<ElementwiseKernel>,
     markov: DsparkMarkovStepOp,
+    plumbing: StepPlumbing,
 }
 
 /// One rank's draft call.
@@ -186,6 +202,7 @@ struct RankDraft {
     /// Requests the draft graph runs (padded).
     requests: u32,
     layer: LayerInput,
+    plumbing: PlumbingShape,
 }
 
 /// DeepSeek-V4.1-Flash + DSpark, DP4 attention + EP4 experts.
@@ -229,14 +246,14 @@ pub fn build(
                     resolved.head.clone(),
                     bridge,
                 )?,
-                logits_cast: atomic_elementwise(
-                    format!("{dspark}.head.logits_fp32_cast"),
-                    resolved.logits.draft_logits_cast.clone(),
-                    bridge,
-                )?,
                 markov: DsparkMarkovStepOp::build(
                     format!("{dspark}.markov"),
                     resolved.markov.clone(),
+                    bridge,
+                )?,
+                plumbing: StepPlumbing::build(
+                    &format!("{name}.plumbing"),
+                    &resolved.plumbing,
                     bridge,
                 )?,
             })
@@ -306,7 +323,6 @@ impl DeepseekV41VllmDpDsparkModel {
             .map(|rank| {
                 CostNode::Sum(vec![
                     rank.head.compile(&mut b),
-                    rank.logits_cast.compile(&mut b),
                     CostNode::Scale {
                         n: self.draft_tokens,
                         child: Box::new(rank.markov.compile(&mut b)),
@@ -316,8 +332,7 @@ impl DeepseekV41VllmDpDsparkModel {
             .collect();
         draft.push(labeled_max(
             format!(
-                "{dspark}.head [Max over DP ranks: full-vocab head -> fp32 cast -> {} Markov \
-                 steps]",
+                "{dspark}.head [Max over DP ranks: full-vocab head -> {} Markov steps]",
                 self.draft_tokens
             ),
             post,
@@ -329,6 +344,19 @@ impl DeepseekV41VllmDpDsparkModel {
             ),
             child: Box::new(CostNode::Sum(draft)),
         });
+        let plumbing = self
+            .ranks
+            .iter()
+            .map(|rank| rank.plumbing.compile(&mut b))
+            .collect();
+        sections.push(labeled_max(
+            format!(
+                "{}.plumbing [Max over DP ranks: step metadata, input prep, sampler and draft \
+                 bookkeeping]",
+                self.name
+            ),
+            plumbing,
+        ));
         b.finish(CostNode::Labeled {
             label: format!(
                 "{} (DeepseekV41VllmDpDsparkModel) [DP{DP_SIZE} attention at TP1, EP{DP_SIZE} \
@@ -388,18 +416,15 @@ impl DeepseekV41VllmDpDsparkModel {
                 },
                 ev,
             );
-            eval_or_zero(
-                &edges.logits_cast,
-                ElementwiseKernelInput { num_tokens: rows },
-                rows == 0,
-                ev,
-            );
             edges.markov.eval(
                 &DsparkMarkovStepInput {
                     num_requests: rank.requests,
                 },
                 ev,
             );
+        }
+        for (edges, rank) in self.ranks.iter().zip(&ranks) {
+            edges.plumbing.eval(&rank.plumbing, ev);
         }
         assert_eq!(
             ev.filled(),
@@ -465,7 +490,8 @@ fn normalize_dp_dspark_input(
         .iter()
         .zip(&live)
         .zip(&logits_rows)
-        .map(|((step, &live), &logits)| {
+        .zip(&target.full.ranks)
+        .map(|(((step, &live), &logits), target_rank)| {
             let requests = graph.unwrap_or(live);
             let rows = requests * draft_tokens;
             let contexts: Vec<u32> = if step.request_count() == 0 {
@@ -488,7 +514,21 @@ fn normalize_dp_dspark_input(
                     })
                 })
                 .collect();
+            let plumbing = PlumbingShape {
+                padded_tokens: target_rank.rows,
+                requests: step.request_count(),
+                contexts: step
+                    .prefill
+                    .iter()
+                    .map(|&(_, context)| context)
+                    .chain(step.decode.iter().map(|&(_, kv)| kv))
+                    .collect(),
+                logits_rows: logits,
+                draft_requests: requests,
+                draft_rows: rows,
+            };
             RankDraft {
+                plumbing,
                 logits_rows: logits,
                 decode_requests: step.decode.len() as u32,
                 context_tokens: if step.request_count() == 0 {
