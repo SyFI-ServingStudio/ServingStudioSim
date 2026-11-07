@@ -948,8 +948,9 @@ fn query_lens(step: &DeepseekV41Step) -> Vec<u32> {
 }
 
 /// vLLM's DP step agreement over per-rank steps (`dp_utils.py`
-/// `sync_cudagraph_and_dp_padding`): an idle rank joins with a one-token dummy
-/// decode (`execute_dummy_batch`, no sampled row); if any rank must run eager
+/// `sync_cudagraph_and_dp_padding`): an idle rank joins with a dummy uniform
+/// decode of one request at `uniform_query_len` rows (`execute_dummy_batch`,
+/// no sampled row); if any rank must run eager
 /// every rank runs eager on its own rows (ragged collectives); a FULL decode
 /// graph only when every rank's step is a uniform decode, all padded to the
 /// busiest rank's FULL request count; otherwise every rank pads to the
@@ -960,8 +961,8 @@ fn query_lens(step: &DeepseekV41Step) -> Vec<u32> {
 /// Bounded replay: the ranks replay together (the replay batch is one more
 /// graph launch around the collectives), when any rank's step replays by the
 /// TP rule ([`replay_rows`]); every rank then keeps its requests' last
-/// `window` rows (a dummy keeps its one row) and pads to the busiest rank's
-/// replay graph ([`DeepseekV41CudaGraphs::replay_rows`]).
+/// `window` rows (a dummy keeps its `uniform_query_len` rows) and pads to
+/// the busiest rank's replay graph ([`DeepseekV41CudaGraphs::replay_rows`]).
 pub(crate) fn normalize_dp_steps(
     graphs: &DeepseekV41CudaGraphs,
     steps: &[DeepseekV41Step],
@@ -969,11 +970,13 @@ pub(crate) fn normalize_dp_steps(
     logits_rows: Vec<u32>,
     replay: Option<&BoundedReplay>,
 ) -> DpStep {
+    // `execute_dummy_batch` -> `_dummy_run(uniform_decode_query_len,
+    // uniform_decode=True)`: one request of `uniform_query_len` rows, a
+    // uniform decode, so it never knocks the step out of a FULL graph. Its
+    // rows attend after one resident token.
     let dummy = DeepseekV41Step {
         prefill: Vec::new(),
-        // A one-token context: the dummy decodes its first row after one
-        // resident token.
-        decode: vec![(1, 2)],
+        decode: vec![(uniform_query_len, uniform_query_len + 1)],
     };
     let steps: Vec<&DeepseekV41Step> = steps
         .iter()
@@ -1286,7 +1289,7 @@ mod tests {
         let rule = BoundedReplay::from_model(&cfg()).unwrap();
         // One 1000-row prefill pads every rank to PIECEWISE 1008 >= 768, so
         // the step replays: rank 0 keeps 128 + 3 rows, the others their decode
-        // rows (the dummy its one row); all pad to the 256-row replay graph.
+        // rows (the dummy its one row at q = 1); all pad to the 256-row replay graph.
         let step = normalize_input(
             &graphs(),
             &input(vec![
@@ -1363,6 +1366,34 @@ mod tests {
         parallel.cudagraph_capture_sizes = Vec::new();
         let configs = build_configs(&cfg(), &parallel, &uniform_demand()).unwrap();
         assert_eq!(configs.graphs.max_tokens(), 0);
+    }
+
+    #[test]
+    fn a_spec_dummy_is_one_uniform_request_and_keeps_the_full_graph() {
+        let spec = DeepseekV41CudaGraphs::new(
+            &tp_arch::vllm_default_cudagraph_capture_sizes(2048),
+            tp_arch::MAX_NUM_SEQS,
+            &[6],
+        );
+        let busy = DeepseekV41Step {
+            prefill: Vec::new(),
+            decode: vec![(6, 1000); 5],
+        };
+        let idle = DeepseekV41Step::default();
+        let step = normalize_dp_steps(
+            &spec,
+            &[busy.clone(), busy.clone(), idle, busy],
+            6,
+            vec![30, 30, 0, 30],
+            None,
+        );
+        assert_eq!(step.mode, GraphMode::Full);
+        let padded = spec.full_decode_requests(5, 6).unwrap() * 6;
+        assert!(step.full.ranks.iter().all(|rank| rank.rows == padded));
+        assert_eq!(
+            step.full.ranks[2].attention.decode_kv_lens,
+            vec![1, 2, 3, 4, 5, 6]
+        );
     }
 
     #[test]
