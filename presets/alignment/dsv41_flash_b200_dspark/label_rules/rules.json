@@ -1,0 +1,1556 @@
+{
+ "schema_version": 1,
+ "note": "DeepSeek-V4.1-Flash, vLLM TP4/EP4 on B200, capture 2 (job 1185, max_cudagraph_capture_size 2048). One order-independent rule set: every position is claimed by at most one operation (checked by subsumptions and disagreements at the fixpoint). Name fragments key the MXFP8 GEMMs by their quant K (the swizzled quant tensor stride), the cuBLAS nvjet tiles by output dtype (tss = fp32: router, compressor; tst = bf16: weights_proj, wk, lm_head), and the anonymous `kernel` launches by exact name plus their successor. Unmapped decisions are listed in manifest.json.",
+ "rules": [
+  {
+   "operation": "prologue.embedding",
+   "name": "vocab_parallel_embedding_kernel",
+   "phase": "preprocess",
+   "type": "model",
+   "role": "vocabulary-parallel token embedding lookup",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "prologue.embedding"
+   ],
+   "note": "Embedding gather; vLLM launches it in the preprocess range.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "prologue.embedding_all_reduce",
+   "name": "trtllm_mnnvl_allreduce::",
+   "phase": "preprocess",
+   "type": "collective",
+   "role": "embedding output TP all-reduce",
+   "cross_rank": "synchronizing",
+   "slot_suffixes": [
+    "prologue.embedding_all_reduce"
+   ],
+   "note": "The only all-reduce in the preprocess range is the vocab-parallel embedding reduction.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "prologue.engram_hash",
+   "name": "_hash_ids_kernel",
+   "phase": "forward",
+   "type": "model",
+   "role": "Engram n-gram hash of the input ids, including its pad-token masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "prologue.engram_hash"
+   ],
+   "note": "Engram n-gram hash (model.py:777).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "prologue.engram_hash",
+   "name": "CompareEqFunctor",
+   "phase": "forward",
+   "before_name": "bitwise_not_kernel_cuda",
+   "type": "model",
+   "role": "Engram n-gram hash of the input ids, including its pad-token masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "prologue.engram_hash"
+   ],
+   "note": "Pad-token compare feeding the Engram hash; the first launch of the forward range, before the mask negation.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "prologue.engram_hash",
+   "name": "CompareEqFunctor",
+   "phase": "forward",
+   "before_name": "_hash_ids_kernel",
+   "type": "model",
+   "role": "Engram n-gram hash of the input ids, including its pad-token masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "prologue.engram_hash"
+   ],
+   "note": "Second pad-token compare, immediately before the hash.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "prologue.engram_hash",
+   "name": "bitwise_not_kernel_cuda",
+   "phase": "forward",
+   "after_name": "CompareEqFunctor",
+   "type": "model",
+   "role": "Engram n-gram hash of the input ids, including its pad-token masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "prologue.engram_hash"
+   ],
+   "note": "Mask negation between the two pad compares feeding the hash.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.entry.hc_expand",
+   "name": "direct_copy_kernel_cuda",
+   "phase": "forward",
+   "before_name": "sm100_tf32_hc_prenorm_gemm_impl",
+   "type": "model",
+   "role": "layer-0 hyper-connection stream expansion copy",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.entry.hc_expand"
+   ],
+   "note": "hc_mult stream expansion copy of the embedding right before the layer-0 mHC pre-norm.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.entry.mhc_hc_prenorm",
+   "name": "sm100_tf32_hc_prenorm_gemm_impl",
+   "phase": "forward",
+   "after": "attn.entry.hc_expand",
+   "type": "model",
+   "role": "layer-0 mHC pre-norm GEMM",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.entry.mhc_hc_prenorm"
+   ],
+   "note": "Layer-0 pre-norm follows the stream-expansion copy.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.entry.mhc_pre_big_fuse",
+   "name": "mhc_pre_big_fuse_with_norm_tilelang_kernel",
+   "phase": "forward",
+   "after": "attn.entry.mhc_hc_prenorm",
+   "type": "model",
+   "role": "layer-0 mHC pre fuse with RMSNorm",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.entry.mhc_pre_big_fuse"
+   ],
+   "note": "Layer-0 mHC pre follows its pre-norm.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "engram.mhc_post",
+   "name": "mhc_post_tilelang_kernel",
+   "phase": "forward",
+   "before_name": "ncclDevKernel_AllGather",
+   "type": "model",
+   "role": "mHC post before the Engram block",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "engram.mhc_post"
+   ],
+   "note": "mHC post feeding the Engram AllGather (layers 1, 14).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "engram.mhc_post",
+   "name": "mhc_post_tilelang_kernel",
+   "phase": "forward",
+   "after_name": "trtllm_mnnvl_allreduce::",
+   "before_name": "<none>",
+   "type": "model",
+   "role": "mHC post before the Engram block",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "engram.mhc_post"
+   ],
+   "note": "In CUDA-graph decode the Engram AllGather sits on another graph branch, so the Engram mhc_post ends its branch; the head mhc_post is always followed by the head reduce.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "engram.all_gather",
+   "name": "ncclDevKernel_AllGather",
+   "phase": "forward",
+   "type": "collective",
+   "role": "Engram embedding AllGather",
+   "cross_rank": "synchronizing",
+   "slot_suffixes": [
+    "engram.all_gather"
+   ],
+   "note": "Forward-range AllGather is the Engram embedding gather (common/engram.py:992).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "engram.gather_copy",
+   "name": "direct_copy_kernel_cuda",
+   "phase": "forward",
+   "after_name": "ncclDevKernel_AllGather",
+   "type": "model",
+   "role": "Engram gathered-row copy",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "engram.gather_copy"
+   ],
+   "note": "Copy of the gathered Engram rows.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "engram.wkv",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o614461441",
+   "phase": "forward",
+   "type": "model",
+   "role": "MXFP8 Engram wkv projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "engram.wkv"
+   ],
+   "note": "K=6144 MXFP8 quant is the Engram wkv input.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "engram.wkv",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "after_name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o614461441",
+   "type": "model",
+   "role": "MXFP8 Engram wkv projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "engram.wkv"
+   ],
+   "note": "GEMM after the K=6144 quant.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "engram.post_wkv",
+   "name": "_fused_engram_post_wkv_kernel",
+   "phase": "forward",
+   "type": "model",
+   "role": "fused Engram post-wkv gate/norm",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "engram.post_wkv"
+   ],
+   "note": "Fused Engram post-wkv.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "engram.mhc_hc_prenorm",
+   "name": "sm100_tf32_hc_prenorm_gemm_impl",
+   "phase": "forward",
+   "after_name": "_fused_engram_post_wkv_kernel",
+   "type": "model",
+   "role": "mHC pre-norm GEMM after Engram",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "engram.mhc_hc_prenorm"
+   ],
+   "note": "Pre-norm after the Engram post-wkv.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "engram.mhc_pre_big_fuse",
+   "name": "mhc_pre_big_fuse_with_norm_tilelang_kernel",
+   "phase": "forward",
+   "after": "engram.mhc_hc_prenorm",
+   "type": "model",
+   "role": "mHC pre fuse with RMSNorm after Engram",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "engram.mhc_pre_big_fuse"
+   ],
+   "note": "mHC pre after the Engram pre-norm.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "engram.lookup",
+   "name": "_engram_lookup_kernel",
+   "phase": "forward",
+   "type": "model",
+   "role": "Engram hashed-row lookup from pinned host memory (prefetch stream)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "engram_lookup"
+   ],
+   "note": "Engram UVA lookup; both prefetch lookups share one operation over the two prefetch slots.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.tp_all_reduce",
+   "name": "trtllm_mnnvl_allreduce::",
+   "phase": "forward",
+   "after_name": "dense_blockscaled_gemm_sm100",
+   "type": "collective",
+   "role": "attention output TP all-reduce",
+   "cross_rank": "synchronizing",
+   "slot_suffixes": [
+    "attn.tp_all_reduce"
+   ],
+   "note": "All-reduce right after the wo_b GEMM.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.tp_all_reduce",
+   "name": "trtllm_mnnvl_allreduce::",
+   "phase": "forward",
+   "before": "ffn.entry.mega_mhc",
+   "type": "collective",
+   "role": "attention output TP all-reduce",
+   "cross_rank": "synchronizing",
+   "slot_suffixes": [
+    "attn.tp_all_reduce"
+   ],
+   "note": "All-reduce followed by the FFN-entry mHC.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.tp_all_reduce",
+   "name": "trtllm_mnnvl_allreduce::",
+   "phase": "forward",
+   "before": "attn.entry.mega_mhc",
+   "type": "collective",
+   "role": "FFN output TP all-reduce",
+   "cross_rank": "synchronizing",
+   "slot_suffixes": [
+    "ffn.tp_all_reduce"
+   ],
+   "note": "All-reduce followed by the attention-entry mHC.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.tp_all_reduce",
+   "name": "trtllm_mnnvl_allreduce::",
+   "phase": "forward",
+   "after_name": "CUDAFunctor_add<c10::BFloat16>",
+   "type": "collective",
+   "role": "FFN output TP all-reduce",
+   "cross_rank": "synchronizing",
+   "slot_suffixes": [
+    "ffn.tp_all_reduce"
+   ],
+   "note": "All-reduce right after the routed + shared residual add.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.entry.mega_mhc",
+   "name": "deep_gemm::sm100_mega_mhc_impl",
+   "phase": "forward",
+   "after": "ffn.tp_all_reduce",
+   "type": "model",
+   "role": "fused mHC post(prev)+pre+RMSNorm before attention",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.entry.mega_mhc_post_pre"
+   ],
+   "note": "mHC after the FFN all-reduce of the previous layer.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.entry.mega_mhc",
+   "name": "deep_gemm::sm100_mega_mhc_impl",
+   "phase": "forward",
+   "after": "attn.tp_all_reduce",
+   "type": "model",
+   "role": "fused mHC post+pre+RMSNorm before the FFN",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.entry.mega_mhc_post_pre"
+   ],
+   "note": "mHC after the attention all-reduce.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.entry.mega_mhc",
+   "name": "deep_gemm::sm100_mega_mhc_impl",
+   "phase": "forward",
+   "before": "attn.fused_wqa_wkv",
+   "type": "model",
+   "role": "fused mHC post(prev)+pre+RMSNorm before attention",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.entry.mega_mhc_post_pre"
+   ],
+   "note": "mHC followed by the fused_wqa_wkv quant.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.entry.mega_mhc",
+   "name": "deep_gemm::sm100_mega_mhc_impl",
+   "phase": "forward",
+   "before": "attn.compressor.kv_score_proj",
+   "type": "model",
+   "role": "fused mHC post(prev)+pre+RMSNorm before attention",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.entry.mega_mhc_post_pre"
+   ],
+   "note": "mHC followed by the compressor projection.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.entry.mega_mhc",
+   "name": "deep_gemm::sm100_mega_mhc_impl",
+   "phase": "forward",
+   "before": "attn.indexer.weights_proj",
+   "type": "model",
+   "role": "fused mHC post(prev)+pre+RMSNorm before attention",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.entry.mega_mhc_post_pre"
+   ],
+   "note": "mHC followed by the indexer weights_proj.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.entry.mega_mhc",
+   "name": "deep_gemm::sm100_mega_mhc_impl",
+   "phase": "forward",
+   "before": "ffn.router_gate",
+   "type": "model",
+   "role": "fused mHC post+pre+RMSNorm before the FFN",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.entry.mega_mhc_post_pre"
+   ],
+   "note": "mHC followed by the router gate.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.entry.mega_mhc",
+   "name": "deep_gemm::sm100_mega_mhc_impl",
+   "phase": "forward",
+   "before": "ffn.shared.gate_up",
+   "type": "model",
+   "role": "fused mHC post+pre+RMSNorm before the FFN",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.entry.mega_mhc_post_pre"
+   ],
+   "note": "mHC followed by the shared-expert gate_up quant.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "phase": "forward",
+   "after": "attn.entry.mega_mhc",
+   "type": "attention",
+   "role": "MXFP8 fused q_a/kv projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.input.fused_wqa_wkv"
+   ],
+   "note": "K=5120 swizzled quant after the attention-entry mHC.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "phase": "forward",
+   "after": "attn.entry.mhc_pre_big_fuse",
+   "type": "attention",
+   "role": "MXFP8 fused q_a/kv projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.input.fused_wqa_wkv"
+   ],
+   "note": "K=5120 swizzled quant after the layer-0 mHC pre.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "phase": "forward",
+   "after": "engram.mhc_pre_big_fuse",
+   "type": "attention",
+   "role": "MXFP8 fused q_a/kv projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.input.fused_wqa_wkv"
+   ],
+   "note": "K=5120 swizzled quant after the Engram mHC pre (layers 1, 14).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "phase": "forward",
+   "before": "attn.fused_wqa_wkv",
+   "type": "attention",
+   "role": "MXFP8 fused q_a/kv projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.input.fused_wqa_wkv"
+   ],
+   "note": "Quant whose GEMM is fused_wqa_wkv.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "after": "attn.fused_wqa_wkv",
+   "type": "attention",
+   "role": "MXFP8 fused q_a/kv projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.input.fused_wqa_wkv"
+   ],
+   "note": "GEMM after the fused_wqa_wkv quant.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "after_name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "before": "attn.qk_rmsnorm",
+   "type": "attention",
+   "role": "MXFP8 fused q_a/kv projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.input.fused_wqa_wkv"
+   ],
+   "note": "K=5120 GEMM followed by the QK RMSNorm.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "after_name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "before": "attn.compressor.kv_score_proj",
+   "type": "attention",
+   "role": "MXFP8 fused q_a/kv projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.input.fused_wqa_wkv"
+   ],
+   "note": "K=5120 GEMM followed by the compressor projection (stage A serial, large T).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "after_name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "before": "attn.indexer.weights_proj",
+   "type": "attention",
+   "role": "MXFP8 fused q_a/kv projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.input.fused_wqa_wkv"
+   ],
+   "note": "K=5120 GEMM followed by the indexer weights_proj (stage A serial, non-KV-source index layers).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.fused_wqa_wkv",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "after_name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "before_name": "<none>",
+   "stream_role": "concurrent",
+   "type": "attention",
+   "role": "MXFP8 fused q_a/kv projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.input.fused_wqa_wkv"
+   ],
+   "note": "Stage-A side-branch GEMM: a K=5120 quant+GEMM pair alone on its stream is fused_wqa_wkv; the shared-expert gate_up branch always continues into act_and_mul.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.qk_rmsnorm",
+   "name": "kernel",
+   "phase": "forward",
+   "name_exact": true,
+   "before_name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o128012801",
+   "type": "attention",
+   "role": "fused q_a / kv RMSNorm",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.main.qk_rmsnorm"
+   ],
+   "note": "Anonymous FusedQKRMSNorm launch, followed by the wq_b quant.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.wq_b",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "after_name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o128012801",
+   "before_name": "fusedDeepseekV4QNormRopeKVRopeQuantInsertKernel",
+   "type": "attention",
+   "role": "MXFP8 query up projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.main.wq_b"
+   ],
+   "note": "K=1280 GEMM followed by the KV insert.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.wq_b",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o128012801",
+   "phase": "forward",
+   "before": "attn.wq_b",
+   "type": "attention",
+   "role": "MXFP8 query up projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.main.wq_b"
+   ],
+   "note": "Quant whose GEMM is wq_b.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.wq_b",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o128012801",
+   "phase": "forward",
+   "after": "attn.qk_rmsnorm",
+   "type": "attention",
+   "role": "MXFP8 query up projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.main.wq_b"
+   ],
+   "note": "K=1280 quant after the QK RMSNorm.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.kv_insert",
+   "name": "fusedDeepseekV4QNormRopeKVRopeQuantInsertKernel",
+   "phase": "forward",
+   "type": "attention",
+   "role": "q norm + RoPE + MXFP8 SWA KV insert",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.main.kv_insert"
+   ],
+   "note": "Fused q norm / RoPE / MXFP8 SWA insert (both grid variants).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.wq_b",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "after_name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o128012801",
+   "before_name": "kernel_cutlass_device_kernel_tensorptri64gmemo1",
+   "type": "attention",
+   "role": "MXFP8 indexer query projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.wq_b"
+   ],
+   "note": "K=1280 GEMM followed by the fused indexer q RoPE quant.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.wq_b",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o128012801",
+   "phase": "forward",
+   "before": "attn.indexer.wq_b",
+   "type": "attention",
+   "role": "MXFP8 indexer query projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.wq_b"
+   ],
+   "note": "Quant whose GEMM is the indexer wq_b.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.q_rope_quant",
+   "name": "kernel_cutlass_device_kernel_tensorptri64gmemo1",
+   "phase": "forward",
+   "type": "attention",
+   "role": "indexer query RoPE + FP8 quant",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.q_rope_quant"
+   ],
+   "note": "CuTe fused_indexer_q_rope_quant.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.wo_a",
+   "name": "sm100_fp8_fp4_gemm_1d1d_impl",
+   "phase": "forward",
+   "type": "attention",
+   "role": "grouped FP8xFP4 wo_a einsum",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.output.wo_a_einsum"
+   ],
+   "note": "deep_gemm fp8 einsum (all tile variants).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.wo_b",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o204820481",
+   "phase": "forward",
+   "type": "attention",
+   "role": "MXFP8 output projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.output.wo_b"
+   ],
+   "note": "K=2048 quant is the wo_b input.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.wo_b",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "after_name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o204820481",
+   "type": "attention",
+   "role": "MXFP8 output projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.output.wo_b"
+   ],
+   "note": "GEMM after the K=2048 quant.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.wo_b",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "before": "attn.tp_all_reduce",
+   "type": "attention",
+   "role": "MXFP8 output projection (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.output.wo_b"
+   ],
+   "note": "Branch-head GEMM feeding the attention all-reduce (its quant ended the previous repeat body).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.compressor.kv_score_proj",
+   "name": "splitKreduce_kernel<(int)32, (int)16, int, float, float",
+   "phase": "forward",
+   "before": "attn.qk_rmsnorm",
+   "type": "attention",
+   "role": "compressor kv/score projection, fp32 output (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.compressor.kv_score_proj",
+    "attn.compressor.kv_score_proj.serial"
+   ],
+   "note": "fp32 split-K reduce joined by the QK RMSNorm: the compressor projection (the router reduce feeds top-k).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.compressor.kv_score_proj",
+   "name": "nvjet_sm100_tss_",
+   "phase": "forward",
+   "before": "attn.compressor.kv_score_proj",
+   "type": "attention",
+   "role": "compressor kv/score projection, fp32 output (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.compressor.kv_score_proj",
+    "attn.compressor.kv_score_proj.serial"
+   ],
+   "note": "fp32 tile whose split-K reduce is the compressor.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.compressor.kv_score_proj",
+   "name": "nvjet_sm100_tss_",
+   "phase": "forward",
+   "before_name": "nvjet_sm100_tst_",
+   "type": "attention",
+   "role": "compressor kv/score projection, fp32 output (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.compressor.kv_score_proj",
+    "attn.compressor.kv_score_proj.serial"
+   ],
+   "note": "fp32 tile directly followed by the indexer weights_proj tile (large-T serial stage A).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.compressor.kv_score_proj",
+   "name": "nvjet_sm100_tss_",
+   "phase": "forward",
+   "before": "attn.qk_rmsnorm",
+   "type": "attention",
+   "role": "compressor kv/score projection, fp32 output (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.compressor.kv_score_proj",
+    "attn.compressor.kv_score_proj.serial"
+   ],
+   "note": "Non-split-K fp32 tile joined by the QK RMSNorm (small-T eager stage A).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.compressor.kv_score_proj",
+   "name": "nvjet_sm100_tss_",
+   "phase": "forward",
+   "after": "attn.fused_wqa_wkv",
+   "type": "attention",
+   "role": "compressor kv/score projection, fp32 output (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.compressor.kv_score_proj",
+    "attn.compressor.kv_score_proj.serial"
+   ],
+   "note": "fp32 tile right after the fused_wqa_wkv GEMM (large-T serial stage A).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.compressor.kv_score_proj",
+   "name": "nvjet_sm100_tss_",
+   "phase": "forward",
+   "after": "attn.entry.mega_mhc",
+   "type": "attention",
+   "role": "compressor kv/score projection, fp32 output (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.compressor.kv_score_proj",
+    "attn.compressor.kv_score_proj.serial"
+   ],
+   "note": "fp32 tile after the attention-entry mHC is the compressor projection.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.weights_proj",
+   "name": "splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16",
+   "phase": "forward",
+   "type": "attention",
+   "role": "indexer head-weight projection, bf16 (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.weights_proj",
+    "attn.indexer.weights_proj.serial"
+   ],
+   "note": "Every forward bf16 split-K reduce belongs to the indexer weights_proj tile.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.weights_proj",
+   "name": "nvjet_sm100_tst_",
+   "phase": "forward",
+   "before_name": "splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16",
+   "type": "attention",
+   "role": "indexer head-weight projection, bf16 (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.weights_proj",
+    "attn.indexer.weights_proj.serial"
+   ],
+   "note": "bf16 tile with a bf16 split-K reduce.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.weights_proj",
+   "name": "nvjet_sm100_tst_",
+   "phase": "forward",
+   "before": "attn.qk_rmsnorm",
+   "type": "attention",
+   "role": "indexer head-weight projection, bf16 (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.weights_proj",
+    "attn.indexer.weights_proj.serial"
+   ],
+   "note": "Non-split-K bf16 tile joined by the QK RMSNorm.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.wk",
+   "name": "nvjet_sm100_tst_",
+   "phase": "forward",
+   "before_name": "_indexer_k_norm_rope_quant_store_kernel",
+   "type": "attention",
+   "role": "indexer key projection, bf16",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.wk"
+   ],
+   "note": "bf16 tile feeding the indexer key store.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.k_store",
+   "name": "_indexer_k_norm_rope_quant_store_kernel",
+   "phase": "forward",
+   "type": "attention",
+   "role": "indexer key norm + RoPE + FP8 quant store",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.k_store"
+   ],
+   "note": "Indexer key store.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.compressor.save_compress_norm",
+   "name": "_fused_save_compress_norm_kernel",
+   "phase": "forward",
+   "type": "attention",
+   "role": "compressor state save + norm",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.compressor.save_compress_norm",
+    "attn.compressor.save_compress_norm.serial"
+   ],
+   "note": "Compressor save + norm.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.compressor.nvfp4_insert",
+   "name": "_rope_quant_insert_nvfp4_kernel",
+   "phase": "forward",
+   "type": "attention",
+   "role": "compressor RoPE + NVFP4 quant + compressed-cache insert",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.compressor.nvfp4_insert",
+    "attn.compressor.nvfp4_insert.serial"
+   ],
+   "note": "Compressor NVFP4 insert.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.prefill_k_gather",
+   "name": "cp_gather_indexer_k_quant_cache_kernel",
+   "phase": "forward",
+   "type": "attention",
+   "role": "indexer prefill key-cache gather",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.prefill_k_gather"
+   ],
+   "note": "Prefill key-cache gather.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.prefill_logits",
+   "name": "deep_gemm::sm100_mqa_logits",
+   "phase": "forward",
+   "type": "attention",
+   "role": "indexer prefill MQA logits",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.prefill_logits"
+   ],
+   "note": "Prefill MQA logits.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.prefill_topk",
+   "name": "topKPerRowPrefill",
+   "phase": "forward",
+   "type": "attention",
+   "role": "indexer prefill top-512",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.prefill_topk"
+   ],
+   "note": "Prefill top-512.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.decode_logits",
+   "name": "deep_gemm::sm100_paged_mqa_logits<",
+   "phase": "forward",
+   "type": "attention",
+   "role": "indexer decode paged MQA logits",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.decode_logits"
+   ],
+   "note": "Decode paged logits (BLOCK_KV 64 and 128); the sched metadata kernel is in preprocess.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.decode_topk",
+   "name": "cooperative::cooperative_topk_cs",
+   "phase": "forward",
+   "type": "attention",
+   "role": "indexer decode top-512",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.decode_topk"
+   ],
+   "note": "Decode top-512 (all cluster sizes).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.candidates",
+   "name": "_block_scores_kernel",
+   "phase": "forward",
+   "type": "attention",
+   "role": "layer-20 candidate-block selection and the consumers' candidate masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.candidates"
+   ],
+   "note": "candidate block scores in the layer-20 candidate chain (candidate_blocks.py); only that chain launches it in forward.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.candidates",
+   "name": "_store_candidates_kernel",
+   "phase": "forward",
+   "type": "attention",
+   "role": "layer-20 candidate-block selection and the consumers' candidate masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.candidates"
+   ],
+   "note": "candidate store in the layer-20 candidate chain (candidate_blocks.py); only that chain launches it in forward.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.candidates",
+   "name": "_candidate_flags_kernel",
+   "phase": "forward",
+   "type": "attention",
+   "role": "layer-20 candidate-block selection and the consumers' candidate masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.candidates"
+   ],
+   "note": "consumer candidate flags in the layer-20 candidate chain (candidate_blocks.py); only that chain launches it in forward.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.candidates",
+   "name": "_mask_candidates_kernel",
+   "phase": "forward",
+   "type": "attention",
+   "role": "layer-20 candidate-block selection and the consumers' candidate masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.candidates"
+   ],
+   "note": "consumer candidate mask in the layer-20 candidate chain (candidate_blocks.py); only that chain launches it in forward.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.candidates",
+   "name": "at::native::mbtopk::",
+   "phase": "forward",
+   "type": "attention",
+   "role": "layer-20 candidate-block selection and the consumers' candidate masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.candidates"
+   ],
+   "note": "torch.topk(2048) multi-block radix select in the layer-20 candidate chain (candidate_blocks.py); only that chain launches it in forward.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.candidates",
+   "name": "at::native::sbtopk::gatherTopK",
+   "phase": "forward",
+   "type": "attention",
+   "role": "layer-20 candidate-block selection and the consumers' candidate masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.candidates"
+   ],
+   "note": "torch.topk gather in the layer-20 candidate chain (candidate_blocks.py); only that chain launches it in forward.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.candidates",
+   "name": "radixSortKVInPlace",
+   "phase": "forward",
+   "type": "attention",
+   "role": "layer-20 candidate-block selection and the consumers' candidate masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.candidates"
+   ],
+   "note": "torch.topk sorted output in the layer-20 candidate chain (candidate_blocks.py); only that chain launches it in forward.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.candidates",
+   "name": "bitonicSortKVInPlace",
+   "phase": "forward",
+   "type": "attention",
+   "role": "layer-20 candidate-block selection and the consumers' candidate masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.candidates"
+   ],
+   "note": "torch.topk sorted output in the layer-20 candidate chain (candidate_blocks.py); only that chain launches it in forward.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.indexer.candidates",
+   "name": "DeviceScanByKey",
+   "phase": "forward",
+   "type": "attention",
+   "role": "layer-20 candidate-block selection and the consumers' candidate masks",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.indexer.score.candidates"
+   ],
+   "note": "torch.topk scan-by-key in the layer-20 candidate chain (candidate_blocks.py); only that chain launches it in forward.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.mega_attn.prefill",
+   "name": "core_attn::Config{(SparseAttnFwdMode)0",
+   "phase": "forward",
+   "type": "attention",
+   "role": "FlashMLA mega attention, prefill mode, with its K dequant/gather, SWA gather and index combine",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.attention.mega_attn.prefill"
+   ],
+   "note": "FlashMLA mega attention, prefill mode.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.mega_attn.decode",
+   "name": "core_attn::Config{(SparseAttnFwdMode)1",
+   "phase": "forward",
+   "type": "attention",
+   "role": "FlashMLA mega attention, decode mode, with the global top-k remap folded in",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.attention.mega_attn.decode"
+   ],
+   "note": "FlashMLA mega attention, decode mode.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.mega_attn.decode",
+   "name": "_compute_global_topk_indices_and_lens_kernel",
+   "phase": "forward",
+   "type": "attention",
+   "role": "FlashMLA mega attention, decode mode, with the global top-k remap folded in",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.attention.mega_attn.decode"
+   ],
+   "note": "Global top-k remap, folded into the decode attention leaf by the arch.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.mega_attn.prefill",
+   "name": "_dequantize_and_gather_k_nvfp4_kernel",
+   "phase": "forward",
+   "type": "attention",
+   "role": "FlashMLA mega attention, prefill mode, with its K dequant/gather, SWA gather and index combine",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.attention.mega_attn.prefill"
+   ],
+   "note": "Compressed-cache dequant/gather inside the prefill mega-attention slot.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.mega_attn.prefill",
+   "name": "kernel_cutlass_device_kernel_tensorptrbf16gmemalign32o512",
+   "phase": "forward",
+   "type": "attention",
+   "role": "FlashMLA mega attention, prefill mode, with its K dequant/gather, SWA gather and index combine",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.attention.mega_attn.prefill"
+   ],
+   "note": "CuTe MXFP8 SWA gather inside the prefill mega-attention slot.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.mega_attn.prefill",
+   "name": "kernel",
+   "phase": "forward",
+   "name_exact": true,
+   "before_name": "core_attn::Config{(SparseAttnFwdMode)0",
+   "type": "attention",
+   "role": "FlashMLA mega attention, prefill mode, with its K dequant/gather, SWA gather and index combine",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.attention.mega_attn.prefill"
+   ],
+   "note": "combine_topk_swa_indices (anonymous Triton launch) right before prefill attention.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.mega_attn.prefill",
+   "name": "div_floor_kernel_cuda",
+   "phase": "forward",
+   "after_name": "direct_copy_kernel_cuda",
+   "type": "attention",
+   "role": "FlashMLA mega attention, prefill mode, with its K dequant/gather, SWA gather and index combine",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.attention.mega_attn.prefill"
+   ],
+   "note": "seq_lens // ratio right after the position cast, part of the prefill slot.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "attn.mega_attn.prefill",
+   "name": "div_floor_kernel_cuda",
+   "phase": "forward",
+   "before_name": "_dequantize_and_gather_k_nvfp4_kernel",
+   "type": "attention",
+   "role": "FlashMLA mega attention, prefill mode, with its K dequant/gather, SWA gather and index combine",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "attn.attention.mega_attn.prefill"
+   ],
+   "note": "seq_lens // ratio before the compressed-cache gather, part of the prefill slot.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.router_gate",
+   "name": "splitKreduce_kernel<(int)32, (int)16, int, float, float",
+   "phase": "forward",
+   "before_name": "_dsv4_topk_kernel",
+   "type": "moe",
+   "role": "router gate, fp32 logits (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.routed.router_gate"
+   ],
+   "note": "fp32 split-K reduce feeding the router top-k.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.router_gate",
+   "name": "nvjet_sm100_tss_",
+   "phase": "forward",
+   "before": "ffn.router_gate",
+   "type": "moe",
+   "role": "router gate, fp32 logits (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.routed.router_gate"
+   ],
+   "note": "fp32 tile whose split-K reduce is the router.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.router_gate",
+   "name": "nvjet_sm100_tss_",
+   "phase": "forward",
+   "before_name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "type": "moe",
+   "role": "router gate, fp32 logits (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.routed.router_gate"
+   ],
+   "note": "fp32 tile followed by the shared-expert quant: the router of a serial large-T FFN.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.router_gate",
+   "name": "nvjet_sm100_tss_",
+   "phase": "forward",
+   "after": "ffn.entry.mega_mhc",
+   "type": "moe",
+   "role": "router gate, fp32 logits (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.routed.router_gate"
+   ],
+   "note": "fp32 tile after the FFN-entry mHC is the router gate.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.router_gate",
+   "name": "LLBf16Dotprod",
+   "phase": "forward",
+   "before_name": "_dsv4_topk_kernel",
+   "type": "moe",
+   "role": "router gate, fp32 logits (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.routed.router_gate"
+   ],
+   "note": "cute-dsl bf16 dot-product router gate, feeding the router top-k (first eager iteration).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.routed.topk",
+   "name": "_dsv4_topk_kernel",
+   "phase": "forward",
+   "type": "moe",
+   "role": "sqrt-softplus top-k with bias",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.routed.topk"
+   ],
+   "note": "Router top-k.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.routed.input_quant",
+   "name": "MXFP8QuantizeLinearKernel",
+   "phase": "forward",
+   "type": "moe",
+   "role": "MXFP8 linear-layout activation quant for the routed experts",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.routed.input_quant"
+   ],
+   "note": "Linear-layout MXFP8 quant before routing: the MoE input-quant placeholder.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.routed.fused_moe",
+   "name": "routingCustom::routingIndices",
+   "phase": "forward",
+   "type": "moe",
+   "role": "trtllm MXFP8xMXFP4 fused MoE: routing, fc1, fc2, finalize",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.routed.fused_moe"
+   ],
+   "note": "One flashinfer trtllm_fp4_block_scale_routed_moe call: routing, fc1, fc2, finalize.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.routed.fused_moe",
+   "name": "bmm_MxE4m3_MxE2m1",
+   "phase": "forward",
+   "type": "moe",
+   "role": "trtllm MXFP8xMXFP4 fused MoE: routing, fc1, fc2, finalize",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.routed.fused_moe"
+   ],
+   "note": "One flashinfer trtllm_fp4_block_scale_routed_moe call: routing, fc1, fc2, finalize.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.routed.fused_moe",
+   "name": "bmm_Bfloat16_MxE2m1",
+   "phase": "forward",
+   "type": "moe",
+   "role": "trtllm MXFP8xMXFP4 fused MoE: routing, fc1, fc2, finalize",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.routed.fused_moe"
+   ],
+   "note": "One flashinfer trtllm_fp4_block_scale_routed_moe call: routing, fc1, fc2, finalize.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.routed.fused_moe",
+   "name": "moe::dev::finalize::finalizeKernel",
+   "phase": "forward",
+   "type": "moe",
+   "role": "trtllm MXFP8xMXFP4 fused MoE: routing, fc1, fc2, finalize",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.routed.fused_moe"
+   ],
+   "note": "One flashinfer trtllm_fp4_block_scale_routed_moe call: routing, fc1, fc2, finalize.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.shared.gate_up",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "phase": "forward",
+   "after": "ffn.entry.mega_mhc",
+   "type": "ffn",
+   "role": "MXFP8 shared-expert gate_up (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.shared.gate_up",
+    "ffn.shared.gate_up.serial"
+   ],
+   "note": "K=5120 quant after the FFN-entry mHC.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.shared.gate_up",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "phase": "forward",
+   "after": "ffn.router_gate",
+   "type": "ffn",
+   "role": "MXFP8 shared-expert gate_up (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.shared.gate_up",
+    "ffn.shared.gate_up.serial"
+   ],
+   "note": "K=5120 quant after the router gate (serial large-T FFN).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.shared.gate_up",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "phase": "forward",
+   "before": "ffn.shared.gate_up",
+   "type": "ffn",
+   "role": "MXFP8 shared-expert gate_up (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.shared.gate_up",
+    "ffn.shared.gate_up.serial"
+   ],
+   "note": "Quant whose GEMM is the shared gate_up.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.shared.gate_up",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "after_name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o512051201",
+   "before_name": "act_and_mul_kernel",
+   "type": "ffn",
+   "role": "MXFP8 shared-expert gate_up (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.shared.gate_up",
+    "ffn.shared.gate_up.serial"
+   ],
+   "note": "K=5120 GEMM followed by the shared-expert activation.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.shared.gate_up",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "after": "ffn.shared.gate_up",
+   "type": "ffn",
+   "role": "MXFP8 shared-expert gate_up (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.shared.gate_up",
+    "ffn.shared.gate_up.serial"
+   ],
+   "note": "GEMM after the shared gate_up quant.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.shared.act_and_mul",
+   "name": "act_and_mul_kernel",
+   "phase": "forward",
+   "type": "ffn",
+   "role": "shared-expert clamped SwiGLU",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.shared.act_and_mul",
+    "ffn.shared.act_and_mul.serial"
+   ],
+   "note": "Shared-expert SwiGLU.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.shared.down",
+   "name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o5765761",
+   "phase": "forward",
+   "type": "ffn",
+   "role": "MXFP8 shared-expert down (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.shared.down",
+    "ffn.shared.down.serial"
+   ],
+   "note": "K=576 quant is the shared down input.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.shared.down",
+   "name": "dense_blockscaled_gemm_sm100",
+   "phase": "forward",
+   "after_name": "MXFP8QuantizeSwizzledKernel_object_at__tensorptrbf16gmemalign16o5765761",
+   "type": "ffn",
+   "role": "MXFP8 shared-expert down (quant + GEMM)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.shared.down",
+    "ffn.shared.down.serial"
+   ],
+   "note": "GEMM after the K=576 quant.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "ffn.residual_add",
+   "name": "CUDAFunctor_add<c10::BFloat16>",
+   "phase": "forward",
+   "type": "ffn",
+   "role": "routed + shared residual add",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "ffn.residual_add"
+   ],
+   "note": "Routed + shared residual add.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "head.mhc_post",
+   "name": "mhc_post_tilelang_kernel",
+   "phase": "forward",
+   "before_name": "_hc_head_reduce_store_kernel",
+   "type": "model",
+   "role": "final mHC post",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "head.mhc_post"
+   ],
+   "note": "Final mHC post, followed by the head reduce.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "head.hc_head_collapse",
+   "name": "_hc_head_reduce_store_kernel",
+   "phase": "forward",
+   "type": "model",
+   "role": "hyper-connection head reduce",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "head.hc_head_collapse"
+   ],
+   "note": "Hyper-connection head reduce.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "head.final_rms_norm",
+   "name": "vllm::rms_norm_kernel",
+   "phase": "forward",
+   "type": "model",
+   "role": "final RMSNorm",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "head.final_rms_norm"
+   ],
+   "note": "Final RMSNorm (the only rms_norm launch in forward).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "head.lm_head",
+   "name": "nvjet_sm100_tst_",
+   "phase": "sample",
+   "type": "model",
+   "role": "TP lm_head projection (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "head.lm_head"
+   ],
+   "note": "lm_head tile; vLLM computes logits in the sample range.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "head.lm_head",
+   "name": "splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16",
+   "phase": "sample",
+   "type": "model",
+   "role": "TP lm_head projection (GEMM + split-K reduce)",
+   "cross_rank": "independent",
+   "slot_suffixes": [
+    "head.lm_head"
+   ],
+   "note": "lm_head split-K reduce.",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  },
+  {
+   "operation": "head.logits_all_gather",
+   "name": "ncclDevKernel_AllGather",
+   "phase": "sample",
+   "type": "collective",
+   "role": "logits AllGather over TP4",
+   "cross_rank": "synchronizing",
+   "slot_suffixes": [
+    "head.logits_all_gather"
+   ],
+   "note": "Logits AllGather over TP4 (logits_processor.py:130).",
+   "source_experiment": "20260924_0_dsv41_flash_capture/profile_nsys_cg2048"
+  }
+ ]
+}
