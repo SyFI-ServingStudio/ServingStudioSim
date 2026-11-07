@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from profiling.exec.container_user import rootless_runtime as real_rootless_runt
 from profiling.exec.env import ContainerProfileEnv
 from profiling.exec.local import (
     IMEX_CHANNEL_CDI_DEVICE,
+    LocalGpuChunk,
     _container_worker_command,
     gpu_uuids_for_indices,
 )
@@ -110,6 +113,87 @@ def test_container_worker_never_passes_a_bare_gpu_index(tmp_path: Path, monkeypa
     gpu_request = command[command.index("--gpus") + 1]
     assert gpu_request == '"device=GPU-fake-0"'
     assert "device=0" not in gpu_request
+
+
+def test_container_worker_pins_cuda_to_the_requested_uuids(tmp_path: Path, monkeypatch) -> None:
+    """A rootless Podman inside a Slurm job ignores ``--gpus`` and exposes every
+    job GPU, so the device request alone left concurrent workers on job GPU 0.
+    CUDA_VISIBLE_DEVICES carries the same UUIDs, in reservation order."""
+
+    exchange_dir = tmp_path / "exchange"
+    exchange_dir.mkdir()
+    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
+
+    command, _env = _container_worker_command(
+        ContainerProfileEnv("vllm_env", "profiler:test"),
+        [3, 1],
+        exchange_dir,
+    )
+
+    assert "CUDA_VISIBLE_DEVICES=GPU-fake-3,GPU-fake-1" in command
+    assert command[command.index("CUDA_VISIBLE_DEVICES=GPU-fake-3,GPU-fake-1") - 1] == "--env"
+    assert command[command.index("--gpus") + 1] == '"device=GPU-fake-3,GPU-fake-1"'
+
+
+def _run_chunk_with_worker_uuids(monkeypatch, gpus: list[int], worker_uuids) -> list:
+    """Run a host-runtime chunk whose fake worker succeeds and reports ``worker_uuids``."""
+
+    monkeypatch.setenv("VIBESIM_PROFILE_RUNTIME", "host")
+
+    def fake_subprocess_run(cmd, **kwargs):
+        del kwargs
+        output_path = Path(cmd[cmd.index("--worker-output") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "results": [
+                        {
+                            "ok": True,
+                            "metrics": {
+                                "kind": "compute",
+                                "time_ms": 1.0,
+                                "tflops": 0.1,
+                                "memory_bandwidth_gbps": 0.2,
+                                "energy_j": 0.0,
+                            },
+                            "gpu_name": "FakeGPU",
+                        }
+                    ],
+                    "gpu_uuids": worker_uuids,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("profiling.exec.local.subprocess.run", fake_subprocess_run)
+    return LocalGpuChunk(gpus).run(
+        "single_gemm",
+        [{"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "torch"}],
+    )
+
+
+def test_chunk_keeps_results_measured_on_the_reserved_card(monkeypatch) -> None:
+    (result,) = _run_chunk_with_worker_uuids(monkeypatch, [2], ["GPU-fake-2"])
+
+    assert result.error is None
+    assert result.metrics is not None
+
+
+@pytest.mark.parametrize(
+    "worker_uuids",
+    [
+        ["GPU-fake-0"],  # another card: the runtime ignored the request
+        ["GPU-fake-0", "GPU-fake-2"],  # every job card visible, CUDA picks the first
+        None,  # a worker that could not say
+    ],
+)
+def test_chunk_rejects_results_from_a_card_it_did_not_reserve(monkeypatch, worker_uuids) -> None:
+    (result,) = _run_chunk_with_worker_uuids(monkeypatch, [2], worker_uuids)
+
+    assert result.metrics is None
+    assert "worker GPU mismatch" in (result.error or "")
+    assert "GPU-fake-2" in (result.error or "")
 
 
 def test_container_worker_fails_when_the_uuid_is_unknown(tmp_path: Path, monkeypatch) -> None:

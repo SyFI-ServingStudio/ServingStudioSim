@@ -121,6 +121,7 @@ def test_the_worker_refuses_an_unsupported_device_without_loading_the_runner(mon
     monkeypatch.setattr(local_worker, "coerce_args", lambda schema, spec: spec)
     monkeypatch.setattr(local_worker, "_current_gpu_name", lambda: "NVIDIA H200")
     monkeypatch.setattr(local_worker, "_runtime_versions", lambda _backend: {})
+    monkeypatch.setattr(local_worker, "_visible_gpu_uuids", lambda: ["GPU-fake-0"])
     request = tmp_path / "in.json"
     output = tmp_path / "out.json"
     request.write_text(
