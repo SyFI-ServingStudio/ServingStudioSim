@@ -521,7 +521,7 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
     num_tokens = shape.num_tokens
     out = alloc_mega_attn_output(num_tokens, shape.num_heads // 8, device)
     q_fused = _q_fused(work.q)
-    positions32 = work.positions.to(torch.int32)
+    positions = work.positions  # int64, as the model passes them
     layer = types.SimpleNamespace(
         compress_ratio=shape.ratio,
         PREFILL_CHUNK_SIZE=_PREFILL_CHUNK_SIZE,
@@ -534,6 +534,15 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
         rotary_emb=types.SimpleNamespace(cos_sin_cache=work.cos_sin),
         n_wv_group=shape.num_heads // 8,
         _compressed_kv_cache=lambda: work.extra_cache,
+        # The swap-AB small-decode kernel (16/32 live heads) is not this backend.
+        _use_swapab=False,
+        # A KV-source layer gathers its compressed columns every step; the
+        # layers after it may reuse them from the retained workspace span.
+        is_kv_source=True,
+        compressed_cache_prefix=f"{KIND}.profile",
+    )
+    layer._prefill_index_workspace_specs = types.MethodType(
+        DeepseekV4MegaAttnAttention._prefill_index_workspace_specs, layer
     )
     flashmla_metadata = (
         types.SimpleNamespace(block_table=work.extra_block_table, block_size=_KV_BLOCK)
@@ -556,7 +565,7 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
 
         def run() -> None:
             DeepseekV4MegaAttnAttention._forward_decode_mega(
-                layer, q_fused, positions32, flashmla_metadata, swa_metadata, out
+                layer, q_fused, positions, flashmla_metadata, swa_metadata, out
             )
 
         return work, run, out
@@ -593,7 +602,7 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
 
     def run() -> None:
         DeepseekV4MegaAttnAttention._forward_prefill_mega(
-            layer, q_fused, positions32, flashmla_metadata, swa_metadata, out, 0
+            layer, q_fused, positions, flashmla_metadata, swa_metadata, out, 0
         )
 
     return work, run, out

@@ -11,8 +11,8 @@ output's last 64 dims, and casts the output to FP8 E4M3 with UE8M0 scales per
 RoPE.
 
 Two paged cache records, documented in the fork's
-``common/ops/cache_utils.py``. Each page puts its whole data region before
-its whole scale region:
+``common/ops/cache_utils.py``. Both are interleaved (FlashMLA 2026.09.30):
+each token's scales follow its own data:
 
 - ``mxfp8`` (528 B/token): 512 FP8 E4M3 values, then 16 UE8M0 scales of 32 dims;
 - ``nvfp4`` (288 B/token): 512 E2M1 values packed two per byte (even element in
@@ -36,6 +36,7 @@ __all__ = [
     "compressed_sparse_mla_rope_cast_reference",
     "encode_records",
     "output_from_fused_layout",
+    "page_regions",
     "q_to_fused_layout",
     "quantize_output",
 ]
@@ -53,21 +54,19 @@ _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _ROW_CHUNK = 64
 
 
-def _page_regions(cache: torch.Tensor, fmt: str) -> tuple[torch.Tensor, torch.Tensor]:
+def page_regions(cache: torch.Tensor, fmt: str) -> tuple[torch.Tensor, torch.Tensor]:
     """``[blocks, page, bytes]`` -> data ``[slots, data]`` and scale ``[slots, sf]`` views."""
     blocks, page, width = cache.shape
     if width != RECORD_BYTES[fmt]:
         raise ValueError(f"{fmt} cache needs {RECORD_BYTES[fmt]} B/token, got {width}")
-    flat = cache.reshape(blocks, page * width)
-    data_bytes = page * _DATA_BYTES[fmt]
-    data = flat[:, :data_bytes].reshape(blocks * page, _DATA_BYTES[fmt])
-    scale = flat[:, data_bytes:].reshape(blocks * page, _SCALE_BYTES[fmt])
-    return data, scale
+    rows = cache.view(blocks * page, width)
+    data_bytes = _DATA_BYTES[fmt]
+    return rows[:, :data_bytes], rows[:, data_bytes:]
 
 
 def decode_records(cache: torch.Tensor, slots: torch.Tensor, fmt: str) -> torch.Tensor:
     """Decode cache rows ``slots`` (any shape, all valid) to fp32 ``[..., 512]``."""
-    data, scale = _page_regions(cache, fmt)
+    data, scale = page_regions(cache, fmt)
     flat_slots = slots.reshape(-1).long()
     raw = data[flat_slots]
     sf = scale[flat_slots]
@@ -114,7 +113,7 @@ def encode_records(rows: torch.Tensor, fmt: str) -> tuple[torch.Tensor, torch.Te
 
 def write_records(cache: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor, fmt: str) -> None:
     """Store ``rows`` at ``slots`` of a paged ``fmt`` cache (Torch encoder)."""
-    data, scale = _page_regions(cache, fmt)
+    data, scale = page_regions(cache, fmt)
     encoded, factors = encode_records(rows, fmt)
     data[slots.long()] = encoded
     scale[slots.long()] = factors
