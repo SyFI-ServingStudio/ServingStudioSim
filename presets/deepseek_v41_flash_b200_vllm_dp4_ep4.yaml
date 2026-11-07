@@ -31,11 +31,10 @@ pools:
           # The capture's --max-model-len (a timing input: the FlashMLA prefill
           # workspace and the indexer's padded logits rows).
           max_model_len: 131072
-          # Recorded per-token expert routes from the TP4/EP4 capture's
-          # token_corpus pass; the routes are per token, so the same corpus
-          # folds over the four EP ranks here.
+          # Recorded per-token expert routes from the 1017 checkpoint's DP4/EP4
+          # token_corpus pass (repo-relative until published to the HF dataset).
           routing: corpus
-          token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
+          token_corpus_file: logs/20261106_0_dsv41_dspark_capture/profile_dp4ep4_corpus/token_corpus/manifest.json
         worker:
           type: chunked_prefill
           # vLLM max_num_batched_tokens=2048, per DP rank.
