@@ -11,6 +11,7 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 from profiling.runners.metrics import RunnerResult
 
 _NVFP4_SCALE_GROUP = 16
+_MXFP8_SCALE_GROUP = 32
 _FP8_BLOCK_SCALE_GROUP = 128
 
 
@@ -121,25 +122,51 @@ def _validate_quantized_all_gather(
     top_k: int,
     activation_dtype: DType | str,
     fabric: str,
-) -> tuple[int, tuple[int, ...], int, int]:
+) -> tuple[int, tuple[int, ...], int, int, DType]:
     num_gpus, token_counts, hidden_size = _validate_topology(
         num_gpus, per_rank_tokens, hidden_size, fabric
     )
-    if hidden_size % _NVFP4_SCALE_GROUP:
-        raise ValueError(f"hidden_size must be a multiple of {_NVFP4_SCALE_GROUP}")
     if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
         raise ValueError("top_k must be a positive integer")
-    if DType.from_value(activation_dtype) is not DType.NVFP4_E2M1:
+    activation_dtype = DType.from_value(activation_dtype)
+    if activation_dtype not in _QUANTIZED_SCALE_GROUP:
         raise ProfilerNotImplemented(
-            "quantized MoE all-gather requires activation_dtype=nvfp4_e2m1"
+            "quantized MoE all-gather requires activation_dtype=nvfp4_e2m1 or mxfp8_e4m3"
         )
-    return num_gpus, token_counts, hidden_size, top_k
+    scale_group = _QUANTIZED_SCALE_GROUP[activation_dtype]
+    if hidden_size % scale_group:
+        raise ValueError(f"hidden_size must be a multiple of {scale_group}")
+    return num_gpus, token_counts, hidden_size, top_k, activation_dtype
 
 
-def quantized_all_gather_token_bytes(hidden_size: int, top_k: int) -> int:
-    """Bytes one token adds to the gather: packed e2m1 pairs, one e4m3 scale per
-    16 elements, then fp32 weights and int32 IDs for each selected expert."""
-    return hidden_size // 2 + hidden_size // _NVFP4_SCALE_GROUP + top_k * (4 + 4)
+# Elements per block scale of each dispatched activation format: NVFP4 carries
+# one e4m3 scale per 16 elements, MXFP8 one ue8m0 exponent per 32
+# (`mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=False)`), both linear layout.
+_QUANTIZED_SCALE_GROUP = {
+    DType.NVFP4_E2M1: _NVFP4_SCALE_GROUP,
+    DType.MXFP8_E4M3: _MXFP8_SCALE_GROUP,
+}
+
+
+def _quantized_data_columns(hidden_size: int, activation_dtype: DType) -> int:
+    """Bytes of one token's activation data: packed e2m1 pairs, or one e4m3 byte
+    per element."""
+    if activation_dtype is DType.NVFP4_E2M1:
+        return hidden_size // 2
+    return hidden_size
+
+
+def quantized_all_gather_token_bytes(
+    hidden_size: int, top_k: int, activation_dtype: DType | str = DType.NVFP4_E2M1
+) -> int:
+    """Bytes one token adds to the gather: the activation data, one one-byte
+    scale per block, then fp32 weights and int32 IDs for each selected expert."""
+    activation_dtype = DType.from_value(activation_dtype)
+    return (
+        _quantized_data_columns(hidden_size, activation_dtype)
+        + hidden_size // _QUANTIZED_SCALE_GROUP[activation_dtype]
+        + top_k * (4 + 4)
+    )
 
 
 def _validate_reduce_scatter(
@@ -246,16 +273,21 @@ def _quantized_all_gather_per_rank_batch(
 
     results = []
     for spec in specs:
-        _, token_counts, hidden_size, top_k = _validate_quantized_all_gather(**spec)
+        _, token_counts, hidden_size, top_k, activation_dtype = _validate_quantized_all_gather(
+            **spec
+        )
         total_tokens = sum(token_counts)
         # vLLM's AgRsAll2AllManager.dispatch gathers [hidden_states, topk_weights,
         # topk_ids] followed by the extra block-scale tensor, in this order.
         columns_and_dtypes = (
-            (hidden_size // 2, torch.uint8),
+            (_quantized_data_columns(hidden_size, activation_dtype), torch.uint8),
             (top_k, torch.float32),
             (top_k, torch.int32),
-            (hidden_size // _NVFP4_SCALE_GROUP, torch.uint8),
+            (hidden_size // _QUANTIZED_SCALE_GROUP[activation_dtype], torch.uint8),
         )
+        # NVFP4 block scales travel as float8_e4m3fn, MXFP8 ue8m0 exponents as
+        # uint8; NCCL moves the same bytes either way.
+        scale_view = torch.float8_e4m3fn if activation_dtype is DType.NVFP4_E2M1 else torch.uint8
 
         def rank_inputs(source_rank: int, rows: int) -> list[Any]:
             tensors = [
@@ -274,13 +306,12 @@ def _quantized_all_gather_per_rank_batch(
             return tensors
 
         inputs = rank_inputs(rank, token_counts[rank])
-        # The block scales travel as float8_e4m3fn; the byte view is what NCCL moves.
-        inputs[3] = inputs[3].view(torch.float8_e4m3fn)
+        inputs[3] = inputs[3].view(scale_view)
         outputs = [
             torch.empty((total_tokens, columns), dtype=dtype, device="cuda")
             for columns, dtype in columns_and_dtypes
         ]
-        outputs[3] = outputs[3].view(torch.float8_e4m3fn)
+        outputs[3] = outputs[3].view(scale_view)
 
         def launch() -> None:
             communicator.group_start()
@@ -310,97 +341,7 @@ def _quantized_all_gather_per_rank_batch(
         rank_time_ms = _time_launch(torch, dist, launch, warmup, rep)
         rank_times = _gather_rank_times(dist, rank, world_size, rank_time_ms)
         if rank == 0:
-            token_bytes = quantized_all_gather_token_bytes(hidden_size, top_k)
-            local_payloads = [count * token_bytes for count in token_counts]
-            results.append(
-                _metric_payload(
-                    rank_times,
-                    sum(local_payloads) / world_size,
-                    sum(local_payloads) - min(local_payloads),
-                )
-            )
-    return results if rank == 0 else None
-
-
-def _quantized_all_gather_per_rank_batch(
-    *,
-    rank: int,
-    world_size: int,
-    communicator: Any,
-    specs: list[dict],
-    warmup: int,
-    rep: int,
-) -> list[dict] | None:
-    import torch
-    import torch.distributed as dist
-
-    results = []
-    for spec in specs:
-        _, token_counts, hidden_size, top_k = _validate_quantized_all_gather(**spec)
-        total_tokens = sum(token_counts)
-        # vLLM's AgRsAll2AllManager.dispatch gathers [hidden_states, topk_weights,
-        # topk_ids] followed by the extra block-scale tensor, in this order.
-        columns_and_dtypes = (
-            (hidden_size // 2, torch.uint8),
-            (top_k, torch.float32),
-            (top_k, torch.int32),
-            (hidden_size // _NVFP4_SCALE_GROUP, torch.uint8),
-        )
-
-        def rank_inputs(source_rank: int, rows: int) -> list[Any]:
-            tensors = [
-                _rank_tensor(
-                    torch,
-                    rows,
-                    columns,
-                    source_rank,
-                    torch.int32 if dtype is torch.uint8 else dtype,
-                )
-                for columns, dtype in columns_and_dtypes
-            ]
-            # Map signed test values onto bytes for the packed operands.
-            tensors[0] = (tensors[0] + 8).to(torch.uint8)
-            tensors[3] = (tensors[3] + 8).to(torch.uint8)
-            return tensors
-
-        inputs = rank_inputs(rank, token_counts[rank])
-        # The block scales travel as float8_e4m3fn; the byte view is what NCCL moves.
-        inputs[3] = inputs[3].view(torch.float8_e4m3fn)
-        outputs = [
-            torch.empty((total_tokens, columns), dtype=dtype, device="cuda")
-            for columns, dtype in columns_and_dtypes
-        ]
-        outputs[3] = outputs[3].view(torch.float8_e4m3fn)
-
-        def launch() -> None:
-            communicator.group_start()
-            for output, tensor in zip(outputs, inputs, strict=True):
-                if len(set(token_counts)) == 1:
-                    communicator.all_gather(output, tensor)
-                else:
-                    communicator.all_gatherv(output, tensor, sizes=list(token_counts))
-            communicator.group_end()
-
-        launch()
-        torch.cuda.synchronize()
-        expected = [
-            torch.cat(parts)
-            for parts in zip(
-                *(rank_inputs(source, count) for source, count in enumerate(token_counts)),
-                strict=True,
-            )
-        ]
-        actual = list(outputs)
-        actual[3] = actual[3].view(torch.uint8)
-        if not all(torch.equal(got, want) for got, want in zip(actual, expected, strict=True)):
-            raise KernelLaunchFailed(
-                "grouped PyNCCL quantized all-gather failed the Torch reference"
-            )
-
-        rank_time_ms = _time_launch(torch, dist, launch, warmup, rep)
-        rank_times = _gather_rank_times(dist, rank, world_size, rank_time_ms)
-        if rank == 0:
-            token_bytes = quantized_all_gather_token_bytes(hidden_size, top_k)
+            token_bytes = quantized_all_gather_token_bytes(hidden_size, top_k, activation_dtype)
             local_payloads = [count * token_bytes for count in token_counts]
             results.append(
                 _metric_payload(

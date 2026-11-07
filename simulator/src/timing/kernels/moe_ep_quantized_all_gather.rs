@@ -1,5 +1,6 @@
-//! Ragged all-gatherv of NVFP4 activations, their block scales and top-k
-//! routing for naive DP/EP MoE that quantizes and routes before dispatch.
+//! Ragged all-gatherv of quantized activations (NVFP4 or MXFP8), their block
+//! scales and top-k routing for naive DP/EP MoE that quantizes and routes
+//! before dispatch.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -53,7 +54,10 @@ impl KernelSpec for MoeEpQuantizedAllGatherSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         assert!(matches!(config.num_gpus, 2 | 4 | 8));
-        assert_eq!(config.activation_dtype, DType::Nvfp4E2m1);
+        assert!(matches!(
+            config.activation_dtype,
+            DType::Nvfp4E2m1 | DType::Mxfp8E4m3
+        ));
         assert_eq!(config.fabric, "nvlink");
         grid.expand_2d(|total, ragged_max| {
             let per_rank_tokens =
@@ -72,3 +76,31 @@ impl KernelSpec for MoeEpQuantizedAllGatherSpec {
 }
 
 register_kernel!(MoeEpQuantizedAllGatherKernel, MoeEpQuantizedAllGatherSpec);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mxfp8_dispatch_forwards_its_activation_dtype() {
+        let config = MoeEpQuantizedAllGatherKernelConfig {
+            backends: vec!["vllm_pynccl"],
+            gpu_name: "NVIDIA B200".to_string(),
+            num_gpus: 4,
+            hidden_size: 5120.into(),
+            top_k: 6.into(),
+            activation_dtype: DType::Mxfp8E4m3,
+            fabric: "nvlink".to_string(),
+            max_total_tokens: 8192,
+        };
+        let grid = MoeEpQuantizedAllGatherSpec::sweep_grid(&config);
+        let payloads = MoeEpQuantizedAllGatherSpec::enumerate(&config, &grid, "vllm_pynccl");
+        assert!(!payloads.is_empty());
+        for payload in payloads {
+            assert_eq!(
+                payload.fields()["activation_dtype"],
+                serde_json::Value::from("mxfp8_e4m3")
+            );
+        }
+    }
+}
