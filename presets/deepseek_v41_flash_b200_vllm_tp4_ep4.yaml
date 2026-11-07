@@ -35,9 +35,6 @@ pools:
           # token_corpus pass (repo-relative until published to the HF dataset).
           routing: corpus
           token_corpus_file: logs/20261106_0_dsv41_dspark_capture/profile_tp4ep4_corpus/token_corpus/manifest.json
-          # The captured vLLM predates decoder SWA bounded replay (the arch
-          # default, on in the current fork): pinned off here.
-          decoder_swa_bounded_replay: false
         worker:
           type: chunked_prefill
           # vLLM max_num_batched_tokens=2048. The V1 scheduler fills decodes
