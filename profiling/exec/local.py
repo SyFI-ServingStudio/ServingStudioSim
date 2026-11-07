@@ -15,6 +15,7 @@ from pathlib import Path
 
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec
+from profiling.exec.container_user import container_user
 from profiling.exec.env import (
     ContainerProfileEnv,
     ProfileEnv,
@@ -306,7 +307,7 @@ def _container_worker_command(
             # Only backends that allocate fabric memory ask for the channel.
             *(["--device", IMEX_CHANNEL_CDI_DEVICE] if imex_channel else []),
             "--user",
-            f"{os.getuid()}:{os.getgid()}",
+            container_user(),
             "--env",
             "HOME=/cache/home",
             "--env",

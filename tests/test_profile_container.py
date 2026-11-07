@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 
+from profiling.exec.container_user import rootless_runtime as real_rootless_runtime
 from profiling.exec.env import ContainerProfileEnv
 from profiling.exec.local import (
     IMEX_CHANNEL_CDI_DEVICE,
@@ -31,6 +33,8 @@ def stub_nvidia_smi(monkeypatch):
     """
 
     monkeypatch.setattr("profiling.exec.local._nvidia_smi_xml", _fake_smi_xml)
+    # Nor on the host's container runtime: pin a rootful one.
+    monkeypatch.setattr("profiling.exec.container_user.rootless_runtime", lambda: False)
 
 
 def test_container_worker_mounts_worktree_source_read_only(tmp_path: Path, monkeypatch) -> None:
@@ -235,3 +239,45 @@ def test_imex_channel_is_declared_by_the_mnnvl_all_reduce_backends_only() -> Non
         ("all_reduce_fusion", "flashinfer_mnnvl"),
         ("all_reduce_residual_rms_norm", "flashinfer_mnnvl"),
     }
+
+
+def test_container_worker_runs_as_root_under_a_rootless_runtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Catches a worker run as the caller's uid under rootless Podman, which maps
+    it to a subordinate host uid that cannot read the 0700 exchange directory."""
+    exchange_dir = tmp_path / "exchange"
+    exchange_dir.mkdir()
+    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
+    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test")
+
+    def user(command: list[str]) -> str:
+        return command[command.index("--user") + 1]
+
+    rootful, _env = _container_worker_command(profiler_env, [0], exchange_dir)
+    assert user(rootful) == f"{os.getuid()}:{os.getgid()}"
+    monkeypatch.setattr("profiling.exec.container_user.rootless_runtime", lambda: True)
+    rootless, _env = _container_worker_command(profiler_env, [0], exchange_dir)
+    assert user(rootless) == "0:0"
+
+
+@pytest.mark.parametrize(
+    ("security_options", "rootless"),
+    [
+        ('["name=seccomp,profile=default","name=rootless","name=cgroupns"]', True),
+        ('["name=seccomp,profile=builtin","name=cgroupns"]', False),
+    ],
+)
+def test_rootless_runtime_reads_docker_info(monkeypatch, security_options, rootless) -> None:
+    import subprocess
+
+    real_rootless_runtime.cache_clear()
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess([], 0, stdout=security_options),
+    )
+    try:
+        assert real_rootless_runtime() is rootless
+    finally:
+        real_rootless_runtime.cache_clear()
