@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import pytest
 
-from alignment.timing_predict_input.engine_text import _validated_shape
+from alignment.timing_predict_input.engine_text import TruncatedDraft, _validated_shape, build_cases
 
 
 def recompute_metric():
@@ -52,3 +52,45 @@ def test_recompute_requires_matching_observed_evidence(defect):
         metric["decode_kv_lens"][1] = -1
     with pytest.raises(ValueError):
         _validated_shape(metric, "test", 5)
+
+
+def truncated_draft_detail():
+    return {
+        "iteration": 7,
+        "ranges": [{"phase": "forward", "kernel_count": 10}],
+        "metrics": {
+            "input_adapter": "vllm_text", "schema_version": 4,
+            "prefill_chunk_pairs": [], "prefill_tokens": 0,
+            "decode_requests": 1, "decode_tokens_scheduled": 5,
+            "decode_kv_lens": [131066], "decode_query_lens": [5],
+            "decode_request_progress": [
+                {"kv_len": 131066, "query_len": 5, "drafted_tokens": 4,
+                 "accepted_draft_tokens": 4},
+            ],
+        },
+    }
+
+
+def test_truncated_draft_step_is_excluded_by_name():
+    """At max_model_len the engine drafts fewer positions; that step has no
+    uniform-width prediction and is excluded with its reason, not repaired."""
+    detail = truncated_draft_detail()
+    with pytest.raises(TruncatedDraft):
+        _validated_shape(detail["metrics"], "test", 5)
+    full = deepcopy(detail)
+    full["iteration"] = 8
+    full["metrics"].update(decode_tokens_scheduled=6, decode_kv_lens=[100],
+                           decode_query_lens=[6], decode_request_progress=None)
+    cases, case_map, excluded = build_cases(
+        {"iteration_details": [detail, full]}, "forward", draft_tokens=5
+    )
+    assert [item["measured_iteration"] for item in case_map] == [8]
+    assert excluded == [{"iteration": 7, "reason": "iteration 7: draft truncated to 4 of 5 tokens"}]
+
+
+def test_short_query_without_truncation_evidence_still_fails():
+    metric = truncated_draft_detail()["metrics"]
+    metric["decode_request_progress"][0]["drafted_tokens"] = 5
+    with pytest.raises(ValueError) as error:
+        _validated_shape(metric, "test", 5)
+    assert not isinstance(error.value, TruncatedDraft)
