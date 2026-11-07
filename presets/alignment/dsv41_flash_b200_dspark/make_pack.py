@@ -35,7 +35,12 @@ on every case (rendered from the case). Changed per the alignment skill:
   with `ceil(s / 6) * 6 <= chunk` (vllm/config/vllm.py `_split_cudagraph_capture_sizes`). The arch block
   carries the same token list.
 - `warmup: true` on the timed passes (req-frontend's bounded warmup + prefix-cache reset), so no
-  DeepGEMM/Triton JIT lands inside the measured window.
+  DeepGEMM/Triton JIT lands inside the measured window. The trace warmup does not reach every M bucket of the
+  DSpark draft's eager MXFP8 context projections, whose CuTe DSL tactics JIT-compile on first use per process
+  (logs/20261107_0_dsv41_arch_design/dp4_host_stalls.md); the job wrapper therefore also sends one prompt per
+  FlashInfer M bucket up to the chunk, plus one past 32K, to every DP rank before measurement
+  (logs/20261107_1_dsv41_dspark_align_pack/warm_draft_buckets.py), and `--jit-monitor-verbose` logs every
+  in-inference compile so a pass with one inside the measured window is found and rerun.
 
 Calibrated case values start `provisional` and are replaced from each case's own workload pass:
 `speculative_acceptance` from `spec_decode_metrics.json`, `attn_gpu_memory_gb` from the server log's
@@ -128,6 +133,8 @@ def variant(topo: str, chunk: int) -> dict:
             "--kv-cache-dtype", "fp8",
             "--seed", "0",
             "--generation-config", "vllm",
+            # Log every in-inference JIT compile (not just the first), to audit the measured window.
+            "--jit-monitor-verbose",
             "--engram-config", '{"cpu_offload": true}',
             "--cudagraph-capture-sizes", *[str(s) for s in sizes],
             "--speculative-config", json.dumps({"method": "dspark", "num_speculative_tokens": DRAFT},

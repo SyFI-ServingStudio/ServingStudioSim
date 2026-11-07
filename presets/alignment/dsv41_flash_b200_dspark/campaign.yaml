@@ -56,6 +56,7 @@ variants:
       - '0'
       - --generation-config
       - vllm
+      - --jit-monitor-verbose
       - --engram-config
       - '{"cpu_offload": true}'
       - --cudagraph-capture-sizes
@@ -430,6 +431,7 @@ variants:
       - '0'
       - --generation-config
       - vllm
+      - --jit-monitor-verbose
       - --engram-config
       - '{"cpu_offload": true}'
       - --cudagraph-capture-sizes
@@ -836,6 +838,7 @@ variants:
       - '0'
       - --generation-config
       - vllm
+      - --jit-monitor-verbose
       - --engram-config
       - '{"cpu_offload": true}'
       - --cudagraph-capture-sizes
@@ -1306,6 +1309,7 @@ variants:
       - '0'
       - --generation-config
       - vllm
+      - --jit-monitor-verbose
       - --engram-config
       - '{"cpu_offload": true}'
       - --cudagraph-capture-sizes
@@ -1680,6 +1684,7 @@ variants:
       - '0'
       - --generation-config
       - vllm
+      - --jit-monitor-verbose
       - --engram-config
       - '{"cpu_offload": true}'
       - --cudagraph-capture-sizes
@@ -2086,6 +2091,7 @@ variants:
       - '0'
       - --generation-config
       - vllm
+      - --jit-monitor-verbose
       - --engram-config
       - '{"cpu_offload": true}'
       - --cudagraph-capture-sizes
