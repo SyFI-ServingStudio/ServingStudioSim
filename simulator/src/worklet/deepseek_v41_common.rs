@@ -11,12 +11,34 @@
 //!   bytes it reads and writes per token; the source anchor is on the config
 //!   field that builds it.
 //! - The NCCL AllGather stand-in (see [`all_gather_as_all_reduce_bytes`]).
+//! - The small-batch mHC overlap boundary ([`MhcOverlapBoundary`]).
+
+use std::sync::Arc;
 
 use crate::common::Fabric;
 use crate::op::attention::byte_rate_placeholder_shape;
+use crate::op::mhc::{MhcTerminalPostConfig, MhcTerminalPostInput, MhcTerminalPostOp};
 use crate::op::Op;
-use crate::timing::kernels::{AllReduceKernelConfig, ElementwiseKernelConfig};
-use crate::timing::{CostNode, CostTreeBuilder, Evaluator, LeafMetrics, Probe, SlotInput};
+use crate::timing::bridge::DType;
+use crate::timing::kernels::{
+    AllReduceKernelConfig, ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
+    MhcPreRmsNormKernel, MhcRmsNormKernelConfig, MhcRmsNormKernelInput,
+};
+use crate::timing::{
+    BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
+    SlotInput,
+};
+
+/// `MHC_OVERLAP_MAX_TOKENS` (fork `models/deepseek_v41/nvidia/ops/mhc.py:36`):
+/// the decoder layer moves the mHC coefficient generation to a side stream
+/// only for `0 < T <= 16` rows, and only inside FULL CUDA graphs
+/// (`nvidia/model.py` `DeepseekV4DecoderLayer.forward`, the `mhc_stream` gate).
+pub const MHC_OVERLAP_MAX_TOKENS: u32 = 16;
+
+/// Whether a forward of `rows` (graph-padded) rows takes the mHC overlap path.
+pub fn mhc_overlap_live(full_graph: bool, rows: u32) -> bool {
+    full_graph && rows > 0 && rows <= MHC_OVERLAP_MAX_TOKENS
+}
 
 /// `VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD` (fork `envs.py:299`, read in
 /// `model_executor/layers/fused_moe/runner/shared_experts.py:111-116`): the
@@ -50,6 +72,153 @@ pub fn attention_aux_stream_live(
     decode_only && num_tokens > 0 && num_tokens <= max_full_graph_tokens
 }
 
+/// Static identity of one mHC overlap boundary.
+#[derive(Clone, Debug)]
+pub struct MhcOverlapBoundaryConfig {
+    pub hidden_size: Dim,
+    pub hc_mult: u32,
+    pub gpu_name: String,
+    /// Backends of the unfused TileLang mHC kinds (`vllm_tilelang`).
+    pub mhc_tilelang_backends: Vec<&'static str>,
+    pub elementwise_backends: Vec<&'static str>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MhcOverlapBoundaryResolved {
+    pub post: MhcTerminalPostConfig,
+    pub pre_input: ElementwiseKernelConfig,
+    pub coefficients: MhcRmsNormKernelConfig,
+}
+
+/// One mHC boundary on the overlap path (`ops/mhc.py` `mhc_shifted_post_pre`
+/// with a `stream`, then `mhc_pre_delayed_overlap`), replacing one fused
+/// `mega_mhc` launch:
+///
+/// - on the caller stream, `mhc_post_tilelang` (the previous sublayer's post)
+///   and the pre epilogue's `split_mode="input"` launch, which writes the
+///   block input this sublayer consumes;
+/// - on the mHC side stream, `tf32_hc_prenorm_gemm` plus the epilogue's
+///   `split_mode="stats"` launch, which produce the next mixes. The caller
+///   joins that stream only after the sublayer body
+///   (`torch.cuda.current_stream().wait_stream(mhc_stream)` after the attention
+///   and after the FFN), so the side branch runs beside the whole body.
+///
+/// The TP all-reduce in front of the post stays the body's own all-reduce
+/// launch: under `--enable-expert-parallel` `supports_mhc_all_reduce` is false
+/// and no fused all-reduce + mHC kernel exists.
+///
+/// Pricing from existing kinds: the post is [`MhcTerminalPostOp`]
+/// (`mhc_fused_post_pre_rms_norm` minus `mhc_pre_rms_norm`, TileLang); the
+/// side branch is one `mhc_pre_rms_norm/vllm_tilelang` call, which is the same
+/// prenorm GEMM plus pre epilogue; the input-mode epilogue has no kind of its
+/// own and is a byte placeholder (hc streams and mixes in, one block input
+/// out).
+pub struct MhcOverlapBoundary {
+    pub post: MhcTerminalPostOp,
+    pub pre_input: Op<ElementwiseKernel>,
+    pub coefficients: Op<MhcPreRmsNormKernel>,
+}
+
+impl MhcOverlapBoundary {
+    pub fn resolve(cfg: &MhcOverlapBoundaryConfig) -> MhcOverlapBoundaryResolved {
+        let hidden = cfg.hidden_size.get();
+        let mhc = MhcRmsNormKernelConfig {
+            backends: cfg.mhc_tilelang_backends.clone(),
+            gpu_name: cfg.gpu_name.clone(),
+            hidden_size: cfg.hidden_size.clone(),
+            hc_mult: cfg.hc_mult,
+            hidden_dtype: DType::Bf16,
+        };
+        let mix_bytes = (2 + cfg.hc_mult) * cfg.hc_mult * 4;
+        MhcOverlapBoundaryResolved {
+            post: MhcTerminalPostConfig {
+                mhc: mhc.clone(),
+                pre_backends: cfg.mhc_tilelang_backends.clone(),
+                fused_backends: cfg.mhc_tilelang_backends.clone(),
+            },
+            pre_input: placeholder(
+                &cfg.elementwise_backends,
+                &cfg.gpu_name,
+                cfg.hc_mult * hidden * 2 + mix_bytes,
+                hidden * 2,
+            ),
+            coefficients: mhc,
+        }
+    }
+
+    pub fn build(
+        name: &str,
+        resolved: MhcOverlapBoundaryResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let pre_input = format!("{name}.mhc_overlap.pre_input");
+        let coefficients = format!("{name}.mhc_overlap.coefficients");
+        Ok(Self {
+            post: MhcTerminalPostOp::build(
+                format!("{name}.mhc_overlap.post"),
+                resolved.post,
+                bridge,
+            )?,
+            pre_input: Op::new(
+                pre_input.clone(),
+                Arc::new(ElementwiseKernel::build(
+                    pre_input,
+                    resolved.pre_input,
+                    bridge,
+                )?),
+            ),
+            coefficients: Op::new(
+                coefficients.clone(),
+                Arc::new(MhcPreRmsNormKernel::build(
+                    coefficients,
+                    resolved.coefficients,
+                    bridge,
+                )?),
+            ),
+        })
+    }
+
+    /// The caller-stream launches that replace the fused entry.
+    pub fn compile_entry(&self, b: &mut CostTreeBuilder) -> Vec<CostNode> {
+        vec![self.post.compile(b), self.pre_input.compile(b)]
+    }
+
+    /// The body with the side-stream coefficient branch beside it (and its
+    /// serial copy for the serial-stream counterfactual). Compile the body's
+    /// children before calling this.
+    pub fn compile_beside(&self, body: Vec<CostNode>, b: &mut CostTreeBuilder) -> CostNode {
+        let side = self.coefficients.compile(b);
+        let serial = compile_serial_copy(&self.coefficients, b);
+        gated_fanout(body, vec![side], vec![serial])
+    }
+
+    pub fn eval_entry(&self, rows: u32, live: bool, ev: &mut Evaluator) {
+        self.post.eval(
+            &MhcTerminalPostInput {
+                num_tokens: if live { rows } else { 0 },
+            },
+            ev,
+        );
+        eval_or_zero(
+            &self.pre_input,
+            ElementwiseKernelInput { num_tokens: rows },
+            !live,
+            ev,
+        );
+    }
+
+    pub fn eval_side(&self, rows: u32, live: bool, serialize_streams: bool, ev: &mut Evaluator) {
+        let input = MhcRmsNormKernelInput { num_tokens: rows };
+        eval_or_zero(
+            &self.coefficients,
+            input.clone(),
+            !live || serialize_streams,
+            ev,
+        );
+        eval_or_zero(&self.coefficients, input, !live || !serialize_streams, ev);
+    }
+}
+
 /// Message size that makes the `all_reduce` NCCL curve stand in for a ring
 /// AllGather producing `gathered_bytes` per rank.
 ///
@@ -63,7 +232,7 @@ pub fn all_gather_as_all_reduce_bytes(gathered_bytes: u64) -> u64 {
     gathered_bytes.div_ceil(2)
 }
 
-pub(super) fn nccl_all_gather_proxy(
+pub(crate) fn nccl_all_gather_proxy(
     backends: &[&'static str],
     gpu_name: &str,
     num_gpus: u32,
@@ -79,7 +248,7 @@ pub(super) fn nccl_all_gather_proxy(
 /// An elementwise byte placeholder, shaped by
 /// [`byte_rate_placeholder_shape`] (high fan-in reduces stream their bytes
 /// evenly so the `triton` runner measures bandwidth, not a serial loop).
-pub(super) fn placeholder(
+pub(crate) fn placeholder(
     backends: &[&'static str],
     gpu_name: &str,
     input_bytes_per_token: u32,
@@ -95,7 +264,7 @@ pub(super) fn placeholder(
     }
 }
 
-pub(super) fn eval_or_zero<K>(op: &Op<K>, input: K::Input, zero: bool, ev: &mut Evaluator)
+pub(crate) fn eval_or_zero<K>(op: &Op<K>, input: K::Input, zero: bool, ev: &mut Evaluator)
 where
     K: Probe,
     K::Input: Clone + Into<SlotInput>,
@@ -108,7 +277,7 @@ where
 }
 
 /// The serial copy of a gated side-branch leaf: same kernel, suffixed name.
-pub(super) fn compile_serial_copy<K: Probe>(op: &Op<K>, builder: &mut CostTreeBuilder) -> CostNode {
+pub(crate) fn compile_serial_copy<K: Probe>(op: &Op<K>, builder: &mut CostTreeBuilder) -> CostNode {
     builder.leaf(
         format!("{}.{SERIAL_COPY_SUFFIX}", op.name),
         op.kernel.kind(),
@@ -120,7 +289,7 @@ pub(super) fn compile_serial_copy<K: Probe>(op: &Op<K>, builder: &mut CostTreeBu
 ///
 /// Each element of `concurrent` is one side stream's branch; `serial` holds
 /// the same branches' serial copies. With no side branch this is just `main`.
-pub(super) fn gated_fanout(
+pub(crate) fn gated_fanout(
     main: Vec<CostNode>,
     concurrent: Vec<CostNode>,
     serial: Vec<CostNode>,

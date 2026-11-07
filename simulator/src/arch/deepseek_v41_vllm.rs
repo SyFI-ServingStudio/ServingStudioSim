@@ -121,6 +121,7 @@ const ENGRAM_TABLE_ROWS_RANK0: u64 = 96_000_564;
 const ENGRAM_WKV_OUT: u32 = 25_600;
 
 const MHC_BACKENDS: &[&str] = &["deepgemm_mega"];
+const MHC_TILELANG_BACKENDS: &[&str] = &["vllm_tilelang"];
 const MXFP8_GEMM_BACKENDS: &[&str] = &["flashinfer_mxfp8"];
 const FP32_GEMM_BACKENDS: &[&str] = &["torch_cublas"];
 const KV_INSERT_BACKENDS: &[&str] = &["vllm_cuda"];
@@ -922,6 +923,7 @@ fn layer_config(
             prefill_chunk_size: PREFILL_CHUNK_SIZE,
             gpu_name: gpu.clone(),
             mhc_backends: MHC_BACKENDS.to_vec(),
+            mhc_tilelang_backends: MHC_TILELANG_BACKENDS.to_vec(),
             gemm_backends: MXFP8_GEMM_BACKENDS.to_vec(),
             fp32_gemm_backends: FP32_GEMM_BACKENDS.to_vec(),
             kv_insert_backends: KV_INSERT_BACKENDS.to_vec(),
@@ -945,6 +947,7 @@ fn layer_config(
                 .into(),
             gpu_name: gpu,
             mhc_backends: MHC_BACKENDS.to_vec(),
+            mhc_tilelang_backends: MHC_TILELANG_BACKENDS.to_vec(),
             router_backends: FP32_GEMM_BACKENDS.to_vec(),
             gemm_backends: MXFP8_GEMM_BACKENDS.to_vec(),
             moe_backends: MOE_BACKENDS.to_vec(),
@@ -1056,6 +1059,7 @@ impl DeepseekV41LayerBody {
         self.ffn.eval(
             &DeepseekV41MoeFfnEpWorkletInput {
                 num_tokens: input.rows,
+                mhc_overlap: false,
             },
             evaluator,
         );
@@ -1339,6 +1343,8 @@ fn normalize_input(
             prefill_query_context_pairs,
             decode_kv_lens: group.decode_kv_lens.clone(),
             aux_stream_live: attention_aux_stream_live(decode_only, rows, MAX_FULL_GRAPH_TOKENS),
+            mhc_overlap: false,
+            write_kv_only: false,
         },
     })
 }
@@ -1368,6 +1374,8 @@ fn bounded_replay_input(full: &NormalizedInput, window: u32) -> NormalizedInput 
             prefill_query_context_pairs,
             decode_kv_lens: full.attention.decode_kv_lens.clone(),
             aux_stream_live: attention_aux_stream_live(decode_only, rows, MAX_FULL_GRAPH_TOKENS),
+            mhc_overlap: false,
+            write_kv_only: false,
         },
     }
 }
@@ -1687,7 +1695,7 @@ mod tests {
             .slots
             .iter()
             .zip(&times)
-            .filter(|(s, _)| !s.name.ends_with(&serial))
+            .filter(|(s, _)| !s.name.ends_with(&serial) && !s.name.contains(".mhc_overlap."))
             .collect();
         let count = |kind: &str| -> u32 {
             launches
