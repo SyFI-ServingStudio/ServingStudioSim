@@ -34,12 +34,14 @@
 //!    compress_norm s47917 851.17-855.23 under wq_b s19 850.05-857.82; NVFP4
 //!    insert s47917 862.11-864.83 under wk s19 860.26-863.74 (overlap). Mixed
 //!    288 and 310: both on s19 after the KV insert (4128.57 / 3854.69; serial).
-//! 6. indexer scoring (index sources), then mega attention (prefill segment,
-//!    decode segment), the `wo_a` MXFP8 einsum, `wo_b`, and the all-reduce.
-//!    All serial on the main stream in every iteration inspected.
+//! 6. indexer scoring (index sources), then the decode global top-k remap
+//!    (compressed layers, its own elementwise placeholder leaf), mega attention
+//!    (prefill segment, decode segment), the `wo_a` MXFP8 einsum, `wo_b`, and
+//!    the all-reduce. All serial on the main stream in every iteration
+//!    inspected.
 //!
-//! Folded, no leaf: the position cast before attention, the global top-k remap
-//! (into the mega-attention op) and the per-layer attention metadata.
+//! Folded, no leaf: the position cast before attention and the per-layer
+//! attention metadata.
 //!
 //! Two per-call modes change which slots carry time (the tree is fixed):
 //!
