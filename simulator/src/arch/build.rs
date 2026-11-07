@@ -1009,8 +1009,9 @@ pub fn deepseek_v4_vllm(
 /// routed layers, verify width 1 (no speculative decoding). The MoE rows were
 /// profiled on the capture's token corpus, so `routing = corpus` is the
 /// production choice. `serialize_streams` changes only CostTree composition;
-/// `decoder_swa_bounded_replay` (a counterfactual, see
-/// [`deepseek_v41_vllm::BoundedReplay`]) changes only the late layers' inputs.
+/// `decoder_swa_bounded_replay` (vLLM's default, see
+/// [`deepseek_v41_vllm::BoundedReplay`]) adds the replay boundary and runs the
+/// layers from the cut on the replay batch.
 #[allow(clippy::too_many_arguments)]
 pub fn deepseek_v41_vllm(
     model_spec: &ModelSpec,

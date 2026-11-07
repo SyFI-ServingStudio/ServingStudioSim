@@ -34,10 +34,8 @@ pools:
           # Recorded per-token expert routes from the capture's token_corpus pass.
           routing: corpus
           token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
-          # What-if, default false (= the captured vLLM): decoder SWA bounded
-          # replay (vLLM PR #58132 / SGLang --enable-decoder-swa-bounded-replay).
-          # Layers past the last KV source (21-39) run only each prefill chunk's
-          # last sliding_window (128) extend tokens. No capture backs it.
+          # The captured vLLM predates decoder SWA bounded replay (the arch
+          # default, on in the current fork): pinned off here.
           decoder_swa_bounded_replay: false
         worker:
           type: chunked_prefill

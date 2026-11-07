@@ -8,7 +8,8 @@
 # 131072 pool less about 5.4 GB of workspace sized by max_model_len (FlashMLA
 # prefill 0.61 -> 4.84 GB, the indexer K gather about 1.2 GB more).
 # gpu_time_multiplier is the capture-2 kernel alignment's (al_6e04cf7b...).
-# decoder_swa_bounded_replay is the arch preset's what-if (no capture behind it).
+# decoder_swa_bounded_replay: vLLM's default in the current fork; false is the
+# vLLM the 20260924 capture ran.
 deployment: unified
 pools:
   main:
