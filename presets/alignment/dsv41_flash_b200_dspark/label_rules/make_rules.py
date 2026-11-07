@@ -261,7 +261,7 @@ if TP:
     R("ncclDevKernel_AllGather", "head.logits_all_gather", ["head.logits_all_gather"], "collective",
       "target logits all-gather", phase="sample", sync=True)
 for frag in ("_compute_local_logits_stats_kernel", "_rejection_kernel", "_resample_kernel", "_insert_resampled_kernel"):
-    R(frag, "sample.verify", ["sample.logits_fp32_cast", "sample.rejection_logits_stats", "sample.resample"],
+    R(frag, "sample.verify", ["sample.rejection_logits_stats", "sample.resample"],
       "model", "speculative verification: logits stats, rejection, resample", phase="sample", excl=None)
 
 # ---------------- DSpark draft (one compute op + one collective op) ----------------
@@ -291,5 +291,40 @@ else:
         R(frag, "dspark.collectives", ["routed.dispatch_all_gather", "routed.combine_reduce_scatter"],
           "collective", "DSpark draft MoE EP dispatch all-gather and combine reduce-scatter", phase="draft",
           sync=True, excl=["unified.layer"])
+
+# ---------------- step plumbing (elementwise placeholders, one op per phase) ----------------
+# Call sites: simulator/src/arch/deepseek_v41_dspark_plumbing.rs. Only kernels whose call site is
+# pinned down are claimed; the forward bf16 copies, `_apply_write_kernel` and the mixed-step int
+# ops stay unmapped.
+def plumbing_slots(phase):
+    out = sorted({sl["name"].split(".plumbing.", 1)[1] for sec in MANIFEST["sections"] for sl in sec["slots"]
+                  if f".plumbing.{phase}." in sl["name"]})
+    return ["plumbing." + n for n in out]
+
+
+DIRECT_COPY = "gpu_kernel_impl_nocast<at::native::direct_copy"
+PLUMBING = {
+    "preprocess": ["_compute_swa_indices_and_lens_kernel", "compare_scalar_kernel<long>",
+                   "sm100_paged_mqa_logits_metadata", "FillFunctor<int>", "FillFunctor<long>",
+                   "_gather_block_tables_kernel", "_combine_sampled_and_draft_tokens_kernel",
+                   "_compute_slot_mappings_kernel", "_gather_lookback_kernel",
+                   "_indexer_decode_metadata_kernel", "_token_request_mapping_kernel"],
+    "forward": ["FillFunctor<int>"],
+    "sample": [DIRECT_COPY, "vectorized_gather_kernel", "_gather_draft_sampled_kernel",
+               "CUDAFunctorOnSelf_add<int>", "_get_num_sampled_and_rejected_kernel"],
+    "draft": ["_prepare_dflash_inputs_kernel", "compare_scalar_kernel<long>", "_token_request_mapping_kernel",
+              DIRECT_COPY, "vectorized_gather_kernel", "gpu_index_kernel"],
+    "bookkeep": ["_post_update_kernel"],
+}
+for phase, frags in PLUMBING.items():
+    slots = plumbing_slots(phase)
+    if not slots:
+        continue
+    role = f"step plumbing ({phase}): metadata, input prep and bookkeeping launches"
+    for frag in frags:
+        R(frag, f"plumbing.{phase}", slots, "model", role, phase=phase, excl=None)
+    if phase in ("preprocess", "draft"):
+        # The anonymous compressed-slot-mapping / DSpark noncausal SWA index launches.
+        R("kernel", f"plumbing.{phase}", slots, "model", role, phase=phase, excl=None, name_exact=True)
 
 json.dump({"schema_version": 2, "note": __doc__.strip(), "rules": rules}, sys.stdout, indent=1)
