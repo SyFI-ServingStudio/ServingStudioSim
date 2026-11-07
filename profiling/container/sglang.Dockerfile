@@ -7,7 +7,7 @@
 # since workers run with --network none. Since 0.7, flashinfer-jit-cache is a
 # metapackage whose dependencies are the per-architecture provider wheels
 # (flashinfer-jit-cache-sm100a, ...) holding the .so files, so it installs with them. Its Rust extensions need a Rust
-# toolchain at build time. Built and tagged by `profiling/container/images.py`.
+# toolchain at build time, and the server crate builds libjpeg-turbo (cmake, nasm). Built and tagged by `profiling/container/images.py`.
 
 ARG CUDA_VERSION=13.0.2
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
@@ -33,9 +33,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        cmake \
         curl \
         git \
         libnuma1 \
+        nasm \
         ninja-build \
         pkg-config \
     && rm -rf /var/lib/apt/lists/* \
