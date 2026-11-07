@@ -41,6 +41,8 @@ from typing import Any
 
 import yaml
 
+from profiling.exec.container_user import container_user
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 IMAGE_NAME = "vllm-align"
@@ -272,24 +274,6 @@ def image_tag(root: Path = REPO_ROOT) -> str:
     return IMAGES[IMAGE_NAME].tag(root)
 
 
-def rootless_runtime() -> bool:
-    """Whether the container runtime maps container root to the invoking user.
-
-    Rootless Docker and Podman (cayenne's Slurm jobs) both report it in
-    `docker info`. There a container uid other than 0 lands on a subordinate
-    host uid, so the outputs written to /out would not be the caller's; root in
-    the container is the caller. A rootful daemon is the opposite: run as the
-    caller's uid, or the outputs belong to host root.
-    """
-    out = subprocess.run(
-        ["docker", "info", "--format", "{{json .SecurityOptions}}"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    return "rootless" in out
-
-
 def docker_argv(
     image: str,
     mounts: Mounts,
@@ -297,9 +281,11 @@ def docker_argv(
     gpu_uuids: list[str],
     cache_dir: Path,
     name: str,
-    rootless: bool,
+    rootless: bool | None = None,
 ) -> list[str]:
-    user = "0:0" if rootless else f"{os.getuid()}:{os.getgid()}"
+    # Container root under a rootless runtime (it is the caller there), else the
+    # caller's uid, so the outputs in /out belong to the caller either way.
+    user = container_user(rootless)
     return [
         "docker",
         "run",
@@ -394,9 +380,7 @@ def run_profile_in_image(config_path: Path, *, image: str | None = None) -> int:
     uuids = gpu_uuids_for_indices([int(token) for token in host_devices])
     cache_dir = _image_cache_dir(tag)
     name = f"vibesim-capture-{os.getpid()}"
-    argv = docker_argv(
-        tag, mounts, gpu_uuids=uuids, cache_dir=cache_dir, name=name, rootless=rootless_runtime()
-    )
+    argv = docker_argv(tag, mounts, gpu_uuids=uuids, cache_dir=cache_dir, name=name)
     image_id = subprocess.run(
         ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
         capture_output=True,
