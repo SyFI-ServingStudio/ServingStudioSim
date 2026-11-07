@@ -1068,6 +1068,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
     token_corpus_file: Option<&str>,
     max_model_len: Option<u32>,
     decoder_swa_bounded_replay: bool,
+    cudagraph_capture_sizes: &[u32],
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1081,6 +1082,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
             model_cfg.max_position_embeddings,
         )?,
         decoder_swa_bounded_replay,
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
     };
     let source = ExpertDemandSource {
         kind: routing_kind,
@@ -2339,6 +2341,7 @@ pub fn build_iter_model(
             token_corpus_file,
             max_model_len,
             decoder_swa_bounded_replay,
+            cudagraph_capture_sizes,
         } => Box::new(deepseek_v41_vllm_dp_attn_ep_moe(
             model,
             *routing,
@@ -2347,6 +2350,7 @@ pub fn build_iter_model(
             token_corpus_file.as_deref(),
             *max_model_len,
             *decoder_swa_bounded_replay,
+            cudagraph_capture_sizes,
             gpu,
             name,
             bridge,

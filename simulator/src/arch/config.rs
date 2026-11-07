@@ -414,7 +414,12 @@ pub enum IterArchSel {
         /// vLLM's decoder SWA bounded replay, as for `deepseek_v41_vllm`;
         /// the DP ranks replay together.
         #[serde(default = "default_decoder_swa_bounded_replay")]
-        decoder_swa_bounded_replay: bool,
+        decoder_swa_bounded_replay: bool,        /// vLLM `--cudagraph-capture-sizes` (per rank). Empty: the captured
+        /// deployment's sizes (1, 2, 4, every 8 to 256, every 16 to 2048).
+        /// Other lists are refused until the TP arch's graph helpers take them.
+        #[serde(default)]
+        #[param(cache_key)]
+        cudagraph_capture_sizes: Vec<u32>,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)

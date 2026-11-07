@@ -104,6 +104,20 @@ pub struct DeepseekV41VllmDpParallel {
     pub max_model_len: u32,
     /// vLLM's decoder SWA bounded replay ([`BoundedReplay`], on by default).
     pub decoder_swa_bounded_replay: bool,
+    /// `--cudagraph-capture-sizes` per rank; empty is the captured
+    /// deployment's list ([`captured_graph_sizes`]), the only one taken yet.
+    pub cudagraph_capture_sizes: Vec<u32>,
+}
+
+/// The captured deployment's `cudagraph_capture_sizes` (server log
+/// `prefill_cudagraph_capture_token_sizes`): 1, 2, 4, every 8 to 256, every
+/// 16 to 2048 -- the sizes the TP arch's graph helpers are written for.
+pub(crate) fn captured_graph_sizes() -> Vec<u32> {
+    [1, 2, 4]
+        .into_iter()
+        .chain((8..=256).step_by(8))
+        .chain((272..=2048).step_by(16))
+        .collect()
 }
 
 /// One body layer's configs: the TP arch's at TP1, with the DP FFN.
@@ -142,6 +156,14 @@ pub fn build_configs(
             "max_model_len must be 1..={} (max_position_embeddings), got {}",
             model.max_position_embeddings, parallel.max_model_len
         )));
+    }
+    if !parallel.cudagraph_capture_sizes.is_empty()
+        && parallel.cudagraph_capture_sizes != captured_graph_sizes()
+    {
+        return Err(fit_failed(
+            "cudagraph_capture_sizes other than the captured list (1, 2, 4, every 8 to 256, \
+             every 16 to 2048) need the TP arch's size-aware graph helpers",
+        ));
     }
     if model.num_experts % DP_SIZE != 0 {
         return Err(fit_failed(format!(
@@ -1058,6 +1080,7 @@ mod tests {
             gpu_name: GPU_NAME.into(),
             max_model_len: 131_072,
             decoder_swa_bounded_replay: true,
+            cudagraph_capture_sizes: Vec::new(),
         }
     }
 
@@ -1252,6 +1275,11 @@ mod tests {
 
     #[test]
     fn invalid_inputs_are_refused() {
+        let mut explicit = parallel();
+        explicit.cudagraph_capture_sizes = captured_graph_sizes();
+        assert!(build_configs(&cfg(), &explicit, &uniform_demand()).is_ok());
+        explicit.cudagraph_capture_sizes = vec![1, 2, 4, 8];
+        assert!(build_configs(&cfg(), &explicit, &uniform_demand()).is_err());
         assert!(normalize_input(&input(vec![group(&[], &[1])]), 131_072, None).is_err());
         let idle = vec![group(&[], &[]); 4];
         assert!(normalize_input(&input(idle), 131_072, None).is_err());
