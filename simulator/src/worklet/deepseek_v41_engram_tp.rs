@@ -55,7 +55,8 @@ pub struct DeepseekV41EngramTpWorkletResolved {
     pub gathered_bytes_per_token: u64,
     pub mhc_post: ElementwiseKernelConfig,
     pub all_gather: Option<AllReduceKernelConfig>,
-    pub gather_copy: ElementwiseKernelConfig,
+    /// `None` at TP1: no all-gather, so no head-major copy.
+    pub gather_copy: Option<ElementwiseKernelConfig>,
     pub wkv: SingleGemmKernelConfig,
     pub post_wkv: ElementwiseKernelConfig,
     pub hc_prenorm: ElementwiseKernelConfig,
@@ -71,7 +72,7 @@ pub struct DeepseekV41EngramTpWorklet {
     pub name: String,
     pub mhc_post: Op<ElementwiseKernel>,
     pub all_gather: Option<Op<AllReduceKernel>>,
-    pub gather_copy: Op<ElementwiseKernel>,
+    pub gather_copy: Option<Op<ElementwiseKernel>>,
     pub wkv: Op<SingleGemmKernel>,
     pub post_wkv: Op<ElementwiseKernel>,
     pub hc_prenorm: Op<ElementwiseKernel>,
@@ -105,8 +106,9 @@ impl DeepseekV41EngramTpWorklet {
             all_gather: (cfg.tp_size > 1).then(|| {
                 nccl_all_gather_proxy(&cfg.all_gather_backends, gpu, cfg.tp_size)
             }),
-            // The all-gather's rank-major -> head-major contiguous copy.
-            gather_copy: ew(engram_width * 2, engram_width * 2),
+            // The all-gather's rank-major -> head-major contiguous copy
+            // (`tensor_model_parallel_all_gather(out, dim=1)`, only at TP > 1).
+            gather_copy: (cfg.tp_size > 1).then(|| ew(engram_width * 2, engram_width * 2)),
             wkv: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -145,7 +147,10 @@ impl DeepseekV41EngramTpWorklet {
                 Some(config) => Some(op!(AllReduceKernel, config, "all_gather")),
                 None => None,
             },
-            gather_copy: op!(ElementwiseKernel, r.gather_copy, "gather_copy"),
+            gather_copy: match r.gather_copy {
+                Some(config) => Some(op!(ElementwiseKernel, config, "gather_copy")),
+                None => None,
+            },
             wkv: op!(SingleGemmKernel, r.wkv, "wkv"),
             post_wkv: op!(ElementwiseKernel, r.post_wkv, "post_wkv"),
             hc_prenorm: op!(ElementwiseKernel, r.hc_prenorm, "mhc_hc_prenorm"),
@@ -160,7 +165,9 @@ impl DeepseekV41EngramTpWorklet {
         if let Some(all_gather) = &self.all_gather {
             children.push(all_gather.compile(b));
         }
-        children.push(self.gather_copy.compile(b));
+        if let Some(gather_copy) = &self.gather_copy {
+            children.push(gather_copy.compile(b));
+        }
         children.push(self.wkv.compile(b));
         children.push(self.post_wkv.compile(b));
         children.push(self.hc_prenorm.compile(b));
@@ -194,7 +201,9 @@ impl DeepseekV41EngramTpWorklet {
                 ev,
             );
         }
-        eval_or_zero(&self.gather_copy, ew.clone(), zero, ev);
+        if let Some(gather_copy) = &self.gather_copy {
+            eval_or_zero(gather_copy, ew.clone(), zero, ev);
+        }
         eval_or_zero(&self.wkv, SingleGemmKernelInput { m: rows }, zero, ev);
         eval_or_zero(&self.post_wkv, ew.clone(), zero, ev);
         eval_or_zero(&self.hc_prenorm, ew.clone(), zero, ev);
@@ -231,8 +240,8 @@ pub(crate) mod tests {
         assert!(r.all_gather.is_some());
         let mut single = config();
         single.tp_size = 1;
-        assert!(DeepseekV41EngramTpWorklet::resolve_config(&single)
-            .all_gather
-            .is_none());
+        let single = DeepseekV41EngramTpWorklet::resolve_config(&single);
+        assert!(single.all_gather.is_none() && single.gather_copy.is_none());
+        assert!(r.gather_copy.is_some());
     }
 }

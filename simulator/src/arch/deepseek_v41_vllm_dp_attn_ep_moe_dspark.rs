@@ -32,8 +32,8 @@
 
 use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
 use crate::arch::deepseek_v41_vllm::{
-    full_decode_graph_requests, kv_cache_layout, prefill_pairs, BoundedReplay, DeepseekV41ModelCfg,
-    DeepseekV41Step, DeepseekV41VllmParallel, LayerInput, MAX_BATCHED_TOKENS,
+    kv_cache_layout, prefill_pairs, BoundedReplay, DeepseekV41CudaGraphs, DeepseekV41ModelCfg,
+    DeepseekV41Step, DeepseekV41VllmParallel, LayerInput, MAX_NUM_SEQS,
 };
 use crate::arch::deepseek_v41_vllm_dp_attn_ep_moe::{
     self as dp_arch, dp_layer_config, labeled_max, normalize_dp_steps, resolve_layer,
@@ -76,6 +76,8 @@ pub struct DeepseekV41DpDsparkConfigs {
     pub markov: DsparkMarkovStepConfig,
     pub vocab_size: u32,
     pub kv_cache_layout: KvCacheLayout,
+    /// `--cudagraph-capture-sizes` per rank (verify/draft FULL graphs).
+    pub cudagraph_capture_sizes: Vec<u32>,
 }
 
 pub struct DeepseekV41DpDsparkResolved {
@@ -90,6 +92,7 @@ pub struct DeepseekV41DpDsparkResolved {
     markov: DsparkMarkovStepConfig,
     logits: LogitsPlaceholders,
     kv_cache_layout: KvCacheLayout,
+    cudagraph_capture_sizes: Vec<u32>,
 }
 
 /// `target` is lane B's DP expansion; `draft_demand` covers the draft MoE.
@@ -111,18 +114,21 @@ pub fn build_configs(
         serialize_streams: false,
         decoder_swa_bounded_replay: false,
         max_model_len: parallel.max_model_len,
+        max_num_batched_tokens: parallel.max_num_batched_tokens,
+        cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
     };
     let (first, rest) = draft_layer_configs(model, dspark, &local, draft_demand);
     Ok(DeepseekV41DpDsparkConfigs {
         draft_tokens,
         num_draft_layers: dspark.num_draft_layers,
         context_kv: context_kv_config(model, dspark, &first.attention),
-        draft_first: dp_layer_config(first),
-        draft_rest: dp_layer_config(rest),
+        draft_first: dp_layer_config(first, parallel.max_num_batched_tokens),
+        draft_rest: dp_layer_config(rest, parallel.max_num_batched_tokens),
         head: target.head.clone(),
         markov: markov_config(model, dspark, &parallel.gpu_name),
         vocab_size: model.vocab_size,
         kv_cache_layout: kv_cache_layout(model, 1, dspark.num_draft_layers),
+        cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
         target,
     })
 }
@@ -144,6 +150,7 @@ pub fn resolve_configs(configs: DeepseekV41DpDsparkConfigs) -> DeepseekV41DpDspa
         logits: logits_placeholders(configs.vocab_size, &configs.markov.gpu_name),
         markov: configs.markov,
         kv_cache_layout: configs.kv_cache_layout,
+        cudagraph_capture_sizes: configs.cudagraph_capture_sizes,
         target: dp_arch::resolve_configs(&configs.target),
     }
 }
@@ -183,6 +190,8 @@ pub struct DeepseekV41VllmDpDsparkModel {
     draft_tokens: u32,
     num_draft_layers: u32,
     kv_cache_layout: KvCacheLayout,
+    /// Graphs at the verify width (decode query length `draft_tokens + 1`).
+    graphs: DeepseekV41CudaGraphs,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -230,6 +239,11 @@ pub fn build(
         draft_rest: DpLayerBody::build(&dspark, resolved.draft_rest, bridge)?,
         target: dp_arch::build(name.clone(), resolved.target, bridge)?,
         ranks,
+        graphs: DeepseekV41CudaGraphs::new(
+            &resolved.cudagraph_capture_sizes,
+            MAX_NUM_SEQS,
+            &[resolved.draft_tokens + 1],
+        ),
         draft_tokens: resolved.draft_tokens,
         num_draft_layers: resolved.num_draft_layers,
         kv_cache_layout: resolved.kv_cache_layout,
@@ -323,6 +337,7 @@ impl DeepseekV41VllmDpDsparkModel {
         input: &SpeculativeArchInput,
     ) -> std::result::Result<(DpStep, Vec<RankDraft>, DpLayerInput), String> {
         normalize_dp_dspark_input(
+            &self.graphs,
             input,
             self.draft_tokens,
             self.target.max_model_len(),
@@ -389,6 +404,7 @@ impl DeepseekV41VllmDpDsparkModel {
 /// Split one DP speculative step (one group per rank) into the target's DP
 /// step, each rank's sample/draft shapes, and the draft layers' DP batch.
 fn normalize_dp_dspark_input(
+    graphs: &DeepseekV41CudaGraphs,
     input: &SpeculativeArchInput,
     draft_tokens: u32,
     max_model_len: u32,
@@ -430,13 +446,13 @@ fn normalize_dp_dspark_input(
         logits_rows.push(prefill.len() as u32 + decode_tokens);
         steps.push(DeepseekV41Step { prefill, decode });
     }
-    let target = normalize_dp_steps(&steps, verify_width, logits_rows.clone(), replay);
+    let target = normalize_dp_steps(graphs, &steps, verify_width, logits_rows.clone(), replay);
 
     // Every scheduled request drafts a block; an idle rank runs the dummy's
     // one request (a one-token context). Ranks agree on the draft graph.
     let live: Vec<u32> = steps.iter().map(|s| s.request_count().max(1)).collect();
     let busiest = live.iter().copied().max().unwrap_or(1);
-    let graph = full_decode_graph_requests(busiest, verify_width);
+    let graph = graphs.full_decode_requests(busiest, verify_width);
     let ranks: Vec<RankDraft> = steps
         .iter()
         .zip(&live)
@@ -492,14 +508,6 @@ fn normalize_dp_dspark_input(
             }
         })
         .collect();
-    if ranks
-        .iter()
-        .any(|rank| rank.layer.rows > MAX_BATCHED_TOKENS)
-    {
-        return Err(format!(
-            "draft rows exceed the per-rank MoE exchange bound {MAX_BATCHED_TOKENS}"
-        ));
-    }
     let draft = DpLayerInput::new(ranks.iter().map(|rank| rank.layer.clone()).collect());
     Ok((target, ranks, draft))
 }
@@ -570,6 +578,7 @@ mod tests {
 
     use crate::arch::config::ModelSpec;
     use crate::arch::contract::{SpeculativeArchGroupInput, SpeculativeDecodeInput};
+    use crate::arch::deepseek_v41_vllm::vllm_default_cudagraph_capture_sizes;
 
     const CONFIG: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -591,7 +600,8 @@ mod tests {
             gpu_name: "NVIDIA B200".into(),
             max_model_len: 131_072,
             decoder_swa_bounded_replay: true,
-            cudagraph_capture_sizes: Vec::new(),
+            max_num_batched_tokens: 2048,
+            cudagraph_capture_sizes: vllm_default_cudagraph_capture_sizes(2048),
         }
     }
 
@@ -676,7 +686,14 @@ mod tests {
             ],
             tokens_per_source_rank: Vec::new(),
         };
-        let (target, ranks, draft) = normalize_dp_dspark_input(&input, 5, 131_072, None).unwrap();
+        let (target, ranks, draft) = normalize_dp_dspark_input(
+            &DeepseekV41CudaGraphs::new(&parallel().cudagraph_capture_sizes, MAX_NUM_SEQS, &[6]),
+            &input,
+            5,
+            131_072,
+            None,
+        )
+        .unwrap();
         // The target: the idle rank's one-row dummy is not a verify-width
         // decode, so every rank pads to the busiest rank's PIECEWISE size.
         assert!(target.full.ranks.iter().all(|rank| rank.rows == 32));

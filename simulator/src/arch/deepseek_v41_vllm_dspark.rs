@@ -55,11 +55,11 @@ use serde::Deserialize;
 
 use crate::arch::contract::{SpeculativeArchInput, SpeculativeUnifiedModel};
 use crate::arch::deepseek_v41_vllm::{
-    self, full_decode_graph_requests, kv_cache_layout, layer_config, normalize_step, prefill_pairs,
-    BoundedReplay, DeepseekV41LayerConfig, DeepseekV41ModelCfg, DeepseekV41ReplayConfig,
+    self, kv_cache_layout, layer_config, normalize_step, prefill_pairs, BoundedReplay,
+    DeepseekV41CudaGraphs, DeepseekV41LayerConfig, DeepseekV41ModelCfg, DeepseekV41ReplayConfig,
     DeepseekV41Step, DeepseekV41VllmConfigs, DeepseekV41VllmModel, DeepseekV41VllmParallel,
     DeepseekV41VllmResolved, LayerKind, NormalizedInput, ELEMENTWISE_BACKENDS, KV_INSERT_BACKENDS,
-    LM_HEAD_BACKENDS, MXFP8_GEMM_BACKENDS,
+    LM_HEAD_BACKENDS, MAX_NUM_SEQS, MXFP8_GEMM_BACKENDS,
 };
 use crate::arch::kv_layout::KvCacheLayout;
 use crate::op::attention::DeepseekV41CandidateRole;
@@ -183,6 +183,9 @@ pub struct DeepseekV41DsparkConfigs {
     pub markov: DsparkMarkovStepConfig,
     pub vocab_size: u32,
     pub kv_cache_layout: KvCacheLayout,
+    /// `--cudagraph-capture-sizes`: the verify (and draft) FULL graphs'
+    /// request counts derive from it at the verify width.
+    pub cudagraph_capture_sizes: Vec<u32>,
 }
 
 pub struct DeepseekV41DsparkResolved {
@@ -200,6 +203,7 @@ pub struct DeepseekV41DsparkResolved {
     markov: DsparkMarkovStepConfig,
     logits: LogitsPlaceholders,
     kv_cache_layout: KvCacheLayout,
+    cudagraph_capture_sizes: Vec<u32>,
 }
 
 /// The draft MoE geometry over the target's checkpoint facts.
@@ -377,6 +381,7 @@ pub fn build_configs(
         markov: markov_config(model, dspark, &parallel.gpu_name),
         vocab_size: model.vocab_size,
         kv_cache_layout: kv_cache_layout(model, parallel.tp_size, dspark.num_draft_layers),
+        cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
         target,
     })
 }
@@ -404,6 +409,7 @@ pub fn resolve_configs(configs: DeepseekV41DsparkConfigs) -> DeepseekV41DsparkRe
         markov: configs.markov,
         logits,
         kv_cache_layout: configs.kv_cache_layout,
+        cudagraph_capture_sizes: configs.cudagraph_capture_sizes,
         target: deepseek_v41_vllm::resolve_configs(&configs.target),
     }
 }
@@ -696,6 +702,8 @@ pub struct DeepseekV41VllmDsparkModel {
     /// Positions drafted per request (5); the verify width is one more.
     draft_tokens: u32,
     max_model_len: u32,
+    /// Graphs at the verify width (decode query length `draft_tokens + 1`).
+    graphs: DeepseekV41CudaGraphs,
     tp_size: u16,
     kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
@@ -721,6 +729,11 @@ pub fn build(
         draft,
         draft_tokens,
         max_model_len,
+        graphs: DeepseekV41CudaGraphs::new(
+            &resolved.cudagraph_capture_sizes,
+            MAX_NUM_SEQS,
+            &[draft_tokens + 1],
+        ),
         tp_size,
         kv_cache_layout,
         cost_flat: Vec::new(),
@@ -769,6 +782,7 @@ impl DeepseekV41VllmDsparkModel {
         input: &SpeculativeArchInput,
     ) -> std::result::Result<(NormalizedInput, u32, DraftStep), String> {
         normalize_dspark_input(
+            &self.graphs,
             input,
             self.draft_tokens,
             self.max_model_len,
@@ -798,6 +812,7 @@ impl DeepseekV41VllmDsparkModel {
 /// Split one speculative step into the target verify input, the decode
 /// request count the sampler resamples, and the draft call's shapes.
 fn normalize_dspark_input(
+    graphs: &DeepseekV41CudaGraphs,
     input: &SpeculativeArchInput,
     draft_tokens: u32,
     max_model_len: u32,
@@ -835,13 +850,13 @@ fn normalize_dspark_input(
     // Every prefill chunk yields one logits row; every verify row one more.
     let logits_rows = prefill.len() as u32 + decode_tokens;
     let step = DeepseekV41Step { prefill, decode };
-    let target = normalize_step(&step, draft_tokens + 1, logits_rows, replay);
+    let target = normalize_step(graphs, &step, draft_tokens + 1, logits_rows, replay);
 
     // Every scheduled request drafts a block. The draft forward is one FULL
     // graph keyed by the request count (the verify width's capture sizes);
     // past the largest it runs eager at the live count.
     let live = step.request_count();
-    let graph = full_decode_graph_requests(live, draft_tokens + 1);
+    let graph = graphs.full_decode_requests(live, draft_tokens + 1);
     let requests = if live == 0 { 0 } else { graph.unwrap_or(live) };
     let rows = requests * draft_tokens;
     // Each draft row attends its request's window plus the block before it.
@@ -967,6 +982,8 @@ mod tests {
             serialize_streams: false,
             decoder_swa_bounded_replay: true,
             max_model_len: 131_072,
+            max_num_batched_tokens: 2048,
+            cudagraph_capture_sizes: deepseek_v41_vllm::vllm_default_cudagraph_capture_sizes(2048),
         }
     }
 
@@ -1079,10 +1096,20 @@ mod tests {
         }
     }
 
+    fn graphs() -> DeepseekV41CudaGraphs {
+        DeepseekV41CudaGraphs::new(&parallel().cudagraph_capture_sizes, MAX_NUM_SEQS, &[6])
+    }
+
     #[test]
     fn draft_runs_five_rows_per_padded_request_and_context_kv_every_target_row() {
-        let (target, decode, draft) =
-            normalize_dspark_input(&step(&[(1000, 6); 3], &[(0, 200)]), 5, 131_072, None).unwrap();
+        let (target, decode, draft) = normalize_dspark_input(
+            &graphs(),
+            &step(&[(1000, 6); 3], &[(0, 200)]),
+            5,
+            131_072,
+            None,
+        )
+        .unwrap();
         assert_eq!(decode, 3);
         assert_eq!(target.logits_rows, 1 + 18);
         assert_eq!(draft.context_tokens, 218);
@@ -1091,9 +1118,12 @@ mod tests {
         assert_eq!(draft.attention.decode_kv_lens.len(), 20);
         // Five requests pad to the six-request graph (no 5 at q = 6).
         let (target, _, draft) =
-            normalize_dspark_input(&step(&[(1000, 6); 5], &[]), 5, 131_072, None).unwrap();
+            normalize_dspark_input(&graphs(), &step(&[(1000, 6); 5], &[]), 5, 131_072, None)
+                .unwrap();
         assert_eq!(target.full.rows, 36);
         assert_eq!((draft.requests, draft.rows), (6, 30));
-        assert!(normalize_dspark_input(&step(&[(1000, 6)], &[]), 4, 131_072, None).is_err());
+        assert!(
+            normalize_dspark_input(&graphs(), &step(&[(1000, 6)], &[]), 4, 131_072, None).is_err()
+        );
     }
 }
