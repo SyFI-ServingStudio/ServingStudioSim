@@ -27,7 +27,8 @@
 //! source, candidate, or Engram boundary.
 //!
 //! Step shape (vLLM MRV2, [`normalize_step`]): a uniform decode batch replays
-//! the FULL graph of its padded request count ([`full_decode_graph_requests`]),
+//! the FULL graph of its padded request count ([`DeepseekV41CudaGraphs`], from
+//! the selector's `cudagraph_capture_sizes` and `max_num_seqs`),
 //! any other batch the PIECEWISE graph of its padded token count, and batches
 //! past the capture limit run eager. FULL graphs keep the attention aux stream
 //! and, at most 16 rows, take the mHC overlap path at every fused mHC boundary.
@@ -107,8 +108,9 @@ const ENGRAM_LAYERS: [u32; 2] = [1, 14];
 // Deployment identity (capture 2 `profile.yaml` / server log). Its
 // `--max-model-len 131072` is the selector's `max_model_len`, which the
 // capture presets pin; see [`resolve_max_model_len`].
-/// `max_num_batched_tokens` (= `chunk_size` 2048).
-const MAX_BATCHED_TOKENS: u32 = 2048;
+/// Default `--max-num-batched-tokens` (= `chunk_size` 2048 of the base
+/// captures); the selector's `max_num_batched_tokens` overrides it.
+pub(crate) const MAX_BATCHED_TOKENS: u32 = 2048;
 /// `--block-size 128`: one KV page; an index page holds `128 / ratio` keys.
 const KV_BLOCK_SIZE: u32 = 128;
 /// Index-cache page used to price ratio-1 index layers. Production pages hold
@@ -124,9 +126,6 @@ const PADDED_HEADS: u32 = 64;
 const PREFILL_CHUNK_SIZE: u32 = 4;
 /// `--max-num-seqs 64`: the most requests a FULL decode graph holds.
 pub(crate) const MAX_NUM_SEQS: u32 = 64;
-/// `max_cudagraph_capture_size 2048`: the piecewise graph sizes run by every
-/// iteration up to 2048 tokens pad the dense spine to the next capture size.
-const MAX_CUDAGRAPH_CAPTURE_SIZE: u32 = 2048;
 /// Rows of TP rank 0's Engram table slice (`part_num_embeddings`, server log
 /// `engram.py:269`, layer 1): the lookup kind's exact table identity.
 const ENGRAM_TABLE_ROWS_RANK0: u64 = 96_000_564;
@@ -529,6 +528,11 @@ pub struct DeepseekV41VllmParallel {
     pub decoder_swa_bounded_replay: bool,
     /// Resolved `--max-model-len` (see [`resolve_max_model_len`]).
     pub max_model_len: u32,
+    /// `--max-num-batched-tokens` (the chunk size): the mega attention's
+    /// prefill workspace identity.
+    pub max_num_batched_tokens: u32,
+    /// `--cudagraph-capture-sizes` (PIECEWISE token sizes; empty = eager).
+    pub cudagraph_capture_sizes: Vec<u32>,
 }
 
 /// The selector's `max_model_len`, defaulted to the checkpoint's
@@ -621,7 +625,7 @@ impl BoundedReplay {
     }
 
     /// Whether a body runs on the replay batch. A body may not straddle the cut.
-    fn is_late(&self, layers: &[u32]) -> std::result::Result<bool, BuildError> {
+    pub(crate) fn is_late(&self, layers: &[u32]) -> std::result::Result<bool, BuildError> {
         let late = layers.iter().filter(|&&l| l >= self.cut_layer).count();
         match late {
             0 => Ok(false),
@@ -645,7 +649,7 @@ pub struct DeepseekV41LayerConfig {
 
 /// Fold plan with each body replaced by its index into the body list.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum PlanNode {
+pub(crate) enum PlanNode {
     Body(usize),
     Repeat { n: u32, body: Vec<PlanNode> },
 }
@@ -663,6 +667,8 @@ pub struct DeepseekV41VllmConfigs {
     pub replay: Option<DeepseekV41ReplayConfig>,
     /// Per body: evaluated on the replay batch (all layers at or past the cut).
     pub late_bodies: Vec<bool>,
+    /// The captured graphs, decode query length 1 (no speculation).
+    pub graphs: DeepseekV41CudaGraphs,
 }
 
 /// The bounded-replay boundary: the cut layer's `write_kv` over every row,
@@ -684,7 +690,7 @@ pub struct DeepseekV41ReplayConfig {
 }
 
 impl DeepseekV41ReplayConfig {
-    fn new(
+    pub(crate) fn new(
         rule: BoundedReplay,
         cut_body: usize,
         write_kv: DeepseekV41AttentionTpWorkletConfig,
@@ -724,6 +730,7 @@ pub struct DeepseekV41VllmResolved {
     kv_cache_layout: KvCacheLayout,
     replay: Option<DeepseekV41ReplayResolved>,
     late_bodies: Vec<bool>,
+    graphs: DeepseekV41CudaGraphs,
 }
 
 pub struct DeepseekV41ReplayResolved {
@@ -851,10 +858,11 @@ pub fn build_configs(
         kv_cache_layout: kv_cache_layout(model, parallel.tp_size, 0),
         replay,
         late_bodies,
+        graphs: DeepseekV41CudaGraphs::new(&parallel.cudagraph_capture_sizes, MAX_NUM_SEQS, &[1]),
     })
 }
 
-fn index_plan(
+pub(crate) fn index_plan(
     fold: &[FoldPlan],
     push: &mut impl FnMut(LayerKind, &[u32]) -> usize,
 ) -> Vec<PlanNode> {
@@ -1050,7 +1058,7 @@ pub(crate) fn layer_config(
             },
             swa_block_size: SWA_BLOCK_SIZE,
             max_model_len: parallel.max_model_len,
-            max_num_batched_tokens: MAX_BATCHED_TOKENS,
+            max_num_batched_tokens: parallel.max_num_batched_tokens,
             prefill_chunk_size: PREFILL_CHUNK_SIZE,
             gpu_name: gpu.clone(),
             mhc_backends: MHC_BACKENDS.to_vec(),
@@ -1134,6 +1142,7 @@ pub fn resolve_configs(configs: &DeepseekV41VllmConfigs) -> DeepseekV41VllmResol
                 scatter: replay.scatter.clone(),
             }),
         late_bodies: configs.late_bodies.clone(),
+        graphs: configs.graphs.clone(),
     }
 }
 
@@ -1229,6 +1238,7 @@ pub struct DeepseekV41VllmModel {
     replay_rule: Option<BoundedReplay>,
     replay: Option<DeepseekV41ReplayBoundary>,
     late_bodies: Vec<bool>,
+    graphs: DeepseekV41CudaGraphs,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1289,6 +1299,7 @@ pub fn build(
         replay_rule,
         replay,
         late_bodies: resolved.late_bodies,
+        graphs: resolved.graphs,
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -1441,6 +1452,7 @@ impl DeepseekV41VllmModel {
         let step = DeepseekV41Step::from_unified(batch, self.max_model_len)?;
         let logits_rows = step.request_count();
         Ok(normalize_step(
+            &self.graphs,
             &step,
             1,
             logits_rows,
@@ -1454,6 +1466,12 @@ impl DeepseekV41VllmModel {
 
     pub fn replay_rule(&self) -> Option<&BoundedReplay> {
         self.replay_rule.as_ref()
+    }
+
+    /// The captured graphs (decode query length 1); a speculative wrapper
+    /// derives its own with [`DeepseekV41CudaGraphs::new`] from the same sizes.
+    pub fn graphs(&self) -> &DeepseekV41CudaGraphs {
+        &self.graphs
     }
 
     fn eval_into(&self, batch: &UnifiedArchInput, evaluator: &mut Evaluator) {
@@ -1532,62 +1550,146 @@ pub enum GraphMode {
     Eager,
 }
 
-/// The token-keyed (PIECEWISE) graph sizes: `prefill_cudagraph_capture_token_sizes`
-/// in the server log, 1, 2, 4, then every 8 to 256 and every 16 to 2048.
-fn piecewise_graph_sizes() -> impl Iterator<Item = u32> {
+/// The token-keyed graph sizes vLLM captures by default for a
+/// `max_cudagraph_capture_size` of `max`: 1, 2, 4, then every 8 to 256 and
+/// every 16 above (the server log's `prefill_cudagraph_capture_token_sizes`
+/// at 2048). The selector default is this list at 2048.
+pub fn vllm_default_cudagraph_capture_sizes(max: u32) -> Vec<u32> {
     [1, 2, 4]
         .into_iter()
         .chain((8..=256).step_by(8))
-        .chain((272..=MAX_CUDAGRAPH_CAPTURE_SIZE).step_by(16))
+        .chain((272..=max.max(256)).step_by(16))
+        .filter(|&s| s <= max)
+        .collect()
 }
 
-/// The padded request count of the FULL decode graph a uniform batch of
-/// `requests` requests with `query_len` rows each replays, or `None` when no
-/// FULL graph holds it.
-///
-/// vLLM captures one FULL decode graph per request count in
-/// `decode_cudagraph_capture_request_sizes` = `{min(cdiv(s, q), max_num_seqs)}`
-/// over the shared token sizes `s` with `cdiv(s, q) * q` within the capture
-/// limit (`config/vllm.py`), and a batch takes the smallest one that holds it.
-/// For `q = 1` these are the PIECEWISE sizes up to 64 (11 graphs); for the
-/// DSpark verify width `q = 6`, 41 graphs (1, 2, 3, 4, 6, 7, 8, ..., 59, 62, 64).
-pub(crate) fn full_decode_graph_requests(requests: u32, query_len: u32) -> Option<u32> {
-    if requests == 0 || query_len == 0 || requests > MAX_NUM_SEQS {
-        return None;
-    }
-    piecewise_graph_sizes()
-        .filter(|&s| s.div_ceil(query_len) * query_len <= MAX_CUDAGRAPH_CAPTURE_SIZE)
-        .map(|s| s.div_ceil(query_len).min(MAX_NUM_SEQS))
-        .find(|&n| n >= requests)
+/// The CUDA graphs vLLM's MRV2 runner captures for one deployment
+/// (`config/vllm.py` capture-size defaults, `config/compilation.py`
+/// `decode_cudagraph_capture_shapes`, `v1/worker/gpu/cudagraph_utils.py`
+/// `CudaGraphManager.dispatch`), derived from `--cudagraph-capture-sizes`,
+/// `--max-num-seqs` and the target's decode query lengths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepseekV41CudaGraphs {
+    /// PIECEWISE token sizes, ascending; the last one is the capture limit.
+    token_sizes: Vec<u32>,
+    max_num_seqs: u32,
+    /// Per decode query length, the FULL graphs' request counts, ascending.
+    decode: Vec<(u32, Vec<u32>)>,
 }
 
-/// The graph a step of `query_lens` (one entry per request) launches, and the
-/// rows its dense spine runs. A step is a uniform decode when every request
-/// has exactly `uniform_query_len` rows (1, or the verify width).
-pub(crate) fn step_graph(query_lens: &[u32], uniform_query_len: u32) -> (GraphMode, u32) {
-    let tokens: u32 = query_lens.iter().sum();
-    let requests = query_lens.len() as u32;
-    if query_lens.iter().all(|&q| q == uniform_query_len) {
-        if let Some(padded) = full_decode_graph_requests(requests, uniform_query_len) {
-            return (GraphMode::Full, padded * uniform_query_len);
+impl DeepseekV41CudaGraphs {
+    /// An empty `capture_sizes` captures nothing: every step runs eager.
+    pub fn new(capture_sizes: &[u32], max_num_seqs: u32, decode_query_lens: &[u32]) -> Self {
+        let mut token_sizes: Vec<u32> = capture_sizes.iter().copied().filter(|&s| s > 0).collect();
+        token_sizes.sort_unstable();
+        token_sizes.dedup();
+        let max_tokens = token_sizes.last().copied().unwrap_or(0);
+        // `decode_cudagraph_capture_request_sizes`: the request counts each
+        // query length rounds the shared sizes up to, within the shared bound.
+        let mut request_sizes: Vec<u32> = token_sizes
+            .iter()
+            .flat_map(|&s| {
+                decode_query_lens
+                    .iter()
+                    .filter(move |&&q| q > 0 && s.div_ceil(q) * q <= max_tokens)
+                    .map(move |&q| s.div_ceil(q).min(max_num_seqs))
+            })
+            .collect();
+        request_sizes.sort_unstable();
+        request_sizes.dedup();
+        // `decode_cudagraph_capture_shapes`: per query length up to the most
+        // requests it holds; the first size above the limit is captured at it.
+        let decode = decode_query_lens
+            .iter()
+            .filter(|&&q| q > 0)
+            .map(|&q| {
+                let limit = max_num_seqs.min(max_tokens / q);
+                let reachable = request_sizes.partition_point(|&n| n < limit) + 1;
+                let mut shapes: Vec<u32> = request_sizes
+                    .iter()
+                    .take(reachable)
+                    .map(|&n| n.min(limit))
+                    .filter(|_| limit >= 1)
+                    .collect();
+                shapes.dedup();
+                (q, shapes)
+            })
+            .collect();
+        Self {
+            token_sizes,
+            max_num_seqs,
+            decode,
         }
     }
-    if tokens <= MAX_CUDAGRAPH_CAPTURE_SIZE {
-        (GraphMode::Piecewise, cudagraph_rows(tokens))
-    } else {
-        (GraphMode::Eager, tokens)
-    }
-}
 
-/// The rows a replay batch of `kept` tokens runs at: the smallest replay graph
-/// (`decoder_replay_cudagraph.py`: multiples of `window` up to
-/// `min(max_cudagraph_capture_size, max_num_seqs * window)`), eager above.
-pub(crate) fn replay_graph_rows(kept: u32, window: u32) -> u32 {
-    let bound = MAX_CUDAGRAPH_CAPTURE_SIZE.min(MAX_NUM_SEQS * window);
-    if kept <= bound {
-        kept.div_ceil(window) * window
-    } else {
-        kept
+    /// The largest PIECEWISE graph (0 when nothing is captured).
+    pub fn max_tokens(&self) -> u32 {
+        self.token_sizes.last().copied().unwrap_or(0)
+    }
+
+    pub fn max_num_seqs(&self) -> u32 {
+        self.max_num_seqs
+    }
+
+    /// The PIECEWISE graph a batch of `tokens` pads to, `None` past the limit.
+    pub fn piecewise_rows(&self, tokens: u32) -> Option<u32> {
+        let index = self.token_sizes.partition_point(|&s| s < tokens);
+        self.token_sizes.get(index).copied()
+    }
+
+    /// The FULL decode graphs' request counts for query length `q`.
+    pub fn decode_request_sizes(&self, q: u32) -> &[u32] {
+        self.decode
+            .iter()
+            .find(|(query_len, _)| *query_len == q)
+            .map_or(&[], |(_, sizes)| sizes.as_slice())
+    }
+
+    /// The padded request count of the FULL decode graph a uniform batch of
+    /// `requests` requests with `q` rows each replays (the smallest that holds
+    /// it), or `None` when none does.
+    pub fn full_decode_requests(&self, requests: u32, q: u32) -> Option<u32> {
+        if requests == 0 {
+            return None;
+        }
+        let sizes = self.decode_request_sizes(q);
+        sizes.get(sizes.partition_point(|&n| n < requests)).copied()
+    }
+
+    /// The graph a step of `query_lens` (one entry per request) launches and
+    /// the rows its dense spine runs. A step is a uniform decode when every
+    /// request has exactly `uniform_query_len` rows.
+    pub fn step_graph(&self, query_lens: &[u32], uniform_query_len: u32) -> (GraphMode, u32) {
+        let tokens: u32 = query_lens.iter().sum();
+        let requests = query_lens.len() as u32;
+        if query_lens.iter().all(|&q| q == uniform_query_len) {
+            if let Some(padded) = self.full_decode_requests(requests, uniform_query_len) {
+                return (GraphMode::Full, padded * uniform_query_len);
+            }
+        }
+        match self.piecewise_rows(tokens) {
+            Some(rows) if tokens > 0 => (GraphMode::Piecewise, rows),
+            _ => (GraphMode::Eager, tokens),
+        }
+    }
+
+    /// The rows a replay batch of `kept` tokens runs at
+    /// (`decoder_replay_cudagraph.py`): its graphs step by `window` up to
+    /// `min(max_tokens, max_num_seqs * window)` (wider intervals by 1/8 of the
+    /// power of two); a larger batch runs eager at its size.
+    pub fn replay_rows(&self, kept: u32, window: u32) -> u32 {
+        let bound = self.max_tokens().min(self.max_num_seqs * window);
+        if bound == 0 || window == 0 || kept > bound {
+            return kept;
+        }
+        let mut size = window;
+        while size < bound {
+            if size >= kept {
+                return size;
+            }
+            size += window.max(1 << (32 - size.leading_zeros()).saturating_sub(4));
+        }
+        bound
     }
 }
 
@@ -1687,21 +1789,6 @@ pub struct NormalizedInput {
     pub logits_rows: u32,
 }
 
-/// The CUDA-graph size an iteration of `tokens` runs at (server log
-/// `prefill_cudagraph_capture_token_sizes`: 1, 2, 4, 8, then every 8 to 256,
-/// every 16 to 2048). Larger iterations run eager at their own size.
-pub fn cudagraph_rows(tokens: u32) -> u32 {
-    match tokens {
-        0 => 0,
-        1..=2 => tokens,
-        3..=4 => 4,
-        5..=8 => 8,
-        9..=256 => tokens.div_ceil(8) * 8,
-        257..=MAX_CUDAGRAPH_CAPTURE_SIZE => tokens.div_ceil(16) * 16,
-        _ => tokens,
-    }
-}
-
 /// Decode requests as one-token attention rows: a request of `q` rows ending
 /// at `kv` attends from resident lengths `kv - q .. kv - 1` (the decode
 /// segment flattens each verify row into its own request).
@@ -1712,7 +1799,7 @@ fn decode_rows(decode: &[(u32, u32)]) -> Vec<u32> {
         .collect()
 }
 
-fn layer_input(
+pub(crate) fn layer_input(
     mode: GraphMode,
     rows: u32,
     prefill: Vec<(u32, u32)>,
@@ -1738,6 +1825,7 @@ fn layer_input(
 /// ([`BoundedReplay`]), and the attention batches. `uniform_query_len` is 1
 /// without speculation and the verify width with it.
 pub(crate) fn normalize_step(
+    graphs: &DeepseekV41CudaGraphs,
     step: &DeepseekV41Step,
     uniform_query_len: u32,
     logits_rows: u32,
@@ -1749,10 +1837,10 @@ pub(crate) fn normalize_step(
         .chain(&step.decode)
         .map(|&(q, _)| q)
         .collect();
-    let (mode, rows) = step_graph(&query_lens, uniform_query_len);
+    let (mode, rows) = graphs.step_graph(&query_lens, uniform_query_len);
     let full = layer_input(mode, rows, step.prefill.clone(), &step.decode);
     let replay = replay
-        .and_then(|rule| replay_rows(rule, mode, rows, step))
+        .and_then(|rule| replay_rows(graphs, rule, mode, rows, step))
         .map(|(late_rows, prefill)| {
             layer_input(GraphMode::Piecewise, late_rows, prefill, &step.decode)
         });
@@ -1768,6 +1856,7 @@ pub(crate) fn normalize_step(
 /// rows and trimmed prefill pairs. Decode requests keep all their rows
 /// (`min(q, window)` with `q <= window`).
 pub(crate) fn replay_rows(
+    graphs: &DeepseekV41CudaGraphs,
     rule: &BoundedReplay,
     mode: GraphMode,
     rows: u32,
@@ -1792,7 +1881,7 @@ pub(crate) fn replay_rows(
             .iter()
             .map(|&(q, _)| q.min(rule.window))
             .sum::<u32>();
-    Some((replay_graph_rows(kept, rule.window), prefill))
+    Some((graphs.replay_rows(kept, rule.window), prefill))
 }
 
 #[cfg(test)]
@@ -1840,6 +1929,8 @@ mod tests {
             serialize_streams: false,
             decoder_swa_bounded_replay: true,
             max_model_len: CAPTURED_MAX_MODEL_LEN,
+            max_num_batched_tokens: MAX_BATCHED_TOKENS,
+            cudagraph_capture_sizes: vllm_default_cudagraph_capture_sizes(2048),
         }
     }
 
@@ -2268,30 +2359,66 @@ mod tests {
 
     #[test]
     fn full_decode_graphs_are_keyed_by_request_count() {
-        let sizes = |q: u32| -> Vec<u32> {
-            let mut out: Vec<u32> = (1..=MAX_NUM_SEQS)
-                .filter_map(|r| full_decode_graph_requests(r, q))
-                .collect();
-            out.dedup();
-            out
-        };
         // Server log `decode_cudagraph_capture_request_sizes` (TP4 + DSpark).
         assert_eq!(
-            sizes(6),
+            graphs(&[6]).decode_request_sizes(6),
             [
                 1, 2, 3, 4, 6, 7, 8, 10, 11, 12, 14, 15, 16, 18, 19, 20, 22, 23, 24, 26, 27, 28,
                 30, 31, 32, 34, 35, 36, 38, 39, 40, 42, 43, 46, 48, 51, 54, 56, 59, 62, 64
             ]
         );
-        assert_eq!(sizes(1), [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]);
-        assert_eq!(full_decode_graph_requests(65, 1), None);
-        assert_eq!(full_decode_graph_requests(0, 6), None);
+        let plain = graphs(&[1]);
+        assert_eq!(
+            plain.decode_request_sizes(1),
+            [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]
+        );
+        assert_eq!(plain.full_decode_requests(65, 1), None);
+        assert_eq!(plain.full_decode_requests(0, 1), None);
+        assert_eq!(plain.full_decode_requests(5, 1), Some(8));
 
+        let spec = graphs(&[6]);
         // A verify batch of 5 requests x 6 rows replays the 6-request graph.
-        assert_eq!(step_graph(&[6; 5], 6), (GraphMode::Full, 36));
+        assert_eq!(spec.step_graph(&[6; 5], 6), (GraphMode::Full, 36));
         // A clipped request breaks uniformity: PIECEWISE by tokens.
-        assert_eq!(step_graph(&[6, 6, 4], 6), (GraphMode::Piecewise, 16));
-        assert_eq!(step_graph(&[1; 3], 1), (GraphMode::Full, 4));
+        assert_eq!(spec.step_graph(&[6, 6, 4], 6), (GraphMode::Piecewise, 16));
+        assert_eq!(plain.step_graph(&[1; 3], 1), (GraphMode::Full, 4));
+        assert_eq!(plain.step_graph(&[2049], 1), (GraphMode::Eager, 2049));
+
+        // The sizes follow the configured list: every 128 up to 8192 (the
+        // alignment pack's chunk-8192 capture) makes 8192 tokens PIECEWISE,
+        // and max_num_seqs bounds the FULL graphs.
+        let wide: Vec<u32> = (1..=64).map(|i| i * 128).collect();
+        let wide = DeepseekV41CudaGraphs::new(&wide, 64, &[1, 6]);
+        assert_eq!(wide.max_tokens(), 8192);
+        assert_eq!(wide.step_graph(&[8000], 1), (GraphMode::Piecewise, 8064));
+        // One request-count list serves every query length (`config/vllm.py`).
+        assert_eq!(wide.decode_request_sizes(1), [22, 43, 64]);
+        assert_eq!(wide.full_decode_requests(3, 6), Some(22));
+        assert_eq!(wide.decode_request_sizes(6), [22, 43, 64]);
+        let narrow =
+            DeepseekV41CudaGraphs::new(&vllm_default_cudagraph_capture_sizes(2048), 16, &[1]);
+        assert_eq!(narrow.full_decode_requests(17, 1), None);
+        assert_eq!(narrow.full_decode_requests(9, 1), Some(16));
+        // Nothing captured: every step runs eager.
+        let eager = DeepseekV41CudaGraphs::new(&[], 64, &[1]);
+        assert_eq!(eager.step_graph(&[1; 8], 1), (GraphMode::Eager, 8));
+    }
+
+    #[test]
+    fn replay_graphs_step_by_the_window_up_to_the_bound() {
+        let default = graphs(&[1]);
+        assert_eq!(default.replay_rows(1, 128), 128);
+        assert_eq!(default.replay_rows(264, 128), 384);
+        assert_eq!(default.replay_rows(2048, 128), 2048);
+        assert_eq!(default.replay_rows(2049, 128), 2049);
+        // Past 2048 the steps widen to 1/8 of the power-of-two interval
+        // (256 in [2048, 4096)); the bound is max_num_seqs x window = 8192.
+        let wide: Vec<u32> = (1..=64).map(|i| i * 128).collect();
+        let wide = DeepseekV41CudaGraphs::new(&wide, 64, &[1]);
+        assert_eq!(wide.replay_rows(2049, 128), 2304);
+        assert_eq!(wide.replay_rows(4097, 128), 4608);
+        assert_eq!(wide.replay_rows(8192, 128), 8192);
+        assert_eq!(wide.replay_rows(8193, 128), 8193);
     }
 
     #[test]
@@ -2300,7 +2427,7 @@ mod tests {
             prefill: vec![],
             decode: vec![(6, 106), (6, 10)],
         };
-        let input = normalize_step(&step, 6, 12, None);
+        let input = normalize_step(&graphs(&[6]), &step, 6, 12, None);
         assert_eq!((input.mode, input.full.rows), (GraphMode::Full, 12));
         assert_eq!(
             input.full.attention.decode_kv_lens,
@@ -2312,7 +2439,7 @@ mod tests {
             prefill: vec![],
             decode: vec![(6, 50); 3],
         };
-        let input = normalize_step(&three, 6, 18, None);
+        let input = normalize_step(&graphs(&[6]), &three, 6, 18, None);
         assert_eq!(input.full.rows, 18);
         assert!(!input.full.attention.mhc_overlap);
         // PIECEWISE steps never take it.
@@ -2383,7 +2510,21 @@ mod tests {
         replay: Option<&BoundedReplay>,
     ) -> std::result::Result<NormalizedInput, String> {
         let step = DeepseekV41Step::from_unified(batch, CAPTURED_MAX_MODEL_LEN)?;
-        Ok(normalize_step(&step, 1, step.request_count(), replay))
+        Ok(normalize_step(
+            &graphs(&[1]),
+            &step,
+            1,
+            step.request_count(),
+            replay,
+        ))
+    }
+
+    fn graphs(decode_query_lens: &[u32]) -> DeepseekV41CudaGraphs {
+        DeepseekV41CudaGraphs::new(
+            &vllm_default_cudagraph_capture_sizes(2048),
+            MAX_NUM_SEQS,
+            decode_query_lens,
+        )
     }
 
     #[test]
@@ -2523,20 +2664,26 @@ mod tests {
     }
 
     #[test]
-    fn cudagraph_rows_follow_the_capture_sizes() {
+    fn piecewise_rows_follow_the_capture_sizes() {
+        let default = graphs(&[1]);
+        assert_eq!(
+            vllm_default_cudagraph_capture_sizes(2048).len(),
+            147,
+            "the logged prefill_cudagraph_capture_token_sizes"
+        );
         let sizes = [
-            (1, 1),
-            (3, 4),
-            (5, 8),
-            (48, 48),
-            (49, 56),
-            (174, 176),
-            (257, 272),
-            (2048, 2048),
-            (2049, 2049),
+            (1, Some(1)),
+            (3, Some(4)),
+            (5, Some(8)),
+            (48, Some(48)),
+            (49, Some(56)),
+            (174, Some(176)),
+            (257, Some(272)),
+            (2048, Some(2048)),
+            (2049, None),
         ];
         for (tokens, rows) in sizes {
-            assert_eq!(cudagraph_rows(tokens), rows, "{tokens}");
+            assert_eq!(default.piecewise_rows(tokens), rows, "{tokens}");
         }
     }
 }

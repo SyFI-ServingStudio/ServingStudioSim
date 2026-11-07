@@ -101,6 +101,16 @@ const fn default_decoder_swa_bounded_replay() -> bool {
     true
 }
 
+const fn default_deepseek_v41_max_num_batched_tokens() -> u32 {
+    crate::arch::deepseek_v41_vllm::MAX_BATCHED_TOKENS
+}
+
+fn default_deepseek_v41_cudagraph_capture_sizes() -> Vec<u32> {
+    crate::arch::deepseek_v41_vllm::vllm_default_cudagraph_capture_sizes(
+        crate::arch::deepseek_v41_vllm::MAX_BATCHED_TOKENS,
+    )
+}
+
 const fn default_glm52_parallel_size() -> u16 {
     8
 }
@@ -383,7 +393,19 @@ pub enum IterArchSel {
         /// the last KV source on run only each request's last
         /// `sliding_window` rows. `false` is the counterfactual without it.
         #[serde(default = "default_decoder_swa_bounded_replay")]
+        #[param(default = true, cache_key)]
         decoder_swa_bounded_replay: bool,
+        /// vLLM `--max-num-batched-tokens` (the chunk size): the FlashMLA
+        /// prefill workspace identity of the mega attention.
+        #[serde(default = "default_deepseek_v41_max_num_batched_tokens")]
+        #[param(default = 2048, cache_key)]
+        max_num_batched_tokens: u32,
+        /// vLLM `--cudagraph-capture-sizes`: the PIECEWISE token sizes (the
+        /// last one is the capture limit); the FULL decode graphs' request
+        /// counts derive from them and `max_num_seqs` 64 as vLLM's MRV2
+        /// runner does. Omitted: vLLM's default list up to 2048. Empty: eager.
+        #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
+        cudagraph_capture_sizes: Vec<u32>,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)
@@ -416,7 +438,19 @@ pub enum IterArchSel {
         /// the last KV source on run only each request's last
         /// `sliding_window` rows. `false` is the counterfactual without it.
         #[serde(default = "default_decoder_swa_bounded_replay")]
+        #[param(default = true, cache_key)]
         decoder_swa_bounded_replay: bool,
+        /// vLLM `--max-num-batched-tokens` (the chunk size): the FlashMLA
+        /// prefill workspace identity of the mega attention.
+        #[serde(default = "default_deepseek_v41_max_num_batched_tokens")]
+        #[param(default = 2048, cache_key)]
+        max_num_batched_tokens: u32,
+        /// vLLM `--cudagraph-capture-sizes`: the PIECEWISE token sizes (the
+        /// last one is the capture limit); the FULL decode graphs' request
+        /// counts derive from them and `max_num_seqs` 64 as vLLM's MRV2
+        /// runner does. Omitted: vLLM's default list up to 2048. Empty: eager.
+        #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
+        cudagraph_capture_sizes: Vec<u32>,
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.

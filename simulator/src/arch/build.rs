@@ -1022,6 +1022,8 @@ pub fn deepseek_v41_vllm(
     serialize_streams: bool,
     decoder_swa_bounded_replay: bool,
     max_model_len: Option<u32>,
+    max_num_batched_tokens: u32,
+    cudagraph_capture_sizes: &[u32],
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1038,6 +1040,8 @@ pub fn deepseek_v41_vllm(
             max_model_len,
             model_cfg.max_position_embeddings,
         )?,
+        max_num_batched_tokens,
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
     };
     let source = ExpertDemandSource {
         kind: routing_kind,
@@ -2254,6 +2258,8 @@ pub fn build_iter_model(
             token_corpus_file,
             decoder_swa_bounded_replay,
             max_model_len,
+            max_num_batched_tokens,
+            cudagraph_capture_sizes,
         } => Box::new(deepseek_v41_vllm(
             model,
             *routing,
@@ -2263,6 +2269,8 @@ pub fn build_iter_model(
             false,
             *decoder_swa_bounded_replay,
             *max_model_len,
+            *max_num_batched_tokens,
+            cudagraph_capture_sizes,
             gpu,
             name,
             bridge,
@@ -2275,6 +2283,8 @@ pub fn build_iter_model(
             token_corpus_file,
             decoder_swa_bounded_replay,
             max_model_len,
+            max_num_batched_tokens,
+            cudagraph_capture_sizes,
         } => Box::new(deepseek_v41_vllm(
             model,
             *routing,
@@ -2284,6 +2294,8 @@ pub fn build_iter_model(
             true,
             *decoder_swa_bounded_replay,
             *max_model_len,
+            *max_num_batched_tokens,
+            cudagraph_capture_sizes,
             gpu,
             name,
             bridge,

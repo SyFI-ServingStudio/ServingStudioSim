@@ -553,6 +553,8 @@ impl Deployment for UnifiedDeployment {
                 token_corpus_file,
                 decoder_swa_bounded_replay,
                 max_model_len,
+                max_num_batched_tokens,
+                cudagraph_capture_sizes,
                 ..
             }
             | IterArchSel::DeepseekV41VllmSerialStreams {
@@ -562,6 +564,8 @@ impl Deployment for UnifiedDeployment {
                 token_corpus_file,
                 decoder_swa_bounded_replay,
                 max_model_len,
+                max_num_batched_tokens,
+                cudagraph_capture_sizes,
                 ..
             }) => {
                 // Pure TP4 attention (one attention group, four replicated KV
@@ -578,6 +582,8 @@ impl Deployment for UnifiedDeployment {
                     serialize_streams,
                     *decoder_swa_bounded_replay,
                     *max_model_len,
+                    *max_num_batched_tokens,
+                    cudagraph_capture_sizes,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
