@@ -121,10 +121,18 @@ class LocalGpuChunk(GpuChunk):
                 return [ChunkResult(metrics=None, error=error) for _ in chunk_specs]
 
             worker_response = json.loads(output_path.read_text(encoding="utf-8"))
-            return [
+            results = [
                 chunk_result_from_payload(result_payload)
                 for result_payload in worker_response["results"]
             ]
+            # A number is only worth keeping if it was measured on the card this
+            # chunk reserved. Checked once per chunk, and only when something
+            # succeeded: an all-failed chunk keeps its own errors.
+            if any(result.metrics is not None for result in results):
+                mismatch = worker_gpu_mismatch(self.gpus, worker_response.get("gpu_uuids"))
+                if mismatch is not None:
+                    return [ChunkResult(metrics=None, error=mismatch) for _ in chunk_specs]
+            return results
 
 
 _WORKER_STREAM_TAIL_CHARS = 2000
@@ -238,8 +246,10 @@ def _container_worker_command(
     imex_channel: bool = False,
 ) -> tuple[list[str], dict[str, str]]:
     cache_dir = _image_cache_dir(profiler_env.image)
-    # Address the cards by UUID, never by index. See gpu_uuids_for_indices.
-    gpu_request = f'"device={",".join(gpu_uuids_for_indices(gpus))}"'
+    # Address the cards by UUID, never by index, and twice: in the runtime's
+    # device request and in CUDA_VISIBLE_DEVICES. See gpu_uuids_for_indices.
+    gpu_uuids = gpu_uuids_for_indices(gpus)
+    gpu_request = f'"device={",".join(gpu_uuids)}"'
     # A container does not inherit this process's environment, so measurement
     # policy has to be handed over explicitly; the host worker gets it for free
     # through os.environ.copy(). Anything here that changes what a number MEANS
@@ -308,6 +318,11 @@ def _container_worker_command(
             *(["--device", IMEX_CHANNEL_CDI_DEVICE] if imex_channel else []),
             "--user",
             container_user(),
+            # Pins the worker to the reserved cards even when the runtime hands
+            # the container more of them than it asked for (gpu_uuids_for_indices).
+            # CUDA accepts UUIDs here and keeps their order as device order.
+            "--env",
+            f"CUDA_VISIBLE_DEVICES={','.join(gpu_uuids)}",
             "--env",
             "HOME=/cache/home",
             "--env",
@@ -388,6 +403,15 @@ def gpu_uuids_for_indices(gpu_indices: Sequence[int]) -> list[str]:
     someone else's job, or every concurrent worker piling onto one card. A UUID
     names the same silicon in both views, so the container path uses it.
 
+    The device request alone is not enough. A rootless Podman inside a Slurm job
+    (what ``docker`` is on cayenne since 2026-11-05) accepts ``--gpus`` and
+    ignores it: every container gets all of the job's GPUs and CUDA picks the
+    first, so the concurrent workers of a multi-GPU job all measured on job
+    GPU 0, up to 2.4x slow and irreproducible. The container command therefore
+    also sets ``CUDA_VISIBLE_DEVICES`` to the same UUIDs, which holds under
+    either runtime, and ``worker_gpu_mismatch`` rejects a chunk whose worker
+    still saw something else.
+
     Raises when a UUID cannot be established, rather than falling back to the
     index: the fallback is exactly the mis-targeting this exists to prevent.
     """
@@ -409,6 +433,27 @@ def gpu_uuids_for_indices(gpu_indices: Sequence[int]) -> list[str]:
             f"indices visible here are {sorted(uuid_by_index)}"
         )
     return [uuid_by_index[gpu_index] for gpu_index in gpu_indices]
+
+
+def worker_gpu_mismatch(
+    gpu_indices: Sequence[int], worker_uuids: Sequence[str] | None
+) -> str | None:
+    """Why a worker's measurements cannot be kept, or None when it saw the reserved cards.
+
+    The worker reports the UUIDs of the CUDA devices it could see, in device
+    order (``local_worker``'s ``gpu_uuids``). Anything but exactly the reserved
+    cards, in reservation order, means the numbers came from some other card or
+    from a card shared with another worker, so none of them is stored.
+    """
+
+    requested = gpu_uuids_for_indices(gpu_indices)
+    observed = list(worker_uuids or [])
+    if observed == requested:
+        return None
+    return (
+        f"worker GPU mismatch: reserved {requested} (indices {list(gpu_indices)}) "
+        f"but the worker saw {observed or 'no GPU UUIDs'}"
+    )
 
 
 def find_idle_gpus(memory_threshold_mb: int = 1000, util_threshold_pct: int = 10) -> list[int]:

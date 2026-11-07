@@ -57,6 +57,11 @@ This is why `KernelKind` strings must match exactly across the boundary (below).
   card. Passing the index across silently profiles GPU 0 instead: concurrent
   workers pile onto one card, and the idle check that cleared the allocated card
   never sees it. Resolution raises rather than falling back to the index.
+  The same UUIDs also go into the container's `CUDA_VISIBLE_DEVICES`, because a
+  rootless Podman inside a Slurm job ignores `--gpus` and exposes every job GPU.
+  Each worker reports the UUIDs it saw (`gpu_uuids` in its output), and a chunk
+  whose worker saw anything but the reserved cards fails and stores nothing
+  (`exec/local.py:worker_gpu_mismatch`).
 - The **backend's runtime libraries** — torch, FlashInfer, Triton, NCCL/NVSHMEM —
   available in the selected subprocess interpreter. These are imported **lazily
   inside the worker subprocess**, never in the simulator/main process.

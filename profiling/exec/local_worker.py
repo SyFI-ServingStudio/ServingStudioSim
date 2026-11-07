@@ -100,7 +100,9 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
         for result, kwargs in zip(results, kwargs_list, strict=True)
     ]
 
-    output: dict = {"results": worker_results}
+    # The cards this worker actually measured on; the controller rejects the
+    # chunk unless they are exactly the ones it reserved (worker_gpu_mismatch).
+    output: dict = {"results": worker_results, "gpu_uuids": _visible_gpu_uuids()}
     if measure_context is not None:
         # `consumed` stays False when the runner never reached Timer.cupti — the
         # driver reads this to reject non-CUPTI kernels for the `measure` verb.
@@ -177,6 +179,22 @@ def _current_gpu_name() -> str | None:
 
         if torch.cuda.is_available():
             return str(torch.cuda.get_device_name(0))
+    except ImportError:
+        pass
+    return None
+
+
+def _visible_gpu_uuids() -> list[str] | None:
+    """UUIDs of the CUDA devices this process can see, in device order, spelled as
+    ``nvidia-smi`` spells them (``GPU-…``)."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return [
+                f"GPU-{torch.cuda.get_device_properties(index).uuid}"
+                for index in range(torch.cuda.device_count())
+            ]
     except ImportError:
         pass
     return None
