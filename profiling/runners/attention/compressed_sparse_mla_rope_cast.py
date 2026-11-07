@@ -515,7 +515,8 @@ def check_against_reference(
     rows = _check_rows(torch, shape.num_tokens).to(work.q.device)
     values, exponents = output_from_fused_layout(out.data[rows], out.scale[rows])
     heads = shape.num_heads
-    got = dequantize_output(values[:, :heads], exponents[:, :heads])
+    values, exponents = values[:, :heads], exponents[:, :heads]
+    got = dequantize_output(values, exponents)
     expected = _reference(torch, shape, work, rows)[:, :heads]
     _ref_values, ref_exponents = quantize_output(expected)
     exponent_gap = int((exponents.int() - ref_exponents.int()).abs().max().item())
