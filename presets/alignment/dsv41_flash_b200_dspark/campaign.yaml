@@ -395,7 +395,7 @@ variants:
       draft_tokens: 5
       measured_phase: forward
       group_assignment: per_dp_rank
-    label_rules: label_rules/manifest.json
+    label_rules: label_rules/tp4/manifest.json
   tp4_c4096_s32:
     deployment: unified
     gpu: NVIDIA B200
@@ -801,7 +801,7 @@ variants:
       draft_tokens: 5
       measured_phase: forward
       group_assignment: per_dp_rank
-    label_rules: label_rules/manifest.json
+    label_rules: label_rules/tp4/manifest.json
   tp4_c8192_s128:
     deployment: unified
     gpu: NVIDIA B200
@@ -1271,7 +1271,7 @@ variants:
       draft_tokens: 5
       measured_phase: forward
       group_assignment: per_dp_rank
-    label_rules: label_rules/manifest.json
+    label_rules: label_rules/tp4/manifest.json
   dp4_c2048_s64:
     deployment: unified
     gpu: NVIDIA B200
@@ -1645,7 +1645,7 @@ variants:
       draft_tokens: 5
       measured_phase: forward
       group_assignment: per_dp_rank
-    label_rules: label_rules/manifest.json
+    label_rules: label_rules/dp4/manifest.json
   dp4_c4096_s32:
     deployment: unified
     gpu: NVIDIA B200
@@ -2051,7 +2051,7 @@ variants:
       draft_tokens: 5
       measured_phase: forward
       group_assignment: per_dp_rank
-    label_rules: label_rules/manifest.json
+    label_rules: label_rules/dp4/manifest.json
   dp4_c8192_s128:
     deployment: unified
     gpu: NVIDIA B200
@@ -2521,7 +2521,7 @@ variants:
       draft_tokens: 5
       measured_phase: forward
       group_assignment: per_dp_rank
-    label_rules: label_rules/manifest.json
+    label_rules: label_rules/dp4/manifest.json
 cases:
 - index: 1
   name: tp4_prefill_heavy_c16_k2048

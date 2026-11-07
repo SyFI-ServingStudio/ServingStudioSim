@@ -195,7 +195,7 @@ def variant(topo: str, chunk: int) -> dict:
             "measured_phase": "forward",
             "group_assignment": "per_dp_rank",
         },
-        "label_rules": "label_rules/manifest.json",
+        "label_rules": f"label_rules/{topo}/manifest.json",
     }
 
 
