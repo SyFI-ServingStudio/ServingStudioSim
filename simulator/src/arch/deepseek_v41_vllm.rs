@@ -135,6 +135,9 @@ const ENGRAM_WKV_OUT: u32 = 25_600;
 pub(crate) const MHC_BACKENDS: &[&str] = &["deepgemm_mega"];
 pub(crate) const MHC_TILELANG_BACKENDS: &[&str] = &["vllm_tilelang"];
 pub(crate) const MXFP8_GEMM_BACKENDS: &[&str] = &["flashinfer_mxfp8"];
+/// The fork's `VLLM_MOE_SKIP_PADDING` default (`vllm/envs.py`, on): graph and
+/// DP padding rows get top-k id -1 and skip the routed experts.
+pub(crate) const MOE_SKIP_PADDING: bool = true;
 /// The MXFP8 linear on an activation its producer already quantized.
 pub(crate) const MXFP8_PREQUANTIZED_GEMM_BACKENDS: &[&str] = &["flashinfer_mxfp8_prequantized"];
 pub(crate) const FP32_GEMM_BACKENDS: &[&str] = &["torch_cublas"];
@@ -1111,6 +1114,7 @@ pub(crate) fn layer_config(
             routed_scaling_denominator: 1,
             expert_demand: demand.clone(),
             folded_rank_position: 0,
+            skip_padding_rows: MOE_SKIP_PADDING,
         },
     }
 }
@@ -1215,6 +1219,7 @@ impl DeepseekV41LayerBody {
         self.ffn.eval(
             &DeepseekV41MoeFfnEpWorkletInput {
                 num_tokens: input.rows,
+                scheduled_tokens: input.scheduled_rows,
                 mhc_overlap: input.attention.mhc_overlap,
             },
             evaluator,
@@ -1781,7 +1786,10 @@ pub(crate) fn prefill_pairs(
 /// batch (whose `mhc_overlap` also gates the FFN's boundary).
 #[derive(Clone, Debug)]
 pub struct LayerInput {
+    /// Rows the layer's kernels run: the scheduled rows plus graph padding.
     pub rows: u32,
+    /// Of `rows`, the scheduled ones (the rest are padding the runner marks).
+    pub scheduled_rows: u32,
     pub attention: DeepseekV41AttentionTpWorkletInput,
 }
 
@@ -1814,8 +1822,15 @@ pub(crate) fn layer_input(
     decode: &[(u32, u32)],
 ) -> LayerInput {
     let full_graph = mode == GraphMode::Full;
+    let scheduled_rows = prefill
+        .iter()
+        .chain(decode)
+        .map(|&(q, _)| q)
+        .sum::<u32>()
+        .min(rows);
     LayerInput {
         rows,
+        scheduled_rows,
         attention: DeepseekV41AttentionTpWorkletInput {
             num_tokens: rows,
             prefill_query_context_pairs: prefill,

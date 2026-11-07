@@ -12,7 +12,8 @@
 //! per rank   entry mHC -> router gate -> _dsv4_topk -> MXFP8 quantize (local rows)
 //!            shared expert inline above 256 local rows
 //! group      all_gatherv [MXFP8 hidden, topk weights, topk ids, ue8m0 scales]
-//! group      trtllm MXFP4 MoE over every gathered row (routing precomputed)
+//! group      trtllm MXFP4 MoE over every gathered row (routing precomputed;
+//!            padding rows carry id -1, so only scheduled rows reach experts)
 //! group      reduce_scatterv of the bf16 expert output
 //! per rank   shared + routed add
 //! ```
@@ -70,6 +71,8 @@ pub struct DeepseekV41MoeFfnDpEpWorkletResolved {
 pub struct DeepseekV41MoeFfnDpRankInput {
     /// Rows the rank's dense kernels run (graph padding included).
     pub num_tokens: u32,
+    /// Of those, the scheduled (non-padding) rows.
+    pub scheduled_tokens: u32,
     /// `mhc_overlap_live(..)` on this rank's rows.
     pub mhc_overlap: bool,
 }
@@ -268,12 +271,16 @@ impl DeepseekV41MoeFfnDpEpWorklet {
             per_rank_tokens: input.collective_tokens.clone(),
         };
         eval_or_zero(&self.dispatch, collective.clone(), idle, ev);
+        // The experts see every gathered row, but padding rows carry id -1.
+        let routed: u32 = input
+            .ranks
+            .iter()
+            .map(|rank| self.resolved.raw_cfg.ffn.routed_rows(rank.num_tokens, rank.scheduled_tokens))
+            .sum();
         eval_or_zero(
             &f.fused_moe,
-            Nvfp4FusedMoeKernelInput {
-                num_tokens: gathered,
-            },
-            idle,
+            Nvfp4FusedMoeKernelInput { num_tokens: routed },
+            routed == 0,
             ev,
         );
         eval_or_zero(&self.combine, collective, idle, ev);

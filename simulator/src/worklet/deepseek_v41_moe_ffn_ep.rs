@@ -79,6 +79,29 @@ pub struct DeepseekV41MoeFfnEpWorkletConfig {
     pub expert_demand: ExpertDemand,
     /// 0 = the busiest EP rank.
     pub folded_rank_position: u32,
+    /// vLLM `VLLM_MOE_SKIP_PADDING`: the runner marks CUDA-graph and DP
+    /// padding rows (`v1/worker/gpu/model_runner.py` `prepare_inputs`), the
+    /// router writes them top-k id -1 / weight 0 (`get_moe_padding_mask` ->
+    /// `dsv4_topk`), and the expert routing counts only local ids >= 0. The
+    /// routed experts then work on the scheduled rows alone; every other
+    /// kernel, collectives included, still runs the padded rows.
+    pub skip_padding_rows: bool,
+}
+
+impl DeepseekV41MoeFfnEpWorkletConfig {
+    /// Rows the routed experts work on: the scheduled rows when padding rows
+    /// route nowhere ([`Self::skip_padding_rows`]),
+    /// else every row. The padded rows' pass through the routing scan is left
+    /// out: an image measurement of 120 real + 456 id -1 rows took 239 us
+    /// against 235 us for the 120 rows alone (`logs/20261107_2_dsv41_dspark_check1/round2`).
+    pub fn routed_rows(&self, rows: u32, scheduled: u32) -> u32 {
+        assert!(scheduled <= rows, "scheduled rows {scheduled} exceed the padded {rows}");
+        if self.skip_padding_rows {
+            scheduled
+        } else {
+            rows
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -99,7 +122,10 @@ pub struct DeepseekV41MoeFfnEpWorkletResolved {
 
 #[derive(Clone, Debug, Default)]
 pub struct DeepseekV41MoeFfnEpWorkletInput {
+    /// Rows the dense kernels run (graph padding included).
     pub num_tokens: u32,
+    /// Of those, the scheduled (non-padding) rows.
+    pub scheduled_tokens: u32,
     /// `mhc_overlap_live(..)`: the entry takes the mHC overlap path.
     pub mhc_overlap: bool,
 }
@@ -319,7 +345,13 @@ impl DeepseekV41MoeFfnEpWorklet {
         eval_or_zero(&self.router_gate, GemmFp32OutputKernelInput { m: rows }, zero, ev);
         eval_or_zero(&self.topk, ew.clone(), zero, ev);
         eval_or_zero(&self.moe_input_quant, ew.clone(), zero, ev);
-        eval_or_zero(&self.fused_moe, Nvfp4FusedMoeKernelInput { num_tokens: rows }, zero, ev);
+        let routed = self.resolved.raw_cfg.routed_rows(rows, input.scheduled_tokens);
+        eval_or_zero(
+            &self.fused_moe,
+            Nvfp4FusedMoeKernelInput { num_tokens: routed },
+            routed == 0,
+            ev,
+        );
         for copy_overlapped in [true, false] {
             let off = zero || overlapped != copy_overlapped;
             eval_or_zero(&self.shared_gate_up, gemm.clone(), off, ev);
@@ -375,6 +407,7 @@ pub(crate) mod tests {
                 layerwise_global_ppm: vec![vec![1_000_000 / 384; 384]],
             },
             folded_rank_position: 0,
+            skip_padding_rows: true,
         }
     }
 
@@ -386,6 +419,16 @@ pub(crate) mod tests {
         assert_eq!((r.shared_down.k.get(), r.shared_down.n.get()), (576, 5120));
         assert_eq!(r.router_gate.n.get(), 384);
         assert_eq!(r.moe_input_quant.output_bytes_per_token.get(), 5280);
+    }
+
+    /// Catches padding rows priced as expert work, or the flag ignored.
+    #[test]
+    fn routed_experts_see_only_scheduled_rows_when_padding_is_skipped() {
+        let mut cfg = config();
+        assert_eq!(cfg.routed_rows(576, 120), 120);
+        assert_eq!(cfg.routed_rows(64, 0), 0);
+        cfg.skip_padding_rows = false;
+        assert_eq!(cfg.routed_rows(576, 120), 576);
     }
 
     #[test]

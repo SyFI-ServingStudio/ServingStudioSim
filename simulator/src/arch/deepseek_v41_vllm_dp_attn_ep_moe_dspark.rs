@@ -503,6 +503,11 @@ fn normalize_dp_dspark_input(
                 requests,
                 layer: LayerInput {
                     rows,
+                    // `_prepare_dflash_inputs_kernel` marks each request's query
+                    // rows non-padding, the idle rank's dummy request included
+                    // (its draft is no `make_dummy` batch); graph slots past
+                    // them are padding.
+                    scheduled_rows: live * draft_tokens,
                     attention: DeepseekV41AttentionTpWorkletInput {
                         num_tokens: rows,
                         prefill_query_context_pairs: Vec::new(),

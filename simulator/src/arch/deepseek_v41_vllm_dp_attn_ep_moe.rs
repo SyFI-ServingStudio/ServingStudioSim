@@ -35,7 +35,9 @@
 //! rank runs eager on its own rows and the collectives are ragged; a FULL
 //! decode graph only when every rank is a uniform decode, padded to the
 //! busiest rank's FULL request count; otherwise every rank pads to the
-//! busiest rank's PIECEWISE size, so the experts see `4 x padded` rows. FULL
+//! busiest rank's PIECEWISE size, so the collectives move `4 x padded` rows;
+//! the routed experts see only the scheduled ones (padding rows route to id -1,
+//! an idle rank's dummy batch is all padding). FULL
 //! graphs keep the attention aux stream and, at <= 16 rows, the mHC overlap
 //! path, evaluated per rank on that rank's rows. Bounded replay
 //! ([`BoundedReplay`]) runs on every rank when it runs on any, each rank's
@@ -487,6 +489,7 @@ impl DpLayerBody {
 fn ffn_rank_input(rank: &LayerInput) -> DeepseekV41MoeFfnDpRankInput {
     DeepseekV41MoeFfnDpRankInput {
         num_tokens: rank.rows,
+        scheduled_tokens: rank.scheduled_rows,
         mhc_overlap: rank.attention.mhc_overlap,
     }
 }
@@ -1019,11 +1022,24 @@ pub(crate) fn normalize_dp_steps(
             vec![padded; steps.len()]
         }
     };
+    // MRV2 builds an idle rank's dummy batch with every row marked padding
+    // (`InputBatch.make_dummy(..., is_padding=not is_profile)`): nothing it
+    // runs is scheduled.
+    let idle: Vec<bool> = steps.iter().map(|&step| std::ptr::eq(step, &dummy)).collect();
+    let unscheduled = |mut layer: LayerInput, idle: bool| {
+        if idle {
+            layer.scheduled_rows = 0;
+        }
+        layer
+    };
     let full = DpLayerInput::new(
         steps
             .iter()
             .zip(&rows)
-            .map(|(step, &rows)| layer_input(mode, rows, step.prefill.clone(), &step.decode))
+            .zip(&idle)
+            .map(|((step, &rows), &idle)| {
+                unscheduled(layer_input(mode, rows, step.prefill.clone(), &step.decode), idle)
+            })
             .collect(),
     );
     let replay = replay
@@ -1057,8 +1073,12 @@ pub(crate) fn normalize_dp_steps(
                 steps
                     .iter()
                     .zip(trimmed)
-                    .map(|(step, (prefill, _))| {
-                        layer_input(GraphMode::Piecewise, late_rows, prefill, &step.decode)
+                    .zip(&idle)
+                    .map(|((step, (prefill, _)), &idle)| {
+                        unscheduled(
+                            layer_input(GraphMode::Piecewise, late_rows, prefill, &step.decode),
+                            idle,
+                        )
                     })
                     .collect(),
             )

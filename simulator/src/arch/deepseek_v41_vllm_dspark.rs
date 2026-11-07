@@ -446,6 +446,7 @@ impl DraftLayer {
         self.ffn.eval(
             &DeepseekV41MoeFfnEpWorkletInput {
                 num_tokens: input.rows,
+                scheduled_tokens: input.scheduled_rows,
                 mhc_overlap: false,
             },
             ev,
@@ -461,6 +462,10 @@ struct DraftStep {
     requests: u32,
     /// `draft_tokens x requests`: the backbone's rows.
     rows: u32,
+    /// `draft_tokens x` live requests: the query rows the DFlash input prep
+    /// marks non-padding (`_prepare_dflash_inputs_kernel`); the graph's pad
+    /// slots past them are padding.
+    scheduled_rows: u32,
     attention: DeepseekV41AttentionTpWorkletInput,
 }
 
@@ -877,6 +882,7 @@ fn normalize_dspark_input(
         context_tokens: group.batch_tokens,
         requests,
         rows,
+        scheduled_rows: live.min(requests) * draft_tokens,
         attention: DeepseekV41AttentionTpWorkletInput {
             num_tokens: rows,
             prefill_query_context_pairs: Vec::new(),
