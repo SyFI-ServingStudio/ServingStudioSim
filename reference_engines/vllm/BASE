@@ -4,3 +4,9 @@ upstream_repo=https://github.com/vllm-project/vllm.git
 upstream_commit=5629b26146a39705c814ddae6a0f98321e14d2a6
 image=public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:5629b26146a39705c814ddae6a0f98321e14d2a6
 digest.linux/amd64=sha256:a3a232b8e67f29b928ca5418a962f7b03d6a29045cf2b27c39d574ab2c1d4e5c
+# linux/arm64: vLLM's CI publishes no -arm64 image of 5629b26. b4dffa50 is 3 commits
+# earlier and differs from it only in recipes/ and tests/ (no vllm/ or csrc/ change),
+# so the same patches apply to its installed vllm/.
+image.linux/arm64=public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:b4dffa5095ffa673ed1530524a503b168f5b611c-arm64
+upstream_commit.linux/arm64=b4dffa5095ffa673ed1530524a503b168f5b611c
+digest.linux/arm64=sha256:f64971090ca3f36d6e3a2b8f20426eefd117c3889b56e73f892409aa9e6f3ca5

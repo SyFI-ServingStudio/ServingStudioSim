@@ -84,11 +84,11 @@ def _engine_base(engine: str) -> Callable[[Path], str]:
 
 def _engine_args(engine: str) -> Callable[[Path], dict[str, str]]:
     def args(root: Path) -> dict[str, str]:
-        from reference_engines import parse_base
+        from reference_engines import host_platform, parse_base
 
         base = parse_base((root / "reference_engines" / engine / "BASE").read_text())
         return {
-            "VIBESIM_UPSTREAM_COMMIT": base.upstream_commit,
+            "VIBESIM_UPSTREAM_COMMIT": base.commit_for(host_platform()),
             "VIBESIM_REQ_FRONTEND_REVISION": gitlink(root, _REQ_FRONTEND),
         }
 

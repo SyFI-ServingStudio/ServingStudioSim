@@ -13,8 +13,14 @@ kept as an official base plus our patches. One directory per engine:
 
 | Engine | Upstream base | Official image |
 | --- | --- | --- |
-| `vllm` | main `5629b26` (2026-11-07) | `public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:5629b26…` (vLLM's post-merge CI image) |
+| `vllm` | main `5629b26` (2026-11-07) | `public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:5629b26…` (vLLM's post-merge CI image); arm64: `…:b4dffa50…-arm64` |
 | `sglang` | main `9d547e19` (2026-11-08) | `lmsysorg/sglang:nightly-dev-cu13-20261108-9d547e19` |
+
+vLLM's CI publishes no arm64 image of `5629b26`; the arm64 base is
+`b4dffa50`, 3 commits earlier, which differs from it only in `recipes/` and
+`tests/`, so the same patches apply (BASE: `image.linux/arm64`,
+`upstream_commit.linux/arm64`). SGLang's tag is a multi-platform index; BASE
+pins both platforms' manifests. The arm64 images are build-verified only.
 
 Both bases are main/nightly builds, not releases: vLLM is on main because
 DeepSeek-V4.1 needs SwapAB and other paths v0.33.0 does not have. The next bump
@@ -52,7 +58,9 @@ Editing the patches: commit in `src/` (amend, rebase, add commits), then
 **bump-base** points BASE at a new upstream commit and official image. It reads
 each platform's image-manifest digest from the registry, so nothing in BASE is a
 moving tag; `--platform-image linux/arm64=REPO:TAG` adds a platform published
-under another tag. It then materializes on the new base. A patch that no longer
+under another tag, and `--platform-commit linux/arm64=SHA` the upstream commit
+that image was built from when it is not `--commit`. It rewrites BASE whole
+(comments included) and then materializes on the new base. A patch that no longer
 applies stops `git am` in `src/`: resolve it there (`git am --continue`), then
 `export-patches`.
 
@@ -69,7 +77,11 @@ least to most:
 1. system tools: Nsight Systems 2025.5.2 (the hosts' version, at
    `/opt/nvidia/nsight-systems/2025.5.2`), gdb, procps;
 2. the capture runner's venv (`/opt/vibesim-capture/.venv`) with py-spy;
-3. what the engine's interpreter lacks (SGLang: `nvtx`);
+3. what the engine's interpreter lacks (SGLang: `nvtx`, and FlashInfer's
+   `tinygemm2` in the sm100a/sm103a jit-cache providers: captures run with
+   `FLASHINFER_DISABLE_JIT=1` and the 0.7.3 wheel does not ship it;
+   `complete_flashinfer_aot.py` compiles it without a GPU and registers it in
+   each provider's manifest);
 4. the req-frontend `session_runner`, built in a stage on the same base;
 5. the patches, applied to the engine as the official image installed it:
    vLLM's wheel in `/usr/local/lib/python3.12/dist-packages` (only `vllm/`

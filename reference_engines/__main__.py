@@ -273,7 +273,13 @@ def platform_digests(image: str) -> dict[str, str]:
     }
 
 
-def bump_base(engine: str, commit: str, image: str, platform_images: dict[str, str]) -> None:
+def bump_base(
+    engine: str,
+    commit: str,
+    image: str,
+    platform_images: dict[str, str],
+    platform_commits: dict[str, str],
+) -> None:
     old = read_base(engine)
     digests = platform_digests(image)
     for name, other in platform_images.items():
@@ -281,7 +287,7 @@ def bump_base(engine: str, commit: str, image: str, platform_images: dict[str, s
         if name not in found:
             raise RefError(f"{other} is not published for {name} (only {', '.join(found)})")
         digests[name] = found[name]
-    base = Base(old.upstream_repo, commit, image, digests, platform_images)
+    base = Base(old.upstream_repo, commit, image, digests, platform_images, platform_commits)
     # Validate before writing: a malformed BASE would stop every later command.
     text = format_base(base, _BASE_HEADER[engine])
     parse_base(text)
@@ -316,6 +322,13 @@ def main(argv: list[str] | None = None) -> int:
         metavar="OS/ARCH=REPOSITORY:TAG",
         help="a platform published under another tag",
     )
+    verb.add_argument(
+        "--platform-commit",
+        action="append",
+        default=[],
+        metavar="OS/ARCH=COMMIT",
+        help="the upstream commit a --platform-image was built from, when not --commit",
+    )
     verb = verbs.add_parser("build-image", help="build the engine image for this platform")
     verb.add_argument("engine", choices=ENGINES)
     args = parser.parse_args(argv)
@@ -326,7 +339,8 @@ def main(argv: list[str] | None = None) -> int:
             export_patches(args.engine, args.checkout or source_dir(args.engine), args.ref)
         elif args.verb == "bump-base":
             platform_images = dict(item.split("=", 1) for item in args.platform_image)
-            bump_base(args.engine, args.commit, args.image, platform_images)
+            platform_commits = dict(item.split("=", 1) for item in args.platform_commit)
+            bump_base(args.engine, args.commit, args.image, platform_images, platform_commits)
         else:
             from profiling.container.images import build
 

@@ -54,6 +54,9 @@ class Base:
     # Platform -> another `repository:tag`, for a platform the official image
     # above is not published for. Its digest is in `digests`.
     platform_images: dict[str, str]
+    # Platform -> the upstream commit that platform's image was built from,
+    # when it is not `upstream_commit` (the patches must still apply to it).
+    platform_commits: dict[str, str]
 
     def image_for(self, platform_name: str) -> str:
         """The pinned reference (`repository@sha256:...`) to build `FROM` on ``platform_name``."""
@@ -66,6 +69,11 @@ class Base:
             )
         image = self.platform_images.get(platform_name, self.image)
         return f"{_repository(image)}@{digest}"
+
+    def commit_for(self, platform_name: str) -> str:
+        """The upstream commit ``platform_name``'s image was built from."""
+
+        return self.platform_commits.get(platform_name, self.upstream_commit)
 
 
 def _repository(image: str) -> str:
@@ -108,8 +116,9 @@ def parse_base(text: str, origin: str = "BASE") -> Base:
 
     Required: `upstream_repo`, `upstream_commit` (40 hex), `image`
     (`repository:tag`), and at least one `digest.<os>/<arch>=sha256:<64 hex>`.
-    Optional: `image.<os>/<arch>=repository:tag` for a platform published under
-    another tag.
+    Optional, for a platform published under another tag:
+    `image.<os>/<arch>=repository:tag` and, when that image is of another
+    upstream commit, `upstream_commit.<os>/<arch>=<40 hex>`.
     """
 
     values: dict[str, str] = {}
@@ -133,6 +142,7 @@ def parse_base(text: str, origin: str = "BASE") -> Base:
         raise BaseError(f"{origin}: image must be repository:tag, without a digest")
     digests: dict[str, str] = {}
     platform_images: dict[str, str] = {}
+    platform_commits: dict[str, str] = {}
     for key, value in values.items():
         if key.startswith("digest."):
             if not _DIGEST.fullmatch(value):
@@ -140,19 +150,25 @@ def parse_base(text: str, origin: str = "BASE") -> Base:
             digests[key.removeprefix("digest.")] = value
         elif key.startswith("image."):
             platform_images[key.removeprefix("image.")] = value
+        elif key.startswith("upstream_commit."):
+            if not _SHA1.fullmatch(value):
+                raise BaseError(f"{origin}: {key} must be a full 40-hex commit")
+            platform_commits[key.removeprefix("upstream_commit.")] = value
         elif key not in ("upstream_repo", "upstream_commit", "image"):
             raise BaseError(f"{origin}: unknown key {key}")
     if not digests:
         raise BaseError(f"{origin}: no digest.<os>/<arch> entry")
-    stray = set(platform_images) - set(digests)
-    if stray:
-        raise BaseError(f"{origin}: image.{sorted(stray)[0]} has no digest")
+    for prefix, entries in (("image", platform_images), ("upstream_commit", platform_commits)):
+        stray = set(entries) - set(digests)
+        if stray:
+            raise BaseError(f"{origin}: {prefix}.{sorted(stray)[0]} has no digest")
     return Base(
         upstream_repo=values["upstream_repo"],
         upstream_commit=values["upstream_commit"],
         image=values["image"],
         digests=digests,
         platform_images=platform_images,
+        platform_commits=platform_commits,
     )
 
 
@@ -175,6 +191,8 @@ def format_base(base: Base, header: str) -> str:
     for name in sorted(base.digests):
         if name in base.platform_images:
             lines.append(f"image.{name}={base.platform_images[name]}")
+        if name in base.platform_commits:
+            lines.append(f"upstream_commit.{name}={base.platform_commits[name]}")
         lines.append(f"digest.{name}={base.digests[name]}")
     return "\n".join(lines) + "\n"
 
