@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Mon, 3 Aug 2026 08:05:55 +0000
-Subject: [PATCH 03/18] feat(alignment): restore iteration and expert profiling
+Subject: [PATCH] feat(alignment): restore iteration and expert profiling
 
 ---
  vllm/distributed/eplb/eplb_state.py | 50 ++++++++++++++-
@@ -11,7 +11,7 @@ Subject: [PATCH 03/18] feat(alignment): restore iteration and expert profiling
  4 files changed, 161 insertions(+), 9 deletions(-)
 
 diff --git a/vllm/distributed/eplb/eplb_state.py b/vllm/distributed/eplb/eplb_state.py
-index bcd8c227f2..fa328692a5 100644
+index bcd8c227f26bafce96d1a1049fbed1c93dea2e72..fa328692a558ef000a8966bafc4d4ef5df64d512 100644
 --- a/vllm/distributed/eplb/eplb_state.py
 +++ b/vllm/distributed/eplb/eplb_state.py
 @@ -25,6 +25,7 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
@@ -116,7 +116,7 @@ index bcd8c227f2..fa328692a5 100644
      def _should_record_current_step(self, log_stats: bool = False) -> bool:
          """Return whether expert-load recording should be enabled this step.
 diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
-index 873f64ce24..2807763354 100644
+index 873f64ce24acc82000a87fcf237f341b5066760e..28077633545a2932f43f07f1df0d0870ebb63571 100644
 --- a/vllm/v1/core/sched/output.py
 +++ b/vllm/v1/core/sched/output.py
 @@ -289,6 +289,11 @@ class SchedulerOutput:
@@ -132,7 +132,7 @@ index 873f64ce24..2807763354 100644
      num_invalid_spec_tokens: dict[str, int] | None = None
  
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index 9a8622980d..c281358a50 100644
+index 9a8622980d06c2a12b44bd97faea5056d4bd0028..c281358a5003774b5cf1a2cc688ecb9ca01446f2 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -1,6 +1,7 @@
@@ -273,7 +273,7 @@ index 9a8622980d..c281358a50 100644
          ):
              model_output = self._wait_for_output(future)
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index c2de73d98d..6b8c2b7ae3 100644
+index c2de73d98dee10f2725ac372cb9198cc64663036..6b8c2b7ae3523af5d2418d12ee2f98b1437aea66 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4032,8 +4032,10 @@ class GPUModelRunner(

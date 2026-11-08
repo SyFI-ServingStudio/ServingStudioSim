@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Wed, 23 Sep 2026 04:11:57 -0700
-Subject: [PATCH 15/18] docs(alignment): describe the converged
+Subject: [PATCH] docs(alignment): describe the converged
  servingstudio-alignment line
 
 Name this branch the one maintained ServingStudio line, record the two lines
@@ -14,7 +14,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  1 file changed, 48 insertions(+), 13 deletions(-)
 
 diff --git a/ALIGNMENT.md b/ALIGNMENT.md
-index 66548b3af1..63afc03236 100644
+index 66548b3af125783c475544f184b2f29632959fd5..63afc03236700389642c8daccfdaf5efb8dbbd25 100644
 --- a/ALIGNMENT.md
 +++ b/ALIGNMENT.md
 @@ -1,13 +1,16 @@

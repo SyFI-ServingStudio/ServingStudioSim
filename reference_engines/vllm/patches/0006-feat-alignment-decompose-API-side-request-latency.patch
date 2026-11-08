@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Tue, 11 Aug 2026 06:14:58 +0000
-Subject: [PATCH 06/18] feat(alignment): decompose API-side request latency
+Subject: [PATCH] feat(alignment): decompose API-side request latency
 
 The v2 records cover EngineCore only. A request's wall-clock latency as the
 client sees it also contains the API frontend: generator activation, add_request,
@@ -43,7 +43,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 
 diff --git a/tests/entrypoints/openai/completion/test_alignment_api_timing.py b/tests/entrypoints/openai/completion/test_alignment_api_timing.py
 new file mode 100644
-index 0000000000..fc3d6ca9e9
+index 0000000000000000000000000000000000000000..fc3d6ca9e9073774b97c9cd861547f7973a05f67
 --- /dev/null
 +++ b/tests/entrypoints/openai/completion/test_alignment_api_timing.py
 @@ -0,0 +1,50 @@
@@ -98,7 +98,7 @@ index 0000000000..fc3d6ca9e9
 +    assert record["engine_core_decode_ms"] == pytest.approx(200.0)
 +    assert record["first_token_event_tokens"] == 2
 diff --git a/tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py b/tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py
-index 98bea6880a..a307dfdebf 100644
+index 98bea6880abda82beed64a896c8018c4471f6fb6..a307dfdebf87f4a519aea544c490bcc3ca8f3b57 100644
 --- a/tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py
 +++ b/tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py
 @@ -5,6 +5,7 @@ import asyncio
@@ -233,7 +233,7 @@ index 98bea6880a..a307dfdebf 100644
  async def test_stream_error_mid_generation():
      """finish_reason='error' mid-stream yields error chunk then [DONE]."""
 diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
-index e80979686c..bfc57743ab 100644
+index e80979686cc9d5d97f7926173a273916964a9d57..bfc57743ab5b8143dd26548d7aaddc6bc3e402e5 100644
 --- a/vllm/entrypoints/openai/completion/serving.py
 +++ b/vllm/entrypoints/openai/completion/serving.py
 @@ -2,6 +2,7 @@
@@ -421,7 +421,7 @@ index e80979686c..bfc57743ab 100644
  
      def request_output_to_completion_response(
 diff --git a/vllm/entrypoints/scale_out/token_in_token_out/serving.py b/vllm/entrypoints/scale_out/token_in_token_out/serving.py
-index 8a733e069e..85da237201 100644
+index 8a733e069ea68b846b46e6b45fb389b158dbc0ad..85da23720167d6d6ca6a00ebf8babe673f0a99e2 100644
 --- a/vllm/entrypoints/scale_out/token_in_token_out/serving.py
 +++ b/vllm/entrypoints/scale_out/token_in_token_out/serving.py
 @@ -3,7 +3,9 @@
@@ -588,7 +588,7 @@ index 8a733e069e..85da237201 100644
  
      @staticmethod
 diff --git a/vllm/entrypoints/serve/utils/api_utils.py b/vllm/entrypoints/serve/utils/api_utils.py
-index b1f3cb788d..c514354436 100644
+index b1f3cb788dd5a5d3dd7703b7d6de351c389d6518..c514354436ecf61c02fcac09ea2add5d18a20fc9 100644
 --- a/vllm/entrypoints/serve/utils/api_utils.py
 +++ b/vllm/entrypoints/serve/utils/api_utils.py
 @@ -50,6 +50,98 @@ def create_json_response(
@@ -691,7 +691,7 @@ index b1f3cb788d..c514354436 100644
      """Returns if a disconnect message is received."""
      while True:
 diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
-index 5d95df0fa8..dad043fc55 100644
+index 5d95df0fa87274bfd34c8d7264109fd9f6ea470a..dad043fc554ee1e18ce1124d82e330fda53c9c95 100644
 --- a/vllm/v1/engine/async_llm.py
 +++ b/vllm/v1/engine/async_llm.py
 @@ -782,6 +782,7 @@ class AsyncLLM(EngineClient):
@@ -744,7 +744,7 @@ index 5d95df0fa8..dad043fc55 100644
                          # NOTE: RequestOutputs are pushed to their queues.
                          assert not processed_outputs.request_outputs
 diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
-index ee03a7ebe0..ff0cc2e89f 100644
+index ee03a7ebe028df839c810ba8f8f0366569cd8320..ff0cc2e89f6b3ebe5c7aac178c3e104a9dcf6411 100644
 --- a/vllm/v1/engine/output_processor.py
 +++ b/vllm/v1/engine/output_processor.py
 @@ -3,6 +3,7 @@
@@ -797,7 +797,7 @@ index ee03a7ebe0..ff0cc2e89f 100644
              self._update_stats_from_output(
                  req_state, engine_core_output, engine_core_timestamp, iteration_stats
 diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
-index 20c754be34..1ca910b3ae 100644
+index 20c754be34ba1c65b567e4dfc82bd0c607759854..1ca910b3ae51de3a428919362ddd39257196ae1a 100644
 --- a/vllm/v1/metrics/stats.py
 +++ b/vllm/v1/metrics/stats.py
 @@ -271,6 +271,15 @@ class RequestStateStats:

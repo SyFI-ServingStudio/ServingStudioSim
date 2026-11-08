@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Wed, 23 Sep 2026 00:40:32 -0700
-Subject: [PATCH 13/18] eplb: add a record-only mode that never rearranges
+Subject: [PATCH] eplb: add a record-only mode that never rearranges
 
 `EPLBConfig.rearrange=False` keeps the initial placement and only records
 expert load for `log_balancedness`. It allocates no transfer buffer (one
@@ -22,7 +22,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  3 files changed, 67 insertions(+), 18 deletions(-)
 
 diff --git a/tests/distributed/test_eplb_utils.py b/tests/distributed/test_eplb_utils.py
-index f54d2cd087..8e646162a6 100644
+index f54d2cd08742314d33bfad92426076caca327687..8e646162a61b7be845149af9e3e18fe87aad1d43 100644
 --- a/tests/distributed/test_eplb_utils.py
 +++ b/tests/distributed/test_eplb_utils.py
 @@ -6,7 +6,9 @@ from unittest.mock import MagicMock
@@ -62,7 +62,7 @@ index f54d2cd087..8e646162a6 100644
 +    state.rearrange.assert_not_called()
 +    assert not state.should_record_tensor.item()
 diff --git a/vllm/config/parallel.py b/vllm/config/parallel.py
-index cc0fa1ac58..0c48d8c5d6 100644
+index cc0fa1ac58d64d1d0ab55281578a4079d710f179..0c48d8c5d6ab9a43dbb2fe8a4eda0464ae7f422b 100644
 --- a/vllm/config/parallel.py
 +++ b/vllm/config/parallel.py
 @@ -96,6 +96,13 @@ class EPLBConfig:
@@ -80,7 +80,7 @@ index cc0fa1ac58..0c48d8c5d6 100644
      policy: EPLBPolicyOption = "default"
      """The policy type for expert parallel load balancing (EPLB)."""
 diff --git a/vllm/distributed/eplb/eplb_state.py b/vllm/distributed/eplb/eplb_state.py
-index bb4e46dbf8..bd42185881 100644
+index bb4e46dbf8d10609e37b97eed08196988ee516e4..bd4218588122f439d6f9bf9b56266174b5b60c91 100644
 --- a/vllm/distributed/eplb/eplb_state.py
 +++ b/vllm/distributed/eplb/eplb_state.py
 @@ -217,9 +217,10 @@ class EplbModelState:

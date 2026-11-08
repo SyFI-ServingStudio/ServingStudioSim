@@ -178,6 +178,12 @@ def export_patches(engine: str, checkout: Path, ref: str) -> list[Path]:
         _git(
             "format-patch",
             "--quiet",
+            # Each file must depend on its own commit only: no "n/m" in the
+            # subject (adding a patch would rewrite every file), full blob ids
+            # (the abbreviation length follows the repository's size), no
+            # source commit id or git-version signature.
+            "--no-numbered",
+            "--full-index",
             "--zero-commit",
             "--no-signature",
             "--output-directory",

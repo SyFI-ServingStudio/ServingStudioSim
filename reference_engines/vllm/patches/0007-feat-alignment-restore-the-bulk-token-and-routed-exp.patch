@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Tue, 11 Aug 2026 06:47:55 +0000
-Subject: [PATCH 07/18] feat(alignment): restore the bulk token and
- routed-expert dumps
+Subject: [PATCH] feat(alignment): restore the bulk token and routed-expert
+ dumps
 
 The v0.23.0 rebase dropped `routing_trace.py` and its two dumps. Most of what
 went with it was deliberate -- the CUDA-event forward/postprocess/sample timing
@@ -53,7 +53,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 
 diff --git a/tests/v1/worker/test_alignment_trace.py b/tests/v1/worker/test_alignment_trace.py
 new file mode 100644
-index 0000000000..42e228da0c
+index 0000000000000000000000000000000000000000..42e228da0cee429fa7aa3504f27d8b49a5c7ae3f
 --- /dev/null
 +++ b/tests/v1/worker/test_alignment_trace.py
 @@ -0,0 +1,122 @@
@@ -181,7 +181,7 @@ index 0000000000..42e228da0c
 +    assert stats["m_block_overlaunch"] is None
 diff --git a/vllm/v1/worker/alignment_trace.py b/vllm/v1/worker/alignment_trace.py
 new file mode 100644
-index 0000000000..886968f31a
+index 0000000000000000000000000000000000000000..886968f31a6d88a5df1f9257213266c10c4299d1
 --- /dev/null
 +++ b/vllm/v1/worker/alignment_trace.py
 @@ -0,0 +1,358 @@
@@ -544,7 +544,7 @@ index 0000000000..886968f31a
 +
 +        _append_jsonl(trace_path, row)
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 6b8c2b7ae3..e95ba98290 100644
+index 6b8c2b7ae3523af5d2418d12ee2f98b1437aea66..e95ba982909dd8522470e67106611d2047750213 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -60,6 +60,10 @@ from vllm.lora.layers import LoRAMapping, LoRAMappingType
@@ -652,7 +652,7 @@ index 6b8c2b7ae3..e95ba98290 100644
          """Add encoder-only layers to the KV cache config."""
          block_size = self.vllm_config.cache_config.block_size
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 44be753298..5c9bc6441d 100644
+index 44be753298463e52873b1a3e3b8845033cc7ef7b..5c9bc6441d53f526da3c74a4f391d5af6655c62e 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -123,6 +123,7 @@ from vllm.v1.worker.startup_plan import (

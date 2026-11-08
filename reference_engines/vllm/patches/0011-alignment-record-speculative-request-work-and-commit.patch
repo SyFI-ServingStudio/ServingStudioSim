@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Sun, 20 Sep 2026 09:40:36 -0700
-Subject: [PATCH 11/18] alignment: record speculative request work and
- committed output progress
+Subject: [PATCH] alignment: record speculative request work and committed
+ output progress
 
 Port the extraction from the spec5 alignment branch onto this DFlash2 base. The
 per-request speculative progress bookkeeping moves out of EngineCore into
@@ -28,7 +28,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
  create mode 100644 vllm/v1/engine/alignment.py
 
 diff --git a/tests/v1/engine/test_iteration_logging.py b/tests/v1/engine/test_iteration_logging.py
-index b1fadb9750..6fb1830355 100644
+index b1fadb975016e5135b1a0ecda1bb75425fa19667..6fb183035543442b5ab9284b2905448cf1d50c1a 100644
 --- a/tests/v1/engine/test_iteration_logging.py
 +++ b/tests/v1/engine/test_iteration_logging.py
 @@ -30,7 +30,7 @@ def make_iteration_details() -> SchedulerIterationDetails:
@@ -104,7 +104,7 @@ index b1fadb9750..6fb1830355 100644
              "emitted_tokens": 3,
 diff --git a/vllm/v1/engine/alignment.py b/vllm/v1/engine/alignment.py
 new file mode 100644
-index 0000000000..93bb036a63
+index 0000000000000000000000000000000000000000..93bb036a63afeceb6d789ee94bf7b4903ee7ec86
 --- /dev/null
 +++ b/vllm/v1/engine/alignment.py
 @@ -0,0 +1,84 @@
@@ -193,7 +193,7 @@ index 0000000000..93bb036a63
 +        "decode_request_progress": progress,
 +    }
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index 78050ff3f2..0b6ef79e71 100644
+index 78050ff3f236a0dfeb98a42c53752484bf444b96..0b6ef79e7183c4ddff33082dec4f7420ce401038 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -93,6 +93,7 @@ from vllm.v1.engine import (

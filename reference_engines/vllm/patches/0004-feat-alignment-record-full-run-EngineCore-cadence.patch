@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Tue, 4 Aug 2026 15:27:48 +0000
-Subject: [PATCH 04/18] feat(alignment): record full-run EngineCore cadence
+Subject: [PATCH] feat(alignment): record full-run EngineCore cadence
 
 ---
  vllm/v1/engine/core.py | 19 ++++++++++++++++---
  1 file changed, 16 insertions(+), 3 deletions(-)
 
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index c281358a50..5b34bb4b8d 100644
+index c281358a5003774b5cf1a2cc688ecb9ca01446f2..5b34bb4b8d8e54d2248ff95191f2943260c39e0f 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -650,8 +650,18 @@ class EngineCore:

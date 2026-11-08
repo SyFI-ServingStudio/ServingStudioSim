@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Wed, 2 Sep 2026 07:38:15 -0700
-Subject: [PATCH 4/8] fix(serving): stabilize multi-tokenizer streaming
+Subject: [PATCH] fix(serving): stabilize multi-tokenizer streaming
 
 Default ordinary HTTP serving to four tokenizer workers while preserving explicit single-worker restrictions for offline Engine, auth, SSL refresh, native gRPC, and elastic EP.
 
@@ -29,7 +29,7 @@ Cover W4 defaults, isolation boundaries, and streaming evidence with unit tests.
  17 files changed, 313 insertions(+), 42 deletions(-)
 
 diff --git a/python/sglang/srt/arg_groups/fields/serving.py b/python/sglang/srt/arg_groups/fields/serving.py
-index 7724d790e7..f75055b65c 100644
+index 7724d790e7c6d48de36c3c83b921528357f77431..f75055b65c0fdbe6faeb8d87bc84c4c314036a17 100644
 --- a/python/sglang/srt/arg_groups/fields/serving.py
 +++ b/python/sglang/srt/arg_groups/fields/serving.py
 @@ -49,8 +49,10 @@ class Serving(msgspec.Struct):
@@ -46,7 +46,7 @@ index 7724d790e7..f75055b65c 100644
          int,
          "The worker num of the detokenizer manager.",
 diff --git a/python/sglang/srt/arg_groups/pipeline.py b/python/sglang/srt/arg_groups/pipeline.py
-index 75b78c1963..b162204f27 100644
+index 75b78c19634bf25df3e2d3a393a1531933fefe9b..b162204f27a6e1887dee28fd8a1bff54b68af35a 100644
 --- a/python/sglang/srt/arg_groups/pipeline.py
 +++ b/python/sglang/srt/arg_groups/pipeline.py
 @@ -71,10 +71,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
@@ -63,7 +63,7 @@ index 75b78c1963..b162204f27 100644
      run_hook(handle_watermark_config, server_args)
      from sglang.srt.arg_groups.hicache_hook import (
 diff --git a/python/sglang/srt/arg_groups/resolution_hooks.py b/python/sglang/srt/arg_groups/resolution_hooks.py
-index 82945e3124..7799b3baf0 100644
+index 82945e31246720517416f7b1838e3bad0ef9a8c3..7799b3baf08dd6de93273aec4540fc6bcb3056fe 100644
 --- a/python/sglang/srt/arg_groups/resolution_hooks.py
 +++ b/python/sglang/srt/arg_groups/resolution_hooks.py
 @@ -17,6 +17,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
@@ -75,7 +75,7 @@ index 82945e3124..7799b3baf0 100644
          "handle_watermark_config",
          "handle_hicache_ratio_default",
 diff --git a/python/sglang/srt/arg_groups/serving_hook.py b/python/sglang/srt/arg_groups/serving_hook.py
-index b9e3d6160d..c446a1b180 100644
+index b9e3d6160d9abc39fa7f7611f9564da304871f9d..c446a1b180df59c0d8445768c23a5704171986e6 100644
 --- a/python/sglang/srt/arg_groups/serving_hook.py
 +++ b/python/sglang/srt/arg_groups/serving_hook.py
 @@ -40,6 +40,23 @@ def handle_watermark_config(server_args: Any) -> None:
@@ -103,7 +103,7 @@ index b9e3d6160d..c446a1b180 100644
      """Ensure SSL arguments are consistent and referenced files exist."""
      cfg = resolving_view(server_args)
 diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
-index a7d25c2f0e..96cac4bf6b 100644
+index a7d25c2f0e6a11bb730d159c24d9cef7b3ba619f..96cac4bf6bbb92a5dd8c3944c801b921a2604da8 100644
 --- a/python/sglang/srt/entrypoints/engine.py
 +++ b/python/sglang/srt/entrypoints/engine.py
 @@ -143,7 +143,12 @@ from sglang.srt.runtime_context import (
@@ -146,7 +146,7 @@ index a7d25c2f0e..96cac4bf6b 100644
                  server_args,
                  "_launch_command",
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
-index 17d2c0d2a2..b06b4ea1e4 100644
+index 17d2c0d2a2dec97894b2369e553b49c45e0c684a..b06b4ea1e4481e2fcb12cce35bec4dd336200db6 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
 +++ b/python/sglang/srt/entrypoints/http_server.py
 @@ -262,9 +262,11 @@ async def init_multi_tokenizer() -> ServerArgs:
@@ -193,7 +193,7 @@ index 17d2c0d2a2..b06b4ea1e4 100644
              if get_serving().enable_http2:
                  logger.info(
 diff --git a/python/sglang/srt/entrypoints/openai/protocol.py b/python/sglang/srt/entrypoints/openai/protocol.py
-index 112f5ef896..b7cf3f334b 100644
+index 112f5ef89630e8ae1ad40ba380208815a7d8fde7..b7cf3f334b26bea12d273d93fe3907ae87091d4a 100644
 --- a/python/sglang/srt/entrypoints/openai/protocol.py
 +++ b/python/sglang/srt/entrypoints/openai/protocol.py
 @@ -422,6 +422,7 @@ class CompletionRequest(PDRoutingFields):
@@ -205,7 +205,7 @@ index 112f5ef896..b7cf3f334b 100644
  
      # Extra parameters for SRT backend only and will be ignored by OpenAI models.
 diff --git a/python/sglang/srt/entrypoints/openai/serving_completions.py b/python/sglang/srt/entrypoints/openai/serving_completions.py
-index afb5f40c16..96edb8a101 100644
+index afb5f40c16424772ae26279f01b2a8722c0ac0cf..96edb8a101f2add0b44aae6593e3daeaee143916 100644
 --- a/python/sglang/srt/entrypoints/openai/serving_completions.py
 +++ b/python/sglang/srt/entrypoints/openai/serving_completions.py
 @@ -130,7 +130,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
@@ -238,7 +238,7 @@ index afb5f40c16..96edb8a101 100644
                  ),
              )
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index b88b0821ea..2946753f13 100644
+index b88b0821ead9394292ed17cd0b8a035ac43f8a4d..2946753f133cc843e2464b0c45c9b350ee257067 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
 @@ -295,6 +295,10 @@ class ReqState:
@@ -357,7 +357,7 @@ index b88b0821ea..2946753f13 100644
              output_tokens=completion_tokens,
          )
 diff --git a/python/sglang/srt/ray/engine.py b/python/sglang/srt/ray/engine.py
-index 3125661213..0d013515c7 100644
+index 312566121359c235a612543516f3276600ce6239..0d013515c79ec845517cd4da41f373306e4fffe3 100644
 --- a/python/sglang/srt/ray/engine.py
 +++ b/python/sglang/srt/ray/engine.py
 @@ -241,6 +241,7 @@ class RayEngine(Engine):
@@ -369,7 +369,7 @@ index 3125661213..0d013515c7 100644
  
      def shutdown(self):
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index 62dfd9d5d0..7476c93388 100644
+index 62dfd9d5d089d7927eb8b5d10136625565bdd803..7476c93388d9c998f6ab071b7c1307a98b113d83 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -742,6 +742,26 @@ def redact_secret_cli_args(
@@ -400,7 +400,7 @@ index 62dfd9d5d0..7476c93388 100644
      """
      Prepare the server arguments from the command line arguments.
 diff --git a/test/registered/unit/entrypoints/openai/test_protocol.py b/test/registered/unit/entrypoints/openai/test_protocol.py
-index efc37b25f3..81c80b2852 100644
+index efc37b25f32bbd2d27f5bcb87f4ec7acccfb74cf..81c80b2852ec9c391a2ace1c4952548368d5eac2 100644
 --- a/test/registered/unit/entrypoints/openai/test_protocol.py
 +++ b/test/registered/unit/entrypoints/openai/test_protocol.py
 @@ -55,6 +55,7 @@ class TestCompletionRequest(unittest.TestCase):
@@ -412,7 +412,7 @@ index efc37b25f3..81c80b2852 100644
      def test_completion_request_validation_errors(self):
          """Test completion request validation errors"""
 diff --git a/test/registered/unit/entrypoints/openai/test_serving_completions.py b/test/registered/unit/entrypoints/openai/test_serving_completions.py
-index e9a1c55c19..65293591c7 100644
+index e9a1c55c190a40fc518db59199d4b875cd8579e2..65293591c7c812a5c9a45ed16d101631959d96e5 100644
 --- a/test/registered/unit/entrypoints/openai/test_serving_completions.py
 +++ b/test/registered/unit/entrypoints/openai/test_serving_completions.py
 @@ -18,7 +18,8 @@ from fastapi import Request
@@ -539,7 +539,7 @@ index e9a1c55c19..65293591c7 100644
          """Test that non-streaming completion responses emit cached token details in sglext."""
  
 diff --git a/test/registered/unit/entrypoints/test_server_info.py b/test/registered/unit/entrypoints/test_server_info.py
-index 1823fae575..c8320ced37 100644
+index 1823fae575d695f7efab84fab0e50b0a17cc2311..c8320ced370a3a61b5f8ccd04860d3ee50024654 100644
 --- a/test/registered/unit/entrypoints/test_server_info.py
 +++ b/test/registered/unit/entrypoints/test_server_info.py
 @@ -335,7 +335,7 @@ class TestServerInfoInternalStatesRedaction(CustomTestCase):
@@ -552,7 +552,7 @@ index 1823fae575..c8320ced37 100644
  
          self._assert_redacted(_call_server_info_with(server_args, [readback]))
 diff --git a/test/registered/unit/managers/test_load_snapshot_backends.py b/test/registered/unit/managers/test_load_snapshot_backends.py
-index ff7e0177c2..12f4f31ec5 100644
+index ff7e0177c26a902faf8a6e17cae8a1d3dfd4ef14..12f4f31ec5aa1200201fed74918fa54e6e2864ca 100644
 --- a/test/registered/unit/managers/test_load_snapshot_backends.py
 +++ b/test/registered/unit/managers/test_load_snapshot_backends.py
 @@ -286,7 +286,8 @@ class TestFactoryFunctions(CustomTestCase):
@@ -566,7 +566,7 @@ index ff7e0177c2..12f4f31ec5 100644
          os.environ["SGLANG_LOAD_SNAPSHOT_USE_ZMQ"] = "1"
          try:
 diff --git a/test/registered/unit/observability/test_crash_dump.py b/test/registered/unit/observability/test_crash_dump.py
-index b567027d02..1321a29050 100644
+index b567027d0296308f3827f30704a4d33222a62762..1321a290509a60ad593fc603b2479c5343ac7282 100644
 --- a/test/registered/unit/observability/test_crash_dump.py
 +++ b/test/registered/unit/observability/test_crash_dump.py
 @@ -190,7 +190,7 @@ class TestTokenizerManagerCrashDump(CustomTestCase):
@@ -597,7 +597,7 @@ index b567027d02..1321a29050 100644
          server.server_args = server_args
          with tempfile.TemporaryDirectory() as folder:
 diff --git a/test/registered/unit/server_args/test_server_args.py b/test/registered/unit/server_args/test_server_args.py
-index b6f4cad499..fc7ee7804d 100644
+index b6f4cad4995c3389ba331b2a9bc980a876228aa4..fc7ee7804d8847d9ebedf7d756f3b09e1eb22bbe 100644
 --- a/test/registered/unit/server_args/test_server_args.py
 +++ b/test/registered/unit/server_args/test_server_args.py
 @@ -120,7 +120,12 @@ from sglang.srt.runtime_context import (

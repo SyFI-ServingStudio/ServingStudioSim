@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Thu, 24 Sep 2026 16:05:07 -0700
-Subject: [PATCH 16/18] docs(alignment): rebase the line onto upstream 04730e8
- for DeepSeek-V4.1
+Subject: [PATCH] docs(alignment): rebase the line onto upstream 04730e8 for
+ DeepSeek-V4.1
 
 The line now sits on upstream main 04730e82700d0c9b957cda188dd1bbc8073e1fcd
 (2026-09-24), the newest main commit with a published cu130 precompiled
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 38 insertions(+), 17 deletions(-)
 
 diff --git a/ALIGNMENT.md b/ALIGNMENT.md
-index 63afc03236..738347cc20 100644
+index 63afc03236700389642c8daccfdaf5efb8dbbd25..738347cc20544909fa6da0ff7a7b884a54aa3870 100644
 --- a/ALIGNMENT.md
 +++ b/ALIGNMENT.md
 @@ -1,9 +1,16 @@

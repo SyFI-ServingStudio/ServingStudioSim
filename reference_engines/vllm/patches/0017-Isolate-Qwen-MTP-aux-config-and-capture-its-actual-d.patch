@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cayenne.cs.washington.edu>
 Date: Thu, 8 Oct 2026 01:05:57 -0700
-Subject: [PATCH 17/18] Isolate Qwen MTP aux config and capture its actual
- draft layer
+Subject: [PATCH] Isolate Qwen MTP aux config and capture its actual draft
+ layer
 
 ---
  .../test_qwen4_mtp_routing_config.py          | 96 +++++++++++++++++++
@@ -13,7 +13,7 @@ Subject: [PATCH 17/18] Isolate Qwen MTP aux config and capture its actual
 
 diff --git a/tests/model_executor/test_qwen4_mtp_routing_config.py b/tests/model_executor/test_qwen4_mtp_routing_config.py
 new file mode 100644
-index 0000000000..efb37b4c78
+index 0000000000000000000000000000000000000000..efb37b4c781de852fded3aaddd722882eeab4772
 --- /dev/null
 +++ b/tests/model_executor/test_qwen4_mtp_routing_config.py
 @@ -0,0 +1,96 @@
@@ -114,7 +114,7 @@ index 0000000000..efb37b4c78
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
-index fc28bde898..9db5a7ec86 100644
+index fc28bde898929eab4dd7eacec178bfab7b8e5ba2..9db5a7ec86a1aa208e3e086865bf980594a4ae8d 100644
 --- a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
 +++ b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
 @@ -61,7 +61,17 @@ def num_capture_layers(vllm_config: VllmConfig) -> int:
@@ -137,7 +137,7 @@ index fc28bde898..9db5a7ec86 100644
  
  
 diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
-index d005e67bad..c977f7ae81 100644
+index d005e67bad27e64b4596bd353c31cfc739c30083..c977f7ae818480539799e128b923242db85c73ef 100644
 --- a/vllm/models/qwen4_exp/nvidia/mtp.py
 +++ b/vllm/models/qwen4_exp/nvidia/mtp.py
 @@ -21,7 +21,7 @@ from torch import nn

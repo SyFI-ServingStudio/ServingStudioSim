@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Fri, 4 Sep 2026 23:38:53 -0700
-Subject: [PATCH 10/18] docs(alignment): document isolated profiler setup and
- wheel provenance
+Subject: [PATCH] docs(alignment): document isolated profiler setup and wheel
+ provenance
 
 Co-authored-by: Codex <noreply@openai.com>
 ---
@@ -10,7 +10,7 @@ Co-authored-by: Codex <noreply@openai.com>
  1 file changed, 11 insertions(+)
 
 diff --git a/ALIGNMENT.md b/ALIGNMENT.md
-index 5446062b26..66548b3af1 100644
+index 5446062b26210da837f81173c4dd2a522747d632..66548b3af125783c475544f184b2f29632959fd5 100644
 --- a/ALIGNMENT.md
 +++ b/ALIGNMENT.md
 @@ -55,6 +55,17 @@ If the upstream base changes, update the wheel commit explicitly. Import and

@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Tue, 11 Aug 2026 07:05:49 +0000
-Subject: [PATCH 1/8] feat(alignment): emit VibeSim alignment records, matching
- the vLLM fork
+Subject: [PATCH] feat(alignment): emit VibeSim alignment records, matching the
+ vLLM fork
 
 The alignment report compares a measured serving run against a VibeSim
 simulation of the same workload. It already reads four record kinds from an
@@ -67,7 +67,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  create mode 100644 test/registered/unit/observability/test_vibesim_alignment.py
 
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index db7d4f9c89..7e4f385702 100644
+index db7d4f9c89437eecff4075a357d7e2eb80e4bba2..7e4f385702190ea11d71a6dc0449af8d1e299db9 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
 @@ -364,6 +364,18 @@ class Envs:
@@ -90,7 +90,7 @@ index db7d4f9c89..7e4f385702 100644
      # IPC, broadcasters, and ports
      # ===================================================================
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index e3cd978e4c..3e3b290059 100644
+index e3cd978e4c4fda36363ecd13673979d5ef116d51..3e3b290059cf4f4dbd1b4c1f6f89808b7adfc055 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
 @@ -145,6 +145,7 @@ from sglang.srt.observability.req_time_stats import (
@@ -114,7 +114,7 @@ index e3cd978e4c..3e3b290059 100644
      # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
      # Batched arguments to model runner
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 375901393a..d2a9b93f62 100644
+index 375901393a5344aee8ca44eaa220f73f96e84eb6..d2a9b93f62578e78e55dfedfc4fa524cafc42113 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -355,6 +355,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
@@ -164,7 +164,7 @@ index 375901393a..d2a9b93f62 100644
          self.maybe_send_health_check_signal()
          self.metrics_reporter.update_device_timer()
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index 05ef7ac8e2..7279b5f022 100644
+index 05ef7ac8e2c7e7b035b243b78d7db2bfbf76cc45..7279b5f022eb0ce6ae27771b740dc26346d82ead 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -36,6 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import (
@@ -243,7 +243,7 @@ index 05ef7ac8e2..7279b5f022 100644
          self._maybe_collect_customized_info(i, req, logits_output, num_new_tokens)
  
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index ac489e32f3..ddb0b11191 100644
+index ac489e32f34395d01d7516c61cd21ba3978d7171..ddb0b11191692bffc71bfd95ffdbd067232b1397 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
 @@ -150,6 +150,7 @@ from sglang.srt.multimodal.mm_utils import has_valid_data
@@ -302,7 +302,7 @@ index ac489e32f3..ddb0b11191 100644
          meta_info: Dict[str, Any],
 diff --git a/python/sglang/srt/observability/vibesim_alignment.py b/python/sglang/srt/observability/vibesim_alignment.py
 new file mode 100644
-index 0000000000..27335e5e6c
+index 0000000000000000000000000000000000000000..27335e5e6cc779e8ccfe9b92f1a509383b4fe3ff
 --- /dev/null
 +++ b/python/sglang/srt/observability/vibesim_alignment.py
 @@ -0,0 +1,406 @@
@@ -714,7 +714,7 @@ index 0000000000..27335e5e6c
 +    _emit(_EXPERT_LOAD_RECORD_NAME, build_expert_load_record(**kwargs))
 diff --git a/test/registered/unit/observability/test_vibesim_alignment.py b/test/registered/unit/observability/test_vibesim_alignment.py
 new file mode 100644
-index 0000000000..b9de845919
+index 0000000000000000000000000000000000000000..b9de8459198ca5d34cb87116abf5310ad1d999e4
 --- /dev/null
 +++ b/test/registered/unit/observability/test_vibesim_alignment.py
 @@ -0,0 +1,188 @@

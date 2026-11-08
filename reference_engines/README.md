@@ -40,8 +40,9 @@ replace an existing tree without `--force`, and a tree with uncommitted changes
 even then.
 
 **export-patches** rewrites `patches/` from the commits a checkout has over
-BASE's commit (`--zero-commit`, no signature, so an unchanged commit gives an
-unchanged file). The checkout is the materialized tree unless `--from` names a
+BASE's commit. A file depends only on its own commit (no `n/m` numbering in the
+subject, full blob ids, no source commit id or signature), so an unchanged
+commit gives an unchanged file wherever it is exported from. The checkout is the materialized tree unless `--from` names a
 fork. The series must be linear. A fork's own `ALIGNMENT_BASE` is not
 exported: BASE replaces it.
 

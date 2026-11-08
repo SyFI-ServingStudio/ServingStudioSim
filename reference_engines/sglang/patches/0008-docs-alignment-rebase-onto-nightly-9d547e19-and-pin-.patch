@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Sat, 7 Nov 2026 17:40:58 -0800
-Subject: [PATCH 8/8] docs(alignment): rebase onto nightly 9d547e19 and pin the
+Subject: [PATCH] docs(alignment): rebase onto nightly 9d547e19 and pin the
  base in ALIGNMENT_BASE
 
 vibesim-alignment-20261108 is vibesim-alignment-20261107 rebased from main
@@ -29,7 +29,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 48 insertions(+), 12 deletions(-)
 
 diff --git a/ALIGNMENT.md b/ALIGNMENT.md
-index bf7e18255f..ed49ac9f86 100644
+index bf7e18255f1843c2165e3af2ea249f2e350c928b..ed49ac9f862f0ce9f485203a042595f69981e7b4 100644
 --- a/ALIGNMENT.md
 +++ b/ALIGNMENT.md
 @@ -1,19 +1,55 @@

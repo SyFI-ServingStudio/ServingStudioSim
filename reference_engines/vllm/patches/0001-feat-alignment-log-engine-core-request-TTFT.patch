@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Mon, 13 Jul 2026 06:52:12 +0000
-Subject: [PATCH 01/18] feat(alignment): log engine-core request TTFT
+Subject: [PATCH] feat(alignment): log engine-core request TTFT
 
 ---
  vllm/v1/engine/output_processor.py | 41 ++++++++++++++++++++++++++++++
  1 file changed, 41 insertions(+)
 
 diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
-index a17fb259c0..2ffd8bffa7 100644
+index a17fb259c01f6e0af725d167f3eb283793e83e13..2ffd8bffa7d732ca0629f941a0893da7315455e1 100644
 --- a/vllm/v1/engine/output_processor.py
 +++ b/vllm/v1/engine/output_processor.py
 @@ -2,6 +2,7 @@

@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Tue, 11 Aug 2026 07:12:27 +0000
-Subject: [PATCH 2/8] feat(alignment): close the last three gaps against the
- vLLM fork
+Subject: [PATCH] feat(alignment): close the last three gaps against the vLLM
+ fork
 
 The first pass left three vLLM-side capabilities with no SGLang counterpart.
 
@@ -45,7 +45,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  4 files changed, 392 insertions(+), 6 deletions(-)
 
 diff --git a/python/sglang/srt/eplb/eplb_manager.py b/python/sglang/srt/eplb/eplb_manager.py
-index 0388dbee15..4c83d37b5f 100644
+index 0388dbee15e36f2756eca410e696a573bdbc6da4..4c83d37b5f0bb275e8ea607f156ee6307d04efd7 100644
 --- a/python/sglang/srt/eplb/eplb_manager.py
 +++ b/python/sglang/srt/eplb/eplb_manager.py
 @@ -18,6 +18,7 @@ from sglang.srt.eplb.expert_location import (
@@ -108,7 +108,7 @@ index 0388dbee15..4c83d37b5f 100644
          return get_parallel().tp_rank + get_parallel().ep_join_rank_offset
  
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index d2a9b93f62..9c5e52ea39 100644
+index d2a9b93f62578e78e55dfedfc4fa524cafc42113..9c5e52ea395b38c1e75aad8c0cf34fc25f5357a4 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -5054,6 +5054,23 @@ class Scheduler(
@@ -146,7 +146,7 @@ index d2a9b93f62..9c5e52ea39 100644
                  iteration_index=batch.forward_iter,
                  geometry=batch.vibesim_geometry,
 diff --git a/python/sglang/srt/observability/vibesim_alignment.py b/python/sglang/srt/observability/vibesim_alignment.py
-index 27335e5e6c..a3f794ef02 100644
+index 27335e5e6cc779e8ccfe9b92f1a509383b4fe3ff..a3f794ef025e0669134eccb171331a9f6c22712b 100644
 --- a/python/sglang/srt/observability/vibesim_alignment.py
 +++ b/python/sglang/srt/observability/vibesim_alignment.py
 @@ -49,15 +49,24 @@ testable without a GPU, a scheduler, or a server.
@@ -491,7 +491,7 @@ index 27335e5e6c..a3f794ef02 100644
 +        row.update(provenance)
 +        _append_jsonl(trace_path, row)
 diff --git a/test/registered/unit/observability/test_vibesim_alignment.py b/test/registered/unit/observability/test_vibesim_alignment.py
-index b9de845919..c86da8feb7 100644
+index b9de8459198ca5d34cb87116abf5310ad1d999e4..c86da8feb7090b5238dd7cb15cbcae8ea368e4fa 100644
 --- a/test/registered/unit/observability/test_vibesim_alignment.py
 +++ b/test/registered/unit/observability/test_vibesim_alignment.py
 @@ -16,7 +16,10 @@ from sglang.srt.observability.vibesim_alignment import (

@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Wed, 2 Sep 2026 01:21:26 -0700
-Subject: [PATCH 08/18] feat(alignment): record Spec5 request and expert
- evidence
+Subject: [PATCH] feat(alignment): record Spec5 request and expert evidence
 
 Co-authored-by: OpenAI Codex <noreply@openai.com>
 ---
@@ -15,7 +14,7 @@ Co-authored-by: OpenAI Codex <noreply@openai.com>
  6 files changed, 107 insertions(+), 15 deletions(-)
 
 diff --git a/tests/v1/worker/test_gpu_model_runner_v2_eplb.py b/tests/v1/worker/test_gpu_model_runner_v2_eplb.py
-index 684d2d10c4..85ab2d7cb2 100644
+index 684d2d10c47b85fd21a732fcb0c8cedbdb546908..85ab2d7cb2ac5b0c7dd2206d1c0d77cc0fed9ab5 100644
 --- a/tests/v1/worker/test_gpu_model_runner_v2_eplb.py
 +++ b/tests/v1/worker/test_gpu_model_runner_v2_eplb.py
 @@ -29,7 +29,7 @@ class FakeEplbState:
@@ -83,7 +82,7 @@ index 684d2d10c4..85ab2d7cb2 100644
      assert speculator.eplb_state is runner.eplb_state
  
 diff --git a/vllm/distributed/eplb/eplb_state.py b/vllm/distributed/eplb/eplb_state.py
-index e4ee8505a9..9e77b98a2a 100644
+index e4ee8505a95fcc75feac0b2a4eac5f5e360d7d4d..9e77b98a2aca34e42c29c08bc4ed3a69429c7f5e 100644
 --- a/vllm/distributed/eplb/eplb_state.py
 +++ b/vllm/distributed/eplb/eplb_state.py
 @@ -188,6 +188,10 @@ class EplbModelState:
@@ -138,7 +137,7 @@ index e4ee8505a9..9e77b98a2a 100644
                          "expert_parallel_size": ep_group.size(),
                          "experts_per_token": eplb_model_state.experts_per_token,
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index 5b34bb4b8d..dcdd3377b9 100644
+index 5b34bb4b8d8e54d2248ff95191f2943260c39e0f..dcdd3377b927d4c86d0324d8fa43239427e20b37 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -633,12 +633,13 @@ class EngineCore:
@@ -267,7 +266,7 @@ index 5b34bb4b8d..dcdd3377b9 100644
          # Before processing the model output, process any aborts that happened
          # during the model execution.
 diff --git a/vllm/v1/worker/alignment_trace.py b/vllm/v1/worker/alignment_trace.py
-index 886968f31a..88406ebc70 100644
+index 886968f31a6d88a5df1f9257213266c10c4299d1..88406ebc709648b7bf03676add4a0232e2eba385 100644
 --- a/vllm/v1/worker/alignment_trace.py
 +++ b/vllm/v1/worker/alignment_trace.py
 @@ -35,6 +35,7 @@ ROUTING_TRACE_PATH_ENV = "VLLM_VIBESIM_ROUTING_TRACE_PATH"
@@ -302,7 +301,7 @@ index 886968f31a..88406ebc70 100644
  
          _append_jsonl(trace_path, row)
 diff --git a/vllm/v1/worker/gpu/eplb_utils.py b/vllm/v1/worker/gpu/eplb_utils.py
-index e7706d7087..5e1c7acf84 100644
+index e7706d70871f64fcfa05bf5e2ebe80bfc8d596d4..5e1c7acf849fc69385491dc5494ef6528e77d639 100644
 --- a/vllm/v1/worker/gpu/eplb_utils.py
 +++ b/vllm/v1/worker/gpu/eplb_utils.py
 @@ -153,6 +153,8 @@ class EPLBController:
@@ -324,7 +323,7 @@ index e7706d7087..5e1c7acf84 100644
          return True
  
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e95ba98290..7203298d76 100644
+index e95ba982909dd8522470e67106611d2047750213..7203298d76afed69a71956f38ef0890a50d32e40 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -5196,6 +5196,8 @@ class GPUModelRunner(

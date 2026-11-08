@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Fri, 4 Sep 2026 23:20:40 -0700
-Subject: [PATCH 09/18] feat(alignment): instrument upstream model runner v2
- for DFlash2
+Subject: [PATCH] feat(alignment): instrument upstream model runner v2 for
+ DFlash2
 
 Preserve the upstream execution and sampling paths while adding indexed phase scopes and bulk evidence hooks. Adapt the migrated logging and API tests to current upstream interfaces.
 
@@ -27,7 +27,7 @@ Co-authored-by: Codex <noreply@openai.com>
 
 diff --git a/ALIGNMENT.md b/ALIGNMENT.md
 new file mode 100644
-index 0000000000..5446062b26
+index 0000000000000000000000000000000000000000..5446062b26210da837f81173c4dd2a522747d632
 --- /dev/null
 +++ b/ALIGNMENT.md
 @@ -0,0 +1,107 @@
@@ -139,7 +139,7 @@ index 0000000000..5446062b26
 +The final migration result and commands belong in the task artifacts. Do not
 +claim GPU/NSYS or full GLM-5.3 serving qualification from unit-test results.
 diff --git a/tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py b/tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py
-index a307dfdebf..518118e646 100644
+index a307dfdebf87f4a519aea544c490bcc3ca8f3b57..518118e64615026b401d071bb6f1612bcdaf7195 100644
 --- a/tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py
 +++ b/tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py
 @@ -12,11 +12,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
@@ -161,7 +161,7 @@ index a307dfdebf..518118e646 100644
      placeholder_ranges_from_engine_input,
  )
 diff --git a/tests/v1/engine/test_iteration_logging.py b/tests/v1/engine/test_iteration_logging.py
-index 5a08308163..b1fadb9750 100644
+index 5a08308163ec3ffa7316a2007162f2358ae4444e..b1fadb975016e5135b1a0ecda1bb75425fa19667 100644
 --- a/tests/v1/engine/test_iteration_logging.py
 +++ b/tests/v1/engine/test_iteration_logging.py
 @@ -1,9 +1,12 @@
@@ -245,7 +245,7 @@ index 5a08308163..b1fadb9750 100644
 +        assert observation == {}
 +    assert records == []
 diff --git a/tests/v1/worker/test_alignment_trace.py b/tests/v1/worker/test_alignment_trace.py
-index 42e228da0c..9d2b8fbbd0 100644
+index 42e228da0cee429fa7aa3504f27d8b49a5c7ae3f..9d2b8fbbd031acbc142d583e3271f894a155c00a 100644
 --- a/tests/v1/worker/test_alignment_trace.py
 +++ b/tests/v1/worker/test_alignment_trace.py
 @@ -12,6 +12,7 @@ from vllm.v1.worker.alignment_trace import (
@@ -289,7 +289,7 @@ index 42e228da0c..9d2b8fbbd0 100644
      row = build_token_input_row(
          iteration_index=7,
 diff --git a/tests/v1/worker/test_gpu_model_runner_v2_eplb.py b/tests/v1/worker/test_gpu_model_runner_v2_eplb.py
-index 85ab2d7cb2..1c11b312bd 100644
+index 85ab2d7cb2ac5b0c7dd2206d1c0d77cc0fed9ab5..1c11b312bdf3406a853e3e184068c7d2b56dda7b 100644
 --- a/tests/v1/worker/test_gpu_model_runner_v2_eplb.py
 +++ b/tests/v1/worker/test_gpu_model_runner_v2_eplb.py
 @@ -261,6 +261,7 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
@@ -301,7 +301,7 @@ index 85ab2d7cb2..1c11b312bd 100644
              num_reqs=2, idx_mapping=torch.zeros(2, dtype=torch.int32)
          ),
 diff --git a/vllm/distributed/aux_output_connector/worker.py b/vllm/distributed/aux_output_connector/worker.py
-index 9f215bf4d6..a147e6918f 100644
+index 9f215bf4d608fffc2b31cfbbce3192a310bac07b..a147e6918f623790aa076bbc13c4bf64254c2bc9 100644
 --- a/vllm/distributed/aux_output_connector/worker.py
 +++ b/vllm/distributed/aux_output_connector/worker.py
 @@ -139,6 +139,11 @@ class AuxOutputWorkerConnector:
@@ -317,7 +317,7 @@ index 9f215bf4d6..a147e6918f 100644
          """Snapshot one step's R3 tensor for asynchronous CPU transfer."""
          if self._buffer is None or self._step_metadata is None:
 diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
-index bfc57743ab..f3c28a26b6 100644
+index bfc57743ab5b8143dd26548d7aaddc6bc3e402e5..f3c28a26b6f311f9913b5ec16cb752f81e5a9f0b 100644
 --- a/vllm/entrypoints/openai/completion/serving.py
 +++ b/vllm/entrypoints/openai/completion/serving.py
 @@ -2,7 +2,6 @@
@@ -329,7 +329,7 @@ index bfc57743ab..f3c28a26b6 100644
  import json
  import time
 diff --git a/vllm/entrypoints/scale_out/token_in_token_out/serving.py b/vllm/entrypoints/scale_out/token_in_token_out/serving.py
-index 85da237201..fd7333dcac 100644
+index 85da23720167d6d6ca6a00ebf8babe673f0a99e2..fd7333dcac3d3605f210127b13e05b49d81eeb40 100644
 --- a/vllm/entrypoints/scale_out/token_in_token_out/serving.py
 +++ b/vllm/entrypoints/scale_out/token_in_token_out/serving.py
 @@ -3,7 +3,6 @@
@@ -341,7 +341,7 @@ index 85da237201..fd7333dcac 100644
  import json
  import math
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index dcdd3377b9..78050ff3f2 100644
+index dcdd3377b927d4c86d0324d8fa43239427e20b37..78050ff3f236a0dfeb98a42c53752484bf444b96 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -116,7 +116,7 @@ from vllm.v1.outputs import ModelRunnerOutput
@@ -354,7 +354,7 @@ index dcdd3377b9..78050ff3f2 100644
  
  logger = init_logger(__name__)
 diff --git a/vllm/v1/worker/alignment_trace.py b/vllm/v1/worker/alignment_trace.py
-index 88406ebc70..c6134bed80 100644
+index 88406ebc709648b7bf03676add4a0232e2eba385..c6134bed80ca5b99dca2fc01168a536290610b45 100644
 --- a/vllm/v1/worker/alignment_trace.py
 +++ b/vllm/v1/worker/alignment_trace.py
 @@ -24,6 +24,7 @@ import json
@@ -379,7 +379,7 @@ index 88406ebc70..c6134bed80 100644
 +
 +    return record_function_or_nullcontext(f"vllm_iteration({iteration_index}): {phase}")
 diff --git a/vllm/v1/worker/gpu/eplb_utils.py b/vllm/v1/worker/gpu/eplb_utils.py
-index 5e1c7acf84..07e8e9993d 100644
+index 5e1c7acf849fc69385491dc5494ef6528e77d639..07e8e9993d7b7ac17cf7d9280adb6816d8c7da91 100644
 --- a/vllm/v1/worker/gpu/eplb_utils.py
 +++ b/vllm/v1/worker/gpu/eplb_utils.py
 @@ -17,6 +17,7 @@ from vllm.model_executor.models.interfaces import (
@@ -404,7 +404,7 @@ index 5e1c7acf84..07e8e9993d 100644
  
          return wrapper
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index e2abe35ea0..aea2f24853 100644
+index e2abe35ea0fa3bd883e503d0e732e0f50482f362..aea2f24853403117bc0891ba8a7f2f8318608cde 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -47,6 +47,10 @@ from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
@@ -1580,7 +1580,7 @@ index e2abe35ea0..aea2f24853 100644
  
  class BatchReqState(NamedTuple):
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 7203298d76..697c1539a0 100644
+index 7203298d76afed69a71956f38ef0890a50d32e40..697c1539a0ee0e2ec736501c726b71c4e698a638 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -201,7 +201,6 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
@@ -1600,7 +1600,7 @@ index 7203298d76..697c1539a0 100644
      check_attention_cp_compatibility,
      get_dcp_dummy_context_len,
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 5c9bc6441d..7e05771df3 100644
+index 5c9bc6441d53f526da3c74a4f391d5af6655c62e..7e05771df330057121a25bf5c6ac719340812e16 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -111,6 +111,7 @@ from vllm.v1.outputs import (

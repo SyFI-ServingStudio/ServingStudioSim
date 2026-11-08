@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Wed, 23 Sep 2026 04:09:43 -0700
-Subject: [PATCH 14/18] moe: capture the MTP drafter's routes under model
- runner V2
+Subject: [PATCH] moe: capture the MTP drafter's routes under model runner V2
 
 A token corpus for an MTP deployment needs the drafter layer's routes: the
 simulator prices the MTP MoE from its own slice. Upstream sizes the capture
@@ -43,7 +42,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  6 files changed, 243 insertions(+), 4 deletions(-)
 
 diff --git a/tests/model_executor/test_routed_experts_capture.py b/tests/model_executor/test_routed_experts_capture.py
-index da70532daf..0cf33fc94b 100644
+index da70532daf520f69537103d163b845330dd4156b..0cf33fc94bd746500f86186483e171d2b1a105f8 100644
 --- a/tests/model_executor/test_routed_experts_capture.py
 +++ b/tests/model_executor/test_routed_experts_capture.py
 @@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -175,7 +174,7 @@ index da70532daf..0cf33fc94b 100644
      monkeypatch.setattr("importlib.metadata.entry_points", lambda **_: ())
      config = SimpleNamespace(
 diff --git a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
-index 2633905c04..fc28bde898 100644
+index 2633905c04e8f97e92c9627a6ae77f5d58066748..fc28bde898929eab4dd7eacec178bfab7b8e5ba2 100644
 --- a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
 +++ b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
 @@ -43,9 +43,31 @@ class RoutedExpertsRowRestorer(Protocol):
@@ -270,7 +269,7 @@ index 2633905c04..fc28bde898 100644
      from vllm.model_executor.layers.fused_moe.modular_kernel import (
          FusedMoEExpertsMonolithic,
 diff --git a/vllm/v1/worker/alignment_trace.py b/vllm/v1/worker/alignment_trace.py
-index c6134bed80..7a08e1c6f6 100644
+index c6134bed80ca5b99dca2fc01168a536290610b45..7a08e1c6f61b2654eb6c4ef4e02784dd860b6199 100644
 --- a/vllm/v1/worker/alignment_trace.py
 +++ b/vllm/v1/worker/alignment_trace.py
 @@ -286,8 +286,12 @@ def dump_routing_summary(
@@ -288,7 +287,7 @@ index c6134bed80..7a08e1c6f6 100644
          topk_ids = device_buffer[:num_tokens, layer_id, :]
          if topk_ids.numel() == 0:
 diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
-index 46182b7854..35a04e6a2d 100644
+index 46182b7854edd96ca1a9f849c1a2a1462580c91b..35a04e6a2dcd3620fe131fdc298eaa283347b200 100644
 --- a/vllm/v1/worker/gpu/async_utils.py
 +++ b/vllm/v1/worker/gpu/async_utils.py
 @@ -171,6 +171,23 @@ class AsyncOutput(AsyncModelRunnerOutput):
@@ -316,7 +315,7 @@ index 46182b7854..35a04e6a2d 100644
          self.copy_event.synchronize()
  
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index aea2f24853..ad7d68ab55 100644
+index aea2f24853403117bc0891ba8a7f2f8318608cde..ad7d68ab555a30b086d945006c6b4db1e7df7199 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -178,6 +178,9 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
@@ -404,7 +403,7 @@ index aea2f24853..ad7d68ab55 100644
                  # Spec-decode and diffusion LLMs both use draft tokens;
                  # diffusion has no speculator (self.speculator is None).
 diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
-index d5b8312b5d..cf6f69dcc3 100644
+index d5b8312b5d86b1a14cb5c7e38e5bbc8642314064..cf6f69dcc3d788fd9a6ac11f9425d611c2504f9f 100644
 --- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
 @@ -8,6 +8,9 @@ import torch

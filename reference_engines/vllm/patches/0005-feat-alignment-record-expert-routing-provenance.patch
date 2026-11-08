@@ -1,14 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Tue, 4 Aug 2026 15:27:48 +0000
-Subject: [PATCH 05/18] feat(alignment): record expert-routing provenance
+Subject: [PATCH] feat(alignment): record expert-routing provenance
 
 ---
  vllm/distributed/eplb/eplb_state.py | 12 +++++++++++-
  1 file changed, 11 insertions(+), 1 deletion(-)
 
 diff --git a/vllm/distributed/eplb/eplb_state.py b/vllm/distributed/eplb/eplb_state.py
-index fa328692a5..e4ee8505a9 100644
+index fa328692a558ef000a8966bafc4d4ef5df64d512..e4ee8505a95fcc75feac0b2a4eac5f5e360d7d4d 100644
 --- a/vllm/distributed/eplb/eplb_state.py
 +++ b/vllm/distributed/eplb/eplb_state.py
 @@ -188,6 +188,8 @@ class EplbModelState:

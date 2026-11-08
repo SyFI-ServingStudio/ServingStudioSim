@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Mon, 13 Jul 2026 23:57:32 +0000
-Subject: [PATCH 02/18] feat(alignment): emit EngineCore TPOT on completion
+Subject: [PATCH] feat(alignment): emit EngineCore TPOT on completion
 
 ---
  tests/v1/engine/test_output_processor.py |  40 ++++++++-
@@ -9,7 +9,7 @@ Subject: [PATCH 02/18] feat(alignment): emit EngineCore TPOT on completion
  2 files changed, 101 insertions(+), 39 deletions(-)
 
 diff --git a/tests/v1/engine/test_output_processor.py b/tests/v1/engine/test_output_processor.py
-index 62cddb9405..5c2d164512 100644
+index 62cddb940599001d1330bf3bf74b991c0574f5a0..5c2d164512951f0290c42d2cd1371c09c4ca393e 100644
 --- a/tests/v1/engine/test_output_processor.py
 +++ b/tests/v1/engine/test_output_processor.py
 @@ -2,9 +2,11 @@
@@ -76,7 +76,7 @@ index 62cddb9405..5c2d164512 100644
  def test_lora_request_tracking(log_stats: bool, dummy_test_vectors):
      """Test LoRA request lifecycle tracking through waiting -> running -> finished."""
 diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
-index 2ffd8bffa7..ee03a7ebe0 100644
+index 2ffd8bffa7d732ca0629f941a0893da7315455e1..ee03a7ebe028df839c810ba8f8f0366569cd8320 100644
 --- a/vllm/v1/engine/output_processor.py
 +++ b/vllm/v1/engine/output_processor.py
 @@ -1027,43 +1027,6 @@ class OutputProcessor:

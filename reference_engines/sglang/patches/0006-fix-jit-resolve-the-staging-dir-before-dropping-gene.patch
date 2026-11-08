@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Sat, 7 Nov 2026 12:27:52 -0800
-Subject: [PATCH 6/8] fix(jit): resolve the staging dir before dropping
- generated units
+Subject: [PATCH] fix(jit): resolve the staging dir before dropping generated
+ units
 
 The JIT cache records each build's transitive dependencies and drops the
 files inside the staging directory. Dependencies arrive symlink-resolved,
@@ -22,7 +22,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 26 insertions(+)
 
 diff --git a/python/sglang/kernels/jit/utils/compile/cache.py b/python/sglang/kernels/jit/utils/compile/cache.py
-index 7ff7a4178e..d52914c3f6 100644
+index 7ff7a4178e1b906abca183f01dd39f6c512acf2f..d52914c3f65dbbdbb9b5e812c4fb8a4762a462fb 100644
 --- a/python/sglang/kernels/jit/utils/compile/cache.py
 +++ b/python/sglang/kernels/jit/utils/compile/cache.py
 @@ -490,6 +490,13 @@ def _to_entries(
@@ -40,7 +40,7 @@ index 7ff7a4178e..d52914c3f6 100644
      for candidate in dependencies:
          path = (
 diff --git a/test/registered/unit/kernels/test_jit_cache.py b/test/registered/unit/kernels/test_jit_cache.py
-index f88129cff1..9900a83408 100644
+index f88129cff1fa843ac9b238d3552d80d54b89abfa..9900a83408a6f99ddb5686b760bfdc88576b04c4 100644
 --- a/test/registered/unit/kernels/test_jit_cache.py
 +++ b/test/registered/unit/kernels/test_jit_cache.py
 @@ -368,6 +368,25 @@ def test_build_directory_entries_are_dropped(tmp_path):

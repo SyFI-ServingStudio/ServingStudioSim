@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Sun, 20 Sep 2026 10:37:45 -0700
-Subject: [PATCH 12/18] eplb: read experts_per_token from the MoE runner config
+Subject: [PATCH] eplb: read experts_per_token from the MoE runner config
 
 `add_model` collected the routing width as `layer.top_k` over
 `model.moe_layers`. Those are `MoERunner` instances, which keep it on
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
  1 file changed, 5 insertions(+), 1 deletion(-)
 
 diff --git a/vllm/distributed/eplb/eplb_state.py b/vllm/distributed/eplb/eplb_state.py
-index 9e77b98a2a..bb4e46dbf8 100644
+index 9e77b98a2aca34e42c29c08bc4ed3a69429c7f5e..bb4e46dbf8d10609e37b97eed08196988ee516e4 100644
 --- a/vllm/distributed/eplb/eplb_state.py
 +++ b/vllm/distributed/eplb/eplb_state.py
 @@ -533,7 +533,11 @@ class EplbState:

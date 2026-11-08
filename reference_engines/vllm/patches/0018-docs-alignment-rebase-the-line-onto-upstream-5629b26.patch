@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Fri, 6 Nov 2026 21:16:47 -0800
-Subject: [PATCH 18/18] docs(alignment): rebase the line onto upstream 5629b26
- for DeepSeek-V4.1 DSpark
+Subject: [PATCH] docs(alignment): rebase the line onto upstream 5629b26 for
+ DeepSeek-V4.1 DSpark
 
 Record the new upstream base (main 5629b26146, 2026-11-07, with a cu130
 precompiled wheel), the wheel commit for the environment, and the
@@ -14,7 +14,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 47 insertions(+), 14 deletions(-)
 
 diff --git a/ALIGNMENT.md b/ALIGNMENT.md
-index 738347cc20..b2c3e393a3 100644
+index 738347cc20544909fa6da0ff7a7b884a54aa3870..b2c3e393a391ce98f1d95d5f68b1c8fa31a72f3f 100644
 --- a/ALIGNMENT.md
 +++ b/ALIGNMENT.md
 @@ -2,15 +2,46 @@

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Kan Zhu <kanzhu@cs.washington.edu>
 Date: Sat, 7 Nov 2026 12:28:06 -0800
-Subject: [PATCH 7/8] docs(alignment): record the carried JIT cache fix
+Subject: [PATCH] docs(alignment): record the carried JIT cache fix
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -9,7 +9,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 11 insertions(+)
 
 diff --git a/ALIGNMENT.md b/ALIGNMENT.md
-index 0dab564c79..bf7e18255f 100644
+index 0dab564c792dd1fe1d89920f27df295e29dd3026..bf7e18255f1843c2165e3af2ea249f2e350c928b 100644
 --- a/ALIGNMENT.md
 +++ b/ALIGNMENT.md
 @@ -26,6 +26,17 @@ The rebase kept all four commits, one for one, and dropped none:
