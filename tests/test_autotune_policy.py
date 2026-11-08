@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -113,6 +114,100 @@ def test_a_tune_after_a_preflight_hit_is_reported_as_a_key_mismatch(monkeypatch)
 
     with pytest.raises(AutotuneForbidden, match="manifest/actual mismatch"):
         tuner()._profile_single_kernel(object(), [], 1)
+
+
+def _module_with_unset_fields(name: str) -> tuple[types.ModuleType, list]:
+    """One fake library module per hook, its objects carrying None where the
+    real libraries may leave a field unset, and the calls to make on them
+    (`forbid_only`: calls the hooked function itself would reject)."""
+
+    module = types.ModuleType(name)
+    calls: list = []
+    forbid_only: list = []
+    if name == "flashinfer.autotuner.autotuner":
+
+        class AutoTuner:
+            def _profile_single_kernel(self, runner, inputs, tactic, *args, **kwargs):
+                return "ran"
+
+        module.AutoTuner = AutoTuner
+        calls = [
+            lambda: AutoTuner()._profile_single_kernel(None, None, None),
+            lambda: AutoTuner()._profile_single_kernel(None, [], -1),
+        ]
+        # A signature the describer cannot even bind still reports, not crashes.
+        forbid_only = [lambda: AutoTuner()._profile_single_kernel()]
+    elif name == "triton.runtime.autotuner":
+
+        class Autotuner:
+            base_fn = None
+            configs = None
+
+            def _bench(self, *args, config=None, **kwargs):
+                return "ran"
+
+        module.Autotuner = Autotuner
+        calls = [lambda: Autotuner()._bench(), lambda: Autotuner()._bench(config=None)]
+    elif name == "torch._inductor.select_algorithm":
+
+        class AlgorithmSelectorCache:
+            def autotune(self, name, *args, **kwargs):
+                return "ran"
+
+            @classmethod
+            def benchmark_choices(cls, choices, *args, **kwargs):
+                return "ran"
+
+        module.AlgorithmSelectorCache = AlgorithmSelectorCache
+        calls = [
+            lambda: AlgorithmSelectorCache().autotune(None),
+            lambda: AlgorithmSelectorCache.benchmark_choices(None),
+            lambda: AlgorithmSelectorCache.benchmark_choices([]),
+        ]
+        forbid_only = [lambda: AlgorithmSelectorCache().autotune()]
+    else:
+
+        class CachingAutotuner:
+            inductor_meta = None
+            configs = None  # what 18315's engine hit: a kernel with no config list
+
+            def benchmark_all_configs(self, *args, **kwargs):
+                return "ran"
+
+            def _coordinate_descent_tuning(self, *args, **kwargs):
+                return "ran"
+
+        module.CachingAutotuner = CachingAutotuner
+        calls = [
+            lambda: CachingAutotuner().benchmark_all_configs(),
+            lambda: CachingAutotuner().benchmark_all_configs(None, None),
+            lambda: CachingAutotuner()._coordinate_descent_tuning(),
+        ]
+    return module, calls, forbid_only
+
+
+@pytest.mark.parametrize("name", sorted(guard._PATCHES))
+def test_every_hook_reports_a_forbidden_tune_whatever_its_arguments(
+    monkeypatch, capsys, name
+) -> None:
+    module, calls, forbid_only = _module_with_unset_fields(name)
+    monkeypatch.setattr(guard, "_TUNED", {})
+    assert guard._PATCHES[name](module) == []
+
+    monkeypatch.setenv(guard.POLICY_ENV, "forbid")
+    monkeypatch.setenv(guard.PREFLIGHT_ENV, "warm-caches manifest m.json")
+    for call in calls + forbid_only:
+        with pytest.raises(AutotuneForbidden, match="manifest/actual mismatch"):
+            call()
+    err = capsys.readouterr().err
+    assert err.count(guard.MARKER) == len(calls + forbid_only)
+    # What the launchers read back from the engine's log to name the fix.
+    assert "manifest/actual mismatch" in guard.forbidden_line(err)
+
+    monkeypatch.setenv(guard.POLICY_ENV, "allow")
+    for call in calls:
+        assert call() == "ran"
+    assert sum(row["measurements"] for row in guard.tuned()) == len(calls)
 
 
 def test_the_finder_hooks_a_module_when_it_is_first_imported(tmp_path, monkeypatch) -> None:

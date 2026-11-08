@@ -128,13 +128,32 @@ def tuned(reset: bool = True) -> list[dict[str, Any]]:
 
 def _shapes(values: Any, limit: int = 8) -> list[Any]:
     shapes = []
-    for value in values or ():
+    for value in values if isinstance(values, (list, tuple)) else ():
         shape = getattr(value, "shape", None)
         if shape is not None:
             shapes.append(tuple(shape))
         if len(shapes) >= limit:
             break
     return shapes
+
+
+def _count(value: Any) -> int | None:
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
+def _describe(describe: Callable[..., dict[str, Any]], *args: Any, **kwargs: Any) -> dict[str, Any]:
+    """What a hooked call measures, for the error and the tally. Never raises:
+    the hooked libraries leave fields unset (inductor's `configs` is None on a
+    kernel built from a single config), and a guard that crashes while
+    describing a tune hides the one message that says what to do."""
+
+    try:
+        return describe(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        return {"describe_failed": f"{type(exc).__name__}: {exc}"}
 
 
 def _wrap(owner: type, name: str, describe: Callable[..., dict[str, Any]], source: str) -> bool:
@@ -149,7 +168,7 @@ def _wrap(owner: type, name: str, describe: Callable[..., dict[str, Any]], sourc
     def guarded(*args: Any, **kwargs: Any) -> Any:
         global _depth
         if not allowed():
-            forbid(source, **describe(*args, **kwargs))
+            forbid(source, **_describe(describe, *args, **kwargs))
         if _depth:
             return function(*args, **kwargs)
         _depth += 1
@@ -158,16 +177,13 @@ def _wrap(owner: type, name: str, describe: Callable[..., dict[str, Any]], sourc
             return function(*args, **kwargs)
         finally:
             _depth -= 1
-            try:
-                # One row per tuned op and shape, not per candidate tactic.
-                detail = {
-                    key: value
-                    for key, value in describe(*args, **kwargs).items()
-                    if key not in ("tactic", "config")
-                }
-                what = json.dumps(detail, default=str, sort_keys=True)
-            except Exception:  # noqa: BLE001 - accounting must not fail a tune
-                what = "?"
+            # One row per tuned op and shape, not per candidate tactic.
+            detail = {
+                key: value
+                for key, value in _describe(describe, *args, **kwargs).items()
+                if key not in ("tactic", "config")
+            }
+            what = json.dumps(detail, default=str, sort_keys=True)
             entry = _TUNED.setdefault((source, what), [0, 0.0])
             entry[0] += 1
             entry[1] += time.perf_counter() - started
@@ -198,7 +214,7 @@ def _triton(module: ModuleType) -> list[str]:
         return {
             "kernel": getattr(base, "__qualname__", repr(base)),
             "config": str(config),
-            "configs": len(getattr(self, "configs", ()) or ()),
+            "configs": _count(getattr(self, "configs", None)),
         }
 
     autotuner = getattr(module, "Autotuner", None)
@@ -215,7 +231,7 @@ def _inductor_select(module: ModuleType) -> list[str]:
         return {"op": name}
 
     def describe_choices(_cls, choices, *_args, **_kwargs):
-        return {"choices": len(choices)}
+        return {"choices": _count(choices)}
 
     if cache is None or not _wrap(cache, "autotune", describe_autotune, "inductor.max_autotune"):
         missing.append("inductor AlgorithmSelectorCache.autotune")
@@ -231,8 +247,11 @@ def _inductor_runtime(module: ModuleType) -> list[str]:
     missing = []
 
     def describe(self, *_args, **_kwargs):
-        meta = getattr(self, "inductor_meta", None) or {}
-        return {"kernel": meta.get("kernel_name"), "configs": len(getattr(self, "configs", ()))}
+        meta = getattr(self, "inductor_meta", None)
+        return {
+            "kernel": meta.get("kernel_name") if isinstance(meta, dict) else None,
+            "configs": _count(getattr(self, "configs", None)),
+        }
 
     for name, source in (
         ("benchmark_all_configs", "inductor.runtime_autotune"),
