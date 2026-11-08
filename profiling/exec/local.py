@@ -399,10 +399,6 @@ def _host_worker_command(
     )
 
 
-# A cache an image tag has not used for this long belongs to a superseded tag.
-STALE_CACHE_SECONDS = 30 * 24 * 3600
-
-
 def image_cache_key(image: str, gpu_uuids: Sequence[str]) -> str:
     """The persistent-cache directory name for ``image`` on the cards ``gpu_uuids``.
 
@@ -494,13 +490,14 @@ def image_cache_dir(image: str, gpu_uuids: Sequence[str]) -> Path:
     cache_dir = root / key
     cache_dir.mkdir(parents=True, exist_ok=True)
     os.utime(cache_dir)
-    prefix = (
-        key.split("-", 1)[0] + "-"
-        if key.startswith(("vllm-", "sglang-"))
-        else ((image.rpartition(":")[0] if ":" in image else image).replace("/", "_") + "_")
-    )
+    # Siblings are this image's other tags (`<repo>_<tag>`, also what an engine
+    # image used before it carried a key label) and, for an engine image, its
+    # other bases and architectures (`<engine>-...`).
+    prefixes = {(image.rpartition(":")[0] if ":" in image else image).replace("/", "_") + "_"}
+    if key.startswith(("vllm-", "sglang-")):
+        prefixes.add(key.split("-", 1)[0] + "-")
     now = time.time()
-    for sibling in root.glob(f"{prefix}*"):
+    for sibling in {path for prefix in prefixes for path in root.glob(f"{prefix}*")}:
         if sibling != cache_dir and now - sibling.stat().st_mtime > STALE_CACHE_SECONDS:
             shutil.rmtree(sibling, ignore_errors=True)
     return cache_dir

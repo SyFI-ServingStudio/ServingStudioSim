@@ -209,3 +209,29 @@ def test_a_superseded_image_tags_jit_cache_is_removed_once_stale(tmp_path, monke
         "vibesim-profiler-vllm_new",
         "vibesim-profiler-vllm_recent",
     ]
+
+
+def test_an_engine_cache_prunes_its_old_bases_and_unlabelled_tags(monkeypatch, tmp_path) -> None:
+    import os
+    import time
+
+    from profiling.exec import local
+
+    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path))
+    old = time.time() - local.STALE_CACHE_SECONDS - 60
+    stale = ("vllm-oldbase-sm100", "vibesim-profiler-vllm_pre-label", "sglang-oldbase-sm100")
+    for name in (*stale, "vllm-recent-sm100"):
+        (tmp_path / name).mkdir()
+    for name in stale:
+        os.utime(tmp_path / name, (old, old))
+
+    monkeypatch.setattr(local, "image_cache_key", lambda _image, _uuids: "vllm-newbase-sm100")
+    cache = local.image_cache_dir("vibesim-profiler-vllm:new", [])
+
+    assert cache == tmp_path / "vllm-newbase-sm100"
+    # The other engine's caches are its own, however old.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "sglang-oldbase-sm100",
+        "vllm-newbase-sm100",
+        "vllm-recent-sm100",
+    ]

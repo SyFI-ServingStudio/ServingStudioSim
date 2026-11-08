@@ -412,7 +412,7 @@ def run_profile_in_image(
     the field out, so the captures still match.
     """
     from launcher.alignment_config import load_profile_config
-    from profiling.exec.local import gpu_uuids_for_indices, image_cache_dir, image_cache_key
+    from profiling.exec.local import gpu_uuids_for_indices, image_cache_dir
     from reference_engines.autotune_guard import (
         POLICY_ENV,
         PREFLIGHT_ENV,
@@ -438,7 +438,7 @@ def run_profile_in_image(
     host_devices = path_info["host_devices"]
     uuids = gpu_uuids_for_indices([int(token) for token in host_devices])
     cache_dir = image_cache_dir(tag, uuids)
-    cache_key = image_cache_key(tag, uuids)
+    cache_key = cache_dir.name  # image_cache_key(tag, uuids)
     policy = warm.capture_policy(allow_autotune=allow_autotune, warm_caches=warm_caches)
     autotune_env = {POLICY_ENV: policy}
     if policy == "forbid":
