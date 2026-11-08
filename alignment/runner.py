@@ -11,8 +11,9 @@ idle polling, worker ranks), and both forks emit the identical alignment records
 so everything after the capture is shared: this module names no engine below the
 point where the driver and its `EngineRecords` descriptor are chosen.
 
-The server is spawned in its own session so a SIGINT to the group lets nsys
-finalize the `.nsys-rep` cleanly on shutdown.
+The server is spawned in its own session; on shutdown the server's process
+groups get a SIGINT, then nsys's, so nsys finalizes the `.nsys-rep` cleanly
+(`_shutdown`).
 """
 
 from __future__ import annotations
@@ -956,18 +957,77 @@ def _captured_nsys_provenance(launch_metadata: Path) -> dict | None:
     return provenance if isinstance(provenance, dict) else None
 
 
-def _shutdown(proc: subprocess.Popen) -> None:
-    """SIGINT the process group (lets nsys finalize), escalate if it lingers."""
+def _descendant_groups(pid: int) -> list[int]:
+    """Process groups of `pid`'s descendants other than its own (nsys runs
+    the application it profiles in a process group of its own)."""
+
+    children: dict[int, list[int]] = {}
+    groups: dict[int, int] = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue  # exited while we looked
+        child = int(stat.parent.name)
+        children.setdefault(int(fields[1]), []).append(child)
+        groups[child] = int(fields[2])
+    own = groups.get(pid)
+    found: list[int] = []
+    pending = list(children.get(pid, ()))
+    while pending:
+        child = pending.pop()
+        group = groups[child]
+        if group not in (own, *found):
+            found.append(group)
+        pending.extend(children.get(child, ()))
+    return found
+
+
+def _signal_groups(groups: list[int], signum: int) -> None:
+    for group in groups:
+        try:
+            os.killpg(group, signum)
+        except ProcessLookupError:
+            pass
+
+
+def _groups_alive(groups: list[int]) -> bool:
+    alive = False
+    for group in groups:
+        try:
+            os.killpg(group, 0)
+            alive = True
+        except ProcessLookupError:
+            pass
+    return alive
+
+
+def _shutdown(proc: subprocess.Popen, timeout: float = 120.0) -> None:
+    """Stop the server, then let nsys finalize; escalate if either lingers.
+
+    nsys finalizes only after the application it launched has exited
+    (`nsys profile --wait`, default `all`), and that application runs in a
+    process group of its own, so a SIGINT to the nsys group reaches the server
+    only if nsys passes it on. Sent that way, a TP4 vLLM server logged no
+    shutdown at all and nsys sat out the whole timeout over a report it had
+    already written. So the server's groups get the SIGINT directly; once they
+    are gone nsys exits by itself, and the SIGINT to its own group covers an
+    nsys that does not.
+    """
+
     if proc.poll() is not None:
         return
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+        own = os.getpgid(proc.pid)
     except ProcessLookupError:
         return
+    targets = _descendant_groups(proc.pid)
+    _signal_groups(targets, signal.SIGINT)
+    deadline = time.monotonic() + timeout
+    while _groups_alive(targets) and proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.2)
+    _signal_groups([own], signal.SIGINT)
     try:
-        proc.wait(timeout=120)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        _signal_groups([*targets, own], signal.SIGKILL)
