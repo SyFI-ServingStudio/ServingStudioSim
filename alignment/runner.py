@@ -656,7 +656,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
                     driver.set_cuda_profile(base_url, active=False)
                 except RuntimeError:
                     pass
-            _shutdown(proc)
+            _shutdown(proc, wrapped=is_nsys)
 
     return _finalize_profile(
         cfg,
@@ -1029,7 +1029,7 @@ def _groups_alive(groups: list[int]) -> bool:
     return alive
 
 
-def _shutdown(proc: subprocess.Popen, timeout: float = 120.0) -> None:
+def _shutdown(proc: subprocess.Popen, timeout: float = 120.0, *, wrapped: bool = True) -> None:
     """Stop the server, then let nsys finalize; escalate if either lingers.
 
     nsys finalizes only after the application it launched has exited
@@ -1040,6 +1040,10 @@ def _shutdown(proc: subprocess.Popen, timeout: float = 120.0) -> None:
     already written. So the server's groups get the SIGINT directly; once they
     are gone nsys exits by itself, and the SIGINT to its own group covers an
     nsys that does not.
+
+    `wrapped=False`: `proc` is the server itself (no nsys). Its own group then
+    gets the SIGINT in the same round, so a helper of the server that sits in
+    a group of its own and ignores SIGINT cannot hold the server's stop back.
     """
 
     if proc.poll() is not None:
@@ -1049,6 +1053,13 @@ def _shutdown(proc: subprocess.Popen, timeout: float = 120.0) -> None:
     except ProcessLookupError:
         return
     targets = _descendant_groups(proc.pid)
+    if not wrapped:
+        _signal_groups([own, *targets], signal.SIGINT)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _signal_groups([*targets, own], signal.SIGKILL)
+        return
     _signal_groups(targets, signal.SIGINT)
     deadline = time.monotonic() + timeout
     while _groups_alive(targets) and proc.poll() is None and time.monotonic() < deadline:

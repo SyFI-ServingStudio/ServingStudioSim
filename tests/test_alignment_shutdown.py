@@ -98,3 +98,45 @@ def test_a_server_sharing_the_launchers_group_gets_one_sigint(tmp_path) -> None:
 
     assert proc.returncode == 0
     assert log.read_text().split() == ["SIGINT"]
+
+
+_HELPER_PARENT = """
+import signal, subprocess, sys, time
+log = sys.argv[2]
+# A helper in a group of its own that ignores SIGINT (vLLM's dp supervisor
+# calls setpgrp; DeepGEMM starts a session).
+subprocess.Popen(
+    [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(60)"],
+    process_group=0,
+)
+def stop(signum, _frame):
+    open(log, "a").write("SIGINT\\n")
+    sys.exit(0)
+signal.signal(signal.SIGINT, stop)
+open(sys.argv[1], "w").write("ready")
+while True:
+    time.sleep(0.05)
+"""
+
+
+def test_an_unwrapped_server_is_signalled_at_once_despite_a_stubborn_helper(tmp_path) -> None:
+    ready, log = tmp_path / "ready", tmp_path / "server.log"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _HELPER_PARENT, str(ready), str(log)], start_new_session=True
+    )
+    deadline = time.monotonic() + 10
+    while not ready.is_file():
+        assert time.monotonic() < deadline, "fake server never started"
+        time.sleep(0.05)
+    time.sleep(0.3)
+    helper_groups = runner._descendant_groups(proc.pid)
+    assert helper_groups
+
+    started = time.monotonic()
+    runner._shutdown(proc, timeout=30, wrapped=False)
+
+    assert time.monotonic() - started < 10  # not the helper-wait timeout
+    assert proc.returncode == 0
+    assert log.read_text().split() == ["SIGINT"]
+    for group in helper_groups:
+        os.killpg(group, signal.SIGKILL)
