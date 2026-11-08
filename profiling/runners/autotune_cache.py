@@ -37,6 +37,12 @@ def _slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").lower() or "unknown"
 
 
+def tactic_version_slug(version: str) -> str:
+    """How a FlashInfer version appears in a tactic file's name (`.fi<slug>.json`)."""
+
+    return _slug(version)
+
+
 def autotune_cache_path(kernel: str) -> Path | None:
     """File holding the persisted tactics for ``kernel``, or ``None``.
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
@@ -23,6 +24,7 @@ from profiling.exec.env import (
     ContainerProfileEnv,
     ProfileEnv,
     compose_library_path,
+    compose_pythonpath,
     resolve_profile_env,
     set_worker_python_env,
 )
@@ -32,7 +34,11 @@ from profiling.gpu_policy import require_gpu
 from profiling.instrument import TIMELINE_ENV, span
 from profiling.profilers.energy import energy_enabled
 from profiling.profilers.timer import CUPTI_BUDGET_ENV, CUPTI_TRACE_ENV, TIMER_COMPARE_ENV
-from profiling.runners.autotune_cache import tactic_cache_dir, tactic_file_stem
+from profiling.runners.autotune_cache import (
+    tactic_cache_dir,
+    tactic_file_stem,
+    tactic_version_slug,
+)
 from reference_engines.autotune_guard import (
     ALLOW,
     FORBID,
@@ -136,6 +142,8 @@ class LocalGpuChunk(GpuChunk):
         worker_env = dict(profiler_spec.worker_env)
         worker_env[POLICY_ENV] = policy
         if policy == FORBID:
+            # A container's tactic dir is per base image (one FlashInfer); the
+            # host's is shared by every env, so match the env's FlashInfer.
             found = autotune_preflight(
                 kernel_kind,
                 profiler_spec,
@@ -146,6 +154,9 @@ class LocalGpuChunk(GpuChunk):
                     else tactic_cache_dir()
                 ),
                 device=gpu_name_of(self.gpus),
+                flashinfer_version=(
+                    None if container else env_flashinfer_version(profiler_env)
+                ),
             )
             if found:
                 worker_env[PREFLIGHT_ENV] = found
@@ -225,6 +236,7 @@ def autotune_preflight(
     *,
     tactic_dir: Path | None,
     device: str,
+    flashinfer_version: str | None = None,
 ) -> str | None:
     """Check, before any worker starts, that a forbid run will not need to tune.
 
@@ -234,8 +246,9 @@ def autotune_preflight(
     ``AutotuneForbiddenError`` listing every missing spec, else returns what it
     found (for ``PREFLIGHT_ENV``) or ``None`` when the row keeps no tactic file.
 
-    A present file is necessary, not sufficient: it may lack a bucket this
-    spec reaches. The worker's guard is the backstop for that, and reports it
+    With ``flashinfer_version`` only that version's file counts (another
+    version's tactics would not be read). A present file is necessary, not
+    sufficient: it may lack a bucket this spec reaches. The worker's guard is the backstop for that, and reports it
     as a manifest/actual mismatch.
     """
 
@@ -253,11 +266,12 @@ def autotune_preflight(
     for spec in specs:
         args = {key: value for key, value in spec.items() if key != "backend"}
         stem = tactic_file_stem(profiler_spec.tactic_label(**args), device)
-        hits = sorted(tactic_dir.glob(f"{stem}.fi*.json")) if tactic_dir is not None else []
+        suffix = f".fi{tactic_version_slug(flashinfer_version)}" if flashinfer_version else ".fi*"
+        hits = sorted(tactic_dir.glob(f"{stem}{suffix}.json")) if tactic_dir is not None else []
         if hits:
             files.update(hit.name for hit in hits)
         else:
-            missing.append(f"  {json.dumps(args, sort_keys=True)} -> {stem}.fi*.json")
+            missing.append(f"  {json.dumps(args, sort_keys=True)} -> {stem}{suffix}.json")
     if missing:
         raise AutotuneForbiddenError(
             f"{row}: {len(missing)} of {len(specs)} spec(s) have no persisted tactics in "
@@ -266,6 +280,30 @@ def autotune_preflight(
             "--allow-autotune. Missing:\n" + "\n".join(missing)
         )
     return f"tactic files {sorted(files)} in {tactic_dir}"
+
+
+@functools.lru_cache(maxsize=None)
+def env_flashinfer_version(profile_env: Any) -> str | None:
+    """The `flashinfer.__version__` an env imports (what names its tactic files), or None."""
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = compose_pythonpath(profile_env, None)
+    try:
+        result = subprocess.run(
+            [
+                str(profile_env.python_executable),
+                "-c",
+                "import flashinfer; print(flashinfer.__version__)",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() or None if result.returncode == 0 else None
 
 
 def _log_tuning(kernel_kind: KernelKind, backend: str, tuned: list[dict] | None) -> None:

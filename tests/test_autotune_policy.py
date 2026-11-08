@@ -263,6 +263,32 @@ def test_l1_preflight_finds_each_specs_tactic_file(tmp_path) -> None:
     assert found is not None and "fi0-7-3" in found
 
 
+def test_l1_preflight_ignores_another_flashinfers_tactics(tmp_path) -> None:
+    # The host tactic dir is shared by every env; a file another FlashInfer
+    # wrote would not be read by this env's tuner.
+    spec = find_kernel_profiler_spec("nvfp4_fused_moe", "flashinfer_trtllm_sm100")
+    label = tactic_labels.nvfp4_fused_moe_vllm(**_MOE)
+    (tmp_path / f"{tactic_file_stem(label, 'NVIDIA B200')}.fi0-7-3.json").write_text("{}")
+
+    with pytest.raises(AutotuneForbiddenError, match=r"\.fi0-6-11\.json"):
+        autotune_preflight(
+            "nvfp4_fused_moe",
+            spec,
+            [_MOE],
+            tactic_dir=tmp_path,
+            device="NVIDIA B200",
+            flashinfer_version="0.6.11",
+        )
+    assert autotune_preflight(
+        "nvfp4_fused_moe",
+        spec,
+        [_MOE],
+        tactic_dir=tmp_path,
+        device="NVIDIA B200",
+        flashinfer_version="0.7.3",
+    )
+
+
 def test_l1_preflight_lists_every_spec_without_tactics(tmp_path) -> None:
     spec = find_kernel_profiler_spec("nvfp4_fused_moe", "flashinfer_trtllm_sm100")
     other = {**_MOE, "num_local_experts": 64}
