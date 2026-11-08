@@ -56,11 +56,11 @@ TOKEN_CORPUS_DIR = "token_corpus"
 # One entry per supported engine: the launch driver, the log dialect its records
 # arrive in, and the venv python a config that names no `fork_python` defaults to.
 _ENGINES = {
-    "vllm": (vllm_server, VLLM_RECORDS, "alignment/profiler/vllm/.venv/bin/python"),
+    "vllm": (vllm_server, VLLM_RECORDS, "reference_engines/vllm/src/.venv/bin/python"),
     "sglang": (
         sglang_server,
         SGLANG_RECORDS,
-        "alignment/profiler/sglang/python/.venv-sglang/bin/python",
+        "reference_engines/sglang/src/python/.venv-sglang/bin/python",
     ),
 }
 

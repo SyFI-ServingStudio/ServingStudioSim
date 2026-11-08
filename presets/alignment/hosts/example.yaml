@@ -26,9 +26,10 @@ text_corpus: /path/to/corpus/enwik9
 # is never resolved from PATH.
 nsys_executable: /opt/nvidia/nsight-systems/<version>/target-linux-x64/nsys
 
-# Interpreter of the instrumented engine fork's venv. Leave empty to render a
-# config that loads but cannot profile — which is what the CPU test tier uses.
-fork_python: alignment/profiler/vllm/.venv/bin/python
+# Interpreter of the patched engine's venv (reference_engines/README.md, "Host
+# venv"). Leave empty to render a config that loads but cannot profile — which
+# is what the CPU test tier uses.
+fork_python: reference_engines/vllm/src/.venv/bin/python
 
 # A case names a role, not a device string, so moving a matrix to a differently
 # populated box is one edit here. Each role must list exactly tp_size * dp_size

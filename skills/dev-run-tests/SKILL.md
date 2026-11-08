@@ -23,7 +23,7 @@ and crashes — see memory `vibesim_pyo3_build_python_pin`).
 | binary | `needs_binary` | release `simulator` built | binary absent |
 | gpu | `gpu` | a CUDA device | `torch.cuda.is_available()` false |
 | db | `needs_db` | warm `profile.db` rows | *(test asserts/skips itself)* |
-| vllm fork | `needs_vllm_fork` | `alignment/profiler/vllm` submodule checkout | submodule not checked out |
+| vllm fork | `needs_vllm_fork` | materialized vLLM reference engine (`just ref materialize vllm`) | `reference_engines/vllm/src` absent |
 | agent | `agent` | Codex runner+judge | not `--run-agent` (opt-in) |
 | bench | `bench` | — (perf, non-deterministic) | not `-m bench` (opt-in) |
 | presets | `presets` | release binary + `profile.db` | excluded by `test-cpu`; run by `just test-presets` |

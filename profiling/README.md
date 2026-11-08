@@ -81,7 +81,8 @@ registry entry names instead, for debugging against a local build. Those rows
 carry the same DB key as the image's, so compare them against the image before
 keeping them. The host setups follow.
 
-`vllm_env` on the host is the alignment checkout `alignment/profiler/vllm` (or
+`vllm_env` on the host is the materialized vLLM reference engine
+`reference_engines/vllm/src` (`just ref materialize vllm`, or
 `$VIBESIM_VLLM_FORK_ROOT`) and its own `.venv`, built as
 `alignment/profiler/README.md` describes. The worker drops inherited
 site-packages from `PYTHONPATH`, so the project Torch cannot shadow the venv's

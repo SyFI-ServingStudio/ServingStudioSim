@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Sat, 7 Nov 2026 12:27:52 -0800
+Subject: [PATCH 6/8] fix(jit): resolve the staging dir before dropping
+ generated units
+
+The JIT cache records each build's transitive dependencies and drops the
+files inside the staging directory. Dependencies arrive symlink-resolved,
+but the staging directory is spelled from the configured cache root. When
+that root sits behind a symlink (~/.cache linked onto another disk), the
+generated cuda.cu failed the containment test and was recorded under its
+.staging-<uuid> path, which disappears when the leaf is published. Every
+leaf then failed its own re-hash, so every process rebuilt every JIT
+module on first use, serialized by the build lock (~5 s per rank per
+module). On GLM-5.2 TP4 that put 20 s and 18 s stalls into serving at the
+first sampling (argmax) and first decode (clamp_position) steps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../sglang/kernels/jit/utils/compile/cache.py |  7 +++++++
+ .../registered/unit/kernels/test_jit_cache.py | 19 +++++++++++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/python/sglang/kernels/jit/utils/compile/cache.py b/python/sglang/kernels/jit/utils/compile/cache.py
+index 7ff7a4178e..d52914c3f6 100644
+--- a/python/sglang/kernels/jit/utils/compile/cache.py
++++ b/python/sglang/kernels/jit/utils/compile/cache.py
+@@ -490,6 +490,13 @@ def _to_entries(
+     their paths are unstable, and their contents are already a function of
+     inputs ``build_key`` covers.
+     """
++    # Resolved like the candidates below. The staging directory is spelled from
++    # the configured cache root, which can sit behind a symlink (a home-directory
++    # `.cache` linked onto another disk); left unresolved, the generated unit
++    # fails the containment test, is recorded under its staging path, and that
++    # path vanishes at publication -- so the leaf never hits and every process
++    # rebuilds the module on first use.
++    build_dir = build_dir.resolve()
+     seen: Dict[Tuple[str, str], _DepEntry] = {}
+     for candidate in dependencies:
+         path = (
+diff --git a/test/registered/unit/kernels/test_jit_cache.py b/test/registered/unit/kernels/test_jit_cache.py
+index f88129cff1..9900a83408 100644
+--- a/test/registered/unit/kernels/test_jit_cache.py
++++ b/test/registered/unit/kernels/test_jit_cache.py
+@@ -368,6 +368,25 @@ def test_build_directory_entries_are_dropped(tmp_path):
+     assert [entry.relpath for entry in entries] == [str(outside)]
+ 
+ 
++def test_build_directory_entries_are_dropped_behind_a_symlink(tmp_path):
++    """A cache root reached through a symlink still drops the generated unit.
++
++    Dependencies arrive resolved; the staging directory is spelled from the
++    configured root. Comparing the two unresolved recorded the staging path,
++    which is gone once the leaf is published, so the leaf could never hit.
++    """
++    real_root = tmp_path / "disk"
++    real_root.mkdir()
++    (tmp_path / "home_cache").symlink_to(real_root, target_is_directory=True)
++    build_dir = tmp_path / "home_cache" / "build"
++    generated = _write(build_dir / "cuda.cu", "// generated")
++    outside = _write(tmp_path / "real.h", "// real")
++    entries = cache._to_entries(
++        dependencies=[generated.resolve(), outside], build_dir=build_dir
++    )
++    assert [entry.relpath for entry in entries] == [str(outside)]
++
++
+ def test_publish_loses_the_race_gracefully(tmp_path):
+     """Two processes building identical content: the loser adopts the winner's leaf."""
+     winner = tmp_path / "leaf"

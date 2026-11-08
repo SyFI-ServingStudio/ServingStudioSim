@@ -2,11 +2,15 @@
 
 A built image's tag is a hash of what decides its contents apart from the
 worker source: the envs it serves, the Dockerfile, the files it copies before
-the source, and the commit of each alignment checkout it installs (the
-superproject's gitlink, so the tag is known without that checkout). Any checkout
-with the same inputs names the same image, and a host that has the tag has the
-image. Workers overlay the checkout's ``profiling/``, ``launcher/`` and ``gpu/``
-(`exec/local.py`).
+the source, the commit of each submodule it builds (the superproject's gitlink,
+so the tag is known without that checkout) and the image it starts `FROM`. Any
+checkout with the same inputs names the same image, and a host that has the tag
+has the image. Workers overlay the checkout's ``profiling/``, ``launcher/`` and
+``gpu/`` (`exec/local.py`).
+
+The `vllm` and `sglang` images are the reference engines (`reference_engines/`):
+the official image pinned by digest, with the engine's patches, serving both
+L1 kernels and alignment captures.
 
 ``VIBESIM_PROFILE_IMAGES`` (a JSON object, env name -> tag) overrides the
 computed tags; `--remote` uses it to hand a job the tags its sender verified,
@@ -61,53 +65,59 @@ def _git(root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _scm_version(checkout: Path) -> str:
-    """The version setuptools-scm gives an untagged checkout, as a host install sees it.
+def _engine_base(engine: str) -> Callable[[Path], str]:
+    """The official image an engine image starts `FROM`, pinned for this host's platform."""
 
-    An image is built without the checkout's .git, where setuptools-scm cannot
-    read it; neither fork carries upstream's tags.
-    """
+    def base(root: Path) -> str:
+        from reference_engines import BaseError, host_platform, parse_base
 
-    count = _git(checkout, "rev-list", "--count", "HEAD")
-    return f"0.1.dev{count}+g{_git(checkout, 'rev-parse', '--short=9', 'HEAD')}"
+        path = root / "reference_engines" / engine / "BASE"
+        try:
+            return parse_base(path.read_text(encoding="utf-8"), str(path)).image_for(
+                host_platform()
+            )
+        except (OSError, BaseError) as exc:
+            raise ImageError(str(exc)) from None
 
-
-def _vllm_args(root: Path) -> dict[str, str]:
-    """The precompiled-wheel base of the alignment fork (alignment/profiler/README.md)."""
-
-    checkout = root / "alignment" / "profiler" / "vllm"
-    first = _git(
-        checkout,
-        "log",
-        "--reverse",
-        "--format=%H",
-        "--fixed-strings",
-        "--grep=feat(alignment):",
-        "HEAD",
-    ).splitlines()
-    if not first:
-        raise ImageError("cannot resolve the vLLM fork's first alignment commit")
-    base = _git(checkout, "rev-parse", f"{first[0]}^")
-    native = [
-        name
-        for name in _git(checkout, "diff", "--name-only", f"{base}..HEAD").splitlines()
-        if name.endswith((".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".rs"))
-    ]
-    if native:
-        raise ImageError(f"the vLLM fork changes native code ({native[:3]}); build it from source")
-    return {
-        "VLLM_REVISION": _git(checkout, "rev-parse", "HEAD"),
-        "VLLM_BASE_REVISION": base,
-        "VLLM_VERSION": _scm_version(checkout),
-    }
+    return base
 
 
-def _sglang_args(root: Path) -> dict[str, str]:
-    checkout = root / "alignment" / "profiler" / "sglang"
-    return {
-        "SGLANG_REVISION": _git(checkout, "rev-parse", "HEAD"),
-        "SGLANG_VERSION": _scm_version(checkout),
-    }
+def _engine_args(engine: str) -> Callable[[Path], dict[str, str]]:
+    def args(root: Path) -> dict[str, str]:
+        from reference_engines import parse_base
+
+        base = parse_base((root / "reference_engines" / engine / "BASE").read_text())
+        return {
+            "VIBESIM_UPSTREAM_COMMIT": base.upstream_commit,
+            "VIBESIM_REQ_FRONTEND_REVISION": gitlink(root, _REQ_FRONTEND),
+        }
+
+    return args
+
+
+_REQ_FRONTEND = "alignment/load_generator/req-frontend"
+
+
+def _engine_image(engine: str, envs: tuple[str, ...], python: str) -> Image:
+    directory = f"reference_engines/{engine}"
+    return Image(
+        engine,
+        f"{directory}/Dockerfile",
+        envs,
+        inputs=(
+            f"{directory}/BASE",
+            f"{directory}/patches",
+            "reference_engines/capture-requirements.txt",
+        ),
+        submodules=(_REQ_FRONTEND,),
+        build_args=_engine_args(engine),
+        base_image=_engine_base(engine),
+        python=python,
+        capture_python=CAPTURE_PYTHON,
+    )
+
+
+CAPTURE_PYTHON = "/opt/vibesim-capture/.venv/bin/python"
 
 
 @dataclass(frozen=True)
@@ -115,23 +125,30 @@ class Image:
     name: str
     dockerfile: str
     envs: tuple[str, ...]
-    # Files the Dockerfile copies into its dependency layers, relative to the
-    # checkout root (the build context).
+    # The interpreter that runs a worker (`python -m profiling.exec.local_worker`).
+    python: str = "/opt/venv/bin/python"
+    # Files (or directories, every file under them) the Dockerfile copies into
+    # its layers, relative to the checkout root (the build context).
     inputs: tuple[str, ...] = ()
-    # Alignment checkouts the image installs; named by their gitlink.
+    # Submodules the image builds; named by their gitlink.
     submodules: tuple[str, ...] = ()
     build_args: Callable[[Path], dict[str, str]] = field(default=lambda root: {})
-    # The image this one is built `FROM` (a key of IMAGES), passed as the
-    # `BASE_IMAGE` build argument. Its tag is an input of this one's.
-    base: str | None = None
+    # A pinned `repository@sha256:...` the image is built `FROM`, passed as the
+    # `BASE_IMAGE` build argument. It is an input of the tag.
+    base_image: Callable[[Path], str] | None = None
+    # The alignment capture runner's interpreter, in an image that runs captures.
+    capture_python: str | None = None
 
     def tag(self, root: Path = REPO_ROOT) -> str:
         digest = hashlib.sha256(f"{' '.join(self.envs)}\0".encode())
-        if self.base is not None:
-            digest.update(f"FROM {IMAGES[self.base].tag(root)}\0".encode())
+        if self.base_image is not None:
+            digest.update(f"FROM {self.base_image(root)}\0".encode())
         for relative in (self.dockerfile, *self.inputs):
-            digest.update(relative.encode() + b"\0")
-            digest.update((root / relative).read_bytes() + b"\0")
+            path = root / relative
+            files = sorted(p for p in path.rglob("*") if p.is_file()) if path.is_dir() else [path]
+            for file in files:
+                digest.update(file.relative_to(root).as_posix().encode() + b"\0")
+                digest.update(file.read_bytes() + b"\0")
         for path in self.submodules:
             digest.update(f"{path}\0{gitlink(root, path)}\0".encode())
         return f"vibesim-profiler-{self.name}:{digest.hexdigest()[:16]}"
@@ -146,52 +163,8 @@ IMAGES = {
             ("default_env", "flashinfer_pip_env", "causal_conv1d_env"),
             inputs=("pyproject.toml", "uv.lock", ".python-version"),
         ),
-        Image(
-            "vllm",
-            "profiling/container/vllm.Dockerfile",
-            ("vllm_env",),
-            submodules=("alignment/profiler/vllm",),
-            build_args=_vllm_args,
-        ),
-        Image(
-            "sglang",
-            "profiling/container/sglang.Dockerfile",
-            ("sglang_env",),
-            inputs=("profiling/container/sglang.Dockerfile.dockerignore",),
-            submodules=("alignment/profiler/sglang",),
-            build_args=_sglang_args,
-        ),
-        # The vLLM image plus what an alignment capture runs beside the server:
-        # Nsight Systems, the req-frontend load generator at its gitlink, and the
-        # capture runner's own interpreter (`alignment/image_runtime.py`). It
-        # serves no profile env.
-        Image(
-            "vllm-align",
-            "profiling/container/vllm_align.Dockerfile",
-            (),
-            inputs=("profiling/container/requirements/capture.txt",),
-            submodules=("alignment/load_generator/req-frontend",),
-            build_args=lambda root: {
-                "VIBESIM_REQ_FRONTEND_REVISION": gitlink(
-                    root, "alignment/load_generator/req-frontend"
-                )
-            },
-            base="vllm",
-        ),
-        # The same for the SGLang image (`sglang_align.Dockerfile`).
-        Image(
-            "sglang-align",
-            "profiling/container/sglang_align.Dockerfile",
-            (),
-            inputs=("profiling/container/requirements/capture.txt",),
-            submodules=("alignment/load_generator/req-frontend",),
-            build_args=lambda root: {
-                "VIBESIM_REQ_FRONTEND_REVISION": gitlink(
-                    root, "alignment/load_generator/req-frontend"
-                )
-            },
-            base="sglang",
-        ),
+        _engine_image("vllm", ("vllm_env",), "/usr/bin/python3"),
+        _engine_image("sglang", ("sglang_env",), "/opt/sglang/bin/python"),
         Image(
             "flashinfer-kda",
             "profiling/container/flashinfer_kda.Dockerfile",
@@ -215,6 +188,15 @@ def _overrides() -> dict[str, str]:
     ):
         raise ImageError(f"{IMAGES_ENV} must map profile env names to image tags")
     return overrides
+
+
+def python_for_env(env_name: str) -> str | None:
+    """The interpreter a worker for ``env_name`` runs on in its image, or None."""
+
+    for image in IMAGES.values():
+        if env_name in image.envs:
+            return image.python
+    return None
 
 
 def image_for_env(env_name: str, root: Path = REPO_ROOT) -> str | None:
@@ -271,12 +253,9 @@ def build(name: str, root: Path = REPO_ROOT) -> str:
     _require_pinned_checkouts(image, root)
     tag = image.tag(root)
     base_args = {}
-    if image.base is not None:
-        # Never pulled (module docstring): a missing base is built here first.
-        base_tag = IMAGES[image.base].tag(root)
-        if not _image_exists(base_tag):
-            build(image.base, root)
-        base_args = {"BASE_IMAGE": base_tag}
+    if image.base_image is not None:
+        base = image.base_image(root)
+        base_args = {"BASE_IMAGE": base, "VIBESIM_BASE_IMAGE": base}
     args = {
         **base_args,
         **image.build_args(root),

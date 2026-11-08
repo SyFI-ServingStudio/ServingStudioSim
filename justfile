@@ -30,9 +30,14 @@ sync:
     uv sync
 
 # The image each L1 profile env runs in (profiling/container/README.md):
-# `just profile-container-build vllm`, or every image with no argument.
+# `just profile-container-build default`, or every image with no argument.
 profile-container-build *images:
     uv run python -m profiling.container.images build {{images}}
+
+# The reference engines (reference_engines/README.md): `just ref materialize vllm`,
+# `export-patches`, `bump-base`, `build-image`.
+ref verb engine *args:
+    uv run python -m reference_engines {{verb}} {{engine}} {{args}}
 
 # The Rust tests run beside pytest; their log prints after it, in full on failure.
 # `workers` is the xdist worker count. Not `auto`: that means one worker per core,

@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Sun, 20 Sep 2026 10:37:45 -0700
+Subject: [PATCH 12/18] eplb: read experts_per_token from the MoE runner config
+
+`add_model` collected the routing width as `layer.top_k` over
+`model.moe_layers`. Those are `MoERunner` instances, which keep it on
+`moe_config.experts_per_token`; `top_k` was the attribute name before the
+runner refactor. Registering any model with EPLB enabled therefore died
+with `AttributeError: 'MoERunner' object has no attribute 'top_k'`
+during weight load, which takes down the whole expert-popularity pass.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ vllm/distributed/eplb/eplb_state.py | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/distributed/eplb/eplb_state.py b/vllm/distributed/eplb/eplb_state.py
+index 9e77b98a2a..bb4e46dbf8 100644
+--- a/vllm/distributed/eplb/eplb_state.py
++++ b/vllm/distributed/eplb/eplb_state.py
+@@ -533,7 +533,11 @@ class EplbState:
+             logical_replica_count,
+         )
+         self._propagate_shared_tensors(model, num_unpadded_tokens_tensors)
+-        experts_per_token_values = {layer.top_k for layer in model.moe_layers}
++        # `moe_layers` is a sequence of `MoERunner`, which carries the routing
++        # width on its `moe_config`; `top_k` was the pre-runner attribute name.
++        experts_per_token_values = {
++            layer.moe_config.experts_per_token for layer in model.moe_layers
++        }
+         assert len(experts_per_token_values) == 1, (
+             "all EPLB-managed MoE layers must use the same experts_per_token"
+         )

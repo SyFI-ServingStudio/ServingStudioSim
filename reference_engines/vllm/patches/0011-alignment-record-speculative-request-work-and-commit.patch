@@ -1,0 +1,304 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Sun, 20 Sep 2026 09:40:36 -0700
+Subject: [PATCH 11/18] alignment: record speculative request work and
+ committed output progress
+
+Port the extraction from the spec5 alignment branch onto this DFlash2 base. The
+per-request speculative progress bookkeeping moves out of EngineCore into
+vllm/v1/engine/alignment.py so the consumer side can load iteration_request_details
+by path and check the producer against it without importing torch or vllm.
+
+Three behavior changes come with it. output_tokens_before is now read from the
+live request in scheduler.requests rather than the scheduler's cached count,
+which can still hold an async placeholder for an earlier batch. Each progress
+entry carries external_request_id (the internal eight-hex suffix stripped) and
+request_finished_before. An emitted count above one with no drafted tokens is
+rejected.
+
+The iteration-logging test asserts the new contract and deliberately disagrees
+the cached count (12) with the live committed count (9) to pin the first change.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ tests/v1/engine/test_iteration_logging.py | 28 +++++---
+ vllm/v1/engine/alignment.py               | 84 ++++++++++++++++++++++
+ vllm/v1/engine/core.py                    | 85 +++--------------------
+ 3 files changed, 113 insertions(+), 84 deletions(-)
+ create mode 100644 vllm/v1/engine/alignment.py
+
+diff --git a/tests/v1/engine/test_iteration_logging.py b/tests/v1/engine/test_iteration_logging.py
+index b1fadb9750..6fb1830355 100644
+--- a/tests/v1/engine/test_iteration_logging.py
++++ b/tests/v1/engine/test_iteration_logging.py
+@@ -30,7 +30,7 @@ def make_iteration_details() -> SchedulerIterationDetails:
+     )
+ 
+ 
+-def make_fake_engine(log_stats: bool = True) -> SimpleNamespace:
++def make_fake_engine(log_stats: bool = True, requests: dict | None = None):
+     return SimpleNamespace(
+         log_stats=log_stats,
+         vllm_config=SimpleNamespace(
+@@ -38,6 +38,7 @@ def make_fake_engine(log_stats: bool = True) -> SimpleNamespace:
+                 enable_logging_iteration_details=True,
+             )
+         ),
++        scheduler=SimpleNamespace(requests=requests or {}),
+     )
+ 
+ 
+@@ -96,24 +97,33 @@ def test_alignment_iteration_preserves_speculative_progress(monkeypatch):
+     monkeypatch.setattr(
+         "vllm.v1.engine.core.logger.info", lambda *args: records.append(args)
+     )
+-    engine = make_fake_engine(log_stats=False)
++    # The scheduler's cached count can still hold an async placeholder, so the
++    # committed count is read from the live request instead.
++    engine = make_fake_engine(
++        log_stats=False,
++        requests={
++            "decode-8e9ffed8": SimpleNamespace(
++                num_output_tokens=9, is_finished=lambda: False
++            )
++        },
++    )
+     scheduled = SimpleNamespace(
+         total_num_scheduled_tokens=8,
+         scheduled_new_reqs=[],
+-        num_scheduled_tokens={"prefill": 2, "decode": 6},
++        num_scheduled_tokens={"prefill": 2, "decode-8e9ffed8": 6},
+         scheduled_cached_reqs=SimpleNamespace(
+-            req_ids=["prefill", "decode"],
++            req_ids=["prefill", "decode-8e9ffed8"],
+             num_computed_tokens=[16, 100],
+-            num_output_tokens=[0, 9],
++            num_output_tokens=[0, 12],
+             is_context_phase=lambda req_id: req_id == "prefill",
+         ),
+-        scheduled_spec_decode_tokens={"decode": [1, 2, 3, 4, 5]},
++        scheduled_spec_decode_tokens={"decode-8e9ffed8": [1, 2, 3, 4, 5]},
+         scheduled_encoder_input_stats=None,
+     )
+     EngineCore.assign_alignment_iteration_index(engine, scheduled)
+     with EngineCore.log_iteration_details(engine, scheduled) as observation:
+         observation["model_output"] = SimpleNamespace(
+-            req_id_to_index={"decode": 0}, sampled_token_ids=[[7, 8, 9]]
++            req_id_to_index={"decode-8e9ffed8": 0}, sampled_token_ids=[[7, 8, 9]]
+         )
+     encoded = next(
+         args[1] for args in records if args[0] == "VibeSimAlignmentIteration %s"
+@@ -125,10 +135,12 @@ def test_alignment_iteration_preserves_speculative_progress(monkeypatch):
+     assert record["decode_query_lens"] == [6]
+     assert record["decode_request_progress"] == [
+         {
+-            "engine_request_id": "decode",
++            "engine_request_id": "decode-8e9ffed8",
++            "external_request_id": "decode",
+             "kv_len": 100,
+             "query_len": 6,
+             "output_tokens_before": 9,
++            "request_finished_before": False,
+             "drafted_tokens": 5,
+             "accepted_draft_tokens": 2,
+             "emitted_tokens": 3,
+diff --git a/vllm/v1/engine/alignment.py b/vllm/v1/engine/alignment.py
+new file mode 100644
+index 0000000000..93bb036a63
+--- /dev/null
++++ b/vllm/v1/engine/alignment.py
+@@ -0,0 +1,84 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Request-level alignment observations before scheduler output is committed."""
++
++import re
++from collections.abc import Mapping
++from typing import TYPE_CHECKING, Any
++
++if TYPE_CHECKING:
++    from vllm.v1.core.sched.output import SchedulerOutput
++    from vllm.v1.outputs import ModelRunnerOutput
++    from vllm.v1.request import Request
++
++
++def iteration_request_details(
++    scheduled: "SchedulerOutput", output: "ModelRunnerOutput | None", *,
++    requests: "Mapping[str, Request]",
++    request_ids_randomized: bool = False,
++) -> dict[str, Any]:
++    """Describe scheduled shapes and sampled output without changing requests.
++
++    Output counts precede scheduler stop/length truncation. They describe the
++    verification result, not the final client-visible completion count.
++    Read committed progress at output consumption: cached scheduler counts can
++    include placeholders for earlier async batches. An already removed request
++    has no remaining progress observation, but its executed work is retained.
++    """
++    prefills = [
++        [request.num_computed_tokens, scheduled.num_scheduled_tokens[request.req_id]]
++        for request in scheduled.scheduled_new_reqs
++        if scheduled.num_scheduled_tokens.get(request.req_id, 0) > 0
++    ]
++    cached = scheduled.scheduled_cached_reqs
++    progress = []
++    for index, request_id in enumerate(cached.req_ids):
++        query_len = scheduled.num_scheduled_tokens.get(request_id, 0)
++        if query_len <= 0:
++            continue
++        kv_len = cached.num_computed_tokens[index]
++        if cached.is_context_phase(request_id):
++            prefills.append([kv_len, query_len])
++            continue
++        if output is None:
++            raise ValueError("alignment decode observation requires model output")
++        output_index = output.req_id_to_index[request_id]
++        external_id = request_id
++        if request_ids_randomized:
++            external_id, separator, suffix = request_id.rpartition("-")
++            if (
++                not separator
++                or not external_id
++                or re.fullmatch(r"[0-9a-f]{8}", suffix) is None
++            ):
++                raise ValueError(f"invalid randomized request id: {request_id!r}")
++        emitted = len(output.sampled_token_ids[output_index])
++        drafted = len(scheduled.scheduled_spec_decode_tokens.get(request_id, ()))
++        accepted = max(emitted - 1, 0) if drafted else 0
++        request = requests.get(request_id)
++        if accepted > drafted or (not drafted and emitted > 1):
++            raise ValueError(
++                f"invalid alignment decode output for {request_id!r}: "
++                f"drafted={drafted}, emitted={emitted}"
++            )
++        progress.append(
++            {
++                "engine_request_id": request_id,
++                "external_request_id": external_id,
++                "kv_len": kv_len,
++                "query_len": query_len,
++                "output_tokens_before": (
++                    request.num_output_tokens if request is not None else None
++                ),
++                "request_finished_before": request is None or request.is_finished(),
++                "drafted_tokens": drafted,
++                "accepted_draft_tokens": accepted,
++                "emitted_tokens": emitted,
++            }
++        )
++    return {
++        "prefill_chunk_pairs": prefills,
++        "decode_kv_lens": [request["kv_len"] for request in progress],
++        "decode_query_lens": [request["query_len"] for request in progress],
++        "decode_request_progress": progress,
++    }
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 78050ff3f2..0b6ef79e71 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -93,6 +93,7 @@ from vllm.v1.engine import (
+     UtilityOutput,
+     UtilityResult,
+ )
++from vllm.v1.engine.alignment import iteration_request_details
+ from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
+ from vllm.v1.engine.utils import (
+     EngineHandshakeMetadata,
+@@ -684,78 +685,6 @@ class EngineCore:
+             )
+         )
+         if scheduler_output is not None:
+-            cached_requests = scheduler_output.scheduled_cached_reqs
+-            prefill_chunk_pairs = []
+-            for new_request in scheduler_output.scheduled_new_reqs:
+-                appended_tokens = scheduler_output.num_scheduled_tokens.get(
+-                    new_request.req_id, 0
+-                )
+-                if appended_tokens > 0:
+-                    prefill_chunk_pairs.append(
+-                        [new_request.num_computed_tokens, appended_tokens]
+-                    )
+-            for request_index, request_id in enumerate(cached_requests.req_ids):
+-                if cached_requests.is_context_phase(request_id):
+-                    appended_tokens = scheduler_output.num_scheduled_tokens.get(
+-                        request_id, 0
+-                    )
+-                    if appended_tokens > 0:
+-                        prefill_chunk_pairs.append(
+-                            [
+-                                cached_requests.num_computed_tokens[request_index],
+-                                appended_tokens,
+-                            ]
+-                        )
+-            decode_kv_lens = [
+-                cached_requests.num_computed_tokens[request_index]
+-                for request_index, request_id in enumerate(cached_requests.req_ids)
+-                if not cached_requests.is_context_phase(request_id)
+-                and scheduler_output.num_scheduled_tokens.get(request_id, 0) > 0
+-            ]
+-            decode_query_lens = [
+-                scheduler_output.num_scheduled_tokens[request_id]
+-                for request_id in cached_requests.req_ids
+-                if not cached_requests.is_context_phase(request_id)
+-                and scheduler_output.num_scheduled_tokens.get(request_id, 0) > 0
+-            ]
+-            model_output = observation.get("model_output")
+-            decode_request_progress = []
+-            if model_output is not None:
+-                for request_index, request_id in enumerate(cached_requests.req_ids):
+-                    query_len = scheduler_output.num_scheduled_tokens.get(request_id, 0)
+-                    if cached_requests.is_context_phase(request_id) or query_len <= 0:
+-                        continue
+-                    output_index = model_output.req_id_to_index[request_id]
+-                    emitted_tokens = len(model_output.sampled_token_ids[output_index])
+-                    drafted_tokens = len(
+-                        scheduler_output.scheduled_spec_decode_tokens.get(
+-                            request_id, ()
+-                        )
+-                    )
+-                    accepted_draft_tokens = (
+-                        max(emitted_tokens - 1, 0) if drafted_tokens else 0
+-                    )
+-                    if accepted_draft_tokens > drafted_tokens:
+-                        raise ValueError(
+-                            "alignment speculative acceptance exceeds drafted tokens: "
+-                            f"request={request_id!r} accepted={accepted_draft_tokens} "
+-                            f"drafted={drafted_tokens}"
+-                        )
+-                    decode_request_progress.append(
+-                        {
+-                            "engine_request_id": request_id,
+-                            "kv_len": cached_requests.num_computed_tokens[
+-                                request_index
+-                            ],
+-                            "query_len": query_len,
+-                            "output_tokens_before": (
+-                                cached_requests.num_output_tokens[request_index]
+-                            ),
+-                            "drafted_tokens": drafted_tokens,
+-                            "accepted_draft_tokens": accepted_draft_tokens,
+-                            "emitted_tokens": emitted_tokens,
+-                        }
+-                    )
+             alignment_record = {
+                 "schema_version": 4,
+                 "input_adapter": "vllm_text",
+@@ -766,10 +695,14 @@ class EngineCore:
+                 "prefill_tokens": iteration_details.num_ctx_tokens,
+                 "decode_requests": iteration_details.num_generation_requests,
+                 "decode_tokens_scheduled": (iteration_details.num_generation_tokens),
+-                "prefill_chunk_pairs": prefill_chunk_pairs,
+-                "decode_kv_lens": decode_kv_lens,
+-                "decode_query_lens": decode_query_lens,
+-                "decode_request_progress": decode_request_progress,
++                **iteration_request_details(
++                    scheduler_output,
++                    observation.get("model_output"),
++                    requests=self.scheduler.requests,
++                    request_ids_randomized=(
++                        not envs.VLLM_DISABLE_REQUEST_ID_RANDOMIZATION
++                    ),
++                ),
+             }
+             logger.info(
+                 "VibeSimAlignmentIteration %s",

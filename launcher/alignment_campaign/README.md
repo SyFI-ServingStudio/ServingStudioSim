@@ -88,7 +88,7 @@ named input. Planning is a pure function (`execute.plan_phase`), which is what
 makes it testable on CPU.
 
 `--runtime image` runs each new capture of a profile pass in its engine's
-alignment image (`vllm-align`, `sglang-align`) (`alignment/README.md`, "In-image capture"); the host keeps scheduling,
+reference image (`vllm`, `sglang`; `reference_engines/README.md`) (`alignment/README.md`, "In-image capture"); the host keeps scheduling,
 markers and journal, GPU choice and outputs. Every other phase, and `--resume`,
 runs on the host from the capture's files, so a matrix can mix host and image
 captures case by case.

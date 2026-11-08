@@ -143,7 +143,7 @@ def test_container_worker_receives_the_row_env(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(local_exec, "gpu_uuids_for_indices", lambda gpus: ["GPU-x"])
     monkeypatch.setattr("profiling.exec.container_user.rootless_runtime", lambda: False)
     cmd, _env = local_exec._container_worker_command(
-        ContainerProfileEnv("c", "image:tag"),
+        ContainerProfileEnv("c", "image:tag", "/opt/venv/bin/python"),
         [0],
         tmp_path,
         worker_env={"TRITON_CACHE_AUTOTUNING": "0"},

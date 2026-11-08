@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Wed, 2 Sep 2026 01:21:26 -0700
+Subject: [PATCH 08/18] feat(alignment): record Spec5 request and expert
+ evidence
+
+Co-authored-by: OpenAI Codex <noreply@openai.com>
+---
+ .../worker/test_gpu_model_runner_v2_eplb.py   | 21 +++++--
+ vllm/distributed/eplb/eplb_state.py           | 20 +++++-
+ vllm/v1/engine/core.py                        | 63 ++++++++++++++++---
+ vllm/v1/worker/alignment_trace.py             | 11 ++++
+ vllm/v1/worker/gpu/eplb_utils.py              |  4 +-
+ vllm/v1/worker/gpu_model_runner.py            |  3 +
+ 6 files changed, 107 insertions(+), 15 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_model_runner_v2_eplb.py b/tests/v1/worker/test_gpu_model_runner_v2_eplb.py
+index 684d2d10c4..85ab2d7cb2 100644
+--- a/tests/v1/worker/test_gpu_model_runner_v2_eplb.py
++++ b/tests/v1/worker/test_gpu_model_runner_v2_eplb.py
+@@ -29,7 +29,7 @@ class FakeEplbState:
+     def __init__(self, parallel_config: Any, device: torch.device):
+         self.parallel_config = parallel_config
+         self.device = device
+-        self.add_model_calls: list[tuple[Any, Any, str | None]] = []
++        self.add_model_calls: list[tuple[Any, Any, str | None, str, int]] = []
+         self.step_calls: list[tuple[bool, bool, bool]] = []
+         self.async_started = False
+         self.is_async = True
+@@ -42,8 +42,12 @@ class FakeEplbState:
+         model_config: Any,
+         *,
+         model_name: str | None = None,
++        model_role: str = "target",
++        max_forwards_per_step: int = 1,
+     ) -> None:
+-        self.add_model_calls.append((model, model_config, model_name))
++        self.add_model_calls.append(
++            (model, model_config, model_name, model_role, max_forwards_per_step)
++        )
+ 
+     def step(self, is_dummy: bool, is_profile: bool, *, log_stats: bool) -> None:
+         self.step_calls.append((is_dummy, is_profile, log_stats))
+@@ -146,7 +150,9 @@ def test_v2_load_model_registers_moe_with_eplb(monkeypatch):
+     assert runner.model is model
+     assert runner.model_state is not None
+     assert runner.eplb_state is not None
+-    assert runner.eplb_state.add_model_calls == [(model, runner.model_config, None)]
++    assert runner.eplb_state.add_model_calls == [
++        (model, runner.model_config, None, "target", 1)
++    ]
+     assert runner.eplb_state.async_started is True
+ 
+ 
+@@ -174,7 +180,9 @@ def test_v2_load_model_with_dummy_weights_defers_eplb_async_loop(monkeypatch):
+     assert runner.load_config.load_format == "dummy"
+     assert runner.eplb_state is not None
+     # A scaling-up worker registers so it can join the EPLB communicator.
+-    assert runner.eplb_state.add_model_calls == [(model, runner.model_config, None)]
++    assert runner.eplb_state.add_model_calls == [
++        (model, runner.model_config, None, "target", 1)
++    ]
+     assert runner.eplb_state.async_started is False
+ 
+ 
+@@ -235,6 +243,7 @@ def test_v2_load_model_registers_dspark_speculator_with_eplb(monkeypatch):
+         speculative_config=SimpleNamespace(
+             method="dspark",
+             draft_model_config=draft_model_config,
++            num_speculative_tokens=3,
+         ),
+         speculator=speculator,
+     )
+@@ -242,8 +251,8 @@ def test_v2_load_model_registers_dspark_speculator_with_eplb(monkeypatch):
+ 
+     assert runner.eplb_state is not None
+     assert runner.eplb_state.add_model_calls == [
+-        (draft_model, draft_model_config, "dspark-draft (draft)"),
+-        (target_model, runner.model_config, None),
++        (draft_model, draft_model_config, "dspark-draft (draft)", "draft", 3),
++        (target_model, runner.model_config, None, "target", 1),
+     ]
+     assert speculator.eplb_state is runner.eplb_state
+ 
+diff --git a/vllm/distributed/eplb/eplb_state.py b/vllm/distributed/eplb/eplb_state.py
+index e4ee8505a9..9e77b98a2a 100644
+--- a/vllm/distributed/eplb/eplb_state.py
++++ b/vllm/distributed/eplb/eplb_state.py
+@@ -188,6 +188,10 @@ class EplbModelState:
+     last_expert_load: torch.Tensor
+     """Global logical-expert totals from the last reshuffle; equal demand initially."""
+     model_name: str
++    model_role: str
++    """Stable alignment role: ``target`` or ``draft``."""
++    max_forwards_per_step: int
++    """Maximum executions of this model per EngineCore step."""
+     experts_per_token: int
+     """Number of routed experts selected for each input token."""
+     model: MixtureOfExperts
+@@ -392,8 +396,15 @@ class EplbState:
+         model: MixtureOfExperts,
+         model_config: ModelConfig,
+         model_name: str | None = None,
++        *,
++        model_role: str = "target",
++        max_forwards_per_step: int = 1,
+     ):
+         """Build the initial EPLB state."""
++        if model_role not in {"target", "draft"}:
++            raise ValueError(f"unsupported EPLB model role: {model_role!r}")
++        if max_forwards_per_step <= 0:
++            raise ValueError("max_forwards_per_step must be positive")
+         self.validate_ep_configuration(model)
+         self.is_async = self.parallel_config.eplb_config.use_async
+ 
+@@ -560,6 +571,8 @@ class EplbState:
+                 device=self.device,
+             ),
+             model_name=model_name or model_config.model,
++            model_role=model_role,
++            max_forwards_per_step=max_forwards_per_step,
+             experts_per_token=experts_per_token,
+             model=model,
+             expert_buffer=expert_buffer,
+@@ -697,8 +710,13 @@ class EplbState:
+                         1, physical_to_logical.long(), expert_load_pass
+                     )
+                     alignment_record = {
+-                        "schema_version": 2,
++                        "schema_version": 3,
+                         "model": eplb_model_state.model_name,
++                        "model_role": eplb_model_state.model_role,
++                        "max_forwards_per_step": (
++                            eplb_model_state.max_forwards_per_step
++                        ),
++                        "observed_monotonic_ns": time.monotonic_ns(),
+                         "eplb_step": self.expert_rearrangement_step,
+                         "expert_parallel_size": ep_group.size(),
+                         "experts_per_token": eplb_model_state.experts_per_token,
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 5b34bb4b8d..dcdd3377b9 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -633,12 +633,13 @@ class EngineCore:
+ 
+     @contextmanager
+     def log_iteration_details(self, scheduler_output: SchedulerOutput | None):
++        observation: dict[str, ModelRunnerOutput] = {}
+         if not self.vllm_config.observability_config.enable_logging_iteration_details:
+-            yield
++            yield observation
+             return
+         # 0-token step: let the dummy_batch wrapper log it (avoids double-log).
+         if scheduler_output and scheduler_output.total_num_scheduled_tokens == 0:
+-            yield
++            yield observation
+             return
+         # scheduler_output=None marks a DP dummy iteration.
+         if scheduler_output is None:
+@@ -657,7 +658,7 @@ class EngineCore:
+         # start-to-end duration retains the historical "iteration elapsed"
+         # observation around result wait + sampling.
+         observed_start_monotonic_ns = time.monotonic_ns()
+-        yield
++        yield observation
+         observed_end_monotonic_ns = time.monotonic_ns()
+         observed_elapsed_ms = (
+             observed_end_monotonic_ns - observed_start_monotonic_ns
+@@ -711,8 +712,52 @@ class EngineCore:
+                 if not cached_requests.is_context_phase(request_id)
+                 and scheduler_output.num_scheduled_tokens.get(request_id, 0) > 0
+             ]
++            decode_query_lens = [
++                scheduler_output.num_scheduled_tokens[request_id]
++                for request_id in cached_requests.req_ids
++                if not cached_requests.is_context_phase(request_id)
++                and scheduler_output.num_scheduled_tokens.get(request_id, 0) > 0
++            ]
++            model_output = observation.get("model_output")
++            decode_request_progress = []
++            if model_output is not None:
++                for request_index, request_id in enumerate(cached_requests.req_ids):
++                    query_len = scheduler_output.num_scheduled_tokens.get(request_id, 0)
++                    if cached_requests.is_context_phase(request_id) or query_len <= 0:
++                        continue
++                    output_index = model_output.req_id_to_index[request_id]
++                    emitted_tokens = len(model_output.sampled_token_ids[output_index])
++                    drafted_tokens = len(
++                        scheduler_output.scheduled_spec_decode_tokens.get(
++                            request_id, ()
++                        )
++                    )
++                    accepted_draft_tokens = (
++                        max(emitted_tokens - 1, 0) if drafted_tokens else 0
++                    )
++                    if accepted_draft_tokens > drafted_tokens:
++                        raise ValueError(
++                            "alignment speculative acceptance exceeds drafted tokens: "
++                            f"request={request_id!r} accepted={accepted_draft_tokens} "
++                            f"drafted={drafted_tokens}"
++                        )
++                    decode_request_progress.append(
++                        {
++                            "engine_request_id": request_id,
++                            "kv_len": cached_requests.num_computed_tokens[
++                                request_index
++                            ],
++                            "query_len": query_len,
++                            "output_tokens_before": (
++                                cached_requests.num_output_tokens[request_index]
++                            ),
++                            "drafted_tokens": drafted_tokens,
++                            "accepted_draft_tokens": accepted_draft_tokens,
++                            "emitted_tokens": emitted_tokens,
++                        }
++                    )
+             alignment_record = {
+-                "schema_version": 2,
++                "schema_version": 4,
+                 "input_adapter": "vllm_text",
+                 "iteration_index": iteration_index,
+                 "observed_start_monotonic_ns": observed_start_monotonic_ns,
+@@ -720,9 +765,11 @@ class EngineCore:
+                 "observed_elapsed_ms": observed_elapsed_ms,
+                 "prefill_tokens": iteration_details.num_ctx_tokens,
+                 "decode_requests": iteration_details.num_generation_requests,
+-                "decode_tokens_scheduled": iteration_details.num_generation_tokens,
++                "decode_tokens_scheduled": (iteration_details.num_generation_tokens),
+                 "prefill_chunk_pairs": prefill_chunk_pairs,
+                 "decode_kv_lens": decode_kv_lens,
++                "decode_query_lens": decode_query_lens,
++                "decode_request_progress": decode_request_progress,
+             }
+             logger.info(
+                 "VibeSimAlignmentIteration %s",
+@@ -833,12 +880,13 @@ class EngineCore:
+         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+         with (
+             self.capture_iteration_details(scheduler_output) as iteration_details,
+-            self.log_iteration_details(scheduler_output),
+             self.log_error_detail(scheduler_output),
++            self.log_iteration_details(scheduler_output) as alignment_observation,
+         ):
+             model_output = self._wait_for_output(future)
+             if model_output is None:
+                 model_output = self.model_executor.sample_tokens(grammar_output)
++            alignment_observation["model_output"] = model_output
+ 
+         # Before processing the model output, process any aborts that happened
+         # during the model execution.
+@@ -938,8 +986,8 @@ class EngineCore:
+         future, scheduler_output, exec_model_fut = batch_queue.pop()
+         with (
+             self.capture_iteration_details(scheduler_output) as iteration_details,
+-            self.log_iteration_details(scheduler_output),
+             self.log_error_detail(scheduler_output),
++            self.log_iteration_details(scheduler_output) as alignment_observation,
+         ):
+             model_output = self._wait_for_output(future)
+             if model_output is None:
+@@ -947,6 +995,7 @@ class EngineCore:
+                 # call failed - raise that exception.
+                 exec_model_fut.result()
+                 raise RuntimeError("unexpected error")
++            alignment_observation["model_output"] = model_output
+ 
+         # Before processing the model output, process any aborts that happened
+         # during the model execution.
+diff --git a/vllm/v1/worker/alignment_trace.py b/vllm/v1/worker/alignment_trace.py
+index 886968f31a..88406ebc70 100644
+--- a/vllm/v1/worker/alignment_trace.py
++++ b/vllm/v1/worker/alignment_trace.py
+@@ -35,6 +35,7 @@ ROUTING_TRACE_PATH_ENV = "VLLM_VIBESIM_ROUTING_TRACE_PATH"
+ ROUTING_TRACE_ITERS_ENV = "VLLM_VIBESIM_ROUTING_TRACE_ITERS"
+ ROUTING_TRACE_BLOCK_M_ENV = "VLLM_VIBESIM_ROUTING_TRACE_BLOCK_M"
+ ROUTING_TRACE_GLOBAL_COUNTS_ENV = "VLLM_VIBESIM_ROUTING_TRACE_GLOBAL_COUNTS"
++ROUTING_TRACE_TOPK_IDS_ENV = "VLLM_VIBESIM_ROUTING_TRACE_TOPK_IDS"
+ 
+ 
+ def is_token_trace_enabled() -> bool:
+@@ -281,6 +282,7 @@ def dump_routing_summary(
+     num_tokens = min(int(num_tokens), int(device_buffer.shape[0]))
+     block_m = int(os.environ.get(ROUTING_TRACE_BLOCK_M_ENV, "64"))
+     include_global_counts = os.environ.get(ROUTING_TRACE_GLOBAL_COUNTS_ENV, "1") != "0"
++    include_topk_ids = os.environ.get(ROUTING_TRACE_TOPK_IDS_ENV, "0") == "1"
+     provenance = _device_provenance()
+ 
+     for layer_id, layer_name, layer in _iter_moe_layers(static_forward_context):
+@@ -354,5 +356,14 @@ def dump_routing_summary(
+         row.update(provenance)
+         if include_global_counts:
+             row["global_counts"] = global_counts
++        if include_topk_ids:
++            # This is deliberately opt-in: one selected decode iteration is
++            # small, while an unbounded prefill dump would be unnecessarily
++            # large. Keep the token-major layout so the companion token trace's
++            # per-request spans can recover within-request routing correlation.
++            row["global_topk_ids"] = [
++                [int(expert_id) for expert_id in token_experts]
++                for token_experts in topk_ids.detach().cpu().tolist()
++            ]
+ 
+         _append_jsonl(trace_path, row)
+diff --git a/vllm/v1/worker/gpu/eplb_utils.py b/vllm/v1/worker/gpu/eplb_utils.py
+index e7706d7087..5e1c7acf84 100644
+--- a/vllm/v1/worker/gpu/eplb_utils.py
++++ b/vllm/v1/worker/gpu/eplb_utils.py
+@@ -153,6 +153,8 @@ class EPLBController:
+             draft_moe_model,
+             draft_model_config,
+             model_name=eplb_draft_model_name(draft_model_config),
++            model_role="draft",
++            max_forwards_per_step=speculative_config.num_speculative_tokens,
+         )
+         speculator.set_eplb_state(self.state)
+         self._has_registered_models = True
+@@ -170,7 +172,7 @@ class EPLBController:
+             "EPLB is enabled for MoE part of model %s.", model_config.model
+         )
+         assert self.state is not None
+-        self.state.add_model(moe_model, model_config)
++        self.state.add_model(moe_model, model_config, model_role="target")
+         self._has_registered_models = True
+         return True
+ 
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index e95ba98290..7203298d76 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -5196,6 +5196,8 @@ class GPUModelRunner(
+                             drafter_moe_model,
+                             draft_model_config,
+                             model_name=eplb_draft_model_name(draft_model_config),
++                            model_role="draft",
++                            max_forwards_per_step=spec_config.num_speculative_tokens,
+                         )
+                         assert hasattr(self.drafter, "set_eplb_state")
+                         self.drafter.set_eplb_state(self.eplb_state)
+@@ -5218,6 +5220,7 @@ class GPUModelRunner(
+                     self.eplb_state.add_model(
+                         self._moe_model,
+                         self.model_config,
++                        model_role="target",
+                     )
+                     eplb_models += 1
+ 

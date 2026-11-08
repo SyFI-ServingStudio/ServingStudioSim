@@ -1,7 +1,0 @@
-# The capture runner's interpreter in the vllm-align image (`launcher alignment profile`
-# inside the container): what `alignment.runner` and `launcher.alignment` import, at the
-# versions uv.lock pins for the host. The vLLM server keeps its own venv.
-numpy==2.4.6
-prometheus-client==0.26.0
-pyarrow==24.0.0
-pyyaml==6.0.3

@@ -2,13 +2,13 @@
 
 The host keeps what belongs to the machine: Slurm, which GPUs, where the
 outputs go. The image owns everything that decides what the capture measures:
-the engine venv and its native extensions, Nsight Systems, the req-frontend
-binary, and the capture runner's interpreter (`profiling/container/images.py`,
-image `vllm-align` or `sglang-align`, chosen by the config's `engine`). The
+the engine (the official image with our patches, `reference_engines/`) and its
+native extensions, Nsight Systems, the req-frontend binary, and the capture
+runner's interpreter (`profiling/container/images.py`, image `vllm` or
+`sglang`, chosen by the config's `engine`; the same images run L1 kernels). The
 capture code itself is not baked in: this checkout's `alignment/` (minus its
-submodules, which the image carries), `launcher/`,
-`profiling/` and `gpu/` are overlaid read-only, exactly as L1 profiler workers
-overlay theirs.
+submodules, which the image carries), `launcher/`, `profiling/` and `gpu/` are
+overlaid read-only, exactly as L1 profiler workers overlay theirs.
 
 Inside the container every path is fixed, so a pass is described by the same
 config wherever it runs:
@@ -46,8 +46,8 @@ from profiling.exec.container_user import container_user
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: Set by the image (`vllm_align.Dockerfile`, `sglang_align.Dockerfile`); the
-#: code that behaves differently in it reads this, never the filesystem.
+#: Set by the engine images (`reference_engines/*/Dockerfile`); the code that
+#: behaves differently in it reads this, never the filesystem.
 RUNTIME_ENV = "VIBESIM_CAPTURE_RUNTIME"
 IN_IMAGE = "in-image"
 
@@ -62,22 +62,28 @@ NSYS = PurePosixPath("/opt/nvidia/nsight-systems/2025.5.2/bin/nsys")
 CONTAINER_CONFIG_NAME = "profile.container.yaml"
 CONTAINER_RUN_NAME = "container_run.json"
 
-_SOURCE_DIRS = ("profiling", "launcher", "gpu")
+_SOURCE_DIRS = ("profiling", "launcher", "gpu", "reference_engines")
 _IMEX_CHANNEL_CDI_DEVICE = "nvidia.com/imex-channel=0"
 
 
 @dataclass(frozen=True)
 class EngineImage:
-    """The alignment image that serves one engine, and its server interpreter."""
+    """The image that serves one engine: its server and capture-runner interpreters."""
 
     image: str
     fork_python: PurePosixPath
+    capture_python: PurePosixPath
 
 
-ENGINE_IMAGES = {
-    "vllm": EngineImage("vllm-align", CONTAINER_ROOT / "alignment/profiler/vllm/.venv/bin/python"),
-    "sglang": EngineImage("sglang-align", PurePosixPath("/opt/sglang-venv/bin/python")),
-}
+def _engine_image(name: str) -> EngineImage:
+    from profiling.container.images import IMAGES
+
+    image = IMAGES[name]
+    assert image.capture_python is not None, f"image {name} runs no captures"
+    return EngineImage(name, PurePosixPath(image.python), PurePosixPath(image.capture_python))
+
+
+ENGINE_IMAGES = {engine: _engine_image(engine) for engine in ("vllm", "sglang")}
 
 
 def in_image() -> bool:
@@ -292,6 +298,7 @@ def docker_argv(
     image: str,
     mounts: Mounts,
     *,
+    capture_python: PurePosixPath,
     gpu_uuids: list[str],
     cache_dir: Path,
     name: str,
@@ -316,6 +323,9 @@ def docker_argv(
         f'"device={",".join(gpu_uuids)}"',
         "--device",
         _IMEX_CHANNEL_CDI_DEVICE,
+        # Explicit: the image's L1 workers run another interpreter and module.
+        "--entrypoint",
+        str(capture_python),
         "--user",
         user,
         "--env",
@@ -334,6 +344,8 @@ def docker_argv(
         f"{cache_dir}:{CACHE}:rw",
         *mounts.args(),
         image,
+        "-m",
+        "launcher",
         "alignment",
         "profile",
         str(WORK / "profile.yaml"),
@@ -382,7 +394,7 @@ def run_profile_in_image(config_path: Path, *, image: str | None = None) -> int:
     if subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode:
         raise ImageRunError(
             f"image {tag} is not on this host; build it with "
-            f"`just profile-container-build {ENGINE_IMAGES[cfg.engine].image}`"
+            f"`just ref build-image {cfg.engine}`"
         )
     container_config_path = log_dir / CONTAINER_CONFIG_NAME
     container_config_path.write_text(yaml.safe_dump(document, sort_keys=False))
@@ -394,7 +406,14 @@ def run_profile_in_image(config_path: Path, *, image: str | None = None) -> int:
     uuids = gpu_uuids_for_indices([int(token) for token in host_devices])
     cache_dir = _image_cache_dir(tag)
     name = f"vibesim-capture-{os.getpid()}"
-    argv = docker_argv(tag, mounts, gpu_uuids=uuids, cache_dir=cache_dir, name=name)
+    argv = docker_argv(
+        tag,
+        mounts,
+        capture_python=ENGINE_IMAGES[cfg.engine].capture_python,
+        gpu_uuids=uuids,
+        cache_dir=cache_dir,
+        name=name,
+    )
     image_id = subprocess.run(
         ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
         capture_output=True,

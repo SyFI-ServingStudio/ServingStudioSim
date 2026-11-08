@@ -90,7 +90,7 @@ def test_a_missing_image_names_its_build_command(monkeypatch):
     )
     monkeypatch.setattr("profiling.exec.env.shutil.which", lambda _: "/usr/bin/docker")
     with pytest.raises(FileNotFoundError, match="images build flashinfer-kda"):
-        ContainerProfileEnv("flashinfer_kda_env", "vibesim-profiler-flashinfer-kda:0123").validate()
+        ContainerProfileEnv("flashinfer_kda_env", "vibesim-profiler-flashinfer-kda:0123", "/opt/venv/bin/python").validate()
 
 
 def test_an_unknown_runtime_is_rejected(monkeypatch):

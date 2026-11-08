@@ -4,7 +4,7 @@ All Python-side per-kernel knowledge for ``rel_bias_attention`` lives here: the
 wire string ``KIND``, the ``RelBiasAttentionArgs`` schema, and the
 ``register(...)`` call that wires the kind into ``profiling.db.registry``.
 
-Source: the alignment vLLM fork (``alignment/profiler/vllm``). Per layer,
+Source: the vLLM reference engine (``reference_engines/vllm``). Per layer,
 ``InklingAttention._attention`` (``vllm/models/inkling/nvidia/attention.py``)
 computes ``num_splits = inkling_fa4_num_splits(...)`` and makes ONE call to
 ``InklingFA4RelAttentionKernel.kernel``

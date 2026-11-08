@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -57,25 +58,30 @@ def _config(tmp_path: Path, **overrides) -> Path:
 
 
 @pytest.mark.parametrize("engine", ["vllm", "sglang"])
-def test_align_image_tag_names_its_base_and_load_generator(engine):
-    name = image_runtime.ENGINE_IMAGES[engine].image
-    align = images.IMAGES[name]
-    assert align.base == engine
-    assert align.envs == ()
-    assert "alignment/load_generator/req-frontend" in align.submodules
-    # A new engine image (another fork gitlink) is a new alignment image.
-    other = images.Image(
-        name,
-        align.dockerfile,
-        align.envs,
-        align.inputs,
-        align.submodules,
-        align.build_args,
-        base="default",
-    )
-    assert other.tag(REPO_ROOT) != align.tag(REPO_ROOT)
-    assert image_runtime.image_tag(engine, REPO_ROOT) == align.tag(REPO_ROOT)
-    assert align.tag(REPO_ROOT).startswith(f"vibesim-profiler-{name}:")
+def test_engine_image_serves_l1_and_captures_from_its_pinned_base(engine, tmp_path, monkeypatch):
+    image = images.IMAGES[image_runtime.ENGINE_IMAGES[engine].image]
+    # One image per engine: the L1 env and the captures share it.
+    assert image.envs == (f"{engine}_env",)
+    assert image.capture_python == str(image_runtime.ENGINE_IMAGES[engine].capture_python)
+    assert "alignment/load_generator/req-frontend" in image.submodules
+    assert image.base_image(REPO_ROOT).split("@")[1].startswith("sha256:")
+    assert image_runtime.image_tag(engine, REPO_ROOT) == image.tag(REPO_ROOT)
+    assert image.tag(REPO_ROOT).startswith(f"vibesim-profiler-{engine}:")
+
+    # The tag follows BASE and every patch: a copy of the inputs with one patch
+    # line changed names another image.
+    for relative in (image.dockerfile, *image.inputs):
+        source, target = REPO_ROOT / relative, tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            target.write_bytes(source.read_bytes())
+    monkeypatch.setattr(images, "gitlink", lambda root, path: "0" * 40)
+    before = image.tag(tmp_path)
+    patch = sorted((tmp_path / f"reference_engines/{engine}/patches").glob("*.patch"))[-1]
+    patch.write_text(patch.read_text() + "\n")
+    assert image.tag(tmp_path) != before
 
 
 def test_container_config_uses_fixed_paths(tmp_path):
@@ -132,7 +138,7 @@ def test_container_config_serves_sglang_from_its_image_venv(tmp_path):
     }
     config = _config(tmp_path, engine="sglang", python_runtime=runtime)
     document, _, _ = image_runtime.container_config(config, tmp_path / "out")
-    assert document["fork_python"] == "/opt/sglang-venv/bin/python"
+    assert document["fork_python"] == "/opt/sglang/bin/python"
     # The prebuilt-artifact contract travels unchanged; the image must satisfy it.
     assert document["python_runtime"] == runtime
 
@@ -148,13 +154,9 @@ def test_container_config_refuses_what_the_image_cannot_honour(tmp_path):
 def test_overlay_keeps_the_images_own_submodules():
     targets = set(image_runtime.overlay_mounts(REPO_ROOT).entries.values())
     assert "/opt/vibesim/alignment/runner.py" in targets
-    assert "/opt/vibesim/alignment/profiler/vllm_server.py" in targets
+    assert "/opt/vibesim/alignment/profiler" in targets
     assert "/opt/vibesim/launcher" in targets
-    for submodule in (
-        "alignment/profiler/vllm",
-        "alignment/profiler/sglang",
-        "alignment/load_generator/req-frontend",
-    ):
+    for submodule in ("alignment/load_generator/req-frontend",):
         path = f"/opt/vibesim/{submodule}"
         assert not any(target == path or path.startswith(target + "/") for target in targets)
 
@@ -208,3 +210,19 @@ def test_capture_facts_refuse_only_what_the_config_states(tmp_path):
     assert "names 1 visible" in capture_facts.check(cfg, facts | {"gpus": gpus[:1]})[0]
     other = [gpus[0], {"index": "3", "name": "NVIDIA H200"}]
     assert "NVIDIA H200" in capture_facts.check(cfg, facts | {"gpus": other})[0]
+
+
+def test_capture_runs_the_capture_interpreter_explicitly(tmp_path):
+    engine = image_runtime.ENGINE_IMAGES["vllm"]
+    argv = image_runtime.docker_argv(
+        "vibesim-profiler-vllm:test",
+        image_runtime.Mounts(),
+        capture_python=engine.capture_python,
+        gpu_uuids=["GPU-a"],
+        cache_dir=tmp_path,
+        name="capture",
+        rootless=True,
+    )
+    assert argv[argv.index("--entrypoint") + 1] == "/opt/vibesim-capture/.venv/bin/python"
+    image = argv.index("vibesim-profiler-vllm:test")
+    assert argv[image + 1 :] == ["-m", "launcher", "alignment", "profile", "/work/profile.yaml"]

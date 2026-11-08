@@ -47,9 +47,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from alignment.image_runtime import in_image
+from reference_engines import source_dir
+
 from .config import IdleWaitConfig, ProfileConfig, ServerConfig
 
-SGLANG_SOURCE_ROOT = Path(__file__).resolve().parent / "sglang" / "python"
+# The materialized source tree's package root (`just ref materialize sglang`).
+SGLANG_SOURCE_ROOT = source_dir("sglang") / "python"
 
 HEALTH_ENDPOINTS = ("/health", "/v1/models")
 
@@ -170,15 +174,17 @@ def build_server_env(
     child cannot import main's packages, prepend the venv bin, and rebuild
     PYTHONPATH to the checked-out source so an editable install elsewhere cannot
     win. `driver_compat_lib_dir`, when set, goes ahead of the torch libs so its
-    `libcuda.so.1` is the one the child resolves.
+    `libcuda.so.1` is the one the child resolves. In an engine image SGLang runs
+    as the official image installed it (its checkout, patched in place).
     """
     env = dict(os.environ)
     for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"):
         env.pop(key, None)
 
-    venv_bin = str(Path(fork_python).parent)
-    env["PATH"] = os.pathsep.join([venv_bin, env.get("PATH", "")])
-    env["PYTHONPATH"] = str(SGLANG_SOURCE_ROOT)
+    if not in_image():
+        venv_bin = str(Path(fork_python).parent)
+        env["PATH"] = os.pathsep.join([venv_bin, env.get("PATH", "")])
+        env["PYTHONPATH"] = str(SGLANG_SOURCE_ROOT)
     env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     env["SGLANG_ENABLE_VIBESIM_ALIGNMENT"] = "1"
     # The `sglang_iteration(N): forward` range rides SGLang's own per-subsystem
@@ -197,7 +203,8 @@ def build_server_env(
             )
         library_paths.append(str(compat))
     for torch_lib in Path(fork_python).parents[1].glob("lib/python*/site-packages/torch/lib"):
-        library_paths.append(str(torch_lib))
+        if not in_image():
+            library_paths.append(str(torch_lib))
         break
     if library_paths:
         env["LD_LIBRARY_PATH"] = os.pathsep.join([*library_paths, env.get("LD_LIBRARY_PATH", "")])
@@ -257,7 +264,7 @@ def write_launch_metadata(
         "nsys_profiler": profiler_provenance,
         "python_runtime": runtime_provenance,
         "fork_python": fork_python,
-        "fork_git": _git_info(SGLANG_SOURCE_ROOT.parent),
+        "fork_git": None if in_image() else _git_info(SGLANG_SOURCE_ROOT.parent),
     }
     Path(path).write_text(json.dumps(metadata, indent=2))
 

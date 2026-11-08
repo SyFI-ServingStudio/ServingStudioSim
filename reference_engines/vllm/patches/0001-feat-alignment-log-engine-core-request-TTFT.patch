@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Mon, 13 Jul 2026 06:52:12 +0000
+Subject: [PATCH 01/18] feat(alignment): log engine-core request TTFT
+
+---
+ vllm/v1/engine/output_processor.py | 41 ++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index a17fb259c0..2ffd8bffa7 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import asyncio
++import json
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+ from dataclasses import dataclass
+@@ -10,6 +11,8 @@ from typing import TYPE_CHECKING, Any, cast
+ import numpy as np
+ import torch
+ 
++import vllm.envs as envs
++from vllm.logger import init_logger
+ from vllm.lora.request import LoRARequest
+ from vllm.outputs import (
+     STREAM_FINISHED,
+@@ -49,6 +52,7 @@ if TYPE_CHECKING:
+ 
+ # shared empty CPU tensor used as a placeholder pooling output
+ EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
++logger = init_logger(__name__)
+ 
+ 
+ class RequestOutputCollector:
+@@ -1023,6 +1027,43 @@ class OutputProcessor:
+             self.lora_states,
+             req_state.lora_name,
+         )
++        if (
++            envs.VLLM_NVTX_SCOPES_FOR_PROFILING
++            and req_state.is_prefilling
++            and engine_core_output.new_token_ids
++        ):
++            queued_ts = req_state.stats.queued_ts
++            scheduled_ts = req_state.stats.scheduled_ts
++            if queued_ts <= 0.0 or scheduled_ts <= 0.0:
++                logger.warning(
++                    "VibeSim alignment request timing unavailable for %s: "
++                    "queued_ts=%s scheduled_ts=%s",
++                    req_state.external_req_id,
++                    queued_ts,
++                    scheduled_ts,
++                )
++            else:
++                # Both boundaries use EngineCore's monotonic clock. QUEUED is
++                # recorded when Scheduler.add_request appends to waiting; the
++                # EngineCoreOutputs timestamp is created after the first-token
++                # model iteration has returned and its output has been processed.
++                timing_record = {
++                    "schema_version": 1,
++                    # OpenAI completions wraps the caller's X-Request-Id as
++                    # `cmpl-<source-id>-0`; the profile extractor owns removing
++                    # that wire-protocol envelope and retains this raw id for audit.
++                    "engine_request_id": req_state.external_req_id,
++                    "engine_core_ttft_ms": (engine_core_timestamp - queued_ts) * 1000.0,
++                    "engine_queue_wait_ms": (scheduled_ts - queued_ts) * 1000.0,
++                    "engine_first_schedule_to_first_token_ms": (
++                        engine_core_timestamp - scheduled_ts
++                    )
++                    * 1000.0,
++                }
++                logger.info(
++                    "VibeSimAlignmentRequestTiming %s",
++                    json.dumps(timing_record, separators=(",", ":")),
++                )
+ 
+     def _update_stats_from_finished(
+         self,

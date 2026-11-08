@@ -7,7 +7,7 @@ vLLM), records launch metadata, and offers ready/idle polling over the
 OpenAI-compatible endpoints. The actual spawn is wrapped by `nsys_capture.py` and
 orchestrated in `__main__.py`.
 
-The fork (`alignment/profiler/vllm`, branch `servingstudio-alignment`) adds the
+The patched engine (`reference_engines/vllm`: upstream plus `patches/`) adds the
 `vllm_iteration(N): <phase>` NVTX scopes (gated by `VLLM_NVTX_SCOPES_FOR_PROFILING`)
 and a versioned `VibeSimAlignmentIteration {json}` record containing the exact
 model input shape consumed by the typed predictor adapter. Per-request
@@ -28,9 +28,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from alignment.image_runtime import in_image
+from reference_engines import source_dir
+
 from .config import IdleWaitConfig, ProfileConfig, ServerConfig
 
-VLLM_SOURCE_ROOT = Path(__file__).resolve().parent / "vllm"
+# The materialized source tree (`just ref materialize vllm`) a host venv installs.
+VLLM_SOURCE_ROOT = source_dir("vllm")
 _IMAGE_MANIFEST = Path("/etc/vibesim-profiler-image.json")
 
 HEALTH_ENDPOINTS = ("/health", "/v1/models")
@@ -151,14 +155,16 @@ def build_server_env(
     *,
     driver_compat_lib_dir: str = "",
 ) -> dict[str, str]:
-    """A subprocess env pinned to the canonical fork source and its venv.
+    """A subprocess env pinned to the patched engine source and its venv.
 
     Mirrors `ref/profile/attention/vllm_flashattention_profiler.py`: drop main's
-    inherited Python/uv markers, prepend the fork venv bin to PATH, and point
-    LD_LIBRARY_PATH at the fork's torch libs. PYTHONPATH is then rebuilt to the
-    checked-out `alignment/profiler/vllm` source so an already-provisioned venv
+    inherited Python/uv markers, prepend the venv bin to PATH, and point
+    LD_LIBRARY_PATH at the venv's torch libs. PYTHONPATH is then rebuilt to the
+    materialized `reference_engines/vllm/src` so an already-provisioned venv
     cannot silently import a different editable checkout; binary extensions and
-    third-party dependencies still come from the selected venv.
+    third-party dependencies still come from the selected venv. In an engine
+    image the engine runs as the official image installed it (patched in
+    place), so only the inherited markers are dropped.
     """
     env = dict(os.environ)
     # The profiler owns an unauthenticated loopback server and its paired load
@@ -174,11 +180,13 @@ def build_server_env(
     ):
         env.pop(key, None)
 
+    env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    env["VLLM_NVTX_SCOPES_FOR_PROFILING"] = "1"
+    if in_image():
+        return env
     venv_bin = str(Path(fork_python).parent)
     env["PATH"] = os.pathsep.join([venv_bin, env.get("PATH", "")])
     env["PYTHONPATH"] = str(VLLM_SOURCE_ROOT)
-    env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
-    env["VLLM_NVTX_SCOPES_FOR_PROFILING"] = "1"
 
     torch_lib = Path(fork_python).parents[1] / "lib"
     # site-packages/torch/lib holds libc10/libtorch; find it under the venv.
@@ -253,7 +261,7 @@ def write_launch_metadata(
         "nsys_profiler": profiler_provenance,
         "python_runtime": runtime_provenance,
         "fork_python": fork_python,
-        "fork_git": _git_info(VLLM_SOURCE_ROOT),
+        "fork_git": None if in_image() else _git_info(VLLM_SOURCE_ROOT),
         # An image carries no .git; its manifest names the inputs it was built from.
         "image": (
             json.loads(_IMAGE_MANIFEST.read_text()) if _IMAGE_MANIFEST.is_file() else None

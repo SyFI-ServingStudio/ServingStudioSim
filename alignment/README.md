@@ -139,7 +139,7 @@ log_dir: ./profile
 gpu: NVIDIA H200
 cuda_visible_devices: "0"
 engine: vllm
-fork_python: ../../alignment/profiler/vllm/.venv/bin/python
+fork_python: ../../reference_engines/vllm/src/.venv/bin/python
 
 server:
   model_path: meta-llama/Meta-Llama-3-8B
@@ -185,14 +185,14 @@ no stream and no topology to state: a corpus records logical expert ids, so the
 pass produces routes alone. A model that does not implement EPLB opts out with
 `--no-enable-eplb` in `server.extra_args` and likewise records routes alone.
 
-Set `engine: sglang` to use the instrumented SGLang submodule instead. Its
-default environment path is
-`alignment/profiler/sglang/python/.venv-sglang/bin/python`, so
-`fork_python` may be omitted after that environment has been built. Both fork
-commits are pinned by the parent repository; initialize them with
-`git submodule update --init alignment/profiler/vllm
-alignment/profiler/sglang`. See `alignment/profiler/README.md` for the separate
-environment setup commands.
+Set `engine: sglang` to use the instrumented SGLang instead. Its default host
+environment path is
+`reference_engines/sglang/src/python/.venv-sglang/bin/python`, so
+`fork_python` may be omitted after that environment has been built. Both
+engines are an upstream commit plus patches (`reference_engines/README.md`);
+materialize a host source tree with `just ref materialize vllm` (or `sglang`).
+See `alignment/profiler/README.md` for the environment setup commands, or
+capture in the engine's image ("In-image capture") with no host environment.
 
 A session frontend selects a canonical `session-execution-v2` trace, whose
 prefix/new-input split per row is already materialized:
@@ -527,19 +527,20 @@ uv run python -m launcher alignment analyze logs/<experiment>/analyze_e2e.yaml
 ### In-image capture
 
 `alignment profile --runtime image <profile.yaml>` runs the same capture inside
-the engine's alignment profiler image, `vllm-align` or `sglang-align`
-(`profiling/container/README.md`), instead of on the checkout's fork venv and
-the host's Nsight Systems. The vLLM image fixes
-everything that decides what is measured: the vLLM fork at its gitlink on the
-precompiled wheel of its upstream base, every FlashInfer cubin, Nsight Systems
+the engine's image, `vllm` or `sglang` (`reference_engines/README.md`; the same
+image runs the engine's L1 kernels), instead of on a host venv and the host's
+Nsight Systems. The image fixes everything that decides what is measured: the
+engine's official image pinned by digest with our patches applied to the
+engine it installs, every FlashInfer cubin and its AOT JIT cache, Nsight Systems
 2025.5.2 (the apt package, at the same `/opt/nvidia/...` path as the hosts), the
 req-frontend `session_runner` at its gitlink, and the capture runner's own
-interpreter. This checkout's `alignment/` (minus its three submodules),
-`launcher/`, `profiling/` and `gpu/` are overlaid read-only, so a code change
-needs no rebuild. `sglang-align` is the same over the SGLang profiler image: its
-server runs `/opt/sglang-venv/bin/python` on the fork source the image carries,
-and the config's `python_runtime` contract is checked against that venv as on a
-host; with `--network none` a wheel the image lacks is refused, not installed. `alignment/image_runtime.py` owns the mapping:
+interpreter. This checkout's `alignment/` (minus its submodule), `launcher/`,
+`profiling/`, `gpu/` and `reference_engines/` are overlaid read-only, so a code
+change needs no rebuild. The vLLM server runs `/usr/bin/python3` (the official
+image's install) and the SGLang server `/opt/sglang/bin/python`; the config's
+`python_runtime` contract is checked against that interpreter as on a host, and
+with `--network none` a wheel the image lacks is refused, not installed.
+`alignment/image_runtime.py` owns the mapping:
 
 | Container path | Mount | Holds |
 | --- | --- | --- |
@@ -567,11 +568,11 @@ container paths to its own (the container's copy stays as
 campaign read an image capture exactly like a host one. `container_run.json`
 records the image tag and id, the docker argv, the GPUs and the path map;
 `profile.container.yaml` is the config the container ran. `--resume` always runs
-on the host, from the capture's own files. The image runs vLLM only; a config
-with `driver_compat_lib_dir` is refused, since the image brings its own CUDA user
-space. A `python_runtime` package must already be in the image (it pins
-`nvtx==0.2.15`, as the packs do): with no network, a missing one fails before
-the server starts.
+on the host, from the capture's own files. A config with `driver_compat_lib_dir`
+is refused, since the image brings its own CUDA user space. A `python_runtime`
+package must already be in the image (the vLLM image has `nvtx==0.2.15`, the
+SGLang image `nvtx==0.2.16`, and both FlashInfer 0.7.3): with no network, a
+missing one fails before the server starts.
 
 `prewarm` (optional, any runtime) sends requests that compile per-shape kernels
 before measurement: after the server is ready and before the load generator

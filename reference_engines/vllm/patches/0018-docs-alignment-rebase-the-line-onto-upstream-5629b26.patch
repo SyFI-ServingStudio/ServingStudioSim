@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Fri, 6 Nov 2026 21:16:47 -0800
+Subject: [PATCH 18/18] docs(alignment): rebase the line onto upstream 5629b26
+ for DeepSeek-V4.1 DSpark
+
+Record the new upstream base (main 5629b26146, 2026-11-07, with a cu130
+precompiled wheel), the wheel commit for the environment, and the
+commits adapted to upstream changes. No commit was dropped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ALIGNMENT.md | 61 ++++++++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 47 insertions(+), 14 deletions(-)
+
+diff --git a/ALIGNMENT.md b/ALIGNMENT.md
+index 738347cc20..b2c3e393a3 100644
+--- a/ALIGNMENT.md
++++ b/ALIGNMENT.md
+@@ -2,15 +2,46 @@
+ 
+ `servingstudio-alignment` is the one maintained ServingStudio line of this fork.
+ It sits on official vLLM `upstream/main`; the current upstream base is main
+-`04730e82700d0c9b957cda188dd1bbc8073e1fcd` (2026-09-24). That is the newest
+-main commit with a published `cu130` precompiled wheel that contains
+-`vllm/models/deepseek_v41`, so DeepSeek-V4.1 can be served. ServingStudio Sim
+-pins the line at `alignment/profiler/vllm`.
+-
+-The line was previously based on `8369affa5428ca29a30f378d660fbffbad12e240`
+-(v0.28.1rc0). The rebase onto `04730e8` kept one commit per instrumentation
+-commit, except `Bind AsyncLLM.profiler on every profiler backend`. That commit
+-is dropped because upstream `c3ec0d29f5` binds `AsyncLLM.profiler` itself.
++`5629b26146a39705c814ddae6a0f98321e14d2a6` (2026-11-07). It has a published
++`cu130` precompiled wheel and carries DeepSeek-V4.1 with its DSpark drafter
++(`vllm/models/deepseek_v41/nvidia/dspark.py`,
++`vllm/v1/worker/gpu/spec_decode/dspark/`). ServingStudio Sim pins the line at
++`alignment/profiler/vllm`.
++
++Earlier bases were `04730e82700d0c9b957cda188dd1bbc8073e1fcd` (main,
++2026-09-24) and `8369affa5428ca29a30f378d660fbffbad12e240` (v0.28.1rc0). The
++rebase onto `04730e8` dropped `Bind AsyncLLM.profiler on every profiler
++backend`, because upstream `c3ec0d29f5` binds `AsyncLLM.profiler` itself.
++
++The rebase onto `5629b26` kept all 17 commits, one for one. These commits were
++adapted to upstream changes:
++
++- `restore iteration and expert profiling`: upstream now copies EPLB
++  balancedness stats to the host without blocking and logs them on a later
++  step. `VibeSimAlignmentExpertLoad` follows the same path. The logical counts
++  are copied with the balancedness stats, and the record is logged when that
++  copy completes. `observed_monotonic_ns` is still taken at the observed step.
++  The record of the last logged step before shutdown can be lost.
++- `decompose API-side request latency`: the two API timing arguments are
++  optional keywords, so upstream callers and tests do not pass them. Completions
++  also time upstream's templated plain-delta frames. Token-in/token-out counts
++  only chunks that carry tokens; upstream now also streams terminal and
++  held-back-text chunks.
++- `record Spec5 request and expert evidence`: `EplbState.add_model` keeps
++  upstream's `model_name` and adds `model_role` and `max_forwards_per_step` as
++  keyword arguments. The V2 EPLB test's DSpark speculator stub now has
++  `num_speculative_tokens`.
++- `instrument upstream model runner v2 for DFlash2`: the phase scopes were
++  applied again to upstream's runner. `step_timing.record_batch` and
++  `forward_start` are inside `preprocess`. The routing capturer binds after
++  `initialize_output_storage`, because upstream creates the AuxOutput connector
++  in `profile_run`.
++- `add a record-only mode that never rearranges`: this commit adapts
++  upstream's `symm_mem` communicator-owned expert buffer.
++- `capture the MTP drafter's routes under model runner V2`: upstream split the
++  autoregressive speculator. The hold and restore of the drafter's slots now
++  wrap `AutoRegressiveSpeculator._run_multi_step_decode`, which MTP uses
++  through `TargetDependentARSpeculator`.
+ 
+ It converges two earlier lines:
+ 
+@@ -53,7 +84,7 @@ or native extensions. The installation used:
+ ```bash
+ uv venv --python 3.12 .venv
+ VLLM_USE_PRECOMPILED=1 \
+-VLLM_PRECOMPILED_WHEEL_COMMIT=04730e82700d0c9b957cda188dd1bbc8073e1fcd \
++VLLM_PRECOMPILED_WHEEL_COMMIT=5629b26146a39705c814ddae6a0f98321e14d2a6 \
+ VLLM_PRECOMPILED_WHEEL_VARIANT=cu130 \
+ uv pip install --python .venv/bin/python -e .
+ uv pip install --python .venv/bin/python -r requirements/lint.txt \
+@@ -62,7 +93,7 @@ uv pip check --python .venv/bin/python
+ ```
+ 
+ `VLLM_PRECOMPILED_WHEEL_COMMIT` must be the upstream base SHA,
+-`04730e82700d0c9b957cda188dd1bbc8073e1fcd`. If the upstream base changes,
++`5629b26146a39705c814ddae6a0f98321e14d2a6`. If the upstream base changes,
+ update the wheel commit explicitly. Import and
+ GPU validation must resolve Python and native extensions under this worktree.
+ An import check alone does not qualify the driver or a serving run.
+@@ -72,7 +103,7 @@ default. Run pre-commit checks explicitly in this checkout; do not replace
+ shared Git hooks with a hook that points at this environment.
+ 
+ The wheel saved in `../glm53-dflash2-artifacts/` is the `cu130` wheel for the
+-earlier `8369aff` base. It does not match `04730e8`, so do not use it with this
++earlier `8369aff` base. It does not match `5629b26`, so do not use it with this
+ base. If that metadata endpoint is
+ temporarily unavailable, set `VLLM_PRECOMPILED_WHEEL_LOCATION` to the path in
+ `vllm-wheel-path.txt`. `native-wheel.json` records its SHA256 and provenance.
+@@ -110,7 +141,7 @@ checkpoint compatibility in a full vLLM run still requires validation.
+ 
+ ServingStudio's `token_corpus` pass serves with `--enable-return-routed-experts`
+ and reads every generated token's routes, body layers and MTP layer. At
+-`04730e8`, upstream serves routes through the AuxOutput connector
++`5629b26`, upstream serves routes through the AuxOutput connector
+ (`vllm/distributed/aux_output_connector/`). The connector requires Model Runner
+ V2, a MoE generate model, and prefix caching. It rejects adaptive speculative
+ verification, PP > 1, DCP/PCP > 1, and KV connectors. Upstream also captures
+@@ -126,7 +157,9 @@ branch adds:
+   propose. `AsyncOutput.copy_aux_output` then starts the step's deferred D2H
+   copy.
+ 
+-V1 cannot return routes at this base. The routing dump
++Drafter slots exist only for method `mtp`. The DSpark drafter's MoE routes
++are not captured or returned; only the target's are. V1 cannot return routes at
++this base. The routing dump
+ (`VLLM_VIBESIM_ROUTING_TRACE_*`) still works on both runners. On V1, and on V2
+ without the connector, the dump's env var binds a private capturer that returns
+ nothing on responses. The dump skips the drafter's slots.

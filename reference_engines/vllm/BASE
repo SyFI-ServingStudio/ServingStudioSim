@@ -1,0 +1,6 @@
+# vLLM reference engine: the upstream commit patches/ apply to and its official image.
+# Read by reference_engines (README.md); change it with `just ref bump-base vllm`.
+upstream_repo=https://github.com/vllm-project/vllm.git
+upstream_commit=5629b26146a39705c814ddae6a0f98321e14d2a6
+image=public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo:5629b26146a39705c814ddae6a0f98321e14d2a6
+digest.linux/amd64=sha256:a3a232b8e67f29b928ca5418a962f7b03d6a29045cf2b27c39d574ab2c1d4e5c

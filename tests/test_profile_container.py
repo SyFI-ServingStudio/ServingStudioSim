@@ -47,7 +47,7 @@ def test_container_worker_mounts_worktree_source_read_only(tmp_path: Path, monke
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(cache_dir))
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [3, 1],
         exchange_dir,
     )
@@ -61,10 +61,15 @@ def test_container_worker_mounts_worktree_source_read_only(tmp_path: Path, monke
     assert f"{cache_dir}/profiler_test:/cache" in command
     assert "MOESIM_CUPTI_BUILD_DIR=/cache/cupti-ext" in command
     project_root = Path(__file__).parents[1].resolve()
-    for directory in ("profiling", "launcher", "gpu"):
+    for directory in ("profiling", "launcher", "gpu", "reference_engines"):
         assert f"{project_root / directory}:/opt/vibesim/{directory}:ro" in command
     assert not any("profile.db" in argument for argument in command)
-    assert command[-4:] == [
+    # The worker is named explicitly, never left to the image's ENTRYPOINT.
+    assert command[command.index("--entrypoint") + 1] == "/usr/bin/python3"
+    assert command[-7:] == [
+        "profiler:test",
+        "-m",
+        "profiling.exec.local_worker",
         "--worker-input",
         "/io/input.json",
         "--worker-output",
@@ -81,7 +86,7 @@ def test_container_worker_mounts_explicit_additional_volume(tmp_path: Path, monk
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(cache_dir))
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [4],
         exchange_dir,
         additional_volumes=((measurement_dir, measurement_dir.resolve()),),
@@ -105,7 +110,7 @@ def test_container_worker_never_passes_a_bare_gpu_index(tmp_path: Path, monkeypa
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [0],
         exchange_dir,
     )
@@ -125,7 +130,7 @@ def test_container_worker_pins_cuda_to_the_requested_uuids(tmp_path: Path, monke
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [3, 1],
         exchange_dir,
     )
@@ -204,7 +209,7 @@ def test_container_worker_fails_when_the_uuid_is_unknown(tmp_path: Path, monkeyp
 
     with pytest.raises(RuntimeError, match="no UUID for GPU index"):
         _container_worker_command(
-            ContainerProfileEnv("vllm_env", "profiler:test"),
+            ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
             [5],
             exchange_dir,
         )
@@ -232,7 +237,7 @@ def test_container_worker_does_not_forward_the_energy_policy(tmp_path, monkeypat
     monkeypatch.setenv(ENERGY_ENV, "1")
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [0],
         exchange_dir,
     )
@@ -256,7 +261,7 @@ def test_container_worker_mounts_the_trace_directory(tmp_path, monkeypatch) -> N
     monkeypatch.setenv(CUPTI_TRACE_ENV, str(trace_dir / "run.jsonl"))
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [0],
         exchange_dir,
     )
@@ -280,7 +285,7 @@ def test_container_worker_redirects_the_inductor_cache_into_the_mount(
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [0],
         exchange_dir,
     )
@@ -297,7 +302,7 @@ def test_container_worker_requests_imex_channel_only_when_asked(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
-    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test")
+    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3")
 
     plain, _env = _container_worker_command(profiler_env, [0, 1], tmp_path)
     fabric, _env = _container_worker_command(profiler_env, [0, 1], tmp_path, imex_channel=True)
@@ -333,7 +338,7 @@ def test_container_worker_runs_as_root_under_a_rootless_runtime(
     exchange_dir = tmp_path / "exchange"
     exchange_dir.mkdir()
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
-    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test")
+    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3")
 
     def user(command: list[str]) -> str:
         return command[command.index("--user") + 1]

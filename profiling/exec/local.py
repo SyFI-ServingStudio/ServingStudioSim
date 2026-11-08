@@ -39,7 +39,7 @@ CONTAINER_INDUCTOR_CACHE_ENV = "VIBESIM_CONTAINER_INDUCTOR_CACHE"
 IMEX_CHANNEL_CDI_DEVICE = "nvidia.com/imex-channel=0"
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_CONTAINER_SOURCE_DIRS = ("profiling", "launcher", "gpu")
+_CONTAINER_SOURCE_DIRS = ("profiling", "launcher", "gpu", "reference_engines")
 
 
 class LocalGpuPool(GpuPool):
@@ -314,6 +314,10 @@ def _container_worker_command(
             "host",
             "--gpus",
             gpu_request,
+            # The worker never relies on the image's ENTRYPOINT: an engine image
+            # also runs captures, on another interpreter.
+            "--entrypoint",
+            profiler_env.python,
             # Only backends that allocate fabric memory ask for the channel.
             *(["--device", IMEX_CHANNEL_CDI_DEVICE] if imex_channel else []),
             "--user",
@@ -349,6 +353,8 @@ def _container_worker_command(
             *source_volume_args,
             *volume_args,
             profiler_env.image,
+            "-m",
+            "profiling.exec.local_worker",
             "--worker-input",
             "/io/input.json",
             "--worker-output",

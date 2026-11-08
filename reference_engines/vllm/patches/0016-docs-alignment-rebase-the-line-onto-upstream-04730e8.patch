@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Thu, 24 Sep 2026 16:05:07 -0700
+Subject: [PATCH 16/18] docs(alignment): rebase the line onto upstream 04730e8
+ for DeepSeek-V4.1
+
+The line now sits on upstream main 04730e82700d0c9b957cda188dd1bbc8073e1fcd
+(2026-09-24), the newest main commit with a published cu130 precompiled
+wheel that contains vllm/models/deepseek_v41. VLLM_PRECOMPILED_WHEEL_COMMIT
+must be that SHA; the saved 8369aff wheel no longer matches.
+
+Also record the routed-experts adaptation to upstream's AuxOutput connector
+and the dropped AsyncLLM.profiler commit, now upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ALIGNMENT.md | 55 ++++++++++++++++++++++++++++++++++++----------------
+ 1 file changed, 38 insertions(+), 17 deletions(-)
+
+diff --git a/ALIGNMENT.md b/ALIGNMENT.md
+index 63afc03236..738347cc20 100644
+--- a/ALIGNMENT.md
++++ b/ALIGNMENT.md
+@@ -1,9 +1,16 @@
+ # ServingStudio instrumentation on upstream vLLM
+ 
+ `servingstudio-alignment` is the one maintained ServingStudio line of this fork.
+-It sits on official vLLM `upstream/main`; the current upstream base is
+-`8369affa5428ca29a30f378d660fbffbad12e240` (v0.28.1rc0). ServingStudio Sim pins
+-it at `alignment/profiler/vllm`.
++It sits on official vLLM `upstream/main`; the current upstream base is main
++`04730e82700d0c9b957cda188dd1bbc8073e1fcd` (2026-09-24). That is the newest
++main commit with a published `cu130` precompiled wheel that contains
++`vllm/models/deepseek_v41`, so DeepSeek-V4.1 can be served. ServingStudio Sim
++pins the line at `alignment/profiler/vllm`.
++
++The line was previously based on `8369affa5428ca29a30f378d660fbffbad12e240`
++(v0.28.1rc0). The rebase onto `04730e8` kept one commit per instrumentation
++commit, except `Bind AsyncLLM.profiler on every profiler backend`. That commit
++is dropped because upstream `c3ec0d29f5` binds `AsyncLLM.profiler` itself.
+ 
+ It converges two earlier lines:
+ 
+@@ -46,7 +53,7 @@ or native extensions. The installation used:
+ ```bash
+ uv venv --python 3.12 .venv
+ VLLM_USE_PRECOMPILED=1 \
+-VLLM_PRECOMPILED_WHEEL_COMMIT=8369affa5428ca29a30f378d660fbffbad12e240 \
++VLLM_PRECOMPILED_WHEEL_COMMIT=04730e82700d0c9b957cda188dd1bbc8073e1fcd \
+ VLLM_PRECOMPILED_WHEEL_VARIANT=cu130 \
+ uv pip install --python .venv/bin/python -e .
+ uv pip install --python .venv/bin/python -r requirements/lint.txt \
+@@ -54,7 +61,9 @@ uv pip install --python .venv/bin/python -r requirements/lint.txt \
+ uv pip check --python .venv/bin/python
+ ```
+ 
+-If the upstream base changes, update the wheel commit explicitly. Import and
++`VLLM_PRECOMPILED_WHEEL_COMMIT` must be the upstream base SHA,
++`04730e82700d0c9b957cda188dd1bbc8073e1fcd`. If the upstream base changes,
++update the wheel commit explicitly. Import and
+ GPU validation must resolve Python and native extensions under this worktree.
+ An import check alone does not qualify the driver or a serving run.
+ 
+@@ -62,8 +71,9 @@ ServingStudio's profiler runs `alignment/profiler/vllm/.venv/bin/python` by
+ default. Run pre-commit checks explicitly in this checkout; do not replace
+ shared Git hooks with a hook that points at this environment.
+ 
+-The native wheel selected by the fixed commit's official `cu130` metadata is
+-also saved in `../glm53-dflash2-artifacts/`. If that metadata endpoint is
++The wheel saved in `../glm53-dflash2-artifacts/` is the `cu130` wheel for the
++earlier `8369aff` base. It does not match `04730e8`, so do not use it with this
++base. If that metadata endpoint is
+ temporarily unavailable, set `VLLM_PRECOMPILED_WHEEL_LOCATION` to the path in
+ `vllm-wheel-path.txt`. `native-wheel.json` records its SHA256 and provenance.
+ 
+@@ -99,16 +109,27 @@ checkpoint compatibility in a full vLLM run still requires validation.
+ ## Routed-experts capture
+ 
+ ServingStudio's `token_corpus` pass serves with `--enable-return-routed-experts`
+-and reads every generated token's routes, body layers and MTP layer. Upstream
+-already captures inside monolithic TRT-LLM kernels, refuses kernels it cannot
+-capture, and carries `routed_experts_prompt_start`. This branch adds:
+-
+-- capture slots for an MTP drafter's layers (method `mtp` only), bound on model
+-  runner V2 for the single-module MTP speculator;
++and reads every generated token's routes, body layers and MTP layer. At
++`04730e8`, upstream serves routes through the AuxOutput connector
++(`vllm/distributed/aux_output_connector/`). The connector requires Model Runner
++V2, a MoE generate model, and prefix caching. It rejects adaptive speculative
++verification, PP > 1, DCP/PCP > 1, and KV connectors. Upstream also captures
++inside monolithic TRT-LLM kernels and refuses kernels it cannot capture. This
++branch adds:
++
++- capture slots for an MTP drafter's layers (method `mtp` only). The
++  single-module MTP speculator is bound when the V2 runner creates the
++  connector;
+ - the draft prefill's routes only; later draft passes cover one row per request
+   and are undone;
+-- the drafter's slots filled after propose, before the step's D2H copy;
+-- V1 refuses MTP capture, since it never binds the drafter.
++- the drafter's slots written into the connector's pending snapshot after
++  propose. `AsyncOutput.copy_aux_output` then starts the step's deferred D2H
++  copy.
++
++V1 cannot return routes at this base. The routing dump
++(`VLLM_VIBESIM_ROUTING_TRACE_*`) still works on both runners. On V1, and on V2
++without the connector, the dump's env var binds a private capturer that returns
++nothing on responses. The dump skips the drafter's slots.
+ 
+ `EPLBConfig.rearrange=false` keeps EPLB a load recorder for the routing passes.
+ It allocates no transfer buffer and never moves experts.
+@@ -119,13 +140,13 @@ It allocates no transfer buffer and never moves experts.
+ | --- | --- |
+ | 6 upstream bugfix cherry-picks (ROCm, Docker, CPU, FastAPI) | in upstream by v0.28 |
+ | 7 `feat(alignment)` instrumentation commits | ported by the v0.28 line |
+-| `9a0675d` speculative progress | ported as `f6c611a27` |
++| `9a0675d` speculative progress | ported as `ce0ad5378d` |
+ | `2c2f73f` target/draft expert-load roles | ported (`model_role`, `max_forwards_per_step`) |
+ | `829f25c`, `7fa4e7c`, `5552bbd`, `2cbd2d9`, `133dc06` prefer modular kernels while capturing | not needed: upstream captures inside monolithic kernels and refuses the rest by name |
+ | `4b0cab6` capture-layer sizing, `routed_experts_prompt_start` | sizing ported; `prompt_start` is upstream |
+ | `5316893` slots for the MTP drafter only | ported |
+ | `4652f20` keep the first draft pass's routes | ported to the V2 speculator |
+-| `b986f76` refuse the unpadded drafter | not applicable: V2 has no unpadded drafter path, and V1 refuses MTP capture |
++| `b986f76` refuse the unpadded drafter | not applicable: V2 has no unpadded drafter path, and V1 returns no routes |
+ | `828da2e` EPLB `rearrange: false` | ported |
+ 
+ ## Maintenance and validation
