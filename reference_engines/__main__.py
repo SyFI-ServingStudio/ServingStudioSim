@@ -325,13 +325,14 @@ def bump_base(
     materialize(engine, source_dir(engine), force=True)
 
 
-def warm_caches(engine: str, config: Path) -> int:
+def warm_caches(engine: str, config: Path, startup_timeout: float | None = None) -> int:
     """Compile and tune `config`'s deployment into the persistent caches.
 
     The same container a capture of `config` runs in, with autotuning allowed,
     stopped once the engine is ready; it then writes the manifest a capture's
     preflight requires (alignment/warm_caches.py). Run it on the GPU type the
     captures will use: the caches are keyed by its architecture.
+    `startup_timeout` overrides the config's for this pass only.
     """
     from alignment.image_runtime import run_profile_in_image
     from launcher.alignment_config import load_profile_config
@@ -339,7 +340,7 @@ def warm_caches(engine: str, config: Path) -> int:
     cfg = load_profile_config(config)
     if cfg.engine != engine:
         raise RefError(f"{config} runs {cfg.engine}, not {engine}")
-    return run_profile_in_image(config, warm_caches=True)
+    return run_profile_in_image(config, warm_caches=True, startup_timeout=startup_timeout)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -389,6 +390,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     verb.add_argument("engine", choices=ENGINES)
     verb.add_argument("config", type=Path, help="the capture's alignment profile YAML")
+    verb.add_argument(
+        "--startup-timeout",
+        type=float,
+        metavar="SECONDS",
+        help="seconds the engine may take to reach ready in this pass (default: the "
+        "config's server.startup_timeout); a warm-up compiles and tunes, so it is slower",
+    )
     args = parser.parse_args(argv)
     try:
         if args.verb == "materialize":
@@ -403,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.engine, args.commit, args.image, platform_images, platform_commits, notes
             )
         elif args.verb == "warm-caches":
-            return warm_caches(args.engine, args.config)
+            return warm_caches(args.engine, args.config, args.startup_timeout)
         else:
             from profiling.container.images import build
 

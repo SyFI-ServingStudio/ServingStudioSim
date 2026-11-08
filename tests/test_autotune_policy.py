@@ -419,6 +419,13 @@ def test_capture_preflight_admits_the_warmed_deployment_only(tmp_path) -> None:
         )
         == written
     )
+    # ... and so is one given longer to start (`warm-caches --startup-timeout`) ...
+    assert (
+        warm_caches.preflight(
+            _cfg(tmp_path, startup_timeout=3600.0), tmp_path / "p.yaml", cache, "vllm-abc-sm100"
+        )
+        == written
+    )
     # ... another chunk size, or another GPU architecture, is not.
     with pytest.raises(AutotuneForbiddenError, match="server.chunk_size") as raised:
         warm_caches.preflight(
@@ -427,6 +434,19 @@ def test_capture_preflight_admits_the_warmed_deployment_only(tmp_path) -> None:
     assert "just ref warm-caches vllm" in str(raised.value)
     with pytest.raises(AutotuneForbiddenError):
         warm_caches.preflight(warmed, tmp_path / "p.yaml", cache, "vllm-abc-sm103")
+
+
+def test_warm_caches_cli_passes_its_startup_timeout(monkeypatch, tmp_path) -> None:
+    import reference_engines.__main__ as ref_main
+
+    seen = []
+    monkeypatch.setattr(ref_main, "warm_caches", lambda *args: seen.append(args) or 0)
+
+    assert ref_main.main(["warm-caches", "sglang", str(tmp_path / "p.yaml")]) == 0
+    assert ref_main.main(
+        ["warm-caches", "sglang", str(tmp_path / "p.yaml"), "--startup-timeout", "2400"]
+    ) == 0
+    assert [args[2] for args in seen] == [None, 2400.0]
 
 
 def test_capture_preflight_without_any_manifest_names_warm_caches(tmp_path) -> None:

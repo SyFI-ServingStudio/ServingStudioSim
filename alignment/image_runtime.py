@@ -395,6 +395,7 @@ def run_profile_in_image(
     image: str | None = None,
     allow_autotune: bool = False,
     warm_caches: bool = False,
+    startup_timeout: float | None = None,
 ) -> int:
     """Run `alignment profile <config>` in the image; return its exit code.
 
@@ -403,6 +404,12 @@ def run_profile_in_image(
     `<log_dir>.warm-caches`), then records the manifest a capture's preflight
     looks for. A capture without `allow_autotune` needs that manifest, and
     fails here, before the container starts, when there is none.
+
+    `startup_timeout` replaces the config's `server.startup_timeout` in the
+    container's copy: a warm-up compiles and tunes what its captures then find
+    cached, so it can take much longer to reach ready (SGLang's GLM-5.3-Flash
+    smoke warm-up ran ~1050 s, over the 900 s default). The manifest key leaves
+    the field out, so the captures still match.
     """
     from launcher.alignment_config import load_profile_config
     from profiling.exec.local import gpu_uuids_for_indices, image_cache_dir, image_cache_key
@@ -421,6 +428,8 @@ def run_profile_in_image(
         log_dir = log_dir.with_name(log_dir.name + ".warm-caches")
     log_dir.mkdir(parents=True, exist_ok=True)
     document, mounts, path_info = container_config(config_path, log_dir)
+    if startup_timeout is not None:
+        document["server"]["startup_timeout"] = float(startup_timeout)
     tag = image or image_tag(cfg.engine)
     if subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode:
         raise ImageRunError(

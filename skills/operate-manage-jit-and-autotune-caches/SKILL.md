@@ -29,7 +29,9 @@ stops. The table, the preflight and the guard are in
 - Before the first capture of a deployment (model, GPU count, server config,
   runtime environment) on a GPU type, run
   `just ref warm-caches <engine> <profile.yaml>` in the GPU job. Without its
-  manifest the capture fails before the container starts.
+  manifest the capture fails before the container starts. A warm-up is slower
+  to reach ready than a capture; give it `--startup-timeout SECONDS` rather
+  than raising the capture config's deadline.
 - An L1 `--force`/`--fresh` needs every spec's tactic file; fill the rows by
   jit-fill first (it may tune, and logs `[autotune]` lines per kernel), or pass
   `--allow-autotune`. KDA rows that pin Triton selections always need the flag.

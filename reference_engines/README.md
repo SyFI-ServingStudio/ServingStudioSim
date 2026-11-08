@@ -38,6 +38,11 @@ just ref warm-caches vllm PROFILE.yaml     # compile + tune a capture's deployme
 
 (`just ref VERB ENGINE` is `uv run python -m reference_engines VERB ENGINE`.)
 
+A warm-up compiles and tunes everything its captures then find cached, so it
+reaches ready much later than they do (SGLang's GLM-5.3-Flash smoke: ~1050 s).
+`warm-caches --startup-timeout SECONDS` raises the readiness deadline for that
+pass only; the manifest key leaves the field out, so captures still match.
+
 **materialize** fetches BASE.yaml's commit once into a bare object cache
 (`~/.cache/vibesim-reference-engines`, or `VIBESIM_REFERENCE_CACHE`), checks it
 out, and applies the patches with `git am`. Every commit gets a fixed committer
