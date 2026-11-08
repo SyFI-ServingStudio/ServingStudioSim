@@ -138,7 +138,7 @@ least to most:
    vLLM's wheel in `/usr/local/lib/python3.12/dist-packages` (only `vllm/`
    paths), SGLang's editable checkout at `/sgl-workspace/sglang`. A patch that
    does not apply means the image is not BASE's commit, and the build fails;
-7. this checkout's `profiling/`, `launcher/`, `gpu/` for the build's self-check
+7. this checkout's `profiling/`, `launcher/`, `gpu/` and the guard for the build's self-check
    (workers and captures overlay the checkout's own at run time);
 8. the manifest (`/etc/vibesim-profiler-image.json`) and labels.
 

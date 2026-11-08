@@ -93,6 +93,9 @@ RUN cd /usr/local/lib/python3.12/dist-packages \
 COPY profiling /opt/vibesim/profiling
 COPY launcher /opt/vibesim/launcher
 COPY gpu /opt/vibesim/gpu
+# The runners import the guard (a namespace package here; the run-time overlay
+# brings the whole reference_engines/).
+COPY reference_engines/autotune_guard.py /opt/vibesim/reference_engines/autotune_guard.py
 
 # The envs images.py assigns this image (`selfcheck` loads their runners).
 ARG VIBESIM_PROFILE_ENVS
