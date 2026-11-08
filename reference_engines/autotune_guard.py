@@ -21,7 +21,8 @@ so every engine process and its workers have it); L1 workers also call
 `install()` themselves, on any image or the host. It hooks, when each module is
 first imported:
 
-- FlashInfer `AutoTuner._profile_single_kernel`: the one per-tactic measurement
+- FlashInfer `AutoTuner._profile_single_kernel` (in `flashinfer.autotuner.autotuner`,
+  or the flat `flashinfer.autotuner` module of FlashInfer <= 0.6): the one per-tactic measurement
   of both the legacy autotuner and autotune_v2 (`choose_one`, `rank_tactics`).
   vLLM's `kernel_warmup.flashinfer_autotune` (cache_hit False), SGLang's
   `_flashinfer_autotune`, and the L1 `autotune_cached` runners reach it.
@@ -234,6 +235,15 @@ def _flashinfer(module: ModuleType) -> list[str]:
     return []
 
 
+def _flashinfer_top(module: ModuleType) -> list[str]:
+    # FlashInfer <= 0.6 ships the tuner as the module `flashinfer.autotuner`;
+    # later releases make that a package whose `autotuner` submodule is hooked
+    # on its own, so the package itself has nothing to report missing.
+    if hasattr(module, "__path__"):
+        return []
+    return _flashinfer(module)
+
+
 def _triton(module: ModuleType) -> list[str]:
     def describe(self, *_args, config=None, **_kwargs):
         base = getattr(self, "base_fn", None)
@@ -290,6 +300,7 @@ def _inductor_runtime(module: ModuleType) -> list[str]:
 
 # Module -> its patch, applied right after the module first executes.
 _PATCHES: dict[str, Callable[[ModuleType], list[str]]] = {
+    "flashinfer.autotuner": _flashinfer_top,
     "flashinfer.autotuner.autotuner": _flashinfer,
     "triton.runtime.autotuner": _triton,
     "torch._inductor.select_algorithm": _inductor_select,

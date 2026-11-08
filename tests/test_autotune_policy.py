@@ -125,7 +125,9 @@ def _module_with_unset_fields(name: str) -> tuple[types.ModuleType, list, list, 
     calls: list = []
     forbid_only: list = []
     small: list = []
-    if name == "flashinfer.autotuner.autotuner":
+    # The flat module is FlashInfer <= 0.6 (the host venv); the package's
+    # submodule is the layout the engine images ship.
+    if name in ("flashinfer.autotuner", "flashinfer.autotuner.autotuner"):
 
         class AutoTuner:
             def _profile_single_kernel(self, runner, inputs, tactic, *args, **kwargs):
@@ -471,3 +473,10 @@ def test_engine_images_stamp_the_base_half_of_the_key() -> None:
             f"{engine}-{digest[:12]}"
         )
         assert "reference_engines/autotune_guard.py" in IMAGES[engine].inputs
+
+
+def test_the_flashinfer_autotuner_package_reports_nothing_missing() -> None:
+    package = types.ModuleType("flashinfer.autotuner")
+    package.__path__ = []  # a package; its `autotuner` submodule is hooked on its own
+
+    assert guard._PATCHES["flashinfer.autotuner"](package) == []
