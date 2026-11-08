@@ -116,7 +116,7 @@ def test_a_tune_after_a_preflight_hit_is_reported_as_a_key_mismatch(monkeypatch)
         tuner()._profile_single_kernel(object(), [], 1)
 
 
-def _module_with_unset_fields(name: str) -> tuple[types.ModuleType, list]:
+def _module_with_unset_fields(name: str) -> tuple[types.ModuleType, list, list, list]:
     """One fake library module per hook, its objects carrying None where the
     real libraries may leave a field unset, and the calls to make on them
     (`forbid_only`: calls the hooked function itself would reject)."""
@@ -124,6 +124,7 @@ def _module_with_unset_fields(name: str) -> tuple[types.ModuleType, list]:
     module = types.ModuleType(name)
     calls: list = []
     forbid_only: list = []
+    small: list = []
     if name == "flashinfer.autotuner.autotuner":
 
         class AutoTuner:
@@ -178,20 +179,21 @@ def _module_with_unset_fields(name: str) -> tuple[types.ModuleType, list]:
                 return "ran"
 
         module.CachingAutotuner = CachingAutotuner
-        calls = [
+        calls = [lambda: CachingAutotuner()._coordinate_descent_tuning()]
+        small = [
             lambda: CachingAutotuner().benchmark_all_configs(),
             lambda: CachingAutotuner().benchmark_all_configs(None, None),
-            lambda: CachingAutotuner()._coordinate_descent_tuning(),
         ]
-    return module, calls, forbid_only
+    return module, calls, forbid_only, small
 
 
 @pytest.mark.parametrize("name", sorted(guard._PATCHES))
 def test_every_hook_reports_a_forbidden_tune_whatever_its_arguments(
     monkeypatch, capsys, name
 ) -> None:
-    module, calls, forbid_only = _module_with_unset_fields(name)
+    module, calls, forbid_only, small = _module_with_unset_fields(name)
     monkeypatch.setattr(guard, "_TUNED", {})
+    monkeypatch.setattr(guard, "_SMALL_SEEN", set())
     assert guard._PATCHES[name](module) == []
 
     monkeypatch.setenv(guard.POLICY_ENV, "forbid")
@@ -204,10 +206,18 @@ def test_every_hook_reports_a_forbidden_tune_whatever_its_arguments(
     # What the launchers read back from the engine's log to name the fix.
     assert "manifest/actual mismatch" in guard.forbidden_line(err)
 
-    monkeypatch.setenv(guard.POLICY_ENV, "allow")
-    for call in calls:
+    # A small tune runs under forbid and is logged once per kernel.
+    for call in small:
         assert call() == "ran"
-    assert sum(row["measurements"] for row in guard.tuned()) == len(calls)
+    err = capsys.readouterr().err
+    assert guard.MARKER not in err
+    assert err.count(guard.SMALL_TUNE_MARKER) == min(len(small), 1)
+    guard.tuned()
+
+    monkeypatch.setenv(guard.POLICY_ENV, "allow")
+    for call in calls + small:
+        assert call() == "ran"
+    assert sum(row["measurements"] for row in guard.tuned()) == len(calls + small)
 
 
 def test_the_finder_hooks_a_module_when_it_is_first_imported(tmp_path, monkeypatch) -> None:

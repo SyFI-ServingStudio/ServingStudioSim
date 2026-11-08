@@ -30,9 +30,14 @@ first imported:
   here unless the caller set it) has the key. Configs with a `pre_hook` are
   never disk-cached, so they always need an allowed run.
 - Inductor `AlgorithmSelectorCache.autotune` / `benchmark_choices`
-  (max-autotune template choice), `CachingAutotuner.benchmark_all_configs`
-  (multi-config runtime kernels) and `_coordinate_descent_tuning`; each runs
-  only when inductor's own autotune cache misses.
+  (max-autotune template choice) and `CachingAutotuner._coordinate_descent_tuning`;
+  each runs only when inductor's own autotune cache misses.
+
+Inductor's `CachingAutotuner.benchmark_all_configs` is hooked but never
+refused: it picks one of the few heuristic launch configs of one generated
+kernel, the first time that kernel runs, which costs milliseconds and can
+first happen on a request shape no warm-up ran. It is timed like the rest and
+logged once per kernel (`SMALL_TUNE_MARKER`), so a capture shows where it ran.
 
 Under `allow` the same hooks time each outermost measurement instead
 (`tuned()`), so an L1 jit-fill can log what it tuned and for how long.
@@ -109,6 +114,9 @@ def forbid(source: str, **detail: Any) -> None:
     raise AutotuneForbidden(message)
 
 
+SMALL_TUNE_MARKER = "[autotune_guard] small tune allowed"
+_SMALL_SEEN: set[tuple[str, str]] = set()
+
 # Under `allow`: (source, what) -> [measurements, seconds], outermost calls only.
 _TUNED: dict[tuple[str, str], list[float]] = {}
 _depth = 0
@@ -156,7 +164,14 @@ def _describe(describe: Callable[..., dict[str, Any]], *args: Any, **kwargs: Any
         return {"describe_failed": f"{type(exc).__name__}: {exc}"}
 
 
-def _wrap(owner: type, name: str, describe: Callable[..., dict[str, Any]], source: str) -> bool:
+def _wrap(
+    owner: type,
+    name: str,
+    describe: Callable[..., dict[str, Any]],
+    source: str,
+    *,
+    small: bool = False,
+) -> bool:
     raw = owner.__dict__.get(name)
     if raw is None:
         return False
@@ -167,7 +182,7 @@ def _wrap(owner: type, name: str, describe: Callable[..., dict[str, Any]], sourc
 
     def guarded(*args: Any, **kwargs: Any) -> Any:
         global _depth
-        if not allowed():
+        if not small and not allowed():
             forbid(source, **_describe(describe, *args, **kwargs))
         if _depth:
             return function(*args, **kwargs)
@@ -187,6 +202,14 @@ def _wrap(owner: type, name: str, describe: Callable[..., dict[str, Any]], sourc
             entry = _TUNED.setdefault((source, what), [0, 0.0])
             entry[0] += 1
             entry[1] += time.perf_counter() - started
+            if small and not allowed() and (source, what) not in _SMALL_SEEN:
+                _SMALL_SEEN.add((source, what))
+                print(
+                    f"{SMALL_TUNE_MARKER} {source} {what} "
+                    f"{time.perf_counter() - started:.3f} s",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     guarded.__vibesim_autotune_guard__ = True  # type: ignore[attr-defined]
     guarded.__wrapped__ = function  # type: ignore[attr-defined]
@@ -253,11 +276,11 @@ def _inductor_runtime(module: ModuleType) -> list[str]:
             "configs": _count(getattr(self, "configs", None)),
         }
 
-    for name, source in (
-        ("benchmark_all_configs", "inductor.runtime_autotune"),
-        ("_coordinate_descent_tuning", "inductor.coordinate_descent"),
+    for name, source, small in (
+        ("benchmark_all_configs", "inductor.runtime_autotune", True),
+        ("_coordinate_descent_tuning", "inductor.coordinate_descent", False),
     ):
-        if autotuner is None or not _wrap(autotuner, name, describe, source):
+        if autotuner is None or not _wrap(autotuner, name, describe, source, small=small):
             missing.append(f"inductor CachingAutotuner.{name}")
     return missing
 

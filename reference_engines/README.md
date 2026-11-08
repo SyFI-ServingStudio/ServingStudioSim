@@ -97,10 +97,16 @@ persisted tactic file (`profiling/runners/tactic_labels.py`); a miss fails at
 once and says what to run. The backstop is `autotune_guard.py`, which the
 images load at interpreter start (a `.pth`) and L1 workers install: it raises at
 every cache-miss tactic measurement (FlashInfer's autotuner, Triton
-`@autotune`, inductor max-autotune and its runtime autotuners) and stops the
+`@autotune`, inductor max-autotune and coordinate descent) and stops the
 process; the parent reports it, and keeps no row of that chunk. If the
 preflight said warm, the error says "manifest/actual mismatch": the key misses
 an input of the tuning and must be completed.
+
+One kind of tune is small enough to let through: inductor's runtime pick among
+the few heuristic launch configs of one generated kernel
+(`CachingAutotuner.benchmark_all_configs`), milliseconds, the first time that
+kernel runs, which can be a request shape no warm-up reached. The guard logs it
+once per kernel (`[autotune_guard] small tune allowed …`) instead of stopping.
 
 What the preflight cannot see, the guard still stops: a Triton `@autotune`
 key never warmed (the engine reaches it only under load), and configs with a
