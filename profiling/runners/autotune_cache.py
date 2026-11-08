@@ -51,10 +51,9 @@ def autotune_cache_path(kernel: str) -> Path | None:
     not a reason to fail a measurement.
     """
 
-    configured = os.environ.get(CACHE_DIR_ENV)
-    if configured is not None and not configured.strip():
+    base = tactic_cache_dir()
+    if base is None:
         return None
-    base = Path(configured) if configured else Path.home() / ".cache" / "vibesim-autotune"
 
     device, version = "unknown", "unknown"
     with contextlib.suppress(Exception):
@@ -69,7 +68,27 @@ def autotune_cache_path(kernel: str) -> Path | None:
         base.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
-    return base / f"{_slug(kernel)}.{_slug(device)}.fi{_slug(version)}.json"
+    return base / f"{tactic_file_stem(kernel, device)}.fi{_slug(version)}.json"
+
+
+def tactic_cache_dir(home: Path | None = None) -> Path | None:
+    """Where the tactic files live: ``$VIBESIM_AUTOTUNE_CACHE_DIR``, else under
+    ``home`` (default: this process's ``$HOME``); ``None`` when set empty."""
+
+    configured = os.environ.get(CACHE_DIR_ENV)
+    if configured is not None and not configured.strip():
+        return None
+    if configured:
+        return Path(configured)
+    return (home or Path.home()) / ".cache" / "vibesim-autotune"
+
+
+def tactic_file_stem(kernel: str, device: str) -> str:
+    """The file name of ``kernel``'s tactics on ``device`` (a CUDA device name,
+    as ``nvidia-smi`` and ``torch.cuda.get_device_name`` both spell it), up to
+    the FlashInfer version, which only the worker's interpreter knows."""
+
+    return f"{_slug(kernel)}.{_slug(device)}"
 
 
 # The ``kernel`` whose tactics the process-wide tuner currently holds.

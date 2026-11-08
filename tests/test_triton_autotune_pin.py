@@ -36,7 +36,20 @@ class _FakeTuner:
 
 def _pin_with(monkeypatch: pytest.MonkeyPatch, tuners: list[tuple[str, _FakeTuner]]):
     monkeypatch.setattr(pin_module, "iter_autotuners", lambda _prefixes: tuners)
+    # The pin re-tunes by design, which only an allowed run may do.
+    monkeypatch.setenv("VIBESIM_AUTOTUNE", "allow")
     return pin_module.AutotunePin(("fake",))
+
+
+def test_the_anchor_tune_is_refused_unless_autotuning_is_allowed(monkeypatch) -> None:
+    from reference_engines.autotune_guard import AutotuneForbidden
+
+    tuned = []
+    pin = _pin_with(monkeypatch, [("k", _FakeTuner())])
+    monkeypatch.setenv("VIBESIM_AUTOTUNE", "forbid")
+    with pytest.raises(AutotuneForbidden, match="triton.AutotunePin"):
+        pin.ensure("a", "a16", lambda: tuned.append(1))
+    assert tuned == []
 
 
 def test_anchor_tunes_once_and_later_rows_reuse_its_selection(monkeypatch) -> None:

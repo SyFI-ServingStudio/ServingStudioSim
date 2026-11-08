@@ -8,6 +8,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners import tactic_labels
 from profiling.runners.autotune_cache import autotune_cached
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
@@ -298,27 +299,10 @@ def _precomputed_routing_kwargs(torch: Any, ids: Any, args: dict[str, Any]) -> d
 
 
 def tuning_label(args: dict[str, Any], stack: str, precomputed_routing: bool) -> str:
-    """Name of the persisted tactic file for this call's runner configuration.
+    """Name of the persisted tactic file for this call's runner configuration
+    (``profiling.runners.tactic_labels.nvfp4_fused_moe``)."""
 
-    FlashInfer's file key for ``trtllm_fp4_block_scale_moe`` holds only the
-    custom-op name, the runner class and the bucketed input shapes (output,
-    logits, top-k ids/weights, hidden states and scales); ``MoERunner`` adds no
-    ``get_cache_key_extras``. The local expert count, the intermediate size and,
-    for the routed call, the global expert count shape the GEMMs but are absent
-    from those shapes, so EP4 and TP8 rows of one model would share a key and
-    the second would replay the first one's tactic. vLLM never sees that: it
-    tunes in-process, where the key also hashes the runner. One file per
-    configuration restores that separation. The routing method selects a
-    different routing kernel in the monolithic call, so it names the file too.
-    """
-
-    label = f"nvfp4_fused_moe.{stack}" + (
-        ".routed" if precomputed_routing else f".{args['routing_method']}"
-    )
-    return (
-        f"{label}.e{args['num_experts']}.l{args['num_local_experts']}"
-        f".h{args['hidden_size']}.i{args['intermediate_size']}"
-    )
+    return tactic_labels.nvfp4_fused_moe(args, stack, precomputed_routing)
 
 
 def forced_routing(

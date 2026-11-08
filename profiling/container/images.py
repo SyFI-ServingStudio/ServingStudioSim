@@ -87,9 +87,14 @@ def _engine_args(engine: str) -> Callable[[Path], dict[str, str]]:
         from reference_engines import host_platform, parse_base
 
         base = parse_base((root / "reference_engines" / engine / "BASE").read_text())
+        platform = host_platform()
+        digest = base.digests[platform].removeprefix("sha256:")
         return {
-            "VIBESIM_UPSTREAM_COMMIT": base.commit_for(host_platform()),
+            "VIBESIM_UPSTREAM_COMMIT": base.commit_for(platform),
             "VIBESIM_REQ_FRONTEND_REVISION": gitlink(root, _REQ_FRONTEND),
+            # The engine half of the persistent-cache key (the official base),
+            # read at run time by profiling/exec/local.py:image_cache_key.
+            "VIBESIM_CACHE_KEY": f"{engine}-{digest[:12]}",
         }
 
     return args
@@ -110,6 +115,7 @@ def _engine_image(
             f"{directory}/BASE",
             f"{directory}/patches",
             "reference_engines/capture-requirements.txt",
+            "reference_engines/autotune_guard.py",
             *inputs,
         ),
         submodules=(_REQ_FRONTEND,),

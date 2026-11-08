@@ -298,6 +298,23 @@ def bump_base(
     materialize(engine, source_dir(engine), force=True)
 
 
+def warm_caches(engine: str, config: Path) -> int:
+    """Compile and tune `config`'s deployment into the persistent caches.
+
+    The same container a capture of `config` runs in, with autotuning allowed,
+    stopped once the engine is ready; it then writes the manifest a capture's
+    preflight requires (alignment/warm_caches.py). Run it on the GPU type the
+    captures will use: the caches are keyed by its architecture.
+    """
+    from alignment.image_runtime import run_profile_in_image
+    from launcher.alignment_config import load_profile_config
+
+    cfg = load_profile_config(config)
+    if cfg.engine != engine:
+        raise RefError(f"{config} runs {cfg.engine}, not {engine}")
+    return run_profile_in_image(config, warm_caches=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m reference_engines", description=__doc__.split("\n\n")[0]
@@ -331,6 +348,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     verb = verbs.add_parser("build-image", help="build the engine image for this platform")
     verb.add_argument("engine", choices=ENGINES)
+    verb = verbs.add_parser(
+        "warm-caches",
+        help="start the engine of a capture config to ready with autotuning allowed, "
+        "then record the manifest its captures need",
+    )
+    verb.add_argument("engine", choices=ENGINES)
+    verb.add_argument("config", type=Path, help="the capture's alignment profile YAML")
     args = parser.parse_args(argv)
     try:
         if args.verb == "materialize":
@@ -341,6 +365,8 @@ def main(argv: list[str] | None = None) -> int:
             platform_images = dict(item.split("=", 1) for item in args.platform_image)
             platform_commits = dict(item.split("=", 1) for item in args.platform_commit)
             bump_base(args.engine, args.commit, args.image, platform_images, platform_commits)
+        elif args.verb == "warm-caches":
+            return warm_caches(args.engine, args.config)
         else:
             from profiling.container.images import build
 

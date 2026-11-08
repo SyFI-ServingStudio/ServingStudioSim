@@ -94,6 +94,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "(alignment/image_runtime.py); the host keeps GPU choice and outputs."
         ),
     )
+    profile.add_argument(
+        "--allow-autotune",
+        action="store_true",
+        help=(
+            "--runtime image: let the engine tune kernel tactics during this capture. "
+            "Without it the capture needs a warm-caches manifest for its deployment "
+            "(`just ref warm-caches <engine> <profile.yaml>`) and fails before the "
+            "container starts when there is none."
+        ),
+    )
+    profile.add_argument("--warm-caches", action="store_true", help=argparse.SUPPRESS)
 
     predict = commands.add_parser(
         "timing-predict",
@@ -491,6 +502,10 @@ def _run_profile(args: argparse.Namespace) -> int:
             "--runtime image starts a container from the host; resume an image "
             "capture on the host with --resume, and run nothing nested"
         )
+    if args.allow_autotune and args.runtime != "image":
+        raise ValueError(
+            "--allow-autotune governs the engine image's autotune guard; it needs --runtime image"
+        )
     if args.dry_run:
         if args.runtime == "image":
             # Every path the container would need, mapped and checked.
@@ -503,11 +518,16 @@ def _run_profile(args: argparse.Namespace) -> int:
         _snapshot_config(args.config, Path(config.log_dir), "profile")
     if args.runtime == "image":
         print(f"[alignment] profiling in image: {args.config}")
-        returncode = run_profile_in_image(args.config)
+        returncode = run_profile_in_image(args.config, allow_autotune=args.allow_autotune)
         if returncode == 0:
             print(f"[alignment] profiling complete: {config.log_dir}/profile_result.json")
         return returncode
     print(f"[alignment] {'resuming' if args.resume else 'profiling'}: {args.config}")
+    if args.warm_caches:
+        # In the image, for `python -m reference_engines warm-caches`.
+        run_profile(config, warm_only=True)
+        print(f"[alignment] engine reached ready and was stopped: {config.log_dir}")
+        return 0
     result = run_profile(config, resume=args.resume)
     if result.get("profile_kind", "nsys") == "nsys":
         print(

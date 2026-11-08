@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 from profiling.gpu_policy import require_gpu
+from reference_engines.autotune_guard import AutotuneForbiddenError, forbidden_line
 
 from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
@@ -354,13 +355,17 @@ def _preflight_capture_environment(
     driver.validate_nsys_capture_environment(fork_python, env=env, cwd=REPO_ROOT)
 
 
-def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
+def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = False) -> dict:
     """Run one explicit measured pass: NSYS, workload timing, or popularity.
 
     `resume=True` reuses an existing capture and redoes only the cheap
     post-capture work (record extraction, NSYS normalization, artifact
     manifest). The GPU capture is the expensive, non-reproducible part of this
     pipeline; a failure in extraction or parsing must never cost a re-capture.
+
+    `warm_only=True` is the warm-caches pass (`alignment/warm_caches.py`): the
+    same server argv and environment, without nsys and without a workload;
+    the engine compiles and tunes to ready and is stopped there.
     """
     if not resume:
         require_gpu(f"an alignment {cfg.profile_kind} capture (starts {cfg.engine})")
@@ -393,8 +398,8 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     if not log_dir.is_absolute():
         log_dir = REPO_ROOT / log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
-    prepared_replay = load_generator.prepare_replay(cfg.workload, log_dir)
-    if not resume:
+    prepared_replay = None if warm_only else load_generator.prepare_replay(cfg.workload, log_dir)
+    if not resume and not warm_only:
         # Build and normalize before nsys starts. This avoids capturing Rust
         # compile work and ensures a bad trace fails before allocating vLLM GPU
         # memory.
@@ -459,7 +464,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     out_rep = nsys_dir / cfg.name
     nsys_executable = (
         nsys_capture.resolve_nsys_executable(cfg.nsys.executable)
-        if is_nsys and not resume
+        if is_nsys and not resume and not warm_only
         else None
     )
     server_log = engine_dir / f"{cfg.name}_server.log"
@@ -542,6 +547,9 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         try:
             driver.wait_for_ready(base_url, proc, cfg.server.startup_timeout)
             driver.verify_server_started(server_log, cfg.server)
+            if warm_only:
+                print("[profile] server ready; warm-caches stops it here", flush=True)
+                return {"warm_only": True, "server_log": str(server_log)}
             prewarm_results = None
             if cfg.prewarm is not None:
                 started = time.monotonic()
@@ -630,6 +638,16 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
                 driver.set_cuda_profile(base_url, active=False)
                 cuda_profile_active = False
             time.sleep(2)  # let the last iterations' kernels flush into the trace
+        except BaseException as error:
+            # An engine stopped by the autotune guard is a set-up error with one
+            # fix, not a capture failure to investigate: say which.
+            line = forbidden_line(server_log.read_text(errors="replace"))
+            if line is not None:
+                raise AutotuneForbiddenError(
+                    f"the engine tried to tune kernels and the autotune guard stopped it "
+                    f"({server_log}): {line}"
+                ) from error
+            raise
         finally:
             capture_timer_cancelled.set()
             if capture_timer is not None:

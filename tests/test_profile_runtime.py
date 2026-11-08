@@ -198,7 +198,9 @@ def test_a_superseded_image_tags_jit_cache_is_removed_once_stale(tmp_path, monke
     for name in ("vibesim-profiler-vllm_old", "other_old"):
         os.utime(tmp_path / name, (old, old))
 
-    cache = local._image_cache_dir("vibesim-profiler-vllm:new")
+    # No cache-key label (no runtime here, or a non-engine image): one per tag.
+    monkeypatch.setattr(local, "image_cache_key", lambda image, _uuids: image.replace(":", "_"))
+    cache = local.image_cache_dir("vibesim-profiler-vllm:new", [])
 
     assert cache == tmp_path / "vibesim-profiler-vllm_new"
     # Only the same image's stale tags go; another image's cache is its own.

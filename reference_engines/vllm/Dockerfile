@@ -63,6 +63,15 @@ RUN python3 -c "import site; open(site.getsitepackages()[0] + '/vibesim_drop_ci_
         -type d -exec chmod a+rwx {} + \
     && python3 -c "import importlib.metadata as m; assert m.version('nvtx') == '0.2.15', m.version('nvtx')"
 
+# Autotuning is a hard error unless the parent set VIBESIM_AUTOTUNE=allow, in
+# every process of the engine's interpreter (reference_engines/autotune_guard.py,
+# loaded by a .pth at interpreter start; reference_engines/README.md#autotuning).
+COPY reference_engines/autotune_guard.py /opt/vibesim-build/vibesim_autotune_guard.py
+RUN SITE="$(python3 -c 'import site; print(site.getsitepackages()[0])')" \
+    && cp /opt/vibesim-build/vibesim_autotune_guard.py "$SITE/" \
+    && echo "import vibesim_autotune_guard; vibesim_autotune_guard.install()" > "$SITE/vibesim_autotune_guard.pth" \
+    && python3 -c "import sys; assert any(getattr(f, 'vibesim_autotune_guard', False) for f in sys.meta_path)"
+
 ENV PYTHONPATH=/opt/vibesim \
     TORCH_EXTENSIONS_DIR=/cache/torch-extensions \
     TRITON_CACHE_DIR=/cache/triton \
@@ -96,6 +105,7 @@ ARG VIBESIM_IMAGE_INPUTS=unknown
 ARG VIBESIM_BASE_IMAGE=unknown
 ARG VIBESIM_UPSTREAM_COMMIT=unknown
 ARG VIBESIM_REQ_FRONTEND_REVISION=unknown
+ARG VIBESIM_CACHE_KEY=unknown
 ENV VIBESIM_CAPTURE_RUNTIME=in-image \
     VIBESIM_CAPTURE_PYTHON=/opt/vibesim-capture/.venv/bin/python
 # What this image is, for a process running inside it (profiling/exec/env.py,
@@ -107,6 +117,7 @@ LABEL org.opencontainers.image.title="ServingStudio vLLM reference engine" \
       ai.vibesim.base-image="${VIBESIM_BASE_IMAGE}" \
       ai.vibesim.upstream-commit="${VIBESIM_UPSTREAM_COMMIT}" \
       ai.vibesim.req-frontend.revision="${VIBESIM_REQ_FRONTEND_REVISION}" \
+      ai.vibesim.cache-key="${VIBESIM_CACHE_KEY}" \
       ai.vibesim.nsys.version="${NSYS_VERSION}" \
       ai.vibesim.profile-envs="${VIBESIM_PROFILE_ENVS}" \
       ai.vibesim.python="/usr/bin/python3"

@@ -36,6 +36,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners import tactic_labels
 from profiling.runners.autotune_cache import autotune_cached
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
@@ -110,14 +111,10 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
 
 
 def tuning_label(args: dict[str, Any]) -> str:
-    """Persisted tactic file for this configuration (see nvfp4_fused_moe's
-    ``tuning_label``: FlashInfer's key omits the expert counts and sizes)."""
+    """Persisted tactic file for this configuration
+    (``profiling.runners.tactic_labels.mxfp4_bf16_fused_moe``)."""
 
-    return (
-        f"nvfp4_fused_moe.mxfp4_bf16_vllm.{args['routing_method']}"
-        f".e{args['num_experts']}.l{args['num_local_experts']}"
-        f".h{args['hidden_size']}.i{args['intermediate_size']}"
-    )
+    return tactic_labels.mxfp4_bf16_fused_moe(**args)
 
 
 def _build_case(

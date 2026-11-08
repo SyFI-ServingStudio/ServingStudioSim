@@ -34,6 +34,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.runners import tactic_labels
 
 KIND = "nvfp4_fused_moe"
 
@@ -208,6 +209,7 @@ register(
             module_name="profiling.runners.moe.nvfp4_fused_moe",
             function_name="profile_nvfp4_fused_moe_sm100",
         ),
+        tactic_label=tactic_labels.nvfp4_fused_moe_vllm,
         table_name=KIND,
         args_schema=Nvfp4FusedMoeArgs,
         metric_family=MetricFamily.COMPUTE,
@@ -236,6 +238,7 @@ register(
             module_name="profiling.runners.moe.nvfp4_fused_moe",
             function_name="profile_nvfp4_fused_moe_routed_sm100",
         ),
+        tactic_label=tactic_labels.nvfp4_fused_moe_vllm_routed,
         table_name=KIND,
         args_schema=Nvfp4FusedMoeArgs,
         metric_family=MetricFamily.COMPUTE,
@@ -269,6 +272,7 @@ register(
             module_name="profiling.runners.moe.nvfp4_fused_moe",
             function_name="profile_nvfp4_fused_moe_routed_sm100",
         ),
+        tactic_label=tactic_labels.nvfp4_fused_moe_vllm_routed,
         table_name=KIND,
         args_schema=Nvfp4FusedMoeArgs,
         metric_family=MetricFamily.COMPUTE,
@@ -327,6 +331,7 @@ register(
             module_name="profiling.runners.moe.fp8_block_fused_moe",
             function_name="profile_fp8_block_fused_moe_sm100",
         ),
+        tactic_label=tactic_labels.fp8_block_fused_moe,
         table_name=KIND,
         args_schema=Nvfp4FusedMoeArgs,
         metric_family=MetricFamily.COMPUTE,
@@ -356,6 +361,7 @@ register(
             module_name="profiling.runners.moe.mxfp4_fused_moe",
             function_name="profile_mxfp4_fused_moe_sm100",
         ),
+        tactic_label=tactic_labels.mxfp4_fused_moe,
         table_name=KIND,
         args_schema=Nvfp4FusedMoeArgs,
         metric_family=MetricFamily.COMPUTE,
@@ -388,6 +394,7 @@ register(
             module_name="profiling.runners.moe.mxfp4_bf16_fused_moe",
             function_name="profile_mxfp4_bf16_fused_moe_sm100",
         ),
+        tactic_label=tactic_labels.mxfp4_bf16_fused_moe,
         table_name=KIND,
         args_schema=Nvfp4FusedMoeArgs,
         metric_family=MetricFamily.COMPUTE,

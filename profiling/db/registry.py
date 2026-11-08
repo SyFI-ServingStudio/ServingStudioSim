@@ -202,6 +202,15 @@ class KernelProfilerSpec:
     # appended to the row's ``backend_version`` so worker-process state that
     # changes the number (e.g. the pinned autotune configs) is recorded with it.
     row_provenance_ref: RunnerRef | None = None
+    # ``(**schema_kwargs) -> str``: the ``autotune_cached`` label (the persisted
+    # FlashInfer tactic file) a spec of this row tunes into; one of
+    # ``profiling/runners/tactic_labels.py``. Under ``VIBESIM_AUTOTUNE=forbid``
+    # the parent requires each spec's file before a worker starts
+    # (``profiling/exec/local.py:autotune_preflight``).
+    tactic_label: Callable[..., str] | None = None
+    # The runner re-tunes in every worker by design (``AutotunePin``), so no
+    # cache can make it run under ``forbid``; the preflight refuses it up front.
+    tunes_every_worker: bool = False
     # Reader-facing description of this backend for the Kernel Library. None
     # until the kind is documented; see profiling/db/doc.py.
     doc: BackendDoc | None = None

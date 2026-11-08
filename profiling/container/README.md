@@ -39,11 +39,15 @@ serves the image's self-check. A worker names its interpreter and module
 since an engine image runs captures on another interpreter. Workers run with
 `--network none` (the engine images take every FlashInfer cubin and its AOT JIT
 cache from the official image) and get a
-temporary JSON exchange directory and a persistent JIT cache at `/cache`: one
-directory per image tag under `VIBESIM_PROFILE_CACHE_DIR` (default
-`~/.cache/vibesim-profiler`), since Torch extensions, Triton and FlashInfer
-builds link that image's libraries. A use touches its directory, and an
-earlier tag's directory of the same image unused for 30 days is removed.
+temporary JSON exchange directory and a persistent JIT cache at `/cache` under
+`VIBESIM_PROFILE_CACHE_DIR` (default `~/.cache/vibesim-profiler`): for an
+engine image one directory per engine, official base and GPU architecture
+(`<engine>-<base digest[:12]>-sm<cc>`, `local.py:image_cache_key`, which says
+why a rebuild on the same base may keep it), for the other images one per tag,
+since Torch extensions, Triton and FlashInfer builds link that image's
+libraries. A use touches its directory, and a sibling of the same engine or
+image unused for 30 days is removed. Each worker gets `VIBESIM_AUTOTUNE`
+from `local.py:autotune_policy` (`reference_engines/README.md#autotuning`).
 `kernel-profile measure` also mounts its
 output directory so the CUPTI/NVML artifacts survive the worker; the images
 carry no matplotlib, so its plots are skipped there (`VIBESIM_PROFILE_RUNTIME=host`

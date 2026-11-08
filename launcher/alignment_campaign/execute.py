@@ -228,6 +228,7 @@ def phase_command(
     resume: bool,
     refresh: bool,
     runtime: str = "host",
+    allow_autotune: bool = False,
 ) -> tuple[str, ...]:
     """The `python -m launcher alignment ...` invocation for one case's phase.
 
@@ -240,8 +241,11 @@ def phase_command(
     if variant.pass_named(phase) is not None:
         if resume:
             return base + ("profile", str(config), "--resume")
-        return base + ("profile", str(config)) + (
-            ("--runtime", runtime) if runtime != "host" else ()
+        return (
+            base
+            + ("profile", str(config))
+            + (("--runtime", runtime) if runtime != "host" else ())
+            + (("--allow-autotune",) if allow_autotune else ())
         )
     if phase == TIMING_PREDICT_PHASE:
         return base + ("timing-predict", str(config))
@@ -261,6 +265,7 @@ def plan_phase(
     refresh: bool = False,
     resume: bool = False,
     runtime: str = "host",
+    allow_autotune: bool = False,
 ) -> tuple[PhasePlan, ...]:
     """Decide each case's disposition. Pure: no process is started, nothing is
     written, so the CPU tier tests this directly against a faked artifact tree."""
@@ -311,6 +316,7 @@ def plan_phase(
                     resume=resume,
                     refresh=refresh,
                     runtime=runtime,
+                    allow_autotune=allow_autotune,
                 ),
             )
         )
@@ -448,6 +454,7 @@ def run_phase(
     resume: bool = False,
     parallelism: int = 1,
     runtime: str = "host",
+    allow_autotune: bool = False,
 ) -> RunReport:
     """Fan one phase across every ready case and collect exit codes separately.
 
@@ -463,6 +470,7 @@ def run_phase(
         refresh=refresh,
         resume=resume,
         runtime=runtime,
+        allow_autotune=allow_autotune,
     )
     report = RunReport(phase=phase, plans=plans)
     report.results = asyncio.run(_run_all(pack, plans, parallelism=parallelism, refresh=refresh))

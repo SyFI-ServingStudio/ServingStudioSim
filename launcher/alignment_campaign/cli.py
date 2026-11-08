@@ -149,6 +149,7 @@ def _run(args) -> int:
             refresh=args.refresh,
             resume=args.resume,
             runtime=args.runtime,
+            allow_autotune=args.allow_autotune,
         )
         print(execute.describe_plan(args.phase, plans))
         _print_calibration_prerequisites(pack)
@@ -162,6 +163,7 @@ def _run(args) -> int:
         resume=args.resume,
         parallelism=args.parallelism,
         runtime=args.runtime,
+        allow_autotune=args.allow_autotune,
     )
     for result in report.results:
         status = "ok" if result.returncode == 0 else f"exit {result.returncode}"
@@ -323,6 +325,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default="host",
         help="forwarded to `alignment profile`: capture in the engine's alignment image "
         "(profile passes only; other phases always run on the host)",
+    )
+    run.add_argument(
+        "--allow-autotune",
+        action="store_true",
+        help="forwarded to `alignment profile`: let the captured engine tune kernel "
+        "tactics (--runtime image only); without it a capture needs warm caches "
+        "(`just ref warm-caches`)",
     )
     run.set_defaults(handler=_run)
 

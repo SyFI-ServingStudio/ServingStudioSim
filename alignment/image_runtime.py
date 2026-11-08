@@ -19,8 +19,9 @@ config wherever it runs:
 - `/work/` (ro, file by file): `profile.yaml` (this pass in container paths),
   the trace, the text corpus.
 - `/out/` (rw): the pass's `log_dir`.
-- `/cache/` (rw): JIT and compile caches, one directory per image tag
-  (`HOME=/cache/home`).
+- `/cache/` (rw): JIT, compile and tactic caches, one directory per engine,
+  official base and GPU architecture (`profiling/exec/local.py:image_cache_key`,
+  `HOME=/cache/home`), with the warm-caches manifests (`alignment/warm_caches.py`).
 
 The container runs with `--network none` (every artifact is in the image or a
 mount), `--ipc host` (the engines' shared-memory queues and CUDA IPC), unlimited
@@ -36,6 +37,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -303,6 +305,8 @@ def docker_argv(
     cache_dir: Path,
     name: str,
     rootless: bool | None = None,
+    autotune_env: dict[str, str] | None = None,
+    warm_caches: bool = False,
 ) -> list[str]:
     # Container root under a rootless runtime (it is the caller there), else the
     # caller's uid, so the outputs in /out belong to the caller either way.
@@ -340,6 +344,9 @@ def docker_argv(
         "TORCHINDUCTOR_CACHE_DIR=/cache/home/.cache/torchinductor",
         "--env",
         "HF_HUB_OFFLINE=1",
+        # The autotune policy (alignment/warm_caches.py); the capture runner
+        # hands its environment to the engine, so every engine process sees it.
+        *[arg for item in (autotune_env or {}).items() for arg in ("--env", "=".join(item))],
         "--volume",
         f"{cache_dir}:{CACHE}:rw",
         *mounts.args(),
@@ -349,6 +356,7 @@ def docker_argv(
         "alignment",
         "profile",
         str(WORK / "profile.yaml"),
+        *(["--warm-caches"] if warm_caches else []),
     ]
 
 
@@ -381,30 +389,62 @@ def rebind_result(log_dir: Path, path_map: dict[str, str], host_devices: list[st
     return rebound
 
 
-def run_profile_in_image(config_path: Path, *, image: str | None = None) -> int:
-    """Run `alignment profile <config>` in the image; return its exit code."""
+def run_profile_in_image(
+    config_path: Path,
+    *,
+    image: str | None = None,
+    allow_autotune: bool = False,
+    warm_caches: bool = False,
+) -> int:
+    """Run `alignment profile <config>` in the image; return its exit code.
+
+    `warm_caches` instead starts the engine with autotuning allowed, lets it
+    reach ready and stops it (no requests, no capture; its logs go to
+    `<log_dir>.warm-caches`), then records the manifest a capture's preflight
+    looks for. A capture without `allow_autotune` needs that manifest, and
+    fails here, before the container starts, when there is none.
+    """
     from launcher.alignment_config import load_profile_config
-    from profiling.exec.local import _image_cache_dir, gpu_uuids_for_indices
+    from profiling.exec.local import gpu_uuids_for_indices, image_cache_dir, image_cache_key
+    from reference_engines.autotune_guard import (
+        POLICY_ENV,
+        PREFLIGHT_ENV,
+        AutotuneForbiddenError,
+        forbidden_line,
+    )
+
+    from . import warm_caches as warm
 
     cfg = load_profile_config(config_path)
     log_dir = Path(cfg.log_dir)
+    if warm_caches:
+        log_dir = log_dir.with_name(log_dir.name + ".warm-caches")
     log_dir.mkdir(parents=True, exist_ok=True)
     document, mounts, path_info = container_config(config_path, log_dir)
     tag = image or image_tag(cfg.engine)
     if subprocess.run(["docker", "image", "inspect", tag], capture_output=True).returncode:
         raise ImageRunError(
-            f"image {tag} is not on this host; build it with "
-            f"`just ref build-image {cfg.engine}`"
+            f"image {tag} is not on this host; build it with `just ref build-image {cfg.engine}`"
         )
+    host_devices = path_info["host_devices"]
+    uuids = gpu_uuids_for_indices([int(token) for token in host_devices])
+    cache_dir = image_cache_dir(tag, uuids)
+    cache_key = image_cache_key(tag, uuids)
+    policy = warm.capture_policy(allow_autotune=allow_autotune, warm_caches=warm_caches)
+    autotune_env = {POLICY_ENV: policy}
+    if policy == "forbid":
+        # Instant, and before anything starts: the guard in the engine is only
+        # the backstop for a manifest whose key turns out incomplete.
+        manifest = warm.preflight(cfg, config_path, cache_dir, cache_key)
+        autotune_env[PREFLIGHT_ENV] = f"warm-caches manifest {manifest}"
+        print(f"[profile] warm caches: {manifest}", flush=True)
+
     container_config_path = log_dir / CONTAINER_CONFIG_NAME
     container_config_path.write_text(yaml.safe_dump(document, sort_keys=False))
     mounts.add(container_config_path, WORK / "profile.yaml")
     for host, container in overlay_mounts().entries.items():
         mounts.add(Path(host), PurePosixPath(container))
 
-    host_devices = path_info["host_devices"]
-    uuids = gpu_uuids_for_indices([int(token) for token in host_devices])
-    cache_dir = _image_cache_dir(tag)
     name = f"vibesim-capture-{os.getpid()}"
     argv = docker_argv(
         tag,
@@ -413,6 +453,8 @@ def run_profile_in_image(config_path: Path, *, image: str | None = None) -> int:
         gpu_uuids=uuids,
         cache_dir=cache_dir,
         name=name,
+        autotune_env=autotune_env,
+        warm_caches=warm_caches,
     )
     image_id = subprocess.run(
         ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
@@ -429,13 +471,43 @@ def run_profile_in_image(config_path: Path, *, image: str | None = None) -> int:
         "host_devices": host_devices,
         "gpu_uuids": uuids,
         "cache_dir": str(cache_dir),
+        "autotune": autotune_env,
         "paths": path_info["paths"],
     }
     (log_dir / CONTAINER_RUN_NAME).write_text(json.dumps(record, indent=2))
-    print(f"[profile] in image {tag} ({image_id[:19]}) on GPUs {','.join(uuids)}", flush=True)
+    print(
+        f"[profile] in image {tag} ({image_id[:19]}) on GPUs {','.join(uuids)}, "
+        f"cache {cache_dir.name}, autotune {policy}",
+        flush=True,
+    )
+    before = warm.snapshot(cache_dir) if warm_caches else {}
+    started = time.monotonic()
     returncode = subprocess.run(argv).returncode
     record["exit_code"] = returncode
     (log_dir / CONTAINER_RUN_NAME).write_text(json.dumps(record, indent=2))
-    if returncode == 0:
+    if returncode != 0:
+        server_log = log_dir / cfg.engine / f"{cfg.name}_server.log"
+        line = (
+            forbidden_line(server_log.read_text(errors="replace")) if server_log.is_file() else None
+        )
+        if line is not None:
+            raise AutotuneForbiddenError(
+                f"the engine tried to tune under VIBESIM_AUTOTUNE={policy} and stopped "
+                f"({server_log}): {line}"
+            )
+        return returncode
+    if warm_caches:
+        manifest = warm.write_manifest(
+            cfg,
+            config_path,
+            cache_dir,
+            cache_key,
+            image=tag,
+            image_id=image_id,
+            before=before,
+            seconds=time.monotonic() - started,
+        )
+        print(f"[warm-caches] manifest: {manifest}", flush=True)
+    else:
         rebind_result(log_dir, path_info["paths"], host_devices)
     return returncode

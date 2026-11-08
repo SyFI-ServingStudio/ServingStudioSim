@@ -33,6 +33,7 @@ just ref materialize vllm                  # BASE + patches -> reference_engines
 just ref export-patches vllm               # src (or --from CHECKOUT --ref REF) -> patches/
 just ref bump-base vllm --commit SHA --image REPO:TAG
 just ref build-image vllm                  # this host's platform
+just ref warm-caches vllm PROFILE.yaml     # compile + tune a capture's deployment, record it
 ```
 
 (`just ref VERB ENGINE` is `uv run python -m reference_engines VERB ENGINE`.)
@@ -69,6 +70,54 @@ applies stops `git am` in `src/`: resolve it there (`git am --continue`), then
 Dockerfile, BASE, every patch, the capture requirements, the req-frontend
 gitlink and the pinned base image, so a host that has the tag has that image.
 
+**warm-caches** starts the engine of a capture config in its image, on the
+config's GPUs, with autotuning allowed; it lets the engine finish JIT, compile,
+autotune and CUDA-graph capture, stops it at ready (no requests, no capture;
+logs in `<log_dir>.warm-caches/`), and writes the manifest a capture needs
+(next section). Run it on the GPU type the captures will use, inside the
+GPU job as any capture.
+
+## Autotuning
+
+A measurement runs the tactics a deliberate warm-up chose; it never tunes.
+`VIBESIM_AUTOTUNE=allow|forbid` carries the decision, set only by the parent:
+
+| Run | Policy |
+| --- | --- |
+| capture (`launcher alignment profile --runtime image`) | forbid |
+| capture with `--allow-autotune`, or `warm-caches` | allow |
+| L1 jit-fill (rows missing from the DB) | allow, and each tune is logged per kernel |
+| L1 `--force` / `--fresh` (rows already there) | forbid, unless `--allow-autotune` |
+
+Two layers enforce it. The preflight runs in the parent before any container
+starts: a capture needs a warm-caches manifest whose key (engine, base and GPU
+architecture, model, GPU count, server config and runtime environment;
+`alignment/warm_caches.py`) matches, and an L1 refresh needs each spec's
+persisted tactic file (`profiling/runners/tactic_labels.py`); a miss fails at
+once and says what to run. The backstop is `autotune_guard.py`, which the
+images load at interpreter start (a `.pth`) and L1 workers install: it raises at
+every cache-miss tactic measurement (FlashInfer's autotuner, Triton
+`@autotune`, inductor max-autotune and its runtime autotuners) and stops the
+process; the parent reports it, and keeps no row of that chunk. If the
+preflight said warm, the error says "manifest/actual mismatch": the key misses
+an input of the tuning and must be completed.
+
+What the preflight cannot see, the guard still stops: a Triton `@autotune`
+key never warmed (the engine reaches it only under load), and configs with a
+`pre_hook`, which Triton never writes to disk. The KDA rows that pin Triton
+selections (`AutotunePin`) re-tune in every worker by design, so they refresh
+only with `--allow-autotune`.
+
+## Persistent caches
+
+A container's `/cache` (JIT, compile, autotune caches and the warm-caches
+manifests) is `~/.cache/vibesim-profiler/<engine>-<base digest[:12]>-sm<cc>`:
+the image's `ai.vibesim.cache-key` label plus the GPUs' architecture
+(`profiling/exec/local.py:image_cache_key`). A rebuild on the same official
+base keeps its caches; the caches that patches could affect are content-addressed
+(the reasoning is beside the key function). Images without the label keep one
+directory per tag.
+
 ## The image
 
 `FROM` the official image at this platform's digest, then, from what changes
@@ -82,14 +131,16 @@ least to most:
    `FLASHINFER_DISABLE_JIT=1` and the 0.7.3 wheel does not ship it;
    `complete_flashinfer_aot.py` compiles it without a GPU and registers it in
    each provider's manifest);
-4. the req-frontend `session_runner`, built in a stage on the same base;
-5. the patches, applied to the engine as the official image installed it:
+4. the autotune guard, in the engine interpreter's site-packages with a `.pth`
+   that installs it at interpreter start;
+5. the req-frontend `session_runner`, built in a stage on the same base;
+6. the patches, applied to the engine as the official image installed it:
    vLLM's wheel in `/usr/local/lib/python3.12/dist-packages` (only `vllm/`
    paths), SGLang's editable checkout at `/sgl-workspace/sglang`. A patch that
    does not apply means the image is not BASE's commit, and the build fails;
-6. this checkout's `profiling/`, `launcher/`, `gpu/` for the build's self-check
+7. this checkout's `profiling/`, `launcher/`, `gpu/` for the build's self-check
    (workers and captures overlay the checkout's own at run time);
-7. the manifest (`/etc/vibesim-profiler-image.json`) and labels.
+8. the manifest (`/etc/vibesim-profiler-image.json`) and labels.
 
 A patch-only or Sim-only change rebuilds only the last layers. FlashInfer's
 cubins and AOT JIT cache come with the official images. The vLLM image is vLLM's

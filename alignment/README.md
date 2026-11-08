@@ -547,7 +547,7 @@ with `--network none` a wheel the image lacks is refused, not installed.
 | `/models/` | ro | the Hugging Face hub directory of each checkpoint the config names (`server.model_path`, `workload.tokenizer`, paths inside `server.extra_args`), whole: a repo's `blobs/` may link on into a shared store beside it (`<hub>/blobs/xx/<sha>`). Every file must resolve inside it through relative links, or the pass is refused before launch |
 | `/work/profile.yaml`, `/work/trace.csv`, `/work/text_corpus` | ro, one file each | the pass in container paths, its trace, its text corpus |
 | `/out` | rw | the pass's `log_dir` |
-| `/cache` | rw | `HOME=/cache/home`: FlashInfer, Triton, Inductor, vLLM, DeepGEMM caches, one directory per image tag (`VIBESIM_PROFILE_CACHE_DIR`, default `~/.cache/vibesim-profiler`) |
+| `/cache` | rw | `HOME=/cache/home`: FlashInfer, Triton, Inductor, vLLM, DeepGEMM caches and the warm-caches manifests, one directory per engine, official base and GPU architecture (`VIBESIM_PROFILE_CACHE_DIR`, default `~/.cache/vibesim-profiler`; `reference_engines/README.md#persistent-caches`) |
 
 The host keeps what belongs to the machine: the Slurm allocation, which GPUs
 (the config's `cuda_visible_devices`, passed to the container by UUID and
@@ -561,6 +561,14 @@ model/UUID/bus id/driver/clocks/power limit, `nvidia-smi topo -m`, NVLink status
 fabric-handle and switch-multicast support per device, IMEX channel, memlock,
 `/dev/shm`, `perf_event_paranoid`, and the image manifest. It refuses to start
 when the devices contradict the config's `gpu` or `tp_size * dp_size`.
+
+An image capture does not tune kernels: before the container starts, the host
+requires the manifest `just ref warm-caches <engine> <profile.yaml>` wrote for
+this deployment (`alignment/warm_caches.py`) and fails at once without one;
+`--allow-autotune` (also on `alignment-campaign run`) lets a capture tune
+instead. An engine that still starts a tactic search stops with
+`VIBESIM_AUTOTUNE_FORBIDDEN`, and the pass fails naming it
+(`reference_engines/README.md#autotuning`).
 
 When the container exits 0, the host rewrites `profile_result.json` from
 container paths to its own (the container's copy stays as
