@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -86,12 +88,17 @@ def run_replay(
     model: str,
     measurement_ready: Callable[[], None] | None = None,
     routed_experts_dir: Path | None = None,
+    server_failure: Callable[[], str | None] | None = None,
 ) -> dict:
     """Replay the shared trace through its explicitly selected wire backend.
 
     `routed_experts_dir` turns the replay non-streaming and collects the routes
     the server took per request. The caller decides when that trade is worth
     making; this layer only knows that it costs the per-event timeline.
+
+    `server_failure`, polled every second while the replay runs, returns why the
+    server can no longer answer (or None). A dead engine leaves its requests
+    open until the stream idle timeout; this stops the replay at once instead.
     """
     prepared.log_path.parent.mkdir(parents=True, exist_ok=True)
     protocol_base_url = (
@@ -143,12 +150,19 @@ def run_replay(
         argv.extend(["--routed-experts-dir", str(routed_experts_dir)])
     argv.extend(config.extra_args)
 
-    if measurement_ready is None:
+    if measurement_ready is None and server_failure is None:
         subprocess.run(argv, cwd=REPO_ROOT, check=True)
+    elif measurement_ready is None:
+        with subprocess.Popen(argv, cwd=REPO_ROOT) as proc:
+            with _watch_server(proc, server_failure) as failure:
+                returncode = proc.wait()
+            _raise_server_failure(failure)
+            if returncode:
+                raise subprocess.CalledProcessError(returncode, argv)
     else:
         with subprocess.Popen(
             argv, cwd=REPO_ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-        ) as proc:
+        ) as proc, _watch_server(proc, server_failure) as failure:
             released = False
             try:
                 for line in proc.stdout:
@@ -162,13 +176,16 @@ def run_replay(
                     else:
                         print(line, end="", flush=True)
                 returncode = proc.wait()
+                _raise_server_failure(failure)
                 if returncode:
                     raise subprocess.CalledProcessError(returncode, argv)
                 if not released:
                     raise RuntimeError("frontend exited without a measurement boundary")
-            except BaseException:
+            except BaseException as error:
                 proc.kill()
                 proc.wait()
+                if failure and not isinstance(error, ServerFailedDuringReplay):
+                    raise ServerFailedDuringReplay(failure[0]) from error
                 raise
     return {
         "source_trace": str(prepared.trace_path.resolve()),
@@ -179,3 +196,41 @@ def run_replay(
         "warmup": config.warmup,
         "routed_experts_dir": str(routed_experts_dir) if routed_experts_dir else None,
     }
+
+
+class ServerFailedDuringReplay(RuntimeError):
+    """The serving engine died or stopped while the replay was running."""
+
+
+@contextlib.contextmanager
+def _watch_server(
+    proc: subprocess.Popen, server_failure: Callable[[], str | None] | None
+) -> Iterator[list[str]]:
+    """Kill the replay as soon as `server_failure` reports; yield what it said."""
+
+    failure: list[str] = []
+    if server_failure is None:
+        yield failure
+        return
+    stop = threading.Event()
+
+    def watch() -> None:
+        while not stop.wait(1.0):
+            reason = server_failure()
+            if reason:
+                failure.append(reason)
+                proc.kill()
+                return
+
+    thread = threading.Thread(target=watch, name="replay-server-watch", daemon=True)
+    thread.start()
+    try:
+        yield failure
+    finally:
+        stop.set()
+        thread.join()
+
+
+def _raise_server_failure(failure: list[str]) -> None:
+    if failure:
+        raise ServerFailedDuringReplay(f"server failed during replay: {failure[0]}")

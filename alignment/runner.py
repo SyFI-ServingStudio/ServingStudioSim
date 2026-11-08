@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -28,7 +29,7 @@ import time
 from pathlib import Path
 
 from profiling.gpu_policy import require_gpu
-from reference_engines.autotune_guard import AutotuneForbiddenError, forbidden_line
+from reference_engines.autotune_guard import MARKER, AutotuneForbiddenError, forbidden_line
 
 from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
@@ -598,6 +599,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
             drive_summary = load_generator.run_replay(
                 cfg.workload, prepared_replay, base_url=base_url, model=model,
                 measurement_ready=measurement_ready,
+                server_failure=_server_failure(proc, server_log),
                 # Only the corpus pass needs per-token routes, and it pays for
                 # them with the replay's streaming timeline. An expert_popularity
                 # pass reads the server's own counters and keeps its timeline.
@@ -666,6 +668,37 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
         drive_summary=drive_summary,
         nsys_executable=nsys_executable,
     )
+
+
+# SGLang's parent process logs this when a scheduler/detokenizer subprocess
+# dies, then keeps its HTTP server up with the requests left open.
+_SGLANG_SUBPROCESS_CRASH = re.compile(r"Subprocess \S+ \(pid=\d+\) crashed with exit code")
+
+
+def _server_failure(proc: subprocess.Popen, server_log: Path):
+    """A poll for `run_replay`: why the server can no longer answer, or None.
+
+    Reads only the log written since the previous poll.
+    """
+
+    offset = server_log.stat().st_size
+
+    def poll() -> str | None:
+        nonlocal offset
+        code = proc.poll()
+        if code is not None:
+            return f"server process exited with code {code}"
+        with server_log.open("rb") as log:
+            log.seek(offset)
+            chunk = log.read()
+        complete = chunk.rfind(b"\n") + 1  # leave a partial last line for later
+        offset += complete
+        for line in chunk[:complete].decode(errors="replace").splitlines():
+            if MARKER in line or _SGLANG_SUBPROCESS_CRASH.search(line):
+                return line.strip()
+        return None
+
+    return poll
 
 
 def _check_routes_cover_replay(summary_path: Path, routes: Path) -> None:
