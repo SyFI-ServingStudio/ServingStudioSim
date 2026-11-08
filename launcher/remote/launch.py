@@ -12,6 +12,11 @@ slurm
     An ``sbatch`` script submitted from the access host. Slurm exports the
     submitting environment by default, so the script clears the managed-job
     context before anything runs (node.py clears it again).
+
+Under ``profile_runtime: full-remote-profile`` either form runs
+``JOBDIR/container.sh`` instead (`container_script`): one ``docker run`` of a
+profiler image whose own interpreter runs ``node.py run-job``. Its pid file is
+the container's, so the host side is tracked by ``launch.pid`` alone.
 """
 
 from __future__ import annotations
@@ -33,6 +38,8 @@ class Submitted:
     # The direct job's session leader pid, or the Slurm job id.
     handle: str
     slurm: bool
+    # A container job: its `pid` file is in the container's pid namespace.
+    container: bool = False
 
 
 @dataclass(frozen=True)
@@ -50,6 +57,85 @@ class Status:
 
 def node_command(remote_python: PurePosixPath, jobdir: PurePosixPath) -> str:
     return f"{q(remote_python)} -m launcher.remote.node run-job {q(jobdir)}"
+
+
+@dataclass(frozen=True)
+class Container:
+    """A full-remote-profile job: run ``node.py`` in ``image`` on ``python``."""
+
+    image: str
+    python: PurePosixPath
+    workdir: PurePosixPath
+    node_local: PurePosixPath
+    mounts: tuple[PurePosixPath, ...] = ()
+    # The GPUs of a direct job; a Slurm job takes those it was allocated.
+    gpus: tuple[str, ...] = ()
+
+
+# Quoted twice: docker reads the value as CSV, so a GPU list needs its own quotes.
+GPU_REQUEST = '"\\"device=$gpus\\""'
+
+
+def container_name(job_id: str) -> str:
+    return f"vibesim-{job_id}"
+
+
+def container_script(container: Container, *, job_id: str, jobdir: PurePosixPath, cwd: PurePosixPath) -> str:
+    """The host side of one container job.
+
+    The container sees the workdir, node-local scratch and each mount at the
+    same absolute path, so ``job.json`` names the same files on both sides.
+    It runs in the background so a TERM (``kill`` here, ``scancel``) reaches
+    the trap, which stops the container; node.py inside records the exit code.
+    A container that never started records the ``docker run`` status instead.
+    """
+
+    name = container_name(job_id)
+    volumes = []
+    for path in dict.fromkeys((container.workdir, container.node_local, *container.mounts)):
+        volumes += ["--volume", f"{path}:{path}"]
+    configured = ",".join(container.gpus)
+    home = container.workdir / "cache" / "home"
+    run = [
+        "docker", "run", "--rm", "--init", "--name", name,
+        "--ipc", "host",
+        "--gpus", GPU_REQUEST,
+        "--user", "$(id -u):$(id -g)",
+        "--env", f"HOME={home}", "--env", "USER=vibesim", "--env", "LOGNAME=vibesim",
+        *volumes,
+        "--workdir", str(cwd),
+        "--entrypoint", str(container.python),
+        container.image,
+        "-m", "launcher.remote.node", "run-job", str(jobdir),
+    ]
+    quoted = " ".join(
+        part if part in (GPU_REQUEST, "$(id -u):$(id -g)") else shlex.quote(part)
+        for part in run
+    )
+    return "\n".join(
+        [
+            "#!/bin/bash",
+            "set -uo pipefail",
+            f"gpus={shlex.quote(configured)}",
+            # Slurm names the allocated GPUs by index; docker, outside the
+            # job's cgroup, addresses the same physical devices.
+            'if [ -z "$gpus" ]; then gpus=${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-${CUDA_VISIBLE_DEVICES:-}}}; fi',
+            'if [ -z "$gpus" ]; then echo "[remote] no GPUs for this job: set gpus in remote.yaml '
+            'or ask Slurm for them" >> ' + f"{q(jobdir / 'stdout.log')}; "
+            f"echo 2 > {q(jobdir / 'exit_code')}; exit 2; fi",
+            f"mkdir -p {q(home)}",
+            f"echo \"[remote] container {name} on GPU(s) $gpus ({container.image})\" >> {q(jobdir / 'stdout.log')}",
+            f"stop() {{ docker kill --signal TERM {name} >/dev/null 2>&1; }}",
+            "trap stop TERM INT HUP",
+            f"{quoted} &",
+            "child=$!",
+            # `wait` returns early when a trapped signal arrives; wait again for the container.
+            'while :; do wait "$child"; status=$?; kill -0 "$child" 2>/dev/null || break; done',
+            f"[ -f {q(jobdir / 'exit_code')} ] || echo $status > {q(jobdir / 'exit_code')}",
+            "exit $status",
+            "",
+        ]
+    )
 
 
 def sbatch_script(
@@ -90,8 +176,16 @@ def submit(
     jobdir: PurePosixPath,
     cwd: PurePosixPath,
     remote_python: PurePosixPath,
+    container: Container | None = None,
 ) -> Submitted:
-    command = node_command(remote_python, jobdir)
+    if container is None:
+        command = node_command(remote_python, jobdir)
+    else:
+        script = jobdir / "container.sh"
+        transport.write_text(
+            script, container_script(container, job_id=job_id, jobdir=jobdir, cwd=cwd)
+        )
+        command = f"bash {q(script)}"
     if remote.slurm is None:
         # Braced so `&` backgrounds only the job: backgrounding the whole `&&`
         # list would leave a subshell holding this command's output open until
@@ -103,7 +197,7 @@ def submit(
         )
         pid = transport.run(script).stdout.strip()
         transport.write_text(jobdir / "launch.pid", pid + "\n")
-        return Submitted(jobdir, pid, slurm=False)
+        return Submitted(jobdir, pid, slurm=False, container=container is not None)
     batch = jobdir / "job.sbatch"
     transport.write_text(
         batch,
@@ -117,7 +211,7 @@ def submit(
     if not slurm_id.isdigit():
         raise RuntimeError(f"sbatch printed no job id: {output!r}")
     transport.write_text(jobdir / "slurm_id", slurm_id + "\n")
-    return Submitted(jobdir, slurm_id, slurm=True)
+    return Submitted(jobdir, slurm_id, slurm=True, container=container is not None)
 
 
 def status_script(submitted: Submitted, offset: int) -> str:
@@ -130,8 +224,13 @@ def status_script(submitted: Submitted, offset: int) -> str:
             '-o State,ExitCode 2>/dev/null | head -1)"; fi'
         )
     else:
+        pid = (
+            f"cat {jobdir}/launch.pid"
+            if submitted.container
+            else f"cat {jobdir}/pid 2>/dev/null || cat {jobdir}/launch.pid"
+        )
         alive = (
-            f"pid=$(cat {jobdir}/pid 2>/dev/null || cat {jobdir}/launch.pid); "
+            f"pid=$({pid}); "
             'if kill -0 "$pid" 2>/dev/null; then echo alive=1; else echo alive=0; fi'
         )
     return (
@@ -169,11 +268,16 @@ def cancel(transport: Transport, submitted: Submitted) -> None:
     if submitted.slurm:
         transport.run(f"scancel {shlex.quote(submitted.handle)}", check=False)
         return
-    # node.py runs as its session's leader and forwards the signal to the job.
+    # node.py runs as its session's leader and forwards the signal to the job;
+    # a container job's leader is container.sh, which stops its container.
     jobdir = q(submitted.jobdir)
+    pid = (
+        f"cat {jobdir}/launch.pid"
+        if submitted.container
+        else f"cat {jobdir}/pid 2>/dev/null || cat {jobdir}/launch.pid"
+    )
     # A job that has ended may have had its pid reused: signal only a live one.
     transport.run(
-        f"[ -f {jobdir}/exit_code ] || {{ pid=$(cat {jobdir}/pid 2>/dev/null || "
-        f'cat {jobdir}/launch.pid); kill -TERM "$pid"; }}',
+        f'[ -f {jobdir}/exit_code ] || {{ pid=$({pid}); kill -TERM "$pid"; }}',
         check=False,
     )

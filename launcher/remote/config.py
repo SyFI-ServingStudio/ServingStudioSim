@@ -50,6 +50,14 @@ class Slurm:
     extra: tuple[str, ...] = ()
 
 
+#: `docker`: the job runs on venvs built on the remote, profiling workers in
+#: images. `in-image`: the remote is itself a profiler image (a pod).
+#: `full-remote-profile`: each job is one container of a profiler image on the
+#: remote, which needs only docker: nothing is installed or built there.
+FULL_REMOTE_PROFILE = "full-remote-profile"
+PROFILE_RUNTIMES = ("docker", "in-image", FULL_REMOTE_PROFILE)
+
+
 @dataclass(frozen=True)
 class Remote:
     name: str
@@ -68,6 +76,11 @@ class Remote:
     env: dict[str, str] = field(default_factory=dict)
     keep_versions: int = 10
     profile_runtime: str = "docker"
+    # `full-remote-profile` only: host directories mounted into the job's
+    # container at the same path (a Hugging Face cache, a text corpus), and the
+    # GPUs a direct job runs on (Slurm assigns them itself).
+    mounts: tuple[PurePosixPath, ...] = ()
+    gpus: tuple[str, ...] = ()
     # The remote may lose its disk (a container pod): copy results back whole.
     ephemeral: bool = False
     # Directory of remote.yaml; `.remote/known_hosts` beside it pins host keys.
@@ -149,6 +162,8 @@ def _parse(name: str, raw: dict[str, Any], config_dir: Path) -> Remote:
             "keep_versions",
             "profile_runtime",
             "ephemeral",
+            "mounts",
+            "gpus",
         },
         "",
     )
@@ -165,10 +180,24 @@ def _parse(name: str, raw: dict[str, Any], config_dir: Path) -> Remote:
     if not isinstance(keep_versions, int) or isinstance(keep_versions, bool) or keep_versions < 1:
         raise RemoteConfigError(f"keep_versions must be a positive integer, got {keep_versions!r}")
     profile_runtime = raw.get("profile_runtime", "docker")
-    if profile_runtime not in ("docker", "in-image"):
+    if profile_runtime not in PROFILE_RUNTIMES:
         raise RemoteConfigError(
-            f"profile_runtime must be docker or in-image, got {profile_runtime!r}"
+            f"profile_runtime must be one of {', '.join(PROFILE_RUNTIMES)}, got {profile_runtime!r}"
         )
+    mounts = raw.get("mounts", [])
+    if isinstance(mounts, str):
+        mounts = [mounts]
+    if not isinstance(mounts, list):
+        raise RemoteConfigError("mounts must be a list of absolute remote paths")
+    gpus = raw.get("gpus", [])
+    if isinstance(gpus, (int, str)) and not isinstance(gpus, bool):
+        gpus = [gpus]
+    if not isinstance(gpus, list) or not all(
+        isinstance(gpu, (int, str)) and not isinstance(gpu, bool) for gpu in gpus
+    ):
+        raise RemoteConfigError("gpus must be a GPU index or UUID, or a list of them")
+    if (mounts or gpus) and profile_runtime != FULL_REMOTE_PROFILE:
+        raise RemoteConfigError(f"mounts and gpus apply only to profile_runtime: {FULL_REMOTE_PROFILE}")
     ephemeral = raw.get("ephemeral", False)
     if not isinstance(ephemeral, bool):
         raise RemoteConfigError(f"ephemeral must be true or false, got {ephemeral!r}")
@@ -182,6 +211,8 @@ def _parse(name: str, raw: dict[str, Any], config_dir: Path) -> Remote:
         env={key: str(value) for key, value in env.items()},
         keep_versions=keep_versions,
         profile_runtime=profile_runtime,
+        mounts=tuple(_absolute(mount, "mounts[]") for mount in mounts),
+        gpus=tuple(str(gpu) for gpu in gpus),
         ephemeral=ephemeral,
         config_dir=config_dir,
     )
