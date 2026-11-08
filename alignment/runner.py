@@ -1058,7 +1058,7 @@ def _shutdown(proc: subprocess.Popen, timeout: float = 120.0, *, wrapped: bool =
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            _signal_groups([*targets, own], signal.SIGKILL)
+            _signal_groups([own, *targets], signal.SIGKILL)
         return
     _signal_groups(targets, signal.SIGINT)
     deadline = time.monotonic() + timeout
@@ -1068,4 +1068,4 @@ def _shutdown(proc: subprocess.Popen, timeout: float = 120.0, *, wrapped: bool =
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _signal_groups([*targets, own], signal.SIGKILL)
+        _signal_groups([own, *targets], signal.SIGKILL)

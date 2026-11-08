@@ -78,9 +78,13 @@ def test_a_server_ignoring_sigint_is_killed_with_its_launcher(tmp_path) -> None:
         except ProcessLookupError:
             break
         # A killed child of a dead launcher is reparented and reaped; until
-        # then it is a zombie, which counts as gone.
-        state = Path(f"/proc/{server_pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-        if state == "Z":
+        # then it is a zombie, which counts as gone. It may also be reaped
+        # between the two looks.
+        try:
+            stat = Path(f"/proc/{server_pid}/stat").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            break
+        if stat.rsplit(")", 1)[1].split()[0] == "Z":
             break
         assert time.monotonic() < deadline, "server survived the shutdown"
         time.sleep(0.05)
