@@ -218,5 +218,27 @@ def format_base(base: Base, header: str) -> str:
     return comment + yaml.safe_dump(doc, sort_keys=False, width=float("inf"))
 
 
+# What the image installs from a patch, per engine (the Dockerfile applies
+# patches to the package as the official image installed it), and what a patch
+# may also touch because no image runs it. Anything else, a native source
+# above all, would build into an image that silently lacks it.
+_INSTALLED = {"vllm": ("vllm/",), "sglang": ("python/sglang/",)}
+_NOT_RUN = re.compile(r"(^|/)(tests?|docs)/|\.md$")
+
+
+def patched_paths_not_installed(engine: str) -> list[str]:
+    """Paths the patches change that the engine's image would not install."""
+
+    stray = []
+    for patch in patch_files(engine):
+        for line in patch.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.startswith("diff --git a/"):
+                continue
+            path = line.split(" b/", 1)[0].removeprefix("diff --git a/")
+            if not path.startswith(_INSTALLED[engine]) and not _NOT_RUN.search(path):
+                stray.append(f"{patch.name}: {path}")
+    return stray
+
+
 def patch_files(engine: str) -> list[Path]:
     return sorted(patches_dir(engine).glob("*.patch"))

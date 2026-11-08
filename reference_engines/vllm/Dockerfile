@@ -83,7 +83,8 @@ COPY --from=req-frontend /src/req-frontend/target/release/session_runner \
     /opt/vibesim/alignment/load_generator/req-frontend/target/release/session_runner
 
 # The patches, onto vLLM as the official image installed it. Only the package's
-# own files apply (the fork's tests and notes are not installed); a patch that
+# own files apply (the fork's tests and notes are not installed; `build` refuses
+# patches that change anything else, e.g. csrc/); a patch that
 # does not apply means the image is not BASE.yaml's commit.
 COPY reference_engines/vllm/patches /opt/vibesim/reference_engines/vllm/patches
 RUN cd /usr/local/lib/python3.12/dist-packages \

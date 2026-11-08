@@ -265,6 +265,15 @@ def _image_exists(tag: str) -> bool:
 def build(name: str, root: Path = REPO_ROOT) -> str:
     image = IMAGES[name]
     _require_pinned_checkouts(image, root)
+    if image.base_image is not None:
+        from reference_engines import patched_paths_not_installed
+
+        stray = patched_paths_not_installed(name)
+        if stray:
+            raise RuntimeError(
+                f"{name}: patches change files the image does not install (a native "
+                "change needs a source build, not this image): " + "; ".join(stray)
+            )
     tag = image.tag(root)
     base_args = {}
     if image.base_image is not None:

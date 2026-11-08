@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import reference_engines
 from reference_engines import ENGINES, BaseError, format_base, parse_base, read_base
 
 COMMIT = "a" * 40
@@ -146,3 +147,24 @@ def test_a_tree_with_untracked_or_ignored_work_is_not_replaced(tmp_path):
     (plain / "x").write_text("")
     with pytest.raises(RefError, match="not a materialized tree"):
         _check_replaceable(plain, force=True)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_checked_in_patches_touch_only_what_the_image_installs(engine):
+    assert reference_engines.patched_paths_not_installed(engine) == []
+
+
+def test_a_native_change_in_a_patch_is_reported(tmp_path, monkeypatch):
+    patch = tmp_path / "0001-x.patch"
+    patch.write_text(
+        "diff --git a/vllm/v1/a.py b/vllm/v1/a.py\n"
+        "diff --git a/tests/v1/test_a.py b/tests/v1/test_a.py\n"
+        "diff --git a/ALIGNMENT.md b/ALIGNMENT.md\n"
+        "diff --git a/csrc/moe/topk.cu b/csrc/moe/topk.cu\n"
+        "diff --git a/CMakeLists.txt b/CMakeLists.txt\n"
+    )
+    monkeypatch.setattr(reference_engines, "patch_files", lambda engine: [patch])
+    assert reference_engines.patched_paths_not_installed("vllm") == [
+        "0001-x.patch: csrc/moe/topk.cu",
+        "0001-x.patch: CMakeLists.txt",
+    ]
