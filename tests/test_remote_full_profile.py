@@ -244,3 +244,35 @@ def test_a_full_remote_profile_remote_runs_gpu_work_only(tmp_path, monkeypatch, 
     assert remote_run.run(None, ["presets/x.yaml"], GlobalOptions(remote="gpu")) == 2
     assert "run `simulation` here" in capsys.readouterr().err
     assert remote_run.run("timing-predict", ["p.json"], GlobalOptions(remote="gpu")) == 2
+
+
+@pytest.mark.parametrize(
+    ("runtime", "argv", "message"),
+    [
+        (FULL_REMOTE_PROFILE, ["label", "--pack", "p", "--out-root", "logs/x"], "label runs here"),
+        ("docker", ["run", "--pack", "p", "--out-root", "logs/x", "--phase", "profile_nsys"],
+         "needs profile_runtime: full-remote-profile"),
+        (FULL_REMOTE_PROFILE,
+         ["run", "--pack", "p", "--out-root", "logs/x", "--phase", "profile_nsys", "--dry-run"],
+         "--dry-run stays local"),
+    ],
+)
+def test_only_a_campaigns_capture_goes_to_a_remote(tmp_path, runtime, argv, message):
+    from launcher.remote.run import RemoteRunError, Session, _alignment_campaign
+
+    session = Session(_remote(tmp_path, profile_runtime=runtime))
+    with pytest.raises(RemoteRunError, match=message):
+        _alignment_campaign(session, argv)
+
+
+def test_a_campaigns_analysis_phase_is_refused_remotely(tmp_path):
+    from launcher.alignment_campaign.cli import PACK_ROOT
+    from launcher.remote.run import RemoteRunError, Session, _alignment_campaign
+
+    pack = next(path for path in sorted(PACK_ROOT.iterdir()) if (path / "campaign.yaml").is_file())
+    session = Session(_remote(tmp_path))
+    with pytest.raises(RemoteRunError, match="not a profile pass"):
+        _alignment_campaign(
+            session,
+            ["run", "--pack", pack.name, "--out-root", "logs/x", "--phase", "timing_predict"],
+        )

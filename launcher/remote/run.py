@@ -280,6 +280,13 @@ class Session:
             self.transport.run(f"mkdir -p {q(destination.parent)}")
             self.data.rsync(str(path), self.data.remote_spec(destination))
 
+    def push_tree(self, local: Path) -> None:
+        """Copy a local directory under ``logs/`` to the same place under the remote's."""
+
+        destination = self.remote_logs_path(local)
+        self.transport.run(f"mkdir -p {q(destination)}")
+        self.data.rsync(f"{local}/", self.data.remote_spec(destination, directory=True))
+
     def copy_back(self, local: Path, *, excludes: tuple[str, ...] = ()) -> str | None:
         """`fetch`, reporting a failed copy instead of raising; returns its error."""
 
@@ -630,6 +637,7 @@ def _simulation(session: Session, argv: list[str]) -> int:
     for flag, used in (
         ("--dry-run", args.dry_run),
         ("--cache-report", args.cache_report),
+        ("--export-missing", args.export_missing is not None),
         ("--emit-backends", args.emit_backends is not None),
         ("--profile", args.profile),
     ):
@@ -806,6 +814,95 @@ def _fold_job_db(session: Session, job_id: str, output_dir: Path) -> tuple[str, 
             shutil.rmtree(held, ignore_errors=True)
 
 
+def _kernel_fill(session: Session, args) -> int:
+    """Measure a work list (`launcher --export-missing`) on the remote; merge its rows here.
+
+    A full-remote-profile job runs in one image, which serves only its own
+    profile envs, so the list is split per image and each part is one job.
+    """
+
+    from profiling.container.images import IMAGES_ENV
+    from profiling.db.registry import find_kernel_profiler_spec
+    from profiling.exec.env import PROFILE_RUNTIME_ENV, container_image
+    from profiling.plan import UNITS_SCHEMA_VERSION
+
+    if session.remote.profile_runtime != FULL_REMOTE_PROFILE:
+        raise RemoteRunError(
+            f"kernel-profile fill --remote needs profile_runtime: {FULL_REMOTE_PROFILE}"
+        )
+    if args.db is not None:
+        raise RemoteRunError("--db cannot be used with --remote: rows merge into this profile.db")
+    if args.output_dir is None:
+        raise RemoteRunError("kernel-profile fill --remote requires --output-dir under logs/")
+    output_dir = _under_logs(args.output_dir, "--output-dir")
+    units = json.loads(args.work.read_text("utf-8"))["units"]
+    by_env: dict[str, list[dict]] = {}
+    for unit in units:
+        profiler_spec = find_kernel_profiler_spec(unit["kernel_kind"], unit["backend"])
+        env_name = (profiler_spec.subprocess_env if profiler_spec else None) or "default_env"
+        by_env.setdefault(env_name, []).append(unit)
+    if not by_env:
+        _say(f"{args.work}: nothing to measure")
+        return 0
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if session.remote.slurm is not None:
+        session.remote = dataclasses.replace(
+            session.remote,
+            slurm=dataclasses.replace(session.remote.slurm, gpus=max(session.remote.slurm.gpus, 1)),
+        )
+    session.ship()
+    status = 0
+    for env_name, env_units in sorted(by_env.items()):
+        image = container_image(env_name)
+        part_dir = output_dir / env_name
+        part_dir.mkdir(parents=True, exist_ok=True)
+        work = part_dir / "work.json"
+        work.write_text(
+            json.dumps({"schema_version": UNITS_SCHEMA_VERSION, "units": env_units}, indent=1) + "\n"
+        )
+        specs = sum(len(unit["specs"]) for unit in env_units)
+        _say(f"{env_name}: {specs} spec(s) in {len(env_units)} unit(s), image {image}")
+        image_id = session.prepare_full_remote_profile(env_name, image)
+        session.push_files([work])
+        command = [
+            "kernel-profile",
+            "fill",
+            "--work",
+            str(work.relative_to(REPO_ROOT)),
+            "--output-dir",
+            str(part_dir.relative_to(REPO_ROOT)),
+        ]
+        outcome = session.run_job(
+            command,
+            env={
+                PROFILE_RUNTIME_ENV: "in-image",
+                IMAGES_ENV: json.dumps({env_name: image}),
+                "VIBESIM_PROFILE_CACHE_DIR": str(session.layout.workdir / "cache"),
+            },
+            keep_db=True,
+        )
+        copy_error = session.copy_back(part_dir)
+        merged, merge_ok = "not merged (the job did not finish)", False
+        if outcome.exit_code in (0, 1):
+            # Exit 1 is a list with failed units: the rows it did measure still count.
+            merged, merge_ok = _fold_job_db(session, outcome.job_id, part_dir)
+        (_say if merge_ok else _warn)(f"{env_name}: {merged}")
+        session.record(
+            part_dir,
+            outcome,
+            command,
+            copied_back=f"incomplete: {copy_error}" if copy_error else "all",
+            image=image,
+            image_id=image_id,
+            profile_runtime=session.remote.profile_runtime,
+            profile_db=merged,
+        )
+        ok = outcome.exit_code == 0 and copy_error is None and merge_ok
+        _say(f"{'done' if ok else _failure(outcome, None if merge_ok else merged)}: {env_name}")
+        status = status or (0 if ok else outcome.exit_code or 1)
+    return status
+
+
 def _kernel_profile(session: Session, argv: list[str]) -> int:
     from profiling.artifacts import MEASUREMENT_METADATA_FILENAME, PROFILE_METADATA_FILENAME
     from profiling.cli import (
@@ -825,6 +922,8 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
     from ..managed_job import prepare_managed_job
 
     args = build_parser(prog="python -m launcher kernel-profile").parse_args(argv)
+    if args.command == "fill":
+        return _kernel_fill(session, args)
     if args.command not in ("run", "measure"):
         raise RemoteRunError(f"kernel-profile {args.command} runs locally; drop --remote")
     if args.db is not None:
@@ -939,15 +1038,153 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
     return outcome.exit_code or (0 if ok else 1)
 
 
+def _world_size(config: Path) -> int:
+    import yaml
+
+    server = (yaml.safe_load(config.read_text("utf-8")) or {}).get("server") or {}
+    return int(server.get("tp_size") or 1) * int(server.get("dp_size") or 1)
+
+
+def _engine(config: Path) -> str:
+    import yaml
+
+    return str((yaml.safe_load(config.read_text("utf-8")) or {}).get("engine") or "vllm")
+
+
+def _alignment_campaign(session: Session, argv: list[str]) -> int:
+    """One profile pass of a campaign, captured in a container on the remote.
+
+    Only the capture runs there: the cases are rendered here (against a host
+    profile naming the remote's paths), the ready ones are sent, one job runs
+    them in turn, and each case's phase directory comes back whole, `.nsys-rep`
+    included. Labeling and every later phase run here on what came back.
+    """
+
+    from profiling.container.images import IMAGES_ENV
+    from profiling.exec.env import PROFILE_RUNTIME_ENV, container_image
+
+    from ..alignment_campaign import execute
+    from ..alignment_campaign.cli import _build_parser, _resolve_pack, _selected_cases
+
+    args = _build_parser().parse_args(argv)
+    if args.verb != "run":
+        raise RemoteRunError(
+            f"alignment-campaign {args.verb} runs here; only `run --phase <profile pass>` "
+            "goes to a remote"
+        )
+    if session.remote.profile_runtime != FULL_REMOTE_PROFILE:
+        raise RemoteRunError(
+            f"alignment-campaign --remote needs profile_runtime: {FULL_REMOTE_PROFILE} "
+            f"({session.remote.name} has {session.remote.profile_runtime})"
+        )
+    if args.dry_run:
+        raise RemoteRunError("--dry-run stays local; drop --remote")
+    pack = _resolve_pack(args.pack)
+    assert pack is not None
+    cases = _selected_cases(pack, args.case)
+    if any(pack.variant_of(case).pass_named(args.phase) is None for case in cases):
+        raise RemoteRunError(
+            f"{args.phase} is not a profile pass of {pack.name}: only captures run remotely"
+        )
+    out_root = _under_logs(Path(args.out_root), "--out-root")
+    plans = execute.plan_phase(
+        pack, out_root, args.phase, cases=cases, refresh=args.refresh, resume=args.resume
+    )
+    ready = [plan for plan in plans if plan.selected]
+    for plan in plans:
+        if not plan.selected:
+            _say(plan.describe().strip())
+    if not ready:
+        _say(f"{args.phase}: no case is ready")
+        return 0 if all(plan.state == "complete" for plan in plans) else 1
+    configs = [plan.directory / f"{args.phase}.yaml" for plan in ready]
+    engines = {_engine(config) for config in configs}
+    if len(engines) != 1:
+        raise RemoteRunError(f"one remote job runs one engine; these cases use {sorted(engines)}")
+    env_name = f"{engines.pop()}_env"
+    image = container_image(env_name)
+    gpus = max(_world_size(config) for config in configs)
+    if session.remote.slurm is not None:
+        session.remote = dataclasses.replace(
+            session.remote,
+            slurm=dataclasses.replace(
+                session.remote.slurm, gpus=max(session.remote.slurm.gpus, gpus)
+            ),
+        )
+    elif len(session.remote.gpus) < gpus:
+        raise RemoteRunError(
+            f"{args.phase} needs {gpus} GPU(s); {session.remote.name} lists "
+            f"{len(session.remote.gpus)} under gpus"
+        )
+
+    session.ship()
+    image_id = session.prepare_full_remote_profile(env_name, image)
+    for plan in ready:
+        session.push_tree(plan.directory)
+    pack_arg = args.pack if not Path(args.pack).is_dir() else str(
+        Path(args.pack).resolve().relative_to(REPO_ROOT.resolve())
+    )
+    command = [
+        "alignment-campaign",
+        "run",
+        "--pack",
+        pack_arg,
+        "--out-root",
+        str(out_root.relative_to(REPO_ROOT)),
+        "--phase",
+        args.phase,
+        *[token for plan in ready for token in ("--case", plan.case_slug)],
+        *(["--refresh"] if args.refresh else []),
+        *(["--resume"] if args.resume else []),
+    ]
+    _say(f"{args.phase}: {len(ready)} case(s) on {session.remote.name} in {image}")
+    outcome = session.run_job(
+        command,
+        env={
+            PROFILE_RUNTIME_ENV: "in-image",
+            IMAGES_ENV: json.dumps({env_name: image}),
+            "VIBESIM_PROFILE_CACHE_DIR": str(session.layout.workdir / "cache"),
+        },
+    )
+    failed = []
+    for plan in ready:
+        phase_dir = plan.directory / args.phase
+        copy_error = session.copy_back(phase_dir)
+        if copy_error:
+            # A partial copy must not look complete here and skip the re-run.
+            (phase_dir / ".complete").unlink(missing_ok=True)
+        session.record(
+            phase_dir,
+            outcome,
+            command,
+            copied_back=f"incomplete: {copy_error}" if copy_error else "all",
+            image=image,
+            image_id=image_id,
+            profile_runtime=session.remote.profile_runtime,
+        )
+        variant = pack.variant_of(pack.case_named(plan.case_slug))
+        complete = copy_error is None and execute.phase_complete(
+            plan.directory, variant, args.phase
+        )
+        _say(f"[{args.phase}] {plan.case_slug}: {'ok' if complete else 'not complete'}")
+        if not complete:
+            failed.append(plan.case_slug)
+    ok = outcome.exit_code == 0 and not failed
+    verdict = "done" if ok else _failure(outcome, f"incomplete: {', '.join(failed)}" if failed else None)
+    _say(f"{verdict}: {out_root.relative_to(REPO_ROOT)} ({args.phase})")
+    return outcome.exit_code or (0 if ok else 1)
+
+
 COMMANDS: dict[str | None, Callable[[Session, list[str]], int]] = {
     None: _simulation,
     "timing-predict": _timing_predict,
     "kernel-profile": _kernel_profile,
+    "alignment-campaign": _alignment_campaign,
 }
 
 
 #: What a full-remote-profile remote runs: GPU work only.
-GPU_COMMANDS = ("kernel-profile",)
+GPU_COMMANDS = ("kernel-profile", "alignment-campaign")
 
 
 def run(subcommand: str | None, argv: list[str], options: GlobalOptions) -> int:

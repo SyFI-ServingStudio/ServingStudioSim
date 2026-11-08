@@ -109,6 +109,14 @@ def _build_argparse():
         "exit without building caches or running.",
     )
     parser.add_argument(
+        "--export-missing",
+        type=Path,
+        metavar="WORK.json",
+        help="Write the kernel specs profile.db lacks (what a cache build would "
+        "measure) to WORK.json and exit, measuring nothing; `kernel-profile fill "
+        "--work WORK.json` measures them, e.g. with --remote on a GPU host.",
+    )
+    parser.add_argument(
         "--kv-report",
         action="store_true",
         help="Print each KV pool's layout, the charge of one request at "
@@ -726,6 +734,11 @@ def run_simulation(argv: list[str]) -> int:
         from .cache_build import report_cache_coverage
 
         return report_cache_coverage(all_candidates, schema, args.build_type)
+
+    if args.export_missing is not None:
+        from .cache_build import export_missing_work
+
+        return export_missing_work(all_candidates, schema, args.export_missing, args.build_type)
 
     if args.kv_report or args.kv_report_json:
         from .kv_report import report_kv_cache
