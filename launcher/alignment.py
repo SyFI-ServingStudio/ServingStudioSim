@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from alignment import artifact_paths
 from alignment.runner import run_profile
 from alignment.timing_predict_input import BuildRequest, build_inputs
 from alignment.timing_predict_input.builder import INPUT_MANIFEST_NAME
@@ -219,9 +220,14 @@ def _load_profile_result(profile_log_dir: Path) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ValueError(f"profile result must be a JSON object: {result_path}")
     recorded = result.get("log_dir")
-    if not isinstance(recorded, str) or Path(recorded).resolve() != profile_log_dir.resolve():
+    # The recorded root is where the capture ran; a profile copied from a remote
+    # GPU host, or moved, keeps its directory name and reads where it lands.
+    if not isinstance(recorded, str) or (
+        Path(recorded).resolve() != profile_log_dir.resolve()
+        and Path(recorded).name != profile_log_dir.resolve().name
+    ):
         raise ValueError(f"profile result does not identify configured directory: {result_path}")
-    return result
+    return artifact_paths.localize(result, profile_log_dir)
 
 
 def _profile_artifact(result: dict[str, Any], key: str) -> Path:

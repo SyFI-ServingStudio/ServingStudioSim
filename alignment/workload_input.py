@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from . import artifact_paths
 from .profiler.config import ROUTING_PROFILE_KINDS
 from .request_population import read_trace, validate_replay
 
@@ -52,7 +53,7 @@ def prepare_workload(*, source_trace: Path, profile_dir: Path, output_trace: Pat
     if missing_acceptance not in {"error", "run-aggregate"}:
         raise ValueError("missing_acceptance must be error or run-aggregate")
     result_path = profile_dir / "profile_result.json"
-    result = json.loads(result_path.read_text())
+    result = artifact_paths.localize(json.loads(result_path.read_text()), profile_dir)
     if (result.get("profile_kind") not in ACCEPTANCE_PROFILE_KINDS
             or result.get("drive_summary", {}).get("reached_idle") is not True):
         raise ValueError(

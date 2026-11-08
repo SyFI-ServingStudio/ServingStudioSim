@@ -28,6 +28,7 @@ from pathlib import Path
 
 from profiling.gpu_policy import require_gpu
 
+from . import artifact_paths
 from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
 from .nsys.parsed_io import kernel_rows_path, write_parsed
@@ -752,7 +753,9 @@ def _finalize_profile(
             "replay_result": str(prepared_replay.log_path.resolve()),
             "drive_summary": drive_summary,
         }
-        (log_dir / "profile_result.json").write_text(json.dumps(result, indent=2))
+        (log_dir / "profile_result.json").write_text(
+            json.dumps(artifact_paths.record(result, log_dir), indent=2)
+        )
         produced = []
         if corpus_artifacts:
             produced.append(f"corpus_tokens={corpus_artifacts['token_corpus_tokens']}")
@@ -790,7 +793,9 @@ def _finalize_profile(
             "replay_result": str(prepared_replay.log_path.resolve()),
             "drive_summary": drive_summary,
         }
-        (log_dir / "profile_result.json").write_text(json.dumps(result, indent=2))
+        (log_dir / "profile_result.json").write_text(
+            json.dumps(artifact_paths.record(result, log_dir), indent=2)
+        )
         print(
             f"[profile] workload metrics: iterations={n_metrics} "
             f"request_timings={n_request_timings}"
@@ -907,7 +912,9 @@ def _finalize_profile(
             else _captured_nsys_provenance(engine_dir / f"{cfg.name}_launch.json")
         ),
     }
-    (log_dir / "profile_result.json").write_text(json.dumps(result, indent=2))
+    (log_dir / "profile_result.json").write_text(
+            json.dumps(artifact_paths.record(result, log_dir), indent=2)
+        )
     return result
 
 
