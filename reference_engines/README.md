@@ -100,8 +100,11 @@ images load at interpreter start (a `.pth`) and L1 workers install: it raises at
 every cache-miss tactic measurement (FlashInfer's autotuner, Triton
 `@autotune`, inductor max-autotune and coordinate descent) and stops the
 process; the parent reports it, and keeps no row of that chunk. If the
-preflight said warm, the error says "manifest/actual mismatch": the key misses
-an input of the tuning and must be completed.
+preflight said warm, the error says "manifest/actual mismatch": either the
+warm-up never reached that kernel and shape (warm-caches sends no requests, so
+a tune keyed on request shapes first happens under load; run that capture once
+with `--allow-autotune`) or the key misses an input of the tuning and must be
+completed.
 
 One kind of tune is small enough to let through: inductor's runtime pick among
 the few heuristic launch configs of one generated kernel

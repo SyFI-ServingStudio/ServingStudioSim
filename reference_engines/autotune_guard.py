@@ -104,8 +104,11 @@ def forbid(source: str, **detail: Any) -> None:
     preflight = os.environ.get(PREFLIGHT_ENV)
     cause = (
         f"manifest/actual mismatch: the preflight found warm caches ({preflight}) but "
-        "this run still tunes, so the preflight key misses an input of this tuning; "
-        "add it to the key"
+        "this run still tunes. Either the warm-up never reached this kernel and shape "
+        "(warm-caches stops at ready and sends no requests, so a tune keyed on request "
+        "shapes, e.g. a Triton @autotune, first happens under load: run this capture "
+        "once with --allow-autotune) or the preflight key misses an input of this "
+        "tuning (add it to the key)"
         if preflight
         else WARM_HINT
     )
