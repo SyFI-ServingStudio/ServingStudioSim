@@ -98,7 +98,9 @@ def _engine_args(engine: str) -> Callable[[Path], dict[str, str]]:
 _REQ_FRONTEND = "alignment/load_generator/req-frontend"
 
 
-def _engine_image(engine: str, envs: tuple[str, ...], python: str) -> Image:
+def _engine_image(
+    engine: str, envs: tuple[str, ...], python: str, inputs: tuple[str, ...] = ()
+) -> Image:
     directory = f"reference_engines/{engine}"
     return Image(
         engine,
@@ -108,6 +110,7 @@ def _engine_image(engine: str, envs: tuple[str, ...], python: str) -> Image:
             f"{directory}/BASE",
             f"{directory}/patches",
             "reference_engines/capture-requirements.txt",
+            *inputs,
         ),
         submodules=(_REQ_FRONTEND,),
         build_args=_engine_args(engine),
@@ -164,7 +167,12 @@ IMAGES = {
             inputs=("pyproject.toml", "uv.lock", ".python-version"),
         ),
         _engine_image("vllm", ("vllm_env",), "/usr/bin/python3"),
-        _engine_image("sglang", ("sglang_env",), "/opt/sglang/bin/python"),
+        _engine_image(
+            "sglang",
+            ("sglang_env",),
+            "/opt/sglang/bin/python",
+            inputs=("reference_engines/complete_flashinfer_aot.py",),
+        ),
         Image(
             "flashinfer-kda",
             "profiling/container/flashinfer_kda.Dockerfile",
