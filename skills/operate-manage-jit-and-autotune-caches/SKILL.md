@@ -60,11 +60,13 @@ re-benchmarks its config list in every new process.
 
 ## Restarting a serving engine
 
-Make compilation a setup failure, not a startup cost. The pinned SGLang profile
-in `alignment/profiler/README.md` already does this: it declares the prebuilt
-FlashInfer jit-cache wheel and sets `FLASHINFER_DISABLE_JIT: "1"`, so a missing
-module fails **before model weights load** instead of compiling while the server
-comes up. Copy that shape for any engine you restart repeatedly.
+Make slow compilation a setup cost paid once, not a per-start cost. Ship
+nvcc-built modules prebuilt (the SGLang image adds FlashInfer's jit-cache and
+builds `tinygemm2` into it) and keep the compile caches outside the worktree.
+Do not set `FLASHINFER_DISABLE_JIT=1`: it also refuses shape-specialized CuTe-DSL
+kernels (e.g. SGLang's NVFP4 quantize on SM100), which can only compile on a GPU
+at first use and take under a second each. Autotuning is the expensive part; the
+reference images refuse it outside `warm-caches` (`reference_engines/README.md`).
 
 - Point `VLLM_CACHE_ROOT` / `TORCHINDUCTOR_CACHE_DIR` / `TRITON_CACHE_DIR` at a
   path that outlives the run and is **not inside a worktree** — a worktree-local

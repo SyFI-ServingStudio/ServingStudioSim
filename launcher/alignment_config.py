@@ -195,19 +195,6 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
         )
     if config.python_runtime is not None:
         _validate_python_runtime(config.python_runtime)
-    if (
-        require_python_runtime
-        and config.engine == "sglang"
-        and (
-            config.python_runtime is None
-            or config.python_runtime.environment.get("FLASHINFER_DISABLE_JIT") != "1"
-        )
-    ):
-        raise ValueError(
-            "invalid profile config: SGLang alignment requires "
-            "python_runtime.environment.FLASHINFER_DISABLE_JIT: '1' so a missing "
-            "prebuilt module fails before runtime compilation"
-        )
     if config.profile_kind not in PROFILE_KINDS:
         raise ValueError(
             "invalid profile config: profile_kind must be one of "

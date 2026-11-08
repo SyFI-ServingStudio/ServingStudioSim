@@ -226,8 +226,6 @@ python_runtime:
         - flashinfer_jit_cache/providers/sm100a/jit_cache/rope/rope.so
         - flashinfer_jit_cache/providers/sm100a/jit_cache/fmha_gen/fmha_gen.so
         - flashinfer_jit_cache/providers/sm100a/jit_cache/fused_moe_trtllm_sm100/fused_moe_trtllm_sm100.so
-  environment:
-    FLASHINFER_DISABLE_JIT: "1"
 ```
 
 The FlashInfer entries mirror SGLang's pinned cu130 Dockerfile packages.

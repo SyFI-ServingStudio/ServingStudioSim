@@ -386,15 +386,9 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
     if (
         not resume
         and cfg.engine == "sglang"
-        and (
-            cfg.python_runtime is None
-            or cfg.python_runtime.environment.get("FLASHINFER_DISABLE_JIT") != "1"
-        )
+        and cfg.python_runtime is None
     ):
-        raise ValueError(
-            "a new SGLang profile requires an explicit python_runtime "
-            "prebuilt-artifact contract with FLASHINFER_DISABLE_JIT=1"
-        )
+        raise ValueError("a new SGLang profile requires an explicit python_runtime")
     log_dir = Path(cfg.log_dir)
     if not log_dir.is_absolute():
         log_dir = REPO_ROOT / log_dir

@@ -49,10 +49,11 @@ RUN uv pip install --no-cache --python /opt/sglang/bin/python "nvtx==${NVTX_VERS
     && find "$(/opt/sglang/bin/python -c 'import flashinfer_cubin; print(flashinfer_cubin.get_cubin_dir())')" \
         -type d -exec chmod a+rwx {} +
 
-# Captures run with FLASHINFER_DISABLE_JIT=1, so every FlashInfer module SGLang
-# loads must be in the jit-cache. The 0.7.3 wheel lacks tinygemm2 (SGLang's BF16
-# low-M GEMM: unquant._bf16_low_m_autotune -> flashinfer mm_bf16); compile it for
-# the Blackwell datacenter providers (no GPU needed) and register it there.
+# The 0.7.3 jit-cache lacks tinygemm2 (SGLang's BF16 low-M GEMM:
+# unquant._bf16_low_m_autotune -> flashinfer mm_bf16), an nvcc build that would
+# otherwise compile at first use; build it for the Blackwell datacenter providers
+# (no GPU needed). Shape-specialized CuTe-DSL kernels still compile at first use
+# (under a second each) into the per-key cache; only autotuning is refused.
 ARG FLASHINFER_AOT_PROVIDERS=sm100a,sm103a
 ARG FLASHINFER_AOT_MODULES="tinygemm2=flashinfer.gemm.routergemm:gen_tinygemm2_module"
 COPY reference_engines/complete_flashinfer_aot.py /opt/vibesim-build/complete_flashinfer_aot.py

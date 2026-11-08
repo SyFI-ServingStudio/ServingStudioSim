@@ -127,10 +127,11 @@ least to most:
    `/opt/nvidia/nsight-systems/2025.5.2`), gdb, procps;
 2. the capture runner's venv (`/opt/vibesim-capture/.venv`) with py-spy;
 3. what the engine's interpreter lacks (SGLang: `nvtx`, and FlashInfer's
-   `tinygemm2` in the sm100a/sm103a jit-cache providers: captures run with
-   `FLASHINFER_DISABLE_JIT=1` and the 0.7.3 wheel does not ship it;
-   `complete_flashinfer_aot.py` compiles it without a GPU and registers it in
-   each provider's manifest);
+   `tinygemm2` in the sm100a/sm103a jit-cache providers: the 0.7.3 wheel does
+   not ship this nvcc module; `complete_flashinfer_aot.py` compiles it without
+   a GPU and registers it in each provider's manifest). Small first-use JIT
+   (shape-specialized CuTe-DSL kernels, under a second each) is allowed and lands
+   in the per-key cache; only autotuning is refused;
 4. the autotune guard, in the engine interpreter's site-packages with a `.pth`
    that installs it at interpreter start;
 5. the req-frontend `session_runner`, built in a stage on the same base;
