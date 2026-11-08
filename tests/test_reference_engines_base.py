@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -110,3 +112,37 @@ def _complete_aot():
 )
 def test_provider_ids_spell_flashinfer_arch_lists(provider, arch):
     assert _complete_aot()._arch_list(provider) == arch
+
+
+def _git(*args, cwd):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def test_a_tree_with_untracked_or_ignored_work_is_not_replaced(tmp_path):
+    from reference_engines.__main__ import RefError, _check_replaceable
+
+    tree = tmp_path / "src"
+    tree.mkdir()
+    _git("init", "-q", cwd=tree)
+    (tree / ".gitignore").write_text(".venv/\n")
+    _git("add", ".gitignore", cwd=tree)
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base", cwd=tree)
+    _check_replaceable(tree, force=True)  # only committed history: replaceable
+    with pytest.raises(RefError, match="pass --force"):
+        _check_replaceable(tree, force=False)
+
+    (tree / ".venv").mkdir()
+    (tree / ".venv" / "python").write_text("")
+    with pytest.raises(RefError, match=r"\.venv"):
+        _check_replaceable(tree, force=True)
+    shutil.rmtree(tree / ".venv")
+
+    (tree / "new_patch_file.py").write_text("")
+    with pytest.raises(RefError, match="new_patch_file.py"):
+        _check_replaceable(tree, force=True)
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "x").write_text("")
+    with pytest.raises(RefError, match="not a materialized tree"):
+        _check_replaceable(plain, force=True)

@@ -125,16 +125,35 @@ def _object_cache(engine: str, base: Base) -> tuple[Path, str]:
     return cache, ref
 
 
+def _check_replaceable(dest: Path, *, force: bool) -> None:
+    """Refuse to delete `dest` unless it holds nothing but committed history.
+
+    Untracked and ignored files count: a host venv (`src/.venv`) or a new file
+    of an unexported patch lives there.
+    """
+
+    if not dest.exists():
+        return
+    if not force:
+        raise RefError(f"{dest} exists; pass --force to replace it")
+    if not (dest / ".git").exists():
+        if any(dest.iterdir()):
+            raise RefError(f"{dest} is not a materialized tree; move it away first")
+        return
+    status = _git("status", "--porcelain", "--ignored", "--untracked-files=normal", cwd=dest)
+    if status:
+        shown = "\n  ".join(status.splitlines()[:10])
+        raise RefError(
+            f"{dest} holds work a replace would delete; export, commit, move or remove "
+            f"it first:\n  {shown}"
+        )
+
+
 def materialize(engine: str, dest: Path, *, force: bool = False) -> str:
     base = read_base(engine)
     patches = patch_files(engine)
+    _check_replaceable(dest, force=force)
     if dest.exists():
-        if not force:
-            raise RefError(f"{dest} exists; pass --force to replace it")
-        if (dest / ".git").exists():
-            dirty = _git("status", "--porcelain", "--untracked-files=no", cwd=dest)
-            if dirty:
-                raise RefError(f"{dest} has uncommitted changes; export or discard them first")
         shutil.rmtree(dest)
     cache, ref = _object_cache(engine, base)
     dest.mkdir(parents=True)
@@ -283,6 +302,9 @@ def bump_base(
     notes: dict[str, str] | None = None,
 ) -> None:
     old = read_base(engine)
+    # Before anything is written: a tree materialize cannot replace would
+    # leave BASE.yaml moved and the tree on the old base.
+    _check_replaceable(source_dir(engine), force=True)
     digests = platform_digests(image)
     for name, other in platform_images.items():
         found = platform_digests(other)

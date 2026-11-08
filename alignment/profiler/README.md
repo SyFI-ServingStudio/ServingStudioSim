@@ -69,6 +69,10 @@ capture through `alignment-campaign`.
 
 `runner.py` defaults `fork_python` to `reference_engines/vllm/src/.venv/bin/python`;
 override `fork_python` in the align config to point elsewhere.
+Host captures are strongly discouraged (no autotune guard, no preflight); the
+reference image is the default runtime. `materialize --force` and `bump-base`
+refuse to replace a tree that holds this venv (or any untracked file): move it
+out first.
 
 The patches are Python-only (NVTX scopes + iteration metrics logging), so the
 **precompiled fast path** works — no multi-hour CUDA compile. Name BASE's
