@@ -93,6 +93,30 @@ def test_a_missing_image_names_its_build_command(monkeypatch):
         ContainerProfileEnv("flashinfer_kda_env", "vibesim-profiler-flashinfer-kda:0123", "/opt/venv/bin/python").validate()
 
 
+def test_the_first_docker_contact_runs_outside_the_callers_process_group(monkeypatch):
+    """A Slurm job's `docker` shim starts a job-scoped runtime service on first use.
+    Started inside the predictor's process group it outlives the predictor and the
+    launcher reports (and kills) it as a leaked descendant."""
+    from profiling.exec.container_user import rootless_runtime
+
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append((argv[:2], kwargs.get("start_new_session")))
+        return __import__("subprocess").CompletedProcess(argv, 0, "sha256:x", "")
+
+    monkeypatch.setattr("profiling.exec.env.subprocess.run", run)
+    monkeypatch.setattr("profiling.exec.env.shutil.which", lambda _: "/usr/bin/docker")
+    ContainerProfileEnv("vllm_env", "vibesim-profiler-vllm:0123", "/usr/bin/python3").validate()
+    monkeypatch.setattr("profiling.exec.container_user.subprocess.run", run)
+    rootless_runtime.cache_clear()
+    try:
+        rootless_runtime()
+    finally:
+        rootless_runtime.cache_clear()
+    assert seen == [(["docker", "image"], True), (["docker", "info"], True)]
+
+
 def test_an_unknown_runtime_is_rejected(monkeypatch):
     monkeypatch.setenv(PROFILE_RUNTIME_ENV, "docker")
     with pytest.raises(ValueError, match=PROFILE_RUNTIME_ENV):

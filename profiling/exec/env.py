@@ -88,11 +88,20 @@ class ContainerProfileEnv:
             raise ValueError(f"profiling env {self.name!r} has no container image")
         if shutil.which("docker") is None:
             raise FileNotFoundError("docker is required for container profiling")
+        # This is the first `docker` call of every container chunk (it runs
+        # before `docker run`). A Slurm job's `docker` can be a shim that starts
+        # a job-scoped runtime service in the background on first use; started
+        # from here it would join the caller's process group, outlive the caller
+        # and be reported -- and killed -- as a leaked descendant of whatever
+        # the launcher was running (the predictor). Its own session keeps a
+        # service it starts out of that group; the query itself needs no
+        # signal from the caller.
         inspect = subprocess.run(
             ["docker", "image", "inspect", "--format", "{{.Id}}", self.image],
             capture_output=True,
             text=True,
             check=False,
+            start_new_session=True,
         )
         if inspect.returncode != 0:
             # Never pulled: the tag names this checkout's inputs, so a registry
