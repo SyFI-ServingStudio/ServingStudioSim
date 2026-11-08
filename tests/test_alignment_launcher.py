@@ -403,7 +403,7 @@ def test_profile_config_is_profile_only_and_config_relative(tmp_path, monkeypatc
         ),
     )
 
-    assert alignment_launcher.main(["profile", str(paths["profile"])]) == 0
+    assert alignment_launcher.main(["profile", str(paths["profile"]), "--runtime", "host"]) == 0
     assert resumed == [False]
     config = profiled[0]
     assert not hasattr(config, "analysis")

@@ -87,11 +87,11 @@ commands plus, for every excluded case, *why* — already complete, or missing a
 named input. Planning is a pure function (`execute.plan_phase`), which is what
 makes it testable on CPU.
 
-`--runtime image` runs each new capture of a profile pass in its engine's
+`--runtime image` (the default) runs each new capture of a profile pass in its engine's
 reference image (`vllm`, `sglang`; `reference_engines/README.md`) (`alignment/README.md`, "In-image capture"); the host keeps scheduling,
 markers and journal, GPU choice and outputs. Every other phase, and `--resume`,
-runs on the host from the capture's files, so a matrix can mix host and image
-captures case by case.
+runs on the host from the capture's files. `--runtime host` captures in a host
+venv with no autotune guard or preflight and is strongly discouraged.
 
 For `--phase simulation`, worker settings come from `simulation.yaml`, including
 `gpu_time_multiplier`. Kernel analysis is an independent phase, not a

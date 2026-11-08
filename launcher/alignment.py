@@ -86,12 +86,15 @@ def _build_parser() -> argparse.ArgumentParser:
     profile.add_argument(
         "--runtime",
         choices=("host", "image"),
-        default="host",
+        default=None,
         help=(
-            "host: a host venv of the engine and the configured nsys. image: the "
-            "engine's reference image (vllm, sglang; reference_engines/) with this "
-            "checkout's capture code overlaid "
-            "(alignment/image_runtime.py); the host keeps GPU choice and outputs."
+            "image (the default): the engine's reference image (vllm, sglang; "
+            "reference_engines/) with this checkout's capture code overlaid "
+            "(alignment/image_runtime.py); the host keeps GPU choice and outputs, "
+            "and autotuning is refused without a warm-caches manifest. "
+            "host: a host venv of the engine and the configured nsys; strongly "
+            "discouraged: no autotune guard and no preflight, so the engine may tune "
+            "or compile inside the measurement. --resume always runs on the host."
         ),
     )
     profile.add_argument(
@@ -497,6 +500,18 @@ def _run_profile(args: argparse.Namespace) -> int:
     )
     from alignment.image_runtime import container_config, in_image, run_profile_in_image
 
+    if args.runtime is None:
+        # A resume re-derives artifacts from an existing capture; inside an image
+        # the container is already the runtime.
+        args.runtime = "host" if args.resume or in_image() else "image"
+    elif args.runtime == "host" and not args.resume and not in_image():
+        print(
+            "[alignment] WARNING: --runtime host captures with no autotune guard and no "
+            "warm-caches preflight; the engine may tune or JIT-compile inside the "
+            "measurement. Use the default --runtime image.",
+            file=sys.stderr,
+            flush=True,
+        )
     if args.runtime == "image" and (args.resume or in_image()):
         raise ValueError(
             "--runtime image starts a container from the host; resume an image "

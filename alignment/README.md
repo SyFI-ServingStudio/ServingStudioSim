@@ -526,7 +526,7 @@ uv run python -m launcher alignment analyze logs/<experiment>/analyze_e2e.yaml
 
 ### In-image capture
 
-`alignment profile --runtime image <profile.yaml>` runs the same capture inside
+`alignment profile <profile.yaml>` (`--runtime image`, the default) runs the capture inside
 the engine's image, `vllm` or `sglang` (`reference_engines/README.md`; the same
 image runs the engine's L1 kernels), instead of on a host venv and the host's
 Nsight Systems. The image fixes everything that decides what is measured: the

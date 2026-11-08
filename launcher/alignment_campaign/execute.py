@@ -227,7 +227,7 @@ def phase_command(
     *,
     resume: bool,
     refresh: bool,
-    runtime: str = "host",
+    runtime: str = "image",
     allow_autotune: bool = False,
 ) -> tuple[str, ...]:
     """The `python -m launcher alignment ...` invocation for one case's phase.
@@ -244,7 +244,7 @@ def phase_command(
         return (
             base
             + ("profile", str(config))
-            + (("--runtime", runtime) if runtime != "host" else ())
+            + ("--runtime", runtime)
             + (("--allow-autotune",) if allow_autotune else ())
         )
     if phase == TIMING_PREDICT_PHASE:
@@ -264,7 +264,7 @@ def plan_phase(
     cases: list[Case] | None = None,
     refresh: bool = False,
     resume: bool = False,
-    runtime: str = "host",
+    runtime: str = "image",
     allow_autotune: bool = False,
 ) -> tuple[PhasePlan, ...]:
     """Decide each case's disposition. Pure: no process is started, nothing is
@@ -453,7 +453,7 @@ def run_phase(
     refresh: bool = False,
     resume: bool = False,
     parallelism: int = 1,
-    runtime: str = "host",
+    runtime: str = "image",
     allow_autotune: bool = False,
 ) -> RunReport:
     """Fan one phase across every ready case and collect exit codes separately.

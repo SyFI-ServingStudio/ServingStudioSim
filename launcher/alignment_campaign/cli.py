@@ -322,9 +322,10 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--runtime",
         choices=("host", "image"),
-        default="host",
-        help="forwarded to `alignment profile`: capture in the engine's alignment image "
-        "(profile passes only; other phases always run on the host)",
+        default="image",
+        help="forwarded to `alignment profile`: image (default) captures in the engine's "
+        "reference image; host (strongly discouraged) in a host venv with no autotune "
+        "guard. Profile passes only; other phases always run on the host",
     )
     run.add_argument(
         "--allow-autotune",

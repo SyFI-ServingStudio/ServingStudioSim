@@ -136,9 +136,11 @@ single-config path below when there is one workload and no matrix.
    model cache, and fork venv (`fork_python` must import `torch` and the
    selected engine).
 
-   Prefer capturing in the image: `alignment profile --runtime image` or
-   `alignment-campaign run --runtime image` (`alignment/README.md`, "In-image
-   capture"). The engine's reference image (`vllm` or `sglang`,
+   Capture in the image, the default of `alignment profile` and
+   `alignment-campaign run` (`alignment/README.md`, "In-image capture").
+   `--runtime host` is strongly discouraged: it has no autotune guard and no
+   warm-caches preflight, so the engine may tune or compile inside the
+   measurement. The engine's reference image (`vllm` or `sglang`,
    `reference_engines/README.md`: the official image plus our patches, the same
    image its L1 kernels run in) replaces a host venv, host nsys and cargo build,
    so the capture does not depend on how one worktree's venv was provisioned.
