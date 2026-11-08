@@ -36,30 +36,42 @@ RUN apt-get update \
     && curl -LsSf https://astral.sh/uv/install.sh | sh
 
 WORKDIR /opt/vibesim
-COPY alignment/profiler/vllm /opt/vibesim/alignment/profiler/vllm
 
+# Layer order: everything that depends only on the fork's dependency pins
+# (requirements/) comes before the fork's source, so a Python-only fork change
+# reuses the dependency and FlashInfer cubin layers (the cubin download alone is
+# ~28 min: 47k files) and rebuilds just the editable install below.
+COPY alignment/profiler/vllm/requirements /opt/vibesim/alignment/profiler/vllm/requirements
 RUN --mount=type=cache,target=/root/.cache/uv \
-    test -n "${VLLM_BASE_REVISION}" \
-    && uv venv --python 3.12 alignment/profiler/vllm/.venv \
-    && cd alignment/profiler/vllm \
-    && VLLM_USE_PRECOMPILED=1 \
-       VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_BASE_REVISION}" \
-       VLLM_PRECOMPILED_WHEEL_VARIANT="${VLLM_WHEEL_VARIANT}" \
-       VLLM_VERSION_OVERRIDE="${VLLM_VERSION}" \
-       uv pip install --python .venv/bin/python -e . \
-    && uv pip install --python .venv/bin/python nvtx numpy nvidia-ml-py \
-    && uv pip check --python .venv/bin/python
+    uv venv --python 3.12 alignment/profiler/vllm/.venv \
+    && uv pip install --python alignment/profiler/vllm/.venv/bin/python \
+        -r alignment/profiler/vllm/requirements/cuda.txt \
+        nvtx numpy nvidia-ml-py
 
 # Workers run with --network none, so bake every FlashInfer cubin into the
 # image. The default directory is under HOME, which the /cache bind mount
 # shadows at run time. Workers create lock files next to the cubins, so the tree
-# stays writable.
+# stays writable. FlashInfer's version comes from requirements/cuda.txt.
 ENV FLASHINFER_CUBIN_DIR=/opt/flashinfer-cubins
 RUN python -m flashinfer --download-cubin \
     && test -f "${FLASHINFER_CUBIN_DIR}"/*/fmha/trtllm-gen/checksums.txt \
     && FLASHINFER_CUDA_ARCH_LIST=10.0 python -c \
        "from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module; gen_trtllm_gen_fused_moe_sm100_module()" \
     && chmod -R a+rwX "${FLASHINFER_CUBIN_DIR}"
+
+# The fork's source last. Its dependencies are already installed above, so this
+# layer is the editable install over the precompiled wheel of the upstream base.
+COPY alignment/profiler/vllm /opt/vibesim/alignment/profiler/vllm
+RUN --mount=type=cache,target=/root/.cache/uv \
+    test -n "${VLLM_BASE_REVISION}" \
+    && cd alignment/profiler/vllm \
+    && VLLM_USE_PRECOMPILED=1 \
+       VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_BASE_REVISION}" \
+       VLLM_PRECOMPILED_WHEEL_VARIANT="${VLLM_WHEEL_VARIANT}" \
+       VLLM_VERSION_OVERRIDE="${VLLM_VERSION}" \
+       uv pip install --python .venv/bin/python -e . \
+    && uv pip check --python .venv/bin/python \
+    && python -c "import flashinfer, importlib.metadata as m; assert flashinfer.__version__ == m.version('flashinfer-python')"
 
 COPY profiling /opt/vibesim/profiling
 COPY launcher /opt/vibesim/launcher
