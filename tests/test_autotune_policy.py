@@ -443,9 +443,12 @@ def test_warm_caches_cli_passes_its_startup_timeout(monkeypatch, tmp_path) -> No
     monkeypatch.setattr(ref_main, "warm_caches", lambda *args: seen.append(args) or 0)
 
     assert ref_main.main(["warm-caches", "sglang", str(tmp_path / "p.yaml")]) == 0
-    assert ref_main.main(
-        ["warm-caches", "sglang", str(tmp_path / "p.yaml"), "--startup-timeout", "2400"]
-    ) == 0
+    assert (
+        ref_main.main(
+            ["warm-caches", "sglang", str(tmp_path / "p.yaml"), "--startup-timeout", "2400"]
+        )
+        == 0
+    )
     assert [args[2] for args in seen] == [None, 2400.0]
 
 

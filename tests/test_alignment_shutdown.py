@@ -106,7 +106,11 @@ log = sys.argv[2]
 # A helper in a group of its own that ignores SIGINT (vLLM's dp supervisor
 # calls setpgrp; DeepGEMM starts a session).
 subprocess.Popen(
-    [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(60)"],
+    [
+        sys.executable,
+        "-c",
+        "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(60)",
+    ],
     process_group=0,
 )
 def stop(signum, _frame):

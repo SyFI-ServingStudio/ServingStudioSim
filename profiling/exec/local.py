@@ -154,9 +154,7 @@ class LocalGpuChunk(GpuChunk):
                     else tactic_cache_dir()
                 ),
                 device=gpu_name_of(self.gpus),
-                flashinfer_version=(
-                    None if container else env_flashinfer_version(profiler_env)
-                ),
+                flashinfer_version=(None if container else env_flashinfer_version(profiler_env)),
             )
             if found:
                 worker_env[PREFLIGHT_ENV] = found
@@ -248,8 +246,8 @@ def autotune_preflight(
 
     With ``flashinfer_version`` only that version's file counts (another
     version's tactics would not be read). A present file is necessary, not
-    sufficient: it may lack a bucket this spec reaches. The worker's guard is the backstop for that, and reports it
-    as a manifest/actual mismatch.
+    sufficient: it may lack a bucket this spec reaches. The worker's guard is
+    the backstop for that, and reports it as a manifest/actual mismatch.
     """
 
     row = f"{kernel_kind} {profiler_spec.backend}"
@@ -282,7 +280,7 @@ def autotune_preflight(
     return f"tactic files {sorted(files)} in {tactic_dir}"
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def env_flashinfer_version(profile_env: Any) -> str | None:
     """The `flashinfer.__version__` an env imports (what names its tactic files), or None."""
 
