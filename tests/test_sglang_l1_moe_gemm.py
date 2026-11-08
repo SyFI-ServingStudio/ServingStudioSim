@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import fields
 
 import pytest
@@ -151,3 +152,56 @@ def test_sglang_compressed_tensors_quantization_uses_non_per_token_path() -> Non
 def test_sglang_gemm_rejects_invalid_shapes_before_framework_import(entry, shape) -> None:
     with pytest.raises(ValueError, match="must be a positive integer"):
         entry(*shape, dtype="bf16")
+
+
+@pytest.mark.parametrize(
+    ("m", "threshold", "kernel"),
+    [
+        (4, 4, "tiny"),  # up to SGLang's threshold: tiny_gemm_bf16
+        (5, 4, "linear"),
+        (1, -1, "linear"),  # SGLang's "never tiny" on a GPU without the kernel
+    ],
+)
+def test_sglang_router_follows_sglangs_own_threshold(monkeypatch, m, threshold, kernel) -> None:
+    import types
+
+    import torch
+
+    from profiling.runners.gemm import gemm_fp32_output_sglang_router as router
+
+    asked = []
+    launched = []
+
+    def tiny_router_gemm_max_tokens(**kwargs):
+        asked.append(kwargs)
+        return threshold
+
+    def tiny_gemm_bf16(hidden, weight, out_dtype):
+        launched.append("tiny")
+        return (hidden @ weight.T).to(out_dtype)
+
+    def linear_bf16_fp32(hidden, weight):
+        launched.append("linear")
+        return (hidden @ weight.T).float()
+
+    modules = {
+        "sglang.kernels.ops.gemm.bf16_fp32": {"linear_bf16_fp32": linear_bf16_fp32},
+        "sglang.kernels.ops.gemm.tiny_gemm": {"tiny_gemm_bf16": tiny_gemm_bf16},
+        "sglang.srt.models.deepseek_common.utils": {
+            "tiny_router_gemm_max_tokens": tiny_router_gemm_max_tokens
+        },
+    }
+    for name, attrs in modules.items():
+        monkeypatch.setitem(sys.modules, name, types.SimpleNamespace(**attrs))
+    # The dispatch on the CPU: no device, timer or energy counter needed.
+    cpu = torch.device("cpu")
+    monkeypatch.setattr(torch, "device", lambda *_args: cpu)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(router.Timer, "cupti", lambda launch, **_: (launch(), 1.0)[1])
+    monkeypatch.setattr(router.Energy, "perf", lambda *_args, **_kwargs: 0.0)
+
+    router.profile_gemm_fp32_output_sglang_router(m, 8, 16, "bf16")
+
+    assert asked == [{"num_experts": 8, "hidden_size": 16, "weight_dtype": torch.bfloat16}]
+    assert set(launched) == {kernel}
