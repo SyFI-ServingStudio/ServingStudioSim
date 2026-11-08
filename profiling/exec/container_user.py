@@ -28,6 +28,9 @@ def rootless_runtime() -> bool:
             capture_output=True,
             text=True,
             check=True,
+            # Like the image check in ContainerProfileEnv.validate: a runtime
+            # service this first call may start must not join our process group.
+            start_new_session=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError):
         return False
