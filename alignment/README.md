@@ -560,7 +560,7 @@ server starts, every capture, host or image, writes `capture_facts.json`: GPU
 model/UUID/bus id/driver/clocks/power limit, `nvidia-smi topo -m`, NVLink status,
 fabric-handle and switch-multicast support per device, IMEX channel, memlock,
 `/dev/shm`, `perf_event_paranoid`, and the image manifest. It refuses to start
-when the devices contradict the config's `gpu` or `tp_size * dp_size`.
+when the devices contradict the config's `gpu` or `gpu_count` (`tp_size * dp_size` times the PP size in `extra_args`).
 
 An image capture does not tune kernels: before the container starts, the host
 requires the manifest `just ref warm-caches <engine> <profile.yaml>` wrote for

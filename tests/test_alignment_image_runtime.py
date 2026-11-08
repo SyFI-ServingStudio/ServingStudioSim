@@ -226,3 +226,55 @@ def test_capture_runs_the_capture_interpreter_explicitly(tmp_path):
     assert argv[argv.index("--entrypoint") + 1] == "/opt/vibesim-capture/.venv/bin/python"
     image = argv.index("vibesim-profiler-vllm:test")
     assert argv[image + 1 :] == ["-m", "launcher", "alignment", "profile", "/work/profile.yaml"]
+
+
+def _with_server(path: Path, engine: str, devices: str, **server) -> Path:
+    document = yaml.safe_load(path.read_text())
+    document["engine"] = engine
+    document["cuda_visible_devices"] = devices
+    document["server"] = {**document["server"], "extra_args": [], **server}
+    path.write_text(yaml.safe_dump(document))
+    return path
+
+
+@pytest.mark.parametrize(
+    ("engine", "server", "gpus"),
+    [
+        ("vllm", {"tp_size": 2, "extra_args": ["--pipeline-parallel-size", "2"]}, 4),
+        ("vllm", {"tp_size": 1, "dp_size": 2, "extra_args": ["-pp=2"]}, 4),
+        ("sglang", {"tp_size": 2, "extra_args": ["--pp-size", "2"]}, 4),
+        # Attention DP splits the TP group: no extra GPUs.
+        ("sglang", {"tp_size": 4, "extra_args": ["--attn-dp-size", "4"]}, 4),
+        ("sglang", {"tp_size": 1, "dp_size": 4}, 4),  # replicas
+    ],
+)
+def test_the_gpu_count_is_tp_dp_and_pp(tmp_path, engine, server, gpus):
+    from alignment.profiler import capture_facts
+
+    devices = ",".join(str(index) for index in range(gpus))
+    cfg = load_profile_config(
+        _with_server(_config(tmp_path), engine, devices, **server), require_python_runtime=False
+    )
+    assert cfg.gpu_count == gpus
+
+    facts = {
+        "gpus": [{"index": str(index), "name": "NVIDIA B200"} for index in range(gpus)],
+        "cuda_visible_devices": devices,
+    }
+    assert capture_facts.check(cfg, facts) == []
+
+    fewer = ",".join(str(index) for index in range(gpus - 1))
+    with pytest.raises(ValueError, match=f"={gpus} devices"):
+        load_profile_config(
+            _with_server(_config(tmp_path / "x"), engine, fewer, **server),
+            require_python_runtime=False,
+        )
+
+
+def test_sglangs_deprecated_dp_attention_spelling_is_refused_with_the_new_one(tmp_path):
+    path = _with_server(
+        _config(tmp_path), "sglang", "0,1,2,3",
+        tp_size=4, dp_size=4, extra_args=["--enable-dp-attention"],
+    )
+    with pytest.raises(ValueError, match="--attn-dp-size 4"):
+        load_profile_config(path, require_python_runtime=False)

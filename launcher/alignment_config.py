@@ -274,10 +274,28 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
                 f"invalid profile config: server.{field_name} must divide "
                 f"tp_size * dp_size={world_size}"
             )
-    if len(visible_devices) != world_size:
+    # SGLang's deprecated `--enable-dp-attention` turns `--dp-size N` into
+    # attention DP inside TP (attn_dp_size=N, dp_size=1), so dp_size here would
+    # no longer be the replica count every DP-rank attribution reads. The same
+    # deployment is `dp_size: 1` with `--attn-dp-size N`.
+    if (
+        config.engine == "sglang"
+        and "--enable-dp-attention" in config.server.extra_args
+        and config.server.dp_size > 1
+    ):
+        raise ValueError(
+            "invalid profile config: SGLang's deprecated --enable-dp-attention makes "
+            f"server.dp_size={config.server.dp_size} attention DP, not replicas; write "
+            f"server.dp_size: 1 and --attn-dp-size {config.server.dp_size} instead"
+        )
+    try:
+        gpu_count = config.gpu_count
+    except ValueError as exc:
+        raise ValueError(f"invalid profile config: {exc}") from exc
+    if len(visible_devices) != gpu_count:
         raise ValueError(
             "invalid profile config: cuda_visible_devices must contain exactly "
-            f"tp_size * dp_size={world_size} devices; found {visible_devices}"
+            f"tp_size * dp_size * pp={gpu_count} devices; found {visible_devices}"
         )
     if len(set(visible_devices)) != len(visible_devices):
         raise ValueError("invalid profile config: cuda_visible_devices contains duplicates")

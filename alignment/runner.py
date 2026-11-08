@@ -900,12 +900,11 @@ def _finalize_profile(
         tp_size=cfg.server.tp_size,
         dp_rank_by_device=dp_rank_by_device,
     )
-    expected_device_count = cfg.server.tp_size * cfg.server.dp_size
-    if len(parsed["device_ids"]) != expected_device_count:
+    if len(parsed["device_ids"]) != cfg.gpu_count:
         raise RuntimeError(
             "normalized NSYS device population does not match server parallelism: "
             f"devices={parsed['device_ids']} tp_size={cfg.server.tp_size} "
-            f"dp_size={cfg.server.dp_size}"
+            f"dp_size={cfg.server.dp_size} pp={cfg.pipeline_parallel_size}"
         )
     observed_dp_ranks = sorted(set(parsed["dp_rank_by_device"].values()))
     if observed_dp_ranks != list(range(cfg.server.dp_size)):

@@ -10,8 +10,8 @@ multicast / fabric-handle support, the IMEX channel, the memlock limit,
 in one.
 
 Only what the config itself states is enforced: every visible GPU must be the
-config's `gpu`, and there must be exactly `tp_size * dp_size` of them. Everything
-else is recorded, not judged here.
+config's `gpu`, and there must be exactly `gpu_count` (`tp_size * dp_size * pp`)
+of them. Everything else is recorded, not judged here.
 """
 
 from __future__ import annotations
@@ -155,11 +155,11 @@ def collect(cfg: ProfileConfig, env: dict[str, str]) -> dict:
 def check(cfg: ProfileConfig, facts: dict) -> list[str]:
     """What the config states and the machine contradicts. Empty means go."""
     problems = []
-    expected = cfg.server.tp_size * cfg.server.dp_size
+    expected = cfg.gpu_count
     gpus = facts["gpus"]
     if len(gpus) != expected:
         problems.append(
-            f"server needs {expected} GPU(s) (tp_size * dp_size), but CUDA_VISIBLE_DEVICES="
+            f"server needs {expected} GPU(s) (tp_size * dp_size * pp), but CUDA_VISIBLE_DEVICES="
             f"{facts['cuda_visible_devices']!r} names {len(gpus)} visible one(s)"
         )
     names = sorted({gpu["name"] for gpu in gpus})

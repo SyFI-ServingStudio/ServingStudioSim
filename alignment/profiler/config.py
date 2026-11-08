@@ -203,6 +203,55 @@ PROFILE_KINDS = frozenset({"nsys", "workload_metrics", "expert_popularity", "tok
 ROUTING_PROFILE_KINDS = frozenset({"expert_popularity", "token_corpus"})
 
 
+# Each engine's spellings of its pipeline-parallel size in ``extra_args``.
+_PP_FLAGS = {
+    "vllm": ("--pipeline-parallel-size", "-pp"),
+    "sglang": ("--pp-size", "--pipeline-parallel-size"),
+}
+
+
+def _flag_value(args: list[str], names: tuple[str, ...]) -> str | None:
+    """The value of the last of ``names`` in ``args`` (``--x N`` or ``--x=N``)."""
+
+    value = None
+    for index, arg in enumerate(args):
+        name, eq, inline = str(arg).partition("=")
+        if name in names:
+            if eq:
+                value = inline
+            elif index + 1 < len(args):
+                value = str(args[index + 1])
+    return value
+
+
+def pipeline_parallel_size(engine: str, extra_args: list[str]) -> int:
+    """The PP degree ``extra_args`` asks ``engine`` for (1 if none)."""
+
+    value = _flag_value(extra_args, _PP_FLAGS.get(engine, ()))
+    if value is None:
+        return 1
+    try:
+        size = int(value)
+    except ValueError:
+        raise ValueError(f"pipeline-parallel size {value!r} is not an integer") from None
+    if size < 1:
+        raise ValueError(f"pipeline-parallel size must be positive, got {size}")
+    return size
+
+
+def server_gpu_count(engine: str, tp_size: int, dp_size: int, extra_args: list[str]) -> int:
+    """GPUs a server runs on: ``tp_size * dp_size * pp``.
+
+    Both engines size their world this way (vLLM's ParallelConfig, SGLang's
+    ``server_args.compute_world_size``). SGLang's attention DP
+    (``--attn-dp-size``) splits the TP group and adds no GPUs; ``dp_size``
+    counts replicas in both. Expert parallelism spans one PP stage, so it
+    divides ``tp_size * dp_size``, not this.
+    """
+
+    return tp_size * dp_size * pipeline_parallel_size(engine, extra_args)
+
+
 @dataclass
 class ProfileConfig:
     """One real-server ground-truth profiling run."""
@@ -211,7 +260,7 @@ class ProfileConfig:
     name: str
     log_dir: str
     gpu: str  # DB/display GPU name, e.g. "NVIDIA H200"
-    cuda_visible_devices: str = "0"  # comma-separated physical GPUs; count equals tp_size
+    cuda_visible_devices: str = "0"  # comma-separated physical GPUs; count equals gpu_count
 
     # ``nsys`` is the timing/segment capture consumed by kernel alignment.
     # ``workload_metrics`` is a clean full-run scheduler/request timing pass.
@@ -251,6 +300,20 @@ class ProfileConfig:
 
     # --- workload: req-frontend consumes the same source trace as the simulator ---
     workload: LoadGeneratorConfig = None  # type: ignore[assignment]
+
+    @property
+    def pipeline_parallel_size(self) -> int:
+        """The PP degree ``server.extra_args`` asks the engine for (1 if none)."""
+
+        return pipeline_parallel_size(self.engine, self.server.extra_args)
+
+    @property
+    def gpu_count(self) -> int:
+        """GPUs the server runs on (``server_gpu_count``)."""
+
+        return server_gpu_count(
+            self.engine, self.server.tp_size, self.server.dp_size, self.server.extra_args
+        )
 
     @property
     def captures_expert_load(self) -> bool:
