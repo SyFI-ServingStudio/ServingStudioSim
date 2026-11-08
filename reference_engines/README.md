@@ -5,7 +5,7 @@ kept as an official base plus our patches. One directory per engine:
 
 | Path | Holds |
 | --- | --- |
-| `<engine>/BASE` | the upstream repository and commit the patches apply to, the official image built from that commit, and that image's digest per platform |
+| `<engine>/BASE.yaml` | the upstream repository and commit the patches apply to, the official image built from that commit, and that image's digest per platform |
 | `<engine>/patches/` | the instrumentation, one `git format-patch` file per commit: the source of truth |
 | `<engine>/Dockerfile` | the engine's one image, for both L1 kernels and alignment captures |
 | `<engine>/src/` | a materialized source tree (git-ignored) |
@@ -18,9 +18,9 @@ kept as an official base plus our patches. One directory per engine:
 
 vLLM's CI publishes no arm64 image of `5629b26`; the arm64 base is
 `b4dffa50`, 3 commits earlier, which differs from it only in `recipes/` and
-`tests/`, so the same patches apply (BASE: `image.linux/arm64`,
-`upstream_commit.linux/arm64`). SGLang's tag is a multi-platform index; BASE
-pins both platforms' manifests. The arm64 images are build-verified only.
+`tests/`, so the same patches apply (BASE.yaml: `platforms.linux/arm64` has its
+own `image`, `upstream_commit` and a `note` saying why). SGLang's tag is a
+multi-platform index; BASE.yaml pins both platforms' manifests. The arm64 images are build-verified only.
 
 Both bases are main/nightly builds, not releases: vLLM is on main because
 DeepSeek-V4.1 needs SwapAB and other paths v0.33.0 does not have. The next bump
@@ -29,7 +29,7 @@ should move both to a stable release and its official image.
 ## Commands
 
 ```bash
-just ref materialize vllm                  # BASE + patches -> reference_engines/vllm/src
+just ref materialize vllm                  # BASE.yaml + patches -> reference_engines/vllm/src
 just ref export-patches vllm               # src (or --from CHECKOUT --ref REF) -> patches/
 just ref bump-base vllm --commit SHA --image REPO:TAG
 just ref build-image vllm                  # this host's platform
@@ -38,36 +38,37 @@ just ref warm-caches vllm PROFILE.yaml     # compile + tune a capture's deployme
 
 (`just ref VERB ENGINE` is `uv run python -m reference_engines VERB ENGINE`.)
 
-**materialize** fetches BASE's commit once into a bare object cache
+**materialize** fetches BASE.yaml's commit once into a bare object cache
 (`~/.cache/vibesim-reference-engines`, or `VIBESIM_REFERENCE_CACHE`), checks it
 out, and applies the patches with `git am`. Every commit gets a fixed committer
-and its author date as committer date, so a BASE and a patch series give the
+and its author date as committer date, so a BASE.yaml and a patch series give the
 same commit ids on every host, on branch `reference/<engine>`. It refuses to
 replace an existing tree without `--force`, and a tree with uncommitted changes
 even then.
 
 **export-patches** rewrites `patches/` from the commits a checkout has over
-BASE's commit. A file depends only on its own commit (no `n/m` numbering in the
+BASE.yaml's commit. A file depends only on its own commit (no `n/m` numbering in the
 subject, full blob ids, no source commit id or signature), so an unchanged
 commit gives an unchanged file wherever it is exported from. The checkout is the materialized tree unless `--from` names a
 fork. The series must be linear. A fork's own `ALIGNMENT_BASE` is not
-exported: BASE replaces it.
+exported: BASE.yaml replaces it.
 
 Editing the patches: commit in `src/` (amend, rebase, add commits), then
 `export-patches`, and review the diff of `patches/`.
 
-**bump-base** points BASE at a new upstream commit and official image. It reads
-each platform's image-manifest digest from the registry, so nothing in BASE is a
+**bump-base** points BASE.yaml at a new upstream commit and official image. It reads
+each platform's image-manifest digest from the registry, so nothing in BASE.yaml is a
 moving tag; `--platform-image linux/arm64=REPO:TAG` adds a platform published
-under another tag, and `--platform-commit linux/arm64=SHA` the upstream commit
-that image was built from when it is not `--commit`. It rewrites BASE whole
-(comments included) and then materializes on the new base. A patch that no longer
+under another tag, `--platform-commit linux/arm64=SHA` the upstream commit
+that image was built from when it is not `--commit`, and `--platform-note
+linux/arm64=TEXT` why. It rewrites BASE.yaml whole (old notes are dropped: they
+explained the old pins) and then materializes on the new base. A patch that no longer
 applies stops `git am` in `src/`: resolve it there (`git am --continue`), then
 `export-patches`.
 
 **build-image** builds the image for this host's platform
 (`profiling/container/images.py`, which names its tag). The tag is a hash of the
-Dockerfile, BASE, every patch, the capture requirements, the req-frontend
+Dockerfile, BASE.yaml, every patch, the capture requirements, the req-frontend
 gitlink and the pinned base image, so a host that has the tag has that image.
 
 **warm-caches** starts the engine of a capture config in its image, on the
@@ -144,7 +145,7 @@ least to most:
 6. the patches, applied to the engine as the official image installed it:
    vLLM's wheel in `/usr/local/lib/python3.12/dist-packages` (only `vllm/`
    paths), SGLang's editable checkout at `/sgl-workspace/sglang`. A patch that
-   does not apply means the image is not BASE's commit, and the build fails;
+   does not apply means the image is not BASE.yaml's commit, and the build fails;
 7. this checkout's `profiling/`, `launcher/`, `gpu/` and the guard for the build's self-check
    (workers and captures overlay the checkout's own at run time);
 8. the manifest (`/etc/vibesim-profiler-image.json`) and labels.

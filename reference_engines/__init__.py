@@ -2,8 +2,8 @@
 
 Each engine is a directory beside this file (`vllm/`, `sglang/`):
 
-- `BASE`: the upstream commit the patches apply to and the official image built
-  from it, pinned by one digest per platform (`read_base`).
+- `BASE.yaml`: the upstream commit the patches apply to and the official image
+  built from it, pinned by one digest per platform (`read_base`).
 - `patches/`: the instrumentation, one `git format-patch` file per commit. They
   are the source of truth; a fork branch is only where they are edited
   (`export-patches`).
@@ -21,8 +21,11 @@ from __future__ import annotations
 
 import platform
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 ROOT = Path(__file__).resolve().parent
 ENGINES = ("vllm", "sglang")
@@ -57,6 +60,8 @@ class Base:
     # Platform -> the upstream commit that platform's image was built from,
     # when it is not `upstream_commit` (the patches must still apply to it).
     platform_commits: dict[str, str]
+    # Platform -> why it is pinned the way it is (free text, kept in the file).
+    notes: dict[str, str] = field(default_factory=dict)
 
     def image_for(self, platform_name: str) -> str:
         """The pinned reference (`repository@sha256:...`) to build `FROM` on ``platform_name``."""
@@ -98,7 +103,7 @@ def engine_dir(engine: str) -> Path:
 
 
 def base_path(engine: str) -> Path:
-    return engine_dir(engine) / "BASE"
+    return engine_dir(engine) / "BASE.yaml"
 
 
 def patches_dir(engine: str) -> Path:
@@ -111,64 +116,74 @@ def source_dir(engine: str) -> Path:
     return engine_dir(engine) / "src"
 
 
-def parse_base(text: str, origin: str = "BASE") -> Base:
-    """`key=value` lines; blank lines and `#` comments are ignored.
+_TOP_KEYS = {"upstream_repo", "upstream_commit", "image", "platforms"}
+_PLATFORM_KEYS = {"digest", "image", "upstream_commit", "note"}
+
+
+def parse_base(text: str, origin: str = "BASE.yaml") -> Base:
+    """A BASE.yaml document.
 
     Required: `upstream_repo`, `upstream_commit` (40 hex), `image`
-    (`repository:tag`), and at least one `digest.<os>/<arch>=sha256:<64 hex>`.
-    Optional, for a platform published under another tag:
-    `image.<os>/<arch>=repository:tag` and, when that image is of another
-    upstream commit, `upstream_commit.<os>/<arch>=<40 hex>`.
+    (`repository:tag`), and `platforms`, a mapping from `<os>/<arch>` to at
+    least `digest: sha256:<64 hex>`. A platform published under another tag
+    adds `image: repository:tag` and, when that image is of another upstream
+    commit, `upstream_commit`. `note` is free text on why it is pinned so.
     """
 
-    values: dict[str, str] = {}
-    for number, raw in enumerate(text.splitlines(), 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, sep, value = line.partition("=")
-        key, value = key.strip(), value.strip()
-        if not sep or not key or not value:
-            raise BaseError(f"{origin}:{number}: expected key=value, got {raw!r}")
-        if key in values:
-            raise BaseError(f"{origin}:{number}: {key} given twice")
-        values[key] = value
-    for key in ("upstream_repo", "upstream_commit", "image"):
-        if key not in values:
+    try:
+        doc: Any = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise BaseError(f"{origin}: not YAML: {exc}") from None
+    if not isinstance(doc, dict):
+        raise BaseError(f"{origin}: expected a mapping")
+    unknown = set(doc) - _TOP_KEYS
+    if unknown:
+        raise BaseError(f"{origin}: unknown key {sorted(unknown)[0]}")
+    for key in _TOP_KEYS:
+        if key not in doc:
             raise BaseError(f"{origin}: missing {key}")
-    if not _SHA1.fullmatch(values["upstream_commit"]):
+    for key in ("upstream_repo", "upstream_commit", "image"):
+        if not isinstance(doc[key], str):
+            raise BaseError(f"{origin}: {key} must be a string")
+    if not _SHA1.fullmatch(doc["upstream_commit"]):
         raise BaseError(f"{origin}: upstream_commit must be a full 40-hex commit")
-    if ":" not in values["image"].rpartition("/")[2] or "@" in values["image"]:
+    if ":" not in doc["image"].rpartition("/")[2] or "@" in doc["image"]:
         raise BaseError(f"{origin}: image must be repository:tag, without a digest")
+    platforms = doc["platforms"]
+    if not isinstance(platforms, dict) or not platforms:
+        raise BaseError(f"{origin}: platforms must map <os>/<arch> to its pins")
     digests: dict[str, str] = {}
     platform_images: dict[str, str] = {}
     platform_commits: dict[str, str] = {}
-    for key, value in values.items():
-        if key.startswith("digest."):
-            if not _DIGEST.fullmatch(value):
-                raise BaseError(f"{origin}: {key} must be sha256:<64 hex>")
-            digests[key.removeprefix("digest.")] = value
-        elif key.startswith("image."):
-            platform_images[key.removeprefix("image.")] = value
-        elif key.startswith("upstream_commit."):
-            if not _SHA1.fullmatch(value):
-                raise BaseError(f"{origin}: {key} must be a full 40-hex commit")
-            platform_commits[key.removeprefix("upstream_commit.")] = value
-        elif key not in ("upstream_repo", "upstream_commit", "image"):
-            raise BaseError(f"{origin}: unknown key {key}")
-    if not digests:
-        raise BaseError(f"{origin}: no digest.<os>/<arch> entry")
-    for prefix, entries in (("image", platform_images), ("upstream_commit", platform_commits)):
-        stray = set(entries) - set(digests)
-        if stray:
-            raise BaseError(f"{origin}: {prefix}.{sorted(stray)[0]} has no digest")
+    notes: dict[str, str] = {}
+    for name, entry in platforms.items():
+        where = f"{origin}: platforms.{name}"
+        if not isinstance(name, str) or name.count("/") != 1:
+            raise BaseError(f"{where}: a platform is <os>/<arch>")
+        if not isinstance(entry, dict):
+            raise BaseError(f"{where}: expected a mapping")
+        unknown = set(entry) - _PLATFORM_KEYS
+        if unknown:
+            raise BaseError(f"{where}: unknown key {sorted(unknown)[0]}")
+        if not isinstance(entry.get("digest"), str) or not _DIGEST.fullmatch(entry["digest"]):
+            raise BaseError(f"{where}.digest must be sha256:<64 hex>")
+        digests[name] = entry["digest"]
+        if "image" in entry:
+            platform_images[name] = str(entry["image"])
+        if "upstream_commit" in entry:
+            if not _SHA1.fullmatch(str(entry["upstream_commit"])):
+                raise BaseError(f"{where}.upstream_commit must be a full 40-hex commit")
+            platform_commits[name] = str(entry["upstream_commit"])
+        if "note" in entry:
+            notes[name] = str(entry["note"]).strip()
     return Base(
-        upstream_repo=values["upstream_repo"],
-        upstream_commit=values["upstream_commit"],
-        image=values["image"],
+        upstream_repo=doc["upstream_repo"],
+        upstream_commit=doc["upstream_commit"],
+        image=doc["image"],
         digests=digests,
         platform_images=platform_images,
         platform_commits=platform_commits,
+        notes=notes,
     )
 
 
@@ -182,19 +197,25 @@ def read_base(engine: str) -> Base:
 
 
 def format_base(base: Base, header: str) -> str:
-    lines = [f"# {line}" if line else "#" for line in header.splitlines()]
-    lines += [
-        f"upstream_repo={base.upstream_repo}",
-        f"upstream_commit={base.upstream_commit}",
-        f"image={base.image}",
-    ]
+    platforms: dict[str, dict[str, str]] = {}
     for name in sorted(base.digests):
+        entry: dict[str, str] = {}
+        if name in base.notes:
+            entry["note"] = base.notes[name]
         if name in base.platform_images:
-            lines.append(f"image.{name}={base.platform_images[name]}")
+            entry["image"] = base.platform_images[name]
         if name in base.platform_commits:
-            lines.append(f"upstream_commit.{name}={base.platform_commits[name]}")
-        lines.append(f"digest.{name}={base.digests[name]}")
-    return "\n".join(lines) + "\n"
+            entry["upstream_commit"] = base.platform_commits[name]
+        entry["digest"] = base.digests[name]
+        platforms[name] = entry
+    doc = {
+        "upstream_repo": base.upstream_repo,
+        "upstream_commit": base.upstream_commit,
+        "image": base.image,
+        "platforms": platforms,
+    }
+    comment = "".join(f"# {line}\n" if line else "#\n" for line in header.splitlines())
+    return comment + yaml.safe_dump(doc, sort_keys=False, width=float("inf"))
 
 
 def patch_files(engine: str) -> list[Path]:

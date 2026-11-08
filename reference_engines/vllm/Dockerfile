@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# The vLLM reference engine: the official image of BASE's upstream commit with
+# The vLLM reference engine: the official image of BASE.yaml's upstream commit with
 # patches/ applied, used by both L1 kernel workers (`vllm_env`) and alignment
 # captures. Built and tagged by `profiling/container/images.py`, which passes
 # the official image pinned by this platform's digest as BASE_IMAGE.
@@ -84,7 +84,7 @@ COPY --from=req-frontend /src/req-frontend/target/release/session_runner \
 
 # The patches, onto vLLM as the official image installed it. Only the package's
 # own files apply (the fork's tests and notes are not installed); a patch that
-# does not apply means the image is not BASE's commit.
+# does not apply means the image is not BASE.yaml's commit.
 COPY reference_engines/vllm/patches /opt/vibesim/reference_engines/vllm/patches
 RUN cd /usr/local/lib/python3.12/dist-packages \
     && git apply --include='vllm/*' /opt/vibesim/reference_engines/vllm/patches/*.patch \

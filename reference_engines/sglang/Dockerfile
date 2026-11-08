@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# The SGLang reference engine: the official image of BASE's upstream commit with
+# The SGLang reference engine: the official image of BASE.yaml's upstream commit with
 # patches/ applied, used by both L1 kernel workers (`sglang_env`) and alignment
 # captures. Built and tagged by `profiling/container/images.py`, which passes
 # the official image pinned by this platform's digest as BASE_IMAGE.
@@ -80,7 +80,7 @@ COPY --from=req-frontend /src/req-frontend/target/release/session_runner \
     /opt/vibesim/alignment/load_generator/req-frontend/target/release/session_runner
 
 # The patches, onto the official image's checkout (and so onto its editable
-# install). A patch that does not apply means the image is not BASE's commit.
+# install). A patch that does not apply means the image is not BASE.yaml's commit.
 COPY reference_engines/sglang/patches /opt/vibesim/reference_engines/sglang/patches
 RUN cd /sgl-workspace/sglang \
     && git -c safe.directory='*' apply /opt/vibesim/reference_engines/sglang/patches/*.patch \

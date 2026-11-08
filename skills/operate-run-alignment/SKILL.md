@@ -142,7 +142,7 @@ single-config path below when there is one workload and no matrix.
    `reference_engines/README.md`: the official image plus our patches, the same
    image its L1 kernels run in) replaces a host venv, host nsys and cargo build,
    so the capture does not depend on how one worktree's venv was provisioned.
-   Build it once per BASE/patches/req-frontend change with
+   Build it once per BASE.yaml/patches/req-frontend change with
    `just ref build-image vllm` (or `sglang`), on the host with rootless Podman
    or inside a Slurm job where docker
    is a job-scoped rootless Podman (unset the workspace `.env`'s `DOCKER_HOST`

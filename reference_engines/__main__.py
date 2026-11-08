@@ -1,14 +1,15 @@
 """`python -m reference_engines <verb> <engine>` (`just ref <verb> <engine>`).
 
 materialize ENGINE [--dest DIR] [--force]
-    BASE's upstream commit plus patches/ as a git tree (default
+    BASE.yaml's upstream commit plus patches/ as a git tree (default
     reference_engines/ENGINE/src): one commit per patch, with a fixed
     committer, so the same inputs give the same commit ids everywhere.
 export-patches ENGINE [--from CHECKOUT] [--ref REF]
     Rewrite patches/ from the commits CHECKOUT (default: the materialized
-    tree) has on top of BASE's upstream commit.
+    tree) has on top of BASE.yaml's upstream commit.
 bump-base ENGINE --commit SHA --image REPO:TAG [--platform-image P=REPO:TAG]
-    Point BASE at a new upstream commit and official image, pinning each
+    [--platform-commit P=SHA] [--platform-note P=TEXT]
+    Point BASE.yaml at a new upstream commit and official image, pinning each
     platform's digest from the registry, then materialize on it. Patches
     that no longer apply stop `git am` in the tree; resolve there, then
     export-patches.
@@ -49,12 +50,12 @@ CACHE_DIR = Path(
     os.environ.get("VIBESIM_REFERENCE_CACHE", Path.home() / ".cache" / "vibesim-reference-engines")
 )
 # `git am` records these as every materialized commit's committer, and the
-# author date as its date, so a commit id depends only on BASE and patches/.
+# author date as its date, so a commit id depends only on BASE.yaml and patches/.
 _COMMITTER = {
     "GIT_COMMITTER_NAME": "ServingStudio reference_engines",
     "GIT_COMMITTER_EMAIL": "reference-engines@servingstudio.invalid",
 }
-# The fork records its base in this file; BASE replaces it, so it is not a patch.
+# The fork records its base in this file; BASE.yaml replaces it, so it is not a patch.
 _NOT_PATCHED = ("ALIGNMENT_BASE",)
 _BASE_HEADER = {
     "vllm": (
@@ -279,6 +280,7 @@ def bump_base(
     image: str,
     platform_images: dict[str, str],
     platform_commits: dict[str, str],
+    notes: dict[str, str] | None = None,
 ) -> None:
     old = read_base(engine)
     digests = platform_digests(image)
@@ -287,8 +289,11 @@ def bump_base(
         if name not in found:
             raise RefError(f"{other} is not published for {name} (only {', '.join(found)})")
         digests[name] = found[name]
-    base = Base(old.upstream_repo, commit, image, digests, platform_images, platform_commits)
-    # Validate before writing: a malformed BASE would stop every later command.
+    # Notes explain the old pins; a bump keeps only the ones it is given.
+    base = Base(
+        old.upstream_repo, commit, image, digests, platform_images, platform_commits, notes or {}
+    )
+    # Validate before writing: a malformed BASE.yaml would stop every later command.
     text = format_base(base, _BASE_HEADER[engine])
     parse_base(text)
     base_path(engine).write_text(text, encoding="utf-8")
@@ -320,15 +325,15 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m reference_engines", description=__doc__.split("\n\n")[0]
     )
     verbs = parser.add_subparsers(dest="verb", required=True)
-    verb = verbs.add_parser("materialize", help="BASE + patches/ -> a git source tree")
+    verb = verbs.add_parser("materialize", help="BASE.yaml + patches/ -> a git source tree")
     verb.add_argument("engine", choices=ENGINES)
     verb.add_argument("--dest", type=Path)
     verb.add_argument("--force", action="store_true", help="replace an existing clean tree")
-    verb = verbs.add_parser("export-patches", help="a branch over BASE -> patches/")
+    verb = verbs.add_parser("export-patches", help="a branch over BASE.yaml -> patches/")
     verb.add_argument("engine", choices=ENGINES)
     verb.add_argument("--from", dest="checkout", type=Path)
     verb.add_argument("--ref", default="HEAD")
-    verb = verbs.add_parser("bump-base", help="move BASE to a new upstream commit and image")
+    verb = verbs.add_parser("bump-base", help="move BASE.yaml to a new upstream commit and image")
     verb.add_argument("engine", choices=ENGINES)
     verb.add_argument("--commit", required=True)
     verb.add_argument("--image", required=True, help="the official image, repository:tag")
@@ -345,6 +350,13 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         metavar="OS/ARCH=COMMIT",
         help="the upstream commit a --platform-image was built from, when not --commit",
+    )
+    verb.add_argument(
+        "--platform-note",
+        action="append",
+        default=[],
+        metavar="OS/ARCH=TEXT",
+        help="why a platform is pinned the way it is (kept in BASE.yaml)",
     )
     verb = verbs.add_parser("build-image", help="build the engine image for this platform")
     verb.add_argument("engine", choices=ENGINES)
@@ -364,7 +376,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.verb == "bump-base":
             platform_images = dict(item.split("=", 1) for item in args.platform_image)
             platform_commits = dict(item.split("=", 1) for item in args.platform_commit)
-            bump_base(args.engine, args.commit, args.image, platform_images, platform_commits)
+            notes = dict(item.split("=", 1) for item in args.platform_note)
+            bump_base(
+                args.engine, args.commit, args.image, platform_images, platform_commits, notes
+            )
         elif args.verb == "warm-caches":
             return warm_caches(args.engine, args.config)
         else:

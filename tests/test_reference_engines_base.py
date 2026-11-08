@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+import yaml
 
 from reference_engines import ENGINES, BaseError, format_base, parse_base, read_base
 
@@ -15,51 +16,67 @@ AMD = "sha256:" + "1" * 64
 ARM = "sha256:" + "2" * 64
 
 
-def _base(*extra: str) -> str:
-    return "\n".join(
-        [
-            "# header",
-            "upstream_repo=https://example.invalid/engine.git",
-            f"upstream_commit={COMMIT}",
-            "image=registry.invalid/engine:tag",
-            f"digest.linux/amd64={AMD}",
-            *extra,
-        ]
-    )
+def _base(**arm64: str) -> str:
+    platforms = {"linux/amd64": {"digest": AMD}}
+    if arm64:
+        platforms["linux/arm64"] = arm64
+    doc = {
+        "upstream_repo": "https://example.invalid/engine.git",
+        "upstream_commit": COMMIT,
+        "image": "registry.invalid/engine:tag",
+        "platforms": platforms,
+    }
+    return "# header\n" + yaml.safe_dump(doc, sort_keys=False)
 
 
 def test_a_platform_published_under_another_tag_and_commit():
     base = parse_base(
         _base(
-            "image.linux/arm64=registry.invalid/engine:older-arm64",
-            f"upstream_commit.linux/arm64={OTHER}",
-            f"digest.linux/arm64={ARM}",
+            note="why this pin",
+            image="registry.invalid/engine:older-arm64",
+            upstream_commit=OTHER,
+            digest=ARM,
         )
     )
     assert base.image_for("linux/amd64") == f"registry.invalid/engine@{AMD}"
     assert base.image_for("linux/arm64") == f"registry.invalid/engine@{ARM}"
     assert base.commit_for("linux/amd64") == COMMIT
     assert base.commit_for("linux/arm64") == OTHER
+    assert base.notes == {"linux/arm64": "why this pin"}
     # format_base writes what parse_base reads.
     assert parse_base(format_base(base, "header")) == base
 
 
 def test_a_platform_without_its_own_commit_uses_the_base_commit():
-    base = parse_base(_base(f"digest.linux/arm64={ARM}"))
+    base = parse_base(_base(digest=ARM))
     assert base.commit_for("linux/arm64") == COMMIT
 
 
 @pytest.mark.parametrize(
-    "extra, message",
+    "arm64, message",
     [
-        ((f"upstream_commit.linux/arm64={OTHER}",), "has no digest"),
-        ((f"digest.linux/arm64={ARM}", "upstream_commit.linux/arm64=abc"), "40-hex"),
-        (("image.linux/arm64=registry.invalid/engine:x",), "has no digest"),
+        ({"upstream_commit": OTHER}, "digest must be"),
+        ({"digest": ARM, "upstream_commit": "abc"}, "40-hex"),
+        ({"image": "registry.invalid/engine:x"}, "digest must be"),
+        ({"digest": ARM, "tag": "x"}, "unknown key tag"),
     ],
 )
-def test_malformed_platform_entries_are_refused(extra, message):
+def test_malformed_platform_entries_are_refused(arm64, message):
     with pytest.raises(BaseError, match=message):
-        parse_base(_base(*extra))
+        parse_base(_base(**arm64))
+
+
+@pytest.mark.parametrize(
+    "text, message",
+    [
+        ("- a list", "expected a mapping"),
+        ("upstream_repo: x\n", "missing"),
+        ("a: [", "not YAML"),
+    ],
+)
+def test_malformed_documents_are_refused(text, message):
+    with pytest.raises(BaseError, match=message):
+        parse_base(text)
 
 
 def test_a_platform_the_base_does_not_pin_is_refused():

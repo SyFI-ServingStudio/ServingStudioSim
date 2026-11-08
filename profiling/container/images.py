@@ -71,7 +71,7 @@ def _engine_base(engine: str) -> Callable[[Path], str]:
     def base(root: Path) -> str:
         from reference_engines import BaseError, host_platform, parse_base
 
-        path = root / "reference_engines" / engine / "BASE"
+        path = root / "reference_engines" / engine / "BASE.yaml"
         try:
             return parse_base(path.read_text(encoding="utf-8"), str(path)).image_for(
                 host_platform()
@@ -86,7 +86,7 @@ def _engine_args(engine: str) -> Callable[[Path], dict[str, str]]:
     def args(root: Path) -> dict[str, str]:
         from reference_engines import host_platform, parse_base
 
-        base = parse_base((root / "reference_engines" / engine / "BASE").read_text())
+        base = parse_base((root / "reference_engines" / engine / "BASE.yaml").read_text())
         platform = host_platform()
         digest = base.digests[platform].removeprefix("sha256:")
         return {
@@ -112,7 +112,7 @@ def _engine_image(
         f"{directory}/Dockerfile",
         envs,
         inputs=(
-            f"{directory}/BASE",
+            f"{directory}/BASE.yaml",
             f"{directory}/patches",
             "reference_engines/capture-requirements.txt",
             "reference_engines/autotune_guard.py",
