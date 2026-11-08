@@ -188,7 +188,9 @@ def test_replay_stops_when_the_server_fails(tmp_path, monkeypatch, gated):
 
     def server_failure():
         polls.append(None)
-        return "Subprocess scheduler_0 (pid=1) crashed with exit code 1" if len(polls) > 1 else None
+        if len(polls) == 1:  # a broken check does not end the watch
+            raise OSError("log mid-rotation")
+        return "Subprocess scheduler_0 (pid=1) crashed with exit code 1" if len(polls) > 2 else None
 
     started = time.monotonic()
     with pytest.raises(runner.ServerFailedDuringReplay, match="scheduler_0"):

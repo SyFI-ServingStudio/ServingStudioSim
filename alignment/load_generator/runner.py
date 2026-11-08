@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import subprocess
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -215,8 +216,22 @@ def _watch_server(
     stop = threading.Event()
 
     def watch() -> None:
+        warned = False
         while not stop.wait(1.0):
-            reason = server_failure()
+            try:
+                reason = server_failure()
+            except Exception as exc:  # noqa: BLE001 - a broken check must not end the watch
+                # Not a server failure: the replay goes on, still watched (the
+                # check may be reading a log that is mid-rotation, say).
+                if not warned:
+                    print(
+                        f"[replay] server check failed, still watching: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    warned = True
+                continue
             if reason:
                 failure.append(reason)
                 proc.kill()
