@@ -117,7 +117,7 @@ def test_profiler_and_counters_start_only_at_frontend_measurement_boundary(tmp_p
     monkeypatch.setattr(alignment_runner, "_resolve_fork_python", lambda _: "python")
     monkeypatch.setattr(alignment_runner, "_preflight_capture_environment", lambda *a, **k: None)
     monkeypatch.setattr(alignment_runner.capture_facts, "record", lambda *a: {})
-    monkeypatch.setattr(alignment_runner, "_shutdown", lambda _: None)
+    monkeypatch.setattr(alignment_runner, "_shutdown", lambda _proc, **_kwargs: None)
     monkeypatch.setattr(alignment_runner, "_finalize_profile", lambda _, **k: k["drive_summary"])
     monkeypatch.setattr(alignment_runner.time, "sleep", lambda _: None)
     monkeypatch.setattr(driver, "build_server_argv", lambda *a: ["python"])
