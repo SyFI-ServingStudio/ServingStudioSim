@@ -55,6 +55,17 @@ engine claims (e.g. 0.75 x 80 GB for `gpu_memory_utilization: 0.75`).
 
 - The checkpoint must already be on the remote under the mounted HF cache.
 
+**A RunPod pod** has no docker inside, so it boots from the profiler image
+itself (`profile_runtime: in-image`, `ephemeral: true`), which runs the same
+captures and fills. Push the image to a private registry RunPod can pull,
+register a RunPod registry credential, and start the pod with the entrypoint
+`bash -c` command in launcher/README.md ("A remote that is a profiler image"),
+`22/tcp` exposed, `PUBLIC_KEY` set to this machine's key, and a `/workspace`
+volume. Before the first capture, put the checkpoint and corpus on that volume:
+run the image's `huggingface_hub` `snapshot_download` over ssh, and rsync the
+corpus from here. The host profile then names `/workspace/...` paths. Terminate
+the pod and delete the credential when the results are back.
+
 ## 3. Build the image here
 
 ```bash
