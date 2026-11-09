@@ -33,7 +33,11 @@
 #                    runs kernel-profile and campaign captures, nothing else.
 #   mounts           full-remote-profile: host dirs mounted into the container at the same
 #                    path (a Hugging Face cache, a text corpus).
-#   gpus             full-remote-profile, direct launch: the GPU indices or UUIDs a job uses.
+#   gpus             full-remote-profile, direct launch: the GPU indices or UUIDs a job uses,
+#                    or `auto`: each job takes as many idle GPUs as it needs when it starts.
+#   gpu_wait         full-remote-profile: {min_free_mib, quiet_s (60), timeout_s (3600)}; the
+#                    job starts once its GPUs have that much free memory for quiet_s (a host
+#                    whose users also run GPU work outside the scheduler), else exits 75.
 #   ephemeral        true when the remote's disk may vanish (a pod): copy results back whole.
 
 remotes:
@@ -80,3 +84,11 @@ remotes:
     workdir: /data/me/vibesim-remote
     profile_runtime: full-remote-profile
     mounts: [/data/me/hf, /data/me/corpus]
+
+  # The same, on a shared GPU server without a scheduler: take idle GPUs.
+  gpushared:
+    access: {ssh: me@gpushared.example.org}
+    workdir: /data/me/vibesim-remote
+    profile_runtime: full-remote-profile
+    gpus: auto
+    gpu_wait: {min_free_mib: 62000, quiet_s: 60, timeout_s: 7200}

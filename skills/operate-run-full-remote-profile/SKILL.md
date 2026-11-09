@@ -31,8 +31,12 @@ ssh HOST 'nvidia-smi --query-gpu=name,driver_version --format=csv,noheader; id -
 ```
 
 If the host runs Slurm (`sinfo`), use `launch: {slurm: ...}` and follow the
-GPU-job rules for partitions and time limits. Never run the GPU job outside the
-scheduler on a Slurm host.
+GPU-job rules for partitions and time limits, unless the user asks for the
+direct path. On a host without a scheduler, or when the user asks for the
+direct path, set `gpus: auto`: each job takes idle GPUs when it starts.
+When other users run GPU work outside the scheduler, a Slurm GPU may still
+be busy. Then set `gpu_wait: {min_free_mib: ...}` to at least what the
+engine claims (e.g. 0.75 x 80 GB for `gpu_memory_utilization: 0.75`).
 
 ## 2. Configure
 
@@ -94,7 +98,9 @@ python -m launcher alignment-campaign compare --pack $P --measured $R/metrics.js
 | Symptom | Action |
 | --- | --- |
 | `missing docker-access` | add the user to the docker group on the remote, then log in again |
-| `no GPUs for this job` | Slurm: the job got no `--gres`. Direct: set `gpus` in remote.yaml |
+| `no GPUs for this job` | Slurm: the job got no `--gres`. Direct: set `gpus` (or `auto`) in remote.yaml |
+| vLLM: `Free memory on device ... is less than desired` | someone else holds the GPU: set `gpu_wait.min_free_mib`, or use `gpus: auto` |
+| exit 75 `never had ... MiB free` / `no N idle GPU(s)` | the host stayed busy for `timeout_s`. Retry later, or raise the timeout |
 | the container exits at start with a CUDA driver error | the driver is too old for the image. Use a host with driver >= 580, or set `driver_compat_lib_dir` in the profile config |
 | `fork_python does not exist` | the host profile names a host path. Use the image's interpreter (above) |
 | model or corpus not found inside the container | add its directory, including symlink targets, to `mounts` |

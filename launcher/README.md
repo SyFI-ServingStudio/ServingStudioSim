@@ -925,8 +925,12 @@ node-local scratch and every `mounts` entry are bind-mounted at the same
 absolute path, and `node.py` runs on the image's interpreter, as on an
 in-image pod. Nothing is built or synced there; the image is sent from here
 when the remote lacks it. Under Slurm the container gets the allocated GPUs;
-a direct remote lists its `gpus`. Such a remote refuses simulation and
-timing-predict. It runs:
+a direct remote lists its `gpus`, or says `gpus: auto` to take idle ones (no
+compute process, little memory used) when the job starts. Where other users
+run GPU work outside the scheduler, `gpu_wait: {min_free_mib, quiet_s,
+timeout_s}` holds the container until its GPUs have that much free memory,
+logging who holds them. Such a remote refuses simulation and timing-predict.
+It runs:
 
 - `kernel-profile run|measure --remote NAME`, as above.
 - `alignment-campaign run --phase <profile pass> --remote NAME`: render the
