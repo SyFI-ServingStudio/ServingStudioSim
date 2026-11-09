@@ -327,3 +327,44 @@ def test_a_job_whose_gpu_stays_busy_gives_up_with_a_reason(tmp_path):
     assert subprocess.run(["bash", str(script)], env=clean, timeout=60).returncode == 75
     assert "never had 60000 MiB free" in (jobdir / "stdout.log").read_text()
     assert not (tmp_path / "docker.calls").exists()
+
+
+def test_auto_gpus_take_an_idle_card(tmp_path):
+    from launcher.remote.config import GpuWait
+
+    env = _fake_docker(
+        tmp_path,
+        "if sys.argv[1] == 'run':\n"
+        "    open(os.path.join(sys.argv[-1], 'exit_code'), 'w').write('0\\n')\n",
+    )
+    smi = tmp_path / "bin" / "nvidia-smi"
+    # GPU 0 runs a process, GPU 1 holds memory, GPU 2 is idle.
+    smi.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if '--query-compute-apps=gpu_uuid' in sys.argv:\n"
+        "    print('GPU-a')\n"
+        "elif '--query-gpu=memory.free' in sys.argv:\n"
+        "    print('80000')\n"
+        "else:\n"
+        "    print('0, GPU-a, 100, 80000'); print('1, GPU-b, 30000, 50000'); print('2, GPU-c, 5, 80000')\n"
+    )
+    smi.chmod(0o755)
+    container = _container(
+        tmp_path, gpus=("auto",), gpu_wait=GpuWait(60000, quiet_s=5, timeout_s=60)
+    )
+    jobdir, script = _script(tmp_path, container)
+    clean = {k: v for k, v in env.items() if not k.startswith("SLURM_")}
+    assert subprocess.run(["bash", str(script)], env=clean, timeout=60).returncode == 0
+    (argv,) = _calls(tmp_path)
+    assert argv[argv.index("--gpus") + 1] == '"device=2"'
+
+
+def test_auto_gpus_cannot_be_mixed_with_names(tmp_path):
+    path = tmp_path / "remote.yaml"
+    path.write_text(
+        "remotes:\n  d:\n    workdir: /w\n    profile_runtime: full-remote-profile\n"
+        "    gpus: [auto, 1]\n"
+    )
+    with pytest.raises(RemoteConfigError, match="cannot be combined"):
+        load_remote("d", path=path)

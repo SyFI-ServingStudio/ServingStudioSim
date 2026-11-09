@@ -62,6 +62,8 @@ class GpuWait:
 #: `full-remote-profile`: each job is one container of a profiler image on the
 #: remote, which needs only docker: nothing is installed or built there.
 FULL_REMOTE_PROFILE = "full-remote-profile"
+#: `gpus: auto` on a direct remote: each job takes idle GPUs when it starts.
+AUTO_GPUS = "auto"
 PROFILE_RUNTIMES = ("docker", "in-image", FULL_REMOTE_PROFILE)
 
 
@@ -208,6 +210,8 @@ def _parse(name: str, raw: dict[str, Any], config_dir: Path) -> Remote:
         isinstance(gpu, (int, str)) and not isinstance(gpu, bool) for gpu in gpus
     ):
         raise RemoteConfigError("gpus must be a GPU index or UUID, or a list of them")
+    if AUTO_GPUS in gpus and gpus != [AUTO_GPUS]:
+        raise RemoteConfigError(f"gpus: {AUTO_GPUS} cannot be combined with GPU names")
     gpu_wait = _parse_gpu_wait(raw.get("gpu_wait"))
     if (mounts or gpus or gpu_wait) and profile_runtime != FULL_REMOTE_PROFILE:
         raise RemoteConfigError(

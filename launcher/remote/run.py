@@ -42,7 +42,7 @@ from pathlib import Path, PurePosixPath
 
 from ..cli import GlobalOptions
 from . import image_send, launch
-from .config import FULL_REMOTE_PROFILE, Remote, RemoteConfigError, load_remote
+from .config import AUTO_GPUS, FULL_REMOTE_PROFILE, Remote, RemoteConfigError, load_remote
 from .layout import Layout
 from .node import SHIPPED_MARKER
 from .source import (
@@ -981,6 +981,9 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
     if full_remote:
         # One container of the image runs controller and workers; nothing is built there.
         image_id = session.prepare_full_remote_profile(env_name, image)
+        session.container = dataclasses.replace(
+            session.container, gpu_count=_spec_gpu_count(profiler_spec, specs)
+        )
         _say(f"{args.table}/{args.backend} runs in a container of {image} on {session.remote.name}")
     elif in_image:
         # The remote is the image: controller and workers run on its interpreter.
@@ -1112,7 +1115,7 @@ def _alignment_campaign(session: Session, argv: list[str]) -> int:
                 session.remote.slurm, gpus=max(session.remote.slurm.gpus, gpus)
             ),
         )
-    elif len(session.remote.gpus) < gpus:
+    elif session.remote.gpus != (AUTO_GPUS,) and len(session.remote.gpus) < gpus:
         raise RemoteRunError(
             f"{args.phase} needs {gpus} GPU(s); {session.remote.name} lists "
             f"{len(session.remote.gpus)} under gpus"
@@ -1120,6 +1123,7 @@ def _alignment_campaign(session: Session, argv: list[str]) -> int:
 
     session.ship()
     image_id = session.prepare_full_remote_profile(env_name, image)
+    session.container = dataclasses.replace(session.container, gpu_count=gpus)
     for plan in ready:
         session.push_tree(plan.directory)
     pack_arg = args.pack if not Path(args.pack).is_dir() else str(
