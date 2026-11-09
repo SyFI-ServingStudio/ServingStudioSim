@@ -514,6 +514,19 @@ class Session:
         )
         return image_id
 
+    def prepare_gpu_only(self, env_name: str, tag: str, *, gpu_count: int = 1) -> str:
+        """Run the job on ``tag``'s interpreter: in a container of it, or on a remote that is it.
+
+        Returns the image id (a container host) or the image inputs (an in-image pod).
+        """
+
+        if self.remote.profile_runtime == "in-image":
+            return self.prepare_in_image(env_name, tag)
+        image_id = self.prepare_full_remote_profile(env_name, tag)
+        assert self.container is not None
+        self.container = dataclasses.replace(self.container, gpu_count=gpu_count)
+        return image_id
+
     def check_container_host(self) -> None:
         """Fail early, by name, on a remote that cannot run a GPU container."""
 
@@ -827,9 +840,9 @@ def _kernel_fill(session: Session, args) -> int:
     from profiling.exec.env import PROFILE_RUNTIME_ENV, container_image
     from profiling.plan import UNITS_SCHEMA_VERSION
 
-    if session.remote.profile_runtime != FULL_REMOTE_PROFILE:
+    if session.remote.profile_runtime not in GPU_ONLY_RUNTIMES:
         raise RemoteRunError(
-            f"kernel-profile fill --remote needs profile_runtime: {FULL_REMOTE_PROFILE}"
+            f"kernel-profile fill --remote needs profile_runtime: {FULL_REMOTE_PROFILE} or in-image"
         )
     if args.db is not None:
         raise RemoteRunError("--db cannot be used with --remote: rows merge into this profile.db")
@@ -863,7 +876,7 @@ def _kernel_fill(session: Session, args) -> int:
         )
         specs = sum(len(unit["specs"]) for unit in env_units)
         _say(f"{env_name}: {specs} spec(s) in {len(env_units)} unit(s), image {image}")
-        image_id = session.prepare_full_remote_profile(env_name, image)
+        image_id = session.prepare_gpu_only(env_name, image)
         session.push_files([work])
         command = [
             "kernel-profile",
@@ -1076,10 +1089,10 @@ def _alignment_campaign(session: Session, argv: list[str]) -> int:
             f"alignment-campaign {args.verb} runs here; only `run --phase <profile pass>` "
             "goes to a remote"
         )
-    if session.remote.profile_runtime != FULL_REMOTE_PROFILE:
+    if session.remote.profile_runtime not in GPU_ONLY_RUNTIMES:
         raise RemoteRunError(
-            f"alignment-campaign --remote needs profile_runtime: {FULL_REMOTE_PROFILE} "
-            f"({session.remote.name} has {session.remote.profile_runtime})"
+            f"alignment-campaign --remote needs profile_runtime: {FULL_REMOTE_PROFILE} or "
+            f"in-image ({session.remote.name} has {session.remote.profile_runtime})"
         )
     if args.dry_run:
         raise RemoteRunError("--dry-run stays local; drop --remote")
@@ -1115,15 +1128,18 @@ def _alignment_campaign(session: Session, argv: list[str]) -> int:
                 session.remote.slurm, gpus=max(session.remote.slurm.gpus, gpus)
             ),
         )
-    elif session.remote.gpus != (AUTO_GPUS,) and len(session.remote.gpus) < gpus:
+    elif (
+        session.remote.profile_runtime == FULL_REMOTE_PROFILE
+        and session.remote.gpus != (AUTO_GPUS,)
+        and len(session.remote.gpus) < gpus
+    ):
         raise RemoteRunError(
             f"{args.phase} needs {gpus} GPU(s); {session.remote.name} lists "
             f"{len(session.remote.gpus)} under gpus"
         )
 
     session.ship()
-    image_id = session.prepare_full_remote_profile(env_name, image)
-    session.container = dataclasses.replace(session.container, gpu_count=gpus)
+    image_id = session.prepare_gpu_only(env_name, image, gpu_count=gpus)
     for plan in ready:
         session.push_tree(plan.directory)
     pack_arg = args.pack if not Path(args.pack).is_dir() else str(
@@ -1190,6 +1206,8 @@ COMMANDS: dict[str | None, Callable[[Session, list[str]], int]] = {
 
 #: What a full-remote-profile remote runs: GPU work only.
 GPU_COMMANDS = ("kernel-profile", "alignment-campaign")
+#: Runtimes that run nothing but GPU work, on a profiler image's own interpreter.
+GPU_ONLY_RUNTIMES = (FULL_REMOTE_PROFILE, "in-image")
 
 
 def run(subcommand: str | None, argv: list[str], options: GlobalOptions) -> int:
@@ -1202,15 +1220,10 @@ def run(subcommand: str | None, argv: list[str], options: GlobalOptions) -> int:
     try:
         _require_repo_cwd()
         remote = load_remote(options.remote or "", options.remote_set)
-        if remote.profile_runtime == "in-image" and subcommand != "kernel-profile":
+        if remote.profile_runtime in GPU_ONLY_RUNTIMES and subcommand not in GPU_COMMANDS:
             raise RemoteRunError(
-                f"{remote.name} is a profiler image (profile_runtime: in-image), "
-                "which runs kernel-profile only"
-            )
-        if remote.profile_runtime == FULL_REMOTE_PROFILE and subcommand not in GPU_COMMANDS:
-            raise RemoteRunError(
-                f"{remote.name} has profile_runtime: {FULL_REMOTE_PROFILE}, which runs only the "
-                f"GPU work ({', '.join(GPU_COMMANDS)}); run `{subcommand or 'simulation'}` here"
+                f"{remote.name} has profile_runtime: {remote.profile_runtime}, which runs only "
+                f"the GPU work ({', '.join(GPU_COMMANDS)}); run `{subcommand or 'simulation'}` here"
             )
     except (RemoteConfigError, RemoteRunError) as exc:
         print(f"python -m launcher --remote: {exc}", file=sys.stderr)

@@ -413,7 +413,7 @@ def test_an_in_image_remote_runs_on_the_images_interpreter_only_if_it_is_the_ima
     assert (tmp_path / "w" / "src" / "v1" / ".venv").readlink() == Path("/opt/v/.venv")
 
 
-def test_an_in_image_remote_runs_kernel_profile_only(monkeypatch, capsys):
+def test_an_in_image_remote_runs_gpu_work_only(monkeypatch, capsys):
     import dataclasses
 
     from launcher.cli import GlobalOptions
@@ -423,7 +423,7 @@ def test_an_in_image_remote_runs_kernel_profile_only(monkeypatch, capsys):
     monkeypatch.setattr(remote_run, "_require_repo_cwd", lambda: None)
     monkeypatch.setattr(remote_run, "load_remote", lambda name, sets: pod)
     assert remote_run.run(None, ["presets/x.yaml"], GlobalOptions(remote="r")) == 2
-    assert "runs kernel-profile only" in capsys.readouterr().err
+    assert "runs only the GPU work" in capsys.readouterr().err
 
 
 def test_a_forwarding_call_opens_its_own_connection():

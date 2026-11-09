@@ -251,7 +251,7 @@ def test_a_full_remote_profile_remote_runs_gpu_work_only(tmp_path, monkeypatch, 
     [
         (FULL_REMOTE_PROFILE, ["label", "--pack", "p", "--out-root", "logs/x"], "label runs here"),
         ("docker", ["run", "--pack", "p", "--out-root", "logs/x", "--phase", "profile_nsys"],
-         "needs profile_runtime: full-remote-profile"),
+         "needs profile_runtime: full-remote-profile or in-image"),
         (FULL_REMOTE_PROFILE,
          ["run", "--pack", "p", "--out-root", "logs/x", "--phase", "profile_nsys", "--dry-run"],
          "--dry-run stays local"),
