@@ -1,0 +1,21 @@
+.git
+**/.git
+**/.venv
+**/__pycache__
+**/*.pyc
+.uv
+target
+logs
+.launcher
+.codex
+.claude
+profiling/profile.db
+*.db-journal
+*.parquet
+*.pftrace
+trace
+# The vLLM image also builds the req-frontend load generator (the capture side).
+alignment/load_generator/*
+!alignment/load_generator/req-frontend
+alignment/load_generator/req-frontend/target
+alignment/profiler/sglang

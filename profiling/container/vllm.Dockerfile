@@ -7,6 +7,21 @@
 # by `profiling/container/images.py`, which resolves the revisions below.
 
 ARG CUDA_VERSION=13.0.2
+
+# The capture side's load generator (alignment/load_generator/req-frontend),
+# built on the runtime image's own OS so its binaries run there. A capture in
+# this image runs them instead of building the shipped source (no cargo needed).
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS req-frontend
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates curl perl pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+COPY alignment/load_generator/req-frontend /src/req-frontend
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    cd /src/req-frontend \
+    && /root/.cargo/bin/cargo build --release --locked --bin session_runner --bin tracegen \
+    && mkdir -p /out && cp target/release/session_runner target/release/tracegen /out/
+
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 
 ARG CUDA_VERSION
@@ -35,6 +50,17 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && curl -LsSf https://astral.sh/uv/install.sh | sh
 
+# Nsight Systems CLI for the alignment capture (`nsys profile` wraps the
+# server), from the CUDA apt repository the base image already configures;
+# the package links it as /usr/local/bin/nsys.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cuda-nsight-systems-13-0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && /usr/local/bin/nsys --version
+
+COPY --from=req-frontend /out/ /opt/req-frontend/bin/
+ENV VIBESIM_REQ_FRONTEND_BIN=/opt/req-frontend/bin
+
 WORKDIR /opt/vibesim
 COPY alignment/profiler/vllm /opt/vibesim/alignment/profiler/vllm
 
@@ -47,7 +73,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
        VLLM_PRECOMPILED_WHEEL_VARIANT="${VLLM_WHEEL_VARIANT}" \
        VLLM_VERSION_OVERRIDE="${VLLM_VERSION}" \
        uv pip install --python .venv/bin/python -e . \
-    && uv pip install --python .venv/bin/python nvtx numpy nvidia-ml-py \
+    && uv pip install --python .venv/bin/python nvtx numpy nvidia-ml-py pyarrow \
     && uv pip check --python .venv/bin/python
 
 # Workers run with --network none, so bake every FlashInfer cubin into the
@@ -69,14 +95,16 @@ COPY gpu /opt/vibesim/gpu
 ARG VIBESIM_PROFILE_ENVS
 RUN python -c "import importlib.metadata, torch; assert torch.version.cuda == '13.0'; print(importlib.metadata.version('vllm'))" \
     && test -f alignment/profiler/vllm/vllm/_C_stable_libtorch.abi3.so \
-    && python -m profiling.container.selfcheck ${VIBESIM_PROFILE_ENVS}
+    && python -m profiling.container.selfcheck ${VIBESIM_PROFILE_ENVS} \
+    && python -c "import pyarrow, yaml, launcher.remote.node" \
+    && /opt/req-frontend/bin/session_runner --help >/dev/null
 
 # Last, so a new commit only rewrites the labels, not the dependency layers.
 ARG VIBESIM_REVISION=unknown
 ARG VIBESIM_IMAGE_INPUTS=unknown
 # What this image is, for a process running inside it
 # (`VIBESIM_PROFILE_RUNTIME=in-image`, profiling/exec/env.py).
-RUN /opt/vibesim/alignment/profiler/vllm/.venv/bin/python -c "import json, os; json.dump({'inputs': '${VIBESIM_IMAGE_INPUTS}', 'envs': '${VIBESIM_PROFILE_ENVS}'.split(), 'python': '/opt/vibesim/alignment/profiler/vllm/.venv/bin/python', 'python_paths': [p for p in os.environ['PYTHONPATH'].split(':') if p and p != '/opt/vibesim']}, open('/etc/vibesim-profiler-image.json', 'w'))"
+RUN /opt/vibesim/alignment/profiler/vllm/.venv/bin/python -c "import json, os; json.dump({'inputs': '${VIBESIM_IMAGE_INPUTS}', 'envs': '${VIBESIM_PROFILE_ENVS}'.split(), 'python': '/opt/vibesim/alignment/profiler/vllm/.venv/bin/python', 'nsys': '/usr/local/bin/nsys', 'req_frontend_bin': '/opt/req-frontend/bin', 'python_paths': [p for p in os.environ['PYTHONPATH'].split(':') if p and p != '/opt/vibesim']}, open('/etc/vibesim-profiler-image.json', 'w'))"
 LABEL org.opencontainers.image.title="VibeSim vLLM kernel profiler" \
       org.opencontainers.image.revision="${VIBESIM_REVISION}" \
       ai.vibesim.image.inputs="${VIBESIM_IMAGE_INPUTS}" \

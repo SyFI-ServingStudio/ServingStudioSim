@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,9 +13,15 @@ from .config import LoadGeneratorConfig
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REQ_FRONTEND_ROOT = Path(__file__).resolve().parent / "req-frontend"
 REPLAY_MANIFEST = REQ_FRONTEND_ROOT / "Cargo.toml"
-SESSION_RUNNER = REQ_FRONTEND_ROOT / "target" / "release" / "session_runner"
+# A profiler image that carries prebuilt req-frontend binaries names their
+# directory here (profiling/container/vllm.Dockerfile); the capture then runs
+# them instead of building the shipped source, so a remote needs no cargo.
+PREBUILT_ENV = "VIBESIM_REQ_FRONTEND_BIN"
+_PREBUILT = os.environ.get(PREBUILT_ENV, "").strip()
+_BIN_DIR = Path(_PREBUILT) if _PREBUILT else REQ_FRONTEND_ROOT / "target" / "release"
+SESSION_RUNNER = _BIN_DIR / "session_runner"
 # Draws or materializes a canonical trace (`tracegen describe` lists its knobs).
-TRACEGEN = REQ_FRONTEND_ROOT / "target" / "release" / "tracegen"
+TRACEGEN = _BIN_DIR / "tracegen"
 
 
 @dataclass(frozen=True)
@@ -35,6 +42,10 @@ def _repo_path(value: str) -> Path:
 
 def build_session_runner() -> Path:
     """Build req-frontend before starting vLLM so compilation is outside nsys."""
+    if _PREBUILT:
+        if not os.access(SESSION_RUNNER, os.X_OK):
+            raise FileNotFoundError(f"{PREBUILT_ENV}={_PREBUILT} has no session_runner")
+        return SESSION_RUNNER
     subprocess.run(
         [
             "cargo",

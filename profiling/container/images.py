@@ -145,7 +145,9 @@ IMAGES = {
             "vllm",
             "profiling/container/vllm.Dockerfile",
             ("vllm_env",),
-            submodules=("alignment/profiler/vllm",),
+            # The capture side: the req-frontend load generator, prebuilt.
+            inputs=("profiling/container/vllm.Dockerfile.dockerignore",),
+            submodules=("alignment/profiler/vllm", "alignment/load_generator/req-frontend"),
             build_args=_vllm_args,
         ),
         Image(
