@@ -129,7 +129,7 @@ def test_the_container_mounts_paths_where_they_are_and_takes_slurms_gpus(tmp_pat
     assert argv[argv.index("--gpus") + 1] == '"device=1,3"'
     volumes = [argv[i + 1] for i, a in enumerate(argv) if a == "--volume"]
     assert volumes == [f"{tmp_path}/w:{tmp_path}/w", f"{tmp_path}/scratch:{tmp_path}/scratch",
-                       "/data/hf:/data/hf"]
+                       "/data/hf:/data/hf", f"{tmp_path}/w/cache:/cache"]
     assert argv[argv.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
     assert argv[argv.index("--entrypoint") + 1] == "/opt/v/.venv/bin/python"
     assert argv[-5:] == ["img:t", "-m", "launcher.remote.node", "run-job", str(jobdir)]

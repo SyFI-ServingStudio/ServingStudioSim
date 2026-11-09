@@ -94,6 +94,9 @@ def container_script(container: Container, *, job_id: str, jobdir: PurePosixPath
     volumes = []
     for path in dict.fromkeys((container.workdir, container.node_local, *container.mounts)):
         volumes += ["--volume", f"{path}:{path}"]
+    # The profiler images point their JIT caches (Triton, torch extensions) at
+    # /cache, as the container workers mount it; keep them across jobs.
+    volumes += ["--volume", f"{container.workdir / 'cache'}:/cache"]
     configured = ",".join(container.gpus)
     home = container.workdir / "cache" / "home"
     run = [
@@ -123,7 +126,7 @@ def container_script(container: Container, *, job_id: str, jobdir: PurePosixPath
             'if [ -z "$gpus" ]; then echo "[remote] no GPUs for this job: set gpus in remote.yaml '
             'or ask Slurm for them" >> ' + f"{q(jobdir / 'stdout.log')}; "
             f"echo 2 > {q(jobdir / 'exit_code')}; exit 2; fi",
-            f"mkdir -p {q(home)}",
+            f"mkdir -p {q(home)} {q(container.workdir / 'cache')}",
             f"echo \"[remote] container {name} on GPU(s) $gpus ({container.image})\" >> {q(jobdir / 'stdout.log')}",
             f"stop() {{ docker kill --signal TERM {name} >/dev/null 2>&1; }}",
             "trap stop TERM INT HUP",

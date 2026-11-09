@@ -10,10 +10,12 @@ present.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -215,6 +217,19 @@ def _install_missing(
             )
 
 
+def _lock_path(venv_root: Path) -> Path:
+    """The preparation lock: beside the venv, or in TMPDIR when it is read-only.
+
+    A profiler image's venv belongs to root while its container runs as the
+    caller's user; nothing can be installed there, so only the version and file
+    checks run, and the lock moves to a per-venv name under TMPDIR.
+    """
+    if os.access(venv_root, os.W_OK):
+        return venv_root / ".vibesim-python-runtime.lock"
+    digest = hashlib.sha256(str(venv_root.resolve()).encode()).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"vibesim-python-runtime-{digest}.lock"
+
+
 def prepare_python_runtime(
     fork_python: str, config: PythonRuntimeConfig | None
 ) -> dict[str, Any] | None:
@@ -229,7 +244,7 @@ def prepare_python_runtime(
         return None
 
     venv_root = Path(fork_python).parent.parent
-    lock_path = venv_root / ".vibesim-python-runtime.lock"
+    lock_path = _lock_path(venv_root)
     with lock_path.open("a+") as lock_file:
         _acquire_lock(lock_file, lock_path, config.lock_timeout_seconds)
         state = _inspect(fork_python, config.packages)

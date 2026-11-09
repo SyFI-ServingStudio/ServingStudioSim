@@ -156,3 +156,17 @@ def test_profiler_and_counters_start_only_at_frontend_measurement_boundary(tmp_p
     assert result["spec_decode_metrics_after"] == ["warmup_drained", True, "measured_requests"]
     assert result["replay_end_monotonic_ns"] >= result["replay_start_monotonic_ns"]
     assert result["measurement_log_offset"] == 0
+
+
+def test_a_read_only_venv_takes_its_runtime_lock_in_tmpdir(tmp_path, monkeypatch):
+    import os
+
+    from alignment.profiler import runtime_artifacts
+
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    assert runtime_artifacts._lock_path(venv) == venv / ".vibesim-python-runtime.lock"
+    monkeypatch.setattr(os, "access", lambda path, mode: False)
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path / "tmp"))
+    locked = runtime_artifacts._lock_path(venv)
+    assert locked.parent == tmp_path / "tmp" and locked.name.startswith("vibesim-python-runtime-")
