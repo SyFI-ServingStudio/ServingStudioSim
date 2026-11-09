@@ -10,11 +10,13 @@ use crate::timing::bridge::{
     PerfApiError, ProfilerVersion,
 };
 
-/// One kernel's profile-coverage line for the `dry-run` report: how many of its
-/// enumerated specs are missing from `profile.db` (i.e. would be JIT-profiled on a
-/// real build). `name` is the kernel's dotted path; counts are summed over its
-/// backends. Shared profile identities count only at their first role in a
-/// dry-run report, matching the number of rows JIT would need to measure.
+/// One kernel's profile-coverage line for a dry-run report (the `dry-run` and
+/// `timing-predict --dry-run` probes, and the collect walk of
+/// [`fill_missing_profiles`]): how many of its enumerated specs are missing from
+/// `profile.db`, i.e. would be collected and measured before a real build.
+/// `name` is the kernel's dotted path; counts are summed over its backends.
+/// Shared profile identities count only at their first role in a dry-run
+/// report, matching the number of rows the collect fill would need to measure.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct KernelMissing {
     pub name: String,
@@ -142,7 +144,7 @@ pub fn print_dry_run(report: &[KernelMissing]) {
     let missing: usize = report.iter().map(|k| k.missing).sum();
     let total: usize = report.iter().map(|k| k.total).sum();
     println!(
-        "total: {missing} / {total} specs missing across {} kernels to JIT",
+        "total: {missing} / {total} specs missing across {} kernels, to collect and measure",
         report.len()
     );
 }
