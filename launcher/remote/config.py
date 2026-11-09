@@ -50,6 +50,13 @@ class Slurm:
     extra: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class GpuWait:
+    min_free_mib: int
+    quiet_s: int = 60
+    timeout_s: int = 3600
+
+
 #: `docker`: the job runs on venvs built on the remote, profiling workers in
 #: images. `in-image`: the remote is itself a profiler image (a pod).
 #: `full-remote-profile`: each job is one container of a profiler image on the
@@ -81,6 +88,10 @@ class Remote:
     # GPUs a direct job runs on (Slurm assigns them itself).
     mounts: tuple[PurePosixPath, ...] = ()
     gpus: tuple[str, ...] = ()
+    # Before a job's container starts, wait until each of its GPUs has this much
+    # free memory for `quiet_s` seconds (a host whose users also run outside
+    # the scheduler). None: start at once.
+    gpu_wait: GpuWait | None = None
     # The remote may lose its disk (a container pod): copy results back whole.
     ephemeral: bool = False
     # Directory of remote.yaml; `.remote/known_hosts` beside it pins host keys.
@@ -164,6 +175,7 @@ def _parse(name: str, raw: dict[str, Any], config_dir: Path) -> Remote:
             "ephemeral",
             "mounts",
             "gpus",
+            "gpu_wait",
         },
         "",
     )
@@ -196,8 +208,11 @@ def _parse(name: str, raw: dict[str, Any], config_dir: Path) -> Remote:
         isinstance(gpu, (int, str)) and not isinstance(gpu, bool) for gpu in gpus
     ):
         raise RemoteConfigError("gpus must be a GPU index or UUID, or a list of them")
-    if (mounts or gpus) and profile_runtime != FULL_REMOTE_PROFILE:
-        raise RemoteConfigError(f"mounts and gpus apply only to profile_runtime: {FULL_REMOTE_PROFILE}")
+    gpu_wait = _parse_gpu_wait(raw.get("gpu_wait"))
+    if (mounts or gpus or gpu_wait) and profile_runtime != FULL_REMOTE_PROFILE:
+        raise RemoteConfigError(
+            f"mounts, gpus and gpu_wait apply only to profile_runtime: {FULL_REMOTE_PROFILE}"
+        )
     ephemeral = raw.get("ephemeral", False)
     if not isinstance(ephemeral, bool):
         raise RemoteConfigError(f"ephemeral must be true or false, got {ephemeral!r}")
@@ -213,6 +228,7 @@ def _parse(name: str, raw: dict[str, Any], config_dir: Path) -> Remote:
         profile_runtime=profile_runtime,
         mounts=tuple(_absolute(mount, "mounts[]") for mount in mounts),
         gpus=tuple(str(gpu) for gpu in gpus),
+        gpu_wait=gpu_wait,
         ephemeral=ephemeral,
         config_dir=config_dir,
     )
@@ -277,6 +293,25 @@ def _parse_launch(raw: Any) -> Slurm | None:
         gpus=gpus,
         extra=tuple(extra),
     )
+
+
+def _parse_gpu_wait(raw: Any) -> GpuWait | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise RemoteConfigError("gpu_wait must be a mapping with min_free_mib")
+    _reject_unknown(raw, {"min_free_mib", "quiet_s", "timeout_s"}, "gpu_wait.")
+    values = {}
+    for key in ("min_free_mib", "quiet_s", "timeout_s"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise RemoteConfigError(f"gpu_wait.{key} must be a non-negative integer, got {value!r}")
+        values[key] = value
+    if "min_free_mib" not in values:
+        raise RemoteConfigError("gpu_wait.min_free_mib is required")
+    return GpuWait(**values)
 
 
 def _absolute(raw: Any, key: str) -> PurePosixPath:

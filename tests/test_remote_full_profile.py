@@ -276,3 +276,54 @@ def test_a_campaigns_analysis_phase_is_refused_remotely(tmp_path):
             session,
             ["run", "--pack", pack.name, "--out-root", "logs/x", "--phase", "timing_predict"],
         )
+
+
+def _fake_nvidia_smi(tmp_path: Path, free_mib: list[int]) -> None:
+    """`nvidia-smi` printing the next free-memory reading on each call (the last repeats)."""
+
+    state = tmp_path / "smi.state"
+    state.write_text("0")
+    smi = tmp_path / "bin" / "nvidia-smi"
+    smi.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"readings = {free_mib!r}\n"
+        f"state = {str(state)!r}\n"
+        "i = int(open(state).read())\n"
+        "if '--query-compute-apps=pid,used_memory' in sys.argv:\n"
+        "    print('4242, 30000 MiB'); sys.exit(0)\n"
+        "print(readings[min(i, len(readings) - 1)])\n"
+        "open(state, 'w').write(str(i + 1))\n"
+    )
+    smi.chmod(0o755)
+
+
+def test_a_job_waits_for_free_gpu_memory_before_its_container_starts(tmp_path, monkeypatch):
+    from launcher.remote.config import GpuWait
+
+    env = _fake_docker(
+        tmp_path,
+        "if sys.argv[1] == 'run':\n"
+        "    open(os.path.join(sys.argv[-1], 'exit_code'), 'w').write('0\\n')\n",
+    )
+    _fake_nvidia_smi(tmp_path, [1000, 70000])
+    container = _container(tmp_path, gpus=("2",), gpu_wait=GpuWait(60000, quiet_s=0, timeout_s=60))
+    jobdir, script = _script(tmp_path, container)
+    clean = {k: v for k, v in env.items() if not k.startswith("SLURM_")}
+    assert subprocess.run(["bash", str(script)], env=clean, timeout=60).returncode == 0
+    log = (jobdir / "stdout.log").read_text()
+    assert "waiting for 60000 MiB free on GPU(s) 2" in log
+    assert len(_calls(tmp_path)) == 1  # the container ran once the memory was free
+
+
+def test_a_job_whose_gpu_stays_busy_gives_up_with_a_reason(tmp_path):
+    from launcher.remote.config import GpuWait
+
+    env = _fake_docker(tmp_path, "")
+    _fake_nvidia_smi(tmp_path, [1000])
+    container = _container(tmp_path, gpus=("2",), gpu_wait=GpuWait(60000, quiet_s=0, timeout_s=0))
+    jobdir, script = _script(tmp_path, container)
+    clean = {k: v for k, v in env.items() if not k.startswith("SLURM_")}
+    assert subprocess.run(["bash", str(script)], env=clean, timeout=60).returncode == 75
+    assert "never had 60000 MiB free" in (jobdir / "stdout.log").read_text()
+    assert not (tmp_path / "docker.calls").exists()

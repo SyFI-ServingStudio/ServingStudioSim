@@ -510,6 +510,7 @@ class Session:
             node_local=self.remote.node_local,
             mounts=self.remote.mounts,
             gpus=self.remote.gpus,
+            gpu_wait=self.remote.gpu_wait,
         )
         return image_id
 

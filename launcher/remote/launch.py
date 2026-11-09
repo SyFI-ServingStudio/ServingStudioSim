@@ -25,7 +25,7 @@ import shlex
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from .config import Remote, Slurm
+from .config import GpuWait, Remote, Slurm
 from .transport import Transport, q
 
 # Larger chunks are left for the next poll.
@@ -70,6 +70,7 @@ class Container:
     mounts: tuple[PurePosixPath, ...] = ()
     # The GPUs of a direct job; a Slurm job takes those it was allocated.
     gpus: tuple[str, ...] = ()
+    gpu_wait: GpuWait | None = None
 
 
 # Quoted twice: docker reads the value as CSV, so a GPU list needs its own quotes.
@@ -78,6 +79,44 @@ GPU_REQUEST = '"\\"device=$gpus\\""'
 
 def container_name(job_id: str) -> str:
     return f"vibesim-{job_id}"
+
+
+# Exit status of a job whose GPUs never had the memory it waits for.
+GPU_WAIT_TIMEOUT = 75
+
+
+def _gpu_wait_lines(wait: GpuWait | None, jobdir: PurePosixPath) -> list[str]:
+    """Shell that waits until every assigned GPU has ``min_free_mib`` free for ``quiet_s``.
+
+    Other users' processes need not go through the scheduler, so an allocated
+    GPU may still be busy; the job reports who holds it while it waits.
+    """
+
+    if wait is None:
+        return []
+    log = q(jobdir / "stdout.log")
+    return [
+        f"need={wait.min_free_mib}; quiet=0; waited=0; last=0",
+        "while :; do",
+        # A Slurm job's nvidia-smi sees only its own GPUs (renumbered from 0).
+        '  if [ -n "${SLURM_JOB_ID:-}" ]; then free=$(nvidia-smi --query-gpu=memory.free '
+        "--format=csv,noheader,nounits); else free=$(for g in ${gpus//,/ }; do nvidia-smi "
+        '-i "$g" --query-gpu=memory.free --format=csv,noheader,nounits; done); fi',
+        "  low=$(echo \"$free\" | awk -v n=$need 'NF && $1 < n' | wc -l)",
+        '  if [ "$low" -eq 0 ]; then',
+        f'    [ "$quiet" -ge {wait.quiet_s} ] && break',
+        "    quiet=$((quiet + 5))",
+        "  else quiet=0; fi",
+        f'  if [ "$waited" -ge {wait.timeout_s} ]; then echo "[remote] GPU(s) $gpus never had '
+        f'$need MiB free for {wait.quiet_s} s within {wait.timeout_s} s" >> {log}; '
+        f"echo {GPU_WAIT_TIMEOUT} > {q(jobdir / 'exit_code')}; exit {GPU_WAIT_TIMEOUT}; fi",
+        '  if [ "$low" -ne 0 ] && [ $((waited - last)) -ge 300 -o "$waited" -eq 0 ]; then last=$waited; '
+        "echo \"[remote] waiting for $need MiB free on GPU(s) $gpus; held by: $(nvidia-smi "
+        "--query-compute-apps=pid,used_memory --format=csv,noheader | while IFS=, read -r p m; do "
+        'printf "%s(%s,%s) " "$(ps -o user= -p "$p" 2>/dev/null)" "$p" "$m"; done)\" >> ' + f"{log}; fi",
+        "  sleep 5; waited=$((waited + 5))",
+        "done",
+    ]
 
 
 def container_script(container: Container, *, job_id: str, jobdir: PurePosixPath, cwd: PurePosixPath) -> str:
@@ -127,6 +166,7 @@ def container_script(container: Container, *, job_id: str, jobdir: PurePosixPath
             'or ask Slurm for them" >> ' + f"{q(jobdir / 'stdout.log')}; "
             f"echo 2 > {q(jobdir / 'exit_code')}; exit 2; fi",
             f"mkdir -p {q(home)} {q(container.workdir / 'cache')}",
+            *_gpu_wait_lines(container.gpu_wait, jobdir),
             f"echo \"[remote] container {name} on GPU(s) $gpus ({container.image})\" >> {q(jobdir / 'stdout.log')}",
             f"stop() {{ docker kill --signal TERM {name} >/dev/null 2>&1; }}",
             "trap stop TERM INT HUP",
