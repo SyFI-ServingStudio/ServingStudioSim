@@ -38,3 +38,15 @@ device_roles:
 
 port: 8000
 startup_timeout: 1800.0
+
+# ── A remote GPU host (launcher/README.md "Full remote profile") ─────────────
+# When the capture runs on a remote (`alignment-campaign run --phase profile_* --remote NAME`),
+# the cases are still rendered here, so this profile names the paths as the job sees them
+# on the remote, not paths on this machine:
+#   - hf_hub_root / text_corpus: directories on the remote. For profile_runtime:
+#     full-remote-profile, list them (and any symlink targets inside the checkpoint)
+#     under `mounts` in remote.yaml; on a pod (in-image), e.g. /workspace/hf/hub.
+#   - the engine and nsys inside the profiler image:
+#       fork_python: /opt/vibesim/alignment/profiler/vllm/.venv/bin/python
+#       nsys_executable: /usr/local/bin/nsys
+#   - device_roles from "0": the job sees only its own GPUs, numbered from 0.
