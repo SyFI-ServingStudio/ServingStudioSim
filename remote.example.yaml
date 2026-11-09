@@ -28,6 +28,12 @@
 #                    image (profiling/container/images.py), sent from here when the
 #                    remote lacks it. `in-image`: the remote is itself a profiling image
 #                    (a pod); it runs kernel-profile only, for the envs that image serves.
+#                    `full-remote-profile`: every job is one container of a profiler image on
+#                    the remote, which needs only docker with GPU support (no uv, no cargo);
+#                    runs kernel-profile and campaign captures, nothing else.
+#   mounts           full-remote-profile: host dirs mounted into the container at the same
+#                    path (a Hugging Face cache, a text corpus).
+#   gpus             full-remote-profile, direct launch: the GPU indices or UUIDs a job uses.
 #   ephemeral        true when the remote's disk may vanish (a pod): copy results back whole.
 
 remotes:
@@ -65,3 +71,12 @@ remotes:
     workdir: /workspace/vibesim-remote
     profile_runtime: in-image
     ephemeral: true
+
+  # GPU work only (nsys capture, kernel profiling) on a Slurm GPU server that
+  # has docker; simulation and analysis stay on this machine.
+  gpuonly:
+    access: {ssh: me@gpubox.example.org}
+    launch: {slurm: {time: "02:00:00", partition: main}}
+    workdir: /data/me/vibesim-remote
+    profile_runtime: full-remote-profile
+    mounts: [/data/me/hf, /data/me/corpus]

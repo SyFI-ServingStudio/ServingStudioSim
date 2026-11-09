@@ -173,6 +173,9 @@ interpreters instead. It exists for debugging a runner, not for producing rows.
 
 ### On a remote GPU host: `--remote NAME`
 
+To fill every spec a preset lacks from one list, use `operate-run-full-remote-profile`
+(`--export-missing` here, then `kernel-profile fill --remote`).
+
 `kernel-profile run|measure ... --remote NAME` runs the same call on a machine
 from the untracked `remote.yaml` (`remote.example.yaml` lists the fields). Use
 it when the user asks, or when the target GPU (`--gpu-name`) is only available

@@ -50,6 +50,10 @@ it to TP1 or collapse DP batches.
 
 ## Run the shared phases
 
+On a remote GPU host (ssh, docker, no ServingStudio setup there), the profile
+passes run with `alignment-campaign run --phase <profile pass> --remote NAME`
+and every other phase runs here: follow `operate-run-full-remote-profile`.
+
 From `ServingStudioSim/`, run each phase through the launcher (`uv run python -m launcher
 alignment {profile,timing-predict,analyze,sim}`; see README for the configs).
 Each phase is an explicit checkpoint with a disjoint artifact root; no phase

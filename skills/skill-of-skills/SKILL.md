@@ -113,6 +113,7 @@ operate-run-simulation - run deployment simulations from presets (DES, workload 
 operate-run-timing-predict - offline per-building-block cost prediction (no DES; iter=PD, attn+ffn=AFD)
 operate-use-analyzer - select, read, interpret, and cite Analyzer-owned simulation, prediction, profile, and measurement results
 operate-run-alignment - produce one shared ServingStudioSim↔framework comparison for vLLM or SGLang; Align ServingStudioSim to framework through top-align-with-framework, or Align framework to ServingStudioSim through top-compose-real-framework-from-sim
+operate-run-full-remote-profile - run the GPU half of a campaign (nsys capture, missing-kernel fill) on a remote GPU host over ssh+docker; everything else stays here
 operate-align-moe-kernel - diagnose one existing fused MoE kernel with exact-input, iteration-popularity, and full-run comparisons
 operate-gpu-spec - query or update the GPU spec catalog
 operate-manage-jit-and-autotune-caches - reuse JIT/autotune work across engine restarts and profiling worker processes instead of rebuilding it every time

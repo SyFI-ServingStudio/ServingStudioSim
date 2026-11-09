@@ -914,6 +914,33 @@ Expose `22/tcp` (RunPod's proxied ssh cannot carry rsync), pull the image from
 a registry under the same tag (`docker tag` + `docker push` from here), and
 set `ephemeral: true` so results come back whole.
 
+**Full remote profile** (`profile_runtime: full-remote-profile`). The remote
+does only the GPU work, the nsys capture of a serving run and kernel
+profiling, and needs no ServingStudio setup: ssh, rsync, and docker with GPU
+support (the user in the docker group, a driver that runs the image's CUDA).
+Everything else (labeling, timing-predict, simulation, analysis, the services)
+runs here on what comes back. Each job is one container of the profiler image
+(`remote/launch.py` `container_script`): the shipped tree, job directory,
+node-local scratch and every `mounts` entry are bind-mounted at the same
+absolute path, and `node.py` runs on the image's interpreter, as on an
+in-image pod. Nothing is built or synced there; the image is sent from here
+when the remote lacks it. Under Slurm the container gets the allocated GPUs;
+a direct remote lists its `gpus`. Such a remote refuses simulation and
+timing-predict. It runs:
+
+- `kernel-profile run|measure --remote NAME`, as above.
+- `alignment-campaign run --phase <profile pass> --remote NAME`: render the
+  cases here with a host profile that names the remote's paths, the image's
+  engine (`/opt/vibesim/alignment/profiler/vllm/.venv/bin/python`) and nsys
+  (`/usr/local/bin/nsys`), and device role `"0"` (the container sees only its
+  GPUs). The ready cases are sent, one job captures them in turn, and each
+  case's phase directory comes back whole, `.nsys-rep` included. Profile
+  results record paths relative to their directory, so a copy reads here.
+- `kernel-profile fill --work WORK.json --output-dir logs/... --remote NAME`:
+  measure the work list `python -m launcher PRESET --export-missing WORK.json`
+  wrote (the specs a cache build would measure, found without a GPU), split
+  per profiler image, one job each; the rows merge into this profile.db.
+
 **Limits.** One invocation is one blocking remote job; a managed job's
 capability token must outlive it (6 h). A job whose process or allocation
 vanishes without an exit code fails after three consecutive polls.
