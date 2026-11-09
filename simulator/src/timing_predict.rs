@@ -4,7 +4,8 @@
 //! it does NOT run the discrete-event sim (no scheduler, no trace, no clock). It
 //! takes a batch of explicit batch shapes and, for each, runs the cost model over
 //! the compiled `CostTree(s)`, predicting timings WITHOUT a GPU (a warm
-//! `profile.db`) or JIT-profiling on demand (a cold one).
+//! `profile.db`) or after measuring every missing row in one collect pass (a
+//! cold one; see [`run_timing_predict`]).
 //!
 //! Three arch kinds, one tool (the `arch` selector picks):
 //!   - `iter` — ONE [`IterwiseUnifiedModel::eval_iter`] over the whole forward
@@ -55,7 +56,9 @@ use crate::arch::contract::{
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, TooLong, WorkerId};
 use crate::deployment::BackendOverrides;
-use crate::timing::bridge::{dry_run_document, print_dry_run, write_dry_run_report};
+use crate::timing::bridge::{
+    dry_run_document, fill_missing_profiles, print_dry_run, write_dry_run_report,
+};
 use crate::timing::{CostManifestDoc, PerfApiBridge};
 use crate::worker::CostBuffers;
 
@@ -374,11 +377,12 @@ fn ensure_prefill_fits(prefix: u32, append: u32, max_model_len: u32) -> Result<(
 /// How `run_timing_predict` treats the cases once they are validated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PredictMode {
-    /// Cost every case, JIT-profiling missing rows, and write the artifacts.
+    /// Fill the `profile.db` rows the model is missing in one collect pass, then
+    /// cost every case and write the artifacts.
     Run,
     /// Build the model on the dry-run bridge and validate every case, then report
-    /// the `profile.db` specs a real run would JIT. Evaluates nothing and writes
-    /// nothing, so it needs no GPU.
+    /// the `profile.db` specs a real run would have to measure. Evaluates nothing
+    /// and writes nothing, so it needs no GPU.
     DryRun,
 }
 
@@ -389,77 +393,28 @@ pub enum PredictMode {
 ///
 /// Every case is lowered and checked against the model before the first one is
 /// costed, so a bad case fails the run before any row is written.
+///
+/// A real run builds the model twice, the same way `build-cache-only` followed
+/// by `run` does. The first build is [`fill_missing_profiles`]' collect walk:
+/// it records every missing spec, checks the cases, and then measures all the
+/// misses in one batch across the GPUs. The second build, on a strict bridge
+/// (JIT off), fits the caches and costs the cases. Both builds enumerate the
+/// same specs — a kernel's sweep grid is a pure function of its config, and
+/// the dry-run branch of `Kernel::build` walks the same grid, backends, and
+/// infeasible mask the fitting branch does — and `issue_collected` fails if any
+/// spec went unmeasured, so after a successful fill the second build finds
+/// every row. A miss there is a collect/build disagreement and fails loudly,
+/// instead of being hidden by a slow kernel-at-a-time JIT.
 pub fn run_timing_predict(
     config_path: &Path,
     mode: PredictMode,
     report_json: Option<&Path>,
 ) -> Result<()> {
     let cfg: PredictConfig = parse_config_file(config_path)?;
-    let bridge = match mode {
-        PredictMode::Run => predict_bridge()?,
-        PredictMode::DryRun => {
-            let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
-            bridge.enable_dry_run();
-            bridge
-        }
-    };
-    let run = mode == PredictMode::Run;
-
-    // Cases are loaded per arch family — each arch owns its own case type, so we do
-    // not assume a shared shape: iter/attn take the attention-shaped [`PredictCase`];
-    // ffn takes [`FfnArchInput`] itself (token counts only), which rejects the
-    // attention vocabulary the ffn cost never reads.
-    let (num_cases, gpu_count) = match &cfg.arch {
-        PredictArchSel::Iter(sel) => {
-            let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
-            let model = build_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
-                .context("building the iter-wise arch model")?;
-            let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
-            let inputs = iter_inputs(&*model, sel.max_model_len()?, cases)?;
-            let n = inputs.len();
-            if run {
-                run_iter_cases(&*model, inputs, &cfg.log_dir);
-            }
-            (n, model.gpus_per_replica())
-        }
-        PredictArchSel::SpeculativeIter(sel) => {
-            let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
-            let (model, draft_tokens) =
-                build_speculative_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
-                    .context("building the speculative iter-wise model")?;
-            let cases: Vec<SpeculativePredictCase> = load_cases(&cfg.cases_file, config_path)?;
-            let inputs =
-                speculative_iter_inputs(&*model, draft_tokens, sel.max_model_len()?, cases)?;
-            let n = inputs.len();
-            if run {
-                run_speculative_iter_cases(&*model, inputs, &cfg.log_dir);
-            }
-            (n, model.gpus_per_replica())
-        }
-        PredictArchSel::Attn(sel) => {
-            let _scope = bridge.with_backend_overrides("attn", cfg.backends.get("attn"));
-            let model = build_attn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
-            let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
-            let inputs = attn_inputs(&*model, sel.max_model_len()?, cases)?;
-            let n = inputs.len();
-            if run {
-                run_attn_cases(&*model, inputs, &cfg.log_dir);
-            }
-            (n, model.gpus_per_replica())
-        }
-        PredictArchSel::Ffn(sel) => {
-            let _scope = bridge.with_backend_overrides("ffn", cfg.backends.get("ffn"));
-            let model = build_ffn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
-            let cases: Vec<FfnArchInput> = load_cases(&cfg.cases_file, config_path)?;
-            check_ffn_cases(&*model, &cases)?;
-            let n = cases.len();
-            if run {
-                run_ffn_cases(&*model, cases, &cfg.log_dir);
-            }
-            (n, model.gpus_per_replica())
-        }
-    };
-    if !run {
+    if mode == PredictMode::DryRun {
+        let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+        bridge.enable_dry_run();
+        let (num_cases, gpu_count) = predict_cases(&cfg, config_path, &bridge, None)?;
         let report = bridge.take_dry_run_report();
         println!(
             "timing-predict dry run: {num_cases} case(s) valid, {gpu_count} GPU(s) per replica"
@@ -470,6 +425,12 @@ pub fn run_timing_predict(
         }
         return Ok(());
     }
+
+    fill_missing_profiles(|collect_bridge| {
+        predict_cases(&cfg, config_path, collect_bridge, None).map(|_| ())
+    })?;
+    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+    let (num_cases, gpu_count) = predict_cases(&cfg, config_path, &bridge, Some(&cfg.log_dir))?;
     write_prediction_provenance(&cfg.log_dir, &cfg.gpu, gpu_count)?;
     // Each `run_*_cases` dropped its `CostBuffers`, flushing and joining the writer.
     let failures = crate::log::cost_log_failures(&cfg.log_dir)?;
@@ -536,15 +497,71 @@ mod provenance_tests {
     }
 }
 
-/// Offline what-if bridge: JIT-fill missing `profile.db` rows on build (like
-/// `kernel-query`), rather than the strict fail-fast a real `run` uses. A warm
-/// cache then needs no GPU; a cold one profiles on demand.
-fn predict_bridge() -> Result<PerfApiBridge> {
-    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
-    bridge
-        .enable_jit_profiling()
-        .context("enabling JIT profiling for offline prediction")?;
-    Ok(bridge)
+/// Build the configured arch on `bridge`, load the cases, and check every one
+/// against the model. With `cost_log_dir` set, also cost each case into that
+/// log dir; without it, only build and validate — the collect walk and the dry
+/// run, whose bridge has no fitted caches to evaluate. Returns the case count
+/// and the model's GPUs per replica.
+fn predict_cases(
+    cfg: &PredictConfig,
+    config_path: &Path,
+    bridge: &PerfApiBridge,
+    cost_log_dir: Option<&Path>,
+) -> Result<(usize, u16)> {
+    // Cases are loaded per arch family — each arch owns its own case type, so we do
+    // not assume a shared shape: iter/attn take the attention-shaped [`PredictCase`];
+    // ffn takes [`FfnArchInput`] itself (token counts only), which rejects the
+    // attention vocabulary the ffn cost never reads.
+    Ok(match &cfg.arch {
+        PredictArchSel::Iter(sel) => {
+            let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
+            let model = build_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, bridge)
+                .context("building the iter-wise arch model")?;
+            let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
+            let inputs = iter_inputs(&*model, sel.max_model_len()?, cases)?;
+            let case_count = inputs.len();
+            if let Some(log_dir) = cost_log_dir {
+                run_iter_cases(&*model, inputs, log_dir);
+            }
+            (case_count, model.gpus_per_replica())
+        }
+        PredictArchSel::SpeculativeIter(sel) => {
+            let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
+            let (model, draft_tokens) =
+                build_speculative_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, bridge)
+                    .context("building the speculative iter-wise model")?;
+            let cases: Vec<SpeculativePredictCase> = load_cases(&cfg.cases_file, config_path)?;
+            let inputs =
+                speculative_iter_inputs(&*model, draft_tokens, sel.max_model_len()?, cases)?;
+            let case_count = inputs.len();
+            if let Some(log_dir) = cost_log_dir {
+                run_speculative_iter_cases(&*model, inputs, log_dir);
+            }
+            (case_count, model.gpus_per_replica())
+        }
+        PredictArchSel::Attn(sel) => {
+            let _scope = bridge.with_backend_overrides("attn", cfg.backends.get("attn"));
+            let model = build_attn_model(sel, &cfg.gpu, AFD_MODEL_NAME, bridge)?;
+            let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
+            let inputs = attn_inputs(&*model, sel.max_model_len()?, cases)?;
+            let case_count = inputs.len();
+            if let Some(log_dir) = cost_log_dir {
+                run_attn_cases(&*model, inputs, log_dir);
+            }
+            (case_count, model.gpus_per_replica())
+        }
+        PredictArchSel::Ffn(sel) => {
+            let _scope = bridge.with_backend_overrides("ffn", cfg.backends.get("ffn"));
+            let model = build_ffn_model(sel, &cfg.gpu, AFD_MODEL_NAME, bridge)?;
+            let cases: Vec<FfnArchInput> = load_cases(&cfg.cases_file, config_path)?;
+            check_ffn_cases(&*model, &cases)?;
+            let case_count = cases.len();
+            if let Some(log_dir) = cost_log_dir {
+                run_ffn_cases(&*model, cases, log_dir);
+            }
+            (case_count, model.gpus_per_replica())
+        }
+    })
 }
 
 /// Lower the iter-wise cases to the model's input, checking each against it.
