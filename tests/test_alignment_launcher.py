@@ -2538,3 +2538,8 @@ def test_warm_caches_from_the_host_is_the_images_warm_pass(tmp_path, monkeypatch
 
     assert alignment_launcher.main(["profile", str(paths["profile"]), "--warm-caches"]) == 0
     assert calls == [{"warm_caches": True}]
+    # The capture's own log_dir gets no bundle marker or config snapshot.
+    from launcher.alignment_config import load_profile_config
+
+    log_dir = Path(load_profile_config(paths["profile"]).log_dir)
+    assert not log_dir.exists() or not any(log_dir.iterdir())

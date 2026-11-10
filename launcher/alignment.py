@@ -527,15 +527,17 @@ def _run_profile(args: argparse.Namespace) -> int:
             container_config(args.config, Path(config.log_dir))
         print(f"[alignment] profile validated: {args.config} (log_dir={config.log_dir})")
         return 0
-    if not in_image():
+    if args.runtime == "image" and args.warm_caches:
+        # From the host this is `python -m reference_engines warm-caches` (the
+        # entry point, which also takes --startup-timeout): the image's
+        # warm-only pass, logged under `<log_dir>.warm-caches`, then its
+        # manifest. It writes nothing into the capture's own log_dir.
+        print(f"[alignment] warming caches in image: {args.config}")
+        return run_profile_in_image(args.config, warm_caches=True)
+    if not in_image() and not args.warm_caches:
         # In an image the host already did both, against the host paths.
         write_artifact_kind(Path(config.log_dir).parent, ArtifactKind.ALIGNMENT_BUNDLE)
         _snapshot_config(args.config, Path(config.log_dir), "profile")
-    if args.runtime == "image" and args.warm_caches:
-        # From the host this is `python -m reference_engines warm-caches`: the
-        # image's warm-only pass, then its manifest.
-        print(f"[alignment] warming caches in image: {args.config}")
-        return run_profile_in_image(args.config, warm_caches=True)
     if args.runtime == "image":
         print(f"[alignment] profiling in image: {args.config}")
         returncode = run_profile_in_image(args.config, allow_autotune=args.allow_autotune)
