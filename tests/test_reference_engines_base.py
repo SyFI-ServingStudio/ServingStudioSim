@@ -167,8 +167,17 @@ def test_a_tree_with_unexported_commits_a_stash_or_a_paused_am_is_not_replaced(t
     exported = sorted(patches.glob("*.patch"))
     _check_replaceable(tree, force=True, patches=exported)
 
+    # A rename exported as a rename (format-patch detects it) still matches.
+    _git("mv", "a.py", "b.py", cwd=tree)
+    (tree / "b.py").write_text("patched\nrenamed\n")
+    _git(*commit, "rename", cwd=tree)
+    _git("format-patch", "-q", "--zero-commit", "-o", str(patches), "HEAD~1..HEAD", cwd=tree)
+    exported = sorted(patches.glob("*.patch"))
+    assert "rename from a.py" in exported[-1].read_text()
+    _check_replaceable(tree, force=True, patches=exported)
+
     # A commit on HEAD that export-patches has not written.
-    (tree / "a.py").write_text("new work\n")
+    (tree / "b.py").write_text("new work\n")
     _git(*commit, "not exported", cwd=tree)
     with pytest.raises(RefError, match="not exported"):
         _check_replaceable(tree, force=True, patches=exported)
@@ -177,7 +186,7 @@ def test_a_tree_with_unexported_commits_a_stash_or_a_paused_am_is_not_replaced(t
 
     # ... or on another branch.
     _git("switch", "-q", "-c", "side", cwd=tree)
-    (tree / "a.py").write_text("side work\n")
+    (tree / "b.py").write_text("side work\n")
     _git(*commit, "side work", cwd=tree)
     _git("switch", "-q", "reference/x", cwd=tree)
     with pytest.raises(RefError, match="side work"):
@@ -185,7 +194,7 @@ def test_a_tree_with_unexported_commits_a_stash_or_a_paused_am_is_not_replaced(t
     _git("branch", "-q", "-D", "side", cwd=tree)
 
     # A stash.
-    (tree / "a.py").write_text("stashed\n")
+    (tree / "b.py").write_text("stashed\n")
     _git("-c", "user.name=t", "-c", "user.email=t@t", "stash", "-q", cwd=tree)
     with pytest.raises(RefError, match="stash"):
         _check_replaceable(tree, force=True, patches=exported)

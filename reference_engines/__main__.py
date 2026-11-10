@@ -57,6 +57,12 @@ _COMMITTER = {
 }
 # The fork records its base in this file; BASE.yaml replaces it, so it is not a patch.
 _NOT_PATCHED = ("ALIGNMENT_BASE",)
+# How export-patches writes a commit, and over which paths. Each file must
+# depend on its own commit only: no "n/m" in the subject (adding a patch would
+# rewrite every file), full blob ids (the abbreviation length follows the
+# repository's size), no source commit id or git-version signature.
+_FORMAT_PATCH = ("format-patch", "--no-numbered", "--full-index", "--zero-commit", "--no-signature")
+_EXPORTED_PATHS = ("--", ".", *(f":(exclude){path}" for path in _NOT_PATCHED))
 _BASE_HEADER = {
     "vllm": (
         "vLLM reference engine: the upstream commit patches/ apply to and its official image.\n"
@@ -134,7 +140,8 @@ def _patch_id(text: str) -> str:
 
 def _unexported_commits(dest: Path, patches: list[Path]) -> list[str]:
     """Commits over the base, on HEAD or any local branch, that no file in
-    `patches` holds (compared by `git patch-id`, over the paths export writes).
+    `patches` holds: each commit is written as export-patches writes it (so a
+    rename is a rename on both sides) and compared by `git patch-id`.
 
     The base is the tree's root: materialize fetches it at depth 1, so it is
     the one commit without parents, whatever BASE.yaml says now.
@@ -147,17 +154,8 @@ def _unexported_commits(dest: Path, patches: list[Path]) -> list[str]:
     ).split()
     unexported = []
     for commit in commits:
-        diff = _git(
-            "diff-tree",
-            "-p",
-            "--full-index",
-            commit,
-            "--",
-            ".",
-            *(f":(exclude){path}" for path in _NOT_PATCHED),
-            cwd=dest,
-        )
-        patch_id = _patch_id(diff + "\n")  # empty when the commit touches only _NOT_PATCHED
+        written = _git(*_FORMAT_PATCH, "--stdout", "-1", commit, *_EXPORTED_PATHS, cwd=dest)
+        patch_id = _patch_id(written + "\n")  # empty when the commit touches only _NOT_PATCHED
         if patch_id and patch_id not in exported:
             unexported.append(commit)
     return unexported
@@ -258,22 +256,12 @@ def export_patches(engine: str, checkout: Path, ref: str) -> list[Path]:
         raise RefError(f"{ref} has merge commits over the base; rebase it to a linear series")
     with tempfile.TemporaryDirectory() as scratch:
         _git(
-            "format-patch",
+            *_FORMAT_PATCH,
             "--quiet",
-            # Each file must depend on its own commit only: no "n/m" in the
-            # subject (adding a patch would rewrite every file), full blob ids
-            # (the abbreviation length follows the repository's size), no
-            # source commit id or git-version signature.
-            "--no-numbered",
-            "--full-index",
-            "--zero-commit",
-            "--no-signature",
             "--output-directory",
             scratch,
             f"{base.upstream_commit}..{head}",
-            "--",
-            ".",
-            *(f":(exclude){path}" for path in _NOT_PATCHED),
+            *_EXPORTED_PATHS,
             cwd=checkout,
         )
         target = patches_dir(engine)
