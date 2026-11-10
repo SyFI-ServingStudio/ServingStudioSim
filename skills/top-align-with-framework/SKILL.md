@@ -49,6 +49,23 @@ unmapped measured kernel usually means the split **missed an op** outright. Both
 route back to `top-split-model-into-kernels` to re-decide that op's home — after
 you have confirmed the labeling is right, per the guilty-until-proven rule below.
 
+## Alignment Phase 1 and alignment Phase 2
+
+An **alignment** is one model checkpoint on one deployment. DeepSeek-V4.1 at
+TP4/EP4 and at DP4/EP4 are two alignments. These two terms are not
+`top-add-new-arch`'s Phase 1/2.
+
+- **alignment Phase 1**: for each alignment, capture `trace/diverse_100.csv` at
+  its recorded arrival times and run Checks 1, 2 and 3 below on it. In a pack it
+  is the case marked `phase: 1`. A model PR merges on alignment Phase 1.
+- **alignment Phase 2**: every case in the pack's matrix
+  (`presets/alignment/<pack>/campaign.yaml`), Phase 1 cases included. It covers
+  the deployment knobs and may run after the merge, by someone else.
+
+Judge both the same way. When you report a result, say which alignment phase it
+covers; an alignment Phase 1 pass says nothing about the matrix's other
+operating points.
+
 ## Step 0 — Run the alignment
 
 Route to the **Align ServingStudio Sim to framework** side of `operate-run-alignment`. It produces the artifacts every
@@ -195,8 +212,9 @@ conclusion but do not prove a throughput cause.
 ## Judging a result and choosing a fix
 
 - **Coverage first.** A result counts only for the deployment settings its
-  cases ran. If the pack covers one chunk size or one concurrency regime, report
-  the rest as unvalidated. `operate-run-alignment` lists what a pack must span.
+  cases ran. An alignment Phase 1 result covers diverse_100 only. If the pack
+  covers one chunk size or one concurrency regime, report the rest as
+  unvalidated. `operate-run-alignment` lists what a pack must span.
 - **Prefer the simplest fix.** Before proposing a new mechanism, measure its
   effect in the regime where it applies. If the effect is within
   repeat-measurement noise, do not propose it.

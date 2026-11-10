@@ -29,7 +29,7 @@ everything else is built.
 
 | Stage | Lanes | Runs in parallel with | Done when |
 |---|---|---|---|
-| 0. Start | **capture**: `operate-run-alignment` profile phase for diverse_100 (nsys, workload, and `token_corpus` for MoE), then the pack's case passes. **source map**: read the framework's model code and write which kernel each module launches. | each other | diverse_100 capture parsed; source map written |
+| 0. Start | **capture**: `operate-run-alignment` profile phase for the alignment Phase 1 diverse_100 case (`--phase1`; nsys, workload, and `token_corpus` for MoE), then the pack's alignment Phase 2 case passes if the user wants them now. **source map**: read the framework's model code and write which kernel each module launches. | each other | diverse_100 capture parsed; source map written |
 | 1. Design | you: rank kernel families by measured share, write the design (below) | capture case passes | user agreed to the design decisions |
 | 2. L1 kernels | one lane per kernel family (for example GDN, PLE, HC, MoE, QSA, glue), each running `top-add-kernel` | capture | rows in `profile.db`, cache fidelity checked, `just test-cpu` green |
 | 3. L3 worklets | one lane per mechanism, branched from the merged kernel branch, each running `impl-compose-worklet` | `model.work` label lane (`impl-add-model-work-label`) | worklet unit tests green |

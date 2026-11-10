@@ -59,9 +59,10 @@ Check every design choice, and every subagent brief, against these rules.
    and no refusal of a step the framework would run. When the framework switches
    path above a threshold (for example an unfused all-reduce past a fused
    kernel's token cap), price that path instead.
-3. **Align across deployment settings, not one template value.** The alignment
-   cases must span chunk size, concurrency, and context length;
-   `operate-run-alignment` lists what a pack must cover.
+3. **Align across deployment settings, not one template value.** The pack's
+   alignment Phase 2 cases must span chunk size, concurrency, and context
+   length; `operate-run-alignment` lists what a pack must cover. The merge
+   needs only alignment Phase 1 (`top-align-with-framework`).
 4. **Key kernel rows on model geometry and dtypes only.** A deployment setting
    (`max_num_seqs`, a CUDA-graph capture bound, `max_model_len`) enters a row key
    only with measured evidence that it changes kernel time. Otherwise every new

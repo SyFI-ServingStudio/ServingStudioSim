@@ -96,6 +96,37 @@ many cases; chaining phases would delete the explicit checkpoint between them.
 Advance the pipeline by issuing the next `--phase` yourself after inspecting the
 previous one, exactly as for a single case.
 
+**Alignment Phase 1 and alignment Phase 2** (defined in
+`top-align-with-framework`) are two selections of one pack's cases:
+
+- **alignment Phase 1**: one case per deployment, marked `phase: 1`, that
+  replays the tracked `trace/diverse_100.csv` at its recorded arrival times:
+  `workload_trace: {path: trace/diverse_100.csv}`, `profile_arrival_mode:
+  trace-timed`, `simulation_arrival_mode: trace_timed`, no `rate`. Declare
+  `attn_gpu_memory_gb: {status: from_capture}` and, for a speculative model,
+  `speculative_acceptance: {status: from_capture}`. Run every verb with
+  `--phase1`:
+
+  ```bash
+  uv run python -m launcher alignment-campaign render  --pack <pack> --host <host> --out-root <root> --phase1
+  uv run python -m launcher alignment-campaign run     --pack <pack> --out-root <root> --phase1 --phase <P>
+  uv run python -m launcher alignment-campaign label   --pack <pack> --out-root <root> --phase1
+  uv run python -m launcher alignment-campaign extract --pack <pack> --runs <root> --out <root>/metrics.json --phase1
+  uv run python -m launcher alignment-campaign compare --pack <pack> --measured <root>/metrics.json --phase1 --markdown
+  ```
+
+  Run the profile passes first. The `from_capture` values are read from the
+  case's workload pass when `--phase timing_predict` or `--phase simulation`
+  runs, and written with their source files to `<root>/<case>/calibration.json`.
+  Until the workload pass has run, those two phases print the case as blocked
+  with that reason. Do not copy the values into the pack by hand. SGLang has no
+  KV-pool extractor; `check` names this, and the case needs a measured value.
+- **alignment Phase 2**: the whole matrix. Run the same verbs without
+  `--phase1`. It must run end to end from the pack with no hand edits, so that
+  the commands alone can be handed to someone else in an issue.
+
+`--phase1` is not `--phase`: `--phase` names the pipeline phase to run.
+
 **A pack's cases must span the knobs that change step shapes.** Do not copy one
 template value across the matrix. At least run prefill-heavy and mixed cases at
 `chunk_size` 2048, 4096 and 8192 (as the GLM-5.3 DFlash2 and GLM-5.2 spec5 packs

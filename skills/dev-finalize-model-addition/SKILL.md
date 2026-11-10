@@ -15,19 +15,25 @@ go-ahead.
 
 ## 1. Check the alignment results
 
-Two kinds of evidence must exist and be reasonable:
+The PR merges on **alignment Phase 1** only. Both alignment phases are defined in
+`top-align-with-framework`; an alignment is one checkpoint on one deployment.
 
-- **diverse_100.** Run the `trace/diverse_100.csv` capture through Check 1 (kernel) and Check 3 (E2E from
-  the `workload_metrics` pass), per `top-align-with-framework`.
-- **Campaign cases.** Take these from the model's pack under `presets/alignment/<pack>/` (the 15 standard
-  operating points). Run at least one high-concurrency case, one prefill-heavy case, one decode-only case,
-  and one long-context case, and cover `chunk_size` 2048, 4096 and 8192 (see `operate-run-alignment`).
-  Run more if the GPU budget allows. Produce the table with
-  `alignment-campaign compare --measured --markdown`.
+- **alignment Phase 1 (required).** For every deployment the PR adds, the model's pack under
+  `presets/alignment/<pack>/` has one `phase: 1` case replaying `trace/diverse_100.csv`. Run it through
+  Check 1 (kernel), Check 2 (duty cycle) and Check 3 (E2E), per `top-align-with-framework`, with the
+  `--phase1` commands in `operate-run-alignment`. Produce the table with
+  `alignment-campaign compare --pack <pack> --measured <metrics.json> --phase1 --markdown`.
+- **alignment Phase 2 (not required to merge).** The rest of the pack's matrix. The pack must already
+  declare it, and `alignment-campaign check --pack <pack>` must pass. Run it now only if the user asks.
+  Otherwise, once the PR is open, ask the user before filing an issue for it. The issue names the pack, the
+  checkpoint snapshot and the host profile keys, and gives the commands to run: the `operate-run-alignment`
+  verbs without `--phase1`, then `compare --pack <pack> --markdown`. The pack must run end to end from
+  those commands with no hand edits.
 
 "Reasonable" means one of two things. The case is within the tolerances in the pack's `acceptance.yaml`,
 or its miss has a stated, checked cause. Either way, mapping coverage must meet the `map_coverage_pct` floor
-(97% in current packs) and no large measured kernel may be unmapped. Write the result table and each miss's cause in `logs/<experiment>/summary.md`.
+(97% in current packs) and no large measured kernel may be unmapped. Write the result table and each miss's
+cause in `logs/<experiment>/summary.md`.
 
 When a miss has no cause yet, return to `top-align-with-framework`. Any change to the cost model, a
 calibration constant, or the acceptance bounds needs the user's approval. Do not tune a number to close a
@@ -109,18 +115,19 @@ Write `doc/pr/<feature>/PR.md` and `doc/pr/<feature>/README.md`. Follow `doc/pr/
   kernels, Check 1, the simulation, changes that reach other models, modeling choices, known gaps, and how
   to reproduce the results.
 - `PR.md`'s Test Result carries the performance numbers from step 1 as tables, not as ranges:
-  - for each deployment, the diverse_100 Check 1 table (signed median per phase, coverage, multiplier) and
-    the E2E table (TTFT, TPOT, E2E, throughput);
-  - the campaign table with one row per case run: kernel abs and signed error, coverage, E2E, output tps,
-    TPOT, and TTFT.
+  - for each deployment, the alignment Phase 1 (diverse_100) Check 1 table (signed median per phase,
+    coverage, multiplier) and the E2E table (TTFT, TPOT, E2E, throughput);
+  - if alignment Phase 2 cases were run, their table with one row per case: kernel abs and signed error,
+    coverage, E2E, output tps, TPOT, and TTFT. Otherwise, say that alignment Phase 2 is not yet run and
+    link the issue once it exists.
 
-  Paste the campaign table from the generated `alignment-campaign compare --markdown` output, and commit
-  that output as `doc/pr/<feature>/alignment_matrix.md` beside the metrics JSON. Name each table's source
+  Paste each table from the generated `alignment-campaign compare --markdown` output, and commit that
+  output as `doc/pr/<feature>/alignment_matrix.md` beside the metrics JSON. Name each table's source
   file and never retype a number.
 - List every out-of-tolerance item with its cause, and every change that alters other models' predictions.
 
-Stop: show the user the draft. Before showing it, check that every case in the pack's run appears as a row
-in `PR.md`.
+Stop: show the user the draft. Before showing it, check that every case that was run appears as a row in
+`PR.md`.
 
 ## 7. Create the review worktree
 
