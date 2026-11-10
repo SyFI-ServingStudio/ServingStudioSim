@@ -266,12 +266,19 @@ def server_gpu_count(engine: str, tp_size: int, dp_size: int, extra_args: list[s
     """GPUs a server runs on: ``dp_size`` replicas of ``replica_ranks`` each.
 
     ``dp_size`` counts replicas in both engines; SGLang's attention DP
-    (``--attn-dp-size``) splits the TP group and adds no GPUs. Expert
-    parallelism spans one PP stage, so it divides ``tp_size * dp_size``, not
-    this.
+    (``--attn-dp-size``) splits the TP group and adds no GPUs.
     """
 
     return dp_size * replica_ranks(engine, tp_size, extra_args)
+
+
+def expert_parallel_world(engine: str, tp_size: int, dp_size: int, extra_args: list[str]) -> int:
+    """Ranks of one PP stage, the most an expert-parallel group can span:
+    ``server_gpu_count`` over the PP degree (vLLM's EP group is
+    dp * pcp * tp, ``parallel_state``; SGLang's lies inside dp * tp)."""
+
+    pipeline = _degree(engine, extra_args, "pipeline-parallel")
+    return server_gpu_count(engine, tp_size, dp_size, extra_args) // pipeline
 
 
 @dataclass
@@ -330,6 +337,14 @@ class ProfileConfig:
         return replica_ranks(self.engine, self.server.tp_size, self.server.extra_args)
 
     @property
+    def expert_parallel_world(self) -> int:
+        """Ranks one expert-parallel group can span (``expert_parallel_world``)."""
+
+        return expert_parallel_world(
+            self.engine, self.server.tp_size, self.server.dp_size, self.server.extra_args
+        )
+
+    @property
     def gpu_count(self) -> int:
         """GPUs the server runs on (``server_gpu_count``)."""
 
@@ -363,5 +378,5 @@ class ProfileConfig:
             and self.engine == "vllm"
             and "--enable-expert-parallel" in extra_args
             and "--no-enable-eplb" not in extra_args
-            and self.server.tp_size * self.server.dp_size > 1
+            and self.expert_parallel_world > 1
         )

@@ -276,6 +276,24 @@ def test_the_gpu_count_is_tp_dp_and_pp(tmp_path, engine, server, gpus):
         )
 
 
+def test_an_expert_group_spans_one_pipeline_stage_including_prefill_cp(tmp_path):
+    # vLLM's EP group is dp * pcp * tp: tp2 pcp2 holds an EP group of 4 ...
+    path = _with_server(
+        _config(tmp_path), "vllm", "0,1,2,3",
+        tp_size=2, expert_parallel_size=4, expert_count_reduction_group_size=4,
+        extra_args=["-pcp", "2"],
+    )
+    assert load_profile_config(path, require_python_runtime=False).expert_parallel_world == 4
+    # ... while PP stages do not share one: tp2 pp2 does not.
+    path = _with_server(
+        _config(tmp_path / "pp"), "vllm", "0,1,2,3",
+        tp_size=2, expert_parallel_size=4, expert_count_reduction_group_size=4,
+        extra_args=["-pp", "2"],
+    )
+    with pytest.raises(ValueError, match="one pipeline stage"):
+        load_profile_config(path, require_python_runtime=False)
+
+
 def test_sglangs_deprecated_dp_attention_spelling_is_refused_with_the_new_one(tmp_path):
     path = _with_server(
         _config(tmp_path), "sglang", "0,1,2,3",

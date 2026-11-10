@@ -655,7 +655,7 @@ def _check_cross_phase(pack: Pack, case: Case, documents: dict[str, Any]) -> lis
             findings.append(
                 Finding("error", f"{where}.{profile_pass.name}",
                         f"device role {case.device_role!r} yields {len(devices)} devices "
-                        f"but tp*dp*pp is {world}")
+                        f"but dp*tp*pp*pcp is {world}")
             )
     return findings
 
