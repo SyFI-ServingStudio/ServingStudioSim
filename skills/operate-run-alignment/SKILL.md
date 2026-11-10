@@ -103,9 +103,11 @@ previous one, exactly as for a single case.
   replays the tracked `trace/diverse_100.csv` at its recorded arrival times:
   `workload_trace: {path: trace/diverse_100.csv}`, `profile_arrival_mode:
   trace-timed`, `simulation_arrival_mode: trace_timed`, no `rate`. Declare
-  `attn_gpu_memory_gb: {status: from_capture}` and, for a speculative model,
-  `speculative_acceptance: {status: from_capture}`. Run every verb with
-  `--phase1`:
+  `attn_gpu_memory_gb: {status: from_capture}`. For a speculative model also
+  declare both `speculative_acceptance: {status: from_capture}` and
+  `speculative_acceptance_by_output_position: {status: from_capture}`; the
+  case-wide chain alone gives every request the same acceptance (see "Preserve
+  speculative acceptance structure"). Run every verb with `--phase1`:
 
   ```bash
   uv run python -m launcher alignment-campaign render  --pack <pack> --host <host> --out-root <root> --phase1
@@ -664,7 +666,8 @@ next to the predictive result, never instead of it. The predictive fix is the
 pack's `speculative_acceptance_by_output_position`: pooled per-position buckets
 from the workload pass, which render folds into one chain per request from its
 `output_len`. It took case 07's TPOT from -26% to -11% and case 08's from -24%
-to -6%.
+to -6%. Declare it `{status: from_capture}` to have it read from the case's own
+workload pass instead of copied into the pack.
 
 ## Match the engine's KV admission
 

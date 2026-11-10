@@ -15,6 +15,7 @@ import io
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -27,6 +28,7 @@ from launcher.alignment_campaign.pack import PackError, load_pack
 from launcher.alignment_campaign.render import (
     SIMULATION_PHASE,
     TIMING_PREDICT_PHASE,
+    acceptance_chain,
     case_documents,
     render_case,
     simulation_document,
@@ -62,10 +64,32 @@ SERVER_LOG = "".join(
 EXPECTED_KV_GB = 86.178519
 
 
+def _progress(position: int, accepted: int) -> dict:
+    return {"output_tokens_before": position, "accepted_draft_tokens": accepted}
+
+
+#: Verify rounds by output position, one metrics JSONL line per engine step:
+#: 60 rounds near the start accept 1 draft, 10 at position 40 accept none (too
+#: few for their own bucket, so they join the first), 60 past 128 accept all 5,
+#: one of which reports 7 and counts as 5.
+METRICS_LINES = (
+    [{"decode_request_progress": [_progress(5, 1)] * 6} for _ in range(10)]
+    + [{"decode_request_progress": [_progress(40, 0)] * 10}]
+    + [{"decode_request_progress": [_progress(200, 5)] * 59 + [_progress(300, 7)]}]
+    + [{"decode_request_progress": [{"output_tokens_before": None, "accepted_draft_tokens": 1}]}]
+)
+EXPECTED_BUCKETS = [
+    {"from": 1, "p": [10 / 70, 60 / 70, 0.0, 0.0, 0.0, 0.0]},
+    {"from": 128, "p": [0.0, 0.0, 0.0, 0.0, 0.0, 1.0]},
+]
+
+
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
 
-def _phase1_pack(tmp_path: Path, *, engine: str = "vllm", acceptance: bool = True):
+def _phase1_pack(
+    tmp_path: Path, *, engine: str = "vllm", acceptance: bool = True, by_position: bool = True
+):
     """The base pack plus one Phase 1 diverse_100 case on a depth-5 variant."""
     root = tmp_path / "pack"
     shutil.copytree(BASE_PACK, root)
@@ -99,6 +123,8 @@ def _phase1_pack(tmp_path: Path, *, engine: str = "vllm", acceptance: bool = Tru
     }
     if acceptance:
         case["speculative_acceptance"] = {"status": "from_capture"}
+        if by_position:
+            case["speculative_acceptance_by_output_position"] = {"status": "from_capture"}
     document["cases"].append(case)
     (root / "campaign.yaml").write_text(yaml.safe_dump(document, sort_keys=False))
     pack = load_pack(root)
@@ -113,12 +139,16 @@ def _write_workload_pass(case_dir: Path, *, log: str = SERVER_LOG, engine: str =
     recorded = "/elsewhere/campaign/90_diverse_100/profile_workload"
     (directory / "spec_decode_metrics.json").write_text(json.dumps(SPEC_METRICS))
     (directory / engine / "p1_server.log").write_text(log)
+    (directory / engine / "p1_metrics.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in METRICS_LINES)
+    )
     (directory / "profile_result.json").write_text(json.dumps({
         "engine": engine,
         "profile_kind": "workload_metrics",
         "log_dir": recorded,
         "server_log": f"{recorded}/{engine}/p1_server.log",
         "spec_decode_metrics_json": f"{recorded}/spec_decode_metrics.json",
+        "metrics_jsonl": f"{recorded}/{engine}/p1_metrics.jsonl",
     }))
 
 
@@ -253,6 +283,23 @@ def test_acceptance_chain_rejects_missing_counters(metrics):
         calibration.acceptance_chain(metrics)
 
 
+def test_buckets_from_metrics_bins_by_output_position(tmp_path):
+    path = tmp_path / "metrics.jsonl"
+    path.write_text("".join(json.dumps(line) + "\n" for line in METRICS_LINES))
+    buckets = calibration.buckets_from_metrics(path, 5)
+    assert [{"from": lo, "p": p} for lo, _hi, p in buckets] == EXPECTED_BUCKETS
+    assert [hi for _lo, hi, _p in buckets] == [128, None]
+
+
+def test_by_position_from_capture_needs_the_chain(tmp_path):
+    pack = _phase1_pack(tmp_path)
+    document = yaml.safe_load((pack.root / "campaign.yaml").read_text())
+    del document["cases"][-1]["speculative_acceptance"]
+    (pack.root / "campaign.yaml").write_text(yaml.safe_dump(document, sort_keys=False))
+    with pytest.raises(PackError, match="refines speculative_acceptance"):
+        load_pack(pack.root)
+
+
 def test_vllm_kv_pool_is_the_smallest_ranks_extended_pool():
     pool = calibration.vllm_kv_pool(SERVER_LOG)
     assert (pool.gib, pool.blocks, pool.gb) == (80.26, 566723, EXPECTED_KV_GB)
@@ -334,7 +381,18 @@ def test_run_reads_the_capture_and_writes_calibration_json(tmp_path, monkeypatch
     rows = list(csv.DictReader(io.StringIO((case_dir / "trace_speculative.csv").read_text())))
     replay = list(csv.DictReader(DIVERSE.open()))
     assert [{k: v for k, v in row.items() if k != "accept_rate"} for row in rows] == replay
-    assert all(json.loads(row["accept_rate"]) == accept["value"] for row in rows)
+    by_position = document["fields"]["speculative_acceptance_by_output_position"]
+    assert by_position["value"] == EXPECTED_BUCKETS
+    assert by_position["source"] == "profile_workload/vllm/p1_metrics.jsonl"
+    assert by_position["tokens_per_round"] == {"1": round(130 / 70, 6), "128": 6.0}
+    # Each request's chain folds the buckets its own output length crosses.
+    folded = SimpleNamespace(
+        speculative_acceptance=SimpleNamespace(value=accept["value"]),
+        speculative_acceptance_by_output_position=SimpleNamespace(value=EXPECTED_BUCKETS),
+    )
+    for row in rows:
+        assert json.loads(row["accept_rate"]) == acceptance_chain(folded, int(row["output_len"]))
+    assert len({row["accept_rate"] for row in rows}) > 1
 
     # Re-rendering now resolves in place, and the measured value is what it uses.
     rendered = _render(pack, case, out_root)
@@ -413,7 +471,9 @@ def test_calibration_reaches_extract_compare_and_record(tmp_path):
     assert compare_module._missing_capture_calibration(extraction, pack) == []
     bare = {"cases": {key: {"available": True, "metrics": {}, "provenance": {}}}}
     assert compare_module._missing_capture_calibration(bare, pack) == [
-        f"{key}.attn_gpu_memory_gb", f"{key}.speculative_acceptance"
+        f"{key}.attn_gpu_memory_gb",
+        f"{key}.speculative_acceptance",
+        f"{key}.speculative_acceptance_by_output_position",
     ]
 
     sidecar = compare_module._write_provenance(tmp_path / "golden.json", extraction, pack, [])

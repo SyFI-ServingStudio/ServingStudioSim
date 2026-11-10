@@ -73,7 +73,11 @@ CALIBRATION_STATUSES = frozenset({"measured", "provisional", "from_capture"})
 #: records it with its source in `<case_dir>/calibration.json`. Only fields
 #: with an extractor may say so.
 FROM_CAPTURE = "from_capture"
-CAPTURE_FIELDS = ("attn_gpu_memory_gb", "speculative_acceptance")
+CAPTURE_FIELDS = (
+    "attn_gpu_memory_gb",
+    "speculative_acceptance",
+    "speculative_acceptance_by_output_position",
+)
 KV_POOL_RULE = (
     "the workload pass's server log: the smallest rank's vLLM `Extended KV cache to N blocks "
     "(X GiB)`, else `Available KV cache memory: X GiB`; X * 2**30 / 1e9 GB"
@@ -81,6 +85,11 @@ KV_POOL_RULE = (
 ACCEPTANCE_RULE = (
     "the workload pass's spec_decode_metrics.json: accepted_tokens_per_position[0] / "
     "num_drafts, then accepted[k] / accepted[k-1]"
+)
+BY_POSITION_RULE = (
+    "the workload pass's metrics_jsonl decode_request_progress: per bucket of "
+    "output_tokens_before, the distribution of accepted drafts 0..K per verify round "
+    "(calibration.buckets_from_metrics)"
 )
 
 #: `phase` values a case may declare: alignment Phase 1 (the per-deployment
@@ -674,7 +683,9 @@ def _case(raw: Any, index_hint: int) -> Case:
             acceptance_raw, f"{where}.speculative_acceptance", capture_rule=ACCEPTANCE_RULE
         ),
         speculative_acceptance_by_output_position=None if by_position_raw is None else _calibrated(
-            by_position_raw, f"{where}.speculative_acceptance_by_output_position"
+            by_position_raw,
+            f"{where}.speculative_acceptance_by_output_position",
+            capture_rule=BY_POSITION_RULE,
         ),
         phase=phase,
     )
@@ -687,12 +698,13 @@ def _case(raw: Any, index_hint: int) -> Case:
             type(value) not in (int, float) or not 0 <= value <= 1 for value in probabilities
         ):
             raise PackError(f"{where}.speculative_acceptance.value must be a non-empty probability list")
-    if case.speculative_acceptance_by_output_position is not None:
-        if case.speculative_acceptance is None:
-            raise PackError(
-                f"{where}: speculative_acceptance_by_output_position refines speculative_acceptance "
-                "and needs it"
-            )
+    by_position = case.speculative_acceptance_by_output_position
+    if by_position is not None and case.speculative_acceptance is None:
+        raise PackError(
+            f"{where}: speculative_acceptance_by_output_position refines speculative_acceptance "
+            "and needs it"
+        )
+    if by_position is not None and not by_position.from_capture:
         buckets = case.speculative_acceptance_by_output_position.value
         depth = (
             # The chain arrives with the capture; render checks it against this.

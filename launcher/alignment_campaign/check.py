@@ -562,11 +562,13 @@ def capture_stand_in(pack: Pack, case: Case) -> Case:
     """
     changes = {}
     for name, value in case.capture_fields.items():
+        depth = int(pack.variant_of(case).arch.get("draft_tokens") or 1)
         if name == "attn_gpu_memory_gb":
             stand_in: object = 1.0
+        elif name == "speculative_acceptance":
+            stand_in = [0.5] * depth
         else:
-            depth = pack.variant_of(case).arch.get("draft_tokens") or 1
-            stand_in = [0.5] * int(depth)
+            stand_in = [{"from": 1, "p": [1 / (depth + 1)] * (depth + 1)}]
         changes[name] = Calibrated(value=stand_in, status="measured", derived_from="check stand-in")
     return dataclasses.replace(case, **changes) if changes else case
 

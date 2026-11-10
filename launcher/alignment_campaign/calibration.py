@@ -5,6 +5,11 @@ Two calibrated case inputs are measurements the workload pass already makes:
 - `speculative_acceptance`, the per-position conditional acceptance chain, from
   `spec_decode_metrics.json`: position 0 is `accepted_tokens_per_position["0"] /
   num_drafts`, position k is `accepted[k] / accepted[k-1]`.
+- `speculative_acceptance_by_output_position`, the per-verify-round
+  distribution of accepted drafts per bucket of output position, from the
+  workload pass's `metrics_jsonl` (`buckets_from_metrics`, the estimator the
+  Qwen3.8-Flash-Next and GLM-5.3 DFlash2 packs were built with). Render folds
+  the buckets into each request's chain (`render.acceptance_chain`).
 - `attn_gpu_memory_gb`, the per-rank KV pool, from the vLLM server log: the
   smallest rank's `Extended KV cache to N blocks (X GiB)` (the vLLM fork's
   extensible cache) or, without that line, `Available KV cache memory: X GiB`;
@@ -31,11 +36,20 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .pack import ACCEPTANCE_RULE, KV_POOL_RULE, Calibrated, Case, Pack, PackError
+from .pack import (
+    ACCEPTANCE_RULE,
+    BY_POSITION_RULE,
+    KV_POOL_RULE,
+    Calibrated,
+    Case,
+    Pack,
+    PackError,
+)
 
 CALIBRATION_NAME = "calibration.json"
 CALIBRATION_SCHEMA_VERSION = 1
@@ -71,6 +85,58 @@ def acceptance_chain(metrics: dict[str, Any]) -> list[float]:
     for previous, current in zip(counts, counts[1:]):
         chain.append(current / previous if previous else 0.0)
     return [round(value, 6) for value in chain]
+
+
+#: Lower bounds of the `output_tokens_before` buckets, and the fewest verify
+#: rounds a bucket may hold before it merges into the previous one.
+EDGES = (1, 32, 128, 512, 1024, 2048, 4096, 8192)
+MIN_ROUNDS = 50
+
+
+def buckets_from_metrics(path: Path, K: int) -> list[tuple[int, int | None, list[float]]]:
+    """Accepted-draft distribution by output position, from one metrics JSONL.
+
+    Every `decode_request_progress` row with both `output_tokens_before` and
+    `accepted_draft_tokens` is one verify round. Rounds are binned by the
+    `EDGES` bucket of `output_tokens_before` (position 0 joins the first), and
+    accepted counts above `K` count as `K`. A bucket with fewer than
+    `MIN_ROUNDS` rounds merges into the previous one; an undersized first
+    bucket merges into the second. Returns `(from, to, p)` with `p` the
+    distribution of 0..K accepted drafts; the last `to` is None.
+    """
+    counts = [Counter() for _ in EDGES]
+    for line in open(path):
+        for p in json.loads(line)["decode_request_progress"]:
+            pos, a = p.get("output_tokens_before"), p.get("accepted_draft_tokens")
+            if pos is None or a is None:
+                continue
+            b = max(i for i, lo in enumerate(EDGES) if pos >= lo) if pos >= 1 else 0
+            counts[b][min(a, K)] += 1
+    # Merge sparse buckets into the previous one; drop empty tails.
+    merged: list[list] = []
+    for i, c in enumerate(counts):
+        n = sum(c.values())
+        if n == 0:
+            continue
+        if merged and n < MIN_ROUNDS:
+            merged[-1][1] += c
+            continue
+        merged.append([EDGES[i], Counter(c)])
+    if len(merged) > 1 and sum(merged[0][1].values()) < MIN_ROUNDS:
+        merged[1][1] += merged[0][1]
+        merged[1][0] = merged[0][0]
+        merged.pop(0)
+    out = []
+    for j, (lo, c) in enumerate(merged):
+        hi = merged[j + 1][0] if j + 1 < len(merged) else None
+        n = sum(c.values())
+        out.append((lo, hi, [c[a] / n for a in range(K + 1)]))
+    return out
+
+
+def tokens_per_round(p: list[float]) -> float:
+    """E = sum_a (a + 1) p(a): tokens one verify round emits under `p`."""
+    return sum((accepted + 1) * share for accepted, share in enumerate(p))
 
 
 @dataclass(frozen=True)
@@ -167,6 +233,26 @@ def resolve(pack: Pack, case: Case, case_dir: Path) -> dict[str, dict[str, Any]]
             "rule": ACCEPTANCE_RULE,
             "num_drafts": metrics["num_drafts"],
             "accepted_tokens_per_position": metrics["accepted_tokens_per_position"],
+        }
+    if "speculative_acceptance_by_output_position" in fields:
+        depth = pack.variant_of(case).arch.get("draft_tokens")
+        if not isinstance(depth, int) or depth < 1:
+            raise CalibrationError(
+                f"speculative_acceptance_by_output_position: from_capture needs the variant's "
+                f"arch.draft_tokens (got {depth!r})"
+            )
+        source = _artifact(directory, result, "metrics_jsonl")
+        buckets = buckets_from_metrics(source, depth)
+        if not buckets:
+            raise CalibrationError(
+                f"{source.name} has no decode_request_progress rows with "
+                "output_tokens_before and accepted_draft_tokens"
+            )
+        resolved["speculative_acceptance_by_output_position"] = {
+            "value": [{"from": lo, "p": p} for lo, _hi, p in buckets],
+            "source": str(source.relative_to(case_dir)),
+            "rule": BY_POSITION_RULE,
+            "tokens_per_round": {str(lo): round(tokens_per_round(p), 6) for lo, _hi, p in buckets},
         }
     if "attn_gpu_memory_gb" in fields:
         if engine != "vllm":

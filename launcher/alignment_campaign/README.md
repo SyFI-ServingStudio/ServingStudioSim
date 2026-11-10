@@ -68,7 +68,8 @@ cases:
   profile_arrival_mode: trace-timed              # recorded arrivals, no `rate`
   simulation_arrival_mode: trace_timed           # rendered with request_rate: 1.0
   attn_gpu_memory_gb: {status: from_capture}
-  speculative_acceptance: {status: from_capture}
+  speculative_acceptance: {status: from_capture}                     # speculative models
+  speculative_acceptance_by_output_position: {status: from_capture}  # speculative models
   # ... max_model_len, gpu_memory_utilization, capture_seconds, device_role, purpose
 ```
 
@@ -276,10 +277,15 @@ Two case fields carry more weight than their size suggests:
   `--accept-provisional` is passed, and then names the provisional fields in the
   provenance sidecar.
 - **`from_capture`** (`{status: from_capture}`, nothing else) is for
-  `attn_gpu_memory_gb` and `speculative_acceptance`: the case's own
+  `attn_gpu_memory_gb`, `speculative_acceptance` and
+  `speculative_acceptance_by_output_position`: the case's own
   `workload_metrics` pass is the measurement, and nobody copies it by hand.
   `calibration.py` reads the chain from `spec_decode_metrics.json` (position 0
-  is `accepted[0] / num_drafts`, position k is `accepted[k] / accepted[k-1]`)
+  is `accepted[0] / num_drafts`, position k is `accepted[k] / accepted[k-1]`),
+  the output-position buckets from the pass's `metrics_jsonl`
+  (`buckets_from_metrics`: `decode_request_progress` rounds binned by
+  `output_tokens_before` at 1/32/128/512/1024/2048/4096/8192, a bucket under 50
+  rounds merged into the previous one, depth = the arch's `draft_tokens`),
   and the per-rank KV pool from the vLLM server log (the smallest rank's
   `Extended KV cache to N blocks (X GiB)`, else `Available KV cache memory: X
   GiB`; `X * 2**30 / 1e9` GB). SGLang has no extractor: its log gives
