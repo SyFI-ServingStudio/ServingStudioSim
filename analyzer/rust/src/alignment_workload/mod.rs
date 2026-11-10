@@ -76,7 +76,7 @@ struct WorkloadPoint {
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read_e2e_align(log_dir)?;
     let simulation_log_dir = input.simulation_log_dir.as_path();
-    let measured = read_measured_points(
+    let (measured, fold) = read_measured_points(
         &input.metrics_jsonl,
         input.replay_start_monotonic_ns,
         input.replay_end_monotonic_ns,
@@ -113,6 +113,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "simulated_span_ms": simulated.last().map(|point| point.time_ms),
             "measured_iteration_cycles": measured.iter().filter(|point| point.iteration_cycle_ms.is_some()).count(),
             "simulated_iteration_cycles": simulated.iter().filter(|point| point.iteration_cycle_ms.is_some()).count(),
+            "measured_dp_fold": fold.as_json(),
         },
         "available": true,
         "metrics": {
@@ -155,7 +156,7 @@ fn read_measured_points(
     metrics_path: &Path,
     replay_start_monotonic_ns: Option<u64>,
     replay_end_monotonic_ns: Option<u64>,
-) -> Result<Vec<WorkloadPoint>> {
+) -> Result<(Vec<WorkloadPoint>, FoldStats)> {
     ensure!(
         replay_start_monotonic_ns.is_some() == replay_end_monotonic_ns.is_some(),
         "workload replay window must provide both start and end monotonic timestamps"
@@ -198,7 +199,7 @@ fn read_measured_points(
 
     // Data-parallel ranks each log the same step, so one step appears as several
     // records. Fold them into the replica's batch shape before reading workload.
-    let records = fold_data_parallel_ranks(records)?;
+    let (records, fold) = fold_data_parallel_ranks(records)?;
 
     // New captures record req-frontend's replay window in the same host
     // CLOCK_MONOTONIC domain as EngineCore. Filter by that window to exclude
@@ -261,7 +262,33 @@ fn read_measured_points(
         });
     }
     assign_iteration_cycles(&mut points);
-    Ok(points)
+    Ok((points, fold))
+}
+
+/// What folding the data-parallel ranks did, reported in the report's meta so a
+/// reader can see how much of the step stream came from which rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FoldStats {
+    /// `wall_clock`, `iteration_index`, or `single_rank`.
+    method: &'static str,
+    reference_rank: Option<u64>,
+    /// Peer records inside the reference's span that overlapped no step and so
+    /// opened a step of their own (the reference rank was idle then).
+    peer_only_steps: usize,
+    dropped_before: usize,
+    dropped_after: usize,
+}
+
+impl FoldStats {
+    fn as_json(&self) -> Value {
+        json!({
+            "method": self.method,
+            "reference_rank": self.reference_rank,
+            "peer_only_steps": self.peer_only_steps,
+            "ragged_dropped_before": self.dropped_before,
+            "ragged_dropped_after": self.dropped_after,
+        })
+    }
 }
 
 /// Fold every data-parallel rank's record for one step into the replica's batch
@@ -281,7 +308,9 @@ fn read_measured_points(
 ///
 /// A single-rank capture passes through unchanged. Schema-v1 is rejected by
 /// the caller because workload alignment no longer borrows an NSYS timeline.
-fn fold_data_parallel_ranks(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasuredMetrics>> {
+fn fold_data_parallel_ranks(
+    records: Vec<FullMeasuredMetrics>,
+) -> Result<(Vec<FullMeasuredMetrics>, FoldStats)> {
     let observed = records
         .iter()
         .all(|record| record.observed_start_monotonic_ns.is_some())
@@ -289,7 +318,20 @@ fn fold_data_parallel_ranks(records: Vec<FullMeasuredMetrics>) -> Result<Vec<Ful
     if observed {
         fold_by_wall_clock(records)
     } else {
-        fold_by_iteration_index(records)
+        let ranks: std::collections::HashSet<_> =
+            records.iter().map(|record| record.dp_rank).collect();
+        let method = if ranks.len() > 1 {
+            "iteration_index"
+        } else {
+            "single_rank"
+        };
+        Ok((
+            fold_by_iteration_index(records)?,
+            FoldStats {
+                method,
+                ..FoldStats::default()
+            },
+        ))
     }
 }
 
@@ -367,12 +409,17 @@ fn observed_window(record: &FullMeasuredMetrics) -> (u64, u64) {
 
 /// Pair ranks by wall-clock overlap against the lowest-numbered rank.
 ///
-/// The reference rank defines the steps; every other rank's record joins the
-/// reference step it overlaps most. A peer record that overlaps no reference
-/// step *inside* the reference's span is refused rather than dropped or given a
-/// step of its own — it would mean the ranks are not stepping together, which
-/// invalidates the union the fold is built on, and that deserves to be read by a
-/// person rather than averaged away.
+/// A step is the union of the ranks' records that overlap in wall clock. The
+/// reference rank's records seed the steps, and every other rank's record joins
+/// the step it overlaps most. A peer record that overlaps no step inside the
+/// reference's span opens a step of its own and is counted in
+/// `FoldStats::peer_only_steps`. Those are real: a data-parallel rank with no
+/// work runs an unrecorded dummy step to join its peers' collectives, because
+/// the metrics log only steps where the rank scheduled something. In the
+/// DeepSeek-V4.1 DP4 diverse_100 capture rank 0 logged 8894 steps and ranks 1-3
+/// 6324/5524/5280, and 312/175/374 of the peers' records fell in rank 0's gaps.
+/// Refusing them withheld the subject; dropping them would lose scheduled work.
+/// A later peer record overlapping such a step merges into it like any other.
 ///
 /// The two RAGGED ENDS are a different thing and are dropped with a count. Data
 /// parallel ranks do not start or retire on the same step: in the GLM-5.2 DP8
@@ -385,9 +432,9 @@ fn observed_window(record: &FullMeasuredMetrics) -> (u64, u64) {
 /// groups (one group prefilling per iteration where vLLM ran all eight), a bug
 /// that instead went unseen until the e2e throughput was traced by hand.
 ///
-/// A record in a gap BETWEEN reference steps still bails: that is a real desync,
-/// not an edge.
-fn fold_by_wall_clock(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasuredMetrics>> {
+fn fold_by_wall_clock(
+    records: Vec<FullMeasuredMetrics>,
+) -> Result<(Vec<FullMeasuredMetrics>, FoldStats)> {
     let reference_rank = records
         .iter()
         .filter_map(|record| record.dp_rank)
@@ -409,6 +456,7 @@ fn fold_by_wall_clock(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasu
     };
     let mut dropped_before = 0usize;
     let mut dropped_after = 0usize;
+    let mut peer_only_steps = 0usize;
     let mut cursor = 0usize;
     for peer in peers {
         let (peer_start, peer_end) = observed_window(&peer);
@@ -420,9 +468,9 @@ fn fold_by_wall_clock(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasu
             dropped_after += 1;
             continue;
         }
-        // The reference windows are sorted and disjoint, so a peer that starts
-        // after this one ends can never match an earlier step: the cursor only
-        // moves forward across the whole pass.
+        // The step windows are sorted by start, so a peer that starts after one
+        // ends can never match it: the cursor only moves forward across the
+        // whole pass (peers are sorted by start too).
         while cursor + 1 < windows.len() && windows[cursor].1 <= peer_start {
             cursor += 1;
         }
@@ -436,16 +484,16 @@ fn fold_by_wall_clock(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasu
             })
             .filter(|&index| windows[index].1.min(peer_end) > windows[index].0.max(peer_start));
         let Some(index) = best else {
-            // Inside the reference's span, so not a ragged end: the peer landed
-            // in a gap BETWEEN two reference steps, which is a real desync.
-            bail!(
-                "full-run metrics rank {:?} iteration {} falls between steps of reference rank \
-                 {} (inside its {:.3} s span); the data-parallel ranks are not stepping together",
-                peer.dp_rank,
-                peer.iteration_index,
-                reference_rank,
-                (span_end - span_start) as f64 / 1e9,
-            );
+            // Inside the reference's span but overlapping no step: the
+            // reference rank was idle (an unrecorded dummy step), so this peer's
+            // work is a step of its own. Insert it in start order; every window
+            // before the cursor ended by an earlier peer's start, so the
+            // insertion point is at or after the cursor.
+            let position = windows.partition_point(|window| window.0 <= peer_start);
+            windows.insert(position, (peer_start, peer_end));
+            steps.insert(position, peer);
+            peer_only_steps += 1;
+            continue;
         };
         merge_rank_record(&mut steps[index], peer)?;
         windows[index] = observed_window(&steps[index]);
@@ -461,7 +509,23 @@ fn fold_by_wall_clock(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasu
             dropped_after,
         );
     }
-    Ok(steps)
+    if peer_only_steps > 0 {
+        eprintln!(
+            "[alignment-workload] {peer_only_steps} peer record(s) overlapped no step of reference \
+             rank {reference_rank} and opened their own step: an idle rank runs unrecorded dummy \
+             steps"
+        );
+    }
+    Ok((
+        steps,
+        FoldStats {
+            method: "wall_clock",
+            reference_rank: Some(reference_rank),
+            peer_only_steps,
+            dropped_before,
+            dropped_after,
+        },
+    ))
 }
 
 async fn read_simulated_points(ctx: &SessionContext) -> Result<Vec<WorkloadPoint>> {
@@ -723,7 +787,7 @@ mod tests {
         )
         .unwrap();
 
-        let points = read_measured_points(&metrics_path, None, None).unwrap();
+        let (points, _) = read_measured_points(&metrics_path, None, None).unwrap();
 
         assert_eq!(
             points
@@ -750,7 +814,7 @@ mod tests {
                 "observed_elapsed_ms": 0.0001
             });
             fs::write(&path, format!("{row}\n")).unwrap();
-            let points = read_measured_points(&path, None, None).unwrap();
+            let (points, _) = read_measured_points(&path, None, None).unwrap();
             assert_eq!(points[0].decode_batch_size, 2);
             assert_eq!(points[0].scheduled_kv_tokens, 300);
         }
@@ -778,7 +842,7 @@ mod tests {
         )
         .unwrap();
 
-        let points = read_measured_points(&metrics_path, Some(450), Some(850)).unwrap();
+        let (points, _) = read_measured_points(&metrics_path, Some(450), Some(850)).unwrap();
 
         assert_eq!(
             points
@@ -795,7 +859,8 @@ mod tests {
             rank_record(7, 4, vec![10], None),
             rank_record(8, 0, vec![11, 12], None),
         ])
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert_eq!(
             folded
@@ -814,7 +879,8 @@ mod tests {
             rank_record(7, 4, vec![10], Some((100, 300, 2.0))),
             rank_record(7, 6, vec![11, 12], Some((110, 350, 2.4))),
         ])
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert_eq!(folded.len(), 1);
         let step = &folded[0];
@@ -834,7 +900,7 @@ mod tests {
             .flat_map(|iteration| (0..8).map(move |_| rank_record(iteration, 1, vec![5], None)))
             .collect();
 
-        let folded = fold_data_parallel_ranks(records).unwrap();
+        let (folded, _) = fold_data_parallel_ranks(records).unwrap();
 
         assert_eq!(
             folded
@@ -873,7 +939,8 @@ mod tests {
             ranked_record(3, 7, 6, vec![11], (110, 310, 2.4)),
             ranked_record(3, 8, 7, vec![21], (405, 615, 2.5)),
         ])
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert_eq!(folded.len(), 2);
         assert_eq!(folded[0].iteration_index, 11);
@@ -887,27 +954,61 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_step_in_a_gap_between_reference_steps_is_refused_rather_than_averaged_away() {
-        // Two reference steps with 300..400 empty between them, and a peer that
-        // lives entirely in that hole. Inside the span and matching nothing is a
-        // real desync: the union the fold is built on does not hold, and that
-        // must reach a person instead of being averaged in.
-        let error = fold_data_parallel_ranks(vec![
+    fn a_peer_step_in_a_gap_between_reference_steps_opens_its_own_step() {
+        // Two ranks. Rank 0 has work at 100..300 and 400..600 and is idle in
+        // between (its dummy step is not logged); rank 1 logs a step in that
+        // hole, which therefore overlaps nothing on rank 0. It must become a
+        // step of its own, between the two, and a later rank-1 record that
+        // overlaps rank 0's second step must still merge into it.
+        let (folded, fold) = fold_data_parallel_ranks(vec![
             ranked_record(0, 11, 4, vec![10], (100, 300, 2.0)),
             ranked_record(0, 12, 5, vec![20], (400, 600, 2.0)),
-            ranked_record(3, 7, 6, vec![11], (310, 390, 0.8)),
+            ranked_record(1, 7, 6, vec![11], (310, 390, 0.8)),
+            ranked_record(1, 8, 3, vec![21, 22], (405, 610, 2.1)),
         ])
-        .unwrap_err();
+        .expect("a peer-only step must not withhold the subject");
 
-        assert!(
-            error.to_string().contains("not stepping together"),
-            "unexpected error: {error}"
+        assert_eq!(folded.len(), 3);
+        assert_eq!(
+            folded
+                .iter()
+                .map(|step| (step.observed_start_monotonic_ns, step.prefill_tokens))
+                .collect::<Vec<_>>(),
+            vec![(Some(100), 4), (Some(310), 6), (Some(400), 8)]
         );
-        assert!(
-            error.to_string().contains("falls between steps"),
-            "the message must say WHERE it fell, or the ragged-end case reads the \
-             same as a desync: {error}"
+        assert_eq!(folded[1].decode_kv_lens, vec![11]);
+        assert_eq!(folded[1].dp_rank, Some(1));
+        assert_eq!(folded[2].decode_kv_lens, vec![20, 21, 22]);
+        assert_eq!(folded[2].observed_end_monotonic_ns, Some(610));
+        assert_eq!(
+            fold,
+            FoldStats {
+                method: "wall_clock",
+                reference_rank: Some(0),
+                peer_only_steps: 1,
+                dropped_before: 0,
+                dropped_after: 0,
+            }
         );
+    }
+
+    #[test]
+    fn peer_records_that_overlap_each_other_in_a_gap_share_one_step() {
+        // Two peers both run while the reference rank is idle: one step, not
+        // two, since a step is the union of overlapping records.
+        let (folded, fold) = fold_data_parallel_ranks(vec![
+            ranked_record(0, 11, 4, vec![10], (100, 300, 2.0)),
+            ranked_record(0, 12, 5, vec![20], (400, 600, 2.0)),
+            ranked_record(1, 7, 6, vec![11], (310, 390, 0.8)),
+            ranked_record(2, 3, 1, vec![12], (315, 395, 0.8)),
+        ])
+        .unwrap();
+
+        assert_eq!(folded.len(), 3);
+        assert_eq!(folded[1].prefill_tokens, 7);
+        assert_eq!(folded[1].decode_kv_lens, vec![11, 12]);
+        assert_eq!(folded[1].observed_end_monotonic_ns, Some(395));
+        assert_eq!(fold.peer_only_steps, 1);
     }
 
     #[test]
@@ -923,7 +1024,8 @@ mod tests {
             ranked_record(3, 7, 6, vec![11], (110, 310, 2.4)),
             ranked_record(3, 8, 7, vec![21], (900, 1000, 1.0)),
         ])
-        .expect("a ragged end must not withhold the subject");
+        .expect("a ragged end must not withhold the subject")
+        .0;
 
         // The overlapping peer still folded; only the trailing one went.
         assert_eq!(folded.len(), 1);
@@ -941,7 +1043,8 @@ mod tests {
             ranked_record(3, 6, 9, vec![9], (1, 50, 0.5)),
             ranked_record(3, 7, 6, vec![11], (110, 310, 2.4)),
         ])
-        .expect("a ragged start must not withhold the subject either");
+        .expect("a ragged start must not withhold the subject either")
+        .0;
 
         assert_eq!(folded.len(), 1);
         assert_eq!(folded[0].decode_kv_lens, vec![10, 11]);
@@ -961,7 +1064,8 @@ mod tests {
                 ..rank_record(7, 6, vec![11], None)
             },
         ])
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert_eq!(folded.len(), 1);
         assert_eq!(folded[0].prefill_tokens, 10);
