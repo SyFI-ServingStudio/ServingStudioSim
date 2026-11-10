@@ -167,6 +167,13 @@ def test_a_tree_with_unexported_commits_a_stash_or_a_paused_am_is_not_replaced(t
     exported = sorted(patches.glob("*.patch"))
     _check_replaceable(tree, force=True, patches=exported)
 
+    # Commits export-patches writes nothing for: empty, or only ALIGNMENT_BASE.
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "empty", cwd=tree)
+    (tree / "ALIGNMENT_BASE").write_text("x\n")
+    _git("add", "ALIGNMENT_BASE", cwd=tree)
+    _git(*commit, "alignment base only", cwd=tree)
+    _check_replaceable(tree, force=True, patches=exported)
+
     # A rename exported as a rename (format-patch detects it) still matches.
     _git("mv", "a.py", "b.py", cwd=tree)
     (tree / "b.py").write_text("patched\nrenamed\n")
@@ -204,6 +211,23 @@ def test_a_tree_with_unexported_commits_a_stash_or_a_paused_am_is_not_replaced(t
     (tree / ".git" / "rebase-apply").mkdir()
     with pytest.raises(RefError, match="rebase-apply"):
         _check_replaceable(tree, force=True, patches=exported)
+
+
+def test_a_commit_on_the_base_that_export_skips_is_not_unexported(tmp_path):
+    from reference_engines.__main__ import _check_replaceable
+
+    tree = tmp_path / "src"
+    tree.mkdir()
+    commit = ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm")
+    _git("init", "-q", cwd=tree)
+    (tree / "a.py").write_text("base\n")
+    _git("add", "a.py", cwd=tree)
+    _git(*commit, "base", cwd=tree)
+    (tree / "ALIGNMENT_BASE").write_text("x\n")
+    _git("add", "ALIGNMENT_BASE", cwd=tree)
+    _git(*commit, "alignment base only", cwd=tree)
+    # Not the root commit as a whole-tree patch: nothing to export, so replaceable.
+    _check_replaceable(tree, force=True, patches=[])
 
 
 @pytest.mark.parametrize("engine", ENGINES)

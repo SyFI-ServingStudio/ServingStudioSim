@@ -154,7 +154,9 @@ def _unexported_commits(dest: Path, patches: list[Path]) -> list[str]:
     ).split()
     unexported = []
     for commit in commits:
-        written = _git(*_FORMAT_PATCH, "--stdout", "-1", commit, *_EXPORTED_PATHS, cwd=dest)
+        # `<commit>^!`, not `-1 <commit>`: a path-limited `-1` walk emits the
+        # nearest ancestor touching the paths when this commit touches none.
+        written = _git(*_FORMAT_PATCH, "--stdout", f"{commit}^!", *_EXPORTED_PATHS, cwd=dest)
         patch_id = _patch_id(written + "\n")  # empty when the commit touches only _NOT_PATCHED
         if patch_id and patch_id not in exported:
             unexported.append(commit)
