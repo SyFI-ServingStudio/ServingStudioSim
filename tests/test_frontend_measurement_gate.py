@@ -3,6 +3,7 @@
 import json
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -115,7 +116,8 @@ def test_profiler_and_counters_start_only_at_frontend_measurement_boundary(tmp_p
     monkeypatch.setattr(runner, "build_session_runner", lambda: None)
     monkeypatch.setattr(alignment_runner, "_resolve_fork_python", lambda _: "python")
     monkeypatch.setattr(alignment_runner, "_preflight_capture_environment", lambda *a, **k: None)
-    monkeypatch.setattr(alignment_runner, "_shutdown", lambda _: None)
+    monkeypatch.setattr(alignment_runner.capture_facts, "record", lambda *a: {})
+    monkeypatch.setattr(alignment_runner, "_shutdown", lambda _proc, **_kwargs: None)
     monkeypatch.setattr(alignment_runner, "_finalize_profile", lambda _, **k: k["drive_summary"])
     monkeypatch.setattr(alignment_runner.time, "sleep", lambda _: None)
     monkeypatch.setattr(driver, "build_server_argv", lambda *a: ["python"])
@@ -156,3 +158,64 @@ def test_profiler_and_counters_start_only_at_frontend_measurement_boundary(tmp_p
     assert result["spec_decode_metrics_after"] == ["warmup_drained", True, "measured_requests"]
     assert result["replay_end_monotonic_ns"] >= result["replay_start_monotonic_ns"]
     assert result["measurement_log_offset"] == 0
+
+
+@pytest.mark.parametrize("gated", [True, False])
+def test_replay_stops_when_the_server_fails(tmp_path, monkeypatch, gated):
+    """A dead engine ends the replay within a poll, not at the stream idle timeout."""
+
+    config = LoadGeneratorConfig(
+        frontend=IndependentFrontendConfig(path="trace.csv"),
+        text_file="corpus.txt", tokenizer="tokenizer", warmup=gated,
+    )
+    prepared = runner.PreparedReplay(
+        tmp_path / "trace.csv", tmp_path / "corpus.txt", "tokenizer",
+        tmp_path / "replay.jsonl", tmp_path / "summary.json",
+    )
+    popen = subprocess.Popen
+    program = "import time\n"
+    if gated:
+        program += (
+            "print('REQ_FRONTEND_MEASUREMENT_READY_V1', flush=True)\n"
+            "assert input() == 'continue'\n"
+        )
+    program += "time.sleep(60)\n"  # requests the dead server never answers
+    monkeypatch.setattr(
+        runner.subprocess, "Popen",
+        lambda argv, **kwargs: popen([sys.executable, "-c", program], **kwargs),
+    )
+    polls = []
+
+    def server_failure():
+        polls.append(None)
+        if len(polls) == 1:  # a broken check does not end the watch
+            raise OSError("log mid-rotation")
+        return "Subprocess scheduler_0 (pid=1) crashed with exit code 1" if len(polls) > 2 else None
+
+    started = time.monotonic()
+    with pytest.raises(runner.ServerFailedDuringReplay, match="scheduler_0"):
+        runner.run_replay(
+            config, prepared, base_url="http://localhost:8000", model="model",
+            measurement_ready=(lambda: None) if gated else None,
+            server_failure=server_failure,
+        )
+    assert time.monotonic() - started < 30
+
+
+def test_server_failure_reads_new_log_lines_and_the_process(tmp_path):
+    log = tmp_path / "server.log"
+    log.write_text("Subprocess scheduler_0 (pid=1) crashed with exit code 1\n")  # before replay
+    proc = SimpleNamespace(code=None, poll=lambda: proc.code)
+    poll = alignment_runner._server_failure(proc, log)
+    assert poll() is None
+    with log.open("a") as out:
+        out.write("[2026] Subprocess scheduler_0 (pid=432) crashed with exit")  # partial line
+    assert poll() is None
+    with log.open("a") as out:
+        out.write(" code 1. Triggering SIGQUIT for cleanup...\n")
+    assert "scheduler_0 (pid=432) crashed" in poll()
+    with log.open("a") as out:
+        out.write('VIBESIM_AUTOTUNE_FORBIDDEN {"source": "flashinfer.AutoTuner"}\n')
+    assert poll().startswith("VIBESIM_AUTOTUNE_FORBIDDEN")
+    proc.code = -9
+    assert poll() == "server process exited with code -9"

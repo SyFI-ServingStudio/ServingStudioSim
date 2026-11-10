@@ -43,6 +43,8 @@ from typing import Any
 
 import yaml
 
+from alignment.profiler.config import server_gpu_count
+
 from ..alignment_config import (
     load_analyze_config,
     load_profile_config,
@@ -98,7 +100,12 @@ def host_for(pack: Pack, host: HostProfile | None) -> HostProfile:
             if key is None:
                 continue
             checkpoints.setdefault(key, f"/nonexistent/checkpoints/{key}")
-        world_size = int(variant.server.get("tp_size", 1)) * int(variant.server.get("dp_size", 1))
+        world_size = server_gpu_count(
+            variant.engine,
+            int(variant.server.get("tp_size", 1)),
+            int(variant.server.get("dp_size", 1)),
+            list(variant.server.get("extra_args", [])),
+        )
         for case in pack.cases:
             if case.variant != variant.name:
                 continue
@@ -638,12 +645,17 @@ def _check_cross_phase(pack: Pack, case: Case, documents: dict[str, Any]) -> lis
                         f"server {limit_flag} does not match the case")
             )
         devices = [item for item in document["cuda_visible_devices"].split(",") if item]
-        world = int(variant.server.get("tp_size", 1)) * int(variant.server.get("dp_size", 1))
+        world = server_gpu_count(
+            variant.engine,
+            int(variant.server.get("tp_size", 1)),
+            int(variant.server.get("dp_size", 1)),
+            flags,
+        )
         if len(devices) != world:
             findings.append(
                 Finding("error", f"{where}.{profile_pass.name}",
                         f"device role {case.device_role!r} yields {len(devices)} devices "
-                        f"but tp*dp is {world}")
+                        f"but dp*tp*pp*pcp is {world}")
             )
     return findings
 

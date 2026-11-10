@@ -540,7 +540,7 @@ def test_measure_worker_uses_container_and_mounts_output(tmp_path, monkeypatch):
 
     monkeypatch.setattr("profiling.measure._container_worker_command", fake_container_command)
     monkeypatch.setattr("profiling.measure.subprocess.run", fake_subprocess_run)
-    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test")
+    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3")
 
     response = _run_worker(
         kernel_kind="single_gemm",

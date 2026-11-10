@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Wed, 23 Sep 2026 04:11:57 -0700
+Subject: [PATCH] docs(alignment): describe the converged
+ servingstudio-alignment line
+
+Name this branch the one maintained ServingStudio line, record the two lines
+it converges, document the routed-experts capture it adds, and list how each
+moesim-profile commit is carried or why it is not needed on v0.28.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ ALIGNMENT.md | 61 +++++++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 48 insertions(+), 13 deletions(-)
+
+diff --git a/ALIGNMENT.md b/ALIGNMENT.md
+index 66548b3af125783c475544f184b2f29632959fd5..63afc03236700389642c8daccfdaf5efb8dbbd25 100644
+--- a/ALIGNMENT.md
++++ b/ALIGNMENT.md
+@@ -1,13 +1,16 @@
+-# VibeSim instrumentation on upstream vLLM
++# ServingStudio instrumentation on upstream vLLM
+ 
+-This checkout maintains `glm53-dflash2-alignment` on official vLLM
+-`upstream/main`. The current upstream base is
+-`8369affa5428ca29a30f378d660fbffbad12e240`.
++`servingstudio-alignment` is the one maintained ServingStudio line of this fork.
++It sits on official vLLM `upstream/main`; the current upstream base is
++`8369affa5428ca29a30f378d660fbffbad12e240` (v0.28.1rc0). ServingStudio Sim pins
++it at `alignment/profiler/vllm`.
+ 
+-The instrumentation source is `glm52-spec5-alignment` at
+-`556aaf7309348fa292d76aa0f49533937eaf48bb`. Its original checkout remains at
+-`../wt-glm52-spec5/alignment/profiler/vllm`; do not switch, install into, or edit
+-that checkout when maintaining this branch.
++It converges two earlier lines:
++
++- `moesim-profile` (base `967c5c3`, v0.22.1rc0), the line Sim pinned for the
++  GLM-5.2 captures. It stays on the remote because recorded captures name it.
++- `glm53-dflash2-alignment` (this branch's start, `79838a5a18`), the v0.28
++  port for GLM-5.3 DFlash2, kept as `backup/glm53-dflash2-alignment-20260923`.
+ 
+ ## Scope
+ 
+@@ -55,11 +58,9 @@ If the upstream base changes, update the wheel commit explicitly. Import and
+ GPU validation must resolve Python and native extensions under this worktree.
+ An import check alone does not qualify the driver or a serving run.
+ 
+-New VibeSim profile configs should set `fork_python` to
+-`/raid/kanzhu/VibeSimWorkspace/wt-vllm-glm53-dflash2/.venv/bin/python`.
+-Keep the original checkout's profiler environment and presets unchanged.
+-Run pre-commit checks explicitly in this worktree; do not replace shared Git
+-hooks with a hook that points at this environment.
++ServingStudio's profiler runs `alignment/profiler/vllm/.venv/bin/python` by
++default. Run pre-commit checks explicitly in this checkout; do not replace
++shared Git hooks with a hook that points at this environment.
+ 
+ The native wheel selected by the fixed commit's official `cu130` metadata is
+ also saved in `../glm53-dflash2-artifacts/`. If that metadata endpoint is
+@@ -95,6 +96,38 @@ Use `VLLM_USE_V2_MODEL_RUNNER=1`. Select topology, memory budget, and attention
+ backend against the actual available GPUs. The model card demonstrates SGLang;
+ checkpoint compatibility in a full vLLM run still requires validation.
+ 
++## Routed-experts capture
++
++ServingStudio's `token_corpus` pass serves with `--enable-return-routed-experts`
++and reads every generated token's routes, body layers and MTP layer. Upstream
++already captures inside monolithic TRT-LLM kernels, refuses kernels it cannot
++capture, and carries `routed_experts_prompt_start`. This branch adds:
++
++- capture slots for an MTP drafter's layers (method `mtp` only), bound on model
++  runner V2 for the single-module MTP speculator;
++- the draft prefill's routes only; later draft passes cover one row per request
++  and are undone;
++- the drafter's slots filled after propose, before the step's D2H copy;
++- V1 refuses MTP capture, since it never binds the drafter.
++
++`EPLBConfig.rearrange=false` keeps EPLB a load recorder for the routing passes.
++It allocates no transfer buffer and never moves experts.
++
++### Audit of `moesim-profile` commits
++
++| `moesim-profile` commit | Here |
++| --- | --- |
++| 6 upstream bugfix cherry-picks (ROCm, Docker, CPU, FastAPI) | in upstream by v0.28 |
++| 7 `feat(alignment)` instrumentation commits | ported by the v0.28 line |
++| `9a0675d` speculative progress | ported as `f6c611a27` |
++| `2c2f73f` target/draft expert-load roles | ported (`model_role`, `max_forwards_per_step`) |
++| `829f25c`, `7fa4e7c`, `5552bbd`, `2cbd2d9`, `133dc06` prefer modular kernels while capturing | not needed: upstream captures inside monolithic kernels and refuses the rest by name |
++| `4b0cab6` capture-layer sizing, `routed_experts_prompt_start` | sizing ported; `prompt_start` is upstream |
++| `5316893` slots for the MTP drafter only | ported |
++| `4652f20` keep the first draft pass's routes | ported to the V2 speculator |
++| `b986f76` refuse the unpadded drafter | not applicable: V2 has no unpadded drafter path, and V1 refuses MTP capture |
++| `828da2e` EPLB `rearrange: false` | ported |
++
+ ## Maintenance and validation
+ 
+ Fetch official upstream, record its SHA, and replay this branch's instrumentation
+@@ -107,6 +140,8 @@ Focused tests include:
+ .venv/bin/python -m pytest -q \
+   tests/v1/worker/test_alignment_trace.py \
+   tests/v1/worker/test_gpu_model_runner_v2_eplb.py \
++  tests/model_executor/test_routed_experts_capture.py \
++  tests/distributed/test_eplb_utils.py \
+   tests/v1/engine/test_iteration_logging.py \
+   tests/entrypoints/openai/completion/test_alignment_api_timing.py \
+   tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py

@@ -1,24 +1,23 @@
 # Serving-engine profiler setup
 
-Alignment ground truth comes from the instrumented **vLLM and SGLang
-submodules in this directory**. Both forks emit indexed per-phase NVTX scopes
-and the same versioned alignment records, so capture parsing and downstream
-analysis stay shared. The parent repository pins the exact fork commits:
+Alignment ground truth comes from instrumented **vLLM and SGLang**, kept as
+reference engines (`reference_engines/README.md`): each is an upstream commit
+and its official image (`reference_engines/<engine>/BASE`) plus our patches
+(`reference_engines/<engine>/patches/`). Both emit indexed per-phase NVTX
+scopes and the same versioned alignment records, so capture parsing and
+downstream analysis stay shared.
 
-```text
-alignment/profiler/vllm    # branch: servingstudio-alignment
-alignment/profiler/sglang  # branch: vibesim-alignment
-```
-
-Initialize both from the ServingStudio Sim checkout:
+A capture runs in the engine's image (`alignment/README.md`, "In-image
+capture"), the same image its L1 kernels run in. A host capture runs the
+engine from a materialized source tree instead:
 
 ```bash
-git submodule update --init alignment/profiler/vllm alignment/profiler/sglang
+just ref materialize vllm     # -> reference_engines/vllm/src
+just ref materialize sglang   # -> reference_engines/sglang/src
 ```
 
 ## vLLM environment
-
-The vLLM fork adds `vllm_iteration(N): <phase>` NVTX scopes and a versioned
+The vLLM patches add `vllm_iteration(N): <phase>` NVTX scopes and a versioned
 `VibeSimAlignmentIteration {json}` model-input record. It also emits one
 `VibeSimAlignmentRequestTiming {json}` record when each request completes. The
 MoE routing passes additionally emit `VibeSimAlignmentExpertLoad {json}` only
@@ -49,41 +48,42 @@ its committed count is `null` if the scheduler has already removed the request.
 Such work contributes to raw verification totals, but cannot advance effective
 client output when deriving per-request acceptance rates.
 
-### One maintained fork line
+### The patches and their base
 
-`servingstudio-alignment` is the only maintained line, on upstream vLLM main
-`04730e8` (2026-09-24, the newest main with a `cu130` wheel that serves
-DeepSeek-V4.1; previously v0.28.1rc0 `8369aff`). Its `ALIGNMENT.md` records the
-base, what the line adds (instrumentation, MTP drafter route capture under model
-runner V2, record-only EPLB), and how each commit of the retired
-`moesim-profile` line was carried.
-`moesim-profile` stays on the remote because recorded captures name it. Every
-capture's `<name>_launch.json` records the fork's `head`, `branch`, and
-`status_short` under `fork_git`.
+The patches are the commits of the fork branch they were exported from
+(`servingstudio-alignment-20261107` on https://github.com/serendipity-zk/vllm),
+and its `ALIGNMENT.md` (patch 0018) records what each carries. The base is
+upstream vLLM main `5629b26` (2026-11-07), not a release: DeepSeek-V4.1 needs
+SwapAB and other paths that v0.33.0 does not have. The next bump should move to
+a stable release and its official image. Every capture's `<name>_launch.json`
+records the materialized tree's `head`, `branch` and `status_short` under
+`fork_git` (a host capture) or the image manifest under `image` (an in-image
+one).
 
-To move to a newer upstream, rebase `servingstudio-alignment` onto it in an
-isolated checkout, update the base SHA in `ALIGNMENT.md`, rebuild `.venv` with
-the new base as the wheel commit, run the fork's focused tests listed there,
-and run a GPU capture through `alignment-campaign` before bumping the Sim
-gitlink.
+To move to a newer upstream: `just ref bump-base vllm --commit SHA --image
+REPO:TAG`, resolve any patch that no longer applies in the materialized tree,
+`just ref export-patches vllm`, run the patches' focused tests, and run a GPU
+capture through `alignment-campaign`.
 
-Only its `.venv` is missing — build it once. `runner.py` defaults `fork_python`
-to `alignment/profiler/vllm/.venv/bin/python`; override `fork_python` in
-the align config to point elsewhere.
+### Host venv
 
-The instrumentation on `servingstudio-alignment` is Python-only (NVTX scopes +
-iteration metrics logging), so the **precompiled fast path** works — no multi-hour CUDA
-compile. The submodule is detached at the parent gitlink, so explicitly select
-the last upstream commit before the `feat(alignment):` patches. Without this,
-vLLM's setup cannot resolve the branch and silently falls back to the latest
-nightly wheel, which can be binary-incompatible with the pinned fork:
+`runner.py` defaults `fork_python` to `reference_engines/vllm/src/.venv/bin/python`;
+override `fork_python` in the align config to point elsewhere.
+Host captures are strongly discouraged (no autotune guard, no preflight); the
+reference image is the default runtime. `materialize --force` and `bump-base`
+refuse to replace a tree that holds this venv (or any untracked file): move it
+out first.
+
+The patches are Python-only (NVTX scopes + iteration metrics logging), so the
+**precompiled fast path** works — no multi-hour CUDA compile. Name BASE's
+upstream commit as the wheel commit explicitly; without it, vLLM's setup cannot
+resolve the materialized branch and silently falls back to the latest nightly
+wheel, which can be binary-incompatible:
 
 ```bash
-cd alignment/profiler/vllm
-git status --short                 # confirm the pinned checkout is clean
-git rev-parse HEAD                 # record the exact detached gitlink
+just ref materialize vllm
+cd reference_engines/vllm/src
 
-# 3.12 venv living next to the fork (the path runner.py expects)
 # Archive any adopted environment first: installing over it does not prune
 # stale dependencies from a different nightly/CUDA generation.
 if [ -e .venv ]; then
@@ -94,25 +94,15 @@ if [ -e .venv ]; then
 fi
 uv venv --python 3.12 .venv
 
-# Resolve the binary base and verify every checkout-local change remains Python.
-FIRST_ALIGNMENT_COMMIT=$(git log --reverse --format=%H --fixed-strings \
-  --grep='feat(alignment):' HEAD | sed -n '1p')
-if [ -z "$FIRST_ALIGNMENT_COMMIT" ]; then
-  echo "cannot resolve the first alignment commit" >&2
-  exit 1
-fi
-PRECOMPILED_BASE_COMMIT=$(git rev-parse "$FIRST_ALIGNMENT_COMMIT^")
-if git diff --name-only "$PRECOMPILED_BASE_COMMIT"..HEAD | \
-  grep -E '\.(c|cc|cpp|cu|cuh|h|hpp|rs)$'; then
-  echo "alignment fork has native changes; build vLLM from source" >&2
+BASE_COMMIT=$(sed -n 's/^upstream_commit=//p' ../BASE)
+if git diff --name-only "$BASE_COMMIT"..HEAD | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp|rs)$'; then
+  echo "the patches change native code; build vLLM from source" >&2
   exit 1
 fi
 
-# Install the fork's Python over that base's precompiled CUDA-13 wheel. This
-# checkout pins Torch 2.11 and CUDA-13 CUTLASS dependencies, so its native vLLM
-# extension must use the matching hosted cu130 variant.
+# The patched Python over the base's precompiled CUDA-13 wheel.
 VLLM_USE_PRECOMPILED=1 \
-  VLLM_PRECOMPILED_WHEEL_COMMIT="$PRECOMPILED_BASE_COMMIT" \
+  VLLM_PRECOMPILED_WHEEL_COMMIT="$BASE_COMMIT" \
   VLLM_PRECOMPILED_WHEEL_VARIANT=cu130 \
   uv pip install --python .venv/bin/python -e .
 
@@ -120,16 +110,15 @@ VLLM_USE_PRECOMPILED=1 \
 # VLLM_NVTX_SCOPES_FOR_PROFILING=1.
 uv pip install --python .venv/bin/python nvtx
 
-# Sanity: the fork imports and exposes the instrumentation env var.
+# Sanity: the patched vLLM imports and exposes the instrumentation env var.
 # (Call the venv directly: `uv run` inside this directory resolves vLLM's own
 # pyproject instead.)
 .venv/bin/python -c "import vllm, vllm.envs as e; print(vllm.__version__, hasattr(e, 'VLLM_NVTX_SCOPES_FOR_PROFILING'))"
 ```
-
 Import success is not a CUDA-runtime qualification: an older driver can load the
 cu130 extensions and still fail at their first PTX kernel with
 `cudaErrorUnsupportedPtxVersion`. Verify that `vllm` and every required native
-extension resolve under this checkout, run `uv pip check`, and execute a small
+extension resolve under this tree, run `uv pip check`, and execute a small
 production kernel from each CUDA toolchain used by the target model. If the host
 driver is too old, set the profile's top-level `driver_compat_lib_dir` to an
 unpacked matching NVIDIA `cuda-compat` directory containing `libcuda.so.1`; the
@@ -147,7 +136,7 @@ exercised by the actual model path. Record the resolved module paths and loaded
 `libcuda.so.1` path with the alignment artifact; an import-only or tensor-only
 probe is insufficient.
 
-If the diff from `PRECOMPILED_BASE_COMMIT` contains native source, or if
+If the diff from `BASE_COMMIT` contains native source, or if
 `VLLM_USE_PRECOMPILED` cannot resolve a wheel for that commit, fall back to a
 from-source build (`uv pip install --python .venv/bin/python -e .` without the
 flag) — this compiles CUDA kernels and takes much longer. Never use the latest
@@ -156,11 +145,13 @@ switches as a fallback.
 
 ## SGLang environment
 
-The SGLang fork emits `sglang_iteration(N): <phase>` and the same iteration,
+The SGLang patches emit `sglang_iteration(N): <phase>` and the same iteration,
 request-timing, expert-load, and worker-device records consumed by the shared
-pipeline. Build its environment under the submodule's `python/` directory,
-which is the default path selected when `engine: sglang` and no `fork_python`
-override is supplied:
+pipeline. Their base is the SGLang nightly `9d547e19` (2026-11-08) and its
+`lmsysorg/sglang:nightly-dev-cu13-20261108-9d547e19` image; the next bump
+should move to a stable release. For a host capture, build the environment under
+the materialized tree's `python/` directory, which is the default path selected
+when `engine: sglang` and no `fork_python` override is supplied:
 
 Expert-popularity topology is a YAML-only contract for every engine. An
 `expert_popularity` profile must state both `server.expert_parallel_size` (the
@@ -176,12 +167,29 @@ more than one rank, and no `--no-enable-eplb`); elsewhere it records routes
 alone, since a corpus holds logical expert ids and needs no topology.
 
 ```bash
-cd alignment/profiler/sglang/python
+just ref materialize sglang
+cd reference_engines/sglang/src/python
 uv venv --python 3.12 .venv-sglang
-uv pip install --python .venv-sglang/bin/python -e .
+uv pip install --python .venv-sglang/bin/python \
+  --extra-index-url https://download.pytorch.org/whl/cu130 \
+  --index-strategy unsafe-best-match -e .
 uv run --python .venv-sglang/bin/python python -c \
   "import sglang; print(sglang.__version__, sglang.__file__)"
 ```
+
+### The SGLang patches
+
+The patches are the commits of `vibesim-alignment-20261108` on
+https://github.com/serendipity-zk/sglang (upstream nightly `9d547e19`), and its
+`ALIGNMENT.md` records what each carries. Earlier lines stay on the remote
+because recorded captures name them: `vibesim-alignment-20261107` (main
+`ba59064`) and `vibesim-alignment` on main `9d4be40` (2026-08-10, tag
+`vibesim-alignment-base-449cb04a5`).
+
+To move to a newer upstream: `just ref bump-base sglang --commit SHA --image
+REPO:TAG`, resolve any patch that no longer applies in the materialized tree,
+`just ref export-patches sglang`, run the patches' focused tests, and run a GPU
+capture through `alignment-campaign`.
 
 Every SGLang alignment profile must also declare its binary runtime contract.
 The launcher owns this step; there is no separate warm-up command to remember.
@@ -203,27 +211,31 @@ python_runtime:
       version: 0.2.16
       index_url: https://pypi.org/simple
     - name: flashinfer-python
-      version: 0.6.15.post1
+      version: 0.7.3
       index_url: https://pypi.org/simple
     - name: flashinfer-cubin
-      version: 0.6.15.post1
+      version: 0.7.3
       index_url: https://flashinfer.ai/whl
     - name: flashinfer-jit-cache
-      version: 0.6.15.post1
+      version: 0.7.3
+      local_version: cu130
+      index_url: https://flashinfer.ai/whl/cu130
+    - name: flashinfer-jit-cache-sm100a
+      version: 0.7.3
       local_version: cu130
       index_url: https://flashinfer.ai/whl/cu130
       required_files:
-        - flashinfer_jit_cache/jit_cache/fp4_quantization_100/fp4_quantization_100.so
-        - flashinfer_jit_cache/jit_cache/trtllm_comm/trtllm_comm.so
-        - flashinfer_jit_cache/jit_cache/rope/rope.so
-        - flashinfer_jit_cache/jit_cache/fmha_gen/fmha_gen.so
-        - flashinfer_jit_cache/jit_cache/fused_moe_trtllm_sm100/fused_moe_trtllm_sm100.so
-  environment:
-    FLASHINFER_DISABLE_JIT: "1"
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/fp4_quantization_100/fp4_quantization_100.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/trtllm_comm/trtllm_comm.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/rope/rope.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/fmha_gen/fmha_gen.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/fused_moe_trtllm_sm100/fused_moe_trtllm_sm100.so
 ```
 
-The three FlashInfer entries mirror SGLang's pinned cu130 Dockerfile package
-trio; `nvtx` satisfies the separate NSYS iteration-range preflight. The
+The FlashInfer entries mirror SGLang's pinned cu130 Dockerfile packages.
+Since FlashInfer 0.7, `flashinfer-jit-cache` is a metapackage and the shared
+objects live in per-architecture providers; the contract names the B200
+(`sm100a`) provider that holds them. `nvtx` satisfies the separate NSYS iteration-range preflight. The
 prebuilt cache wheel, rather than a worktree-specific Ninja directory under
 `~/.cache`, owns the shared objects. If the declared wheel does not contain a
 required module, the profile fails before loading model weights instead of

@@ -7,7 +7,8 @@ ones the host can't run, so bare ``uv run pytest`` "just works" anywhere:
   - ``needs_binary`` requires the built ``simulator`` binary (release).
   - ``gpu``         requires a CUDA device.
   - ``needs_db``    requires warm ``profile.db`` rows for the config under test.
-  - ``needs_vllm_fork`` requires the ``alignment/profiler/vllm`` submodule checkout
+  - ``needs_vllm_fork`` requires the materialized vLLM reference engine
+    (``just ref materialize vllm``)
                     (the pinned vLLM fork whose alignment records the tests consume).
   - ``agent``       Codex runner+judge runtime — opt-in only (``--run-agent``).
   - ``bench``       perf/timing, non-deterministic — opt-in only (``-m bench``).
@@ -71,8 +72,8 @@ _TIER_MARKERS = {
 # is shared rather than duplicated on either side.
 assert GOLDEN_ROOT == Path(__file__).resolve().parent / "golden"
 
-# The pinned vLLM fork is a submodule a plain worktree does not initialize.
-VLLM_FORK = Path(__file__).resolve().parents[1] / "alignment/profiler/vllm"
+# The patched vLLM source, which a plain worktree does not materialize.
+VLLM_FORK = Path(__file__).resolve().parents[1] / "reference_engines/vllm/src"
 
 
 # ── registration + CLI options ───────────────────────────────────────────────
@@ -128,8 +129,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             reason="release simulator not built (uv run cargo build --release -p simulator)"),
         "needs_db": None,  # presence is config-specific; the test asserts/skips itself
         "needs_vllm_fork": None if has_vllm_fork else pytest.mark.skip(
-            reason="vLLM fork submodule not checked out "
-            "(git submodule update --init alignment/profiler/vllm)"),
+            reason="vLLM reference engine not materialized (just ref materialize vllm)"),
         "agent": None if run_agent else pytest.mark.skip(reason="agent tier opt-in (--run-agent)"),
         "bench": None if bench_requested else pytest.mark.skip(reason="bench tier opt-in (-m bench)"),
     }

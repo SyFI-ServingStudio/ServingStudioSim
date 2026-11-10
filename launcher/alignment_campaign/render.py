@@ -364,6 +364,8 @@ def profile_document(
     document["workload"] = _workload_block(variant, case, host, trace_name, profile_pass.kind)
     if profile_pass.warmup:
         document["workload"]["warmup"] = True
+    if variant.prewarm is not None and profile_pass.kind in ("nsys", "workload_metrics"):
+        document["prewarm"] = dict(variant.prewarm)
     return document
 
 

@@ -56,3 +56,7 @@ model/work/examples/
 # remote.example.yaml is tracked. `.remote/` holds the pinned ssh host keys.
 /remote.yaml
 /.remote/
+
+# Reference-engine source trees: `just ref materialize <engine>` rebuilds them
+# from the engine's BASE and patches/ (reference_engines/README.md).
+reference_engines/*/src/

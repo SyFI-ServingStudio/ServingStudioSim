@@ -898,8 +898,9 @@ own interpreter, and only the envs that image serves. Before anything runs, the
 remote's `/etc/vibesim-profiler-image.json` (written by every profiler
 Dockerfile) must name the inputs of the image this checkout assigns the
 backend's env; nothing is built, synced or sent. Such a remote runs
-`kernel-profile` only. The image's entrypoint is the worker, so start the pod
-with entrypoint `bash -c` and this command, which installs ssh and rsync, keeps
+`kernel-profile` only. Workers never use an image's entrypoint (an engine image
+has none, others' is the worker), so start the pod with entrypoint `bash -c` and
+this command, which installs ssh and rsync, keeps
 the image's environment for ssh sessions, and authorizes the pod's
 `PUBLIC_KEY`:
 
