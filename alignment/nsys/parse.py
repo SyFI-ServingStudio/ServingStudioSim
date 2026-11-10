@@ -1452,8 +1452,9 @@ def parse_trace(
     label/metrics stage (use "decode" for a pure-decode capture window).
 
     `worker_ranks` (worker pid → global rank, from the server log) and
-    `replica_ranks` (ranks per DP replica; `tp_size` when unset) resolve which DP rank ran on which device. Without them the capture is read
-    as a single-rank run.
+    `replica_ranks` (ranks per DP replica; `tp_size` when unset) resolve which
+    DP rank ran on which device. Without them the capture is read as a
+    single-rank run.
 
     `dp_rank_by_device` short-circuits that: an engine whose workers state their
     own device and rank has already answered the question, so its answer is used
