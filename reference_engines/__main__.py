@@ -125,11 +125,51 @@ def _object_cache(engine: str, base: Base) -> tuple[Path, str]:
     return cache, ref
 
 
-def _check_replaceable(dest: Path, *, force: bool) -> None:
-    """Refuse to delete `dest` unless it holds nothing but committed history.
+def _patch_id(text: str) -> str:
+    result = subprocess.run(
+        ["git", "patch-id", "--stable"], input=text, capture_output=True, text=True, check=True
+    )
+    return result.stdout.split(" ", 1)[0]
+
+
+def _unexported_commits(dest: Path, patches: list[Path]) -> list[str]:
+    """Commits over the base, on HEAD or any local branch, that no file in
+    `patches` holds (compared by `git patch-id`, over the paths export writes).
+
+    The base is the tree's root: materialize fetches it at depth 1, so it is
+    the one commit without parents, whatever BASE.yaml says now.
+    """
+
+    exported = {_patch_id(path.read_text()) for path in patches}
+    roots = _git("rev-list", "--max-parents=0", "HEAD", "--branches", cwd=dest).split()
+    commits = _git(
+        "rev-list", "--no-merges", "HEAD", "--branches", *(f"^{root}" for root in roots), cwd=dest
+    ).split()
+    unexported = []
+    for commit in commits:
+        diff = _git(
+            "diff-tree",
+            "-p",
+            "--full-index",
+            commit,
+            "--",
+            ".",
+            *(f":(exclude){path}" for path in _NOT_PATCHED),
+            cwd=dest,
+        )
+        patch_id = _patch_id(diff + "\n")  # empty when the commit touches only _NOT_PATCHED
+        if patch_id and patch_id not in exported:
+            unexported.append(commit)
+    return unexported
+
+
+def _check_replaceable(dest: Path, *, force: bool, patches: list[Path]) -> None:
+    """Refuse to delete `dest` unless it holds nothing `patches` does not.
 
     Untracked and ignored files count: a host venv (`src/.venv`) or a new file
-    of an unexported patch lives there.
+    of an unexported patch lives there. So do commits not exported to
+    `patches`, a stash, and an unfinished `git am` (a patch that did not apply
+    leaves the tree clean, its work in `.git/rebase-apply`).
     """
 
     if not dest.exists():
@@ -147,12 +187,34 @@ def _check_replaceable(dest: Path, *, force: bool) -> None:
             f"{dest} holds work a replace would delete; export, commit, move or remove "
             f"it first:\n  {shown}"
         )
+    git_dir = Path(_git("rev-parse", "--absolute-git-dir", cwd=dest))
+    pending = [
+        name
+        for name in ("rebase-apply", "rebase-merge", "MERGE_HEAD", "CHERRY_PICK_HEAD")
+        if (git_dir / name).exists()
+    ]
+    if pending:
+        raise RefError(
+            f"{dest} has an unfinished git operation ({', '.join(pending)}); finish it and "
+            "`export-patches`, or abort it, first"
+        )
+    if (git_dir / "refs" / "stash").exists() or (git_dir / "logs" / "refs" / "stash").exists():
+        raise RefError(f"{dest} has a stash a replace would delete; apply or drop it first")
+    unexported = _unexported_commits(dest, patches)
+    if unexported:
+        shown = "\n  ".join(
+            _git("log", "--no-walk", "--format=%h %s", *unexported[:10], cwd=dest).splitlines()
+        )
+        raise RefError(
+            f"{dest} has commits not in patches/ a replace would delete; `export-patches` "
+            f"them (or drop them) first:\n  {shown}"
+        )
 
 
 def materialize(engine: str, dest: Path, *, force: bool = False) -> str:
     base = read_base(engine)
     patches = patch_files(engine)
-    _check_replaceable(dest, force=force)
+    _check_replaceable(dest, force=force, patches=patches)
     if dest.exists():
         shutil.rmtree(dest)
     cache, ref = _object_cache(engine, base)
@@ -304,7 +366,7 @@ def bump_base(
     old = read_base(engine)
     # Before anything is written: a tree materialize cannot replace would
     # leave BASE.yaml moved and the tree on the old base.
-    _check_replaceable(source_dir(engine), force=True)
+    _check_replaceable(source_dir(engine), force=True, patches=patch_files(engine))
     digests = platform_digests(image)
     for name, other in platform_images.items():
         found = platform_digests(other)

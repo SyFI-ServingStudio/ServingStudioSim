@@ -128,25 +128,71 @@ def test_a_tree_with_untracked_or_ignored_work_is_not_replaced(tmp_path):
     (tree / ".gitignore").write_text(".venv/\n")
     _git("add", ".gitignore", cwd=tree)
     _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base", cwd=tree)
-    _check_replaceable(tree, force=True)  # only committed history: replaceable
+    _check_replaceable(tree, force=True, patches=[])  # only committed history: replaceable
     with pytest.raises(RefError, match="pass --force"):
-        _check_replaceable(tree, force=False)
+        _check_replaceable(tree, force=False, patches=[])
 
     (tree / ".venv").mkdir()
     (tree / ".venv" / "python").write_text("")
     with pytest.raises(RefError, match=r"\.venv"):
-        _check_replaceable(tree, force=True)
+        _check_replaceable(tree, force=True, patches=[])
     shutil.rmtree(tree / ".venv")
 
     (tree / "new_patch_file.py").write_text("")
     with pytest.raises(RefError, match="new_patch_file.py"):
-        _check_replaceable(tree, force=True)
+        _check_replaceable(tree, force=True, patches=[])
 
     plain = tmp_path / "plain"
     plain.mkdir()
     (plain / "x").write_text("")
     with pytest.raises(RefError, match="not a materialized tree"):
-        _check_replaceable(plain, force=True)
+        _check_replaceable(plain, force=True, patches=[])
+
+
+def test_a_tree_with_unexported_commits_a_stash_or_a_paused_am_is_not_replaced(tmp_path):
+    from reference_engines.__main__ import RefError, _check_replaceable
+
+    tree, patches = tmp_path / "src", tmp_path / "patches"
+    tree.mkdir()
+    commit = ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam")
+    _git("init", "-q", "-b", "reference/x", cwd=tree)
+    (tree / "a.py").write_text("base\n")
+    _git("add", "a.py", cwd=tree)
+    _git(*commit, "base", cwd=tree)
+    (tree / "a.py").write_text("patched\n")
+    _git(*commit, "exported", cwd=tree)
+    _git("format-patch", "-q", "--zero-commit", "-o", str(patches), "HEAD~1..HEAD", cwd=tree)
+    exported = sorted(patches.glob("*.patch"))
+    _check_replaceable(tree, force=True, patches=exported)
+
+    # A commit on HEAD that export-patches has not written.
+    (tree / "a.py").write_text("new work\n")
+    _git(*commit, "not exported", cwd=tree)
+    with pytest.raises(RefError, match="not exported"):
+        _check_replaceable(tree, force=True, patches=exported)
+    _git("reset", "-q", "--hard", "HEAD~1", cwd=tree)
+    _check_replaceable(tree, force=True, patches=exported)
+
+    # ... or on another branch.
+    _git("switch", "-q", "-c", "side", cwd=tree)
+    (tree / "a.py").write_text("side work\n")
+    _git(*commit, "side work", cwd=tree)
+    _git("switch", "-q", "reference/x", cwd=tree)
+    with pytest.raises(RefError, match="side work"):
+        _check_replaceable(tree, force=True, patches=exported)
+    _git("branch", "-q", "-D", "side", cwd=tree)
+
+    # A stash.
+    (tree / "a.py").write_text("stashed\n")
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "stash", "-q", cwd=tree)
+    with pytest.raises(RefError, match="stash"):
+        _check_replaceable(tree, force=True, patches=exported)
+    _git("stash", "drop", "-q", cwd=tree)
+
+    # A `git am` paused on a patch that did not apply (the tree stays clean).
+    (tree / ".git" / "rebase-apply").mkdir()
+    with pytest.raises(RefError, match="rebase-apply"):
+        _check_replaceable(tree, force=True, patches=exported)
 
 
 @pytest.mark.parametrize("engine", ENGINES)

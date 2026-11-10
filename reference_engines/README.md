@@ -48,8 +48,9 @@ pass only; the manifest key leaves the field out, so captures still match.
 out, and applies the patches with `git am`. Every commit gets a fixed committer
 and its author date as committer date, so a BASE.yaml and a patch series give the
 same commit ids on every host, on branch `reference/<engine>`. It refuses to
-replace an existing tree without `--force`, and a tree with uncommitted changes
-even then.
+replace an existing tree without `--force`, and even then a tree holding
+anything `patches/` does not: uncommitted, untracked or ignored files, commits
+(on any local branch) not yet exported, a stash, or an unfinished `git am`.
 
 **export-patches** rewrites `patches/` from the commits a checkout has over
 BASE.yaml's commit. A file depends only on its own commit (no `n/m` numbering in the
