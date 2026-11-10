@@ -106,8 +106,7 @@ impl BoundedReplay {
             .iter()
             .max()
             .ok_or("decoder SWA bounded replay needs kv_source_layer_ids")?;
-        if model.engram_layer_ids.contains(&start)
-            || !model.index_source_layer_ids.contains(&start)
+        if model.engram_layer_ids.contains(&start) || !model.index_source_layer_ids.contains(&start)
         {
             return Err(format!(
                 "bounded replay: the last KV source layer {start} must be an index source without Engram"
@@ -130,7 +129,10 @@ impl BoundedReplay {
     }
 
     fn is_late(&self, layers: &[u32]) -> std::result::Result<bool, String> {
-        let late = layers.iter().filter(|&&l| l >= self.late_layer_start).count();
+        let late = layers
+            .iter()
+            .filter(|&&l| l >= self.late_layer_start)
+            .count();
         match late {
             0 => Ok(false),
             n if n == layers.len() => Ok(true),
@@ -210,10 +212,12 @@ pub fn build(
         .collect();
     let folded = fold_layers(&layers);
     let bounded_replay = if settings.decoder_swa_bounded_replay {
-        Some(BoundedReplay::from_model(model).map_err(|reason| BuildError::FitFailed {
-            kind: ARCH_KIND,
-            reason,
-        })?)
+        Some(
+            BoundedReplay::from_model(model).map_err(|reason| BuildError::FitFailed {
+                kind: ARCH_KIND,
+                reason,
+            })?,
+        )
     } else {
         None
     };
@@ -545,7 +549,9 @@ impl DeepseekV41SglangModel {
         logits_rows: u32,
         ev: &mut Evaluator,
     ) -> u32 {
-        let tail = self.bounded_replay.and_then(|replay| replay.tail_input(input));
+        let tail = self
+            .bounded_replay
+            .and_then(|replay| replay.tail_input(input));
         self.prologue.eval(input.rows, ev);
         self.eval_plan(&self.plan, input, tail.as_ref(), ev);
         self.head.eval(logits_rows, self.tp_size, ev);

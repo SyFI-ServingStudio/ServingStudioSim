@@ -1078,7 +1078,8 @@ pub fn deepseek_v41_sglang(
         .context("loading exact DeepSeek-V4.1-Flash model config")?;
     let settings = sg::DeepseekV41SglangSettings {
         gpu_name: gpu.to_string(),
-        path: crate::worklet::sglang_dsv41_tp::SglangDsv41KernelPath::of(gpu)?.with_gpu_p2p(gpu_p2p),
+        path: crate::worklet::sglang_dsv41_tp::SglangDsv41KernelPath::of(gpu)?
+            .with_gpu_p2p(gpu_p2p),
         max_model_len: sg::resolve_max_model_len(max_model_len, model_cfg.max_position_embeddings)?,
         engram_residency: engram_residency.to_string(),
         decoder_swa_bounded_replay,
@@ -1150,7 +1151,8 @@ pub fn deepseek_v41_sglang_dspark(
     let dspark = dsv41_dspark_spec(&model_spec.model_config)?;
     let settings = sg::DeepseekV41SglangSettings {
         gpu_name: gpu.to_string(),
-        path: crate::worklet::sglang_dsv41_tp::SglangDsv41KernelPath::of(gpu)?.with_gpu_p2p(gpu_p2p),
+        path: crate::worklet::sglang_dsv41_tp::SglangDsv41KernelPath::of(gpu)?
+            .with_gpu_p2p(gpu_p2p),
         max_model_len: sg::resolve_max_model_len(max_model_len, model_cfg.max_position_embeddings)?,
         engram_residency: engram_residency.to_string(),
         decoder_swa_bounded_replay,

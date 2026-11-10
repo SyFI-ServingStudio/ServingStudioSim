@@ -4032,7 +4032,12 @@ mod tests {
         let mut samples: Vec<DutyCycleSample> = (0..20)
             .map(|index| {
                 let measured = 205.0 + (index % 4) as f64;
-                duty_sample(index, "mixed", measured + 30.0 + (index % 3) as f64, measured)
+                duty_sample(
+                    index,
+                    "mixed",
+                    measured + 30.0 + (index % 3) as f64,
+                    measured,
+                )
             })
             .collect();
         samples.push(duty_sample(100, "mixed", 4979.7, 2912.2));
