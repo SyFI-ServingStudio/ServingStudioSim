@@ -146,5 +146,8 @@ def test_an_unwrapped_server_is_signalled_at_once_despite_a_stubborn_helper(tmp_
     assert time.monotonic() - started < 10  # not the helper-wait timeout
     assert proc.returncode == 0
     assert log.read_text().split() == ["SIGINT"]
-    for group in helper_groups:
-        os.killpg(group, signal.SIGKILL)
+    # The helper ignored the SIGINT; it does not outlive the server.
+    deadline = time.monotonic() + 10
+    while runner._groups_alive(helper_groups):
+        assert time.monotonic() < deadline, "the helper outlived the server"
+        time.sleep(0.05)

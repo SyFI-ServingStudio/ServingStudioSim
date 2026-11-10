@@ -1044,6 +1044,9 @@ def _shutdown(proc: subprocess.Popen, timeout: float = 120.0, *, wrapped: bool =
     `wrapped=False`: `proc` is the server itself (no nsys). Its own group then
     gets the SIGINT in the same round, so a helper of the server that sits in
     a group of its own and ignores SIGINT cannot hold the server's stop back.
+
+    Either way, a helper group still alive once `proc` has exited is killed:
+    it would otherwise keep GPU memory or a port into the next run.
     """
 
     if proc.poll() is not None:
@@ -1053,19 +1056,23 @@ def _shutdown(proc: subprocess.Popen, timeout: float = 120.0, *, wrapped: bool =
     except ProcessLookupError:
         return
     targets = _descendant_groups(proc.pid)
-    if not wrapped:
-        _signal_groups([own, *targets], signal.SIGINT)
+    try:
+        if not wrapped:
+            _signal_groups([own, *targets], signal.SIGINT)
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _signal_groups([own, *targets], signal.SIGKILL)
+            return
+        _signal_groups(targets, signal.SIGINT)
+        deadline = time.monotonic() + timeout
+        while _groups_alive(targets) and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.2)
+        _signal_groups([own], signal.SIGINT)
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             _signal_groups([own, *targets], signal.SIGKILL)
-        return
-    _signal_groups(targets, signal.SIGINT)
-    deadline = time.monotonic() + timeout
-    while _groups_alive(targets) and proc.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.2)
-    _signal_groups([own], signal.SIGINT)
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _signal_groups([own, *targets], signal.SIGKILL)
+    finally:
+        if proc.poll() is not None:
+            _signal_groups(targets, signal.SIGKILL)  # whatever outlived the server
