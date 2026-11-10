@@ -263,3 +263,43 @@ def test_a_native_change_in_a_patch_is_reported(tmp_path, monkeypatch):
         "0001-x.patch: csrc/x y.cu",  # a path with a space
         "0001-x.patch: csrc/café.cu",  # a C-quoted path
     ]
+
+
+@pytest.mark.parametrize("quote_path", ["true", "false"])
+def test_patch_paths_reads_real_format_patch_headers(tmp_path, quote_path):
+    tree = tmp_path / "t"
+    (tree / "csrc").mkdir(parents=True)
+    (tree / "vllm" / "x b").mkdir(parents=True)
+    _git("init", "-q", cwd=tree)
+    (tree / "csrc" / "modé.cu").write_text("a\n")
+    (tree / "csrc" / "bïn.bin").write_bytes(b"\x00\x01")
+    (tree / "vllm" / "x b" / "y.py").write_text("a\n")
+    (tree / "vllm" / "中文.py").write_text("a\n")
+    (tree / "vllm" / "body.py").write_text("-- a/csrc/not_a_header.cu\n")
+    _git("add", "-A", cwd=tree)
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base", cwd=tree)
+    (tree / "csrc" / "modé.cu").chmod(0o755)  # mode only
+    (tree / "csrc" / "bïn.bin").write_bytes(b"\x00\x02")  # binary
+    (tree / "csrc" / "new bïn.bin").write_bytes(b"\x00\x03")  # new binary
+    (tree / "vllm" / "x b" / "y.py").write_text("b\n")  # " b/" inside the path
+    _git("mv", "vllm/中文.py", "csrc/中文.cu", cwd=tree)  # rename into csrc
+    (tree / "vllm" / "body.py").write_text("")  # removes a line reading "-- a/..."
+    _git("add", "-A", cwd=tree)
+    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "change", cwd=tree)
+    text = subprocess.run(
+        ["git", "-c", f"core.quotePath={quote_path}", "format-patch", "--binary", "--stdout",
+         "-1", "HEAD"],
+        cwd=tree, check=True, capture_output=True, text=True,
+    ).stdout
+
+    assert sorted(reference_engines.patch_paths(text)) == sorted(
+        [
+            "csrc/modé.cu",
+            "csrc/bïn.bin",
+            "csrc/new bïn.bin",
+            "vllm/x b/y.py",
+            "vllm/中文.py",
+            "csrc/中文.cu",
+            "vllm/body.py",
+        ]
+    )

@@ -232,22 +232,71 @@ def format_base(base: Base, header: str) -> str:
 _INSTALLED = {"vllm": ("vllm/",), "sglang": ("python/sglang/",)}
 _NOT_RUN = re.compile(r"(^|/)(tests?|docs)/|\.md$")
 _RENAME_LINE = re.compile(r"(?:rename|copy) (?:from|to) (.+)")
+_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+
+
+def _take_quoted(text: str) -> tuple[str, str]:
+    """Split a leading C-quoted string (git's `core.quotePath` form) off
+    `text`: (its decoded value, the rest after the closing quote)."""
+
+    raw = bytearray()
+    index = 1
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            return raw.decode("utf-8", "replace"), text[index + 1 :]
+        if char == "\\" and index + 1 < len(text):
+            following = text[index + 1]
+            octal = text[index + 1 : index + 4]
+            if len(octal) == 3 and all(digit in "01234567" for digit in octal):
+                raw.append(int(octal, 8))
+                index += 4
+                continue
+            raw.append(_ESCAPES.get(following, ord(following)))
+            index += 2
+            continue
+        raw.extend(char.encode("utf-8"))
+        index += 1
+    raise ValueError(f"unterminated quoted path: {text!r}")
 
 
 def _unquote(path: str) -> str:
     """A path as git wrote it: C-quoted ("a/\\303\\251.py") when unusual."""
 
-    if len(path) > 1 and path[0] == path[-1] == '"':
-        raw = path[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape")
-        return raw.encode("latin-1").decode("utf-8", "replace")
-    return path
+    return _take_quoted(path)[0] if path.startswith('"') else path
+
+
+def _header_paths(rest: str) -> tuple[str, ...]:
+    """The two paths of `diff --git <rest>`, each `a/x` or `"a/..."`."""
+
+    if rest.startswith('"'):
+        old, tail = _take_quoted(rest)
+        tail = tail.lstrip(" ")
+        new = _take_quoted(tail)[0] if tail.startswith('"') else tail
+    elif rest.startswith("a/"):
+        if ' "b/' in rest:
+            old, _, quoted = rest.partition(' "')
+            new = _take_quoted('"' + quoted)[0]
+        else:
+            # `a/X b/X` when unrenamed: split in the middle, so a path that
+            # holds " b/" itself is read whole; otherwise at " b/".
+            half = (len(rest) - 1) // 2
+            if rest[half:half + 3] == " b/" and rest[2:half] == rest[half + 3 :]:
+                old, new = rest[:half], "b/" + rest[half + 3 :]
+            else:
+                old, _, tail = rest.partition(" b/")
+                new = "b/" + tail
+    else:
+        return ()
+    return tuple(path[2:] for path in (old, new) if path[:2] in ("a/", "b/"))
 
 
 def patch_paths(text: str) -> list[str]:
     """Every path a patch touches, both sides of a rename or copy.
 
-    Read from each file's header only (`diff --git` up to its first hunk), so
-    a body line that happens to read `--- a/x` is not taken for one.
+    Read from each file's header only (`diff --git` up to its first hunk or
+    binary payload), so a body line that happens to read `--- a/x` is not
+    taken for one.
     """
 
     paths: dict[str, None] = {}
@@ -255,12 +304,9 @@ def patch_paths(text: str) -> list[str]:
     for line in text.splitlines():
         if line.startswith("diff --git "):
             in_header = True
-            rest = line[len("diff --git ") :]
-            if rest.startswith("a/") and " b/" in rest:  # unquoted: a/x b/x (mode-only too)
-                old, _, new = rest[2:].partition(" b/")
-                paths.update(dict.fromkeys((old, new)))
+            paths.update(dict.fromkeys(_header_paths(line[len("diff --git ") :])))
             continue
-        if line.startswith("@@"):
+        if line.startswith(("@@", "GIT binary patch", "Binary files ")):
             in_header = False
         if not in_header:
             continue
