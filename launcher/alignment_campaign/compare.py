@@ -25,6 +25,7 @@ not hidden by an aggregate that looks fine.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,6 +76,9 @@ class Comparison:
     judgements: tuple[Judgement, ...]
     unavailable: tuple[str, ...]
     missing_metrics: tuple[str, ...]
+    #: `case_key -> {field: {value, source, ...}}`: the inputs each case's
+    #: simulation read from its own workload pass (`calibration.json`).
+    capture_calibration: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
     @property
     def failures(self) -> tuple[Judgement, ...]:
@@ -143,6 +147,7 @@ def compare(
     specs: dict[str, MetricSpec] = {spec.name: spec for spec in metric_specs(schemas)}
 
     stores: dict[str, Golden] = {}
+    capture_calibration: dict[str, dict[str, Any]] = {}
     judgements: list[Judgement] = []
     unavailable: list[str] = []
     missing: list[str] = []
@@ -150,6 +155,9 @@ def compare(
     for case_key, body in sorted(extraction.get("cases", {}).items()):
         if not body.get("available"):
             unavailable.append(case_key)
+        captured = (body.get("provenance") or {}).get("capture_calibration")
+        if captured:
+            capture_calibration[case_key] = captured
         variant_name, _, slug = case_key.partition("/")
         overrides = per_case.get(slug, {}) or {}
         rationale = str(overrides.get("rationale", ""))
@@ -200,6 +208,7 @@ def compare(
         judgements=tuple(judgements),
         unavailable=tuple(unavailable),
         missing_metrics=tuple(missing),
+        capture_calibration=capture_calibration,
     )
 
 
@@ -250,6 +259,14 @@ def record(
                     "recorded across a schema change compares different statistics"
                 )
 
+    uncalibrated = _missing_capture_calibration(extraction, pack)
+    if uncalibrated:
+        raise RecordRefused(
+            "refusing to record: these from_capture inputs have no calibration.json in the "
+            "run, so nothing says which value the simulation used — "
+            + ", ".join(uncalibrated)
+        )
+
     provisional = pack.provisional_fields
     if provisional and not accept_provisional:
         raise RecordRefused(
@@ -277,6 +294,18 @@ def record(
         written.append(store.path)
         written.append(_write_provenance(store.path, extraction, pack, provisional))
     return written
+
+
+def _missing_capture_calibration(extraction: dict[str, Any], pack: Pack) -> list[str]:
+    """`<case_key>.<field>` for each from_capture input the extraction lacks."""
+    missing: list[str] = []
+    for case_key, body in sorted(extraction.get("cases", {}).items()):
+        case = pack.case_named(case_key.partition("/")[2])
+        if case is None:
+            continue
+        captured = (body.get("provenance") or {}).get("capture_calibration") or {}
+        missing += [f"{case_key}.{name}" for name in case.capture_fields if name not in captured]
+    return missing
 
 
 def _portable(value: str) -> str:
@@ -334,6 +363,14 @@ def _write_provenance(
         "formulas": extraction.get("formulas", {}),
         "provisional_inputs": provisional,
     }
+    captured = {
+        case_key: (body.get("provenance") or {}).get("capture_calibration")
+        for case_key, body in sorted(extraction.get("cases", {}).items())
+        if (body.get("provenance") or {}).get("capture_calibration")
+    }
+    if captured:
+        # Sources are relative to each case directory, so nothing machine-bound.
+        document["capture_calibration"] = captured
     if pack.gpu_time_multiplier is not None:
         multiplier = pack.gpu_time_multiplier
         document["gpu_time_multiplier"] = {
@@ -394,6 +431,14 @@ def render_text(comparison: Comparison) -> str:
                 f"{_format(row.value, row.bound):>10}  {row.status}{tolerance}{drift}"
             )
 
+    if comparison.capture_calibration:
+        lines.append("")
+        lines.append("inputs read from each case's workload pass (calibration.json):")
+        for case_key, fields in sorted(comparison.capture_calibration.items()):
+            for name, body in sorted(fields.items()):
+                value, source = _capture_value(body), _capture_source(body)
+                lines.append(f"  {case_key}  {name} = {value}  ({source})")
+
     if comparison.failures:
         lines.append("")
         lines.append("out of tolerance:")
@@ -415,6 +460,14 @@ def render_text(comparison: Comparison) -> str:
         f"{len(comparison.drifts)} drifted"
     )
     return "\n".join(lines) + "\n"
+
+
+def _capture_value(body: Any) -> str:
+    return json.dumps(body.get("value")) if isinstance(body, dict) else str(body)
+
+
+def _capture_source(body: Any) -> str:
+    return str(body.get("source", "?")) if isinstance(body, dict) else "?"
 
 
 def render_markdown(comparison: Comparison, specs: tuple[MetricSpec, ...]) -> str:
@@ -439,6 +492,19 @@ def render_markdown(comparison: Comparison, specs: tuple[MetricSpec, ...]) -> st
             item = values.get((case_key, spec.name))
             cells.append("—" if item is None else _format(item.value, item.bound))
         lines.append(f"| {case_key} | " + " | ".join(cells) + " |")
+
+    if comparison.capture_calibration:
+        lines += [
+            "",
+            "## Inputs read from the capture",
+            "",
+            "| Case | Input | Value | Source |",
+            "|---|---|---|---|",
+        ]
+        for case_key, fields in sorted(comparison.capture_calibration.items()):
+            for name, body in sorted(fields.items()):
+                value, source = _capture_value(body), _capture_source(body)
+                lines.append(f"| {case_key} | {name} | `{value}` | `{source}` |")
 
     exceptions = [item for item in comparison.judgements if item.rationale]
     if exceptions:
@@ -468,6 +534,7 @@ def as_json(comparison: Comparison) -> dict[str, Any]:
         "pack": comparison.pack_name,
         "accepted": comparison.accepted,
         "unavailable": list(comparison.unavailable),
+        "capture_calibration": comparison.capture_calibration,
         "judgements": [
             {
                 "case": item.case_key,

@@ -71,8 +71,11 @@ def discover_case_dirs(root: Path) -> list[Path]:
     return sorted(child for child in root.iterdir() if child.is_dir() and is_case_directory(child))
 
 
-def extract(roots: list[Path], pack: Pack | None = None) -> Extraction:
-    """Read every case under `roots` into one document."""
+def extract(
+    roots: list[Path], pack: Pack | None = None, *, only: set[str] | None = None
+) -> Extraction:
+    """Read every case under `roots` into one document. `only` keeps those case
+    slugs (`--phase1`); it needs a pack, which is what names them."""
     by_slug: dict[str, Path] = {}
     resolved_roots: list[Path] = []
     for root in roots:
@@ -96,6 +99,8 @@ def extract(roots: list[Path], pack: Pack | None = None) -> Extraction:
             case = pack.case_named(slug)
             if case is None:
                 continue  # a directory the pack does not declare is not this matrix
+            if only is not None and case.slug not in only:
+                continue
             variant = case.variant
             expected = case.workload_trace.request_count
         measurement = measure_case(directory, expected_requests=expected)
@@ -103,6 +108,8 @@ def extract(roots: list[Path], pack: Pack | None = None) -> Extraction:
 
     if pack is not None:
         for case in pack.cases:
+            if only is not None and case.slug not in only:
+                continue
             key = f"{case.variant}/{case.slug}"
             if key not in cases:
                 cases[key] = CaseMeasurement(

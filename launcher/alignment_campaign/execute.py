@@ -11,6 +11,10 @@ exit codes separately; do not serialize the campaign for attribution's sake").
 So there is a `--phase` and there is no `--all`. Every arrow between phases stays
 a human checkpoint; what gets automated is typing the same command fifteen times.
 Simulation reads its worker settings directly from the rendered preset.
+A case with `from_capture` inputs gets that preset written by `run` itself, from
+its workload pass, right before `timing_predict` or `simulation` launches
+(`render.materialize`); until that pass has run, both phases are blocked with
+the reason.
 
 ## Readiness before spend
 
@@ -41,15 +45,21 @@ from ..process import ProcessResult, ProcessSpec, ProcessSupervisor
 from ..process.journal import RunJournal, StageState
 from ..process.leases import LauncherLeases
 from ..process.markers import clear_marker, has_marker, mark_complete
-from .pack import REPO_ROOT, Case, Pack, Variant
+from . import calibration
+from .pack import REPO_ROOT, Case, Pack, PackError, Variant
 from .render import (
     ANALYSIS_E2E_PHASE,
     ANALYSIS_KERNEL_PHASE,
     SIMULATION_PHASE,
     TIMING_PREDICT_PHASE,
     config_stem,
+    materialize,
     phase_names,
 )
+
+#: Phases that read `simulation.yaml`, so they wait for a case's from_capture
+#: inputs and get that preset written right before they launch.
+CAPTURE_DEPENDENT_PHASES = frozenset({TIMING_PREDICT_PHASE, SIMULATION_PHASE})
 
 LABELED_SEQUENCES_NAME = "kernel_sequences_labeled.json"
 _PROCESS_SUPERVISOR = ProcessSupervisor()
@@ -175,16 +185,33 @@ def phase_complete(case_dir: Path, variant: Variant, phase: str) -> bool:
     return has_marker(directory) or bool(artifacts)
 
 
-def phase_requirements(case_dir: Path, variant: Variant, phase: str) -> list[str]:
+def phase_requirements(
+    case_dir: Path,
+    variant: Variant,
+    phase: str,
+    *,
+    pack: Pack | None = None,
+    case: Case | None = None,
+) -> list[str]:
     """What this phase still needs. Empty means ready.
 
     Deliberately expressed as *inputs of P*, never as "run the previous phase":
     the campaign must not be able to schedule a predecessor as a side effect of
-    being asked for P.
+    being asked for P. With `pack` and `case`, a from_capture input is one of
+    those: it needs the workload pass's files, and `simulation.yaml` is then
+    written at launch rather than required beforehand.
     """
     missing: list[str] = []
     stem = config_stem(variant, phase)
-    if not (case_dir / f"{stem}.yaml").is_file():
+    captured = (
+        pack is not None
+        and case is not None
+        and bool(case.capture_fields)
+        and phase in CAPTURE_DEPENDENT_PHASES
+    )
+    if captured:
+        missing += calibration.requirements(pack, case, case_dir)
+    if not (case_dir / f"{stem}.yaml").is_file() and not (captured and phase == SIMULATION_PHASE):
         missing.append(f"{stem}.yaml not rendered")
 
     if variant.pass_named(phase) is not None:
@@ -298,7 +325,7 @@ def plan_phase(
         if not refresh and phase_complete(case_dir, variant, phase):
             plans.append(PhasePlan(case.slug, phase, case_dir, "complete"))
             continue
-        blockers = phase_requirements(case_dir, variant, phase)
+        blockers = phase_requirements(case_dir, variant, phase, pack=pack, case=case)
         if blockers:
             plans.append(PhasePlan(case.slug, phase, case_dir, "blocked", tuple(blockers)))
             continue
@@ -472,6 +499,33 @@ def run_phase(
         runtime=runtime,
         allow_autotune=allow_autotune,
     )
+    plans = _materialize_captured(pack, plans)
     report = RunReport(phase=phase, plans=plans)
     report.results = asyncio.run(_run_all(pack, plans, parallelism=parallelism, refresh=refresh))
     return report
+
+
+def _materialize_captured(pack: Pack, plans: tuple[PhasePlan, ...]) -> tuple[PhasePlan, ...]:
+    """Write each ready case's from_capture preset before its phase launches.
+
+    A case whose capture cannot be read after all is blocked with the reason,
+    exactly like an input missing at planning time.
+    """
+    by_slug = {case.slug: case for case in pack.cases}
+    updated: list[PhasePlan] = []
+    for plan in plans:
+        case = by_slug.get(plan.case_slug)
+        if (
+            plan.selected
+            and case is not None
+            and case.capture_fields
+            and plan.phase in CAPTURE_DEPENDENT_PHASES
+        ):
+            try:
+                materialize(pack, case, plan.directory, REPO_ROOT)
+            except (PackError, OSError, ValueError, KeyError) as error:
+                plan = PhasePlan(
+                    plan.case_slug, plan.phase, plan.directory, "blocked", (str(error),)
+                )
+        updated.append(plan)
+    return tuple(updated)

@@ -24,7 +24,12 @@ fall into four groups:
    which catches a copy-pasted case that measures nothing new.
 4. **The policy is complete.** Every metric the engine computes has a tolerance,
    every per-case exception states why, and every calibrated value says how it
-   was obtained.
+   was obtained. A `from_capture` value is checked for a source it can be read
+   from (a workload pass, an engine with an extractor); its rendering is checked
+   with a stand-in value, since the real one exists only after the capture.
+
+A tracked trace (`workload_trace: {path: ...}`) is checked the same way as a
+generated one: its file's sha256 must match `traces/invariants.json`.
 
 The stub host is built in code rather than read from `presets/alignment/hosts/`
 so `check` cannot be broken by editing an example file. It deliberately omits
@@ -35,6 +40,7 @@ GPU and no engine venv.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import tempfile
@@ -51,7 +57,7 @@ from ..alignment_config import (
     load_timing_predict_config,
 )
 from ..corpus import ROUTING_FILES
-from .pack import Case, Finding, HostProfile, Pack, PackError
+from .pack import Calibrated, Case, Finding, HostProfile, Pack, PackError
 from .render import (
     ANALYSIS_E2E_PHASE,
     ANALYSIS_KERNEL_PHASE,
@@ -507,6 +513,8 @@ def _check_calibration(pack: Pack) -> list[Finding]:
     if pack.gpu_time_multiplier is not None:
         fields.insert(0, ("gpu_time_multiplier", pack.gpu_time_multiplier))
     for where, value in fields:
+        if value.from_capture:
+            continue
         if value.provisional:
             findings.append(
                 Finding("warn", where,
@@ -518,7 +526,49 @@ def _check_calibration(pack: Pack) -> list[Finding]:
                         "measured but cites no evidence path; the run that produced "
                         "it cannot be found later")
             )
+    findings += _check_capture_sources(pack)
     return findings
+
+
+def _check_capture_sources(pack: Pack) -> list[Finding]:
+    """A from_capture field needs a workload pass to read and an extractor for
+    its engine; both are known before anything runs."""
+    findings: list[Finding] = []
+    for case in pack.cases:
+        if not case.capture_fields or case.variant not in pack.variants:
+            continue
+        variant = pack.variant_of(case)
+        where = f"cases[{case.slug}]"
+        if not any(item.kind == "workload_metrics" for item in variant.profile_passes):
+            findings.append(Finding(
+                "error", where,
+                f"{sorted(case.capture_fields)} from_capture needs a workload_metrics pass; "
+                f"variant {variant.name} declares none",
+            ))
+        if "attn_gpu_memory_gb" in case.capture_fields and variant.engine != "vllm":
+            findings.append(Finding(
+                "error", f"{where}.attn_gpu_memory_gb",
+                f"from_capture has no {variant.engine} extractor (only vLLM's KV pool log "
+                "line is read); declare a measured value",
+            ))
+    return findings
+
+
+def capture_stand_in(pack: Pack, case: Case) -> Case:
+    """`case` with placeholder values in its from_capture fields.
+
+    Only `check` uses this, to hand a renderable preset to the loaders before
+    any capture exists. Nothing it produces is run or written to a case dir.
+    """
+    changes = {}
+    for name, value in case.capture_fields.items():
+        if name == "attn_gpu_memory_gb":
+            stand_in: object = 1.0
+        else:
+            depth = pack.variant_of(case).arch.get("draft_tokens") or 1
+            stand_in = [0.5] * int(depth)
+        changes[name] = Calibrated(value=stand_in, status="measured", derived_from="check stand-in")
+    return dataclasses.replace(case, **changes) if changes else case
 
 
 def _check_rendering(pack: Pack, host: HostProfile) -> list[Finding]:
@@ -533,6 +583,7 @@ def _check_rendering(pack: Pack, host: HostProfile) -> list[Finding]:
             if case.variant not in pack.variants:
                 continue  # already reported by _check_identity
             where = f"cases[{case.slug}]"
+            case = capture_stand_in(pack, case)
             case_dir = out_root / case.slug
             case_dir.mkdir(parents=True, exist_ok=True)
             try:

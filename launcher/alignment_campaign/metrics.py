@@ -338,6 +338,9 @@ def measure_case(directory: Path, *, expected_requests: int | None = None) -> Ca
         values[spec.name] = value
 
     provenance = _provenance(documents)
+    captured = _capture_calibration(directory)
+    if captured:
+        provenance["capture_calibration"] = captured
     if "e2e" in documents:
         from alignment.request_population import audit_alignment_population
 
@@ -364,6 +367,20 @@ def measure_case(directory: Path, *, expected_requests: int | None = None) -> Ca
         provenance=provenance,
         issues=tuple(issues),
     )
+
+
+def _capture_calibration(directory: Path) -> dict[str, Any]:
+    """The from_capture inputs this case's simulation used (`calibration.json`),
+    so the report and a recorded golden say which values and files they were."""
+    from .calibration import load
+
+    try:
+        document = load(directory)
+    except ValueError:
+        return {"unreadable": "calibration.json is not JSON"}
+    if not document:
+        return {}
+    return dict(document.get("fields", {}))
 
 
 def _provenance(documents: dict[str, dict[str, Any]]) -> dict[str, Any]:

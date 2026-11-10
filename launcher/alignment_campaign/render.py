@@ -20,14 +20,26 @@ copy of; configs are built as dicts and dumped, so a malformed nesting is a
 | `server.extra_args`                  | variant + `--max-model-len` from case   |
 | `--speculative-config` `model`       | host `checkpoints[variant.draft_checkpoint]` |
 | `arch.max_model_len`                 | case                                    |
-| `worker.attn_gpu_memory_gb`          | case (calibrated)                       |
+| `worker.attn_gpu_memory_gb`          | case (calibrated; a `from_capture` one  |
+|                                      | is read from the case's workload pass,  |
+|                                      | see `calibration.py`)                   |
 | `worker.gpu_time_multiplier`         | pack `gpu_time_multiplier` (calibrated  |
 |                                      | on a workload outside the matrix), else |
 |                                      | 1.0; a case's own recommendation is     |
 |                                      | only reported, never injected           |
 | `worker.prefill_gpu_time_multiplier` | variant, verbatim (a pack-declared      |
 |                                      | calibration, never the recommendation)  |
-| `workload.arrival_mode` / `rate`     | case                                    |
+| `workload.arrival_mode` / `rate`     | case; a tracked trace replays its       |
+|                                      | recorded arrivals (`request_rate: 1.0`) |
+
+## Inputs that wait for a capture
+
+A case whose `attn_gpu_memory_gb` or `speculative_acceptance` is
+`from_capture` has no value until its workload pass has run. `render` writes
+every other config then, and leaves `simulation.yaml` (and
+`trace_speculative.csv`) out until it can read the values; `run --phase
+timing_predict|simulation` writes them, with `calibration.json`, right before
+launching (`materialize`). Nothing guesses the value in between.
 
 ## Two normalizations that are not cosmetic
 
@@ -60,6 +72,7 @@ import yaml
 from alignment.load_generator.config import IndependentFrontendConfig, routes_backend
 
 from ..corpus import ROUTING_FILES
+from . import calibration
 from .pack import Case, HostProfile, Pack, PackError, TraceSpec, Variant
 
 #: Trace file names inside a rendered case directory. Fixed rather than derived
@@ -112,6 +125,9 @@ class RenderedCase:
     directory: Path
     phases: tuple[str, ...]
     files: tuple[Path, ...]
+    #: Why `simulation.yaml` was not written yet: the from_capture inputs it
+    #: waits for. Empty when every config was rendered.
+    pending: tuple[str, ...] = ()
 
 
 def phase_names(variant: Variant) -> tuple[str, ...]:
@@ -177,7 +193,11 @@ def trace_text(
     never confused, and arrival times are a deterministic 1 req/s baseline that
     `saturated` discards and `trace-timed` rescales by `rate`.
     `speculative_acceptance` maps a request's output length to its chain.
+    A tracked trace (`spec.path`) is returned byte for byte, ids and recorded
+    arrival times included; only the `accept_rate` column is ever added.
     """
+    if spec.tracked:
+        return _tracked_trace_text(case, spec, speculative_acceptance)
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
     columns = ["id", "input_len", "output_len", "arrival_time"]
@@ -196,6 +216,36 @@ def trace_text(
         if speculative_acceptance is not None:
             row.append(json.dumps(speculative_acceptance(output_len), separators=(",", ":")))
         writer.writerow(row)
+    return buffer.getvalue()
+
+
+TRACE_COLUMNS = ["id", "input_len", "output_len", "arrival_time"]
+
+
+def _tracked_trace_text(
+    case: Case, spec: TraceSpec, speculative_acceptance: Callable[[int], list[float]] | None
+) -> str:
+    text = spec.source.read_text(encoding="utf-8")
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows or rows[0] != TRACE_COLUMNS:
+        raise PackError(
+            f"{case.slug}: {spec.path} must have the columns {','.join(TRACE_COLUMNS)}"
+        )
+    for index, row in enumerate(rows[1:]):
+        input_len, output_len = int(row[1]), int(row[2])
+        if input_len + output_len >= case.max_model_len:
+            raise PackError(
+                f"{case.slug} trace row {index} reaches max_model_len: "
+                f"{input_len}+{output_len} >= {case.max_model_len}"
+            )
+    if speculative_acceptance is None:
+        return text
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(TRACE_COLUMNS + ["accept_rate"])
+    for row in rows[1:]:
+        chain = speculative_acceptance(int(row[2]))
+        writer.writerow(row + [json.dumps(chain, separators=(",", ":"))])
     return buffer.getvalue()
 
 
@@ -415,6 +465,11 @@ def simulation_document(
     cannot be written once and moved. Paths are emitted repo-relative when the
     run directory is inside the repository and absolute otherwise.
     """
+    if case.capture_fields:
+        raise PackError(
+            f"{case.slug}: {sorted(case.capture_fields)} still from_capture; resolve them "
+            "from the workload pass first (calibration.resolve)"
+        )
     # The speculative worker is the contract that consumes per-position
     # acceptance, whichever proposer the arch models, so it is what decides.
     speculative = variant.worker.get("type") == "speculative"
@@ -452,6 +507,10 @@ def simulation_document(
         workload["max_concurrency"] = case.max_concurrency
     if case.rate is not None:
         workload["request_rate"] = case.rate.value
+    elif case.simulation_arrival_mode == "trace_timed":
+        # A tracked trace's recorded arrivals at scale 1, as the profile side
+        # replays them with no `rate`.
+        workload["request_rate"] = 1.0
     workload["run_to_end"] = True
 
     arch = dict(variant.arch)
@@ -565,16 +624,17 @@ def case_documents(
         variant
     )
     documents[f"{PHASE_CONFIG_STEMS[ANALYSIS_E2E_PHASE]}.yaml"] = analyze_e2e_document(variant)
-    documents[f"{PHASE_CONFIG_STEMS[SIMULATION_PHASE]}.yaml"] = simulation_document(
-        pack, case, variant, case_dir, repo_root
-    )
+    if not case.capture_fields:
+        documents[f"{PHASE_CONFIG_STEMS[SIMULATION_PHASE]}.yaml"] = simulation_document(
+            pack, case, variant, case_dir, repo_root
+        )
     return documents
 
 
 def case_traces(pack: Pack, case: Case) -> dict[str, str]:
     """Trace file name → contents for one rendered case directory."""
     traces = {WORKLOAD_TRACE_NAME: trace_text(case, case.workload_trace)}
-    if case.speculative_acceptance is not None:
+    if case.speculative_acceptance is not None and not case.speculative_acceptance.from_capture:
         traces[SPECULATIVE_TRACE_NAME] = trace_text(
             case,
             case.workload_trace,
@@ -594,6 +654,15 @@ def render_case(
     case_dir = Path(out_root).resolve() / case.slug
     case_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
+    pending: tuple[str, ...] = ()
+    if case.capture_fields:
+        try:
+            resolved = calibration.resolve(pack, case, case_dir)
+        except (calibration.CalibrationError, OSError, ValueError, KeyError) as error:
+            pending = (str(error),)
+        else:
+            written.append(calibration.write(pack, case, case_dir, resolved))
+            case = calibration.resolved_case(case, resolved, case_dir)
     for name, text in case_traces(pack, case).items():
         target = case_dir / name
         target.write_text(text, encoding="utf-8")
@@ -610,4 +679,28 @@ def render_case(
         directory=case_dir,
         phases=phase_names(pack.variant_of(case)),
         files=tuple(written),
+        pending=pending,
     )
+
+
+def materialize(pack: Pack, case: Case, case_dir: Path, repo_root: Path) -> Case:
+    """Read a case's from_capture inputs and write what depends on them.
+
+    Writes `calibration.json`, `simulation.yaml` and, for a speculative case,
+    `trace_speculative.csv`. `run` calls this right before `timing_predict` or
+    `simulation`, so the values always come from the workload pass on disk.
+    Raises `CalibrationError` when the pass has not produced them.
+    """
+    case_dir = Path(case_dir)
+    resolved = calibration.resolve(pack, case, case_dir)
+    calibration.write(pack, case, case_dir, resolved)
+    case = calibration.resolved_case(case, resolved, case_dir)
+    if case.speculative_acceptance is not None:
+        (case_dir / SPECULATIVE_TRACE_NAME).write_text(
+            case_traces(pack, case)[SPECULATIVE_TRACE_NAME], encoding="utf-8"
+        )
+    document = simulation_document(pack, case, pack.variant_of(case), case_dir, repo_root)
+    (case_dir / f"{PHASE_CONFIG_STEMS[SIMULATION_PHASE]}.yaml").write_text(
+        yaml.safe_dump(document, sort_keys=False, default_flow_style=False), encoding="utf-8"
+    )
+    return case
