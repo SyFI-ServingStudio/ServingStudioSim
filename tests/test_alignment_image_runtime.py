@@ -290,7 +290,14 @@ def test_an_expert_group_spans_one_pipeline_stage_including_prefill_cp(tmp_path)
         tp_size=2, expert_parallel_size=4, expert_count_reduction_group_size=4,
         extra_args=["-pp", "2"],
     )
-    with pytest.raises(ValueError, match="one pipeline stage"):
+    with pytest.raises(ValueError, match="expert group can span"):
+        load_profile_config(path, require_python_runtime=False)
+    # SGLang's expert group lies inside one TP group: tp4 dp2 cannot hold ep8.
+    path = _with_server(
+        _config(tmp_path / "sgl"), "sglang", ",".join(map(str, range(8))),
+        tp_size=4, dp_size=2, expert_parallel_size=8, expert_count_reduction_group_size=4,
+    )
+    with pytest.raises(ValueError, match="expert group can span"):
         load_profile_config(path, require_python_runtime=False)
 
 

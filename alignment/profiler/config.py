@@ -273,10 +273,13 @@ def server_gpu_count(engine: str, tp_size: int, dp_size: int, extra_args: list[s
 
 
 def expert_parallel_world(engine: str, tp_size: int, dp_size: int, extra_args: list[str]) -> int:
-    """Ranks of one PP stage, the most an expert-parallel group can span:
-    ``server_gpu_count`` over the PP degree (vLLM's EP group is
-    dp * pcp * tp, ``parallel_state``; SGLang's lies inside dp * tp)."""
+    """The most ranks one expert-parallel group can span. vLLM: one PP stage,
+    dp * pcp * tp (``parallel_state``'s EP group). SGLang: one TP group
+    (``parallel_state`` builds _MOE_EP inside it; ``ep_size * moe_dp_size <=
+    tp_size``)."""
 
+    if engine == "sglang":
+        return tp_size
     pipeline = _degree(engine, extra_args, "pipeline-parallel")
     return server_gpu_count(engine, tp_size, dp_size, extra_args) // pipeline
 

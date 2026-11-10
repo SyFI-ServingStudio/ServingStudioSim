@@ -275,8 +275,9 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
             )
         if expert_world % value != 0:
             raise ValueError(
-                f"invalid profile config: server.{field_name} must divide the ranks of "
-                f"one pipeline stage (dp_size * tp_size * pcp)={expert_world}"
+                f"invalid profile config: server.{field_name} must divide the ranks one "
+                f"expert group can span ({expert_world}: vLLM dp_size * tp_size * pcp, "
+                "SGLang tp_size)"
             )
     # SGLang's deprecated `--enable-dp-attention` turns `--dp-size N` into
     # attention DP inside TP (attn_dp_size=N, dp_size=1), so dp_size here would
