@@ -62,6 +62,8 @@ def test_a_platform_without_its_own_commit_uses_the_base_commit():
         ({"digest": ARM, "upstream_commit": "abc"}, "40-hex"),
         ({"image": "registry.invalid/engine:x"}, "digest must be"),
         ({"digest": ARM, "tag": "x"}, "unknown key tag"),
+        ({"digest": ARM, "image": f"registry.invalid/engine:x@{ARM}"}, "without a digest"),
+        ({"digest": ARM, "image": "registry.invalid/engine"}, "repository:tag"),
     ],
 )
 def test_malformed_platform_entries_are_refused(arm64, message):
@@ -208,9 +210,11 @@ def test_a_native_change_in_a_patch_is_reported(tmp_path, monkeypatch):
         "diff --git a/ALIGNMENT.md b/ALIGNMENT.md\n"
         "diff --git a/csrc/moe/topk.cu b/csrc/moe/topk.cu\n"
         "diff --git a/CMakeLists.txt b/CMakeLists.txt\n"
+        "diff --git a/vllm/kernel.cu b/csrc/kernel.cu\n"
     )
     monkeypatch.setattr(reference_engines, "patch_files", lambda engine: [patch])
     assert reference_engines.patched_paths_not_installed("vllm") == [
         "0001-x.patch: csrc/moe/topk.cu",
         "0001-x.patch: CMakeLists.txt",
+        "0001-x.patch: csrc/kernel.cu",  # renamed into a native source
     ]

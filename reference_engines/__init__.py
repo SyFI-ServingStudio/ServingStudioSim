@@ -120,6 +120,13 @@ _TOP_KEYS = {"upstream_repo", "upstream_commit", "image", "platforms"}
 _PLATFORM_KEYS = {"digest", "image", "upstream_commit", "note"}
 
 
+def _check_image(image: Any, where: str) -> None:
+    # The digest lives in `platforms.<p>.digest`; one here too would build a
+    # reference neither digest pins (`Base.reference`).
+    if not isinstance(image, str) or ":" not in image.rpartition("/")[2] or "@" in image:
+        raise BaseError(f"{where} must be repository:tag, without a digest")
+
+
 def parse_base(text: str, origin: str = "BASE.yaml") -> Base:
     """A BASE.yaml document.
 
@@ -147,8 +154,7 @@ def parse_base(text: str, origin: str = "BASE.yaml") -> Base:
             raise BaseError(f"{origin}: {key} must be a string")
     if not _SHA1.fullmatch(doc["upstream_commit"]):
         raise BaseError(f"{origin}: upstream_commit must be a full 40-hex commit")
-    if ":" not in doc["image"].rpartition("/")[2] or "@" in doc["image"]:
-        raise BaseError(f"{origin}: image must be repository:tag, without a digest")
+    _check_image(doc["image"], f"{origin}: image")
     platforms = doc["platforms"]
     if not isinstance(platforms, dict) or not platforms:
         raise BaseError(f"{origin}: platforms must map <os>/<arch> to its pins")
@@ -169,7 +175,8 @@ def parse_base(text: str, origin: str = "BASE.yaml") -> Base:
             raise BaseError(f"{where}.digest must be sha256:<64 hex>")
         digests[name] = entry["digest"]
         if "image" in entry:
-            platform_images[name] = str(entry["image"])
+            _check_image(entry["image"], f"{where}.image")
+            platform_images[name] = entry["image"]
         if "upstream_commit" in entry:
             if not _SHA1.fullmatch(str(entry["upstream_commit"])):
                 raise BaseError(f"{where}.upstream_commit must be a full 40-hex commit")
@@ -224,6 +231,7 @@ def format_base(base: Base, header: str) -> str:
 # above all, would build into an image that silently lacks it.
 _INSTALLED = {"vllm": ("vllm/",), "sglang": ("python/sglang/",)}
 _NOT_RUN = re.compile(r"(^|/)(tests?|docs)/|\.md$")
+_DIFF_HEADER = re.compile(r"diff --git a/(\S+) b/(\S+)")
 
 
 def patched_paths_not_installed(engine: str) -> list[str]:
@@ -232,11 +240,13 @@ def patched_paths_not_installed(engine: str) -> list[str]:
     stray = []
     for patch in patch_files(engine):
         for line in patch.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.startswith("diff --git a/"):
+            match = _DIFF_HEADER.fullmatch(line)
+            if match is None:
                 continue
-            path = line.split(" b/", 1)[0].removeprefix("diff --git a/")
-            if not path.startswith(_INSTALLED[engine]) and not _NOT_RUN.search(path):
-                stray.append(f"{patch.name}: {path}")
+            # Both sides: a rename or copy into a native source counts too.
+            for path in dict.fromkeys(match.groups()):
+                if not path.startswith(_INSTALLED[engine]) and not _NOT_RUN.search(path):
+                    stray.append(f"{patch.name}: {path}")
     return stray
 
 
