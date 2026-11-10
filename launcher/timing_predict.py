@@ -393,8 +393,9 @@ async def run_one(
             str(log_dir / "raw" / ERROR_JSON),
         ]
         journal = RunJournal(log_dir)
-        # The predictor writes profile.db only to JIT-profile a missing row, which
-        # it refuses to do without a GPU: then predictions share the database.
+        # The predictor writes profile.db only when its collect pass measures
+        # missing rows, which it refuses to do without a GPU: then predictions
+        # share the database.
         write = not gpu_disabled()
         async with _LAUNCHER_LEASES.profile_database(write=write):
             journal.update(

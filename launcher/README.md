@@ -726,7 +726,7 @@ takes them off before dispatch): `--no-gpu`, and `--remote NAME` with repeatable
   itself and every child. Each GPU entry point in `profiling/` and
   `alignment/runner.py` checks it (`profiling/gpu_policy.py`), so a step that
   needs a GPU fails and names itself: a cache prebuild with missing rows
-  (before any builder starts), a timing-predict JIT fill, `kernel-profile
+  (before any builder starts), a timing-predict cache fill, `kernel-profile
   run`/`measure`, and an `alignment profile` capture (`--resume` still works).
   A run over a warm `profile.db` is unaffected.
 - `timing-predict` evaluates explicit batch shapes without a workload, scheduler,
@@ -739,7 +739,7 @@ takes them off before dispatch): `--no-gpu`, and `--remote NAME` with repeatable
   timing-predict does not create simulation `run_meta.json`.
 - `timing-predict --dry-run` builds the model on the simulator's dry-run bridge,
   checks every case against it, and prints the `profile.db` specs a real run
-  would JIT. It costs nothing, writes nothing under `log_dir`, announces no job,
+  would measure. It costs nothing, writes nothing under `log_dir`, announces no job,
   and needs no GPU. `alignment timing-predict --dry-run` builds the measured
   cases in a scratch directory and runs the same check. A real run also checks
   every case before costing the first, so a bad case writes no rows.
