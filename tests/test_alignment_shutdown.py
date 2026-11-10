@@ -218,3 +218,30 @@ def test_a_wrapped_launchers_leftover_helper_is_killed(tmp_path) -> None:
     runner._shutdown(proc, timeout=2)  # the helper ignores its SIGINT: waits 2 s
     assert proc.returncode == 0
     assert _gone(child), "the helper outlived the launcher"
+
+
+def test_a_hung_servers_leftovers_are_swept_after_the_kill(tmp_path) -> None:
+    # The server ignores SIGINT: the timeout SIGKILLs it, then its worker
+    # (same session, a group of its own, also ignoring SIGINT) must go too.
+    proc, child = _leaves_a_child(tmp_path, own_group=True, exit_at_once=False)
+    os.kill(proc.pid, signal.SIGSTOP)  # stands in for a hung server
+    runner._shutdown(proc, timeout=1, wrapped=False)
+    assert proc.returncode == -signal.SIGKILL
+    assert _gone(child), "the hung server's worker outlived the kill"
+
+
+def test_a_reused_leader_pid_is_not_swept(monkeypatch) -> None:
+    # The leader is reaped; a live process now holds its pid (a stranger),
+    # so its session is not ours.
+    killed = []
+    monkeypatch.setattr(
+        runner, "_processes", lambda: {500: (1, 500, 500), 600: (500, 600, 500)}
+    )
+    monkeypatch.setattr(runner, "_signal_groups", lambda groups, _sig: killed.extend(groups))
+    runner._kill_leftovers(500, {})
+    assert killed == []
+    runner._kill_leftovers(400, {})  # a leader whose pid nobody holds: sweep
+    assert killed == []  # no process is in session 400
+    monkeypatch.setattr(runner, "_processes", lambda: {600: (1, 600, 500)})
+    runner._kill_leftovers(500, {})
+    assert killed == [600]

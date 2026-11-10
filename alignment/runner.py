@@ -1032,12 +1032,25 @@ def _kill_leftovers(leader: int, group_sessions: dict[int, int]) -> None:
     match reaches an unrelated process.
     """
 
+    processes = _processes()
+    # Called once `leader` is reaped: a live process holding its pid is a
+    # stranger the pid went to (no leftover kept it), and so is that session.
+    sweep_session = leader not in processes
     groups = {
         group
-        for group, session in (entry[1:] for entry in _processes().values())
-        if session == leader or group_sessions.get(group) == session
+        for group, session in (entry[1:] for entry in processes.values())
+        if (sweep_session and session == leader) or group_sessions.get(group) == session
     }
     _signal_groups(sorted(groups), signal.SIGKILL)
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    """Wait (bounded) for a SIGKILLed `proc`, so its leftovers are swept after it."""
+
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _signal_groups(groups: list[int], signum: int) -> None:
@@ -1097,6 +1110,7 @@ def _shutdown(proc: subprocess.Popen, timeout: float = 120.0, *, wrapped: bool =
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 _signal_groups([own, *targets], signal.SIGKILL)
+                _reap(proc)
             return
         _signal_groups(targets, signal.SIGINT)
         deadline = time.monotonic() + timeout
@@ -1107,6 +1121,7 @@ def _shutdown(proc: subprocess.Popen, timeout: float = 120.0, *, wrapped: bool =
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             _signal_groups([own, *targets], signal.SIGKILL)
+            _reap(proc)
     finally:
         if proc.poll() is not None:
             _kill_leftovers(proc.pid, target_sessions)
