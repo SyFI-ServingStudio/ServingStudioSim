@@ -1005,48 +1005,48 @@ def _processes() -> dict[int, tuple[int, int, int, int]]:
     return found
 
 
-# A helper group recorded while the server ran: its session, and the start
-# time of the process then holding the group's pid (None: none did).
-_HelperGroup = tuple[int, int | None]
-
-
-def _descendant_group_sessions(pid: int) -> dict[int, _HelperGroup]:
-    """Process group -> (session, start time of its pid's process) of `pid`'s
-    descendants' groups other than its own (nsys runs the application it
-    profiles in a process group of its own)."""
+def _descendant_group_sessions(pid: int) -> tuple[list[int], dict[int, int | None]]:
+    """`pid`'s descendants' process groups other than its own (nsys runs the
+    application it profiles in a process group of its own), and their
+    sessions, each with the start time of the process then holding the
+    session's pid (None: none did)."""
 
     processes = _processes()
     children: dict[int, list[int]] = {}
     for child, (parent, *_rest) in processes.items():
         children.setdefault(parent, []).append(child)
     own = processes.get(pid, (0, None, 0, 0))[1]
-    found: dict[int, _HelperGroup] = {}
+    groups: dict[int, None] = {}
+    sessions: dict[int, int | None] = {}
     pending = list(children.get(pid, ()))
     while pending:
         child = pending.pop()
         _parent, group, session, _start = processes[child]
-        if group != own and group not in found:
-            holder = processes.get(group)
-            found[group] = (session, None if holder is None else holder[3])
+        if group != own:
+            groups.setdefault(group)
+            holder = processes.get(session)
+            sessions.setdefault(session, None if holder is None else holder[3])
         pending.extend(children.get(child, ()))
-    return found
+    return list(groups), sessions
 
 
 def _descendant_groups(pid: int) -> list[int]:
-    return list(_descendant_group_sessions(pid))
+    return _descendant_group_sessions(pid)[0]
 
 
-def _kill_leftovers(leader: int, helpers: dict[int, _HelperGroup], *, reaped: bool = True) -> None:
-    """SIGKILL what is left of a stopped server.
+def _kill_leftovers(leader: int, sessions: dict[int, int | None], *, reaped: bool = True) -> None:
+    """SIGKILL what is left of a stopped server: every process in its session
+    or in a session its helpers were recorded in (`sessions`, see
+    `_descendant_group_sessions`), whatever group it moved to since.
 
-    `leader` started its own session (`start_new_session`), so every process
-    still in session `leader` is its leftover, whatever group it moved to;
-    a helper that started a session of its own is matched by the
-    (group, session) recorded while the server ran (`helpers`). The kernel
-    does not reuse a pid while a live process names it as its group or
-    session, so a match reaches an unrelated process only if the pid itself
-    went to one -- checked: `leader` must be unreaped or gone, and a group's
-    pid must be gone or held by the process recorded then (same start time).
+    The server started its own session (`start_new_session`); a helper may
+    have started one too. The kernel does not hand out a pid while a live
+    process names it as its session, so a session matches an unrelated
+    process only if its pid went to one -- refused when that process still
+    holds the pid: `leader` must be unreaped or gone, a helper session's pid
+    gone or held by the process recorded then (same start time). Not caught:
+    a stranger that got the pid and left it again (a daemon's double fork),
+    which takes a full pid wraparound during the shutdown.
     """
 
     processes = _processes()
@@ -1055,17 +1055,15 @@ def _kill_leftovers(leader: int, helpers: dict[int, _HelperGroup], *, reaped: bo
     # the pid is still `leader`'s own.
     sweep_session = not reaped or leader not in processes
 
-    def ours(group: int, session: int) -> bool:
-        if group not in helpers or helpers[group][0] != session:
+    def ours(session: int) -> bool:
+        if session == leader:
+            return sweep_session
+        if session not in sessions:
             return False
-        holder = processes.get(group)
-        return holder is None or holder[3] == helpers[group][1]
+        holder = processes.get(session)
+        return holder is None or holder[3] == sessions[session]
 
-    groups = {
-        group
-        for _parent, group, session, _start in processes.values()
-        if (sweep_session and session == leader) or ours(group, session)
-    }
+    groups = {group for _parent, group, session, _start in processes.values() if ours(session)}
     _signal_groups(sorted(groups), signal.SIGKILL)
 
 
@@ -1126,8 +1124,7 @@ def _shutdown(proc: subprocess.Popen, timeout: float = 120.0, *, wrapped: bool =
     except ProcessLookupError:
         _kill_leftovers(proc.pid, {})
         return
-    target_sessions = _descendant_group_sessions(proc.pid)
-    targets = list(target_sessions)
+    targets, target_sessions = _descendant_group_sessions(proc.pid)
     killed = False
     try:
         if not wrapped:

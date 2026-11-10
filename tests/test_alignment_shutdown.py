@@ -188,13 +188,6 @@ def _leaves_a_child(tmp_path: Path, *, own_group: bool, exit_at_once: bool):
     return proc, int(child_file.read_text())
 
 
-def _kill_quietly(pid: int) -> None:
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-
-
 def _gone(pid: int) -> bool:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -266,52 +259,74 @@ def test_an_unreaped_leader_still_has_its_session_swept(monkeypatch) -> None:
     assert killed == [500, 600]
 
 
-def test_a_helper_group_is_matched_unless_its_pid_went_to_a_stranger(monkeypatch) -> None:
+def test_a_helper_session_is_matched_unless_its_pid_went_to_a_stranger(monkeypatch) -> None:
     killed = []
     monkeypatch.setattr(runner, "_signal_groups", lambda groups, _sig: killed.extend(groups))
-    helpers = {700: (700, 10)}  # helper 700 ran setsid; it started at tick 10
     cases = [
-        ({700: (1, 700, 700, 10)}, [700]),  # the helper itself
-        ({702: (1, 700, 700, 30)}, [700]),  # a fork it made after the record, orphaned
-        ({700: (1, 700, 700, 40)}, []),  # pid 700 went to a stranger that ran setsid
-        ({702: (1, 700, 701, 30)}, []),  # another session
+        # helper 700 ran setsid; it started at tick 10
+        ({700: 10}, {700: (1, 700, 700, 10)}, [700]),  # the helper itself
+        ({700: 10}, {702: (1, 700, 700, 30)}, [700]),  # its fork after the record, orphaned
+        ({700: 10}, {703: (1, 703, 700, 30)}, [703]),  # ...that moved to a group of its own
+        ({700: 10}, {700: (1, 700, 700, 40)}, []),  # pid 700 went to a stranger (setsid)
+        ({700: 10}, {702: (1, 702, 701, 30)}, []),  # another session
+        ({700: None}, {700: (1, 700, 700, 40)}, []),  # nobody held 700; now a stranger does
+        ({700: None}, {702: (1, 702, 700, 30)}, [702]),  # nobody held it, nor holds it now
     ]
-    for table, expected in cases:
+    for sessions, table, expected in cases:
         killed.clear()
         monkeypatch.setattr(runner, "_processes", lambda table=table: table)
-        runner._kill_leftovers(400, helpers)
-        assert killed == expected, table
+        runner._kill_leftovers(400, sessions)
+        assert killed == expected, (sessions, table)
 
 
 def test_an_unreaped_server_is_swept_with_a_warning(tmp_path, monkeypatch, capsys) -> None:
-    proc, child = _leaves_a_child(tmp_path, own_group=True, exit_at_once=False)
+    proc, _child = _leaves_a_child(tmp_path, own_group=True, exit_at_once=False)
     os.kill(proc.pid, signal.SIGSTOP)  # a hung server
     swept = []
-    monkeypatch.setattr(runner, "_reap", lambda _proc: None)  # the wait times out
-    monkeypatch.setattr(proc, "poll", lambda: None)  # ...and it stays unreaped
-    monkeypatch.setattr(
-        runner, "_kill_leftovers", lambda leader, _h, *, reaped: swept.append((leader, reaped))
-    )
-    runner._shutdown(proc, timeout=1, wrapped=False)
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "_reap", lambda _proc: None)  # the wait times out
+        patch.setattr(proc, "poll", lambda: None)  # ...and it stays unreaped
+        patch.setattr(
+            runner, "_kill_leftovers", lambda leader, _s, *, reaped: swept.append((leader, reaped))
+        )
+        runner._shutdown(proc, timeout=1, wrapped=False)
     assert swept == [(proc.pid, False)]
     assert "survived SIGKILL unreaped" in capsys.readouterr().err
-    proc.wait(timeout=30)
-    _kill_quietly(child)
+    proc.wait(timeout=30)  # its worker got the SIGKILL with it
 
 
 def test_an_interrupted_shutdown_kills_nothing(tmp_path, monkeypatch) -> None:
     proc, child = _leaves_a_child(tmp_path, own_group=True, exit_at_once=False)
     os.kill(proc.pid, signal.SIGSTOP)
     swept = []
-    monkeypatch.setattr(runner, "_kill_leftovers", lambda *a, **k: swept.append(a))
 
     def interrupted(*_a, **_k):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(proc, "wait", interrupted)
-    with pytest.raises(KeyboardInterrupt):
-        runner._shutdown(proc, timeout=1, wrapped=False)
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "_kill_leftovers", lambda *a, **k: swept.append(a))
+        patch.setattr(proc, "wait", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            runner._shutdown(proc, timeout=1, wrapped=False)
     assert swept == []
-    os.kill(proc.pid, signal.SIGKILL)
-    _kill_quietly(child)
-    os.waitpid(proc.pid, 0)
+    assert Path(f"/proc/{child}").exists()  # its worker was left alone
+    os.killpg(os.getpgid(child), signal.SIGKILL)
+    proc.kill()
+    proc.wait(timeout=30)
+
+
+def test_an_interrupt_after_the_sigkill_still_sweeps(tmp_path, monkeypatch) -> None:
+    proc, _child = _leaves_a_child(tmp_path, own_group=True, exit_at_once=False)
+    os.kill(proc.pid, signal.SIGSTOP)
+    swept = []
+
+    def interrupted(_proc):
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "_reap", interrupted)
+        patch.setattr(runner, "_kill_leftovers", lambda leader, _s, *, reaped: swept.append(leader))
+        with pytest.raises(KeyboardInterrupt):
+            runner._shutdown(proc, timeout=1, wrapped=False)
+    assert swept == [proc.pid]
+    proc.wait(timeout=30)
