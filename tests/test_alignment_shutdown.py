@@ -151,3 +151,70 @@ def test_an_unwrapped_server_is_signalled_at_once_despite_a_stubborn_helper(tmp_
     while runner._groups_alive(helper_groups):
         assert time.monotonic() < deadline, "the helper outlived the server"
         time.sleep(0.05)
+
+
+# A server that leaves a child behind: `child_group` 0 puts the child in a
+# group of its own, None keeps it in the server's. The child ignores SIGINT.
+_LEAVES_A_CHILD = """
+import signal, subprocess, sys, time
+kwargs = {{"process_group": 0}} if {own_group} else {{}}
+child = subprocess.Popen(
+    [sys.executable, "-c",
+     "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(60)"],
+    **kwargs,
+)
+open(sys.argv[1], "w").write(str(child.pid))
+if {exit_at_once}:
+    sys.exit(3)
+signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+while True:
+    time.sleep(0.05)
+"""
+
+
+def _leaves_a_child(tmp_path: Path, *, own_group: bool, exit_at_once: bool):
+    child_file = tmp_path / "child.pid"
+    program = _LEAVES_A_CHILD.format(own_group=own_group, exit_at_once=exit_at_once)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", program, str(child_file)], start_new_session=True
+    )
+    deadline = time.monotonic() + 10
+    while not (child_file.is_file() and child_file.read_text()):
+        assert time.monotonic() < deadline, "fake server never started"
+        time.sleep(0.05)
+    time.sleep(0.3)
+    return proc, int(child_file.read_text())
+
+
+def _gone(pid: int) -> bool:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+        if stat.rsplit(")", 1)[1].split()[0] == "Z":
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_a_worker_left_in_the_servers_own_group_is_killed(tmp_path) -> None:
+    proc, child = _leaves_a_child(tmp_path, own_group=False, exit_at_once=False)
+    runner._shutdown(proc, timeout=30, wrapped=False)
+    assert proc.returncode == 0
+    assert _gone(child), "the server's worker outlived it"
+
+
+def test_a_crashed_servers_leftovers_are_killed(tmp_path) -> None:
+    proc, child = _leaves_a_child(tmp_path, own_group=True, exit_at_once=True)
+    proc.wait(timeout=10)
+    runner._shutdown(proc, timeout=30, wrapped=False)  # already exited
+    assert _gone(child), "a crashed server's helper outlived it"
+
+
+def test_a_wrapped_launchers_leftover_helper_is_killed(tmp_path) -> None:
+    proc, child = _leaves_a_child(tmp_path, own_group=True, exit_at_once=False)
+    runner._shutdown(proc, timeout=2)  # the helper ignores its SIGINT: waits 2 s
+    assert proc.returncode == 0
+    assert _gone(child), "the helper outlived the launcher"

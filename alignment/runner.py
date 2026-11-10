@@ -984,38 +984,68 @@ def _captured_nsys_provenance(launch_metadata: Path) -> dict | None:
     return provenance if isinstance(provenance, dict) else None
 
 
-def _descendant_groups(pid: int) -> list[int]:
-    """Process groups of `pid`'s descendants other than its own (nsys runs
-    the application it profiles in a process group of its own)."""
+def _processes() -> dict[int, tuple[int, int, int]]:
+    """pid -> (ppid, pgid, session id) of every process visible now."""
 
-    children: dict[int, list[int]] = {}
-    groups: dict[int, int] = {}
+    found: dict[int, tuple[int, int, int]] = {}
     for stat in Path("/proc").glob("[0-9]*/stat"):
         try:
             fields = stat.read_text().rsplit(")", 1)[1].split()
-        except (OSError, IndexError):
+            found[int(stat.parent.name)] = (int(fields[1]), int(fields[2]), int(fields[3]))
+        except (OSError, IndexError, ValueError):
             continue  # exited while we looked
-        child = int(stat.parent.name)
-        children.setdefault(int(fields[1]), []).append(child)
-        groups[child] = int(fields[2])
-    own = groups.get(pid)
-    found: list[int] = []
+    return found
+
+
+def _descendant_group_sessions(pid: int) -> dict[int, int]:
+    """Process group -> session of `pid`'s descendants' groups other than its
+    own (nsys runs the application it profiles in a process group of its own)."""
+
+    processes = _processes()
+    children: dict[int, list[int]] = {}
+    for child, (parent, _group, _session) in processes.items():
+        children.setdefault(parent, []).append(child)
+    own = processes.get(pid, (0, None, 0))[1]
+    found: dict[int, int] = {}
     pending = list(children.get(pid, ()))
     while pending:
         child = pending.pop()
-        group = groups[child]
-        if group not in (own, *found):
-            found.append(group)
+        _parent, group, session = processes[child]
+        if group != own and group not in found:
+            found[group] = session
         pending.extend(children.get(child, ()))
     return found
+
+
+def _descendant_groups(pid: int) -> list[int]:
+    return list(_descendant_group_sessions(pid))
+
+
+def _kill_leftovers(leader: int, group_sessions: dict[int, int]) -> None:
+    """SIGKILL what is left of a stopped server.
+
+    `leader` started its own session (`start_new_session`), so every process
+    still in session `leader` is its leftover, whatever group it moved to;
+    a helper that started a session of its own is matched by the
+    (group, session) recorded while the server ran. The kernel does not reuse
+    a pid while a live process names it as its group or session, so neither
+    match reaches an unrelated process.
+    """
+
+    groups = {
+        group
+        for group, session in (entry[1:] for entry in _processes().values())
+        if session == leader or group_sessions.get(group) == session
+    }
+    _signal_groups(sorted(groups), signal.SIGKILL)
 
 
 def _signal_groups(groups: list[int], signum: int) -> None:
     for group in groups:
         try:
             os.killpg(group, signum)
-        except ProcessLookupError:
-            pass
+        except (ProcessLookupError, PermissionError):
+            pass  # gone, or (not ours) no longer the group we meant
 
 
 def _groups_alive(groups: list[int]) -> bool:
@@ -1024,8 +1054,8 @@ def _groups_alive(groups: list[int]) -> bool:
         try:
             os.killpg(group, 0)
             alive = True
-        except ProcessLookupError:
-            pass
+        except (ProcessLookupError, PermissionError):
+            pass  # gone, or no longer ours
     return alive
 
 
@@ -1045,17 +1075,21 @@ def _shutdown(proc: subprocess.Popen, timeout: float = 120.0, *, wrapped: bool =
     gets the SIGINT in the same round, so a helper of the server that sits in
     a group of its own and ignores SIGINT cannot hold the server's stop back.
 
-    Either way, a helper group still alive once `proc` has exited is killed:
-    it would otherwise keep GPU memory or a port into the next run.
+    Either way, once `proc` has exited, whatever of it is still alive is
+    killed (`_kill_leftovers`): a worker or helper would otherwise keep GPU
+    memory or a port into the next run.
     """
 
     if proc.poll() is not None:
+        _kill_leftovers(proc.pid, {})
         return
     try:
         own = os.getpgid(proc.pid)
     except ProcessLookupError:
+        _kill_leftovers(proc.pid, {})
         return
-    targets = _descendant_groups(proc.pid)
+    target_sessions = _descendant_group_sessions(proc.pid)
+    targets = list(target_sessions)
     try:
         if not wrapped:
             _signal_groups([own, *targets], signal.SIGINT)
@@ -1075,4 +1109,4 @@ def _shutdown(proc: subprocess.Popen, timeout: float = 120.0, *, wrapped: bool =
             _signal_groups([own, *targets], signal.SIGKILL)
     finally:
         if proc.poll() is not None:
-            _signal_groups(targets, signal.SIGKILL)  # whatever outlived the server
+            _kill_leftovers(proc.pid, target_sessions)
