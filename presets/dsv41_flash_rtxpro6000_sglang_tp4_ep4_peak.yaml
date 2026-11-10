@@ -9,7 +9,7 @@
 # workload_metrics pass measures on real text (launcher alignment prepare-workload); the
 # 2026-11-05 random-token run accepted 5.2-5.9 per verify, which is optimistic. Draft experts
 # draw uniform routing (no measured draft routing yet). Routing reuses the B200 vLLM diverse_100 corpus until the SM120 SGLang
-# token_corpus pass exists. gpu_time_multiplier 1.0 until kernel-align on the B2 capture.
+# token_corpus pass exists. gpu_time_multiplier from kernel-align (below).
 deployment: unified
 workload:
   trace_files: [/mnt/storage/yilegu/airbox/airbox-cost-calculator/data/traces/decycle/decycle-peak-accept080.csv]
@@ -56,7 +56,10 @@ pools:
           kv_new_token_ratio_decay_steps: 600
           kv_retract_decode_steps: 20
           decode_retraction_policy: length
-          gpu_time_multiplier: 1.0
+          # Kernel-align duty cycle on the B2 nsys captures (07 / 01), warm-up iterations screened
+          # (doc/pr/dsv41-sglang-sm120/KERNEL_ALIGN.md): decode 1.040 / 1.034, prefill 1.151 / 1.204.
+          gpu_time_multiplier: 1.04
+          prefill_gpu_time_multiplier: 1.17
           # SGLang DSV4 pools per GPU at --mem-fraction-static 0.86: full 2929152 tokens x
           # 1673 B + the SWA pools, 49664 tokens x 584 B x (target layers + 3 DSpark draft
           # layers; a fixed engine allocation).
