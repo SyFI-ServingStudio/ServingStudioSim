@@ -234,12 +234,40 @@ def test_a_reused_leader_pid_is_not_swept(monkeypatch) -> None:
     # The leader is reaped; a live process now holds its pid (a stranger),
     # so its session is not ours.
     killed = []
-    monkeypatch.setattr(runner, "_processes", lambda: {500: (1, 500, 500), 600: (500, 600, 500)})
+    table = {500: (1, 500, 500, 9), 600: (500, 600, 500, 9)}
+    monkeypatch.setattr(runner, "_processes", lambda: table)
     monkeypatch.setattr(runner, "_signal_groups", lambda groups, _sig: killed.extend(groups))
     runner._kill_leftovers(500, {})
     assert killed == []
     runner._kill_leftovers(400, {})  # a leader whose pid nobody holds: sweep
     assert killed == []  # no process is in session 400
-    monkeypatch.setattr(runner, "_processes", lambda: {600: (1, 600, 500)})
+    monkeypatch.setattr(runner, "_processes", lambda: {600: (1, 600, 500, 9)})
     runner._kill_leftovers(500, {})
     assert killed == [600]
+
+
+def test_an_unreaped_leader_still_has_its_session_swept(monkeypatch) -> None:
+    # SIGKILLed but not reaped in time (stuck in the kernel): its pid is
+    # still its own, so its session is swept.
+    killed = []
+    table = {500: (1, 500, 500, 5), 600: (500, 600, 500, 6)}
+    monkeypatch.setattr(runner, "_processes", lambda: table)
+    monkeypatch.setattr(runner, "_signal_groups", lambda groups, _sig: killed.extend(groups))
+    runner._kill_leftovers(500, {}, reaped=False)
+    assert killed == [500, 600]
+
+
+def test_a_helper_group_is_matched_by_a_recorded_member(monkeypatch) -> None:
+    killed = []
+    monkeypatch.setattr(runner, "_signal_groups", lambda groups, _sig: killed.extend(groups))
+    helpers = {700: (700, frozenset({(700, 10), (701, 11)}))}
+    # A recorded member is alive (its later fork 702 goes with the group).
+    table = {701: (1, 700, 700, 11), 702: (701, 700, 700, 30)}
+    monkeypatch.setattr(runner, "_processes", lambda: table)
+    runner._kill_leftovers(400, helpers)
+    assert killed == [700]
+    killed.clear()
+    # All members gone; pid 700 went to a stranger that started a session.
+    monkeypatch.setattr(runner, "_processes", lambda: {700: (1, 700, 700, 40)})
+    runner._kill_leftovers(400, helpers)
+    assert killed == []

@@ -24,6 +24,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -984,62 +985,81 @@ def _captured_nsys_provenance(launch_metadata: Path) -> dict | None:
     return provenance if isinstance(provenance, dict) else None
 
 
-def _processes() -> dict[int, tuple[int, int, int]]:
-    """pid -> (ppid, pgid, session id) of every process visible now."""
+def _processes() -> dict[int, tuple[int, int, int, int]]:
+    """pid -> (ppid, pgid, session id, start time in clock ticks) of every
+    process visible now. (pid, start time) names one process for good: a pid
+    the kernel hands out again comes with a later start time."""
 
-    found: dict[int, tuple[int, int, int]] = {}
+    found: dict[int, tuple[int, int, int, int]] = {}
     for stat in Path("/proc").glob("[0-9]*/stat"):
         try:
             fields = stat.read_text().rsplit(")", 1)[1].split()
-            found[int(stat.parent.name)] = (int(fields[1]), int(fields[2]), int(fields[3]))
+            found[int(stat.parent.name)] = (
+                int(fields[1]),
+                int(fields[2]),
+                int(fields[3]),
+                int(fields[19]),
+            )
         except (OSError, IndexError, ValueError):
             continue  # exited while we looked
     return found
 
 
-def _descendant_group_sessions(pid: int) -> dict[int, int]:
-    """Process group -> session of `pid`'s descendants' groups other than its
-    own (nsys runs the application it profiles in a process group of its own)."""
+# A helper group recorded while the server ran: its session, and the
+# (pid, start time) of each member then.
+HelperGroup = tuple[int, frozenset[tuple[int, int]]]
+
+
+def _descendant_group_sessions(pid: int) -> dict[int, HelperGroup]:
+    """Process group -> (session, members) of `pid`'s descendants' groups other
+    than its own (nsys runs the application it profiles in a process group of
+    its own)."""
 
     processes = _processes()
     children: dict[int, list[int]] = {}
-    for child, (parent, _group, _session) in processes.items():
+    for child, (parent, *_rest) in processes.items():
         children.setdefault(parent, []).append(child)
-    own = processes.get(pid, (0, None, 0))[1]
-    found: dict[int, int] = {}
+    own = processes.get(pid, (0, None, 0, 0))[1]
+    sessions: dict[int, int] = {}
+    members: dict[int, set[tuple[int, int]]] = {}
     pending = list(children.get(pid, ()))
     while pending:
         child = pending.pop()
-        _parent, group, session = processes[child]
-        if group != own and group not in found:
-            found[group] = session
+        _parent, group, session, start = processes[child]
+        if group != own:
+            sessions.setdefault(group, session)
+            members.setdefault(group, set()).add((child, start))
         pending.extend(children.get(child, ()))
-    return found
+    return {group: (session, frozenset(members[group])) for group, session in sessions.items()}
 
 
 def _descendant_groups(pid: int) -> list[int]:
     return list(_descendant_group_sessions(pid))
 
 
-def _kill_leftovers(leader: int, group_sessions: dict[int, int]) -> None:
+def _kill_leftovers(leader: int, helpers: dict[int, HelperGroup], *, reaped: bool = True) -> None:
     """SIGKILL what is left of a stopped server.
 
     `leader` started its own session (`start_new_session`), so every process
-    still in session `leader` is its leftover, whatever group it moved to;
-    a helper that started a session of its own is matched by the
-    (group, session) recorded while the server ran. The kernel does not reuse
-    a pid while a live process names it as its group or session, so neither
-    match reaches an unrelated process.
+    still in session `leader` is its leftover, whatever group it moved to.
+    The kernel does not reuse a pid while a live process names it as its
+    session, so that match reaches no unrelated process -- unless `leader`
+    itself is reaped and gone, which is checked. A helper that started a
+    session of its own is matched by a member recorded while the server ran
+    (`helpers`), by pid and start time, so a pid handed out again is not
+    taken for it; killing its group takes the forks made since along.
     """
 
     processes = _processes()
-    # Called once `leader` is reaped: a live process holding its pid is a
-    # stranger the pid went to (no leftover kept it), and so is that session.
-    sweep_session = leader not in processes
+    # Once `leader` is reaped, a live process holding its pid is a stranger
+    # the pid went to (no leftover kept it), and so is that session. Unreaped,
+    # the pid is still `leader`'s own.
+    sweep_session = not reaped or leader not in processes
     groups = {
         group
-        for group, session in (entry[1:] for entry in processes.values())
-        if (sweep_session and session == leader) or group_sessions.get(group) == session
+        for pid, (_parent, group, session, start) in processes.items()
+        if (sweep_session and session == leader)
+        or (group in helpers and helpers[group][0] == session and (pid, start) in helpers[group][1])
     }
     _signal_groups(sorted(groups), signal.SIGKILL)
 
@@ -1123,5 +1143,11 @@ def _shutdown(proc: subprocess.Popen, timeout: float = 120.0, *, wrapped: bool =
             _signal_groups([own, *targets], signal.SIGKILL)
             _reap(proc)
     finally:
-        if proc.poll() is not None:
-            _kill_leftovers(proc.pid, target_sessions)
+        reaped = proc.poll() is not None
+        if not reaped:
+            print(
+                f"[profile] pid {proc.pid} survived SIGKILL unreaped (stuck in the kernel?); "
+                "killing its leftovers anyway",
+                file=sys.stderr,
+            )
+        _kill_leftovers(proc.pid, target_sessions, reaped=reaped)
