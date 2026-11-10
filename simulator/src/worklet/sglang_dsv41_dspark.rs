@@ -31,7 +31,6 @@ use super::sglang_dsv41_tp::{
     op, SglangDsv41KernelPath, SglangDsv41LayerConfig, SglangDsv41LayerInput,
     SglangDsv41LayerWorklet,
 };
-use crate::common::Fabric;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
@@ -71,11 +70,24 @@ pub struct DsparkDraftWorklet {
     markov_gather: Op<AllReduceKernel>,
     markov_finish: Op<ElementwiseKernel>,
     token_broadcast: Op<AllReduceKernel>,
+    partial_bytes: u64,
 }
 
+/// Vocab columns per `_markov_sample_partial` block (`markov_sample.py` `_BLOCK`).
+const MARKOV_SAMPLE_BLOCK: u32 = 1024;
+
 /// Bytes one rank contributes to the Markov partial all-gather per request:
-/// a (value, index) pair (`_markov_sample_partial` reduces its vocab shard).
-const MARKOV_PARTIAL_BYTES: u64 = 16;
+/// one fp32 (value, index-bits) candidate per 1024-column block of its vocab
+/// shard (`_launch_partial` returns `[rows, parts * 2]` fp32, which
+/// `NcclVocabGather.gather_stacked` all-gathers): 32 blocks, 256 B at
+/// vocab 129280 / TP4.
+fn markov_partial_bytes(vocab_per_rank: u32) -> u64 {
+    u64::from(vocab_per_rank.div_ceil(MARKOV_SAMPLE_BLOCK)) * 2 * 4
+}
+/// The byte shape the `sample_partial` / `sample_finish` elementwise
+/// placeholders were profiled at (one candidate pair). Placeholder rows are
+/// keyed by it, so it stays; only the gather prices the real payload.
+const PLACEHOLDER_PARTIAL_BYTES: u32 = 16;
 /// The drafted token id broadcast per request.
 const TOKEN_BYTES: u64 = 8;
 
@@ -91,6 +103,7 @@ impl DsparkDraftWorklet {
         let tp = s.tp_size;
         let hidden = s.hidden_size;
         let vocab_per_rank = cfg.vocab_size.div_ceil(tp);
+        let partial_bytes = markov_partial_bytes(vocab_per_rank);
         let ew = |i: u32, o: u32| placeholder(&[p.elementwise()], gpu, i, o);
         let gemm = |backend: &'static str, n: u32, k: u32, dtype: DType| SingleGemmKernelConfig {
             backends: vec![backend],
@@ -103,7 +116,7 @@ impl DsparkDraftWorklet {
             backends: vec![p.comm()],
             gpu_name: s.gpu_name.clone(),
             num_gpus: tp,
-            fabric: Fabric::Pcie,
+            fabric: p.fabric(),
         };
         let n = &name;
         let stage = SglangDsv41LayerWorklet::build(format!("{name}.stage"), s.clone(), bridge)?;
@@ -146,17 +159,18 @@ impl DsparkDraftWorklet {
             markov_partial: op(
                 n,
                 "markov.sample_partial",
-                ew(vocab_per_rank * 4, MARKOV_PARTIAL_BYTES as u32),
+                ew(vocab_per_rank * 4, PLACEHOLDER_PARTIAL_BYTES),
                 bridge,
             )?,
             markov_gather: op(n, "markov.vocab_all_gather", comm(), bridge)?,
             markov_finish: op(
                 n,
                 "markov.sample_finish",
-                ew(MARKOV_PARTIAL_BYTES as u32 * tp, TOKEN_BYTES as u32),
+                ew(PLACEHOLDER_PARTIAL_BYTES * tp, TOKEN_BYTES as u32),
                 bridge,
             )?,
             token_broadcast: op(n, "markov.token_broadcast", comm(), bridge)?,
+            partial_bytes,
             cfg,
             name,
         })
@@ -262,7 +276,7 @@ impl DsparkDraftWorklet {
             &self.markov_gather,
             AllReduceKernelInput {
                 message_size_bytes: all_gather_as_all_reduce_bytes(
-                    u64::from(requests) * MARKOV_PARTIAL_BYTES * tp,
+                    u64::from(requests) * self.partial_bytes * tp,
                 ),
             },
             zero,

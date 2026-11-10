@@ -101,6 +101,10 @@ fn default_dsv41_engram_residency() -> String {
     "host_shared_huge".to_string()
 }
 
+const fn default_dsv41_sglang_bounded_replay() -> bool {
+    true
+}
+
 const fn default_dsv41_dspark_draft_tokens() -> u32 {
     6
 }
@@ -452,6 +456,20 @@ pub enum IterArchSel {
         #[serde(default = "default_dsv41_engram_residency")]
         #[param(string, default = "host_shared_huge", cache_key)]
         engram_residency: String,
+        /// SGLang `--enable-decoder-swa-bounded-replay`, which v0.5.23 turns on
+        /// for DeepSeek-V4.1 by default (`deepseek_v4_hook.py`): from the last
+        /// KV source layer on, each prefill request runs only its last
+        /// `sliding_window` extend tokens (the 2026-11-05 capture shows it).
+        #[serde(default = "default_dsv41_sglang_bounded_replay")]
+        #[param(default = true, cache_key)]
+        decoder_swa_bounded_replay: bool,
+        /// GPU peer-to-peer between the TP ranks. Off: the profiled Massed
+        /// Compute VM (NCCL over host shared memory; collective rows keyed by
+        /// fabric `pcie`). On: a P2P host such as RunPod's (rows keyed
+        /// `pcie_p2p`). Only the collectives change.
+        #[serde(default)]
+        #[param(cache_key)]
+        gpu_p2p: bool,
     },
     /// [`Self::DeepseekV41Sglang`] with DSpark speculative decoding: the target
     /// forward at the verify width plus the DSpark draft (KV inject, 3 stages,
@@ -482,6 +500,20 @@ pub enum IterArchSel {
         #[serde(default = "default_dsv41_engram_residency")]
         #[param(string, default = "host_shared_huge", cache_key)]
         engram_residency: String,
+        /// SGLang `--enable-decoder-swa-bounded-replay`, which v0.5.23 turns on
+        /// for DeepSeek-V4.1 by default (`deepseek_v4_hook.py`): from the last
+        /// KV source layer on, each prefill request runs only its last
+        /// `sliding_window` extend tokens (the 2026-11-05 capture shows it).
+        #[serde(default = "default_dsv41_sglang_bounded_replay")]
+        #[param(default = true, cache_key)]
+        decoder_swa_bounded_replay: bool,
+        /// GPU peer-to-peer between the TP ranks. Off: the profiled Massed
+        /// Compute VM (NCCL over host shared memory; collective rows keyed by
+        /// fabric `pcie`). On: a P2P host such as RunPod's (rows keyed
+        /// `pcie_p2p`). Only the collectives change.
+        #[serde(default)]
+        #[param(cache_key)]
+        gpu_p2p: bool,
         /// DSpark block size (`--speculative-dspark-block-size`): draft
         /// positions per request; the verify window is one more. Must equal the
         /// speculative worker's `draft_tokens`.

@@ -1067,6 +1067,8 @@ pub fn deepseek_v41_sglang(
     token_corpus_file: Option<&str>,
     max_model_len: Option<u32>,
     engram_residency: &str,
+    decoder_swa_bounded_replay: bool,
+    gpu_p2p: bool,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1076,9 +1078,10 @@ pub fn deepseek_v41_sglang(
         .context("loading exact DeepSeek-V4.1-Flash model config")?;
     let settings = sg::DeepseekV41SglangSettings {
         gpu_name: gpu.to_string(),
-        path: crate::worklet::sglang_dsv41_tp::SglangDsv41KernelPath::of(gpu)?,
+        path: crate::worklet::sglang_dsv41_tp::SglangDsv41KernelPath::of(gpu)?.with_gpu_p2p(gpu_p2p),
         max_model_len: sg::resolve_max_model_len(max_model_len, model_cfg.max_position_embeddings)?,
         engram_residency: engram_residency.to_string(),
+        decoder_swa_bounded_replay,
         verify_width: 1,
     };
     let source = ExpertDemandSource {
@@ -1133,6 +1136,8 @@ pub fn deepseek_v41_sglang_dspark(
     token_corpus_file: Option<&str>,
     max_model_len: Option<u32>,
     engram_residency: &str,
+    decoder_swa_bounded_replay: bool,
+    gpu_p2p: bool,
     draft_tokens: u32,
     gpu: &str,
     name: &str,
@@ -1145,9 +1150,10 @@ pub fn deepseek_v41_sglang_dspark(
     let dspark = dsv41_dspark_spec(&model_spec.model_config)?;
     let settings = sg::DeepseekV41SglangSettings {
         gpu_name: gpu.to_string(),
-        path: crate::worklet::sglang_dsv41_tp::SglangDsv41KernelPath::of(gpu)?,
+        path: crate::worklet::sglang_dsv41_tp::SglangDsv41KernelPath::of(gpu)?.with_gpu_p2p(gpu_p2p),
         max_model_len: sg::resolve_max_model_len(max_model_len, model_cfg.max_position_embeddings)?,
         engram_residency: engram_residency.to_string(),
+        decoder_swa_bounded_replay,
         verify_width: draft_tokens + 1,
     };
     let source = ExpertDemandSource {
@@ -2404,6 +2410,8 @@ pub fn build_iter_model(
             token_corpus_file,
             max_model_len,
             engram_residency,
+            decoder_swa_bounded_replay,
+            gpu_p2p,
         } => Box::new(deepseek_v41_sglang(
             model,
             *routing,
@@ -2412,6 +2420,8 @@ pub fn build_iter_model(
             token_corpus_file.as_deref(),
             *max_model_len,
             engram_residency,
+            *decoder_swa_bounded_replay,
+            *gpu_p2p,
             gpu,
             name,
             bridge,
@@ -2833,6 +2843,8 @@ pub fn build_speculative_iter_model(
             token_corpus_file,
             max_model_len,
             engram_residency,
+            decoder_swa_bounded_replay,
+            gpu_p2p,
             draft_tokens,
         } => Ok((
             Box::new(deepseek_v41_sglang_dspark(
@@ -2843,6 +2855,8 @@ pub fn build_speculative_iter_model(
                 token_corpus_file.as_deref(),
                 *max_model_len,
                 engram_residency,
+                *decoder_swa_bounded_replay,
+                *gpu_p2p,
                 *draft_tokens,
                 gpu,
                 name,

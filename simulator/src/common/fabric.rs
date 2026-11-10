@@ -12,8 +12,15 @@ pub enum Fabric {
     Nvlink,
     #[serde(rename = "infinity_fabric")]
     InfinityFabric,
+    /// PCIe without GPU peer-to-peer between the ranks (NCCL falls back to
+    /// host shared memory), e.g. the Massed Compute RTX PRO 6000 VMs.
     #[serde(rename = "pcie")]
     Pcie,
+    /// PCIe with GPU peer-to-peer (`nvidia-smi topo -p2p r` OK on every pair),
+    /// e.g. RunPod's 4x RTX PRO 6000 hosts. Kept apart from `pcie` because
+    /// NCCL's transport, and so every collective row, differs.
+    #[serde(rename = "pcie_p2p")]
+    PcieP2p,
     #[serde(rename = "infiniband")]
     Infiniband,
     #[serde(rename = "roce")]
@@ -31,6 +38,7 @@ impl Fabric {
             Fabric::Nvlink => "nvlink",
             Fabric::InfinityFabric => "infinity_fabric",
             Fabric::Pcie => "pcie",
+            Fabric::PcieP2p => "pcie_p2p",
             Fabric::Infiniband => "infiniband",
             Fabric::Roce => "roce",
             Fabric::Ethernet => "ethernet",

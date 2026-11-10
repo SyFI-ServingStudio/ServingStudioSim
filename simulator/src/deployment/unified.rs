@@ -554,6 +554,8 @@ impl Deployment for UnifiedDeployment {
                 token_corpus_file,
                 max_model_len,
                 engram_residency,
+                decoder_swa_bounded_replay,
+                gpu_p2p,
                 ..
             } => {
                 // Pure TP4 attention (one group, four replicated KV shards).
@@ -567,6 +569,8 @@ impl Deployment for UnifiedDeployment {
                     token_corpus_file.as_deref(),
                     *max_model_len,
                     engram_residency,
+                    *decoder_swa_bounded_replay,
+                    *gpu_p2p,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
@@ -885,6 +889,8 @@ impl Deployment for UnifiedDeployment {
                 token_corpus_file,
                 max_model_len,
                 engram_residency,
+                decoder_swa_bounded_replay,
+                gpu_p2p,
                 draft_tokens,
                 ..
             } => {
@@ -897,6 +903,8 @@ impl Deployment for UnifiedDeployment {
                     token_corpus_file.as_deref(),
                     *max_model_len,
                     engram_residency,
+                    *decoder_swa_bounded_replay,
+                    *gpu_p2p,
                     *draft_tokens,
                     &gpu_name,
                     MODEL_NAME,

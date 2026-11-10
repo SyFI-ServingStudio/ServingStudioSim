@@ -209,6 +209,7 @@ pub(crate) fn normalize_speculative_input(
         prefill: Vec::new(),
         decode_kv_lens: decode_kv_lens.clone(),
         decode_rows_per_request: draft_tokens,
+        source_rows: None,
     });
     Ok(DsparkBatch {
         target: SglangDsv41LayerInput {
@@ -217,6 +218,7 @@ pub(crate) fn normalize_speculative_input(
             prefill,
             decode_kv_lens,
             decode_rows_per_request: verify_width,
+            source_rows: None,
         },
         // One logit row per prefill request, every verify row of a decode.
         logits_rows: group.prefill_chunk_pairs.len() as u32 + decodes * verify_width,
@@ -245,9 +247,10 @@ impl DeepseekV41SglangDsparkModel {
     fn eval_into(&self, input: &SpeculativeArchInput, ev: &mut Evaluator) {
         let batch = normalize_speculative_input(input, self.draft_tokens, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid {ARCH_KIND} input: {reason}"));
-        self.target
+        let injected_rows = self
+            .target
             .eval_target(&batch.target, batch.logits_rows, ev);
-        self.draft.eval(batch.target.rows, batch.draft.as_ref(), ev);
+        self.draft.eval(injected_rows, batch.draft.as_ref(), ev);
     }
 }
 

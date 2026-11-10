@@ -57,9 +57,24 @@ use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBri
 /// scoring (position/length bookkeeping, gathers, casts): 20 in the decode
 /// trace. Priced as this many byte-floor elementwise launches.
 pub const INDEXER_BOOKKEEPING_LAUNCHES: u32 = 20;
+/// CALIBRATED, not profiled: how many 128-byte `elementwise` placeholder
+/// passes over the `[requests, max_model_len / ratio]` dense-blocks indexer
+/// tensors one decode step costs, per index layer. Fitted to the labeled
+/// `indexer.torch_bookkeeping` kernels of the R4 nsys capture at 1M context
+/// length (case 21, 8 decoding: 24.77 ms per step measured; the placeholder is
+/// linear in passes, 6.78 ms at 3 and 22.03 ms at 10). Replace with profiled
+/// rows.
+pub const DENSE_INDEXER_PASSES: u64 = 11;
+/// The widest `sparse_indexer_logits_decode` rows in profile.db (B1 rental).
+pub const INDEXER_LOGITS_MAX_PROFILED_WIDTH: u32 = 65_536;
+/// CALIBRATED on the R4 case-21 capture (1M context, 8 decoding): byte-floor
+/// passes the torch top-k makes over the `[requests, lmax]` scores.
+pub const DENSE_TOPK_PASSES: u64 = 1;
 /// Torch top-k launches per index layer (`mbtopk` passes, scans, radix sort,
 /// gather): about 30 in the decode trace.
 pub const INDEXER_TOPK_LAUNCHES: u32 = 30;
+/// Bytes per gathered logit: the bf16 lm_head output.
+const LOGITS_GATHER_BYTES: u64 = 2;
 /// SGLang KV page size (`server_info.page_size`, V4 layout on SM12x).
 pub const PAGE_SIZE: u32 = 256;
 
@@ -67,8 +82,12 @@ pub const PAGE_SIZE: u32 = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SglangDsv41KernelPath {
     /// RTX PRO 6000 / RTX 50 class: Triton block-32 FP8 linears, FlashInfer
-    /// `sparse_mla_sm120`, CUTLASS MXFP8 x MXFP4 experts, NCCL over PCIe.
+    /// `sparse_mla_sm120`, CUTLASS MXFP8 x MXFP4 experts, NCCL over PCIe
+    /// without GPU peer-to-peer (host shared memory).
     Sm120,
+    /// The same kernels on a host with GPU peer-to-peer over PCIe: only the
+    /// collectives' fabric identity (`pcie_p2p`) differs.
+    Sm120P2p,
 }
 
 impl SglangDsv41KernelPath {
@@ -79,6 +98,23 @@ impl SglangDsv41KernelPath {
                 "deepseek_v41_sglang is captured on SM12x only; {gpu_name} has compute capability \
                  {other:?}"
             ),
+        }
+    }
+
+    /// `gpu_p2p`: the host has GPU peer-to-peer between the TP ranks.
+    pub fn with_gpu_p2p(self, gpu_p2p: bool) -> Self {
+        if gpu_p2p {
+            Self::Sm120P2p
+        } else {
+            Self::Sm120
+        }
+    }
+
+    /// The fabric every collective row is keyed by.
+    pub(crate) fn fabric(self) -> Fabric {
+        match self {
+            Self::Sm120 => Fabric::Pcie,
+            Self::Sm120P2p => Fabric::PcieP2p,
         }
     }
 
@@ -170,6 +206,9 @@ pub struct SglangDsv41LayerConfig {
     /// (`speculative_num_draft_tokens`, 7 for DSpark block 6). The decode
     /// indexer is captured per width (`next_n`).
     pub verify_width: u32,
+    /// SGLang `--context-length`: the width of the decode CUDA graph's page
+    /// table, which sizes the SM12x dense-blocks indexer's tensors.
+    pub max_model_len: u32,
 }
 
 /// One forward's batch as every layer sees it.
@@ -185,6 +224,11 @@ pub struct SglangDsv41LayerInput {
     pub decode_kv_lens: Vec<u32>,
     /// Query rows per decode request (1, or the verify width).
     pub decode_rows_per_request: u32,
+    /// Rows the KV-source writes (compressor, index K) run when they differ
+    /// from `rows`: the bounded-replay tail-start layer writes every row's
+    /// compressed KV before switching to the tail
+    /// (`DeepseekV4AttnBackend.write_tail_source_kv`). `None`: `rows`.
+    pub source_rows: Option<u32>,
 }
 
 impl SglangDsv41LayerInput {
@@ -326,7 +370,7 @@ impl SglangDsv41LayerWorklet {
             backends: vec![p.comm()],
             gpu_name: c.gpu_name.clone(),
             num_gpus: tp,
-            fabric: Fabric::Pcie,
+            fabric: p.fabric(),
         };
         let hidden = c.hidden_size;
         let head_dim = c.head_dim;
@@ -715,6 +759,48 @@ impl SglangDsv41LayerWorklet {
         }
     }
 
+    /// Tokens one indexer-bookkeeping launch is priced at. On SM12x the
+    /// dense-blocks decode indexer (`v41_indexer/scoring.py` `decode_scores`,
+    /// non-paged branch) builds its tensors at `lmax = min(page_table width x
+    /// compressed page size, req_to_token width / ratio)`, and a decode CUDA
+    /// graph's page table spans `--context-length`: every decode step runs
+    /// `arange` / `valid` mask / `req_to_token` gather / int64 slot math /
+    /// `masked_fill` / top-k over `[requests, max_model_len / ratio]`, whatever
+    /// the batch's real context. The 20 launches together move the work of
+    /// [`DENSE_INDEXER_PASSES`] byte-floor passes per (request, lmax) element.
+    /// Without it, decode at
+    /// 1M context priced 20-50% under the live server at 3-8 requests
+    /// (2026-11-05 `serve_full.log`; torch-profiler `decode_bs8_ctx16k` spends
+    /// ~30 ms/step in these torch kernels against ~2 ms at bs 1). Prefill and
+    /// mixed forwards size by real lengths: the bookkeeping stays per row.
+    fn bookkeeping_tokens(&self, input: &SglangDsv41LayerInput) -> u32 {
+        self.lmax_scaled_tokens(input, DENSE_INDEXER_PASSES, INDEXER_BOOKKEEPING_LAUNCHES)
+    }
+
+    /// The torch top-k over the `[requests, lmax]` scores (`select_decode`):
+    /// [`DENSE_TOPK_PASSES`] byte-floor passes per element across the
+    /// [`INDEXER_TOPK_LAUNCHES`] launches (R4 case 21: 2.07 ms measured vs
+    /// 0.42 ms priced per row).
+    fn topk_tokens(&self, input: &SglangDsv41LayerInput) -> u32 {
+        self.lmax_scaled_tokens(input, DENSE_TOPK_PASSES, INDEXER_TOPK_LAUNCHES)
+    }
+
+    /// `lmax` of a decode CUDA-graph forward (`max_model_len / ratio`), `None`
+    /// for prefill and mixed forwards, which size by real lengths.
+    fn decode_graph_lmax(&self, input: &SglangDsv41LayerInput) -> Option<u64> {
+        (input.decode_only && !input.decode_kv_lens.is_empty())
+            .then(|| u64::from(self.cfg.max_model_len / self.cfg.layer.compress_ratio.max(1)))
+    }
+
+    fn lmax_scaled_tokens(&self, input: &SglangDsv41LayerInput, passes: u64, launches: u32) -> u32 {
+        let Some(lmax) = self.decode_graph_lmax(input) else {
+            return input.rows.max(1);
+        };
+        let requests = input.decode_kv_lens.len() as u64;
+        let tokens = (requests * lmax * passes).div_ceil(u64::from(launches));
+        u32::try_from(tokens).unwrap_or(u32::MAX).max(1)
+    }
+
     pub fn eval(&self, input: &SglangDsv41LayerInput, ev: &mut Evaluator) {
         let rows = input.rows;
         let zero = rows == 0;
@@ -741,18 +827,26 @@ impl SglangDsv41LayerWorklet {
         eval_or_zero(&self.qkv_norm, ew.clone(), zero, ev);
         eval_or_zero(&self.wq_b, gemm.clone(), zero, ev);
         eval_or_zero(&self.rope_kv_store, ew.clone(), zero, ev);
+        let source_rows = input.source_rows.unwrap_or(rows);
+        let source_ew = ElementwiseKernelInput {
+            num_tokens: source_rows,
+        };
         if let Some(op) = &self.compressor_proj {
-            eval_or_zero(op, GemmFp32OutputKernelInput { m: rows }, zero, ev);
+            eval_or_zero(
+                op,
+                GemmFp32OutputKernelInput { m: source_rows },
+                source_rows == 0,
+                ev,
+            );
         }
-        for op in [
-            &self.compressor_store,
-            &self.indexer_weights,
-            &self.indexer_wk,
-        ]
-        .into_iter()
-        .flatten()
-        {
+        if let Some(op) = &self.compressor_store {
+            eval_or_zero(op, source_ew.clone(), source_rows == 0, ev);
+        }
+        if let Some(op) = &self.indexer_weights {
             eval_or_zero(op, ew.clone(), zero, ev);
+        }
+        if let Some(op) = &self.indexer_wk {
+            eval_or_zero(op, source_ew, source_rows == 0, ev);
         }
         if let Some(op) = &self.indexer_wq_b {
             eval_or_zero(op, gemm.clone(), zero, ev);
@@ -764,7 +858,7 @@ impl SglangDsv41LayerWorklet {
             eval_or_zero(
                 op,
                 ElementwiseKernelInput {
-                    num_tokens: rows.max(1),
+                    num_tokens: self.bookkeeping_tokens(input),
                 },
                 zero,
                 ev,
@@ -778,7 +872,15 @@ impl SglangDsv41LayerWorklet {
                 Some(call) => {
                     let max_ctx = input.decode_kv_lens.iter().copied().max().unwrap_or(0);
                     let keys = (call.context_before / ratio).max(1);
-                    let width = (max_ctx / ratio).max(1).div_ceil(64) * 64;
+                    // Decode CUDA graphs size the logits grid by the page-table
+                    // width (`lmax`, R4 case 21: 4.65 ms measured vs 1.84 ms
+                    // priced at the real context); eager decode by the batch.
+                    let width = match self.decode_graph_lmax(input) {
+                        Some(lmax) => lmax as u32,
+                        None => (max_ctx / ratio).max(1),
+                    }
+                    .div_ceil(64)
+                        * 64;
                     // `next_n` rows per request are one indexer row each at
                     // width 1; at the verify width the kind counts requests.
                     let batch_size = if self.cfg.verify_width > 1 {
@@ -786,11 +888,20 @@ impl SglangDsv41LayerWorklet {
                     } else {
                         call.num_requests * call.rows_per_request
                     };
+                    // Past the widest profiled row, price the [rows, width] grid
+                    // as `pieces` row blocks of the widest profiled width (linear
+                    // in width and in keys from measured rows, instead of the
+                    // interpolator's extrapolation, which priced R4 case 21's
+                    // 1M-wide grid at 2.42 ms against 4.65 ms measured).
+                    let pieces = width.div_ceil(INDEXER_LOGITS_MAX_PROFILED_WIDTH).max(1);
                     op.eval(
                         &SparseIndexerLogitsDecodeKernelInput {
-                            batch_size,
-                            num_keys: keys,
-                            logits_width: width,
+                            batch_size: batch_size * pieces,
+                            // Keys split across the pieces: rows x keys (the dot
+                            // products) and rows x width (grid + output) both keep
+                            // their totals.
+                            num_keys: (keys / pieces).max(1),
+                            logits_width: width.min(INDEXER_LOGITS_MAX_PROFILED_WIDTH),
                         },
                         ev,
                     );
@@ -831,7 +942,7 @@ impl SglangDsv41LayerWorklet {
             eval_or_zero(
                 op,
                 ElementwiseKernelInput {
-                    num_tokens: rows.max(1),
+                    num_tokens: self.topk_tokens(input),
                 },
                 zero,
                 ev,
@@ -905,7 +1016,7 @@ impl SglangDsv41PrologueWorklet {
                     backends: vec![path.comm()],
                     gpu_name: gpu_name.to_string(),
                     num_gpus: tp_size,
-                    fabric: Fabric::Pcie,
+                    fabric: path.fabric(),
                 },
                 bridge,
             )?,
@@ -1006,7 +1117,7 @@ impl SglangDsv41HeadWorklet {
                     backends: vec![path.comm()],
                     gpu_name: gpu_name.to_string(),
                     num_gpus: tp_size,
-                    fabric: Fabric::Pcie,
+                    fabric: path.fabric(),
                 },
                 bridge,
             )?,
@@ -1036,8 +1147,12 @@ impl SglangDsv41HeadWorklet {
             zero,
             ev,
         );
-        let gathered =
-            u64::from(logits_rows) * u64::from(self.vocab_per_rank) * u64::from(tp_size) * 4;
+        // The lm_head output dtype: bf16 (`enable_fp32_lm_head` off), gathered
+        // before the fp32 cast (`LogitsProcessor._logits_gatherer`).
+        let gathered = u64::from(logits_rows)
+            * u64::from(self.vocab_per_rank)
+            * u64::from(tp_size)
+            * LOGITS_GATHER_BYTES;
         eval_or_zero(
             &self.logits_all_gather,
             AllReduceKernelInput {
@@ -1063,6 +1178,7 @@ mod tests {
             prefill: vec![(2048, 50_000), (1000, 1000)],
             decode_kv_lens: vec![1000, 3000],
             decode_rows_per_request: 1,
+            source_rows: None,
         };
         let decode = input.decode_call().expect("two decodes");
         assert_eq!(

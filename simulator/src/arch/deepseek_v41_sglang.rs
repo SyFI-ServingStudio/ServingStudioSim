@@ -67,6 +67,103 @@ pub struct DeepseekV41SglangSettings {
     /// Query rows per decoding request the target runs: 1 here, the DSpark
     /// verify width (`draft_tokens + 1`) under speculative decoding.
     pub verify_width: u32,
+    /// SGLang `--enable-decoder-swa-bounded-replay` ([`BoundedReplay`]).
+    pub decoder_swa_bounded_replay: bool,
+}
+
+/// SGLang's decoder SWA bounded replay (`models/deepseek_v4.py`,
+/// `late_layer_start` and the `LateLayerTail` slicing in
+/// `DeepseekV4Model.forward`; on by default in v0.5.23). With
+/// `tail_writes_source_kv`, the tail starts AT the last KV source layer (20
+/// on V4.1-Flash): `write_tail_source_kv` first writes that layer's
+/// compressed KV for every extend row, then layers 20..40 run each extend
+/// request's last `SWA_WINDOW` (128) rows only. Nothing later reads the
+/// skipped rows' late-layer state except through the 128-token window, and
+/// the DSpark draft reads tail rows only, so its KV inject also covers just
+/// the tail. Only extend forwards without speculation take it: decode and
+/// DSpark verify run every row.
+///
+/// Measured in the B2 nsys capture (`07_balanced_anchor_c16`): in every
+/// 2048-token chunk layers 0-19 run at full M and layers 20-39 at tail M
+/// (all-reduce 1.7-1.9 ms vs 0.13-0.27 ms; wq_b 0.44 vs 0.03 ms).
+///
+/// Approximation: the tail-start layer's own full-row `mhc.combine` before
+/// the source-KV write is not priced (one small launch per prefill chunk).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoundedReplay {
+    pub late_layer_start: u32,
+    /// `SWA_WINDOW`: replayed extend rows per request.
+    pub window: u32,
+}
+
+impl BoundedReplay {
+    /// The tail start and SGLang's preconditions (`DeepseekV4Model.__init__`):
+    /// the last KV source carries no Engram and is an index source; later
+    /// layers compress at ratio 0 or 1 and own no KV or Engram.
+    pub fn from_model(model: &DeepseekV41ModelCfg) -> std::result::Result<Self, String> {
+        let start = *model
+            .kv_source_layer_ids
+            .iter()
+            .max()
+            .ok_or("decoder SWA bounded replay needs kv_source_layer_ids")?;
+        if model.engram_layer_ids.contains(&start)
+            || !model.index_source_layer_ids.contains(&start)
+        {
+            return Err(format!(
+                "bounded replay: the last KV source layer {start} must be an index source without Engram"
+            ));
+        }
+        for layer in start + 1..model.num_layers {
+            if model.compress_ratios[layer as usize] > 1
+                || model.kv_source_layer_ids.contains(&layer)
+                || model.engram_layer_ids.contains(&layer)
+            {
+                return Err(format!(
+                    "bounded replay: late layer {layer} must compress at ratio 0/1 and own no KV or Engram"
+                ));
+            }
+        }
+        Ok(Self {
+            late_layer_start: start,
+            window: model.sliding_window,
+        })
+    }
+
+    fn is_late(&self, layers: &[u32]) -> std::result::Result<bool, String> {
+        let late = layers.iter().filter(|&&l| l >= self.late_layer_start).count();
+        match late {
+            0 => Ok(false),
+            n if n == layers.len() => Ok(true),
+            _ => Err(format!(
+                "body for layers {layers:?} straddles late_layer_start {}",
+                self.late_layer_start
+            )),
+        }
+    }
+
+    /// The late layers' input: each prefill request keeps its last `window`
+    /// rows (same context); decode rows are unchanged; the source-KV writes
+    /// keep every row. `None` when the forward is not a prefill (extend).
+    pub fn tail_input(&self, full: &SglangDsv41LayerInput) -> Option<SglangDsv41LayerInput> {
+        if full.prefill.is_empty() {
+            return None;
+        }
+        let appended: u32 = full.prefill.iter().map(|&(a, _)| a).sum();
+        let prefill: Vec<(u32, u32)> = full
+            .prefill
+            .iter()
+            .map(|&(a, c)| (a.min(self.window), c))
+            .collect();
+        let kept: u32 = prefill.iter().map(|&(a, _)| a).sum();
+        Some(SglangDsv41LayerInput {
+            rows: full.rows - appended + kept,
+            decode_only: false,
+            prefill,
+            decode_kv_lens: full.decode_kv_lens.clone(),
+            decode_rows_per_request: full.decode_rows_per_request,
+            source_rows: Some(full.rows),
+        })
+    }
 }
 
 enum PlanNode {
@@ -80,6 +177,9 @@ pub struct DeepseekV41SglangModel {
     prologue: SglangDsv41PrologueWorklet,
     bodies: Vec<SglangDsv41LayerWorklet>,
     plan: Vec<PlanNode>,
+    /// Per body: all its layers are in the bounded-replay tail.
+    late_bodies: Vec<bool>,
+    bounded_replay: Option<BoundedReplay>,
     head: SglangDsv41HeadWorklet,
     max_model_len: u32,
     kv_cache_layout: KvCacheLayout,
@@ -109,7 +209,16 @@ pub fn build(
         .map(|l| (l, model.layer_kind(l)))
         .collect();
     let folded = fold_layers(&layers);
+    let bounded_replay = if settings.decoder_swa_bounded_replay {
+        Some(BoundedReplay::from_model(model).map_err(|reason| BuildError::FitFailed {
+            kind: ARCH_KIND,
+            reason,
+        })?)
+    } else {
+        None
+    };
     let mut bodies = Vec::new();
+    let mut body_layers: Vec<Vec<u32>> = Vec::new();
     fn plan_of(
         folded: &[FoldPlan],
         model: &DeepseekV41ModelCfg,
@@ -118,6 +227,7 @@ pub fn build(
         demand: &ExpertDemand,
         name: &str,
         bodies: &mut Vec<SglangDsv41LayerWorklet>,
+        body_layers: &mut Vec<Vec<u32>>,
         bridge: &PerfApiBridge,
     ) -> std::result::Result<Vec<PlanNode>, BuildError> {
         let mut out = Vec::new();
@@ -138,11 +248,22 @@ pub fn build(
                         format!("{name}.layers{}", layers_label(layers))
                     };
                     bodies.push(SglangDsv41LayerWorklet::build(label, cfg, bridge)?);
+                    body_layers.push(layers.clone());
                     out.push(PlanNode::Body(bodies.len() - 1));
                 }
                 FoldPlan::Repeat { n, body } => out.push(PlanNode::Repeat {
                     n: *n,
-                    body: plan_of(body, model, settings, path, demand, name, bodies, bridge)?,
+                    body: plan_of(
+                        body,
+                        model,
+                        settings,
+                        path,
+                        demand,
+                        name,
+                        bodies,
+                        body_layers,
+                        bridge,
+                    )?,
                 }),
             }
         }
@@ -156,8 +277,20 @@ pub fn build(
         demand,
         &name,
         &mut bodies,
+        &mut body_layers,
         bridge,
     )?;
+    let late_bodies = match &bounded_replay {
+        Some(replay) => body_layers
+            .iter()
+            .map(|layers| replay.is_late(layers))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|reason| BuildError::FitFailed {
+                kind: ARCH_KIND,
+                reason,
+            })?,
+        None => vec![false; bodies.len()],
+    };
     let prologue = SglangDsv41PrologueWorklet::build(
         format!("{name}.prologue"),
         path,
@@ -183,6 +316,8 @@ pub fn build(
         prologue,
         bodies,
         plan,
+        late_bodies,
+        bounded_replay,
         head,
         max_model_len: settings.max_model_len,
         kv_cache_layout: kv_cache_layout(model),
@@ -234,6 +369,7 @@ pub(crate) fn layer_config(
         engram_residency: settings.engram_residency.clone(),
         engram_wkv_n: ENGRAM_WKV_OUT,
         verify_width: settings.verify_width.max(1),
+        max_model_len: settings.max_model_len,
     }
 }
 
@@ -325,6 +461,7 @@ pub(crate) fn normalize_input(
             prefill,
             decode_kv_lens: group.decode_kv_lens.clone(),
             decode_rows_per_request: 1,
+            source_rows: None,
         },
         group.request_count(),
     ))
@@ -364,11 +501,23 @@ impl DeepseekV41SglangModel {
             .collect()
     }
 
-    fn eval_plan(&self, plan: &[PlanNode], input: &SglangDsv41LayerInput, ev: &mut Evaluator) {
+    fn eval_plan(
+        &self,
+        plan: &[PlanNode],
+        input: &SglangDsv41LayerInput,
+        tail: Option<&SglangDsv41LayerInput>,
+        ev: &mut Evaluator,
+    ) {
         for node in plan {
             match node {
-                PlanNode::Body(i) => self.bodies[*i].eval(input, ev),
-                PlanNode::Repeat { body, .. } => self.eval_plan(body, input, ev),
+                PlanNode::Body(i) => {
+                    let body_input = match tail {
+                        Some(tail) if self.late_bodies[*i] => tail,
+                        _ => input,
+                    };
+                    self.bodies[*i].eval(body_input, ev)
+                }
+                PlanNode::Repeat { body, .. } => self.eval_plan(body, input, tail, ev),
             }
         }
     }
@@ -387,16 +536,20 @@ impl DeepseekV41SglangModel {
         sections
     }
 
-    /// Evaluate [`Self::compile_target`]'s slots for one forward.
+    /// Evaluate [`Self::compile_target`]'s slots for one forward. Returns the
+    /// rows the last layers ran (the bounded-replay tail of a prefill, else
+    /// every row): the hidden states the DSpark KV inject reads.
     pub(crate) fn eval_target(
         &self,
         input: &SglangDsv41LayerInput,
         logits_rows: u32,
         ev: &mut Evaluator,
-    ) {
+    ) -> u32 {
+        let tail = self.bounded_replay.and_then(|replay| replay.tail_input(input));
         self.prologue.eval(input.rows, ev);
-        self.eval_plan(&self.plan, input, ev);
+        self.eval_plan(&self.plan, input, tail.as_ref(), ev);
         self.head.eval(logits_rows, self.tp_size, ev);
+        tail.map_or(input.rows, |t| t.rows)
     }
 
     pub(crate) fn unique_bodies(&self) -> usize {
@@ -469,6 +622,38 @@ pub fn resolve_max_model_len(requested: Option<u32>, max_position_embeddings: u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_replay_keeps_each_prefill_tail_and_every_source_row() {
+        let replay = BoundedReplay {
+            late_layer_start: 20,
+            window: 128,
+        };
+        let full = SglangDsv41LayerInput {
+            rows: 2048 + 100 + 2,
+            decode_only: false,
+            prefill: vec![(2048, 50_000), (100, 100)],
+            decode_kv_lens: vec![1000, 3000],
+            decode_rows_per_request: 1,
+            source_rows: None,
+        };
+        let tail = replay.tail_input(&full).expect("a prefill forward");
+        assert_eq!(tail.prefill, vec![(128, 50_000), (100, 100)]);
+        assert_eq!(tail.rows, 128 + 100 + 2);
+        assert_eq!(tail.source_rows, Some(full.rows));
+        assert_eq!(tail.decode_kv_lens, full.decode_kv_lens);
+        let decode = SglangDsv41LayerInput {
+            rows: 16,
+            decode_only: true,
+            decode_kv_lens: vec![1000; 16],
+            decode_rows_per_request: 1,
+            ..Default::default()
+        };
+        assert!(replay.tail_input(&decode).is_none());
+        assert_eq!(replay.is_late(&[20]), Ok(true));
+        assert_eq!(replay.is_late(&[2, 8]), Ok(false));
+        assert!(replay.is_late(&[19, 20]).is_err());
+    }
 
     #[test]
     fn decode_batches_pad_to_sglang_graph_sizes() {
