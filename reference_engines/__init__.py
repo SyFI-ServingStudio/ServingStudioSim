@@ -231,7 +231,46 @@ def format_base(base: Base, header: str) -> str:
 # above all, would build into an image that silently lacks it.
 _INSTALLED = {"vllm": ("vllm/",), "sglang": ("python/sglang/",)}
 _NOT_RUN = re.compile(r"(^|/)(tests?|docs)/|\.md$")
-_DIFF_HEADER = re.compile(r"diff --git a/(\S+) b/(\S+)")
+_RENAME_LINE = re.compile(r"(?:rename|copy) (?:from|to) (.+)")
+
+
+def _unquote(path: str) -> str:
+    """A path as git wrote it: C-quoted ("a/\\303\\251.py") when unusual."""
+
+    if len(path) > 1 and path[0] == path[-1] == '"':
+        raw = path[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape")
+        return raw.encode("latin-1").decode("utf-8", "replace")
+    return path
+
+
+def patch_paths(text: str) -> list[str]:
+    """Every path a patch touches, both sides of a rename or copy.
+
+    Read from each file's header only (`diff --git` up to its first hunk), so
+    a body line that happens to read `--- a/x` is not taken for one.
+    """
+
+    paths: dict[str, None] = {}
+    in_header = False
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            in_header = True
+            rest = line[len("diff --git ") :]
+            if rest.startswith("a/") and " b/" in rest:  # unquoted: a/x b/x (mode-only too)
+                old, _, new = rest[2:].partition(" b/")
+                paths.update(dict.fromkeys((old, new)))
+            continue
+        if line.startswith("@@"):
+            in_header = False
+        if not in_header:
+            continue
+        if line.startswith(("--- ", "+++ ")):
+            path = _unquote(line[4:].rstrip("\t"))
+            if path != "/dev/null":
+                paths[path[2:] if path.startswith(("a/", "b/")) else path] = None
+        elif match := _RENAME_LINE.fullmatch(line):
+            paths[_unquote(match.group(1))] = None
+    return list(paths)
 
 
 def patched_paths_not_installed(engine: str) -> list[str]:
@@ -239,14 +278,10 @@ def patched_paths_not_installed(engine: str) -> list[str]:
 
     stray = []
     for patch in patch_files(engine):
-        for line in patch.read_text(encoding="utf-8", errors="replace").splitlines():
-            match = _DIFF_HEADER.fullmatch(line)
-            if match is None:
-                continue
-            # Both sides: a rename or copy into a native source counts too.
-            for path in dict.fromkeys(match.groups()):
-                if not path.startswith(_INSTALLED[engine]) and not _NOT_RUN.search(path):
-                    stray.append(f"{patch.name}: {path}")
+        # Both sides: a rename or copy into a native source counts too.
+        for path in patch_paths(patch.read_text(encoding="utf-8", errors="replace")):
+            if not path.startswith(_INSTALLED[engine]) and not _NOT_RUN.search(path):
+                stray.append(f"{patch.name}: {path}")
     return stray
 
 

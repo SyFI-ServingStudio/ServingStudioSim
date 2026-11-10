@@ -196,7 +196,13 @@ def _check_replaceable(dest: Path, *, force: bool, patches: list[Path]) -> None:
             f"{dest} has an unfinished git operation ({', '.join(pending)}); finish it and "
             "`export-patches`, or abort it, first"
         )
-    if (git_dir / "refs" / "stash").exists() or (git_dir / "logs" / "refs" / "stash").exists():
+    has_stash = subprocess.run(
+        ["git", "rev-parse", "--quiet", "--verify", "refs/stash"],
+        cwd=dest,
+        capture_output=True,
+        check=False,
+    )
+    if has_stash.returncode == 0:
         raise RefError(f"{dest} has a stash a replace would delete; apply or drop it first")
     unexported = _unexported_commits(dest, patches)
     if unexported:

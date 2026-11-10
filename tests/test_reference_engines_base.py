@@ -220,10 +220,22 @@ def test_a_native_change_in_a_patch_is_reported(tmp_path, monkeypatch):
         "diff --git a/csrc/moe/topk.cu b/csrc/moe/topk.cu\n"
         "diff --git a/CMakeLists.txt b/CMakeLists.txt\n"
         "diff --git a/vllm/kernel.cu b/csrc/kernel.cu\n"
+        "diff --git a/vllm/x y.py b/csrc/x y.cu\n"
+        'diff --git "a/vllm/caf\\303\\251.py" "b/csrc/caf\\303\\251.cu"\n'
+        "similarity index 90%\n"
+        'rename from "vllm/caf\\303\\251.py"\n'
+        'rename to "csrc/caf\\303\\251.cu"\n'
+        "diff --git a/vllm/b.py b/vllm/b.py\n"
+        "--- a/vllm/b.py\n"
+        "+++ b/vllm/b.py\n"
+        "@@ -1 +1 @@\n"
+        "--- a/csrc/not_a_header.cu\n"  # a body line removing "-- a/..."
     )
     monkeypatch.setattr(reference_engines, "patch_files", lambda engine: [patch])
     assert reference_engines.patched_paths_not_installed("vllm") == [
         "0001-x.patch: csrc/moe/topk.cu",
         "0001-x.patch: CMakeLists.txt",
         "0001-x.patch: csrc/kernel.cu",  # renamed into a native source
+        "0001-x.patch: csrc/x y.cu",  # a path with a space
+        "0001-x.patch: csrc/café.cu",  # a C-quoted path
     ]
