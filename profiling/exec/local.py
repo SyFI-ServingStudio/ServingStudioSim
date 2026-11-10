@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -24,7 +24,6 @@ from profiling.exec.env import (
     ContainerProfileEnv,
     ProfileEnv,
     compose_library_path,
-    compose_pythonpath,
     resolve_profile_env,
     set_worker_python_env,
 )
@@ -154,7 +153,9 @@ class LocalGpuChunk(GpuChunk):
                     else tactic_cache_dir()
                 ),
                 device=gpu_name_of(self.gpus),
-                flashinfer_version=(None if container else env_flashinfer_version(profiler_env)),
+                flashinfer_version=(
+                    None if container else functools.partial(env_flashinfer_version, profiler_env)
+                ),
             )
             if found:
                 worker_env[PREFLIGHT_ENV] = found
@@ -234,7 +235,7 @@ def autotune_preflight(
     *,
     tactic_dir: Path | None,
     device: str,
-    flashinfer_version: str | None = None,
+    flashinfer_version: str | Callable[[], str] | None = None,
 ) -> str | None:
     """Check, before any worker starts, that a forbid run will not need to tune.
 
@@ -244,8 +245,9 @@ def autotune_preflight(
     ``AutotuneForbiddenError`` listing every missing spec, else returns what it
     found (for ``PREFLIGHT_ENV``) or ``None`` when the row keeps no tactic file.
 
-    With ``flashinfer_version`` only that version's file counts (another
-    version's tactics would not be read). A present file is necessary, not
+    With ``flashinfer_version`` (or a callable giving it, asked only when a
+    row keeps tactic files) only that version's file counts: another
+    version's tactics would not be read. A present file is necessary, not
     sufficient: it may lack a bucket this spec reaches. The worker's guard is
     the backstop for that, and reports it as a manifest/actual mismatch.
     """
@@ -259,6 +261,8 @@ def autotune_preflight(
         )
     if profiler_spec.tactic_label is None:
         return None
+    if callable(flashinfer_version):
+        flashinfer_version = flashinfer_version()
     missing: list[str] = []
     files: set[str] = set()
     for spec in specs:
@@ -280,28 +284,48 @@ def autotune_preflight(
     return f"tactic files {sorted(files)} in {tactic_dir}"
 
 
-@functools.cache
-def env_flashinfer_version(profile_env: Any) -> str | None:
-    """The `flashinfer.__version__` an env imports (what names its tactic files), or None."""
+_FLASHINFER_VERSIONS: dict[Any, str] = {}
+_VERSION_MARK = "VIBESIM_FLASHINFER_VERSION="
 
-    env = dict(os.environ)
-    env["PYTHONPATH"] = compose_pythonpath(profile_env, None)
+
+def env_flashinfer_version(profile_env: Any) -> str:
+    """The `flashinfer.__version__` a host env's worker imports (what names
+    its tactic files), probed under the worker's own interpreter, import path
+    and library path. Raises when the probe fails: falling back to any
+    version's file would let a forbid run pass on tactics it cannot read."""
+
+    if profile_env in _FLASHINFER_VERSIONS:
+        return _FLASHINFER_VERSIONS[profile_env]
+    env = os.environ.copy()
+    set_worker_python_env(profile_env, env)
+    if profile_env.additional_library_paths:
+        env["LD_LIBRARY_PATH"] = compose_library_path(profile_env, env.get("LD_LIBRARY_PATH"))
+    command = [
+        str(profile_env.python_executable),
+        "-c",
+        f"import flashinfer; print({_VERSION_MARK!r} + flashinfer.__version__)",
+    ]
     try:
         result = subprocess.run(
-            [
-                str(profile_env.python_executable),
-                "-c",
-                "import flashinfer; print(flashinfer.__version__)",
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
+            command, env=env, capture_output=True, text=True, check=False, timeout=120
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return result.stdout.strip() or None if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"cannot tell which FlashInfer {profile_env.python_executable} imports: {exc}"
+        ) from exc
+    versions = [
+        line[len(_VERSION_MARK) :].strip()
+        for line in result.stdout.splitlines()
+        if line.startswith(_VERSION_MARK)
+    ]
+    if result.returncode != 0 or len(versions) != 1 or not versions[0]:
+        tail = (result.stderr or result.stdout).strip()[-500:]
+        raise RuntimeError(
+            f"cannot tell which FlashInfer {profile_env.python_executable} imports "
+            f"(exit {result.returncode}): {tail}"
+        )
+    _FLASHINFER_VERSIONS[profile_env] = versions[0]
+    return versions[0]
 
 
 def _log_tuning(kernel_kind: KernelKind, backend: str, tuned: list[dict] | None) -> None:

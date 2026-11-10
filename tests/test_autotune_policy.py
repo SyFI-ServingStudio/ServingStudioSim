@@ -291,6 +291,52 @@ def test_l1_preflight_ignores_another_flashinfers_tactics(tmp_path) -> None:
     )
 
 
+def test_l1_preflight_asks_the_version_only_of_a_row_with_tactic_files(tmp_path) -> None:
+    spec = find_kernel_profiler_spec("single_gemm", "torch")
+
+    def never():
+        raise AssertionError("a row without tactic files must not probe the env")
+
+    assert (
+        autotune_preflight(
+            "single_gemm", spec, [{}], tactic_dir=tmp_path, device="x", flashinfer_version=never
+        )
+        is None
+    )
+
+
+def test_the_env_flashinfer_probe_reads_its_marked_line_and_refuses_to_guess(
+    monkeypatch, tmp_path
+) -> None:
+    from profiling.exec.env import ProfileEnv
+
+    env = ProfileEnv(name="probe_env", python_executable=Path(sys.executable))
+    monkeypatch.setattr(local, "_FLASHINFER_VERSIONS", {})
+    outputs = iter(
+        [
+            subprocess.CompletedProcess([], 1, stdout="", stderr="No module named flashinfer"),
+            subprocess.CompletedProcess(
+                [], 0, stdout=f"import chatter\n{local._VERSION_MARK}0.6.11.post3\n", stderr=""
+            ),
+        ]
+    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(kwargs["env"])
+        return next(outputs)
+
+    monkeypatch.setattr(local.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="No module named flashinfer"):
+        local.env_flashinfer_version(env)
+    # A failure is not remembered; a success is.
+    assert local.env_flashinfer_version(env) == "0.6.11.post3"
+    assert local.env_flashinfer_version(env) == "0.6.11.post3"
+    assert len(calls) == 2
+    assert "PYTHONPATH" in calls[0]  # the worker's import path
+
+
 def test_l1_preflight_lists_every_spec_without_tactics(tmp_path) -> None:
     spec = find_kernel_profiler_spec("nvfp4_fused_moe", "flashinfer_trtllm_sm100")
     other = {**_MOE, "num_local_experts": 64}
