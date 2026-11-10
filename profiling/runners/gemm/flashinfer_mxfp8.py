@@ -38,6 +38,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners import tactic_labels
 from profiling.runners.autotune_cache import autotune_cached
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
@@ -184,7 +185,7 @@ def _profile(
         def run_once() -> Any:
             return kernel.apply_weights(layer, activation)
 
-        with autotune_cached(autotune, "single_gemm.flashinfer_mxfp8"):
+        with autotune_cached(autotune, tactic_labels.flashinfer_mxfp8()):
             run_once()
         out = run_once()
         torch.cuda.synchronize()

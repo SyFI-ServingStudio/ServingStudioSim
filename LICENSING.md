@@ -85,9 +85,10 @@ The two that matter most here:
 
 - Files under `profiling/runners/attention/dsa_persistent_topk_native/upstream/`
   are byte-identical vLLM v0.23.0 source under **Apache-2.0**.
-- `alignment/profiler/vllm` and `alignment/load_generator/req-frontend` are git
-  submodules. Their contents are fetched from their own repositories and are not
-  stored in this repository.
+- `alignment/load_generator/req-frontend` is a git submodule. Its contents are
+  fetched from its own repository and are not stored in this repository.
+- `reference_engines/*/patches/` are patches to vLLM and SGLang and stay under
+  their **Apache-2.0** license.
 
 The inventory is in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 

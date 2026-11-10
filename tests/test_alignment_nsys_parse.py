@@ -687,7 +687,7 @@ def test_iteration_aggregate_is_the_union_of_the_ranks_batches():
     assert iteration_kind(aggregate) == "mixed"
 
 
-def test_dp_rank_by_device_folds_global_ranks_by_the_tp_degree():
+def test_dp_rank_by_device_folds_global_ranks_by_the_replica_size():
     workers = {
         1: Worker(global_pid=10, pid=100, name="VLLM::Worker", device_id=0),
         2: Worker(global_pid=20, pid=101, name="VLLM::Worker", device_id=1),
@@ -696,17 +696,20 @@ def test_dp_rank_by_device_folds_global_ranks_by_the_tp_degree():
     }
     worker_ranks = {100: 0, 101: 1, 102: 2, 103: 3}
 
-    assert resolve_dp_rank_by_device(workers, worker_ranks, tp_size=1) == {0: 0, 1: 1, 2: 2, 3: 3}
-    assert resolve_dp_rank_by_device(workers, worker_ranks, tp_size=2) == {0: 0, 1: 0, 2: 1, 3: 1}
+    resolve = resolve_dp_rank_by_device
+    assert resolve(workers, worker_ranks, replica_ranks=1) == {0: 0, 1: 1, 2: 2, 3: 3}
+    assert resolve(workers, worker_ranks, replica_ranks=2) == {0: 0, 1: 0, 2: 1, 3: 1}
+    # TP2 x PP2 (or x PCP2) is one replica of four ranks, not two DP ranks.
+    assert resolve(workers, worker_ranks, replica_ranks=4) == {0: 0, 1: 0, 2: 0, 3: 0}
     # No banner at all is the historical single-process capture.
-    assert resolve_dp_rank_by_device(workers, {}, tp_size=1) == {0: 0, 1: 0, 2: 0, 3: 0}
+    assert resolve_dp_rank_by_device(workers, {}, replica_ranks=1) == {0: 0, 1: 0, 2: 0, 3: 0}
 
 
 def test_dp_rank_by_device_rejects_a_device_with_no_rank_banner():
     workers = {1: Worker(global_pid=10, pid=100, name="VLLM::Worker", device_id=0)}
 
     with pytest.raises(ValueError, match="no rank banner"):
-        resolve_dp_rank_by_device(workers, {999: 0}, tp_size=1)
+        resolve_dp_rank_by_device(workers, {999: 0}, replica_ranks=1)
 
 
 # ---- logical step alignment -----------------------------------------------

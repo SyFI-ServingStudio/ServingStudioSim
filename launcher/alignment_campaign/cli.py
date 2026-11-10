@@ -148,6 +148,8 @@ def _run(args) -> int:
             cases=cases,
             refresh=args.refresh,
             resume=args.resume,
+            runtime=args.runtime,
+            allow_autotune=args.allow_autotune,
         )
         print(execute.describe_plan(args.phase, plans))
         _print_calibration_prerequisites(pack)
@@ -160,6 +162,8 @@ def _run(args) -> int:
         refresh=args.refresh,
         resume=args.resume,
         parallelism=args.parallelism,
+        runtime=args.runtime,
+        allow_autotune=args.allow_autotune,
     )
     for result in report.results:
         status = "ok" if result.returncode == 0 else f"exit {result.returncode}"
@@ -314,6 +318,21 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="in-process concurrency budget (default 1: GPU phases contend for one device)",
+    )
+    run.add_argument(
+        "--runtime",
+        choices=("host", "image"),
+        default="image",
+        help="forwarded to `alignment profile`: image (default) captures in the engine's "
+        "reference image; host (strongly discouraged) in a host venv with no autotune "
+        "guard. Profile passes only; other phases always run on the host",
+    )
+    run.add_argument(
+        "--allow-autotune",
+        action="store_true",
+        help="forwarded to `alignment profile`: let the captured engine tune kernel "
+        "tactics (--runtime image only); without it a capture needs warm caches "
+        "(`just ref warm-caches`)",
     )
     run.set_defaults(handler=_run)
 

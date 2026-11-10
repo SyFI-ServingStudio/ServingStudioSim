@@ -43,6 +43,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.runners import tactic_labels
 
 KIND: str = "single_gemm"
 
@@ -273,6 +274,7 @@ register(
             module_name="profiling.runners.gemm.flashinfer_fp8_tensor",
             function_name="profile_single_gemm_flashinfer_fp8_tensor",
         ),
+        tactic_label=tactic_labels.flashinfer_fp8_tensor,
         table_name=KIND,
         args_schema=SingleGemmArgs,
         metric_family=MetricFamily.COMPUTE,
@@ -340,6 +342,7 @@ register(
             module_name="profiling.runners.gemm.flashinfer_mxfp8",
             function_name="profile_single_gemm_flashinfer_mxfp8",
         ),
+        tactic_label=tactic_labels.flashinfer_mxfp8,
         table_name=KIND,
         args_schema=SingleGemmArgs,
         metric_family=MetricFamily.COMPUTE,

@@ -24,6 +24,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners import tactic_labels
 from profiling.runners.autotune_cache import autotune_cached
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
@@ -347,7 +348,7 @@ def profile_fp8_block_fused_moe_sm100(
         def run_once() -> None:
             _call(call_kwargs)
 
-        with autotune_cached(autotune, "nvfp4_fused_moe.fp8_block_vllm"):
+        with autotune_cached(autotune, tactic_labels.fp8_block_fused_moe()):
             run_once()
         torch.cuda.synchronize()
         time_ms = Timer.cupti(run_once, warmup=3, interval_union=True)

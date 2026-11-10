@@ -32,7 +32,9 @@ use simulator::sim::{
     run_sim, trace_formats, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema,
     LoadedTrace, TickCfg, TraceFrontend, TraceTag,
 };
-use simulator::timing::bridge::{dry_run_document, print_dry_run, write_dry_run_report};
+use simulator::timing::bridge::{
+    dry_run_document, fill_missing_profiles, print_dry_run, write_dry_run_report,
+};
 use simulator::timing::PerfApiBridge;
 use simulator::timing_predict::PredictMode;
 
@@ -421,36 +423,15 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
 /// The collect walk is the bridge's dry-run mode, which calls only
 /// `count_missing` and never fits, so no kernel time is needed to discover what
 /// is missing. JIT stays off throughout: nothing is profiled on demand, and
-/// `issue_collected` does all the measuring.
+/// `issue_collected` does all the measuring. The walk-then-issue sequence is
+/// [`fill_missing_profiles`], shared with `timing-predict`.
 fn cmd_build_cache(config: &Path) -> anyhow::Result<()> {
     let cfg = load_config(config)?;
-    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
-    bridge.enable_dry_run();
-    bridge
-        .begin_collect()
-        .context("starting the profiling collect pass")?;
-    let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
-    let flow = build_flow(&cfg, &bridge, store)?;
-    drop(flow);
-
-    // The plan is worth printing before spending GPU time on it: this is the
-    // point at which a grid that quietly grew by an order of magnitude is still
-    // cheap to notice.
-    let report = bridge.take_dry_run_report();
-    let total_missing: usize = report.iter().map(|k| k.missing).sum();
-    let total_specs: usize = report.iter().map(|k| k.total).sum();
-    println!(
-        "cache build plan: {} kernels, {total_missing} / {total_specs} specs missing",
-        report.len()
-    );
-    for k in report.iter().filter(|k| k.missing > 0) {
-        println!("{k}");
-    }
-    // Called even at zero: it clears the collector and reports the no-op, and
-    // an early return here would leave the collector installed.
-    bridge
-        .issue_collected(total_missing)
-        .context("measuring the collected profiling work")?;
+    fill_missing_profiles(|bridge| {
+        let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+        drop(build_flow(&cfg, bridge, store)?);
+        Ok(())
+    })?;
     tracing::info!("cache build complete: profile.db populated");
     Ok(())
 }

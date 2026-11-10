@@ -730,20 +730,22 @@ def attribute_jit_stalls(
 def resolve_dp_rank_by_device(
     workers: dict[int, Worker],
     worker_ranks: dict[int, int],
-    tp_size: int,
+    replica_ranks: int,
 ) -> dict[int, int]:
     """CUDA device → data-parallel rank, joining nsys pids with the server log.
 
     nsys knows which pid ran on which device; vLLM's startup banner states which
-    pid holds which global rank. A replica lays its ranks out as
-    `global_rank = dp_rank * tp_size + tp_rank`, so the DP rank is the global
-    rank divided by the TP degree. With no banner (single-process capture) every
-    observed device belongs to rank 0.
+    pid holds which global rank. vLLM numbers ranks replica by replica:
+    `global_rank = dp_rank * replica_ranks + rank_in_replica`, where a replica
+    holds pp * pcp * tp ranks (`ParallelConfig.world_size`, and the DP offset
+    in `parallel_state`), so the DP rank is the global rank divided by
+    `replica_ranks`. With no banner (single-process capture) every observed
+    device belongs to rank 0.
     """
     if not worker_ranks:
         return {worker.device_id: 0 for worker in workers.values() if worker.device_id is not None}
-    if tp_size <= 0:
-        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    if replica_ranks <= 0:
+        raise ValueError(f"replica_ranks must be positive, got {replica_ranks}")
 
     dp_rank_by_device: dict[int, int] = {}
     for worker in workers.values():
@@ -755,7 +757,7 @@ def resolve_dp_rank_by_device(
                 f"nsys worker pid {worker.pid} (device {worker.device_id}) has no rank banner "
                 "in the server log; the capture and the log do not describe the same run"
             )
-        dp_rank = global_rank // tp_size
+        dp_rank = global_rank // replica_ranks
         existing = dp_rank_by_device.setdefault(worker.device_id, dp_rank)
         if existing != dp_rank:
             raise ValueError(f"device {worker.device_id} maps to DP ranks {existing} and {dp_rank}")
@@ -1440,6 +1442,7 @@ def parse_trace(
     worker_ranks: dict[int, int] | None = None,
     tp_size: int = 1,
     dp_rank_by_device: dict[int, int] | None = None,
+    replica_ranks: int | None = None,
 ) -> dict:
     """Top-level parse: nsys sqlite → per-device per-category busy time / iter.
 
@@ -1448,9 +1451,10 @@ def parse_trace(
     independently from one capture. `default_stage` tags ranges with no
     label/metrics stage (use "decode" for a pure-decode capture window).
 
-    `worker_ranks` (worker pid → global rank, from the server log) and `tp_size`
-    resolve which DP rank ran on which device. Without them the capture is read
-    as a single-rank run.
+    `worker_ranks` (worker pid → global rank, from the server log) and
+    `replica_ranks` (ranks per DP replica; `tp_size` when unset) resolve which
+    DP rank ran on which device. Without them the capture is read as a
+    single-rank run.
 
     `dp_rank_by_device` short-circuits that: an engine whose workers state their
     own device and rank has already answered the question, so its answer is used
@@ -1472,7 +1476,9 @@ def parse_trace(
         string_ids = load_string_ids(con)
         workers = load_workers(con)
         if dp_rank_by_device is None:
-            dp_rank_by_device = resolve_dp_rank_by_device(workers, worker_ranks or {}, tp_size)
+            dp_rank_by_device = resolve_dp_rank_by_device(
+                workers, worker_ranks or {}, replica_ranks or tp_size
+            )
         else:
             captured_devices = {
                 worker.device_id for worker in workers.values() if worker.device_id is not None
@@ -1562,6 +1568,7 @@ def parse_trace(
             str(device): rank for device, rank in sorted(dp_rank_by_device.items())
         },
         "tp_size": tp_size,
+        "replica_ranks": replica_ranks or tp_size,
         "kernel_sequences": kernel_sequences,
         "by_phase": by_phase,
         "by_stage": by_stage,
@@ -1603,6 +1610,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="tensor-parallel degree, used to fold global ranks into DP ranks",
+    )
+    parser.add_argument(
+        "--replica-ranks",
+        type=int,
+        default=None,
+        help="global ranks per DP replica (vLLM: tp * pp * pcp; default --tp-size)",
     )
     parser.add_argument("--output", type=Path, default=None, help="Write JSON here (else stdout)")
     parser.add_argument(
@@ -1678,6 +1691,7 @@ def main(argv: list[str] | None = None) -> int:
         top_n=args.top_n,
         worker_ranks=worker_ranks,
         tp_size=args.tp_size,
+        replica_ranks=args.replica_ranks,
     )
     if args.output:
         write_parsed(Path(args.output), result)

@@ -19,7 +19,8 @@ from alignment.timing_predict_input.builder import SpeculativeEngineTextInputSpe
 @pytest.fixture
 def request_details():
     path = (
-        Path(__file__).resolve().parents[1] / "alignment/profiler/vllm/vllm/v1/engine/alignment.py"
+        Path(__file__).resolve().parents[1]
+        / "reference_engines/vllm/src/vllm/v1/engine/alignment.py"
     )
     spec = importlib.util.spec_from_file_location("vllm_alignment_records", path)
     module = importlib.util.module_from_spec(spec)

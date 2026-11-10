@@ -30,6 +30,7 @@ from profiling.profilers.measure_context import (
 )
 from profiling.runners.device import unsupported_device
 from profiling.runners.metrics import RunnerResult
+from reference_engines import autotune_guard
 
 _PROCESS_STARTED = time.time()
 
@@ -39,6 +40,10 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
     # interpreter's own start-up cost as seen from inside: torch and the backend
     # import, CUDA context creation, registry resolution.
     boot_started = _PROCESS_STARTED
+    # Before any runner imports a tuner. The parent decided VIBESIM_AUTOTUNE
+    # (profiling/exec/local.py:autotune_policy); an engine image has already
+    # installed its own copy at interpreter start, which this then leaves alone.
+    autotune_guard.install()
     worker_request = json.loads(input_path.read_text(encoding="utf-8"))
     kernel_kind: KernelKind = worker_request["kernel_kind"]
     chunk_specs = worker_request["specs"]
@@ -103,6 +108,9 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
     # The cards this worker actually measured on; the controller rejects the
     # chunk unless they are exactly the ones it reserved (worker_gpu_mismatch).
     output: dict = {"results": worker_results, "gpu_uuids": _visible_gpu_uuids()}
+    # What an allowed run tuned, for the parent's per-kernel log; the guard of
+    # whichever copy installed first holds the tally.
+    output["autotune"] = _tuned()
     if measure_context is not None:
         # `consumed` stays False when the runner never reached Timer.cupti — the
         # driver reads this to reject non-CUPTI kernels for the `measure` verb.
@@ -112,6 +120,13 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
             "artifacts": measure_context.artifacts,
         }
     output_path.write_text(json.dumps(output), encoding="utf-8")
+
+
+def _tuned() -> list[dict]:
+    # An engine image's site-packages copy installs first and so holds the
+    # hooks; on any other interpreter this checkout's copy does.
+    image_copy = sys.modules.get("vibesim_autotune_guard")
+    return autotune_guard.tuned() + (image_copy.tuned() if image_copy is not None else [])
 
 
 def _build_measure_context(

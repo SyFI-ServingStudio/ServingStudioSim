@@ -33,6 +33,8 @@ import sys
 from collections.abc import Callable, Hashable, Iterable
 from typing import Any
 
+from reference_engines.autotune_guard import forbid
+
 _MAX_WRAPPER_DEPTH = 4
 
 
@@ -100,6 +102,9 @@ class AutotunePin:
             if saved is not None:
                 tuner.cache.update(saved.get(id(tuner), {}))
         if saved is None:
+            # Re-tuning in every worker is this pin's design, so it is tuning by
+            # definition: refused outright unless the parent allowed autotuning.
+            forbid("triton.AutotunePin", anchor=anchor_label, modules=self._module_prefixes)
             tune()
             # The anchor call imports nothing new in practice, but re-scan so a
             # lazily imported kernel module is still covered by the digest.

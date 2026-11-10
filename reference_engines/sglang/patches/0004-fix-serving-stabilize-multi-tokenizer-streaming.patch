@@ -1,0 +1,748 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Wed, 2 Sep 2026 07:38:15 -0700
+Subject: [PATCH] fix(serving): stabilize multi-tokenizer streaming
+
+Default ordinary HTTP serving to four tokenizer workers while preserving explicit single-worker restrictions for offline Engine, auth, SSL refresh, native gRPC, and elastic EP.
+
+Separate prompt and generated token-ID response controls; derive alignment first/last-token timestamps from token-bearing output batches; preserve alignment logging inside Uvicorn tokenizer workers.
+
+Cover W4 defaults, isolation boundaries, and streaming evidence with unit tests.
+---
+ .../sglang/srt/arg_groups/fields/serving.py   |   6 +-
+ python/sglang/srt/arg_groups/pipeline.py      |   2 +
+ .../sglang/srt/arg_groups/resolution_hooks.py |   1 +
+ python/sglang/srt/arg_groups/serving_hook.py  |  17 +++
+ python/sglang/srt/entrypoints/engine.py       |  24 ++---
+ python/sglang/srt/entrypoints/http_server.py  |  28 +++--
+ .../sglang/srt/entrypoints/openai/protocol.py |   1 +
+ .../entrypoints/openai/serving_completions.py |   8 +-
+ .../sglang/srt/managers/tokenizer_manager.py  |  45 +++++++-
+ python/sglang/srt/ray/engine.py               |   1 +
+ python/sglang/srt/server_args.py              |  20 ++++
+ .../unit/entrypoints/openai/test_protocol.py  |   1 +
+ .../openai/test_serving_completions.py        |  88 ++++++++++++++-
+ .../unit/entrypoints/test_server_info.py      |   2 +-
+ .../managers/test_load_snapshot_backends.py   |   3 +-
+ .../unit/observability/test_crash_dump.py     |   6 +-
+ .../unit/server_args/test_server_args.py      | 102 +++++++++++++++++-
+ 17 files changed, 313 insertions(+), 42 deletions(-)
+
+diff --git a/python/sglang/srt/arg_groups/fields/serving.py b/python/sglang/srt/arg_groups/fields/serving.py
+index 7724d790e7c6d48de36c3c83b921528357f77431..f75055b65c0fdbe6faeb8d87bc84c4c314036a17 100644
+--- a/python/sglang/srt/arg_groups/fields/serving.py
++++ b/python/sglang/srt/arg_groups/fields/serving.py
+@@ -49,8 +49,10 @@ class Serving(msgspec.Struct):
+     ] = "huggingface"
+     tokenizer_worker_num: A[
+         int,
+-        "The worker num of the tokenizer manager.",
+-    ] = 1
++        "The tokenizer worker count for HTTP serving; defaults to 4. The offline "
++        "Engine API, HTTP API-key authentication, SSL refresh, native gRPC, and "
++        "elastic EP runtime scale-up require 1.",
++    ] = 4
+     detokenizer_worker_num: A[
+         int,
+         "The worker num of the detokenizer manager.",
+diff --git a/python/sglang/srt/arg_groups/pipeline.py b/python/sglang/srt/arg_groups/pipeline.py
+index 75b78c19634bf25df3e2d3a393a1531933fefe9b..b162204f27a6e1887dee28fd8a1bff54b68af35a 100644
+--- a/python/sglang/srt/arg_groups/pipeline.py
++++ b/python/sglang/srt/arg_groups/pipeline.py
+@@ -71,10 +71,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
+         handle_return_hidden_states_mode,
+         handle_ssl_validation,
+         handle_tokenizer_batching,
++        handle_tokenizer_worker_compatibility,
+         handle_watermark_config,
+     )
+ 
+     run_hook(handle_return_hidden_states_mode, server_args)
++    run_hook(handle_tokenizer_worker_compatibility, server_args)
+     run_hook(handle_media_url_security, server_args)
+     run_hook(handle_watermark_config, server_args)
+     from sglang.srt.arg_groups.hicache_hook import (
+diff --git a/python/sglang/srt/arg_groups/resolution_hooks.py b/python/sglang/srt/arg_groups/resolution_hooks.py
+index 82945e31246720517416f7b1838e3bad0ef9a8c3..7799b3baf08dd6de93273aec4540fc6bcb3056fe 100644
+--- a/python/sglang/srt/arg_groups/resolution_hooks.py
++++ b/python/sglang/srt/arg_groups/resolution_hooks.py
+@@ -17,6 +17,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
+         "handle_mega_moe",
+         "validate_rust_server_unsupported_args",
+         "handle_return_hidden_states_mode",
++        "handle_tokenizer_worker_compatibility",
+         "handle_media_url_security",
+         "handle_watermark_config",
+         "handle_hicache_ratio_default",
+diff --git a/python/sglang/srt/arg_groups/serving_hook.py b/python/sglang/srt/arg_groups/serving_hook.py
+index b9e3d6160d9abc39fa7f7611f9564da304871f9d..c446a1b180df59c0d8445768c23a5704171986e6 100644
+--- a/python/sglang/srt/arg_groups/serving_hook.py
++++ b/python/sglang/srt/arg_groups/serving_hook.py
+@@ -40,6 +40,23 @@ def handle_watermark_config(server_args: Any) -> None:
+         declare_resolution(server_args, "handle_watermark_config", **resolved)
+ 
+ 
++def handle_tokenizer_worker_compatibility(server_args: Any):
++    """Reject HTTP features not wired into multi-tokenizer workers."""
++    cfg = resolving_view(server_args)
++    if cfg.tokenizer_worker_num == 1:
++        return
++
++    if cfg.api_key or cfg.admin_api_key:
++        raise ValueError(
++            "HTTP API-key authentication currently requires "
++            "--tokenizer-worker-num 1."
++        )
++    if cfg.enable_ssl_refresh:
++        raise ValueError(
++            "--enable-ssl-refresh currently requires --tokenizer-worker-num 1."
++        )
++
++
+ def handle_ssl_validation(server_args: Any):
+     """Ensure SSL arguments are consistent and referenced files exist."""
+     cfg = resolving_view(server_args)
+diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
+index a7d25c2f0e6a11bb730d159c24d9cef7b3ba619f..96cac4bf6bbb92a5dd8c3944c801b921a2604da8 100644
+--- a/python/sglang/srt/entrypoints/engine.py
++++ b/python/sglang/srt/entrypoints/engine.py
+@@ -143,7 +143,12 @@ from sglang.srt.runtime_context import (
+     snapshot_context,
+ )
+ from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+-from sglang.srt.server_args import PortArgs, ServerArgs, redact_server_args_secrets
++from sglang.srt.server_args import (
++    PortArgs,
++    ServerArgs,
++    _resolve_offline_server_args,
++    redact_server_args_secrets,
++)
+ from sglang.srt.utils import (
+     MultiprocessingSerializer,
+     SerializedTensorPayload,
+@@ -302,19 +307,12 @@ class Engine(EngineScoreMixin, EngineBase):
+         # so hooks on ServerArgs.__post_init__ fire correctly.
+         load_plugins()
+ 
+-        # Parse server_args
+-        if "server_args" in kwargs:
+-            # Directly load server_args
+-            server_args = kwargs["server_args"]
+-        else:
+-            # Construct server_args from kwargs
+-            if "log_level" not in kwargs:
+-                # Do not print logs by default
+-                kwargs["log_level"] = "error"
+-            server_args = self.server_args_class(**kwargs)
++        server_args = _resolve_offline_server_args(self.server_args_class, kwargs)
++        if "server_args" not in kwargs:
+             # There was no command line, so the call is what the operator
+-            # asked for. `log_level` is filled in above when absent, so it
+-            # shows here even when the caller did not pass it.
++            # asked for. `log_level` and `tokenizer_worker_num` are filled in
++            # above when absent, so they show here even when the caller did
++            # not pass them.
+             msgspec.Struct.__setattr__(
+                 server_args,
+                 "_launch_command",
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 17d2c0d2a2dec97894b2369e553b49c45e0c684a..b06b4ea1e4481e2fcb12cce35bec4dd336200db6 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -262,9 +262,11 @@ async def init_multi_tokenizer() -> ServerArgs:
+ 
+     publish(server_args, role="tokenizer")
+ 
+-    # API key authentication is not supported in multi-tokenizer mode
+-    assert get_serving().api_key is None, (
+-        "API key is not supported in multi-tokenizer mode"
++    # API key authentication is not supported in multi-tokenizer mode. This
++    # duplicates the early ServerArgs validation as a defense against a
++    # deserialized or programmatically mutated configuration.
++    assert get_serving().api_key is None and get_serving().admin_api_key is None, (
++        "API keys are not supported in multi-tokenizer mode"
+     )
+ 
+     # Create a new ipc name for the current process
+@@ -3075,13 +3077,21 @@ def _setup_and_run_http_server(
+                 "level": "INFO",
+                 "propagate": False,
+             }
++            # Uvicorn replaces the parent process's logging configuration in
++            # each tokenizer worker. Keep alignment records visible there too;
++            # otherwise scheduler-side records survive but every API timing row
++            # silently disappears when --tokenizer-worker-num is greater than 1.
++            LOGGING_CONFIG["loggers"][
++                "sglang.srt.observability.vibesim_alignment"
++            ] = {
++                "handlers": ["default"],
++                "level": "INFO",
++                "propagate": False,
++            }
+ 
+-            if get_serving().enable_ssl_refresh:
+-                logger.warning(
+-                    "--enable-ssl-refresh is not supported with multiple "
+-                    "tokenizer workers (--tokenizer-worker-num > 1). "
+-                    "SSL refresh will be disabled."
+-                )
++            assert not get_serving().enable_ssl_refresh, (
++                "SSL refresh is not supported in multi-tokenizer mode"
++            )
+ 
+             if get_serving().enable_http2:
+                 logger.info(
+diff --git a/python/sglang/srt/entrypoints/openai/protocol.py b/python/sglang/srt/entrypoints/openai/protocol.py
+index 112f5ef89630e8ae1ad40ba380208815a7d8fde7..b7cf3f334b26bea12d273d93fe3907ae87091d4a 100644
+--- a/python/sglang/srt/entrypoints/openai/protocol.py
++++ b/python/sglang/srt/entrypoints/openai/protocol.py
+@@ -422,6 +422,7 @@ class CompletionRequest(PDRoutingFields):
+     routed_experts_start_len: int = 0
+     return_cached_tokens_details: bool = False
+     return_spec_tokens_details: bool = False
++    return_prompt_token_ids: bool = False
+     return_token_ids: bool = False
+ 
+     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
+diff --git a/python/sglang/srt/entrypoints/openai/serving_completions.py b/python/sglang/srt/entrypoints/openai/serving_completions.py
+index afb5f40c16424772ae26279f01b2a8722c0ac0cf..96edb8a101f2add0b44aae6593e3daeaee143916 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_completions.py
++++ b/python/sglang/srt/entrypoints/openai/serving_completions.py
+@@ -130,7 +130,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
+             return_hidden_states=request.return_hidden_states,
+             return_routed_experts=request.return_routed_experts,
+             routed_experts_start_len=request.routed_experts_start_len,
+-            return_prompt_token_ids=request.return_token_ids,
++            return_prompt_token_ids=request.return_prompt_token_ids,
+             rid=request.rid,
+             session_id=request.session_id,
+             extra_key=request.extra_key,
+@@ -343,8 +343,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
+                         n_prev_token_ids[index] = len(output_ids)
+                     else:
+                         chunk_token_ids = output_ids
+-                    if is_first_chunk:
+-                        chunk_prompt_token_ids = content.get("prompt_token_ids")
++                if request.return_prompt_token_ids and is_first_chunk:
++                    chunk_prompt_token_ids = content.get("prompt_token_ids")
+ 
+                 # Generate delta
+                 if get_serving().incremental_streaming_output:
+@@ -624,7 +624,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
+                 ),
+                 prompt_token_ids=(
+                     ret_item.get("prompt_token_ids")
+-                    if request.return_token_ids
++                    if request.return_prompt_token_ids
+                     else None
+                 ),
+             )
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index b88b0821ead9394292ed17cd0b8a035ac43f8a4d..2946753f133cc843e2464b0c45c9b350ee257067 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -295,6 +295,10 @@ class ReqState:
+     # The latest stats the scheduler sent; see RequestOutputStats for when.
+     request_stats: Optional[RequestOutputStats] = None
+     ttft_observed: bool = False
++    # Alignment timing must not depend on Prometheus metrics being enabled.
++    # APIServerReqTimeStats.last_time is advanced only by collect_metrics, while
++    # workload_metrics deliberately launches with enable_metrics=False.
++    vibesim_last_token_time: float = 0.0
+ 
+     dispatched: bool = False
+     abort_sent: bool = False
+@@ -335,6 +339,24 @@ class ReqState:
+             self.request_stats = new_request_stats
+         return self.request_stats
+ 
++    def mark_vibesim_token_output(
++        self, token_count: int, observed_monotonic: Optional[float] = None
++    ) -> None:
++        """Advance alignment API timing for one token-bearing output.
++
++        This is deliberately separate from ``collect_metrics``: workload-only
++        alignment disables Prometheus metrics, but still requires an exact
++        first-to-last token span. A terminal/usage-only output has zero tokens
++        and must preserve the preceding token boundary.
++        """
++        if token_count <= 0:
++            return
++        if observed_monotonic is None:
++            observed_monotonic = time.perf_counter()
++        if self.time_stats.first_token_time == 0.0:
++            self.time_stats.set_first_token_time(observed_monotonic)
++        self.vibesim_last_token_time = observed_monotonic
++
+     def get_crash_dump_output(self) -> Dict[Any, Any]:
+         out = {}
+         if self.text or self.text_chunks:
+@@ -2831,6 +2853,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
+ 
+             state.finished = recv_obj.finished_reasons[i] is not None
++            # Output ids carried by a token stream row. A terminal/usage-only
++            # row carries neither ids nor text and must not move a token
++            # boundary; other outputs (embeddings, beam search) always do.
++            received_token_count = 0
++            carries_output = True
+ 
+             # Must run after meta_info is fully populated.
+             beam_out_dict = try_build_beam_search_out_dict(recv_obj, i, meta_info)
+@@ -2843,6 +2870,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 incremental = is_stream and self.incremental_streaming_output
+                 delta_text = recv_obj.output_strs[i]
+                 delta_output_ids = list(row_output_ids(recv_obj, i))
++                received_token_count = len(delta_output_ids)
++                carries_output = received_token_count > 0 or bool(delta_text)
+                 output_offset = state.last_output_offset
+                 state.append_text(delta_text)
+                 state.output_ids.extend(delta_output_ids)
+@@ -2890,6 +2919,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 is_stream = getattr(state.obj, "stream", False)
+                 incremental = is_stream and self.incremental_streaming_output
+                 delta_output_ids = list(row_output_ids(recv_obj, i))
++                received_token_count = len(delta_output_ids)
++                carries_output = received_token_count > 0
+                 output_offset = state.last_output_offset
+                 state.output_ids.extend(delta_output_ids)
+ 
+@@ -2948,16 +2979,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     if pooled_hidden_states[i] is not None:
+                         out_dict["pooled_hidden_state"] = pooled_hidden_states[i]
+ 
+-            # Set first_token_time on the first output batch.
+-            # This is the single write point for first_token_time.
++            # Stamp the first token on the first output batch that carries one.
+             first_output_time = None
+-            if state.time_stats.first_token_time == 0.0:
++            if state.time_stats.first_token_time == 0.0 and carries_output:
+                 first_output_time = time.perf_counter()
+                 state.time_stats.set_first_token_time(
+                     ts=self._get_scheduler_first_token_time(state, request_stats)
+                     or first_output_time
+                 )
+                 state.time_stats.set_last_time(ts=first_output_time)
++            # Keep the alignment-specific last boundary independent of
++            # collect_metrics: workload-only captures intentionally leave
++            # Prometheus disabled.
++            state.mark_vibesim_token_output(received_token_count, first_output_time)
+ 
+             if state.finished:
+                 span_attrs = (
+@@ -2971,7 +3005,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     ts=first_output_time, span_attrs=span_attrs
+                 )
+                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
+-                self._maybe_emit_vibesim_api_timing(rid, state, recv_obj, i)
+ 
+                 if get_spec().speculative_algorithm:
+                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
+@@ -3005,6 +3038,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+ 
+             if self.enable_metrics and state.obj.log_metrics:
+                 self.collect_metrics(state, recv_obj, i, request_stats)
++            if state.finished:
++                self._maybe_emit_vibesim_api_timing(rid, state, recv_obj, i)
+             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
+                 self.dump_requests(state, out_dict)
+             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
+@@ -3381,7 +3416,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             dispatch_monotonic=stats.api_server_dispatch_time,
+             dispatch_finish_monotonic=stats.api_server_dispatch_finish_time,
+             first_token_monotonic=stats.first_token_time,
+-            last_token_monotonic=stats.last_time,
++            last_token_monotonic=state.vibesim_last_token_time,
+             finished_monotonic=stats.finished_time,
+             output_tokens=completion_tokens,
+         )
+diff --git a/python/sglang/srt/ray/engine.py b/python/sglang/srt/ray/engine.py
+index 312566121359c235a612543516f3276600ce6239..0d013515c79ec845517cd4da41f373306e4fffe3 100644
+--- a/python/sglang/srt/ray/engine.py
++++ b/python/sglang/srt/ray/engine.py
+@@ -241,6 +241,7 @@ class RayEngine(Engine):
+             from sglang.srt.observability.ray_wrappers import build_ray_stat_loggers
+ 
+             kwargs["stat_loggers"] = build_ray_stat_loggers()
++        kwargs.setdefault("tokenizer_worker_num", 1)
+         super().__init__(server_args=ServerArgs(**kwargs))
+ 
+     def shutdown(self):
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 62dfd9d5d089d7927eb8b5d10136625565bdd803..7476c93388d9c998f6ab071b7c1307a98b113d83 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -742,6 +742,26 @@ def redact_secret_cli_args(
+     return result
+ 
+ 
++def _resolve_offline_server_args(server_args_class, kwargs):
++    """Build/validate args for the in-process offline Engine topology."""
++    if "server_args" in kwargs:
++        server_args = kwargs["server_args"]
++    else:
++        kwargs.setdefault("log_level", "error")
++        # Multi-tokenizer workers are an HTTP serving topology. The offline
++        # Engine API owns its TokenizerManager in this process and therefore
++        # keeps the historical single-worker topology.
++        kwargs.setdefault("tokenizer_worker_num", 1)
++        server_args = server_args_class(**kwargs)
++
++    if server_args.tokenizer_worker_num != 1:
++        raise ValueError(
++            "The offline Engine API requires tokenizer_worker_num=1; "
++            "multi-tokenizer workers are only supported by HTTP serving."
++        )
++    return server_args
++
++
+ def prepare_server_args(argv: list[str]) -> ServerArgs:
+     """
+     Prepare the server arguments from the command line arguments.
+diff --git a/test/registered/unit/entrypoints/openai/test_protocol.py b/test/registered/unit/entrypoints/openai/test_protocol.py
+index efc37b25f32bbd2d27f5bcb87f4ec7acccfb74cf..81c80b2852ec9c391a2ace1c4952548368d5eac2 100644
+--- a/test/registered/unit/entrypoints/openai/test_protocol.py
++++ b/test/registered/unit/entrypoints/openai/test_protocol.py
+@@ -55,6 +55,7 @@ class TestCompletionRequest(unittest.TestCase):
+         self.assertEqual(request.n, 1)  # default
+         self.assertFalse(request.stream)  # default
+         self.assertFalse(request.echo)  # default
++        self.assertFalse(request.return_prompt_token_ids)
+ 
+     def test_completion_request_validation_errors(self):
+         """Test completion request validation errors"""
+diff --git a/test/registered/unit/entrypoints/openai/test_serving_completions.py b/test/registered/unit/entrypoints/openai/test_serving_completions.py
+index e9a1c55c190a40fc518db59199d4b875cd8579e2..65293591c7c812a5c9a45ed16d101631959d96e5 100644
+--- a/test/registered/unit/entrypoints/openai/test_serving_completions.py
++++ b/test/registered/unit/entrypoints/openai/test_serving_completions.py
+@@ -18,7 +18,8 @@ from fastapi import Request
+ 
+ from sglang.srt.entrypoints.openai.protocol import CompletionRequest
+ from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+-from sglang.srt.managers.tokenizer_manager import TokenizerManager
++from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
++from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+ from sglang.srt.runtime_context import get_context, publish, reset_context
+ from sglang.srt.server_args import ServerArgs
+ from sglang.srt.utils import get_or_create_event_loop
+@@ -227,6 +228,7 @@ class ServingCompletionTestCase(unittest.TestCase):
+             max_tokens=10,
+             logprobs=False,
+             return_token_ids=True,
++            return_prompt_token_ids=True,
+         )
+ 
+         mock_ret = [
+@@ -252,6 +254,30 @@ class ServingCompletionTestCase(unittest.TestCase):
+         self.assertEqual(response.choices[0].token_ids, [3, 4])
+         self.assertEqual(response.choices[0].prompt_token_ids, [1, 2])
+ 
++    def test_token_ids_do_not_implicitly_request_prompt_ids(self):
++        req = CompletionRequest(
++            model="x", prompt=[1, 2], return_token_ids=True
++        )
++
++        adapted_request, _ = self.sc._convert_to_internal_request(req)
++
++        self.assertTrue(req.return_token_ids)
++        self.assertFalse(req.return_prompt_token_ids)
++        self.assertFalse(adapted_request.return_prompt_token_ids)
++
++    def test_alignment_token_span_does_not_depend_on_metrics(self):
++        stats = APIServerReqTimeStats()
++        state = ReqState([], False, Mock(), Mock(), stats)
++
++        state.mark_vibesim_token_output(1, 100.0)
++        state.mark_vibesim_token_output(0, 150.0)
++        self.assertEqual(stats.first_token_time, 100.0)
++        self.assertEqual(state.vibesim_last_token_time, 100.0)
++
++        state.mark_vibesim_token_output(2, 200.0)
++        self.assertEqual(stats.first_token_time, 100.0)
++        self.assertEqual(state.vibesim_last_token_time, 200.0)
++
+     def test_streaming_abort_yields_error(self):
+         """Test that an abort finish reason during streaming correctly yields an error and stops."""
+         err_msg = "Aborted by scheduler"
+@@ -421,6 +447,7 @@ class ServingCompletionTestCase(unittest.TestCase):
+             max_tokens=10,
+             stream=True,
+             return_token_ids=True,
++            return_prompt_token_ids=True,
+         )
+         adapted_request, _ = self.sc._convert_to_internal_request(req)
+ 
+@@ -487,6 +514,65 @@ class ServingCompletionTestCase(unittest.TestCase):
+                 for choice in choices[1:]:
+                     self.assertNotIn("prompt_token_ids", choice)
+ 
++    def test_streaming_generated_and_prompt_id_controls_are_independent(self):
++        for return_token_ids in (False, True):
++            for return_prompt_token_ids in (False, True):
++                with (
++                    self.subTest(
++                        return_token_ids=return_token_ids,
++                        return_prompt_token_ids=return_prompt_token_ids,
++                    ),
++                    get_context().override_server_args(
++                        stream_response_default_include_usage=False,
++                        incremental_streaming_output=True,
++                    ),
++                ):
++                    req = CompletionRequest(
++                        model="x",
++                        prompt=[1, 2],
++                        stream=True,
++                        return_token_ids=return_token_ids,
++                        return_prompt_token_ids=return_prompt_token_ids,
++                    )
++                    adapted_request, _ = self.sc._convert_to_internal_request(req)
++                    self.assertEqual(
++                        adapted_request.return_prompt_token_ids,
++                        return_prompt_token_ids,
++                    )
++
++                    async def _mock_generate(*args, **kwargs):
++                        yield {
++                            "text": "a",
++                            "output_ids": [5],
++                            "prompt_token_ids": [1, 2],
++                            "meta_info": {
++                                "id": "cmpl-test",
++                                "prompt_tokens": 2,
++                                "completion_tokens": 1,
++                                "finish_reason": {"type": "stop"},
++                            },
++                            "index": 0,
++                        }
++
++                    self.sc.tokenizer_manager.generate_request = _mock_generate
++
++                    async def run_stream():
++                        return [
++                            chunk
++                            async for chunk in self.sc._generate_completion_stream(
++                                adapted_request, req, self.fastapi_request
++                            )
++                        ]
++
++                    raw_chunks = get_or_create_event_loop().run_until_complete(
++                        run_stream()
++                    )
++                    first = json.loads(raw_chunks[0][len("data: ") :])["choices"][0]
++                    self.assertEqual("token_ids" in first, return_token_ids)
++                    self.assertEqual(
++                        "prompt_token_ids" in first, return_prompt_token_ids
++                    )
++
+     def test_non_streaming_cached_tokens_details_emits_sglext(self):
+         """Test that non-streaming completion responses emit cached token details in sglext."""
+ 
+diff --git a/test/registered/unit/entrypoints/test_server_info.py b/test/registered/unit/entrypoints/test_server_info.py
+index 1823fae575d695f7efab84fab0e50b0a17cc2311..c8320ced370a3a61b5f8ccd04860d3ee50024654 100644
+--- a/test/registered/unit/entrypoints/test_server_info.py
++++ b/test/registered/unit/entrypoints/test_server_info.py
+@@ -335,7 +335,7 @@ class TestServerInfoInternalStatesRedaction(CustomTestCase):
+     def test_http_and_engine_server_info(self):
+         from sglang.srt.entrypoints.engine import Engine
+ 
+-        server_args = ServerArgs(model_path="dummy", **self.SECRETS)
++        server_args = ServerArgs(model_path="dummy", tokenizer_worker_num=1, **self.SECRETS)
+         readback = self._scheduler_readback(server_args)
+ 
+         self._assert_redacted(_call_server_info_with(server_args, [readback]))
+diff --git a/test/registered/unit/managers/test_load_snapshot_backends.py b/test/registered/unit/managers/test_load_snapshot_backends.py
+index ff7e0177c26a902faf8a6e17cae8a1d3dfd4ef14..12f4f31ec5aa1200201fed74918fa54e6e2864ca 100644
+--- a/test/registered/unit/managers/test_load_snapshot_backends.py
++++ b/test/registered/unit/managers/test_load_snapshot_backends.py
+@@ -286,7 +286,8 @@ class TestFactoryFunctions(CustomTestCase):
+             os.unlink(path)
+ 
+     def test_zmq_mode_via_env(self):
+-        self._publish(nnodes=1, dp_size=1)
++        # One tokenizer worker: several give each its own SHM reader instead.
++        self._publish(nnodes=1, dp_size=1, tokenizer_worker_num=1)
+         port_args = SimpleNamespace(instance_id="test_zmq_factory")
+         os.environ["SGLANG_LOAD_SNAPSHOT_USE_ZMQ"] = "1"
+         try:
+diff --git a/test/registered/unit/observability/test_crash_dump.py b/test/registered/unit/observability/test_crash_dump.py
+index b567027d0296308f3827f30704a4d33222a62762..1321a290509a60ad593fc603b2479c5343ac7282 100644
+--- a/test/registered/unit/observability/test_crash_dump.py
++++ b/test/registered/unit/observability/test_crash_dump.py
+@@ -190,7 +190,7 @@ class TestTokenizerManagerCrashDump(CustomTestCase):
+     def test_server_args_snapshot_redacted_with_watermarking_off(self):
+         # The request dump pickles this snapshot as is. The Python API accepts
+         # a server key without --enable-watermark, and validation then skips it.
+-        server_args = ServerArgs(model_path="dummy", **_SECRETS)
++        server_args = ServerArgs(model_path="dummy", tokenizer_worker_num=1, **_SECRETS)
+         context = create_context(server_args, role="test")
+         self.assertFalse(context.config_bag("exec").features.enable_watermark)
+         tm = SimpleNamespace(server_args=server_args)
+@@ -204,7 +204,7 @@ class TestTokenizerManagerCrashDump(CustomTestCase):
+         """`write_crash_dump` redacts on its own, so the dump carries no
+         secret even when the writer passes the server args unredacted, as a
+         dict or as the record."""
+-        server_args = ServerArgs(model_path="dummy", **_SECRETS)
++        server_args = ServerArgs(model_path="dummy", tokenizer_worker_num=1, **_SECRETS)
+         finished = (_request("done"), _out("done"), 100.0, 101.5)
+         for passed in (server_args.resolved_dict(), server_args):
+             tm = SimpleNamespace(
+@@ -404,7 +404,7 @@ class TestRustServerCrashDump(CustomTestCase):
+         """The dump carries no secret, as Python's does. Rust mode refuses
+         `--enable-watermark`, but the Python API takes a server key without
+         it and validation then skips the key."""
+-        server_args = ServerArgs(model_path="dummy", **_SECRETS)
++        server_args = ServerArgs(model_path="dummy", tokenizer_worker_num=1, **_SECRETS)
+         server = _rust_server(_SNAPSHOT)
+         server.server_args = server_args
+         with tempfile.TemporaryDirectory() as folder:
+diff --git a/test/registered/unit/server_args/test_server_args.py b/test/registered/unit/server_args/test_server_args.py
+index b6f4cad4995c3389ba331b2a9bc980a876228aa4..fc7ee7804d8847d9ebedf7d756f3b09e1eb22bbe 100644
+--- a/test/registered/unit/server_args/test_server_args.py
++++ b/test/registered/unit/server_args/test_server_args.py
+@@ -120,7 +120,12 @@ from sglang.srt.runtime_context import (
+     get_serving,
+     override_platform,
+ )
+-from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
++from sglang.srt.server_args import (
++    PortArgs,
++    ServerArgs,
++    _resolve_offline_server_args,
++    prepare_server_args,
++)
+ from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
+ from sglang.test.ci.ci_register import register_cpu_ci
+ from sglang.test.test_utils import (
+@@ -1027,6 +1032,70 @@ class TestPrepareServerArgs(CustomTestCase):
+             os.unlink(config_file)
+ 
+ 
++class TestMultiTokenizerDefaults(CustomTestCase):
++    def test_default_tokenizer_worker_count_is_four(self):
++        direct = ServerArgs(model_path="dummy")
++        parsed = prepare_server_args(["--model-path", "dummy"])
++
++        self.assertEqual(direct.tokenizer_worker_num, 4)
++        self.assertEqual(parsed.tokenizer_worker_num, 4)
++
++    def test_multi_tokenizer_rejects_api_keys(self):
++        for key_name in ("api_key", "admin_api_key"):
++            with self.subTest(key_name=key_name):
++                with self.assertRaisesRegex(ValueError, "tokenizer-worker-num 1"):
++                    ServerArgs(model_path="dummy", **{key_name: "secret"}).resolve_once()
++
++                args = ServerArgs(
++                    model_path="dummy",
++                    tokenizer_worker_num=1,
++                    **{key_name: "secret"},
++                )
++                args.resolve_once()
++                self.assertEqual(getattr(args, key_name), "secret")
++
++    def test_multi_tokenizer_rejects_ssl_refresh(self):
++        with self.assertRaisesRegex(ValueError, "tokenizer-worker-num 1"):
++            ServerArgs(model_path="dummy", enable_ssl_refresh=True).resolve_once()
++
++        args = ServerArgs(
++            model_path="dummy",
++            tokenizer_worker_num=1,
++            enable_ssl_refresh=True,
++        )
++        args.resolve_once()
++        self.assertTrue(args.enable_ssl_refresh)
++
++    def test_offline_engine_keeps_single_tokenizer_default(self):
++        class FakeServerArgs:
++            def __init__(self, **kwargs):
++                self.tokenizer_worker_num = kwargs["tokenizer_worker_num"]
++                self.log_level = kwargs["log_level"]
++
++        args = _resolve_offline_server_args(FakeServerArgs, {})
++        self.assertEqual(args.tokenizer_worker_num, 1)
++        self.assertEqual(args.log_level, "error")
++
++    def test_offline_engine_rejects_explicit_multi_tokenizer_args(self):
++        for args in (
++            SimpleNamespace(tokenizer_worker_num=4),
++            ServerArgs(model_path="dummy"),
++        ):
++            with self.subTest(args=args):
++                with self.assertRaisesRegex(ValueError, "offline Engine API"):
++                    _resolve_offline_server_args(
++                        ServerArgs,
++                        {"server_args": args},
++                    )
++
++    def test_offline_engine_accepts_explicit_single_tokenizer_args(self):
++        args = ServerArgs(model_path="dummy", tokenizer_worker_num=1)
++        self.assertIs(
++            _resolve_offline_server_args(ServerArgs, {"server_args": args}),
++            args,
++        )
++
++
+ class TestMmEncoderDataParallelLogging(CustomTestCase):
+     def test_logs_when_encoder_dp_has_no_parallelism(self):
+         server_args = ServerArgs(
+@@ -2671,6 +2740,7 @@ class TestPortArgs(unittest.TestCase):
+ 
+ class TestSSLArgs(unittest.TestCase):
+     def _validate_ssl(self, **kwargs):
++        kwargs.setdefault("tokenizer_worker_num", 1)
+         server_args = ServerArgs(model_path="dummy", **kwargs)
+         handle_ssl_validation(server_args)
+         return server_args
+@@ -4273,8 +4343,22 @@ class TestGrpcServerArgs(CustomTestCase):
+ 
+     @staticmethod
+     def _args(**kwargs):
++        # Native gRPC is one of the restricted modes that must opt out of the
++        # HTTP serving default of four tokenizer workers.
++        kwargs.setdefault("tokenizer_worker_num", 1)
+         return ServerArgs(model_path="dummy", **kwargs)
+ 
++    def test_native_grpc_rejects_default_multi_tokenizer(self):
++        sa = ServerArgs(model_path="dummy", grpc_port=40000)
++        self.assertEqual(sa.tokenizer_worker_num, 4)
++        with self.assertRaisesRegex(ValueError, "tokenizer-worker-num 1"):
++            handle_deprecated_args(sa)
++
++    def test_native_grpc_accepts_explicit_single_tokenizer(self):
++        sa = self._args(grpc_port=40000)
++        handle_deprecated_args(sa)
++        self.assertEqual(sa.tokenizer_worker_num, 1)
++
+     def test_http_only_high_port_does_not_derive_grpc_port(self):
+         sa = self._args(port=56000)
+         handle_deprecated_args(sa)
+@@ -4530,7 +4614,15 @@ class TestGrpcServerArgs(CustomTestCase):
+         parser = self._sidecar_parser()
+         for value in (300, 1800, 0, -1):
+             with self.subTest(timeout=value):
+-                argv = ["--model-path", "dummy", "--grpc-port", "50051"]
++                argv = [
++                    "--model-path",
++                    "dummy",
++                    "--grpc-port",
++                    "50051",
++                    # Native gRPC requires one tokenizer worker.
++                    "--tokenizer-worker-num",
++                    "1",
++                ]
+                 if value != 300:
+                     argv += ["--grpc-response-timeout-secs", str(value)]
+                 sa = ServerArgs.from_cli_args(parser.parse_args(argv))
+@@ -5599,7 +5691,11 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
+ 
+     @staticmethod
+     def _resolve(cli_args, rust_server=True):
+-        args = prepare_server_args(["--model-path", "dummy", *cli_args])
++        # API keys and SSL refresh are honored by the Python frontend only with
++        # one tokenizer worker, so state that rather than the HTTP default of 4.
++        args = prepare_server_args(
++            ["--model-path", "dummy", "--tokenizer-worker-num", "1", *cli_args]
++        )
+         # `override` leaves the variable set when its body raises.
+         with patch.dict(os.environ), envs.SGLANG_RUST_SERVER.override(rust_server):
+             args.resolve_once()

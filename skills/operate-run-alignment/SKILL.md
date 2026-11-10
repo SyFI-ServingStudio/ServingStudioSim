@@ -136,6 +136,30 @@ single-config path below when there is one workload and no matrix.
    model cache, and fork venv (`fork_python` must import `torch` and the
    selected engine).
 
+   Capture in the image, the default of `alignment profile` and
+   `alignment-campaign run` (`alignment/README.md`, "In-image capture").
+   `--runtime host` is strongly discouraged: it has no autotune guard and no
+   warm-caches preflight, so the engine may tune or compile inside the
+   measurement. The engine's reference image (`vllm` or `sglang`,
+   `reference_engines/README.md`: the official image plus our patches, the same
+   image its L1 kernels run in) replaces a host venv, host nsys and cargo build,
+   so the capture does not depend on how one worktree's venv was provisioned.
+   Build it once per BASE.yaml/patches/req-frontend change with
+   `just ref build-image vllm` (or `sglang`), on the host with rootless Podman
+   or inside a Slurm job where docker
+   is a job-scoped rootless Podman (unset the workspace `.env`'s `DOCKER_HOST`
+   there, or docker reaches the host daemon instead). Run the capture inside a
+   GPU job with the same CPU/memory share a host capture gets (a 4-GPU job's
+   default, not a trimmed `-c`): the workers' shared memory and the checkpoint's
+   page cache count against the job's memory cgroup, and a 285 GiB job thrashed
+   for minutes loading DeepSeek-V4.1-Flash that a ~1 TB job loads in under one.
+   The job's GPUs reach the container by UUID. Read the pass's
+   `capture_facts.json` (GPUs, driver, topology, multicast, memlock, shm) before
+   comparing captures from different machines. When a kernel JIT-compiles per
+   shape on first use inside the window (vLLM's jit_monitor logs
+   "JIT compilation during inference"), declare a `prewarm` block with those
+   shapes' prompt lengths instead of a side script.
+
    `profile_kind` selects one of four passes, and they are not
    interchangeable — each buys one kind of evidence at the cost of another, so
    pick by which check will consume it (see `alignment/README.md` for the

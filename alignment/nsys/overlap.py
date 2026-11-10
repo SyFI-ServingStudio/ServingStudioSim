@@ -428,6 +428,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--default-stage", default="all")
     parser.add_argument("--server-log", type=Path, default=None)
     parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument(
+        "--replica-ranks",
+        type=int,
+        default=None,
+        help="global ranks per DP replica (vLLM: tp * pp * pcp; default --tp-size)",
+    )
     parser.add_argument("--device", type=int, action="append", dest="devices")
     parser.add_argument("--all-devices", action="store_true")
     parser.add_argument("--stage", action="append", dest="stages")
@@ -465,6 +471,7 @@ def main(argv: list[str] | None = None) -> int:
         default_stage=args.default_stage,
         worker_ranks=worker_ranks,
         tp_size=args.tp_size,
+        replica_ranks=args.replica_ranks,
     )
     try:
         report = build_overlap_diagnostics(

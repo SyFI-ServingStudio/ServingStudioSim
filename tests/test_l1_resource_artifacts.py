@@ -91,6 +91,7 @@ def _run_args(output_dir: Path | None, **overrides) -> SimpleNamespace:
         gpu_name="NVIDIA H200",
         force=False,
         fresh=False,
+        allow_autotune=False,
         energy=True,
         output_dir=output_dir,
         json=True,
