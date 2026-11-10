@@ -234,9 +234,7 @@ def test_a_reused_leader_pid_is_not_swept(monkeypatch) -> None:
     # The leader is reaped; a live process now holds its pid (a stranger),
     # so its session is not ours.
     killed = []
-    monkeypatch.setattr(
-        runner, "_processes", lambda: {500: (1, 500, 500), 600: (500, 600, 500)}
-    )
+    monkeypatch.setattr(runner, "_processes", lambda: {500: (1, 500, 500), 600: (500, 600, 500)})
     monkeypatch.setattr(runner, "_signal_groups", lambda groups, _sig: killed.extend(groups))
     runner._kill_leftovers(500, {})
     assert killed == []

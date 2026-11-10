@@ -281,7 +281,7 @@ def _header_paths(rest: str) -> tuple[str, ...]:
             # `a/X b/X` when unrenamed: split in the middle, so a path that
             # holds " b/" itself is read whole; otherwise at " b/".
             half = (len(rest) - 1) // 2
-            if rest[half:half + 3] == " b/" and rest[2:half] == rest[half + 3 :]:
+            if rest[half : half + 3] == " b/" and rest[2:half] == rest[half + 3 :]:
                 old, new = rest[:half], "b/" + rest[half + 3 :]
             else:
                 old, _, tail = rest.partition(" b/")

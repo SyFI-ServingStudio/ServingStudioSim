@@ -168,7 +168,18 @@ def test_a_tree_with_unexported_commits_a_stash_or_a_paused_am_is_not_replaced(t
     _check_replaceable(tree, force=True, patches=exported)
 
     # Commits export-patches writes nothing for: empty, or only ALIGNMENT_BASE.
-    _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "empty", cwd=tree)
+    _git(
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "empty",
+        cwd=tree,
+    )
     (tree / "ALIGNMENT_BASE").write_text("x\n")
     _git("add", "ALIGNMENT_BASE", cwd=tree)
     _git(*commit, "alignment base only", cwd=tree)
@@ -287,9 +298,20 @@ def test_patch_paths_reads_real_format_patch_headers(tmp_path, quote_path):
     _git("add", "-A", cwd=tree)
     _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "change", cwd=tree)
     text = subprocess.run(
-        ["git", "-c", f"core.quotePath={quote_path}", "format-patch", "--binary", "--stdout",
-         "-1", "HEAD"],
-        cwd=tree, check=True, capture_output=True, text=True,
+        [
+            "git",
+            "-c",
+            f"core.quotePath={quote_path}",
+            "format-patch",
+            "--binary",
+            "--stdout",
+            "-1",
+            "HEAD",
+        ],
+        cwd=tree,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
 
     assert sorted(reference_engines.patch_paths(text)) == sorted(
