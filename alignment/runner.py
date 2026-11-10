@@ -656,7 +656,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = F
                     driver.set_cuda_profile(base_url, active=False)
                 except RuntimeError:
                     pass
-            _shutdown(proc, wrapped=is_nsys)
+            _shutdown(proc, wrapped=nsys_executable is not None)
 
     return _finalize_profile(
         cfg,
