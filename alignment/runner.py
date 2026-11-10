@@ -898,13 +898,14 @@ def _finalize_profile(
         range_mode="phases",
         worker_ranks=worker_ranks,
         tp_size=cfg.server.tp_size,
+        replica_ranks=cfg.replica_ranks,
         dp_rank_by_device=dp_rank_by_device,
     )
     if len(parsed["device_ids"]) != cfg.gpu_count:
         raise RuntimeError(
             "normalized NSYS device population does not match server parallelism: "
             f"devices={parsed['device_ids']} tp_size={cfg.server.tp_size} "
-            f"dp_size={cfg.server.dp_size} pp={cfg.pipeline_parallel_size}"
+            f"dp_size={cfg.server.dp_size} replica_ranks={cfg.replica_ranks}"
         )
     observed_dp_ranks = sorted(set(parsed["dp_rank_by_device"].values()))
     if observed_dp_ranks != list(range(cfg.server.dp_size)):

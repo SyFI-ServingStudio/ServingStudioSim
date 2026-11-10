@@ -203,20 +203,34 @@ PROFILE_KINDS = frozenset({"nsys", "workload_metrics", "expert_popularity", "tok
 ROUTING_PROFILE_KINDS = frozenset({"expert_popularity", "token_corpus"})
 
 
-# Each engine's spellings of its pipeline-parallel size in ``extra_args``.
-_PP_FLAGS = {
-    "vllm": ("--pipeline-parallel-size", "-pp"),
-    "sglang": ("--pp-size", "--pipeline-parallel-size"),
+# Each engine's spellings, in ``extra_args``, of the parallel degrees that
+# multiply a replica's GPUs beyond TP. vLLM: ParallelConfig.world_size is
+# pp * tp * pcp (decode context parallelism reuses the TP GPUs). SGLang:
+# ``server_args.compute_world_size`` is dp * tp * pp (attention DP and
+# attention CP split the TP group).
+_REPLICA_FLAGS: dict[str, dict[str, tuple[str, ...]]] = {
+    "vllm": {
+        "pipeline-parallel": ("--pipeline-parallel-size", "-pp"),
+        "prefill-context-parallel": ("--prefill-context-parallel-size", "-pcp"),
+    },
+    "sglang": {"pipeline-parallel": ("--pp-size", "--pipeline-parallel-size")},
 }
 
 
-def _flag_value(args: list[str], names: tuple[str, ...]) -> str | None:
+def _flag_name(engine: str, arg: str) -> str:
+    # vLLM's parser reads `--a_b` as `--a-b` (utils/argparse_utils.py).
+    if engine == "vllm" and arg.startswith("--"):
+        return "--" + arg[2:].replace("_", "-")
+    return arg
+
+
+def _flag_value(engine: str, args: list[str], names: tuple[str, ...]) -> str | None:
     """The value of the last of ``names`` in ``args`` (``--x N`` or ``--x=N``)."""
 
     value = None
     for index, arg in enumerate(args):
         name, eq, inline = str(arg).partition("=")
-        if name in names:
+        if _flag_name(engine, name) in names:
             if eq:
                 value = inline
             elif index + 1 < len(args):
@@ -224,32 +238,40 @@ def _flag_value(args: list[str], names: tuple[str, ...]) -> str | None:
     return value
 
 
-def pipeline_parallel_size(engine: str, extra_args: list[str]) -> int:
-    """The PP degree ``extra_args`` asks ``engine`` for (1 if none)."""
-
-    value = _flag_value(extra_args, _PP_FLAGS.get(engine, ()))
+def _degree(engine: str, extra_args: list[str], what: str) -> int:
+    value = _flag_value(engine, extra_args, _REPLICA_FLAGS.get(engine, {}).get(what, ()))
     if value is None:
         return 1
     try:
         size = int(value)
     except ValueError:
-        raise ValueError(f"pipeline-parallel size {value!r} is not an integer") from None
+        raise ValueError(f"{what} size {value!r} is not an integer") from None
     if size < 1:
-        raise ValueError(f"pipeline-parallel size must be positive, got {size}")
+        raise ValueError(f"{what} size must be positive, got {size}")
+    return size
+
+
+def replica_ranks(engine: str, tp_size: int, extra_args: list[str]) -> int:
+    """Ranks (GPUs) in one data-parallel replica: ``tp_size`` times every degree
+    in ``_REPLICA_FLAGS`` that ``extra_args`` sets. vLLM numbers its global
+    ranks replica by replica, so a rank's DP rank is ``rank // replica_ranks``."""
+
+    size = tp_size
+    for what in _REPLICA_FLAGS.get(engine, {}):
+        size *= _degree(engine, extra_args, what)
     return size
 
 
 def server_gpu_count(engine: str, tp_size: int, dp_size: int, extra_args: list[str]) -> int:
-    """GPUs a server runs on: ``tp_size * dp_size * pp``.
+    """GPUs a server runs on: ``dp_size`` replicas of ``replica_ranks`` each.
 
-    Both engines size their world this way (vLLM's ParallelConfig, SGLang's
-    ``server_args.compute_world_size``). SGLang's attention DP
-    (``--attn-dp-size``) splits the TP group and adds no GPUs; ``dp_size``
-    counts replicas in both. Expert parallelism spans one PP stage, so it
-    divides ``tp_size * dp_size``, not this.
+    ``dp_size`` counts replicas in both engines; SGLang's attention DP
+    (``--attn-dp-size``) splits the TP group and adds no GPUs. Expert
+    parallelism spans one PP stage, so it divides ``tp_size * dp_size``, not
+    this.
     """
 
-    return tp_size * dp_size * pipeline_parallel_size(engine, extra_args)
+    return dp_size * replica_ranks(engine, tp_size, extra_args)
 
 
 @dataclass
@@ -302,10 +324,10 @@ class ProfileConfig:
     workload: LoadGeneratorConfig = None  # type: ignore[assignment]
 
     @property
-    def pipeline_parallel_size(self) -> int:
-        """The PP degree ``server.extra_args`` asks the engine for (1 if none)."""
+    def replica_ranks(self) -> int:
+        """Ranks in one DP replica (``replica_ranks``)."""
 
-        return pipeline_parallel_size(self.engine, self.server.extra_args)
+        return replica_ranks(self.engine, self.server.tp_size, self.server.extra_args)
 
     @property
     def gpu_count(self) -> int:

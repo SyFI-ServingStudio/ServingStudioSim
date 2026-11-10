@@ -242,6 +242,10 @@ def _with_server(path: Path, engine: str, devices: str, **server) -> Path:
     [
         ("vllm", {"tp_size": 2, "extra_args": ["--pipeline-parallel-size", "2"]}, 4),
         ("vllm", {"tp_size": 1, "dp_size": 2, "extra_args": ["-pp=2"]}, 4),
+        ("vllm", {"tp_size": 2, "extra_args": ["--pipeline_parallel_size", "2"]}, 4),
+        ("vllm", {"tp_size": 2, "extra_args": ["-pcp", "2"]}, 4),
+        # Decode context parallelism reuses the TP GPUs.
+        ("vllm", {"tp_size": 4, "extra_args": ["--decode-context-parallel-size", "2"]}, 4),
         ("sglang", {"tp_size": 2, "extra_args": ["--pp-size", "2"]}, 4),
         # Attention DP splits the TP group: no extra GPUs.
         ("sglang", {"tp_size": 4, "extra_args": ["--attn-dp-size", "4"]}, 4),
@@ -256,6 +260,7 @@ def test_the_gpu_count_is_tp_dp_and_pp(tmp_path, engine, server, gpus):
         _with_server(_config(tmp_path), engine, devices, **server), require_python_runtime=False
     )
     assert cfg.gpu_count == gpus
+    assert cfg.replica_ranks == gpus // cfg.server.dp_size
 
     facts = {
         "gpus": [{"index": str(index), "name": "NVIDIA B200"} for index in range(gpus)],
