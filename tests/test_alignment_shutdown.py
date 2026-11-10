@@ -14,6 +14,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from alignment import runner
 
 _LAUNCHER = """
@@ -186,6 +188,13 @@ def _leaves_a_child(tmp_path: Path, *, own_group: bool, exit_at_once: bool):
     return proc, int(child_file.read_text())
 
 
+def _kill_quietly(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def _gone(pid: int) -> bool:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -257,17 +266,52 @@ def test_an_unreaped_leader_still_has_its_session_swept(monkeypatch) -> None:
     assert killed == [500, 600]
 
 
-def test_a_helper_group_is_matched_by_a_recorded_member(monkeypatch) -> None:
+def test_a_helper_group_is_matched_unless_its_pid_went_to_a_stranger(monkeypatch) -> None:
     killed = []
     monkeypatch.setattr(runner, "_signal_groups", lambda groups, _sig: killed.extend(groups))
-    helpers = {700: (700, frozenset({(700, 10), (701, 11)}))}
-    # A recorded member is alive (its later fork 702 goes with the group).
-    table = {701: (1, 700, 700, 11), 702: (701, 700, 700, 30)}
-    monkeypatch.setattr(runner, "_processes", lambda: table)
-    runner._kill_leftovers(400, helpers)
-    assert killed == [700]
-    killed.clear()
-    # All members gone; pid 700 went to a stranger that started a session.
-    monkeypatch.setattr(runner, "_processes", lambda: {700: (1, 700, 700, 40)})
-    runner._kill_leftovers(400, helpers)
-    assert killed == []
+    helpers = {700: (700, 10)}  # helper 700 ran setsid; it started at tick 10
+    cases = [
+        ({700: (1, 700, 700, 10)}, [700]),  # the helper itself
+        ({702: (1, 700, 700, 30)}, [700]),  # a fork it made after the record, orphaned
+        ({700: (1, 700, 700, 40)}, []),  # pid 700 went to a stranger that ran setsid
+        ({702: (1, 700, 701, 30)}, []),  # another session
+    ]
+    for table, expected in cases:
+        killed.clear()
+        monkeypatch.setattr(runner, "_processes", lambda table=table: table)
+        runner._kill_leftovers(400, helpers)
+        assert killed == expected, table
+
+
+def test_an_unreaped_server_is_swept_with_a_warning(tmp_path, monkeypatch, capsys) -> None:
+    proc, child = _leaves_a_child(tmp_path, own_group=True, exit_at_once=False)
+    os.kill(proc.pid, signal.SIGSTOP)  # a hung server
+    swept = []
+    monkeypatch.setattr(runner, "_reap", lambda _proc: None)  # the wait times out
+    monkeypatch.setattr(proc, "poll", lambda: None)  # ...and it stays unreaped
+    monkeypatch.setattr(
+        runner, "_kill_leftovers", lambda leader, _h, *, reaped: swept.append((leader, reaped))
+    )
+    runner._shutdown(proc, timeout=1, wrapped=False)
+    assert swept == [(proc.pid, False)]
+    assert "survived SIGKILL unreaped" in capsys.readouterr().err
+    proc.wait(timeout=30)
+    _kill_quietly(child)
+
+
+def test_an_interrupted_shutdown_kills_nothing(tmp_path, monkeypatch) -> None:
+    proc, child = _leaves_a_child(tmp_path, own_group=True, exit_at_once=False)
+    os.kill(proc.pid, signal.SIGSTOP)
+    swept = []
+    monkeypatch.setattr(runner, "_kill_leftovers", lambda *a, **k: swept.append(a))
+
+    def interrupted(*_a, **_k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(proc, "wait", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        runner._shutdown(proc, timeout=1, wrapped=False)
+    assert swept == []
+    os.kill(proc.pid, signal.SIGKILL)
+    _kill_quietly(child)
+    os.waitpid(proc.pid, 0)
