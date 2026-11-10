@@ -2517,3 +2517,24 @@ def test_a_model_without_eplb_opts_out_of_the_expert_load_stream(tmp_path):
     assert not cfg.captures_expert_load
     assert "--enable-eplb" not in argv
     assert "--enable-return-routed-experts" in argv
+
+
+def test_warm_caches_from_the_host_is_the_images_warm_pass(tmp_path, monkeypatch):
+    import alignment.image_runtime as image_runtime
+
+    paths = _phase_configs(tmp_path)
+    monkeypatch.delenv(image_runtime.RUNTIME_ENV, raising=False)
+    calls = []
+    monkeypatch.setattr(
+        image_runtime,
+        "run_profile_in_image",
+        lambda config, **kwargs: calls.append(kwargs) or 0,
+    )
+    monkeypatch.setattr(
+        alignment_launcher,
+        "run_profile",
+        lambda *args, **kwargs: pytest.fail("the host must not profile on --warm-caches"),
+    )
+
+    assert alignment_launcher.main(["profile", str(paths["profile"]), "--warm-caches"]) == 0
+    assert calls == [{"warm_caches": True}]
