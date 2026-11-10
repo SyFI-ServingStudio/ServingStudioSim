@@ -9,6 +9,7 @@ NSYS normalization, and timing-predict input conversion.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import filecmp
 import json
 import shutil
@@ -546,7 +547,14 @@ def _run_profile(args: argparse.Namespace) -> int:
         return returncode
     print(f"[alignment] {'resuming' if args.resume else 'profiling'}: {args.config}")
     if args.warm_caches:
-        # In the image, for `python -m reference_engines warm-caches`.
+        # In the image, for `python -m reference_engines warm-caches` (whose
+        # host side already pointed log_dir at `<log_dir>.warm-caches`). An
+        # explicit host warm-up logs there too, not into the capture's log_dir.
+        if not in_image():
+            warm_dir = Path(config.log_dir)
+            config = dataclasses.replace(
+                config, log_dir=str(warm_dir.with_name(warm_dir.name + ".warm-caches"))
+            )
         run_profile(config, warm_only=True)
         print(f"[alignment] engine reached ready and was stopped: {config.log_dir}")
         return 0

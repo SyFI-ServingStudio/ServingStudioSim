@@ -2543,3 +2543,21 @@ def test_warm_caches_from_the_host_is_the_images_warm_pass(tmp_path, monkeypatch
 
     log_dir = Path(load_profile_config(paths["profile"]).log_dir)
     assert not log_dir.exists() or not any(log_dir.iterdir())
+
+
+def test_an_explicit_host_warm_up_logs_beside_the_capture(tmp_path, monkeypatch):
+    import alignment.image_runtime as image_runtime
+
+    paths = _phase_configs(tmp_path)
+    monkeypatch.delenv(image_runtime.RUNTIME_ENV, raising=False)
+    warmed = []
+    monkeypatch.setattr(
+        alignment_launcher,
+        "run_profile",
+        lambda config, *, warm_only=False, **_: warmed.append((config.log_dir, warm_only)) or {},
+    )
+
+    argv = ["profile", str(paths["profile"]), "--runtime", "host", "--warm-caches"]
+    assert alignment_launcher.main(argv) == 0
+    (log_dir, warm_only), = warmed
+    assert warm_only and log_dir.endswith(".warm-caches")
