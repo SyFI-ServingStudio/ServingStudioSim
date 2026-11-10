@@ -310,6 +310,7 @@ exists to hold.
 | File | Contents |
 |---|---|
 | `pack.py` | Pack/variant/case dataclasses, `Calibrated`, YAML loading, host profiles |
+| `packfile.py` | The `campaign.yaml` writer every `make_pack.py` uses: scalar lists in flow style |
 | `render.py` | Phase configs and traces from a `(case, variant, host)` triple |
 | `check.py` | Pure-CPU pack self-check; trace invariants; cross-phase consistency |
 | `execute.py` | Phase planning (pure) and execution (scheduler + leases + journal) |
