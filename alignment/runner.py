@@ -1024,8 +1024,9 @@ def _descendant_group_sessions(pid: int) -> tuple[list[int], dict[int, int | Non
         _parent, group, session, _start = processes[child]
         if group != own:
             groups.setdefault(group)
-            holder = processes.get(session)
-            sessions.setdefault(session, None if holder is None else holder[3])
+            if session != pid:  # `pid`'s own session is swept as the leader's
+                holder = processes.get(session)
+                sessions.setdefault(session, None if holder is None else holder[3])
         pending.extend(children.get(child, ()))
     return list(groups), sessions
 
@@ -1056,6 +1057,8 @@ def _kill_leftovers(leader: int, sessions: dict[int, int | None], *, reaped: boo
     sweep_session = not reaped or leader not in processes
 
     def ours(session: int) -> bool:
+        if session <= 0:  # kernel threads, or a session outside our pid namespace
+            return False
         if session == leader:
             return sweep_session
         if session not in sessions:

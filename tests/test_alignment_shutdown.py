@@ -271,6 +271,8 @@ def test_a_helper_session_is_matched_unless_its_pid_went_to_a_stranger(monkeypat
         ({700: 10}, {702: (1, 702, 701, 30)}, []),  # another session
         ({700: None}, {700: (1, 700, 700, 40)}, []),  # nobody held 700; now a stranger does
         ({700: None}, {702: (1, 702, 700, 30)}, [702]),  # nobody held it, nor holds it now
+        ({400: 5}, {400: (1, 400, 400, 5)}, []),  # the leader's pid went to a stranger
+        ({0: None}, {2: (0, 0, 0, 0)}, []),  # kernel threads
     ]
     for sessions, table, expected in cases:
         killed.clear()
@@ -309,7 +311,7 @@ def test_an_interrupted_shutdown_kills_nothing(tmp_path, monkeypatch) -> None:
         with pytest.raises(KeyboardInterrupt):
             runner._shutdown(proc, timeout=1, wrapped=False)
     assert swept == []
-    assert Path(f"/proc/{child}").exists()  # its worker was left alone
+    assert Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
     os.killpg(os.getpgid(child), signal.SIGKILL)
     proc.kill()
     proc.wait(timeout=30)
