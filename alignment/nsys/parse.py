@@ -78,6 +78,9 @@ _JIT_MODULE_LOAD_APIS = frozenset(
 _KERNEL_LOOKUP_INDEX = "vibesim_kernel_gpid_corr_start_idx"
 
 
+# Correlation ids bound per kernel-attach query (under SQLite's 32766 default).
+_CORRELATION_CHUNK = 20000
+
 def iteration_kind(metric: dict | None, fallback: str = "all") -> str:
     """Classify one workload unit without collapsing mixed into prefill."""
     if metric is None:
@@ -608,27 +611,33 @@ def attach_kernels_by_correlation(
         if not correlation_ids:
             continue
 
-        placeholders = ",".join("?" for _ in correlation_ids)
-        params = [item.worker.global_pid, *correlation_ids]
-        query = f"""
-            SELECT
-                k.start,
-                k.end,
-                k.demangledName,
-                k.streamId,
-                k.correlationId
-            FROM CUPTI_ACTIVITY_KIND_KERNEL k
-            WHERE k.globalPid = ?
-              AND k.correlationId IN ({placeholders})
-            ORDER BY k.start
-        """
+        # SQLite caps bound variables per statement (32766 by default); a long
+        # iteration (a 1M-context prefill chunk) launches more kernels than
+        # that, so query in chunks and restore the global start order.
+        rows = []
+        for offset in range(0, len(correlation_ids), _CORRELATION_CHUNK):
+            chunk = correlation_ids[offset : offset + _CORRELATION_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            query = f"""
+                SELECT
+                    k.start,
+                    k.end,
+                    k.demangledName,
+                    k.streamId,
+                    k.correlationId
+                FROM CUPTI_ACTIVITY_KIND_KERNEL k
+                WHERE k.globalPid = ?
+                  AND k.correlationId IN ({placeholders})
+            """
+            rows.extend(con.execute(query, [item.worker.global_pid, *chunk]))
+        rows.sort(key=lambda row: (int(row[0]), int(row[4]) if row[4] is not None else -1))
         for (
             start,
             end,
             name,
             stream_id,
             correlation_id,
-        ) in con.execute(query, params):
+        ) in rows:
             kernel_rows += 1
             start = int(start)
             end = int(end)

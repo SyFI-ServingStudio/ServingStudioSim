@@ -692,6 +692,1308 @@
    "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
   },
   {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "vectorized_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "vectorized_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "vectorized_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "vectorized_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "vectorized_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "vectorized_elementwise_kernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "vectorized_elementwise_kernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "elementwise_kernel_with_index",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "elementwise_kernel_with_index",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "elementwise_kernel_with_index",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "elementwise_kernel_with_index",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "elementwise_kernel_with_index",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "elementwise_kernel_with_index",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "elementwise_kernel_with_index",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "at::native::elementwise_kernel<",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "at::native::elementwise_kernel<",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "at::native::elementwise_kernel<",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "at::native::elementwise_kernel<",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "at::native::elementwise_kernel<",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "at::native::elementwise_kernel<",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "at::native::elementwise_kernel<",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "index_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "index_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "index_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "index_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "index_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "index_elementwise_kernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "index_elementwise_kernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "direct_copy_kernel_cuda",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "direct_copy_kernel_cuda",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "direct_copy_kernel_cuda",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "direct_copy_kernel_cuda",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "direct_copy_kernel_cuda",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "direct_copy_kernel_cuda",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "direct_copy_kernel_cuda",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "_scatter_gather_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "_scatter_gather_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "_scatter_gather_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "_scatter_gather_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "_scatter_gather_elementwise_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "_scatter_gather_elementwise_kernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "_scatter_gather_elementwise_kernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "vectorized_gather_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "vectorized_gather_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "vectorized_gather_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "vectorized_gather_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "vectorized_gather_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "vectorized_gather_kernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "vectorized_gather_kernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "mbtopk::fill",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "mbtopk::fill",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "mbtopk::fill",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "mbtopk::fill",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "mbtopk::fill",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "mbtopk::fill",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "mbtopk::fill",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "at::native::reduce_kernel<",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "at::native::reduce_kernel<",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "at::native::reduce_kernel<",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "at::native::reduce_kernel<",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "at::native::reduce_kernel<",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "at::native::reduce_kernel<",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "at::native::reduce_kernel<",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "CatArrayBatchedCopy",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "CatArrayBatchedCopy",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "CatArrayBatchedCopy",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "CatArrayBatchedCopy",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "CatArrayBatchedCopy",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "CatArrayBatchedCopy",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "CatArrayBatchedCopy",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "exp2_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "exp2_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "exp2_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "exp2_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "exp2_kernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "exp2_kernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "exp2_kernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceCompactInitKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceCompactInitKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceCompactInitKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceCompactInitKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceCompactInitKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "DeviceCompactInitKernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "DeviceCompactInitKernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceSelectSweepKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceSelectSweepKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceSelectSweepKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceSelectSweepKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceSelectSweepKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "DeviceSelectSweepKernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "DeviceSelectSweepKernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceReduceSingleTileKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "concurrent",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceReduceSingleTileKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.wk_store",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceReduceSingleTileKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_decode",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceReduceSingleTileKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_topk",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.torch_bookkeeping",
+   "name": "DeviceReduceSingleTileKernel",
+   "type": "model",
+   "role": "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+   "slot_suffixes": [
+    "indexer.torch_bookkeeping"
+   ],
+   "phase": "forward",
+   "after": "indexer.torch_bookkeeping",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "DeviceReduceSingleTileKernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.weights_proj",
+   "stream_role": "primary",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
+   "operation": "indexer.logits_prefill",
+   "name": "DeviceReduceSingleTileKernel",
+   "type": "model",
+   "role": "torch indexer logits einsum (prefill, per request)",
+   "slot_suffixes": [
+    "indexer.logits_prefill"
+   ],
+   "phase": "forward",
+   "after": "indexer.logits_prefill",
+   "cross_rank": "independent",
+   "source_experiment": "logs/b2_reextract/07_balanced_anchor_c16/profile_nsys (B2 4x RTX PRO 6000, 2026-11-06)"
+  },
+  {
    "operation": "engram.lookup",
    "name": "_engram_gather_kernel",
    "type": "model",

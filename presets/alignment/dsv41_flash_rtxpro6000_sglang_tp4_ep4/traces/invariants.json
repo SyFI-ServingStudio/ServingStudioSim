@@ -169,6 +169,90 @@
       "output_tokens": 12288,
       "request_count": 64,
       "sha256": "54bda80aa089682d703b02079114596f1532c0b9ae6cfdf9abff446434b397fa"
+    },
+    "traces/15_decode_midbatch_ctx1m_c4.csv": {
+      "arrival_span_ms": 7000.0,
+      "distinct_request_ids": 8,
+      "distinct_shapes": 2,
+      "input_tokens": 393216,
+      "max_input_len": 65536,
+      "max_output_len": 1024,
+      "max_total_len": 66560,
+      "output_tokens": 8192,
+      "request_count": 8,
+      "sha256": "351c19b09f80acc5ac3378fc9fc376a5bb0e271d61c0ce47b09bb97f66279ea6"
+    },
+    "traces/16_decode_midbatch_ctx1m_c8.csv": {
+      "arrival_span_ms": 15000.0,
+      "distinct_request_ids": 16,
+      "distinct_shapes": 2,
+      "input_tokens": 786432,
+      "max_input_len": 65536,
+      "max_output_len": 1024,
+      "max_total_len": 66560,
+      "output_tokens": 16384,
+      "request_count": 16,
+      "sha256": "fe9c51da6c58dcc33b9ce5cd5bb58f9fb7573d03f9d8b14b69a8cab913e192c0"
+    },
+    "traces/17_balanced_anchor_c16_ctx1m.csv": {
+      "arrival_span_ms": 63000.0,
+      "distinct_request_ids": 64,
+      "distinct_shapes": 4,
+      "input_tokens": 180224,
+      "max_input_len": 4096,
+      "max_output_len": 256,
+      "max_total_len": 4352,
+      "output_tokens": 12288,
+      "request_count": 64,
+      "sha256": "00feda1c0d494d103ea2e7331ab79d01b294f8541bb9781a6168c907b0deb8a2"
+    },
+    "traces/18_balanced_anchor_c16_bcg.csv": {
+      "arrival_span_ms": 63000.0,
+      "distinct_request_ids": 64,
+      "distinct_shapes": 4,
+      "input_tokens": 180224,
+      "max_input_len": 4096,
+      "max_output_len": 256,
+      "max_total_len": 4352,
+      "output_tokens": 12288,
+      "request_count": 64,
+      "sha256": "2e10e652924ff458563fbf54154cbdf1f994e6e63090e99c4e4124e1d02bea29"
+    },
+    "traces/19_prefill_spectrum_c8_bcg.csv": {
+      "arrival_span_ms": 47000.0,
+      "distinct_request_ids": 48,
+      "distinct_shapes": 6,
+      "input_tokens": 561920,
+      "max_input_len": 49152,
+      "max_output_len": 16,
+      "max_total_len": 49168,
+      "output_tokens": 768,
+      "request_count": 48,
+      "sha256": "eb2decef4ca0bcefdb69b55577e1415f171f4f56d2824b4e15eaf6da085e1f9a"
+    },
+    "traces/20_balanced_anchor_c16_p2p.csv": {
+      "arrival_span_ms": 63000.0,
+      "distinct_request_ids": 64,
+      "distinct_shapes": 4,
+      "input_tokens": 180224,
+      "max_input_len": 4096,
+      "max_output_len": 256,
+      "max_total_len": 4352,
+      "output_tokens": 12288,
+      "request_count": 64,
+      "sha256": "1af2716e69a89a1f844d88de91fe0e6dddf7fd7034ae186ee9abde7b44e1fd05"
+    },
+    "traces/21_decode_midbatch_ctx1m_c8_p2p.csv": {
+      "arrival_span_ms": 15000.0,
+      "distinct_request_ids": 16,
+      "distinct_shapes": 2,
+      "input_tokens": 786432,
+      "max_input_len": 65536,
+      "max_output_len": 1024,
+      "max_total_len": 66560,
+      "output_tokens": 16384,
+      "request_count": 16,
+      "sha256": "a81c26a43a37c9fedd4702b3a1262c4b1a80c8dc2212369116458843958a4dbb"
     }
   }
 }

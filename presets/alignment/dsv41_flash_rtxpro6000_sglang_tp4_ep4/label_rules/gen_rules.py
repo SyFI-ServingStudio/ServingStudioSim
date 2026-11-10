@@ -33,8 +33,9 @@ How the capture is shaped, and why the rules look the way they do:
   (DSpark hidden-state capture on layers 37-39), verify/accept bookkeeping (argmax, softcap,
   `_fused_correct_drafts_and_bonus`, accept-length broadcasts), the kv-inject RMSNorm, the folded
   `[2x: quant, GEMM]` bodies on the draft side streams (one shared-down and one kv-a projection folded
-  into one position), the prefill Engram id sort (cub radix sort in repeat bodies with no neighbours)
-  and the torch bookkeeping between the indexer projections and the FP4 logits.
+  into one position) and the prefill Engram id sort (cub radix sort in repeat bodies with no neighbours).
+  The dense-blocks indexer's torch kernels ARE mapped (decode bookkeeping, prefill logits; see the
+  indexer section), from the 1M-context-length R4 capture.
 """
 
 import json
@@ -203,6 +204,39 @@ for frag in ("computeBlockDigitCounts", "computeDigitCumSum", "computeBlockwiseW
     topk(frag, note="torch.topk internals; in this capture torch.topk runs only in the indexer.")
 topk("radixSortKVInPlace", before_name=TORCH, note="The sort of the selected indices (the Engram id "
                                                    "sort is the one followed by the gather).")
+
+# The dense-blocks indexer's torch work (SM12x, v41_indexer/scoring.py), read off the 1M-context-length
+# R4 capture (logs/r4/21_decode_midbatch_ctx1m_c8_p2p). Names are generic torch kernels, so every rule is
+# chained to an indexer neighbour; fragments never occur in torch.topk's own kernel names. `after` is the
+# IMMEDIATE predecessor's operation, so runs are labeled by forward chains (one sweep, since the walk labels in
+# place); each chain stops at the first kernel that is not a BK fragment. Decode vs prefill after weights_proj is
+# told apart by stream: decode-graph index layers run on concurrent tracks, eager prefill on the primary track.
+#   decode : [wk_store] 3 x (copy/gather) [wq_b..weights_proj] ~12 x (arange / valid mask / req_to_token
+#            gather / int64 math / masked_fill) [logits_decode] fill [topk] ~10 x (scatter/gather/copy of the
+#            selection) [page_metadata]
+#   prefill: the same, except everything from weights_proj through the einsum epilogue (index-K dequant,
+#            cub compaction, cat, exp2, gathers; ReLU, head-weight multiply, head reduction) is the prefill
+#            logits op.
+BK = ("vectorized_elementwise_kernel", "elementwise_kernel_with_index", "at::native::elementwise_kernel<",
+      "index_elementwise_kernel", "direct_copy_kernel_cuda", "_scatter_gather_elementwise_kernel",
+      "vectorized_gather_kernel", "mbtopk::fill", "at::native::reduce_kernel<", "CatArrayBatchedCopy",
+      "exp2_kernel", "DeviceCompactInitKernel", "DeviceSelectSweepKernel", "DeviceReduceSingleTileKernel")
+bk = op("indexer.torch_bookkeeping", "model",
+        "dense-blocks indexer torch bookkeeping over [requests, lmax] (decode) and the selection writes",
+        ["indexer.torch_bookkeeping"])
+lp = op("indexer.logits_prefill", "model", "torch indexer logits einsum (prefill, per request)",
+        ["indexer.logits_prefill"])
+for frag in BK:
+    # decode graph (index layers on concurrent tracks): forward from the k store, weights_proj, the FP4
+    # logits and the top-k, then along the run
+    bk(frag, after="indexer.weights_proj", stream_role="concurrent")
+    bk(frag, after="indexer.wk_store")
+    bk(frag, after="indexer.logits_decode")
+    bk(frag, after="indexer.torch_topk")
+    bk(frag, after="indexer.torch_bookkeeping")
+    # eager prefill (primary track): from weights_proj through the einsum epilogue to the top-k
+    lp(frag, after="indexer.weights_proj", stream_role="primary")
+    lp(frag, after="indexer.logits_prefill")
 
 # ---------------------------------------------------------------- Engram (layers 1, 14)
 lk = op("engram.lookup", "model", "Engram host-table gather (+ id sort)", ["engram.lookup"])
