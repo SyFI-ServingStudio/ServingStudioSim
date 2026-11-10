@@ -278,14 +278,14 @@ def _header_paths(rest: str) -> tuple[str, ...]:
             old, _, quoted = rest.partition(' "')
             new = _take_quoted('"' + quoted)[0]
         else:
-            # `a/X b/X` when unrenamed: split in the middle, so a path that
-            # holds " b/" itself is read whole; otherwise at " b/".
+            # Unquoted, the line splits only when both sides are equal
+            # (`a/X b/X`), and then in the middle, so a path holding " b/"
+            # is read whole. A rename or copy names its paths on its own
+            # lines (and a change on `---`/`+++`), read from there.
             half = (len(rest) - 1) // 2
-            if rest[half : half + 3] == " b/" and rest[2:half] == rest[half + 3 :]:
-                old, new = rest[:half], "b/" + rest[half + 3 :]
-            else:
-                old, _, tail = rest.partition(" b/")
-                new = "b/" + tail
+            if not (rest[half : half + 3] == " b/" and rest[2:half] == rest[half + 3 :]):
+                return ()
+            old, new = rest[:half], "b/" + rest[half + 3 :]
     else:
         return ()
     return tuple(path[2:] for path in (old, new) if path[:2] in ("a/", "b/"))

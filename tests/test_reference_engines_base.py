@@ -255,7 +255,13 @@ def test_a_native_change_in_a_patch_is_reported(tmp_path, monkeypatch):
         "diff --git a/csrc/moe/topk.cu b/csrc/moe/topk.cu\n"
         "diff --git a/CMakeLists.txt b/CMakeLists.txt\n"
         "diff --git a/vllm/kernel.cu b/csrc/kernel.cu\n"
+        "similarity index 90%\n"
+        "rename from vllm/kernel.cu\n"
+        "rename to csrc/kernel.cu\n"
         "diff --git a/vllm/x y.py b/csrc/x y.cu\n"
+        "similarity index 90%\n"
+        "rename from vllm/x y.py\n"
+        "rename to csrc/x y.cu\n"
         'diff --git "a/vllm/caf\\303\\251.py" "b/csrc/caf\\303\\251.cu"\n'
         "similarity index 90%\n"
         'rename from "vllm/caf\\303\\251.py"\n'
@@ -281,11 +287,13 @@ def test_patch_paths_reads_real_format_patch_headers(tmp_path, quote_path):
     tree = tmp_path / "t"
     (tree / "csrc").mkdir(parents=True)
     (tree / "vllm" / "x b").mkdir(parents=True)
+    (tree / "vllm" / "a b").mkdir(parents=True)
     _git("init", "-q", cwd=tree)
     (tree / "csrc" / "modé.cu").write_text("a\n")
     (tree / "csrc" / "bïn.bin").write_bytes(b"\x00\x01")
     (tree / "vllm" / "x b" / "y.py").write_text("a\n")
     (tree / "vllm" / "中文.py").write_text("a\n")
+    (tree / "vllm" / "a b" / "c.py").write_text("a\n")
     (tree / "vllm" / "body.py").write_text("-- a/csrc/not_a_header.cu\n")
     _git("add", "-A", cwd=tree)
     _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base", cwd=tree)
@@ -294,6 +302,7 @@ def test_patch_paths_reads_real_format_patch_headers(tmp_path, quote_path):
     (tree / "csrc" / "new bïn.bin").write_bytes(b"\x00\x03")  # new binary
     (tree / "vllm" / "x b" / "y.py").write_text("b\n")  # " b/" inside the path
     _git("mv", "vllm/中文.py", "csrc/中文.cu", cwd=tree)  # rename into csrc
+    _git("mv", "vllm/a b/c.py", "vllm/d.py", cwd=tree)  # renamed from a path holding " b/"
     (tree / "vllm" / "body.py").write_text("")  # removes a line reading "-- a/..."
     _git("add", "-A", cwd=tree)
     _git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "change", cwd=tree)
@@ -322,6 +331,8 @@ def test_patch_paths_reads_real_format_patch_headers(tmp_path, quote_path):
             "vllm/x b/y.py",
             "vllm/中文.py",
             "csrc/中文.cu",
+            "vllm/a b/c.py",
+            "vllm/d.py",
             "vllm/body.py",
         ]
     )
