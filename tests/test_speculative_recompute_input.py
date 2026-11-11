@@ -25,8 +25,10 @@ def recompute_metric():
     }
 
 
-def test_recompute_preserves_rows_and_does_not_mutate_measurement():
+@pytest.mark.parametrize("schema_version", [4, 5])
+def test_recompute_preserves_rows_and_does_not_mutate_measurement(schema_version):
     metric = recompute_metric()
+    metric["schema_version"] = schema_version
     original = deepcopy(metric)
     pairs, decode, tokens = _validated_shape(metric, "test", 5)
     assert pairs == [[10, 20], [0, 2195], [65600, 250]]
