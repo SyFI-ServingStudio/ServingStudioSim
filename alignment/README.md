@@ -779,10 +779,17 @@ labeling inventory stores one representative sequence only after proving that
 the ordered `(name, suggested_category)` sequence is identical on every device
 for every phase/iteration. Ranks driven by one scheduler are paired by exact
 iteration index and identical phase inventory; asynchronous host NVTX spans are
-not a join key. Independent data-parallel schedulers can have diverging counters,
-so the parser instead pairs only mutual, unique overlaps of attributed GPU-kernel
-envelopes. Missing kernel evidence, ambiguous overlap, and incomplete phase
-inventory remain explicitly unpaired. Analysis applies labels independently to
+not a join key. Independent data-parallel schedulers have diverging counters:
+each numbers its own scheduled steps, and an idle rank runs a dummy forward
+(no NVTX range, no scheduled work) to join its peers' collectives. Every rank
+runs one forward per global step, so the parser pairs data-parallel ranks by
+the `forward_ordinal` their schema-5 metrics record for each iteration
+(`step_alignment.rule: forward_ordinal`). A peer step whose forward the
+reference rank ran as a dummy has no reference step and stays unpaired, as
+`unpaired_steps_by_device` counts. A capture without ordinals falls back to
+mutual, unique overlaps of attributed GPU-kernel envelopes
+(`kernel_time_overlap`). Missing kernel evidence, ambiguous overlap, and
+incomplete phase inventory remain explicitly unpaired. Analysis applies labels independently to
 each rank, then reduces the iteration with the barrier model
 (`doc/analyzer.md`): each run of synchronizing positions is a barrier costing
 `max(end) - max(start)`, and each window between barriers is won by the rank

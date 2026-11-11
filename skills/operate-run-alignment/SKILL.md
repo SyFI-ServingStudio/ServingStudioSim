@@ -357,6 +357,14 @@ single-config path below when there is one workload and no matrix.
    divide full-run tokens by an NSYS span or disable workload analysis merely
    because the kernel capture used a smaller representative trace.
 
+   Under data parallelism both the workload fold and Check 1 join the ranks by
+   the `forward_ordinal` in the full-run iteration records (schema 5, vLLM
+   reference patch 0019). A DP capture recorded before that patch has no
+   ordinals: `alignment-workload` refuses it ("predates forward ordinals") and
+   the pass must be recaptured with the current reference image; never pair its
+   ranks by wall clock or iteration index instead. The SGLang patch does not
+   emit ordinals yet, so an SGLang DP workload pass is refused the same way.
+
 Do not use the phase NVTX envelope as GPU E2E (host submission ranges; graph
 kernels run after the marker closes), and do not subtract an iteration's own busy
 union from its host span and call the remainder idle or CPU overhead — it can be
