@@ -109,6 +109,7 @@ def test_profile_run_writes_immutable_snapshot(monkeypatch, tmp_path: Path) -> N
         gpu_name="NVIDIA H200",
         force=False,
         fresh=False,
+        allow_autotune=False,
         energy=True,
         output_dir=output_dir,
         json=True,

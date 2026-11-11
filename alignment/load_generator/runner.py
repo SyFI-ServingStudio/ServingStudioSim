@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-import os
+import contextlib
 import subprocess
-from collections.abc import Callable
+import sys
+import threading
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,15 +15,9 @@ from .config import LoadGeneratorConfig
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REQ_FRONTEND_ROOT = Path(__file__).resolve().parent / "req-frontend"
 REPLAY_MANIFEST = REQ_FRONTEND_ROOT / "Cargo.toml"
-# A profiler image that carries prebuilt req-frontend binaries names their
-# directory here (profiling/container/vllm.Dockerfile); the capture then runs
-# them instead of building the shipped source, so a remote needs no cargo.
-PREBUILT_ENV = "VIBESIM_REQ_FRONTEND_BIN"
-_PREBUILT = os.environ.get(PREBUILT_ENV, "").strip()
-_BIN_DIR = Path(_PREBUILT) if _PREBUILT else REQ_FRONTEND_ROOT / "target" / "release"
-SESSION_RUNNER = _BIN_DIR / "session_runner"
+SESSION_RUNNER = REQ_FRONTEND_ROOT / "target" / "release" / "session_runner"
 # Draws or materializes a canonical trace (`tracegen describe` lists its knobs).
-TRACEGEN = _BIN_DIR / "tracegen"
+TRACEGEN = REQ_FRONTEND_ROOT / "target" / "release" / "tracegen"
 
 
 @dataclass(frozen=True)
@@ -41,10 +37,16 @@ def _repo_path(value: str) -> Path:
 
 
 def build_session_runner() -> Path:
-    """Build req-frontend before starting vLLM so compilation is outside nsys."""
-    if _PREBUILT:
-        if not os.access(SESSION_RUNNER, os.X_OK):
-            raise FileNotFoundError(f"{PREBUILT_ENV}={_PREBUILT} has no session_runner")
+    """Build req-frontend before starting vLLM so compilation is outside nsys.
+
+    In an engine image the binary was built at the gitlink when the image was
+    (`reference_engines/*/Dockerfile`), and nothing is built at run time.
+    """
+    from ..image_runtime import in_image
+
+    if in_image():
+        if not SESSION_RUNNER.is_file():
+            raise FileNotFoundError(f"the image carries no req-frontend binary at {SESSION_RUNNER}")
         return SESSION_RUNNER
     subprocess.run(
         [
@@ -87,12 +89,17 @@ def run_replay(
     model: str,
     measurement_ready: Callable[[], None] | None = None,
     routed_experts_dir: Path | None = None,
+    server_failure: Callable[[], str | None] | None = None,
 ) -> dict:
     """Replay the shared trace through its explicitly selected wire backend.
 
     `routed_experts_dir` turns the replay non-streaming and collects the routes
     the server took per request. The caller decides when that trade is worth
     making; this layer only knows that it costs the per-event timeline.
+
+    `server_failure`, polled every second while the replay runs, returns why the
+    server can no longer answer (or None). A dead engine leaves its requests
+    open until the stream idle timeout; this stops the replay at once instead.
     """
     prepared.log_path.parent.mkdir(parents=True, exist_ok=True)
     protocol_base_url = (
@@ -144,12 +151,19 @@ def run_replay(
         argv.extend(["--routed-experts-dir", str(routed_experts_dir)])
     argv.extend(config.extra_args)
 
-    if measurement_ready is None:
+    if measurement_ready is None and server_failure is None:
         subprocess.run(argv, cwd=REPO_ROOT, check=True)
+    elif measurement_ready is None:
+        with subprocess.Popen(argv, cwd=REPO_ROOT) as proc:
+            with _watch_server(proc, server_failure) as failure:
+                returncode = proc.wait()
+            _raise_server_failure(failure)
+            if returncode:
+                raise subprocess.CalledProcessError(returncode, argv)
     else:
         with subprocess.Popen(
             argv, cwd=REPO_ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-        ) as proc:
+        ) as proc, _watch_server(proc, server_failure) as failure:
             released = False
             try:
                 for line in proc.stdout:
@@ -163,13 +177,16 @@ def run_replay(
                     else:
                         print(line, end="", flush=True)
                 returncode = proc.wait()
+                _raise_server_failure(failure)
                 if returncode:
                     raise subprocess.CalledProcessError(returncode, argv)
                 if not released:
                     raise RuntimeError("frontend exited without a measurement boundary")
-            except BaseException:
+            except BaseException as error:
                 proc.kill()
                 proc.wait()
+                if failure and not isinstance(error, ServerFailedDuringReplay):
+                    raise ServerFailedDuringReplay(failure[0]) from error
                 raise
     return {
         "source_trace": str(prepared.trace_path.resolve()),
@@ -180,3 +197,55 @@ def run_replay(
         "warmup": config.warmup,
         "routed_experts_dir": str(routed_experts_dir) if routed_experts_dir else None,
     }
+
+
+class ServerFailedDuringReplay(RuntimeError):
+    """The serving engine died or stopped while the replay was running."""
+
+
+@contextlib.contextmanager
+def _watch_server(
+    proc: subprocess.Popen, server_failure: Callable[[], str | None] | None
+) -> Iterator[list[str]]:
+    """Kill the replay as soon as `server_failure` reports; yield what it said."""
+
+    failure: list[str] = []
+    if server_failure is None:
+        yield failure
+        return
+    stop = threading.Event()
+
+    def watch() -> None:
+        warned = False
+        while not stop.wait(1.0):
+            try:
+                reason = server_failure()
+            except Exception as exc:  # noqa: BLE001 - a broken check must not end the watch
+                # Not a server failure: the replay goes on, still watched (the
+                # check may be reading a log that is mid-rotation, say).
+                if not warned:
+                    print(
+                        f"[replay] server check failed, still watching: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    warned = True
+                continue
+            if reason:
+                failure.append(reason)
+                proc.kill()
+                return
+
+    thread = threading.Thread(target=watch, name="replay-server-watch", daemon=True)
+    thread.start()
+    try:
+        yield failure
+    finally:
+        stop.set()
+        thread.join()
+
+
+def _raise_server_failure(failure: list[str]) -> None:
+    if failure:
+        raise ServerFailedDuringReplay(f"server failed during replay: {failure[0]}")

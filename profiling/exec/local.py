@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec
+from profiling.exec.container_user import container_user
 from profiling.exec.env import (
     ContainerProfileEnv,
     ProfileEnv,
@@ -28,6 +33,19 @@ from profiling.gpu_policy import require_gpu
 from profiling.instrument import TIMELINE_ENV, span
 from profiling.profilers.energy import energy_enabled
 from profiling.profilers.timer import CUPTI_BUDGET_ENV, CUPTI_TRACE_ENV, TIMER_COMPARE_ENV
+from profiling.runners.autotune_cache import (
+    tactic_cache_dir,
+    tactic_file_stem,
+    tactic_version_slug,
+)
+from reference_engines.autotune_guard import (
+    ALLOW,
+    FORBID,
+    POLICY_ENV,
+    PREFLIGHT_ENV,
+    AutotuneForbiddenError,
+    forbidden_line,
+)
 
 CONTAINER_INDUCTOR_CACHE_ENV = "VIBESIM_CONTAINER_INDUCTOR_CACHE"
 
@@ -38,7 +56,47 @@ CONTAINER_INDUCTOR_CACHE_ENV = "VIBESIM_CONTAINER_INDUCTOR_CACHE"
 IMEX_CHANNEL_CDI_DEVICE = "nvidia.com/imex-channel=0"
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_CONTAINER_SOURCE_DIRS = ("profiling", "launcher", "gpu")
+
+#: The image label holding the engine half of its persistent-cache key.
+CACHE_KEY_LABEL = "ai.vibesim.cache-key"
+
+
+# --- Autotune policy: the one place an L1 worker's VIBESIM_AUTOTUNE is decided.
+#
+#   jit-fill (rows missing from the DB)      allow: tuning a new shape is part of
+#                                                   filling it; logged per kernel
+#   --force / --fresh (rows already there)   forbid, unless --allow-autotune
+#
+# A refresh re-measures a row under the tactics an earlier run chose; one that
+# re-derived them would compare a new search, not the kernel, with the old row.
+_allow_autotune = False
+_refreshing = False
+
+
+def set_allow_autotune(allowed: bool) -> None:
+    """``--allow-autotune``: let a refresh tune too."""
+
+    global _allow_autotune
+    _allow_autotune = allowed
+
+
+@contextmanager
+def refreshing_rows() -> Iterator[None]:
+    """Mark the batches run inside as re-measuring existing rows."""
+
+    global _refreshing
+    previous, _refreshing = _refreshing, True
+    try:
+        yield
+    finally:
+        _refreshing = previous
+
+
+def autotune_policy() -> str:
+    return ALLOW if _allow_autotune or not _refreshing else FORBID
+
+
+_CONTAINER_SOURCE_DIRS = ("profiling", "launcher", "gpu", "reference_engines")
 
 
 class LocalGpuPool(GpuPool):
@@ -76,6 +134,32 @@ class LocalGpuChunk(GpuChunk):
         profiler_env = resolve_profile_env(profiler_spec.subprocess_env)
         profiler_env.validate()
 
+        policy = autotune_policy()
+        container = isinstance(profiler_env, ContainerProfileEnv)
+        gpu_uuids = gpu_uuids_for_indices(self.gpus) if container else None
+        cache_dir = image_cache_dir(profiler_env.image, gpu_uuids) if container else None
+        worker_env = dict(profiler_spec.worker_env)
+        worker_env[POLICY_ENV] = policy
+        if policy == FORBID:
+            # A container's tactic dir is per base image (one FlashInfer); the
+            # host's is shared by every env, so match the env's FlashInfer.
+            found = autotune_preflight(
+                kernel_kind,
+                profiler_spec,
+                chunk_specs,
+                tactic_dir=(
+                    cache_dir / "home" / ".cache" / "vibesim-autotune"
+                    if cache_dir is not None
+                    else tactic_cache_dir()
+                ),
+                device=gpu_name_of(self.gpus),
+                flashinfer_version=(
+                    None if container else functools.partial(env_flashinfer_version, profiler_env)
+                ),
+            )
+            if found:
+                worker_env[PREFLIGHT_ENV] = found
+
         with tempfile.TemporaryDirectory(prefix="vibesim-profile-") as tmp:
             input_path = Path(tmp) / "input.json"
             output_path = Path(tmp) / "output.json"
@@ -96,7 +180,6 @@ class LocalGpuChunk(GpuChunk):
                 ),
                 encoding="utf-8",
             )
-            worker_env = dict(profiler_spec.worker_env)
             if isinstance(profiler_env, ContainerProfileEnv):
                 cmd, env = _container_worker_command(
                     profiler_env,
@@ -104,6 +187,8 @@ class LocalGpuChunk(GpuChunk):
                     Path(tmp),
                     worker_env=worker_env,
                     imex_channel=profiler_spec.imex_channel,
+                    cache_dir=cache_dir,
+                    gpu_uuids=gpu_uuids,
                 )
             else:
                 cmd, env = _host_worker_command(
@@ -116,14 +201,151 @@ class LocalGpuChunk(GpuChunk):
                     cmd, env=env, capture_output=True, text=True, check=False
                 )
             if completed.returncode != 0:
+                forbidden = forbidden_line(completed.stderr)
+                if forbidden is not None:
+                    # Not a row failure to retry or skip: the run itself is
+                    # mis-set-up, and every later chunk would stop the same way.
+                    raise AutotuneForbiddenError(
+                        f"{kernel_kind} {backend}: the worker tried to tune under "
+                        f"VIBESIM_AUTOTUNE={policy}; no row of this chunk was kept. {forbidden}"
+                    )
                 error = _worker_failure_message(completed)
                 return [ChunkResult(metrics=None, error=error) for _ in chunk_specs]
 
             worker_response = json.loads(output_path.read_text(encoding="utf-8"))
-            return [
+            _log_tuning(kernel_kind, backend, worker_response.get("autotune"))
+            results = [
                 chunk_result_from_payload(result_payload)
                 for result_payload in worker_response["results"]
             ]
+            # A number is only worth keeping if it was measured on the card this
+            # chunk reserved. Checked once per chunk, and only when something
+            # succeeded: an all-failed chunk keeps its own errors.
+            if any(result.metrics is not None for result in results):
+                mismatch = worker_gpu_mismatch(self.gpus, worker_response.get("gpu_uuids"))
+                if mismatch is not None:
+                    return [ChunkResult(metrics=None, error=mismatch) for _ in chunk_specs]
+            return results
+
+
+def autotune_preflight(
+    kernel_kind: KernelKind,
+    profiler_spec: Any,
+    specs: Sequence[dict],
+    *,
+    tactic_dir: Path | None,
+    device: str,
+    flashinfer_version: str | Callable[[], str] | None = None,
+) -> str | None:
+    """Check, before any worker starts, that a forbid run will not need to tune.
+
+    Each spec of a row with a ``tactic_label`` needs its persisted FlashInfer
+    tactic file (``profiling/runners/autotune_cache.py``); a row that re-tunes in
+    every worker (``tunes_every_worker``) cannot run at all. Raises
+    ``AutotuneForbiddenError`` listing every missing spec, else returns what it
+    found (for ``PREFLIGHT_ENV``) or ``None`` when the row keeps no tactic file.
+
+    With ``flashinfer_version`` (or a callable giving it, asked only when a
+    row keeps tactic files) only that version's file counts: another
+    version's tactics would not be read. A present file is necessary, not
+    sufficient: it may lack a bucket this spec reaches. The worker's guard is
+    the backstop for that, and reports it as a manifest/actual mismatch.
+    """
+
+    row = f"{kernel_kind} {profiler_spec.backend}"
+    if profiler_spec.tunes_every_worker:
+        raise AutotuneForbiddenError(
+            f"{row} re-tunes its Triton kernels in every worker (AutotunePin), so it "
+            f"cannot run under VIBESIM_AUTOTUNE=forbid; {len(specs)} spec(s) refused. "
+            "Pass --allow-autotune to refresh these rows."
+        )
+    if profiler_spec.tactic_label is None:
+        return None
+    if callable(flashinfer_version):
+        flashinfer_version = flashinfer_version()
+    missing: list[str] = []
+    files: set[str] = set()
+    for spec in specs:
+        args = {key: value for key, value in spec.items() if key != "backend"}
+        stem = tactic_file_stem(profiler_spec.tactic_label(**args), device)
+        suffix = f".fi{tactic_version_slug(flashinfer_version)}" if flashinfer_version else ".fi*"
+        hits = sorted(tactic_dir.glob(f"{stem}{suffix}.json")) if tactic_dir is not None else []
+        if hits:
+            files.update(hit.name for hit in hits)
+        else:
+            missing.append(f"  {json.dumps(args, sort_keys=True)} -> {stem}{suffix}.json")
+    if missing:
+        raise AutotuneForbiddenError(
+            f"{row}: {len(missing)} of {len(specs)} spec(s) have no persisted tactics in "
+            f"{tactic_dir}, so measuring them would tune, which VIBESIM_AUTOTUNE=forbid "
+            "refuses. Fill them with a jit-fill run (no --force/--fresh), or pass "
+            "--allow-autotune. Missing:\n" + "\n".join(missing)
+        )
+    return f"tactic files {sorted(files)} in {tactic_dir}"
+
+
+_FLASHINFER_VERSIONS: dict[Any, str] = {}
+_VERSION_MARK = "VIBESIM_FLASHINFER_VERSION="
+
+
+def env_flashinfer_version(profile_env: Any) -> str:
+    """The `flashinfer.__version__` a host env's worker imports (what names
+    its tactic files), probed under the worker's own interpreter, import path
+    and library path. Raises when the probe fails: falling back to any
+    version's file would let a forbid run pass on tactics it cannot read."""
+
+    if profile_env in _FLASHINFER_VERSIONS:
+        return _FLASHINFER_VERSIONS[profile_env]
+    env = os.environ.copy()
+    set_worker_python_env(profile_env, env)
+    if profile_env.additional_library_paths:
+        env["LD_LIBRARY_PATH"] = compose_library_path(profile_env, env.get("LD_LIBRARY_PATH"))
+    command = [
+        str(profile_env.python_executable),
+        "-c",
+        f"import flashinfer; print({_VERSION_MARK!r} + flashinfer.__version__)",
+    ]
+    try:
+        result = subprocess.run(
+            command, env=env, capture_output=True, text=True, check=False, timeout=120
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"cannot tell which FlashInfer {profile_env.python_executable} imports: {exc}"
+        ) from exc
+    versions = [
+        line[len(_VERSION_MARK) :].strip()
+        for line in result.stdout.splitlines()
+        if line.startswith(_VERSION_MARK)
+    ]
+    if result.returncode != 0 or len(versions) != 1 or not versions[0]:
+        tail = (result.stderr or result.stdout).strip()[-500:]
+        raise RuntimeError(
+            f"cannot tell which FlashInfer {profile_env.python_executable} imports "
+            f"(exit {result.returncode}): {tail}"
+        )
+    _FLASHINFER_VERSIONS[profile_env] = versions[0]
+    return versions[0]
+
+
+def _log_tuning(kernel_kind: KernelKind, backend: str, tuned: list[dict] | None) -> None:
+    """Print what a worker tuned (an allowed run), one line per op and shape."""
+
+    if not tuned:
+        return
+    total = sum(entry["seconds"] for entry in tuned)
+    print(
+        f"[autotune] {kernel_kind} {backend}: tuned {len(tuned)} op/shape(s) in {total:.1f} s",
+        file=sys.stderr,
+        flush=True,
+    )
+    for entry in tuned:
+        print(
+            f"[autotune]   {entry['seconds']:8.2f} s  {entry['measurements']:5d} "
+            f"measurement(s)  {entry['source']} {entry['what']}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 _WORKER_STREAM_TAIL_CHARS = 2000
@@ -199,29 +421,105 @@ def _host_worker_command(
     )
 
 
-# A cache an image tag has not used for this long belongs to a superseded tag.
+def image_cache_key(image: str, gpu_uuids: Sequence[str]) -> str:
+    """The persistent-cache directory name for ``image`` on the cards ``gpu_uuids``.
+
+    An engine image carries ``<engine>-<base digest[:12]>`` in its
+    ``ai.vibesim.cache-key`` label (``reference_engines/*/Dockerfile``); the key
+    appends the cards' architecture, ``-sm<major><minor>``. So a rebuild that
+    keeps the official base -- a patch, the capture venv, the guard -- keeps its
+    caches, and only a new base or another GPU generation starts cold.
+
+    That is safe because the patches cannot make a stale entry load. Every
+    cache in the directory is content-addressed or keyed by what it compiled
+    against: vLLM's compile cache hashes the traced source files and the config
+    (``vllm/compilation/backends.py``), inductor's FX graph and autotune caches
+    and Triton's kernel cache hash the source they compile, FlashInfer's JIT
+    directory is keyed by its version and the architecture, and the persisted
+    FlashInfer tactic files by device and FlashInfer version
+    (``profiling/runners/autotune_cache.py``) -- versions only the base changes.
+    A patched source file therefore misses and recompiles; it never reuses.
+
+    An image without the label (the L1 ``default`` and ``flashinfer-kda``
+    images) keeps one directory per tag, as before.
+    """
+
+    try:
+        label = subprocess.run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                f'{{{{index .Config.Labels "{CACHE_KEY_LABEL}"}}}}',
+                image,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+    except OSError:  # no container runtime here: nothing to read a label from
+        label = ""
+    if not label or label in ("<no value>", "unknown"):
+        return image.replace("/", "_").replace(":", "_")
+    return f"{label}-{gpu_arch(gpu_uuids)}"
+
+
+def _nvidia_smi_query(fields: str, gpus: Sequence[str]) -> list[list[str]]:
+    require_gpu("querying nvidia-smi")
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            f"--query-gpu={fields}",
+            "--format=csv,noheader",
+            "-i",
+            ",".join(str(gpu) for gpu in gpus),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [[cell.strip() for cell in line.split(",")] for line in result.stdout.splitlines()]
+
+
+def gpu_arch(gpus: Sequence[str | int]) -> str:
+    """``sm<major><minor>`` of the cards ``gpus`` (indices or UUIDs), which must agree."""
+
+    caps = {row[0] for row in _nvidia_smi_query("compute_cap", [str(gpu) for gpu in gpus])}
+    if len(caps) != 1:
+        raise RuntimeError(f"GPUs {list(gpus)} report compute capabilities {sorted(caps)}")
+    return "sm" + caps.pop().replace(".", "")
+
+
+def gpu_name_of(gpus: Sequence[int]) -> str:
+    """The CUDA device name of the first of ``gpus``, as the worker's torch spells it."""
+
+    return _nvidia_smi_query("name", [str(gpus[0])])[0][0]
+
+
+# A cache directory no run has used for this long belongs to a superseded image.
 STALE_CACHE_SECONDS = 30 * 24 * 3600
 
 
-def _image_cache_dir(image: str) -> Path:
-    """The JIT cache directory for ``image``, pruning the stale ones of its name.
-
-    Per tag: a JIT cache (Torch extensions, Triton, FlashInfer) holds builds
-    against that image's libraries, which another tag's cannot load. A tag
-    changes only with its dependencies, so the caches of a name's earlier tags
-    are dead weight once no checkout uses them; each use touches its own.
-    """
+def image_cache_dir(image: str, gpu_uuids: Sequence[str]) -> Path:
+    """The JIT, compile and tactic cache directory for ``image`` on these cards
+    (``image_cache_key``), pruning its stale siblings; each use touches its own."""
 
     root = Path(
         os.environ.get("VIBESIM_PROFILE_CACHE_DIR", Path.home() / ".cache" / "vibesim-profiler")
     ).resolve()
-    name = image.rpartition(":")[0] if ":" in image else image
-    prefix = name.replace("/", "_").replace(":", "_") + "_"
-    cache_dir = root / image.replace("/", "_").replace(":", "_")
+    key = image_cache_key(image, gpu_uuids)
+    cache_dir = root / key
     cache_dir.mkdir(parents=True, exist_ok=True)
     os.utime(cache_dir)
+    # Siblings are this image's other tags (`<repo>_<tag>`, also what an engine
+    # image used before it carried a key label) and, for an engine image, its
+    # other bases and architectures (`<engine>-...`).
+    prefixes = {(image.rpartition(":")[0] if ":" in image else image).replace("/", "_") + "_"}
+    if key.startswith(("vllm-", "sglang-")):
+        prefixes.add(key.split("-", 1)[0] + "-")
     now = time.time()
-    for sibling in root.glob(f"{prefix}*"):
+    for sibling in {path for prefix in prefixes for path in root.glob(f"{prefix}*")}:
         if sibling != cache_dir and now - sibling.stat().st_mtime > STALE_CACHE_SECONDS:
             shutil.rmtree(sibling, ignore_errors=True)
     return cache_dir
@@ -235,10 +533,15 @@ def _container_worker_command(
     *,
     worker_env: Mapping[str, str] | None = None,
     imex_channel: bool = False,
+    cache_dir: Path | None = None,
+    gpu_uuids: Sequence[str] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
-    cache_dir = _image_cache_dir(profiler_env.image)
-    # Address the cards by UUID, never by index. See gpu_uuids_for_indices.
-    gpu_request = f'"device={",".join(gpu_uuids_for_indices(gpus))}"'
+    # Address the cards by UUID, never by index, and twice: in the runtime's
+    # device request and in CUDA_VISIBLE_DEVICES. See gpu_uuids_for_indices.
+    gpu_uuids = list(gpu_uuids) if gpu_uuids is not None else gpu_uuids_for_indices(gpus)
+    if cache_dir is None:
+        cache_dir = image_cache_dir(profiler_env.image, gpu_uuids)
+    gpu_request = f'"device={",".join(gpu_uuids)}"'
     # A container does not inherit this process's environment, so measurement
     # policy has to be handed over explicitly; the host worker gets it for free
     # through os.environ.copy(). Anything here that changes what a number MEANS
@@ -303,10 +606,19 @@ def _container_worker_command(
             "host",
             "--gpus",
             gpu_request,
+            # The worker never relies on the image's ENTRYPOINT: an engine image
+            # also runs captures, on another interpreter.
+            "--entrypoint",
+            profiler_env.python,
             # Only backends that allocate fabric memory ask for the channel.
             *(["--device", IMEX_CHANNEL_CDI_DEVICE] if imex_channel else []),
             "--user",
-            f"{os.getuid()}:{os.getgid()}",
+            container_user(),
+            # Pins the worker to the reserved cards even when the runtime hands
+            # the container more of them than it asked for (gpu_uuids_for_indices).
+            # CUDA accepts UUIDs here and keeps their order as device order.
+            "--env",
+            f"CUDA_VISIBLE_DEVICES={','.join(gpu_uuids)}",
             "--env",
             "HOME=/cache/home",
             "--env",
@@ -333,6 +645,8 @@ def _container_worker_command(
             *source_volume_args,
             *volume_args,
             profiler_env.image,
+            "-m",
+            "profiling.exec.local_worker",
             "--worker-input",
             "/io/input.json",
             "--worker-output",
@@ -387,6 +701,15 @@ def gpu_uuids_for_indices(gpu_indices: Sequence[int]) -> list[str]:
     someone else's job, or every concurrent worker piling onto one card. A UUID
     names the same silicon in both views, so the container path uses it.
 
+    The device request alone is not enough. A rootless Podman inside a Slurm job
+    (what ``docker`` is on cayenne since 2026-11-05) accepts ``--gpus`` and
+    ignores it: every container gets all of the job's GPUs and CUDA picks the
+    first, so the concurrent workers of a multi-GPU job all measured on job
+    GPU 0, up to 2.4x slow and irreproducible. The container command therefore
+    also sets ``CUDA_VISIBLE_DEVICES`` to the same UUIDs, which holds under
+    either runtime, and ``worker_gpu_mismatch`` rejects a chunk whose worker
+    still saw something else.
+
     Raises when a UUID cannot be established, rather than falling back to the
     index: the fallback is exactly the mis-targeting this exists to prevent.
     """
@@ -408,6 +731,27 @@ def gpu_uuids_for_indices(gpu_indices: Sequence[int]) -> list[str]:
             f"indices visible here are {sorted(uuid_by_index)}"
         )
     return [uuid_by_index[gpu_index] for gpu_index in gpu_indices]
+
+
+def worker_gpu_mismatch(
+    gpu_indices: Sequence[int], worker_uuids: Sequence[str] | None
+) -> str | None:
+    """Why a worker's measurements cannot be kept, or None when it saw the reserved cards.
+
+    The worker reports the UUIDs of the CUDA devices it could see, in device
+    order (``local_worker``'s ``gpu_uuids``). Anything but exactly the reserved
+    cards, in reservation order, means the numbers came from some other card or
+    from a card shared with another worker, so none of them is stored.
+    """
+
+    requested = gpu_uuids_for_indices(gpu_indices)
+    observed = list(worker_uuids or [])
+    if observed == requested:
+        return None
+    return (
+        f"worker GPU mismatch: reserved {requested} (indices {list(gpu_indices)}) "
+        f"but the worker saw {observed or 'no GPU UUIDs'}"
+    )
 
 
 def find_idle_gpus(memory_threshold_mb: int = 1000, util_threshold_pct: int = 10) -> list[int]:

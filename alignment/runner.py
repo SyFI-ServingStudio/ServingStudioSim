@@ -11,28 +11,33 @@ idle polling, worker ranks), and both forks emit the identical alignment records
 so everything after the capture is shared: this module names no engine below the
 point where the driver and its `EngineRecords` descriptor are chosen.
 
-The server is spawned in its own session so a SIGINT to the group lets nsys
-finalize the `.nsys-rep` cleanly on shutdown.
+The server is spawned in its own session; on shutdown the server's process
+groups get a SIGINT, then nsys's, so nsys finalizes the `.nsys-rep` cleanly
+(`_shutdown`).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 
 from profiling.gpu_policy import require_gpu
+from reference_engines.autotune_guard import MARKER, AutotuneForbiddenError, forbidden_line
 
 from . import artifact_paths
 from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
 from .nsys.parsed_io import kernel_rows_path, write_parsed
 from .profiler import (
+    capture_facts,
     nsys_capture,
     record_extraction,
     runtime_artifacts,
@@ -56,11 +61,11 @@ TOKEN_CORPUS_DIR = "token_corpus"
 # One entry per supported engine: the launch driver, the log dialect its records
 # arrive in, and the venv python a config that names no `fork_python` defaults to.
 _ENGINES = {
-    "vllm": (vllm_server, VLLM_RECORDS, "alignment/profiler/vllm/.venv/bin/python"),
+    "vllm": (vllm_server, VLLM_RECORDS, "reference_engines/vllm/src/.venv/bin/python"),
     "sglang": (
         sglang_server,
         SGLANG_RECORDS,
-        "alignment/profiler/sglang/python/.venv-sglang/bin/python",
+        "reference_engines/sglang/src/python/.venv-sglang/bin/python",
     ),
 }
 
@@ -354,13 +359,17 @@ def _preflight_capture_environment(
     driver.validate_nsys_capture_environment(fork_python, env=env, cwd=REPO_ROOT)
 
 
-def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
+def run_profile(cfg: ProfileConfig, *, resume: bool = False, warm_only: bool = False) -> dict:
     """Run one explicit measured pass: NSYS, workload timing, or popularity.
 
     `resume=True` reuses an existing capture and redoes only the cheap
     post-capture work (record extraction, NSYS normalization, artifact
     manifest). The GPU capture is the expensive, non-reproducible part of this
     pipeline; a failure in extraction or parsing must never cost a re-capture.
+
+    `warm_only=True` is the warm-caches pass (`alignment/warm_caches.py`): the
+    same server argv and environment, without nsys and without a workload;
+    the engine compiles and tunes to ready and is stopped there.
     """
     if not resume:
         require_gpu(f"an alignment {cfg.profile_kind} capture (starts {cfg.engine})")
@@ -370,6 +379,8 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         or (cfg.profile_kind == "nsys" and cfg.nsys.capture_mode != "cuda_profiler_api")
     ):
         raise ValueError("warmup requires vLLM and cuda_profiler_api for NSYS captures")
+    if cfg.prewarm is not None and cfg.engine != "vllm":
+        raise ValueError("prewarm addresses DP ranks through vLLM's X-data-parallel-rank header")
     if (
         cfg.workload is not None and cfg.workload.warmup
         and not cfg.server.enable_server_load_tracking
@@ -378,21 +389,15 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     if (
         not resume
         and cfg.engine == "sglang"
-        and (
-            cfg.python_runtime is None
-            or cfg.python_runtime.environment.get("FLASHINFER_DISABLE_JIT") != "1"
-        )
+        and cfg.python_runtime is None
     ):
-        raise ValueError(
-            "a new SGLang profile requires an explicit python_runtime "
-            "prebuilt-artifact contract with FLASHINFER_DISABLE_JIT=1"
-        )
+        raise ValueError("a new SGLang profile requires an explicit python_runtime")
     log_dir = Path(cfg.log_dir)
     if not log_dir.is_absolute():
         log_dir = REPO_ROOT / log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
-    prepared_replay = load_generator.prepare_replay(cfg.workload, log_dir)
-    if not resume:
+    prepared_replay = None if warm_only else load_generator.prepare_replay(cfg.workload, log_dir)
+    if not resume and not warm_only:
         # Build and normalize before nsys starts. This avoids capturing Rust
         # compile work and ensures a bad trace fails before allocating vLLM GPU
         # memory.
@@ -450,12 +455,14 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         profile_kind=cfg.profile_kind,
         resume=resume,
     )
+    if not resume:
+        capture_facts.record(cfg, env, log_dir)
     # Only the timing pass runs under NSYS. The other passes launch the same
     # server argv bare so profiler lifecycle work cannot enter their evidence.
     out_rep = nsys_dir / cfg.name
     nsys_executable = (
         nsys_capture.resolve_nsys_executable(cfg.nsys.executable)
-        if is_nsys and not resume
+        if is_nsys and not resume and not warm_only
         else None
     )
     server_log = engine_dir / f"{cfg.name}_server.log"
@@ -538,6 +545,20 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         try:
             driver.wait_for_ready(base_url, proc, cfg.server.startup_timeout)
             driver.verify_server_started(server_log, cfg.server)
+            if warm_only:
+                print("[profile] server ready; warm-caches stops it here", flush=True)
+                return {"warm_only": True, "server_log": str(server_log)}
+            prewarm_results = None
+            if cfg.prewarm is not None:
+                started = time.monotonic()
+                prewarm_results = driver.send_prewarm(
+                    base_url, model, cfg.prewarm, cfg.server.dp_size
+                )
+                print(
+                    f"[profile] prewarm: {len(prewarm_results)} request(s) in "
+                    f"{time.monotonic() - started:.1f} s",
+                    flush=True,
+                )
             speculative = driver.speculative_decode_enabled(cfg.server)
             counters_before = None
             replay_start_monotonic_ns = None
@@ -580,12 +601,15 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
             drive_summary = load_generator.run_replay(
                 cfg.workload, prepared_replay, base_url=base_url, model=model,
                 measurement_ready=measurement_ready,
+                server_failure=_server_failure(proc, server_log),
                 # Only the corpus pass needs per-token routes, and it pays for
                 # them with the replay's streaming timeline. An expert_popularity
                 # pass reads the server's own counters and keeps its timeline.
                 routed_experts_dir=_prepared_routes_dir(cfg, log_dir),
             )
             replay_end_monotonic_ns = time.monotonic_ns()
+            if prewarm_results is not None:
+                drive_summary["prewarm"] = prewarm_results
             # EngineCore metrics use the same host CLOCK_MONOTONIC domain. The
             # explicit window lets workload alignment exclude server-startup
             # and prefix-cache preflight iterations without consulting NSYS.
@@ -613,6 +637,16 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
                 driver.set_cuda_profile(base_url, active=False)
                 cuda_profile_active = False
             time.sleep(2)  # let the last iterations' kernels flush into the trace
+        except BaseException as error:
+            # An engine stopped by the autotune guard is a set-up error with one
+            # fix, not a capture failure to investigate: say which.
+            line = forbidden_line(server_log.read_text(errors="replace"))
+            if line is not None:
+                raise AutotuneForbiddenError(
+                    f"the engine tried to tune kernels and the autotune guard stopped it "
+                    f"({server_log}): {line}"
+                ) from error
+            raise
         finally:
             capture_timer_cancelled.set()
             if capture_timer is not None:
@@ -624,7 +658,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
                     driver.set_cuda_profile(base_url, active=False)
                 except RuntimeError:
                     pass
-            _shutdown(proc)
+            _shutdown(proc, wrapped=nsys_executable is not None)
 
     return _finalize_profile(
         cfg,
@@ -636,6 +670,37 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         drive_summary=drive_summary,
         nsys_executable=nsys_executable,
     )
+
+
+# SGLang's parent process logs this when a scheduler/detokenizer subprocess
+# dies, then keeps its HTTP server up with the requests left open.
+_SGLANG_SUBPROCESS_CRASH = re.compile(r"Subprocess \S+ \(pid=\d+\) crashed with exit code")
+
+
+def _server_failure(proc: subprocess.Popen, server_log: Path):
+    """A poll for `run_replay`: why the server can no longer answer, or None.
+
+    Reads only the log written since the previous poll.
+    """
+
+    offset = server_log.stat().st_size
+
+    def poll() -> str | None:
+        nonlocal offset
+        code = proc.poll()
+        if code is not None:
+            return f"server process exited with code {code}"
+        with server_log.open("rb") as log:
+            log.seek(offset)
+            chunk = log.read()
+        complete = chunk.rfind(b"\n") + 1  # leave a partial last line for later
+        offset += complete
+        for line in chunk[:complete].decode(errors="replace").splitlines():
+            if MARKER in line or _SGLANG_SUBPROCESS_CRASH.search(line):
+                return line.strip()
+        return None
+
+    return poll
 
 
 def _check_routes_cover_replay(summary_path: Path, routes: Path) -> None:
@@ -839,14 +904,14 @@ def _finalize_profile(
         range_mode="phases",
         worker_ranks=worker_ranks,
         tp_size=cfg.server.tp_size,
+        replica_ranks=cfg.replica_ranks,
         dp_rank_by_device=dp_rank_by_device,
     )
-    expected_device_count = cfg.server.tp_size * cfg.server.dp_size
-    if len(parsed["device_ids"]) != expected_device_count:
+    if len(parsed["device_ids"]) != cfg.gpu_count:
         raise RuntimeError(
             "normalized NSYS device population does not match server parallelism: "
             f"devices={parsed['device_ids']} tp_size={cfg.server.tp_size} "
-            f"dp_size={cfg.server.dp_size}"
+            f"dp_size={cfg.server.dp_size} replica_ranks={cfg.replica_ranks}"
         )
     observed_dp_ranks = sorted(set(parsed["dp_rank_by_device"].values()))
     if observed_dp_ranks != list(range(cfg.server.dp_size)):
@@ -927,18 +992,179 @@ def _captured_nsys_provenance(launch_metadata: Path) -> dict | None:
     return provenance if isinstance(provenance, dict) else None
 
 
-def _shutdown(proc: subprocess.Popen) -> None:
-    """SIGINT the process group (lets nsys finalize), escalate if it lingers."""
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGINT)
-    except ProcessLookupError:
-        return
-    try:
-        proc.wait(timeout=120)
-    except subprocess.TimeoutExpired:
+def _processes() -> dict[int, tuple[int, int, int, int]]:
+    """pid -> (ppid, pgid, session id, start time in clock ticks) of every
+    process visible now. (pid, start time) names one process for good: a pid
+    the kernel hands out again comes with a later start time."""
+
+    found: dict[int, tuple[int, int, int, int]] = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+            found[int(stat.parent.name)] = (
+                int(fields[1]),
+                int(fields[2]),
+                int(fields[3]),
+                int(fields[19]),
+            )
+        except (OSError, IndexError, ValueError):
+            continue  # exited while we looked
+    return found
+
+
+def _descendant_group_sessions(pid: int) -> tuple[list[int], dict[int, int | None]]:
+    """`pid`'s descendants' process groups other than its own (nsys runs the
+    application it profiles in a process group of its own), and their
+    sessions, each with the start time of the process then holding the
+    session's pid (None: none did)."""
+
+    processes = _processes()
+    children: dict[int, list[int]] = {}
+    for child, (parent, *_rest) in processes.items():
+        children.setdefault(parent, []).append(child)
+    own = processes.get(pid, (0, None, 0, 0))[1]
+    groups: dict[int, None] = {}
+    sessions: dict[int, int | None] = {}
+    pending = list(children.get(pid, ()))
+    while pending:
+        child = pending.pop()
+        _parent, group, session, _start = processes[child]
+        if group != own:
+            groups.setdefault(group)
+            if session != pid:  # `pid`'s own session is swept as the leader's
+                holder = processes.get(session)
+                sessions.setdefault(session, None if holder is None else holder[3])
+        pending.extend(children.get(child, ()))
+    return list(groups), sessions
+
+
+def _descendant_groups(pid: int) -> list[int]:
+    return _descendant_group_sessions(pid)[0]
+
+
+def _kill_leftovers(leader: int, sessions: dict[int, int | None], *, reaped: bool = True) -> None:
+    """SIGKILL what is left of a stopped server: every process in its session
+    or in a session its helpers were recorded in (`sessions`, see
+    `_descendant_group_sessions`), whatever group it moved to since.
+
+    The server started its own session (`start_new_session`); a helper may
+    have started one too. The kernel does not hand out a pid while a live
+    process names it as its session, so a session matches an unrelated
+    process only if its pid went to one -- refused when that process still
+    holds the pid: `leader` must be unreaped or gone, a helper session's pid
+    gone or held by the process recorded then (same start time). Not caught:
+    a stranger that got the pid and left it again (a daemon's double fork),
+    which takes a full pid wraparound during the shutdown.
+    """
+
+    processes = _processes()
+    # Once `leader` is reaped, a live process holding its pid is a stranger
+    # the pid went to (no leftover kept it), and so is that session. Unreaped,
+    # the pid is still `leader`'s own.
+    sweep_session = not reaped or leader not in processes
+
+    def ours(session: int) -> bool:
+        if session <= 0:  # kernel threads, or a session outside our pid namespace
+            return False
+        if session == leader:
+            return sweep_session
+        if session not in sessions:
+            return False
+        holder = processes.get(session)
+        return holder is None or holder[3] == sessions[session]
+
+    groups = {group for _parent, group, session, _start in processes.values() if ours(session)}
+    _signal_groups(sorted(groups), signal.SIGKILL)
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    """Wait (bounded) for a SIGKILLed `proc`, so its leftovers are swept after it."""
+
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _signal_groups(groups: list[int], signum: int) -> None:
+    for group in groups:
+        try:
+            os.killpg(group, signum)
+        except (ProcessLookupError, PermissionError):
+            pass  # gone, or (not ours) no longer the group we meant
+
+
+def _groups_alive(groups: list[int]) -> bool:
+    alive = False
+    for group in groups:
+        try:
+            os.killpg(group, 0)
+            alive = True
+        except (ProcessLookupError, PermissionError):
+            pass  # gone, or no longer ours
+    return alive
+
+
+def _shutdown(proc: subprocess.Popen, timeout: float = 120.0, *, wrapped: bool = True) -> None:
+    """Stop the server, then let nsys finalize; escalate if either lingers.
+
+    nsys finalizes only after the application it launched has exited
+    (`nsys profile --wait`, default `all`), and that application runs in a
+    process group of its own, so a SIGINT to the nsys group reaches the server
+    only if nsys passes it on. Sent that way, a TP4 vLLM server logged no
+    shutdown at all and nsys sat out the whole timeout over a report it had
+    already written. So the server's groups get the SIGINT directly; once they
+    are gone nsys exits by itself, and the SIGINT to its own group covers an
+    nsys that does not.
+
+    `wrapped=False`: `proc` is the server itself (no nsys). Its own group then
+    gets the SIGINT in the same round, so a helper of the server that sits in
+    a group of its own and ignores SIGINT cannot hold the server's stop back.
+
+    Either way, once `proc` has exited, whatever of it is still alive is
+    killed (`_kill_leftovers`): a worker or helper would otherwise keep GPU
+    memory or a port into the next run.
+    """
+
+    if proc.poll() is not None:
+        _kill_leftovers(proc.pid, {})
+        return
+    try:
+        own = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        _kill_leftovers(proc.pid, {})
+        return
+    targets, target_sessions = _descendant_group_sessions(proc.pid)
+    killed = False
+    try:
+        if not wrapped:
+            _signal_groups([own, *targets], signal.SIGINT)
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _signal_groups([own, *targets], signal.SIGKILL)
+                killed = True
+                _reap(proc)
+            return
+        _signal_groups(targets, signal.SIGINT)
+        deadline = time.monotonic() + timeout
+        while _groups_alive(targets) and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.2)
+        _signal_groups([own], signal.SIGINT)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _signal_groups([own, *targets], signal.SIGKILL)
+            killed = True
+            _reap(proc)
+    finally:
+        reaped = proc.poll() is not None
+        if not reaped and killed:
+            print(
+                f"[profile] pid {proc.pid} survived SIGKILL unreaped (stuck in the kernel?); "
+                "killing its leftovers anyway",
+                file=sys.stderr,
+            )
+        # Interrupted before any SIGKILL (a second Ctrl-C): leave it be.
+        if reaped or killed:
+            _kill_leftovers(proc.pid, target_sessions, reaped=reaped)

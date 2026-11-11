@@ -1,0 +1,266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Tue, 10 Nov 2026 16:48:44 -0800
+Subject: [PATCH] alignment: record every DP forward with a forward ordinal
+
+Under data parallelism an idle rank runs a dummy forward on every
+busy-loop pass in which it ran no real step, so that its DP/EP
+collectives pair with its peers'. The alignment iteration record was
+written only for real steps, so idle ranks' forwards were missing and a
+consumer had to pair ranks by wall clock, which the asynchronous
+observation windows do not support.
+
+Schema 5 adds forward_ordinal (per-rank count of model forwards, dummies
+included, from 0), is_dummy and dp_rank. A step that runs a forward
+(scheduled tokens > 0) takes the next ordinal when it is dispatched; a
+DP dummy forward takes one and writes a zero-work record. A 0-token
+step runs no forward and takes none. Equal ordinals on two ranks are
+the same global step: each forward syncs its batch across DP ranks
+(coordinate_batch_across_dp / dispatch_cg_and_sync_dp).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ALIGNMENT.md                              | 12 +++-
+ tests/v1/engine/test_iteration_logging.py | 66 ++++++++++++++++++++-
+ vllm/v1/core/sched/output.py              |  5 ++
+ vllm/v1/engine/core.py                    | 71 ++++++++++++++++++++++-
+ 4 files changed, 147 insertions(+), 7 deletions(-)
+
+diff --git a/ALIGNMENT.md b/ALIGNMENT.md
+index b2c3e393a391ce98f1d95d5f68b1c8fa31a72f3f..b925d08d3eaba0ca825b7687c8f57103c2af14c0 100644
+--- a/ALIGNMENT.md
++++ b/ALIGNMENT.md
+@@ -69,8 +69,16 @@ index travels with `ExecuteModelState` from target execution to sampling.
+ Bookkeeping may have multiple disjoint scopes in one iteration.
+ 
+ `VLLM_NVTX_SCOPES_FOR_PROFILING=1` enables the scopes. Enable
+-`--enable-logging-iteration-details` for schema-v4
+-`VibeSimAlignmentIteration` records. Existing
++`--enable-logging-iteration-details` for schema-v5
++`VibeSimAlignmentIteration` records. Schema 5 adds `forward_ordinal`,
++`is_dummy`, `dp_rank` and `max_forwards_in_flight` (the batch-queue depth: how
++many forwards a rank can have launched but not finished), and records every model forward of the EngineCore
++loop: a real step (scheduled tokens > 0) and, under data parallelism, each
++dummy forward an idle rank runs to join its peers' collectives (zero work,
++`iteration_index: null`). A 0-token step runs no forward and records none.
++Every DP rank runs exactly one forward per busy-loop pass while a wave runs
++(both runners sync the batch across DP ranks inside each forward), so equal
++`forward_ordinal`s on two ranks are the same global step. Existing
+ `VLLM_VIBESIM_TOKEN_TRACE_*` and `VLLM_VIBESIM_ROUTING_TRACE_*` switches apply
+ to both model runners. Dumps can synchronize/copy GPU data; collect them in
+ the separate evidence pass, not in timing captures. The token dump uses actual
+diff --git a/tests/v1/engine/test_iteration_logging.py b/tests/v1/engine/test_iteration_logging.py
+index 6fb183035543442b5ab9284b2905448cf1d50c1a..91c82e9843a5da453f3a559a7c264b9469f3f9ef 100644
+--- a/tests/v1/engine/test_iteration_logging.py
++++ b/tests/v1/engine/test_iteration_logging.py
+@@ -36,9 +36,11 @@ def make_fake_engine(log_stats: bool = True, requests: dict | None = None):
+         vllm_config=SimpleNamespace(
+             observability_config=SimpleNamespace(
+                 enable_logging_iteration_details=True,
+-            )
++            ),
++            parallel_config=SimpleNamespace(data_parallel_rank=2),
+         ),
+         scheduler=SimpleNamespace(requests=requests or {}),
++        batch_queue_size=2,
+     )
+ 
+ 
+@@ -129,8 +131,12 @@ def test_alignment_iteration_preserves_speculative_progress(monkeypatch):
+         args[1] for args in records if args[0] == "VibeSimAlignmentIteration %s"
+     )
+     record = json.loads(encoded)
+-    assert record["schema_version"] == 4
++    assert record["schema_version"] == 5
+     assert record["iteration_index"] == scheduled.alignment_iteration_index == 0
++    assert record["forward_ordinal"] == scheduled.alignment_forward_ordinal == 0
++    assert record["is_dummy"] is False
++    assert record["dp_rank"] == 2
++    assert record["max_forwards_in_flight"] == 2
+     assert record["prefill_chunk_pairs"] == [[16, 2]]
+     assert record["decode_query_lens"] == [6]
+     assert record["decode_request_progress"] == [
+@@ -164,3 +170,59 @@ def test_alignment_zero_token_step_does_not_emit_an_iteration(monkeypatch, enabl
+     ) as observation:
+         assert observation == {}
+     assert records == []
++
++
++def _alignment_records(records):
++    return [
++        json.loads(args[1])
++        for args in records
++        if args[0] == "VibeSimAlignmentIteration %s"
++    ]
++
++
++def test_every_forward_takes_one_ordinal_dummies_included(monkeypatch):
++    """Real steps and DP dummy forwards share one per-rank forward count; a
++    0-token step runs no forward and takes none."""
++    records = []
++    monkeypatch.setattr(
++        "vllm.v1.engine.core.logger.info", lambda *args: records.append(args)
++    )
++    engine = make_fake_engine()
++    real = SimpleNamespace(total_num_scheduled_tokens=4)
++    EngineCore.assign_alignment_iteration_index(engine, real)
++    assert real.alignment_forward_ordinal == 0
++
++    empty = SimpleNamespace(total_num_scheduled_tokens=0, alignment_forward_ordinal=None)
++    EngineCore.assign_alignment_iteration_index(engine, empty)
++    assert empty.alignment_forward_ordinal is None
++    with EngineCore.log_dummy_forward(engine):
++        pass
++
++    later = SimpleNamespace(total_num_scheduled_tokens=1)
++    EngineCore.assign_alignment_iteration_index(engine, later)
++    assert later.alignment_iteration_index == 2
++    assert later.alignment_forward_ordinal == 2
++
++    (dummy,) = _alignment_records(records)
++    assert dummy["schema_version"] == 5
++    assert dummy["is_dummy"] is True
++    assert dummy["forward_ordinal"] == 1
++    assert dummy["iteration_index"] is None
++    assert dummy["dp_rank"] == 2
++    assert dummy["max_forwards_in_flight"] == 2
++    assert dummy["prefill_tokens"] == dummy["decode_requests"] == 0
++    assert dummy["prefill_chunk_pairs"] == dummy["decode_kv_lens"] == []
++    assert dummy["decode_query_lens"] == dummy["decode_request_progress"] == []
++    assert dummy["observed_end_monotonic_ns"] >= dummy["observed_start_monotonic_ns"]
++
++
++def test_dummy_forward_is_not_recorded_when_iteration_logging_is_off(monkeypatch):
++    records = []
++    monkeypatch.setattr(
++        "vllm.v1.engine.core.logger.info", lambda *args: records.append(args)
++    )
++    engine = make_fake_engine()
++    engine.vllm_config.observability_config.enable_logging_iteration_details = False
++    with EngineCore.log_dummy_forward(engine):
++        pass
++    assert records == []
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 28077633545a2932f43f07f1df0d0870ebb63571..1812001c808a953b43280dc370fc217368315c04 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -293,6 +293,11 @@ class SchedulerOutput:
+     # index in their per-phase NVTX ranges, while the EngineCore emits the
+     # matching structured model-input record after the iteration completes.
+     alignment_iteration_index: int | None = None
++    # EngineCore's count of model forwards it has launched, dummy DP forwards
++    # included; set only for a step that runs a forward (scheduled tokens > 0).
++    # Under data parallelism every rank runs exactly one forward per busy-loop
++    # pass while the wave runs, so equal ordinals name the same global step.
++    alignment_forward_ordinal: int | None = None
+ 
+     # Used for adjusting acceptance rate calculation.
+     num_invalid_spec_tokens: dict[str, int] | None = None
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 0b6ef79e7183c4ddff33082dec4f7420ce401038..8f1e846ac3a2651c3ded2221fd4e88c490624b6e 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -128,6 +128,13 @@ HANDSHAKE_TIMEOUT_MINS = 5
+ _R = TypeVar("_R")  # Return type for collective_rpc
+ 
+ 
++def _take_forward_ordinal(engine: Any) -> int:
++    """Next per-rank model-forward ordinal (real and DP dummy forwards alike)."""
++    ordinal = getattr(engine, "_next_alignment_forward_ordinal", 0)
++    engine._next_alignment_forward_ordinal = ordinal + 1
++    return ordinal
++
++
+ class EngineCore:
+     """Inner loop of vLLM's Engine."""
+ 
+@@ -686,9 +693,13 @@ class EngineCore:
+         )
+         if scheduler_output is not None:
+             alignment_record = {
+-                "schema_version": 4,
++                "schema_version": 5,
+                 "input_adapter": "vllm_text",
+                 "iteration_index": iteration_index,
++                "forward_ordinal": scheduler_output.alignment_forward_ordinal,
++                "is_dummy": False,
++                "dp_rank": self.vllm_config.parallel_config.data_parallel_rank,
++                "max_forwards_in_flight": getattr(self, "batch_queue_size", 1),
+                 "observed_start_monotonic_ns": observed_start_monotonic_ns,
+                 "observed_end_monotonic_ns": observed_end_monotonic_ns,
+                 "observed_elapsed_ms": observed_elapsed_ms,
+@@ -712,10 +723,61 @@ class EngineCore:
+     def assign_alignment_iteration_index(
+         self, scheduler_output: SchedulerOutput
+     ) -> None:
+-        """Attach one dispatch-order index shared by EngineCore logs and worker NVTX."""
++        """Attach one dispatch-order index shared by EngineCore logs and worker NVTX.
++
++        A step that will run a forward also takes the next forward ordinal; a
++        0-token step runs none (the DP loop then runs a dummy forward, which
++        takes the ordinal instead).
++        """
+         next_index = getattr(self, "_next_alignment_iteration_index", 0)
+         scheduler_output.alignment_iteration_index = next_index
+         self._next_alignment_iteration_index = next_index + 1
++        if scheduler_output.total_num_scheduled_tokens > 0:
++            scheduler_output.alignment_forward_ordinal = _take_forward_ordinal(self)
++
++    @contextmanager
++    def log_dummy_forward(self) -> Generator[None, None, None]:
++        """Record one DP dummy forward as a schema-5 alignment iteration record.
++
++        An idle DP rank runs a dummy forward on every busy-loop pass in which it
++        ran no real one, so that its EP/DP collectives pair with its peers'.
++        Recording it (no scheduled work, `is_dummy`) gives each rank one record
++        per forward, so the k-th forward of every rank can be joined by
++        `forward_ordinal` instead of by wall clock.
++        """
++        if not self.vllm_config.observability_config.enable_logging_iteration_details:
++            yield
++            return
++        forward_ordinal = _take_forward_ordinal(self)
++        observed_start_monotonic_ns = time.monotonic_ns()
++        yield
++        observed_end_monotonic_ns = time.monotonic_ns()
++        alignment_record = {
++            "schema_version": 5,
++            "input_adapter": "vllm_text",
++            "iteration_index": None,
++            "forward_ordinal": forward_ordinal,
++            "is_dummy": True,
++            "dp_rank": self.vllm_config.parallel_config.data_parallel_rank,
++            "max_forwards_in_flight": getattr(self, "batch_queue_size", 1),
++            "observed_start_monotonic_ns": observed_start_monotonic_ns,
++            "observed_end_monotonic_ns": observed_end_monotonic_ns,
++            "observed_elapsed_ms": (
++                observed_end_monotonic_ns - observed_start_monotonic_ns
++            )
++            / 1e6,
++            "prefill_tokens": 0,
++            "decode_requests": 0,
++            "decode_tokens_scheduled": 0,
++            "prefill_chunk_pairs": [],
++            "decode_kv_lens": [],
++            "decode_query_lens": [],
++            "decode_request_progress": [],
++        }
++        logger.info(
++            "VibeSimAlignmentIteration %s",
++            json.dumps(alignment_record, separators=(",", ":")),
++        )
+ 
+     @contextmanager
+     def capture_iteration_details(
+@@ -2847,7 +2909,10 @@ class DPEngineCoreProc(EngineCoreProc):
+                 # Execute a dummy pass when no ready requests ran, unless the
+                 # engine is sleeping.
+                 elif not self.model_executor.is_sleeping:
+-                    with self.capture_iteration_details(None) as iteration_details:
++                    with (
++                        self.capture_iteration_details(None) as iteration_details,
++                        self.log_dummy_forward(),
++                    ):
+                         self.execute_dummy_batch()
+                     if iteration_details is not None and not self.has_coordinator:
+                         stats = self._make_iteration_details_stats(iteration_details)

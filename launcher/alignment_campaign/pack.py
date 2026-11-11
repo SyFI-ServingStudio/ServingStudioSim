@@ -29,6 +29,16 @@ The split that matters inside a case is **authored** versus **calibrated**.
 workload-only startup log and `rate` off a saturation sweep. A calibrated field
 is a mapping (`value` + `status` + `derived_from`) rather than a bare scalar, so
 re-rendering on a different machine cannot silently reuse a stale KV budget.
+`attn_gpu_memory_gb`, `speculative_acceptance` and
+`speculative_acceptance_by_output_position` may instead say
+`{status: from_capture}`: the value is read from the case's own workload pass
+when its simulation is rendered (`calibration.py`), never typed into the pack.
+
+A case belongs to **alignment Phase 1** (`phase: 1`) or **alignment Phase 2**
+(the default). Phase 1 is the per-deployment `diverse_100` check that gates a
+model PR; Phase 2 is the full matrix, Phase 1 cases included. The verbs'
+`--alignment-phase 1` selects the Phase 1 cases; `--alignment-phase 2`, like
+omitting it, selects every case.
 """
 
 from __future__ import annotations
@@ -58,7 +68,35 @@ TRACE_ROLES = frozenset({"kernel", "workload"})
 #: preflight run; `provisional` is a placeholder that preflight has not replaced
 #: yet. Recording a golden over provisional inputs is possible but must be said
 #: out loud (`compare --record --accept-provisional`).
-CALIBRATION_STATUSES = frozenset({"measured", "provisional"})
+CALIBRATION_STATUSES = frozenset({"measured", "provisional", "from_capture"})
+
+#: `from_capture`: the case's own workload pass is the measurement. The pack
+#: names no value; rendering the simulation reads it (`calibration.py`) and
+#: records it with its source in `<case_dir>/calibration.json`. Only fields
+#: with an extractor may say so.
+FROM_CAPTURE = "from_capture"
+CAPTURE_FIELDS = (
+    "attn_gpu_memory_gb",
+    "speculative_acceptance",
+    "speculative_acceptance_by_output_position",
+)
+KV_POOL_RULE = (
+    "the workload pass's server log: the smallest rank's vLLM `Extended KV cache to N blocks "
+    "(X GiB)`, else `Available KV cache memory: X GiB`; X * 2**30 / 1e9 GB"
+)
+ACCEPTANCE_RULE = (
+    "the workload pass's spec_decode_metrics.json: accepted_tokens_per_position[0] / "
+    "num_drafts, then accepted[k] / accepted[k-1]"
+)
+BY_POSITION_RULE = (
+    "the workload pass's metrics_jsonl decode_request_progress: per bucket of "
+    "output_tokens_before, the distribution of accepted drafts 0..K per verify round "
+    "(calibration.buckets_from_metrics)"
+)
+
+#: `phase` values a case may declare: alignment Phase 1 (the per-deployment
+#: merge check) or alignment Phase 2 (the full matrix, the default).
+ALIGNMENT_PHASES = (1, 2)
 
 
 class PackError(ValueError):
@@ -91,6 +129,12 @@ class Calibrated:
     def provisional(self) -> bool:
         return self.status == "provisional"
 
+    @property
+    def from_capture(self) -> bool:
+        """Still to be read from the case's workload pass. A resolved value is
+        `measured` (`calibration.resolve_case`), so this is False after it."""
+        return self.status == FROM_CAPTURE
+
 
 @dataclass(frozen=True)
 class TraceSpec:
@@ -104,15 +148,33 @@ class TraceSpec:
     are replayed against one server: a kernel trace writes `<slug>-nsys-0000`.
     The IDs are in the bytes the accepted captures replayed, and the request
     audit joins on them, so they are data, not something to normalize away.
+
+    `path` instead names a tracked, repo-relative CSV (`trace/diverse_100.csv`)
+    that is replayed byte for byte, ids and recorded arrival times included.
+    `file` is then that path, so its sha256 is checked against the same record.
     """
 
     file: str
     shapes: tuple[tuple[int, int], ...]
     repeats: int
     id_suffix: str | None = None
+    path: str | None = None
+
+    @property
+    def tracked(self) -> bool:
+        return self.path is not None
+
+    @property
+    def source(self) -> Path:
+        """The tracked CSV on disk; only for a `path` trace."""
+        assert self.path is not None
+        return REPO_ROOT / self.path
 
     @property
     def request_count(self) -> int:
+        if self.path is not None:
+            with self.source.open(encoding="utf-8") as handle:
+                return max(0, sum(1 for line in handle if line.strip()) - 1)
         return len(self.shapes) * self.repeats
 
 
@@ -154,6 +216,11 @@ class Variant:
     #: own checkpoint. Rendering writes its path into `--speculative-config`, so
     #: the pack never carries a machine's HF cache path.
     draft_checkpoint: str | None = None
+    #: `alignment profile`'s `prewarm` block, rendered into the timed passes
+    #: (nsys, workload_metrics): requests that compile per-shape kernels before
+    #: measurement. Lengths are this variant's choice, e.g. its kernels' M buckets
+    #: up to its chunk size.
+    prewarm: dict[str, Any] | None = None
 
     def pass_named(self, name: str) -> ProfilePass | None:
         for item in self.profile_passes:
@@ -196,6 +263,10 @@ class Case:
     #: request's declared output length crosses into that request's chain, so
     #: short and long requests stop sharing one token-weighted chain.
     speculative_acceptance_by_output_position: Calibrated | None = None
+    #: 1 for an alignment Phase 1 case (the per-deployment diverse_100 merge
+    #: check), 2 otherwise. Alignment Phase 2 is the full matrix, Phase 1 cases
+    #: included.
+    phase: int = 2
 
     @property
     def slug(self) -> str:
@@ -216,6 +287,11 @@ class Case:
             )
         return found
 
+    @property
+    def capture_fields(self) -> dict[str, Calibrated]:
+        """Calibrated fields still to be read from this case's workload pass."""
+        return {name: value for name, value in self.calibrated_fields.items() if value.from_capture}
+
     def trace_for(self, role: str) -> TraceSpec:
         """The trace a pass with this role drives. A case with no bounded kernel
         trace profiles kernels from its full workload trace, which is what cases
@@ -223,6 +299,21 @@ class Case:
         if role == "kernel" and self.kernel_trace is not None:
             return self.kernel_trace
         return self.workload_trace
+
+
+@dataclass(frozen=True)
+class AcceptanceStructure:
+    """A pack-level admission that its speculative cases carry only the
+    case-wide acceptance chain, with the reason their captures cannot give the
+    by-output-position buckets. `check` then warns instead of failing; a pack
+    without this declaration gets the error."""
+
+    status: str  # LEGACY_SINGLE_CHAIN
+    reason: str
+
+
+#: The one `acceptance_structure.status`: speculative cases use one chain.
+LEGACY_SINGLE_CHAIN = "legacy_single_chain"
 
 
 @dataclass(frozen=True)
@@ -244,6 +335,7 @@ class Pack:
     so no case is judged against a factor fitted to itself; `derived_from` and
     `evidence` name that report. Each case's own recommendation stays a reported
     metric and is never read back."""
+    acceptance_structure: AcceptanceStructure | None = None
 
     def case_named(self, slug_or_index: str) -> Case | None:
         for case in self.cases:
@@ -253,6 +345,11 @@ class Pack:
 
     def variant_of(self, case: Case) -> Variant:
         return self.variants[case.variant]
+
+    @property
+    def phase1_cases(self) -> tuple[Case, ...]:
+        """The alignment Phase 1 cases: one diverse_100 run per deployment."""
+        return tuple(case for case in self.cases if case.phase == 1)
 
     @property
     def provisional_fields(self) -> list[str]:
@@ -337,13 +434,28 @@ def _typed(value: Any, kind: type | tuple[type, ...], where: str) -> Any:
     return value
 
 
-def _calibrated(raw: Any, where: str) -> Calibrated:
+def _calibrated(raw: Any, where: str, *, capture_rule: str | None = None) -> Calibrated:
+    """`capture_rule` is how the field is read from a workload pass; a field
+    without one cannot be `from_capture`."""
     if not isinstance(raw, dict):
         raise PackError(
             f"{where}: a calibrated field must be a mapping with 'value', 'status' and "
             f"'derived_from' (got {raw!r}); a bare scalar would hide where it came from"
         )
     body = dict(raw)
+    if body.get("status") == FROM_CAPTURE:
+        if capture_rule is None:
+            raise PackError(
+                f"{where}.status {FROM_CAPTURE!r} is only supported for {list(CAPTURE_FIELDS)}"
+            )
+        body.pop("status")
+        if body:
+            raise PackError(
+                f"{where}: a {FROM_CAPTURE} field is just `{{status: {FROM_CAPTURE}}}`; the "
+                f"value and its source are read from the workload pass, so "
+                f"{sorted(body)} would never be used"
+            )
+        return Calibrated(value=None, status=FROM_CAPTURE, derived_from=capture_rule)
     value = _require(body, "value", where)
     status = _require(body, "status", where)
     derived_from = _require(body, "derived_from", where)
@@ -384,10 +496,24 @@ def _check_acceptance_buckets(buckets: Any, depth: int, where: str) -> None:
         previous = start
 
 
+def _tracked_trace(body: dict, where: str) -> TraceSpec:
+    path = _typed(body.pop("path"), str, f"{where}.path")
+    _reject_extra(body, where)
+    relative = Path(path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise PackError(f"{where}.path must be repo-relative, e.g. trace/diverse_100.csv")
+    if not (REPO_ROOT / relative).is_file():
+        raise PackError(f"{where}.path {path!r} is not a file in the repository")
+    return TraceSpec(file=path, shapes=(), repeats=1, path=path)
+
+
 def _trace_spec(raw: Any, where: str) -> TraceSpec:
     if not isinstance(raw, dict):
         raise PackError(f"{where}: must be a mapping")
     body = dict(raw)
+    if "path" in body:
+        # A tracked file is the trace; nothing generates it.
+        return _tracked_trace(body, where)
     file_name = _typed(_require(body, "file", where), str, f"{where}.file")
     shapes_raw = _require(body, "shapes", where)
     repeats = _typed(body.pop("repeats", 1), int, f"{where}.repeats")
@@ -475,6 +601,11 @@ def _variant(name: str, raw: Any) -> Variant:
             if (draft_checkpoint := body.pop("draft_checkpoint", None)) is None
             else _typed(draft_checkpoint, str, f"{where}.draft_checkpoint")
         ),
+        prewarm=(
+            None
+            if (prewarm := body.pop("prewarm", None)) is None
+            else dict(_typed(prewarm, dict, f"{where}.prewarm"))
+        ),
     )
     _reject_extra(body, where)
     if len({item.name for item in variant.profile_passes}) != len(variant.profile_passes):
@@ -498,6 +629,12 @@ def _case(raw: Any, index_hint: int) -> Case:
     rate_raw = body.pop("rate", None)
     kernel_raw = body.pop("kernel_trace", None)
     window_raw = body.pop("analyze_iterations", None)
+    phase = body.pop("phase", 2)
+    if type(phase) is not int or phase not in ALIGNMENT_PHASES:
+        raise PackError(
+            f"{where}.phase must be 1 (alignment Phase 1) or 2 (alignment Phase 2, the "
+            f"default), got {phase!r}"
+        )
     window: tuple[int, int] | None = None
     if window_raw is not None:
         if (
@@ -554,36 +691,51 @@ def _case(raw: Any, index_hint: int) -> Case:
             None if kernel_raw is None else _trace_spec(kernel_raw, f"{where}.kernel_trace")
         ),
         attn_gpu_memory_gb=_calibrated(
-            _require(body, "attn_gpu_memory_gb", where), f"{where}.attn_gpu_memory_gb"
+            _require(body, "attn_gpu_memory_gb", where),
+            f"{where}.attn_gpu_memory_gb",
+            capture_rule=KV_POOL_RULE,
         ),
         rate=(None if rate_raw is None else _calibrated(rate_raw, f"{where}.rate")),
         provenance=dict(body.pop("provenance", {}) or {}),
         chunk_size=None if chunk_size_raw is None else _typed(chunk_size_raw, int, f"{where}.chunk_size"),
         speculative_acceptance=None if acceptance_raw is None else _calibrated(
-            acceptance_raw, f"{where}.speculative_acceptance"
+            acceptance_raw, f"{where}.speculative_acceptance", capture_rule=ACCEPTANCE_RULE
         ),
         speculative_acceptance_by_output_position=None if by_position_raw is None else _calibrated(
-            by_position_raw, f"{where}.speculative_acceptance_by_output_position"
+            by_position_raw,
+            f"{where}.speculative_acceptance_by_output_position",
+            capture_rule=BY_POSITION_RULE,
         ),
+        phase=phase,
     )
     _reject_extra(body, where)
     if case.chunk_size is not None and case.chunk_size <= 0:
         raise PackError(f"{where}.chunk_size must be positive")
-    if case.speculative_acceptance is not None:
+    if case.speculative_acceptance is not None and not case.speculative_acceptance.from_capture:
         probabilities = case.speculative_acceptance.value
         if not isinstance(probabilities, list) or not probabilities or any(
             type(value) not in (int, float) or not 0 <= value <= 1 for value in probabilities
         ):
             raise PackError(f"{where}.speculative_acceptance.value must be a non-empty probability list")
-    if case.speculative_acceptance_by_output_position is not None:
-        if case.speculative_acceptance is None:
-            raise PackError(
-                f"{where}: speculative_acceptance_by_output_position refines speculative_acceptance "
-                "and needs it"
-            )
+    by_position = case.speculative_acceptance_by_output_position
+    if by_position is not None and case.speculative_acceptance is None:
+        raise PackError(
+            f"{where}: speculative_acceptance_by_output_position refines speculative_acceptance "
+            "and needs it"
+        )
+    if by_position is not None and not by_position.from_capture:
+        buckets = case.speculative_acceptance_by_output_position.value
+        depth = (
+            # The chain arrives with the capture; render checks it against this.
+            len(buckets[0]["p"]) - 1
+            if case.speculative_acceptance.from_capture
+            and isinstance(buckets, list) and buckets and isinstance(buckets[0], dict)
+            and isinstance(buckets[0].get("p"), list) and buckets[0]["p"]
+            else len(case.speculative_acceptance.value or ())
+        )
         _check_acceptance_buckets(
-            case.speculative_acceptance_by_output_position.value,
-            len(case.speculative_acceptance.value),
+            buckets,
+            depth,
             f"{where}.speculative_acceptance_by_output_position.value",
         )
 
@@ -602,7 +754,20 @@ def _case(raw: Any, index_hint: int) -> Case:
             f"{where}: rate rescales the trace arrival timeline, which arrival_mode "
             "'saturated' discards; set one or the other"
         )
-    if profile_mode == "trace-timed" and case.rate is None:
+    if case.workload_trace.tracked and case.rate is not None:
+        # The two sides read `rate` differently: req-frontend rescales recorded
+        # arrivals by trace_rate/rate, the simulator divides arrival_time by
+        # request_rate. Equal only for a 1 req/s timeline, which a recorded
+        # trace is not, so the same pack would replay two different loads.
+        raise PackError(
+            f"{where}: a tracked workload_trace replays its recorded arrivals; drop "
+            "rate (req-frontend scales by trace_rate/rate, the simulator by 1/rate, "
+            "so the two sides would run different loads)"
+        )
+    if profile_mode == "trace-timed" and case.rate is None and not case.workload_trace.tracked:
+        # A generated trace is a 1 req/s placeholder timeline, so it needs a
+        # calibrated rate. A tracked trace carries recorded arrivals, which
+        # both sides replay at scale 1.
         raise PackError(f"{where}: trace-timed arrival needs a rate")
     return case
 
@@ -627,7 +792,12 @@ def load_pack(root: Path) -> Pack:
     variants_raw = _typed(_require(raw, "variants", where), dict, f"{where}.variants")
     cases_raw = _require(raw, "cases", where)
     multiplier_raw = raw.pop("gpu_time_multiplier", None)
+    structure_raw = raw.pop("acceptance_structure", None)
     _reject_extra(raw, where)
+    structure = (
+        None if structure_raw is None
+        else _acceptance_structure(structure_raw, f"{where}.acceptance_structure")
+    )
     multiplier = None
     if multiplier_raw is not None:
         multiplier = _calibrated(multiplier_raw, f"{where}.gpu_time_multiplier")
@@ -653,7 +823,24 @@ def load_pack(root: Path) -> Pack:
         acceptance=acceptance,
         recorded_on=recorded_on,
         gpu_time_multiplier=multiplier,
+        acceptance_structure=structure,
     )
+
+
+def _acceptance_structure(raw: Any, where: str) -> AcceptanceStructure:
+    if not isinstance(raw, dict) or set(raw) != {"status", "reason"}:
+        raise PackError(f"{where} must be a mapping with exactly 'status' and 'reason'")
+    if raw["status"] != LEGACY_SINGLE_CHAIN:
+        raise PackError(
+            f"{where}.status must be {LEGACY_SINGLE_CHAIN!r}, got {raw['status']!r}"
+        )
+    reason = raw["reason"]
+    if not isinstance(reason, str) or not reason.strip():
+        raise PackError(
+            f"{where}.reason must say why the captures cannot give acceptance by "
+            "output position"
+        )
+    return AcceptanceStructure(status=raw["status"], reason=reason.strip())
 
 
 def load_host(path: Path) -> HostProfile:

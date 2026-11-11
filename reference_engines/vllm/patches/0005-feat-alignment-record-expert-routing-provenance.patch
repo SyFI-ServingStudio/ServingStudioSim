@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Tue, 4 Aug 2026 15:27:48 +0000
+Subject: [PATCH] feat(alignment): record expert-routing provenance
+
+---
+ vllm/distributed/eplb/eplb_state.py | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/distributed/eplb/eplb_state.py b/vllm/distributed/eplb/eplb_state.py
+index fa328692a558ef000a8966bafc4d4ef5df64d512..e4ee8505a95fcc75feac0b2a4eac5f5e360d7d4d 100644
+--- a/vllm/distributed/eplb/eplb_state.py
++++ b/vllm/distributed/eplb/eplb_state.py
+@@ -188,6 +188,8 @@ class EplbModelState:
+     last_expert_load: torch.Tensor
+     """Global logical-expert totals from the last reshuffle; equal demand initially."""
+     model_name: str
++    experts_per_token: int
++    """Number of routed experts selected for each input token."""
+     model: MixtureOfExperts
+     expert_buffer: list[torch.Tensor]
+     """
+@@ -520,6 +522,11 @@ class EplbState:
+             logical_replica_count,
+         )
+         self._propagate_shared_tensors(model, num_unpadded_tokens_tensors)
++        experts_per_token_values = {layer.top_k for layer in model.moe_layers}
++        assert len(experts_per_token_values) == 1, (
++            "all EPLB-managed MoE layers must use the same experts_per_token"
++        )
++        experts_per_token = experts_per_token_values.pop()
+ 
+         backend = self.parallel_config.eplb_config.communicator
+         assert backend is not None, (
+@@ -553,6 +560,7 @@ class EplbState:
+                 device=self.device,
+             ),
+             model_name=model_name or model_config.model,
++            experts_per_token=experts_per_token,
+             model=model,
+             expert_buffer=expert_buffer,
+             rebalanced=False,
+@@ -689,9 +697,11 @@ class EplbState:
+                         1, physical_to_logical.long(), expert_load_pass
+                     )
+                     alignment_record = {
+-                        "schema_version": 1,
++                        "schema_version": 2,
+                         "model": eplb_model_state.model_name,
+                         "eplb_step": self.expert_rearrangement_step,
++                        "expert_parallel_size": ep_group.size(),
++                        "experts_per_token": eplb_model_state.experts_per_token,
+                     }
+                     alignment_records.append(
+                         (

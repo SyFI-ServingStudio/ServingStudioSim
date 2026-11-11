@@ -36,6 +36,7 @@ from profiling.db.args import KernelArgs
 from profiling.db.batch import ProfileProvenance
 from profiling.db.registry import KernelProfilerSpec, iter_kernel_profiler_specs
 from profiling.db.table import MissingEntry
+from profiling.exec.local import set_allow_autotune
 from profiling.facade import run_kind_times
 from profiling.gpu_catalog import resolve_gpu_spec
 from profiling.profilers.energy import energy_enabled, set_energy_enabled
@@ -92,6 +93,15 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
                 help=(
                     "Measure all specs like --force but insert nothing: "
                     "report the rows and leave profile.db untouched."
+                ),
+            )
+            command_parser.add_argument(
+                "--allow-autotune",
+                action="store_true",
+                help=(
+                    "Let --force/--fresh tune kernel tactics. Without it a refresh "
+                    "measures under the persisted tactics and fails before any worker "
+                    "starts when a spec has none (a jit-fill run always may tune)."
                 ),
             )
             command_parser.add_argument(
@@ -431,6 +441,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # clobber an inherited VIBESIM_PROFILE_ENERGY=0.
     if args.energy is not None:
         set_energy_enabled(args.energy)
+    set_allow_autotune(args.allow_autotune)
     # --force and --fresh both re-measure every spec; only --force keeps the rows.
     measure_all = args.force or args.fresh
     mode = "fresh" if args.fresh else "force-refresh" if args.force else "jit-fill"

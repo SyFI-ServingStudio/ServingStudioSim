@@ -19,6 +19,27 @@ tactics an earlier process already had.
 
 This skill is about getting that time back. Reuse the work; do not rebuild it.
 
+## Autotuning is off in measurements
+
+A capture and an L1 refresh never tune: `VIBESIM_AUTOTUNE=forbid`, set by the
+parent, and an engine-image process that tries raises `AutotuneForbidden` and
+stops. The table, the preflight and the guard are in
+`reference_engines/README.md#autotuning`. In practice:
+
+- Before the first capture of a deployment (model, GPU count, server config,
+  runtime environment) on a GPU type, run
+  `just ref warm-caches <engine> <profile.yaml>` in the GPU job. Without its
+  manifest the capture fails before the container starts. A warm-up is slower
+  to reach ready than a capture; give it `--startup-timeout SECONDS` rather
+  than raising the capture config's deadline.
+- An L1 `--force`/`--fresh` needs every spec's tactic file; fill the rows by
+  jit-fill first (it may tune, and logs `[autotune]` lines per kernel), or pass
+  `--allow-autotune`. KDA rows that pin Triton selections always need the flag.
+- "manifest/actual mismatch" means the warm-up and the run differ in something
+  the manifest key does not hold. Find it and add it to
+  `alignment/warm_caches.py:deployment_key`; do not answer it with
+  `--allow-autotune`.
+
 ## Know which cache you are talking about
 
 They persist differently, so do not treat them as one thing.
@@ -28,23 +49,26 @@ They persist differently, so do not treat them as one thing.
 | FlashInfer JIT `.so` | first use of a module | prebuilt `flashinfer-jit-cache` wheel, else `~/.cache/flashinfer` | yes, if the wheel is pinned |
 | FlashInfer autotune tactics | first call per **process** | `profiling/runners/autotune_cache.py` | only where a runner wraps it |
 | Triton compiled binaries | first launch per shape key | `TRITON_CACHE_DIR` | yes |
-| `triton.autotune` **selections** | first launch per **process** | nothing | **no** |
+| `triton.autotune` **selections** | first launch per **process** per key | `TRITON_CACHE_DIR`, only with `TRITON_CACHE_AUTOTUNING=1` and no `pre_hook` | only then |
 | torch.compile / inductor | first compiled graph | `TORCHINDUCTOR_CACHE_DIR`, vLLM's `VLLM_CACHE_ROOT` | yes |
 | deep_gemm JIT | `just sync` on a cold uv cache | uv caches the built wheel by commit | yes |
 | CUDA graph capture | every engine start | nothing | no, always paid |
 
-The trap is the two `autotune` rows. `TRITON_CACHE_DIR` persists *compilation*,
-not *which config was selected* — `triton.autotune` re-benchmarks its config list
-in every new process, and there is no persistent equivalent. Setting
-`TRITON_CACHE_DIR` does not buy that search back.
+The trap is the two `autotune` rows. `TRITON_CACHE_DIR` persists *compilation*;
+*which config was selected* persists only under `TRITON_CACHE_AUTOTUNING=1`
+(vLLM sets it, and so does the autotune guard unless a row sets it otherwise),
+and never for a config list with a `pre_hook`. Without it `triton.autotune`
+re-benchmarks its config list in every new process.
 
 ## Restarting a serving engine
 
-Make compilation a setup failure, not a startup cost. The pinned SGLang profile
-in `alignment/profiler/README.md` already does this: it declares the prebuilt
-FlashInfer jit-cache wheel and sets `FLASHINFER_DISABLE_JIT: "1"`, so a missing
-module fails **before model weights load** instead of compiling while the server
-comes up. Copy that shape for any engine you restart repeatedly.
+Make slow compilation a setup cost paid once, not a per-start cost. Ship
+nvcc-built modules prebuilt (the SGLang image adds FlashInfer's jit-cache and
+builds `tinygemm2` into it) and keep the compile caches outside the worktree.
+Do not set `FLASHINFER_DISABLE_JIT=1`: it also refuses shape-specialized CuTe-DSL
+kernels (e.g. SGLang's NVFP4 quantize on SM100), which can only compile on a GPU
+at first use and take under a second each. Autotuning is the expensive part; the
+reference images refuse it outside `warm-caches` (`reference_engines/README.md`).
 
 - Point `VLLM_CACHE_ROOT` / `TORCHINDUCTOR_CACHE_DIR` / `TRITON_CACHE_DIR` at a
   path that outlives the run and is **not inside a worktree** — a worktree-local
@@ -80,10 +104,10 @@ What it does, and the parts that bite:
   persistence and the run still succeeds. So **check the file appeared** rather
   than assuming the tax is gone.
 - **Container workers already have it.** `HOME=/cache/home` is bind-mounted from
-  the host cache dir; nothing extra to mount.
-- Right now only `profiling/runners/moe/nvfp4_fused_moe.py` wraps it. Any other
-  FlashInfer-autotuned runner is still paying per process — wrapping one is a
-  small change with a large return.
+  the host cache dir, `~/.cache/vibesim-profiler/<engine>-<base digest[:12]>-sm<cc>`
+  for an engine image (one per tag for the others); nothing extra to mount.
+- **Name the file in `profiling/runners/tactic_labels.py`** and set the row's
+  `tactic_label` to it, so a refresh's preflight can check the file exists.
 
 ## When you must invalidate by hand
 

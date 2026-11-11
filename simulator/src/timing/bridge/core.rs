@@ -10,11 +10,13 @@ use crate::timing::bridge::{
     PerfApiError, ProfilerVersion,
 };
 
-/// One kernel's profile-coverage line for the `dry-run` report: how many of its
-/// enumerated specs are missing from `profile.db` (i.e. would be JIT-profiled on a
-/// real build). `name` is the kernel's dotted path; counts are summed over its
-/// backends. Shared profile identities count only at their first role in a
-/// dry-run report, matching the number of rows JIT would need to measure.
+/// One kernel's profile-coverage line for a dry-run report (the `dry-run` and
+/// `timing-predict --dry-run` probes, and the collect walk of
+/// [`fill_missing_profiles`]): how many of its enumerated specs are missing from
+/// `profile.db`, i.e. would be collected and measured before a real build.
+/// `name` is the kernel's dotted path; counts are summed over its backends.
+/// Shared profile identities count only at their first role in a dry-run
+/// report, matching the number of rows the collect fill would need to measure.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct KernelMissing {
     pub name: String,
@@ -142,7 +144,7 @@ pub fn print_dry_run(report: &[KernelMissing]) {
     let missing: usize = report.iter().map(|k| k.missing).sum();
     let total: usize = report.iter().map(|k| k.total).sum();
     println!(
-        "total: {missing} / {total} specs missing across {} kernels to JIT",
+        "total: {missing} / {total} specs missing across {} kernels, to collect and measure",
         report.len()
     );
 }
@@ -156,6 +158,60 @@ pub fn write_dry_run_report(
     use anyhow::Context;
     let text = serde_json::to_string(document).expect("dry-run report serializes");
     std::fs::write(path, text).with_context(|| format!("writing dry-run report {}", path.display()))
+}
+
+/// Measure every `profile.db` row a build is missing in one collect pass, so
+/// the caller's next build — on a fresh, JIT-off bridge — finds every row.
+///
+/// `walk` runs the caller's build cascade on a dry-run bridge with the Python
+/// collector open: each kernel's `count_missing` records its absent specs
+/// instead of only counting them, no cache is fitted, and nothing is measured.
+/// `issue_collected` then measures every recorded spec, one whole
+/// `(kind, backend)` unit per GPU. On-demand JIT instead profiled node by node,
+/// so one kind was profiled once per cost-tree node that used it, each call
+/// fanned across the GPUs and joined; an instrumented tp4/ep4/spec5 fill did
+/// the same 6308 rows in 2595 GPU-seconds collected versus 6256 on demand (see
+/// `profiling/plan.py`).
+///
+/// The plan (one line per kernel with missing specs) is printed before any GPU
+/// time is spent. A walk with nothing missing needs no GPU; under
+/// `SERVINGSTUDIO_NO_GPU`, a walk with something missing fails in
+/// `issue_collected` before any GPU work starts.
+///
+/// Every command that fills the cache before building for real goes through
+/// here (`build-cache-only`, `timing-predict`). The walk's bridge is created
+/// and dropped inside on purpose: it stays in dry-run mode with empty caches,
+/// so nothing built on it may be evaluated.
+pub fn fill_missing_profiles(
+    walk: impl FnOnce(&PerfApiBridge) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+    bridge.enable_dry_run();
+    bridge
+        .begin_collect()
+        .context("starting the profiling collect pass")?;
+    walk(&bridge)?;
+
+    // The plan is worth printing before spending GPU time on it: this is the
+    // point at which a grid that quietly grew by an order of magnitude is still
+    // cheap to notice.
+    let report = bridge.take_dry_run_report();
+    let total_missing: usize = report.iter().map(|kernel| kernel.missing).sum();
+    let total_specs: usize = report.iter().map(|kernel| kernel.total).sum();
+    println!(
+        "cache build plan: {} kernels, {total_missing} / {total_specs} specs missing",
+        report.len()
+    );
+    for kernel in report.iter().filter(|kernel| kernel.missing > 0) {
+        println!("{kernel}");
+    }
+    // Called even at zero: it clears the collector and reports the no-op, and
+    // an early return here would leave the collector installed.
+    bridge
+        .issue_collected(total_missing)
+        .context("measuring the collected profiling work")?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -489,10 +545,11 @@ impl PerfApiBridge {
         self.call_perf_api_void("disable_jit_profiling")
     }
 
-    /// Re-enable JIT profiling. Used by the `--build-cache-only` entry point
-    /// (L1 design.md §7.2): Rust main flips this back on *before* calling any
-    /// `*Kernel::build`, so missing specs are profiled into the DB on demand
-    /// instead of erroring out.
+    /// Re-enable JIT profiling, so missing specs are profiled into the DB on
+    /// demand instead of erroring out. Flip it on *before* calling any
+    /// `*Kernel::build`. Only the single-kernel `kernel-query` paths use it; a
+    /// whole-model build fills its misses up front with
+    /// [`fill_missing_profiles`] instead.
     pub fn enable_jit_profiling(&self) -> Result<(), PerfApiError> {
         self.call_perf_api_void("enable_jit_profiling")
     }

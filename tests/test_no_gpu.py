@@ -168,3 +168,41 @@ def test_a_warm_cache_prebuild_runs_beside_a_running_simulation(no_gpu, monkeypa
         )
 
     assert ok is True
+
+
+@pytest.mark.needs_binary
+def test_a_cold_timing_predict_collects_every_miss_before_it_builds(no_gpu, tmp_path, sim_bin):
+    """A cold prediction measures its misses in one collect pass before the real
+    build. Under `--no-gpu` it therefore fails in `issue_collected`, after the
+    whole model's plan is printed, rather than on the first kernel that a
+    build-time JIT would have tried to profile."""
+    import json
+    import subprocess
+
+    from launcher.exec import REPO_ROOT, _build_subprocess_env
+    from profiling.gpu_policy import GPU_DISABLED_MARKER
+
+    preset = json.loads((REPO_ROOT / "presets/predict_llama3_8b_iter.json").read_text())
+    preset["cases_file"] = str(REPO_ROOT / "presets" / preset["cases_file"])
+    preset["log_dir"] = str(tmp_path / "out")
+    config_path = tmp_path / "predict.json"
+    config_path.write_text(json.dumps(preset))
+    error_path = tmp_path / "error.json"
+    environment = _build_subprocess_env()
+    environment["VIBESIM_PROFILE_DB"] = str(tmp_path / "empty.db")
+
+    result = subprocess.run(
+        [str(sim_bin), "timing-predict", str(config_path), "--error-json", str(error_path)],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    assert result.returncode != 0
+    assert "cache build plan:" in result.stdout
+    error = json.loads(error_path.read_text())["error"]
+    assert "missing profile.db spec(s)" in error
+    assert GPU_DISABLED_MARKER in error
+    assert not (tmp_path / "out" / "raw" / "cost_log").exists()

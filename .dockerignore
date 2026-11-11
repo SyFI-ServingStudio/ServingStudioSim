@@ -15,4 +15,7 @@ profiling/profile.db
 *.pftrace
 trace
 alignment/load_generator
-alignment/profiler/sglang
+!alignment/load_generator/req-frontend
+**/target
+# Materialized engine trees; images apply reference_engines/*/patches instead.
+reference_engines/*/src

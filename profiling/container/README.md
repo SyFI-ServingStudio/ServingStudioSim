@@ -7,22 +7,25 @@ names their tags:
 | Image | Profile envs | Holds |
 | --- | --- | --- |
 | `default` | `default_env`, `flashinfer_pip_env`, `causal_conv1d_env` | the project's `profiling` group from `uv.lock` (Torch 2.10 cu128, FlashInfer 0.6, Triton, NVSHMEM, DeepGEMM), plus the causal-conv1d wheel |
-| `vllm` | `vllm_env` | CUDA 13.0, the alignment vLLM checkout at its gitlink on the precompiled wheel of its upstream base (with the FlashKDA build it vendors as `_flashkda_C`), every FlashInfer cubin |
-| `sglang` | `sglang_env` | CUDA 13.0, the alignment SGLang checkout at its gitlink with the `sglang-kernel` and FlashInfer 0.6.15.post1 builds it pins |
+| `vllm` | `vllm_env` | the vLLM reference engine (`reference_engines/vllm`): vLLM's official image pinned by digest, with the patches applied to its installed vLLM. Also runs vLLM alignment captures |
+| `sglang` | `sglang_env` | the SGLang reference engine (`reference_engines/sglang`): SGLang's official image pinned by digest, with the patches applied to its checkout, plus `nvtx`. Also runs SGLang alignment captures |
 | `flashinfer-kda` | `flashinfer_kda_env` | FlashInfer's KDA nightly, Torch 2.11 cu130, TVM/TIRx (`requirements/flashinfer_kda.txt`) |
 
 ```bash
 just profile-container-build              # every image
-just profile-container-build vllm sglang  # some of them
+just profile-container-build default      # some of them
+just ref build-image vllm                 # an engine image (reference_engines/README.md)
 uv run python -m profiling.container.images list           # tag and envs of each
 uv run python -m profiling.container.images env vllm_env   # the tag one env uses
 ```
 
-A tag is a hash of the Dockerfile, the files it copies into its dependency
-layers, and the gitlink of each alignment checkout it installs. A checkout with
-the same inputs names the same image, and a host that has the tag has the
-image. The build refuses an alignment checkout that is not at its gitlink or has
-uncommitted changes, so the tag never names something else. The commit that
+A tag is a hash of the Dockerfile, the files it copies into its layers (an
+engine's `BASE` and every patch), the gitlink of each submodule it builds, and
+the pinned image it starts `FROM` (an engine's official image at this host's
+platform digest). A checkout with the same inputs names the same image, and a
+host that has the tag has the image. The build refuses a submodule that is not
+at its gitlink or has uncommitted changes, so the tag never names something
+else. The commit that
 built the image is only a label, written last, so a new commit reuses every
 dependency layer. Images are never pulled: a registry copy under the same tag
 could be any build. `VIBESIM_PROFILE_IMAGES` (a JSON object, env name -> tag)
@@ -31,13 +34,20 @@ git to compute them from.
 
 Workers overlay the checkout's `profiling/`, `launcher/` and `gpu/` read-only,
 so a code change never rebuilds an image; the copy baked in at build time only
-serves the image's self-check. Workers run with `--network none` (the vLLM
-image therefore downloads every FlashInfer cubin at build time) and get a
-temporary JSON exchange directory and a persistent JIT cache at `/cache`: one
-directory per image tag under `VIBESIM_PROFILE_CACHE_DIR` (default
-`~/.cache/vibesim-profiler`), since Torch extensions, Triton and FlashInfer
-builds link that image's libraries. A use touches its directory, and an
-earlier tag's directory of the same image unused for 30 days is removed.
+serves the image's self-check. A worker names its interpreter and module
+(`--entrypoint`, `Image.python`), never relying on the image's own entrypoint,
+since an engine image runs captures on another interpreter. Workers run with
+`--network none` (the engine images take every FlashInfer cubin and its AOT JIT
+cache from the official image) and get a
+temporary JSON exchange directory and a persistent JIT cache at `/cache` under
+`VIBESIM_PROFILE_CACHE_DIR` (default `~/.cache/vibesim-profiler`): for an
+engine image one directory per engine, official base and GPU architecture
+(`<engine>-<base digest[:12]>-sm<cc>`, `local.py:image_cache_key`, which says
+why a rebuild on the same base may keep it), for the other images one per tag,
+since Torch extensions, Triton and FlashInfer builds link that image's
+libraries. A use touches its directory, and a sibling of the same engine or
+image unused for 30 days is removed. Each worker gets `VIBESIM_AUTOTUNE`
+from `local.py:autotune_policy` (`reference_engines/README.md#autotuning`).
 `kernel-profile measure` also mounts its
 output directory so the CUPTI/NVML artifacts survive the worker; the images
 carry no matplotlib, so its plots are skipped there (`VIBESIM_PROFILE_RUNTIME=host`
@@ -53,14 +63,20 @@ uv run python -m profiling run nvfp4_quant \
   --json
 ```
 
-The vLLM image builds the fork on the precompiled wheel of the upstream commit
-it is rebased on (the parent of its first `feat(alignment):` commit,
-`alignment/profiler/README.md`), so the fork's Python changes need no CUDA
-build; `images.py` refuses a fork that changes native code. The SGLang image
-installs the checkout editable against the cu130 Torch index.
+The engine images (`reference_engines/README.md`) add, over the official
+image: Nsight Systems 2025.5.2 (apt, pinned version), gdb and py-spy for hang
+stacks, the capture runner's venv (`reference_engines/capture-requirements.txt`),
+the req-frontend `session_runner` built at its gitlink on the same userland, the
+patches, and this checkout's worker code for the self-check. Inside them,
+`VIBESIM_CAPTURE_RUNTIME=in-image` makes the capture runner use the baked
+`session_runner` instead of calling cargo. A capture runs `python -m launcher`
+on the capture venv (`alignment/image_runtime.py`), with the same overlay as the
+workers', applied around submodules.
 
 Every image also writes `/etc/vibesim-profiler-image.json`: its input hash
-(the tag's suffix), the envs it serves, its interpreter and import path. A
+(the tag's suffix), the envs it serves, its interpreter and import path; an
+engine image adds its capture interpreter, Nsight Systems, official base image
+and upstream commit, and req-frontend revision. A
 process that itself runs in an image (a pod started from it) sets
 `VIBESIM_PROFILE_RUNTIME=in-image`; the envs in that manifest then run on the
 image's interpreter, and any other env, or an image whose inputs differ from

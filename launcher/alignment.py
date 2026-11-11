@@ -9,6 +9,7 @@ NSYS normalization, and timing-predict input conversion.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import filecmp
 import json
 import shutil
@@ -84,6 +85,31 @@ def _build_parser() -> argparse.ArgumentParser:
             "failure so the GPU capture is never repeated."
         ),
     )
+    profile.add_argument(
+        "--runtime",
+        choices=("host", "image"),
+        default=None,
+        help=(
+            "image (the default): the engine's reference image (vllm, sglang; "
+            "reference_engines/) with this checkout's capture code overlaid "
+            "(alignment/image_runtime.py); the host keeps GPU choice and outputs, "
+            "and autotuning is refused without a warm-caches manifest. "
+            "host: a host venv of the engine and the configured nsys; strongly "
+            "discouraged: no autotune guard and no preflight, so the engine may tune "
+            "or compile inside the measurement. --resume always runs on the host."
+        ),
+    )
+    profile.add_argument(
+        "--allow-autotune",
+        action="store_true",
+        help=(
+            "--runtime image: let the engine tune kernel tactics during this capture. "
+            "Without it the capture needs a warm-caches manifest for its deployment "
+            "(`just ref warm-caches <engine> <profile.yaml>`) and fails before the "
+            "container starts when there is none."
+        ),
+    )
+    profile.add_argument("--warm-caches", action="store_true", help=argparse.SUPPRESS)
 
     predict = commands.add_parser(
         "timing-predict",
@@ -479,12 +505,65 @@ def _run_profile(args: argparse.Namespace) -> int:
         args.config,
         require_python_runtime=not args.resume,
     )
+    from alignment.image_runtime import container_config, in_image, run_profile_in_image
+
+    if args.runtime is None:
+        # A resume re-derives artifacts from an existing capture; inside an image
+        # the container is already the runtime.
+        args.runtime = "host" if args.resume or in_image() else "image"
+    elif args.runtime == "host" and not args.resume and not in_image():
+        print(
+            "[alignment] WARNING: --runtime host captures with no autotune guard and no "
+            "warm-caches preflight; the engine may tune or JIT-compile inside the "
+            "measurement. Use the default --runtime image.",
+            file=sys.stderr,
+            flush=True,
+        )
+    if args.runtime == "image" and (args.resume or in_image()):
+        raise ValueError(
+            "--runtime image starts a container from the host; resume an image "
+            "capture on the host with --resume, and run nothing nested"
+        )
+    if args.allow_autotune and args.runtime != "image":
+        raise ValueError(
+            "--allow-autotune governs the engine image's autotune guard; it needs --runtime image"
+        )
     if args.dry_run:
+        if args.runtime == "image":
+            # Every path the container would need, mapped and checked.
+            container_config(args.config, Path(config.log_dir))
         print(f"[alignment] profile validated: {args.config} (log_dir={config.log_dir})")
         return 0
-    write_artifact_kind(Path(config.log_dir).parent, ArtifactKind.ALIGNMENT_BUNDLE)
-    _snapshot_config(args.config, Path(config.log_dir), "profile")
+    if args.runtime == "image" and args.warm_caches:
+        # From the host this is `python -m reference_engines warm-caches` (the
+        # entry point, which also takes --startup-timeout): the image's
+        # warm-only pass, logged under `<log_dir>.warm-caches`, then its
+        # manifest. It writes nothing into the capture's own log_dir.
+        print(f"[alignment] warming caches in image: {args.config}")
+        return run_profile_in_image(args.config, warm_caches=True)
+    if not in_image() and not args.warm_caches:
+        # In an image the host already did both, against the host paths.
+        write_artifact_kind(Path(config.log_dir).parent, ArtifactKind.ALIGNMENT_BUNDLE)
+        _snapshot_config(args.config, Path(config.log_dir), "profile")
+    if args.runtime == "image":
+        print(f"[alignment] profiling in image: {args.config}")
+        returncode = run_profile_in_image(args.config, allow_autotune=args.allow_autotune)
+        if returncode == 0:
+            print(f"[alignment] profiling complete: {config.log_dir}/profile_result.json")
+        return returncode
     print(f"[alignment] {'resuming' if args.resume else 'profiling'}: {args.config}")
+    if args.warm_caches:
+        # In the image, for `python -m reference_engines warm-caches` (whose
+        # host side already pointed log_dir at `<log_dir>.warm-caches`). An
+        # explicit host warm-up logs there too, not into the capture's log_dir.
+        if not in_image():
+            warm_dir = Path(config.log_dir)
+            config = dataclasses.replace(
+                config, log_dir=str(warm_dir.with_name(warm_dir.name + ".warm-caches"))
+            )
+        run_profile(config, warm_only=True)
+        print(f"[alignment] engine reached ready and was stopped: {config.log_dir}")
+        return 0
     result = run_profile(config, resume=args.resume)
     if result.get("profile_kind", "nsys") == "nsys":
         print(

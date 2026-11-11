@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 
+from profiling.exec.container_user import rootless_runtime as real_rootless_runtime
 from profiling.exec.env import ContainerProfileEnv
 from profiling.exec.local import (
     IMEX_CHANNEL_CDI_DEVICE,
+    LocalGpuChunk,
     _container_worker_command,
     gpu_uuids_for_indices,
 )
@@ -31,6 +36,8 @@ def stub_nvidia_smi(monkeypatch):
     """
 
     monkeypatch.setattr("profiling.exec.local._nvidia_smi_xml", _fake_smi_xml)
+    # Nor on the host's container runtime: pin a rootful one.
+    monkeypatch.setattr("profiling.exec.container_user.rootless_runtime", lambda: False)
 
 
 def test_container_worker_mounts_worktree_source_read_only(tmp_path: Path, monkeypatch) -> None:
@@ -40,7 +47,7 @@ def test_container_worker_mounts_worktree_source_read_only(tmp_path: Path, monke
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(cache_dir))
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [3, 1],
         exchange_dir,
     )
@@ -54,10 +61,15 @@ def test_container_worker_mounts_worktree_source_read_only(tmp_path: Path, monke
     assert f"{cache_dir}/profiler_test:/cache" in command
     assert "MOESIM_CUPTI_BUILD_DIR=/cache/cupti-ext" in command
     project_root = Path(__file__).parents[1].resolve()
-    for directory in ("profiling", "launcher", "gpu"):
+    for directory in ("profiling", "launcher", "gpu", "reference_engines"):
         assert f"{project_root / directory}:/opt/vibesim/{directory}:ro" in command
     assert not any("profile.db" in argument for argument in command)
-    assert command[-4:] == [
+    # The worker is named explicitly, never left to the image's ENTRYPOINT.
+    assert command[command.index("--entrypoint") + 1] == "/usr/bin/python3"
+    assert command[-7:] == [
+        "profiler:test",
+        "-m",
+        "profiling.exec.local_worker",
         "--worker-input",
         "/io/input.json",
         "--worker-output",
@@ -74,7 +86,7 @@ def test_container_worker_mounts_explicit_additional_volume(tmp_path: Path, monk
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(cache_dir))
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [4],
         exchange_dir,
         additional_volumes=((measurement_dir, measurement_dir.resolve()),),
@@ -98,7 +110,7 @@ def test_container_worker_never_passes_a_bare_gpu_index(tmp_path: Path, monkeypa
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [0],
         exchange_dir,
     )
@@ -106,6 +118,87 @@ def test_container_worker_never_passes_a_bare_gpu_index(tmp_path: Path, monkeypa
     gpu_request = command[command.index("--gpus") + 1]
     assert gpu_request == '"device=GPU-fake-0"'
     assert "device=0" not in gpu_request
+
+
+def test_container_worker_pins_cuda_to_the_requested_uuids(tmp_path: Path, monkeypatch) -> None:
+    """A rootless Podman inside a Slurm job ignores ``--gpus`` and exposes every
+    job GPU, so the device request alone left concurrent workers on job GPU 0.
+    CUDA_VISIBLE_DEVICES carries the same UUIDs, in reservation order."""
+
+    exchange_dir = tmp_path / "exchange"
+    exchange_dir.mkdir()
+    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
+
+    command, _env = _container_worker_command(
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
+        [3, 1],
+        exchange_dir,
+    )
+
+    assert "CUDA_VISIBLE_DEVICES=GPU-fake-3,GPU-fake-1" in command
+    assert command[command.index("CUDA_VISIBLE_DEVICES=GPU-fake-3,GPU-fake-1") - 1] == "--env"
+    assert command[command.index("--gpus") + 1] == '"device=GPU-fake-3,GPU-fake-1"'
+
+
+def _run_chunk_with_worker_uuids(monkeypatch, gpus: list[int], worker_uuids) -> list:
+    """Run a host-runtime chunk whose fake worker succeeds and reports ``worker_uuids``."""
+
+    monkeypatch.setenv("VIBESIM_PROFILE_RUNTIME", "host")
+
+    def fake_subprocess_run(cmd, **kwargs):
+        del kwargs
+        output_path = Path(cmd[cmd.index("--worker-output") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "results": [
+                        {
+                            "ok": True,
+                            "metrics": {
+                                "kind": "compute",
+                                "time_ms": 1.0,
+                                "tflops": 0.1,
+                                "memory_bandwidth_gbps": 0.2,
+                                "energy_j": 0.0,
+                            },
+                            "gpu_name": "FakeGPU",
+                        }
+                    ],
+                    "gpu_uuids": worker_uuids,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("profiling.exec.local.subprocess.run", fake_subprocess_run)
+    return LocalGpuChunk(gpus).run(
+        "single_gemm",
+        [{"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "torch"}],
+    )
+
+
+def test_chunk_keeps_results_measured_on_the_reserved_card(monkeypatch) -> None:
+    (result,) = _run_chunk_with_worker_uuids(monkeypatch, [2], ["GPU-fake-2"])
+
+    assert result.error is None
+    assert result.metrics is not None
+
+
+@pytest.mark.parametrize(
+    "worker_uuids",
+    [
+        ["GPU-fake-0"],  # another card: the runtime ignored the request
+        ["GPU-fake-0", "GPU-fake-2"],  # every job card visible, CUDA picks the first
+        None,  # a worker that could not say
+    ],
+)
+def test_chunk_rejects_results_from_a_card_it_did_not_reserve(monkeypatch, worker_uuids) -> None:
+    (result,) = _run_chunk_with_worker_uuids(monkeypatch, [2], worker_uuids)
+
+    assert result.metrics is None
+    assert "worker GPU mismatch" in (result.error or "")
+    assert "GPU-fake-2" in (result.error or "")
 
 
 def test_container_worker_fails_when_the_uuid_is_unknown(tmp_path: Path, monkeypatch) -> None:
@@ -116,7 +209,7 @@ def test_container_worker_fails_when_the_uuid_is_unknown(tmp_path: Path, monkeyp
 
     with pytest.raises(RuntimeError, match="no UUID for GPU index"):
         _container_worker_command(
-            ContainerProfileEnv("vllm_env", "profiler:test"),
+            ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
             [5],
             exchange_dir,
         )
@@ -144,7 +237,7 @@ def test_container_worker_does_not_forward_the_energy_policy(tmp_path, monkeypat
     monkeypatch.setenv(ENERGY_ENV, "1")
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [0],
         exchange_dir,
     )
@@ -168,7 +261,7 @@ def test_container_worker_mounts_the_trace_directory(tmp_path, monkeypatch) -> N
     monkeypatch.setenv(CUPTI_TRACE_ENV, str(trace_dir / "run.jsonl"))
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [0],
         exchange_dir,
     )
@@ -192,7 +285,7 @@ def test_container_worker_redirects_the_inductor_cache_into_the_mount(
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
 
     command, _env = _container_worker_command(
-        ContainerProfileEnv("vllm_env", "profiler:test"),
+        ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3"),
         [0],
         exchange_dir,
     )
@@ -209,7 +302,7 @@ def test_container_worker_requests_imex_channel_only_when_asked(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
-    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test")
+    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3")
 
     plain, _env = _container_worker_command(profiler_env, [0, 1], tmp_path)
     fabric, _env = _container_worker_command(profiler_env, [0, 1], tmp_path, imex_channel=True)
@@ -235,3 +328,45 @@ def test_imex_channel_is_declared_by_the_mnnvl_all_reduce_backends_only() -> Non
         ("all_reduce_fusion", "flashinfer_mnnvl"),
         ("all_reduce_residual_rms_norm", "flashinfer_mnnvl"),
     }
+
+
+def test_container_worker_runs_as_root_under_a_rootless_runtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Catches a worker run as the caller's uid under rootless Podman, which maps
+    it to a subordinate host uid that cannot read the 0700 exchange directory."""
+    exchange_dir = tmp_path / "exchange"
+    exchange_dir.mkdir()
+    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path / "cache"))
+    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test", "/usr/bin/python3")
+
+    def user(command: list[str]) -> str:
+        return command[command.index("--user") + 1]
+
+    rootful, _env = _container_worker_command(profiler_env, [0], exchange_dir)
+    assert user(rootful) == f"{os.getuid()}:{os.getgid()}"
+    monkeypatch.setattr("profiling.exec.container_user.rootless_runtime", lambda: True)
+    rootless, _env = _container_worker_command(profiler_env, [0], exchange_dir)
+    assert user(rootless) == "0:0"
+
+
+@pytest.mark.parametrize(
+    ("security_options", "rootless"),
+    [
+        ('["name=seccomp,profile=default","name=rootless","name=cgroupns"]', True),
+        ('["name=seccomp,profile=builtin","name=cgroupns"]', False),
+    ],
+)
+def test_rootless_runtime_reads_docker_info(monkeypatch, security_options, rootless) -> None:
+    import subprocess
+
+    real_rootless_runtime.cache_clear()
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess([], 0, stdout=security_options),
+    )
+    try:
+        assert real_rootless_runtime() is rootless
+    finally:
+        real_rootless_runtime.cache_clear()
