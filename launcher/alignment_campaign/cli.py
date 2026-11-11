@@ -371,6 +371,8 @@ def _verify_bundle(args) -> int:
     pack = _resolve_pack(args.pack)
     assert pack is not None
     if args.from_hf:
+        if not args.download_dir:
+            raise PackError("--from-hf needs --download-dir")
         source = bundle_module.download(args.from_hf, Path(args.download_dir))
     elif args.bundle:
         source = Path(args.bundle)
@@ -527,7 +529,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--from-hf", metavar="REPO@REV:PATH", help="download from a dataset at a pinned revision"
     )
     verify.add_argument(
-        "--download-dir", default=".", help="where --from-hf downloads (default: here)"
+        "--download-dir", help="where --from-hf downloads (required with it; several GB)"
     )
     verify.add_argument("--check-only", action="store_true", help="verify, place nothing")
     verify.add_argument("--replace", action="store_true", help="overwrite existing pass dirs")
