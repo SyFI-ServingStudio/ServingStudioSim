@@ -107,14 +107,14 @@ previous one, exactly as for a single case.
   declare both `speculative_acceptance: {status: from_capture}` and
   `speculative_acceptance_by_output_position: {status: from_capture}`; the
   case-wide chain alone gives every request the same acceptance (see "Preserve
-  speculative acceptance structure"). Run every verb with `--phase1`:
+  speculative acceptance structure"). Run every verb with `--alignment-phase 1`:
 
   ```bash
-  uv run python -m launcher alignment-campaign render  --pack <pack> --host <host> --out-root <root> --phase1
-  uv run python -m launcher alignment-campaign run     --pack <pack> --out-root <root> --phase1 --phase <P>
-  uv run python -m launcher alignment-campaign label   --pack <pack> --out-root <root> --phase1
-  uv run python -m launcher alignment-campaign extract --pack <pack> --runs <root> --out <root>/metrics.json --phase1
-  uv run python -m launcher alignment-campaign compare --pack <pack> --measured <root>/metrics.json --phase1 --markdown
+  uv run python -m launcher alignment-campaign render  --pack <pack> --host <host> --out-root <root> --alignment-phase 1
+  uv run python -m launcher alignment-campaign run     --pack <pack> --out-root <root> --alignment-phase 1 --phase <P>
+  uv run python -m launcher alignment-campaign label   --pack <pack> --out-root <root> --alignment-phase 1
+  uv run python -m launcher alignment-campaign extract --pack <pack> --runs <root> --out <root>/metrics.json --alignment-phase 1
+  uv run python -m launcher alignment-campaign compare --pack <pack> --measured <root>/metrics.json --alignment-phase 1 --markdown
   ```
 
   Run the profile passes first. The `from_capture` values are read from the
@@ -123,11 +123,11 @@ previous one, exactly as for a single case.
   Until the workload pass has run, those two phases print the case as blocked
   with that reason. Do not copy the values into the pack by hand. SGLang has no
   KV-pool extractor; `check` names this, and the case needs a measured value.
-- **alignment Phase 2**: the whole matrix. Run the same verbs without
-  `--phase1`. It must run end to end from the pack with no hand edits, so that
+- **alignment Phase 2**: the whole matrix. Run the same verbs with
+  `--alignment-phase 2` (the same as omitting it). It must run end to end from the pack with no hand edits, so that
   the commands alone can be handed to someone else in an issue.
 
-`--phase1` is not `--phase`: `--phase` names the pipeline phase to run.
+`--alignment-phase` is not `--phase`: `--phase` names the pipeline step to run.
 
 **A pack's cases must span the knobs that change step shapes.** Do not copy one
 template value across the matrix. At least run prefill-heavy and mixed cases at

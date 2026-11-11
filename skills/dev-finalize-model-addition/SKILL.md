@@ -21,13 +21,13 @@ The PR merges on **alignment Phase 1** only. Both alignment phases are defined i
 - **alignment Phase 1 (required).** For every deployment the PR adds, the model's pack under
   `presets/alignment/<pack>/` has one `phase: 1` case replaying `trace/diverse_100.csv`. Run it through
   Check 1 (kernel), Check 2 (duty cycle) and Check 3 (E2E), per `top-align-with-framework`, with the
-  `--phase1` commands in `operate-run-alignment`. Produce the table with
-  `alignment-campaign compare --pack <pack> --measured <metrics.json> --phase1 --markdown`.
+  `--alignment-phase 1` commands in `operate-run-alignment`. Produce the table with
+  `alignment-campaign compare --pack <pack> --measured <metrics.json> --alignment-phase 1 --markdown`.
 - **alignment Phase 2 (not required to merge).** The rest of the pack's matrix. The pack must already
   declare it, and `alignment-campaign check --pack <pack>` must pass. Run it now only if the user asks.
   Otherwise, once the PR is open, ask the user before filing an issue for it. The issue names the pack, the
   checkpoint snapshot and the host profile keys, and gives the commands to run: the `operate-run-alignment`
-  verbs without `--phase1`, then `compare --pack <pack> --markdown`. The pack must run end to end from
+  verbs with `--alignment-phase 2`, then `compare --pack <pack> --markdown`. The pack must run end to end from
   those commands with no hand edits.
 
 "Reasonable" means one of two things. The case is within the tolerances in the pack's `acceptance.yaml`,

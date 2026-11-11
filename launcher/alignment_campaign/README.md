@@ -54,9 +54,10 @@ A pack's cases fall into two groups, chosen per case with `phase`:
   It runs end to end from the pack with no hand edits, so it can be handed to
   someone else as an issue.
 
-`render`, `run`, `label`, `extract` and `compare` take `--phase1` to work on the
-Phase 1 cases only; a pack with none is an error. `--phase1` is unrelated to
-`--phase`, which names a pipeline phase (`profile_nsys`, `simulation`, ...).
+`render`, `run`, `label`, `extract` and `compare` take `--alignment-phase {1,2}`.
+`1` works on the Phase 1 cases only; a pack with none is an error. `2` is the
+full matrix, the same as omitting the flag. It is unrelated to `--phase`, which
+names a pipeline step (`profile_nsys`, `simulation`, ...).
 
 ```yaml
 cases:
@@ -77,13 +78,13 @@ cases:
 
 ```bash
 python -m launcher alignment-campaign check   --pack <pack_dir>
-python -m launcher alignment-campaign render  --pack <> --host <> --out-root <> [--case 01] [--phase1]
-python -m launcher alignment-campaign run     --pack <> --out-root <> --phase <P> [--phase1] \
+python -m launcher alignment-campaign render  --pack <> --host <> --out-root <> [--case 01] [--alignment-phase 1|2]
+python -m launcher alignment-campaign run     --pack <> --out-root <> --phase <P> [--alignment-phase 1|2] \
                                               [--case ...] [--dry-run] [--refresh] [--resume]
-python -m launcher alignment-campaign label   --pack <> --out-root <> [--phase1]
-python -m launcher alignment-campaign extract [--pack <>] --runs <dir[:dir]> --out metrics.json [--phase1]
+python -m launcher alignment-campaign label   --pack <> --out-root <> [--alignment-phase 1|2]
+python -m launcher alignment-campaign extract [--pack <>] --runs <dir[:dir]> --out metrics.json [--alignment-phase 1|2]
 python -m launcher alignment-campaign compare [--pack <>] --measured metrics.json \
-                                              [--json|--markdown] [--record] [--phase1]
+                                              [--json|--markdown] [--record] [--alignment-phase 1|2]
 ```
 
 `--pack` is **optional for `extract` and `compare`** — the read side. Point

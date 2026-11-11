@@ -35,8 +35,9 @@ when its simulation is rendered (`calibration.py`), never typed into the pack.
 
 A case belongs to **alignment Phase 1** (`phase: 1`) or **alignment Phase 2**
 (the default). Phase 1 is the per-deployment `diverse_100` check that gates a
-model PR; Phase 2 is the whole matrix, Phase 1 cases included. The verbs'
-`--phase1` flag selects the Phase 1 cases.
+model PR; Phase 2 is the full matrix, Phase 1 cases included. The verbs'
+`--alignment-phase 1` selects the Phase 1 cases; `--alignment-phase 2`, like
+omitting it, selects every case.
 """
 
 from __future__ import annotations

@@ -75,7 +75,7 @@ def extract(
     roots: list[Path], pack: Pack | None = None, *, only: set[str] | None = None
 ) -> Extraction:
     """Read every case under `roots` into one document. `only` keeps those case
-    slugs (`--phase1`); it needs a pack, which is what names them."""
+    slugs (`--alignment-phase 1`); it needs a pack, which is what names them."""
     by_slug: dict[str, Path] = {}
     resolved_roots: list[Path] = []
     for root in roots:

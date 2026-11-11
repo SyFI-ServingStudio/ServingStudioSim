@@ -13,14 +13,15 @@ would also read as `alignment campaign run --phase simulation` invoking
     extract  completed reports -> one metrics document
     compare  judge that document against tolerances and the golden
 
-`--phase` values are artifact directory names, so the phase, its config, its
-output directory and its `.complete` marker all share one name.
+`--phase` names a pipeline step (profile_nsys, timing_predict, simulation, ...).
+Its values are artifact directory names, so the step, its config, its output
+directory and its `.complete` marker all share one name.
 
-`--phase1` (render, run, label, extract, compare) restricts a verb to the
-pack's alignment Phase 1 cases (`phase: 1`): one diverse_100 run per
-deployment, the check a model PR must pass. Without it a verb covers alignment
-Phase 2, the whole matrix, Phase 1 cases included. It is unrelated to
-`--phase`, which names a pipeline phase.
+`--alignment-phase {1,2}` (render, run, label, extract, compare) picks the
+cases. 1 is the pack's alignment Phase 1 cases (`phase: 1`): one diverse_100
+run per deployment, the check a model PR must pass. 2 is alignment Phase 2, the
+full matrix, Phase 1 cases included, which is also what a verb covers without
+the flag. It is unrelated to `--phase`.
 """
 
 from __future__ import annotations
@@ -63,6 +64,10 @@ def _resolve_host(value: str):
     return load_host(candidate)
 
 
+#: `--alignment-phase` values: 1 selects the Phase 1 cases, 2 the full matrix.
+ALIGNMENT_PHASE_CHOICES = (1, 2)
+
+
 def _phase1_cases(pack: Pack) -> tuple[Case, ...]:
     cases = pack.phase1_cases
     if not cases:
@@ -73,7 +78,10 @@ def _phase1_cases(pack: Pack) -> tuple[Case, ...]:
     return cases
 
 
-def _selected_cases(pack: Pack, names: list[str] | None, phase1: bool = False) -> list[Case]:
+def _selected_cases(
+    pack: Pack, names: list[str] | None, alignment_phase: int | None = None
+) -> list[Case]:
+    phase1 = alignment_phase == 1
     pool = _phase1_cases(pack) if phase1 else pack.cases
     if not names:
         return list(pool)
@@ -86,18 +94,34 @@ def _selected_cases(pack: Pack, names: list[str] | None, phase1: bool = False) -
                 f"available: {[item.slug for item in pack.cases]}"
             )
         if case not in pool:
-            raise PackError(f"case {case.slug} is not an alignment Phase 1 case (--phase1)")
+            raise PackError(
+                f"case {case.slug} is not an alignment Phase 1 case (--alignment-phase 1)"
+            )
         chosen.append(case)
     return chosen
 
 
-def _phase1_pack(args, pack: Pack | None) -> set[str] | None:
-    """Phase 1 case slugs for the read-side verbs, or None without --phase1."""
-    if not getattr(args, "phase1", False):
+def _phase1_slugs(args, pack: Pack | None) -> set[str] | None:
+    """Phase 1 case slugs for the read-side verbs, or None unless
+    `--alignment-phase 1` (Phase 2 is every case)."""
+    if getattr(args, "alignment_phase", None) != 1:
         return None
     if pack is None:
-        raise PackError("--phase1 selects cases by the pack's `phase: 1`; it needs --pack")
+        raise PackError(
+            "--alignment-phase 1 selects cases by the pack's `phase: 1`; it needs --pack"
+        )
     return {case.slug for case in _phase1_cases(pack)}
+
+
+def _add_alignment_phase(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--alignment-phase",
+        type=int,
+        choices=ALIGNMENT_PHASE_CHOICES,
+        help="1: only the pack's alignment Phase 1 cases (`phase: 1`); 2: alignment "
+        "Phase 2, the full matrix with Phase 1 included (the same as omitting it). "
+        "Unrelated to --phase, which names a pipeline step",
+    )
 
 
 def _acceptance_schemas(pack: Pack | None) -> dict[str, int] | None:
@@ -155,7 +179,7 @@ def _render(args) -> int:
     assert pack is not None
     host = _resolve_host(args.host)
     out_root = Path(args.out_root)
-    for case in _selected_cases(pack, args.case, args.phase1):
+    for case in _selected_cases(pack, args.case, args.alignment_phase):
         rendered = render_module.render_case(pack, case, host, out_root, REPO_ROOT)
         print(f"[render] {rendered.directory}  ({len(rendered.files)} files)")
         for reason in rendered.pending:
@@ -171,7 +195,7 @@ def _render(args) -> int:
 def _run(args) -> int:
     pack = _resolve_pack(args.pack)
     assert pack is not None
-    cases = _selected_cases(pack, args.case, args.phase1)
+    cases = _selected_cases(pack, args.case, args.alignment_phase)
     out_root = Path(args.out_root)
     if args.dry_run:
         plans = execute.plan_phase(
@@ -245,7 +269,7 @@ def _label(args) -> int:
     assert pack is not None
     out_root = Path(args.out_root)
     failed = 0
-    for case in _selected_cases(pack, args.case, args.phase1):
+    for case in _selected_cases(pack, args.case, args.alignment_phase):
         variant = pack.variant_of(case)
         kernel_pass = next((item for item in variant.profile_passes if item.kind == "nsys"), None)
         if kernel_pass is None:
@@ -273,7 +297,7 @@ def _label(args) -> int:
 def _extract(args) -> int:
     pack = _resolve_pack(args.pack)
     roots = [Path(item) for item in args.runs.split(":") if item]
-    extraction = extract_module.extract(roots, pack, only=_phase1_pack(args, pack))
+    extraction = extract_module.extract(roots, pack, only=_phase1_slugs(args, pack))
     path = extract_module.write_extraction(extraction, Path(args.out))
     print(f"[extract] {len(extraction.cases)} case(s) -> {path}")
     for key in extraction.unavailable:
@@ -285,7 +309,7 @@ def _extract(args) -> int:
 def _compare(args) -> int:
     pack = _resolve_pack(args.pack)
     document = extract_module.load_extraction(Path(args.measured))
-    only = _phase1_pack(args, pack)
+    only = _phase1_slugs(args, pack)
     if only is not None:
         document = {
             **document,
@@ -348,11 +372,7 @@ def _build_parser() -> argparse.ArgumentParser:
     render.add_argument("--host", required=True)
     render.add_argument("--out-root", required=True, help="directory to hold one dir per case")
     render.add_argument("--case", action="append", help="restrict to these cases (repeatable)")
-    render.add_argument(
-        "--phase1",
-        action="store_true",
-        help="only the pack's alignment Phase 1 cases (`phase: 1`); not --phase",
-    )
+    _add_alignment_phase(render)
     render.set_defaults(handler=_render)
 
     run = commands.add_parser("run", help="run ONE phase across every ready case")
@@ -364,11 +384,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="artifact directory name, e.g. profile_nsys / timing_predict / analysis_kernel",
     )
     run.add_argument("--case", action="append")
-    run.add_argument(
-        "--phase1",
-        action="store_true",
-        help="only the pack's alignment Phase 1 cases (`phase: 1`); not --phase",
-    )
+    _add_alignment_phase(run)
     run.add_argument("--dry-run", action="store_true", help="print the plan and stop")
     run.add_argument("--refresh", action="store_true", help="ignore .complete markers")
     run.add_argument(
@@ -403,11 +419,7 @@ def _build_parser() -> argparse.ArgumentParser:
     label.add_argument("--pack", required=True)
     label.add_argument("--out-root", required=True)
     label.add_argument("--case", action="append")
-    label.add_argument(
-        "--phase1",
-        action="store_true",
-        help="only the pack's alignment Phase 1 cases (`phase: 1`); not --phase",
-    )
+    _add_alignment_phase(label)
     label.add_argument(
         "--refresh", action="store_true", help="re-initialize from the parsed inventory"
     )
@@ -417,22 +429,14 @@ def _build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--pack", help="optional; without it any run directory is readable")
     extract.add_argument("--runs", required=True, help="colon-separated run roots")
     extract.add_argument("--out", required=True)
-    extract.add_argument(
-        "--phase1",
-        action="store_true",
-        help="only the pack's alignment Phase 1 cases (`phase: 1`); not --phase",
-    )
+    _add_alignment_phase(extract)
     extract.set_defaults(handler=_extract)
 
     compare = commands.add_parser("compare", help="judge a metrics document")
     compare.add_argument("--pack", help="optional; needed for tolerances, drift and --record")
     compare.add_argument("--measured", required=True, help="metrics document from `extract`")
     compare.add_argument("--json", action="store_true")
-    compare.add_argument(
-        "--phase1",
-        action="store_true",
-        help="only the pack's alignment Phase 1 cases (`phase: 1`); not --phase",
-    )
+    _add_alignment_phase(compare)
     compare.add_argument("--markdown", action="store_true")
     compare.add_argument("--record", action="store_true", help="write the golden baseline")
     compare.add_argument(

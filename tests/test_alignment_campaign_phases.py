@@ -177,30 +177,57 @@ def _phase1_case(pack):
 # ── alignment Phase 1 / 2 selection ──────────────────────────────────────────
 
 
-def test_phase_defaults_to_two_and_phase1_selects_only_phase_one(tmp_path):
+def test_alignment_phase_selects_cases(tmp_path):
     pack = _phase1_pack(tmp_path)
     case = _phase1_case(pack)
     assert case.slug == "90_diverse_100" and case.phase == 1
     assert all(item.phase == 2 for item in pack.cases if item is not case)
-    assert cli._selected_cases(pack, None, phase1=True) == [case]
-    # alignment Phase 2 is the whole matrix, Phase 1 included.
+    assert cli._selected_cases(pack, None, alignment_phase=1) == [case]
+    # alignment Phase 2 is the full matrix, Phase 1 included, as is no flag.
+    assert cli._selected_cases(pack, None, alignment_phase=2) == list(pack.cases)
     assert cli._selected_cases(pack, None) == list(pack.cases)
     with pytest.raises(PackError, match="not an alignment Phase 1 case"):
-        cli._selected_cases(pack, [pack.cases[0].slug], phase1=True)
+        cli._selected_cases(pack, [pack.cases[0].slug], alignment_phase=1)
 
 
-def test_phase1_on_a_pack_without_one_is_a_clear_error(tmp_path, capsys):
+def test_alignment_phase_flag_parses_one_or_two_only(capsys):
+    parser = cli._build_parser()
+    for verb in (["render", "--pack", "p", "--host", "h", "--out-root", "o"],
+                 ["run", "--pack", "p", "--out-root", "o", "--phase", "simulation"],
+                 ["label", "--pack", "p", "--out-root", "o"],
+                 ["extract", "--runs", "r", "--out", "m.json"],
+                 ["compare", "--measured", "m.json"]):
+        assert parser.parse_args(verb + ["--alignment-phase", "1"]).alignment_phase == 1
+        assert parser.parse_args(verb + ["--alignment-phase", "2"]).alignment_phase == 2
+        assert parser.parse_args(verb).alignment_phase is None
+        with pytest.raises(SystemExit):
+            parser.parse_args(verb + ["--alignment-phase", "3"])
+        with pytest.raises(SystemExit):
+            parser.parse_args(verb + ["--phase1"])
+    capsys.readouterr()
+
+
+def test_alignment_phase_two_reads_every_case(tmp_path):
+    pack = _phase1_pack(tmp_path)
+    args = SimpleNamespace(alignment_phase=2)
+    assert cli._phase1_slugs(args, pack) is None
+    assert cli._phase1_slugs(SimpleNamespace(alignment_phase=1), pack) == {"90_diverse_100"}
+    with pytest.raises(PackError, match="needs --pack"):
+        cli._phase1_slugs(SimpleNamespace(alignment_phase=1), None)
+
+
+def test_alignment_phase_one_on_a_pack_without_one_is_a_clear_error(tmp_path, capsys):
     pack = load_pack(BASE_PACK)
     with pytest.raises(PackError, match="declares no alignment Phase 1 case"):
-        cli._selected_cases(pack, None, phase1=True)
+        cli._selected_cases(pack, None, alignment_phase=1)
     code = cli.main([
         "run", "--pack", str(BASE_PACK), "--out-root", str(tmp_path), "--phase", "simulation",
-        "--phase1", "--dry-run",
+        "--alignment-phase", "1", "--dry-run",
     ])
     assert code == 2
     assert "declares no alignment Phase 1 case" in capsys.readouterr().err
     assert cli.main(["extract", "--runs", str(tmp_path), "--out", str(tmp_path / "m.json"),
-                     "--phase1"]) == 2
+                     "--alignment-phase", "1"]) == 2
 
 
 @pytest.mark.parametrize("phase", [0, 3, "1", True])
@@ -213,7 +240,7 @@ def test_phase_rejects_anything_but_one_or_two(tmp_path, phase):
         load_pack(pack.root)
 
 
-def test_extract_phase1_keeps_only_phase_one_cases(tmp_path):
+def test_extract_alignment_phase_one_keeps_only_phase_one_cases(tmp_path):
     from launcher.alignment_campaign import extract as extract_module
 
     pack = _phase1_pack(tmp_path)
