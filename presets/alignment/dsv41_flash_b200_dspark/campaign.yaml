@@ -60,7 +60,7 @@ variants:
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
       routing: corpus
-      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json
       draft_tokens: 5
       cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136,
         144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352,
@@ -141,7 +141,7 @@ variants:
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
       routing: corpus
-      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json
       draft_tokens: 5
       cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136,
         144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352,
@@ -225,7 +225,7 @@ variants:
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
       routing: corpus
-      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json
       draft_tokens: 5
       cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136,
         144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352,
@@ -308,7 +308,7 @@ variants:
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
       routing: corpus
-      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json
       draft_tokens: 5
       cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136,
         144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352,
@@ -389,7 +389,7 @@ variants:
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
       routing: corpus
-      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json
       draft_tokens: 5
       cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136,
         144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352,
@@ -473,7 +473,7 @@ variants:
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
       routing: corpus
-      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json
       draft_tokens: 5
       cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136,
         144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352,
@@ -554,7 +554,7 @@ variants:
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
       routing: corpus
-      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json
       draft_tokens: 5
       cudagraph_capture_sizes: &id002 [1, 2, 4, 6, 8, 12, 16, 18, 24, 32, 36, 40, 42, 48, 56, 60, 64, 66, 72, 80,
         84, 88, 90, 96, 104, 108, 112, 114, 120, 128, 132, 136, 138, 144, 152, 156, 160, 162, 168, 176, 180, 184,
@@ -631,7 +631,7 @@ variants:
       model_config: model/config/deepseek_v41_flash.json
       fp8: true
       routing: corpus
-      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json
       draft_tokens: 5
       cudagraph_capture_sizes: *id002
     worker:

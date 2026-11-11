@@ -154,9 +154,10 @@ def variant(topo: str, chunk: int) -> dict:
         "model_config": "model/config/deepseek_v41_flash.json",
         "fp8": True,
         "routing": "corpus",
-        # Old-vLLM diverse_100 routes; replaced by this pack's token_corpus capture once uploaded.
-        "token_corpus_file": "hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/"
-                             "deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json",
+        # The DSpark k5 diverse_100 corpus (TP4 replay, job 17921). The dataset keys a capture by model and
+        # workload, not deployment, so TP4 and DP4 both read it.
+        "token_corpus_file": "hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/"
+                             "deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json",
         "draft_tokens": DRAFT,
         "cudagraph_capture_sizes": sizes,
     }
