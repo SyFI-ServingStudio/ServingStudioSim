@@ -12,6 +12,7 @@ import argparse
 import dataclasses
 import filecmp
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -505,7 +506,13 @@ def _run_profile(args: argparse.Namespace) -> int:
         args.config,
         require_python_runtime=not args.resume,
     )
-    from alignment.image_runtime import container_config, in_image, run_profile_in_image
+    from alignment.image_runtime import (
+        container_config,
+        in_image,
+        run_profile_in_image,
+        run_profile_unhosted,
+    )
+    from reference_engines.autotune_guard import POLICY_ENV
 
     if args.runtime is None:
         # A resume re-derives artifacts from an existing capture; inside an image
@@ -524,7 +531,12 @@ def _run_profile(args: argparse.Namespace) -> int:
             "--runtime image starts a container from the host; resume an image "
             "capture on the host with --resume, and run nothing nested"
         )
-    if args.allow_autotune and args.runtime != "image":
+    # In an image that no host-side runner started (a remote job, a pod), the
+    # capture owns the autotune policy itself (`run_profile_unhosted`).
+    unhosted = (
+        in_image() and not args.resume and not args.warm_caches and POLICY_ENV not in os.environ
+    )
+    if args.allow_autotune and args.runtime != "image" and not unhosted:
         raise ValueError(
             "--allow-autotune governs the engine image's autotune guard; it needs --runtime image"
         )
@@ -551,6 +563,11 @@ def _run_profile(args: argparse.Namespace) -> int:
         if returncode == 0:
             print(f"[alignment] profiling complete: {config.log_dir}/profile_result.json")
         return returncode
+    if unhosted:
+        print(f"[alignment] profiling in this image: {args.config}")
+        run_profile_unhosted(args.config, allow_autotune=args.allow_autotune)
+        print(f"[alignment] profiling complete: {config.log_dir}/profile_result.json")
+        return 0
     print(f"[alignment] {'resuming' if args.resume else 'profiling'}: {args.config}")
     if args.warm_caches:
         # In the image, for `python -m reference_engines warm-caches` (whose

@@ -520,3 +520,100 @@ def run_profile_in_image(
     else:
         rebind_result(log_dir, path_info["paths"], host_devices)
     return returncode
+
+
+def _own_manifest() -> dict[str, Any]:
+    from profiling.exec.env import IMAGE_MANIFEST, IMAGE_MANIFEST_ENV
+
+    path = Path(os.environ.get(IMAGE_MANIFEST_ENV) or IMAGE_MANIFEST)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def own_cache_key(manifest: dict[str, Any]) -> str:
+    """`profiling/exec/local.py:image_cache_key` as seen from inside the image.
+
+    The engine and its official base digest come from the image's manifest, the
+    architecture from the GPUs this process sees; whatever mounted `/cache`
+    keyed it the same way.
+    """
+    digest = str(manifest.get("base_image", "")).rpartition("@sha256:")[2]
+    if not digest:
+        raise ImageRunError(f"the image manifest names no pinned base image: {manifest}")
+    caps = subprocess.run(
+        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    if len(set(caps)) != 1:
+        raise ImageRunError(f"the visible GPUs report compute capabilities {sorted(set(caps))}")
+    return f"{manifest['image']}-{digest[:12]}-sm{caps[0].replace('.', '')}"
+
+
+def run_profile_unhosted(config_path: Path, *, allow_autotune: bool = False) -> dict:
+    """`alignment profile` in an engine image that no host-side runner started.
+
+    A remote job or a pod runs the capture here directly, so this does what
+    `run_profile_in_image` does from a host: it owns the autotune policy. (The
+    image's own engine and nsys replace whatever the config names when it is
+    loaded in an image, `load_profile_config`.) Without
+    `allow_autotune` the capture needs a warm-caches manifest in `/cache`; when
+    there is none for this deployment, a warm-up pass runs first in this same
+    process (logged under `<log_dir>.warm-caches`) and records it, and the
+    capture then runs with tuning forbidden.
+    """
+    import dataclasses
+
+    from launcher.alignment_config import load_profile_config
+    from reference_engines.autotune_guard import (
+        ALLOW,
+        FORBID,
+        POLICY_ENV,
+        PREFLIGHT_ENV,
+        AutotuneForbiddenError,
+    )
+
+    from . import warm_caches as warm
+    from .runner import run_profile
+
+    cfg = load_profile_config(config_path)
+    engine = ENGINE_IMAGES.get(cfg.engine)
+    if engine is None:
+        raise ImageRunError(f"no alignment image runs engine {cfg.engine!r}")
+    manifest = _own_manifest()
+    if manifest.get("image") != engine.image:
+        raise ImageRunError(
+            f"a {cfg.engine} capture needs the {engine.image} image; "
+            f"this is {manifest.get('image')}"
+        )
+    if allow_autotune:
+        os.environ[POLICY_ENV] = ALLOW
+        return run_profile(cfg)
+    cache_key = own_cache_key(manifest)
+    try:
+        found = warm.preflight(cfg, config_path, Path(CACHE), cache_key)
+    except AutotuneForbiddenError:
+        log_dir = Path(cfg.log_dir)
+        warm_cfg = dataclasses.replace(
+            cfg, log_dir=str(log_dir.with_name(log_dir.name + ".warm-caches"))
+        )
+        print(f"[profile] no warm caches in {CACHE} for this deployment: warming first", flush=True)
+        os.environ[POLICY_ENV] = ALLOW
+        before = warm.snapshot(Path(CACHE))
+        started = time.monotonic()
+        run_profile(warm_cfg, warm_only=True)
+        found = warm.write_manifest(
+            cfg,
+            config_path,
+            Path(CACHE),
+            cache_key,
+            image=f"{engine.image}:{manifest.get('inputs')}",
+            image_id=str(manifest.get("inputs")),
+            before=before,
+            seconds=time.monotonic() - started,
+        )
+        print(f"[warm-caches] manifest: {found}", flush=True)
+    os.environ[POLICY_ENV] = FORBID
+    os.environ[PREFLIGHT_ENV] = f"warm-caches manifest {found}"
+    print(f"[profile] warm caches: {found}", flush=True)
+    return run_profile(cfg)

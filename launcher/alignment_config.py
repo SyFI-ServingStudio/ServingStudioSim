@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from alignment.image_runtime import ENGINE_IMAGES, NSYS, in_image
 from alignment.load_generator.config import LoadGeneratorConfig
 from alignment.profiler.config import (
     PROFILE_KINDS,
@@ -159,6 +160,12 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
         fork_python = raw.pop("fork_python", "")
         if fork_python:
             fork_python = str(_config_path_preserving_symlink(base, fork_python, "fork_python"))
+        if in_image() and raw.get("engine") in ENGINE_IMAGES:
+            # In an engine image the engine and nsys are the image's own, whatever
+            # the config names (a remote capture's config was rendered elsewhere),
+            # exactly as `container_config` writes them for a host-started run.
+            fork_python = str(ENGINE_IMAGES[raw["engine"]].fork_python)
+            nsys = replace(nsys, executable=str(NSYS))
         driver_compat_lib_dir = raw.pop("driver_compat_lib_dir", "")
         if driver_compat_lib_dir:
             driver_compat_lib_dir = str(

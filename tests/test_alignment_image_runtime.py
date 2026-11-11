@@ -194,7 +194,7 @@ def test_session_runner_is_never_built_in_the_image(monkeypatch, tmp_path):
     from alignment.load_generator import runner
 
     monkeypatch.setenv(image_runtime.RUNTIME_ENV, image_runtime.IN_IMAGE)
-    monkeypatch.setattr(runner, "SESSION_RUNNER", tmp_path / "missing")
+    monkeypatch.setattr(runner, "IMAGE_SESSION_RUNNER", tmp_path / "missing")
     monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: pytest.fail("cargo ran"))
     with pytest.raises(FileNotFoundError, match="no req-frontend binary"):
         runner.build_session_runner()
@@ -308,3 +308,97 @@ def test_sglangs_deprecated_dp_attention_spelling_is_refused_with_the_new_one(tm
     )
     with pytest.raises(ValueError, match="--attn-dp-size 4"):
         load_profile_config(path, require_python_runtime=False)
+
+
+def _unhosted(tmp_path: Path, monkeypatch, *, manifest_present: bool):
+    """`run_profile_unhosted` with the engine runs recorded instead of started."""
+
+    from alignment import runner as alignment_runner
+    from alignment import warm_caches
+    from reference_engines.autotune_guard import POLICY_ENV, PREFLIGHT_ENV
+
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(image_runtime, "CACHE", cache)
+    monkeypatch.setattr(
+        image_runtime,
+        "_own_manifest",
+        lambda: {
+            "image": "vllm",
+            "inputs": "abc",
+            "nsys": "/opt/nsys/bin/nsys",
+            "base_image": "vllm/vllm-openai@sha256:0123456789abcdef",
+        },
+    )
+    monkeypatch.setattr(
+        image_runtime.subprocess,
+        "run",
+        lambda *a, **k: type("Done", (), {"stdout": "10.0\n10.0\n"})(),
+    )
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+    monkeypatch.delenv(PREFLIGHT_ENV, raising=False)
+    monkeypatch.setenv(image_runtime.RUNTIME_ENV, image_runtime.IN_IMAGE)
+    runs = []
+
+    def run_profile(cfg, *, resume=False, warm_only=False):
+        import os
+
+        runs.append((cfg, warm_only, os.environ.get(POLICY_ENV)))
+        if warm_only:
+            (cache / "triton" / "k.bin").parent.mkdir(parents=True, exist_ok=True)
+            (cache / "triton" / "k.bin").write_text("tuned")
+        return {}
+
+    monkeypatch.setattr(alignment_runner, "run_profile", run_profile)
+    config = _config(tmp_path)
+    if manifest_present:
+        cfg = load_profile_config(config)
+        key = warm_caches.deployment_key(cfg)
+        path = warm_caches.manifest_path(cache, "vllm-0123456789ab-sm100", key)
+        path.parent.mkdir(parents=True)
+        path.write_text("{}")
+    return config, runs
+
+
+def test_an_unhosted_capture_warms_first_then_captures_without_tuning(tmp_path, monkeypatch):
+    config, runs = _unhosted(tmp_path, monkeypatch, manifest_present=False)
+    image_runtime.run_profile_unhosted(config)
+    (warm, warm_only, warm_policy), (capture, capture_only, capture_policy) = runs
+    assert (warm_only, warm_policy) == (True, "allow")
+    assert warm.log_dir.endswith("profile_nsys.warm-caches")
+    assert (capture_only, capture_policy) == (False, "forbid")
+    # The image's own engine and nsys, whatever the host profile named.
+    assert capture.fork_python == str(image_runtime.ENGINE_IMAGES["vllm"].fork_python)
+    assert capture.nsys.executable == str(image_runtime.NSYS)
+    # The warm-up recorded what the capture's preflight now finds.
+    (manifest,) = (tmp_path / "cache").rglob("*.json")
+    assert json.loads(manifest.read_text())["cache_key"] == "vllm-0123456789ab-sm100"
+
+
+def test_an_unhosted_capture_with_warm_caches_goes_straight_to_the_capture(tmp_path, monkeypatch):
+    config, runs = _unhosted(tmp_path, monkeypatch, manifest_present=True)
+    image_runtime.run_profile_unhosted(config)
+    assert [(warm_only, policy) for _, warm_only, policy in runs] == [(False, "forbid")]
+
+
+def test_an_unhosted_capture_may_tune_when_told(tmp_path, monkeypatch):
+    config, runs = _unhosted(tmp_path, monkeypatch, manifest_present=False)
+    image_runtime.run_profile_unhosted(config, allow_autotune=True)
+    assert [(warm_only, policy) for _, warm_only, policy in runs] == [(False, "allow")]
+
+
+def test_an_unhosted_capture_refuses_another_engines_image(tmp_path, monkeypatch):
+    config, _ = _unhosted(tmp_path, monkeypatch, manifest_present=False)
+    monkeypatch.setattr(image_runtime, "_own_manifest", lambda: {"image": "sglang"})
+    with pytest.raises(image_runtime.ImageRunError, match="needs the vllm image"):
+        image_runtime.run_profile_unhosted(config)
+
+
+def test_a_config_rendered_elsewhere_loads_in_the_image(tmp_path, monkeypatch):
+    # A remote capture's config names the sending machine's engine venv and nsys.
+    path = _config(tmp_path, fork_python="/nowhere/.venv/bin/python")
+    with pytest.raises(ValueError, match="fork_python does not exist"):
+        load_profile_config(path)
+    monkeypatch.setenv(image_runtime.RUNTIME_ENV, image_runtime.IN_IMAGE)
+    cfg = load_profile_config(path)
+    assert cfg.fork_python == str(image_runtime.ENGINE_IMAGES["vllm"].fork_python)
+    assert cfg.nsys.executable == str(image_runtime.NSYS)
