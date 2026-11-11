@@ -296,6 +296,16 @@ def image_tag(engine: str, root: Path = REPO_ROOT) -> str:
     return IMAGES[ENGINE_IMAGES[engine].image].tag(root)
 
 
+def container_cache_path(path: Path, cache_dir: Path) -> PurePosixPath:
+    """Where a file under the host `cache_dir` appears inside the container.
+
+    Anything handed to the container environment uses this form: nsys records
+    the environment in the `.nsys-rep`, and a host path there names the host's
+    user and layout in a published capture.
+    """
+    return CACHE / PurePosixPath(Path(path).resolve().relative_to(Path(cache_dir).resolve()))
+
+
 def docker_argv(
     image: str,
     mounts: Mounts,
@@ -445,7 +455,9 @@ def run_profile_in_image(
         # Instant, and before anything starts: the guard in the engine is only
         # the backstop for a manifest whose key turns out incomplete.
         manifest = warm.preflight(cfg, config_path, cache_dir, cache_key)
-        autotune_env[PREFLIGHT_ENV] = f"warm-caches manifest {manifest}"
+        autotune_env[PREFLIGHT_ENV] = (
+            f"warm-caches manifest {container_cache_path(manifest, cache_dir)}"
+        )
         print(f"[profile] warm caches: {manifest}", flush=True)
 
     container_config_path = log_dir / CONTAINER_CONFIG_NAME
