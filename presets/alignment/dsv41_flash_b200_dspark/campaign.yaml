@@ -324,14 +324,7 @@ variants:
       batch_policy: mix
       draft_tokens: 5
       acceptance_seed: 73
-      kv_admission_policy: bounded-future
-      kv_page_size: 1
-      kv_max_future_tokens: 6
-      kv_initial_new_token_ratio: 0.0
-      kv_minimum_new_token_ratio: 0.0
-      kv_new_token_ratio_decay_steps: 1
-      kv_retract_decode_steps: 1
-      decode_retraction_policy: fcfs
+      dp_placement: vllm-least-loaded
     profile_passes:
     - kind: workload_metrics
       name: profile_workload
@@ -406,14 +399,7 @@ variants:
       batch_policy: mix
       draft_tokens: 5
       acceptance_seed: 73
-      kv_admission_policy: bounded-future
-      kv_page_size: 1
-      kv_max_future_tokens: 6
-      kv_initial_new_token_ratio: 0.0
-      kv_minimum_new_token_ratio: 0.0
-      kv_new_token_ratio_decay_steps: 1
-      kv_retract_decode_steps: 1
-      decode_retraction_policy: fcfs
+      dp_placement: vllm-least-loaded
     profile_passes:
     - kind: workload_metrics
       name: profile_workload
@@ -492,14 +478,7 @@ variants:
       batch_policy: mix
       draft_tokens: 5
       acceptance_seed: 73
-      kv_admission_policy: bounded-future
-      kv_page_size: 1
-      kv_max_future_tokens: 6
-      kv_initial_new_token_ratio: 0.0
-      kv_minimum_new_token_ratio: 0.0
-      kv_new_token_ratio_decay_steps: 1
-      kv_retract_decode_steps: 1
-      decode_retraction_policy: fcfs
+      dp_placement: vllm-least-loaded
     profile_passes:
     - kind: workload_metrics
       name: profile_workload
@@ -640,14 +619,7 @@ variants:
       batch_policy: mix
       draft_tokens: 5
       acceptance_seed: 73
-      kv_admission_policy: bounded-future
-      kv_page_size: 1
-      kv_max_future_tokens: 6
-      kv_initial_new_token_ratio: 0.0
-      kv_minimum_new_token_ratio: 0.0
-      kv_new_token_ratio_decay_steps: 1
-      kv_retract_decode_steps: 1
-      decode_retraction_policy: fcfs
+      dp_placement: vllm-least-loaded
     profile_passes:
     - kind: workload_metrics
       name: profile_workload

@@ -178,6 +178,13 @@ def variant(topo: str, chunk: int) -> dict:
         "kv_retract_decode_steps": 1,
         "decode_retraction_policy": "fcfs",
     }
+    if topo == "dp4":
+        # Four attention partitions: the simulator validates bounded-future KV admission for one partition only
+        # (worker/admission/chunked_prefill_admission.rs), so DP4 keeps the default admission. Requests go to the
+        # least-loaded rank, as vLLM's DP coordinator does.
+        for key in [k for k in worker if k.startswith("kv_") or k == "decode_retraction_policy"]:
+            del worker[key]
+        worker["dp_placement"] = "vllm-least-loaded"
     return {
         "deployment": "unified",
         "gpu": "NVIDIA B200",
