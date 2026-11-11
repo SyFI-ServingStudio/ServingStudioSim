@@ -762,12 +762,12 @@ takes them off before dispatch): `--no-gpu`, and `--remote NAME` with repeatable
 
 ### Remote execution
 
-`--remote NAME` runs a simulation, `timing-predict` or `kernel-profile
-run|measure` on another machine — to use its CPUs, disk or GPUs — and blocks
-until the results are back here. The command is otherwise the one you would run
-locally. A simulation or prediction runs with `--no-gpu --no-plot`, so it never
-profiles and never draws PNGs; a kernel profile runs each worker in its env's
-image (below).
+`--remote NAME` runs a simulation, `timing-predict`, `kernel-profile
+run|measure|fill` or a campaign's capture on another machine — to use its CPUs,
+disk or GPUs — and blocks until the results are back here. The command is
+otherwise the one you would run locally. A simulation or prediction runs with
+`--no-gpu --no-plot`, so it never profiles and never draws PNGs; GPU work runs
+in its env's profiler image (below).
 
 ```
 python -m launcher presets/x.yaml --remote bigbox
@@ -794,8 +794,9 @@ so use a key file without a passphrase) and one shared ControlMaster connection
 under `$TMPDIR`. When `.remote/known_hosts` exists beside remote.yaml it is the
 only host-key store, so a sandbox that cannot write `~/.ssh` still connects;
 seed it once with `ssh-keyscan host >> .remote/known_hosts`. The remote needs
-`bash`, `rsync`, `flock`, `uv` and `cargo` on its login-shell PATH; Slurm needs
-the workdir on a filesystem its compute nodes share.
+`bash`, `rsync` and `flock` on its login-shell PATH, plus `uv` and `cargo` for a
+simulation or prediction, or docker for GPU work (below); Slurm needs the
+workdir on a filesystem its compute nodes share.
 
 **What happens** (`remote/run.py`):
 
@@ -862,47 +863,84 @@ launcher recomputes the hash against its own checkout and refuses a set built
 from other sources or another Python, and checks the schema against the
 simulator's own `list-params`. Only `--build-type release` can use it.
 
-**Kernel profiling** (`kernel-profile run|measure --remote`). The remote job
-runs with `VIBESIM_PROFILE_RUNTIME=container`: every worker runs in the image
-`profiling/container/images.py` assigns its profile env — never on a host
-interpreter, and an env with no image is refused — so the remote needs only
-docker with the NVIDIA runtime. The image is named by a hash of its dependency
-inputs; when the remote lacks it, it is sent from here, so build it here first.
-Only the layers the remote lacks move (`remote/image_send.py`): the image is
-pushed to a `registry` container on this machine's loopback, over a persistent
-store (`~/.cache/vibesim-profiler/registry`, or `VIBESIM_PROFILE_REGISTRY_DIR`),
-and the remote pulls it through an `ssh -R` forward, then the image id is
-checked against this one. A new tag of an image the remote already has costs
-its last few layers (seconds); the first send of an image pays for compressing
-all of it into the store, and a remote whose layers came from `docker load`
-pulls them once more, since docker cannot match them to registry digests. `python -m launcher.remote.image_send clear` empties the store.
-Under Slurm the job
-asks for the GPUs its specs need (`--gres=gpu:N`, or more with `launch.slurm.gpus`)
-and the controller addresses them by UUID. The JIT cache persists in
-`<workdir>/cache`.
+**GPU work** (`kernel-profile run|measure|fill` and `alignment-campaign run
+--phase <profile pass>`). A GPU job always runs on the interpreters of its env's
+profiler image (`profiling/container/images.py`) over the shipped tree — never
+on a host venv, and an env with no image is refused. Nothing GPU-side is built
+or installed on the remote: no venv, no torch, no cargo. With `profile_runtime:
+docker` (the default) each GPU job is one container of that image
+(`remote/launch.py` `container_script`), a temporary in-image pod: the shipped
+tree, job directory, node-local scratch and every `mounts` entry are
+bind-mounted at the same absolute path, and `node.py` runs on the image's
+interpreter. So a remote used only for GPU work needs ssh, rsync, and docker
+with GPU support (the user in the docker group, a driver that runs the image's
+CUDA).
 
-`--output-dir` is required and must be under `logs/`; `--db` is refused. The job
-measures into its own profile.db copy, which is fetched and merged into this
-checkout's (`VIBESIM_PROFILE_DB` or `profiling/profile.db`) under the profile-DB
-write lease. A conflicting row merges nothing: the report is left in the output
-directory. `--fresh` writes no rows and merges nothing. The whole output
-directory comes back; `remote-run.json` adds the image and its id, and the
-artifact metadata carries the observed GPU as for a local run. Under a managed
-job the `kp_`/`km_` id is registered here and seeded into the remote output
-directory, as for a prediction.
+The image is named by a hash of its dependency inputs; when the remote lacks
+it, it is sent from here, so build it here first. Only the layers the remote
+lacks move (`remote/image_send.py`): the image is pushed to a `registry`
+container on this machine's loopback, over a persistent store
+(`~/.cache/vibesim-profiler/registry`, or `VIBESIM_PROFILE_REGISTRY_DIR`), and
+the remote pulls it through an `ssh -R` forward, then the image id is checked
+against this one. A new tag of an image the remote already has costs its last
+few layers (seconds); the first send of an image pays for compressing all of it
+into the store, and a remote whose layers came from `docker load` pulls them
+once more, since docker cannot match them to registry digests. `python -m
+launcher.remote.image_send clear` empties the store.
+
+The container's GPUs are named by UUID, in the device request and in
+`CUDA_VISIBLE_DEVICES` (as `profiling/exec/local.py` does: under Slurm's device
+cgroup an index means another card to dockerd, and rootless Podman ignores the
+request). Under Slurm the job asks for the GPUs it needs (`--gres=gpu:N`, or
+more with `launch.slurm.gpus`) and takes those it was allocated; a direct
+remote lists its `gpus`, or says `gpus: auto` to take idle ones (no compute
+process, little memory used) when the job starts. Where other users run GPU
+work outside the scheduler, `gpu_wait: {min_free_mib, quiet_s, timeout_s}`
+holds the container until its GPUs have that much free memory, logging who
+holds them, and gives up with exit 75. `/cache` (JIT, compile and tactic
+caches, `HOME`) is `<workdir>/cache/<key>`, keyed per image base and GPU
+architecture as `image_cache_key` keys it locally.
+
+- `kernel-profile run|measure --remote NAME`: the controller and its workers
+  run in one container (`VIBESIM_PROFILE_RUNTIME=in-image`). `--output-dir` is
+  required and must be under `logs/`; `--db` is refused. The job measures into
+  its own profile.db copy, which is fetched and merged into this checkout's
+  (`VIBESIM_PROFILE_DB` or `profiling/profile.db`) under the profile-DB write
+  lease. A conflicting row merges nothing: the report is left in the output
+  directory. `--fresh` writes no rows and merges nothing. The whole output
+  directory comes back; `remote-run.json` adds the image and its id, and the
+  artifact metadata carries the observed GPU as for a local run. Under a
+  managed job the `kp_`/`km_` id is registered here and seeded into the remote
+  output directory, as for a prediction.
+- `kernel-profile fill --work WORK.json --output-dir logs/... --remote NAME`:
+  measure the work list `python -m launcher PRESET --export-missing WORK.json`
+  wrote (the specs a cache build would measure, found without a GPU), split
+  per profiler image, one job each; the rows merge into this profile.db.
+- `alignment-campaign run --phase <profile pass> --remote NAME`: the cases are
+  rendered here, with a host profile that names the remote's model and corpus
+  paths and device role `"0"` (the container sees only its GPUs,
+  `presets/alignment/hosts/example.yaml`). The ready cases are sent, and one
+  job captures them in turn on the image's capture interpreter, with the
+  image's own engine and nsys whatever the profile names. With no host-side
+  runner around it, the capture owns its autotune policy
+  (`alignment/image_runtime.py` `run_profile_unhosted`): without
+  `--allow-autotune` it needs a warm-caches manifest in `/cache`, and when there
+  is none for the deployment a warm-up pass runs first in the same job (under
+  `<phase>.warm-caches`), so the capture itself never tunes. Each case's phase
+  directory comes back whole, `.nsys-rep` included, and profile results record
+  paths relative to their directory, so a copy reads here. Every other
+  campaign verb and phase runs here.
 
 **A remote that is a profiler image** (`profile_runtime: in-image`, e.g. a
-RunPod pod started from one). There is no docker inside, so the job runs with
-`VIBESIM_PROFILE_RUNTIME=in-image`: controller and workers run on the image's
-own interpreter, and only the envs that image serves. Before anything runs, the
-remote's `/etc/vibesim-profiler-image.json` (written by every profiler
-Dockerfile) must name the inputs of the image this checkout assigns the
-backend's env; nothing is built, synced or sent. Such a remote runs
-`kernel-profile` only. Workers never use an image's entrypoint (an engine image
-has none, others' is the worker), so start the pod with entrypoint `bash -c` and
-this command, which installs ssh and rsync, keeps
-the image's environment for ssh sessions, and authorizes the pod's
-`PUBLIC_KEY`:
+RunPod pod started from one). There is no docker inside, so the GPU jobs above
+run on the pod's own interpreters, and only for the envs that image serves.
+Before anything runs, the remote's `/etc/vibesim-profiler-image.json` (written
+by every profiler Dockerfile) must name the inputs of the image this checkout
+assigns the env; nothing is built, synced or sent. Such a remote runs GPU work
+only. Workers never use an image's entrypoint (an engine image has none,
+others' is the worker), so start the pod with entrypoint `bash -c` and this
+command, which installs ssh and rsync, keeps the image's environment for ssh
+sessions, and authorizes the pod's `PUBLIC_KEY`:
 
 ```
 export -p | grep -vE '^declare -x (HOME|PWD|OLDPWD|SHLVL)=' > /etc/profile.d/00-vibesim-image.sh
@@ -914,37 +952,6 @@ chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && exec /usr/sbin/s
 Expose `22/tcp` (RunPod's proxied ssh cannot carry rsync), pull the image from
 a registry under the same tag (`docker tag` + `docker push` from here), and
 set `ephemeral: true` so results come back whole.
-
-**Full remote profile** (`profile_runtime: full-remote-profile`). The remote
-does only the GPU work, the nsys capture of a serving run and kernel
-profiling, and needs no ServingStudio setup: ssh, rsync, and docker with GPU
-support (the user in the docker group, a driver that runs the image's CUDA).
-Everything else (labeling, timing-predict, simulation, analysis, the services)
-runs here on what comes back. Each job is one container of the profiler image
-(`remote/launch.py` `container_script`): the shipped tree, job directory,
-node-local scratch and every `mounts` entry are bind-mounted at the same
-absolute path, and `node.py` runs on the image's interpreter, as on an
-in-image pod. Nothing is built or synced there; the image is sent from here
-when the remote lacks it. Under Slurm the container gets the allocated GPUs;
-a direct remote lists its `gpus`, or says `gpus: auto` to take idle ones (no
-compute process, little memory used) when the job starts. Where other users
-run GPU work outside the scheduler, `gpu_wait: {min_free_mib, quiet_s,
-timeout_s}` holds the container until its GPUs have that much free memory,
-logging who holds them. Such a remote refuses simulation and timing-predict.
-It runs:
-
-- `kernel-profile run|measure --remote NAME`, as above.
-- `alignment-campaign run --phase <profile pass> --remote NAME`: render the
-  cases here with a host profile that names the remote's paths, the image's
-  engine (`/opt/vibesim/alignment/profiler/vllm/.venv/bin/python`) and nsys
-  (`/usr/local/bin/nsys`), and device role `"0"` (the container sees only its
-  GPUs). The ready cases are sent, one job captures them in turn, and each
-  case's phase directory comes back whole, `.nsys-rep` included. Profile
-  results record paths relative to their directory, so a copy reads here.
-- `kernel-profile fill --work WORK.json --output-dir logs/... --remote NAME`:
-  measure the work list `python -m launcher PRESET --export-missing WORK.json`
-  wrote (the specs a cache build would measure, found without a GPU), split
-  per profiler image, one job each; the rows merge into this profile.db.
 
 **Limits.** One invocation is one blocking remote job; a managed job's
 capability token must outlive it (6 h). A job whose process or allocation

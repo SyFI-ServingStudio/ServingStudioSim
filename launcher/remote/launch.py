@@ -13,10 +13,10 @@ slurm
     submitting environment by default, so the script clears the managed-job
     context before anything runs (node.py clears it again).
 
-Under ``profile_runtime: full-remote-profile`` either form runs
-``JOBDIR/container.sh`` instead (`container_script`): one ``docker run`` of a
-profiler image whose own interpreter runs ``node.py run-job``. Its pid file is
-the container's, so the host side is tracked by ``launch.pid`` alone.
+A GPU job on a ``profile_runtime: docker`` remote runs ``JOBDIR/container.sh``
+in either form instead (`container_script`): one ``docker run`` of a profiler
+image whose own interpreter runs ``node.py run-job``. Its pid file is the
+container's, so the host side is tracked by ``launch.pid`` alone.
 """
 
 from __future__ import annotations
@@ -61,7 +61,11 @@ def node_command(remote_python: PurePosixPath, jobdir: PurePosixPath) -> str:
 
 @dataclass(frozen=True)
 class Container:
-    """A full-remote-profile job: run ``node.py`` in ``image`` on ``python``."""
+    """A GPU job on a `docker` remote: ``node.py`` in a container of ``image``.
+
+    The container is a temporary in-image pod: the job runs on the image's own
+    ``python`` over the shipped tree, mounted at its own path.
+    """
 
     image: str
     python: PurePosixPath
@@ -73,10 +77,12 @@ class Container:
     gpu_wait: GpuWait | None = None
     # How many GPUs the job needs; `gpus: auto` takes that many idle ones.
     gpu_count: int = 1
+    # The image's `ai.vibesim.cache-key` label; empty for an image without one.
+    cache_label: str = ""
 
 
 # Quoted twice: docker reads the value as CSV, so a GPU list needs its own quotes.
-GPU_REQUEST = '"\\"device=$gpus\\""'
+GPU_REQUEST = '"\\"device=$uuids\\""'
 
 
 def container_name(job_id: str) -> str:
@@ -103,8 +109,9 @@ def _auto_gpu_lines(container: Container, jobdir: PurePosixPath) -> list[str]:
         "    pick=$(nvidia-smi --query-gpu=index,uuid,memory.used,memory.free "
         "--format=csv,noheader,nounits | while IFS=', ' read -r i u used free; do "
         f'case "$busy" in *"$u"*) continue;; esac; [ "$used" -lt {IDLE_USED_MIB} ] '
-        f'&& [ "$free" -ge {wait.min_free_mib} ] && echo "$i"; done | head -n "$count" | paste -sd, -)',
-        '    if [ -n "$pick" ] && [ "$(echo "$pick" | tr , "\n" | wc -l)" -eq "$count" ] '
+        f'&& [ "$free" -ge {wait.min_free_mib} ] && echo "$i"; done '
+        '| head -n "$count" | paste -sd, -)',
+        '    if [ -n "$pick" ] && [ "$(echo "$pick" | tr , "\\n" | wc -l)" -eq "$count" ] '
         '&& [ "$pick" = "$prev" ]; then',
         f'      [ "$quiet" -ge {wait.quiet_s} ] && break',
         "      quiet=$((quiet + 5))",
@@ -133,10 +140,7 @@ def _gpu_wait_lines(wait: GpuWait | None, jobdir: PurePosixPath) -> list[str]:
     return [
         f"need={wait.min_free_mib}; quiet=0; waited=0; last=0",
         "while :; do",
-        # A Slurm job's nvidia-smi sees only its own GPUs (renumbered from 0).
-        '  if [ -n "${SLURM_JOB_ID:-}" ]; then free=$(nvidia-smi --query-gpu=memory.free '
-        "--format=csv,noheader,nounits); else free=$(for g in ${gpus//,/ }; do nvidia-smi "
-        '-i "$g" --query-gpu=memory.free --format=csv,noheader,nounits; done); fi',
+        '  free=$(nvidia-smi -i "$uuids" --query-gpu=memory.free --format=csv,noheader,nounits)',
         "  low=$(echo \"$free\" | awk -v n=$need 'NF && $1 < n' | wc -l)",
         '  if [ "$low" -eq 0 ]; then',
         f'    [ "$quiet" -ge {wait.quiet_s} ] && break',
@@ -145,65 +149,127 @@ def _gpu_wait_lines(wait: GpuWait | None, jobdir: PurePosixPath) -> list[str]:
         f'  if [ "$waited" -ge {wait.timeout_s} ]; then echo "[remote] GPU(s) $gpus never had '
         f'$need MiB free for {wait.quiet_s} s within {wait.timeout_s} s" >> {log}; '
         f"echo {GPU_WAIT_TIMEOUT} > {q(jobdir / 'exit_code')}; exit {GPU_WAIT_TIMEOUT}; fi",
-        '  if [ "$low" -ne 0 ] && [ $((waited - last)) -ge 300 -o "$waited" -eq 0 ]; then last=$waited; '
-        "echo \"[remote] waiting for $need MiB free on GPU(s) $gpus; held by: $(nvidia-smi "
+        '  if [ "$low" -ne 0 ] && [ $((waited - last)) -ge 300 -o "$waited" -eq 0 ]; '
+        "then last=$waited; "
+        'echo "[remote] waiting for $need MiB free on GPU(s) $gpus; held by: $(nvidia-smi '
         "--query-compute-apps=pid,used_memory --format=csv,noheader | while IFS=, read -r p m; do "
-        'printf "%s(%s,%s) " "$(ps -o user= -p "$p" 2>/dev/null)" "$p" "$m"; done)\" >> ' + f"{log}; fi",
+        'printf "%s(%s,%s) " "$(ps -o user= -p "$p" 2>/dev/null)" "$p" "$m"; done)" >> '
+        + f"{log}; fi",
         "  sleep 5; waited=$((waited + 5))",
         "done",
     ]
 
 
-def container_script(container: Container, *, job_id: str, jobdir: PurePosixPath, cwd: PurePosixPath) -> str:
+def container_script(
+    container: Container, *, job_id: str, jobdir: PurePosixPath, cwd: PurePosixPath
+) -> str:
     """The host side of one container job.
 
     The container sees the workdir, node-local scratch and each mount at the
     same absolute path, so ``job.json`` names the same files on both sides.
-    It runs in the background so a TERM (``kill`` here, ``scancel``) reaches
-    the trap, which stops the container; node.py inside records the exit code.
-    A container that never started records the ``docker run`` status instead.
+    Its GPUs are named by UUID (`profiling/exec/local.py:gpu_uuids_for_indices`:
+    under Slurm's device cgroup an index means another card to dockerd), both
+    in the device request and in ``CUDA_VISIBLE_DEVICES``, which a runtime that
+    ignores the request (rootless Podman) still honours. ``/cache`` is the
+    image's persistent cache directory for these cards, keyed as
+    `profiling/exec/local.py:image_cache_key` keys it. The container runs in the
+    background so a TERM (``kill`` here, ``scancel``) reaches the trap, which
+    stops it; node.py inside records the exit code. A container that never
+    started records the ``docker run`` status instead.
     """
 
     name = container_name(job_id)
+    log = q(jobdir / "stdout.log")
     volumes = []
     for path in dict.fromkeys((container.workdir, container.node_local, *container.mounts)):
         volumes += ["--volume", f"{path}:{path}"]
-    # The profiler images point their JIT caches (Triton, torch extensions) at
-    # /cache, as the container workers mount it; keep them across jobs.
-    volumes += ["--volume", f"{container.workdir / 'cache'}:/cache"]
+    cache_root = container.workdir / "cache"
+    volumes += ["--volume", "$cache:/cache"]
     configured = ",".join(container.gpus)
-    home = container.workdir / "cache" / "home"
     run = [
-        "docker", "run", "--rm", "--init", "--name", name,
-        "--ipc", "host",
-        "--gpus", GPU_REQUEST,
-        "--user", "$(id -u):$(id -g)",
-        "--env", f"HOME={home}", "--env", "USER=vibesim", "--env", "LOGNAME=vibesim",
+        "docker",
+        "run",
+        "--rm",
+        "--init",
+        "--name",
+        name,
+        "--ipc",
+        "host",
+        "--ulimit",
+        "memlock=-1:-1",
+        "--gpus",
+        GPU_REQUEST,
+        "--env",
+        "CUDA_VISIBLE_DEVICES=$uuids",
+        "--user",
+        "$(id -u):$(id -g)",
+        "--env",
+        "HOME=/cache/home",
+        "--env",
+        "USER=vibesim",
+        "--env",
+        "LOGNAME=vibesim",
+        # Every input is on a mount; never fetch a checkpoint mid-measurement.
+        "--env",
+        "HF_HUB_OFFLINE=1",
         *volumes,
-        "--workdir", str(cwd),
-        "--entrypoint", str(container.python),
+        "--workdir",
+        str(cwd),
+        "--entrypoint",
+        str(container.python),
         container.image,
-        "-m", "launcher.remote.node", "run-job", str(jobdir),
+        "-m",
+        "launcher.remote.node",
+        "run-job",
+        str(jobdir),
     ]
+    shell_words = (GPU_REQUEST, "$(id -u):$(id -g)", "CUDA_VISIBLE_DEVICES=$uuids", "$cache:/cache")
     quoted = " ".join(
-        part if part in (GPU_REQUEST, "$(id -u):$(id -g)") else shlex.quote(part)
+        f'"{part}"'
+        if part in shell_words[2:]
+        else part
+        if part in shell_words
+        else shlex.quote(part)
         for part in run
     )
+    fallback_key = container.image.replace("/", "_").replace(":", "_")
     return "\n".join(
         [
             "#!/bin/bash",
             "set -uo pipefail",
             f"gpus={shlex.quote(configured)}",
-            # Slurm names the allocated GPUs by index; docker, outside the
-            # job's cgroup, addresses the same physical devices.
-            'if [ -z "$gpus" ]; then gpus=${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-${CUDA_VISIBLE_DEVICES:-}}}; fi',
+            # Slurm's CUDA_VISIBLE_DEVICES is in nvidia-smi's own numbering,
+            # whether or not the device cgroup renumbers the job's cards.
+            'if [ -z "$gpus" ]; then '
+            "gpus=${CUDA_VISIBLE_DEVICES:-${SLURM_JOB_GPUS:-${SLURM_STEP_GPUS:-}}}; fi",
             'if [ -z "$gpus" ]; then echo "[remote] no GPUs for this job: set gpus in remote.yaml '
-            'or ask Slurm for them" >> ' + f"{q(jobdir / 'stdout.log')}; "
+            f'or ask Slurm for them" >> {log}; '
             f"echo 2 > {q(jobdir / 'exit_code')}; exit 2; fi",
-            f"mkdir -p {q(home)} {q(container.workdir / 'cache')}",
             *_auto_gpu_lines(container, jobdir),
+            'uuids=$(nvidia-smi -i "$gpus" --query-gpu=uuid --format=csv,noheader | paste -sd, -)',
+            'if [ -z "$uuids" ]; then echo "[remote] nvidia-smi names no GPU $gpus" >> '
+            f"{log}; echo 2 > {q(jobdir / 'exit_code')}; exit 2; fi",
             *_gpu_wait_lines(container.gpu_wait, jobdir),
-            f"echo \"[remote] container {name} on GPU(s) $gpus ({container.image})\" >> {q(jobdir / 'stdout.log')}",
+            *(
+                [
+                    'caps=$(nvidia-smi -i "$uuids" --query-gpu=compute_cap '
+                    "--format=csv,noheader | sort -u)",
+                    'if [ "$(echo "$caps" | wc -l)" -ne 1 ]; then echo "[remote] GPU(s) $gpus mix '
+                    f'compute capabilities: $caps" >> {log}; '
+                    f"echo 2 > {q(jobdir / 'exit_code')}; exit 2; fi",
+                ]
+                if container.cache_label
+                else []
+            ),
+            (
+                f"cache={q(cache_root)}/{shlex.quote(container.cache_label)}"
+                '-sm$(echo "$caps" | tr -d .)'
+                if container.cache_label
+                else f"cache={q(cache_root / fallback_key)}"
+            ),
+            'mkdir -p "$cache/home"',
+            f'echo "[remote] container {name} on GPU(s) $gpus ($uuids), {container.image}, '
+            f'cache $cache" >> {log}',
             f"stop() {{ docker kill --signal TERM {name} >/dev/null 2>&1; }}",
             "trap stop TERM INT HUP",
             f"{quoted} &",
@@ -309,8 +375,7 @@ def status_script(submitted: Submitted, offset: int) -> str:
             else f"cat {jobdir}/pid 2>/dev/null || cat {jobdir}/launch.pid"
         )
         alive = (
-            f"pid=$({pid}); "
-            'if kill -0 "$pid" 2>/dev/null; then echo alive=1; else echo alive=0; fi'
+            f'pid=$({pid}); if kill -0 "$pid" 2>/dev/null; then echo alive=1; else echo alive=0; fi'
         )
     return (
         f"if [ -f {jobdir}/exit_code ]; then echo exit=$(cat {jobdir}/exit_code); "

@@ -42,11 +42,10 @@ from pathlib import Path, PurePosixPath
 
 from ..cli import GlobalOptions
 from . import image_send, launch
-from .config import AUTO_GPUS, FULL_REMOTE_PROFILE, Remote, RemoteConfigError, load_remote
+from .config import AUTO_GPUS, Remote, RemoteConfigError, load_remote
 from .layout import Layout
 from .node import SHIPPED_MARKER
 from .source import (
-    CPU_GROUPS,
     REPO_ROOT,
     Source,
     SourceError,
@@ -120,9 +119,9 @@ class Session:
         self.layout = Layout(remote.workdir)
         self.source: Source | None = None
         self.bin_dir: PurePosixPath | None = None
-        # The remote is itself a profiler image (`prepare_in_image`).
-        self.in_image = False
-        # A full-remote-profile job: the container it runs in (`prepare_full_remote_profile`).
+        # A GPU job runs on a profiler image's own interpreter (`prepare_image_job`),
+        # in a container of it on a `docker` remote.
+        self.image_python: PurePosixPath | None = None
         self.container: launch.Container | None = None
         # The job's own venv, when it is not the version's (CPU) `.venv`.
         self.job_venv: PurePosixPath | None = None
@@ -316,9 +315,7 @@ class Session:
         """Run ``python -m launcher ARGV`` there; ``keep_db`` keeps its profile.db copy."""
 
         source, bin_dir = self.source, self.bin_dir
-        assert source is not None and (
-            bin_dir is not None or self.in_image or self.container is not None
-        )
+        assert source is not None and (bin_dir is not None or self.image_python is not None)
         job_id = f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
         jobdir = self.layout.job(job_id)
         src = self.layout.src(source.version)
@@ -330,6 +327,7 @@ class Session:
             "env": {**self.remote.env, **(env or {})},
             "keep_db": keep_db,
             "venv": str(self.job_venv or src / ".venv"),
+            **({"python": str(self.image_python)} if self.image_python else {}),
             "node_local": str(self.remote.node_local),
             "bin_dir": "" if bin_dir is None else str(bin_dir),
             "sender": socket.gethostname(),
@@ -343,7 +341,7 @@ class Session:
             job_id=job_id,
             jobdir=jobdir,
             cwd=src,
-            remote_python=self.layout.python(source.version),
+            remote_python=self.image_python or self.layout.python(source.version),
             container=self.container,
         )
         where = f"Slurm job {submitted.handle}" if submitted.slurm else f"pid {submitted.handle}"
@@ -435,59 +433,33 @@ class Session:
             raise RemoteRunError(f"{self.remote.name} loaded {tag} as {sent}, not {image_id}")
         return sent
 
-    def prepare_in_image(self, env_name: str, tag: str) -> str:
-        """Run jobs on the interpreter of the profiler image the remote is; its inputs.
+    def prepare_image_job(
+        self, env_name: str, tag: str, *, capture: bool = False, gpu_count: int = 1
+    ) -> str:
+        """Run the next job on the interpreter of profiler image ``tag``.
 
-        The remote must be ``tag``, the image this checkout names for
-        ``env_name``: its manifest (written by every profiler Dockerfile) has to
-        carry the same inputs hash and serve the env. Nothing is built there.
+        On an `in-image` remote (a pod) the remote is that image; on a `docker`
+        remote the job is one container of it, sent from here when the remote
+        lacks it. Nothing is built or installed there. The image's manifest must
+        serve ``env_name``; ``capture`` picks its capture interpreter over the one
+        that runs kernel workers. Returns the image inputs (a pod, which has no
+        docker to name an image id) or the image id.
         """
 
         from profiling.exec.env import IMAGE_MANIFEST
 
-        source = self.source
-        assert source is not None
-        found = self.transport.run(f"cat {q(IMAGE_MANIFEST)}", check=False)
-        try:
-            manifest = json.loads(found.stdout)
-        except ValueError:
-            manifest = None
-        if found.returncode != 0 or not isinstance(manifest, dict):
-            raise RemoteRunError(
-                f"{self.remote.name} has profile_runtime: in-image, but no profiler image "
-                f"manifest at {IMAGE_MANIFEST}: it does not run a profiler image "
-                "(or one built before the manifest existed)"
+        assert self.source is not None
+        pod = self.remote.profile_runtime == "in-image"
+        if pod:
+            found = self.transport.run(f"cat {q(IMAGE_MANIFEST)}", check=False)
+            image_id = ""
+        else:
+            self.check_container_host()
+            image_id = self.ensure_image(tag)
+            found = self.transport.run(
+                f"docker run --rm --network none --entrypoint cat {q(tag)} {q(IMAGE_MANIFEST)}",
+                check=False,
             )
-        inputs = tag.rpartition(":")[2]
-        if manifest.get("inputs") != inputs or env_name not in manifest.get("envs", ()):
-            raise RemoteRunError(
-                f"{env_name} needs image {tag}, but {self.remote.name} runs an image "
-                f"with inputs {manifest.get('inputs')} serving {manifest.get('envs')}"
-            )
-        src = self.layout.src(source.version)
-        venv = PurePosixPath(manifest["python"]).parents[1]
-        self.transport.run(f"ln -sfn {q(venv)} {q(src / '.venv')}")
-        self.in_image = True
-        return inputs
-
-    def prepare_full_remote_profile(self, env_name: str, tag: str) -> str:
-        """Run jobs in a container of ``tag`` on the remote; the image id.
-
-        The remote needs only docker: nothing is built or synced there. The
-        image is sent from here when the remote lacks it, and its manifest must
-        serve ``env_name``. The version's ``.venv`` names the image's venv, a
-        path that exists inside the container only.
-        """
-
-        from profiling.exec.env import IMAGE_MANIFEST
-
-        source = self.source
-        assert source is not None
-        self.check_container_host()
-        image_id = self.ensure_image(tag)
-        found = self.transport.run(
-            f"docker run --rm --entrypoint cat {q(tag)} {q(IMAGE_MANIFEST)}", check=False
-        )
         # Some hosts wrap docker and print a banner first.
         text = found.stdout[found.stdout.find("{") :] if "{" in found.stdout else ""
         try:
@@ -495,36 +467,44 @@ class Session:
         except ValueError:
             manifest = None
         if found.returncode != 0 or not isinstance(manifest, dict):
-            raise RemoteRunError(f"image {tag} on {self.remote.name} has no profiler manifest")
+            where = f"{self.remote.name} (profile_runtime: in-image)" if pod else f"image {tag}"
+            raise RemoteRunError(
+                f"{where} has no profiler image manifest at {IMAGE_MANIFEST}"
+                + (": it does not run a profiler image" if pod else "")
+            )
+        inputs = tag.rpartition(":")[2]
+        if pod and manifest.get("inputs") != inputs:
+            raise RemoteRunError(
+                f"{env_name} needs image {tag}, but {self.remote.name} runs an image "
+                f"with inputs {manifest.get('inputs')}"
+            )
         if env_name not in manifest.get("envs", ()):
             raise RemoteRunError(
                 f"{env_name} needs image {tag}, but its manifest serves {manifest.get('envs')}"
             )
-        python = PurePosixPath(manifest["python"])
-        src = self.layout.src(source.version)
-        self.transport.run(f"ln -sfn {q(python.parents[1])} {q(src / '.venv')}")
+        python = manifest.get("capture_python") if capture else manifest.get("python")
+        if not python:
+            raise RemoteRunError(f"image {tag} runs no alignment captures (no capture_python)")
+        self.image_python = PurePosixPath(python)
+        if pod:
+            return inputs
+        label = self.transport.run(
+            "docker image inspect --format "
+            + q('{{index .Config.Labels "ai.vibesim.cache-key"}}')
+            + f" {q(tag)}",
+            check=False,
+        ).stdout.strip()
         self.container = launch.Container(
             image=tag,
-            python=python,
+            python=self.image_python,
             workdir=self.layout.workdir,
             node_local=self.remote.node_local,
             mounts=self.remote.mounts,
             gpus=self.remote.gpus,
             gpu_wait=self.remote.gpu_wait,
+            gpu_count=gpu_count,
+            cache_label="" if label in ("", "<no value>", "unknown") else label,
         )
-        return image_id
-
-    def prepare_gpu_only(self, env_name: str, tag: str, *, gpu_count: int = 1) -> str:
-        """Run the job on ``tag``'s interpreter: in a container of it, or on a remote that is it.
-
-        Returns the image id (a container host) or the image inputs (an in-image pod).
-        """
-
-        if self.remote.profile_runtime == "in-image":
-            return self.prepare_in_image(env_name, tag)
-        image_id = self.prepare_full_remote_profile(env_name, tag)
-        assert self.container is not None
-        self.container = dataclasses.replace(self.container, gpu_count=gpu_count)
         return image_id
 
     def check_container_host(self) -> None:
@@ -532,18 +512,21 @@ class Session:
 
         report = self.transport.run(
             "command -v docker >/dev/null || { echo 'missing=docker'; exit 0; }; "
-            "docker info --format '{{.ServerVersion}}' >/dev/null 2>&1 || echo 'missing=docker-access'; "
+            "docker info --format '{{.ServerVersion}}' >/dev/null 2>&1 "
+            "|| echo 'missing=docker-access'; "
             "command -v rsync >/dev/null || echo 'missing=rsync'; "
-            "v=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1); "
+            "v=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null "
+            "| head -1); "
             'echo "driver=$v"; '
-            f"echo \"free_gb=$(df -Pk {q(self.layout.workdir.parent)} | awk 'NR==2 {{print int($4/1048576)}}')\"",
+            f'echo "free_gb=$(df -Pk {q(self.layout.workdir.parent)} '
+            "| awk 'NR==2 {print int($4/1048576)}')\"",
             check=False,
         ).stdout
         fields = [line.split("=", 1) for line in report.splitlines() if "=" in line]
         missing = [value for key, value in fields if key == "missing"]
         if missing:
             raise RemoteRunError(
-                f"{self.remote.name} cannot run full-remote-profile jobs: missing {', '.join(missing)} "
+                f"{self.remote.name} cannot run GPU containers: missing {', '.join(missing)} "
                 "(docker with GPU support, and this user in the docker group)"
             )
         values = dict(fields)
@@ -831,8 +814,8 @@ def _fold_job_db(session: Session, job_id: str, output_dir: Path) -> tuple[str, 
 def _kernel_fill(session: Session, args) -> int:
     """Measure a work list (`launcher --export-missing`) on the remote; merge its rows here.
 
-    A full-remote-profile job runs in one image, which serves only its own
-    profile envs, so the list is split per image and each part is one job.
+    A GPU job runs in one profiler image, which serves only its own profile
+    envs, so the list is split per image and each part is one job.
     """
 
     from profiling.container.images import IMAGES_ENV
@@ -840,10 +823,6 @@ def _kernel_fill(session: Session, args) -> int:
     from profiling.exec.env import PROFILE_RUNTIME_ENV, container_image
     from profiling.plan import UNITS_SCHEMA_VERSION
 
-    if session.remote.profile_runtime not in GPU_ONLY_RUNTIMES:
-        raise RemoteRunError(
-            f"kernel-profile fill --remote needs profile_runtime: {FULL_REMOTE_PROFILE} or in-image"
-        )
     if args.db is not None:
         raise RemoteRunError("--db cannot be used with --remote: rows merge into this profile.db")
     if args.output_dir is None:
@@ -872,11 +851,12 @@ def _kernel_fill(session: Session, args) -> int:
         part_dir.mkdir(parents=True, exist_ok=True)
         work = part_dir / "work.json"
         work.write_text(
-            json.dumps({"schema_version": UNITS_SCHEMA_VERSION, "units": env_units}, indent=1) + "\n"
+            json.dumps({"schema_version": UNITS_SCHEMA_VERSION, "units": env_units}, indent=1)
+            + "\n"
         )
         specs = sum(len(unit["specs"]) for unit in env_units)
         _say(f"{env_name}: {specs} spec(s) in {len(env_units)} unit(s), image {image}")
-        image_id = session.prepare_gpu_only(env_name, image)
+        image_id = session.prepare_image_job(env_name, image)
         session.push_files([work])
         command = [
             "kernel-profile",
@@ -989,31 +969,19 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
     for seed in seeds:
         seed.unlink()
     env_name = profiler_spec.subprocess_env or "default_env"
-    in_image = session.remote.profile_runtime == "in-image"
-    full_remote = session.remote.profile_runtime == FULL_REMOTE_PROFILE
-    if full_remote:
-        # One container of the image runs controller and workers; nothing is built there.
-        image_id = session.prepare_full_remote_profile(env_name, image)
-        session.container = dataclasses.replace(
-            session.container, gpu_count=_spec_gpu_count(profiler_spec, specs)
-        )
-        _say(f"{args.table}/{args.backend} runs in a container of {image} on {session.remote.name}")
-    elif in_image:
-        # The remote is the image: controller and workers run on its interpreter.
-        image_id = session.prepare_in_image(env_name, image)
-        _say(f"{args.table}/{args.backend} runs on {session.remote.name}, which is {image}")
-    else:
-        # The controller runs as it does here: on the project's profiling stack.
-        session.prepare(job_groups=(*CPU_GROUPS, "profiling"))
-        image_id = session.ensure_image(image)
-        _say(f"{args.table}/{args.backend} runs in {image} ({image_id[:19]})")
+    # One container of the image (or the pod that is it) runs controller and
+    # workers on the image's interpreter; nothing is built on the remote.
+    image_id = session.prepare_image_job(
+        env_name, image, gpu_count=_spec_gpu_count(profiler_spec, specs)
+    )
+    _say(f"{args.table}/{args.backend} runs in {image} on {session.remote.name}")
     session.report(job, "running")
     command = ["kernel-profile", *argv]
     keep_db = not measure and not args.fresh
     outcome = session.run_job(
         command,
         env={
-            PROFILE_RUNTIME_ENV: "in-image" if in_image or full_remote else "container",
+            PROFILE_RUNTIME_ENV: "in-image",
             # The shipped tree has no git to compute the tag from.
             IMAGES_ENV: json.dumps({env_name: image}),
             "VIBESIM_PROFILE_CACHE_DIR": str(session.layout.workdir / "cache"),
@@ -1034,7 +1002,11 @@ def _kernel_profile(session: Session, argv: list[str]) -> int:
         copied_back=f"incomplete: {copy_error}" if copy_error else "all",
         image=image,
         # A pod has no docker to name an image id; its manifest names the inputs.
-        **({"image_inputs": image_id} if in_image else {"image_id": image_id}),
+        **(
+            {"image_inputs": image_id}
+            if session.remote.profile_runtime == "in-image"
+            else {"image_id": image_id}
+        ),
         profile_runtime=session.remote.profile_runtime,
         profile_db=merged,
     )
@@ -1089,11 +1061,6 @@ def _alignment_campaign(session: Session, argv: list[str]) -> int:
             f"alignment-campaign {args.verb} runs here; only `run --phase <profile pass>` "
             "goes to a remote"
         )
-    if session.remote.profile_runtime not in GPU_ONLY_RUNTIMES:
-        raise RemoteRunError(
-            f"alignment-campaign --remote needs profile_runtime: {FULL_REMOTE_PROFILE} or "
-            f"in-image ({session.remote.name} has {session.remote.profile_runtime})"
-        )
     if args.dry_run:
         raise RemoteRunError("--dry-run stays local; drop --remote")
     pack = _resolve_pack(args.pack)
@@ -1129,7 +1096,7 @@ def _alignment_campaign(session: Session, argv: list[str]) -> int:
             ),
         )
     elif (
-        session.remote.profile_runtime == FULL_REMOTE_PROFILE
+        session.remote.profile_runtime == "docker"
         and session.remote.gpus != (AUTO_GPUS,)
         and len(session.remote.gpus) < gpus
     ):
@@ -1139,11 +1106,13 @@ def _alignment_campaign(session: Session, argv: list[str]) -> int:
         )
 
     session.ship()
-    image_id = session.prepare_gpu_only(env_name, image, gpu_count=gpus)
+    image_id = session.prepare_image_job(env_name, image, capture=True, gpu_count=gpus)
     for plan in ready:
         session.push_tree(plan.directory)
-    pack_arg = args.pack if not Path(args.pack).is_dir() else str(
-        Path(args.pack).resolve().relative_to(REPO_ROOT.resolve())
+    pack_arg = (
+        args.pack
+        if not Path(args.pack).is_dir()
+        else str(Path(args.pack).resolve().relative_to(REPO_ROOT.resolve()))
     )
     command = [
         "alignment-campaign",
@@ -1157,6 +1126,11 @@ def _alignment_campaign(session: Session, argv: list[str]) -> int:
         *[token for plan in ready for token in ("--case", plan.case_slug)],
         *(["--refresh"] if args.refresh else []),
         *(["--resume"] if args.resume else []),
+        # The job already runs in the engine image: the capture runs here, with
+        # no container of its own, and owns its warm-up (`run_profile_unhosted`).
+        "--runtime",
+        "host",
+        *(["--allow-autotune"] if args.allow_autotune else []),
     ]
     _say(f"{args.phase}: {len(ready)} case(s) on {session.remote.name} in {image}")
     outcome = session.run_job(
@@ -1191,7 +1165,9 @@ def _alignment_campaign(session: Session, argv: list[str]) -> int:
         if not complete:
             failed.append(plan.case_slug)
     ok = outcome.exit_code == 0 and not failed
-    verdict = "done" if ok else _failure(outcome, f"incomplete: {', '.join(failed)}" if failed else None)
+    verdict = (
+        "done" if ok else _failure(outcome, f"incomplete: {', '.join(failed)}" if failed else None)
+    )
     _say(f"{verdict}: {out_root.relative_to(REPO_ROOT)} ({args.phase})")
     return outcome.exit_code or (0 if ok else 1)
 
@@ -1204,10 +1180,8 @@ COMMANDS: dict[str | None, Callable[[Session, list[str]], int]] = {
 }
 
 
-#: What a full-remote-profile remote runs: GPU work only.
+#: What an `in-image` remote (a pod) runs: GPU work only, on the image's interpreters.
 GPU_COMMANDS = ("kernel-profile", "alignment-campaign")
-#: Runtimes that run nothing but GPU work, on a profiler image's own interpreter.
-GPU_ONLY_RUNTIMES = (FULL_REMOTE_PROFILE, "in-image")
 
 
 def run(subcommand: str | None, argv: list[str], options: GlobalOptions) -> int:
@@ -1220,10 +1194,11 @@ def run(subcommand: str | None, argv: list[str], options: GlobalOptions) -> int:
     try:
         _require_repo_cwd()
         remote = load_remote(options.remote or "", options.remote_set)
-        if remote.profile_runtime in GPU_ONLY_RUNTIMES and subcommand not in GPU_COMMANDS:
+        if remote.profile_runtime == "in-image" and subcommand not in GPU_COMMANDS:
             raise RemoteRunError(
-                f"{remote.name} has profile_runtime: {remote.profile_runtime}, which runs only "
-                f"the GPU work ({', '.join(GPU_COMMANDS)}); run `{subcommand or 'simulation'}` here"
+                f"{remote.name} is a profiler image (profile_runtime: in-image), which runs "
+                f"only GPU work ({', '.join(GPU_COMMANDS)}); run `{subcommand or 'simulation'}` "
+                "here or on a docker remote"
             )
     except (RemoteConfigError, RemoteRunError) as exc:
         print(f"python -m launcher --remote: {exc}", file=sys.stderr)

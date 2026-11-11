@@ -1,8 +1,9 @@
 """The remote half of `--remote`: build a shipped version, run one job.
 
 The sending launcher calls this module on the remote with the shipped tree's
-own interpreter, ``src/<version>/.venv/bin/python -m launcher.remote.node``,
-so it runs the same code as the job it serves:
+own interpreter, ``src/<version>/.venv/bin/python -m launcher.remote.node``, or,
+for GPU work, a profiler image's interpreter in the shipped tree (``job.json``
+then names it as ``python``), so it runs the same code as the job it serves:
 
 ``build WORKDIR VERSION``
     Give ``src/<version>`` its binaries. Cargo always builds in the fixed
@@ -165,6 +166,12 @@ def _job_venv(job: dict) -> Path:
     return Path(job.get("venv") or Path(job["src"]) / ".venv").resolve()
 
 
+def _job_python(job: dict) -> str:
+    """The interpreter that runs ``launcher``: a profiler image's own, or the venv's."""
+
+    return job.get("python") or str(_job_venv(job) / "bin" / "python")
+
+
 def _job_environment(job: dict, scratch: Path) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in MANAGED_CONTEXT_VARIABLES}
     env.update(job.get("env", {}))
@@ -176,10 +183,11 @@ def _job_environment(job: dict, scratch: Path) -> dict[str, str]:
     # project's default groups (the whole GPU profiling stack) into the shared
     # venv. That venv is made once, by `run.py`, for its key's groups only.
     env["UV_NO_SYNC"] = "1"
-    venv = str(_job_venv(job))
-    env["VIRTUAL_ENV"] = venv
-    # The project `uv run` resolves to, which would otherwise be the version's `.venv`.
-    env["UV_PROJECT_ENVIRONMENT"] = venv
+    if not job.get("python"):
+        venv = str(_job_venv(job))
+        env["VIRTUAL_ENV"] = venv
+        # The project `uv run` resolves to, which would otherwise be the version's `.venv`.
+        env["UV_PROJECT_ENVIRONMENT"] = venv
     env[PROFILE_DB_ENV] = str(scratch / "profile.db")
     return env
 
@@ -210,7 +218,7 @@ def run_job(jobdir: Path) -> int:
     exit_code = 1
     try:
         shutil.copy2(src / "profiling" / "profile.db", scratch / "profile.db")
-        argv = [str(_job_venv(job) / "bin" / "python"), "-m", "launcher", *job["argv"]]
+        argv = [_job_python(job), "-m", "launcher", *job["argv"]]
         with (jobdir / "stdout.log").open("ab") as log:
             if stopped:
                 exit_code = 128 + stopped[0]

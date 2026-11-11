@@ -57,14 +57,15 @@ class GpuWait:
     timeout_s: int = 3600
 
 
-#: `docker`: the job runs on venvs built on the remote, profiling workers in
-#: images. `in-image`: the remote is itself a profiler image (a pod).
-#: `full-remote-profile`: each job is one container of a profiler image on the
-#: remote, which needs only docker: nothing is installed or built there.
-FULL_REMOTE_PROFILE = "full-remote-profile"
+#: How GPU work (kernel profiling, alignment captures) runs on a remote.
+#: `docker`: each GPU job is one container of the profiler image; the remote
+#: needs only docker (and, for simulation or timing-predict there, uv and cargo).
+#: `in-image`: the remote is itself a profiler image (a pod), which runs GPU work only.
+#: Either way the job runs on the image's own interpreters: nothing GPU-side is
+#: installed or built on the remote.
+PROFILE_RUNTIMES = ("docker", "in-image")
 #: `gpus: auto` on a direct remote: each job takes idle GPUs when it starts.
 AUTO_GPUS = "auto"
-PROFILE_RUNTIMES = ("docker", "in-image", FULL_REMOTE_PROFILE)
 
 
 @dataclass(frozen=True)
@@ -85,9 +86,9 @@ class Remote:
     env: dict[str, str] = field(default_factory=dict)
     keep_versions: int = 10
     profile_runtime: str = "docker"
-    # `full-remote-profile` only: host directories mounted into the job's
-    # container at the same path (a Hugging Face cache, a text corpus), and the
-    # GPUs a direct job runs on (Slurm assigns them itself).
+    # `docker` only: host directories mounted into a GPU job's container at
+    # the same path (a Hugging Face cache, a text corpus), and the GPUs a direct
+    # job runs on (Slurm assigns them itself).
     mounts: tuple[PurePosixPath, ...] = ()
     gpus: tuple[str, ...] = ()
     # Before a job's container starts, wait until each of its GPUs has this much
@@ -213,10 +214,8 @@ def _parse(name: str, raw: dict[str, Any], config_dir: Path) -> Remote:
     if AUTO_GPUS in gpus and gpus != [AUTO_GPUS]:
         raise RemoteConfigError(f"gpus: {AUTO_GPUS} cannot be combined with GPU names")
     gpu_wait = _parse_gpu_wait(raw.get("gpu_wait"))
-    if (mounts or gpus or gpu_wait) and profile_runtime != FULL_REMOTE_PROFILE:
-        raise RemoteConfigError(
-            f"mounts, gpus and gpu_wait apply only to profile_runtime: {FULL_REMOTE_PROFILE}"
-        )
+    if (mounts or gpus or gpu_wait) and profile_runtime != "docker":
+        raise RemoteConfigError("mounts, gpus and gpu_wait apply only to profile_runtime: docker")
     ephemeral = raw.get("ephemeral", False)
     if not isinstance(ephemeral, bool):
         raise RemoteConfigError(f"ephemeral must be true or false, got {ephemeral!r}")

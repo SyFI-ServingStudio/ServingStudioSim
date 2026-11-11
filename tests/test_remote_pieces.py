@@ -392,25 +392,26 @@ def test_an_in_image_remote_runs_on_the_images_interpreter_only_if_it_is_the_ima
 
     manifest = tmp_path / "manifest.json"
     monkeypatch.setattr(profile_env, "IMAGE_MANIFEST", manifest)
-    session = Session(_remote(workdir=PurePosixPath(tmp_path / "w")))
+    session = Session(_remote(workdir=PurePosixPath(tmp_path / "w"), profile_runtime="in-image"))
     session.source = types.SimpleNamespace(version="v1")
     (tmp_path / "w" / "src" / "v1").mkdir(parents=True)
     tag = "vibesim-profiler-vllm:abc123"
     with pytest.raises(RemoteRunError, match="no profiler image manifest"):
-        session.prepare_in_image("vllm_env", tag)
+        session.prepare_image_job("vllm_env", tag)
 
     manifest.write_text(
         json.dumps({"inputs": "abc123", "envs": ["vllm_env"], "python": "/opt/v/.venv/bin/python"})
     )
-    with pytest.raises(RemoteRunError, match="serving \\['vllm_env'\\]"):
-        session.prepare_in_image("default_env", tag)
+    with pytest.raises(RemoteRunError, match="serves \\['vllm_env'\\]"):
+        session.prepare_image_job("default_env", tag)
     with pytest.raises(RemoteRunError, match="with inputs abc123"):
-        session.prepare_in_image("vllm_env", "vibesim-profiler-vllm:newer")
-    assert not session.in_image
+        session.prepare_image_job("vllm_env", "vibesim-profiler-vllm:newer")
+    assert session.image_python is None
 
-    assert session.prepare_in_image("vllm_env", tag) == "abc123"
-    assert session.in_image
-    assert (tmp_path / "w" / "src" / "v1" / ".venv").readlink() == Path("/opt/v/.venv")
+    assert session.prepare_image_job("vllm_env", tag) == "abc123"
+    # The job runs on the image's interpreter as it is; nothing is linked as a venv.
+    assert session.image_python == PurePosixPath("/opt/v/.venv/bin/python")
+    assert not (tmp_path / "w" / "src" / "v1" / ".venv").exists()
 
 
 def test_an_in_image_remote_runs_gpu_work_only(monkeypatch, capsys):
@@ -423,7 +424,7 @@ def test_an_in_image_remote_runs_gpu_work_only(monkeypatch, capsys):
     monkeypatch.setattr(remote_run, "_require_repo_cwd", lambda: None)
     monkeypatch.setattr(remote_run, "load_remote", lambda name, sets: pod)
     assert remote_run.run(None, ["presets/x.yaml"], GlobalOptions(remote="r")) == 2
-    assert "runs only the GPU work" in capsys.readouterr().err
+    assert "runs only GPU work" in capsys.readouterr().err
 
 
 def test_a_forwarding_call_opens_its_own_connection():

@@ -190,7 +190,7 @@ SUBCOMMANDS: dict[str, Subcommand] = {
     "alignment-campaign": Subcommand(
         "alignment-campaign {check,render,run,label,extract,compare} ...",
         _alignment_campaign,
-        # `run --phase <profile pass>` only, on a full-remote-profile remote.
+        # `run --phase <profile pass>` only: a capture on a remote GPU host.
         remote=True,
     ),
     "migrate-artifact-kinds": Subcommand(

@@ -1,4 +1,4 @@
-"""GPU jobs on a remote: one profiler container per job (`docker`), or the pod itself (`in-image`)."""
+"""GPU jobs on a remote: one profiler container each (`docker`), or the pod itself (`in-image`)."""
 
 from __future__ import annotations
 
@@ -117,7 +117,8 @@ def _fake_nvidia_smi(
     smi.write_text(
         "#!/usr/bin/env python3\n"
         "import sys\n"
-        f"readings, caps, listing, busy = {list(free_mib)!r}, {caps or {}!r}, {list(listing)!r}, {busy!r}\n"
+        f"readings, caps = {list(free_mib)!r}, {caps or {}!r}\n"
+        f"listing, busy = {list(listing)!r}, {busy!r}\n"
         f"state = {str(state)!r}\n"
         "args = sys.argv[1:]\n"
         "cards = args[args.index('-i') + 1].split(',') if '-i' in args else []\n"
