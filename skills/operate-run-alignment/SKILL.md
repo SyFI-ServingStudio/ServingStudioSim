@@ -153,6 +153,28 @@ uv run python -m launcher alignment-campaign compare --pack $PACK --measured $RO
 
 `--alignment-phase` is not `--phase`: `--phase` names the pipeline step to run.
 
+**Hand the profile passes to someone else** with `bundle` / `verify-bundle`
+(`launcher/alignment_campaign/README.md`, "Handing captures off"). The
+contributor runs the block above through the profile steps on their own host,
+then publishes the scrubbed capture directories; the maintainer checks them and
+runs every later step locally, so no number is taken on trust:
+
+```bash
+# contributor, after the profile steps
+uv run python -m launcher alignment-campaign bundle --pack $PACK --host $HOST --out-root $ROOT --alignment-phase $AP \
+    --dest $ROOT.bundle --upload UW-SyFI/servingstudio-alignment-captures   # uploads as a dataset PR
+# maintainer, on a campaign rendered with its own host profile
+uv run python -m launcher alignment-campaign verify-bundle --pack $PACK --out-root $ROOT \
+    --from-hf UW-SyFI/servingstudio-alignment-captures@refs/pr/<n>:$PACK/<bundle> --download-dir <dir>
+```
+
+Then continue the block at `--phase timing_predict`. `verify-bundle` refuses a
+capture taken in another reference image, with another model snapshot, trace or
+GPU, or from another `campaign.yaml`; it never places a capture that failed at
+the contributor. A contributor who hits a failure sends the bundle anyway
+(failed passes are recorded as incomplete) and does not change a config to get
+past it.
+
 **A pack's cases must span the knobs that change step shapes.** Do not copy one
 template value across the matrix. At least run prefill-heavy and mixed cases at
 `chunk_size` 2048, 4096 and 8192 (as the GLM-5.3 DFlash2 and GLM-5.2 spec5 packs
