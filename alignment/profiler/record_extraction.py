@@ -212,6 +212,16 @@ def extract_metrics_jsonl(
                         f"dp_rank={identity[0]} forward_ordinal={identity[1]}"
                     )
                 seen_rank_forwards.add(identity)
+                if not row["is_dummy"]:
+                    # A real forward is also one scheduled step of its rank,
+                    # and that identity must stay unique too.
+                    step = (dp_rank, row["iteration_index"])
+                    if step in seen_rank_iterations:
+                        raise ValueError(
+                            "duplicate alignment iteration record for "
+                            f"dp_rank={step[0]} iteration={step[1]}"
+                        )
+                    seen_rank_iterations.add(step)
             elif records is VLLM_RECORDS and dp_size > 1:
                 iteration_index = int(row["iteration_index"])
                 observed_elapsed_ms = row.get("observed_elapsed_ms")

@@ -1798,6 +1798,10 @@ def test_forward_ordinal_records_keep_dummies_and_their_own_rank(tmp_path):
             [{**_forward_record(1, 0, 3), "max_forwards_in_flight": 0}],
             "max_forwards_in_flight >= 1",
         ),
+        (
+            [_forward_record(1, 0, 3), _forward_record(1, 1, 3)],
+            "duplicate alignment iteration record for dp_rank=1 iteration=3",
+        ),
     ],
 )
 def test_forward_ordinal_records_are_validated(tmp_path, records, message):
