@@ -358,12 +358,18 @@ single-config path below when there is one workload and no matrix.
    because the kernel capture used a smaller representative trace.
 
    Under data parallelism both the workload fold and Check 1 join the ranks by
-   the `forward_ordinal` in the full-run iteration records (schema 5, vLLM
-   reference patch 0019). A DP capture recorded before that patch has no
-   ordinals: `alignment-workload` refuses it ("predates forward ordinals") and
-   the pass must be recaptured with the current reference image; never pair its
-   ranks by wall clock or iteration index instead. The SGLang patch does not
-   emit ordinals yet, so an SGLang DP workload pass is refused the same way.
+   the `forward_ordinal` in the iteration records (schema 5, vLLM reference
+   patches 0019 and 0020). A DP capture recorded before that patch has no
+   ordinals: `alignment-workload` and Check 1 both refuse it ("predates forward
+   ordinals") and the pass must be recaptured with the current reference image;
+   never pair its ranks by wall clock or iteration index instead. The SGLang
+   patch does not emit ordinals yet, so an SGLang DP pass is refused the same
+   way. Check 1's DP steps are the union of the forwards any rank ran with real
+   work, keyed by ordinal; read `step_alignment.incomplete_steps` (forwards cut
+   at the capture's edges) and `zero_token_windows_by_device` before trusting a
+   step count. A missing peer window inside the capture, a rank renumbered by
+   one forward, a missing rank, or a single-rank file holding DP dummies is an
+   error, not a count: fix the capture, not the check.
 
 Do not use the phase NVTX envelope as GPU E2E (host submission ranges; graph
 kernels run after the marker closes), and do not subtract an iteration's own busy

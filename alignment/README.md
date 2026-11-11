@@ -779,17 +779,30 @@ labeling inventory stores one representative sequence only after proving that
 the ordered `(name, suggested_category)` sequence is identical on every device
 for every phase/iteration. Ranks driven by one scheduler are paired by exact
 iteration index and identical phase inventory; asynchronous host NVTX spans are
-not a join key. Independent data-parallel schedulers have diverging counters:
-each numbers its own scheduled steps, and an idle rank runs a dummy forward
-(no NVTX range, no scheduled work) to join its peers' collectives. Every rank
-runs one forward per global step, so the parser pairs data-parallel ranks by
-the `forward_ordinal` their schema-5 metrics record for each iteration
-(`step_alignment.rule: forward_ordinal`). A peer step whose forward the
-reference rank ran as a dummy has no reference step and stays unpaired, as
-`unpaired_steps_by_device` counts. A capture without ordinals falls back to
-mutual, unique overlaps of attributed GPU-kernel envelopes
-(`kernel_time_overlap`). Missing kernel evidence, ambiguous overlap, and
-incomplete phase inventory remain explicitly unpaired. Analysis applies labels independently to
+not a join key; TP peers whose phase inventory differs stay unpaired
+(`unpaired_steps_by_device`). Independent data-parallel schedulers have
+diverging counters: each numbers its own scheduled steps, and an idle rank runs
+a dummy forward (no NVTX range, no scheduled work) to join its peers'
+collectives. Every rank runs one forward per global step, so the parser joins
+data-parallel ranks by the `forward_ordinal` their schema-5 metrics record
+(`step_alignment.rule: forward_ordinal`). The steps are the union of the
+forwards any rank ran with real work, so a forward the reference rank ran as a
+dummy is still a step; a step's `iteration` is its forward ordinal,
+`iteration_index_by_device` keeps each device's own index, and
+`dummy_dp_ranks` names the ranks that ran it as a dummy (they fold no metrics
+row, and timing-predict gives them an empty group). A rank that did real work
+in a forward but has no window for it is an error between that device's first
+and last captured forward, and outside them (the bounded capture cut the step)
+the forward is dropped and counted in `step_alignment.incomplete_steps`. A
+0-token step keeps its iteration index and the V1 runner still opens its
+`preprocess` scope, but it runs no forward and writes no record: such a window
+is skipped and counted in `zero_token_windows_by_device`. An
+`--iteration-start/--iteration-end` window is the reference rank's iterations,
+translated into the forwards they ran and applied to every rank. A
+multi-device DP capture without ordinals, or one with no device-to-DP-rank
+mapping, is refused ("predates forward ordinals"); measured time is never a
+join key across schedulers. A single-device capture reports
+`rule: single_device`. Analysis applies labels independently to
 each rank, then reduces the iteration with the barrier model
 (`doc/analyzer.md`): each run of synchronizing positions is a barrier costing
 `max(end) - max(start)`, and each window between barriers is won by the rank

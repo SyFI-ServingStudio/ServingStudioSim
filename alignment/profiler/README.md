@@ -45,9 +45,17 @@ rank's forward count from 0, dummies included), its own `dp_rank` and
 scheduling or PP, 2 with async scheduling, the PP size under PP, plus one
 with the V2 runner's async scheduling). Each
 forward syncs its batch across the DP ranks, so the k-th forward of every rank
-is one global step; `alignment-workload` pairs the ranks by that ordinal. A
-step with no scheduled tokens runs no forward and takes no ordinal. A record's
-observed window is the EngineCore's CPU observation, not the GPU forward. Explicit external IDs preserve client identity;
+is one global step; `alignment-workload` and Check 1 pair the ranks by that
+ordinal. The dummy record is written by `EngineCore.execute_dummy_batch`
+(patch 0020), so DPEngineCoreProc's busy loop and the offline
+`LLMEngine.step()` path record their dummies alike. A step with no scheduled
+tokens runs no forward and takes no ordinal; it still takes an iteration index,
+and the V1 runner still emits its `preprocess` NVTX scope. Extraction refuses a
+duplicate `(dp_rank, forward_ordinal)` or, for a real record,
+`(dp_rank, iteration_index)`; a dummy in a dp_size=1 capture; a missing rank;
+and a gap in a rank's ordinals (each rank's run may start and end at a
+different forward). A record's observed window is the EngineCore's CPU
+observation, not the GPU forward. Explicit external IDs preserve client identity;
 an apparent random suffix alone is not sufficient reason to strip client text.
 These observations support alignment and acceptance diagnostics, not simulator
 placement policy.
@@ -64,9 +72,10 @@ client output when deriving per-request acceptance rates.
 
 The patches are the commits of the fork branch they were exported from
 (`servingstudio-alignment-20261107` on https://github.com/serendipity-zk/vllm),
-and its `ALIGNMENT.md` records what each carries. Patch 0019 (forward
-ordinals) was exported from `servingstudio-alignment-dp-ordinal`, one commit on
-top of that branch's head (patch 0018). The base is
+and its `ALIGNMENT.md` records what each carries. Patches 0019 (forward
+ordinals) and 0020 (the dummy record moved into `execute_dummy_batch`) were
+exported from `servingstudio-alignment-dp-ordinal`, two commits on top of that
+branch's head (patch 0018). The base is
 upstream vLLM main `5629b26` (2026-11-07), not a release: DeepSeek-V4.1 needs
 SwapAB and other paths that v0.33.0 does not have. The next bump should move to
 a stable release and its official image. Every capture's `<name>_launch.json`
