@@ -1,6 +1,6 @@
 # feat(dsv41): DeepSeek-V4.1-Flash-1017 + DSpark on vLLM, B200 TP4/EP4 and DP4/EP4
 
-Draft. The TP4 Phase 1 case is being recaptured; see Test Result.
+Draft. The TP4 Phase 1 case and the DP4 workload pass are being recaptured; see Test Result.
 
 ## Purpose
 
@@ -74,8 +74,10 @@ The work builds on the TP4/EP4 no-spec arch already on `main` (`doc/pr/dsv41-fla
 | dp4_phase1/20_dp4_diverse_100 | +1.58% | -0.92% | 99.14% | -5.15% | +4.05% | -5.73% | -10.29% |
 | tp4_phase1/19_tp4_diverse_100 | *recapture pending* | | | | | | |
 
-- **DP4 captures.** nsys job 20826 and workload job 20807. Image `vibesim-profiler-vllm:fe6a3d9a6af96e67`,
-  vLLM reference patches through 0022.
+- **DP4 captures.** nsys job 20826, in image `vibesim-profiler-vllm:fe6a3d9a6af96e67` (vLLM reference patches
+  through 0022). The workload pass, job 20807, ran in the previous image `cbe2f57bc603b683` (patches through
+  0021); 0022 changes only when alignment NVTX scopes open. It is being recaptured in `fe6a3d9a6af96e67` as
+  job 20894, so both passes come from one image.
 - **TP4 recapture.** The earlier TP4 capture, job 20586, predates patch 0021. Its workload pass holds 3 forward
   steps of 500, 1691 and 469 ms (2.66 s in all). These are mid-serving JIT compiles that stall every in-flight
   request. With them in the measurement, TP4 read TTFT -23.33% and E2E -8.40%, against tolerances of 12 and 7.
