@@ -5,8 +5,7 @@
 //! current KV lengths plus every scheduled prefill request's `(prefix + append)`
 //! length.  Resident cache state belongs to the normal `kv-occupancy` subject.
 
-use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -42,7 +41,9 @@ const COST_COLUMNS: &[&str] = &[
 struct FullMeasuredMetrics {
     schema_version: u32,
     input_adapter: String,
-    iteration_index: u64,
+    /// The rank's scheduled-step index; null on a DP dummy forward (schema 5).
+    #[serde(default)]
+    iteration_index: Option<u64>,
     prefill_tokens: u64,
     #[serde(default)]
     decode_kv_lens: Vec<u64>,
@@ -56,6 +57,16 @@ struct FullMeasuredMetrics {
     observed_end_monotonic_ns: Option<u64>,
     #[serde(default)]
     observed_elapsed_ms: Option<f64>,
+    /// Per-rank count of model forwards, DP dummies included (schema 5).
+    #[serde(default)]
+    forward_ordinal: Option<u64>,
+    /// A DP dummy forward: the rank's participation, no scheduled work.
+    #[serde(default)]
+    is_dummy: bool,
+    /// How many forwards the engine can have launched but not finished: its
+    /// batch-queue depth (schema 5).
+    #[serde(default)]
+    max_forwards_in_flight: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,13 +190,13 @@ fn read_measured_points(
         // check is that the dialect is one this build knows, not that it is vLLM.
         ensure!(
             SUPPORTED_INPUT_ADAPTERS.contains(&record.input_adapter.as_str()),
-            "unsupported full-run metrics input_adapter {:?} at iteration {}",
+            "unsupported full-run metrics input_adapter {:?} at iteration {:?}",
             record.input_adapter,
             record.iteration_index
         );
         ensure!(
-            (2..=4).contains(&record.schema_version),
-            "alignment-workload requires schema-v2/v3/v4 full-run metrics with host-monotonic timestamps; got schema_version {} at iteration {}",
+            (2..=5).contains(&record.schema_version),
+            "alignment-workload requires schema-v2..v5 full-run metrics with host-monotonic timestamps; got schema_version {} at iteration {:?}",
             record.schema_version,
             record.iteration_index
         );
@@ -197,8 +208,8 @@ fn read_measured_points(
         metrics_path.display()
     );
 
-    // Data-parallel ranks each log the same step, so one step appears as several
-    // records. Fold them into the replica's batch shape before reading workload.
+    // Each data-parallel rank logs its own part of a global step. Pair the
+    // ranks by forward ordinal and fold them into the replica's batch shape.
     let (records, fold) = fold_data_parallel_ranks(records)?;
 
     // New captures record req-frontend's replay window in the same host
@@ -240,19 +251,21 @@ fn read_measured_points(
             .context("schema-v2 full-run metrics omit observed_elapsed_ms")?;
         ensure!(
             end_ns >= start_ns,
-            "full-run metrics iteration {} ends before it starts",
+            "full-run metrics iteration {:?} ends before it starts",
             record.iteration_index
         );
         ensure!(
             observed_elapsed_ms.is_finite() && observed_elapsed_ms >= 0.0,
-            "full-run metrics iteration {} has invalid observed_elapsed_ms {}",
+            "full-run metrics iteration {:?} has invalid observed_elapsed_ms {}",
             record.iteration_index,
             observed_elapsed_ms
         );
         let scheduled_kv_tokens =
             scheduled_kv_tokens(&record.decode_kv_lens, &record.prefill_chunk_pairs);
         points.push(WorkloadPoint {
-            iteration_id: record.iteration_index,
+            iteration_id: record
+                .iteration_index
+                .context("a folded workload step carries no iteration id")?,
             time_ms: start_ns.saturating_sub(origin_ns) as f64 / 1e6,
             iteration_cycle_ms: None,
             prefill_tokens: record.prefill_tokens,
@@ -266,96 +279,149 @@ fn read_measured_points(
 }
 
 /// What folding the data-parallel ranks did, reported in the report's meta so a
-/// reader can see how much of the step stream came from which rule.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// reader can see which records became which steps and how well the ranks'
+/// observation windows agree.
+#[derive(Debug, Clone, Default, PartialEq)]
 struct FoldStats {
-    /// `wall_clock`, `iteration_index`, or `single_rank`.
+    /// `forward_ordinal` or `single_rank`.
     method: &'static str,
-    reference_rank: Option<u64>,
-    /// Peer records inside the reference's span that overlapped no step and so
-    /// opened a step of their own (the reference rank was idle then).
-    peer_only_steps: usize,
+    ranks: usize,
+    /// Records outside the ordinal range every rank covers (ranks start and
+    /// stop recording at different forwards).
     dropped_before: usize,
     dropped_after: usize,
+    /// Records of DP dummy forwards: a rank's participation in a step, with no
+    /// scheduled work.
+    dummy_records: usize,
+    /// Global forwards in which every rank ran a dummy. They schedule no work
+    /// and are not workload steps.
+    all_dummy_steps: usize,
+    /// Steps whose ranks' observation windows do not all share an instant.
+    /// Allowed: a dummy's window brackets the launch-time DP sync, a real
+    /// step's the later result wait.
+    non_overlapping_steps: usize,
+    /// Steps whose start (earliest real-record start) precedes the previous
+    /// step's; their cycle is negative and is dropped from the cycle stats.
+    non_monotone_starts: usize,
+    /// Spread of the ranks' window starts within one step, in ms.
+    start_skew_ms: Option<Value>,
 }
 
 impl FoldStats {
     fn as_json(&self) -> Value {
         json!({
             "method": self.method,
-            "reference_rank": self.reference_rank,
-            "peer_only_steps": self.peer_only_steps,
+            "ranks": self.ranks,
             "ragged_dropped_before": self.dropped_before,
             "ragged_dropped_after": self.dropped_after,
+            "dummy_records": self.dummy_records,
+            "all_dummy_steps": self.all_dummy_steps,
+            "non_overlapping_steps": self.non_overlapping_steps,
+            "non_monotone_starts": self.non_monotone_starts,
+            "start_skew_ms": self.start_skew_ms,
         })
     }
 }
 
-/// Fold every data-parallel rank's record for one step into the replica's batch
-/// shape. DP ranks execute one step in lockstep behind the expert-parallel
-/// collectives, so the replica's workload for that step is the union of the
-/// ranks' local batches.
+/// Fold every data-parallel rank's record of one global step into the
+/// replica's batch shape: the union of the ranks' local batches.
 ///
-/// What identifies "one step" is the question this function used to get wrong.
-/// `iteration_index` counts a single EngineCore's own scheduled steps, and the
-/// ranks do not start counting together: in the GLM-5.2 DP8 capture the very
-/// same wall-clock step is iteration 11 on rank 0, 7 on ranks 1-4 and 6 on
-/// ranks 5-7. Folding by index therefore merged eight *different* steps, and
-/// the mixed prefill steps it produced were pure fiction. When the records
-/// carry engine-observed timestamps (schema 2) the fold pairs ranks by
-/// wall-clock overlap against a reference rank, exactly as `alignment/nsys/
-/// parse.py` does for the kernel side.
+/// One global step is one `forward_ordinal`. Each DP rank runs exactly one
+/// model forward per EngineCore busy-loop pass while a wave runs (a real step,
+/// or a dummy forward when it has no ready work), and every forward syncs its
+/// batch across the DP ranks, so the k-th forward of every rank is the same
+/// global step. Schema-5 captures record every forward, dummies included, with
+/// that ordinal (vLLM reference patch 0019).
 ///
-/// A single-rank capture passes through unchanged. Schema-v1 is rejected by
-/// the caller because workload alignment no longer borrows an NSYS timeline.
+/// Wall clock only checks the pairing. Pairing by wall clock is what this fold
+/// used to do, and the records do not support it: a record's window is the
+/// EngineCore's result wait plus sampling, not the GPU forward, so under async
+/// scheduling the windows of one global step are offset across ranks, and
+/// idle ranks' dummy forwards were not recorded at all.
+///
+/// A multi-rank capture without ordinals is refused. A single rank passes
+/// through, sorted by observation start when it has timestamps.
 fn fold_data_parallel_ranks(
     records: Vec<FullMeasuredMetrics>,
 ) -> Result<(Vec<FullMeasuredMetrics>, FoldStats)> {
-    let observed = records
+    let ranks: BTreeSet<u64> = records
         .iter()
-        .all(|record| record.observed_start_monotonic_ns.is_some())
-        && records.iter().all(|record| record.dp_rank.is_some());
-    let ranks: std::collections::HashSet<_> = records.iter().map(|record| record.dp_rank).collect();
-    if observed {
-        // One rank passes through the same path (it only sorts by start), but
-        // nothing was paired, so the report says so.
-        let (steps, mut fold) = fold_by_wall_clock(records)?;
-        if ranks.len() == 1 {
-            fold.method = "single_rank";
-        }
-        Ok((steps, fold))
-    } else if ranks.len() <= 1 {
-        Ok((
-            fold_by_iteration_index(records)?,
-            FoldStats {
-                method: "single_rank",
-                ..FoldStats::default()
-            },
-        ))
-    } else {
-        Ok((
-            fold_by_iteration_index(records)?,
-            FoldStats {
-                method: "iteration_index",
-                ..FoldStats::default()
-            },
-        ))
+        .map(|record| record.dp_rank.unwrap_or(0))
+        .collect();
+    if ranks.len() <= 1 {
+        return fold_single_rank(records);
     }
+    ensure!(
+        records
+            .iter()
+            .all(|record| record.forward_ordinal.is_some()),
+        "this capture has {} data-parallel ranks but its records carry no forward_ordinal: it \
+         predates forward ordinals (full-run metrics schema 5, vLLM reference patch 0019), so its \
+         ranks' records cannot be joined into global steps; recapture the workload pass",
+        ranks.len()
+    );
+    fold_by_forward_ordinal(records, ranks.len())
+}
+
+fn fold_single_rank(
+    records: Vec<FullMeasuredMetrics>,
+) -> Result<(Vec<FullMeasuredMetrics>, FoldStats)> {
+    let dummy_records = records.iter().filter(|record| record.is_dummy).count();
+    let mut steps: Vec<_> = records
+        .into_iter()
+        .filter(|record| !record.is_dummy)
+        .collect();
+    let mut seen = HashSet::new();
+    for step in &steps {
+        let index = step
+            .iteration_index
+            .context("a real full-run metrics record carries no iteration_index")?;
+        // Without dp_rank an unlabeled multi-rank capture looks like one rank
+        // whose steps repeat; its ranks cannot be joined into global steps.
+        ensure!(
+            seen.insert(index),
+            "full-run metrics repeat iteration_index {index} without a dp_rank: the records come \
+             from several data-parallel ranks but carry no rank or forward_ordinal: the \
+             capture predates forward ordinals (schema 5, vLLM reference patch 0019); recapture the \
+             workload pass"
+        );
+    }
+    if steps
+        .iter()
+        .all(|step| step.observed_start_monotonic_ns.is_some())
+    {
+        steps.sort_by_key(|step| {
+            (
+                step.observed_start_monotonic_ns,
+                step.forward_ordinal,
+                step.iteration_index,
+            )
+        });
+    }
+    Ok((
+        steps,
+        FoldStats {
+            method: "single_rank",
+            ranks: 1,
+            dummy_records,
+            ..FoldStats::default()
+        },
+    ))
 }
 
 /// Merge one rank's record into the step being built.
 fn merge_rank_record(merged: &mut FullMeasuredMetrics, record: FullMeasuredMetrics) -> Result<()> {
     ensure!(
         merged.schema_version == record.schema_version,
-        "step at iteration {} mixes full-run metrics schema versions {} and {}",
-        merged.iteration_index,
+        "step at forward {:?} mixes full-run metrics schema versions {} and {}",
+        merged.forward_ordinal,
         merged.schema_version,
         record.schema_version
     );
     ensure!(
         merged.input_adapter == record.input_adapter,
-        "step at iteration {} mixes input adapters {:?} and {:?}",
-        merged.iteration_index,
+        "step at forward {:?} mixes input adapters {:?} and {:?}",
+        merged.forward_ordinal,
         merged.input_adapter,
         record.input_adapter
     );
@@ -388,173 +454,187 @@ fn merge_rank_record(merged: &mut FullMeasuredMetrics, record: FullMeasuredMetri
     Ok(())
 }
 
-fn fold_by_iteration_index(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasuredMetrics>> {
-    let mut order: Vec<u64> = Vec::new();
-    let mut folded: HashMap<u64, FullMeasuredMetrics> = HashMap::new();
-    for record in records {
-        match folded.entry(record.iteration_index) {
-            Entry::Vacant(slot) => {
-                order.push(record.iteration_index);
-                slot.insert(record);
-            }
-            Entry::Occupied(mut slot) => merge_rank_record(slot.get_mut(), record)?,
-        }
-    }
-    Ok(order
-        .into_iter()
-        .map(|iteration| folded.remove(&iteration).expect("iteration was inserted"))
-        .collect())
-}
-
 /// The observed window of a record, which the caller has already checked exists.
-fn observed_window(record: &FullMeasuredMetrics) -> (u64, u64) {
-    let start = record
-        .observed_start_monotonic_ns
-        .expect("caller checked observed_start_monotonic_ns");
+fn observed_window(record: &FullMeasuredMetrics) -> Option<(u64, u64)> {
+    let start = record.observed_start_monotonic_ns?;
     let end = record.observed_end_monotonic_ns.unwrap_or(start);
-    (start, end.max(start))
+    Some((start, end.max(start)))
 }
 
-/// Pair ranks by wall-clock overlap against the lowest-numbered rank.
-///
-/// A step is the union of the ranks' records that overlap in wall clock. The
-/// reference rank's records seed the steps, and every other rank's record joins
-/// the step it overlaps most. A peer record that overlaps no step inside the
-/// reference's span opens a step of its own and is counted in
-/// `FoldStats::peer_only_steps`. Those are real: a data-parallel rank with no
-/// work runs an unrecorded dummy step to join its peers' collectives, because
-/// the metrics log only steps where the rank scheduled something. In the
-/// DeepSeek-V4.1 DP4 diverse_100 capture rank 0 logged 8894 steps and ranks 1-3
-/// 6324/5524/5280, and 312/175/374 of the peers' records fell in rank 0's gaps.
-/// Refusing them withheld the subject; dropping them would lose scheduled work.
-/// A later peer record overlapping such a step merges into it like any other.
-///
-/// Steps are kept in ANCHOR order: a reference step's own start, or a
-/// peer-only step's own start. A merged peer can start before an earlier
-/// step's anchor (it overlapped the later step more), so the merged unions
-/// are not sorted by start; they are used only to test overlap, and the span
-/// that bounds the ragged ends below is the union of all steps so far.
-///
-/// The two RAGGED ENDS are a different thing and are dropped with a count. Data
-/// parallel ranks do not start or retire on the same step: in the GLM-5.2 DP8
-/// run the ranks began 0.0-1.6 s apart and ran 6154..6159 iterations each, so
-/// rank 3's last step opened 1.09 ms after rank 0 had finished for good. Exactly
-/// one peer record of 43,091 fell outside, at the very end, with zero misses
-/// inside the span — and refusing on it withheld the whole subject. That is the
-/// wrong trade: this is the one view that compares SCHEDULED WORK per step, and
-/// it is what would have shown the simulator serialising its prefills across DP
-/// groups (one group prefilling per iteration where vLLM ran all eight), a bug
-/// that instead went unseen until the e2e throughput was traced by hand.
-///
-fn fold_by_wall_clock(
+fn fold_by_forward_ordinal(
     records: Vec<FullMeasuredMetrics>,
+    rank_count: usize,
 ) -> Result<(Vec<FullMeasuredMetrics>, FoldStats)> {
-    let reference_rank = records
-        .iter()
-        .filter_map(|record| record.dp_rank)
-        .min()
-        .expect("caller checked dp_rank");
-    let (reference_records, peer_records): (Vec<_>, Vec<_>) = records
-        .into_iter()
-        .partition(|record| record.dp_rank == Some(reference_rank));
-    let mut steps: Vec<FullMeasuredMetrics> = reference_records;
-    steps.sort_by_key(|record| observed_window(record).0);
-    // Each step keeps its own ANCHOR: the reference record's start, or a
-    // peer-only step's own start. Steps stay sorted by anchor, which is what
-    // the insertion point and the cursor rely on. The merged union (`windows`)
-    // is only for overlap tests: a merged peer can pull a union's start before
-    // an earlier step's anchor, so unions are not sorted by start.
-    let mut anchors: Vec<u64> = steps.iter().map(|step| observed_window(step).0).collect();
-    let mut windows: Vec<(u64, u64)> = steps.iter().map(observed_window).collect();
-    // How far any union starts before its anchor: a window that overlaps a peer
-    // ending at `peer_end` has `anchor < peer_end + lead`.
-    let mut lead = 0u64;
+    let dummy_records = records.iter().filter(|record| record.is_dummy).count();
+    // A rank launches forward k only after it began waiting on forward
+    // k - in_flight (its batch queue is full until then).
+    let mut in_flight = 1;
+    for record in &records {
+        let depth = record.max_forwards_in_flight.with_context(|| {
+            format!(
+                "dp_rank {:?} forward {:?} carries no max_forwards_in_flight",
+                record.dp_rank, record.forward_ordinal
+            )
+        })?;
+        ensure!(depth >= 1, "max_forwards_in_flight must be at least 1");
+        in_flight = in_flight.max(depth);
+    }
+    let mut by_rank: BTreeMap<u64, BTreeMap<u64, FullMeasuredMetrics>> = BTreeMap::new();
+    for record in records {
+        let rank = record.dp_rank.unwrap_or(0);
+        let ordinal = record
+            .forward_ordinal
+            .expect("caller checked forward_ordinal");
+        ensure!(
+            record.is_dummy || record.iteration_index.is_some(),
+            "a real record of dp_rank {rank} forward {ordinal} carries no iteration_index"
+        );
+        let previous = by_rank.entry(rank).or_default().insert(ordinal, record);
+        ensure!(
+            previous.is_none(),
+            "dp_rank {rank} records forward {ordinal} twice"
+        );
+    }
 
-    let mut peers = peer_records;
-    peers.sort_by_key(|record| observed_window(record).0);
-    // The span of the steps so far (the reference's, widened by merged peers).
-    // Anything wholly outside it is a ragged end.
-    let (mut span_start, mut span_end) = match (windows.first(), windows.last()) {
-        (Some(first), Some(last)) => (first.0, last.1),
-        _ => bail!("reference rank {reference_rank} contributed no steps"),
-    };
+    // The ordinals every rank covers. Ranks start and stop recording at
+    // different forwards (the measurement log starts at an offset, the last
+    // records can be cut), so the ends are ragged and dropped with a count.
+    let first = by_rank
+        .values()
+        .map(|forwards| *forwards.keys().next().expect("non-empty"))
+        .max()
+        .expect("ranks");
+    let last = by_rank
+        .values()
+        .map(|forwards| *forwards.keys().next_back().expect("non-empty"))
+        .min()
+        .expect("ranks");
+    ensure!(
+        first <= last,
+        "the data-parallel ranks' recorded forwards do not overlap: the common ordinal range \
+         would be {first}..={last}"
+    );
     let mut dropped_before = 0usize;
     let mut dropped_after = 0usize;
-    let mut peer_only_steps = 0usize;
-    let mut cursor = 0usize;
-    for peer in peers {
-        let (peer_start, peer_end) = observed_window(&peer);
-        if peer_end <= span_start {
-            dropped_before += 1;
-            continue;
-        }
-        if peer_start >= span_end {
-            dropped_after += 1;
-            continue;
-        }
-        // Peers come in start order, and a union only grows by merging a peer
-        // that overlaps it, so a union that ended by this peer's start can
-        // match no later peer either: the cursor only moves forward.
-        while cursor + 1 < windows.len() && windows[cursor].1 <= peer_start {
-            cursor += 1;
-        }
-        let overlap = |index: usize| {
-            windows[index]
-                .1
-                .min(peer_end)
-                .saturating_sub(windows[index].0.max(peer_start))
-        };
-        let best = (cursor..windows.len())
-            .take_while(|&index| anchors[index] < peer_end.saturating_add(lead))
-            .filter(|&index| overlap(index) > 0)
-            .max_by_key(|&index| overlap(index));
-        let Some(index) = best else {
-            // Inside the reference's span but overlapping no step: the
-            // reference rank was idle (an unrecorded dummy step), so this peer's
-            // work is a step of its own, anchored at its own start. Every step
-            // before the cursor ended by an earlier peer's start, so its anchor
-            // is at most this start and the insertion point is past the cursor.
-            let position = anchors.partition_point(|&anchor| anchor <= peer_start);
-            anchors.insert(position, peer_start);
-            windows.insert(position, (peer_start, peer_end));
-            steps.insert(position, peer);
-            peer_only_steps += 1;
-            continue;
-        };
-        merge_rank_record(&mut steps[index], peer)?;
-        windows[index] = observed_window(&steps[index]);
-        lead = lead.max(anchors[index].saturating_sub(windows[index].0));
-        span_start = span_start.min(windows[index].0);
-        span_end = span_end.max(windows[index].1);
+    for forwards in by_rank.values() {
+        dropped_before += forwards.range(..first).count();
+        dropped_after += forwards.range(last + 1..).count();
     }
+    for (rank, forwards) in &by_rank {
+        let present = forwards.range(first..=last).count() as u64;
+        let expected = last - first + 1;
+        if present != expected {
+            let missing = (first..=last)
+                .find(|ordinal| !forwards.contains_key(ordinal))
+                .expect("a gap exists");
+            bail!(
+                "dp_rank {rank} records {present} of the {expected} forwards {first}..={last} \
+                 every rank covers (first missing: {missing}); every rank runs one forward per \
+                 global step, so a missing record means a lost log line, not an idle rank"
+            );
+        }
+    }
+
+    // Wall clock checks the pairing. A rank's forward k cannot finish before
+    // every rank launched it, and a rank launches k only after it began waiting
+    // on k - in_flight, so one rank's window for k ends after any rank's window
+    // for k - in_flight starts. A violation means
+    // the ordinals do not name the same global step.
+    let windows: Vec<BTreeMap<u64, Option<(u64, u64)>>> = by_rank
+        .values()
+        .map(|forwards| {
+            forwards
+                .range(first..=last)
+                .map(|(ordinal, record)| (*ordinal, observed_window(record)))
+                .collect()
+        })
+        .collect();
+    for ordinal in (first + in_flight)..=last {
+        let earliest_end = windows
+            .iter()
+            .filter_map(|rank| rank[&ordinal].map(|window| window.1))
+            .min();
+        let latest_earlier_start = windows
+            .iter()
+            .filter_map(|rank| rank[&(ordinal - in_flight)].map(|window| window.0))
+            .max();
+        if let (Some(end), Some(start)) = (earliest_end, latest_earlier_start) {
+            ensure!(
+                end > start,
+                "forward {ordinal} ended on one rank ({end} ns) before another rank began waiting \
+                 on forward {} ({start} ns): the ranks' forward ordinals do not name the same \
+                 global step",
+                ordinal - in_flight
+            );
+        }
+    }
+
+    let mut steps = Vec::new();
+    let mut all_dummy_steps = 0usize;
+    let mut non_overlapping_steps = 0usize;
+    let mut skews_ms = Vec::new();
+    let mut ranks_iter: Vec<_> = by_rank.into_values().collect();
+    for ordinal in first..=last {
+        let records: Vec<FullMeasuredMetrics> = ranks_iter
+            .iter_mut()
+            .map(|forwards| forwards.remove(&ordinal).expect("checked contiguous"))
+            .collect();
+        let observed: Vec<(u64, u64)> = records.iter().filter_map(observed_window).collect();
+        if observed.len() == records.len() {
+            let latest_start = observed.iter().map(|window| window.0).max().expect("ranks");
+            let earliest_start = observed.iter().map(|window| window.0).min().expect("ranks");
+            let earliest_end = observed.iter().map(|window| window.1).min().expect("ranks");
+            if earliest_end < latest_start {
+                non_overlapping_steps += 1;
+            }
+            skews_ms.push((latest_start - earliest_start) as f64 / 1e6);
+        }
+        // Dummy forwards are the idle ranks' participation: no scheduled work.
+        let mut real = records.into_iter().filter(|record| !record.is_dummy);
+        let Some(mut step) = real.next() else {
+            all_dummy_steps += 1;
+            continue;
+        };
+        step.dp_rank = None;
+        for record in real {
+            merge_rank_record(&mut step, record)?;
+        }
+        // Under DP a step's identity is its global forward ordinal.
+        step.iteration_index = Some(ordinal);
+        steps.push(step);
+    }
+    let non_monotone_starts = steps
+        .windows(2)
+        .filter(|pair| {
+            matches!(
+                (pair[0].observed_start_monotonic_ns, pair[1].observed_start_monotonic_ns),
+                (Some(left), Some(right)) if right < left
+            )
+        })
+        .count();
+    let start_skew_ms = (!skews_ms.is_empty())
+        .then(|| serde_json::to_value(stats(&clean_nonnegative_sorted(&skews_ms))))
+        .transpose()?;
+    let fold = FoldStats {
+        method: "forward_ordinal",
+        ranks: rank_count,
+        dropped_before,
+        dropped_after,
+        dummy_records,
+        all_dummy_steps,
+        non_overlapping_steps,
+        non_monotone_starts,
+        start_skew_ms,
+    };
     if dropped_before + dropped_after > 0 {
         eprintln!(
-            "[alignment-workload] dropped {} peer record(s) outside reference rank {}'s span \
-             ({} before its first step, {} after its last): data-parallel ranks do not start or \
-             retire on the same step",
-            dropped_before + dropped_after,
-            reference_rank,
-            dropped_before,
-            dropped_after,
+            "[alignment-workload] dropped {} record(s) outside the forwards every rank covers \
+             ({dropped_before} before, {dropped_after} after): ranks start and stop recording at \
+             different forwards",
+            dropped_before + dropped_after
         );
     }
-    if peer_only_steps > 0 {
-        eprintln!(
-            "[alignment-workload] {peer_only_steps} peer record(s) overlapped no step of reference \
-             rank {reference_rank} and opened their own step: an idle rank runs unrecorded dummy \
-             steps"
-        );
-    }
-    Ok((
-        steps,
-        FoldStats {
-            method: "wall_clock",
-            reference_rank: Some(reference_rank),
-            peer_only_steps,
-            dropped_before,
-            dropped_after,
-        },
-    ))
+    Ok((steps, fold))
 }
 
 async fn read_simulated_points(ctx: &SessionContext) -> Result<Vec<WorkloadPoint>> {
@@ -772,7 +852,7 @@ mod tests {
         FullMeasuredMetrics {
             schema_version: if observed.is_some() { 2 } else { 1 },
             input_adapter: "vllm_text".to_string(),
-            iteration_index,
+            iteration_index: Some(iteration_index),
             prefill_tokens,
             decode_kv_lens,
             prefill_chunk_pairs: Vec::new(),
@@ -780,26 +860,43 @@ mod tests {
             observed_start_monotonic_ns: observed.map(|(start, _, _)| start),
             observed_end_monotonic_ns: observed.map(|(_, end, _)| end),
             observed_elapsed_ms: observed.map(|(_, _, elapsed)| elapsed),
+            forward_ordinal: None,
+            is_dummy: false,
+            max_forwards_in_flight: None,
         }
     }
 
-    /// The same record, attributed to a data-parallel rank. Only records that
-    /// carry both a rank and a timestamp can be paired by wall clock.
-    fn ranked_record(
+    /// A schema-5 real forward of one data-parallel rank. Its window is
+    /// `[10 * ordinal + offset, 10 * ordinal + offset + 8]` ns.
+    fn forward(
         dp_rank: u64,
+        ordinal: u64,
         iteration_index: u64,
         prefill_tokens: u64,
         decode_kv_lens: Vec<u64>,
-        observed: (u64, u64, f64),
+        offset: u64,
     ) -> FullMeasuredMetrics {
+        let start = 10 * ordinal + offset;
         FullMeasuredMetrics {
+            schema_version: 5,
             dp_rank: Some(dp_rank),
+            forward_ordinal: Some(ordinal),
+            max_forwards_in_flight: Some(2),
             ..rank_record(
                 iteration_index,
                 prefill_tokens,
                 decode_kv_lens,
-                Some(observed),
+                Some((start, start + 8, 8e-6)),
             )
+        }
+    }
+
+    /// A schema-5 dummy forward: the idle rank's participation in a step.
+    fn dummy(dp_rank: u64, ordinal: u64, offset: u64) -> FullMeasuredMetrics {
+        FullMeasuredMetrics {
+            iteration_index: None,
+            is_dummy: true,
+            ..forward(dp_rank, ordinal, 0, 0, Vec::new(), offset)
         }
     }
 
@@ -884,70 +981,281 @@ mod tests {
 
     #[test]
     fn a_single_rank_capture_passes_through_unchanged() {
-        let folded = fold_data_parallel_ranks(vec![
+        let (folded, fold) = fold_data_parallel_ranks(vec![
             rank_record(7, 4, vec![10], None),
             rank_record(8, 0, vec![11, 12], None),
         ])
-        .unwrap()
-        .0;
+        .unwrap();
 
         assert_eq!(
             folded
                 .iter()
                 .map(|record| (record.iteration_index, record.prefill_tokens))
                 .collect::<Vec<_>>(),
-            vec![(7, 4), (8, 0)]
+            vec![(Some(7), 4), (Some(8), 0)]
         );
+        assert_eq!(fold.method, "single_rank");
     }
 
     #[test]
-    fn data_parallel_ranks_fold_into_the_replica_batch() {
-        // Two ranks log the same step. The replica's batch is their union, and
-        // the step spans the earliest start to the latest end.
-        let folded = fold_data_parallel_ranks(vec![
-            rank_record(7, 4, vec![10], Some((100, 300, 2.0))),
-            rank_record(7, 6, vec![11, 12], Some((110, 350, 2.4))),
+    fn a_single_rank_sorts_by_start_and_drops_its_dummies() {
+        let (folded, fold) = fold_data_parallel_ranks(vec![
+            forward(0, 1, 8, 2, vec![], 0),
+            dummy(0, 2, 0),
+            forward(0, 0, 7, 1, vec![], 0),
         ])
-        .unwrap()
-        .0;
-
-        assert_eq!(folded.len(), 1);
-        let step = &folded[0];
-        assert_eq!(step.iteration_index, 7);
-        assert_eq!(step.prefill_tokens, 10);
-        assert_eq!(step.decode_kv_lens, vec![10, 11, 12]);
-        assert_eq!(step.observed_start_monotonic_ns, Some(100));
-        assert_eq!(step.observed_end_monotonic_ns, Some(350));
-        assert_eq!(step.observed_elapsed_ms, Some(2.4));
-    }
-
-    #[test]
-    fn folding_keeps_a_repeated_index_from_breaking_the_contiguity_scan() {
-        // The DP shape that used to split every step into its own segment:
-        // 8 records per iteration means the raw `+1` scan never continues.
-        let records: Vec<_> = (7..=9)
-            .flat_map(|iteration| (0..8).map(move |_| rank_record(iteration, 1, vec![5], None)))
-            .collect();
-
-        let (folded, _) = fold_data_parallel_ranks(records).unwrap();
+        .unwrap();
 
         assert_eq!(
             folded
                 .iter()
                 .map(|record| record.iteration_index)
                 .collect::<Vec<_>>(),
-            vec![7, 8, 9]
+            vec![Some(7), Some(8)]
         );
-        assert!(folded
-            .windows(2)
-            .all(|pair| pair[0].iteration_index + 1 == pair[1].iteration_index));
+        assert_eq!(fold.method, "single_rank");
+        assert_eq!(fold.dummy_records, 1);
+    }
+
+    #[test]
+    fn data_parallel_ranks_pair_by_forward_ordinal_with_dummies() {
+        // Rank 0 counts its own scheduled steps from 11, rank 1 from 3; the
+        // ordinal, not the index, names the global step. Rank 1 is idle at
+        // forward 1 and runs a dummy, which joins the step with no work.
+        let records = vec![
+            forward(0, 0, 11, 4, vec![10], 0),
+            forward(0, 1, 12, 0, vec![10, 20], 0),
+            forward(0, 2, 13, 0, vec![30], 0),
+            forward(1, 0, 3, 6, vec![11], 2),
+            dummy(1, 1, 2),
+            forward(1, 2, 4, 0, vec![40], 2),
+        ];
+
+        let (folded, fold) = fold_data_parallel_ranks(records).unwrap();
+
+        assert_eq!(fold.method, "forward_ordinal");
+        assert_eq!(fold.ranks, 2);
+        assert_eq!(fold.dummy_records, 1);
+        assert_eq!(fold.all_dummy_steps, 0);
+        assert_eq!(fold.non_overlapping_steps, 0);
+        assert_eq!(
+            folded
+                .iter()
+                .map(|step| (
+                    step.iteration_index,
+                    step.prefill_tokens,
+                    step.decode_kv_lens.clone()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(0), 10, vec![10, 11]),
+                (Some(1), 0, vec![10, 20]),
+                (Some(2), 0, vec![30, 40]),
+            ]
+        );
+        // The step's window is the union of its real records' windows.
+        assert_eq!(folded[0].observed_start_monotonic_ns, Some(0));
+        assert_eq!(folded[0].observed_end_monotonic_ns, Some(10));
+        assert_eq!(folded[1].observed_end_monotonic_ns, Some(18));
+        let skew = fold.start_skew_ms.unwrap();
+        assert_eq!(skew["max"], json!(2e-6));
+    }
+
+    #[test]
+    fn a_step_every_rank_ran_as_a_dummy_is_not_a_workload_step() {
+        let (folded, fold) = fold_data_parallel_ranks(vec![
+            forward(0, 0, 1, 1, vec![], 0),
+            forward(1, 0, 1, 1, vec![], 0),
+            dummy(0, 1, 0),
+            dummy(1, 1, 0),
+            forward(0, 2, 2, 1, vec![], 0),
+            forward(1, 2, 2, 1, vec![], 0),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            folded
+                .iter()
+                .map(|step| step.iteration_index)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(2)]
+        );
+        assert_eq!(fold.all_dummy_steps, 1);
+        assert_eq!(fold.dummy_records, 2);
+    }
+
+    #[test]
+    fn ragged_ends_are_dropped_with_a_count() {
+        // Rank 1 starts recording at forward 1 and rank 0 stops at forward 2.
+        let (folded, fold) = fold_data_parallel_ranks(vec![
+            forward(0, 0, 0, 1, vec![], 0),
+            forward(0, 1, 1, 1, vec![], 0),
+            forward(0, 2, 2, 1, vec![], 0),
+            forward(1, 1, 0, 1, vec![], 0),
+            forward(1, 2, 1, 1, vec![], 0),
+            forward(1, 3, 2, 1, vec![], 0),
+            forward(1, 4, 3, 1, vec![], 0),
+        ])
+        .unwrap();
+
+        assert_eq!(folded.len(), 2);
+        assert_eq!(fold.dropped_before, 1);
+        assert_eq!(fold.dropped_after, 2);
+    }
+
+    #[test]
+    fn a_missing_ordinal_inside_the_common_range_is_refused() {
+        let error = fold_data_parallel_ranks(vec![
+            forward(0, 0, 0, 1, vec![], 0),
+            forward(0, 1, 1, 1, vec![], 0),
+            forward(0, 2, 2, 1, vec![], 0),
+            forward(1, 0, 0, 1, vec![], 0),
+            forward(1, 2, 1, 1, vec![], 0),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("dp_rank 1 records 2 of the 3 forwards 0..=2")
+                && error.contains("first missing: 1"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_rank_that_records_one_forward_twice_is_refused() {
+        let error = fold_data_parallel_ranks(vec![
+            forward(0, 0, 0, 1, vec![], 0),
+            forward(1, 0, 0, 1, vec![], 0),
+            dummy(1, 0, 0),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("records forward 0 twice"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_multi_rank_capture_without_forward_ordinals_is_refused() {
+        let legacy = |rank, index| FullMeasuredMetrics {
+            dp_rank: Some(rank),
+            ..rank_record(index, 1, vec![], Some((10 * index, 10 * index + 8, 8e-6)))
+        };
+        let error = fold_data_parallel_ranks(vec![legacy(0, 0), legacy(1, 0)])
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("predates forward ordinals") && error.contains("recapture"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn records_that_repeat_an_index_without_a_rank_are_refused() {
+        // An unlabeled multi-rank capture used to be folded by iteration_index,
+        // which merged different global steps.
+        let error = fold_data_parallel_ranks(vec![
+            rank_record(7, 4, vec![10], None),
+            rank_record(7, 6, vec![11], None),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("predates forward ordinals"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn ordinals_that_contradict_the_wall_clock_are_refused() {
+        // Rank 1's forward 2 ends before rank 0 began forward 0's successor
+        // window by more than the two forwards a rank can have in flight: the
+        // ordinals cannot name the same global step.
+        let error = fold_data_parallel_ranks(vec![
+            forward(0, 0, 0, 1, vec![], 1000),
+            forward(0, 1, 1, 1, vec![], 1000),
+            forward(0, 2, 2, 1, vec![], 1000),
+            forward(1, 0, 0, 1, vec![], 0),
+            forward(1, 1, 1, 1, vec![], 0),
+            forward(1, 2, 2, 1, vec![], 0),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("do not name the same global step"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn the_wall_clock_check_reads_the_capture_in_flight_depth() {
+        // Rank 1 runs two forwards ahead: legal with three forwards in
+        // flight, impossible with two.
+        let records = |depth| {
+            (0..4)
+                .flat_map(|ordinal| {
+                    [(0, 30), (1, 0)].map(|(rank, offset)| FullMeasuredMetrics {
+                        max_forwards_in_flight: Some(depth),
+                        ..forward(rank, ordinal, ordinal, 1, vec![], offset)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert!(fold_data_parallel_ranks(records(3)).is_ok());
+        let error = fold_data_parallel_ranks(records(2))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("do not name the same global step"),
+            "unexpected error: {error}"
+        );
+        let missing: Vec<_> = records(2)
+            .into_iter()
+            .map(|record| FullMeasuredMetrics {
+                max_forwards_in_flight: None,
+                ..record
+            })
+            .collect();
+        let error = fold_data_parallel_ranks(missing).unwrap_err().to_string();
+        assert!(
+            error.contains("carries no max_forwards_in_flight"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_skewed_but_possible_step_is_counted_not_refused() {
+        // Rank 1 runs a full forward behind rank 0 (async scheduling offsets
+        // the observation windows): no overlap, still a legal pairing.
+        let (folded, fold) = fold_data_parallel_ranks(vec![
+            forward(0, 0, 0, 1, vec![], 0),
+            forward(0, 1, 1, 1, vec![], 0),
+            forward(0, 2, 2, 1, vec![], 0),
+            forward(1, 0, 0, 1, vec![], 9),
+            forward(1, 1, 1, 1, vec![], 9),
+            forward(1, 2, 2, 1, vec![], 9),
+        ])
+        .unwrap();
+
+        assert_eq!(folded.len(), 3);
+        assert_eq!(fold.non_overlapping_steps, 3);
     }
 
     #[test]
     fn mixed_schema_versions_within_one_step_are_rejected() {
         let error = fold_data_parallel_ranks(vec![
-            rank_record(7, 4, vec![10], None),
-            rank_record(7, 6, vec![11], Some((100, 200, 1.0))),
+            forward(0, 0, 0, 1, vec![], 0),
+            FullMeasuredMetrics {
+                schema_version: 6,
+                ..forward(1, 0, 0, 1, vec![], 0)
+            },
         ])
         .unwrap_err();
 
@@ -958,190 +1266,43 @@ mod tests {
     }
 
     #[test]
-    fn ranks_that_count_their_own_steps_still_fold_by_wall_clock() {
-        // The GLM-5.2 DP8 shape, minimised: one wall-clock step is iteration 11
-        // on the reference rank and 7 on its peer, and the next step is 12/8.
-        // Folding by index would pair 11 with the peer's *later* step.
-        let folded = fold_data_parallel_ranks(vec![
-            ranked_record(0, 11, 4, vec![10], (100, 300, 2.0)),
-            ranked_record(0, 12, 5, vec![20], (400, 600, 2.0)),
-            ranked_record(3, 7, 6, vec![11], (110, 310, 2.4)),
-            ranked_record(3, 8, 7, vec![21], (405, 615, 2.5)),
-        ])
-        .unwrap()
-        .0;
+    fn schema_five_metrics_read_through_the_ordinal_fold() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        let row = |rank: u64, ordinal: u64, dummy: bool| {
+            let start = 100 * (ordinal + 1);
+            json!({
+                "schema_version": 5, "input_adapter": "vllm_text",
+                "iteration_index": if dummy { Value::Null } else { json!(ordinal + 40 * rank) },
+                "forward_ordinal": ordinal, "is_dummy": dummy, "dp_rank": rank,
+                "max_forwards_in_flight": 2,
+                "prefill_tokens": if dummy { 0 } else { 4 },
+                "decode_kv_lens": [], "prefill_chunk_pairs": [],
+                "decode_request_progress": [],
+                "observed_start_monotonic_ns": start,
+                "observed_end_monotonic_ns": start + 50,
+                "observed_elapsed_ms": 5e-5
+            })
+            .to_string()
+        };
+        let lines = [
+            row(0, 0, false),
+            row(1, 0, false),
+            row(0, 1, false),
+            row(1, 1, true),
+        ];
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
 
-        assert_eq!(folded.len(), 2);
-        assert_eq!(folded[0].iteration_index, 11);
-        assert_eq!(folded[0].prefill_tokens, 10);
-        assert_eq!(folded[0].decode_kv_lens, vec![10, 11]);
-        assert_eq!(folded[0].observed_start_monotonic_ns, Some(100));
-        assert_eq!(folded[0].observed_end_monotonic_ns, Some(310));
-        assert_eq!(folded[1].iteration_index, 12);
-        assert_eq!(folded[1].prefill_tokens, 12);
-        assert_eq!(folded[1].decode_kv_lens, vec![20, 21]);
-    }
+        let (points, fold) = read_measured_points(&path, None, None).unwrap();
 
-    #[test]
-    fn a_peer_step_in_a_gap_between_reference_steps_opens_its_own_step() {
-        // Two ranks. Rank 0 has work at 100..300 and 400..600 and is idle in
-        // between (its dummy step is not logged); rank 1 logs a step in that
-        // hole, which therefore overlaps nothing on rank 0. It must become a
-        // step of its own, between the two, and a later rank-1 record that
-        // overlaps rank 0's second step must still merge into it.
-        let (folded, fold) = fold_data_parallel_ranks(vec![
-            ranked_record(0, 11, 4, vec![10], (100, 300, 2.0)),
-            ranked_record(0, 12, 5, vec![20], (400, 600, 2.0)),
-            ranked_record(1, 7, 6, vec![11], (310, 390, 0.8)),
-            ranked_record(1, 8, 3, vec![21, 22], (405, 610, 2.1)),
-        ])
-        .expect("a peer-only step must not withhold the subject");
-
-        assert_eq!(folded.len(), 3);
         assert_eq!(
-            folded
+            points
                 .iter()
-                .map(|step| (step.observed_start_monotonic_ns, step.prefill_tokens))
+                .map(|point| (point.iteration_id, point.prefill_tokens))
                 .collect::<Vec<_>>(),
-            vec![(Some(100), 4), (Some(310), 6), (Some(400), 8)]
+            vec![(0, 8), (1, 4)]
         );
-        assert_eq!(folded[1].decode_kv_lens, vec![11]);
-        assert_eq!(folded[1].dp_rank, Some(1));
-        assert_eq!(folded[2].decode_kv_lens, vec![20, 21, 22]);
-        assert_eq!(folded[2].observed_end_monotonic_ns, Some(610));
-        assert_eq!(
-            fold,
-            FoldStats {
-                method: "wall_clock",
-                reference_rank: Some(0),
-                peer_only_steps: 1,
-                dropped_before: 0,
-                dropped_after: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn a_merged_peer_that_starts_early_keeps_the_steps_in_anchor_order() {
-        // The reviewer's counterexample. P overlaps A by 20 and B by 170, so it
-        // joins B and pulls B's union start to 95, before A's 100. R then
-        // overlaps only B's union and must join it; Q falls in the gap between
-        // B and C and must open its own step between them, and S overlaps C.
-        let (folded, fold) = fold_data_parallel_ranks(vec![
-            ranked_record(0, 1, 1, vec![], (100, 120, 0.2)),
-            ranked_record(0, 2, 2, vec![], (130, 400, 2.7)),
-            ranked_record(0, 3, 3, vec![], (500, 600, 1.0)),
-            ranked_record(1, 7, 10, vec![], (95, 300, 2.0)),
-            ranked_record(2, 4, 20, vec![], (96, 98, 0.1)),
-            ranked_record(1, 8, 40, vec![], (410, 450, 0.4)),
-            ranked_record(2, 5, 80, vec![], (505, 590, 0.9)),
-        ])
-        .unwrap();
-
-        assert_eq!(
-            folded
-                .iter()
-                .map(|step| (step.iteration_index, step.prefill_tokens))
-                .collect::<Vec<_>>(),
-            vec![(1, 1), (2, 32), (8, 40), (3, 83)]
-        );
-        assert_eq!(folded[1].observed_start_monotonic_ns, Some(95));
-        assert_eq!(fold.peer_only_steps, 1);
-    }
-
-    #[test]
-    fn a_single_timestamped_rank_reports_single_rank() {
-        let (folded, fold) = fold_data_parallel_ranks(vec![
-            ranked_record(0, 2, 2, vec![], (300, 400, 1.0)),
-            ranked_record(0, 1, 1, vec![], (100, 200, 1.0)),
-        ])
-        .unwrap();
-        assert_eq!(
-            folded
-                .iter()
-                .map(|step| step.iteration_index)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert_eq!(fold.method, "single_rank");
-    }
-
-    #[test]
-    fn peer_records_that_overlap_each_other_in_a_gap_share_one_step() {
-        // Two peers both run while the reference rank is idle: one step, not
-        // two, since a step is the union of overlapping records.
-        let (folded, fold) = fold_data_parallel_ranks(vec![
-            ranked_record(0, 11, 4, vec![10], (100, 300, 2.0)),
-            ranked_record(0, 12, 5, vec![20], (400, 600, 2.0)),
-            ranked_record(1, 7, 6, vec![11], (310, 390, 0.8)),
-            ranked_record(2, 3, 1, vec![12], (315, 395, 0.8)),
-        ])
-        .unwrap();
-
-        assert_eq!(folded.len(), 3);
-        assert_eq!(folded[1].prefill_tokens, 7);
-        assert_eq!(folded[1].decode_kv_lens, vec![11, 12]);
-        assert_eq!(folded[1].observed_end_monotonic_ns, Some(395));
-        assert_eq!(fold.peer_only_steps, 1);
-    }
-
-    #[test]
-    fn a_peer_step_past_the_reference_span_is_a_ragged_end_and_is_dropped() {
-        // Data-parallel ranks do not retire on the same step. In the GLM-5.2 DP8
-        // run the ranks ran 6154..6159 iterations each and rank 3's last step
-        // opened 1.09 ms after rank 0 had finished for good -- one peer record of
-        // 43,091, with zero misses inside the span. Refusing on that withheld the
-        // whole scheduler-shape subject, which is the one view that compares
-        // scheduled work per step.
-        let folded = fold_data_parallel_ranks(vec![
-            ranked_record(0, 11, 4, vec![10], (100, 300, 2.0)),
-            ranked_record(3, 7, 6, vec![11], (110, 310, 2.4)),
-            ranked_record(3, 8, 7, vec![21], (900, 1000, 1.0)),
-        ])
-        .expect("a ragged end must not withhold the subject")
-        .0;
-
-        // The overlapping peer still folded; only the trailing one went.
-        assert_eq!(folded.len(), 1);
-        assert_eq!(folded[0].iteration_index, 11);
-        assert_eq!(folded[0].decode_kv_lens, vec![10, 11]);
-        assert_eq!(folded[0].prefill_tokens, 10);
-    }
-
-    #[test]
-    fn a_peer_step_before_the_reference_span_is_dropped_the_same_way() {
-        // The other end: ranks do not start together either (0.0..1.6 s apart in
-        // the measured run), so the reference rank may open after a peer.
-        let folded = fold_data_parallel_ranks(vec![
-            ranked_record(0, 11, 4, vec![10], (100, 300, 2.0)),
-            ranked_record(3, 6, 9, vec![9], (1, 50, 0.5)),
-            ranked_record(3, 7, 6, vec![11], (110, 310, 2.4)),
-        ])
-        .expect("a ragged start must not withhold the subject either")
-        .0;
-
-        assert_eq!(folded.len(), 1);
-        assert_eq!(folded[0].decode_kv_lens, vec![10, 11]);
-    }
-
-    #[test]
-    fn records_without_timestamps_keep_the_index_fold() {
-        // Schema 1 has nothing to pair on. The index fold is what feeds the
-        // preflight-vs-replay segment scan, so it must survive untouched.
-        let folded = fold_data_parallel_ranks(vec![
-            FullMeasuredMetrics {
-                dp_rank: Some(0),
-                ..rank_record(7, 4, vec![10], None)
-            },
-            FullMeasuredMetrics {
-                dp_rank: Some(3),
-                ..rank_record(7, 6, vec![11], None)
-            },
-        ])
-        .unwrap()
-        .0;
-
-        assert_eq!(folded.len(), 1);
-        assert_eq!(folded[0].prefill_tokens, 10);
+        assert_eq!(fold.method, "forward_ordinal");
+        assert_eq!(fold.dummy_records, 1);
     }
 }
