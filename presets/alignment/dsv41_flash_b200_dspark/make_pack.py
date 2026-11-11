@@ -42,23 +42,25 @@ on every case (rendered from the case). Changed per the alignment skill:
   (logs/20261107_1_dsv41_dspark_align_pack/warm_draft_buckets.py), and `--jit-monitor-verbose` logs every
   in-inference compile so a pass with one inside the measured window is found and rerun.
 
-Calibrated case values start `provisional` and are replaced from each case's own workload pass:
-`speculative_acceptance` from `spec_decode_metrics.json`, `attn_gpu_memory_gb` from the server log's
-KV block count x block bytes.
+Calibrated case values are `from_capture`: `run` reads them from each case's own workload pass
+(`speculative_acceptance` and `speculative_acceptance_by_output_position` from the speculative metrics and
+request progress, `attn_gpu_memory_gb` from the server log's KV pool).
+
+alignment Phase 1: one `phase: 1` case per topology replays the tracked trace/diverse_100.csv on the server
+the Phase 1 captures ran (see PHASE1_GRAPH_SIZES).
 
 Run from the repo root: uv run python presets/alignment/dsv41_flash_b200_dspark/make_pack.py
 """
 import json
+import sys
 from pathlib import Path
 
-import yaml
-
 HERE = Path(__file__).resolve().parent
-GIB = 1 << 30
+sys.path.insert(0, str(HERE.parents[2]))  # the repo root, for `launcher`
+from launcher.alignment_campaign.packfile import write_campaign  # noqa: E402
 L = 131072  # --max-model-len on every case
 VERIFY = 6  # DSpark num_speculative_tokens 5 + 1
 DRAFT = 5
-EVIDENCE_DIR = "logs/20261107_1_dsv41_dspark_align_pack/runs"
 
 
 def capture_sizes(chunk: int) -> list[int]:
@@ -95,19 +97,23 @@ PYTHON_RUNTIME = {
     },
 }
 
-# Provisional chains: conditional per-position acceptance of the manual diverse_100 captures (jobs 17986 TP4,
-# 17987 DP4), replaced per case from its own workload pass.
-PROVISIONAL_ACCEPTANCE = {
-    "tp4": ([0.7957, 0.802, 0.8402, 0.8661, 0.8805],
-            "logs/20261106_0_dsv41_dspark_capture/profile_tp4ep4_diverse_workload/spec_decode_metrics.json"),
-    "dp4": ([0.7732, 0.783, 0.8116, 0.8405, 0.8605],
-            "logs/20261106_0_dsv41_dspark_capture/profile_dp4ep4_diverse_workload/spec_decode_metrics.json"),
-}
-# Provisional per-rank KV pool: the same captures' "Extended KV cache to N blocks (X GiB)".
-PROVISIONAL_KV_GIB = {"tp4": 80.26, "dp4": 69.64}
+# Calibrated inputs come from each case's own workload pass (launcher/alignment_campaign/calibration.py):
+# the global acceptance chain and acceptance by output position from spec_decode_metrics.json and the
+# request progress rows, the per-rank KV pool from the server log.
+FROM_CAPTURE = {"status": "from_capture"}
 
-MEASURED_PATH = HERE / "measured.json"
-MEASURED = json.loads(MEASURED_PATH.read_text()) if MEASURED_PATH.exists() else {}
+# alignment Phase 1 server: the one the diverse_100 captures ran (logs/20261110_0_dsv41_phase1 TP4, job 20586;
+# logs/20261111_1_dsv41_dp4_img0021 DP4, jobs 20807/20826). It is the chunk-2048 variant except that vLLM
+# chose the CUDA-graph sizes from max_cudagraph_capture_size 2052 (no explicit list, no JIT monitor, no
+# warmup pass). PHASE1_GRAPH_SIZES is the list both servers logged ("cudagraph_capture_sizes" in the
+# resolved compilation config); it is the arch's list too.
+PHASE1_GRAPH_SIZES = (
+    [1, 2, 4, 6, 8, 12, 16, 18, 24, 32, 36, 40, 42, 48, 56, 60, 64, 66, 72, 80, 84, 88, 90, 96, 104, 108, 112,
+     114, 120, 128, 132, 136, 138, 144, 152, 156, 160, 162, 168, 176, 180, 184, 186, 192, 200, 204, 208, 210,
+     216, 224, 228, 232, 234, 240, 248, 252, 256, 258, 272, 276, 288, 304, 306, 320, 324, 336, 352, 354, 368,
+     372, 384]
+    + list(range(400, 2049, 16))
+)
 
 
 def variant_name(topo: str, chunk: int) -> str:
@@ -199,6 +205,43 @@ def variant(topo: str, chunk: int) -> dict:
     }
 
 
+def phase1_variant(topo: str) -> dict:
+    out = json.loads(json.dumps(variant(topo, 2048)))
+    server = out["server"]
+    server["max_cudagraph_capture_size"] = 2052
+    args = server["extra_args"]
+    i = args.index("--cudagraph-capture-sizes")
+    del args[i:i + 1 + len(capture_sizes(2048))]
+    args.remove("--jit-monitor-verbose")
+    out["arch"]["cudagraph_capture_sizes"] = PHASE1_GRAPH_SIZES
+    for p in out["profile_passes"]:
+        p.pop("warmup", None)
+    return out
+
+
+def phase1_case(topo: str, number: int) -> dict:
+    return {
+        "index": number,
+        "name": f"{topo}_diverse_100",
+        "variant": f"{topo}_phase1",
+        "phase": 1,
+        "purpose": "alignment Phase 1: the tracked diverse_100 trace at its recorded arrival times.",
+        "coverage": ["diverse_100"],
+        "max_model_len": L,
+        "max_concurrency": 64,
+        "chunk_size": 2048,
+        "speculative_acceptance": FROM_CAPTURE,
+        "speculative_acceptance_by_output_position": FROM_CAPTURE,
+        "profile_arrival_mode": "trace-timed",
+        "simulation_arrival_mode": "trace_timed",
+        "gpu_memory_utilization": 0.9,
+        "capture_seconds": 60.0,
+        "device_role": "primary",
+        "workload_trace": {"path": "trace/diverse_100.csv"},
+        "attn_gpu_memory_gb": FROM_CAPTURE,
+    }
+
+
 # ---------------------------------------------------------------- workloads
 PREFILL_HEAVY = [(1024, 32), (2047, 32), (2048, 64), (3000, 32), (4096, 64), (6000, 32), (8192, 64),
                  (12288, 32), (16384, 128), (32768, 64), (65536, 32)]
@@ -237,33 +280,6 @@ def case(topo: str, offset: int, spec) -> dict:
     number = offset + index
     name = f"{topo}_{name}_k{chunk}"
     slug = f"{number:02d}_{name}"
-    measured = MEASURED.get(slug, {})
-    if "acceptance" in measured:
-        acceptance = {
-            "value": measured["acceptance"],
-            "status": "measured",
-            "derived_from": "Conditional accepted-token count ratios from this case's warm workload pass: "
-                            "position 0 / num_drafts, then position i / position i-1.",
-            "evidence": f"{EVIDENCE_DIR}/{slug}/profile_workload/spec_decode_metrics.json",
-        }
-    else:
-        chain, source = PROVISIONAL_ACCEPTANCE[topo]
-        acceptance = {"value": chain, "status": "provisional",
-                      "derived_from": "diverse_100 manual capture of the same server at chunk 2048; "
-                                      "replace from this case's workload pass", "evidence": source}
-    if "kv_blocks" in measured:
-        kv = {
-            "value": round(measured["kv_bytes"] / 1e9, 9),
-            "status": "measured",
-            "derived_from": f"Smallest rank's KV pool: {measured['kv_blocks']} blocks "
-                            f"({measured['kv_gib']} GiB) per the server log; GPU KV cache size "
-                            f"{measured['kv_tokens']:,} tokens.",
-            "evidence": f"{EVIDENCE_DIR}/{slug}/profile_workload/vllm/",
-        }
-    else:
-        kv = {"value": round(PROVISIONAL_KV_GIB[topo] * GIB / 1e9, 6), "status": "provisional",
-              "derived_from": "chunk-2048 manual capture's per-rank KV pool; replace from this case's "
-                              "workload server log"}
     return {
         "index": number,
         "name": name,
@@ -273,7 +289,8 @@ def case(topo: str, offset: int, spec) -> dict:
         "max_model_len": L,
         "max_concurrency": conc,
         "chunk_size": chunk,
-        "speculative_acceptance": acceptance,
+        "speculative_acceptance": FROM_CAPTURE,
+        "speculative_acceptance_by_output_position": FROM_CAPTURE,
         "profile_arrival_mode": "saturated",
         "simulation_arrival_mode": "saturated",
         "gpu_memory_utilization": 0.9,
@@ -284,13 +301,15 @@ def case(topo: str, offset: int, spec) -> dict:
             "shapes": [list(s) for s in shapes],
             "repeats": repeats,
         },
-        "attn_gpu_memory_gb": kv,
+        "attn_gpu_memory_gb": FROM_CAPTURE,
     }
 
 
 def main() -> None:
     variants = {variant_name(t, c): variant(t, c) for t in TOPOLOGIES for c in CHUNKS}
+    variants.update({f"{t}_phase1": phase1_variant(t) for t in TOPOLOGIES})
     cases = [case("tp4", 0, spec) for spec in CASES] + [case("dp4", len(CASES), spec) for spec in CASES]
+    cases += [phase1_case("tp4", 2 * len(CASES) + 1), phase1_case("dp4", 2 * len(CASES) + 2)]
     pack = {
         "schema_version": 1,
         "pack": "dsv41_flash_b200_dspark",
@@ -311,9 +330,7 @@ def main() -> None:
         "variants": variants,
         "cases": cases,
     }
-    text = "# Generated by make_pack.py; edit that, not this.\n" + yaml.safe_dump(
-        pack, sort_keys=False, width=120)
-    (HERE / "campaign.yaml").write_text(text)
+    write_campaign(HERE / "campaign.yaml", pack)
     for chunk, seqs in CHUNKS.items():
         print(f"chunk {chunk}: {len(capture_sizes(chunk))} token sizes, "
               f"{len(decode_request_sizes(chunk, seqs))} decode request sizes")
