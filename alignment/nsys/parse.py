@@ -773,7 +773,6 @@ class DeviceStepWindow:
     start: int
     end: int
     items: list[RangeStats]
-    matchable: bool = True
 
 
 @dataclass
@@ -795,80 +794,25 @@ class AlignedStep:
         return {window.device_id: window.iteration for window in self.windows}
 
 
-def _device_step_windows(
-    ranges: list[RangeStats], *, use_kernel_time: bool
-) -> dict[int | None, list[DeviceStepWindow]]:
-    """Build each device's steps from the evidence used to match them.
-
-    Independent schedulers are paired by attributed GPU work, not asynchronous
-    host submission ranges. A step without a correlated kernel remains in the
-    reference timeline but is not eligible for a time-based match.
-    """
+def _device_step_windows(ranges: list[RangeStats]) -> dict[int | None, list[DeviceStepWindow]]:
+    """Group each device's ranges by its own iteration index."""
     grouped: dict[tuple[int | None, int], list[RangeStats]] = defaultdict(list)
     for item in ranges:
         grouped[(item.worker.device_id, item.iteration)].append(item)
     by_device: dict[int | None, list[DeviceStepWindow]] = defaultdict(list)
     for (device_id, iteration), items in grouped.items():
-        kernel_intervals = [interval for item in items for interval in item.intervals]
-        if use_kernel_time and kernel_intervals:
-            start = min(start for start, _ in kernel_intervals)
-            end = max(end for _, end in kernel_intervals)
-            matchable = True
-        else:
-            start = min(item.start for item in items)
-            end = max(item.end for item in items)
-            matchable = not use_kernel_time
         by_device[device_id].append(
             DeviceStepWindow(
                 device_id=device_id,
                 iteration=iteration,
-                start=start,
-                end=end,
+                start=min(item.start for item in items),
+                end=max(item.end for item in items),
                 items=sorted(items, key=lambda item: (item.start, item.phase)),
-                matchable=matchable,
             )
         )
     for windows in by_device.values():
         windows.sort(key=lambda window: (window.start, window.iteration))
     return by_device
-
-
-def _pair_by_overlap(
-    reference: list[DeviceStepWindow], peer: list[DeviceStepWindow]
-) -> tuple[dict[int, DeviceStepWindow], list[DeviceStepWindow]]:
-    """Match only mutual, unique best overlaps between two GPU timelines."""
-    matchable_reference = [window for window in reference if window.matchable]
-    matchable_peer = [window for window in peer if window.matchable]
-
-    def overlap(left: DeviceStepWindow, right: DeviceStepWindow) -> int:
-        return max(0, min(left.end, right.end) - max(left.start, right.start))
-
-    def unique_best(
-        window: DeviceStepWindow, candidates: list[DeviceStepWindow]
-    ) -> DeviceStepWindow | None:
-        scored = [(overlap(window, candidate), candidate) for candidate in candidates]
-        best_score = max((score for score, _ in scored), default=0)
-        if best_score <= 0:
-            return None
-        best = [candidate for score, candidate in scored if score == best_score]
-        return best[0] if len(best) == 1 else None
-
-    reference_best = {
-        window.iteration: unique_best(window, matchable_peer) for window in matchable_reference
-    }
-    peer_best = {
-        window.iteration: unique_best(window, matchable_reference) for window in matchable_peer
-    }
-    matched: dict[int, DeviceStepWindow] = {}
-    matched_peer_iterations: set[int] = set()
-    for reference_window in matchable_reference:
-        peer_window = reference_best[reference_window.iteration]
-        if peer_window is None or peer_best[peer_window.iteration] is not reference_window:
-            continue
-        matched[reference_window.iteration] = peer_window
-        matched_peer_iterations.add(peer_window.iteration)
-    unpaired = [window for window in peer if window.iteration not in matched_peer_iterations]
-    return matched, unpaired
 
 
 def _pair_by_iteration_index(
@@ -966,13 +910,14 @@ def align_ranges_into_steps(
     """Group device ranges into logical serving steps.
 
     TP ranks behind one scheduler share an authoritative indexed marker.
-    Independent DP schedulers number their own steps. When the metrics carry
-    forward ordinals (schema 5, `forward_ordinals`) their steps join by the
-    global forward they ran; otherwise only on unambiguous attributed-kernel
-    overlap. Unmatched evidence remains explicit.
+    Independent DP schedulers number their own steps; their steps join by the
+    global forward they ran (schema 5, `forward_ordinals`). A multi-device
+    capture whose ranks cannot be joined that way -- no DP-rank mapping, or DP
+    ranks without ordinals -- is refused: measured time does not identify a
+    step across asynchronous schedulers. Unmatched evidence remains explicit.
     """
     shared_iteration_index = _uses_shared_iteration_index(dp_rank_by_device)
-    by_device = _device_step_windows(ranges, use_kernel_time=not shared_iteration_index)
+    by_device = _device_step_windows(ranges)
     if not by_device:
         return [], {}
     reference_device_id = sorted(by_device, key=lambda device: (device is None, device))[0]
@@ -982,6 +927,18 @@ def align_ranges_into_steps(
         if shared_iteration_index or len(by_device) < 2
         else _window_ordinals(by_device, dp_rank_by_device or {}, ordinals or {})
     )
+    if len(by_device) > 1 and not shared_iteration_index and window_ordinals is None:
+        if not dp_rank_by_device:
+            raise ValueError(
+                f"the capture has {len(by_device)} devices but no device-to-DP-rank mapping, so "
+                "tensor-parallel peers cannot be told from independent DP schedulers"
+            )
+        raise ValueError(
+            f"the capture has {len(set(dp_rank_by_device.values()))} data-parallel ranks but "
+            "its metrics carry no forward_ordinal: it predates forward ordinals (schema 5, "
+            "vLLM reference patch 0019), so its ranks' steps cannot be joined; recapture it "
+            "with the current reference image (SGLang emits no ordinals yet)"
+        )
 
     joined: dict[int, list[DeviceStepWindow]] = {window.iteration: [window] for window in reference}
     unpaired_by_device: dict[int, int] = {}
@@ -990,15 +947,13 @@ def align_ranges_into_steps(
             continue
         if shared_iteration_index:
             matched, unpaired = _pair_by_iteration_index(reference, windows)
-        elif window_ordinals is not None:
+        else:
             matched, unpaired = _pair_by_forward_ordinal(
                 reference,
                 windows,
                 window_ordinals[reference_device_id],
                 window_ordinals[device_id],
             )
-        else:
-            matched, unpaired = _pair_by_overlap(reference, windows)
         for iteration, window in matched.items():
             joined[iteration].append(window)
         if unpaired:
@@ -1101,8 +1056,7 @@ def build_iteration_details(
     lossless ground-truth artifact. Kernel names are never truncated here.
 
     TP ranks join by exact indexed phase identity. Independent DP ranks join
-    by forward ordinal when the metrics carry it (schema 5), otherwise only on
-    unambiguous attributed-kernel overlap. Each range retains its own
+    by forward ordinal (schema 5); without it a DP capture is refused. Each range retains its own
     `iteration_index`; missing or untrusted matches remain explicit.
 
     `metrics` is the index-keyed replica aggregate, used only as the fallback for
@@ -1621,8 +1575,8 @@ def parse_trace(
                 "iteration_index"
                 if _uses_shared_iteration_index(dp_rank_by_device)
                 else "forward_ordinal"
-                if ordinals and len({r.worker.device_id for r in ranges}) > 1
-                else "kernel_time_overlap"
+                if len({r.worker.device_id for r in ranges}) > 1
+                else "single_device"
             ),
             "reference_device_id": (
                 aligned_steps[0].reference_device_id if aligned_steps else None

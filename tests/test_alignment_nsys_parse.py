@@ -735,25 +735,6 @@ def _window(device_id: int, iteration: int, start: int, end: int, phase: str = "
     )
 
 
-def test_steps_group_by_measured_time_not_by_iteration_index():
-    from alignment.nsys.parse import align_ranges_into_steps
-
-    ranges = [
-        _window(0, 5, 0, 10),
-        _window(0, 6, 10, 20),
-        _window(0, 7, 20, 30),
-        # Device 1 is two steps behind on the counter but runs at the same time.
-        _window(1, 3, 1, 11),
-        _window(1, 4, 11, 21),
-        _window(1, 5, 21, 31),
-    ]
-    steps, unpaired = align_ranges_into_steps(ranges)
-
-    assert [step.iteration for step in steps] == [5, 6, 7]
-    assert [step.index_by_device for step in steps] == [{0: 5, 1: 3}, {0: 6, 1: 4}, {0: 7, 1: 5}]
-    assert unpaired == {}
-
-
 def test_single_engine_tp_steps_group_by_index_when_host_ranges_do_not_overlap():
     from alignment.nsys.parse import align_ranges_into_steps
 
@@ -786,33 +767,6 @@ def test_single_engine_tp_requires_the_same_phase_identity():
     assert unpaired == {1: 1}
 
 
-def test_multi_engine_steps_use_kernel_time_instead_of_host_submission_time():
-    from alignment.nsys.parse import align_ranges_into_steps
-
-    reference = _window(0, 5, 100, 110)
-    peer = _window(1, 3, 200, 210)
-    reference.intervals = [(1_000, 1_010)]
-    peer.intervals = [(1_001, 1_011)]
-
-    steps, unpaired = align_ranges_into_steps([reference, peer], {0: 0, 1: 1})
-
-    assert [step.index_by_device for step in steps] == [{0: 5, 1: 3}]
-    assert unpaired == {}
-
-
-def test_multi_engine_step_without_kernel_evidence_stays_unpaired():
-    from alignment.nsys.parse import align_ranges_into_steps
-
-    reference = _window(0, 5, 100, 110)
-    peer = _window(1, 3, 101, 109)
-    peer.intervals = []
-
-    steps, unpaired = align_ranges_into_steps([reference, peer], {0: 0, 1: 1})
-
-    assert [step.index_by_device for step in steps] == [{0: 5}]
-    assert unpaired == {1: 1}
-
-
 def test_multi_engine_steps_pair_by_forward_ordinal_when_metrics_carry_it():
     """Schema 5: the k-th forward of every DP rank is one global step.
 
@@ -838,6 +792,19 @@ def test_multi_engine_steps_pair_by_forward_ordinal_when_metrics_carry_it():
     assert unpaired == {1: 1}
 
 
+def test_dp_ranks_without_forward_ordinals_are_refused():
+    """Measured time does not identify a step across asynchronous schedulers:
+    a pre-schema-5 DP capture is refused, as alignment-workload refuses it."""
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    ranges = [_window(0, 5, 0, 10), _window(1, 3, 1, 11)]
+
+    with pytest.raises(ValueError, match="predates forward ordinals"):
+        align_ranges_into_steps(ranges, {0: 0, 1: 1})
+    with pytest.raises(ValueError, match="no device-to-DP-rank mapping"):
+        align_ranges_into_steps(ranges)
+
+
 def test_forward_ordinal_pairing_needs_an_ordinal_for_every_window():
     from alignment.nsys.parse import align_ranges_into_steps
 
@@ -847,53 +814,25 @@ def test_forward_ordinal_pairing_needs_an_ordinal_for_every_window():
         align_ranges_into_steps(ranges, {0: 0, 1: 1}, {(0, 5): 0})
 
 
-def test_multi_engine_ambiguous_kernel_overlap_stays_unpaired():
-    from alignment.nsys.parse import align_ranges_into_steps
-
-    first = _window(0, 5, 100, 110)
-    second = _window(0, 6, 110, 120)
-    peer = _window(1, 3, 100, 120)
-    first.intervals = [(1_000, 1_010)]
-    second.intervals = [(1_010, 1_020)]
-    peer.intervals = [(1_005, 1_015)]
-
-    steps, unpaired = align_ranges_into_steps([first, second, peer], {0: 0, 1: 1})
-
-    assert [step.index_by_device for step in steps] == [{0: 5}, {0: 6}]
-    assert unpaired == {1: 1}
-
-
-def test_a_step_only_one_rank_ran_keeps_that_rank_and_names_the_absent_ones():
-    from alignment.nsys.parse import align_ranges_into_steps
-
-    ranges = [
-        # Device 0 alone for the first two steps — the prefill chunks.
-        _window(0, 8, 0, 100),
-        _window(0, 9, 100, 200),
-        _window(0, 10, 200, 210),
-        _window(1, 8, 201, 211),
-    ]
-    steps, _ = align_ranges_into_steps(ranges)
-
-    assert [step.index_by_device for step in steps] == [{0: 8}, {0: 9}, {0: 10, 1: 8}]
-
-    name_ids, _ = build_kernel_name_index(ranges)
-    details = build_iteration_details(ranges, {}, name_ids, {}, {0: 0, 1: 1})
-    assert [detail["devices_absent"] for detail in details] == [[1], [1], []]
-    assert details[0]["iteration_index_by_device"] == {"0": 8}
-    assert details[2]["iteration_index_by_device"] == {"0": 10, "1": 8}
-
-
 def test_each_range_carries_its_own_index_and_its_own_ranks_metrics():
     from alignment.nsys.parse import align_ranges_into_steps  # noqa: F401
 
     ranges = [_window(0, 5, 0, 10), _window(1, 3, 1, 11)]
     rank_metrics = {
-        (0, 5): {"input_adapter": "vllm_text", "prefill_tokens": 8189, "decode_requests": 3},
-        (1, 3): {"input_adapter": "vllm_text", "prefill_tokens": 0, "decode_requests": 7},
+        (0, 5): {
+            "input_adapter": "vllm_text", "prefill_tokens": 8189, "decode_requests": 3,
+            "forward_ordinal": 0,
+        },
+        (1, 3): {
+            "input_adapter": "vllm_text", "prefill_tokens": 0, "decode_requests": 7,
+            "forward_ordinal": 0,
+        },
         # The peer's row under the STEP's id belongs to a different step and must
         # not be picked up.
-        (1, 5): {"input_adapter": "vllm_text", "prefill_tokens": 0, "decode_requests": 99},
+        (1, 5): {
+            "input_adapter": "vllm_text", "prefill_tokens": 0, "decode_requests": 99,
+            "forward_ordinal": 2,
+        },
     }
     name_ids, _ = build_kernel_name_index(ranges)
     (detail,) = build_iteration_details(ranges, {}, name_ids, rank_metrics, {0: 0, 1: 1})
@@ -934,8 +873,8 @@ def test_tensor_parallel_devices_state_one_shared_scheduler_batch():
 def test_dp_batches_fold_once_each_even_when_each_has_multiple_tp_devices():
     ranges = [_window(device_id, 5 if device_id < 2 else 3, 0, 10) for device_id in range(4)]
     rank_metrics = {
-        (0, 5): json.loads(_metrics_line(0, 5, prefill_tokens=100, decode_kv_lens=[])),
-        (1, 3): json.loads(_metrics_line(1, 3, prefill_tokens=0, decode_kv_lens=[9, 11])),
+        (0, 5): {**json.loads(_metrics_line(0, 5, 100, [])), "forward_ordinal": 0},
+        (1, 3): {**json.loads(_metrics_line(1, 3, 0, [9, 11])), "forward_ordinal": 0},
     }
     name_ids, _ = build_kernel_name_index(ranges)
 
@@ -975,21 +914,6 @@ def test_tp_iteration_disagreement_is_rejected_even_when_one_metric_row_is_missi
             {(0, 5): {"iteration_index": 5}},
             {0: 0, 1: 0},
         )
-
-
-def test_a_peer_step_with_no_reference_counterpart_is_counted_not_dropped():
-    from alignment.nsys.parse import align_ranges_into_steps
-
-    ranges = [
-        _window(0, 5, 100, 110),
-        # Device 1 ran a step before the reference's window opens at all.
-        _window(1, 1, 0, 10),
-        _window(1, 2, 101, 111),
-    ]
-    steps, unpaired = align_ranges_into_steps(ranges)
-
-    assert [step.index_by_device for step in steps] == [{0: 5, 1: 2}]
-    assert unpaired == {1: 1}
 
 
 def test_the_window_follows_the_reference_rank_and_peers_join_by_time():
