@@ -15,7 +15,7 @@ decision in the labeled kernel-sequence JSON; never create a separate mapping
 YAML.
 
 Read `alignment/README.md` and `alignment/profiler/README.md` first — they own
-the phase configs, artifact roots, and commands. This skill covers only the
+the pipeline-step configs, artifact roots, and commands. This skill covers only the
 operator judgment those docs leave open.
 
 ## Choose the consuming direction
@@ -48,16 +48,16 @@ each attention-DP rank schedules its own batch. Stop and report an unsupported
 replica, deployment, topology, or input-builder request; never silently reduce
 it to TP1 or collapse DP batches.
 
-## Run the shared phases
+## Run the shared pipeline steps
 
-From `ServingStudioSim/`, run each phase through the launcher (`uv run python -m launcher
+From `ServingStudioSim/`, run each pipeline step through the launcher (`uv run python -m launcher
 alignment {profile,timing-predict,analyze,sim}`; see README for the configs).
-Each phase is an explicit checkpoint with a disjoint artifact root; no phase
+Each step is an explicit checkpoint with a disjoint artifact root; no step
 launches the next. The duty-cycle `gpu_time_multiplier` is no longer hand-derived
 before the simulation — the analyzer's **kernel-align** pass emits
 `recommended_gpu_time_multiplier`
 (`Σ measured_gpu_cycle_ms / Σ measured_ms`),
-and the simulation phase injects it automatically. So `analyze` splits into two
+and the simulation step injects it automatically. So `analyze` splits into two
 semantic passes and runs on both sides of the simulation. Dry-run profile and sim
 before the real launch.
 
@@ -66,7 +66,7 @@ Require launcher metadata to declare the producer/artifact kind explicitly
 incidental file such as `raw/run_meta.json`. A consumer must reject absent or
 unknown producer kinds rather than choosing semantics from directory contents.
 
-When several cases have independent artifact roots, run the same phase for all
+When several cases have independent artifact roots, run the same step for all
 ready cases concurrently. Complete shared prerequisites once (build, profile DB,
 labels or common configuration), then fan out the cases and collect their exit
 statuses separately. Do not serialize independent experiments merely to make
@@ -85,14 +85,14 @@ uv run python -m launcher alignment-campaign render --pack <pack> --host <host> 
 uv run python -m launcher alignment-campaign run    --pack <pack> --out-root <root> --phase <P>
 ```
 
-One `run` invocation is **one phase across every ready case**, scheduled through
+One `run` invocation is **one pipeline step across every ready case**, scheduled through
 the repository's resource manager, with each case's exit status journaled
-separately. Completed case×phase pairs are skipped, so a labeling or analysis
+separately. Completed case×step pairs are skipped, so a labeling or analysis
 failure never costs a repeated capture; `--refresh` re-runs one deliberately.
 Preview the plan and each excluded case's reason with `--dry-run`.
 
-There is no `--all` and you must not build one. The batch axis is one phase over
-many cases; chaining phases would delete the explicit checkpoint between them.
+There is no `--all` and you must not build one. The batch axis is one step over
+many cases; chaining steps would delete the explicit checkpoint between them.
 Advance the pipeline by issuing the next `--phase` yourself after inspecting the
 previous one, exactly as for a single case.
 
@@ -102,30 +102,51 @@ previous one, exactly as for a single case.
 - **alignment Phase 1**: one case per deployment, marked `phase: 1`, that
   replays the tracked `trace/diverse_100.csv` at its recorded arrival times:
   `workload_trace: {path: trace/diverse_100.csv}`, `profile_arrival_mode:
-  trace-timed`, `simulation_arrival_mode: trace_timed`, no `rate`. Declare
-  `attn_gpu_memory_gb: {status: from_capture}`. For a speculative model also
-  declare both `speculative_acceptance: {status: from_capture}` and
-  `speculative_acceptance_by_output_position: {status: from_capture}`; the
-  case-wide chain alone gives every request the same acceptance (see "Preserve
-  speculative acceptance structure"). Run every verb with `--alignment-phase 1`:
+  trace-timed`, `simulation_arrival_mode: trace_timed`, no `rate` (`check`
+  rejects a `rate` on a tracked trace). Declare `attn_gpu_memory_gb: {status:
+  from_capture}`.
 
-  ```bash
-  uv run python -m launcher alignment-campaign render  --pack <pack> --host <host> --out-root <root> --alignment-phase 1
-  uv run python -m launcher alignment-campaign run     --pack <pack> --out-root <root> --alignment-phase 1 --phase <P>
-  uv run python -m launcher alignment-campaign label   --pack <pack> --out-root <root> --alignment-phase 1
-  uv run python -m launcher alignment-campaign extract --pack <pack> --runs <root> --out <root>/metrics.json --alignment-phase 1
-  uv run python -m launcher alignment-campaign compare --pack <pack> --measured <root>/metrics.json --alignment-phase 1 --markdown
-  ```
+  A speculative case needs **both** acceptance fields, `speculative_acceptance:
+  {status: from_capture}` and `speculative_acceptance_by_output_position:
+  {status: from_capture}`. The chain alone gives every request the same
+  acceptance, and Check 3's request-weighted TPOT then reads fast: GLM-5.3
+  DFlash2 cases 07 and 08 read -26% and -24% with the chain alone, -11% and -6%
+  with the buckets (see "Preserve speculative acceptance structure"). `check`
+  reports a speculative case without the buckets as an error.
 
-  Run the profile passes first. The `from_capture` values are read from the
+  Run the profile steps first. The `from_capture` values are read from the
   case's workload pass when `--phase timing_predict` or `--phase simulation`
   runs, and written with their source files to `<root>/<case>/calibration.json`.
-  Until the workload pass has run, those two phases print the case as blocked
+  Until the workload pass has run, those two steps print the case as blocked
   with that reason. Do not copy the values into the pack by hand. SGLang has no
   KV-pool extractor; `check` names this, and the case needs a measured value.
-- **alignment Phase 2**: the whole matrix. Run the same verbs with
-  `--alignment-phase 2` (the same as omitting it). It must run end to end from the pack with no hand edits, so that
-  the commands alone can be handed to someone else in an issue.
+  If the workload pass is re-run, the next `run --phase simulation` re-runs the
+  simulation: a finished simulation counts only with the preset and
+  calibration it ran with (`simulation/campaign_inputs.json`).
+- **alignment Phase 2**: the full matrix, Phase 1 cases included. It must run
+  end to end from the pack with no hand edits, so that the commands alone can be
+  handed to someone else in an issue.
+
+Both run the same commands; only `--alignment-phase` differs (`1` or `2`;
+omitting it is `2`). Run one pipeline step at a time and check its plan and exit
+status before the next. Run `--phase profile_corpus` only when the pack's
+variants declare it; `run --dry-run --phase <step>` lists each case's steps.
+
+```bash
+PACK=<pack> HOST=<host> ROOT=logs/<experiment> AP=2   # AP=1 for alignment Phase 1
+uv run python -m launcher alignment-campaign check   --pack $PACK
+uv run python -m launcher alignment-campaign render  --pack $PACK --host $HOST --out-root $ROOT --alignment-phase $AP
+uv run python -m launcher alignment-campaign run     --pack $PACK --out-root $ROOT --alignment-phase $AP --phase profile_nsys
+uv run python -m launcher alignment-campaign run     --pack $PACK --out-root $ROOT --alignment-phase $AP --phase profile_workload
+uv run python -m launcher alignment-campaign run     --pack $PACK --out-root $ROOT --alignment-phase $AP --phase profile_corpus  # MoE packs that declare it
+uv run python -m launcher alignment-campaign run     --pack $PACK --out-root $ROOT --alignment-phase $AP --phase timing_predict
+uv run python -m launcher alignment-campaign label   --pack $PACK --out-root $ROOT --alignment-phase $AP
+uv run python -m launcher alignment-campaign run     --pack $PACK --out-root $ROOT --alignment-phase $AP --phase analysis_kernel
+uv run python -m launcher alignment-campaign run     --pack $PACK --out-root $ROOT --alignment-phase $AP --phase simulation
+uv run python -m launcher alignment-campaign run     --pack $PACK --out-root $ROOT --alignment-phase $AP --phase analysis_e2e
+uv run python -m launcher alignment-campaign extract --pack $PACK --runs $ROOT --out $ROOT/metrics_phase$AP.json --alignment-phase $AP
+uv run python -m launcher alignment-campaign compare --pack $PACK --measured $ROOT/metrics_phase$AP.json --alignment-phase $AP --markdown > $ROOT/alignment_phase$AP.md
+```
 
 `--alignment-phase` is not `--phase`: `--phase` names the pipeline step to run.
 
@@ -329,7 +350,7 @@ single-config path below when there is one workload and no matrix.
    `alignment-e2e` consume this full run directly and must not name or inspect
    the bounded NSYS capture. The profile records req-frontend's host-monotonic
    replay window so workload analysis can exclude startup/preflight iterations
-   independently. NSYS belongs only to the earlier kernel-align phase; never
+   independently. NSYS belongs only to the earlier kernel-align step; never
    divide full-run tokens by an NSYS span or disable workload analysis merely
    because the kernel capture used a smaller representative trace.
 

@@ -59,6 +59,9 @@ A pack's cases fall into two groups, chosen per case with `phase`:
 full matrix, the same as omitting the flag. It is unrelated to `--phase`, which
 names a pipeline step (`profile_nsys`, `simulation`, ...).
 
+An illustrative Phase 1 case (no pack declares one yet; the index, name and
+variant are placeholders):
+
 ```yaml
 cases:
 - index: 30
@@ -286,7 +289,8 @@ Two case fields carry more weight than their size suggests:
   the output-position buckets from the pass's `metrics_jsonl`
   (`buckets_from_metrics`: `decode_request_progress` rounds binned by
   `output_tokens_before` at 1/32/128/512/1024/2048/4096/8192, a bucket under 50
-  rounds merged into the previous one, depth = the arch's `draft_tokens`),
+  rounds merged into the previous one and a first bucket under 50 rounds merged
+  into the second, depth = the arch's `draft_tokens`),
   and the per-rank KV pool from the vLLM server log (the smallest rank's
   `Extended KV cache to N blocks (X GiB)`, else `Available KV cache memory: X
   GiB`; `X * 2**30 / 1e9` GB). SGLang has no extractor: its log gives
@@ -296,10 +300,16 @@ Two case fields carry more weight than their size suggests:
   with the reason until then. Once it has, `run` writes `calibration.json`
   (each value with its source file, relative to the case directory), the
   simulation preset and `trace_speculative.csv` just before launching. A
-  resolved field counts as measured; `extract` copies `calibration.json` into
-  the case's provenance, `compare` prints it, and `compare --record` writes it
-  into the golden's provenance sidecar and refuses a from_capture case whose
-  run has no `calibration.json`.
+  resolved field counts as measured. When `run` finishes the simulation it
+  records the sha256 of the preset and `calibration.json` it ran with, and a
+  copy of that calibration, in `simulation/campaign_inputs.json`. A later
+  change to either file, or a re-run workload pass that now resolves to other
+  values, makes the simulation not complete, and the next `run --phase
+  simulation` re-runs it with `--refresh`. `extract` copies the recorded
+  calibration (never the live file) into the case's provenance, `compare`
+  prints it, and `compare --record` writes it into the golden's provenance
+  sidecar (merged per case, like the golden values) and refuses a from_capture
+  case whose simulation recorded none.
 - **`analyze_iterations`** overrides the profiler's whole-capture default with a
   stable numbered excerpt. Use it when the accepted evidence population is a
   particular iteration interval that must remain fixed even if capture duration

@@ -1,6 +1,6 @@
 """Read a case's `from_capture` inputs out of its own workload pass.
 
-Two calibrated case inputs are measurements the workload pass already makes:
+Three calibrated case inputs are measurements the workload pass already makes:
 
 - `speculative_acceptance`, the per-position conditional acceptance chain, from
   `spec_decode_metrics.json`: position 0 is `accepted_tokens_per_position["0"] /
@@ -19,8 +19,9 @@ Two calibrated case inputs are measurements the workload pass already makes:
 
 A case that says `{status: from_capture}` gets these at render or run time
 instead of a hand copy. The resolved values, with the files they came from,
-are written to `<case_dir>/calibration.json`, which `extract` carries into the
-compare report and `compare --record` into the golden's provenance.
+are written to `<case_dir>/calibration.json`. The simulation that runs with
+them keeps a copy (`execute.SIMULATION_INPUTS_NAME`), which `extract` carries
+into the compare report and `compare --record` into the golden's provenance.
 
 Rounding follows the scripts these replace: the chain to 6 decimals
 (`collect_measured.py` of the DSv4.1 DSpark pack), the KV pool to 6 decimals of

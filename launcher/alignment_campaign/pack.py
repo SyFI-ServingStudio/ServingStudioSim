@@ -29,7 +29,8 @@ The split that matters inside a case is **authored** versus **calibrated**.
 workload-only startup log and `rate` off a saturation sweep. A calibrated field
 is a mapping (`value` + `status` + `derived_from`) rather than a bare scalar, so
 re-rendering on a different machine cannot silently reuse a stale KV budget.
-`attn_gpu_memory_gb` and `speculative_acceptance` may instead say
+`attn_gpu_memory_gb`, `speculative_acceptance` and
+`speculative_acceptance_by_output_position` may instead say
 `{status: from_capture}`: the value is read from the case's own workload pass
 when its simulation is rendered (`calibration.py`), never typed into the pack.
 
@@ -263,7 +264,8 @@ class Case:
     #: short and long requests stop sharing one token-weighted chain.
     speculative_acceptance_by_output_position: Calibrated | None = None
     #: 1 for an alignment Phase 1 case (the per-deployment diverse_100 merge
-    #: check), 2 for the rest of the matrix. Phase 2 runs every case.
+    #: check), 2 otherwise. Alignment Phase 2 is the full matrix, Phase 1 cases
+    #: included.
     phase: int = 2
 
     @property

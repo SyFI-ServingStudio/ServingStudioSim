@@ -2,7 +2,7 @@
 name: top-align-with-framework
 description: >-
   Align ServingStudio Sim to a real framework across kernel timing, GPU duty cycle, and TTFT/TPOT.
-  Routes execution and fixes; does not run phases or edit code.
+  Routes execution and fixes; does not run pipeline steps or edit code.
 ---
 
 # Top Align With Framework
@@ -11,7 +11,7 @@ Top-level skill for **judging** whether ServingStudio Sim is well aligned to a r
 framework (vLLM or SGLang), from one measured alignment run. `operate-run-alignment`
 *produces* the comparison; this skill *interprets* it — what to compare, what a
 healthy gap looks like, and how to diagnose a bad one. You route and judge here;
-you do not run phases or edit cost code from this skill.
+you do not run pipeline steps or edit cost code from this skill.
 
 ## The through-line: evaluate tightest → loosest
 

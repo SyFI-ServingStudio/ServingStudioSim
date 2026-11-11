@@ -21,14 +21,14 @@ The PR merges on **alignment Phase 1** only. Both alignment phases are defined i
 - **alignment Phase 1 (required).** For every deployment the PR adds, the model's pack under
   `presets/alignment/<pack>/` has one `phase: 1` case replaying `trace/diverse_100.csv`. Run it through
   Check 1 (kernel), Check 2 (duty cycle) and Check 3 (E2E), per `top-align-with-framework`, with the
-  `--alignment-phase 1` commands in `operate-run-alignment`. Produce the table with
-  `alignment-campaign compare --pack <pack> --measured <metrics.json> --alignment-phase 1 --markdown`.
-- **alignment Phase 2 (not required to merge).** The rest of the pack's matrix. The pack must already
-  declare it, and `alignment-campaign check --pack <pack>` must pass. Run it now only if the user asks.
-  Otherwise, once the PR is open, ask the user before filing an issue for it. The issue names the pack, the
-  checkpoint snapshot and the host profile keys, and gives the commands to run: the `operate-run-alignment`
-  verbs with `--alignment-phase 2`, then `compare --pack <pack> --markdown`. The pack must run end to end from
-  those commands with no hand edits.
+  command block in `operate-run-alignment` ("Alignment Phase 1 and alignment Phase 2") at `AP=1`. It
+  writes the table to `<root>/alignment_phase1.md`.
+- **alignment Phase 2 (not required to merge).** The full matrix, Phase 1 cases included. The pack must
+  already declare it, and `alignment-campaign check --pack <pack>` must pass. Run it now only if the user
+  asks; its table goes to `<root>/alignment_phase2.md`. Otherwise, once the PR is open, ask the user before
+  filing an issue for it. The issue names the pack, the checkpoint snapshot and the host profile keys, and
+  pastes that `operate-run-alignment` command block with `AP=2`; do not restate the commands. The pack must
+  run end to end from that block with no hand edits.
 
 "Reasonable" means one of two things. The case is within the tolerances in the pack's `acceptance.yaml`,
 or its miss has a stated, checked cause. Either way, mapping coverage must meet the `map_coverage_pct` floor
@@ -121,9 +121,11 @@ Write `doc/pr/<feature>/PR.md` and `doc/pr/<feature>/README.md`. Follow `doc/pr/
     coverage, E2E, output tps, TPOT, and TTFT. Otherwise, say that alignment Phase 2 is not yet run and
     link the issue once it exists.
 
-  Paste each table from the generated `alignment-campaign compare --markdown` output, and commit that
-  output as `doc/pr/<feature>/alignment_matrix.md` beside the metrics JSON. Name each table's source
-  file and never retype a number.
+  Paste each table from the generated `alignment-campaign compare --markdown` output. Commit the
+  alignment Phase 1 output as `doc/pr/<feature>/alignment_phase1.md` and, if run, the alignment Phase 2
+  output as `doc/pr/<feature>/alignment_phase2.md`, each beside its metrics JSON
+  (`metrics_phase1.json`, `metrics_phase2.json`). Name each table's source file and never retype a
+  number.
 - List every out-of-tolerance item with its cause, and every change that alters other models' predictions.
 
 Stop: show the user the draft. Before showing it, check that every case that was run appears as a row in
