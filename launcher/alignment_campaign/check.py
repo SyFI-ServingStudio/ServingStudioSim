@@ -527,7 +527,33 @@ def _check_calibration(pack: Pack) -> list[Finding]:
                         "it cannot be found later")
             )
     findings += _check_capture_sources(pack)
+    findings += _check_acceptance_structure(pack)
     return findings
+
+
+#: Why a speculative case needs acceptance by output position, for the error.
+ACCEPTANCE_STRUCTURE_REASON = (
+    "a single case-wide chain is token-weighted and gives every request the same "
+    "acceptance, so short requests decode too fast: GLM-5.3 DFlash2 cases 07/08 read "
+    "request-weighted TPOT -26%/-24% with it and -11%/-6% with the buckets "
+    "(skills/operate-run-alignment, 'Preserve speculative acceptance structure')"
+)
+
+
+def _check_acceptance_structure(pack: Pack) -> list[Finding]:
+    """A speculative case declares acceptance by output position too."""
+    return [
+        Finding(
+            "error",
+            f"cases[{case.slug}].speculative_acceptance_by_output_position",
+            "missing beside speculative_acceptance; " + ACCEPTANCE_STRUCTURE_REASON
+            + ". Declare the buckets from the case's workload pass "
+            "(`{status: from_capture}`, or measured via calibration.buckets_from_metrics)",
+        )
+        for case in pack.cases
+        if case.speculative_acceptance is not None
+        and case.speculative_acceptance_by_output_position is None
+    ]
 
 
 def _check_capture_sources(pack: Pack) -> list[Finding]:

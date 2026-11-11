@@ -662,3 +662,15 @@ def test_materialize_validates_draft_depth_before_writing(tmp_path):
     assert not (case_dir / "trace_speculative.csv").exists()
     assert not (case_dir / "calibration.json").exists()
     assert not (case_dir / "simulation.yaml").exists()
+
+
+def test_check_requires_acceptance_by_position_for_a_speculative_case(tmp_path):
+    pack = _phase1_pack(tmp_path, by_position=False)
+    findings = check_module.check_pack(pack, metric_names=metric_names(None))
+    (error,) = [item for item in findings if item.level == "error"]
+    assert error.where == "cases[90_diverse_100].speculative_acceptance_by_output_position"
+    assert "single case-wide chain" in error.message
+    assert "operate-run-alignment" in error.message
+    with_buckets = _phase1_pack(tmp_path / "b")
+    findings = check_module.check_pack(with_buckets, metric_names=metric_names(None))
+    assert not [item for item in findings if item.level == "error"]
