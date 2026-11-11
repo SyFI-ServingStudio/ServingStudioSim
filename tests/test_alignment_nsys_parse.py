@@ -813,6 +813,40 @@ def test_multi_engine_step_without_kernel_evidence_stays_unpaired():
     assert unpaired == {1: 1}
 
 
+def test_multi_engine_steps_pair_by_forward_ordinal_when_metrics_carry_it():
+    """Schema 5: the k-th forward of every DP rank is one global step.
+
+    Kernel time would pair device 1's iteration 3 with device 0's iteration 6
+    here; the ordinals say it ran in forward 0, beside device 0's iteration 5.
+    Device 1's iteration 4 ran in forward 1, which device 0 ran as a dummy
+    forward (no NVTX range), so it stays unpaired.
+    """
+    from alignment.nsys.parse import align_ranges_into_steps, forward_ordinals
+
+    ranges = [_window(0, 5, 0, 10), _window(0, 6, 20, 30), _window(1, 3, 21, 31)]
+    ranges.append(_window(1, 4, 40, 50))
+    rank_metrics = {
+        (0, 5): {"forward_ordinal": 0},
+        (0, 6): {"forward_ordinal": 2},
+        (1, 3): {"forward_ordinal": 0},
+        (1, 4): {"forward_ordinal": 1},
+    }
+
+    steps, unpaired = align_ranges_into_steps(ranges, {0: 0, 1: 1}, forward_ordinals(rank_metrics))
+
+    assert [step.index_by_device for step in steps] == [{0: 5, 1: 3}, {0: 6}]
+    assert unpaired == {1: 1}
+
+
+def test_forward_ordinal_pairing_needs_an_ordinal_for_every_window():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    ranges = [_window(0, 5, 0, 10), _window(1, 3, 1, 11)]
+
+    with pytest.raises(ValueError, match="dp_rank 1 ran iteration 3 .* no forward_ordinal"):
+        align_ranges_into_steps(ranges, {0: 0, 1: 1}, {(0, 5): 0})
+
+
 def test_multi_engine_ambiguous_kernel_overlap_stays_unpaired():
     from alignment.nsys.parse import align_ranges_into_steps
 

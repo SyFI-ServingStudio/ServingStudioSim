@@ -274,7 +274,7 @@ def aggregate_metrics_by_iteration(rank_metrics: dict[tuple[int, int], dict]) ->
     alike — a single-EngineCore run, or a capture whose ranks never diverged.
     Under data parallelism they do diverge (a rank that runs a prefill chunk
     alone advances its counter while its peers run uncounted dummy steps), and
-    the wall-clock grouping in `align_ranges_into_steps` is what pairs the ranks
+    the step alignment in `align_ranges_into_steps` is what pairs the ranks
     there. This stays for the replica-level, timeline-free views.
     """
     grouped: dict[int, list[dict]] = defaultdict(list)
@@ -892,18 +892,84 @@ def _pair_by_iteration_index(
     return matched, unpaired
 
 
+def _pair_by_forward_ordinal(
+    reference: list[DeviceStepWindow],
+    peer: list[DeviceStepWindow],
+    reference_ordinal: dict[int, int],
+    peer_ordinal: dict[int, int],
+) -> tuple[dict[int, DeviceStepWindow], list[DeviceStepWindow]]:
+    """Pair DP ranks by the global forward each window ran (schema-5 metrics).
+
+    The k-th forward of every DP rank is one global step. A peer window whose
+    forward the reference rank ran as a dummy forward (no NVTX range) has no
+    reference window and stays unpaired.
+    """
+    reference_by_ordinal = {reference_ordinal[window.iteration]: window for window in reference}
+    matched: dict[int, DeviceStepWindow] = {}
+    unpaired: list[DeviceStepWindow] = []
+    for peer_window in peer:
+        reference_window = reference_by_ordinal.get(peer_ordinal[peer_window.iteration])
+        if reference_window is None:
+            unpaired.append(peer_window)
+            continue
+        matched[reference_window.iteration] = peer_window
+    return matched, unpaired
+
+
+def forward_ordinals(rank_metrics: dict[tuple[int, int], dict]) -> dict[tuple[int, int], int]:
+    """(dp_rank, iteration_index) -> forward_ordinal, from schema-5 metrics rows."""
+    return {
+        key: int(row["forward_ordinal"])
+        for key, row in rank_metrics.items()
+        if row.get("forward_ordinal") is not None
+    }
+
+
+def _window_ordinals(
+    by_device: dict[int | None, list[DeviceStepWindow]],
+    dp_rank_by_device: dict[int, int],
+    ordinals: dict[tuple[int, int], int],
+) -> dict[int | None, dict[int, int]] | None:
+    """Each device window's forward ordinal, or None for a capture without them.
+
+    A capture whose metrics carry ordinals must have one for every window: a
+    window without one is a step the metrics do not describe.
+    """
+    if not ordinals:
+        return None
+    out: dict[int | None, dict[int, int]] = {}
+    for device_id, windows in by_device.items():
+        dp_rank = dp_rank_by_device.get(device_id) if device_id is not None else None
+        if dp_rank is None:
+            raise ValueError(f"device {device_id} has no dp_rank to look up forward ordinals by")
+        out[device_id] = {}
+        for window in windows:
+            ordinal = ordinals.get((dp_rank, window.iteration))
+            if ordinal is None:
+                raise ValueError(
+                    f"dp_rank {dp_rank} ran iteration {window.iteration} on device {device_id} "
+                    "but its metrics record carries no forward_ordinal"
+                )
+            out[device_id][window.iteration] = ordinal
+    return out
+
+
 def _uses_shared_iteration_index(dp_rank_by_device: dict[int, int] | None) -> bool:
     return bool(dp_rank_by_device) and len(set(dp_rank_by_device.values())) == 1
 
 
 def align_ranges_into_steps(
-    ranges: list[RangeStats], dp_rank_by_device: dict[int, int] | None = None
+    ranges: list[RangeStats],
+    dp_rank_by_device: dict[int, int] | None = None,
+    ordinals: dict[tuple[int, int], int] | None = None,
 ) -> tuple[list[AlignedStep], dict[int, int]]:
     """Group device ranges into logical serving steps.
 
     TP ranks behind one scheduler share an authoritative indexed marker.
-    Independent DP schedulers can diverge, so their steps join only on
-    unambiguous attributed-kernel overlap. Unmatched evidence remains explicit.
+    Independent DP schedulers number their own steps. When the metrics carry
+    forward ordinals (schema 5, `forward_ordinals`) their steps join by the
+    global forward they ran; otherwise only on unambiguous attributed-kernel
+    overlap. Unmatched evidence remains explicit.
     """
     shared_iteration_index = _uses_shared_iteration_index(dp_rank_by_device)
     by_device = _device_step_windows(ranges, use_kernel_time=not shared_iteration_index)
@@ -911,6 +977,11 @@ def align_ranges_into_steps(
         return [], {}
     reference_device_id = sorted(by_device, key=lambda device: (device is None, device))[0]
     reference = by_device[reference_device_id]
+    window_ordinals = (
+        None
+        if shared_iteration_index or len(by_device) < 2
+        else _window_ordinals(by_device, dp_rank_by_device or {}, ordinals or {})
+    )
 
     joined: dict[int, list[DeviceStepWindow]] = {window.iteration: [window] for window in reference}
     unpaired_by_device: dict[int, int] = {}
@@ -919,6 +990,13 @@ def align_ranges_into_steps(
             continue
         if shared_iteration_index:
             matched, unpaired = _pair_by_iteration_index(reference, windows)
+        elif window_ordinals is not None:
+            matched, unpaired = _pair_by_forward_ordinal(
+                reference,
+                windows,
+                window_ordinals[reference_device_id],
+                window_ordinals[device_id],
+            )
         else:
             matched, unpaired = _pair_by_overlap(reference, windows)
         for iteration, window in matched.items():
@@ -1023,7 +1101,8 @@ def build_iteration_details(
     lossless ground-truth artifact. Kernel names are never truncated here.
 
     TP ranks join by exact indexed phase identity. Independent DP ranks join
-    only on unambiguous attributed-kernel overlap. Each range retains its own
+    by forward ordinal when the metrics carry it (schema 5), otherwise only on
+    unambiguous attributed-kernel overlap. Each range retains its own
     `iteration_index`; missing or untrusted matches remain explicit.
 
     `metrics` is the index-keyed replica aggregate, used only as the fallback for
@@ -1032,7 +1111,7 @@ def build_iteration_details(
     """
     rank_metrics = rank_metrics or {}
     dp_rank_by_device = dp_rank_by_device or {}
-    steps, _ = align_ranges_into_steps(ranges, dp_rank_by_device)
+    steps, _ = align_ranges_into_steps(ranges, dp_rank_by_device, forward_ordinals(rank_metrics))
     all_devices = sorted(
         {item.worker.device_id for item in ranges if item.worker.device_id is not None}
     )
@@ -1526,7 +1605,8 @@ def parse_trace(
     iteration_details = build_iteration_details(
         ranges, metrics, kernel_name_ids, rank_metrics, dp_rank_by_device
     )
-    aligned_steps, unpaired_by_device = align_ranges_into_steps(ranges, dp_rank_by_device)
+    ordinals = forward_ordinals(rank_metrics)
+    aligned_steps, unpaired_by_device = align_ranges_into_steps(ranges, dp_rank_by_device, ordinals)
     iterations = [step.iteration for step in aligned_steps]
     kernel_sequences, device_ids = build_device_kernel_sequences(iteration_details, kernel_names)
     return {
@@ -1540,6 +1620,8 @@ def parse_trace(
             "rule": (
                 "iteration_index"
                 if _uses_shared_iteration_index(dp_rank_by_device)
+                else "forward_ordinal"
+                if ordinals and len({r.worker.device_id for r in ranges}) > 1
                 else "kernel_time_overlap"
             ),
             "reference_device_id": (
