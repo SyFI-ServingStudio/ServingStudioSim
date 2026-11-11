@@ -385,12 +385,17 @@ async def run_one(
         binary_config = _binary_config(config_path, resolved, log_dir)
         binary = binary_path(build_type)
         (log_dir / "raw").mkdir(parents=True, exist_ok=True)
+        # The binary writes this file only when it fails, and `_report_failure`
+        # prints whatever is there: a file left by an earlier run in the same
+        # log_dir would be reported as this run's cause.
+        error_json = log_dir / "raw" / ERROR_JSON
+        error_json.unlink(missing_ok=True)
         argv = [
             str(binary),
             "timing-predict",
             str(binary_config),
             "--error-json",
-            str(log_dir / "raw" / ERROR_JSON),
+            str(error_json),
         ]
         journal = RunJournal(log_dir)
         # The predictor writes profile.db only when its collect pass measures

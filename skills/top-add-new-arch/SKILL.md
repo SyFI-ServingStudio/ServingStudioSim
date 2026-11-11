@@ -59,9 +59,12 @@ Check every design choice, and every subagent brief, against these rules.
    and no refusal of a step the framework would run. When the framework switches
    path above a threshold (for example an unfused all-reduce past a fused
    kernel's token cap), price that path instead.
-3. **Align across deployment settings, not one template value.** The alignment
-   cases must span chunk size, concurrency, and context length;
-   `operate-run-alignment` lists what a pack must cover.
+3. **Align across deployment settings, not one template value.** The pack's
+   alignment Phase 2 cases must span chunk size, concurrency, and context
+   length; `operate-run-alignment` lists what a pack must cover. The merge
+   needs only alignment Phase 1 (`top-align-with-framework`). Alignment Phase 1
+   and 2 select a pack's cases; they are unrelated to this skill's own Phase
+   0–5.
 4. **Key kernel rows on model geometry and dtypes only.** A deployment setting
    (`max_num_seqs`, a CUDA-graph capture bound, `max_model_len`) enters a row key
    only with measured evidence that it changes kernel time. Otherwise every new
@@ -88,13 +91,13 @@ reliably: **which math is really one fused launch**, and **which launches are bi
 enough to matter**. Without them, every kernel gets the same effort and the
 fusion guesses stay untested until Phase 5.
 
-It can run this early because the profile phase stands alone — it needs only the
+It can run this early because the profile step stands alone — it needs only the
 real engine running the checkpoint, not any ServingStudio Sim code. (Only the
-later `timing-predict` phase reads a `simulation.yaml` preset, and that preset
+later `timing_predict` step reads a `simulation.yaml` preset, and that preset
 needs the arch you have not written yet.)
 
-- **How.** Route to `operate-run-alignment` and run **only its profile phase**,
-  `profile_kind: nsys`. Stop there: the label and analyze phases compare against
+- **How.** Route to `operate-run-alignment` and run **only its profile step**,
+  `profile_kind: nsys`. Stop there: the label and analyze steps compare against
   a CostTree you do not have yet. They run in Phase 5, on this same capture.
 - **MoE models get a second pass**, `profile_kind: token_corpus`. Routing skew
   redistributes tokens into fuller and emptier expert groups, which changes the
@@ -276,7 +279,7 @@ deployment — you do not need a workload / pools / trace to check the cost mode
   plausibly-scaled timing (no missing kernel, no absurd µs). This is the tightest
   loop for catching a mis-wired L2/L3/L4 composition.
 - **Then close the loop on the Phase 0 capture** — the arch now exists, so the
-  alignment phases that were blocked in Phase 0 can run. Resume that experiment in
+  pipeline steps that were blocked in Phase 0 can run. Resume that experiment in
   `operate-run-alignment`: `timing-predict` → label → `analyze` (kernel-align),
   then hand the artifacts to `top-align-with-framework` for Check 1, the
   per-kernel comparison against measured. **Never re-run the GPU profile** — the
@@ -288,11 +291,12 @@ deployment — you do not need a workload / pools / trace to check the cost mode
   Phase 1 verdicts — a large simulated slot with no measured kernel usually means
   a **fold** verdict was wrong, and a large unmapped measured kernel usually means
   the split **missed an op**.
-- **Then a real run** — once the per-building-block numbers look right, graduate to
-  `operate-run-simulation`: build + `--dry-run` to confirm the expanded plan, then
-  launch a small workload and sanity-check end-to-end throughput. This is also what
-  the alignment run's duty-cycle and TTFT/TPOT checks need, so if you want Checks
-  2–3 they follow here, not above.
+- **Then alignment Phase 1 for each deployment** — once the per-building-block
+  numbers look right, run each deployment's alignment Phase 1 case (the tracked
+  diverse_100 replay) through Check 1 (kernel), Check 2 (duty cycle) and Check 3
+  (TTFT/TPOT/E2E) with `operate-run-alignment --alignment-phase 1`, judged by
+  `top-align-with-framework`. Phase 5 ends there; landing the model is
+  `dev-finalize-model-addition`.
 
 ## Delegation boundary
 
@@ -304,7 +308,7 @@ to the user between phases whenever a design decision surfaces — a new args sc
 or a deviation from the design docs — rather than deciding it silently. The build
 is complete only when every element from the Phase 1 table has a home at its
 correct layer, the arch is wired (Phase 3), `model.work` support and the intended
-deployment maps are complete (Phase 4), and the Phase 5 checks pass — including,
-unless the user explicitly declined Phase 0, a Check 1 comparison with no
-missing large kernel and every material deviation attributed. To publish and
+deployment maps are complete (Phase 4), and the Phase 5 checks pass — each
+deployment's alignment Phase 1 through Checks 1–3, with no missing large kernel
+in Check 1 and every material deviation attributed. To publish and
 merge the finished model, continue with `dev-finalize-model-addition`.

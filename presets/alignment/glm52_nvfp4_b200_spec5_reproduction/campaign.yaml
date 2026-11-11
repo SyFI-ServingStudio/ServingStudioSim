@@ -2,6 +2,10 @@
   "schema_version": 1,
   "pack": "glm52_nvfp4_b200_spec5_reproduction",
   "description": "Reproduce preserved Spec5 evidence: 17 TP4 workload cases and diverse_100 TP4/TP8 NSYS. Borrowed captures retain original request identities and arrivals; generated traces are recipes, not replacement replay evidence.",
+  "acceptance_structure": {
+    "status": "legacy_single_chain",
+    "reason": "its workload captures (logs/20260831_0_glm52_nvfp4_b200_spec5_matrix, logs/20260830_1_glm52_diverse100_spec5) predate decode_request_progress.output_tokens_before, and cases 18-19 cite no capture"
+  },
   "recorded_on": {
     "host": "b200_raid",
     "gpu": "NVIDIA B200",

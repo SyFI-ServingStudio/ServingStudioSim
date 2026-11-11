@@ -26,8 +26,7 @@ variants:
       - name: flashinfer-python
         version: 0.7.0
         index_url: https://pypi.org/simple
-        required_files:
-        - flashinfer/__init__.py
+        required_files: [flashinfer/__init__.py]
       environment:
         HF_HUB_OFFLINE: '0'
         TRANSFORMERS_OFFLINE: '1'
@@ -45,36 +44,12 @@ variants:
       enable_server_load_tracking: true
       api_server_count: 4
       served_model_name: mimo-v26-flash-rl
-      extra_args:
-      - --trust-remote-code
-      - --revision
-      - 5711b268169967567844e1e560e8a3966da959b1
-      - --tokenizer-revision
-      - 5711b268169967567844e1e560e8a3966da959b1
-      - --dtype
-      - bfloat16
-      - --kv-cache-dtype
-      - bfloat16
-      - --block-size
-      - '16'
-      - --language-model-only
-      - --enable-expert-parallel
-      - --expert-placement-strategy
-      - linear
-      - --no-enable-eplb
-      - --all2all-backend
-      - allgather_reducescatter
-      - --moe-backend
-      - flashinfer_trtllm
-      - --attention-backend
-      - FLASH_ATTN_DIFFKV
-      - --no-disable-hybrid-kv-cache-manager
-      - --generation-config
-      - vllm
-      - --max-num-seqs
-      - '100'
-      - --quantization-config
-      - '{"moe":{"activation":"mxfp8"}}'
+      extra_args: [--trust-remote-code, --revision, 5711b268169967567844e1e560e8a3966da959b1, --tokenizer-revision,
+        5711b268169967567844e1e560e8a3966da959b1, --dtype, bfloat16, --kv-cache-dtype, bfloat16, --block-size, '16',
+        --language-model-only, --enable-expert-parallel, --expert-placement-strategy, linear, --no-enable-eplb,
+        --all2all-backend, allgather_reducescatter, --moe-backend, flashinfer_trtllm, --attention-backend, FLASH_ATTN_DIFFKV,
+        --no-disable-hybrid-kv-cache-manager, --generation-config, vllm, --max-num-seqs, '100', --quantization-config,
+        '{"moe":{"activation":"mxfp8"}}']
     arch:
       type: mimo_v2_vllm_fp8_swa_moe
       model_config: model/config/mimo_v2_6_flash_rl.json
@@ -82,154 +57,14 @@ variants:
       tp_size: 4
       routing: corpus
       token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@18506fd7afbaf925da2d31821287d079fffba5a6/mimo_v26_flash_rl/vllm/diverse_100/capture/20261007/manifest.json
-      cudagraph_capture_sizes: &id002
-      - 1
-      - 2
-      - 4
-      - 8
-      - 16
-      - 24
-      - 32
-      - 40
-      - 48
-      - 56
-      - 64
-      - 72
-      - 80
-      - 88
-      - 96
-      - 104
-      - 112
-      - 120
-      - 128
-      - 136
-      - 144
-      - 152
-      - 160
-      - 168
-      - 176
-      - 184
-      - 192
-      - 200
-      - 208
-      - 216
-      - 224
-      - 232
-      - 240
-      - 248
-      - 256
-      - 272
-      - 288
-      - 304
-      - 320
-      - 336
-      - 352
-      - 368
-      - 384
-      - 400
-      - 416
-      - 432
-      - 448
-      - 464
-      - 480
-      - 496
-      - 512
-      - 528
-      - 544
-      - 560
-      - 576
-      - 592
-      - 608
-      - 624
-      - 640
-      - 656
-      - 672
-      - 688
-      - 704
-      - 720
-      - 736
-      - 752
-      - 768
-      - 784
-      - 800
-      - 816
-      - 832
-      - 848
-      - 864
-      - 880
-      - 896
-      - 912
-      - 928
-      - 944
-      - 960
-      - 976
-      - 992
-      - 1008
-      - 1024
-      - 1040
-      - 1056
-      - 1072
-      - 1088
-      - 1104
-      - 1120
-      - 1136
-      - 1152
-      - 1168
-      - 1184
-      - 1200
-      - 1216
-      - 1232
-      - 1248
-      - 1264
-      - 1280
-      - 1296
-      - 1312
-      - 1328
-      - 1344
-      - 1360
-      - 1376
-      - 1392
-      - 1408
-      - 1424
-      - 1440
-      - 1456
-      - 1472
-      - 1488
-      - 1504
-      - 1520
-      - 1536
-      - 1552
-      - 1568
-      - 1584
-      - 1600
-      - 1616
-      - 1632
-      - 1648
-      - 1664
-      - 1680
-      - 1696
-      - 1712
-      - 1728
-      - 1744
-      - 1760
-      - 1776
-      - 1792
-      - 1808
-      - 1824
-      - 1840
-      - 1856
-      - 1872
-      - 1888
-      - 1904
-      - 1920
-      - 1936
-      - 1952
-      - 1968
-      - 1984
-      - 2000
-      - 2016
-      - 2032
-      - 2048
+      cudagraph_capture_sizes: &id002 [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128,
+        136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336,
+        352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640, 656, 672,
+        688, 704, 720, 736, 752, 768, 784, 800, 816, 832, 848, 864, 880, 896, 912, 928, 944, 960, 976, 992, 1008,
+        1024, 1040, 1056, 1072, 1088, 1104, 1120, 1136, 1152, 1168, 1184, 1200, 1216, 1232, 1248, 1264, 1280, 1296,
+        1312, 1328, 1344, 1360, 1376, 1392, 1408, 1424, 1440, 1456, 1472, 1488, 1504, 1520, 1536, 1552, 1568, 1584,
+        1600, 1616, 1632, 1648, 1664, 1680, 1696, 1712, 1728, 1744, 1760, 1776, 1792, 1808, 1824, 1840, 1856, 1872,
+        1888, 1904, 1920, 1936, 1952, 1968, 1984, 2000, 2016, 2032, 2048]
     worker:
       type: chunked_prefill
       max_batch_tokens: 2048
@@ -267,38 +102,12 @@ variants:
       enable_server_load_tracking: true
       api_server_count: 4
       served_model_name: mimo-v26-flash-rl
-      extra_args:
-      - --trust-remote-code
-      - --revision
-      - 5711b268169967567844e1e560e8a3966da959b1
-      - --tokenizer-revision
-      - 5711b268169967567844e1e560e8a3966da959b1
-      - --dtype
-      - bfloat16
-      - --kv-cache-dtype
-      - bfloat16
-      - --block-size
-      - '16'
-      - --language-model-only
-      - --enable-expert-parallel
-      - --expert-placement-strategy
-      - linear
-      - --no-enable-eplb
-      - --all2all-backend
-      - allgather_reducescatter
-      - --moe-backend
-      - flashinfer_trtllm
-      - --attention-backend
-      - FLASH_ATTN_DIFFKV
-      - --no-disable-hybrid-kv-cache-manager
-      - --generation-config
-      - vllm
-      - --max-num-seqs
-      - '100'
-      - --quantization-config
-      - '{"moe":{"activation":"mxfp8"}}'
-      - --kv-cache-memory-bytes
-      - '19621785600'
+      extra_args: [--trust-remote-code, --revision, 5711b268169967567844e1e560e8a3966da959b1, --tokenizer-revision,
+        5711b268169967567844e1e560e8a3966da959b1, --dtype, bfloat16, --kv-cache-dtype, bfloat16, --block-size, '16',
+        --language-model-only, --enable-expert-parallel, --expert-placement-strategy, linear, --no-enable-eplb,
+        --all2all-backend, allgather_reducescatter, --moe-backend, flashinfer_trtllm, --attention-backend, FLASH_ATTN_DIFFKV,
+        --no-disable-hybrid-kv-cache-manager, --generation-config, vllm, --max-num-seqs, '100', --quantization-config,
+        '{"moe":{"activation":"mxfp8"}}', --kv-cache-memory-bytes, '19621785600']
     arch:
       type: mimo_v2_vllm_fp8_swa_moe
       model_config: model/config/mimo_v2_6_flash_rl.json
@@ -344,38 +153,12 @@ variants:
       enable_server_load_tracking: true
       api_server_count: 4
       served_model_name: mimo-v26-flash-rl
-      extra_args:
-      - --trust-remote-code
-      - --revision
-      - 5711b268169967567844e1e560e8a3966da959b1
-      - --tokenizer-revision
-      - 5711b268169967567844e1e560e8a3966da959b1
-      - --dtype
-      - bfloat16
-      - --kv-cache-dtype
-      - bfloat16
-      - --block-size
-      - '16'
-      - --language-model-only
-      - --enable-expert-parallel
-      - --expert-placement-strategy
-      - linear
-      - --no-enable-eplb
-      - --all2all-backend
-      - allgather_reducescatter
-      - --moe-backend
-      - flashinfer_trtllm
-      - --attention-backend
-      - FLASH_ATTN_DIFFKV
-      - --no-disable-hybrid-kv-cache-manager
-      - --generation-config
-      - vllm
-      - --max-num-seqs
-      - '100'
-      - --quantization-config
-      - '{"moe":{"activation":"mxfp8"}}'
-      - --kv-cache-memory-bytes
-      - '27457597440'
+      extra_args: [--trust-remote-code, --revision, 5711b268169967567844e1e560e8a3966da959b1, --tokenizer-revision,
+        5711b268169967567844e1e560e8a3966da959b1, --dtype, bfloat16, --kv-cache-dtype, bfloat16, --block-size, '16',
+        --language-model-only, --enable-expert-parallel, --expert-placement-strategy, linear, --no-enable-eplb,
+        --all2all-backend, allgather_reducescatter, --moe-backend, flashinfer_trtllm, --attention-backend, FLASH_ATTN_DIFFKV,
+        --no-disable-hybrid-kv-cache-manager, --generation-config, vllm, --max-num-seqs, '100', --quantization-config,
+        '{"moe":{"activation":"mxfp8"}}', --kv-cache-memory-bytes, '27457597440']
     arch:
       type: mimo_v2_vllm_fp8_swa_moe
       model_config: model/config/mimo_v2_6_flash_rl.json
@@ -407,9 +190,7 @@ cases:
   name: micro_throughput_c100
   variant: tp4_ep4
   purpose: Maximum request batching and scheduler pressure.
-  coverage:
-  - batching
-  - scheduler_pressure
+  coverage: [batching, scheduler_pressure]
   max_model_len: 131072
   max_concurrency: 100
   profile_arrival_mode: saturated
@@ -419,15 +200,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/01_micro_throughput_c100.csv
-    shapes:
-    - - 16
-      - 16
-    - - 32
-      - 32
-    - - 64
-      - 64
-    - - 128
-      - 64
+    shapes: [[16, 16], [32, 32], [64, 64], [128, 64]]
     repeats: 100
   attn_gpu_memory_gb:
     value: 116.4366
@@ -445,9 +218,7 @@ cases:
   name: graph_boundaries_c100
   variant: tp4_ep4
   purpose: CUDA graph and small-batch kernel boundaries.
-  coverage:
-  - cuda_graph_boundaries
-  - small_batch
+  coverage: [cuda_graph_boundaries, small_batch]
   max_model_len: 131072
   max_concurrency: 100
   profile_arrival_mode: saturated
@@ -457,31 +228,8 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/02_graph_boundaries_c100.csv
-    shapes:
-    - - 1
-      - 32
-    - - 15
-      - 32
-    - - 16
-      - 32
-    - - 31
-      - 32
-    - - 32
-      - 32
-    - - 63
-      - 64
-    - - 64
-      - 64
-    - - 99
-      - 64
-    - - 100
-      - 64
-    - - 199
-      - 64
-    - - 200
-      - 64
-    - - 201
-      - 64
+    shapes: [[1, 32], [15, 32], [16, 32], [31, 32], [32, 32], [63, 64], [64, 64], [99, 64], [100, 64], [199, 64],
+      [200, 64], [201, 64]]
     repeats: 34
   attn_gpu_memory_gb:
     value: 116.4366
@@ -501,8 +249,7 @@ cases:
   name: balanced_anchor_c32
   variant: tp4_ep4
   purpose: Comparable extension of the existing c32 anchor.
-  coverage:
-  - balanced_anchor
+  coverage: [balanced_anchor]
   max_model_len: 131072
   max_concurrency: 32
   profile_arrival_mode: saturated
@@ -512,23 +259,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/03_balanced_anchor_c32.csv
-    shapes:
-    - - 256
-      - 128
-    - - 256
-      - 256
-    - - 1024
-      - 128
-    - - 1024
-      - 256
-    - - 2048
-      - 128
-    - - 2048
-      - 256
-    - - 4096
-      - 128
-    - - 4096
-      - 256
+    shapes: [[256, 128], [256, 256], [1024, 128], [1024, 256], [2048, 128], [2048, 256], [4096, 128], [4096, 256]]
     repeats: 16
   attn_gpu_memory_gb:
     value: 116.4366
@@ -544,9 +275,7 @@ cases:
   name: prefill_spectrum_c32
   variant: tp4_ep4
   purpose: Prefill scaling and the 2048-token chunk boundary.
-  coverage:
-  - prefill_scaling
-  - chunk_boundary
+  coverage: [prefill_scaling, chunk_boundary]
   max_model_len: 131072
   max_concurrency: 32
   profile_arrival_mode: saturated
@@ -556,23 +285,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/04_prefill_spectrum_c32.csv
-    shapes:
-    - - 128
-      - 64
-    - - 512
-      - 64
-    - - 1984
-      - 64
-    - - 2048
-      - 64
-    - - 2112
-      - 64
-    - - 4096
-      - 64
-    - - 6144
-      - 64
-    - - 7168
-      - 64
+    shapes: [[128, 64], [512, 64], [1984, 64], [2048, 64], [2112, 64], [4096, 64], [6144, 64], [7168, 64]]
     repeats: 16
   attn_gpu_memory_gb:
     value: 116.4366
@@ -588,9 +301,7 @@ cases:
   name: decode_spectrum_c64
   variant: tp4_ep4
   purpose: Decode residence, KV growth, and batch contraction.
-  coverage:
-  - decode_residence
-  - kv_growth
+  coverage: [decode_residence, kv_growth]
   max_model_len: 131072
   max_concurrency: 64
   profile_arrival_mode: saturated
@@ -600,23 +311,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/05_decode_spectrum_c64.csv
-    shapes:
-    - - 128
-      - 16
-    - - 128
-      - 128
-    - - 128
-      - 512
-    - - 128
-      - 1024
-    - - 128
-      - 2048
-    - - 128
-      - 4096
-    - - 512
-      - 2048
-    - - 1024
-      - 4096
+    shapes: [[128, 16], [128, 128], [128, 512], [128, 1024], [128, 2048], [128, 4096], [512, 2048], [1024, 4096]]
     repeats: 16
   attn_gpu_memory_gb:
     value: 116.4366
@@ -633,9 +328,7 @@ cases:
   name: long_long_c8
   variant: tp4_ep4
   purpose: Long-prefill plus long-decode interaction near context capacity.
-  coverage:
-  - long_prefill
-  - long_decode
+  coverage: [long_prefill, long_decode]
   max_model_len: 131072
   max_concurrency: 8
   profile_arrival_mode: saturated
@@ -645,17 +338,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/06_long_long_c8.csv
-    shapes:
-    - - 32768
-      - 4096
-    - - 49152
-      - 3072
-    - - 65536
-      - 3968
-    - - 81920
-      - 2944
-    - - 98304
-      - 1920
+    shapes: [[32768, 4096], [49152, 3072], [65536, 3968], [81920, 2944], [98304, 1920]]
     repeats: 7
   attn_gpu_memory_gb:
     value: 116.4366
@@ -673,9 +356,7 @@ cases:
   name: quadrant_interference_c48
   variant: tp4_ep4
   purpose: All four IO quadrants sharing continuous batches.
-  coverage:
-  - io_quadrants
-  - continuous_batching
+  coverage: [io_quadrants, continuous_batching]
   max_model_len: 131072
   max_concurrency: 48
   profile_arrival_mode: saturated
@@ -685,15 +366,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/07_quadrant_interference_c48.csv
-    shapes:
-    - - 128
-      - 128
-    - - 128
-      - 4096
-    - - 4096
-      - 128
-    - - 3072
-      - 3072
+    shapes: [[128, 128], [128, 4096], [4096, 128], [3072, 3072]]
     repeats: 24
   attn_gpu_memory_gb:
     value: 116.4366
@@ -710,9 +383,7 @@ cases:
   name: completion_churn_c96
   variant: tp4_ep4
   purpose: Rapid completions, shrinking batches, and request replacement.
-  coverage:
-  - completion_churn
-  - admission
+  coverage: [completion_churn, admission]
   max_model_len: 131072
   max_concurrency: 96
   profile_arrival_mode: saturated
@@ -722,19 +393,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/08_completion_churn_c96.csv
-    shapes:
-    - - 512
-      - 1
-    - - 512
-      - 16
-    - - 512
-      - 64
-    - - 512
-      - 256
-    - - 512
-      - 1024
-    - - 512
-      - 4096
+    shapes: [[512, 1], [512, 16], [512, 64], [512, 256], [512, 1024], [512, 4096]]
     repeats: 32
   attn_gpu_memory_gb:
     value: 116.4366
@@ -750,8 +409,7 @@ cases:
   name: rate_knee
   variant: tp4_ep4
   purpose: Maximum sustainable open-loop request rate.
-  coverage:
-  - arrival_rate_knee
+  coverage: [arrival_rate_knee]
   max_model_len: 131072
   max_concurrency: 100
   profile_arrival_mode: trace-timed
@@ -761,23 +419,8 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/09_rate_knee.csv
-    shapes: &id003
-    - - 128
-      - 128
-    - - 128
-      - 4096
-    - - 4096
-      - 128
-    - - 3072
-      - 3072
-    - - 512
-      - 256
-    - - 2048
-      - 1024
-    - - 6144
-      - 512
-    - - 1024
-      - 4096
+    shapes: &id003 [[128, 128], [128, 4096], [4096, 128], [3072, 3072], [512, 256], [2048, 1024], [6144, 512], [
+        1024, 4096]]
     repeats: 64
   rate:
     value: 3.34
@@ -801,9 +444,7 @@ cases:
   name: full_saturation_rate
   variant: tp4_ep4
   purpose: Peak-throughput open-loop load beyond the sustainable knee.
-  coverage:
-  - saturation
-  - peak_throughput
+  coverage: [saturation, peak_throughput]
   max_model_len: 131072
   max_concurrency: 100
   profile_arrival_mode: saturated
@@ -830,9 +471,7 @@ cases:
   name: long_prefill_ladder_c1
   variant: tp4_ep4
   purpose: '4K-120K prompts: long-prefill ladder at concurrency 1.'
-  coverage:
-  - long_prefill
-  - bounded_kernel_trace
+  coverage: [long_prefill, bounded_kernel_trace]
   max_model_len: 131072
   max_concurrency: 1
   profile_arrival_mode: saturated
@@ -842,46 +481,13 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/11_long_prefill_ladder_c1.csv
-    shapes:
-    - - 4096
-      - 16
-    - - 8192
-      - 64
-    - - 16384
-      - 16
-    - - 24576
-      - 64
-    - - 32768
-      - 16
-    - - 49152
-      - 64
-    - - 65536
-      - 16
-    - - 98304
-      - 64
-    - - 114688
-      - 16
-    - - 122880
-      - 64
+    shapes: [[4096, 16], [8192, 64], [16384, 16], [24576, 64], [32768, 16], [49152, 64], [65536, 16], [98304, 64],
+      [114688, 16], [122880, 64]]
     repeats: 2
     id_suffix: full
   kernel_trace:
     file: traces/11_long_prefill_ladder_c1.nsys.csv
-    shapes:
-    - - 4096
-      - 16
-    - - 8192
-      - 64
-    - - 16384
-      - 16
-    - - 24576
-      - 64
-    - - 32768
-      - 16
-    - - 49152
-      - 64
-    - - 65536
-      - 16
+    shapes: [[4096, 16], [8192, 64], [16384, 16], [24576, 64], [32768, 16], [49152, 64], [65536, 16]]
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
@@ -899,9 +505,7 @@ cases:
   name: ultra_context_decode_c1
   variant: tp4_ep4
   purpose: 'Long context plus long output: ultra-context decode at concurrency 1.'
-  coverage:
-  - ultra_context
-  - long_decode
+  coverage: [ultra_context, long_decode]
   max_model_len: 131072
   max_concurrency: 1
   profile_arrival_mode: saturated
@@ -911,48 +515,14 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/12_ultra_context_decode_c1.csv
-    shapes:
-    - - 114688
-      - 256
-    - - 114688
-      - 1024
-    - - 114688
-      - 4096
-    - - 65536
-      - 256
-    - - 65536
-      - 1024
-    - - 65536
-      - 4096
-    - - 32768
-      - 256
-    - - 32768
-      - 1024
-    - - 32768
-      - 4096
-    - - 8192
-      - 256
-    - - 8192
-      - 1024
-    - - 8192
-      - 4096
-    - - 2048
-      - 256
-    - - 2048
-      - 1024
-    - - 2048
-      - 4096
+    shapes: [[114688, 256], [114688, 1024], [114688, 4096], [65536, 256], [65536, 1024], [65536, 4096], [32768,
+        256], [32768, 1024], [32768, 4096], [8192, 256], [8192, 1024], [8192, 4096], [2048, 256], [2048, 1024],
+      [2048, 4096]]
     repeats: 1
     id_suffix: full
   kernel_trace:
     file: traces/12_ultra_context_decode_c1.nsys.csv
-    shapes:
-    - - 114688
-      - 64
-    - - 2048
-      - 256
-    - - 3072
-      - 64
+    shapes: [[114688, 64], [2048, 256], [3072, 64]]
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
@@ -971,8 +541,7 @@ cases:
   name: generation_length_matrix_c8
   variant: tp4_ep4
   purpose: Mixed prompt and output lengths across a generation-length matrix.
-  coverage:
-  - generation_length_matrix
+  coverage: [generation_length_matrix]
   max_model_len: 131072
   max_concurrency: 8
   profile_arrival_mode: saturated
@@ -982,76 +551,16 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/13_generation_length_matrix_c8.csv
-    shapes:
-    - - 128
-      - 4096
-    - - 128
-      - 8192
-    - - 128
-      - 16384
-    - - 128
-      - 32768
-    - - 512
-      - 4096
-    - - 512
-      - 8192
-    - - 512
-      - 16384
-    - - 512
-      - 32768
-    - - 2048
-      - 4096
-    - - 2048
-      - 8192
-    - - 2048
-      - 16384
-    - - 2048
-      - 32768
-    - - 8192
-      - 4096
-    - - 8192
-      - 8192
-    - - 8192
-      - 16384
-    - - 8192
-      - 32768
-    - - 16384
-      - 4096
-    - - 16384
-      - 8192
-    - - 16384
-      - 16384
-    - - 16384
-      - 32768
-    - - 32768
-      - 4096
-    - - 32768
-      - 8192
-    - - 32768
-      - 16384
-    - - 32768
-      - 32768
+    shapes: [[128, 4096], [128, 8192], [128, 16384], [128, 32768], [512, 4096], [512, 8192], [512, 16384], [512,
+        32768], [2048, 4096], [2048, 8192], [2048, 16384], [2048, 32768], [8192, 4096], [8192, 8192], [8192, 16384],
+      [8192, 32768], [16384, 4096], [16384, 8192], [16384, 16384], [16384, 32768], [32768, 4096], [32768, 8192],
+      [32768, 16384], [32768, 32768]]
     repeats: 1
     id_suffix: full
   kernel_trace:
     file: traces/13_generation_length_matrix_c8.nsys.csv
-    shapes:
-    - - 128
-      - 256
-    - - 512
-      - 256
-    - - 2048
-      - 256
-    - - 8192
-      - 256
-    - - 16384
-      - 256
-    - - 32768
-      - 256
-    - - 4096
-      - 256
-    - - 24576
-      - 256
+    shapes: [[128, 256], [512, 256], [2048, 256], [8192, 256], [16384, 256], [32768, 256], [4096, 256], [24576,
+        256]]
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
@@ -1069,8 +578,7 @@ cases:
   name: near_full_long_decode_c100
   variant: tp4_ep4_kv14
   purpose: 'About 91.4% terminal KV demand: near-full long decode.'
-  coverage:
-  - kv_near_full
+  coverage: [kv_near_full]
   max_model_len: 131072
   max_concurrency: 100
   profile_arrival_mode: saturated
@@ -1080,224 +588,25 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/14_near_full_long_decode_c100.csv
-    shapes:
-    - - 8192
-      - 8192
-    - - 12288
-      - 8192
-    - - 16384
-      - 8192
-    - - 24576
-      - 4096
-    - - 32768
-      - 4096
-    - - 49152
-      - 2048
+    shapes: [[8192, 8192], [12288, 8192], [16384, 8192], [24576, 4096], [32768, 4096], [49152, 2048]]
     repeats: 48
     id_suffix: full
   kernel_trace:
     file: traces/14_near_full_long_decode_c100.nsys.csv
-    shapes:
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
+    shapes: [[50944, 256], [16128, 256], [20224, 256], [24320, 256], [28416, 256], [36608, 256], [50944, 256], [
+        16128, 256], [20224, 256], [24320, 256], [28416, 256], [36608, 256], [50944, 256], [16128, 256], [20224,
+        256], [24320, 256], [28416, 256], [36608, 256], [50944, 256], [16128, 256], [20224, 256], [24320, 256],
+      [28416, 256], [36608, 256], [50944, 256], [16128, 256], [20224, 256], [24320, 256], [28416, 256], [36608,
+        256], [50944, 256], [16128, 256], [20224, 256], [24320, 256], [28416, 256], [36608, 256], [50944, 256],
+      [16128, 256], [20224, 256], [24320, 256], [28416, 256], [36608, 256], [50944, 256], [16128, 256], [20224,
+        256], [24320, 256], [28416, 256], [36608, 256], [50944, 256], [16128, 256], [20224, 256], [24320, 256],
+      [28416, 256], [36608, 256], [50944, 256], [16128, 256], [20224, 256], [24320, 256], [28416, 256], [36608,
+        256], [50944, 256], [16128, 256], [20224, 256], [24320, 256], [28416, 256], [36608, 256], [50944, 256],
+      [16128, 256], [20224, 256], [24320, 256], [28416, 256], [36608, 256], [50944, 256], [16128, 256], [20224,
+        256], [24320, 256], [28416, 256], [36608, 256], [50944, 256], [16128, 256], [20224, 256], [24320, 256],
+      [28416, 256], [36608, 256], [50944, 256], [16128, 256], [20224, 256], [24320, 256], [28416, 256], [36608,
+        256], [50944, 256], [16128, 256], [20224, 256], [24320, 256], [28416, 256], [36608, 256], [50944, 256],
+      [16128, 256], [20224, 256], [24320, 256]]
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
@@ -1316,9 +625,7 @@ cases:
   name: kv_overcommit_mixed_churn_c100
   variant: tp4_ep4_kv15
   purpose: About 122.6% average terminal KV demand, admission-controlled churn.
-  coverage:
-  - kv_overcommit
-  - admission
+  coverage: [kv_overcommit, admission]
   max_model_len: 131072
   max_concurrency: 100
   profile_arrival_mode: saturated
@@ -1328,224 +635,25 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/15_kv_overcommit_mixed_churn_c100.csv
-    shapes:
-    - - 65536
-      - 4096
-    - - 16384
-      - 32768
-    - - 98304
-      - 2048
-    - - 32768
-      - 16384
-    - - 8192
-      - 8192
-    - - 49152
-      - 8192
+    shapes: [[65536, 4096], [16384, 32768], [98304, 2048], [32768, 16384], [8192, 8192], [49152, 8192]]
     repeats: 34
     id_suffix: full
   kernel_trace:
     file: traces/15_kv_overcommit_mixed_churn_c100.nsys.csv
-    shapes:
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
+    shapes: [[69376, 256], [48896, 256], [100096, 256], [48896, 256], [16128, 256], [57088, 256], [69376, 256],
+      [48896, 256], [100096, 256], [48896, 256], [16128, 256], [57088, 256], [69376, 256], [48896, 256], [100096,
+        256], [48896, 256], [16128, 256], [57088, 256], [69376, 256], [48896, 256], [100096, 256], [48896, 256],
+      [16128, 256], [57088, 256], [69376, 256], [48896, 256], [100096, 256], [48896, 256], [16128, 256], [57088,
+        256], [69376, 256], [48896, 256], [100096, 256], [48896, 256], [16128, 256], [57088, 256], [69376, 256],
+      [48896, 256], [100096, 256], [48896, 256], [16128, 256], [57088, 256], [69376, 256], [48896, 256], [100096,
+        256], [48896, 256], [16128, 256], [57088, 256], [69376, 256], [48896, 256], [100096, 256], [48896, 256],
+      [16128, 256], [57088, 256], [69376, 256], [48896, 256], [100096, 256], [48896, 256], [16128, 256], [57088,
+        256], [69376, 256], [48896, 256], [100096, 256], [48896, 256], [16128, 256], [57088, 256], [69376, 256],
+      [48896, 256], [100096, 256], [48896, 256], [16128, 256], [57088, 256], [69376, 256], [48896, 256], [100096,
+        256], [48896, 256], [16128, 256], [57088, 256], [69376, 256], [48896, 256], [100096, 256], [48896, 256],
+      [16128, 256], [57088, 256], [69376, 256], [48896, 256], [100096, 256], [48896, 256], [16128, 256], [57088,
+        256], [69376, 256], [48896, 256], [100096, 256], [48896, 256], [16128, 256], [57088, 256], [69376, 256],
+      [48896, 256], [100096, 256], [48896, 256]]
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
@@ -1564,10 +672,7 @@ cases:
   name: prefill_spectrum_chunk4k_c32
   variant: tp4_ep4
   purpose: Prefill scaling and the 4096-token chunk boundary.
-  coverage:
-  - prefill_scaling
-  - chunk_boundary
-  - chunk_size
+  coverage: [prefill_scaling, chunk_boundary, chunk_size]
   max_model_len: 131072
   max_concurrency: 32
   profile_arrival_mode: saturated
@@ -1577,23 +682,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/16_prefill_spectrum_chunk4k_c32.csv
-    shapes:
-    - - 128
-      - 64
-    - - 512
-      - 64
-    - - 4032
-      - 64
-    - - 4096
-      - 64
-    - - 4160
-      - 64
-    - - 8192
-      - 64
-    - - 12288
-      - 64
-    - - 14336
-      - 64
+    shapes: [[128, 64], [512, 64], [4032, 64], [4096, 64], [4160, 64], [8192, 64], [12288, 64], [14336, 64]]
     repeats: 16
   chunk_size: 4096
   attn_gpu_memory_gb:
@@ -1611,10 +700,7 @@ cases:
   name: prefill_spectrum_chunk8k_c32
   variant: tp4_ep4
   purpose: Prefill scaling and the 8192-token chunk boundary.
-  coverage:
-  - prefill_scaling
-  - chunk_boundary
-  - chunk_size
+  coverage: [prefill_scaling, chunk_boundary, chunk_size]
   max_model_len: 131072
   max_concurrency: 32
   profile_arrival_mode: saturated
@@ -1624,23 +710,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/17_prefill_spectrum_chunk8k_c32.csv
-    shapes:
-    - - 128
-      - 64
-    - - 512
-      - 64
-    - - 8128
-      - 64
-    - - 8192
-      - 64
-    - - 8256
-      - 64
-    - - 16384
-      - 64
-    - - 24576
-      - 64
-    - - 28672
-      - 64
+    shapes: [[128, 64], [512, 64], [8128, 64], [8192, 64], [8256, 64], [16384, 64], [24576, 64], [28672, 64]]
     repeats: 16
   chunk_size: 8192
   attn_gpu_memory_gb:
@@ -1658,10 +728,7 @@ cases:
   name: quadrant_interference_chunk4k_c48
   variant: tp4_ep4
   purpose: All four IO quadrants sharing continuous batches at a 4096-token chunk.
-  coverage:
-  - io_quadrants
-  - continuous_batching
-  - chunk_size
+  coverage: [io_quadrants, continuous_batching, chunk_size]
   max_model_len: 131072
   max_concurrency: 48
   profile_arrival_mode: saturated
@@ -1671,15 +738,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/18_quadrant_interference_chunk4k_c48.csv
-    shapes:
-    - - 128
-      - 128
-    - - 128
-      - 4096
-    - - 8192
-      - 128
-    - - 6144
-      - 3072
+    shapes: [[128, 128], [128, 4096], [8192, 128], [6144, 3072]]
     repeats: 24
   chunk_size: 4096
   attn_gpu_memory_gb:
@@ -1697,10 +756,7 @@ cases:
   name: quadrant_interference_chunk8k_c48
   variant: tp4_ep4
   purpose: All four IO quadrants sharing continuous batches at a 8192-token chunk.
-  coverage:
-  - io_quadrants
-  - continuous_batching
-  - chunk_size
+  coverage: [io_quadrants, continuous_batching, chunk_size]
   max_model_len: 131072
   max_concurrency: 48
   profile_arrival_mode: saturated
@@ -1710,15 +766,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/19_quadrant_interference_chunk8k_c48.csv
-    shapes:
-    - - 128
-      - 128
-    - - 128
-      - 4096
-    - - 16384
-      - 128
-    - - 12288
-      - 3072
+    shapes: [[128, 128], [128, 4096], [16384, 128], [12288, 3072]]
     repeats: 24
   chunk_size: 8192
   attn_gpu_memory_gb:

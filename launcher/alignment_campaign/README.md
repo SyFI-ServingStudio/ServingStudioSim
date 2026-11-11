@@ -42,17 +42,52 @@ unsupported schema version, and a corpus manifest whose payload is not beside
 it. Rendering preserves the routing selector and converts pack-relative file
 paths to simulator paths; it never falls back to uniform.
 
+## Alignment Phase 1 and alignment Phase 2
+
+A pack's cases fall into two groups, chosen per case with `phase`:
+
+- **alignment Phase 1** (`phase: 1`): for each alignment — one checkpoint on one
+  deployment, e.g. DeepSeek-V4.1 TP4/EP4 and DP4/EP4 are two — one case replaying
+  the tracked `trace/diverse_100.csv` at its recorded arrival times, through Check
+  1 (kernel), Check 2 (duty cycle) and Check 3 (E2E). It is what a model PR must pass.
+- **alignment Phase 2** (the default): the whole matrix, Phase 1 cases included.
+  It runs end to end from the pack with no hand edits, so it can be handed to
+  someone else as an issue.
+
+`render`, `run`, `label`, `extract` and `compare` take `--alignment-phase {1,2}`.
+`1` works on the Phase 1 cases only; a pack with none is an error. `2` is the
+full matrix, the same as omitting the flag. It is unrelated to `--phase`, which
+names a pipeline step (`profile_nsys`, `simulation`, ...).
+
+An illustrative Phase 1 case (no pack declares one yet; the index, name and
+variant are placeholders):
+
+```yaml
+cases:
+- index: 30
+  name: tp4_diverse_100
+  variant: tp4_c2048_s64
+  phase: 1
+  workload_trace: {path: trace/diverse_100.csv}  # tracked, replayed byte for byte
+  profile_arrival_mode: trace-timed              # recorded arrivals, no `rate`
+  simulation_arrival_mode: trace_timed           # rendered with request_rate: 1.0
+  attn_gpu_memory_gb: {status: from_capture}
+  speculative_acceptance: {status: from_capture}                     # speculative models
+  speculative_acceptance_by_output_position: {status: from_capture}  # speculative models
+  # ... max_model_len, gpu_memory_utilization, capture_seconds, device_role, purpose
+```
+
 ## Verbs
 
 ```bash
 python -m launcher alignment-campaign check   --pack <pack_dir>
-python -m launcher alignment-campaign render  --pack <> --host <> --out-root <> [--case 01]
-python -m launcher alignment-campaign run     --pack <> --out-root <> --phase <P> \
+python -m launcher alignment-campaign render  --pack <> --host <> --out-root <> [--case 01] [--alignment-phase 1|2]
+python -m launcher alignment-campaign run     --pack <> --out-root <> --phase <P> [--alignment-phase 1|2] \
                                               [--case ...] [--dry-run] [--refresh] [--resume]
-python -m launcher alignment-campaign label   --pack <> --run-dir <>
-python -m launcher alignment-campaign extract [--pack <>] --runs <dir[:dir]> --out metrics.json
+python -m launcher alignment-campaign label   --pack <> --out-root <> [--alignment-phase 1|2]
+python -m launcher alignment-campaign extract [--pack <>] --runs <dir[:dir]> --out metrics.json [--alignment-phase 1|2]
 python -m launcher alignment-campaign compare [--pack <>] --measured metrics.json \
-                                              [--json|--markdown] [--record]
+                                              [--json|--markdown] [--record] [--alignment-phase 1|2]
 ```
 
 `--pack` is **optional for `extract` and `compare`** — the read side. Point
@@ -94,7 +129,8 @@ runs on the host from the capture's files. `--runtime host` captures in a host
 venv with no autotune guard or preflight and is strongly discouraged.
 
 For `--phase simulation`, worker settings come from `simulation.yaml`, including
-`gpu_time_multiplier`. Kernel analysis is an independent phase, not a
+`gpu_time_multiplier`; a case with `from_capture` inputs gets that file written
+by `run` from its workload pass (see `campaign.yaml` below). Kernel analysis is an independent phase, not a
 prerequisite for simulation. The campaign never reads a case's own calibration
 report back into that case. A pack may instead declare one top-level, calibrated
 `gpu_time_multiplier` (`value`, `status`, `derived_from`, `evidence`) measured on
@@ -186,7 +222,16 @@ variant's chunk size.
 A **case** is one operating point: `max_model_len`, `max_concurrency`, the two
 arrival modes, `gpu_memory_utilization`, `capture_seconds`, `device_role`, its
 `workload_trace` (and `kernel_trace` where the NSYS capture is bounded
-separately), plus `purpose` and `coverage` so the matrix explains itself.
+separately), plus `purpose` and `coverage` so the matrix explains itself, and
+`phase` (1 or 2, default 2; see above).
+
+A trace is either generated (`file` + `shapes` x `repeats`) or a tracked file
+(`{path: trace/diverse_100.csv}`, repo-relative). A tracked file is replayed
+byte for byte, ids and arrival times included, and `check` compares its sha256
+with `traces/invariants.json` like a generated trace's. A trace-timed case
+normally needs a calibrated `rate`, because a generated trace's arrivals are a
+1 req/s placeholder; a tracked trace instead replays its recorded arrivals,
+with no `rate` on the profile side and `request_rate: 1.0` in the simulation.
 
 Optional per-case `chunk_size` sets both server `max_num_batched_tokens` and
 worker `max_batch_tokens`. CUDA graph capture size remains a separate variant
@@ -226,7 +271,7 @@ Two case fields carry more weight than their size suggests:
 
 - **`attn_gpu_memory_gb` and `rate` are `Calibrated`**, not plain numbers. Each
   records `value`, `derived_from`, `evidence`, and `status: measured |
-  provisional`. These are *measured* prerequisites — KV capacity is read out of a
+  provisional | from_capture`. These are *measured* prerequisites — KV capacity is read out of a
   workload-only server log, the open-loop rate comes from a saturation run — and
   the generator scripts this replaced shipped a literal
   `# provisional; replace after saturation calibration` next to a hard-coded
@@ -235,6 +280,42 @@ Two case fields carry more weight than their size suggests:
   --record` refuses to write a golden that depends on one unless
   `--accept-provisional` is passed, and then names the provisional fields in the
   provenance sidecar.
+- **`from_capture`** (`{status: from_capture}`, nothing else) is for
+  `attn_gpu_memory_gb`, `speculative_acceptance` and
+  `speculative_acceptance_by_output_position`: the case's own
+  `workload_metrics` pass is the measurement, and nobody copies it by hand.
+  `calibration.py` reads the chain from `spec_decode_metrics.json` (position 0
+  is `accepted[0] / num_drafts`, position k is `accepted[k] / accepted[k-1]`),
+  the output-position buckets from the pass's `metrics_jsonl`
+  (`buckets_from_metrics`: `decode_request_progress` rounds binned by
+  `output_tokens_before` at 1/32/128/512/1024/2048/4096/8192, a bucket under 50
+  rounds merged into the previous one and a first bucket under 50 rounds merged
+  into the second, depth = the arch's `draft_tokens`),
+  and the per-rank KV pool from the vLLM server log (the smallest rank's
+  `Extended KV cache to N blocks (X GiB)`, else `Available KV cache memory: X
+  GiB`; `X * 2**30 / 1e9` GB). SGLang has no extractor: its log gives
+  `max_total_num_tokens`, which needs a per-token byte size to become GB, so
+  `check` rejects `from_capture` there. `render` leaves `simulation.yaml` out
+  until the pass has run, and `run --phase timing_predict|simulation` blocks
+  with the reason until then. Once it has, `run` writes `calibration.json`
+  (each value with its source file, relative to the case directory), the
+  simulation preset and `trace_speculative.csv` just before launching. A
+  resolved field counts as measured. When `run` finishes the simulation it
+  records the sha256 of the preset and `calibration.json` it ran with, and a
+  copy of that calibration, in `simulation/campaign_inputs.json`. A later
+  change to either file, or a re-run workload pass that now resolves to other
+  values, makes the simulation not complete, and the next `run --phase
+  simulation` re-runs it with `--refresh`. `extract` copies the recorded
+  calibration (never the live file) into the case's provenance, `compare`
+  prints it, and `compare --record` writes it into the golden's provenance
+  sidecar (merged per case, like the golden values) and refuses a from_capture
+  case whose simulation recorded none.
+- **`acceptance_structure`** (pack top level, optional) is
+  `{status: legacy_single_chain, reason: <why>}`: the pack's speculative cases
+  carry only the case-wide chain because their captures cannot give the
+  by-output-position buckets. Without it, `check` fails a speculative case that
+  lacks `speculative_acceptance_by_output_position`; with it, `check` warns and
+  prints the reason. Only the two GLM-5.2 spec5 packs declare it.
 - **`analyze_iterations`** overrides the profiler's whole-capture default with a
   stable numbered excerpt. Use it when the accepted evidence population is a
   particular iteration interval that must remain fixed even if capture duration
@@ -310,7 +391,9 @@ exists to hold.
 | File | Contents |
 |---|---|
 | `pack.py` | Pack/variant/case dataclasses, `Calibrated`, YAML loading, host profiles |
+| `packfile.py` | The `campaign.yaml` writer every `make_pack.py` uses: scalar lists in flow style |
 | `render.py` | Phase configs and traces from a `(case, variant, host)` triple |
+| `calibration.py` | `from_capture` inputs read from a case's workload pass; `calibration.json` |
 | `check.py` | Pure-CPU pack self-check; trace invariants; cross-phase consistency |
 | `execute.py` | Phase planning (pure) and execution (scheduler + leases + journal) |
 | `label.py` | Applying the rule set to a fixpoint, then `check` |

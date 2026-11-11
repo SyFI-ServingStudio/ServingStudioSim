@@ -1,9 +1,10 @@
 """Write acceptance_by_position.json: MTP acceptance by output position, from each case's workload pass.
 
-Same estimator as the GLM-5.3 DFlash2 pack (glm53_nvfp4_b200_dflash2, `position_accept.buckets_from_metrics`): per
-bucket of `output_tokens_before` at EDGES, the per-verify-round distribution of accepted draft tokens 0..K over every
-`decode_request_progress` row of the warm workload pass; a bucket under MIN_ROUNDS rounds merges into the previous
-one. make_pack.py reads the JSON into each case's `speculative_acceptance_by_output_position`.
+The estimator is `launcher.alignment_campaign.calibration.buckets_from_metrics`, the one a case's
+`speculative_acceptance_by_output_position: {status: from_capture}` uses: per bucket of `output_tokens_before` at
+its EDGES, the per-verify-round distribution of accepted draft tokens 0..K over every `decode_request_progress` row
+of the warm workload pass; a bucket under MIN_ROUNDS rounds merges into the previous one. make_pack.py reads the
+JSON into each case's `speculative_acceptance_by_output_position`.
 
 Run from the repo root:
   uv run python presets/alignment/qwen38_flash_next_nvfp4_b200_tp1/acceptance_by_position.py <cases dir>
@@ -11,45 +12,14 @@ where <cases dir> holds `<NN>_<name>/profile_workload/vllm/*_metrics.jsonl` (wt-
 """
 import json
 import sys
-from collections import Counter
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[2]))  # the repo root, for `launcher`
+from launcher.alignment_campaign.calibration import buckets_from_metrics  # noqa: E402
+
 DRAFT = 3
-EDGES = [1, 32, 128, 512, 1024, 2048, 4096, 8192]  # bucket lower bounds
-MIN_ROUNDS = 50
 EVIDENCE_ROOT = "logs/20261013_2_qf_cases"
-
-
-def buckets_from_metrics(path: Path, K: int) -> list[tuple[int, int | None, list[float]]]:
-    counts = [Counter() for _ in EDGES]
-    for line in open(path):
-        for p in json.loads(line)["decode_request_progress"]:
-            pos, a = p.get("output_tokens_before"), p.get("accepted_draft_tokens")
-            if pos is None or a is None:
-                continue
-            b = max(i for i, lo in enumerate(EDGES) if pos >= lo) if pos >= 1 else 0
-            counts[b][min(a, K)] += 1
-    # Merge sparse buckets into the previous one; drop empty tails.
-    merged: list[list] = []
-    for i, c in enumerate(counts):
-        n = sum(c.values())
-        if n == 0:
-            continue
-        if merged and n < MIN_ROUNDS:
-            merged[-1][1] += c
-            continue
-        merged.append([EDGES[i], Counter(c)])
-    if len(merged) > 1 and sum(merged[0][1].values()) < MIN_ROUNDS:
-        merged[1][1] += merged[0][1]
-        merged[1][0] = merged[0][0]
-        merged.pop(0)
-    out = []
-    for j, (lo, c) in enumerate(merged):
-        hi = merged[j + 1][0] if j + 1 < len(merged) else None
-        n = sum(c.values())
-        out.append((lo, hi, [c[a] / n for a in range(K + 1)]))
-    return out
 
 
 def main() -> None:
