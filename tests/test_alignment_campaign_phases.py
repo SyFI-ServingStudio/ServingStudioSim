@@ -674,3 +674,51 @@ def test_check_requires_acceptance_by_position_for_a_speculative_case(tmp_path):
     with_buckets = _phase1_pack(tmp_path / "b")
     findings = check_module.check_pack(with_buckets, metric_names=metric_names(None))
     assert not [item for item in findings if item.level == "error"]
+
+
+def _declare_legacy(pack, structure) -> None:
+    document = yaml.safe_load((pack.root / "campaign.yaml").read_text())
+    document["acceptance_structure"] = structure
+    (pack.root / "campaign.yaml").write_text(yaml.safe_dump(document, sort_keys=False))
+
+
+def test_legacy_single_chain_downgrades_only_the_declaring_pack(tmp_path):
+    reason = "captures predate decode_request_progress.output_tokens_before"
+    legacy = _phase1_pack(tmp_path / "legacy", by_position=False)
+    _declare_legacy(legacy, {"status": "legacy_single_chain", "reason": reason})
+    legacy = load_pack(legacy.root)
+    findings = check_module.check_pack(legacy, metric_names=metric_names(None))
+    assert not [item for item in findings if item.level == "error"]
+    (warning,) = [item for item in findings
+                  if item.where.endswith(".speculative_acceptance_by_output_position")]
+    assert warning.level == "warn" and reason in warning.message
+    assert check_module.ACCEPTANCE_STRUCTURE_REASON in warning.message
+
+    # The same case in a pack without the declaration still fails.
+    other = _phase1_pack(tmp_path / "other", by_position=False)
+    assert other.acceptance_structure is None
+    findings = check_module.check_pack(other, metric_names=metric_names(None))
+    assert [item.level for item in findings
+            if item.where.endswith(".speculative_acceptance_by_output_position")] == ["error"]
+
+
+@pytest.mark.parametrize("structure", [
+    {"status": "legacy_single_chain"},
+    {"status": "legacy_single_chain", "reason": "  "},
+    {"status": "legacy_single_chain", "reason": 3},
+    {"status": "something_else", "reason": "x"},
+    {"status": "legacy_single_chain", "reason": "x", "extra": 1},
+    "legacy_single_chain",
+])
+def test_legacy_single_chain_needs_a_reason(tmp_path, structure):
+    pack = _phase1_pack(tmp_path, by_position=False)
+    _declare_legacy(pack, structure)
+    with pytest.raises(PackError, match="acceptance_structure"):
+        load_pack(pack.root)
+
+
+def test_the_two_glm52_spec5_packs_declare_legacy_single_chain():
+    for name in ("glm52_nvfp4_b200_spec5", "glm52_nvfp4_b200_spec5_reproduction"):
+        pack = load_pack(PACK_ROOT / name)
+        assert pack.acceptance_structure is not None
+        assert pack.acceptance_structure.status == "legacy_single_chain"

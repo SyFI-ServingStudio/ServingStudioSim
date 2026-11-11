@@ -112,7 +112,10 @@ previous one, exactly as for a single case.
   acceptance, and Check 3's request-weighted TPOT then reads fast: GLM-5.3
   DFlash2 cases 07 and 08 read -26% and -24% with the chain alone, -11% and -6%
   with the buckets (see "Preserve speculative acceptance structure"). `check`
-  reports a speculative case without the buckets as an error.
+  reports a speculative case without the buckets as an error. Only a pack whose
+  captures cannot give them may say so once at the top level,
+  `acceptance_structure: {status: legacy_single_chain, reason: <why>}`; `check`
+  then warns with that reason. Never declare it in a new pack.
 
   Run the profile steps first. The `from_capture` values are read from the
   case's workload pass when `--phase timing_predict` or `--phase simulation`

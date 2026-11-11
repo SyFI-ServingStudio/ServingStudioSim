@@ -310,6 +310,12 @@ Two case fields carry more weight than their size suggests:
   prints it, and `compare --record` writes it into the golden's provenance
   sidecar (merged per case, like the golden values) and refuses a from_capture
   case whose simulation recorded none.
+- **`acceptance_structure`** (pack top level, optional) is
+  `{status: legacy_single_chain, reason: <why>}`: the pack's speculative cases
+  carry only the case-wide chain because their captures cannot give the
+  by-output-position buckets. Without it, `check` fails a speculative case that
+  lacks `speculative_acceptance_by_output_position`; with it, `check` warns and
+  prints the reason. Only the two GLM-5.2 spec5 packs declare it.
 - **`analyze_iterations`** overrides the profiler's whole-capture default with a
   stable numbered excerpt. Use it when the accepted evidence population is a
   particular iteration interval that must remain fixed even if capture duration

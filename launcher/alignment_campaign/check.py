@@ -541,19 +541,35 @@ ACCEPTANCE_STRUCTURE_REASON = (
 
 
 def _check_acceptance_structure(pack: Pack) -> list[Finding]:
-    """A speculative case declares acceptance by output position too."""
-    return [
-        Finding(
-            "error",
-            f"cases[{case.slug}].speculative_acceptance_by_output_position",
+    """A speculative case declares acceptance by output position too.
+
+    A pack whose captures predate the per-position counters says so once, at
+    the top (`acceptance_structure: {status: legacy_single_chain, reason}`);
+    its cases are then warned about, with that reason, instead of failing.
+    """
+    legacy = pack.acceptance_structure
+    findings: list[Finding] = []
+    for case in pack.cases:
+        if (
+            case.speculative_acceptance is None
+            or case.speculative_acceptance_by_output_position is not None
+        ):
+            continue
+        where = f"cases[{case.slug}].speculative_acceptance_by_output_position"
+        if legacy is not None:
+            findings.append(Finding(
+                "warn", where,
+                f"missing; pack declares acceptance_structure {legacy.status} "
+                f"({legacy.reason}). " + ACCEPTANCE_STRUCTURE_REASON,
+            ))
+            continue
+        findings.append(Finding(
+            "error", where,
             "missing beside speculative_acceptance; " + ACCEPTANCE_STRUCTURE_REASON
             + ". Declare the buckets from the case's workload pass "
             "(`{status: from_capture}`, or measured via calibration.buckets_from_metrics)",
-        )
-        for case in pack.cases
-        if case.speculative_acceptance is not None
-        and case.speculative_acceptance_by_output_position is None
-    ]
+        ))
+    return findings
 
 
 def _check_capture_sources(pack: Pack) -> list[Finding]:

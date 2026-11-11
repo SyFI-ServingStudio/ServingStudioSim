@@ -302,6 +302,21 @@ class Case:
 
 
 @dataclass(frozen=True)
+class AcceptanceStructure:
+    """A pack-level admission that its speculative cases carry only the
+    case-wide acceptance chain, with the reason their captures cannot give the
+    by-output-position buckets. `check` then warns instead of failing; a pack
+    without this declaration gets the error."""
+
+    status: str  # LEGACY_SINGLE_CHAIN
+    reason: str
+
+
+#: The one `acceptance_structure.status`: speculative cases use one chain.
+LEGACY_SINGLE_CHAIN = "legacy_single_chain"
+
+
+@dataclass(frozen=True)
 class Pack:
     root: Path
     name: str
@@ -320,6 +335,7 @@ class Pack:
     so no case is judged against a factor fitted to itself; `derived_from` and
     `evidence` name that report. Each case's own recommendation stays a reported
     metric and is never read back."""
+    acceptance_structure: AcceptanceStructure | None = None
 
     def case_named(self, slug_or_index: str) -> Case | None:
         for case in self.cases:
@@ -776,7 +792,12 @@ def load_pack(root: Path) -> Pack:
     variants_raw = _typed(_require(raw, "variants", where), dict, f"{where}.variants")
     cases_raw = _require(raw, "cases", where)
     multiplier_raw = raw.pop("gpu_time_multiplier", None)
+    structure_raw = raw.pop("acceptance_structure", None)
     _reject_extra(raw, where)
+    structure = (
+        None if structure_raw is None
+        else _acceptance_structure(structure_raw, f"{where}.acceptance_structure")
+    )
     multiplier = None
     if multiplier_raw is not None:
         multiplier = _calibrated(multiplier_raw, f"{where}.gpu_time_multiplier")
@@ -802,7 +823,24 @@ def load_pack(root: Path) -> Pack:
         acceptance=acceptance,
         recorded_on=recorded_on,
         gpu_time_multiplier=multiplier,
+        acceptance_structure=structure,
     )
+
+
+def _acceptance_structure(raw: Any, where: str) -> AcceptanceStructure:
+    if not isinstance(raw, dict) or set(raw) != {"status", "reason"}:
+        raise PackError(f"{where} must be a mapping with exactly 'status' and 'reason'")
+    if raw["status"] != LEGACY_SINGLE_CHAIN:
+        raise PackError(
+            f"{where}.status must be {LEGACY_SINGLE_CHAIN!r}, got {raw['status']!r}"
+        )
+    reason = raw["reason"]
+    if not isinstance(reason, str) or not reason.strip():
+        raise PackError(
+            f"{where}.reason must say why the captures cannot give acceptance by "
+            "output position"
+        )
+    return AcceptanceStructure(status=raw["status"], reason=reason.strip())
 
 
 def load_host(path: Path) -> HostProfile:

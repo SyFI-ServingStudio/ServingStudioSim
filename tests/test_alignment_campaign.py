@@ -91,17 +91,6 @@ def test_at_least_one_pack_is_tracked():
     assert PACK_DIRS, f"no alignment pack under {PACK_ROOT}"
 
 
-#: Packs whose speculative cases have no acceptance-by-position buckets and
-#: whose captures cannot supply them: their workload passes predate
-#: `decode_request_progress` or are missing on this host, and neither pack has
-#: a generator. `check` reports them as errors; this list only keeps those
-#: known errors from hiding any other. Remove a pack once it declares buckets.
-ACCEPTANCE_STRUCTURE_PENDING = {
-    "glm52_nvfp4_b200_spec5",
-    "glm52_nvfp4_b200_spec5_reproduction",
-}
-
-
 def test_pack_check_reports_no_errors(pack):
     """`alignment-campaign check` end to end: renders every case, hands it to the
     real phase loaders, reproduces every trace, and validates the policy."""
@@ -109,15 +98,7 @@ def test_pack_check_reports_no_errors(pack):
         pack, metric_names=metric_names(_schemas(pack))
     )
     errors = [item for item in findings if item.level == "error"]
-    structure = [item for item in errors
-                 if item.where.endswith(".speculative_acceptance_by_output_position")
-                 and check_module.ACCEPTANCE_STRUCTURE_REASON in item.message]
-    others = [item for item in errors if item not in structure]
-    assert not others, "\n".join(str(item) for item in others)
-    if pack.name in ACCEPTANCE_STRUCTURE_PENDING:
-        assert structure, f"{pack.name} now declares its buckets; drop it from the list"
-        pytest.xfail(f"{len(structure)} speculative case(s) lack acceptance by position")
-    assert not structure, "\n".join(str(item) for item in structure)
+    assert not errors, "\n".join(str(item) for item in errors)
 
 
 @pytest.mark.parametrize("routing", [None, "uniform", "random"])
