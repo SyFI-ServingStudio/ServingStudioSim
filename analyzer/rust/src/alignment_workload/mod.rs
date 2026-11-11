@@ -339,8 +339,10 @@ impl FoldStats {
 /// scheduling the windows of one global step are offset across ranks, and
 /// idle ranks' dummy forwards were not recorded at all.
 ///
-/// A multi-rank capture without ordinals is refused. A single rank passes
-/// through, sorted by observation start when it has timestamps.
+/// A multi-rank capture without ordinals is refused, and so is one whose ranks
+/// are not exactly `0..n` (record extraction checks `n` against the capture's
+/// dp_size). A single rank passes through, sorted by observation start when it
+/// has timestamps, unless its records show it is one rank of a DP capture.
 fn fold_data_parallel_ranks(
     records: Vec<FullMeasuredMetrics>,
 ) -> Result<(Vec<FullMeasuredMetrics>, FoldStats)> {
@@ -360,17 +362,46 @@ fn fold_data_parallel_ranks(
          ranks' records cannot be joined into global steps; recapture the workload pass",
         ranks.len()
     );
+    let expected: BTreeSet<u64> = (0..ranks.len() as u64).collect();
+    ensure!(
+        ranks == expected,
+        "full-run metrics record data-parallel ranks {ranks:?}: a capture must record every rank \
+         0..dp_size, so {:?} is missing (record extraction checks this against dp_size)",
+        (0..=*ranks.last().expect("ranks"))
+            .filter(|rank| !ranks.contains(rank))
+            .collect::<Vec<_>>()
+    );
     fold_by_forward_ordinal(records, ranks.len())
 }
 
+/// A capture of one EngineCore. DP evidence is refused here rather than read
+/// as one rank: a dummy forward exists only under data parallelism, and a lone
+/// `dp_rank > 0` means the other ranks' records are missing, so either way the
+/// file is part of a multi-rank capture that this path would silently treat as
+/// the whole replica.
 fn fold_single_rank(
     records: Vec<FullMeasuredMetrics>,
 ) -> Result<(Vec<FullMeasuredMetrics>, FoldStats)> {
-    let dummy_records = records.iter().filter(|record| record.is_dummy).count();
-    let mut steps: Vec<_> = records
-        .into_iter()
-        .filter(|record| !record.is_dummy)
-        .collect();
+    if let Some(record) = records.iter().find(|record| record.is_dummy) {
+        bail!(
+            "full-run metrics hold a single rank (dp_rank {}) but record DP dummy forward {:?}: \
+             dummy forwards exist only under data parallelism, so the other ranks' records are \
+             missing from this capture",
+            record.dp_rank.unwrap_or(0),
+            record.forward_ordinal
+        );
+    }
+    if let Some(rank) = records
+        .iter()
+        .filter_map(|record| record.dp_rank)
+        .find(|rank| *rank > 0)
+    {
+        bail!(
+            "full-run metrics hold only dp_rank {rank}: a data-parallel capture must record every \
+             rank 0..dp_size, so ranks below {rank} are missing"
+        );
+    }
+    let mut steps = records;
     let mut seen = HashSet::new();
     for step in &steps {
         let index = step
@@ -403,7 +434,6 @@ fn fold_single_rank(
         FoldStats {
             method: "single_rank",
             ranks: 1,
-            dummy_records,
             ..FoldStats::default()
         },
     ))
@@ -496,9 +526,15 @@ fn fold_by_forward_ordinal(
         );
     }
 
-    // The ordinals every rank covers. Ranks start and stop recording at
-    // different forwards (the measurement log starts at an offset, the last
-    // records can be cut), so the ends are ragged and dropped with a count.
+    // The ordinals every rank covers. The ends can be ragged legitimately, so
+    // they are dropped with a count rather than refused: the measurement log is
+    // the server log from a byte offset taken when the API server reports no
+    // in-flight request (`alignment/runner.py`, `measurement_log_offset`), and
+    // the EngineCores may still be running a wave's trailing dummy forwards
+    // then, written to the shared log by independent processes, so each rank's
+    // first record after the offset can be a different forward. The tail is cut
+    // the same way when the server stops. A gap inside the common range has no
+    // such explanation and is refused below.
     let first = by_rank
         .values()
         .map(|forwards| *forwards.keys().next().expect("non-empty"))
@@ -1026,10 +1062,9 @@ mod tests {
     }
 
     #[test]
-    fn a_single_rank_sorts_by_start_and_drops_its_dummies() {
+    fn a_single_rank_sorts_by_start() {
         let (folded, fold) = fold_data_parallel_ranks(vec![
             forward(0, 1, 8, 2, vec![], 0),
-            dummy(0, 2, 0),
             forward(0, 0, 7, 1, vec![], 0),
         ])
         .unwrap();
@@ -1042,7 +1077,50 @@ mod tests {
             vec![Some(7), Some(8)]
         );
         assert_eq!(fold.method, "single_rank");
-        assert_eq!(fold.dummy_records, 1);
+    }
+
+    #[test]
+    fn a_single_rank_with_dummy_forwards_is_refused() {
+        // Dummy forwards exist only under DP: this is one rank of a DP capture
+        // whose peers' records are missing, not a single-rank run.
+        let error = fold_data_parallel_ranks(vec![forward(0, 0, 7, 1, vec![], 0), dummy(0, 1, 0)])
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("record DP dummy forward") && error.contains("missing"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_lone_nonzero_rank_is_refused() {
+        let error = fold_data_parallel_ranks(vec![
+            forward(2, 0, 7, 1, vec![], 0),
+            forward(2, 1, 8, 1, vec![], 0),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("hold only dp_rank 2"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_missing_rank_is_refused() {
+        let error = fold_data_parallel_ranks(vec![
+            forward(0, 0, 0, 1, vec![], 0),
+            forward(2, 0, 0, 1, vec![], 0),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("ranks {0, 2}") && error.contains("[1] is missing"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
