@@ -151,6 +151,14 @@ def extract_metrics_jsonl(
 
     When an engine repeats scheduler records on every TP rank, its descriptor
     selects one owner inside each DP group before identities are validated.
+
+    Schema 5 (vLLM) records every model forward, DP dummy forwards included
+    (`is_dummy`, no scheduled work, `iteration_index` null), each with its
+    rank's `forward_ordinal`, its own `dp_rank` and the engine's
+    `max_forwards_in_flight` (batch-queue depth). Its identity is
+    `(dp_rank, forward_ordinal)`, and equal ordinals across ranks are one
+    global step. The record's own rank is used, cross-checked against a
+    single-rank log prefix when the line has one.
     """
     required = {
         "schema_version",
@@ -181,6 +189,7 @@ def extract_metrics_jsonl(
 
     used_human_iterations: set[int] = set()
     seen_rank_iterations: set[tuple[int, int]] = set()
+    seen_rank_forwards: set[tuple[int, int]] = set()
     last_iteration_by_rank = [-1] * dp_size
     n = 0
     with Path(out_jsonl).open("w") as out:
@@ -194,7 +203,16 @@ def extract_metrics_jsonl(
             missing = required - set(row)
             if missing:
                 raise ValueError(f"alignment iteration record missing fields {sorted(missing)}")
-            if records is VLLM_RECORDS and dp_size > 1:
+            if row.get("schema_version") == FORWARD_ORDINAL_SCHEMA:
+                dp_rank = _forward_record_rank(row, line, dp_size, records)
+                identity = (dp_rank, row["forward_ordinal"])
+                if identity in seen_rank_forwards:
+                    raise ValueError(
+                        "duplicate alignment forward record for "
+                        f"dp_rank={identity[0]} forward_ordinal={identity[1]}"
+                    )
+                seen_rank_forwards.add(identity)
+            elif records is VLLM_RECORDS and dp_size > 1:
                 iteration_index = int(row["iteration_index"])
                 observed_elapsed_ms = row.get("observed_elapsed_ms")
                 matching_human = [
@@ -260,7 +278,10 @@ def extract_metrics_jsonl(
                     f"emitted by {records.rank_prefix_label} rank {dp_rank}"
                 )
             row["dp_rank"] = dp_rank
-            if row["schema_version"] not in {1, 2, 3, 4} or row["input_adapter"] != records.adapter:
+            if (
+                row["schema_version"] not in {1, 2, 3, 4, FORWARD_ORDINAL_SCHEMA}
+                or row["input_adapter"] != records.adapter
+            ):
                 raise ValueError(
                     "unsupported alignment iteration record "
                     f"schema={row['schema_version']!r} adapter={row['input_adapter']!r}"
@@ -286,6 +307,42 @@ def extract_metrics_jsonl(
             out.write(json.dumps(row) + "\n")
             n += 1
     return n
+
+
+#: The first iteration-record schema that records every forward, DP dummy
+#: forwards included, with a per-rank `forward_ordinal`.
+FORWARD_ORDINAL_SCHEMA = 5
+
+
+def _forward_record_rank(row: dict, line: str, dp_size: int, records: EngineRecords) -> int:
+    """The DP rank a schema-5 record names, checked against what it must hold."""
+    ordinal, is_dummy, dp_rank = row.get("forward_ordinal"), row.get("is_dummy"), row.get("dp_rank")
+    if type(ordinal) is not int or ordinal < 0:
+        raise ValueError(f"schema-5 alignment record needs a forward_ordinal >= 0, got {ordinal!r}")
+    if type(is_dummy) is not bool:
+        raise ValueError(f"schema-5 alignment record needs a boolean is_dummy, got {is_dummy!r}")
+    if type(dp_rank) is not int or not 0 <= dp_rank < dp_size:
+        raise ValueError(
+            f"schema-5 alignment record names dp_rank {dp_rank!r} in a dp_size={dp_size} capture"
+        )
+    in_flight = row.get("max_forwards_in_flight")
+    if type(in_flight) is not int or in_flight < 1:
+        raise ValueError(
+            f"schema-5 alignment record needs a max_forwards_in_flight >= 1, got {in_flight!r}"
+        )
+    if is_dummy:
+        if row["iteration_index"] is not None or row["prefill_tokens"] or row["decode_requests"]:
+            raise ValueError("a dummy forward record must carry no iteration index and no work")
+    elif type(row["iteration_index"]) is not int:
+        raise ValueError("a real forward record needs an integer iteration_index")
+    if records is VLLM_RECORDS:
+        prefixes = _vllm_engine_core_prefixes(line)
+        if len(prefixes) == 1 and prefixes[0] != dp_rank:
+            raise ValueError(
+                f"alignment record claims dp_rank {dp_rank} but was logged by "
+                f"EngineCore_DP{prefixes[0]}"
+            )
+    return dp_rank
 
 
 def _validate_decode_queries(row: dict) -> None:
