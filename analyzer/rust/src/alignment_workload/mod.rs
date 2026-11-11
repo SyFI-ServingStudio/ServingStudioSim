@@ -579,6 +579,34 @@ fn fold_by_forward_ordinal(
             .iter_mut()
             .map(|forwards| forwards.remove(&ordinal).expect("checked contiguous"))
             .collect();
+        // Two dummy forwards of one global step both enclose the same DP sync
+        // (the dummy's window brackets the forward that joins it), so their
+        // windows share an instant. Unlike the in-flight bound above, this has
+        // no slack: ranks paired one forward apart fail it on most idle steps.
+        let dummy_windows: Vec<(u64, u64)> = records
+            .iter()
+            .filter(|record| record.is_dummy)
+            .filter_map(observed_window)
+            .collect();
+        if dummy_windows.len() >= 2 {
+            let latest_start = dummy_windows
+                .iter()
+                .map(|window| window.0)
+                .max()
+                .expect("dummies");
+            let earliest_end = dummy_windows
+                .iter()
+                .map(|window| window.1)
+                .min()
+                .expect("dummies");
+            ensure!(
+                latest_start <= earliest_end,
+                "forward {ordinal}: two ranks' dummy forwards do not overlap in time (one ends at \
+                 {earliest_end} ns, another starts at {latest_start} ns), but dummy forwards of one \
+                 global step enclose the same DP sync: the ranks' forward ordinals do not name the \
+                 same global step"
+            );
+        }
         let observed: Vec<(u64, u64)> = records.iter().filter_map(observed_window).collect();
         if observed.len() == records.len() {
             let latest_start = observed.iter().map(|window| window.0).max().expect("ranks");
@@ -1015,6 +1043,41 @@ mod tests {
         );
         assert_eq!(fold.method, "single_rank");
         assert_eq!(fold.dummy_records, 1);
+    }
+
+    #[test]
+    fn a_rank_shifted_by_one_forward_is_refused() {
+        // Both ranks idle through forwards 1 and 2. Renumbering rank 1 one
+        // forward later still passes the in-flight wall-clock bound, but pairs
+        // rank 0's dummy forward 2 with rank 1's dummy of forward 1, and two
+        // dummies of one global step must overlap.
+        let rank = |dp_rank, shift| {
+            vec![
+                forward(dp_rank, 0, 0, 1, vec![], 0),
+                dummy(dp_rank, 1, 0),
+                dummy(dp_rank, 2, 0),
+                forward(dp_rank, 3, 1, 1, vec![], 0),
+            ]
+            .into_iter()
+            .map(|record| FullMeasuredMetrics {
+                forward_ordinal: record.forward_ordinal.map(|ordinal| ordinal + shift),
+                ..record
+            })
+            .collect::<Vec<_>>()
+        };
+
+        let (aligned, fold) = fold_data_parallel_ranks([rank(0, 0), rank(1, 0)].concat()).unwrap();
+        assert_eq!(aligned.len(), 2);
+        assert_eq!(fold.all_dummy_steps, 2);
+
+        let error = fold_data_parallel_ranks([rank(0, 0), rank(1, 1)].concat())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("forward 2: two ranks' dummy forwards do not overlap")
+                && error.contains("do not name the same global step"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
