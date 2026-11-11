@@ -94,12 +94,12 @@ alignment Phase 2, the full matrix, has not run yet. It will be filed as an issu
   capture by model and workload, so both topologies read it. Swapping the DP4 replay's corpus for this one moved
   the DP4 Check 1 decode signed error from -0.1% to -0.5% (R≤2) and from -2.0% to -2.8% (R3–12). The
   multiplier is unchanged at 1.0484.
-- `profiling/profile.db`:
-  - Merging onto `main` inserts 6390 rows.
-  - It also re-measures 1210 existing `compressed_sparse_mla_rope_cast` / `flashmla_mega` rows after the
-    runner fixes. The re-measured value over `main`'s value is 0.83 at the median, from 0.58 at p10 to 1.16 at
-    p90.
-  - Whether those 1210 rows replace `main`'s values is pending a decision.
+- `profiling/profile.db` is merged row-wise onto `main`'s DB with `launcher kernel-profile merge-db`:
+  - 183,817 rows are identical; 6,390 rows are new.
+  - 1,210 `compressed_sparse_mla_rope_cast` / `flashmla_mega` rows take this branch's re-measurement, taken after
+    the runner fixes. The re-measured value over `main`'s value is 0.83 at the median, from 0.58 at p10 to 1.16
+    at p90.
+  - Only the DeepSeek-V4.1 arch, worklet and op read that backend.
 
 ## Contribution licensing
 
