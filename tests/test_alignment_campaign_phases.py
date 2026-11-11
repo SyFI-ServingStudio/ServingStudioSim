@@ -152,6 +152,19 @@ def _write_workload_pass(case_dir: Path, *, log: str = SERVER_LOG, engine: str =
     }))
 
 
+def _finish_simulation(pack, case, case_dir: Path) -> None:
+    """What a campaign-launched simulation leaves: summary, marker, and the
+    record of the inputs it ran with."""
+    from launcher.process.markers import mark_complete
+
+    directory = case_dir / SIMULATION_PHASE
+    directory.mkdir(exist_ok=True)
+    (directory / "summary.json").write_text("{}")
+    mark_complete(directory)
+    inputs = execute.simulation_inputs(case_dir, pack.variant_of(case))
+    execute._record_simulation_inputs(case_dir, inputs)
+
+
 def _render(pack, case, out_root):
     return render_case(pack, case, check_module.host_for(pack, None), out_root, REPO_ROOT)
 
@@ -453,6 +466,9 @@ def test_calibration_reaches_extract_compare_and_record(tmp_path):
     case_dir.mkdir(parents=True)
     _write_workload_pass(case_dir)
     calibration.write(pack, case, case_dir, calibration.resolve(pack, case, case_dir))
+    # A live calibration.json alone says nothing about the simulation.
+    assert "capture_calibration" not in measure_case(case_dir).provenance
+    _finish_simulation(pack, case, case_dir)
 
     measured = measure_case(case_dir)
     captured = measured.provenance["capture_calibration"]
@@ -487,3 +503,135 @@ def test_record_refuses_a_from_capture_case_without_calibration(tmp_path, monkey
     extraction = {"cases": {key: {"available": True, "metrics": {}, "provenance": {}}}}
     with pytest.raises(compare_module.RecordRefused, match="from_capture"):
         compare_module.record(extraction, pack, accept_provisional=True)
+
+
+# ── review fixes ─────────────────────────────────────────────────────────────
+
+
+def test_a_tracked_trace_rejects_a_rate(tmp_path):
+    # req-frontend scales recorded arrivals by trace_rate/rate, the simulator
+    # by 1/rate: the same pack would replay two different loads.
+    pack = _phase1_pack(tmp_path)
+    document = yaml.safe_load((pack.root / "campaign.yaml").read_text())
+    document["cases"][-1]["rate"] = {"value": 2.0, "status": "measured",
+                                     "derived_from": "x", "evidence": "y"}
+    (pack.root / "campaign.yaml").write_text(yaml.safe_dump(document, sort_keys=False))
+    with pytest.raises(PackError, match="tracked workload_trace replays its recorded arrivals"):
+        load_pack(pack.root)
+
+
+def test_a_new_workload_pass_makes_the_simulation_stale(tmp_path, monkeypatch):
+    pack = _phase1_pack(tmp_path)
+    case = _phase1_case(pack)
+    out_root = tmp_path / "runs"
+    case_dir = _render(pack, case, out_root).directory
+    _write_workload_pass(case_dir)
+    case_dir = _render(pack, case, out_root).directory
+    _finish_simulation(pack, case, case_dir)
+    (plan,) = execute.plan_phase(pack, out_root, SIMULATION_PHASE, cases=[case])
+    assert plan.state == "complete"
+    used = measure_case(case_dir).provenance["capture_calibration"]
+    assert used["attn_gpu_memory_gb"]["value"] == EXPECTED_KV_GB
+
+    # The workload pass is re-run and lands a different pool. Before anything
+    # re-renders, the plan already sees the capture moved on.
+    _write_workload_pass(case_dir, log=SERVER_LOG.replace("80.26 GiB", "70.00 GiB"))
+    (plan,) = execute.plan_phase(pack, out_root, SIMULATION_PHASE, cases=[case])
+    assert plan.state == "ready" and plan.reasons == (execute.STALE_SIMULATION,)
+    assert "--refresh" in plan.command
+
+    # Re-rendering rewrites calibration.json and simulation.yaml; the finished
+    # simulation ran with neither, so it is not complete, and its report keeps
+    # the values it actually used.
+    _render(pack, case, out_root)
+    assert calibration.load(case_dir)["fields"]["attn_gpu_memory_gb"]["value"] == round(
+        70.0 * 1.073741824, 6
+    )
+    assert not execute.phase_complete(case_dir, pack.variant_of(case), SIMULATION_PHASE)
+    (plan,) = execute.plan_phase(pack, out_root, SIMULATION_PHASE, cases=[case])
+    assert plan.state == "ready" and "--refresh" in plan.command
+    assert measure_case(case_dir).provenance["capture_calibration"] == used
+
+    # Running it again records the new inputs.
+    _finish_simulation(pack, case, case_dir)
+    (plan,) = execute.plan_phase(pack, out_root, SIMULATION_PHASE, cases=[case])
+    assert plan.state == "complete"
+    now = measure_case(case_dir).provenance["capture_calibration"]
+    assert now["attn_gpu_memory_gb"]["value"] == round(70.0 * 1.073741824, 6)
+
+
+def test_a_simulation_without_a_record_is_complete_only_without_calibration(tmp_path):
+    from launcher.process.markers import mark_complete
+
+    pack = load_pack(BASE_PACK)
+    case = pack.cases[0]
+    case_dir = tmp_path / case.slug
+    (case_dir / SIMULATION_PHASE).mkdir(parents=True)
+    (case_dir / SIMULATION_PHASE / "summary.json").write_text("{}")
+    mark_complete(case_dir / SIMULATION_PHASE)
+    variant = pack.variant_of(case)
+    # A simulation from before the record existed still counts.
+    assert execute.phase_complete(case_dir, variant, SIMULATION_PHASE)
+    (case_dir / "calibration.json").write_text("{}")
+    assert not execute.phase_complete(case_dir, variant, SIMULATION_PHASE)
+
+
+def test_record_merges_provenance_per_case(tmp_path):
+    pack = _phase1_pack(tmp_path)
+    golden = tmp_path / "golden.json"
+    full = {
+        "roots": ["/x/full"],
+        "formulas": {"tpot": "a"},
+        "cases": {
+            "v/01_a": {"analyzer_schema": {"e2e": 1}, "reports": {"e2e": "/x/full/01_a/r.json"},
+                       "provenance": {}},
+            "p1/90_diverse_100": {"analyzer_schema": {"e2e": 1},
+                                  "reports": {"e2e": "/x/full/90/r.json"},
+                                  "provenance": {"capture_calibration": {"k": {"value": 1}}}},
+        },
+    }
+    compare_module._write_provenance(golden, full, pack, [])
+    phase1 = {
+        "roots": ["/x/p1"],
+        "formulas": {"ttft": "b"},
+        "cases": {
+            "p1/90_diverse_100": {"analyzer_schema": {"e2e": 2},
+                                  "reports": {"e2e": "/x/p1/90/r.json"},
+                                  "provenance": {"capture_calibration": {"k": {"value": 2}}}},
+        },
+    }
+    path = compare_module._write_provenance(golden, phase1, pack, [])
+    document = json.loads(path.read_text())
+    assert set(document["case_reports"]) == {"v/01_a", "p1/90_diverse_100"}
+    assert document["analyzer_schema"]["v/01_a"] == {"e2e": 1}
+    assert document["analyzer_schema"]["p1/90_diverse_100"] == {"e2e": 2}
+    assert document["case_reports"]["p1/90_diverse_100"]["e2e"] == compare_module._portable(
+        "/x/p1/90/r.json"
+    )
+    assert document["case_reports"]["v/01_a"]["e2e"] == compare_module._portable(
+        "/x/full/01_a/r.json"
+    )
+    assert document["capture_calibration"] == {"p1/90_diverse_100": {"k": {"value": 2}}}
+    assert document["formulas"] == {"tpot": "a", "ttft": "b"}
+    assert len(document["recorded_from"]) == 2
+
+
+def test_materialize_validates_draft_depth_before_writing(tmp_path):
+    pack = _phase1_pack(tmp_path)
+    case = _phase1_case(pack)
+    case_dir = _render(pack, case, tmp_path / "runs").directory
+    _write_workload_pass(case_dir)
+    # A pack whose arch says depth 3 against a depth-5 capture.
+    variant = pack.variant_of(case)
+    arch = {**variant.arch, "draft_tokens": 3}
+    worker = {**variant.worker, "draft_tokens": 3}
+    variants = {**pack.variants, variant.name: dataclasses.replace(variant, arch=arch,
+                                                                   worker=worker)}
+    broken = dataclasses.replace(pack, variants=variants)
+    from launcher.alignment_campaign.render import materialize
+
+    with pytest.raises((PackError, calibration.CalibrationError)):
+        materialize(broken, case, case_dir, REPO_ROOT)
+    assert not (case_dir / "trace_speculative.csv").exists()
+    assert not (case_dir / "calibration.json").exists()
+    assert not (case_dir / "simulation.yaml").exists()

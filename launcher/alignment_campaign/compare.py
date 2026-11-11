@@ -262,8 +262,10 @@ def record(
     uncalibrated = _missing_capture_calibration(extraction, pack)
     if uncalibrated:
         raise RecordRefused(
-            "refusing to record: these from_capture inputs have no calibration.json in the "
-            "run, so nothing says which value the simulation used — "
+            "refusing to record: these from_capture inputs have no calibration recorded "
+            "with the simulation (simulation/campaign_inputs.json, written when "
+            "`alignment-campaign run` finishes it), so nothing says which value the "
+            "simulation used — "
             + ", ".join(uncalibrated)
         )
 
@@ -379,8 +381,41 @@ def _write_provenance(
             "derived_from": multiplier.derived_from,
             "evidence": multiplier.evidence,
         }
+    document = _merge_provenance(path, document, set(extraction.get("cases", {})))
     path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
     return path
+
+
+#: Sidecar sections keyed by case. A record that covers some cases (say,
+#: `--alignment-phase 1`) replaces those cases' entries and keeps the rest,
+#: the same way the golden values merge.
+_PER_CASE_PROVENANCE = ("analyzer_schema", "case_reports", "capture_calibration")
+
+
+def _merge_provenance(
+    path: Path, document: dict[str, Any], recorded: set[str]
+) -> dict[str, Any]:
+    try:
+        existing = json.loads(path.read_text()) if path.is_file() else {}
+    except ValueError:
+        existing = {}
+    if not isinstance(existing, dict) or existing.get("pack") != document["pack"]:
+        return document
+    merged = dict(document)
+    for section in _PER_CASE_PROVENANCE:
+        kept = {
+            case_key: value
+            for case_key, value in (existing.get(section) or {}).items()
+            if case_key not in recorded
+        }
+        combined = {**kept, **document.get(section, {})}
+        if combined:
+            merged[section] = dict(sorted(combined.items()))
+    roots = list(existing.get("recorded_from") or [])
+    merged["recorded_from"] = roots + [root for root in document["recorded_from"]
+                                       if root not in roots]
+    merged["formulas"] = {**(existing.get("formulas") or {}), **document["formulas"]}
+    return merged
 
 
 # ── rendering ────────────────────────────────────────────────────────────────

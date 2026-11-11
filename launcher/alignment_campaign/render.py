@@ -655,19 +655,25 @@ def render_case(
     case_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     pending: tuple[str, ...] = ()
+    original, resolved = case, None
     if case.capture_fields:
         try:
             resolved = calibration.resolve(pack, case, case_dir)
         except (calibration.CalibrationError, OSError, ValueError, KeyError) as error:
             pending = (str(error),)
         else:
-            written.append(calibration.write(pack, case, case_dir, resolved))
             case = calibration.resolved_case(case, resolved, case_dir)
-    for name, text in case_traces(pack, case).items():
+    # Build (and so validate) everything before the first write, so a rejected
+    # capture leaves no calibration.json that no simulation.yaml matches.
+    traces = case_traces(pack, case)
+    documents = case_documents(pack, case, host, case_dir, repo_root)
+    if resolved is not None:
+        written.append(calibration.write(pack, original, case_dir, resolved))
+    for name, text in traces.items():
         target = case_dir / name
         target.write_text(text, encoding="utf-8")
         written.append(target)
-    for name, document in case_documents(pack, case, host, case_dir, repo_root).items():
+    for name, document in documents.items():
         target = case_dir / name
         target.write_text(
             yaml.safe_dump(document, sort_keys=False, default_flow_style=False),
@@ -693,13 +699,16 @@ def materialize(pack: Pack, case: Case, case_dir: Path, repo_root: Path) -> Case
     """
     case_dir = Path(case_dir)
     resolved = calibration.resolve(pack, case, case_dir)
-    calibration.write(pack, case, case_dir, resolved)
+    original = case
     case = calibration.resolved_case(case, resolved, case_dir)
+    # Build (and so validate, draft depth included) before writing anything the
+    # simulation would read, so a rejected capture leaves no half-written case.
+    document = simulation_document(pack, case, pack.variant_of(case), case_dir, repo_root)
     if case.speculative_acceptance is not None:
         (case_dir / SPECULATIVE_TRACE_NAME).write_text(
             case_traces(pack, case)[SPECULATIVE_TRACE_NAME], encoding="utf-8"
         )
-    document = simulation_document(pack, case, pack.variant_of(case), case_dir, repo_root)
+    calibration.write(pack, original, case_dir, resolved)
     (case_dir / f"{PHASE_CONFIG_STEMS[SIMULATION_PHASE]}.yaml").write_text(
         yaml.safe_dump(document, sort_keys=False, default_flow_style=False), encoding="utf-8"
     )

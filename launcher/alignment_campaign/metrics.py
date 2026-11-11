@@ -370,17 +370,21 @@ def measure_case(directory: Path, *, expected_requests: int | None = None) -> Ca
 
 
 def _capture_calibration(directory: Path) -> dict[str, Any]:
-    """The from_capture inputs this case's simulation used (`calibration.json`),
-    so the report and a recorded golden say which values and files they were."""
-    from .calibration import load
+    """The from_capture inputs this case's simulation used, so the report and a
+    recorded golden say which values and files they were.
 
-    try:
-        document = load(directory)
-    except ValueError:
-        return {"unreadable": "calibration.json is not JSON"}
-    if not document:
+    Read from the copy the campaign kept beside the simulation when it ran
+    (`simulation/campaign_inputs.json`), never from the live `calibration.json`:
+    re-rendering after a new workload pass rewrites that file, and the report
+    would then carry values the simulation never saw. A live calibration with
+    no such copy yields nothing, which `compare --record` refuses.
+    """
+    from .execute import recorded_simulation_inputs
+
+    recorded = recorded_simulation_inputs(directory)
+    if recorded is None or not isinstance(recorded.get("calibration"), dict):
         return {}
-    return dict(document.get("fields", {}))
+    return dict(recorded["calibration"].get("fields", {}))
 
 
 def _provenance(documents: dict[str, dict[str, Any]]) -> dict[str, Any]:

@@ -35,6 +35,7 @@ per-case stage state and exit codes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import shlex
 import sys
@@ -55,6 +56,10 @@ from .render import (
     config_stem,
     materialize,
     phase_names,
+)
+
+STALE_SIMULATION = (
+    "re-run: simulation.yaml or calibration.json changed since this simulation ran"
 )
 
 #: Phases that read `simulation.yaml`, so they wait for a case's from_capture
@@ -102,7 +107,8 @@ class PhasePlan:
 
     def describe(self) -> str:
         if self.state == "ready":
-            return f"  [run]      {self.case_slug}  {shlex.join(self.command)}"
+            note = f"  ({'; '.join(self.reasons)})" if self.reasons else ""
+            return f"  [run]      {self.case_slug}  {shlex.join(self.command)}{note}"
         if self.state == "complete":
             return f"  [skip]     {self.case_slug}  already complete (--refresh to re-run)"
         detail = "; ".join(self.reasons) or "unknown"
@@ -168,9 +174,75 @@ def _recorded_artifacts_exist(directory: Path, kind: str) -> bool:
     )
 
 
+#: Written into the simulation directory when a campaign-launched simulation
+#: succeeds: the sha256 of the preset and of `calibration.json` it ran with,
+#: and a copy of that calibration. Re-rendering after a new workload pass
+#: rewrites both inputs, and a simulation that read the old ones must neither
+#: count as complete nor lend its report the new calibration.
+SIMULATION_INPUTS_NAME = "campaign_inputs.json"
+
+
+def _sha256(path: Path) -> str | None:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
+def simulation_inputs(case_dir: Path, variant: Variant) -> dict:
+    """The inputs a simulation of this case would run with right now."""
+    case_dir = Path(case_dir)
+    preset = case_dir / f"{config_stem(variant, SIMULATION_PHASE)}.yaml"
+    calibration_path = case_dir / calibration.CALIBRATION_NAME
+    return {
+        "schema_version": 1,
+        "simulation_yaml_sha256": _sha256(preset),
+        "calibration_sha256": _sha256(calibration_path),
+    }
+
+
+def recorded_simulation_inputs(case_dir: Path) -> dict | None:
+    """What the campaign recorded when this case's simulation succeeded."""
+    path = Path(case_dir) / SIMULATION_PHASE / SIMULATION_INPUTS_NAME
+    if not path.is_file():
+        return None
+    try:
+        document = json.loads(path.read_text())
+    except ValueError:
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def simulation_inputs_current(case_dir: Path, variant: Variant) -> bool:
+    """Whether the simulation on disk ran with today's preset and calibration.
+
+    A case with a `calibration.json` has a preset only the campaign writes, so
+    its simulation needs the record. Any other case may have been simulated
+    before the record existed; the marker alone still speaks for it then.
+    """
+    recorded = recorded_simulation_inputs(case_dir)
+    current = simulation_inputs(case_dir, variant)
+    if recorded is None:
+        return current["calibration_sha256"] is None
+    return all(recorded.get(key) == current[key] for key in
+               ("simulation_yaml_sha256", "calibration_sha256"))
+
+
+def _record_simulation_inputs(case_dir: Path, inputs: dict) -> None:
+    document = dict(inputs)
+    calibration_path = Path(case_dir) / calibration.CALIBRATION_NAME
+    if inputs["calibration_sha256"] is not None and calibration_path.is_file():
+        snapshot = json.loads(calibration_path.read_text())
+        # Only if it is still the file that was hashed before launch.
+        if _sha256(calibration_path) == inputs["calibration_sha256"]:
+            document["calibration"] = snapshot
+    (Path(case_dir) / SIMULATION_PHASE / SIMULATION_INPUTS_NAME).write_text(
+        json.dumps(document, indent=2, sort_keys=True) + "\n"
+    )
+
+
 def phase_complete(case_dir: Path, variant: Variant, phase: str) -> bool:
     """Exit status *and* artifacts. `simulation` already carries a marker written
-    by the ordinary launcher, so the campaign reads it rather than writing it."""
+    by the ordinary launcher, so the campaign reads it rather than writing it;
+    it is complete only while its preset and calibration are the ones it ran
+    with (`simulation_inputs_current`)."""
     directory = case_dir / phase
     if not directory.is_dir():
         return False
@@ -181,7 +253,7 @@ def phase_complete(case_dir: Path, variant: Variant, phase: str) -> bool:
     if profile_pass is not None and not _recorded_artifacts_exist(directory, profile_pass.kind):
         return False
     if phase == SIMULATION_PHASE:
-        return has_marker(directory)
+        return has_marker(directory) and simulation_inputs_current(case_dir, variant)
     return has_marker(directory) or bool(artifacts)
 
 
@@ -322,9 +394,23 @@ def plan_phase(
                 )
             )
             continue
-        if not refresh and phase_complete(case_dir, variant, phase):
+        if (
+            not refresh
+            and phase_complete(case_dir, variant, phase)
+            and not _capture_moved_on(pack, case, case_dir, phase)
+        ):
             plans.append(PhasePlan(case.slug, phase, case_dir, "complete"))
             continue
+        # A finished simulation whose preset or calibration has changed since:
+        # the launcher would skip it on its own marker, so it is re-run.
+        stale = (
+            phase == SIMULATION_PHASE
+            and has_marker(case_dir / phase)
+            and (
+                not simulation_inputs_current(case_dir, variant)
+                or _capture_moved_on(pack, case, case_dir, phase)
+            )
+        )
         blockers = phase_requirements(case_dir, variant, phase, pack=pack, case=case)
         if blockers:
             plans.append(PhasePlan(case.slug, phase, case_dir, "blocked", tuple(blockers)))
@@ -335,19 +421,32 @@ def plan_phase(
                 phase,
                 case_dir,
                 "ready",
-                (),
+                (STALE_SIMULATION,) if stale else (),
                 phase_command(
                     case_dir,
                     variant,
                     phase,
                     resume=resume,
-                    refresh=refresh,
+                    refresh=refresh or stale,
                     runtime=runtime,
                     allow_autotune=allow_autotune,
                 ),
             )
         )
     return tuple(plans)
+
+
+def _capture_moved_on(pack: Pack, case: Case, case_dir: Path, phase: str) -> bool:
+    """A re-run workload pass now resolves to inputs other than the
+    `calibration.json` the simulation used, though nothing re-rendered yet."""
+    if phase != SIMULATION_PHASE or not case.capture_fields:
+        return False
+    try:
+        current = calibration.resolve(pack, case, case_dir)
+        written = calibration.load(case_dir)
+    except (calibration.CalibrationError, OSError, ValueError, KeyError):
+        return False
+    return written is None or written.get("fields") != json.loads(json.dumps(current))
 
 
 def describe_plan(phase: str, plans: tuple[PhasePlan, ...]) -> str:
@@ -399,10 +498,16 @@ async def _run_one(
         slot = scheduler.simulation_slot() if uses_simulation_slot else scheduler.analysis_slot()
         async with slot:
             async with leases.run_directory(plan.directory):
-                if refresh and directory.is_dir():
+                if (refresh or STALE_SIMULATION in plan.reasons) and directory.is_dir():
                     clear_marker(directory)
+                inputs = None
+                if plan.phase == SIMULATION_PHASE:
+                    (directory / SIMULATION_INPUTS_NAME).unlink(missing_ok=True)
+                    inputs = simulation_inputs(plan.directory, variant)
                 journal.update(plan.phase, StageState.RUNNING, spec=spec)
                 result = await _PROCESS_SUPERVISOR.run(spec)
+                if result.succeeded and inputs is not None and directory.is_dir():
+                    _record_simulation_inputs(plan.directory, inputs)
                 journal.update(plan.phase, StageState.EXITED, spec=spec, result=result)
 
         # Resource release is part of the attempt. Publish no terminal state or

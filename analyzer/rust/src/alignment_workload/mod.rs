@@ -315,20 +315,28 @@ fn fold_data_parallel_ranks(
         .iter()
         .all(|record| record.observed_start_monotonic_ns.is_some())
         && records.iter().all(|record| record.dp_rank.is_some());
+    let ranks: std::collections::HashSet<_> = records.iter().map(|record| record.dp_rank).collect();
     if observed {
-        fold_by_wall_clock(records)
-    } else {
-        let ranks: std::collections::HashSet<_> =
-            records.iter().map(|record| record.dp_rank).collect();
-        let method = if ranks.len() > 1 {
-            "iteration_index"
-        } else {
-            "single_rank"
-        };
+        // One rank passes through the same path (it only sorts by start), but
+        // nothing was paired, so the report says so.
+        let (steps, mut fold) = fold_by_wall_clock(records)?;
+        if ranks.len() == 1 {
+            fold.method = "single_rank";
+        }
+        Ok((steps, fold))
+    } else if ranks.len() <= 1 {
         Ok((
             fold_by_iteration_index(records)?,
             FoldStats {
-                method,
+                method: "single_rank",
+                ..FoldStats::default()
+            },
+        ))
+    } else {
+        Ok((
+            fold_by_iteration_index(records)?,
+            FoldStats {
+                method: "iteration_index",
                 ..FoldStats::default()
             },
         ))
@@ -421,6 +429,12 @@ fn observed_window(record: &FullMeasuredMetrics) -> (u64, u64) {
 /// Refusing them withheld the subject; dropping them would lose scheduled work.
 /// A later peer record overlapping such a step merges into it like any other.
 ///
+/// Steps are kept in ANCHOR order: a reference step's own start, or a
+/// peer-only step's own start. A merged peer can start before an earlier
+/// step's anchor (it overlapped the later step more), so the merged unions
+/// are not sorted by start; they are used only to test overlap, and the span
+/// that bounds the ragged ends below is the union of all steps so far.
+///
 /// The two RAGGED ENDS are a different thing and are dropped with a count. Data
 /// parallel ranks do not start or retire on the same step: in the GLM-5.2 DP8
 /// run the ranks began 0.0-1.6 s apart and ran 6154..6159 iterations each, so
@@ -445,12 +459,22 @@ fn fold_by_wall_clock(
         .partition(|record| record.dp_rank == Some(reference_rank));
     let mut steps: Vec<FullMeasuredMetrics> = reference_records;
     steps.sort_by_key(|record| observed_window(record).0);
+    // Each step keeps its own ANCHOR: the reference record's start, or a
+    // peer-only step's own start. Steps stay sorted by anchor, which is what
+    // the insertion point and the cursor rely on. The merged union (`windows`)
+    // is only for overlap tests: a merged peer can pull a union's start before
+    // an earlier step's anchor, so unions are not sorted by start.
+    let mut anchors: Vec<u64> = steps.iter().map(|step| observed_window(step).0).collect();
     let mut windows: Vec<(u64, u64)> = steps.iter().map(observed_window).collect();
+    // How far any union starts before its anchor: a window that overlaps a peer
+    // ending at `peer_end` has `anchor < peer_end + lead`.
+    let mut lead = 0u64;
 
     let mut peers = peer_records;
     peers.sort_by_key(|record| observed_window(record).0);
-    // The reference's own span. Anything wholly outside it is a ragged end.
-    let (span_start, span_end) = match (windows.first(), windows.last()) {
+    // The span of the steps so far (the reference's, widened by merged peers).
+    // Anything wholly outside it is a ragged end.
+    let (mut span_start, mut span_end) = match (windows.first(), windows.last()) {
         (Some(first), Some(last)) => (first.0, last.1),
         _ => bail!("reference rank {reference_rank} contributed no steps"),
     };
@@ -468,28 +492,30 @@ fn fold_by_wall_clock(
             dropped_after += 1;
             continue;
         }
-        // The step windows are sorted by start, so a peer that starts after one
-        // ends can never match it: the cursor only moves forward across the
-        // whole pass (peers are sorted by start too).
+        // Peers come in start order, and a union only grows by merging a peer
+        // that overlaps it, so a union that ended by this peer's start can
+        // match no later peer either: the cursor only moves forward.
         while cursor + 1 < windows.len() && windows[cursor].1 <= peer_start {
             cursor += 1;
         }
+        let overlap = |index: usize| {
+            windows[index]
+                .1
+                .min(peer_end)
+                .saturating_sub(windows[index].0.max(peer_start))
+        };
         let best = (cursor..windows.len())
-            .take_while(|&index| windows[index].0 < peer_end)
-            .max_by_key(|&index| {
-                windows[index]
-                    .1
-                    .min(peer_end)
-                    .saturating_sub(windows[index].0.max(peer_start))
-            })
-            .filter(|&index| windows[index].1.min(peer_end) > windows[index].0.max(peer_start));
+            .take_while(|&index| anchors[index] < peer_end.saturating_add(lead))
+            .filter(|&index| overlap(index) > 0)
+            .max_by_key(|&index| overlap(index));
         let Some(index) = best else {
             // Inside the reference's span but overlapping no step: the
             // reference rank was idle (an unrecorded dummy step), so this peer's
-            // work is a step of its own. Insert it in start order; every window
-            // before the cursor ended by an earlier peer's start, so the
-            // insertion point is at or after the cursor.
-            let position = windows.partition_point(|window| window.0 <= peer_start);
+            // work is a step of its own, anchored at its own start. Every step
+            // before the cursor ended by an earlier peer's start, so its anchor
+            // is at most this start and the insertion point is past the cursor.
+            let position = anchors.partition_point(|&anchor| anchor <= peer_start);
+            anchors.insert(position, peer_start);
             windows.insert(position, (peer_start, peer_end));
             steps.insert(position, peer);
             peer_only_steps += 1;
@@ -497,6 +523,9 @@ fn fold_by_wall_clock(
         };
         merge_rank_record(&mut steps[index], peer)?;
         windows[index] = observed_window(&steps[index]);
+        lead = lead.max(anchors[index].saturating_sub(windows[index].0));
+        span_start = span_start.min(windows[index].0);
+        span_end = span_end.max(windows[index].1);
     }
     if dropped_before + dropped_after > 0 {
         eprintln!(
@@ -990,6 +1019,51 @@ mod tests {
                 dropped_after: 0,
             }
         );
+    }
+
+    #[test]
+    fn a_merged_peer_that_starts_early_keeps_the_steps_in_anchor_order() {
+        // The reviewer's counterexample. P overlaps A by 20 and B by 170, so it
+        // joins B and pulls B's union start to 95, before A's 100. R then
+        // overlaps only B's union and must join it; Q falls in the gap between
+        // B and C and must open its own step between them, and S overlaps C.
+        let (folded, fold) = fold_data_parallel_ranks(vec![
+            ranked_record(0, 1, 1, vec![], (100, 120, 0.2)),
+            ranked_record(0, 2, 2, vec![], (130, 400, 2.7)),
+            ranked_record(0, 3, 3, vec![], (500, 600, 1.0)),
+            ranked_record(1, 7, 10, vec![], (95, 300, 2.0)),
+            ranked_record(2, 4, 20, vec![], (96, 98, 0.1)),
+            ranked_record(1, 8, 40, vec![], (410, 450, 0.4)),
+            ranked_record(2, 5, 80, vec![], (505, 590, 0.9)),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            folded
+                .iter()
+                .map(|step| (step.iteration_index, step.prefill_tokens))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (2, 32), (8, 40), (3, 83)]
+        );
+        assert_eq!(folded[1].observed_start_monotonic_ns, Some(95));
+        assert_eq!(fold.peer_only_steps, 1);
+    }
+
+    #[test]
+    fn a_single_timestamped_rank_reports_single_rank() {
+        let (folded, fold) = fold_data_parallel_ranks(vec![
+            ranked_record(0, 2, 2, vec![], (300, 400, 1.0)),
+            ranked_record(0, 1, 1, vec![], (100, 200, 1.0)),
+        ])
+        .unwrap();
+        assert_eq!(
+            folded
+                .iter()
+                .map(|step| step.iteration_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(fold.method, "single_rank");
     }
 
     #[test]

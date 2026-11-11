@@ -735,6 +735,16 @@ def _case(raw: Any, index_hint: int) -> Case:
             f"{where}: rate rescales the trace arrival timeline, which arrival_mode "
             "'saturated' discards; set one or the other"
         )
+    if case.workload_trace.tracked and case.rate is not None:
+        # The two sides read `rate` differently: req-frontend rescales recorded
+        # arrivals by trace_rate/rate, the simulator divides arrival_time by
+        # request_rate. Equal only for a 1 req/s timeline, which a recorded
+        # trace is not, so the same pack would replay two different loads.
+        raise PackError(
+            f"{where}: a tracked workload_trace replays its recorded arrivals; drop "
+            "rate (req-frontend scales by trace_rate/rate, the simulator by 1/rate, "
+            "so the two sides would run different loads)"
+        )
     if profile_mode == "trace-timed" and case.rate is None and not case.workload_trace.tracked:
         # A generated trace is a 1 req/s placeholder timeline, so it needs a
         # calibrated rate. A tracked trace carries recorded arrivals, which
