@@ -60,7 +60,7 @@ completion condition should be obvious.
 ```text
 top-add-new-arch - add a whole model architecture end to end (capture → split → build L1–L4, largest kernel first)
 ├── dev-parallelize-arch-addition - single-agent mode only: run the phases as parallel lanes: capture beside the build, one lane per kernel family and per worklet, one serial arch lane
-├── operate-run-alignment - Phase 0: capture the real vLLM/SGLang kernel sequence that drives the split (profile phase only; needs no arch)
+├── operate-run-alignment - Phase 0: capture the real vLLM/SGLang kernel sequence that drives the split (profile step only; needs no arch)
 ├── top-split-model-into-kernels - explore + break the forward into the kernel/op sequence
 ├── top-add-kernel - create each new L1 kernel (L1-Python impl-register-kernel + L1-Rust impl-wire-kernel-to-rust)
 ├── impl-compose-op - compose kernels into L2 ops
@@ -85,7 +85,7 @@ top-explore-models - understand a new model or checkpoint from HF/public sources
 
 top-split-model-into-kernels - break a model forward into the ServingStudioSim kernel sequence, ordered by measured share
 ├── top-explore-models - step 1: establish the architecture (entry above)
-├── operate-run-alignment - measured launch granularity, when no capture was supplied (profile phase only)
+├── operate-run-alignment - measured launch granularity, when no capture was supplied (profile step only)
 ├── dev-lookup-transformers-model - what math each op computes (shared)
 └── dev-explore-kernel - which callable to wrap; and, with no capture, whether a real fused kernel exists (shared)
 

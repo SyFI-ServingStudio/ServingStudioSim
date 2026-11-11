@@ -715,10 +715,11 @@ def test_dp_rank_by_device_rejects_a_device_with_no_rank_banner():
 # ---- logical step alignment -----------------------------------------------
 #
 # A data-parallel rank numbers its OWN scheduled steps. When one rank runs a
-# prefill chunk alone its peers run dummy batches that join the expert-parallel
+# prefill chunk alone its peers run dummy forwards that join the expert-parallel
 # collectives but are not scheduled iterations, so they never advance their
 # counters and the ranks stay offset for the rest of the capture. Grouping by
-# `iteration_index` then reduces kernels from steps that never coexisted.
+# `iteration_index` then reduces kernels from steps that never coexisted; the
+# schema-5 `forward_ordinal` is what names one global step on every rank.
 
 
 def _window(device_id: int, iteration: int, start: int, end: int, phase: str = "forward"):
@@ -735,23 +736,11 @@ def _window(device_id: int, iteration: int, start: int, end: int, phase: str = "
     )
 
 
-def test_steps_group_by_measured_time_not_by_iteration_index():
-    from alignment.nsys.parse import align_ranges_into_steps
+def _forwards(steps: dict[tuple[int, int], int], dummies=()):
+    """A ForwardIndex: (dp_rank, iteration) -> ordinal, and (dp_rank, ordinal) dummies."""
+    from alignment.nsys.parse import ForwardIndex
 
-    ranges = [
-        _window(0, 5, 0, 10),
-        _window(0, 6, 10, 20),
-        _window(0, 7, 20, 30),
-        # Device 1 is two steps behind on the counter but runs at the same time.
-        _window(1, 3, 1, 11),
-        _window(1, 4, 11, 21),
-        _window(1, 5, 21, 31),
-    ]
-    steps, unpaired = align_ranges_into_steps(ranges)
-
-    assert [step.iteration for step in steps] == [5, 6, 7]
-    assert [step.index_by_device for step in steps] == [{0: 5, 1: 3}, {0: 6, 1: 4}, {0: 7, 1: 5}]
-    assert unpaired == {}
+    return ForwardIndex(ordinal_by_step=dict(steps), dummies=frozenset(dummies))
 
 
 def test_single_engine_tp_steps_group_by_index_when_host_ranges_do_not_overlap():
@@ -765,13 +754,14 @@ def test_single_engine_tp_steps_group_by_index_when_host_ranges_do_not_overlap()
         _window(1, 132, 112, 113, phase="preprocess"),
     ]
 
-    steps, unpaired = align_ranges_into_steps(ranges, {0: 0, 1: 0})
+    alignment = align_ranges_into_steps(ranges, {0: 0, 1: 0})
 
-    assert [step.index_by_device for step in steps] == [
+    assert alignment.rule == "iteration_index"
+    assert [step.index_by_device for step in alignment.steps] == [
         {0: 130, 1: 130},
         {0: 131, 1: 131},
     ]
-    assert unpaired == {1: 1}
+    assert alignment.unpaired_by_device == {1: 1}
 
 
 def test_single_engine_tp_requires_the_same_phase_identity():
@@ -780,86 +770,209 @@ def test_single_engine_tp_requires_the_same_phase_identity():
     reference = _window(0, 5, 100, 110, phase="forward")
     peer = _window(1, 5, 100, 110, phase="preprocess")
 
-    steps, unpaired = align_ranges_into_steps([reference, peer], {0: 0, 1: 0})
+    alignment = align_ranges_into_steps([reference, peer], {0: 0, 1: 0})
 
-    assert [step.index_by_device for step in steps] == [{0: 5}]
-    assert unpaired == {1: 1}
+    assert [step.index_by_device for step in alignment.steps] == [{0: 5}]
+    assert alignment.unpaired_by_device == {1: 1}
 
 
-def test_multi_engine_steps_use_kernel_time_instead_of_host_submission_time():
+def test_one_device_is_its_own_step_sequence():
     from alignment.nsys.parse import align_ranges_into_steps
 
-    reference = _window(0, 5, 100, 110)
-    peer = _window(1, 3, 200, 210)
-    reference.intervals = [(1_000, 1_010)]
-    peer.intervals = [(1_001, 1_011)]
+    alignment = align_ranges_into_steps([_window(0, 6, 10, 20), _window(0, 5, 0, 10)])
 
-    steps, unpaired = align_ranges_into_steps([reference, peer], {0: 0, 1: 1})
-
-    assert [step.index_by_device for step in steps] == [{0: 5, 1: 3}]
-    assert unpaired == {}
+    assert alignment.rule == "single_device"
+    assert [step.iteration for step in alignment.steps] == [5, 6]
 
 
-def test_multi_engine_step_without_kernel_evidence_stays_unpaired():
+def test_dp_ranks_without_forward_ordinals_are_refused():
+    """Measured time does not identify a step across asynchronous schedulers:
+    a pre-schema-5 DP capture is refused, as alignment-workload refuses it."""
     from alignment.nsys.parse import align_ranges_into_steps
 
-    reference = _window(0, 5, 100, 110)
-    peer = _window(1, 3, 101, 109)
-    peer.intervals = []
+    ranges = [_window(0, 5, 0, 10), _window(1, 3, 1, 11)]
 
-    steps, unpaired = align_ranges_into_steps([reference, peer], {0: 0, 1: 1})
-
-    assert [step.index_by_device for step in steps] == [{0: 5}]
-    assert unpaired == {1: 1}
-
-
-def test_multi_engine_ambiguous_kernel_overlap_stays_unpaired():
-    from alignment.nsys.parse import align_ranges_into_steps
-
-    first = _window(0, 5, 100, 110)
-    second = _window(0, 6, 110, 120)
-    peer = _window(1, 3, 100, 120)
-    first.intervals = [(1_000, 1_010)]
-    second.intervals = [(1_010, 1_020)]
-    peer.intervals = [(1_005, 1_015)]
-
-    steps, unpaired = align_ranges_into_steps([first, second, peer], {0: 0, 1: 1})
-
-    assert [step.index_by_device for step in steps] == [{0: 5}, {0: 6}]
-    assert unpaired == {1: 1}
+    with pytest.raises(ValueError, match="predates forward ordinals"):
+        align_ranges_into_steps(ranges, {0: 0, 1: 1})
+    with pytest.raises(ValueError, match="predates forward ordinals"):
+        align_ranges_into_steps(ranges, {0: 0, 1: 1}, _forwards({}))
+    with pytest.raises(ValueError, match="no device-to-DP-rank mapping"):
+        align_ranges_into_steps(ranges)
 
 
-def test_a_step_only_one_rank_ran_keeps_that_rank_and_names_the_absent_ones():
+def test_steps_are_the_union_of_the_ranks_forwards():
+    """Every forward with real work on any rank is a step.
+
+    Device 0 ran forward 1 as a dummy (no NVTX window) while device 1 ran its
+    iteration 4: that forward is a step of device 1 alone, with rank 0 named
+    as a dummy, not a peer window dropped for lack of a reference counterpart.
+    Kernel time would have paired device 1's iteration 3 with device 0's 6.
+    """
     from alignment.nsys.parse import align_ranges_into_steps
 
     ranges = [
-        # Device 0 alone for the first two steps — the prefill chunks.
-        _window(0, 8, 0, 100),
-        _window(0, 9, 100, 200),
-        _window(0, 10, 200, 210),
-        _window(1, 8, 201, 211),
+        _window(0, 5, 0, 10),
+        _window(0, 6, 20, 30),
+        _window(1, 3, 21, 31),
+        _window(1, 4, 40, 50),
+        _window(1, 5, 60, 70),
     ]
-    steps, _ = align_ranges_into_steps(ranges)
+    forwards = _forwards(
+        {(0, 5): 0, (0, 6): 2, (1, 3): 0, (1, 4): 1, (1, 5): 2}, dummies={(0, 1)}
+    )
 
-    assert [step.index_by_device for step in steps] == [{0: 8}, {0: 9}, {0: 10, 1: 8}]
+    alignment = align_ranges_into_steps(ranges, {0: 0, 1: 1}, forwards)
+
+    assert alignment.rule == "forward_ordinal"
+    assert [step.iteration for step in alignment.steps] == [0, 1, 2]
+    assert [step.index_by_device for step in alignment.steps] == [
+        {0: 5, 1: 3},
+        {1: 4},
+        {0: 6, 1: 5},
+    ]
+    assert [step.dummy_dp_ranks for step in alignment.steps] == [[], [0], []]
+    assert alignment.unpaired_by_device == {}
+    assert alignment.incomplete_steps == 0
+
+    rank_metrics = {
+        (rank, iteration): {
+            "input_adapter": "vllm_text", "dp_rank": rank, "forward_ordinal": ordinal, **work
+        }
+        for (rank, iteration), ordinal, work in [
+            ((0, 5), 0, {"prefill_tokens": 8}),
+            ((0, 6), 2, {"decode_requests": 2}),
+            ((1, 3), 0, {"decode_requests": 1}),
+            ((1, 4), 1, {"prefill_tokens": 16}),
+            ((1, 5), 2, {"decode_requests": 3}),
+        ]
+    }
+    name_ids, _ = build_kernel_name_index(ranges)
+    details = build_iteration_details(
+        ranges, {}, name_ids, rank_metrics, {0: 0, 1: 1}, alignment=alignment
+    )
+    assert [detail["iteration"] for detail in details] == [0, 1, 2]
+    assert [detail["forward_ordinal"] for detail in details] == [0, 1, 2]
+    assert details[1]["dummy_dp_ranks"] == [0]
+    assert details[1]["devices_absent"] == [0]
+    assert details[1]["iteration_index_by_device"] == {"1": 4}
+    # The dummy rank contributes no scheduled work: the step is rank 1's batch.
+    assert details[1]["metrics"]["prefill_tokens"] == 16
+    assert details[1]["metrics"]["dp_ranks"] == [1]
+    assert list(details[1]["metrics_by_dp_rank"]) == ["1"]
+
+
+def test_a_window_without_an_ordinal_that_ran_a_forward_is_an_error():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    ranges = [_window(0, 5, 0, 10), _window(1, 3, 1, 11)]
+
+    with pytest.raises(ValueError, match=r"dp_rank 1 ran iteration 3 .* no forward_ordinal"):
+        align_ranges_into_steps(ranges, {0: 0, 1: 1}, _forwards({(0, 5): 0}))
+
+
+@pytest.mark.parametrize("mode", ["phases", "envelope"])
+def test_a_zero_token_step_window_is_skipped_and_counted(mode):
+    """A 0-token step takes an iteration index and the V1 runner still opens
+    its `preprocess` scope, but no forward runs and no record is written."""
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    zero_token = _window(1, 4, 15, 16, phase="preprocess")
+    if mode == "envelope":
+        zero_token.phase = "iteration_envelope"
+        zero_token.intervals, zero_token.kernel_count = [], 0
+    ranges = [_window(0, 5, 0, 10), _window(1, 3, 1, 11), zero_token, _window(1, 5, 21, 31)]
+    ranges.append(_window(0, 6, 20, 30))
+    forwards = _forwards({(0, 5): 0, (1, 3): 0, (0, 6): 1, (1, 5): 1})
+
+    alignment = align_ranges_into_steps(ranges, {0: 0, 1: 1}, forwards)
+
+    assert [step.index_by_device for step in alignment.steps] == [{0: 5, 1: 3}, {0: 6, 1: 5}]
+    assert alignment.zero_token_windows_by_device == {1: 1}
+
+
+def test_a_missing_peer_window_at_the_capture_edge_drops_the_step():
+    """The bounded capture cuts ranks at different forwards. A forward whose
+    real work on some rank fell outside that rank's captured windows is not a
+    whole step; it is dropped and counted. Inside a rank's captured windows a
+    missing one is lost evidence and an error."""
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    forwards = _forwards({(0, 10): 0, (0, 11): 1, (0, 12): 2, (1, 3): 0, (1, 4): 1, (1, 5): 2})
+    # Device 1's first captured window is forward 1; its forward 0 began before
+    # the capture.
+    edge = [
+        _window(0, 10, 0, 10),
+        _window(0, 11, 20, 30),
+        _window(0, 12, 40, 50),
+        _window(1, 4, 21, 31),
+        _window(1, 5, 41, 51),
+    ]
+    alignment = align_ranges_into_steps(edge, {0: 0, 1: 1}, forwards)
+    assert [step.iteration for step in alignment.steps] == [1, 2]
+    assert alignment.incomplete_steps == 1
+
+    interior = [row for row in edge if row.iteration != 4] + [_window(1, 3, 1, 11)]
+    with pytest.raises(ValueError, match=r"forward 1: device 1 \(dp_rank 1\) ran its iteration 4"):
+        align_ranges_into_steps(interior, {0: 0, 1: 1}, forwards)
+
+
+def test_dp_by_tp_joins_each_ranks_devices_by_its_ordinals():
+    """Two DP ranks of two TP devices each: a rank's devices share its local
+    index, the ranks join by ordinal, and each rank's batch folds once."""
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    ranges = [
+        _window(0, 7, 0, 10),
+        _window(1, 7, 2, 12),
+        _window(2, 2, 1, 11),
+        _window(3, 2, 3, 13),
+        # Forward 1: rank 0 alone; rank 1 (devices 2 and 3) ran a dummy.
+        _window(0, 8, 20, 30),
+        _window(1, 8, 21, 31),
+    ]
+    dp_rank_by_device = {0: 0, 1: 0, 2: 1, 3: 1}
+    forwards = _forwards({(0, 7): 0, (1, 2): 0, (0, 8): 1}, dummies={(1, 1)})
+    rank_metrics = {
+        (0, 7): json.loads(_metrics_line(0, 7, prefill_tokens=100, decode_kv_lens=[])),
+        (1, 2): json.loads(_metrics_line(1, 2, prefill_tokens=0, decode_kv_lens=[9, 11])),
+        (0, 8): json.loads(_metrics_line(0, 8, prefill_tokens=0, decode_kv_lens=[5])),
+    }
+
+    alignment = align_ranges_into_steps(ranges, dp_rank_by_device, forwards)
+    assert [step.index_by_device for step in alignment.steps] == [
+        {0: 7, 1: 7, 2: 2, 3: 2},
+        {0: 8, 1: 8},
+    ]
+    assert [step.dummy_dp_ranks for step in alignment.steps] == [[], [1]]
 
     name_ids, _ = build_kernel_name_index(ranges)
-    details = build_iteration_details(ranges, {}, name_ids, {}, {0: 0, 1: 1})
-    assert [detail["devices_absent"] for detail in details] == [[1], [1], []]
-    assert details[0]["iteration_index_by_device"] == {"0": 8}
-    assert details[2]["iteration_index_by_device"] == {"0": 10, "1": 8}
+    first, second = build_iteration_details(
+        ranges, {}, name_ids, rank_metrics, dp_rank_by_device, alignment=alignment
+    )
+    assert first["metrics"]["prefill_tokens"] == 100
+    assert first["metrics"]["decode_kv_lens"] == [9, 11]
+    assert first["metrics"]["dp_ranks"] == [0, 1]
+    assert second["metrics"]["dp_ranks"] == [0]
+    assert second["devices_absent"] == [2, 3]
 
 
 def test_each_range_carries_its_own_index_and_its_own_ranks_metrics():
-    from alignment.nsys.parse import align_ranges_into_steps  # noqa: F401
-
     ranges = [_window(0, 5, 0, 10), _window(1, 3, 1, 11)]
     rank_metrics = {
-        (0, 5): {"input_adapter": "vllm_text", "prefill_tokens": 8189, "decode_requests": 3},
-        (1, 3): {"input_adapter": "vllm_text", "prefill_tokens": 0, "decode_requests": 7},
-        # The peer's row under the STEP's id belongs to a different step and must
-        # not be picked up.
-        (1, 5): {"input_adapter": "vllm_text", "prefill_tokens": 0, "decode_requests": 99},
+        (0, 5): {
+            "input_adapter": "vllm_text", "prefill_tokens": 8189, "decode_requests": 3,
+            "forward_ordinal": 0,
+        },
+        (1, 3): {
+            "input_adapter": "vllm_text", "prefill_tokens": 0, "decode_requests": 7,
+            "forward_ordinal": 0,
+        },
+        # The peer's row under the reference's index belongs to a different
+        # step and must not be picked up.
+        (1, 5): {
+            "input_adapter": "vllm_text", "prefill_tokens": 0, "decode_requests": 99,
+            "forward_ordinal": 2,
+        },
     }
     name_ids, _ = build_kernel_name_index(ranges)
     (detail,) = build_iteration_details(ranges, {}, name_ids, rank_metrics, {0: 0, 1: 1})
@@ -895,29 +1008,8 @@ def test_tensor_parallel_devices_state_one_shared_scheduler_batch():
     assert detail["metrics"]["decode_kv_lens"] == [7]
     assert detail["metrics"]["dp_ranks"] == [0]
     assert list(detail["metrics_by_dp_rank"]) == ["0"]
-
-
-def test_dp_batches_fold_once_each_even_when_each_has_multiple_tp_devices():
-    ranges = [_window(device_id, 5 if device_id < 2 else 3, 0, 10) for device_id in range(4)]
-    rank_metrics = {
-        (0, 5): json.loads(_metrics_line(0, 5, prefill_tokens=100, decode_kv_lens=[])),
-        (1, 3): json.loads(_metrics_line(1, 3, prefill_tokens=0, decode_kv_lens=[9, 11])),
-    }
-    name_ids, _ = build_kernel_name_index(ranges)
-
-    (detail,) = build_iteration_details(
-        ranges,
-        {},
-        name_ids,
-        rank_metrics,
-        {0: 0, 1: 0, 2: 1, 3: 1},
-    )
-
-    assert detail["metrics"]["prefill_tokens"] == 100
-    assert detail["metrics"]["decode_requests"] == 2
-    assert detail["metrics"]["decode_kv_lens"] == [9, 11]
-    assert detail["metrics"]["dp_ranks"] == [0, 1]
-    assert list(detail["metrics_by_dp_rank"]) == ["0", "1"]
+    assert detail["forward_ordinal"] is None
+    assert detail["dummy_dp_ranks"] == []
 
 
 def test_one_dp_rank_cannot_name_two_iterations_in_one_measured_step():
@@ -943,19 +1035,150 @@ def test_tp_iteration_disagreement_is_rejected_even_when_one_metric_row_is_missi
         )
 
 
-def test_a_peer_step_with_no_reference_counterpart_is_counted_not_dropped():
-    from alignment.nsys.parse import align_ranges_into_steps
+def test_metrics_keep_dummy_forwards_apart_from_scheduled_steps(tmp_path):
+    from alignment.nsys.parse import load_metrics_and_dummies
 
-    ranges = [
-        _window(0, 5, 100, 110),
-        # Device 1 ran a step before the reference's window opens at all.
-        _window(1, 1, 0, 10),
-        _window(1, 2, 101, 111),
+    real = json.loads(_metrics_line(1, 4, prefill_tokens=8, decode_kv_lens=[]))
+    real.update(schema_version=5, forward_ordinal=0, is_dummy=False)
+    dummy = {"schema_version": 5, "iteration_index": None, "forward_ordinal": 1,
+             "is_dummy": True, "dp_rank": 1}
+    path = tmp_path / "metrics.jsonl"
+    path.write_text(json.dumps(real) + "\n" + json.dumps(dummy) + "\n")
+
+    rows, dummies = load_metrics_and_dummies(path)
+
+    assert set(rows) == {(1, 4)}
+    assert dummies == {(1, 1)}
+    assert load_metrics(path) == rows
+    path.write_text(json.dumps({**real, "iteration_index": None}) + "\n")
+    with pytest.raises(ValueError, match="neither a scheduled step"):
+        load_metrics(path)
+
+
+def _dp_capture(path: Path) -> None:
+    """Two DP ranks on devices 0 and 1, one kernel per forward range.
+
+    Rank 0: iteration 10 (forward 0), a dummy (forward 1), iteration 11
+    (forward 2), and a 0-token step 12 whose only scope is `preprocess`.
+    Rank 1: iterations 3, 4, 5 (forwards 0, 1, 2).
+    """
+    con = sqlite3.connect(str(path))
+    con.executescript(
+        """
+        CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT);
+        CREATE TABLE PROCESSES (globalPid INTEGER, pid INTEGER, name TEXT);
+        CREATE TABLE NVTX_EVENTS (
+            start INTEGER, end INTEGER, globalTid INTEGER, text TEXT, textId INTEGER
+        );
+        CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (
+            globalPid INTEGER, deviceId INTEGER, correlationId INTEGER, start INTEGER,
+            end INTEGER, demangledName INTEGER, streamId INTEGER
+        );
+        CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (
+            globalTid INTEGER, start INTEGER, end INTEGER, nameId INTEGER, correlationId INTEGER
+        );
+        INSERT INTO StringIds VALUES (1, 'cudaLaunchKernel_v7000');
+        INSERT INTO StringIds VALUES (2, 'gemm_kernel');
+        """
+    )
+    pids = {0: (1 << 24, 7), 1: (2 << 24, 8)}
+    for device, (global_pid, pid) in pids.items():
+        con.execute(
+            "INSERT INTO PROCESSES VALUES (?, ?, ?)", (global_pid, pid, f"VLLM::Worker{device}")
+        )
+    windows = {0: [(10, 0), (11, 200), (12, 300, "preprocess")], 1: [(3, 0), (4, 100), (5, 200)]}
+    correlation = 0
+    for device, rows in windows.items():
+        global_pid, pid = pids[device]
+        tid = global_pid + pid
+        for iteration, start, *phase in rows:
+            phase = phase[0] if phase else "forward"
+            con.execute(
+                "INSERT INTO NVTX_EVENTS VALUES (?, ?, ?, ?, NULL)",
+                (start, start + 50, tid, f"vllm_iteration({iteration}): {phase}"),
+            )
+            if phase != "forward":
+                continue
+            correlation += 1
+            con.execute(
+                "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (?, ?, ?, 1, ?)",
+                (tid, start + 1, start + 2, correlation),
+            )
+            con.execute(
+                "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?, ?, ?, ?, 2, 7)",
+                (global_pid, device, correlation, start + 10, start + 40),
+            )
+    con.commit()
+    con.close()
+
+
+def test_parse_trace_joins_dp_ranks_by_forward_ordinal(tmp_path):
+    from alignment.nsys.parse import parse_trace
+
+    sqlite_path = tmp_path / "capture.sqlite"
+    _dp_capture(sqlite_path)
+
+    def record(dp_rank, ordinal, iteration):
+        row = {
+            "schema_version": 5, "input_adapter": "vllm_text", "iteration_index": iteration,
+            "forward_ordinal": ordinal, "is_dummy": iteration is None, "dp_rank": dp_rank,
+            "max_forwards_in_flight": 2, "prefill_tokens": 0 if iteration is None else 4,
+            "decode_requests": 0, "decode_tokens_scheduled": 0,
+            "prefill_chunk_pairs": [] if iteration is None else [[0, 4]],
+            "decode_kv_lens": [],
+        }
+        return json.dumps(row)
+
+    metrics_path = tmp_path / "metrics.jsonl"
+    metrics_path.write_text(
+        "\n".join(
+            [
+                record(0, 0, 10), record(1, 0, 3),
+                record(0, 1, None), record(1, 1, 4),
+                record(0, 2, 11), record(1, 2, 5),
+            ]
+        )
+        + "\n"
+    )
+
+    parsed = parse_trace(sqlite_path, metrics_path, dp_rank_by_device={0: 0, 1: 1})
+
+    assert parsed["step_alignment"] == {
+        "rule": "forward_ordinal",
+        "reference_device_id": 0,
+        "steps": 3,
+        "unpaired_steps_by_device": {},
+        "zero_token_windows_by_device": {"0": 1},
+        "incomplete_steps": 0,
+    }
+    assert parsed["iterations"] == [0, 1, 2]
+    details = parsed["iteration_details"]
+    assert [detail["iteration_index_by_device"] for detail in details] == [
+        {"0": 10, "1": 3},
+        {"1": 4},
+        {"0": 11, "1": 5},
     ]
-    steps, unpaired = align_ranges_into_steps(ranges)
+    assert details[1]["dummy_dp_ranks"] == [0]
+    assert details[1]["metrics"]["prefill_tokens"] == 4
 
-    assert [step.index_by_device for step in steps] == [{0: 5, 1: 2}]
-    assert unpaired == {1: 1}
+    # A window ordinal bound on the reference rank selects the same forwards on
+    # every rank: reference iteration 11 is forward 2.
+    windowed = parse_trace(sqlite_path, metrics_path, 11, 11, dp_rank_by_device={0: 0, 1: 1})
+    assert [d["iteration_index_by_device"] for d in windowed["iteration_details"]] == [
+        {"0": 11, "1": 5}
+    ]
+
+    # The same capture without ordinals cannot be joined and is refused.
+    legacy = tmp_path / "legacy.jsonl"
+    legacy.write_text(
+        "\n".join(
+            _metrics_line(rank, iteration, 4, [])
+            for rank, iteration in [(0, 10), (1, 3), (1, 4), (0, 11), (1, 5)]
+        )
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="predates forward ordinals"):
+        parse_trace(sqlite_path, legacy, dp_rank_by_device={0: 0, 1: 1})
 
 
 def test_the_window_follows_the_reference_rank_and_peers_join_by_time():

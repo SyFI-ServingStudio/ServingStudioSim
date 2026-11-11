@@ -28,11 +28,7 @@ variants:
       chunk_size: 2048
       max_cudagraph_capture_size: 2048
       enable_server_load_tracking: true
-      extra_args:
-      - --enable-expert-parallel
-      - --no-enable-eplb
-      - --limit-mm-per-prompt
-      - '{"image":0,"audio":0}'
+      extra_args: [--enable-expert-parallel, --no-enable-eplb, --limit-mm-per-prompt, '{"image":0,"audio":0}']
     arch:
       type: inkling_vllm_nvfp4_rel_attn_moe
       model_config: model/config/inkling_nvfp4.json
@@ -41,154 +37,14 @@ variants:
       enable_expert_parallel: true
       routing: corpus
       token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@a6959f415133a183260ecba335fbdb0fb12c3db8/inkling_nvfp4/vllm/diverse_100/capture/20261009/manifest.json
-      cudagraph_capture_sizes:
-      - 1
-      - 2
-      - 4
-      - 8
-      - 16
-      - 24
-      - 32
-      - 40
-      - 48
-      - 56
-      - 64
-      - 72
-      - 80
-      - 88
-      - 96
-      - 104
-      - 112
-      - 120
-      - 128
-      - 136
-      - 144
-      - 152
-      - 160
-      - 168
-      - 176
-      - 184
-      - 192
-      - 200
-      - 208
-      - 216
-      - 224
-      - 232
-      - 240
-      - 248
-      - 256
-      - 272
-      - 288
-      - 304
-      - 320
-      - 336
-      - 352
-      - 368
-      - 384
-      - 400
-      - 416
-      - 432
-      - 448
-      - 464
-      - 480
-      - 496
-      - 512
-      - 528
-      - 544
-      - 560
-      - 576
-      - 592
-      - 608
-      - 624
-      - 640
-      - 656
-      - 672
-      - 688
-      - 704
-      - 720
-      - 736
-      - 752
-      - 768
-      - 784
-      - 800
-      - 816
-      - 832
-      - 848
-      - 864
-      - 880
-      - 896
-      - 912
-      - 928
-      - 944
-      - 960
-      - 976
-      - 992
-      - 1008
-      - 1024
-      - 1040
-      - 1056
-      - 1072
-      - 1088
-      - 1104
-      - 1120
-      - 1136
-      - 1152
-      - 1168
-      - 1184
-      - 1200
-      - 1216
-      - 1232
-      - 1248
-      - 1264
-      - 1280
-      - 1296
-      - 1312
-      - 1328
-      - 1344
-      - 1360
-      - 1376
-      - 1392
-      - 1408
-      - 1424
-      - 1440
-      - 1456
-      - 1472
-      - 1488
-      - 1504
-      - 1520
-      - 1536
-      - 1552
-      - 1568
-      - 1584
-      - 1600
-      - 1616
-      - 1632
-      - 1648
-      - 1664
-      - 1680
-      - 1696
-      - 1712
-      - 1728
-      - 1744
-      - 1760
-      - 1776
-      - 1792
-      - 1808
-      - 1824
-      - 1840
-      - 1856
-      - 1872
-      - 1888
-      - 1904
-      - 1920
-      - 1936
-      - 1952
-      - 1968
-      - 1984
-      - 2000
-      - 2016
-      - 2032
-      - 2048
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136,
+        144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352,
+        368, 384, 400, 416, 432, 448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640, 656, 672, 688,
+        704, 720, 736, 752, 768, 784, 800, 816, 832, 848, 864, 880, 896, 912, 928, 944, 960, 976, 992, 1008, 1024,
+        1040, 1056, 1072, 1088, 1104, 1120, 1136, 1152, 1168, 1184, 1200, 1216, 1232, 1248, 1264, 1280, 1296, 1312,
+        1328, 1344, 1360, 1376, 1392, 1408, 1424, 1440, 1456, 1472, 1488, 1504, 1520, 1536, 1552, 1568, 1584, 1600,
+        1616, 1632, 1648, 1664, 1680, 1696, 1712, 1728, 1744, 1760, 1776, 1792, 1808, 1824, 1840, 1856, 1872, 1888,
+        1904, 1920, 1936, 1952, 1968, 1984, 2000, 2016, 2032, 2048]
     worker:
       type: chunked_prefill
       max_batch_tokens: 2048
@@ -210,9 +66,7 @@ cases:
   name: micro_throughput_c256
   variant: tp8_ep8
   purpose: Maximum request batching and scheduler pressure.
-  coverage:
-  - batching
-  - scheduler_pressure
+  coverage: [batching, scheduler_pressure]
   max_model_len: 8192
   max_concurrency: 256
   profile_arrival_mode: saturated
@@ -222,15 +76,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/01_micro_throughput_c256.csv
-    shapes:
-    - - 16
-      - 16
-    - - 32
-      - 32
-    - - 64
-      - 64
-    - - 128
-      - 64
+    shapes: [[16, 16], [32, 32], [64, 64], [128, 64]]
     repeats: 256
   attn_gpu_memory_gb:
     value: 79.2958
@@ -241,9 +87,7 @@ cases:
   name: graph_boundaries_c128
   variant: tp8_ep8
   purpose: CUDA graph and small-batch kernel boundaries.
-  coverage:
-  - cuda_graph_boundaries
-  - small_batch
+  coverage: [cuda_graph_boundaries, small_batch]
   max_model_len: 8192
   max_concurrency: 128
   profile_arrival_mode: saturated
@@ -251,34 +95,11 @@ cases:
   gpu_memory_utilization: 0.85
   capture_seconds: 15.0
   device_role: primary
-  analyze_iterations:
-  - 0
-  - 239
+  analyze_iterations: [0, 239]
   workload_trace:
     file: traces/02_graph_boundaries_c128.csv
-    shapes:
-    - - 1
-      - 32
-    - - 15
-      - 32
-    - - 16
-      - 32
-    - - 31
-      - 32
-    - - 32
-      - 32
-    - - 63
-      - 64
-    - - 64
-      - 64
-    - - 127
-      - 64
-    - - 128
-      - 64
-    - - 255
-      - 64
-    - - 256
-      - 64
+    shapes: [[1, 32], [15, 32], [16, 32], [31, 32], [32, 32], [63, 64], [64, 64], [127, 64], [128, 64], [255, 64],
+      [256, 64]]
     repeats: 48
   attn_gpu_memory_gb:
     value: 79.2958
@@ -289,8 +110,7 @@ cases:
   name: balanced_anchor_c32
   variant: tp8_ep8
   purpose: Comparable extension of the existing c32 anchor.
-  coverage:
-  - balanced_anchor
+  coverage: [balanced_anchor]
   max_model_len: 8192
   max_concurrency: 32
   profile_arrival_mode: saturated
@@ -300,23 +120,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/03_balanced_anchor_c32.csv
-    shapes:
-    - - 256
-      - 128
-    - - 256
-      - 256
-    - - 1024
-      - 128
-    - - 1024
-      - 256
-    - - 2048
-      - 128
-    - - 2048
-      - 256
-    - - 4096
-      - 128
-    - - 4096
-      - 256
+    shapes: [[256, 128], [256, 256], [1024, 128], [1024, 256], [2048, 128], [2048, 256], [4096, 128], [4096, 256]]
     repeats: 16
   attn_gpu_memory_gb:
     value: 79.2958
@@ -327,9 +131,7 @@ cases:
   name: prefill_spectrum_c32
   variant: tp8_ep8
   purpose: Prefill scaling and the 2048-token chunk boundary.
-  coverage:
-  - prefill_scaling
-  - chunk_boundary
+  coverage: [prefill_scaling, chunk_boundary]
   max_model_len: 8192
   max_concurrency: 32
   profile_arrival_mode: saturated
@@ -339,23 +141,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/04_prefill_spectrum_c32.csv
-    shapes:
-    - - 128
-      - 64
-    - - 512
-      - 64
-    - - 1984
-      - 64
-    - - 2048
-      - 64
-    - - 2112
-      - 64
-    - - 4096
-      - 64
-    - - 6144
-      - 64
-    - - 7168
-      - 64
+    shapes: [[128, 64], [512, 64], [1984, 64], [2048, 64], [2112, 64], [4096, 64], [6144, 64], [7168, 64]]
     repeats: 16
   attn_gpu_memory_gb:
     value: 79.2958
@@ -366,9 +152,7 @@ cases:
   name: decode_spectrum_c64
   variant: tp8_ep8
   purpose: Decode residence, KV growth, and batch contraction.
-  coverage:
-  - decode_residence
-  - kv_growth
+  coverage: [decode_residence, kv_growth]
   max_model_len: 8192
   max_concurrency: 64
   profile_arrival_mode: saturated
@@ -378,23 +162,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/05_decode_spectrum_c64.csv
-    shapes:
-    - - 128
-      - 16
-    - - 128
-      - 128
-    - - 128
-      - 512
-    - - 128
-      - 1024
-    - - 128
-      - 2048
-    - - 128
-      - 4096
-    - - 512
-      - 2048
-    - - 1024
-      - 4096
+    shapes: [[128, 16], [128, 128], [128, 512], [128, 1024], [128, 2048], [128, 4096], [512, 2048], [1024, 4096]]
     repeats: 16
   attn_gpu_memory_gb:
     value: 79.2958
@@ -405,9 +173,7 @@ cases:
   name: long_long_c8
   variant: tp8_ep8
   purpose: Long-prefill plus long-decode interaction near context capacity.
-  coverage:
-  - long_prefill
-  - long_decode
+  coverage: [long_prefill, long_decode]
   max_model_len: 8192
   max_concurrency: 8
   profile_arrival_mode: saturated
@@ -417,17 +183,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/06_long_long_c8.csv
-    shapes:
-    - - 2048
-      - 4096
-    - - 3072
-      - 3072
-    - - 4096
-      - 3968
-    - - 5120
-      - 2944
-    - - 6144
-      - 1920
+    shapes: [[2048, 4096], [3072, 3072], [4096, 3968], [5120, 2944], [6144, 1920]]
     repeats: 7
   attn_gpu_memory_gb:
     value: 79.2958
@@ -438,9 +194,7 @@ cases:
   name: quadrant_interference_c48
   variant: tp8_ep8
   purpose: All four IO quadrants sharing continuous batches.
-  coverage:
-  - io_quadrants
-  - continuous_batching
+  coverage: [io_quadrants, continuous_batching]
   max_model_len: 8192
   max_concurrency: 48
   profile_arrival_mode: saturated
@@ -450,15 +204,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/07_quadrant_interference_c48.csv
-    shapes:
-    - - 128
-      - 128
-    - - 128
-      - 4096
-    - - 4096
-      - 128
-    - - 3072
-      - 3072
+    shapes: [[128, 128], [128, 4096], [4096, 128], [3072, 3072]]
     repeats: 24
   attn_gpu_memory_gb:
     value: 79.2958
@@ -469,9 +215,7 @@ cases:
   name: completion_churn_c96
   variant: tp8_ep8
   purpose: Rapid completions, shrinking batches, and request replacement.
-  coverage:
-  - completion_churn
-  - admission
+  coverage: [completion_churn, admission]
   max_model_len: 8192
   max_concurrency: 96
   profile_arrival_mode: saturated
@@ -481,19 +225,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/08_completion_churn_c96.csv
-    shapes:
-    - - 512
-      - 1
-    - - 512
-      - 16
-    - - 512
-      - 64
-    - - 512
-      - 256
-    - - 512
-      - 1024
-    - - 512
-      - 4096
+    shapes: [[512, 1], [512, 16], [512, 64], [512, 256], [512, 1024], [512, 4096]]
     repeats: 32
   attn_gpu_memory_gb:
     value: 79.2958
@@ -504,8 +236,7 @@ cases:
   name: rate_knee
   variant: tp8_ep8
   purpose: Maximum sustainable open-loop request rate.
-  coverage:
-  - arrival_rate_knee
+  coverage: [arrival_rate_knee]
   max_model_len: 8192
   max_concurrency: null
   profile_arrival_mode: trace-timed
@@ -515,23 +246,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/09_rate_knee.csv
-    shapes:
-    - - 128
-      - 128
-    - - 128
-      - 4096
-    - - 4096
-      - 128
-    - - 3072
-      - 3072
-    - - 512
-      - 256
-    - - 2048
-      - 1024
-    - - 6144
-      - 512
-    - - 1024
-      - 4096
+    shapes: [[128, 128], [128, 4096], [4096, 128], [3072, 3072], [512, 256], [2048, 1024], [6144, 512], [1024, 4096]]
     repeats: 64
   rate:
     value: 1.0
@@ -547,9 +262,7 @@ cases:
   name: full_saturation_rate
   variant: tp8_ep8
   purpose: Peak-throughput open-loop load beyond the sustainable knee.
-  coverage:
-  - saturation
-  - peak_throughput
+  coverage: [saturation, peak_throughput]
   max_model_len: 8192
   max_concurrency: 256
   profile_arrival_mode: saturated
@@ -559,23 +272,7 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/10_full_saturation_rate.csv
-    shapes:
-    - - 128
-      - 128
-    - - 128
-      - 4096
-    - - 4096
-      - 128
-    - - 3072
-      - 3072
-    - - 512
-      - 256
-    - - 2048
-      - 1024
-    - - 6144
-      - 512
-    - - 1024
-      - 4096
+    shapes: [[128, 128], [128, 4096], [4096, 128], [3072, 3072], [512, 256], [2048, 1024], [6144, 512], [1024, 4096]]
     repeats: 64
   attn_gpu_memory_gb:
     value: 79.2958
@@ -586,9 +283,7 @@ cases:
   name: long_prefill_ladder_c1
   variant: tp8_ep8
   purpose: '16K-491K prompts: long-prefill ladder at concurrency 1.'
-  coverage:
-  - long_prefill
-  - bounded_kernel_trace
+  coverage: [long_prefill, bounded_kernel_trace]
   max_model_len: 524288
   max_concurrency: 1
   profile_arrival_mode: saturated
@@ -598,46 +293,13 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/11_long_prefill_ladder_c1.csv
-    shapes:
-    - - 16384
-      - 16
-    - - 32768
-      - 64
-    - - 65536
-      - 16
-    - - 98304
-      - 64
-    - - 131072
-      - 16
-    - - 196608
-      - 64
-    - - 262144
-      - 16
-    - - 393216
-      - 64
-    - - 458752
-      - 16
-    - - 491520
-      - 64
+    shapes: [[16384, 16], [32768, 64], [65536, 16], [98304, 64], [131072, 16], [196608, 64], [262144, 16], [393216,
+        64], [458752, 16], [491520, 64]]
     repeats: 2
     id_suffix: full
   kernel_trace:
     file: traces/11_long_prefill_ladder_c1.nsys.csv
-    shapes:
-    - - 16384
-      - 16
-    - - 32768
-      - 64
-    - - 65536
-      - 16
-    - - 98304
-      - 64
-    - - 131072
-      - 16
-    - - 196608
-      - 64
-    - - 262144
-      - 16
+    shapes: [[16384, 16], [32768, 64], [65536, 16], [98304, 64], [131072, 16], [196608, 64], [262144, 16]]
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
@@ -649,9 +311,7 @@ cases:
   name: ultra_context_decode_c1
   variant: tp8_ep8
   purpose: 'Long context plus long output: ultra-context decode at concurrency 1.'
-  coverage:
-  - ultra_context
-  - long_decode
+  coverage: [ultra_context, long_decode]
   max_model_len: 524288
   max_concurrency: 1
   profile_arrival_mode: saturated
@@ -661,48 +321,14 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/12_ultra_context_decode_c1.csv
-    shapes:
-    - - 458752
-      - 256
-    - - 458752
-      - 1024
-    - - 458752
-      - 4096
-    - - 262144
-      - 256
-    - - 262144
-      - 1024
-    - - 262144
-      - 4096
-    - - 131072
-      - 256
-    - - 131072
-      - 1024
-    - - 131072
-      - 4096
-    - - 32768
-      - 256
-    - - 32768
-      - 1024
-    - - 32768
-      - 4096
-    - - 8192
-      - 256
-    - - 8192
-      - 1024
-    - - 8192
-      - 4096
+    shapes: [[458752, 256], [458752, 1024], [458752, 4096], [262144, 256], [262144, 1024], [262144, 4096], [131072,
+        256], [131072, 1024], [131072, 4096], [32768, 256], [32768, 1024], [32768, 4096], [8192, 256], [8192, 1024],
+      [8192, 4096]]
     repeats: 1
     id_suffix: full
   kernel_trace:
     file: traces/12_ultra_context_decode_c1.nsys.csv
-    shapes:
-    - - 458752
-      - 64
-    - - 8192
-      - 256
-    - - 12288
-      - 64
+    shapes: [[458752, 64], [8192, 256], [12288, 64]]
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
@@ -714,8 +340,7 @@ cases:
   name: generation_length_matrix_c8
   variant: tp8_ep8
   purpose: Mixed prompt and output lengths across a generation-length matrix.
-  coverage:
-  - generation_length_matrix
+  coverage: [generation_length_matrix]
   max_model_len: 131072
   max_concurrency: 8
   profile_arrival_mode: saturated
@@ -725,76 +350,16 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/13_generation_length_matrix_c8.csv
-    shapes:
-    - - 128
-      - 4096
-    - - 128
-      - 8192
-    - - 128
-      - 16384
-    - - 128
-      - 32768
-    - - 512
-      - 4096
-    - - 512
-      - 8192
-    - - 512
-      - 16384
-    - - 512
-      - 32768
-    - - 2048
-      - 4096
-    - - 2048
-      - 8192
-    - - 2048
-      - 16384
-    - - 2048
-      - 32768
-    - - 8192
-      - 4096
-    - - 8192
-      - 8192
-    - - 8192
-      - 16384
-    - - 8192
-      - 32768
-    - - 16384
-      - 4096
-    - - 16384
-      - 8192
-    - - 16384
-      - 16384
-    - - 16384
-      - 32768
-    - - 32768
-      - 4096
-    - - 32768
-      - 8192
-    - - 32768
-      - 16384
-    - - 32768
-      - 32768
+    shapes: [[128, 4096], [128, 8192], [128, 16384], [128, 32768], [512, 4096], [512, 8192], [512, 16384], [512,
+        32768], [2048, 4096], [2048, 8192], [2048, 16384], [2048, 32768], [8192, 4096], [8192, 8192], [8192, 16384],
+      [8192, 32768], [16384, 4096], [16384, 8192], [16384, 16384], [16384, 32768], [32768, 4096], [32768, 8192],
+      [32768, 16384], [32768, 32768]]
     repeats: 1
     id_suffix: full
   kernel_trace:
     file: traces/13_generation_length_matrix_c8.nsys.csv
-    shapes:
-    - - 128
-      - 256
-    - - 512
-      - 256
-    - - 2048
-      - 256
-    - - 8192
-      - 256
-    - - 16384
-      - 256
-    - - 32768
-      - 256
-    - - 4096
-      - 256
-    - - 24576
-      - 256
+    shapes: [[128, 256], [512, 256], [2048, 256], [8192, 256], [16384, 256], [32768, 256], [4096, 256], [24576,
+        256]]
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
@@ -807,8 +372,7 @@ cases:
   variant: tp8_ep8
   purpose: 'About 91.4% terminal KV demand: near-full long decode. (terminal-KV figure is GLM-5.2''s capacity; Inkling''s
     is larger)'
-  coverage:
-  - kv_near_full
+  coverage: [kv_near_full]
   max_model_len: 65536
   max_concurrency: 21
   profile_arrival_mode: saturated
@@ -818,66 +382,14 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/14_near_full_long_decode_c21.csv
-    shapes:
-    - - 8192
-      - 8192
-    - - 12288
-      - 8192
-    - - 16384
-      - 8192
-    - - 24576
-      - 4096
-    - - 32768
-      - 4096
-    - - 49152
-      - 2048
+    shapes: [[8192, 8192], [12288, 8192], [16384, 8192], [24576, 4096], [32768, 4096], [49152, 2048]]
     repeats: 10
     id_suffix: full
   kernel_trace:
     file: traces/14_near_full_long_decode_c21.nsys.csv
-    shapes:
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
-    - - 24320
-      - 256
-    - - 28416
-      - 256
-    - - 36608
-      - 256
-    - - 50944
-      - 256
-    - - 16128
-      - 256
-    - - 20224
-      - 256
+    shapes: [[50944, 256], [16128, 256], [20224, 256], [24320, 256], [28416, 256], [36608, 256], [50944, 256], [
+        16128, 256], [20224, 256], [24320, 256], [28416, 256], [36608, 256], [50944, 256], [16128, 256], [20224,
+        256], [24320, 256], [28416, 256], [36608, 256], [50944, 256], [16128, 256], [20224, 256]]
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
@@ -890,9 +402,7 @@ cases:
   variant: tp8_ep8
   purpose: About 122.6% average terminal KV demand, admission-controlled churn. (terminal-KV figure is GLM-5.2's
     capacity; Inkling's is larger)
-  coverage:
-  - kv_overcommit
-  - admission
+  coverage: [kv_overcommit, admission]
   max_model_len: 262144
   max_concurrency: 14
   profile_arrival_mode: saturated
@@ -902,52 +412,13 @@ cases:
   device_role: primary
   workload_trace:
     file: traces/15_kv_overcommit_mixed_churn_c14.csv
-    shapes:
-    - - 65536
-      - 4096
-    - - 16384
-      - 32768
-    - - 98304
-      - 2048
-    - - 32768
-      - 16384
-    - - 8192
-      - 8192
-    - - 49152
-      - 8192
+    shapes: [[65536, 4096], [16384, 32768], [98304, 2048], [32768, 16384], [8192, 8192], [49152, 8192]]
     repeats: 12
     id_suffix: full
   kernel_trace:
     file: traces/15_kv_overcommit_mixed_churn_c14.nsys.csv
-    shapes:
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
-    - - 100096
-      - 256
-    - - 48896
-      - 256
-    - - 16128
-      - 256
-    - - 57088
-      - 256
-    - - 69376
-      - 256
-    - - 48896
-      - 256
+    shapes: [[69376, 256], [48896, 256], [100096, 256], [48896, 256], [16128, 256], [57088, 256], [69376, 256],
+      [48896, 256], [100096, 256], [48896, 256], [16128, 256], [57088, 256], [69376, 256], [48896, 256]]
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:

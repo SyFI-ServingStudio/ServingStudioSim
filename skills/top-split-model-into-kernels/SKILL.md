@@ -46,7 +46,7 @@ attention.
 If the model runs in vLLM or SGLang, a measured nsys capture settles launch
 granularity that source reading can only estimate. Your caller may already have
 one — `top-add-new-arch` takes it in its Phase 0 — and if not, one can be
-produced by the profile phase of `operate-run-alignment` alone, with no
+produced by the profile step of `operate-run-alignment` alone, with no
 ServingStudio Sim arch in place. Ask for it before you start deciding.
 
 The capture gives you the folded kernel sequence per engine phase: how many

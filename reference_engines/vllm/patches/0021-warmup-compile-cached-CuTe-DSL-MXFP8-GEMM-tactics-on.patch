@@ -1,0 +1,133 @@
+From 9e2095f1d166f445bed91564517919bcd47396dc Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Wed, 11 Nov 2026 05:37:56 -0800
+Subject: [PATCH] warmup: compile cached CuTe-DSL MXFP8 GEMM tactics on an
+ autotune cache hit
+
+A cache hit skips the tuning dummy runs, which were what compiled each
+bucket's tactic; FlashInfer keeps compiled CuTe-DSL GEMMs only in process
+memory, so serving compiled them (~0.5 s each) the first time it reached a
+bucket, and every other DP rank waited in its next collective. Run each
+CuTe-DSL MXFP8 linear shape of the target and the drafter once per tuning
+bucket after the cache loads.
+---
+ vllm/model_executor/warmup/kernel_warmup.py | 92 +++++++++++++++++----
+ 1 file changed, 77 insertions(+), 15 deletions(-)
+
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+index e8efb7bb31..7b5d070b4f 100644
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -437,6 +437,80 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
+     return tuple(dict.fromkeys(token_counts))
+ 
+ 
++def _flashinfer_max_tuning_tokens(runner: "GPUModelRunner", num_tokens: int) -> int:
++    """The largest M a dummy run of ``num_tokens`` tokens tunes for.
++
++    The drafter may use more tokens than the target in the same dummy run, so
++    its max M is included when building the autotune buckets.
++    """
++    max_tuning_tokens = num_tokens
++    speculator = getattr(runner, "speculator", None)
++    if speculator is not None:
++        num_query_per_req = speculator.num_query_per_req
++        num_draft_reqs = min(
++            num_tokens,
++            runner.max_num_reqs,
++            runner.max_num_tokens // num_query_per_req,
++        )
++        max_tuning_tokens = max(max_tuning_tokens, num_draft_reqs * num_query_per_req)
++    return max_tuning_tokens
++
++
++def _warmup_cached_cute_dsl_mxfp8_gemm(runner: "GPUModelRunner") -> None:
++    """Compile the tactic a loaded autotune cache picks for every M bucket of
++    every CuTe-DSL MXFP8 linear shape, target and drafter.
++
++    Tuning compiles every candidate tactic as it profiles it, but a cache hit
++    skips the tuning dummy runs, and FlashInfer keeps compiled CuTe-DSL GEMMs
++    only in process memory. Without this, each bucket's tactic compiles
++    (~0.5 s) the first time serving reaches it, and every other DP rank waits
++    for it in the next collective.
++    """
++    import vllm.utils.flashinfer as fi_utils
++    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
++        FlashInferCutedslMxfp8LinearKernel,
++    )
++
++    models = [runner.get_model()]
++    get_draft_model = getattr(runner, "get_draft_model", None)
++    draft = get_draft_model() if get_draft_model is not None else None
++    if draft is not None:
++        models.append(draft)
++
++    # One layer per (K, N, dtype): the tactic is keyed on the shape, not the
++    # layer.
++    layers: dict[tuple[int, int, torch.dtype], tuple] = {}
++    for model in models:
++        for module in model.modules():
++            method = getattr(module, "scheme", getattr(module, "quant_method", None))
++            kernel = getattr(method, "kernel", None)
++            if type(kernel) is FlashInferCutedslMxfp8LinearKernel:
++                k, n = module.weight.shape  # column-major [K, N]
++                layers.setdefault((k, n, module.params_dtype), (module, kernel))
++    if not layers:
++        return
++
++    max_tokens = max(
++        _flashinfer_max_tuning_tokens(runner, num_tokens)
++        for num_tokens in _flashinfer_autotune_token_counts(runner)
++    )
++    buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(max_tokens)
++    start = time.perf_counter()
++    with torch.inference_mode():
++        for (k, _n, dtype), (layer, kernel) in layers.items():
++            for m in buckets:
++                x = torch.zeros(m, k, dtype=dtype, device=layer.weight.device)
++                kernel.apply_weights(layer, x)
++    torch.accelerator.synchronize()
++    logger.info(
++        "Compiled cached CuTe-DSL MXFP8 GEMM tactics for %d shapes x %d M buckets "
++        "in %.2fs.",
++        len(layers),
++        len(buckets),
++        time.perf_counter() - start,
++    )
++
++
+ def _run_flashinfer_autotune_dummy_runs(
+     runner: "GPUModelRunner", *, skip_attn: bool = False
+ ) -> None:
+@@ -445,21 +519,7 @@ def _run_flashinfer_autotune_dummy_runs(
+ 
+     dummy_run_kwargs = {"skip_attn": True} if skip_attn else {}
+     for num_tokens in _flashinfer_autotune_token_counts(runner):
+-        # The drafter may use more tokens than this pass in the same dummy run.
+-        # Include its max M when building the autotune buckets.
+-        max_tuning_tokens = num_tokens
+-        speculator = getattr(runner, "speculator", None)
+-        if speculator is not None:
+-            num_query_per_req = speculator.num_query_per_req
+-            num_draft_reqs = min(
+-                num_tokens,
+-                runner.max_num_reqs,
+-                runner.max_num_tokens // num_query_per_req,
+-            )
+-            max_tuning_tokens = max(
+-                max_tuning_tokens, num_draft_reqs * num_query_per_req
+-            )
+-
++        max_tuning_tokens = _flashinfer_max_tuning_tokens(runner, num_tokens)
+         tuning_buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(
+             max_tuning_tokens
+         )
+@@ -626,3 +686,5 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
+             world.barrier()
+     elif tuner._dirty:
+         tuner.save_configs(str(cache_path))
++    if cache_hit:
++        _warmup_cached_cute_dsl_mxfp8_gemm(runner)
+-- 
+2.43.0
+

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from typing import Any
 
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
+#: Schema 5 adds per-forward `forward_ordinal` / `is_dummy` (DP dummy forwards
+#: recorded); its batch-shape fields are those of schema 4.
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5})
 SUPPORTED_INPUT_ADAPTERS = frozenset({"vllm_text", "sglang_text"})
 
 

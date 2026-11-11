@@ -111,7 +111,9 @@ first.
 recorded case depends on a `provisional` calibrated input. That last one is
 overridable with `--accept-provisional`, and the provisional field names are then
 written into the `.provenance.json` sidecar next to the golden, so a baseline can
-never quietly depend on an uncalibrated value.
+never quietly depend on an uncalibrated value. A case whose inputs are
+`from_capture` must have its `calibration.json`; the values and their source
+files are written into that sidecar too.
 
 Tolerances are **not** in the golden store. Re-recording measured values is
 routine; moving the standard they are judged against belongs in a reviewed edit

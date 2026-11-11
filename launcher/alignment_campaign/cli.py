@@ -13,8 +13,15 @@ would also read as `alignment campaign run --phase simulation` invoking
     extract  completed reports -> one metrics document
     compare  judge that document against tolerances and the golden
 
-`--phase` values are artifact directory names, so the phase, its config, its
-output directory and its `.complete` marker all share one name.
+`--phase` names a pipeline step (profile_nsys, timing_predict, simulation, ...).
+Its values are artifact directory names, so the step, its config, its output
+directory and its `.complete` marker all share one name.
+
+`--alignment-phase {1,2}` (render, run, label, extract, compare) picks the
+cases. 1 is the pack's alignment Phase 1 cases (`phase: 1`): one diverse_100
+run per deployment, the check a model PR must pass. 2 is alignment Phase 2, the
+full matrix, Phase 1 cases included, which is also what a verb covers without
+the flag. It is unrelated to `--phase`.
 """
 
 from __future__ import annotations
@@ -57,9 +64,27 @@ def _resolve_host(value: str):
     return load_host(candidate)
 
 
-def _selected_cases(pack: Pack, names: list[str] | None) -> list[Case]:
+#: `--alignment-phase` values: 1 selects the Phase 1 cases, 2 the full matrix.
+ALIGNMENT_PHASE_CHOICES = (1, 2)
+
+
+def _phase1_cases(pack: Pack) -> tuple[Case, ...]:
+    cases = pack.phase1_cases
+    if not cases:
+        raise PackError(
+            f"pack {pack.name} declares no alignment Phase 1 case; mark each deployment's "
+            "diverse_100 case with `phase: 1`"
+        )
+    return cases
+
+
+def _selected_cases(
+    pack: Pack, names: list[str] | None, alignment_phase: int | None = None
+) -> list[Case]:
+    phase1 = alignment_phase == 1
+    pool = _phase1_cases(pack) if phase1 else pack.cases
     if not names:
-        return list(pack.cases)
+        return list(pool)
     chosen: list[Case] = []
     for name in names:
         case = pack.case_named(name)
@@ -68,8 +93,35 @@ def _selected_cases(pack: Pack, names: list[str] | None) -> list[Case]:
                 f"no case {name!r} in pack {pack.name}; "
                 f"available: {[item.slug for item in pack.cases]}"
             )
+        if case not in pool:
+            raise PackError(
+                f"case {case.slug} is not an alignment Phase 1 case (--alignment-phase 1)"
+            )
         chosen.append(case)
     return chosen
+
+
+def _phase1_slugs(args, pack: Pack | None) -> set[str] | None:
+    """Phase 1 case slugs for the read-side verbs, or None unless
+    `--alignment-phase 1` (Phase 2 is every case)."""
+    if getattr(args, "alignment_phase", None) != 1:
+        return None
+    if pack is None:
+        raise PackError(
+            "--alignment-phase 1 selects cases by the pack's `phase: 1`; it needs --pack"
+        )
+    return {case.slug for case in _phase1_cases(pack)}
+
+
+def _add_alignment_phase(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--alignment-phase",
+        type=int,
+        choices=ALIGNMENT_PHASE_CHOICES,
+        help="1: only the pack's alignment Phase 1 cases (`phase: 1`); 2: alignment "
+        "Phase 2, the full matrix with Phase 1 included (the same as omitting it). "
+        "Unrelated to --phase, which names a pipeline step",
+    )
 
 
 def _acceptance_schemas(pack: Pack | None) -> dict[str, int] | None:
@@ -127,9 +179,14 @@ def _render(args) -> int:
     assert pack is not None
     host = _resolve_host(args.host)
     out_root = Path(args.out_root)
-    for case in _selected_cases(pack, args.case):
+    for case in _selected_cases(pack, args.case, args.alignment_phase):
         rendered = render_module.render_case(pack, case, host, out_root, REPO_ROOT)
         print(f"[render] {rendered.directory}  ({len(rendered.files)} files)")
+        for reason in rendered.pending:
+            print(
+                f"[render] {case.slug}: simulation.yaml waits for its from_capture inputs "
+                f"({reason}); `run --phase timing_predict|simulation` writes it"
+            )
     first_phase = render_module.phase_names(next(iter(pack.variants.values())))[0]
     print(f"[render] host {host.name}; next: `alignment-campaign run --phase {first_phase}`")
     return 0
@@ -138,7 +195,7 @@ def _render(args) -> int:
 def _run(args) -> int:
     pack = _resolve_pack(args.pack)
     assert pack is not None
-    cases = _selected_cases(pack, args.case)
+    cases = _selected_cases(pack, args.case, args.alignment_phase)
     out_root = Path(args.out_root)
     if args.dry_run:
         plans = execute.plan_phase(
@@ -152,7 +209,7 @@ def _run(args) -> int:
             allow_autotune=args.allow_autotune,
         )
         print(execute.describe_plan(args.phase, plans))
-        _print_calibration_prerequisites(pack)
+        _print_calibration_prerequisites(pack, cases)
         return 0
     report = execute.run_phase(
         pack,
@@ -179,10 +236,20 @@ def _run(args) -> int:
     return 0
 
 
-def _print_calibration_prerequisites(pack: Pack) -> None:
-    """List the preflight measurements a run still depends on. Never executed
-    automatically: their result is an edit to the pack's calibrated block, which
-    is a change a person should see."""
+def _print_calibration_prerequisites(pack: Pack, cases: list[Case]) -> None:
+    """List the calibrated inputs a run still depends on.
+
+    A `from_capture` input is read automatically from the case's workload pass
+    when timing_predict or simulation runs, and recorded in calibration.json.
+    A provisional one is not: replacing it is an edit to the pack's calibrated
+    block, which is a change a person should see.
+    """
+    captured = [f"{case.slug}.{name}" for case in cases for name in case.capture_fields]
+    if captured:
+        print("")
+        print("[calibration] read from each case's workload pass at timing_predict/simulation:")
+        for name in captured:
+            print(f"  {name}")
     provisional = pack.provisional_fields
     if not provisional:
         return
@@ -202,7 +269,7 @@ def _label(args) -> int:
     assert pack is not None
     out_root = Path(args.out_root)
     failed = 0
-    for case in _selected_cases(pack, args.case):
+    for case in _selected_cases(pack, args.case, args.alignment_phase):
         variant = pack.variant_of(case)
         kernel_pass = next((item for item in variant.profile_passes if item.kind == "nsys"), None)
         if kernel_pass is None:
@@ -230,7 +297,7 @@ def _label(args) -> int:
 def _extract(args) -> int:
     pack = _resolve_pack(args.pack)
     roots = [Path(item) for item in args.runs.split(":") if item]
-    extraction = extract_module.extract(roots, pack)
+    extraction = extract_module.extract(roots, pack, only=_phase1_slugs(args, pack))
     path = extract_module.write_extraction(extraction, Path(args.out))
     print(f"[extract] {len(extraction.cases)} case(s) -> {path}")
     for key in extraction.unavailable:
@@ -242,6 +309,16 @@ def _extract(args) -> int:
 def _compare(args) -> int:
     pack = _resolve_pack(args.pack)
     document = extract_module.load_extraction(Path(args.measured))
+    only = _phase1_slugs(args, pack)
+    if only is not None:
+        document = {
+            **document,
+            "cases": {
+                key: body
+                for key, body in document.get("cases", {}).items()
+                if key.partition("/")[2] in only
+            },
+        }
     comparison = compare_module.compare(document, pack)
 
     if args.json:
@@ -295,6 +372,7 @@ def _build_parser() -> argparse.ArgumentParser:
     render.add_argument("--host", required=True)
     render.add_argument("--out-root", required=True, help="directory to hold one dir per case")
     render.add_argument("--case", action="append", help="restrict to these cases (repeatable)")
+    _add_alignment_phase(render)
     render.set_defaults(handler=_render)
 
     run = commands.add_parser("run", help="run ONE phase across every ready case")
@@ -306,6 +384,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="artifact directory name, e.g. profile_nsys / timing_predict / analysis_kernel",
     )
     run.add_argument("--case", action="append")
+    _add_alignment_phase(run)
     run.add_argument("--dry-run", action="store_true", help="print the plan and stop")
     run.add_argument("--refresh", action="store_true", help="ignore .complete markers")
     run.add_argument(
@@ -340,6 +419,7 @@ def _build_parser() -> argparse.ArgumentParser:
     label.add_argument("--pack", required=True)
     label.add_argument("--out-root", required=True)
     label.add_argument("--case", action="append")
+    _add_alignment_phase(label)
     label.add_argument(
         "--refresh", action="store_true", help="re-initialize from the parsed inventory"
     )
@@ -349,12 +429,14 @@ def _build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--pack", help="optional; without it any run directory is readable")
     extract.add_argument("--runs", required=True, help="colon-separated run roots")
     extract.add_argument("--out", required=True)
+    _add_alignment_phase(extract)
     extract.set_defaults(handler=_extract)
 
     compare = commands.add_parser("compare", help="judge a metrics document")
     compare.add_argument("--pack", help="optional; needed for tolerances, drift and --record")
     compare.add_argument("--measured", required=True, help="metrics document from `extract`")
     compare.add_argument("--json", action="store_true")
+    _add_alignment_phase(compare)
     compare.add_argument("--markdown", action="store_true")
     compare.add_argument("--record", action="store_true", help="write the golden baseline")
     compare.add_argument(
