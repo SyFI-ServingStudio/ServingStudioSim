@@ -1821,3 +1821,59 @@ def test_forward_ordinal_record_must_match_its_log_prefix(tmp_path):
 
     with pytest.raises(ValueError, match="claims dp_rank 1 but was logged by EngineCore_DP0"):
         record_extraction.extract_metrics_jsonl(server_log, tmp_path / "m.jsonl", dp_size=2)
+
+
+@pytest.mark.parametrize(
+    ("records", "dp_size", "message"),
+    [
+        # Rank 1 never appears: its records are lost, not idle (idle records dummies).
+        ([_forward_record(0, 0, 0), _forward_record(0, 1, 1)], 2, r"no forward of dp_rank\(s\) \[1\]"),
+        (
+            [
+                _forward_record(0, 0, 0),
+                _forward_record(0, 1, 1),
+                _forward_record(0, 2, 2),
+                _forward_record(1, 0, 0),
+                _forward_record(1, 2, 1),
+            ],
+            2,
+            r"dp_rank 1 records forwards 0..2 but not \[1\]",
+        ),
+        (
+            [_forward_record(0, 0, 0), _forward_record(1, 5, 0)],
+            2,
+            "recorded forwards do not overlap",
+        ),
+        (
+            [_forward_record(0, 0, 0), _forward_record(0, 1, None, dummy=True)],
+            1,
+            "dp_size=1 capture records a DP dummy forward",
+        ),
+    ],
+)
+def test_forward_ordinal_records_must_cover_every_rank(tmp_path, records, dp_size, message):
+    server_log = tmp_path / "server.log"
+    server_log.write_text(_forward_log(*records))
+
+    with pytest.raises(ValueError, match=message):
+        record_extraction.extract_metrics_jsonl(
+            server_log, tmp_path / "m.jsonl", dp_size=dp_size
+        )
+
+
+def test_forward_ordinal_ranks_may_start_at_different_forwards(tmp_path):
+    """Ragged ends are legal (the measurement log starts at a byte offset); the
+    runs only have to be unbroken and to share forwards."""
+    records = [
+        _forward_record(0, 0, 0),
+        _forward_record(0, 1, 1),
+        _forward_record(1, 1, None, dummy=True),
+        _forward_record(1, 2, 0),
+        _forward_record(0, 2, None, dummy=True),
+    ]
+    server_log = tmp_path / "server.log"
+    server_log.write_text(_forward_log(*records))
+
+    assert record_extraction.extract_metrics_jsonl(
+        server_log, tmp_path / "m.jsonl", dp_size=2
+    ) == 5

@@ -158,7 +158,10 @@ def extract_metrics_jsonl(
     `max_forwards_in_flight` (batch-queue depth). Its identity is
     `(dp_rank, forward_ordinal)`, and equal ordinals across ranks are one
     global step. The record's own rank is used, cross-checked against a
-    single-rank log prefix when the line has one.
+    single-rank log prefix when the line has one. A real record's
+    `(dp_rank, iteration_index)` stays unique as well, and once the log is read
+    every rank `0..dp_size` must be present, each over one unbroken run of
+    ordinals (`_check_forward_coverage`).
     """
     required = {
         "schema_version",
@@ -190,6 +193,7 @@ def extract_metrics_jsonl(
     used_human_iterations: set[int] = set()
     seen_rank_iterations: set[tuple[int, int]] = set()
     seen_rank_forwards: set[tuple[int, int]] = set()
+    ordinals_by_rank: dict[int, list[int]] = {}
     last_iteration_by_rank = [-1] * dp_size
     n = 0
     with Path(out_jsonl).open("w") as out:
@@ -222,6 +226,7 @@ def extract_metrics_jsonl(
                             f"dp_rank={step[0]} iteration={step[1]}"
                         )
                     seen_rank_iterations.add(step)
+                ordinals_by_rank.setdefault(dp_rank, []).append(row["forward_ordinal"])
             elif records is VLLM_RECORDS and dp_size > 1:
                 iteration_index = int(row["iteration_index"])
                 observed_elapsed_ms = row.get("observed_elapsed_ms")
@@ -316,12 +321,47 @@ def extract_metrics_jsonl(
                 _validate_decode_request_progress(row, records)
             out.write(json.dumps(row) + "\n")
             n += 1
+    if ordinals_by_rank:
+        _check_forward_coverage(ordinals_by_rank, dp_size)
     return n
 
 
 #: The first iteration-record schema that records every forward, DP dummy
 #: forwards included, with a per-rank `forward_ordinal`.
 FORWARD_ORDINAL_SCHEMA = 5
+
+
+def _check_forward_coverage(ordinals_by_rank: dict[int, list[int]], dp_size: int) -> None:
+    """Every DP rank recorded, each over one unbroken run of forwards.
+
+    Every rank runs one forward per global step, so a schema-5 capture must
+    hold every rank `0..dp_size` and each rank's ordinals must be contiguous: a
+    gap is a lost record, not an idle rank (an idle rank records a dummy). The
+    runs may start and end at different forwards -- the measurement log begins
+    at a byte offset while ranks can still be logging a wave's trailing
+    forwards -- but they must share at least one forward.
+    """
+    missing = sorted(set(range(dp_size)) - set(ordinals_by_rank))
+    if missing:
+        raise ValueError(
+            f"a dp_size={dp_size} capture recorded no forward of dp_rank(s) {missing}; "
+            "every rank records every forward, dummies included"
+        )
+    spans = {}
+    for dp_rank, ordinals in sorted(ordinals_by_rank.items()):
+        first, last = min(ordinals), max(ordinals)
+        if last - first + 1 != len(ordinals):
+            absent = sorted(set(range(first, last + 1)) - set(ordinals))
+            raise ValueError(
+                f"dp_rank {dp_rank} records forwards {first}..{last} but not {absent[:5]}"
+                f"{' ...' if len(absent) > 5 else ''}: every forward writes a record, so a gap "
+                "is a lost log line"
+            )
+        spans[dp_rank] = (first, last)
+    if max(first for first, _ in spans.values()) > min(last for _, last in spans.values()):
+        raise ValueError(
+            f"the data-parallel ranks' recorded forwards do not overlap: {spans}"
+        )
 
 
 def _forward_record_rank(row: dict, line: str, dp_size: int, records: EngineRecords) -> int:
@@ -341,6 +381,11 @@ def _forward_record_rank(row: dict, line: str, dp_size: int, records: EngineReco
             f"schema-5 alignment record needs a max_forwards_in_flight >= 1, got {in_flight!r}"
         )
     if is_dummy:
+        if dp_size == 1:
+            raise ValueError(
+                "a dp_size=1 capture records a DP dummy forward; dummy forwards exist only "
+                "under data parallelism, so the capture's dp_size is wrong"
+            )
         if row["iteration_index"] is not None or row["prefill_tokens"] or row["decode_requests"]:
             raise ValueError("a dummy forward record must carry no iteration index and no work")
     elif type(row["iteration_index"]) is not int:
