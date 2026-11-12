@@ -1073,6 +1073,8 @@ fn is_communication_kind(kind: &str) -> bool {
             | "all_to_all"
             | "moe_ep_all_gather"
             | "moe_ep_quantized_all_gather"
+            | "moe_ep_quantize_and_all_gather"
+            | "row_all_gather"
             | "moe_ep_reduce_scatter"
             | "broadcast"
             | "gather"
