@@ -29,8 +29,9 @@ class DsaPersistentTopkDecodeArgs(KernelArgs):
     logits_dtype: DType = arg(doc="Element type of the indexer logits.")
     index_dtype: str = arg(doc="Element type of the selected positions.")
     context_mode: str = arg(
-        doc="Pattern of valid prefix lengths across requests; uniform_random also "
-        "draws the scores at random instead of an increasing sequence."
+        doc="Pattern of valid prefix lengths across requests; uniform_random and "
+        "uniform_measured also draw the scores at random (standard normal, or from a "
+        "measured live-indexer score distribution) instead of an increasing sequence."
     )
 
 
@@ -43,16 +44,19 @@ DOC = KernelDoc(
         "request has next_n rows. With context_mode uniform, a request's rows "
         "have valid lengths context_len − next_n + 1 to context_len; with "
         "max_ragged, next_n is 1 and request b has max(0, context_len − b) "
-        "valid logits; uniform_random has uniform lengths. A row no longer than "
-        "top_k yields only its own positions. The logits are FP32 in rows padded "
-        "to logits_row_stride; uniform rows all hold the same increasing "
-        "sequence, uniform_random rows seeded standard-normal scores, max_ragged "
-        "rows one seeded random template."
+        "valid logits; uniform_random and uniform_measured have uniform lengths. "
+        "A row no longer than top_k yields only its own positions. "
+        "The logits are FP32 in rows padded to logits_row_stride; "
+        "uniform rows all hold the same increasing sequence, "
+        "uniform_random rows seeded standard-normal scores, "
+        "uniform_measured rows seeded draws from a measured live-indexer score "
+        "distribution, max_ragged rows one seeded random template."
     ),
     category="Attention",
     subcategory="DSA",
     formula=(
-        "uniform, uniform_random: length[j] = context_len − next_n + 1 + (j mod next_n); "
+        "uniform, uniform_random, uniform_measured: "
+        "length[j] = context_len − next_n + 1 + (j mod next_n); "
         "max_ragged: length[b] = max(0, context_len − b)",
         "output[j] = top_k positions from logits[j, :length[j]], or natural positions "
         "when length[j] ≤ top_k",
@@ -73,7 +77,12 @@ DOC = KernelDoc(
         "Time follows the score distribution: the increasing uniform template "
         "crowds a short row's valid logits into a narrow value range and the "
         "random max_ragged template is shared by every row; uniform_random "
-        "scores are independent normals, like a live indexer's continuous scores.",
+        "scores are independent normals; uniform_measured scores follow a measured live "
+        "indexer's distribution, whose real rows it times within -5..+1% on B200 "
+        "(normals read +10..+21%, the increasing template +50..+59%).",
+        "Above 64 rows the op switches to a sampled top-k when the host max_seq_len "
+        "reaches 98304 (K=512); serving passes the token max_seq_len, this runner the "
+        "row length. On B200 the difference measured within 2% at 37,500 and 75,000.",
         "Off SM90 the check before timing accepts a long row that differs from "
         "the reference only when the kernel's known threshold-bin buffer "
         "overflow explains the difference; such a row's timing is the "
