@@ -1,6 +1,6 @@
 # feat(dsv41): DeepSeek-V4.1-Flash-1017 + DSpark on vLLM, B200 TP4/EP4 and DP4/EP4
 
-Draft. The TP4 Phase 1 case and the DP4 workload pass are being recaptured; see Test Result.
+Draft. DP4 Phase 1 TTFT is outside its tolerance; see Test Result.
 
 ## Purpose
 
@@ -71,20 +71,18 @@ The work builds on the TP4/EP4 no-spec arch already on `main` (`doc/pr/dsv41-fla
 
 | Case | kernel_abs_pct | kernel_signed_pct | map_coverage_pct | e2e_mean_pct | output_tps_pct | server_tpot_mean_pct | server_ttft_mean_pct |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| dp4_phase1/20_dp4_diverse_100 | +1.58% | -0.92% | 99.14% | -5.15% | +4.05% | -5.73% | -10.29% |
-| tp4_phase1/19_tp4_diverse_100 | *recapture pending* | | | | | | |
+| dp4_phase1/20_dp4_diverse_100 | +1.58% | -0.92% | 99.14% | -4.67% | +5.08% | -5.64% | -13.15% |
+| tp4_phase1/19_tp4_diverse_100 | +2.06% | -1.39% | 99.13% | -3.38% | +0.84% | -1.07% | -3.35% |
 
-- **DP4 captures.** nsys job 20826, in image `vibesim-profiler-vllm:fe6a3d9a6af96e67` (vLLM reference patches
-  through 0022). The workload pass, job 20807, ran in the previous image `cbe2f57bc603b683` (patches through
-  0021); 0022 changes only when alignment NVTX scopes open. It is being recaptured in `fe6a3d9a6af96e67` as
-  job 20894, so both passes come from one image.
-- **TP4 recapture.** The earlier TP4 capture, job 20586, predates patch 0021. Its workload pass holds 3 forward
-  steps of 500, 1691 and 469 ms (2.66 s in all). These are mid-serving JIT compiles that stall every in-flight
-  request. With them in the measurement, TP4 read TTFT -23.33% and E2E -8.40%, against tolerances of 12 and 7.
-  TP4 is being recaptured in the DP4 image as jobs 20863 and 20864.
-- **DP4 TTFT.** DP4 TTFT is -10.29%, inside tolerance 12. Its cause has not been investigated yet.
-- **DP4 step-shape metrics.** These are just outside their 1% tolerance: decode batch +1.73%, iterations -1.86%,
-  prefill tokens +1.89% and scheduled KV -2.34%.
+- **Captures.** All four passes ran in image `vibesim-profiler-vllm:fe6a3d9a6af96e67` (vLLM reference patches
+  through 0022): TP4 workload job 20863 and nsys job 20864, DP4 workload job 20894 and nsys job 20826. The
+  longest forward step is 103 ms in the TP4 workload pass and 128 ms in the DP4 one, so no mid-serving JIT
+  compile is in the measurement.
+- **DP4 TTFT.** -13.15%, outside tolerance 12. A DP4 workload pass of the same deployment in the previous image
+  (job 20807) read -10.29%, so the measured TTFT moves by about 3 points between captures. The cause of the
+  gap has not been investigated yet.
+- **Step-shape metrics outside their 1% tolerance.** TP4: decode batch -4.93%, iterations +4.83%, prefill
+  tokens -4.60%, scheduled KV -5.87%. DP4: scheduled KV +1.37%.
 
 alignment Phase 2, the full matrix, has not run yet. It will be filed as an issue once this PR is open.
 
