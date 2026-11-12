@@ -32,8 +32,6 @@ _HEAD_DIM = 512
 _ROPE_DIM = 64
 _BLOCK_SIZE = 32
 _RECORD_BYTES = MXFP8_RECORD_BYTES
-_DATA_BYTES = 512
-_SCALE_BYTES = 16
 _MAX_TOKENS = 65_536
 _MAX_POSITION = 8192
 _LIVE_HEADS = (8, 16, 32, 64, 128)
@@ -117,6 +115,7 @@ def check_outputs(
     from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import (
         decode_records,
         encode_records,
+        page_regions,
     )
 
     report: dict = {}
@@ -132,13 +131,11 @@ def check_outputs(
     if insert:
         rows = reference_kv_rows(torch, kv[:insert], positions[:insert], cos_sin)
         ref_data, ref_scale = encode_records(rows, "mxfp8")
-        blocks = cache.shape[0]
-        flat = cache.view(blocks, _BLOCK_SIZE * _RECORD_BYTES)
-        data = flat[:, : _BLOCK_SIZE * _DATA_BYTES].reshape(-1, _DATA_BYTES)[slots]
-        scale = flat[:, _BLOCK_SIZE * _DATA_BYTES :].reshape(-1, _SCALE_BYTES)[slots]
+        data_rows, scale_rows = page_regions(cache, "mxfp8")
+        data, scale = data_rows[slots], scale_rows[slots]
         scale_gap = int((scale.int() - ref_scale.int()).abs().max().item())
         mismatch = float((data != ref_data).float().mean().item())
-        got = decode_records(cache.view(blocks, _BLOCK_SIZE, _RECORD_BYTES), slots, "mxfp8")
+        got = decode_records(cache, slots, "mxfp8")
         rel = (got - rows.float()).norm(dim=-1) / rows.float().norm(dim=-1).clamp(min=1e-6)
         report.update(
             max_scale_gap=scale_gap,
@@ -150,8 +147,7 @@ def check_outputs(
 
     written = torch.zeros(cache.shape[0] * _BLOCK_SIZE, dtype=torch.bool, device=cache.device)
     written[slots] = True
-    idle_data = cache.view(cache.shape[0], -1)[:, : _BLOCK_SIZE * _DATA_BYTES]
-    idle = idle_data.reshape(-1, _DATA_BYTES)[~written]
+    idle = page_regions(cache, "mxfp8")[0][~written]
     report["untouched_slots_poisoned"] = bool((idle == _POISON).all().item())
     if not report["untouched_slots_poisoned"]:
         raise KernelLaunchFailed(f"{_BACKEND} wrote outside slot_mapping")

@@ -24,10 +24,13 @@ unified CostTree keeps separate bodies (consumers of the engram KV source, and
 the ``dspark_target_layer_ids`` consumers whose hidden state feeds the draft
 head); both splits add no work.
 
-Excluded, deliberately: the ``num_nextn_predict_layers`` DSpark draft layers
-(``mtp.*``) and the vision tower/aligner/image-token embeddings, which only a
-speculative or multimodal deployment runs, and the router's ``bias_vl``, which
-only image-span tokens read.
+The ``num_nextn_predict_layers`` DSpark draft layers (``mtp.*``) are staged
+stacks (:mod:`model.work.models.dspark`): they run, and count, only when a
+workload carries the DSpark stages, so a non-speculative label is unchanged.
+
+Excluded, deliberately: the vision tower/aligner/image-token embeddings, which
+only a multimodal deployment runs, and the router's ``bias_vl``, which only
+image-span tokens read.
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ from ..attention.deepseek_v41 import (
 from ..core import LayerStack, LearnedWeightGroup, MatmulGroup, Model, dtype_bytes
 from ..ffn.moe import MoE
 from ..quantization import parse_quantization_config
+from . import dspark
 
 #: Checkpoint tensors stored BF16 although the config declares an FP8 scheme and
 #: no ``modules_to_not_convert`` (layer-relative, as MatmulGroup.module names them).
@@ -221,6 +225,10 @@ def build(raw_config: dict) -> Model:
                 ]
             )
     weights.append(LearnedWeightGroup("final_norm", hidden, 1))
+    if dspark.enabled(raw_config):
+        draft_layers, draft_weights = dspark.stacks(raw_config, mhc_matmuls)
+        layers.extend(draft_layers)
+        weights.extend(draft_weights)
 
     return Model(
         name=raw_config["architectures"][0],

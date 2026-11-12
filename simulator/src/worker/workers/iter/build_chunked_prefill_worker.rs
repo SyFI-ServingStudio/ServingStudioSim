@@ -15,7 +15,6 @@ use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{
     ChunkEndAlignment, ChunkedPrefillAdmission, LoadBalance, PendingOrder,
 };
-use crate::worker::config::DpPlacement;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::types::WorkerConfig;
@@ -76,11 +75,7 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
-    let balance = match (num_partitions, config.dp_placement) {
-        (1, _) => LoadBalance::Single,
-        (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },
-        (_, DpPlacement::VllmLeastLoaded) => LoadBalance::LeastLoaded { next: 0 },
-    };
+    let balance = LoadBalance::for_dp(num_partitions, config.dp_placement);
     let admission = ChunkedPrefillAdmission::new(
         (0..num_partitions)
             .map(|_| (PendingOrder::new(config.pending_order), ()))

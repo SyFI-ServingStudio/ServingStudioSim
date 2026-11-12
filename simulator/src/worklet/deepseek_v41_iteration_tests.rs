@@ -85,10 +85,29 @@ fn n(slot: &crate::timing::LeafDesc) -> u64 {
 #[test]
 fn one_iteration_has_the_captured_launch_counts() {
     let tree = compile_iteration();
+    // Every `mega_mhc_post_pre` boundary has an mHC overlap twin (post,
+    // input-split pre, side-stream coefficients) that only small FULL graphs
+    // run; it replaces the fused launch, so it is counted apart.
+    let overlap = |s: &&crate::timing::LeafDesc| s.name.contains(".mhc_overlap.");
+    let serial = format!(".{SERIAL_COPY_SUFFIX}");
+    let overlap_launches: Vec<_> = tree
+        .slots
+        .iter()
+        .filter(overlap)
+        .filter(|s| !s.name.ends_with(&serial))
+        .collect();
+    assert_eq!(overlap_launches.len(), 3 * 77);
+    assert_eq!(
+        overlap_launches
+            .iter()
+            .filter(|s| s.name.ends_with(".mhc_overlap.coefficients"))
+            .count(),
+        77
+    );
     let launches: Vec<_> = tree
         .slots
         .iter()
-        .filter(|s| !s.name.ends_with(&format!(".{SERIAL_COPY_SUFFIX}")))
+        .filter(|s| !s.name.ends_with(&serial) && !overlap(s))
         .collect();
     let mut by_kind = BTreeMap::<&str, usize>::new();
     for slot in &launches {
@@ -165,8 +184,9 @@ fn gated_side_branches_carry_exactly_one_serial_copy_each() {
         .filter(|s| s.name.ends_with(&format!(".{SERIAL_COPY_SUFFIX}")))
         .collect();
     // Stage A: 4 compressor + 8 weights_proj; B1/B2: 4 + 4 compressor;
-    // FFN: 3 shared-expert launches x 40.
-    assert_eq!(serial.len(), 4 + 8 + 4 + 4 + 120);
+    // FFN: 3 shared-expert launches x 40; one side-stream mHC coefficient
+    // launch per overlap boundary (77).
+    assert_eq!(serial.len(), 4 + 8 + 4 + 4 + 120 + 77);
     for copy in serial {
         let base = copy.name.strip_suffix(".serial").unwrap();
         let original = tree

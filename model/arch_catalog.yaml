@@ -57,6 +57,10 @@ deepseek_v41_vllm:
   name: "vLLM, TP attention, EP MoE"
 deepseek_v41_vllm_serial_streams:
   name: "vLLM, TP attention, EP MoE, side streams serialized"
+deepseek_v41_vllm_dspark:
+  name: "vLLM, TP attention, EP MoE, DSpark speculative decoding"
+deepseek_v41_vllm_dp_attn_ep_moe_dspark:
+  name: "vLLM, DP attention, EP MoE, DSpark speculative decoding"
 inkling_vllm_nvfp4_rel_attn_moe:
   name: "vLLM, TP attention, EP MoE"
 mimo_v2_vllm_fp8_swa_moe:

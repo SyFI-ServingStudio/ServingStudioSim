@@ -19,6 +19,11 @@
 //! branch is a gated dual slot: `Parallel{routed, shared}` at `T <= 256`, serial
 //! above.
 //!
+//! FULL-graph forwards of at most 16 rows replace the entry `mega_mhc` with the
+//! mHC overlap boundary ([`MhcOverlapBoundary`]); its side-stream coefficient
+//! branch runs beside the rest of the FFN up to the closing all-reduce, where
+//! the decoder layer joins the mHC stream.
+//!
 //! The busiest EP rank is `folded_rank_position = 0` of the shared
 //! active-count-ranked fold inside the fused-MoE L1 kind; the L4 caller picks
 //! the position (0 for the critical path).
@@ -26,8 +31,8 @@
 use std::sync::Arc;
 
 use super::deepseek_v41_common::{
-    compile_serial_copy, eval_or_zero, gated_fanout, placeholder,
-    SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
+    compile_serial_copy, eval_or_zero, gated_fanout, placeholder, MhcOverlapBoundary,
+    MhcOverlapBoundaryConfig, MhcOverlapBoundaryResolved, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
 };
 use crate::common::Fabric;
 use crate::op::Op;
@@ -57,6 +62,7 @@ pub struct DeepseekV41MoeFfnEpWorkletConfig {
     pub shared_intermediate_size: Dim,
     pub gpu_name: String,
     pub mhc_backends: Vec<&'static str>,
+    pub mhc_tilelang_backends: Vec<&'static str>,
     pub router_backends: Vec<&'static str>,
     pub gemm_backends: Vec<&'static str>,
     pub moe_backends: Vec<&'static str>,
@@ -73,12 +79,36 @@ pub struct DeepseekV41MoeFfnEpWorkletConfig {
     pub expert_demand: ExpertDemand,
     /// 0 = the busiest EP rank.
     pub folded_rank_position: u32,
+    /// vLLM `VLLM_MOE_SKIP_PADDING`: the runner marks CUDA-graph and DP
+    /// padding rows (`v1/worker/gpu/model_runner.py` `prepare_inputs`), the
+    /// router writes them top-k id -1 / weight 0 (`get_moe_padding_mask` ->
+    /// `dsv4_topk`), and the expert routing counts only local ids >= 0. The
+    /// routed experts then work on the scheduled rows alone; every other
+    /// kernel, collectives included, still runs the padded rows.
+    pub skip_padding_rows: bool,
+}
+
+impl DeepseekV41MoeFfnEpWorkletConfig {
+    /// Rows the routed experts work on: the scheduled rows when padding rows
+    /// route nowhere ([`Self::skip_padding_rows`]),
+    /// else every row. The padded rows' pass through the routing scan is left
+    /// out: an image measurement of 120 real + 456 id -1 rows took 239 us
+    /// against 235 us for the 120 rows alone (`logs/20261107_2_dsv41_dspark_check1/round2`).
+    pub fn routed_rows(&self, rows: u32, scheduled: u32) -> u32 {
+        assert!(scheduled <= rows, "scheduled rows {scheduled} exceed the padded {rows}");
+        if self.skip_padding_rows {
+            scheduled
+        } else {
+            rows
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct DeepseekV41MoeFfnEpWorkletResolved {
     pub raw_cfg: DeepseekV41MoeFfnEpWorkletConfig,
     pub entry: MhcRmsNormKernelConfig,
+    pub mhc_overlap: MhcOverlapBoundaryResolved,
     pub router_gate: GemmFp32OutputKernelConfig,
     pub topk: ElementwiseKernelConfig,
     pub moe_input_quant: ElementwiseKernelConfig,
@@ -92,12 +122,18 @@ pub struct DeepseekV41MoeFfnEpWorkletResolved {
 
 #[derive(Clone, Debug, Default)]
 pub struct DeepseekV41MoeFfnEpWorkletInput {
+    /// Rows the dense kernels run (graph padding included).
     pub num_tokens: u32,
+    /// Of those, the scheduled (non-padding) rows.
+    pub scheduled_tokens: u32,
+    /// `mhc_overlap_live(..)`: the entry takes the mHC overlap path.
+    pub mhc_overlap: bool,
 }
 
 pub struct DeepseekV41MoeFfnEpWorklet {
     pub name: String,
     pub entry: Op<MhcFusedPostPreRmsNormKernel>,
+    pub mhc_overlap: MhcOverlapBoundary,
     pub router_gate: Op<GemmFp32OutputKernel>,
     pub topk: Op<ElementwiseKernel>,
     pub moe_input_quant: Op<ElementwiseKernel>,
@@ -151,6 +187,13 @@ impl DeepseekV41MoeFfnEpWorklet {
                 hc_mult: cfg.hc_mult,
                 hidden_dtype: DType::Bf16,
             },
+            mhc_overlap: MhcOverlapBoundary::resolve(&MhcOverlapBoundaryConfig {
+                hidden_size: cfg.hidden_size.clone(),
+                hc_mult: cfg.hc_mult,
+                gpu_name: cfg.gpu_name.clone(),
+                mhc_tilelang_backends: cfg.mhc_tilelang_backends.clone(),
+                elementwise_backends: cfg.elementwise_backends.clone(),
+            }),
             router_gate: GemmFp32OutputKernelConfig {
                 backends: cfg.router_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -222,6 +265,11 @@ impl DeepseekV41MoeFfnEpWorklet {
         let r = resolved.clone();
         Ok(Self {
             entry: op!(MhcFusedPostPreRmsNormKernel, r.entry, "entry.mega_mhc_post_pre"),
+            mhc_overlap: MhcOverlapBoundary::build(
+                &format!("{name}.entry"),
+                r.mhc_overlap,
+                bridge,
+            )?,
             router_gate: op!(GemmFp32OutputKernel, r.router_gate, "routed.router_gate"),
             topk: op!(ElementwiseKernel, r.topk, "routed.topk"),
             moe_input_quant: op!(ElementwiseKernel, r.moe_input_quant, "routed.input_quant"),
@@ -240,7 +288,8 @@ impl DeepseekV41MoeFfnEpWorklet {
     }
 
     pub fn compile(&self, b: &mut CostTreeBuilder) -> CostNode {
-        let entry = self.entry.compile(b);
+        let mut entries = vec![self.entry.compile(b)];
+        entries.extend(self.mhc_overlap.compile_entry(b));
         let routed = vec![
             self.router_gate.compile(b),
             self.topk.compile(b),
@@ -257,14 +306,15 @@ impl DeepseekV41MoeFfnEpWorklet {
             compile_serial_copy(&self.shared_act, b),
             compile_serial_copy(&self.shared_down, b),
         ];
-        let mut children = vec![
-            entry,
+        let mut body = vec![
             gated_fanout(routed, vec![shared], shared_serial),
             self.residual_add.compile(b),
         ];
         if let Some(all_reduce) = &self.all_reduce {
-            children.push(all_reduce.compile(b));
+            body.push(all_reduce.compile(b));
         }
+        let mut children = entries;
+        children.push(self.mhc_overlap.compile_beside(body, b));
         CostNode::Labeled {
             label: format!(
                 "{} (DeepseekV41MoeFfnEpWorklet) [tp={}; ep={}; local_experts={}; rank_position={}]",
@@ -281,14 +331,27 @@ impl DeepseekV41MoeFfnEpWorklet {
     pub fn eval(&self, input: &DeepseekV41MoeFfnEpWorkletInput, ev: &mut Evaluator) {
         let rows = input.num_tokens;
         let zero = rows == 0;
+        let mhc_overlap = !zero && input.mhc_overlap;
         let overlapped = shared_on_aux_stream(rows, self.resolved.raw_cfg.serialize_streams);
         let ew = ElementwiseKernelInput { num_tokens: rows };
         let gemm = SingleGemmKernelInput { m: rows };
-        eval_or_zero(&self.entry, MhcRmsNormKernelInput { num_tokens: rows }, zero, ev);
+        eval_or_zero(
+            &self.entry,
+            MhcRmsNormKernelInput { num_tokens: rows },
+            zero || mhc_overlap,
+            ev,
+        );
+        self.mhc_overlap.eval_entry(rows, mhc_overlap, ev);
         eval_or_zero(&self.router_gate, GemmFp32OutputKernelInput { m: rows }, zero, ev);
         eval_or_zero(&self.topk, ew.clone(), zero, ev);
         eval_or_zero(&self.moe_input_quant, ew.clone(), zero, ev);
-        eval_or_zero(&self.fused_moe, Nvfp4FusedMoeKernelInput { num_tokens: rows }, zero, ev);
+        let routed = self.resolved.raw_cfg.routed_rows(rows, input.scheduled_tokens);
+        eval_or_zero(
+            &self.fused_moe,
+            Nvfp4FusedMoeKernelInput { num_tokens: routed },
+            routed == 0,
+            ev,
+        );
         for copy_overlapped in [true, false] {
             let off = zero || overlapped != copy_overlapped;
             eval_or_zero(&self.shared_gate_up, gemm.clone(), off, ev);
@@ -299,6 +362,8 @@ impl DeepseekV41MoeFfnEpWorklet {
         if let Some(all_reduce) = &self.all_reduce {
             eval_or_zero(all_reduce, AllReduceFusionKernelInput { num_tokens: rows }, zero, ev);
         }
+        self.mhc_overlap
+            .eval_side(rows, mhc_overlap, self.resolved.raw_cfg.serialize_streams, ev);
     }
 }
 
@@ -324,6 +389,7 @@ pub(crate) mod tests {
             shared_intermediate_size: 2304.into(),
             gpu_name: "NVIDIA B200".into(),
             mhc_backends: vec!["deepgemm_mega"],
+            mhc_tilelang_backends: vec!["vllm_tilelang"],
             router_backends: vec!["torch_cublas"],
             gemm_backends: vec!["flashinfer_mxfp8"],
             moe_backends: vec!["flashinfer_trtllm_sm100_mxfp4"],
@@ -341,6 +407,7 @@ pub(crate) mod tests {
                 layerwise_global_ppm: vec![vec![1_000_000 / 384; 384]],
             },
             folded_rank_position: 0,
+            skip_padding_rows: true,
         }
     }
 
@@ -352,6 +419,16 @@ pub(crate) mod tests {
         assert_eq!((r.shared_down.k.get(), r.shared_down.n.get()), (576, 5120));
         assert_eq!(r.router_gate.n.get(), 384);
         assert_eq!(r.moe_input_quant.output_bytes_per_token.get(), 5280);
+    }
+
+    /// Catches padding rows priced as expert work, or the flag ignored.
+    #[test]
+    fn routed_experts_see_only_scheduled_rows_when_padding_is_skipped() {
+        let mut cfg = config();
+        assert_eq!(cfg.routed_rows(576, 120), 120);
+        assert_eq!(cfg.routed_rows(64, 0), 0);
+        cfg.skip_padding_rows = false;
+        assert_eq!(cfg.routed_rows(576, 120), 576);
     }
 
     #[test]
