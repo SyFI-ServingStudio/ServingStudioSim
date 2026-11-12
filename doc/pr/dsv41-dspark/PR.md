@@ -1,7 +1,5 @@
 # feat(dsv41): DeepSeek-V4.1-Flash-1017 + DSpark on vLLM, B200 TP4/EP4 and DP4/EP4
 
-Draft. DP4 Phase 1 TTFT is outside its tolerance; see Test Result.
-
 ## Purpose
 
 Model DeepSeek-V4.1-Flash-1017 served by vLLM (model runner V2) with the DSpark speculative proposer
@@ -83,6 +81,16 @@ The work builds on the TP4/EP4 no-spec arch already on `main` (`doc/pr/dsv41-fla
   gap has not been investigated yet.
 - **Step-shape metrics outside their 1% tolerance.** TP4: decode batch -4.93%, iterations +4.83%, prefill
   tokens -4.60%, scheduled KV -5.87%. DP4: scheduled KV +1.37%.
+
+- **Known residuals, not fixed in this PR.**
+  - Routed MoE in prefill steps where vLLM picks the tile-N 128 kernels: the simulator is 15.5% slow in TP4
+    (483 steps) and 13.4% slow in DP4 (13 steps). Steps where vLLM picks tile-N 192, most DP4 prefill steps,
+    are 3.7% fast. Both topologies read the same `profile.db` rows; the cause of the tile-128 gap is not
+    investigated.
+  - The reference image does not carry the vLLM dummy-run fix (randomized `inputs_embeds` during warmup; upstream
+    vLLM #64530). The engine therefore tunes its MoE tactics on degenerate routing, while the L1 rows are tuned on
+    real routing.
+  - DP4 TTFT above.
 
 alignment Phase 2, the full matrix, has not run yet. It will be filed as an issue once this PR is open.
 
