@@ -45,9 +45,16 @@
 //!   bf16 partial sums go back by a reduce-scatter that each owner sums. The
 //!   dispatch store is assumed fused into the activation-quant kernel, and
 //!   the combine read and its sum into the next op.
-//! * **mHC boundaries.** vLLM's kernels, unfused (the presets pick the
-//!   TileLang ones); `mhc_one_launch` prices the measured one-launch kernel
-//!   instead.
+//! * **mHC boundaries.** `mhc_boundary` ([`MhcBoundary`]): vLLM's kernels,
+//!   unfused (default; the presets pick the TileLang ones), or fused into one
+//!   launch per boundary, priced either from the faster DB row of TileLang
+//!   and the measured one-launch kernel (`fused_rows`) or as TileLang less
+//!   the one-launch kernel's saving measured against it in the same job
+//!   (`fused_less_saving` + `mhc_fused_saving_us`, set per load point).
+//! * **KDA group communication pricing.** `kda_tp_comm_pricing`
+//!   ([`KdaTpCommPricing`]): the two collectives from fixed-pattern rows
+//!   (default, conservative) or one borrowed all-reduce (optimistic); the
+//!   real cost lies between them until dedicated all-gather rows exist.
 //! * **Router gate.** Once per MoE layer (`router_gate_once`, default on: the
 //!   vLLM fork's GateLinear since #55736).
 //!
@@ -83,8 +90,9 @@
 //!   row as a stand-in. A bf16 fixed-pattern all-gather row (and rows at 2
 //!   and 4 GPUs) would replace it inside
 //!   `glm53_flash_vllm_fp8_dp_attn_ep_moe::KdaGatherScatter`; no new param.
-//! * **One-launch mHC rows** (worktree `wt-flash-mhc-fuse`): `mhc_one_launch`
-//!   is wired through; its `cuda_one_launch` rows are not in the shared DB yet.
+//! * **One-launch mHC rows** (worktree `wt-flash-mhc-fuse`): the
+//!   `cuda_one_launch` rows behind `mhc_boundary: fused_rows` are in this
+//!   tree's DB, not yet in the shared DB.
 
 use anyhow::{bail, ensure, Result};
 
@@ -94,6 +102,45 @@ use crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::{AttnTpCollective, AttnTpL
 
 /// The selector tag.
 pub const ARCH_TAG: &str = "glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2";
+
+/// How the mHC post/pre boundaries are priced (`mhc_boundary`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MhcBoundary {
+    /// vLLM's kernels, unfused (the backends file picks TileLang).
+    #[default]
+    Unfused,
+    /// Fused: each boundary at the faster `profile.db` row of vLLM's TileLang
+    /// call and the measured one-launch kernel; the boundary after an MoE
+    /// layer adds the shared expert.
+    FusedRows,
+    /// Fused: vLLM's TileLang rows less `mhc_fused_saving_us` per boundary,
+    /// the one-launch kernel's saving measured against TileLang in one job at
+    /// the deployment's rows per rank. Used where the TileLang rows and
+    /// today's re-measure disagree.
+    FusedLessSaving,
+}
+
+/// The `mhc_boundary` choices the launcher schema advertises.
+pub const MHC_BOUNDARIES: [&str; 3] = ["unfused", "fused_rows", "fused_less_saving"];
+
+/// How the KDA group's input all-gather + output reduce-scatter is priced
+/// (`kda_tp_comm_pricing`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KdaTpCommPricing {
+    /// The two collectives from the fixed-pattern MNNVL reduce-scatter rows
+    /// (`attn_tp_collective: fixed_gather_scatter`; conservative).
+    #[default]
+    GatherScatter,
+    /// One all-reduce of the group's rows at the group size
+    /// (`attn_tp_collective: fast_unbudgeted`): the same bytes in one launch,
+    /// which the layout cannot run (optimistic).
+    AllReduce,
+}
+
+/// The `kda_tp_comm_pricing` choices the launcher schema advertises.
+pub const KDA_TP_COMM_PRICINGS: [&str; 2] = ["gather_scatter", "all_reduce"];
 
 /// `sel` (this tag) as the `glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2`
 /// selector it fixes (module doc).
@@ -112,7 +159,9 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         indexer_max_logits_mb,
         draft_tokens,
         kda_state_dtype,
-        mhc_one_launch,
+        mhc_boundary,
+        mhc_fused_saving_us,
+        kda_tp_comm_pricing,
         router_gate_once,
         hisparse_buffer_tokens,
         hisparse_top_k,
@@ -129,13 +178,26 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         *kda_tp_gpus >= 1 && ep_size % kda_tp_gpus == 0,
         "{ARCH_TAG}: kda_tp_gpus {kda_tp_gpus} must divide ep_size {ep_size}"
     );
+    let (mhc_fuse_fixed_us, mhc_one_launch) = match (mhc_boundary, mhc_fused_saving_us) {
+        (MhcBoundary::Unfused, None) => (None, false),
+        (MhcBoundary::FusedRows, None) => (None, true),
+        (MhcBoundary::FusedLessSaving, Some(us)) if *us >= 0.0 => (Some(*us), false),
+        (MhcBoundary::FusedLessSaving, _) => {
+            bail!("{ARCH_TAG}: mhc_boundary fused_less_saving needs mhc_fused_saving_us >= 0")
+        }
+        (_, Some(_)) => bail!("{ARCH_TAG}: mhc_fused_saving_us is for mhc_boundary fused_less_saving"),
+    };
+    let attn_tp_collective = match kda_tp_comm_pricing {
+        KdaTpCommPricing::GatherScatter => AttnTpCollective::FixedGatherScatter,
+        KdaTpCommPricing::AllReduce => AttnTpCollective::FastUnbudgeted,
+    };
     Ok(IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
         model: model.clone(),
         ep_size: *ep_size,
         attn_tp: *kda_tp_gpus,
         attn_all_reduce_row_gpus: None,
         attn_tp_layers: AttnTpLayers::KdaOnly,
-        attn_tp_collective: AttnTpCollective::FixedGatherScatter,
+        attn_tp_collective,
         kda_gate_b_merged: true,
         max_model_len: *max_model_len,
         routing: *routing,
@@ -168,8 +230,8 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         ep_fast_fused_residual_us: None,
         ep_fanout_ranks: None,
         ep_combine_row_bytes: None,
-        mhc_fuse_fixed_us: None,
-        mhc_one_launch: *mhc_one_launch,
+        mhc_fuse_fixed_us,
+        mhc_one_launch,
         router_gate_once: *router_gate_once,
     })
 }
@@ -256,5 +318,33 @@ mod tests {
         let mut no_routing = tag(8);
         no_routing.as_object_mut().unwrap().remove("routing");
         assert!(serde_json::from_value::<IterArchSel>(no_routing).is_err());
+        for (boundary, saving) in [("fused_less_saving", None), ("unfused", Some(1.0)), ("fused_rows", Some(1.0))] {
+            let mut bad = tag(8);
+            bad["mhc_boundary"] = boundary.into();
+            bad["mhc_fused_saving_us"] = saving.into();
+            let sel: IterArchSel = serde_json::from_value(bad).unwrap();
+            assert!(target_selector(&sel).is_err(), "{boundary} {saving:?}");
+        }
+    }
+
+    /// Catches the mHC and KDA-communication choices reaching the wrong
+    /// knob of the target selector.
+    #[test]
+    fn the_tag_maps_its_pricing_choices() {
+        let target = |extra: serde_json::Value| {
+            let mut sel = tag(8);
+            sel.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let sel: IterArchSel = serde_json::from_value(sel).unwrap();
+            serde_json::to_value(format!("{:?}", target_selector(&sel).unwrap())).unwrap().to_string()
+        };
+        let default = target(serde_json::json!({}));
+        assert!(default.contains("mhc_fuse_fixed_us: None") && default.contains("mhc_one_launch: false"));
+        assert!(default.contains("attn_tp_collective: FixedGatherScatter"));
+        let saving = target(serde_json::json!({"mhc_boundary": "fused_less_saving", "mhc_fused_saving_us": 1.796}));
+        assert!(saving.contains("mhc_fuse_fixed_us: Some(1.796)") && saving.contains("mhc_one_launch: false"));
+        let rows = target(serde_json::json!({"mhc_boundary": "fused_rows"}));
+        assert!(rows.contains("mhc_fuse_fixed_us: None") && rows.contains("mhc_one_launch: true"));
+        let ar = target(serde_json::json!({"kda_tp_comm_pricing": "all_reduce"}));
+        assert!(ar.contains("attn_tp_collective: FastUnbudgeted"));
     }
 }

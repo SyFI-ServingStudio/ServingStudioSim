@@ -1787,12 +1787,22 @@ pub enum IterArchSel {
         #[serde(default = "default_kda_tp_fused_kda_state_dtype")]
         #[param(string, default = "bf16", choices = KDA_STATE_DTYPES, cache_key)]
         kda_state_dtype: KdaStateDtype,
-        /// Price the mHC post/pre boundaries from the measured one-launch
-        /// kernel instead of vLLM's kernel (the backends file picks which of
-        /// vLLM's: TileLang in the presets).
+        /// How the mHC post/pre boundaries are priced
+        /// ([`crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::MhcBoundary`]).
         #[serde(default)]
-        #[param(default = false, cache_key)]
-        mhc_one_launch: bool,
+        #[param(string, default = "unfused", choices = crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::MHC_BOUNDARIES, cache_key)]
+        mhc_boundary: crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::MhcBoundary,
+        /// `mhc_boundary: fused_less_saving` only: the measured per-boundary
+        /// saving of the one-launch kernel over vLLM's TileLang call at this
+        /// deployment's rows per rank, us.
+        #[serde(default)]
+        #[param(cache_key)]
+        mhc_fused_saving_us: Option<f64>,
+        /// How the KDA group's all-gather + reduce-scatter is priced
+        /// ([`crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::KdaTpCommPricing`]).
+        #[serde(default)]
+        #[param(string, default = "gather_scatter", choices = crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::KDA_TP_COMM_PRICINGS, cache_key)]
+        kda_tp_comm_pricing: crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::KdaTpCommPricing,
         /// Compute the MoE router gate once per layer (the vLLM fork since
         /// #55736; the default here) instead of twice.
         #[serde(default = "default_kda_tp_fused_router_gate_once")]
