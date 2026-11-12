@@ -12,22 +12,20 @@
 # Pricing per step (实测 = profile.db row, 拟合 = fit to measured rows, 外推 = beyond any row):
 #   attention DP8; KDA layers TP over kda_tp_gpus GPUs, DSA on the owner rank      实测
 #   KDA input all-gather + output reduce-scatter over the group (fixed-pattern MNNVL):
-#     reduce-scatter                                                                实测 (8-GPU mnnvl_pull rows; b<8 at byte-matched counts)
-#     all-gather                                                                    stand-in (the reduce-scatter row)
+#     reduce-scatter                                                                实测 (at the group size b; faster of push / pull)
+#     all-gather                                                                    实测 at b=2/4 (row_all_gather); b=8 stand-in (the RS row)
 #   KDA f_b/g_b as one batched GEMM                                                 实测
 #   mHC post/pre boundaries: vLLM's TileLang kernels, unfused                      实测
 #   MoE router gate once per layer (vLLM GateLinear)                                实测
 #   MoE EP8 routed experts, dispatch activation quant, router top-k select          实测
-#   expert exchange (fused direct-write all-gather + reduce-scatter, MNNVL):
-#     dispatch store, per-row and link cost                                         拟合 (B200 EP8 moe_alltoall fit)
-#     combine read, per-row and link cost                                           拟合 (same fit)
-#     fixed cost per leg: 0 us (fused into the quant / next op; unfused 4.11 us)    外推, optimistic
-#     owner's sum of the partials: 0 us (fused into the next op)                    外推, optimistic
+#   expert exchange (expert_exchange: fixed_measured, the fixed-pattern MNNVL kernels):
+#     quantized all-gather dispatch + push reduce-scatter combine, each a launch    实测 (B200 EP8 mnnvl_lamport rows)
+#     (expert_exchange: fused_fit = the fused design on the analytic fit, fixed cost 0: 拟合/外推, optimistic)
 #   DFlash2 draft, TP1 per rank                                                     实测
 #
-# kda_tp_gpus is static per deployment, so each load point sets it: the 2026-11-12 sweep with the
-# KDA pair priced as all-gather + reduce-scatter (logs/20261112_6_kda_tp_agrs) picked 8 GPUs at
-# 1-32 concurrent requests, 4 at 64, and 1 (off) from 128 up.
+# kda_tp_gpus is static per deployment, so each load point sets it: the 2026-11-13 sweep on the
+# measured exchange and group-size KDA rows (logs/20261113_6_k1_mainline) picked 8 GPUs at 1-32
+# concurrent requests, 4 at 64, 2 at 128, and 1 (off) from 256 up.
 #
 # The trace is not in the repo (79 MB / 55 MB). Link it from the study that made it:
 #   ln -s <workspace>/wt-glm53-decode-investigate/logs/20261011_13_flash_dflash2_k_sweep_long/traces/reported_600k_decode_k7.csv \
@@ -91,6 +89,6 @@ compound:
     c16: {conc: 16, kda_tp_gpus: 8, mhc_fused_saving_us: 1.796}
     c32: {conc: 32, kda_tp_gpus: 8, mhc_fused_saving_us: 2.255}
     c64: {conc: 64, kda_tp_gpus: 4, mhc_fused_saving_us: 1.828}
-    c128: {conc: 128, kda_tp_gpus: 1, mhc_fused_saving_us: 0.507}
+    c128: {conc: 128, kda_tp_gpus: 2, mhc_fused_saving_us: 0.507}
     c256: {conc: 256, kda_tp_gpus: 1, mhc_fused_saving_us: 0.0}
 backends_file: backends_dp8.yaml
