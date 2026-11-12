@@ -613,7 +613,7 @@ impl Glm53DsaAttnLocalWorklet {
             &self.mqa_logits_decode,
             DsaPagedMqaLogitsDecodeKernelInput {
                 batch_size: w.decode_requests,
-                context_len: w.decode_pools,
+                context_len: w.decode_mean_pools,
             },
             no_decode,
             ev,
@@ -735,6 +735,13 @@ struct Work {
     decode_requests: u32,
     /// `ceil(max decode context / index_kpool)`.
     decode_pools: u32,
+    /// `ceil(Σ ceil(decode context / index_kpool) / decode_requests)`: the
+    /// uniform context with the batch's total pools. DeepGEMM's paged MQA
+    /// logits balances SMs by each request's own context, so its time follows
+    /// the total pools, not `decode_requests * decode_pools`; ragged B200
+    /// measurements (logs/20261112_0_indexer_ragged) match a uniform batch at
+    /// this mean context within a few percent.
+    decode_mean_pools: u32,
     /// Every prefill row once any prefill context exceeds `index_topk`, else
     /// 0: vLLM skips the prefill indexer only when every context fits, and
     /// otherwise scores and selects for all prefill rows.
@@ -884,6 +891,17 @@ fn derive_work(
         .checked_mul(next_n)
         .ok_or("decode row count overflows u32")?;
     let max_decode = input.decode_kv_lens.iter().copied().max().unwrap_or(0);
+    let total_decode_pools: u64 = input
+        .decode_kv_lens
+        .iter()
+        .map(|&context| u64::from(context.div_ceil(index_kpool)))
+        .sum();
+    let decode_mean_pools = if decode_requests == 0 {
+        0
+    } else {
+        u32::try_from(total_decode_pools.div_ceil(u64::from(decode_requests)))
+            .map_err(|_| "decode mean pools overflow u32")?
+    };
     let total_tokens = prefill_tokens
         .checked_add(decode_rows)
         .ok_or("token sum overflows u32")?;
@@ -896,6 +914,7 @@ fn derive_work(
         decode_rows,
         decode_requests,
         decode_pools: max_decode.div_ceil(index_kpool),
+        decode_mean_pools,
         prefill_indexer_rows,
         prefill_indexer_chunks,
     })
@@ -1029,6 +1048,8 @@ mod tests {
             (2, 16, 16)
         );
         assert_eq!(w.decode_pools, 1001);
+        // 250 + 1001 pools over two requests.
+        assert_eq!(w.decode_mean_pools, 626);
         assert_eq!(
             decode_row_context_lens(&[10, 50], 4),
             [7, 8, 9, 10, 47, 48, 49, 50]
