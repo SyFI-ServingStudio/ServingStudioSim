@@ -326,7 +326,10 @@ def test_imex_channel_is_declared_by_the_mnnvl_all_reduce_backends_only() -> Non
     }
     assert declared == {
         ("all_reduce_fusion", "flashinfer_mnnvl"),
+        ("all_reduce_fusion", "flashinfer_mnnvl_unbudgeted_oneshot"),
+        ("all_reduce_fusion", "flashinfer_mnnvl_unbudgeted_twoshot"),
         ("all_reduce_residual_rms_norm", "flashinfer_mnnvl"),
+        ("all_reduce_residual_rms_norm", "flashinfer_mnnvl_unbudgeted"),
     }
 
 

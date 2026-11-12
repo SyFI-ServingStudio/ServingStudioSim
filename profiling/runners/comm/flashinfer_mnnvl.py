@@ -28,6 +28,7 @@ RMSNorm (fused).
 from __future__ import annotations
 
 from collections import defaultdict
+from functools import partial
 
 from profiling.db.args import DType
 from profiling.runners.comm._batch import run_comm_batch
@@ -101,6 +102,25 @@ def spec_error(spec: dict) -> str | None:
     return None
 
 
+def unbudgeted_spec_error(spec: dict) -> str | None:
+    """``spec_error`` without vLLM's byte budget: the workspace is sized to the request."""
+    error = spec_error(spec)
+    if error is not None and "budget" in error:
+        return None
+    return error
+
+
+def unbudgeted_fused_spec_error(spec: dict) -> str | None:
+    """Strategy auto, oneshot or twoshot, honoured as given; no vLLM byte budget."""
+    if spec["strategy"] not in _USE_ONESHOT:
+        return f"strategy must be one of {sorted(_USE_ONESHOT)}, got {spec['strategy']!r}"
+    return unbudgeted_spec_error(spec)
+
+
+# ``strategy`` arg -> allreduce_fusion's ``use_oneshot`` (None leaves FlashInfer's AUTO).
+_USE_ONESHOT: dict[str, bool | None] = {"auto": None, "oneshot": True, "twoshot": False}
+
+
 def fused_spec_error(spec: dict) -> str | None:
     """``spec_error`` plus the fused call's strategy: vLLM never forces it on MNNVL."""
     if spec["strategy"] != "auto":
@@ -117,6 +137,39 @@ def profile_all_reduce_fusion_batch(kwargs_list: list[dict]) -> list[RunnerResul
 
 def profile_all_reduce_residual_rms_norm_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
     return _profile_batch(kwargs_list, fused_spec_error, _fused_per_rank_batch)
+
+
+# Beyond vLLM's budget: the workspace is sized to the chunk's largest request (with
+# one-shot room when one-shot is forced), so a tensor vLLM would send elsewhere
+# still runs on the MNNVL kernel. These rows are not production vLLM's dispatch.
+def profile_all_reduce_fusion_unbudgeted_oneshot_batch(
+    kwargs_list: list[dict],
+) -> list[RunnerResult]:
+    return _profile_batch(
+        kwargs_list,
+        unbudgeted_spec_error,
+        partial(_all_reduce_per_rank_batch, sized=True, use_oneshot=True),
+    )
+
+
+def profile_all_reduce_fusion_unbudgeted_twoshot_batch(
+    kwargs_list: list[dict],
+) -> list[RunnerResult]:
+    return _profile_batch(
+        kwargs_list,
+        unbudgeted_spec_error,
+        partial(_all_reduce_per_rank_batch, sized=True, use_oneshot=False),
+    )
+
+
+def profile_all_reduce_residual_rms_norm_unbudgeted_batch(
+    kwargs_list: list[dict],
+) -> list[RunnerResult]:
+    return _profile_batch(
+        kwargs_list,
+        unbudgeted_fused_spec_error,
+        partial(_fused_per_rank_batch, sized=True),
+    )
 
 
 def _profile_batch(kwargs_list: list[dict], error_fn, per_rank_fn) -> list[RunnerResult]:
@@ -143,19 +196,58 @@ def _profile_batch(kwargs_list: list[dict], error_fn, per_rank_fn) -> list[Runne
 
 
 def _all_reduce_per_rank_batch(
-    *, rank: int, world_size: int, specs: list[dict], warmup: int, rep: int
+    *,
+    rank: int,
+    world_size: int,
+    specs: list[dict],
+    warmup: int,
+    rep: int,
+    sized: bool = False,
+    use_oneshot: bool | None = None,
 ) -> list[dict] | None:
-    return _per_rank_batch(_profile_one_shape, rank, world_size, specs, warmup, rep)
+    return _per_rank_batch(
+        partial(_profile_one_shape, use_oneshot=use_oneshot),
+        rank,
+        world_size,
+        specs,
+        warmup,
+        rep,
+        sized=sized,
+        force_oneshot=use_oneshot is True,
+    )
 
 
 def _fused_per_rank_batch(
-    *, rank: int, world_size: int, specs: list[dict], warmup: int, rep: int
+    *,
+    rank: int,
+    world_size: int,
+    specs: list[dict],
+    warmup: int,
+    rep: int,
+    sized: bool = False,
 ) -> list[dict] | None:
-    return _per_rank_batch(_profile_one_fused_shape, rank, world_size, specs, warmup, rep)
+    return _per_rank_batch(
+        partial(_profile_one_fused_shape, honour_strategy=sized),
+        rank,
+        world_size,
+        specs,
+        warmup,
+        rep,
+        sized=sized,
+        force_oneshot=sized and any(spec["strategy"] == "oneshot" for spec in specs),
+    )
 
 
 def _per_rank_batch(
-    profile_one, rank: int, world_size: int, specs: list[dict], warmup: int, rep: int
+    profile_one,
+    rank: int,
+    world_size: int,
+    specs: list[dict],
+    warmup: int,
+    rep: int,
+    *,
+    sized: bool = False,
+    force_oneshot: bool = False,
 ) -> list[dict] | None:
     flashinfer_comm, torch, dist, torch_dist_backend = _imports()
     # vLLM passes the TP group's gloo CPU group to the workspace.
@@ -169,14 +261,19 @@ def _per_rank_batch(
     try:
         for (hidden_dim, dtype), indexed_specs in by_workspace.items():
             torch_dtype = dtype.torch()
+            if sized:
+                max_token_num = max(int(spec["num_tokens"]) for _, spec in indexed_specs)
+            else:
+                max_token_num = max_workspace_bytes(world_size) // (hidden_dim * _ELEM_SIZE[dtype])
             workspace = flashinfer_comm.create_allreduce_fusion_workspace(
                 backend="mnnvl",
                 world_size=world_size,
                 rank=rank,
-                max_token_num=max_workspace_bytes(world_size) // (hidden_dim * _ELEM_SIZE[dtype]),
+                max_token_num=max_token_num,
                 hidden_dim=hidden_dim,
                 dtype=torch_dtype,
                 comm_backend=torch_dist_backend(group=cpu_group),
+                force_oneshot_support=force_oneshot,
                 group=cpu_group,
             )
             try:
@@ -232,18 +329,13 @@ def _profile_one_shape(
     torch_dtype,
     warmup: int,
     rep: int,
+    use_oneshot: bool | None = None,
 ) -> dict:
     num_tokens = int(spec["num_tokens"])
     hidden_dim = int(spec["hidden_dim"])
-    if not workspace.is_buffer_size_sufficient(
-        tp_size=world_size,
-        num_tokens=num_tokens,
-        hidden_dim=hidden_dim,
-        dtype=torch_dtype,
-    ):
-        raise ValueError(
-            f"MNNVL workspace cannot hold num_tokens={num_tokens} hidden_dim={hidden_dim}"
-        )
+    _require_buffer(
+        flashinfer_comm, workspace, world_size, num_tokens, hidden_dim, torch_dtype, use_oneshot
+    )
     generator = torch.Generator(device="cuda").manual_seed(1234 + rank)
     input_tensor = torch.randn(
         num_tokens, hidden_dim, dtype=torch_dtype, device="cuda", generator=generator
@@ -256,6 +348,7 @@ def _profile_one_shape(
             pattern=flashinfer_comm.AllReduceFusionPattern.kAllReduce,
             launch_with_pdl=True,
             trigger_completion_at_end=num_tokens > PDL_ADVANCE_LAUNCH_TOKENS,
+            use_oneshot=use_oneshot,
         )
 
     output_tensor = launch()
@@ -296,18 +389,14 @@ def _profile_one_fused_shape(
     torch_dtype,
     warmup: int,
     rep: int,
+    honour_strategy: bool = False,
 ) -> dict:
     num_tokens = int(spec["num_tokens"])
     hidden_dim = int(spec["hidden_dim"])
-    if not workspace.is_buffer_size_sufficient(
-        tp_size=world_size,
-        num_tokens=num_tokens,
-        hidden_dim=hidden_dim,
-        dtype=torch_dtype,
-    ):
-        raise ValueError(
-            f"MNNVL workspace cannot hold num_tokens={num_tokens} hidden_dim={hidden_dim}"
-        )
+    use_oneshot = _USE_ONESHOT[spec["strategy"]] if honour_strategy else None
+    _require_buffer(
+        flashinfer_comm, workspace, world_size, num_tokens, hidden_dim, torch_dtype, use_oneshot
+    )
     generator = torch.Generator(device="cuda").manual_seed(1234 + rank)
     input_tensor = torch.randn(
         num_tokens, hidden_dim, dtype=torch_dtype, device="cuda", generator=generator
@@ -335,7 +424,7 @@ def _profile_one_fused_shape(
             residual_in=residual_in,
             rms_gamma=rms_gamma,
             rms_eps=RMS_EPS,
-            use_oneshot=None,
+            use_oneshot=use_oneshot,
             fp32_acc=bool(spec["fp32_acc"]),
             trigger_completion_at_end=bool(spec["trigger_completion_at_end"]),
         )
@@ -363,6 +452,27 @@ def _profile_one_fused_shape(
         message_size_bytes=input_tensor.numel() * input_tensor.element_size(),
         world_size=world_size,
     )
+
+
+def _require_buffer(
+    flashinfer_comm, workspace, world_size, num_tokens, hidden_dim, torch_dtype, use_oneshot
+) -> None:
+    del flashinfer_comm
+    from flashinfer.comm.trtllm_mnnvl_ar import (
+        MNNVLAllreduceFusionStrategy as strategy_enum,
+    )
+
+    strategy = (
+        strategy_enum.AUTO
+        if use_oneshot is None
+        else (strategy_enum.ONESHOT if use_oneshot else strategy_enum.TWOSHOT)
+    )
+    if not workspace.is_buffer_size_sufficient(
+        world_size, num_tokens, hidden_dim, torch_dtype, strategy
+    ):
+        raise ValueError(
+            f"MNNVL workspace cannot hold num_tokens={num_tokens} hidden_dim={hidden_dim}"
+        )
 
 
 def _check_close(*, torch, dist, actual, reference, what: str) -> None:

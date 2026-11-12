@@ -1,6 +1,10 @@
 """Collect the all-stacked experiment into results.json + table.md.
 
-Usage: python tools/all-stacked/collect.py <experiment dir>
+Usage: python tools/all-stacked/collect.py <experiment dir> [mqa|topk]
+
+`mqa` (default): the mqa-only study (20261112_0). `topk`: the mqa+topk baseline
+(20261112_1) with step 4 priced twice (S4n: nccl/nvshmem above the MNNVL budget;
+S4u: + unbudgeted MNNVL two-shot); the path continues on S4u.
 
 Reads <exp>/{k7,hs}/<strategy>/c<conc>/ (summary.json, reports/slo_general_report.json,
 reports/kernel_time_share_report.json). Point fields match
@@ -13,6 +17,7 @@ import sys
 from pathlib import Path
 
 exp = Path(sys.argv[1])
+MODE = sys.argv[2] if len(sys.argv) > 2 else "mqa"
 LOADS = [("k7-c1", "k7", 1), ("k7-c8", "k7", 8), ("k7-c16", "k7", 16), ("k7-c32", "k7", 32),
          ("k7-c64", "k7", 64), ("k7-c128", "k7", 128), ("k7-c256", "k7", 256),
          ("hs-k3-c768", "hs", 768), ("hs-k3-c1280", "hs", 1280)]
@@ -44,6 +49,23 @@ STRATEGIES = [
     ("C_M0_ko4", "control: M0 + KDA-only TP4", "M0", 4, False, False, "control"),
     ("C_M0_ko8", "control: M0 + KDA-only TP8", "M0", 8, False, False, "control"),
 ]
+
+
+if MODE == "topk":
+    _keep = {k: v for k, *v in STRATEGIES}
+    _s4 = {b: _keep[f"S4_M3_mhc_ko{b}"] for b in (2, 4, 8)}
+    STRATEGIES = [(k, *_keep[k]) for k in ("S0_base", "S1_M2", "S2_M3", "S3_M3_mhc")]
+    for b in (2, 4, 8):
+        name, moe, tp, mhc, gbm, note = _s4[b]
+        STRATEGIES.append((f"S4n_M3_mhc_ko{b}", name + " (nvshmem/nccl above the MNNVL budget)", moe, tp, mhc, False, note))
+        STRATEGIES.append((f"S4u_M3_mhc_ko{b}", name + " (+ unbudgeted MNNVL two-shot)", moe, tp, mhc, False,
+                           note + "; + flashinfer_mnnvl_unbudgeted_twoshot measured rows (16..256 rows per rank; "
+                           "larger calls extrapolated); not vLLM dispatch"))
+        STRATEGIES.append((f"S5u_M3_mhc_ko{b}_gbm", f"+ f_b/g_b merged, KDA-only TP{b} (unbudgeted)", moe, tp, mhc, True,
+                           "as S4u + measured bmm rows"))
+    STRATEGIES.append(("S5_M3_mhc_gbm", *_keep["S5_M3_mhc_gbm"]))
+    for k in ("S0_base", "S1_M2", "S2_M3", "S3_M3_mhc"):
+        pass
 
 
 def point(d, load):
@@ -89,6 +111,13 @@ STEP_IDS = [("0 base (indexer fix)", ["S0_base"]), ("1 + M2", ["S1_M2"]), ("2 M2
             ("4 + KDA-only TP (best b)", ["S3_M3_mhc", "S4_M3_mhc_ko2", "S4_M3_mhc_ko4", "S4_M3_mhc_ko8"])]
 GBM = {"S3_M3_mhc": "S5_M3_mhc_gbm", "S4_M3_mhc_ko2": "S5_M3_mhc_ko2_gbm",
        "S4_M3_mhc_ko4": "S5_M3_mhc_ko4_gbm", "S4_M3_mhc_ko8": "S5_M3_mhc_ko8_gbm"}
+SIDE = None
+if MODE == "topk":
+    STEP_IDS[0] = ("0 base (indexer mqa+topk fix)", ["S0_base"])
+    STEP_IDS[-1] = ("4 + KDA-only TP (best b, unbudgeted MNNVL)",
+                    ["S3_M3_mhc", "S4u_M3_mhc_ko2", "S4u_M3_mhc_ko4", "S4u_M3_mhc_ko8"])
+    SIDE = ("4' KDA-only TP, nvshmem pricing (side row)", ["S3_M3_mhc", "S4n_M3_mhc_ko2", "S4n_M3_mhc_ko4", "S4n_M3_mhc_ko8"])
+    GBM = {"S3_M3_mhc": "S5_M3_mhc_gbm", **{f"S4u_M3_mhc_ko{b}": f"S5u_M3_mhc_ko{b}_gbm" for b in (2, 4, 8)}}
 cumulative = []
 for load, _, _ in LOADS:
     rows, prev = [], None
@@ -111,10 +140,22 @@ for load, _, _ in LOADS:
         r["tpot_vs_prev_pct"] = 0.0 if prev is None else pct(r["tpot_ms"], prev["tpot_ms"])
         prev = r
     tp_options = {i: by[i][load]["tok_s"] for i in STEP_IDS[-1][1] if load in by[i]}
-    cumulative.append({"load": load, "kda_tp_options_tok_s": tp_options, "steps": rows})
+    entry = {"load": load, "kda_tp_options_tok_s": tp_options, "steps": rows}
+    if SIDE:
+        cands = [(by[i][load], i) for i in SIDE[1] if load in by[i]]
+        if cands and rows:
+            p, sid = max(cands, key=lambda c: c[0]["tok_s"])
+            step3 = next(r for r in rows if r["step"].startswith("3"))
+            entry["side_nvshmem_step4"] = dict(p, step=SIDE[0], strategy=sid,
+                                               tok_s_vs_baseline_pct=pct(p["tok_s"], rows[0]["tok_s"]),
+                                               tpot_vs_baseline_pct=pct(p["tpot_ms"], rows[0]["tpot_ms"]),
+                                               tok_s_vs_prev_pct=pct(p["tok_s"], step3["tok_s"]),
+                                               tpot_vs_prev_pct=pct(p["tpot_ms"], step3["tpot_ms"]))
+            entry["kda_tp_options_nvshmem_tok_s"] = {i: by[i][load]["tok_s"] for i in SIDE[1] if load in by[i]}
+    cumulative.append(entry)
 
 result = {"experiment": str(exp.resolve()),
-          "label": "all stacked: indexer fix -> M2 -> M3 -> mHC fuse -> KDA-only TP -> f_b/g_b merge "
+          "label": ("[mqa+topk baseline] " if MODE == "topk" else "[mqa-only baseline] ") + "all stacked: indexer fix -> M2 -> M3 -> mHC fuse -> KDA-only TP -> f_b/g_b merge "
                    "(MoE expert GEMM rows from the October nvfp4_fused_moe batch)",
           "strategies": strategies, "cumulative": cumulative, "baseline": "S0_base"}
 (exp / "results.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
@@ -127,7 +168,7 @@ L = ["# All stacked: GLM-5.3-Flash NVFP4 + DFlash2, 8x B200, attention DP8 + MoE
      "| load | step | strategy | tok/s | vs base | vs prev | TPOT mean ms | p50 | p90 | p99 | TTFT p50 ms | p90 | p99 | comm % |",
      "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
 for c in cumulative:
-    for r in c["steps"]:
+    for r in c["steps"] + ([c["side_nvshmem_step4"]] if "side_nvshmem_step4" in c else []):
         L.append(f"| {c['load']} | {r['step']} | {r['strategy']} | {f(r['tok_s'])} | {sg(r['tok_s_vs_baseline_pct'])} | "
                  f"{sg(r['tok_s_vs_prev_pct'])} | {f(r['tpot_ms'],2)} | {f(r['tpot_p50_ms'],2)} | {f(r['tpot_p90_ms'],2)} | "
                  f"{f(r['tpot_p99_ms'],2)} | {f(r['ttft_p50_ms'],1)} | {f(r['ttft_p90_ms'],1)} | {f(r['ttft_p99_ms'],1)} | {f(r['comm_share_pct'])} |")

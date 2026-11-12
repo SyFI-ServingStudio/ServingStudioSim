@@ -160,7 +160,7 @@ const fn default_glm52_nvfp4_max_model_len() -> u32 {
 
 /// The captured GLM-5.3-Flash deployment's `--max-model-len`.
 const ATTN_TP_LAYERS: &[&str] = &["all", "kda_only"];
-const ATTN_TP_COLLECTIVES: &[&str] = &["fast", "nccl"];
+const ATTN_TP_COLLECTIVES: &[&str] = &["fast", "nccl", "fast_unbudgeted"];
 
 const fn default_attn_tp() -> u16 {
     1

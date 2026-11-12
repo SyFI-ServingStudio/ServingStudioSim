@@ -164,3 +164,37 @@ register(
         ),
     )
 )
+
+# Same kernel and environment as ``flashinfer_mnnvl``, without vLLM's dispatch
+# budget: the workspace is sized to the largest requested tensor, so sizes vLLM
+# would route to another all-reduce still run here. Not production vLLM dispatch.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_mnnvl_unbudgeted",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_100a"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.comm.flashinfer_mnnvl",
+            function_name="profile_all_reduce_residual_rms_norm_unbudgeted_batch",
+        ),
+        table_name=KIND,
+        args_schema=AllReduceResidualRmsNormArgs,
+        metric_family=MetricFamily.COMM,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        imex_channel=True,
+        gpu_count_fn=lambda spec: int(spec["num_gpus"]),
+        list_native=True,
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer's MNNVL kARResidualRMSNorm with the spec's strategy (auto, "
+                "oneshot or twoshot) honoured "
+                "and the workspace sized to the request instead of vLLM's per-TP byte budget."
+            ),
+            url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/comm/trtllm_mnnvl_ar.py",
+        ),
+    )
+)

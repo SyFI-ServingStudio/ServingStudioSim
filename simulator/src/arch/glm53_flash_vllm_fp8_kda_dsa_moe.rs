@@ -973,6 +973,9 @@ enum Ffn {
 pub(crate) struct TpAllReduce {
     fused: Op<AllReduceFusionKernel>,
     large: Op<AllReduceKernel>,
+    /// Not vLLM dispatch: MNNVL with its workspace sized to the request, a
+    /// candidate beside `large` above the budget (the faster one is billed).
+    unbudgeted: Option<Op<AllReduceFusionKernel>>,
     max_fused_tokens: u32,
     bytes_per_token: u64,
 }
@@ -999,6 +1002,7 @@ impl TpAllReduce {
                 AllReduceKernel::build,
                 bridge,
             )?,
+            unbudgeted: None,
             max_fused_tokens: AllReduceFusionSpec::max_fused_tokens(&cfg.all_reduce),
             bytes_per_token: u64::from(cfg.all_reduce.hidden_dim)
                 * u64::from(cfg.all_reduce.dtype.size_bytes()),
@@ -1011,11 +1015,17 @@ impl TpAllReduce {
         self
     }
 
+    /// Add the unbudgeted MNNVL candidate above the FlashInfer budget
+    /// (`unbudgeted` field doc).
+    pub(crate) fn with_unbudgeted(mut self, op: Op<AllReduceFusionKernel>) -> Self {
+        self.unbudgeted = Some(op);
+        self
+    }
+
     pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        CostNode::Sum(vec![
-            self.fused.compile(builder),
-            self.large.compile(builder),
-        ])
+        let mut leaves = vec![self.fused.compile(builder), self.large.compile(builder)];
+        leaves.extend(self.unbudgeted.as_ref().map(|op| op.compile(builder)));
+        CostNode::Sum(leaves)
     }
 
     pub(crate) fn eval(&self, tokens: u32, ev: &mut Evaluator) {
@@ -1024,11 +1034,27 @@ impl TpAllReduce {
             message_size_bytes: u64::from(tokens) * self.bytes_per_token,
         };
         if tokens <= self.max_fused_tokens {
-            push(&self.fused, fused_input, ev);
+            push(&self.fused, fused_input.clone(), ev);
             ev.push(LeafMetrics::ZERO, || large_input.into());
-        } else {
-            ev.push(LeafMetrics::ZERO, || fused_input.into());
-            push(&self.large, large_input, ev);
+            if self.unbudgeted.is_some() {
+                ev.push(LeafMetrics::ZERO, || fused_input.into());
+            }
+            return;
+        }
+        ev.push(LeafMetrics::ZERO, || fused_input.clone().into());
+        let large = self.large.kernel.eval(&large_input);
+        match &self.unbudgeted {
+            None => ev.push(large, || large_input.into()),
+            Some(op) => {
+                let unbudgeted = op.kernel.eval(&fused_input);
+                if unbudgeted.m.time_ms < large.m.time_ms {
+                    ev.push(LeafMetrics::ZERO, || large_input.into());
+                    ev.push(unbudgeted, || fused_input.into());
+                } else {
+                    ev.push(large, || large_input.into());
+                    ev.push(LeafMetrics::ZERO, || fused_input.into());
+                }
+            }
         }
     }
 }

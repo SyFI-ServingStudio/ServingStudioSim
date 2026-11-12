@@ -188,7 +188,16 @@ pub enum AttnTpCollective {
     Fast,
     /// NCCL only (the pynccl path).
     Nccl,
+    /// `fast`, plus FlashInfer's MNNVL two-shot with the workspace sized to
+    /// the request above vLLM's budget (not vLLM dispatch); the fastest
+    /// measured candidate is billed.
+    FastUnbudgeted,
 }
+
+/// The unbudgeted MNNVL two-shot candidate (`AttnTpCollective::FastUnbudgeted`).
+const UNBUDGETED_ATTN_ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl_unbudgeted_twoshot"];
+const UNBUDGETED_MAX_TOKENS_PER_RANK: u32 =
+    crate::timing::kernels::all_reduce_fusion::UNBUDGETED_ROWS_PER_RANK[4];
 
 #[derive(Clone, Debug)]
 pub struct Glm53FlashDpAttnEpConfigs {
@@ -298,7 +307,9 @@ pub fn build_configs(
         local.large_all_reduce = attn.large_all_reduce;
         local.large_all_reduce.num_gpus = row_gpus;
         local.large_all_reduce.backends = match parallel.attn_tp_collective {
-            AttnTpCollective::Fast => LARGE_ATTN_ALL_REDUCE_BACKENDS.to_vec(),
+            AttnTpCollective::Fast | AttnTpCollective::FastUnbudgeted => {
+                LARGE_ATTN_ALL_REDUCE_BACKENDS.to_vec()
+            }
             AttnTpCollective::Nccl => vec!["nccl"],
         };
     }
@@ -1086,10 +1097,26 @@ fn build_group(
     let attn_all_reduce = tp_layer
         .then(|| tp_arch::TpAllReduce::build(p, "attn_tp_all_reduce", local, bridge))
         .transpose()?
-        .map(|op| match cfg.parallel.attn_tp_collective {
-            AttnTpCollective::Fast => op,
-            AttnTpCollective::Nccl => op.without_fused(),
-        });
+        .map(|op| -> std::result::Result<_, BuildError> {
+            Ok(match cfg.parallel.attn_tp_collective {
+                AttnTpCollective::Fast => op,
+                AttnTpCollective::Nccl => op.without_fused(),
+                AttnTpCollective::FastUnbudgeted => {
+                    let mut unbudgeted = local.all_reduce.clone();
+                    unbudgeted.backends = UNBUDGETED_ATTN_ALL_REDUCE_BACKENDS.to_vec();
+                    unbudgeted.fused_token_limit =
+                        Some(UNBUDGETED_MAX_TOKENS_PER_RANK * unbudgeted.num_gpus);
+                    op.with_unbudgeted(atomic(
+                        p,
+                        "attn_tp_all_reduce_unbudgeted",
+                        unbudgeted,
+                        crate::timing::kernels::AllReduceFusionKernel::build,
+                        bridge,
+                    )?)
+                }
+            })
+        })
+        .transpose()?;
     Ok(LayerGroup {
         label: group.label.clone(),
         layers: group.layers.clone(),
