@@ -13,28 +13,54 @@ pub fn compute_capability(gpu_name: &str) -> Option<(u32, u32)> {
     BY_NAME.get_or_init(load).get(&key(gpu_name)).copied()
 }
 
+/// The GPU's streaming-multiprocessor count, by catalog name or alias as
+/// [`compute_capability`]. `None` when the catalog does not record it: a
+/// kernel that launches one CTA per row runs in waves of this many rows.
+pub fn sm_count(gpu_name: &str) -> Option<u32> {
+    static BY_NAME: OnceLock<HashMap<String, u32>> = OnceLock::new();
+    BY_NAME
+        .get_or_init(|| {
+            let mut by_name = HashMap::new();
+            for gpu in catalog() {
+                if let Some(count) = gpu.sm_count {
+                    for name in std::iter::once(gpu.name).chain(gpu.aliases) {
+                        by_name.entry(key(&name)).or_insert(count);
+                    }
+                }
+            }
+            by_name
+        })
+        .get(&key(gpu_name))
+        .copied()
+}
+
 /// The form a GPU name is matched in.
 fn key(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
-fn load() -> HashMap<String, (u32, u32)> {
+#[derive(serde::Deserialize)]
+struct Gpu {
+    name: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    compute_capability: Option<String>,
+    sm_count: Option<u32>,
+}
+
+fn catalog() -> Vec<Gpu> {
     #[derive(serde::Deserialize)]
     struct Catalog {
         gpus: Vec<Gpu>,
     }
-    #[derive(serde::Deserialize)]
-    struct Gpu {
-        name: String,
-        #[serde(default)]
-        aliases: Vec<String>,
-        compute_capability: Option<String>,
-    }
-
     let catalog: Catalog = serde_json::from_str(include_str!("../../../gpu/spec.json"))
         .expect("gpu/spec.json is a GPU catalog");
+    catalog.gpus
+}
+
+fn load() -> HashMap<String, (u32, u32)> {
     let mut by_name = HashMap::new();
-    for gpu in catalog.gpus {
+    for gpu in catalog() {
         let Some(text) = gpu.compute_capability else {
             continue;
         };
@@ -56,7 +82,15 @@ fn load() -> HashMap<String, (u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_capability;
+    use super::{compute_capability, sm_count};
+
+    #[test]
+    fn sm_count_resolves_where_the_catalog_records_it() {
+        assert_eq!(sm_count("NVIDIA B200"), Some(148));
+        assert_eq!(sm_count("nvidia h200"), Some(132));
+        assert_eq!(sm_count("A100-SXM4-80GB"), None);
+        assert_eq!(sm_count("No Such GPU"), None);
+    }
 
     #[test]
     fn names_and_aliases_resolve_to_the_catalog_capability() {
