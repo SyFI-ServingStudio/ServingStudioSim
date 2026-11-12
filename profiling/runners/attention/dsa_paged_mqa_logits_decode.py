@@ -404,14 +404,20 @@ def _build_operands(
     block_size: int,
     device: str,
     context_mode: str = _CONTEXT_MODE,
+    request_lens: tuple[int, ...] | None = None,
 ) -> _DsaPagedMqaLogitsDecodeOperands:
     """Construct exact GLM operands and deterministic unique scattered pages.
 
     Request b owns ``ceil(length[b] / block_size)`` pages; block-table columns
-    past them stay 0 and are never read.
+    past them stay 0 and are never read. ``request_lens`` replaces the
+    ``context_mode`` shape with explicit per-request lengths (diagnostics that
+    replay recorded batches).
     """
     del max_model_len
-    request_lens = _request_context_lens(batch_size, context_len, context_mode)
+    if request_lens is None:
+        request_lens = _request_context_lens(batch_size, context_len, context_mode)
+    elif len(request_lens) != batch_size or max(request_lens) != context_len:
+        raise ValueError("request_lens must hold batch_size lengths whose max is context_len")
     request_pages = [(length + block_size - 1) // block_size for length in request_lens]
     logical_pages = max(request_pages)
     padded_context = logical_pages * block_size
