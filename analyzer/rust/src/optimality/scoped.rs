@@ -1319,16 +1319,32 @@ fn selected_semantics(
         .section(&occurrence.section)
         .context("selected section missing while applying location map")?;
     let leaf_names = descendant_leaves(manifest, occurrence.node_idx);
-    let mut semantics = BTreeSet::new();
+    // A row may be shared by several locations. A subtree owns it whole only
+    // when it holds every location that shares it.
+    let mut sharers: HashMap<&str, usize> = HashMap::new();
+    for rule in &map.locations {
+        for semantic in &rule.semantics {
+            *sharers.entry(semantic.as_str()).or_default() += 1;
+        }
+    }
+    let mut selected: HashMap<&str, usize> = HashMap::new();
     for location in leaf_names {
         let rule = rules
             .get(location.as_str())
             .with_context(|| format!("location map has no rule for selected leaf {location:?}"))?;
         for semantic in &rule.semantics {
-            if !semantics.insert(semantic.clone()) {
-                bail!("selected CostTree subtree maps semantic row {semantic:?} more than once");
-            }
+            *selected.entry(semantic.as_str()).or_default() += 1;
         }
+    }
+    let mut semantics = BTreeSet::new();
+    for (semantic, count) in selected {
+        if count != sharers[semantic] {
+            bail!(
+                "selected CostTree subtree holds {count} of the {} locations that share semantic row {semantic:?}",
+                sharers[semantic]
+            );
+        }
+        semantics.insert(semantic.to_owned());
     }
     Ok(semantics)
 }

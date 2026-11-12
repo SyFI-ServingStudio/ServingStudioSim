@@ -4036,6 +4036,71 @@ mod tests {
         }
     }
 
+    /// The Flash DP + DFlash2 necessary-work maps list exactly the compiled
+    /// non-communication locations, with and without HiSparse.
+    #[test]
+    fn glm53_flash_dp_dflash2_necessary_work_maps_cover_the_compiled_locations() {
+        use std::collections::BTreeSet;
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        for (hisparse, text) in [
+            (
+                serde_json::Value::Null,
+                include_str!(
+                    "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2_ep8.json"
+                ),
+            ),
+            (
+                serde_json::json!(49_152),
+                include_str!(
+                    "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2_ep8_hisparse.json"
+                ),
+            ),
+        ] {
+            let map: serde_json::Value = serde_json::from_str(text).unwrap();
+            let mapped: BTreeSet<_> = map["locations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["location"].as_str().unwrap())
+                .collect();
+            for draft_tokens in [3, 7] {
+                let sel: IterArchSel = serde_json::from_value(serde_json::json!({
+                    "type": "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+                    "model_config": Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("model/config/glm53_flash_nvfp4.json"),
+                    "fp8": false,
+                    "ep_size": 8,
+                    "max_model_len": 131_072,
+                    "draft_tokens": draft_tokens,
+                    "kda_state_dtype": "bf16",
+                    "hisparse_buffer_tokens": hisparse,
+                }))
+                .unwrap();
+                let built = glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+                    &sel,
+                    "NVIDIA B200",
+                    "unified",
+                    &bridge,
+                )
+                .unwrap();
+                let manifest = built.cost_log_manifest();
+                let actual: BTreeSet<_> = manifest
+                    .slots
+                    .iter()
+                    .filter(|slot| {
+                        !matches!(
+                            slot.kind.as_str(),
+                            "moe_ep_quantized_all_gather" | "moe_ep_reduce_scatter"
+                        )
+                    })
+                    .map(|slot| slot.name.as_str())
+                    .collect();
+                assert_eq!(actual, mapped, "hisparse={hisparse} k={draft_tokens}");
+            }
+        }
+    }
+
     #[test]
     fn glm52_sparse_layer_count_matches_the_checkpoint_schedule() {
         // A popularity profile is keyed by MoE layers, not decoder layers.

@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::fold::WorkerFoldAccumulator;
+use super::fold::{LocationCells, WorkerFoldAccumulator};
 use super::ladder::{AggregateLevel, KernelContribution, KernelLadder, KernelRungs};
 use super::levels::BaseRungs;
 use super::prepare::KernelLocation;
@@ -18,7 +18,7 @@ use super::{ms_to_s, TOP_KERNELS};
 /// Anchor the fold's per-`(location, worker)` R2..R5 cells with each worker's factor
 /// and sum per location → one `[R2, R3, R4, R5]` (GPU·ms) row per location.
 pub(super) fn aggregate_kernel_rungs(
-    sampled_rungs_by_location_worker: &HashMap<(u32, usize), [f64; 4]>,
+    sampled_rungs_by_location_worker: &HashMap<(u32, usize), LocationCells>,
     worker_anchor_factors: &[f64],
     num_locations: usize,
 ) -> Vec<[f64; 4]> {
@@ -133,7 +133,7 @@ pub(super) fn worker_kernel_ladders(
     kernel_locations: &[KernelLocation],
     workers: &[WorkerFoldAccumulator],
     worker_rungs_in_fold_order: &[BaseRungs],
-    sampled_rungs_by_location_worker: &HashMap<(u32, usize), [f64; 4]>,
+    sampled_rungs_by_location_worker: &HashMap<(u32, usize), LocationCells>,
     worker_anchor_factors: &[f64],
 ) -> Vec<KernelLadder> {
     let mut worker_indices: Vec<usize> = (0..workers.len()).collect();
@@ -147,7 +147,7 @@ pub(super) fn worker_kernel_ladders(
         .map(|worker_index| {
             let worker = &workers[worker_index];
             let worker_rungs = &worker_rungs_in_fold_order[worker_index];
-            let mut kernel_rows: Vec<(usize, [f64; 4])> = kernel_locations
+            let mut kernel_rows: Vec<(usize, LocationCells)> = kernel_locations
                 .iter()
                 .enumerate()
                 .filter_map(|(location_index, _)| {

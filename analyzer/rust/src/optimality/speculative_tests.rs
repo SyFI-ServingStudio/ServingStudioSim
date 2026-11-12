@@ -40,6 +40,20 @@ async fn speculative_exact_iteration_handoff_reconciles_r6_r7() {
             7,
             "glm53_vllm_nvfp4_dsa_moe_dflash2",
         ),
+        (
+            json!({"type":"glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+                "model_config":"model/config/glm53_flash_nvfp4.json",
+                "ep_size":8, "draft_tokens":7}),
+            7,
+            "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2_ep8",
+        ),
+        (
+            json!({"type":"glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+                "model_config":"model/config/glm53_flash_nvfp4.json",
+                "ep_size":8, "draft_tokens":7, "hisparse_buffer_tokens":49152}),
+            7,
+            "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2_ep8_hisparse",
+        ),
     ] {
         let dir = tempfile::tempdir_in(&logs).unwrap();
         std::fs::create_dir(dir.path().join("raw")).unwrap();

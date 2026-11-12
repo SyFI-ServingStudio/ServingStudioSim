@@ -192,3 +192,76 @@ def test_dflash2_geometry_needs_its_arch(tmp_path):
     write_params(tmp_path, arch={**DFLASH2_ARCH, "type": "glm52_vllm_nvfp4_dsa_moe"})
     result = floors.compute_floors(tmp_path, {"main": totals(depth=7, decode=((4104, 8),))})
     assert "requires a speculative architecture" in result["main"]["error"]
+
+
+# --- GLM-5.3-Flash NVFP4 target + its own DFlash2 draft --------------------------
+#
+# Draft checkpoint incoai/GLM-5.3-Flash-DFlash2 (`model/config/glm53_flash_dflash2.json`,
+# a verbatim copy of its config): five layers at the target's hidden 4096. The
+# target's KDA layers verify with RecoverSSM and commit afterwards, once per
+# KV-cache group: the commit groups share the KDA stacks' state-write rows.
+FLASH_DFLASH2_ARCH = {
+    "type": "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+    "model_config": str(ROOT / "model/config/glm53_flash_nvfp4.json"),
+    "fp8": False,
+    "ep_size": 8,
+    "draft_tokens": 7,
+}
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode", "mixed"])
+@pytest.mark.parametrize(
+    "map_name",
+    [
+        "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2_ep8",
+        "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2_ep8_hisparse",
+    ],
+)
+def test_flash_dflash2_floor_handoff_and_exact_semantic_coverage(tmp_path, phase, map_name):
+    write_params(tmp_path, arch=FLASH_DFLASH2_ARCH)
+    shape = totals(
+        depth=7,
+        prefill=() if phase == "decode" else ((0, 100),),
+        decode=() if phase == "prefill" else ((4104, 8),),
+    )
+    result = floors.compute_floors(tmp_path, {"main/0": shape})["main/0"]
+    assert "error" not in result, result
+    assert result["segmented"] >= result["necessary"] > 0
+    names = {s["name"] for s in result["segments"]}
+    assert any(name.startswith("dflash2_draft") for name in names)
+    mapping = json.loads((ROOT / f"model/work/location_maps/{map_name}.json").read_text())
+    assert mapping["arch_types"] == [FLASH_DFLASH2_ARCH["type"]]
+    rules = {row["location"]: row["semantics"] for row in mapping["locations"]}
+    assert all(len(rows) == len(set(rows)) for rows in rules.values())
+    assert {s for rows in rules.values() for s in rows} == names
+    # Rows listed by several locations are shared among them: every EP rank runs
+    # its stack's routed experts, and the four commit groups write every KDA
+    # stack's state, which the verify locations therefore do not own.
+    for tag in ("kda_moe", "dsa_moe"):
+        ranks = [rules[f"unified.{tag}.moe.routed_rank{rank}.fused_moe"] for rank in range(8)]
+        assert all(rows == [f"{tag}.expert_gate_up", f"{tag}.expert_down"] for rows in ranks)
+    writes = [
+        f"{tag}.recurrent_state.decode_write" for tag in ("first_kda_dense", "kda_dense", "kda_moe")
+    ]
+    assert all(rules[f"unified.kda_recoverssm_commit_group{group}"] == writes for group in range(4))
+    for tag in ("first_kda_dense", "kda_dense", "kda_moe"):
+        assert rules[f"unified.{tag}.kda.recoverssm_verify"] == [
+            f"{tag}.attn.decode",
+            f"{tag}.recurrent_state.decode_read",
+        ]
+    shared = {s for s in names if sum(s in rows for rows in rules.values()) > 1}
+    assert shared == {
+        *writes,
+        *(f"{t}.expert_{e}" for t in ("kda_moe", "dsa_moe") for e in ("gate_up", "down")),
+    }
+
+
+def test_flash_dflash2_omitted_depth_is_the_checkpoint_block(tmp_path):
+    # An omitted `draft_tokens` resolves to the arch's serde default (7), so a
+    # depth-7 log is accepted and a depth-5 one (the MTP default) is refused.
+    arch = {k: v for k, v in FLASH_DFLASH2_ARCH.items() if k != "draft_tokens"}
+    write_params(tmp_path, arch=arch)
+    ok = floors.compute_floors(tmp_path, {"main": totals(depth=7, decode=((4104, 8),))})["main"]
+    assert "error" not in ok, ok
+    bad = floors.compute_floors(tmp_path, {"main": totals(depth=5, decode=((4104, 6),))})["main"]
+    assert "draft depth disagrees" in bad["error"]

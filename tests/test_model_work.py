@@ -3337,3 +3337,58 @@ def test_unlocked_pipeline_stage_levels_add_up_to_one_whole_model(monkeypatch, a
     assert result["pp/__saturated_worker__/1"] == result["pp/1"]
     assert "sum of its stages" in result["pp"]["error"]
     assert "sum of its stages" in result["cluster"]["error"]
+
+
+# --- DFlash2 proposer of GLM-5.3-Flash (glm53_flash_vllm_nvfp4_*_dflash2) ---------
+#
+# Draft checkpoint incoai/GLM-5.3-Flash-DFlash2 (`model/config/glm53_flash_dflash2.json`):
+# five layers of the same block as above at the Flash target's hidden 4096, 32 query /
+# 8 KV heads of 128, `fc` over five target layers ([5, 14, 24, 33, 42] of 45).
+
+GLM53_FLASH_DFLASH2 = (
+    Path(__file__).resolve().parents[1] / "model" / "config" / "glm53_flash_dflash2.json"
+)
+GLM53_FLASH_NVFP4_TARGET = (
+    Path(__file__).resolve().parents[1] / "model" / "config" / "glm53_flash_nvfp4.json"
+)
+F_H, F_I, F_HQ, F_HKV, F_HD, F_L = 4096, 12288, 32, 8, 128, 5
+F_CONV_N = 2 * 2 * (F_H // 16)
+F_LAYER_PARAMS = (
+    (F_HQ + 2 * F_HKV) * F_HD * F_H  # q/k/v: 25,165,824
+    + F_H * F_HQ * F_HD  # o: 16,777,216
+    + 3 * F_H * F_I  # gate, up, down: 150,994,944
+    + 2 * F_CONV_N * F_H  # conv projections: 8,388,608
+    + 2 * (2 * 2 * F_H)  # conv base kernels: 32,768
+    + 2 * F_H  # input / post-attention norms
+    + 2 * F_HD  # q_norm, k_norm
+)
+F_PARAMS = (
+    F_L * F_LAYER_PARAMS
+    + F_H * 5 * F_H  # fc over five target layers
+    + 2 * F_H  # hidden_norm, final norm
+    + D_RANK * F_H  # selector hidden_projection
+    + 2 * D_V * D_RANK  # predecessor / successor codebooks
+)
+
+
+def test_flash_dflash2_draft_params_and_stage_goldens():
+    assert F_LAYER_PARAMS == 201_367_808
+    assert F_PARAMS == 1_171_080_448
+    model = work_floors._dflash2_model(str(GLM53_FLASH_NVFP4_TARGET), str(GLM53_FLASH_DFLASH2), D_W)
+    target = load_model(GLM53_FLASH_NVFP4_TARGET)
+    wl = _dflash2_workload([[0, 16]], [[100, 8], [4104, 8]])
+    body = target.label(replace(wl, stages={})).params["total"]
+    assert model.label(wl).params["total"] - body == F_PARAMS
+    # R = 3 requests, k = 7, C = 32 context rows, 24 draft rows, 21 scored positions.
+    seg = {s.name: s for s in model.label(wl).segments}
+    assert seg["dflash2_context.fc"].flops_total == 2 * 32 * F_H * 5 * F_H
+    assert seg["dflash2_context_kv.kv_proj"].flops_total == F_L * 2 * 32 * 2 * F_HKV * F_HD * F_H
+    assert seg["dflash2_context_kv.kv_cache_append"].bytes_total == F_L * 32 * 2 * F_HKV * F_HD
+    assert seg["dflash2_draft.qkv"].flops_total == F_L * 2 * 24 * (F_HQ + 2 * F_HKV) * F_HD * F_H
+    pairs = 8 * 108 + (8 * 2048 + 28) + 8 * 24
+    assert seg["dflash2_draft.attn"].flops_total == F_L * 4 * F_HQ * F_HD * pairs
+    assert seg["dflash2_select.lm_head"].flops_total == 2 * 21 * F_H * D_V
+    # The KDA target rows are the Flash model's own: one state read and write per
+    # verifying request and layer, whatever the verify width.
+    assert seg["kda_moe.recurrent_state.decode_read"].bytes_total > 0
+    assert seg["kda_moe.recurrent_state.decode_write"].bytes_total > 0

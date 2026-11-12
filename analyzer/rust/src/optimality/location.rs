@@ -5,6 +5,10 @@
 //! all-or-nothing so an arch change cannot silently turn missing necessary work into
 //! zero. Communication leaves are exempt because necessary model work is local work.
 //!
+//! A semantic row listed by several locations is work those locations perform
+//! together, such as one routed-expert stack run by every EP rank: the row is
+//! split among them (see [`semantic_shares`]) and still counted once in total.
+//!
 //! A pipeline-parallel arch's map covers the whole pipeline, while each stage
 //! worker's manifest holds only its own layers' locations. A stage therefore uses
 //! the one map of its arch that contains all of its locations, restricted to them;
@@ -235,6 +239,7 @@ impl LocationCatalog {
             .iter()
             .map(|location| (location.name.as_str(), location.kind.as_str()))
             .collect();
+        let shares = semantic_shares(location_map, ladder);
         let mut work_by_location: BTreeMap<&str, KernelNecessaryWork> = BTreeMap::new();
         let mut expected_floors = Floors::default();
         for (label, occurrences) in labels {
@@ -276,10 +281,11 @@ impl LocationCatalog {
                         let row = semantic_work.get(semantic.as_str()).with_context(|| {
                             format!("mapped semantic row {semantic:?} is absent")
                         })?;
-                        total.flops += row.flops;
-                        total.bytes += row.bytes;
-                        total.roofline_gpu_s += row.roofline_gpu_s;
-                        total.compute_gpu_s += row.compute_gpu_s;
+                        let share = shares[&(rule.location.as_str(), semantic.as_str())];
+                        total.flops += row.flops * share;
+                        total.bytes += row.bytes * share;
+                        total.roofline_gpu_s += row.roofline_gpu_s * share;
+                        total.compute_gpu_s += row.compute_gpu_s * share;
                         Ok::<_, anyhow::Error>(total)
                     },
                 )?;
@@ -370,6 +376,46 @@ impl LocationCatalog {
             mapping_id: location_map.mapping_id.clone(),
         })
     }
+}
+
+/// Each location's share of every semantic row it lists, keyed by
+/// `(location, semantic)`. A row listed by one location is wholly that
+/// location's. A row listed by several is split in proportion to their R5
+/// hardware-limit GPU-seconds, the work each of them did at the hardware's
+/// rate, and evenly when none of them has any. The split only places the row
+/// among its locations; the shares of a row sum to one.
+fn semantic_shares<'a>(
+    location_map: &'a LocationMap,
+    ladder: &KernelLadder,
+) -> BTreeMap<(&'a str, &'a str), f64> {
+    let hardware_limit: BTreeMap<&str, f64> = ladder
+        .kernels
+        .iter()
+        .map(|kernel| (kernel.name.as_str(), kernel.rungs.hardware_limit.max(0.0)))
+        .collect();
+    let mut sharers: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for rule in &location_map.locations {
+        for semantic in &rule.semantics {
+            sharers
+                .entry(semantic.as_str())
+                .or_default()
+                .push(rule.location.as_str());
+        }
+    }
+    let mut shares = BTreeMap::new();
+    for (semantic, locations) in sharers {
+        let weight = |location: &str| hardware_limit.get(location).copied().unwrap_or(0.0);
+        let total: f64 = locations.iter().map(|location| weight(location)).sum();
+        for location in &locations {
+            let share = if total > 0.0 {
+                weight(location) / total
+            } else {
+                1.0 / locations.len() as f64
+            };
+            shares.insert((*location, semantic), share);
+        }
+    }
+    shares
 }
 
 /// The one map of `arch_type` whose locations are exactly the worker's
@@ -472,10 +518,18 @@ fn validate_mapping(
         .iter()
         .flat_map(|rule| rule.semantics.iter().map(String::as_str))
         .collect();
-    let unique_semantics: BTreeSet<&str> = mapped_semantics.iter().copied().collect();
-    if unique_semantics.len() != mapped_semantics.len() {
-        bail!("location map consumes a semantic row more than once");
+    // A row may be listed by several locations that share it; one location
+    // listing it twice would take two shares of it.
+    for rule in &location_map.locations {
+        let listed: BTreeSet<&str> = rule.semantics.iter().map(String::as_str).collect();
+        if listed.len() != rule.semantics.len() {
+            bail!(
+                "location {:?} lists a semantic row more than once",
+                rule.location
+            );
+        }
     }
+    let unique_semantics: BTreeSet<&str> = mapped_semantics.iter().copied().collect();
     if expected_semantics != unique_semantics {
         bail!(
             "semantic map mismatch; missing={:?}, extra={:?}",
@@ -526,7 +580,8 @@ mod tests {
         };
         assert!(validate_mapping(&complete, &[location("model.gemm")], &[segment("gemm")]).is_ok());
 
-        let duplicate_semantic = LocationMap {
+        // Two locations may share one row; one location may not list it twice.
+        let shared_semantic = LocationMap {
             locations: vec![
                 LocationRule {
                     location: "model.gemm".to_string(),
@@ -537,14 +592,66 @@ mod tests {
                     semantics: vec!["gemm".to_string()],
                 },
             ],
-            ..complete
+            ..complete.clone()
         };
         assert!(validate_mapping(
-            &duplicate_semantic,
+            &shared_semantic,
             &[location("model.gemm"), location("model.norm")],
             &[segment("gemm")],
         )
-        .is_err());
+        .is_ok());
+        let listed_twice = LocationMap {
+            locations: vec![LocationRule {
+                location: "model.gemm".to_string(),
+                semantics: vec!["gemm".to_string(), "gemm".to_string()],
+            }],
+            ..complete
+        };
+        assert!(
+            validate_mapping(&listed_twice, &[location("model.gemm")], &[segment("gemm")]).is_err()
+        );
+    }
+
+    /// A row shared by several locations is split by their R5 GPU-seconds and
+    /// evenly when they have none, and its shares sum to one either way.
+    #[test]
+    fn a_shared_semantic_row_is_split_by_hardware_limit() {
+        let location_map = LocationMap {
+            schema_version: 1,
+            mapping_id: "test".to_string(),
+            arch_types: vec!["test".to_string()],
+            locations: ["rank0", "rank1", "norm"]
+                .into_iter()
+                .map(|name| LocationRule {
+                    location: name.to_string(),
+                    semantics: vec![if name == "norm" { "norm" } else { "experts" }.to_string()],
+                })
+                .collect(),
+        };
+        let ladder_with = |limits: [f64; 2]| {
+            let kernels = ["rank0", "rank1"]
+                .into_iter()
+                .zip(limits)
+                .map(|(name, hardware_limit)| KernelContribution {
+                    name: name.to_string(),
+                    kind: "single_gemm".to_string(),
+                    is_comm: false,
+                    rungs: KernelRungs {
+                        hardware_limit,
+                        ..KernelRungs::default()
+                    },
+                    necessary_work: None,
+                })
+                .collect();
+            KernelLadder::worker("main", 0, &BaseRungs::default(), kernels)
+        };
+        let shares = semantic_shares(&location_map, &ladder_with([3.0, 1.0]));
+        assert_eq!(shares[&("rank0", "experts")], 0.75);
+        assert_eq!(shares[&("rank1", "experts")], 0.25);
+        assert_eq!(shares[&("norm", "norm")], 1.0);
+        let even = semantic_shares(&location_map, &ladder_with([0.0, 0.0]));
+        assert_eq!(even[&("rank0", "experts")], 0.5);
+        assert_eq!(even[&("rank1", "experts")], 0.5);
     }
 
     /// One semantic row whose two roofline terms are set independently, so a
@@ -615,7 +722,7 @@ mod tests {
                 name: "unified.fused".to_string(),
                 kind: "single_gemm".to_string(),
                 is_comm: false,
-                rungs: KernelRungs::from_gpu_ms([10_000.0, 9_000.0, 9_000.0, 8_000.0]),
+                rungs: KernelRungs::from_gpu_ms([10_000.0, 9_000.0, 9_000.0, 8_000.0, 0.0]),
                 necessary_work: None,
             }],
         );

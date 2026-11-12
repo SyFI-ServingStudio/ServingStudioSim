@@ -127,18 +127,39 @@ _FP4_ARCHS = frozenset(
         "glm53_flash_vllm_nvfp4_kda_dsa_moe",
         "glm53_flash_vllm_nvfp4_pp_kda_dsa_moe",
         "glm53_flash_vllm_nvfp4_dp_attn_ep_moe",
+        "glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2",
+        "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
     }
 )
 
 #: Speculative arch types: their cost log carries per-stage request geometry.
 _SPECULATIVE_ARCHS = frozenset(
-    {"glm52_vllm_nvfp4_dsa_moe_speculative", "glm53_vllm_nvfp4_dsa_moe_dflash2"}
+    {
+        "glm52_vllm_nvfp4_dsa_moe_speculative",
+        "glm53_vllm_nvfp4_dsa_moe_dflash2",
+        "glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2",
+        "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+    }
 )
+
+#: Each speculative arch's ``draft_tokens`` serde default (``simulator/src/arch/
+#: config.rs``): params.json records the run config as written, so an omitted
+#: depth must resolve to what the simulator ran, not another arch's default.
+_DEFAULT_DRAFT_TOKENS = {
+    "glm52_vllm_nvfp4_dsa_moe_speculative": 5,
+    "glm53_vllm_nvfp4_dsa_moe_dflash2": 7,
+    "glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2": 7,
+    "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2": 7,
+}
 
 #: The proposer of a speculative arch that ships as its own checkpoint, by the
 #: draft's ``config.json`` under the repo root. The run's params name only the
 #: target's config; the draft is fixed by the arch.
-_DRAFT_CONFIGS = {"glm53_vllm_nvfp4_dsa_moe_dflash2": "model/config/glm53_dflash2.json"}
+_DRAFT_CONFIGS = {
+    "glm53_vllm_nvfp4_dsa_moe_dflash2": "model/config/glm53_dflash2.json",
+    "glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2": "model/config/glm53_flash_dflash2.json",
+    "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2": "model/config/glm53_flash_dflash2.json",
+}
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -251,7 +272,7 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
         specs[pool_tag] = {
             "arch_type": arch_type,
             "mtp_mode": arch.get("mtp_mode", "index_share"),
-            "draft_tokens": arch.get("draft_tokens", 5),
+            "draft_tokens": arch.get("draft_tokens", _DEFAULT_DRAFT_TOKENS.get(arch_type)),
             "draft_sliding_window": arch.get("draft_sliding_window"),
             "config": arch["model_config"],
             # `gpu` is a group-level field (the arch block carries model/tp/fp8).

@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+use super::fold::{LocationCells, COMPUTE_BOUND_HARDWARE_GAP_CELL};
 use super::levels::BaseRungs;
 use super::{ms_to_s, under_accounted_difference};
 
@@ -160,16 +161,30 @@ pub(super) struct KernelRungs {
     pub(super) per_config_best: f64,
     pub(super) ignore_network: f64,
     pub(super) hardware_limit: f64,
+    /// Part of `ignore_network - hardware_limit` from rows where the hardware
+    /// limit used the compute peak; the rest used the memory-bandwidth peak.
+    pub(super) compute_bound_hardware_gap: f64,
 }
 
 impl KernelRungs {
-    pub(super) fn from_gpu_ms(rungs: [f64; 4]) -> Self {
+    pub(super) fn from_gpu_ms(cells: LocationCells) -> Self {
         Self {
-            balanced: ms_to_s(rungs[0]),
-            per_config_best: ms_to_s(rungs[1]),
-            ignore_network: ms_to_s(rungs[2]),
-            hardware_limit: ms_to_s(rungs[3]),
+            balanced: ms_to_s(cells[0]),
+            per_config_best: ms_to_s(cells[1]),
+            ignore_network: ms_to_s(cells[2]),
+            hardware_limit: ms_to_s(cells[3]),
+            compute_bound_hardware_gap: ms_to_s(cells[COMPUTE_BOUND_HARDWARE_GAP_CELL]),
         }
+    }
+
+    /// The hardware gap split by which hardware peak bounded R5.
+    fn hardware_gap_by_bound_json(&self) -> Value {
+        let hardware_gap = (self.ignore_network - self.hardware_limit).max(0.0);
+        let compute = self.compute_bound_hardware_gap.clamp(0.0, hardware_gap);
+        json!({
+            "compute_gpu_s": compute,
+            "memory_gpu_s": hardware_gap - compute,
+        })
     }
 
     fn add_assign(&mut self, other: Self) {
@@ -177,6 +192,7 @@ impl KernelRungs {
         self.per_config_best += other.per_config_best;
         self.ignore_network += other.ignore_network;
         self.hardware_limit += other.hardware_limit;
+        self.compute_bound_hardware_gap += other.compute_bound_hardware_gap;
     }
 }
 
@@ -337,6 +353,7 @@ impl KernelContribution {
             "kind": self.kind,
             "is_comm": self.is_comm,
             "rungs": rung_value,
+            "hardware_gap_by_bound": self.rungs.hardware_gap_by_bound_json(),
         });
         if let Some(necessary_work) = &self.necessary_work {
             value["necessary_work"] = necessary_work.to_json(self.rungs.hardware_limit);
@@ -706,6 +723,7 @@ mod tests {
                 per_config_best: balanced,
                 ignore_network: balanced,
                 hardware_limit: balanced,
+                compute_bound_hardware_gap: 0.0,
             },
             necessary_work: Some(KernelNecessaryWork {
                 semantics: BTreeSet::from([name.to_string()]),

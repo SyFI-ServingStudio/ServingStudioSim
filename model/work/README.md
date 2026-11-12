@@ -286,6 +286,26 @@ Every scheduled request drafts, prefilling or verifying. The simulator prices
 no separate draft final norm, so `glm53_vllm_nvfp4_dsa_moe_dflash2.json` maps
 that learned scale to the selector's `lm_head` location it feeds.
 
+The two GLM-5.3-Flash NVFP4 DFlash2 arches (`glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2`,
+`glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2`) attach the Flash draft
+(`model/config/glm53_flash_dflash2.json`, a verbatim copy of
+`incoai/GLM-5.3-Flash-DFlash2`'s config: five layers at hidden 4096) to the Flash
+target the same way. The target's KDA rows are unchanged: one state read and one
+write per verifying request and layer. The simulator verifies with RecoverSSM and
+commits per KV-cache group afterwards, so each stack's `recoverssm_verify`
+location owns its attention and state-read rows, and the four
+`kda_recoverssm_commit_group*` locations share the three stacks' state-write rows.
+Location maps exist for the DP-attention EP8 deployment with and without HiSparse
+(whose analytic `hisparse.h2d_miss_io` location owns no row); the TP8 deployment
+has none yet.
+
+A map may list one semantic row under several locations when they perform it
+together: the commit groups above, and the eight `routed_rank*.fused_moe`
+locations of each MoE stack in these three maps (the older Flash maps still put
+a stack's expert rows on rank 0 alone). The analyzer splits such a row among its
+locations in proportion to their R5 hardware-limit GPU-seconds, so the row is
+still counted once; a location may not list a row twice.
+
 Request-side admission/completion telemetry separately records completed rounds,
 emitted outputs, resident KV, and pending work. Conservation uses those facts,
 not an average acceptance-rate estimate, including at a mid-iteration stop.

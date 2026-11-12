@@ -185,7 +185,7 @@ pub async fn run_optimality(
 
     // Sampled fold for R2..R5 + per-(location, worker) raw contributions.
     let sample_stride = fold::choose_stride(ctx).await?;
-    let mut sampled_rungs_by_location_worker: HashMap<(u32, usize), [f64; 4]> = HashMap::new();
+    let mut sampled_rungs_by_location_worker: HashMap<(u32, usize), fold::LocationCells> = HashMap::new();
     let sampled_row_count = fold::accumulate_fold(
         ctx,
         sample_stride,

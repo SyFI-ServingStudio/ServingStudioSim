@@ -134,6 +134,12 @@ pub(super) async fn choose_stride(ctx: &SessionContext) -> Result<u64> {
     Ok((num_iters / TARGET_SAMPLED_ITERS).clamp(1, MAX_STRIDE))
 }
 
+/// One `(location, worker)` cell: the leaf's attributed `[R2, R3, R4, R5]` GPU·ms
+/// plus the part of its hardware gap (`R4 - R5`) that came from rows where R5 used
+/// the compute peak. The rest of the gap used the memory-bandwidth peak.
+pub(super) type LocationCells = [f64; 5];
+pub(super) const COMPUTE_BOUND_HARDWARE_GAP_CELL: usize = 4;
+
 /// Fold the stride-sampled rows: per row the balanced R2..R5 tree values into its
 /// worker, and their per-leaf attribution into `(location, worker)`.
 pub(super) async fn accumulate_fold(
@@ -144,7 +150,7 @@ pub(super) async fn accumulate_fold(
     section_fold_plan_by_key: &HashMap<(String, u16, String), SectionFoldPlan>,
     worker_index_by_key: &HashMap<(String, u16), usize>,
     workers: &mut [WorkerFoldAccumulator],
-    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 4]>,
+    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), LocationCells>,
 ) -> Result<u64> {
     let sql = format!(
         "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, worker_id, \
@@ -177,7 +183,7 @@ pub(super) async fn accumulate_iteration_fold(
     section_fold_plan_by_key: &HashMap<(String, u16, String), SectionFoldPlan>,
     worker_index_by_key: &HashMap<(String, u16), usize>,
     workers: &mut [WorkerFoldAccumulator],
-    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 4]>,
+    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), LocationCells>,
 ) -> Result<u64> {
     let pool_tag = sql_string_literal(pool_tag);
     let sql = format!(
@@ -208,12 +214,13 @@ async fn accumulate_fold_query(
     section_fold_plan_by_key: &HashMap<(String, u16, String), SectionFoldPlan>,
     worker_index_by_key: &HashMap<(String, u16), usize>,
     workers: &mut [WorkerFoldAccumulator],
-    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 4]>,
+    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), LocationCells>,
 ) -> Result<u64> {
     let record_batches = collect(ctx, &sql).await?;
     let mut sampled_rows = 0u64;
     let mut balanced_fold = BalancedFold::<4>::default();
     let mut leaf_rungs_by_slot: Vec<[f64; 4]> = Vec::new();
+    let mut uses_compute_throughput_by_slot: Vec<bool> = Vec::new();
     for batch in &record_batches {
         let pool_tags = string_column(batch, "pool_tag")?;
         let worker_ids = col(batch, "worker_id")?;
@@ -264,6 +271,8 @@ async fn accumulate_fold_query(
             let num_slots = fold_plan.location_id_by_slot.len();
             leaf_rungs_by_slot.clear();
             leaf_rungs_by_slot.resize(num_slots, [0.0; 4]);
+            uses_compute_throughput_by_slot.clear();
+            uses_compute_throughput_by_slot.resize(num_slots, false);
             for (slot, value_index) in (start..end).enumerate().take(num_slots) {
                 let observed_time_ms = times.value(value_index) as f64;
                 let leaf_flops = flops.value(value_index) as f64;
@@ -301,6 +310,7 @@ async fn accumulate_fold_query(
                         hardware_bandwidth_gbps,
                     )
                 };
+                uses_compute_throughput_by_slot[slot] = uses_compute_throughput;
                 // R2 real, R3 per-config-best, R4 drop-comm, R5 hardware.
                 leaf_rungs_by_slot[slot] = [
                     observed_time_ms,
@@ -328,9 +338,13 @@ async fn accumulate_fold_query(
                     };
                     let location_worker_rungs = sampled_rungs_by_location_worker
                         .entry((location_id, worker_index))
-                        .or_insert([0.0; 4]);
+                        .or_insert([0.0; 5]);
                     for rung_index in 0..4 {
                         location_worker_rungs[rung_index] += contribution_ms[rung_index];
+                    }
+                    if uses_compute_throughput_by_slot[slot] {
+                        location_worker_rungs[COMPUTE_BOUND_HARDWARE_GAP_CELL] +=
+                            contribution_ms[2] - contribution_ms[3];
                     }
                 },
             );
