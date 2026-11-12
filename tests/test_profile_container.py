@@ -325,6 +325,8 @@ def test_imex_channel_is_declared_by_the_fabric_memory_backends_only() -> None:
         if spec.imex_channel
     }
     assert declared == {
+        ("all_gather", "mnnvl_lamport"),
+        ("all_gather", "mnnvl_pull"),
         ("all_reduce_fusion", "flashinfer_mnnvl"),
         ("all_reduce_fusion", "flashinfer_mnnvl_unbudgeted_oneshot"),
         ("all_reduce_fusion", "flashinfer_mnnvl_unbudgeted_twoshot"),

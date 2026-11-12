@@ -11,7 +11,12 @@ Times the repo's fixed-pattern exchange kernels (``mnnvl_fixed_exchange``):
   rows from every rank and sums them;
 * ``moe_ep_quantize_and_all_gather`` / ``mnnvl_lamport``: bf16 rows
   NVFP4-quantized inside the dispatch push (quantization + all-gather in one
-  launch).
+  launch);
+* ``all_gather`` / ``mnnvl_lamport``: plain bf16 rows all-gathered by the
+  dispatch push (one plane);
+* ``all_gather`` / ``mnnvl_pull``: every rank's rows already sit in its own
+  mapped region (the producer wrote them there) and every rank copies all of
+  them out after the ready flags.
 
 One spawn per chunk maps the workspace once, sized for the chunk's largest
 per-rank count, and loops every shape inside it. Every shape is first checked
@@ -57,6 +62,14 @@ def profile_moe_ep_quantize_and_all_gather_batch(kwargs_list: list[dict]) -> lis
     return _run(kwargs_list, "quant_dispatch")
 
 
+def profile_all_gather_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
+    return _run(kwargs_list, "gather")
+
+
+def profile_all_gather_pull_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
+    return _run(kwargs_list, "pull_gather")
+
+
 def _run(kwargs_list: list[dict], leg: str) -> list[RunnerResult]:
     if not kwargs_list:
         return []
@@ -71,6 +84,8 @@ def _run(kwargs_list: list[dict], leg: str) -> list[RunnerResult]:
         "quant_dispatch": _quant_dispatch_per_rank,
         "combine": _combine_per_rank,
         "pull": _pull_per_rank,
+        "gather": _gather_per_rank,
+        "pull_gather": _pull_gather_per_rank,
     }[leg]
     return run_comm_batch(launcher, per_rank, kwargs_list)
 
@@ -92,18 +107,18 @@ def spec_error(spec: dict, leg: str) -> str | None:
             return "hidden_size must be a multiple of 256 and top_k of 4 (16-byte planes)"
     else:
         if str(spec["dtype"]) != "bf16":
-            return "the fixed exchange combines bf16 partials only"
+            return "the fixed exchange moves bf16 rows only here"
         if hidden % 8:
             return "hidden_size must be a multiple of 8"
     return None
 
 
 # --------------------------------------------------------------------------- per-rank bodies
-def _session(rank: int, world: int, specs: list[dict]):
+def _session(rank: int, world: int, specs: list[dict], bf16_rows: bool = False):
     try:
         import torch
 
-        from profiling.runners.comm.mnnvl_fixed_exchange import FixedExchange
+        from profiling.runners.comm.mnnvl_fixed_exchange import DispatchRow, FixedExchange
     except ImportError as exc:
         raise ProfilerNotImplemented(f"fixed exchange needs torch and flashinfer: {exc}") from exc
     max_rows = max(int(t) for spec in specs for t in spec["per_rank_tokens"])
@@ -112,14 +127,15 @@ def _session(rank: int, world: int, specs: list[dict]):
     if any(int(s["hidden_size"]) != hidden or int(s.get("top_k", top_k)) != top_k for s in specs):
         raise KernelLaunchFailed("one chunk must share hidden_size and top_k")
     try:
-        exchange = FixedExchange(rank, world, max_rows, hidden, top_k)
+        row = DispatchRow.bf16(hidden) if bf16_rows else None
+        exchange = FixedExchange(rank, world, max_rows, hidden, top_k, row=row)
     except Exception as exc:  # noqa: BLE001 — fabric memory is a host capability
         raise KernelLaunchFailed(f"MNNVL workspace allocation failed: {exc}") from exc
     return torch, exchange
 
 
-def _per_rank(rank, world_size, specs, body) -> list[dict] | None:
-    torch, exchange = _session(rank, world_size, specs)
+def _per_rank(rank, world_size, specs, body, bf16_rows=False) -> list[dict] | None:
+    torch, exchange = _session(rank, world_size, specs, bf16_rows)
     results = []
     try:
         for spec in specs:
@@ -148,6 +164,14 @@ def _combine_per_rank(*, rank, world_size, specs, warmup, rep):
 
 def _pull_per_rank(*, rank, world_size, specs, warmup, rep):
     return _per_rank(rank, world_size, specs, _time_pull)
+
+
+def _gather_per_rank(*, rank, world_size, specs, warmup, rep):
+    return _per_rank(rank, world_size, specs, _time_gather, bf16_rows=True)
+
+
+def _pull_gather_per_rank(*, rank, world_size, specs, warmup, rep):
+    return _per_rank(rank, world_size, specs, _time_pull_gather, bf16_rows=True)
 
 
 # ------------------------------------------------------------------------------ references
@@ -387,3 +411,45 @@ def _time_pull(torch, exchange, counts, rank, world):
     time_ms = _graph_time_ms(torch, lambda: exchange.pull_combine(out), total * hidden * 2)
     dist.barrier()
     return _metrics(time_ms, *_busiest_combine_bytes(counts, hidden))
+
+
+def _rows(torch, rank, count, hidden):
+    g = torch.Generator(device="cuda").manual_seed(4000 + rank)
+    return (torch.randn((count, hidden), generator=g, device="cuda") * 2).to(torch.bfloat16)
+
+
+def _gather_reference(torch, counts, hidden):
+    return torch.cat([_rows(torch, r, c, hidden) for r, c in enumerate(counts)])
+
+
+def _time_gather(torch, exchange, counts, rank, world):
+    hidden = exchange.hidden_size
+    total = sum(counts)
+    rows = _rows(torch, rank, counts[rank], hidden)
+    out = torch.empty((total, hidden), dtype=torch.bfloat16, device="cuda")
+    exchange.all_gather(rows, out)
+    torch.cuda.synchronize()
+    _expect_equal(torch, "all-gather", out, _gather_reference(torch, counts, hidden))
+    time_ms = _graph_time_ms(torch, lambda: exchange.all_gather(rows, out), total * hidden * 2)
+    return _metrics(time_ms, *_busiest_dispatch_bytes(counts, 2 * hidden))
+
+
+def _time_pull_gather(torch, exchange, counts, rank, world):
+    import torch.distributed as dist
+
+    hidden = exchange.hidden_size
+    total = sum(counts)
+    first = sum(counts[:rank])
+    rows = _rows(torch, rank, counts[rank], hidden)
+    # Both sets hold this rank's rows, so graph replays of either round parity read them.
+    for set_index in (0, 1):
+        exchange.partials(set_index, total)[first : first + counts[rank]].copy_(rows)
+    torch.cuda.synchronize()
+    dist.barrier()
+    out = torch.empty((total, hidden), dtype=torch.bfloat16, device="cuda")
+    exchange.pull_gather(out)
+    torch.cuda.synchronize()
+    _expect_equal(torch, "pull all-gather", out, _gather_reference(torch, counts, hidden))
+    time_ms = _graph_time_ms(torch, lambda: exchange.pull_gather(out), total * hidden * 2)
+    dist.barrier()
+    return _metrics(time_ms, *_busiest_dispatch_bytes(counts, 2 * hidden))

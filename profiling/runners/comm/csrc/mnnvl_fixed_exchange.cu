@@ -53,8 +53,9 @@ DispatchPlanes make_planes(int64_t payload, int64_t scales, int64_t weights, int
   DispatchPlanes p{};
   int64_t const bytes[kNumPlanes] = {payload, scales, weights, ids};
   for (int i = 0; i < kNumPlanes; ++i) {
-    TVM_FFI_ICHECK(bytes[i] > 0 && bytes[i] % 16 == 0)
-        << "plane " << i << " row bytes " << bytes[i] << " must be a positive multiple of 16";
+    // An empty plane is skipped (the bf16 row gather sends one plane).
+    TVM_FFI_ICHECK(bytes[i] >= 0 && bytes[i] % 16 == 0)
+        << "plane " << i << " row bytes " << bytes[i] << " must be a multiple of 16";
     p.bytes[i] = static_cast<int>(bytes[i]);
     p.vectors[i] = static_cast<int>(bytes[i] / 16);
     p.row_vectors += p.vectors[i];
@@ -94,8 +95,12 @@ int64_t max_resident_blocks(int64_t which) {
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, fixed_combine_kernel<kThreads>,
                                                     kThreads, 0);
       break;
-    default:
+    case 3:
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, pull_combine_kernel<kThreads>,
+                                                    kThreads, 0);
+      break;
+    default:
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, pull_gather_kernel<kThreads>,
                                                     kThreads, 0);
       break;
   }
@@ -173,6 +178,21 @@ void pull_combine(tvm::ffi::TensorView config, int64_t hidden_size, int64_t out,
   check_launch("pull_combine");
 }
 
+void pull_gather(tvm::ffi::TensorView config, int64_t hidden_size, int64_t out, int64_t counts,
+                 int64_t set, int64_t blocks, int64_t stream) {
+  TVM_FFI_ICHECK(set == 0 || set == 1) << "source set must be 0 or 1";
+  TVM_FFI_ICHECK(hidden_size % 8 == 0) << "hidden_size must be a multiple of 8";
+  PullGatherArgs a{};
+  a.group = make_group(config);
+  a.out = ptr<__nv_bfloat16>(out);
+  a.counts = ptr<int32_t const>(counts);
+  a.hidden_size = static_cast<int>(hidden_size);
+  a.set = static_cast<int>(set);
+  pull_gather_kernel<kThreads>
+      <<<static_cast<int>(blocks), kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(a);
+  check_launch("pull_gather");
+}
+
 // Diagnostics: the empty kernel at a grid shape, and the timeline (zeros without
 // -DFIXED_EXCHANGE_TIMELINE).
 void noop(int64_t blocks, int64_t threads, int64_t stream) {
@@ -218,3 +238,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(fixed_dispatch, vibesim::fixed_exchange::fixed_dis
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(quant_dispatch, vibesim::fixed_exchange::quant_dispatch);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fixed_combine, vibesim::fixed_exchange::fixed_combine);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(pull_combine, vibesim::fixed_exchange::pull_combine);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(pull_gather, vibesim::fixed_exchange::pull_gather);

@@ -816,6 +816,42 @@ __global__ void __launch_bounds__(kThreads) pull_combine_kernel(PullCombineArgs 
   finish_round(g, kPullRound, kPullFinished, round.epoch);
 }
 
+// =================================================================== bf16 pull all-gather
+// The gather's reader side: every rank's rows already sit in its own mapped partials buffer of
+// `set` at their gathered positions (the producer wrote them there); after the ready flags, each
+// rank copies every gathered row (its own included) from the owner's buffer into `out`.
+struct PullGatherArgs {
+  Group group;
+  __nv_bfloat16* out;  // [sum(counts), hidden]
+  int32_t const* counts;
+  int hidden_size;
+  int set;
+};
+
+template <int kThreads>
+__global__ void __launch_bounds__(kThreads) pull_gather_kernel(PullGatherArgs const a) {
+  Group const& g = a.group;
+  RoundInfo round;
+  load_round(g, kPullRound, a.counts, round);
+  pull_wait_ready(g, round.epoch);
+  int const row_vectors = a.hidden_size / 8;
+  int64_t const row_bytes = static_cast<int64_t>(a.hidden_size) * 2;
+  int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  int64_t const base = g.layout.partials_offset + a.set * g.layout.partials_set_bytes;
+  int64_t const tasks = static_cast<int64_t>(round.total) * row_vectors;
+  for (int64_t task = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; task < tasks;
+       task += stride) {
+    int const row = static_cast<int>(task / row_vectors);
+    int const vec = static_cast<int>(task % row_vectors);
+    int owner = 0;
+    while (owner + 1 < g.world && row >= round.offsets[owner + 1]) ++owner;
+    int64_t const offset = base + row * row_bytes + vec * 16;
+    *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(a.out) + row * row_bytes + vec * 16) =
+        load_volatile(g.slices[owner] + offset);
+  }
+  finish_round(g, kPullRound, kPullFinished, round.epoch);
+}
+
 // Empty kernel of the exchange's grid shape: the graph-replay launch floor (diagnostic).
 __global__ void noop_kernel() {}
 

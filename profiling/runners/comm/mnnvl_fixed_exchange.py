@@ -38,6 +38,7 @@ _ALIGN = 4096
 
 # Which kernel `max_resident_blocks` reports on.
 KERNEL_DISPATCH, KERNEL_QUANT_DISPATCH, KERNEL_COMBINE, KERNEL_PULL = 0, 1, 2, 3
+KERNEL_PULL_GATHER = 4
 
 
 # DLPack capsules of every mapped view, never freed (see FixedExchange._view).
@@ -78,6 +79,12 @@ class DispatchRow:
     @classmethod
     def nvfp4(cls, hidden_size: int, top_k: int) -> DispatchRow:
         return cls(hidden_size // 2, hidden_size // 16, 4 * top_k, 4 * top_k)
+
+    @classmethod
+    def bf16(cls, hidden_size: int) -> DispatchRow:
+        """Plain bf16 rows for the row all-gather: one plane, sent with the scales plane's
+        lossless wire rule (a 0xFFFFFFFF word, two NaN lanes, becomes 0x7FFFFFFF)."""
+        return cls(0, hidden_size * 2, 0, 0)
 
     @property
     def total(self) -> int:
@@ -169,6 +176,7 @@ class FixedExchange:
         top_k: int,
         group=None,
         timeline: bool = False,
+        row: DispatchRow | None = None,
     ):
         import torch
         import torch.distributed as dist
@@ -179,7 +187,7 @@ class FixedExchange:
         self.torch = torch
         self.rank, self.world, self.max_rows = rank, world, max_rows
         self.hidden_size, self.top_k = hidden_size, top_k
-        self.row = DispatchRow.nvfp4(hidden_size, top_k)
+        self.row = row if row is not None else DispatchRow.nvfp4(hidden_size, top_k)
         self.layout = ExchangeLayout.build(world, max_rows, self.row, hidden_size)
         self._group = group if group is not None else dist.group.WORLD
         self.module = load_module(timeline)
@@ -201,7 +209,7 @@ class FixedExchange:
         self.local[:MARKER_OFFSET].zero_()
         self._pull_round = 0
         self.counts = torch.empty(world, dtype=torch.int32, device="cuda")
-        self.max_blocks = {k: int(self.module.max_resident_blocks(k)) for k in range(4)}
+        self.max_blocks = {k: int(self.module.max_resident_blocks(k)) for k in range(5)}
         torch.cuda.synchronize()
         dist.barrier(group=self._group)
 
@@ -389,6 +397,50 @@ class FixedExchange:
             self.counts.data_ptr(),
             partials_set,
             self._blocks(KERNEL_PULL, tasks, blocks),
+            self._stream(),
+        )
+        self._pull_round += 1
+
+    def all_gather(self, rows, out, *, blocks: int | None = None) -> None:
+        """Push all-gather of bf16 rows (``row=DispatchRow.bf16(hidden)``): this rank's
+        ``rows`` [counts[rank], hidden] into every rank's ``out`` [sum(counts), hidden]."""
+        row = self.row
+        if row.payload or row.weights or row.ids:
+            raise ValueError("all_gather needs the bf16 row layout (DispatchRow.bf16)")
+        tasks = self.world * self.max_rows * (row.total // 16)
+        self.module.fixed_dispatch(
+            self.config,
+            0,
+            row.scales,
+            0,
+            0,
+            0,
+            rows.data_ptr(),
+            0,
+            0,
+            0,
+            out.data_ptr(),
+            0,
+            0,
+            self.counts.data_ptr(),
+            self._blocks(KERNEL_DISPATCH, tasks, blocks),
+            self._stream(),
+        )
+
+    def pull_gather(self, out, *, source_set: int | None = None, blocks: int | None = None):
+        """Pull all-gather: every rank's rows sit in its own ``partials(source_set)`` at their
+        gathered positions; copy all of them into ``out`` [sum(counts), hidden]. Shares the
+        pull round (ready flags) with ``pull_combine``."""
+        tasks = self.world * self.max_rows * self.hidden_size // 8
+        if source_set is None:
+            source_set = self.next_pull_set
+        self.module.pull_gather(
+            self.config,
+            self.hidden_size,
+            out.data_ptr(),
+            self.counts.data_ptr(),
+            source_set,
+            self._blocks(KERNEL_PULL_GATHER, tasks, blocks),
             self._stream(),
         )
         self._pull_round += 1

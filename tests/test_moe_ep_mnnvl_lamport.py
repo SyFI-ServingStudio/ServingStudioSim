@@ -40,6 +40,8 @@ _SCATTER = {
             "mnnvl_lamport",
             "profile_moe_ep_quantize_and_all_gather_batch",
         ),
+        ("all_gather", "mnnvl_lamport", "profile_all_gather_batch"),
+        ("all_gather", "mnnvl_pull", "profile_all_gather_pull_batch"),
     ],
 )
 def test_each_backend_runs_its_leg_in_fabric_memory(kind, backend, function):
@@ -76,3 +78,13 @@ def test_spec_error_names_what_the_kernels_cannot_run():
         {**_SCATTER, "num_gpus": 16, "per_rank_tokens": [1] * 16}, "combine"
     )
     assert "no tokens" in runner.spec_error({**_SCATTER, "per_rank_tokens": [0] * 8}, "combine")
+
+
+def test_bf16_row_layout_sends_one_plane():
+    row = DispatchRow.bf16(4096)
+    assert (row.payload, row.scales, row.weights, row.ids, row.total) == (0, 8192, 0, 0, 8192)
+    layout = ExchangeLayout.build(4, 656, row, 4096)
+    assert layout.dispatch_set >= 4 * 656 * 8192
+    assert (
+        runner.spec_error({**_SCATTER, "num_gpus": 2, "per_rank_tokens": [8, 0]}, "gather") is None
+    )
