@@ -9,6 +9,8 @@ transactions or Torch intermediates.
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -24,6 +26,10 @@ _SCALE_DTYPE = DType.FP32
 _WEIGHT_DTYPE = DType.FP32
 _OUTPUT_DTYPE = DType.FP32
 _CONTEXT_MODE = "uniform"
+# Ragged batches under the same longest request: `context_len` is the longest
+# request and the others follow one of three shapes, scaled so the batch holds
+# `fill` percent of `batch_size * context_len` keys (see _request_context_lens).
+_RAGGED_CONTEXT_MODE = re.compile(r"ragged_(power|exp|one_long)_fill([1-9][0-9]?)")
 _PAGE_MAPPING = "unique_scattered"
 _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
 # Request-contiguous, 576-byte-aligned pages: see dsa_paged_mqa_logits_decode_contiguous.
@@ -156,10 +162,10 @@ def _validate_args(
             "scale_dtype=weight_dtype=output_dtype=fp32, got "
             f"{scale_dtype.value}, {weight_dtype.value}, and {output_dtype.value}"
         )
-    if context_mode != _CONTEXT_MODE:
+    if context_mode != _CONTEXT_MODE and not _RAGGED_CONTEXT_MODE.fullmatch(context_mode):
         raise ValueError(
-            f"dsa_paged_mqa_logits_decode requires context_mode='{_CONTEXT_MODE}', "
-            f"got {context_mode!r}"
+            f"dsa_paged_mqa_logits_decode requires context_mode='{_CONTEXT_MODE}' or "
+            f"'ragged_{{power,exp,one_long}}_fill<1-99>', got {context_mode!r}"
         )
     if page_mapping != _PAGE_MAPPING:
         raise ValueError(
@@ -194,6 +200,60 @@ def _validate_args(
         cache_format,
         clean_logits,
     )
+
+
+def _bisect_decreasing(fill_of: Any, target: float, low: float, high: float) -> float:
+    """Return x in [low, high] with fill_of(x) == target for a decreasing fill_of."""
+    for _ in range(200):
+        mid = 0.5 * (low + high)
+        if fill_of(mid) > target:
+            low = mid
+        else:
+            high = mid
+    return 0.5 * (low + high)
+
+
+def _request_context_lens(batch_size: int, context_len: int, context_mode: str) -> tuple[int, ...]:
+    """Each request's key count; the longest is always ``context_len``.
+
+    ``uniform`` gives every request ``context_len``. The ragged modes keep one
+    request at ``context_len`` and size the rest so the batch holds about
+    ``fill`` of ``batch_size * context_len`` keys:
+
+    - ``power``: request b holds ``context_len * ((b + 1) / batch_size) ** p``
+      (fill 50 is a linear ramp, fill 25 a long tail of short requests);
+    - ``exp``: request b holds ``context_len * exp(-lam * b / (batch_size - 1))``,
+      a few long requests and many short ones;
+    - ``one_long``: one request at ``context_len``, the others equal.
+
+    ``p`` and ``lam`` are solved for the fill before rounding.
+    """
+    if context_mode == _CONTEXT_MODE or batch_size == 1:
+        return (context_len,) * batch_size
+    match = _RAGGED_CONTEXT_MODE.fullmatch(context_mode)
+    if match is None:
+        raise ValueError(f"unknown context_mode {context_mode!r}")
+    family, fill = match.group(1), int(match.group(2)) / 100.0
+    if family == "power":
+
+        def power_fill(p: float) -> float:
+            return sum(((b + 1) / batch_size) ** p for b in range(batch_size)) / batch_size
+
+        p = _bisect_decreasing(power_fill, fill, 0.0, 1000.0)
+        shares = [((b + 1) / batch_size) ** p for b in range(batch_size)]
+    elif family == "exp":
+
+        def exp_fill(lam: float) -> float:
+            return (
+                sum(math.exp(-lam * b / (batch_size - 1)) for b in range(batch_size)) / batch_size
+            )
+
+        lam = _bisect_decreasing(exp_fill, fill, 0.0, 1000.0)
+        shares = [math.exp(-lam * b / (batch_size - 1)) for b in range(batch_size)]
+    else:
+        rest = max(0.0, (fill * batch_size - 1.0) / (batch_size - 1))
+        shares = [1.0] + [rest] * (batch_size - 1)
+    return tuple(min(context_len, max(1, round(context_len * share))) for share in shares)
 
 
 def _check_deepgemm_launch_bounds(
@@ -343,12 +403,19 @@ def _build_operands(
     head_dim: int,
     block_size: int,
     device: str,
+    context_mode: str = _CONTEXT_MODE,
 ) -> _DsaPagedMqaLogitsDecodeOperands:
-    """Construct exact GLM operands and deterministic unique scattered pages."""
+    """Construct exact GLM operands and deterministic unique scattered pages.
+
+    Request b owns ``ceil(length[b] / block_size)`` pages; block-table columns
+    past them stay 0 and are never read.
+    """
     del max_model_len
-    logical_pages = (context_len + block_size - 1) // block_size
+    request_lens = _request_context_lens(batch_size, context_len, context_mode)
+    request_pages = [(length + block_size - 1) // block_size for length in request_lens]
+    logical_pages = max(request_pages)
     padded_context = logical_pages * block_size
-    referenced_page_count = batch_size * logical_pages
+    referenced_page_count = sum(request_pages)
     num_pages = max(256, 2 * referenced_page_count + 1)
 
     q = _stable_values(
@@ -366,11 +433,11 @@ def _build_operands(
         )
         / 4.0
     )
-    context_lens = torch.full(
-        (batch_size, next_n),
-        context_len,
-        dtype=torch.int32,
-        device=device,
+    context_lens = (
+        torch.tensor(request_lens, dtype=torch.int32, device=device)
+        .unsqueeze(1)
+        .expand(batch_size, next_n)
+        .contiguous()
     )
     physical_pages = (
         2
@@ -381,7 +448,19 @@ def _build_operands(
         )
         + 1
     )
-    block_table = physical_pages.reshape(batch_size, logical_pages).contiguous()
+    if referenced_page_count == batch_size * logical_pages:
+        block_table = physical_pages.reshape(batch_size, logical_pages).contiguous()
+    else:
+        pages = torch.tensor(request_pages, dtype=torch.int32, device=device)
+        owned = torch.arange(logical_pages, dtype=torch.int32, device=device).unsqueeze(
+            0
+        ) < pages.unsqueeze(1)
+        block_table = torch.zeros(
+            (batch_size, logical_pages),
+            dtype=torch.int32,
+            device=device,
+        )
+        block_table[owned] = physical_pages
 
     cache = torch.empty(
         (num_pages, block_size, 1, head_dim + 4),
@@ -461,14 +540,16 @@ def _scheduled_work(
     num_heads: int,
     head_dim: int,
     block_size: int,
+    context_mode: str = _CONTEXT_MODE,
 ) -> tuple[int, int, int]:
-    """Return ``(logical_pages, C, nominal_flops)`` for the padded schedule."""
+    """Return ``(Σ_b pages[b], C, nominal_flops)`` for the padded schedule."""
     if min(batch_size, context_len, next_n, num_heads, head_dim, block_size) <= 0:
         raise ValueError("scheduled-work dimensions must be > 0")
-    logical_pages = (context_len + block_size - 1) // block_size
-    scheduled_cells = batch_size * next_n * logical_pages * block_size
+    request_lens = _request_context_lens(batch_size, context_len, context_mode)
+    total_pages = sum((length + block_size - 1) // block_size for length in request_lens)
+    scheduled_cells = next_n * total_pages * block_size
     nominal_flops = 2 * scheduled_cells * num_heads * head_dim
-    return logical_pages, scheduled_cells, nominal_flops
+    return total_pages, scheduled_cells, nominal_flops
 
 
 def _logical_scheduled_bytes(
@@ -479,6 +560,7 @@ def _logical_scheduled_bytes(
     num_heads: int,
     head_dim: int,
     block_size: int,
+    context_mode: str = _CONTEXT_MODE,
 ) -> int:
     """Return scheduled logical bytes, excluding Torch/TMA intermediates.
 
@@ -487,19 +569,20 @@ def _logical_scheduled_bytes(
     an argument: it controls the returned allocation shape, not scheduled cache
     work in the production kernel model.
     """
-    logical_pages, scheduled_cells, _nominal_flops = _scheduled_work(
+    total_pages, scheduled_cells, _nominal_flops = _scheduled_work(
         batch_size=batch_size,
         context_len=context_len,
         next_n=next_n,
         num_heads=num_heads,
         head_dim=head_dim,
         block_size=block_size,
+        context_mode=context_mode,
     )
     return (
         batch_size * next_n * num_heads * head_dim
         + 4 * batch_size * next_n * num_heads
         + (head_dim + 4) * scheduled_cells
-        + 4 * batch_size * logical_pages
+        + 4 * total_pages
         + 4 * batch_size * next_n
         + 4 * scheduled_cells
     )
@@ -601,6 +684,10 @@ def profile_dsa_paged_mqa_logits_decode_torch(
         cache_format,
         clean_logits,
     )
+    if _context_mode != _CONTEXT_MODE:
+        raise ProfilerNotImplemented(
+            "the torch dsa_paged_mqa_logits_decode composite measures uniform contexts only"
+        )
     try:
         import torch
     except ImportError as exc:
@@ -671,14 +758,21 @@ def _check_first_request(
     context_len: int,
     max_model_len: int,
 ) -> None:
-    """Compare request 0's logits rows with the Torch composite on the valid columns."""
+    """Compare request 0's logits rows with the Torch composite on the valid columns.
+
+    ``context_len`` is request 0's own key count.
+    """
     next_n = operands.q.shape[1]
+    block_size = operands.key_view.shape[1]
+    first_pages = (context_len + block_size - 1) // block_size
     first = replace(
         operands,
         q=operands.q[:1],
         weights=operands.weights[:next_n],
         context_lens=operands.context_lens[:1],
-        block_table=operands.block_table[:1],
+        block_table=operands.block_table[:1, :first_pages],
+        logical_pages=first_pages,
+        padded_context=first_pages * block_size,
     )
     expected = _torch_composite(first, context_len=context_len, max_model_len=max_model_len)
     expected = expected[:, :context_len]
@@ -724,7 +818,7 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
         _scale_dtype,
         _weight_dtype,
         _output_dtype,
-        _context_mode,
+        context_mode,
         _page_mapping,
         _cache_format,
         _clean_logits,
@@ -762,6 +856,7 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
             head_dim=head_dim,
             block_size=block_size,
             device="cuda",
+            context_mode=context_mode,
         )
         _runnable_context_lens, _schedule_metadata, kernel = _prepare_deepgemm_call(
             deep_gemm,
@@ -772,8 +867,9 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
         )
 
         # Compile, initialize, and check the exact shape before formal CUPTI timing.
+        first_context_len = _request_context_lens(batch_size, context_len, context_mode)[0]
         _check_first_request(
-            torch, operands, kernel(), context_len=context_len, max_model_len=max_model_len
+            torch, operands, kernel(), context_len=first_context_len, max_model_len=max_model_len
         )
         torch.cuda.synchronize()
         time_ms = Timer.cupti(
@@ -792,6 +888,7 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
             num_heads=num_heads,
             head_dim=head_dim,
             block_size=block_size,
+            context_mode=context_mode,
         )
         # This models the block-rounded DeepGEMM schedule. Metadata construction,
         # JIT work, physical TMA/cache transactions, and intermediates are excluded.
@@ -802,6 +899,7 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
             num_heads=num_heads,
             head_dim=head_dim,
             block_size=block_size,
+            context_mode=context_mode,
         )
         elapsed_seconds = time_ms / 1000.0
         tflops = nominal_flops / elapsed_seconds / 1e12 if elapsed_seconds > 0 else 0.0

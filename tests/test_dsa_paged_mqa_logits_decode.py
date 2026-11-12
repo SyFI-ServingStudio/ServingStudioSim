@@ -962,3 +962,94 @@ def test_cpu_composite_matches_reference_and_preserves_every_operand():
     )
     for tensor, snapshot in zip(tensors, snapshots, strict=True):
         assert torch.equal(tensor, snapshot)
+
+
+@pytest.mark.parametrize("family", ["power", "exp", "one_long"])
+@pytest.mark.parametrize("fill", [25, 50, 75])
+@pytest.mark.parametrize("batch_size", [16, 128])
+def test_ragged_context_lens_keep_the_longest_request_and_hit_the_fill(family, fill, batch_size):
+    """A ragged mode that drifted off its fill or lost the longest request would
+    no longer isolate Σ-context from max-context in the uniform-vs-ragged study."""
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import _request_context_lens
+
+    lens = _request_context_lens(batch_size, 131072, f"ragged_{family}_fill{fill}")
+
+    assert len(lens) == batch_size
+    assert max(lens) == 131072
+    assert min(lens) >= 1
+    assert sum(lens) / (batch_size * 131072) == pytest.approx(fill / 100, abs=0.01)
+    assert _request_context_lens(batch_size, 131072, "uniform") == (131072,) * batch_size
+
+
+def test_ragged_operands_give_each_request_its_own_pages_and_lengths():
+    """Short requests must own only their own pages and report their own length;
+    otherwise DeepGEMM would scan the uniform max for every request."""
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
+        _build_operands,
+        _request_context_lens,
+        _scheduled_work,
+    )
+
+    shape = {"batch_size": 8, "context_len": 300, "max_model_len": 512}
+    mode = "ragged_exp_fill50"
+    operands = _build_operands(
+        torch,
+        next_n=2,
+        num_heads=32,
+        head_dim=128,
+        block_size=64,
+        device="cpu",
+        context_mode=mode,
+        **shape,
+    )
+    lens = _request_context_lens(8, 300, mode)
+    pages = [(length + 63) // 64 for length in lens]
+
+    assert operands.context_lens.tolist() == [[length, length] for length in lens]
+    owned = [row[:count] for row, count in zip(operands.block_table.tolist(), pages)]
+    flat = [page for row in owned for page in row]
+    assert len(set(flat)) == len(flat) == sum(pages)
+    assert 0 not in flat
+    assert _scheduled_work(
+        batch_size=8,
+        context_len=300,
+        next_n=2,
+        num_heads=32,
+        head_dim=128,
+        block_size=64,
+        context_mode=mode,
+    )[:2] == (sum(pages), 2 * 64 * sum(pages))
+
+
+def test_ragged_first_request_check_matches_the_reference():
+    """The pre-timing check must compare request 0 at its own length."""
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
+        _build_operands,
+        _check_first_request,
+        _request_context_lens,
+    )
+
+    mode = "ragged_power_fill25"
+    operands = _build_operands(
+        torch,
+        batch_size=4,
+        context_len=200,
+        next_n=1,
+        max_model_len=256,
+        num_heads=32,
+        head_dim=128,
+        block_size=64,
+        device="cpu",
+        context_mode=mode,
+    )
+    expected = dsa_paged_mqa_logits_decode_reference(
+        operands.q,
+        operands.cache,
+        operands.weights,
+        operands.context_lens,
+        operands.block_table,
+        block_size=64,
+        max_model_len=256,
+    )
+    first_len = _request_context_lens(4, 200, mode)[0]
+    _check_first_request(torch, operands, expected, context_len=first_len, max_model_len=256)

@@ -49,7 +49,12 @@ DOC = KernelDoc(
         "are measured. With page_mapping unique_scattered and context_mode "
         "uniform, every request has context_len keys in scattered pages. With "
         "request_contiguous and max_ragged, request b has max(1, context_len − "
-        "b) keys in consecutive pages padded to a 576-byte stride. max_model_len"
+        "b) keys in consecutive pages padded to a 576-byte stride. Scattered "
+        "pages also take the ragged modes ragged_{power,exp,one_long}_fill<NN>: "
+        "the longest request holds context_len keys and the others are sized so "
+        "the batch holds NN percent of batch_size · context_len (power: a ramp "
+        "(b+1)/batch_size raised to a power, exp: exponential decay, one_long: "
+        "one long request and equal short ones). max_model_len"
         " only sets the width of the score rows, and the work is counted in "
         "whole pages."
     ),
@@ -57,7 +62,8 @@ DOC = KernelDoc(
     subcategory="DSA",
     formula=(
         "logit[q, k] = scale[k] · Σₕ weight[q, h] · ReLU(query[q, h] · key[k])",
-        "length[b] = context_len (uniform) or max(1, context_len − b) (max_ragged)",
+        "length[b] = context_len (uniform), max(1, context_len − b) (max_ragged), "
+        "or the ragged_* shape with max_b length[b] = context_len",
         "C = next_n · Σ_b block_size · ⌈length[b] / block_size⌉; P = ⌈context_len / block_size⌉",
         "TFLOPS = 2 · C · num_heads · head_dim / time",
         "B = batch_size · next_n · num_heads · head_dim "
