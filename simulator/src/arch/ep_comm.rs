@@ -230,7 +230,8 @@ pub struct EpFastConfig {
     pub latency_us: Option<f64>,
     /// `fused_allgather`: what is left of `a` per leg once fused (default 0).
     pub fused_residual_us: f64,
-    /// `fast_sparse`: distinct ranks a token's top-k reach (default uniform).
+    /// `fast_sparse`: distinct ranks a token's top-k reach (default: the
+    /// routing corpus's mean, else uniform).
     pub fanout_ranks: Option<f64>,
     /// The combine's row bytes (default bf16, `2 H`).
     pub combine_row_bytes: Option<u32>,
@@ -377,6 +378,9 @@ pub struct AnalyticEpComm {
     pub top_k: u32,
     /// `D / N` under uniform routing.
     pub uniform_hit: f64,
+    /// A routing corpus's mean distinct ranks per token, `fast_sparse`'s
+    /// fan-out when `ep_fanout_ranks` is unset; `None` for popularity.
+    pub corpus_fanout: Option<f64>,
     /// `(log2 tokens, busiest-rank hit probability)` ascending.
     recv_hit: Vec<(f64, f64)>,
 }
@@ -418,12 +422,18 @@ impl AnalyticEpComm {
                 (f64::from(count).log2(), (hit(share) * norm).min(1.0))
             })
             .collect();
+        let corpus_fanout = if config.kind == EpCommKind::FastSparse {
+            demand.corpus_mean_distinct_ranks(local)?
+        } else {
+            None
+        };
         Ok(Self {
             config,
             ep_size,
             hidden,
             top_k,
             uniform_hit,
+            corpus_fanout,
             recv_hit,
         })
     }
@@ -645,6 +655,7 @@ impl AnalyticEpComm {
         self.config
             .fast
             .fanout_ranks
+            .or(self.corpus_fanout)
             .unwrap_or(self.uniform_hit * f64::from(self.ep_size))
             .min(f64::from(self.ep_size))
     }

@@ -59,6 +59,15 @@ def steps(d):
                 picked.append(r)
         if len(picked) >= 400:
             break
+    routed = [i for name, sl in idx.items() if ".routed_rank" in name and name.endswith(".fused_moe") for i in sl]
+    rank_max, rank_mean = [], []
+    for r in picked:
+        vals = [r["slot_time_ms"][i] * 1e3 for i in routed]
+        if vals:
+            rank_max.append(max(vals))
+            rank_mean.append(sum(vals) / len(vals))
+    fused = {"busiest_us": round(statistics.median(rank_max), 2) if rank_max else None,
+             "mean_us": round(statistics.median(rank_mean), 2) if rank_mean else None}
     out = []
     for name, slots in idx.items():
         kind = man[slots[0]]["kind"]
@@ -117,7 +126,7 @@ def steps(d):
             rec["bw_floor_us"] = round(moved / (LINK * 1e3), 2)
         rec.update(group=group, backend=backend)
         out.append(rec)
-    return out, len(picked)
+    return out, len(picked), fused
 
 
 result = {"experiment": str(exp.resolve()), "link_gb_per_s_one_way": LINK, "strategies": [], "comm_utilization": []}
@@ -127,9 +136,11 @@ for st in strategies:
         d = run_dir(fam, st["ex"], conc)
         if (d / "summary.json").exists() and (d / "reports/slo_general_report.json").exists():
             pts.append(point(d, load))
-    stp, n = steps(run_dir("dp8", st["ex"], 128)) if (run_dir("dp8", st["ex"], 128) / "raw/cost_log").exists() else ([], 0)
-    entry = {"id": f"K0+{st['moe']}", "name": st["name"], "moe": st["moe"], "kda": "K0", "source": "sim",
+    stp, n, fused = steps(run_dir("dp8", st["ex"], 128)) if (run_dir("dp8", st["ex"], 128) / "raw/cost_log").exists() else ([], 0, {})
+    entry = {"id": st.get("id", f"K0+{st['moe']}"), "name": st["name"], "moe": st["moe"], "kda": "K0", "source": "sim",
              "note": st.get("note", ""), "run_label": st["ex"], "steps_iterations": n,
+             "routed_fused_moe_k7_c128": fused,
+             **{k: st[k] for k in ("superseded", "placement") if k in st},
              "steps": [{k: s.get(k) for k in ("name", "group", "us", "rows", "bytes_per_row", "backend", "extrapolated")} for s in stp],
              "points": pts}
     result["strategies"].append(entry)
@@ -151,7 +162,29 @@ for e in result["strategies"]:
     for l, _, _ in LOADS:
         p = by.get(l)
         cells += [f"{p['tok_s']:,.1f}", f"{p['tpot_ms']:.2f}", "-" if p["comm_share_pct"] is None else f"{p['comm_share_pct']:.1f}"] if p else ["-"] * 3
-    L.append(f"| {e['id']} | {e['run_label']} | " + " | ".join(cells) + " |")
+    tag = " (superseded)" if e.get("superseded") else ""
+    L.append(f"| {e['id']}{tag} | {e['run_label']} | " + " | ".join(cells) + " |")
+placed = [e for e in result["strategies"] if e.get("placement")]
+if placed:
+    L += ["\n## Expert placement (renumbered corpora through the standard corpus demand path)\n",
+          "Permutations fitted on the first half of the corpus tokens; sims use the held-out second half (eval). "
+          "full = whole corpus incl. the fitting half (optimistic). Busiest share = per layer max-rank (token, expert) "
+          "pairs / mean, averaged over layers. Fused MoE = one KDA+MoE layer at k7 c128, median over iterations of the "
+          "max (busiest) / mean over the 8 EP ranks.\n",
+          "| id | variant | D eval | D full | busiest eval | busiest full | fused MoE busiest us | fused MoE mean us | dispatch us | combine us | "
+          + " | ".join(f"{l} tok/s | TPOT ms" for l, _, _ in LOADS) + " |",
+          "|" + "---|" * (10 + 2 * len(LOADS))]
+    for e in placed:
+        pl, f = e["placement"], e.get("routed_fused_moe_k7_c128") or {}
+        disp = sum(s["us"] for s in e["steps"] if s["group"] == "comm" and "dispatch" in s["name"])
+        comb = sum(s["us"] for s in e["steps"] if s["group"] == "comm" and "combine" in s["name"])
+        by = {p["load"]: p for p in e["points"]}
+        cells = []
+        for l, _, _ in LOADS:
+            p = by.get(l)
+            cells += [f"{p['tok_s']:,.1f}", f"{p['tpot_ms']:.2f}"] if p else ["-", "-"]
+        L.append(f"| {e['id']} | {e['run_label']} | {pl['D_eval']} | {pl['D_full']} | {pl['busiest_eval']} | {pl['busiest_full']} | "
+                 f"{f.get('busiest_us')} | {f.get('mean_us')} | {disp:.2f} | {comb:.2f} | " + " | ".join(cells) + " |")
 L += ["\n## Comm steps, k7 c128, one KDA+MoE layer, busiest rank\n",
       "| variant | step | rows | B/row | send B | recv B | us | GB/s | link % | BW floor us | extrap | backend |",
       "|---|---|---|---|---|---|---|---|---|---|---|---|"]
