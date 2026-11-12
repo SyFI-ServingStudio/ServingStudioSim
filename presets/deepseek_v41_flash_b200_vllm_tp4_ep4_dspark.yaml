@@ -34,9 +34,8 @@ pools:
           max_model_len: 131072
           # Recorded target routes of this deployment (TP4 EP4, DSpark k=5),
           # sampled in verify-width groups. The draft MoE routes uniformly.
-          # TODO(publish): local capture path until the corpus is on the hub.
           routing: corpus
-          token_corpus_file: /raid/kanzhu/ServingStudio/wt-dsv41-dspark/logs/20261106_0_dsv41_dspark_capture/profile_tp4ep4_corpus/token_corpus/manifest.json
+          token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json
           draft_tokens: 5
         worker:
           type: speculative
