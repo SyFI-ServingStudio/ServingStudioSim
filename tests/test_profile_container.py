@@ -316,7 +316,7 @@ def test_container_worker_requests_imex_channel_only_when_asked(
     assert [arg for arg in fabric if arg not in ("--device", IMEX_CHANNEL_CDI_DEVICE)] == plain
 
 
-def test_imex_channel_is_declared_by_the_mnnvl_all_reduce_backends_only() -> None:
+def test_imex_channel_is_declared_by_the_fabric_memory_backends_only() -> None:
     from profiling.db.registry import iter_kernel_profiler_specs
 
     declared = {
@@ -332,6 +332,10 @@ def test_imex_channel_is_declared_by_the_mnnvl_all_reduce_backends_only() -> Non
         ("all_reduce_residual_rms_norm", "flashinfer_mnnvl_unbudgeted"),
         ("moe_alltoall", "flashinfer_nvlink_two_sided"),
         ("moe_alltoall_prepare", "flashinfer_nvlink_two_sided"),
+        ("moe_ep_quantized_all_gather", "mnnvl_lamport"),
+        ("moe_ep_quantize_and_all_gather", "mnnvl_lamport"),
+        ("moe_ep_reduce_scatter", "mnnvl_lamport"),
+        ("moe_ep_reduce_scatter", "mnnvl_pull"),
     }
 
 

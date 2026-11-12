@@ -94,3 +94,62 @@ register(
         ),
     )
 )
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="mnnvl_lamport",
+        supports=BackendSupport(compute=frozenset({DType.BF16})),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.comm.moe_ep_mnnvl_lamport",
+            function_name="profile_moe_ep_reduce_scatter_batch",
+        ),
+        table_name=KIND,
+        args_schema=MoeEpReduceScatterArgs,
+        metric_family=MetricFamily.COMM,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        imex_channel=True,
+        gpu_count_fn=lambda spec: int(spec["num_gpus"]),
+        list_native=True,
+        doc=BackendDoc(
+            summary=(
+                "One kernel launch: every GPU stores each owner's partial rows directly into the "
+                "owner's landing rows in fabric (MNNVL) memory; the owner sums the arrived rows in"
+                " fp32 in rank order (Lamport-style arrival, no separate barrier)."
+            ),
+            url="https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/comm/moe_alltoall_lamport.cuh",
+        ),
+    )
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="mnnvl_pull",
+        supports=BackendSupport(compute=frozenset({DType.BF16})),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.comm.moe_ep_mnnvl_lamport",
+            function_name="profile_moe_ep_reduce_scatter_pull_batch",
+        ),
+        table_name=KIND,
+        args_schema=MoeEpReduceScatterArgs,
+        metric_family=MetricFamily.COMM,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        imex_channel=True,
+        gpu_count_fn=lambda spec: int(spec["num_gpus"]),
+        list_native=True,
+        doc=BackendDoc(
+            summary=(
+                "One kernel launch, reader side only: every GPU's partials already sit in its own "
+                "fabric-mapped buffer (the expert kernel wrote them there); after a ready flag per"
+                " peer, the owner reads its rows from every GPU and sums them in fp32 in rank "
+                "order. The producer's write into the mapped buffer is not part of this time."
+            ),
+            url="https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/comm/moe_alltoall_lamport.cuh",
+        ),
+    )
+)
