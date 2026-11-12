@@ -97,7 +97,7 @@
 use anyhow::{bail, ensure, Result};
 
 use crate::arch::config::IterArchSel;
-use crate::arch::ep_comm::{EpCommKind, EpCommModel, FastBackend, FastCombine};
+use crate::arch::ep_comm::{EpCommKind, EpCommModel, FastBackend, FastCombine, FixedCombineSide};
 use crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::{AttnTpCollective, AttnTpLayers};
 
 /// The selector tag.
@@ -230,6 +230,8 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         ep_fast_fused_residual_us: None,
         ep_fanout_ranks: None,
         ep_combine_row_bytes: None,
+        // Read only by `ep_comm_model: measured`.
+        ep_fixed_combine: FixedCombineSide::Auto,
         mhc_fuse_fixed_us,
         mhc_one_launch,
         router_gate_once: *router_gate_once,
