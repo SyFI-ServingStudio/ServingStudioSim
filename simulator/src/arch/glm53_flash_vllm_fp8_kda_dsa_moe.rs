@@ -969,7 +969,7 @@ enum Ffn {
 /// pynccl, and at TP8 torch symmetric memory up to 128 MiB, for which the
 /// measured NCCL curve stands in. Both slots are compiled and the inactive one
 /// is pushed as zero, so the slot layout does not depend on the batch.
-struct TpAllReduce {
+pub(crate) struct TpAllReduce {
     fused: Op<AllReduceFusionKernel>,
     large: Op<AllReduceKernel>,
     max_fused_tokens: u32,
@@ -977,7 +977,7 @@ struct TpAllReduce {
 }
 
 impl TpAllReduce {
-    fn build(
+    pub(crate) fn build(
         prefix: &str,
         suffix: &str,
         cfg: &Glm53FlashVllmConfigs,
@@ -1004,14 +1004,20 @@ impl TpAllReduce {
         })
     }
 
-    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+    /// Price every call on the large (non-FlashInfer) all-reduce.
+    pub(crate) fn without_fused(mut self) -> Self {
+        self.max_fused_tokens = 0;
+        self
+    }
+
+    pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         CostNode::Sum(vec![
             self.fused.compile(builder),
             self.large.compile(builder),
         ])
     }
 
-    fn eval(&self, tokens: u32, ev: &mut Evaluator) {
+    pub(crate) fn eval(&self, tokens: u32, ev: &mut Evaluator) {
         let fused_input = AllReduceFusionKernelInput { num_tokens: tokens };
         let large_input = AllReduceKernelInput {
             message_size_bytes: u64::from(tokens) * self.bytes_per_token,
