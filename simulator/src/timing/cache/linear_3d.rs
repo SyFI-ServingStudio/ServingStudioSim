@@ -94,7 +94,9 @@ impl Cache for Cache3DLinear {
             return LeafMetrics::MISS;
         }
         let query = std::array::from_fn(|axis| sweep[axis] as f32);
-        let (metrics, extrapolated) = self.interpolate_cell(query);
+        let Some((metrics, extrapolated)) = self.interpolate_cell(query) else {
+            return LeafMetrics::MISS;
+        };
         LeafMetrics {
             m: metrics.clamped(),
             coverage: if extrapolated {
@@ -117,7 +119,10 @@ impl Cache for Cache3DLinear {
 }
 
 impl Cache3DLinear {
-    fn interpolate_cell(&self, query: [f32; 3]) -> (Metrics4, bool) {
+    /// Trilinear blend of the bracketing cell, plus whether the query fell
+    /// outside the grid or leaned on a dropped corner; `None` when every corner
+    /// of the cell was dropped.
+    fn interpolate_cell(&self, query: [f32; 3]) -> Option<(Metrics4, bool)> {
         let located: [(usize, usize, f32, bool); 3] =
             std::array::from_fn(|axis| locate(&self.axes[axis], query[axis]));
         let outside = located.iter().any(|entry| entry.3);
@@ -141,7 +146,7 @@ impl Cache3DLinear {
             for &(_, index, weight) in &corners {
                 acc.add_scaled(self.cells[index], weight);
             }
-            return (acc, outside);
+            return Some((acc, outside));
         }
 
         let meaningful_drop = corners
@@ -154,7 +159,7 @@ impl Cache3DLinear {
                     acc.add_scaled(self.cells[index], weight);
                 }
             }
-            return (acc, outside);
+            return Some((acc, outside));
         }
 
         let mut acc = Metrics4::ZERO;
@@ -168,10 +173,10 @@ impl Cache3DLinear {
         }
         if weight_sum > f32::EPSILON {
             acc.scale(1.0 / weight_sum);
-            return (acc, true);
+            return Some((acc, true));
         }
 
-        let nearest = corners
+        corners
             .iter()
             .filter_map(|&(indices, index, _)| {
                 self.valid[index].then(|| {
@@ -191,9 +196,7 @@ impl Cache3DLinear {
                 })
             })
             .min_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
-            .map(|(cell, _)| cell)
-            .unwrap_or(Metrics4::ZERO);
-        (nearest, true)
+            .map(|(cell, _)| (cell, true))
     }
 }
 
@@ -395,6 +398,27 @@ mod tests {
         let dropped_corner = cache.eval(&[0.0; 3]);
         assert_eq!(dropped_corner.coverage, CoverageFlags::EXTRAPOLATED);
         assert_eq!(dropped_corner.m.time_ms, 5.0);
+    }
+
+    #[test]
+    fn cell_with_every_corner_dropped_is_a_miss_not_a_zero() {
+        // The low cube of a 3x2x2 grid loses all eight corners; the high cube
+        // keeps its far face, so the cache as a whole still has coverage.
+        let grid = SweepGrid::new(vec![vec![0.0, 1.0, 2.0], vec![0.0, 1.0], vec![0.0, 1.0]]);
+        let samples = (0..12)
+            .map(|index| {
+                if index < 8 {
+                    nan_sample()
+                } else {
+                    sample(index as f64)
+                }
+            })
+            .collect::<Vec<_>>();
+        let (cache, _) = Cache3DLinear::from_samples(&grid, &samples);
+        let hole = cache.eval(&[0.5; 3]);
+        assert_eq!(hole.coverage, CoverageFlags::NO_COVERAGE);
+        assert_eq!(hole.m.time_ms, 0.0);
+        assert!(cache.eval(&[2.0, 0.5, 0.5]).m.time_ms > 0.0);
     }
 
     #[test]

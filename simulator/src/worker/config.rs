@@ -17,7 +17,10 @@ use serde::Deserialize;
 use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::admission::PendingOrderKind;
-use super::kv::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
+use super::kv::{
+    KvOverhead, PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy, PrefixResumePoints,
+};
+use super::types::WorkerConfig;
 
 /// Batch-composition policy for the chunked-prefill worker. Closed set → serde
 /// enum (kebab-case matches the historical CLI spelling).
@@ -49,14 +52,14 @@ const DP_PLACEMENT_CHOICES: [&str; 4] = [
     "kv-fit-least-loaded",
 ];
 
-/// Where the chunked-prefill worker may end a hybrid (recurrent +
-/// full-attention) arch's non-final prefill chunk. A pure full-attention arch
-/// has no recurrent checkpoint and always chunks plainly.
+/// Where the chunked-prefill worker may end a non-final prefill chunk of an
+/// arch whose KV layout keeps a resumable recurrent state. A layout without
+/// one has no checkpoint and always chunks plainly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PrefillChunkAlignment {
-    /// With prefix caching on, end every non-final chunk on the arch's
-    /// recurrent checkpoint interval, as vLLM's Mamba `align` cache mode does
+    /// With prefix caching on, end every non-final chunk on the layout's
+    /// engine block, as vLLM's Mamba `align` cache mode does
     /// (`Scheduler._mamba_block_aligned_split`).
     #[default]
     Checkpoint,
@@ -341,6 +344,64 @@ impl KvAdmissionSpec {
     }
 }
 
+const KV_OVERHEAD_CHOICES: [&str; 2] = ["vllm", "none"];
+const PREFIX_RESUME_POINTS_CHOICES: [&str; 4] = [
+    "prompt_end",
+    "response_end",
+    "prompt_and_response_end",
+    "every_block",
+];
+
+/// How a worker turns the arch's `KvCacheLayout` into charges: whether the
+/// serving engine's own allocation counts, and where a finished request keeps
+/// the state a later request resumes from. Flattened into every selector that
+/// owns KV.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ParamStruct)]
+pub struct KvAccountingSpec {
+    /// `vllm` charges what vLLM allocates (padding, state copies, engine
+    /// blocks, a sliding window's in-flight tokens) and resumes prefixes where
+    /// vLLM does; `none` charges only what the model must keep, an upper bound
+    /// on capacity and reuse.
+    #[serde(default)]
+    #[param(string, default = "vllm", choices = KV_OVERHEAD_CHOICES)]
+    kv_overhead: KvOverhead,
+    /// Where a finished request keeps sliding-window tails and recurrent state
+    /// for a later request to resume from. Absent follows `kv_overhead`:
+    /// `prompt_end` under `vllm`, `response_end` under `none`. A layout of
+    /// per-token parts only resumes anywhere and ignores it.
+    #[serde(default)]
+    #[param(string, choices = PREFIX_RESUME_POINTS_CHOICES)]
+    prefix_resume_points: Option<PrefixResumePoints>,
+    /// Also keep that state at every multiple of this many tokens (a
+    /// multiple of the layout's engine block).
+    #[serde(default)]
+    prefix_resume_interval: Option<u32>,
+    /// Tokens one step may have in flight, which caps what admission charges
+    /// a sliding window. Absent is two steps of `max_batch_tokens` (vLLM's
+    /// async scheduling), or the whole prompt without a token budget.
+    #[serde(default)]
+    kv_max_in_flight_tokens: Option<u32>,
+}
+
+impl KvAccountingSpec {
+    /// Validate the knobs and set them on `config`.
+    pub(crate) fn apply(self, owner: &str, config: &mut WorkerConfig) -> Result<()> {
+        ensure!(
+            self.prefix_resume_interval != Some(0),
+            "{owner}: prefix_resume_interval must be positive"
+        );
+        ensure!(
+            self.kv_max_in_flight_tokens != Some(0),
+            "{owner}: kv_max_in_flight_tokens must be positive"
+        );
+        config.kv_overhead = self.kv_overhead;
+        config.prefix_resume_points = self.prefix_resume_points;
+        config.prefix_resume_interval = self.prefix_resume_interval;
+        config.kv_max_in_flight_tokens = self.kv_max_in_flight_tokens;
+        Ok(())
+    }
+}
+
 const PENDING_ORDER_CHOICES: [&str; 5] = [
     "session-start",
     "fifo",
@@ -396,6 +457,19 @@ pub(crate) fn prefix_tier_specs(
     ])
 }
 
+/// One recurrent state's bytes as a DRAM/SSD tier stores it: the layout's
+/// prefix-reusable per-request parts, one copy each, without the engine's
+/// padding or extra copies. 0 for a layout with no such part.
+pub(crate) fn tier_state_bytes_per_request(layout: &crate::arch::kv_layout::KvCacheLayout) -> u64 {
+    use crate::arch::kv_layout::KvGrowth;
+    layout
+        .parts
+        .iter()
+        .filter(|part| part.prefix_reusable && matches!(part.growth, KvGrowth::PerRequest))
+        .map(|part| part.one_copy_bytes_per_entry())
+        .sum()
+}
+
 fn default_dram_tier_gb_per_s() -> f64 {
     50.0
 }
@@ -416,6 +490,9 @@ pub enum IterWorkerSel {
         /// GPU memory for the worker (GB; primarily KV cache budget).
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// How the arch's KV layout is charged; see [`KvAccountingSpec`].
+        #[serde(flatten)]
+        kv_accounting: KvAccountingSpec,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
@@ -447,14 +524,6 @@ pub enum IterWorkerSel {
         /// attention budget. None uses all dynamically available slack.
         #[serde(default)]
         prefix_cache_max_gpu_memory_gb: Option<f64>,
-        /// Hybrid (recurrent + full-attention) archs only: context-token spacing
-        /// of resumable SSM snapshots, i.e. vLLM's aligned hybrid block size.
-        /// None uses the value the arch derives from its own layer geometry.
-        /// Set it to reproduce a specific vLLM deployment's alignment, or sweep
-        /// it to study the reuse-granularity / state-capacity trade-off. Ignored
-        /// by a pure full-attention arch, which has no recurrent state.
-        #[serde(default)]
-        ssm_checkpoint_interval_tokens: Option<u32>,
         /// Multiplier (≥ 1.0) for iterations that schedule any prefill tokens.
         /// See [`IterWorkerSel::ChunkedPrefill`]'s field of the same name.
         #[serde(default)]
@@ -468,6 +537,9 @@ pub enum IterWorkerSel {
         /// DP shard's KV pool.
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// How the arch's KV layout is charged; see [`KvAccountingSpec`].
+        #[serde(flatten)]
+        kv_accounting: KvAccountingSpec,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
@@ -506,6 +578,9 @@ pub enum IterWorkerSel {
         /// GPU memory for the worker (GB; primarily KV cache budget).
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// How the arch's KV layout is charged; see [`KvAccountingSpec`].
+        #[serde(flatten)]
+        kv_accounting: KvAccountingSpec,
         /// Chunked-prefill cap: max tokens per batch.
         max_batch_tokens: u32,
         /// How resident decode shares an iteration with chunked prefill.
@@ -544,12 +619,14 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, default = "round-robin", choices = DP_PLACEMENT_CHOICES)]
         dp_placement: DpPlacement,
-        /// Hybrid archs only: `checkpoint` ends non-final prefill chunks on the
-        /// recurrent checkpoint interval (vLLM's Mamba `align` mode); `plain`
-        /// chunks as `min(remaining, budget)`, leaving that engine artifact out.
+        /// Archs whose KV layout keeps a resumable recurrent state only:
+        /// `checkpoint` ends non-final prefill chunks on the layout's engine
+        /// block (vLLM's Mamba `align` mode); `plain` chunks as
+        /// `min(remaining, budget)`. Absent follows `kv_overhead`: `vllm`
+        /// aligns, `none` does not.
         #[serde(default)]
-        #[param(string, default = "checkpoint", choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
-        prefill_chunk_alignment: PrefillChunkAlignment,
+        #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
+        prefill_chunk_alignment: Option<PrefillChunkAlignment>,
         /// vLLM's `long_prefill_token_threshold`: the most prefill tokens one
         /// request takes per iteration, so a long prompt leaves the rest of the
         /// budget to other requests (`0`: no cap, vLLM's default). Applies per
@@ -565,7 +642,8 @@ pub enum IterWorkerSel {
         #[param(string, default = "fifo", choices = PENDING_ORDER_CHOICES)]
         pending_order: PendingOrderKind,
         /// Host DRAM behind each attention DP rank's HBM prefix cache, per GPU
-        /// (GB; `0`: none), as `pipeline_chunked_prefill`'s; hybrid archs only.
+        /// (GB; `0`: none), as `pipeline_chunked_prefill`'s; archs whose KV
+        /// layout keeps a recurrent state only.
         /// Sessions then stick to the rank they last ran on. Not vLLM.
         #[serde(default)]
         #[param(default = 0.0)]
@@ -580,8 +658,8 @@ pub enum IterWorkerSel {
         #[serde(default = "default_ssd_tier_gb_per_s")]
         #[param(default = 10.0)]
         ssd_tier_gb_per_s: f64,
-        /// Decode runs elsewhere, as `pipeline_chunked_prefill`'s; hybrid archs
-        /// only. Not vLLM.
+        /// Decode runs elsewhere, as `pipeline_chunked_prefill`'s; archs whose
+        /// KV layout keeps a recurrent state only. Not vLLM.
         /// With a tier: a session request whose declared prefix exceeds every
         /// context the run stored for that session is a conversation that began
         /// before the run, and its context is read from the slowest tier, as a
@@ -638,8 +716,9 @@ pub enum IterWorkerSel {
         external_decode: bool,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
-    /// iteration submits `draft_tokens + 1` rows per resident decode and retires
-    /// the target's own token plus the leading run of accepted drafts.
+    /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a
+    /// request clipped at `max_model_len`, and retires the target's own token
+    /// plus the leading run of accepted drafts.
     ///
     /// A separate selector from `chunked_prefill` rather than a flag on it: the
     /// arch must also be the speculative one (a different model type, not the
@@ -648,6 +727,9 @@ pub enum IterWorkerSel {
         /// GPU memory for the worker (GB; primarily KV cache budget).
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// How the arch's KV layout is charged; see [`KvAccountingSpec`].
+        #[serde(flatten)]
+        kv_accounting: KvAccountingSpec,
         /// Chunked-prefill cap: max tokens per batch. Decode spends it in query
         /// rows, so a resident decode costs the whole verify width here, and
         /// every scheduled request also costs the arch's drafting slots
@@ -682,9 +764,15 @@ pub enum IterWorkerSel {
         /// See [`IterWorkerSel::ChunkedPrefill`]'s field of the same name.
         #[serde(default)]
         prefill_gpu_time_multiplier: Option<f64>,
-        /// Request spread across attention DP partitions. See
-        /// [`IterWorkerSel::ChunkedPrefill`]'s field of the same name; only the
-        /// hybrid speculative recipe reads it, the full-attention one rotates.
+        /// Chunk-end alignment for archs whose KV layout keeps a resumable
+        /// recurrent state. See [`IterWorkerSel::ChunkedPrefill`]'s field of the
+        /// same name; the arch's drafter additionally decides whether the
+        /// prompt's last checkpoint sits one block early.
+        #[serde(default)]
+        #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
+        prefill_chunk_alignment: Option<PrefillChunkAlignment>,
+        /// How new requests spread across the arch's attention DP partitions.
+        /// See [`IterWorkerSel::ChunkedPrefill`]'s field of the same name.
         #[serde(default)]
         #[param(string, default = "round-robin", choices = DP_PLACEMENT_CHOICES)]
         dp_placement: DpPlacement,
@@ -702,6 +790,9 @@ pub enum IterWorkerSel {
         /// sets the pipeline's token capacity.
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// How the arch's KV layout is charged; see [`KvAccountingSpec`].
+        #[serde(flatten)]
+        kv_accounting: KvAccountingSpec,
         /// Chunked-prefill cap: max tokens per microbatch.
         max_batch_tokens: u32,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
@@ -709,14 +800,14 @@ pub enum IterWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
-        /// Hybrid archs only: `checkpoint` is vLLM's Mamba `align` mode, which
-        /// ends non-final prefill chunks on the KV block and floors prefix hits
-        /// to it; `plain` chunks as `min(remaining, budget)` and reuses a
-        /// retained prefix exactly (one state at its end), leaving both engine
-        /// artifacts out.
+        /// Archs whose KV layout keeps a resumable recurrent state only:
+        /// `checkpoint` ends non-final prefill chunks on the layout's engine
+        /// block (vLLM's Mamba `align` mode); `plain` chunks as
+        /// `min(remaining, budget)`. Absent follows `kv_overhead`: `vllm`
+        /// aligns, `none` does not.
         #[serde(default)]
-        #[param(string, default = "checkpoint", choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
-        prefill_chunk_alignment: PrefillChunkAlignment,
+        #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
+        prefill_chunk_alignment: Option<PrefillChunkAlignment>,
         /// Cap each microbatch at `ceil(resident decodes / pp_size)` decodes so
         /// running requests split across the in-flight microbatches. Off is
         /// vLLM: every ready decode joins the next microbatch, so requests that
@@ -836,6 +927,9 @@ pub enum IterWorkerSel {
         /// GPU memory for the worker (GB; primarily KV cache budget).
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// How the arch's KV layout is charged; see [`KvAccountingSpec`].
+        #[serde(flatten)]
+        kv_accounting: KvAccountingSpec,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
@@ -859,12 +953,50 @@ pub enum IterWorkerSel {
         /// GPU memory for the worker (GB; primarily KV cache budget).
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// How the arch's KV layout is charged; see [`KvAccountingSpec`].
+        #[serde(flatten)]
+        kv_accounting: KvAccountingSpec,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
     },
+}
+
+impl IterWorkerSel {
+    /// The selector's KV accounting knobs; every iteration-wise worker owns KV.
+    pub(crate) fn kv_accounting(&self) -> KvAccountingSpec {
+        match self {
+            Self::Barebone { kv_accounting, .. }
+            | Self::HpUnified { kv_accounting, .. }
+            | Self::ChunkedPrefill { kv_accounting, .. }
+            | Self::Speculative { kv_accounting, .. }
+            | Self::PipelineChunkedPrefill { kv_accounting, .. }
+            | Self::PdPrefill { kv_accounting, .. }
+            | Self::PdDecode { kv_accounting, .. } => *kv_accounting,
+        }
+    }
+
+    /// The chunk alignment a chunked selector asks for; `None` follows the
+    /// worker's `kv_overhead`.
+    pub(crate) fn prefill_chunk_alignment(&self) -> Option<PrefillChunkAlignment> {
+        match self {
+            Self::ChunkedPrefill {
+                prefill_chunk_alignment,
+                ..
+            }
+            | Self::Speculative {
+                prefill_chunk_alignment,
+                ..
+            }
+            | Self::PipelineChunkedPrefill {
+                prefill_chunk_alignment,
+                ..
+            } => *prefill_chunk_alignment,
+            _ => None,
+        }
+    }
 }
 
 // ── layer-wise attn / ffn contract (afd) ────────────────────────────────────
@@ -876,6 +1008,9 @@ pub enum AttnWorkerSel {
         /// GPU memory for the attention worker (GB; KV cache budget).
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// How the arch's KV layout is charged; see [`KvAccountingSpec`].
+        #[serde(flatten)]
+        kv_accounting: KvAccountingSpec,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]

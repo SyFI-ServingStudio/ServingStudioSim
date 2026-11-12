@@ -1,4 +1,4 @@
-//! `SessionTierWorker` — the hybrid chunked-prefill worker with DRAM/SSD prefix
+//! `SessionTierWorker` — the chunked-prefill worker with DRAM/SSD prefix
 //! tiers behind each attention DP rank's HBM cache, and decode run elsewhere.
 //!
 //! It wraps the whole-iteration shell and acts only between its messages:
@@ -25,10 +25,10 @@ use crate::worker::kv::PrefixKv;
 use crate::worker::types::WorkerStatus;
 use crate::worker::{WorkerEventCommon, WorkerMsgCommon};
 
-use super::iter_batch_worker::HybridChunkedPrefillShell;
+use super::iter_batch_worker::ChunkedPrefillWorker;
 
 pub struct SessionTierWorker<M: IterwiseUnifiedModel> {
-    inner: HybridChunkedPrefillShell<M>,
+    inner: ChunkedPrefillWorker<M>,
     /// Whether the admission reads from DRAM/SSD tiers (finished contexts are
     /// then written through).
     tiers: bool,
@@ -39,7 +39,7 @@ pub struct SessionTierWorker<M: IterwiseUnifiedModel> {
 
 impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
     pub(super) fn new(
-        inner: HybridChunkedPrefillShell<M>,
+        inner: ChunkedPrefillWorker<M>,
         tiers: bool,
         external_decode: bool,
     ) -> Self {
@@ -48,11 +48,6 @@ impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
             tiers,
             external_outputs: external_decode.then(HashMap::new),
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn shell_mut(&mut self) -> &mut HybridChunkedPrefillShell<M> {
-        &mut self.inner
     }
 
     fn on_request(&mut self, request: RequestId) {
@@ -150,7 +145,7 @@ mod tests {
     use crate::worker::config::PrefixTierReadWaitPolicy;
     use crate::worker::kv::PrefixTierSpec;
     use crate::worker::types::WorkerConfig;
-    use crate::worker::workers::iter::build_hybrid_chunked_prefill_worker;
+    use crate::worker::workers::iter::build_session_chunked_prefill_worker;
 
     fn as_session(
         store: &SharedRequests,
@@ -176,10 +171,10 @@ mod tests {
         dp_groups: u16,
         external_decode: bool,
     ) -> SessionTierWorker<FakeModel> {
-        build_hybrid_chunked_prefill_worker(
+        build_session_chunked_prefill_worker(
             WorkerId(0),
             "main",
-            Arc::new(FakeModel { ms: 1.0, dp_groups }),
+            Arc::new(FakeModel::with_dp_groups(1.0, dp_groups)),
             store,
             WorkerConfig {
                 max_batch_tokens: Some(256),
@@ -231,13 +226,10 @@ mod tests {
         let store = shared_with(&[(0, 4, 1), (1, 2, 1), (2, 8, 1)]);
         as_session(&store, 0, 7, 40, 0.0);
         as_session(&store, 1, 9, 20, 0.0);
-        let mut worker = build_hybrid_chunked_prefill_worker(
+        let mut worker = build_session_chunked_prefill_worker(
             WorkerId(0),
             "main",
-            Arc::new(FakeModel {
-                ms: 1.0,
-                dp_groups: 1,
-            }),
+            Arc::new(FakeModel::for_ms(1.0)),
             store.clone(),
             WorkerConfig {
                 max_batch_tokens: Some(256),

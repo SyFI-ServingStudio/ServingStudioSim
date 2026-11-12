@@ -239,3 +239,56 @@ def test_the_resolved_copy_is_written_only_under_the_run_directory_lease(
 
     assert seen_before_lease == [False]
     assert copy.is_file()
+
+
+def test_an_error_file_left_by_an_earlier_run_is_cleared_before_the_binary_starts(
+    hub, tmp_path, monkeypatch
+):
+    """The binary writes raw/error.json only on failure, and a failed run prints it:
+    one left in the log_dir by an earlier run must not be reported as this run's cause."""
+    import asyncio
+    import contextlib
+
+    import launcher.timing_predict as timing_predict
+
+    config_path, cfg = _direct_prediction(tmp_path)
+    log_dir = tmp_path / "logs" / "run"
+    cfg["log_dir"] = str(log_dir)
+    config_path.write_text(json.dumps(cfg))
+    stale = log_dir / "raw" / "error.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(json.dumps({"error": "need 1 idle GPU(s), found 0"}))
+    seen_at_start = []
+
+    class Lease:
+        async def acquire(self):
+            pass
+
+        def release(self):
+            pass
+
+    class Leases:
+        def run_directory(self, _log_dir):
+            return Lease()
+
+        @contextlib.asynccontextmanager
+        async def profile_database(self, write):
+            yield
+
+    class Stop(Exception):
+        pass
+
+    async def run_logged_process(argv, *_args, **_kwargs):
+        seen_at_start.append(stale.exists())
+        assert argv[argv.index("--error-json") + 1] == str(stale)
+        raise Stop
+
+    monkeypatch.setattr(timing_predict, "_LAUNCHER_LEASES", Leases())
+    monkeypatch.setattr(timing_predict, "prepare_managed_job", lambda *_, **__: None)
+    monkeypatch.setattr(timing_predict, "binary_path", lambda _build_type: Path("simulator"))
+    monkeypatch.setattr(timing_predict, "run_logged_process", run_logged_process)
+
+    with pytest.raises(Stop):
+        asyncio.run(timing_predict.run_one(config_path, "release", analysis="none"))
+
+    assert seen_at_start == [False]

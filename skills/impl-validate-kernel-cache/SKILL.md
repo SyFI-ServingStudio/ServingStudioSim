@@ -17,6 +17,15 @@ cache variants if the codebase provides one. This is the cache's
 - **batch-aggregation fidelity** (`agent-trace/attention_cache_fidelity.md`) — how
   an L2 op collapses a heterogeneous batch into one shape. Separate concern.
 
+## Keep the effort proportional to the kernel's share
+
+Validation effort follows the kernel's measured share of iteration time, from
+the real-engine capture (`top-add-new-arch` Phase 0). A kernel that dominates an
+engine phase deserves a full probe set and a remediation attempt; a minor kernel
+needs one pass. Either way, when the bar still fails, record the failing regions
+and move on. Phase 5 alignment shows whether the error matters end to end, and
+that evidence is what justifies more cache work.
+
 ## Architecture (why it can't drift)
 
 Two exposed, kernel-agnostic interfaces, fed ONE config from Python:
@@ -119,8 +128,9 @@ cells. A CSV of per-probe rows lands in `--log-dir`. `ratio < 1` = the cache
 under-estimates time (too optimistic); `> 1` = over-estimates.
 
 Treat command success as transport only; validation means the final ratios are
-acceptable under the user-specified threshold, or the default ±15% bar. If the
-error is too large, classify the failure before changing code:
+acceptable under the user-specified threshold, or the default ±15% bar. When
+the error is too large and the kernel's share justifies a fix, classify the
+failure before changing code:
 
 - interior interpolation error → consider a denser sweep grid, a different
   built-in cache kind, or an existing fitted variant;
@@ -132,13 +142,13 @@ error is too large, classify the failure before changing code:
   denser buckets or a non-direct cache;
 - re-axis/domain error → verify probes are physical query points and revise the
   re-axis if the projection is wrong;
-- noisy backend measurements → rerun/pre-warm before treating it as a cache
-  design problem.
+- noisy backend measurements → rerun the failing probes once before treating
+  it as a cache design problem.
 
-Ask the user before accepting a known inaccurate region, materially increasing
-profiling cost with a denser grid, adding a new cache/fitting mechanism, or
-changing the public query/input contract. After any remediation, rerun fidelity
-and report the new final CSV/log summary.
+Ask the user before materially increasing profiling cost with a denser grid,
+adding a new cache/fitting mechanism, or changing the public query/input
+contract. A known inaccurate region needs no approval: record it and move on.
+After any remediation, rerun fidelity and report the new final CSV/log summary.
 
 Grid refinement must preserve the 500-feasible-coordinate design ceiling from
 `orchestrator-wire-kernel-to-rust`. If a denser candidate would exceed it, do

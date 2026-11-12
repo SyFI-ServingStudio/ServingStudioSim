@@ -179,7 +179,9 @@ class SchemaNotFound(FileNotFoundError):
 
 
 def schema_path(build_type: str = "debug") -> Path:
-    return REPO_ROOT / "target" / build_type / "deployment_schema.json"
+    from ..binaries import build_output_dir
+
+    return build_output_dir(build_type) / "deployment_schema.json"
 
 
 @dataclass(frozen=True)

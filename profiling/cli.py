@@ -36,6 +36,7 @@ from profiling.db.args import KernelArgs
 from profiling.db.batch import ProfileProvenance
 from profiling.db.registry import KernelProfilerSpec, iter_kernel_profiler_specs
 from profiling.db.table import MissingEntry
+from profiling.exec.local import set_allow_autotune
 from profiling.facade import run_kind_times
 from profiling.gpu_catalog import resolve_gpu_spec
 from profiling.profilers.energy import energy_enabled, set_energy_enabled
@@ -92,6 +93,15 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
                 help=(
                     "Measure all specs like --force but insert nothing: "
                     "report the rows and leave profile.db untouched."
+                ),
+            )
+            command_parser.add_argument(
+                "--allow-autotune",
+                action="store_true",
+                help=(
+                    "Let --force/--fresh tune kernel tactics. Without it a refresh "
+                    "measures under the persisted tactics and fails before any worker "
+                    "starts when a spec has none (a jit-fill run always may tune)."
                 ),
             )
             command_parser.add_argument(
@@ -157,6 +167,14 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
         dest="clear_l2",
         action="store_false",
         help="Warm continuous window (no per-launch L2 displacement); reveals power/clock drift.",
+    )
+    measure_parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help=(
+            "Replay the kernel from a CUDA graph so host dispatch leaves no gaps; with "
+            "--no-clear-l2 the window runs back to back at the sustained power limit."
+        ),
     )
     measure_energy = measure_parser.add_mutually_exclusive_group()
     measure_energy.add_argument(
@@ -374,6 +392,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # clobber an inherited VIBESIM_PROFILE_ENERGY=0.
     if args.energy is not None:
         set_energy_enabled(args.energy)
+    set_allow_autotune(args.allow_autotune)
     # --force and --fresh both re-measure every spec; only --force keeps the rows.
     measure_all = args.force or args.fresh
     mode = "fresh" if args.fresh else "force-refresh" if args.force else "jit-fill"
@@ -390,13 +409,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # a conversation backend.
     create_time = _utc_now()
     profile_id = _profile_id(output_dir)
-    descriptor = {
-        "table": args.table,
-        "kernelKind": str(profiler_spec.kernel_kind),
-        "backend": args.backend,
-        "metricFamily": profiler_spec.metric_family.value,
-        "pointCount": len(specs),
-    }
+    descriptor = run_descriptor(args, profiler_spec, specs)
     if managed_job is not None:
         assert output_dir is not None
         managed_job.register(
@@ -538,20 +551,14 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     specs = _load_specs(args.spec, args.specs)
     if len(specs) != 1:
         raise ValueError(f"measure takes exactly one spec, got {len(specs)}")
+    _set_db_path(args.db)
     if args.energy is not None:
         set_energy_enabled(args.energy)
-    output_dir = args.output_dir or Path(f"measure_{args.table}_{args.backend}")
+    output_dir = measure_output_dir(args)
     profiler_spec = _resolve_profiler_spec(args.table, args.backend)
     create_time = _utc_now()
     measurement_id = _measurement_id(output_dir)
-    descriptor = {
-        "table": args.table,
-        "backend": args.backend,
-        "pointCount": 1,
-        "durationSeconds": args.duration_s,
-        "clearL2": args.clear_l2,
-        "energyMeasured": energy_enabled(),
-    }
+    descriptor = measure_descriptor(args)
     managed_job = ManagedJob.from_environment("kernel_measure")
     if managed_job is not None:
         managed_job.register(
@@ -572,6 +579,7 @@ def _cmd_measure(args: argparse.Namespace) -> int:
             telemetry_hz=args.telemetry_hz,
             telemetry=args.telemetry,
             clear_l2=args.clear_l2,
+            cuda_graph=args.cuda_graph,
         )
         runner_error = result.get("runner_error")
         if runner_error:
@@ -632,6 +640,36 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         _print_measure_result(result)
         print(f"measurement: {output_dir / MEASUREMENT_METADATA_FILENAME}")
     return 0
+
+
+def run_descriptor(
+    args: argparse.Namespace, profiler_spec: KernelProfilerSpec, specs: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """The managed-job descriptor of a `run` (also registered by `--remote`)."""
+    return {
+        "table": args.table,
+        "kernelKind": str(profiler_spec.kernel_kind),
+        "backend": args.backend,
+        "metricFamily": profiler_spec.metric_family.value,
+        "pointCount": len(specs),
+    }
+
+
+def measure_descriptor(args: argparse.Namespace) -> dict[str, Any]:
+    """The managed-job descriptor of a `measure` (also registered by `--remote`)."""
+    return {
+        "table": args.table,
+        "backend": args.backend,
+        "pointCount": 1,
+        "durationSeconds": args.duration_s,
+        "clearL2": args.clear_l2,
+        # Read after --energy/--no-energy has been applied.
+        "energyMeasured": energy_enabled() if args.energy is None else args.energy,
+    }
+
+
+def measure_output_dir(args: argparse.Namespace) -> Path:
+    return args.output_dir or Path(f"measure_{args.table}_{args.backend}")
 
 
 def _print_measure_result(result: Mapping[str, Any]) -> None:

@@ -69,7 +69,7 @@ use crate::worker::types::IterBatchPlan;
 
 use crate::worker::types::LoadBudget;
 
-use super::chunked_prefill_admission::next_chunk_tokens;
+use super::chunked_prefill_admission::{next_chunk_tokens, ChunkEndAlignment};
 use super::fresh_source::{FreshQueues, FreshSource};
 use super::overdue::OverdueQueue;
 use super::prefix_fetch::{AtHead, PrefixFetch};
@@ -84,8 +84,9 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     policy_context: P::Context,
     enqueue_sequence: EnqueueSequence,
     max_batch_tokens: u32,
-    /// Checkpoint interval a non-final chunk must end on, if any.
-    chunk_end_quantum: Option<u32>,
+    /// Where chunks may end, when the engine can only checkpoint recurrent
+    /// state on block boundaries.
+    chunk_end_alignment: Option<ChunkEndAlignment>,
     /// vLLM's `long_prefill_token_threshold`: the most prefill tokens one
     /// request may take per microbatch.
     long_prefill_threshold: Option<u32>,
@@ -161,7 +162,7 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             policy_context,
             enqueue_sequence: EnqueueSequence::default(),
             max_batch_tokens,
-            chunk_end_quantum: None,
+            chunk_end_alignment: None,
             long_prefill_threshold: None,
             started_prefills: Vec::new(),
             in_flight_decodes: HashSet::new(),
@@ -190,10 +191,10 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         self
     }
 
-    /// End every non-final chunk on a multiple of `quantum` context tokens.
-    pub(crate) fn with_chunk_end_quantum(mut self, quantum: u32) -> Self {
-        assert!(quantum > 0, "chunk-end quantum must be positive");
-        self.chunk_end_quantum = Some(quantum);
+    /// End every non-final chunk on a checkpoint boundary of `alignment`.
+    pub(crate) fn with_chunk_end_alignment(mut self, alignment: ChunkEndAlignment) -> Self {
+        assert!(alignment.quantum > 0, "chunk-end quantum must be positive");
+        self.chunk_end_alignment = Some(alignment);
         self
     }
 
@@ -348,7 +349,7 @@ where
             let chunk_tokens = next_chunk_tokens(
                 resolved_prefill,
                 remaining_budget,
-                self.chunk_end_quantum,
+                self.chunk_end_alignment,
                 self.max_batch_tokens,
                 self.long_prefill_threshold,
             );
@@ -406,7 +407,7 @@ where
         let chunk_tokens = next_chunk_tokens(
             kv_store.resolved_prefill_context(candidate.request_id),
             budget,
-            self.chunk_end_quantum,
+            self.chunk_end_alignment,
             self.max_batch_tokens,
             self.long_prefill_threshold,
         );
@@ -473,7 +474,7 @@ where
             overdue.promote(PARTITION, &mut self.policy, now);
         }
         let max_batch_tokens = self.max_batch_tokens;
-        let chunk_end_quantum = self.chunk_end_quantum;
+        let chunk_end_alignment = self.chunk_end_alignment;
         let mut remaining_budget = max_batch_tokens;
         // Running decodes first, as vLLM schedules its running queue before
         // waiting prompts. One whose previous step has not returned sits out.
@@ -510,7 +511,7 @@ where
                 let chunk_tokens = next_chunk_tokens(
                     resolved_prefill,
                     remaining_budget,
-                    chunk_end_quantum,
+                    chunk_end_alignment,
                     max_batch_tokens,
                     long_prefill_threshold,
                 );

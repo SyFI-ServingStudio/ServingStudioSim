@@ -56,7 +56,13 @@ including one recorded on another model). Each member gives:
 - `gpus`: the GPUs it occupies, every pool and replica included.
 - `pools`: per role, `replicas`, the arch preset's `arch_params`,
   `max_model_len` (the longest request the pool serves; `arch_params` may leave
-  it to the model's own limit), `gpus_per_replica` and the `worker` block.
+  it to the model's own limit), `gpus_per_replica`, the `worker` block, and
+  `kv_cache`: the pool's KV cache as its build sizes it, the first
+  partition's entry of a run's `raw/kv_cache.json` plus `partitions` (per
+  replica). `result.max_concurrency_at_max_model_len` is vLLM's "Maximum
+  concurrency" for one partition, `result.request_parts` what one request of
+  `max_model_len` holds per part, and `layout` the arch's declared parts;
+  bytes are over `attention_shards` GPUs.
 - `unavailable`: per capture, why the member cannot run it: `{"error": ...}`
   when it does not build, `{"missing": {<kernel role>: <rows>}}` when
   profile.db lacks rows, or `{"misfit": {"reason", "max_model_len", ...}}`
@@ -221,7 +227,7 @@ The request is checked before it queues:
 | Status | Cause | `detail` |
 | --- | --- | --- |
 | 400 | `params` miss an axis, name an unknown one, or match no member | `{message, choices}`; `choices` lists every member's `params` |
-| 400 | A bad workload: an unknown capture or upload, a generator argument tracegen rejects, a trace the simulator cannot read, more than 2000 requests, a request longer than a pool's `max_model_len` (prefix + input + output, plus the draft tokens of a speculative worker; a capture's own requests included, which `/simulations/presets` lists as its `misfit`), a missing or wrong `accept_rate` (both the request's and an upload's column, or a list that is not `draft_tokens` long) | the reason, naming the request or argument; for a request too long, `{message, too_long: {pool, max_model_len, requests, total}}`, `pool` naming the pool whose limit it broke |
+| 400 | A bad workload: an unknown capture or upload, a generator argument tracegen rejects, a trace the simulator cannot read, more than 2000 requests, a request longer than a pool's `max_model_len` (prefix + input + output; a capture's own requests included, which `/simulations/presets` lists as its `misfit`), a missing or wrong `accept_rate` (both the request's and an upload's column, or a list that is not `draft_tokens` long) | the reason, naming the request or argument; for a request too long, `{message, too_long: {pool, max_model_len, requests, total}}`, `pool` naming the pool whose limit it broke |
 | 404 | Unknown preset id | `no public preset '...'` |
 | 409 | The member does not build or lacks profile.db rows for that capture | the reason; pick another member or capture |
 | 413 | An upload over `max_bytes` | the limit |
@@ -242,9 +248,8 @@ echo "$S" | jq '{status, error, routing, workload, gpus, summary}'
 `status` is `queued` (with `queue_position`), `running`, `done`, `failed`
 (with `error`) or `timed_out`. The record repeats the request: `preset`,
 `params`, `workload` (with the `capture` used, `trace`, its facts as
-recorded, before any `load` rescales its rate, and
-`shortened`, how many requests lost their last tokens to fit a speculative
-pool's draft window), `routing` and `gpus`. Once done, `summary` has:
+recorded, before any `load` rescales its rate), `routing` and `gpus`. Once
+done, `summary` has:
 
 - `cause`: why the run stopped;
 - `requests`: `total` and `finished`;

@@ -39,7 +39,6 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -56,6 +55,7 @@ from public_api.deployments import (
     _axes,
     find_member,
 )
+from public_api.forked import forked_map
 
 REPO_ROOT = public_preset.REPO_ROOT
 SIM_PRESET_ROOT = REPO_ROOT / "presets" / "public_sim"
@@ -248,6 +248,10 @@ class SimMember:
     # Its pools' request bounds as the simulator's build gives them
     # (`dry-run --report-json` `pools`: role, max_model_len, draft_tokens).
     bounds: list[dict] | None = None
+    # Its KV pools as the same build gives them (`dry-run --report-json`
+    # `kv_cache`: the run's `raw/kv_cache.json`). The workload never changes
+    # them, so the first build's stands for every capture.
+    kv_cache: dict | None = None
 
     @property
     def dense(self) -> bool:
@@ -332,6 +336,7 @@ class SimMember:
                 "max_model_len": limits.get(role),
                 "gpus_per_replica": per_replica,
                 "worker": pool["worker"],
+                "kv_cache": pool_kv_cache(self.kv_cache, role),
             }
         return {
             "params": self.params,
@@ -344,6 +349,25 @@ class SimMember:
                 if (blocker := self.blocker(capture)) is not None
             },
         }
+
+
+def pool_kv_cache(document: dict | None, role: str) -> dict | None:
+    """One pool's KV cache from a build's ``kv_cache`` document: the report of
+    its first partition (a pool's replicas and partitions are alike), with the
+    GPU and how many partitions one replica holds (``partitions``: its
+    attention DP groups, each with its own cache and concurrency). None when
+    the pool keeps none, or before a build."""
+    entries = [e for e in (document or {}).get("pools", []) if e["pool_tag"] == role]
+    if not entries:
+        return None
+    first = entries[0]
+    report = {
+        key: value
+        for key, value in first.items()
+        if key not in ("pool_tag", "pool", "worker_id", "group_id")
+    }
+    partitions = sum(1 for e in entries if e["worker_id"] == first["worker_id"])
+    return {"partitions": partitions, **report}
 
 
 @dataclass
@@ -482,25 +506,31 @@ class SimIndex:
                         built = capture in member.checked
                         (builds if built else fits).append((member, capture, built))
 
+        # Runs in a forked worker (public_api.forked): it returns the answer
+        # alone, and the members here are updated from it.
         def one(item):
             member, capture, build = item
             try:
-                return member, capture, check(member, capture, build), None
+                return check(member, capture, build), None
             except Exception as error:  # noqa: BLE001 — the build's own message
-                return member, capture, None, str(error)
+                return None, str(error)
 
-        with ThreadPoolExecutor(max_workers=jobs) as pool:
-            for work in (builds, fits):
-                for member, capture, answer, error in pool.map(one, work):
-                    if error is not None:
-                        member.failures[capture.name] = error
-                        continue
-                    missing, misfit, bounds = answer
-                    if missing is not None:
-                        member.missing[capture.name] = missing
-                        member.bounds = bounds
-                    if misfit is not None:
-                        member.misfits[capture.name] = misfit
+        # Each pass forks its own workers: a fit is checked against the bounds
+        # the builds recorded, which a worker forked before them would not see.
+        for work in (builds, fits):
+            for (member, capture, _), (answer, error) in zip(
+                work, forked_map(one, work, jobs), strict=True
+            ):
+                if error is not None:
+                    member.failures[capture.name] = error
+                    continue
+                missing, misfit, bounds, kv_cache = answer
+                if missing is not None:
+                    member.missing[capture.name] = missing
+                    member.bounds = bounds
+                    member.kv_cache = member.kv_cache or kv_cache
+                if misfit is not None:
+                    member.misfits[capture.name] = misfit
 
     def preset(self, preset_id: str) -> SimPreset:
         if preset_id not in self.presets:

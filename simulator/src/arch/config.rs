@@ -33,6 +33,7 @@ use schema_derive::{ParamStruct, ProviderSchema};
 use super::glm52_model_cfg::Glm52MtpMode;
 use super::ep_comm::{EpCommConfig, EpCommKind, EpCommModel};
 use super::hisparse::HisparseConfig;
+use super::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
 /// carries no `deny_unknown_fields` (the flattened struct must let the arch's
@@ -123,6 +124,20 @@ const EP_COMM_MODELS: [&str; 2] = ["measured", "analytic"];
 /// [`Glm52MtpMode`]'s serde representation.
 const GLM52_MTP_MODES: [&str; 3] = ["off", "full_index", "index_share"];
 
+const fn default_decoder_swa_bounded_replay() -> bool {
+    true
+}
+
+const fn default_deepseek_v41_max_num_batched_tokens() -> u32 {
+    crate::arch::deepseek_v41_vllm::MAX_BATCHED_TOKENS
+}
+
+fn default_deepseek_v41_cudagraph_capture_sizes() -> Vec<u32> {
+    crate::arch::deepseek_v41_vllm::vllm_default_cudagraph_capture_sizes(
+        crate::arch::deepseek_v41_vllm::MAX_BATCHED_TOKENS,
+    )
+}
+
 const fn default_glm52_parallel_size() -> u16 {
     8
 }
@@ -139,6 +154,32 @@ const fn default_glm52_nvfp4_max_model_len() -> u32 {
 const fn default_glm53_flash_max_model_len() -> u32 {
     8192
 }
+
+/// The MiMo-V2.6-Flash capture's `--max-model-len` (its attention rows'
+/// FA4 split count).
+const fn default_mimo_v2_max_model_len() -> u32 {
+    131_072
+}
+
+/// The Qwen3.8-27B capture's `--max-model-len`.
+const fn default_qwen35_max_model_len() -> u32 {
+    131_072
+}
+
+/// The Qwen3.8-Flash-Next capture's `--max-model-len`.
+const fn default_qwen4_exp_max_model_len() -> u32 {
+    131_072
+}
+
+/// The Qwen3.8-Flash-Next capture's MTP `num_speculative_tokens`.
+const fn default_qwen4_exp_draft_tokens() -> u32 {
+    3
+}
+
+/// [`Qwen4ExpCacheDtype`]'s serde representation.
+const QWEN4_EXP_CACHE_DTYPES: [&str; 2] = Qwen4ExpCacheDtype::CHOICES;
+/// [`PleTableResidency`]'s serde representation.
+const PLE_TABLE_RESIDENCIES: [&str; 2] = PleTableResidency::CHOICES;
 
 /// The captured GLM-5.3-Flash deployment ran `--enable-expert-parallel`.
 const fn default_glm53_flash_enable_expert_parallel() -> bool {
@@ -169,6 +210,11 @@ const fn default_glm52_draft_tokens() -> u32 {
 /// drafted positions.
 const fn default_dflash2_draft_tokens() -> u32 {
     7
+}
+
+/// DeepSeek-V4.1-Flash's `dspark_block_size`.
+const fn default_dspark_draft_tokens() -> u32 {
+    5
 }
 
 /// `sliding_window` in the DFlash2 draft checkpoint.
@@ -374,12 +420,65 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         max_model_len: Option<u32>,
-        /// Decoder SWA bounded replay what-if (vLLM PR #58132 / SGLang
-        /// `--enable-decoder-swa-bounded-replay`): layers past the last KV
-        /// source run only each prefill chunk's last `sliding_window` extend
-        /// tokens. A counterfactual with no capture behind it; default off.
-        #[serde(default)]
+        /// vLLM's decoder SWA bounded replay (`swa_bounded_replay`, on by
+        /// default): on eager steps and large PIECEWISE steps the layers from
+        /// the last KV source on run only each request's last
+        /// `sliding_window` rows. `false` is the counterfactual without it.
+        #[serde(default = "default_decoder_swa_bounded_replay")]
+        #[param(default = true, cache_key)]
         decoder_swa_bounded_replay: bool,
+        /// vLLM `--max-num-batched-tokens` (the chunk size): the FlashMLA
+        /// prefill workspace identity of the mega attention.
+        #[serde(default = "default_deepseek_v41_max_num_batched_tokens")]
+        #[param(default = 2048, cache_key)]
+        max_num_batched_tokens: u32,
+        /// vLLM `--cudagraph-capture-sizes`: the PIECEWISE token sizes (the
+        /// last one is the capture limit); the FULL decode graphs' request
+        /// counts derive from them and `max_num_seqs` 64 as vLLM's MRV2
+        /// runner does. Omitted: vLLM's default list up to 2048. Empty: eager.
+        #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// DeepSeek-V4.1-Flash under vLLM DP4 attention + EP4 experts on B200
+    /// (`--data-parallel-size 4 --enable-expert-parallel`, TP1): every rank
+    /// its own engine with its own batch and KV; attention, Engram, shared
+    /// expert and the full-vocabulary lm_head at TP1, the routed experts
+    /// behind an MXFP8 all-gatherv and a bf16 reduce-scatterv.
+    DeepseekV41VllmDpAttnEpMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--max-model-len`, as for `deepseek_v41_vllm`.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// vLLM's decoder SWA bounded replay, as for `deepseek_v41_vllm`;
+        /// the DP ranks replay together.
+        #[serde(default = "default_decoder_swa_bounded_replay")]
+        #[param(default = true, cache_key)]
+        decoder_swa_bounded_replay: bool,
+        /// vLLM `--max-num-batched-tokens` per rank, as for `deepseek_v41_vllm`.
+        #[serde(default = "default_deepseek_v41_max_num_batched_tokens")]
+        #[param(default = 2048, cache_key)]
+        max_num_batched_tokens: u32,
+        /// vLLM `--cudagraph-capture-sizes` per rank, as for
+        /// `deepseek_v41_vllm`. Omitted: vLLM's default list up to 2048.
+        /// Empty: eager.
+        #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
+        cudagraph_capture_sizes: Vec<u32>,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)
@@ -407,12 +506,115 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         max_model_len: Option<u32>,
-        /// Decoder SWA bounded replay what-if (vLLM PR #58132 / SGLang
-        /// `--enable-decoder-swa-bounded-replay`): layers past the last KV
-        /// source run only each prefill chunk's last `sliding_window` extend
-        /// tokens. A counterfactual with no capture behind it; default off.
-        #[serde(default)]
+        /// vLLM's decoder SWA bounded replay (`swa_bounded_replay`, on by
+        /// default): on eager steps and large PIECEWISE steps the layers from
+        /// the last KV source on run only each request's last
+        /// `sliding_window` rows. `false` is the counterfactual without it.
+        #[serde(default = "default_decoder_swa_bounded_replay")]
+        #[param(default = true, cache_key)]
         decoder_swa_bounded_replay: bool,
+        /// vLLM `--max-num-batched-tokens` (the chunk size): the FlashMLA
+        /// prefill workspace identity of the mega attention.
+        #[serde(default = "default_deepseek_v41_max_num_batched_tokens")]
+        #[param(default = 2048, cache_key)]
+        max_num_batched_tokens: u32,
+        /// vLLM `--cudagraph-capture-sizes`: the PIECEWISE token sizes (the
+        /// last one is the capture limit); the FULL decode graphs' request
+        /// counts derive from them and `max_num_seqs` 64 as vLLM's MRV2
+        /// runner does. Omitted: vLLM's default list up to 2048. Empty: eager.
+        #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// The DeepSeek-V4.1 target driven by its **DSpark** proposer
+    /// (`--speculative-config {"method":"dspark"}`): three SWA-only draft
+    /// layers drafting a `draft_tokens` block in one pass, then that many
+    /// sequential Markov steps. TP4 attention + EP4 experts as the target.
+    DeepseekV41VllmDspark {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Target routing; the draft MoE routes uniformly (no capture).
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Target per-token routes (`routing = corpus`), recorded at the
+        /// verify width when available.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--max-model-len`, as for `deepseek_v41_vllm`.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// Positions drafted per request: must equal `dspark_block_size`.
+        #[serde(default = "default_dspark_draft_tokens")]
+        #[param(default = 5, cache_key)]
+        draft_tokens: u32,
+        /// Decoder SWA bounded replay of the target, as for `deepseek_v41_vllm`.
+        #[serde(default = "default_decoder_swa_bounded_replay")]
+        #[param(default = true, cache_key)]
+        decoder_swa_bounded_replay: bool,
+        /// vLLM `--max-num-batched-tokens`, as for `deepseek_v41_vllm`.
+        #[serde(default = "default_deepseek_v41_max_num_batched_tokens")]
+        #[param(default = 2048, cache_key)]
+        max_num_batched_tokens: u32,
+        /// vLLM `--cudagraph-capture-sizes`, as for `deepseek_v41_vllm`; the
+        /// FULL verify and draft graphs' request counts derive from it at the
+        /// verify width. Omitted: vLLM's default list up to 2048. Empty: eager.
+        #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// [`DeepseekV41VllmDspark`] over the DP4 target
+    /// (`deepseek_v41_vllm_dp_attn_ep_moe`): rank-local sampler and proposer
+    /// edges, draft layers as DP layers with the EP-sharded draft MoE.
+    /// The DeepSeek-V4.1 target driven by its **DSpark** proposer
+    /// (`--speculative-config {"method":"dspark"}`): three SWA-only draft
+    /// layers drafting a `draft_tokens` block in one pass, then that many
+    /// sequential Markov steps. TP4 attention + EP4 experts as the target.
+    DeepseekV41VllmDpAttnEpMoeDspark {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Target routing; the draft MoE routes uniformly (no capture).
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Target per-token routes (`routing = corpus`), recorded at the
+        /// verify width when available.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--max-model-len`, as for `deepseek_v41_vllm`.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// Positions drafted per request: must equal `dspark_block_size`.
+        #[serde(default = "default_dspark_draft_tokens")]
+        #[param(default = 5, cache_key)]
+        draft_tokens: u32,
+        /// Decoder SWA bounded replay of the target, as for `deepseek_v41_vllm`.
+        #[serde(default = "default_decoder_swa_bounded_replay")]
+        #[param(default = true, cache_key)]
+        decoder_swa_bounded_replay: bool,
+        /// vLLM `--max-num-batched-tokens`, as for `deepseek_v41_vllm`.
+        #[serde(default = "default_deepseek_v41_max_num_batched_tokens")]
+        #[param(default = 2048, cache_key)]
+        max_num_batched_tokens: u32,
+        /// vLLM `--cudagraph-capture-sizes`, as for `deepseek_v41_vllm`; the
+        /// FULL verify and draft graphs' request counts derive from it at the
+        /// verify width. Omitted: vLLM's default list up to 2048. Empty: eager.
+        #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
+        cudagraph_capture_sizes: Vec<u32>,
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.
@@ -1333,6 +1535,173 @@ pub enum IterArchSel {
         #[param(cache_key)]
         token_corpus_file: Option<String>,
     },
+    /// Inkling's ModelOpt NVFP4 checkpoints (`thinkingmachines/Inkling-NVFP4`,
+    /// `Inkling-Small-NVFP4`) under the vLLM fork's TP group: TP attention,
+    /// dense FFN and sink experts, replicated router, routed experts EP = TP
+    /// or MoE TP, and every sublayer closed by the Lamport RS + sconv + AG +
+    /// norm call.
+    InklingVllmNvfp4RelAttnMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count (at least 2: the Lamport boundary).
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// vLLM `--enable-expert-parallel`. On, each rank owns
+        /// `n_routed_experts / tp_size` whole experts (EP = TP). Off, each rank
+        /// owns every expert, sliced on the intermediate axis (MoE TP).
+        #[serde(default = "default_glm53_flash_enable_expert_parallel")]
+        #[param(default = true, cache_key)]
+        enable_expert_parallel: bool,
+        /// Configured context cap: the global layers' FA4 split count. It is
+        /// also part of every attention layer's kernel config, local layers
+        /// included (their context axis stops at it), and each request's
+        /// context is validated against it.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Its layer axis is the
+        /// MoE layers; the BF16-expert layers and the NVFP4 ones each fold
+        /// their own slice.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. Every kernel but attention runs
+        /// on the token count padded up to the next captured size; attention
+        /// on a uniform-decode step runs at the padded request count. The
+        /// sizes also decide whether the sink experts overlap the routed call
+        /// (FULL-graph decode or eager steps only). Empty: no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// MiMo-V2's FP8 checkpoints (`XiaomiMiMo/MiMo-V2.6-Flash-RL`) under
+    /// vLLM's TP group: TP attention over global and sliding-window layers
+    /// (FA4 DiffKV), replicated router, routed MXFP4 experts EP = TP with BF16
+    /// activations, and every TP all-reduce fused with the residual add and
+    /// RMSNorm (FlashInfer MNNVL).
+    MimoV2VllmFp8SwaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count; the routed experts are expert-parallel
+        /// over the same ranks (`--enable-expert-parallel`).
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// Configured context cap: FA4's split count on a FULL-graph decode
+        /// and the context axis top of every attention layer's config. Each
+        /// request's context is validated against it.
+        #[serde(default = "default_mimo_v2_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Its layer axis is the
+        /// MoE layers (layer 0's dense MLP has none).
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). Every kernel
+        /// but attention runs on the token count padded up to the next
+        /// captured size; attention on a uniform-decode step runs at the
+        /// padded request count from a FULL graph. Empty: no padding, no graphs
+        /// (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// Qwen3.5-family hybrid decoders (`Qwen3_5ForConditionalGeneration`,
+    /// text only) with ModelOpt mixed-precision weights (FP8 per-tensor
+    /// attention projections, NVFP4 MLP and lm_head) on one GPU under vLLM:
+    /// Gated DeltaNet and gated-GQA layers (FlashInfer trtllm-gen, FP8 KV),
+    /// each with a dense SwiGLU MLP. Precisions come from the checkpoint's
+    /// `quantization_config`; `fp8` is not read.
+    Qwen35VllmNvfp4GdnDense {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Configured context cap; each request's context is validated
+        /// against it.
+        #[serde(default = "default_qwen35_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). The compiled
+        /// pieces run on the token count padded up to the next captured size;
+        /// a uniform decode replays a FULL graph, so the GDN core and decode
+        /// attention run padded too. Empty: no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// Qwen4Exp hybrid decoders (`Qwen4ExpForConditionalGeneration`, text
+    /// only; Qwen3.8-Flash-Next) with ModelOpt mixed-precision weights on one
+    /// GPU under the vLLM fork, drafting with the checkpoint's MTP layer:
+    /// Gated DeltaNet and QSA (sparse GQA with a compressed indexer) layers
+    /// joined by hyper-connections, PLE n-gram blocks, NVFP4 routed experts
+    /// with a BF16 shared expert, and an FP8-block MTP layer. Precisions come
+    /// from the checkpoint's `quantization_config`; `fp8` is not read.
+    Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Configured context cap; each request's context is validated
+        /// against it, and it sizes the QSA top-k and block-table rows.
+        #[serde(default = "default_qwen4_exp_max_model_len")]
+        #[param(default = 131072, cache_key)]
+        max_model_len: u32,
+        /// MTP `num_speculative_tokens`: fixes the verify width at
+        /// `draft_tokens + 1`, a profiled kernel shape.
+        #[serde(default = "default_qwen4_exp_draft_tokens")]
+        #[param(default = 3, cache_key)]
+        draft_tokens: u32,
+        /// vLLM `--kv-cache-dtype` of the QSA KV.
+        #[serde(default)]
+        #[param(string, default = "fp8", choices = QWEN4_EXP_CACHE_DTYPES, cache_key)]
+        kv_cache_dtype: Qwen4ExpCacheDtype,
+        /// The QSA indexer's key-cache dtype.
+        #[serde(default)]
+        #[param(string, default = "fp8", choices = QWEN4_EXP_CACHE_DTYPES, cache_key)]
+        indexer_kv_dtype: Qwen4ExpCacheDtype,
+        /// Where the PLE n-gram table lives: pinned host memory over UVA
+        /// (the fork's CPU offload) or HBM.
+        #[serde(default)]
+        #[param(string, default = "host_uva", choices = PLE_TABLE_RESIDENCIES, cache_key)]
+        ple_table_residency: PleTableResidency,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Its layer axis is the
+        /// body's MoE layers, then the MTP layer.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes` (FULL_AND_PIECEWISE). The graph
+        /// pieces run on the token count padded up to the next captured size;
+        /// a uniform verify step replays a FULL graph, so its eager breaks run
+        /// padded too. Empty: no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
 }
 
 impl IterArchSel {
@@ -1350,6 +1719,9 @@ impl IterArchSel {
             | Self::DeepseekV4VllmSerialStreams { model, .. }
             | Self::DeepseekV41Vllm { model, .. }
             | Self::DeepseekV41VllmSerialStreams { model, .. }
+            | Self::DeepseekV41VllmDspark { model, .. }
+            | Self::DeepseekV41VllmDpAttnEpMoeDspark { model, .. }
+            | Self::DeepseekV41VllmDpAttnEpMoe { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
             | Self::Glm52VllmNvfp4PpDsaMoe { model, .. }
@@ -1365,7 +1737,11 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { model, .. }
             | Self::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { model, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { model, .. }
-            | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
+            | Self::Glm52SglangNvfp4TpDsaMoe { model, .. }
+            | Self::InklingVllmNvfp4RelAttnMoe { model, .. }
+            | Self::MimoV2VllmFp8SwaMoe { model, .. }
+            | Self::Qwen35VllmNvfp4GdnDense { model, .. }
+            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { model, .. } => model,
         }
     }
 
@@ -1487,13 +1863,34 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { max_model_len, .. }
-            | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. } => Ok(*max_model_len),
+            | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. }
+            | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. }
+            | Self::MimoV2VllmFp8SwaMoe { max_model_len, .. }
+            | Self::Qwen35VllmNvfp4GdnDense { max_model_len, .. }
+            | Self::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { max_model_len, .. } => {
+                Ok(*max_model_len)
+            }
             Self::DeepseekV41Vllm {
                 model,
                 max_model_len,
                 ..
             }
             | Self::DeepseekV41VllmSerialStreams {
+                model,
+                max_model_len,
+                ..
+            }
+            | Self::DeepseekV41VllmDspark {
+                model,
+                max_model_len,
+                ..
+            }
+            | Self::DeepseekV41VllmDpAttnEpMoeDspark {
+                model,
+                max_model_len,
+                ..
+            }
+            | Self::DeepseekV41VllmDpAttnEpMoe {
                 model,
                 max_model_len,
                 ..
@@ -1963,7 +2360,11 @@ mod iter_tests {
         );
         // DeepSeek-V4.1 defaults to the checkpoint's 1M positions; the
         // capture presets pin their 131072.
-        for arch in ["deepseek_v41_vllm", "deepseek_v41_vllm_serial_streams"] {
+        for arch in [
+            "deepseek_v41_vllm",
+            "deepseek_v41_vllm_serial_streams",
+            "deepseek_v41_vllm_dp_attn_ep_moe",
+        ] {
             assert_eq!(limit(arch, "deepseek_v41_flash", ""), 1_048_576);
             assert_eq!(
                 limit(arch, "deepseek_v41_flash", r#","max_model_len":131072"#),

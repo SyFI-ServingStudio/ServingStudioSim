@@ -1,5 +1,11 @@
-//! FlashInfer TRT-LLM fused TP boundary:
+//! FlashInfer fused TP boundary:
 //! all-reduce + residual add + RMSNorm in one device kernel.
+//!
+//! Backends: `flashinfer_trtllm` (TRT-LLM IPC workspace) and `flashinfer_mnnvl`
+//! (NVLink-multicast workspace, vLLM's `auto` choice on B200). MNNVL
+//! switches from one-shot to two-shot inside the call by the same 1 MiB
+//! all-gathered-payload rule as the standalone call, so its grid brackets that
+//! switch and the 16-token PDL completion boundary.
 //!
 //! Unlike byte-keyed pure all-reduce, launch cost depends on the 2-D
 //! `[num_tokens, hidden_dim]` shape. `hidden_dim` is static config and
@@ -10,7 +16,9 @@
 use crate::common::Fabric;
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
-use crate::timing::kernels::all_reduce_fusion::flashinfer_fusion_max_bytes;
+use crate::timing::kernels::all_reduce_fusion::{
+    flashinfer_fusion_max_bytes, mnnvl_max_oneshot_tokens,
+};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
@@ -67,11 +75,21 @@ impl KernelSpec for AllReduceResidualRmsNormSpec {
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         let max_fused_tokens = Self::max_fused_tokens(config);
         let mut tokens = Axis::chain([Axis::pow2(0, 4), Axis::token_axis()]);
-        tokens.retain(|num_tokens| *num_tokens <= max_fused_tokens as f64);
-        if tokens.last().copied() != Some(max_fused_tokens as f64) {
-            tokens.push(max_fused_tokens as f64);
-            tokens.sort_by(f64::total_cmp);
+        // Only MNNVL gets the PDL completion (17) and one-shot/two-shot
+        // brackets; keeping them off the trtllm grid avoids resampling that
+        // backend's existing rows.
+        if config.backends.contains(&"flashinfer_mnnvl") {
+            let last_oneshot =
+                mnnvl_max_oneshot_tokens(config.hidden_dim, config.num_gpus, config.dtype);
+            tokens.push(17.0);
+            if last_oneshot > 0 {
+                tokens.extend([f64::from(last_oneshot), f64::from(last_oneshot + 1)]);
+            }
         }
+        tokens.retain(|num_tokens| *num_tokens <= max_fused_tokens as f64);
+        tokens.push(max_fused_tokens as f64);
+        tokens.sort_by(f64::total_cmp);
+        tokens.dedup();
         SweepGrid::new(vec![tokens])
     }
 
@@ -178,6 +196,27 @@ mod tests {
             AllReduceResidualRmsNormSpec::cache_kind("flashinfer_trtllm"),
             CacheKind::Cache1DLinear
         ));
+    }
+
+    #[test]
+    fn mnnvl_sweep_brackets_completion_and_oneshot_switch() {
+        let mnnvl = AllReduceResidualRmsNormKernelConfig {
+            backends: vec!["flashinfer_mnnvl"],
+            ..config("NVIDIA B200", 4)
+        };
+        let grid = AllReduceResidualRmsNormSpec::sweep_grid(&mnnvl);
+        let tokens = &grid.axes()[0];
+        // 1 MiB / (4096 * 4 * 2 B) = 32 tokens one-shot.
+        for t in [16.0, 17.0, 32.0, 33.0] {
+            assert!(tokens.contains(&t), "missing {t}");
+        }
+        assert_eq!(tokens.last(), Some(&4096.0));
+        assert!(tokens.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(tokens.len(), 41);
+
+        let trtllm = AllReduceResidualRmsNormSpec::sweep_grid(&config("NVIDIA B200", 4));
+        assert!(!trtllm.axes()[0].contains(&17.0) && !trtllm.axes()[0].contains(&33.0));
+        assert_eq!(trtllm.axes()[0].len(), 39);
     }
 
     #[test]

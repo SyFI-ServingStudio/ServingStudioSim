@@ -77,9 +77,12 @@ measurement behind that claim lives in the workspace-level (out-of-repo)
 - **`op/moe/`** — `MoeDispatchOp` / `MoeCombineOp`, both leaf views over the one
   `sim::simulate_moe_comm` realization that prices all six network stages, plus
   `GroupedFp8GemmWithQuantOp` for the expert FFN.
-- **Stubs:** `op/comm` and `op/ssm` are still one-line module headers. Dense
-  collectives are atomic `Op<K>` over the `all_reduce*` kernels today; the
-  compound comm/SSM ops are specified in `doc/detailed_design/L2.md`.
+- **`op/comm/`** — `TpAllReduceRmsNormOp`: a TP sublayer boundary under vLLM's
+  `allreduce_rms` pass, the fused FlashInfer call up to its token cap and the
+  unfused all-reduce + residual RMSNorm above it (or where vLLM does not fuse).
+  Other dense collectives are atomic `Op<K>` over the `all_reduce*` kernels.
+- **Stub:** `op/ssm` is still a one-line module header; the compound SSM ops are
+  specified in `doc/detailed_design/L2.md`.
 
 ## Up / down
 

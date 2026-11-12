@@ -133,7 +133,7 @@ register(
             kv=frozenset({DType.FP8_E4M3}),
             min_compute_capability=(8, 0),
         ),
-        subprocess_env="vllm_upstream_fork_env",
+        subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
                 "vLLM's fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert CUDA op with "

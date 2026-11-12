@@ -14,23 +14,24 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::common::StageVocab;
+use crate::worker::gpu_cluster::KvPoolFacts;
 use crate::worker::GpuCluster;
 
-// v5 adds `stage_vocab` (deployment + `code → "category:detail"` names, decoding
-// the `request_slo` stage-transition list columns). v4 makes
+// v6 replaces each `kv_pools` entry's `capacity_tokens` with the pool's KV
+// units: `capacity_units`, `bytes_per_unit` and `kv_overhead`, the units the
+// `kv_snapshot` series counts in (a layout with one per-token part keeps one
+// unit per token). v5 adds `stage_vocab` (deployment + `code → "category:detail"`
+// names, decoding the `request_slo` stage-transition list columns). v4 makes
 // `workers[].pool_tag` authoritative for every worker (stamped on each GPU
 // at `GpuCluster::allocate`), so non-KV workers (e.g. AFD ffn) no longer carry a null
 // tag that consumers had to reverse-recover through `comm_groups`. v3 added per-worker
-// `kv_pools` (`group_id` → KV token `capacity_tokens`); v2 added the `comm_groups`
-// array. Append-only; the analyzer reads by field name and never asserts the version,
-// so older readers are unaffected and older logs (null ffn tag) still parse via the
-// analyzer's legacy `comm_groups` fallback.
-const SCHEMA_VERSION: u32 = 5;
+// `kv_pools`; v2 added the `comm_groups` array. The analyzer reads by field name.
+const SCHEMA_VERSION: u32 = 6;
 
 /// Write `<log_dir>/raw/run_meta.json` from the run's [`GpuCluster`]'s GPU
 /// registry. Emits the flat per-GPU list, a derived worker→gpu grouping (each
-/// worker also carrying its `kv_pools` = per-group KV token capacity, via
-/// [`GpuCluster::kv_capacities`]), the total count, and the comm-group registry
+/// worker also carrying its `kv_pools` = per-group KV capacity in units, via
+/// [`GpuCluster::kv_pools`]), the total count, and the comm-group registry
 /// (gid → base/count/gpu_ids, via [`GpuCluster::comm_groups`]). (The cluster's
 /// runtime state — `cost` / `logger` / `kv_caps` — is `#[serde(skip)]` and never
 /// reaches disk via the derived `Serialize`; only the reads above export it.)
@@ -52,17 +53,16 @@ pub fn write_run_meta(log_dir: &Path, cluster: &GpuCluster, stage_vocab: StageVo
         entry.0.push(g.id);
     }
 
-    // Per-worker KV-pool capacities (static token counts), grouped by the same
-    // (pool, worker_id) key as `workers`. This is where the `kv_snapshot` stream's
-    // former `capacity` column lives now — recorded once here, not per occupancy
-    // row. Empty for workers with no KV pool (e.g. AFD ffn); the worker's tag no
-    // longer rides along here since `by_worker` now carries it for every worker.
-    let mut kv_by_worker: BTreeMap<(u16, u16), Vec<(u16, u64)>> = BTreeMap::new();
-    for (_pool_tag, pool, worker_id, group_id, capacity) in cluster.kv_capacities() {
+    // Per-worker KV pools (static facts), grouped by the same (pool, worker_id)
+    // key as `workers`. This is where the `kv_snapshot` stream's capacity lives
+    // — recorded once here, not per occupancy row. Empty for workers with no KV
+    // pool (e.g. AFD ffn).
+    let mut kv_by_worker: BTreeMap<(u16, u16), Vec<(u16, &KvPoolFacts)>> = BTreeMap::new();
+    for (_pool_tag, pool, worker_id, group_id, facts) in cluster.kv_pools() {
         kv_by_worker
             .entry((pool, worker_id))
             .or_default()
-            .push((group_id, capacity));
+            .push((group_id, facts));
     }
 
     let workers: Vec<_> = by_worker
@@ -72,8 +72,13 @@ pub fn write_run_meta(log_dir: &Path, cluster: &GpuCluster, stage_vocab: StageVo
                 .get(&(pool, worker_id))
                 .into_iter()
                 .flatten()
-                .map(|(group_id, capacity)| {
-                    json!({ "group_id": group_id, "capacity_tokens": capacity })
+                .map(|(group_id, facts)| {
+                    json!({
+                        "group_id": group_id,
+                        "capacity_units": facts.capacity_units,
+                        "bytes_per_unit": facts.bytes_per_unit,
+                        "kv_overhead": facts.kv_overhead.as_str(),
+                    })
                 })
                 .collect();
             // `pool_tag` is authoritative for every worker (stamped per GPU at

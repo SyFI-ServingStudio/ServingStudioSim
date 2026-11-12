@@ -429,9 +429,9 @@ cases:
     derived_from: queueing knee of the case-10 saturation sweep; DESIGN.md step 2
     evidence: ''
   attn_gpu_memory_gb:
-    value: 37.990577664
+    value: 32.8145472
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/09_rate_knee/profile_workload
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/09_rate_knee
@@ -471,9 +471,9 @@ cases:
       - 4096
     repeats: 64
   attn_gpu_memory_gb:
-    value: 37.990577664
+    value: 32.8145472
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate/profile_workload
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate
@@ -536,9 +536,9 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 32.402792448
+    value: 27.9880704
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/11_long_prefill_ladder_c1/profile_workload
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/11_long_prefill_ladder_c1
@@ -603,9 +603,9 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 32.402792448
+    value: 27.9880704
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/12_ultra_context_decode_c1/profile_workload
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/12_ultra_context_decode_c1
@@ -697,9 +697,9 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 37.34025984
+    value: 32.252832
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/13_generation_length_matrix_c8/profile_workload
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/13_generation_length_matrix_c8
@@ -781,9 +781,9 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 37.686624768
+    value: 32.5520064
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21/profile_workload
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21
@@ -852,9 +852,9 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 35.933594112
+    value: 31.0378176
     status: measured
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 47700 / 1e9'
     evidence: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14/profile_workload
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14

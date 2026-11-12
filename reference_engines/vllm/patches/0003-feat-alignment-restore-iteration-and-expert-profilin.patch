@@ -1,0 +1,345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Mon, 3 Aug 2026 08:05:55 +0000
+Subject: [PATCH] feat(alignment): restore iteration and expert profiling
+
+---
+ vllm/distributed/eplb/eplb_state.py | 50 ++++++++++++++-
+ vllm/v1/core/sched/output.py        |  5 ++
+ vllm/v1/engine/core.py              | 98 +++++++++++++++++++++++++++++
+ vllm/v1/worker/gpu_model_runner.py  | 17 +++--
+ 4 files changed, 161 insertions(+), 9 deletions(-)
+
+diff --git a/vllm/distributed/eplb/eplb_state.py b/vllm/distributed/eplb/eplb_state.py
+index bcd8c227f26bafce96d1a1049fbed1c93dea2e72..fa328692a558ef000a8966bafc4d4ef5df64d512 100644
+--- a/vllm/distributed/eplb/eplb_state.py
++++ b/vllm/distributed/eplb/eplb_state.py
+@@ -25,6 +25,7 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
+ physical experts.
+ """
+ 
++import json
+ import threading
+ import time
+ from collections import deque
+@@ -280,10 +281,17 @@ class EplbState:
+         self._should_record_value: bool | None = None
+         """Last value written to ``should_record_tensor``."""
+         self._pending_balancedness: deque[
+-            tuple[int, int, torch.Event, list[tuple[str, torch.Tensor]]]
++            tuple[
++                int,
++                int,
++                torch.Event,
++                list[tuple[str, torch.Tensor]],
++                list[tuple[dict, torch.Tensor]],
++            ]
+         ] = deque()
+         """Balancedness stats whose copies to the host are in flight, oldest
+-        first."""
++        first. The last element holds alignment expert-load records and their
++        in-flight logical expert counts."""
+         self.is_async: bool = False
+         """
+         The flag indicates whether the EPLB is running in async mode.
+@@ -637,6 +645,7 @@ class EplbState:
+             ep_group = get_ep_group().device_group
+             if ep_group.rank() == 0:
+                 stats: list[tuple[str, torch.Tensor]] = []
++                alignment_records: list[tuple[dict, torch.Tensor]] = []
+                 for expert_load_pass, eplb_model_state in zip(
+                     expert_load_pass_list, self.model_states.values()
+                 ):
+@@ -662,6 +671,34 @@ class EplbState:
+                             tokens.to("cpu", non_blocking=True),
+                         )
+                     )
++                    # Machine-readable alignment-only routing evidence.  EPLB
++                    # logging is default-off; when explicitly enabled for the
++                    # popularity pass, map synchronized physical loads back to
++                    # stable logical expert ids before the mapping can change.
++                    # The counts reach the host with the balancedness copy.
++                    physical_to_logical = eplb_model_state.physical_to_logical_map
++                    logical_expert_load = torch.zeros(
++                        (
++                            expert_load_pass.shape[0],
++                            eplb_model_state.model.num_logical_experts,
++                        ),
++                        dtype=expert_load_pass.dtype,
++                        device=expert_load_pass.device,
++                    )
++                    logical_expert_load.scatter_add_(
++                        1, physical_to_logical.long(), expert_load_pass
++                    )
++                    alignment_record = {
++                        "schema_version": 1,
++                        "model": eplb_model_state.model_name,
++                        "eplb_step": self.expert_rearrangement_step,
++                    }
++                    alignment_records.append(
++                        (
++                            alignment_record,
++                            logical_expert_load.to("cpu", non_blocking=True),
++                        )
++                    )
+                 copied = torch.Event()
+                 copied.record()
+                 self._pending_balancedness.append(
+@@ -671,6 +708,7 @@ class EplbState:
+                         - self.expert_rearrangement_step,
+                         copied,
+                         stats,
++                        alignment_records,
+                     )
+                 )
+ 
+@@ -727,7 +765,7 @@ class EplbState:
+     def _maybe_log_balancedness(self) -> None:
+         pending = self._pending_balancedness
+         while pending:
+-            step, steps_left, copied, stats = pending[0]
++            step, steps_left, copied, stats, alignment_records = pending[0]
+             if not copied.query():
+                 break
+             pending.popleft()
+@@ -745,6 +783,12 @@ class EplbState:
+                     balancedness,
+                     steps_left,
+                 )
++            for alignment_record, logical_expert_load in alignment_records:
++                alignment_record["logical_expert_counts"] = logical_expert_load.tolist()
++                logger.info(
++                    "VibeSimAlignmentExpertLoad %s",
++                    json.dumps(alignment_record, separators=(",", ":")),
++                )
+ 
+     def _should_record_current_step(self, log_stats: bool = False) -> bool:
+         """Return whether expert-load recording should be enabled this step.
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 873f64ce24acc82000a87fcf237f341b5066760e..28077633545a2932f43f07f1df0d0870ebb63571 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -289,6 +289,11 @@ class SchedulerOutput:
+     # need to perform grammar bitmask computation.
+     pending_structured_output_tokens: bool = False
+ 
++    # EngineCore assigns this before dispatch. Workers use the same stable
++    # index in their per-phase NVTX ranges, while the EngineCore emits the
++    # matching structured model-input record after the iteration completes.
++    alignment_iteration_index: int | None = None
++
+     # Used for adjusting acceptance rate calculation.
+     num_invalid_spec_tokens: dict[str, int] | None = None
+ 
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 9a8622980d06c2a12b44bd97faea5056d4bd0028..c281358a5003774b5cf1a2cc688ecb9ca01446f2 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import gc
++import json
+ import os
+ import queue
+ import signal
+@@ -630,6 +631,99 @@ class EngineCore:
+             )
+             raise err
+ 
++    @contextmanager
++    def log_iteration_details(self, scheduler_output: SchedulerOutput | None):
++        if not self.vllm_config.observability_config.enable_logging_iteration_details:
++            yield
++            return
++        # 0-token step: let the dummy_batch wrapper log it (avoids double-log).
++        if scheduler_output and scheduler_output.total_num_scheduled_tokens == 0:
++            yield
++            return
++        # scheduler_output=None marks a DP dummy iteration.
++        if scheduler_output is None:
++            iteration_details = IterationDetails(0, 0, 0, 0)
++            iteration_index = -1
++            is_dummy = True
++        else:
++            iteration_details = compute_iteration_details(scheduler_output)
++            assert scheduler_output.alignment_iteration_index is not None
++            iteration_index = scheduler_output.alignment_iteration_index
++            is_dummy = False
++        before = time.monotonic()
++        yield
++        logger.info(
++            "".join(
++                [
++                    "Iteration(",
++                    str(iteration_index),
++                    "): ",
++                    str(iteration_details.num_ctx_requests),
++                    " context requests, ",
++                    str(iteration_details.num_ctx_tokens),
++                    " context tokens, ",
++                    str(iteration_details.num_generation_requests),
++                    " generation requests, ",
++                    str(iteration_details.num_generation_tokens),
++                    " generation tokens, iteration elapsed time: ",
++                    format((time.monotonic() - before) * 1000, ".2f"),
++                    " ms",
++                    " (dummy)" if is_dummy else "",
++                ]
++            )
++        )
++        if scheduler_output is not None:
++            cached_requests = scheduler_output.scheduled_cached_reqs
++            prefill_chunk_pairs = []
++            for new_request in scheduler_output.scheduled_new_reqs:
++                appended_tokens = scheduler_output.num_scheduled_tokens.get(
++                    new_request.req_id, 0
++                )
++                if appended_tokens > 0:
++                    prefill_chunk_pairs.append(
++                        [new_request.num_computed_tokens, appended_tokens]
++                    )
++            for request_index, request_id in enumerate(cached_requests.req_ids):
++                if cached_requests.is_context_phase(request_id):
++                    appended_tokens = scheduler_output.num_scheduled_tokens.get(
++                        request_id, 0
++                    )
++                    if appended_tokens > 0:
++                        prefill_chunk_pairs.append(
++                            [
++                                cached_requests.num_computed_tokens[request_index],
++                                appended_tokens,
++                            ]
++                        )
++            decode_kv_lens = [
++                cached_requests.num_computed_tokens[request_index]
++                for request_index, request_id in enumerate(cached_requests.req_ids)
++                if not cached_requests.is_context_phase(request_id)
++                and scheduler_output.num_scheduled_tokens.get(request_id, 0) > 0
++            ]
++            alignment_record = {
++                "schema_version": 1,
++                "input_adapter": "vllm_text",
++                "iteration_index": iteration_index,
++                "prefill_tokens": iteration_details.num_ctx_tokens,
++                "decode_requests": iteration_details.num_generation_requests,
++                "decode_tokens_scheduled": iteration_details.num_generation_tokens,
++                "prefill_chunk_pairs": prefill_chunk_pairs,
++                "decode_kv_lens": decode_kv_lens,
++            }
++            logger.info(
++                "VibeSimAlignmentIteration %s",
++                json.dumps(alignment_record, separators=(",", ":")),
++            )
++
++    def assign_alignment_iteration_index(
++        self, scheduler_output: SchedulerOutput
++    ) -> None:
++        """Attach one dispatch-order index shared by EngineCore logs and worker NVTX."""
++        next_index = getattr(self, "_next_alignment_iteration_index", 0)
++        scheduler_output.alignment_iteration_index = next_index
++        self._next_alignment_iteration_index = next_index + 1
++
+     @contextmanager
+     def capture_iteration_details(
+         self, scheduler_output: SchedulerOutput | None
+@@ -721,10 +815,12 @@ class EngineCore:
+         if not self.scheduler.has_requests():
+             return {}, False
+         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
++        self.assign_alignment_iteration_index(scheduler_output)
+         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+         with (
+             self.capture_iteration_details(scheduler_output) as iteration_details,
++            self.log_iteration_details(scheduler_output),
+             self.log_error_detail(scheduler_output),
+         ):
+             model_output = self._wait_for_output(future)
+@@ -783,6 +879,7 @@ class EngineCore:
+         deferred_scheduler_output = None
+         if self.scheduler.has_requests():
+             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
++            self.assign_alignment_iteration_index(scheduler_output)
+             with self.log_error_detail(scheduler_output):
+                 exec_future = self.model_executor.execute_model(
+                     scheduler_output, non_block=True
+@@ -828,6 +925,7 @@ class EngineCore:
+         future, scheduler_output, exec_model_fut = batch_queue.pop()
+         with (
+             self.capture_iteration_details(scheduler_output) as iteration_details,
++            self.log_iteration_details(scheduler_output),
+             self.log_error_detail(scheduler_output),
+         ):
+             model_output = self._wait_for_output(future)
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index c2de73d98dee10f2725ac372cb9198cc64663036..6b8c2b7ae3523af5d2418d12ee2f98b1437aea66 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4032,8 +4032,10 @@ class GPUModelRunner(
+             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+ 
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
++        iteration_index = scheduler_output.alignment_iteration_index
++        iteration_prefix = f"vllm_iteration({iteration_index})"
+         with (
+-            record_function_or_nullcontext("gpu_model_runner: preprocess"),
++            record_function_or_nullcontext(f"{iteration_prefix}: preprocess"),
+             self.synchronize_input_prep(),
+         ):
+             # Update persistent batch states.
+@@ -4260,7 +4262,7 @@ class GPUModelRunner(
+                 skip_compiled=has_encoder_input,
+                 is_padding=is_padding,
+             ),
+-            record_function_or_nullcontext("gpu_model_runner: forward"),
++            record_function_or_nullcontext(f"{iteration_prefix}: forward"),
+             self.maybe_get_kv_connector_output(
+                 scheduler_output,
+                 defer_finalize=defer_kv_connector_finalize,
+@@ -4274,7 +4276,7 @@ class GPUModelRunner(
+                 **model_kwargs,
+             )
+ 
+-        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
++        with record_function_or_nullcontext(f"{iteration_prefix}: postprocess"):
+             if self.use_aux_hidden_state_outputs:
+                 # True when EAGLE 3 is used.
+                 hidden_states, aux_hidden_states = model_output
+@@ -4391,6 +4393,9 @@ class GPUModelRunner(
+         ) = self.execute_model_state
+         # Clear ephemeral state.
+         self.execute_model_state = None
++        iteration_prefix = (
++            f"vllm_iteration({scheduler_output.alignment_iteration_index})"
++        )
+ 
+         # Apply structured output bitmasks if present.
+         if grammar_output is not None:
+@@ -4398,7 +4403,7 @@ class GPUModelRunner(
+                 scheduler_output, grammar_output, self.input_batch, logits
+             )
+ 
+-        with record_function_or_nullcontext("gpu_model_runner: sample"):
++        with record_function_or_nullcontext(f"{iteration_prefix}: sample"):
+             sampler_output = self._sample(logits, spec_decode_metadata)
+ 
+         self._update_states_after_model_execute(
+@@ -4526,7 +4531,7 @@ class GPUModelRunner(
+                 self._draft_prob_req_ids = None
+                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
+ 
+-        with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
++        with record_function_or_nullcontext(f"{iteration_prefix}: bookkeep"):
+             (
+                 num_nans_in_logits,
+                 num_nans_device,
+@@ -4570,7 +4575,7 @@ class GPUModelRunner(
+         if spec_config is not None:
+             self.finalize_kv_connector()
+ 
+-        with record_function_or_nullcontext("gpu_model_runner: eplb"):
++        with record_function_or_nullcontext(f"{iteration_prefix}: eplb"):
+             self.eplb_step()
+ 
+         # self.kv_connector_output may be modified during drafting

@@ -130,6 +130,7 @@ register(
         # and process. The runner instead tunes at a documented anchor per
         # worker and records it through row_provenance.
         worker_env=(("TRITON_CACHE_AUTOTUNING", "0"),),
+        tunes_every_worker=True,
         row_provenance_ref=RunnerRef(
             module_name="profiling.runners.attention.kda_recurrent_decode_vllm_triton",
             function_name="row_provenance",

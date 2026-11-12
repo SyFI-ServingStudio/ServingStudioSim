@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::arch::contract::{ArchGroupInput, AttnArchInput, AttnLayerwiseModel};
 use crate::common::{RequestId, SharedRequests, Time};
 use crate::worker::cost_buffers::CostBuffers;
-use crate::worker::execution::{AttentionLayerExecution, ModelKvLayout};
+use crate::worker::execution::AttentionLayerExecution;
 use crate::worker::kv::{PrefixKv, SlotPipelineKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
 
@@ -25,13 +25,6 @@ impl<M: AttnLayerwiseModel> AttentionLayerExecution for AttentionLayerExecutionA
 
     fn num_layers(&self) -> u16 {
         self.model.num_layers() as u16
-    }
-
-    fn model_kv_layout(&self) -> ModelKvLayout {
-        ModelKvLayout {
-            total_kv_bytes_per_token: self.model.total_kv_bytes_per_token(),
-            num_attn_shards: self.model.num_attn_shards(),
-        }
     }
 
     fn attn_to_ffn_bytes_per_token(&self) -> u64 {

@@ -19,7 +19,7 @@ from profiling.db.registry import KernelProfilerSpec, MetricFamily, RunnerRef
 from profiling.kernels import flashinfer_attn_rect as rect_kernel
 from profiling.kernels.flashinfer_attn_rect import KIND, FlashinferAttnRectArgs
 
-_BACKENDS = ("fa2", "fa3", "trt", "cudnn")
+_BACKENDS = ("fa2", "fa3", "cudnn")
 _RUNNER_MODULE = "profiling.runners.attention.flashinfer_attn_prefill_and_rect"
 
 

@@ -97,6 +97,7 @@ The tree route takes the preset's `id` from `/models`, which has the form
 ```bash
 curl -s "$API/models/Llama-3.1-8B/llama3_dense_tp/tree?tp_size=2" > tree.json
 jq '{arch, gpu, gpus_per_replica, predict, missing}' tree.json
+jq '.kv_cache' tree.json   # the arch's KV layout; bytes over attention_shards GPUs
 jq -r '.sections[] | .section as $s | .slots | to_entries[]
   | [$s, .key, .value.name, .value.kernel, .value.config] | @tsv' tree.json
 ```
@@ -292,8 +293,10 @@ curl -s "$P/subjects/cases/payload" | jq -c '.cases[] | {case_id, total_time_ms}
 curl -s "$P/cases/0/subjects/optimality-waterfall/payload" | jq '{meta, level: (.level | {total, buckets})}'
 ```
 
-The waterfall's `buckets` are `hardware_optimal`, `hardware_gap`,
-`communication`, `imbalance`, `batching` and `idle`, in GPU-seconds. Check
+The waterfall's `buckets` are `hardware_optimal`, `hardware_gap` (best measured
+kernel vs spec sheet), `power_gap` (the rate a GEMM or copy sustains back to back
+under the power limit vs its best measured rate), `kernel_gap` (this kernel vs
+that sustained rate), `communication`, `imbalance`, `batching` and `idle`, in GPU-seconds. Check
 `meta.necessary_work_available` and `meta.caveats` first: when the Analyzer
 cannot label the iteration's necessary work exactly, it estimates it
 (`meta.necessary_work_mode`) and says why in `caveats`; pass that on with the

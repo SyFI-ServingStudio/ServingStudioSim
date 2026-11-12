@@ -71,6 +71,7 @@ use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
 use crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::{
     draft_kv_bytes_per_token, Dflash2DraftResolved, Dflash2DraftStage,
 };
+use crate::arch::kv_layout::{KvCacheLayout, KvCachePart, KvGrowth};
 use crate::op::Op;
 use crate::timing::kernels::{
     KdaRecoverSSMCommitKernel, KdaRecoverSSMCommitKernelConfig, KdaRecoverSSMCommitKernelInput,
@@ -170,16 +171,12 @@ pub struct Dflash2VerifyModel<T> {
     /// assumes this depth.
     draft_tokens: u32,
     max_model_len: u32,
-    /// The draft's sliding-window KV held per request, summed over one group's
-    /// attention shards as the worker's capacity contract counts the target's.
-    /// Zero when the draft's KV is full attention.
-    draft_kv_bytes_per_request: u64,
-    /// The draft's full-attention KV per context token, on the same contract
-    /// as the target's per-token bytes. Zero when it is held as a window.
-    draft_kv_bytes_per_token: u64,
-    /// The target's HiSparse host tier, its device buffer joined by the
-    /// draft's window when that window is not already per-request state.
-    /// `None` when the target keeps its cache on the GPU.
+    /// The target's layout plus the draft's own KV: its window as one
+    /// per-request part beside a recurrent target or under HiSparse, full
+    /// attention per context token beside an all-attention target.
+    kv_cache_layout: KvCacheLayout,
+    /// The target's HiSparse host tier; `None` when the target keeps its
+    /// cache on the GPU.
     host_offload: Option<KvHostOffload>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
@@ -378,16 +375,8 @@ impl<T: Dflash2VerifyTarget> SpeculativeUnifiedModel for Dflash2VerifyModel<T> {
         self.target.check_input(&verify_batch(batch))
     }
 
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.target.total_kv_bytes_per_token() + self.draft_kv_bytes_per_token
-    }
-
-    fn recurrent_state_bytes_per_request(&self) -> u64 {
-        self.target.recurrent_state_bytes_per_request() + self.draft_kv_bytes_per_request
-    }
-
-    fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-        self.target.recurrent_checkpoint_interval_tokens()
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn kv_host_offload(&self) -> Option<KvHostOffload> {
@@ -446,6 +435,10 @@ impl<T: Dflash2VerifyTarget> SpeculativeUnifiedModel for Dflash2VerifyModel<T> {
     }
 }
 
+/// Layout part names: the target's KDA state, and the draft's own KV.
+const KDA_STATE_PART: &str = "kda";
+const DRAFT_KV_PART: &str = "dflash2_draft";
+
 /// Wrap a built `target` with one DFlash2 proposer per attention DP group. The
 /// draft's KV is `draft.sliding_window` tokens per request beside a recurrent
 /// target, and full attention per context token beside an all-attention one
@@ -470,7 +463,11 @@ pub fn build<T: Dflash2VerifyTarget>(
     }
     // KDA layers are exactly what needs a commit, and exactly what keeps vLLM
     // from paging the draft's window layers as full attention.
-    let recurrent = target.recurrent_state_bytes_per_request() > 0;
+    let target_layout = target.kv_cache_layout();
+    let recurrent = target_layout
+        .parts
+        .iter()
+        .any(|part| part.name == KDA_STATE_PART && part.growth == KvGrowth::PerRequest);
     let plan = match (target.kda_commit(), recurrent) {
         (Some(plan), true) => Some(plan),
         (None, false) => None,
@@ -520,32 +517,31 @@ pub fn build<T: Dflash2VerifyTarget>(
             kind: ARCH_KIND,
             reason: "DFlash2 draft window KV overflows u64".to_string(),
         })?;
-    // Under HiSparse the draft holds only its window. Beside KDA that window
-    // is already per-request state (below), which the hybrid store charges
-    // apart from the host tier's buffer. Beside an all-attention target it
-    // joins the target's fixed device buffer: an engine that already pages
-    // the target's cache per request is assumed to hold only the window the
-    // draft attends to (an assumption; vLLM's unified pool does not, see
+    // Beside KDA the draft's window is per-request state a retained prefix
+    // keeps, like the KDA state. Under HiSparse beside an all-attention
+    // target it is held like the target's device buffer, which a retained
+    // prefix does not keep: an engine that already pages the target's cache
+    // per request is assumed to hold only the window the draft attends to
+    // (an assumption; vLLM's unified pool does not, see
     // `draft_kv_bytes_per_token`).
-    let host_offload = target.kv_host_offload().map(|offload| KvHostOffload {
-        device_bytes_per_request: offload.device_bytes_per_request
-            + if recurrent { 0 } else { window },
-        ..offload
-    });
-    let (draft_kv_bytes_per_request, draft_kv_bytes_per_token) =
-        match (recurrent, host_offload.is_some()) {
-            (true, _) => (window, 0),
-            (false, true) => (0, 0),
-            (false, false) => (0, draft_per_token),
-        };
+    let host_offload = target.kv_host_offload();
+    let kv_cache_layout = match (recurrent, host_offload.is_some()) {
+        (true, _) => target_layout.with_part(KvCachePart::per_request(DRAFT_KV_PART, window)),
+        (false, true) => target_layout
+            .with_part(KvCachePart::per_request(DRAFT_KV_PART, window).not_prefix_reusable()),
+        // The draft's KV heads are split over its TP ranks, one copy in all.
+        (false, false) => target_layout.with_part(
+            KvCachePart::per_token(DRAFT_KV_PART, draft_per_token)
+                .sharded(u32::from(draft.context_kv.raw_cfg.tp_size)),
+        ),
+    };
     let mut model = Dflash2VerifyModel {
         target,
         commit,
         drafts,
         draft_tokens,
         max_model_len,
-        draft_kv_bytes_per_request,
-        draft_kv_bytes_per_token,
+        kv_cache_layout,
         host_offload,
         cost_flat: Vec::new(),
         n_slots: 0,

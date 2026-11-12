@@ -111,3 +111,118 @@ def profile_elementwise(
         )
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc
+
+
+def _copy_elements(input_size_bytes: int, output_size_bytes: int, realization: str) -> int:
+    """BF16 element count of a one-input copy; other fan-ins have no such realization."""
+    input_size_bytes = int(input_size_bytes)
+    output_size_bytes = int(output_size_bytes)
+    if output_size_bytes <= 0 or input_size_bytes != output_size_bytes:
+        raise ValueError(f"{realization} is a copy: input_size_bytes must equal output_size_bytes > 0")
+    if output_size_bytes % 2:
+        raise ValueError(f"{realization} copies bf16 elements: output_size_bytes must be even")
+    return output_size_bytes // 2
+
+
+def _time_copy(run_once, output_size_bytes: int) -> ComputeMetrics:
+    time_ms = Timer.cupti(run_once, warmup=5, kernel_name=None)
+    energy_j = Energy.perf(run_once, warmup=5, per_iter_time_ms=time_ms)
+    bytes_accessed = 2 * output_size_bytes
+    bandwidth_gbps = (bytes_accessed / (time_ms / 1000.0)) / 1e9 if time_ms > 0 else 0.0
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        tflops=0.0,
+        memory_bandwidth_gbps=float(bandwidth_gbps),
+        energy_j=float(energy_j),
+    )
+
+
+# Row length of the strided copy. A contiguous run of 128 bf16 elements is one
+# attention head row; the probe in the Qwen3.8-27B alignment (head-major
+# [H, T, 128] -> token-major [T, H, 128]) showed the two-plane transpose below
+# reproduces that copy's curve at every size, so the number of planes does not
+# matter, only that the source is non-contiguous with 256-byte runs.
+_STRIDED_RUN_ELEMENTS = 128
+
+
+def profile_elementwise_strided_copy(
+    input_size_bytes: int,
+    output_size_bytes: int,
+) -> ComputeMetrics:
+    """A copy whose source is a non-contiguous view (``dst.copy_(src)`` or
+    ``src.contiguous()`` of a transposed/sliced tensor).
+
+    TensorIterator cannot vectorize it, so the device kernel is the legacy
+    ``at::native::elementwise_kernel<128, 4, gpu_kernel_impl_nocast<direct_copy>>``,
+    which moves bytes at roughly half the rate of the vectorized unary map the
+    ``torch`` backend times. The source is two planes of 256-byte rows transposed
+    into the destination; a byte count that does not split into whole rows on both
+    planes falls back to an element-stride-2 view, the same kernel.
+    """
+    elements = _copy_elements(input_size_bytes, output_size_bytes, "strided copy")
+    try:
+        import torch
+    except ImportError as exc:
+        raise ProfilerNotImplemented("torch is required for the strided copy runner") from exc
+    try:
+        run_elements = _STRIDED_RUN_ELEMENTS
+        rows = elements // run_elements
+        if elements % run_elements == 0 and rows % 2 == 0:
+            source = torch.empty(2, rows // 2, run_elements, dtype=torch.bfloat16, device="cuda")
+            source.normal_()
+            source = source.transpose(0, 1)
+            destination = torch.empty(rows // 2, 2, run_elements, dtype=torch.bfloat16, device="cuda")
+        else:
+            # Every other element of a buffer twice the size: same kernel, any count.
+            pitched = torch.empty(elements, 2, dtype=torch.bfloat16, device="cuda")
+            pitched.normal_()
+            source = pitched[:, 0]
+            destination = torch.empty(elements, dtype=torch.bfloat16, device="cuda")
+        if source.is_contiguous():
+            raise AssertionError("strided copy source must be non-contiguous")
+
+        def run_once():
+            destination.copy_(source)
+
+        run_once()
+        torch.cuda.synchronize()
+        if not torch.equal(destination, source):
+            raise AssertionError("strided copy wrote the wrong values")
+        return _time_copy(run_once, int(output_size_bytes))
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_elementwise_cat(
+    input_size_bytes: int,
+    output_size_bytes: int,
+) -> ComputeMetrics:
+    """``torch.cat`` of two inputs that together are the output bytes.
+
+    Eager ``cat`` lands on ``CatArrayBatchedCopy`` (vectorized when aligned), a
+    different kernel from the unary map, and noticeably faster per byte at large
+    sizes. The bytes split into two near-equal bf16 inputs.
+    """
+    elements = _copy_elements(input_size_bytes, output_size_bytes, "cat")
+    try:
+        import torch
+    except ImportError as exc:
+        raise ProfilerNotImplemented("torch is required for the cat runner") from exc
+    try:
+        first_elements = max(elements // 2, 1)
+        first = torch.empty(first_elements, dtype=torch.bfloat16, device="cuda")
+        second = torch.empty(elements - first_elements, dtype=torch.bfloat16, device="cuda")
+        first.normal_()
+        second.normal_()
+        destination = torch.empty(elements, dtype=torch.bfloat16, device="cuda")
+
+        def run_once():
+            torch.cat([first, second], out=destination)
+
+        run_once()
+        torch.cuda.synchronize()
+        if not torch.equal(destination[:first_elements], first):
+            raise AssertionError("cat wrote the wrong values")
+        return _time_copy(run_once, int(output_size_bytes))
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc

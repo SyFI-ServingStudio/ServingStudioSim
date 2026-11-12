@@ -1,7 +1,9 @@
 //! Gated DeltaNet fused recurrent-decode kernel.
 //!
-//! The model geometry and dtypes are static config identity. Decode batch size
-//! is the sole physical runtime interpolation axis. `state_dtype` remains an
+//! The model geometry and dtypes are static config identity, and so is a
+//! speculative step's tokens per request (`tokens_per_request`; only the
+//! `vllm_triton_sigmoid_gating` backend prices q > 1). Decode batch size is the
+//! sole physical runtime interpolation axis. `state_dtype` remains an
 //! explicit profiler/cache key, but is not a standard KV capability axis.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
@@ -22,11 +24,38 @@ pub struct GdnRecurrentDecodeKernelConfig {
     #[compute_dtype]
     pub dtype: DType,
     pub state_dtype: DType,
+    /// Tokens per request of a speculative (MTP verify) step. Unset, or 1, is
+    /// one-token decode and keys the rows it keyed before the field existed; q > 1
+    /// adds the profile arg `num_tokens = q · batch_size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_request: Option<Dim>,
 }
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
 pub struct GdnRecurrentDecodeKernelInput {
     pub batch_size: u32,
+}
+
+/// Tokens per request of a verify step (q > 1), or `None` for one-token decode
+/// (unset or 1), which keeps the keys it had before the field existed.
+pub(crate) fn verify_tokens_per_request(tokens_per_request: Option<&Dim>) -> Option<u32> {
+    tokens_per_request.map(Dim::get).filter(|&q| q != 1)
+}
+
+/// Batch axis of a verify step: dense over 1..8, then pow2 to 256. Its kernels
+/// launch a fixed CTA count per request, so small batches cross SM-wave
+/// boundaries that pow2 points straddle.
+pub(crate) fn verify_batch_axis() -> Vec<f64> {
+    Axis::chain([Axis::arithmetic(1, 8, 1), Axis::pow2(4, 8)])
+}
+
+/// Decode batch axis of the GDN decode kinds: the verify axis for q > 1, the
+/// frozen pow2 axis for one-token decode.
+pub(crate) fn decode_batch_axis(tokens_per_request: Option<&Dim>) -> Vec<f64> {
+    match verify_tokens_per_request(tokens_per_request) {
+        Some(_) => verify_batch_axis(),
+        None => Axis::pow2(0, 8),
+    }
 }
 
 pub struct GdnRecurrentDecodeSpec;
@@ -37,8 +66,8 @@ impl KernelSpec for GdnRecurrentDecodeSpec {
 
     const KIND: KernelKind = "gdn_recurrent_decode";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![Axis::pow2(0, 8)])
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        SweepGrid::new(vec![decode_batch_axis(config.tokens_per_request.as_ref())])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -50,8 +79,9 @@ impl KernelSpec for GdnRecurrentDecodeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
+        let per_request = verify_tokens_per_request(config.tokens_per_request.as_ref());
         grid.expand_1d(|batch_size| {
-            ArgsPayload::new()
+            let payload = ArgsPayload::new()
                 .with("backend", backend)
                 .with("batch_size", batch_size as u32)
                 .with("num_qk_heads", config.num_qk_heads.get())
@@ -59,7 +89,11 @@ impl KernelSpec for GdnRecurrentDecodeSpec {
                 .with("key_head_dim", config.key_head_dim.get())
                 .with("value_head_dim", config.value_head_dim.get())
                 .with("dtype", config.dtype.as_str())
-                .with("state_dtype", config.state_dtype.as_str())
+                .with("state_dtype", config.state_dtype.as_str());
+            match per_request {
+                Some(q) => payload.with("num_tokens", batch_size as u32 * q),
+                None => payload,
+            }
         })
     }
 }
@@ -74,6 +108,7 @@ mod tests {
     use crate::timing::bridge::DType;
     use crate::timing::cache::CacheKind;
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
+    use crate::timing::sweep::Axis;
     use crate::timing::{SlotInput, SweepCoords};
     use serde_json::Value;
 
@@ -87,6 +122,7 @@ mod tests {
             value_head_dim: 128.into(),
             dtype: DType::Bf16,
             state_dtype: DType::Fp32,
+            tokens_per_request: None,
         }
     }
 
@@ -219,5 +255,28 @@ mod tests {
 
         assert_eq!(decoded, config());
         assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+    }
+
+    /// A verify config (q tokens per request) must reach the profiler as
+    /// `num_tokens = q · batch_size`; q = 1 must keep the one-token rows' keys.
+    #[test]
+    fn verify_tokens_per_request_emits_num_tokens_and_q1_keeps_old_keys() {
+        let mut cfg = config();
+        cfg.tokens_per_request = Some(4.into());
+        let grid = GdnRecurrentDecodeSpec::sweep_grid(&cfg);
+        let payloads = GdnRecurrentDecodeSpec::enumerate(&cfg, &grid, "vllm_triton_sigmoid_gating");
+        let batches: Vec<f64> = grid.axes()[0].clone();
+        assert_eq!(
+            batches,
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+        );
+        assert_eq!(payloads[2].fields()["batch_size"], Value::from(3_u32));
+        assert_eq!(payloads[2].fields()["num_tokens"], Value::from(12_u32));
+
+        cfg.tokens_per_request = Some(1.into());
+        let grid = GdnRecurrentDecodeSpec::sweep_grid(&cfg);
+        assert_eq!(grid.axes()[0], Axis::pow2(0, 8));
+        let one = GdnRecurrentDecodeSpec::enumerate(&cfg, &grid, "vllm_triton_sigmoid_gating");
+        assert!(!one[3].fields().contains_key("num_tokens"));
     }
 }

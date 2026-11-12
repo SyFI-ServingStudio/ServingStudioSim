@@ -35,7 +35,7 @@
 //! The engine attends **fp8** KV with an fp8 query. No `flashinfer_attn_rect`
 //! backend can measure that on B200 today: `fa2` has no fp8 tensor-core path,
 //! `cudnn` is bf16-only, `fa3`'s ragged kernels are built for SM90 and have no
-//! Blackwell image, and `trt` (Blackwell-only) has no ragged kernel at all. The
+//! Blackwell image, and FlashInfer's trtllm-gen kernels are paged only. The
 //! leaf is therefore measured at bf16/bf16, which reads twice the KV bytes the
 //! engine does, so it **overstates** this term and errs slow rather than fast.
 //!

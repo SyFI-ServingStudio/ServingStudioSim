@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Tue, 10 Nov 2026 19:31:30 -0800
+Subject: [PATCH] alignment: record DP dummy forwards in
+ EngineCore.execute_dummy_batch
+
+The schema-5 dummy record was written only around DPEngineCoreProc's busy
+loop call. The offline LLMEngine.step() path reaches
+EngineCore.execute_dummy_batch through the in-process or utility client
+and ran its dummy forwards without taking a forward ordinal or writing a
+record, so its ranks' ordinals drifted apart.
+
+execute_dummy_batch now wraps the executor call in log_dummy_forward, and
+the busy loop no longer adds its own, so every dummy path takes one
+ordinal and records once. ALIGNMENT.md also states that a 0-token step
+keeps its iteration index and its V1 preprocess scope but has no record.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ALIGNMENT.md                              |  7 +++-
+ tests/v1/engine/test_iteration_logging.py | 41 ++++++++++++++++++++---
+ vllm/v1/engine/core.py                    | 14 ++++----
+ 3 files changed, 51 insertions(+), 11 deletions(-)
+
+diff --git a/ALIGNMENT.md b/ALIGNMENT.md
+index b925d08d3eaba0ca825b7687c8f57103c2af14c0..f2ddf708c120e65bfa5631fb099a8c479e2a598f 100644
+--- a/ALIGNMENT.md
++++ b/ALIGNMENT.md
+@@ -75,7 +75,12 @@ Bookkeeping may have multiple disjoint scopes in one iteration.
+ many forwards a rank can have launched but not finished), and records every model forward of the EngineCore
+ loop: a real step (scheduled tokens > 0) and, under data parallelism, each
+ dummy forward an idle rank runs to join its peers' collectives (zero work,
+-`iteration_index: null`). A 0-token step runs no forward and records none.
++`iteration_index: null`). The dummy record is written by
++`EngineCore.execute_dummy_batch` itself, so `DPEngineCoreProc`'s busy loop and
++the offline `LLMEngine.step()` path record their dummies alike. A 0-token step
++runs no forward and records none, although it still takes an iteration index
++and, in the V1 runner, still emits its `vllm_iteration(N): preprocess` scope
++(state updates run before the runner sees there is nothing to compute).
+ Every DP rank runs exactly one forward per busy-loop pass while a wave runs
+ (both runners sync the batch across DP ranks inside each forward), so equal
+ `forward_ordinal`s on two ranks are the same global step. Existing
+diff --git a/tests/v1/engine/test_iteration_logging.py b/tests/v1/engine/test_iteration_logging.py
+index 91c82e9843a5da453f3a559a7c264b9469f3f9ef..ec344e8611c5c1f6d9322d1f37fd3680b0ff2e32 100644
+--- a/tests/v1/engine/test_iteration_logging.py
++++ b/tests/v1/engine/test_iteration_logging.py
+@@ -172,6 +172,18 @@ def test_alignment_zero_token_step_does_not_emit_an_iteration(monkeypatch, enabl
+     assert records == []
+ 
+ 
++def _run_dummy_forward(engine, executed: list | None = None) -> None:
++    """Run EngineCore.execute_dummy_batch on the fake engine, as every DP
++    dummy path (DPEngineCoreProc's busy loop, the offline LLMEngine) does."""
++    engine.log_dummy_forward = lambda: EngineCore.log_dummy_forward(engine)
++    engine.model_executor = SimpleNamespace(
++        execute_dummy_batch=lambda: (executed if executed is not None else []).append(
++            "dummy"
++        )
++    )
++    EngineCore.execute_dummy_batch(engine)
++
++
+ def _alignment_records(records):
+     return [
+         json.loads(args[1])
+@@ -195,8 +207,9 @@ def test_every_forward_takes_one_ordinal_dummies_included(monkeypatch):
+     empty = SimpleNamespace(total_num_scheduled_tokens=0, alignment_forward_ordinal=None)
+     EngineCore.assign_alignment_iteration_index(engine, empty)
+     assert empty.alignment_forward_ordinal is None
+-    with EngineCore.log_dummy_forward(engine):
+-        pass
++    executed = []
++    _run_dummy_forward(engine, executed)
++    assert executed == ["dummy"]
+ 
+     later = SimpleNamespace(total_num_scheduled_tokens=1)
+     EngineCore.assign_alignment_iteration_index(engine, later)
+@@ -223,6 +236,26 @@ def test_dummy_forward_is_not_recorded_when_iteration_logging_is_off(monkeypatch
+     )
+     engine = make_fake_engine()
+     engine.vllm_config.observability_config.enable_logging_iteration_details = False
+-    with EngineCore.log_dummy_forward(engine):
+-        pass
++    executed = []
++    _run_dummy_forward(engine, executed)
++    assert executed == ["dummy"]
+     assert records == []
++    assert not hasattr(engine, "_next_alignment_forward_ordinal")
++
++
++def test_each_dummy_batch_records_once_whoever_calls_it(monkeypatch):
++    """The offline LLMEngine.step() reaches EngineCore.execute_dummy_batch
++    without DPEngineCoreProc's busy loop; its dummy forwards record too, each
++    once, with consecutive ordinals."""
++    records = []
++    monkeypatch.setattr(
++        "vllm.v1.engine.core.logger.info", lambda *args: records.append(args)
++    )
++    engine = make_fake_engine()
++    _run_dummy_forward(engine)
++    _run_dummy_forward(engine)
++    assert [record["forward_ordinal"] for record in _alignment_records(records)] == [
++        0,
++        1,
++    ]
++    assert all(record["is_dummy"] for record in _alignment_records(records))
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 8f1e846ac3a2651c3ded2221fd4e88c490624b6e..86685c378fbdfa08c76bfbdb76ff6bda3ff8927c 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -743,7 +743,8 @@ class EngineCore:
+         ran no real one, so that its EP/DP collectives pair with its peers'.
+         Recording it (no scheduled work, `is_dummy`) gives each rank one record
+         per forward, so the k-th forward of every rank can be joined by
+-        `forward_ordinal` instead of by wall clock.
++        `forward_ordinal` instead of by wall clock. `execute_dummy_batch` is its
++        only caller, so every dummy path records exactly once.
+         """
+         if not self.vllm_config.observability_config.enable_logging_iteration_details:
+             yield
+@@ -1341,7 +1342,11 @@ class EngineCore:
+         )
+ 
+     def execute_dummy_batch(self):
+-        self.model_executor.execute_dummy_batch()
++        # Every DP dummy forward enters here: DPEngineCoreProc's busy loop, the
++        # offline LLMEngine.step() (through the in-process or utility client)
++        # and any other caller, so each takes one forward ordinal and records.
++        with self.log_dummy_forward():
++            self.model_executor.execute_dummy_batch()
+ 
+     def compute_weight_checksums(self) -> list[dict[str, str]]:
+         return self.collective_rpc("compute_weight_checksums")
+@@ -2909,10 +2914,7 @@ class DPEngineCoreProc(EngineCoreProc):
+                 # Execute a dummy pass when no ready requests ran, unless the
+                 # engine is sleeping.
+                 elif not self.model_executor.is_sleeping:
+-                    with (
+-                        self.capture_iteration_details(None) as iteration_details,
+-                        self.log_dummy_forward(),
+-                    ):
++                    with self.capture_iteration_details(None) as iteration_details:
+                         self.execute_dummy_batch()
+                     if iteration_details is not None and not self.has_coordinator:
+                         stats = self._make_iteration_details_stats(iteration_details)

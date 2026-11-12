@@ -1,5 +1,5 @@
 //! Worker / pool / cluster tiers — turn the fold's per-worker accumulators into
-//! the named R0..R5 rung values, then roll them up. Pool and cluster are sums of
+//! the named R0..R5 rung values (with R4a and R4b), then roll them up. Pool and cluster are sums of
 //! the worker tier, so they live here alongside it rather than in a third file.
 //! Also owns the level → payload JSON (`level_entry_json`) and the report-side rung
 //! object (`rung_report_json`).
@@ -12,8 +12,8 @@ use super::floors::{Floors, FloorsByLevel};
 use super::fold::WorkerFoldAccumulator;
 use super::{ms_to_s, ratio};
 
-/// Named R0..R5 GPU·ms values. This is the additive hierarchy unit; keeping
-/// fields named prevents the rung-order assumptions that a `[f64; 6]` leaks to
+/// Named R0..R5 GPU·ms values, R4a and R4b between R4 and R5. This is the additive hierarchy unit; keeping
+/// fields named prevents the rung-order assumptions that a `[f64; 7]` leaks to
 /// every consumer.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct BaseRungs {
@@ -22,6 +22,8 @@ pub(super) struct BaseRungs {
     pub(super) balanced: f64,
     pub(super) per_config_best: f64,
     pub(super) ignore_network: f64,
+    pub(super) sustained_limit: f64,
+    pub(super) achievable_limit: f64,
     pub(super) hardware_limit: f64,
 }
 
@@ -32,6 +34,8 @@ impl BaseRungs {
         self.balanced += other.balanced;
         self.per_config_best += other.per_config_best;
         self.ignore_network += other.ignore_network;
+        self.sustained_limit += other.sustained_limit;
+        self.achievable_limit += other.achievable_limit;
         self.hardware_limit += other.hardware_limit;
     }
 
@@ -40,7 +44,9 @@ impl BaseRungs {
         self.balanced = self.balanced.min(self.busy).max(0.0);
         self.per_config_best = self.per_config_best.min(self.balanced).max(0.0);
         self.ignore_network = self.ignore_network.min(self.per_config_best).max(0.0);
-        self.hardware_limit = self.hardware_limit.min(self.ignore_network).max(0.0);
+        self.sustained_limit = self.sustained_limit.min(self.ignore_network).max(0.0);
+        self.achievable_limit = self.achievable_limit.min(self.sustained_limit).max(0.0);
+        self.hardware_limit = self.hardware_limit.min(self.achievable_limit).max(0.0);
     }
 }
 
@@ -80,13 +86,17 @@ pub(super) fn assemble_tiers(workers: &[WorkerFoldAccumulator]) -> TierAggregate
             rungs.balanced = anchor_factor * worker.sampled_rungs_ms[0];
             rungs.per_config_best = anchor_factor * worker.sampled_rungs_ms[1];
             rungs.ignore_network = anchor_factor * worker.sampled_rungs_ms[2];
-            rungs.hardware_limit = anchor_factor * worker.sampled_rungs_ms[3];
+            rungs.sustained_limit = anchor_factor * worker.sampled_rungs_ms[3];
+            rungs.achievable_limit = anchor_factor * worker.sampled_rungs_ms[4];
+            rungs.hardware_limit = anchor_factor * worker.sampled_rungs_ms[5];
         } else {
             // No sampled rows for this worker: leave R2..R5 = R1 (all lower buckets
             // 0) rather than 0 (which would over-attribute to imbalance).
             rungs.balanced = rungs.busy;
             rungs.per_config_best = rungs.busy;
             rungs.ignore_network = rungs.busy;
+            rungs.sustained_limit = rungs.busy;
+            rungs.achievable_limit = rungs.busy;
             rungs.hardware_limit = rungs.busy;
         }
         // Enforce monotonicity defensively (sampling noise / clamp interplay).
@@ -195,7 +205,7 @@ fn level_entry_json(
     };
     let green_s = ms_to_s(rungs.hardware_limit);
 
-    // The five buckets above the green floor are the same telescoping rung diffs.
+    // The seven buckets above the green floor are the same telescoping rung diffs.
     let mut bucket_obj = serde_json::Map::new();
     for (bucket_key, bucket_gpu_ms) in [
         ("idle", idle),
@@ -205,7 +215,12 @@ fn level_entry_json(
             "communication",
             rungs.per_config_best - rungs.ignore_network,
         ),
-        ("hardware_gap", rungs.ignore_network - rungs.hardware_limit),
+        ("kernel_gap", rungs.ignore_network - rungs.sustained_limit),
+        ("power_gap", rungs.sustained_limit - rungs.achievable_limit),
+        (
+            "hardware_gap",
+            rungs.achievable_limit - rungs.hardware_limit,
+        ),
     ] {
         bucket_obj.insert(
             bucket_key.to_string(),
@@ -218,6 +233,8 @@ fn level_entry_json(
         "balanced": ms_to_s(rungs.balanced),
         "per_config_best": ms_to_s(rungs.per_config_best),
         "ignore_network": ms_to_s(rungs.ignore_network),
+        "sustained_limit": ms_to_s(rungs.sustained_limit),
+        "achievable_limit": ms_to_s(rungs.achievable_limit),
         "hardware_limit": ms_to_s(rungs.hardware_limit),
     })
     .as_object()
@@ -298,6 +315,8 @@ pub(super) fn rung_report_json(rungs: &BaseRungs, floor: Option<Floors>) -> Valu
         "balanced": ms_to_s(rungs.balanced),
         "per_config_best": ms_to_s(rungs.per_config_best),
         "ignore_network": ms_to_s(rungs.ignore_network),
+        "sustained_limit": ms_to_s(rungs.sustained_limit),
+        "achievable_limit": ms_to_s(rungs.achievable_limit),
         "hardware_limit": ms_to_s(rungs.hardware_limit),
         "optimality_ratio": ratio(rungs.hardware_limit, rungs.real),
     });
@@ -306,7 +325,9 @@ pub(super) fn rung_report_json(rungs: &BaseRungs, floor: Option<Floors>) -> Valu
         "imbalance": bucket_ms(rungs.busy - rungs.balanced),
         "batching": bucket_ms(rungs.balanced - rungs.per_config_best),
         "communication": bucket_ms(rungs.per_config_best - rungs.ignore_network),
-        "hardware_gap": bucket_ms(rungs.ignore_network - rungs.hardware_limit),
+        "kernel_gap": bucket_ms(rungs.ignore_network - rungs.sustained_limit),
+        "power_gap": bucket_ms(rungs.sustained_limit - rungs.achievable_limit),
+        "hardware_gap": bucket_ms(rungs.achievable_limit - rungs.hardware_limit),
     });
     let green_s = ms_to_s(rungs.hardware_limit);
     if let Some(floor) = floor {
@@ -344,6 +365,8 @@ mod tests {
             balanced: 8_000.0,
             per_config_best: 7_000.0,
             ignore_network: 6_000.0,
+            sustained_limit: 5_800.0,
+            achievable_limit: 5_500.0,
             hardware_limit: 5_000.0,
         };
         let report = rung_report_json(
@@ -358,5 +381,8 @@ mod tests {
         assert_eq!(report["buckets"]["hardware_necessary"]["gpu_s"], 2.0);
         assert_eq!(report["buckets"]["fusion"]["gpu_s"], 1.0);
         assert_eq!(report["buckets"]["excess_over_necessary"]["gpu_s"], 2.0);
+        assert_eq!(report["buckets"]["kernel_gap"]["gpu_s"], 0.2);
+        assert_eq!(report["buckets"]["power_gap"]["gpu_s"], 0.3);
+        assert_eq!(report["buckets"]["hardware_gap"]["gpu_s"], 0.5);
     }
 }

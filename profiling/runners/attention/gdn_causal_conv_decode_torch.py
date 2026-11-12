@@ -14,6 +14,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.attention._gdn_common import reject_verify_tokens
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
@@ -136,13 +137,15 @@ def _build_operands(torch: Any, args: _ValidatedArgs, *, device: Any) -> _Operan
     )
 
 
-def _semantic_flops(*, batch_size: int, channels: int, kernel_size: int) -> int:
+def _semantic_flops(
+    *, batch_size: int, channels: int, kernel_size: int, per_request: int = 1
+) -> int:
     """Nominal semantic FLOPs, not physical Torch instruction count.
 
     Each channel's FP32 dot counts ``W`` multiplies and ``W-1`` additions. SiLU
     counts one sigmoid and one multiply. Casts and the state shift count as zero.
     """
-    return batch_size * channels * (2 * kernel_size + 1)
+    return batch_size * per_request * channels * (2 * kernel_size + 1)
 
 
 def _logical_bytes(
@@ -152,14 +155,17 @@ def _logical_bytes(
     kernel_size: int,
     dtype: DType,
     state_dtype: DType,
+    per_request: int = 1,
 ) -> float:
     """Logical boundary traffic, excluding Torch composite intermediates.
 
     Counts input/weight/state reads, output/state writes, and fixed-int32 slot
     indices. The shared depthwise weight is counted once rather than per row.
+    A verify step (``per_request`` tokens) reads ``kernel_size − 1`` history
+    samples and writes its ``kernel_size − 2 + per_request`` history row.
     """
-    data_elements = 2 * batch_size * channels + channels * kernel_size
-    state_elements = 2 * batch_size * channels * (kernel_size - 1)
+    data_elements = 2 * batch_size * per_request * channels + channels * kernel_size
+    state_elements = batch_size * channels * (2 * kernel_size - 3 + per_request)
     slot_index_bytes = batch_size * 4
     return (
         data_elements * dtype.size_bytes()
@@ -174,8 +180,10 @@ def profile_gdn_causal_conv_decode(
     kernel_size: int,
     dtype: DType | str,
     state_dtype: DType | str,
+    num_tokens: int | None = None,
 ) -> ComputeMetrics:
     """Profile the complete multi-launch Torch causal-conv decode reference."""
+    reject_verify_tokens("gdn_causal_conv_decode:torch", int(batch_size), num_tokens)
     args = _validate_args(
         batch_size=batch_size,
         channels=channels,

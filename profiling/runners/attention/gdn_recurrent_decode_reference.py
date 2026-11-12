@@ -42,10 +42,9 @@ def gdn_recurrent_decode_reference(
     activations, and head layouts where ``Hv`` is not divisible by ``Hq``.
 
     Semantics follow Transformers 5.13 ``torch_recurrent_gated_delta_rule`` and
-    vLLM's ``fused_recurrent_gated_delta_rule_packed_decode_kernel``. The packed
-    kernel computes sigmoid in FP32, rounds beta through the activation dtype,
-    and then applies the recurrence in FP32; this reference preserves that
-    rounding point.
+    vLLM's ``fused_recurrent_gated_delta_rule_packed_decode_kernel`` and
+    ``fused_sigmoid_gating_delta_rule_update_kernel``: both compute the gates
+    and beta in FP32 and apply the recurrence in FP32.
     """
     _validate(query, key, value, a, b, A_log, dt_bias, state)
 
@@ -66,7 +65,7 @@ def gdn_recurrent_decode_reference(
 
     decay_log = -torch.exp(A_log) * F.softplus(a.float() + dt_bias)
     decay = torch.exp(decay_log).unsqueeze(-1).unsqueeze(-1)
-    beta = torch.sigmoid(b.float()).to(b.dtype).float().unsqueeze(-1)
+    beta = torch.sigmoid(b.float()).unsqueeze(-1)
 
     decayed_state = state * decay
     memory = torch.sum(decayed_state * key_fp32.unsqueeze(-1), dim=-2)

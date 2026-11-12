@@ -59,6 +59,8 @@ const THRASH_SLOPE: f64 = 1.0 - MISS_CURVE[0].1;
 
 /// The slot kind of the analytic host -> device IO leaf.
 pub const HISPARSE_H2D_IO_KIND: &str = "hisparse_h2d_io";
+/// Layout part of the per-request latent buffer an offloading arch keeps on the GPU.
+pub const DEVICE_BUFFER_PART: &str = "hisparse_device_buffer";
 
 const fn default_buffer_tokens() -> u32 {
     4096

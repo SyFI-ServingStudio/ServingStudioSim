@@ -5,6 +5,14 @@
 //! (cache/truth ratio 0.85575) and `(363, 2896)` (ratio 0.73969), so the shared
 //! 363 boundary below targets both the masked diagonal and interior M=363 miss
 //! without changing the public query contract or cache algorithm.
+//!
+//! B200 GLM-5.3 PP4 prefill chunks then read up to 22% off between the
+//! power-of-two rows. DeepGEMM's time steps up between 512 and 1024 queries
+//! (`(736, 40212)` measured 0.160 ms, interpolated 0.125), and a fresh chunk's
+//! diagonal cell interpolates across a factor-of-two query gap (`(10991,
+//! 10991)` 0.266 vs 0.294). The query axis adds 576..896 across the step and
+//! the 1.5x points from 1536 to 24576; the key axis adds 12288 and 24576 so
+//! those query counts have their own diagonal.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -63,12 +71,12 @@ impl KernelSpec for DsaMqaLogitsPrefillSpec {
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
         SweepGrid::new(vec![
             Axis::values([
-                1, 2, 3, 4, 8, 16, 32, 64, 127, 128, 129, 255, 256, 257, 363, 512, 1024, 2048,
-                4096, 8192, 16384, 32768, 65536,
+                1, 2, 3, 4, 8, 16, 32, 64, 127, 128, 129, 255, 256, 257, 363, 512, 576, 640, 768,
+                896, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 65536,
             ]),
             Axis::values([
                 1, 2, 4, 8, 16, 32, 64, 128, 255, 256, 257, 363, 512, 1024, 2048, 4096, 8192,
-                16384, 32768, 65536, 131072, 262144, 524288, 1048576,
+                12288, 16384, 24576, 32768, 65536, 131072, 262144, 524288, 1048576,
             ]),
         ])
     }
@@ -132,11 +140,13 @@ mod tests {
     const DEEPGEMM_BACKEND: &str = "deepgemm_fp8";
     const QUERY_AXIS: &[f64] = &[
         1.0, 2.0, 3.0, 4.0, 8.0, 16.0, 32.0, 64.0, 127.0, 128.0, 129.0, 255.0, 256.0, 257.0, 363.0,
-        512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0,
+        512.0, 576.0, 640.0, 768.0, 896.0, 1024.0, 1536.0, 2048.0, 3072.0, 4096.0, 6144.0, 8192.0,
+        12288.0, 16384.0, 24576.0, 32768.0, 65536.0,
     ];
     const KEY_AXIS: &[f64] = &[
         1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 255.0, 256.0, 257.0, 363.0, 512.0, 1024.0,
-        2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 524288.0, 1048576.0,
+        2048.0, 4096.0, 8192.0, 12288.0, 16384.0, 24576.0, 32768.0, 65536.0, 131072.0, 262144.0,
+        524288.0, 1048576.0,
     ];
 
     fn config() -> DsaMqaLogitsPrefillKernelConfig {
@@ -234,8 +244,8 @@ mod tests {
         assert_eq!(axes.len(), 2);
         assert_eq!(axes[0], QUERY_AXIS);
         assert_eq!(axes[1], KEY_AXIS);
-        assert_eq!(axes[0].len(), 23);
-        assert_eq!(axes[1].len(), 24);
+        assert_eq!(axes[0].len(), 32);
+        assert_eq!(axes[1].len(), 26);
         assert!(axes[0].windows(2).all(|pair| pair[0] < pair[1]));
         assert!(axes[1].windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(&axes[0][..3], &[1.0, 2.0, 3.0]);
@@ -249,7 +259,7 @@ mod tests {
         // logits block no longer fits on a card.
         assert_eq!(axes[0].last(), Some(&65536.0));
         assert_eq!(axes[1].last(), Some(&1_048_576.0));
-        assert_eq!(axes[0].len() * axes[1].len(), 552);
+        assert_eq!(axes[0].len() * axes[1].len(), 832);
     }
 
     #[test]
@@ -259,9 +269,9 @@ mod tests {
         let mask = DsaMqaLogitsPrefillSpec::infeasible_mask(&cfg, &grid);
         let key_count = grid.axes()[1].len();
 
-        assert_eq!(mask.len(), 552);
-        assert_eq!(mask.iter().filter(|&&masked| masked).count(), 217);
-        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 335);
+        assert_eq!(mask.len(), 832);
+        assert_eq!(mask.iter().filter(|&&masked| masked).count(), 358);
+        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 474);
 
         let masked = |m: f64, n: f64| {
             let i = grid.axes()[0].iter().position(|&value| value == m).unwrap();
@@ -301,7 +311,7 @@ mod tests {
         let grid = DsaMqaLogitsPrefillSpec::sweep_grid(&cfg);
         let payloads = DsaMqaLogitsPrefillSpec::enumerate(&cfg, &grid, DEEPGEMM_BACKEND);
 
-        assert_eq!(payloads.len(), 552);
+        assert_eq!(payloads.len(), 832);
         let expected_names = [
             "backend",
             "clean_logits",

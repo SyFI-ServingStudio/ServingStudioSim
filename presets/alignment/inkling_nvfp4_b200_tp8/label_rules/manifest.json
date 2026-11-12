@@ -1,0 +1,26 @@
+{
+ "schema_version": 2,
+ "rule_files": [
+  "rules.json",
+  "tp8_qkvr_rules.json"
+ ],
+ "note": "Inkling rules from Inkling-Small-NVFP4 TP4/EP4 (logs/20261007_0_inkling_small_nvfp4_tp4ep4/check1_label_rules), with the dedupe-merge slot rename *.activation -> *.act_and_mul; applied to Inkling-NVFP4 TP8/EP8. Inkling-Small-NVFP4 on 4x B200, vLLM TP4 attention / EP4 experts, labeled against the inkling_vllm_nvfp4_rel_attn_moe CostTree (check1_timing_predict). One order-independent rule set applied to a fixpoint (subsumptions and disagreements both empty). Generator: tmp/inkling-phase45/partB/scripts/gen_rules.py.",
+ "source": {
+  "capture": "logs/20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)",
+  "cost_manifest": "logs/20261007_0_inkling_small_nvfp4_tp4ep4/check1_timing_predict/raw/cost_manifest/worker_predict_0.json",
+  "arch": "inkling_vllm_nvfp4_rel_attn_moe, model/config/inkling_small_nvfp4.json, routing corpus"
+ },
+ "unmapped_decisions": {
+  "note": "Every forward kernel is mapped. The rest stays at the initialized unmapped label.",
+  "preprocess": {
+   "_apply_write, _prepare_pos_seq_lens, _combine_sampled_and_draft_tokens, _gather_block_tables, _compute_slot_mappings, _seq_metadata, fills, empty-named launch": "input preparation and attention metadata; no CostTree leaf"
+  },
+  "sample": {
+   "vectorized_gather_kernel / index_elementwise_kernel before lm_head": "last-token row gather, framework plumbing",
+   "direct_copy after the logits AllGather, index gathers, _gumbel_sample, argmax reduce, scatter_gather, FillFunctor, _get_num_sampled_and_rejected": "sampling, not modelled"
+  },
+  "bookkeep": {
+   "_post_update_kernel": "scheduler bookkeeping"
+  }
+ }
+}

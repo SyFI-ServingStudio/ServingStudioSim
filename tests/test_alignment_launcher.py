@@ -403,7 +403,7 @@ def test_profile_config_is_profile_only_and_config_relative(tmp_path, monkeypatc
         ),
     )
 
-    assert alignment_launcher.main(["profile", str(paths["profile"])]) == 0
+    assert alignment_launcher.main(["profile", str(paths["profile"]), "--runtime", "host"]) == 0
     assert resumed == [False]
     config = profiled[0]
     assert not hasattr(config, "analysis")
@@ -619,13 +619,7 @@ def test_sglang_profile_requires_an_explicit_prebuilt_runtime(tmp_path):
     assert config.python_runtime.environment == {"FLASHINFER_DISABLE_JIT": "1"}
 
 
-@pytest.mark.parametrize(
-    "python_runtime",
-    [None, PythonRuntimeConfig(packages=[], environment={})],
-)
-def test_direct_sglang_profile_fails_before_replay_without_strict_jit_policy(
-    tmp_path, monkeypatch, python_runtime
-):
+def test_direct_sglang_profile_fails_before_replay_without_python_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(
         load_runner,
         "prepare_replay",
@@ -637,10 +631,9 @@ def test_direct_sglang_profile_fails_before_replay_without_strict_jit_policy(
         gpu="NVIDIA B200",
         engine="sglang",
         server=ServerConfig(model_path="model"),
-        python_runtime=python_runtime,
     )
 
-    with pytest.raises(ValueError, match="FLASHINFER_DISABLE_JIT=1"):
+    with pytest.raises(ValueError, match="explicit python_runtime"):
         alignment_runner.run_profile(config)
 
 
@@ -2524,3 +2517,47 @@ def test_a_model_without_eplb_opts_out_of_the_expert_load_stream(tmp_path):
     assert not cfg.captures_expert_load
     assert "--enable-eplb" not in argv
     assert "--enable-return-routed-experts" in argv
+
+
+def test_warm_caches_from_the_host_is_the_images_warm_pass(tmp_path, monkeypatch):
+    import alignment.image_runtime as image_runtime
+
+    paths = _phase_configs(tmp_path)
+    monkeypatch.delenv(image_runtime.RUNTIME_ENV, raising=False)
+    calls = []
+    monkeypatch.setattr(
+        image_runtime,
+        "run_profile_in_image",
+        lambda config, **kwargs: calls.append(kwargs) or 0,
+    )
+    monkeypatch.setattr(
+        alignment_launcher,
+        "run_profile",
+        lambda *args, **kwargs: pytest.fail("the host must not profile on --warm-caches"),
+    )
+
+    assert alignment_launcher.main(["profile", str(paths["profile"]), "--warm-caches"]) == 0
+    assert calls == [{"warm_caches": True}]
+    # The capture's own log_dir gets no bundle marker or config snapshot.
+    from launcher.alignment_config import load_profile_config
+
+    log_dir = Path(load_profile_config(paths["profile"]).log_dir)
+    assert not log_dir.exists() or not any(log_dir.iterdir())
+
+
+def test_an_explicit_host_warm_up_logs_beside_the_capture(tmp_path, monkeypatch):
+    import alignment.image_runtime as image_runtime
+
+    paths = _phase_configs(tmp_path)
+    monkeypatch.delenv(image_runtime.RUNTIME_ENV, raising=False)
+    warmed = []
+    monkeypatch.setattr(
+        alignment_launcher,
+        "run_profile",
+        lambda config, *, warm_only=False, **_: warmed.append((config.log_dir, warm_only)) or {},
+    )
+
+    argv = ["profile", str(paths["profile"]), "--runtime", "host", "--warm-caches"]
+    assert alignment_launcher.main(argv) == 0
+    (log_dir, warm_only), = warmed
+    assert warm_only and log_dir.endswith(".warm-caches")

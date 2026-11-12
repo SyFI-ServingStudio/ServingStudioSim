@@ -5,7 +5,13 @@
 //! one, and execution lowers a verify batch through `SpeculativeIterExecution`.
 //! Both differences are the same underlying fact — a resident decode moves by a
 //! whole accepted chain per iteration rather than one token — split across the
-//! axis that owns advancement and the axis that owns model input.
+//! axis that owns advancement and the axis that owns model input. Chunk-end
+//! alignment comes from the same `prefill_chunk_end_quantum`; the drafter adds
+//! whether the prompt's last checkpoint moves one block earlier
+//! (`SpeculativeUnifiedModel::prunes_last_prefix_block`). Only the chunk-end
+//! stop reads this; prefix-hit lengths do not yet drop the block. A layout
+//! without resumable recurrent state gets no alignment, so the hook is inert
+//! there.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,17 +20,17 @@ use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{
-    ChunkedPrefillAdmission, LoadBalance, PendingOrder, SpeculativeDecodeCompletion,
+    ChunkEndAlignment, ChunkedPrefillAdmission, LoadBalance, PendingOrder,
+    SpeculativeDecodeCompletion,
 };
-use crate::worker::config::DpPlacement;
 use crate::worker::execution::SpeculativeIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::{FullAttnKv, HybridGdnKv};
 use crate::worker::types::WorkerConfig;
 
-use super::iter_batch_worker::{HybridSpeculativeWorker, IterBatchWorker, SpeculativeWorker};
+use super::iter_batch_worker::{IterBatchWorker, SpeculativeWorker};
 use crate::worker::workers::iter_build_essentials::{
-    full_attention_token_capacity, host_kv_tier, prepare_iter_build_essentials,
+    host_kv_tier, kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials,
+    resolve_kv_accounting,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -58,16 +64,24 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
     );
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let num_partitions = model.num_attn_dp_groups().max(1) as usize;
-    let kv_capacity = full_attention_token_capacity(
-        model.num_attn_shards(),
-        model.total_kv_bytes_per_token(),
-        &config,
+    let kv_accounting =
+        resolve_kv_accounting(&model.kv_cache_layout(), model.num_attn_shards(), &config);
+    let chunk_end_alignment =
+        prefill_chunk_end_quantum(&kv_accounting, &config).map(|quantum| ChunkEndAlignment {
+            quantum,
+            last_checkpoint_one_block_early: model.prunes_last_prefix_block(),
+        });
+    tracing::info!(
+        worker = id.0,
+        pool_tag,
+        kv_capacity_units = kv_accounting.capacity_units(),
+        kv_bytes_per_unit = kv_accounting.bytes_per_unit(),
+        chunk_end_alignment = ?chunk_end_alignment,
+        max_batch_tokens,
+        "speculative chunked prefill KV"
     );
-    let prefix_cache = config.prefix_cache.resolve_tokens(
-        kv_capacity,
-        model.total_kv_bytes_per_token(),
-        model.num_attn_shards(),
-    );
+    let host_tier = host_kv_tier(model.kv_host_offload(), &config);
+    let kv_capacity_units = kv_accounting.capacity_units();
     let essentials = prepare_iter_build_essentials(
         id,
         pool_tag,
@@ -79,44 +93,33 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         &cluster,
         model.gpus_per_replica(),
         model.cost_log_manifest(),
-        kv_capacity,
+        &kv_accounting,
         num_partitions,
     );
-    let host_tier = host_kv_tier(
-        model.kv_host_offload(),
-        model.total_kv_bytes_per_token(),
+    let kv_store = kv_cache_store(
+        kv_accounting,
+        num_partitions,
+        model.num_attn_shards(),
         &config,
-    );
-    let kv_store = FullAttnKv::with_prefix_cache(
-        num_partitions,
-        essentials.kv_capacity,
-        prefix_cache,
         essentials.sampler,
         prefix_cache_logger,
     );
-    // A host-tier cache (HiSparse) charges a fixed device buffer per request
-    // and bounds the summed context by host memory.
+    // A host-tier cache (HiSparse) bounds the summed context by host memory;
+    // its fixed device buffer per request is a part of the arch's KV layout.
     let kv_store = match host_tier {
         Some(tier) => {
             tracing::info!(
                 worker = id.0,
                 pool_tag,
-                kv_capacity_tokens = essentials.kv_capacity,
-                device_tokens_per_request = tier.device_tokens_per_request,
+                kv_capacity_units,
                 host_capacity_tokens = tier.host_capacity_tokens,
-                "host-tier KV: per-request device buffer and host context cap"
+                "host-tier KV: host memory caps the summed context"
             );
             kv_store.with_host_tier(tier)
         }
         None => kv_store,
     };
-    let balance = match (num_partitions, config.dp_placement) {
-        (1, _) => LoadBalance::Single,
-        (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },
-        (_, DpPlacement::VllmLeastLoaded) => LoadBalance::LeastLoaded { next: 0 },
-        (_, DpPlacement::KvLeastLoaded) => LoadBalance::KvLeastLoaded { next: 0 },
-        (_, DpPlacement::KvFitLeastLoaded) => LoadBalance::KvFitLeastLoaded { next: 0 },
-    };
+    let balance = LoadBalance::for_dp(num_partitions, config.dp_placement);
     let admission = ChunkedPrefillAdmission::with_decode_completion(
         (0..num_partitions)
             .map(|_| (PendingOrder::new(config.pending_order), ()))
@@ -127,149 +130,15 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         balance,
         SpeculativeDecodeCompletion::new(
             draft_tokens,
+            model.max_model_len(),
             config.speculative_acceptance_seed.unwrap_or(0),
         ),
         drafting_slots,
     );
-
-    IterBatchWorker::from_components(
-        essentials.context,
-        kv_store,
-        admission,
-        SpeculativeIterExecution::new(
-            model,
-            essentials.cost,
-            draft_tokens,
-            config.speculative_acceptance_seed.unwrap_or(0),
-        ),
-    )
-}
-
-/// `build_speculative_worker` with a `HybridGdnKv` store: each request's
-/// recurrent state (target linear-attention layers plus any per-request draft
-/// state) shares one capacity with the per-token attention KV, as in
-/// `build_hybrid_chunked_prefill_worker`. Prefill chunks are not checkpoint
-/// aligned here; the verify step is what this worker models.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_hybrid_speculative_worker<M: SpeculativeUnifiedModel>(
-    id: WorkerId,
-    pool_tag: &'static str,
-    model: Arc<M>,
-    requests: SharedRequests,
-    config: WorkerConfig,
-    cost_log_dir: Option<PathBuf>,
-    pool: PoolId,
-    gpu_name: &str,
-    cluster: SharedGpuCluster,
-) -> HybridSpeculativeWorker<M> {
-    let max_batch_tokens = config
-        .max_batch_tokens
-        .expect("speculative worker requires max_batch_tokens");
-    let draft_tokens = config.speculative_draft_tokens;
-    assert!(
-        draft_tokens > 0,
-        "speculative worker requires speculative_draft_tokens > 0; \
-         zero drafts is the chunked-prefill worker"
-    );
-    let drafting_slots = model.drafting_slots_per_request();
-    assert!(
-        draft_tokens
-            .checked_add(1)
-            .and_then(|width| width.checked_add(drafting_slots))
-            .is_some_and(|width| width <= max_batch_tokens),
-        "speculative verify width must fit max_batch_tokens"
-    );
-    let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
-    let num_partitions = model.num_attn_dp_groups().max(1) as usize;
-    let kv_capacity = full_attention_token_capacity(
-        model.num_attn_shards(),
-        model.total_kv_bytes_per_token(),
-        &config,
-    );
-    let state_tokens_per_request = model
-        .recurrent_state_bytes_per_request()
-        .div_ceil(model.total_kv_bytes_per_token().max(1));
-    let checkpoint_interval_tokens = config
-        .ssm_checkpoint_interval_tokens
-        .unwrap_or_else(|| model.recurrent_checkpoint_interval_tokens());
-    tracing::info!(
-        worker = id.0,
-        pool_tag,
-        state_tokens_per_request,
-        checkpoint_interval_tokens,
-        max_batch_tokens,
-        kv_capacity_tokens = kv_capacity,
-        "hybrid speculative: recurrent state shares the attention capacity"
-    );
-    let prefix_cache = config.prefix_cache.resolve_tokens(
-        kv_capacity,
-        model.total_kv_bytes_per_token(),
-        model.num_attn_shards(),
-    );
-    let essentials = prepare_iter_build_essentials(
-        id,
-        pool_tag,
-        requests,
-        &config,
-        cost_log_dir,
-        pool,
-        gpu_name,
-        &cluster,
-        model.gpus_per_replica(),
-        model.cost_log_manifest(),
-        kv_capacity,
-        num_partitions,
-    );
-    let kv_store = HybridGdnKv::new(
-        num_partitions,
-        essentials.kv_capacity,
-        state_tokens_per_request,
-        checkpoint_interval_tokens,
-        prefix_cache,
-        essentials.sampler,
-        prefix_cache_logger,
-    );
-    // A host-tier cache (HiSparse) adds a fixed device buffer per request
-    // beside the recurrent state and bounds the summed context by host memory.
-    let kv_store = match host_kv_tier(
-        model.kv_host_offload(),
-        model.total_kv_bytes_per_token(),
-        &config,
-    ) {
-        Some(tier) => {
-            tracing::info!(
-                worker = id.0,
-                pool_tag,
-                kv_capacity_tokens = essentials.kv_capacity,
-                device_tokens_per_request = tier.device_tokens_per_request,
-                host_capacity_tokens = tier.host_capacity_tokens,
-                "host-tier KV: per-request device buffer and host context cap"
-            );
-            kv_store.with_host_tier(tier)
-        }
-        None => kv_store,
+    let admission = match chunk_end_alignment {
+        Some(alignment) => admission.with_chunk_end_alignment(alignment),
+        None => admission,
     };
-    let balance = match (num_partitions, config.dp_placement) {
-        (1, _) => LoadBalance::Single,
-        (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },
-        (_, DpPlacement::VllmLeastLoaded) => LoadBalance::LeastLoaded { next: 0 },
-        (_, DpPlacement::KvLeastLoaded) => LoadBalance::KvLeastLoaded { next: 0 },
-        (_, DpPlacement::KvFitLeastLoaded) => LoadBalance::KvFitLeastLoaded { next: 0 },
-    };
-    let admission = ChunkedPrefillAdmission::with_decode_completion(
-        (0..num_partitions)
-            .map(|_| (PendingOrder::new(config.pending_order), ()))
-            .collect(),
-        max_batch_tokens,
-        config.batch_policy,
-        config.kv_admission,
-        balance,
-        SpeculativeDecodeCompletion::new(
-            draft_tokens,
-            config.speculative_acceptance_seed.unwrap_or(0),
-        ),
-        drafting_slots,
-    );
 
     IterBatchWorker::from_components(
         essentials.context,
@@ -328,8 +197,9 @@ mod tests {
             lm(1.0)
         }
 
-        fn total_kv_bytes_per_token(&self) -> u64 {
-            1024
+        fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+            crate::arch::kv_layout::KvCacheLayout::new()
+                .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1024))
         }
 
         fn max_model_len(&self) -> u32 {
@@ -394,10 +264,11 @@ mod tests {
     }
 
     #[test]
-    fn the_hybrid_recipe_charges_recurrent_state_against_capacity() {
-        // The defect this catches: building a hybrid speculative arch on the
-        // full-attention store, which would leave each request's recurrent
-        // state out of capacity and admit several times too many decodes.
+    fn the_recipe_charges_recurrent_state_against_capacity() {
+        // The defect this catches: a speculative recipe that leaves each
+        // request's recurrent state (the layout's per-request part) out of
+        // capacity and admits several times too many decodes.
+        use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
         use std::sync::atomic::{AtomicU32, Ordering};
         const CAPACITY: u64 = 1000;
         struct StatefulModel {
@@ -417,11 +288,13 @@ mod tests {
                 }
                 FakeSpeculativeModel.eval_speculative_iter(batch, slots, scratch)
             }
-            fn total_kv_bytes_per_token(&self) -> u64 {
-                1024
-            }
-            fn recurrent_state_bytes_per_request(&self) -> u64 {
-                self.state_bytes
+            fn kv_cache_layout(&self) -> KvCacheLayout {
+                let layout = KvCacheLayout::new().with_part(KvCachePart::per_token("kv", 1024));
+                if self.state_bytes == 0 {
+                    layout
+                } else {
+                    layout.with_part(KvCachePart::per_request("state", self.state_bytes))
+                }
             }
             fn max_model_len(&self) -> u32 {
                 8192
@@ -449,7 +322,7 @@ mod tests {
             });
             let mut config = config(KvAdmissionConfig::FullFootprint);
             config.attn_kv_bytes = CAPACITY * 1024;
-            let mut worker = build_hybrid_speculative_worker(
+            let mut worker = build_speculative_worker(
                 WorkerId(0),
                 "test",
                 model.clone(),
@@ -567,8 +440,9 @@ mod tests {
                 }
                 FakeSpeculativeModel.eval_speculative_iter(batch, slots, scratch)
             }
-            fn total_kv_bytes_per_token(&self) -> u64 {
-                1024
+            fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+                crate::arch::kv_layout::KvCacheLayout::new()
+                    .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1024))
             }
             fn max_model_len(&self) -> u32 {
                 8192
@@ -617,7 +491,7 @@ mod tests {
             worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
         }
         for tick in 0..400 {
-            // `FullAttnKv::advance` asserts the store never overfills.
+            // `KvCacheStore::advance` asserts the store never overfills.
             worker.tick(Time::from_ms(tick as f64), &mut Vec::new());
         }
 
@@ -680,8 +554,9 @@ mod tests {
                 }
                 FakeSpeculativeModel.eval_speculative_iter(batch, slots, scratch)
             }
-            fn total_kv_bytes_per_token(&self) -> u64 {
-                1024
+            fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+                crate::arch::kv_layout::KvCacheLayout::new()
+                    .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1024))
             }
             fn max_model_len(&self) -> u32 {
                 8192
@@ -751,8 +626,9 @@ mod tests {
                 assert!(batch.groups.iter().all(|group| group.batch_tokens <= 8));
                 FakeSpeculativeModel.eval_speculative_iter(batch, slots, scratch)
             }
-            fn total_kv_bytes_per_token(&self) -> u64 {
-                1024
+            fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+                crate::arch::kv_layout::KvCacheLayout::new()
+                    .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1024))
             }
             fn max_model_len(&self) -> u32 {
                 8192
@@ -808,6 +684,99 @@ mod tests {
             for id in 0..8 {
                 assert!(requests.borrow()[RequestId(id)].lifecycle.completed);
             }
+        }
+    }
+
+    #[test]
+    fn a_hybrid_layout_aligns_chunks_and_a_pruning_drafter_stops_a_block_early() {
+        // The defect this catches: a speculative recipe that ignores the
+        // layout's checkpoint block (vLLM's Mamba `align` mode), or ignores
+        // that an MTP/EAGLE drafter moves the prompt's last checkpoint one
+        // block earlier. An 18-token prompt under an 18-token cap with a
+        // 4-token block runs whole (plain), 16 + 2 (aligned), or 12 + 6
+        // (aligned, pruning drafter).
+        use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
+        use crate::worker::config::PrefillChunkAlignment;
+        use std::sync::Mutex;
+        struct HybridModel {
+            prunes: bool,
+            chunks: Mutex<Vec<(u32, u32)>>,
+        }
+        impl SpeculativeUnifiedModel for HybridModel {
+            fn eval_speculative_iter(
+                &self,
+                batch: &SpeculativeArchInput,
+                slots: &mut Vec<LeafMetrics>,
+                _scratch: &mut Vec<LeafMetrics>,
+            ) -> LeafMetrics {
+                slots.clear();
+                for group in &batch.groups {
+                    self.chunks
+                        .lock()
+                        .unwrap()
+                        .extend_from_slice(&group.prefill_chunk_pairs);
+                }
+                lm(1.0)
+            }
+            fn kv_cache_layout(&self) -> KvCacheLayout {
+                KvCacheLayout::new()
+                    .with_part(KvCachePart::per_token("kv", 1))
+                    .with_part(KvCachePart::per_request("state", 1))
+                    .with_engine(EngineOverhead {
+                        block_tokens: Some(4),
+                        fixed_device_bytes: 0,
+                    })
+            }
+            fn max_model_len(&self) -> u32 {
+                8192
+            }
+            fn gpus_per_replica(&self) -> u16 {
+                1
+            }
+            fn prunes_last_prefix_block(&self) -> bool {
+                self.prunes
+            }
+        }
+        for (alignment, prunes, expected) in [
+            (Some(PrefillChunkAlignment::Plain), true, vec![(0, 18)]),
+            (None, false, vec![(0, 16), (16, 2)]),
+            (None, true, vec![(0, 12), (12, 6)]),
+        ] {
+            let requests = shared_with(&[(0, 18, 2)]);
+            requests.borrow_mut()[RequestId(0)]
+                .request
+                .definition
+                .decoding = DecodingStrategy::Speculative {
+                accept_rate: AcceptanceProfile::Uniform(0.0),
+            };
+            let model = Arc::new(HybridModel {
+                prunes,
+                chunks: Mutex::new(Vec::new()),
+            });
+            let mut config = config(KvAdmissionConfig::FullFootprint);
+            config.max_batch_tokens = Some(18);
+            config.prefill_chunk_alignment = alignment;
+            let mut worker = build_speculative_worker(
+                WorkerId(0),
+                "test",
+                model.clone(),
+                requests.clone(),
+                config,
+                None,
+                PoolId(0),
+                "test-gpu",
+                test_cluster(),
+            );
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+            for tick in 0..20 {
+                worker.tick(Time::from_ms(tick as f64), &mut Vec::new());
+            }
+            assert!(requests.borrow()[RequestId(0)].lifecycle.completed);
+            assert_eq!(
+                *model.chunks.lock().unwrap(),
+                expected,
+                "alignment={alignment:?} prunes={prunes}"
+            );
         }
     }
 }

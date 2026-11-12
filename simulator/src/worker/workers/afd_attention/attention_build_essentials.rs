@@ -8,14 +8,15 @@ use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::{KvSampler, PrefixCacheLogger};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::execution::AttentionLayerExecutionAdapter;
-use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::FullAttnKv;
+use crate::worker::gpu_cluster::{KvPoolFacts, SharedGpuCluster};
+use crate::worker::kv::KvCacheStore;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::WorkerConfig;
+use crate::worker::workers::iter_build_essentials::{kv_cache_store, resolve_kv_accounting};
 
 pub(super) struct AttentionBuildEssentials<M: AttnLayerwiseModel> {
     pub(super) context: WorkerContext,
-    pub(super) kv_store: FullAttnKv,
+    pub(super) kv_store: KvCacheStore,
     pub(super) execution: AttentionLayerExecutionAdapter<M>,
     pub(super) cluster: SharedGpuCluster,
     pub(super) receive_group_id: u16,
@@ -44,18 +45,15 @@ pub(super) fn prepare_attention_build_essentials<M: AttnLayerwiseModel>(
             id.0,
         )
     };
-    let shard_bytes = config
-        .attn_kv_bytes
-        .saturating_mul(model.num_attn_shards().max(1) as u64);
-    let kv_capacity = (shard_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
-    let prefix_cache = config.prefix_cache.resolve_tokens(
-        kv_capacity,
-        model.total_kv_bytes_per_token(),
-        model.num_attn_shards(),
+    let kv_accounting =
+        resolve_kv_accounting(&model.kv_cache_layout(), model.num_attn_shards(), &config);
+    cluster.borrow_mut().register_kv_pool(
+        pool_tag,
+        pool.0,
+        id.0,
+        0,
+        KvPoolFacts::of(&kv_accounting, config.max_model_len),
     );
-    cluster
-        .borrow_mut()
-        .register_kv_capacity(pool_tag, pool.0, id.0, 0, kv_capacity);
     let sampler = KvSampler::open_opt(
         cost_log_dir.as_deref(),
         pool_tag,
@@ -81,10 +79,11 @@ pub(super) fn prepare_attention_build_essentials<M: AttnLayerwiseModel>(
 
     AttentionBuildEssentials {
         context,
-        kv_store: FullAttnKv::with_prefix_cache(
+        kv_store: kv_cache_store(
+            kv_accounting,
             1,
-            kv_capacity,
-            prefix_cache,
+            model.num_attn_shards(),
+            &config,
             sampler,
             prefix_cache_logger,
         ),

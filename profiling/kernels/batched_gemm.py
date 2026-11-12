@@ -196,7 +196,7 @@ register(
         args_schema=BatchedGemmArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        subprocess_env="vllm_upstream_fork_env",
+        subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
                 'DeepGEMM fp8_einsum("bhr,hdr->bhd") with a (1, 1, 32) MXFP8 recipe, '

@@ -28,7 +28,10 @@ class DsaPersistentTopkDecodeArgs(KernelArgs):
     logits_row_stride: int = arg(unit="elements", doc="Physical spacing between logit rows.")
     logits_dtype: DType = arg(doc="Element type of the indexer logits.")
     index_dtype: str = arg(doc="Element type of the selected positions.")
-    context_mode: str = arg(doc="Pattern of valid prefix lengths across requests.")
+    context_mode: str = arg(
+        doc="Pattern of valid prefix lengths across requests; uniform_random also "
+        "draws the scores at random instead of an increasing sequence."
+    )
 
 
 DOC = KernelDoc(
@@ -40,15 +43,16 @@ DOC = KernelDoc(
         "request has next_n rows. With context_mode uniform, a request's rows "
         "have valid lengths context_len − next_n + 1 to context_len; with "
         "max_ragged, next_n is 1 and request b has max(0, context_len − b) "
-        "valid logits. A row no longer than top_k yields only its own "
-        "positions. The logits are FP32 in rows padded to logits_row_stride; "
-        "uniform rows all hold the same increasing sequence, max_ragged rows "
-        "one seeded random template."
+        "valid logits; uniform_random has uniform lengths. A row no longer than "
+        "top_k yields only its own positions. The logits are FP32 in rows padded "
+        "to logits_row_stride; uniform rows all hold the same increasing "
+        "sequence, uniform_random rows seeded standard-normal scores, max_ragged "
+        "rows one seeded random template."
     ),
     category="Attention",
     subcategory="DSA",
     formula=(
-        "uniform: length[j] = context_len − next_n + 1 + (j mod next_n); "
+        "uniform, uniform_random: length[j] = context_len − next_n + 1 + (j mod next_n); "
         "max_ragged: length[b] = max(0, context_len − b)",
         "output[j] = top_k positions from logits[j, :length[j]], or natural positions "
         "when length[j] ≤ top_k",
@@ -66,8 +70,10 @@ DOC = KernelDoc(
         "run before timing."
     ),
     caveats=(
-        "Neither the increasing uniform logits nor the random max_ragged "
-        "template follows a live indexer's score distribution.",
+        "Time follows the score distribution: the increasing uniform template "
+        "crowds a short row's valid logits into a narrow value range and the "
+        "random max_ragged template is shared by every row; uniform_random "
+        "scores are independent normals, like a live indexer's continuous scores.",
         "Off SM90 the check before timing accepts a long row that differs from "
         "the reference only when the kernel's known threshold-bin buffer "
         "overflow explains the difference; such a row's timing is the "
@@ -150,6 +156,40 @@ register(
                 "length, with a filtered top-k kernel above batch 32."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/persistent_topk.cuh",
+        ),
+    )
+)
+
+
+# The same indexer call sites dispatch here for at most 64 rows: vLLM
+# model_executor/layers/indexer_topk.py:215-254 and the QSA indexer
+# models/qwen4_exp/nvidia/ops/qsa_indexer.py:471-499. The op picks this backend
+# by row count, as the framework does; it is never a min over backends. The
+# kernel is built for SM90 and newer (CMakeLists.txt COOPERATIVE_TOPK_ARCHS,
+# SM12x included); only vLLM's dispatch skips it on the SM12x family.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cuda_cooperative",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP32}),
+            min_compute_capability=(9, 0),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_persistent_topk_decode_cooperative",
+            function_name="profile_dsa_persistent_topk_decode_vllm_cuda_cooperative",
+        ),
+        table_name=KIND,
+        args_schema=DsaPersistentTopkDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's cooperative_topk: one cooperative radix select for up to 64 "
+                "rows; rejects larger batches."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/cooperative_topk.cu",
         ),
     )
 )

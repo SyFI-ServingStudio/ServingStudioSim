@@ -339,6 +339,10 @@ pub struct KernelListEntry {
     pub cache_coords: &'static [&'static str],
     /// The config field holding the compute dtype (`#[compute_dtype]`).
     pub compute_dtype: Option<&'static str>,
+    /// An optional config field that, when present and non-null in a config,
+    /// is its compute dtype instead of `compute_dtype`'s field
+    /// (`#[compute_dtype_override]`).
+    pub compute_dtype_override: Option<&'static str>,
     /// The config field holding the KV-cache dtype (`#[kv_dtype]`).
     pub kv_dtype: Option<&'static str>,
 }
@@ -359,6 +363,7 @@ pub fn kernel_list() -> Vec<KernelListEntry> {
             input: (e.input_fields)(),
             cache_coords: (e.coord_fields)(),
             compute_dtype: e.compute_dtype_field,
+            compute_dtype_override: e.compute_dtype_override_field,
             kv_dtype: e.kv_dtype_field,
         })
         .collect();
@@ -407,7 +412,10 @@ mod kernel_list_tests {
         }
         for e in &list {
             assert!(!e.input.is_empty(), "{}: no input fields read", e.kind);
-            for field in [e.compute_dtype, e.kv_dtype].into_iter().flatten() {
+            for field in [e.compute_dtype, e.compute_dtype_override, e.kv_dtype]
+                .into_iter()
+                .flatten()
+            {
                 assert!(
                     e.config.contains(&field),
                     "{}: {field} not in config",

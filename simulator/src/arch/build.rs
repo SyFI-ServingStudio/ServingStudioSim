@@ -10,7 +10,6 @@
 //! caller supplies `name` — the model's dotted-leaf prefix (`"unified"` / `"pd"`)
 //! — so each deployment's cost manifests read naturally.
 
-use std::fs::File;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -20,31 +19,39 @@ use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, Routi
 use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::ep_comm::EpCommConfig;
 use crate::arch::hisparse::HisparseConfig;
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
+use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use crate::arch::{
-    deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
+    deepseek_v41_vllm, deepseek_v41_vllm_dp_attn_ep_moe, deepseek_v41_vllm_dp_attn_ep_moe_dspark, deepseek_v41_vllm_dspark,
+    deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
     glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
     glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
-    glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_flash_vllm_nvfp4_dflash2,
-    glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
-    qwen36_local, qwen3_attn_layerwise, qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise,
-    qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn,
-    AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel,
-    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
-    DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg,
-    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
-    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel,
-    Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel,
-    Glm53FlashKernelPath, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel,
-    Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel, Glm53FlashVllmParallel,
-    Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
-    Llama3DpAttnTpFfnModel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
+    glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_flash_vllm_nvfp4_dflash2, glm53_vllm_nvfp4_dsa_moe_dflash2,
+    inkling_vllm_nvfp4_rel_attn_moe, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
+    mimo_v2_vllm_fp8_swa_moe, qwen35_vllm_nvfp4_gdn_dense, qwen36_local, qwen3_attn_layerwise,
+    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
+    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, qwen4_exp_vllm_nvfp4_gdn_qsa_moe,
+    AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmDpDsparkModel, DeepseekV41VllmDsparkModel, DeepseekV41VllmModel,
+    DeepseekV41VllmParallel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
+    DenseParallel, DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, DsparkCfg,
+    FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel,
+    Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
+    Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel,
+    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashKernelPath,
+    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel,
+    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
+    InklingExpertDemand, InklingExpertPrecision, InklingModelCfg, InklingVllmModel,
+    InklingVllmParallel, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
+    Llama3DpAttnTpFfnModel, MimoV2ModelCfg, MimoV2VllmModel, MimoV2VllmParallel, Qwen35ModelCfg,
+    Qwen35VllmModel, Qwen35VllmParallel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
     Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
     Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
     Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
-    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel, Qwen4ExpModelCfg, Qwen4ExpVllmParallel,
+    Qwen4ExpVllmSpeculativeModel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -323,15 +330,17 @@ fn load_expert_popularity(
     expected_num_moe_layers: u32,
     expected_experts_per_token: u32,
 ) -> Result<RoutingDistribution> {
-    let profile_file =
-        File::open(path).with_context(|| format!("opening expert popularity profile {path}"))?;
-    let profile_value: serde_json::Value = serde_json::from_reader(profile_file)
-        .with_context(|| format!("parsing expert popularity profile {path}"))?;
-    let version: ExpertPopularityVersion = serde_json::from_value(profile_value.clone())
-        .with_context(|| format!("reading expert popularity schema_version from {path}"))?;
+    // Read whole, then parse the bytes: `serde_json::from_reader` on an
+    // unbuffered `File` issues one read syscall per byte. The version and the
+    // profile are each parsed from the bytes rather than through a `Value`
+    // tree, which would be cloned for the version alone.
+    let profile_bytes =
+        std::fs::read(path).with_context(|| format!("reading expert popularity profile {path}"))?;
+    let version: ExpertPopularityVersion = serde_json::from_slice(&profile_bytes)
+        .with_context(|| format!("parsing expert popularity schema_version from {path}"))?;
     let (num_logical_experts, counts_by_layer, legacy_ratios) = match version.schema_version {
         1 => {
-            let profile: ExpertPopularityProfileV1 = serde_json::from_value(profile_value)
+            let profile: ExpertPopularityProfileV1 = serde_json::from_slice(&profile_bytes)
                 .with_context(|| format!("parsing legacy expert popularity v1 profile {path}"))?;
             let ratios = if profile.counts_by_layer.is_empty()
                 && profile.probabilities_all_layers.len() == expected_num_experts as usize
@@ -367,7 +376,7 @@ fn load_expert_popularity(
             (profile.num_logical_experts, profile.counts_by_layer, ratios)
         }
         2 | 3 | 4 => {
-            let profile: ExpertPopularityProfile = serde_json::from_value(profile_value)
+            let profile: ExpertPopularityProfile = serde_json::from_slice(&profile_bytes)
                 .with_context(|| {
                     format!(
                         "parsing strict expert popularity v{} profile {path}",
@@ -1005,8 +1014,9 @@ pub fn deepseek_v4_vllm(
 /// routed layers, verify width 1 (no speculative decoding). The MoE rows were
 /// profiled on the capture's token corpus, so `routing = corpus` is the
 /// production choice. `serialize_streams` changes only CostTree composition;
-/// `decoder_swa_bounded_replay` (a counterfactual, see
-/// [`deepseek_v41_vllm::BoundedReplay`]) changes only the late layers' inputs.
+/// `decoder_swa_bounded_replay` (vLLM's default, see
+/// [`deepseek_v41_vllm::BoundedReplay`]) adds the replay boundary and runs the
+/// layers from the cut on the replay batch.
 #[allow(clippy::too_many_arguments)]
 pub fn deepseek_v41_vllm(
     model_spec: &ModelSpec,
@@ -1017,6 +1027,8 @@ pub fn deepseek_v41_vllm(
     serialize_streams: bool,
     decoder_swa_bounded_replay: bool,
     max_model_len: Option<u32>,
+    max_num_batched_tokens: u32,
+    cudagraph_capture_sizes: &[u32],
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1033,6 +1045,8 @@ pub fn deepseek_v41_vllm(
             max_model_len,
             model_cfg.max_position_embeddings,
         )?,
+        max_num_batched_tokens,
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
     };
     let source = ExpertDemandSource {
         kind: routing_kind,
@@ -1050,6 +1064,216 @@ pub fn deepseek_v41_vllm(
     let resolved = deepseek_v41_vllm::resolve_configs(&configs);
     deepseek_v41_vllm::build(name.to_string(), resolved, bridge)
         .context("building DeepSeek-V4.1-Flash vLLM model (often a missing profile.db row)")
+}
+
+/// Build DeepSeek-V4.1-Flash + DSpark: the TP4/EP4 target priced at verify
+/// width `draft_tokens + 1`, plus the DSpark proposer.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v41_vllm_dspark(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    max_model_len: Option<u32>,
+    draft_tokens: u32,
+    decoder_swa_bounded_replay: bool,
+    max_num_batched_tokens: u32,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<DeepseekV41VllmDsparkModel> {
+    let config_path = Path::new(&model_spec.model_config);
+    let model_cfg = DeepseekV41ModelCfg::from_json(config_path, model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let dspark = DsparkCfg::from_json(config_path).context("loading the DSpark config")?;
+    let parallel = DeepseekV41VllmParallel {
+        tp_size: deepseek_v41_vllm::TP_SIZE,
+        ep_size: deepseek_v41_vllm::EP_SIZE,
+        gpu_name: gpu.to_string(),
+        serialize_streams: false,
+        decoder_swa_bounded_replay,
+        max_model_len: deepseek_v41_vllm::resolve_max_model_len(
+            max_model_len,
+            model_cfg.max_position_embeddings,
+        )?,
+        max_num_batched_tokens,
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let (target_demand, draft_demand) = dspark_demands(
+        &model_cfg,
+        &dspark,
+        parallel.ep_size as u16,
+        routing_kind,
+        routing_seed,
+        expert_popularity_file,
+        token_corpus_file,
+        draft_tokens,
+    )?;
+    let target = deepseek_v41_vllm::build_configs(&model_cfg, &parallel, &target_demand)
+        .context("expanding DeepSeek-V4.1-Flash target configs")?;
+    let configs = deepseek_v41_vllm_dspark::build_configs(
+        &model_cfg,
+        &dspark,
+        &parallel,
+        target,
+        &draft_demand,
+        draft_tokens,
+    )
+    .context("expanding the DSpark proposer configs")?;
+    let resolved = deepseek_v41_vllm_dspark::resolve_configs(configs);
+    deepseek_v41_vllm_dspark::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash + DSpark (often a missing profile.db row)")
+}
+
+/// Build DeepSeek-V4.1-Flash under vLLM DP4 attention + EP4 experts (B200,
+/// TP1 per rank). Routed demand resolves as for [`deepseek_v41_vllm`]: one
+/// binding over all 40 routed layers, verify width 1.
+pub fn deepseek_v41_vllm_dp_attn_ep_moe(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    max_model_len: Option<u32>,
+    decoder_swa_bounded_replay: bool,
+    max_num_batched_tokens: u32,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<deepseek_v41_vllm_dp_attn_ep_moe::DeepseekV41VllmDpModel> {
+    let model_cfg = DeepseekV41ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let parallel = deepseek_v41_vllm_dp_attn_ep_moe::DeepseekV41VllmDpParallel {
+        gpu_name: gpu.to_string(),
+        max_model_len: deepseek_v41_vllm::resolve_max_model_len(
+            max_model_len,
+            model_cfg.max_position_embeddings,
+        )?,
+        decoder_swa_bounded_replay,
+        max_num_batched_tokens,
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.top_k,
+        ep_size: deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE as u16,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_layers,
+    };
+    let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
+    let configs = deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding DeepSeek-V4.1-Flash DP4/EP4 architecture configs")?;
+    let resolved = deepseek_v41_vllm_dp_attn_ep_moe::resolve_configs(&configs);
+    deepseek_v41_vllm_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash DP4/EP4 model (often a missing profile.db row)")
+}
+
+/// Build DeepSeek-V4.1-Flash + DSpark under DP4 attention + EP4 experts: the
+/// DP target priced at verify width `draft_tokens + 1`, plus the proposer with
+/// its EP-sharded draft MoE.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v41_vllm_dp_attn_ep_moe_dspark(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    max_model_len: Option<u32>,
+    draft_tokens: u32,
+    decoder_swa_bounded_replay: bool,
+    max_num_batched_tokens: u32,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<DeepseekV41VllmDpDsparkModel> {
+    let config_path = Path::new(&model_spec.model_config);
+    let model_cfg = DeepseekV41ModelCfg::from_json(config_path, model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let dspark = DsparkCfg::from_json(config_path).context("loading the DSpark config")?;
+    let parallel = deepseek_v41_vllm_dp_attn_ep_moe::DeepseekV41VllmDpParallel {
+        gpu_name: gpu.to_string(),
+        max_model_len: deepseek_v41_vllm::resolve_max_model_len(
+            max_model_len,
+            model_cfg.max_position_embeddings,
+        )?,
+        decoder_swa_bounded_replay,
+        max_num_batched_tokens,
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let ep_size = deepseek_v41_vllm_dp_attn_ep_moe::DP_SIZE as u16;
+    let (target_demand, draft_demand) = dspark_demands(
+        &model_cfg,
+        &dspark,
+        ep_size,
+        routing_kind,
+        routing_seed,
+        expert_popularity_file,
+        token_corpus_file,
+        draft_tokens,
+    )?;
+    let target =
+        deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &target_demand)
+            .context("expanding DeepSeek-V4.1-Flash DP4/EP4 target configs")?;
+    let configs = deepseek_v41_vllm_dp_attn_ep_moe_dspark::build_configs(
+        &model_cfg,
+        &dspark,
+        &parallel,
+        target,
+        &draft_demand,
+        draft_tokens,
+    )
+    .context("expanding the DP DSpark proposer configs")?;
+    let resolved = deepseek_v41_vllm_dp_attn_ep_moe_dspark::resolve_configs(configs);
+    deepseek_v41_vllm_dp_attn_ep_moe_dspark::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash DP4 + DSpark (often a missing profile.db row)")
+}
+
+/// The target's routed demand at the verify width and the draft MoE's
+/// uniform demand (draft routes are not captured, design D1).
+#[allow(clippy::too_many_arguments)]
+fn dspark_demands(
+    model_cfg: &DeepseekV41ModelCfg,
+    dspark: &DsparkCfg,
+    ep_size: u16,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    draft_tokens: u32,
+) -> Result<(ExpertDemand, ExpertDemand)> {
+    let verify_width = draft_tokens
+        .checked_add(1)
+        .context("speculative draft_tokens + 1 overflows u32")?;
+    let target = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.top_k,
+        ep_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_layers,
+    }
+    .demand(0..model_cfg.num_layers as usize, verify_width)?;
+    let draft = ExpertDemandSource {
+        kind: RoutingKind::Uniform,
+        seed: None,
+        num_experts: dspark.num_experts,
+        experts_per_token: dspark.top_k,
+        ep_size,
+        expert_popularity_file: None,
+        token_corpus_file: None,
+        num_routed_layers: 1,
+    }
+    .demand(0..1, 1)?;
+    Ok((target, draft))
 }
 
 /// Build the GLM-5.2 model in aligned vLLM kernel granularity.
@@ -1510,6 +1734,234 @@ fn glm53_flash_model_and_demand(
     // a speculative verify.
     let demand = source.demand(0..routed_layers as usize, verify_width)?;
     Ok((model_cfg, demand))
+}
+
+/// Build an Inkling ModelOpt NVFP4 checkpoint's graph under one vLLM TP group
+/// (routed experts EP = TP, or MoE TP).
+///
+/// The checkpoint's layer schedule is exact, so layer-count overrides are
+/// rejected. Routing is resolved per expert precision over that precision's
+/// slice of the MoE layer axis (Inkling-Small: layer 2's BF16 experts are
+/// corpus layer 0, the NVFP4 layers 3..41 are corpus layers 1..40); a corpus
+/// captured with MTP off records exactly the MoE layers.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling_vllm_nvfp4_rel_attn_moe(
+    model_spec: &ModelSpec,
+    tp_size: u16,
+    enable_expert_parallel: bool,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<InklingVllmModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "Inkling architecture rejects num_layers/sim_num_layers overrides; the exact \
+             local/global and dense/MoE layer schedule is required"
+        );
+    }
+    anyhow::ensure!(
+        !model_spec.fp8,
+        "Inkling NVFP4: set fp8: false (the checkpoint is ModelOpt NVFP4)"
+    );
+    let model_cfg = InklingModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading Inkling config")?;
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.n_routed_experts,
+        experts_per_token: model_cfg.num_experts_per_tok,
+        ep_size: if enable_expert_parallel { tp_size } else { 1 },
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_moe_layers(),
+    };
+    // Ordinary decode: one row per request, so a verify block is one token.
+    let demand_for = |precision: InklingExpertPrecision| -> Result<Option<ExpertDemand>> {
+        model_cfg
+            .moe_layer_range(precision)?
+            .map(|layers| source.demand(layers, 1))
+            .transpose()
+    };
+    let demand = InklingExpertDemand {
+        nvfp4: demand_for(InklingExpertPrecision::Nvfp4)?,
+        bf16: demand_for(InklingExpertPrecision::Bf16)?,
+    };
+    let parallel = InklingVllmParallel {
+        tp_size,
+        enable_expert_parallel,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let configs = inkling_vllm_nvfp4_rel_attn_moe::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding Inkling architecture configs")?;
+    let resolved = inkling_vllm_nvfp4_rel_attn_moe::resolve_configs(&configs);
+    inkling_vllm_nvfp4_rel_attn_moe::build(name.to_string(), resolved, bridge)
+        .context("building Inkling model (often a missing profile.db row)")
+}
+
+/// Build a MiMo-V2 FP8 checkpoint's graph under one vLLM TP group with the
+/// routed experts EP = TP.
+///
+/// The checkpoint's global / sliding-window and dense / MoE layer schedule is
+/// exact, so layer-count overrides are rejected. Routing is resolved over the
+/// MoE layers (a corpus captured with MTP off records exactly those).
+#[allow(clippy::too_many_arguments)]
+pub fn mimo_v2_vllm_fp8_swa_moe(
+    model_spec: &ModelSpec,
+    tp_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<MimoV2VllmModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "MiMo-V2 architecture rejects num_layers/sim_num_layers overrides; the exact \
+             global/sliding-window and dense/MoE layer schedule is required"
+        );
+    }
+    anyhow::ensure!(
+        model_spec.fp8,
+        "MiMo-V2: set fp8: true (the checkpoint's linears are block FP8)"
+    );
+    let model_cfg = MimoV2ModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading MiMo-V2 config")?;
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.n_routed_experts,
+        experts_per_token: model_cfg.num_experts_per_tok,
+        ep_size: tp_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_moe_layers(),
+    };
+    // Ordinary decode: one row per request, so a verify block is one token.
+    let demand = source.demand(0..model_cfg.num_moe_layers() as usize, 1)?;
+    let parallel = MimoV2VllmParallel {
+        tp_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let configs = mimo_v2_vllm_fp8_swa_moe::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding MiMo-V2 architecture configs")?;
+    let resolved = mimo_v2_vllm_fp8_swa_moe::resolve_configs(&configs);
+    mimo_v2_vllm_fp8_swa_moe::build(name.to_string(), resolved, bridge)
+        .context("building MiMo-V2 model (often a missing profile.db row)")
+}
+
+/// Build a Qwen3.5-family ModelOpt mixed-precision checkpoint on one GPU under
+/// vLLM. The exact GDN / GQA layer schedule is the checkpoint's, so
+/// layer-count overrides are rejected; the linears' precisions come from its
+/// `quantization_config`.
+pub fn qwen35_vllm_nvfp4_gdn_dense(
+    model_spec: &ModelSpec,
+    max_model_len: u32,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen35VllmModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "Qwen3.5 GDN architecture rejects num_layers/sim_num_layers overrides; the exact \
+             GDN/GQA layer schedule is required"
+        );
+    }
+    let model_cfg = Qwen35ModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading Qwen3.5 config")?;
+    let parallel = Qwen35VllmParallel {
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let configs = qwen35_vllm_nvfp4_gdn_dense::build_configs(&model_cfg, &parallel)
+        .context("expanding Qwen3.5 architecture configs")?;
+    let resolved = qwen35_vllm_nvfp4_gdn_dense::resolve_configs(&configs);
+    qwen35_vllm_nvfp4_gdn_dense::build(name.to_string(), resolved, bridge)
+        .context("building Qwen3.5 model (often a missing profile.db row)")
+}
+
+/// Build the one-GPU Qwen4Exp (Qwen3.8-Flash-Next) NVFP4 model with its MTP
+/// layer drafting `draft_tokens` per request.
+///
+/// The checkpoint's layer schedule is exact, so layer-count overrides are
+/// rejected. Routing is resolved over the body's routed layers; a corpus
+/// captured with MTP on records the MTP layer as one more.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative(
+    model_spec: &ModelSpec,
+    max_model_len: u32,
+    draft_tokens: u32,
+    kv_cache_dtype: Qwen4ExpCacheDtype,
+    indexer_kv_dtype: Qwen4ExpCacheDtype,
+    ple_table_residency: PleTableResidency,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen4ExpVllmSpeculativeModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "Qwen4Exp architecture rejects num_layers/sim_num_layers overrides; the exact \
+             GDN/QSA layer schedule is required"
+        );
+    }
+    let model_cfg = Qwen4ExpModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading Qwen4Exp config")?;
+    let routed_layers = model_cfg.num_layers();
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.experts_per_token,
+        ep_size: 1,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: routed_layers,
+    };
+    // A verify step carries `draft_tokens + 1` rows per request, as does the
+    // MTP's first pass; its later passes carry one.
+    let verify_width = draft_tokens
+        .checked_add(1)
+        .context("speculative draft_tokens + 1 overflows u32")?;
+    let body = routed_layers as usize;
+    let demand = qwen4_exp_vllm_nvfp4_gdn_qsa_moe::Qwen4ExpDemand {
+        body: source.demand(0..body, verify_width)?,
+        mtp: source.demand(body..body + 1, verify_width)?,
+        mtp_recurrent: source.demand(body..body + 1, 1)?,
+    };
+    let parallel = Qwen4ExpVllmParallel {
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        draft_tokens,
+        kv_cache_dtype,
+        indexer_kv_dtype,
+        ple_table_residency,
+    };
+    let configs = qwen4_exp_vllm_nvfp4_gdn_qsa_moe::build_configs(&model_cfg, &parallel, demand)
+        .context("expanding Qwen4Exp architecture configs")?;
+    let resolved = qwen4_exp_vllm_nvfp4_gdn_qsa_moe::resolve_configs(&configs);
+    qwen4_exp_vllm_nvfp4_gdn_qsa_moe::build(name.to_string(), resolved, bridge)
+        .context("building Qwen4Exp model (often a missing profile.db row)")
 }
 
 /// Build the B200 GLM-5.3-Flash FP8 graph under pure pipeline parallelism:
@@ -2334,6 +2786,8 @@ pub fn build_iter_model(
             token_corpus_file,
             decoder_swa_bounded_replay,
             max_model_len,
+            max_num_batched_tokens,
+            cudagraph_capture_sizes,
         } => Box::new(deepseek_v41_vllm(
             model,
             *routing,
@@ -2343,6 +2797,8 @@ pub fn build_iter_model(
             false,
             *decoder_swa_bounded_replay,
             *max_model_len,
+            *max_num_batched_tokens,
+            cudagraph_capture_sizes,
             gpu,
             name,
             bridge,
@@ -2355,6 +2811,8 @@ pub fn build_iter_model(
             token_corpus_file,
             decoder_swa_bounded_replay,
             max_model_len,
+            max_num_batched_tokens,
+            cudagraph_capture_sizes,
         } => Box::new(deepseek_v41_vllm(
             model,
             *routing,
@@ -2364,6 +2822,32 @@ pub fn build_iter_model(
             true,
             *decoder_swa_bounded_replay,
             *max_model_len,
+            *max_num_batched_tokens,
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::DeepseekV41VllmDpAttnEpMoe {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            max_model_len,
+            decoder_swa_bounded_replay,
+            max_num_batched_tokens,
+            cudagraph_capture_sizes,
+        } => Box::new(deepseek_v41_vllm_dp_attn_ep_moe(
+            model,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            *max_model_len,
+            *decoder_swa_bounded_replay,
+            *max_num_batched_tokens,
+            cudagraph_capture_sizes,
             gpu,
             name,
             bridge,
@@ -2522,6 +3006,64 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
+        IterArchSel::InklingVllmNvfp4RelAttnMoe {
+            model,
+            tp_size,
+            enable_expert_parallel,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Box::new(inkling_vllm_nvfp4_rel_attn_moe(
+            model,
+            *tp_size,
+            *enable_expert_parallel,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::MimoV2VllmFp8SwaMoe {
+            model,
+            tp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Box::new(mimo_v2_vllm_fp8_swa_moe(
+            model,
+            *tp_size,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Qwen35VllmNvfp4GdnDense {
+            model,
+            max_model_len,
+            cudagraph_capture_sizes,
+        } => Box::new(qwen35_vllm_nvfp4_gdn_dense(
+            model,
+            *max_model_len,
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
         IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe {
             model,
             pp_size,
@@ -2604,7 +3146,10 @@ pub fn build_iter_model(
         | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
         | IterArchSel::Glm53VllmNvfp4DpAttnEpMoeDflash2 { .. }
         | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { .. }
-        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. } => {
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. }
+        | IterArchSel::DeepseekV41VllmDspark { .. }
+        | IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark { .. }
+        | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
         }
     })
@@ -2691,6 +3236,95 @@ pub fn build_speculative_iter_model(
         IterArchSel::Glm53VllmNvfp4DpAttnEpMoeDflash2 { draft_tokens, .. } => Ok((
             Box::new(glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(
                 selector, gpu, name, bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::DeepseekV41VllmDspark {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            max_model_len,
+            draft_tokens,
+            decoder_swa_bounded_replay,
+            max_num_batched_tokens,
+            cudagraph_capture_sizes,
+        } => Ok((
+            Box::new(deepseek_v41_vllm_dspark(
+                model,
+                *routing,
+                *routing_seed,
+                expert_popularity_file.as_deref(),
+                token_corpus_file.as_deref(),
+                *max_model_len,
+                *draft_tokens,
+                *decoder_swa_bounded_replay,
+                *max_num_batched_tokens,
+                cudagraph_capture_sizes,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            max_model_len,
+            draft_tokens,
+            decoder_swa_bounded_replay,
+            max_num_batched_tokens,
+            cudagraph_capture_sizes,
+        } => Ok((
+            Box::new(deepseek_v41_vllm_dp_attn_ep_moe_dspark(
+                model,
+                *routing,
+                *routing_seed,
+                expert_popularity_file.as_deref(),
+                token_corpus_file.as_deref(),
+                *max_model_len,
+                *draft_tokens,
+                *decoder_swa_bounded_replay,
+                *max_num_batched_tokens,
+                cudagraph_capture_sizes,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative {
+            model,
+            max_model_len,
+            draft_tokens,
+            kv_cache_dtype,
+            indexer_kv_dtype,
+            ple_table_residency,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Ok((
+            Box::new(qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative(
+                model,
+                *max_model_len,
+                *draft_tokens,
+                *kv_cache_dtype,
+                *indexer_kv_dtype,
+                *ple_table_residency,
+                *routing,
+                *routing_seed,
+                expert_popularity_file.as_deref(),
+                token_corpus_file.as_deref(),
+                cudagraph_capture_sizes,
+                gpu,
+                name,
+                bridge,
             )?),
             *draft_tokens,
         )),
@@ -2784,6 +3418,10 @@ pub struct ArchBuild {
     pub predict: Option<PredictShape>,
     /// The cost tree, in the `cost_manifest/*.json` form; `None` on error.
     pub cost_manifest: Option<crate::timing::CostManifestDoc>,
+    /// What the arch alone fixes about its KV cache; `None` for an FFN side,
+    /// which holds none, and on error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_cache: Option<ArchKvCache>,
     /// The kernel configs the build asks profile.db for, as
     /// [`config_records_document`](crate::timing::bridge::config_records_document)
     /// builds; only when asked for, and `None` on error.
@@ -2828,9 +3466,39 @@ impl PredictShape {
     }
 }
 
+/// The arch's half of a KV report: its declared layout and how many GPUs one
+/// partition spans. Budget, `kv_overhead`, prefix caching and tokens in flight
+/// come from the worker, so the concurrency is in a run's `raw/kv_cache.json`
+/// (or `launcher <preset> --kv-report`), not here.
+#[derive(Debug, serde::Serialize)]
+pub struct ArchKvCache {
+    /// GPUs one KV partition spans; the layout's bytes are over all of them,
+    /// so divide by this for one GPU. Partitions per replica are the
+    /// prediction shape's `groups`.
+    pub attention_shards: u16,
+    pub layout: KvCacheLayout,
+}
+
+impl ArchKvCache {
+    /// The arch's report half, rejecting a layout whose parts do not sit on
+    /// the partition's `attention_shards` ranks.
+    fn new(attention_shards: u16, layout: KvCacheLayout) -> Result<Self> {
+        layout.check_placement(attention_shards)?;
+        Ok(Self {
+            attention_shards,
+            layout,
+        })
+    }
+}
+
 /// What a structure-only build returns: the replica width, its prediction case
-/// shape and its cost tree.
-type Built = (u16, PredictShape, crate::timing::CostManifestDoc);
+/// shape, its cost tree and its KV cache.
+type Built = (
+    u16,
+    PredictShape,
+    crate::timing::CostManifestDoc,
+    Option<ArchKvCache>,
+);
 
 /// The dotted-leaf prefix a deployment gives its model, which starts every leaf
 /// name and kernel-config role. Arch builds use the deployment's own, as
@@ -2885,6 +3553,7 @@ pub fn build_arch_blocks(blocks: &[ArchBlock], kernel_configs: bool) -> Vec<Arch
                     gpus_per_replica: None,
                     predict: None,
                     cost_manifest: None,
+                    kv_cache: None,
                     kernel_configs: None,
                     slot_configs: None,
                     error: Some(format!("no arch contract provides {tag:?}")),
@@ -2931,12 +3600,15 @@ fn build_arch(
             |selector: &IterArchSel, gpu, bridge| {
                 // A speculative arch builds a different model type, with its
                 // own tree: the verify pass plus its draft passes.
-                let (gpus, shape, manifest) = match selector {
+                let (gpus, shape, manifest, kv_cache) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
                     | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. }
                     | IterArchSel::Glm53VllmNvfp4DpAttnEpMoeDflash2 { .. }
                     | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { .. }
-                    | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. } => {
+                    | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. }
+                    | IterArchSel::DeepseekV41VllmDspark { .. }
+                    | IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark { .. }
+                    | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
                         let (model, draft_tokens) = build_speculative_iter_model(
                             selector,
                             gpu,
@@ -2948,7 +3620,14 @@ fn build_arch(
                             max_model_len: Some(selector.max_model_len()?),
                             ..PredictShape::new("speculative_iter", model.num_attn_dp_groups())
                         };
-                        (model.gpus_per_replica(), shape, model.cost_log_manifest())
+                        let kv_cache =
+                            ArchKvCache::new(model.num_attn_shards(), model.kv_cache_layout())?;
+                        (
+                            model.gpus_per_replica(),
+                            shape,
+                            model.cost_log_manifest(),
+                            kv_cache,
+                        )
                     }
                     _ => {
                         let model = build_iter_model(selector, gpu, UNIFIED_MODEL_NAME, bridge)?;
@@ -2956,13 +3635,21 @@ fn build_arch(
                             max_model_len: Some(selector.max_model_len()?),
                             ..PredictShape::new("iter", model.num_attn_dp_groups())
                         };
-                        (model.gpus_per_replica(), shape, model.cost_log_manifest())
+                        let kv_cache =
+                            ArchKvCache::new(model.num_attn_shards(), model.kv_cache_layout())?;
+                        (
+                            model.gpus_per_replica(),
+                            shape,
+                            model.cost_log_manifest(),
+                            kv_cache,
+                        )
                     }
                 };
                 Ok((
                     gpus,
                     shape,
                     crate::timing::CostManifestDoc::single("iter", manifest),
+                    Some(kv_cache),
                 ))
             },
         ),
@@ -2976,7 +3663,13 @@ fn build_arch(
                     max_model_len: Some(selector.max_model_len()?),
                     ..PredictShape::new("attn", model.num_attn_dp_groups())
                 };
-                Ok((model.gpus_per_replica(), shape, model.cost_log_manifest()))
+                let kv_cache = ArchKvCache::new(model.num_attn_shards(), model.kv_cache_layout())?;
+                Ok((
+                    model.gpus_per_replica(),
+                    shape,
+                    model.cost_log_manifest(),
+                    Some(kv_cache),
+                ))
             },
         ),
         _ => build_selector(
@@ -2986,7 +3679,12 @@ fn build_arch(
             |selector: &FfnArchSel, gpu, bridge| {
                 let model = build_ffn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
                 let shape = PredictShape::new("ffn", model.num_dp_groups());
-                Ok((model.gpus_per_replica(), shape, model.cost_log_manifest()))
+                Ok((
+                    model.gpus_per_replica(),
+                    shape,
+                    model.cost_log_manifest(),
+                    None,
+                ))
             },
         ),
     };
@@ -2998,14 +3696,16 @@ fn build_arch(
         gpus_per_replica: None,
         predict: None,
         cost_manifest: None,
+        kv_cache: None,
         kernel_configs: None,
         slot_configs: None,
         error: None,
     };
     match built {
-        Ok(((gpus_per_replica, shape, manifest), configs)) => {
+        Ok(((gpus_per_replica, shape, manifest, kv_cache), configs)) => {
             out.gpus_per_replica = Some(gpus_per_replica);
             out.predict = Some(shape);
+            out.kv_cache = kv_cache;
             if let Some((document, slots)) = configs {
                 out.kernel_configs = Some(document);
                 out.slot_configs = Some(slots);
@@ -3107,6 +3807,16 @@ mod tests {
 
     use super::*;
 
+    /// One request's fixed state in a layout: its per-request parts' bytes.
+    fn per_request_bytes(layout: &KvCacheLayout) -> u64 {
+        layout
+            .parts
+            .iter()
+            .filter(|part| part.growth == crate::arch::kv_layout::KvGrowth::PerRequest)
+            .map(|part| part.bytes_per_entry)
+            .sum()
+    }
+
     #[test]
     fn glm53_flash_kernel_path_reads_the_layout_params() {
         // Kernel backends are no longer arch params (the run config's
@@ -3150,7 +3860,7 @@ mod tests {
         let built = build_iter_model(&selector, "NVIDIA H200", "test", &bridge)
             .expect("build exact local Qwen3.6 model");
         assert_eq!(built.gpus_per_replica(), 1);
-        assert_eq!(built.total_kv_bytes_per_token(), 20_480);
+        assert_eq!(built.kv_cache_layout().per_token_bytes(), 20_480);
         assert_eq!(built.cost_log_manifest().slots.len(), 72);
     }
 
@@ -3770,11 +4480,11 @@ mod tests {
         assert_eq!(model.num_attn_dp_groups(), 8);
         assert_eq!(model.num_attn_shards(), 1);
         assert_eq!(model.drafting_slots_per_request(), 7);
-        assert_eq!(model.recurrent_state_bytes_per_request(), 0);
+        assert_eq!(per_request_bytes(&model.kv_cache_layout()), 0);
         // 78 layers x 576 B of MLA latent, 21 full-index layers x 132 B of index
         // key, plus six draft layers
         // x 8 KV heads x 128 x K/V x fp8, all on the one rank holding the token.
-        assert_eq!(model.total_kv_bytes_per_token(), 47_700 + 12_288);
+        assert_eq!(model.kv_cache_layout().per_token_bytes(), 47_700 + 12_288);
 
         let group = |decodes: usize| SpeculativeArchGroupInput {
             batch_tokens: decodes as u32 * 8,
@@ -3859,11 +4569,12 @@ mod tests {
         )
         .unwrap();
         assert!(plain.kv_host_offload().is_none());
-        assert_eq!(plain.total_kv_bytes_per_token(), 11 * (512 + 33));
-        assert_eq!(model.total_kv_bytes_per_token(), 11 * 33);
+        assert_eq!(plain.kv_cache_layout().per_token_bytes(), 11 * (512 + 33));
+        assert_eq!(model.kv_cache_layout().per_token_bytes(), 11 * 33);
+        // The KDA state and the draft window stay; the latent buffer joins them.
         assert_eq!(
-            model.recurrent_state_bytes_per_request(),
-            plain.recurrent_state_bytes_per_request()
+            per_request_bytes(&model.kv_cache_layout()),
+            per_request_bytes(&plain.kv_cache_layout()) + 49_152 * 11 * 512
         );
         assert_eq!(
             model.kv_host_offload(),
@@ -3915,12 +4626,15 @@ mod tests {
             &bridge,
         )
         .unwrap();
-        assert_eq!(model.total_kv_bytes_per_token(), 2_772);
-        assert_eq!(model.recurrent_state_bytes_per_request(), 0);
+        assert_eq!(model.kv_cache_layout().per_token_bytes(), 2_772);
+        assert_eq!(
+            per_request_bytes(&model.kv_cache_layout()),
+            8192 * 44_928 + 2048 * 12_288
+        );
         assert_eq!(
             model.kv_host_offload(),
             Some(KvHostOffload {
-                device_bytes_per_request: 8192 * 44_928 + 2048 * 12_288,
+                device_bytes_per_request: 8192 * 44_928,
                 host_bytes_per_token: 44_928,
                 host_bytes_per_partition: 250_000_000_000,
             })
@@ -3940,7 +4654,7 @@ mod tests {
         )
         .unwrap();
         assert!(plain.kv_host_offload().is_none());
-        assert_eq!(plain.total_kv_bytes_per_token(), 47_700 + 12_288);
+        assert_eq!(plain.kv_cache_layout().per_token_bytes(), 47_700 + 12_288);
     }
 
     /// Catches a bf16 KDA pool that does not reach the RecoverSSM rows: the
@@ -4190,7 +4904,7 @@ mod tests {
         );
         // total KV bytes: 2 (k+v) × kv_heads × head_dim × kv_dtype × layers.
         assert_eq!(
-            attn_cfgs.total_kv_bytes_per_token.get() as u64,
+            attn_cfgs.kv_cache_part.bytes_per_entry,
             2 * model.num_kv_heads.get() as u64
                 * model.head_dim.get() as u64
                 * model.kv_dtype.size_bytes() as u64
@@ -4236,7 +4950,7 @@ mod tests {
             q_dim * 1
         );
         assert_eq!(
-            attn_cfgs.total_kv_bytes_per_token.get() as u64,
+            attn_cfgs.kv_cache_part.bytes_per_entry,
             2 * model.num_kv_heads.get() as u64
                 * model.head_dim.get() as u64
                 * 1
@@ -4329,6 +5043,39 @@ mod tests {
         // 6 layers * 8 KV heads * 128 * 2 (K and V) * 1 byte, summed over the
         // four attention ranks the heads are sharded across.
         assert_eq!(narrow_bytes, 6 * 8 * 128 * 2);
+
+        // With the target's 78 latents and 21 index keys, the pool matches the
+        // fork's GLM-5.3 DFlash2 logs at 131072 tokens: "GPU KV cache size:
+        // 779,136 tokens ... 5.94x" at 36.84 GiB, 912,832 / 6.96x at 43.17.
+        use crate::arch::glm52_model_cfg::Glm52MtpMode;
+        use crate::arch::kv_layout::KvCachePart;
+        use crate::worker::kv::{KvAccounting, KvAccountingOptions};
+        let layout = crate::arch::glm52_vllm_nvfp4_dsa_moe::kv_cache_layout(4, Glm52MtpMode::Off)
+            .with_part(KvCachePart::per_token("dflash2_draft", narrow_bytes));
+        assert_eq!(
+            layout.per_token_bytes(),
+            4 * (78 * 576 + 21 * 132 + 6 * 8 * 128 * 2 / 4)
+        );
+        for (gib_per_rank, logged_tokens, logged) in
+            [(36.84, 779_136, 5.94), (43.17, 912_832, 6.96)]
+        {
+            let budget = (gib_per_rank * f64::from(1u32 << 30)) as u64 * 4;
+            let tokens = budget / layout.per_token_bytes();
+            assert!(
+                (tokens as f64 / f64::from(logged_tokens) - 1.0).abs() < 0.005,
+                "{tokens}"
+            );
+            let options = KvAccountingOptions {
+                prefix_caching: true,
+                ..Default::default()
+            };
+            let accounting = KvAccounting::resolve(&layout, options, budget).unwrap();
+            let concurrency = accounting.concurrency_at(131_072);
+            assert!(
+                (concurrency / logged - 1.0).abs() < 0.005,
+                "{concurrency} vs {logged}"
+            );
+        }
     }
 
     #[test]
@@ -4492,6 +5239,49 @@ mod tests {
                 ("attn", 1, None, Some(40_960)),
                 ("iter", 4, None, Some(40_960)),
                 ("speculative_iter", 1, Some(6), Some(8192)),
+            ]
+        );
+    }
+
+    /// An attention-holding build carries the arch's KV layout and how many
+    /// GPUs one partition spans (bytes over all of them); an FFN side, none.
+    #[test]
+    fn arch_blocks_carry_their_kv_cache_layout() {
+        let mut blocks = sample_blocks();
+        blocks.push(arch_block(
+            "NVIDIA H200",
+            "qwen3_ffn_moe",
+            "qwen3_235b",
+            serde_json::json!({"ep_size": 4, "routing": "uniform"}),
+        ));
+        let built = build_arch_blocks(&blocks, false);
+        let kv: Vec<_> = built
+            .iter()
+            .map(|b| {
+                assert_eq!(b.error, None, "{}", b.arch);
+                b.kv_cache.as_ref().map(|kv| {
+                    let parts: Vec<_> = kv
+                        .layout
+                        .parts
+                        .iter()
+                        .map(|part| {
+                            let per_gpu = part.bytes_per_entry / u64::from(kv.attention_shards);
+                            (part.name, per_gpu)
+                        })
+                        .collect();
+                    (kv.attention_shards, parts)
+                })
+            })
+            .collect();
+        assert_eq!(
+            kv,
+            [
+                // GLM-5.2's MLA latent and indexer keys are held on each rank.
+                Some((4, vec![("mla", 44_928), ("indexer", 2_772)])),
+                // Qwen3-235B's 4 KV heads over attention TP4: one bf16 K and
+                // V head of 128 per GPU on 94 layers.
+                Some((4, vec![("gqa", 94 * 2 * 128 * 2)])),
+                None,
             ]
         );
     }

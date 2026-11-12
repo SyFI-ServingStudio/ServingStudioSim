@@ -46,9 +46,18 @@ submodule's own `LICENSE` after checkout.
 
 | Path | Upstream | Notes |
 | --- | --- | --- |
-| `alignment/profiler/vllm` | https://github.com/serendipity-zk/vllm (branch `servingstudio-alignment`) | A fork of vLLM, Apache-2.0. Used to capture instrumented traces for alignment. |
-| `alignment/profiler/sglang` | https://github.com/serendipity-zk/sglang (branch `vibesim-alignment`) | A fork of SGLang, Apache-2.0. Used to capture instrumented traces for alignment. |
 | `alignment/load_generator/req-frontend` | https://github.com/uw-syfi/request-factory (branch `main`) | Request-frontend schema/load generator, Apache-2.0. |
+
+## Reference-engine patches
+
+`reference_engines/vllm/patches/` and `reference_engines/sglang/patches/` are
+patches to vLLM (https://github.com/vllm-project/vllm) and SGLang
+(https://github.com/sgl-project/sglang), both **Apache-2.0**, and stay under
+that license. They were exported from the instrumented forks
+https://github.com/serendipity-zk/vllm (branch `servingstudio-alignment-20261107`)
+and https://github.com/serendipity-zk/sglang (branch `vibesim-alignment-20261108`).
+Each engine's `BASE` names the upstream commit they apply to and the official
+image, which is pulled, never stored here.
 
 ## Launch-only bindings over third-party kernels
 

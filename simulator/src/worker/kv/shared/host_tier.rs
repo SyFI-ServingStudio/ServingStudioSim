@@ -1,38 +1,31 @@
 //! The host half of a KV cache split between GPU and host memory (SGLang
-//! HiSparse), shared by every store that can carry one.
+//! HiSparse).
 //!
-//! The GPU keeps a fixed device buffer per request beside the per-token part
-//! the store's capacity is counted in; the host keeps each request's context.
-//! A store charges the buffer through [`ResidentPartitionState`]'s fixed
-//! per-request charge (beside any recurrent state it already charges there),
-//! so the host occupancy is derived from the existing ledgers -- resident and
-//! promised charge minus the fixed part -- and no second ledger can drift.
+//! The GPU side needs nothing here: the arch's `KvCacheLayout` declares what
+//! the GPU keeps of a token as its per-token parts and the fixed device buffer
+//! as a per-request part, and [`KvAccounting`](super::kv_accounting::KvAccounting)
+//! charges both like any other layout. The host keeps each request's context,
+//! and this tier bounds their sum. The store counts context tokens beside the
+//! units it already ledgers -- resident decodes in
+//! [`ResidentPartitionState`], reservations in the request ledger -- so the
+//! host occupancy follows the same lifecycle and no second ledger can drift.
 
-use crate::worker::kv::shared::request_ledger::RequestLedger;
 use crate::worker::kv::shared::resident_partition::ResidentPartitionState;
-use crate::worker::shared::advance_scope::PartitionId;
 
-/// The host tier, in the store's token units.
+/// The host tier of one KV partition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostKvTier {
-    /// Fixed GPU charge per resident or promised request, in units of the
-    /// per-token GPU bytes the store's capacity is counted in.
-    pub device_tokens_per_request: u64,
     /// Context tokens one partition's host memory holds.
     pub host_capacity_tokens: u64,
 }
 
 impl HostKvTier {
-    /// Context tokens promised on `partition`: each promise's charge less the
-    /// store's whole fixed charge per request (this tier's buffer plus any
-    /// recurrent state).
-    pub(crate) fn promised_context_tokens(
-        ledger: &RequestLedger,
-        partition: PartitionId,
-        fixed_tokens_per_request: u64,
-    ) -> u64 {
-        ledger.partition_promised(partition)
-            - fixed_tokens_per_request * u64::from(ledger.partition_promised_count(partition))
+    /// A tier of `host_bytes_per_partition` bytes holding
+    /// `host_bytes_per_token` per context token.
+    pub fn from_bytes(host_bytes_per_partition: u64, host_bytes_per_token: u64) -> Self {
+        Self {
+            host_capacity_tokens: host_bytes_per_partition / host_bytes_per_token.max(1),
+        }
     }
 
     /// The host half of a store's `fits`: the immediate and projected-peak

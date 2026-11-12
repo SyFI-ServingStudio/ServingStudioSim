@@ -26,6 +26,8 @@ use crate::timing::kernels::{
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
+use super::glm53_common::push_or_zero;
+
 #[derive(Clone, Debug)]
 pub struct Bf16MoeLocalWorkletConfig {
     pub hidden: Dim,
@@ -206,6 +208,19 @@ impl Bf16MoeLocalWorklet {
             &Bf16FusedMoeKernelInput {
                 num_tokens: input.num_tokens,
             },
+            ev,
+        );
+    }
+
+    /// Push zeros instead when this copy of the call does not run (a consumer
+    /// that compiles a concurrent and a serial copy, of which one runs).
+    pub fn eval_or_zero(&self, input: &Bf16MoeLocalWorkletInput, zero: bool, ev: &mut Evaluator) {
+        push_or_zero(
+            &self.fused_moe,
+            Bf16FusedMoeKernelInput {
+                num_tokens: input.num_tokens,
+            },
+            zero,
             ev,
         );
     }

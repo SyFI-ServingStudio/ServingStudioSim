@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import subprocess
 import sys
 from collections.abc import Iterable, MutableMapping
 from dataclasses import dataclass
@@ -77,23 +79,49 @@ class ContainerProfileEnv:
 
     name: str
     image: str
+    # The image's worker interpreter: the worker's entrypoint is explicit,
+    # never the image's own.
+    python: str
 
     def validate(self) -> None:
         if not self.image:
             raise ValueError(f"profiling env {self.name!r} has no container image")
         if shutil.which("docker") is None:
             raise FileNotFoundError("docker is required for container profiling")
+        # This is the first `docker` call of every container chunk (it runs
+        # before `docker run`). A Slurm job's `docker` can be a shim that starts
+        # a job-scoped runtime service in the background on first use; started
+        # from here it would join the caller's process group, outlive the caller
+        # and be reported -- and killed -- as a leaked descendant of whatever
+        # the launcher was running (the predictor). Its own session keeps a
+        # service it starts out of that group; the query itself needs no
+        # signal from the caller.
+        inspect = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", self.image],
+            capture_output=True,
+            text=True,
+            check=False,
+            start_new_session=True,
+        )
+        if inspect.returncode != 0:
+            # Never pulled: the tag names this checkout's inputs, so a registry
+            # copy under it would be some other build.
+            raise FileNotFoundError(
+                f"profiling env {self.name!r} needs image {self.image}, which this host "
+                "does not have; build it with `python -m profiling.container.images "
+                f"build {self.image.split(':')[0].removeprefix('vibesim-profiler-')}`"
+            )
 
 
 _PROFILE_ENVS_ROOT = Path.home() / "profile_envs"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROJECT_UV_PYTHON = _PROJECT_ROOT / ".venv" / "bin" / "python"
-_SGLANG_CHECKOUT = _PROJECT_ROOT / "alignment" / "profiler" / "sglang"
-# The alignment vLLM checkout (alignment/profiler/vllm) and its own built
-# `.venv`. A separate worktree without the initialized submodule points
-# VIBESIM_VLLM_FORK_ROOT at the checkout that owns the `.venv`.
+# The reference engines' materialized source trees (`just ref materialize
+# ENGINE`, reference_engines/README.md), each with its own built venv. A
+# worktree that has not built one points VIBESIM_VLLM_FORK_ROOT at a tree that has.
+_SGLANG_CHECKOUT = _PROJECT_ROOT / "reference_engines" / "sglang" / "src"
 _VLLM_FORK_CHECKOUT = Path(
-    os.environ.get("VIBESIM_VLLM_FORK_ROOT", _PROJECT_ROOT / "alignment" / "profiler" / "vllm")
+    os.environ.get("VIBESIM_VLLM_FORK_ROOT", _PROJECT_ROOT / "reference_engines" / "vllm" / "src")
 )
 _VLLM_FORK_PYTHON = _VLLM_FORK_CHECKOUT / ".venv" / "bin" / "python"
 _VLLM_FORK_TORCH_LIB = (
@@ -117,7 +145,7 @@ def _default_python() -> Path:
     return configured if configured.exists() else Path(sys.executable)
 
 
-ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
+ENV_REGISTRY: dict[str, ProfileEnv] = {
     "default_env": ProfileEnv("default_env", _default_python()),
     # Most profilers should stay on default_env via subprocess_env=None. In this
     # repo, default_env is the uv-managed project .venv when it exists.
@@ -126,10 +154,6 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
     # so KernelProfilerSpec rows can state the dependency intent without
     # forcing a separate venv.
     "flashinfer_pip_env": ProfileEnv("flashinfer_pip_env", _default_python()),
-    "flashinfer_local": ProfileEnv(
-        "flashinfer_local",
-        _profile_env_python("flashinfer_local"),
-    ),
     # FlashInfer's Blackwell KDA prefill backends (TIRx, CuTe DSL persistent)
     # are on FlashInfer main after the 0.7.1 release branch was cut, and need
     # Torch cu130, CuTe DSL >= 4.7 and a CUDA-enabled TVM with TIRx -- none of
@@ -140,41 +164,14 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         _profile_env_python("flashinfer_kda"),
         isolated_site_packages=True,
     ),
-    # SGLang's CUDA extensions are built against the checkout-local Torch and
+    # SGLang's CUDA extensions are built against the tree-local Torch and
     # FlashInfer stack. Keep the interpreter and source tree from the same
-    # checkout so profiling cannot silently import a globally installed build.
+    # materialized tree so profiling cannot silently import a globally
+    # installed build.
     "sglang_env": ProfileEnv(
         "sglang_env",
         _SGLANG_PYTHON,
         additional_python_paths=(_SGLANG_PYTHON_ROOT,),
-    ),
-    # The alignment vLLM checkout's own host venv (alignment/profiler/README.md).
-    # It exists because vllm_env's image is built from fork commit 3f667d7, and
-    # some backends need a newer tree: the checkout rebased onto upstream vLLM
-    # 04730e8, with the models and the newer FlashInfer/DeepGEMM/FlashMLA builds
-    # those backends call. Source and native extensions come from the checkout,
-    # Torch's CUDA runtime resolves first as in the alignment server launch, and
-    # inherited site-packages are dropped so the project Torch cannot shadow the
-    # venv's ABI-matched build. Remove this env, and move its backends to
-    # vllm_env, once profiling/container/build.sh builds from the rebased
-    # checkout.
-    "vllm_upstream_fork_env": ProfileEnv(
-        "vllm_upstream_fork_env",
-        _VLLM_FORK_PYTHON,
-        additional_python_paths=(_VLLM_FORK_CHECKOUT,),
-        additional_library_paths=(_VLLM_FORK_TORCH_LIB,),
-        isolated_site_packages=True,
-    ),
-    # FlashKDA, the KDA prefill kernel upstream vLLM vendors as _flashkda_C,
-    # built standalone from the same commit (vllm-project/FlashKDA@17a037d,
-    # registered as torch.ops.flash_kda). vllm_env's fork image predates it,
-    # and the project Torch (cu128) cannot build its sm_100f code, so this
-    # venv carries Torch 2.13.0/cu130 as upstream vLLM pins it. Setup:
-    # profiling/README.md "flashkda_env".
-    "flashkda_env": ProfileEnv(
-        "flashkda_env",
-        _profile_env_python("flashkda_env"),
-        isolated_site_packages=True,
     ),
     # Dao-AILab causal-conv1d's prebuilt wheel, installed with `--no-deps
     # --target` into one directory and imported on the project interpreter.
@@ -186,12 +183,20 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         _default_python(),
         additional_python_paths=(_PROFILE_ENVS_ROOT / "causal_conv1d",),
     ),
-    # vLLM runners execute in the pinned image (the alignment fork's vLLM
-    # commit, profiling/container/build.sh); host source and Python packages
-    # are deliberately outside this environment boundary.
-    "vllm_env": ContainerProfileEnv(
+    # The vLLM reference engine (reference_engines/vllm): upstream at BASE plus
+    # patches/, with the models and the FlashInfer/DeepGEMM/FlashMLA builds its
+    # backends call. Its image is the official image with the patches applied
+    # (reference_engines/vllm/Dockerfile). On the host it is the materialized
+    # tree's own `.venv`: source and native extensions come from that tree,
+    # Torch's CUDA runtime resolves first as in the alignment server launch, and
+    # inherited site-packages are dropped so the project Torch cannot shadow
+    # the venv's ABI-matched build.
+    "vllm_env": ProfileEnv(
         "vllm_env",
-        os.environ.get("VIBESIM_VLLM_PROFILE_IMAGE", "vibesim-profiler-vllm:cu130-3f667d7e"),
+        _VLLM_FORK_PYTHON,
+        additional_python_paths=(_VLLM_FORK_CHECKOUT,),
+        additional_library_paths=(_VLLM_FORK_TORCH_LIB,),
+        isolated_site_packages=True,
     ),
 }
 
@@ -240,7 +245,7 @@ def set_worker_python_env(profile_env: ProfileEnv, env: MutableMapping[str, str]
     """Set a host worker's import path in `env` (a copy of the caller's environment).
 
     A worker on the project interpreter keeps the caller's PYTHONPATH after its
-    own entries. A worker on its own interpreter (`sglang_env`, `vllm_upstream_fork_env`) drops the
+    own entries. A worker on its own interpreter (`sglang_env`, `vllm_env`) drops the
     caller's interpreter variables: inherited, they would put the project venv's
     Torch and FlashInfer ahead of the env's own stack.
     """
@@ -264,21 +269,115 @@ def compose_library_path(profile_env: ProfileEnv, existing: str | None) -> str:
     return os.pathsep.join(entries)
 
 
+# Every env runs in the image `profiling/container/images.py` assigns it
+# ("container"). "in-image" is for a process that already runs inside one of
+# those images (a container host such as a RunPod pod): the envs that image
+# serves run on its own interpreter, and any other env is refused. "host" runs
+# an env on the host interpreter its entry above names, for debugging an env
+# against a local build; rows it writes share the image's DB key, so compare
+# against the image before keeping them.
+PROFILE_RUNTIME_ENV = "VIBESIM_PROFILE_RUNTIME"
+_PROFILE_RUNTIMES = ("container", "in-image", "host")
+# Written by every profiler image's Dockerfile: the image's input hash (its
+# tag's suffix), the envs it serves, its interpreter and import path.
+IMAGE_MANIFEST_ENV = "VIBESIM_PROFILE_IMAGE_MANIFEST"
+IMAGE_MANIFEST = Path("/etc/vibesim-profiler-image.json")
+
+
+def profile_runtime() -> str:
+    runtime = os.environ.get(PROFILE_RUNTIME_ENV, "").strip() or "container"
+    if runtime not in _PROFILE_RUNTIMES:
+        raise ValueError(
+            f"{PROFILE_RUNTIME_ENV} must be one of {_PROFILE_RUNTIMES}, got {runtime!r}"
+        )
+    return runtime
+
+
 def resolve_profile_env(name: str | None) -> ProfileEnv | ContainerProfileEnv:
     env_name = name or "default_env"
     try:
-        return ENV_REGISTRY[env_name]
+        env = ENV_REGISTRY[env_name]
     except KeyError as exc:
         known_envs = sorted(ENV_REGISTRY)
         raise ValueError(f"unknown profiling env {env_name!r}; known envs: {known_envs}") from exc
+    runtime = profile_runtime()
+    if runtime == "container":
+        return ContainerProfileEnv(env_name, container_image(env_name), container_python(env_name))
+    if runtime == "in-image":
+        return in_image_env(env_name)
+    return env
+
+
+def in_image_env(env_name: str) -> ProfileEnv:
+    """Profile env ``env_name`` on the interpreter of the image this process runs in.
+
+    Only an env that image serves, and only when the image is the one this
+    checkout names for it: another image's rows would share the same DB key.
+    """
+    path = Path(os.environ.get(IMAGE_MANIFEST_ENV) or IMAGE_MANIFEST)
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise FileNotFoundError(
+            f"{PROFILE_RUNTIME_ENV}=in-image, but {path} is not a profiler image "
+            f"manifest ({exc}); this process does not run in a profiler image"
+        ) from None
+    if env_name not in manifest["envs"]:
+        raise ValueError(
+            f"profiling env {env_name!r} needs image {container_image(env_name)}; "
+            f"the image this process runs in serves only {manifest['envs']}"
+        )
+    expected = container_image(env_name)
+    if expected.rpartition(":")[2] != manifest["inputs"]:
+        raise ValueError(
+            f"profiling env {env_name!r} needs image {expected}, but this process "
+            f"runs in an image built from inputs {manifest['inputs']}"
+        )
+    return ProfileEnv(
+        env_name,
+        Path(manifest["python"]),
+        additional_python_paths=tuple(Path(p) for p in manifest["python_paths"]),
+        isolated_site_packages=True,
+    )
+
+
+def container_image(name: str | None) -> str:
+    """The image that runs profile env ``name``."""
+    from profiling.container.images import image_for_env
+
+    env_name = name or "default_env"
+    image = image_for_env(env_name, _PROJECT_ROOT)
+    if image is None:
+        raise ValueError(
+            f"profiling env {env_name!r} has no image (profiling/container/images.py); "
+            f"only {PROFILE_RUNTIME_ENV}=host can run it"
+        )
+    return image
+
+
+def container_python(name: str | None) -> str:
+    """The interpreter a worker for profile env ``name`` runs on in its image."""
+    from profiling.container.images import python_for_env
+
+    env_name = name or "default_env"
+    python = python_for_env(env_name)
+    if python is None:
+        raise ValueError(f"profiling env {env_name!r} has no image (profiling/container/images.py)")
+    return python
 
 
 __all__ = [
     "ENV_REGISTRY",
     "ContainerProfileEnv",
+    "IMAGE_MANIFEST",
+    "IMAGE_MANIFEST_ENV",
+    "PROFILE_RUNTIME_ENV",
     "ProfileEnv",
     "compose_library_path",
     "compose_pythonpath",
+    "container_image",
+    "in_image_env",
+    "profile_runtime",
     "register_profile_env",
     "resolve_profile_env",
     "set_worker_python_env",

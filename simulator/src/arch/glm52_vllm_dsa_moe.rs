@@ -40,6 +40,7 @@ use anyhow::Result;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
+use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -1125,7 +1126,7 @@ pub struct Glm52VllmDsaMoeModel {
     pub nvl_num_gpu: u16,
     pub num_attn_dp_groups: u16,
     pub num_attn_shards: u16,
-    pub total_state_bytes_per_token: u64,
+    pub kv_cache_layout: KvCacheLayout,
     pub embedding: Op<ElementwiseKernel>,
     pub dense_full_index_attention: VllmGlm52DsaAttnLocalWorklet,
     pub dense_ffn: VllmGlm52DenseFfnLocalWorklet,
@@ -1220,7 +1221,6 @@ pub fn build(
         }
     };
 
-    let total_state_bytes_per_token = state_bytes_per_token(mtp_mode)?;
     let fp8 = resolved.raw_cfg.moe_expert_compute[0].dtype == DType::Fp8E4m3;
     let mut model = Glm52VllmDsaMoeModel {
         name,
@@ -1229,7 +1229,7 @@ pub fn build(
         nvl_num_gpu,
         num_attn_dp_groups: ep_size,
         num_attn_shards: 1,
-        total_state_bytes_per_token,
+        kv_cache_layout: kv_cache_layout(mtp_mode),
         embedding,
         dense_full_index_attention,
         dense_ffn,
@@ -1443,8 +1443,8 @@ impl IterwiseUnifiedModel for Glm52VllmDsaMoeModel {
         normalize_input(batch, self.ep_size).map(|_| ())
     }
 
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_state_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn gpus_per_replica(&self) -> u16 {
@@ -1802,26 +1802,27 @@ fn expected_slot_count(ep_size: u16, fp8: bool, mtp_mode: Glm52MtpMode) -> usize
     }
 }
 
-fn state_bytes_per_token(mtp_mode: Glm52MtpMode) -> std::result::Result<u64, BuildError> {
-    let main_mla = u64::from(NUM_LAYERS)
-        .checked_mul(u64::from(KV_LORA_RANK + ROPE_DIM))
-        .and_then(|value| value.checked_mul(u64::from(DType::Bf16.size_bytes())))
-        .ok_or_else(|| fit_failed("main MLA state bytes overflow u64"))?;
-    let index = u64::try_from(FULL_INDEX_LAYERS.len())
-        .expect("full-index count fits u64")
-        .checked_mul(u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes()))
-        .ok_or_else(|| fit_failed("index state bytes overflow u64"))?;
-    let main = main_mla
-        .checked_add(index)
-        .ok_or_else(|| fit_failed("main state bytes overflow u64"))?;
-    let mtp_mla = u64::from(KV_LORA_RANK + ROPE_DIM)
-        .checked_mul(u64::from(DType::Bf16.size_bytes()))
-        .ok_or_else(|| fit_failed("MTP MLA state bytes overflow u64"))?;
-    Ok(match mtp_mode {
-        Glm52MtpMode::Off => main,
-        Glm52MtpMode::FullIndex => main + mtp_mla + u64::from(INDEX_HEAD_DIM + 4),
-        Glm52MtpMode::IndexShare => main + mtp_mla,
-    })
+/// One rank's cache: a BF16 (kv_lora_rank + rope_dim) latent in every layer,
+/// and an FP8 index key plus FP32 scale in the full-index layers. The MTP layer
+/// adds its latent and its key: vLLM always builds the MTP layer's indexer,
+/// even when later draft steps share its index.
+fn kv_cache_layout(mtp_mode: Glm52MtpMode) -> KvCacheLayout {
+    let full_index_layers = FULL_INDEX_LAYERS.len() as u64;
+    let (mtp_mla, mtp_index) = match mtp_mode {
+        Glm52MtpMode::Off => (0, 0),
+        Glm52MtpMode::FullIndex | Glm52MtpMode::IndexShare => (1, 1),
+    };
+    let mla_layer_bytes = u64::from(KV_LORA_RANK + ROPE_DIM) * u64::from(DType::Bf16.size_bytes());
+    let index_layer_bytes = u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes());
+    KvCacheLayout::new()
+        .with_part(KvCachePart::per_token(
+            "mla",
+            (u64::from(NUM_LAYERS) + mtp_mla) * mla_layer_bytes,
+        ))
+        .with_part(KvCachePart::per_token(
+            "indexer",
+            (full_index_layers + mtp_index) * index_layer_bytes,
+        ))
 }
 
 #[cfg(test)]
@@ -2640,15 +2641,10 @@ mod tests {
 
     #[test]
     fn state_and_topology_contracts_are_exact() {
-        assert_eq!(state_bytes_per_token(Glm52MtpMode::Off).unwrap(), 92_628);
-        assert_eq!(
-            state_bytes_per_token(Glm52MtpMode::FullIndex).unwrap(),
-            93_912
-        );
-        assert_eq!(
-            state_bytes_per_token(Glm52MtpMode::IndexShare).unwrap(),
-            93_780
-        );
+        let bytes = |mode| kv_cache_layout(mode).per_token_bytes();
+        assert_eq!(bytes(Glm52MtpMode::Off), 92_628);
+        assert_eq!(bytes(Glm52MtpMode::FullIndex), 93_912);
+        assert_eq!(bytes(Glm52MtpMode::IndexShare), 93_912);
         assert_eq!(u32::from(parallel(8).ep_size), 8);
     }
 

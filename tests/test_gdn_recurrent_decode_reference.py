@@ -50,7 +50,7 @@ def _manual_equation(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, to
     k = k.repeat_interleave(repeats, dim=1)
 
     g = -torch.exp(A_log) * F.softplus(a.float() + dt_bias)
-    beta = torch.sigmoid(b.float()).to(torch.bfloat16).float()
+    beta = torch.sigmoid(b.float())
     decayed = state * torch.exp(g)[..., None, None]
     memory = torch.sum(decayed * k[..., None], dim=-2)
     delta = (value.float() - memory) * beta[..., None]

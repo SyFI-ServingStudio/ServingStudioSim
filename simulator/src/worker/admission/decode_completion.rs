@@ -2,18 +2,22 @@
 //!
 //! This is the one thing speculative decoding changes about a lifecycle: an
 //! ordinary engine emits exactly one token per resident request per iteration,
-//! a speculating engine verifies a fixed-width window and retires between one
-//! and `draft_tokens + 1`. Everything else about admission — placement,
-//! chunking, capacity gates, retraction — is identical, so the difference is a
-//! sub-axis of the lifecycle rather than a second lifecycle.
+//! a speculating engine verifies a `draft_tokens + 1` window (clipped at the
+//! context limit) and retires between one and that many. Everything else about
+//! admission — placement, chunking, capacity gates, retraction — is identical,
+//! so the difference is a sub-axis of the lifecycle rather than a second
+//! lifecycle.
 //!
 //! A policy owns exactly two facts:
 //!
-//! - [`DecodeCompletion::query_tokens_per_request`], the *fixed* query width the
-//!   engine submits per resident request. It is a batch-shape fact the
+//! - [`DecodeCompletion::query_tokens_per_request`], the full query width the
+//!   engine reserves per resident request. It is a batch-shape fact the
 //!   lifecycle needs before the iteration runs (to size its token budget) and
 //!   the execution adapter needs to lower the L4 input. It does not depend on
-//!   how many tokens are ultimately accepted.
+//!   how many tokens are ultimately accepted. A request at the context limit
+//!   submits fewer ([`DecodeCompletion::query_tokens_at`]); the budget keeps
+//!   reserving the full width for it, at most `draft_tokens` spare rows in the
+//!   rare step that clips.
 //! - [`DecodeCompletion::complete_decodes`], the post-iteration transition:
 //!   emit the retired tokens, stamp finished requests, and grow KV by exactly
 //!   as many positions as were retired.
@@ -21,6 +25,7 @@
 //! It does not own membership, capacity, or batch composition. The lifecycle
 //! decides *whether* a partition runs decode; this decides *how far* it moves.
 
+use crate::arch::contract::SpeculativeDecodeInput;
 use crate::common::{AcceptanceProfile, DecodingStrategy, RequestId, Time, UnifiedStage};
 use crate::worker::kv::IterWorkerKv;
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
@@ -38,6 +43,11 @@ pub trait DecodeCompletion<K: IterWorkerKv> {
     /// iteration. Fixed for the worker's lifetime; the token budget and the
     /// L4 input lowering both read it.
     fn query_tokens_per_request(&self) -> u32;
+
+    /// Query rows one resident request with `resident_kv` keys submits this
+    /// iteration: [`Self::query_tokens_per_request`] unless the context limit
+    /// clips it.
+    fn query_tokens_at(&self, resident_kv: u64) -> u32;
 
     /// Retire this iteration's accepted tokens on one partition, appending any
     /// request that finished to `completed`, and advance KV to match.
@@ -58,6 +68,10 @@ pub struct SingleTokenDecodeCompletion;
 
 impl<K: IterWorkerKv> DecodeCompletion<K> for SingleTokenDecodeCompletion {
     fn query_tokens_per_request(&self) -> u32 {
+        1
+    }
+
+    fn query_tokens_at(&self, _resident_kv: u64) -> u32 {
         1
     }
 
@@ -86,11 +100,12 @@ impl<K: IterWorkerKv> DecodeCompletion<K> for SingleTokenDecodeCompletion {
     }
 }
 
-/// The speculating engine: a fixed `draft_tokens + 1` verify window per resident
-/// request, retiring the target's own token plus the leading run of accepted
-/// drafts.
+/// The speculating engine: a `draft_tokens + 1` verify window per resident
+/// request, clipped at `max_model_len` the way vLLM schedules it, retiring the
+/// target's own token plus the leading run of accepted drafts in that window.
 pub struct SpeculativeDecodeCompletion {
     draft_tokens: u32,
+    max_model_len: u32,
     seed: u64,
     /// Scratch, indexed by retired count: `request_buckets[n]` holds the
     /// requests that retired `n` tokens this iteration. Requests in the same
@@ -100,7 +115,7 @@ pub struct SpeculativeDecodeCompletion {
 }
 
 impl SpeculativeDecodeCompletion {
-    pub(crate) fn new(draft_tokens: u32, seed: u64) -> Self {
+    pub(crate) fn new(draft_tokens: u32, max_model_len: u32, seed: u64) -> Self {
         assert!(
             draft_tokens > 0,
             "speculative draft_tokens must be positive"
@@ -112,6 +127,7 @@ impl SpeculativeDecodeCompletion {
             .expect("speculative acceptance bucket count must fit usize");
         Self {
             draft_tokens,
+            max_model_len,
             seed,
             request_buckets: vec![Vec::new(); bucket_count],
         }
@@ -124,6 +140,7 @@ impl SpeculativeDecodeCompletion {
         output_tokens_emitted: u32,
         accept_rate: &AcceptanceProfile,
         remaining_output_tokens: u32,
+        query_rows: u32,
     ) -> u32 {
         speculative_accepted_length(
             self.seed,
@@ -132,12 +149,15 @@ impl SpeculativeDecodeCompletion {
             output_tokens_emitted,
             accept_rate,
             remaining_output_tokens,
+            query_rows,
         )
     }
 }
 
 /// Tokens a verify retires: the target's own token, plus the leading run of
-/// accepted drafts, truncated by the request's remaining output length.
+/// accepted drafts, truncated by the request's remaining output length and by
+/// the rows the verify ran (`query_rows`, below the full window only at the
+/// context limit).
 ///
 /// A pure function of the seed and the request's progress, so the execution
 /// that bills a verify sees the same count the completion retires.
@@ -148,6 +168,7 @@ pub(crate) fn speculative_accepted_length(
     output_tokens_emitted: u32,
     accept_rate: &AcceptanceProfile,
     remaining_output_tokens: u32,
+    query_rows: u32,
 ) -> u32 {
     let mut accepted = 1_u32;
     for draft_position in 0..draft_tokens {
@@ -163,12 +184,16 @@ pub(crate) fn speculative_accepted_length(
         }
         accepted += 1;
     }
-    accepted.min(remaining_output_tokens)
+    accepted.min(remaining_output_tokens).min(query_rows)
 }
 
 impl<K: IterWorkerKv> DecodeCompletion<K> for SpeculativeDecodeCompletion {
     fn query_tokens_per_request(&self) -> u32 {
         self.draft_tokens + 1
+    }
+
+    fn query_tokens_at(&self, resident_kv: u64) -> u32 {
+        SpeculativeDecodeInput::verify_query_len(resident_kv, self.draft_tokens, self.max_model_len)
     }
 
     fn complete_decodes(
@@ -209,11 +234,17 @@ impl<K: IterWorkerKv> DecodeCompletion<K> for SpeculativeDecodeCompletion {
                     "completed request {} remained in speculative decode membership",
                     request.0
                 );
+                let query_rows = SpeculativeDecodeInput::verify_query_len(
+                    resident_kv,
+                    self.draft_tokens,
+                    self.max_model_len,
+                );
                 let accepted = self.accepted_length(
                     request,
                     record.progress.output_tokens_emitted,
                     accept_rate,
                     remaining,
+                    query_rows,
                 );
                 let observation = record
                     .telemetry
@@ -221,7 +252,10 @@ impl<K: IterWorkerKv> DecodeCompletion<K> for SpeculativeDecodeCompletion {
                     .get_or_insert_with(Default::default);
                 observation.query_width = self.draft_tokens + 1;
                 observation.decode_rounds += 1;
-                observation.resident_kv_sum += resident_kv as u64;
+                observation.resident_kv_sum += resident_kv;
+                let q = u64::from(query_rows);
+                observation.query_rows += q;
+                observation.verify_pairs += q * resident_kv + q * (q + 1) / 2;
                 observation.emitted_tokens += u64::from(accepted);
                 observation.pending_decode = None;
                 for _ in 0..accepted {
@@ -295,9 +329,10 @@ mod tests {
 
     use crate::common::{PoolId, SharedRequests, WorkerId};
     use crate::test_helpers::shared_with;
-    use crate::worker::kv::{FullAttnKv, KvStore};
+    use crate::worker::kv::{KvAccounting, KvCacheStore, KvStore};
 
     const DRAFT_TOKENS: u32 = 3;
+    const MAX_MODEL_LEN: u32 = 4096;
 
     #[test]
     fn multi_round_acceptance_matches_python_diagnostic_fixture() {
@@ -314,7 +349,8 @@ mod tests {
         ))
         .unwrap();
         for chain in chains {
-            let policy = SpeculativeDecodeCompletion::new(chain.rates.len() as u32, chain.seed);
+            let draft_tokens = chain.rates.len() as u32;
+            let policy = SpeculativeDecodeCompletion::new(draft_tokens, u32::MAX, chain.seed);
             let acceptance = AcceptanceProfile::ByPosition(chain.rates);
             let mut emitted = 1;
             let mut observed = Vec::new();
@@ -324,6 +360,7 @@ mod tests {
                     emitted,
                     &acceptance,
                     chain.output_len - emitted,
+                    draft_tokens + 1,
                 );
                 observed.push(count);
                 emitted += count;
@@ -364,7 +401,7 @@ mod tests {
         per_request: &[DecodingStrategy],
         target_output_tokens: u32,
         kv_decode_budget: u32,
-    ) -> (FullAttnKv, WorkerContext) {
+    ) -> (KvCacheStore, WorkerContext) {
         let rows: Vec<(u32, u32, u32)> = (0..per_request.len() as u32)
             .map(|id| (id, 8, target_output_tokens))
             .collect();
@@ -378,7 +415,8 @@ mod tests {
                 record.record_token(Time::ZERO, false);
             }
         }
-        let mut kv_store = FullAttnKv::without_prefix_cache(1, 10_000, None);
+        let mut kv_store =
+            KvCacheStore::without_prefix_cache(1, KvAccounting::tokens_for_test(10_000), None);
         for id in 0..per_request.len() as u32 {
             let request = RequestId(id);
             let footprint = kv_store.footprint(request, 8, target_output_tokens);
@@ -392,7 +430,7 @@ mod tests {
         target_output_tokens: u32,
         kv_decode_budget: u32,
         decoding: DecodingStrategy,
-    ) -> (FullAttnKv, WorkerContext) {
+    ) -> (KvCacheStore, WorkerContext) {
         resident_decodes(&[decoding], target_output_tokens, kv_decode_budget)
     }
 
@@ -400,8 +438,8 @@ mod tests {
     /// They must agree: KV that outruns emission is exactly the silent
     /// over-allocation this policy exists to avoid.
     fn run_one_iteration(
-        policy: &mut impl DecodeCompletion<FullAttnKv>,
-        kv_store: &mut FullAttnKv,
+        policy: &mut impl DecodeCompletion<KvCacheStore>,
+        kv_store: &mut KvCacheStore,
         context: &WorkerContext,
     ) -> (u32, u64) {
         let before = context.requests.borrow()[RequestId(0)]
@@ -424,12 +462,14 @@ mod tests {
     #[test]
     fn a_verify_window_is_wider_than_an_ordinary_decode_row() {
         assert_eq!(
-            DecodeCompletion::<FullAttnKv>::query_tokens_per_request(&SingleTokenDecodeCompletion),
+            DecodeCompletion::<KvCacheStore>::query_tokens_per_request(
+                &SingleTokenDecodeCompletion
+            ),
             1
         );
         assert_eq!(
-            DecodeCompletion::<FullAttnKv>::query_tokens_per_request(
-                &SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 0)
+            DecodeCompletion::<KvCacheStore>::query_tokens_per_request(
+                &SpeculativeDecodeCompletion::new(DRAFT_TOKENS, MAX_MODEL_LEN, 0)
             ),
             DRAFT_TOKENS + 1,
             "the engine verifies every draft plus the target's own position"
@@ -439,7 +479,7 @@ mod tests {
     #[test]
     fn a_rejected_draft_still_retires_the_target_token() {
         let (mut kv_store, context) = one_resident_decode(64, 63, uniform(0.0));
-        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 7);
+        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, MAX_MODEL_LEN, 7);
         assert_eq!(
             run_one_iteration(&mut policy, &mut kv_store, &context),
             (1, 1),
@@ -450,11 +490,37 @@ mod tests {
     #[test]
     fn a_fully_accepted_window_retires_every_drafted_position() {
         let (mut kv_store, context) = one_resident_decode(64, 63, uniform(1.0));
-        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 7);
+        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, MAX_MODEL_LEN, 7);
         assert_eq!(
             run_one_iteration(&mut policy, &mut kv_store, &context),
             (DRAFT_TOKENS + 1, u64::from(DRAFT_TOKENS + 1))
         );
+    }
+
+    #[test]
+    fn a_window_clipped_at_the_model_limit_retires_no_more_than_its_rows() {
+        // Eight resident keys and an 11-token limit leave room for two verify
+        // rows (the pending token at 8, one draft at 9; the step samples 10).
+        // Every draft would be accepted, but the clipped ones never ran.
+        let (mut kv_store, context) = one_resident_decode(64, 63, uniform(1.0));
+        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 11, 7);
+        assert_eq!(
+            DecodeCompletion::<KvCacheStore>::query_tokens_at(&policy, 8),
+            2
+        );
+        assert_eq!(
+            run_one_iteration(&mut policy, &mut kv_store, &context),
+            (2, 2)
+        );
+        let store = context.requests.borrow();
+        let progress = store[RequestId(0)]
+            .telemetry
+            .speculative
+            .as_deref()
+            .unwrap();
+        assert_eq!(progress.query_width, DRAFT_TOKENS + 1);
+        assert_eq!(progress.query_rows, 2);
+        assert_eq!(progress.verify_pairs, 2 * 8 + 3);
     }
 
     #[test]
@@ -463,7 +529,7 @@ mod tests {
         // measured acceptance curve is not geometric, and position 1 rejecting
         // must stop the chain even though position 2 would have accepted.
         let (mut kv_store, context) = one_resident_decode(64, 63, by_position(&[1.0, 0.0, 1.0]));
-        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 7);
+        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, MAX_MODEL_LEN, 7);
         assert_eq!(
             run_one_iteration(&mut policy, &mut kv_store, &context),
             (2, 2),
@@ -477,7 +543,7 @@ mod tests {
         // The trace declares a depth and the worker declares a width. If they
         // disagree the run is not modelling what either of them says.
         let (mut kv_store, context) = one_resident_decode(64, 63, by_position(&[0.5, 0.5]));
-        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 7);
+        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, MAX_MODEL_LEN, 7);
         run_one_iteration(&mut policy, &mut kv_store, &context);
     }
 
@@ -488,7 +554,7 @@ mod tests {
         // request would pay the wide batch and advance one position — which is
         // not something a speculating engine does to any request.
         let (mut kv_store, context) = one_resident_decode(64, 63, DecodingStrategy::Standard);
-        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 7);
+        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, MAX_MODEL_LEN, 7);
         run_one_iteration(&mut policy, &mut kv_store, &context);
     }
 
@@ -499,7 +565,7 @@ mod tests {
         // left with room for 63 more, so the request's own target is the only
         // thing that can truncate the chain.
         let (mut kv_store, context) = one_resident_decode(2, 63, uniform(1.0));
-        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 7);
+        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, MAX_MODEL_LEN, 7);
         let mut completed = Vec::new();
         policy.complete_decodes(
             &mut kv_store,
@@ -532,7 +598,8 @@ mod tests {
             }
         }
         let context = context_for(requests);
-        let mut kv_store = FullAttnKv::without_prefix_cache(1, 10_000, None);
+        let mut kv_store =
+            KvCacheStore::without_prefix_cache(1, KvAccounting::tokens_for_test(10_000), None);
         for id in 0..2u32 {
             let request = RequestId(id);
             let footprint = kv_store.footprint(request, 8, 64);
@@ -540,7 +607,7 @@ mod tests {
             kv_store.commit_resident(request, 0, 8, 63);
         }
 
-        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 7);
+        let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, MAX_MODEL_LEN, 7);
         let mut completed = Vec::new();
         policy.complete_decodes(
             &mut kv_store,
@@ -583,7 +650,7 @@ mod tests {
                 64,
                 63,
             );
-            let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, 12345);
+            let mut policy = SpeculativeDecodeCompletion::new(DRAFT_TOKENS, MAX_MODEL_LEN, 12345);
             let mut completed = Vec::new();
             policy.complete_decodes(
                 &mut kv_store,
@@ -633,7 +700,8 @@ mod tests {
             store[request].progress.prefill_tokens_processed = 8;
         }
         let context = context_for(requests);
-        let mut kv_store = FullAttnKv::without_prefix_cache(1, 10_000, None);
+        let mut kv_store =
+            KvCacheStore::without_prefix_cache(1, KvAccounting::tokens_for_test(10_000), None);
         let footprint = kv_store.footprint(request, 8, 64);
         KvStore::reserve(&mut kv_store, request, 0, footprint, Time::ZERO);
         kv_store.commit_resident(request, 0, 8, 64);

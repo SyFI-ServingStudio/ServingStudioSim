@@ -19,6 +19,8 @@ mod prefix_fetch;
 mod srpt;
 mod token_budget;
 
+pub(crate) use chunked_prefill_admission::ChunkEndAlignment;
+pub use chunked_prefill_admission::ChunkedPrefillAdmission;
 pub(crate) use decode_completion::speculative_accepted_length;
 pub use decode_completion::{
     DecodeCompletion, SingleTokenDecodeCompletion, SpeculativeDecodeCompletion,
@@ -125,4 +127,3 @@ pub trait SlotPipelineAdmission<K: KvStore> {
     fn queued_kv_tokens(&self) -> u64;
     fn queued_requests(&self) -> u32;
 }
-pub use chunked_prefill_admission::ChunkedPrefillAdmission;

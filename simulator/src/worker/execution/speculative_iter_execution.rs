@@ -15,9 +15,11 @@
 //!   while each request's own `kv_len` is the longest context its final verify
 //!   row sees.
 //!
-//! It does not own how far a request advances after the verify: that is the
-//! lifecycle's `DecodeCompletion`. This adapter only states the width submitted,
-//! which is fixed per worker because it selects a profiled kernel shape.
+//! The width is the worker's `draft_tokens + 1` except for a request at the
+//! context limit, whose window vLLM clips
+//! ([`SpeculativeDecodeInput::verify_query_len`]); `decode_tokens` sums the
+//! per-request widths. It does not own how far a request advances after the
+//! verify: that is the lifecycle's `DecodeCompletion`.
 
 use std::sync::Arc;
 
@@ -28,16 +30,17 @@ use crate::arch::contract::{
 use crate::common::{DecodingStrategy, SharedRequests, Time};
 use crate::worker::admission::speculative_accepted_length;
 use crate::worker::cost_buffers::CostBuffers;
-use crate::worker::execution::{IterModelExecution, ModelKvLayout};
+use crate::worker::execution::IterModelExecution;
 use crate::worker::kv::{IterWorkerKv, PrefixKv};
 use crate::worker::types::IterBatchPlan;
 
 pub struct SpeculativeIterExecution<M: SpeculativeUnifiedModel> {
     model: Arc<M>,
     cost: CostBuffers,
-    /// Candidate positions drafted per request per iteration. The verify width
-    /// is `draft_tokens + 1`; the model was compiled for that width, so it is a
-    /// worker-lifetime constant rather than a per-iteration quantity.
+    /// Candidate positions drafted per request per iteration, a worker-lifetime
+    /// constant: the model was compiled for the `draft_tokens + 1` verify
+    /// width. A request at `max_model_len` verifies fewer rows
+    /// ([`SpeculativeDecodeInput::verify_query_len`]).
     draft_tokens: u32,
     /// The completion's acceptance seed, so each request's committed rows are
     /// the ones its verify will retire.
@@ -64,11 +67,6 @@ impl<M: SpeculativeUnifiedModel> SpeculativeIterExecution<M> {
         }
     }
 
-    /// Query rows one resident decode request submits per iteration.
-    fn verify_width(&self) -> u32 {
-        self.draft_tokens + 1
-    }
-
     fn build_input<K: IterWorkerKv + PrefixKv>(
         &self,
         kv_store: &K,
@@ -82,7 +80,6 @@ impl<M: SpeculativeUnifiedModel> SpeculativeIterExecution<M> {
             .resize_with(num_partitions, SpeculativeArchGroupInput::default);
         out.groups.truncate(num_partitions);
 
-        let verify_width = self.verify_width();
         let max_model_len = self.model.max_model_len();
         for partition in 0..num_partitions as u16 {
             let group = &mut out.groups[partition as usize];
@@ -121,15 +118,17 @@ impl<M: SpeculativeUnifiedModel> SpeculativeIterExecution<M> {
                         "completed request {} remained in speculative decode membership",
                         request.0
                     );
-                    // A capped endpoint would silently discard resident keys
-                    // while still billing every query. Variable-width boundary
-                    // batches need their own model input/profile support.
-                    let final_context = current_kv.checked_add(u64::from(verify_width));
+                    let query_len = SpeculativeDecodeInput::verify_query_len(
+                        current_kv,
+                        self.draft_tokens,
+                        max_model_len,
+                    );
+                    // Admission keeps prompt + output within max_model_len, so
+                    // the pending target token always has room.
                     assert!(
-                        final_context.is_some_and(|end| end <= u64::from(max_model_len)),
-                        "fixed-width speculative verify exceeds max_model_len for request {}: \
-                         resident_kv={current_kv}, query_width={verify_width}, \
-                         max_model_len={max_model_len}; variable-width boundary batches are unsupported",
+                        query_len > 0,
+                        "speculative request {} has no room below max_model_len {max_model_len} \
+                         for its pending token: resident_kv={current_kv}",
                         request.0
                     );
                     let DecodingStrategy::Speculative { accept_rate } =
@@ -148,19 +147,20 @@ impl<M: SpeculativeUnifiedModel> SpeculativeIterExecution<M> {
                             .definition
                             .target_output_tokens
                             .saturating_sub(record.progress.output_tokens_emitted),
+                        query_len,
                     );
                     let current_kv = current_kv as u32;
                     group.decode_requests.push(SpeculativeDecodeInput {
                         // Resident KV excludes the pending target input token.
                         // Every query, including that token, extends context.
-                        kv_len: current_kv + verify_width,
-                        query_len: verify_width,
+                        kv_len: current_kv + query_len,
+                        query_len,
                         committed_rows,
                     });
+                    group.decode_tokens += query_len;
                     group.total_kv_len += current_kv;
                 });
             }
-            group.decode_tokens = group.decode_requests.len() as u32 * verify_width;
             group.batch_tokens = group.prefill_tokens + group.decode_tokens;
         }
         if num_partitions > 1 {
@@ -190,13 +190,6 @@ where
 {
     type Input = SpeculativeArchInput;
 
-    fn model_kv_layout(&self) -> ModelKvLayout {
-        ModelKvLayout {
-            total_kv_bytes_per_token: self.model.total_kv_bytes_per_token(),
-            num_attn_shards: self.model.num_attn_shards(),
-        }
-    }
-
     fn build_iteration_input(
         &self,
         kv_store: &K,
@@ -219,7 +212,7 @@ mod tests {
     use crate::common::{AcceptanceProfile, RequestId, SharedRequests, WorkerId};
     use crate::test_helpers::shared_with;
     use crate::timing::{CostManifest, CostManifestDoc, LeafMetrics};
-    use crate::worker::kv::{FullAttnKv, KvStore};
+    use crate::worker::kv::{KvAccounting, KvCacheStore, KvStore};
 
     const DRAFT_TOKENS: u32 = 3;
     const MAX_MODEL_LEN: u32 = 4096;
@@ -247,8 +240,9 @@ mod tests {
             }
         }
 
-        fn total_kv_bytes_per_token(&self) -> u64 {
-            1
+        fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+            crate::arch::kv_layout::KvCacheLayout::new()
+                .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1))
         }
 
         fn max_model_len(&self) -> u32 {
@@ -273,7 +267,7 @@ mod tests {
 
     /// `count` resident speculative decode requests, each holding
     /// `context_tokens` of KV, plus the request store the adapter reads.
-    fn resident_decodes(count: u32, context_tokens: u32) -> (FullAttnKv, SharedRequests) {
+    fn resident_decodes(count: u32, context_tokens: u32) -> (KvCacheStore, SharedRequests) {
         let rows: Vec<(u32, u32, u32)> = (0..count).map(|id| (id, context_tokens, 64)).collect();
         let requests = shared_with(&rows);
         {
@@ -287,7 +281,8 @@ mod tests {
                 record.record_token(Time::ZERO, false);
             }
         }
-        let mut kv_store = FullAttnKv::without_prefix_cache(1, 10_000_000, None);
+        let mut kv_store =
+            KvCacheStore::without_prefix_cache(1, KvAccounting::tokens_for_test(10_000_000), None);
         for id in 0..count {
             let request = RequestId(id);
             let footprint = kv_store.footprint(request, context_tokens, 64);
@@ -327,7 +322,7 @@ mod tests {
                 .decode_requests
                 .iter()
                 .all(|d| d.query_len == DRAFT_TOKENS + 1),
-            "the width is fixed by the profiled kernel shape, not by the batch"
+            "away from max_model_len the width is the profiled kernel shape"
         );
         assert_eq!(input.draft_tokens, DRAFT_TOKENS);
     }
@@ -352,29 +347,54 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_verify_window_can_end_at_the_model_limit() {
+    fn a_window_whose_sampled_position_fits_is_not_clipped() {
+        // The last full window: its final row sits at max_model_len - 2, so the
+        // token this step samples lands at the last position the model has.
         let execution = execution();
-        let (kv_store, requests) = resident_decodes(1, MAX_MODEL_LEN - DRAFT_TOKENS - 1);
+        let (kv_store, requests) = resident_decodes(1, MAX_MODEL_LEN - DRAFT_TOKENS - 2);
         let mut input = SpeculativeArchInput::default();
 
         execution.build_input(&kv_store, &requests, &plan_running_decode(true), &mut input);
 
         let decode = input.groups[0].decode_requests[0];
-        assert_eq!(decode.kv_len, MAX_MODEL_LEN);
         assert_eq!(decode.query_len, DRAFT_TOKENS + 1);
+        assert_eq!(decode.kv_len, MAX_MODEL_LEN - 1);
     }
 
     #[test]
-    #[should_panic(expected = "fixed-width speculative verify exceeds max_model_len")]
-    fn a_partial_verify_window_cannot_discard_resident_context() {
+    fn a_request_near_the_model_limit_verifies_only_the_rows_that_fit() {
+        // vLLM clips `num_new_tokens` to `max_model_len - num_computed - 1`, so a
+        // request within `draft_tokens` of the limit verifies fewer drafts. The
+        // batch bills exactly those rows and its context stays whole.
         let execution = execution();
-        let (kv_store, requests) = resident_decodes(1, MAX_MODEL_LEN - DRAFT_TOKENS);
+        let (kv_store, requests) = resident_decodes(2, PROMPT_TOKENS);
+        let (boundary_store, boundary_requests) = resident_decodes(1, MAX_MODEL_LEN - 3);
+        let mut input = SpeculativeArchInput::default();
+
         execution.build_input(
-            &kv_store,
-            &requests,
+            &boundary_store,
+            &boundary_requests,
             &plan_running_decode(true),
-            &mut SpeculativeArchInput::default(),
+            &mut input,
         );
+        let group = &input.groups[0];
+        let clipped = group.decode_requests[0];
+        assert_eq!((clipped.kv_len, clipped.query_len), (MAX_MODEL_LEN - 1, 2));
+        assert!(
+            (1..=2).contains(&clipped.committed_rows),
+            "a clipped verify commits no more rows than it ran"
+        );
+        assert_eq!(group.decode_tokens, 2);
+        assert_eq!(group.batch_tokens, 2);
+        assert_eq!(group.total_kv_len, MAX_MODEL_LEN - 3);
+        assert_eq!(
+            group.decode_requests[0].check_verify_row(DRAFT_TOKENS, MAX_MODEL_LEN),
+            Ok(true)
+        );
+
+        // Requests away from the limit keep the full window.
+        execution.build_input(&kv_store, &requests, &plan_running_decode(true), &mut input);
+        assert_eq!(input.groups[0].decode_tokens, 2 * (DRAFT_TOKENS + 1));
     }
 
     #[test]

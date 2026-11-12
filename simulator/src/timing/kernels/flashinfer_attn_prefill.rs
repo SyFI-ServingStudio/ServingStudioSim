@@ -157,7 +157,7 @@ mod tests {
 
     fn config() -> FlashinferAttnPrefillKernelConfig {
         FlashinferAttnPrefillKernelConfig {
-            backends: vec!["fa2", "fa3", "trt", "cudnn"],
+            backends: vec!["fa2", "fa3", "cudnn"],
             gpu_name: "H100".to_string(),
             num_qo_heads: 32.into(),
             num_kv_heads: 8.into(),
@@ -171,7 +171,7 @@ mod tests {
     #[test]
     fn config_identity_includes_backends_and_attention_dims() {
         let cfg = config();
-        assert_eq!(cfg.backends, vec!["fa2", "fa3", "trt", "cudnn"]);
+        assert_eq!(cfg.backends, vec!["fa2", "fa3", "cudnn"]);
         assert_eq!(cfg.num_qo_heads, 32);
         assert_eq!(cfg.num_kv_heads, 8);
         assert_eq!(cfg.head_dim, 128);
@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(
             config().describe_config(),
             serde_json::json!({
-                "backends": ["fa2", "fa3", "trt", "cudnn"], "gpu_name": "H100",
+                "backends": ["fa2", "fa3", "cudnn"], "gpu_name": "H100",
                 "num_qo_heads": {"value": 32, "expression": null, "bindings": {}},
                 "num_kv_heads": {"value": 8, "expression": null, "bindings": {}},
                 "head_dim": {"value": 128, "expression": null, "bindings": {}},

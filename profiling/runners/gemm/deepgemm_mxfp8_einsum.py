@@ -96,14 +96,16 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
         from vllm.utils.deep_gemm import fp8_einsum
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{BACKEND} requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)"
+            f"{BACKEND} requires the upstream-rebased vLLM fork (vllm_env)"
         ) from exc
     supported, reason = DeepGemmMxfp8BmmLinearKernel.is_supported()
     if not supported:
         raise ProfilerNotImplemented(f"DeepGEMM MXFP8 BMM unavailable: {reason}")
 
     def make_kernel(num_batches: int) -> Any:
-        return DeepGemmMxfp8BmmLinearKernel(Mxfp8LinearLayerConfig(bmm_batch_size=num_batches))
+        return DeepGemmMxfp8BmmLinearKernel(
+            Mxfp8LinearLayerConfig(weight_shape=(WO_A_N, WO_A_K), bmm_batch_size=num_batches)
+        )
 
     return torch, make_kernel, alloc_mega_attn_output, fp8_einsum
 

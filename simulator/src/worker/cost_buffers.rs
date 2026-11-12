@@ -797,8 +797,9 @@ mod tests {
                     backend_index: LeafMetrics::NO_BACKEND,
                 }
             }
-            fn total_kv_bytes_per_token(&self) -> u64 {
-                1
+            fn kv_cache_layout(&self) -> crate::arch::kv_layout::KvCacheLayout {
+                crate::arch::kv_layout::KvCacheLayout::new()
+                    .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1))
             }
             fn max_model_len(&self) -> u32 {
                 4096

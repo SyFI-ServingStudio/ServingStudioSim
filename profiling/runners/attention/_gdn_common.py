@@ -41,3 +41,73 @@ def load_required_callable(
         message = missing_message or f"{backend} requires {module_name}.{callable_name}"
         raise ProfilerNotImplemented(message)
     return required_callable
+
+
+def conv_state_dim_first() -> bool:
+    """Whether the installed vLLM stores conv state dim-first (``DS``)."""
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+
+    return bool(is_conv_state_dim_first())
+
+
+def conv_state_pool(
+    torch: Any,
+    shape: tuple[int, int, int],
+    *,
+    dtype: Any,
+    device: Any,
+    dim_first: bool = False,
+) -> Any:
+    """Allocate a ``[slots, channels, width - 1]`` conv-state pool in vLLM's layout.
+
+    vLLM stores each slot either dim-first (``DS``: ``[channels, width - 1]``) or
+    state-first (``SD``: ``[width - 1, channels]``, its default) and hands the
+    conv kernels a ``[slots, channels, width - 1]`` view of it, transposed for
+    ``SD``. The kernels' state reads and writes are strided accordingly, which
+    moves their time by 12-25% at decode and long-prefill shapes, so runners
+    pass the layout the installed vLLM selects (``conv_state_dim_first``).
+    """
+    slots, channels, state_len = shape
+    if dim_first:
+        return torch.empty((slots, channels, state_len), dtype=dtype, device=device)
+    return torch.empty((slots, state_len, channels), dtype=dtype, device=device).transpose(-1, -2)
+
+
+def tokens_per_request(batch_size: int, num_tokens: int | None) -> int:
+    """Uniform tokens per request of a decode spec; 1 when ``num_tokens`` is absent.
+
+    ``num_tokens`` is the optional ``same_as="batch_size"`` arg of the decode
+    kinds: a speculative verify step carries the accepted token plus the drafts
+    of every request, an equal count each.
+    """
+    if num_tokens is None:
+        return 1
+    num_tokens = int(num_tokens)
+    if num_tokens <= 0 or batch_size <= 0 or num_tokens % batch_size != 0:
+        raise ValueError(
+            f"num_tokens must be a positive multiple of batch_size, got {num_tokens} "
+            f"for batch_size={batch_size}"
+        )
+    return num_tokens // batch_size
+
+
+def reject_verify_tokens(backend: str, batch_size: int, num_tokens: int | None) -> None:
+    """Refuse a multi-token (verify) spec on a backend that decodes one token per request."""
+    if tokens_per_request(batch_size, num_tokens) != 1:
+        raise ValueError(
+            f"{backend} decodes one token per request; num_tokens={num_tokens} with "
+            f"batch_size={batch_size} is a verify step"
+        )
+
+
+def accepted_counts(batch_size: int, per_request: int) -> tuple[int, ...]:
+    """Deterministic accepted counts covering 1..q (the verify kernels read from ``a − 1``)."""
+    return tuple(request % per_request + 1 for request in range(batch_size))
+
+
+def checkpoint_indices(batch_size: int, per_request: int) -> tuple[tuple[int, ...], ...]:
+    """vLLM's ``[B, q]`` per-token checkpoint slots; slot zero stays reserved."""
+    return tuple(
+        tuple(request * per_request + token + 1 for token in range(per_request))
+        for request in range(batch_size)
+    )

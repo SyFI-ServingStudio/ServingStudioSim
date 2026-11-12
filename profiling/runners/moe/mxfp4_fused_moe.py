@@ -36,6 +36,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners import tactic_labels
 from profiling.runners.autotune_cache import autotune_cached
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
@@ -66,10 +67,13 @@ _MIN_TILE_TOKENS = 8
 # FC1 outputs around the clamp limit so the clamp path is exercised.
 _W13_SCALE_BYTES = (121, 122)
 _W2_SCALE_BYTES = (117, 118)
-_PREPARED_WEIGHT_CACHE: dict[tuple[int, int, int, int, int], dict[str, Any]] = {}
+_PREPARED_WEIGHT_CACHE: dict[tuple[str, int, int, int, int, int], dict[str, Any]] = {}
 
 
-def _load_runtime() -> tuple[Any, Any, Any, Any]:
+def load_weight_converter(backend_name: str) -> tuple[Any, Any, Any]:
+    """``(torch, convert, backend)``: vLLM's MXFP4 weight converter and the
+    ``Mxfp4MoeBackend`` member it lays the weights out for."""
+
     try:
         import torch
         import vllm.model_executor.layers.fused_moe  # noqa: F401  (breaks an import cycle)
@@ -77,17 +81,20 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
             Mxfp4MoeBackend,
             convert_weight_to_mxfp4_moe_kernel_format,
         )
+    except ImportError as exc:
+        raise ProfilerNotImplemented("FlashInfer and the vLLM fork are required") from exc
+    return torch, convert_weight_to_mxfp4_moe_kernel_format, Mxfp4MoeBackend[backend_name]
+
+
+def _load_runtime() -> tuple[Any, Any, Any, Any]:
+    torch, convert, backend = load_weight_converter("FLASHINFER_TRTLLM_MXFP4_MXFP8")
+    try:
         from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
             mxfp8_e4m3_quantize,
         )
     except ImportError as exc:
         raise ProfilerNotImplemented("FlashInfer and the vLLM fork are required") from exc
-    return (
-        torch,
-        mxfp8_e4m3_quantize,
-        convert_weight_to_mxfp4_moe_kernel_format,
-        Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
-    )
+    return torch, mxfp8_e4m3_quantize, convert, backend
 
 
 def max_tokens_per_call(top_k: int, num_experts: int) -> int:
@@ -151,7 +158,7 @@ def _random_scale_bytes(torch: Any, shape: tuple[int, ...], bounds: tuple[int, i
     return torch.randint(low, high + 1, shape, generator=g, device="cuda", dtype=torch.uint8)
 
 
-def _prepared_weights(
+def prepared_weights(
     torch: Any,
     convert: Any,
     backend: Any,
@@ -162,9 +169,10 @@ def _prepared_weights(
     seed: int,
     keep_checkpoint: bool,
 ) -> dict[str, Any]:
-    """Build checkpoint-order MXFP4 weights and convert them as vLLM does."""
+    """Build checkpoint-order MXFP4 weights and convert them as vLLM does for
+    ``backend`` (an ``Mxfp4MoeBackend`` member; the layout is the backend's)."""
 
-    key = (torch.cuda.current_device(), experts, hidden_size, intermediate_size, seed)
+    key = (str(backend), torch.cuda.current_device(), experts, hidden_size, intermediate_size, seed)
     cached = _PREPARED_WEIGHT_CACHE.get(key)
     if cached is not None and (not keep_checkpoint or "w13" in cached):
         return cached
@@ -234,7 +242,7 @@ def _build_case(
     """Return ``(torch, call_kwargs, weights)`` for one validated spec."""
 
     torch, quantize, convert, backend = _load_runtime()
-    weights = _prepared_weights(
+    weights = prepared_weights(
         torch,
         convert,
         backend,
@@ -358,7 +366,7 @@ def profile_mxfp4_fused_moe_sm100(
         def run_once() -> None:
             _call(call_kwargs)
 
-        with autotune_cached(autotune, "nvfp4_fused_moe.mxfp4_vllm"):
+        with autotune_cached(autotune, tactic_labels.mxfp4_fused_moe()):
             run_once()
         torch.cuda.synchronize()
         time_ms = Timer.cupti(run_once, warmup=3, interval_union=True)

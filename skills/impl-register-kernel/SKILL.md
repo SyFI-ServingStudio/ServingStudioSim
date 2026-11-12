@@ -62,7 +62,10 @@ Keep these invariants:
   it against the real device before loading the runner, so the runner does not
   repeat it and keeps only shape-dependent checks.
 - special Python environments go through `KernelProfilerSpec.subprocess_env` and
-  `profiling.exec.env`, not runner-local environment mutation;
+  `profiling.exec.env`, not runner-local environment mutation. Workers run in
+  the env's image by default, so a new env also needs an image in
+  `profiling/container/images.py` (prefer adding the dependency to an existing
+  image); `profiling/container/README.md`;
 - `perf_api.py` gets no hand-written `get_<kind>_times` or
   `count_missing_<kind>` wrappers.
 

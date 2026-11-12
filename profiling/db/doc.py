@@ -68,6 +68,11 @@ SUBCATEGORIES: dict[str, tuple[Subcategory, ...]] = {
             "plus compressed keys.",
         ),
         Subcategory(
+            "Sparse GQA",
+            "Sparse grouped-query attention: an indexer scores compressed keys and "
+            "each query attends only to the tokens of its top-k groups.",
+        ),
+        Subcategory(
             "Gated DeltaNet",
             "Linear attention: a gated delta-rule state stands in for the KV cache.",
         ),
@@ -129,6 +134,20 @@ def arg(*, doc: str, unit: str | None = None) -> Any:
     """
 
     return field(metadata={"doc": doc, "unit": unit})
+
+
+def optional_arg(*, doc: str, same_as: str, unit: str | None = None) -> Any:
+    """Declare a ``KernelArgs`` field that a spec may leave out.
+
+    Absent (``None``) means the field equals the field ``same_as``, and a value
+    equal to it is stored as absent too, so one call has one key. An absent
+    value is stored as NULL and left out of ``args_hash``: rows written before
+    the field existed keep their keys, and a table gains the column (appended,
+    nullable) only when a row first sets it. Declare it after every required
+    field.
+    """
+
+    return field(default=None, metadata={"doc": doc, "unit": unit, "same_as": same_as})
 
 
 def arg_docs(args_schema: type) -> dict[str, dict[str, str | None]]:
@@ -282,4 +301,3 @@ def kind_vocabulary() -> dict:
             if doc is not None
         },
     }
-

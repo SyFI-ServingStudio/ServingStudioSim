@@ -1,5 +1,6 @@
-//! Ragged all-gatherv of NVFP4 activations, their block scales and top-k
-//! routing for naive DP/EP MoE that quantizes and routes before dispatch.
+//! Ragged all-gatherv of quantized activations (NVFP4 or MXFP8), their block
+//! scales and top-k routing for naive DP/EP MoE that quantizes and routes
+//! before dispatch.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -53,7 +54,10 @@ impl KernelSpec for MoeEpQuantizedAllGatherSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         assert!(matches!(config.num_gpus, 2 | 4 | 8));
-        assert_eq!(config.activation_dtype, DType::Nvfp4E2m1);
+        assert!(matches!(
+            config.activation_dtype,
+            DType::Nvfp4E2m1 | DType::Mxfp8E4m3
+        ));
         assert_eq!(config.fabric, "nvlink");
         grid.expand_2d(|total, ragged_max| {
             let per_rank_tokens =

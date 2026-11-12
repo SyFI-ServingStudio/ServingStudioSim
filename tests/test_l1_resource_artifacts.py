@@ -91,6 +91,7 @@ def _run_args(output_dir: Path | None, **overrides) -> SimpleNamespace:
         gpu_name="NVIDIA H200",
         force=False,
         fresh=False,
+        allow_autotune=False,
         energy=True,
         output_dir=output_dir,
         json=True,
@@ -652,6 +653,7 @@ def test_managed_measure_registration_carries_analyzer_resource_id(
             telemetry_hz=20.0,
             telemetry=True,
             clear_l2=True,
+            cuda_graph=False,
             energy=True,
         )
     )

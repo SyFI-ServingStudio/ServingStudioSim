@@ -32,6 +32,10 @@ class MeasureContext:
     telemetry_hz: float = 20.0
     clear_l2: bool = True
     telemetry: bool = True
+    # Replay the callable from a CUDA graph so host dispatch cannot leave the
+    # GPU idle between launches: the window then runs back to back, as a
+    # graph-captured serving step does, and sustained power limits show.
+    cuda_graph: bool = False
     # Filled by the Timer.cupti hook after the capture runs.
     consumed: bool = False
     time_ms: float | None = None

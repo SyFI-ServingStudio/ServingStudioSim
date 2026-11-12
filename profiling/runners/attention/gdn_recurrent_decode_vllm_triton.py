@@ -16,7 +16,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention._gdn_common import load_required_callable
+from profiling.runners.attention._gdn_common import load_required_callable, reject_verify_tokens
 from profiling.runners.attention.gdn_recurrent_decode_torch import (
     _logical_bytes,
     _semantic_flops,
@@ -29,7 +29,7 @@ from profiling.runners.exceptions import (
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "gdn_recurrent_decode:vllm_triton"
-_CALLABLE_MODULE = "vllm.model_executor.layers.fla.ops.fused_recurrent"
+_CALLABLE_MODULE = "vllm.third_party.flash_linear_attention.ops.fused_recurrent"
 _CALLABLE_NAME = "fused_recurrent_gated_delta_rule_packed_decode"
 _KERNEL_NAME = "fused_recurrent_gated_delta_rule_packed_decode_kernel"
 _OUTPUT_ATOL = 1e-2
@@ -301,8 +301,10 @@ def profile_gdn_recurrent_decode_vllm_triton(
     value_head_dim: int,
     dtype: DType | str,
     state_dtype: DType | str,
+    num_tokens: int | None = None,
 ) -> ComputeMetrics:
     """Profile vLLM's fused packed recurrent decode."""
+    reject_verify_tokens("gdn_recurrent_decode:vllm_triton", int(batch_size), num_tokens)
     args = _validate_args(
         batch_size,
         num_qk_heads,

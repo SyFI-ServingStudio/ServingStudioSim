@@ -92,7 +92,7 @@ impl Deployment for AfdDeployment {
             attn_prefix_cache_max_gpu_memory_gb(&ag.worker),
             attn_gpu_memory_gb,
         )?;
-        let attn_wc = worker_config(
+        let mut attn_wc = worker_config(
             attn_gpu_memory_gb,
             attn_gpu_time_multiplier(&ag.worker),
             prefix_cache,
@@ -100,6 +100,9 @@ impl Deployment for AfdDeployment {
             cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
         );
+        attn_wc.max_model_len = ag.arch.max_model_len().ok();
+        let AttnWorkerSel::DisaggAttn { kv_accounting, .. } = &ag.worker;
+        kv_accounting.apply("afd attention", &mut attn_wc)?;
         let ffn_wc = worker_config(
             80.0, // ffn has no KV
             ffn_gpu_time_multiplier(&fg.worker),

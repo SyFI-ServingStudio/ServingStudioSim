@@ -3,12 +3,18 @@
 ``kv_cache_append`` writes the newly produced K/V rows for ``num_tokens`` into
 the paged cache slots selected by ``slot_mapping``.  The semantic operation is
 framework-independent; the ``vllm_cuda`` backend wraps vLLM's
-``reshape_and_cache_flash_kernel`` while ``torch`` is the small executable
-reference used to validate the write contract.
+``reshape_and_cache_flash_kernel`` (separate K and V caches of one head size),
+``vllm_triton_diffkv`` wraps vLLM's ``triton_reshape_and_cache_flash_diffkv``
+(K and V packed into one cache, key head size ``head_dim`` and value head size
+``head_dim_v``), and ``torch`` is the small executable reference used to
+validate the write contract.
 
-The runtime sweep axis is ``num_tokens``.  KV-head count, head size, page size,
-input/cache dtypes, physical cache layout, and scale granularity are static
-kernel identity because each can select a different implementation branch.
+The runtime sweep axis is ``num_tokens``.  KV-head count, key and value head
+sizes, page size, input/cache dtypes, physical cache layout, and scale
+granularity are static kernel identity because each can select a different
+implementation branch.  ``head_dim_v`` is optional: absent means symmetric
+K/V (equal to ``head_dim``), so symmetric rows keep the keys they had before
+the field existed and only asymmetric rows carry it.
 """
 
 from __future__ import annotations
@@ -35,20 +41,23 @@ DOC = KernelDoc(
         "stored in the paged cache for later attention. A slot mapping names "
         "one cache slot per token, and block_size is the tokens per page. The "
         "measurement writes num_tokens tokens into distinct random slots of a "
-        "cache with at least 256 pages."
+        "cache with at least 256 pages. Keys have head_dim elements per head and "
+        "values head_dim_v, which is left out when the two are equal."
     ),
     category="Attention",
     subcategory="MHA / GQA",
     formula=(
         "key_cache[slot[t]] ← key[t], value_cache[slot[t]] ← value[t], for each new token t",
-        "GB/s = [2 · num_tokens · num_kv_heads · head_dim · (bytes(input_dtype)"
+        "GB/s = [num_tokens · num_kv_heads · (head_dim + head_dim_v) · (bytes(input_dtype)"
         " + bytes(kv_dtype)) + 8 · num_tokens] / time",
     ),
     default_metric="memory_bandwidth_gbps",
     method=(
         "vllm_cuda: GPU kernel time from CUPTI, averaged over repeated launches"
         " of reshape_and_cache_flash_kernel after five warm-ups, with the L2 "
-        "cache flushed before each launch. torch: CUDA-event time around a loop"
+        "cache flushed before each launch. vllm_triton_diffkv: the same for the "
+        "Triton reshape_and_cache_kernel_flash_diffkv, after one checked write. "
+        "torch: CUDA-event time around a loop"
         " of calls after five warm-ups, the median of three loops; the cache is"
         " not flushed, and the time includes the gap between its two launches."
     ),
@@ -57,6 +66,8 @@ DOC = KernelDoc(
         "warm loop, so their numbers are not directly comparable.",
         "The torch backend only covers matching input and cache dtypes with one scale per tensor.",
         "vllm_cuda uses K and V scales of 1.",
+        "vllm_cuda needs head_dim_v == head_dim; vllm_triton_diffkv writes one packed "
+        "[num_blocks, block_size, num_kv_heads, head_dim + head_dim_v] cache.",
         "GB/s counts the K and V reads and writes and the int64 slot map, not the scales.",
     ),
     # The torch backend is the PyTorch reference; it lives in the runner module.
@@ -109,6 +120,37 @@ register(
                 "vLLM's reshape_and_cache_flash CUDA kernel writes both K and V to mapped slots."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/cache_kernels.cu",
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_triton_diffkv",
+        # Source: vllm/v1/attention/ops/triton_reshape_and_cache_flash.py in the
+        # alignment vLLM checkout. A plain Triton store kernel with no
+        # architecture-specific path, so no compute-capability gate. Its fp8
+        # cache path is not measured or claimed yet.
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+        ),
+        runner_ref=RunnerRef(
+            module_name=_RUNNER_MODULE,
+            function_name="profile_kv_cache_append_vllm_triton_diffkv",
+        ),
+        table_name=KIND,
+        args_schema=KvCacheAppendArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's Triton diffkv kernel writes K and V, of their own head sizes, "
+                "into one packed cache in a single launch."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py",
         ),
     )
 )

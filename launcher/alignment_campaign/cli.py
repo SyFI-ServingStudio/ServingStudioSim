@@ -12,9 +12,18 @@ would also read as `alignment campaign run --phase simulation` invoking
     label    apply the pack's rule set to a fixpoint
     extract  completed reports -> one metrics document
     compare  judge that document against tolerances and the golden
+    bundle   scrub a campaign's captures into one publishable directory
+    verify-bundle  check a bundle against this checkout and place its captures
 
-`--phase` values are artifact directory names, so the phase, its config, its
-output directory and its `.complete` marker all share one name.
+`--phase` names a pipeline step (profile_nsys, timing_predict, simulation, ...).
+Its values are artifact directory names, so the step, its config, its output
+directory and its `.complete` marker all share one name.
+
+`--alignment-phase {1,2}` (render, run, label, extract, compare) picks the
+cases. 1 is the pack's alignment Phase 1 cases (`phase: 1`): one diverse_100
+run per deployment, the check a model PR must pass. 2 is alignment Phase 2, the
+full matrix, Phase 1 cases included, which is also what a verb covers without
+the flag. It is unrelated to `--phase`.
 """
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ import json
 import sys
 from pathlib import Path
 
+from . import bundle as bundle_module
 from . import check as check_module
 from . import compare as compare_module
 from . import execute
@@ -57,9 +67,27 @@ def _resolve_host(value: str):
     return load_host(candidate)
 
 
-def _selected_cases(pack: Pack, names: list[str] | None) -> list[Case]:
+#: `--alignment-phase` values: 1 selects the Phase 1 cases, 2 the full matrix.
+ALIGNMENT_PHASE_CHOICES = (1, 2)
+
+
+def _phase1_cases(pack: Pack) -> tuple[Case, ...]:
+    cases = pack.phase1_cases
+    if not cases:
+        raise PackError(
+            f"pack {pack.name} declares no alignment Phase 1 case; mark each deployment's "
+            "diverse_100 case with `phase: 1`"
+        )
+    return cases
+
+
+def _selected_cases(
+    pack: Pack, names: list[str] | None, alignment_phase: int | None = None
+) -> list[Case]:
+    phase1 = alignment_phase == 1
+    pool = _phase1_cases(pack) if phase1 else pack.cases
     if not names:
-        return list(pack.cases)
+        return list(pool)
     chosen: list[Case] = []
     for name in names:
         case = pack.case_named(name)
@@ -68,8 +96,35 @@ def _selected_cases(pack: Pack, names: list[str] | None) -> list[Case]:
                 f"no case {name!r} in pack {pack.name}; "
                 f"available: {[item.slug for item in pack.cases]}"
             )
+        if case not in pool:
+            raise PackError(
+                f"case {case.slug} is not an alignment Phase 1 case (--alignment-phase 1)"
+            )
         chosen.append(case)
     return chosen
+
+
+def _phase1_slugs(args, pack: Pack | None) -> set[str] | None:
+    """Phase 1 case slugs for the read-side verbs, or None unless
+    `--alignment-phase 1` (Phase 2 is every case)."""
+    if getattr(args, "alignment_phase", None) != 1:
+        return None
+    if pack is None:
+        raise PackError(
+            "--alignment-phase 1 selects cases by the pack's `phase: 1`; it needs --pack"
+        )
+    return {case.slug for case in _phase1_cases(pack)}
+
+
+def _add_alignment_phase(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--alignment-phase",
+        type=int,
+        choices=ALIGNMENT_PHASE_CHOICES,
+        help="1: only the pack's alignment Phase 1 cases (`phase: 1`); 2: alignment "
+        "Phase 2, the full matrix with Phase 1 included (the same as omitting it). "
+        "Unrelated to --phase, which names a pipeline step",
+    )
 
 
 def _acceptance_schemas(pack: Pack | None) -> dict[str, int] | None:
@@ -127,9 +182,14 @@ def _render(args) -> int:
     assert pack is not None
     host = _resolve_host(args.host)
     out_root = Path(args.out_root)
-    for case in _selected_cases(pack, args.case):
+    for case in _selected_cases(pack, args.case, args.alignment_phase):
         rendered = render_module.render_case(pack, case, host, out_root, REPO_ROOT)
         print(f"[render] {rendered.directory}  ({len(rendered.files)} files)")
+        for reason in rendered.pending:
+            print(
+                f"[render] {case.slug}: simulation.yaml waits for its from_capture inputs "
+                f"({reason}); `run --phase timing_predict|simulation` writes it"
+            )
     first_phase = render_module.phase_names(next(iter(pack.variants.values())))[0]
     print(f"[render] host {host.name}; next: `alignment-campaign run --phase {first_phase}`")
     return 0
@@ -138,7 +198,7 @@ def _render(args) -> int:
 def _run(args) -> int:
     pack = _resolve_pack(args.pack)
     assert pack is not None
-    cases = _selected_cases(pack, args.case)
+    cases = _selected_cases(pack, args.case, args.alignment_phase)
     out_root = Path(args.out_root)
     if args.dry_run:
         plans = execute.plan_phase(
@@ -148,9 +208,11 @@ def _run(args) -> int:
             cases=cases,
             refresh=args.refresh,
             resume=args.resume,
+            runtime=args.runtime,
+            allow_autotune=args.allow_autotune,
         )
         print(execute.describe_plan(args.phase, plans))
-        _print_calibration_prerequisites(pack)
+        _print_calibration_prerequisites(pack, cases)
         return 0
     report = execute.run_phase(
         pack,
@@ -160,6 +222,8 @@ def _run(args) -> int:
         refresh=args.refresh,
         resume=args.resume,
         parallelism=args.parallelism,
+        runtime=args.runtime,
+        allow_autotune=args.allow_autotune,
     )
     for result in report.results:
         status = "ok" if result.returncode == 0 else f"exit {result.returncode}"
@@ -175,10 +239,20 @@ def _run(args) -> int:
     return 0
 
 
-def _print_calibration_prerequisites(pack: Pack) -> None:
-    """List the preflight measurements a run still depends on. Never executed
-    automatically: their result is an edit to the pack's calibrated block, which
-    is a change a person should see."""
+def _print_calibration_prerequisites(pack: Pack, cases: list[Case]) -> None:
+    """List the calibrated inputs a run still depends on.
+
+    A `from_capture` input is read automatically from the case's workload pass
+    when timing_predict or simulation runs, and recorded in calibration.json.
+    A provisional one is not: replacing it is an edit to the pack's calibrated
+    block, which is a change a person should see.
+    """
+    captured = [f"{case.slug}.{name}" for case in cases for name in case.capture_fields]
+    if captured:
+        print("")
+        print("[calibration] read from each case's workload pass at timing_predict/simulation:")
+        for name in captured:
+            print(f"  {name}")
     provisional = pack.provisional_fields
     if not provisional:
         return
@@ -198,7 +272,7 @@ def _label(args) -> int:
     assert pack is not None
     out_root = Path(args.out_root)
     failed = 0
-    for case in _selected_cases(pack, args.case):
+    for case in _selected_cases(pack, args.case, args.alignment_phase):
         variant = pack.variant_of(case)
         kernel_pass = next((item for item in variant.profile_passes if item.kind == "nsys"), None)
         if kernel_pass is None:
@@ -226,7 +300,7 @@ def _label(args) -> int:
 def _extract(args) -> int:
     pack = _resolve_pack(args.pack)
     roots = [Path(item) for item in args.runs.split(":") if item]
-    extraction = extract_module.extract(roots, pack)
+    extraction = extract_module.extract(roots, pack, only=_phase1_slugs(args, pack))
     path = extract_module.write_extraction(extraction, Path(args.out))
     print(f"[extract] {len(extraction.cases)} case(s) -> {path}")
     for key in extraction.unavailable:
@@ -238,6 +312,16 @@ def _extract(args) -> int:
 def _compare(args) -> int:
     pack = _resolve_pack(args.pack)
     document = extract_module.load_extraction(Path(args.measured))
+    only = _phase1_slugs(args, pack)
+    if only is not None:
+        document = {
+            **document,
+            "cases": {
+                key: body
+                for key, body in document.get("cases", {}).items()
+                if key.partition("/")[2] in only
+            },
+        }
     comparison = compare_module.compare(document, pack)
 
     if args.json:
@@ -262,6 +346,55 @@ def _compare(args) -> int:
             print(f"[record] wrote {path}")
         return 0
     return 1 if comparison.failures or comparison.unavailable else 0
+
+
+def _bundle(args) -> int:
+    pack = _resolve_pack(args.pack)
+    assert pack is not None
+    host = _resolve_host(args.host)
+    cases = _selected_cases(pack, args.case, args.alignment_phase)
+    report = bundle_module.bundle(pack, host, Path(args.out_root), cases, Path(args.dest))
+    for slug, entry in report.manifest["cases"].items():
+        for name, item in entry["passes"].items():
+            print(f"[bundle] {slug}/{name}: {item['state']}, {len(item.get('files', {}))} files")
+    print(f"[bundle] {report.dest}  ({report.bytes / 1e9:.2f} GB)")
+    if args.upload:
+        url = bundle_module.upload(
+            report.dest, args.upload, args.path_in_repo or f"{pack.name}/{report.dest.name}",
+            create_pr=not args.no_pr,
+        )
+        print(f"[bundle] uploaded: {url}")
+    return 0
+
+
+def _verify_bundle(args) -> int:
+    pack = _resolve_pack(args.pack)
+    assert pack is not None
+    if args.from_hf:
+        if not args.download_dir:
+            raise PackError("--from-hf needs --download-dir")
+        source = bundle_module.download(args.from_hf, Path(args.download_dir))
+    elif args.bundle:
+        source = Path(args.bundle)
+    else:
+        raise PackError("verify-bundle needs --bundle <dir> or --from-hf <repo>@<rev>:<path>")
+    result = bundle_module.verify_bundle(
+        pack, source, Path(args.out_root), place=not args.check_only, replace=args.replace
+    )
+    for line in result.warnings:
+        print(f"[verify-bundle] warning: {line}")
+    for line in result.skipped:
+        print(f"[verify-bundle] not placed: {line}")
+    for line in result.placed:
+        print(f"[verify-bundle] placed {line}")
+    for line in result.errors:
+        print(f"[verify-bundle] error: {line}", file=sys.stderr)
+    if result.ok and result.placed:
+        print(
+            "[verify-bundle] next: `alignment-campaign run --phase timing_predict`, then "
+            "analysis_kernel, simulation, analysis_e2e, extract and compare"
+        )
+    return 0 if result.ok else 1
 
 
 # ── parser ───────────────────────────────────────────────────────────────────
@@ -291,6 +424,7 @@ def _build_parser() -> argparse.ArgumentParser:
     render.add_argument("--host", required=True)
     render.add_argument("--out-root", required=True, help="directory to hold one dir per case")
     render.add_argument("--case", action="append", help="restrict to these cases (repeatable)")
+    _add_alignment_phase(render)
     render.set_defaults(handler=_render)
 
     run = commands.add_parser("run", help="run ONE phase across every ready case")
@@ -302,6 +436,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="artifact directory name, e.g. profile_nsys / timing_predict / analysis_kernel",
     )
     run.add_argument("--case", action="append")
+    _add_alignment_phase(run)
     run.add_argument("--dry-run", action="store_true", help="print the plan and stop")
     run.add_argument("--refresh", action="store_true", help="ignore .complete markers")
     run.add_argument(
@@ -315,12 +450,28 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1,
         help="in-process concurrency budget (default 1: GPU phases contend for one device)",
     )
+    run.add_argument(
+        "--runtime",
+        choices=("host", "image"),
+        default="image",
+        help="forwarded to `alignment profile`: image (default) captures in the engine's "
+        "reference image; host (strongly discouraged) in a host venv with no autotune "
+        "guard. Profile passes only; other phases always run on the host",
+    )
+    run.add_argument(
+        "--allow-autotune",
+        action="store_true",
+        help="forwarded to `alignment profile`: let the captured engine tune kernel "
+        "tactics (--runtime image only); without it a capture needs warm caches "
+        "(`just ref warm-caches`)",
+    )
     run.set_defaults(handler=_run)
 
     label = commands.add_parser("label", help="apply the rule set to a fixpoint")
     label.add_argument("--pack", required=True)
     label.add_argument("--out-root", required=True)
     label.add_argument("--case", action="append")
+    _add_alignment_phase(label)
     label.add_argument(
         "--refresh", action="store_true", help="re-initialize from the parsed inventory"
     )
@@ -330,12 +481,14 @@ def _build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--pack", help="optional; without it any run directory is readable")
     extract.add_argument("--runs", required=True, help="colon-separated run roots")
     extract.add_argument("--out", required=True)
+    _add_alignment_phase(extract)
     extract.set_defaults(handler=_extract)
 
     compare = commands.add_parser("compare", help="judge a metrics document")
     compare.add_argument("--pack", help="optional; needed for tolerances, drift and --record")
     compare.add_argument("--measured", required=True, help="metrics document from `extract`")
     compare.add_argument("--json", action="store_true")
+    _add_alignment_phase(compare)
     compare.add_argument("--markdown", action="store_true")
     compare.add_argument("--record", action="store_true", help="write the golden baseline")
     compare.add_argument(
@@ -344,6 +497,43 @@ def _build_parser() -> argparse.ArgumentParser:
         help="allow --record while calibrated inputs are still provisional",
     )
     compare.set_defaults(handler=_compare)
+
+    bundle = commands.add_parser(
+        "bundle", help="scrub the cases' profile passes into one publishable directory"
+    )
+    bundle.add_argument("--pack", required=True)
+    bundle.add_argument("--host", required=True, help="the host profile the captures ran with")
+    bundle.add_argument("--out-root", required=True)
+    bundle.add_argument("--case", action="append")
+    _add_alignment_phase(bundle)
+    bundle.add_argument("--dest", required=True, help="new directory to write the bundle into")
+    bundle.add_argument(
+        "--upload", metavar="REPO_ID", help="also upload to this Hugging Face dataset"
+    )
+    bundle.add_argument(
+        "--path-in-repo", help="directory in the dataset (default <pack>/<dest name>)"
+    )
+    bundle.add_argument(
+        "--no-pr", action="store_true", help="commit directly instead of opening a PR"
+    )
+    bundle.set_defaults(handler=_bundle)
+
+    verify = commands.add_parser(
+        "verify-bundle", help="check a bundle against this checkout and place its captures"
+    )
+    verify.add_argument("--pack", required=True)
+    verify.add_argument("--out-root", required=True, help="a campaign rendered on this host")
+    source = verify.add_mutually_exclusive_group(required=True)
+    source.add_argument("--bundle", help="local bundle directory")
+    source.add_argument(
+        "--from-hf", metavar="REPO@REV:PATH", help="download from a dataset at a pinned revision"
+    )
+    verify.add_argument(
+        "--download-dir", help="where --from-hf downloads (required with it; several GB)"
+    )
+    verify.add_argument("--check-only", action="store_true", help="verify, place nothing")
+    verify.add_argument("--replace", action="store_true", help="overwrite existing pass dirs")
+    verify.set_defaults(handler=_verify_bundle)
     return parser
 
 

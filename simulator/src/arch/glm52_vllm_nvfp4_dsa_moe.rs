@@ -27,6 +27,7 @@ use crate::arch::contract::{
     UnifiedArchInput,
 };
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
+use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
 use crate::op::attention::DsaSparseMlaExactVarlenConfig;
 use crate::op::Op;
@@ -590,6 +591,7 @@ fn build_configs_for_decode(
             quant_backends: NVFP4_QUANT_BACKENDS.to_vec(),
             moe_backends: NVFP4_FUSED_MOE_BACKENDS.to_vec(),
             weight_format: DType::Nvfp4E2m1,
+            activation_format: None,
             group_size: 16,
             routing_method: "minimax2".to_string(),
             n_group: 1,
@@ -1560,7 +1562,7 @@ pub struct Glm52VllmNvfp4DsaMoeModel {
     pub max_model_len: u32,
     pub num_attn_dp_groups: u16,
     pub num_attn_shards: u16,
-    pub total_state_bytes_per_token: u64,
+    pub kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1584,7 +1586,7 @@ pub struct Glm52VllmNvfp4DsaMoeSpeculativeModel {
     max_model_len: u32,
     num_attn_dp_groups: u16,
     num_attn_shards: u16,
-    total_state_bytes_per_token: u64,
+    kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1735,7 +1737,7 @@ pub fn build(
         max_model_len,
         num_attn_dp_groups: 1,
         num_attn_shards: ep_size,
-        total_state_bytes_per_token: state_bytes_per_token(ep_size, Glm52MtpMode::Off)?,
+        kv_cache_layout: kv_cache_layout(ep_size, Glm52MtpMode::Off),
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -1810,7 +1812,7 @@ pub fn build_speculative(
         max_model_len,
         num_attn_dp_groups: 1,
         num_attn_shards: ep_size,
-        total_state_bytes_per_token: state_bytes_per_token(ep_size, mtp_mode)?,
+        kv_cache_layout: kv_cache_layout(ep_size, mtp_mode),
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -2056,8 +2058,8 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4DsaMoeModel {
         normalize_input(batch, self.target.ep_size, self.max_model_len).map(|_| ())
     }
 
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_state_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn gpus_per_replica(&self) -> u16 {
@@ -2168,8 +2170,8 @@ impl SpeculativeUnifiedModel for Glm52VllmNvfp4DsaMoeSpeculativeModel {
         normalize_speculative_input(batch, self.draft_tokens, self.max_model_len).map(|_| ())
     }
 
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_state_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn max_model_len(&self) -> u32 {
@@ -2494,15 +2496,15 @@ pub(crate) fn normalize_speculative_input(
             input.draft_tokens
         ));
     }
+    let verify_width = draft_tokens
+        .checked_add(1)
+        .ok_or_else(|| "draft_tokens + 1 overflows u32".to_string())?;
     if input.groups.len() != 1 {
         return Err(format!(
             "expected exactly one tensor-parallel attention group, got {}",
             input.groups.len()
         ));
     }
-    let verify_width = draft_tokens
-        .checked_add(1)
-        .ok_or_else(|| "draft_tokens + 1 overflows u32".to_string())?;
     let mut groups = Vec::with_capacity(input.groups.len());
     let mut total_tokens = 0_u32;
     for (group_index, group) in input.groups.iter().enumerate() {
@@ -2541,28 +2543,29 @@ pub(crate) fn normalize_speculative_input(
             .map_err(|_| format!("group {group_index} decode request count exceeds u32"))?;
         let mut decode_tokens = 0_u32;
         let mut decode_context_lens = Vec::with_capacity(group.decode_requests.len());
+        let mut clipped_query_cache_pairs = Vec::new();
         for (request_index, decode) in group.decode_requests.iter().enumerate() {
-            // The scheduler does not admit partial verify groups, because a
-            // ragged one would leave the uniform decode kernels behind. The
-            // accepted count truncates the output after this compute, not the
-            // compute itself -- the pass is `k + 1` rows either way.
-            if decode.query_len != verify_width {
-                return Err(format!(
-                    "group {group_index} decode request {request_index} query_len {} must equal verify width {verify_width}",
-                    decode.query_len
-                ));
-            }
-            if !(verify_width..=max_model_len).contains(&decode.kv_len) {
-                return Err(format!(
-                    "group {group_index} decode request {request_index} kv_len {} must be in {verify_width}..={max_model_len}",
-                    decode.kv_len
-                ));
-            }
+            // A full verify window runs the uniform `k + 1`-row decode kernels;
+            // acceptance truncates the output after this compute, not the
+            // compute. Only a request at max_model_len verifies fewer rows, and
+            // that ragged row cannot share the uniform launch: price it on the
+            // prefill-shaped `(query, cache)` path, a profiled shape. Such
+            // steps are rare (the last verifies of a request ending within
+            // `k` of the limit).
+            let clipped = decode
+                .check_verify_row(draft_tokens, max_model_len)
+                .map_err(|reason| {
+                    format!("group {group_index} decode request {request_index}: {reason}")
+                })?;
             decode_tokens = decode_tokens
                 .checked_add(decode.query_len)
                 .ok_or_else(|| format!("group {group_index} decode token sum overflows u32"))?;
-            decode_context_lens.push(decode.kv_len);
             endpoint_context_lens.push(decode.kv_len);
+            if clipped {
+                clipped_query_cache_pairs.push((decode.query_len, decode.kv_len));
+                continue;
+            }
+            decode_context_lens.push(decode.kv_len);
         }
         if group.decode_tokens != decode_tokens {
             return Err(format!(
@@ -2593,16 +2596,22 @@ pub(crate) fn normalize_speculative_input(
         total_tokens = total_tokens
             .checked_add(batch_tokens)
             .ok_or_else(|| "pooled token count overflows u32".to_string())?;
+        // A clipped verify row stays on the prefill-shaped path whatever its
+        // width: it is not an append that `attention_input` may reclassify.
+        let mut attention_input =
+            attention_input(prefill_query_cache_pairs, decode_context_lens, verify_width);
+        for (query_len, kv_len) in clipped_query_cache_pairs {
+            attention_input.num_new_tokens += query_len;
+            attention_input
+                .prefill_query_cache_pairs
+                .push((query_len, kv_len));
+        }
         groups.push(NormalizedGroup {
             batch_tokens,
             request_count,
             logits_rows,
             endpoint_context_lens,
-            attention_input: attention_input(
-                prefill_query_cache_pairs,
-                decode_context_lens,
-                verify_width,
-            ),
+            attention_input,
         });
     }
     Ok(NormalizedBatch {
@@ -2700,64 +2709,65 @@ fn expected_speculative_slot_count(
     expected_slot_count(ep_size) + expected_mtp_pass_slots(ep_size, false) + recurrent
 }
 
-/// Decoder layer `layer`'s cached state for one token on one rank.
-///
-/// MLA stores one FP8 (kv_lora_rank + rope_dim) vector in every layer. Only a
-/// full-index layer builds a DSA indexer and so allocates its FP8 index key
-/// plus one FP32 scale: an IndexShare layer reuses an earlier layer's top-k and
-/// vLLM constructs no `Indexer` (hence no `DeepseekV32IndexerCache`) for it
-/// (vLLM #45895, `deepseek_v2.py` `_skip_topk`).
-pub(crate) fn decoder_layer_state_bytes_per_token(layer: u32) -> u64 {
-    let index = if FULL_INDEX_LAYERS.contains(&layer) {
-        index_key_bytes_per_layer_token()
-    } else {
-        0
-    };
-    mla_latent_bytes_per_layer_token() + index
-}
-
-/// Cached state for one token on one rank over decoder layers `start..end`.
-pub(crate) fn layer_range_state_bytes_per_token(start: u32, end: u32) -> u64 {
-    (start..end).map(decoder_layer_state_bytes_per_token).sum()
-}
-
-/// One layer's fp8 MLA latent (compressed KV plus RoPE key) for one token.
-pub(crate) fn mla_latent_bytes_per_layer_token() -> u64 {
+/// One decoder layer's MLA cache for one token on one rank: one FP8
+/// (kv_lora_rank + rope_dim) vector.
+pub(crate) fn mla_bytes_per_layer_token() -> u64 {
     u64::from(KV_LORA_RANK + ROPE_DIM) * u64::from(DType::Fp8E4m3.size_bytes())
 }
 
-/// One layer's DSA indexer key for one token: the fp8 key plus its fp32 scale.
-pub(crate) fn index_key_bytes_per_layer_token() -> u64 {
+/// One indexer layer's DSA index cache for one token on one rank: the FP8
+/// index key plus one FP32 scale.
+pub(crate) fn indexer_bytes_per_layer_token() -> u64 {
     u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes())
 }
 
-pub(crate) fn state_bytes_per_token(
-    ep_size: u16,
-    mtp_mode: Glm52MtpMode,
-) -> std::result::Result<u64, BuildError> {
-    // vLLM keeps both caches replicated on every TP rank: an MLA latent in
-    // all 78 body layers, an index key only in the 21 full-index layers.
-    let main_per_rank = layer_range_state_bytes_per_token(0, NUM_LAYERS);
-    let mtp_mla_per_rank = u64::from(KV_LORA_RANK + ROPE_DIM)
-        .checked_mul(u64::from(DType::Fp8E4m3.size_bytes()))
-        .ok_or_else(|| fit_failed("MTP MLA state bytes overflow u64"))?;
-    let per_rank = match mtp_mode {
-        Glm52MtpMode::Off => Some(main_per_rank),
-        Glm52MtpMode::FullIndex => main_per_rank
-            .checked_add(mtp_mla_per_rank)
-            .and_then(|value| {
-                value.checked_add(u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes()))
-            }),
-        Glm52MtpMode::IndexShare => main_per_rank.checked_add(mtp_mla_per_rank),
-    }
-    .ok_or_else(|| fit_failed("per-rank state bytes overflow u64"))?;
+/// Name of the layout part holding the MLA latent, the part SGLang HiSparse
+/// moves to host memory.
+pub(crate) const MLA_LATENT_PART: &str = "mla";
 
-    // IterwiseUnifiedModel's KV contract is the physical total across all
-    // attention ranks. Multiplying the replicated per-rank allocation by TP
-    // keeps both worker capacity and PD wire-size accounting consistent.
-    per_rank
-        .checked_mul(u64::from(ep_size))
-        .ok_or_else(|| fit_failed("replicated state bytes overflow u64"))
+/// The MLA latent and DSA index caches of `mla_layers` and `index_layers`
+/// layers over an attention TP group of `attn_tp` ranks. vLLM and SGLang
+/// replicate both on every rank, so the group keeps `attn_tp` copies.
+pub(crate) fn mla_dsa_kv_cache_layout(
+    mla_layers: u32,
+    index_layers: u32,
+    attn_tp: u16,
+) -> KvCacheLayout {
+    let replicas = u32::from(attn_tp);
+    KvCacheLayout::new()
+        .with_part(
+            KvCachePart::per_token(
+                MLA_LATENT_PART,
+                u64::from(mla_layers) * mla_bytes_per_layer_token(),
+            )
+            .replicated(replicas),
+        )
+        .with_part(
+            KvCachePart::per_token(
+                "indexer",
+                u64::from(index_layers) * indexer_bytes_per_layer_token(),
+            )
+            .replicated(replicas),
+        )
+}
+
+/// The whole model's cache: the latent of all 78 body layers and the index key
+/// of the 21 full-index layers, plus the MTP layer's latent and index key.
+///
+/// vLLM builds an indexer, and so an index cache, only on a layer that
+/// computes its own top-k; a shared layer reuses the previous result and has
+/// none. The MTP layer always builds one, whether or not its later draft steps
+/// share the index (fork `deepseek_v2.py`, `DeepseekV2MLAAttention`).
+pub(crate) fn kv_cache_layout(attn_tp: u16, mtp_mode: Glm52MtpMode) -> KvCacheLayout {
+    let mtp = match mtp_mode {
+        Glm52MtpMode::Off => 0,
+        Glm52MtpMode::FullIndex | Glm52MtpMode::IndexShare => NUM_MTP_LAYERS,
+    };
+    mla_dsa_kv_cache_layout(
+        NUM_LAYERS + mtp,
+        FULL_INDEX_LAYERS.len() as u32 + mtp,
+        attn_tp,
+    )
 }
 
 #[cfg(test)]
@@ -3442,35 +3452,52 @@ mod tests {
 
     #[test]
     fn state_and_topology_contracts_are_exact() {
+        // 78 latents of 576 B and 21 index keys of 132 B per rank, plus one
+        // of each for the MTP layer in either MTP mode.
+        let bytes = |mode| kv_cache_layout(4, mode).per_token_bytes();
+        assert_eq!(bytes(Glm52MtpMode::Off), 4 * (78 * 576 + 21 * 132));
+        assert_eq!(bytes(Glm52MtpMode::FullIndex), 4 * (79 * 576 + 22 * 132));
         assert_eq!(
-            state_bytes_per_token(4, Glm52MtpMode::Off).unwrap(),
-            190_800
-        );
-        assert_eq!(
-            state_bytes_per_token(4, Glm52MtpMode::FullIndex).unwrap(),
-            193_632
-        );
-        assert_eq!(
-            state_bytes_per_token(4, Glm52MtpMode::IndexShare).unwrap(),
-            193_104
+            bytes(Glm52MtpMode::IndexShare),
+            bytes(Glm52MtpMode::FullIndex)
         );
     }
 
+    /// The fork's (892da082) "GPU KV cache size" and "Maximum concurrency for
+    /// N tokens per request" at TP4, without and with five MTP drafts. An
+    /// older vLLM gave every layer an index key (55,224 B per rank and token);
+    /// this one gives it only to the layers that compute top-k.
     #[test]
-    fn only_full_index_layers_cache_an_index_key() {
-        // vLLM builds a DSA indexer (and its DeepseekV32IndexerCache) only on
-        // the 21 full-index layers; the 57 IndexShare layers cache the MLA
-        // latent alone. (An older vLLM allocated an index key on every layer:
-        // 341,120 tokens in 17.55 GiB per TP4 rank, i.e. 78 * 708 B/token.)
-        assert_eq!(FULL_INDEX_LAYERS.len(), 21);
-        assert_eq!(
-            layer_range_state_bytes_per_token(0, NUM_LAYERS),
-            78 * 576 + 21 * 132
-        );
-        assert_eq!(
-            state_bytes_per_token(4, Glm52MtpMode::Off).unwrap(),
-            4 * layer_range_state_bytes_per_token(0, NUM_LAYERS)
-        );
+    fn kv_cache_layout_reproduces_vllms_logged_concurrency() {
+        use crate::worker::kv::{KvAccounting, KvAccountingOptions};
+        for (gib_per_rank, max_model_len, mtp_mode, logged_tokens, logged) in [
+            (41.58, 131_072, Glm52MtpMode::Off, 935_872, 7.14),
+            (35.26, 131_072, Glm52MtpMode::Off, 793_600, 6.05),
+            (34.49, 131_072, Glm52MtpMode::FullIndex, 764_992, 5.84),
+            (11.89, 8192, Glm52MtpMode::FullIndex, 263_616, 32.18),
+        ] {
+            let layout = kv_cache_layout(4, mtp_mode);
+            let budget = (gib_per_rank * f64::from(1u32 << 30)) as u64 * 4;
+            let tokens = budget / layout.per_token_bytes();
+            assert!(
+                (tokens as f64 / f64::from(logged_tokens) - 1.0).abs() < 0.005,
+                "{gib_per_rank} GiB {mtp_mode:?}: {tokens} vs {logged_tokens} tokens"
+            );
+            let options = KvAccountingOptions {
+                prefix_caching: true,
+                ..Default::default()
+            };
+            let accounting = KvAccounting::resolve(&layout, options, budget).unwrap();
+            let concurrency = accounting.concurrency_at(max_model_len);
+            assert!(
+                (concurrency / logged - 1.0).abs() < 0.005,
+                "{gib_per_rank} GiB {mtp_mode:?}: {concurrency} vs {logged}"
+            );
+            // `kv_cache.json` reports the same two numbers.
+            let report = accounting.report(Some(max_model_len as u32)).result;
+            assert_eq!(report.capacity_tokens, Some(tokens));
+            assert_eq!(report.max_concurrency_at_max_model_len, Some(concurrency));
+        }
     }
 
     fn group(prefill_tokens: u32, decode_lens: Vec<u32>, pairs: Vec<(u32, u32)>) -> ArchGroupInput {
@@ -3571,6 +3598,39 @@ mod tests {
     }
 
     #[test]
+    fn a_verify_clipped_at_the_model_limit_runs_its_rows_on_the_prefill_path() {
+        // vLLM clips a request at the context limit to the rows that leave its
+        // sampled position inside max_model_len. The ragged row bills exactly
+        // its queries and every one is scored, but it leaves the uniform
+        // decode launch to the full-width requests.
+        let mut input = speculative_input(5, vec![], vec![64, 91]);
+        let group = &mut input.groups[0];
+        group.decode_requests.push(SpeculativeDecodeInput {
+            kv_len: 8_191,
+            query_len: 2,
+            committed_rows: 2,
+        });
+        group.decode_tokens += 2;
+        group.batch_tokens += 2;
+        group.total_kv_len += 8_189;
+        let normalized = normalize_speculative_input(&input, 5, 8_192).unwrap();
+        let group = &normalized.groups[0];
+
+        assert_eq!(group.batch_tokens, 14);
+        assert_eq!(group.request_count, 3);
+        assert_eq!(group.logits_rows, 14);
+        assert_eq!(group.endpoint_context_lens, vec![64, 91, 8_191]);
+        assert_eq!(
+            group.attention_input.prefill_query_cache_pairs,
+            vec![(2, 8_191)]
+        );
+        let decode = group.attention_input.decode.as_ref().unwrap();
+        assert_eq!(decode.batch_size, 2);
+        assert_eq!(decode.context_lens.as_deref(), Some(&[64, 91][..]));
+        assert_eq!(group.attention_input.num_new_tokens, 14);
+    }
+
+    #[test]
     fn a_recurrent_draft_pass_forwards_one_row_per_request_at_an_advanced_context() {
         let input = speculative_input(5, vec![(3, 2)], vec![64]);
         let normalized = normalize_speculative_input(&input, 5, 8_192).unwrap();
@@ -3600,7 +3660,8 @@ mod tests {
         let input = speculative_input(5, vec![], vec![64]);
         assert!(normalize_speculative_input(&input, 3, 8_192).is_err());
 
-        // A ragged verify group is not a shape the scheduler admits.
+        // A ragged verify row away from max_model_len is not a shape the
+        // scheduler produces.
         let mut ragged = speculative_input(5, vec![], vec![64, 91]);
         ragged.groups[0].decode_requests[1].query_len = 4;
         ragged.groups[0].decode_tokens = 10;

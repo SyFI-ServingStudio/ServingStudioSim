@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Wed, 23 Sep 2026 00:40:32 -0700
+Subject: [PATCH] eplb: add a record-only mode that never rearranges
+
+`EPLBConfig.rearrange=False` keeps the initial placement and only records
+expert load for `log_balancedness`. It allocates no transfer buffer (one
+layer of expert weights per model -- gigabytes for a BF16 MTP drafter layer),
+skips the rehearsed transfer in profile_run, and starts no async worker.
+
+A routing capture needs the per-step load log, not rebalancing. On GLM-5.2
+NVFP4 MTP-5 TP4 EP4 a rearranging EPLB cost ~16 GiB per GPU and left the
+deployment's calibrated 0.75 memory budget with -7.33 GiB of KV cache; with
+rearrange=False model load and KV capacity match a run without EPLB
+(112.44 vs 112.22 GiB, 8.63 vs 8.58 GiB).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ tests/distributed/test_eplb_utils.py | 24 +++++++++++++
+ vllm/config/parallel.py              |  7 ++++
+ vllm/distributed/eplb/eplb_state.py  | 54 ++++++++++++++++++----------
+ 3 files changed, 67 insertions(+), 18 deletions(-)
+
+diff --git a/tests/distributed/test_eplb_utils.py b/tests/distributed/test_eplb_utils.py
+index f54d2cd08742314d33bfad92426076caca327687..8e646162a61b7be845149af9e3e18fe87aad1d43 100644
+--- a/tests/distributed/test_eplb_utils.py
++++ b/tests/distributed/test_eplb_utils.py
+@@ -6,7 +6,9 @@ from unittest.mock import MagicMock
+ import pytest
+ import torch
+ 
++import vllm.distributed.eplb.eplb_state as eplb_state_module
+ from vllm.distributed.eplb.eplb_state import (
++    EplbState,
+     _commit_eplb_maps,
+     _commit_eplb_maps_for_layer,
+ )
+@@ -182,3 +184,25 @@ def test_commit_eplb_maps_for_layer_does_not_sync_host():
+         _commit_eplb_maps_for_layer(model_state, new_phy2log, layer=0)
+     finally:
+         torch.cuda.set_sync_debug_mode(prev_mode)
++
++
++def test_record_only_eplb_never_rearranges(monkeypatch):
++    """rearrange=False keeps the placement: no profile rehearsal, no interval
++    rearrangement, and no rearrangement-window recording."""
++    monkeypatch.setattr(eplb_state_module, "get_ep_group", MagicMock())
++    state = EplbState.__new__(EplbState)
++    state.rearranges = False
++    state.is_async = False
++    state.model_states = {}
++    state.expert_rearrangement_step = 10
++    state.expert_rearrangement_step_interval = 10
++    state.expert_load_window_size = 4
++    state.should_record_tensor = torch.tensor(True)
++    state._should_record_value = True
++    state.rearrange = MagicMock()
++
++    state.step(is_profile=True)
++    state.step()
++
++    state.rearrange.assert_not_called()
++    assert not state.should_record_tensor.item()
+diff --git a/vllm/config/parallel.py b/vllm/config/parallel.py
+index cc0fa1ac58d64d1d0ab55281578a4079d710f179..0c48d8c5d6ab9a43dbb2fe8a4eda0464ae7f422b 100644
+--- a/vllm/config/parallel.py
++++ b/vllm/config/parallel.py
+@@ -96,6 +96,13 @@ class EPLBConfig:
+     """
+     Whether to use non-blocking EPLB.
+     """
++    rearrange: bool = True
++    """
++    Whether EPLB moves experts between ranks. When False the initial placement
++    is kept for the whole run and EPLB only records expert load (for
++    `log_balancedness`): no transfer buffer is allocated, `profile_run` does not
++    rehearse a rearrangement, and no async worker is started.
++    """
+ 
+     policy: EPLBPolicyOption = "default"
+     """The policy type for expert parallel load balancing (EPLB)."""
+diff --git a/vllm/distributed/eplb/eplb_state.py b/vllm/distributed/eplb/eplb_state.py
+index bb4e46dbf8d10609e37b97eed08196988ee516e4..bd4218588122f439d6f9bf9b56266174b5b60c91 100644
+--- a/vllm/distributed/eplb/eplb_state.py
++++ b/vllm/distributed/eplb/eplb_state.py
+@@ -217,9 +217,10 @@ class EplbModelState:
+     """
+     Device index for the async EPLB worker thread.
+     """
+-    communicator: EplbCommunicator
++    communicator: EplbCommunicator | None
+     """
+-    The communicator for expert weight transfers.
++    The communicator for expert weight transfers; None when EPLB never
++    rearranges.
+     """
+     pending_result: AsyncEplbLayerResult | None = None
+     """
+@@ -284,6 +285,10 @@ class EplbState:
+         a single ``.fill_()`` updates all layers at once.  Allocated on the
+         first call to :meth:`_propagate_shared_tensors`.
+         """
++        self.rearranges: bool = parallel_config.eplb_config.rearrange
++        """
++        Whether EPLB moves experts; False records expert load only.
++        """
+         self._should_record_value: bool | None = None
+         """Last value written to ``should_record_tensor``."""
+         self._pending_balancedness: deque[
+@@ -406,7 +411,7 @@ class EplbState:
+         if max_forwards_per_step <= 0:
+             raise ValueError("max_forwards_per_step must be positive")
+         self.validate_ep_configuration(model)
+-        self.is_async = self.parallel_config.eplb_config.use_async
++        self.is_async = self.parallel_config.eplb_config.use_async and self.rearranges
+ 
+         physical_to_logical_map_list = (
+             EplbState.build_initial_global_physical_to_logical_map(
+@@ -547,18 +552,24 @@ class EplbState:
+         assert backend is not None, (
+             "EPLB communicator backend must be set by ParallelConfig"
+         )
+-        expert_buffer = (
+-            None
+-            if backend == "symm_mem"
+-            else [torch.empty_like(w) for w in model.expert_weights[0]]
+-        )
+-        communicator = create_eplb_communicator(
+-            group_coordinator=get_eplb_group(),
+-            backend=backend,
+-            expert_weights=model.expert_weights,
+-            expert_buffer=expert_buffer,
+-        )
+-        expert_buffer = communicator.owned_expert_buffer or expert_buffer
++        # The transfer buffer is one layer of expert weights -- gigabytes for a
++        # BF16 drafter layer -- so a record-only EPLB does not allocate it.
++        if self.rearranges:
++            expert_buffer = (
++                None
++                if backend == "symm_mem"
++                else [torch.empty_like(w) for w in model.expert_weights[0]]
++            )
++            communicator = create_eplb_communicator(
++                group_coordinator=get_eplb_group(),
++                backend=backend,
++                expert_weights=model.expert_weights,
++                expert_buffer=expert_buffer,
++            )
++            expert_buffer = communicator.owned_expert_buffer or expert_buffer
++        else:
++            expert_buffer = []
++            communicator = None
+         assert expert_buffer is not None
+ 
+         model_state = EplbModelState(
+@@ -653,7 +664,8 @@ class EplbState:
+                 eplb_model_state.expert_load_pass.zero_()
+ 
+         if is_profile:
+-            self.rearrange(is_profile=True)
++            if self.rearranges:
++                self.rearrange(is_profile=True)
+             return
+ 
+         if log_stats:
+@@ -779,7 +791,11 @@ class EplbState:
+                         ep_rank=ep_group.rank(),
+                     )
+ 
+-        if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
++        if (
++            self.rearranges
++            and self.expert_rearrangement_step
++            >= self.expert_rearrangement_step_interval
++        ):
+             if self.is_async and any(
+                 eplb_model_state.rebalanced
+                 for eplb_model_state in self.model_states.values()
+@@ -832,7 +848,9 @@ class EplbState:
+         steps_remaining = (
+             self.expert_rearrangement_step_interval - self.expert_rearrangement_step
+         )
+-        should_record_for_rearrange = steps_remaining <= self.expert_load_window_size
++        should_record_for_rearrange = (
++            self.rearranges and steps_remaining <= self.expert_load_window_size
++        )
+ 
+         if not log_stats:
+             return should_record_for_rearrange

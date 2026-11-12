@@ -394,11 +394,12 @@ mod tests {
         };
         let layout = PipelineLayout {
             depth,
-            kv_bytes_per_token: 1,
             tier_kv_bytes_per_token: 1,
             tier_state_bytes_per_request: 0,
             activation_bytes_per_token: 0,
         };
+        let kv_cache_layout = crate::arch::kv_layout::KvCacheLayout::new()
+            .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 1));
         let flow = PpFlow::new(
             Rc::clone(&store),
             &PpStagePoolConfig {
@@ -413,6 +414,7 @@ mod tests {
                     "stage",
                     Arc::clone(&model),
                     layout,
+                    &kv_cache_layout,
                     Rc::clone(&store),
                     config,
                     None,

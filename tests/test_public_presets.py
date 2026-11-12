@@ -149,3 +149,34 @@ def test_every_member_is_measured(index):
         if member.error or member.missing
     ]
     assert not unmeasured
+
+
+@pytest.mark.presets
+@pytest.mark.needs_binary
+@pytest.mark.needs_db
+def test_every_attention_member_declares_its_kv_cache(index):
+    """A member that holds attention carries its arch's KV layout, which the
+    Models page shows per GPU; an FFN side holds none."""
+    for preset in index.presets.values():
+        for member in preset.members:
+            kv = member.kv_cache
+            if member.contract == "layer_wise_ffn":
+                assert kv is None, (preset.id, member.params)
+                continue
+            assert kv["attention_shards"] >= 1, (preset.id, member.params)
+            parts = kv["layout"]["parts"]
+            assert parts and all(part["bytes_per_entry"] > 0 for part in parts), (
+                preset.id,
+                member.params,
+            )
+            # Each entry comes in three sizes the page reads as given: over the
+            # partition, stored once, and on one of the partition's GPUs.
+            for part in parts:
+                placement = part["placement"]
+                assert (
+                    part["one_copy_bytes_per_entry"] * placement["replicas"]
+                    == part["bytes_per_entry"]
+                ), (preset.id, member.params, part["name"])
+                assert part["per_gpu_bytes_per_entry"] * kv["attention_shards"] == pytest.approx(
+                    part["bytes_per_entry"]
+                ), (preset.id, member.params, part["name"])

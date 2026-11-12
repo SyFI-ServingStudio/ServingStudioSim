@@ -1,0 +1,10 @@
+# SGLang reference engine: the upstream commit patches/ apply to and its official image.
+# Read by reference_engines (README.md); change it with `just ref bump-base sglang`.
+upstream_repo: https://github.com/sgl-project/sglang.git
+upstream_commit: 9d547e19ff519f0d1b964b0b1c014d98dc65caf4
+image: docker.io/lmsysorg/sglang:nightly-dev-cu13-20261108-9d547e19
+platforms:
+  linux/amd64:
+    digest: sha256:528d797d1e75b4b985f402f1236dc81e2575c199a05d493ee8cb2a64e977ca5e
+  linux/arm64:
+    digest: sha256:400aea754dcfa0496070f3c4ae2929039dc2678160c23517000c65dd38a229b7

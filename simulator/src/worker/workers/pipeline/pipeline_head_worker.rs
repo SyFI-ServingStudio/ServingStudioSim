@@ -58,13 +58,9 @@ use crate::worker::types::{
 pub struct PipelineLayout {
     /// Number of stages, and so the maximum number of microbatches in flight.
     pub depth: u16,
-    /// KV bytes per token on the stage holding the most KV. Every stage keeps
-    /// the same blocks, so the stage with the most bytes per token bounds the
-    /// pipeline's token capacity.
-    pub kv_bytes_per_token: u64,
     /// Bytes per token each GPU reads from a DRAM/SSD tier: the most loaded
-    /// stage's (`kv_bytes_per_token`), or the stages' mean when tier loads
-    /// are assumed balanced (`prefix_tier_balanced_load`).
+    /// stage's, or the stages' mean when tier loads are assumed balanced
+    /// (`prefix_tier_balanced_load`).
     pub tier_kv_bytes_per_token: u64,
     /// Recurrent-state bytes each GPU reads from a tier per load, on the same
     /// GPU as `tier_kv_bytes_per_token`: the most loaded stage's own state, or
@@ -400,7 +396,7 @@ mod tests {
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use crate::worker::admission::{FifoOrder, PipelinedChunkedPrefillAdmission};
     use crate::worker::execution::UnifiedIterExecution;
-    use crate::worker::kv::FullAttnKv;
+    use crate::worker::kv::KvCacheStore;
     use crate::worker::types::WorkerConfig;
     use crate::worker::workers::pipeline::{build_pipeline_head_worker, PipelineHead};
 
@@ -410,7 +406,7 @@ mod tests {
     fn pending_policy_is_a_composition_axis_for_the_pipeline_head() {
         assert_iter_worker::<
             PipelineHeadWorker<
-                FullAttnKv,
+                KvCacheStore,
                 PipelinedChunkedPrefillAdmission<FifoOrder>,
                 UnifiedIterExecution<FakeModel>,
             >,
@@ -419,11 +415,16 @@ mod tests {
 
     const LAYOUT: PipelineLayout = PipelineLayout {
         depth: 2,
-        kv_bytes_per_token: 2,
         tier_kv_bytes_per_token: 2,
         tier_state_bytes_per_request: 0,
         activation_bytes_per_token: 4,
     };
+
+    /// Two KV bytes per token on the most constrained stage.
+    fn kv_layout() -> crate::arch::kv_layout::KvCacheLayout {
+        crate::arch::kv_layout::KvCacheLayout::new()
+            .with_part(crate::arch::kv_layout::KvCachePart::per_token("kv", 2))
+    }
 
     fn head(
         store: SharedRequests,
@@ -446,6 +447,7 @@ mod tests {
             "stage",
             Arc::new(FakeModel::for_ms(1.0)),
             LAYOUT,
+            &kv_layout(),
             store,
             config,
             None,
@@ -651,27 +653,29 @@ mod tests {
         assert_eq!(record.telemetry.prefix_cache_hit_tokens, Some(100));
     }
 
+    /// A hybrid head over 2-byte tokens on 4-token blocks, with an 8-unit
+    /// recurrent state per request and one null block.
     fn hybrid_head(
         store: SharedRequests,
         max_batch_tokens: u32,
         attn_kv_bytes: u64,
-        align_mode: bool,
-    ) -> crate::worker::workers::pipeline::HybridPipelineHead<FakeModel> {
+        block_aligned_chunks: bool,
+    ) -> PipelineHead<FakeModel> {
+        use crate::arch::kv_layout::{EngineOverhead, KvCachePart};
+        use crate::worker::config::PrefillChunkAlignment;
         use crate::worker::kv::{PrefixCacheConfig, PrefixCachePolicy};
-        use crate::worker::workers::pipeline::{
-            build_hybrid_pipeline_head_worker, PipelineHybridState,
-        };
-        build_hybrid_pipeline_head_worker(
+        let kv_cache_layout = kv_layout()
+            .with_part(KvCachePart::per_request("state", 16))
+            .with_engine(EngineOverhead {
+                block_tokens: Some(4),
+                fixed_device_bytes: 8,
+            });
+        build_pipeline_head_worker(
             WorkerId(0),
             "stage",
             Arc::new(FakeModel::for_ms(1.0)),
             PipelineLayout { depth: 3, ..LAYOUT },
-            // 4-token blocks of 2 x 4 = 8 bytes; 2 fixed blocks per request.
-            PipelineHybridState {
-                block_tokens: 4,
-                state_blocks_per_request: 2,
-                align_mode,
-            },
+            &kv_cache_layout,
             store,
             WorkerConfig {
                 max_batch_tokens: Some(max_batch_tokens),
@@ -680,6 +684,11 @@ mod tests {
                     policy: PrefixCachePolicy::Lru,
                     max_retained_bytes: None,
                 },
+                prefill_chunk_alignment: Some(if block_aligned_chunks {
+                    PrefillChunkAlignment::Checkpoint
+                } else {
+                    PrefillChunkAlignment::Plain
+                }),
                 ..WorkerConfig::default()
             },
             None,
@@ -690,18 +699,10 @@ mod tests {
     }
 
     #[test]
-    fn a_hybrid_head_sizes_one_block_pool_and_charges_fixed_state() {
-        use crate::worker::workers::pipeline::PipelineHybridState;
-        let hybrid = PipelineHybridState {
-            block_tokens: 4,
-            state_blocks_per_request: 2,
-            align_mode: true,
-        };
-        // 80 bytes / 8 per block = 10 blocks, less vLLM's null block.
-        assert_eq!(hybrid.capacity_tokens(&LAYOUT, 80), 36);
-        assert_eq!(hybrid.state_tokens_per_request(), 8);
-
-        // Each 12-token prompt costs 12 + 8: one fits in 36 tokens, two do not.
+    fn a_hybrid_head_sizes_one_pool_and_charges_the_state() {
+        // (80 - 8 null-block bytes) / 2 = 36 units. A 12-token prompt holds
+        // 12 tokens of KV plus its 8-unit state once (align mode's previous-step
+        // copy is not held): 20 units, so one fits and two do not.
         let store = shared_with(&[(0, 12, 1), (1, 12, 1)]);
         let mut worker = hybrid_head(Rc::clone(&store), 16, 80, true);
         worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
@@ -723,8 +724,9 @@ mod tests {
 
     #[test]
     fn a_hybrid_head_decodes_and_frees_its_state_blocks_for_the_next_request() {
-        // 36 tokens of blocks; each request needs 12 + 3 tokens plus 8 of fixed
-        // state, so the second starts only once the first has decoded and left.
+        // 36 units; each request reaches 15 tokens (16 in whole blocks) plus
+        // two 8-unit states, so the second starts only once the first has
+        // decoded and left.
         let store = shared_with(&[(0, 12, 3), (1, 12, 3)]);
         let mut worker = hybrid_head(Rc::clone(&store), 16, 80, true);
         worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
@@ -764,9 +766,9 @@ mod tests {
 
     /// Chunk sizes a hybrid head launches for one 10-token prompt at budget 6
     /// with 4-token blocks.
-    fn hybrid_chunks(align_mode: bool) -> Vec<u64> {
+    fn hybrid_chunks(block_aligned_chunks: bool) -> Vec<u64> {
         let store = shared_with(&[(0, 10, 1)]);
-        let mut worker = hybrid_head(Rc::clone(&store), 6, 1_000, align_mode);
+        let mut worker = hybrid_head(Rc::clone(&store), 6, 1_000, block_aligned_chunks);
         worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..6 {
@@ -960,6 +962,7 @@ mod tests {
             "stage",
             Arc::new(FakeModel::for_ms(1.0)),
             PipelineLayout { depth: 4, ..LAYOUT },
+            &kv_layout(),
             store,
             WorkerConfig {
                 max_batch_tokens: Some(2048),
@@ -1063,6 +1066,7 @@ mod tests {
             "stage",
             Arc::new(FakeModel::for_ms(1.0)),
             PipelineLayout { depth: 4, ..LAYOUT },
+            &kv_layout(),
             store,
             WorkerConfig {
                 max_batch_tokens: Some(2048),
@@ -1124,6 +1128,7 @@ mod tests {
             "stage",
             Arc::new(FakeModel::for_ms(1.0)),
             PipelineLayout { depth: 4, ..LAYOUT },
+            &kv_layout(),
             store,
             WorkerConfig {
                 max_batch_tokens: Some(2048),
@@ -1161,6 +1166,7 @@ mod tests {
             "stage",
             Arc::new(FakeModel::for_ms(1.0)),
             PipelineLayout { depth: 4, ..LAYOUT },
+            &kv_layout(),
             store,
             WorkerConfig {
                 max_batch_tokens: Some(2048),
@@ -1209,6 +1215,7 @@ mod tests {
             "stage",
             Arc::new(FakeModel::for_ms(1.0)),
             PipelineLayout { depth: 4, ..LAYOUT },
+            &kv_layout(),
             Rc::clone(&store),
             WorkerConfig {
                 max_batch_tokens: Some(2048),
@@ -1610,7 +1617,7 @@ mod tests {
                 },
             );
             let reading = |worker: &PipelineHead<FakeModel>| {
-                crate::worker::admission::MicrobatchAdmission::<crate::worker::kv::FullAttnKv>::reading_requests(
+                crate::worker::admission::MicrobatchAdmission::<crate::worker::kv::KvCacheStore>::reading_requests(
                     &worker.admission,
                 )
             };

@@ -15,7 +15,7 @@ import pytest
 from profiling.db import storage
 from profiling.db.args import DType
 from profiling.db.merge import merge_profile_databases
-from profiling.db.migrate import SCHEMA_VERSION, migrate
+from profiling.db.migrate import SCHEMA_HASH, SCHEMA_VERSION, migrate
 from profiling.db.registry import KernelProfilerSpec, iter_kernel_profiler_specs
 from profiling.db.table import ProfileRow, Table, _sqlite_type, _to_db_value
 from profiling.runners.metrics import ComputeMetrics
@@ -287,3 +287,152 @@ def test_a_conflict_report_names_the_runs_by_their_provenance(tmp_path: Path) ->
         "other",
     )
     assert json.dumps(report.to_dict())
+
+
+# ── optional args (profiling.db.doc.optional_arg) ────────────────────────────
+
+_KV_APPEND_MAIN_TYPES = {
+    "num_kv_heads": "INTEGER",
+    "head_dim": "INTEGER",
+    "block_size": "INTEGER",
+    "input_dtype": "TEXT",
+    "kv_dtype": "TEXT",
+    "cache_layout": "TEXT",
+    "scale_granularity": "TEXT",
+    "num_tokens": "INTEGER",
+}
+
+
+def _kv_append_spec(num_tokens: int = 8, **extra) -> dict:
+    return {
+        "num_kv_heads": 2,
+        "head_dim": 128,
+        "block_size": 16,
+        "input_dtype": "bf16",
+        "kv_dtype": "bf16",
+        "cache_layout": "NHD",
+        "scale_granularity": "tensor",
+        "num_tokens": num_tokens,
+        **extra,
+    }
+
+
+def _kv_append_args(num_tokens: int = 8, **extra):
+    from profiling.db.batch import coerce_args
+
+    return coerce_args(_spec("kv_cache_append").args_schema, _kv_append_spec(num_tokens, **extra))
+
+
+def _kv_append_row(args, time_ms: float) -> ProfileRow:
+    return ProfileRow(
+        args=args,
+        metrics=ComputeMetrics(time_ms=time_ms, tflops=0.0, memory_bandwidth_gbps=1.0),
+        gpu_name=GPU,
+        backend="vllm_cuda",
+        profiler_git_hash="abc",
+    )
+
+
+def _main_layout_kv_append(path: Path) -> None:
+    """``kv_cache_append`` as a checkout without ``head_dim_v`` writes it."""
+    values = {k: v for k, v in _kv_append_spec().items()}
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("CREATE TABLE _db_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(f"INSERT INTO _db_metadata VALUES ('schema_version', '{SCHEMA_VERSION}')")
+        conn.execute(f"INSERT INTO _db_metadata VALUES ('schema_hash', '{SCHEMA_HASH}')")
+        conn.execute(storage.RUN_SCHEMA)
+        conn.execute(
+            storage.kind_table_schema(
+                "kv_cache_append",
+                [f"{c} {t} NOT NULL" for c, t in _KV_APPEND_MAIN_TYPES.items()],
+                [
+                    "time_ms REAL NOT NULL",
+                    "tflops REAL NOT NULL",
+                    "memory_bandwidth_gbps REAL NOT NULL",
+                    "energy_j REAL NOT NULL DEFAULT 0.0",
+                ],
+            )
+        )
+        columns = ["gpu_name", "backend", *values, "args_hash", "run_key", "profiler_run_at"]
+        columns += ["time_ms", "tflops", "memory_bandwidth_gbps"]
+        conn.execute(
+            f"INSERT INTO kv_cache_append ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            (
+                GPU,
+                "vllm_cuda",
+                *values.values(),
+                storage.args_hash(values, _KV_APPEND_MAIN_TYPES),
+                storage.run_key(conn, ("abc", "12.9", "580.1", None)),
+                1_790_000_000,
+                0.0042,
+                0.0,
+                123.0,
+            ),
+        )
+
+
+def test_an_unset_optional_arg_keeps_the_key_rows_had_before_it_existed() -> None:
+    """Symmetric K/V, spelled out or not, must hash exactly as before
+    head_dim_v existed, or every existing row would turn into a miss."""
+    table = Table(_spec("kv_cache_append"), Path("unused.db"))
+    before = storage.args_hash(_kv_append_spec(), _KV_APPEND_MAIN_TYPES)
+    for args in (_kv_append_args(), _kv_append_args(head_dim_v=128)):
+        assert args.head_dim_v is None
+        assert table.args_hash(table.db_key(args)) == before
+    assert table.args_hash(table.db_key(_kv_append_args(head_dim_v=96))) != before
+
+
+def test_a_table_without_the_optional_column_is_read_and_extended_in_place(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "profile.db"
+    _main_layout_kv_append(db)
+    table = Table(_spec("kv_cache_append"), db)
+    assert table.query([_kv_append_args()], backend="vllm_cuda", gpu_name=GPU)[0].time_ms == 0.0042
+    assert table.exists([_kv_append_args(head_dim_v=96)], backend="vllm_cuda", gpu_name=GPU) == [
+        False
+    ]
+
+    table.insert([_kv_append_row(_kv_append_args(16), 0.005)])
+    with closing(sqlite3.connect(db)) as conn:
+        assert "head_dim_v" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(kv_cache_append)")
+        }
+
+    table.insert([_kv_append_row(_kv_append_args(head_dim_v=96), 0.006)])
+    with closing(sqlite3.connect(db)) as conn:
+        info = conn.execute("PRAGMA table_info(kv_cache_append)").fetchall()
+    assert info[-1][1:6] == ("head_dim_v", "INTEGER", 0, None, 0)
+    old, new, asym, missing = table.query(
+        [
+            _kv_append_args(),
+            _kv_append_args(16),
+            _kv_append_args(head_dim_v=96),
+            _kv_append_args(head_dim_v=64),
+        ],
+        backend="vllm_cuda",
+        gpu_name=GPU,
+    )
+    assert (old.time_ms, new.time_ms, asym.time_ms) == (0.0042, 0.005, 0.006)
+    assert not hasattr(missing, "time_ms")
+
+
+@pytest.mark.parametrize("wide_side", ["left", "right"])
+def test_dbs_with_and_without_an_optional_column_merge(tmp_path: Path, wide_side: str) -> None:
+    narrow, wide = tmp_path / "narrow.db", tmp_path / "wide.db"
+    _main_layout_kv_append(narrow)
+    _main_layout_kv_append(wide)
+    Table(_spec("kv_cache_append"), wide).insert(
+        [_kv_append_row(_kv_append_args(head_dim_v=96), 0.006)]
+    )
+    left, right = (wide, narrow) if wide_side == "left" else (narrow, wide)
+    merged = tmp_path / "merged.db"
+    report = merge_profile_databases(left, right, merged)
+
+    assert report.published
+    table = Table(_spec("kv_cache_append"), merged)
+    old, asym = table.query(
+        [_kv_append_args(), _kv_append_args(head_dim_v=96)], backend="vllm_cuda", gpu_name=GPU
+    )
+    assert (old.time_ms, asym.time_ms) == (0.0042, 0.006)

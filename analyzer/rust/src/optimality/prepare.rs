@@ -1,6 +1,6 @@
-//! Preparation stage — turn the per-worker CostTree manifests + grid peaks + GPU
-//! spec into the precomputed structures the fold consumes. Interns every manifest
-//! leaf into a global location and, per `(pool_tag, worker_id, section)`, precomputes
+//! Preparation stage — turn the per-worker CostTree manifests + grid peaks +
+//! achievable peaks + GPU spec (with its sustained rates) into the precomputed structures the fold
+//! consumes. Interns every manifest leaf into a global location and, per `(pool_tag, worker_id, section)`, precomputes
 //! the mean-fold weight `α` per slot, the slot→location map, and each slot's rate
 //! ceilings. No folding happens here — this is all input precompute.
 
@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::trace::manifest::{Manifest, ManifestDoc};
 
+use super::achievable::AchievablePeaks;
 use super::compute_dtype::ComputeDtypeFields;
 use super::grid_peaks::GridPeakCatalog;
 use super::spec::GpuSpec;
@@ -67,6 +68,16 @@ pub(super) struct SectionFoldPlan {
     /// uses bandwidth. This deliberately models the large-batch regime rather
     /// than rooflining the current small-batch point.
     pub(super) r3_uses_compute_throughput_by_slot: Vec<bool>,
+    /// Back-to-back GEMM TFLOP/s of the slot's dtype class and large-copy GB/s
+    /// for R4a, from `gpu/spec.json`'s `sustained` block. Each falls back to the
+    /// R4b rate when not measured and is capped at it, so R4a ≥ R4b.
+    pub(super) sustained_peak_tflops_by_slot: Vec<f64>,
+    pub(super) sustained_peak_gbps_by_slot: Vec<f64>,
+    /// Best measured GEMM TFLOP/s of the slot's dtype class and best large-copy
+    /// GB/s for R4b (`0` = not measured or a comm leaf → that leaf's R4b = R4a).
+    /// Each is capped at the spec peak so R5 below it stays the spec roofline.
+    pub(super) achievable_peak_tflops_by_slot: Vec<f64>,
+    pub(super) achievable_peak_gbps_by_slot: Vec<f64>,
     /// Hardware spec compute peak for R5 by the slot's dtype (`0` = no spec).
     pub(super) hardware_peak_tflops_by_slot: Vec<f64>,
 }
@@ -76,6 +87,7 @@ pub(super) struct SectionFoldPlan {
 pub(super) fn build_section_fold_plans(
     manifests_by_worker: &BTreeMap<(String, u16), ManifestDoc>,
     grid_peak_catalog: &GridPeakCatalog,
+    achievable_peaks: &AchievablePeaks,
     gpu_spec: &GpuSpec,
     compute_dtypes: &ComputeDtypeFields,
 ) -> (
@@ -96,6 +108,10 @@ pub(super) fn build_section_fold_plans(
             let mut grid_peak_tflops_by_slot = Vec::with_capacity(num_slots);
             let mut grid_peak_gbps_by_slot = Vec::with_capacity(num_slots);
             let mut r3_uses_compute_throughput_by_slot = Vec::with_capacity(num_slots);
+            let mut sustained_peak_tflops_by_slot = Vec::with_capacity(num_slots);
+            let mut sustained_peak_gbps_by_slot = Vec::with_capacity(num_slots);
+            let mut achievable_peak_tflops_by_slot = Vec::with_capacity(num_slots);
+            let mut achievable_peak_gbps_by_slot = Vec::with_capacity(num_slots);
             let mut hardware_peak_tflops_by_slot = Vec::with_capacity(num_slots);
             for leaf in &manifest.slots {
                 let is_communication = is_communication_kind(&leaf.kind);
@@ -126,6 +142,34 @@ pub(super) fn build_section_fold_plans(
                 };
                 hardware_peak_tflops_by_slot.push(hardware_peak_tflops);
                 let hardware_bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;
+                let (achievable_tflops, achievable_gbps) = if is_communication {
+                    (0.0, 0.0)
+                } else {
+                    (
+                        cap_at_spec(achievable_peaks.peak_tflops(dtype), hardware_peak_tflops),
+                        cap_at_spec(achievable_peaks.copy_gbps(), hardware_bandwidth_gbps),
+                    )
+                };
+                achievable_peak_tflops_by_slot.push(achievable_tflops);
+                achievable_peak_gbps_by_slot.push(achievable_gbps);
+                let (sustained_tflops, sustained_gbps) = if is_communication {
+                    (0.0, 0.0)
+                } else {
+                    (
+                        sustained_rate(
+                            gpu_spec.sustained_tflops(dtype),
+                            achievable_tflops,
+                            hardware_peak_tflops,
+                        ),
+                        sustained_rate(
+                            gpu_spec.sustained_copy_gbps,
+                            achievable_gbps,
+                            hardware_bandwidth_gbps,
+                        ),
+                    )
+                };
+                sustained_peak_tflops_by_slot.push(sustained_tflops);
+                sustained_peak_gbps_by_slot.push(sustained_gbps);
                 let hardware_ridge_flops_per_byte =
                     if hardware_peak_tflops > 0.0 && hardware_bandwidth_gbps > 0.0 {
                         hardware_peak_tflops * 1_000.0 / hardware_bandwidth_gbps
@@ -152,12 +196,37 @@ pub(super) fn build_section_fold_plans(
                     grid_peak_tflops_by_slot,
                     grid_peak_gbps_by_slot,
                     r3_uses_compute_throughput_by_slot,
+                    sustained_peak_tflops_by_slot,
+                    sustained_peak_gbps_by_slot,
+                    achievable_peak_tflops_by_slot,
+                    achievable_peak_gbps_by_slot,
                     hardware_peak_tflops_by_slot,
                 },
             );
         }
     }
     (kernel_locations, section_fold_plans)
+}
+
+/// R4a's rate: the sustained measurement, capped at R4b's peak rate (or the spec
+/// when no peak was measured) so R4a ≥ R4b; without a sustained measurement it
+/// is R4b's rate, so the power gap reads zero rather than absorbing the kernel gap.
+fn sustained_rate(sustained: f64, peak: f64, spec: f64) -> f64 {
+    if sustained <= 0.0 {
+        return peak;
+    }
+    cap_at_spec(sustained, if peak > 0.0 { peak } else { spec })
+}
+
+/// A measured rate above the spec peak (a cache-resident effect, or a stale
+/// spec entry) would push R4b below R5; cap it so R4b ≥ R5 always holds. With no
+/// spec peak (`0`), the measured rate stands alone.
+fn cap_at_spec(measured: f64, spec: f64) -> f64 {
+    if spec > 0.0 {
+        measured.min(spec)
+    } else {
+        measured
+    }
 }
 
 fn r3_uses_compute_throughput(
@@ -206,7 +275,25 @@ fn is_communication_kind(kind: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_communication_kind, r3_uses_compute_throughput};
+    use super::{cap_at_spec, is_communication_kind, r3_uses_compute_throughput, sustained_rate};
+
+    #[test]
+    fn sustained_rates_sit_between_kernel_and_peak() {
+        // Measured: capped at the peak rate.
+        assert_eq!(sustained_rate(4_000.0, 6_600.0, 9_000.0), 4_000.0);
+        assert_eq!(sustained_rate(7_000.0, 6_600.0, 9_000.0), 6_600.0);
+        // No peak measured: the spec caps it.
+        assert_eq!(sustained_rate(4_000.0, 0.0, 9_000.0), 4_000.0);
+        // Not measured: R4a = R4b, so the power gap is zero.
+        assert_eq!(sustained_rate(0.0, 6_600.0, 9_000.0), 6_600.0);
+    }
+
+    #[test]
+    fn achievable_rates_never_exceed_the_spec_peak() {
+        assert_eq!(cap_at_spec(8_400.0, 8_000.0), 8_000.0);
+        assert_eq!(cap_at_spec(7_000.0, 8_000.0), 7_000.0);
+        assert_eq!(cap_at_spec(7_000.0, 0.0), 7_000.0);
+    }
 
     #[test]
     fn moe_exchange_is_communication_but_its_local_prepare_is_not() {

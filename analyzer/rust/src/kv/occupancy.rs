@@ -422,7 +422,7 @@ fn definitions() -> Value {
         "has_retained_prefix_breakdown": "false for old kv_snapshot logs without the retained_prefix_kv column; their compatibility series is zero-filled and must not be interpreted as a measured zero",
         "projected_tokens": "admission gate's FUTURE estimate (each admitted request's full decode horizon); may exceed capacity",
         "promised_tokens": "reserved-but-not-resident KV footprint (admitted, not yet realized)",
-        "capacity_tokens": "static per-shard KV token budget from run_meta.json kv_pools; null when KV logging carries no capacity",
+        "capacity_tokens": "static per-shard KV budget from run_meta.json kv_pools, in the pool's KV units (one per token when the arch's layout grows only per token; bytes_per_unit in run_meta); null when KV logging carries no capacity",
         "fraction": "tokens / capacity_tokens (percent on the plot); projected is intentionally not clamped to 100%",
         "peak_active_max_pct": "worst individual shard's peak — the imbalance-aware headroom",
         "bin": "one equal-width time segment (200 bins over the run span)",

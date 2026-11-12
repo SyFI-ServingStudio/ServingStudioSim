@@ -73,21 +73,34 @@ draws no PNGs.
 
 Run `--dry-run` first on a new config. It builds the model, checks every case
 against it, and prints one line per kernel with the `profile.db` specs a real
-run would JIT-profile. It writes nothing and needs no GPU. `total: 0 / N specs
+run would have to measure. It writes nothing and needs no GPU. `total: 0 / N specs
 missing` means the real run needs no GPU either. A rejected case fails the dry
 run with the same error the real run would give.
 
 Pass `--no-gpu` when the run must not touch a GPU: the user asks, or the host's
-GPUs are not yours to use. A missing row then fails with `GpuDisabledError`,
-naming the kernel, instead of being profiled. Report that error; do not drop
+GPUs are not yours to use. A missing row then fails with `GpuDisabledError`
+(`measuring N missing profile.db spec(s) needs a GPU`) instead of being
+profiled; the `cache build plan` lines printed just before it name the kernels. Report that error; do not drop
 `--no-gpu` to get past it without asking.
 
 Do not pin GPUs by default. A warm `profiling/profile.db` needs no GPU. On a cold
-cache, timing-predict asks the profiling layer to JIT-fill the rows it actually
-uses, and that layer selects idle GPUs. Do not precompute a guessed row list or
+cache, timing-predict first walks the model to collect every row it uses that
+is missing, then has the profiling layer measure them all in one batch across
+the idle GPUs it selects, and only then costs the cases. Do not precompute a guessed row list or
 restrict `CUDA_VISIBLE_DEVICES` unless the user or machine policy requires it.
 
-If prediction or JIT profiling fails, preserve the exact error and stop. Do not
+`--remote NAME` runs the same command on a machine from the untracked
+`remote.yaml` (see `remote.example.yaml`) and blocks until `log_dir` is copied
+back in full. Use it when the user asks. Run from the checkout root; `log_dir`
+must be under `logs/`, and so must any config or cases file that is not
+tracked. The remote runs with `--no-gpu --no-plot`, so a row missing there fails
+instead of being profiled: run `--dry-run` here first and fill reported missing
+specs here (or with `kernel-profile run --remote`). `--dry-run` itself never
+goes remote. Do not create or edit `remote.yaml` or ssh setup unless asked; if
+the remote fails to connect, stop and report it. Details: `launcher/README.md`,
+"Remote execution".
+
+If prediction or the cache fill fails, preserve the exact error and stop. Do not
 report totals from an incomplete run. Use `operate-profile-existing-kernel` only
 when diagnosing a specific registered kernel row.
 

@@ -109,7 +109,30 @@ categories:
 | `kv` | a KV pool over time | `kv_snapshot` + `run_meta` capacity |
 | `alignment-iteration` | one measured iteration joined to one predict case | normalized NSYS + predict `cost_log`/manifest + mapping |
 | `alignment-e2e` | one measured/simulated latency distribution | req-frontend replay JSONL + optional vLLM EngineCore request-timing JSONL + sim `request_slo` |
-| `alignment-workload` | one scheduler iteration by recorded iteration id | full-run vLLM structured iteration metrics (NSYS window anchors the replay segment) + sim `cost_log` |
+| `alignment-workload` | one scheduler iteration by recorded iteration id; under data parallelism one global step by forward ordinal | full-run vLLM structured iteration metrics (NSYS window anchors the replay segment) + sim `cost_log` |
+
+Under data parallelism `alignment-workload` folds the ranks' records into the
+replica's step by **forward ordinal**. Every DP rank runs one model forward per
+EngineCore loop pass, a dummy forward when it has no ready work, and every
+forward syncs its batch across the ranks, so the k-th forward of every rank is
+one global step. Schema-5 metrics (vLLM reference patch 0019) record every
+forward with that ordinal, dummies included (`is_dummy`, no work). The fold
+pairs ordinals exactly: the ragged ends outside the range every rank covers
+are dropped with counts, a gap inside it is an error, a dummy counts as the
+rank's participation, and a step every rank ran as a dummy is not a workload
+step. The ends can be ragged legitimately: the measurement log starts at a byte
+offset taken when the API server reports no in-flight request, while the
+EngineCores can still be logging a wave's trailing forwards. A record's window
+is the EngineCore's CPU observation, not the GPU forward, so wall clock is only
+a check: `meta.measured_dp_fold` reports the per-step start skew and the steps
+whose rank windows do not overlap, and the fold fails if one rank's forward k
+ends before another rank began waiting on forward k - `max_forwards_in_flight`,
+or if two ranks' dummy forwards of one ordinal do not overlap (both enclose the
+same DP sync, so a rank renumbered by one forward fails this on most idle
+steps). A multi-rank capture without ordinals is refused; recapture it. So is
+a rank set other than `0..n` (extraction checks `n` against dp_size), and a
+single-rank file that records dummy forwards or only a `dp_rank > 0`: it is
+one rank of a DP capture, not a single-EngineCore run.
 
 For a symmetric tensor-parallel alignment, one measured iteration contains one
 range set per rank. The analyzer reduces it with the **barrier model**

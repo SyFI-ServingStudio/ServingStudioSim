@@ -1,27 +1,32 @@
 ---
 name: orchestrator-add-kernel-to-python-profile
-description: Use when orchestrating Python-side ServingStudio Sim L1 profiling work for a new kernel kind or a new backend of an existing kind. This skill is for the coordinator who writes implementer briefs, defines completion checks, and sequences Torch reference work before framework backends. It does not cover Rust timing/cache wiring.
+description: Use when owning the Python-side ServingStudio Sim L1 profiling work for a new kernel kind or a new backend of an existing kind, either as the coordinator who writes implementer briefs or as the agent a whole kernel was handed to. Defines the steps, their completion checks, and the order of Torch reference work before framework backends. It does not cover Rust timing/cache wiring.
 ---
 
 # Orchestrator Add Kernel To Python Profile
 
-You are the orchestrator, not the implementer. Your job is to turn a user's
-kernel request into one or more clear implementation tasks for the Python
-profiling side under `profiling/`, with enough completion criteria that you can
-verify whether the step is done.
+This skill turns a kernel request into the steps of the Python profiling side
+under `profiling/`, each with completion criteria that show whether it is done.
+It is written for the orchestrator who briefs an implementer. When a whole
+kernel was handed to you (`top-add-kernel`), you own it: do the steps yourself
+and run their checks yourself.
 
 This skill deliberately stops before Rust timing/cache wiring. Any Rust
 `KernelSpec`, cache, bridge, or simulator integration belongs to a later skill.
 
 ## Verification Ownership
 
-The implementer may be another agent, but the verifier is the orchestrator. Ask
-the implementer for evidence, then independently check it before accepting the
-step. Do not treat "the implementer says it works" as completion.
+The tasks below are checkpoints for whoever owns the kernel, not one delegation
+each. The owner checks each one before moving on and stops at the first that
+fails. Do not treat "it ran" as completion: name the evidence each step leaves,
+such as file diffs, imports, registry entries, generated facade symbols, focused
+tests, dry-run output, environment notes, and unresolved assumptions.
 
-For each assigned task, state what evidence must come back and what you will
-check yourself: file diffs, imports, registry entries, generated facade symbols,
-focused tests, dry-run output, environment notes, and unresolved assumptions.
+An orchestrator that delegated the kernel reviews it once, at the closeout. Read
+the diff and the returned evidence, and rerun only the cheapest checks that
+would expose a false claim, such as one focused test or `profiling list`. Do not
+reproduce the owner's whole suite, and never delegate a task whose only purpose
+is to re-check the previous one.
 
 ## Grounding
 
@@ -53,6 +58,11 @@ Classify the request before doing anything else:
   example, adding a TensorRT or FlashInfer backend for an existing attention or
   norm kind is a new backend, not a new kind, unless the requested behavior
   changes the operation contract.
+
+A backend is a distinct implementation of the operation. Execution modes of the
+same kernel, such as graph capture versus eager launch, are not separate
+backends: profile the kernel once, and charge the extra work a mode adds to the
+layer that issues it.
 
 If the user asks for both, split it into ordered tasks. The new kind lands first
 with its production backend and an independent Torch correctness oracle, then
@@ -181,8 +191,8 @@ Things to verify:
 - the claimed backend support matrix is checked on available hardware/dtypes,
   or untested entries are clearly marked as assumptions;
 - unsupported shapes or dtypes fail clearly;
-- you independently review the correctness evidence and, when feasible, rerun
-  the provided check before allowing registration work to proceed.
+- the correctness evidence is reviewed; registration follows once this check
+  passes.
 
 **Task B.3 — Backend registration.** Ask the implementer to add the backend
 through `impl-register-kernel`, reusing the existing kind's args schema.

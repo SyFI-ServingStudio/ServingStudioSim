@@ -33,8 +33,14 @@ from profiling.exec.env import (
     resolve_profile_env,
     set_worker_python_env,
 )
-from profiling.exec.local import _container_worker_command, find_idle_gpus
+from profiling.exec.local import (
+    _container_worker_command,
+    _log_tuning,
+    autotune_policy,
+    find_idle_gpus,
+)
 from profiling.gpu_policy import require_gpu
+from reference_engines.autotune_guard import POLICY_ENV
 
 
 class MeasureError(RuntimeError):
@@ -52,6 +58,7 @@ def measure_kernel(
     telemetry_hz: float = 20.0,
     clear_l2: bool = True,
     telemetry: bool = True,
+    cuda_graph: bool = False,
 ) -> dict[str, Any]:
     """Run one trend+telemetry capture for ``spec`` and return the artifact summary."""
 
@@ -86,16 +93,22 @@ def measure_kernel(
         spec=spec,
         gpu_index=gpu_index,
         profiler_env=profiler_env,
-        worker_env=dict(profiler_spec.worker_env),
+        # The autotune decision is local.py's, like every L1 worker's: this
+        # verb re-measures no DB row, so it tunes like a fill (before the
+        # CUPTI window) and logs what it tuned.
+        worker_env={**dict(profiler_spec.worker_env), POLICY_ENV: autotune_policy()},
+        imex_channel=profiler_spec.imex_channel,
         measure_block={
             "output_dir": str(resolved_output_dir),
             "duration_s": duration_s,
             "telemetry_hz": telemetry_hz,
             "clear_l2": clear_l2,
             "telemetry": telemetry,
+            "cuda_graph": cuda_graph,
         },
     )
 
+    _log_tuning(kernel_kind, resolved_backend, response.get("autotune"))
     measure_result = response.get("measure") or {}
     if not measure_result.get("consumed"):
         raise MeasureError(
@@ -131,6 +144,7 @@ def _run_worker(
     profiler_env: ProfileEnv | ContainerProfileEnv,
     measure_block: dict[str, Any],
     worker_env: dict[str, str] | None = None,
+    imex_channel: bool = False,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="vibesim-measure-") as tmp:
         input_path = Path(tmp) / "input.json"
@@ -153,6 +167,7 @@ def _run_worker(
                 Path(tmp),
                 additional_volumes=((output_dir, output_dir),),
                 worker_env=worker_env,
+                imex_channel=imex_channel,
             )
         else:
             env = os.environ.copy()

@@ -228,6 +228,7 @@ impl Glm53RoutedMoeLocalWorklet {
                 top_k: cfg.top_k,
                 input_dtype: cfg.activation_dtype,
                 weight_format: cfg.precision.gemm_dtype(),
+                activation_format: None,
                 group_size,
                 routing_method: cfg.routing_method.clone(),
                 n_group: cfg.n_group,

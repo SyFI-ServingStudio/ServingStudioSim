@@ -684,3 +684,24 @@ def test_cpu_composite_matches_reference_and_preserves_inputs(num_queries, num_k
         strict=True,
     ):
         assert torch.equal(tensor, snapshot)
+
+
+def test_operands_are_seeded_normal_values_quantized_like_the_vllm_indexer():
+    from profiling.runners.attention.dsa_mqa_logits_prefill import _build_operands
+
+    def build():
+        return _build_operands(
+            torch, num_queries=4, num_keys=64, num_heads=32, head_dim=128, device="cpu"
+        )
+
+    first, second = build(), build()
+    assert torch.equal(first.q.view(torch.uint8), second.q.view(torch.uint8))
+    assert torch.equal(first.k_scale, second.k_scale)
+    # Per-key power-of-two (ue8m0) scales with the key's amax inside the FP8 range.
+    assert torch.equal(first.k_scale, torch.exp2(torch.log2(first.k_scale).round()))
+    k = first.k.float()
+    assert float(k.abs().amax()) <= 448.0
+    assert float(k.abs().amax(dim=-1).min()) > 224.0
+    # The codes vary across keys and dimensions instead of repeating a short pattern.
+    assert len(torch.unique(first.k.view(torch.uint8))) > 100
+    assert abs(float((k * first.k_scale[:, None]).std()) - 1.0) < 0.1

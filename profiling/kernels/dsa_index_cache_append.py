@@ -142,7 +142,7 @@ register(
                 "SGLang fused_k_indexer_norm_rope_store: LayerNorm, RoPE, FP8 "
                 "quantization and page writes in one call."
             ),
-            url="https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/ops/quantization/dsv32/elementwise.py",
+            url="https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/ops/attention/dsa/indexer_k.py",
         ),
     )
 )

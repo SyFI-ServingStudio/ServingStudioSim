@@ -95,6 +95,33 @@ class ServerConfig:
 
 
 @dataclass
+class PrewarmConfig:
+    """Requests that compile per-shape kernels before the measurement starts.
+
+    Some engines JIT a kernel the first time a shape bucket appears in a
+    process (the DSpark drafter's eager MXFP8 GEMMs compile one CuTe DSL kernel
+    per M bucket, 0.4-1.3 s each, every server start). A capture that meets one
+    inside its window measures the compile. These prompts -- random token ids,
+    so they share no prefix with each other or the trace -- run on every DP rank
+    once the server is up and before the load generator starts; the lengths are
+    the workload's choice, stated in the config, never derived here.
+    """
+
+    prompt_lengths: list[int] = field(default_factory=list)
+    max_tokens: int = 4
+    seed: int = 0
+    timeout: float = 600.0
+
+    def validate(self) -> None:
+        if not self.prompt_lengths or any(
+            type(n) is not int or n <= 0 for n in self.prompt_lengths
+        ):
+            raise ValueError("prewarm.prompt_lengths must be a non-empty list of positive ints")
+        if type(self.max_tokens) is not int or self.max_tokens <= 0:
+            raise ValueError("prewarm.max_tokens must be a positive int")
+
+
+@dataclass
 class IdleWaitConfig:
     """Poll vLLM's /load endpoint until in-flight requests drain to zero."""
 
@@ -176,6 +203,87 @@ PROFILE_KINDS = frozenset({"nsys", "workload_metrics", "expert_popularity", "tok
 ROUTING_PROFILE_KINDS = frozenset({"expert_popularity", "token_corpus"})
 
 
+# Each engine's spellings, in ``extra_args``, of the parallel degrees that
+# multiply a replica's GPUs beyond TP. vLLM: ParallelConfig.world_size is
+# pp * tp * pcp (decode context parallelism reuses the TP GPUs). SGLang:
+# ``server_args.compute_world_size`` is dp * tp * pp (attention DP and
+# attention CP split the TP group).
+_REPLICA_FLAGS: dict[str, dict[str, tuple[str, ...]]] = {
+    "vllm": {
+        "pipeline-parallel": ("--pipeline-parallel-size", "-pp"),
+        "prefill-context-parallel": ("--prefill-context-parallel-size", "-pcp"),
+    },
+    "sglang": {"pipeline-parallel": ("--pp-size", "--pipeline-parallel-size")},
+}
+
+
+def _flag_name(engine: str, arg: str) -> str:
+    # vLLM's parser reads `--a_b` as `--a-b` (utils/argparse_utils.py).
+    if engine == "vllm" and arg.startswith("--"):
+        return "--" + arg[2:].replace("_", "-")
+    return arg
+
+
+def _flag_value(engine: str, args: list[str], names: tuple[str, ...]) -> str | None:
+    """The value of the last of ``names`` in ``args`` (``--x N`` or ``--x=N``)."""
+
+    value = None
+    for index, arg in enumerate(args):
+        name, eq, inline = str(arg).partition("=")
+        if _flag_name(engine, name) in names:
+            if eq:
+                value = inline
+            elif index + 1 < len(args):
+                value = str(args[index + 1])
+    return value
+
+
+def _degree(engine: str, extra_args: list[str], what: str) -> int:
+    value = _flag_value(engine, extra_args, _REPLICA_FLAGS.get(engine, {}).get(what, ()))
+    if value is None:
+        return 1
+    try:
+        size = int(value)
+    except ValueError:
+        raise ValueError(f"{what} size {value!r} is not an integer") from None
+    if size < 1:
+        raise ValueError(f"{what} size must be positive, got {size}")
+    return size
+
+
+def replica_ranks(engine: str, tp_size: int, extra_args: list[str]) -> int:
+    """Ranks (GPUs) in one data-parallel replica: ``tp_size`` times every degree
+    in ``_REPLICA_FLAGS`` that ``extra_args`` sets. vLLM numbers its global
+    ranks replica by replica, so a rank's DP rank is ``rank // replica_ranks``."""
+
+    size = tp_size
+    for what in _REPLICA_FLAGS.get(engine, {}):
+        size *= _degree(engine, extra_args, what)
+    return size
+
+
+def server_gpu_count(engine: str, tp_size: int, dp_size: int, extra_args: list[str]) -> int:
+    """GPUs a server runs on: ``dp_size`` replicas of ``replica_ranks`` each.
+
+    ``dp_size`` counts replicas in both engines; SGLang's attention DP
+    (``--attn-dp-size``) splits the TP group and adds no GPUs.
+    """
+
+    return dp_size * replica_ranks(engine, tp_size, extra_args)
+
+
+def expert_parallel_world(engine: str, tp_size: int, dp_size: int, extra_args: list[str]) -> int:
+    """The most ranks one expert-parallel group can span. vLLM: one PP stage,
+    dp * pcp * tp (``parallel_state``'s EP group). SGLang: one TP group
+    (``parallel_state`` builds _MOE_EP inside it; ``ep_size * moe_dp_size <=
+    tp_size``)."""
+
+    if engine == "sglang":
+        return tp_size
+    pipeline = _degree(engine, extra_args, "pipeline-parallel")
+    return server_gpu_count(engine, tp_size, dp_size, extra_args) // pipeline
+
+
 @dataclass
 class ProfileConfig:
     """One real-server ground-truth profiling run."""
@@ -184,7 +292,7 @@ class ProfileConfig:
     name: str
     log_dir: str
     gpu: str  # DB/display GPU name, e.g. "NVIDIA H200"
-    cuda_visible_devices: str = "0"  # comma-separated physical GPUs; count equals tp_size
+    cuda_visible_devices: str = "0"  # comma-separated physical GPUs; count equals gpu_count
 
     # ``nsys`` is the timing/segment capture consumed by kernel alignment.
     # ``workload_metrics`` is a clean full-run scheduler/request timing pass.
@@ -220,9 +328,32 @@ class ProfileConfig:
     server: ServerConfig = None  # type: ignore[assignment]
     idle: IdleWaitConfig = field(default_factory=IdleWaitConfig)
     nsys: NsysConfig = field(default_factory=NsysConfig)
+    prewarm: PrewarmConfig | None = None
 
     # --- workload: req-frontend consumes the same source trace as the simulator ---
     workload: LoadGeneratorConfig = None  # type: ignore[assignment]
+
+    @property
+    def replica_ranks(self) -> int:
+        """Ranks in one DP replica (``replica_ranks``)."""
+
+        return replica_ranks(self.engine, self.server.tp_size, self.server.extra_args)
+
+    @property
+    def expert_parallel_world(self) -> int:
+        """Ranks one expert-parallel group can span (``expert_parallel_world``)."""
+
+        return expert_parallel_world(
+            self.engine, self.server.tp_size, self.server.dp_size, self.server.extra_args
+        )
+
+    @property
+    def gpu_count(self) -> int:
+        """GPUs the server runs on (``server_gpu_count``)."""
+
+        return server_gpu_count(
+            self.engine, self.server.tp_size, self.server.dp_size, self.server.extra_args
+        )
 
     @property
     def captures_expert_load(self) -> bool:
@@ -250,5 +381,5 @@ class ProfileConfig:
             and self.engine == "vllm"
             and "--enable-expert-parallel" in extra_args
             and "--no-enable-eplb" not in extra_args
-            and self.server.tp_size * self.server.dp_size > 1
+            and self.expert_parallel_world > 1
         )

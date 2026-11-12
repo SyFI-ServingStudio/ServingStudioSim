@@ -33,8 +33,9 @@ const HEAD_DIM: u32 = 256;
 const QUANT_BLOCK_SIZE: u32 = 32;
 /// `(max_ngram - 1) * n_heads` on V4.1-Flash; a rank never owns more columns.
 const MAX_LOCAL_HEADS: u32 = 24;
-/// The runner's largest pinned table (49 GiB).
-const MAX_TABLE_ROWS: u64 = 200_000_000;
+/// The runner's largest pinned table (400M rows, 98 GiB): above the TP1
+/// (DP-attention) tables of V4.1-Flash (about 384M rows per layer).
+const MAX_TABLE_ROWS: u64 = 400_000_000;
 const RESIDENCIES: [&str; 2] = ["host_uva", "device"];
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -47,7 +48,8 @@ pub struct EngramLookupKernelConfig {
     pub head_dim: u32,
     pub quant_block_size: u32,
     /// Rows of this rank's table slice (`part_num_embeddings`; 96,000,564 on
-    /// V4.1-Flash TP4 rank 0). Exact identity: sets the gather's TLB footprint.
+    /// V4.1-Flash TP4 rank 0, the whole 384,006,168-row layer-1 table at TP1).
+    /// Exact identity: sets the gather's TLB footprint.
     pub table_rows: u64,
     /// `host_uva` (pinned host, half-SM grid) or `device` (HBM, full grid).
     pub residency: String,

@@ -192,11 +192,25 @@ class KernelProfilerSpec:
     # ``@autotune`` selection never leaks between worker processes through
     # ``TRITON_CACHE_DIR``. Runners must not mutate ``os.environ`` for this.
     worker_env: tuple[tuple[str, str], ...] = ()
+    # The runner allocates CUDA fabric memory (CU_MEM_HANDLE_TYPE_FABRIC), as
+    # FlashInfer's MNNVL workspace does, which needs an IMEX channel device. A
+    # container worker gets that device only when this is set (see
+    # profiling/exec/local.py); a host worker sees the host's /dev directly.
+    imex_channel: bool = False
     # Optional lazy ``(**schema_kwargs) -> str | None`` called in the worker
     # right after the chunk runs, once per successful spec. A returned note is
     # appended to the row's ``backend_version`` so worker-process state that
     # changes the number (e.g. the pinned autotune configs) is recorded with it.
     row_provenance_ref: RunnerRef | None = None
+    # ``(**schema_kwargs) -> str``: the ``autotune_cached`` label (the persisted
+    # FlashInfer tactic file) a spec of this row tunes into; one of
+    # ``profiling/runners/tactic_labels.py``. Under ``VIBESIM_AUTOTUNE=forbid``
+    # the parent requires each spec's file before a worker starts
+    # (``profiling/exec/local.py:autotune_preflight``).
+    tactic_label: Callable[..., str] | None = None
+    # The runner re-tunes in every worker by design (``AutotunePin``), so no
+    # cache can make it run under ``forbid``; the preflight refuses it up front.
+    tunes_every_worker: bool = False
     # Reader-facing description of this backend for the Kernel Library. None
     # until the kind is documented; see profiling/db/doc.py.
     doc: BackendDoc | None = None

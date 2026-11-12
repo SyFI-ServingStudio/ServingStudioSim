@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::kv_layout::{gqa_kv_bytes_per_token, gqa_placement, KvCacheLayout, KvCachePart};
 use crate::arch::model_cfg::ModelCfg;
 use crate::op::Op;
 use crate::timing::kernels::{
@@ -38,7 +39,7 @@ const NORM_BACKENDS: &[&str] = &["flashinfer"];
 const GEMM_BACKENDS: &[&str] = &["torch", "torch_linear"];
 const ACT_BACKENDS: &[&str] = &["triton"];
 // Attention backends are FlashInfer *implementations* (the profiler registers
-// `flashinfer_attn_{prefill,decode,rect}` under `fa2`/`fa3`/`trt`/`cudnn`), NOT a
+// `flashinfer_attn_{prefill,decode,rect}` under `fa2`/`fa3`/`cudnn`), NOT a
 // backend literally named "flashinfer". List the two FlashAttention paths; the
 // kernel engine picks whichever the GPU/profile.db actually has.
 const ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];
@@ -69,10 +70,8 @@ pub struct Llama3DenseResolved {
 pub struct Llama3DenseModel {
     pub name: String,
     pub num_layers: u32,
-    /// KV footprint per token, kept SYMBOLIC (`2*num_kv_heads*head_dim*kv_bytes
-    /// *num_layers`); folds to bytes only at the `IterwiseUnifiedModel` boundary
-    /// where a worker sizes its KV partition capacity.
-    pub total_kv_bytes_per_token: Dim,
+    /// The attention KV as one cache part, placed on the KV partition's ranks.
+    pub kv_cache_part: KvCachePart,
     pub pre_attn: PreAttnLocalWorklet,
     pub attn: AttnLocalWorklet,
     pub post_attn: PostAttnLocalWorklet,
@@ -160,17 +159,23 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseParallel) -> Llama3DenseC
     }
 }
 
-/// KV-cache bytes one token occupies across the whole model, for this dense-GQA
-/// architecture: `2` (K and V) × `num_kv_heads` × `head_dim` × `kv_dtype` bytes ×
-/// `num_layers`, read off the resolved attention config. Arch-specific (MLA's
-/// compressed latent KV, cross-layer KV sharing, … would compute it differently),
-/// so it lives in the model_arch, not on the parallelism-agnostic `ModelCfg`.
-fn total_kv_bytes_per_token(resolved: &Llama3DenseResolved) -> Dim {
+/// Per-token KV bytes of every GQA layer over the single GPU
+/// (`2 × KV heads × head_dim × kv dtype × layers`, heads replicated when the TP
+/// degree exceeds them). Arch-specific: MLA's compressed latent or cross-layer
+/// sharing would compute it differently, so it lives in the model_arch.
+fn gqa_kv_part(resolved: &Llama3DenseResolved) -> KvCachePart {
     let attn = &resolved.attn.attn;
-    2 * attn.num_kv_heads.clone()
-        * attn.head_dim.clone()
-        * Dim::param("bytes", attn.kv_dtype().size_bytes())
-        * Dim::param("num_layers", resolved.num_layers)
+    KvCachePart::per_token(
+        "gqa",
+        gqa_kv_bytes_per_token(
+            u64::from(resolved.num_layers),
+            u64::from(attn.num_kv_heads.get()),
+            u64::from(attn.head_dim.get()),
+            u64::from(attn.head_dim.get()),
+            u64::from(attn.kv_dtype().size_bytes()),
+        ),
+    )
+    .placed(gqa_placement(u64::from(attn.num_kv_heads.get()), 1))
 }
 
 pub fn resolve_configs(cfgs: &Llama3DenseConfigs) -> Llama3DenseResolved {
@@ -191,7 +196,7 @@ pub fn build(
     bridge: &PerfApiBridge,
 ) -> Result<Llama3DenseModel, BuildError> {
     let num_layers = resolved.num_layers;
-    let total_kv_bytes_per_token = total_kv_bytes_per_token(&resolved);
+    let kv_cache_part = gqa_kv_part(&resolved);
 
     let embed_name = format!("{model_name}.embedding");
     let final_norm_name = format!("{model_name}.final_norm");
@@ -244,7 +249,7 @@ pub fn build(
         lm_head,
         name: model_name,
         num_layers,
-        total_kv_bytes_per_token,
+        kv_cache_part,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -338,10 +343,8 @@ impl Llama3DenseModel {
 }
 
 impl IterwiseUnifiedModel for Llama3DenseModel {
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        // Seam B: collapse the symbolic KV footprint to bytes for the worker's
-        // KV partition-capacity sizing.
-        self.total_kv_bytes_per_token.get() as u64
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        KvCacheLayout::new().with_part(self.kv_cache_part)
     }
 
     /// Dense *local* arch: one replica runs the whole model on a single GPU (no

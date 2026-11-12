@@ -1,0 +1,22 @@
+# vLLM DeepSeek-V4.1-Flash-1017 + DSpark (5 draft tokens) on four B200s, chunked
+# prefill at 2048 tokens per DP rank, as case 20_dp4_diverse_100 of the alignment pack
+# presets/alignment/dsv41_flash_b200_dspark ran it. attn_gpu_memory_gb is the KV
+# pool per GPU that case's workload pass measured (--max-model-len 131072).
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: deepseek_v41_vllm_dp_attn_ep_moe_dspark
+        worker:
+          type: speculative
+          max_batch_tokens: 2048
+          batch_policy: mix
+          draft_tokens: 5
+          acceptance_seed: 73
+          # vLLM's DP coordinator places each request on the least-loaded engine.
+          dp_placement: vllm-least-loaded
+          attn_gpu_memory_gb: 75.215615
+sweep:
+  replicas: [1, 2]

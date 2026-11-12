@@ -9,6 +9,9 @@ mechanism, chosen by the stages the model declares:
 - **DFlash2** runs once, with no recurrence: it projects the context K/V of the
   target's rows, forwards one non-causal block of ``k + 1`` query rows per
   request against its context, and scores the ``k`` drafted positions.
+- **DSpark** also runs once: it projects the context of the target's rows,
+  forwards one non-causal block of ``k`` rows per request (anchor first), and
+  fixes the ``k`` drafts by a sequential rank-limited Markov bias.
 """
 
 import json
@@ -17,13 +20,21 @@ from collections import defaultdict
 from dataclasses import replace
 
 from .core import AttnInteraction, Workload
-from .models import dflash2
-from .models.glm52 import DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE
+from .models import dflash2, dspark
+
+#: :attr:`Workload.stages` key for the proposer's first draft pass. It forwards
+#: the target's whole scheduled batch, because it is the pass that fills the MTP
+#: layer's own attention state.
+DRAFT_FIRST_STAGE = "mtp_first"
+#: …and for every drafted position after the first: one row per request, over a
+#: context the first pass already indexed.
+DRAFT_RECURRENT_STAGE = "mtp_recurrent"
 
 #: Proposer -> the stages its stacks run against.
 PROPOSER_STAGES = {
     "mtp": frozenset({DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE}),
     "dflash2": frozenset(dflash2.STAGES),
+    "dspark": frozenset(dspark.STAGES),
 }
 
 
@@ -76,8 +87,13 @@ def aggregate_workload(totals: dict, proposer: str = "mtp") -> Workload:
                 else:
                     final = _integer(left, "decode context", k + 1)
                     q = _integer(right, "decode query", 1)
-                    if q != k + 1:
-                        raise ValueError("decode query must equal draft_tokens + 1")
+                    # Full width, or clipped by vLLM at the context limit so
+                    # the sampled position is the model's last.
+                    if q > k + 1 or (q < k + 1 and final != maximum - 1):
+                        raise ValueError(
+                            "decode query must equal draft_tokens + 1 "
+                            "except a verify clipped to end at max_model_len - 1"
+                        )
                     cached = final - q
                 if final > maximum:
                     raise ValueError("request context exceeds max_model_len")
@@ -129,6 +145,8 @@ def aggregate_workload(totals: dict, proposer: str = "mtp") -> Workload:
             raise ValueError(f"speculative geometry disagrees with {name}: {actual} != {expected}")
     if proposer == "dflash2":
         stages = _dflash2_stages(result, endpoints, depth)
+    elif proposer == "dspark":
+        stages = dspark.stage_workloads(result, endpoints, depth)
     else:
         stages = {DRAFT_FIRST_STAGE: workload(target, endpoint_head=True)}
         if depth > 1:

@@ -1,4 +1,4 @@
 interface:
   display_name: "Calculate KV Cache Capacity"
-  short_description: "Estimate KV cache memory and tokens"
-  default_prompt: "Use $dev-calculate-kv-cache-capacity to estimate KV cache size and token capacity for a model."
+  short_description: "KV cache layout, memory and concurrency"
+  default_prompt: "Use $dev-calculate-kv-cache-capacity to get KV cache size and max concurrency for a model or deployment."

@@ -56,6 +56,7 @@
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -64,6 +65,7 @@ use crate::log::{GpuClusterEntry, NetworkLogger};
 use crate::timing::kernels::{
     P2pInterKernel, P2pInterKernelInput, P2pIntraKernel, P2pIntraKernelInput,
 };
+use crate::worker::kv::{KvAccounting, KvCacheReport, KvOverhead};
 
 /// One physical GPU and who owns it. The cluster's `gpus` field is a flat list
 /// of these (the reporting / `run_meta.json` subset); `pool` + `worker_id` make
@@ -170,6 +172,30 @@ struct CommGroup {
     owner_worker_id: u16,
 }
 
+/// One KV pool's static facts, as `run_meta.json` records them. The
+/// `kv_snapshot` series counts KV in this pool's units; `bytes_per_unit` turns
+/// them into bytes. `report` is the pool's whole capacity breakdown, as
+/// `kv_cache.json` records it; the groups of one worker share it.
+#[derive(Clone, Debug)]
+pub struct KvPoolFacts {
+    pub capacity_units: u64,
+    pub bytes_per_unit: u64,
+    pub kv_overhead: KvOverhead,
+    pub report: Arc<KvCacheReport>,
+}
+
+impl KvPoolFacts {
+    /// `max_model_len` only sizes the report's concurrency.
+    pub(crate) fn of(accounting: &KvAccounting, max_model_len: Option<u32>) -> Self {
+        Self {
+            capacity_units: accounting.capacity_units(),
+            bytes_per_unit: accounting.bytes_per_unit(),
+            kv_overhead: accounting.overhead(),
+            report: Arc::new(accounting.report(max_model_len)),
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct GpuCluster {
     /// Flat per-GPU registry, indexed by global GPU id (dense `0..num_gpus`).
@@ -191,19 +217,19 @@ pub struct GpuCluster {
     /// whole run (the cluster is the single shared transfer oracle).
     #[serde(skip)]
     logger: Option<NetworkLogger>,
-    /// Per-worker × group KV-pool token capacity, as
-    /// `(pool_tag, pool, worker_id, group_id, capacity_tokens)`. A static per-run
+    /// Per-worker × group KV-pool facts, as
+    /// `(pool_tag, pool, worker_id, group_id, facts)`. A static per-run
     /// fact each worker reports at construction via
-    /// [`register_kv_capacity`](GpuCluster::register_kv_capacity) (right after
+    /// [`register_kv_pool`](GpuCluster::register_kv_pool) (right after
     /// [`allocate`](GpuCluster::allocate)); L7 folds it into `run_meta.json`'s
     /// per-worker `kv_pools` so the `kv_snapshot` occupancy series need not repeat
     /// the constant. `pool_tag` is carried so `run_meta` stamps the same
     /// `(pool_tag, worker_id, group_id)` key the `kv_snapshot` rows use — an exact
     /// analyzer join even when `worker_id` collides across pools (PD prefill#0 vs
     /// decode#0). `#[serde(skip)]` like the other runtime tables — exported via
-    /// [`kv_capacities`](GpuCluster::kv_capacities), not the derived `Serialize`.
+    /// [`kv_pools`](GpuCluster::kv_pools), not the derived `Serialize`.
     #[serde(skip)]
-    kv_caps: Vec<(&'static str, u16, u16, u16, u64)>,
+    kv_caps: Vec<(&'static str, u16, u16, u16, KvPoolFacts)>,
 }
 
 impl GpuCluster {
@@ -261,23 +287,23 @@ impl GpuCluster {
         base
     }
 
-    /// Record the KV-pool token `capacity` of `(pool_tag, pool, worker_id,
-    /// group_id)` — a static per-run fact the worker reports at construction, right
+    /// Record the KV-pool `facts` of `(pool_tag, pool, worker_id, group_id)` — a
+    /// static per-run fact the worker reports at construction, right
     /// after [`allocate`](GpuCluster::allocate). L7 folds these into
     /// `run_meta.json`'s per-worker `kv_pools`, keeping the `kv_snapshot` occupancy
     /// series capacity-free. `pool_tag` is the worker's cost-log pool literal, so
     /// `run_meta` can key capacity by the same `(pool_tag, worker_id, group_id)` the
     /// snapshot rows use. Multi-group workers (HP / PD decode) call once per group.
-    pub fn register_kv_capacity(
+    pub fn register_kv_pool(
         &mut self,
         pool_tag: &'static str,
         pool: u16,
         worker_id: u16,
         group_id: u16,
-        capacity: u64,
+        facts: KvPoolFacts,
     ) {
         self.kv_caps
-            .push((pool_tag, pool, worker_id, group_id, capacity));
+            .push((pool_tag, pool, worker_id, group_id, facts));
     }
 
     /// Register one comm group covering `[base, base+count)`, owned by worker
@@ -331,12 +357,19 @@ impl GpuCluster {
         })
     }
 
-    /// Registered KV-pool capacities as `(pool_tag, pool, worker_id, group_id,
-    /// capacity_tokens)`, in registration order (group-ordered within a worker).
+    /// Registered KV pools as `(pool_tag, pool, worker_id, group_id, facts)`, in
+    /// registration order (group-ordered within a worker).
     /// The one read path for L7 to export per-worker `kv_pools` into
-    /// `run_meta.json` — the internal `kv_caps` table is `#[serde(skip)]`.
-    pub fn kv_capacities(&self) -> impl Iterator<Item = (&'static str, u16, u16, u16, u64)> + '_ {
-        self.kv_caps.iter().copied()
+    /// `run_meta.json` and the reports into `kv_cache.json` — the internal
+    /// `kv_caps` table is `#[serde(skip)]`.
+    pub fn kv_pools(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, u16, u16, u16, &KvPoolFacts)> + '_ {
+        self.kv_caps
+            .iter()
+            .map(|(pool_tag, pool, worker_id, group_id, facts)| {
+                (*pool_tag, *pool, *worker_id, *group_id, facts)
+            })
     }
 
     /// Submit `bytes` from `send_gid` (acting as src) to `recv_gid` (acting as

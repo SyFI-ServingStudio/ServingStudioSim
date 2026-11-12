@@ -29,9 +29,15 @@ sync:
     uv sync --inexact --no-install-package deep-gemm
     uv sync
 
-# Reproducible CUDA-13 environment for vLLM-backed L1 kernels.
-profile-container-build:
-    profiling/container/build.sh
+# The image each L1 profile env runs in (profiling/container/README.md):
+# `just profile-container-build default`, or every image with no argument.
+profile-container-build *images:
+    uv run python -m profiling.container.images build {{images}}
+
+# The reference engines (reference_engines/README.md): `just ref materialize vllm`,
+# `export-patches`, `bump-base`, `build-image`.
+ref verb engine *args:
+    uv run python -m reference_engines {{verb}} {{engine}} {{args}}
 
 # The Rust tests run beside pytest; their log prints after it, in full on failure.
 # `workers` is the xdist worker count. Not `auto`: that means one worker per core,

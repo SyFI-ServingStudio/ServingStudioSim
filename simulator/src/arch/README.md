@@ -10,10 +10,12 @@ The canonical layer contract is
 ## Read the tree in this order
 
 1. `contract.rs` — the three L4↔L5 query contracts and their input types.
-2. `model_cfg.rs` / `moe_model_cfg.rs` — dense and MoE model dimensions.
-3. `config.rs` — serde selector surfaces.
-4. `build.rs` — shared selector-to-concrete-model builders.
-5. `llama3_*.rs` / `qwen3_*.rs` / `glm52_*.rs` — concrete model composition.
+2. `kv_layout.rs` — `KvCacheLayout`, the per-request KV state the contracts
+   report.
+3. `model_cfg.rs` / `moe_model_cfg.rs` — dense and MoE model dimensions.
+4. `config.rs` — serde selector surfaces.
+5. `build.rs` — shared selector-to-concrete-model builders.
+6. `llama3_*.rs` / `qwen3_*.rs` / `glm52_*.rs` — concrete model composition.
 
 ## Contracts (`contract.rs`)
 
@@ -34,18 +36,28 @@ The model fills caller-owned `slots` and `scratch` buffers and returns aggregate
 
 Capacity/topology methods are:
 
-- `total_kv_bytes_per_token()` — total all-layer/all-rank KV bytes for one token;
+- `kv_cache_layout()` — one request's persistent KV state as a `KvCacheLayout`
+  (`kv_layout.rs`), part by part, bytes summed over one KV partition's ranks;
 - `gpus_per_replica()` — physical extent of one replica;
 - `num_attn_dp_groups()` — independent attention-DP groups;
 - `num_attn_shards()` — GPUs in one attention shard.
 
-The worker derives a partition's token capacity from:
+`kv_cache_layout()` is required on all three KV-owning contracts
+(`IterwiseUnifiedModel`, `SpeculativeUnifiedModel`, `AttnLayerwiseModel`). Each
+`KvCachePart` says how it grows (`KvGrowth::PerToken { tokens_per_entry }`,
+`SlidingWindow { window_tokens }`, `PerRequest`), its `bytes_per_entry`, whether
+a prefix hit can resume from it (`prefix_reusable`), and what vLLM allocates on
+top (`PartOverhead`: padded entry bytes, extra copies). `EngineOverhead` holds
+the pool-wide terms: a large engine block and fixed device bytes. Each part
+declares its one-copy bytes and a `RankPlacement` over the partition's ranks
+(`.sharded(n)` / `.replicated(m)`, or `.placed(gqa_placement(heads, tp))` for
+GQA after `gqa_kv_bytes_per_token`), so a report can give the model's intrinsic
+size beside the per-GPU size and the replication factor.
 
-```text
-attn_kv_bytes_per_gpu × num_attn_shards
-────────────────────────────────────────
-       total_kv_bytes_per_token
-```
+The worker resolves the layout into KV units against the partition budget
+`attn_kv_bytes_per_gpu × num_attn_shards` (L5 `KvAccounting`); a layout of one
+per-token part counts plain tokens. Contract and rationale:
+`doc/detailed_design/L4.md` (KV cache layout).
 
 ### Speculative Iter-wise
 
@@ -98,6 +110,12 @@ reimplement model assembly.
   dimensions live in `Glm52ModelCfg` (`glm52_model_cfg.rs`), because its
   heterogeneous 78-layer schedule and indexer dimensions are not a `MoeModelCfg`
   extension.
+- `InklingModelCfg` (`inkling_model_cfg.rs`) reads Inkling's `text_config` and
+  its ModelOpt NVFP4 exclusions: the sliding-window/global attention schedule,
+  the dense-FFN layers, the sink experts and each MoE layer's expert precision.
+- `Qwen4ExpModelCfg` (`qwen4_exp_model_cfg.rs`) reads Qwen4Exp's `text_config`:
+  the GDN/QSA layer schedule, hyper-connections, PLE tables and the ModelOpt
+  mixed-precision map.
 - `ParallelCfg` and the family-specific parallel structs resolve TP, EP,
   attention-DP/HP, NVLink-domain, and GPU facts.
 - `num_layers` / `sim_num_layers` truncation is applied before
@@ -114,7 +132,7 @@ variant's parameters.
 
 | Contract | Wired selectors |
 |---|---|
-| `IterArchSel` | `qwen36_local`, `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `deepseek_v4_vllm`, `deepseek_v4_vllm_serial_streams`, `deepseek_v41_vllm`, `deepseek_v41_vllm_serial_streams`, `glm52_vllm_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe_speculative`, `glm52_vllm_nvfp4_pp_dsa_moe`, `glm52_vllm_nvfp4_dp_attn_dsa_moe`, `glm53_vllm_nvfp4_dsa_moe_dflash2`, `glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2`, `glm52_sglang_nvfp4_tp_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_pp_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_dp_attn_ep_moe` |
+| `IterArchSel` | `qwen36_local`, `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `deepseek_v4_vllm`, `deepseek_v4_vllm_serial_streams`, `deepseek_v41_vllm`, `deepseek_v41_vllm_serial_streams`, `glm52_vllm_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe_speculative`, `glm52_vllm_nvfp4_pp_dsa_moe`, `glm52_vllm_nvfp4_dp_attn_dsa_moe`, `glm53_vllm_nvfp4_dsa_moe_dflash2`, `glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2`, `glm52_sglang_nvfp4_tp_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_pp_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_dp_attn_ep_moe`, `inkling_vllm_nvfp4_rel_attn_moe`, `mimo_v2_vllm_fp8_swa_moe`, `qwen35_vllm_nvfp4_gdn_dense`, `qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative` |
 | `AttnArchSel` | `qwen3_attn_tp` |
 | `FfnArchSel` | `qwen3_ffn_moe`, `qwen3_fp8_ffn_moe` |
 
@@ -133,6 +151,8 @@ schema; no second hand-maintained config union belongs here.
   - GLM-5.2/5.3 vLLM NVFP4 DP attention + EP (`glm52_vllm_nvfp4_dp_attn_dsa_moe`)
     → `hp_unified` or `chunked_prefill`, one KV partition per DP rank
   - GLM-5.2 SGLang NVFP4 pure TP → `chunked_prefill`
+  - Qwen4Exp vLLM NVFP4 MTP (`qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative`) →
+    `speculative`
 - pp:
   - GLM-5.2/5.3 vLLM NVFP4 pipeline stages (`glm52_vllm_nvfp4_pp_dsa_moe`) →
     pipeline stage workers; `unified` rejects it. Each stage is its own

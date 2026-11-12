@@ -131,9 +131,8 @@ register(
         args_schema=KdaRecoverSSMVerifyArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        # Kimi-K3 RecoverSSM exists only in the alignment checkout rebased onto
-        # upstream vLLM (892da08), not in the vllm_env image (3f667d7).
-        subprocess_env="vllm_upstream_fork_env",
+        # Kimi-K3 RecoverSSM ships in the vllm_env image's upstream base (5629b26).
+        subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
                 "vLLM fork's kda_recoverssm_verify (Kimi-K3): one Triton kernel that "

@@ -1,0 +1,818 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Tue, 11 Aug 2026 06:14:58 +0000
+Subject: [PATCH] feat(alignment): decompose API-side request latency
+
+The v2 records cover EngineCore only. A request's wall-clock latency as the
+client sees it also contains the API frontend: generator activation, add_request,
+the output collector handoff, and SSE serialization. Alignment had no visibility
+into any of it, so the simulator had nothing to compare its client-side queueing
+against.
+
+Adds a v3 `VibeSimAlignmentApiRequestTiming` record on the completions and disagg
+streaming paths, splitting that span into frontend prepare / stream activation /
+add_request / collector wait / engine output wait / output fanout / collector
+wakeup / generator resume / first-output serialize, plus the token receive and
+SSE yield spans and the terminal tail.
+
+EngineCore and the API frontend are separate processes, so their monotonic
+clocks share no origin. `build_alignment_api_timing_record` therefore only ever
+subtracts within one domain -- the EngineCore TTFT and decode durations are
+carried alongside as their own values, never differenced against an API
+timestamp. That is what the new unit test pins, by passing the two domains
+deliberately different origins.
+
+Five API-process timestamps go on `RequestStateStats`. They are stamped from the
+loops that already run (`RequestOutputCollector.put`, the per-output loop in
+`process_outputs`) rather than from a new pass, and each is guarded by a
+`== 0.0` first-write check plus a non-empty `token_ids` check so prompt-only and
+empty outputs do not claim the first-token boundary.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../completion/test_alignment_api_timing.py   |  50 +++++++++
+ .../test_generate_stream.py                   |  89 ++++++++++++++-
+ vllm/entrypoints/openai/completion/serving.py | 103 +++++++++++++++++-
+ .../scale_out/token_in_token_out/serving.py   |  92 +++++++++++++++-
+ vllm/entrypoints/serve/utils/api_utils.py     |  92 ++++++++++++++++
+ vllm/v1/engine/async_llm.py                   |  14 +++
+ vllm/v1/engine/output_processor.py            |  21 ++++
+ vllm/v1/metrics/stats.py                      |   9 ++
+ 8 files changed, 464 insertions(+), 6 deletions(-)
+ create mode 100644 tests/entrypoints/openai/completion/test_alignment_api_timing.py
+
+diff --git a/tests/entrypoints/openai/completion/test_alignment_api_timing.py b/tests/entrypoints/openai/completion/test_alignment_api_timing.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc3d6ca9e9073774b97c9cd861547f7973a05f67
+--- /dev/null
++++ b/tests/entrypoints/openai/completion/test_alignment_api_timing.py
+@@ -0,0 +1,50 @@
++import pytest
++
++from vllm.entrypoints.serve.utils.api_utils import (
++    build_alignment_api_timing_record,
++)
++
++
++def test_alignment_api_timing_uses_only_within_process_durations():
++    record = build_alignment_api_timing_record(
++        request_id="cmpl-vibesim_7",
++        request_start_monotonic=100.0,
++        generators_ready_monotonic=100.003,
++        first_output_received_monotonic=100.020,
++        last_output_received_monotonic=100.220,
++        first_token_yield_monotonic=100.021,
++        last_token_yield_monotonic=100.225,
++        done_yield_monotonic=100.226,
++        # Deliberately use a different absolute origin for EngineCore. Only
++        # within-EngineCore differences are meaningful across processes.
++        engine_queued_monotonic=10.0,
++        engine_first_token_monotonic=10.015,
++        engine_last_token_monotonic=10.215,
++        generate_start_monotonic=100.005,
++        add_request_done_monotonic=100.007,
++        first_engine_output_received_monotonic=100.016,
++        first_output_collector_put_monotonic=100.018,
++        first_output_dequeued_monotonic=100.019,
++        output_tokens=32,
++        token_events=31,
++        first_token_event_tokens=2,
++    )
++
++    assert record["schema_version"] == 3
++    assert record["api_request_id"] == "cmpl-vibesim_7"
++    assert record["api_frontend_prepare_ms"] == pytest.approx(3.0)
++    assert record["api_first_output_wait_ms"] == pytest.approx(17.0)
++    assert record["api_stream_activation_ms"] == pytest.approx(2.0)
++    assert record["api_add_request_ms"] == pytest.approx(2.0)
++    assert record["api_collector_wait_ms"] == pytest.approx(11.0)
++    assert record["api_engine_output_wait_ms"] == pytest.approx(9.0)
++    assert record["api_output_fanout_ms"] == pytest.approx(2.0)
++    assert record["api_collector_wakeup_ms"] == pytest.approx(1.0)
++    assert record["api_generator_resume_ms"] == pytest.approx(1.0)
++    assert record["api_first_output_serialize_ms"] == pytest.approx(1.0)
++    assert record["api_token_output_receive_span_ms"] == pytest.approx(200.0)
++    assert record["api_token_sse_yield_span_ms"] == pytest.approx(204.0)
++    assert record["api_terminal_tail_ms"] == pytest.approx(1.0)
++    assert record["engine_core_ttft_ms"] == pytest.approx(15.0)
++    assert record["engine_core_decode_ms"] == pytest.approx(200.0)
++    assert record["first_token_event_tokens"] == 2
+diff --git a/tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py b/tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py
+index 98bea6880abda82beed64a896c8018c4471f6fb6..a307dfdebf87f4a519aea544c490bcc3ca8f3b57 100644
+--- a/tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py
++++ b/tests/entrypoints/scale_out/token_in_token_out/test_generate_stream.py
+@@ -5,6 +5,7 @@ import asyncio
+ import functools
+ import json
+ from dataclasses import dataclass, field
++from types import SimpleNamespace
+ from typing import Any
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+@@ -12,6 +13,8 @@ import pytest
+ 
+ from vllm.config.multimodal import MultiModalConfig
+ from vllm.entrypoints.generate.base.protocol import DeltaMessage, StreamOptions
++from vllm.entrypoints.scale_out.token_in_token_out import serving as serving_module
++from vllm.entrypoints.serve.engine.protocol import RequestResponseMetadata
+ from vllm.entrypoints.openai.models.protocol import BaseModelPath
+ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+ from vllm.entrypoints.scale_out.token_in_token_out.mm_features import (
+@@ -45,7 +48,7 @@ from vllm.renderers.online_derenderer import OnlineDerenderer
+ from vllm.renderers.online_renderer import OnlineRenderer
+ from vllm.sampling_params import SamplingParams
+ from vllm.v1.engine.async_llm import AsyncLLM
+-from vllm.v1.metrics.stats import RequestSpecDecodeMetrics
++from vllm.v1.metrics.stats import RequestSpecDecodeMetrics, RequestStateStats
+ 
+ MODEL_NAME = "openai-community/gpt2"
+ BASE_MODEL_PATHS = [
+@@ -154,6 +157,7 @@ def _make_request_output(
+     index: int = 0,
+     spec_decode_metrics: RequestSpecDecodeMetrics | None = None,
+     text: str = "",
++    metrics: RequestStateStats | None = None,
+ ) -> RequestOutput:
+     return RequestOutput(
+         request_id=request_id,
+@@ -173,7 +177,7 @@ def _make_request_output(
+             )
+         ],
+         finished=finished,
+-        metrics=None,
++        metrics=metrics,
+         lora_request=None,
+         encoder_prompt=None,
+         encoder_prompt_token_ids=None,
+@@ -969,6 +973,87 @@ async def test_stream_parallel_sampling_first_output_missing_a_choice():
+     assert parsed[-2]["usage"]["completion_tokens"] == 2
+ 
+ 
++@pytest.mark.asyncio
++async def test_stream_logs_alignment_api_timing(monkeypatch: pytest.MonkeyPatch):
++    request_metrics = RequestStateStats(
++        queued_ts=10.0,
++        first_token_ts=10.015,
++        last_token_ts=10.215,
++        api_generate_start_ts=100.005,
++        api_add_request_done_ts=100.007,
++        api_first_engine_output_received_ts=100.016,
++        api_first_output_collector_put_ts=100.018,
++        api_first_output_dequeued_ts=100.019,
++    )
++
++    async def mock_generate(*args, **kwargs):
++        yield _make_request_output("req-1", token_ids=[10], metrics=request_metrics)
++        yield _make_request_output("req-1", token_ids=[20, 30], metrics=request_metrics)
++        yield _make_request_output(
++            "req-1",
++            token_ids=[40],
++            finish_reason="stop",
++            finished=True,
++            metrics=request_metrics,
++        )
++
++    serving = object.__new__(ServingTokens)
++    serving.enable_prompt_tokens_details = False
++    serving.return_tokens_as_token_ids = False
++    logger_info = MagicMock()
++    monkeypatch.setattr(serving_module.logger, "info", logger_info)
++    monotonic_values = iter(
++        [100.020, 100.021, 100.120, 100.121, 100.220, 100.221, 100.222]
++    )
++    monkeypatch.setattr(
++        serving_module,
++        "time",
++        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
++    )
++
++    request = GenerateRequest(
++        token_ids=[1, 2, 3],
++        sampling_params=SamplingParams(max_tokens=10),
++        model=MODEL_NAME,
++        stream=True,
++    )
++
++    response = serving.serve_tokens_stream_generator(
++        request,
++        mock_generate(),
++        "generate-tokens-vibesim_1",
++        MODEL_NAME,
++        RequestResponseMetadata(request_id="generate-tokens-vibesim_1"),
++        api_request_start_monotonic=100.0,
++        api_generators_ready_monotonic=100.003,
++    )
++    chunks = [chunk async for chunk in response]
++
++    assert chunks[-1] == "data: [DONE]\n\n"
++    timing_calls = [
++        call
++        for call in logger_info.call_args_list
++        if call.args[0] == "VibeSimAlignmentApiRequestTiming %s"
++    ]
++    assert len(timing_calls) == 1
++    timing_record = json.loads(timing_calls[0].args[1])
++    assert timing_record["schema_version"] == 3
++    assert timing_record["api_request_id"].startswith("generate-tokens-")
++    assert timing_record["output_tokens"] == 4
++    assert timing_record["token_events"] == 3
++    assert timing_record["first_token_event_tokens"] == 1
++    assert timing_record["engine_core_ttft_ms"] == pytest.approx(15.0)
++    assert timing_record["engine_core_decode_ms"] == pytest.approx(200.0)
++    assert timing_record["api_first_output_wait_ms"] == pytest.approx(17.0)
++    assert timing_record["api_stream_activation_ms"] == pytest.approx(2.0)
++    assert timing_record["api_add_request_ms"] == pytest.approx(2.0)
++    assert timing_record["api_collector_wait_ms"] == pytest.approx(11.0)
++    assert timing_record["api_engine_output_wait_ms"] == pytest.approx(9.0)
++    assert timing_record["api_output_fanout_ms"] == pytest.approx(2.0)
++    assert timing_record["api_collector_wakeup_ms"] == pytest.approx(1.0)
++    assert timing_record["api_generator_resume_ms"] == pytest.approx(1.0)
++
++
+ @pytest.mark.asyncio
+ async def test_stream_error_mid_generation():
+     """finish_reason='error' mid-stream yields error chunk then [DONE]."""
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index e80979686cc9d5d97f7926173a273916964a9d57..bfc57743ab5b8143dd26548d7aaddc6bc3e402e5 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import asyncio
++import io
+ import itertools
+ import json
+ import time
+@@ -38,7 +39,11 @@ from vllm.entrypoints.serve.engine.protocol import (
+     PromptTokenUsageInfo,
+     UsageInfo,
+ )
+-from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
++from vllm.entrypoints.serve.utils.api_utils import (
++    build_alignment_api_timing_record,
++    get_max_tokens,
++    should_include_usage,
++)
+ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+ from vllm.exceptions import GenerationError, VLLMValidationError
+ from vllm.inputs import EngineInput
+@@ -178,6 +183,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
+         request: CompletionRequest,
+         raw_request: Request | None = None,
+     ) -> AsyncGenerator[str, None] | CompletionResponse | ErrorResponse:
++        api_request_start_monotonic = time.monotonic()
+         if request.stream and request.use_beam_search:
+             return self.create_error_response(
+                 "Streaming is not currently supported with beam search"
+@@ -266,6 +272,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
+             generators.append(generator)
+ 
+         result_generator = merge_async_iterators(*generators)
++        api_generators_ready_monotonic = time.monotonic()
+ 
+         model_name = self.models.model_name(lora_request)
+         num_prompts = len(engine_inputs)
+@@ -284,6 +291,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
+                 num_prompts=num_prompts,
+                 tokenizer=tokenizer,
+                 request_metadata=request_metadata,
++                api_request_start_monotonic=api_request_start_monotonic,
++                api_generators_ready_monotonic=api_generators_ready_monotonic,
+             )
+ 
+         # Non-streaming response
+@@ -351,6 +360,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
+         num_prompts: int,
+         tokenizer: TokenizerLike | None,
+         request_metadata: RequestResponseMetadata,
++        api_request_start_monotonic: float | None = None,
++        api_generators_ready_monotonic: float | None = None,
+     ) -> AsyncGenerator[str, None]:
+         num_choices = 1 if request.n is None else request.n
+         next_text_offsets = [0] * num_choices * num_prompts
+@@ -360,6 +371,13 @@ class OpenAIServingCompletion(GenerateBaseServing):
+         num_prompt_tokens = [0] * num_prompts
+         num_cached_tokens = None
+         first_iteration = True
++        api_first_output_received_monotonic = None
++        api_last_output_received_monotonic = None
++        api_first_token_yield_monotonic = None
++        api_last_token_yield_monotonic = None
++        api_token_events = 0
++        api_first_token_event_tokens = 0
++        final_request_stats = None
+ 
+         stream_options = request.stream_options
+         include_usage, include_continuous_usage = should_include_usage(
+@@ -384,6 +402,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
+ 
+             async for prompt_idx, res in result_generator:
+                 last_res = res
++                output_received_monotonic = time.monotonic()
++                if res.metrics is not None:
++                    final_request_stats = res.metrics
+                 prompt_token_ids = res.prompt_token_ids
+                 prompt_logprobs = res.prompt_logprobs
+ 
+@@ -496,11 +517,26 @@ class OpenAIServingCompletion(GenerateBaseServing):
+ 
+                     if delta_template is not None and finish_reason is None:
+                         prefix, infix, suffix = delta_template
+-                        yield (
++                        frame = (
+                             f"{prefix}{i}{infix}"
+                             f"{json.dumps(delta_text, ensure_ascii=False)}"
+                             f"{suffix}"
+                         )
++                        if output.token_ids:
++                            if api_first_output_received_monotonic is None:
++                                api_first_output_received_monotonic = (
++                                    output_received_monotonic
++                                )
++                            api_last_output_received_monotonic = (
++                                output_received_monotonic
++                            )
++                            token_yield_monotonic = time.monotonic()
++                            if api_first_token_yield_monotonic is None:
++                                api_first_token_yield_monotonic = token_yield_monotonic
++                                api_first_token_event_tokens = len(output.token_ids)
++                            api_last_token_yield_monotonic = token_yield_monotonic
++                            api_token_events += 1
++                        yield frame
+                         continue
+ 
+                     chunk = CompletionStreamResponse(
+@@ -552,6 +588,18 @@ class OpenAIServingCompletion(GenerateBaseServing):
+                         )
+ 
+                     response_json = chunk.model_dump_json(exclude_unset=True)
++                    if output.token_ids:
++                        if api_first_output_received_monotonic is None:
++                            api_first_output_received_monotonic = (
++                                output_received_monotonic
++                            )
++                        api_last_output_received_monotonic = output_received_monotonic
++                        token_yield_monotonic = time.monotonic()
++                        if api_first_token_yield_monotonic is None:
++                            api_first_token_yield_monotonic = token_yield_monotonic
++                            api_first_token_event_tokens = len(output.token_ids)
++                        api_last_token_yield_monotonic = token_yield_monotonic
++                        api_token_events += 1
+                     yield f"data: {response_json}\n\n"
+ 
+             if self.enable_log_outputs and self.request_logger:
+@@ -623,6 +671,57 @@ class OpenAIServingCompletion(GenerateBaseServing):
+             logger.exception("Error in completion stream generator.")
+             data = self.create_streaming_error_response(e)
+             yield f"data: {data}\n\n"
++        api_done_yield_monotonic = time.monotonic()
++        if (
++            final_request_stats is not None
++            and api_request_start_monotonic is not None
++            and api_generators_ready_monotonic is not None
++            and api_first_output_received_monotonic is not None
++            and api_last_output_received_monotonic is not None
++            and api_first_token_yield_monotonic is not None
++            and api_last_token_yield_monotonic is not None
++            and final_request_stats.queued_ts > 0.0
++            and final_request_stats.first_token_ts > 0.0
++            and final_request_stats.last_token_ts > 0.0
++            and final_request_stats.api_generate_start_ts > 0.0
++            and final_request_stats.api_add_request_done_ts > 0.0
++            and final_request_stats.api_first_engine_output_received_ts > 0.0
++            and final_request_stats.api_first_output_collector_put_ts > 0.0
++            and final_request_stats.api_first_output_dequeued_ts > 0.0
++        ):
++            timing_record = build_alignment_api_timing_record(
++                request_id=request_id,
++                request_start_monotonic=api_request_start_monotonic,
++                generators_ready_monotonic=api_generators_ready_monotonic,
++                first_output_received_monotonic=api_first_output_received_monotonic,
++                last_output_received_monotonic=api_last_output_received_monotonic,
++                first_token_yield_monotonic=api_first_token_yield_monotonic,
++                last_token_yield_monotonic=api_last_token_yield_monotonic,
++                done_yield_monotonic=api_done_yield_monotonic,
++                engine_queued_monotonic=final_request_stats.queued_ts,
++                engine_first_token_monotonic=final_request_stats.first_token_ts,
++                engine_last_token_monotonic=final_request_stats.last_token_ts,
++                generate_start_monotonic=final_request_stats.api_generate_start_ts,
++                add_request_done_monotonic=(
++                    final_request_stats.api_add_request_done_ts
++                ),
++                first_engine_output_received_monotonic=(
++                    final_request_stats.api_first_engine_output_received_ts
++                ),
++                first_output_collector_put_monotonic=(
++                    final_request_stats.api_first_output_collector_put_ts
++                ),
++                first_output_dequeued_monotonic=(
++                    final_request_stats.api_first_output_dequeued_ts
++                ),
++                output_tokens=sum(previous_num_tokens),
++                token_events=api_token_events,
++                first_token_event_tokens=api_first_token_event_tokens,
++            )
++            logger.info(
++                "VibeSimAlignmentApiRequestTiming %s",
++                json.dumps(timing_record, separators=(",", ":")),
++            )
+         yield "data: [DONE]\n\n"
+ 
+     def request_output_to_completion_response(
+diff --git a/vllm/entrypoints/scale_out/token_in_token_out/serving.py b/vllm/entrypoints/scale_out/token_in_token_out/serving.py
+index 8a733e069ea68b846b46e6b45fb389b158dbc0ad..85da23720167d6d6ca6a00ebf8babe673f0a99e2 100644
+--- a/vllm/entrypoints/scale_out/token_in_token_out/serving.py
++++ b/vllm/entrypoints/scale_out/token_in_token_out/serving.py
+@@ -3,7 +3,9 @@
+ 
+ 
+ import asyncio
++import io
+ import itertools
++import json
+ import math
+ import time
+ from collections.abc import AsyncGenerator, Callable
+@@ -41,7 +43,11 @@ from vllm.entrypoints.serve.engine.protocol import (
+     PromptTokenUsageInfo,
+     UsageInfo,
+ )
+-from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
++from vllm.entrypoints.serve.utils.api_utils import (
++    build_alignment_api_timing_record,
++    get_max_tokens,
++    should_include_usage,
++)
+ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+ from vllm.exceptions import GenerationError, VLLMValidationError
+ from vllm.inputs import EngineInput, TokensPrompt, mm_input
+@@ -214,6 +220,7 @@ class ServingTokens(GenerateBaseServing):
+         request: GenerateRequest,
+         raw_request: Request | None = None,
+     ) -> GenerateResponse | ErrorResponse | AsyncGenerator[str, None]:
++        api_request_start_monotonic = time.monotonic()
+         error_check_ret = await self._check_model(request)
+         if error_check_ret is not None:
+             logger.error("Error with model %s", error_check_ret)
+@@ -437,6 +444,7 @@ class ServingTokens(GenerateBaseServing):
+         )
+ 
+         assert result_generator is not None
++        api_generators_ready_monotonic = time.monotonic()
+ 
+         if request.stream:
+             return self.serve_tokens_stream_generator(
+@@ -446,6 +454,8 @@ class ServingTokens(GenerateBaseServing):
+                 model_name,
+                 request_metadata,
+                 processors=processors,
++                api_request_start_monotonic=api_request_start_monotonic,
++                api_generators_ready_monotonic=api_generators_ready_monotonic,
+             )
+ 
+         return await self.serve_tokens_full_generator(
+@@ -681,6 +691,8 @@ class ServingTokens(GenerateBaseServing):
+         model_name: str,
+         request_metadata: RequestResponseMetadata,
+         processors: list[ChatStreamProcessor] | None = None,
++        api_request_start_monotonic: float | None = None,
++        api_generators_ready_monotonic: float | None = None,
+     ) -> AsyncGenerator[str, None]:
+         num_prompt_tokens = 0
+         first_iteration = True
+@@ -698,6 +710,13 @@ class ServingTokens(GenerateBaseServing):
+         response_cls = _STREAM_RESPONSE_CLS[request.output_mode]
+         role_sent = [False] * sampling_params.n
+         finish_reason_sent = [False] * sampling_params.n
++        api_first_output_received_monotonic = None
++        api_last_output_received_monotonic = None
++        api_first_token_yield_monotonic = None
++        api_last_token_yield_monotonic = None
++        api_token_events = 0
++        api_first_token_event_tokens = 0
++        final_request_stats = None
+ 
+         include_usage, include_continuous_usage = should_include_usage(
+             request.stream_options, False
+@@ -706,6 +725,9 @@ class ServingTokens(GenerateBaseServing):
+         try:
+             async for res in result_generator:
+                 last_res = res
++                output_received_monotonic = time.monotonic()
++                if res.metrics is not None:
++                    final_request_stats = res.metrics
+                 if first_iteration:
+                     if res.prompt_token_ids is not None:
+                         num_prompt_tokens = len(res.prompt_token_ids)
+@@ -838,7 +860,22 @@ class ServingTokens(GenerateBaseServing):
+                         for name in ("prompt_token_ids", "mm_placeholders", "metrics")
+                         if getattr(chunk, name) is None
+                     }
+-                    yield f"data: {chunk.model_dump_json(exclude=exclude)}\n\n"
++                    response_json = chunk.model_dump_json(exclude=exclude)
++                    # Terminal and held-back-text chunks can carry no tokens;
++                    # only token-bearing chunks are token events.
++                    if delta_token_ids:
++                        if api_first_output_received_monotonic is None:
++                            api_first_output_received_monotonic = (
++                                output_received_monotonic
++                            )
++                        api_last_output_received_monotonic = output_received_monotonic
++                        token_yield_monotonic = time.monotonic()
++                        if api_first_token_yield_monotonic is None:
++                            api_first_token_yield_monotonic = token_yield_monotonic
++                            api_first_token_event_tokens = len(delta_token_ids)
++                        api_last_token_yield_monotonic = token_yield_monotonic
++                        api_token_events += 1
++                    yield f"data: {response_json}\n\n"
+ 
+             total_completion_tokens = sum(num_generated_tokens)
+             final_usage_info = UsageInfo(
+@@ -885,6 +922,57 @@ class ServingTokens(GenerateBaseServing):
+             task.add_done_callback(_background_tasks.discard)
+             data = self.create_streaming_error_response(e)
+             yield f"data: {data}\n\n"
++        api_done_yield_monotonic = time.monotonic()
++        if (
++            final_request_stats is not None
++            and api_request_start_monotonic is not None
++            and api_generators_ready_monotonic is not None
++            and api_first_output_received_monotonic is not None
++            and api_last_output_received_monotonic is not None
++            and api_first_token_yield_monotonic is not None
++            and api_last_token_yield_monotonic is not None
++            and final_request_stats.queued_ts > 0.0
++            and final_request_stats.first_token_ts > 0.0
++            and final_request_stats.last_token_ts > 0.0
++            and final_request_stats.api_generate_start_ts > 0.0
++            and final_request_stats.api_add_request_done_ts > 0.0
++            and final_request_stats.api_first_engine_output_received_ts > 0.0
++            and final_request_stats.api_first_output_collector_put_ts > 0.0
++            and final_request_stats.api_first_output_dequeued_ts > 0.0
++        ):
++            timing_record = build_alignment_api_timing_record(
++                request_id=request_id,
++                request_start_monotonic=api_request_start_monotonic,
++                generators_ready_monotonic=api_generators_ready_monotonic,
++                first_output_received_monotonic=api_first_output_received_monotonic,
++                last_output_received_monotonic=api_last_output_received_monotonic,
++                first_token_yield_monotonic=api_first_token_yield_monotonic,
++                last_token_yield_monotonic=api_last_token_yield_monotonic,
++                done_yield_monotonic=api_done_yield_monotonic,
++                engine_queued_monotonic=final_request_stats.queued_ts,
++                engine_first_token_monotonic=final_request_stats.first_token_ts,
++                engine_last_token_monotonic=final_request_stats.last_token_ts,
++                generate_start_monotonic=final_request_stats.api_generate_start_ts,
++                add_request_done_monotonic=(
++                    final_request_stats.api_add_request_done_ts
++                ),
++                first_engine_output_received_monotonic=(
++                    final_request_stats.api_first_engine_output_received_ts
++                ),
++                first_output_collector_put_monotonic=(
++                    final_request_stats.api_first_output_collector_put_ts
++                ),
++                first_output_dequeued_monotonic=(
++                    final_request_stats.api_first_output_dequeued_ts
++                ),
++                output_tokens=sum(num_generated_tokens),
++                token_events=api_token_events,
++                first_token_event_tokens=api_first_token_event_tokens,
++            )
++            logger.info(
++                "VibeSimAlignmentApiRequestTiming %s",
++                json.dumps(timing_record, separators=(",", ":")),
++            )
+         yield "data: [DONE]\n\n"
+ 
+     @staticmethod
+diff --git a/vllm/entrypoints/serve/utils/api_utils.py b/vllm/entrypoints/serve/utils/api_utils.py
+index b1f3cb788dd5a5d3dd7703b7d6de351c389d6518..c514354436ecf61c02fcac09ea2add5d18a20fc9 100644
+--- a/vllm/entrypoints/serve/utils/api_utils.py
++++ b/vllm/entrypoints/serve/utils/api_utils.py
+@@ -50,6 +50,98 @@ def create_json_response(
+     )
+ 
+ 
++def build_alignment_api_timing_record(
++    *,
++    request_id: str,
++    request_start_monotonic: float,
++    generators_ready_monotonic: float,
++    first_output_received_monotonic: float,
++    last_output_received_monotonic: float,
++    first_token_yield_monotonic: float,
++    last_token_yield_monotonic: float,
++    done_yield_monotonic: float,
++    engine_queued_monotonic: float,
++    engine_first_token_monotonic: float,
++    engine_last_token_monotonic: float,
++    generate_start_monotonic: float,
++    add_request_done_monotonic: float,
++    first_engine_output_received_monotonic: float,
++    first_output_collector_put_monotonic: float,
++    first_output_dequeued_monotonic: float,
++    output_tokens: int,
++    token_events: int,
++    first_token_event_tokens: int,
++) -> dict[str, int | float | str]:
++    """Build one same-request API timing record without crossing clocks.
++
++    EngineCore and API timestamps come from different processes. The report
++    compares durations within each clock domain; it never subtracts an API
++    absolute timestamp from an EngineCore absolute timestamp.
++    """
++    return {
++        "schema_version": 3,
++        "api_request_id": request_id,
++        "output_tokens": output_tokens,
++        "token_events": token_events,
++        "first_token_event_tokens": first_token_event_tokens,
++        "api_frontend_prepare_ms": (
++            generators_ready_monotonic - request_start_monotonic
++        )
++        * 1000.0,
++        "api_first_output_wait_ms": (
++            first_output_received_monotonic - generators_ready_monotonic
++        )
++        * 1000.0,
++        "api_stream_activation_ms": (
++            generate_start_monotonic - generators_ready_monotonic
++        )
++        * 1000.0,
++        "api_add_request_ms": (add_request_done_monotonic - generate_start_monotonic)
++        * 1000.0,
++        "api_collector_wait_ms": (
++            first_output_collector_put_monotonic - add_request_done_monotonic
++        )
++        * 1000.0,
++        "api_engine_output_wait_ms": (
++            first_engine_output_received_monotonic - add_request_done_monotonic
++        )
++        * 1000.0,
++        "api_output_fanout_ms": (
++            first_output_collector_put_monotonic
++            - first_engine_output_received_monotonic
++        )
++        * 1000.0,
++        "api_collector_wakeup_ms": (
++            first_output_dequeued_monotonic - first_output_collector_put_monotonic
++        )
++        * 1000.0,
++        "api_generator_resume_ms": (
++            first_output_received_monotonic - first_output_dequeued_monotonic
++        )
++        * 1000.0,
++        "api_first_output_serialize_ms": (
++            first_token_yield_monotonic - first_output_received_monotonic
++        )
++        * 1000.0,
++        "api_token_output_receive_span_ms": (
++            last_output_received_monotonic - first_output_received_monotonic
++        )
++        * 1000.0,
++        "api_token_sse_yield_span_ms": (
++            last_token_yield_monotonic - first_token_yield_monotonic
++        )
++        * 1000.0,
++        "api_terminal_tail_ms": (done_yield_monotonic - last_token_yield_monotonic)
++        * 1000.0,
++        "engine_core_ttft_ms": (engine_first_token_monotonic - engine_queued_monotonic)
++        * 1000.0,
++        "engine_core_decode_ms": (
++            engine_last_token_monotonic - engine_first_token_monotonic
++        )
++        * 1000.0,
++    }
++
++
+ async def listen_for_disconnect(request: Request) -> None:
+     """Returns if a disconnect message is received."""
+     while True:
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 5d95df0fa87274bfd34c8d7264109fd9f6ea470a..dad043fc554ee1e18ce1124d82e330fda53c9c95 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -782,6 +782,7 @@ class AsyncLLM(EngineClient):
+             >>> gen = self.generate(engine_input, sampling_params, request_id)
+ 
+         """
++        api_generate_start_monotonic = time.monotonic()
+         q: RequestOutputCollector | None = None
+         try:
+             q = await self.add_request(
+@@ -799,6 +800,7 @@ class AsyncLLM(EngineClient):
+                 reasoning_ended=reasoning_ended,
+                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+             )
++            api_add_request_done_monotonic = time.monotonic()
+ 
+             # The output_handler task pushes items into the queue.
+             # This task pulls from the queue and yields to caller.
+@@ -811,6 +813,14 @@ class AsyncLLM(EngineClient):
+                 # Note: both OutputProcessor and EngineCore handle their
+                 # own request cleanup based on finished.
+                 assert isinstance(out, RequestOutput)
++                if (
++                    out.metrics is not None
++                    and out.metrics.api_first_output_dequeued_ts == 0.0
++                    and any(completion.token_ids for completion in out.outputs)
++                ):
++                    out.metrics.api_generate_start_ts = api_generate_start_monotonic
++                    out.metrics.api_add_request_done_ts = api_add_request_done_monotonic
++                    out.metrics.api_first_output_dequeued_ts = time.monotonic()
+                 finished = out.finished
+                 if out is not STREAM_FINISHED:
+                     yield out
+@@ -892,6 +902,7 @@ class AsyncLLM(EngineClient):
+                 while True:
+                     # 1) Pull EngineCoreOutputs from the EngineCore.
+                     outputs = await engine_core.get_output_async()
++                    api_engine_output_received_timestamp = time.monotonic()
+                     num_outputs = len(outputs.outputs)
+ 
+                     iteration_stats = (
+@@ -921,6 +932,9 @@ class AsyncLLM(EngineClient):
+                             outputs.timestamp,
+                             iteration_stats,
+                             weight_version=outputs.weight_version,
++                            api_engine_output_received_timestamp=(
++                                api_engine_output_received_timestamp
++                            ),
+                         )
+                         # NOTE: RequestOutputs are pushed to their queues.
+                         assert not processed_outputs.request_outputs
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index ee03a7ebe028df839c810ba8f8f0366569cd8320..ff0cc2e89f6b3ebe5c7aac178c3e104a9dcf6411 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -3,6 +3,7 @@
+ 
+ import asyncio
+ import json
++import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+ from dataclasses import dataclass
+@@ -73,6 +74,13 @@ class RequestOutputCollector:
+ 
+     def put(self, output: RequestOutput | PoolingRequestOutput | Exception) -> None:
+         """Non-blocking put operation."""
++        if (
++            isinstance(output, RequestOutput)
++            and output.metrics is not None
++            and output.metrics.api_first_output_collector_put_ts == 0.0
++            and any(completion.token_ids for completion in output.outputs)
++        ):
++            output.metrics.api_first_output_collector_put_ts = time.monotonic()
+         if self.output is None or isinstance(output, Exception):
+             self.output = output
+             self.ready.set()
+@@ -738,6 +746,7 @@ class OutputProcessor:
+         engine_core_timestamp: float | None = None,
+         iteration_stats: IterationStats | None = None,
+         weight_version: str | None = None,
++        api_engine_output_received_timestamp: float | None = None,
+     ) -> OutputProcessorOutput:
+         """Process the EngineCoreOutputs:
+         1) Compute stats for logging
+@@ -778,6 +787,18 @@ class OutputProcessor:
+                     reqs_to_abort.append(req_id)
+                 continue
+ 
++            if (
++                api_engine_output_received_timestamp is not None
++                and req_state.stats is not None
++                and req_state.stats.api_first_engine_output_received_ts == 0.0
++                and engine_core_output.new_token_ids
++            ):
++                # Reuse the existing per-output loop so instrumentation does not
++                # add another full-batch pass to this latency-sensitive path.
++                req_state.stats.api_first_engine_output_received_ts = (
++                    api_engine_output_received_timestamp
++                )
++
+             # 1) Compute stats for this iteration.
+             self._update_stats_from_output(
+                 req_state, engine_core_output, engine_core_timestamp, iteration_stats
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+index 20c754be34ba1c65b567e4dfc82bd0c607759854..1ca910b3ae51de3a428919362ddd39257196ae1a 100644
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -271,6 +271,15 @@ class RequestStateStats:
+     first_token_ts: float = 0.0
+     last_token_ts: float = 0.0
+ 
++    # These timestamps are produced and consumed entirely in the API process.
++    # They decompose lazy generator activation and first-output delivery around
++    # the separate EngineCore duration without crossing absolute clock domains.
++    api_generate_start_ts: float = 0.0
++    api_add_request_done_ts: float = 0.0
++    api_first_engine_output_received_ts: float = 0.0
++    api_first_output_collector_put_ts: float = 0.0
++    api_first_output_dequeued_ts: float = 0.0
++
+     # first token latency
+     first_token_latency: float = 0.0
+ 

@@ -3,21 +3,21 @@
 //! `KvStore` is the common resource lifecycle. `IterWorkerKv` is the narrow
 //! capability required by the whole-iteration worker family. Membership is
 //! exposed through generic visitors, not owned snapshots, so abstraction does
-//! not add hot-path allocation or leak `FullAttnPartitionState`.
+//! not add hot-path allocation or leak partition state.
 
 use crate::common::{RequestId, SessionInput, Time};
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
 
 use self::shared::prefix_cache::PrefixCacheReturnMetadata;
 
-mod full_attn;
-mod hybrid_gdn;
+mod kv_cache_store;
 mod shared;
 
-pub use full_attn::FullAttnKv;
-pub use hybrid_gdn::HybridGdnKv;
+pub use kv_cache_store::KvCacheStore;
 pub use shared::host_tier::HostKvTier;
-pub(crate) use shared::prefix_cache::PrefixCacheTokenConfig;
+pub(crate) use shared::kv_accounting::{KvAccounting, KvAccountingOptions, SharedKvAccounting};
+pub use shared::kv_accounting::{KvOverhead, PrefixResumePoints};
+pub use shared::kv_cache_report::KvCacheReport;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub use shared::prefix_tiers::PrefixTierSpec;
 pub(crate) use shared::prefix_tiers::{PrefixTierHit, PrefixTiers};
@@ -284,7 +284,7 @@ pub trait ChunkedPrefillKv: PrefixKv + IterWorkerKv {
         new_token_ratio: f64,
         decode_step_tokens: u32,
     ) -> bool;
-    /// Shortfall, in tokens, for the next decode step, after shrinking the
+    /// Shortfall, in KV units, for the next decode step, after shrinking the
     /// prefix cache. `step_tokens` is how far one decode can advance per step:
     /// 1 for autoregressive decode, the verify width for a speculating engine.
     fn prepare_next_decode(
@@ -329,7 +329,9 @@ pub trait IterWorkerKv: KvStore {
     /// have reserved (retained prefix KV is reclaimable, so it does not count),
     /// the analogue of vLLM's per-engine `kv_cache_usage`.
     fn kv_usage(&self, partition: PartitionId) -> f64;
-    /// The partition's static KV token budget, the denominator of [`Self::kv_usage`].
+    /// The partition's static KV budget in context tokens: the longest single
+    /// context it holds. A load balancer divides token counts by it to compare
+    /// them with [`Self::kv_usage`].
     fn kv_capacity_tokens(&self, partition: PartitionId) -> u64;
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId>;
 

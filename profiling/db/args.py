@@ -10,12 +10,13 @@ kernels or L1b registry/table code.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from enum import StrEnum
 from functools import cache
-from typing import Any, get_type_hints
+from types import NoneType, UnionType
+from typing import Any, get_args, get_type_hints
 
-from profiling.db.doc import arg
+from profiling.db.doc import arg, optional_arg
 
 
 class DType(StrEnum):
@@ -114,7 +115,36 @@ def field_types(args_schema: type[KernelArgs]) -> dict[str, Any]:
     """
 
     type_hints = get_type_hints(args_schema)
-    return {field.name: type_hints[field.name] for field in fields(args_schema)}
+    return {field.name: _value_type(type_hints[field.name]) for field in fields(args_schema)}
+
+
+@cache
+def optional_fields(args_schema: type[KernelArgs]) -> dict[str, str]:
+    """``{field: same_as}`` of each field declared with ``optional_arg``."""
+
+    return {f.name: f.metadata["same_as"] for f in fields(args_schema) if "same_as" in f.metadata}
+
+
+def canonical_args(args: KernelArgs) -> KernelArgs:
+    """``args`` with each optional field that equals its ``same_as`` field unset,
+    so a call has one key whether or not its spec spelled the field out."""
+
+    changes = {
+        name: None
+        for name, same_as in optional_fields(type(args)).items()
+        if getattr(args, name) is not None and getattr(args, name) == getattr(args, same_as)
+    }
+    return replace(args, **changes) if changes else args
+
+
+def _value_type(annotation: Any) -> Any:
+    """The type an optional field holds when set (``int | None`` -> ``int``)."""
+
+    if isinstance(annotation, UnionType):
+        members = [member for member in get_args(annotation) if member is not NoneType]
+        if len(members) == 1:
+            return members[0]
+    return annotation
 
 
 @dataclass(frozen=True)
@@ -142,10 +172,15 @@ class Fp8BlockscaleGroupedGemmArgs(KernelArgs):
 @dataclass(frozen=True)
 class KvCacheAppendArgs(KernelArgs):
     num_kv_heads: int = arg(unit="heads", doc="KV heads written for each token.")
-    head_dim: int = arg(unit="elements", doc="Elements in each key or value head.")
+    head_dim: int = arg(unit="elements", doc="Elements in each key head.")
     block_size: int = arg(unit="tokens", doc="Token slots in each cache page.")
     input_dtype: DType = arg(doc="Element type of the new keys and values.")
     kv_dtype: DType = arg(doc="Element type stored in the KV cache.")
     cache_layout: str = arg(doc="Physical cache layout, NHD or HND.")
     scale_granularity: str = arg(doc="FP8 scale granularity, tensor or head.")
     num_tokens: int = arg(unit="tokens", doc="New tokens whose keys and values are written.")
+    head_dim_v: int | None = optional_arg(
+        unit="elements",
+        same_as="head_dim",
+        doc="Elements in each value head; absent when equal to head_dim (symmetric K/V).",
+    )

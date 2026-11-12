@@ -158,6 +158,9 @@ async def _launch_one(
         # run argv, before any perf wrapping).
         metadata.write_run_metadata(log_dir, params, argv)
         (log_dir / COMPLETE_MARKER).unlink(missing_ok=True)
+        # Written only on failure; one left by an earlier run here would be read
+        # back as this run's cause.
+        (metadata.raw_dir(log_dir) / ERROR_JSON).unlink(missing_ok=True)
 
         env = _build_subprocess_env()
         if profile:

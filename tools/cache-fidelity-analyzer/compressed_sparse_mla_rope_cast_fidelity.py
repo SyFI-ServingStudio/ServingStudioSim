@@ -21,6 +21,13 @@ Two stages, run from the repo root under uv on a B200 node:
     uv run python tools/cache-fidelity-analyzer/compressed_sparse_mla_rope_cast_fidelity.py \
         report --out-dir DIR --truth DIR/truth.json
 
+`--backend swapab_cutedsl` checks the swap-AB decode rows instead (16 live
+heads, decode on ratio 1 and 2, at the capture's 131072 and at 1048576): off-grid
+row counts, contexts between key points, ragged verify-shaped batches (runs of
+consecutive positions, as DSpark's 6-row verify writes them) and saturated
+long contexts. Pass the same flag to `probes` and `report`, and
+`--backend swapab_cutedsl` to `kernel-profile run`.
+
 `report` evaluates the Rust cache through `simulator kernel-query eval`, which
 reads the grid rows from profile.db; profile them first (the grid must be
 complete, or the eval JIT-profiles through the bridge).
@@ -58,15 +65,46 @@ _DIMS = {
 }
 
 
-def config(mode: str, ratio: int) -> dict:
+SWAPAB = "swapab_cutedsl"
+SWAPAB_HEADS = 16
+
+
+def config(
+    mode: str, ratio: int, backend: str = BACKEND, max_model_len: int = MAX_MODEL_LEN
+) -> dict:
+    swapab = backend == SWAPAB
     return {
-        "backends": [BACKEND],
+        "backends": [backend],
         "gpu_name": GPU,
         "mode": mode,
         "compress_ratio": ratio,
         "compressed_cache_format": "none" if ratio == 0 else "nvfp4",
         **_DIMS,
+        "num_heads": SWAPAB_HEADS if swapab else _DIMS["num_heads"],
+        "max_model_len": max_model_len,
     }
+
+
+def verify_rows(requests: int, context: int, width: int = 6) -> list[list[int]]:
+    """``requests`` verify blocks of ``width`` one-row decodes at consecutive positions."""
+    return [[1, context - width + 1 + i] for _ in range(requests) for i in range(width)]
+
+
+def swapab_probes(ratio: int, max_model_len: int) -> list[tuple[list[list[int]], str]]:
+    p = [([[1, 4096]] * rows, "rows_off") for rows in (3, 5, 7, 9, 11, 13, 15)]
+    # Contexts whose keys sit between the key-axis points.
+    p += [([[1, c]] * 6, "keys_off") for c in (40, 150, 300, 700)]
+    p += [(verify_rows(1, c), "verify_r1") for c in (1000, 20_000, 120_000)]
+    p += [(verify_rows(2, 60_000), "verify_r2")]
+    p.append(([[1, 200]] * 5 + [[1, 90_000]], "ragged"))
+    if max_model_len > 131072:
+        p += [(verify_rows(1, c), "verify_long") for c in (500_000, max_model_len)]
+        p.append((verify_rows(2, max_model_len), "verify_long"))
+    return p
+
+
+def swapab_configs() -> list[tuple[int, int]]:
+    return [(r, m) for r in (1, 2) for m in (131072, MAX_MODEL_LEN)]
 
 
 def prefill_probes() -> list[tuple[list[list[int]], str]]:
@@ -89,9 +127,22 @@ def configs() -> list[tuple[str, int]]:
     return [("prefill", 1), ("prefill", 2), ("decode", 1), ("decode", 2), ("decode", 0)]
 
 
-def stage_probes(out: Path) -> None:
+def stage_probes(out: Path, backend: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
     probes, specs = [], []
+    if backend == SWAPAB:
+        for ratio, mml in swapab_configs():
+            cfg = config("decode", ratio, SWAPAB, mml)
+            dims = {k: v for k, v in cfg.items() if k not in cf._NON_DIM_KEYS}
+            for pairs, region in swapab_probes(ratio, mml):
+                probes.append(
+                    {"mode": "decode", "ratio": ratio, "mml": mml, "region": region, "pairs": pairs}
+                )
+                specs.append({**dims, "query_context_pairs": pairs})
+        (out / "probes.json").write_text(json.dumps(probes))
+        (out / "probe_specs.json").write_text(json.dumps(specs))
+        print(len(specs), "probe specs ->", out / "probe_specs.json")
+        return
     for mode, ratio in configs():
         dims = {k: v for k, v in config(mode, ratio).items() if k not in cf._NON_DIM_KEYS}
         gen = prefill_probes() if mode == "prefill" else decode_probes(ratio)
@@ -123,15 +174,24 @@ def _describe(pairs: list[list[int]]) -> str:
     return "+".join(f"{n}x({q},{c})" if n > 1 else f"({q},{c})" for n, (q, c) in runs)
 
 
-def stage_report(out: Path, truth_path: Path, sim_bin: str) -> None:
+def stage_report(out: Path, truth_path: Path, sim_bin: str, backend: str) -> None:
     probes = json.loads((out / "probes.json").read_text())
     truth = json.loads(truth_path.read_text())["results"]
     assert len(truth) == len(probes), (len(truth), len(probes))
     rows = []
-    for mode, ratio in configs():
-        idx = [i for i, p in enumerate(probes) if p["mode"] == mode and p["ratio"] == ratio]
+    groups = (
+        [("decode", r, m) for r, m in swapab_configs()]
+        if backend == SWAPAB
+        else [(mode, ratio, MAX_MODEL_LEN) for mode, ratio in configs()]
+    )
+    for mode, ratio, mml in groups:
+        idx = [
+            i
+            for i, p in enumerate(probes)
+            if p["mode"] == mode and p["ratio"] == ratio and p.get("mml", MAX_MODEL_LEN) == mml
+        ]
         points = [{"query_context_pairs": probes[i]["pairs"]} for i in idx]
-        results = cf.eval_kind(sim_bin, KIND, config(mode, ratio), points)
+        results = cf.eval_kind(sim_bin, KIND, config(mode, ratio, backend, mml), points)
         for i, r in zip(idx, results):
             t = truth[i]
             tms = t.get("metrics", {}).get("time_ms") if t.get("status") == "ok" else None
@@ -139,7 +199,7 @@ def stage_report(out: Path, truth_path: Path, sim_bin: str) -> None:
                 {
                     "mode": mode,
                     "ratio": ratio,
-                    "region": probes[i]["region"],
+                    "region": f"{probes[i]['region']}@{mml}",
                     "pairs": _describe(probes[i]["pairs"]),
                     "truth_us": round(tms * 1e3, 3) if tms else "",
                     "cache_us": round(r["time_ms"] * 1e3, 3),
@@ -157,7 +217,7 @@ def stage_report(out: Path, truth_path: Path, sim_bin: str) -> None:
     lines = [f"ALL {_stat([r['ratio_cache_truth'] for r in ok])}  {bar}"]
     for r in rows:
         lines.append(
-            f"{r['mode']:<7} r{r['ratio']} {r['region']:<11} {r['pairs']:<26} "
+            f"{r['mode']:<7} r{r['ratio']} {r['region']:<20} {r['pairs']:<26} "
             f"truth={r['truth_us']} cache={r['cache_us']} ratio={r['ratio_cache_truth']} "
             f"cov={r['coverage']} {r['status']}"
         )
@@ -172,11 +232,12 @@ def main() -> None:
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--truth", type=Path)
     ap.add_argument("--sim-bin", default="target/release/simulator")
+    ap.add_argument("--backend", default=BACKEND, choices=[BACKEND, SWAPAB])
     args = ap.parse_args()
     if args.stage == "probes":
-        stage_probes(args.out_dir)
+        stage_probes(args.out_dir, args.backend)
     else:
-        stage_report(args.out_dir, args.truth, args.sim_bin)
+        stage_report(args.out_dir, args.truth, args.sim_bin, args.backend)
 
 
 if __name__ == "__main__":

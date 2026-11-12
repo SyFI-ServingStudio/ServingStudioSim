@@ -58,6 +58,33 @@ use super::{
     PartitionLoad, PendingOrderPolicy, SingleTokenDecodeCompletion,
 };
 
+/// Where a hybrid engine lets a prefill chunk end when it can checkpoint
+/// recurrent state only on block boundaries (vLLM's Mamba `align` cache mode
+/// under prefix caching).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChunkEndAlignment {
+    /// Checkpoint interval, in context tokens, that every non-final chunk ends
+    /// on: the layout's engine block.
+    pub(crate) quantum: u32,
+    /// The prompt's last checkpoint sits one block below its last whole block.
+    /// vLLM sets this with a drafter that reads target hidden states
+    /// (`SpeculativeConfig.use_eagle_block_drop`: EAGLE, MTP, DFlash): its
+    /// prefix lookup prunes the last matching block, so the scheduler stops the
+    /// prefill one block earlier to cache the state that lookup can reach.
+    pub(crate) last_checkpoint_one_block_early: bool,
+}
+
+impl ChunkEndAlignment {
+    /// Alignment on `quantum` with the last checkpoint on the prompt's last
+    /// whole block.
+    pub(crate) const fn on_blocks(quantum: u32) -> Self {
+        Self {
+            quantum,
+            last_checkpoint_one_block_early: false,
+        }
+    }
+}
+
 pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeCompletion> {
     partition_policies: Vec<(P, P::Context)>,
     enqueue_sequence: EnqueueSequence,
@@ -69,9 +96,9 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// Per partition: prompts that have started and still have prefill tokens
     /// left to schedule, in start order.
     started_prefills: Vec<Vec<AdmissionCandidate>>,
-    /// Context-token spacing that every non-final chunk must end on, when the
-    /// engine can only checkpoint recurrent state at those boundaries.
-    chunk_end_quantum: Option<u32>,
+    /// Where chunks may end, when the engine can only checkpoint recurrent
+    /// state on block boundaries.
+    chunk_end_alignment: Option<ChunkEndAlignment>,
     /// vLLM's `long_prefill_token_threshold`: the most prefill tokens one
     /// request may take per iteration. `None` leaves only the batch budget.
     long_prefill_threshold: Option<u32>,
@@ -174,7 +201,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             current_new_token_ratio,
             balance,
             started_prefills: Vec::new(),
-            chunk_end_quantum: None,
+            chunk_end_alignment: None,
             long_prefill_threshold: None,
             prefill_episodes: HashMap::new(),
             admission_order: HashMap::new(),
@@ -281,10 +308,10 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             .map(|&partition| partition as u16)
     }
 
-    /// End every non-final chunk on a multiple of `quantum` context tokens.
-    pub(crate) fn with_chunk_end_quantum(mut self, quantum: u32) -> Self {
-        assert!(quantum > 0, "chunk-end quantum must be positive");
-        self.chunk_end_quantum = Some(quantum);
+    /// End every non-final chunk on a checkpoint boundary of `alignment`.
+    pub(crate) fn with_chunk_end_alignment(mut self, alignment: ChunkEndAlignment) -> Self {
+        assert!(alignment.quantum > 0, "chunk-end quantum must be positive");
+        self.chunk_end_alignment = Some(alignment);
         self
     }
 
@@ -629,7 +656,7 @@ where
             let chunk_tokens = next_chunk_tokens(
                 resolved_prefill,
                 remaining_budget - drafting_slots,
-                self.chunk_end_quantum,
+                self.chunk_end_alignment,
                 self.max_batch_tokens,
                 self.long_prefill_threshold,
             );
@@ -729,7 +756,7 @@ where
         let chunk_tokens = next_chunk_tokens(
             kv_store.resolved_prefill_context(candidate.request_id),
             budget.saturating_sub(self.drafting_slots),
-            self.chunk_end_quantum,
+            self.chunk_end_alignment,
             self.max_batch_tokens,
             self.long_prefill_threshold,
         );
@@ -839,7 +866,7 @@ where
         // Every scheduled request, decode or prefill chunk, also spends the
         // drafter's slots.
         let drafting_slots = self.drafting_slots;
-        let chunk_end_quantum = self.chunk_end_quantum;
+        let chunk_end_alignment = self.chunk_end_alignment;
         let long_prefill_threshold = self.long_prefill_threshold;
         let max_batch_tokens = self.max_batch_tokens;
         let decode_budget = query_width + drafting_slots;
@@ -914,7 +941,7 @@ where
                     let chunk_tokens = next_chunk_tokens(
                         resolved_prefill,
                         remaining_budgets[partition_index].saturating_sub(drafting_slots),
-                        chunk_end_quantum,
+                        chunk_end_alignment,
                         max_batch_tokens,
                         long_prefill_threshold,
                     );
@@ -978,6 +1005,7 @@ where
             }
         }
         if has_batch && query_width > 1 {
+            let decode_completion = &self.decode_completion;
             let mut store = context.requests.borrow_mut();
             for partition in 0..kv_store.num_partitions() as u16 {
                 kv_store.visit_prefill_admits(partition, |request| {
@@ -996,7 +1024,8 @@ where
                             .speculative
                             .get_or_insert_with(Default::default);
                         observation.query_width = query_width;
-                        observation.pending_decode = Some(resident as u64);
+                        observation.pending_decode =
+                            Some((resident, decode_completion.query_tokens_at(resident)));
                     });
                 }
             }
@@ -1151,8 +1180,8 @@ where
 }
 
 /// The next chunk of `resolved_prefill` that `budget` tokens can carry, ending
-/// on a `chunk_end_quantum` boundary when one is set. `0` means the request
-/// cannot run this iteration.
+/// on a checkpoint boundary when `chunk_end_alignment` is set. `0` means the
+/// request cannot run this iteration.
 ///
 /// `long_prefill_threshold` caps the chunk before the budget does, as vLLM's
 /// `long_prefill_token_threshold` caps `num_new_tokens`, and also lowers the
@@ -1160,7 +1189,7 @@ where
 pub(super) fn next_chunk_tokens(
     resolved_prefill: ResolvedPrefillContext,
     budget: u32,
-    chunk_end_quantum: Option<u32>,
+    chunk_end_alignment: Option<ChunkEndAlignment>,
     max_chunk_tokens: u32,
     long_prefill_threshold: Option<u32>,
 ) -> u32 {
@@ -1170,15 +1199,15 @@ pub(super) fn next_chunk_tokens(
         Some(threshold) => (remaining.min(threshold), max_chunk_tokens.min(threshold)),
     };
     let chunk_tokens = request_tokens.min(budget);
-    match chunk_end_quantum {
+    match chunk_end_alignment {
         None => chunk_tokens,
-        Some(quantum) => {
+        Some(alignment) => {
             let start = resolved_prefill.active_chunk().0;
             checkpoint_aligned_chunk_tokens(
                 start,
                 start + remaining,
                 chunk_tokens,
-                quantum,
+                alignment,
                 max_chunk_tokens,
             )
         }
@@ -1194,8 +1223,9 @@ pub(super) fn next_chunk_tokens(
 ///   exceeds the chunk cap no boundary may fit, so the chunk runs sub-block
 ///   instead and re-aligns at the next boundary.
 /// - A chunk starting mid-block stops at the next boundary.
-/// - No chunk runs past the prompt's last boundary, so its state is cached
-///   before the unaligned tail.
+/// - No chunk runs past the prompt's last checkpoint, so its state is cached
+///   before the unaligned tail. That checkpoint is the last whole block, or the
+///   one before it under `last_checkpoint_one_block_early`.
 ///
 /// The fork's partial-tail hash stop, shared-prefix junction stop, and in-chunk
 /// prefill checkpoints are not modeled.
@@ -1203,9 +1233,10 @@ fn checkpoint_aligned_chunk_tokens(
     start: u32,
     prefill_end: u32,
     chunk_tokens: u32,
-    quantum: u32,
+    alignment: ChunkEndAlignment,
     max_chunk_tokens: u32,
 ) -> u32 {
+    let quantum = alignment.quantum;
     if chunk_tokens == 0 || start >= prefill_end {
         return chunk_tokens;
     }
@@ -1217,7 +1248,13 @@ fn checkpoint_aligned_chunk_tokens(
         }
     }
     let next_boundary = (start / quantum + 1) * quantum;
-    let last_boundary = prefill_end / quantum * quantum;
+    let last_boundary = (prefill_end / quantum * quantum).saturating_sub(
+        if alignment.last_checkpoint_one_block_early {
+            quantum
+        } else {
+            0
+        },
+    );
     let stops = [
         (start % quantum != 0).then_some(next_boundary),
         Some(last_boundary),
@@ -1233,24 +1270,26 @@ fn checkpoint_aligned_chunk_tokens(
 
 #[cfg(test)]
 mod tests {
-    use super::checkpoint_aligned_chunk_tokens;
+    use super::{checkpoint_aligned_chunk_tokens, ChunkEndAlignment};
 
     const BLOCK: u32 = 2_176;
+    /// GLM-5.3-Flash: a 2176-token engine block, no pruning drafter.
+    const ALIGNED: ChunkEndAlignment = ChunkEndAlignment::on_blocks(BLOCK);
 
     #[test]
     fn a_non_final_chunk_ends_on_the_last_checkpoint_boundary_it_reaches() {
         // GLM-5.3-Flash at an 8192-token cap: 3 x 2176, as the trace shows.
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 40_000, 8_192, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(0, 40_000, 8_192, ALIGNED, 8_192),
             6_528
         );
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(6_528, 40_000, 8_192, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(6_528, 40_000, 8_192, ALIGNED, 8_192),
             6_528
         );
         // Budget shared with decode still floors to a boundary.
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 40_000, 3_837, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(0, 40_000, 3_837, ALIGNED, 8_192),
             2_176
         );
     }
@@ -1258,7 +1297,7 @@ mod tests {
     #[test]
     fn a_budget_below_one_block_cannot_start_an_aligned_chunk() {
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 40_000, 1_664, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(0, 40_000, 1_664, ALIGNED, 8_192),
             0
         );
     }
@@ -1268,11 +1307,11 @@ mod tests {
         // The last 4532 tokens cross 43520 = 20 x 2176; the tail runs separately.
         let prefill_end = 43_700;
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(39_168, prefill_end, 4_532, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(39_168, prefill_end, 4_532, ALIGNED, 8_192),
             4_352
         );
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(43_520, prefill_end, 180, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(43_520, prefill_end, 180, ALIGNED, 8_192),
             180
         );
     }
@@ -1280,7 +1319,7 @@ mod tests {
     #[test]
     fn a_final_chunk_that_crosses_no_boundary_is_not_clipped() {
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 1_801, 1_801, BLOCK, 8_192),
+            checkpoint_aligned_chunk_tokens(0, 1_801, 1_801, ALIGNED, 8_192),
             1_801
         );
     }
@@ -1289,16 +1328,88 @@ mod tests {
     fn a_block_wider_than_the_cap_runs_sub_block_then_realigns() {
         // GLM-5.3-Flash at a 2048-token cap: 0 -> 2034 -> 2176, as the trace shows.
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(0, 5_000, 2_034, BLOCK, 2_048),
+            checkpoint_aligned_chunk_tokens(0, 5_000, 2_034, ALIGNED, 2_048),
             2_034
         );
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(2_034, 5_000, 2_048, BLOCK, 2_048),
+            checkpoint_aligned_chunk_tokens(2_034, 5_000, 2_048, ALIGNED, 2_048),
             142
         );
         assert_eq!(
-            checkpoint_aligned_chunk_tokens(2_176, 5_000, 2_048, BLOCK, 2_048),
+            checkpoint_aligned_chunk_tokens(2_176, 5_000, 2_048, ALIGNED, 2_048),
             2_048
+        );
+    }
+
+    /// Qwen3.8-Flash-Next with MTP: a 3200-token engine block, and the drafter's
+    /// prefix lookup prunes the last matching block.
+    const MTP_BLOCK: ChunkEndAlignment = ChunkEndAlignment {
+        quantum: 3_200,
+        last_checkpoint_one_block_early: true,
+    };
+
+    #[test]
+    fn a_pruning_drafter_moves_the_last_checkpoint_one_block_earlier() {
+        // An 8128-token prompt under an 8192 cap runs 3200 + 4928, as the
+        // capture shows; without the pruning drafter it would stop at 6400.
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(0, 8_128, 8_128, MTP_BLOCK, 8_192),
+            3_200
+        );
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(3_200, 8_128, 4_928, MTP_BLOCK, 8_192),
+            4_928
+        );
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(
+                0,
+                8_128,
+                8_128,
+                ChunkEndAlignment::on_blocks(3_200),
+                8_192
+            ),
+            6_400
+        );
+        // A whole-block prompt also stops one block short: 6400 runs 3200 + 3200.
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(0, 6_400, 6_400, MTP_BLOCK, 8_192),
+            3_200
+        );
+    }
+
+    #[test]
+    fn a_prompt_under_two_blocks_has_no_checkpoint_to_stop_at() {
+        // 4096 tokens: the last checkpoint would be 0, so the prompt runs whole.
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(0, 4_096, 4_096, MTP_BLOCK, 4_096),
+            4_096
+        );
+    }
+
+    #[test]
+    fn non_final_chunks_still_end_on_blocks_with_a_pruning_drafter() {
+        // 24576 tokens at an 8192 cap: 9600 -> 16000 -> 19200 (the last
+        // checkpoint, 24576 floored to 22400 minus one block) -> 24576.
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(3_200, 24_576, 8_176, MTP_BLOCK, 8_192),
+            6_400
+        );
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(16_000, 24_576, 8_176, MTP_BLOCK, 8_192),
+            3_200
+        );
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(19_200, 24_576, 5_376, MTP_BLOCK, 8_192),
+            5_376
+        );
+        // A 2048 cap below the block runs sub-block, then realigns: 2048, 1152.
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(0, 16_384, 2_048, MTP_BLOCK, 2_048),
+            2_048
+        );
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(2_048, 16_384, 2_048, MTP_BLOCK, 2_048),
+            1_152
         );
     }
 }

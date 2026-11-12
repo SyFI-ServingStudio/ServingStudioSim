@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Fri, 4 Sep 2026 23:38:53 -0700
+Subject: [PATCH] docs(alignment): document isolated profiler setup and wheel
+ provenance
+
+Co-authored-by: Codex <noreply@openai.com>
+---
+ ALIGNMENT.md | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/ALIGNMENT.md b/ALIGNMENT.md
+index 5446062b26210da837f81173c4dd2a522747d632..66548b3af125783c475544f184b2f29632959fd5 100644
+--- a/ALIGNMENT.md
++++ b/ALIGNMENT.md
+@@ -55,6 +55,17 @@ If the upstream base changes, update the wheel commit explicitly. Import and
+ GPU validation must resolve Python and native extensions under this worktree.
+ An import check alone does not qualify the driver or a serving run.
+ 
++New VibeSim profile configs should set `fork_python` to
++`/raid/kanzhu/VibeSimWorkspace/wt-vllm-glm53-dflash2/.venv/bin/python`.
++Keep the original checkout's profiler environment and presets unchanged.
++Run pre-commit checks explicitly in this worktree; do not replace shared Git
++hooks with a hook that points at this environment.
++
++The native wheel selected by the fixed commit's official `cu130` metadata is
++also saved in `../glm53-dflash2-artifacts/`. If that metadata endpoint is
++temporarily unavailable, set `VLLM_PRECOMPILED_WHEEL_LOCATION` to the path in
++`vllm-wheel-path.txt`. `native-wheel.json` records its SHA256 and provenance.
++
+ ## Frozen models
+ 
+ | Role | Repository | Revision |

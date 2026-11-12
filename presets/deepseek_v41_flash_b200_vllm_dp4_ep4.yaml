@@ -1,0 +1,48 @@
+# DeepSeek-V4.1-Flash on one four-GPU B200 NVLink domain under vLLM data-parallel
+# attention: DP4 engines at TP1 (one scheduler and KV cache per GPU) with EP4 experts
+# behind an MXFP8 all-gatherv and a bf16 reduce-scatterv, chunked prefill with a
+# 2048-token budget per rank. Mirrors the DP4/EP4 deployment of
+# logs/20261106_0_dsv41_dspark_capture/profile_dp4ep4_*.yaml without speculative
+# decoding (those captures ran DSpark; this preset is the no-spec target).
+deployment: unified
+
+workload:
+  # The quadrant workload: 96 requests (128/128, 128/4096, 4096/128,
+  # 3072/3072 x 24), saturated at 48 in flight.
+  trace_files:
+    - trace/quadrant_c48_96.csv
+  input_file_format: text-generation-independent
+  arrival_mode: saturated
+  max_concurrency: 48
+  run_to_end: true
+
+io:
+  log_dir: logs/deepseek_v41_flash_b200_vllm_dp4_ep4
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: deepseek_v41_vllm_dp_attn_ep_moe
+          model_config: model/config/deepseek_v41_flash.json
+          fp8: true
+          # The capture's --max-model-len (a timing input: the FlashMLA prefill
+          # workspace and the indexer's padded logits rows).
+          max_model_len: 131072
+          # Recorded per-token expert routes from the 1017 checkpoint's DP4/EP4
+          # token_corpus pass (repo-relative until published to the HF dataset).
+          routing: corpus
+          token_corpus_file: logs/20261106_0_dsv41_dspark_capture/profile_dp4ep4_corpus/token_corpus/manifest.json
+        worker:
+          type: chunked_prefill
+          # vLLM max_num_batched_tokens=2048, per DP rank.
+          max_batch_tokens: 2048
+          batch_policy: mix
+          # vLLM's DP coordinator places each request on the least-loaded engine.
+          dp_placement: vllm-least-loaded
+          # Per-GPU KV budget: the DP4 captures' "Available KV cache memory:
+          # 76.68 GiB" (82.334 GB). Those servers also held the DSpark draft
+          # weights; no no-spec DP4 server was measured.
+          attn_gpu_memory_gb: 82.334

@@ -142,8 +142,8 @@ at eval. The default set is the arch's const-default. To tailor it per kernel:
    ```
    (omit the FILE arg to print to stdout instead.)
    `options` is already dtype- AND GPU-filtered (from each kernel's declared
-   `BackendSupport`), so it lists only the backends legal for this run (e.g. `trt`
-   is dropped off a non-Blackwell GPU).
+   `BackendSupport`), so it lists only the backends legal for this run (e.g. an
+   sm_100f-only backend is dropped off a non-Blackwell GPU).
 
 2. **Edit `backends.yaml`** — set each role to a subset (`[fa3]` forces one,
    `[fa2, fa3]` is best-of-N), keep the default, or point it at a `${var}` declared
@@ -232,6 +232,13 @@ per kernel per cache key, builds nothing). Reach for
 `operate-profile-existing-kernel` only for a question about one specific
 kernel's rows, never as a pre-step for a simulation.
 
+**KV capacity before a run.** `uv run python -m launcher <preset> --kv-report`
+prints each KV pool's layout, what one request at `max_model_len` holds per
+part, and the max concurrency, with no profile.db, GPU or log_dir
+(`--kv-report-json` for the machine form). A finished run has the same document
+at `raw/kv_cache.json`. For KV questions in general, use skill
+`dev-calculate-kv-cache-capacity`.
+
 ## GPU selection
 
 **Do not restrict how many GPUs the run may use unless there is a concrete
@@ -255,6 +262,28 @@ GPUs. A run over a warm `profile.db` is unchanged. With missing rows, the cache
 prebuild fails before profiling and names the missing count; check coverage
 first with `--cache-report`. Report that failure; do not drop `--no-gpu`
 without asking.
+
+### On another machine: `--remote NAME`
+
+Append `--remote NAME` to the launch command (step 9) to run it on a machine
+from `remote.yaml` (an untracked file; `remote.example.yaml` lists the fields),
+when the user asks for it or this host's CPUs are not available. The dry run in
+step 8 stays local. Run from the checkout root; the preset and `io.log_dir`
+must be under `logs/`. The command blocks until the results are copied back to
+the same `logs/<experiment-name>/`, relaying remote output with a heartbeat at
+least once a minute; rerunning it resumes on the remote. A managed run is
+registered here, so the Analyzer ID is the same as for a local run.
+
+The remote runs with `--no-gpu --no-plot`: it never profiles, so check
+`--cache-report` first and fill missing rows locally (or with
+`kernel-profile run --remote`), and it renders no PNGs. Copy-back leaves out
+`raw/cost_log/` and `plots/`; the full run stays on the remote, and
+`remote-run.json` in the experiment root records where. Report the remote name
+and that file's remote path. A one-call field change is
+`--remote-set launch.slurm.time=04:00:00`. Do not create or edit `remote.yaml`,
+its ssh keys, or `.remote/known_hosts` unless the user asks; if the named remote
+is missing or ssh fails, stop and report it. Details: `launcher/README.md`,
+"Remote execution".
 
 ## Analysis output
 

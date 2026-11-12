@@ -1,0 +1,699 @@
+{
+ "schema_version": 1,
+ "note": "MiMo-V2.6-Flash-RL vLLM TP4/EP4 B200, capture job 6264, against mimo_v2_vllm_fp8_swa_moe. Residual zeros_like, preprocess and sampling stay unmapped.",
+ "rules": [
+  {
+   "operation": "prologue.embed",
+   "name": "vocab_parallel_embedding_kernel",
+   "type": "model",
+   "role": "vocab-parallel embedding gather",
+   "slot_suffixes": [
+    "embed"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "prologue.embed_ar_norm",
+   "name": "oneshotAllreduceFusionKernel",
+   "type": "collective",
+   "role": "embedding all-reduce + layer-0 input RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "embed.ar_norm"
+   ],
+   "phase": "forward",
+   "after_name": "triton_poi_fused_zeros_like_0",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "prologue.embed_ar_norm",
+   "name": "twoshotAllreduceKernel",
+   "type": "collective",
+   "role": "embedding all-reduce + layer-0 input RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "embed.ar_norm"
+   ],
+   "phase": "forward",
+   "after_name": "triton_poi_fused_zeros_like_0",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "prologue.embed_ar_norm",
+   "name": "rmsNormLamport",
+   "type": "collective",
+   "role": "embedding all-reduce + layer-0 input RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "embed.ar_norm"
+   ],
+   "phase": "forward",
+   "after": "prologue.embed_ar_norm",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "prologue.embed_ar_norm_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum",
+   "type": "collective",
+   "role": "unfused all-reduce above the fused cap (NCCL)",
+   "slot_suffixes": [
+    "embed.ar_norm_all_reduce"
+   ],
+   "phase": "forward",
+   "after": "prologue.embed",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "prologue.embed_ar_norm_residual_norm",
+   "name": "rms_norm",
+   "type": "model",
+   "role": "unfused residual add + RMSNorm above the fused cap (Inductor Triton)",
+   "slot_suffixes": [
+    "embed.ar_norm_residual_norm"
+   ],
+   "phase": "forward",
+   "after": "prologue.embed_ar_norm_all_reduce",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.qkv_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "attention",
+   "role": "FP8 per-token-group activation quant of the QKV input",
+   "slot_suffixes": [
+    "attn.qkv_proj.input_quant"
+   ],
+   "phase": "forward",
+   "after": "prologue.embed_ar_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.qkv_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "attention",
+   "role": "FP8 per-token-group activation quant of the QKV input",
+   "slot_suffixes": [
+    "attn.qkv_proj.input_quant"
+   ],
+   "phase": "forward",
+   "after": "prologue.embed_ar_norm_residual_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.qkv_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "attention",
+   "role": "FP8 per-token-group activation quant of the QKV input",
+   "slot_suffixes": [
+    "attn.qkv_proj.input_quant"
+   ],
+   "phase": "forward",
+   "after": "ffn.ar_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.qkv_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "attention",
+   "role": "FP8 per-token-group activation quant of the QKV input",
+   "slot_suffixes": [
+    "attn.qkv_proj.input_quant"
+   ],
+   "phase": "forward",
+   "after": "ffn.ar_norm_residual_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.qkv_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "attention",
+   "role": "FP8 per-token-group activation quant of the QKV input",
+   "slot_suffixes": [
+    "attn.qkv_proj.input_quant"
+   ],
+   "phase": "forward",
+   "after": "moe.ar_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.qkv_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "attention",
+   "role": "FP8 per-token-group activation quant of the QKV input",
+   "slot_suffixes": [
+    "attn.qkv_proj.input_quant"
+   ],
+   "phase": "forward",
+   "after": "moe.ar_norm_residual_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.qkv_proj",
+   "name": "sm100_fp8_fp4_gemm_1d1d_impl",
+   "type": "attention",
+   "role": "fused QKV projection (DeepGEMM FP8 block)",
+   "slot_suffixes": [
+    "attn.qkv_proj.gemm"
+   ],
+   "phase": "forward",
+   "after": "attn.qkv_input_quant",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.rope",
+   "name": "triton_poi_fused_0",
+   "type": "attention",
+   "role": "partial rotary + v scale (Inductor Triton)",
+   "slot_suffixes": [
+    "attn.rope"
+   ],
+   "phase": "forward",
+   "after": "attn.qkv_proj",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.rope",
+   "name": "triton_poi_fused_1",
+   "type": "attention",
+   "role": "partial rotary + v scale (Inductor Triton)",
+   "slot_suffixes": [
+    "attn.rope"
+   ],
+   "phase": "forward",
+   "after": "attn.qkv_proj",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.rope",
+   "name": "triton_poi_fused_2",
+   "type": "attention",
+   "role": "partial rotary + v scale (Inductor Triton)",
+   "slot_suffixes": [
+    "attn.rope"
+   ],
+   "phase": "forward",
+   "after": "attn.qkv_proj",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.rope",
+   "name": "triton_poi_fused_3",
+   "type": "attention",
+   "role": "partial rotary + v scale (Inductor Triton)",
+   "slot_suffixes": [
+    "attn.rope"
+   ],
+   "phase": "forward",
+   "after": "attn.qkv_proj",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.kv_append",
+   "name": "reshape_and_cache_kernel_flash_diffkv",
+   "type": "attention",
+   "role": "DiffKV paged cache write",
+   "slot_suffixes": [
+    "attn.kv_append"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.attention",
+   "name": "flash_attncuteprepare_scheduler",
+   "type": "attention",
+   "role": "FA4 varlen attention: prepare_scheduler, mainloop, split-KV combine",
+   "slot_suffixes": [
+    "attn.attention"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.attention",
+   "name": "flash_attncuteflash_fwd_sm100",
+   "type": "attention",
+   "role": "FA4 varlen attention: prepare_scheduler, mainloop, split-KV combine",
+   "slot_suffixes": [
+    "attn.attention"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.attention",
+   "name": "flash_attncuteflash_fwd_combine",
+   "type": "attention",
+   "role": "FA4 varlen attention: prepare_scheduler, mainloop, split-KV combine",
+   "slot_suffixes": [
+    "attn.attention"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.o_proj",
+   "name": "nvjet_sm100_tst",
+   "type": "attention",
+   "role": "BF16 output projection (cuBLAS)",
+   "slot_suffixes": [
+    "attn.o_proj"
+   ],
+   "phase": "forward",
+   "after": "attn.attention",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.ar_norm",
+   "name": "oneshotAllreduceFusionKernel",
+   "type": "collective",
+   "role": "attention all-reduce + residual + RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "attn.ar_norm"
+   ],
+   "phase": "forward",
+   "after": "attn.o_proj",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.ar_norm",
+   "name": "twoshotAllreduceKernel",
+   "type": "collective",
+   "role": "attention all-reduce + residual + RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "attn.ar_norm"
+   ],
+   "phase": "forward",
+   "after": "attn.o_proj",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.ar_norm",
+   "name": "rmsNormLamport",
+   "type": "collective",
+   "role": "attention all-reduce + residual + RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "attn.ar_norm"
+   ],
+   "phase": "forward",
+   "after": "attn.ar_norm",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.ar_norm_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum",
+   "type": "collective",
+   "role": "unfused all-reduce above the fused cap (NCCL)",
+   "slot_suffixes": [
+    "attn.ar_norm_all_reduce"
+   ],
+   "phase": "forward",
+   "after": "attn.o_proj",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "attn.ar_norm_residual_norm",
+   "name": "rms_norm",
+   "type": "model",
+   "role": "unfused residual add + RMSNorm above the fused cap (Inductor Triton)",
+   "slot_suffixes": [
+    "attn.ar_norm_residual_norm"
+   ],
+   "phase": "forward",
+   "after": "attn.ar_norm_all_reduce",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.router",
+   "name": "nvjet_sm100_tss",
+   "type": "moe",
+   "role": "router GEMM with FP32 output (cuBLAS)",
+   "slot_suffixes": [
+    "moe.router"
+   ],
+   "phase": "forward",
+   "after": "attn.ar_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.router",
+   "name": "nvjet_sm100_tss",
+   "type": "moe",
+   "role": "router GEMM with FP32 output (cuBLAS)",
+   "slot_suffixes": [
+    "moe.router"
+   ],
+   "phase": "forward",
+   "after": "attn.ar_norm_residual_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.router",
+   "name": "splitKreduce_kernel",
+   "type": "moe",
+   "role": "router GEMM with FP32 output (cuBLAS)",
+   "slot_suffixes": [
+    "moe.router"
+   ],
+   "phase": "forward",
+   "after": "moe.router",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.routed",
+   "name": "moe::dev::routing",
+   "type": "moe",
+   "role": "FlashInfer TRT-LLM MXFP4 x BF16 routed MoE: routing, FC1, FC2, finalize",
+   "slot_suffixes": [
+    "fused_moe"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.routed",
+   "name": "bmm_Bfloat16_MxE2m1Bfloat16",
+   "type": "moe",
+   "role": "FlashInfer TRT-LLM MXFP4 x BF16 routed MoE: routing, FC1, FC2, finalize",
+   "slot_suffixes": [
+    "fused_moe"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.routed",
+   "name": "moe::dev::finalize",
+   "type": "moe",
+   "role": "FlashInfer TRT-LLM MXFP4 x BF16 routed MoE: routing, FC1, FC2, finalize",
+   "slot_suffixes": [
+    "fused_moe"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.ar_norm",
+   "name": "oneshotAllreduceFusionKernel",
+   "type": "collective",
+   "role": "MoE all-reduce + residual + RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "moe.ar_norm"
+   ],
+   "phase": "forward",
+   "after": "moe.routed",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.ar_norm",
+   "name": "twoshotAllreduceKernel",
+   "type": "collective",
+   "role": "MoE all-reduce + residual + RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "moe.ar_norm"
+   ],
+   "phase": "forward",
+   "after": "moe.routed",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.ar_norm",
+   "name": "rmsNormLamport",
+   "type": "collective",
+   "role": "MoE all-reduce + residual + RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "moe.ar_norm"
+   ],
+   "phase": "forward",
+   "after": "moe.ar_norm",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.ar_norm_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum",
+   "type": "collective",
+   "role": "unfused all-reduce above the fused cap (NCCL)",
+   "slot_suffixes": [
+    "moe.ar_norm_all_reduce"
+   ],
+   "phase": "forward",
+   "after": "moe.routed",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.ar_norm_residual_norm",
+   "name": "rms_norm",
+   "type": "model",
+   "role": "unfused residual add + RMSNorm above the fused cap (Inductor Triton)",
+   "slot_suffixes": [
+    "moe.ar_norm_residual_norm"
+   ],
+   "phase": "forward",
+   "after": "moe.ar_norm_all_reduce",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.ar_norm",
+   "name": "oneshotAllreduceFusionKernel",
+   "type": "collective",
+   "role": "MoE all-reduce + residual + RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "moe.ar_norm"
+   ],
+   "phase": "forward",
+   "after_name": "<none>",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.ar_norm",
+   "name": "twoshotAllreduceKernel",
+   "type": "collective",
+   "role": "MoE all-reduce + residual + RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "moe.ar_norm"
+   ],
+   "phase": "forward",
+   "after_name": "<none>",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "moe.ar_norm_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum",
+   "type": "collective",
+   "role": "unfused all-reduce above the fused cap (NCCL)",
+   "slot_suffixes": [
+    "moe.ar_norm_all_reduce"
+   ],
+   "phase": "forward",
+   "after_name": "<none>",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.gate_up_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "ffn",
+   "role": "FP8 quant of the dense FFN input",
+   "slot_suffixes": [
+    "ffn.gate_up_input_quant"
+   ],
+   "phase": "forward",
+   "after": "attn.ar_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.gate_up_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "ffn",
+   "role": "FP8 quant of the dense FFN input",
+   "slot_suffixes": [
+    "ffn.gate_up_input_quant"
+   ],
+   "phase": "forward",
+   "after": "attn.ar_norm_residual_norm",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.gate_up",
+   "name": "sm100_fp8_fp4_gemm_1d1d_impl",
+   "type": "ffn",
+   "role": "dense gate_up GEMM (DeepGEMM FP8 block)",
+   "slot_suffixes": [
+    "ffn.gate_up"
+   ],
+   "phase": "forward",
+   "after": "ffn.gate_up_input_quant",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.act_and_mul",
+   "name": "triton_poi_fused_mul_per_token_group_fp8_quant_packed_silu_slice",
+   "type": "ffn",
+   "role": "dense SiLU-and-mul (Inductor Triton)",
+   "slot_suffixes": [
+    "ffn.act_and_mul"
+   ],
+   "phase": "forward",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.down_input_quant",
+   "name": "per_token_group_quant_8bit_packed_register_kernel",
+   "type": "ffn",
+   "role": "FP8 quant of the dense down input",
+   "slot_suffixes": [
+    "ffn.down_input_quant"
+   ],
+   "phase": "forward",
+   "after": "ffn.act_and_mul",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.down",
+   "name": "sm100_fp8_fp4_gemm_1d1d_impl",
+   "type": "ffn",
+   "role": "dense down GEMM (DeepGEMM FP8 block)",
+   "slot_suffixes": [
+    "ffn.down"
+   ],
+   "phase": "forward",
+   "after": "ffn.down_input_quant",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.ar_norm",
+   "name": "oneshotAllreduceFusionKernel",
+   "type": "collective",
+   "role": "dense FFN all-reduce + residual + RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "ffn.ar_norm"
+   ],
+   "phase": "forward",
+   "after": "ffn.down",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.ar_norm",
+   "name": "twoshotAllreduceKernel",
+   "type": "collective",
+   "role": "dense FFN all-reduce + residual + RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "ffn.ar_norm"
+   ],
+   "phase": "forward",
+   "after": "ffn.down",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.ar_norm",
+   "name": "rmsNormLamport",
+   "type": "collective",
+   "role": "dense FFN all-reduce + residual + RMSNorm (FlashInfer MNNVL)",
+   "slot_suffixes": [
+    "ffn.ar_norm"
+   ],
+   "phase": "forward",
+   "after": "ffn.ar_norm",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.ar_norm_all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum",
+   "type": "collective",
+   "role": "unfused all-reduce above the fused cap (NCCL)",
+   "slot_suffixes": [
+    "ffn.ar_norm_all_reduce"
+   ],
+   "phase": "forward",
+   "after": "ffn.down",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "ffn.ar_norm_residual_norm",
+   "name": "rms_norm",
+   "type": "model",
+   "role": "unfused residual add + RMSNorm above the fused cap (Inductor Triton)",
+   "slot_suffixes": [
+    "ffn.ar_norm_residual_norm"
+   ],
+   "phase": "forward",
+   "after": "ffn.ar_norm_all_reduce",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "epilogue.logits_select",
+   "name": "index_elementwise_kernel",
+   "type": "model",
+   "role": "gather the rows that need logits",
+   "slot_suffixes": [
+    "logits_select"
+   ],
+   "phase": "sample",
+   "before_name": "nvjet_sm100_tst",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "epilogue.logits_select",
+   "name": "vectorized_gather_kernel",
+   "type": "model",
+   "role": "gather the rows that need logits",
+   "slot_suffixes": [
+    "logits_select"
+   ],
+   "phase": "sample",
+   "before_name": "nvjet_sm100_tst",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "epilogue.lm_head",
+   "name": "nvjet_sm100_tst",
+   "type": "model",
+   "role": "vocab-parallel LM head GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "lm_head"
+   ],
+   "phase": "sample",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "epilogue.lm_head",
+   "name": "splitKreduce_kernel",
+   "type": "model",
+   "role": "vocab-parallel LM head GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "lm_head"
+   ],
+   "phase": "sample",
+   "after": "epilogue.lm_head",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  },
+  {
+   "operation": "epilogue.logits_all_gather",
+   "name": "ncclDevKernel_AllGather",
+   "type": "collective",
+   "role": "vocab-parallel logits all-gather",
+   "slot_suffixes": [
+    "logits_all_gather"
+   ],
+   "phase": "sample",
+   "cross_rank": "synchronizing",
+   "source_experiment": "20261012_1_mimo_fused_ar_nsys/profile_nsys (Slurm job 6264)"
+  }
+ ]
+}

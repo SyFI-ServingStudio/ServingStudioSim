@@ -32,6 +32,10 @@ class MoE:
     # stack that is quantized differently from the body (GLM-5.2's MTP layer
     # keeps BF16 experts under an NVFP4 checkpoint) is what makes them distinct.
     module_prefix: str = ""
+    # Router logits beyond one per routed expert. Inkling's router also scores its
+    # always-on sink experts (256 routed + 2 sink = 258 logits); the sink logits
+    # weight the shared-expert outputs per token instead of selecting experts.
+    router_extra_logits: int = 0
 
     def _module(self, path: str) -> str:
         return f"{self.module_prefix}.{path}" if self.module_prefix else path
@@ -44,7 +48,7 @@ class MoE:
             # Qwen3-235B-FP8 leave it at the master dtype.
             MatmulGroup(
                 "router",
-                n=self.num_experts,
+                n=self.num_experts + self.router_extra_logits,
                 k=self.hidden,
                 bucket="router",
                 module=self._module("mlp.gate"),

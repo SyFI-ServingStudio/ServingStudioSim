@@ -138,3 +138,42 @@ def test_each_file_receives_only_its_own_configs_tactics(tmp_path: Path, monkeyp
         label: json.loads(autotune_cache_path(label).read_text()) for label in ("cfg-a", "cfg-b")
     }
     assert saved == {"cfg-a": {"shape-cfg-a": "a"}, "cfg-b": {"shape-cfg-b": "b"}}
+
+
+def test_same_configuration_keeps_its_live_tactics(tmp_path: Path, monkeypatch) -> None:
+    """Consecutive specs of one configuration reuse the tactics tuned in this
+    process; FlashInfer >= 0.7 would otherwise re-tune every bucket per spec."""
+
+    import sys
+    import threading
+    import types
+
+    class AutoTuner:
+        instance = None
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.profiling_cache: dict[str, str] = {}
+
+        @classmethod
+        def get(cls) -> AutoTuner:
+            cls.instance = cls.instance or cls()
+            return cls.instance
+
+    module = types.ModuleType("fake_flashinfer_autotuner_same")
+    module.AutoTuner = AutoTuner
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    @contextlib.contextmanager
+    def autotune(tune_mode: bool = True, cache: str | None = None):
+        yield
+
+    autotune.__module__ = module.__name__
+    monkeypatch.setenv(CACHE_DIR_ENV, str(tmp_path))
+
+    with autotune_cached(autotune, "cfg-same"):
+        AutoTuner.get().profiling_cache["bucket-1"] = "t"
+    with autotune_cached(autotune, "cfg-same"):
+        assert AutoTuner.get().profiling_cache == {"bucket-1": "t"}
+    with autotune_cached(autotune, "cfg-other"):
+        assert AutoTuner.get().profiling_cache == {}

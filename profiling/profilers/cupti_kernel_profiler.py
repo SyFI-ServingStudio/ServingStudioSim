@@ -7,8 +7,10 @@ runner files stay small and only choose the timer method.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import site
+import sys
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -40,6 +42,18 @@ BUILD_DIR = Path(
     os.environ.get("MOESIM_CUPTI_BUILD_DIR")
     or Path(os.environ.get("TMPDIR") or "/tmp") / "moesim_cupti_ext"
 )
+
+
+def _build_dir() -> Path:
+    """One build per interpreter and Torch: the profile envs share BUILD_DIR.
+
+    Torch's JIT build keys a directory on the extension's sources and flags, not
+    on the Torch it links. Envs with another Torch would rebuild over each
+    other's module and wait on each other's lock.
+    """
+
+    interpreter = hashlib.sha256(sys.prefix.encode()).hexdigest()[:8]
+    return BUILD_DIR / f"torch-{torch.__version__}-{interpreter}"
 
 
 @dataclass(frozen=True)
@@ -119,7 +133,8 @@ def _load_extension() -> Any:
         raise RuntimeError("CUPTI profiling requires torch.utils.cpp_extension.load")
 
     include_dir, lib_dir = _resolve_cupti_paths()
-    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    build_dir = _build_dir()
+    build_dir.mkdir(parents=True, exist_ok=True)
     extra_includes = [str(include_dir)]
     if CUDA_HOME is not None:
         extra_includes.append(str(Path(CUDA_HOME) / "include"))
@@ -139,7 +154,7 @@ def _load_extension() -> Any:
         extra_include_paths=extra_includes,
         extra_cflags=["-O3", "-std=c++17"],
         extra_ldflags=[str(cupti_lib), f"-Wl,-rpath,{lib_dir}"],
-        build_directory=str(BUILD_DIR),
+        build_directory=str(build_dir),
         verbose=False,
         with_cuda=False,
     )
@@ -360,6 +375,14 @@ def _capture_launch_unit(
             f"expected={expected_count}, captured={len(records)}"
         )
 
+    # A multi-stream callable (the interval-union case) starts its streams'
+    # kernels in no fixed order, so only the multiset of names is stable
+    # within one launch. Launches still occupy contiguous record blocks: each
+    # one joins its streams before the next launch (or L2 clear) starts.
+    def launch_signature(names: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(sorted(names)) if interval_union else names
+
+    expected_signature = launch_signature(launch_pattern.callable_kernel_names)
     cursor = 0
     per_launch_ms: list[float] = []
     matched_kernel_names: set[str] = set()
@@ -368,7 +391,7 @@ def _capture_launch_unit(
         callable_records = records[cursor : cursor + callable_count]
         cursor += callable_count
         callable_names = tuple(record.name for record in callable_records)
-        if callable_names != launch_pattern.callable_kernel_names:
+        if launch_signature(callable_names) != expected_signature:
             raise RuntimeError(
                 "CUPTI callable kernel pattern changed inside the multi-launch "
                 f"capture at logical launch {launch_index}"

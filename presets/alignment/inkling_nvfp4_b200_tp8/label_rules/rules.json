@@ -1,0 +1,975 @@
+{
+ "schema_version": 1,
+ "note": "Inkling-Small-NVFP4, vLLM TP4/EP4 on B200, Phase 0 capture job 4575, labeled against the inkling_vllm_nvfp4_rel_attn_moe CostTree. Operations aggregate across the four layer variants by slot suffix (local_dense / local_bf16_moe / local_nvfp4_moe / global_nvfp4_moe); the routed MoE splits NVFP4 vs BF16 by kernel family. Lamport launches are synchronizing.",
+ "rules": [
+  {
+   "operation": "prologue.embed",
+   "name": "_embed_rmsnorm_kernel",
+   "type": "model",
+   "role": "vocab embedding gather + embed RMSNorm (+ layer-0 attn norm)",
+   "slot_suffixes": [
+    "embed"
+   ],
+   "phase": "forward",
+   "note": "Triton _embed_rmsnorm, the first forward launch.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "prologue.log_scaling_tau",
+   "name": "CUDAFunctorOnSelf_add<long>",
+   "type": "model",
+   "role": "compute_log_scaling_tau: add, cast, mul, clamp, log, mul, add over [T]",
+   "slot_suffixes": [
+    "log_scaling_tau"
+   ],
+   "phase": "forward",
+   "after_name": "_embed_rmsnorm_kernel",
+   "note": "First tau launch (positions + 1), right after the embed kernel.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "prologue.log_scaling_tau",
+   "name": "direct_copy_kernel_cuda",
+   "type": "model",
+   "role": "compute_log_scaling_tau: add, cast, mul, clamp, log, mul, add over [T]",
+   "slot_suffixes": [
+    "log_scaling_tau"
+   ],
+   "phase": "forward",
+   "after": "prologue.log_scaling_tau",
+   "note": "Tau chain launch; its predecessor is the previous tau launch.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "prologue.log_scaling_tau",
+   "name": "BUnaryFunctor<float",
+   "type": "model",
+   "role": "compute_log_scaling_tau: add, cast, mul, clamp, log, mul, add over [T]",
+   "slot_suffixes": [
+    "log_scaling_tau"
+   ],
+   "phase": "forward",
+   "after": "prologue.log_scaling_tau",
+   "note": "Tau chain launch; its predecessor is the previous tau launch.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "prologue.log_scaling_tau",
+   "name": "launch_clamp_scalar",
+   "type": "model",
+   "role": "compute_log_scaling_tau: add, cast, mul, clamp, log, mul, add over [T]",
+   "slot_suffixes": [
+    "log_scaling_tau"
+   ],
+   "phase": "forward",
+   "after": "prologue.log_scaling_tau",
+   "note": "Tau chain launch; its predecessor is the previous tau launch.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "prologue.log_scaling_tau",
+   "name": "log_kernel_cuda",
+   "type": "model",
+   "role": "compute_log_scaling_tau: add, cast, mul, clamp, log, mul, add over [T]",
+   "slot_suffixes": [
+    "log_scaling_tau"
+   ],
+   "phase": "forward",
+   "after": "prologue.log_scaling_tau",
+   "note": "Tau chain launch; its predecessor is the previous tau launch.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "prologue.log_scaling_tau",
+   "name": "AUnaryFunctor<float",
+   "type": "model",
+   "role": "compute_log_scaling_tau: add, cast, mul, clamp, log, mul, add over [T]",
+   "slot_suffixes": [
+    "log_scaling_tau"
+   ],
+   "phase": "forward",
+   "after": "prologue.log_scaling_tau",
+   "note": "Tau chain launch; its predecessor is the previous tau launch.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "prologue.log_scaling_tau",
+   "name": "CUDAFunctorOnSelf_add<float>",
+   "type": "model",
+   "role": "compute_log_scaling_tau: add, cast, mul, clamp, log, mul, add over [T]",
+   "slot_suffixes": [
+    "log_scaling_tau"
+   ],
+   "phase": "forward",
+   "after": "prologue.log_scaling_tau",
+   "note": "Tau chain launch; its predecessor is the previous tau launch.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.qkvr_proj",
+   "name": "nvjet_sm100",
+   "type": "attention",
+   "role": "fused QKV + relative-position projection GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "attn.qkvr_proj"
+   ],
+   "phase": "forward",
+   "before_name": "_qkvr_qkv_kernel",
+   "note": "QKVR GEMM: the GEMM right before _qkvr_qkv_kernel.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.qkvr_proj",
+   "name": "splitKreduce_kernel",
+   "type": "attention",
+   "role": "fused QKV + relative-position projection GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "attn.qkvr_proj"
+   ],
+   "phase": "forward",
+   "before_name": "_qkvr_qkv_kernel",
+   "note": "QKVR split-K reduce, right before _qkvr_qkv_kernel.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.qkvr_proj",
+   "name": "nvjet_sm100",
+   "type": "attention",
+   "role": "fused QKV + relative-position projection GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "attn.qkvr_proj"
+   ],
+   "phase": "forward",
+   "before_name": "_kv_kernel",
+   "note": "QKVR GEMM: the GEMM right before _kv_kernel.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.qkvr_proj",
+   "name": "nvjet_sm100",
+   "type": "attention",
+   "role": "fused QKV + relative-position projection GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "attn.qkvr_proj"
+   ],
+   "phase": "forward",
+   "before": "attn.qkvr_proj",
+   "note": "QKVR split-K GEMM preceding its reduce.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.qkvr_prep",
+   "name": "_qkvr_qkv_kernel",
+   "type": "attention",
+   "role": "QKV + relative-position prep (q/k norm, rope, KV write, rel-proj)",
+   "slot_suffixes": [
+    "attn.qkvr_prep"
+   ],
+   "phase": "forward",
+   "note": "Decode: fused _qkvr_qkv. Mixed: _kv_kernel on the main stream, _q_kernel + _rel_proj_* on a per-layer side stream.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.qkvr_prep",
+   "name": "_kv_kernel",
+   "type": "attention",
+   "role": "QKV + relative-position prep (q/k norm, rope, KV write, rel-proj)",
+   "slot_suffixes": [
+    "attn.qkvr_prep"
+   ],
+   "phase": "forward",
+   "note": "Decode: fused _qkvr_qkv. Mixed: _kv_kernel on the main stream, _q_kernel + _rel_proj_* on a per-layer side stream.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.qkvr_prep",
+   "name": "_q_kernel",
+   "type": "attention",
+   "role": "QKV + relative-position prep (q/k norm, rope, KV write, rel-proj)",
+   "slot_suffixes": [
+    "attn.qkvr_prep"
+   ],
+   "phase": "forward",
+   "note": "Decode: fused _qkvr_qkv. Mixed: _kv_kernel on the main stream, _q_kernel + _rel_proj_* on a per-layer side stream.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.qkvr_prep",
+   "name": "_rel_proj_throughput_kernel",
+   "type": "attention",
+   "role": "QKV + relative-position prep (q/k norm, rope, KV write, rel-proj)",
+   "slot_suffixes": [
+    "attn.qkvr_prep"
+   ],
+   "phase": "forward",
+   "note": "Decode: fused _qkvr_qkv. Mixed: _kv_kernel on the main stream, _q_kernel + _rel_proj_* on a per-layer side stream.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.qkvr_prep",
+   "name": "_rel_proj_low_latency_kernel",
+   "type": "attention",
+   "role": "QKV + relative-position prep (q/k norm, rope, KV write, rel-proj)",
+   "slot_suffixes": [
+    "attn.qkvr_prep"
+   ],
+   "phase": "forward",
+   "note": "Decode: fused _qkvr_qkv. Mixed: _kv_kernel on the main stream, _q_kernel + _rel_proj_* on a per-layer side stream.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.rel_attention",
+   "name": "tml_fa4cu_blocks_kernelsCuSeqlensToBlocksKernel",
+   "type": "attention",
+   "role": "tml FA4 relative-position attention: cu_blocks metadata, ShearingBias, prepare_scheduler, mainloop, split-KV combine",
+   "slot_suffixes": [
+    "attn.rel_attention"
+   ],
+   "phase": "forward",
+   "note": "tml FA4 launch of the rel-attention call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.rel_attention",
+   "name": "tml_fa4cu_blocks_kernelsCuBlocksToBatchKernel",
+   "type": "attention",
+   "role": "tml FA4 relative-position attention: cu_blocks metadata, ShearingBias, prepare_scheduler, mainloop, split-KV combine",
+   "slot_suffixes": [
+    "attn.rel_attention"
+   ],
+   "phase": "forward",
+   "note": "tml FA4 launch of the rel-attention call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.rel_attention",
+   "name": "tml_fa4shearing_biasShearingBias",
+   "type": "attention",
+   "role": "tml FA4 relative-position attention: cu_blocks metadata, ShearingBias, prepare_scheduler, mainloop, split-KV combine",
+   "slot_suffixes": [
+    "attn.rel_attention"
+   ],
+   "phase": "forward",
+   "note": "tml FA4 launch of the rel-attention call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.rel_attention",
+   "name": "tml_fa4prepare_schedulerFlashPrepareScheduler",
+   "type": "attention",
+   "role": "tml FA4 relative-position attention: cu_blocks metadata, ShearingBias, prepare_scheduler, mainloop, split-KV combine",
+   "slot_suffixes": [
+    "attn.rel_attention"
+   ],
+   "phase": "forward",
+   "note": "tml FA4 launch of the rel-attention call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.rel_attention",
+   "name": "tml_fa4flash_fwd_sm100FlashAttentionForwardSm100",
+   "type": "attention",
+   "role": "tml FA4 relative-position attention: cu_blocks metadata, ShearingBias, prepare_scheduler, mainloop, split-KV combine",
+   "slot_suffixes": [
+    "attn.rel_attention"
+   ],
+   "phase": "forward",
+   "note": "tml FA4 launch of the rel-attention call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.rel_attention",
+   "name": "tml_fa4flash_fwd_combineFlashAttentionForwardCombine",
+   "type": "attention",
+   "role": "tml FA4 relative-position attention: cu_blocks metadata, ShearingBias, prepare_scheduler, mainloop, split-KV combine",
+   "slot_suffixes": [
+    "attn.rel_attention"
+   ],
+   "phase": "forward",
+   "note": "tml FA4 launch of the rel-attention call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.o_proj",
+   "name": "nvjet_sm100",
+   "type": "attention",
+   "role": "attention output projection GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "attn.o_proj"
+   ],
+   "phase": "forward",
+   "after_name": "FlashAttentionForward",
+   "note": "The GEMM right after the FA4 mainloop / combine.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.rs_sconv_ag_norm",
+   "name": "_publish_input_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the attn sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "attn.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "attn.o_proj",
+   "cross_rank": "synchronizing",
+   "note": "First Lamport launch after attn.o_proj.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.rs_sconv_ag_norm",
+   "name": "_reduce_insert_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the attn sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "attn.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "attn.rs_sconv_ag_norm",
+   "cross_rank": "synchronizing",
+   "note": "Lamport chain: follows the previous launch of the same call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.rs_sconv_ag_norm",
+   "name": "_sconv_publish_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the attn sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "attn.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "attn.rs_sconv_ag_norm",
+   "cross_rank": "synchronizing",
+   "note": "Lamport chain: follows the previous launch of the same call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "attn.rs_sconv_ag_norm",
+   "name": "_gather_norm_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the attn sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "attn.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "attn.rs_sconv_ag_norm",
+   "cross_rank": "synchronizing",
+   "note": "Lamport chain: follows the previous launch of the same call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "ffn.rs_sconv_ag_norm",
+   "name": "_publish_input_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the ffn sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "ffn.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "ffn.global_scale",
+   "cross_rank": "synchronizing",
+   "note": "First Lamport launch after ffn.global_scale.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "ffn.rs_sconv_ag_norm",
+   "name": "_reduce_insert_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the ffn sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "ffn.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "ffn.rs_sconv_ag_norm",
+   "cross_rank": "synchronizing",
+   "note": "Lamport chain: follows the previous launch of the same call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "ffn.rs_sconv_ag_norm",
+   "name": "_sconv_publish_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the ffn sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "ffn.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "ffn.rs_sconv_ag_norm",
+   "cross_rank": "synchronizing",
+   "note": "Lamport chain: follows the previous launch of the same call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "ffn.rs_sconv_ag_norm",
+   "name": "_gather_norm_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the ffn sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "ffn.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "ffn.rs_sconv_ag_norm",
+   "cross_rank": "synchronizing",
+   "note": "Lamport chain: follows the previous launch of the same call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.rs_sconv_ag_norm",
+   "name": "_publish_input_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the moe sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "moe.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "moe.routed_nvfp4",
+   "cross_rank": "synchronizing",
+   "note": "First Lamport launch after moe.routed_nvfp4.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.rs_sconv_ag_norm",
+   "name": "_publish_input_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the moe sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "moe.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "moe.routed_bf16",
+   "cross_rank": "synchronizing",
+   "note": "First Lamport launch after moe.routed_bf16.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.rs_sconv_ag_norm",
+   "name": "_publish_input_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the moe sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "moe.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "moe.sink.down",
+   "cross_rank": "synchronizing",
+   "note": "First Lamport launch after moe.sink.down.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.rs_sconv_ag_norm",
+   "name": "_reduce_insert_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the moe sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "moe.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "moe.rs_sconv_ag_norm",
+   "cross_rank": "synchronizing",
+   "note": "Lamport chain: follows the previous launch of the same call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.rs_sconv_ag_norm",
+   "name": "_sconv_publish_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the moe sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "moe.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "moe.rs_sconv_ag_norm",
+   "cross_rank": "synchronizing",
+   "note": "Lamport chain: follows the previous launch of the same call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.rs_sconv_ag_norm",
+   "name": "_gather_norm_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the moe sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "moe.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "moe.rs_sconv_ag_norm",
+   "cross_rank": "synchronizing",
+   "note": "Lamport chain: follows the previous launch of the same call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.rs_sconv_ag_norm",
+   "name": "_publish_input_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the moe sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "moe.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "<none>",
+   "cross_rank": "synchronizing",
+   "note": "Segment-start Lamport launch: the call began in the previous fold segment after the routed MoE; every such boundary in this capture closes an MoE sublayer.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.rs_sconv_ag_norm",
+   "name": "_sconv_publish_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the moe sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "moe.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "<none>",
+   "cross_rank": "synchronizing",
+   "note": "Segment-start Lamport launch: the call began in the previous fold segment after the routed MoE; every such boundary in this capture closes an MoE sublayer.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.rs_sconv_ag_norm",
+   "name": "_gather_norm_kernel",
+   "type": "collective",
+   "role": "Lamport RS + short conv + AG + residual + RMSNorm closing the moe sublayer (publish_input, reduce_insert, sconv_publish, gather_norm)",
+   "slot_suffixes": [
+    "moe.rs_sconv_ag_norm"
+   ],
+   "phase": "forward",
+   "after": "<none>",
+   "cross_rank": "synchronizing",
+   "note": "Segment-start Lamport launch: the call began in the previous fold segment after the routed MoE; every such boundary in this capture closes an MoE sublayer.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "ffn.gate_up",
+   "name": "nvjet_sm100",
+   "type": "ffn",
+   "role": "dense FFN gate_up GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "ffn.gate_up"
+   ],
+   "phase": "forward",
+   "before_name": "_silu_and_mul_triton_kernel",
+   "note": "GEMM right before _silu_and_mul_triton.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "ffn.act_and_mul",
+   "name": "_silu_and_mul_triton_kernel",
+   "type": "ffn",
+   "role": "dense FFN SiLU-and-mul (Triton)",
+   "slot_suffixes": [
+    "ffn.act_and_mul"
+   ],
+   "phase": "forward",
+   "note": "Only the dense layers launch it.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "ffn.down",
+   "name": "nvjet_sm100",
+   "type": "ffn",
+   "role": "dense FFN down GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "ffn.down"
+   ],
+   "phase": "forward",
+   "after_name": "_silu_and_mul_triton_kernel",
+   "note": "GEMM right after _silu_and_mul_triton.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "ffn.down",
+   "name": "splitKreduce_kernel",
+   "type": "ffn",
+   "role": "dense FFN down GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "ffn.down"
+   ],
+   "phase": "forward",
+   "after": "ffn.down",
+   "note": "down split-K reduce.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "ffn.global_scale",
+   "name": "BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor",
+   "type": "ffn",
+   "role": "dense FFN global_scale multiply (eager torch)",
+   "slot_suffixes": [
+    "ffn.global_scale"
+   ],
+   "phase": "forward",
+   "after": "ffn.down",
+   "note": "BF16 mul right after the dense down GEMM.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.router",
+   "name": "cute_dsl_ll_bf16",
+   "type": "moe",
+   "role": "router gate GEMM with fp32 output (cute-DSL ll_bf16 at T<=64, cuBLAS above)",
+   "slot_suffixes": [
+    "moe.router"
+   ],
+   "phase": "forward",
+   "note": "cute-DSL LLBf16SplitK / LLBf16Dotprod router.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.router",
+   "name": "nvjet_sm100",
+   "type": "moe",
+   "role": "router gate GEMM with fp32 output (cute-DSL ll_bf16 at T<=64, cuBLAS above)",
+   "slot_suffixes": [
+    "moe.router"
+   ],
+   "phase": "forward",
+   "before_name": "_inkling_gate_select_kernel",
+   "note": "cuBLAS fp32-out router GEMM right before gate select.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.gate_select",
+   "name": "_inkling_gate_select_kernel",
+   "type": "moe",
+   "role": "sigmoid gate + top-k select (Triton)",
+   "slot_suffixes": [
+    "moe.gate_select"
+   ],
+   "phase": "forward",
+   "note": "",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.topk_copy",
+   "name": "gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda",
+   "type": "moe",
+   "role": "two eager top-k id/weight copies",
+   "slot_suffixes": [
+    "moe.topk_copy"
+   ],
+   "phase": "forward",
+   "after": "moe.gate_select",
+   "note": "First copy, right after gate select.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.topk_copy",
+   "name": "gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda",
+   "type": "moe",
+   "role": "two eager top-k id/weight copies",
+   "slot_suffixes": [
+    "moe.topk_copy"
+   ],
+   "phase": "forward",
+   "after": "moe.topk_copy",
+   "note": "Second copy, right after the first.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.input_quant",
+   "name": "cvt_fp16_to_fp4_sf_major",
+   "type": "moe",
+   "role": "NVFP4 activation quant of the routed input",
+   "slot_suffixes": [
+    "input_quant"
+   ],
+   "phase": "forward",
+   "note": "",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.routed_nvfp4",
+   "name": "routingCustom::routingIndicesClusterKernel",
+   "type": "moe",
+   "role": "FlashInfer trtllm-gen NVFP4 routed MoE: routing indices, FC1, FC2, finalize",
+   "slot_suffixes": [
+    "fused_moe"
+   ],
+   "phase": "forward",
+   "excluded_slot_prefixes": [
+    "unified.local_bf16_moe."
+   ],
+   "note": "trtllm-gen launch of the NVFP4 routed call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.routed_nvfp4",
+   "name": "routingCustom::routingIndicesBlockKernel",
+   "type": "moe",
+   "role": "FlashInfer trtllm-gen NVFP4 routed MoE: routing indices, FC1, FC2, finalize",
+   "slot_suffixes": [
+    "fused_moe"
+   ],
+   "phase": "forward",
+   "excluded_slot_prefixes": [
+    "unified.local_bf16_moe."
+   ],
+   "note": "trtllm-gen launch of the NVFP4 routed call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.routed_nvfp4",
+   "name": "routingCustom::routingIndicesDynBlockKernel",
+   "type": "moe",
+   "role": "FlashInfer trtllm-gen NVFP4 routed MoE: routing indices, FC1, FC2, finalize",
+   "slot_suffixes": [
+    "fused_moe"
+   ],
+   "phase": "forward",
+   "excluded_slot_prefixes": [
+    "unified.local_bf16_moe."
+   ],
+   "note": "trtllm-gen launch of the NVFP4 routed call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.routed_nvfp4",
+   "name": "bmm_E2m1_E2m1E2m1",
+   "type": "moe",
+   "role": "FlashInfer trtllm-gen NVFP4 routed MoE: routing indices, FC1, FC2, finalize",
+   "slot_suffixes": [
+    "fused_moe"
+   ],
+   "phase": "forward",
+   "excluded_slot_prefixes": [
+    "unified.local_bf16_moe."
+   ],
+   "note": "trtllm-gen launch of the NVFP4 routed call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.routed_nvfp4",
+   "name": "bmm_Bfloat16_E2m1E2m1",
+   "type": "moe",
+   "role": "FlashInfer trtllm-gen NVFP4 routed MoE: routing indices, FC1, FC2, finalize",
+   "slot_suffixes": [
+    "fused_moe"
+   ],
+   "phase": "forward",
+   "excluded_slot_prefixes": [
+    "unified.local_bf16_moe."
+   ],
+   "note": "trtllm-gen launch of the NVFP4 routed call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.routed_nvfp4",
+   "name": "moe::dev::finalize::finalizeKernel",
+   "type": "moe",
+   "role": "FlashInfer trtllm-gen NVFP4 routed MoE: routing indices, FC1, FC2, finalize",
+   "slot_suffixes": [
+    "fused_moe"
+   ],
+   "phase": "forward",
+   "excluded_slot_prefixes": [
+    "unified.local_bf16_moe."
+   ],
+   "note": "trtllm-gen launch of the NVFP4 routed call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.routed_bf16",
+   "name": "tensorrt_llm::kernels::cutlass_kernels::",
+   "type": "moe",
+   "role": "TRT-LLM CUTLASS BF16 routed MoE (expert maps / prefix sums, expand rows, grouped GEMMs, activation, finalize)",
+   "slot_suffixes": [
+    "fused_moe"
+   ],
+   "phase": "forward",
+   "excluded_slot_prefixes": [
+    "unified.local_nvfp4_moe.",
+    "unified.global_nvfp4_moe."
+   ],
+   "note": "CUTLASS MoE launch of the layer-2 BF16 routed call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.routed_bf16",
+   "name": "GemmUniversal<cutlass::gemm::GroupProblemShape",
+   "type": "moe",
+   "role": "TRT-LLM CUTLASS BF16 routed MoE (expert maps / prefix sums, expand rows, grouped GEMMs, activation, finalize)",
+   "slot_suffixes": [
+    "fused_moe"
+   ],
+   "phase": "forward",
+   "excluded_slot_prefixes": [
+    "unified.local_nvfp4_moe.",
+    "unified.global_nvfp4_moe."
+   ],
+   "note": "CUTLASS MoE launch of the layer-2 BF16 routed call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.routed_bf16",
+   "name": "fused_moe::run_global<fused_moe::Fused_Moe_Kernel_sm80",
+   "type": "moe",
+   "role": "TRT-LLM CUTLASS BF16 routed MoE (expert maps / prefix sums, expand rows, grouped GEMMs, activation, finalize)",
+   "slot_suffixes": [
+    "fused_moe"
+   ],
+   "phase": "forward",
+   "excluded_slot_prefixes": [
+    "unified.local_nvfp4_moe.",
+    "unified.global_nvfp4_moe."
+   ],
+   "note": "CUTLASS MoE launch of the layer-2 BF16 routed call.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.sink.gate_up",
+   "name": "nvjet_sm100",
+   "type": "moe",
+   "role": "sink experts gate_up GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "moe.sink.gate_up"
+   ],
+   "phase": "forward",
+   "before_name": "_sink_epilogue_kernel",
+   "note": "GEMM right before _sink_epilogue.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.sink.gate_up",
+   "name": "splitKreduce_kernel",
+   "type": "moe",
+   "role": "sink experts gate_up GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "moe.sink.gate_up"
+   ],
+   "phase": "forward",
+   "before_name": "_sink_epilogue_kernel",
+   "note": "sink gate_up split-K reduce.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.sink.gate_up",
+   "name": "nvjet_sm100",
+   "type": "moe",
+   "role": "sink experts gate_up GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "moe.sink.gate_up"
+   ],
+   "phase": "forward",
+   "before": "moe.sink.gate_up",
+   "note": "sink gate_up split-K GEMM before its reduce.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.sink.act_and_mul",
+   "name": "_sink_epilogue_kernel",
+   "type": "moe",
+   "role": "sink SiLU-mul epilogue (Triton)",
+   "slot_suffixes": [
+    "moe.sink.act_and_mul"
+   ],
+   "phase": "forward",
+   "note": "",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "moe.sink.down",
+   "name": "nvjet_sm100",
+   "type": "moe",
+   "role": "sink experts down GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "moe.sink.down"
+   ],
+   "phase": "forward",
+   "after_name": "_sink_epilogue_kernel",
+   "note": "GEMM right after _sink_epilogue.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "epilogue.lm_head",
+   "name": "nvjet_sm100",
+   "type": "model",
+   "role": "LM head GEMM over one row per request",
+   "slot_suffixes": [
+    "lm_head"
+   ],
+   "phase": "sample",
+   "note": "The only GEMM of the sample range.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "epilogue.lm_head",
+   "name": "splitKreduce_kernel",
+   "type": "model",
+   "role": "LM head GEMM over one row per request",
+   "slot_suffixes": [
+    "lm_head"
+   ],
+   "phase": "sample",
+   "after": "epilogue.lm_head",
+   "note": "lm_head split-K reduce.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "epilogue.logits_all_gather",
+   "name": "ncclDevKernel_AllGather",
+   "type": "collective",
+   "role": "vocab-parallel logits all-gather",
+   "slot_suffixes": [
+    "logits_all_gather"
+   ],
+   "phase": "sample",
+   "cross_rank": "synchronizing",
+   "note": "The only collective of the sample range.",
+   "source_experiment": "20261007_0_inkling_small_nvfp4_tp4ep4/profile_nsys (Slurm job 4575)"
+  },
+  {
+   "operation": "ffn.gate_up",
+   "type": "ffn",
+   "role": "dense FFN gate_up GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "ffn.gate_up"
+   ],
+   "phase": "forward",
+   "name": "splitKreduce_kernel",
+   "before_name": "_silu_and_mul_triton_kernel",
+   "note": "gate_up split-K reduce right before _silu_and_mul_triton (Inkling-NVFP4 TP8 picks split-K at hidden 6144).",
+   "source_experiment": "20261009_0_inkling_nvfp4_tp8ep8_diverse100/profile_nsys (Slurm job 5138)"
+  },
+  {
+   "operation": "ffn.gate_up",
+   "type": "ffn",
+   "role": "dense FFN gate_up GEMM (cuBLAS)",
+   "slot_suffixes": [
+    "ffn.gate_up"
+   ],
+   "phase": "forward",
+   "name": "nvjet_sm100",
+   "before": "ffn.gate_up",
+   "note": "gate_up split-K GEMM, followed by its reduce.",
+   "source_experiment": "20261009_0_inkling_nvfp4_tp8ep8_diverse100/profile_nsys (Slurm job 5138)"
+  },
+  {
+   "operation": "moe.router",
+   "type": "moe",
+   "role": "router gate GEMM with fp32 output (cute-DSL ll_bf16 at T<=64, cuBLAS above)",
+   "slot_suffixes": [
+    "moe.router"
+   ],
+   "phase": "forward",
+   "name": "splitKreduce_kernel",
+   "before_name": "_inkling_gate_select_kernel",
+   "note": "router split-K reduce right before gate select (Inkling-NVFP4 TP8, hidden 6144).",
+   "source_experiment": "20261009_0_inkling_nvfp4_tp8ep8_diverse100/profile_nsys (Slurm job 5138)"
+  },
+  {
+   "operation": "moe.router",
+   "type": "moe",
+   "role": "router gate GEMM with fp32 output (cute-DSL ll_bf16 at T<=64, cuBLAS above)",
+   "slot_suffixes": [
+    "moe.router"
+   ],
+   "phase": "forward",
+   "name": "nvjet_sm100",
+   "before": "moe.router",
+   "note": "router split-K GEMM, followed by its reduce.",
+   "source_experiment": "20261009_0_inkling_nvfp4_tp8ep8_diverse100/profile_nsys (Slurm job 5138)"
+  }
+ ]
+}

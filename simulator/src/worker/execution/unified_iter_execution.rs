@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{SharedRequests, Time};
 use crate::worker::cost_buffers::CostBuffers;
-use crate::worker::execution::{IterModelExecution, ModelKvLayout, PipelineStageExecution};
+use crate::worker::execution::{IterModelExecution, PipelineStageExecution};
 use crate::worker::kv::{IterWorkerKv, PrefixKv};
 use crate::worker::types::IterBatchPlan;
 
@@ -83,13 +83,6 @@ where
     K: IterWorkerKv + PrefixKv,
 {
     type Input = UnifiedArchInput;
-
-    fn model_kv_layout(&self) -> ModelKvLayout {
-        ModelKvLayout {
-            total_kv_bytes_per_token: self.model.total_kv_bytes_per_token(),
-            num_attn_shards: self.model.num_attn_shards(),
-        }
-    }
 
     fn build_iteration_input(
         &self,

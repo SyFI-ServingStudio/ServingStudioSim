@@ -21,6 +21,7 @@ from alignment.profiler.config import (
     ROUTING_PROFILE_KINDS,
     IdleWaitConfig,
     NsysConfig,
+    PrewarmConfig,
     ProfileConfig,
     PythonPackageArtifact,
     PythonRuntimeConfig,
@@ -122,6 +123,7 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
         idle_raw = _pop_optional_mapping(raw, "idle", "profile")
         nsys_raw = _pop_optional_mapping(raw, "nsys", "profile")
         python_runtime_raw = _pop_optional_mapping(raw, "python_runtime", "profile")
+        prewarm_raw = _pop_optional_mapping(raw, "prewarm", "profile")
         server = ServerConfig(**server_raw)
         workload = LoadGeneratorConfig.from_mapping(workload_raw)
         workload = replace(
@@ -135,6 +137,10 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
         idle = IdleWaitConfig(**idle_raw)
         nsys = NsysConfig(**nsys_raw)
         nsys.validate()
+        prewarm = None
+        if prewarm_raw:
+            prewarm = PrewarmConfig(**prewarm_raw)
+            prewarm.validate()
         python_runtime = None
         if python_runtime_raw:
             packages_raw = python_runtime_raw.pop("packages", None)
@@ -167,6 +173,7 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
             fork_python=fork_python,
             driver_compat_lib_dir=driver_compat_lib_dir,
             python_runtime=python_runtime,
+            prewarm=prewarm,
             **raw,
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -188,19 +195,6 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
         )
     if config.python_runtime is not None:
         _validate_python_runtime(config.python_runtime)
-    if (
-        require_python_runtime
-        and config.engine == "sglang"
-        and (
-            config.python_runtime is None
-            or config.python_runtime.environment.get("FLASHINFER_DISABLE_JIT") != "1"
-        )
-    ):
-        raise ValueError(
-            "invalid profile config: SGLang alignment requires "
-            "python_runtime.environment.FLASHINFER_DISABLE_JIT: '1' so a missing "
-            "prebuilt module fails before runtime compilation"
-        )
     if config.profile_kind not in PROFILE_KINDS:
         raise ValueError(
             "invalid profile config: profile_kind must be one of "
@@ -209,7 +203,11 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
     visible_devices = [
         device.strip() for device in config.cuda_visible_devices.split(",") if device.strip()
     ]
-    world_size = config.server.tp_size * config.server.dp_size
+    try:
+        gpu_count = config.gpu_count
+        expert_world = config.expert_parallel_world
+    except ValueError as exc:
+        raise ValueError(f"invalid profile config: {exc}") from exc
     expert_topology = {
         "expert_parallel_size": config.server.expert_parallel_size,
         "expert_count_reduction_group_size": (config.server.expert_count_reduction_group_size),
@@ -275,15 +273,30 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
             raise ValueError(
                 f"invalid profile config: server.{field_name} must be a positive integer"
             )
-        if world_size % value != 0:
+        if expert_world % value != 0:
             raise ValueError(
-                f"invalid profile config: server.{field_name} must divide "
-                f"tp_size * dp_size={world_size}"
+                f"invalid profile config: server.{field_name} must divide the ranks one "
+                f"expert group can span ({expert_world}: vLLM dp_size * tp_size * pcp, "
+                "SGLang tp_size)"
             )
-    if len(visible_devices) != world_size:
+    # SGLang's deprecated `--enable-dp-attention` turns `--dp-size N` into
+    # attention DP inside TP (attn_dp_size=N, dp_size=1), so dp_size here would
+    # no longer be the replica count every DP-rank attribution reads. The same
+    # deployment is `dp_size: 1` with `--attn-dp-size N`.
+    if (
+        config.engine == "sglang"
+        and "--enable-dp-attention" in config.server.extra_args
+        and config.server.dp_size > 1
+    ):
+        raise ValueError(
+            "invalid profile config: SGLang's deprecated --enable-dp-attention makes "
+            f"server.dp_size={config.server.dp_size} attention DP, not replicas; write "
+            f"server.dp_size: 1 and --attn-dp-size {config.server.dp_size} instead"
+        )
+    if len(visible_devices) != gpu_count:
         raise ValueError(
             "invalid profile config: cuda_visible_devices must contain exactly "
-            f"tp_size * dp_size={world_size} devices; found {visible_devices}"
+            f"dp_size * tp_size * pp * pcp={gpu_count} devices; found {visible_devices}"
         )
     if len(set(visible_devices)) != len(visible_devices):
         raise ValueError("invalid profile config: cuda_visible_devices contains duplicates")

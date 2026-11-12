@@ -85,13 +85,14 @@ use crate::arch::ep_comm::{
 };
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
-    self as ep_graph, build_atomic, eval_atomic_or_zero, normalize_group, state_bytes_per_token,
+    self as ep_graph, build_atomic, eval_atomic_or_zero, kv_cache_layout, normalize_group,
     Glm52VllmNvfp4DsaMoeConfigs, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeResolved,
     NormalizedGroup, CHECKPOINT_MAX_CONTEXT, NUM_DENSE_LAYERS, NUM_INITIAL_SHARED_LAYERS,
 };
 use crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::eval_compiled;
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::graph_padded_tokens;
 use crate::arch::hisparse::{push_rank_step, HisparseConfig, HisparseRankStep};
+use crate::arch::kv_layout::{KvCacheLayout, KvCachePart};
 use crate::common::Fabric;
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -552,7 +553,8 @@ impl DpSparseLayer {
             .collect::<Result<Vec<_>, _>>()?;
         let input_quant = experts
             .first()
-            .map(|expert| Op::new(expert.quant.name.clone(), Arc::clone(&expert.quant.kernel)))
+            .and_then(|expert| expert.quant.as_ref())
+            .map(|quant| Op::new(quant.name.clone(), Arc::clone(&quant.kernel)))
             .ok_or_else(|| fit_failed("no routed-expert rank to quantize for"))?;
         Ok(Self {
             attention: VllmGlm52DsaAttnLocalWorklet::build(
@@ -1063,7 +1065,7 @@ pub struct Glm52VllmNvfp4DpAttnDsaMoeModel {
     final_norm: Op<ResidualRmsNormKernel>,
     /// Full vocabulary: a TP1 `ParallelLMHead` shards nothing.
     lm_head: Op<SingleGemmKernel>,
-    kv_bytes_per_token: u64,
+    kv_cache_layout: KvCacheLayout,
     /// Query rows each decode request presents: 1, or `draft_tokens + 1` for
     /// the target of a DFlash2 verify.
     verify_width: u32,
@@ -1161,7 +1163,7 @@ pub fn build(
             bridge,
         )?,
         // A token's whole cache lives on the one rank that admitted it.
-        kv_bytes_per_token: state_bytes_per_token(1, Glm52MtpMode::Off)?,
+        kv_cache_layout: kv_cache_layout(1, Glm52MtpMode::Off),
         name,
         ep_size,
         max_model_len: recipe.parallel.max_model_len,
@@ -1204,12 +1206,22 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
     ) -> Result<Self, BuildError> {
         config.validate().map_err(fit_failed)?;
         let layers = u64::from(ep_graph::NUM_LAYERS);
-        let latent_bytes_per_token = layers * ep_graph::mla_latent_bytes_per_layer_token();
+        let latent_bytes_per_token = layers * ep_graph::mla_bytes_per_layer_token();
         // A token's indexer keys stay on the GPU: one per full-index layer
         // (IndexShare layers build no indexer and cache no key).
-        let index_layers = ep_graph::FULL_INDEX_LAYERS.len() as u64;
-        self.kv_bytes_per_token = index_layers * ep_graph::index_key_bytes_per_layer_token();
-        self.host_offload = Some(config.kv_host_offload(latent_bytes_per_token, 0, nvl_num_gpu, 1));
+        self.kv_cache_layout
+            .parts
+            .retain(|part| part.name != ep_graph::MLA_LATENT_PART);
+        let host_offload = config.kv_host_offload(latent_bytes_per_token, 0, nvl_num_gpu, 1);
+        // In its place each request holds a fixed latent buffer on the GPU.
+        self.kv_cache_layout.parts.push(
+            KvCachePart::per_request(
+                crate::arch::hisparse::DEVICE_BUFFER_PART,
+                host_offload.device_bytes_per_request,
+            )
+            .not_prefix_reusable(),
+        );
+        self.host_offload = Some(host_offload);
         self.hisparse = Some(config);
         self.recompile();
         Ok(self)
@@ -1314,7 +1326,7 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
                     hisparse.rank_step(
                         &group.decode_kv_lens,
                         self.verify_width,
-                        ep_graph::mla_latent_bytes_per_layer_token(),
+                        ep_graph::mla_bytes_per_layer_token(),
                         ep_graph::NUM_LAYERS,
                     )
                 })
@@ -1385,8 +1397,8 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4DpAttnDsaMoeModel {
 
     /// One token's cache, which one rank holds whole: 78 layers of MLA latent
     /// plus index key, with nothing replicated.
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.kv_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
 
     fn kv_host_offload(&self) -> Option<KvHostOffload> {
@@ -1446,7 +1458,9 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4DpAttnDsaMoeModel {
 mod tests {
     use super::*;
     use crate::arch::contract::ArchGroupInput;
-    use crate::arch::glm52_vllm_nvfp4_dsa_moe::{decoder_layer_state_bytes_per_token, NUM_LAYERS};
+    use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
+        indexer_bytes_per_layer_token, mla_bytes_per_layer_token, NUM_LAYERS,
+    };
     use crate::timing::routing::RoutingDistribution;
     use std::collections::BTreeSet;
     use std::path::Path;
@@ -1660,25 +1674,24 @@ mod tests {
 
     #[test]
     fn each_rank_holds_whole_tokens_of_kv_in_its_own_partition() {
-        // A full-index layer caches latent + index key, an IndexShare layer the
-        // latent only: 78 * 576 + 21 * 132.
-        assert_eq!(decoder_layer_state_bytes_per_token(0), 708);
-        assert_eq!(decoder_layer_state_bytes_per_token(3), 576);
+        // Every layer's 576 B latent; the 21 full-index layers' 132 B key.
+        assert_eq!(
+            (mla_bytes_per_layer_token(), indexer_bytes_per_layer_token()),
+            (576, 132)
+        );
         for ep_size in [4_u16, 8] {
             let model = built("glm52_nvfp4", ep_size);
-            assert_eq!(
-                model.total_kv_bytes_per_token(),
-                u64::from(NUM_LAYERS) * 576 + 21 * 132
-            );
-            assert_eq!(model.total_kv_bytes_per_token(), 47_700);
+            let bytes_per_token = model.kv_cache_layout().per_token_bytes();
+            assert_eq!(bytes_per_token, u64::from(NUM_LAYERS) * 576 + 21 * 132);
+            assert_eq!(bytes_per_token, 47_700);
             assert_eq!(model.gpus_per_replica(), ep_size);
             assert_eq!(model.num_attn_dp_groups(), ep_size);
             assert_eq!(model.num_attn_shards(), 1);
             // The chunked-prefill worker sizes each partition as
-            // attn_kv_bytes * num_attn_shards / total_kv_bytes_per_token.
+            // attn_kv_bytes * num_attn_shards / bytes per token.
             let attn_kv_bytes: u64 = 45_140_539_392;
-            let per_partition = attn_kv_bytes * u64::from(model.num_attn_shards())
-                / model.total_kv_bytes_per_token();
+            let per_partition =
+                attn_kv_bytes * u64::from(model.num_attn_shards()) / bytes_per_token;
             assert_eq!(per_partition, 946_342);
         }
     }
@@ -1691,8 +1704,8 @@ mod tests {
             .with_hisparse(HisparseConfig::default(), ep_size)
             .unwrap();
         // 47,700 = 78 * 576 latent + 21 * 132 indexer key: only the keys stay.
-        assert_eq!(model.total_kv_bytes_per_token(), 21 * 132);
-        assert_eq!(model.total_kv_bytes_per_token(), 2_772);
+        assert_eq!(model.kv_cache_layout().per_token_bytes(), 21 * 132);
+        assert_eq!(model.kv_cache_layout().per_token_bytes(), 2_772);
         let offload = model.kv_host_offload().unwrap();
         assert_eq!(offload.host_bytes_per_token, 78 * 576);
         assert_eq!(offload.device_bytes_per_request, 4096 * 44_928);
@@ -1912,7 +1925,7 @@ mod tests {
         let model = build("unified".to_string(), resolve_configs(&cfgs), &bridge).unwrap();
         assert_eq!(model.verify_width(), 4);
         assert_eq!(model.n_slots, expected_slot_count(8));
-        assert_eq!(model.total_kv_bytes_per_token(), 47_700);
+        assert_eq!(model.kv_cache_layout().per_token_bytes(), 47_700);
         assert_eq!(built("glm52_nvfp4", 8).verify_width(), 1);
     }
 

@@ -80,7 +80,7 @@ Produce this share-vs-new table:
 | Part | Reuse by default | Write only when |
 |---|---|---|
 | Shell | nearest cadence family | the shell discriminator above fires |
-| KV | `FullAttnKv` plus existing capabilities | resource lifecycle or required observation is absent |
+| KV | `KvCacheStore` plus existing capabilities; a new kind of cached state is a `KvCachePart` in the arch's layout, not a new store | resource lifecycle or required observation is absent |
 | Lifecycle | nearest family lifecycle | required state transitions cannot be expressed by one existing lifecycle |
 | Policy | existing `PendingOrderPolicy` | ordering needs new frozen facts or a new algorithm |
 | Execution | matching production adapter | input lowering or cost evaluation needs new facts/shape |
@@ -136,6 +136,10 @@ Keep these invariants:
 - one request stays on one KV partition for its KV lifetime;
 - an AFD cadence slot is not a KV partition;
 - the KV implementation is the only strict capacity/accounting source;
+- charges come from the resolved `KvAccounting` in KV units; the store never
+  reads layout parts, and `current_kv` stays context tokens for the L4 input;
+- live checkpoints and retained prefixes are the soft tier: evictable, never in
+  `fits` or `kv_usage`;
 - input builders consume borrowed visitors/slices instead of cloning live
   membership;
 - `KvStore` never constructs an L4 input.

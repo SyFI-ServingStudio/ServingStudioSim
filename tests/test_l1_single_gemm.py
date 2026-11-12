@@ -35,7 +35,6 @@ from profiling.db.table import MissingEntry
 from profiling.exec import (
     ENV_REGISTRY,
     ChunkResult,
-    ContainerProfileEnv,
     GpuChunk,
     GpuPool,
     LocalGpuPool,
@@ -140,8 +139,10 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "sglang_bf16_auto",
         "sglang_fused_a_auto",
         "deepgemm",
+        "flashinfer_fp8_tensor",
         "flashinfer_cutedsl",
         "flashinfer_mxfp8",
+        "flashinfer_mxfp8_prequantized",
     }
 
 
@@ -1432,6 +1433,8 @@ def test_local_chunk_puts_the_energy_policy_in_the_worker_payload(
 
     from profiling.profilers import energy as energy_mod
 
+    # The host path; the container path is test_profile_container's.
+    monkeypatch.setenv("VIBESIM_PROFILE_RUNTIME", "host")
     energy_mod.set_energy_enabled(enabled)
     seen: dict[str, object] = {}
 
@@ -1510,7 +1513,7 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
             (
                 '{"results":[{"ok":true,"metrics":{"kind":"compute",'
                 '"time_ms":1.0,"tflops":0.1,"memory_bandwidth_gbps":0.2,'
-                '"energy_j":0.0},"gpu_name":"FakeGPU"}]}'
+                '"energy_j":0.0},"gpu_name":"FakeGPU"}],"gpu_uuids":["GPU-fake-2"]}'
             ),
             encoding="utf-8",
         )
@@ -1522,6 +1525,11 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
     )
     monkeypatch.setattr("profiling.exec.local.resolve_profile_env", fake_resolve_profile_env)
     monkeypatch.setattr("profiling.exec.local.subprocess.run", fake_subprocess_run)
+    # The worker reports the card it saw; the chunk checks it against index 2.
+    monkeypatch.setattr(
+        "profiling.exec.local.gpu_uuids_for_indices",
+        lambda indices: [f"GPU-fake-{index}" for index in indices],
+    )
     # The launcher's PyO3 child points these at the project venv; an env with
     # its own interpreter must not import the project's Torch through them.
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["/project/site-packages", "/existing"]))
@@ -1579,12 +1587,9 @@ def test_documented_profile_env_registry_complete():
         "causal_conv1d_env",
         "default_env",
         "flashinfer_pip_env",
-        "flashinfer_local",
         "flashinfer_kda_env",
         "sglang_env",
         "vllm_env",
-        "vllm_upstream_fork_env",
-        "flashkda_env",
     }
     assert set(ENV_REGISTRY) == expected_envs
     assert (
@@ -1597,15 +1602,11 @@ def test_documented_profile_env_registry_complete():
         ENV_REGISTRY["causal_conv1d_env"].python_executable
         == ENV_REGISTRY["default_env"].python_executable
     )
+    # vllm_env on the host is the fork's .venv, resolving Torch's CUDA runtime
+    # from that venv first.
     vllm_env = ENV_REGISTRY["vllm_env"]
-    assert isinstance(vllm_env, ContainerProfileEnv)
-    assert vllm_env.image == "vibesim-profiler-vllm:cu130-3f667d7e"
-    vllm_env.validate()
-    # The fork env resolves Torch's CUDA runtime from its own venv first.
-    fork_env = ENV_REGISTRY["vllm_upstream_fork_env"]
-    assert isinstance(fork_env, ProfileEnv)
-    assert fork_env.additional_library_paths[0].parts[-2:] == ("torch", "lib")
-    assert fork_env.python_executable.parents[2] in fork_env.additional_python_paths
+    assert vllm_env.additional_library_paths[0].parts[-2:] == ("torch", "lib")
+    assert vllm_env.python_executable.parents[2] in vllm_env.additional_python_paths
 
 
 def test_comm_launcher_interfaces_exist():

@@ -38,6 +38,11 @@ pub struct GdnPrefillOpConfig {
 #[derive(Clone, Debug, Default)]
 pub struct GdnPrefillOpInput {
     pub sequence_lengths: Vec<u32>,
+    /// Single-token decode rows batched ahead of the prefills into the same
+    /// varlen convolution (vLLM's mixed step runs `causal_conv1d_fn` over every
+    /// non-spec token). They join the convolution only: the post-conv and the
+    /// delta rule cover the prefill tokens. Ignored without a prefill.
+    pub decode_rows: u32,
 }
 
 pub struct GdnPrefillOp {
@@ -123,14 +128,22 @@ fn eval_with(kernels: &impl GdnPrefillEval, input: &GdnPrefillOpInput, ev: &mut 
     let geometry = derive_geometry(&input.sequence_lengths)
         .unwrap_or_else(|reason| panic!("invalid GdnPrefillOpInput: {reason}"));
 
+    let decode_rows = if geometry.is_some() {
+        input.decode_rows
+    } else {
+        0
+    };
     let mut causal_conv_metrics = LeafMetrics::ZERO;
     if geometry.is_some() {
         causal_conv_metrics =
-            aggregate_causal_conv(&input.sequence_lengths, |shape| kernels.causal_conv(shape));
+            aggregate_causal_conv(&input.sequence_lengths, decode_rows, |shape| {
+                kernels.causal_conv(shape)
+            });
     }
     ev.push(causal_conv_metrics, || {
         GdnCausalConvPrefillLog {
             sequence_lengths: input.sequence_lengths.clone(),
+            decode_rows,
         }
         .into()
     });
@@ -197,12 +210,22 @@ fn derive_geometry(sequence_lengths: &[u32]) -> Result<Option<GdnPrefillGeometry
 /// backend (`gdn_causal_conv_prefill::launches_per_sequence`), but vLLM's
 /// `vllm_triton` covers the whole varlen batch in one launch, so this charges
 /// it a launch floor per sequence: +3% at 8 x 2048 tokens, +93% at 256 x 64 on
-/// the B200 24576-channel rows.
+/// the B200 24576-channel rows. Decode rows sharing the launch add one
+/// `(B, 1)` row: on the B200 10240-channel rows a 32-decode + 2016-token mixed
+/// launch measures 39.3 us against 5.5 + 36.8 us for the two rows, and one
+/// `(1, 2048)` launch 37.3 us.
 fn aggregate_causal_conv(
     sequence_lengths: &[u32],
+    decode_rows: u32,
     mut eval: impl FnMut(&GdnCausalConvPrefillKernelInput) -> LeafMetrics,
 ) -> LeafMetrics {
     let mut metrics = LeafMetrics::ZERO;
+    if decode_rows > 0 {
+        metrics.add_fanin(eval(&GdnCausalConvPrefillKernelInput {
+            batch_size: decode_rows,
+            sequence_length: 1,
+        }));
+    }
     for &sequence_length in sequence_lengths {
         metrics.add_fanin(eval(&GdnCausalConvPrefillKernelInput {
             batch_size: 1,
@@ -427,6 +450,7 @@ mod tests {
                 &fake,
                 &GdnPrefillOpInput {
                     sequence_lengths: lengths.clone(),
+                    decode_rows: 0,
                 },
                 &mut evaluator,
             );
@@ -457,7 +481,7 @@ mod tests {
     #[test]
     fn causal_conv_fanin_is_b1_per_sequence_and_adopts_backend() {
         let mut seen = Vec::new();
-        let metrics = aggregate_causal_conv(&[3, 65, 2], |shape| {
+        let metrics = aggregate_causal_conv(&[3, 65, 2], 0, |shape| {
             seen.push((shape.batch_size, shape.sequence_length));
             LeafMetrics {
                 m: Metrics4 {
@@ -477,14 +501,52 @@ mod tests {
     }
 
     #[test]
+    fn decode_rows_join_the_convolution_as_one_b_by_1_row() {
+        let mut seen = Vec::new();
+        aggregate_causal_conv(&[65], 4, |shape| {
+            seen.push((shape.batch_size, shape.sequence_length));
+            LeafMetrics::ZERO
+        });
+        assert_eq!(seen, [(4, 1), (1, 65)]);
+        // Without a prefill there is no varlen launch to join.
+        let fake = FakeEval::default();
+        let mut buf = vec![LeafMetrics::ZERO; 3];
+        let mut inputs = Vec::new();
+        let mut evaluator = Evaluator::with_inputs(&mut buf, &mut inputs);
+        eval_with(
+            &fake,
+            &GdnPrefillOpInput {
+                sequence_lengths: vec![],
+                decode_rows: 4,
+            },
+            &mut evaluator,
+        );
+        assert!(fake.calls.borrow().is_empty());
+        assert_eq!(
+            serde_json::to_value(&inputs).unwrap()[0],
+            serde_json::json!({"sequence_lengths": []})
+        );
+    }
+
+    #[test]
     fn fanin_log_serializes_the_exact_sequence_vector() {
         let slot: SlotInput = GdnCausalConvPrefillLog {
             sequence_lengths: vec![3, 65, 2],
+            decode_rows: 0,
         }
         .into();
         assert_eq!(
             serde_json::to_value(slot).unwrap(),
             serde_json::json!({"sequence_lengths":[3,65,2]})
+        );
+        let mixed: SlotInput = GdnCausalConvPrefillLog {
+            sequence_lengths: vec![65],
+            decode_rows: 4,
+        }
+        .into();
+        assert_eq!(
+            serde_json::to_value(mixed).unwrap(),
+            serde_json::json!({"sequence_lengths":[65],"decode_rows":4})
         );
     }
 
@@ -495,9 +557,11 @@ mod tests {
             GdnPrefillOpInput::default(),
             GdnPrefillOpInput {
                 sequence_lengths: vec![128],
+                decode_rows: 0,
             },
             GdnPrefillOpInput {
                 sequence_lengths: vec![3, 65, 2],
+                decode_rows: 2,
             },
         ] {
             let mut builder = CostTreeBuilder::new();

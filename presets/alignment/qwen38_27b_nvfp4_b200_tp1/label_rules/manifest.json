@@ -1,0 +1,20 @@
+{
+ "schema_version": 2,
+ "rule_files": [
+  "rules.json"
+ ],
+ "note": "Qwen3.8-27B-NVFP4 on one B200, vLLM fork 892da082 TP1, labeled against the qwen35_vllm_nvfp4_gdn_dense CostTree. One order-independent rule set (rules.json), written by gen_rules.py. Mapped critical-path coverage: diverse_100 99.0%, campaign cases 97.5-99.7%; the only unmapped forward kernel is the byte Fill before each trtllm-gen FMHA launch.",
+ "source": {
+  "capture": "logs/20261012_2_q38_diverse100/profile_nsys (Slurm job 6443) and the 20 cases of logs/20261012_1_q38_align_campaign",
+  "cost_manifest": "timing_predict/raw/cost_manifest/worker_predict_0.json of each case",
+  "arch": "qwen35_vllm_nvfp4_gdn_dense, model/config/qwen3_8_27b_nvfp4.json"
+ },
+ "unmapped_decisions": {
+  "forward": {
+   "at::native::vectorized_elementwise_kernel<(int)8, at::native::FillFunctor<unsigned char>": "memset vLLM issues before each trtllm-gen FMHA launch; no CostTree leaf"
+  },
+  "preprocess": "input preparation, slot mapping, mamba align copies; no CostTree leaf",
+  "sample": "sampling kernels (gumbel sample, argmax reduce, scatter/gather, index, counters) are not modelled; the logits row select, LM-head quant and GEMM are mapped (head.*)",
+  "bookkeep": "scheduler bookkeeping and the mamba state postprocess (postprocess_mamba_fused_kernel); no CostTree leaf"
+ }
+}

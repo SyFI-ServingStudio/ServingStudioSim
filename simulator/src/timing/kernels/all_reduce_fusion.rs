@@ -134,17 +134,21 @@ impl AllReduceFusionSpec {
         (flashinfer_fusion_max_bytes(&config.gpu_name, config.num_gpus) / bytes_per_token) as u32
     }
 
-    /// FlashInfer `MNNVL_ONE_SHOT_THRESHOLD` (`trtllm_mnnvl_ar.py`): one-shot
-    /// iff the all-gathered payload `T * H * N * elem` is at most 1 MiB.
-    const MNNVL_ONE_SHOT_BYTES: u64 = 1024 * 1024;
-
     /// Largest token count for which the MNNVL backend runs one-shot.
     pub fn mnnvl_max_oneshot_tokens(config: &AllReduceFusionKernelConfig) -> u32 {
-        let bytes_per_token = u64::from(config.hidden_dim)
-            * u64::from(config.num_gpus)
-            * config.dtype.size_bytes() as u64;
-        (Self::MNNVL_ONE_SHOT_BYTES / bytes_per_token) as u32
+        mnnvl_max_oneshot_tokens(config.hidden_dim, config.num_gpus, config.dtype)
     }
+}
+
+/// FlashInfer `MNNVL_ONE_SHOT_THRESHOLD` (`trtllm_mnnvl_ar.py`): one-shot
+/// iff the all-gathered payload `T * H * N * elem` is at most 1 MiB.
+const MNNVL_ONE_SHOT_BYTES: u64 = 1024 * 1024;
+
+/// Largest token count for which an MNNVL call (standalone or fused with
+/// residual + RMSNorm, which share the AUTO rule) runs one-shot.
+pub(crate) fn mnnvl_max_oneshot_tokens(hidden_dim: u32, num_gpus: u32, dtype: DType) -> u32 {
+    let bytes_per_token = u64::from(hidden_dim) * u64::from(num_gpus) * dtype.size_bytes() as u64;
+    (MNNVL_ONE_SHOT_BYTES / bytes_per_token) as u32
 }
 
 impl KernelSpec for AllReduceFusionSpec {

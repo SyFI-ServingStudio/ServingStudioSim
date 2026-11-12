@@ -1,0 +1,23 @@
+# vLLM MiMo-V2.6-Flash-RL on 4 B200s, TP4 attention with EP4 experts, chunked prefill at
+# 2048 tokens, as the diverse_100 capture's server ran
+# (logs/20261012_1_mimo_fused_ar_nsys: vLLM fork, --max-model-len 131072,
+# --max-num-batched-tokens 2048, --max-num-seqs 100, --gpu-memory-utilization 0.85).
+# attn_gpu_memory_gb is the KV pool per GPU, measured from
+# `Available KV cache memory: 110.07 GiB` in the capture's server log (x 1.073741824).
+# gpu_time_multiplier is that capture's kernel alignment recommendation
+# (sum of measured GPU cycle / sum of measured kernel time; logs/20261012_2_mimo_arch_kernel_align).
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: mimo_v2_vllm_fp8_swa_moe
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: 2048
+          batch_policy: mix
+          gpu_time_multiplier: 1.1103
+          attn_gpu_memory_gb: 118.1868
+sweep:
+  replicas: [1, 2]

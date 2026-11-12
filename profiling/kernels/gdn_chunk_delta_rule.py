@@ -4,15 +4,18 @@ FLA's Triton realization splits the chunked gated delta rule into six launches
 (local cumsum, scaled dot K·Kᵀ, triangular solve, w/u recompute, inter-chunk
 state scan, output). This kind models the realization vLLM actually selects on
 Hopper and Blackwell instead: FlashInfer's `flashinfer.gdn_prefill.
-chunk_gated_delta_rule`, a single CUTLASS TMA warp-specialized kernel
-(`flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule`) that keeps every
-intermediate on chip. The simulator has no kinds for the six Triton launches.
+chunk_gated_delta_rule`, a single kernel that keeps every intermediate on
+chip: a CUTLASS TMA warp-specialized kernel
+(`flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule`) on SM90 and a persistent
+CuTe DSL kernel (`GatedDeltaNetChunkedKernel`) on SM100. The simulator has no
+kinds for the six Triton launches.
 
 The choice is not a tuning detail. `ChunkGatedDeltaRule._resolve_gdn_prefill_backend`
-picks `flashinfer` for the default `auto` request on any SM90 part with no
-further constraints, so a measured H200 vLLM run never launches the six Triton
-kernels at all. Costing the six-launch path against it over-predicted the
-operation by 110% on a Qwen3.6-35B-A3B-FP8 capture, because the split path
+picks `flashinfer` for the default `auto` request on any SM90 part, and on
+SM100 when the head dim is 128 and CUDA is 13+, so a measured H200 or B200 vLLM
+run never launches the six Triton kernels at all. Costing the six-launch path
+against it over-predicted the operation by 110% on a Qwen3.6-35B-A3B-FP8
+capture, because the split path
 round-trips h/w/u/A through HBM five extra times.
 
 Wire string: ``"gdn_chunk_delta_rule"`` — matches the Rust ``KernelSpec::KIND``
@@ -78,7 +81,7 @@ DOC = KernelDoc(
     summary="Compute Gated DeltaNet prefill output and final recurrent states in one launch.",
     description=(
         "The chunked gated delta rule of Gated DeltaNet prefill, "
-        "which vLLM on H200 runs as one FlashInfer CUTLASS kernel: it writes "
+        "which vLLM on H200 and B200 runs as one FlashInfer kernel: it writes "
         "every token's output and each sequence's final state. The inputs are "
         "prepared as vLLM prepares them: queries and keys already L2-normalized"
         " outside the call, the decay passed already exponentiated, beta in "
@@ -102,8 +105,9 @@ DOC = KernelDoc(
     default_metric="tflops",
     method=(
         f"{CUPTI_METHOD} "
-        "Only the FlatKernel launch is counted. Inputs, gates, sequence "
-        "boundaries and outputs are allocated before the capture."
+        "Every launch of the call is counted: FlatKernel on SM90, "
+        "GatedDeltaNetChunkedKernel on SM100. Inputs, gates and sequence "
+        "boundaries are allocated before the capture."
     ),
     caveats=(
         "Each call starts from an all-zero state.",
@@ -119,12 +123,12 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer",
-        # FlashInfer builds the timed CUTLASS kernel only for sm_90a (gen_gdn_prefill_sm90_module,
-        # sm90a_nvcc_flags); on SM100 chunk_gated_delta_rule dispatches a different CuTe DSL kernel
-        # (chunk_gated_delta_rule_sm100) that the runner does not time.
+        # chunk_gated_delta_rule dispatches by architecture: a CUTLASS kernel on
+        # SM90, the CuTe DSL chunk_gated_delta_rule_sm100 kernel on SM100/SM103
+        # (CUDA 13+, head dim 128). The runner times whichever the call launches.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            sm_targets=frozenset({"sm_90a"}),
+            sm_targets=frozenset({"sm_90a", "sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.gdn_chunk_delta_rule_flashinfer",
@@ -136,8 +140,8 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         doc=BackendDoc(
             summary=(
-                "FlashInfer's chunk_gated_delta_rule CUTLASS call computes "
-                "output and final state in one launch."
+                "FlashInfer's chunk_gated_delta_rule call computes output and "
+                "final state in one launch (CUTLASS on SM90, CuTe DSL on SM100)."
             ),
             url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/gdn_prefill.py",
         ),

@@ -22,6 +22,7 @@ import sysconfig
 import time
 from pathlib import Path
 
+from .binaries import PrebuiltBinaryError, build_output_dir, check_prebuilt, prebuilt_dir
 from .process import ProcessResult, ProcessSpec, ProcessSupervisor
 from .process.artifacts import (
     ArtifactValidationError,
@@ -42,7 +43,7 @@ ERROR_JSON = "error.json"
 
 
 def binary_path(build_type: str = "debug") -> Path:
-    return REPO_ROOT / "target" / build_type / "simulator"
+    return build_output_dir(build_type) / "simulator"
 
 
 def _error_document(path: Path) -> dict:
@@ -68,11 +69,11 @@ def binary_too_long(path: Path) -> dict | None:
 
 
 def analyzer_binary_path(build_type: str = "debug") -> Path:
-    return REPO_ROOT / "target" / build_type / "analyze"
+    return build_output_dir(build_type) / "analyze"
 
 
 def schema_json_path(build_type: str = "debug") -> Path:
-    return REPO_ROOT / "target" / build_type / "deployment_schema.json"
+    return build_output_dir(build_type) / "deployment_schema.json"
 
 
 def _build_subprocess_env() -> dict[str, str]:
@@ -226,7 +227,13 @@ def _report_build_failure(stage: str, result: ProcessResult) -> None:
 def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
     """Build the simulator crate, then run schema discovery (INV-8). Returns
     True on success; on failure no schema is written (design §1.2.7 bootstrap
-    edge — `load_schema` then raises `SchemaNotFound`)."""
+    edge — `load_schema` then raises `SchemaNotFound`).
+
+    With ``VIBESIM_BIN_DIR`` set (`launcher/binaries.py`) nothing is compiled:
+    the prebuilt set is checked instead, including that its schema is the one
+    its simulator reports."""
+    if prebuilt_dir() is not None:
+        return _check_prebuilt_build(build_type, build_analyzer)
     cmd = ["cargo", "build"]
     if build_type == "release":
         cmd.append("--release")
@@ -285,6 +292,36 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
         return True
 
 
+def _check_prebuilt_build(build_type: str, build_analyzer: bool) -> bool:
+    try:
+        directory = build_output_dir(build_type)
+        check_prebuilt(directory)
+    except PrebuiltBinaryError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return False
+    schema_result = _PROCESS_SUPERVISOR.run_sync(
+        ProcessSpec(
+            argv=[str(directory / "simulator"), "list-params"],
+            cwd=REPO_ROOT,
+            env=_build_subprocess_env(),
+            capture_output=True,
+            separate_stderr=True,
+            name="discover-schema",
+        )
+    )
+    if not schema_result.succeeded:
+        _report_build_failure("schema discovery", schema_result)
+        return False
+    if schema_result.output != (directory / "deployment_schema.json").read_text():
+        sys.stderr.write(
+            f"{directory}: deployment_schema.json is not the schema its simulator reports\n"
+        )
+        return False
+    if build_analyzer and not analyzer_binary_path(build_type).is_file():
+        sys.stderr.write("[warn] no prebuilt analyzer; runs will skip post-run analysis\n")
+    return True
+
+
 def cargo_build_analyzer(build_type: str = "debug") -> bool:
     """Build only the standalone analyzer used by post-run analysis.
 
@@ -293,6 +330,8 @@ def cargo_build_analyzer(build_type: str = "debug") -> bool:
     boundary separate means `alignment analyze` cannot be blocked by unrelated
     simulator source drift.
     """
+    if prebuilt_dir() is not None:
+        return analyzer_binary_path(build_type).is_file()
     analyzer_cmd = _analyzer_build_command(build_type)
 
     with _LAUNCHER_LEASES.build(build_type):

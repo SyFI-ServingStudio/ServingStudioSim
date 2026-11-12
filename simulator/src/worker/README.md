@@ -35,20 +35,20 @@ different timelines and should not be hidden behind one giant FSM abstraction.
 
 | Worker selector | KV | Admission | Execution | Shell |
 |---|---|---|---|---|
-| `barebone` | `FullAttnKv` | `LocalPrefillDecodeAdmission<SessionStartOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
-| `hp_unified` | `FullAttnKv` with N partitions | `LocalPrefillDecodeAdmission<SessionStartOrder>` with prefix affinity then RR misses | `UnifiedIterExecution` | `IterBatchWorker` |
-| `chunked_prefill` | `FullAttnKv` with N partitions | `ChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
-| `speculative` | `FullAttnKv` with N partitions | `ChunkedPrefillAdmission<PendingOrder, SpeculativeDecodeCompletion>` | `SpeculativeIterExecution` | `IterBatchWorker` |
-| `pd_prefill` | `FullAttnKv` with held-KV ledger | `PrefillHandoffAdmission<SessionStartOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
-| `pd_decode` | `FullAttnKv` | thin inline landed-request ingress | `UnifiedIterExecution` | `PullDecodeWorker` |
-| `disagg_attn` | `FullAttnKv` | `FreshRequestSlotAdmission<SessionStartOrder>` | `AttentionLayerExecutionAdapter` | `SlotAttentionWorker` + private `AttentionSlotPipeline` |
+| `barebone` | `KvCacheStore` | `LocalPrefillDecodeAdmission<SessionStartOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
+| `hp_unified` | `KvCacheStore` with N partitions | `LocalPrefillDecodeAdmission<SessionStartOrder>` with prefix affinity then RR misses | `UnifiedIterExecution` | `IterBatchWorker` |
+| `chunked_prefill` | `KvCacheStore` with N partitions | `ChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
+| `speculative` | `KvCacheStore` with N partitions | `ChunkedPrefillAdmission<PendingOrder, SpeculativeDecodeCompletion>` | `SpeculativeIterExecution` | `IterBatchWorker` |
+| `pd_prefill` | `KvCacheStore` with held-KV ledger | `PrefillHandoffAdmission<SessionStartOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
+| `pd_decode` | `KvCacheStore` less the reserved pull budget, no prefix tier | thin inline landed-request ingress | `UnifiedIterExecution` | `PullDecodeWorker` |
+| `disagg_attn` | `KvCacheStore` | `FreshRequestSlotAdmission<SessionStartOrder>` | `AttentionLayerExecutionAdapter` | `SlotAttentionWorker` + private `AttentionSlotPipeline` |
 | `disagg_ffn` | none | none; L6 sends complete tasks | `FfnSectionExecutionAdapter` | `BufferedFfnWorker` |
-| `pipeline_chunked_prefill`, stage 0 | `FullAttnKv`, one partition, sized by the stage with the most KV per token | `PipelinedChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `PipelineHeadWorker` |
+| `pipeline_chunked_prefill`, stage 0 | `KvCacheStore`, one partition, sized by the most constrained stage's `KvCacheLayout` | `PipelinedChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `PipelineHeadWorker` |
 | `pipeline_chunked_prefill`, stages 1..N-1 | none | none; L6 hands over microbatches | `UnifiedIterExecution` (as `PipelineStageExecution`) | `PipelineStageWorker` |
 
-Hybrid recurrent + attention archs (Qwen3.6 local, GLM-5.3-Flash) swap in
-`HybridGdnKv` under `barebone` (`Qwen36HybridWorker`) and `chunked_prefill`
-(`HybridChunkedPrefillWorker`).
+Hybrid archs (sliding-window, recurrent, or compressed state: Inkling,
+Qwen3.6, GLM-5.3-Flash, DeepSeek-V4) use the same selectors and recipes; only
+their `KvCacheLayout` differs.
 
 Aliases such as `BareboneWorker<M>` and `DisaggAttnWorker<M>` name these concrete
 generic compositions. They are not wrapper runtimes.
@@ -90,9 +90,9 @@ itself.
 footprint → fits → reserve → commit_resident → advance → release
 ```
 
-`FullAttnKv` owns:
+`KvCacheStore` (`kv/kv_cache_store.rs`) is the only store. It owns:
 
-- one private `FullAttnPartitionState` per independent KV partition;
+- one private `ResidentPartitionState` per independent KV partition;
 - the promised reservation ledger;
 - the PD-prefill held-KV ledger;
 - resolved request-prefill contexts and one retained-prefix cache per partition;
@@ -112,11 +112,24 @@ Iteration and slot input builders consume borrowed membership visitors/slices,
 so composition does not require cloning the live batch on the hot path.
 
 The partition-local implementation is split by ownership: resident decode state
-and capacity live in `kv/full_attn_partition.rs`, while `FullAttnKv::fits`
-directly owns the only strict capacity gate. Partition placement and the prefill
+and capacity live in `kv/shared/resident_partition.rs`, while
+`KvCacheStore::fits` directly owns the only strict capacity gate. Partition placement and the prefill
 token gate belong to admission (`admission/placement.rs` and
 `admission/token_budget.rs`); there is no mixed `admission_helpers` module or
 one-variant capacity-policy seam.
+
+Every charge is in KV units of the partition's `KvAccounting`
+(`kv/shared/kv_accounting.rs`), resolved once at build from the arch's
+`KvCacheLayout`; the store never sees layout parts. One unit is the gcd of the
+parts' entry bytes, so a layout of one per-token part counts plain tokens. The
+accounting answers what a running request holds (`held_while_running`), what a
+waiting one needs free (`needed_to_admit`), and what a retained prefix entry
+keeps (`entry_charge`). `current_kv` stays context tokens for the arch input;
+charge never replaces it. The worker's flattened `KvAccountingSpec` picks
+`kv_overhead` (`vllm` default: padding, state copies, engine blocks, in-flight
+window tokens; `none`: model state only), `prefix_resume_points`,
+`prefix_resume_interval`, and `kv_max_in_flight_tokens`. Rules and rationale:
+`doc/detailed_design/L5.md` §3.1–3.2.
 
 `SessionInput` remains one closed immutable request declaration: `Standalone`;
 `PinnedPrefix`, a standalone request whose trace declares its prefix resident on
@@ -142,12 +155,20 @@ by default and may carry an optional retained-byte ceiling; `Disabled` is the
 explicit no-reuse baseline. Active reservations shrink/evict retained entries
 to preserve the physical capacity invariant. A hit transfers ownership out of
 the cache until completion, so there is no inter-request sharing. PD prefill
-returns held KV to the cache only after decode acknowledges the pull. The
-implementation lives in `kv/prefix_cache.rs`; `kv/full_attn.rs` owns the
-combined ledger and capacity gate.
+returns held KV to the cache only after decode acknowledges the pull.
 
-The same combined accounting feeds `kv_snapshot`: `active_kv` remains total
-committed attention KV, while `retained_prefix_kv` exposes its retained-cache
+An entry resumes only at the `ResumePositions` its request left behind: any
+length for per-token parts, but only where a sliding-window tail or recurrent
+state was kept for the others (`prefix_resume_points`, default `prompt_end`
+under `vllm`). A hit is the largest position at or below the declared prefix.
+A running request's tails and states at positions it has already passed are
+live checkpoints: like retained entries they are a soft, evictable tier that
+never enters `fits` or `kv_usage`, and they win the slack over retained
+entries. The implementation lives in `kv/shared/prefix_cache.rs`;
+`kv/kv_cache_store.rs` owns the combined ledger and capacity gate.
+
+The same combined accounting feeds `kv_snapshot`, in KV units: `active_kv`
+remains total committed attention KV (live checkpoints included), while `retained_prefix_kv` exposes its retained-cache
 component. The sampler keeps both values from the same throttle-window peak
 submit, so their difference is a valid non-prefix occupancy rather than a
 difference between unrelated maxima.
@@ -165,11 +186,12 @@ the summed context, derived from the same resident and promised ledgers
 
 Every prefix-capable KV worker also owns one sparse `PrefixCacheLogger`. It
 writes `prefix_cache_event` from mutation receipts returned by
-`kv/prefix_cache.rs`: admission-time ownership transfer (`activate`), exact
+`kv/shared/prefix_cache.rs`: admission-time ownership transfer (`activate`), exact
 victim removal and reason (`evict`), and completion/PD-ack return (`retain`). A
 worker-local sequence orders equal-time mutations, and entry/cache before/after
-counts make the stream replayable. The logger is an observer of the same
-`FullAttnKv`; it does not infer operations from `kv_snapshot` or maintain shadow
+counts make the stream replayable. An `activate` row's `full_hit_tokens` is the
+hit the entry would give if every position were resumable. The logger is an
+observer of the same `KvCacheStore`; it does not infer operations from `kv_snapshot` or maintain shadow
 residency.
 
 ## Admission axis
@@ -188,12 +210,13 @@ one stable head through `peek`/`pop`:
 `DecodeCompletion` is a sub-axis of the chunked-prefill lifecycle, not a second
 lifecycle: it owns only how far one resident decode moves per iteration.
 `SingleTokenDecodeCompletion` is the ordinary one-row-in/one-token-out engine.
-`SpeculativeDecodeCompletion` submits a fixed `draft_tokens + 1` verify window
-per resident request and retires the target's own token plus the leading run of
-accepted drafts, so its requests advance by different distances in the same
-iteration. Membership, capacity, and batch composition stay with the lifecycle;
-the query width it publishes is what sizes the mixed-iteration token budget and
-what the execution adapter lowers into the L4 input.
+`SpeculativeDecodeCompletion` submits a `draft_tokens + 1` verify window per
+resident request (clipped at `max_model_len`, below) and retires the target's
+own token plus the leading run of accepted drafts, so its requests advance by
+different distances in the same iteration. Membership, capacity, and batch
+composition stay with the lifecycle; the query width it publishes is what sizes
+the mixed-iteration token budget and what the execution adapter lowers into the
+L4 input.
 
 Its acceptance draw is keyed by `(seed, request, tokens already emitted, draft
 position)` rather than drawn from one stream, so a request accepts the same
@@ -229,11 +252,15 @@ Execution owns the model, reusable input buffer shape, and `CostBuffers`:
   constant because it selects a profiled kernel shape; how far a request actually
   advances after the verify belongs to the lifecycle's `DecodeCompletion`, not
   here.
-  The complete verify window must fit within `max_model_len`. A boundary batch
-  that requires fewer query rows fails explicitly; clipping only the context
-  would discard resident keys and invalidate necessary-work conservation.
-  vLLM can shorten these boundary batches, which this fixed-width model does
-  not yet represent.
+  At the context limit the width follows vLLM's scheduler: a request with
+  `resident` keys verifies `min(draft_tokens + 1, max_model_len - resident - 1)`
+  rows (`SpeculativeDecodeInput::verify_query_len`), so the position it samples
+  stays inside `max_model_len`. Its `kv_len` and `query_len` shrink together,
+  keeping necessary-work conservation, and `DecodeCompletion` retires no more
+  tokens than those rows. Arch models whose decode kernels take one uniform
+  width price that rare ragged row on their prefill (varlen) path, which is
+  also how vLLM leaves the uniform-decode graph. The mixed-iteration token
+  budget still reserves the full width for it.
 - `AttentionLayerExecutionAdapter` builds one slot's `AttnArchInput` and costs
   one attention layer.
 - `FfnSectionExecutionAdapter` splits token counts across FFN DP groups and
@@ -407,15 +434,19 @@ allocation/capacity/sampler/cost setup lives in a family-neutral or
 family-private essentials helper, while the recipe visibly selects its concrete
 KV, admission, execution, and shell. The whole-iteration helper
 (`workers/iter_build_essentials.rs`) takes plain model facts — GPUs per replica,
-attention shard count, KV bytes per token, cost manifest — instead of a model
+the resolved `KvAccounting`, partition count, cost manifest — instead of a model
 handle, so it names no L4 model trait and cannot select an execution adapter. It
-returns the `CostBuffers`; the recipe wraps them.
+returns the `CostBuffers`; the recipe wraps them. The same file holds the KV
+helpers every KV-owning recipe shares: `resolve_kv_accounting` (layout, attention
+shard count and worker options to `KvAccounting`), `kv_cache_store`, and
+`prefill_chunk_end_quantum`. PD decode sets its pull budget aside with
+`KvAccounting::reserving`; the pipeline head resolves the most constrained
+stage's layout (`pipeline_kv_cache_layout`).
 
 Deployments and pool controllers only call those recipes:
 
 - unified → `build_barebone_worker` / `build_hp_worker` /
-  `build_chunked_prefill_worker` / `build_speculative_worker` /
-  `build_qwen36_hybrid_worker` / `build_hybrid_chunked_prefill_worker`
+  `build_chunked_prefill_worker` / `build_speculative_worker`
 - PD → `build_pd_prefill_worker` / `build_pd_decode_worker`
 - AFD attention → `build_afd_attention_worker`
 - AFD FFN → `build_afd_ffn_worker`
@@ -431,13 +462,19 @@ shell-owned iteration plan expresses whether resident decode shares that
 iteration (`mix`) or waits behind a runnable prefill
 (`separate-prefill-priority`); KV membership is unchanged in both cases. It
 does not replay an observed DP rank or rewrite request shapes. An optional
-chunk-end quantum (`with_chunk_end_quantum`) ports vLLM's Mamba `align` split:
-non-final chunks end on recurrent-state checkpoint boundaries, and the budget
-a clipped chunk leaves may start further prompts. Only the hybrid recipes set
-it, from the arch's checkpoint interval, when prefix caching is on and the
-worker's `prefill_chunk_alignment` is `checkpoint` (the default, vLLM's
-behavior); `plain` gives `min(remaining, budget)` chunks. The unified hybrid
-recipe honours `dp_placement` like the full-attention one.
+chunk-end alignment (`with_chunk_end_alignment`) ports vLLM's Mamba `align`
+split: non-final chunks end on recurrent-state checkpoint boundaries, and the
+budget a clipped chunk leaves may start further prompts.
+`prefill_chunk_end_quantum` sets its block to the layout's engine block when
+the layout keeps a resumable per-request state, prefix caching is on, and
+`prefill_chunk_alignment` resolves to `checkpoint`; unset follows
+`kv_overhead` (`vllm` aligns, `none` does not), and `plain` gives
+`min(remaining, budget)` chunks. The `speculative` recipe applies the same
+block; when its arch's drafter prunes the last matching prefix block
+(`SpeculativeUnifiedModel::prunes_last_prefix_block`, vLLM's
+`use_eagle_block_drop` for MTP/EAGLE/DFlash), the prompt's last checkpoint, and
+therefore the stop no chunk may run past, sits one block earlier. Only that
+chunk-end stop reads the hook; prefix-hit lengths do not yet drop the block.
 
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;

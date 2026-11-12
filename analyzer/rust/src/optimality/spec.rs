@@ -1,4 +1,6 @@
-//! Hardware peaks from `gpu/spec.json` — the R5 "hardware limit" rung.
+//! Hardware peaks from `gpu/spec.json` — the R5 "hardware limit" rung — and the
+//! entry's measured `sustained` rates, the R4a "sustained limit" rung.
+//! [`DtypeClass`] also keys R4a's and R4b's measured GEMM rates.
 //!
 //! R5 divides each leaf's active throughput unit by the matching spec-sheet
 //! peak. Unlocked analysis reuses R3's grid regime; locked-batch analysis uses
@@ -29,6 +31,50 @@ pub(crate) struct GpuSpec {
     fp32_tflops: f64,
     int8_tops: f64,
     pub mem_bandwidth_gbps: f64,
+    /// Back-to-back GEMM TFLOP/s by [`DtypeClass`] (best dtype string of the
+    /// class) and large-copy GB/s, from the entry's `sustained` block (`0` =
+    /// not measured).
+    sustained_tflops_by_class: [f64; DtypeClass::COUNT],
+    pub sustained_copy_gbps: f64,
+}
+
+/// The tensor-core precision a dtype string runs at. R5 picks its spec-sheet
+/// peak by class, and the achievable rung its best measured GEMM by class, so
+/// `fp8_e4m3` and `mxfp8_e4m3` share one fp8 ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DtypeClass {
+    Fp4,
+    Fp8,
+    Int8,
+    Fp16,
+    Fp32,
+    /// bf16 / bfloat16 and anything unrecognized (the common default).
+    Bf16,
+}
+
+impl DtypeClass {
+    const COUNT: usize = 6;
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) fn of(dtype: &str) -> Self {
+        let d = dtype.to_ascii_lowercase();
+        if d.contains("fp4") || d.contains("e2m1") {
+            Self::Fp4
+        } else if d.contains("fp8") || d.contains("e4m3") || d.contains("e5m2") {
+            Self::Fp8
+        } else if d.contains("int8") {
+            Self::Int8
+        } else if d.contains("fp16") || d.contains("half") {
+            Self::Fp16
+        } else if d.contains("fp32") || d.contains("float32") || d.contains("tf32") {
+            Self::Fp32
+        } else {
+            Self::Bf16
+        }
+    }
 }
 
 impl GpuSpec {
@@ -37,21 +83,24 @@ impl GpuSpec {
     /// to `0.0` — meaning "no hardware ceiling, R5 leaf degrades to R4" — when the
     /// matched spec entry lacks that field (e.g. an fp8 kernel on a pre-fp8 GPU).
     pub fn peak_tflops(&self, dtype: &str) -> f64 {
-        let d = dtype.to_ascii_lowercase();
-        if d.contains("fp4") || d.contains("e2m1") {
-            self.fp4_tflops
-        } else if d.contains("fp8") || d.contains("e4m3") || d.contains("e5m2") {
-            self.fp8_tflops
-        } else if d.contains("int8") {
-            self.int8_tops
-        } else if d.contains("fp16") || d.contains("half") {
-            self.fp16_tflops
-        } else if d.contains("fp32") || d.contains("float32") || d.contains("tf32") {
-            self.fp32_tflops
-        } else {
-            // bf16 / bfloat16 / anything else → bf16 peak.
-            self.bf16_tflops
+        match DtypeClass::of(dtype) {
+            DtypeClass::Fp4 => self.fp4_tflops,
+            DtypeClass::Fp8 => self.fp8_tflops,
+            DtypeClass::Int8 => self.int8_tops,
+            DtypeClass::Fp16 => self.fp16_tflops,
+            DtypeClass::Fp32 => self.fp32_tflops,
+            DtypeClass::Bf16 => self.bf16_tflops,
         }
+    }
+
+    /// Whether the entry carries any `sustained` measurement.
+    pub fn has_sustained(&self) -> bool {
+        self.sustained_copy_gbps > 0.0 || self.sustained_tflops_by_class.iter().any(|&t| t > 0.0)
+    }
+
+    /// Measured back-to-back GEMM TFLOP/s for `dtype`'s class; `0.0` = none.
+    pub fn sustained_tflops(&self, dtype: &str) -> f64 {
+        self.sustained_tflops_by_class[DtypeClass::of(dtype).index()]
     }
 }
 
@@ -75,6 +124,11 @@ impl GpuSpec {
 /// hardware-gap bucket) with a logged caveat pointing at the missing alias.
 pub(crate) fn load_gpu_spec(repo_root: &Path, gpu_name: &str) -> Option<(String, GpuSpec)> {
     let resolved = resolve_gpu(repo_root, gpu_name)?;
+    let mut sustained_tflops_by_class = [0.0f64; DtypeClass::COUNT];
+    for (dtype, tflops) in &resolved.sustained_tflops {
+        let best = &mut sustained_tflops_by_class[DtypeClass::of(dtype).index()];
+        *best = (*best).max(*tflops);
+    }
     let spec = GpuSpec {
         fp4_tflops: resolved.fp4_tflops.unwrap_or(0.0),
         fp8_tflops: resolved.fp8_tflops.unwrap_or(0.0),
@@ -83,6 +137,8 @@ pub(crate) fn load_gpu_spec(repo_root: &Path, gpu_name: &str) -> Option<(String,
         fp32_tflops: resolved.fp32_tflops.unwrap_or(0.0),
         int8_tops: resolved.int8_tops.unwrap_or(0.0),
         mem_bandwidth_gbps: resolved.mem_bandwidth_gbps.unwrap_or(0.0),
+        sustained_tflops_by_class,
+        sustained_copy_gbps: resolved.sustained_copy_gbps.unwrap_or(0.0),
     };
     Some((resolved.canonical_name, spec))
 }
@@ -109,6 +165,29 @@ mod tests {
         // A bare "H200" is an alias too; an unknown name does not resolve.
         assert!(load_gpu_spec(repo, "H200").is_some());
         assert!(load_gpu_spec(repo, "Totally Made Up GPU").is_none());
+    }
+
+    #[test]
+    fn sustained_rates_are_keyed_by_dtype_class() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("gpu")).unwrap();
+        std::fs::write(
+            repo.path().join("gpu/spec.json"),
+            r#"{"gpus": [{"name": "X", "bf16_tflops": 2250, "mem_bandwidth_gbps": 8000,
+                "sustained": {"tflops": {"bf16": 1372, "fp8_e4m3": 2497, "mxfp8_e4m3": 2400},
+                              "copy_gbps": 6500}},
+                         {"name": "Y", "bf16_tflops": 990}]}"#,
+        )
+        .unwrap();
+        let (_, spec) = load_gpu_spec(repo.path(), "X").unwrap();
+        assert!(spec.has_sustained());
+        assert_eq!(spec.sustained_tflops("bfloat16"), 1372.0);
+        // Both fp8 strings share one class; the class keeps its best.
+        assert_eq!(spec.sustained_tflops("mxfp8_e4m3"), 2497.0);
+        assert_eq!(spec.sustained_tflops("nvfp4_e2m1"), 0.0);
+        assert_eq!(spec.sustained_copy_gbps, 6500.0);
+        let (_, unmeasured) = load_gpu_spec(repo.path(), "Y").unwrap();
+        assert!(!unmeasured.has_sustained());
     }
 
     #[test]

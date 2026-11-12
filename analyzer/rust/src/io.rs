@@ -219,8 +219,10 @@ fn worker_pools_from_run_meta(json: &serde_json::Value) -> Option<Vec<(String, u
     (!worker_pool_rows.is_empty()).then_some(worker_pool_rows)
 }
 
-/// Per-worker × group KV-pool token capacities from `run_meta.json`'s `workers[]`
-/// (v3+), as `(pool_tag, worker_id, group_id, capacity_tokens)`. This is the static
+/// Per-worker × group KV-pool capacities from `run_meta.json`'s `workers[]`
+/// (v3+), as `(pool_tag, worker_id, group_id, capacity)`, in the KV units the
+/// `kv_snapshot` series counts: `capacity_units` from v6, `capacity_tokens`
+/// before (those runs counted tokens). This is the static
 /// denominator the `kv-occupancy` subject divides the `kv_snapshot` series by; the
 /// `pool_tag` matches the snapshot rows' key exactly (worker_id alone collides
 /// across pools). Read as bare JSON (no `simulator` dep), like [`read_worker_pools`].
@@ -246,7 +248,8 @@ pub fn read_kv_capacities(log_dir: &Path) -> Option<Vec<(String, u64, u64, u64)>
         for p in pools {
             let group_id = p.get("group_id").and_then(|v| v.as_u64()).unwrap_or(0);
             let capacity = p
-                .get("capacity_tokens")
+                .get("capacity_units")
+                .or_else(|| p.get("capacity_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             out.push((tag.to_owned(), worker_id, group_id, capacity));

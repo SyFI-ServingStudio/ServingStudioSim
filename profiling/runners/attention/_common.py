@@ -46,11 +46,6 @@ def to_torch_dtype(dt: DType | str) -> Any:
     return dt.torch()
 
 
-def flashinfer_backend_name(backend: str) -> str:
-    """ServingStudioSim backend string -> FlashInfer wrapper ``backend`` kwarg."""
-    return "trtllm-gen" if backend == "trt" else backend
-
-
 def is_fp8(dt: DType | str) -> bool:
     return DType.from_value(dt) in (DType.FP8_E4M3, DType.FP8_E5M2)
 

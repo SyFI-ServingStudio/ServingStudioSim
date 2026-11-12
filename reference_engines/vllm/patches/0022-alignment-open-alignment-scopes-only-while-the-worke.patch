@@ -1,0 +1,137 @@
+From 7ad62d02b7535444426e9cb0018137ac7bfe5e7d Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Wed, 11 Nov 2026 10:27:24 -0800
+Subject: [PATCH] alignment: open alignment scopes only while the worker's CUDA
+ profiler runs
+
+Each alignment scope name carries its iteration, so every scope registers a new
+NVTX string. After an nsys capture range ends, that registration can block for
+good while holding the GIL: in a DP4 capture two workers sat in it in
+sample_tokens while the other ranks waited in the next DP all-reduce, and every
+EngineCore timed out after 300 s. Outside a profiler-bounded capture nothing is
+recorded anyway, so a worker with a CUDA profiler gates the scopes on it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/v1/worker/test_alignment_trace.py | 22 +++++++++++++++++++++
+ vllm/v1/worker/alignment_trace.py       | 26 +++++++++++++++++++++++--
+ vllm/v1/worker/gpu_worker.py            | 11 ++++++++++-
+ 3 files changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/worker/test_alignment_trace.py b/tests/v1/worker/test_alignment_trace.py
+index 9d2b8fbbd0..f21df77ed0 100644
+--- a/tests/v1/worker/test_alignment_trace.py
++++ b/tests/v1/worker/test_alignment_trace.py
+@@ -16,6 +16,7 @@ from vllm.v1.worker.alignment_trace import (
+     build_token_input_row,
+     grouped_gemm_block_stats,
+     parse_iterations,
++    set_alignment_scope_gate,
+     should_trace_token_iteration,
+ )
+ 
+@@ -45,6 +46,27 @@ def test_alignment_phase_skips_warmup_and_closes_on_failure(monkeypatch):
+     ]
+ 
+ 
++def test_alignment_phase_opens_only_while_the_gate_is_open(monkeypatch):
++    names = []
++    monkeypatch.setattr(
++        "vllm.v1.utils.record_function_or_nullcontext",
++        lambda name: names.append(name) or __import__("contextlib").nullcontext(),
++    )
++    running = False
++    set_alignment_scope_gate(lambda: running)
++    try:
++        with alignment_phase(3, "forward"):
++            pass
++        running = True
++        with alignment_phase(4, "forward"):
++            pass
++    finally:
++        set_alignment_scope_gate(None)
++    with alignment_phase(5, "forward"):
++        pass
++    assert names == ["vllm_iteration(4): forward", "vllm_iteration(5): forward"]
++
++
+ def test_token_spans_follow_the_scheduled_counts_not_equal_shares():
+     row = build_token_input_row(
+         iteration_index=7,
+diff --git a/vllm/v1/worker/alignment_trace.py b/vllm/v1/worker/alignment_trace.py
+index 7a08e1c6f6..5d973cae86 100644
+--- a/vllm/v1/worker/alignment_trace.py
++++ b/vllm/v1/worker/alignment_trace.py
+@@ -24,6 +24,7 @@ import json
+ import math
+ import os
+ import time
++from collections.abc import Callable
+ from contextlib import nullcontext
+ from pathlib import Path
+ from typing import Any
+@@ -374,9 +375,30 @@ def dump_routing_summary(
+         _append_jsonl(trace_path, row)
+ 
+ 
++#: Whether this process may open alignment scopes now. A worker whose CUDA
++#: profiler bounds the nsys capture installs one that is true only while that
++#: profiler runs; None means no bound, so scopes are always open.
++_scope_gate: Callable[[], bool] | None = None
++
++
++def set_alignment_scope_gate(gate: Callable[[], bool] | None) -> None:
++    """Install the process's alignment-scope gate (see `_scope_gate`)."""
++
++    global _scope_gate
++    _scope_gate = gate
++
++
+ def alignment_phase(iteration_index: int | None, phase: str):
+-    """Use indexed scopes for real dispatches only; warmup has no iteration."""
+-    if iteration_index is None:
++    """Use indexed scopes for real dispatches only; warmup has no iteration.
++
++    Every scope name is new (it carries the iteration), so each one registers a
++    string with the NVTX injection. Once an nsys capture range has ended, that
++    registration can block for good while holding the GIL, as seen in DP4: two
++    workers sat in it while the other ranks waited in the next DP all-reduce.
++    Outside a profiler-bounded capture nothing would be recorded anyway, so
++    the gate closes the scopes there.
++    """
++    if iteration_index is None or (_scope_gate is not None and not _scope_gate()):
+         return nullcontext()
+     from vllm.v1.utils import record_function_or_nullcontext
+ 
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 7e05771df3..0a28254bfa 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -111,7 +111,10 @@ from vllm.v1.outputs import (
+     ModelRunnerOutput,
+ )
+ from vllm.v1.utils import compute_iteration_details, report_usage_stats
+-from vllm.v1.worker.alignment_trace import is_routing_trace_enabled
++from vllm.v1.worker.alignment_trace import (
++    is_routing_trace_enabled,
++    set_alignment_scope_gate,
++)
+ from vllm.v1.worker.extensible_kv_cache import (
+     extend_kv_cache,
+     kv_cache_lent_for_weight_update,
+@@ -273,6 +276,12 @@ class Worker(WorkerBase):
+         self.profiler: Any | None = None
+         self.profiler_config = vllm_config.profiler_config
+         validate_worker_profiler_config(self.profiler_config)
++        if self.profiler_config is not None and self.profiler_config.profiler == "cuda":
++            # The CUDA profiler bounds the nsys capture: alignment scopes only
++            # inside it (see `alignment_phase`).
++            set_alignment_scope_gate(
++                lambda: self.profiler is not None and self.profiler.is_running
++            )
+ 
+         # Device handles of the previous step's PP intermediate-tensor send.
+         self._pp_send_work: list[Handle] = []
+-- 
+2.43.0
+

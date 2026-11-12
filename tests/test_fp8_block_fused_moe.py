@@ -6,15 +6,13 @@ import pytest
 import torch
 
 from profiling.runners.moe.exact_topk import exact_topk_ids
-from profiling.runners.moe.fp8_block_fused_moe import (
-    _logical_bytes,
-    _validate_args,
-    forced_routing_logits,
-)
+from profiling.runners.moe.fp8_block_fused_moe import _logical_bytes, _validate_args
 from profiling.runners.moe.fp8_block_fused_moe_reference import (
     deepseek_v3_routing,
     fp8_block_fused_moe_reference,
+    renormalize_naive_routing,
 )
+from profiling.runners.moe.routing_methods import forced_routing_logits
 
 
 def _spec(**overrides: object) -> dict:
@@ -64,10 +62,36 @@ def test_forced_logits_make_deepseek_v3_routing_realize_the_histogram() -> None:
     torch.testing.assert_close(weights.sum(dim=-1), torch.full((16,), 2.5))
 
 
+def test_forced_bf16_logits_make_renormalize_naive_routing_realize_the_histogram() -> None:
+    """Softmax routing over the BF16 logits vLLM passes for an unbiased router
+    must pick the row's experts, with weights renormalized to one."""
+    spec = _validate_args(
+        **_spec(routing_method="renormalize_naive", n_group=0, topk_group=0)
+    )
+    ids = exact_topk_ids(
+        num_tokens=spec["num_tokens"], top_k=8, per_expert_batches=spec["per_expert_batches"]
+    )
+    logits = forced_routing_logits(torch, ids, 288, "cpu", torch.bfloat16)
+
+    chosen, weights = renormalize_naive_routing(torch, logits, top_k=8)
+
+    counts = torch.bincount(chosen.flatten(), minlength=288).tolist()
+    assert counts == list(spec["per_expert_batches"])
+    torch.testing.assert_close(weights.sum(dim=-1), torch.ones(16))
+
+
+def test_forced_logits_refuse_more_experts_than_stay_distinct() -> None:
+    """Past 32 selected experts the stepped logits reach the unselected value,
+    so top-k could pick an unselected expert instead."""
+    with pytest.raises(ValueError, match="top_k <= 32"):
+        forced_routing_logits(torch, [list(range(33))], 64, "cpu")
+
+
 @pytest.mark.parametrize(
     ("override", "message"),
     [
         ({"n_group": 8, "topk_group": 4}, "ungrouped"),
+        ({"routing_method": "renormalize_naive"}, "n_group=topk_group=0"),
         ({"weight_format": "nvfp4_e2m1", "group_size": 16}, "fp8_e4m3"),
         ({"routing_method": "minimax2"}, "routing method"),
         ({"input_dtype": "fp16"}, "BF16"),
@@ -123,6 +147,7 @@ def test_reference_applies_clamp_routed_scale_and_ep_slice() -> None:
         w13_scale=w13_scale,
         w2=w2,
         w2_scale=w2_scale,
+        routing_method="deepseek_v3",
         routing_logits=logits,
         routing_bias=torch.zeros(2),
         top_k=2,

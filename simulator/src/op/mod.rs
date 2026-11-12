@@ -12,6 +12,7 @@ pub mod comm;
 pub mod gemm;
 pub mod mhc;
 pub mod moe;
+pub mod spec;
 pub mod ssm;
 
 use std::sync::Arc;

@@ -10,6 +10,7 @@ nothing, as on one EP rank.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 MX_BLOCK = 32
@@ -57,6 +58,43 @@ def clamped_swiglu(torch: Any, gate: Any, up: Any, limit: float | None) -> Any:
     return torch.nn.functional.silu(gate) * up
 
 
+def mxfp4_routed_experts(
+    torch: Any,
+    *,
+    x: Any,
+    w13: Any,
+    w13_scale: Any,
+    w2: Any,
+    w2_scale: Any,
+    topk_ids: Any,
+    topk_weights: Any,
+    local_offset: int,
+    num_local: int,
+    clamp_limit: float | None,
+    round_intermediate: Callable[[Any], Any] | None,
+) -> Any:
+    """FP32 ``[T, H]`` of one EP rank's MXFP4 experts over FP32 activations ``x``.
+
+    ``round_intermediate`` models the storage of the SwiGLU output that GEMM2
+    reads (an MXFP8 or BF16 round-trip), or ``None`` to keep it in FP32.
+    """
+
+    out = torch.zeros_like(x)
+    intermediate = w13.shape[1] // 2
+    for local in range(num_local):
+        rows, slots = torch.nonzero(topk_ids == local_offset + local, as_tuple=True)
+        if rows.numel() == 0:
+            continue
+        w13_f = dequantize_mxfp4(torch, w13[local], w13_scale[local])
+        h = x[rows] @ w13_f.t()
+        act = clamped_swiglu(torch, h[:, :intermediate], h[:, intermediate:], clamp_limit)
+        if round_intermediate is not None:
+            act = round_intermediate(act)
+        y = act @ dequantize_mxfp4(torch, w2[local], w2_scale[local]).t()
+        out.index_add_(0, rows, y * topk_weights[rows, slots].float().unsqueeze(-1))
+    return out
+
+
 def mxfp4_fused_moe_reference(
     torch: Any,
     *,
@@ -73,23 +111,24 @@ def mxfp4_fused_moe_reference(
     clamp_limit: float | None,
     requantize_intermediate: bool,
 ) -> Any:
-    """FP32 output ``[T, H]`` of one EP rank's routed experts."""
+    """FP32 output ``[T, H]`` of one EP rank's routed experts on MXFP8 input."""
 
-    x = dequantize_mxfp8(torch, hidden, hidden_scale)
-    out = torch.zeros_like(x)
-    intermediate = w13.shape[1] // 2
-    for local in range(num_local):
-        rows, slots = torch.nonzero(topk_ids == local_offset + local, as_tuple=True)
-        if rows.numel() == 0:
-            continue
-        w13_f = dequantize_mxfp4(torch, w13[local], w13_scale[local])
-        h = x[rows] @ w13_f.t()
-        act = clamped_swiglu(torch, h[:, :intermediate], h[:, intermediate:], clamp_limit)
-        if requantize_intermediate:
-            act = quantize_dequantize_mxfp8(torch, act)
-        y = act @ dequantize_mxfp4(torch, w2[local], w2_scale[local]).t()
-        out.index_add_(0, rows, y * topk_weights[rows, slots].float().unsqueeze(-1))
-    return out
+    return mxfp4_routed_experts(
+        torch,
+        x=dequantize_mxfp8(torch, hidden, hidden_scale),
+        w13=w13,
+        w13_scale=w13_scale,
+        w2=w2,
+        w2_scale=w2_scale,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        local_offset=local_offset,
+        num_local=num_local,
+        clamp_limit=clamp_limit,
+        round_intermediate=(
+            (lambda act: quantize_dequantize_mxfp8(torch, act)) if requantize_intermediate else None
+        ),
+    )
 
 
 __all__ = [
@@ -97,5 +136,6 @@ __all__ = [
     "dequantize_mxfp4",
     "dequantize_mxfp8",
     "mxfp4_fused_moe_reference",
+    "mxfp4_routed_experts",
     "quantize_dequantize_mxfp8",
 ]

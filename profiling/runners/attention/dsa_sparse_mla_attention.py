@@ -50,6 +50,7 @@ _TRTLLM_FP8_CACHE_LAYOUT = "hnd_paged_mqa_fp8_latent_rope"
 _TRTLLM_KERNEL_NAME = "fmhaSm100"
 _TRTLLM_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TRTLLM_PAGE_SIZE = 64
+_TRTLLM_FP8_SEED = 0
 # GLM-5.3-Flash's rope-free MLA (rope_dim 0; FlashInfer >= 0.6.18
 # `nope_mla_dimensions`, 512-byte latent-only cache rows). Its page table is
 # `selected_k` wide (2048, or vLLM's kpool buffer 2176); FlashInfer only checks
@@ -785,6 +786,11 @@ def profile_dsa_sparse_mla_attention_torch(
     )
 
 
+def _standard_normal_fp8(torch: Any, shape: tuple[int, ...], generator: Any, device: Any) -> Any:
+    values = torch.randn(shape, generator=generator, dtype=torch.bfloat16, device=device)
+    return values.to(torch.float8_e4m3fn)
+
+
 def _build_trtllm_fp8_operands(
     torch: Any,
     validated: _ValidatedArgs,
@@ -794,26 +800,20 @@ def _build_trtllm_fp8_operands(
     selected_k: int,
     device: Any,
 ) -> _TrtllmFp8Operands:
-    fp8 = torch.float8_e4m3fn
     score_dim = _LATENT_DIM + rope_dim
-    query = torch.empty(
-        (validated.num_queries, 1, num_heads, score_dim),
-        dtype=fp8,
-        device=device,
+    # Seeded standard-normal latents, cast to FP8 at scale 1 as vLLM's FP8 MLA
+    # cache stores them (k_scale 1.0): the RMS-normed latent and the absorbed
+    # query are unit-scale. Values do not change the work, but they set the
+    # power draw: a linspace row broadcast to every token and head ran 14% faster
+    # than this on B200.
+    generator = torch.Generator(device=device).manual_seed(_TRTLLM_FP8_SEED)
+    query = _standard_normal_fp8(
+        torch, (validated.num_queries, 1, num_heads, score_dim), generator, device
     )
-    query.copy_(
-        torch.linspace(-0.75, 0.75, score_dim, device=device)
-        .view(1, 1, 1, score_dim)
-        .expand_as(query)
-    )
-
     num_pages = math.ceil(validated.num_cache_tokens / _TRTLLM_PAGE_SIZE)
-    cache = torch.empty(
-        (num_pages, 1, _TRTLLM_PAGE_SIZE, score_dim),
-        dtype=fp8,
-        device=device,
+    cache = _standard_normal_fp8(
+        torch, (num_pages, 1, _TRTLLM_PAGE_SIZE, score_dim), generator, device
     )
-    cache.copy_(torch.linspace(-0.5, 0.5, score_dim, device=device).view(1, 1, 1, score_dim))
 
     block_tables = torch.zeros(
         (validated.num_queries, 1, selected_k),

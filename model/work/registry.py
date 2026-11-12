@@ -14,7 +14,18 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .core import Model
-from .models import deepseek_v41, glm52, glm53_flash, llama3, qwen3_6, qwen3_6_moe, qwen3_moe
+from .models import (
+    deepseek_v41,
+    glm52,
+    glm53_flash,
+    inkling,
+    llama3,
+    mimo_v2,
+    qwen3_6,
+    qwen3_6_moe,
+    qwen3_moe,
+    qwen4_exp,
+)
 
 # architecture string -> builder. Add a row when you add a model file.
 REGISTRY: dict[str, Callable[[dict], Model]] = {
@@ -27,6 +38,15 @@ REGISTRY: dict[str, Callable[[dict], Model]] = {
     # GLM-5.3-Flash: KDA/DSA hybrid over an mHC residual; text decoder only.
     "Glm5NextForConditionalGeneration": glm53_flash.build,
     "DeepseekV41ForCausalLM": deepseek_v41.build,
+    # Inkling (Small and large): relative-position SWA/global attention, short
+    # convolutions, sink-expert MoE; text decoder only.
+    "InklingForConditionalGeneration": inkling.build,
+    # MiMo-V2 (Flash): GA/SWA hybrid with asymmetric QK/V heads and SWA sinks, dense
+    # layer 0 then MXFP4 MoE; text decoder only.
+    "MiMoV2ForCausalLM": mimo_v2.build,
+    # Qwen3.8-Flash-Next: GDN/QSA hybrid over gated hyper-connections, per-layer
+    # n-gram embedding, MoE with a gated shared expert, one MTP layer; text only.
+    "Qwen4ExpForConditionalGeneration": qwen4_exp.build,
 }
 
 

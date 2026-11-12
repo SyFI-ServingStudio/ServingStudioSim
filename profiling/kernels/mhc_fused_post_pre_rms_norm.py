@@ -109,7 +109,7 @@ register(
             compute=frozenset({DType.BF16}),
             sm_targets=frozenset({"sm_100f"}),
         ),
-        subprocess_env="vllm_upstream_fork_env",
+        subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
                 "One DeepGEMM mega_mhc launch (shifted post, TF32 pre GEMM, "
@@ -139,7 +139,7 @@ register(
             compute=frozenset({DType.BF16}),
             sm_targets=frozenset({"sm_100f"}),
         ),
-        subprocess_env="vllm_upstream_fork_env",
+        subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
                 "One DeepGEMM mega_mhc launch without the shifted collapse (post, "

@@ -5,6 +5,7 @@
 //!   - `run <config>`              — run one sim
 //!   - `build-cache-only <config>` — prebuild profile.db, no sim
 //!   - `dry-run <config>`          — report missing profile.db rows, no sim
+//!   - `kv-cache <config>`         — each KV pool's capacity breakdown, no sim
 //!   - `emit-backends <config>`    — enumerate distinct kernels (JSON), no sim
 //!   - `list-params`               — emit the param-schema registry JSON
 //!   - `kernel-list`               — every kernel kind's config / sweep fields
@@ -31,7 +32,9 @@ use simulator::sim::{
     run_sim, trace_formats, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema,
     LoadedTrace, TickCfg, TraceFrontend, TraceTag,
 };
-use simulator::timing::bridge::{dry_run_document, print_dry_run, write_dry_run_report};
+use simulator::timing::bridge::{
+    dry_run_document, fill_missing_profiles, print_dry_run, write_dry_run_report,
+};
 use simulator::timing::PerfApiBridge;
 use simulator::timing_predict::PredictMode;
 
@@ -67,6 +70,12 @@ enum Cmd {
     /// Report how many kernel specs are missing from profile.db (the JIT work a
     /// cache build would do), per kernel, then exit without building or running.
     DryRun(DryRunArgs),
+    /// Print each KV pool's capacity breakdown — the declared layout, the
+    /// resolved options, what each part is charged, and the concurrency at
+    /// `max_model_len` under both `kv_overhead` modes — then exit without
+    /// simulating. Builds the flow structure only (no Python, profile.db or
+    /// GPU), with its logs redirected so the config's `log_dir` is untouched.
+    KvCache(KvCacheArgs),
     /// Print the deployment schema JSON consumed by the launcher (§1.2.7).
     ListParams,
     /// Enumerate the distinct kernels this config touches — one JSON record per
@@ -86,8 +95,9 @@ enum Cmd {
     /// kernel registry only (no config, GPU or profile.db).
     KernelList,
     /// Build each given arch block on its GPU, iter-wise or layer-wise, and
-    /// print each one's cost tree (the `cost_manifest` form) as JSON. Structure
-    /// only: no run config, Python perf_api, profile.db or GPU.
+    /// print each one's cost tree (the `cost_manifest` form) and, when it holds
+    /// attention, its KV cache layout (`kv_cache`) as JSON. Structure only: no
+    /// run config, Python perf_api, profile.db or GPU.
     CostTrees(CostTreeArgs),
     /// Predict per-building-block timing offline for a batch of explicit batch
     /// shapes — NO sim/scheduler/trace. Reads a minimal config (one arch selector
@@ -156,9 +166,19 @@ struct DryRunArgs {
     /// "kernels": [{name, kind, missing, total}], "missing", "total",
     /// "pools": [{role, max_model_len, draft_tokens}]}`, one `pools` entry per
     /// request-serving pool group (`deployment::pool_bounds`; `draft_tokens`
-    /// is null for a non-speculative worker).
+    /// is null for a non-speculative worker), and "kv_cache", the run's
+    /// `raw/kv_cache.json` document.
     #[arg(long, value_name = "FILE")]
     report_json: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct KvCacheArgs {
+    #[command(flatten)]
+    run: RunArgs,
+    /// Print the `raw/kv_cache.json` document instead of text.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Shared payload for `run` / `build-cache-only` / `dry-run` / `emit-backends`: a path to one
@@ -275,6 +295,7 @@ fn dispatch(cmd: Cmd) -> Result<()> {
         Cmd::BuildCacheOnly(args) => cmd_build_cache(&args.config),
         Cmd::DryRun(args) => cmd_dry_run(&args.run.config, args.report_json.as_deref()),
         Cmd::EmitBackends(args) => cmd_emit_backends(&args.config),
+        Cmd::KvCache(args) => cmd_kv_cache(&args.run.config, args.json),
         Cmd::ListParams => {
             // serde_json::Value serializes infallibly; pretty for `list-params`.
             println!(
@@ -363,6 +384,7 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // Run-level GPU facts sidecar (L7): written before the tick loop so the
     // analyzer can normalize per-GPU even if the run later fails.
     simulator::log::write_run_meta(log_dir, &flow.cluster().borrow(), cfg.stage_vocab())?;
+    simulator::log::write_kv_cache(log_dir, &flow.cluster().borrow())?;
     let summary = run_sim(flow.as_mut(), &store, &mut frontend, &mut logger, &tick_cfg)?;
     // run_sim emits the stats summary (completed/throughput/wall) to the log;
     // persist the structured form as `<log_dir>/summary.json` for regression
@@ -401,36 +423,15 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
 /// The collect walk is the bridge's dry-run mode, which calls only
 /// `count_missing` and never fits, so no kernel time is needed to discover what
 /// is missing. JIT stays off throughout: nothing is profiled on demand, and
-/// `issue_collected` does all the measuring.
+/// `issue_collected` does all the measuring. The walk-then-issue sequence is
+/// [`fill_missing_profiles`], shared with `timing-predict`.
 fn cmd_build_cache(config: &Path) -> anyhow::Result<()> {
     let cfg = load_config(config)?;
-    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
-    bridge.enable_dry_run();
-    bridge
-        .begin_collect()
-        .context("starting the profiling collect pass")?;
-    let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
-    let flow = build_flow(&cfg, &bridge, store)?;
-    drop(flow);
-
-    // The plan is worth printing before spending GPU time on it: this is the
-    // point at which a grid that quietly grew by an order of magnitude is still
-    // cheap to notice.
-    let report = bridge.take_dry_run_report();
-    let total_missing: usize = report.iter().map(|k| k.missing).sum();
-    let total_specs: usize = report.iter().map(|k| k.total).sum();
-    println!(
-        "cache build plan: {} kernels, {total_missing} / {total_specs} specs missing",
-        report.len()
-    );
-    for k in report.iter().filter(|k| k.missing > 0) {
-        println!("{k}");
-    }
-    // Called even at zero: it clears the collector and reports the no-op, and
-    // an early return here would leave the collector installed.
-    bridge
-        .issue_collected(total_missing)
-        .context("measuring the collected profiling work")?;
+    fill_missing_profiles(|bridge| {
+        let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+        drop(build_flow(&cfg, bridge, store)?);
+        Ok(())
+    })?;
     tracing::info!("cache build complete: profile.db populated");
     Ok(())
 }
@@ -445,7 +446,7 @@ fn cmd_dry_run(config: &Path, report_json: Option<&Path>) -> anyhow::Result<()> 
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     bridge.enable_dry_run();
     let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
-    let _flow = build_flow(&cfg, &bridge, store)?;
+    let flow = build_flow(&cfg, &bridge, store)?;
 
     let report = bridge.take_dry_run_report();
     println!("dry run: {} kernels", report.len());
@@ -453,7 +454,42 @@ fn cmd_dry_run(config: &Path, report_json: Option<&Path>) -> anyhow::Result<()> 
     if let Some(path) = report_json {
         let mut document = dry_run_document(&report);
         document["pools"] = serde_json::to_value(pool_bounds(&cfg)?)?;
+        document["kv_cache"] = simulator::log::kv_cache_document(&flow.cluster().borrow());
         write_dry_run_report(path, &document)?;
+    }
+    Ok(())
+}
+
+/// `kv-cache` — build the flow structure only (no Python, `profile.db` or GPU)
+/// and print every KV pool's report (`raw/kv_cache.json`'s document with
+/// `--json`). Workers open their
+/// log streams at construction, which clears an earlier run's files, so the
+/// build logs into a scratch directory under `TMPDIR` instead of `log_dir`.
+fn cmd_kv_cache(config: &Path, json: bool) -> anyhow::Result<()> {
+    let mut cfg = load_config(config)?;
+    let scratch = std::env::temp_dir().join(format!("simulator-kv-cache-{}", std::process::id()));
+    cfg.io_mut().log_dir = scratch.clone();
+    // KV capacity needs the layout and the worker options, never a kernel time:
+    // build structure only, with no Python, profile.db or GPU.
+    let bridge = PerfApiBridge::structure_only();
+    let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+    let printed = build_flow(&cfg, &bridge, store).map(|flow| {
+        let cluster = flow.cluster().borrow();
+        if json {
+            serde_json::to_string_pretty(&simulator::log::kv_cache_document(&cluster))
+                .expect("kv_cache document serializes")
+        } else {
+            simulator::log::kv_cache_text(&cluster)
+        }
+    });
+    if let Err(error) = std::fs::remove_dir_all(&scratch) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("removing {}: {error}", scratch.display());
+        }
+    }
+    print!("{}", printed?);
+    if json {
+        println!();
     }
     Ok(())
 }

@@ -31,16 +31,22 @@ use crate::worker::shared::advance_scope::PartitionId;
 
 pub(crate) struct RequestLedger {
     /// Reserved-but-not-yet-resident footprints, as `(partition, charge)`,
-    /// with the sequence number each was promised at.
-    promised: HashMap<RequestId, (PartitionId, u64, u64)>,
+    /// with the sequence number each was promised at and the context tokens
+    /// the charge covers.
+    promised: HashMap<RequestId, (PartitionId, u64, u64, u64)>,
     /// The sequence number the next promise gets.
     next_promise: u64,
-    /// Full-footprint reservations held across partial-prefill iterations.
-    chunked_prefill: HashMap<RequestId, (PartitionId, u64)>,
+    /// Full-footprint reservations held across partial-prefill iterations, as
+    /// `(partition, charge, context tokens)`.
+    chunked_prefill: HashMap<RequestId, (PartitionId, u64, u64)>,
     /// Charge and count of `promised` plus `chunked_prefill`, per partition.
     reserved_by_partition: Vec<(u64, u32)>,
-    /// Prefilled KV awaiting a decode-side pull acknowledgement.
-    held: HashMap<RequestId, (PartitionId, u64)>,
+    /// Context tokens of `promised` plus `chunked_prefill`, per partition: what
+    /// a host tier holds for them.
+    reserved_context_by_partition: Vec<u64>,
+    /// Prefilled KV awaiting a decode-side pull acknowledgement, as
+    /// `(partition, units, context tokens)`.
+    held: HashMap<RequestId, (PartitionId, u64, u64)>,
     held_by_partition: Vec<u64>,
     /// Sticky placement. Outlives `promised`; cleared on release.
     placement: HashMap<RequestId, PartitionId>,
@@ -56,6 +62,7 @@ impl RequestLedger {
             next_promise: 0,
             chunked_prefill: HashMap::new(),
             reserved_by_partition: vec![(0, 0); num_partitions],
+            reserved_context_by_partition: vec![0; num_partitions],
             held: HashMap::new(),
             held_by_partition: vec![0; num_partitions],
             placement: HashMap::new(),
@@ -85,21 +92,31 @@ impl RequestLedger {
 
     // ── promised ─────────────────────────────────────────────────────────────
 
-    pub(crate) fn promise(&mut self, request: RequestId, partition: PartitionId, charge: u64) {
-        if let Some((previous_partition, previous_charge, _)) = self
-            .promised
-            .insert(request, (partition, charge, self.next_promise))
+    /// Promise `charge` units on `partition` for a footprint that covers
+    /// `context_tokens` of context.
+    pub(crate) fn promise(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        charge: u64,
+        context_tokens: u64,
+    ) {
+        if let Some((previous_partition, previous_charge, _, previous_context)) =
+            self.promised.insert(
+                request,
+                (partition, charge, self.next_promise, context_tokens),
+            )
         {
-            self.remove_reserved(previous_partition, previous_charge);
+            self.remove_reserved(previous_partition, previous_charge, previous_context);
         }
-        self.add_reserved(partition, charge);
+        self.add_reserved(partition, charge, context_tokens);
         self.next_promise += 1;
         self.placement.insert(request, partition);
     }
 
     pub(crate) fn forget_promise(&mut self, request: RequestId) {
-        if let Some((partition, charge, _)) = self.promised.remove(&request) {
-            self.remove_reserved(partition, charge);
+        if let Some((partition, charge, _, context_tokens)) = self.promised.remove(&request) {
+            self.remove_reserved(partition, charge, context_tokens);
         }
     }
 
@@ -110,11 +127,11 @@ impl RequestLedger {
     pub(crate) fn promised_charge(&self, request: RequestId) -> Option<u64> {
         self.promised
             .get(&request)
-            .map(|&(_, charge, _)| charge)
+            .map(|&(_, charge, _, _)| charge)
             .or_else(|| {
                 self.chunked_prefill
                     .get(&request)
-                    .map(|&(_, charge)| charge)
+                    .map(|&(_, charge, _)| charge)
             })
     }
 
@@ -128,36 +145,45 @@ impl RequestLedger {
         self.reserved_by_partition[partition as usize].1
     }
 
-    fn add_reserved(&mut self, partition: PartitionId, charge: u64) {
+    /// Context tokens the partition's reservations cover.
+    #[inline]
+    pub(crate) fn partition_promised_context(&self, partition: PartitionId) -> u64 {
+        self.reserved_context_by_partition[partition as usize]
+    }
+
+    fn add_reserved(&mut self, partition: PartitionId, charge: u64, context_tokens: u64) {
         let (total, count) = &mut self.reserved_by_partition[partition as usize];
         *total += charge;
         *count = count
             .checked_add(1)
             .expect("partition reservation count exceeds u32");
+        self.reserved_context_by_partition[partition as usize] += context_tokens;
     }
 
-    fn remove_reserved(&mut self, partition: PartitionId, charge: u64) {
+    fn remove_reserved(&mut self, partition: PartitionId, charge: u64, context_tokens: u64) {
         let (total, count) = &mut self.reserved_by_partition[partition as usize];
         *total -= charge;
         *count -= 1;
+        self.reserved_context_by_partition[partition as usize] -= context_tokens;
     }
 
     pub(crate) fn promote_promise_to_chunked_prefill(&mut self, request: RequestId) {
-        let (partition, charge, _) = self
+        let (partition, charge, _, context_tokens) = self
             .promised
             .remove(&request)
             .expect("chunked prefill must promote an existing promise");
         // The reservation only changes maps, so the partition total keeps it.
-        if let Some((previous_partition, previous_charge)) =
-            self.chunked_prefill.insert(request, (partition, charge))
+        if let Some((previous_partition, previous_charge, previous_context)) = self
+            .chunked_prefill
+            .insert(request, (partition, charge, context_tokens))
         {
-            self.remove_reserved(previous_partition, previous_charge);
+            self.remove_reserved(previous_partition, previous_charge, previous_context);
         }
     }
 
     pub(crate) fn forget_chunked_prefill(&mut self, request: RequestId) {
-        if let Some((partition, charge)) = self.chunked_prefill.remove(&request) {
-            self.remove_reserved(partition, charge);
+        if let Some((partition, charge, context_tokens)) = self.chunked_prefill.remove(&request) {
+            self.remove_reserved(partition, charge, context_tokens);
         }
     }
 
@@ -168,41 +194,51 @@ impl RequestLedger {
     /// Empty `promised` and report `(partition, request)` in the order the
     /// promises were made.
     pub(crate) fn drain_promised(&mut self) -> Vec<(PartitionId, RequestId)> {
-        let mut drained: Vec<(u64, PartitionId, RequestId, u64)> = self
+        let mut drained: Vec<(u64, PartitionId, RequestId, u64, u64)> = self
             .promised
             .drain()
-            .map(|(request, (partition, charge, seq))| (seq, partition, request, charge))
+            .map(|(request, (partition, charge, seq, context_tokens))| {
+                (seq, partition, request, charge, context_tokens)
+            })
             .collect();
-        for &(_, partition, _, charge) in &drained {
-            self.remove_reserved(partition, charge);
+        for &(_, partition, _, charge, context_tokens) in &drained {
+            self.remove_reserved(partition, charge, context_tokens);
         }
-        drained.sort_unstable_by_key(|&(seq, _, _, _)| seq);
+        drained.sort_unstable_by_key(|&(seq, _, _, _, _)| seq);
         drained
             .into_iter()
-            .map(|(_, partition, request, _)| (partition, request))
+            .map(|(_, partition, request, _, _)| (partition, request))
             .collect()
     }
 
     // ── held ─────────────────────────────────────────────────────────────────
 
-    /// Move a prefilled request's KV into the held ledger. Held KV is no longer
-    /// placed: its owner has handed the request off.
-    pub(crate) fn hold(&mut self, request: RequestId, partition: PartitionId, kv_tokens: u64) {
+    /// Move a prefilled request's KV, `units` charged for `kv_tokens` of
+    /// context, into the held ledger. Held KV is no longer placed: its owner
+    /// has handed the request off.
+    pub(crate) fn hold(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        units: u64,
+        kv_tokens: u64,
+    ) {
         self.placement.remove(&request);
-        if let Some((previous_partition, previous_tokens)) =
-            self.held.insert(request, (partition, kv_tokens))
+        if let Some((previous_partition, previous_units, _)) =
+            self.held.insert(request, (partition, units, kv_tokens))
         {
             let total = &mut self.held_by_partition[previous_partition as usize];
-            *total = total.saturating_sub(previous_tokens);
+            *total = total.saturating_sub(previous_units);
         }
-        self.held_by_partition[partition as usize] += kv_tokens;
+        self.held_by_partition[partition as usize] += units;
     }
 
-    /// Drop a held reservation and report what it was, if anything.
+    /// Drop a held reservation and report its partition and context tokens,
+    /// if anything was held.
     pub(crate) fn take_held(&mut self, request: RequestId) -> Option<(PartitionId, u64)> {
-        let (partition, kv_tokens) = self.held.remove(&request)?;
+        let (partition, units, kv_tokens) = self.held.remove(&request)?;
         let total = &mut self.held_by_partition[partition as usize];
-        *total = total.saturating_sub(kv_tokens);
+        *total = total.saturating_sub(units);
         Some((partition, kv_tokens))
     }
 
@@ -259,7 +295,7 @@ mod tests {
         let order: Vec<u32> = (0..64).map(|i| (i * 37) % 64).collect();
         let mut ledger = RequestLedger::new(1);
         for &id in &order {
-            ledger.promise(RequestId(id), 0, 1);
+            ledger.promise(RequestId(id), 0, 1, 1);
         }
         ledger.forget_promise(RequestId(order[5]));
         let drained: Vec<u32> = ledger
@@ -274,9 +310,9 @@ mod tests {
     #[test]
     fn promise_places_and_drain_clears_both_the_promise_and_nothing_else() {
         let mut ledger = RequestLedger::new(2);
-        ledger.promise(RequestId(0), 1, 30);
-        ledger.promise(RequestId(1), 1, 40);
-        ledger.promise(RequestId(2), 0, 50);
+        ledger.promise(RequestId(0), 1, 30, 30);
+        ledger.promise(RequestId(1), 1, 40, 40);
+        ledger.promise(RequestId(2), 0, 50, 50);
         assert_eq!(ledger.partition_promised(1), 70);
         assert_eq!(ledger.partition_promised_count(1), 2);
         assert_eq!(ledger.partition_promised(0), 50);
@@ -296,16 +332,17 @@ mod tests {
     #[test]
     fn reserved_totals_follow_a_promise_through_chunked_prefill_and_re_promises() {
         let mut ledger = RequestLedger::new(2);
-        ledger.promise(RequestId(0), 0, 30);
-        ledger.promise(RequestId(1), 0, 40);
+        ledger.promise(RequestId(0), 0, 30, 30);
+        ledger.promise(RequestId(1), 0, 40, 40);
         ledger.promote_promise_to_chunked_prefill(RequestId(0));
         assert_eq!(ledger.partition_promised(0), 70);
         assert_eq!(ledger.partition_promised_count(0), 2);
+        assert_eq!(ledger.partition_promised_context(0), 70);
 
         // A chunked request may promise again; the re-promise replaces only
         // its earlier promise, and both maps count until each is forgotten.
-        ledger.promise(RequestId(0), 1, 5);
-        ledger.promise(RequestId(0), 1, 8);
+        ledger.promise(RequestId(0), 1, 5, 5);
+        ledger.promise(RequestId(0), 1, 8, 8);
         assert_eq!(
             (ledger.partition_promised(0), ledger.partition_promised(1)),
             (70, 8)
@@ -317,23 +354,31 @@ mod tests {
             (0, 8)
         );
         assert_eq!(ledger.partition_promised_count(1), 1);
+        assert_eq!(
+            (
+                ledger.partition_promised_context(0),
+                ledger.partition_promised_context(1)
+            ),
+            (0, 8)
+        );
         ledger.drain_promised();
         assert_eq!(ledger.partition_promised_count(1), 0);
+        assert_eq!(ledger.partition_promised_context(1), 0);
     }
 
     #[test]
     fn holding_moves_a_request_out_of_placement_and_totals_per_partition() {
         let mut ledger = RequestLedger::new(2);
-        ledger.promise(RequestId(0), 0, 10);
-        ledger.hold(RequestId(0), 0, 64);
+        ledger.promise(RequestId(0), 0, 10, 10);
+        ledger.hold(RequestId(0), 0, 96, 64);
         assert_eq!(ledger.placement(RequestId(0)), None);
-        assert_eq!(ledger.partition_held(0), 64);
+        assert_eq!(ledger.partition_held(0), 96);
 
         // Re-holding on another partition moves the whole total, never doubles it.
-        ledger.hold(RequestId(0), 1, 64);
+        ledger.hold(RequestId(0), 1, 96, 64);
         assert_eq!(
             (ledger.partition_held(0), ledger.partition_held(1)),
-            (0, 64)
+            (0, 96)
         );
 
         assert_eq!(ledger.take_held(RequestId(0)), Some((1, 64)));

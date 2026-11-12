@@ -37,6 +37,12 @@ def _slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").lower() or "unknown"
 
 
+def tactic_version_slug(version: str) -> str:
+    """How a FlashInfer version appears in a tactic file's name (`.fi<slug>.json`)."""
+
+    return _slug(version)
+
+
 def autotune_cache_path(kernel: str) -> Path | None:
     """File holding the persisted tactics for ``kernel``, or ``None``.
 
@@ -51,10 +57,9 @@ def autotune_cache_path(kernel: str) -> Path | None:
     not a reason to fail a measurement.
     """
 
-    configured = os.environ.get(CACHE_DIR_ENV)
-    if configured is not None and not configured.strip():
+    base = tactic_cache_dir()
+    if base is None:
         return None
-    base = Path(configured) if configured else Path.home() / ".cache" / "vibesim-autotune"
 
     device, version = "unknown", "unknown"
     with contextlib.suppress(Exception):
@@ -69,7 +74,31 @@ def autotune_cache_path(kernel: str) -> Path | None:
         base.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
-    return base / f"{_slug(kernel)}.{_slug(device)}.fi{_slug(version)}.json"
+    return base / f"{tactic_file_stem(kernel, device)}.fi{_slug(version)}.json"
+
+
+def tactic_cache_dir(home: Path | None = None) -> Path | None:
+    """Where the tactic files live: ``$VIBESIM_AUTOTUNE_CACHE_DIR``, else under
+    ``home`` (default: this process's ``$HOME``); ``None`` when set empty."""
+
+    configured = os.environ.get(CACHE_DIR_ENV)
+    if configured is not None and not configured.strip():
+        return None
+    if configured:
+        return Path(configured)
+    return (home or Path.home()) / ".cache" / "vibesim-autotune"
+
+
+def tactic_file_stem(kernel: str, device: str) -> str:
+    """The file name of ``kernel``'s tactics on ``device`` (a CUDA device name,
+    as ``nvidia-smi`` and ``torch.cuda.get_device_name`` both spell it), up to
+    the FlashInfer version, which only the worker's interpreter knows."""
+
+    return f"{_slug(kernel)}.{_slug(device)}"
+
+
+# The ``kernel`` whose tactics the process-wide tuner currently holds.
+_live_kernel: str | None = None
 
 
 @contextlib.contextmanager
@@ -82,16 +111,22 @@ def autotune_cached(autotune: Any, kernel: str) -> Iterator[None]:
 
     Tactics this process tuned under an earlier ``kernel`` are forgotten
     first, so the file holds only this configuration's
-    (:func:`_forget_live_tactics`).
+    (:func:`_forget_live_tactics`). Tactics tuned under the same ``kernel``
+    are kept: FlashInfer >= 0.7 ignores the loaded file while tuning whenever
+    the op's profiling policy is not the legacy default (the NVFP4 MoE's is
+    not), so clearing them would re-tune every bucket on every spec -- 46 s a
+    spec for the routed MoE, against 0.3 s of measurement.
 
     Concurrent workers can still race -- one that loaded before another saved
     will overwrite it -- but the loser is a cache miss on the next run, not a
     wrong tactic, and the file converges as runs accumulate.
     """
 
+    global _live_kernel
     path = autotune_cache_path(kernel) if _supports_cache(autotune) else None
-    if path is not None:
+    if path is not None and kernel != _live_kernel:
         _forget_live_tactics(autotune)
+    _live_kernel = kernel
     with autotune() if path is None else autotune(cache=str(path)):
         yield
 

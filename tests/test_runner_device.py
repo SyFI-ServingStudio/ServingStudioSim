@@ -37,7 +37,7 @@ _PINNED = {
     ("nvfp4_quant", "vllm_cuda"): "---YYY",  # 10.0+
     ("all_reduce_fusion", "flashinfer_mnnvl"): "---Y--",  # sm_100a
     ("nvfp4_fused_moe", "flashinfer_trtllm_sm100"): "---YY-",  # sm_100f
-    ("gdn_chunk_delta_rule", "flashinfer"): "--Y---",  # sm_90a
+    ("gdn_chunk_delta_rule", "flashinfer"): "--YYY-",  # sm_90a, sm_100f
     ("dsa_sparse_mla_attention", "vllm_flashmla_bf16"): "--YYY-",  # sm_90a, sm_100f
     ("dsa_paged_mqa_logits_decode", "deepgemm_fp8"): "--YYYY",  # + sm_120f
 }
@@ -121,6 +121,7 @@ def test_the_worker_refuses_an_unsupported_device_without_loading_the_runner(mon
     monkeypatch.setattr(local_worker, "coerce_args", lambda schema, spec: spec)
     monkeypatch.setattr(local_worker, "_current_gpu_name", lambda: "NVIDIA H200")
     monkeypatch.setattr(local_worker, "_runtime_versions", lambda _backend: {})
+    monkeypatch.setattr(local_worker, "_visible_gpu_uuids", lambda: ["GPU-fake-0"])
     request = tmp_path / "in.json"
     output = tmp_path / "out.json"
     request.write_text(

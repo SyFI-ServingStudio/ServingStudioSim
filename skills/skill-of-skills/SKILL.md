@@ -16,10 +16,12 @@ source of truth.
 - `top-*`: top-level entry points for major user requests. A top skill may
   complete the request by sequencing lower-level skills, but should stay concise
   and route work rather than duplicate implementation details.
-- `orchestrator-*`: planning and verification roles. An orchestrator classifies
-  intent, writes implementer briefs, defines completion evidence, and verifies
-  returned work. It should not contain detailed implementation contracts that
-  belong in an implement skill.
+- `orchestrator-*`: planning and verification roles. An orchestrator skill
+  classifies intent, defines the steps and their completion evidence, and
+  verifies the result. Its reader owns that piece of work: a coordinator
+  briefing an implementer, or the agent the whole piece was handed to. It
+  should not contain detailed implementation contracts that belong in an
+  implement skill.
 - `impl-*`: leaf implementation roles. An implement skill owns a concrete write
   scope or investigation scope, states the files/contracts to follow, and lists
   the tests or smoke commands that prove completion.
@@ -57,7 +59,8 @@ completion condition should be obvious.
 
 ```text
 top-add-new-arch - add a whole model architecture end to end (capture → split → build L1–L4, largest kernel first)
-├── operate-run-alignment - Phase 0: capture the real vLLM/SGLang kernel sequence that drives the split (profile phase only; needs no arch)
+├── dev-parallelize-arch-addition - single-agent mode only: run the phases as parallel lanes: capture beside the build, one lane per kernel family and per worklet, one serial arch lane
+├── operate-run-alignment - Phase 0: capture the real vLLM/SGLang kernel sequence that drives the split (profile step only; needs no arch)
 ├── top-split-model-into-kernels - explore + break the forward into the kernel/op sequence
 ├── top-add-kernel - create each new L1 kernel (L1-Python impl-register-kernel + L1-Rust impl-wire-kernel-to-rust)
 ├── impl-compose-op - compose kernels into L2 ops
@@ -65,9 +68,10 @@ top-add-new-arch - add a whole model architecture end to end (capture → split 
 ├── impl-compose-arch - wire worklets into the L4 model_arch cost file
 ├── impl-wire-new-arch - integrate the arch into dispatch/build/timing-predict/deployment (Phase 3)
 ├── impl-add-model-work-label - add the independent model.work label and semantic location maps for R6/R7 (Phase 4, before Validate)
-└── top-align-with-framework - Phase 5: close the loop on the same capture; ranks which placeholder to promote next
+├── top-align-with-framework - Phase 5: close the loop on the same capture; ranks which placeholder to promote next
+└── dev-finalize-model-addition - after Phase 5: check results, publish presets and captures, merge main, review, open the PR
 
-top-add-kernel - add an L1 kernel end to end (several at once: fan out one subagent per kernel, 3 at a time)
+top-add-kernel - add an L1 kernel end to end; one kernel is one delegated task (several at once: fan out one subagent per kernel, 3 at a time)
 ├── orchestrator-add-kernel-to-python-profile - plan and verify Python profiling
 │   ├── dev-explore-kernel - search vLLM/SGLang/FlashInfer for a source to wrap (shared)
 │   └── impl-register-kernel - register a Python profiler kind or backend
@@ -76,12 +80,12 @@ top-add-kernel - add an L1 kernel end to end (several at once: fan out one subag
     └── impl-validate-kernel-cache - measure Rust cache fidelity
 
 top-explore-models - understand a new model or checkpoint from HF/public sources
-├── dev-calculate-kv-cache-capacity - calculate KV cache bytes and capacity
+├── dev-calculate-kv-cache-capacity - KV capacity: read it from the sim for an existing arch, derive the layout for a new model
 └── dev-lookup-transformers-model - inspect local Transformers/Torch semantics
 
 top-split-model-into-kernels - break a model forward into the ServingStudioSim kernel sequence, ordered by measured share
 ├── top-explore-models - step 1: establish the architecture (entry above)
-├── operate-run-alignment - measured launch granularity, when no capture was supplied (profile phase only)
+├── operate-run-alignment - measured launch granularity, when no capture was supplied (profile step only)
 ├── dev-lookup-transformers-model - what math each op computes (shared)
 └── dev-explore-kernel - which callable to wrap; and, with no capture, whether a real fused kernel exists (shared)
 
@@ -123,6 +127,7 @@ dev-run-tests - select and run ServingStudioSim test tiers
 dev-compose-worker - plan, estimate, implement, compose, and review production L5 workers against the four-axis ownership rules
 dev-file-design-review - review one file against docs and contracts
 dev-present-changes-for-review - organize a diff for human review
+dev-finalize-model-addition - land an aligned model on main: result checks, public presets, HF captures, profiling, merge, review worktree, PR
 dev-clean-reimplement-for-merge - rebuild accepted but unmergeably iterative branch work cleanly from main, preserving behavior
 dev-build-serving-repetitive-unit - kernel/layer-timing development with reduced depth but production model, loader, engine, API, and profiler paths
 dev-compose-kernel - compose a real serving kernel, fused boundary, or collective change through six practical steps

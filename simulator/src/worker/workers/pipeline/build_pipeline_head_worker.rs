@@ -4,32 +4,37 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::IterwiseUnifiedModel;
+use crate::arch::kv_layout::KvCacheLayout;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{
-    PendingOrder, PipelinedChunkedPrefillAdmission, PrefixFetch, SessionPrefixTiers,
+    ChunkEndAlignment, PendingOrder, PipelinedChunkedPrefillAdmission, PrefixFetch,
+    SessionPrefixTiers,
 };
 use crate::worker::config::MicrobatchSizing;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::{FullAttnKv, HybridGdnKv, PrefixCacheConfig};
 use crate::worker::types::WorkerConfig;
 use crate::worker::workers::iter_build_essentials::{
-    full_attention_token_capacity, prepare_iter_build_essentials,
+    kv_cache_store, prefill_chunk_end_quantum, prepare_iter_build_essentials, resolve_kv_accounting,
 };
 
 use super::pipeline_head_worker::{PipelineHeadWorker, PipelineLayout};
-use super::{HybridPipelineHead, PipelineHead};
+use super::PipelineHead;
 
-/// `stage_model` is stage 0's layers. KV capacity comes from `layout`, not the
-/// stage model: every stage holds the same tokens, so the stage with the most KV
-/// bytes per token bounds the pipeline.
+/// `stage_model` is stage 0's layers. KV capacity comes from
+/// `kv_cache_layout`, not the stage model: every stage holds the same
+/// requests, so the stage with the most KV per token bounds the pipeline. With
+/// prefix caching on and a resumable recurrent state in the layout (vLLM's
+/// Mamba `align` mode), every non-final chunk ends on the layout's block, and
+/// a DRAM/SSD tier hit counts in that block.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     id: WorkerId,
     pool_tag: &'static str,
     stage_model: Arc<M>,
     layout: PipelineLayout,
+    kv_cache_layout: &KvCacheLayout,
     requests: SharedRequests,
     config: WorkerConfig,
     cost_log_dir: Option<PathBuf>,
@@ -46,185 +51,26 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         "a pipeline stage runs on one GPU"
     );
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
-    let prefix_tiers = head_prefix_tiers(&config, &layout, 1, cost_log_dir.as_deref(), id);
-    let kv_capacity = full_attention_token_capacity(1, layout.kv_bytes_per_token, &config);
-    let prefix_cache =
-        config
-            .prefix_cache
-            .resolve_tokens(kv_capacity, layout.kv_bytes_per_token, 1);
-    let essentials = prepare_iter_build_essentials(
-        id,
-        pool_tag,
-        requests,
-        &config,
-        cost_log_dir,
-        pool,
-        gpu_name,
-        &cluster,
-        1,
-        stage_model.cost_log_manifest(),
-        kv_capacity,
-        1,
-    );
-    let send_gid =
-        cluster
-            .borrow_mut()
-            .register_comm_group(essentials.allocation_base, 1, pool_tag, id.0);
-    let kv_store = FullAttnKv::with_prefix_cache(
-        1,
-        essentials.kv_capacity,
-        prefix_cache,
-        essentials.sampler,
-        prefix_cache_logger,
-    );
-    let mut admission = PipelinedChunkedPrefillAdmission::new(
-        PendingOrder::new(config.pending_order),
-        (),
-        max_batch_tokens,
-    );
-    if config.balance_decode_microbatches {
-        admission = admission.with_balanced_decodes(layout.depth);
-    }
-    if let MicrobatchSizing::Even { min_tokens } = config.microbatch_sizing {
-        admission = admission.with_even_split(layout.depth, min_tokens);
-    }
-    if let Some(threshold) = config.long_prefill_token_threshold {
-        admission = admission.with_long_prefill_threshold(threshold);
-    }
-    if let Some(load) = config.load_budget {
-        admission = admission.with_load_budget(load);
-    }
-    if config.srpt {
-        admission = admission.with_srpt();
-    }
-    if config.force_schedule_after_ms > 0.0 {
-        admission = admission.with_force_after(config.force_schedule_after_ms);
-    }
-    let has_tiers = prefix_tiers.is_some();
-    if let Some(tiers) = prefix_tiers {
-        admission = admission.with_prefix_fetch(
-            PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start).with_max_read_wait_ms(
-                config.prefix_tier_max_read_wait_ms,
-                config.prefix_tier_read_wait_policy,
-            ),
-        );
-    }
-
-    with_head_options(
-        PipelineHeadWorker::from_components(
-            essentials.context,
-            kv_store,
-            admission,
-            UnifiedIterExecution::new(stage_model, essentials.cost),
-            layout,
-            send_gid,
-        ),
-        has_tiers,
-        config.external_decode,
-    )
-}
-
-/// How a hybrid recurrent + full-attention pipeline shares one block pool,
-/// following vLLM's hybrid KV cache manager.
-///
-/// Every cache group draws `block_tokens`-token blocks from one pool. The pool
-/// holds as many blocks as the stage with the most bytes per block affords
-/// (`PipelineLayout::kv_bytes_per_token` x `block_tokens`), less vLLM's null
-/// block. A request holds one attention block per `block_tokens` of context
-/// plus `state_blocks_per_request` fixed blocks (its recurrent-state groups and
-/// any per-request scratch group).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PipelineHybridState {
-    pub block_tokens: u32,
-    pub state_blocks_per_request: u32,
-    /// vLLM's Mamba `align` mode: with prefix caching on, every non-final
-    /// chunk ends on a `block_tokens` boundary, and a retained prefix keeps one
-    /// state per block and resumes at the last one. `false` chunks plainly and
-    /// reuses exactly: a retained prefix keeps the state at its end and resumes
-    /// at any token.
-    pub align_mode: bool,
-}
-
-impl PipelineHybridState {
-    /// Pool capacity in attention-token units: usable blocks x block tokens.
-    pub fn capacity_tokens(&self, layout: &PipelineLayout, attn_kv_bytes: u64) -> u64 {
-        let block_tokens = u64::from(self.block_tokens.max(1));
-        let bytes_per_block = layout.kv_bytes_per_token.max(1) * block_tokens;
-        (attn_kv_bytes / bytes_per_block).saturating_sub(1).max(1) * block_tokens
-    }
-
-    /// One request's fixed blocks, in the same token units.
-    pub fn state_tokens_per_request(&self) -> u64 {
-        u64::from(self.state_blocks_per_request) * u64::from(self.block_tokens)
-    }
-}
-
-/// [`build_pipeline_head_worker`] for a hybrid model: `HybridGdnKv` charges
-/// each request its fixed state blocks on top of its context. With prefix
-/// caching on and `hybrid.align_mode` set (vLLM's Mamba `align`
-/// mode), every non-final chunk ends on a `block_tokens` boundary and prefix
-/// hits floor to it; otherwise chunks are plain and reuse is exact.
-///
-/// Context is charged by the token, not rounded up to whole blocks, so a
-/// request's charge is low by less than one block.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
-    id: WorkerId,
-    pool_tag: &'static str,
-    stage_model: Arc<M>,
-    layout: PipelineLayout,
-    hybrid: PipelineHybridState,
-    requests: SharedRequests,
-    config: WorkerConfig,
-    cost_log_dir: Option<PathBuf>,
-    pool: PoolId,
-    gpu_name: &str,
-    cluster: SharedGpuCluster,
-) -> HybridPipelineHead<M> {
-    let max_batch_tokens = config
-        .max_batch_tokens
-        .expect("pipeline head requires max_batch_tokens");
-    assert_eq!(
-        stage_model.gpus_per_replica(),
-        1,
-        "a pipeline stage runs on one GPU"
-    );
-    assert!(
-        hybrid.block_tokens > 0,
-        "hybrid block size must be positive"
-    );
-    let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
-    let kv_capacity = hybrid.capacity_tokens(&layout, config.attn_kv_bytes);
-    let state_tokens_per_request = hybrid.state_tokens_per_request();
+    let kv_accounting = resolve_kv_accounting(kv_cache_layout, 1, &config);
+    let chunk_end_quantum = prefill_chunk_end_quantum(&kv_accounting, &config);
     let prefix_tiers = head_prefix_tiers(
         &config,
         &layout,
-        if hybrid.align_mode {
-            hybrid.block_tokens
-        } else {
-            1
-        },
+        chunk_end_quantum.unwrap_or(1),
         cost_log_dir.as_deref(),
         id,
     );
-    let chunk_end_quantum = (hybrid.align_mode
-        && !matches!(config.prefix_cache, PrefixCacheConfig::Disabled))
-    .then_some(hybrid.block_tokens);
     tracing::info!(
         worker = id.0,
         pool_tag,
-        kv_capacity_tokens = kv_capacity,
-        block_tokens = hybrid.block_tokens,
-        state_tokens_per_request,
+        kv_capacity_units = kv_accounting.capacity_units(),
+        kv_bytes_per_unit = kv_accounting.bytes_per_unit(),
+        tier_kv_bytes_per_token = layout.tier_kv_bytes_per_token,
         tier_state_bytes_per_request = layout.tier_state_bytes_per_request,
         chunk_end_quantum,
         max_batch_tokens,
-        "hybrid pipeline head: one block pool sized by the most constrained stage"
+        "pipeline head KV, sized by the most constrained stage"
     );
-    let prefix_cache =
-        config
-            .prefix_cache
-            .resolve_tokens(kv_capacity, layout.kv_bytes_per_token, 1);
     let essentials = prepare_iter_build_essentials(
         id,
         pool_tag,
@@ -236,34 +82,28 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         &cluster,
         1,
         stage_model.cost_log_manifest(),
-        kv_capacity,
+        &kv_accounting,
         1,
     );
     let send_gid =
         cluster
             .borrow_mut()
             .register_comm_group(essentials.allocation_base, 1, pool_tag, id.0);
-    let kv_store = HybridGdnKv::new(
+    let kv_store = kv_cache_store(
+        kv_accounting,
         1,
-        essentials.kv_capacity,
-        state_tokens_per_request,
-        hybrid.block_tokens,
-        prefix_cache,
+        1,
+        &config,
         essentials.sampler,
         prefix_cache_logger,
     );
-    let kv_store = if hybrid.align_mode {
-        kv_store
-    } else {
-        kv_store.with_exact_prefix_reuse()
-    };
     let admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
         (),
         max_batch_tokens,
     );
     let mut admission = match chunk_end_quantum {
-        Some(quantum) => admission.with_chunk_end_quantum(quantum),
+        Some(quantum) => admission.with_chunk_end_alignment(ChunkEndAlignment::on_blocks(quantum)),
         None => admission,
     };
     if config.balance_decode_microbatches {
@@ -294,18 +134,24 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         );
     }
 
-    with_head_options(
-        PipelineHeadWorker::from_components(
-            essentials.context,
-            kv_store,
-            admission,
-            UnifiedIterExecution::new(stage_model, essentials.cost),
-            layout,
-            send_gid,
-        ),
-        has_tiers,
-        config.external_decode,
-    )
+    let head = PipelineHeadWorker::from_components(
+        essentials.context,
+        kv_store,
+        admission,
+        UnifiedIterExecution::new(stage_model, essentials.cost),
+        layout,
+        send_gid,
+    );
+    let head = if has_tiers {
+        head.with_prefix_tiers()
+    } else {
+        head
+    };
+    if config.external_decode {
+        head.with_external_decode()
+    } else {
+        head
+    }
 }
 
 /// The DRAM/SSD tiers `config` asks for, in the pipeline's per-GPU token units.
@@ -331,29 +177,4 @@ fn head_prefix_tiers(
             &format!("w{}", id.0),
         )
     })
-}
-
-fn with_head_options<K, A, E>(
-    head: PipelineHeadWorker<K, A, E>,
-    prefix_tiers: bool,
-    external_decode: bool,
-) -> PipelineHeadWorker<K, A, E>
-where
-    K: crate::worker::kv::IterWorkerKv + crate::worker::kv::PrefixKv,
-    A: crate::worker::admission::MicrobatchAdmission<K>,
-    E: crate::worker::execution::IterModelExecution<
-        K,
-        Input = crate::arch::contract::UnifiedArchInput,
-    >,
-{
-    let head = if prefix_tiers {
-        head.with_prefix_tiers()
-    } else {
-        head
-    };
-    if external_decode {
-        head.with_external_decode()
-    } else {
-        head
-    }
 }

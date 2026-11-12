@@ -196,13 +196,15 @@ impl PreparedDemand<'_> {
         }
     }
 
-    /// [`Self::sample_and_fold`] at every token count, in order.
+    /// [`Self::sample_and_fold`] at every token count (ascending), in order.
     ///
     /// Each histogram is a deterministic function of its own seed, so they are
     /// drawn on worker threads without changing a single count. A corpus
-    /// histogram is the median of independent candidates, and each candidate is
-    /// its own task: the largest grid point alone is ~15% of a sweep's work, so
-    /// splitting only by grid point would leave it as the critical path.
+    /// histogram is the median of independent candidates; each candidate walks
+    /// the whole axis in one pass ([`TokenCorpus::candidates_ascending`]), so
+    /// its work is the largest count rather than the sum of the axis, and the
+    /// candidates are the tasks. Fewer tasks than before, but no longer path:
+    /// the longest task was already one candidate at the largest count.
     fn sample_and_fold_many(
         &self,
         top_k: u32,
@@ -219,23 +221,22 @@ impl PreparedDemand<'_> {
             ),
             Self::Corpus(corpus) => {
                 let draws = corpus.sampling_candidates() as usize;
-                let costs: Vec<u64> = token_counts
-                    .iter()
-                    .flat_map(|&n| std::iter::repeat(u64::from(n)).take(draws))
-                    .collect();
-                let mut candidates = parallel_by_cost(&costs, |task| {
-                    corpus.candidate(
-                        token_counts[task / draws],
-                        experts_per_rank,
-                        (task % draws) as u32,
-                    )
-                })
-                .into_iter();
+                // Every candidate walks the same axis: equal costs.
+                let mut per_draw = parallel_by_cost(&vec![1; draws], |draw| {
+                    corpus
+                        .candidates_ascending(token_counts, experts_per_rank, draw as u32)
+                        .into_iter()
+                });
                 token_counts
                     .iter()
                     .map(|_| {
                         select_candidate(
-                            candidates.by_ref().take(draws).collect(),
+                            per_draw
+                                .iter_mut()
+                                .map(|draw_candidates| {
+                                    draw_candidates.next().expect("one candidate per count")
+                                })
+                                .collect(),
                             experts_per_rank,
                         )
                     })

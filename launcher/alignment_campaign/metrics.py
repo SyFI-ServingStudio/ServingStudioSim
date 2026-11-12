@@ -338,6 +338,9 @@ def measure_case(directory: Path, *, expected_requests: int | None = None) -> Ca
         values[spec.name] = value
 
     provenance = _provenance(documents)
+    captured = _capture_calibration(directory)
+    if captured:
+        provenance["capture_calibration"] = captured
     if "e2e" in documents:
         from alignment.request_population import audit_alignment_population
 
@@ -364,6 +367,24 @@ def measure_case(directory: Path, *, expected_requests: int | None = None) -> Ca
         provenance=provenance,
         issues=tuple(issues),
     )
+
+
+def _capture_calibration(directory: Path) -> dict[str, Any]:
+    """The from_capture inputs this case's simulation used, so the report and a
+    recorded golden say which values and files they were.
+
+    Read from the copy the campaign kept beside the simulation when it ran
+    (`simulation/campaign_inputs.json`), never from the live `calibration.json`:
+    re-rendering after a new workload pass rewrites that file, and the report
+    would then carry values the simulation never saw. A live calibration with
+    no such copy yields nothing, which `compare --record` refuses.
+    """
+    from .execute import recorded_simulation_inputs
+
+    recorded = recorded_simulation_inputs(directory)
+    if recorded is None or not isinstance(recorded.get("calibration"), dict):
+        return {}
+    return dict(recorded["calibration"].get("fields", {}))
 
 
 def _provenance(documents: dict[str, dict[str, Any]]) -> dict[str, Any]:

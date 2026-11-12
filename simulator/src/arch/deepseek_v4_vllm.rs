@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::arch::config::ModelSpec;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
 use crate::op::Op;
 use crate::timing::kernels::kv_compress_store::FP8_DS_MLA_ROW_BYTES;
 use crate::timing::kernels::{
@@ -78,6 +79,7 @@ pub struct DeepseekV4ModelCfg {
     pub num_shared_experts: u32,
     pub vocab_size: Dim,
     pub max_model_len: u32,
+    pub sliding_window: u32,
     pub compress_ratios: Vec<u32>,
 }
 
@@ -106,6 +108,7 @@ struct JsonDeepseekV4Config {
     vocab_size: u32,
     num_hash_layers: u32,
     max_position_embeddings: u32,
+    sliding_window: u32,
     compress_ratios: Vec<u32>,
     expert_dtype: String,
     scoring_func: String,
@@ -144,6 +147,7 @@ impl DeepseekV4ModelCfg {
             ("index_n_heads", raw.index_n_heads, 64),
             ("index_head_dim", raw.index_head_dim, 128),
             ("index_topk", raw.index_topk, 512),
+            ("sliding_window", raw.sliding_window, 128),
             ("q_lora_rank", raw.q_lora_rank, 1024),
             ("o_lora_rank", raw.o_lora_rank, 1024),
             ("o_groups", raw.o_groups, 8),
@@ -201,6 +205,7 @@ impl DeepseekV4ModelCfg {
             num_shared_experts: raw.n_shared_experts,
             vocab_size: raw.vocab_size.into(),
             max_model_len: raw.max_position_embeddings,
+            sliding_window: raw.sliding_window,
             compress_ratios: normalized,
         })
     }
@@ -294,7 +299,7 @@ pub struct DeepseekV4VllmConfigs {
     layers: Vec<DeepseekV4LayerConfig>,
     lm_head: SingleGemmKernelConfig,
     terminal_mhc_head: MhcRmsNormKernelConfig,
-    total_kv_bytes_per_token: u64,
+    kv_cache_layout: KvCacheLayout,
 }
 
 pub struct DeepseekV4LayerResolved {
@@ -312,7 +317,7 @@ pub struct DeepseekV4VllmResolved {
     layers: Vec<DeepseekV4LayerResolved>,
     lm_head: SingleGemmKernelConfig,
     terminal_mhc_head: MhcRmsNormKernelConfig,
-    total_kv_bytes_per_token: u64,
+    kv_cache_layout: KvCacheLayout,
 }
 
 fn fit_failed(reason: impl Into<String>) -> BuildError {
@@ -351,21 +356,6 @@ pub fn build_configs(
         .iter()
         .map(|recipe| layer_config(model, parallel, recipe, local_ppm.clone()))
         .collect();
-    let total_kv_bytes_per_token = model
-        .compress_ratios
-        .iter()
-        .try_fold(0_u64, |sum, ratio| {
-            sum.checked_add(
-                u64::from(FP8_DS_MLA_ROW_BYTES)
-                    + match ratio {
-                        1 => 0,
-                        4 => 146,
-                        128 => 5,
-                        _ => unreachable!(),
-                    },
-            )
-        })
-        .ok_or_else(|| fit_failed("KV byte accounting overflow"))?;
     Ok(DeepseekV4VllmConfigs {
         ep_size: parallel.ep_size,
         layers,
@@ -383,8 +373,92 @@ pub fn build_configs(
             hc_mult: model.hc_mult,
             hidden_dtype: DType::Bf16,
         },
-        total_kv_bytes_per_token,
+        kv_cache_layout: kv_cache_layout(model),
     })
+}
+
+/// One DP rank's cache (every DP rank keeps a whole copy), in vLLM's packed
+/// groups (fork `v1/kv_cache_interface.py`, BLHNC layout).
+///
+/// Per 256-token block, the full-attention group packs every C4 layer's
+/// compressed rows (one 584 B fp8_ds_mla row per 4 tokens) and indexer keys
+/// (132 B per 4 tokens), and every C128 layer's rows (one per 128 tokens); each
+/// layer's page rounds up to 576 B. That page, 1,002,240 B, is the pool's block,
+/// and a block of any other group costs the same. Every layer keeps a 128-token
+/// sliding window of 584 B rows in 64-token blocks; C4 layers keep their KV and
+/// indexer compressor states for the last 8 tokens in 4-token blocks, C128
+/// layers theirs for the last 128 tokens in 8-token blocks. Each windowed kind
+/// fills `ceil(pages / block)` groups, so it pays that many blocks per its own
+/// block of tokens. vLLM reserves one null block.
+fn kv_cache_layout(model: &DeepseekV4ModelCfg) -> KvCacheLayout {
+    const BLOCK_TOKENS: u64 = 256;
+    const PAGE_ALIGN: u64 = 576;
+    const SWA_BLOCK_TOKENS: u64 = 64;
+    const FP32: u64 = 4;
+    let page = |entries: u64, bytes: u64| (entries * bytes).div_ceil(PAGE_ALIGN) * PAGE_ALIGN;
+    let layers_at = |ratio: u32| {
+        model
+            .compress_ratios
+            .iter()
+            .filter(|&&r| r == ratio)
+            .count() as u64
+    };
+    let (all, c4, c128) = (
+        model.compress_ratios.len() as u64,
+        layers_at(4),
+        layers_at(128),
+    );
+    let row = u64::from(FP8_DS_MLA_ROW_BYTES);
+    let (head_dim, index_dim) = (
+        u64::from(model.head_dim.get()),
+        u64::from(model.index_head_dim.get()),
+    );
+    let index_row = index_dim + FP32; // fp8 key + fp32 scale
+    let (c4_entries, c128_entries) = (BLOCK_TOKENS / 4, BLOCK_TOKENS / 128);
+    let block =
+        c4 * (page(c4_entries, row) + page(c4_entries, index_row)) + c128 * page(c128_entries, row);
+    // Bytes per token of a windowed kind whose layers' pages fill whole groups.
+    let windowed = |pages: u64, block_tokens: u64| pages.div_ceil(block) * block / block_tokens;
+
+    // Each compressor keeps [kv, score] rows in fp32 for the tokens it has not
+    // folded yet: two ratios' worth at C4 (overlapping windows), one at C128.
+    let (c4_state_block, c128_state_block) = (4, 8);
+    let c4_state = 2 * 2 * (head_dim + index_dim) * FP32;
+    let c4_state_pages = c4
+        * (page(c4_state_block, 2 * 2 * head_dim * FP32)
+            + page(c4_state_block, 2 * 2 * index_dim * FP32));
+    let c128_state = 2 * head_dim * FP32;
+    KvCacheLayout::new()
+        .with_part(
+            KvCachePart::sliding_window("swa", model.sliding_window, all * row).padded_to(
+                windowed(all * page(SWA_BLOCK_TOKENS, row), SWA_BLOCK_TOKENS),
+            ),
+        )
+        .with_part(
+            KvCachePart::compressed("c4_kv", 4, c4 * row)
+                .padded_to(c4 * page(c4_entries, row) / c4_entries),
+        )
+        .with_part(
+            KvCachePart::compressed("c4_indexer", 4, c4 * index_row)
+                .padded_to(c4 * page(c4_entries, index_row) / c4_entries),
+        )
+        .with_part(
+            KvCachePart::compressed("c128_kv", 128, c128 * row)
+                .padded_to(c128 * page(c128_entries, row) / c128_entries),
+        )
+        .with_part(
+            KvCachePart::sliding_window("c4_compressor_state", 2 * 4, c4 * c4_state)
+                .padded_to(windowed(c4_state_pages, c4_state_block)),
+        )
+        .with_part(
+            KvCachePart::sliding_window("c128_compressor_state", 128, c128 * c128_state).padded_to(
+                windowed(c128 * page(c128_state_block, c128_state), c128_state_block),
+            ),
+        )
+        .with_engine(EngineOverhead {
+            block_tokens: Some(BLOCK_TOKENS as u32),
+            fixed_device_bytes: block,
+        })
 }
 
 fn critical_contiguous_shard(ppm: &[u32], partitions: usize) -> Vec<u32> {
@@ -530,7 +604,7 @@ pub fn resolve_configs(configs: &DeepseekV4VllmConfigs) -> DeepseekV4VllmResolve
             .collect(),
         lm_head: configs.lm_head.clone(),
         terminal_mhc_head: configs.terminal_mhc_head.clone(),
-        total_kv_bytes_per_token: configs.total_kv_bytes_per_token,
+        kv_cache_layout: configs.kv_cache_layout.clone(),
     }
 }
 
@@ -671,7 +745,7 @@ pub struct DeepseekV4VllmModel {
     layers: Vec<DeepseekV4LayerBody>,
     terminal_mhc_head: Op<MhcTerminalHeadKernel>,
     lm_head: Op<SingleGemmKernel>,
-    total_kv_bytes_per_token: u64,
+    kv_cache_layout: KvCacheLayout,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -710,7 +784,7 @@ pub fn build(
                 bridge,
             )?),
         ),
-        total_kv_bytes_per_token: resolved.total_kv_bytes_per_token,
+        kv_cache_layout: resolved.kv_cache_layout,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -810,8 +884,8 @@ impl IterwiseUnifiedModel for DeepseekV4VllmModel {
     fn cost_log_manifest(&self) -> CostManifest {
         self.cost_tree().manifest()
     }
-    fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token
+    fn kv_cache_layout(&self) -> KvCacheLayout {
+        self.kv_cache_layout.clone()
     }
     fn gpus_per_replica(&self) -> u16 {
         self.ep_size
@@ -1014,6 +1088,53 @@ mod tests {
             let built = build("dsv4".to_string(), resolve_configs(&configs), &bridge).unwrap();
             assert_eq!(built.gpus_per_replica(), ep_size);
             assert_eq!(built.num_attn_dp_groups(), ep_size);
+        }
+    }
+
+    #[test]
+    fn kv_cache_layout_reproduces_vllms_packed_groups() {
+        use crate::worker::kv::{KvAccounting, KvAccountingOptions};
+        let layout = kv_cache_layout(&model_cfg());
+        let padded = |name: &str| {
+            let part = layout.parts.iter().find(|part| part.name == name).unwrap();
+            (
+                part.bytes_per_entry,
+                part.overhead.padded_bytes_per_entry.unwrap(),
+            )
+        };
+        // The full group's page is the pool's block: 3,915 B per token.
+        assert_eq!(layout.engine.fixed_device_bytes, 1_002_240);
+        assert_eq!(
+            layout.per_token_bytes(),
+            (21 * 584 + 21 * 132) / 4 + 20 * 584 / 128
+        );
+        assert_eq!(padded("c4_kv"), (21 * 584, 21 * 585));
+        assert_eq!(padded("c4_indexer"), (21 * 132, 21 * 135));
+        assert_eq!(padded("c128_kv"), (20 * 584, 20 * 864));
+        // Two SWA groups of 64-token blocks, one C4-state group of 4-token
+        // blocks, one C128-state group of 8-token blocks.
+        assert_eq!(padded("swa"), (43 * 584, 2 * 1_002_240 / 64));
+        assert_eq!(
+            padded("c4_compressor_state"),
+            (21 * (8192 + 2048), 1_002_240 / 4)
+        );
+        assert_eq!(padded("c128_compressor_state"), (20 * 4096, 1_002_240 / 8));
+
+        // The fork's "Maximum concurrency for 1,048,576 tokens per request" at
+        // 82.36 GiB per rank: 8.19x with async scheduling (two batches of 8192
+        // tokens in flight), 11.84x without.
+        let budget = (82.36 * f64::from(1u32 << 30)) as u64;
+        for (in_flight, logged) in [(2 * 8192, 8.19), (8192, 11.84)] {
+            let options = KvAccountingOptions {
+                max_in_flight_tokens: Some(in_flight),
+                ..Default::default()
+            };
+            let accounting = KvAccounting::resolve(&layout, options, budget).unwrap();
+            let concurrency = accounting.concurrency_at(1 << 20);
+            assert!(
+                (concurrency / logged - 1.0).abs() < 0.005,
+                "{concurrency} vs {logged}"
+            );
         }
     }
 

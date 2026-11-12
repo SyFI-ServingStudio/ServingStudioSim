@@ -348,7 +348,7 @@ def profile_dsa_index_cache_append_sglang_fused_norm_rope_store(
     )
     try:
         import torch
-        from sglang.kernels.ops.quantization.dsv32 import fused_k_indexer_norm_rope_store
+        from sglang.kernels.ops.attention.dsa.indexer_k import fused_k_indexer_norm_rope_store
     except (ImportError, OSError) as exc:
         raise ProfilerNotImplemented(
             "dsa_index_cache_append:sglang_fused_norm_rope_store requires the SGLang environment"

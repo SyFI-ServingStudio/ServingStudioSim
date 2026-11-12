@@ -55,8 +55,12 @@ pub struct DeepseekV41HeadTpWorkletResolved {
 
 #[derive(Clone, Debug, Default)]
 pub struct DeepseekV41HeadTpWorkletInput {
-    /// Every scheduled token (the hc post / collapse / norm run over all).
+    /// Every scheduled token (the hc collapse and norm run over all).
     pub num_tokens: u32,
+    /// Rows the last layer's hc post runs on: `num_tokens`, or the replay
+    /// rows when bounded replay ran the late layers (`_collapse` runs inside
+    /// the replay layers; the scatter back to batch rows follows it).
+    pub mhc_post_rows: u32,
     /// Rows that produce logits (one per request, more with spec decode).
     pub logits_rows: u32,
 }
@@ -162,7 +166,15 @@ impl DeepseekV41HeadTpWorklet {
         let rows = input.num_tokens;
         let logits = input.logits_rows;
         let ew = ElementwiseKernelInput { num_tokens: rows };
-        eval_or_zero(&self.mhc_post, ew.clone(), rows == 0, ev);
+        let post_rows = input.mhc_post_rows;
+        eval_or_zero(
+            &self.mhc_post,
+            ElementwiseKernelInput {
+                num_tokens: post_rows,
+            },
+            post_rows == 0,
+            ev,
+        );
         eval_or_zero(&self.hc_collapse, ew.clone(), rows == 0, ev);
         eval_or_zero(&self.final_norm, ew, rows == 0, ev);
         eval_or_zero(&self.lm_head, SingleGemmKernelInput { m: logits }, logits == 0, ev);

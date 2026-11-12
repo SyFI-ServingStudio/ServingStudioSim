@@ -1,0 +1,24 @@
+# vLLM MiMo-V2.6-Flash-RL on 4 B200s: TP4 attention (FP8 block-quantized QKV, BF16
+# o_proj, FA4 diffkv over 9 global and 39 sliding-window layers), EP4 MXFP4 routed
+# experts with BF16 activations over the same ranks, as the diverse_100 capture's
+# server ran (logs/20261012_1_mimo_fused_ar_nsys: --max-model-len 131072,
+# --max-num-batched-tokens 2048, --max-num-seqs 100, flashinfer_trtllm MoE,
+# mnnvl fused all-reduce + RMSNorm). cudagraph_capture_sizes is the capture's
+# vLLM default list for max-num-seqs 100 (max_cudagraph_capture_size 200,
+# FULL_AND_PIECEWISE).
+checkpoint: XiaomiMiMo/MiMo-V2.6-Flash-RL
+gpu: NVIDIA B200
+arch:
+  type: mimo_v2_vllm_fp8_swa_moe
+  fp8: true
+  tp_size: 4
+  max_model_len: 131072
+  routing: ${routing}
+  token_corpus_file: ${token_corpus_file}
+  cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 100, 104, 112, 120, 128,
+                            136, 144, 152, 160, 168, 176, 184, 192, 200]
+compound:
+  workload:
+    diverse_100:
+      routing: corpus
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@18506fd7afbaf925da2d31821287d079fffba5a6/mimo_v26_flash_rl/vllm/diverse_100/capture/20261007/manifest.json

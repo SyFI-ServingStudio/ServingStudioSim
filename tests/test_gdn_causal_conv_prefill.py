@@ -380,7 +380,11 @@ def test_vllm_derived_shapes_packing_metadata_and_chunk_mapping() -> None:
         operands.semantic_x.untyped_storage().data_ptr()
     )
     assert operands.weight.is_contiguous()
-    assert operands.state.is_contiguous()
+    # vLLM's default state-first (SD) pool, handed over as a transposed view:
+    # a contiguous dim-first pool would time a layout production never uses.
+    assert not operands.state.is_contiguous()
+    assert operands.state.stride(1) == 1
+    assert operands.state.transpose(-1, -2).is_contiguous()
     assert operands.slot_indices.tolist() == [1, 2, 3]
     assert operands.query_start_loc_cpu.tolist() == [0, 17, 34, 51]
     assert operands.query_start_loc_cpu.dtype is torch.int32
@@ -546,6 +550,7 @@ def test_vllm_profile_timed_callable_is_one_fused_call(monkeypatch) -> None:
         return 0.25
 
     monkeypatch.setattr(runner, "_load_vllm_components", lambda: (fake_fused, object()))
+    monkeypatch.setattr(runner, "conv_state_dim_first", lambda: False)
     monkeypatch.setattr(runner, "_build_operands", fake_build)
     monkeypatch.setattr(runner, "_check_correctness", fake_guard)
     monkeypatch.setattr(runner.Timer, "cupti", staticmethod(fake_timer))

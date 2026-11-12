@@ -77,6 +77,24 @@ Precision is then per segment, never global, because a real checkpoint is mixed:
 - GLM-5.2 NVFP4 converts only `mlp.experts`: packed E2M1 weights cost half a
   byte each and read one FP8 E4M3 scale per 16 weights. Dense layers, attention,
   router, shared experts, embedding, and head remain BF16.
+- A ModelOpt `MIXED_PRECISION` checkpoint (Qwen3.8-27B-NVFP4) instead lists
+  every converted Linear per layer under `quantized_layers`, each with its own
+  algorithm; anything unlisted stays at the master dtype, as in vLLM's
+  `ModelOptMixedPrecisionConfig`. `FP8` is E4M3 with one static FP32 scale per
+  tensor, `NVFP4` the E2M1 + per-16 E4M3 scale above. The builder passes its
+  layer schedule (every layer of one type must quantize alike; a caller without
+  one falls back to the config's own `layer_types`) and vLLM's
+  `packed_modules_mapping`, so the checkpoint's shards (`q_proj`, `k_proj`,
+  `v_proj`) name the fused matrix the spec carries (`self_attn.qkv_proj`); its
+  shards must share one algorithm. Qwen3.8 stores the GDN `in_proj_qkvz` and
+  `out_proj` and the attention `qkv_proj`/`o_proj` in FP8, the MLP and
+  `lm_head` in NVFP4, and keeps `in_proj_ba`, `conv1d`, the norms and the
+  embedding BF16. Its KV cache is FP8 only by the serving flag
+  (`--kv-cache-dtype fp8`), which the config does not declare: `floors.py`
+  serves it for the arch types in `_FP8_KV_CACHE_ARCHS` (one byte per GQA K/V
+  or MLA latent element, FP8 prefill attention math for GQA). The arch's
+  precision check matches a mixed scheme by its headline, lowest-precision
+  dtype (FP4 here), so the arch needs no `fp8` flag.
 - A mechanism can fix its own precision independently of the weights:
   `AttentionSemantic.compute_dtype` pins GLM's DSA index logits to FP8 (the index
   cache is FP8 by construction) and its sparse MLA to BF16 (vLLM's FlashMLA
@@ -113,6 +131,17 @@ models/qwen3_6.py    hybrid [GDN×3, GQA×1] + dense    registry.py  architectur
 models/glm52.py      dense/full-index + sparse/index-share stacks + shared MoE
 attention/deepseek_v41.py  DeepSeek-V4.1 window + compressed sparse attention
 models/deepseek_v41.py     10 role stacks + MXFP4 MoE + FP32 mHC mixing + engram
+attention/dspark.py        DSpark context K/V + non-causal block over the draft window
+models/dspark.py           staged DSpark proposer (context / draft / Markov stages)
+attention/inkling_rel.py   Inkling relative-position SWA/global attention + K/V short conv
+mixers/short_conv.py       sublayer-output short convolutions + their norms (Inkling)
+models/inkling.py          local/global x dense/BF16/NVFP4-expert stacks + sink-expert MoE
+attention/sliding_window.py  causal sliding-window GQA (exact per-request geometry)
+models/mimo_v2.py          GA/SWA x dense/MoE stacks, asymmetric QK/V, SWA sinks, MXFP4 MoE
+attention/qsa.py           Qwen4Exp QSA: pooled-indexer top-k sparse GQA
+mixers/gated_hc.py         gated low-rank hyper-connection residual streams (Qwen4Exp)
+mixers/ngram_embedding.py  hashed n-gram embedding + dilated conv history (Qwen4Exp)
+models/qwen4_exp.py        GDN/QSA stacks + n-gram layer + gated HC + NVFP4 MoE + staged MTP
 ```
 
 - **New attention (MLA/SWA/SSM)** → one new `attention/*.py`; every FFN combination is free.
@@ -179,6 +208,63 @@ analyzer sends one summed interaction per phase, so this spec reconstructs a
 mean request per phase: exact for a single request, an over-estimate of the
 sparse-attention floor when a batch straddles the window/top-k caps. The DSpark
 MTP layers and the vision tower are not labeled.
+
+Inkling (`InklingForConditionalGeneration`, text decoder only) mixes 512-key
+sliding-window layers with global layers. Every query also adds a learned
+relative logit per head and distance (`d_rel x E` table; `E` is the window on
+local layers, `rel_extent` on global ones): only distances a query can reach are
+necessary, so those FLOPs are `2*H*d_rel*sum_q min(pos_q + 1, E)`. A depthwise
+4-tap short convolution runs on K, on V, and on each sublayer output; its
+persistent state is the last `W - 1` inputs per stream, so a request reads
+`min(prefix, 3)` and writes `min(append, 3)` rows. A local layer's KV cache keeps
+only `min(append, 511)` new tokens. The two always-on sink experts are the MoE's
+shared expert, and the router scores all 258 experts. The checkpoint's tables
+hold 201,024 rows for a 200,058-token vocabulary (`Model.param_vocab`): the padding
+counts as parameters only. Text-path parameters reconcile exactly with both
+checkpoints' safetensors headers (263,655,199,274 Small, 947,025,564,226 large).
+The arch opts into per-request decode geometry, because the window, the extent and
+the short-conv states make the minimum non-linear in context.
+
+MiMo-V2.6-Flash (`MiMoV2ForCausalLM`, text decoder only) composes generic pieces.
+`GQA` takes a `v_head_dim` (QK 192, V 128: a pair costs `2*H*(d_qk + d_v)` FLOPs and
+the cache stores `d_qk + d_v` per KV head) and optional per-head softmax sinks, which
+add no key and no FLOP, only their learned vector. Its nine global layers (KV4) are
+plain `GQA`; its 39 window layers (KV8, 128 keys including the query's own, sinks)
+are `SlidingWindowGQA`, which counts `sum_q min(pos_q + 1, W)` pairs, reads
+`min(prefix, W - 1)` cached keys and keeps `min(append, W - 1)` new ones. That
+window is not linear in summed geometry, so the spec labels only the logged
+per-request geometry and refuses a collapsed aggregate; the arch must log
+`decode_kv_lens`. Layer 0 is a dense SwiGLU, the other 47 the shared MoE (E256 top-8,
+sigmoid `noaux_tc` with an FP32 selection bias). The FP8 config's `ignored_layers`
+(vLLM's preferred key) keeps every `o_proj` BF16 and `store_dtype: mxfp4` stores the
+routed experts as E2M1 plus one E8M0 scale per 32 weights, multiplied by BF16
+activations; the router and `lm_head` are BF16 in the checkpoint though unlisted.
+Text-path parameters reconcile exactly with the safetensors headers (308,778,780,864).
+`mimo_v2_vllm_fp8_swa_moe_tp4_ep4_unified.json` maps it onto the TP4 = EP4 arch. Its
+RMSNorms run only inside the fused all-reduce leaves (communication), so each learned
+scale sits at the GEMM its output feeds (input norm -> `qkv_proj.gemm`, post-attention
+norm -> dense `gate_up` / MoE `router`, final norm -> `lm_head`); the sinks join the
+attention row and the FP32 selection bias the rank-0 routed leaf.
+
+Qwen3.8-Flash-Next (`Qwen4ExpForConditionalGeneration`, text decoder only) interleaves
+36 Gated DeltaNet and 12 QSA layers over a 4-stream gated low-rank hyper-connection
+residual (`mixers/gated_hc.py`: per module a rank-320 down/up gate, a stream-injection
+projection, and `2·S·hidden` FLOPs per gated stream mean and per injected combine; a
+final mixer collapses the streams). QSA (`attention/qsa.py`) scores mean-pooled
+groups of 4 indexer keys and attends `min(k, 2048 + k mod 4)` keys per query (the
+kpool closed forms); every pass runs its own indexer, the MTP layer's recurrent draft
+steps included (the checkpoint has no `index_share_for_mtp_iteration`). Layer 1
+adds a hashed n-gram embedding (`mixers/ngram_embedding.py`): its 51.2 G-element
+FP8 table counts as parameters and is read only at the `16·tokens` gathered rows
+(the deployment keeps it in host memory), and its dilated convolution keeps a 9-row
+history per request. Every layer is a 512-expert top-10
+MoE with a sigmoid-gated shared expert (NVFP4 experts); the staged MTP layer has
+FP8 128-block experts and shares the target's embedding and `lm_head`. Parameters
+reconcile exactly with the safetensors header (176,943,899,520 body,
+2,607,150,848 MTP). `qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_unified.json`
+(340 locations) maps `draft_tokens >= 2`;
+`qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative_single_draft_unified.json` (286) maps
+`draft_tokens = 1`, which compiles no recurrent MTP pass.
 
 ## Modality-agnostic workload
 
@@ -305,6 +391,34 @@ locations of each MoE stack in these three maps (the older Flash maps still put
 a stack's expert rows on rank 0 alone). The analyzer splits such a row among its
 locations in proportion to their R5 hardware-limit GPU-seconds, so the row is
 still counted once; a location may not list a row twice.
+### DSpark proposer
+
+DeepSeek-V4.1-Flash-1017 ships its proposer in the target checkpoint (`mtp.{0,1,2}`),
+so `models/deepseek_v41.py` always builds it as staged stacks (`models/dspark.py`)
+that run, and count, only when a workload carries the DSpark stages; a
+non-speculative label is unchanged. Sources: the reference `inference/model.py`
+(`DSparkBlock`, `DSparkAttention`, `DSparkMarkovHead`, `forward_spec`) and the
+safetensors headers (14,225,356,770 draft parameters: every `mtp.*` tensor less the
+never-run `confidence_head` and the image-only `bias_vl`). With `k =
+dspark_block_size` (= `draft_tokens`, verify width `k + 1`), `speculative.py` builds:
+
+- `dspark_context`, over every target row `C`: `main_proj` (FP8, the
+  `dspark_target_layer_ids` layers' hc-mean hidden states, `3·hidden -> hidden`),
+  `main_norm`, and per draft layer its `wkv`/`kv_norm` plus the surviving
+  window-cache appends (`min(rows, window)` per request, 528 B each).
+- `dspark_draft`, over `R · k` block rows (anchor first, then noise tokens): three
+  sliding-window DeepSeek-V4.1 layers (target attention projections, FP32 mHC
+  mixing, a 128-expert top-3 MXFP4 MoE with one FP8 shared expert), the block
+  attending `min(window, context)` cached entries plus its own `k` keys
+  non-causally (`k · (min(W, context) + k)` pairs per request; the block keys are
+  not cached), the final `norm`, and the target `lm_head` over every block row
+  (FLOPs only).
+- `dspark_markov`, `k` sequential steps of `R` rows: a gathered rank-256
+  `markov_head.embed` row and the BF16 `markov_head.head` (`2·rank·vocab` FLOPs per
+  drafted position, head read once).
+
+The draft's embedding (the target's table), hc expand/collapse, the logit-bias add
+and greedy argmax carry no row. Every scheduled request drafts.
 
 Request-side admission/completion telemetry separately records completed rounds,
 emitted outputs, resident KV, and pending work. Conservation uses those facts,
@@ -329,7 +443,8 @@ convention, so `params["activated"]` exposes **all** of them rather than picking
 - **Golden** — hand-computed FLOP buckets + `total`/`activated` params for a reference
   model, asserted in `tests/test_model_work.py`. (Llama3-8B: total 8.030 B, activated
   6.979 B; Qwen3-235B-A22B MoE: total ≈ 235 B, activated ≈ 22 B; Qwen3.6-27B hybrid:
-  total 26.895 B over 48 GDN + 16 gated-full layers, dense so activated == total.)
+  total 26.896 B over 48 GDN + 16 gated-full layers, dense so activated == total;
+  Qwen3.8-27B-NVFP4 shares that text model and its count.)
 - **Oracle** (Phase 3) — cross-check against the sim's *unsharded* per-op `slot_flops`:
   for a sharded, non-replicated matmul, `Σ achieved == labeler F_min` bucket (ratio ≈ 1).
 

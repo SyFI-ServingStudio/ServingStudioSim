@@ -59,8 +59,9 @@ DOC = KernelDoc(
         "The simulator prices small memory-bound steps by their bytes alone: a "
         "MoE activation reads 2N bytes and writes N, a reduction over k inputs "
         "reads kN, a copy reads N, and a zero fill reads nothing. The byte counts "
-        "cover the whole batch. Both backends work on uint8 buffers and round the "
-        "input-to-output ratio to a whole fan-in."
+        "cover the whole batch. The triton and torch backends work on uint8 "
+        "buffers and round the input-to-output ratio to a whole fan-in; the "
+        "torch_strided_copy and torch_cat backends price one-input bf16 copies only."
     ),
     category="Other",
     formula=(
@@ -69,9 +70,9 @@ DOC = KernelDoc(
     ),
     default_metric="memory_bandwidth_gbps",
     method=(
-        f"{CUPTI_METHOD} Both backends run five warm-ups before timing. Triton "
+        f"{CUPTI_METHOD} Every backend runs five warm-ups before timing. Triton "
         "counts only the elementwise_fan_kernel or elementwise_zero_kernel launch; "
-        "torch counts every launch of its selected PyTorch operation."
+        "the eager backends count every launch of their PyTorch operation."
     ),
     caveats=(
         "The backends match byte counts, not values: Triton sums each fan-in, "
@@ -87,7 +88,6 @@ DOC = KernelDoc(
 )
 
 
-
 # Two realizations of the one byte contract, and the choice is load-bearing at
 # small sizes where both kernels are launch-bound: `triton` for a slot the
 # framework hands to a Triton kernel (including torch-compile output), `torch`
@@ -95,10 +95,45 @@ DOC = KernelDoc(
 # TensorIterator. Picking `triton` for a torch-realized slot under-predicted a
 # measured vLLM shared-expert gate application by 71.5%. A fused CUDA op such as
 # vLLM's `act_and_mul_kernel` is neither, and belongs in its own kernel kind.
-for _backend, _runner_module in (
-    ("triton", "profiling.runners.elementwise.triton"),
-    ("torch", "profiling.runners.elementwise.torch"),
+#
+# Two more eager realizations exist only for a one-input copy (input bytes ==
+# output bytes) and copy bf16 elements: `torch_strided_copy` for a copy whose
+# source is a non-contiguous view, which TensorIterator cannot vectorize and so
+# runs the legacy `elementwise_kernel` at about half the unary map's rate, and
+# `torch_cat` for `torch.cat`, which runs `CatArrayBatchedCopy`. Pricing a
+# vLLM Qwen3.8-27B strided core-output copy with the unary map under-predicted
+# it by 55% at 7.8k tokens, and its cat over-predicted by 54%.
+_SUMMARIES = {
+    "triton": "Triton kernels: elementwise_fan_kernel sums the fan-in uint8 "
+    "inputs, elementwise_zero_kernel fills zeros.",
+    "torch": "Eager PyTorch: bitwise_not for fan-in 1, amax over the inputs for "
+    "more, zero_ for a fill.",
+    "torch_strided_copy": "Eager PyTorch copy_ from a non-contiguous bf16 view "
+    "(two planes of 256-byte rows transposed): the legacy direct_copy "
+    "elementwise_kernel. Copies only.",
+    "torch_cat": "Eager torch.cat of two bf16 halves: CatArrayBatchedCopy. Copies only.",
+}
+
+# Each eager realization is also registered with a `_vllm` suffix: the same
+# runner in vLLM's pinned environment (its Torch build), for a model whose
+# glue rows must come from the serving build.
+_EAGER = (
+    ("torch", "profiling.runners.elementwise.torch", "profile_elementwise"),
+    (
+        "torch_strided_copy",
+        "profiling.runners.elementwise.torch",
+        "profile_elementwise_strided_copy",
+    ),
+    ("torch_cat", "profiling.runners.elementwise.torch", "profile_elementwise_cat"),
+)
+for _backend, _runner_module, _function, _env in (
+    ("triton", "profiling.runners.elementwise.triton", "profile_elementwise", None),
+    *((b, m, f, None) for b, m, f in _EAGER),
+    *((f"{b}_vllm", m, f, "vllm_env") for b, m, f in _EAGER),
 ):
+    _summary = _SUMMARIES[_backend.removesuffix("_vllm")]
+    if _env is not None:
+        _summary += " Run in vLLM's pinned environment."
     register(
         KernelProfilerSpec(
             kernel_kind=KIND,
@@ -107,20 +142,15 @@ for _backend, _runner_module in (
             supports=BackendSupport(compute=None),
             runner_ref=RunnerRef(
                 module_name=_runner_module,
-                function_name="profile_elementwise",
+                function_name=_function,
             ),
             table_name=KIND,
             args_schema=ElementwiseArgs,
             metric_family=MetricFamily.COMPUTE,
             batch_outlier_policy=BatchOutlierPolicy(),
             doc=BackendDoc(
-                summary=(
-                    "Triton kernels: elementwise_fan_kernel sums the fan-in uint8 "
-                    "inputs, elementwise_zero_kernel fills zeros."
-                    if _backend == "triton"
-                    else "Eager PyTorch: bitwise_not for fan-in 1, amax over the "
-                    "inputs for more, zero_ for a fill."
-                ),
+                summary=_summary,
             ),
+            subprocess_env=_env,
         )
     )

@@ -8,11 +8,13 @@ description: >-
   one criterion running through the timing layers is the
   timing-prediction wiring — where each element's timing comes from: L1 is the
   only layer that MEASURES a number (profile.db); L2/L3/L4 only COMPOSE measured
-  L1 timings. Adding an arch is paired with alignment by default: unless the user
-  declines, capture a real vLLM/SGLang run first and let the measured kernel
-  inventory — not source-reading guesswork — decide which kernels to add, largest
-  first. This is a routing/sequencing skill; it delegates each phase to a lower
-  skill and does not implement leaves itself.
+  L1 timings. Adding an arch is paired with alignment: capture a real
+  vLLM/SGLang run first and let the measured kernel inventory — not
+  source-reading guesswork — decide which kernels to add, largest first. Skipping
+  the capture requires the user's explicit confirmation. This is a
+  routing/sequencing skill; it delegates each phase to a lower skill and does not
+  implement leaves itself. Landing the finished model on main is
+  dev-finalize-model-addition.
 ---
 
 # Top Add New Arch
@@ -44,21 +46,58 @@ or **composed**? That answer is its layer.
 This is both the categorization rule and the through-line of the whole build:
 build bottom-up, and at each element ask "measure it, or wire it from below?"
 
+## Modeling rules
+
+Check every design choice, and every subagent brief, against these rules.
+
+1. **Build the simplest model that matches the measurements.** Before adding a
+   mechanism that mirrors a framework rule, measure its effect where it applies
+   (for example small batches, not only large ones). If the effect is within
+   repeat-measurement noise, leave the mechanism out.
+2. **Set no artificial limits.** Never cap batch size, tokens per step, or
+   context below what the framework allows. That means no hardcoded token cap
+   and no refusal of a step the framework would run. When the framework switches
+   path above a threshold (for example an unfused all-reduce past a fused
+   kernel's token cap), price that path instead.
+3. **Align across deployment settings, not one template value.** The pack's
+   alignment Phase 2 cases must span chunk size, concurrency, and context
+   length; `operate-run-alignment` lists what a pack must cover. The merge
+   needs only alignment Phase 1 (`top-align-with-framework`). Alignment Phase 1
+   and 2 select a pack's cases; they are unrelated to this skill's own Phase
+   0–5.
+4. **Key kernel rows on model geometry and dtypes only.** A deployment setting
+   (`max_num_seqs`, a CUDA-graph capture bound, `max_model_len`) enters a row key
+   only with measured evidence that it changes kernel time. Otherwise every new
+   deployment needs a new set of rows.
+5. **Use generic grids over the full deployment range.** Never pick grid points
+   from the shapes one workload happened to produce.
+6. **Decide kernels and paths from evidence.** Cite the framework source by
+   file and line and confirm it in a capture. Profile rows on the same framework
+   build the serving run used.
+7. **Keep shared code generic and model code config-derived.** Put no model
+   names in kernel kinds or shared layers, and derive every dimension from the
+   checkpoint config. After a shared change, confirm that other models' runs are
+   unchanged per iteration.
+8. **Report honestly.** Give every out-of-tolerance result a cause you checked.
+   When a later measurement contradicts an earlier claim, correct the claim
+   explicitly.
+
 ## Phase 0 — Capture the real kernel sequence first
 
-**Run this before Phase 1 unless the user declines.** Nearly every architecture
-worth adding already runs in vLLM or SGLang, so the kernels you are about to
-model can be watched instead of inferred. A capture answers two questions no
-amount of source reading answers reliably: **which math is really one fused
-launch**, and **which launches are big enough to matter**.
+**Run this before Phase 1.** Nearly every architecture worth adding already runs
+in vLLM or SGLang, so the kernels you are about to model can be watched instead
+of inferred. A capture answers two questions no amount of source reading answers
+reliably: **which math is really one fused launch**, and **which launches are big
+enough to matter**. Without them, every kernel gets the same effort and the
+fusion guesses stay untested until Phase 5.
 
-It can run this early because the profile phase stands alone — it needs only the
+It can run this early because the profile step stands alone — it needs only the
 real engine running the checkpoint, not any ServingStudio Sim code. (Only the
-later `timing-predict` phase reads a `simulation.yaml` preset, and that preset
+later `timing_predict` step reads a `simulation.yaml` preset, and that preset
 needs the arch you have not written yet.)
 
-- **How.** Route to `operate-run-alignment` and run **only its profile phase**,
-  `profile_kind: nsys`. Stop there: the label and analyze phases compare against
+- **How.** Route to `operate-run-alignment` and run **only its profile step**,
+  `profile_kind: nsys`. Stop there: the label and analyze steps compare against
   a CostTree you do not have yet. They run in Phase 5, on this same capture.
 - **MoE models get a second pass**, `profile_kind: token_corpus`. Routing skew
   redistributes tokens into fuller and emptier expert groups, which changes the
@@ -77,11 +116,16 @@ needs the arch you have not written yet.)
   launch edges are and which ones are large; `dev-lookup-transformers-model`
   still tells you what each one computes.
 
-If the user declines, or the model has no vLLM/SGLang implementation, or there is
-no GPU or checkpoint: Phase 1's source-reading path still works, but mark every
-granularity verdict `inferred, unverified` in the decision table and say plainly
-what that costs — Phase 5 becomes the first and only place those guesses are
-tested, and a fusion edge found wrong there is a rebuild of L1/L2, not a retune.
+Missing prerequisites — weights not yet downloaded, an engine environment not
+yet installed, a GPU allocation still queued — are setup work for this phase,
+not reasons to skip it.
+
+**Skipping the capture requires the user's explicit confirmation.** If it truly
+cannot run, ask the user, stating the blocker and what skipping costs; do not
+decide it yourself. With that confirmation, Phase 1's source-reading path still
+works, but mark every granularity verdict `inferred, unverified` in the decision
+table — Phase 5 becomes the first and only place those guesses are tested, and a
+fusion edge found wrong there is a rebuild of L1/L2, not a retune.
 
 ## Phase 1 — Explore & split against the capture
 
@@ -116,12 +160,12 @@ Build in strict bottom-up order; each layer only wires the layer below.
 - **L1 — kernels (get the timing), largest first.** For each *new dedicated
   kernel* verdict, run `top-add-kernel` (Python profiling + Rust timing/cache).
   Reuse / elementwise / fold verdicts need no new L1. Done when `profile.db` has
-  the rows and the Rust cache resolves.
+  the rows and the Rust cache resolves. Scale each kernel's cache-fidelity
+  effort to its measured share (`impl-validate-kernel-cache`).
 
-  Work the Phase 1 table top-down, biggest measured share first. Everything below
-  your current line already has a home — an `elementwise` placeholder or a fold —
-  so the arch is complete and runnable at every point in the build; descending the
-  table improves precision, not coverage.
+  Work the Phase 1 table top-down, biggest measured share first. Ops you do not
+  build keep their Phase 1 home, an `elementwise` placeholder or a fold, so L1
+  can stop before the end of the table without leaving a gap.
 
   Not forward order. Iteration time is dominated by a handful of kernels, so error
   retires fastest at the top of the table: a placeholder standing in for a 0.5% op
@@ -129,14 +173,16 @@ Build in strict bottom-up order; each layer only wires the layer below.
   Building embed → norm → QKV → … in forward order spends the expensive
   `top-add-kernel` budget on ops that cannot move the number.
 
-  Stop rule: after each new kernel, re-run Phase 5's checks and watch the
-  deviation drop. Promote the next placeholder only while its remaining share
-  justifies it — a placeholder the comparison already shows is close is a finished
-  answer, not a debt.
+  Stop rule: choose the set to build from the measured shares before starting,
+  and leave the rest as placeholders. L1 is done when every kernel in the set has
+  `profile.db` rows and a resolving Rust cache; only then move to L2. Do not
+  start L2 while L1 work is still open. After Phase 5, its comparison ranks which
+  placeholder to promote next; that starts a new L1 round, followed by the L2–L4
+  rewiring it needs.
 
   The stop rule picks *which* kernels to build, not the order you build them in.
-  Once several have cleared it, hand them to `top-add-kernel` as one set and let
-  it fan out — see its "Several kernels at once".
+  Hand the chosen set to `top-add-kernel` together and let it fan out — see its
+  "Several kernels at once".
 - **L2 — ops (sum + normalize).** Compose kernels into named ops: atomic
   (`Op<K>`, one kernel, naming only) or compound (hand-written, multi-kernel +
   op normalization). Boundary — a fixed 0-overlap sequence; comm merges into the
@@ -171,6 +217,10 @@ Build in strict bottom-up order; each layer only wires the layer below.
 - **L4 — arch (fan-out + stitch).** Wire the chosen worklets into the
   `model_arch` cost file: prologue / per-layer / epilogue groups, multi-rank
   fan-out, and `WorkletGroup` boundaries. It computes no partition itself.
+  The arch also declares one request's KV state part by part
+  (`kv_cache_layout`: per-token, sliding-window, per-request), which sizes
+  capacity, admission and prefix hits; check it against the Phase 0 capture's
+  logged vLLM KV concurrency.
   Skill `impl-compose-arch` (contract: `simulator/src/arch/README.md`).
 
 ## Phase 3 — Wire (make it selectable & predictable)
@@ -229,7 +279,7 @@ deployment — you do not need a workload / pools / trace to check the cost mode
   plausibly-scaled timing (no missing kernel, no absurd µs). This is the tightest
   loop for catching a mis-wired L2/L3/L4 composition.
 - **Then close the loop on the Phase 0 capture** — the arch now exists, so the
-  alignment phases that were blocked in Phase 0 can run. Resume that experiment in
+  pipeline steps that were blocked in Phase 0 can run. Resume that experiment in
   `operate-run-alignment`: `timing-predict` → label → `analyze` (kernel-align),
   then hand the artifacts to `top-align-with-framework` for Check 1, the
   per-kernel comparison against measured. **Never re-run the GPU profile** — the
@@ -241,20 +291,24 @@ deployment — you do not need a workload / pools / trace to check the cost mode
   Phase 1 verdicts — a large simulated slot with no measured kernel usually means
   a **fold** verdict was wrong, and a large unmapped measured kernel usually means
   the split **missed an op**.
-- **Then a real run** — once the per-building-block numbers look right, graduate to
-  `operate-run-simulation`: build + `--dry-run` to confirm the expanded plan, then
-  launch a small workload and sanity-check end-to-end throughput. This is also what
-  the alignment run's duty-cycle and TTFT/TPOT checks need, so if you want Checks
-  2–3 they follow here, not above.
+- **Then alignment Phase 1 for each deployment** — once the per-building-block
+  numbers look right, run each deployment's alignment Phase 1 case (the tracked
+  diverse_100 replay) through Check 1 (kernel), Check 2 (duty cycle) and Check 3
+  (TTFT/TPOT/E2E) with `operate-run-alignment --alignment-phase 1`, judged by
+  `top-align-with-framework`. Phase 5 ends there; landing the model is
+  `dev-finalize-model-addition`.
 
 ## Delegation boundary
 
 You are the umbrella, not an implementer. Issue each phase to the named skill and
-verify its closeout before moving up a layer. Stop and return to the user between
-phases whenever a design decision surfaces — a new args schema, a boundary call,
+verify its closeout before moving up a layer. In single-agent mode, to run the
+phases with parallel subagents (capture beside the build, one lane per kernel
+family and per worklet), follow `dev-parallelize-arch-addition`. Stop and return
+to the user between phases whenever a design decision surfaces — a new args schema, a boundary call,
 or a deviation from the design docs — rather than deciding it silently. The build
 is complete only when every element from the Phase 1 table has a home at its
 correct layer, the arch is wired (Phase 3), `model.work` support and the intended
-deployment maps are complete (Phase 4), and the Phase 5 checks pass — including,
-unless the user declined Phase 0, a Check 1 comparison with no missing large
-kernel and every material deviation attributed.
+deployment maps are complete (Phase 4), and the Phase 5 checks pass — each
+deployment's alignment Phase 1 through Checks 1–3, with no missing large kernel
+in Check 1 and every material deviation attributed. To publish and
+merge the finished model, continue with `dev-finalize-model-addition`.

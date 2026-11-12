@@ -57,49 +57,38 @@ This is why `KernelKind` strings must match exactly across the boundary (below).
   card. Passing the index across silently profiles GPU 0 instead: concurrent
   workers pile onto one card, and the idle check that cleared the allocated card
   never sees it. Resolution raises rather than falling back to the index.
+  The same UUIDs also go into the container's `CUDA_VISIBLE_DEVICES`, because a
+  rootless Podman inside a Slurm job ignores `--gpus` and exposes every job GPU.
+  Each worker reports the UUIDs it saw (`gpu_uuids` in its output), and a chunk
+  whose worker saw anything but the reserved cards fails and stores nothing
+  (`exec/local.py:worker_gpu_mismatch`).
 - The **backend's runtime libraries** — torch, FlashInfer, Triton, NCCL/NVSHMEM —
   available in the selected subprocess interpreter. These are imported **lazily
   inside the worker subprocess**, never in the simulator/main process.
 - The `profilers/` timing primitives (`Timer.cupti`, `Energy.perf`, the CUPTI
   C++ extension).
 
-The pinned `vllm_env` also owns a `lib/cuda-compat` link beside its virtual
-environment. Point that link at the unpacked NVIDIA forward-compatibility
-library used by the matching alignment run. Environment validation fails before
-acquiring a GPU when the link is absent; the execution layer prepends it to
-`LD_LIBRARY_PATH` before Torch's libraries.
+Every profile env runs its workers in an image
+(`profiling/container/images.py`, `profiling/container/README.md`): build them
+with `just profile-container-build`, and a worker whose image is missing fails
+with the command that builds it. The CUDA 13 images also run on an older
+datacenter driver: the CUDA base image carries the forward-compatibility
+libraries (`/usr/local/cuda/compat`), which the NVIDIA container runtime uses
+when the host driver predates the image's CUDA (seen on driver 570, CUDA 12.8).
 
-`vllm_upstream_fork_env` is a host env: the alignment checkout
-`alignment/profiler/vllm` (or `$VIBESIM_VLLM_FORK_ROOT`) and its own `.venv`. It
-serves the backends that need that checkout rebased onto upstream vLLM (its
-models and newer FlashInfer, DeepGEMM and FlashMLA builds), which the
-`vllm_env` image, built from fork commit 3f667d7, lacks. The worker drops
-inherited site-packages from `PYTHONPATH`, so the project Torch cannot shadow
-the venv's own build. Once the container is rebuilt from the rebased checkout,
-move those backends to `vllm_env` and remove this env.
+`VIBESIM_PROFILE_RUNTIME=host` runs each env on the host interpreter its
+registry entry names instead, for debugging against a local build. Those rows
+carry the same DB key as the image's, so compare them against the image before
+keeping them. The host setups follow.
 
-`flashkda_env` is a host venv at `~/profile_envs/flashkda_env` (a symlink to a
-disk with room is fine) for the `kda_chunk_prefill` `flashkda` backend. It holds
-Torch 2.13.0 (cu130, upstream vLLM's pin) and FlashKDA built from
-`vllm-project/FlashKDA@17a037d98da546deb4591e967cf961a43c034d8b`, the commit
-upstream vLLM vendors as `_flashkda_C`. The project Torch is cu128 and cannot
-build FlashKDA's `sm_100f`/`sm_120f` code, so the backend needs its own venv.
-Build it with a CUDA 13 toolkit:
+`vllm_env` on the host is the materialized vLLM reference engine
+`reference_engines/vllm/src` (`just ref materialize vllm`, or
+`$VIBESIM_VLLM_FORK_ROOT`) and its own `.venv`, built as
+`alignment/profiler/README.md` describes. The worker drops inherited
+site-packages from `PYTHONPATH`, so the project Torch cannot shadow the venv's
+own build.
 
-```bash
-uv venv --python 3.12 ~/profile_envs/flashkda_env
-uv pip install --python ~/profile_envs/flashkda_env/bin/python \
-  torch==2.13.0 numpy nvidia-ml-py setuptools wheel packaging ninja
-git clone https://github.com/vllm-project/FlashKDA.git && cd FlashKDA
-git checkout 17a037d98da546deb4591e967cf961a43c034d8b
-git submodule update --init --depth 1 cutlass
-CUDA_HOME=/usr/local/cuda-13.1 FLASH_KDA_CUDA_ARCHS=90a,100f,120f \
-  uv pip install --python ~/profile_envs/flashkda_env/bin/python --no-build-isolation .
-```
-
-The package version (`0.0.1+17a037d`) goes into each row's `backend_version`.
-
-`flashinfer_kda_env` is a host venv at `~/profile_envs/flashinfer_kda` (or a
+`flashinfer_kda_env` on the host is a venv at `~/profile_envs/flashinfer_kda` (or a
 symlink to it) for the `kda_chunk_prefill` `flashinfer_*` backends. FlashInfer's
 Blackwell KDA prefill kernels are only on its main branch, and they need Torch
 cu130, CuTe DSL >= 4.7 and a CUDA-enabled TVM with TIRx, so neither the project
@@ -343,6 +332,14 @@ SELECT t.*, r.profiler_git_hash, datetime(t.profiler_run_at, 'unixepoch')
 FROM single_gemm t JOIN _profile_run r USING (run_key)
 ```
 
+An args field added to a kind that already has rows is declared with
+`optional_arg(same_as=...)` (`profiling/db/doc.py`), last in its schema: unset
+(or equal to `same_as`) it is stored NULL and left out of `args_hash`, so
+existing rows keep their keys and no migration runs. The table gains the
+nullable column, appended, only when a row first sets it; readers of a table
+without it treat it as unset, and `merge-db` merges a table with it and one
+without. Example: `kv_cache_append.head_dim_v` (`same_as="head_dim"`).
+
 A DB an older checkout wrote (schema v2) is refused by readers until
 `python -m launcher kernel-profile migrate-db <path>` upgrades it in place; the
 upgrade keeps every row and id and then VACUUMs the file.
@@ -371,7 +368,7 @@ python -m launcher kernel-profile list [--json]
 python -m launcher kernel-profile query         <table> --backend <b> [--spec '{...}'] [--specs file] [--gpu-name N] [--db path]
 python -m launcher kernel-profile count-missing <table> --backend <b> ...
 python -m launcher kernel-profile run           <table> --backend <b> [--force | --fresh] ...
-python -m launcher kernel-profile measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2]
+python -m launcher kernel-profile measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2] [--cuda-graph]
 python -m launcher kernel-profile merge-db LEFT.db RIGHT.db --output MERGED.db [--report REPORT.json]
 python -m launcher kernel-profile migrate-db profile.db
 python -m launcher kernel-profile audit-provenance [--db profile.db] [--json]
@@ -443,4 +440,8 @@ for this verb (see `profilers/measure_context.py`, `profilers/trend.py`) — **n
 runner changes**, and the guard is inert for every other call. `--no-clear-l2`
 switches from the default cold per-launch L2-displacement (matching the `profile.db`
 measurement) to a warm continuous window that surfaces sustained power/clock drift.
+`--cuda-graph` replays the kernel from a CUDA graph so host dispatch leaves no gap
+between launches; with `--no-clear-l2` the GPU then runs it back to back, as a
+graph-captured serving step does, and settles at its power-limited clock
+(`gpu/measure_sustained.py` uses this for the `sustained` rates in `gpu/spec.json`).
 Kernels whose runner does not time through `Timer.cupti` (e.g. comm) are rejected.

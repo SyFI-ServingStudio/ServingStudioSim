@@ -1,18 +1,21 @@
 ---
 name: orchestrator-wire-kernel-to-rust
 description: >-
-  Use when orchestrating the Rust timing/cache wiring for a ServingStudio Sim L1 kernel
-  after the Python profiling side is defined. This skill is for the coordinator
-  who turns a Python-to-Rust handoff into Rust implementation tasks, verifies
-  KernelSpec/cache/bridge behavior, and decides when cache fidelity is good
-  enough. It does not implement Python runners or profile new backend sources.
+  Use when owning the Rust timing/cache wiring for a ServingStudio Sim L1 kernel
+  after the Python profiling side is defined, either as the coordinator who
+  briefs an implementer or as the agent a whole kernel was handed to. Turns a
+  Python-to-Rust handoff into Rust steps, verifies KernelSpec/cache/bridge
+  behavior, and decides when cache fidelity is good enough. It does not
+  implement Python runners or profile new backend sources.
 ---
 
 # Orchestrator Wire Kernel To Rust
 
-You are the orchestrator, not the implementer. Your job is to take the
-Python-side facts for a kernel and turn them into Rust timing/cache wiring tasks
-under `simulator/src/timing/`, with completion criteria you can verify.
+This skill takes the Python-side facts for a kernel and turns them into the
+Rust timing/cache wiring steps under `simulator/src/timing/`, each with
+completion criteria. It is written for the orchestrator who briefs an
+implementer. When a whole kernel was handed to you (`top-add-kernel`), you own
+it: do the steps yourself and run their checks yourself.
 
 This skill starts after the Python profiling side has a working registry entry,
 runner, public CLI smoke, and a Python-to-Rust handoff. If those facts are
@@ -35,9 +38,15 @@ Use docs as background, but let current code decide the exact API shape.
 
 ## Verification Ownership
 
-The implementer may be another agent, but the verifier is the orchestrator. Ask
-for evidence, then independently inspect the Rust diff and rerun the relevant
-commands when feasible.
+The tasks below are checkpoints for whoever owns the kernel, not one delegation
+each. The owner checks each one before moving on and stops at the first that
+fails.
+
+An orchestrator that delegated the kernel reviews it once, at the closeout:
+inspect the Rust diff and rerun only the cheapest commands that would expose a
+false claim, such as the focused tests or one `kernel-query grid`. Do not
+reproduce the owner's whole run, and never delegate a task whose only purpose is
+to re-check the previous one.
 
 ## Task R.1 — Validate The Python-To-Rust Handoff
 
@@ -72,7 +81,10 @@ orchestrator before assigning implementation.
 
 ## Task R.2 — Decide Rust Kernel Shape
 
-Ask the implementer to propose the Rust `KernelSpec` shape before writing code:
+When the kernel is a new backend of a kind whose Config, Input, grid, and cache
+already fit, there is no shape to decide: confirm the fit and go on to R.3.
+Otherwise, ask the implementer to propose the Rust `KernelSpec` shape before
+writing code:
 
 - new `simulator/src/timing/kernels/<kind>.rs` or reuse/variant of an existing
   kind via `profile_kind()`;
@@ -101,6 +113,9 @@ Things to verify:
 - the proposal reports its feasible-coordinate count and it is at most 500;
 - `CacheKind` is one currently built in `timing/cache/mod.rs`, unless the user
   explicitly approved adding a new cache variant;
+- the change stays in the kernel's own leaf and `slot_input.rs`. Changing the
+  shared engine, bridge, or cache code to fit one kernel needs the user's
+  approval, the same as a new cache variant;
 - if multiple cache/grid choices are plausible, summarize tradeoffs and ask the
   user which one to implement first.
 
@@ -139,7 +154,8 @@ printf '%s' '{"op":"grid","kind":"<kind>","config":{...}}' \
 
 Do this after Rust wiring compiles and `kernel-query grid` works. Ask the
 implementer to validate interpolation or quantization error through
-`impl-validate-kernel-cache`.
+`impl-validate-kernel-cache`. Include the kernel's measured share of iteration
+time in the brief; the check's depth follows it.
 
 Things to verify:
 
@@ -149,20 +165,21 @@ Things to verify:
 - re-axis/domain kernels use a thin caller with physical probes;
 - report includes median ratio, within-rate, worst ratio, regions, and CSV/log
   path;
-- the orchestrator inspected the final CSV/log summary, not just accepted that
-  the command ran;
+- the orchestrator inspected the final CSV/log summary and the worst probes,
+  not just accepted that the command ran;
 - the reported error is acceptable under the user-specified threshold, or the
   default fidelity bar from `impl-validate-kernel-cache`;
 - deviations are localized by region and failure mode: interior interpolation,
   extrapolation, quantization bucket boundaries, re-axis mismatch, or noisy
   backend measurements;
-- unacceptable error leads to a concrete remediation plan, not silent
-  acceptance. Consider a denser sweep grid, a different built-in cache kind, a
+- unacceptable error on a kernel whose share justifies it gets one concrete
+  remediation attempt: a denser sweep grid, a different built-in cache kind, a
   better physical re-axis, a fitted variant if the codebase supports it, or a
-  narrower supported domain;
+  narrower supported domain. Otherwise, or if it still fails, list the failing
+  regions in the closeout and move on;
 - if the remediation would increase profiling cost materially, add a new cache
-  or fitting mechanism, change the public query/input contract, or accept a
-  known inaccurate region, ask the user before continuing;
+  or fitting mechanism, or change the public query/input contract, ask the user
+  before continuing;
 - after remediation, rerun fidelity and validate the new final result.
 
 Use `Cache1DDirect` quantization the same way: probe inside buckets and at

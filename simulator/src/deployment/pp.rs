@@ -6,8 +6,8 @@
 //! Wired pairs: `glm52_vllm_nvfp4_pp_dsa_moe` and the hybrid
 //! `glm53_flash_vllm_fp8_pp_kda_dsa_moe`, each with `pipeline_chunked_prefill`.
 //! The arch builds every stage's model once; the stage models are shared across
-//! replicas. The hybrid head charges KV and recurrent state against one block
-//! pool (`PipelineHybridState`).
+//! replicas. The head sizes the pipeline's KV from the arch's
+//! `pipeline_kv_cache_layout`: the most constrained stage's cache.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,10 +25,9 @@ use crate::orchestrator::{
 use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::{
-    build_hybrid_pipeline_head_worker, build_pipeline_head_worker, build_pipeline_stage_worker,
-    resolve_microbatch_sizing, resolve_prefix_cache_config, CostSource, IterWorker, IterWorkerSel,
-    PipelineHeadEvent, PipelineHeadMsg, PipelineHybridState, PipelineLayout, PrefillChunkAlignment,
-    PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    build_pipeline_head_worker, build_pipeline_stage_worker, resolve_microbatch_sizing,
+    resolve_prefix_cache_config, CostSource, IterWorker, IterWorkerSel, PipelineHeadEvent,
+    PipelineHeadMsg, PipelineLayout, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -56,7 +55,7 @@ impl Deployment for PpDeployment {
             pool.groups.len()
         );
         let g = &pool.groups[0];
-        let worker_config = worker_config(cfg, &g.worker)?;
+        let worker_config = worker_config(cfg, &g.worker, g.arch.max_model_len().ok())?;
         let gpu_name = g.gpu.clone();
         let log_dir = Some(cfg.io.log_dir.clone());
         let placement = match pool.placement {
@@ -90,18 +89,23 @@ impl Deployment for PpDeployment {
                     MODEL_NAME,
                     bridge,
                 )?;
+                let stage_kv = stage_tier_bytes(
+                    &pipeline
+                        .stages()
+                        .iter()
+                        .map(|stage| stage.kv_cache_layout())
+                        .collect::<Vec<_>>(),
+                );
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
-                    kv_bytes_per_token: pipeline.pipeline_kv_bytes_per_token(),
-                    tier_kv_bytes_per_token: tier_kv_bytes_per_token(
+                    tier_kv_bytes_per_token: tier_kv_bytes_per_token(&g.worker, &stage_kv),
+                    tier_state_bytes_per_request: tier_state_bytes_per_request(
                         &g.worker,
-                        pipeline.pipeline_kv_bytes_per_token(),
-                        pipeline.total_kv_bytes_per_token(),
-                        pipeline.pp_size(),
+                        &stage_kv,
                     ),
-                    tier_state_bytes_per_request: 0,
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
                 };
+                let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
@@ -124,6 +128,7 @@ impl Deployment for PpDeployment {
                             STAGE_POOL_TAG,
                             Arc::clone(&head_model),
                             layout,
+                            &kv_cache_layout,
                             std::rc::Rc::clone(&head_store),
                             worker_config,
                             head_log_dir.clone(),
@@ -172,41 +177,23 @@ impl Deployment for PpDeployment {
                     MODEL_NAME,
                     bridge,
                 )?;
+                let stage_kv = stage_tier_bytes(
+                    &pipeline
+                        .stages()
+                        .iter()
+                        .map(|stage| stage.kv_cache_layout())
+                        .collect::<Vec<_>>(),
+                );
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
-                    kv_bytes_per_token: pipeline.pipeline_kv_bytes_per_token(),
-                    tier_kv_bytes_per_token: tier_kv_bytes_per_token(
-                        &g.worker,
-                        pipeline.pipeline_kv_bytes_per_token(),
-                        pipeline.total_kv_bytes_per_token(),
-                        pipeline.pp_size(),
-                    ),
+                    tier_kv_bytes_per_token: tier_kv_bytes_per_token(&g.worker, &stage_kv),
                     tier_state_bytes_per_request: tier_state_bytes_per_request(
                         &g.worker,
-                        &pipeline
-                            .stages()
-                            .iter()
-                            .map(|s| {
-                                (
-                                    s.total_kv_bytes_per_token(),
-                                    s.recurrent_state_bytes_per_request(),
-                                )
-                            })
-                            .collect::<Vec<_>>(),
+                        &stage_kv,
                     ),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
                 };
-                let hybrid = PipelineHybridState {
-                    block_tokens: pipeline.block_tokens(),
-                    state_blocks_per_request: pipeline.state_blocks_per_request(),
-                    align_mode: matches!(
-                        g.worker,
-                        IterWorkerSel::PipelineChunkedPrefill {
-                            prefill_chunk_alignment: PrefillChunkAlignment::Checkpoint,
-                            ..
-                        }
-                    ),
-                };
+                let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
                 let head_model = Arc::clone(&pipeline.stages()[0]);
                 let head_store = std::rc::Rc::clone(&store);
                 let head_log_dir = log_dir.clone();
@@ -224,12 +211,12 @@ impl Deployment for PpDeployment {
                     },
                     build_activation_cost(&gpu_name, bridge)?,
                     move |id, cluster| {
-                        build_hybrid_pipeline_head_worker(
+                        build_pipeline_head_worker(
                             id,
                             STAGE_POOL_TAG,
                             Arc::clone(&head_model),
                             layout,
-                            hybrid,
+                            &kv_cache_layout,
                             std::rc::Rc::clone(&head_store),
                             worker_config,
                             head_log_dir.clone(),
@@ -245,20 +232,35 @@ impl Deployment for PpDeployment {
     }
 }
 
-/// Bytes per token each stage reads from a tier: the most loaded stage's, or
-/// with `prefix_tier_balanced_load` the stages' mean (rounded up).
-fn tier_kv_bytes_per_token(
-    worker: &IterWorkerSel,
-    most_loaded: u64,
-    total: u64,
-    depth: u16,
-) -> u64 {
+/// Each stage's `(KV bytes per token, recurrent-state bytes per request)`, as
+/// a DRAM/SSD tier stores them: the stage layout's per-token parts and one
+/// copy of its resumable per-request state.
+fn stage_tier_bytes(layouts: &[crate::arch::kv_layout::KvCacheLayout]) -> Vec<(u64, u64)> {
+    layouts
+        .iter()
+        .map(|layout| {
+            (
+                layout.per_token_bytes(),
+                crate::worker::config::tier_state_bytes_per_request(layout),
+            )
+        })
+        .collect()
+}
+
+/// Bytes per token each stage reads from a tier, given each stage's
+/// `(KV bytes per token, state bytes per request)`: the most loaded stage's,
+/// or with `prefix_tier_balanced_load` the stages' mean (rounded up).
+fn tier_kv_bytes_per_token(worker: &IterWorkerSel, stages: &[(u64, u64)]) -> u64 {
     match worker {
         IterWorkerSel::PipelineChunkedPrefill {
             prefix_tier_balanced_load: true,
             ..
-        } => total.div_ceil(u64::from(depth.max(1))),
-        _ => most_loaded,
+        } => stages
+            .iter()
+            .map(|&(kv, _)| kv)
+            .sum::<u64>()
+            .div_ceil(stages.len().max(1) as u64),
+        _ => stages.iter().map(|&(kv, _)| kv).max().unwrap_or(0),
     }
 }
 
@@ -287,7 +289,11 @@ fn tier_state_bytes_per_request(worker: &IterWorkerSel, stages: &[(u64, u64)]) -
     }
 }
 
-fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<WorkerConfig> {
+fn worker_config(
+    cfg: &PpConfig,
+    worker: &IterWorkerSel,
+    max_model_len: Option<u32>,
+) -> anyhow::Result<WorkerConfig> {
     let IterWorkerSel::PipelineChunkedPrefill {
         attn_gpu_memory_gb,
         max_batch_tokens,
@@ -310,6 +316,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         prefix_tier_read_wait_policy,
         force_schedule_after_ms,
         external_decode,
+        prefill_chunk_alignment,
         ..
     } = worker
     else {
@@ -345,7 +352,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         *prefix_tier_max_read_wait_ms,
         *prefix_tier_read_wait_policy,
     )?;
-    Ok(WorkerConfig {
+    let mut config = WorkerConfig {
         attn_kv_bytes: (*attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times: cfg.io.log_output_token_times,
         log_stage_transitions: cfg.io.log_stage_transitions,
@@ -366,8 +373,12 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         prefix_tier_read_wait_policy: *prefix_tier_read_wait_policy,
         force_schedule_after_ms: *force_schedule_after_ms,
         external_decode: *external_decode,
+        prefill_chunk_alignment: *prefill_chunk_alignment,
+        max_model_len,
         ..WorkerConfig::default()
-    })
+    };
+    worker.kv_accounting().apply("pp", &mut config)?;
+    Ok(config)
 }
 
 /// Stages of one pipeline share an NVLink domain, so activations move on the
@@ -439,17 +450,21 @@ mod tests {
     #[test]
     fn tiers_read_the_most_loaded_stage_unless_loads_are_balanced() {
         // PP8 of GLM-5.3-Flash: 11 DSA layers of 545 B, at most 2 per stage.
-        let (most_loaded, total) = (2 * 545, 11 * 545);
-        assert_eq!(
-            tier_kv_bytes_per_token(&pipeline_worker(""), most_loaded, total, 8),
-            1090
-        );
+        let stages = [
+            (1090, 0),
+            (1090, 0),
+            (1090, 0),
+            (545, 0),
+            (545, 0),
+            (545, 0),
+            (545, 0),
+            (545, 0),
+        ];
+        assert_eq!(tier_kv_bytes_per_token(&pipeline_worker(""), &stages), 1090);
         assert_eq!(
             tier_kv_bytes_per_token(
                 &pipeline_worker("prefix_tier_balanced_load: true\n"),
-                most_loaded,
-                total,
-                8
+                &stages
             ),
             750,
             "5995 B over 8 stages, rounded up"

@@ -60,7 +60,9 @@ def test_every_argument_is_documented(kind: str) -> None:
     for name, entry in arg_docs(schema).items():
         assert entry["doc"], f"{kind}.{name} has no doc"
         # A count or size has a unit; a dtype, enum or flag does not.
-        numeric = str(types[name]) in ("int", "float", "tuple[int, ...]")
+        # An optional arg (`optional_arg`) is typed `<value type> | None`.
+        value_type = str(types[name]).removesuffix(" | None")
+        numeric = value_type in ("int", "float", "tuple[int, ...]")
         assert (entry["unit"] is not None) == numeric, f"{kind}.{name} unit"
 
 

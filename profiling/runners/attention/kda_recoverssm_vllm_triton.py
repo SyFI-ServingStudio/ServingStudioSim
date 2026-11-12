@@ -83,7 +83,7 @@ from profiling.runners.exceptions import (
 from profiling.runners.metrics import ComputeMetrics
 
 _MODULE = "vllm.models.kimi_k3.nvidia.ops.recoverssm"
-_ENV = "vllm_upstream_fork_env"
+_ENV = "vllm_env"
 _VERIFY_BACKEND = "kda_recoverssm_verify:vllm_triton"
 _COMMIT_BACKEND = "kda_recoverssm_commit:vllm_triton"
 # GLM-5.3-Flash `linear_attn_config.gate_lower_bound` and short conv width.

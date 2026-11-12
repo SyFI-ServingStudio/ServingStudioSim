@@ -126,13 +126,21 @@ pub struct RequestTelemetry {
 /// Bounded per request even when per-token timestamp logging is disabled.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct SpeculativeProgress {
+    /// The worker's full verify width, `draft_tokens + 1`.
     pub query_width: u32,
     pub prefill_chunks: u64,
     pub decode_rounds: u64,
     pub resident_kv_sum: u64,
+    /// Verify rows over completed rounds: `query_width` per round, fewer for a
+    /// round clipped at `max_model_len`.
+    pub query_rows: u64,
+    /// Causal query-key pairs over completed rounds, `q * resident + q(q+1)/2`
+    /// per round of `q` rows.
+    pub verify_pairs: u64,
     pub emitted_tokens: u64,
     pub pending_prefill: Option<(u32, u32)>,
-    pub pending_decode: Option<u64>,
+    /// `(resident KV, query rows)` of a verify round the run stopped inside.
+    pub pending_decode: Option<(u64, u32)>,
 }
 
 /// One live request: immutable definition + progress + lifecycle + telemetry.

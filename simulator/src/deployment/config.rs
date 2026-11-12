@@ -195,6 +195,15 @@ impl RunConfig {
         }
     }
 
+    pub fn io_mut(&mut self) -> &mut IoSpec {
+        match self {
+            RunConfig::Unified(c) => &mut c.io,
+            RunConfig::Pd(c) => &mut c.io,
+            RunConfig::Afd(c) => &mut c.io,
+            RunConfig::Pp(c) => &mut c.io,
+        }
+    }
+
     /// The per-deployment stage vocabulary (`code → "category:detail"` names) written
     /// into `run_meta.json` so the analyzer can decode the `request_slo`
     /// stage-transition codes. Barebone and HP unified share `UnifiedStage`.

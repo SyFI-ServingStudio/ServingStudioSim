@@ -84,7 +84,7 @@ That `Box<dyn Flow>` is the **single `dyn` erasure point** — each concrete mod
 monomorphizes its own flow, so the per-iter cost path stays `dyn`-free.
 
 GLM-5.2 pairs with the existing `hp_unified` recipe. Its attention is TP1 local,
-so the L4 model reports one attention-DP group per EP rank; `FullAttnKv` creates
+so the L4 model reports one attention-DP group per EP rank; `KvCacheStore` creates
 one independent sticky KV partition for each group and `UnifiedIterExecution`
 emits one matching `ArchGroupInput`. The worker shell, admission and selection
 policy, request lifecycle, event ownership, and `SimpleDpFlow` remain the same as
