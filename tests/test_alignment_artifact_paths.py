@@ -86,3 +86,20 @@ def test_a_copy_beside_its_original_reads_its_own_files(tmp_path):
     copy = tmp_path / "b" / "profile_nsys"
     shutil.copytree(original, copy)
     assert Path(_load_profile_result(copy)["parsed_nsys"]) == copy / "parsed.json"
+
+
+def test_the_case_trace_of_a_copied_back_capture_reads_beside_it(tmp_path):
+    # A remote capture records its case trace (outside the phase dir) by the
+    # remote's path; the copied-back case dir has the same trace beside it.
+    remote = "/remote/workdir/logs/run/case_a/profile_nsys"
+    here = tmp_path / "logs" / "run" / "case_a" / "profile_nsys"
+    here.mkdir(parents=True)
+    (here.parent / "trace.csv").write_text("t,in,out\n")
+    trace = "/remote/workdir/logs/run/case_a/trace.csv"
+    assert artifact_paths.resolve_beside(trace, here, remote) == here.parent / "trace.csv"
+    # A path that exists here, or that has no counterpart here, is left alone.
+    assert artifact_paths.resolve_beside(str(here.parent / "trace.csv"), here, remote) == (
+        here.parent / "trace.csv"
+    )
+    gone = "/remote/workdir/logs/run/case_b/trace.csv"
+    assert artifact_paths.resolve_beside(gone, here, remote) == Path(gone)

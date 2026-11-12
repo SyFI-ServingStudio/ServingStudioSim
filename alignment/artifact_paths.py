@@ -70,6 +70,30 @@ def resolve(value: str, root: Path, recorded_root: str | None = None) -> Path:
     return path
 
 
+def resolve_beside(value: str, root: Path, recorded_root: str | None) -> Path:
+    """Where a recorded input outside the phase directory is, for a result read from ``root``.
+
+    An input such as the case's ``trace.csv`` sits beside or above the recorded
+    ``log_dir``, so `resolve` cannot rebase it. When the recorded path is gone
+    here, it is rebased from the nearest ancestor of ``recorded_root`` that
+    contains it onto the same ancestor of ``root`` (a remote's out-root copied
+    back to this host keeps the layout under it), if that file exists.
+    """
+    path = Path(value)
+    if not path.is_absolute() or path.exists() or not recorded_root:
+        return resolve(value, root, recorded_root)
+    recorded = Path(recorded_root)
+    for here, there in zip((root, *root.parents), (recorded, *recorded.parents)):
+        if len(there.parts) <= 1:
+            break
+        try:
+            moved = here / path.relative_to(there)
+        except ValueError:
+            continue
+        return moved if moved.exists() else path
+    return path
+
+
 def localize(result: dict[str, Any], root: Path) -> dict[str, Any]:
     """A copy of ``result`` with every artifact path absolute, as it is here."""
     recorded_root = result.get("log_dir") if isinstance(result.get("log_dir"), str) else None

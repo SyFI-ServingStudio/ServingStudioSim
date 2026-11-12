@@ -292,11 +292,23 @@ def _same_trace_source(left: Any, right: Any) -> bool:
         return False
 
 
-def _warn_if_trace_mismatch(params: dict[str, Any], profile_result: dict[str, Any]) -> None:
+def _warn_if_trace_mismatch(
+    params: dict[str, Any], profile_result: dict[str, Any], profile_log_dir: Path
+) -> None:
     workload = params.get("workload")
     traces = workload.get("trace_files") if isinstance(workload, dict) else None
     drive_summary = profile_result.get("drive_summary")
     profile_trace = drive_summary.get("source_trace") if isinstance(drive_summary, dict) else None
+    if isinstance(profile_trace, str):
+        # A capture run elsewhere (a remote GPU host) names its trace there.
+        recorded_root = profile_result.get("log_dir")
+        profile_trace = str(
+            artifact_paths.resolve_beside(
+                profile_trace,
+                profile_log_dir,
+                recorded_root if isinstance(recorded_root, str) else None,
+            )
+        )
     resolved_simulation = []
     if isinstance(traces, list) and all(isinstance(item, str) for item in traces):
         resolved_simulation = [
@@ -627,7 +639,7 @@ def _build_timing_predict_inputs(
     # sharding differently, so a launcher-side guess is brittle. A genuine
     # mismatch surfaces on its own downstream (e.g. the per-rank device-symmetry
     # fold and the labeled-slot coverage), which is where it is meaningful.
-    _warn_if_trace_mismatch(preset, profile_result)
+    _warn_if_trace_mismatch(preset, profile_result, Path(config.profile_log_dir))
     build_result = build_inputs(
         BuildRequest(
             simulation_preset=config.simulation_preset,
