@@ -84,7 +84,7 @@ use crate::arch::contract::{IterwiseUnifiedModel, KvHostOffload, UnifiedArchInpu
 use crate::arch::ep_comm::{EpCommConfig, EpCommKind, EpCommModel};
 use crate::arch::ep_exchange::{
     AllgatherLeafNames, EpExchange, EpExchangeConfigs, EpExchangeGeometry,
-    MEASURED_ALLTOALL_EP_SIZE,
+    MEASURED_ALLTOALL_EP_SIZE, MNNVL_ALLTOALL_BACKENDS,
 };
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
@@ -339,6 +339,7 @@ fn build_configs_for(
             top_k: u32::from(model.router_top_k),
             num_experts: model.num_experts.get(),
         },
+        MNNVL_ALLTOALL_BACKENDS,
         body_demand,
     )
     .map_err(fit_failed)?;

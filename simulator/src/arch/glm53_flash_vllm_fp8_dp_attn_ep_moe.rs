@@ -90,6 +90,7 @@ use crate::arch::contract::{IterwiseUnifiedModel, KvHostOffload, UnifiedArchInpu
 use crate::arch::ep_comm::{EpCommConfig, EpCommKind};
 use crate::arch::ep_exchange::{
     AllgatherLeafNames, EpExchange, EpExchangeConfigs, EpExchangeGeometry,
+    NVLINK_TWO_SIDED_ALLTOALL_BACKENDS,
 };
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
     self as tp_arch, atomic, attention_inputs, graph_padded_tokens, push, AttnKind, Boundary,
@@ -258,6 +259,7 @@ pub fn build_configs(
             top_k: model.num_experts_per_tok,
             num_experts: model.n_routed_experts,
         },
+        NVLINK_TWO_SIDED_ALLTOALL_BACKENDS,
         demand,
     )
     .map_err(fit_failed)?;
@@ -2305,7 +2307,7 @@ mod tests {
                 (kernel.ep_size, kernel.top_k, kernel.slot_count),
                 (8, 8, 288)
             );
-            assert_eq!(kernel.backends, ["flashinfer_mnnvl"]);
+            assert_eq!(kernel.backends, ["flashinfer_nvlink_two_sided"]);
         }
         assert_eq!(
             (

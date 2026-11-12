@@ -54,7 +54,17 @@ use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge, Probe, SlotInput,
 };
 
-pub const ALLTOALL_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
+/// FlashInfer 0.6's `trtllm_alltoall` (`MnnvlMoe`), the `moe_comm` kernel
+/// vLLM's `--all2all-backend flashinfer_nvlink_two_sided` called before
+/// FlashInfer 0.7 removed it; its rows cover 384 / 3,072 / 12,288-byte rows at
+/// 256 slots.
+pub const MNNVL_ALLTOALL_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
+/// FlashInfer 0.7's `moe_ep` `NVLinkTwoSidedAlltoAll`, the same `moe_comm`
+/// kernel under today's vLLM path; its rows cover 256 / 2,048 / 2,368 /
+/// 8,192-byte rows at 288 slots. A backend list names one of the two: the
+/// prebuild fills every listed backend's grid, so a second backend without
+/// rows at the config would demand a GPU fill.
+pub const NVLINK_TWO_SIDED_ALLTOALL_BACKENDS: &[&str] = &["flashinfer_nvlink_two_sided"];
 /// The only group the `moe_alltoall` / `moe_alltoall_prepare` rows span.
 pub const MEASURED_ALLTOALL_EP_SIZE: u16 = 8;
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
@@ -132,11 +142,14 @@ impl EpExchangeConfigs {
     /// arch's experts see it. Checks only what every arch shares: the params
     /// and the EP8 extent of the measured all-to-all rows. The arch checks its
     /// own group (domain size, measured all-gather group sizes).
+    /// `alltoall_backends` is the profiled `moe_alltoall` backend whose rows
+    /// cover the arch's row widths and slot count.
     pub fn new(
         ep_comm: &EpCommConfig,
         ep_size: u16,
         gpu_name: &str,
         geometry: EpExchangeGeometry,
+        alltoall_backends: &[&'static str],
         demand: &ExpertDemand,
     ) -> Result<Self, String> {
         ep_comm.validate()?;
@@ -222,7 +235,7 @@ impl EpExchangeConfigs {
             combine_reduce: elementwise(top_k * bf16_row, bf16_row),
         });
         let alltoall_kernel = |hidden_bytes: u32, direction| MoeAlltoallKernelConfig {
-            backends: ALLTOALL_BACKENDS.to_vec(),
+            backends: alltoall_backends.to_vec(),
             gpu_name: gpu_name.to_string(),
             ep_size: u32::from(ep_size),
             top_k,
@@ -233,7 +246,7 @@ impl EpExchangeConfigs {
         };
         let measured_alltoall = measured_alltoall_kind.then(|| MeasuredAlltoall {
             prepare: MoeAlltoallPrepareKernelConfig {
-                backends: ALLTOALL_BACKENDS.to_vec(),
+                backends: alltoall_backends.to_vec(),
                 gpu_name: gpu_name.to_string(),
                 ep_size: u32::from(ep_size),
                 top_k,
