@@ -193,6 +193,98 @@ pub enum AttnTpCollective {
     /// the request above vLLM's budget (not vLLM dispatch); the fastest
     /// measured candidate is billed.
     FastUnbudgeted,
+    /// KDA-only: the two collectives the layout actually runs, each its own
+    /// launch: the KDA input all-gather before the layer and the output
+    /// reduce-scatter after it ([`KdaGatherScatter`]), priced from the
+    /// fixed-pattern MNNVL exchange's measured 8-GPU bf16 rows.
+    FixedGatherScatter,
+}
+
+/// The fixed-pattern MNNVL exchange's reader-side reduce-scatter
+/// (`moe_ep_reduce_scatter` backend `mnnvl_pull`): the owner reads its rows'
+/// bf16 partials from every rank's fabric-mapped buffer and sums them.
+const FIXED_GATHER_SCATTER_BACKENDS: &[&str] = &["mnnvl_pull"];
+/// The only group size the fixed-pattern rows were measured at.
+const FIXED_GATHER_SCATTER_GPUS: u32 = 8;
+
+/// The KDA-only attention-TP pair as two leaves (`AttnTpCollective::
+/// FixedGatherScatter`). Both legs move `hidden` bf16 values per row: the
+/// gather brings every group rank the other owners' KDA inputs (the mHC pre
+/// output), the scatter returns each owner the sum of the ranks' row-parallel
+/// `o_proj` partials. Both read the measured `mnnvl_pull` rows: the scatter is
+/// that kernel; the gather is not measured on its own and takes the pull's
+/// time at the same counts (same bytes received per rank at equal counts,
+/// plus the pull's fp32 sum, so it does not under-price). The rows exist at
+/// 8 GPUs only: a group of `b < 8` reads them at the per-rank counts that
+/// receive its bytes ([`Self::eval`]); the 8-peer flag handshake stays, so
+/// the fixed part over-prices. Both stand-ins are flagged in the cost-tree
+/// label.
+struct KdaGatherScatter {
+    gather: Op<MoeEpReduceScatterKernel>,
+    scatter: Op<MoeEpReduceScatterKernel>,
+}
+
+impl KdaGatherScatter {
+    fn build(
+        prefix: &str,
+        gpu_name: &str,
+        hidden: u32,
+        bridge: &PerfApiBridge,
+    ) -> std::result::Result<Self, BuildError> {
+        let config = MoeEpReduceScatterKernelConfig {
+            backends: FIXED_GATHER_SCATTER_BACKENDS.to_vec(),
+            gpu_name: gpu_name.to_string(),
+            num_gpus: FIXED_GATHER_SCATTER_GPUS,
+            hidden_size: hidden.into(),
+            dtype: ACTIVATION_DTYPE,
+            fabric: "nvlink".into(),
+            max_total_tokens: RANK_TOKEN_BUDGET * FIXED_GATHER_SCATTER_GPUS,
+        };
+        Ok(Self {
+            gather: atomic(
+                prefix,
+                "attn_tp_input_all_gather",
+                config.clone(),
+                MoeEpReduceScatterKernel::build,
+                bridge,
+            )?,
+            scatter: atomic(
+                prefix,
+                "attn_tp_output_reduce_scatter",
+                config,
+                MoeEpReduceScatterKernel::build,
+                bridge,
+            )?,
+        })
+    }
+
+    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        CostNode::Sum(vec![self.gather.compile(builder), self.scatter.compile(builder)])
+    }
+
+    /// The 8 per-rank counts the measured rows are read at (see [`Self::eval`]).
+    fn row_counts(member_rows: &[u32]) -> Vec<u32> {
+        let b = member_rows.len() as u32;
+        let peers = FIXED_GATHER_SCATTER_GPUS - 1;
+        member_rows
+            .iter()
+            .map(|&own| (own * (b - 1)).div_ceil(peers))
+            .cycle()
+            .take(FIXED_GATHER_SCATTER_GPUS as usize)
+            .collect()
+    }
+
+    /// `member_rows`: each group rank's own rows. A group of `b < 8` reads
+    /// the 8-GPU rows at the counts that receive the same bytes per rank:
+    /// `ceil(own (b - 1) / 7)` rows from each of 7 peers in place of `own`
+    /// rows from each of `b - 1` peers.
+    fn eval(&self, member_rows: &[u32], ev: &mut Evaluator) {
+        let input = MoeEpCollectiveKernelInput {
+            per_rank_tokens: Self::row_counts(member_rows),
+        };
+        push(&self.gather, input.clone(), ev);
+        push(&self.scatter, input, ev);
+    }
 }
 
 /// The unbudgeted MNNVL two-shot candidate (`AttnTpCollective::FastUnbudgeted`).
@@ -309,9 +401,9 @@ pub fn build_configs(
         local.large_all_reduce = attn.large_all_reduce;
         local.large_all_reduce.num_gpus = row_gpus;
         local.large_all_reduce.backends = match parallel.attn_tp_collective {
-            AttnTpCollective::Fast | AttnTpCollective::FastUnbudgeted => {
-                LARGE_ATTN_ALL_REDUCE_BACKENDS.to_vec()
-            }
+            AttnTpCollective::Fast
+            | AttnTpCollective::FastUnbudgeted
+            | AttnTpCollective::FixedGatherScatter => LARGE_ATTN_ALL_REDUCE_BACKENDS.to_vec(),
             AttnTpCollective::Nccl => vec!["nccl"],
         };
     }
@@ -462,6 +554,9 @@ struct LayerGroup {
     /// The attention-TP all-gather + reduce-scatter pair, priced as one TP
     /// all-reduce of the group's rows; `None` at attention TP 1.
     attn_all_reduce: Option<tp_arch::TpAllReduce>,
+    /// KDA-only `fixed_gather_scatter`: the pair as two measured launches, in
+    /// place of `attn_all_reduce`.
+    attn_gather_scatter: Option<KdaGatherScatter>,
     ffn_boundary: Op<MhcFusedPostPreRmsNormKernel>,
     ffn: Ffn,
     mhc_fuse_fixed_us: Option<f64>,
@@ -573,6 +668,11 @@ impl LayerGroup {
                 .map(|_| {
                     let mut leaves = vec![worklet.compile(builder)];
                     leaves.extend(self.attn_all_reduce.as_ref().map(|op| op.compile(builder)));
+                    leaves.extend(
+                        self.attn_gather_scatter
+                            .as_ref()
+                            .map(|op| op.compile(builder)),
+                    );
                     CostNode::Sum(leaves)
                 })
                 .collect(),
@@ -602,9 +702,15 @@ impl LayerGroup {
             },
             CostNode::Labeled {
                 label: format!(
-                    "{} KDA tensor-parallel over the group [Max over groups; all-gather + \
-                     reduce-scatter priced as one all-reduce of the group's rows]",
-                    self.label
+                    "{} KDA tensor-parallel over the group [Max over groups; {}]",
+                    self.label,
+                    if self.attn_gather_scatter.is_some() {
+                        "input all-gather + output reduce-scatter, two launches on the \
+                         measured 8-GPU fixed-pattern mnnvl_pull rows (the gather, and a \
+                         group under 8 GPUs at byte-matched counts, are STAND-INS)"
+                    } else {
+                        "all-gather + reduce-scatter priced as one all-reduce of the group's rows"
+                    }
                 ),
                 child: Box::new(kda),
             },
@@ -638,6 +744,9 @@ impl LayerGroup {
                     worklet.eval(&group.kda, ev);
                     if let Some(all_reduce) = &self.attn_all_reduce {
                         all_reduce.eval(group.rows, ev);
+                    }
+                    if let Some(pair) = &self.attn_gather_scatter {
+                        pair.eval(&group.member_rows, ev);
                     }
                 }
                 for rank in &batch.ranks {
@@ -1096,12 +1205,24 @@ fn build_group(
     };
     let tp_layer = cfg.parallel.attn_tp > 1
         && (cfg.parallel.attn_tp_layers == AttnTpLayers::All || group.attn == AttnKind::Kda);
-    let attn_all_reduce = tp_layer
+    let gather_scatter =
+        cfg.parallel.attn_tp_collective == AttnTpCollective::FixedGatherScatter;
+    if gather_scatter && tp_layer && cfg.parallel.attn_tp_layers != AttnTpLayers::KdaOnly {
+        return Err(fit_failed(
+            "attn_tp_collective fixed_gather_scatter prices the KDA-only layout: \
+             attn_tp_layers kda_only",
+        ));
+    }
+    let attn_gather_scatter = (tp_layer && gather_scatter)
+        .then(|| KdaGatherScatter::build(p, &cfg.parallel.gpu_name, cfg.local.all_reduce.hidden_dim, bridge))
+        .transpose()?;
+    let attn_all_reduce = (tp_layer && !gather_scatter)
         .then(|| tp_arch::TpAllReduce::build(p, "attn_tp_all_reduce", local, bridge))
         .transpose()?
         .map(|op| -> std::result::Result<_, BuildError> {
             Ok(match cfg.parallel.attn_tp_collective {
                 AttnTpCollective::Fast => op,
+                AttnTpCollective::FixedGatherScatter => unreachable!("built as KdaGatherScatter"),
                 AttnTpCollective::Nccl => op.without_fused(),
                 AttnTpCollective::FastUnbudgeted => {
                     let mut unbudgeted = local.all_reduce.clone();
@@ -1125,6 +1246,7 @@ fn build_group(
         attn_boundary,
         attn,
         attn_all_reduce,
+        attn_gather_scatter,
         ffn_boundary: atomic(
             p,
             "ffn_mhc_post_pre",
@@ -1530,6 +1652,8 @@ struct RankBatch {
 struct KdaGroupBatch {
     /// The group's rows, all-gathered for KDA.
     rows: u32,
+    /// Each member rank's own rows.
+    member_rows: Vec<u32>,
     kda: Glm53KdaAttnLocalWorkletInput,
 }
 
@@ -1671,6 +1795,7 @@ fn normalize_input(
             .chunks(tp)
             .map(|members| KdaGroupBatch {
                 rows: members.iter().map(|rank| rank.rows).sum(),
+                member_rows: members.iter().map(|rank| rank.rows).collect(),
                 kda: Glm53KdaAttnLocalWorkletInput {
                     prefill_sequence_lengths: members
                         .iter()
@@ -1763,6 +1888,42 @@ mod tests {
             attn_tp_collective: Default::default(),
             kda_gate_b_merged: false,
         }
+    }
+
+    /// Catches the KDA-only TP pair falling back to one all-reduce leaf, or
+    /// being built for a layout that also splits the DSA layers.
+    #[test]
+    fn fixed_gather_scatter_prices_kda_tp_as_two_leaves() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        let mut par = parallel(8);
+        par.attn_tp = 8;
+        par.attn_tp_layers = AttnTpLayers::KdaOnly;
+        par.attn_tp_collective = AttnTpCollective::FixedGatherScatter;
+        let configs = build_configs(&model_cfg(), &par, &demand).unwrap();
+        let model = build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
+        let mut kda_groups = 0;
+        for group in &model.groups {
+            assert!(group.attn_all_reduce.is_none());
+            let kda = matches!(group.attn, Attention::Kda(_));
+            assert_eq!(group.attn_gather_scatter.is_some(), kda, "{}", group.label);
+            kda_groups += usize::from(kda);
+        }
+        assert!(kda_groups > 0);
+
+        par.attn_tp_layers = AttnTpLayers::All;
+        let configs = build_configs(&model_cfg(), &par, &demand).unwrap();
+        assert!(build("unified".into(), resolve_configs(&configs), &bridge).is_err());
+    }
+
+    /// Catches a group under 8 GPUs reading the 8-GPU rows at counts that do
+    /// not receive its bytes: each rank receives `own (b - 1)` rows.
+    #[test]
+    fn fixed_gather_scatter_counts_match_the_received_rows() {
+        assert_eq!(KdaGatherScatter::row_counts(&[56; 8]), vec![56; 8]);
+        assert_eq!(KdaGatherScatter::row_counts(&[56, 56]), vec![8; 8]);
+        assert_eq!(KdaGatherScatter::row_counts(&[70, 7, 14, 21]), [30, 3, 6, 9].repeat(2));
     }
 
     fn built(dp_size: u16) -> Glm53FlashDpAttnEpModel {
