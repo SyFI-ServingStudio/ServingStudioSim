@@ -252,6 +252,15 @@ class FixedExchange:
         nbytes = total_rows * self.hidden_size * 2
         return self._view(offset, nbytes, torch.bfloat16).view(total_rows, self.hidden_size)
 
+    def partials_peer_ptrs(self, set_index: int) -> list[int]:
+        """Device addresses, valid in this process, of every rank's ``partials(set_index)``
+        ([world * max_rows, hidden] bf16, gathered-token order), rank order. A consumer that
+        reads them must first see every rank's ready flag for the round (``pull_wait_ready``)."""
+        if set_index not in (0, 1):
+            raise ValueError("partials set must be 0 or 1")
+        offset = self.layout.partials + set_index * self.layout.partials_set
+        return [slice_ptr + offset for slice_ptr in self.slices]
+
     @property
     def next_pull_set(self) -> int:
         """The partials set the next ``pull_combine`` reads (host mirror of the round)."""
