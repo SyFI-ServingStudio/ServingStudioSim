@@ -11,7 +11,6 @@ kernel kind owns its Python wire format and registry presence.
 """
 
 from profiling.kernels import (
-    all_gather,  # noqa: F401
     all_reduce,  # noqa: F401
     all_reduce_fusion,  # noqa: F401
     all_reduce_residual_rms_norm,  # noqa: F401
@@ -103,6 +102,7 @@ from profiling.kernels import (
     rel_bias_attention,  # noqa: F401
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
+    row_all_gather,  # noqa: F401
     rs_sconv_ag_residual_rms_norm,  # noqa: F401
     scaled_silu,  # noqa: F401
     sconv_qkvr_prep,  # noqa: F401

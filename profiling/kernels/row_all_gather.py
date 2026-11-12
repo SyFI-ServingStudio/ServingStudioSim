@@ -15,11 +15,11 @@ from profiling.db.registry import (
     register,
 )
 
-KIND = "all_gather"
+KIND = "row_all_gather"
 
 
 @dataclass(frozen=True)
-class AllGatherArgs(KernelArgs):
+class RowAllGatherArgs(KernelArgs):
     num_gpus: int = arg(unit="GPUs", doc="GPUs in the group.")
     per_rank_tokens: tuple[int, ...] = arg(
         unit="tokens", doc="Rows each GPU contributes, in rank order."
@@ -69,7 +69,7 @@ register(
             function_name="profile_all_gather_batch",
         ),
         table_name=KIND,
-        args_schema=AllGatherArgs,
+        args_schema=RowAllGatherArgs,
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="vllm_env",
@@ -98,7 +98,7 @@ register(
             function_name="profile_all_gather_pull_batch",
         ),
         table_name=KIND,
-        args_schema=AllGatherArgs,
+        args_schema=RowAllGatherArgs,
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="vllm_env",

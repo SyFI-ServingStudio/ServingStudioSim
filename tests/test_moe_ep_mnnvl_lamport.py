@@ -40,8 +40,8 @@ _SCATTER = {
             "mnnvl_lamport",
             "profile_moe_ep_quantize_and_all_gather_batch",
         ),
-        ("all_gather", "mnnvl_lamport", "profile_all_gather_batch"),
-        ("all_gather", "mnnvl_pull", "profile_all_gather_pull_batch"),
+        ("row_all_gather", "mnnvl_lamport", "profile_all_gather_batch"),
+        ("row_all_gather", "mnnvl_pull", "profile_all_gather_pull_batch"),
     ],
 )
 def test_each_backend_runs_its_leg_in_fabric_memory(kind, backend, function):
@@ -88,3 +88,38 @@ def test_bf16_row_layout_sends_one_plane():
     assert (
         runner.spec_error({**_SCATTER, "num_gpus": 2, "per_rank_tokens": [8, 0]}, "gather") is None
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend", "num_gpus"),
+    [
+        ("row_all_gather", "mnnvl_lamport", 2),
+        ("row_all_gather", "mnnvl_pull", 4),
+        ("moe_ep_reduce_scatter", "mnnvl_pull", 2),
+    ],
+)
+def test_group_rows_store_beside_the_legacy_all_gather_table(tmp_path, kind, backend, num_gpus):
+    """A b < 8 group row lands in its own table, also in a DB that still carries
+    the unregistered legacy `all_gather` table (num_rows/num_cols schema)."""
+    import sqlite3
+
+    from profiling.db.batch import coerce_args
+    from profiling.db.table import ProfileRow, Table
+    from profiling.runners.metrics import CommMetrics
+
+    database_path = tmp_path / "profile.db"
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            "CREATE TABLE all_gather (id INTEGER PRIMARY KEY, num_rows INTEGER, num_cols INTEGER)"
+        )
+    spec = find_kernel_profiler_spec(kind, backend)
+    tokens = [8] + [0] * (num_gpus - 1)
+    args = coerce_args(
+        spec.args_schema,
+        {**_SCATTER, "num_gpus": num_gpus, "per_rank_tokens": tokens},
+    )
+    table = Table(spec, database_path)
+    metrics = CommMetrics(time_ms=0.005, algbw_gbps=10.0, busbw_gbps=10.0)
+    table.insert([ProfileRow(args=args, metrics=metrics, gpu_name="TestGPU", backend=backend)])
+    (got,) = table.query([args], gpu_name="TestGPU")
+    assert isinstance(got, CommMetrics) and got.time_ms == 0.005

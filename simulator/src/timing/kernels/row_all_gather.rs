@@ -13,7 +13,7 @@ use crate::timing::sweep::SweepGrid;
 use crate::timing::{Dim, KernelConfig};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct AllGatherKernelConfig {
+pub struct RowAllGatherKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
@@ -26,13 +26,13 @@ pub struct AllGatherKernelConfig {
     pub max_total_tokens: u32,
 }
 
-pub struct AllGatherSpec;
+pub struct RowAllGatherSpec;
 
-impl KernelSpec for AllGatherSpec {
-    type Config = AllGatherKernelConfig;
+impl KernelSpec for RowAllGatherSpec {
+    type Config = RowAllGatherKernelConfig;
     type Input = MoeEpCollectiveKernelInput;
 
-    const KIND: KernelKind = "all_gather";
+    const KIND: KernelKind = "row_all_gather";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         collective_grid(config.max_total_tokens)
@@ -71,4 +71,4 @@ impl KernelSpec for AllGatherSpec {
     }
 }
 
-register_kernel!(AllGatherKernel, AllGatherSpec);
+register_kernel!(RowAllGatherKernel, RowAllGatherSpec);
