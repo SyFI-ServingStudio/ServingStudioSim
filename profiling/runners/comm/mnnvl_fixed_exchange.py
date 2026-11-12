@@ -38,11 +38,11 @@ _ALIGN = 4096
 KERNEL_DISPATCH, KERNEL_QUANT_DISPATCH, KERNEL_COMBINE, KERNEL_PULL = 0, 1, 2, 3
 
 
-@functools.cache
 # DLPack capsules of every mapped view, never freed (see FixedExchange._view).
 _CAPSULES: list = []
 
 
+@functools.cache
 def load_module(timeline: bool = False):
     """JIT-build (once per JIT cache) and load the launchers. ``timeline`` builds the
     diagnostic variant (separate module) whose dispatch kernels record phase timestamps."""
@@ -233,8 +233,13 @@ class FixedExchange:
 
         torch = self.torch
         wrapper = create_dlpack_capsule(
-            self.slices[self.rank] + offset, nbytes, nbytes, 1, torch.uint8,
-            torch.cuda.current_device())
+            self.slices[self.rank] + offset,
+            nbytes,
+            nbytes,
+            1,
+            torch.uint8,
+            torch.cuda.current_device(),
+        )
         _CAPSULES.append(wrapper)
         return torch.utils.dlpack.from_dlpack(wrapper.capsule).view(-1).view(dtype)
 
@@ -352,14 +357,26 @@ class FixedExchange:
         )
 
     def pull_combine(
-        self, out, *, blocks: int | None = None, tasks_hint: int | None = None
+        self,
+        out,
+        *,
+        partials_set: int | None = None,
+        blocks: int | None = None,
+        tasks_hint: int | None = None,
     ) -> None:
+        """Sum this rank's rows of every rank's ``partials(partials_set)`` into ``out``.
+
+        ``partials_set`` defaults to the host round parity (``next_pull_set``); a CUDA-graph
+        caller passes the set its producer was captured writing (e.g. the layer parity)."""
         tasks = tasks_hint if tasks_hint is not None else self.max_rows * self.hidden_size // 8
+        if partials_set is None:
+            partials_set = self.next_pull_set
         self.module.pull_combine(
             self.config,
             self.hidden_size,
             out.data_ptr(),
             self.counts.data_ptr(),
+            partials_set,
             self._blocks(KERNEL_PULL, tasks, blocks),
             self._stream(),
         )

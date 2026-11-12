@@ -159,13 +159,15 @@ void fixed_combine(tvm::ffi::TensorView config, int64_t hidden_size, int64_t par
 }
 
 void pull_combine(tvm::ffi::TensorView config, int64_t hidden_size, int64_t out, int64_t counts,
-                  int64_t blocks, int64_t stream) {
+                  int64_t set, int64_t blocks, int64_t stream) {
+  TVM_FFI_ICHECK(set == 0 || set == 1) << "partials set must be 0 or 1";
   TVM_FFI_ICHECK(hidden_size % 8 == 0) << "hidden_size must be a multiple of 8";
   PullCombineArgs a{};
   a.group = make_group(config);
   a.out = ptr<__nv_bfloat16>(out);
   a.counts = ptr<int32_t const>(counts);
   a.hidden_size = static_cast<int>(hidden_size);
+  a.set = static_cast<int>(set);
   pull_combine_kernel<kThreads>
       <<<static_cast<int>(blocks), kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(a);
   check_launch("pull_combine");

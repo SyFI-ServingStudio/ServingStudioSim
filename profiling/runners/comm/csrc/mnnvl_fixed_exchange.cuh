@@ -34,9 +34,10 @@
 // mapped "partials" region (the MoE kernel writes it there; no copy). The consumer of round n
 // announces its partials with a release store of n + 1 into every peer's ready flag, waits for
 // all peers' flags, then reads its own tokens' rows from all ranks over NVLink and sums them in
-// fp32. The partials have two sets by round parity; the producer may rewrite set n % 2 only after
-// a group-wide step that every consumer of round n has passed (in a MoE stack, the next layer's
-// dispatch). `pull_sum_vector` is the device-side entry for a consumer kernel that fuses the sum.
+// fp32. The partials have two sets, chosen by the caller (the producer's buffer, fixed when a
+// CUDA graph is captured; e.g. the MoE layer's parity); the producer may rewrite a set only after
+// a group-wide step that every consumer of its previous round has passed (in a MoE stack, the
+// next layer's dispatch). `pull_sum_vector` is the device-side entry for a consumer kernel that fuses the sum.
 //
 // Layout of one rank's mapped slice (byte offsets in ExchangeLayout):
 //   state     int32 round state (kStateWords), this rank's only
@@ -718,7 +719,8 @@ __device__ __forceinline__ void pull_sum_vector(Group const& g, int set, int gat
 
 // Announce this rank's partials of `round` to every peer (one thread per peer after a system
 // fence), then wait until every peer has announced the same round. Every block calls it; block
-// 0 announces. Returns the partials set of the round.
+// 0 announces. Returns round parity; a consumer inside a CUDA graph should instead read the set
+// its producer wrote (fixed at capture), as pull_combine_kernel does.
 __device__ __forceinline__ int pull_wait_ready(Group const& g, int round) {
   int32_t* state = reinterpret_cast<int32_t*>(g.slices[g.rank] + g.layout.state_offset);
   if (blockIdx.x == 0 && threadIdx.x < g.world) {
@@ -744,6 +746,9 @@ struct PullCombineArgs {
   __nv_bfloat16* out;  // [counts[rank], hidden]
   int32_t const* counts;
   int hidden_size;
+  // Partials set to read, fixed by the caller (e.g. the MoE layer's parity) so a CUDA graph's
+  // producer pointer and this read agree whatever the round count; the ready flags use rounds.
+  int set;
 };
 
 template <int kThreads>
@@ -751,7 +756,8 @@ __global__ void __launch_bounds__(kThreads) pull_combine_kernel(PullCombineArgs 
   Group const& g = a.group;
   RoundInfo round;
   load_round(g, kPullRound, a.counts, round);
-  int const set = pull_wait_ready(g, round.epoch);
+  pull_wait_ready(g, round.epoch);
+  int const set = a.set;
   int const self = g.rank;
   int const row_vectors = a.hidden_size / 8;
   int const row_bytes = a.hidden_size * 2;
