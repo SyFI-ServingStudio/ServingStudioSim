@@ -10,8 +10,16 @@ from __future__ import annotations
 
 from typing import Any
 
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
+#: Schema 5 adds per-forward `forward_ordinal` / `is_dummy` (DP dummy forwards
+#: recorded); its batch-shape fields are those of schema 4.
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5})
 SUPPORTED_INPUT_ADAPTERS = frozenset({"vllm_text", "sglang_text"})
+
+
+class TruncatedDraft(ValueError):
+    """A verify row whose draft the engine cut short (fewer than `draft_tokens`
+    positions, e.g. at max_model_len). The arch prices a uniform verify width,
+    so such a step has no prediction; the caller excludes it by name."""
 
 
 def _validated_shape(
@@ -114,6 +122,17 @@ def _validated_shape(
             ):
                 lowered_pairs.append([kv, query])
                 continue
+            if (
+                metric["schema_version"] >= 4
+                and query < draft_tokens + 1
+                and isinstance(row, dict)
+                and row.get("kv_len") == kv
+                and row.get("query_len") == query
+                and row.get("drafted_tokens") == query - 1
+            ):
+                raise TruncatedDraft(
+                    f"{context}: draft truncated to {query - 1} of {draft_tokens} tokens"
+                )
             raise ValueError(
                 f"{context}: query lengths must equal draft_tokens + 1 ({draft_tokens + 1})"
             )
@@ -189,9 +208,13 @@ def build_cases(
 
         # The aggregate always validates: it classifies the step and gates the
         # empty-batch exclusion regardless of how the groups are laid out.
-        aggregate_pairs, _, aggregate_workload = _validated_shape(
-            metric, f"iteration {iteration}", draft_tokens
-        )
+        try:
+            aggregate_pairs, _, aggregate_workload = _validated_shape(
+                metric, f"iteration {iteration}", draft_tokens
+            )
+        except TruncatedDraft as truncated:
+            excluded.append({"iteration": iteration, "reason": str(truncated)})
+            continue
         if aggregate_workload == 0:
             excluded.append({"iteration": iteration, "reason": "empty model batch"})
             continue

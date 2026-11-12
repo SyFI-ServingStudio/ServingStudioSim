@@ -397,16 +397,17 @@ pub(crate) fn kv_cache_layout_with_draft(
     draft_swa_layers: u64,
 ) -> KvCacheLayout {
     let swa_layers = model.compress_ratios.len() as u64 + draft_swa_layers;
+    // Every TP rank holds the whole MQA cache (one latent KV per token), so each
+    // part is replicated over the TP ranks, and so is the fixed SWA pool.
     KvCacheLayout::new()
-        .with_part(KvCachePart::per_token(
-            "sglang_dsv4_full",
-            FULL_TOKEN_BYTES_PER_RANK,
-        ))
+        .with_part(
+            KvCachePart::per_token("sglang_dsv4_full", FULL_TOKEN_BYTES_PER_RANK)
+                .replicated(TP_SIZE),
+        )
         .with_engine(EngineOverhead {
             block_tokens: Some(PAGE_SIZE),
-            fixed_device_bytes: SWA_POOL_TOKENS * SWA_ROW_BYTES * swa_layers,
+            fixed_device_bytes: SWA_POOL_TOKENS * SWA_ROW_BYTES * swa_layers * u64::from(TP_SIZE),
         })
-        .held_on_each_rank(u64::from(TP_SIZE))
 }
 
 /// The decode batch SGLang's CUDA graph runs `requests` at; larger batches run

@@ -508,6 +508,11 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
         prefill_chunk_alignment: Option<PrefillChunkAlignment>,
+        /// How new requests spread across the arch's attention DP partitions.
+        /// See [`IterWorkerSel::ChunkedPrefill`]'s field of the same name.
+        #[serde(default)]
+        #[param(string, default = "round-robin", choices = DP_PLACEMENT_CHOICES)]
+        dp_placement: DpPlacement,
     },
     /// Pipeline-parallel stage worker for the `pp` deployment: stage 0 admits
     /// requests and owns the pipeline's KV, later stages pull activations and

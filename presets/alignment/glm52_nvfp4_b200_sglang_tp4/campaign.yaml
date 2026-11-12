@@ -52,21 +52,25 @@ variants:
         version: 0.2.16
         index_url: https://pypi.org/simple
       - name: flashinfer-python
-        version: 0.6.15.post1
+        version: 0.7.3
         index_url: https://pypi.org/simple
       - name: flashinfer-cubin
-        version: 0.6.15.post1
+        version: 0.7.3
         index_url: https://flashinfer.ai/whl
       - name: flashinfer-jit-cache
-        version: 0.6.15.post1
+        version: 0.7.3
+        local_version: cu130
+        index_url: https://flashinfer.ai/whl/cu130
+      - name: flashinfer-jit-cache-sm100a
+        version: 0.7.3
         local_version: cu130
         index_url: https://flashinfer.ai/whl/cu130
         required_files:
-        - flashinfer_jit_cache/jit_cache/fp4_quantization_100/fp4_quantization_100.so
-        - flashinfer_jit_cache/jit_cache/trtllm_comm/trtllm_comm.so
-        - flashinfer_jit_cache/jit_cache/rope/rope.so
-        - flashinfer_jit_cache/jit_cache/fmha_gen/fmha_gen.so
-        - flashinfer_jit_cache/jit_cache/fused_moe_trtllm_sm100/fused_moe_trtllm_sm100.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/fp4_quantization_100/fp4_quantization_100.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/trtllm_comm/trtllm_comm.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/rope/rope.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/fmha_gen/fmha_gen.so
+        - flashinfer_jit_cache/providers/sm100a/jit_cache/fused_moe_trtllm_sm100/fused_moe_trtllm_sm100.so
       environment:
         FLASHINFER_DISABLE_JIT: '1'
     run_name_prefix: glm52_b200_tp4_sglang

@@ -7,9 +7,13 @@
 pub mod build;
 pub mod config;
 pub mod contract;
+pub mod deepseek_v41_dspark_plumbing;
 pub mod deepseek_v41_sglang;
 pub mod deepseek_v41_sglang_dspark;
 pub mod deepseek_v41_vllm;
+pub mod deepseek_v41_vllm_dspark;
+pub mod deepseek_v41_vllm_dp_attn_ep_moe;
+pub mod deepseek_v41_vllm_dp_attn_ep_moe_dspark;
 pub mod deepseek_v4_vllm;
 pub mod glm52_model_cfg;
 pub mod glm52_sglang_nvfp4_tp_dsa_moe;
@@ -52,6 +56,12 @@ pub use contract::{
 pub use deepseek_v41_vllm::{
     DeepseekV41ModelCfg, DeepseekV41VllmConfigs, DeepseekV41VllmModel, DeepseekV41VllmParallel,
     DeepseekV41VllmResolved,
+};
+pub use deepseek_v41_vllm_dp_attn_ep_moe_dspark::{
+    DeepseekV41DpDsparkConfigs, DeepseekV41VllmDpDsparkModel,
+};
+pub use deepseek_v41_vllm_dspark::{
+    DeepseekV41DsparkConfigs, DeepseekV41VllmDsparkModel, DsparkCfg,
 };
 pub use deepseek_v4_vllm::{
     DeepseekV4ModelCfg, DeepseekV4VllmConfigs, DeepseekV4VllmModel, DeepseekV4VllmParallel,

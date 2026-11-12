@@ -143,6 +143,7 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "flashinfer_cutedsl",
         "flashinfer_mxfp8",
         "sglang_triton_block32_fp8",
+        "flashinfer_mxfp8_prequantized",
     }
 
 
@@ -1513,7 +1514,7 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
             (
                 '{"results":[{"ok":true,"metrics":{"kind":"compute",'
                 '"time_ms":1.0,"tflops":0.1,"memory_bandwidth_gbps":0.2,'
-                '"energy_j":0.0},"gpu_name":"FakeGPU"}]}'
+                '"energy_j":0.0},"gpu_name":"FakeGPU"}],"gpu_uuids":["GPU-fake-2"]}'
             ),
             encoding="utf-8",
         )
@@ -1525,6 +1526,11 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
     )
     monkeypatch.setattr("profiling.exec.local.resolve_profile_env", fake_resolve_profile_env)
     monkeypatch.setattr("profiling.exec.local.subprocess.run", fake_subprocess_run)
+    # The worker reports the card it saw; the chunk checks it against index 2.
+    monkeypatch.setattr(
+        "profiling.exec.local.gpu_uuids_for_indices",
+        lambda indices: [f"GPU-fake-{index}" for index in indices],
+    )
     # The launcher's PyO3 child points these at the project venv; an env with
     # its own interpreter must not import the project's Torch through them.
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["/project/site-packages", "/existing"]))

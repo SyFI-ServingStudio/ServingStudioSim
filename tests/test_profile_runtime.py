@@ -90,7 +90,31 @@ def test_a_missing_image_names_its_build_command(monkeypatch):
     )
     monkeypatch.setattr("profiling.exec.env.shutil.which", lambda _: "/usr/bin/docker")
     with pytest.raises(FileNotFoundError, match="images build flashinfer-kda"):
-        ContainerProfileEnv("flashinfer_kda_env", "vibesim-profiler-flashinfer-kda:0123").validate()
+        ContainerProfileEnv("flashinfer_kda_env", "vibesim-profiler-flashinfer-kda:0123", "/opt/venv/bin/python").validate()
+
+
+def test_the_first_docker_contact_runs_outside_the_callers_process_group(monkeypatch):
+    """A Slurm job's `docker` shim starts a job-scoped runtime service on first use.
+    Started inside the predictor's process group it outlives the predictor and the
+    launcher reports (and kills) it as a leaked descendant."""
+    from profiling.exec.container_user import rootless_runtime
+
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append((argv[:2], kwargs.get("start_new_session")))
+        return __import__("subprocess").CompletedProcess(argv, 0, "sha256:x", "")
+
+    monkeypatch.setattr("profiling.exec.env.subprocess.run", run)
+    monkeypatch.setattr("profiling.exec.env.shutil.which", lambda _: "/usr/bin/docker")
+    ContainerProfileEnv("vllm_env", "vibesim-profiler-vllm:0123", "/usr/bin/python3").validate()
+    monkeypatch.setattr("profiling.exec.container_user.subprocess.run", run)
+    rootless_runtime.cache_clear()
+    try:
+        rootless_runtime()
+    finally:
+        rootless_runtime.cache_clear()
+    assert seen == [(["docker", "image"], True), (["docker", "info"], True)]
 
 
 def test_an_unknown_runtime_is_rejected(monkeypatch):
@@ -198,7 +222,9 @@ def test_a_superseded_image_tags_jit_cache_is_removed_once_stale(tmp_path, monke
     for name in ("vibesim-profiler-vllm_old", "other_old"):
         os.utime(tmp_path / name, (old, old))
 
-    cache = local._image_cache_dir("vibesim-profiler-vllm:new")
+    # No cache-key label (no runtime here, or a non-engine image): one per tag.
+    monkeypatch.setattr(local, "image_cache_key", lambda image, _uuids: image.replace(":", "_"))
+    cache = local.image_cache_dir("vibesim-profiler-vllm:new", [])
 
     assert cache == tmp_path / "vibesim-profiler-vllm_new"
     # Only the same image's stale tags go; another image's cache is its own.
@@ -206,4 +232,30 @@ def test_a_superseded_image_tags_jit_cache_is_removed_once_stale(tmp_path, monke
         "other_old",
         "vibesim-profiler-vllm_new",
         "vibesim-profiler-vllm_recent",
+    ]
+
+
+def test_an_engine_cache_prunes_its_old_bases_and_unlabelled_tags(monkeypatch, tmp_path) -> None:
+    import os
+    import time
+
+    from profiling.exec import local
+
+    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(tmp_path))
+    old = time.time() - local.STALE_CACHE_SECONDS - 60
+    stale = ("vllm-oldbase-sm100", "vibesim-profiler-vllm_pre-label", "sglang-oldbase-sm100")
+    for name in (*stale, "vllm-recent-sm100"):
+        (tmp_path / name).mkdir()
+    for name in stale:
+        os.utime(tmp_path / name, (old, old))
+
+    monkeypatch.setattr(local, "image_cache_key", lambda _image, _uuids: "vllm-newbase-sm100")
+    cache = local.image_cache_dir("vibesim-profiler-vllm:new", [])
+
+    assert cache == tmp_path / "vllm-newbase-sm100"
+    # The other engine's caches are its own, however old.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "sglang-oldbase-sm100",
+        "vllm-newbase-sm100",
+        "vllm-recent-sm100",
     ]

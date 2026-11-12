@@ -3137,7 +3137,8 @@ def test_glm53_nvfp4_location_maps_are_the_fp8_maps_less_the_shared_expert_quant
 # --------------------------------------------------------------------------- #
 # Hand-derived from DeepSeek's reference inference/model.py, the config, and the
 # checkpoint's safetensors headers (logical FP4 elements unpacked, scales not
-# parameters). The DSpark MTP layers and the vision tower are excluded.
+# parameters). The vision tower is excluded; the DSpark draft (mtp.*) is staged and
+# counts only when a workload runs it (DSpark goldens below).
 
 DSV41 = Path(__file__).resolve().parents[1] / "model" / "config" / "deepseek_v41_flash.json"
 DSV41_MAP = (
@@ -3360,7 +3361,8 @@ def test_dsv41_sparse_caps_and_candidate_restriction(dsv41):
 
 def test_dsv41_excludes_mtp_and_vision_and_keeps_bf16_modules(dsv41):
     assert dsv41.num_layers == 40
-    assert [stack.count for stack in dsv41.layers] == [1, 1, 2, 10, 1, 5, 1, 12, 4, 3]
+    body = [stack.count for stack in dsv41.layers if stack.stage is None]
+    assert body == [1, 1, 2, 10, 1, 5, 1, 12, 4, 3]
     label = dsv41.label(Workload.causal_lm(decode=[4096], sampled=1))
     dtypes = {segment.name: segment.compute_dtype for segment in label.segments}
     assert dtypes["c2_source.compressor.wkv"] == "bf16"
@@ -3405,6 +3407,141 @@ def test_dsv41_location_map_consumes_every_semantic_once(dsv41):
     ]
     assert not any("all_reduce" in location or "all_gather" in location for location in locations)
     assert sum(not row["semantics"] for row in location_map["locations"]) == 99
+
+
+# --- DSpark proposer (the checkpoint's mtp.{0,1,2}) -------------------------------
+#
+# Hand-derived from the reference inference/model.py (DSparkBlock, DSparkAttention,
+# DSparkMarkovHead, forward_spec) and the safetensors headers: three sliding-window
+# draft layers with the body's attention shapes, a 128-expert top-3 MXFP4 MoE with
+# one FP8 shared expert, main_proj over layers 37/38/39 (3 x 5120 -> 5120), a
+# rank-256 Markov head, block size 5. The confidence head and bias_vl never run.
+
+V41_DS_L, V41_DS_E, V41_DS_K, V41_DS_RANK, V41_DS_BLOCK = 3, 128, 3, 256, 5
+V41_DS_LAYER = (
+    V41_ATTN_MM
+    + V41_ATTN_VEC
+    + 2 * V41_H  # attn_norm, ffn_norm
+    + V41_MHC
+    + V41_DS_E * V41_H  # router
+    + V41_DS_E  # router selection bias
+    + V41_DS_E * V41_EXPERT
+    + V41_EXPERT  # shared expert
+)
+V41_DS_PARAMS = (
+    V41_DS_L * V41_DS_LAYER
+    + 3 * V41_H * V41_H  # main_proj
+    + 2 * V41_H  # main_norm, final norm
+    + 2 * V41_V * V41_DS_RANK  # markov embed + head
+)
+
+
+def _dspark_workload(prefill, decode, depth=V41_DS_BLOCK):
+    from model.work.speculative import aggregate_workload
+
+    geometry = {"draft_tokens": depth, "max_model_len": 131072, "prefill": prefill,
+                "decode": decode}
+    totals = {
+        "matmul_tokens": sum(q for _, q in prefill) + sum(q for _, q in decode),
+        "prefill_tokens": sum(q for _, q in prefill),
+        "prefill_requests": len(prefill),
+        "prefill_pairs": sum(q * p + q * (q + 1) // 2 for p, q in prefill),
+        "prefill_cached": sum(p for p, _ in prefill),
+        "decode_passes": len(decode),
+        "decode_kv": sum(kv - q for kv, q in decode),
+        "speculative_geometry": {json.dumps(geometry): 1},
+    }
+    return aggregate_workload(totals, "dspark")
+
+
+def test_dspark_params_reconcile_with_the_checkpoint(dsv41):
+    from model.work.speculative import proposer_for
+
+    assert proposer_for({s.stage for s in dsv41.layers if s.stage}) == "dspark"
+    # Sum of every mtp.* safetensors tensor (I8 FP4 packs x2, scales excluded),
+    # 14,225,362,530, minus three bias_vl [128] and the confidence head [1, 5376].
+    assert V41_DS_PARAMS == 14_225_362_530 - 3 * 128 - 5376 == 14_225_356_770
+    wl = _dspark_workload([[0, 16]], [[100, 6]])
+    body = dsv41.label(replace(wl, stages={})).params
+    label = dsv41.label(wl).params
+    assert label["total"] - body["total"] == V41_DS_PARAMS
+    active = (
+        V41_DS_L * (V41_DS_LAYER - V41_DS_E * V41_EXPERT + V41_DS_K * V41_EXPERT)
+        + 3 * V41_H * V41_H
+        + 2 * V41_H
+        + V41_DS_RANK  # one gathered markov embedding row
+        + V41_V * V41_DS_RANK  # markov head
+    )
+    assert label["activated"]["layers"] - body["activated"]["layers"] == active
+    # The non-speculative parameter overview is unchanged.
+    assert compute_parameter_counts(DSV41)["total"] == 748_494_669_424
+
+
+def test_dspark_stage_flop_and_byte_goldens(dsv41):
+    # One 16-token prompt and two verifies (width 6) ending at contexts 100 and
+    # 4104: R = 3 requests, C = 28 target rows, 15 block rows, 15 Markov steps.
+    label = dsv41.label(_dspark_workload([[0, 16]], [[100, 6], [4104, 6]]))
+    seg = {s.name: s for s in label.segments}
+    fp8 = lambda n, k: n * k + (n // 32) * (k // 32)  # noqa: E731  FP8 32x32 + UE8M0
+    # Context: main_proj over every target row, then each layer's wkv and the
+    # surviving window entries (min(rows, 128) per request) at 528 B.
+    assert seg["dspark_context.main_proj"].flops_total == 2 * 28 * V41_H * 3 * V41_H
+    assert seg["dspark_context.main_proj"].bytes_total == fp8(V41_H, 3 * V41_H)
+    assert seg["dspark_context.main_proj"].compute_dtype == "fp8"
+    assert seg["dspark_context_kv.wkv"].flops_total == V41_DS_L * 2 * 28 * V41_HD * V41_H
+    assert seg["dspark_context_kv.window_cache_append"].bytes_total == V41_DS_L * 28 * 528
+    # Draft: 15 block rows through three full layers.
+    rows = 15
+    assert seg["dspark_draft.wq_b"].flops_total == V41_DS_L * 2 * rows * V41_NH * V41_HD * V41_Q
+    assert seg["dspark_draft.router"].flops_total == V41_DS_L * 2 * rows * V41_DS_E * V41_H
+    assert seg["dspark_draft.expert_gate_up"].flops_total == (
+        V41_DS_L * 2 * rows * V41_DS_K * 2 * V41_I * V41_H
+    )
+    loaded = V41_DS_E * (1 - (1 - 1 / V41_DS_E) ** (rows * V41_DS_K))
+    expert_bytes = 2 * V41_I * V41_H // 2 + 2 * V41_I * V41_H // 32
+    assert seg["dspark_draft.expert_gate_up"].bytes_total == pytest.approx(
+        V41_DS_L * loaded * expert_bytes, rel=1e-12
+    )
+    assert seg["dspark_draft.mhc_ffn.fn"].flops_total == V41_DS_L * 2 * rows * V41_MIX * 4 * V41_H
+    # Each block query sees min(128, context) context keys plus the 5 block keys.
+    pairs = 5 * ((16 + 5) + (100 + 5) + (128 + 5))
+    assert seg["dspark_draft.attn"].flops_total == V41_DS_L * 2 * V41_NH * 2 * V41_HD * pairs
+    assert seg["dspark_draft.attn"].bytes_total == V41_DS_L * (16 + 100 + 128) * 528
+    assert "dspark_draft.window_cache_append" not in seg  # block keys are not cached
+    # The target's head over every block row: FLOPs only, its weights read once.
+    assert seg["dspark_draft.lm_head"].flops_total == 2 * rows * V41_H * V41_V
+    assert seg["dspark_draft.lm_head"].bytes_total == 0
+    # Markov: one rank-256 bias per drafted position, the BF16 head read once.
+    assert seg["dspark_markov.markov_head"].flops_total == 2 * rows * V41_DS_RANK * V41_V
+    assert seg["dspark_markov.markov_head"].bytes_total == V41_V * V41_DS_RANK * 2
+    assert seg["dspark_markov.markov_embed"].bytes_total == rows * V41_DS_RANK * 2
+    # The target verifies and samples every row.
+    assert seg["lm_head"].flops_total == 2 * (1 + 12) * V41_H * V41_V
+    draft_flops = sum(s.flops_total for name, s in seg.items() if name.startswith("dspark"))
+    expected = (
+        2 * 28 * V41_H * 3 * V41_H
+        + V41_DS_L * 2 * 28 * V41_HD * V41_H
+        + V41_DS_L * 2 * rows * (
+            V41_ATTN_MM
+            + 2 * V41_MIX * 4 * V41_H
+            + V41_DS_E * V41_H
+            + (V41_DS_K + 1) * V41_EXPERT
+        )
+        + V41_DS_L * 2 * V41_NH * 2 * V41_HD * pairs
+        + 2 * rows * V41_H * V41_V
+        + 2 * rows * V41_DS_RANK * V41_V
+    )
+    assert draft_flops == expected
+
+
+def test_dspark_rejects_a_depth_other_than_its_block(dsv41):
+    with pytest.raises(ValueError, match="5 query rows"):
+        dsv41.label(_dspark_workload([], [[100, 4]], depth=3))
+
+
+def test_dspark_never_touches_a_non_speculative_label(dsv41):
+    workload = Workload.causal_lm(decode=[4096] * 3, sampled=3)
+    assert not any(s.name.startswith("dspark") for s in dsv41.label(workload).segments)
 
 
 # ---------------------------------------------------------------------------

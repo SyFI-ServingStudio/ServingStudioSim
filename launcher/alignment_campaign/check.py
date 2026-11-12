@@ -24,7 +24,12 @@ fall into four groups:
    which catches a copy-pasted case that measures nothing new.
 4. **The policy is complete.** Every metric the engine computes has a tolerance,
    every per-case exception states why, and every calibrated value says how it
-   was obtained.
+   was obtained. A `from_capture` value is checked for a source it can be read
+   from (a workload pass, an engine with an extractor); its rendering is checked
+   with a stand-in value, since the real one exists only after the capture.
+
+A tracked trace (`workload_trace: {path: ...}`) is checked the same way as a
+generated one: its file's sha256 must match `traces/invariants.json`.
 
 The stub host is built in code rather than read from `presets/alignment/hosts/`
 so `check` cannot be broken by editing an example file. It deliberately omits
@@ -35,6 +40,7 @@ GPU and no engine venv.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import tempfile
@@ -43,13 +49,15 @@ from typing import Any
 
 import yaml
 
+from alignment.profiler.config import server_gpu_count
+
 from ..alignment_config import (
     load_analyze_config,
     load_profile_config,
     load_timing_predict_config,
 )
 from ..corpus import ROUTING_FILES
-from .pack import Case, Finding, HostProfile, Pack, PackError
+from .pack import Calibrated, Case, Finding, HostProfile, Pack, PackError
 from .render import (
     ANALYSIS_E2E_PHASE,
     ANALYSIS_KERNEL_PHASE,
@@ -98,7 +106,12 @@ def host_for(pack: Pack, host: HostProfile | None) -> HostProfile:
             if key is None:
                 continue
             checkpoints.setdefault(key, f"/nonexistent/checkpoints/{key}")
-        world_size = int(variant.server.get("tp_size", 1)) * int(variant.server.get("dp_size", 1))
+        world_size = server_gpu_count(
+            variant.engine,
+            int(variant.server.get("tp_size", 1)),
+            int(variant.server.get("dp_size", 1)),
+            list(variant.server.get("extra_args", [])),
+        )
         for case in pack.cases:
             if case.variant != variant.name:
                 continue
@@ -500,6 +513,8 @@ def _check_calibration(pack: Pack) -> list[Finding]:
     if pack.gpu_time_multiplier is not None:
         fields.insert(0, ("gpu_time_multiplier", pack.gpu_time_multiplier))
     for where, value in fields:
+        if value.from_capture:
+            continue
         if value.provisional:
             findings.append(
                 Finding("warn", where,
@@ -511,7 +526,93 @@ def _check_calibration(pack: Pack) -> list[Finding]:
                         "measured but cites no evidence path; the run that produced "
                         "it cannot be found later")
             )
+    findings += _check_capture_sources(pack)
+    findings += _check_acceptance_structure(pack)
     return findings
+
+
+#: Why a speculative case needs acceptance by output position, for the error.
+ACCEPTANCE_STRUCTURE_REASON = (
+    "a single case-wide chain is token-weighted and gives every request the same "
+    "acceptance, so short requests decode too fast: GLM-5.3 DFlash2 cases 07/08 read "
+    "request-weighted TPOT -26%/-24% with it and -11%/-6% with the buckets "
+    "(skills/operate-run-alignment, 'Preserve speculative acceptance structure')"
+)
+
+
+def _check_acceptance_structure(pack: Pack) -> list[Finding]:
+    """A speculative case declares acceptance by output position too.
+
+    A pack whose captures predate the per-position counters says so once, at
+    the top (`acceptance_structure: {status: legacy_single_chain, reason}`);
+    its cases are then warned about, with that reason, instead of failing.
+    """
+    legacy = pack.acceptance_structure
+    findings: list[Finding] = []
+    for case in pack.cases:
+        if (
+            case.speculative_acceptance is None
+            or case.speculative_acceptance_by_output_position is not None
+        ):
+            continue
+        where = f"cases[{case.slug}].speculative_acceptance_by_output_position"
+        if legacy is not None:
+            findings.append(Finding(
+                "warn", where,
+                f"missing; pack declares acceptance_structure {legacy.status} "
+                f"({legacy.reason}). " + ACCEPTANCE_STRUCTURE_REASON,
+            ))
+            continue
+        findings.append(Finding(
+            "error", where,
+            "missing beside speculative_acceptance; " + ACCEPTANCE_STRUCTURE_REASON
+            + ". Declare the buckets from the case's workload pass "
+            "(`{status: from_capture}`, or measured via calibration.buckets_from_metrics)",
+        ))
+    return findings
+
+
+def _check_capture_sources(pack: Pack) -> list[Finding]:
+    """A from_capture field needs a workload pass to read and an extractor for
+    its engine; both are known before anything runs."""
+    findings: list[Finding] = []
+    for case in pack.cases:
+        if not case.capture_fields or case.variant not in pack.variants:
+            continue
+        variant = pack.variant_of(case)
+        where = f"cases[{case.slug}]"
+        if not any(item.kind == "workload_metrics" for item in variant.profile_passes):
+            findings.append(Finding(
+                "error", where,
+                f"{sorted(case.capture_fields)} from_capture needs a workload_metrics pass; "
+                f"variant {variant.name} declares none",
+            ))
+        if "attn_gpu_memory_gb" in case.capture_fields and variant.engine != "vllm":
+            findings.append(Finding(
+                "error", f"{where}.attn_gpu_memory_gb",
+                f"from_capture has no {variant.engine} extractor (only vLLM's KV pool log "
+                "line is read); declare a measured value",
+            ))
+    return findings
+
+
+def capture_stand_in(pack: Pack, case: Case) -> Case:
+    """`case` with placeholder values in its from_capture fields.
+
+    Only `check` uses this, to hand a renderable preset to the loaders before
+    any capture exists. Nothing it produces is run or written to a case dir.
+    """
+    changes = {}
+    for name, value in case.capture_fields.items():
+        depth = int(pack.variant_of(case).arch.get("draft_tokens") or 1)
+        if name == "attn_gpu_memory_gb":
+            stand_in: object = 1.0
+        elif name == "speculative_acceptance":
+            stand_in = [0.5] * depth
+        else:
+            stand_in = [{"from": 1, "p": [1 / (depth + 1)] * (depth + 1)}]
+        changes[name] = Calibrated(value=stand_in, status="measured", derived_from="check stand-in")
+    return dataclasses.replace(case, **changes) if changes else case
 
 
 def _check_rendering(pack: Pack, host: HostProfile) -> list[Finding]:
@@ -526,6 +627,7 @@ def _check_rendering(pack: Pack, host: HostProfile) -> list[Finding]:
             if case.variant not in pack.variants:
                 continue  # already reported by _check_identity
             where = f"cases[{case.slug}]"
+            case = capture_stand_in(pack, case)
             case_dir = out_root / case.slug
             case_dir.mkdir(parents=True, exist_ok=True)
             try:
@@ -638,12 +740,17 @@ def _check_cross_phase(pack: Pack, case: Case, documents: dict[str, Any]) -> lis
                         f"server {limit_flag} does not match the case")
             )
         devices = [item for item in document["cuda_visible_devices"].split(",") if item]
-        world = int(variant.server.get("tp_size", 1)) * int(variant.server.get("dp_size", 1))
+        world = server_gpu_count(
+            variant.engine,
+            int(variant.server.get("tp_size", 1)),
+            int(variant.server.get("dp_size", 1)),
+            flags,
+        )
         if len(devices) != world:
             findings.append(
                 Finding("error", f"{where}.{profile_pass.name}",
                         f"device role {case.device_role!r} yields {len(devices)} devices "
-                        f"but tp*dp is {world}")
+                        f"but dp*tp*pp*pcp is {world}")
             )
     return findings
 

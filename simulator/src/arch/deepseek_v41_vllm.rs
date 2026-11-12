@@ -26,6 +26,18 @@
 //! every field of their type matches, so no fold crosses a ratio, KV/index
 //! source, candidate, or Engram boundary.
 //!
+//! Step shape (vLLM MRV2, [`normalize_step`]): a uniform decode batch replays
+//! the FULL graph of its padded request count ([`DeepseekV41CudaGraphs`], from
+//! the selector's `cudagraph_capture_sizes` and `max_num_seqs`),
+//! any other batch the PIECEWISE graph of its padded token count, and batches
+//! past the capture limit run eager. FULL graphs keep the attention aux stream
+//! and, at most 16 rows, take the mHC overlap path at every fused mHC boundary.
+//!
+//! Decoder SWA bounded replay ([`BoundedReplay`], on by default): eager steps
+//! with a long prefill chunk and PIECEWISE steps of 768+ rows run layer 20's KV
+//! write over every row, then layers 20-39 on each request's last 128 rows
+//! (gathered, then scattered back after the last hc post).
+//!
 //! Routed demand: every MoE layer shares one `ExpertDemand` over all 40 routed
 //! layers (the capture's token corpus, `routing = corpus`), priced on the busiest
 //! EP rank (`folded_rank_position = 0`).
@@ -36,6 +48,7 @@
 //! and `quantization_config` kept and the vision tower dropped.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
@@ -44,6 +57,7 @@ use crate::arch::config::ModelSpec;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::kv_layout::{EngineOverhead, KvCacheLayout, KvCachePart};
 use crate::op::attention::DeepseekV41CandidateRole;
+use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::all_reduce_fusion::fused_all_reduce_refusal;
@@ -51,11 +65,12 @@ use crate::timing::kernels::compressed_sparse_mla_rope_cast::{
     MXFP8_RECORD_BYTES, NVFP4_RECORD_BYTES,
 };
 use crate::timing::kernels::kv_compress_store::FP8_INDEXER_ROW_BYTES;
+use crate::timing::kernels::{ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput};
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
 };
-use crate::worklet::deepseek_v41_common::attention_aux_stream_live;
+use crate::worklet::deepseek_v41_common::{eval_or_zero, mhc_overlap_live, placeholder};
 use crate::worklet::{
     DeepseekV41AttentionEntry, DeepseekV41AttentionLayer, DeepseekV41AttentionTpWorklet,
     DeepseekV41AttentionTpWorkletConfig, DeepseekV41AttentionTpWorkletInput,
@@ -93,46 +108,52 @@ const ENGRAM_LAYERS: [u32; 2] = [1, 14];
 // Deployment identity (capture 2 `profile.yaml` / server log). Its
 // `--max-model-len 131072` is the selector's `max_model_len`, which the
 // capture presets pin; see [`resolve_max_model_len`].
-/// `max_num_batched_tokens` (= `chunk_size` 2048).
-const MAX_BATCHED_TOKENS: u32 = 2048;
+/// Default `--max-num-batched-tokens` (= `chunk_size` 2048 of the base
+/// captures); the selector's `max_num_batched_tokens` overrides it.
+pub(crate) const MAX_BATCHED_TOKENS: u32 = 2048;
 /// `--block-size 128`: one KV page; an index page holds `128 / ratio` keys.
-const KV_BLOCK_SIZE: u32 = 128;
+pub(crate) const KV_BLOCK_SIZE: u32 = 128;
 /// Index-cache page used to price ratio-1 index layers. Production pages hold
 /// `128 / ratio` keys (128 at ratio 1), but the `dsa_paged_mqa_logits_decode`
 /// DeepGEMM runner only builds 64-key pages (`_BLOCK_SIZE = 64`), so ratio-1
 /// scoring is priced on 64-key pages: the same keys in twice the pages.
 const RATIO1_INDEX_PAGE_FALLBACK: u32 = 64;
 /// SWA page of the fused q-norm/rope/KV insert (the profiled kernel identity).
-const SWA_BLOCK_SIZE: u32 = 32;
+pub(crate) const SWA_BLOCK_SIZE: u32 = 32;
 /// FlashMLA's padded per-rank Q width.
 const PADDED_HEADS: u32 = 64;
 /// Mega-attention prefill chunking (the profiled op identity).
 const PREFILL_CHUNK_SIZE: u32 = 4;
-/// FULL CUDA graphs cover decode batches up to `max_num_seqs` 64 (11 sizes);
-/// only they keep the attention aux stream (`attention_aux_stream_live`).
-const MAX_FULL_GRAPH_TOKENS: u32 = 64;
-/// `max_cudagraph_capture_size 2048`: the piecewise graph sizes run by every
-/// iteration up to 2048 tokens pad the dense spine to the next capture size.
-const MAX_CUDAGRAPH_CAPTURE_SIZE: u32 = 2048;
+/// `--max-num-seqs 64`: the most requests a FULL decode graph holds.
+pub(crate) const MAX_NUM_SEQS: u32 = 64;
 /// Rows of TP rank 0's Engram table slice (`part_num_embeddings`, server log
 /// `engram.py:269`, layer 1): the lookup kind's exact table identity.
 const ENGRAM_TABLE_ROWS_RANK0: u64 = 96_000_564;
 /// `wkv` output width of the Engram block (captured MXFP8 GEMM 6144 -> 25600).
 const ENGRAM_WKV_OUT: u32 = 25_600;
 
-const MHC_BACKENDS: &[&str] = &["deepgemm_mega"];
-const MXFP8_GEMM_BACKENDS: &[&str] = &["flashinfer_mxfp8"];
-const FP32_GEMM_BACKENDS: &[&str] = &["torch_cublas"];
-const KV_INSERT_BACKENDS: &[&str] = &["vllm_cuda"];
-const MEGA_ATTN_BACKENDS: &[&str] = &["flashmla_mega"];
-const WO_A_BACKENDS: &[&str] = &["deepgemm_mxfp8_einsum_grouped_o_proj"];
-const ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
-const ALL_GATHER_PROXY_BACKENDS: &[&str] = &["nccl"];
-const INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
-const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
-const MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_sm100_mxfp4"];
-const ENGRAM_LOOKUP_BACKENDS: &[&str] = &["vllm_triton"];
-const LM_HEAD_BACKENDS: &[&str] = &["torch_linear"];
+pub(crate) const MHC_BACKENDS: &[&str] = &["deepgemm_mega"];
+pub(crate) const MHC_TILELANG_BACKENDS: &[&str] = &["vllm_tilelang"];
+pub(crate) const MXFP8_GEMM_BACKENDS: &[&str] = &["flashinfer_mxfp8"];
+/// The fork's `VLLM_MOE_SKIP_PADDING` default (`vllm/envs.py`, on): graph and
+/// DP padding rows get top-k id -1 and skip the routed experts.
+pub(crate) const MOE_SKIP_PADDING: bool = true;
+/// The MXFP8 linear on an activation its producer already quantized.
+pub(crate) const MXFP8_PREQUANTIZED_GEMM_BACKENDS: &[&str] = &["flashinfer_mxfp8_prequantized"];
+pub(crate) const FP32_GEMM_BACKENDS: &[&str] = &["torch_cublas"];
+pub(crate) const KV_INSERT_BACKENDS: &[&str] = &["vllm_cuda"];
+pub(crate) const MEGA_ATTN_BACKENDS: &[&str] = &["flashmla_mega"];
+/// vLLM's swap-AB decode kernel, which takes small decode steps of compressed
+/// layers at 16 or 32 live heads (TP4 / TP2 of the 64-head checkpoint).
+pub(crate) const SWAPAB_ATTN_BACKENDS: &[&str] = &["swapab_cutedsl"];
+pub(crate) const WO_A_BACKENDS: &[&str] = &["deepgemm_mxfp8_einsum_grouped_o_proj"];
+pub(crate) const ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
+pub(crate) const ALL_GATHER_PROXY_BACKENDS: &[&str] = &["nccl"];
+pub(crate) const INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
+pub(crate) const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
+pub(crate) const MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_sm100_mxfp4"];
+pub(crate) const ENGRAM_LOOKUP_BACKENDS: &[&str] = &["vllm_triton"];
+pub(crate) const LM_HEAD_BACKENDS: &[&str] = &["torch_linear"];
 
 /// The checkpoint facts this arch reads, validated against the exact V4.1-Flash
 /// identity.
@@ -167,6 +188,9 @@ pub struct DeepseekV41ModelCfg {
     pub engram_layer_ids: Vec<u32>,
     /// Hash columns = `(engram_max_ngram_size - 1) * engram_n_heads` (24).
     pub engram_hash_heads: u32,
+    /// Prior tokens each request's n-gram hash looks back on:
+    /// `engram_max_ngram_size - 1` (fork `common/engram.py:444`).
+    pub engram_lookback_depth: u32,
     pub engram_head_dim: u32,
 }
 
@@ -353,6 +377,7 @@ impl DeepseekV41ModelCfg {
             candidate_source_layer_id: raw.candidate_source_layer_id,
             engram_layer_ids: raw.engram_layer_ids,
             engram_hash_heads: (raw.engram_max_ngram_size - 1) * raw.engram_n_heads,
+            engram_lookback_depth: raw.engram_max_ngram_size - 1,
             engram_head_dim: raw.engram_head_dim,
         })
     }
@@ -511,10 +536,15 @@ pub struct DeepseekV41VllmParallel {
     pub gpu_name: String,
     /// The serial-stream counterfactual: every gated side branch runs serial.
     pub serialize_streams: bool,
-    /// Decoder SWA bounded replay (what-if; see [`BoundedReplay`]).
+    /// Decoder SWA bounded replay (vLLM default on; see [`BoundedReplay`]).
     pub decoder_swa_bounded_replay: bool,
     /// Resolved `--max-model-len` (see [`resolve_max_model_len`]).
     pub max_model_len: u32,
+    /// `--max-num-batched-tokens` (the chunk size): the mega attention's
+    /// prefill workspace identity.
+    pub max_num_batched_tokens: u32,
+    /// `--cudagraph-capture-sizes` (PIECEWISE token sizes; empty = eager).
+    pub cudagraph_capture_sizes: Vec<u32>,
 }
 
 /// The selector's `max_model_len`, defaulted to the checkpoint's
@@ -539,75 +569,82 @@ pub(crate) fn resolve_max_model_len(
     Ok(max_model_len)
 }
 
-/// Decoder SWA bounded replay: a counterfactual with no framework capture
-/// behind it. vLLM PR #58132 and SGLang `--enable-decoder-swa-bounded-replay`
-/// (`python/sglang/srt/models/deepseek_v4.py`, `late_layer_start` and the
-/// `late_layer_tail` slicing in `forward`) run the layers past the last KV
-/// source over each prefill request's last `sliding_window` extend tokens only:
-/// those layers own no compressed KV (ratio 0/1, not KV sources), so the only
-/// state they leave for later decode steps is the sliding window, and only the
-/// last token's hidden state reaches the head.
+/// vLLM's decoder-side SWA bounded replay (fork
+/// `models/deepseek_v41/decoder_replay_layers.py`, `nvidia/model.py`
+/// `decoder_replay_start`, `nvidia/model_state.py` `_prepare_replay_batch`),
+/// on by default (`cache_config.swa_bounded_replay`).
 ///
-/// Modeled as a reduced input for every body whose layers are all
-/// `>= late_layer_start` (= `max(kv_source_layer_ids) + 1`, layer 21 on
-/// V4.1-Flash): each prefill chunk `(append, context)` becomes
-/// `(min(append, window), context)`, decode rows are unchanged, and the dense
-/// rows re-pad to the CUDA-graph size of the reduced token count (which also
-/// re-derives the aux-stream gate). Layer 0, the prologue, the Engram prefetch,
-/// layers `1..late_layer_start` and the head keep the full input. The cost tree
-/// is the same with the flag on or off; only slot inputs change.
+/// The cut is the last KV-source layer (`max(kv_source_layer_ids)`, layer 20
+/// on V4.1-Flash). Layers past it own only sliding-window KV, so on a replay
+/// step the cut layer first writes its KV for every row (`write_kv`: entry
+/// mHC, input projections, norms and the KV/compressor/index-K stores, no
+/// attention), then the cut layer and every later layer run on each
+/// request's last `min(query_len, window)` rows only, gathered into a replay
+/// batch and scattered back to batch rows after the last layer's hc post.
+///
+/// Which steps replay ([`replay_rows`]): FULL decode graphs and PIECEWISE
+/// graphs under `trim_threshold` padded tokens run the whole batch; PIECEWISE
+/// graphs at or above it always break out to the replay batch; eager steps
+/// replay when some prefilling request has more than `window` query rows.
+/// The replay batch runs in a PIECEWISE replay graph sized to a multiple of
+/// `window` up to the capture limit, eager above it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoundedReplay {
-    pub late_layer_start: u32,
-    /// Replayed extend tokens per prefill chunk (`sliding_window`, 128).
+    /// First layer of the replay batch; it also runs `write_kv` on every row.
+    pub cut_layer: u32,
+    /// Rows kept per request (`sliding_window`, 128).
     pub window: u32,
+    /// `decoder_replay_trim_threshold`: PIECEWISE graphs of this many padded
+    /// tokens or more break out to the replay batch.
+    pub trim_threshold: u32,
 }
 
+/// `decoder_replay_trim_threshold` of the fork's MRV2 model state.
+pub const DECODER_REPLAY_TRIM_THRESHOLD: u32 = 768;
+
 impl BoundedReplay {
-    /// Derive the tail start from the config and check the SGLang
-    /// preconditions: every late layer compresses at ratio 0 or 1, is no KV
-    /// source, and has no Engram block.
+    /// The cut and the fork's preconditions (`_decoder_replay_supported`, the
+    /// `cut < end_layer - 1` and `compress_ratio <= 1` asserts): a layer past
+    /// the cut, no Engram layer at or after it, and a cut whose compressed KV
+    /// (if any) is written row by row.
     pub fn from_model(model: &DeepseekV41ModelCfg) -> std::result::Result<Self, BuildError> {
-        let late_layer_start = model
-            .kv_source_layer_ids
-            .iter()
-            .max()
-            .map(|&last| last + 1)
-            .ok_or_else(|| fit_failed("decoder SWA bounded replay needs kv_source_layer_ids"))?;
-        if late_layer_start >= model.num_layers {
+        let cut_layer =
+            *model.kv_source_layer_ids.iter().max().ok_or_else(|| {
+                fit_failed("decoder SWA bounded replay needs kv_source_layer_ids")
+            })?;
+        if cut_layer + 1 >= model.num_layers {
             return Err(fit_failed(format!(
-                "decoder SWA bounded replay: late_layer_start {late_layer_start} leaves no tail"
+                "decoder SWA bounded replay: cut layer {cut_layer} leaves no layer after it"
             )));
         }
-        for layer in late_layer_start..model.num_layers {
-            let ratio = model.compress_ratios[layer as usize];
-            if ratio > 1
-                || model.kv_source_layer_ids.contains(&layer)
-                || model.engram_layer_ids.contains(&layer)
-            {
-                return Err(fit_failed(format!(
-                    "decoder SWA bounded replay: late layer {layer} must be a non-KV-source, \
-                     non-Engram layer with compress ratio 0 or 1 (got ratio {ratio})"
-                )));
-            }
+        if model.compress_ratios[cut_layer as usize] > 1 {
+            return Err(fit_failed(format!(
+                "decoder SWA bounded replay: cut layer {cut_layer} compresses at ratio {}",
+                model.compress_ratios[cut_layer as usize]
+            )));
+        }
+        if let Some(layer) = model.engram_layer_ids.iter().find(|&&l| l >= cut_layer) {
+            return Err(fit_failed(format!(
+                "decoder SWA bounded replay: Engram layer {layer} sits at or after the cut \
+                 layer {cut_layer}"
+            )));
         }
         Ok(Self {
-            late_layer_start,
+            cut_layer,
             window: model.sliding_window,
+            trim_threshold: DECODER_REPLAY_TRIM_THRESHOLD,
         })
     }
 
-    fn is_late(&self, layers: &[u32]) -> std::result::Result<bool, BuildError> {
-        let late = layers
-            .iter()
-            .filter(|&&l| l >= self.late_layer_start)
-            .count();
+    /// Whether a body runs on the replay batch. A body may not straddle the cut.
+    pub(crate) fn is_late(&self, layers: &[u32]) -> std::result::Result<bool, BuildError> {
+        let late = layers.iter().filter(|&&l| l >= self.cut_layer).count();
         match late {
             0 => Ok(false),
             n if n == layers.len() => Ok(true),
             _ => Err(fit_failed(format!(
-                "body for layers {layers:?} straddles late_layer_start {}",
-                self.late_layer_start
+                "body for layers {layers:?} straddles the replay cut layer {}",
+                self.cut_layer
             ))),
         }
     }
@@ -624,7 +661,7 @@ pub struct DeepseekV41LayerConfig {
 
 /// Fold plan with each body replaced by its index into the body list.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum PlanNode {
+pub(crate) enum PlanNode {
     Body(usize),
     Repeat { n: u32, body: Vec<PlanNode> },
 }
@@ -639,9 +676,53 @@ pub struct DeepseekV41VllmConfigs {
     pub head: DeepseekV41HeadTpWorkletConfig,
     pub kv_cache_layout: KvCacheLayout,
     /// `Some` with `decoder_swa_bounded_replay` on.
-    pub bounded_replay: Option<BoundedReplay>,
-    /// Per body: evaluated on the bounded-replay input (all layers late).
+    pub replay: Option<DeepseekV41ReplayConfig>,
+    /// Per body: evaluated on the replay batch (all layers at or past the cut).
     pub late_bodies: Vec<bool>,
+    /// The captured graphs, decode query length 1 (no speculation).
+    pub graphs: DeepseekV41CudaGraphs,
+}
+
+/// The bounded-replay boundary: the cut layer's `write_kv` over every row,
+/// the gather into the replay batch, and the scatter of its outputs back.
+#[derive(Clone)]
+pub struct DeepseekV41ReplayConfig {
+    pub rule: BoundedReplay,
+    /// Index into `bodies` of the cut layer's body (exactly the cut layer).
+    pub cut_body: usize,
+    /// The cut layer's attention config, run with `write_kv_only`.
+    pub write_kv: DeepseekV41AttentionTpWorkletConfig,
+    /// `index_select` of the layer inputs (hidden, residual streams, mixes,
+    /// positions, ids) by the replay rows, per replay row.
+    pub gather: ElementwiseKernelConfig,
+    /// `new_zeros(..).index_copy_` of the outputs (hc streams, pre-mix, any
+    /// aux hidden states) back to batch rows, per batch row. A drafter that
+    /// captures late aux hidden states widens it.
+    pub scatter: ElementwiseKernelConfig,
+}
+
+impl DeepseekV41ReplayConfig {
+    pub(crate) fn new(
+        rule: BoundedReplay,
+        cut_body: usize,
+        write_kv: DeepseekV41AttentionTpWorkletConfig,
+        model: &DeepseekV41ModelCfg,
+        gpu: &str,
+    ) -> Self {
+        let (hidden, hc) = (model.hidden_size, model.hc_mult);
+        // hidden (bf16) + residual hc streams (bf16) + pre/post (hc) and res
+        // (hc x hc) fp32 mixes + int64 position + int32 id.
+        let gathered = hidden * 2 + hc * hidden * 2 + (2 * hc + hc * hc) * 4 + 8 + 4;
+        // hc streams (bf16) + the last FFN's pre-mix (hc fp32).
+        let scattered = hc * hidden * 2 + hc * 4;
+        Self {
+            rule,
+            cut_body,
+            write_kv,
+            gather: placeholder(ELEMENTWISE_BACKENDS, gpu, gathered, gathered),
+            scatter: placeholder(ELEMENTWISE_BACKENDS, gpu, scattered, scattered),
+        }
+    }
 }
 
 pub struct DeepseekV41LayerResolved {
@@ -659,8 +740,17 @@ pub struct DeepseekV41VllmResolved {
     plan: Vec<PlanNode>,
     head: DeepseekV41HeadTpWorkletResolved,
     kv_cache_layout: KvCacheLayout,
-    bounded_replay: Option<BoundedReplay>,
+    replay: Option<DeepseekV41ReplayResolved>,
     late_bodies: Vec<bool>,
+    graphs: DeepseekV41CudaGraphs,
+}
+
+pub struct DeepseekV41ReplayResolved {
+    rule: BoundedReplay,
+    cut_body: usize,
+    write_kv: DeepseekV41AttentionTpWorkletResolved,
+    gather: ElementwiseKernelConfig,
+    scatter: ElementwiseKernelConfig,
 }
 
 fn fit_failed(reason: impl Into<String>) -> BuildError {
@@ -716,18 +806,32 @@ pub fn build_configs(
         bodies.push(layer_config(model, parallel, demand, kind, layers.to_vec()));
         bodies.len() - 1
     });
-    let bounded_replay = parallel
-        .decoder_swa_bounded_replay
-        .then(|| BoundedReplay::from_model(model))
-        .transpose()?;
-    let late_bodies = match &bounded_replay {
-        Some(replay) => bodies
-            .iter()
-            .map(|body: &DeepseekV41LayerConfig| replay.is_late(&body.layers))
-            .collect::<std::result::Result<Vec<_>, _>>()?,
-        None => vec![false; bodies.len()],
-    };
     let gpu = parallel.gpu_name.clone();
+    let (replay, late_bodies) = if parallel.decoder_swa_bounded_replay {
+        let rule = BoundedReplay::from_model(model)?;
+        let late_bodies = bodies
+            .iter()
+            .map(|body: &DeepseekV41LayerConfig| rule.is_late(&body.layers))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let cut_body = bodies
+            .iter()
+            .position(|body| body.layers == [rule.cut_layer])
+            .ok_or_else(|| {
+                fit_failed(format!(
+                    "decoder SWA bounded replay: cut layer {} shares its body",
+                    rule.cut_layer
+                ))
+            })?;
+        let write_kv = bodies[cut_body].attention.clone();
+        (
+            Some(DeepseekV41ReplayConfig::new(
+                rule, cut_body, write_kv, model, &gpu,
+            )),
+            late_bodies,
+        )
+    } else {
+        (None, vec![false; bodies.len()])
+    };
     Ok(DeepseekV41VllmConfigs {
         prologue: DeepseekV41PrologueTpWorkletConfig {
             tp_size: parallel.tp_size,
@@ -763,13 +867,14 @@ pub fn build_configs(
             all_gather_backends: ALL_GATHER_PROXY_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
-        kv_cache_layout: kv_cache_layout(model, parallel.tp_size),
-        bounded_replay,
+        kv_cache_layout: kv_cache_layout(model, parallel.tp_size, 0),
+        replay,
         late_bodies,
+        graphs: DeepseekV41CudaGraphs::new(&parallel.cudagraph_capture_sizes, MAX_NUM_SEQS, &[1]),
     })
 }
 
-fn index_plan(
+pub(crate) fn index_plan(
     fold: &[FoldPlan],
     push: &mut impl FnMut(LayerKind, &[u32]) -> usize,
 ) -> Vec<PlanNode> {
@@ -786,28 +891,37 @@ fn index_plan(
 
 /// One request's cache over the TP group, in vLLM's packed groups (fork
 /// `v1/kv_cache_interface.py`, BLHNC layout). Each rank holds the one KV head,
-/// so the TP group holds one rank's layout on each of its `tp_size` ranks.
+/// so every part is one rank's bytes replicated on each of the `tp_size` ranks,
+/// and so is the null block.
 ///
 /// Per 128-token block, the full-attention group packs every KV-source layer's
 /// NVFP4 compressed page (288 B per `ratio` tokens) and each owned indexer FP8
 /// key page (132 B per `ratio` tokens), each page rounded up to the 512 B TMA
-/// stride. With sources 2/8/14 at ratio 2 and 20 at ratio 1 that is 135,168 B
-/// per rank, the pool's block, and 1056 B per token (the ratio-2 index pages
-/// round 8448 B up to 8704 B). Every layer keeps a 128-token sliding window of
-/// 528 B MXFP8 rows in 32-token blocks, eight layers to a group; vLLM's SWA
-/// bounded replay (`swa_bounded_replay`, on by default) recomputes it after a
-/// prefix hit instead of reusing it. Each ratio-2 source's compressor keeps a
-/// ring of eight fp32 [kv, score] rows, one block per request, also never
-/// reused. vLLM reserves one null block.
-fn kv_cache_layout(model: &DeepseekV41ModelCfg, tp_size: u32) -> KvCacheLayout {
+/// stride: with sources 2/8/14 at ratio 2 and 20 at ratio 1 that is 135,168 B
+/// per rank (the ratio-2 index pages round 8448 B up to 8704 B). This
+/// unaligned block sets how many layers' pages share one block
+/// (`states_per_block`). With an MXFP8 KV cache, FlashMLA reads the
+/// interleaved SWA (528 B) and compressed (288 B) records as rows of the whole
+/// cache, so the block stride is a multiple of `lcm(528, 288)` = 3168 B and of
+/// the 512 B page (`attention.py` `packed_block_stride_alignment`): 50,688 B,
+/// which rounds the pool's block to 152,064 B. Every block of every group pays
+/// that stride; the full-attention parts carry the rounding per token.
+///
+/// Every layer keeps a 128-token sliding window of 528 B MXFP8 rows in 32-token
+/// blocks, eight layers to a group; `extra_swa_layers` adds a drafter's
+/// sliding-window-only layers (DSpark: 3) to the same groups. vLLM's SWA
+/// bounded replay (on by default) recomputes the window after a prefix hit
+/// instead of reusing it. Each ratio-2 source's compressor keeps a ring of
+/// eight fp32 [kv, score] rows, one block per request, also never reused.
+/// vLLM reserves one null block.
+/// The packed full-attention block every KV group's page matches (bytes),
+/// and its per-ratio parts `(name, ratio, bytes per entry, padded bytes)`.
+fn packed_full_block(model: &DeepseekV41ModelCfg) -> (u64, Vec<(&'static str, u32, u64, u64)>) {
     const BLOCK_TOKENS: u64 = KV_BLOCK_SIZE as u64;
-    const PAGE_ALIGN: u64 = 512;
-    const RING_ROWS: u64 = 8;
-    const FP32: u64 = 4;
-    let page = |entries: u64, bytes: u64| (entries * bytes).div_ceil(PAGE_ALIGN) * PAGE_ALIGN;
-    let (record, index_row) = (
+    let (record, index_row, swa_row) = (
         u64::from(NVFP4_RECORD_BYTES),
         u64::from(FP8_INDEXER_ROW_BYTES),
+        u64::from(MXFP8_RECORD_BYTES),
     );
     let sources_at = |ratio: u32, indexed: bool| {
         model
@@ -818,55 +932,155 @@ fn kv_cache_layout(model: &DeepseekV41ModelCfg, tp_size: u32) -> KvCacheLayout {
             .count() as u64
     };
 
-    let mut layout = KvCacheLayout::new();
+    // The unaligned full-attention block (the packing anchor) and its stride.
     let mut block = 0;
+    let mut full_parts = Vec::new();
     for (ratio, kv_name, index_name) in [(2, "c2_kv", "c2_indexer"), (1, "c1_kv", "c1_indexer")] {
         let entries = BLOCK_TOKENS / u64::from(ratio);
         let (kv_layers, index_layers) = (sources_at(ratio, false), sources_at(ratio, true));
-        let (kv_page, index_page) = (page(entries, record), page(entries, index_row));
+        let (kv_page, index_page) = (
+            kv_page_bytes(entries, record),
+            kv_page_bytes(entries, index_row),
+        );
         block += kv_layers * kv_page + index_layers * index_page;
-        layout = layout
-            .with_part(
-                KvCachePart::compressed(kv_name, ratio, kv_layers * record)
-                    .padded_to(kv_layers * kv_page / entries),
-            )
-            .with_part(
-                KvCachePart::compressed(index_name, ratio, index_layers * index_row)
-                    .padded_to(index_layers * index_page / entries),
-            );
+        full_parts.push((
+            kv_name,
+            ratio,
+            kv_layers * record,
+            kv_layers * kv_page / entries,
+        ));
+        full_parts.push((
+            index_name,
+            ratio,
+            index_layers * index_row,
+            index_layers * index_page / entries,
+        ));
     }
-    // A kind whose layers' pages fill whole groups pays a block per group.
-    let groups = |pages: u64| pages.div_ceil(block);
+    let stride_align = lcm(KV_PAGE_ALIGN, lcm(swa_row, record));
+    let stride = block.div_ceil(stride_align) * stride_align;
+    // The stride rounding, per token, carried by the last ratio-1 part.
+    let rounding = stride - block;
+    assert_eq!(
+        rounding % BLOCK_TOKENS,
+        0,
+        "block stride rounding must split per token"
+    );
+    if let Some(last) = full_parts.last_mut() {
+        last.3 += rounding / BLOCK_TOKENS;
+    }
+    (block, full_parts)
+}
 
-    let swa_layers = model.compress_ratios.len() as u64;
-    let swa_row = u64::from(MXFP8_RECORD_BYTES);
-    let swa_block = u64::from(SWA_BLOCK_SIZE);
-    let swa_groups = groups(swa_layers * page(swa_block, swa_row));
+const KV_PAGE_ALIGN: u64 = 512;
+
+fn kv_page_bytes(entries: u64, bytes: u64) -> u64 {
+    (entries * bytes).div_ceil(KV_PAGE_ALIGN) * KV_PAGE_ALIGN
+}
+
+/// SWA layers (body plus `extra_swa_layers` draft layers) whose 32-token pages
+/// pack into page-size-matched KV cache groups: vLLM's
+/// `kv cache group sizes (32 x6, 128, 8)` for DSpark.
+fn swa_kv_groups(model: &DeepseekV41ModelCfg, extra_swa_layers: u32) -> u32 {
+    let (block, _) = packed_full_block(model);
+    let swa_layers = model.compress_ratios.len() as u64 + u64::from(extra_swa_layers);
+    let pages = swa_layers
+        * kv_page_bytes(
+            u64::from(SWA_BLOCK_SIZE),
+            u64::from(MXFP8_RECORD_BYTES),
+        );
+    pages.div_ceil(block) as u32
+}
+
+/// Compressed (ratio > 1) KV sources and the bytes of one layer's compressor
+/// ring state (8 rows of `2 x head_dim` fp32).
+fn compressor_ring(model: &DeepseekV41ModelCfg) -> (u64, u64) {
+    const RING_ROWS: u64 = 8;
+    const FP32: u64 = 4;
     let ring_layers = model
         .kv_source_layer_ids
         .iter()
         .filter(|&&layer| model.compress_ratios[layer as usize] > 1)
         .count() as u64;
-    let ring_layer_bytes = RING_ROWS * 2 * u64::from(model.head_dim) * FP32;
+    (ring_layers, RING_ROWS * 2 * u64::from(model.head_dim) * FP32)
+}
+
+/// KV cache groups by kind: the SWA groups (32-token blocks), the one packed
+/// full-attention group (128-token blocks) and the compressor-ring groups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeepseekV41KvGroups {
+    pub swa: u32,
+    pub full: u32,
+    pub ring: u32,
+}
+
+pub(crate) fn kv_groups(model: &DeepseekV41ModelCfg, extra_swa_layers: u32) -> DeepseekV41KvGroups {
+    let (block, _) = packed_full_block(model);
+    let (ring_layers, ring_layer_bytes) = compressor_ring(model);
+    DeepseekV41KvGroups {
+        swa: swa_kv_groups(model, extra_swa_layers),
+        full: 1,
+        ring: (ring_layers * kv_page_bytes(1, ring_layer_bytes)).div_ceil(block) as u32,
+    }
+}
+
+pub(crate) fn kv_cache_layout(
+    model: &DeepseekV41ModelCfg,
+    tp_size: u32,
+    extra_swa_layers: u32,
+) -> KvCacheLayout {
+    let page = kv_page_bytes;
+    let swa_row = u64::from(MXFP8_RECORD_BYTES);
+    let (block, full_parts) = packed_full_block(model);
+    let stride_align = lcm(KV_PAGE_ALIGN, lcm(swa_row, u64::from(NVFP4_RECORD_BYTES)));
+    let stride = block.div_ceil(stride_align) * stride_align;
+
+    let tp = tp_size;
+    let mut layout = KvCacheLayout::new();
+    for (name, ratio, bytes, padded) in full_parts {
+        layout = layout.with_part(
+            KvCachePart::compressed(name, ratio, bytes)
+                .padded_to(padded)
+                .replicated(tp),
+        );
+    }
+    // A kind whose layers' pages fill whole groups pays a stride per group.
+    let groups = |pages: u64| pages.div_ceil(block);
+
+    let swa_layers = model.compress_ratios.len() as u64 + u64::from(extra_swa_layers);
+    let swa_block = u64::from(SWA_BLOCK_SIZE);
+    let swa_groups = u64::from(swa_kv_groups(model, extra_swa_layers));
+    let (ring_layers, ring_layer_bytes) = compressor_ring(model);
     layout
         .with_part(
             KvCachePart::sliding_window("swa", model.sliding_window, swa_layers * swa_row)
-                .padded_to(swa_groups * block / swa_block)
-                .not_prefix_reusable(),
+                .padded_to(swa_groups * stride / swa_block)
+                .not_prefix_reusable()
+                .replicated(tp),
         )
         .with_part(
             KvCachePart::per_request("compressor_ring", ring_layers * ring_layer_bytes)
-                .padded_to(groups(ring_layers * page(1, ring_layer_bytes)) * block)
-                .not_prefix_reusable(),
+                .padded_to(groups(ring_layers * page(1, ring_layer_bytes)) * stride)
+                .not_prefix_reusable()
+                .replicated(tp),
         )
         .with_engine(EngineOverhead {
             block_tokens: Some(KV_BLOCK_SIZE),
-            fixed_device_bytes: block,
+            fixed_device_bytes: stride * u64::from(tp),
         })
-        .held_on_each_rank(u64::from(tp_size))
 }
 
-fn layer_config(
+fn lcm(a: u64, b: u64) -> u64 {
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    a / gcd(a, b) * b
+}
+
+pub(crate) fn layer_config(
     model: &DeepseekV41ModelCfg,
     parallel: &DeepseekV41VllmParallel,
     demand: &ExpertDemand,
@@ -913,14 +1127,17 @@ fn layer_config(
             },
             swa_block_size: SWA_BLOCK_SIZE,
             max_model_len: parallel.max_model_len,
-            max_num_batched_tokens: MAX_BATCHED_TOKENS,
+            max_num_batched_tokens: parallel.max_num_batched_tokens,
             prefill_chunk_size: PREFILL_CHUNK_SIZE,
             gpu_name: gpu.clone(),
             mhc_backends: MHC_BACKENDS.to_vec(),
+            mhc_tilelang_backends: MHC_TILELANG_BACKENDS.to_vec(),
             gemm_backends: MXFP8_GEMM_BACKENDS.to_vec(),
+            prequantized_gemm_backends: MXFP8_PREQUANTIZED_GEMM_BACKENDS.to_vec(),
             fp32_gemm_backends: FP32_GEMM_BACKENDS.to_vec(),
             kv_insert_backends: KV_INSERT_BACKENDS.to_vec(),
             mega_attn_backends: MEGA_ATTN_BACKENDS.to_vec(),
+            swapab_attn_backends: SWAPAB_ATTN_BACKENDS.to_vec(),
             wo_a_backends: WO_A_BACKENDS.to_vec(),
             all_reduce_backends: ALL_REDUCE_BACKENDS.to_vec(),
             index_logits_prefill_backends: INDEX_LOGITS_BACKENDS.to_vec(),
@@ -940,6 +1157,7 @@ fn layer_config(
                 .into(),
             gpu_name: gpu,
             mhc_backends: MHC_BACKENDS.to_vec(),
+            mhc_tilelang_backends: MHC_TILELANG_BACKENDS.to_vec(),
             router_backends: FP32_GEMM_BACKENDS.to_vec(),
             gemm_backends: MXFP8_GEMM_BACKENDS.to_vec(),
             moe_backends: MOE_BACKENDS.to_vec(),
@@ -957,6 +1175,7 @@ fn layer_config(
             routed_scaling_denominator: 1,
             expert_demand: demand.clone(),
             folded_rank_position: 0,
+            skip_padding_rows: MOE_SKIP_PADDING,
         },
     }
 }
@@ -984,8 +1203,18 @@ pub fn resolve_configs(configs: &DeepseekV41VllmConfigs) -> DeepseekV41VllmResol
         plan: configs.plan.clone(),
         head: DeepseekV41HeadTpWorklet::resolve_config(&configs.head),
         kv_cache_layout: configs.kv_cache_layout.clone(),
-        bounded_replay: configs.bounded_replay,
+        replay: configs
+            .replay
+            .as_ref()
+            .map(|replay| DeepseekV41ReplayResolved {
+                rule: replay.rule,
+                cut_body: replay.cut_body,
+                write_kv: DeepseekV41AttentionTpWorklet::resolve_config(&replay.write_kv),
+                gather: replay.gather.clone(),
+                scatter: replay.scatter.clone(),
+            }),
         late_bodies: configs.late_bodies.clone(),
+        graphs: configs.graphs.clone(),
     }
 }
 
@@ -1038,7 +1267,7 @@ impl DeepseekV41LayerBody {
         }
     }
 
-    fn eval(&self, input: &NormalizedInput, evaluator: &mut Evaluator) {
+    fn eval(&self, input: &LayerInput, evaluator: &mut Evaluator) {
         if let Some(engram) = &self.engram {
             engram.eval(
                 &DeepseekV41EngramTpWorkletInput {
@@ -1051,10 +1280,20 @@ impl DeepseekV41LayerBody {
         self.ffn.eval(
             &DeepseekV41MoeFfnEpWorkletInput {
                 num_tokens: input.rows,
+                scheduled_tokens: input.scheduled_rows,
+                mhc_overlap: input.attention.mhc_overlap,
             },
             evaluator,
         );
     }
+}
+
+/// The built bounded-replay boundary ([`DeepseekV41ReplayConfig`]).
+struct DeepseekV41ReplayBoundary {
+    cut_body: usize,
+    write_kv: DeepseekV41AttentionTpWorklet,
+    gather: Op<ElementwiseKernel>,
+    scatter: Op<ElementwiseKernel>,
 }
 
 pub struct DeepseekV41VllmModel {
@@ -1069,8 +1308,10 @@ pub struct DeepseekV41VllmModel {
     /// Longest request context; longer inputs are refused.
     max_model_len: u32,
     kv_cache_layout: KvCacheLayout,
-    bounded_replay: Option<BoundedReplay>,
+    replay_rule: Option<BoundedReplay>,
+    replay: Option<DeepseekV41ReplayBoundary>,
     late_bodies: Vec<bool>,
+    graphs: DeepseekV41CudaGraphs,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1087,6 +1328,29 @@ pub fn build(
         .into_iter()
         .map(|body| DeepseekV41LayerBody::build(&name, body, bridge))
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let replay_rule = resolved.replay.as_ref().map(|replay| replay.rule);
+    let replay = match resolved.replay {
+        Some(replay) => {
+            let cut = format!("{name}.layer{}", replay.rule.cut_layer);
+            let elementwise = |leaf: String, config| -> std::result::Result<_, BuildError> {
+                Ok(Op::new(
+                    leaf.clone(),
+                    Arc::new(ElementwiseKernel::build(leaf, config, bridge)?),
+                ))
+            };
+            Some(DeepseekV41ReplayBoundary {
+                cut_body: replay.cut_body,
+                write_kv: DeepseekV41AttentionTpWorklet::build(
+                    format!("{cut}.write_kv"),
+                    replay.write_kv,
+                    bridge,
+                )?,
+                gather: elementwise(format!("{name}.replay.gather"), replay.gather)?,
+                scatter: elementwise(format!("{name}.replay.scatter"), replay.scatter)?,
+            })
+        }
+        None => None,
+    };
     let mut model = DeepseekV41VllmModel {
         prologue: DeepseekV41PrologueTpWorklet::build(
             format!("{name}.prologue"),
@@ -1105,8 +1369,10 @@ pub fn build(
         serialize_streams,
         max_model_len,
         kv_cache_layout: resolved.kv_cache_layout,
-        bounded_replay: resolved.bounded_replay,
+        replay_rule,
+        replay,
         late_bodies: resolved.late_bodies,
+        graphs: resolved.graphs,
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -1120,18 +1386,13 @@ pub fn build(
 impl DeepseekV41VllmModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
-        let mut sections = vec![self.prologue.compile(&mut builder)];
-        // Hash -> layer-1 consumer: layer 0 plus the two contending Engram
-        // lookups, which are minted after it.
-        let main_path = self.layer0.compile(&mut builder);
-        sections.push(self.engram_prefetch.compile_joined(&mut builder, main_path));
-        sections.extend(self.compile_plan(&self.plan, &mut builder));
-        sections.push(self.head.compile(&mut builder));
+        let sections = self.compile_sections(&mut builder);
         let root = CostNode::Labeled {
             label: format!(
-                "{} (DeepseekV41VllmModel) [TP4 attention, EP4 experts; {} unique bodies over 40 layers; serialize_streams={}]",
+                "{} (DeepseekV41VllmModel) [TP4 attention, EP4 experts; {} unique bodies over 40 layers; bounded_replay={}; serialize_streams={}]",
                 self.name,
                 self.bodies.len() + 1,
+                self.replay.is_some(),
                 self.serialize_streams,
             ),
             child: Box::new(CostNode::Sum(sections)),
@@ -1139,82 +1400,167 @@ impl DeepseekV41VllmModel {
         builder.finish(root)
     }
 
+    /// The target forward, prologue to head, in evaluation order; a wrapper
+    /// (the DSpark drafter) sums these with its own sections.
+    pub(crate) fn compile_sections(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
+        let mut sections = vec![self.prologue.compile(builder)];
+        // Hash -> layer-1 consumer: layer 0 plus the two contending Engram
+        // lookups, which are minted after it.
+        let main_path = self.layer0.compile(builder);
+        sections.push(self.engram_prefetch.compile_joined(builder, main_path));
+        sections.extend(self.compile_plan(&self.plan, builder));
+        if let Some(replay) = &self.replay {
+            sections.push(replay.scatter.compile(builder));
+        }
+        sections.push(self.head.compile(builder));
+        sections
+    }
+
     fn compile_plan(&self, plan: &[PlanNode], builder: &mut CostTreeBuilder) -> Vec<CostNode> {
-        plan.iter()
-            .map(|node| match node {
-                PlanNode::Body(index) => self.bodies[*index].compile(builder),
+        let mut out = Vec::with_capacity(plan.len());
+        for node in plan {
+            match node {
+                PlanNode::Body(index) => {
+                    if let Some(replay) = self.replay.as_ref().filter(|r| r.cut_body == *index) {
+                        out.push(replay.write_kv.compile(builder));
+                        out.push(replay.gather.compile(builder));
+                    }
+                    out.push(self.bodies[*index].compile(builder));
+                }
                 PlanNode::Repeat { n, body } => {
                     let children = self.compile_plan(body, builder);
-                    CostNode::Scale {
+                    out.push(CostNode::Scale {
                         n: *n,
                         child: Box::new(if children.len() == 1 {
                             children.into_iter().next().unwrap()
                         } else {
                             CostNode::Sum(children)
                         }),
-                    }
+                    });
                 }
-            })
-            .collect()
+            }
+        }
+        out
     }
 
-    /// `late` is the bounded-replay input, used for bodies in `late_bodies`.
-    fn eval_plan(
-        &self,
-        plan: &[PlanNode],
-        input: &NormalizedInput,
-        late: &NormalizedInput,
-        evaluator: &mut Evaluator,
-    ) {
+    fn eval_plan(&self, plan: &[PlanNode], input: &NormalizedInput, evaluator: &mut Evaluator) {
         for node in plan {
             match node {
                 PlanNode::Body(index) => {
-                    let body_input = if self.late_bodies[*index] {
-                        late
-                    } else {
-                        input
+                    if let Some(replay) = self.replay.as_ref().filter(|r| r.cut_body == *index) {
+                        // `write_kv` and the gather run only on replay steps.
+                        let write_kv = if input.replay.is_some() {
+                            DeepseekV41AttentionTpWorkletInput {
+                                write_kv_only: true,
+                                ..input.full.attention.clone()
+                            }
+                        } else {
+                            DeepseekV41AttentionTpWorkletInput {
+                                num_tokens: 0,
+                                prefill_query_context_pairs: Vec::new(),
+                                decode_kv_lens: Vec::new(),
+                                aux_stream_live: false,
+                                full_graph: false,
+                                mhc_overlap: false,
+                                write_kv_only: true,
+                            }
+                        };
+                        replay.write_kv.eval(&write_kv, evaluator);
+                        let gathered = input.replay.as_ref().map_or(0, |late| late.rows);
+                        eval_or_zero(
+                            &replay.gather,
+                            ElementwiseKernelInput {
+                                num_tokens: gathered,
+                            },
+                            gathered == 0,
+                            evaluator,
+                        );
+                    }
+                    let body_input = match &input.replay {
+                        Some(late) if self.late_bodies[*index] => late,
+                        _ => &input.full,
                     };
                     self.bodies[*index].eval(body_input, evaluator)
                 }
-                PlanNode::Repeat { body, .. } => self.eval_plan(body, input, late, evaluator),
+                PlanNode::Repeat { body, .. } => self.eval_plan(body, input, evaluator),
             }
         }
     }
 
-    fn eval_into(&self, batch: &UnifiedArchInput, evaluator: &mut Evaluator) {
-        let input = normalize_input(batch, self.max_model_len)
-            .unwrap_or_else(|reason| panic!("invalid DeepSeek-V4.1 input: {reason}"));
-        let tokens = DeepseekV41PrologueTpWorkletInput {
-            num_tokens: input.rows,
-        };
-        self.prologue.eval(&tokens, evaluator);
-        self.layer0.eval(&input, evaluator);
+    /// Evaluate the target forward's sections (see [`Self::compile_sections`]).
+    pub(crate) fn eval_sections(&self, input: &NormalizedInput, evaluator: &mut Evaluator) {
+        let rows = input.full.rows;
+        self.prologue.eval(
+            &DeepseekV41PrologueTpWorkletInput { num_tokens: rows },
+            evaluator,
+        );
+        self.layer0.eval(&input.full, evaluator);
         self.engram_prefetch.eval(
-            &DeepseekV41EngramPrefetchLocalWorkletInput {
-                num_tokens: input.rows,
-            },
+            &DeepseekV41EngramPrefetchLocalWorkletInput { num_tokens: rows },
             evaluator,
         );
-        let late = self
-            .bounded_replay
-            .map(|replay| bounded_replay_input(&input, replay.window));
-        self.eval_plan(
-            &self.plan,
-            &input,
-            late.as_ref().unwrap_or(&input),
-            evaluator,
-        );
+        self.eval_plan(&self.plan, input, evaluator);
+        if let Some(replay) = &self.replay {
+            let scattered = if input.replay.is_some() { rows } else { 0 };
+            eval_or_zero(
+                &replay.scatter,
+                ElementwiseKernelInput {
+                    num_tokens: scattered,
+                },
+                scattered == 0,
+                evaluator,
+            );
+        }
         self.head.eval(
             &DeepseekV41HeadTpWorkletInput {
-                num_tokens: input.rows,
+                num_tokens: rows,
+                mhc_post_rows: input.replay.as_ref().map_or(rows, |late| late.rows),
                 logits_rows: input.logits_rows,
             },
             evaluator,
         );
     }
+
+    /// The step a no-spec batch runs: every decode request is one query row.
+    pub(crate) fn normalize(&self, batch: &UnifiedArchInput) -> Result<NormalizedInput, String> {
+        let step = DeepseekV41Step::from_unified(batch, self.max_model_len)?;
+        let logits_rows = step.request_count();
+        Ok(normalize_step(
+            &self.graphs,
+            &step,
+            1,
+            logits_rows,
+            self.replay_rule.as_ref(),
+        ))
+    }
+
+    pub fn max_model_len(&self) -> u32 {
+        self.max_model_len
+    }
+
+    pub fn replay_rule(&self) -> Option<&BoundedReplay> {
+        self.replay_rule.as_ref()
+    }
+
+    /// The captured graphs (decode query length 1); a speculative wrapper
+    /// derives its own with [`DeepseekV41CudaGraphs::new`] from the same sizes.
+    pub fn graphs(&self) -> &DeepseekV41CudaGraphs {
+        &self.graphs
+    }
+
+    fn eval_into(&self, batch: &UnifiedArchInput, evaluator: &mut Evaluator) {
+        let input = self
+            .normalize(batch)
+            .unwrap_or_else(|reason| panic!("invalid DeepSeek-V4.1 input: {reason}"));
+        self.eval_sections(&input, evaluator);
+    }
 }
 
 impl IterwiseUnifiedModel for DeepseekV41VllmModel {
+    fn check_input(&self, batch: &UnifiedArchInput) -> std::result::Result<(), String> {
+        self.normalize(batch).map(|_| ())
+    }
+
     fn eval_iter(
         &self,
         batch: &UnifiedArchInput,
@@ -1265,106 +1611,362 @@ impl IterwiseUnifiedModel for DeepseekV41VllmModel {
     }
 }
 
-struct NormalizedInput {
-    /// Rows every dense launch runs: scheduled tokens padded to the CUDA-graph
-    /// capture size.
-    rows: u32,
-    logits_rows: u32,
-    attention: DeepseekV41AttentionTpWorkletInput,
+/// How vLLM's MRV2 runner launches a step (`v1/worker/gpu/cudagraph_utils.py`
+/// `CudaGraphManager.dispatch`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphMode {
+    /// A uniform decode batch replays the FULL graph of its padded request count.
+    Full,
+    /// Any other batch up to the capture limit replays the PIECEWISE graph of
+    /// its padded token count.
+    Piecewise,
+    /// Larger batches run eager at their own size.
+    Eager,
 }
 
-/// The CUDA-graph size an iteration of `tokens` runs at (capture 2 server log
-/// `cudagraph_capture_sizes`: 1, 2, 4, 8, then every 8 to 256, every 16 to
-/// 2048). Larger iterations run eager at their own size.
-pub fn cudagraph_rows(tokens: u32) -> u32 {
-    match tokens {
-        0 => 0,
-        1..=2 => tokens,
-        3..=4 => 4,
-        5..=8 => 8,
-        9..=256 => tokens.div_ceil(8) * 8,
-        257..=MAX_CUDAGRAPH_CAPTURE_SIZE => tokens.div_ceil(16) * 16,
-        _ => tokens,
+/// The token-keyed graph sizes vLLM captures by default for a
+/// `max_cudagraph_capture_size` of `max`: 1, 2, 4, then every 8 to 256 and
+/// every 16 above (the server log's `prefill_cudagraph_capture_token_sizes`
+/// at 2048). The selector default is this list at 2048.
+pub fn vllm_default_cudagraph_capture_sizes(max: u32) -> Vec<u32> {
+    [1, 2, 4]
+        .into_iter()
+        .chain((8..=256).step_by(8))
+        .chain((272..=max.max(256)).step_by(16))
+        .filter(|&s| s <= max)
+        .collect()
+}
+
+/// The CUDA graphs vLLM's MRV2 runner captures for one deployment
+/// (`config/vllm.py` capture-size defaults, `config/compilation.py`
+/// `decode_cudagraph_capture_shapes`, `v1/worker/gpu/cudagraph_utils.py`
+/// `CudaGraphManager.dispatch`), derived from `--cudagraph-capture-sizes`,
+/// `--max-num-seqs` and the target's decode query lengths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepseekV41CudaGraphs {
+    /// PIECEWISE token sizes, ascending; the last one is the capture limit.
+    token_sizes: Vec<u32>,
+    max_num_seqs: u32,
+    /// Per decode query length, the FULL graphs' request counts, ascending.
+    decode: Vec<(u32, Vec<u32>)>,
+}
+
+impl DeepseekV41CudaGraphs {
+    /// An empty `capture_sizes` captures nothing: every step runs eager.
+    pub fn new(capture_sizes: &[u32], max_num_seqs: u32, decode_query_lens: &[u32]) -> Self {
+        let mut token_sizes: Vec<u32> = capture_sizes.iter().copied().filter(|&s| s > 0).collect();
+        token_sizes.sort_unstable();
+        token_sizes.dedup();
+        let max_tokens = token_sizes.last().copied().unwrap_or(0);
+        // `decode_cudagraph_capture_request_sizes`: the request counts each
+        // query length rounds the shared sizes up to, within the shared bound.
+        let mut request_sizes: Vec<u32> = token_sizes
+            .iter()
+            .flat_map(|&s| {
+                decode_query_lens
+                    .iter()
+                    .filter(move |&&q| q > 0 && s.div_ceil(q) * q <= max_tokens)
+                    .map(move |&q| s.div_ceil(q).min(max_num_seqs))
+            })
+            .collect();
+        request_sizes.sort_unstable();
+        request_sizes.dedup();
+        // `decode_cudagraph_capture_shapes`: per query length up to the most
+        // requests it holds; the first size above the limit is captured at it.
+        let decode = decode_query_lens
+            .iter()
+            .filter(|&&q| q > 0)
+            .map(|&q| {
+                let limit = max_num_seqs.min(max_tokens / q);
+                let reachable = request_sizes.partition_point(|&n| n < limit) + 1;
+                let mut shapes: Vec<u32> = request_sizes
+                    .iter()
+                    .take(reachable)
+                    .map(|&n| n.min(limit))
+                    .filter(|_| limit >= 1)
+                    .collect();
+                shapes.dedup();
+                (q, shapes)
+            })
+            .collect();
+        Self {
+            token_sizes,
+            max_num_seqs,
+            decode,
+        }
+    }
+
+    /// The largest PIECEWISE graph (0 when nothing is captured).
+    pub fn max_tokens(&self) -> u32 {
+        self.token_sizes.last().copied().unwrap_or(0)
+    }
+
+    pub fn max_num_seqs(&self) -> u32 {
+        self.max_num_seqs
+    }
+
+    /// The PIECEWISE graph a batch of `tokens` pads to, `None` past the limit.
+    pub fn piecewise_rows(&self, tokens: u32) -> Option<u32> {
+        let index = self.token_sizes.partition_point(|&s| s < tokens);
+        self.token_sizes.get(index).copied()
+    }
+
+    /// The FULL decode graphs' request counts for query length `q`.
+    pub fn decode_request_sizes(&self, q: u32) -> &[u32] {
+        self.decode
+            .iter()
+            .find(|(query_len, _)| *query_len == q)
+            .map_or(&[], |(_, sizes)| sizes.as_slice())
+    }
+
+    /// The padded request count of the FULL decode graph a uniform batch of
+    /// `requests` requests with `q` rows each replays (the smallest that holds
+    /// it), or `None` when none does.
+    pub fn full_decode_requests(&self, requests: u32, q: u32) -> Option<u32> {
+        if requests == 0 {
+            return None;
+        }
+        let sizes = self.decode_request_sizes(q);
+        sizes.get(sizes.partition_point(|&n| n < requests)).copied()
+    }
+
+    /// The graph a step of `query_lens` (one entry per request) launches and
+    /// the rows its dense spine runs. A step is a uniform decode when every
+    /// request has exactly `uniform_query_len` rows.
+    pub fn step_graph(&self, query_lens: &[u32], uniform_query_len: u32) -> (GraphMode, u32) {
+        let tokens: u32 = query_lens.iter().sum();
+        let requests = query_lens.len() as u32;
+        if query_lens.iter().all(|&q| q == uniform_query_len) {
+            if let Some(padded) = self.full_decode_requests(requests, uniform_query_len) {
+                return (GraphMode::Full, padded * uniform_query_len);
+            }
+        }
+        match self.piecewise_rows(tokens) {
+            Some(rows) if tokens > 0 => (GraphMode::Piecewise, rows),
+            _ => (GraphMode::Eager, tokens),
+        }
+    }
+
+    /// The rows a replay batch of `kept` tokens runs at
+    /// (`decoder_replay_cudagraph.py`): its graphs step by `window` up to
+    /// `min(max_tokens, max_num_seqs * window)` (wider intervals by 1/8 of the
+    /// power of two); a larger batch runs eager at its size.
+    pub fn replay_rows(&self, kept: u32, window: u32) -> u32 {
+        let bound = self.max_tokens().min(self.max_num_seqs * window);
+        if bound == 0 || window == 0 || kept > bound {
+            return kept;
+        }
+        let mut size = window;
+        while size < bound {
+            if size >= kept {
+                return size;
+            }
+            size += window.max(1 << (32 - size.leading_zeros()).saturating_sub(4));
+        }
+        bound
     }
 }
 
-fn normalize_input(
-    input: &UnifiedArchInput,
-    max_model_len: u32,
-) -> std::result::Result<NormalizedInput, String> {
-    if input.groups.len() != 1 {
-        return Err(format!(
-            "TP4 attention takes exactly one group, got {}",
-            input.groups.len()
-        ));
+/// One step's requests as the target sees them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeepseekV41Step {
+    /// `(query_len, context_len)` per prefilling request, context including
+    /// the query.
+    pub prefill: Vec<(u32, u32)>,
+    /// `(query_len, kv_len)` per decode request: 1 row without speculation,
+    /// the verify width with it; `kv_len` includes every query row.
+    pub decode: Vec<(u32, u32)>,
+}
+
+impl DeepseekV41Step {
+    pub fn request_count(&self) -> u32 {
+        (self.prefill.len() + self.decode.len()) as u32
     }
-    let group = &input.groups[0];
-    let mut prefill_tokens = 0_u32;
-    let mut prefill_query_context_pairs = Vec::with_capacity(group.prefill_chunk_pairs.len());
-    for (request, &(prefix, append)) in group.prefill_chunk_pairs.iter().enumerate() {
-        let context = prefix
-            .checked_add(append)
-            .ok_or_else(|| format!("prefill request {request} context overflows u32"))?;
-        if append == 0 || context > max_model_len {
+
+    /// A no-spec batch: each decode request is one row after its resident KV.
+    pub fn from_unified(input: &UnifiedArchInput, max_model_len: u32) -> Result<Self, String> {
+        if input.groups.len() != 1 {
             return Err(format!(
-                "prefill request {request} ({prefix}, {append}) must append 1..=max_model_len \
-                 {max_model_len}"
+                "TP4 attention takes exactly one group, got {}",
+                input.groups.len()
             ));
         }
-        prefill_tokens = prefill_tokens
-            .checked_add(append)
-            .ok_or("prefill token sum overflows u32")?;
-        prefill_query_context_pairs.push((append, context));
+        let group = &input.groups[0];
+        let prefill = prefill_pairs(&group.prefill_chunk_pairs, max_model_len)?;
+        let prefill_tokens: u32 = prefill.iter().map(|&(q, _)| q).sum();
+        let decode_tokens =
+            u32::try_from(group.decode_kv_lens.len()).map_err(|_| "decode count exceeds u32")?;
+        if group.prefill_tokens != prefill_tokens
+            || group.decode_tokens != decode_tokens
+            || group.batch_tokens != prefill_tokens + decode_tokens
+        {
+            return Err("group token accounting is inconsistent".into());
+        }
+        let decode = group
+            .decode_kv_lens
+            .iter()
+            .map(|&kv| {
+                kv.checked_add(1)
+                    .map(|kv| (1, kv))
+                    .ok_or_else(|| "decode kv length overflows u32".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { prefill, decode })
     }
-    let decode_tokens =
-        u32::try_from(group.decode_kv_lens.len()).map_err(|_| "decode count exceeds u32")?;
-    if group.prefill_tokens != prefill_tokens
-        || group.decode_tokens != decode_tokens
-        || group.batch_tokens != prefill_tokens + decode_tokens
-    {
-        return Err("group token accounting is inconsistent".into());
-    }
-    let rows = cudagraph_rows(group.batch_tokens);
-    let decode_only = prefill_tokens == 0 && decode_tokens > 0;
-    Ok(NormalizedInput {
-        rows,
-        logits_rows: group.request_count(),
-        attention: DeepseekV41AttentionTpWorkletInput {
-            num_tokens: rows,
-            prefill_query_context_pairs,
-            decode_kv_lens: group.decode_kv_lens.clone(),
-            aux_stream_live: attention_aux_stream_live(decode_only, rows, MAX_FULL_GRAPH_TOKENS),
-        },
-    })
 }
 
-/// The input of a bounded-replay late layer ([`BoundedReplay`]): each prefill
-/// chunk keeps only its last `window` extend tokens; decode rows are unchanged.
-fn bounded_replay_input(full: &NormalizedInput, window: u32) -> NormalizedInput {
-    let prefill_query_context_pairs: Vec<(u32, u32)> = full
-        .attention
-        .prefill_query_context_pairs
+/// `(prefix, append)` chunks as `(query, context)` pairs, bounded by
+/// `max_model_len`.
+pub(crate) fn prefill_pairs(
+    chunks: &[(u32, u32)],
+    max_model_len: u32,
+) -> Result<Vec<(u32, u32)>, String> {
+    let mut tokens = 0_u32;
+    chunks
         .iter()
-        .map(|&(append, context)| (append.min(window), context))
-        .collect();
-    let decode_tokens = full.attention.decode_kv_lens.len() as u32;
-    let tokens = decode_tokens
-        + prefill_query_context_pairs
-            .iter()
-            .map(|&(append, _)| append)
-            .sum::<u32>();
-    let rows = cudagraph_rows(tokens);
-    let decode_only = prefill_query_context_pairs.is_empty() && decode_tokens > 0;
-    NormalizedInput {
+        .enumerate()
+        .map(|(request, &(prefix, append))| {
+            let context = prefix
+                .checked_add(append)
+                .ok_or_else(|| format!("prefill request {request} context overflows u32"))?;
+            if append == 0 || context > max_model_len {
+                return Err(format!(
+                    "prefill request {request} ({prefix}, {append}) must append \
+                     1..=max_model_len {max_model_len}"
+                ));
+            }
+            tokens = tokens
+                .checked_add(append)
+                .ok_or("prefill token sum overflows u32")?;
+            Ok((append, context))
+        })
+        .collect()
+}
+
+/// One layer group's input: the rows its dense launches run and its attention
+/// batch (whose `mhc_overlap` also gates the FFN's boundary).
+#[derive(Clone, Debug)]
+pub struct LayerInput {
+    /// Rows the layer's kernels run: the scheduled rows plus graph padding.
+    pub rows: u32,
+    /// Of `rows`, the scheduled ones (the rest are padding the runner marks).
+    pub scheduled_rows: u32,
+    pub attention: DeepseekV41AttentionTpWorkletInput,
+}
+
+/// A step, normalized: the batch the layers before the replay cut (and the
+/// whole forward when nothing replays) run, the replay batch, and the logits
+/// rows.
+#[derive(Clone, Debug)]
+pub struct NormalizedInput {
+    pub mode: GraphMode,
+    pub full: LayerInput,
+    /// `Some` when the step runs the layers from the cut on the replay batch.
+    pub replay: Option<LayerInput>,
+    pub logits_rows: u32,
+}
+
+/// Decode requests as one-token attention rows: a request of `q` rows ending
+/// at `kv` attends from resident lengths `kv - q .. kv - 1` (the decode
+/// segment flattens each verify row into its own request).
+fn decode_rows(decode: &[(u32, u32)]) -> Vec<u32> {
+    decode
+        .iter()
+        .flat_map(|&(q, kv)| (0..q).map(move |i| kv - q + i))
+        .collect()
+}
+
+pub(crate) fn layer_input(
+    mode: GraphMode,
+    rows: u32,
+    prefill: Vec<(u32, u32)>,
+    decode: &[(u32, u32)],
+) -> LayerInput {
+    let full_graph = mode == GraphMode::Full;
+    let scheduled_rows = prefill
+        .iter()
+        .chain(decode)
+        .map(|&(q, _)| q)
+        .sum::<u32>()
+        .min(rows);
+    LayerInput {
         rows,
-        logits_rows: full.logits_rows,
+        scheduled_rows,
         attention: DeepseekV41AttentionTpWorkletInput {
             num_tokens: rows,
-            prefill_query_context_pairs,
-            decode_kv_lens: full.attention.decode_kv_lens.clone(),
-            aux_stream_live: attention_aux_stream_live(decode_only, rows, MAX_FULL_GRAPH_TOKENS),
+            prefill_query_context_pairs: prefill,
+            decode_kv_lens: decode_rows(decode),
+            // The attention aux stream exists only outside breakable capture
+            // (`utils/multi_stream_utils.py`), i.e. in FULL graphs.
+            aux_stream_live: full_graph && rows > 0,
+            full_graph,
+            mhc_overlap: mhc_overlap_live(full_graph, rows),
+            write_kv_only: false,
         },
     }
+}
+
+/// Normalize a step: graph mode and padded rows, the replay batch
+/// ([`BoundedReplay`]), and the attention batches. `uniform_query_len` is 1
+/// without speculation and the verify width with it.
+pub(crate) fn normalize_step(
+    graphs: &DeepseekV41CudaGraphs,
+    step: &DeepseekV41Step,
+    uniform_query_len: u32,
+    logits_rows: u32,
+    replay: Option<&BoundedReplay>,
+) -> NormalizedInput {
+    let query_lens: Vec<u32> = step
+        .prefill
+        .iter()
+        .chain(&step.decode)
+        .map(|&(q, _)| q)
+        .collect();
+    let (mode, rows) = graphs.step_graph(&query_lens, uniform_query_len);
+    let full = layer_input(mode, rows, step.prefill.clone(), &step.decode);
+    let replay = replay
+        .and_then(|rule| replay_rows(graphs, rule, mode, rows, step))
+        .map(|(late_rows, prefill)| {
+            layer_input(GraphMode::Piecewise, late_rows, prefill, &step.decode)
+        });
+    NormalizedInput {
+        mode,
+        full,
+        replay,
+        logits_rows,
+    }
+}
+
+/// Whether a step replays (`_prepare_replay_batch`), and the replay batch's
+/// rows and trimmed prefill pairs. Decode requests keep all their rows
+/// (`min(q, window)` with `q <= window`).
+pub(crate) fn replay_rows(
+    graphs: &DeepseekV41CudaGraphs,
+    rule: &BoundedReplay,
+    mode: GraphMode,
+    rows: u32,
+    step: &DeepseekV41Step,
+) -> Option<(u32, Vec<(u32, u32)>)> {
+    let replays = match mode {
+        GraphMode::Full => false,
+        GraphMode::Piecewise => rows >= rule.trim_threshold,
+        GraphMode::Eager => step.prefill.iter().any(|&(q, _)| q > rule.window),
+    };
+    if !replays {
+        return None;
+    }
+    let prefill: Vec<(u32, u32)> = step
+        .prefill
+        .iter()
+        .map(|&(q, context)| (q.min(rule.window), context))
+        .collect();
+    let kept: u32 = prefill.iter().map(|&(q, _)| q).sum::<u32>()
+        + step
+            .decode
+            .iter()
+            .map(|&(q, _)| q.min(rule.window))
+            .sum::<u32>();
+    Some((graphs.replay_rows(kept, rule.window), prefill))
 }
 
 #[cfg(test)]
@@ -1410,8 +2012,10 @@ mod tests {
             ep_size: 4,
             gpu_name: GPU_NAME.into(),
             serialize_streams: false,
-            decoder_swa_bounded_replay: false,
+            decoder_swa_bounded_replay: true,
             max_model_len: CAPTURED_MAX_MODEL_LEN,
+            max_num_batched_tokens: MAX_BATCHED_TOKENS,
+            cudagraph_capture_sizes: vllm_default_cudagraph_capture_sizes(2048),
         }
     }
 
@@ -1536,19 +2140,23 @@ mod tests {
     #[test]
     fn kv_cache_layout_reproduces_vllms_packed_groups() {
         use crate::worker::kv::{KvAccounting, KvAccountingOptions};
-        let layout = kv_cache_layout(&model_cfg(), 4);
+        let layout = kv_cache_layout(&model_cfg(), 4, 0);
         let part = |name: &str| *layout.parts.iter().find(|part| part.name == name).unwrap();
         let padded = |name: &str| part(name).overhead.padded_bytes_per_entry.unwrap();
         // vLLM block of 128 tokens: 3 x (18432 + 8704) + (36864 + 16896)
-        // = 135168 B per rank -> 1056 B/token, replicated on 4 ranks.
-        let block = 135_168;
-        assert_eq!(layout.engine.fixed_device_bytes, 4 * block);
+        // = 135168 B per rank packs the groups; the MXFP8 stride alignment
+        // lcm(528, 288, 512) = 50688 B rounds the block to 152064 B
+        // (1188 B/token), replicated on 4 ranks.
+        let (anchor, stride) = (135_168, 152_064);
+        assert_eq!(layout.engine.fixed_device_bytes, 4 * stride);
         assert_eq!(
             padded("c2_kv") / 2 + padded("c2_indexer") / 2 + padded("c1_kv") + padded("c1_indexer"),
-            4 * 1056
+            4 * stride / 128
         );
-        // Five SWA groups of eight layers fill their 32-token blocks exactly.
-        assert_eq!(padded("swa"), 4 * 5 * block / 32);
+        // Five SWA groups of eight layers (by the unaligned anchor), each
+        // paying the aligned stride per 32-token block.
+        assert_eq!(anchor / (32 * 528), 8);
+        assert_eq!(padded("swa"), 4 * 5 * stride / 32);
         assert_eq!(part("swa").bytes_per_entry, 4 * 40 * 528);
         // Three compressor rings of 32 KiB share one block per request.
         assert_eq!(
@@ -1556,31 +2164,31 @@ mod tests {
                 part("compressor_ring").bytes_per_entry,
                 padded("compressor_ring")
             ),
-            (4 * 3 * 32_768, 4 * block)
+            (4 * 3 * 32_768, 4 * stride)
         );
         assert!(!part("swa").prefix_reusable && !part("compressor_ring").prefix_reusable);
 
-        // The capture's "Maximum concurrency for 131,072 tokens per request:
-        // 404.89x" at 86.14 GiB per rank, two 2048-token batches in flight.
-        // vLLM rounds each SWA group's window to blocks plus one, 1690 blocks
-        // per request where the model charges 1685.
-        // Capture 2's pool of 603,004 blocks per rank logged "GPU KV cache
-        // size: 46,767,420 tokens", 356.81 requests of 131,072 tokens.
-        for (budget, logged) in [
-            (4 * (86.14 * f64::from(1u32 << 30)) as u64, 404.89),
-            (4 * 603_004 * block, 46_767_420.0 / 131_072.0),
-        ] {
-            let options = KvAccountingOptions {
-                max_in_flight_tokens: Some(2 * 2048),
-                ..Default::default()
-            };
-            let accounting = KvAccounting::resolve(&layout, options, budget).unwrap();
-            let concurrency = accounting.concurrency_at(131_072);
-            assert!(
-                (concurrency / logged - 1.0).abs() < 0.005,
-                "{concurrency} vs {logged}"
-            );
-        }
+        // The DSpark drafter's three SWA layers make 43: six SWA groups.
+        let dspark = kv_cache_layout(&model_cfg(), 4, 3);
+        let dspark_swa = *dspark.parts.iter().find(|part| part.name == "swa").unwrap();
+        assert_eq!(dspark_swa.bytes_per_entry, 4 * 43 * 528);
+        assert_eq!(
+            dspark_swa.overhead.padded_bytes_per_entry.unwrap(),
+            4 * 6 * stride / 32
+        );
+        // TP4 + DSpark capture (fork 5629b26146, 1017 checkpoint): 566,723
+        // blocks (80.26 GiB) per rank logged "GPU KV cache size: 40,746,855
+        // tokens, Maximum concurrency for 131,072 tokens per request: 310.87x".
+        let options = KvAccountingOptions {
+            max_in_flight_tokens: Some(2 * 2048),
+            ..Default::default()
+        };
+        let accounting = KvAccounting::resolve(&dspark, options, 4 * 566_723 * stride).unwrap();
+        let concurrency = accounting.concurrency_at(131_072);
+        assert!(
+            (concurrency / 310.87 - 1.0).abs() < 0.005,
+            "{concurrency} vs 310.87"
+        );
     }
 
     #[test]
@@ -1611,6 +2219,10 @@ mod tests {
             configs.kv_cache_layout.per_token_bytes(),
             (3 * (288 + 132) / 2 + 288 + 132) * 4
         );
+        // Bounded replay is on by default, cut at the last KV source.
+        let replay = configs.replay.as_ref().unwrap();
+        assert_eq!(replay.rule.cut_layer, 20);
+        assert_eq!(configs.bodies[replay.cut_body].layers, [20]);
 
         let resolved = resolve_configs(&configs);
         assert_eq!(resolved.head.lm_head.n.get(), 32_320);
@@ -1641,10 +2253,13 @@ mod tests {
         assert!(build_configs(&cfg, &parallel(), &narrow).is_err());
     }
 
+    /// The forward without the bounded-replay boundary (its `write_kv`
+    /// launches are extra; `replay_boundary_runs_only_on_replay_steps`).
     fn built_tree() -> CostTree {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
-        let configs = build_configs(&model_cfg(), &parallel(), &uniform_demand()).unwrap();
+        let configs =
+            build_configs(&model_cfg(), &no_replay_parallel(), &uniform_demand()).unwrap();
         build("unified".into(), resolve_configs(&configs), &bridge)
             .unwrap()
             .cost_tree()
@@ -1682,7 +2297,7 @@ mod tests {
             .slots
             .iter()
             .zip(&times)
-            .filter(|(s, _)| !s.name.ends_with(&serial))
+            .filter(|(s, _)| !s.name.ends_with(&serial) && !s.name.contains(".mhc_overlap."))
             .collect();
         let count = |kind: &str| -> u32 {
             launches
@@ -1711,6 +2326,9 @@ mod tests {
         assert_eq!(count("q_pad_kv_rope_mxfp8_insert"), 40);
         assert_eq!(named("mega_attn.decode"), 40);
         assert_eq!(named("mega_attn.prefill"), 40);
+        // TP4 leaves 16 live heads: every compressed layer (2-39) has the
+        // swap-AB decode leaf, the two ratio-0 layers do not.
+        assert_eq!(named("mega_attn.decode_swapab"), 38);
         assert_eq!(count("nvfp4_fused_moe"), 40);
         assert_eq!(count("batched_gemm"), 40);
         assert_eq!(count("all_reduce"), 3);
@@ -1790,48 +2408,134 @@ mod tests {
 
     #[test]
     fn input_pads_to_the_graph_size_and_gates_the_aux_stream() {
-        let decode = normalize_input(
-            &UnifiedArchInput {
-                groups: vec![group(vec![], vec![1000; 48])],
-                tokens_per_source_rank: vec![],
-            },
-            CAPTURED_MAX_MODEL_LEN,
-        )
-        .unwrap();
-        assert_eq!((decode.rows, decode.logits_rows), (48, 48));
-        assert!(decode.attention.aux_stream_live);
+        let normalize = |prefill, decode| normalize_input(&one_group(prefill, decode), None);
+        let decode = normalize(vec![], vec![1000; 48]).unwrap();
+        assert_eq!(decode.mode, GraphMode::Full);
+        assert_eq!((decode.full.rows, decode.logits_rows), (48, 48));
+        assert!(decode.full.attention.aux_stream_live && decode.full.attention.full_graph);
+        assert!(!decode.full.attention.mhc_overlap);
+        // The decode segment sees each row's resident KV.
+        assert_eq!(decode.full.attention.decode_kv_lens, vec![1000; 48]);
 
-        let mixed = normalize_input(
-            &UnifiedArchInput {
-                groups: vec![group(vec![(512, 126)], vec![900; 48])],
-                tokens_per_source_rank: vec![],
-            },
-            CAPTURED_MAX_MODEL_LEN,
-        )
-        .unwrap();
-        assert_eq!((mixed.rows, mixed.logits_rows), (176, 49));
-        assert!(!mixed.attention.aux_stream_live);
-        assert_eq!(mixed.attention.prefill_query_context_pairs, [(126, 638)]);
+        let mixed = normalize(vec![(512, 126)], vec![900; 48]).unwrap();
+        assert_eq!(mixed.mode, GraphMode::Piecewise);
+        assert_eq!((mixed.full.rows, mixed.logits_rows), (176, 49));
+        assert!(!mixed.full.attention.aux_stream_live && !mixed.full.attention.full_graph);
+        assert_eq!(
+            mixed.full.attention.prefill_query_context_pairs,
+            [(126, 638)]
+        );
 
-        let big_decode = normalize_input(
-            &UnifiedArchInput {
-                groups: vec![group(vec![], vec![10; 65])],
-                tokens_per_source_rank: vec![],
-            },
-            CAPTURED_MAX_MODEL_LEN,
-        )
-        .unwrap();
-        assert_eq!(big_decode.rows, 72);
-        assert!(!big_decode.attention.aux_stream_live);
+        // 65 decodes exceed max_num_seqs: no FULL graph holds them.
+        let big_decode = normalize(vec![], vec![10; 65]).unwrap();
+        assert_eq!(big_decode.mode, GraphMode::Piecewise);
+        assert_eq!(big_decode.full.rows, 72);
+        assert!(!big_decode.full.attention.aux_stream_live);
+
+        let eager = normalize(vec![(0, 2049)], vec![]).unwrap();
+        assert_eq!((eager.mode, eager.full.rows), (GraphMode::Eager, 2049));
 
         assert!(normalize_input(
             &UnifiedArchInput {
                 groups: vec![ArchGroupInput::default(), ArchGroupInput::default()],
                 tokens_per_source_rank: vec![],
             },
-            CAPTURED_MAX_MODEL_LEN,
+            None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn full_decode_graphs_are_keyed_by_request_count() {
+        // Server log `decode_cudagraph_capture_request_sizes` (TP4 + DSpark).
+        assert_eq!(
+            graphs(&[6]).decode_request_sizes(6),
+            [
+                1, 2, 3, 4, 6, 7, 8, 10, 11, 12, 14, 15, 16, 18, 19, 20, 22, 23, 24, 26, 27, 28,
+                30, 31, 32, 34, 35, 36, 38, 39, 40, 42, 43, 46, 48, 51, 54, 56, 59, 62, 64
+            ]
+        );
+        let plain = graphs(&[1]);
+        assert_eq!(
+            plain.decode_request_sizes(1),
+            [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]
+        );
+        assert_eq!(plain.full_decode_requests(65, 1), None);
+        assert_eq!(plain.full_decode_requests(0, 1), None);
+        assert_eq!(plain.full_decode_requests(5, 1), Some(8));
+
+        let spec = graphs(&[6]);
+        // A verify batch of 5 requests x 6 rows replays the 6-request graph.
+        assert_eq!(spec.step_graph(&[6; 5], 6), (GraphMode::Full, 36));
+        // A clipped request breaks uniformity: PIECEWISE by tokens.
+        assert_eq!(spec.step_graph(&[6, 6, 4], 6), (GraphMode::Piecewise, 16));
+        assert_eq!(plain.step_graph(&[1; 3], 1), (GraphMode::Full, 4));
+        assert_eq!(plain.step_graph(&[2049], 1), (GraphMode::Eager, 2049));
+
+        // The sizes follow the configured list: every 128 up to 8192 (the
+        // alignment pack's chunk-8192 capture) makes 8192 tokens PIECEWISE,
+        // and max_num_seqs bounds the FULL graphs.
+        let wide: Vec<u32> = (1..=64).map(|i| i * 128).collect();
+        let wide = DeepseekV41CudaGraphs::new(&wide, 64, &[1, 6]);
+        assert_eq!(wide.max_tokens(), 8192);
+        assert_eq!(wide.step_graph(&[8000], 1), (GraphMode::Piecewise, 8064));
+        // One request-count list serves every query length (`config/vllm.py`).
+        assert_eq!(wide.decode_request_sizes(1), [22, 43, 64]);
+        assert_eq!(wide.full_decode_requests(3, 6), Some(22));
+        assert_eq!(wide.decode_request_sizes(6), [22, 43, 64]);
+        let narrow =
+            DeepseekV41CudaGraphs::new(&vllm_default_cudagraph_capture_sizes(2048), 16, &[1]);
+        assert_eq!(narrow.full_decode_requests(17, 1), None);
+        assert_eq!(narrow.full_decode_requests(9, 1), Some(16));
+        // Nothing captured: every step runs eager.
+        let eager = DeepseekV41CudaGraphs::new(&[], 64, &[1]);
+        assert_eq!(eager.step_graph(&[1; 8], 1), (GraphMode::Eager, 8));
+    }
+
+    #[test]
+    fn replay_graphs_step_by_the_window_up_to_the_bound() {
+        let default = graphs(&[1]);
+        assert_eq!(default.replay_rows(1, 128), 128);
+        assert_eq!(default.replay_rows(264, 128), 384);
+        assert_eq!(default.replay_rows(2048, 128), 2048);
+        assert_eq!(default.replay_rows(2049, 128), 2049);
+        // Past 2048 the steps widen to 1/8 of the power-of-two interval
+        // (256 in [2048, 4096)); the bound is max_num_seqs x window = 8192.
+        let wide: Vec<u32> = (1..=64).map(|i| i * 128).collect();
+        let wide = DeepseekV41CudaGraphs::new(&wide, 64, &[1]);
+        assert_eq!(wide.replay_rows(2049, 128), 2304);
+        assert_eq!(wide.replay_rows(4097, 128), 4608);
+        assert_eq!(wide.replay_rows(8192, 128), 8192);
+        assert_eq!(wide.replay_rows(8193, 128), 8193);
+    }
+
+    #[test]
+    fn verify_rows_flatten_and_small_full_graphs_take_the_mhc_overlap() {
+        let step = DeepseekV41Step {
+            prefill: vec![],
+            decode: vec![(6, 106), (6, 10)],
+        };
+        let input = normalize_step(&graphs(&[6]), &step, 6, 12, None);
+        assert_eq!((input.mode, input.full.rows), (GraphMode::Full, 12));
+        assert_eq!(
+            input.full.attention.decode_kv_lens,
+            [100, 101, 102, 103, 104, 105, 4, 5, 6, 7, 8, 9]
+        );
+        assert!(input.full.attention.mhc_overlap && input.full.attention.aux_stream_live);
+        // 3 requests pad to the 3-request graph, 18 rows: past the overlap.
+        let three = DeepseekV41Step {
+            prefill: vec![],
+            decode: vec![(6, 50); 3],
+        };
+        let input = normalize_step(&graphs(&[6]), &three, 6, 18, None);
+        assert_eq!(input.full.rows, 18);
+        assert!(!input.full.attention.mhc_overlap);
+        // PIECEWISE steps never take it.
+        let mixed = normalize_input(&one_group(vec![(0, 4)], vec![9; 4]), None).unwrap();
+        assert_eq!((mixed.mode, mixed.full.rows), (GraphMode::Piecewise, 8));
+        assert!(!mixed.full.attention.mhc_overlap);
+        let small = normalize_input(&one_group(vec![], vec![9; 16]), None).unwrap();
+        assert!(small.full.attention.mhc_overlap);
     }
 
     /// `max_model_len` defaults to the checkpoint's 1M positions, refuses more,
@@ -1867,17 +2571,17 @@ mod tests {
         // A request whose context is exactly max_model_len is served; one
         // token more is refused.
         let last_chunk = one_group(vec![(default - 2048, 2048)], vec![]);
-        assert!(normalize_input(&last_chunk, default).is_ok());
+        assert!(DeepseekV41Step::from_unified(&last_chunk, default).is_ok());
         let past = one_group(vec![(default - 2047, 2048)], vec![]);
-        let error = normalize_input(&past, default).err().unwrap();
+        let error = DeepseekV41Step::from_unified(&past, default).err().unwrap();
         assert!(error.contains("max_model_len 1048576"), "{error}");
         // The capture's pin refuses what the default serves.
-        assert!(normalize_input(&last_chunk, CAPTURED_MAX_MODEL_LEN).is_err());
+        assert!(DeepseekV41Step::from_unified(&last_chunk, CAPTURED_MAX_MODEL_LEN).is_err());
     }
 
-    fn replay_parallel() -> DeepseekV41VllmParallel {
+    fn no_replay_parallel() -> DeepseekV41VllmParallel {
         DeepseekV41VllmParallel {
-            decoder_swa_bounded_replay: true,
+            decoder_swa_bounded_replay: false,
             ..parallel()
         }
     }
@@ -1889,22 +2593,45 @@ mod tests {
         }
     }
 
+    fn normalize_input(
+        batch: &UnifiedArchInput,
+        replay: Option<&BoundedReplay>,
+    ) -> std::result::Result<NormalizedInput, String> {
+        let step = DeepseekV41Step::from_unified(batch, CAPTURED_MAX_MODEL_LEN)?;
+        Ok(normalize_step(
+            &graphs(&[1]),
+            &step,
+            1,
+            step.request_count(),
+            replay,
+        ))
+    }
+
+    fn graphs(decode_query_lens: &[u32]) -> DeepseekV41CudaGraphs {
+        DeepseekV41CudaGraphs::new(
+            &vllm_default_cudagraph_capture_sizes(2048),
+            MAX_NUM_SEQS,
+            decode_query_lens,
+        )
+    }
+
     #[test]
-    fn bounded_replay_starts_after_the_last_kv_source_and_splits_no_body() {
+    fn bounded_replay_cuts_at_the_last_kv_source_and_splits_no_body() {
         let cfg = model_cfg();
-        let off = build_configs(&cfg, &parallel(), &uniform_demand()).unwrap();
-        assert_eq!(off.bounded_replay, None);
+        let off = build_configs(&cfg, &no_replay_parallel(), &uniform_demand()).unwrap();
+        assert!(off.replay.is_none());
         assert!(off.late_bodies.iter().all(|&late| !late));
 
-        let on = build_configs(&cfg, &replay_parallel(), &uniform_demand()).unwrap();
+        let on = build_configs(&cfg, &parallel(), &uniform_demand()).unwrap();
         assert_eq!(
-            on.bounded_replay,
-            Some(BoundedReplay {
-                late_layer_start: 21,
-                window: 128
-            })
+            on.replay.as_ref().unwrap().rule,
+            BoundedReplay {
+                cut_layer: 20,
+                window: 128,
+                trim_threshold: 768,
+            }
         );
-        // Same bodies and plan: the flag only picks inputs.
+        // Same bodies and plan: the flag only adds the boundary and picks inputs.
         assert_eq!(on.plan, off.plan);
         let late: Vec<_> = on
             .bodies
@@ -1916,6 +2643,7 @@ mod tests {
         assert_eq!(
             late,
             vec![
+                vec![20],
                 vec![21, 22, 23, 25, 26, 27, 29, 30, 31, 33, 34, 35],
                 vec![24, 28, 32, 36],
                 vec![37, 38, 39],
@@ -1924,104 +2652,126 @@ mod tests {
     }
 
     #[test]
-    fn bounded_replay_rejects_a_tail_sglang_would_reject() {
+    fn bounded_replay_follows_the_fork_preconditions() {
         let replay = BoundedReplay::from_model(&model_cfg()).unwrap();
-        assert!(replay.is_late(&[20, 21]).is_err());
-        assert_eq!(replay.is_late(&[21, 39]).ok(), Some(true));
-        assert_eq!(replay.is_late(&[1, 20]).ok(), Some(false));
+        assert!(replay.is_late(&[19, 20]).is_err());
+        assert_eq!(replay.is_late(&[20, 39]).ok(), Some(true));
+        assert_eq!(replay.is_late(&[1, 19]).ok(), Some(false));
 
-        let mut compressing = model_cfg();
-        compressing.compress_ratios[30] = 2;
-        assert!(BoundedReplay::from_model(&compressing).is_err());
         let mut engram = model_cfg();
         engram.engram_layer_ids.push(30);
         assert!(BoundedReplay::from_model(&engram).is_err());
         let mut no_sources = model_cfg();
         no_sources.kv_source_layer_ids.clear();
         assert!(BoundedReplay::from_model(&no_sources).is_err());
-        // A later last source moves the tail start with it.
+        let mut compressing_cut = model_cfg();
+        compressing_cut.compress_ratios[20] = 2;
+        assert!(BoundedReplay::from_model(&compressing_cut).is_err());
+        let mut last = model_cfg();
+        last.kv_source_layer_ids.push(39);
+        assert!(BoundedReplay::from_model(&last).is_err());
+        // A later last source moves the cut with it.
         let mut later = model_cfg();
         later.kv_source_layer_ids.push(24);
-        assert_eq!(
-            BoundedReplay::from_model(&later).unwrap().late_layer_start,
-            25
-        );
+        assert_eq!(BoundedReplay::from_model(&later).unwrap().cut_layer, 24);
     }
 
     #[test]
-    fn bounded_replay_input_keeps_the_last_window_of_each_chunk() {
-        let reduce = |prefill, decode| {
-            let full =
-                normalize_input(&one_group(prefill, decode), CAPTURED_MAX_MODEL_LEN).unwrap();
-            let late = bounded_replay_input(&full, 128);
-            (full, late)
-        };
-        // Cold 2048-token chunk: 2048 rows -> 128 rows at the late layers.
-        let (full, late) = reduce(vec![(0, 2048)], vec![]);
-        assert_eq!((full.rows, late.rows), (2048, 128));
-        assert_eq!(late.attention.num_tokens, 128);
+    fn replay_trims_eager_and_large_piecewise_steps_only() {
+        let rule = BoundedReplay::from_model(&model_cfg()).unwrap();
+        let reduce = |prefill, decode| normalize_input(&one_group(prefill, decode), Some(&rule));
+
+        // A full 2048-token chunk: PIECEWISE 2048 >= 768 -> 128 replay rows.
+        let cold = reduce(vec![(0, 2048)], vec![]).unwrap();
+        assert_eq!((cold.mode, cold.full.rows), (GraphMode::Piecewise, 2048));
+        let late = cold.replay.as_ref().unwrap();
+        assert_eq!(late.rows, 128);
         assert_eq!(late.attention.prefill_query_context_pairs, [(128, 2048)]);
-        assert_eq!(late.logits_rows, 1);
-        assert!(!late.attention.aux_stream_live);
+        assert!(!late.attention.aux_stream_live && !late.attention.mhc_overlap);
 
-        // A chunk no longer than the window is untouched.
-        let (full, late) = reduce(vec![(300, 100)], vec![]);
-        assert_eq!((full.rows, late.rows), (104, 104));
-        assert_eq!(late.attention.prefill_query_context_pairs, [(100, 400)]);
-
-        // Mixed: 45 decodes + chunks 1912 and 91 -> 45 + 128 + 91 = 264 tokens
-        // pad to 272 (full batch 2048).
-        let (full, late) = reduce(vec![(0, 1912), (4005, 91)], vec![300; 45]);
-        assert_eq!((full.rows, late.rows), (2048, 272));
+        // Mixed at 2048 rows: 45 decodes + 128 + 91 = 264 kept -> 384 rows.
+        let mixed = reduce(vec![(0, 1912), (4005, 91)], vec![300; 45]).unwrap();
+        let late = mixed.replay.as_ref().unwrap();
+        assert_eq!((mixed.full.rows, late.rows), (2048, 384));
         assert_eq!(
             late.attention.prefill_query_context_pairs,
             [(128, 1912), (91, 4096)]
         );
         assert_eq!(late.attention.decode_kv_lens, vec![300; 45]);
-        assert!(!late.attention.aux_stream_live);
 
-        // Decode-only batches are unchanged, including the aux-stream gate.
-        let (full, late) = reduce(vec![], vec![1000; 48]);
-        assert_eq!((full.rows, late.rows), (48, 48));
-        assert_eq!(full.attention.decode_kv_lens, late.attention.decode_kv_lens);
-        assert!(late.attention.aux_stream_live && full.attention.aux_stream_live);
+        // Forced at the threshold even with nothing to trim: 768 rows of
+        // decodes and short chunks keep every row (768 -> 768).
+        let forced = reduce(vec![(0, 100); 7], vec![50; 68]).unwrap();
+        assert_eq!(forced.full.rows, 768);
+        assert_eq!(forced.replay.as_ref().unwrap().rows, 768);
 
-        // Two decodes + a 200-token chunk -> 2 + 128 = 130 tokens -> 136 rows;
-        // a prefill is present, so the aux stream stays off.
-        let (_, late) = reduce(vec![(0, 200)], vec![10; 2]);
-        assert_eq!(late.rows, 136);
-        assert!(!late.attention.aux_stream_live);
+        // Under the threshold the whole batch runs.
+        assert!(reduce(vec![(0, 700)], vec![]).unwrap().replay.is_none());
+        // FULL decode graphs never replay.
+        assert!(reduce(vec![], vec![1000; 48]).unwrap().replay.is_none());
+
+        // Eager steps replay only when a prefilling request exceeds the window.
+        let eager = reduce(vec![(0, 4096)], vec![]).unwrap();
+        assert_eq!(eager.mode, GraphMode::Eager);
+        assert_eq!(eager.replay.as_ref().unwrap().rows, 128);
+        let short = reduce(vec![(0, 100); 21], vec![]).unwrap();
+        assert_eq!(short.mode, GraphMode::Eager);
+        assert!(short.replay.is_none());
+        // A replay batch past the replay graphs runs eager at its size.
+        let many = reduce(vec![(0, 200); 17], vec![]).unwrap();
+        assert_eq!(many.replay.as_ref().unwrap().rows, 17 * 128);
     }
 
     #[test]
-    fn bounded_replay_keeps_the_cost_tree_shape() {
+    fn replay_boundary_runs_only_on_replay_steps() {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
-        let tree = |parallel: &DeepseekV41VllmParallel| {
+        let build_model = |parallel: &DeepseekV41VllmParallel| {
             let configs = build_configs(&model_cfg(), parallel, &uniform_demand()).unwrap();
             build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
         };
-        let (off, on) = (tree(&parallel()), tree(&replay_parallel()));
-        assert_eq!(off.n_slots, on.n_slots);
-        assert_eq!(off.cost_log_manifest(), on.cost_log_manifest());
-        assert_eq!(off.cost_flat.len(), on.cost_flat.len());
+        let (off, on) = (build_model(&no_replay_parallel()), build_model(&parallel()));
+        // write_kv attention + gather + scatter.
+        let names: Vec<String> = on
+            .cost_tree()
+            .slots
+            .iter()
+            .map(|slot| slot.name.clone())
+            .collect();
+        assert!(names.iter().any(|n| n == "unified.replay.gather"));
+        assert!(names.iter().any(|n| n == "unified.replay.scatter"));
+        assert!(names
+            .iter()
+            .any(|n| n.starts_with("unified.layer20.write_kv.")));
+        assert!(on.n_slots > off.n_slots);
+        assert!(off
+            .cost_tree()
+            .slots
+            .iter()
+            .all(|slot| !slot.name.contains("replay") && !slot.name.contains("write_kv")));
     }
 
     #[test]
-    fn cudagraph_rows_follow_the_capture_sizes() {
+    fn piecewise_rows_follow_the_capture_sizes() {
+        let default = graphs(&[1]);
+        assert_eq!(
+            vllm_default_cudagraph_capture_sizes(2048).len(),
+            147,
+            "the logged prefill_cudagraph_capture_token_sizes"
+        );
         let sizes = [
-            (1, 1),
-            (3, 4),
-            (5, 8),
-            (48, 48),
-            (49, 56),
-            (174, 176),
-            (257, 272),
-            (2048, 2048),
-            (2049, 2049),
+            (1, Some(1)),
+            (3, Some(4)),
+            (5, Some(8)),
+            (48, Some(48)),
+            (49, Some(56)),
+            (174, Some(176)),
+            (257, Some(272)),
+            (2048, Some(2048)),
+            (2049, None),
         ];
         for (tokens, rows) in sizes {
-            assert_eq!(cudagraph_rows(tokens), rows, "{tokens}");
+            assert_eq!(default.piecewise_rows(tokens), rows, "{tokens}");
         }
     }
 }

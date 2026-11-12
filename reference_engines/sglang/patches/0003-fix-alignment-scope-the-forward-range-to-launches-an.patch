@@ -1,0 +1,360 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Tue, 11 Aug 2026 18:43:59 +0000
+Subject: [PATCH] fix(alignment): scope the forward range to launches, and
+ state device <-> rank
+
+Three defects the first end-to-end capture against this fork exposed.
+
+**The forward NVTX range spanned two iterations.** It closed in
+`process_batch_result`, which under overlap scheduling runs after the *next*
+batch has already been dispatched -- so each range swallowed its successor's
+launches and every iteration was credited with two forwards' kernels. It now
+closes at the single `return ret` of `run_batch`. The range's job is to bracket
+this forward's launches, not its execution: kernels are attributed by the
+correlation id of the runtime call that issued them, never by when they ran, so
+a range that ends when the last launch is issued loses nothing. Opening moved
+below the `is_prebuilt()` early return for the same reason -- a PD-disagg
+placeholder runs no forward, so it has no range to open rather than one to clean
+up.
+
+This matters beyond bookkeeping. The obvious way to make the old range correct
+was to capture with `--disable-overlap-schedule`, which removes the very thing
+the alignment timeline exists to measure: overlap is what puts scheduler CPU
+work underneath GPU work, so a capture without it can show neither a launch gap
+nor a GPU bubble. With the narrowed range a capture keeps overlap on and the
+gap is directly readable -- a decode iteration's host launch window is 2.4 ms
+against 4.7 ms of GPU busy, the CPU running 4.4 ms ahead.
+
+**No iteration records were emitted at all.** `ScheduleBatch.copy()` is a
+whitelist of the fields `process_batch_result` reads, and `vibesim_geometry` was
+not on it; under overlap scheduling that method only ever sees the copy, so the
+geometry was always None by the time it was read.
+
+**A multi-rank capture could not be attributed.** Turning per-device kernel
+streams back into per-rank evidence needs someone to say which device ran which
+rank. A scheduler is handed its `gpu_id` outright, so it now emits a
+`VibeSimAlignmentWorker` record stating it, before anything else can fail.
+`visible_devices` rides along because `gpu_id` indexes the process's visible set
+and only equals the profiler's ordinal while every rank shares one -- recording
+it lets a reader detect `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS` and refuse
+rather than silently fold every rank onto device 0.
+
+Also corrects the API request timing record. `api_first_output_wait_ms` is the
+*parent* of the dispatch segments in the vLLM fork's schema, not the residual
+left after them, and the reader checks that nesting. `api_e2e_ms` and
+`api_response_sent_ms` are dropped: this frontend has no separable phase behind
+them, and reporting a number to fill a schema slot is worse than reporting none.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ python/sglang/srt/managers/schedule_batch.py  |  3 +
+ python/sglang/srt/managers/scheduler.py       | 42 ++++++++--
+ .../sglang/srt/managers/tokenizer_manager.py  |  1 -
+ .../srt/observability/vibesim_alignment.py    | 78 ++++++++++++++++---
+ .../observability/test_vibesim_alignment.py   | 38 +++++----
+ 5 files changed, 128 insertions(+), 34 deletions(-)
+
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 3e3b290059cf4f4dbd1b4c1f6f89808b7adfc055..29e6201b2bf095effa3f716b79f119f05da6d41c 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -3512,6 +3512,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             launch_ts=self.launch_ts,
+             after_idle_gap=self.after_idle_gap,
+             extend_num_tokens=self.extend_num_tokens,
++            # Snapshotted at dispatch and read back in process_batch_result,
++            # which under overlap scheduling only ever sees this copy.
++            vibesim_geometry=self.vibesim_geometry,
+         )
+ 
+     def _swa_eviction_trigger(self, sliding_window_size: int, eviction_interval: int):
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 9c5e52ea395b38c1e75aad8c0cf34fc25f5357a4..eb117d3311eeb8dcb03563ea46c3f78ac87dbdef 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -5054,10 +5054,6 @@ class Scheduler(
+                 extend_lens=batch.extend_lens,
+                 seq_lens=batch.seq_lens,
+             )
+-            batch.vibesim_geometry.nvtx_range_id = (
+-                vibesim_alignment.open_iteration_forward_range(batch.forward_iter)
+-            )
+-
+         if vibesim_alignment.should_trace_token_iteration(batch.forward_iter):
+             # One scheduled token per request on the decode path; the extend
+             # path already carries its own per-request counts.
+@@ -5079,6 +5075,15 @@ class Scheduler(
+         if batch.forward_mode.is_prebuilt():
+             return self._run_batch_prebuilt(batch)
+ 
++        if batch.vibesim_geometry is not None:
++            # Opened below the prebuilt early return so the range exists only on
++            # the path that reaches the single `return ret` that closes it. A
++            # prebuilt batch is a PD-disagg placeholder that runs no forward, so
++            # it has no forward range to open rather than one to clean up.
++            batch.vibesim_geometry.nvtx_range_id = (
++                vibesim_alignment.open_iteration_forward_range(batch.forward_iter)
++            )
++
+         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
+         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+             # A load-back submitted in this build may still be writing pages that a
+@@ -5377,6 +5382,19 @@ class Scheduler(
+ 
+         self._maybe_report_active_ranks()
+ 
++        if batch.vibesim_geometry is not None:
++            # Closed here, not after the result is processed. The range's job is
++            # to bracket this forward's *launches* -- kernels are attributed by
++            # the correlation id of the runtime call that issued them, never by
++            # when they ran -- and every launch has been issued by now. Holding
++            # it open until process_batch_result would make it span the next
++            # batch's dispatch under overlap scheduling, and hand this iteration
++            # the next one's kernels as well.
++            vibesim_alignment.close_iteration_forward_range(
++                batch.vibesim_geometry.nvtx_range_id
++            )
++            batch.vibesim_geometry.nvtx_range_id = None
++
+         return ret
+ 
+     def _maybe_report_active_ranks(self) -> None:
+@@ -5574,9 +5592,6 @@ class Scheduler(
+             self.metrics_reporter._emit_forward_pass_metrics(batch, result)
+ 
+         if batch.vibesim_geometry is not None:
+-            vibesim_alignment.close_iteration_forward_range(
+-                batch.vibesim_geometry.nvtx_range_id
+-            )
+             vibesim_alignment.emit_iteration_from_geometry(
+                 iteration_index=batch.forward_iter,
+                 geometry=batch.vibesim_geometry,
+@@ -6740,6 +6755,19 @@ def run_scheduler_process(
+         display_dp_rank=display_dp_rank,
+         display_moe_ep_rank=display_moe_ep_rank,
+     )
++    if vibesim_alignment.is_enabled():
++        # Before anything can fail: this is the only statement of which device
++        # ran which rank, and a capture without it cannot be attributed.
++        vibesim_alignment.emit_worker_record(
++            pid=os.getpid(),
++            device_id=gpu_id,
++            visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
++            tp_rank=tp_rank,
++            dp_rank=dp_rank,
++            pp_rank=pp_rank,
++            tp_size=server_args.tp_size,
++            dp_size=server_args.dp_size,
++        )
+     parent_process = psutil.Process().parent()
+ 
+     # Set up tracing
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index ddb0b11191692bffc71bfd95ffdbd067232b1397..b88b0821ead9394292ed17cd0b8a035ac43f8a4d 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -3383,7 +3383,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             first_token_monotonic=stats.first_token_time,
+             last_token_monotonic=stats.last_time,
+             finished_monotonic=stats.finished_time,
+-            response_sent_monotonic=stats.response_sent_to_client_time,
+             output_tokens=completion_tokens,
+         )
+ 
+diff --git a/python/sglang/srt/observability/vibesim_alignment.py b/python/sglang/srt/observability/vibesim_alignment.py
+index a3f794ef025e0669134eccb171331a9f6c22712b..03aa4b1f0ece3202065acda12bbf07c8b1782182 100644
+--- a/python/sglang/srt/observability/vibesim_alignment.py
++++ b/python/sglang/srt/observability/vibesim_alignment.py
+@@ -135,11 +135,13 @@ def capture_iteration_geometry(
+ #: this rather than guessing from which fields happen to be present.
+ INPUT_ADAPTER = "sglang_text"
+ 
++WORKER_SCHEMA_VERSION = 1
+ ITERATION_SCHEMA_VERSION = 2
+ REQUEST_TIMING_SCHEMA_VERSION = 2
+ EXPERT_LOAD_SCHEMA_VERSION = 2
+ API_REQUEST_TIMING_SCHEMA_VERSION = 3
+ 
++_WORKER_RECORD_NAME = "VibeSimAlignmentWorker"
+ _ITERATION_RECORD_NAME = "VibeSimAlignmentIteration"
+ _REQUEST_TIMING_RECORD_NAME = "VibeSimAlignmentRequestTiming"
+ _API_REQUEST_TIMING_RECORD_NAME = "VibeSimAlignmentApiRequestTiming"
+@@ -243,6 +245,58 @@ def build_iteration_record(
+     }
+ 
+ 
++# ── worker identity ──────────────────────────────────────────────────────────
++
++
++def build_worker_record(
++    *,
++    pid: int,
++    device_id: int,
++    visible_devices: Optional[str],
++    tp_rank: int,
++    dp_rank: Optional[int],
++    pp_rank: int,
++    tp_size: int,
++    dp_size: int,
++) -> dict[str, Any]:
++    """State which device this scheduler owns and which rank it holds.
++
++    A multi-rank capture is a set of per-device kernel streams, and turning it
++    back into per-rank evidence needs someone to say which device ran which
++    rank. The vLLM fork leaves that to be recovered indirectly -- its banner
++    states pid <-> rank, and the profiler separately knows pid <-> device -- but
++    a scheduler process here is handed its `gpu_id` outright, so it can state
++    the thing the analyzer actually wants and skip the join.
++
++    `visible_devices` is recorded because that directness has one precondition:
++    `gpu_id` is an index into the process's visible set, and it only equals the
++    device ordinal the profiler reports while every rank shares one visible set.
++    Under `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS` each rank sees a single device
++    and calls it 0, so every rank would claim device 0. Recording what each rank
++    could see lets the reader detect that and refuse, instead of silently
++    folding the whole run onto one device.
++    """
++    return {
++        "schema_version": WORKER_SCHEMA_VERSION,
++        "input_adapter": INPUT_ADAPTER,
++        "pid": int(pid),
++        "device_id": int(device_id),
++        "visible_devices": visible_devices,
++        "tp_rank": int(tp_rank),
++        "dp_rank": int(dp_rank or 0),
++        "pp_rank": int(pp_rank),
++        "tp_size": int(tp_size),
++        "dp_size": int(dp_size),
++    }
++
++
++def emit_worker_record(**kwargs: Any) -> None:
++    _emit(_WORKER_RECORD_NAME, build_worker_record(**kwargs))
++
++
++# ── iteration ────────────────────────────────────────────────────────────────
++
++
+ def emit_iteration_record(**kwargs: Any) -> None:
+     _emit(_ITERATION_RECORD_NAME, build_iteration_record(**kwargs))
+ 
+@@ -344,7 +398,6 @@ def build_api_request_timing_record(
+     first_token_monotonic: float,
+     last_token_monotonic: float,
+     finished_monotonic: float,
+-    response_sent_monotonic: float,
+     output_tokens: int,
+ ) -> Optional[dict[str, Any]]:
+     """Split the API-server span the client waits on, ahead of the scheduler.
+@@ -353,6 +406,13 @@ def build_api_request_timing_record(
+     calibrate its API and scheduler clocks against each other, but this record
+     does not lean on that: it reports one domain, and the scheduler-side
+     `RequestTiming` record reports the other, exactly as the vLLM fork does.
++
++    The field set is a subset of the vLLM fork's, and deliberately so: vLLM
++    splits the wait for the first output across its output collector and its
++    per-request generator, handoffs SGLang does not have -- it moves outputs over
++    its own IPC and the phases are not separable from outside. Reporting the
++    parent span and the two dispatch segments states what is true here rather
++    than inventing a split to fill the schema.
+     """
+     boundaries = (
+         created_monotonic,
+@@ -377,25 +437,21 @@ def build_api_request_timing_record(
+         # same keeps the two engines' waterfalls stackable.
+         "api_frontend_prepare_ms": (tokenize_finish_monotonic - created_monotonic)
+         * 1000.0,
++        # The whole wait for the first output, prepare excluded -- the parent of
++        # the two dispatch segments below, not the residual left after them.
++        # That nesting is the vLLM fork's, and the report checks it: the parts
++        # an engine reports must fit inside this span.
++        "api_first_output_wait_ms": (first_token_monotonic - tokenize_finish_monotonic)
++        * 1000.0,
+         "api_stream_activation_ms": (dispatch_monotonic - tokenize_finish_monotonic)
+         * 1000.0,
+         "api_add_request_ms": (dispatch_finish_monotonic - dispatch_monotonic) * 1000.0,
+-        "api_first_output_wait_ms": (first_token_monotonic - dispatch_finish_monotonic)
+-        * 1000.0,
+         "api_token_output_receive_span_ms": (
+             last_token_monotonic - first_token_monotonic
+         )
+         * 1000.0,
+         "api_terminal_tail_ms": (finished_monotonic - last_token_monotonic) * 1000.0,
+-        "api_e2e_ms": (finished_monotonic - created_monotonic) * 1000.0,
+     }
+-    # Only the streaming path stamps the moment the last chunk left the server;
+-    # the non-streaming path has no such boundary, so the field is absent rather
+-    # than folded into the tail.
+-    if response_sent_monotonic > 0.0:
+-        record["api_response_sent_ms"] = (
+-            response_sent_monotonic - finished_monotonic
+-        ) * 1000.0
+     return record
+ 
+ 
+diff --git a/test/registered/unit/observability/test_vibesim_alignment.py b/test/registered/unit/observability/test_vibesim_alignment.py
+index c86da8feb7090b5238dd7cb15cbcae8ea368e4fa..a84f91290560dce9de4c63b92bdf2100b13af03f 100644
+--- a/test/registered/unit/observability/test_vibesim_alignment.py
++++ b/test/registered/unit/observability/test_vibesim_alignment.py
+@@ -134,37 +134,45 @@ class TestApiRequestTimingRecord(unittest.TestCase):
+             first_token_monotonic=100.020,
+             last_token_monotonic=100.220,
+             finished_monotonic=100.221,
+-            response_sent_monotonic=100.222,
+             output_tokens=32,
+         )
+         arguments.update(overrides)
+         return build_api_request_timing_record(**arguments)
+ 
+-    def test_frontend_span_decomposes_into_adjacent_segments(self):
++    def test_first_output_wait_is_the_parent_of_the_dispatch_segments(self):
++        """The dispatch parts nest inside the wait; they do not follow it.
++
++        Regression: they were first emitted as four adjacent segments, so
++        `api_first_output_wait_ms` was the residual after dispatch. The report
++        reads the vLLM fork's nesting, where the wait is the parent span, and
++        rejected every SGLang row for not summing.
++        """
+         record = self._record()
+ 
+         self.assertEqual(record["schema_version"], API_REQUEST_TIMING_SCHEMA_VERSION)
+         self.assertAlmostEqual(record["api_frontend_prepare_ms"], 3.0)
+         self.assertAlmostEqual(record["api_stream_activation_ms"], 2.0)
+         self.assertAlmostEqual(record["api_add_request_ms"], 2.0)
+-        self.assertAlmostEqual(record["api_first_output_wait_ms"], 13.0)
++        # created→first_token is 20 ms, of which 3 ms is prepare.
++        self.assertAlmostEqual(record["api_first_output_wait_ms"], 17.0)
+         self.assertAlmostEqual(record["api_token_output_receive_span_ms"], 200.0)
+         self.assertAlmostEqual(record["api_terminal_tail_ms"], 1.0)
+-        self.assertAlmostEqual(record["api_e2e_ms"], 221.0)
+-        # The segments up to the first token must tile that whole span.
+-        self.assertAlmostEqual(
+-            record["api_frontend_prepare_ms"]
+-            + record["api_stream_activation_ms"]
+-            + record["api_add_request_ms"]
+-            + record["api_first_output_wait_ms"],
+-            20.0,
++        # The dispatch parts fit inside the wait rather than extending it.
++        self.assertLess(
++            record["api_stream_activation_ms"] + record["api_add_request_ms"],
++            record["api_first_output_wait_ms"],
+         )
+ 
+-    def test_non_streaming_request_omits_the_response_sent_segment(self):
+-        record = self._record(response_sent_monotonic=0.0)
++    def test_span_carries_no_field_the_vllm_fork_does_not_define(self):
++        """The record is a subset of the vLLM fork's, never a superset.
++
++        One analyzer reads both, and a field only one engine emits would either
++        go unread or force a per-engine branch. Guards against re-adding the
++        `api_e2e_ms` / `api_response_sent_ms` pair that was here first.
++        """
++        record = self._record()
+ 
+-        # Absent rather than zero: the non-streaming path never stamps it, and a
+-        # zero would read as "sent instantly".
++        self.assertNotIn("api_e2e_ms", record)
+         self.assertNotIn("api_response_sent_ms", record)
+ 
+     def test_incomplete_timestamps_produce_no_record(self):

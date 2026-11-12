@@ -42,17 +42,56 @@ unsupported schema version, and a corpus manifest whose payload is not beside
 it. Rendering preserves the routing selector and converts pack-relative file
 paths to simulator paths; it never falls back to uniform.
 
+## Alignment Phase 1 and alignment Phase 2
+
+A pack's cases fall into two groups, chosen per case with `phase`:
+
+- **alignment Phase 1** (`phase: 1`): for each alignment — one checkpoint on one
+  deployment, e.g. DeepSeek-V4.1 TP4/EP4 and DP4/EP4 are two — one case replaying
+  the tracked `trace/diverse_100.csv` at its recorded arrival times, through Check
+  1 (kernel), Check 2 (duty cycle) and Check 3 (E2E). It is what a model PR must pass.
+- **alignment Phase 2** (the default): the whole matrix, Phase 1 cases included.
+  It runs end to end from the pack with no hand edits, so it can be handed to
+  someone else as an issue.
+
+`render`, `run`, `label`, `extract` and `compare` take `--alignment-phase {1,2}`.
+`1` works on the Phase 1 cases only; a pack with none is an error. `2` is the
+full matrix, the same as omitting the flag. It is unrelated to `--phase`, which
+names a pipeline step (`profile_nsys`, `simulation`, ...).
+
+An illustrative Phase 1 case (no pack declares one yet; the index, name and
+variant are placeholders):
+
+```yaml
+cases:
+- index: 30
+  name: tp4_diverse_100
+  variant: tp4_c2048_s64
+  phase: 1
+  workload_trace: {path: trace/diverse_100.csv}  # tracked, replayed byte for byte
+  profile_arrival_mode: trace-timed              # recorded arrivals, no `rate`
+  simulation_arrival_mode: trace_timed           # rendered with request_rate: 1.0
+  attn_gpu_memory_gb: {status: from_capture}
+  speculative_acceptance: {status: from_capture}                     # speculative models
+  speculative_acceptance_by_output_position: {status: from_capture}  # speculative models
+  # ... max_model_len, gpu_memory_utilization, capture_seconds, device_role, purpose
+```
+
 ## Verbs
 
 ```bash
 python -m launcher alignment-campaign check   --pack <pack_dir>
-python -m launcher alignment-campaign render  --pack <> --host <> --out-root <> [--case 01]
-python -m launcher alignment-campaign run     --pack <> --out-root <> --phase <P> \
+python -m launcher alignment-campaign render  --pack <> --host <> --out-root <> [--case 01] [--alignment-phase 1|2]
+python -m launcher alignment-campaign run     --pack <> --out-root <> --phase <P> [--alignment-phase 1|2] \
                                               [--case ...] [--dry-run] [--refresh] [--resume]
-python -m launcher alignment-campaign label   --pack <> --run-dir <>
-python -m launcher alignment-campaign extract [--pack <>] --runs <dir[:dir]> --out metrics.json
+python -m launcher alignment-campaign label   --pack <> --out-root <> [--alignment-phase 1|2]
+python -m launcher alignment-campaign extract [--pack <>] --runs <dir[:dir]> --out metrics.json [--alignment-phase 1|2]
 python -m launcher alignment-campaign compare [--pack <>] --measured metrics.json \
-                                              [--json|--markdown] [--record]
+                                              [--json|--markdown] [--record] [--alignment-phase 1|2]
+python -m launcher alignment-campaign bundle  --pack <> --host <> --out-root <> --dest <new dir> \
+                                              [--case ...] [--alignment-phase 1|2] [--upload <dataset> [--no-pr]]
+python -m launcher alignment-campaign verify-bundle --pack <> --out-root <> (--bundle <dir> | --from-hf <repo>@<rev>:<path>) \
+                                              [--check-only] [--replace]
 ```
 
 `--pack` is **optional for `extract` and `compare`** — the read side. Point
@@ -87,8 +126,15 @@ commands plus, for every excluded case, *why* — already complete, or missing a
 named input. Planning is a pure function (`execute.plan_phase`), which is what
 makes it testable on CPU.
 
+`--runtime image` (the default) runs each new capture of a profile pass in its engine's
+reference image (`vllm`, `sglang`; `reference_engines/README.md`) (`alignment/README.md`, "In-image capture"); the host keeps scheduling,
+markers and journal, GPU choice and outputs. Every other phase, and `--resume`,
+runs on the host from the capture's files. `--runtime host` captures in a host
+venv with no autotune guard or preflight and is strongly discouraged.
+
 For `--phase simulation`, worker settings come from `simulation.yaml`, including
-`gpu_time_multiplier`. Kernel analysis is an independent phase, not a
+`gpu_time_multiplier`; a case with `from_capture` inputs gets that file written
+by `run` from its workload pass (see `campaign.yaml` below). Kernel analysis is an independent phase, not a
 prerequisite for simulation. The campaign never reads a case's own calibration
 report back into that case. A pack may instead declare one top-level, calibrated
 `gpu_time_multiplier` (`value`, `status`, `derived_from`, `evidence`) measured on
@@ -103,6 +149,60 @@ the measured and simulated request contracts. Audit failures block comparison
 eligibility. Missing legacy identity evidence is reported explicitly; it is not
 presented as a successful identity check. Observed-conditioned trace manifests
 are included in provenance when their output hash matches the selected trace.
+
+### Handing captures off: `bundle` / `verify-bundle`
+
+The profile passes need the GPUs; everything after them does not. So a matrix
+can be handed to someone with the hardware as an issue: they run the profile
+steps from the pack and return the capture directories, and the maintainer runs
+the rest. `bundle.py` is the contract.
+
+- **What is sent.** Every profile pass directory of the selected cases, file
+  for file, except the nsys `.sqlite` export (`alignment profile --resume`
+  re-exports it from the `.nsys-rep`, which is sent), plus the trace each pass
+  replayed (`<case>/<pass>.trace.csv`). `bundle.json` lists each file's sha256
+  and size, each pass's state (`complete`, `incomplete`, `missing`), the pack's
+  `campaign.yaml` sha256 and the ServingStudioSim commit.
+- **Scrubbing.** `--host` must be the profile the captures ran with. Text files
+  have the host's paths replaced by `${...}` placeholders: capture dir, case
+  dir, out root, checkout and workspace, home, the host profile's paths and
+  checkpoints, and every mount source the capture recorded. The user and host
+  name are replaced as whole words (names under 5 characters are not
+  replaced); GPU UUIDs become `GPU-<n>`. Then every file, binaries included, is
+  searched for the home, every non-shared host path, and the user and host
+  name (5 characters or more, anywhere), and any hit refuses the bundle. A hit in an `.nsys-rep` is fixed
+  where the capture writes it, never by dropping the file: e.g. the autotune
+  preflight variable carries the container's path
+  (`alignment/image_runtime.py:container_cache_path`). Captures taken before
+  that fix are refused and have to be recaptured to be published.
+- **Published as is.** GPU model, count and driver; the engine image; the model
+  snapshot; server logs and the kernel timeline. nsys stores each GPU's bare
+  UUID in the `.nsys-rep`; it cannot be scrubbed there, so it is published.
+- **Where it goes.** A public Hugging Face dataset,
+  `UW-SyFI/servingstudio-alignment-captures`, under `<pack>/<bundle dir>/`.
+  `--upload` opens a dataset PR, so a contributor needs no write access.
+  `verify-bundle --from-hf` accepts only a pinned revision: a commit sha or the
+  PR ref (`refs/pr/<n>`).
+- **What the maintainer checks.** `verify-bundle` accepts only the case's own
+  profile pass names and safe relative paths; re-hashes every file and rejects
+  a changed, missing or unlisted one; reads the conditions again from the
+  hashed capture (the image in `container_run.json`, the model snapshot in
+  `profile.yaml`, the GPU in `profile_result.json`, the bundled trace) and
+  compares them with what its own checkout renders. A mismatch, or a condition
+  either side cannot state, is an error (so a checkpoint outside the HF hub,
+  which has no `snapshots/<sha>` to compare, cannot be verified), as is a different `campaign.yaml`; a
+  different commit is a warning. A pass marked complete must contain its
+  phase's required artifacts. Nothing is placed unless every check passed.
+  Each pass is then staged beside its case directory, its completion marker
+  written last, and renamed into place, with the structural placeholders
+  restored so the capture's `log_dir` names where it now lives. Every metric is
+  then computed locally by the ordinary phases.
+
+An issue that hands a matrix off names the pack and commit, the reference
+image tag, the model snapshot and the GPUs; gives the command block of
+`skills/operate-run-alignment` up to the profile steps plus the `bundle`
+line; and asks that a failing step be reported with its bundle rather than
+worked around by editing a config.
 
 ### `label`
 
@@ -171,10 +271,25 @@ Each pass can also set `warmup: true` (default false). This renders
 drain, prefix-cache reset and measurement boundary. vLLM variants must enable
 server load tracking. Warmup does not alter either materialized trace.
 
+A variant may set `prewarm` (`prompt_lengths`, optional `max_tokens`, `seed`,
+`timeout`), rendered into its `nsys` and `workload_metrics` passes as the
+profile's `prewarm` block: requests that compile per-shape kernels before
+measurement. Its lengths are the variant's, e.g. its kernels' M buckets up to the
+variant's chunk size.
+
 A **case** is one operating point: `max_model_len`, `max_concurrency`, the two
 arrival modes, `gpu_memory_utilization`, `capture_seconds`, `device_role`, its
 `workload_trace` (and `kernel_trace` where the NSYS capture is bounded
-separately), plus `purpose` and `coverage` so the matrix explains itself.
+separately), plus `purpose` and `coverage` so the matrix explains itself, and
+`phase` (1 or 2, default 2; see above).
+
+A trace is either generated (`file` + `shapes` x `repeats`) or a tracked file
+(`{path: trace/diverse_100.csv}`, repo-relative). A tracked file is replayed
+byte for byte, ids and arrival times included, and `check` compares its sha256
+with `traces/invariants.json` like a generated trace's. A trace-timed case
+normally needs a calibrated `rate`, because a generated trace's arrivals are a
+1 req/s placeholder; a tracked trace instead replays its recorded arrivals,
+with no `rate` on the profile side and `request_rate: 1.0` in the simulation.
 
 Optional per-case `chunk_size` sets both server `max_num_batched_tokens` and
 worker `max_batch_tokens`. CUDA graph capture size remains a separate variant
@@ -214,7 +329,7 @@ Two case fields carry more weight than their size suggests:
 
 - **`attn_gpu_memory_gb` and `rate` are `Calibrated`**, not plain numbers. Each
   records `value`, `derived_from`, `evidence`, and `status: measured |
-  provisional`. These are *measured* prerequisites — KV capacity is read out of a
+  provisional | from_capture`. These are *measured* prerequisites — KV capacity is read out of a
   workload-only server log, the open-loop rate comes from a saturation run — and
   the generator scripts this replaced shipped a literal
   `# provisional; replace after saturation calibration` next to a hard-coded
@@ -223,6 +338,42 @@ Two case fields carry more weight than their size suggests:
   --record` refuses to write a golden that depends on one unless
   `--accept-provisional` is passed, and then names the provisional fields in the
   provenance sidecar.
+- **`from_capture`** (`{status: from_capture}`, nothing else) is for
+  `attn_gpu_memory_gb`, `speculative_acceptance` and
+  `speculative_acceptance_by_output_position`: the case's own
+  `workload_metrics` pass is the measurement, and nobody copies it by hand.
+  `calibration.py` reads the chain from `spec_decode_metrics.json` (position 0
+  is `accepted[0] / num_drafts`, position k is `accepted[k] / accepted[k-1]`),
+  the output-position buckets from the pass's `metrics_jsonl`
+  (`buckets_from_metrics`: `decode_request_progress` rounds binned by
+  `output_tokens_before` at 1/32/128/512/1024/2048/4096/8192, a bucket under 50
+  rounds merged into the previous one and a first bucket under 50 rounds merged
+  into the second, depth = the arch's `draft_tokens`),
+  and the per-rank KV pool from the vLLM server log (the smallest rank's
+  `Extended KV cache to N blocks (X GiB)`, else `Available KV cache memory: X
+  GiB`; `X * 2**30 / 1e9` GB). SGLang has no extractor: its log gives
+  `max_total_num_tokens`, which needs a per-token byte size to become GB, so
+  `check` rejects `from_capture` there. `render` leaves `simulation.yaml` out
+  until the pass has run, and `run --phase timing_predict|simulation` blocks
+  with the reason until then. Once it has, `run` writes `calibration.json`
+  (each value with its source file, relative to the case directory), the
+  simulation preset and `trace_speculative.csv` just before launching. A
+  resolved field counts as measured. When `run` finishes the simulation it
+  records the sha256 of the preset and `calibration.json` it ran with, and a
+  copy of that calibration, in `simulation/campaign_inputs.json`. A later
+  change to either file, or a re-run workload pass that now resolves to other
+  values, makes the simulation not complete, and the next `run --phase
+  simulation` re-runs it with `--refresh`. `extract` copies the recorded
+  calibration (never the live file) into the case's provenance, `compare`
+  prints it, and `compare --record` writes it into the golden's provenance
+  sidecar (merged per case, like the golden values) and refuses a from_capture
+  case whose simulation recorded none.
+- **`acceptance_structure`** (pack top level, optional) is
+  `{status: legacy_single_chain, reason: <why>}`: the pack's speculative cases
+  carry only the case-wide chain because their captures cannot give the
+  by-output-position buckets. Without it, `check` fails a speculative case that
+  lacks `speculative_acceptance_by_output_position`; with it, `check` warns and
+  prints the reason. Only the two GLM-5.2 spec5 packs declare it.
 - **`analyze_iterations`** overrides the profiler's whole-capture default with a
   stable numbered excerpt. Use it when the accepted evidence population is a
   particular iteration interval that must remain fixed even if capture duration
@@ -298,7 +449,9 @@ exists to hold.
 | File | Contents |
 |---|---|
 | `pack.py` | Pack/variant/case dataclasses, `Calibrated`, YAML loading, host profiles |
+| `packfile.py` | The `campaign.yaml` writer every `make_pack.py` uses: scalar lists in flow style |
 | `render.py` | Phase configs and traces from a `(case, variant, host)` triple |
+| `calibration.py` | `from_capture` inputs read from a case's workload pass; `calibration.json` |
 | `check.py` | Pure-CPU pack self-check; trace invariants; cross-phase consistency |
 | `execute.py` | Phase planning (pure) and execution (scheduler + leases + journal) |
 | `label.py` | Applying the rule set to a fixpoint, then `check` |

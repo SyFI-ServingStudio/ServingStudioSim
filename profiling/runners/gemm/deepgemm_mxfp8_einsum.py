@@ -103,7 +103,9 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
         raise ProfilerNotImplemented(f"DeepGEMM MXFP8 BMM unavailable: {reason}")
 
     def make_kernel(num_batches: int) -> Any:
-        return DeepGemmMxfp8BmmLinearKernel(Mxfp8LinearLayerConfig(bmm_batch_size=num_batches))
+        return DeepGemmMxfp8BmmLinearKernel(
+            Mxfp8LinearLayerConfig(weight_shape=(WO_A_N, WO_A_K), bmm_batch_size=num_batches)
+        )
 
     return torch, make_kernel, alloc_mega_attn_output, fp8_einsum
 

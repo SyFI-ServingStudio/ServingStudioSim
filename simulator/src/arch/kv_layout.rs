@@ -8,15 +8,26 @@
 //! capacity, admission and prefix-cache charges (`worker::kv::KvAccounting`).
 //!
 //! Bytes are summed over the part's layers **and over every rank of one KV
-//! partition** (one attention TP group). Ranks share a request's cache in one of
-//! two ways:
+//! partition** (one attention TP group, or a PP replica's stages). Each part
+//! says how it sits on those ranks ([`RankPlacement`]): the arch builds the part
+//! from **one copy** of its state, then declares how many slices that copy is
+//! cut into and how many copies the partition keeps:
 //!
-//! - **split by KV head** (GQA): each rank stores its share of the heads, and a
-//!   rank whose TP exceeds the head count still stores one whole head;
-//!   [`gqa_kv_bytes_per_token`] counts those replicated heads.
-//! - **one copy on each rank** (an MLA latent, a DSA index key, a KDA state, a
-//!   DeepSeek-V4 compressed cache): the arch describes one rank's layout and
-//!   [`KvCacheLayout::held_on_each_rank`] scales every byte count by the ranks.
+//! - **sharded** (`.sharded(n)`): one copy is cut over `n` ranks, such as GQA
+//!   KV heads or KDA heads split by TP, or layers split by PP stage. The bytes
+//!   stay one copy's.
+//! - **replicated** (`.replicated(m)`): the partition keeps `m` copies, such as
+//!   an MLA latent, a DSA index key or a single-head (MQA) cache that every TP
+//!   rank stores whole, or a GQA head that TP ranks beyond the head count
+//!   repeat ([`gqa_placement`]). The bytes scale by `m`.
+//!
+//! `shards × replicas` is the partition's rank count for every part
+//! ([`KvCacheLayout::check_placement`]). A part whose layers sit differently
+//! (some replicated, some split) is two parts. So `bytes_per_entry` is what the
+//! partition stores, [`KvCachePart::one_copy_bytes_per_entry`] what the model
+//! stores once, and [`KvCachePart::per_gpu_bytes_per_entry`] what one GPU
+//! stores; the replicas are the factor parallelism adds. A part serializes all
+//! three, so a reader of the JSON never re-derives them from the placement.
 //!
 //! Each part carries two byte counts. `bytes_per_entry` is what the model must
 //! store. [`PartOverhead`] and [`EngineOverhead`] add what the serving engine
@@ -35,6 +46,7 @@ pub struct KvCacheLayout {
 /// One kind of cache in the layout, such as global attention, sliding-window
 /// attention, a short-conv window, a DSA indexer or a GDN state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(into = "KvCachePartJson")]
 pub struct KvCachePart {
     pub name: &'static str,
     pub growth: KvGrowth,
@@ -49,6 +61,69 @@ pub struct KvCachePart {
     pub prefix_reusable: bool,
     #[serde(flatten)]
     pub overhead: PartOverhead,
+    /// How the part's bytes sit on the partition's ranks.
+    pub placement: RankPlacement,
+}
+
+/// A part as JSON: the declared fields plus the bytes of one entry stored once
+/// and on one GPU, so every consumer reads the three sizes the simulator
+/// derives rather than dividing by the placement itself.
+#[derive(Serialize)]
+struct KvCachePartJson {
+    name: &'static str,
+    growth: KvGrowth,
+    /// Over the whole KV partition, replicas included.
+    bytes_per_entry: u64,
+    /// The model's own bytes, stored once.
+    one_copy_bytes_per_entry: u64,
+    /// One GPU's share: the partition's bytes over its ranks. Fractional only
+    /// when a pipeline stage split leaves the layers uneven, where it is the
+    /// average GPU's.
+    per_gpu_bytes_per_entry: f64,
+    prefix_reusable: bool,
+    #[serde(flatten)]
+    overhead: PartOverhead,
+    placement: RankPlacement,
+}
+
+impl From<KvCachePart> for KvCachePartJson {
+    fn from(part: KvCachePart) -> Self {
+        Self {
+            name: part.name,
+            growth: part.growth,
+            bytes_per_entry: part.bytes_per_entry,
+            one_copy_bytes_per_entry: part.one_copy_bytes_per_entry(),
+            per_gpu_bytes_per_entry: part.per_gpu_bytes_per_entry(),
+            prefix_reusable: part.prefix_reusable,
+            overhead: part.overhead,
+            placement: part.placement,
+        }
+    }
+}
+
+/// How one part sits on the ranks of a KV partition: one copy of the part is
+/// cut into `shards` slices on different ranks, and the partition keeps
+/// `replicas` copies. `shards × replicas` is the partition's rank count; the
+/// default (`1 × 1`) is a one-GPU partition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct RankPlacement {
+    pub shards: u32,
+    pub replicas: u32,
+}
+
+impl RankPlacement {
+    pub fn ranks(&self) -> u32 {
+        self.shards * self.replicas
+    }
+}
+
+impl Default for RankPlacement {
+    fn default() -> Self {
+        Self {
+            shards: 1,
+            replicas: 1,
+        }
+    }
 }
 
 /// How a part grows with the request's context.
@@ -110,17 +185,12 @@ impl KvCacheLayout {
         self
     }
 
-    /// The partition's layout when each of `ranks` ranks holds this one-rank
-    /// layout whole: every byte count, padding and fixed buffer included, scales
-    /// by `ranks`; block tokens and copies do not.
-    pub fn held_on_each_rank(mut self, ranks: u64) -> Self {
+    /// Every part cut over `shards` more ranks: a pipeline-parallel replica,
+    /// whose stages each cache only their own layers.
+    pub fn sharded(mut self, shards: u32) -> Self {
         for part in &mut self.parts {
-            part.bytes_per_entry *= ranks;
-            if let Some(padded) = &mut part.overhead.padded_bytes_per_entry {
-                *padded *= ranks;
-            }
+            *part = part.sharded(shards);
         }
-        self.engine.fixed_device_bytes *= ranks;
         self
     }
 
@@ -137,6 +207,24 @@ impl KvCacheLayout {
                 _ => None,
             })
             .sum()
+    }
+
+    /// Reject a layout whose parts do not all sit on `attention_shards` ranks
+    /// (`shards × replicas`), the GPUs one KV partition spans. A one-GPU
+    /// partition accepts only the default placement.
+    pub fn check_placement(&self, attention_shards: u16) -> anyhow::Result<()> {
+        let ranks = u32::from(attention_shards.max(1));
+        for part in &self.parts {
+            anyhow::ensure!(
+                part.placement.ranks() == ranks,
+                "KV cache part {} sits on {} shards x {} replicas, but the partition \
+                 spans {ranks} ranks",
+                part.name,
+                part.placement.shards,
+                part.placement.replicas
+            );
+        }
+        Ok(())
     }
 
     /// Reject layouts L5 cannot account: no parts, a zero-byte part, a zero
@@ -205,6 +293,7 @@ impl KvCachePart {
             bytes_per_entry,
             prefix_reusable: true,
             overhead: PartOverhead::default(),
+            placement: RankPlacement::default(),
         }
     }
 
@@ -217,6 +306,7 @@ impl KvCachePart {
             bytes_per_entry: bytes_per_token,
             prefix_reusable: true,
             overhead: PartOverhead::default(),
+            placement: RankPlacement::default(),
         }
     }
 
@@ -228,6 +318,7 @@ impl KvCachePart {
             bytes_per_entry: bytes_per_request,
             prefix_reusable: true,
             overhead: PartOverhead::default(),
+            placement: RankPlacement::default(),
         }
     }
 
@@ -245,21 +336,86 @@ impl KvCachePart {
         self.prefix_reusable = false;
         self
     }
+
+    /// One copy of this part is cut over `shards` ranks (heads split by TP,
+    /// layers split by PP stage). The bytes are unchanged: they are still one
+    /// copy's, now spread over more GPUs.
+    pub fn sharded(mut self, shards: u32) -> Self {
+        self.placement.shards *= shards;
+        self
+    }
+
+    /// The partition keeps `replicas` copies of this part (an MLA latent or MQA
+    /// cache on every TP rank). Every byte count, padding included, scales by
+    /// `replicas`, so declare the placement after `padded_to`.
+    pub fn replicated(mut self, replicas: u32) -> Self {
+        self.placement.replicas *= replicas;
+        self.bytes_per_entry *= u64::from(replicas);
+        if let Some(padded) = &mut self.overhead.padded_bytes_per_entry {
+            *padded *= u64::from(replicas);
+        }
+        self
+    }
+
+    /// Both factors of `placement`, as from [`gqa_placement`].
+    pub fn placed(self, placement: RankPlacement) -> Self {
+        self.sharded(placement.shards)
+            .replicated(placement.replicas)
+    }
+
+    /// The model's own bytes of this part for one request of
+    /// `context_tokens`, stored once: no replicas, padding, state copies,
+    /// block rounding or in-flight tokens. The intrinsic size a report
+    /// measures amplification against.
+    pub fn one_copy_bytes_at(&self, context_tokens: u64) -> u64 {
+        let entries = match self.growth {
+            KvGrowth::PerToken { tokens_per_entry } => {
+                context_tokens.div_ceil(u64::from(tokens_per_entry.max(1)))
+            }
+            KvGrowth::SlidingWindow { window_tokens } => {
+                context_tokens.min(u64::from(window_tokens))
+            }
+            KvGrowth::PerRequest => 1,
+        };
+        entries * self.one_copy_bytes_per_entry()
+    }
+
+    /// One entry stored once: `bytes_per_entry` without the replicas.
+    pub fn one_copy_bytes_per_entry(&self) -> u64 {
+        self.bytes_per_entry / u64::from(self.placement.replicas.max(1))
+    }
+
+    /// One entry's bytes on one GPU of the partition: `bytes_per_entry` over
+    /// `shards × replicas` ranks.
+    pub fn per_gpu_bytes_per_entry(&self) -> f64 {
+        self.bytes_per_entry as f64 / f64::from(self.placement.ranks().max(1))
+    }
 }
 
-/// Per-token bytes of `layers` GQA layers over one attention TP group of
-/// `attn_tp` ranks. When `attn_tp` exceeds `num_kv_heads`, each rank still
-/// stores one whole KV head, so the group stores `attn_tp` heads, not
-/// `num_kv_heads`.
+/// Per-token bytes of one copy of `layers` GQA layers: K and V of every KV
+/// head. How a TP group holds that copy is [`gqa_placement`].
 pub fn gqa_kv_bytes_per_token(
     layers: u64,
     num_kv_heads: u64,
     k_head_dim: u64,
     v_head_dim: u64,
     dtype_bytes: u64,
-    attn_tp: u64,
 ) -> u64 {
-    layers * num_kv_heads.max(attn_tp.max(1)) * (k_head_dim + v_head_dim) * dtype_bytes
+    layers * num_kv_heads * (k_head_dim + v_head_dim) * dtype_bytes
+}
+
+/// How an attention TP group of `attn_tp` ranks holds GQA KV of
+/// `num_kv_heads` heads: split by head over `min(heads, tp)` ranks, and, when
+/// TP exceeds the head count, every head repeated on `tp / heads` ranks (each
+/// rank still stores one whole head; vLLM requires `tp` to be a multiple of the
+/// head count then).
+pub fn gqa_placement(num_kv_heads: u64, attn_tp: u64) -> RankPlacement {
+    let tp = attn_tp.max(1);
+    let shards = num_kv_heads.max(1).min(tp);
+    RankPlacement {
+        shards: u32::try_from(shards).expect("KV head count exceeds u32"),
+        replicas: u32::try_from(tp / shards).expect("attention TP exceeds u32"),
+    }
 }
 
 /// vLLM's hybrid attention block (`_align_hybrid_block_size`): the smallest
@@ -321,32 +477,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gqa_bytes_count_replicated_heads_once_tp_exceeds_kv_heads() {
+    fn gqa_heads_split_up_to_the_head_count_and_repeat_beyond_it() {
         // Llama-3-8B: 32 layers, 8 KV heads of 128, bf16.
-        let tp8 = gqa_kv_bytes_per_token(32, 8, 128, 128, 2, 8);
-        assert_eq!(tp8, 131_072);
-        assert_eq!(gqa_kv_bytes_per_token(32, 8, 128, 128, 2, 1), tp8);
-        // TP16 stores 16 heads: every rank holds one.
-        assert_eq!(gqa_kv_bytes_per_token(32, 8, 128, 128, 2, 16), 2 * tp8);
+        let one_copy = gqa_kv_bytes_per_token(32, 8, 128, 128, 2);
+        assert_eq!(one_copy, 131_072);
+        let tp1 = gqa_placement(8, 1);
+        assert_eq!((tp1.shards, tp1.replicas), (1, 1));
+        let tp8 = gqa_placement(8, 8);
+        assert_eq!((tp8.shards, tp8.replicas), (8, 1));
+        // TP16 stores 16 heads: every head on two ranks.
+        let tp16 = gqa_placement(8, 16);
+        assert_eq!((tp16.shards, tp16.replicas), (8, 2));
+        let part = KvCachePart::per_token("gqa", one_copy).placed(tp16);
+        assert_eq!(part.bytes_per_entry, 2 * one_copy);
+        assert_eq!(part.one_copy_bytes_at(1), one_copy);
     }
 
     #[test]
-    fn a_layout_held_on_each_rank_scales_bytes_but_not_blocks_or_copies() {
-        let one_rank = KvCacheLayout::new()
-            .with_part(KvCachePart::per_token("mla", 576).padded_to(640))
-            .with_part(KvCachePart::per_request("state", 1000).with_copies(2))
-            .with_engine(EngineOverhead {
-                block_tokens: Some(64),
-                fixed_device_bytes: 4096,
-            });
-        let tp4 = one_rank.clone().held_on_each_rank(4);
-        assert_eq!(tp4.parts[0].bytes_per_entry, 4 * 576);
-        assert_eq!(tp4.parts[0].overhead.padded_bytes_per_entry, Some(4 * 640));
-        assert_eq!(tp4.parts[1].bytes_per_entry, 4 * 1000);
-        assert_eq!(tp4.parts[1].overhead.copies, Some(2));
-        assert_eq!(tp4.engine.block_tokens, Some(64));
-        assert_eq!(tp4.engine.fixed_device_bytes, 4 * 4096);
-        assert_eq!(one_rank.clone().held_on_each_rank(1), one_rank);
+    fn a_part_serializes_its_entry_stored_once_over_the_partition_and_per_gpu() {
+        // GLM-5.2's MLA latent on attention TP4: each rank holds the whole copy.
+        let mla = KvCachePart::per_token("mla", 576).replicated(4);
+        let json = serde_json::to_value(mla).unwrap();
+        assert_eq!(json["bytes_per_entry"], 4 * 576);
+        assert_eq!(json["one_copy_bytes_per_entry"], 576);
+        assert_eq!(json["per_gpu_bytes_per_entry"], 576.0);
+        // GQA heads split over TP16, each head on two ranks.
+        let gqa = KvCachePart::per_token("gqa", 1024).placed(gqa_placement(8, 16));
+        let json = serde_json::to_value(gqa).unwrap();
+        assert_eq!(json["bytes_per_entry"], 2 * 1024);
+        assert_eq!(json["one_copy_bytes_per_entry"], 1024);
+        assert_eq!(json["per_gpu_bytes_per_entry"], 128.0);
+        assert_eq!(json["placement"]["replicas"], 2);
+    }
+
+    #[test]
+    fn replication_scales_bytes_and_padding_but_sharding_does_not() {
+        let mla = KvCachePart::per_token("mla", 576)
+            .padded_to(640)
+            .replicated(4);
+        assert_eq!(mla.bytes_per_entry, 4 * 576);
+        assert_eq!(mla.overhead.padded_bytes_per_entry, Some(4 * 640));
+        assert_eq!(mla.one_copy_bytes_at(1), 576);
+        let state = KvCachePart::per_request("state", 1000)
+            .with_copies(2)
+            .sharded(4);
+        assert_eq!(state.bytes_per_entry, 1000);
+        assert_eq!(state.overhead.copies, Some(2));
+        assert_eq!(state.placement.ranks(), 4);
+        let layout = KvCacheLayout::new().with_part(mla).with_part(state);
+        assert!(layout.check_placement(4).is_ok());
+        assert!(layout.check_placement(2).is_err());
+        let unplaced = KvCacheLayout::new().with_part(KvCachePart::per_token("kv", 8));
+        assert!(unplaced.check_placement(1).is_ok());
+        assert!(unplaced.check_placement(4).is_err());
+    }
+
+    #[test]
+    fn one_copy_bytes_leave_out_replicas_and_engine_overhead() {
+        let context_tokens = 1001;
+        let mla = KvCachePart::per_token("mla", 576)
+            .padded_to(640)
+            .replicated(4);
+        assert_eq!(mla.one_copy_bytes_at(context_tokens), 1001 * 576);
+        let indexer = KvCachePart::compressed("indexer", 4, 132).replicated(4);
+        assert_eq!(indexer.one_copy_bytes_at(context_tokens), 251 * 132);
+        let swa = KvCachePart::sliding_window("swa", 128, 7).sharded(4);
+        assert_eq!(swa.one_copy_bytes_at(context_tokens), 128 * 7);
+        assert_eq!(swa.one_copy_bytes_at(100), 100 * 7);
+        let state = KvCachePart::per_request("state", 1000)
+            .with_copies(2)
+            .sharded(4);
+        assert_eq!(state.one_copy_bytes_at(context_tokens), 1000);
     }
 
     #[test]

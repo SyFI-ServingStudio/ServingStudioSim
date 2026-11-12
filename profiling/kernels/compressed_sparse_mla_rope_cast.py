@@ -28,10 +28,15 @@ before ``wq_b``. Outside the slot: the fused Q-pad/KV insert, the decode
 global top-k remap (``compute_global_topk_indices_and_lens``), and
 ``wo_a``/``wo_b``.
 
-``num_heads`` is the kernel's padded Q head count (64 or 128). TP4 on the
-64-head checkpoint leaves 16 live heads, padded to 64. The kernel runs, and
-writes output for, all padded heads, so the live count does not change the
-execution. ``query_context_pairs`` holds ``(query_len, context_len)`` per
+``num_heads`` is the Q head count the kernel runs. The mega kernel runs the
+padded count (64 or 128): TP4 on the 64-head checkpoint leaves 16 live heads,
+padded to 64, and the kernel computes and writes all padded heads, so the live
+count does not change its execution. Decode segments of at most
+``_SWAPAB_MAX_TOKENS`` (16) tokens on compressed layers with 16 or 32 live
+heads take the swap-AB kernel instead (``_swapab_decode_supported``,
+``nvidia/ops/swapab_decode_attn.py``): same inputs and output layout, but it
+puts the KV slots on the MMA's M side and runs only the live heads, so its
+rows carry the live count (16 or 32). ``query_context_pairs`` holds ``(query_len, context_len)`` per
 request, with context including the query. In decode mode every query token
 is one flattened row. ``max_model_len``, ``max_num_batched_tokens`` and
 ``prefill_chunk_size`` drive the prefill chunk planner, and decode ignores them.
@@ -81,7 +86,8 @@ class CompressedSparseMlaRopeCastArgs(KernelArgs):
         unit="tokens", doc="Most compressed keys the indexer selects for one query token."
     )
     num_heads: int = arg(
-        unit="heads", doc="Query heads the kernel runs, after padding the live heads."
+        unit="heads",
+        doc="Query heads the kernel runs: padded for the mega kernel, live for swap-AB.",
     )
     head_dim: int = arg(unit="elements", doc="Elements in each query head and latent key.")
     rope_dim: int = arg(unit="elements", doc="Trailing head elements rotated by RoPE.")
@@ -146,8 +152,11 @@ DOC = KernelDoc(
         "512, prefill_chunk_size 4, num_heads 64 or 128, compress_ratio 0, 1 or 2, "
         f"bf16 queries, an MXFP8 window cache ({MXFP8_RECORD_BYTES} B per token) and an "
         f"NVFP4 ({NVFP4_RECORD_BYTES} B) or MXFP8 compressed cache.",
-        "num_heads is the padded head count: the kernel computes every padded "
-        "head, so fewer live heads take the same time.",
+        "num_heads is the head count the kernel runs: the padded count (64 or "
+        "128) for flashmla_mega, which computes every padded head, and the live "
+        "count (16 or 32) for swapab_cutedsl.",
+        "swapab_cutedsl times decode only, on compressed layers (ratio 1 or 2), "
+        "at most 16 query rows: the steps vLLM routes to it.",
         "Decode takes at most 2048 query rows and 256 requests. The global top-k "
         "remap that precedes decode is outside the call; the runner passes "
         "precomputed cache slots.",
@@ -214,6 +223,39 @@ register(
                 "gathers included."
             ),
             url="https://github.com/deepseek-ai/FlashMLA",
+        ),
+    )
+)
+
+# The swap-AB kernel is CuTe DSL tcgen05 code: vLLM gates it on
+# is_device_capability_family(100) (flash_mla_mega_attn.py
+# _swapab_decode_supported) and a CUDA 13.2+ CuTe DSL (swapab_decode_supported).
+_SWAPAB_SUPPORT = BackendSupport(
+    compute=frozenset({DType.BF16}),
+    kv=frozenset({DType.FP8_E4M3}),
+    sm_targets=frozenset({"sm_100f"}),
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="swapab_cutedsl",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.compressed_sparse_mla_rope_cast",
+            function_name="profile_compressed_sparse_mla_rope_cast_swapab_cutedsl",
+        ),
+        table_name=KIND,
+        args_schema=CompressedSparseMlaRopeCastArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        supports=_SWAPAB_SUPPORT,
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's swap-AB CuTe DSL decode kernel for 16 or 32 live heads "
+                "(KV slots on the MMA M side, one thread-block cluster per token), "
+                "through the mega-attention layer's decode segment method."
+            ),
         ),
     )
 )

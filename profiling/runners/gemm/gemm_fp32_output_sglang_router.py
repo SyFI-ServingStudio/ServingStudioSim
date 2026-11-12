@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
@@ -11,20 +9,11 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "gemm_fp32_output:sglang_router_auto"
-# SGLang's own router dispatch, not a measured set: the dedicated
-# dsv3_router_gemm kernel serves only n in {256, 384} (python/sglang/srt/models/
-# deepseek_v2.py, MoEGate.forward); every other shape takes linear_bf16_fp32.
-_DEDICATED_N = frozenset({256, 384})
-_DEDICATED_MIN_SM = 90
-
-
-def _device_sm(torch: Any) -> int:
-    major, minor = torch.cuda.get_device_capability()
-    return major * 10 + minor
-
-
-def _max_router_gemm_tokens(sm: int) -> int:
-    return 4 if sm in (100, 103) else 16
+# SGLang's own router dispatch, not a measured set (python/sglang/srt/models/
+# deepseek_v2.py, MoEGate.forward): tiny_gemm_bf16 serves up to
+# tiny_router_gemm_max_tokens(...) rows; every other shape takes
+# linear_bf16_fp32. The threshold comes from SGLang's own helper so the runner
+# cannot disagree with the pinned checkout.
 
 
 def profile_gemm_fp32_output_sglang_router(
@@ -44,38 +33,24 @@ def profile_gemm_fp32_output_sglang_router(
 
     try:
         import torch
-
-        try:
-            # v0.5.23+: where DeepSeek-V4's compressor and router import it from.
-            from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
-        except ImportError:
-            from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+        from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
+        from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
+        from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires the SGLang environment") from exc
-
-    sm = _device_sm(torch)
 
     try:
         device = torch.device("cuda", torch.cuda.current_device())
         generator = torch.Generator(device=device).manual_seed(31)
         hidden = torch.randn((m, k), dtype=torch.bfloat16, device=device, generator=generator)
         weight = torch.randn((n, k), dtype=torch.bfloat16, device=device, generator=generator)
-        use_dedicated = (
-            m <= _max_router_gemm_tokens(sm)
-            and k % 1024 == 0
-            and n in _DEDICATED_N
-            and sm >= _DEDICATED_MIN_SM
+        tiny_max_tokens = tiny_router_gemm_max_tokens(
+            num_experts=n, hidden_size=k, weight_dtype=weight.dtype
         )
-        if use_dedicated:
-            # Only the dedicated router shapes need it; v0.5.23 no longer exports it from
-            # sglang.kernels.ops.gemm, so import it where it is used.
-            try:
-                from sglang.kernels.ops.gemm import dsv3_router_gemm
-            except ImportError as exc:
-                raise ProfilerNotImplemented(f"{_BACKEND}: dsv3_router_gemm is unavailable") from exc
+        if m <= tiny_max_tokens:
 
             def launch():
-                return dsv3_router_gemm(hidden, weight, out_dtype=torch.float32)
+                return tiny_gemm_bf16(hidden, weight, out_dtype=torch.float32)
 
         else:
 

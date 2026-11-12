@@ -101,11 +101,7 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
-    let balance = if num_partitions == 1 {
-        LoadBalance::Single
-    } else {
-        LoadBalance::RoundRobin { next: 0 }
-    };
+    let balance = LoadBalance::for_dp(num_partitions, config.dp_placement);
     let admission = ChunkedPrefillAdmission::with_decode_completion(
         (0..num_partitions)
             .map(|_| (PendingOrder::new(config.pending_order), ()))

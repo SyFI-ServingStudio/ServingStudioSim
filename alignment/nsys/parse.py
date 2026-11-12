@@ -220,25 +220,52 @@ def load_metrics(path: Path | None) -> dict[tuple[int, int], dict]:
     its own iterations, so several rows share one `iteration_index`. Keying on
     the rank as well keeps every rank's batch shape; a capture without rank
     provenance (`dp_rank` absent) is a single-EngineCore run and lands on rank 0.
+
+    These are the scheduled steps. A schema-5 DP dummy forward (`is_dummy`, no
+    index) is not one; `load_metrics_and_dummies` keeps those apart.
+    """
+    return load_metrics_and_dummies(path)[0]
+
+
+def load_metrics_and_dummies(
+    path: Path | None,
+) -> tuple[dict[tuple[int, int], dict], frozenset[tuple[int, int]]]:
+    """The scheduled-step rows (as `load_metrics`) and every DP dummy forward.
+
+    Dummies are `(dp_rank, forward_ordinal)`: a dummy forward schedules no
+    work, but it is the rank's part in a global step, and Check 1 needs it to
+    tell "this rank ran a dummy" from "this rank's step is missing".
     """
     if path is None:
-        return {}
+        return {}, frozenset()
     metrics: dict[tuple[int, int], dict] = {}
+    dummies: set[tuple[int, int]] = set()
     with Path(path).open() as fh:
         for line in fh:
             if not line.strip():
                 continue
             row = json.loads(line)
+            if row.get("is_dummy"):
+                key = (int(row.get("dp_rank", 0)), int(row["forward_ordinal"]))
+                if key in dummies:
+                    raise ValueError(
+                        f"duplicate dummy forward record for dp_rank {key[0]} forward {key[1]}"
+                    )
+                dummies.add(key)
+                continue
             iteration = row.get("iteration_index", row.get("iteration_num"))
             if iteration is None:
-                continue
+                raise ValueError(
+                    f"metrics record of dp_rank {row.get('dp_rank', 0)} is neither a scheduled "
+                    "step (no iteration_index) nor a dummy forward"
+                )
             key = (int(row.get("dp_rank", 0)), int(iteration))
             if key in metrics:
                 raise ValueError(
                     f"duplicate metrics record for dp_rank {key[0]} iteration {key[1]}"
                 )
             metrics[key] = row
-    return metrics
+    return metrics, frozenset(dummies)
 
 
 def fold_rank_metrics(rows: list[dict], iteration_index: int) -> dict:
@@ -277,7 +304,7 @@ def aggregate_metrics_by_iteration(rank_metrics: dict[tuple[int, int], dict]) ->
     alike — a single-EngineCore run, or a capture whose ranks never diverged.
     Under data parallelism they do diverge (a rank that runs a prefill chunk
     alone advances its counter while its peers run uncounted dummy steps), and
-    the wall-clock grouping in `align_ranges_into_steps` is what pairs the ranks
+    the step alignment in `align_ranges_into_steps` is what pairs the ranks
     there. This stays for the replica-level, timeline-free views.
     """
     grouped: dict[int, list[dict]] = defaultdict(list)
@@ -427,6 +454,70 @@ def window_rows_by_reference_rank(
     ]
 
 
+def window_rows_by_forward_ordinal(
+    parsed_rows: list[list],
+    iteration_start: int | None,
+    iteration_end: int | None,
+    dp_rank_by_device: dict[int, int],
+    forwards: ForwardIndex,
+) -> list[list]:
+    """Keep, on every DP rank, the global forwards the reference rank's window spans.
+
+    `parsed_rows` is `[iteration, phase, worker, start_ns, end_ns, global_tid]`.
+    The bounds are the reference rank's (lowest device id) iteration numbers,
+    as in `window_rows_by_reference_rank`; they are translated into the forward
+    ordinals those iterations ran, and every rank keeps its windows of forwards
+    in that range. An open bound stays open, so the default keeps everything.
+
+    A window with no metrics record (a 0-token step's `preprocess` scope) has
+    no ordinal. It is kept when its device's iteration number lies inside the
+    span of that device's kept windows, so the step alignment still sees -- and
+    classifies -- every window between the bounds.
+    """
+    if iteration_start is None and iteration_end is None:
+        return list(parsed_rows)
+    devices = sorted({row[2].device_id for row in parsed_rows})
+    if not devices:
+        return []
+    reference_device_id = devices[0]
+
+    def ordinal_of(row: list) -> int | None:
+        dp_rank = dp_rank_by_device.get(row[2].device_id)
+        if dp_rank is None:
+            raise ValueError(f"device {row[2].device_id} has no dp_rank to look up forwards by")
+        return forwards.ordinal_by_step.get((dp_rank, row[0]))
+
+    reference_ordinals = [
+        ordinal
+        for row in parsed_rows
+        if row[2].device_id == reference_device_id
+        and (iteration_start is None or row[0] >= iteration_start)
+        and (iteration_end is None or row[0] <= iteration_end)
+        and (ordinal := ordinal_of(row)) is not None
+    ]
+    if not reference_ordinals:
+        return []
+    low = min(reference_ordinals) if iteration_start is not None else None
+    high = max(reference_ordinals) if iteration_end is not None else None
+
+    kept = []
+    unrecorded = []
+    for row in parsed_rows:
+        ordinal = ordinal_of(row)
+        if ordinal is None:
+            unrecorded.append(row)
+        elif (low is None or ordinal >= low) and (high is None or ordinal <= high):
+            kept.append(row)
+    iterations_by_device: dict[int, list[int]] = defaultdict(list)
+    for row in kept:
+        iterations_by_device[row[2].device_id].append(row[0])
+    for row in unrecorded:
+        iterations = iterations_by_device.get(row[2].device_id)
+        if iterations and min(iterations) < row[0] < max(iterations):
+            kept.append(row)
+    return kept
+
+
 def load_ranges(
     con: sqlite3.Connection,
     workers_by_gtid: dict[int, Worker],
@@ -437,6 +528,8 @@ def load_ranges(
     default_stage: str = "all",
     *,
     shared_iteration_index: bool = False,
+    forwards: ForwardIndex | None = None,
+    dp_rank_by_device: dict[int, int] | None = None,
 ) -> list[RangeStats]:
     """Extract the NVTX iteration ranges of the requested iteration window.
 
@@ -447,16 +540,19 @@ def load_ranges(
     markers establish ownership. An unindexed vLLM draft may fill a same-thread
     gap between phases of one indexed iteration; it cannot establish one.
 
-    The window is an interval of the REFERENCE rank's iteration numbers, and the
-    independent DP ranks join it by measured time. TP peers with an explicitly
-    shared index use that index directly, including peers outside the reference
-    rank's CPU envelope. Applying the same numeric interval to independent DP
-    every rank looks equivalent and is not: a rank numbers its own scheduled
+    The window is an interval of the REFERENCE rank's iteration numbers. TP
+    peers with an explicitly shared index use that index directly, including
+    peers outside the reference rank's CPU envelope. Independent DP ranks
+    (schema-5 `forwards`) translate it into the global forwards the reference's
+    iterations ran, and every rank keeps its windows of those forwards
+    (`window_rows_by_forward_ordinal`). Applying the same numeric interval to
+    every DP rank looks equivalent and is not: a rank numbers its own scheduled
     steps, and in the GLM-5.2 DP8 capture the ranks that step together at
     t=15.67 s call it iteration 11, 7 and 6. Filtering each rank on its own
     number would then drop seven of the eight ranks from the first steps of the
-    window and leave a step that looks like one rank running alone — which is
-    what happened, and what this rule exists to prevent.
+    window and leave a step that looks like one rank running alone.
+    Otherwise peers join by measured time (`window_rows_by_reference_rank`); a
+    multi-rank DP capture without ordinals is then refused by the step join.
 
     `range_mode="forward"` keeps only the forward phase (the usual alignment
     target); "phases" keeps every phase; "envelope" merges an iteration's phases.
@@ -491,6 +587,10 @@ def load_ranges(
             if (iteration_start is None or row[0] >= iteration_start)
             and (iteration_end is None or row[0] <= iteration_end)
         ]
+    elif forwards and len(set((dp_rank_by_device or {}).values())) > 1:
+        windowed = window_rows_by_forward_ordinal(
+            parsed_rows, iteration_start, iteration_end, dp_rank_by_device or {}, forwards
+        )
     else:
         windowed = window_rows_by_reference_rank(parsed_rows, iteration_start, iteration_end)
     if range_mode == "forward":
@@ -739,20 +839,22 @@ def attribute_jit_stalls(
 def resolve_dp_rank_by_device(
     workers: dict[int, Worker],
     worker_ranks: dict[int, int],
-    tp_size: int,
+    replica_ranks: int,
 ) -> dict[int, int]:
     """CUDA device → data-parallel rank, joining nsys pids with the server log.
 
     nsys knows which pid ran on which device; vLLM's startup banner states which
-    pid holds which global rank. A replica lays its ranks out as
-    `global_rank = dp_rank * tp_size + tp_rank`, so the DP rank is the global
-    rank divided by the TP degree. With no banner (single-process capture) every
-    observed device belongs to rank 0.
+    pid holds which global rank. vLLM numbers ranks replica by replica:
+    `global_rank = dp_rank * replica_ranks + rank_in_replica`, where a replica
+    holds pp * pcp * tp ranks (`ParallelConfig.world_size`, and the DP offset
+    in `parallel_state`), so the DP rank is the global rank divided by
+    `replica_ranks`. With no banner (single-process capture) every observed
+    device belongs to rank 0.
     """
     if not worker_ranks:
         return {worker.device_id: 0 for worker in workers.values() if worker.device_id is not None}
-    if tp_size <= 0:
-        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    if replica_ranks <= 0:
+        raise ValueError(f"replica_ranks must be positive, got {replica_ranks}")
 
     dp_rank_by_device: dict[int, int] = {}
     for worker in workers.values():
@@ -764,7 +866,7 @@ def resolve_dp_rank_by_device(
                 f"nsys worker pid {worker.pid} (device {worker.device_id}) has no rank banner "
                 "in the server log; the capture and the log do not describe the same run"
             )
-        dp_rank = global_rank // tp_size
+        dp_rank = global_rank // replica_ranks
         existing = dp_rank_by_device.setdefault(worker.device_id, dp_rank)
         if existing != dp_rank:
             raise ValueError(f"device {worker.device_id} maps to DP ranks {existing} and {dp_rank}")
@@ -780,102 +882,105 @@ class DeviceStepWindow:
     start: int
     end: int
     items: list[RangeStats]
-    matchable: bool = True
 
 
 @dataclass
 class AlignedStep:
     """One logical serving step and each device's local iteration identity.
 
-    `iteration` is the reference device's index and remains the step's identity
-    downstream — a case index, a labeled sequence occurrence and an analyzer row
-    all address a step by it. `index_by_device` is the provenance that makes the
-    identity honest when independent scheduler counters diverge.
+    `iteration` is the step's identity downstream -- a case index, a labeled
+    sequence occurrence and an analyzer row all address a step by it. Behind
+    one scheduler (one device, or TP devices sharing an index) it is that
+    scheduler's iteration index. Across DP ranks it is the global
+    `forward_ordinal`, the only identity the ranks share; `index_by_device`
+    keeps each device's own iteration index as provenance, and
+    `dummy_dp_ranks` names the ranks that ran this forward as a DP dummy (they
+    have no window here).
     """
 
     iteration: int
     reference_device_id: int | None
     windows: list[DeviceStepWindow]
+    forward_ordinal: int | None = None
+    dummy_dp_ranks: list[int] = field(default_factory=list)
 
     @property
     def index_by_device(self) -> dict[int | None, int]:
         return {window.device_id: window.iteration for window in self.windows}
 
 
-def _device_step_windows(
-    ranges: list[RangeStats], *, use_kernel_time: bool
-) -> dict[int | None, list[DeviceStepWindow]]:
-    """Build each device's steps from the evidence used to match them.
+@dataclass
+class StepAlignment:
+    """The steps a capture's ranges form, and what the join left out.
 
-    Independent schedulers are paired by attributed GPU work, not asynchronous
-    host submission ranges. A step without a correlated kernel remains in the
-    reference timeline but is not eligible for a time-based match.
+    `rule` is `single_device`, `iteration_index` (TP devices behind one
+    scheduler) or `forward_ordinal` (DP ranks, schema-5 metrics).
+    `unpaired_by_device` counts TP peer windows whose phase inventory differs
+    from the reference's. `zero_token_windows_by_device` counts ordinal-mode
+    windows of 0-token steps: the scheduler handed the runner a step with
+    nothing to compute, the V1 runner still opened its `preprocess` scope, and
+    no forward ran, so there is no metrics record and no forward to join.
+    `incomplete_steps` counts ordinal-mode forwards dropped at the capture's
+    edges because a rank that did real work in them has no window there.
     """
+
+    steps: list[AlignedStep]
+    rule: str
+    unpaired_by_device: dict[int, int] = field(default_factory=dict)
+    zero_token_windows_by_device: dict[int, int] = field(default_factory=dict)
+    incomplete_steps: int = 0
+
+
+@dataclass(frozen=True)
+class ForwardIndex:
+    """Which global forward each DP rank ran, from schema-5 metrics.
+
+    `ordinal_by_step` maps every real record's `(dp_rank, iteration_index)` to
+    its `forward_ordinal`; `dummies` holds `(dp_rank, forward_ordinal)` of every
+    DP dummy forward. The k-th forward of every DP rank is one global step.
+    """
+
+    ordinal_by_step: dict[tuple[int, int], int]
+    dummies: frozenset[tuple[int, int]] = frozenset()
+
+    def __bool__(self) -> bool:
+        return bool(self.ordinal_by_step) or bool(self.dummies)
+
+
+def forward_index(
+    rank_metrics: dict[tuple[int, int], dict],
+    dummies: frozenset[tuple[int, int]] = frozenset(),
+) -> ForwardIndex:
+    """The forward identity of a capture's metrics (empty before schema 5)."""
+    return ForwardIndex(
+        ordinal_by_step={
+            key: int(row["forward_ordinal"])
+            for key, row in rank_metrics.items()
+            if row.get("forward_ordinal") is not None
+        },
+        dummies=dummies,
+    )
+
+
+def _device_step_windows(ranges: list[RangeStats]) -> dict[int | None, list[DeviceStepWindow]]:
+    """Group each device's ranges by its own iteration index."""
     grouped: dict[tuple[int | None, int], list[RangeStats]] = defaultdict(list)
     for item in ranges:
         grouped[(item.worker.device_id, item.iteration)].append(item)
     by_device: dict[int | None, list[DeviceStepWindow]] = defaultdict(list)
     for (device_id, iteration), items in grouped.items():
-        kernel_intervals = [interval for item in items for interval in item.intervals]
-        if use_kernel_time and kernel_intervals:
-            start = min(start for start, _ in kernel_intervals)
-            end = max(end for _, end in kernel_intervals)
-            matchable = True
-        else:
-            start = min(item.start for item in items)
-            end = max(item.end for item in items)
-            matchable = not use_kernel_time
         by_device[device_id].append(
             DeviceStepWindow(
                 device_id=device_id,
                 iteration=iteration,
-                start=start,
-                end=end,
+                start=min(item.start for item in items),
+                end=max(item.end for item in items),
                 items=sorted(items, key=lambda item: (item.start, item.phase)),
-                matchable=matchable,
             )
         )
     for windows in by_device.values():
         windows.sort(key=lambda window: (window.start, window.iteration))
     return by_device
-
-
-def _pair_by_overlap(
-    reference: list[DeviceStepWindow], peer: list[DeviceStepWindow]
-) -> tuple[dict[int, DeviceStepWindow], list[DeviceStepWindow]]:
-    """Match only mutual, unique best overlaps between two GPU timelines."""
-    matchable_reference = [window for window in reference if window.matchable]
-    matchable_peer = [window for window in peer if window.matchable]
-
-    def overlap(left: DeviceStepWindow, right: DeviceStepWindow) -> int:
-        return max(0, min(left.end, right.end) - max(left.start, right.start))
-
-    def unique_best(
-        window: DeviceStepWindow, candidates: list[DeviceStepWindow]
-    ) -> DeviceStepWindow | None:
-        scored = [(overlap(window, candidate), candidate) for candidate in candidates]
-        best_score = max((score for score, _ in scored), default=0)
-        if best_score <= 0:
-            return None
-        best = [candidate for score, candidate in scored if score == best_score]
-        return best[0] if len(best) == 1 else None
-
-    reference_best = {
-        window.iteration: unique_best(window, matchable_peer) for window in matchable_reference
-    }
-    peer_best = {
-        window.iteration: unique_best(window, matchable_reference) for window in matchable_peer
-    }
-    matched: dict[int, DeviceStepWindow] = {}
-    matched_peer_iterations: set[int] = set()
-    for reference_window in matchable_reference:
-        peer_window = reference_best[reference_window.iteration]
-        if peer_window is None or peer_best[peer_window.iteration] is not reference_window:
-            continue
-        matched[reference_window.iteration] = peer_window
-        matched_peer_iterations.add(peer_window.iteration)
-    unpaired = [window for window in peer if window.iteration not in matched_peer_iterations]
-    return matched, unpaired
 
 
 def _pair_by_iteration_index(
@@ -899,35 +1004,182 @@ def _pair_by_iteration_index(
     return matched, unpaired
 
 
+def _ran_no_forward(window: DeviceStepWindow) -> bool:
+    """A 0-token step's window: only the `preprocess` scope, or an envelope of
+    it with no kernel. Anything else ran a forward and must have a record."""
+    phases = {item.phase for item in window.items}
+    if phases <= {"preprocess"}:
+        return True
+    return phases == {"iteration_envelope"} and not any(
+        item.kernel_count for item in window.items
+    )
+
+
+def _align_by_forward_ordinal(
+    by_device: dict[int | None, list[DeviceStepWindow]],
+    reference_device_id: int | None,
+    dp_rank_by_device: dict[int, int],
+    forwards: ForwardIndex,
+) -> StepAlignment:
+    """One step per global forward that any rank ran with real work.
+
+    Steps are the union of the ordinals every device's windows ran, so a
+    forward the reference rank ran as a dummy while a peer did real work is a
+    step of its own rather than a dropped peer window. At each forward, every
+    device of every DP rank either has its window or its rank recorded a dummy
+    forward. A device without either did real work that the capture does not
+    show: at the capture's edges (before the device's first or after its last
+    window) that is the bounded capture cutting the step, and the step is
+    dropped and counted; between its windows it is lost evidence and an error.
+    """
+    windows_by_device: dict[int | None, dict[int, DeviceStepWindow]] = {}
+    zero_token: dict[int, int] = {}
+    for device_id, windows in by_device.items():
+        dp_rank = dp_rank_by_device.get(device_id) if device_id is not None else None
+        if dp_rank is None:
+            raise ValueError(f"device {device_id} has no dp_rank to look up forward ordinals by")
+        by_ordinal: dict[int, DeviceStepWindow] = {}
+        for window in windows:
+            ordinal = forwards.ordinal_by_step.get((dp_rank, window.iteration))
+            if ordinal is None:
+                if _ran_no_forward(window):
+                    zero_token[device_id] = zero_token.get(device_id, 0) + 1
+                    continue
+                raise ValueError(
+                    f"dp_rank {dp_rank} ran iteration {window.iteration} on device {device_id} "
+                    f"(phases {sorted({item.phase for item in window.items})}) but the metrics "
+                    "hold no forward_ordinal for it: a step that ran a forward must have a "
+                    "schema-5 record"
+                )
+            previous = by_ordinal.get(ordinal)
+            if previous is not None:
+                raise ValueError(
+                    f"device {device_id} ran iterations {previous.iteration} and "
+                    f"{window.iteration} as one forward {ordinal}"
+                )
+            by_ordinal[ordinal] = window
+        windows_by_device[device_id] = by_ordinal
+
+    spans = {
+        device_id: (min(by_ordinal), max(by_ordinal))
+        for device_id, by_ordinal in windows_by_device.items()
+        if by_ordinal
+    }
+    step_by_ordinal = {
+        (dp_rank, ordinal): iteration
+        for (dp_rank, iteration), ordinal in forwards.ordinal_by_step.items()
+    }
+    devices = sorted(windows_by_device, key=lambda device: (device is None, device))
+    steps: list[AlignedStep] = []
+    incomplete = 0
+    for ordinal in sorted({o for by_ordinal in windows_by_device.values() for o in by_ordinal}):
+        windows: list[DeviceStepWindow] = []
+        dummy_dp_ranks: set[int] = set()
+        cut = False
+        for device_id in devices:
+            dp_rank = dp_rank_by_device[device_id]
+            window = windows_by_device[device_id].get(ordinal)
+            if window is not None:
+                windows.append(window)
+                continue
+            if (dp_rank, ordinal) in forwards.dummies:
+                dummy_dp_ranks.add(dp_rank)
+                continue
+            span = spans.get(device_id)
+            if span is None or not span[0] <= ordinal <= span[1]:
+                cut = True
+                continue
+            iteration = step_by_ordinal.get((dp_rank, ordinal))
+            ran = (
+                f"its iteration {iteration}"
+                if iteration is not None
+                else "a forward its metrics do not record"
+            )
+            raise ValueError(
+                f"forward {ordinal}: device {device_id} (dp_rank {dp_rank}) ran {ran} but has "
+                f"no NVTX window for it, although it has windows for forwards {span[0]}..{span[1]} "
+                "around it; a peer's window inside the capture cannot be missing"
+            )
+        if cut:
+            incomplete += 1
+            continue
+        steps.append(
+            AlignedStep(
+                iteration=ordinal,
+                reference_device_id=reference_device_id,
+                windows=windows,
+                forward_ordinal=ordinal,
+                dummy_dp_ranks=sorted(dummy_dp_ranks),
+            )
+        )
+    return StepAlignment(
+        steps=steps,
+        rule="forward_ordinal",
+        zero_token_windows_by_device=dict(sorted(zero_token.items())),
+        incomplete_steps=incomplete,
+    )
+
+
 def _uses_shared_iteration_index(dp_rank_by_device: dict[int, int] | None) -> bool:
     return bool(dp_rank_by_device) and len(set(dp_rank_by_device.values())) == 1
 
 
 def align_ranges_into_steps(
-    ranges: list[RangeStats], dp_rank_by_device: dict[int, int] | None = None
-) -> tuple[list[AlignedStep], dict[int, int]]:
+    ranges: list[RangeStats],
+    dp_rank_by_device: dict[int, int] | None = None,
+    forwards: ForwardIndex | None = None,
+) -> StepAlignment:
     """Group device ranges into logical serving steps.
 
-    TP ranks behind one scheduler share an authoritative indexed marker.
-    Independent DP schedulers can diverge, so their steps join only on
-    unambiguous attributed-kernel overlap. Unmatched evidence remains explicit.
+    One device is its own step sequence. TP devices behind one scheduler share
+    an authoritative indexed marker and pair by it. Independent DP schedulers
+    number their own steps; they join by the global forward each step ran
+    (schema-5 `forward_ordinal`, `_align_by_forward_ordinal`). A multi-device
+    capture whose ranks cannot be joined that way -- no DP-rank mapping, or DP
+    ranks without ordinals -- is refused: measured time does not identify a
+    step across asynchronous schedulers.
     """
-    shared_iteration_index = _uses_shared_iteration_index(dp_rank_by_device)
-    by_device = _device_step_windows(ranges, use_kernel_time=not shared_iteration_index)
+    by_device = _device_step_windows(ranges)
     if not by_device:
-        return [], {}
+        return StepAlignment(steps=[], rule="single_device")
     reference_device_id = sorted(by_device, key=lambda device: (device is None, device))[0]
     reference = by_device[reference_device_id]
+
+    if len(by_device) == 1:
+        steps = [
+            AlignedStep(
+                iteration=window.iteration,
+                reference_device_id=reference_device_id,
+                windows=[window],
+            )
+            for window in reference
+        ]
+        steps.sort(key=lambda step: step.iteration)
+        return StepAlignment(steps=steps, rule="single_device")
+
+    if not _uses_shared_iteration_index(dp_rank_by_device):
+        if not dp_rank_by_device:
+            raise ValueError(
+                f"the capture has {len(by_device)} devices but no device-to-DP-rank mapping, so "
+                "tensor-parallel peers cannot be told from independent DP schedulers"
+            )
+        if not forwards:
+            raise ValueError(
+                f"the capture has {len(set(dp_rank_by_device.values()))} data-parallel ranks but "
+                "its metrics carry no forward_ordinal: it predates forward ordinals (schema 5, "
+                "vLLM reference patch 0019), so its ranks' steps cannot be joined; recapture it "
+                "with the current reference image (SGLang emits no ordinals yet)"
+            )
+        return _align_by_forward_ordinal(
+            by_device, reference_device_id, dp_rank_by_device, forwards
+        )
 
     joined: dict[int, list[DeviceStepWindow]] = {window.iteration: [window] for window in reference}
     unpaired_by_device: dict[int, int] = {}
     for device_id, windows in by_device.items():
         if device_id == reference_device_id:
             continue
-        if shared_iteration_index:
-            matched, unpaired = _pair_by_iteration_index(reference, windows)
-        else:
-            matched, unpaired = _pair_by_overlap(reference, windows)
+        matched, unpaired = _pair_by_iteration_index(reference, windows)
         for iteration, window in matched.items():
             joined[iteration].append(window)
         if unpaired:
@@ -947,7 +1199,9 @@ def align_ranges_into_steps(
         for window in reference
     ]
     steps.sort(key=lambda step: step.iteration)
-    return steps, unpaired_by_device
+    return StepAlignment(
+        steps=steps, rule="iteration_index", unpaired_by_device=unpaired_by_device
+    )
 
 
 def partition_kernel_tracks(kernel_events: list[KernelEvent]) -> list[list[KernelEvent]]:
@@ -1023,15 +1277,20 @@ def build_iteration_details(
     kernel_name_ids: dict[str, int],
     rank_metrics: dict[tuple[int, int], dict] | None = None,
     dp_rank_by_device: dict[int, int] | None = None,
+    *,
+    alignment: StepAlignment | None = None,
 ) -> list[dict]:
     """Serialize every owned kernel in launch order, grouped by logical step.
 
     Summary categories are convenient analyzer inputs, but this list is the
     lossless ground-truth artifact. Kernel names are never truncated here.
 
-    TP ranks join by exact indexed phase identity. Independent DP ranks join
-    only on unambiguous attributed-kernel overlap. Each range retains its own
-    `iteration_index`; missing or untrusted matches remain explicit.
+    Steps come from `align_ranges_into_steps`: TP ranks join by exact indexed
+    phase identity, DP ranks by forward ordinal (schema 5), and the step's
+    `iteration` is the global forward ordinal under DP. `alignment` passes a
+    join already made (with the capture's dummy forwards); without it the join
+    is made here from `rank_metrics`, which hold no dummies. Each range retains
+    its own `iteration_index`.
 
     `metrics` is the index-keyed replica aggregate, used only as the fallback for
     a capture with no per-rank rows; when those rows exist the step's shape is
@@ -1039,7 +1298,11 @@ def build_iteration_details(
     """
     rank_metrics = rank_metrics or {}
     dp_rank_by_device = dp_rank_by_device or {}
-    steps, _ = align_ranges_into_steps(ranges, dp_rank_by_device)
+    if alignment is None:
+        alignment = align_ranges_into_steps(
+            ranges, dp_rank_by_device, forward_index(rank_metrics)
+        )
+    steps = alignment.steps
     all_devices = sorted(
         {item.worker.device_id for item in ranges if item.worker.device_id is not None}
     )
@@ -1141,6 +1404,10 @@ def build_iteration_details(
                 "iteration_type": iteration_type,
                 "stage": items[0].stage,
                 "reference_device_id": step.reference_device_id,
+                # Under DP: the global forward this step is, and the ranks that
+                # ran it as a dummy forward (no window, no scheduled work).
+                "forward_ordinal": step.forward_ordinal,
+                "dummy_dp_ranks": step.dummy_dp_ranks,
                 "iteration_index_by_device": {
                     str(device): index
                     for device, index in sorted(index_by_device.items())
@@ -1449,6 +1716,7 @@ def parse_trace(
     worker_ranks: dict[int, int] | None = None,
     tp_size: int = 1,
     dp_rank_by_device: dict[int, int] | None = None,
+    replica_ranks: int | None = None,
 ) -> dict:
     """Top-level parse: nsys sqlite → per-device per-category busy time / iter.
 
@@ -1457,9 +1725,10 @@ def parse_trace(
     independently from one capture. `default_stage` tags ranges with no
     label/metrics stage (use "decode" for a pure-decode capture window).
 
-    `worker_ranks` (worker pid → global rank, from the server log) and `tp_size`
-    resolve which DP rank ran on which device. Without them the capture is read
-    as a single-rank run.
+    `worker_ranks` (worker pid → global rank, from the server log) and
+    `replica_ranks` (ranks per DP replica; `tp_size` when unset) resolve which
+    DP rank ran on which device. Without them the capture is read as a
+    single-rank run.
 
     `dp_rank_by_device` short-circuits that: an engine whose workers state their
     own device and rank has already answered the question, so its answer is used
@@ -1476,12 +1745,15 @@ def parse_trace(
     con = sqlite3.connect(str(sqlite_path))
     try:
         ensure_query_indexes(con)
-        rank_metrics = load_metrics(metrics_jsonl)
+        rank_metrics, dummy_forwards = load_metrics_and_dummies(metrics_jsonl)
+        forwards = forward_index(rank_metrics, dummy_forwards)
         metrics = aggregate_metrics_by_iteration(rank_metrics)
         string_ids = load_string_ids(con)
         workers = load_workers(con)
         if dp_rank_by_device is None:
-            dp_rank_by_device = resolve_dp_rank_by_device(workers, worker_ranks or {}, tp_size)
+            dp_rank_by_device = resolve_dp_rank_by_device(
+                workers, worker_ranks or {}, replica_ranks or tp_size
+            )
         else:
             captured_devices = {
                 worker.device_id for worker in workers.values() if worker.device_id is not None
@@ -1501,6 +1773,8 @@ def parse_trace(
             range_mode,
             default_stage,
             shared_iteration_index=_uses_shared_iteration_index(dp_rank_by_device),
+            forwards=forwards,
+            dp_rank_by_device=dp_rank_by_device,
         )
         kernel_rows = attach_kernels_by_correlation(con, string_ids, ranges)
         jit_module_loads = attribute_jit_stalls(con, string_ids, ranges)
@@ -1526,10 +1800,11 @@ def parse_trace(
             },
             "all": summarize_devices(phase_ranges, top_n),
         }
+    alignment = align_ranges_into_steps(ranges, dp_rank_by_device, forwards)
     iteration_details = build_iteration_details(
-        ranges, metrics, kernel_name_ids, rank_metrics, dp_rank_by_device
+        ranges, metrics, kernel_name_ids, rank_metrics, dp_rank_by_device, alignment=alignment
     )
-    aligned_steps, unpaired_by_device = align_ranges_into_steps(ranges, dp_rank_by_device)
+    aligned_steps = alignment.steps
     iterations = [step.iteration for step in aligned_steps]
     kernel_sequences, device_ids = build_device_kernel_sequences(iteration_details, kernel_names)
     return {
@@ -1540,18 +1815,20 @@ def parse_trace(
         # Record the authoritative join rule; downstream consumers cannot infer
         # scheduler ownership from the flattened ranges alone.
         "step_alignment": {
-            "rule": (
-                "iteration_index"
-                if _uses_shared_iteration_index(dp_rank_by_device)
-                else "kernel_time_overlap"
-            ),
+            "rule": alignment.rule,
             "reference_device_id": (
                 aligned_steps[0].reference_device_id if aligned_steps else None
             ),
             "steps": len(aligned_steps),
             "unpaired_steps_by_device": {
-                str(device): count for device, count in sorted(unpaired_by_device.items())
+                str(device): count
+                for device, count in sorted(alignment.unpaired_by_device.items())
             },
+            "zero_token_windows_by_device": {
+                str(device): count
+                for device, count in sorted(alignment.zero_token_windows_by_device.items())
+            },
+            "incomplete_steps": alignment.incomplete_steps,
         },
         "sqlite": str(sqlite_path),
         "iteration_start": iteration_start,
@@ -1571,6 +1848,7 @@ def parse_trace(
             str(device): rank for device, rank in sorted(dp_rank_by_device.items())
         },
         "tp_size": tp_size,
+        "replica_ranks": replica_ranks or tp_size,
         "kernel_sequences": kernel_sequences,
         "by_phase": by_phase,
         "by_stage": by_stage,
@@ -1612,6 +1890,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="tensor-parallel degree, used to fold global ranks into DP ranks",
+    )
+    parser.add_argument(
+        "--replica-ranks",
+        type=int,
+        default=None,
+        help="global ranks per DP replica (vLLM: tp * pp * pcp; default --tp-size)",
     )
     parser.add_argument("--output", type=Path, default=None, help="Write JSON here (else stdout)")
     parser.add_argument(
@@ -1687,6 +1971,7 @@ def main(argv: list[str] | None = None) -> int:
         top_n=args.top_n,
         worker_ranks=worker_ranks,
         tp_size=args.tp_size,
+        replica_ranks=args.replica_ranks,
     )
     if args.output:
         write_parsed(Path(args.output), result)

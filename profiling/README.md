@@ -57,6 +57,11 @@ This is why `KernelKind` strings must match exactly across the boundary (below).
   card. Passing the index across silently profiles GPU 0 instead: concurrent
   workers pile onto one card, and the idle check that cleared the allocated card
   never sees it. Resolution raises rather than falling back to the index.
+  The same UUIDs also go into the container's `CUDA_VISIBLE_DEVICES`, because a
+  rootless Podman inside a Slurm job ignores `--gpus` and exposes every job GPU.
+  Each worker reports the UUIDs it saw (`gpu_uuids` in its output), and a chunk
+  whose worker saw anything but the reserved cards fails and stores nothing
+  (`exec/local.py:worker_gpu_mismatch`).
 - The **backend's runtime libraries** — torch, FlashInfer, Triton, NCCL/NVSHMEM —
   available in the selected subprocess interpreter. These are imported **lazily
   inside the worker subprocess**, never in the simulator/main process.
@@ -76,7 +81,8 @@ registry entry names instead, for debugging against a local build. Those rows
 carry the same DB key as the image's, so compare them against the image before
 keeping them. The host setups follow.
 
-`vllm_env` on the host is the alignment checkout `alignment/profiler/vllm` (or
+`vllm_env` on the host is the materialized vLLM reference engine
+`reference_engines/vllm/src` (`just ref materialize vllm`, or
 `$VIBESIM_VLLM_FORK_ROOT`) and its own `.venv`, built as
 `alignment/profiler/README.md` describes. The worker drops inherited
 site-packages from `PYTHONPATH`, so the project Torch cannot shadow the venv's

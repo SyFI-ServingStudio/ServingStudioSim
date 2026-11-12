@@ -103,7 +103,7 @@ DOC = KernelDoc(
     ),
     caveats=(
         "The runner takes head_dim 256, quant_block_size 32 and FP8 tables, with "
-        "at most 24 local heads, 65,536 tokens and 200 million table rows.",
+        "at most 24 local heads, 65,536 tokens and 400 million table rows.",
         "Ids are uniform within each head's slice of the table; real n-gram "
         "hashes may hit some rows more often and cache better.",
         "TFLOPS is not computed.",

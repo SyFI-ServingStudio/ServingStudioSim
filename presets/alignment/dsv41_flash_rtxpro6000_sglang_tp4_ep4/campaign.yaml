@@ -400,6 +400,14 @@ cases:
       correct-draft histograms of the 2026-11-05 fixed-shape decode runs on this hardware (1506 verifies, mean
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -436,6 +444,14 @@ cases:
       correct-draft histograms of the 2026-11-05 fixed-shape decode runs on this hardware (1506 verifies, mean
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -477,6 +493,14 @@ cases:
       correct-draft histograms of the 2026-11-05 fixed-shape decode runs on this hardware (1506 verifies, mean
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -512,6 +536,14 @@ cases:
       correct-draft histograms of the 2026-11-05 fixed-shape decode runs on this hardware (1506 verifies, mean
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -548,6 +580,14 @@ cases:
       correct-draft histograms of the 2026-11-05 fixed-shape decode runs on this hardware (1506 verifies, mean
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -581,6 +621,14 @@ cases:
       correct-draft histograms of the 2026-11-05 fixed-shape decode runs on this hardware (1506 verifies, mean
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -615,6 +663,14 @@ cases:
       correct-draft histograms of the 2026-11-05 fixed-shape decode runs on this hardware (1506 verifies, mean
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -850,6 +906,14 @@ cases:
     derived_from: 'Conditional accepted-draft ratios from the 2026-11-05 fixed-shape decode runs (synthetic token-id
       prompts, optimistic); replace with this case''s workload_metrics pass (enwik9 text).'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -885,6 +949,14 @@ cases:
     derived_from: 'Conditional accepted-draft ratios from the 2026-11-05 fixed-shape decode runs (synthetic token-id
       prompts, optimistic); replace with this case''s workload_metrics pass (enwik9 text).'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -921,6 +993,14 @@ cases:
     derived_from: 'Conditional accepted-draft ratios from the 2026-11-05 fixed-shape decode runs (synthetic token-id
       prompts, optimistic); replace with this case''s workload_metrics pass (enwik9 text).'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -956,6 +1036,14 @@ cases:
     derived_from: 'Conditional accepted-draft ratios from the 2026-11-05 fixed-shape decode runs (synthetic token-id
       prompts, optimistic); replace with this case''s workload_metrics pass (enwik9 text).'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -994,6 +1082,14 @@ cases:
     derived_from: 'Conditional accepted-draft ratios from the 2026-11-05 fixed-shape decode runs (synthetic token-id
       prompts, optimistic); replace with this case''s workload_metrics pass (enwik9 text).'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -1029,6 +1125,14 @@ cases:
       correct-draft histograms of the 2026-11-05 fixed-shape decode runs on this hardware (1506 verifies, mean
       3.27 accepted). Synthetic token-id prompts, so optimistic; replace with this case''s workload_metrics pass.'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional
@@ -1063,6 +1167,14 @@ cases:
     derived_from: 'Conditional accepted-draft ratios from the 2026-11-05 fixed-shape decode runs (synthetic token-id
       prompts, optimistic); replace with this case''s workload_metrics pass (enwik9 text).'
     evidence: airbox-cost-calculator docs/clients/decycle/sim/kt_bench/results_sglang_4xpro6000/shapes.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p: [0.1853, 0.173287, 0.046502, 0.122195, 0.054457, 0.092268, 0.325991]
+    status: provisional
+    derived_from: 'One bucket for every output position: the 0..6-accepted distribution implied by this case''s
+      provisional speculative_acceptance chain, so simulations are unchanged. Replace with per-position buckets
+      from this case''s workload pass (calibration.buckets_from_metrics).'
   attn_gpu_memory_gb:
     value: 6.1476
     status: provisional

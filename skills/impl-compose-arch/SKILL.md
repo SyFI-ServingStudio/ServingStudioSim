@@ -69,11 +69,13 @@ backends/algorithms = different arch files (no in-file if/match polymorphism).
   `per_token` for GQA/MLA KV, `compressed(name, tokens_per_entry, …)` for a
   DSA indexer or compressed cache, `sliding_window` for SWA or a short-conv
   window, `per_request` for a GDN/KDA state or ring buffer.
-  - Bytes are summed over the part's layers **and every rank of one KV
-    partition** (one attention TP group). For GQA use `gqa_kv_bytes_per_token`,
-    which counts heads replicated when TP exceeds `num_kv_heads`. A state every
-    rank holds whole (MLA latent, recurrent state) is described for one rank
-    and finished with `.held_on_each_rank(attn_tp)`.
+  - Write each part's **one-copy** bytes (summed over its layers), then declare
+    how it sits on the partition's ranks: `.sharded(n)` when split (KDA/GQA
+    heads, PP stages), `.replicated(m)` when every rank holds it whole (MLA
+    latent, DSA indexer, MQA head; after `padded_to`), or for GQA
+    `gqa_kv_bytes_per_token(…)` plus `.placed(gqa_placement(num_kv_heads, attn_tp))`.
+    Every part must satisfy `shards × replicas == num_attn_shards()`; the build
+    rejects one that does not. Place each part of a hybrid on its own.
   - `bytes_per_entry` is the model's own state. Put what vLLM allocates on top
     in the overhead, never in `bytes_per_entry`: `.padded_to(…)` (padded head,
     mamba page, packed group page), `.with_copies(…)` (speculative blocks), and

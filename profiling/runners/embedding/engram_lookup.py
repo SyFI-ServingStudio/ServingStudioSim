@@ -52,9 +52,9 @@ _RESIDENCIES = ("host_uva", "device")
 _MAX_TOKENS = 65_536
 # (max_ngram - 1) * n_heads on V4.1-Flash; a rank never owns more columns.
 _MAX_LOCAL_HEADS = 24
-# 200M rows x 264 B = 49 GiB: above the TP1 slice of one V4.1-Flash layer
-# (384M rows would be TP1; its 94 GiB table is outside what a profiling job pins).
-_MAX_TABLE_ROWS = 200_000_000
+# 400M rows x 264 B = 98 GiB pinned: above the TP1 (DP-attention) tables of
+# V4.1-Flash, 384,006,168 / 384,016,682 rows (94 GiB) for layers 1 / 14.
+_MAX_TABLE_ROWS = 400_000_000
 # Distinct rows the timing pool spans (~1 GB of rows at 264 B), well past L2.
 _POOL_ROWS = 4 << 20
 _MAX_POOL = 4096
@@ -198,8 +198,14 @@ def build_id_pool(
     return (raw % size + lo).to(torch.int32)
 
 
-def _lookup_module(torch: Any, device: Any, views: tuple[Any, Any], local_heads: int, rows: int):
-    """The attributes ``ParallelEngramEmbedding.lookup`` reads, for rank 0's slice."""
+def _lookup_module(
+    torch: Any, device: Any, views: tuple[Any, Any], local_heads: int, rows: int, host: bool
+):
+    """The attributes ``ParallelEngramEmbedding.lookup`` reads, for rank 0's slice.
+
+    A host table is pinned with ordinary pages, as production's private
+    cpu_offload table (no THP, no DP-shared storage), so lookup sorts large
+    batches the same way."""
     return SimpleNamespace(
         part_n_hash_cols=local_heads,
         n_hash_cols=local_heads,
@@ -210,6 +216,9 @@ def _lookup_module(torch: Any, device: Any, views: tuple[Any, Any], local_heads:
         block_size=_QUANT_BLOCK,
         _num_sms=torch.cuda.get_device_properties(device).multi_processor_count,
         _storage=lambda: views,
+        _uses_small_host_pages=host,
+        peer_rows=0,
+        peer_ptrs=None,
     )
 
 
@@ -260,7 +269,9 @@ def profile_engram_lookup_vllm_triton(
     try:
         device = torch.device("cuda", torch.cuda.current_device())
         table = _get_table(torch, device, table_rows, residency)
-        module = _lookup_module(torch, device, table["views"], local_heads, table_rows)
+        module = _lookup_module(
+            torch, device, table["views"], local_heads, table_rows, residency == "host_uva"
+        )
         background = residency == "host_uva"
 
         def lookup(ids: Any, out: Any) -> None:

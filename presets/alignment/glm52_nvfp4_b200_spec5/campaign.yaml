@@ -5,6 +5,13 @@ description: GLM-5.2 NVFP4 with vLLM MTP spec-5 on B200, EP4/TP4/DP1. Cases 01-1
   chunk ceilings across them; cases 16-17 add high-concurrency mixed 8K-boundary and
   concurrent long-prefill coverage. This is a new alignment campaign, not a new golden
   for the accepted non-spec runs.
+# Speculative cases keep the case-wide chain only (see check's error text for
+# what that costs in request-weighted TPOT).
+acceptance_structure:
+  status: legacy_single_chain
+  reason: cases 11-12 borrow logs/20260830_1_glm52_diverse100_spec5, whose workload
+    metrics predate decode_request_progress.output_tokens_before; buckets were not
+    backfilled for the other cases either
 recorded_on:
   host: b200_raid
   gpu: NVIDIA B200

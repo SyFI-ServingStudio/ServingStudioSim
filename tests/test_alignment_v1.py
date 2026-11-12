@@ -1728,3 +1728,152 @@ def _replay_row(request_id: str, submit: float, complete: float) -> str:
             },
         }
     )
+
+
+def _forward_record(
+    dp_rank: int, ordinal: int, iteration: int | None, *, dummy: bool = False
+) -> dict:
+    """A schema-5 vLLM forward record; a dummy carries no index and no work."""
+    return {
+        "schema_version": 5,
+        "input_adapter": "vllm_text",
+        "iteration_index": iteration,
+        "forward_ordinal": ordinal,
+        "is_dummy": dummy,
+        "dp_rank": dp_rank,
+        "max_forwards_in_flight": 2,
+        "prefill_tokens": 0 if dummy else 8,
+        "decode_requests": 0,
+        "decode_tokens_scheduled": 0,
+        "prefill_chunk_pairs": [] if dummy else [[0, 8]],
+        "decode_kv_lens": [],
+        "decode_query_lens": [],
+        "decode_request_progress": [],
+        "observed_start_monotonic_ns": 100 * (ordinal + 1),
+        "observed_end_monotonic_ns": 100 * (ordinal + 1) + 50,
+        "observed_elapsed_ms": 0.00005,
+    }
+
+
+def _forward_log(*records: dict) -> str:
+    return "".join(
+        f"(EngineCore_DP{record['dp_rank']} pid=1{record['dp_rank']}) INFO "
+        f"VibeSimAlignmentIteration {json.dumps(record)}\n"
+        for record in records
+    )
+
+
+def test_forward_ordinal_records_keep_dummies_and_their_own_rank(tmp_path):
+    """Schema 5: every forward is a record; identity is (dp_rank, forward_ordinal)."""
+    records = [
+        _forward_record(0, 0, 11),
+        _forward_record(1, 0, 3),
+        _forward_record(0, 1, 12),
+        _forward_record(1, 1, None, dummy=True),
+    ]
+    server_log = tmp_path / "server.log"
+    server_log.write_text(_forward_log(*records))
+    output = tmp_path / "metrics.jsonl"
+
+    assert record_extraction.extract_metrics_jsonl(server_log, output, dp_size=2) == 4
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert rows == records
+
+
+@pytest.mark.parametrize(
+    ("records", "message"),
+    [
+        (
+            [_forward_record(1, 0, 3), _forward_record(1, 0, 4)],
+            "duplicate alignment forward record for dp_rank=1 forward_ordinal=0",
+        ),
+        (
+            [{**_forward_record(1, 0, None, dummy=True), "prefill_tokens": 8}],
+            "dummy forward record must carry no iteration index and no work",
+        ),
+        ([_forward_record(1, 0, None)], "real forward record needs an integer iteration_index"),
+        ([{**_forward_record(1, 0, 3), "forward_ordinal": -1}], "forward_ordinal >= 0"),
+        ([{**_forward_record(1, 0, 3), "dp_rank": 2}], "dp_rank 2 in a dp_size=2 capture"),
+        (
+            [{**_forward_record(1, 0, 3), "max_forwards_in_flight": 0}],
+            "max_forwards_in_flight >= 1",
+        ),
+        (
+            [_forward_record(1, 0, 3), _forward_record(1, 1, 3)],
+            "duplicate alignment iteration record for dp_rank=1 iteration=3",
+        ),
+    ],
+)
+def test_forward_ordinal_records_are_validated(tmp_path, records, message):
+    server_log = tmp_path / "server.log"
+    server_log.write_text(_forward_log(*records))
+
+    with pytest.raises(ValueError, match=message):
+        record_extraction.extract_metrics_jsonl(server_log, tmp_path / "m.jsonl", dp_size=2)
+
+
+def test_forward_ordinal_record_must_match_its_log_prefix(tmp_path):
+    record = _forward_record(1, 0, 3)
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        f"(EngineCore_DP0 pid=10) INFO VibeSimAlignmentIteration {json.dumps(record)}\n"
+    )
+
+    with pytest.raises(ValueError, match="claims dp_rank 1 but was logged by EngineCore_DP0"):
+        record_extraction.extract_metrics_jsonl(server_log, tmp_path / "m.jsonl", dp_size=2)
+
+
+@pytest.mark.parametrize(
+    ("records", "dp_size", "message"),
+    [
+        # Rank 1 never appears: its records are lost, not idle (idle records dummies).
+        ([_forward_record(0, 0, 0), _forward_record(0, 1, 1)], 2, r"no forward of dp_rank\(s\) \[1\]"),
+        (
+            [
+                _forward_record(0, 0, 0),
+                _forward_record(0, 1, 1),
+                _forward_record(0, 2, 2),
+                _forward_record(1, 0, 0),
+                _forward_record(1, 2, 1),
+            ],
+            2,
+            r"dp_rank 1 records forwards 0..2 but not \[1\]",
+        ),
+        (
+            [_forward_record(0, 0, 0), _forward_record(1, 5, 0)],
+            2,
+            "recorded forwards do not overlap",
+        ),
+        (
+            [_forward_record(0, 0, 0), _forward_record(0, 1, None, dummy=True)],
+            1,
+            "dp_size=1 capture records a DP dummy forward",
+        ),
+    ],
+)
+def test_forward_ordinal_records_must_cover_every_rank(tmp_path, records, dp_size, message):
+    server_log = tmp_path / "server.log"
+    server_log.write_text(_forward_log(*records))
+
+    with pytest.raises(ValueError, match=message):
+        record_extraction.extract_metrics_jsonl(
+            server_log, tmp_path / "m.jsonl", dp_size=dp_size
+        )
+
+
+def test_forward_ordinal_ranks_may_start_at_different_forwards(tmp_path):
+    """Ragged ends are legal (the measurement log starts at a byte offset); the
+    runs only have to be unbroken and to share forwards."""
+    records = [
+        _forward_record(0, 0, 0),
+        _forward_record(0, 1, 1),
+        _forward_record(1, 1, None, dummy=True),
+        _forward_record(1, 2, 0),
+        _forward_record(0, 2, None, dummy=True),
+    ]
+    server_log = tmp_path / "server.log"
+    server_log.write_text(_forward_log(*records))
+
+    assert record_extraction.extract_metrics_jsonl(
+        server_log, tmp_path / "m.jsonl", dp_size=2
+    ) == 5

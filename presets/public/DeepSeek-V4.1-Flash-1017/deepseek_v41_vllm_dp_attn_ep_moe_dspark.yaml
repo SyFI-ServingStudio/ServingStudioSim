@@ -1,0 +1,17 @@
+# vLLM DeepSeek-V4.1-Flash-1017 with its DSpark proposer drafting 5 tokens, on
+# four B200s: DP4 attention (TP1 per rank) and EP4 experts over the same ranks. As the alignment pack
+# presets/alignment/dsv41_flash_b200_dspark ran it (--max-model-len 131072).
+checkpoint: deepseek-ai/DeepSeek-V4.1-Flash-1017
+gpu: NVIDIA B200
+arch:
+  type: deepseek_v41_vllm_dp_attn_ep_moe_dspark
+  fp8: true
+  max_model_len: 131072
+  draft_tokens: 5
+  routing: ${routing}
+  token_corpus_file: ${token_corpus_file}
+compound:
+  workload:
+    diverse_100:
+      routing: corpus
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9c64b393b4d5769ffb88d5d74a1f67f6985dea4f/deepseek_v41_flash/vllm_dspark_k5/diverse_100/capture/20261106/manifest.json

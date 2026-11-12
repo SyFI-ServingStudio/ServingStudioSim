@@ -414,8 +414,10 @@ pub fn build_dflash2(
         // separate checkpoint, so it adds none of MTP's *target-side* state.
         // What it does add is its own six GQA layers, which vLLM allocates out
         // of the same pool -- see `draft_kv_bytes_per_token`.
+        // The draft's KV heads are split over its TP ranks, one copy in all.
         kv_cache_layout: kv_cache_layout(ep_size, Glm52MtpMode::Off).with_part(
-            KvCachePart::per_token("dflash2_draft", draft_kv_bytes_per_token),
+            KvCachePart::per_token("dflash2_draft", draft_kv_bytes_per_token)
+                .sharded(u32::from(draft.context_kv.raw_cfg.tp_size)),
         ),
         cost_flat: Vec::new(),
         n_slots: 0,

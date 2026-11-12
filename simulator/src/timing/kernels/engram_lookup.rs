@@ -33,8 +33,9 @@ const HEAD_DIM: u32 = 256;
 const QUANT_BLOCK_SIZE: u32 = 32;
 /// `(max_ngram - 1) * n_heads` on V4.1-Flash; a rank never owns more columns.
 const MAX_LOCAL_HEADS: u32 = 24;
-/// The runners' largest pinned table: SGLang's shared host table holds a whole
-/// layer (384M rows, about 101 GiB); vLLM's per-rank slices stay under 200M.
+/// The runners' largest pinned table (400M rows, about 98 GiB): above the TP1
+/// (DP-attention) tables of V4.1-Flash and SGLang's shared host table, both
+/// about 384M rows per layer; vLLM's per-rank slices stay under 200M.
 const MAX_TABLE_ROWS: u64 = 400_000_000;
 /// `vllm_triton`: host_uva / device. `sglang_triton`: SGLang's shared host table
 /// on 4 KiB or huge shmem pages, or device.
@@ -50,7 +51,8 @@ pub struct EngramLookupKernelConfig {
     pub head_dim: u32,
     pub quant_block_size: u32,
     /// Rows of this rank's table slice (`part_num_embeddings`; 96,000,564 on
-    /// V4.1-Flash TP4 rank 0). Exact identity: sets the gather's TLB footprint.
+    /// V4.1-Flash TP4 rank 0, the whole 384,006,168-row layer-1 table at TP1).
+    /// Exact identity: sets the gather's TLB footprint.
     pub table_rows: u64,
     /// `host_uva` (pinned host, half-SM grid) or `device` (HBM, full grid).
     pub residency: String,

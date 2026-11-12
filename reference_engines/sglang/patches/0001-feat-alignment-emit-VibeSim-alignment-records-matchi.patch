@@ -1,0 +1,908 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kan Zhu <kanzhu@cs.washington.edu>
+Date: Tue, 11 Aug 2026 07:05:49 +0000
+Subject: [PATCH] feat(alignment): emit VibeSim alignment records, matching the
+ vLLM fork
+
+The alignment report compares a measured serving run against a VibeSim
+simulation of the same workload. It already reads four record kinds from an
+instrumented vLLM; this teaches SGLang to emit the same four, in the same
+schema, down to the field names -- one analyzer, two engines, no per-engine
+special cases beyond the new `input_adapter` tag.
+
+* `Iteration` (v2), from `Scheduler.run_batch` + `process_batch_result`: the
+  per-forward batch geometry a simulator has to reproduce -- `(prefix, extend)`
+  pairs for an extend batch, context lengths for a decode batch -- plus a
+  scheduler-side cadence that does not need a profiler attached.
+* `RequestTiming` (v2), beside each `set_completion_time()`: TTFT split into
+  queue wait and first-schedule-to-first-token, the decode span, and TPOT.
+* `ApiRequestTiming` (v3), from `TokenizerManager` on finish: the frontend span
+  the client waits on, which the scheduler never sees.
+* `ExpertLoad` (v2): builder only for now, not yet wired to EPLB.
+
+SGLang turned out to be most of the way there already, which shaped the work
+more than anything else:
+
+* `ScheduleBatch.forward_iter` already is a dispatch-order iteration index, so
+  unlike the vLLM fork there was no field to add -- only a geometry snapshot
+  hung beside it.
+* `ReqTimeStats` is already split into `APIServerReqTimeStats` and
+  `SchedulerReqTimeStats`, which is exactly the two-clock-domain split the vLLM
+  fork had to build. Each record stays inside one domain and the two join by
+  rid, so neither engine's numbers depend on cross-process clock calibration.
+
+Two details worth keeping in mind when reading it:
+
+* The geometry is snapshotted at dispatch, not at result-processing time: the
+  decode path advances `seq_lens` during the forward, and in overlap mode the
+  next batch is dispatched before the previous result is processed. That is
+  also why it hangs off the batch rather than the scheduler.
+* `iteration_profile_method` names spans `sglang_iteration(N): <stage>` to match
+  the vLLM fork's `vllm_iteration(N)`, but it can only decorate methods where
+  `forward_iter` is already assigned. `run_batch` assigns it, so the forward
+  keeps SGLang's own `scheduler.run_batch` span and the iteration record's
+  `observed_start/end_monotonic_ns` is what windows it on a timeline.
+
+All off behind `SGLANG_ENABLE_VIBESIM_ALIGNMENT` (default false): the iteration
+record is one log line per forward pass.
+
+The record arithmetic is pure functions over plain numbers, unit tested with no
+GPU, scheduler, or server (11 cases). They cover the derived properties -- the
+TTFT parts summing to the whole, the API segments tiling their span -- and the
+negative branches that would otherwise fail silently: a zero-token request
+dropped from the pairs, a one-token request reporting null TPOT rather than
+zero, and an out-of-order or unstamped timestamp producing no row at all.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ python/sglang/srt/environ.py                  |  12 +
+ python/sglang/srt/managers/schedule_batch.py  |   6 +
+ python/sglang/srt/managers/scheduler.py       |  18 +
+ .../batch_result_processor.py                 |  26 ++
+ .../sglang/srt/managers/tokenizer_manager.py  |  33 ++
+ .../srt/observability/vibesim_alignment.py    | 406 ++++++++++++++++++
+ .../observability/test_vibesim_alignment.py   | 188 ++++++++
+ 7 files changed, 689 insertions(+)
+ create mode 100644 python/sglang/srt/observability/vibesim_alignment.py
+ create mode 100644 test/registered/unit/observability/test_vibesim_alignment.py
+
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index db7d4f9c89437eecff4075a357d7e2eb80e4bba2..7e4f385702190ea11d71a6dc0449af8d1e299db9 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -364,6 +364,18 @@ class Envs:
+     SGLANG_JIT_LOG_LEVEL = EnvStr("WARNING")
+     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
+ 
++    # VibeSim alignment records. Off in production: the iteration record is one
++    # log line per forward pass, which is only wanted while a run is being
++    # compared against a simulation of the same workload.
++    SGLANG_ENABLE_VIBESIM_ALIGNMENT = EnvBool(False)
++    # Bulk dumps, each to its own JSONL file. Separate from the flag above
++    # because a single iteration's token IDs or per-layer expert histograms are
++    # far too large for the log. Unset = off.
++    SGLANG_VIBESIM_TOKEN_TRACE_PATH = EnvStr(None)
++    SGLANG_VIBESIM_TOKEN_TRACE_ITERS = EnvStr("")
++    SGLANG_VIBESIM_ROUTING_TRACE_PATH = EnvStr(None)
++    SGLANG_VIBESIM_ROUTING_TRACE_ITERS = EnvStr("")
++
+     # ===================================================================
+     # IPC, broadcasters, and ports
+     # ===================================================================
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index e3cd978e4c4fda36363ecd13673979d5ef116d51..3e3b290059cf4f4dbd1b4c1f6f89808b7adfc055 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -145,6 +145,7 @@ from sglang.srt.observability.req_time_stats import (
+     DPControllerReqTimeStats,
+     SchedulerReqTimeStats,
+ )
++from sglang.srt.observability.vibesim_alignment import IterationGeometry
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.sampling.sampling_mask import SamplingMaskRows
+ from sglang.srt.sampling.sampling_params import SamplingParams
+@@ -1961,6 +1962,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+     forward_iter: Optional[int] = None
+     launch_ts: Optional[float] = None
+     after_idle_gap: bool = False
++    # Batch shape snapshotted at dispatch for the VibeSim alignment iteration
++    # record; None whenever that instrumentation is off. Held on the batch
++    # rather than the scheduler because overlap mode dispatches the next batch
++    # before the previous one's result is processed.
++    vibesim_geometry: Optional[IterationGeometry] = None
+ 
+     # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
+     # Batched arguments to model runner
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 375901393a5344aee8ca44eaa220f73f96e84eb6..d2a9b93f62578e78e55dfedfc4fa524cafc42113 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -355,6 +355,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
+     UocrSchedulerRuntime,
+ )
+ from sglang.srt.multimodal.transport.receive_budget import ReceiveFeatureBudget
++from sglang.srt.observability import vibesim_alignment
+ from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
+ from sglang.srt.observability.req_time_stats import (
+     flush_trace_batch,
+@@ -5044,6 +5045,15 @@ class Scheduler(
+         """Run a batch."""
+         self._on_step_launch(batch)
+ 
++        if vibesim_alignment.is_enabled():
++            # Before the forward: the decode path advances seq_lens in place.
++            batch.vibesim_geometry = vibesim_alignment.capture_iteration_geometry(
++                launch_monotonic_ns=time.monotonic_ns(),
++                is_extend=batch.forward_mode.is_extend(),
++                prefix_lens=batch.prefix_lens,
++                extend_lens=batch.extend_lens,
++                seq_lens=batch.seq_lens,
++            )
+         if self.forward_sleep_time is not None:
+             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
+             time.sleep(self.forward_sleep_time)
+@@ -5501,6 +5511,7 @@ class Scheduler(
+             batch_result.logits_output.next_token_logits = None
+ 
+     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_BATCH_RESULT)
++    @vibesim_alignment.iteration_profile_method("process_batch_result")
+     def process_batch_result(
+         self,
+         batch: ScheduleBatch,
+@@ -5545,6 +5556,13 @@ class Scheduler(
+         if self.enable_fpm:
+             self.metrics_reporter._emit_forward_pass_metrics(batch, result)
+ 
++        if batch.vibesim_geometry is not None:
++            vibesim_alignment.emit_iteration_from_geometry(
++                iteration_index=batch.forward_iter,
++                geometry=batch.vibesim_geometry,
++                observed_end_monotonic_ns=time.monotonic_ns(),
++            )
++
+         self._maybe_clear_mm_inputs(batch)
+         self.maybe_send_health_check_signal()
+         self.metrics_reporter.update_device_timer()
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index 05ef7ac8e2c7e7b035b243b78d7db2bfbf76cc45..7279b5f022eb0ce6ae27771b740dc26346d82ead 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -36,6 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import (
+     get_server_return_hidden_states_mode,
+ )
+ from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
++from sglang.srt.observability import vibesim_alignment
+ from sglang.srt.runtime_context import (
+     get_disagg,
+     get_exec,
+@@ -129,6 +130,26 @@ def _record_token_values(
+     values.extend(row if num_visible == len(row) else row[:num_visible])
+ 
+ 
++def _emit_vibesim_request_timing(req: Req) -> None:
++    """Report one finished request's scheduler-side latency split.
++
++    Called beside every `set_completion_time()` rather than from inside it: the
++    stats object holds the timestamps but not the request id, and the id is what
++    joins this row to the API server's own record for the same request.
++    """
++    if not vibesim_alignment.is_enabled():
++        return
++    stats = req.time_stats
++    vibesim_alignment.emit_request_timing_record(
++        request_id=req.rid,
++        queued_monotonic=stats.wait_queue_entry_time,
++        scheduled_monotonic=stats.forward_entry_time,
++        first_token_monotonic=stats.prefill_finished_time,
++        last_token_monotonic=stats.completion_time,
++        num_output_tokens=len(req.output_ids),
++    )
++
++
+ @dataclass(kw_only=True, slots=True, frozen=True)
+ class SchedulerBatchResultProcessor:
+     is_generation: bool
+@@ -479,6 +500,7 @@ class SchedulerBatchResultProcessor:
+                             )
+                         )
+                         req.time_stats.set_completion_time()
++                        _emit_vibesim_request_timing(req)
+                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                         kv_ops.append(
+                             partial(checkpoint_kv_cache, req, self.tree_cache)
+@@ -571,6 +593,7 @@ class SchedulerBatchResultProcessor:
+                     req.update_finish_state(0)
+                     self.request_retirer.release(req, checkpoint=False)
+                     req.time_stats.set_completion_time()
++                    _emit_vibesim_request_timing(req)
+                     continue
+ 
+                 req.embedding = self._convert_embedding_for_response(
+@@ -589,6 +612,7 @@ class SchedulerBatchResultProcessor:
+                     if req.finished():
+                         self.request_retirer.release(req, checkpoint=True)
+                         req.time_stats.set_completion_time()
++                        _emit_vibesim_request_timing(req)
+                     else:
+                         checkpoint_kv_cache(req, self.tree_cache)
+                 else:
+@@ -1487,6 +1511,7 @@ class SchedulerBatchResultProcessor:
+             self._prepare_kv_cache_release(req)
+             self.request_retirer.release(req, checkpoint=False)
+         req.time_stats.set_completion_time()
++        _emit_vibesim_request_timing(req)
+ 
+     def _handle_finish_state_updated_req(
+         self,
+@@ -1575,6 +1600,7 @@ class SchedulerBatchResultProcessor:
+                 self.request_retirer.release(req, checkpoint=checkpoint)
+ 
+             req.time_stats.set_completion_time()
++            _emit_vibesim_request_timing(req)
+ 
+         self._maybe_collect_customized_info(i, req, logits_output, num_new_tokens)
+ 
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index ac489e32f34395d01d7516c61cd21ba3978d7171..ddb0b11191692bffc71bfd95ffdbd067232b1397 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -150,6 +150,7 @@ from sglang.srt.multimodal.mm_utils import has_valid_data
+ from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+ from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+ from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
++from sglang.srt.observability import vibesim_alignment
+ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+ from sglang.srt.observability.metrics_collector import (
+     STAT_LOGGER_ROLE_TOKENIZER,
+@@ -2970,6 +2971,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                     ts=first_output_time, span_attrs=span_attrs
+                 )
+                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
++                self._maybe_emit_vibesim_api_timing(rid, state, recv_obj, i)
+ 
+                 if get_spec().speculative_algorithm:
+                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
+@@ -3354,6 +3356,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 ret.append(None)
+         return ret
+ 
++    def _maybe_emit_vibesim_api_timing(
++        self, rid: str, state, recv_obj, index: int
++    ) -> None:
++        """Report the API-server span for one finished request.
++
++        The scheduler emits its own record for the same rid. Keeping the two
++        separate is the point: they are stamped in different processes, so this
++        one never subtracts a scheduler timestamp, and the report stacks them by
++        rid instead of by clock.
++        """
++        if not vibesim_alignment.is_enabled():
++            return
++        stats = state.time_stats
++        completion_tokens = (
++            recv_obj.completion_tokens[index]
++            if not isinstance(recv_obj, BatchEmbeddingOutput)
++            else 0
++        )
++        vibesim_alignment.emit_api_request_timing_record(
++            request_id=rid,
++            created_monotonic=stats.created_time,
++            tokenize_finish_monotonic=stats.tokenize_finish_time,
++            dispatch_monotonic=stats.api_server_dispatch_time,
++            dispatch_finish_monotonic=stats.api_server_dispatch_finish_time,
++            first_token_monotonic=stats.first_token_time,
++            last_token_monotonic=stats.last_time,
++            finished_monotonic=stats.finished_time,
++            response_sent_monotonic=stats.response_sent_to_client_time,
++            output_tokens=completion_tokens,
++        )
++
+     def _calculate_spec_decoding_metrics(
+         self,
+         meta_info: Dict[str, Any],
+diff --git a/python/sglang/srt/observability/vibesim_alignment.py b/python/sglang/srt/observability/vibesim_alignment.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..27335e5e6cc779e8ccfe9b92f1a509383b4fe3ff
+--- /dev/null
++++ b/python/sglang/srt/observability/vibesim_alignment.py
+@@ -0,0 +1,406 @@
++# Copyright 2023-2024 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""VibeSim alignment records, emitted in the same schema the vLLM fork emits.
++
++The alignment report compares a measured serving run against a VibeSim
++simulation of the same workload. It reads four record kinds, each one JSON
++object on a `VibeSimAlignment<Kind> {...}` log line:
++
++* `Iteration` (v2) -- per forward pass: the batch geometry the simulator has to
++  reproduce, plus a scheduler-side cadence that does not depend on any profiler
++  being attached.
++* `RequestTiming` (v2) -- per finished request, scheduler-side: TTFT split into
++  queue wait and first-schedule-to-first-token, decode span, and TPOT.
++* `ApiRequestTiming` (v3) -- per finished request, API-server-side: the frontend
++  span the client actually waits on, which the scheduler never sees.
++* `ExpertLoad` (v2) -- per EPLB rebalance: routed load per logical expert.
++
++**The schema is vLLM's**, deliberately, down to the field names: one analyzer
++reads both engines, and a field that means something slightly different under
++one of them would be worse than a field that is absent. Where SGLang has no
++equivalent the field is omitted rather than filled with a lookalike, and
++`input_adapter` says which engine produced the row.
++
++Two structural differences from the vLLM fork are worth knowing:
++
++* SGLang already carries `ScheduleBatch.forward_iter`, so there is no need to
++  add a dispatch-order index -- that field *is* vLLM's
++  `alignment_iteration_index`, and the NVTX ranges key off the same value.
++* SGLang's `ReqTimeStats` is already split by process (`APIServerReqTimeStats`
++  vs `SchedulerReqTimeStats`) and calibrates the two clocks against each other.
++  The vLLM fork instead refuses to subtract across domains. Both records here
++  stay within one domain anyway, so the two engines' numbers stay comparable
++  without relying on that calibration being exact.
++
++Every builder below is a pure function over plain numbers so the arithmetic is
++testable without a GPU, a scheduler, or a server.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++from functools import wraps
++from typing import Any, Optional, Sequence
++
++import msgspec
++
++from sglang.srt.environ import envs
++from sglang.srt.utils.nvtx_utils import NVTX_SCHEDULER_ENABLED, profile_range
++
++logger = logging.getLogger(__name__)
++
++
++def is_enabled() -> bool:
++    return envs.SGLANG_ENABLE_VIBESIM_ALIGNMENT.get()
++
++
++class IterationGeometry(msgspec.Struct, frozen=True, omit_defaults=True):
++    """A batch's shape, snapshotted before the forward pass mutates it.
++
++    Taken at dispatch rather than at result-processing time because the decode
++    path advances `seq_lens` during the forward: read afterwards, every context
++    length would be one token too long, and in overlap mode the next batch may
++    already be in flight.
++    """
++
++    launch_monotonic_ns: int = 0
++    prefill_chunk_pairs: list[list[int]] = []
++    decode_kv_lens: list[int] = []
++
++
++def capture_iteration_geometry(
++    *,
++    launch_monotonic_ns: int,
++    is_extend: bool,
++    prefix_lens: Optional[Sequence[int]],
++    extend_lens: Optional[Sequence[int]],
++    seq_lens: Optional[Sequence[int]],
++) -> IterationGeometry:
++    """Snapshot the axes attention cost depends on, for one batch.
++
++    An extend batch contributes `(prefix, extend)` pairs and no decode lengths;
++    a decode batch contributes context lengths and no pairs. SGLang keeps the
++    two modes in separate batches, so a batch is one or the other -- unlike
++    vLLM, where a single step can carry both and the record has to hold both
++    lists at once. The record shape is vLLM's either way, so a reader does not
++    need to know which engine produced it.
++    """
++    if is_extend:
++        if prefix_lens is None or extend_lens is None:
++            return IterationGeometry(launch_monotonic_ns=launch_monotonic_ns)
++        pairs = [
++            [int(prefix), int(extend)]
++            for prefix, extend in zip(prefix_lens, extend_lens)
++            if int(extend) > 0
++        ]
++        return IterationGeometry(
++            launch_monotonic_ns=launch_monotonic_ns, prefill_chunk_pairs=pairs
++        )
++
++    if seq_lens is None:
++        return IterationGeometry(launch_monotonic_ns=launch_monotonic_ns)
++    return IterationGeometry(
++        launch_monotonic_ns=launch_monotonic_ns,
++        decode_kv_lens=[int(length) for length in seq_lens],
++    )
++
++
++#: Names the engine that produced a row. The analyzer keys per-engine quirks off
++#: this rather than guessing from which fields happen to be present.
++INPUT_ADAPTER = "sglang_text"
++
++ITERATION_SCHEMA_VERSION = 2
++REQUEST_TIMING_SCHEMA_VERSION = 2
++EXPERT_LOAD_SCHEMA_VERSION = 2
++API_REQUEST_TIMING_SCHEMA_VERSION = 3
++
++_ITERATION_RECORD_NAME = "VibeSimAlignmentIteration"
++_REQUEST_TIMING_RECORD_NAME = "VibeSimAlignmentRequestTiming"
++_API_REQUEST_TIMING_RECORD_NAME = "VibeSimAlignmentApiRequestTiming"
++_EXPERT_LOAD_RECORD_NAME = "VibeSimAlignmentExpertLoad"
++
++
++def _emit(record_name: str, record: dict[str, Any]) -> None:
++    logger.info("%s %s", record_name, json.dumps(record, separators=(",", ":")))
++
++
++def iteration_profile_method(stage: str):
++    """Name a span `sglang_iteration(N): <stage>`, mirroring the vLLM fork.
++
++    The point of putting the index in the name is that an nsys range then joins
++    to that iteration's records with no timestamp matching, which is what makes
++    a measured GPU timeline comparable to a simulated one span by span.
++
++    Only applicable where `batch.forward_iter` is already assigned. It is not,
++    on entry to `run_batch` -- that method assigns it -- so the forward keeps
++    SGLang's own `scheduler.run_batch` span, and the iteration record's
++    `observed_start/end_monotonic_ns` is what windows the forward on a timeline.
++    """
++
++    def decorator(func):
++        @wraps(func)
++        def wrapper(self, batch, *args: Any, **kwargs: Any):
++            if not is_enabled():
++                return func(self, batch, *args, **kwargs)
++            with profile_range(
++                f"sglang_iteration({batch.forward_iter}): {stage}",
++                nvtx_enabled=NVTX_SCHEDULER_ENABLED,
++            ):
++                return func(self, batch, *args, **kwargs)
++
++        return wrapper
++
++    return decorator
++
++
++# ── iteration ────────────────────────────────────────────────────────────────
++
++
++def build_iteration_record(
++    *,
++    iteration_index: Optional[int],
++    observed_start_monotonic_ns: int,
++    observed_end_monotonic_ns: int,
++    prefill_chunk_pairs: Sequence[Sequence[int]],
++    decode_kv_lens: Sequence[int],
++) -> dict[str, Any]:
++    """Describe one forward pass by the geometry a simulator has to reproduce.
++
++    `prefill_chunk_pairs` is `[already_computed, appended_this_step]` per
++    prefill-carrying request -- SGLang's `(prefix_lens[i], extend_lens[i])`, and
++    vLLM's `(num_computed_tokens, num_scheduled_tokens)`. The pair matters
++    rather than the sum because attention cost depends on both the query length
++    and the context it attends over.
++
++    `decode_kv_lens` is the context length of each single-token request, which
++    is the other axis of that same attention cost.
++    """
++    prefill_pairs = [
++        [int(prefix), int(extend)] for prefix, extend in prefill_chunk_pairs
++    ]
++    decode_lens = [int(length) for length in decode_kv_lens]
++    elapsed_ms = (observed_end_monotonic_ns - observed_start_monotonic_ns) / 1e6
++    return {
++        "schema_version": ITERATION_SCHEMA_VERSION,
++        "input_adapter": INPUT_ADAPTER,
++        "iteration_index": iteration_index,
++        "observed_start_monotonic_ns": int(observed_start_monotonic_ns),
++        "observed_end_monotonic_ns": int(observed_end_monotonic_ns),
++        "observed_elapsed_ms": elapsed_ms,
++        "prefill_tokens": sum(pair[1] for pair in prefill_pairs),
++        "decode_requests": len(decode_lens),
++        # One scheduled token per decode request; speculative drafts are counted
++        # by the verify step that admits them, not here.
++        "decode_tokens_scheduled": len(decode_lens),
++        "prefill_chunk_pairs": prefill_pairs,
++        "decode_kv_lens": decode_lens,
++    }
++
++
++def emit_iteration_record(**kwargs: Any) -> None:
++    _emit(_ITERATION_RECORD_NAME, build_iteration_record(**kwargs))
++
++
++def emit_iteration_from_geometry(
++    *,
++    iteration_index: Optional[int],
++    geometry: Optional[IterationGeometry],
++    observed_end_monotonic_ns: int,
++) -> None:
++    """Close the record opened by `capture_iteration_geometry` at dispatch.
++
++    A batch with no geometry was dispatched while the flag was off, so it has no
++    start timestamp either and is skipped rather than reported with a zero one.
++    """
++    if geometry is None:
++        return
++    emit_iteration_record(
++        iteration_index=iteration_index,
++        observed_start_monotonic_ns=geometry.launch_monotonic_ns,
++        observed_end_monotonic_ns=observed_end_monotonic_ns,
++        prefill_chunk_pairs=geometry.prefill_chunk_pairs,
++        decode_kv_lens=geometry.decode_kv_lens,
++    )
++
++
++# ── request timing, scheduler side ───────────────────────────────────────────
++
++
++def build_request_timing_record(
++    *,
++    request_id: str,
++    queued_monotonic: float,
++    scheduled_monotonic: float,
++    first_token_monotonic: float,
++    last_token_monotonic: float,
++    num_output_tokens: int,
++) -> Optional[dict[str, Any]]:
++    """Split a finished request's scheduler-side latency.
++
++    Returns `None` -- rather than a record full of negative or zero durations --
++    when a timestamp is missing or the four are out of order. A request that was
++    aborted, or finished during a phase that never stamped its boundary, has no
++    meaningful split, and a partial row would quietly skew the aggregate.
++    """
++    boundaries = (
++        queued_monotonic,
++        scheduled_monotonic,
++        first_token_monotonic,
++        last_token_monotonic,
++    )
++    if any(boundary <= 0.0 for boundary in boundaries) or num_output_tokens <= 0:
++        return None
++    if (
++        not queued_monotonic
++        <= scheduled_monotonic
++        <= first_token_monotonic
++        <= (last_token_monotonic)
++    ):
++        return None
++
++    decode_ms = (last_token_monotonic - first_token_monotonic) * 1000.0
++    return {
++        "schema_version": REQUEST_TIMING_SCHEMA_VERSION,
++        "input_adapter": INPUT_ADAPTER,
++        "engine_request_id": request_id,
++        "engine_core_ttft_ms": (first_token_monotonic - queued_monotonic) * 1000.0,
++        "engine_queue_wait_ms": (scheduled_monotonic - queued_monotonic) * 1000.0,
++        "engine_first_schedule_to_first_token_ms": (
++            first_token_monotonic - scheduled_monotonic
++        )
++        * 1000.0,
++        "engine_core_decode_ms": decode_ms,
++        "num_output_tokens": int(num_output_tokens),
++        # A one-token request has no inter-token interval, so it contributes no
++        # TPOT sample. JSON null keeps that distinct from a measured zero.
++        "engine_core_tpot_ms": (
++            decode_ms / (num_output_tokens - 1) if num_output_tokens > 1 else None
++        ),
++    }
++
++
++def emit_request_timing_record(**kwargs: Any) -> None:
++    record = build_request_timing_record(**kwargs)
++    if record is not None:
++        _emit(_REQUEST_TIMING_RECORD_NAME, record)
++
++
++# ── request timing, API server side ──────────────────────────────────────────
++
++
++def build_api_request_timing_record(
++    *,
++    request_id: str,
++    created_monotonic: float,
++    tokenize_finish_monotonic: float,
++    dispatch_monotonic: float,
++    dispatch_finish_monotonic: float,
++    first_token_monotonic: float,
++    last_token_monotonic: float,
++    finished_monotonic: float,
++    response_sent_monotonic: float,
++    output_tokens: int,
++) -> Optional[dict[str, Any]]:
++    """Split the API-server span the client waits on, ahead of the scheduler.
++
++    Every subtraction here is between two API-process timestamps. SGLang does
++    calibrate its API and scheduler clocks against each other, but this record
++    does not lean on that: it reports one domain, and the scheduler-side
++    `RequestTiming` record reports the other, exactly as the vLLM fork does.
++    """
++    boundaries = (
++        created_monotonic,
++        tokenize_finish_monotonic,
++        dispatch_monotonic,
++        dispatch_finish_monotonic,
++        first_token_monotonic,
++        last_token_monotonic,
++        finished_monotonic,
++    )
++    if any(boundary <= 0.0 for boundary in boundaries):
++        return None
++    if not created_monotonic <= first_token_monotonic <= last_token_monotonic:
++        return None
++
++    record = {
++        "schema_version": API_REQUEST_TIMING_SCHEMA_VERSION,
++        "input_adapter": INPUT_ADAPTER,
++        "api_request_id": request_id,
++        "output_tokens": int(output_tokens),
++        # Tokenization is the frontend work vLLM calls "prepare"; naming it the
++        # same keeps the two engines' waterfalls stackable.
++        "api_frontend_prepare_ms": (tokenize_finish_monotonic - created_monotonic)
++        * 1000.0,
++        "api_stream_activation_ms": (dispatch_monotonic - tokenize_finish_monotonic)
++        * 1000.0,
++        "api_add_request_ms": (dispatch_finish_monotonic - dispatch_monotonic) * 1000.0,
++        "api_first_output_wait_ms": (first_token_monotonic - dispatch_finish_monotonic)
++        * 1000.0,
++        "api_token_output_receive_span_ms": (
++            last_token_monotonic - first_token_monotonic
++        )
++        * 1000.0,
++        "api_terminal_tail_ms": (finished_monotonic - last_token_monotonic) * 1000.0,
++        "api_e2e_ms": (finished_monotonic - created_monotonic) * 1000.0,
++    }
++    # Only the streaming path stamps the moment the last chunk left the server;
++    # the non-streaming path has no such boundary, so the field is absent rather
++    # than folded into the tail.
++    if response_sent_monotonic > 0.0:
++        record["api_response_sent_ms"] = (
++            response_sent_monotonic - finished_monotonic
++        ) * 1000.0
++    return record
++
++
++def emit_api_request_timing_record(**kwargs: Any) -> None:
++    record = build_api_request_timing_record(**kwargs)
++    if record is not None:
++        _emit(_API_REQUEST_TIMING_RECORD_NAME, record)
++
++
++# ── expert load ──────────────────────────────────────────────────────────────
++
++
++def build_expert_load_record(
++    *,
++    model: str,
++    eplb_step: int,
++    expert_parallel_size: int,
++    experts_per_token: int,
++    logical_expert_counts: Sequence[Sequence[int]],
++) -> dict[str, Any]:
++    """Routed load per *logical* expert, per layer.
++
++    Logical rather than physical: the physical placement is what EPLB is about
++    to change, so a physical histogram is only meaningful next to the mapping
++    that produced it. The simulator reasons about logical experts.
++    """
++    return {
++        "schema_version": EXPERT_LOAD_SCHEMA_VERSION,
++        "input_adapter": INPUT_ADAPTER,
++        "model": model,
++        "eplb_step": int(eplb_step),
++        "expert_parallel_size": int(expert_parallel_size),
++        "experts_per_token": int(experts_per_token),
++        "logical_expert_counts": [
++            [int(count) for count in layer_counts]
++            for layer_counts in logical_expert_counts
++        ],
++    }
++
++
++def emit_expert_load_record(**kwargs: Any) -> None:
++    _emit(_EXPERT_LOAD_RECORD_NAME, build_expert_load_record(**kwargs))
+diff --git a/test/registered/unit/observability/test_vibesim_alignment.py b/test/registered/unit/observability/test_vibesim_alignment.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9de8459198ca5d34cb87116abf5310ad1d999e4
+--- /dev/null
++++ b/test/registered/unit/observability/test_vibesim_alignment.py
+@@ -0,0 +1,188 @@
++"""Unit tests for the VibeSim alignment record builders.
++
++These records are the contract the alignment report reads, and it reads the
++same one from the vLLM fork, so the field names and the guard behaviour are
++pinned here rather than left to a live run to discover.
++"""
++
++import unittest
++
++from sglang.srt.observability.vibesim_alignment import (
++    API_REQUEST_TIMING_SCHEMA_VERSION,
++    INPUT_ADAPTER,
++    ITERATION_SCHEMA_VERSION,
++    REQUEST_TIMING_SCHEMA_VERSION,
++    build_api_request_timing_record,
++    build_expert_load_record,
++    build_iteration_record,
++    build_request_timing_record,
++    capture_iteration_geometry,
++)
++from sglang.test.ci.ci_register import register_cpu_ci
++
++# Pure arithmetic over plain numbers: no GPU, no scheduler, no server.
++register_cpu_ci(est_time=5, suite="base-c-test-cpu")
++
++
++class TestIterationRecord(unittest.TestCase):
++    def test_extend_batch_keeps_the_prefix_and_extend_split(self):
++        geometry = capture_iteration_geometry(
++            launch_monotonic_ns=1_000,
++            is_extend=True,
++            prefix_lens=[0, 4096],
++            extend_lens=[512, 128],
++            seq_lens=[512, 4224],
++        )
++
++        # The pair is what attention cost depends on; the sum would lose the
++        # distinction between a fresh 512-token prefill and a 128-token chunk
++        # appended onto 4096 tokens of cached context.
++        self.assertEqual(geometry.prefill_chunk_pairs, [[0, 512], [4096, 128]])
++        # An extend batch reports no decode lengths even though seq_lens exists.
++        self.assertEqual(geometry.decode_kv_lens, [])
++
++    def test_extend_batch_drops_requests_scheduled_zero_tokens(self):
++        geometry = capture_iteration_geometry(
++            launch_monotonic_ns=0,
++            is_extend=True,
++            prefix_lens=[0, 100, 200],
++            extend_lens=[16, 0, 32],
++            seq_lens=None,
++        )
++
++        self.assertEqual(geometry.prefill_chunk_pairs, [[0, 16], [200, 32]])
++
++    def test_decode_batch_reports_context_lengths_only(self):
++        geometry = capture_iteration_geometry(
++            launch_monotonic_ns=0,
++            is_extend=False,
++            prefix_lens=None,
++            extend_lens=None,
++            seq_lens=[128, 4096],
++        )
++
++        self.assertEqual(geometry.prefill_chunk_pairs, [])
++        self.assertEqual(geometry.decode_kv_lens, [128, 4096])
++
++    def test_record_totals_are_derived_not_passed_in(self):
++        record = build_iteration_record(
++            iteration_index=42,
++            observed_start_monotonic_ns=1_000_000,
++            observed_end_monotonic_ns=4_000_000,
++            prefill_chunk_pairs=[[0, 512], [4096, 128]],
++            decode_kv_lens=[7, 9, 11],
++        )
++
++        self.assertEqual(record["schema_version"], ITERATION_SCHEMA_VERSION)
++        self.assertEqual(record["input_adapter"], INPUT_ADAPTER)
++        self.assertEqual(record["iteration_index"], 42)
++        self.assertEqual(record["prefill_tokens"], 640)
++        self.assertEqual(record["decode_requests"], 3)
++        self.assertEqual(record["decode_tokens_scheduled"], 3)
++        self.assertAlmostEqual(record["observed_elapsed_ms"], 3.0)
++
++
++class TestRequestTimingRecord(unittest.TestCase):
++    def _record(self, **overrides):
++        arguments = dict(
++            request_id="rid-1",
++            queued_monotonic=100.0,
++            scheduled_monotonic=100.010,
++            first_token_monotonic=100.025,
++            last_token_monotonic=100.225,
++            num_output_tokens=21,
++        )
++        arguments.update(overrides)
++        return build_request_timing_record(**arguments)
++
++    def test_ttft_splits_into_queue_wait_and_first_schedule_to_first_token(self):
++        record = self._record()
++
++        self.assertEqual(record["schema_version"], REQUEST_TIMING_SCHEMA_VERSION)
++        self.assertAlmostEqual(record["engine_queue_wait_ms"], 10.0)
++        self.assertAlmostEqual(record["engine_first_schedule_to_first_token_ms"], 15.0)
++        # The two parts have to add back up to the whole.
++        self.assertAlmostEqual(record["engine_core_ttft_ms"], 25.0)
++        self.assertAlmostEqual(record["engine_core_decode_ms"], 200.0)
++        self.assertAlmostEqual(record["engine_core_tpot_ms"], 10.0)
++
++    def test_single_token_request_has_no_tpot_sample(self):
++        record = self._record(num_output_tokens=1)
++
++        # Null, not zero: there is no inter-token interval to have measured.
++        self.assertIsNone(record["engine_core_tpot_ms"])
++
++    def test_missing_or_reordered_timestamps_produce_no_record(self):
++        # A request aborted before it was scheduled never stamped a boundary.
++        self.assertIsNone(self._record(scheduled_monotonic=0.0))
++        self.assertIsNone(self._record(num_output_tokens=0))
++        # First token cannot precede the schedule that produced it.
++        self.assertIsNone(self._record(first_token_monotonic=100.005))
++
++
++class TestApiRequestTimingRecord(unittest.TestCase):
++    def _record(self, **overrides):
++        arguments = dict(
++            request_id="rid-1",
++            created_monotonic=100.0,
++            tokenize_finish_monotonic=100.003,
++            dispatch_monotonic=100.005,
++            dispatch_finish_monotonic=100.007,
++            first_token_monotonic=100.020,
++            last_token_monotonic=100.220,
++            finished_monotonic=100.221,
++            response_sent_monotonic=100.222,
++            output_tokens=32,
++        )
++        arguments.update(overrides)
++        return build_api_request_timing_record(**arguments)
++
++    def test_frontend_span_decomposes_into_adjacent_segments(self):
++        record = self._record()
++
++        self.assertEqual(record["schema_version"], API_REQUEST_TIMING_SCHEMA_VERSION)
++        self.assertAlmostEqual(record["api_frontend_prepare_ms"], 3.0)
++        self.assertAlmostEqual(record["api_stream_activation_ms"], 2.0)
++        self.assertAlmostEqual(record["api_add_request_ms"], 2.0)
++        self.assertAlmostEqual(record["api_first_output_wait_ms"], 13.0)
++        self.assertAlmostEqual(record["api_token_output_receive_span_ms"], 200.0)
++        self.assertAlmostEqual(record["api_terminal_tail_ms"], 1.0)
++        self.assertAlmostEqual(record["api_e2e_ms"], 221.0)
++        # The segments up to the first token must tile that whole span.
++        self.assertAlmostEqual(
++            record["api_frontend_prepare_ms"]
++            + record["api_stream_activation_ms"]
++            + record["api_add_request_ms"]
++            + record["api_first_output_wait_ms"],
++            20.0,
++        )
++
++    def test_non_streaming_request_omits_the_response_sent_segment(self):
++        record = self._record(response_sent_monotonic=0.0)
++
++        # Absent rather than zero: the non-streaming path never stamps it, and a
++        # zero would read as "sent instantly".
++        self.assertNotIn("api_response_sent_ms", record)
++
++    def test_incomplete_timestamps_produce_no_record(self):
++        self.assertIsNone(self._record(dispatch_monotonic=0.0))
++        self.assertIsNone(self._record(first_token_monotonic=99.0))
++
++
++class TestExpertLoadRecord(unittest.TestCase):
++    def test_counts_are_kept_per_layer(self):
++        record = build_expert_load_record(
++            model="deepseek-ai/DeepSeek-V3",
++            eplb_step=7,
++            expert_parallel_size=8,
++            experts_per_token=8,
++            logical_expert_counts=[[1, 2, 3], [4, 5, 6]],
++        )
++
++        self.assertEqual(record["input_adapter"], INPUT_ADAPTER)
++        self.assertEqual(record["logical_expert_counts"], [[1, 2, 3], [4, 5, 6]])
++        self.assertEqual(record["experts_per_token"], 8)
++
++
++if __name__ == "__main__":
++    unittest.main()

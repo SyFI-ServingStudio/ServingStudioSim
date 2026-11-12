@@ -152,6 +152,8 @@ _FP4_ARCHS = frozenset(
 _SPECULATIVE_ARCHS = frozenset(
     {
         "deepseek_v41_sglang_dspark",
+        "deepseek_v41_vllm_dspark",
+        "deepseek_v41_vllm_dp_attn_ep_moe_dspark",
         "glm52_vllm_nvfp4_dsa_moe_speculative",
         "glm53_vllm_nvfp4_dsa_moe_dflash2",
         "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative",
@@ -163,6 +165,8 @@ _SPECULATIVE_ARCHS = frozenset(
 #: depth must resolve to what the simulator ran, not another arch's default.
 _DEFAULT_DRAFT_TOKENS = {
     "deepseek_v41_sglang_dspark": 6,
+    "deepseek_v41_vllm_dspark": 5,
+    "deepseek_v41_vllm_dp_attn_ep_moe_dspark": 5,
     "glm52_vllm_nvfp4_dsa_moe_speculative": 5,
     "glm53_vllm_nvfp4_dsa_moe_dflash2": 7,
     "qwen4_exp_vllm_nvfp4_gdn_qsa_moe_speculative": 3,

@@ -48,9 +48,11 @@ Capacity/topology methods are:
 `SlidingWindow { window_tokens }`, `PerRequest`), its `bytes_per_entry`, whether
 a prefix hit can resume from it (`prefix_reusable`), and what vLLM allocates on
 top (`PartOverhead`: padded entry bytes, extra copies). `EngineOverhead` holds
-the pool-wide terms: a large engine block and fixed device bytes. Use
-`gqa_kv_bytes_per_token` for GQA layers; it counts the heads replicated when TP
-exceeds `num_kv_heads`.
+the pool-wide terms: a large engine block and fixed device bytes. Each part
+declares its one-copy bytes and a `RankPlacement` over the partition's ranks
+(`.sharded(n)` / `.replicated(m)`, or `.placed(gqa_placement(heads, tp))` for
+GQA after `gqa_kv_bytes_per_token`), so a report can give the model's intrinsic
+size beside the per-GPU size and the replication factor.
 
 The worker resolves the layout into KV units against the partition budget
 `attn_kv_bytes_per_gpu × num_attn_shards` (L5 `KvAccounting`); a layout of one

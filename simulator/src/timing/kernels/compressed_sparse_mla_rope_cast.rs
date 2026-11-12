@@ -31,6 +31,16 @@
 //!   `get_prefill_chunk_plan` workspace budget. Chunks can hold more than
 //!   `prefill_chunk_size` short requests.
 //!
+//! Decode at 16 or 32 heads is vLLM's swap-AB kernel (backend
+//! `swapab_cutedsl`, fork `nvidia/ops/swapab_decode_attn.py`), which
+//! `_forward_decode_mega` takes instead of the mega kernel for decode segments
+//! of at most `_SWAPAB_MAX_TOKENS` rows on compressed layers with 16 or 32
+//! live heads (`flash_mla_mega_attn.py` `_swapab_decode_supported`). It runs
+//! only the live heads, so `num_heads` is the live count there. Each row is one
+//! thread-block cluster of [`swapab_tiles`] CTAs (64-slot SWA tiles, 128-slot
+//! compressed tiles; tiles past a row's length exit early), so at <= 16 rows
+//! the launch is one wave and its time follows the longest row.
+//!
 //! Measured B200 behaviour behind the axes: at 2048 prefill tokens (ratio 2),
 //! mean keys 240 -> 640 moves time 116 -> 183 us. The gather alone costs about
 //! 80 us for 100000 rows (ratio 1). Decode steps at every 148 rows (148 SMs).
@@ -59,6 +69,32 @@ const MAX_REQUESTS: u32 = 256;
 const MAX_DECODE_ROWS: u32 = 2048;
 /// SMs on the only supported GPU (NVIDIA B200); the decode wave width at 64 heads.
 const B200_SMS: u32 = 148;
+/// `_SWAPAB_MAX_TOKENS` (fork `flash_mla_mega_attn.py`): the most decode rows
+/// the swap-AB kernel takes.
+pub const SWAPAB_MAX_TOKENS: u32 = 16;
+/// KV slots per swap-AB CTA: SWA tiles (`_SWA_ROWS`) and compressed tiles
+/// (`_TILE`), and the portable cluster bound on a row's tiles (`_MAX_CLUSTER`).
+const SWAPAB_SWA_ROWS: u32 = 64;
+const SWAPAB_EXTRA_ROWS: u32 = 128;
+const SWAPAB_MAX_CLUSTER: u32 = 8;
+
+/// CTAs in one swap-AB row's cluster (`swapab_decode_supported`).
+pub fn swapab_tiles(window_size: u32, index_topk: u32) -> u32 {
+    window_size.div_ceil(SWAPAB_SWA_ROWS) + index_topk.div_ceil(SWAPAB_EXTRA_ROWS)
+}
+
+/// Whether vLLM gives a layer's small decode steps to the swap-AB kernel:
+/// a compressed layer with 16 or 32 live heads whose tiles fit one cluster
+/// (`_swapab_decode_supported` + `swapab_decode_supported`).
+pub fn swapab_layer(
+    compress_ratio: u32,
+    live_heads: u32,
+    window_size: u32,
+    index_topk: u32,
+) -> bool {
+    let tiles = swapab_tiles(window_size, index_topk);
+    compress_ratio > 0 && matches!(live_heads, 16 | 32) && (1..=SWAPAB_MAX_CLUSTER).contains(&tiles)
+}
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CompressedSparseMlaRopeCastKernelConfig {
@@ -71,7 +107,9 @@ pub struct CompressedSparseMlaRopeCastKernelConfig {
     pub compress_ratio: u32,
     pub window_size: u32,
     pub index_topk: u32,
-    /// The kernel's padded Q head count (64 or 128), not the live TP heads.
+    /// Q heads the kernel runs: the mega kernel's padded count (64 or 128),
+    /// or the swap-AB kernel's live count (16 or 32, decode on compressed
+    /// layers only).
     pub num_heads: Dim,
     pub head_dim: Dim,
     pub rope_dim: Dim,
@@ -205,7 +243,14 @@ fn validate_config(config: &CompressedSparseMlaRopeCastKernelConfig) {
         (WINDOW, INDEX_TOPK, 512, 64, 4),
         "unsupported (window, index_topk, head_dim, rope_dim, prefill_chunk_size)"
     );
-    assert!(matches!(config.num_heads.get(), 64 | 128));
+    match config.num_heads.get() {
+        64 | 128 => {}
+        16 | 32 => assert!(
+            is_decode(config) && config.compress_ratio > 0,
+            "16 or 32 heads (swap-AB) is decode on a compressed layer only"
+        ),
+        other => panic!("num_heads must be 64 or 128 (padded) or 16 or 32 (live), got {other}"),
+    }
     assert_eq!(
         config.compressed_cache_format == "none",
         config.compress_ratio == 0,
@@ -218,8 +263,17 @@ fn is_decode(config: &CompressedSparseMlaRopeCastKernelConfig) -> bool {
     config.mode == "decode"
 }
 
-/// Decode rows per CTA wave: one CTA per row and 64 heads.
+/// Whether the config is the swap-AB kernel's: it alone runs live heads.
+fn is_swapab(config: &CompressedSparseMlaRopeCastKernelConfig) -> bool {
+    config.num_heads.get() < 64
+}
+
+/// Decode rows per CTA wave: one CTA per row and 64 heads for the mega
+/// kernel, one cluster of [`swapab_tiles`] CTAs per row for swap-AB.
 fn rows_per_wave(config: &CompressedSparseMlaRopeCastKernelConfig) -> u32 {
+    if is_swapab(config) {
+        return B200_SMS / swapab_tiles(config.window_size, config.index_topk);
+    }
     B200_SMS * 64 / config.num_heads.get()
 }
 
@@ -337,10 +391,65 @@ fn project(pairs: &[(u32, u32)], config: &CompressedSparseMlaRopeCastKernelConfi
 /// `count` requests sharing `tokens` queries as evenly as possible, all at
 /// context `context`.
 fn uniform_pairs(tokens: u32, count: u32, context: u32) -> Vec<(u32, u32)> {
-    let (base, remainder) = (tokens / count, tokens % count);
+    let (base, remainder) = uniform_split(tokens, count);
     (0..count)
         .map(|request| (base + u32::from(request < remainder), context))
         .collect()
+}
+
+/// How [`uniform_pairs`] shares `tokens` queries over `count` requests:
+/// `(base, remainder)`, the first `remainder` requests one query longer. The
+/// closed forms below read the batch through this, so they cannot drift from
+/// the batch they stand in for.
+fn uniform_split(tokens: u32, count: u32) -> (u32, u32) {
+    (tokens / count, tokens % count)
+}
+
+/// [`uniform_split`] plus the longest query, checked as [`mean_keys`] checks
+/// each pair of the built batch.
+fn checked_uniform_split(tokens: u32, count: u32, context: u32) -> (u32, u32, u32) {
+    let (base, remainder) = uniform_split(tokens, count);
+    let longest = base + u32::from(remainder > 0);
+    assert!(
+        base > 0 && longest <= context,
+        "each pair needs 0 < query <= context"
+    );
+    (base, remainder, longest)
+}
+
+/// [`mean_keys`] of `uniform_pairs(tokens, count, context)`, without building
+/// it. The canonical searches evaluate this at every probe of a binary search
+/// over the context, for every request count, so the per-request sum dominated
+/// a DeepSeek V4 build. The batch has two query lengths at one context, so its
+/// key total is two prefix differences: the same integer total, hence the same
+/// mean to the bit.
+fn uniform_mean_keys(tokens: u32, count: u32, context: u32, ratio: u32) -> f64 {
+    let (base, remainder, longest) = checked_uniform_split(tokens, count, context);
+    let full = keys_prefix(context, ratio);
+    let keys = u64::from(remainder) * (full - keys_prefix(context - longest, ratio))
+        + u64::from(count - remainder) * (full - keys_prefix(context - base, ratio));
+    keys as f64 / f64::from(tokens)
+}
+
+/// [`wave_keys`]' mean of `uniform_pairs(tokens, count, context)`, without
+/// building or sorting the rows. Every request ends at `context` and a row's
+/// keys never fall as its position rises, so longest first is position
+/// `context` `count` times, then `context - 1` and so on, the extra rows of
+/// the `remainder` longer requests last. Wave maxima are read off that order
+/// and summed in it, so the mean matches to the bit.
+fn uniform_wave_keys(tokens: u32, count: u32, context: u32, ratio: u32, per_wave: usize) -> f64 {
+    let (base, _, _) = checked_uniform_split(tokens, count, context);
+    let shared_rows = (base * count) as usize;
+    let maxima = (0..tokens as usize).step_by(per_wave).map(|row| {
+        let back = if row < shared_rows {
+            row as u32 / count
+        } else {
+            base
+        };
+        f64::from(token_keys(context - back, ratio))
+    });
+    let waves = (tokens as usize).div_ceil(per_wave);
+    maxima.sum::<f64>() / waves as f64
 }
 
 fn key_tolerance(keys: f64) -> f64 {
@@ -366,19 +475,20 @@ fn lower_bound(lo: u32, hi: u32, target: f64, f: impl Fn(u32) -> f64) -> u32 {
 }
 
 /// The smallest shared context whose uniform batch comes closest to
-/// `target` keys under `keys_of`, or `None` if no context reaches it.
+/// `target` keys, or `None` if no context reaches it. `uniform_keys(tokens,
+/// count, context)` is the keys of `uniform_pairs(tokens, count, context)`.
 fn uniform_for_keys(
     tokens: u32,
     count: u32,
     target: f64,
     max_context: u32,
-    keys_of: &impl Fn(&[(u32, u32)]) -> f64,
+    uniform_keys: &impl Fn(u32, u32, u32) -> f64,
 ) -> Option<Vec<(u32, u32)>> {
     let lowest = tokens.div_ceil(count);
     if lowest > max_context {
         return None;
     }
-    let keys = |context| keys_of(&uniform_pairs(tokens, count, context));
+    let keys = |context| uniform_keys(tokens, count, context);
     let tolerance = key_tolerance(target);
     if keys(max_context) < target - tolerance || keys(lowest) > target + tolerance {
         return None;
@@ -417,17 +527,19 @@ fn canonical_decode(
     config: &CompressedSparseMlaRopeCastKernelConfig,
 ) -> Option<Vec<(u32, u32)>> {
     let rows = point[0] as u32;
-    if rows > MAX_DECODE_ROWS {
+    if rows > MAX_DECODE_ROWS || (is_swapab(config) && rows > SWAPAB_MAX_TOKENS) {
         return None;
     }
     let per_wave = rows_per_wave(config) as usize;
-    let keys_of = |pairs: &[(u32, u32)]| wave_keys(pairs, config.compress_ratio, per_wave).1;
+    let uniform_keys = |tokens, count, context| {
+        uniform_wave_keys(tokens, count, context, config.compress_ratio, per_wave)
+    };
     let pairs = uniform_for_keys(
         rows,
         rows.min(MAX_REQUESTS),
         point[1],
         config.max_model_len,
-        &keys_of,
+        &uniform_keys,
     )?;
     on_point(&pairs, point, config).then_some(pairs)
 }
@@ -441,9 +553,9 @@ fn canonical_prefill(
 ) -> Option<Vec<(u32, u32)>> {
     let (tokens, keys) = (point[0] as u32, point[1]);
     let ratio = config.compress_ratio;
-    let keys_of = |pairs: &[(u32, u32)]| mean_keys(pairs, ratio).1;
+    let uniform_keys = |tokens, count, context| uniform_mean_keys(tokens, count, context, ratio);
     for count in 1..=tokens.min(MAX_REQUESTS - 1) {
-        let Some(base) = uniform_for_keys(tokens, count, keys, config.max_model_len, &keys_of)
+        let Some(base) = uniform_for_keys(tokens, count, keys, config.max_model_len, &uniform_keys)
         else {
             continue;
         };
@@ -484,13 +596,19 @@ fn with_filler(
         return None;
     }
     let ratio = config.compress_ratio;
-    let keys_of = |pairs: &[(u32, u32)]| mean_keys(pairs, ratio).1;
+    let uniform_keys = |tokens, count, context| uniform_mean_keys(tokens, count, context, ratio);
     let mut filler = 1_u32;
     let mut pairs = Vec::new();
     for _ in 0..4 {
         let filler_keys = f64::from(token_keys(filler, ratio));
         let base_keys = (f64::from(tokens) * keys - filler_keys) / f64::from(tokens - 1);
-        let base = uniform_for_keys(tokens - 1, count, base_keys, config.max_model_len, &keys_of)?;
+        let base = uniform_for_keys(
+            tokens - 1,
+            count,
+            base_keys,
+            config.max_model_len,
+            &uniform_keys,
+        )?;
         let with = |context| {
             let mut candidate = base.clone();
             candidate.push((1, context));
@@ -505,6 +623,10 @@ fn with_filler(
 }
 
 fn token_axis(config: &CompressedSparseMlaRopeCastKernelConfig) -> Vec<f64> {
+    if is_swapab(config) {
+        // Every step vLLM sends here: 1..=16 rows, one wave.
+        return Axis::values([1, 2, 4, 6, 8, 10, 12, 14, 16]);
+    }
     if is_decode(config) {
         // The decode time steps one wave at a time: bracket every wave edge.
         let wave = rows_per_wave(config);
@@ -736,6 +858,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn uniform_keys_match_the_built_batch() {
+        for ratio in 0..=2 {
+            for (tokens, count) in [(1_u32, 1_u32), (7, 3), (256, 255), (4096, 17), (8192, 255)] {
+                let lowest = tokens.div_ceil(count);
+                for context in [lowest, lowest + 1, 129, 1025, 70_000, 1_048_576] {
+                    if context < lowest {
+                        continue;
+                    }
+                    let pairs = uniform_pairs(tokens, count, context);
+                    let closed = uniform_mean_keys(tokens, count, context, ratio);
+                    assert_eq!(closed.to_bits(), mean_keys(&pairs, ratio).1.to_bits());
+                    for per_wave in [1, 74, 148, 1000] {
+                        let closed = uniform_wave_keys(tokens, count, context, ratio, per_wave);
+                        let built = wave_keys(&pairs, ratio, per_wave).1;
+                        assert_eq!(closed.to_bits(), built.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
     /// Catches a decode projection that averages keys: one long row in a
     /// single wave costs as much as an all-long wave.
     #[test]
@@ -821,6 +965,51 @@ mod tests {
             [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 522752.0, 1047040.0]
         );
         assert_eq!(excess_axis(&config_at("decode", 2, 64, 1_048_576)), [0.0]);
+    }
+
+    /// Catches a swap-AB grid that leaves the steps vLLM routes there (more
+    /// than 16 rows) or whose canonical batches miss their grid points.
+    #[test]
+    fn swapab_grid_spans_one_to_sixteen_rows_in_one_wave() {
+        assert_eq!(swapab_tiles(128, 512), 6);
+        assert!(swapab_layer(1, 16, 128, 512) && swapab_layer(2, 32, 128, 512));
+        assert!(!swapab_layer(0, 16, 128, 512) && !swapab_layer(2, 64, 128, 512));
+        assert!(
+            !swapab_layer(2, 16, 128, 1024),
+            "10 tiles exceed one cluster"
+        );
+        for ratio in 1..=2 {
+            for heads in [16, 32] {
+                for max_model_len in [131072, 1_048_576] {
+                    let config = config_at("decode", ratio, heads, max_model_len);
+                    assert_eq!(rows_per_wave(&config), 24);
+                    let grid = CompressedSparseMlaRopeCastSpec::sweep_grid(&config);
+                    assert_eq!(grid.axes()[0].last(), Some(&16.0));
+                    let mask = CompressedSparseMlaRopeCastSpec::infeasible_mask(&config, &grid);
+                    let feasible = mask.iter().filter(|&&drop| !drop).count();
+                    assert!(
+                        feasible > 40 && feasible <= 500,
+                        "r{ratio} h{heads}: {feasible}"
+                    );
+                }
+            }
+        }
+        // One wave: a single long row sets the keys of the whole step.
+        let config = config_at("decode", 1, 16, 131072);
+        let input = CompressedSparseMlaRopeCastKernelInput {
+            query_context_pairs: [vec![(1, 5000)], vec![(1, 64); 15]].concat(),
+        };
+        assert_eq!(
+            CompressedSparseMlaRopeCastSpec::cache_coords(&config, &input)[1],
+            640.0
+        );
+    }
+
+    /// Catches swap-AB heads configured for a step the mega kernel serves.
+    #[test]
+    #[should_panic(expected = "swap-AB")]
+    fn live_heads_are_decode_on_compressed_layers_only() {
+        CompressedSparseMlaRopeCastSpec::sweep_grid(&config_at("prefill", 2, 16, 131072));
     }
 
     /// Catches a ratio-0 layer configured with a compressed cache.

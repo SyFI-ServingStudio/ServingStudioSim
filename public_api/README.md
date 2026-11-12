@@ -97,6 +97,10 @@ corpus named by its path in the dataset repo). The service builds every preset
 member once at startup (`simulator cost-trees --kernel-configs`, captures read
 from the local hub cache) and asks profile.db which rows each lacks
 (`timing-predict --dry-run`), so a restart picks up new presets, code or rows.
+Building a member, and building and fitting a sim member (below), runs in
+workers forked from the service (`public_api/forked.py`): the Python around each
+simulator call, above all parsing a member's cost-tree JSON, would otherwise
+hold the main interpreter's GIL. A worker sends back only what the index keeps.
 
 A kind's `view` is its `KernelDoc.view` (`ConfigView` in `profiling/db/doc.py`):
 a `title`, a `summary`, and two roles, each a Rust config field with a `label`

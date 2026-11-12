@@ -248,8 +248,9 @@ impl TokenCorpus {
         })
     }
 
-    /// One complete global histogram per layer for `num_tokens` sampled tokens,
-    /// over the config's layer slice.
+    /// One complete global histogram per layer for each of `token_counts`
+    /// (ascending) sampled tokens, over the config's layer slice, each folded
+    /// by `fold` as soon as it is complete.
     ///
     /// Tokens arrive in runs of `group_size`: a decode step of N tokens is
     /// `⌈N/w⌉` sequences contributing w consecutive positions each, so the draw
@@ -257,41 +258,81 @@ impl TokenCorpus {
     /// positions, because a token's routing is correlated across layers too —
     /// which is also why slicing happens here and not in the packer: the body
     /// and MTP slices of one draw must see the same tokens.
-    fn sample_layer_counts(&self, num_tokens: u32, seed: u64) -> Vec<Vec<u32>> {
+    ///
+    /// The window starts come from one stream per seed, and every full window
+    /// draws from the same range, so N tokens begin with the full windows of
+    /// any smaller count. Walking the counts in ascending order adds each full
+    /// window once; only a count's final partial window is drawn on a copy.
+    /// The histograms are exactly those of drawing each count on its own.
+    fn sample_layer_counts_ascending<T>(
+        &self,
+        token_counts: &[u32],
+        seed: u64,
+        mut fold: impl FnMut(&[Vec<u32>]) -> T,
+    ) -> Vec<T> {
+        assert!(
+            token_counts.windows(2).all(|pair| pair[0] <= pair[1]),
+            "token counts must be ascending"
+        );
         let config = &self.config;
-        let layers = config.layers();
-        let mut counts = vec![vec![0u32; config.num_experts]; layers.len()];
+        let group_size = config.group_size as usize;
+        let mut counts = vec![vec![0u32; config.num_experts]; config.layers().len()];
         let mut state = seed;
-        let mut remaining = num_tokens as usize;
-        while remaining > 0 {
-            let take = remaining.min(config.group_size as usize);
-            let bound = (config.num_tokens - take + 1) as u64;
-            // Unbiased bounded SplitMix64. Starts are drawn with replacement,
-            // and a window may cross the seam between two concatenated
-            // requests; both are properties of the recorded corpus, not of the
-            // sampler, and the packer is what decides how many seams exist.
-            let threshold = bound.wrapping_neg() % bound;
-            let start = loop {
-                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-                let mut value = state;
-                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-                value ^= value >> 31;
-                if value >= threshold {
-                    break (value % bound) as usize;
+        let mut full_tokens = 0usize;
+        token_counts
+            .iter()
+            .map(|&num_tokens| {
+                let num_tokens = num_tokens as usize;
+                while full_tokens + group_size <= num_tokens {
+                    let start = self.window_start(&mut state, group_size);
+                    self.add_window(&mut counts, start, group_size);
+                    full_tokens += group_size;
                 }
-            };
-            for token in start..start + take {
-                for (layer, row) in layers.clone().zip(counts.iter_mut()) {
-                    let offset = (token * config.num_layers + layer) * config.top_k;
-                    for &expert in &self.ids[offset..offset + config.top_k] {
-                        row[expert as usize] += 1;
-                    }
+                let partial = num_tokens - full_tokens;
+                if partial == 0 {
+                    return fold(&counts);
+                }
+                // The partial window consumes the stream only for this count.
+                let mut partial_state = state;
+                let start = self.window_start(&mut partial_state, partial);
+                let mut with_partial = counts.clone();
+                self.add_window(&mut with_partial, start, partial);
+                fold(&with_partial)
+            })
+            .collect()
+    }
+
+    /// The start of the next `take`-token window, advancing `state`.
+    fn window_start(&self, state: &mut u64, take: usize) -> usize {
+        let bound = (self.config.num_tokens - take + 1) as u64;
+        // Unbiased bounded SplitMix64. Starts are drawn with replacement,
+        // and a window may cross the seam between two concatenated
+        // requests; both are properties of the recorded corpus, not of the
+        // sampler, and the packer is what decides how many seams exist.
+        let threshold = bound.wrapping_neg() % bound;
+        loop {
+            *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut value = *state;
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            value ^= value >> 31;
+            if value >= threshold {
+                return (value % bound) as usize;
+            }
+        }
+    }
+
+    /// Count the `take` recorded tokens from `start` into `counts`.
+    fn add_window(&self, counts: &mut [Vec<u32>], start: usize, take: usize) {
+        let config = &self.config;
+        for token in start..start + take {
+            for (layer, row) in config.layers().zip(counts.iter_mut()) {
+                let offset = (token * config.num_layers + layer) * config.top_k;
+                for &expert in &self.ids[offset..offset + config.top_k] {
+                    row[expert as usize] += 1;
                 }
             }
-            remaining -= take;
         }
-        counts
     }
 
     /// Draw `sampling_candidates` complete folded histograms and return the
@@ -308,22 +349,29 @@ impl TokenCorpus {
         self.config.sampling_candidates
     }
 
-    /// Candidate `draw` of [`Self::sample_and_fold`]. Each draw has its own
-    /// seed, so candidates are independent and can be drawn in any order.
-    pub(super) fn candidate(
+    /// Candidate `draw` of [`Self::sample_and_fold`] at `num_tokens`.
+    fn candidate(&self, num_tokens: u32, experts_per_rank: usize, draw: u32) -> Vec<u32> {
+        self.candidates_ascending(&[num_tokens], experts_per_rank, draw)
+            .pop()
+            .expect("one token count, one candidate")
+    }
+
+    /// Candidate `draw` of [`Self::sample_and_fold`] at each of
+    /// `token_counts` (ascending), in that order. Each draw has its own seed,
+    /// so candidates are independent and can be drawn in any order.
+    pub(super) fn candidates_ascending(
         &self,
-        num_tokens: u32,
+        token_counts: &[u32],
         experts_per_rank: usize,
         draw: u32,
-    ) -> Vec<u32> {
+    ) -> Vec<Vec<u32>> {
         let seed = self
             .config
             .seed
             .wrapping_add(u64::from(draw).wrapping_mul(CANDIDATE_STRIDE));
-        fold_layerwise_expert_counts(
-            &self.sample_layer_counts(num_tokens, seed),
-            experts_per_rank,
-        )
+        self.sample_layer_counts_ascending(token_counts, seed, |counts| {
+            fold_layerwise_expert_counts(counts, experts_per_rank)
+        })
     }
 }
 
@@ -543,6 +591,64 @@ pub(crate) mod tests {
         assert_eq!(folded.len(), 64);
         assert_eq!(folded.iter().map(|&c| u64::from(c)).sum::<u64>(), 24 * 8);
         assert_eq!(folded, corpus.sample_and_fold(24, 16));
+    }
+
+    #[test]
+    fn one_pass_over_the_axis_draws_what_each_count_draws_alone() {
+        let dir = temp_dir("ascending");
+        let corpus = synthetic(&dir, 64, 8, 4, 256).load().unwrap();
+        // Group size 8: whole windows, partial ones, and a repeated count.
+        let token_counts = [3, 8, 13, 13, 24, 30, 64];
+        for draw in 0..3 {
+            let walked = corpus.candidates_ascending(&token_counts, 16, draw);
+            let alone: Vec<_> = token_counts
+                .iter()
+                .map(|&n| per_count_candidate(&corpus, n, 16, draw))
+                .collect();
+            assert_eq!(walked, alone);
+        }
+    }
+
+    /// The sampler before the one-pass walk, kept verbatim as the reference:
+    /// each count drawn on its own, window by window from the seed.
+    fn per_count_candidate(
+        corpus: &TokenCorpus,
+        num_tokens: u32,
+        experts_per_rank: usize,
+        draw: u32,
+    ) -> Vec<u32> {
+        let config = &corpus.config;
+        let mut state = config
+            .seed
+            .wrapping_add(u64::from(draw).wrapping_mul(CANDIDATE_STRIDE));
+        let layers = config.layers();
+        let mut counts = vec![vec![0u32; config.num_experts]; layers.len()];
+        let mut remaining = num_tokens as usize;
+        while remaining > 0 {
+            let take = remaining.min(config.group_size as usize);
+            let bound = (config.num_tokens - take + 1) as u64;
+            let threshold = bound.wrapping_neg() % bound;
+            let start = loop {
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut value = state;
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                value ^= value >> 31;
+                if value >= threshold {
+                    break (value % bound) as usize;
+                }
+            };
+            for token in start..start + take {
+                for (layer, row) in layers.clone().zip(counts.iter_mut()) {
+                    let offset = (token * config.num_layers + layer) * config.top_k;
+                    for &expert in &corpus.ids[offset..offset + config.top_k] {
+                        row[expert as usize] += 1;
+                    }
+                }
+            }
+            remaining -= take;
+        }
+        fold_layerwise_expert_counts(&counts, experts_per_rank)
     }
 
     /// The unification this replaces two popularity files with: one artifact,

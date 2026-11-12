@@ -34,18 +34,33 @@
 //!    compress_norm s47917 851.17-855.23 under wq_b s19 850.05-857.82; NVFP4
 //!    insert s47917 862.11-864.83 under wk s19 860.26-863.74 (overlap). Mixed
 //!    288 and 310: both on s19 after the KV insert (4128.57 / 3854.69; serial).
-//! 6. indexer scoring (index sources), then mega attention (prefill segment,
-//!    decode segment), the `wo_a` MXFP8 einsum, `wo_b`, and the all-reduce.
-//!    All serial on the main stream in every iteration inspected.
+//! 6. indexer scoring (index sources), then the decode global top-k remap
+//!    (compressed layers, its own elementwise placeholder leaf), mega attention
+//!    (prefill segment, decode segment), the `wo_a` MXFP8 einsum, `wo_b`, and
+//!    the all-reduce. All serial on the main stream in every iteration
+//!    inspected.
 //!
-//! Folded, no leaf: the position cast before attention, the global top-k remap
-//! (into the mega-attention op) and the per-layer attention metadata.
+//! Folded, no leaf: the position cast before attention and the per-layer
+//! attention metadata.
+//!
+//! Two per-call modes change which slots carry time (the tree is fixed):
+//!
+//! - `mhc_overlap`: FULL-graph forwards of at most 16 rows replace the fused
+//!   `mega_mhc` entry with [`MhcOverlapBoundary`] (caller-stream post + input
+//!   epilogue, side-stream coefficients beside the rest of the block). Only a
+//!   `FusedPostPre` entry has the boundary; the layer-0 and Engram entries
+//!   keep their unfused launches.
+//! - `write_kv_only`: the bounded-replay cut layer's KV write over every row
+//!   (`DeepseekV4DecoderLayer.write_kv` -> `attention.py` `forward_kv`): the
+//!   entry mHC, the input projections, the q/kv norm, the SWA KV insert, the
+//!   compressor and the index-K store run; `wq_b`, the indexer Q path and
+//!   scoring, attention, `wo_a`, `wo_b` and the all-reduce do not.
 
 use std::sync::Arc;
 
 use super::deepseek_v41_common::{
-    compile_serial_copy, eval_or_zero, gated_fanout, placeholder,
-    MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+    compile_serial_copy, eval_or_zero, gated_fanout, placeholder, MhcOverlapBoundary,
+    MhcOverlapBoundaryConfig, MhcOverlapBoundaryResolved, MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
 };
 use crate::common::Fabric;
 use crate::op::attention::{
@@ -174,10 +189,24 @@ pub struct DeepseekV41AttentionTpWorkletConfig {
     pub prefill_chunk_size: u32,
     pub gpu_name: String,
     pub mhc_backends: Vec<&'static str>,
+    /// The unfused TileLang mHC kinds of the overlap path.
+    pub mhc_tilelang_backends: Vec<&'static str>,
     pub gemm_backends: Vec<&'static str>,
+    /// The same MXFP8 linear fed an activation its producer already quantized
+    /// (GEMM only). Used where production hands the linear a
+    /// `QuantizedActivation`: `wq_b` / indexer `wq_b` after
+    /// `fused_q_kv_rmsnorm_quant` (`attention.py` `_split_qkv_and_norm`, taken
+    /// when `q_lora_rank % 32 == 0`) and `wo_b` after the `wo_a` einsum
+    /// (`flash_mla_mega_attn.py` `_o_proj`, taken when `o_lora_rank % 128 == 0`
+    /// and no GEMM-RS is bound -- GEMM-RS needs sequence parallel, which this
+    /// worklet never runs).
+    pub prequantized_gemm_backends: Vec<&'static str>,
     pub fp32_gemm_backends: Vec<&'static str>,
     pub kv_insert_backends: Vec<&'static str>,
     pub mega_attn_backends: Vec<&'static str>,
+    /// The swap-AB decode backends of compressed layers at 16 or 32 live
+    /// heads; empty keeps every decode on the mega kernel.
+    pub swapab_attn_backends: Vec<&'static str>,
     pub wo_a_backends: Vec<&'static str>,
     pub all_reduce_backends: Vec<&'static str>,
     pub index_logits_prefill_backends: Vec<&'static str>,
@@ -194,6 +223,8 @@ pub struct DeepseekV41AttentionTpWorkletResolved {
     pub entry_hc_prenorm: Option<ElementwiseKernelConfig>,
     pub entry_pre_fuse: Option<ElementwiseKernelConfig>,
     pub entry_fused: Option<MhcRmsNormKernelConfig>,
+    /// `Some` exactly when `entry_fused` is.
+    pub mhc_overlap: Option<MhcOverlapBoundaryResolved>,
     pub fused_wqa_wkv: SingleGemmKernelConfig,
     pub compressor_proj: Option<GemmFp32OutputKernelConfig>,
     pub indexer_weights_proj: Option<ElementwiseKernelConfig>,
@@ -206,6 +237,7 @@ pub struct DeepseekV41AttentionTpWorkletResolved {
     pub indexer_wq_b: Option<SingleGemmKernelConfig>,
     pub indexer_q_rope: Option<ElementwiseKernelConfig>,
     pub compressor_insert: Option<ElementwiseKernelConfig>,
+    pub global_topk_remap: Option<ElementwiseKernelConfig>,
     pub indexer: Option<DeepseekV41IndexerOpConfig>,
     pub mega_attn: DeepseekV41MegaAttnOpConfig,
     pub wo_a: BatchedGemmKernelConfig,
@@ -223,6 +255,14 @@ pub struct DeepseekV41AttentionTpWorkletInput {
     pub decode_kv_lens: Vec<u32>,
     /// `attention_aux_stream_live(..)`: the stage-B aux stream exists.
     pub aux_stream_live: bool,
+    /// The forward replays a FULL CUDA graph (decode only): its attention
+    /// metadata, and so the decode segment's launch rows, are `num_tokens`.
+    pub full_graph: bool,
+    /// `mhc_overlap_live(..)`: the entry takes the mHC overlap path.
+    pub mhc_overlap: bool,
+    /// Only the KV-writing launches run (the bounded-replay cut layer's
+    /// `write_kv` over every row).
+    pub write_kv_only: bool,
 }
 
 pub struct DeepseekV41AttentionTpWorklet {
@@ -231,6 +271,7 @@ pub struct DeepseekV41AttentionTpWorklet {
     pub entry_hc_prenorm: Option<Op<ElementwiseKernel>>,
     pub entry_pre_fuse: Option<Op<ElementwiseKernel>>,
     pub entry_fused: Option<Op<MhcFusedPostPreRmsNormKernel>>,
+    pub mhc_overlap: Option<MhcOverlapBoundary>,
     pub fused_wqa_wkv: Op<SingleGemmKernel>,
     pub compressor_proj: Option<Op<GemmFp32OutputKernel>>,
     pub indexer_weights_proj: Option<Op<ElementwiseKernel>>,
@@ -243,6 +284,7 @@ pub struct DeepseekV41AttentionTpWorklet {
     pub indexer_wq_b: Option<Op<SingleGemmKernel>>,
     pub indexer_q_rope: Option<Op<ElementwiseKernel>>,
     pub compressor_insert: Option<Op<ElementwiseKernel>>,
+    pub global_topk_remap: Option<Op<ElementwiseKernel>>,
     pub indexer: Option<DeepseekV41IndexerOp>,
     pub mega_attn: DeepseekV41MegaAttnOp,
     pub wo_a: Op<BatchedGemmKernel>,
@@ -291,13 +333,25 @@ impl DeepseekV41AttentionTpWorklet {
 
         let gpu = cfg.gpu_name.as_str();
         let ew = |input: u32, output: u32| placeholder(&cfg.elementwise_backends, gpu, input, output);
-        let mxfp8 = |n: Dim, k: Dim| SingleGemmKernelConfig {
-            backends: cfg.gemm_backends.clone(),
+        let mxfp8_from = |backends: &Vec<&'static str>, n: Dim, k: Dim| SingleGemmKernelConfig {
+            backends: backends.clone(),
             gpu_name: cfg.gpu_name.clone(),
             n,
             k,
             dtype: DType::Mxfp8E4m3,
         };
+        let mxfp8 = |n: Dim, k: Dim| mxfp8_from(&cfg.gemm_backends, n, k);
+        let prequantized_if = |fused: bool| {
+            if fused {
+                &cfg.prequantized_gemm_backends
+            } else {
+                &cfg.gemm_backends
+            }
+        };
+        // `_split_qkv_and_norm`: the fused norm writes MXFP8 Q for every wq_b.
+        let query_backends = prequantized_if(cfg.q_lora_rank.get() % 32 == 0);
+        // `_can_quantize_o_proj`: wo_a writes wo_b's MXFP8 input.
+        let o_backends = prequantized_if(cfg.o_lora_rank.get() % 128 == 0);
         let hidden = cfg.hidden_size.get();
         let hc_hidden_bytes = cfg.hc_mult * hidden * 2;
         let mix_bytes = (2 + cfg.hc_mult) * cfg.hc_mult * 4;
@@ -320,6 +374,15 @@ impl DeepseekV41AttentionTpWorklet {
             // nvidia/model.py:435 -> `mhc_pre_big_fuse_with_norm`: streams and
             // mixes in, the normalized attention input out.
             entry_pre_fuse: layer0.then(|| ew(hc_hidden_bytes + mix_bytes, hidden * 2)),
+            mhc_overlap: (layer.entry == DeepseekV41AttentionEntry::FusedPostPre).then(|| {
+                MhcOverlapBoundary::resolve(&MhcOverlapBoundaryConfig {
+                    hidden_size: cfg.hidden_size.clone(),
+                    hc_mult: cfg.hc_mult,
+                    gpu_name: cfg.gpu_name.clone(),
+                    mhc_tilelang_backends: cfg.mhc_tilelang_backends.clone(),
+                    elementwise_backends: cfg.elementwise_backends.clone(),
+                })
+            }),
             entry_fused: (layer.entry == DeepseekV41AttentionEntry::FusedPostPre).then(|| {
                 MhcRmsNormKernelConfig {
                     backends: cfg.mhc_backends.clone(),
@@ -350,7 +413,8 @@ impl DeepseekV41AttentionTpWorklet {
                 (cfg.q_lora_rank.get() + head_dim) * 2,
                 (cfg.q_lora_rank.get() + head_dim) * 2,
             ),
-            wq_b: mxfp8(
+            wq_b: mxfp8_from(
+                query_backends,
                 cfg.head_dim.clone() * heads_per_rank,
                 cfg.q_lora_rank.clone(),
             ),
@@ -358,7 +422,15 @@ impl DeepseekV41AttentionTpWorklet {
                 backends: cfg.kv_insert_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_heads: heads_per_rank,
-                padded_heads: cfg.padded_heads.get(),
+                // attention.py `_fused_qnorm_rope_kv_insert`: the mega-attention
+                // layer takes an unnormed, unroped Q, so the launch only zero-pads
+                // Q to `padded_heads`; a shard already that wide passes
+                // `q_head_padded = 0` and runs the KV-only instance.
+                padded_heads: if heads_per_rank == cfg.padded_heads.get() {
+                    0
+                } else {
+                    cfg.padded_heads.get()
+                },
                 block_size: cfg.swa_block_size,
                 input_dtype: DType::Bf16,
                 swa_cache_format: "mxfp8".to_string(),
@@ -380,7 +452,8 @@ impl DeepseekV41AttentionTpWorklet {
                 )
             }),
             indexer_wq_b: index_source.then(|| {
-                mxfp8(
+                mxfp8_from(
+                    query_backends,
                     cfg.index_num_heads.clone() * cfg.index_head_dim.clone(),
                     cfg.q_lora_rank.clone(),
                 )
@@ -398,6 +471,14 @@ impl DeepseekV41AttentionTpWorklet {
             // `_rope_quant_insert_nvfp4`: one 288-byte NVFP4 row per `ratio`
             // tokens.
             compressor_insert: layer.kv_source.then(|| ew(head_dim * 2, 288 / ratio.max(1))),
+            // flash_mla_mega_attn.py `_decode_compressed_kv_and_topk` ->
+            // cache_utils.py `compute_global_topk_indices_and_lens`: one Triton
+            // launch per compressed layer before the decode attention, one
+            // program per decode row. Reads the row's top-k local indices and
+            // their block-table entries (int32 each), writes the global slot
+            // ids plus one length.
+            global_topk_remap: (ratio > 0)
+                .then(|| ew(cfg.index_topk * 8, cfg.index_topk * 4 + 4)),
             indexer: index_source.then(|| DeepseekV41IndexerOpConfig {
                 gpu_name: cfg.gpu_name.clone(),
                 compress_ratio: ratio,
@@ -418,6 +499,8 @@ impl DeepseekV41AttentionTpWorklet {
                 window_size: cfg.window_size,
                 index_topk: cfg.index_topk,
                 padded_heads: cfg.padded_heads.clone(),
+                live_heads: heads_per_rank,
+                swapab_backends: cfg.swapab_attn_backends.clone(),
                 head_dim: cfg.head_dim.clone(),
                 rope_dim: cfg.rope_dim.clone(),
                 max_model_len: cfg.max_model_len,
@@ -436,7 +519,8 @@ impl DeepseekV41AttentionTpWorklet {
                 k: cfg.num_attention_heads.clone() * cfg.head_dim.clone() / cfg.o_groups.clone(),
                 dtype: DType::Mxfp8E4m3,
             },
-            wo_b: mxfp8(
+            wo_b: mxfp8_from(
+                o_backends,
                 cfg.hidden_size.clone(),
                 cfg.o_lora_rank.clone() * o_groups_per_rank,
             ),
@@ -485,6 +569,14 @@ impl DeepseekV41AttentionTpWorklet {
                 r.entry_fused,
                 "entry.mega_mhc_post_pre"
             ),
+            mhc_overlap: match r.mhc_overlap {
+                Some(config) => Some(MhcOverlapBoundary::build(
+                    &format!("{name}.entry"),
+                    config,
+                    bridge,
+                )?),
+                None => None,
+            },
             fused_wqa_wkv: op!(SingleGemmKernel, r.fused_wqa_wkv, "input.fused_wqa_wkv"),
             compressor_proj: maybe!(
                 GemmFp32OutputKernel,
@@ -512,6 +604,11 @@ impl DeepseekV41AttentionTpWorklet {
                 ElementwiseKernel,
                 r.compressor_insert,
                 "compressor.nvfp4_insert"
+            ),
+            global_topk_remap: maybe!(
+                ElementwiseKernel,
+                r.global_topk_remap,
+                "attention.global_topk_remap"
             ),
             indexer: match r.indexer {
                 Some(config) => Some(DeepseekV41IndexerOp::build(
@@ -545,6 +642,10 @@ impl DeepseekV41AttentionTpWorklet {
         if let Some(entry) = &self.entry_fused {
             children.push(entry.compile(b));
         }
+        if let Some(overlap) = &self.mhc_overlap {
+            children.extend(overlap.compile_entry(b));
+        }
+        let entries = children.len();
 
         // Stage A: fused_wqa_wkv | compressor kv_score | indexer weights_proj.
         let main = vec![self.fused_wqa_wkv.compile(b)];
@@ -596,11 +697,18 @@ impl DeepseekV41AttentionTpWorklet {
         if let Some(indexer) = &self.indexer {
             children.push(indexer.compile(b));
         }
+        if let Some(op) = &self.global_topk_remap {
+            children.push(op.compile(b));
+        }
         children.push(self.mega_attn.compile(b));
         children.push(self.wo_a.compile(b));
         children.push(self.wo_b.compile(b));
         if let Some(all_reduce) = &self.all_reduce {
             children.push(all_reduce.compile(b));
+        }
+        if let Some(overlap) = &self.mhc_overlap {
+            let body = children.split_off(entries);
+            children.push(overlap.compile_beside(body, b));
         }
 
         let layer = self.resolved.raw_cfg.layer;
@@ -626,6 +734,9 @@ impl DeepseekV41AttentionTpWorklet {
             .unwrap_or_else(|reason| panic!("invalid DeepseekV41AttentionTpWorkletInput: {reason}"));
         let rows = input.num_tokens;
         let zero = rows == 0;
+        // Launches `write_kv` skips.
+        let skip = zero || input.write_kv_only;
+        let overlap = !zero && input.mhc_overlap && self.mhc_overlap.is_some();
         let gates = stream_gates(input, &self.resolved.raw_cfg);
         let ew = ElementwiseKernelInput { num_tokens: rows };
         let gemm = SingleGemmKernelInput { m: rows };
@@ -637,7 +748,10 @@ impl DeepseekV41AttentionTpWorklet {
             eval_or_zero(entry, ew.clone(), zero, ev);
         }
         if let Some(entry) = &self.entry_fused {
-            eval_or_zero(entry, MhcRmsNormKernelInput { num_tokens: rows }, zero, ev);
+            eval_or_zero(entry, MhcRmsNormKernelInput { num_tokens: rows }, zero || overlap, ev);
+        }
+        if let Some(boundary) = &self.mhc_overlap {
+            boundary.eval_entry(rows, overlap, ev);
         }
 
         eval_or_zero(&self.fused_wqa_wkv, gemm.clone(), zero, ev);
@@ -653,7 +767,7 @@ impl DeepseekV41AttentionTpWorklet {
 
         eval_or_zero(&self.qk_rmsnorm, ew.clone(), zero, ev);
 
-        eval_or_zero(&self.wq_b, gemm.clone(), zero, ev);
+        eval_or_zero(&self.wq_b, gemm.clone(), skip, ev);
         eval_or_zero(
             &self.kv_insert,
             QPadKvRopeMxfp8InsertKernelInput { num_tokens: rows },
@@ -669,41 +783,66 @@ impl DeepseekV41AttentionTpWorklet {
             eval_or_zero(op, ew.clone(), zero, ev);
         }
         if let Some(op) = &self.indexer_wq_b {
-            eval_or_zero(op, gemm.clone(), zero, ev);
+            eval_or_zero(op, gemm.clone(), skip, ev);
         }
         if let Some(op) = &self.indexer_q_rope {
-            eval_or_zero(op, ew.clone(), zero, ev);
+            eval_or_zero(op, ew.clone(), skip, ev);
         }
         if let Some(op) = &self.compressor_insert {
             eval_or_zero(op, ew.clone(), zero || !gates.aux_stream, ev);
             eval_or_zero(op, ew.clone(), zero || gates.aux_stream, ev);
         }
 
+        // `write_kv` scores nothing and attends nothing.
+        let (prefill_pairs, decode_kv_lens) = if input.write_kv_only {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                input.prefill_query_context_pairs.clone(),
+                input.decode_kv_lens.clone(),
+            )
+        };
         if let Some(indexer) = &self.indexer {
             indexer.eval(
                 &DeepseekV41IndexerOpInput {
-                    prefill_query_context_pairs: input.prefill_query_context_pairs.clone(),
-                    decode_kv_lens: input.decode_kv_lens.clone(),
+                    prefill_query_context_pairs: prefill_pairs.clone(),
+                    decode_kv_lens: decode_kv_lens.clone(),
                 },
+                ev,
+            );
+        }
+        // The remap launches over the decode segment's rows (`q.shape[0]`):
+        // the padded rows inside a FULL graph, else the live decode rows.
+        let decode_launch_rows = input.full_graph.then_some(rows);
+        if let Some(op) = &self.global_topk_remap {
+            let launched = decode_launch_rows.unwrap_or(decode_kv_lens.len() as u32);
+            eval_or_zero(
+                op,
+                ElementwiseKernelInput { num_tokens: launched },
+                decode_kv_lens.is_empty(),
                 ev,
             );
         }
         self.mega_attn.eval(
             &DeepseekV41MegaAttnOpInput {
-                prefill_query_context_pairs: input.prefill_query_context_pairs.clone(),
-                decode_kv_lens: input.decode_kv_lens.clone(),
+                prefill_query_context_pairs: prefill_pairs,
+                decode_kv_lens,
+                decode_launch_rows,
             },
             ev,
         );
-        eval_or_zero(&self.wo_a, BatchedGemmKernelInput { m: rows }, zero, ev);
-        eval_or_zero(&self.wo_b, gemm, zero, ev);
+        eval_or_zero(&self.wo_a, BatchedGemmKernelInput { m: rows }, skip, ev);
+        eval_or_zero(&self.wo_b, gemm, skip, ev);
         if let Some(all_reduce) = &self.all_reduce {
             eval_or_zero(
                 all_reduce,
                 AllReduceFusionKernelInput { num_tokens: rows },
-                zero,
+                skip,
                 ev,
             );
+        }
+        if let Some(boundary) = &self.mhc_overlap {
+            boundary.eval_side(rows, overlap, self.resolved.raw_cfg.serialize_streams, ev);
         }
     }
 }
@@ -785,10 +924,13 @@ pub(crate) mod tests {
             prefill_chunk_size: 4,
             gpu_name: "NVIDIA B200".into(),
             mhc_backends: vec!["deepgemm_mega"],
+            mhc_tilelang_backends: vec!["vllm_tilelang"],
             gemm_backends: vec!["flashinfer_mxfp8"],
+            prequantized_gemm_backends: vec!["flashinfer_mxfp8_prequantized"],
             fp32_gemm_backends: vec!["torch_cublas"],
             kv_insert_backends: vec!["vllm_cuda"],
             mega_attn_backends: vec!["flashmla_mega"],
+            swapab_attn_backends: vec!["swapab_cutedsl"],
             wo_a_backends: vec!["deepgemm_mxfp8_einsum_grouped_o_proj"],
             all_reduce_backends: vec!["flashinfer_mnnvl"],
             index_logits_prefill_backends: vec!["deepgemm_fp8"],
@@ -836,6 +978,37 @@ pub(crate) mod tests {
         );
         assert_eq!((r.kv_insert.num_heads, r.kv_insert.padded_heads), (16, 64));
         assert_eq!(r.indexer.as_ref().unwrap().page_block_size, 64);
+        // Producers that already write MXFP8 leave these linears the GEMM alone.
+        let prequantized = ["flashinfer_mxfp8_prequantized"];
+        assert_eq!(r.wq_b.backends, prequantized);
+        assert_eq!(r.indexer_wq_b.as_ref().unwrap().backends, prequantized);
+        assert_eq!(r.wo_b.backends, prequantized);
+        assert_eq!(r.fused_wqa_wkv.backends, ["flashinfer_mxfp8"]);
+    }
+
+    /// Catches a full-width shard (TP1 / DP attention) priced with the Q-pad
+    /// instance: production passes `q_head_padded = 0` and runs KV-only.
+    #[test]
+    fn kv_insert_is_kv_only_when_the_shard_is_already_padded_width() {
+        let mut cfg = config(2);
+        cfg.tp_size = 1;
+        let r = DeepseekV41AttentionTpWorklet::resolve_config(&cfg);
+        assert_eq!((r.kv_insert.num_heads, r.kv_insert.padded_heads), (64, 0));
+    }
+
+    /// Catches the decode top-k remap launch folded away at zero cost, or
+    /// priced on the ratio-0 layers that never launch it.
+    #[test]
+    fn global_topk_remap_is_priced_on_compressed_layers_only() {
+        let bytes = |layer: u32| {
+            DeepseekV41AttentionTpWorklet::resolve_config(&config(layer))
+                .global_topk_remap
+                .map(|c| (c.input_bytes_per_token.get(), c.output_bytes_per_token.get()))
+        };
+        assert_eq!(bytes(0), None);
+        assert_eq!(bytes(1), None);
+        assert_eq!(bytes(2), Some((4096, 2052)));
+        assert_eq!(bytes(3), Some((4096, 2052)));
     }
 
     #[test]
@@ -896,6 +1069,9 @@ pub(crate) mod tests {
             prefill_query_context_pairs: vec![(4, 16)],
             decode_kv_lens: vec![7; 48],
             aux_stream_live: false,
+            full_graph: false,
+            mhc_overlap: false,
+            write_kv_only: false,
         };
         assert!(validate_input(&ok, &cfg).is_ok());
         let bad = DeepseekV41AttentionTpWorkletInput {

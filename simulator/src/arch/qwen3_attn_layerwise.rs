@@ -27,7 +27,7 @@
 //! projection back (`(q_dim + 2·kv_dim) · bpe`).
 
 use crate::arch::contract::{AttnArchInput, AttnLayerwiseModel};
-use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
+use crate::arch::kv_layout::{gqa_kv_bytes_per_token, gqa_placement, KvCacheLayout, KvCachePart};
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::op::attention::{
     FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp,
@@ -92,7 +92,7 @@ pub struct Qwen3AttnLayerwiseConfigs {
     pub attn: FlashInferAttentionConfig,
     pub num_layers: u32,
     pub attn_tp_size: u16,
-    pub kv_bytes_per_token: u64,
+    pub kv_cache_part: KvCachePart,
     pub attn_to_ffn_bytes_per_token: Dim,
 }
 
@@ -102,7 +102,7 @@ pub struct Qwen3AttnLayerwiseResolved {
     pub attn: FlashInferAttentionConfig,
     pub num_layers: u32,
     pub attn_tp_size: u16,
-    pub kv_bytes_per_token: u64,
+    pub kv_cache_part: KvCachePart,
     pub attn_to_ffn_bytes_per_token: Dim,
 }
 
@@ -110,7 +110,7 @@ pub struct Qwen3AttnLayerwiseModel {
     pub name: String,
     pub num_layers: u32,
     pub attn_tp_size: u16,
-    pub kv_bytes_per_token: u64,
+    pub kv_cache_part: KvCachePart,
     pub attn_to_ffn_bytes_per_token: Dim,
     pub attn: FlashInferAttentionOp,
     /// This shard's per-layer attention cost tree (a single `attn`), compiled once
@@ -135,14 +135,20 @@ pub fn build_configs(
         attn_tp_size: parallel.attn_tp_size,
         // Per-token KV bytes over the attention TP group: 2 (k+v) × kv_heads ×
         // head_dim × kv_dtype × layers.
-        kv_bytes_per_token: gqa_kv_bytes_per_token(
-            u64::from(model.num_layers),
+        kv_cache_part: KvCachePart::per_token(
+            "gqa",
+            gqa_kv_bytes_per_token(
+                u64::from(model.num_layers),
+                u64::from(model.num_kv_heads.get()),
+                u64::from(model.head_dim.get()),
+                u64::from(model.head_dim.get()),
+                u64::from(model.kv_dtype.size_bytes()),
+            ),
+        )
+        .placed(gqa_placement(
             u64::from(model.num_kv_heads.get()),
-            u64::from(model.head_dim.get()),
-            u64::from(model.head_dim.get()),
-            u64::from(model.kv_dtype.size_bytes()),
             u64::from(parallel.attn_tp_size),
-        ),
+        )),
         // attn → ffn handoff: the attention output, q_dim · bpe per token.
         attn_to_ffn_bytes_per_token: model.num_qo_heads.clone()
             * model.head_dim.clone()
@@ -155,7 +161,7 @@ pub fn resolve_configs(cfgs: &Qwen3AttnLayerwiseConfigs) -> Qwen3AttnLayerwiseRe
         attn: cfgs.attn.clone(),
         num_layers: cfgs.num_layers,
         attn_tp_size: cfgs.attn_tp_size,
-        kv_bytes_per_token: cfgs.kv_bytes_per_token,
+        kv_cache_part: cfgs.kv_cache_part,
         attn_to_ffn_bytes_per_token: cfgs.attn_to_ffn_bytes_per_token.clone(),
     }
 }
@@ -170,7 +176,7 @@ pub fn build(
         name: model_name,
         num_layers: resolved.num_layers,
         attn_tp_size: resolved.attn_tp_size,
-        kv_bytes_per_token: resolved.kv_bytes_per_token,
+        kv_cache_part: resolved.kv_cache_part,
         attn_to_ffn_bytes_per_token: resolved.attn_to_ffn_bytes_per_token,
         attn,
         attn_flat: Vec::new(),
@@ -263,7 +269,7 @@ impl AttnLayerwiseModel for Qwen3AttnLayerwiseModel {
     }
 
     fn kv_cache_layout(&self) -> KvCacheLayout {
-        KvCacheLayout::new().with_part(KvCachePart::per_token("gqa", self.kv_bytes_per_token))
+        KvCacheLayout::new().with_part(self.kv_cache_part)
     }
 
     fn attn_to_ffn_bytes_per_token(&self) -> u64 {

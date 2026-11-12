@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
-use crate::arch::kv_layout::{gqa_kv_bytes_per_token, KvCacheLayout, KvCachePart};
+use crate::arch::kv_layout::{gqa_kv_bytes_per_token, gqa_placement, KvCacheLayout, KvCachePart};
 use crate::arch::model_cfg::ModelCfg;
 use crate::op::Op;
 use crate::timing::kernels::{
@@ -70,8 +70,8 @@ pub struct Llama3DenseResolved {
 pub struct Llama3DenseModel {
     pub name: String,
     pub num_layers: u32,
-    /// Per-token KV bytes over one KV partition, for the KV cache layout.
-    pub kv_bytes_per_token: u64,
+    /// The attention KV as one cache part, placed on the KV partition's ranks.
+    pub kv_cache_part: KvCachePart,
     pub pre_attn: PreAttnLocalWorklet,
     pub attn: AttnLocalWorklet,
     pub post_attn: PostAttnLocalWorklet,
@@ -163,16 +163,19 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseParallel) -> Llama3DenseC
 /// (`2 × KV heads × head_dim × kv dtype × layers`, heads replicated when the TP
 /// degree exceeds them). Arch-specific: MLA's compressed latent or cross-layer
 /// sharing would compute it differently, so it lives in the model_arch.
-fn kv_bytes_per_token(resolved: &Llama3DenseResolved) -> u64 {
+fn gqa_kv_part(resolved: &Llama3DenseResolved) -> KvCachePart {
     let attn = &resolved.attn.attn;
-    gqa_kv_bytes_per_token(
-        u64::from(resolved.num_layers),
-        u64::from(attn.num_kv_heads.get()),
-        u64::from(attn.head_dim.get()),
-        u64::from(attn.head_dim.get()),
-        u64::from(attn.kv_dtype().size_bytes()),
-        1,
+    KvCachePart::per_token(
+        "gqa",
+        gqa_kv_bytes_per_token(
+            u64::from(resolved.num_layers),
+            u64::from(attn.num_kv_heads.get()),
+            u64::from(attn.head_dim.get()),
+            u64::from(attn.head_dim.get()),
+            u64::from(attn.kv_dtype().size_bytes()),
+        ),
     )
+    .placed(gqa_placement(u64::from(attn.num_kv_heads.get()), 1))
 }
 
 pub fn resolve_configs(cfgs: &Llama3DenseConfigs) -> Llama3DenseResolved {
@@ -193,7 +196,7 @@ pub fn build(
     bridge: &PerfApiBridge,
 ) -> Result<Llama3DenseModel, BuildError> {
     let num_layers = resolved.num_layers;
-    let kv_bytes_per_token = kv_bytes_per_token(&resolved);
+    let kv_cache_part = gqa_kv_part(&resolved);
 
     let embed_name = format!("{model_name}.embedding");
     let final_norm_name = format!("{model_name}.final_norm");
@@ -246,7 +249,7 @@ pub fn build(
         lm_head,
         name: model_name,
         num_layers,
-        kv_bytes_per_token,
+        kv_cache_part,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -341,7 +344,7 @@ impl Llama3DenseModel {
 
 impl IterwiseUnifiedModel for Llama3DenseModel {
     fn kv_cache_layout(&self) -> KvCacheLayout {
-        KvCacheLayout::new().with_part(KvCachePart::per_token("gqa", self.kv_bytes_per_token))
+        KvCacheLayout::new().with_part(self.kv_cache_part)
     }
 
     /// Dense *local* arch: one replica runs the whole model on a single GPU (no

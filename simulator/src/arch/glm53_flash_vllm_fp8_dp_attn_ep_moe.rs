@@ -519,6 +519,7 @@ pub fn build(
         kda_layers,
         kda_layers.div_ceil(dsa_layers.max(1)),
         tp_arch::hybrid_block_tokens(kda_state_bytes, u64::from(model_cfg.kv_lora_rank)),
+        1,
     );
     let mut model = Glm53FlashDpAttnEpModel {
         embedding: atomic(

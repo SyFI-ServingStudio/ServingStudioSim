@@ -19,6 +19,13 @@ normal matrix with the fork's own MXFP8 quantizer.
 vLLM enables FlashInfer autotune at kernel warmup by default, so the runner
 tunes the exact call once (persisted via ``autotune_cached``) before timing.
 CUPTI time is the sum of every kernel in the sequence (``kernel_name=None``).
+
+``flashinfer_mxfp8_prequantized`` times step 2 alone: the same ``apply_weights``
+called with a ``QuantizedActivation`` (e4m3 data + F8_128x4 ue8m0 scales), which
+skips step 1. That is the production call wherever the producer already wrote
+MXFP8 -- e.g. DeepSeek-V4.1's ``wo_b`` after the ``wo_a`` einsum
+(``flash_mla_mega_attn.py`` ``_o_proj``) and ``wq_b`` / indexer ``wq_b`` after
+``fused_q_kv_rmsnorm_quant`` (``attention.py`` ``_split_qkv_and_norm``).
 The GEMM launches with PDL, but on B200 the interval union of the two kernels
 measured within 0.3% of the sum at every smoked shape, so the overlap is
 negligible.
@@ -31,6 +38,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners import tactic_labels
 from profiling.runners.autotune_cache import autotune_cached
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
@@ -80,8 +88,11 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
     supported, reason = FlashInferCutedslMxfp8LinearKernel.is_supported()
     if not supported:
         raise ProfilerNotImplemented(f"FlashInfer CuTe-DSL MXFP8 linear unavailable: {reason}")
-    kernel = FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearLayerConfig())
-    return torch, autotune, kernel, mxfp8_e4m3_quantize
+
+    def make_kernel(n: int, k: int) -> Any:
+        return FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearLayerConfig(weight_shape=(n, k)))
+
+    return torch, autotune, make_kernel, mxfp8_e4m3_quantize
 
 
 def _dequantize(torch: Any, data: Any, scale_2d: Any) -> Any:
@@ -123,8 +134,38 @@ def profile_single_gemm_flashinfer_mxfp8(
     k: int,
     dtype: DType | str,
 ) -> ComputeMetrics:
+    return _profile(m, n, k, dtype, prequantized=False)
+
+
+def profile_single_gemm_flashinfer_mxfp8_prequantized(
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    return _profile(m, n, k, dtype, prequantized=True)
+
+
+def _quantized_activation(torch: Any, quantize: Any, x: Any) -> Any:
+    """The ``QuantizedActivation`` an MXFP8 producer hands the linear."""
+    from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+
+    x_q, x_scale = quantize(x, is_sf_swizzled_layout=True)
+    return QuantizedActivation(x_q, x_scale, torch.bfloat16, x.shape, kMxfp8Dynamic)
+
+
+def _profile(
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+    *,
+    prequantized: bool,
+) -> ComputeMetrics:
     m, n, k = _validate(m, n, k, dtype)
-    torch, autotune, kernel, quantize = _load_runtime()
+    torch, autotune, make_kernel, quantize = _load_runtime()
+    kernel = make_kernel(n, k)
     try:
         torch.manual_seed(0)
         weight_q, weight_scale_2d = quantize(
@@ -133,15 +174,18 @@ def profile_single_gemm_flashinfer_mxfp8(
         )
         weight_scale_2d = weight_scale_2d.view(n, -1)
         layer = torch.nn.Module()
+        # apply_weights casts a bf16 activation's output to the layer dtype.
+        layer.params_dtype = torch.bfloat16
         layer.weight = torch.nn.Parameter(weight_q.clone(), requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(weight_scale_2d.clone(), requires_grad=False)
         kernel.process_weights_after_loading(layer)
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        activation = _quantized_activation(torch, quantize, x) if prequantized else x
 
         def run_once() -> Any:
-            return kernel.apply_weights(layer, x)
+            return kernel.apply_weights(layer, activation)
 
-        with autotune_cached(autotune, "single_gemm.flashinfer_mxfp8"):
+        with autotune_cached(autotune, tactic_labels.flashinfer_mxfp8()):
             run_once()
         out = run_once()
         torch.cuda.synchronize()
@@ -160,7 +204,8 @@ def profile_single_gemm_flashinfer_mxfp8(
     # Quant reads bf16 x and writes e4m3 + scales; the GEMM reads both e4m3
     # operands with their scales and writes bf16.
     scale_bytes = (m + n) * (k // MXFP8_BLOCK)
-    bytes_accessed = 2 * m * k + 2 * m * k + n * k + scale_bytes + 2 * m * n
+    gemm_bytes = m * k + n * k + scale_bytes + 2 * m * n
+    bytes_accessed = gemm_bytes if prequantized else 2 * m * k + m * k + gemm_bytes
     elapsed_s = time_ms / 1000.0
     return ComputeMetrics(
         time_ms=float(time_ms),
@@ -170,4 +215,8 @@ def profile_single_gemm_flashinfer_mxfp8(
     )
 
 
-__all__ = ["check_against_dequantized_reference", "profile_single_gemm_flashinfer_mxfp8"]
+__all__ = [
+    "check_against_dequantized_reference",
+    "profile_single_gemm_flashinfer_mxfp8",
+    "profile_single_gemm_flashinfer_mxfp8_prequantized",
+]

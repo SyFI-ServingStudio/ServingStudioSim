@@ -559,7 +559,6 @@ fn kv_cache_layout(
         u64::from(model.qsa_head_dim),
         u64::from(model.qsa_head_dim),
         u64::from(parallel.kv_cache_dtype.dtype().size_bytes()),
-        1,
     );
     // FP8 index keys carry no scales (`indexer_qsa.py:147-175`).
     let index_entry = u64::from(model.indexer_kv_heads * model.indexer_head_dim)

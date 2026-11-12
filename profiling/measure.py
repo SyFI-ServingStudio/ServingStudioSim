@@ -33,8 +33,14 @@ from profiling.exec.env import (
     resolve_profile_env,
     set_worker_python_env,
 )
-from profiling.exec.local import _container_worker_command, find_idle_gpus
+from profiling.exec.local import (
+    _container_worker_command,
+    _log_tuning,
+    autotune_policy,
+    find_idle_gpus,
+)
 from profiling.gpu_policy import require_gpu
+from reference_engines.autotune_guard import POLICY_ENV
 
 
 class MeasureError(RuntimeError):
@@ -87,7 +93,10 @@ def measure_kernel(
         spec=spec,
         gpu_index=gpu_index,
         profiler_env=profiler_env,
-        worker_env=dict(profiler_spec.worker_env),
+        # The autotune decision is local.py's, like every L1 worker's: this
+        # verb re-measures no DB row, so it tunes like a fill (before the
+        # CUPTI window) and logs what it tuned.
+        worker_env={**dict(profiler_spec.worker_env), POLICY_ENV: autotune_policy()},
         imex_channel=profiler_spec.imex_channel,
         measure_block={
             "output_dir": str(resolved_output_dir),
@@ -99,6 +108,7 @@ def measure_kernel(
         },
     )
 
+    _log_tuning(kernel_kind, resolved_backend, response.get("autotune"))
     measure_result = response.get("measure") or {}
     if not measure_result.get("consumed"):
         raise MeasureError(

@@ -246,12 +246,17 @@ def _get_times(
         # return the freshly persisted rows through the same table path.
         profile_specs = [dict(args_to_spec(args), backend=backend) for args in args_list]
         if profile_specs:
-            outcome = execute_profile_batch(
-                kernel_kind,
-                profile_specs,
-                db_path=db_path if persist else None,
-                gpu_name=resolved_gpu,
-            )
+            from profiling.exec.local import refreshing_rows
+
+            # Re-measuring rows: autotuning is forbidden unless --allow-autotune
+            # (the policy table is profiling/exec/local.py:autotune_policy).
+            with refreshing_rows():
+                outcome = execute_profile_batch(
+                    kernel_kind,
+                    profile_specs,
+                    db_path=db_path if persist else None,
+                    gpu_name=resolved_gpu,
+                )
         results = (
             table.query(args_list, backend=backend, gpu_name=resolved_gpu)
             if persist

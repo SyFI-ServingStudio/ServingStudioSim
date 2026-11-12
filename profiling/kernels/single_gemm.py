@@ -18,8 +18,10 @@ production BF16 dispatches, SM100 only), ``deepgemm`` (FP8 dense GEMM,
 linear on SM10x, ``dtype = fp8_e4m3``), ``flashinfer_cutedsl`` (vLLM's default NVFP4 W4A4
 linear on SM10x, ``dtype = nvfp4_e2m1``), and ``flashinfer_mxfp8`` (MXFP8 dense
 linear: activation quant + FlashInfer CuTe-DSL block-scaled GEMM,
-``dtype = mxfp8_e4m3``), and ``sglang_triton_block32_fp8`` (SGLang's block-32 FP8
-linear on SM12x: per-32 UE8M0 activation quant + Triton GEMM, ``dtype = fp8_e4m3``).
+``dtype = mxfp8_e4m3``), ``flashinfer_mxfp8_prequantized`` (the same linear
+fed an already-quantized MXFP8 activation: the GEMM alone), and ``sglang_triton_block32_fp8``
+(SGLang's block-32 FP8 linear on SM12x: per-32 UE8M0 activation quant + Triton GEMM,
+``dtype = fp8_e4m3``).
 BF16/FP16 model defaults offer both generic Torch variants and the timing cache
 selects the faster one per shape.
 
@@ -43,6 +45,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.runners import tactic_labels
 
 KIND: str = "single_gemm"
 
@@ -85,7 +88,9 @@ DOC = KernelDoc(
         "because the weight layout changes which cuBLAS kernel runs.",
         "flashinfer_mxfp8 takes bf16 activations and includes their MXFP8 "
         "quantization in the time; its GB/s adds the bf16 read and the "
-        "quantized write of the activation.",
+        "quantized write of the activation. flashinfer_mxfp8_prequantized is "
+        "the same call on an activation its producer already quantized, so it "
+        "times the GEMM alone.",
     ),
     method=(
         f"{CUPTI_METHOD} The torch and SGLang backends count overlapping launches "
@@ -93,7 +98,8 @@ DOC = KernelDoc(
         "GEMM into several; deepgemm, flashinfer_fp8_tensor, flashinfer_cutedsl and "
         "flashinfer_mxfp8 sum their launches. flashinfer_cutedsl times only the GEMM: "
         "the activation quantization before it is the nvfp4_quant kind. flashinfer_mxfp8 includes "
-        "its activation quantization and autotunes the call once before timing. "
+        "its activation quantization and autotunes the call once before timing; "
+        "flashinfer_mxfp8_prequantized passes a QuantizedActivation and times the GEMM only. "
         "flashinfer_fp8_tensor times only the GEMM on already-quantized fp8 input, "
         "after autotuning FlashInfer's hybrid token buckets as vLLM's warmup does."
     ),
@@ -303,6 +309,7 @@ register(
             module_name="profiling.runners.gemm.flashinfer_fp8_tensor",
             function_name="profile_single_gemm_flashinfer_fp8_tensor",
         ),
+        tactic_label=tactic_labels.flashinfer_fp8_tensor,
         table_name=KIND,
         args_schema=SingleGemmArgs,
         metric_family=MetricFamily.COMPUTE,
@@ -370,6 +377,7 @@ register(
             module_name="profiling.runners.gemm.flashinfer_mxfp8",
             function_name="profile_single_gemm_flashinfer_mxfp8",
         ),
+        tactic_label=tactic_labels.flashinfer_mxfp8,
         table_name=KIND,
         args_schema=SingleGemmArgs,
         metric_family=MetricFamily.COMPUTE,
@@ -380,6 +388,38 @@ register(
                 "vLLM's FlashInferCutedslMxfp8LinearKernel: FlashInfer MXFP8 "
                 "quantization of the bf16 activation (UE8M0 per 32, swizzled) and "
                 "the CuTe-DSL block-scaled GEMM mm_mxfp8, bf16 output."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py",
+        ),
+    )
+)
+
+# The same linear fed a QuantizedActivation (e4m3 + F8_128x4 ue8m0 scales) that
+# its producer wrote, so apply_weights skips the quant and one slot = the GEMM.
+# A separate backend, like flashinfer_cutedsl beside nvfp4_quant: the args are
+# the GEMM shape either way, and which call runs is the backend's identity.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_mxfp8_prequantized",
+        supports=BackendSupport(
+            compute=frozenset({DType.MXFP8_E4M3}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.flashinfer_mxfp8",
+            function_name="profile_single_gemm_flashinfer_mxfp8_prequantized",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's FlashInferCutedslMxfp8LinearKernel on an already-quantized "
+                "MXFP8 activation (QuantizedActivation): the CuTe-DSL block-scaled "
+                "GEMM mm_mxfp8 alone, bf16 output."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py",
         ),

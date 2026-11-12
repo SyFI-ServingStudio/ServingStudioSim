@@ -32,6 +32,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners import tactic_labels
 from profiling.runners.autotune_cache import autotune_cached
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
@@ -117,7 +118,7 @@ def profile_single_gemm_flashinfer_fp8_tensor(
             return scaled_fp8_mm(a, weight_t, scale_a, scale_w, torch.bfloat16)
 
         with (
-            autotune_cached(autotune, "single_gemm.flashinfer_fp8_tensor"),
+            autotune_cached(autotune, tactic_labels.flashinfer_fp8_tensor()),
             autotune(tuning_buckets=serving_buckets(m)),
         ):
             run_once()
