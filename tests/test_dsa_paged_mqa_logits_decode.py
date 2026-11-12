@@ -1053,3 +1053,30 @@ def test_ragged_first_request_check_matches_the_reference():
     )
     first_len = _request_context_lens(4, 200, mode)[0]
     _check_first_request(torch, operands, expected, context_len=first_len, max_model_len=256)
+
+
+@pytest.mark.parametrize(
+    ("next_n", "num_heads", "passes"),
+    [(1, 32, 1), (4, 32, 1), (5, 32, 2), (8, 32, 2), (2, 64, 1), (3, 64, 2), (8, 64, 4)],
+)
+def test_key_bytes_count_each_pass_not_each_query_row(next_n, num_heads, passes):
+    """Counting keys once per query row billed 26 TB/s on B200, above HBM, so
+    every roofline rung collapsed onto the measured time."""
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
+        _logical_scheduled_bytes,
+    )
+
+    shape = {"batch_size": 16, "context_len": 4096, "num_heads": num_heads, "head_dim": 128}
+    key_bytes = 16 * 4096 * (128 + 4)
+    fixed = (
+        16 * next_n * num_heads * 128
+        + 4 * 16 * next_n * num_heads
+        + 4 * 16 * (4096 // 64)
+        + 4 * 16 * next_n
+        + 4 * next_n * 16 * 4096
+    )
+
+    assert (
+        _logical_scheduled_bytes(next_n=next_n, block_size=64, **shape)
+        == fixed + passes * key_bytes
+    )

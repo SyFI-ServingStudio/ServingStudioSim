@@ -12,6 +12,7 @@ from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
     _check_deepgemm_launch_bounds,
+    _key_passes,
 )
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
@@ -335,7 +336,7 @@ def profile_contiguous_deepgemm_fp8(
         logical_bytes = (
             batch_size * next_n * num_heads * head_dim
             + batch_size * next_n * num_heads * 4
-            + scheduled_tokens * (head_dim + 4)
+            + (scheduled_tokens // next_n) * (head_dim + 4) * _key_passes(next_n, num_heads)
             + batch_size * ((context_len + block_size - 1) // block_size) * 4
             + batch_size * next_n * 4
             + scheduled_tokens * 4

@@ -558,6 +558,19 @@ def _scheduled_work(
     return total_pages, scheduled_cells, nominal_flops
 
 
+# Query-head rows scored per pass over a request's keys. DeepGEMM's SM100 paged
+# MQA logits tiles BLOCK_Q query tokens x num_heads heads as the MMA N side of a
+# 128-row key tile and loads the keys once per such Q block (scheduler
+# RequestInfo.num_q_blocks); B200 rows at H32 are flat for next_n 1-4 and step
+# up at 5-8, and at H64 step up at 3-4 and again at 8, i.e. 128 rows per pass.
+_QUERY_ROWS_PER_KEY_PASS = 128
+
+
+def _key_passes(next_n: int, num_heads: int) -> int:
+    """Passes the kernel makes over each request's keys."""
+    return -(-(next_n * num_heads) // _QUERY_ROWS_PER_KEY_PASS)
+
+
 def _logical_scheduled_bytes(
     *,
     batch_size: int,
@@ -568,12 +581,17 @@ def _logical_scheduled_bytes(
     block_size: int,
     context_mode: str = _CONTEXT_MODE,
 ) -> int:
-    """Return scheduled logical bytes, excluding Torch/TMA intermediates.
+    """Return the DRAM bytes the scheduled kernel reads and writes.
 
     The count covers Q, weights, block-rounded cache keys/scales, block/context
-    metadata, and ``4 * C`` output bytes. ``max_model_len`` deliberately is not
-    an argument: it controls the returned allocation shape, not scheduled cache
-    work in the production kernel model.
+    metadata, and ``4 * C`` output bytes. Each request's keys and scales are
+    counted once per pass over them, not once per query row: one pass scores
+    ``_QUERY_ROWS_PER_KEY_PASS`` query-head rows (``next_n * num_heads``), so a
+    request with more rows reads its keys ``_key_passes`` times. The second pass
+    is a real re-read; counting the keys per row instead would charge 26 TB/s
+    on B200 and hide every gap below the measured time. ``max_model_len``
+    deliberately is not an argument: it controls the returned allocation shape,
+    not scheduled cache work in the production kernel model.
     """
     total_pages, scheduled_cells, _nominal_flops = _scheduled_work(
         batch_size=batch_size,
@@ -587,7 +605,7 @@ def _logical_scheduled_bytes(
     return (
         batch_size * next_n * num_heads * head_dim
         + 4 * batch_size * next_n * num_heads
-        + (head_dim + 4) * scheduled_cells
+        + (head_dim + 4) * block_size * total_pages * _key_passes(next_n, num_heads)
         + 4 * total_pages
         + 4 * batch_size * next_n
         + 4 * scheduled_cells
