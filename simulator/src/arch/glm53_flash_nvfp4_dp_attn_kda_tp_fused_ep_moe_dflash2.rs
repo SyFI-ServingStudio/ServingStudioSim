@@ -45,7 +45,11 @@
 //!   bf16 partial sums go back by a reduce-scatter that each owner sums. The
 //!   dispatch store is assumed fused into the activation-quant kernel, and
 //!   the combine read and its sum into the next op.
-//! * **mHC boundaries.** vLLM's kernels, unfused.
+//! * **mHC boundaries.** vLLM's kernels, unfused (the presets pick the
+//!   TileLang ones); `mhc_one_launch` prices the measured one-launch kernel
+//!   instead.
+//! * **Router gate.** Once per MoE layer (`router_gate_once`, default on: the
+//!   vLLM fork's GateLinear since #55736).
 //!
 //! # Where each component's time comes from
 //!
@@ -56,7 +60,7 @@
 //! |---|---|
 //! | KDA kernels and projections at TP `b` | 实测 (TP-`b` rows) |
 //! | f_b / g_b batched GEMM | 实测 (`batched_gemm` `torch_bmm_packed_lhs`) |
-//! | DSA, dense FFN, shared expert, router, mHC pre/post (vLLM kernels) | 实测 |
+//! | DSA, dense FFN, shared expert, router gate (GateLinear), mHC pre/post (TileLang) | 实测 |
 //! | KDA output reduce-scatter | 实测 at 8 GPUs (`moe_ep_reduce_scatter` `mnnvl_pull` rows); `b < 8` reads them at the per-rank counts that receive the same bytes, keeping the 8-peer fixed cost (over-prices) |
 //! | KDA input all-gather | stand-in: the reduce-scatter row at the same counts (same bytes received plus an fp32 sum; not measured on its own) |
 //! | routed experts (`nvfp4_fused_moe`, routing precomputed) | 实测 |
@@ -79,12 +83,8 @@
 //!   row as a stand-in. A bf16 fixed-pattern all-gather row (and rows at 2
 //!   and 4 GPUs) would replace it inside
 //!   `glm53_flash_vllm_fp8_dp_attn_ep_moe::KdaGatherScatter`; no new param.
-//! * **Fused mHC boundary / router gate once** (worktree `wt-flash-mhc-fuse`):
-//!   it replaces the target builder's `mhc_fuse_fixed_us` with
-//!   `Glm53FlashFusions { mhc_boundary, router_gate_once }`, read from new
-//!   `mhc_one_launch` / `router_gate_once` selector keys. Once merged, add
-//!   those two keys (same names) to this tag and copy them through
-//!   [`target_selector`]; never the fixed-us what-if.
+//! * **One-launch mHC rows** (worktree `wt-flash-mhc-fuse`): `mhc_one_launch`
+//!   is wired through; its `cuda_one_launch` rows are not in the shared DB yet.
 
 use anyhow::{bail, ensure, Result};
 
@@ -112,6 +112,8 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         indexer_max_logits_mb,
         draft_tokens,
         kda_state_dtype,
+        mhc_one_launch,
+        router_gate_once,
         hisparse_buffer_tokens,
         hisparse_top_k,
         hisparse_host_dram_gb_per_node,
@@ -167,6 +169,8 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         ep_fanout_ranks: None,
         ep_combine_row_bytes: None,
         mhc_fuse_fixed_us: None,
+        mhc_one_launch: *mhc_one_launch,
+        router_gate_once: *router_gate_once,
     })
 }
 
@@ -216,6 +220,7 @@ mod tests {
                 "attn_tp_layers": "kda_only",
                 "attn_tp_collective": "fixed_gather_scatter",
                 "kda_gate_b_merged": true,
+                "router_gate_once": true,
             }))
             .unwrap();
             let sel: IterArchSel = serde_json::from_value(tag(b)).unwrap();

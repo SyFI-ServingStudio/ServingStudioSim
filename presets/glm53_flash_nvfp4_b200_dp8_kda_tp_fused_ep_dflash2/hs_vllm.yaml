@@ -51,6 +51,7 @@ pools:
           2048]
         draft_tokens: 3
         kda_state_dtype: bf16
+        router_gate_once: true
         hisparse_buffer_tokens: 49152
         hisparse_top_k: 2048
         hisparse_host_dram_gb_per_node: 1500

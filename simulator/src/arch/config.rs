@@ -175,6 +175,10 @@ const fn default_kda_tp_fused_ep_size() -> u16 {
     8
 }
 
+const fn default_kda_tp_fused_router_gate_once() -> bool {
+    true
+}
+
 const fn default_kda_tp_fused_kda_state_dtype() -> KdaStateDtype {
     KdaStateDtype::Bf16
 }
@@ -1783,6 +1787,17 @@ pub enum IterArchSel {
         #[serde(default = "default_kda_tp_fused_kda_state_dtype")]
         #[param(string, default = "bf16", choices = KDA_STATE_DTYPES, cache_key)]
         kda_state_dtype: KdaStateDtype,
+        /// Price the mHC post/pre boundaries from the measured one-launch
+        /// kernel instead of vLLM's kernel (the backends file picks which of
+        /// vLLM's: TileLang in the presets).
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        mhc_one_launch: bool,
+        /// Compute the MoE router gate once per layer (the vLLM fork since
+        /// #55736; the default here) instead of twice.
+        #[serde(default = "default_kda_tp_fused_router_gate_once")]
+        #[param(default = true, cache_key)]
+        router_gate_once: bool,
         /// SGLang HiSparse KV offload of the 11 DSA layers (as on
         /// [`Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2`]); absent keeps the
         /// whole cache on the GPU.

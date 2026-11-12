@@ -48,6 +48,7 @@ pools:
           2048]
         draft_tokens: 7
         kda_state_dtype: bf16
+        router_gate_once: true
       worker:
         type: speculative
         max_batch_tokens: 8192
