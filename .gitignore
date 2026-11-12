@@ -60,3 +60,6 @@ model/work/examples/
 # Reference-engine source trees: `just ref materialize <engine>` rebuilds them
 # from the engine's BASE and patches/ (reference_engines/README.md).
 reference_engines/*/src/
+
+# Local links to the GLM-5.3-Flash 600k decode traces (presets/glm53_flash_nvfp4_b200_dp8_kda_tp_fused_ep_dflash2).
+/trace/glm53_flash_600k_decode_k*.csv

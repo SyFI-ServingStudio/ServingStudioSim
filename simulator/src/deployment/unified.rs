@@ -1027,6 +1027,23 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { draft_tokens, .. } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(
+                    arch_build::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2(
+                        &g.arch, &gpu_name, MODEL_NAME, bridge,
+                    )?,
+                );
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
             // DFlash2 on the GLM-5.3 DP target: no recurrent state, and the
             // draft's KV is full attention per token, so the plain speculative
             // recipe's per-token store sizes each rank's partition.

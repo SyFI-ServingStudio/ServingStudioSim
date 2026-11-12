@@ -2404,6 +2404,24 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
     .context("building GLM-5.3-Flash NVFP4 DP + DFlash2 (often a missing profile.db row)")
 }
 
+/// The `glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2` design: the
+/// knob-by-knob Flash DP + DFlash2 selector it fixes
+/// (`arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2`).
+pub fn glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2(
+    sel: &IterArchSel,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<
+    glm53_flash_vllm_nvfp4_dflash2::Dflash2VerifyModel<
+        glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpModel,
+    >,
+> {
+    let target =
+        crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::target_selector(sel)?;
+    glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(&target, gpu, name, bridge)
+}
+
 /// GLM-5.3 NVFP4 (DP-attention/EP graph) verifying the GLM-5.3 DFlash2
 /// proposer: one TP1 draft per attention DP rank. The target is
 /// [`glm52_vllm_nvfp4_dp_attn_dsa_moe`] compiled at verify width
@@ -3182,6 +3200,7 @@ pub fn build_iter_model(
         | IterArchSel::Glm53VllmNvfp4DpAttnEpMoeDflash2 { .. }
         | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { .. }
         | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. }
+        | IterArchSel::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { .. }
         | IterArchSel::DeepseekV41VllmDspark { .. }
         | IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark { .. }
         | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {
@@ -3264,6 +3283,12 @@ pub fn build_speculative_iter_model(
         )),
         IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { draft_tokens, .. } => Ok((
             Box::new(glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+                selector, gpu, name, bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { draft_tokens, .. } => Ok((
+            Box::new(glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2(
                 selector, gpu, name, bridge,
             )?),
             *draft_tokens,
@@ -3641,6 +3666,7 @@ fn build_arch(
                     | IterArchSel::Glm53VllmNvfp4DpAttnEpMoeDflash2 { .. }
                     | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { .. }
                     | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { .. }
+                    | IterArchSel::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { .. }
                     | IterArchSel::DeepseekV41VllmDspark { .. }
                     | IterArchSel::DeepseekV41VllmDpAttnEpMoeDspark { .. }
                     | IterArchSel::Qwen4ExpVllmNvfp4GdnQsaMoeSpeculative { .. } => {

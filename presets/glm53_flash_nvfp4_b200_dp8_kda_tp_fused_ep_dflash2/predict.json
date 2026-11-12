@@ -1,0 +1,653 @@
+{
+  "arch": {
+    "speculative_iter": {
+      "type": "glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2",
+      "model_config": "model/config/glm53_flash_nvfp4.json",
+      "fp8": false,
+      "kda_tp_gpus": 8,
+      "max_model_len": 1048576,
+      "routing": "corpus",
+      "token_corpus_file": "hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm53_flash_fp8/vllm/balanced_c32/capture/20260924/manifest.json",
+      "cudagraph_capture_sizes": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        24,
+        32,
+        40,
+        48,
+        56,
+        64,
+        72,
+        80,
+        88,
+        96,
+        104,
+        112,
+        120,
+        128,
+        136,
+        144,
+        152,
+        160,
+        168,
+        176,
+        184,
+        192,
+        200,
+        208,
+        216,
+        224,
+        232,
+        240,
+        248,
+        256,
+        272,
+        288,
+        304,
+        320,
+        336,
+        352,
+        368,
+        384,
+        400,
+        416,
+        432,
+        448,
+        464,
+        480,
+        496,
+        512,
+        528,
+        544,
+        560,
+        576,
+        592,
+        608,
+        624,
+        640,
+        656,
+        672,
+        688,
+        704,
+        720,
+        736,
+        752,
+        768,
+        784,
+        800,
+        816,
+        832,
+        848,
+        864,
+        880,
+        896,
+        912,
+        928,
+        944,
+        960,
+        976,
+        992,
+        1008,
+        1024,
+        1040,
+        1056,
+        1072,
+        1088,
+        1104,
+        1120,
+        1136,
+        1152,
+        1168,
+        1184,
+        1200,
+        1216,
+        1232,
+        1248,
+        1264,
+        1280,
+        1296,
+        1312,
+        1328,
+        1344,
+        1360,
+        1376,
+        1392,
+        1408,
+        1424,
+        1440,
+        1456,
+        1472,
+        1488,
+        1504,
+        1520,
+        1536,
+        1552,
+        1568,
+        1584,
+        1600,
+        1616,
+        1632,
+        1648,
+        1664,
+        1680,
+        1696,
+        1712,
+        1728,
+        1744,
+        1760,
+        1776,
+        1792,
+        1808,
+        1824,
+        1840,
+        1856,
+        1872,
+        1888,
+        1904,
+        1920,
+        1936,
+        1952,
+        1968,
+        1984,
+        2000,
+        2016,
+        2032,
+        2048
+      ],
+      "draft_tokens": 7
+    }
+  },
+  "gpu": "NVIDIA B200",
+  "log_dir": "logs/predict_glm53_flash_nvfp4_b200_dp8_kda_tp_fused_ep_dflash2",
+  "cases_file": "predict_cases.json",
+  "backends": {
+    "main": {
+      "unified.first_kda_dense.attn_mhc_pre": [
+        "vllm_tilelang"
+      ],
+      "unified.first_kda_dense.kda.in_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.first_kda_dense.kda.f_b_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.first_kda_dense.kda.g_b_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.first_kda_dense.kda.short_conv_prefill": [
+        "dao_channellast"
+      ],
+      "unified.first_kda_dense.kda.short_conv_decode": [
+        "vllm_triton"
+      ],
+      "unified.first_kda_dense.kda.prefill_glue": [
+        "triton"
+      ],
+      "unified.first_kda_dense.kda.state_gather": [
+        "triton"
+      ],
+      "unified.first_kda_dense.kda.chunk_prefill": [
+        "flashinfer_cute_persistent"
+      ],
+      "unified.first_kda_dense.kda.recoverssm_verify": [
+        "flashinfer_cute"
+      ],
+      "unified.first_kda_dense.kda.state_scatter": [
+        "triton"
+      ],
+      "unified.first_kda_dense.kda.gated_norm": [
+        "triton"
+      ],
+      "unified.first_kda_dense.kda.o_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.first_kda_dense.dense_ffn.gate_up_input_quant": [
+        "vllm_cuda"
+      ],
+      "unified.first_kda_dense.dense_ffn.gate_up": [
+        "flashinfer_cutedsl"
+      ],
+      "unified.first_kda_dense.dense_ffn.act_and_mul": [
+        "triton"
+      ],
+      "unified.first_kda_dense.dense_ffn.down_input_quant": [
+        "vllm_cuda"
+      ],
+      "unified.first_kda_dense.dense_ffn.down": [
+        "flashinfer_cutedsl"
+      ],
+      "unified.first_kda_dense.ffn_mhc_post_pre": [
+        "deepgemm_mega_nonshifted"
+      ],
+      "unified.kda_dense.attn_mhc_post_pre": [
+        "deepgemm_mega_nonshifted"
+      ],
+      "unified.kda_dense.kda.in_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.kda_dense.kda.f_b_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.kda_dense.kda.g_b_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.kda_dense.kda.short_conv_prefill": [
+        "dao_channellast"
+      ],
+      "unified.kda_dense.kda.short_conv_decode": [
+        "vllm_triton"
+      ],
+      "unified.kda_dense.kda.prefill_glue": [
+        "triton"
+      ],
+      "unified.kda_dense.kda.state_gather": [
+        "triton"
+      ],
+      "unified.kda_dense.kda.chunk_prefill": [
+        "flashinfer_cute_persistent"
+      ],
+      "unified.kda_dense.kda.recoverssm_verify": [
+        "flashinfer_cute"
+      ],
+      "unified.kda_dense.kda.state_scatter": [
+        "triton"
+      ],
+      "unified.kda_dense.kda.gated_norm": [
+        "triton"
+      ],
+      "unified.kda_dense.kda.o_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.kda_dense.dense_ffn.gate_up_input_quant": [
+        "vllm_cuda"
+      ],
+      "unified.kda_dense.dense_ffn.gate_up": [
+        "flashinfer_cutedsl"
+      ],
+      "unified.kda_dense.dense_ffn.act_and_mul": [
+        "triton"
+      ],
+      "unified.kda_dense.dense_ffn.down_input_quant": [
+        "vllm_cuda"
+      ],
+      "unified.kda_dense.dense_ffn.down": [
+        "flashinfer_cutedsl"
+      ],
+      "unified.kda_dense.ffn_mhc_post_pre": [
+        "deepgemm_mega_nonshifted"
+      ],
+      "unified.dsa_moe.attn_mhc_post_pre": [
+        "deepgemm_mega_nonshifted"
+      ],
+      "unified.dsa_moe.dsa.fused_qkv_a": [
+        "torch_linear_vllm"
+      ],
+      "unified.dsa_moe.dsa.q_kv_a_norm": [
+        "vllm_triton"
+      ],
+      "unified.dsa_moe.dsa.q_b_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.dsa_moe.dsa.indexer.wq_b": [
+        "torch_linear_vllm"
+      ],
+      "unified.dsa_moe.dsa.indexer.wk_weights": [
+        "torch_linear_vllm"
+      ],
+      "unified.dsa_moe.dsa.indexer.head_weights": [
+        "torch_cublas"
+      ],
+      "unified.dsa_moe.dsa.indexer.k_norm": [
+        "triton"
+      ],
+      "unified.dsa_moe.dsa.indexer.q_fwht_quant": [
+        "triton"
+      ],
+      "unified.dsa_moe.dsa.indexer.weight_scale": [
+        "triton"
+      ],
+      "unified.dsa_moe.dsa.indexer.kpool_gate_score": [
+        "torch_linear_vllm"
+      ],
+      "unified.dsa_moe.dsa.indexer.prefill_gather": [
+        "triton"
+      ],
+      "unified.dsa_moe.dsa.indexer.kpool_decode_update": [
+        "triton"
+      ],
+      "unified.dsa_moe.dsa.indexer.kpool_prefill_write": [
+        "triton"
+      ],
+      "unified.dsa_moe.dsa.indexer.kpool_tail_seed": [
+        "triton"
+      ],
+      "unified.dsa_moe.dsa.indexer.mqa_logits_decode": [
+        "deepgemm_fp8"
+      ],
+      "unified.dsa_moe.dsa.indexer.topk_decode": [
+        "vllm_cuda"
+      ],
+      "unified.dsa_moe.dsa.indexer.mqa_logits_prefill": [
+        "deepgemm_fp8"
+      ],
+      "unified.dsa_moe.dsa.indexer.topk_prefill": [
+        "deep_select",
+        "vllm_cuda"
+      ],
+      "unified.dsa_moe.dsa.indexer.expand_pools": [
+        "triton"
+      ],
+      "unified.dsa_moe.dsa.q_absorb": [
+        "torch_mla_q_absorb_no_rope"
+      ],
+      "unified.dsa_moe.dsa.q_concat": [
+        "triton"
+      ],
+      "unified.dsa_moe.dsa.q_fp8_quant": [
+        "triton"
+      ],
+      "unified.dsa_moe.dsa.sparse_mla.mla_cache_append": [
+        "vllm_cuda"
+      ],
+      "unified.dsa_moe.dsa.sparse_mla.index_remap": [
+        "vllm_triton"
+      ],
+      "unified.dsa_moe.dsa.sparse_mla.prefill": [
+        "flashinfer_trtllm_fp8"
+      ],
+      "unified.dsa_moe.dsa.sparse_mla.decode": [
+        "flashinfer_trtllm_fp8"
+      ],
+      "unified.dsa_moe.dsa.output_copy": [
+        "triton"
+      ],
+      "unified.dsa_moe.dsa.v_up": [
+        "torch_mla_v_up_unpadded"
+      ],
+      "unified.dsa_moe.dsa.o_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.dsa_moe.dsa.glue": [
+        "triton"
+      ],
+      "unified.dsa_moe.dsa.prefill_glue": [
+        "triton"
+      ],
+      "unified.dsa_moe.moe.router.gate": [
+        "torch_cublas"
+      ],
+      "unified.dsa_moe.moe.router.gate_recompute": [
+        "torch_cublas"
+      ],
+      "unified.dsa_moe.moe.input_glue": [
+        "triton"
+      ],
+      "unified.dsa_moe.moe.shared_expert.gate_up": [
+        "torch_linear_vllm"
+      ],
+      "unified.dsa_moe.moe.shared_expert.act_and_mul": [
+        "triton"
+      ],
+      "unified.dsa_moe.moe.shared_expert.down": [
+        "torch_linear_vllm"
+      ],
+      "unified.dsa_moe.moe.router_select": [
+        "triton"
+      ],
+      "unified.dsa_moe.moe.dispatch_quant": [
+        "vllm_cuda"
+      ],
+      "unified.dsa_moe.moe.routed_rank0.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.dsa_moe.moe.routed_rank1.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.dsa_moe.moe.routed_rank2.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.dsa_moe.moe.routed_rank3.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.dsa_moe.moe.routed_rank4.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.dsa_moe.moe.routed_rank5.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.dsa_moe.moe.routed_rank6.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.dsa_moe.moe.routed_rank7.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.dsa_moe.moe.combine_glue": [
+        "triton"
+      ],
+      "unified.dsa_moe.ffn_mhc_post_pre": [
+        "deepgemm_mega_nonshifted"
+      ],
+      "unified.kda_moe.attn_mhc_post_pre": [
+        "deepgemm_mega_nonshifted"
+      ],
+      "unified.kda_moe.kda.in_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.kda_moe.kda.f_b_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.kda_moe.kda.g_b_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.kda_moe.kda.short_conv_prefill": [
+        "dao_channellast"
+      ],
+      "unified.kda_moe.kda.short_conv_decode": [
+        "vllm_triton"
+      ],
+      "unified.kda_moe.kda.prefill_glue": [
+        "triton"
+      ],
+      "unified.kda_moe.kda.state_gather": [
+        "triton"
+      ],
+      "unified.kda_moe.kda.chunk_prefill": [
+        "flashinfer_cute_persistent"
+      ],
+      "unified.kda_moe.kda.recoverssm_verify": [
+        "flashinfer_cute"
+      ],
+      "unified.kda_moe.kda.state_scatter": [
+        "triton"
+      ],
+      "unified.kda_moe.kda.gated_norm": [
+        "triton"
+      ],
+      "unified.kda_moe.kda.o_proj": [
+        "torch_linear_vllm"
+      ],
+      "unified.kda_moe.moe.router.gate": [
+        "torch_cublas"
+      ],
+      "unified.kda_moe.moe.router.gate_recompute": [
+        "torch_cublas"
+      ],
+      "unified.kda_moe.moe.input_glue": [
+        "triton"
+      ],
+      "unified.kda_moe.moe.shared_expert.gate_up": [
+        "torch_linear_vllm"
+      ],
+      "unified.kda_moe.moe.shared_expert.act_and_mul": [
+        "triton"
+      ],
+      "unified.kda_moe.moe.shared_expert.down": [
+        "torch_linear_vllm"
+      ],
+      "unified.kda_moe.moe.router_select": [
+        "triton"
+      ],
+      "unified.kda_moe.moe.dispatch_quant": [
+        "vllm_cuda"
+      ],
+      "unified.kda_moe.moe.routed_rank0.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.kda_moe.moe.routed_rank1.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.kda_moe.moe.routed_rank2.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.kda_moe.moe.routed_rank3.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.kda_moe.moe.routed_rank4.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.kda_moe.moe.routed_rank5.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.kda_moe.moe.routed_rank6.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.kda_moe.moe.routed_rank7.fused_moe": [
+        "flashinfer_trtllm_routed_sm100"
+      ],
+      "unified.kda_moe.moe.combine_glue": [
+        "triton"
+      ],
+      "unified.kda_moe.ffn_mhc_post_pre": [
+        "deepgemm_mega_nonshifted"
+      ],
+      "unified.embedding": [
+        "triton"
+      ],
+      "unified.hc_expand": [
+        "triton"
+      ],
+      "unified.final_mhc_post.fused_reference": [
+        "vllm_tilelang"
+      ],
+      "unified.final_mhc_post.pre_reference": [
+        "vllm_tilelang"
+      ],
+      "unified.hc_contract_mean": [
+        "triton"
+      ],
+      "unified.final_norm": [
+        "vllm_cuda"
+      ],
+      "unified.lm_head": [
+        "torch_linear_vllm"
+      ],
+      "unified.kda_recoverssm_commit_group0": [
+        "tilelang"
+      ],
+      "unified.kda_recoverssm_commit_group1": [
+        "tilelang"
+      ],
+      "unified.kda_recoverssm_commit_group2": [
+        "tilelang"
+      ],
+      "unified.kda_recoverssm_commit_group3": [
+        "tilelang"
+      ],
+      "unified.dflash2.context_kv.aux_hidden_fc": [
+        "torch_linear"
+      ],
+      "unified.dflash2.context_kv.hidden_norm": [
+        "flashinfer"
+      ],
+      "unified.dflash2.context_kv.fused_kv_proj": [
+        "torch_linear"
+      ],
+      "unified.dflash2.context_kv.layer_major_transpose": [
+        "triton"
+      ],
+      "unified.dflash2.context_kv.grouped_k_norm": [
+        "flashinfer"
+      ],
+      "unified.dflash2.context_kv.fused_rope": [
+        "triton"
+      ],
+      "unified.dflash2.context_kv.context_kv_append": [
+        "vllm_cuda"
+      ],
+      "unified.dflash2.layer.attn.input_add_rms_norm": [
+        "vllm_cuda"
+      ],
+      "unified.dflash2.layer.attn.attn_conv_projection": [
+        "torch_linear"
+      ],
+      "unified.dflash2.layer.attn.attn_conv_prepare": [
+        "triton"
+      ],
+      "unified.dflash2.layer.attn.qkv_proj": [
+        "torch_linear"
+      ],
+      "unified.dflash2.layer.attn.q_norm": [
+        "flashinfer"
+      ],
+      "unified.dflash2.layer.attn.k_norm": [
+        "flashinfer"
+      ],
+      "unified.dflash2.layer.attn.rope": [
+        "triton"
+      ],
+      "unified.dflash2.layer.attn.attention": [
+        "fa2"
+      ],
+      "unified.dflash2.layer.attn.o_proj": [
+        "torch_linear"
+      ],
+      "unified.dflash2.layer.ffn.attn_conv_finish": [
+        "triton"
+      ],
+      "unified.dflash2.layer.ffn.post_attn_add_rms_norm": [
+        "vllm_cuda"
+      ],
+      "unified.dflash2.layer.ffn.mlp_conv_projection": [
+        "torch_linear"
+      ],
+      "unified.dflash2.layer.ffn.mlp_conv_prepare": [
+        "triton"
+      ],
+      "unified.dflash2.layer.ffn.gate_up_proj": [
+        "torch_linear"
+      ],
+      "unified.dflash2.layer.ffn.silu_and_mul": [
+        "triton"
+      ],
+      "unified.dflash2.layer.ffn.down_proj": [
+        "torch_linear"
+      ],
+      "unified.dflash2.layer.ffn.mlp_conv_finish": [
+        "triton"
+      ],
+      "unified.dflash2.selector.lm_head": [
+        "torch_linear"
+      ],
+      "unified.dflash2.selector.candidate_topk": [
+        "flashinfer",
+        "torch"
+      ],
+      "unified.dflash2.selector.candidate_topk_merge": [
+        "flashinfer",
+        "torch"
+      ],
+      "unified.dflash2.selector.hidden_projection": [
+        "torch_linear"
+      ],
+      "unified.dflash2.selector.codebook_gather": [
+        "triton"
+      ],
+      "unified.dflash2.selector.edge_scores": [
+        "torch_linear"
+      ]
+    }
+  }
+}

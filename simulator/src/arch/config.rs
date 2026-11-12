@@ -170,6 +170,15 @@ const fn default_glm53_flash_max_model_len() -> u32 {
     8192
 }
 
+/// `glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2`: one B200 node.
+const fn default_kda_tp_fused_ep_size() -> u16 {
+    8
+}
+
+const fn default_kda_tp_fused_kda_state_dtype() -> KdaStateDtype {
+    KdaStateDtype::Bf16
+}
+
 /// The MiMo-V2.6-Flash capture's `--max-model-len` (its attention rows'
 /// FA4 split count).
 const fn default_mimo_v2_max_model_len() -> u32 {
@@ -1694,6 +1703,87 @@ pub enum IterArchSel {
         #[param(cache_key)]
         mhc_fuse_fixed_us: Option<f64>,
     },
+    /// GLM-5.3-Flash NVFP4 + DFlash2 under attention DP with the KDA layers
+    /// tensor-parallel in groups of `kda_tp_gpus`, a fused direct-write
+    /// expert exchange and the merged KDA gate up-projection. Not a vLLM
+    /// layout: a fixed configuration of
+    /// [`Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2`]; the design and the
+    /// pricing source of every component are in
+    /// `arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2`.
+    Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Attention DP ranks, which are also the EP group: one GPU each.
+        #[serde(default = "default_kda_tp_fused_ep_size")]
+        #[param(default = 8, cache_key)]
+        ep_size: u16,
+        /// GPUs per KDA tensor-parallel group (1 = plain DP attention, every
+        /// layer rank-local). Must divide `ep_size`. A static choice per
+        /// deployment: set it per load point (module doc).
+        #[param(cache_key)]
+        kda_tp_gpus: u16,
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        /// MoE routing; no default (a synthetic default would hide a missing
+        /// corpus).
+        #[param(string, choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`, as for the base Flash graph.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// vLLM fork 3f667d7's two sparse-MLA layout copies; vLLM 04730e8 and
+        /// later drop them (the default here).
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        mla_layout_copies: bool,
+        #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
+        #[param(default = 512, cache_key)]
+        indexer_max_logits_mb: u32,
+        /// Candidate positions drafted per request per iteration (at most 7);
+        /// the speculative worker's `draft_tokens` must match.
+        #[serde(default = "default_dflash2_draft_tokens")]
+        #[param(default = 7, cache_key)]
+        draft_tokens: u32,
+        /// KDA recurrent state pool dtype; `bf16` (the default here) adds
+        /// FlashInfer's frozen RecoverSSM verify.
+        #[serde(default = "default_kda_tp_fused_kda_state_dtype")]
+        #[param(string, default = "bf16", choices = KDA_STATE_DTYPES, cache_key)]
+        kda_state_dtype: KdaStateDtype,
+        /// SGLang HiSparse KV offload of the 11 DSA layers (as on
+        /// [`Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2`]); absent keeps the
+        /// whole cache on the GPU.
+        #[serde(default)]
+        hisparse_buffer_tokens: Option<u32>,
+        /// HiSparse: indexer top-k per layer per query position (default 2048).
+        #[serde(default)]
+        hisparse_top_k: Option<u32>,
+        /// HiSparse: host DRAM per node for the latent cache, GB (default 2000).
+        #[serde(default)]
+        hisparse_host_dram_gb_per_node: Option<f64>,
+        /// HiSparse: GPUs sharing a node's host DRAM (default `ep_size`).
+        #[serde(default)]
+        hisparse_gpus_per_node: Option<u16>,
+        /// HiSparse: host -> device GB/s per GPU (default 50).
+        #[serde(default)]
+        hisparse_h2d_gb_per_s: Option<f64>,
+        /// HiSparse: share of the miss copy not hidden by prefetch (default 0.5).
+        #[serde(default)]
+        hisparse_exposed_io_fraction: Option<f64>,
+        /// HiSparse: overlap of consecutive query positions' top-k in one
+        /// verify step (default 0.5).
+        #[serde(default)]
+        hisparse_intra_step_overlap: Option<f64>,
+    },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
     /// TP, so there is no expert-parallel or NVLink-domain selector.
@@ -1927,6 +2017,7 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { model, .. }
             | Self::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { model, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { model, .. }
+            | Self::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. }
             | Self::InklingVllmNvfp4RelAttnMoe { model, .. }
             | Self::MimoV2VllmFp8SwaMoe { model, .. }
@@ -2121,6 +2212,7 @@ impl IterArchSel {
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4KdaDsaMoeDflash2 { max_model_len, .. }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { max_model_len, .. }
+            | Self::Glm53FlashNvfp4DpAttnKdaTpFusedEpMoeDflash2 { max_model_len, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. }
             | Self::InklingVllmNvfp4RelAttnMoe { max_model_len, .. }
             | Self::MimoV2VllmFp8SwaMoe { max_model_len, .. }
