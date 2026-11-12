@@ -182,12 +182,15 @@ pub enum MhcBoundaryPricing {
     /// What-if: vLLM's rows less this fixed us per boundary (the leaf keeps
     /// its per-row part and is flagged `extrapolated`).
     VllmKernelLessFixedUs(f64),
-    /// The measured one-launch kernel (`cuda_one_launch`). The boundary
-    /// after an MoE layer also sums the combine's partial outputs (`dp_size`
-    /// of them on `fused_allgather`, whose combine leaves each rank's partial
-    /// in the owner's memory; one otherwise) and adds the shared expert, so
-    /// the MoE block's separate shared + routed add is not billed. The last
-    /// MoE layer's add goes to the terminal post, which stays as measured.
+    /// The faster per row of vLLM's rows and the measured one-launch kernel
+    /// (`cuda_one_launch`). The boundary after an MoE layer also adds the
+    /// shared expert to the routed output, so the MoE block's separate
+    /// shared + routed add is not billed; on vLLM's rows that add is measured
+    /// with the call. The routed output arrives reduced (one partial): the
+    /// exchange prices its own reduce, and `fused_allgather`, which defers it
+    /// to the next op, bills it as `ep_fast_fused_residual_us`, so this
+    /// boundary does not bill it again. The last MoE layer's add goes to the
+    /// terminal post, which stays as measured.
     OneLaunchKernel,
 }
 
@@ -200,7 +203,7 @@ pub struct MhcOneLaunchConfigs {
     pub after_moe: MhcFusedSumKernelConfig,
 }
 
-const MHC_ONE_LAUNCH_BACKENDS: &[&str] = &["cuda_one_launch"];
+const MHC_ONE_LAUNCH_BACKENDS: &[&str] = &["vllm_tilelang", "cuda_one_launch"];
 
 /// Which attention layers an `attn_tp > 1` group runs tensor-parallel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -416,11 +419,6 @@ pub fn build_configs(
         local.groups = split_groups_after_dense(model, std::mem::take(&mut local.groups));
         let mut post_pre = local.mhc_fused.clone();
         post_pre.backends = MHC_ONE_LAUNCH_BACKENDS.to_vec();
-        let partials = if parallel.ep_comm.kind == EpCommKind::FusedAllgather {
-            u32::from(dp)
-        } else {
-            1
-        };
         MhcOneLaunchConfigs {
             after_moe: MhcFusedSumKernelConfig {
                 backends: MHC_ONE_LAUNCH_BACKENDS.to_vec(),
@@ -428,7 +426,7 @@ pub fn build_configs(
                 hidden_size: post_pre.hidden_size.clone(),
                 hc_mult: post_pre.hc_mult,
                 hidden_dtype: post_pre.hidden_dtype,
-                num_partials: partials,
+                num_partials: 1,
                 shared_addend: true,
             },
             post_pre,
@@ -2121,11 +2119,11 @@ mod tests {
         assert!(build_configs(&model_cfg(), &parallel(5), &demand).is_err());
     }
 
-    /// Catches a one-launch config that sums the wrong partial count, or a
-    /// split that leaves a layer after a dense FFN in a group whose attention
-    /// boundary sums MoE partials.
+    /// Catches a one-launch config that bills the exchange's reduce again
+    /// (more than one partial), or a split that leaves a layer after a dense
+    /// FFN in a group whose attention boundary adds the shared expert.
     #[test]
-    fn one_launch_splits_layers_after_dense_and_sums_ep_partials() {
+    fn one_launch_splits_layers_after_dense_and_adds_the_shared_expert() {
         let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
         let model = config("glm53_flash_nvfp4");
         let mut fused = parallel(8);
@@ -2133,8 +2131,10 @@ mod tests {
         fused.ep_comm.kind = EpCommKind::FusedAllgather;
         let configs = build_configs(&model, &fused, &demand).unwrap();
         let one = configs.mhc_one_launch.as_ref().unwrap();
-        assert_eq!((one.after_moe.num_partials, one.after_moe.shared_addend), (8, true));
+        // fused_allgather bills its deferred reduce as ep_fast_fused_residual_us.
+        assert_eq!((one.after_moe.num_partials, one.after_moe.shared_addend), (1, true));
         assert_eq!(one.post_pre.backends, MHC_ONE_LAUNCH_BACKENDS);
+        assert_eq!(one.after_moe.backends, MHC_ONE_LAUNCH_BACKENDS);
         let mut layers: Vec<u32> = configs.local.groups.iter().flat_map(|g| g.layers.clone()).collect();
         layers.sort_unstable();
         assert_eq!(layers, (0..model.num_layers).collect::<Vec<_>>());
@@ -2145,7 +2145,6 @@ mod tests {
                 assert!(follows_moe(&model, group), "{}", group.label);
             }
         }
-        // Any other exchange leaves the combine's sum in one tensor.
         let mut measured = parallel(8);
         measured.mhc_boundary = MhcBoundaryPricing::OneLaunchKernel;
         let configs = build_configs(&model, &measured, &demand).unwrap();

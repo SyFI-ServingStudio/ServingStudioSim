@@ -1,12 +1,19 @@
-"""Profile the one-launch mHC boundary kernel (csrc/mhc_post_pre_one_launch.cu).
+"""Profile the one-launch mHC boundary kernel (csrc/mhc_lane_m_{small,large}.cu).
 
-One cooperative launch does the mHC post of the finished block, the next
-block's pre (the 24-wide mix GEMM on BF16 tensor cores with fn split into bf16
-hi + lo, the gates and the Sinkhorn comb) and its RMSNorm: the math of vLLM's
-``mhc_fused_post_pre_tilelang`` with ``norm_weight``. Phase A splits the
-GEMM's K over hidden / 32 CTAs and stores each CTA's partial mixes; one grid
-barrier; phase B reduces them per token, runs the gates and collapses the
-updated streams with this call's own pre mix (the non-shifted order).
+The kernel is lane M of the MoE copy-gap study (mhc2.cu / mhc3.cu in
+wt-glm53-decode-investigate/tmp/mhc-skillcheck, 2026-11-12), with one change
+made here: the last warps of each CTA run the Sinkhorn while the other warps
+already collapse the streams (late_sinkhorn bit 4). One launch of 16-CTA
+clusters; CTA r of a cluster owns hidden columns [256 r, 256 r + 256) of all
+four streams. Per tile of TM tokens: the post mix and the 24 pre mixes on BF16
+tensor cores (fn split into bf16 hi + lo), a cluster barrier, the owner warp
+gathers the cluster's partial mixes over DSMEM and runs the gates, a second
+cluster barrier, then the collapse with this call's own pre mix and the
+RMSNorm (the non-shifted order, vLLM's TileLang math).
+
+Two builds of the same algorithm: ``small`` (TM <= 16, mhc2) for
+num_tokens <= SMALL_MAX_TOKENS, ``large`` (TM <= 32, mhc3) above it. TM is
+ceil(num_tokens / clusters), capped, with clusters the co-resident maximum.
 
 Two entries share it:
 
@@ -17,12 +24,14 @@ Two entries share it:
   rounding, the MoE combine's reduce), plus, with ``shared_addend``, one more
   bf16 tensor added after that rounding (the shared expert).
 
-The source is built on first use with FlashInfer's JIT (its TVM-FFI binding),
-as the other in-repo CUDA runners are. CUPTI time is the sum of every kernel in
-the call (``kernel_name=None``); the call is one kernel.
+The sources are built on first use with FlashInfer's JIT (its TVM-FFI
+binding), as the other in-repo CUDA runners are. CUPTI time is the sum of
+every kernel in the call (``kernel_name=None``); the call is one kernel,
+launched without programmatic dependent launch.
 """
 
 import functools
+import math
 from pathlib import Path
 from typing import Any
 
@@ -45,17 +54,21 @@ from profiling.runners.mhc._common import (
     post_pre_one_pass_bytes,
     prepare_common,
     reference_pre,
-    residual_bytes,
 )
 from profiling.runners.mhc._common import validate_args as validate_common_args
 
-_SOURCE = Path(__file__).resolve().parent / "csrc" / "mhc_post_pre_one_launch.cu"
-_JIT_MODULE_NAME = "mhc_post_pre_one_launch"
-# Phase A gives each CTA 32 hidden columns of all four streams; the grid is
-# hidden / 32 CTAs and must be co-resident (cooperative launch).
-_SLICE = 32
+_CSRC = Path(__file__).resolve().parent / "csrc"
+# The kernel is compiled for hidden 4096: 16 CTAs of 256 columns.
+HIDDEN = 4096
 HC_MULT = 4
+CLUSTER = 16
 MAX_PARTIALS = 8
+SMALL_MAX_TOKENS = 96
+# (source, TM cap) per build.
+_BUILDS = {"small": ("mhc_lane_m_small.cu", 16), "large": ("mhc_lane_m_large.cu", 32)}
+# Fast fp32 Sinkhorn (bit 2), Sinkhorn overlapped with the collapse (bit 4).
+_LATE_SINKHORN = 6
+_FULL_STAGE = 5
 
 
 def validate_args(
@@ -67,10 +80,8 @@ def validate_args(
     num_partials: int = 1,
 ) -> Shape:
     shape = validate_common_args(kind, num_tokens, hidden_size, hc_mult, hidden_dtype)
-    if hc_mult != HC_MULT or hidden_size % _SLICE != 0:
-        raise ProfilerNotImplemented(
-            f"{kind} requires hc_mult == {HC_MULT} and hidden_size % {_SLICE} == 0"
-        )
+    if hc_mult != HC_MULT or hidden_size != HIDDEN:
+        raise ProfilerNotImplemented(f"{kind} is built for hc_mult == {HC_MULT} and hidden_size == {HIDDEN}")
     if not 1 <= num_partials <= MAX_PARTIALS:
         raise ProfilerNotImplemented(f"{kind} sums 1..{MAX_PARTIALS} partial outputs")
     return shape
@@ -78,36 +89,39 @@ def validate_args(
 
 def call_bytes(shape: Shape, num_partials: int = 1, shared_addend: bool = False) -> int:
     """HBM traffic of one call: one pass over the tensors, the block output read
-    once per partial (and the addend), plus phase B's re-read of the updated
-    streams. The partial-mix workspace (128 B per token per CTA, L2-resident)
-    is left out."""
+    once per partial (and the addend). The updated streams stay in shared
+    memory for the collapse, and the partial mixes move over DSMEM."""
     extra_inputs = (num_partials - 1) + int(shared_addend)
-    return (
-        post_pre_one_pass_bytes(shape)
-        + extra_inputs * hidden_bytes(shape)
-        + residual_bytes(shape)
-    )
+    return post_pre_one_pass_bytes(shape) + extra_inputs * hidden_bytes(shape)
 
 
 @functools.cache
-def _load_module():
+def _load_module(build: str):
     try:
         from flashinfer.jit.core import gen_jit_spec
     except ImportError as exc:
         raise ProfilerNotImplemented("FlashInfer JIT is required to build the one-launch kernel") from exc
+    source, _ = _BUILDS[build]
     return gen_jit_spec(
-        _JIT_MODULE_NAME,
-        [_SOURCE],
+        f"mhc_lane_m_{build}",
+        [_CSRC / source],
         extra_cuda_cflags=["-O3", "-gencode=arch=compute_100a,code=sm_100a"],
     ).build_and_load()
 
 
+def build_for(num_tokens: int) -> str:
+    return "small" if num_tokens <= SMALL_MAX_TOKENS else "large"
+
+
 class OneLaunch:
-    """Inputs, outputs and workspace of one call, allocated once."""
+    """Inputs, outputs and launch geometry of one call, allocated once."""
 
     def __init__(self, torch: Any, inputs: CommonInputs, parts: Any, shared: Any, post_mix: Any, comb_mix: Any):
-        self.module = _load_module()
         num_tokens, hidden = parts.shape[1], parts.shape[2]
+        build = build_for(num_tokens)
+        self.module = _load_module(build)
+        self.clusters = int(self.module.m_max_clusters(CLUSTER))
+        self.tile = max(1, min(_BUILDS[build][1], math.ceil(num_tokens / self.clusters)))
         self.args_in = (
             parts,
             shared if shared is not None else torch.empty(0, dtype=torch.bfloat16, device="cuda"),
@@ -123,24 +137,30 @@ class OneLaunch:
         self.post = torch.empty((num_tokens, HC_MULT, 1), dtype=torch.float32, device="cuda")
         self.comb = torch.empty((num_tokens, HC_MULT, HC_MULT), dtype=torch.float32, device="cuda")
         self.y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-        floats = int(self.module.mhc_post_pre_one_launch_workspace_floats(num_tokens, hidden))
-        self.workspace = torch.empty(floats, dtype=torch.float32, device="cuda")
+        # Written only by the ablation switches (skip != 0), which this runner leaves off.
+        self.sink = torch.zeros(4, dtype=torch.int32, device="cuda")
 
     def run(self):
-        self.module.mhc_post_pre_one_launch(
+        self.module.m_fused(
             *self.args_in,
             self.new_residual,
             self.post,
             self.comb,
             self.y,
-            self.workspace,
+            self.sink,
+            self.tile,
+            CLUSTER,
+            self.clusters,
+            _FULL_STAGE,
+            0,
+            SINKHORN_ITERATIONS,
+            _LATE_SINKHORN,
+            0,
             RMS_EPS,
             HC_EPS,
             HC_EPS,
             POST_MULTIPLIER,
             RMS_EPS,
-            SINKHORN_ITERATIONS,
-            5,
         )
         return self.new_residual, self.post, self.comb, self.y
 

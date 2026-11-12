@@ -70,8 +70,8 @@ DOC = KernelDoc(
         "measure.",
         "The runner uses ε = 1e-6; another ε runs the same launches.",
         "GB/s counts one pass over the call's tensors, each partial and the addend "
-        "once, and the second read of the updated streams; the partial-mix "
-        "workspace is left out. TFLOPS is not computed.",
+        "once; vllm_tilelang also counts its add (two reads, one write) and its "
+        "own re-reads of the updated streams. TFLOPS is not computed.",
     ),
     reference=None,
 )
@@ -88,8 +88,8 @@ register(
         args_schema=MhcFusedSumArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        # Built for sm_100a with mma.sync BF16 and a cooperative grid barrier
-        # (csrc/mhc_post_pre_one_launch.cu).
+        # Built for sm_100a: 16-CTA clusters, DSMEM, mma.sync BF16
+        # (csrc/mhc_lane_m_{small,large}.cu).
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             sm_targets=frozenset({"sm_100f"}),
@@ -99,6 +99,31 @@ register(
             summary=(
                 "The cuda_one_launch kernel of mhc_fused_post_pre_rms_norm reading "
                 "num_partials partial outputs (and the addend) in its post phase."
+            ),
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_tilelang",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.mhc.mhc_fused_post_pre_rms_norm_vllm_tilelang",
+            function_name="profile_mhc_fused_sum_post_pre_rms_norm_vllm_tilelang",
+        ),
+        table_name=KIND,
+        args_schema=MhcFusedSumArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        supports=BackendSupport(compute=frozenset({DType.BF16})),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's path: the shared expert's output added to the reduced routed "
+                "output (one bf16 tensor add, when shared_addend is set), then the "
+                "mhc_fused_post_pre_rms_norm vllm_tilelang call. Only num_partials = 1: "
+                "vLLM's combine hands over the routed output already reduced."
             ),
         ),
     )

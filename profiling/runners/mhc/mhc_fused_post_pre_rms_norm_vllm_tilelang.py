@@ -129,4 +129,89 @@ def profile_mhc_fused_post_pre_rms_norm_vllm_tilelang(
     )
 
 
-__all__ = ["profile_mhc_fused_post_pre_rms_norm_vllm_tilelang"]
+_SUM_KIND = "mhc_fused_sum_post_pre_rms_norm:vllm_tilelang"
+
+
+@dataclass(frozen=True)
+class _SumLaunch:
+    """The shared expert's add as vLLM issues it (a bf16 tensor add), then the fused call."""
+
+    fused: _Launch
+    routed: Any
+    shared: Any
+
+    def run(self):
+        x = self.routed + self.shared if self.shared is not None else self.routed
+        return _Launch(self.fused.callable, x, self.fused.post_mix, self.fused.comb_mix, self.fused.inputs).run()
+
+
+def profile_mhc_fused_sum_post_pre_rms_norm_vllm_tilelang(
+    num_tokens: int,
+    hidden_size: int,
+    hc_mult: int,
+    hidden_dtype: DType | str,
+    num_partials: int,
+    shared_addend: bool,
+) -> ComputeMetrics:
+    """The add of the shared expert's output (with ``shared_addend``) and vLLM's fused call.
+
+    Only ``num_partials == 1``: vLLM gets the routed output already reduced
+    from its combine and has no partial-sum kernel at this boundary."""
+    shape = validate_args(_SUM_KIND, num_tokens, hidden_size, hc_mult, hidden_dtype)
+    if num_partials != 1:
+        raise ProfilerNotImplemented(f"{_SUM_KIND}: vLLM's path takes one reduced routed output")
+    try:
+        import torch
+        from vllm.model_executor.kernels.mhc.tilelang import mhc_fused_post_pre_tilelang
+        from vllm.model_executor.kernels.mhc.torch import mhc_post_torch
+    except ImportError as exc:
+        raise ProfilerNotImplemented(f"{_SUM_KIND} requires pinned vLLM and TileLang") from exc
+
+    try:
+        inputs = prepare_common(torch, shape)
+        routed = torch.randn((shape.num_tokens, shape.hidden_size), dtype=torch.bfloat16).cuda()
+        shared = (
+            (torch.randn((shape.num_tokens, shape.hidden_size)) * 0.5).to(torch.bfloat16).cuda()
+            if shared_addend
+            else None
+        )
+        post_mix, comb_mix, _ = reference_pre(torch, inputs)
+        launch = _SumLaunch(
+            _Launch(mhc_fused_post_pre_tilelang, routed, post_mix, comb_mix, inputs), routed, shared
+        )
+        x = routed + shared if shared is not None else routed
+        expected_residual = mhc_post_torch(x, inputs.residual, post_mix, comb_mix)
+        expected_inputs = CommonInputs(
+            expected_residual,
+            inputs.fn,
+            inputs.hc_scale,
+            inputs.hc_base,
+            inputs.norm_weight,
+        )
+        expected = (expected_residual, *reference_pre(torch, expected_inputs))
+        actual = launch.run()
+        torch.cuda.synchronize()
+        assert_outputs_close(torch, actual, expected)
+        time_ms = Timer.cupti(launch.run, warmup=3, kernel_name=None)
+        energy_j = Energy.perf(launch.run, warmup=3, per_iter_time_ms=time_ms)
+    except torch.OutOfMemoryError as exc:
+        raise OOMError(f"{_SUM_KIND} ran out of CUDA memory") from exc
+    except ProfilerNotImplemented:
+        raise
+    except Exception as exc:
+        raise KernelLaunchFailed(f"{_SUM_KIND} failed") from exc
+
+    # The add reads two block outputs and writes one.
+    add_bytes = 3 * shape.num_tokens * shape.hidden_size * 2 if shared_addend else 0
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        tflops=0.0,
+        memory_bandwidth_gbps=bandwidth_gbps(call_bytes(shape) + add_bytes, time_ms),
+        energy_j=float(energy_j),
+    )
+
+
+__all__ = [
+    "profile_mhc_fused_post_pre_rms_norm_vllm_tilelang",
+    "profile_mhc_fused_sum_post_pre_rms_norm_vllm_tilelang",
+]

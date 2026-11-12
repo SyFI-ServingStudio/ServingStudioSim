@@ -34,9 +34,11 @@ DOC = KernelDoc(
         "launch without the shift: it collapses the streams with this call's own "
         "pre mix, as vllm_tilelang does, so it has to read the updated streams "
         "back once the mixes are known. The cuda_one_launch backend is an "
-        "in-repo cooperative CUDA kernel with the same non-shifted math: one "
-        "launch, one grid barrier between the K-split GEMM and the per-token "
-        "epilogue."
+        "in-repo CUDA kernel with the same non-shifted math in one launch of "
+        "16-CTA clusters: each CTA owns 256 hidden columns, and two cluster "
+        "barriers per token tile separate the column-split GEMM, the gates "
+        "(the partial mixes gathered over distributed shared memory) and the "
+        "collapse."
     ),
     category="Normalization",
     subcategory="Hyper-connections",
@@ -60,10 +62,13 @@ DOC = KernelDoc(
         "and steps at each switch and wave. Its GB/s counts one pass over the "
         "call's tensors plus the second read of the updated streams; the K-split "
         "partials are left out. No vLLM model dispatches it yet.",
-        "cuda_one_launch runs hidden / 32 co-resident CTAs (128 at hidden 4096) for "
-        "every num_tokens and processes tokens in rounds of 1024 inside the launch. "
-        "Its pre GEMM multiplies the bf16 updated streams by fn split into bf16 hi "
-        "and lo parts (about 16 mantissa bits of fn). No vLLM model dispatches it.",
+        "cuda_one_launch is built for hidden 4096 and hc_mult 4. It runs as many "
+        "clusters as fit (at most ceil(num_tokens / TM)), with token tiles of TM = "
+        "ceil(num_tokens / clusters) capped at 16 up to 96 tokens and at 32 above "
+        "(two builds), so the time steps where TM or the cluster count changes. Its "
+        "pre GEMM multiplies the bf16 updated streams by fn split into bf16 hi and "
+        "lo parts (about 16 mantissa bits of fn). Launched without programmatic "
+        "dependent launch. No vLLM model dispatches it.",
         "The previous post and comb weights come from the pre step on the same random streams.",
         "TFLOPS is not computed. vllm_tilelang GB/s counts the HBM traffic of the "
         "launches the call issues: the layer output, streams, previous mixes and "
@@ -170,9 +175,8 @@ register(
         args_schema=MhcRmsNormArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        # The kernel uses mma.sync BF16 (sm_80+), a cooperative grid barrier
-        # and is built for sm_100a (csrc/mhc_post_pre_one_launch.cu); its
-        # hidden / 32 CTAs must be co-resident.
+        # Thread-block clusters of 16 (non-portable size), DSMEM and mma.sync
+        # BF16, built for sm_100a (csrc/mhc_lane_m_{small,large}.cu).
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             sm_targets=frozenset({"sm_100f"}),
@@ -180,11 +184,11 @@ register(
         subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
-                "One cooperative CUDA launch (csrc/mhc_post_pre_one_launch.cu): post "
-                "mix and the K-split of the pre GEMM (BF16 tensor cores, fn as "
-                "bf16 hi + lo) over hidden / 32 CTAs, one grid barrier, then per "
-                "token the gates, Sinkhorn, collapse with this call's pre mix and "
-                "RMSNorm; the math of vllm_tilelang."
+                "One CUDA launch of 16-CTA clusters (csrc/mhc_lane_m_*.cu, from the "
+                "MoE copy-gap study's lane M): post mix and the pre GEMM (BF16 tensor "
+                "cores, fn as bf16 hi + lo) on each CTA's 256 columns, partial mixes "
+                "gathered over DSMEM, gates and Sinkhorn overlapped with the collapse, "
+                "then RMSNorm; the math of vllm_tilelang."
             ),
         ),
     )
