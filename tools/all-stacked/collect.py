@@ -4,7 +4,9 @@ Usage: python tools/all-stacked/collect.py <experiment dir> [mqa|topk]
 
 `mqa` (default): the mqa-only study (20261112_0). `topk`: the mqa+topk baseline
 (20261112_1) with step 4 priced twice (S4n: nccl/nvshmem above the MNNVL budget;
-S4u: + unbudgeted MNNVL two-shot); the path continues on S4u.
+S4u: + unbudgeted MNNVL two-shot); the path continues on S4u. `refit`: the topk
+path after the ep_comm.rs all-to-all refit with b=2 on measured 2-GPU rows
+(20261112_4); `refit <pre-refit experiment dir>` also writes the per-step diff.
 
 Reads <exp>/{k7,hs}/<strategy>/c<conc>/ (summary.json, reports/slo_general_report.json,
 reports/kernel_time_share_report.json). Point fields match
@@ -51,6 +53,9 @@ STRATEGIES = [
 ]
 
 
+REFIT = MODE == "refit"
+if REFIT:
+    MODE = "topk"
 if MODE == "topk":
     _keep = {k: v for k, *v in STRATEGIES}
     _s4 = {b: _keep[f"S4_M3_mhc_ko{b}"] for b in (2, 4, 8)}
@@ -64,6 +69,22 @@ if MODE == "topk":
         STRATEGIES.append((f"S5u_M3_mhc_ko{b}_gbm", f"+ f_b/g_b merged, KDA-only TP{b} (unbudgeted)", moe, tp, mhc, True,
                            "as S4u + measured bmm rows"))
     STRATEGIES.append(("S5_M3_mhc_gbm", *_keep["S5_M3_mhc_gbm"]))
+if REFIT:
+    FIT = ("MNNVL fit refit 2026-11-12 on flashinfer_mnnvl + flashinfer_nvlink_two_sided rows "
+           "(a 4.11 us, c 3.86 GB/s, p 2.63 ns, L 605 GB/s, w 0.9; fixed-width rows read 3.5-16% low)")
+    _ko2 = "TP2 all-reduce from the measured 2-GPU rows (16..4096 tokens; below 16 extrapolated)"
+    STRATEGIES = [(k, n, m, t, h, g, note.replace("the moe_alltoall MNNVL fit (a 4.11 us, L 638 GB/s)", FIT)
+                   .replace("MNNVL fit minus its 4.11 us fixed cost", FIT + " minus its 4.11 us fixed cost")
+                   .replace("TP2 all-reduce priced from 4-GPU rows (EXTRAPOLATED)", _ko2))
+                  for k, n, m, t, h, g, note in STRATEGIES]
+    # The path's b=2 runs on the measured 2-GPU rows (`*_ko2r2`); the 4-GPU-row
+    # runs stay as controls that isolate the refit from the 2-GPU rows.
+    controls = []
+    for i, (k, n, m, t, h, g, note) in enumerate(STRATEGIES):
+        if t == 2:
+            controls.append((f"C_{k}", "control: " + n + " on 4-GPU rows (pre-refit pricing of b=2)", m, t, h, g, "control"))
+            STRATEGIES[i] = (k.replace("_ko2", "_ko2r2"), n, m, t, h, g, note)
+    STRATEGIES += controls
     for k in ("S0_base", "S1_M2", "S2_M3", "S3_M3_mhc"):
         pass
 
@@ -92,7 +113,7 @@ strategies, by = [], {}
 for sid, name, moe, tp, mhc, gbm, note in STRATEGIES:
     pts = {}
     for load, fam, conc in LOADS:
-        d = exp / fam / sid / f"c{conc}"
+        d = exp / fam / (sid[2:] if REFIT and sid.startswith("C_S") else sid) / f"c{conc}"
         if (d / "summary.json").exists() and (d / "reports/slo_general_report.json").exists():
             pts[load] = point(d, load)
     by[sid] = pts
@@ -114,10 +135,12 @@ GBM = {"S3_M3_mhc": "S5_M3_mhc_gbm", "S4_M3_mhc_ko2": "S5_M3_mhc_ko2_gbm",
 SIDE = None
 if MODE == "topk":
     STEP_IDS[0] = ("0 base (indexer mqa+topk fix)", ["S0_base"])
+    k2 = "ko2r2" if REFIT else "ko2"
     STEP_IDS[-1] = ("4 + KDA-only TP (best b, unbudgeted MNNVL)",
-                    ["S3_M3_mhc", "S4u_M3_mhc_ko2", "S4u_M3_mhc_ko4", "S4u_M3_mhc_ko8"])
-    SIDE = ("4' KDA-only TP, nvshmem pricing (side row)", ["S3_M3_mhc", "S4n_M3_mhc_ko2", "S4n_M3_mhc_ko4", "S4n_M3_mhc_ko8"])
-    GBM = {"S3_M3_mhc": "S5_M3_mhc_gbm", **{f"S4u_M3_mhc_ko{b}": f"S5u_M3_mhc_ko{b}_gbm" for b in (2, 4, 8)}}
+                    ["S3_M3_mhc", f"S4u_M3_mhc_{k2}", "S4u_M3_mhc_ko4", "S4u_M3_mhc_ko8"])
+    SIDE = ("4' KDA-only TP, nvshmem pricing (side row)", ["S3_M3_mhc", f"S4n_M3_mhc_{k2}", "S4n_M3_mhc_ko4", "S4n_M3_mhc_ko8"])
+    GBM = {"S3_M3_mhc": "S5_M3_mhc_gbm", f"S4u_M3_mhc_{k2}": f"S5u_M3_mhc_{k2}_gbm",
+           **{f"S4u_M3_mhc_ko{b}": f"S5u_M3_mhc_ko{b}_gbm" for b in (4, 8)}}
 cumulative = []
 for load, _, _ in LOADS:
     rows, prev = [], None
@@ -155,7 +178,8 @@ for load, _, _ in LOADS:
     cumulative.append(entry)
 
 result = {"experiment": str(exp.resolve()),
-          "label": ("[mqa+topk baseline] " if MODE == "topk" else "[mqa-only baseline] ") + "all stacked: indexer fix -> M2 -> M3 -> mHC fuse -> KDA-only TP -> f_b/g_b merge "
+          "label": ("[mqa+topk baseline, a2a refit + 2-GPU rows] " if REFIT else
+                    "[mqa+topk baseline] " if MODE == "topk" else "[mqa-only baseline] ") + "all stacked: indexer fix -> M2 -> M3 -> mHC fuse -> KDA-only TP -> f_b/g_b merge "
                    "(MoE expert GEMM rows from the October nvfp4_fused_moe batch)",
           "strategies": strategies, "cumulative": cumulative, "baseline": "S0_base"}
 (exp / "results.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
@@ -179,5 +203,21 @@ for s in strategies:
     L.append(f"| {s['id']} | " + " | ".join(
         f"{f(pts[l]['tok_s'])} / {f(pts[l]['tpot_ms'],2)}" if l in pts else "-" for l, _, _ in LOADS) + " |")
 L += ["", "## Pricing source per step", ""] + [f"- {s['id']}: {s['note']}" for s in strategies]
+if REFIT and len(sys.argv) > 3:
+    old = {c["load"]: c for c in json.loads((Path(sys.argv[3]) / "results.json").read_text())["cumulative"]}
+    L += ["", f"## Refit vs pre-refit ({sys.argv[3]}), tok/s per step", "",
+          "| load | step | pre-refit strategy | pre-refit tok/s | refit strategy | refit tok/s | diff |", "|---|---|---|---|---|---|---|"]
+    diffs = []
+    for c in cumulative:
+        o = {r["step"][0]: r for r in old[c["load"]]["steps"]}
+        for r in c["steps"]:
+            q = o.get(r["step"][0])
+            if q:
+                diffs.append({"load": c["load"], "step": r["step"], "pre_strategy": q["strategy"], "pre_tok_s": q["tok_s"],
+                              "strategy": r["strategy"], "tok_s": r["tok_s"], "diff_pct": pct(r["tok_s"], q["tok_s"])})
+                L.append(f"| {c['load']} | {r['step']} | {q['strategy']} | {f(q['tok_s'])} | {r['strategy']} | "
+                         f"{f(r['tok_s'])} | {sg(pct(r['tok_s'], q['tok_s']))} |")
+    result["refit_vs_pre_refit"] = diffs
+    (exp / "results.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
 (exp / "table.md").write_text("\n".join(L) + "\n")
 print("\n".join(L[:60]))
