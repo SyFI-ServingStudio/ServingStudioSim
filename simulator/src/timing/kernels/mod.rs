@@ -1,5 +1,6 @@
 //! Per-kind L1 kernel structs.
 
+pub mod all_gather;
 pub mod all_reduce;
 pub mod all_reduce_fusion;
 pub mod all_reduce_residual_rms_norm;
@@ -109,6 +110,7 @@ pub mod static_fp8_quant;
 pub mod vllm_fused_moe;
 pub mod vllm_mla_rope;
 
+pub use all_gather::{AllGatherKernel, AllGatherKernelConfig, AllGatherSpec};
 pub use all_reduce::{AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, AllReduceSpec};
 pub use all_reduce_fusion::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
