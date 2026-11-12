@@ -406,6 +406,7 @@ impl Deployment for UnifiedDeployment {
                     None,
                     Default::default(),
                     Default::default(),
+                    false,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

@@ -716,6 +716,7 @@ pub fn build_configs(
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             decode_query_len: 1,
             ssm_state_dtype: DType::Fp32,
+            merge_gate_b: false,
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
             hidden: model.hidden.into(),

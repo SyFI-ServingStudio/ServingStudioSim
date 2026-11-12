@@ -61,7 +61,10 @@ DOC = KernelDoc(
         "packed weight, activation and output that vLLM passes to torch.bmm. "
         "A grouped low-rank attention output projection is the same shape of "
         "work: each group of 8 heads' 4,096-wide attention output is multiplied "
-        "by that group's weight, as one DeepGEMM einsum on MXFP8 operands."
+        "by that group's weight, as one DeepGEMM einsum on MXFP8 operands. "
+        "Two or more same-shape linears whose inputs are adjacent column slices "
+        "of one packed activation can also run as one torch.bmm "
+        "(torch_bmm_packed_lhs), in place of one linear call each."
     ),
     category="GEMM",
     formula=(
@@ -79,8 +82,9 @@ DOC = KernelDoc(
     caveats=(
         "GB/s counts the logical operand elements, not the gaps in the packed "
         "storage the strided views skip.",
-        "Each backend fixes k and n to its layout: k = 192 or 256, n = 512 for "
-        "query absorption and k = 512, n = 256 for value expansion.",
+        "Each MLA backend fixes k and n to its layout: k = 192 or 256, n = 512 for "
+        "query absorption and k = 512, n = 256 for value expansion. "
+        "torch_bmm_packed_lhs takes any k and n.",
         "torch_mla_v_up reads an attention output padded to 64 heads, so it takes "
         "at most 64 heads.",
         "The grouped output projection's activation is the FP8 attention output "
@@ -204,6 +208,38 @@ register(
                 "projection to the fused attention's FP8 output."
             ),
             url="https://github.com/deepseek-ai/DeepGEMM",
+        ),
+    )
+)
+
+# Two or more same-shape low-rank linears whose inputs are adjacent column
+# slices of one packed activation (for example the up halves of two low-rank
+# gates read from one fused down projection), merged into one torch.bmm over
+# stacked (n, k) weights. Same Torch stack as single_gemm's torch_linear_vllm,
+# which prices the linears run one by one.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="torch_bmm_packed_lhs",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.batched_gemm",
+            function_name="profile_bmm_packed_lhs",
+        ),
+        table_name=KIND,
+        args_schema=BatchedGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "torch.bmm over num_batches linears: each LHS is a k-wide column "
+                "slice of one packed (m, num_batches*k) activation, the weights "
+                "are stacked (n, k) linear weights, the output (num_batches, m, n)."
+            ),
+            url="https://pytorch.org/docs/stable/generated/torch.bmm.html",
         ),
     )
 )

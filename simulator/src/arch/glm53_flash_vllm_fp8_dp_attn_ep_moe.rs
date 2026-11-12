@@ -163,6 +163,9 @@ pub struct Glm53FlashDpAttnEpParallel {
     pub attn_tp_layers: AttnTpLayers,
     /// How the attention-TP collective is priced (module doc).
     pub attn_tp_collective: AttnTpCollective,
+    /// KDA `f_b` / `g_b` as one batched GEMM (worklet
+    /// `Glm53KdaAttnLocalWorkletConfig::merge_gate_b`).
+    pub kda_gate_b_merged: bool,
 }
 
 /// Which attention layers an `attn_tp > 1` group runs tensor-parallel.
@@ -269,6 +272,7 @@ pub fn build_configs(
         )));
     }
     let mut local = local;
+    local.kda.merge_gate_b = parallel.kda_gate_b_merged;
     let kda_tp1 = local.kda.clone();
     if attn_tp > 1 {
         let attn = tp_arch::build_configs(
@@ -284,6 +288,7 @@ pub fn build_configs(
             demand,
         )?;
         local.kda = attn.kda;
+        local.kda.merge_gate_b = parallel.kda_gate_b_merged;
         if parallel.attn_tp_layers == AttnTpLayers::All {
             local.dsa = attn.dsa;
         }
@@ -1727,6 +1732,7 @@ mod tests {
             attn_all_reduce_row_gpus: None,
             attn_tp_layers: Default::default(),
             attn_tp_collective: Default::default(),
+            kda_gate_b_merged: false,
         }
     }
 

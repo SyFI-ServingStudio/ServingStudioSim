@@ -1554,6 +1554,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "fast", choices = ATTN_TP_COLLECTIVES, cache_key)]
         attn_tp_collective: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::AttnTpCollective,
+        /// Run each KDA layer's two low-rank gate up-projections (`f_b`,
+        /// `g_b`) as one batched GEMM over their packed inputs instead of two
+        /// linear calls. Not a vLLM path; priced from measured
+        /// `batched_gemm` rows.
+        #[serde(default)]
+        #[param(default = false, cache_key)]
+        kda_gate_b_merged: bool,
         #[serde(default = "default_glm53_flash_max_model_len")]
         #[param(default = 8192, cache_key)]
         max_model_len: u32,

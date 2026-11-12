@@ -41,13 +41,13 @@ use crate::timing::bridge::DType;
 use crate::timing::kernels::gdn_causal_conv_prefill::launches_per_sequence;
 use crate::timing::kernels::kda_chunk_prefill::takes_beta_logits;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelInput, GdnCausalConvDecodeKernel,
-    GdnCausalConvDecodeKernelConfig, GdnCausalConvDecodeKernelInput, GdnCausalConvPrefillKernel,
-    GdnCausalConvPrefillKernelConfig, GdnCausalConvPrefillKernelInput, KdaChunkPrefillKernel,
-    KdaChunkPrefillKernelConfig, KdaChunkPrefillKernelInput, KdaRecoverSSMVerifyKernel,
-    KdaRecoverSSMVerifyKernelConfig, KdaRecoverSSMVerifyKernelInput, KdaRecurrentDecodeKernel,
-    KdaRecurrentDecodeKernelConfig, KdaRecurrentDecodeKernelInput, SingleGemmKernel,
-    SingleGemmKernelConfig, SingleGemmKernelInput,
+    BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, ElementwiseKernel,
+    ElementwiseKernelInput, GdnCausalConvDecodeKernel, GdnCausalConvDecodeKernelConfig,
+    GdnCausalConvDecodeKernelInput, GdnCausalConvPrefillKernel, GdnCausalConvPrefillKernelConfig,
+    GdnCausalConvPrefillKernelInput, KdaChunkPrefillKernel, KdaChunkPrefillKernelConfig,
+    KdaChunkPrefillKernelInput, KdaRecoverSSMVerifyKernel, KdaRecoverSSMVerifyKernelConfig,
+    KdaRecoverSSMVerifyKernelInput, KdaRecurrentDecodeKernel, KdaRecurrentDecodeKernelConfig,
+    KdaRecurrentDecodeKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, GdnCausalConvPrefillLog, LeafMetrics,
@@ -71,6 +71,9 @@ pub const RECOVERSSM_COMMIT_BACKENDS: &[&str] = &["tilelang", "vllm_triton"];
 /// through one: reads the bf16 logits, writes fp32 (capture 20260924_0).
 const BETA_SIGMOID_IN_BYTES_PER_HEAD: u32 = 2;
 const BETA_SIGMOID_OUT_BYTES_PER_HEAD: u32 = 4;
+/// `f_b` and `g_b` as one `torch.bmm` over their packed low-rank inputs
+/// (`merge_gate_b`).
+const GATE_B_BMM_BACKENDS: &[&str] = &["torch_bmm_packed_lhs"];
 
 #[derive(Clone, Debug)]
 pub struct Glm53KdaAttnLocalWorkletConfig {
@@ -99,6 +102,11 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     pub decode_query_len: u32,
     /// Element type of the recurrent state pool (fp32 or bf16).
     pub ssm_state_dtype: DType,
+    /// Not the fork's path: run `f_b` and `g_b` as one batched GEMM over the
+    /// two adjacent `gate_rank`-wide slices of the `in_proj` output (one
+    /// launch instead of two). Their two leaves then bill zero and the
+    /// `gate_b_proj` leaf bills the batched call.
+    pub merge_gate_b: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +115,8 @@ pub struct Glm53KdaAttnLocalWorkletResolved {
     pub in_proj: SingleGemmKernelConfig,
     pub f_b: SingleGemmKernelConfig,
     pub g_b: SingleGemmKernelConfig,
+    /// `f_b` + `g_b` as one batched GEMM when `merge_gate_b`.
+    pub gate_b: Option<BatchedGemmKernelConfig>,
     pub conv_prefill: GdnCausalConvPrefillKernelConfig,
     pub conv_decode: GdnCausalConvDecodeKernelConfig,
     pub prefill_small_glue: crate::timing::kernels::ElementwiseKernelConfig,
@@ -155,6 +165,7 @@ pub struct Glm53KdaAttnLocalWorklet {
     pub in_proj: Op<SingleGemmKernel>,
     pub f_b: Op<SingleGemmKernel>,
     pub g_b: Op<SingleGemmKernel>,
+    pub gate_b: Option<Op<BatchedGemmKernel>>,
     pub conv_prefill: Op<GdnCausalConvPrefillKernel>,
     pub conv_decode: Op<GdnCausalConvDecodeKernel>,
     pub prefill_small_glue: Op<ElementwiseKernel>,
@@ -212,6 +223,14 @@ impl Glm53KdaAttnLocalWorklet {
             in_proj: gemm(in_proj_width.into(), cfg.hidden.clone()),
             f_b: gemm(value_width.into(), cfg.gate_rank.into()),
             g_b: gemm(value_width.into(), cfg.gate_rank.into()),
+            gate_b: cfg.merge_gate_b.then(|| BatchedGemmKernelConfig {
+                backends: GATE_B_BMM_BACKENDS.to_vec(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_batches: 2.into(),
+                n: value_width.into(),
+                k: cfg.gate_rank.into(),
+                dtype: cfg.activation_dtype,
+            }),
             conv_prefill: GdnCausalConvPrefillKernelConfig {
                 backends: cfg.conv_prefill_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -294,6 +313,10 @@ impl Glm53KdaAttnLocalWorklet {
             in_proj: atomic(n, "in_proj", r.in_proj, SingleGemmKernel::build, bridge)?,
             f_b: atomic(n, "f_b_proj", r.f_b, SingleGemmKernel::build, bridge)?,
             g_b: atomic(n, "g_b_proj", r.g_b, SingleGemmKernel::build, bridge)?,
+            gate_b: r
+                .gate_b
+                .map(|c| atomic(n, "gate_b_proj", c, BatchedGemmKernel::build, bridge))
+                .transpose()?,
             conv_prefill: atomic(
                 n,
                 "short_conv_prefill",
@@ -387,27 +410,34 @@ impl Glm53KdaAttnLocalWorklet {
                 "{} (Glm53KdaAttnLocalWorklet) [TP rank; H={}, D={}]",
                 self.name, cfg.num_heads, cfg.head_dim
             ),
-            child: Box::new(CostNode::Sum(vec![
-                self.in_proj.compile(builder),
-                self.f_b.compile(builder),
-                self.g_b.compile(builder),
-                self.conv_prefill.compile(builder),
-                self.conv_decode.compile(builder),
-                repeated(
-                    &self.prefill_small_glue,
-                    self.beta_sigmoid_launches,
-                    builder,
-                ),
-                self.state_gather.compile(builder),
-                self.chunk_prefill.compile(builder),
-                match &self.decode_core {
-                    KdaDecodeCore::Recurrent(op) => op.compile(builder),
-                    KdaDecodeCore::RecoverSsmVerify(op) => op.compile(builder),
-                },
-                self.state_scatter.compile(builder),
-                self.gated_norm.compile(builder),
-                self.o_proj.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum(
+                [
+                    self.in_proj.compile(builder),
+                    self.f_b.compile(builder),
+                    self.g_b.compile(builder),
+                ]
+                .into_iter()
+                .chain(self.gate_b.as_ref().map(|op| op.compile(builder)))
+                .chain([
+                    self.conv_prefill.compile(builder),
+                    self.conv_decode.compile(builder),
+                    repeated(
+                        &self.prefill_small_glue,
+                        self.beta_sigmoid_launches,
+                        builder,
+                    ),
+                    self.state_gather.compile(builder),
+                    self.chunk_prefill.compile(builder),
+                    match &self.decode_core {
+                        KdaDecodeCore::Recurrent(op) => op.compile(builder),
+                        KdaDecodeCore::RecoverSsmVerify(op) => op.compile(builder),
+                    },
+                    self.state_scatter.compile(builder),
+                    self.gated_norm.compile(builder),
+                    self.o_proj.compile(builder),
+                ])
+                .collect(),
+            )),
         }
     }
 
@@ -428,8 +458,12 @@ impl Glm53KdaAttnLocalWorklet {
         let decode_only = !w.prefill_bearing;
         let per_sequence = self.conv_per_sequence;
         push_or_zero(&self.in_proj, rows.clone(), false, ev);
-        push_or_zero(&self.f_b, rows.clone(), false, ev);
-        push_or_zero(&self.g_b, rows.clone(), false, ev);
+        let merged = self.gate_b.is_some();
+        push_or_zero(&self.f_b, rows.clone(), merged, ev);
+        push_or_zero(&self.g_b, rows.clone(), merged, ev);
+        if let Some(op) = &self.gate_b {
+            push_or_zero(op, BatchedGemmKernelInput { m: w.total_tokens }, false, ev);
+        }
         if per_sequence {
             push_conv_per_sequence(&self.conv_prefill, &input.prefill_sequence_lengths, ev);
         } else {
@@ -630,6 +664,7 @@ mod tests {
             elementwise_backends: vec!["triton"],
             decode_query_len: 1,
             ssm_state_dtype: DType::Fp32,
+            merge_gate_b: false,
         }
     }
 

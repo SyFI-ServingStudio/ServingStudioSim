@@ -2040,6 +2040,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     attn_all_reduce_row_gpus: Option<u16>,
     attn_tp_layers: glm53_flash_vllm_fp8_dp_attn_ep_moe::AttnTpLayers,
     attn_tp_collective: glm53_flash_vllm_fp8_dp_attn_ep_moe::AttnTpCollective,
+    kda_gate_b_merged: bool,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -2074,6 +2075,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         attn_all_reduce_row_gpus,
         attn_tp_layers,
         attn_tp_collective,
+        kda_gate_b_merged,
     };
     let mut configs =
         glm53_flash_vllm_fp8_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
@@ -2359,6 +2361,7 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         attn_all_reduce_row_gpus,
         attn_tp_layers,
         attn_tp_collective,
+        kda_gate_b_merged,
         ..
     } = sel
     else {
@@ -2384,6 +2387,7 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         *attn_all_reduce_row_gpus,
         *attn_tp_layers,
         *attn_tp_collective,
+        *kda_gate_b_merged,
         gpu,
         name,
         bridge,
@@ -3168,6 +3172,7 @@ pub fn build_iter_model(
             None,
             Default::default(),
             Default::default(),
+            false,
             gpu,
             name,
             bridge,
