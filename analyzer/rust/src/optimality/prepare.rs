@@ -271,6 +271,7 @@ fn is_communication_kind(kind: &str) -> bool {
     ) || kind.starts_with("p2p")
         || kind.starts_with("nccl")
         || kind.starts_with("comm")
+        || kind.starts_with("ep_comm")
 }
 
 #[cfg(test)]
@@ -307,6 +308,8 @@ mod tests {
             "moe_ep_all_gather",
             "moe_ep_quantized_all_gather",
             "moe_ep_reduce_scatter",
+            // The analytic exchange legs (`arch::ep_comm`).
+            "ep_comm_analytic",
         ] {
             assert!(is_communication_kind(kind), "{kind}");
         }

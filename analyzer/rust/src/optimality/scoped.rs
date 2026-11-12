@@ -1082,6 +1082,7 @@ fn is_communication_kind(kind: &str) -> bool {
     ) || kind.starts_with("p2p")
         || kind.starts_with("nccl")
         || kind.starts_with("comm")
+        || kind.starts_with("ep_comm")
 }
 
 async fn compute_semantic_floors(
