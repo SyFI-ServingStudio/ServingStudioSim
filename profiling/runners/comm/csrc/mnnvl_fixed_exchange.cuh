@@ -27,8 +27,11 @@
 //
 // Rounds. Each leg's landing has two sets, chosen by the leg's epoch (device memory, so CUDA
 // graphs replay it); the last block to finish advances it. A sender writes set n % 2 in round n.
-// It reaches round n + 2 only after its round n + 1 received every peer's rows, which every peer
-// sends after finishing round n (stream order), so a set is never written while still being read.
+// It reaches round n + 2 only after its round n + 1 received something from every peer, which
+// every peer sends after finishing round n (stream order), so a set is never written while still
+// being read. A peer's rows alone do not guarantee that (a zero-count peer sends none, and a rank
+// receiving nothing would lap it), so every round also carries one 16-byte marker per peer and
+// set (markers region), pushed and polled like a row vector.
 //
 // Pull combine (the fused exchange's consumer side). Every rank's expert output lives in its own
 // mapped "partials" region (the MoE kernel writes it there; no copy). The consumer of round n
@@ -42,6 +45,7 @@
 // Layout of one rank's mapped slice (byte offsets in ExchangeLayout):
 //   state     int32 round state (kStateWords), this rank's only
 //   flags     int32 ready flag per source rank (pull combine)
+//   markers   per leg 2 sets x [world source] 16-byte round markers (Lamport), at kMarkerOffset
 //   dispatch  2 sets x [world source][max_rows][dispatch row bytes]
 //   combine   2 sets x [world source][max_rows][hidden * 2]
 //   partials  2 sets x [world * max_rows][hidden * 2] bf16, gathered-token order
@@ -74,6 +78,11 @@ enum StateWord : int {
   kTimeoutReported = 6,
   kStateWords = 16,
 };
+
+// Round markers: byte offset in a slice (inside the first 4 KiB, after the flags; the host arms
+// them with the landing) and one 2 x kMaxRanks x 16-byte block per Lamport leg.
+constexpr int64_t kMarkerOffset = 1024;
+enum MarkerLeg : int { kDispatchMarkers = 0, kCombineMarkers = 1 };
 
 // Dispatch row planes, in wire order.
 enum Plane : int { kPayload = 0, kScales = 1, kWeights = 2, kIds = 3, kNumPlanes = 4 };
@@ -289,6 +298,32 @@ __device__ __forceinline__ void finish_round(Group const& g, int epoch_word, int
   }
 }
 
+__device__ __forceinline__ uint8_t* round_marker(Group const& g, int leg, int dest, int set,
+                                                 int source) {
+  return g.slices[dest] + kMarkerOffset + ((leg * 2 + set) * kMaxRanks + source) * 16;
+}
+
+// Block 0, one thread per peer: push this rank's marker of the round to the peer.
+__device__ __forceinline__ void push_round_markers(Group const& g, int leg, int set, int epoch) {
+  if (blockIdx.x == 0 && threadIdx.x < g.world && threadIdx.x != g.rank) {
+    uint32_t const w = static_cast<uint32_t>(epoch) & 0x7FFFFFFFu;  // never the sentinel
+    store_volatile(round_marker(g, leg, threadIdx.x, set, g.rank), splat(w));
+  }
+}
+
+// Block 0, one thread per peer: wait for the peer's marker of the round, then re-arm it.
+__device__ __forceinline__ void receive_round_markers(Group const& g, int leg, int set) {
+  if (blockIdx.x == 0 && threadIdx.x < g.world && threadIdx.x != g.rank) {
+    uint8_t* const addr = round_marker(g, leg, g.rank, set, threadIdx.x);
+    int32_t* state = reinterpret_cast<int32_t*>(g.slices[g.rank] + g.layout.state_offset);
+    uint64_t const start = global_timer_ns();
+    for (int spins = 0; !has_arrived(load_volatile(addr)); ++spins)
+      if ((spins & 255) == 255 && global_timer_ns() - start > kTimeoutNs)
+        report_and_trap(state, g.rank, "round markers");
+    store_volatile(addr, splat(kSentinel));
+  }
+}
+
 __device__ __forceinline__ void locate_plane(DispatchPlanes const& planes, int vec, int& plane,
                                              int& plane_vec, int& byte_in_row) {
   int base = 0, bytes = 0;
@@ -403,6 +438,7 @@ __global__ void __launch_bounds__(kThreads) fixed_dispatch_kernel(DispatchArgs c
   FX_TIMELINE(kEntryMax, round.epoch);
   int const set = round.epoch & 1;
   int const self = g.rank;
+  push_round_markers(g, kDispatchMarkers, set, round.epoch);
   int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   int64_t const push_tasks = static_cast<int64_t>(round.counts[self]) * a.planes.row_vectors;
   int64_t const landing_base =
@@ -427,6 +463,7 @@ __global__ void __launch_bounds__(kThreads) fixed_dispatch_kernel(DispatchArgs c
   FX_TIMELINE(kPushEnd, round.epoch);
   dispatch_receive<kUnroll>(g, a.planes, round, set, const_cast<uint8_t* const*>(a.out));
   FX_TIMELINE(kReceiveEnd, round.epoch);
+  receive_round_markers(g, kDispatchMarkers, set);
   finish_round(g, kDispatchEpoch, kDispatchFinished, round.epoch);
   FX_TIMELINE(kExit, round.epoch);
 }
@@ -517,6 +554,7 @@ __global__ void __launch_bounds__(kThreads) quant_dispatch_kernel(QuantDispatchA
   FX_TIMELINE(kEntryMax, round.epoch);
   int const set = round.epoch & 1;
   int const self = g.rank;
+  push_round_markers(g, kDispatchMarkers, set, round.epoch);
   int const rows = round.counts[self];
   int const payload_vectors = a.planes.vectors[kPayload];  // hidden / 32
   float const global_scale = *a.global_scale;
@@ -594,6 +632,7 @@ __global__ void __launch_bounds__(kThreads) quant_dispatch_kernel(QuantDispatchA
   FX_TIMELINE(kPushEnd, round.epoch);
   dispatch_receive<kUnroll>(g, a.planes, round, set, const_cast<uint8_t* const*>(a.out));
   FX_TIMELINE(kReceiveEnd, round.epoch);
+  receive_round_markers(g, kDispatchMarkers, set);
   finish_round(g, kDispatchEpoch, kDispatchFinished, round.epoch);
   FX_TIMELINE(kExit, round.epoch);
 }
@@ -632,6 +671,7 @@ __global__ void __launch_bounds__(kThreads) fixed_combine_kernel(CombineArgs con
   load_round(g, kCombineEpoch, a.counts, round);
   int const set = round.epoch & 1;
   int const self = g.rank;
+  push_round_markers(g, kCombineMarkers, set, round.epoch);
   int const row_vectors = a.hidden_size / 8;  // bf16 16-byte vectors
   int const row_bytes = a.hidden_size * 2;
   int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -697,6 +737,7 @@ __global__ void __launch_bounds__(kThreads) fixed_combine_kernel(CombineArgs con
     *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(a.out) +
                               static_cast<int64_t>(row) * row_bytes + vec * 16) = pack_bf16x8(acc);
   }
+  receive_round_markers(g, kCombineMarkers, set);
   finish_round(g, kCombineEpoch, kCombineFinished, round.epoch);
 }
 

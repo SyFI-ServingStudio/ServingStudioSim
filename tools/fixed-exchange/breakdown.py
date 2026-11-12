@@ -30,8 +30,8 @@ from dev_check import (  # noqa: E402
     quant_inputs,
 )
 
-ROWS = (8, 32, 64, 128)
-BLOCKS = (None, 64, 32, 16, 8, 4, 2)
+ROWS = (0, 8, 32, 64, 128)  # 0: markers only (the cross-GPU signal floor of this kernel shape)
+BLOCKS = (None, 64, 32, 16, 8, 4, 2, 1)
 PHASES = ("entry_min", "entry_max", "push_end", "receive_end", "exit")
 
 

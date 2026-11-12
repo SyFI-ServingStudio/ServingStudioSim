@@ -31,6 +31,8 @@ _JIT_MODULE_NAME = "vibesim_mnnvl_fixed_exchange_sm100a"
 _CSRC = Path(__file__).resolve().parent / "csrc"
 MAX_RANKS = 8
 STATE_BYTES = 64
+# Round markers (Lamport, armed with the landing): kMarkerOffset in the .cuh; flags lie below.
+MARKER_OFFSET = 1024
 FLAGS_BYTES = 64
 _ALIGN = 4096
 
@@ -194,9 +196,9 @@ class FixedExchange:
         self.slices = [int(self.memory.get_unicast_ptr(r)) for r in range(world)]
         self.config = torch.tensor(self._config_words(), dtype=torch.int64)
         self.local = self._view(0, self.layout.total, torch.uint8)
-        # Arm every landing word, clear the round state and the ready flags.
+        # Arm every landing word and round marker, clear the round state and the ready flags.
         self.local.fill_(0xFF)
-        self.local[:_ALIGN].zero_()
+        self.local[:MARKER_OFFSET].zero_()
         self._pull_round = 0
         self.counts = torch.empty(world, dtype=torch.int32, device="cuda")
         self.max_blocks = {k: int(self.module.max_resident_blocks(k)) for k in range(4)}

@@ -43,16 +43,22 @@ def words(t):
 
 def make_inputs(torch, rank: int, rows: int, seed: int):
     g = torch.Generator(device="cuda").manual_seed(seed * 1000 + rank)
-    payload = torch.randint(0, 256, (rows, HIDDEN // 2), generator=g, device="cuda", dtype=torch.int32).to(torch.uint8)
+    payload = torch.randint(
+        0, 256, (rows, HIDDEN // 2), generator=g, device="cuda", dtype=torch.int32
+    ).to(torch.uint8)
     if rows:
         # Words that collide with the sentinel before canonicalization: eight -0 / eight -6.
         payload.view(torch.int32)[0, 0] = int(0x88888888 - (1 << 32))
         payload.view(torch.int32)[rows - 1, 1] = -1
-    scales = torch.randint(0, 0x7F, (rows, HIDDEN // 16), generator=g, device="cuda", dtype=torch.int32).to(torch.uint8)
+    scales = torch.randint(
+        0, 0x7F, (rows, HIDDEN // 16), generator=g, device="cuda", dtype=torch.int32
+    ).to(torch.uint8)
     weights = torch.rand((rows, TOP_K), generator=g, device="cuda", dtype=torch.float32)
     if rows:
         weights.view(torch.int32)[0, 0] = -1  # a NaN word equal to the sentinel
-    ids = torch.randint(0, NUM_EXPERTS, (rows, TOP_K), generator=g, device="cuda", dtype=torch.int32)
+    ids = torch.randint(
+        0, NUM_EXPERTS, (rows, TOP_K), generator=g, device="cuda", dtype=torch.int32
+    )
     return payload, scales, weights, ids
 
 
@@ -123,8 +129,9 @@ def worker(rank: int, world: int, args) -> None:
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     torch.cuda.set_device(rank)
-    dist.init_process_group("cpu:gloo,cuda:nccl", rank=rank, world_size=world,
-                            device_id=torch.device("cuda", rank))
+    dist.init_process_group(
+        "cpu:gloo,cuda:nccl", rank=rank, world_size=world, device_id=torch.device("cuda", rank)
+    )
     from profiling.runners.comm.mnnvl_fixed_exchange import FixedExchange
 
     rows_list = [int(r) for r in args.rows.split(",")]
@@ -132,8 +139,11 @@ def worker(rank: int, world: int, args) -> None:
     t0 = time.time()
     ex = FixedExchange(rank, world, max_rows, HIDDEN, TOP_K)
     if rank == 0:
-        print(f"workspace up in {time.time() - t0:.1f}s, {ex.layout.total / 2**20:.0f} MiB/rank, "
-              f"max blocks {ex.max_blocks}", flush=True)
+        print(
+            f"workspace up in {time.time() - t0:.1f}s, {ex.layout.total / 2**20:.0f} MiB/rank, "
+            f"max blocks {ex.max_blocks}",
+            flush=True,
+        )
     results = []
     try:
         if args.check:
@@ -160,16 +170,26 @@ def gathered(torch, world, counts, seed):
 
 def out_planes(torch, ex, total):
     row = ex.row
-    return [torch.empty((total, b), dtype=torch.uint8, device="cuda") for b in
-            (row.payload, row.scales, row.weights, row.ids)]
+    return [
+        torch.empty((total, b), dtype=torch.uint8, device="cuda")
+        for b in (row.payload, row.scales, row.weights, row.ids)
+    ]
 
 
 def check(torch, ex, rank, world, max_rows, args):
     import torch.distributed as dist
 
-    cases = [[1] * world, [8] * world, [128] * world, [max_rows] * world,
-             [(3 * r + 1) % 17 for r in range(world)], [0] + [5] * (world - 1),
-             [max_rows - r for r in range(world)]]
+    cases = [
+        [1] * world,
+        [8] * world,
+        [128] * world,
+        [max_rows] * world,
+        [(3 * r + 1) % 17 for r in range(world)],
+        [0] + [5] * (world - 1),
+        [max_rows - r for r in range(world)],
+        [1] + [0] * (world - 1),
+        [4, 1, 1, 1, 0, 0, 0, 0][:world],
+    ]
     failures = []
     for case_index, counts in enumerate(cases):
         ex.set_counts(counts)
@@ -192,10 +212,11 @@ def check(torch, ex, rank, world, max_rows, args):
             acc = torch.zeros((counts[rank], HIDDEN), dtype=torch.float32, device="cuda")
             first = sum(counts[:rank])
             for r in range(world):
-                acc += make_partials(torch, r, total, seed)[first:first + counts[rank]].float()
+                acc += make_partials(torch, r, total, seed)[first : first + counts[rank]].float()
             if not torch.equal(o, acc.to(torch.bfloat16)):
-                failures.append(f"combine {counts} rep {rep}: max err "
-                                f"{(o.float() - acc).abs().max().item()}")
+                failures.append(
+                    f"combine {counts} rep {rep}: max err {(o.float() - acc).abs().max().item()}"
+                )
             # pull combine: partials in the mapped set the round reads
             ex.partials(ex.next_pull_set, total).copy_(partials)
             torch.cuda.synchronize()
@@ -205,21 +226,61 @@ def check(torch, ex, rank, world, max_rows, args):
             torch.cuda.synchronize()
             if not torch.equal(o2, acc.to(torch.bfloat16)):
                 diff = (o2.float() - acc.to(torch.bfloat16).float()).abs()
-                failures.append(f"pull_combine {counts} rep {rep}: {(diff > 0).float().mean().item():.4f} "
-                                f"of elements differ, max {diff.max().item():.3g}, set {ex.next_pull_set - 0}")
+                failures.append(
+                    f"pull_combine {counts} rep {rep}: {(diff > 0).float().mean().item():.4f} "
+                    f"of elements differ, max {diff.max().item():.3g}, set {ex.next_pull_set - 0}"
+                )
             dist.barrier()  # nobody rewrites partials while a peer still reads them
             # quant dispatch vs vLLM's own quantization
             failures += check_quant(torch, ex, rank, world, counts, seed)
+        if os.environ.get("FX_DEBUG_FLAGS"):
+            torch.cuda.synchronize()
+            words32 = ex.local[:128].view(torch.int32).tolist()
+            print(f"rank {rank} case {case_index} state {words32[:8]} flags {words32[16:40]}",
+                  flush=True)
+        failures += check_burst(torch, ex, rank, world, counts, 1000 + case_index)
+        if os.environ.get("FX_DEBUG_FLAGS") and rank == 0:
+            print(f"case {case_index} burst done", flush=True)
     all_failures = [None] * world
     dist.all_gather_object(all_failures, failures)
     if rank == 0:
         flat = [f"rank {r}: {f}" for r, fs in enumerate(all_failures) for f in fs]
         print("CHECK", "PASS" if not flat else "FAIL", len(cases) * 3, "rounds per leg", flush=True)
         import collections
+
         kinds = collections.Counter(f.split(": ", 1)[1].split(" ")[0] for f in flat)
         print("  failures by leg:", dict(kinds), flush=True)
         for f in flat[:12]:
             print("  ", f, flush=True)
+
+
+def check_burst(torch, ex, rank, world, counts, seed, calls=24):
+    """Back-to-back rounds without a host sync: a rank with nothing to receive (a zero-count peer)
+    must not lap a slower peer and overwrite a landing set it has not read yet."""
+    failures = []
+    total = sum(counts)
+    inp = make_inputs(torch, rank, counts[rank], seed)
+    outs = [out_planes(torch, ex, total) for _ in range(calls)]
+    partials = make_partials(torch, rank, total, seed)
+    combined = [
+        torch.empty((counts[rank], HIDDEN), dtype=torch.bfloat16, device="cuda")
+        for _ in range(calls)
+    ]
+    for i in range(calls):
+        ex.dispatch(*inp, outs[i])
+        ex.combine(partials, combined[i])
+    torch.cuda.synchronize()
+    ref = gathered(torch, world, counts, seed)
+    acc = torch.zeros((counts[rank], HIDDEN), dtype=torch.float32, device="cuda")
+    first = sum(counts[:rank])
+    for r in range(world):
+        acc += make_partials(torch, r, total, seed)[first : first + counts[rank]].float()
+    for i in range(calls):
+        if any(not torch.equal(words(o), r) for o, r in zip(outs[i], ref)):
+            failures.append(f"burst dispatch {counts} call {i}")
+        if not torch.equal(combined[i], acc.to(torch.bfloat16)):
+            failures.append(f"burst combine {counts} call {i}")
+    return failures
 
 
 def quant_inputs(torch, rank, rows, seed):
@@ -229,16 +290,26 @@ def quant_inputs(torch, rank, rows, seed):
         x[0, :32] = 0  # an all-zero block
         x[rows - 1, 16:32] = -1e-9  # tiny negatives: -0 nibbles
     w = torch.rand((rows, TOP_K), generator=g, device="cuda", dtype=torch.float32)
-    ids = torch.randint(0, NUM_EXPERTS, (rows, TOP_K), generator=g, device="cuda", dtype=torch.int32)
+    ids = torch.randint(
+        0, NUM_EXPERTS, (rows, TOP_K), generator=g, device="cuda", dtype=torch.int32
+    )
     return x, w, ids
 
 
 def vllm_quant(torch, x, gscale):
     from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
-    q, s = moe_kernel_quantize_input(x, gscale, quant_dtype="nvfp4", per_act_token_quant=False,
-                                     block_shape=None, is_scale_swizzled=False)
-    return q.view(torch.uint8).reshape(x.shape[0], HIDDEN // 2), s.view(torch.uint8).reshape(x.shape[0], HIDDEN // 16)
+    q, s = moe_kernel_quantize_input(
+        x,
+        gscale,
+        quant_dtype="nvfp4",
+        per_act_token_quant=False,
+        block_shape=None,
+        is_scale_swizzled=False,
+    )
+    return q.view(torch.uint8).reshape(x.shape[0], HIDDEN // 2), s.view(torch.uint8).reshape(
+        x.shape[0], HIDDEN // 16
+    )
 
 
 def check_quant(torch, ex, rank, world, counts, seed):
@@ -276,30 +347,43 @@ def time_shape(torch, ex, rank, world, rows, args):
     row_bytes = ex.row.total
     res = {"rows_per_rank": rows, "dispatch_row_bytes": row_bytes, "combine_row_bytes": HIDDEN * 2}
     blocks = args.blocks
-    res["dispatch_ms"] = max_over_ranks(torch, graph_time_ms(
-        torch, lambda: ex.dispatch(*inp, out, blocks=blocks), rows * world * row_bytes))
+    res["dispatch_ms"] = max_over_ranks(
+        torch,
+        graph_time_ms(
+            torch, lambda: ex.dispatch(*inp, out, blocks=blocks), rows * world * row_bytes
+        ),
+    )
     x, w, ids = quant_inputs(torch, rank, rows, 1)
     gscale = torch.tensor([448.0 * 6.0 / 20.0], dtype=torch.float32, device="cuda")
-    res["quant_dispatch_ms"] = max_over_ranks(torch, graph_time_ms(
-        torch, lambda: ex.quant_dispatch(x, gscale, w, ids, out, blocks=blocks),
-        rows * world * row_bytes))
+    res["quant_dispatch_ms"] = max_over_ranks(
+        torch,
+        graph_time_ms(
+            torch,
+            lambda: ex.quant_dispatch(x, gscale, w, ids, out, blocks=blocks),
+            rows * world * row_bytes,
+        ),
+    )
     try:
-        res["vllm_quant_ms"] = max_over_ranks(torch, graph_time_ms(
-            torch, lambda: vllm_quant(torch, x, gscale), rows * HIDDEN * 2))
+        res["vllm_quant_ms"] = max_over_ranks(
+            torch, graph_time_ms(torch, lambda: vllm_quant(torch, x, gscale), rows * HIDDEN * 2)
+        )
     except Exception as exc:  # noqa: BLE001
         res["vllm_quant_error"] = repr(exc)[:200]
     partials = make_partials(torch, rank, total, 1)
     o = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device="cuda")
-    res["combine_ms"] = max_over_ranks(torch, graph_time_ms(
-        torch, lambda: ex.combine(partials, o, blocks=blocks), total * HIDDEN * 2))
+    res["combine_ms"] = max_over_ranks(
+        torch,
+        graph_time_ms(torch, lambda: ex.combine(partials, o, blocks=blocks), total * HIDDEN * 2),
+    )
     for s in (0, 1):
         ex.partials(s, total).copy_(partials)
     torch.cuda.synchronize()
     import torch.distributed as dist
 
     dist.barrier()
-    res["pull_combine_ms"] = max_over_ranks(torch, graph_time_ms(
-        torch, lambda: ex.pull_combine(o, blocks=blocks), total * HIDDEN * 2))
+    res["pull_combine_ms"] = max_over_ranks(
+        torch, graph_time_ms(torch, lambda: ex.pull_combine(o, blocks=blocks), total * HIDDEN * 2)
+    )
     return res
 
 

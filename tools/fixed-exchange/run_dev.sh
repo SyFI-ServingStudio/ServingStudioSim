@@ -11,6 +11,6 @@ USER_ARG=$(cd "$TREE" && uv run --no-sync python -c 'from profiling.exec.contain
 exec docker run --rm --network none --ipc host --gpus all \
   --device nvidia.com/imex-channel=0 --user "$USER_ARG" \
   --env HOME=/cache/home --env USER=vibesim --env LOGNAME=vibesim \
-  --env PYTHONUNBUFFERED=1 \
+  --env PYTHONUNBUFFERED=1 ${FX_DEBUG_FLAGS:+--env FX_DEBUG_FLAGS=1} \
   --volume "$CACHE:/cache" --volume "$TREE:/work:ro" --volume "$TREE/tmp:/work/tmp" \
   --workdir /work --entrypoint /usr/bin/python3 "$IMAGE" ${FIXED_EXCHANGE_SCRIPT:-tools/fixed-exchange/dev_check.py} "$@"
