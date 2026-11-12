@@ -2929,6 +2929,27 @@ mod tests {
         }
     }
 
+    /// `ep_fixed_combine` picks the measured combine's rows; `auto` keeps the
+    /// pull rows for the fused exchange and the push rows otherwise.
+    #[test]
+    fn the_fixed_combine_side_picks_the_combine_rows() {
+        use crate::arch::ep_comm::FixedCombineSide;
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        let nvfp4 = config("glm53_flash_nvfp4");
+        for (kind, side, backend) in [
+            (EpCommKind::FastAllgather, FixedCombineSide::Auto, "mnnvl_lamport"),
+            (EpCommKind::FusedAllgather, FixedCombineSide::Auto, "mnnvl_pull"),
+            (EpCommKind::FastAllgather, FixedCombineSide::Pull, "mnnvl_pull"),
+            (EpCommKind::FusedAllgather, FixedCombineSide::Push, "mnnvl_lamport"),
+        ] {
+            let mut parallel = exchange(8, kind, EpCommModel::Measured);
+            parallel.ep_comm.fast.fixed_combine = side;
+            let configs = build_configs(&nvfp4, &parallel, &demand).unwrap();
+            let fixed = configs.exchange.measured_fixed.unwrap();
+            assert_eq!(fixed.combine.backends, [backend], "{kind:?} {side:?}");
+        }
+    }
+
     #[test]
     fn every_dp_size_accepts_mixed_ragged_iterations() {
         for dp in [4_u16, 8] {

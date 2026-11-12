@@ -230,6 +230,21 @@ pub enum FastCombine {
     AllReduce,
 }
 
+/// Which side runs the measured fixed-pattern combine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixedCombineSide {
+    /// Pull for `fused_allgather`, push for `fast_allgather`.
+    #[default]
+    Auto,
+    /// Every rank stores its partials into the owners' fabric memory
+    /// (`mnnvl_lamport` rows).
+    Push,
+    /// The owner reads every rank's partials from fabric memory
+    /// (`mnnvl_pull` rows).
+    Pull,
+}
+
 /// The fast exchanges' params (`ep_fast_*`, `ep_fanout_ranks`,
 /// `ep_combine_row_bytes`).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -245,6 +260,8 @@ pub struct EpFastConfig {
     pub fanout_ranks: Option<f64>,
     /// The combine's row bytes (default bf16, `2 H`).
     pub combine_row_bytes: Option<u32>,
+    /// Measured fixed-pattern combine side.
+    pub fixed_combine: FixedCombineSide,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

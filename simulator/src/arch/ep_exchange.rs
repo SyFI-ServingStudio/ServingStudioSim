@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use crate::arch::ep_comm::{
     push_extrapolated_leg, push_leg, AlltoallRows, AnalyticEpComm, EpCommConfig, EpCommKind,
-    EpCommModel, EpCommStep, FastBackend, FastCombine,
+    EpCommModel, EpCommStep, FastBackend, FastCombine, FixedCombineSide,
 };
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
@@ -330,10 +330,11 @@ impl EpExchangeConfigs {
             Some(MeasuredFixedExchange {
                 dispatch,
                 combine: MoeEpReduceScatterKernelConfig {
-                    backends: if fused {
-                        FIXED_EXCHANGE_PULL_BACKENDS.to_vec()
-                    } else {
-                        FIXED_EXCHANGE_PUSH_BACKENDS.to_vec()
+                    backends: match ep_comm.fast.fixed_combine {
+                        FixedCombineSide::Pull => FIXED_EXCHANGE_PULL_BACKENDS.to_vec(),
+                        FixedCombineSide::Push => FIXED_EXCHANGE_PUSH_BACKENDS.to_vec(),
+                        FixedCombineSide::Auto if fused => FIXED_EXCHANGE_PULL_BACKENDS.to_vec(),
+                        FixedCombineSide::Auto => FIXED_EXCHANGE_PUSH_BACKENDS.to_vec(),
                     },
                     gpu_name: gpu_name.to_string(),
                     num_gpus: u32::from(ep_size),

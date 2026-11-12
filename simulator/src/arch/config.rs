@@ -31,7 +31,9 @@ use serde::Deserialize;
 use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::glm52_model_cfg::Glm52MtpMode;
-use super::ep_comm::{EpCommConfig, EpCommKind, EpCommModel, EpFastConfig, FastBackend, FastCombine};
+use super::ep_comm::{
+    EpCommConfig, EpCommKind, EpCommModel, EpFastConfig, FastBackend, FastCombine, FixedCombineSide,
+};
 use super::hisparse::HisparseConfig;
 use super::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 
@@ -127,6 +129,7 @@ const EP_COMM_KINDS: [&str; 5] = [
 const EP_FAST_BACKENDS: [&str; 3] = ["mnnvl", "nvshmem", "lamport"];
 const EP_FAST_COMBINES: [&str; 2] = ["reduce_scatter", "all_reduce"];
 const EP_COMM_MODELS: [&str; 2] = ["measured", "analytic"];
+const EP_FIXED_COMBINES: [&str; 3] = ["auto", "push", "pull"];
 
 /// GLM-5.2 proposer modes exposed by the iter selector. This mirrors
 /// [`Glm52MtpMode`]'s serde representation.
@@ -1479,6 +1482,11 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         ep_combine_row_bytes: Option<u32>,
+        /// `ep_comm_model: measured` fixed-pattern exchange: `push` or `pull`
+        /// combine rows (`auto`: pull for `fused_allgather`, push otherwise).
+        #[serde(default)]
+        #[param(string, default = "auto", choices = EP_FIXED_COMBINES, cache_key)]
+        ep_fixed_combine: FixedCombineSide,
         /// What-if (`extrapolated`): the fixed us taken off every fused mHC
         /// post/pre boundary, as if its post half were fused into the op
         /// before and its pre half into the op after (only the per-row part
@@ -1711,6 +1719,11 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         ep_combine_row_bytes: Option<u32>,
+        /// `ep_comm_model: measured` fixed-pattern exchange: `push` or `pull`
+        /// combine rows (`auto`: pull for `fused_allgather`, push otherwise).
+        #[serde(default)]
+        #[param(string, default = "auto", choices = EP_FIXED_COMBINES, cache_key)]
+        ep_fixed_combine: FixedCombineSide,
         /// What-if (`extrapolated`): the fixed us taken off every fused mHC
         /// post/pre boundary, as if its post half were fused into the op
         /// before and its pre half into the op after (only the per-row part
@@ -2178,6 +2191,7 @@ impl IterArchSel {
             ep_fast_fused_residual_us,
             ep_fanout_ranks,
             ep_combine_row_bytes,
+            ep_fixed_combine,
             ..
         }
         | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
@@ -2187,6 +2201,7 @@ impl IterArchSel {
             ep_fast_fused_residual_us,
             ep_fanout_ranks,
             ep_combine_row_bytes,
+            ep_fixed_combine,
             ..
         }) = self
         else {
@@ -2199,6 +2214,7 @@ impl IterArchSel {
             fused_residual_us: ep_fast_fused_residual_us.unwrap_or(0.0),
             fanout_ranks: *ep_fanout_ranks,
             combine_row_bytes: *ep_combine_row_bytes,
+            fixed_combine: *ep_fixed_combine,
         })
     }
 
