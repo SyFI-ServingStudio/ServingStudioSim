@@ -31,7 +31,7 @@ use serde::Deserialize;
 use schema_derive::{ParamStruct, ProviderSchema};
 
 use super::glm52_model_cfg::Glm52MtpMode;
-use super::ep_comm::{EpCommConfig, EpCommKind, EpCommModel};
+use super::ep_comm::{EpCommConfig, EpCommKind, EpCommModel, EpFastConfig, FastBackend, FastCombine};
 use super::hisparse::HisparseConfig;
 use super::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 
@@ -117,7 +117,15 @@ const MARGINAL_ROUTING_KINDS: [&str; 3] = ["uniform", "random", "popularity"];
 
 // AFD FFN selectors do not yet accept popularity files.
 const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
-const EP_COMM_KINDS: [&str; 2] = ["allgather_reducescatter", "alltoall"];
+const EP_COMM_KINDS: [&str; 5] = [
+    "allgather_reducescatter",
+    "alltoall",
+    "fast_allgather",
+    "fused_allgather",
+    "fast_sparse",
+];
+const EP_FAST_BACKENDS: [&str; 3] = ["mnnvl", "nvshmem", "lamport"];
+const EP_FAST_COMBINES: [&str; 2] = ["reduce_scatter", "all_reduce"];
 const EP_COMM_MODELS: [&str; 2] = ["measured", "analytic"];
 
 /// GLM-5.2 proposer modes exposed by the iter selector. This mirrors
@@ -754,32 +762,38 @@ pub enum IterArchSel {
         /// HiSparse: overlap of consecutive query positions' top-k in one
         /// verify step (default 0.5).
         #[serde(default)]
-        hisparse_intra_step_overlap: Option<f64>,        /// Expert exchange (`arch::ep_comm`): `allgather_reducescatter`
+        hisparse_intra_step_overlap: Option<f64>,
+        /// Expert exchange (`arch::ep_comm`): `allgather_reducescatter`
         /// (default) or `alltoall` (flashinfer two-sided MNNVL).
         #[serde(default)]
-        #[param(string, default = "allgather_reducescatter", choices = EP_COMM_KINDS)]
+        #[param(string, default = "allgather_reducescatter", choices = EP_COMM_KINDS, cache_key)]
         ep_comm: EpCommKind,
         /// `measured` (default; all-gather / reduce-scatter at EP 2, 4, 8 with
         /// `nvl_num_gpu == ep_size`, all-to-all at EP8 only) or `analytic` (any
         /// `ep_size` dividing the experts inside one `nvl_num_gpu` NVLink domain).
         #[serde(default)]
-        #[param(string, default = "measured", choices = EP_COMM_MODELS)]
+        #[param(string, default = "measured", choices = EP_COMM_MODELS, cache_key)]
         ep_comm_model: EpCommModel,
         /// Analytic: effective per-direction NVLink GB/s per GPU (default 620
         /// for the all-gather / reduce-scatter, 638 for the all-to-all).
         #[serde(default)]
+        #[param(cache_key)]
         ep_link_gb_per_s: Option<f64>,
         /// Analytic: one all-to-all `moe_comm` call's fixed us (default 4.11).
         #[serde(default)]
+        #[param(cache_key)]
         ep_comm_latency_us: Option<f64>,
         /// Analytic: multiplier on every collective's fixed cost (default 1).
         #[serde(default)]
+        #[param(cache_key)]
         ep_comm_latency_scale: Option<f64>,
         /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.9).
         #[serde(default)]
+        #[param(cache_key)]
         ep_prepare_latency_us: Option<f64>,
         /// Analytic all-to-all: multiplier on the whole prepare (default 1).
         #[serde(default)]
+        #[param(cache_key)]
         ep_prepare_scale: Option<f64>,
     },
     /// [`Self::Glm52VllmNvfp4DsaMoe`]'s kernels under pure pipeline
@@ -994,32 +1008,38 @@ pub enum IterArchSel {
         /// HiSparse: overlap of consecutive query positions' top-k in one
         /// verify step (default 0.5).
         #[serde(default)]
-        hisparse_intra_step_overlap: Option<f64>,        /// Expert exchange (`arch::ep_comm`): `allgather_reducescatter`
+        hisparse_intra_step_overlap: Option<f64>,
+        /// Expert exchange (`arch::ep_comm`): `allgather_reducescatter`
         /// (default) or `alltoall` (flashinfer two-sided MNNVL).
         #[serde(default)]
-        #[param(string, default = "allgather_reducescatter", choices = EP_COMM_KINDS)]
+        #[param(string, default = "allgather_reducescatter", choices = EP_COMM_KINDS, cache_key)]
         ep_comm: EpCommKind,
         /// `measured` (default; all-gather / reduce-scatter at EP 2, 4, 8 with
         /// `nvl_num_gpu == ep_size`, all-to-all at EP8 only) or `analytic` (any
         /// `ep_size` dividing the experts inside one `nvl_num_gpu` NVLink domain).
         #[serde(default)]
-        #[param(string, default = "measured", choices = EP_COMM_MODELS)]
+        #[param(string, default = "measured", choices = EP_COMM_MODELS, cache_key)]
         ep_comm_model: EpCommModel,
         /// Analytic: effective per-direction NVLink GB/s per GPU (default 620
         /// for the all-gather / reduce-scatter, 638 for the all-to-all).
         #[serde(default)]
+        #[param(cache_key)]
         ep_link_gb_per_s: Option<f64>,
         /// Analytic: one all-to-all `moe_comm` call's fixed us (default 4.11).
         #[serde(default)]
+        #[param(cache_key)]
         ep_comm_latency_us: Option<f64>,
         /// Analytic: multiplier on every collective's fixed cost (default 1).
         #[serde(default)]
+        #[param(cache_key)]
         ep_comm_latency_scale: Option<f64>,
         /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.9).
         #[serde(default)]
+        #[param(cache_key)]
         ep_prepare_latency_us: Option<f64>,
         /// Analytic all-to-all: multiplier on the whole prepare (default 1).
         #[serde(default)]
+        #[param(cache_key)]
         ep_prepare_scale: Option<f64>,
     },
     /// GLM-5.3-Flash FP8 block checkpoint on B200 through the vLLM fork: 34 KDA
@@ -1302,7 +1322,8 @@ pub enum IterArchSel {
     },
     /// [`Self::Glm53FlashVllmFp8DpAttnEpMoe`] for the NVFP4 checkpoint (see
     /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]): the routed experts sit behind
-    /// an NVFP4 all-gather and a bf16 reduce-scatter.
+    /// an NVFP4 all-gather and a bf16 reduce-scatter, or with `ep_comm:
+    /// alltoall` flashinfer's two-sided MNNVL all-to-all.
     Glm53FlashVllmNvfp4DpAttnEpMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -1378,6 +1399,73 @@ pub enum IterArchSel {
         /// verify step (default 0.5).
         #[serde(default)]
         hisparse_intra_step_overlap: Option<f64>,
+        /// Expert exchange (`arch::ep_comm`, `arch::ep_exchange`):
+        /// `allgather_reducescatter` (default) or `alltoall` (flashinfer
+        /// two-sided MNNVL), with rows sized from this model's hidden size,
+        /// top-k and experts.
+        #[serde(default)]
+        #[param(string, default = "allgather_reducescatter", choices = EP_COMM_KINDS, cache_key)]
+        ep_comm: EpCommKind,
+        /// `measured` (default; the all-to-all at EP8 only, from `moe_alltoall`
+        /// rows profiled at this model's row widths) or `analytic` (the link
+        /// model fitted on the GLM-5.3 B200 EP8 rows, any `ep_size`).
+        #[serde(default)]
+        #[param(string, default = "measured", choices = EP_COMM_MODELS, cache_key)]
+        ep_comm_model: EpCommModel,
+        /// Analytic: effective per-direction NVLink GB/s per GPU (default 620
+        /// for the all-gather / reduce-scatter, 638 for the all-to-all).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_link_gb_per_s: Option<f64>,
+        /// Analytic: one all-to-all `moe_comm` call's fixed us (default 4.11).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_comm_latency_us: Option<f64>,
+        /// Analytic: multiplier on every collective's fixed cost (default 1).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_comm_latency_scale: Option<f64>,
+        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.9).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_prepare_latency_us: Option<f64>,
+        /// Analytic all-to-all: multiplier on the whole prepare (default 1).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_prepare_scale: Option<f64>,
+        /// Fast exchanges (`ep_comm: fast_*`, `fused_allgather`): the
+        /// transport whose B200 fit prices the legs (`arch::ep_comm`).
+        #[serde(default)]
+        #[param(string, default = "mnnvl", choices = EP_FAST_BACKENDS, cache_key)]
+        ep_fast_backend: FastBackend,
+        /// Fast exchanges: the partial sums' collective.
+        #[serde(default)]
+        #[param(string, default = "reduce_scatter", choices = EP_FAST_COMBINES, cache_key)]
+        ep_fast_combine: FastCombine,
+        /// Fast exchanges: overrides the backend's fixed us per leg.
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_fast_latency_us: Option<f64>,
+        /// `fused_allgather`: fixed us left per leg once fused (default 0).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_fast_fused_residual_us: Option<f64>,
+        /// `fast_sparse`: distinct ranks a token's top-k reach (default the
+        /// uniform value).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_fanout_ranks: Option<f64>,
+        /// Fast exchanges: combine row bytes (default bf16, 2 x hidden).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_combine_row_bytes: Option<u32>,
+        /// What-if (`extrapolated`): the fixed us taken off every fused mHC
+        /// post/pre boundary, as if its post half were fused into the op
+        /// before and its pre half into the op after (only the per-row part
+        /// stays). Absent: the measured kernel.
+        #[serde(default)]
+        #[param(cache_key)]
+        mhc_fuse_fixed_us: Option<f64>,
     },
     /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`] verifying the
     /// `incoai/GLM-5.3-Flash-DFlash2` proposer's drafts: each verify row is
@@ -1503,6 +1591,73 @@ pub enum IterArchSel {
         /// verify step (default 0.5).
         #[serde(default)]
         hisparse_intra_step_overlap: Option<f64>,
+        /// Expert exchange (`arch::ep_comm`, `arch::ep_exchange`):
+        /// `allgather_reducescatter` (default) or `alltoall` (flashinfer
+        /// two-sided MNNVL), with rows sized from this model's hidden size,
+        /// top-k and experts.
+        #[serde(default)]
+        #[param(string, default = "allgather_reducescatter", choices = EP_COMM_KINDS, cache_key)]
+        ep_comm: EpCommKind,
+        /// `measured` (default; the all-to-all at EP8 only, from `moe_alltoall`
+        /// rows profiled at this model's row widths) or `analytic` (the link
+        /// model fitted on the GLM-5.3 B200 EP8 rows, any `ep_size`).
+        #[serde(default)]
+        #[param(string, default = "measured", choices = EP_COMM_MODELS, cache_key)]
+        ep_comm_model: EpCommModel,
+        /// Analytic: effective per-direction NVLink GB/s per GPU (default 620
+        /// for the all-gather / reduce-scatter, 638 for the all-to-all).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_link_gb_per_s: Option<f64>,
+        /// Analytic: one all-to-all `moe_comm` call's fixed us (default 4.11).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_comm_latency_us: Option<f64>,
+        /// Analytic: multiplier on every collective's fixed cost (default 1).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_comm_latency_scale: Option<f64>,
+        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.9).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_prepare_latency_us: Option<f64>,
+        /// Analytic all-to-all: multiplier on the whole prepare (default 1).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_prepare_scale: Option<f64>,
+        /// Fast exchanges (`ep_comm: fast_*`, `fused_allgather`): the
+        /// transport whose B200 fit prices the legs (`arch::ep_comm`).
+        #[serde(default)]
+        #[param(string, default = "mnnvl", choices = EP_FAST_BACKENDS, cache_key)]
+        ep_fast_backend: FastBackend,
+        /// Fast exchanges: the partial sums' collective.
+        #[serde(default)]
+        #[param(string, default = "reduce_scatter", choices = EP_FAST_COMBINES, cache_key)]
+        ep_fast_combine: FastCombine,
+        /// Fast exchanges: overrides the backend's fixed us per leg.
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_fast_latency_us: Option<f64>,
+        /// `fused_allgather`: fixed us left per leg once fused (default 0).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_fast_fused_residual_us: Option<f64>,
+        /// `fast_sparse`: distinct ranks a token's top-k reach (default the
+        /// uniform value).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_fanout_ranks: Option<f64>,
+        /// Fast exchanges: combine row bytes (default bf16, 2 x hidden).
+        #[serde(default)]
+        #[param(cache_key)]
+        ep_combine_row_bytes: Option<u32>,
+        /// What-if (`extrapolated`): the fixed us taken off every fused mHC
+        /// post/pre boundary, as if its post half were fused into the op
+        /// before and its pre half into the op after (only the per-row part
+        /// stays). Absent: the measured kernel.
+        #[serde(default)]
+        #[param(cache_key)]
+        mhc_fuse_fixed_us: Option<f64>,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
@@ -1767,12 +1922,34 @@ impl IterArchSel {
             ep_prepare_latency_us,
             ep_prepare_scale,
             ..
+        }
+        | Self::Glm53FlashVllmNvfp4DpAttnEpMoe {
+            ep_comm,
+            ep_comm_model,
+            ep_link_gb_per_s,
+            ep_comm_latency_us,
+            ep_comm_latency_scale,
+            ep_prepare_latency_us,
+            ep_prepare_scale,
+            ..
+        }
+        | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+            ep_comm,
+            ep_comm_model,
+            ep_link_gb_per_s,
+            ep_comm_latency_us,
+            ep_comm_latency_scale,
+            ep_prepare_latency_us,
+            ep_prepare_scale,
+            ..
         }) = self
         else {
             return EpCommConfig::default();
         };
         let defaults = EpCommConfig::default();
+        let fast = self.ep_fast().unwrap_or_default();
         EpCommConfig {
+            fast,
             kind: *ep_comm,
             model: *ep_comm_model,
             link_gb_per_s: *ep_link_gb_per_s,
@@ -1781,6 +1958,52 @@ impl IterArchSel {
             prepare_latency_us: ep_prepare_latency_us.unwrap_or(defaults.prepare_latency_us),
             prepare_scale: ep_prepare_scale.unwrap_or(defaults.prepare_scale),
         }
+    }
+
+    /// `mhc_fuse_fixed_us` (GLM-5.3-Flash NVFP4 DP arches), else `None`.
+    pub fn mhc_fuse_fixed_us(&self) -> Option<f64> {
+        match self {
+            Self::Glm53FlashVllmNvfp4DpAttnEpMoe {
+                mhc_fuse_fixed_us, ..
+            }
+            | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+                mhc_fuse_fixed_us, ..
+            } => *mhc_fuse_fixed_us,
+            _ => None,
+        }
+    }
+
+    /// The fast exchanges' `ep_fast_*` params (GLM-5.3-Flash NVFP4 DP arches).
+    fn ep_fast(&self) -> Option<EpFastConfig> {
+        let (Self::Glm53FlashVllmNvfp4DpAttnEpMoe {
+            ep_fast_backend,
+            ep_fast_combine,
+            ep_fast_latency_us,
+            ep_fast_fused_residual_us,
+            ep_fanout_ranks,
+            ep_combine_row_bytes,
+            ..
+        }
+        | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+            ep_fast_backend,
+            ep_fast_combine,
+            ep_fast_latency_us,
+            ep_fast_fused_residual_us,
+            ep_fanout_ranks,
+            ep_combine_row_bytes,
+            ..
+        }) = self
+        else {
+            return None;
+        };
+        Some(EpFastConfig {
+            backend: *ep_fast_backend,
+            combine: *ep_fast_combine,
+            latency_us: *ep_fast_latency_us,
+            fused_residual_us: ep_fast_fused_residual_us.unwrap_or(0.0),
+            fanout_ranks: *ep_fanout_ranks,
+            combine_row_bytes: *ep_combine_row_bytes,
+        })
     }
 
     /// The `hisparse_*` params as one config, `None` unless

@@ -171,6 +171,38 @@ schema; no second hand-maintained config union belongs here.
   - Qwen3 BF16 attention + `qwen3_ffn_moe`
   - Qwen3 FP8 attention + `qwen3_fp8_ffn_moe`
 
+## Expert exchange (`ep_comm`)
+
+The vLLM data-parallel-attention EP-MoE arches that take `ep_comm`,
+`ep_comm_model`, `ep_link_gb_per_s`, `ep_comm_latency_us`,
+`ep_comm_latency_scale`, `ep_prepare_latency_us` and `ep_prepare_scale`:
+
+- `glm52_vllm_nvfp4_dp_attn_dsa_moe` and `glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2`
+  (GLM-5.2/5.3 NVFP4);
+- `glm53_flash_vllm_nvfp4_dp_attn_ep_moe` and
+  `glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2` (GLM-5.3-Flash NVFP4; the
+  FP8 Flash DP arch keeps the measured all-gather / reduce-scatter).
+
+The default (`allgather_reducescatter`, `measured`) is each arch's profiled
+all-gather / reduce-scatter. `alltoall` is vLLM's
+`flashinfer_nvlink_two_sided` backend. `arch/ep_exchange.rs` builds the
+exchange leaves for every one of these arches, with row widths from the
+model's hidden size, top-k and expert count. `arch/ep_comm.rs` holds the
+analytic model, and its header gives the calibration. Measured all-to-all
+rows exist only at EP8, keyed by row width, so a model with other widths
+needs its own `moe_alltoall` rows or `ep_comm_model: analytic`.
+
+The Flash NVFP4 DP arches also take three design-candidate exchanges, none in
+vLLM or SGLang: `fast_allgather` (direct-write all-gather dispatch, then a
+reduce-scatter or all-reduce of the partial sums, `ep_fast_combine`),
+`fused_allgather` (the same bytes with the per-leg fixed cost fused away) and
+`fast_sparse` (one row per token and distinct remote rank, `ep_fanout_ranks`).
+`ep_fast_backend` picks the transport fit (`mnnvl`: the `moe_alltoall` fit;
+`nvshmem`, `lamport`: `a + bytes / L` from `tools/fast-moe-exchange/`),
+`ep_combine_row_bytes` narrows the combine row, and `mhc_fuse_fixed_us` is a
+what-if that takes a fixed cost off each fused mHC boundary. Their legs are
+flagged `extrapolated` in the cost log. Every `ep_*` param is a cache key.
+
 ## Authoring
 
 Use the `impl-compose-arch` skill when adding an L4 model. Keep the concrete

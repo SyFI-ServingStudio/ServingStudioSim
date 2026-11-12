@@ -36,6 +36,26 @@
 //!   undershoots them). A received row weighs `w < 1` of a sent one: fan-in
 //!   arrives from every sender in parallel, egress leaves one GPU.
 //!
+//! * **Fast exchanges** (`fast_allgather`, `fused_allgather`, `fast_sparse`;
+//!   not in vLLM or SGLang, design candidates). No prepare. The dispatch is
+//!   one direct-to-peer-memory write of each rank's rows (NVFP4 activations,
+//!   block scales, ids and weights in one row) and the combine moves bf16
+//!   partial sums (each rank sums its local experts first) by a reduce-scatter
+//!   or an all-reduce on the same backend. Each leg is `a + bytes / L` on the
+//!   busiest rank, `(a, L)` per backend fitted on B200 8-GPU rows
+//!   ([`FastBackend`]); the legs are flagged `extrapolated` in the cost log,
+//!   since no B200 row measures them. `fast_allgather` with
+//!   `ep_fast_combine: all_reduce` and `ep_comm_model: measured` prices the
+//!   combine from the backend's measured all-reduce instead (in the arch).
+//!   `fused_allgather` assumes the dispatch write is fused into the
+//!   activation-quant kernel and the combine read into the next op: the same
+//!   bytes with the fixed cost `a` replaced by `ep_fast_fused_residual_us`
+//!   (default 0). `fast_sparse` writes one row per (token, distinct remote
+//!   destination rank) both ways, `ep_fanout_ranks` distinct ranks per token
+//!   (default the uniform `D`; an expert placement by co-occurrence lowers
+//!   it), at the fast model's price. `ep_combine_row_bytes` narrows the
+//!   combine row (bf16 `2 H` by default) for every fast kind.
+//!
 //! ## Rows
 //!
 //! A token's top-k experts reach `D = N (1 - C(E - E/N, k) / C(E, k))`
@@ -127,6 +147,93 @@ pub enum EpCommKind {
     AllgatherReducescatter,
     /// flashinfer's two-sided MNNVL all-to-all.
     Alltoall,
+    /// Direct-write all-gather dispatch, then a reduce-scatter or all-reduce
+    /// of the partial sums on the same backend, no prepare.
+    FastAllgather,
+    /// [`Self::FastAllgather`] with the dispatch fused into the quant kernel
+    /// and the combine into the next op: no fixed cost per leg.
+    FusedAllgather,
+    /// Direct writes of one row per (token, distinct remote rank) each way.
+    FastSparse,
+}
+
+impl EpCommKind {
+    pub fn is_fast(self) -> bool {
+        matches!(
+            self,
+            Self::FastAllgather | Self::FusedAllgather | Self::FastSparse
+        )
+    }
+}
+
+/// The transport a fast exchange runs on, with its B200 8-GPU fit `(a, L)`
+/// (`tools/fast-moe-exchange/fit_fast_collectives.py`, 2026-11-11): one
+/// collective's fixed cost and link over the busiest rank's one-direction
+/// bytes of a two-shot all-reduce, `2 (N - 1) / N` x message.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastBackend {
+    /// FlashInfer MNNVL: the `moe_alltoall` transport kernel (`moe_comm`)
+    /// called at the fast exchange's rows, priced by this module's B200 EP8
+    /// all-to-all fit (a = 4.11 us, L = 638 GB/s, per-row issue cost, recv
+    /// weight 0.9). Cross-check: `all_reduce_fusion` flashinfer_mnnvl TP8
+    /// hidden 4096 two-shot rows (17..128 tokens) fit a = 5.37 us at 638 GB/s
+    /// (rms 5.0%).
+    #[default]
+    Mnnvl,
+    /// NVSHMEM (`all_reduce` nvshmem 8 GPUs, 4 KiB..64 MiB, 15 rows):
+    /// 15.0 us, 729 GB/s; rms 14%, worst +36% (4 KiB) / -26% (256 KiB).
+    Nvshmem,
+    /// vLLM Lamport Triton (`rs_sconv_ag_residual_rms_norm` TP8 hidden 6144,
+    /// 45 token counts 1..16,384, fused short conv + RMSNorm included):
+    /// 14.9 us, 495 GB/s; rms 7.3%, worst +22%.
+    Lamport,
+}
+
+impl FastBackend {
+    pub fn latency_us(self) -> f64 {
+        match self {
+            Self::Mnnvl => DEFAULT_A2A_LATENCY_US,
+            Self::Nvshmem => 15.0,
+            Self::Lamport => 14.9,
+        }
+    }
+
+    pub fn link_gb_per_s(self) -> f64 {
+        match self {
+            Self::Mnnvl => 638.0,
+            Self::Nvshmem => 729.0,
+            Self::Lamport => 495.0,
+        }
+    }
+}
+
+/// How a fast exchange returns the partial sums.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastCombine {
+    /// Each rank receives only its own tokens' partials and sums them.
+    #[default]
+    ReduceScatter,
+    /// Every rank gets every token's sum (two-shot: twice the bytes) and keeps
+    /// its own.
+    AllReduce,
+}
+
+/// The fast exchanges' params (`ep_fast_*`, `ep_fanout_ranks`,
+/// `ep_combine_row_bytes`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EpFastConfig {
+    pub backend: FastBackend,
+    pub combine: FastCombine,
+    /// Overrides the backend's fixed cost `a`, us.
+    pub latency_us: Option<f64>,
+    /// `fused_allgather`: what is left of `a` per leg once fused (default 0).
+    pub fused_residual_us: f64,
+    /// `fast_sparse`: distinct ranks a token's top-k reach (default uniform).
+    pub fanout_ranks: Option<f64>,
+    /// The combine's row bytes (default bf16, `2 H`).
+    pub combine_row_bytes: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -158,6 +265,8 @@ pub struct EpCommConfig {
     pub prepare_latency_us: f64,
     /// Multiplies the whole prepare, for sensitivity.
     pub prepare_scale: f64,
+    /// The fast exchanges' params; unused by the other kinds.
+    pub fast: EpFastConfig,
 }
 
 impl Default for EpCommConfig {
@@ -170,6 +279,7 @@ impl Default for EpCommConfig {
             latency_scale: 1.0,
             prepare_latency_us: DEFAULT_PREPARE_LATENCY_US,
             prepare_scale: 1.0,
+            fast: EpFastConfig::default(),
         }
     }
 }
@@ -184,6 +294,9 @@ impl EpCommConfig {
         self.link_gb_per_s.unwrap_or(match self.kind {
             EpCommKind::AllgatherReducescatter => DEFAULT_LINK_GB_PER_S,
             EpCommKind::Alltoall => DEFAULT_A2A_LINK_GB_PER_S,
+            EpCommKind::FastAllgather | EpCommKind::FusedAllgather | EpCommKind::FastSparse => {
+                self.fast.backend.link_gb_per_s()
+            }
         })
     }
 
@@ -195,6 +308,10 @@ impl EpCommConfig {
             || !non_negative(self.latency_scale)
             || !non_negative(self.prepare_latency_us)
             || !non_negative(self.prepare_scale)
+            || !non_negative(self.fast.fused_residual_us)
+            || !self.fast.latency_us.is_none_or(non_negative)
+            || !self.fast.fanout_ranks.is_none_or(|d| d.is_finite() && d >= 1.0)
+            || self.fast.combine_row_bytes == Some(0)
         {
             return Err(format!("invalid ep_comm params {self:?}"));
         }
@@ -346,7 +463,17 @@ impl AnalyticEpComm {
     /// One all-to-all `moe_comm` call of `row_bytes`-wide rows on the busiest
     /// rank (the module doc's form).
     pub fn alltoall_call(&self, send: f64, recv: f64, row_bytes: f64) -> EpCommLeg {
-        let latency_us = self.a2a_latency_us();
+        self.alltoall_call_with(send, recv, row_bytes, self.a2a_latency_us())
+    }
+
+    /// [`Self::alltoall_call`] with its fixed cost `latency_us`.
+    fn alltoall_call_with(
+        &self,
+        send: f64,
+        recv: f64,
+        row_bytes: f64,
+        latency_us: f64,
+    ) -> EpCommLeg {
         let rows = send.max(A2A_RECV_ROW_WEIGHT * recv);
         let per_row_us = A2A_PER_ROW_US.hypot(row_bytes / self.bytes_per_us());
         let floor_us = row_bytes / (A2A_ROW_FLOOR_GB_PER_S * 1e3);
@@ -474,6 +601,9 @@ impl AnalyticEpComm {
                     ),
                 }
             }
+            EpCommKind::FastAllgather | EpCommKind::FusedAllgather | EpCommKind::FastSparse => {
+                self.fast_step(tokens)
+            }
             EpCommKind::Alltoall => {
                 let AlltoallRows {
                     busiest_tokens: busiest,
@@ -492,7 +622,103 @@ impl AnalyticEpComm {
         }
     }
 
+    /// A fast leg's fixed cost: the backend's `a` (or the override) x the
+    /// latency scale, or the fused residual.
+    pub fn fast_latency_us(&self) -> f64 {
+        let fast = &self.config.fast;
+        if self.config.kind == EpCommKind::FusedAllgather {
+            return fast.fused_residual_us;
+        }
+        self.config.latency_scale * fast.latency_us.unwrap_or(fast.backend.latency_us())
+    }
+
+    /// The fast combine's row: bf16 unless `ep_combine_row_bytes` narrows it.
+    pub fn fast_combine_row_bytes(&self) -> f64 {
+        self.config
+            .fast
+            .combine_row_bytes
+            .map_or(self.bf16_row_bytes(), f64::from)
+    }
+
+    /// `fast_sparse`'s distinct ranks per token.
+    pub fn fanout_ranks(&self) -> f64 {
+        self.config
+            .fast
+            .fanout_ranks
+            .unwrap_or(self.uniform_hit * f64::from(self.ep_size))
+            .min(f64::from(self.ep_size))
+    }
+
+    /// One fast leg on the busiest rank. MNNVL is the same `moe_alltoall`
+    /// transport kernel at the fast exchange's rows (the B200 EP8 fit above,
+    /// fixed cost `a` = `fast_latency_us`); the other backends are
+    /// `a + max(send, recv) row / L`.
+    fn fast_leg(&self, send: f64, recv: f64, row_bytes: f64) -> EpCommLeg {
+        match self.config.fast.backend {
+            FastBackend::Mnnvl => {
+                self.alltoall_call_with(send, recv, row_bytes, self.fast_latency_us())
+            }
+            FastBackend::Nvshmem | FastBackend::Lamport => {
+                self.leg(send, recv, row_bytes, self.fast_latency_us())
+            }
+        }
+    }
+
+    /// The fast exchanges on the busiest rank (module doc). The all-reduce
+    /// combine is two-shot: a reduce-scatter, then an all-gather of the sums.
+    fn fast_step(&self, tokens: &[u32]) -> EpCommStep {
+        let total: f64 = tokens.iter().map(|&t| f64::from(t)).sum();
+        let ranks = f64::from(self.ep_size);
+        let peers = self.peers();
+        let combine_row = self.fast_combine_row_bytes();
+        let (mut send, mut recv) = (0.0_f64, 0.0_f64);
+        let (remote_out, remote_in) = if self.config.kind == EpCommKind::FastSparse {
+            // Of a token's D distinct ranks, its own is one with chance D / N.
+            let fanout = self.fanout_ranks();
+            (fanout * peers / ranks, fanout / ranks)
+        } else {
+            (peers, 1.0)
+        };
+        for &t in tokens {
+            let own = f64::from(t);
+            send = send.max(own * remote_out);
+            recv = recv.max((total - own) * remote_in);
+        }
+        let dispatch = self.fast_leg(send, recv, self.gather_row_bytes());
+        // The combine is the transpose: partials of others' tokens out, own in.
+        let mut combine = self.fast_leg(recv, send, combine_row);
+        if self.config.fast.combine == FastCombine::AllReduce
+            && self.config.kind != EpCommKind::FastSparse
+        {
+            // Two-shot: the sums go back out to every peer (all-gather leg).
+            let gather = self.leg(send, recv, combine_row, 0.0);
+            combine = EpCommLeg {
+                max_send_rows: combine.max_send_rows + gather.max_send_rows,
+                max_recv_rows: combine.max_recv_rows + gather.max_recv_rows,
+                bytes: combine.bytes + gather.bytes,
+                latency_us: combine.latency_us,
+                time_us: combine.time_us + gather.time_us,
+            };
+        }
+        EpCommStep {
+            prepare: EpCommLeg::default(),
+            dispatch,
+            dispatch_scales: EpCommLeg::default(),
+            combine,
+        }
+    }
+
     pub fn label(&self) -> String {
+        if self.config.kind.is_fast() {
+            return format!(
+                "analytic {:?} on {:?} (a {:.2} us, {} GB/s per direction), combine {:?}",
+                self.config.kind,
+                self.config.fast.backend,
+                self.fast_latency_us(),
+                self.config.link_gb_per_s(),
+                self.config.fast.combine
+            );
+        }
         format!(
             "analytic {:?} over {} GB/s per direction; latency x{}",
             self.config.kind,
@@ -514,6 +740,14 @@ impl AnalyticEpComm {
                 "link_gb_per_s": self.config.link_gb_per_s(),
                 "latency_scale": self.config.latency_scale,
                 "prepare_scale": self.config.prepare_scale,
+                "fast": self.config.kind.is_fast().then(|| serde_json::json!({
+                    "backend": self.config.fast.backend,
+                    "combine": self.config.fast.combine,
+                    "latency_us": self.fast_latency_us(),
+                    "fanout_ranks": (self.config.kind == EpCommKind::FastSparse)
+                        .then(|| self.fanout_ranks()),
+                    "combine_row_bytes": self.fast_combine_row_bytes(),
+                })),
             }),
         )
     }
@@ -521,6 +755,15 @@ impl AnalyticEpComm {
 
 /// Push one leg's leaf.
 pub fn push_leg(op: &'static str, leg: EpCommLeg, ev: &mut Evaluator) {
+    push_leg_with(op, leg, CoverageFlags::EMPTY, ev);
+}
+
+/// Push one leg's leaf, flagged `extrapolated` (a fast exchange's model leg).
+pub fn push_extrapolated_leg(op: &'static str, leg: EpCommLeg, ev: &mut Evaluator) {
+    push_leg_with(op, leg, CoverageFlags::EXTRAPOLATED, ev);
+}
+
+fn push_leg_with(op: &'static str, leg: EpCommLeg, coverage: CoverageFlags, ev: &mut Evaluator) {
     let metrics = LeafMetrics {
         m: Metrics4 {
             time_ms: (leg.time_us / 1e3) as f32,
@@ -528,7 +771,7 @@ pub fn push_leg(op: &'static str, leg: EpCommLeg, ev: &mut Evaluator) {
             bytes: leg.bytes as f32,
             energy_j: 0.0,
         },
-        coverage: CoverageFlags::EMPTY,
+        coverage,
         backend_index: LeafMetrics::NO_BACKEND,
     };
     ev.push(metrics, || {
@@ -637,6 +880,79 @@ mod tests {
         // Skew decays to uniform at large exchanges.
         assert!(a2a.busiest_hit(64) >= a2a.busiest_hit(131_072));
         assert!((a2a.busiest_hit(131_072) / a2a.uniform_hit - 1.0).abs() < 0.05);
+    }
+
+    fn fast(kind: EpCommKind, fast: EpFastConfig) -> AnalyticEpComm {
+        AnalyticEpComm::new(
+            EpCommConfig {
+                kind,
+                model: EpCommModel::Analytic,
+                fast,
+                ..EpCommConfig::default()
+            },
+            8,
+            4096,
+            288,
+            8,
+            &uniform(288),
+        )
+        .unwrap()
+    }
+
+    /// Catches a fast leg priced off its `a + bytes / L` form or the wrong
+    /// rows: GLM-5.3-Flash k7 c128, 128 rows on each of 8 ranks.
+    #[test]
+    fn fast_exchanges_price_the_busiest_rank_bytes() {
+        let tokens = [128_u32; 8];
+        let m2 = fast(EpCommKind::FastAllgather, EpFastConfig::default());
+        let step = m2.step(&tokens);
+        // Dispatch: 896 gathered rows of 2,048 + 256 + 64 B in, 7 x 128 out.
+        assert!(close(step.dispatch.max_recv_rows, 896.0));
+        assert!(close(step.dispatch.bytes, 896.0 * 2368.0));
+        // MNNVL: the moe_alltoall fit at 896 x 896 rows.
+        assert!(close(step.dispatch.time_us, m2.alltoall_call(896.0, 896.0, 2368.0).time_us));
+        assert!((step.dispatch.time_us - 8.14).abs() < 0.01, "{}", step.dispatch.time_us);
+        // Combine: the bf16 partials of everyone else's tokens.
+        assert!(close(step.combine.bytes, 896.0 * 8192.0));
+        assert!(close(step.combine.time_us, m2.alltoall_call(896.0, 896.0, 8192.0).time_us));
+        assert_eq!(step.prepare, EpCommLeg::default());
+        // All-reduce: twice the combine bytes, one fixed cost.
+        let ar = fast(
+            EpCommKind::FastAllgather,
+            EpFastConfig {
+                combine: FastCombine::AllReduce,
+                ..EpFastConfig::default()
+            },
+        )
+        .step(&tokens);
+        assert!(close(
+            ar.combine.time_us,
+            step.combine.time_us + 896.0 * 8192.0 / 638e3
+        ));
+        // Fused: the same bytes without the fixed cost.
+        let m3 = fast(EpCommKind::FusedAllgather, EpFastConfig::default()).step(&tokens);
+        assert!(close(m3.dispatch.time_us, step.dispatch.time_us - 4.11));
+        assert!(close(m3.combine.time_us, step.combine.time_us - 4.11));
+        // Sparse: D distinct ranks per token, D (N-1)/N of them remote.
+        let sparse = fast(EpCommKind::FastSparse, EpFastConfig::default());
+        let d = sparse.fanout_ranks();
+        assert!(close(d, 8.0 * uniform_hit_probability(288, 8, 8)));
+        let s = sparse.step(&tokens);
+        assert!(close(s.dispatch.max_send_rows, 128.0 * d * 7.0 / 8.0));
+        assert!(close(s.dispatch.max_recv_rows, 896.0 * d / 8.0));
+        let placed = fast(
+            EpCommKind::FastSparse,
+            EpFastConfig {
+                fanout_ranks: Some(3.0),
+                combine_row_bytes: Some(4224),
+                backend: FastBackend::Nvshmem,
+                ..EpFastConfig::default()
+            },
+        );
+        let p = placed.step(&tokens);
+        assert!(close(p.combine.bytes, 896.0 * 3.0 / 8.0 * 4224.0));
+        assert!(close(p.combine.latency_us, 15.0));
+        assert_eq!(placed.config.link_gb_per_s(), 729.0);
     }
 
     /// The all-to-all constants are the 2026-10-11 fit to the B200 EP8

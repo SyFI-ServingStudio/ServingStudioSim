@@ -2034,6 +2034,8 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     verify_width: u32,
     kda_state_dtype: DType,
     hisparse: Option<&HisparseConfig>,
+    ep_comm: &EpCommConfig,
+    mhc_fuse_fixed_us: Option<f64>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -2062,6 +2064,8 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
         kernel_path,
+        ep_comm: ep_comm.clone(),
+        mhc_fuse_fixed_us,
     };
     let mut configs =
         glm53_flash_vllm_fp8_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
@@ -2360,6 +2364,8 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         *draft_tokens + 1,
         kda_state_dtype.dtype(),
         sel.hisparse().as_ref(),
+        &sel.ep_comm(),
+        sel.mhc_fuse_fixed_us(),
         gpu,
         name,
         bridge,
@@ -3138,6 +3144,8 @@ pub fn build_iter_model(
             1,
             DType::Fp32,
             sel.hisparse().as_ref(),
+            &sel.ep_comm(),
+        sel.mhc_fuse_fixed_us(),
             gpu,
             name,
             bridge,
@@ -4429,6 +4437,55 @@ mod tests {
         // Four KDA cache groups on each of eight ranks.
         assert_eq!(stages.iter().filter(|&&s| s == 1).count(), 32);
         assert!(stages.contains(&2));
+    }
+
+    /// Catches the Flash DP + DFlash2 selector dropping its `ep_*` params: the
+    /// verify target's exchange becomes the all-to-all (one prepare and three
+    /// transfers per MoE kind, no gather or scatter), and the default keeps the
+    /// measured all-gather / reduce-scatter.
+    #[test]
+    fn flash_dflash2_target_takes_the_ep_comm_exchange() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let kinds = |ep_comm: serde_json::Value| -> Vec<String> {
+            let mut arch = serde_json::json!({
+                "type": "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+                "model_config": Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("model/config/glm53_flash_nvfp4.json"),
+                "fp8": false,
+                "ep_size": 8,
+                "draft_tokens": 7,
+            });
+            arch.as_object_mut()
+                .unwrap()
+                .extend(ep_comm.as_object().unwrap().clone());
+            let sel: IterArchSel = serde_json::from_value(arch).unwrap();
+            glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(&sel, "NVIDIA B200", "test", &bridge)
+                .unwrap()
+                .cost_log_manifest()
+                .slots
+                .into_iter()
+                .map(|slot| slot.kind)
+                .collect()
+        };
+        let count = |kinds: &[String], kind: &str| kinds.iter().filter(|k| *k == kind).count();
+        let default = kinds(serde_json::json!({}));
+        assert_eq!(count(&default, "moe_ep_quantized_all_gather"), 2);
+        assert_eq!(count(&default, "moe_ep_reduce_scatter"), 2);
+        let measured = kinds(serde_json::json!({"ep_comm": "alltoall"}));
+        assert_eq!(count(&measured, "moe_alltoall_prepare"), 2);
+        assert_eq!(count(&measured, "moe_alltoall"), 6);
+        assert!(measured.iter().all(|kind| !kind.starts_with("moe_ep_")));
+        let analytic = kinds(serde_json::json!({
+            "ep_comm": "alltoall",
+            "ep_comm_model": "analytic",
+            "ep_comm_latency_scale": 1.5,
+        }));
+        assert_eq!(
+            count(&analytic, crate::arch::ep_comm::EP_COMM_ANALYTIC_KIND),
+            8
+        );
+        assert_eq!(analytic.len(), measured.len());
     }
 
     /// Catches the GLM-5.3 DP + DFlash2 composition losing a piece: the target

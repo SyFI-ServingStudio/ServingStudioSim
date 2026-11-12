@@ -400,6 +400,8 @@ impl Deployment for UnifiedDeployment {
                     1,
                     crate::timing::bridge::DType::Fp32,
                     g.arch.hisparse().as_ref(),
+                    &g.arch.ep_comm(),
+                    g.arch.mhc_fuse_fixed_us(),
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

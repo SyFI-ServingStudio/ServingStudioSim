@@ -53,10 +53,25 @@
 //! step adds the exposed host -> device miss copy as one more `Max` over
 //! ranks. The 34 KDA layers' recurrent state and conv window cannot be
 //! offloaded and stay on the GPU unchanged.
+//!
+//! The NVFP4 checkpoint's exchange can instead run as flashinfer's two-sided
+//! MNNVL all-to-all (`ep_comm: alltoall`, vLLM `--all2all-backend
+//! flashinfer_nvlink_two_sided`), or either exchange can be priced by
+//! `arch::ep_comm`'s analytic model (`ep_comm_model: analytic`); the leaves
+//! are `arch::ep_exchange`'s, as on the GLM-5.3 DP graph, with rows sized from
+//! this model's hidden size (4096), top-k (8) and 288 experts. The profiled
+//! EP8 `moe_alltoall` rows (`ep_comm_model: measured`) are keyed by those
+//! widths, so they need the Flash shapes in `profile.db`. The FP8 checkpoint
+//! keeps the measured all-gather / reduce-scatter. The default, measured
+//! all-gather / reduce-scatter, is unchanged.
 
 use anyhow::Result;
 
 use crate::arch::contract::{IterwiseUnifiedModel, KvHostOffload, UnifiedArchInput};
+use crate::arch::ep_comm::{EpCommConfig, EpCommKind};
+use crate::arch::ep_exchange::{
+    AllgatherLeafNames, EpExchange, EpExchangeConfigs, EpExchangeGeometry,
+};
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
     self as tp_arch, atomic, attention_inputs, graph_padded_tokens, push, AttnKind, Boundary,
     FfnKind, Glm53FlashLayerGroup, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmConfigs,
@@ -107,6 +122,13 @@ pub struct Glm53FlashDpAttnEpParallel {
     /// vLLM `--cudagraph-capture-sizes`; empty runs eager (no padding).
     pub cudagraph_capture_sizes: Vec<u32>,
     pub kernel_path: tp_arch::Glm53FlashKernelPath,
+    /// How the expert exchange runs and is priced (`arch::ep_comm`). The
+    /// default is the measured all-gather / reduce-scatter; anything else
+    /// needs the NVFP4 checkpoint.
+    pub ep_comm: EpCommConfig,
+    /// What-if: fixed us taken off each fused mHC post/pre boundary (the
+    /// leaf keeps only its per-row part and is flagged `extrapolated`).
+    pub mhc_fuse_fixed_us: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +144,9 @@ pub struct Glm53FlashDpAttnEpConfigs {
     /// in, top-k IDs and weights out. FP8 routes inside the fused MoE.
     pub router_select: Option<ElementwiseKernelConfig>,
     pub combine: MoeEpReduceScatterKernelConfig,
+    /// The exchange `ep_comm` puts in place of `dispatch` / `combine`; empty
+    /// on the measured all-gather / reduce-scatter.
+    pub exchange: EpExchangeConfigs,
 }
 
 /// The MoE dispatch all-gather for the checkpoint's routed experts.
@@ -145,6 +170,24 @@ pub fn build_configs(
             model.n_routed_experts
         )));
     }
+    if model.quant != Glm53FlashQuant::Nvfp4 && !parallel.ep_comm.is_default_measured() {
+        return Err(fit_failed(
+            "ep_comm other than the measured all-gather / reduce-scatter needs the NVFP4 \
+             checkpoint (its NVFP4 activations and block scales are the exchanged rows)",
+        ));
+    }
+    let exchange = EpExchangeConfigs::new(
+        &parallel.ep_comm,
+        dp,
+        &parallel.gpu_name,
+        EpExchangeGeometry {
+            hidden: model.hidden,
+            top_k: model.num_experts_per_tok,
+            num_experts: model.n_routed_experts,
+        },
+        demand,
+    )
+    .map_err(fit_failed)?;
     let local = tp_arch::build_configs(
         model,
         &Glm53FlashVllmParallel {
@@ -218,6 +261,7 @@ pub fn build_configs(
         routed,
         local,
         parallel: parallel.clone(),
+        exchange,
     })
 }
 
@@ -252,11 +296,21 @@ struct MoeBlock {
     shared_expert: Glm53MlpLocalWorklet,
     router_select: Option<Op<ElementwiseKernel>>,
     dispatch_quant: Glm53ActivationQuant,
-    dispatch: Dispatch,
+    exchange: Exchange,
     /// One per EP rank, ranked by routed workload.
     fused_moe: Vec<Op<Nvfp4FusedMoeKernel>>,
-    combine: Op<MoeEpReduceScatterKernel>,
     combine_glue: Op<ElementwiseKernel>,
+}
+
+/// How the routed tokens reach the experts and come back.
+enum Exchange {
+    /// The profiled all-gatherv and bf16 reduce-scatterv.
+    MeasuredAllgather {
+        dispatch: Dispatch,
+        combine: Op<MoeEpReduceScatterKernel>,
+    },
+    /// What `ep_comm` selects instead (`arch::ep_exchange`).
+    Configured(EpExchange),
 }
 
 enum Ffn {
@@ -292,6 +346,24 @@ struct LayerGroup {
     attn: Attention,
     ffn_boundary: Op<MhcFusedPostPreRmsNormKernel>,
     ffn: Ffn,
+    mhc_fuse_fixed_us: Option<f64>,
+}
+
+/// A fused mHC post/pre boundary, less `fixed_us` when the what-if is on.
+fn push_mhc_fused(
+    op: &Op<MhcFusedPostPreRmsNormKernel>,
+    num_tokens: u32,
+    fixed_us: Option<f64>,
+    ev: &mut Evaluator,
+) {
+    let input = MhcRmsNormKernelInput { num_tokens };
+    let mut metrics = op.kernel.eval(&input);
+    if let Some(fixed) = fixed_us {
+        let measured = f64::from(metrics.m.time_ms);
+        metrics.m.time_ms = (measured - fixed / 1e3).max(0.0) as f32;
+        metrics.coverage = metrics.coverage | crate::timing::CoverageFlags::EXTRAPOLATED;
+    }
+    ev.push(metrics, || input.clone().into());
 }
 
 impl LayerGroup {
@@ -348,18 +420,15 @@ impl LayerGroup {
 
     fn eval(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
         for rank in &batch.ranks {
-            self.attn_boundary.eval(rank.rows, ev);
+            match &self.attn_boundary {
+                Boundary::Fused(op) => push_mhc_fused(op, rank.rows, self.mhc_fuse_fixed_us, ev),
+                boundary => boundary.eval(rank.rows, ev),
+            }
             match &self.attn {
                 Attention::Kda(worklet) => worklet.eval(&rank.kda, ev),
                 Attention::Dsa(worklet) => worklet.eval(&rank.dsa, ev),
             }
-            push(
-                &self.ffn_boundary,
-                MhcRmsNormKernelInput {
-                    num_tokens: rank.rows,
-                },
-                ev,
-            );
+            push_mhc_fused(&self.ffn_boundary, rank.rows, self.mhc_fuse_fixed_us, ev);
             match &self.ffn {
                 Ffn::Dense(worklet) => worklet.eval(
                     &Glm53MlpLocalWorkletInput {
@@ -380,8 +449,11 @@ impl MoeBlock {
     /// The dispatch / routed experts / combine chain, which the aux-stream
     /// shared expert (T_r <= 256) overlaps, then the per-rank shared + routed add.
     fn compile_expert_sections(&self, dp: usize, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
-        let dispatch = self.dispatch.compile(builder);
-        let experts = CostNode::Labeled {
+        let mut chain = match &self.exchange {
+            Exchange::MeasuredAllgather { dispatch, .. } => vec![dispatch.compile(builder)],
+            Exchange::Configured(exchange) => exchange.compile_dispatch(dp, builder),
+        };
+        chain.push(CostNode::Labeled {
             label: format!("{}.ep_ranks (max over EP ranks)", self.name),
             child: Box::new(CostNode::Max {
                 overlap: 1.0,
@@ -391,8 +463,24 @@ impl MoeBlock {
                     .map(|op| op.compile(builder))
                     .collect(),
             }),
+        });
+        let path = match &self.exchange {
+            Exchange::MeasuredAllgather { combine, .. } => {
+                chain.push(combine.compile(builder));
+                format!(
+                    "all_gatherv -> EP{} routed experts -> reduce_scatterv",
+                    self.fused_moe.len()
+                )
+            }
+            Exchange::Configured(exchange) => {
+                chain.extend(exchange.compile_combine(dp, builder));
+                format!(
+                    "{} around EP{} routed experts",
+                    exchange.label(),
+                    self.fused_moe.len()
+                )
+            }
         };
-        let combine = self.combine.compile(builder);
         let concurrent_shared = CostNode::Max {
             overlap: 1.0,
             children: (0..dp)
@@ -408,18 +496,12 @@ impl MoeBlock {
         vec![
             CostNode::Labeled {
                 label: format!(
-                    "{} (MoE) [all_gatherv -> EP{} routed experts -> reduce_scatterv; \
-                     aux-stream shared expert at T_r<={} overlaps]",
-                    self.name,
-                    self.fused_moe.len(),
-                    SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+                    "{} (MoE) [{path}; aux-stream shared expert at T_r<={} overlaps]",
+                    self.name, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
                 ),
                 child: Box::new(CostNode::Parallel {
                     overlap: SHARED_EXPERTS_STREAM_OVERLAP,
-                    children: vec![
-                        CostNode::Sum(vec![dispatch, experts, combine]),
-                        concurrent_shared,
-                    ],
+                    children: vec![CostNode::Sum(chain), concurrent_shared],
                 }),
             },
             CostNode::Labeled {
@@ -451,10 +533,23 @@ impl MoeBlock {
     }
 
     fn eval_expert_sections(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
-        let collective = MoeEpCollectiveKernelInput {
-            per_rank_tokens: batch.ranks.iter().map(|rank| rank.rows).collect(),
+        let tokens: Vec<u32> = batch.ranks.iter().map(|rank| rank.rows).collect();
+        let step = match &self.exchange {
+            Exchange::MeasuredAllgather { dispatch, .. } => {
+                dispatch.eval(
+                    MoeEpCollectiveKernelInput {
+                        per_rank_tokens: tokens.clone(),
+                    },
+                    ev,
+                );
+                None
+            }
+            Exchange::Configured(exchange) => {
+                let step = exchange.step(&tokens);
+                exchange.eval_dispatch(&step, &tokens, ev);
+                Some(step)
+            }
         };
-        self.dispatch.eval(collective.clone(), ev);
         for op in &self.fused_moe {
             push(
                 op,
@@ -464,7 +559,19 @@ impl MoeBlock {
                 ev,
             );
         }
-        push(&self.combine, collective, ev);
+        match (&self.exchange, step) {
+            (Exchange::MeasuredAllgather { combine, .. }, _) => push(
+                combine,
+                MoeEpCollectiveKernelInput {
+                    per_rank_tokens: tokens.clone(),
+                },
+                ev,
+            ),
+            (Exchange::Configured(exchange), Some(step)) => {
+                exchange.eval_combine(&step, &tokens, ev)
+            }
+            (Exchange::Configured(_), None) => unreachable!("the dispatch computed the step"),
+        }
         for rank in &batch.ranks {
             self.shared_expert.eval_or_zero(
                 &Glm53MlpLocalWorkletInput {
@@ -493,6 +600,7 @@ pub struct Glm53FlashDpAttnEpModel {
     /// Query rows each decode request presents (see `Glm53FlashVllmModel`).
     pub verify_width: u32,
     cudagraph_capture_sizes: Vec<u32>,
+    ep_comm_kind: EpCommKind,
     embedding: Op<ElementwiseKernel>,
     hc_expand: Op<ElementwiseKernel>,
     groups: Vec<LayerGroup>,
@@ -589,6 +697,7 @@ pub fn build(
             bridge,
         )?,
         dp_size: cfg.parallel.dp_size,
+        ep_comm_kind: cfg.parallel.ep_comm.kind,
         max_model_len: cfg.parallel.max_model_len,
         verify_width: tp_arch::verify_width(&cfg.local)?,
         cudagraph_capture_sizes: {
@@ -690,22 +799,7 @@ fn build_group(
                     resolved.routed[0].input_quant.clone(),
                     bridge,
                 )?,
-                dispatch: match cfg.dispatch.clone() {
-                    Glm53FlashDispatchConfig::Fp8(dispatch) => Dispatch::Fp8(atomic(
-                        m,
-                        "dispatch_all_gather",
-                        dispatch,
-                        MoeEpAllGatherKernel::build,
-                        bridge,
-                    )?),
-                    Glm53FlashDispatchConfig::Nvfp4(dispatch) => Dispatch::Nvfp4(atomic(
-                        m,
-                        "dispatch_all_gather",
-                        dispatch,
-                        MoeEpQuantizedAllGatherKernel::build,
-                        bridge,
-                    )?),
-                },
+                exchange: build_exchange(m, cfg, bridge)?,
                 fused_moe: resolved
                     .routed
                     .iter()
@@ -720,13 +814,6 @@ fn build_group(
                         )
                     })
                     .collect::<std::result::Result<_, _>>()?,
-                combine: atomic(
-                    m,
-                    "combine_reduce_scatter",
-                    cfg.combine.clone(),
-                    MoeEpReduceScatterKernel::build,
-                    bridge,
-                )?,
                 combine_glue: atomic(
                     m,
                     "combine_glue",
@@ -751,6 +838,52 @@ fn build_group(
             bridge,
         )?,
         ffn,
+        mhc_fuse_fixed_us: cfg.parallel.mhc_fuse_fixed_us,
+    })
+}
+
+/// The configured exchange, else the measured all-gatherv / reduce-scatterv.
+fn build_exchange(
+    m: &str,
+    cfg: &Glm53FlashDpAttnEpConfigs,
+    bridge: &PerfApiBridge,
+) -> std::result::Result<Exchange, BuildError> {
+    let configured = EpExchange::build(
+        m,
+        AllgatherLeafNames {
+            dispatch: "dispatch_all_gather",
+            combine: "combine_reduce_scatter",
+        },
+        &cfg.exchange,
+        bridge,
+    )?;
+    if let Some(exchange) = configured {
+        return Ok(Exchange::Configured(exchange));
+    }
+    Ok(Exchange::MeasuredAllgather {
+        dispatch: match cfg.dispatch.clone() {
+            Glm53FlashDispatchConfig::Fp8(dispatch) => Dispatch::Fp8(atomic(
+                m,
+                "dispatch_all_gather",
+                dispatch,
+                MoeEpAllGatherKernel::build,
+                bridge,
+            )?),
+            Glm53FlashDispatchConfig::Nvfp4(dispatch) => Dispatch::Nvfp4(atomic(
+                m,
+                "dispatch_all_gather",
+                dispatch,
+                MoeEpQuantizedAllGatherKernel::build,
+                bridge,
+            )?),
+        },
+        combine: atomic(
+            m,
+            "combine_reduce_scatter",
+            cfg.combine.clone(),
+            MoeEpReduceScatterKernel::build,
+            bridge,
+        )?,
     })
 }
 
@@ -854,9 +987,19 @@ impl Glm53FlashDpAttnEpModel {
         }
         CostNode::Labeled {
             label: format!(
-                "{} (Glm53FlashDpAttnEpModel) [attention DP{}/TP1; MoE EP{} \
-                 all_gatherv/reduce_scatterv; timing_context<={}]",
-                self.name, self.dp_size, self.dp_size, self.max_model_len
+                "{} (Glm53FlashDpAttnEpModel) [attention DP{}/TP1; MoE EP{} {}; \
+                 timing_context<={}]",
+                self.name,
+                self.dp_size,
+                self.dp_size,
+                match self.ep_comm_kind {
+                    EpCommKind::AllgatherReducescatter => "all_gatherv/reduce_scatterv",
+                    EpCommKind::Alltoall => "MNNVL all-to-all",
+                    EpCommKind::FastAllgather => "fast direct-write all-gather + combine",
+                    EpCommKind::FusedAllgather => "fused direct-write all-gather + combine",
+                    EpCommKind::FastSparse => "fast sparse direct writes",
+                },
+                self.max_model_len
             ),
             child: Box::new(CostNode::Sum(children)),
         }
@@ -1168,6 +1311,8 @@ mod tests {
 
     use super::*;
     use crate::arch::contract::ArchGroupInput;
+    use crate::arch::ep_comm::EpCommModel;
+    use crate::timing::kernels::MoeAlltoallDirection;
     use crate::timing::routing::RoutingDistribution;
 
     fn model_cfg() -> Glm53FlashModelCfg {
@@ -1186,6 +1331,8 @@ mod tests {
             gpu_name: "NVIDIA B200".into(),
             cudagraph_capture_sizes: Vec::new(),
             kernel_path: Default::default(),
+            ep_comm: EpCommConfig::default(),
+            mhc_fuse_fixed_us: None,
         }
     }
 
@@ -1582,6 +1729,336 @@ mod tests {
             prefill(0, 8),
         ]);
         assert!(normalize_input(&long, 4, 131072, 1, &[]).is_err());
+    }
+
+    fn exchange(dp_size: u16, kind: EpCommKind, model: EpCommModel) -> Glm53FlashDpAttnEpParallel {
+        Glm53FlashDpAttnEpParallel {
+            ep_comm: EpCommConfig {
+                kind,
+                model,
+                ..EpCommConfig::default()
+            },
+            ..parallel(dp_size)
+        }
+    }
+
+    fn built_with(
+        model: &Glm53FlashModelCfg,
+        p: &Glm53FlashDpAttnEpParallel,
+    ) -> Glm53FlashDpAttnEpModel {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        let configs = build_configs(model, p, &demand).unwrap();
+        build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
+    }
+
+    /// `(leaf, kind)` of every slot, the leaf being the name's last segment.
+    fn leaves(model: &Glm53FlashDpAttnEpModel) -> Vec<(String, String)> {
+        model
+            .cost_log_manifest()
+            .slots
+            .into_iter()
+            .map(|slot| (slot.name.rsplit('.').next().unwrap().to_string(), slot.kind))
+            .collect()
+    }
+
+    fn named<'a>(leaves: &'a [(String, String)], kind: &str) -> Vec<&'a str> {
+        leaves
+            .iter()
+            .filter(|(_, k)| k == kind)
+            .map(|(leaf, _)| leaf.as_str())
+            .collect()
+    }
+
+    /// Catches a default `ep_comm` changing the cost tree: the measured
+    /// all-gatherv / reduce-scatterv stay, once per MoE kind, and nothing of
+    /// the all-to-all appears.
+    #[test]
+    fn the_default_exchange_is_the_measured_gather_and_scatter() {
+        let model = config("glm53_flash_nvfp4");
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        let configs = build_configs(&model, &parallel(8), &demand).unwrap();
+        assert!(configs.exchange.is_measured_allgather());
+        let explicit = built_with(
+            &model,
+            &exchange(8, EpCommKind::AllgatherReducescatter, EpCommModel::Measured),
+        );
+        let default = built_for(&model, 8);
+        assert_eq!(default.n_slots, explicit.n_slots);
+        assert_eq!(
+            serde_json::to_value(default.cost_log_manifest()).unwrap(),
+            serde_json::to_value(explicit.cost_log_manifest()).unwrap()
+        );
+        let slots = leaves(&default);
+        assert_eq!(
+            named(&slots, "moe_ep_quantized_all_gather"),
+            ["dispatch_all_gather"; 2]
+        );
+        assert_eq!(
+            named(&slots, "moe_ep_reduce_scatter"),
+            ["combine_reduce_scatter"; 2]
+        );
+        assert!(slots.iter().all(|(leaf, kind)| {
+            !kind.starts_with("moe_alltoall")
+                && kind != crate::arch::ep_comm::EP_COMM_ANALYTIC_KIND
+                && !leaf.contains("alltoall")
+        }));
+    }
+
+    /// Catches the all-to-all sized from GLM-5.3's widths instead of Flash's:
+    /// 4096 hidden gives 2,048-byte NVFP4 rows, 256-byte block scales and
+    /// 8,192-byte bf16 combine rows; 288 experts are 288 MNNVL slots.
+    #[test]
+    fn the_alltoall_is_sized_from_the_flash_geometry() {
+        let model = config("glm53_flash_nvfp4");
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        let configs = build_configs(
+            &model,
+            &exchange(8, EpCommKind::Alltoall, EpCommModel::Measured),
+            &demand,
+        )
+        .unwrap();
+        let kernels = configs.exchange.measured_alltoall.as_ref().unwrap();
+        for (kernel, bytes, direction) in [
+            (&kernels.dispatch, 2_048, MoeAlltoallDirection::Dispatch),
+            (
+                &kernels.dispatch_scales,
+                256,
+                MoeAlltoallDirection::Dispatch,
+            ),
+            (&kernels.combine, 8_192, MoeAlltoallDirection::Combine),
+        ] {
+            assert_eq!(kernel.hidden_bytes.get(), bytes);
+            assert_eq!(kernel.direction, direction);
+            assert_eq!(
+                (kernel.ep_size, kernel.top_k, kernel.slot_count),
+                (8, 8, 288)
+            );
+            assert_eq!(kernel.backends, ["flashinfer_mnnvl"]);
+        }
+        assert_eq!(
+            (
+                kernels.prepare.ep_size,
+                kernels.prepare.top_k,
+                kernels.prepare.slot_count
+            ),
+            (8, 8, 288)
+        );
+        let elementwise = configs.exchange.alltoall.as_ref().unwrap();
+        for (config, input, output) in [
+            (&elementwise.scale_swizzle, 256, 256),
+            (&elementwise.combine_fill, 0, 8 * 8_192),
+            (&elementwise.combine_reduce, 8 * 8_192, 8_192),
+        ] {
+            assert_eq!(
+                (
+                    config.input_bytes_per_token.get(),
+                    config.output_bytes_per_token.get()
+                ),
+                (input, output)
+            );
+        }
+        // The analytic legs price the same widths: one exchange of 16 tokens
+        // per rank moves (rows x width) bytes on the busiest rank.
+        let comm = configs.exchange.analytic.as_ref().unwrap();
+        assert_eq!((comm.hidden, comm.top_k), (4096, 8));
+        let step = comm.step(&[16; 8]);
+        let rows = step.dispatch.max_send_rows.max(step.dispatch.max_recv_rows);
+        assert_eq!(step.dispatch.bytes, rows * 2_048.0);
+        assert_eq!(step.dispatch_scales.bytes, rows * 256.0);
+        assert_eq!(step.combine.bytes, rows * 8_192.0);
+        // 288 experts, 36 per rank: 1 - C(252, 8) / C(288, 8) of tokens reach a rank.
+        let mut miss = 1.0;
+        for i in 0..8 {
+            miss *= f64::from(252 - i) / f64::from(288 - i);
+        }
+        assert!((comm.uniform_hit - (1.0 - miss)).abs() < 1e-12);
+        // The analytic all-gather row: NVFP4 activations, scales, ids, weights.
+        assert_eq!(comm.gather_row_bytes(), f64::from(2_048 + 256 + 8 * 8));
+    }
+
+    /// Catches the all-to-all leaving the gather / scatter in place or
+    /// dropping a leaf: per MoE kind it adds the prepare, a second dispatch
+    /// call and three elementwise leaves per rank, under the GLM-5.3 DP
+    /// graph's leaf names, measured or analytic. The analytic all-gather keeps
+    /// the measured slot names and count.
+    #[test]
+    fn the_alltoall_replaces_the_gather_and_scatter_leaves() {
+        let model = config("glm53_flash_nvfp4");
+        let base = built_for(&model, 8).n_slots;
+        let measured = built_with(
+            &model,
+            &exchange(8, EpCommKind::Alltoall, EpCommModel::Measured),
+        );
+        assert_eq!(measured.n_slots, base + 2 * (2 + 3 * 8));
+        let slots = leaves(&measured);
+        assert_eq!(
+            named(&slots, "moe_alltoall_prepare"),
+            ["dispatch_alltoall_prepare"; 2]
+        );
+        assert_eq!(
+            named(&slots, "moe_alltoall"),
+            [
+                "dispatch_alltoall",
+                "dispatch_alltoall_scales",
+                "combine_alltoall"
+            ]
+            .repeat(2)
+        );
+        assert!(slots.iter().all(|(_, kind)| !kind.starts_with("moe_ep_")));
+        for leaf in [
+            "dispatch_scale_swizzle",
+            "combine_output_fill",
+            "combine_reduce",
+        ] {
+            assert_eq!(
+                slots
+                    .iter()
+                    .filter(|(l, kind)| l == leaf && kind == "elementwise")
+                    .count(),
+                2 * 8,
+                "{leaf}"
+            );
+        }
+        let mut order = Vec::new();
+        leaf_order(&measured.cost_tree().root, &mut order);
+        assert_eq!(order, (0..order.len()).collect::<Vec<_>>());
+
+        let analytic = built_with(
+            &model,
+            &exchange(8, EpCommKind::Alltoall, EpCommModel::Analytic),
+        );
+        assert_eq!(analytic.n_slots, measured.n_slots);
+        assert_eq!(
+            named(
+                &leaves(&analytic),
+                crate::arch::ep_comm::EP_COMM_ANALYTIC_KIND
+            ),
+            [
+                "dispatch_alltoall_prepare",
+                "dispatch_alltoall",
+                "dispatch_alltoall_scales",
+                "combine_alltoall"
+            ]
+            .repeat(2)
+        );
+
+        let gather = built_with(
+            &model,
+            &exchange(8, EpCommKind::AllgatherReducescatter, EpCommModel::Analytic),
+        );
+        assert_eq!(gather.n_slots, base);
+        assert_eq!(
+            named(
+                &leaves(&gather),
+                crate::arch::ep_comm::EP_COMM_ANALYTIC_KIND
+            ),
+            ["dispatch_all_gather", "combine_reduce_scatter"].repeat(2)
+        );
+    }
+
+    /// Catches a fast exchange keeping the gather / scatter kernels or the
+    /// all-to-all's prepare: one dispatch and one combine leaf per MoE kind,
+    /// analytic, or the combine from the measured nvshmem all-reduce.
+    #[test]
+    fn the_fast_exchanges_replace_the_collectives_with_two_leaves() {
+        use crate::arch::ep_comm::{EpFastConfig, FastBackend, FastCombine};
+        let model = config("glm53_flash_nvfp4");
+        let base = built_for(&model, 8).n_slots;
+        let fast_parallel = |kind, comm_model, fast| Glm53FlashDpAttnEpParallel {
+            ep_comm: EpCommConfig {
+                kind,
+                model: comm_model,
+                fast,
+                ..EpCommConfig::default()
+            },
+            ..parallel(8)
+        };
+        for (kind, dispatch, combine) in [
+            (
+                EpCommKind::FastAllgather,
+                "dispatch_fast_all_gather",
+                "combine_fast_reduce_scatter",
+            ),
+            (
+                EpCommKind::FusedAllgather,
+                "dispatch_fused_all_gather",
+                "combine_fused_reduce",
+            ),
+            (
+                EpCommKind::FastSparse,
+                "dispatch_sparse_write",
+                "combine_sparse_write",
+            ),
+        ] {
+            let built = built_with(
+                &model,
+                &fast_parallel(kind, EpCommModel::Analytic, EpFastConfig::default()),
+            );
+            // The reduce-scatter combines add the receiver's sum on each of
+            // the 8 ranks, per MoE kind; the fused combine folds it away.
+            let sums = if kind == EpCommKind::FusedAllgather { 0 } else { 2 * 8 };
+            assert_eq!(built.n_slots, base + sums, "{kind:?}");
+            let slots = leaves(&built);
+            assert_eq!(
+                slots.iter().filter(|(l, k)| l == "combine_sum" && k == "elementwise").count(),
+                sums
+            );
+            assert_eq!(
+                named(&slots, crate::arch::ep_comm::EP_COMM_ANALYTIC_KIND),
+                [dispatch, combine].repeat(2)
+            );
+            assert!(slots.iter().all(|(_, k)| !k.starts_with("moe_ep_")
+                && !k.starts_with("moe_alltoall")));
+        }
+        let measured = built_with(
+            &model,
+            &fast_parallel(
+                EpCommKind::FastAllgather,
+                EpCommModel::Measured,
+                EpFastConfig {
+                    backend: FastBackend::Nvshmem,
+                    combine: FastCombine::AllReduce,
+                    ..EpFastConfig::default()
+                },
+            ),
+        );
+        let slots = leaves(&measured);
+        assert_eq!(named(&slots, "all_reduce"), ["combine_fast_all_reduce"; 2]);
+        assert_eq!(
+            named(&slots, crate::arch::ep_comm::EP_COMM_ANALYTIC_KIND),
+            ["dispatch_fast_all_gather"; 2]
+        );
+    }
+
+    /// Catches an exchange the rows cannot price: the measured all-to-all is
+    /// EP8 only, and FP8 dispatches FP8 activations no `ep_comm` exchange
+    /// models.
+    #[test]
+    fn the_exchange_rejects_what_it_cannot_price() {
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        let nvfp4 = config("glm53_flash_nvfp4");
+        let error = build_configs(
+            &nvfp4,
+            &exchange(4, EpCommKind::Alltoall, EpCommModel::Measured),
+            &demand,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("ep_size 4"), "{error}");
+        assert!(build_configs(
+            &nvfp4,
+            &exchange(4, EpCommKind::Alltoall, EpCommModel::Analytic),
+            &demand,
+        )
+        .is_ok());
+        for (kind, comm_model) in [
+            (EpCommKind::Alltoall, EpCommModel::Measured),
+            (EpCommKind::AllgatherReducescatter, EpCommModel::Analytic),
+        ] {
+            assert!(build_configs(&model_cfg(), &exchange(8, kind, comm_model), &demand).is_err());
+        }
     }
 
     #[test]
