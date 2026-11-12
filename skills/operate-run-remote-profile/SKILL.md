@@ -82,10 +82,12 @@ P=presets/alignment/<pack>; R=logs/<date>_<topic>; H=presets/alignment/hosts/<ho
 python -m launcher alignment-campaign render --pack $P --host $H --out-root $R --case C
 python -m launcher alignment-campaign run --pack $P --out-root $R --phase profile_nsys --case C --remote HOST
 python -m launcher alignment-campaign run --pack $P --out-root $R --phase profile_workload --case C --remote HOST
-python -m launcher alignment-campaign label --pack $P --out-root $R --case C
 python -m launcher $R/<case>/simulation.yaml --export-missing $R/work.json
 python -m launcher kernel-profile fill --work $R/work.json --output-dir $R/fill --remote HOST
-for p in timing_predict analysis_kernel simulation analysis_e2e; do
+python -m launcher $R/<case>/simulation.yaml --export-missing $R/work.json   # must report 0 spec(s)
+python -m launcher alignment-campaign run --pack $P --out-root $R --phase timing_predict --case C
+python -m launcher alignment-campaign label --pack $P --out-root $R --case C
+for p in analysis_kernel simulation analysis_e2e; do
   python -m launcher alignment-campaign run --pack $P --out-root $R --phase $p --case C; done
 python -m launcher alignment-campaign extract --pack $P --runs $R --out $R/metrics.json
 python -m launcher alignment-campaign compare --pack $P --measured $R/metrics.json --markdown
@@ -98,7 +100,10 @@ python -m launcher alignment-campaign compare --pack $P --measured $R/metrics.js
   Budget the first job's time limit for both.
 - Keep each remote job inside the Slurm time limit: pass one `--case` per capture call.
 - Run each command in a named tmux session, and record the session and log in `progress.md`.
-- `--export-missing` reports `0 spec(s)` when profile.db already covers the case. Skip the fill then.
+- Fill before `timing_predict`, and rerun `--export-missing` until it reports
+  `0 spec(s)`. `timing_predict` builds the same kernel cache as the simulation, and
+  it measures any missing row on this machine's GPU, outside the scheduler and on the
+  wrong GPU model. `label` reads the cost manifest that `timing_predict` writes.
 
 ## 5. Check what came back
 
