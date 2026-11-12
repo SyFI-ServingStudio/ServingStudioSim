@@ -53,6 +53,7 @@ from launcher.alignment_campaign.render import (
     _extra_args,
     case_documents,
     case_traces,
+    materialize,
     phase_names,
     render_case,
 )
@@ -60,6 +61,7 @@ from launcher.golden import GOLDEN_ROOT
 from launcher.process import ProcessResult, ProcessSpec
 from launcher.process.journal import RunJournal, StageState
 from launcher.process.markers import has_marker, mark_complete
+from tests.test_alignment_campaign_phases import _write_workload_pass
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACK_ROOT = REPO_ROOT / "presets" / "alignment"
@@ -82,6 +84,30 @@ PACK_IDS = [path.name for path in PACK_DIRS]
 @pytest.fixture(scope="module", params=PACK_DIRS, ids=PACK_IDS)
 def pack(request):
     return load_pack(request.param)
+
+
+@pytest.fixture(scope="module", params=PACK_DIRS, ids=PACK_IDS)
+def resolved_pack(request, tmp_path_factory):
+    """The pack with every `from_capture` input read from a workload pass.
+
+    Such a case has no `simulation.yaml` until its workload pass has run, so the
+    rendering tests take each one through `render.materialize` over the
+    synthetic workload pass of the phases tests. A pack without those inputs is
+    returned as loaded.
+    """
+    loaded = load_pack(request.param)
+    if not any(case.capture_fields for case in loaded.cases):
+        return loaded
+    out_root = tmp_path_factory.mktemp("captured")
+    host = check_module.host_for(loaded, None)
+    cases = []
+    for case in loaded.cases:
+        if case.capture_fields:
+            directory = render_case(loaded, case, host, out_root, REPO_ROOT).directory
+            _write_workload_pass(directory)
+            case = materialize(loaded, case, directory, REPO_ROOT)
+        cases.append(case)
+    return dataclasses.replace(loaded, cases=tuple(cases))
 
 
 # ── the pack itself ──────────────────────────────────────────────────────────
@@ -251,7 +277,8 @@ def _schemas(pack):
 
 # ── rendering ────────────────────────────────────────────────────────────────
 
-def test_render_writes_every_phase_config(pack, tmp_path):
+def test_render_writes_every_phase_config(resolved_pack, tmp_path):
+    pack = resolved_pack
     host = check_module.host_for(pack, None)
     case = pack.cases[0]
     rendered = render_case(pack, case, host, tmp_path, REPO_ROOT)
@@ -295,13 +322,14 @@ def test_a_corpus_pass_renders_on_the_protocol_that_returns_routes(pack, tmp_pat
     assert backend(timed.name) == "vllm_tokens"
 
 
-def test_render_resolves_a_corpus_path_the_way_it_resolves_a_marginal(pack, tmp_path):
+def test_render_resolves_a_corpus_path_the_way_it_resolves_a_marginal(resolved_pack, tmp_path):
     """A pack-relative corpus reaches the simulator as a path it can resolve.
 
     `TokenCorpusConfig::from_manifest` resolves against the process, not the
     pack, so leaving the authored string alone fails the build after the capture
     it depends on has already run.
     """
+    pack = resolved_pack
     import dataclasses
 
     case = pack.cases[0]
@@ -323,8 +351,9 @@ def test_render_resolves_a_corpus_path_the_way_it_resolves_a_marginal(pack, tmp_
     assert (REPO_ROOT / rendered) == (pack.root / "token_corpus/manifest.json").resolve()
 
 
-def test_render_leaves_a_hub_reference_for_the_launcher_to_fetch(pack, tmp_path):
+def test_render_leaves_a_hub_reference_for_the_launcher_to_fetch(resolved_pack, tmp_path):
     """`hf://` is resolved during launcher expansion; it is not a pack path."""
+    pack = resolved_pack
     import dataclasses
 
     reference = "hf://datasets/uw/workload@0123456789abcdef0123456789abcdef01234567/glm53/manifest.json"
@@ -357,9 +386,10 @@ def test_render_never_leaks_a_stub_host_into_the_pack(pack, tmp_path):
     assert not offenders, f"stub host path in campaign.yaml: {offenders[:2]}"
 
 
-def test_render_rejects_a_variant_that_sets_a_per_case_field(pack, tmp_path):
+def test_render_rejects_a_variant_that_sets_a_per_case_field(resolved_pack, tmp_path):
     """`max_model_len` and `attn_gpu_memory_gb` are the case's to set. A variant
     that also sets them would produce two sources for one number."""
+    pack = resolved_pack
     import dataclasses
 
     case = pack.cases[0]
@@ -382,14 +412,20 @@ def _simulated_worker(pack, case, tmp_path):
     return documents[f"{PHASE_CONFIG_STEMS['simulation']}.yaml"]["pools"]["main"]["groups"][0]["worker"]
 
 
-def test_render_defaults_the_multiplier_to_neutral_without_a_pack_declaration(pack, tmp_path):
+def test_render_defaults_the_multiplier_to_neutral_without_a_pack_declaration(
+    resolved_pack, tmp_path
+):
+    pack = resolved_pack
     bare = dataclasses.replace(pack, gpu_time_multiplier=None)
     assert _simulated_worker(bare, bare.cases[0], tmp_path)["gpu_time_multiplier"] == 1.0
 
 
-def test_render_applies_the_pack_multiplier_to_every_case(pack, tmp_path):
+def test_render_applies_the_pack_multiplier_to_every_case(
+    resolved_pack, tmp_path
+):
     """One calibrated multiplier, measured outside the matrix, reaches every
     case's simulated worker unchanged."""
+    pack = resolved_pack
     declared = pack_module.Calibrated(
         value=1.0625, status="measured", derived_from="reference kernel-align",
         evidence="logs/reference/analysis_kernel",
@@ -400,7 +436,8 @@ def test_render_applies_the_pack_multiplier_to_every_case(pack, tmp_path):
         assert worker["gpu_time_multiplier"] == 1.0625
 
 
-def test_a_variant_cannot_set_the_multiplier_the_pack_owns(pack, tmp_path):
+def test_a_variant_cannot_set_the_multiplier_the_pack_owns(resolved_pack, tmp_path):
+    pack = resolved_pack
     case = pack.cases[0]
     variant = pack.variant_of(case)
     poisoned = dataclasses.replace(variant, worker={**variant.worker, "gpu_time_multiplier": 1.2})
@@ -485,7 +522,10 @@ def test_unknown_engine_has_no_implicit_context_limit_spelling(pack):
         _extra_args(variant, case)
 
 
-def test_cross_phase_check_uses_the_same_sglang_context_limit_flag(pack, tmp_path):
+def test_cross_phase_check_uses_the_same_sglang_context_limit_flag(
+    resolved_pack, tmp_path
+):
+    pack = resolved_pack
     case = pack.cases[0]
     original = pack.variant_of(case)
     python_runtime = {
@@ -532,7 +572,8 @@ def test_profile_pass_warmup_reaches_frontend_config(pack, tmp_path):
         assert documents[f"{item.name}.yaml"]["workload"]["warmup"] is True
 
 
-def test_speculative_case_keeps_replay_trace_and_calibrates_simulation(pack, tmp_path):
+def test_speculative_case_keeps_replay_trace_and_calibrates_simulation(resolved_pack, tmp_path):
+    pack = resolved_pack
     original_case = pack.cases[0]
     original_variant = pack.variant_of(original_case)
     rates = [0.8, 0.5, 0.25, 0.5, 0.0]
@@ -591,7 +632,10 @@ def test_speculative_case_keeps_replay_trace_and_calibrates_simulation(pack, tmp
         )
 
 
-def test_acceptance_by_output_position_gives_each_request_its_own_chain(pack, tmp_path):
+def test_acceptance_by_output_position_gives_each_request_its_own_chain(
+    resolved_pack, tmp_path
+):
+    pack = resolved_pack
     original_case = pack.cases[0]
     original_variant = pack.variant_of(original_case)
     calibrated = original_case.attn_gpu_memory_gb
@@ -804,7 +848,8 @@ def test_simulation_command_only_uses_preset(pack, tmp_path):
     assert command[-2:] == ("sim", str(tmp_path / case.slug / "simulation.yaml"))
 
 
-def test_simulation_is_ready_without_kernel_analysis(pack, tmp_path):
+def test_simulation_is_ready_without_kernel_analysis(resolved_pack, tmp_path):
+    pack = resolved_pack
     case = pack.cases[0]
     render_case(pack, case, check_module.host_for(pack, None), tmp_path, REPO_ROOT)
     (original,) = execute.plan_phase(pack, tmp_path, SIMULATION_PHASE, cases=[case])
@@ -1391,7 +1436,8 @@ def test_compare_without_a_pack_judges_nothing_and_records_nothing():
 # ── needs_binary: the arch registry ──────────────────────────────────────────
 
 @pytest.mark.needs_binary
-def test_rendered_simulation_preset_passes_the_real_schema(pack, tmp_path):
+def test_rendered_simulation_preset_passes_the_real_schema(resolved_pack, tmp_path):
+    pack = resolved_pack
     from launcher.schema import normalize_params, validate_params
     from launcher.schema.loader import SchemaNotFound, _load_preset, load_schema
 
