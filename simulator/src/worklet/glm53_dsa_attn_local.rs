@@ -223,7 +223,7 @@ pub struct Glm53DsaAttnLocalWorklet {
     /// [`COOPERATIVE_MAX_ROWS`] rows; its time lands in the `topk_decode`
     /// slot. None without cooperative backends, on a GPU the fork's dispatch
     /// skips (below SM90, or the SM12x family), or when `topk_decode` is
-    /// overridden away from the auto chain's persistent kernel.
+    /// overridden to a backend outside [`LONG_ROW_BACKENDS`].
     topk_decode_cooperative: Option<Arc<DsaPersistentTopkDecodeKernel>>,
     /// Rows `topk_decode` runs at once (the GPU's SM count, one CTA per row),
     /// or `None` when the GPU catalog does not record it.
@@ -547,7 +547,8 @@ impl Glm53DsaAttnLocalWorklet {
         }
         // The fork's "auto" chain runs `cooperative_topk` up to 64 rows and the
         // persistent kernel past it; checked on the backends as built, after
-        // any run-config override.
+        // any run-config override. DeepSelect past 64 rows is the same chain
+        // with its long-row kernel swapped.
         let cooperative_capable = compute_capability(&worklet.topk_decode.kernel.config.gpu_name)
             .is_some_and(|(major, _)| major >= 9 && major != 12);
         let auto_chain = worklet
@@ -555,7 +556,8 @@ impl Glm53DsaAttnLocalWorklet {
             .kernel
             .config
             .backends
-            .contains(&AUTO_PERSISTENT_BACKEND);
+            .iter()
+            .all(|backend| LONG_ROW_BACKENDS.contains(backend));
         if let (Some(config), true) = (
             &r.topk_decode_cooperative,
             cooperative_capable && auto_chain,
@@ -858,10 +860,13 @@ struct Work {
 /// `40 * max_model_len` keys, and a request pack never exceeds it.
 const PREFILL_KEY_WORKSPACE_PER_MODEL_LEN: u64 = 40;
 
-/// The persistent backend the fork's "auto" decode top-k chain falls back to
-/// past [`COOPERATIVE_MAX_ROWS`]; a `topk_decode` override without it (an
-/// explicit backend such as DeepSelect) runs every batch on that backend.
-const AUTO_PERSISTENT_BACKEND: &str = "vllm_cuda";
+/// The `topk_decode` backends that run past [`COOPERATIVE_MAX_ROWS`] behind
+/// the cooperative kernel. `vllm_cuda` (persistent_topk) is the fork's "auto"
+/// chain, the default. `deep_select` there is not a fork setting: the fork's
+/// explicit `deep_select` backend runs every batch on DeepSelect, while this
+/// keeps cooperative_topk up to 64 rows (a one-line change to `_resolve_auto`).
+/// Any other override (torch) runs every batch on itself.
+const LONG_ROW_BACKENDS: [&str; 2] = ["vllm_cuda", "deep_select"];
 
 /// Rows of the one-wave uniform launch `eval_decode_topk` prices each row
 /// from: below the SM count, so the measured B axis does not straddle a wave
@@ -1375,9 +1380,10 @@ mod tests {
     }
 
     #[test]
-    fn decode_topk_takes_the_cooperative_kernel_only_on_the_auto_chain() {
-        // The fork's "auto" decode top-k runs cooperative_topk up to 64 rows;
-        // an explicit backend (DeepSelect) or a pre-SM90 GPU never does.
+    fn decode_topk_takes_the_cooperative_kernel_only_ahead_of_a_long_row_kernel() {
+        // The fork's "auto" decode top-k runs cooperative_topk up to 64 rows,
+        // also with DeepSelect for the longer batches; torch or a pre-SM90 GPU
+        // never does.
         let build = |topk: Option<Vec<&str>>, gpu: &str| {
             let bridge = PerfApiBridge::new_uninit_for_test();
             bridge.enable_enumerate();
@@ -1403,6 +1409,9 @@ mod tests {
         assert_eq!(cooperative.config.backends, vec!["vllm_cuda_cooperative"]);
         assert_eq!(cooperative.config.context_mode, "uniform_measured");
         assert!(build(Some(vec!["deep_select"]), "NVIDIA B200")
+            .topk_decode_cooperative
+            .is_some());
+        assert!(build(Some(vec!["torch"]), "NVIDIA B200")
             .topk_decode_cooperative
             .is_none());
         assert!(build(None, "A100-SXM4-80GB")
