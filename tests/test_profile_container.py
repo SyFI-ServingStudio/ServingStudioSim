@@ -330,6 +330,8 @@ def test_imex_channel_is_declared_by_the_mnnvl_all_reduce_backends_only() -> Non
         ("all_reduce_fusion", "flashinfer_mnnvl_unbudgeted_twoshot"),
         ("all_reduce_residual_rms_norm", "flashinfer_mnnvl"),
         ("all_reduce_residual_rms_norm", "flashinfer_mnnvl_unbudgeted"),
+        ("moe_alltoall", "flashinfer_nvlink_two_sided"),
+        ("moe_alltoall_prepare", "flashinfer_nvlink_two_sided"),
     }
 
 
