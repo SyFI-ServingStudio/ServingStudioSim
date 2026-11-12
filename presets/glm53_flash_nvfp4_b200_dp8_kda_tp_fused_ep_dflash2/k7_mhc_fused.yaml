@@ -1,0 +1,96 @@
+# Variant of k7.yaml with the mHC post/pre boundaries fused into one launch
+# (mhc_boundary: fused_less_saving): vLLM's TileLang rows less the one-launch (lane M) kernel's
+# saving per boundary, measured graph-replay with PDL against TileLang in the same Slurm job
+# (21278, wt-flash-mhc-fuse logs/20261113_2_mhc_measured/graph_saving_us.json) at each point's
+# rows per rank; 0 where TileLang is faster (c256 and HiSparse). Same-job savings are used instead
+# of the DB rows because the 2026-09 TileLang rows read 1.0-2.7 us below that job's re-measure.
+# GLM-5.3-Flash NVFP4 + DFlash2 on one 8x B200 node under the
+# glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2 design (simulator/src/arch/
+# glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2.rs has the design and the full
+# pricing table). Not a vLLM deployment; run --no-gpu.
+#
+# Pricing per step (实测 = profile.db row, 拟合 = fit to measured rows, 外推 = beyond any row):
+#   attention DP8; KDA layers TP over kda_tp_gpus GPUs, DSA on the owner rank      实测
+#   KDA input all-gather + output reduce-scatter over the group (fixed-pattern MNNVL):
+#     reduce-scatter                                                                实测 (8-GPU mnnvl_pull rows; b<8 at byte-matched counts)
+#     all-gather                                                                    stand-in (the reduce-scatter row)
+#   KDA f_b/g_b as one batched GEMM                                                 实测
+#   mHC post/pre boundaries: vLLM's TileLang kernels, unfused                      实测
+#   MoE router gate once per layer (vLLM GateLinear)                                实测
+#   MoE EP8 routed experts, dispatch activation quant, router top-k select          实测
+#   expert exchange (fused direct-write all-gather + reduce-scatter, MNNVL):
+#     dispatch store, per-row and link cost                                         拟合 (B200 EP8 moe_alltoall fit)
+#     combine read, per-row and link cost                                           拟合 (same fit)
+#     fixed cost per leg: 0 us (fused into the quant / next op; unfused 4.11 us)    外推, optimistic
+#     owner's sum of the partials: 0 us (fused into the next op)                    外推, optimistic
+#   DFlash2 draft, TP1 per rank                                                     实测
+#
+# kda_tp_gpus is static per deployment, so each load point sets it: the 2026-11-12 sweep with the
+# KDA pair priced as all-gather + reduce-scatter (logs/20261112_6_kda_tp_agrs) picked 8 GPUs at
+# 1-32 concurrent requests, 4 at 64, and 1 (off) from 128 up.
+#
+# The trace is not in the repo (79 MB / 55 MB). Link it from the study that made it:
+#   ln -s <workspace>/wt-glm53-decode-investigate/logs/20261011_13_flash_dflash2_k_sweep_long/traces/reported_600k_decode_k7.csv \
+#         trace/glm53_flash_600k_decode_k7.csv
+#   ln -s <workspace>/wt-glm53-decode-investigate/logs/20261012_0_glm53_flash_hisparse/traces/reported_600k_decode_k3.csv \
+#         trace/glm53_flash_600k_decode_k3.csv
+# (600k decode-only requests from the reported long-context distribution, each carrying the
+# measured per-position DFlash2 acceptance.) Saturated arrival: max_concurrency requests are
+# always in flight; one simulated hour.
+# Routing: the recorded per-token routes of the GLM-5.3-Flash FP8 balanced_c32 capture; the
+# NVFP4 export keeps the router in BF16, so the FP8 routes stand in (as in the public preset).
+deployment: unified
+workload:
+  trace_files:
+    - trace/glm53_flash_600k_decode_k7.csv
+  input_file_format: text-generation-independent
+  input_file_tags: [speculative]
+  arrival_mode: saturated
+  max_concurrency: ${conc}
+  run_to_end: false
+  duration_ms: 3600000.0
+io:
+  log_dir: logs/glm53_flash_nvfp4_b200_dp8_kda_tp_fused_ep_dflash2/k7_mhc_fused/{load}
+pools:
+  main:
+    groups:
+    - gpu: NVIDIA B200
+      replicas: 1
+      arch:
+        type: glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2
+        kda_tp_gpus: ${kda_tp_gpus}
+        mhc_boundary: fused_less_saving
+        mhc_fused_saving_us: ${mhc_fused_saving_us}
+        model_config: model/config/glm53_flash_nvfp4.json
+        fp8: false
+        ep_size: 8
+        max_model_len: 1048576
+        mla_layout_copies: false
+        indexer_max_logits_mb: 512
+        routing: corpus
+        token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm53_flash_fp8/vllm/balanced_c32/capture/20260924/manifest.json
+        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320,
+          336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640, 656, 672, 688, 704, 720, 736, 752, 768, 784, 800, 816, 832, 848, 864, 880, 896, 912, 928, 944, 960,
+          976, 992, 1008, 1024, 1040, 1056, 1072, 1088, 1104, 1120, 1136, 1152, 1168, 1184, 1200, 1216, 1232, 1248, 1264, 1280, 1296, 1312, 1328, 1344, 1360, 1376, 1392, 1408, 1424, 1440, 1456, 1472, 1488, 1504,
+          1520, 1536, 1552, 1568, 1584, 1600, 1616, 1632, 1648, 1664, 1680, 1696, 1712, 1728, 1744, 1760, 1776, 1792, 1808, 1824, 1840, 1856, 1872, 1888, 1904, 1920, 1936, 1952, 1968, 1984, 2000, 2016, 2032,
+          2048]
+        draft_tokens: 7
+        kda_state_dtype: bf16
+      worker:
+        type: speculative
+        max_batch_tokens: 8192
+        batch_policy: mix
+        draft_tokens: 7
+        gpu_time_multiplier: 1.0
+        attn_gpu_memory_gb: 110.12
+        dp_placement: vllm-least-loaded
+compound:
+  load:
+    c1: {conc: 1, kda_tp_gpus: 8, mhc_fused_saving_us: 1.9}
+    c8: {conc: 8, kda_tp_gpus: 8, mhc_fused_saving_us: 1.9}
+    c16: {conc: 16, kda_tp_gpus: 8, mhc_fused_saving_us: 1.796}
+    c32: {conc: 32, kda_tp_gpus: 8, mhc_fused_saving_us: 2.255}
+    c64: {conc: 64, kda_tp_gpus: 4, mhc_fused_saving_us: 1.828}
+    c128: {conc: 128, kda_tp_gpus: 1, mhc_fused_saving_us: 0.507}
+    c256: {conc: 256, kda_tp_gpus: 1, mhc_fused_saving_us: 0.0}
+backends_file: backends_dp8.yaml
