@@ -388,6 +388,7 @@ pub fn build_configs(
             hidden: model.hidden,
             top_k: model.num_experts_per_tok,
             num_experts: model.n_routed_experts,
+            max_total_tokens: RANK_TOKEN_BUDGET * u32::from(dp),
         },
         NVLINK_TWO_SIDED_ALLTOALL_BACKENDS,
         demand,
@@ -1000,7 +1001,10 @@ impl MoeBlock {
             rows <= SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
             ev,
         );
-        self.dispatch_quant.eval_or_zero(rows, false, ev);
+        // The measured fused dispatch quantizes inside its gather.
+        let folded = matches!(&self.exchange, Exchange::Configured(exchange)
+            if exchange.folds_dispatch_quant());
+        self.dispatch_quant.eval_or_zero(rows, folded, ev);
     }
 
     fn eval_expert_sections(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
@@ -2856,6 +2860,34 @@ mod tests {
             named(&slots, crate::arch::ep_comm::EP_COMM_ANALYTIC_KIND),
             ["dispatch_fast_all_gather"; 2]
         );
+        // Measured reduce-scatter combines read the fixed-pattern exchange
+        // rows; the owner's sum is inside the combine kernel.
+        for (kind, dispatch_kind, dispatch, combine) in [
+            (
+                EpCommKind::FastAllgather,
+                "moe_ep_quantized_all_gather",
+                "dispatch_fast_all_gather",
+                "combine_fast_reduce_scatter",
+            ),
+            (
+                EpCommKind::FusedAllgather,
+                "moe_ep_quantize_and_all_gather",
+                "dispatch_fused_all_gather",
+                "combine_fused_reduce",
+            ),
+        ] {
+            let built = built_with(
+                &model,
+                &fast_parallel(kind, EpCommModel::Measured, EpFastConfig::default()),
+            );
+            assert_eq!(built.n_slots, base, "{kind:?}");
+            let slots = leaves(&built);
+            assert_eq!(named(&slots, dispatch_kind), [dispatch; 2], "{kind:?}");
+            assert_eq!(named(&slots, "moe_ep_reduce_scatter"), [combine; 2], "{kind:?}");
+            assert!(slots
+                .iter()
+                .all(|(l, k)| l != "combine_sum" && k != crate::arch::ep_comm::EP_COMM_ANALYTIC_KIND));
+        }
     }
 
     /// Catches an exchange the rows cannot price: the measured all-to-all is
@@ -2865,6 +2897,16 @@ mod tests {
     fn the_exchange_rejects_what_it_cannot_price() {
         let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
         let nvfp4 = config("glm53_flash_nvfp4");
+        // The fixed-pattern exchange rows are MNNVL at EP8 only.
+        for (ep, backend, needle) in [
+            (4, crate::arch::ep_comm::FastBackend::Mnnvl, "ep_size 4"),
+            (8, crate::arch::ep_comm::FastBackend::Nvshmem, "ep_fast_backend mnnvl"),
+        ] {
+            let mut parallel = exchange(ep, EpCommKind::FusedAllgather, EpCommModel::Measured);
+            parallel.ep_comm.fast.backend = backend;
+            let error = build_configs(&nvfp4, &parallel, &demand).err().unwrap();
+            assert!(error.to_string().contains(needle), "{error}");
+        }
         let error = build_configs(
             &nvfp4,
             &exchange(4, EpCommKind::Alltoall, EpCommModel::Measured),

@@ -18,12 +18,23 @@
 //!   elementwise leaves either way.
 //!
 //! * the **fast exchanges** (`ep_comm: fast_allgather | fused_allgather |
-//!   fast_sparse`): one analytic dispatch leg and one combine leg each, no
-//!   prepare, flagged `extrapolated`; `fast_allgather` with
-//!   `ep_fast_combine: all_reduce` and `ep_comm_model: measured` takes the
-//!   combine from the backend's profiled all-reduce (`all_reduce` nvshmem at
-//!   `T x row` bytes, or `all_reduce_fusion` flashinfer_mnnvl at `T` tokens,
-//!   which extrapolates past vLLM's 128-token TP8 cap).
+//!   fast_sparse`): one dispatch leg and one combine leg each, no prepare.
+//!   With `ep_comm_model: analytic` both legs are `arch::ep_comm`'s fit,
+//!   flagged `extrapolated`. With `ep_comm_model: measured` (MNNVL, EP8):
+//!   `fast_allgather` + `ep_fast_combine: reduce_scatter` reads the
+//!   fixed-pattern exchange kernels' rows (`moe_ep_quantized_all_gather` and
+//!   `moe_ep_reduce_scatter`, backend `mnnvl_lamport`; the owner's sum is
+//!   inside the combine kernel, so no separate sum leaf); `fused_allgather`
+//!   reads `moe_ep_quantize_and_all_gather` (the arch's dispatch quantization
+//!   is inside it, see [`EpExchange::folds_dispatch_quant`]) and
+//!   `moe_ep_reduce_scatter` `mnnvl_pull` (the owner reads every rank's
+//!   partials from fabric memory and sums them; measured as its own launch,
+//!   not fused into the next op); `fast_allgather` + `ep_fast_combine:
+//!   all_reduce` takes the combine from the backend's profiled all-reduce
+//!   (`all_reduce` nvshmem at `T x row` bytes, or `all_reduce_fusion`
+//!   flashinfer_mnnvl at `T` tokens, which extrapolates past vLLM's 128-token
+//!   TP8 cap) and its dispatch from the fit; `fast_sparse` has no kernel and
+//!   stays on the fit.
 //!
 //! Every row width comes from the model's hidden size, top-k and routed
 //! expert count ([`EpExchangeGeometry`]), so one exchange serves every
@@ -48,7 +59,10 @@ use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, MoeAlltoallDirection,
     MoeAlltoallKernel, MoeAlltoallKernelConfig, MoeAlltoallKernelInput, MoeAlltoallPrepareKernel,
-    MoeAlltoallPrepareKernelConfig, MoeAlltoallPrepareKernelInput,
+    MoeAlltoallPrepareKernelConfig, MoeAlltoallPrepareKernelInput, MoeEpCollectiveKernelInput,
+    MoeEpQuantizeAndAllGatherKernel, MoeEpQuantizeAndAllGatherKernelConfig,
+    MoeEpQuantizedAllGatherKernel, MoeEpQuantizedAllGatherKernelConfig, MoeEpReduceScatterKernel,
+    MoeEpReduceScatterKernelConfig,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge, Probe, SlotInput,
@@ -68,6 +82,15 @@ pub const NVLINK_TWO_SIDED_ALLTOALL_BACKENDS: &[&str] = &["flashinfer_nvlink_two
 /// The only group the `moe_alltoall` / `moe_alltoall_prepare` rows span.
 pub const MEASURED_ALLTOALL_EP_SIZE: u16 = 8;
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
+/// The fixed-pattern MNNVL exchange kernels
+/// (`profiling/runners/comm/csrc/mnnvl_fixed_exchange.cuh`): direct stores
+/// into every peer's landing rows with Lamport-style arrival.
+pub const FIXED_EXCHANGE_PUSH_BACKENDS: &[&str] = &["mnnvl_lamport"];
+/// The same exchange's reader-side combine: the owner reads every rank's
+/// partials from fabric memory and sums them.
+pub const FIXED_EXCHANGE_PULL_BACKENDS: &[&str] = &["mnnvl_pull"];
+/// The only group the fixed-pattern exchange rows span.
+pub const MEASURED_FIXED_EXCHANGE_EP_SIZE: u16 = 8;
 
 /// The model dimensions the exchange's rows are sized from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +99,26 @@ pub struct EpExchangeGeometry {
     pub top_k: u32,
     /// Routed experts; one MNNVL slot each (no EPLB redundancy).
     pub num_experts: u32,
+    /// Largest token count summed over the EP group (the arch's per-rank
+    /// batch budget times `ep_size`): the measured exchange grids' total axis.
+    pub max_total_tokens: u32,
+}
+
+/// The fixed-pattern exchange's profiled dispatch.
+#[derive(Clone, Debug)]
+pub enum FixedDispatchConfig {
+    /// `fast_allgather`: the already-quantized rows, gathered.
+    Gather(MoeEpQuantizedAllGatherKernelConfig),
+    /// `fused_allgather`: bf16 rows quantized inside the gather.
+    QuantizeAndGather(MoeEpQuantizeAndAllGatherKernelConfig),
+}
+
+/// The fixed-pattern MNNVL exchange's profiled dispatch and combine.
+#[derive(Clone, Debug)]
+pub struct MeasuredFixedExchange {
+    pub dispatch: FixedDispatchConfig,
+    /// `mnnvl_lamport` (pushed partials) or `mnnvl_pull` (read by the owner).
+    pub combine: MoeEpReduceScatterKernelConfig,
 }
 
 /// The profiled flashinfer MNNVL all-to-all of vLLM's two-sided path.
@@ -121,6 +164,10 @@ pub struct EpExchangeConfigs {
     /// is `fast_allgather`, `ep_fast_combine` `all_reduce` and `ep_comm_model`
     /// `measured`.
     pub measured_fast_combine: Option<MeasuredFastCombine>,
+    /// The fixed-pattern exchange kernels; `None` unless `ep_comm_model` is
+    /// `measured` and `ep_comm` is `fused_allgather`, or `fast_allgather`
+    /// with `ep_fast_combine: reduce_scatter`.
+    pub measured_fixed: Option<MeasuredFixedExchange>,
     /// A fast reduce-scatter combine's receiver sum of the `ep_size` partial
     /// rows per token (dense slots, bf16), the all-to-all `combine_reduce`
     /// shape at EP8 top-8; `None` for the all-reduce (the sum is in the
@@ -217,7 +264,88 @@ impl EpExchangeConfigs {
             hidden,
             top_k,
             num_experts,
+            max_total_tokens,
         } = geometry;
+        let measured_fixed_kind = ep_comm.model == EpCommModel::Measured
+            && match ep_comm.kind {
+                EpCommKind::FusedAllgather => true,
+                EpCommKind::FastAllgather => ep_comm.fast.combine == FastCombine::ReduceScatter,
+                _ => false,
+            };
+        let measured_fixed = if measured_fixed_kind {
+            if ep_size != MEASURED_FIXED_EXCHANGE_EP_SIZE {
+                return Err(format!(
+                    "ep_size {ep_size}: the fixed-pattern exchange has B200 rows at \
+                     {MEASURED_FIXED_EXCHANGE_EP_SIZE} GPUs only (ep_comm_model analytic goes \
+                     further)"
+                ));
+            }
+            if ep_comm.fast.backend != FastBackend::Mnnvl {
+                return Err(format!(
+                    "the measured fixed-pattern exchange runs on MNNVL fabric memory: \
+                     ep_fast_backend mnnvl, not {:?} (or ep_comm_model analytic)",
+                    ep_comm.fast.backend
+                ));
+            }
+            if ep_comm.kind == EpCommKind::FusedAllgather
+                && ep_comm.fast.combine != FastCombine::ReduceScatter
+            {
+                return Err("fused_allgather with ep_comm_model measured reads the owner-side \
+                            reduce-scatter rows: ep_fast_combine reduce_scatter"
+                    .to_string());
+            }
+            if ep_comm
+                .fast
+                .combine_row_bytes
+                .is_some_and(|bytes| bytes != 2 * hidden)
+            {
+                return Err("the measured fixed-pattern combine moves bf16 rows; \
+                            ep_combine_row_bytes needs ep_comm_model analytic"
+                    .to_string());
+            }
+            let fused = ep_comm.kind == EpCommKind::FusedAllgather;
+            let dispatch = if fused {
+                FixedDispatchConfig::QuantizeAndGather(MoeEpQuantizeAndAllGatherKernelConfig {
+                    backends: FIXED_EXCHANGE_PUSH_BACKENDS.to_vec(),
+                    gpu_name: gpu_name.to_string(),
+                    num_gpus: u32::from(ep_size),
+                    hidden_size: hidden.into(),
+                    top_k: top_k.into(),
+                    activation_dtype: DType::Nvfp4E2m1,
+                    fabric: "nvlink".into(),
+                    max_total_tokens,
+                })
+            } else {
+                FixedDispatchConfig::Gather(MoeEpQuantizedAllGatherKernelConfig {
+                    backends: FIXED_EXCHANGE_PUSH_BACKENDS.to_vec(),
+                    gpu_name: gpu_name.to_string(),
+                    num_gpus: u32::from(ep_size),
+                    hidden_size: hidden.into(),
+                    top_k: top_k.into(),
+                    activation_dtype: DType::Nvfp4E2m1,
+                    fabric: "nvlink".into(),
+                    max_total_tokens,
+                })
+            };
+            Some(MeasuredFixedExchange {
+                dispatch,
+                combine: MoeEpReduceScatterKernelConfig {
+                    backends: if fused {
+                        FIXED_EXCHANGE_PULL_BACKENDS.to_vec()
+                    } else {
+                        FIXED_EXCHANGE_PUSH_BACKENDS.to_vec()
+                    },
+                    gpu_name: gpu_name.to_string(),
+                    num_gpus: u32::from(ep_size),
+                    hidden_size: hidden.into(),
+                    dtype: DType::Bf16,
+                    fabric: "nvlink".into(),
+                    max_total_tokens,
+                },
+            })
+        } else {
+            None
+        };
         // The measured all-to-all still takes its rows from the analytic model.
         let analytic =
             AnalyticEpComm::new(ep_comm.clone(), ep_size, hidden, num_experts, top_k, demand)
@@ -257,7 +385,9 @@ impl EpExchangeConfigs {
             dispatch_scales: alltoall_kernel(hidden / 16, MoeAlltoallDirection::Dispatch),
             combine: alltoall_kernel(bf16_row, MoeAlltoallDirection::Combine),
         });
+        // The measured fixed-pattern combine sums inside its kernel.
         let fast_combine_sum = (ep_comm.kind.is_fast()
+            && measured_fixed.is_none()
             && ep_comm.kind != EpCommKind::FusedAllgather
             && (ep_comm.kind == EpCommKind::FastSparse
                 || ep_comm.fast.combine == FastCombine::ReduceScatter))
@@ -267,6 +397,7 @@ impl EpExchangeConfigs {
             alltoall,
             measured_alltoall,
             measured_fast_combine,
+            measured_fixed,
             fast_combine_sum,
         })
     }
@@ -291,6 +422,18 @@ pub enum FastCombineOp {
     Mnnvl(Op<AllReduceFusionKernel>),
 }
 
+/// The fixed-pattern exchange's profiled dispatch op.
+pub enum FixedDispatchOp {
+    Gather(Op<MoeEpQuantizedAllGatherKernel>),
+    QuantizeAndGather(Op<MoeEpQuantizeAndAllGatherKernel>),
+}
+
+/// The fixed-pattern exchange's profiled ops.
+pub struct MeasuredFixedOps {
+    dispatch: FixedDispatchOp,
+    combine: Op<MoeEpReduceScatterKernel>,
+}
+
 /// One MoE layer's exchange, built from non-default [`EpExchangeConfigs`].
 pub enum EpExchange {
     /// `arch::ep_comm`'s fast exchange: one dispatch and one combine leaf.
@@ -300,6 +443,8 @@ pub enum EpExchange {
         combine: String,
         /// The measured all-reduce in place of the analytic combine leg.
         measured_combine: Option<FastCombineOp>,
+        /// The fixed-pattern exchange kernels in place of both analytic legs.
+        measured_fixed: Option<MeasuredFixedOps>,
         /// The receiver's sum of the partial rows (measured elementwise).
         combine_sum: Option<Op<ElementwiseKernel>>,
         prefix: String,
@@ -416,6 +561,39 @@ impl EpExchange {
                     bridge,
                 )?)),
             };
+            let dispatch = format!("{prefix}.{dispatch}");
+            let measured_fixed = configs
+                .measured_fixed
+                .as_ref()
+                .map(|kernels| -> Result<_, BuildError> {
+                    Ok(MeasuredFixedOps {
+                        dispatch: match &kernels.dispatch {
+                            FixedDispatchConfig::Gather(config) => {
+                                FixedDispatchOp::Gather(build_op(
+                                    dispatch.clone(),
+                                    config.clone(),
+                                    MoeEpQuantizedAllGatherKernel::build,
+                                    bridge,
+                                )?)
+                            }
+                            FixedDispatchConfig::QuantizeAndGather(config) => {
+                                FixedDispatchOp::QuantizeAndGather(build_op(
+                                    dispatch.clone(),
+                                    config.clone(),
+                                    MoeEpQuantizeAndAllGatherKernel::build,
+                                    bridge,
+                                )?)
+                            }
+                        },
+                        combine: build_op(
+                            combine.clone(),
+                            kernels.combine.clone(),
+                            MoeEpReduceScatterKernel::build,
+                            bridge,
+                        )?,
+                    })
+                })
+                .transpose()?;
             let combine_sum = configs
                 .fast_combine_sum
                 .as_ref()
@@ -430,9 +608,10 @@ impl EpExchange {
                 .transpose()?;
             return Ok(Some(Self::Fast {
                 comm,
-                dispatch: format!("{prefix}.{dispatch}"),
+                dispatch,
                 combine,
                 measured_combine,
+                measured_fixed,
                 combine_sum,
                 prefix: prefix.to_string(),
             }));
@@ -490,9 +669,36 @@ impl EpExchange {
         }))
     }
 
+    /// The measured fused dispatch quantizes inside the gather: the arch's
+    /// own dispatch quantization must not be billed again.
+    pub fn folds_dispatch_quant(&self) -> bool {
+        matches!(
+            self,
+            Self::Fast {
+                measured_fixed: Some(MeasuredFixedOps {
+                    dispatch: FixedDispatchOp::QuantizeAndGather(_),
+                    ..
+                }),
+                ..
+            }
+        )
+    }
+
     /// The path, for the exchange's cost-tree label.
     pub fn label(&self) -> String {
         match self {
+            Self::Fast {
+                measured_fixed: Some(ops),
+                ..
+            } => match ops.dispatch {
+                FixedDispatchOp::Gather(_) => "measured fixed-pattern MNNVL all-gather + \
+                                               reduce-scatter (mnnvl_lamport EP8 rows)"
+                    .to_string(),
+                FixedDispatchOp::QuantizeAndGather(_) => "measured fused MNNVL quantize + \
+                                                          all-gather (mnnvl_lamport) and owner-read \
+                                                          reduce-scatter (mnnvl_pull), EP8 rows"
+                    .to_string(),
+            },
             Self::Alltoall {
                 measured: Some(_), ..
             } => "measured flashinfer MNNVL all-to-all (EP8 rows)".to_string(),
@@ -518,6 +724,13 @@ impl EpExchange {
     /// `ranks` EP ranks. Leaves are declared in [`Self::eval_dispatch`] order.
     pub fn compile_dispatch(&self, ranks: usize, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
         match self {
+            Self::Fast {
+                measured_fixed: Some(ops),
+                ..
+            } => vec![match &ops.dispatch {
+                FixedDispatchOp::Gather(op) => op.compile(builder),
+                FixedDispatchOp::QuantizeAndGather(op) => op.compile(builder),
+            }],
             Self::AnalyticAllgather { comm, dispatch, .. } | Self::Fast { comm, dispatch, .. } => {
                 vec![comm.compile_leg(dispatch.clone(), "dispatch", builder)]
             }
@@ -566,14 +779,16 @@ impl EpExchange {
                 comm,
                 combine,
                 measured_combine,
+                measured_fixed,
                 combine_sum,
                 prefix,
                 ..
             } => {
-                let mut chain = vec![match measured_combine {
-                    Some(FastCombineOp::Nvshmem(op)) => op.compile(builder),
-                    Some(FastCombineOp::Mnnvl(op)) => op.compile(builder),
-                    None => comm.compile_leg(combine.clone(), "combine", builder),
+                let mut chain = vec![match (measured_fixed, measured_combine) {
+                    (Some(ops), _) => ops.combine.compile(builder),
+                    (None, Some(FastCombineOp::Nvshmem(op))) => op.compile(builder),
+                    (None, Some(FastCombineOp::Mnnvl(op))) => op.compile(builder),
+                    (None, None) => comm.compile_leg(combine.clone(), "combine", builder),
                 }];
                 if let Some(sum) = combine_sum {
                     chain.push(ranks_max(prefix, "combine_sum", sum, ranks, builder));
@@ -624,6 +839,19 @@ impl EpExchange {
     pub fn eval_dispatch(&self, step: &EpExchangeStep, tokens: &[u32], ev: &mut Evaluator) {
         match self {
             Self::AnalyticAllgather { .. } => push_leg("dispatch", step.analytic.dispatch, ev),
+            Self::Fast {
+                measured_fixed: Some(ops),
+                ..
+            } => {
+                let input = MoeEpCollectiveKernelInput {
+                    per_rank_tokens: tokens.to_vec(),
+                };
+                let idle = tokens.iter().all(|&rows| rows == 0);
+                match &ops.dispatch {
+                    FixedDispatchOp::Gather(op) => push_or_zero(op, input, idle, ev),
+                    FixedDispatchOp::QuantizeAndGather(op) => push_or_zero(op, input, idle, ev),
+                }
+            }
             Self::Fast { .. } => push_extrapolated_leg("dispatch", step.analytic.dispatch, ev),
             Self::Alltoall {
                 measured,
@@ -667,12 +895,20 @@ impl EpExchange {
             Self::Fast {
                 comm,
                 measured_combine,
+                measured_fixed,
                 combine_sum,
                 ..
             } => {
                 let total: u32 = tokens.iter().sum();
                 let idle = total == 0;
+                if let Some(ops) = measured_fixed {
+                    let input = MoeEpCollectiveKernelInput {
+                        per_rank_tokens: tokens.to_vec(),
+                    };
+                    push_or_zero(&ops.combine, input, idle, ev);
+                }
                 match measured_combine {
+                    _ if measured_fixed.is_some() => {}
                     None => push_extrapolated_leg("combine", step.analytic.combine, ev),
                     // Every rank's partial sums of all `T` tokens, all-reduced.
                     Some(FastCombineOp::Nvshmem(op)) => push_or_zero(

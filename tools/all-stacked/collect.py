@@ -23,7 +23,7 @@ MODE = sys.argv[2] if len(sys.argv) > 2 else "mqa"
 LOADS = [("k7-c1", "k7", 1), ("k7-c8", "k7", 8), ("k7-c16", "k7", 16), ("k7-c32", "k7", 32),
          ("k7-c64", "k7", 64), ("k7-c128", "k7", 128), ("k7-c256", "k7", 256),
          ("hs-k3-c768", "hs", 768), ("hs-k3-c1280", "hs", 1280)]
-COMM_KINDS = {"moe_ep_quantized_all_gather", "moe_ep_reduce_scatter", "moe_alltoall", "moe_alltoall_prepare",
+COMM_KINDS = {"moe_ep_quantized_all_gather", "moe_ep_quantize_and_all_gather", "moe_ep_reduce_scatter", "moe_alltoall", "moe_alltoall_prepare",
               "ep_comm_analytic", "all_reduce", "all_reduce_fusion"}
 
 MEAS = "measured rows"

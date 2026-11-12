@@ -330,6 +330,16 @@ fn build_configs_for(
         fabric: "nvlink".to_string(),
         max_total_tokens,
     };
+    if parallel.ep_comm.kind == EpCommKind::FusedAllgather
+        && parallel.ep_comm.model == EpCommModel::Measured
+    {
+        // The measured fused dispatch quantizes inside the gather; this arch
+        // does not take its activation quantization out of the cost tree.
+        return Err(fit_failed(
+            "ep_comm fused_allgather with ep_comm_model measured is wired for the GLM-5.3 \
+             Flash DP arch only; use ep_comm_model analytic",
+        ));
+    }
     let exchange = EpExchangeConfigs::new(
         &parallel.ep_comm,
         parallel.ep_size,
@@ -338,6 +348,7 @@ fn build_configs_for(
             hidden: model.hidden_dim.get(),
             top_k: u32::from(model.router_top_k),
             num_experts: model.num_experts.get(),
+            max_total_tokens,
         },
         MNNVL_ALLTOALL_BACKENDS,
         body_demand,
