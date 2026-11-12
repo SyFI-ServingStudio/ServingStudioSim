@@ -83,13 +83,22 @@ def test_registration_support_policy_and_facades() -> None:
 
     assert KIND == "dsa_persistent_topk_decode"
     # The fork build is its own backend; tests/test_dsa_persistent_topk_decode_fork.py
-    # covers its registration. The cooperative backend is the small-batch dispatch.
+    # covers its registration. The cooperative backend is the small-batch dispatch;
+    # deep_select is the fork's opt-in decode top-k on SM100.
     assert known_backends(KIND) == [
         _TORCH_BACKEND,
         _NATIVE_BACKEND,
         _FORK_BACKEND,
         _COOPERATIVE_BACKEND,
+        "deep_select",
     ]
+    deep_select = find_kernel_profiler_spec(KIND, "deep_select")
+    assert deep_select.supports.allows(DType.FP32, gpu="NVIDIA B200")
+    assert not deep_select.supports.allows(DType.FP32, gpu="NVIDIA H200")
+    assert deep_select.subprocess_env == "vllm_env"
+    assert deep_select.runner_ref.module_name == (
+        "profiling.runners.attention.dsa_persistent_topk_decode_deep_select"
+    )
     for spec in (torch_spec, native_spec):
         assert spec.kernel_kind == spec.table_name == KIND
         assert spec.args_schema is DsaPersistentTopkDecodeArgs
