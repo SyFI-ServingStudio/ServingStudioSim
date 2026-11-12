@@ -96,6 +96,12 @@ pub trait Dflash2VerifyTarget: IterwiseUnifiedModel {
     fn kda_commit(&self) -> Option<&KdaCommitPlan>;
     fn compile_target(&self, builder: &mut CostTreeBuilder) -> CostNode;
     fn eval_target(&self, input: &UnifiedArchInput, ev: &mut Evaluator);
+    /// Ranks of one attention DP group that split its requests between their
+    /// drafts (each drafts every `n`-th request); 1 drafts the whole group on
+    /// one rank.
+    fn draft_ranks_per_group(&self) -> u32 {
+        1
+    }
 }
 
 impl Dflash2VerifyTarget for Glm53FlashVllmModel {
@@ -120,6 +126,12 @@ impl Dflash2VerifyTarget for Glm53FlashVllmModel {
 
 impl Dflash2VerifyTarget for Glm53FlashDpAttnEpModel {
     const MODEL: &'static str = "GLM-5.3-Flash NVFP4";
+
+    /// Under attention TP over a shared partition the group's ranks draft
+    /// (and commit) disjoint request slices.
+    fn draft_ranks_per_group(&self) -> u32 {
+        u32::from(self.partition_ranks())
+    }
 
     fn verify_width(&self) -> u32 {
         self.verify_width
@@ -254,10 +266,15 @@ impl<T: Dflash2VerifyTarget> Dflash2VerifyModel<T> {
             panic!("invalid Dflash2VerifyModel input: {reason}")
         });
         self.target.eval_target(&verify_batch(input), ev);
-        // A target without KDA commits nothing, so this pushes no slot.
+        // A target without KDA commits nothing, so this pushes no slot. The
+        // commit is priced per rank at full heads on the rank's share of the
+        // partition's requests (TP1 plan); under attention TP that equals the
+        // head-split commit of all of them at linear cost (an assumption).
+        let commit_ranks = self.target.draft_ranks_per_group().max(1) as usize;
         for group in &input.groups {
-            let requests = group.decode_requests.len() as u32;
-            let committed: u32 = group.decode_requests.iter().map(|d| d.committed_rows).sum();
+            let slice: Vec<_> = group.decode_requests.iter().step_by(commit_ranks).collect();
+            let requests = slice.len() as u32;
+            let committed: u32 = slice.iter().map(|d| d.committed_rows).sum();
             let commit = KdaRecoverSSMCommitKernelInput {
                 batch_size: requests,
                 mean_commit_len: if requests == 0 {
@@ -274,20 +291,44 @@ impl<T: Dflash2VerifyTarget> Dflash2VerifyModel<T> {
                 }
             }
         }
+        let draft_ranks = self.target.draft_ranks_per_group().max(1) as usize;
         for (draft, group) in self.drafts.iter().zip(&input.groups) {
-            let endpoints: Vec<u32> = group
+            // (endpoint context, scheduled rows) per request.
+            let requests: Vec<(u32, u32)> = group
                 .prefill_chunk_pairs
                 .iter()
-                .map(|&(prefix, append)| prefix + append)
-                .chain(group.decode_requests.iter().map(|decode| decode.kv_len))
+                .map(|&(prefix, append)| (prefix + append, append))
+                .chain(
+                    group
+                        .decode_requests
+                        .iter()
+                        .map(|decode| (decode.kv_len, decode.query_len)),
+                )
                 .collect();
-            draft.eval_group(
-                group.request_count(),
-                group.batch_tokens,
-                &endpoints,
-                self.draft_tokens,
-                ev,
-            );
+            if draft_ranks == 1 {
+                let endpoints: Vec<u32> = requests.iter().map(|&(end, _)| end).collect();
+                draft.eval_group(
+                    group.request_count(),
+                    group.batch_tokens,
+                    &endpoints,
+                    self.draft_tokens,
+                    ev,
+                );
+            } else {
+                // The busiest rank's slice: every `draft_ranks`-th request
+                // from the first (ceil of the even split).
+                let slice: Vec<(u32, u32)> =
+                    requests.iter().copied().step_by(draft_ranks).collect();
+                let endpoints: Vec<u32> = slice.iter().map(|&(end, _)| end).collect();
+                let rows: u32 = slice.iter().map(|&(_, rows)| rows).sum();
+                draft.eval_group(
+                    slice.len() as u32,
+                    rows,
+                    &endpoints,
+                    self.draft_tokens,
+                    ev,
+                );
+            }
         }
     }
 
@@ -526,7 +567,11 @@ pub fn build<T: Dflash2VerifyTarget>(
     // `draft_kv_bytes_per_token`).
     let host_offload = target.kv_host_offload();
     let kv_cache_layout = match (recurrent, host_offload.is_some()) {
-        (true, _) => target_layout.with_part(KvCachePart::per_request(DRAFT_KV_PART, window)),
+        // Split over the group's draft ranks, each holding its own requests'.
+        (true, _) => target_layout.with_part(
+            KvCachePart::per_request(DRAFT_KV_PART, window)
+                .sharded(target.draft_ranks_per_group().max(1)),
+        ),
         (false, true) => target_layout
             .with_part(KvCachePart::per_request(DRAFT_KV_PART, window).not_prefix_reusable()),
         // The draft's KV heads are split over its TP ranks, one copy in all.

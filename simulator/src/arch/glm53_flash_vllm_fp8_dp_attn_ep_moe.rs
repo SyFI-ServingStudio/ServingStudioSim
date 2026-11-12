@@ -64,6 +64,25 @@
 //! widths, so they need the Flash shapes in `profile.db`. The FP8 checkpoint
 //! keeps the measured all-gather / reduce-scatter. The default, measured
 //! all-gather / reduce-scatter, is unchanged.
+//!
+//! # Attention DP x TP (`attn_tp > 1`)
+//!
+//! Not a vLLM layout; a design the simulator prices from measured leaves.
+//!
+//! The `dp_size` GPUs form `dp_size / attn_tp` attention groups of `attn_tp`
+//! GPUs. A group's requests share one scheduler and KV partition; its KDA and
+//! MLA heads, and their projections, are split over the group's ranks (the TP
+//! arch's `tp_size = attn_tp` worklets), so every rank runs attention on all
+//! of the group's rows. Everything else is sequence-parallel: each rank owns
+//! `ceil(rows / attn_tp)` of the group's rows for the mHC boundaries, the dense
+//! FFN, the router, the shared expert and the EP dispatch, so every EP source
+//! rank sends its own slice and the expert exchange is the DP one over
+//! `dp_size` ranks. Per layer the group moves the attention input from slices
+//! to all rows (all-gather) and the attention output back (reduce-scatter);
+//! the pair is priced as one TP all-reduce of the group's rows (FlashInfer
+//! MNNVL up to its workspace, else the faster of NCCL / NVSHMEM). MLA latent,
+//! indexer cache and kpool tail are replicated over the group's ranks; the KDA
+//! state is sharded by head.
 
 use anyhow::Result;
 
@@ -112,6 +131,9 @@ const ROUTER_SELECT_BACKENDS: &[&str] = &["triton"];
 /// vLLM V1's default `max_num_batched_tokens` for chunked prefill: one rank's
 /// scheduler budget, which bounds the collectives' profiled token grid.
 const RANK_TOKEN_BUDGET: u32 = 8192;
+/// Above FlashInfer's fused workspace the attention-TP all-reduce takes the
+/// faster measured large all-reduce (best of N per shape).
+const LARGE_ATTN_ALL_REDUCE_BACKENDS: &[&str] = &["nccl", "nvshmem"];
 
 /// Deployment layout: `dp_size` engine cores, one GPU each, forming one EP group.
 #[derive(Clone, Debug)]
@@ -129,13 +151,52 @@ pub struct Glm53FlashDpAttnEpParallel {
     /// What-if: fixed us taken off each fused mHC post/pre boundary (the
     /// leaf keeps only its per-row part and is flagged `extrapolated`).
     pub mhc_fuse_fixed_us: Option<f64>,
+    /// Attention tensor-parallel degree inside each attention DP group (module
+    /// doc, "Attention DP x TP"): `dp_size / attn_tp` groups; 1 is plain DP
+    /// attention.
+    pub attn_tp: u16,
+    /// Price the attention-TP all-reduce from rows measured at this GPU count
+    /// instead of `attn_tp` (a stand-in while the `attn_tp` rows are missing;
+    /// the cost-tree label says so). `None` uses `attn_tp`.
+    pub attn_all_reduce_row_gpus: Option<u16>,
+    /// Which attention layers run at `attn_tp` (module doc).
+    pub attn_tp_layers: AttnTpLayers,
+    /// How the attention-TP collective is priced (module doc).
+    pub attn_tp_collective: AttnTpCollective,
+}
+
+/// Which attention layers an `attn_tp > 1` group runs tensor-parallel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttnTpLayers {
+    /// KDA and DSA (MLA cache replicated over the group).
+    #[default]
+    All,
+    /// KDA only; DSA stays rank-local DP on each request's owner rank.
+    KdaOnly,
+}
+
+/// Pricing of the attention-TP collective (one all-reduce of the group's rows).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttnTpCollective {
+    /// FlashInfer MNNVL up to its workspace, else the faster of NCCL/NVSHMEM.
+    #[default]
+    Fast,
+    /// NCCL only (the pynccl path).
+    Nccl,
 }
 
 #[derive(Clone, Debug)]
 pub struct Glm53FlashDpAttnEpConfigs {
     /// Every rank-local sublayer at TP 1 (64 KDA/MLA heads, full dense FFN,
     /// shared expert and vocab). Its `routed` and `all_reduce` are unused.
+    /// Under `attn_tp > 1` its KDA (and, unless KDA-only, DSA) configs and
+    /// `all_reduce` are the `attn_tp` ones.
     pub local: Glm53FlashVllmConfigs,
+    /// The TP1 KDA config: the RecoverSSM commit and, KDA-only, the KV layout
+    /// are priced per owner rank from it.
+    pub kda_tp1: crate::worklet::Glm53KdaAttnLocalWorkletConfig,
     pub parallel: Glm53FlashDpAttnEpParallel,
     /// One per EP rank, ranked by routed workload.
     pub routed: Vec<Glm53RoutedMoeLocalWorkletConfig>,
@@ -201,6 +262,41 @@ pub fn build_configs(
         },
         demand,
     )?;
+    let attn_tp = parallel.attn_tp.max(1);
+    if dp % attn_tp != 0 {
+        return Err(fit_failed(format!(
+            "attention TP {attn_tp} must divide the {dp} EP ranks"
+        )));
+    }
+    let mut local = local;
+    let kda_tp1 = local.kda.clone();
+    if attn_tp > 1 {
+        let attn = tp_arch::build_configs(
+            model,
+            &Glm53FlashVllmParallel {
+                tp_size: attn_tp,
+                enable_expert_parallel: true,
+                max_model_len: parallel.max_model_len,
+                gpu_name: parallel.gpu_name.clone(),
+                cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
+                kernel_path: parallel.kernel_path.clone(),
+            },
+            demand,
+        )?;
+        local.kda = attn.kda;
+        if parallel.attn_tp_layers == AttnTpLayers::All {
+            local.dsa = attn.dsa;
+        }
+        let row_gpus = u32::from(parallel.attn_all_reduce_row_gpus.unwrap_or(attn_tp));
+        local.all_reduce = attn.all_reduce;
+        local.all_reduce.num_gpus = row_gpus;
+        local.large_all_reduce = attn.large_all_reduce;
+        local.large_all_reduce.num_gpus = row_gpus;
+        local.large_all_reduce.backends = match parallel.attn_tp_collective {
+            AttnTpCollective::Fast => LARGE_ATTN_ALL_REDUCE_BACKENDS.to_vec(),
+            AttnTpCollective::Nccl => vec!["nccl"],
+        };
+    }
     let mut template = local.routed[0].clone();
     template.ep_size = dp;
     if model.quant == Glm53FlashQuant::Nvfp4 {
@@ -260,6 +356,7 @@ pub fn build_configs(
         },
         routed,
         local,
+        kda_tp1,
         parallel: parallel.clone(),
         exchange,
     })
@@ -344,6 +441,9 @@ struct LayerGroup {
     layers: Vec<u32>,
     attn_boundary: Boundary,
     attn: Attention,
+    /// The attention-TP all-gather + reduce-scatter pair, priced as one TP
+    /// all-reduce of the group's rows; `None` at attention TP 1.
+    attn_all_reduce: Option<tp_arch::TpAllReduce>,
     ffn_boundary: Op<MhcFusedPostPreRmsNormKernel>,
     ffn: Ffn,
     mhc_fuse_fixed_us: Option<f64>,
@@ -370,7 +470,18 @@ impl LayerGroup {
     /// Per rank: everything up to the dispatch (the whole layer for a dense
     /// FFN). Then, for an MoE layer, the group-wide expert section and the
     /// per-rank combine add.
-    fn compile(&self, dp: usize, builder: &mut CostTreeBuilder) -> CostNode {
+    fn compile(
+        &self,
+        dp: usize,
+        kda_groups: usize,
+        kda_only: bool,
+        builder: &mut CostTreeBuilder,
+    ) -> CostNode {
+        if kda_only {
+            if let Attention::Kda(worklet) = &self.attn {
+                return self.compile_kda_tp(worklet, dp, kda_groups, builder);
+            }
+        }
         let ranks = (0..dp)
             .map(|_| {
                 let mut leaves = vec![
@@ -379,8 +490,11 @@ impl LayerGroup {
                         Attention::Kda(worklet) => worklet.compile(builder),
                         Attention::Dsa(worklet) => worklet.compile(builder),
                     },
-                    self.ffn_boundary.compile(builder),
                 ];
+                if !kda_only {
+                    leaves.extend(self.attn_all_reduce.as_ref().map(|op| op.compile(builder)));
+                }
+                leaves.push(self.ffn_boundary.compile(builder));
                 match &self.ffn {
                     Ffn::Dense(worklet) => leaves.push(worklet.compile(builder)),
                     Ffn::Moe(block) => {
@@ -418,29 +532,141 @@ impl LayerGroup {
         }
     }
 
+    /// KDA-only attention TP: every owner rank runs its boundary, the group
+    /// all-gathers the KDA input, runs KDA on all its rows with heads split,
+    /// reduce-scatters the output back to the owners (the pair priced as one
+    /// all-reduce of the group's rows), and every owner rank runs the rest.
+    fn compile_kda_tp(
+        &self,
+        worklet: &Glm53KdaAttnLocalWorklet,
+        dp: usize,
+        kda_groups: usize,
+        builder: &mut CostTreeBuilder,
+    ) -> CostNode {
+        let boundary = CostNode::Max {
+            overlap: 1.0,
+            children: (0..dp)
+                .map(|_| self.attn_boundary.compile(builder))
+                .collect(),
+        };
+        let kda = CostNode::Max {
+            overlap: 1.0,
+            children: (0..kda_groups)
+                .map(|_| {
+                    let mut leaves = vec![worklet.compile(builder)];
+                    leaves.extend(self.attn_all_reduce.as_ref().map(|op| op.compile(builder)));
+                    CostNode::Sum(leaves)
+                })
+                .collect(),
+        };
+        let ranks = (0..dp)
+            .map(|_| {
+                let mut leaves = vec![self.ffn_boundary.compile(builder)];
+                match &self.ffn {
+                    Ffn::Dense(worklet) => leaves.push(worklet.compile(builder)),
+                    Ffn::Moe(block) => {
+                        leaves.push(block.router.compile(builder));
+                        leaves.extend(block.router_select.as_ref().map(|op| op.compile(builder)));
+                        leaves.extend([
+                            block.input_glue.compile(builder),
+                            block.shared_expert.compile(builder),
+                            block.dispatch_quant.compile(builder),
+                        ]);
+                    }
+                }
+                CostNode::Sum(leaves)
+            })
+            .collect();
+        let mut body = vec![
+            CostNode::Labeled {
+                label: format!("{} attention boundary [Max over owner ranks]", self.label),
+                child: Box::new(boundary),
+            },
+            CostNode::Labeled {
+                label: format!(
+                    "{} KDA tensor-parallel over the group [Max over groups; all-gather + \
+                     reduce-scatter priced as one all-reduce of the group's rows]",
+                    self.label
+                ),
+                child: Box::new(kda),
+            },
+            CostNode::Labeled {
+                label: format!("{} [Max over owner ranks: FFN up to the dispatch]", self.label),
+                child: Box::new(CostNode::Max {
+                    overlap: 1.0,
+                    children: ranks,
+                }),
+            },
+        ];
+        if let Ffn::Moe(block) = &self.ffn {
+            body.extend(block.compile_expert_sections(dp, builder));
+        }
+        CostNode::Labeled {
+            label: format!("{} layers {:?}", self.label, self.layers),
+            child: Box::new(CostNode::Scale {
+                n: self.layers.len() as u32,
+                child: Box::new(CostNode::Sum(body)),
+            }),
+        }
+    }
+
     fn eval(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
-        for rank in &batch.ranks {
-            match &self.attn_boundary {
-                Boundary::Fused(op) => push_mhc_fused(op, rank.rows, self.mhc_fuse_fixed_us, ev),
-                boundary => boundary.eval(rank.rows, ev),
+        if batch.kda_only {
+            if let Attention::Kda(worklet) = &self.attn {
+                for rank in &batch.ranks {
+                    self.eval_attn_boundary(rank.rows, ev);
+                }
+                for group in &batch.kda_groups {
+                    worklet.eval(&group.kda, ev);
+                    if let Some(all_reduce) = &self.attn_all_reduce {
+                        all_reduce.eval(group.rows, ev);
+                    }
+                }
+                for rank in &batch.ranks {
+                    self.eval_ffn_local(rank, ev);
+                }
+                if let Ffn::Moe(block) = &self.ffn {
+                    block.eval_expert_sections(batch, ev);
+                }
+                return;
             }
+        }
+        for rank in &batch.ranks {
+            self.eval_attn_boundary(rank.rows, ev);
             match &self.attn {
                 Attention::Kda(worklet) => worklet.eval(&rank.kda, ev),
                 Attention::Dsa(worklet) => worklet.eval(&rank.dsa, ev),
             }
-            push_mhc_fused(&self.ffn_boundary, rank.rows, self.mhc_fuse_fixed_us, ev);
-            match &self.ffn {
-                Ffn::Dense(worklet) => worklet.eval(
-                    &Glm53MlpLocalWorkletInput {
-                        num_tokens: rank.rows,
-                    },
-                    ev,
-                ),
-                Ffn::Moe(block) => block.eval_local(rank.rows, ev),
+            // KDA-only: DSA layers are rank-local and reduce nothing.
+            if !batch.kda_only {
+                if let Some(all_reduce) = &self.attn_all_reduce {
+                    all_reduce.eval(rank.attn_rows, ev);
+                }
             }
+            self.eval_ffn_local(rank, ev);
         }
         if let Ffn::Moe(block) = &self.ffn {
             block.eval_expert_sections(batch, ev);
+        }
+    }
+
+    fn eval_attn_boundary(&self, rows: u32, ev: &mut Evaluator) {
+        match &self.attn_boundary {
+            Boundary::Fused(op) => push_mhc_fused(op, rows, self.mhc_fuse_fixed_us, ev),
+            boundary => boundary.eval(rows, ev),
+        }
+    }
+
+    fn eval_ffn_local(&self, rank: &RankBatch, ev: &mut Evaluator) {
+        push_mhc_fused(&self.ffn_boundary, rank.rows, self.mhc_fuse_fixed_us, ev);
+        match &self.ffn {
+            Ffn::Dense(worklet) => worklet.eval(
+                &Glm53MlpLocalWorkletInput {
+                    num_tokens: rank.rows,
+                },
+                ev,
+            ),
+            Ffn::Moe(block) => block.eval_local(rank.rows, ev),
         }
     }
 }
@@ -533,7 +759,8 @@ impl MoeBlock {
     }
 
     fn eval_expert_sections(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
-        let tokens: Vec<u32> = batch.ranks.iter().map(|rank| rank.rows).collect();
+        // EP source ranks: each rank's own (sequence-parallel) slice.
+        let tokens: Vec<u32> = batch.source_rank_tokens.clone();
         let step = match &self.exchange {
             Exchange::MeasuredAllgather { dispatch, .. } => {
                 dispatch.eval(
@@ -596,6 +823,12 @@ impl MoeBlock {
 pub struct Glm53FlashDpAttnEpModel {
     pub name: String,
     pub dp_size: u16,
+    /// Attention TP inside each attention DP group; 1 is plain DP attention.
+    pub attn_tp: u16,
+    /// `Some(n)` when the attention all-reduce is priced from `n`-GPU rows.
+    attn_all_reduce_row_gpus: Option<u16>,
+    attn_tp_layers: AttnTpLayers,
+    attn_tp_collective: AttnTpCollective,
     pub max_model_len: u32,
     /// Query rows each decode request presents (see `Glm53FlashVllmModel`).
     pub verify_width: u32,
@@ -640,7 +873,21 @@ pub fn build(
     // replicated across ranks, and the block is vLLM's TP1 hybrid block.
     let dsa_layers = model_cfg.num_dsa_layers();
     let kda_layers = model_cfg.kda_layers.len() as u32;
-    let kda_state_bytes = tp_arch::kda_layer_state_bytes_per_request(&resolved.local);
+    // TP1 resolution: the commit is priced per owner rank from it, and under
+    // KDA-only each owner rank holds its own requests' whole KDA state (the
+    // group's ranks hold equal head slices of equal request counts).
+    let mut tp1_cfg = local.clone();
+    tp1_cfg.kda = cfg.kda_tp1.clone();
+    tp1_cfg.kda.decode_query_len = local.kda.decode_query_len;
+    tp1_cfg.kda.ssm_state_dtype = local.kda.ssm_state_dtype;
+    let tp1 = tp_arch::resolve_configs(&tp1_cfg);
+    let kda_only = cfg.parallel.attn_tp_layers == AttnTpLayers::KdaOnly;
+    let layout_tp = if kda_only { 1 } else { cfg.parallel.attn_tp.max(1) };
+    let kda_state_bytes = tp_arch::kda_layer_state_bytes_per_request(if kda_only {
+        &tp1
+    } else {
+        &resolved.local
+    });
     let kv_cache_layout = tp_arch::hybrid_kv_cache_layout(
         model_cfg,
         kda_state_bytes,
@@ -648,7 +895,7 @@ pub fn build(
         kda_layers,
         kda_layers.div_ceil(dsa_layers.max(1)),
         tp_arch::hybrid_block_tokens(kda_state_bytes, u64::from(model_cfg.kv_lora_rank)),
-        1,
+        layout_tp,
     );
     let mut model = Glm53FlashDpAttnEpModel {
         embedding: atomic(
@@ -698,6 +945,10 @@ pub fn build(
         )?,
         dp_size: cfg.parallel.dp_size,
         ep_comm_kind: cfg.parallel.ep_comm.kind,
+        attn_tp: cfg.parallel.attn_tp.max(1),
+        attn_all_reduce_row_gpus: cfg.parallel.attn_all_reduce_row_gpus,
+        attn_tp_layers: cfg.parallel.attn_tp_layers,
+        attn_tp_collective: cfg.parallel.attn_tp_collective,
         max_model_len: cfg.parallel.max_model_len,
         verify_width: tp_arch::verify_width(&cfg.local)?,
         cudagraph_capture_sizes: {
@@ -707,7 +958,7 @@ pub fn build(
             sizes
         },
         kv_cache_layout,
-        kda_commit: tp_arch::kda_commit_plan(&resolved.local),
+        kda_commit: tp_arch::kda_commit_plan(&tp1),
         num_dsa_layers: dsa_layers,
         dsa_latent_bytes_per_token: tp_arch::dsa_layer_latent_bytes_per_token(model_cfg),
         hisparse: None,
@@ -825,11 +1076,21 @@ fn build_group(
             })
         }
     };
+    let tp_layer = cfg.parallel.attn_tp > 1
+        && (cfg.parallel.attn_tp_layers == AttnTpLayers::All || group.attn == AttnKind::Kda);
+    let attn_all_reduce = tp_layer
+        .then(|| tp_arch::TpAllReduce::build(p, "attn_tp_all_reduce", local, bridge))
+        .transpose()?
+        .map(|op| match cfg.parallel.attn_tp_collective {
+            AttnTpCollective::Fast => op,
+            AttnTpCollective::Nccl => op.without_fused(),
+        });
     Ok(LayerGroup {
         label: group.label.clone(),
         layers: group.layers.clone(),
         attn_boundary,
         attn,
+        attn_all_reduce,
         ffn_boundary: atomic(
             p,
             "ffn_mhc_post_pre",
@@ -921,7 +1182,7 @@ impl Glm53FlashDpAttnEpModel {
             u64::from(self.num_dsa_layers) * self.dsa_latent_bytes_per_token,
             0,
             gpus_per_node,
-            1,
+            self.cache_replicas(),
         );
         // In its place each request holds a fixed latent buffer on the GPU.
         self.kv_cache_layout.parts.push(
@@ -929,7 +1190,9 @@ impl Glm53FlashDpAttnEpModel {
                 crate::arch::hisparse::DEVICE_BUFFER_PART,
                 host_offload.device_bytes_per_request,
             )
-            .not_prefix_reusable(),
+            .not_prefix_reusable()
+            // Every rank of an attention TP group attends the whole latent.
+            .replicated(u32::from(self.cache_replicas())),
         );
         self.host_offload = Some(host_offload);
         self.hisparse = Some(config);
@@ -945,8 +1208,39 @@ impl Glm53FlashDpAttnEpModel {
 
     /// The whole forward as one node in `builder`, so a speculative model can
     /// compile it beside its draft stage. [`Self::eval_into`] fills it.
+    fn kda_only(&self) -> bool {
+        self.attn_tp > 1 && self.attn_tp_layers == AttnTpLayers::KdaOnly
+    }
+
+    /// Scheduler / KV partitions: one per rank under KDA-only, else one per
+    /// attention group.
+    fn num_groups(&self) -> u16 {
+        if self.kda_only() {
+            self.dp_size
+        } else {
+            self.dp_size / self.attn_tp
+        }
+    }
+
+    /// GPUs holding a copy of a request's MLA cache.
+    fn cache_replicas(&self) -> u16 {
+        if self.kda_only() {
+            1
+        } else {
+            self.attn_tp
+        }
+    }
+
+    /// Ranks that split one partition's drafts and commit (attention TP over
+    /// a shared partition); 1 when every rank owns its requests.
+    pub(crate) fn partition_ranks(&self) -> u16 {
+        self.dp_size / self.num_groups()
+    }
+
     pub(crate) fn compile_root(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        let dp = usize::from(self.dp_size);
+        // One representative rank per attention DP group: a group's ranks run
+        // the same shapes.
+        let dp = usize::from(self.num_groups());
         let prologue = (0..dp)
             .map(|_| {
                 CostNode::Sum(vec![
@@ -962,8 +1256,9 @@ impl Glm53FlashDpAttnEpModel {
                 children: prologue,
             }),
         }];
+        let kda_groups = usize::from(self.dp_size / self.attn_tp);
         for group in &self.groups {
-            children.push(group.compile(dp, builder));
+            children.push(group.compile(dp, kda_groups, self.kda_only(), builder));
         }
         let epilogue = (0..dp)
             .map(|_| {
@@ -983,14 +1278,28 @@ impl Glm53FlashDpAttnEpModel {
             }),
         });
         if let Some(hisparse) = &self.hisparse {
-            children.push(hisparse.compile(&self.name, self.dp_size, builder));
+            children.push(hisparse.compile(&self.name, self.num_groups(), builder));
         }
         CostNode::Labeled {
             label: format!(
-                "{} (Glm53FlashDpAttnEpModel) [attention DP{}/TP1; MoE EP{} {}; \
+                "{} (Glm53FlashDpAttnEpModel) [attention DP{}/TP{}{}; MoE EP{} {}; \
                  timing_context<={}]",
                 self.name,
-                self.dp_size,
+                self.num_groups(),
+                self.attn_tp,
+                match self.attn_all_reduce_row_gpus {
+                    _ if self.attn_tp == 1 => String::new(),
+                    row_gpus => format!(
+                        " ({}; sequence-parallel FFN/MoE; collective {:?}{})",
+                        if self.kda_only() { "KDA layers only, DSA DP" } else { "KDA and DSA" },
+                        self.attn_tp_collective,
+                        match row_gpus {
+                            Some(gpus) if gpus != self.attn_tp =>
+                                format!(", EXTRAPOLATED from {gpus}-GPU rows"),
+                            _ => String::new(),
+                        }
+                    ),
+                },
                 self.dp_size,
                 match self.ep_comm_kind {
                     EpCommKind::AllgatherReducescatter => "all_gatherv/reduce_scatterv",
@@ -1009,6 +1318,8 @@ impl Glm53FlashDpAttnEpModel {
         let batch = normalize_input(
             input,
             self.dp_size,
+            self.attn_tp,
+            self.kda_only(),
             self.max_model_len,
             self.verify_width,
             &self.cudagraph_capture_sizes,
@@ -1102,6 +1413,8 @@ impl IterwiseUnifiedModel for Glm53FlashDpAttnEpModel {
         normalize_input(
             batch,
             self.dp_size,
+            self.attn_tp,
+            self.kda_only(),
             self.max_model_len,
             self.verify_width,
             &self.cudagraph_capture_sizes,
@@ -1130,7 +1443,7 @@ impl IterwiseUnifiedModel for Glm53FlashDpAttnEpModel {
     }
 
     fn num_attn_dp_groups(&self) -> u16 {
-        self.dp_size
+        self.num_groups()
     }
 
     fn cost_log_manifest(&self) -> CostManifest {
@@ -1165,17 +1478,36 @@ impl IterwiseUnifiedModel for Glm53FlashDpAttnEpModel {
 
 /// One DP rank's view of an iteration.
 struct RankBatch {
-    /// Rows every kernel outside attention runs on: the scheduled tokens, the
-    /// one-token dummy batch of an idle rank, or the common graph size.
+    /// Rows every kernel outside attention runs on, on one rank: the
+    /// scheduled tokens, the one-token dummy batch of an idle rank, or the
+    /// common graph size; under attention TP the rank's sequence-parallel
+    /// slice of them.
     rows: u32,
+    /// Rows the group's attention runs on (each rank, heads split): `rows`
+    /// before the sequence-parallel slice.
+    attn_rows: u32,
     /// lm_head rows: one per scheduled request (none for a dummy batch).
     logits_rows: u32,
     kda: Glm53KdaAttnLocalWorkletInput,
     dsa: Glm53DsaAttnLocalWorkletInput,
 }
 
+/// One KDA tensor-parallel group's view under KDA-only attention TP.
+struct KdaGroupBatch {
+    /// The group's rows, all-gathered for KDA.
+    rows: u32,
+    kda: Glm53KdaAttnLocalWorkletInput,
+}
+
 struct NormalizedBatch {
+    /// One per partition: a representative rank per attention DP group, or
+    /// every owner rank under KDA-only.
     ranks: Vec<RankBatch>,
+    /// KDA-only: the KDA groups, `attn_tp` ranks each.
+    kda_groups: Vec<KdaGroupBatch>,
+    kda_only: bool,
+    /// Tokens each of the `dp_size` EP source ranks dispatches.
+    source_rank_tokens: Vec<u32>,
     /// Rows every EP rank's fused MoE reads after the all-gather.
     gathered_tokens: u32,
 }
@@ -1183,18 +1515,26 @@ struct NormalizedBatch {
 fn normalize_input(
     input: &UnifiedArchInput,
     dp_size: u16,
+    attn_tp: u16,
+    kda_only: bool,
     max_model_len: u32,
     verify_width: u32,
     sorted_capture_sizes: &[u32],
 ) -> std::result::Result<NormalizedBatch, String> {
-    let dp = usize::from(dp_size);
+    let dp = usize::from(if kda_only { dp_size } else { dp_size / attn_tp });
     if input.groups.len() != dp {
         return Err(format!(
             "expected {dp} attention-DP groups, got {}",
             input.groups.len()
         ));
     }
-    if input.tokens_per_source_rank.len() != dp {
+    // A single attention group's worker sends no per-source-rank counts.
+    let source_counts = if dp == 1 && input.tokens_per_source_rank.is_empty() {
+        vec![input.groups[0].batch_tokens]
+    } else {
+        input.tokens_per_source_rank.clone()
+    };
+    if source_counts.len() != dp {
         return Err(format!(
             "expected {dp} EP source-rank token counts, got {}",
             input.tokens_per_source_rank.len()
@@ -1245,11 +1585,11 @@ fn normalize_input(
             ));
         }
         let total = prefill_tokens + decode_tokens;
-        if group.batch_tokens != total || input.tokens_per_source_rank[rank] != total {
+        if group.batch_tokens != total || source_counts[rank] != total {
             return Err(format!(
                 "rank {rank} batch_tokens {} and source-rank tokens {} must equal \
                  prefill+decode {total}",
-                group.batch_tokens, input.tokens_per_source_rank[rank]
+                group.batch_tokens, source_counts[rank]
             ));
         }
         let (kda, dsa) = if total == 0 {
@@ -1269,6 +1609,7 @@ fn normalize_input(
         };
         ranks.push(RankBatch {
             rows: total.max(verify_width),
+            attn_rows: 0,
             logits_rows: group.request_count(),
             kda,
             dsa,
@@ -1288,12 +1629,61 @@ fn normalize_input(
         let padded = graph_padded_tokens(sorted_capture_sizes, busiest);
         ranks.iter_mut().for_each(|rank| rank.rows = padded);
     }
-    let gathered_tokens = ranks
+    if kda_only {
+        // Every rank owns its rows; each group's KDA runs on its ranks' rows
+        // and requests together.
+        let tp = usize::from(attn_tp);
+        let kda_groups = ranks
+            .chunks(tp)
+            .map(|members| KdaGroupBatch {
+                rows: members.iter().map(|rank| rank.rows).sum(),
+                kda: Glm53KdaAttnLocalWorkletInput {
+                    prefill_sequence_lengths: members
+                        .iter()
+                        .flat_map(|rank| rank.kda.prefill_sequence_lengths.iter().copied())
+                        .collect(),
+                    decode_batch_size: members.iter().map(|rank| rank.kda.decode_batch_size).sum(),
+                },
+            })
+            .collect();
+        for rank in &mut ranks {
+            rank.attn_rows = rank.rows;
+        }
+        let source_rank_tokens: Vec<u32> = ranks.iter().map(|rank| rank.rows).collect();
+        let gathered_tokens = source_rank_tokens
+            .iter()
+            .try_fold(0_u32, |sum, &rows| sum.checked_add(rows))
+            .ok_or("gathered token sum overflows u32")?;
+        return Ok(NormalizedBatch {
+            ranks,
+            kda_groups,
+            kda_only: true,
+            source_rank_tokens,
+            gathered_tokens,
+        });
+    }
+    // Sequence-parallel slice: each of a group's `attn_tp` ranks owns
+    // ceil(rows / attn_tp) rows outside attention (the busiest rank's share)
+    // and one lm_head row per owned request.
+    let tp = u32::from(attn_tp);
+    for rank in &mut ranks {
+        rank.attn_rows = rank.rows;
+        rank.rows = rank.rows.div_ceil(tp);
+        rank.logits_rows = rank.logits_rows.div_ceil(tp);
+    }
+    let source_rank_tokens: Vec<u32> = ranks
         .iter()
-        .try_fold(0_u32, |sum, rank| sum.checked_add(rank.rows))
+        .flat_map(|rank| std::iter::repeat_n(rank.rows, usize::from(attn_tp)))
+        .collect();
+    let gathered_tokens = source_rank_tokens
+        .iter()
+        .try_fold(0_u32, |sum, &rows| sum.checked_add(rows))
         .ok_or("gathered token sum overflows u32")?;
     Ok(NormalizedBatch {
         ranks,
+        kda_groups: Vec::new(),
+        kda_only: false,
+        source_rank_tokens,
         gathered_tokens,
     })
 }
@@ -1333,6 +1723,10 @@ mod tests {
             kernel_path: Default::default(),
             ep_comm: EpCommConfig::default(),
             mhc_fuse_fixed_us: None,
+            attn_tp: 1,
+            attn_all_reduce_row_gpus: None,
+            attn_tp_layers: Default::default(),
+            attn_tp_collective: Default::default(),
         }
     }
 
@@ -1659,6 +2053,8 @@ mod tests {
                 prefill(0, 100),
             ]),
             4,
+            1,
+            false,
             131072,
             1,
             &[],
@@ -1683,6 +2079,8 @@ mod tests {
                 prefill(0, 1),
             ]),
             4,
+            1,
+            false,
             131072,
             1,
             &sizes,
@@ -1699,6 +2097,8 @@ mod tests {
                 prefill(0, 1),
             ]),
             4,
+            1,
+            false,
             131072,
             1,
             &sizes,
@@ -1706,6 +2106,43 @@ mod tests {
         .unwrap();
         let rows: Vec<_> = eager.ranks.iter().map(|rank| rank.rows).collect();
         assert_eq!(rows, [3, 40, 1, 1]);
+    }
+
+    #[test]
+    fn attention_tp_all_slices_group_rows_over_its_ranks() {
+        // DP2 x TP2 over 4 ranks: one input group per TP group; every rank
+        // runs the group's attention rows and a ceil(rows/2) FFN slice.
+        let batch =
+            normalize_input(&input(vec![prefill(0, 101), prefill(0, 8)]), 4, 2, false, 131072, 1, &[])
+                .unwrap();
+        assert!(!batch.kda_only);
+        let attn: Vec<_> = batch.ranks.iter().map(|rank| rank.attn_rows).collect();
+        let rows: Vec<_> = batch.ranks.iter().map(|rank| rank.rows).collect();
+        assert_eq!(attn, [101, 8]);
+        assert_eq!(rows, [51, 4]);
+        assert!(batch.kda_groups.is_empty());
+    }
+
+    #[test]
+    fn attention_tp_kda_only_keeps_dp_ranks_and_merges_kda_groups() {
+        // KDA-only TP2 over 4 ranks: four DP partitions (DSA stays on the owner
+        // rank) and two KDA groups of two ranks each.
+        let batch = normalize_input(
+            &input(vec![prefill(0, 10), prefill(0, 20), prefill(0, 30), prefill(0, 40)]),
+            4,
+            2,
+            true,
+            131072,
+            1,
+            &[],
+        )
+        .unwrap();
+        assert!(batch.kda_only);
+        let rows: Vec<_> = batch.ranks.iter().map(|rank| rank.rows).collect();
+        assert_eq!(rows, [10, 20, 30, 40]);
+        let kda: Vec<_> = batch.kda_groups.iter().map(|group| group.rows).collect();
+        assert_eq!(kda, [30, 70]);
+        assert_eq!(batch.gathered_tokens, 100);
     }
 
     #[test]
@@ -1717,18 +2154,18 @@ mod tests {
             prefill(0, 8),
         ]);
         bad.tokens_per_source_rank[1] = 7;
-        assert!(normalize_input(&bad, 4, 131072, 1, &[]).is_err());
+        assert!(normalize_input(&bad, 4, 1, false, 131072, 1, &[]).is_err());
         let empty = input(vec![ArchGroupInput::default(); 4]);
-        assert!(normalize_input(&empty, 4, 131072, 1, &[]).is_err());
+        assert!(normalize_input(&empty, 4, 1, false, 131072, 1, &[]).is_err());
         let three = input(vec![prefill(0, 8); 3]);
-        assert!(normalize_input(&three, 4, 131072, 1, &[]).is_err());
+        assert!(normalize_input(&three, 4, 1, false, 131072, 1, &[]).is_err());
         let long = input(vec![
             prefill(131000, 100),
             prefill(0, 8),
             prefill(0, 8),
             prefill(0, 8),
         ]);
-        assert!(normalize_input(&long, 4, 131072, 1, &[]).is_err());
+        assert!(normalize_input(&long, 4, 1, false, 131072, 1, &[]).is_err());
     }
 
     fn exchange(dp_size: u16, kind: EpCommKind, model: EpCommModel) -> Glm53FlashDpAttnEpParallel {

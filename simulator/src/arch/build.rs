@@ -2036,6 +2036,10 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     hisparse: Option<&HisparseConfig>,
     ep_comm: &EpCommConfig,
     mhc_fuse_fixed_us: Option<f64>,
+    attn_tp: u16,
+    attn_all_reduce_row_gpus: Option<u16>,
+    attn_tp_layers: glm53_flash_vllm_fp8_dp_attn_ep_moe::AttnTpLayers,
+    attn_tp_collective: glm53_flash_vllm_fp8_dp_attn_ep_moe::AttnTpCollective,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -2066,6 +2070,10 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         kernel_path,
         ep_comm: ep_comm.clone(),
         mhc_fuse_fixed_us,
+        attn_tp,
+        attn_all_reduce_row_gpus,
+        attn_tp_layers,
+        attn_tp_collective,
     };
     let mut configs =
         glm53_flash_vllm_fp8_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
@@ -2073,6 +2081,8 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     configs.local.dsa.decode_next_n = verify_width;
     configs.local.kda.decode_query_len = verify_width;
     configs.local.kda.ssm_state_dtype = kda_state_dtype;
+    configs.kda_tp1.decode_query_len = verify_width;
+    configs.kda_tp1.ssm_state_dtype = kda_state_dtype;
     let resolved = glm53_flash_vllm_fp8_dp_attn_ep_moe::resolve_configs(&configs);
     let model = glm53_flash_vllm_fp8_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
         .context("building GLM-5.3-Flash DP-attention/EP model (often a missing profile.db row)")?;
@@ -2345,6 +2355,10 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         cudagraph_capture_sizes,
         draft_tokens,
         kda_state_dtype,
+        attn_tp,
+        attn_all_reduce_row_gpus,
+        attn_tp_layers,
+        attn_tp_collective,
         ..
     } = sel
     else {
@@ -2366,6 +2380,10 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         sel.hisparse().as_ref(),
         &sel.ep_comm(),
         sel.mhc_fuse_fixed_us(),
+        *attn_tp,
+        *attn_all_reduce_row_gpus,
+        *attn_tp_layers,
+        *attn_tp_collective,
         gpu,
         name,
         bridge,
@@ -3146,6 +3164,10 @@ pub fn build_iter_model(
             sel.hisparse().as_ref(),
             &sel.ep_comm(),
         sel.mhc_fuse_fixed_us(),
+            1,
+            None,
+            Default::default(),
+            Default::default(),
             gpu,
             name,
             bridge,

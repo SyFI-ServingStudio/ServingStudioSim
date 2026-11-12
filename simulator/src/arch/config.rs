@@ -159,6 +159,13 @@ const fn default_glm52_nvfp4_max_model_len() -> u32 {
 }
 
 /// The captured GLM-5.3-Flash deployment's `--max-model-len`.
+const ATTN_TP_LAYERS: &[&str] = &["all", "kda_only"];
+const ATTN_TP_COLLECTIVES: &[&str] = &["fast", "nccl"];
+
+const fn default_attn_tp() -> u16 {
+    1
+}
+
 const fn default_glm53_flash_max_model_len() -> u32 {
     8192
 }
@@ -1526,6 +1533,27 @@ pub enum IterArchSel {
         #[serde(default = "default_glm52_nvfp4_parallel_size")]
         #[param(default = 4, cache_key)]
         ep_size: u16,
+        /// Attention TP inside each attention DP group (`ep_size / attn_tp`
+        /// groups; heads split, FFN/MoE sequence-parallel; see
+        /// `glm53_flash_vllm_fp8_dp_attn_ep_moe`). 1 is plain DP attention.
+        #[serde(default = "default_attn_tp")]
+        #[param(default = 1, cache_key)]
+        attn_tp: u16,
+        /// Price the attention-TP all-reduce from rows measured at this GPU
+        /// count (a labeled stand-in while `attn_tp` rows are missing).
+        #[serde(default)]
+        #[param(cache_key)]
+        attn_all_reduce_row_gpus: Option<u16>,
+        /// `all` (KDA and DSA at `attn_tp`; MLA cache replicated over the
+        /// group) or `kda_only` (DSA stays DP on each request's owner rank).
+        #[serde(default)]
+        #[param(string, default = "all", choices = ATTN_TP_LAYERS, cache_key)]
+        attn_tp_layers: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::AttnTpLayers,
+        /// Attention-TP collective pricing: `fast` (FlashInfer MNNVL, else the
+        /// faster of NCCL / NVSHMEM) or `nccl`.
+        #[serde(default)]
+        #[param(string, default = "fast", choices = ATTN_TP_COLLECTIVES, cache_key)]
+        attn_tp_collective: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::AttnTpCollective,
         #[serde(default = "default_glm53_flash_max_model_len")]
         #[param(default = 8192, cache_key)]
         max_model_len: u32,
