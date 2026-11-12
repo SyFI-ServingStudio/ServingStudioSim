@@ -5,8 +5,9 @@
 #
 # Pricing per step (实测 = profile.db row, 拟合 = fit to measured rows, 外推 = beyond any row):
 #   attention DP8; KDA layers TP over kda_tp_gpus GPUs, DSA on the owner rank      实测
-#   KDA all-reduce over the group: fastest of MNNVL (vLLM budget), MNNVL two-shot
-#     with the workspace sized to the call (not vLLM dispatch), NCCL, NVSHMEM      实测 (unbudgeted rows 16..256 rows/rank, longer calls 外推)
+#   KDA input all-gather + output reduce-scatter over the group (fixed-pattern MNNVL):
+#     reduce-scatter                                                                实测 (8-GPU mnnvl_pull rows; b<8 at byte-matched counts)
+#     all-gather                                                                    stand-in (the reduce-scatter row)
 #   KDA f_b/g_b as one batched GEMM                                                 实测
 #   mHC post/pre boundaries: vLLM's kernels, unfused                               实测
 #   MoE EP8 routed experts, dispatch activation quant, router top-k select          实测
@@ -21,9 +22,9 @@
 # HiSparse (SGLang's DSA latent offload, arch::hisparse; its host -> device miss copy is an
 # analytic model, 外推) at the high-load points, 3 drafted tokens.
 #
-# kda_tp_gpus is static per deployment, so each load point sets it: the 2026-11-12 sweep
-# (logs/20261112_4_flash_all_stacked_refit) picked 8 GPUs at 1-32 concurrent requests, 4 at
-# 64-128, and 1 (off) from 256 up.
+# kda_tp_gpus is static per deployment, so each load point sets it: the 2026-11-12 sweep with the
+# KDA pair priced as all-gather + reduce-scatter (logs/20261112_6_kda_tp_agrs) picked 8 GPUs at
+# 1-32 concurrent requests, 4 at 64, and 1 (off) from 128 up.
 #
 # The trace is not in the repo (79 MB / 55 MB). Link it from the study that made it:
 #   ln -s <workspace>/wt-glm53-decode-investigate/logs/20261011_13_flash_dflash2_k_sweep_long/traces/reported_600k_decode_k7.csv \
