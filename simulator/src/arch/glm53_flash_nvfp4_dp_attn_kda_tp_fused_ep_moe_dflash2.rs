@@ -39,7 +39,11 @@
 //!   values, each owner reading its peers' fabric-mapped buffers.
 //! * **f_b / g_b merged.** Each KDA layer runs its two low-rank gate
 //!   up-projections as one batched GEMM (`kda_gate_b_merged`).
-//! * **Expert exchange.** `ep_comm: fused_allgather` on MNNVL: each rank writes
+//! * **Expert exchange.** `expert_exchange` ([`ExpertExchange`]): `fixed_measured`
+//!   (default) is the fixed-pattern MNNVL exchange as measured (quantized
+//!   all-gather dispatch + push reduce-scatter combine, each its own launch,
+//!   dispatch quant separate); `fused_fit` is the design below, priced by the
+//!   analytic fit. `fused_fit`: `ep_comm: fused_allgather` on MNNVL: each rank writes
 //!   its NVFP4 rows (activations, block scales, top-k ids and weights) into
 //!   every peer's memory in one fixed-pattern store, the experts run, and the
 //!   bf16 partial sums go back by a reduce-scatter that each owner sums. The
@@ -68,27 +72,22 @@
 //! | KDA kernels and projections at TP `b` | 实测 (TP-`b` rows) |
 //! | f_b / g_b batched GEMM | 实测 (`batched_gemm` `torch_bmm_packed_lhs`) |
 //! | DSA, dense FFN, shared expert, router gate (GateLinear), mHC pre/post (TileLang) | 实测 |
-//! | KDA output reduce-scatter | 实测 at 8 GPUs (`moe_ep_reduce_scatter` `mnnvl_pull` rows); `b < 8` reads them at the per-rank counts that receive the same bytes, keeping the 8-peer fixed cost (over-prices) |
-//! | KDA input all-gather | stand-in: the reduce-scatter row at the same counts (same bytes received plus an fp32 sum; not measured on its own) |
+//! | KDA output reduce-scatter | 实测 at the group size `b` (`moe_ep_reduce_scatter`, faster of `mnnvl_lamport` push and `mnnvl_pull`) |
+//! | KDA input all-gather | 实测 at `b` = 2, 4 (`row_all_gather`, faster of push and pull); `b = 8` stand-in: the reduce-scatter row at the same counts (no 8-GPU all-gather rows yet) |
 //! | routed experts (`nvfp4_fused_moe`, routing precomputed) | 实测 |
 //! | dispatch activation quant, router top-k select | 实测 (elementwise rows) |
-//! | exchange dispatch and combine: per-row and link cost | 拟合 (`arch::ep_comm` B200 EP8 `moe_alltoall` fit: c 3.86 GB/s, p 2.63 ns, L 605 GB/s, w 0.9) |
-//! | exchange dispatch and combine: fixed cost per leg | 外推: 0 us (the fusion; the fit's unfused `a` is 4.11 us per leg). Optimistic, not conservative |
-//! | combine owner sum of the partials | 外推: 0 us (assumed inside the next op; the unfused exchanges bill it as an elementwise row) |
+//! | exchange, `fixed_measured` (default): dispatch + combine | 实测 (`moe_ep_quantized_all_gather` / `moe_ep_reduce_scatter` `mnnvl_lamport`, B200 EP8, Slurm 21248) |
+//! | exchange, `fused_fit`: dispatch and combine per-row and link cost | 拟合 (`arch::ep_comm` B200 EP8 `moe_alltoall` fit: c 3.86 GB/s, p 2.63 ns, L 605 GB/s, w 0.9) |
+//! | exchange, `fused_fit`: fixed cost per leg | 外推: 0 us (the fusion; the fit's unfused `a` is 4.11 us per leg). Optimistic, not conservative |
+//! | combine owner sum of the partials (`fused_fit`) | 外推: 0 us (assumed inside the next op; the unfused exchanges bill it as an elementwise row) |
 //! | DFlash2 draft (TP1 per rank) | 实测 |
 //! | HiSparse host -> device miss copy (HiSparse presets only) | 外推 (`arch::hisparse` analytic model) |
 //!
 //! # Hooks for work in flight (not merged here)
 //!
-//! * **Measured fixed-pattern exchange** (branch `flash-exchange-kernel`):
-//!   its `ep_comm_model: measured` prices `fused_allgather` from
-//!   `moe_ep_quantize_and_all_gather` (`mnnvl_lamport`, quant folded in) and
-//!   `moe_ep_reduce_scatter` (`mnnvl_pull`) rows at EP8. Once merged, set
-//!   `ep_comm_model` in [`target_selector`] to `Measured` and move the two
-//!   exchange rows above to 实测; no new param.
-//! * **Measured KDA all-gather.** The all-gather leg reads the reduce-scatter
-//!   row as a stand-in. A bf16 fixed-pattern all-gather row (and rows at 2
-//!   and 4 GPUs) would replace it inside
+//! * **Measured KDA all-gather at 8 GPUs.** At `b = 8` the all-gather leg
+//!   still reads the reduce-scatter row as a stand-in; 8-GPU `row_all_gather`
+//!   rows replace it inside
 //!   `glm53_flash_vllm_fp8_dp_attn_ep_moe::KdaGatherScatter`; no new param.
 //! * **One-launch mHC rows** (worktree `wt-flash-mhc-fuse`): the
 //!   `cuda_one_launch` rows behind `mhc_boundary: fused_rows` are in this
@@ -142,6 +141,24 @@ pub enum KdaTpCommPricing {
 /// The `kda_tp_comm_pricing` choices the launcher schema advertises.
 pub const KDA_TP_COMM_PRICINGS: [&str; 2] = ["gather_scatter", "all_reduce"];
 
+/// How the expert exchange is priced (`expert_exchange`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpertExchange {
+    /// The fixed-pattern MNNVL exchange as measured: quantized all-gather
+    /// dispatch and reduce-scatter combine, each its own launch
+    /// (`fast_allgather`, `ep_comm_model: measured`; dispatch quant separate).
+    #[default]
+    FixedMeasured,
+    /// The fused exchange (dispatch inside the quant kernel, combine inside
+    /// the next op): the analytic link fit with 0 fixed cost per leg. No
+    /// kernel; optimistic.
+    FusedFit,
+}
+
+/// The `expert_exchange` choices the launcher schema advertises.
+pub const EXPERT_EXCHANGES: [&str; 2] = ["fixed_measured", "fused_fit"];
+
 /// `sel` (this tag) as the `glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2`
 /// selector it fixes (module doc).
 pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
@@ -162,6 +179,7 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         mhc_boundary,
         mhc_fused_saving_us,
         kda_tp_comm_pricing,
+        expert_exchange,
         router_gate_once,
         hisparse_buffer_tokens,
         hisparse_top_k,
@@ -186,6 +204,10 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
             bail!("{ARCH_TAG}: mhc_boundary fused_less_saving needs mhc_fused_saving_us >= 0")
         }
         (_, Some(_)) => bail!("{ARCH_TAG}: mhc_fused_saving_us is for mhc_boundary fused_less_saving"),
+    };
+    let (ep_comm, ep_comm_model) = match expert_exchange {
+        ExpertExchange::FixedMeasured => (EpCommKind::FastAllgather, EpCommModel::Measured),
+        ExpertExchange::FusedFit => (EpCommKind::FusedAllgather, EpCommModel::Analytic),
     };
     let attn_tp_collective = match kda_tp_comm_pricing {
         KdaTpCommPricing::GatherScatter => AttnTpCollective::FixedGatherScatter,
@@ -216,9 +238,8 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         hisparse_h2d_gb_per_s: *hisparse_h2d_gb_per_s,
         hisparse_exposed_io_fraction: *hisparse_exposed_io_fraction,
         hisparse_intra_step_overlap: *hisparse_intra_step_overlap,
-        ep_comm: EpCommKind::FusedAllgather,
-        // Hook: `Measured` once the fixed-pattern exchange rows merge.
-        ep_comm_model: EpCommModel::Analytic,
+        ep_comm,
+        ep_comm_model,
         ep_link_gb_per_s: None,
         ep_comm_latency_us: None,
         ep_comm_latency_scale: None,
@@ -260,7 +281,8 @@ mod tests {
 
     /// Catches the tag drifting from the knob-by-knob selector the design was
     /// measured with (logs/20261112_6_kda_tp_agrs strategies G5_ko*_gbm, and
-    /// N5_gbm at b = 1): the two must compile the same slots.
+    /// N5_gbm at b = 1, with the exchange now the measured fixed-pattern one;
+    /// logs/20261113_5_k1_measured kfull): the two must compile the same slots.
     #[test]
     fn the_tag_builds_the_knob_by_knob_selector() {
         let bridge = PerfApiBridge::new_uninit_for_test();
@@ -276,8 +298,8 @@ mod tests {
                 "routing": "uniform",
                 "mla_layout_copies": false,
                 "kda_state_dtype": "bf16",
-                "ep_comm": "fused_allgather",
-                "ep_comm_model": "analytic",
+                "ep_comm": "fast_allgather",
+                "ep_comm_model": "measured",
                 "ep_fast_backend": "mnnvl",
                 "ep_fast_combine": "reduce_scatter",
                 "attn_tp": b,
@@ -348,5 +370,8 @@ mod tests {
         assert!(rows.contains("mhc_fuse_fixed_us: None") && rows.contains("mhc_one_launch: true"));
         let ar = target(serde_json::json!({"kda_tp_comm_pricing": "all_reduce"}));
         assert!(ar.contains("attn_tp_collective: FastUnbudgeted"));
+        assert!(default.contains("ep_comm: FastAllgather") && default.contains("ep_comm_model: Measured"));
+        let fit = target(serde_json::json!({"expert_exchange": "fused_fit"}));
+        assert!(fit.contains("ep_comm: FusedAllgather") && fit.contains("ep_comm_model: Analytic"));
     }
 }

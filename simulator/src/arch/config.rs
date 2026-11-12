@@ -1816,6 +1816,11 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "gather_scatter", choices = crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::KDA_TP_COMM_PRICINGS, cache_key)]
         kda_tp_comm_pricing: crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::KdaTpCommPricing,
+        /// How the expert exchange is priced
+        /// ([`crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::ExpertExchange`]).
+        #[serde(default)]
+        #[param(string, default = "fixed_measured", choices = crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::EXPERT_EXCHANGES, cache_key)]
+        expert_exchange: crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::ExpertExchange,
         /// Compute the MoE router gate once per layer (the vLLM fork since
         /// #55736; the default here) instead of twice.
         #[serde(default = "default_kda_tp_fused_router_gate_once")]
