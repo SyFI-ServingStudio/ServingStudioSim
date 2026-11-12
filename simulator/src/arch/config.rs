@@ -782,7 +782,7 @@ pub enum IterArchSel {
         #[param(string, default = "measured", choices = EP_COMM_MODELS, cache_key)]
         ep_comm_model: EpCommModel,
         /// Analytic: effective per-direction NVLink GB/s per GPU (default 620
-        /// for the all-gather / reduce-scatter, 638 for the all-to-all).
+        /// for the all-gather / reduce-scatter, 605 for the all-to-all).
         #[serde(default)]
         #[param(cache_key)]
         ep_link_gb_per_s: Option<f64>,
@@ -794,7 +794,7 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         ep_comm_latency_scale: Option<f64>,
-        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.9).
+        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.6).
         #[serde(default)]
         #[param(cache_key)]
         ep_prepare_latency_us: Option<f64>,
@@ -1028,7 +1028,7 @@ pub enum IterArchSel {
         #[param(string, default = "measured", choices = EP_COMM_MODELS, cache_key)]
         ep_comm_model: EpCommModel,
         /// Analytic: effective per-direction NVLink GB/s per GPU (default 620
-        /// for the all-gather / reduce-scatter, 638 for the all-to-all).
+        /// for the all-gather / reduce-scatter, 605 for the all-to-all).
         #[serde(default)]
         #[param(cache_key)]
         ep_link_gb_per_s: Option<f64>,
@@ -1040,7 +1040,7 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         ep_comm_latency_scale: Option<f64>,
-        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.9).
+        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.6).
         #[serde(default)]
         #[param(cache_key)]
         ep_prepare_latency_us: Option<f64>,
@@ -1420,7 +1420,7 @@ pub enum IterArchSel {
         #[param(string, default = "measured", choices = EP_COMM_MODELS, cache_key)]
         ep_comm_model: EpCommModel,
         /// Analytic: effective per-direction NVLink GB/s per GPU (default 620
-        /// for the all-gather / reduce-scatter, 638 for the all-to-all).
+        /// for the all-gather / reduce-scatter, 605 for the all-to-all).
         #[serde(default)]
         #[param(cache_key)]
         ep_link_gb_per_s: Option<f64>,
@@ -1432,7 +1432,7 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         ep_comm_latency_scale: Option<f64>,
-        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.9).
+        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.6).
         #[serde(default)]
         #[param(cache_key)]
         ep_prepare_latency_us: Option<f64>,
@@ -1640,7 +1640,7 @@ pub enum IterArchSel {
         #[param(string, default = "measured", choices = EP_COMM_MODELS, cache_key)]
         ep_comm_model: EpCommModel,
         /// Analytic: effective per-direction NVLink GB/s per GPU (default 620
-        /// for the all-gather / reduce-scatter, 638 for the all-to-all).
+        /// for the all-gather / reduce-scatter, 605 for the all-to-all).
         #[serde(default)]
         #[param(cache_key)]
         ep_link_gb_per_s: Option<f64>,
@@ -1652,7 +1652,7 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         ep_comm_latency_scale: Option<f64>,
-        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.9).
+        /// Analytic all-to-all: the prepare's fixed us at EP8 (default 21.6).
         #[serde(default)]
         #[param(cache_key)]
         ep_prepare_latency_us: Option<f64>,

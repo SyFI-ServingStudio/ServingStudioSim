@@ -70,19 +70,29 @@
 //!
 //! ## Calibration caveat
 //!
-//! The all-to-all constants are a fit to the B200 EP8 `flashinfer_mnnvl`
-//! rows profiled 2026-10-11 (`moe_alltoall`: 705 rows over 3,072-, 384- and
-//! 12,288-byte rows, send x recv 1..65,536; `moe_alltoall_prepare`: 68 rows,
-//! 1..65,536 tokens per rank; graph replay). The transfer fit is relative
-//! least squares over the 3 x 105 shapes with both sides >= 8 rows and within
-//! 2x of each other, the shapes this model produces: rms 4.2 / 3.9 / 4.2%,
-//! worst 16 / 13 / 19% (3,072 / 384 / 12,288 bytes); on the send = recv
-//! diagonal it reads 0-10% low, mostly 1-5%. Off the band it overprices
-//! receive-heavy shapes (4-8x more received than sent: up to +25..+50% at a
-//! few hundred to a few thousand rows), and at 1-4 rows it reads 4.2-7.3 us
-//! against 3.0-4.3 us measured (not every peer is reached). The prepare is
-//! the B200 EP8 intercept and slope over all 68 rows (rms 3.7%, worst +11% at
-//! 1 token).
+//! The all-to-all constants are a fit to the B200 EP8 rows of both backends
+//! of the same `moe_comm` kernel: `flashinfer_mnnvl` (FlashInfer 0.6,
+//! 2026-10-11; 705 rows over 384-, 3,072- and 12,288-byte rows at 256 slots)
+//! and `flashinfer_nvlink_two_sided` (FlashInfer 0.7 `moe_ep`, 2026-11-12;
+//! 256-, 2,048-, 2,368- and 8,192-byte rows at 288 slots, plus 54 repeats of
+//! the old shapes, which read 0.7-1.0% slower at the median); send x recv
+//! 1..65,536; `moe_alltoall_prepare`: 147 rows, 1..65,536 tokens per rank;
+//! graph replay. The transfer fit is relative least squares over the 546
+//! shapes with both sides >= 8 rows and within 2x of each other, the shapes
+//! this model produces. Per row width (median / worst): 256 B +1.7 / +14%,
+//! 384 B +1.4 / +16%, 2,048 B -17.5 / -25%, 2,368 B -13.8 / -16%, 3,072 B
+//! +4.8 / +21%, 8,192 B -2.0 / +18%, 12,288 B +3.4 / +24%. The 2,048- and
+//! 2,368-byte rows read low because the measured per-row cost is not smooth
+//! in the row width: 2,048-, 2,368- and 3,072-byte rows all cost ~5.5 ns a
+//! row at large counts, which `hypot(p, B / L)` cannot follow; the
+//! fast exchange's 2,368-byte dispatch reads 8-16% low and its 8,192-byte
+//! combine 3.5-10% low on the send = recv diagonal. Off the band it
+//! overprices receive-heavy shapes (4-8x more received than sent: up to
+//! +25..+55% at a few hundred to a few thousand rows), and at 1-4 rows it
+//! reads 4.2-7.3 us against 3.0-4.3 us measured (not every peer is reached).
+//! At 2 and 4 GPUs (8,192-byte rows, 32..1,024 rows) the EP8 constants read
+//! +8 / +2% at the median. The prepare is the B200 EP8 intercept and slope
+//! over all 147 rows (rms 3.9%, worst +11% at 1 token).
 //! Applying them past EP8 assumes the per-call cost stays flat in the peer
 //! count and the link and per-row costs do not change on NVL72's
 //! inter-tray NVLink; the prepare's peer scaling is an assumption. The
@@ -104,26 +114,26 @@ pub const EP_COMM_ANALYTIC_KIND: &str = "ep_comm_analytic";
 /// all-gather / reduce-scatter: NVLink5 900 GB/s times the MNNVL all-to-all
 /// efficiency measured on H200 (0.69).
 pub const DEFAULT_LINK_GB_PER_S: f64 = 620.0;
-/// The all-to-all's link `L`: B200 EP8 `moe_alltoall` fit (2026-10-11; the
-/// 12,288-byte combine tops out at ~625 GB/s).
-pub const DEFAULT_A2A_LINK_GB_PER_S: f64 = 638.0;
+/// The all-to-all's link `L`: B200 EP8 `moe_alltoall` fit (2026-11-12; the
+/// 12,288-byte combine tops out at ~625 GB/s, the 8,192-byte one at ~580).
+pub const DEFAULT_A2A_LINK_GB_PER_S: f64 = 605.0;
 /// One `moe_comm` call's fixed cost `a`: B200 EP8 `moe_alltoall` fit
-/// (2026-10-11; floors of 4.5 / 5.0 / 7.4 us at 8..128 rows of 384 / 3,072 /
+/// (2026-11-12; floors of 4.5 / 5.0 / 7.4 us at 8..128 rows of 384 / 3,072 /
 /// 12,288 bytes).
 pub const DEFAULT_A2A_LATENCY_US: f64 = 4.11;
-/// The all-to-all's one-row floor `c`, GB/s (B200 EP8 fit, 2026-10-11).
-const A2A_ROW_FLOOR_GB_PER_S: f64 = 3.81;
-/// The all-to-all's per-row issue cost `p`, us (B200 EP8 fit, 2026-10-11:
-/// 2.55 ns; the 384-byte scales run at ~2.75 ns per row at 64k rows).
-const A2A_PER_ROW_US: f64 = 0.002_55;
+/// The all-to-all's one-row floor `c`, GB/s (B200 EP8 fit, 2026-11-12).
+const A2A_ROW_FLOOR_GB_PER_S: f64 = 3.86;
+/// The all-to-all's per-row issue cost `p`, us (B200 EP8 fit, 2026-11-12:
+/// 2.63 ns; the 256- and 384-byte scales run at ~2.7 ns per row at 64k rows).
+const A2A_PER_ROW_US: f64 = 0.002_63;
 /// Weight `w` of a received row against a sent one (B200 EP8 fit,
-/// 2026-10-11).
+/// 2026-11-12).
 const A2A_RECV_ROW_WEIGHT: f64 = 0.9;
 /// The all-to-all prepare at EP8: intercept and per-token slope of the B200
 /// EP8 `moe_alltoall_prepare` rows, 1..65,536 tokens per rank, with the
-/// metadata transfer over [`DEFAULT_A2A_LINK_GB_PER_S`] (2026-10-11; rms 3.7%).
-pub const DEFAULT_PREPARE_LATENCY_US: f64 = 21.9;
-const PREPARE_US_PER_TOKEN: f64 = 0.0133;
+/// metadata transfer over [`DEFAULT_A2A_LINK_GB_PER_S`] (2026-11-12; rms 3.9%).
+pub const DEFAULT_PREPARE_LATENCY_US: f64 = 21.6;
+const PREPARE_US_PER_TOKEN: f64 = 0.0132;
 /// Growth of the prepare's fixed part per doubling of the EP group past 8
 /// (more peers to signal and wait on; assumption).
 const PREPARE_GROWTH_PER_DOUBLING: f64 = 0.25;
@@ -175,7 +185,7 @@ impl EpCommKind {
 pub enum FastBackend {
     /// FlashInfer MNNVL: the `moe_alltoall` transport kernel (`moe_comm`)
     /// called at the fast exchange's rows, priced by this module's B200 EP8
-    /// all-to-all fit (a = 4.11 us, L = 638 GB/s, per-row issue cost, recv
+    /// all-to-all fit (a = 4.11 us, L = 605 GB/s, per-row issue cost, recv
     /// weight 0.9). Cross-check: `all_reduce_fusion` flashinfer_mnnvl TP8
     /// hidden 4096 two-shot rows (17..128 tokens) fit a = 5.37 us at 638 GB/s
     /// (rms 5.0%).
@@ -201,7 +211,7 @@ impl FastBackend {
 
     pub fn link_gb_per_s(self) -> f64 {
         match self {
-            Self::Mnnvl => 638.0,
+            Self::Mnnvl => DEFAULT_A2A_LINK_GB_PER_S,
             Self::Nvshmem => 729.0,
             Self::Lamport => 495.0,
         }
@@ -886,8 +896,8 @@ mod tests {
             step.dispatch.max_recv_rows.max(step.dispatch.max_send_rows) * 12288.0
         ));
         // Prepare: fixed part grows 1.75x from EP8 to EP64.
-        assert!(close(a2a.prepare_fixed_us(), 21.9 * 1.75));
-        assert!(step.prepare.time_us > 21.9 * 1.75);
+        assert!(close(a2a.prepare_fixed_us(), 21.6 * 1.75));
+        assert!(step.prepare.time_us > 21.6 * 1.75);
         // Skew decays to uniform at large exchanges.
         assert!(a2a.busiest_hit(64) >= a2a.busiest_hit(131_072));
         assert!((a2a.busiest_hit(131_072) / a2a.uniform_hit - 1.0).abs() < 0.05);
@@ -922,7 +932,9 @@ mod tests {
         assert!(close(step.dispatch.bytes, 896.0 * 2368.0));
         // MNNVL: the moe_alltoall fit at 896 x 896 rows.
         assert!(close(step.dispatch.time_us, m2.alltoall_call(896.0, 896.0, 2368.0).time_us));
-        assert!((step.dispatch.time_us - 8.14).abs() < 0.01, "{}", step.dispatch.time_us);
+        // 8.34 us against 9.61 us measured (flashinfer_nvlink_two_sided, 288
+        // slots): the fit reads the 2,368-byte rows low (module doc).
+        assert!((step.dispatch.time_us - 8.34).abs() < 0.01, "{}", step.dispatch.time_us);
         // Combine: the bf16 partials of everyone else's tokens.
         assert!(close(step.combine.bytes, 896.0 * 8192.0));
         assert!(close(step.combine.time_us, m2.alltoall_call(896.0, 896.0, 8192.0).time_us));
@@ -938,7 +950,7 @@ mod tests {
         .step(&tokens);
         assert!(close(
             ar.combine.time_us,
-            step.combine.time_us + 896.0 * 8192.0 / 638e3
+            step.combine.time_us + 896.0 * 8192.0 / 605e3
         ));
         // Fused: the same bytes without the fixed cost.
         let m3 = fast(EpCommKind::FusedAllgather, EpFastConfig::default()).step(&tokens);
@@ -966,23 +978,24 @@ mod tests {
         assert_eq!(placed.config.link_gb_per_s(), 729.0);
     }
 
-    /// The all-to-all constants are the 2026-10-11 fit to the B200 EP8
-    /// `flashinfer_mnnvl` rows; the targets below are those rows (us, graph
-    /// replay, send = recv). Re-fitting moves this test on purpose.
+    /// The all-to-all constants are the 2026-11-12 fit to the B200 EP8
+    /// `flashinfer_mnnvl` and `flashinfer_nvlink_two_sided` rows; the targets
+    /// below are `flashinfer_mnnvl` rows (us, graph replay, send = recv).
+    /// Re-fitting moves this test on purpose.
     #[test]
     fn the_alltoall_fit_reproduces_the_b200_ep8_rows() {
-        assert_eq!(DEFAULT_A2A_LINK_GB_PER_S, 638.0);
+        assert_eq!(DEFAULT_A2A_LINK_GB_PER_S, 605.0);
         assert_eq!(DEFAULT_A2A_LATENCY_US, 4.11);
-        assert_eq!(A2A_ROW_FLOOR_GB_PER_S, 3.81);
-        assert_eq!(A2A_PER_ROW_US, 0.002_55);
+        assert_eq!(A2A_ROW_FLOOR_GB_PER_S, 3.86);
+        assert_eq!(A2A_PER_ROW_US, 0.002_63);
         assert_eq!(A2A_RECV_ROW_WEIGHT, 0.9);
-        assert_eq!(DEFAULT_PREPARE_LATENCY_US, 21.9);
-        assert_eq!(PREPARE_US_PER_TOKEN, 0.0133);
+        assert_eq!(DEFAULT_PREPARE_LATENCY_US, 21.6);
+        assert_eq!(PREPARE_US_PER_TOKEN, 0.0132);
         // The all-gather / reduce-scatter keep their link.
         let ag = comm(EpCommKind::AllgatherReducescatter, 8);
         assert_eq!(ag.config.link_gb_per_s(), 620.0);
         let a2a = comm(EpCommKind::Alltoall, 8);
-        assert_eq!(a2a.config.link_gb_per_s(), 638.0);
+        assert_eq!(a2a.config.link_gb_per_s(), 605.0);
         assert_eq!(
             EpCommConfig {
                 link_gb_per_s: Some(900.0),
@@ -1007,9 +1020,10 @@ mod tests {
                 within(model, measured, 0.06, &format!("{bytes} B x {rows}"));
             }
         }
-        // Off the diagonal a received row weighs 0.9 of a sent one.
-        within(a2a.alltoall_call(8_192.0, 4_096.0, 12_288.0).time_us, 162.67, 0.02, "send-heavy");
-        within(a2a.alltoall_call(4_096.0, 8_192.0, 12_288.0).time_us, 145.57, 0.02, "recv-heavy");
+        // Off the diagonal a received row weighs 0.9 of a sent one (the
+        // 12,288-byte rows read ~+5% since the 2026-11-12 refit).
+        within(a2a.alltoall_call(8_192.0, 4_096.0, 12_288.0).time_us, 162.67, 0.07, "send-heavy");
+        within(a2a.alltoall_call(4_096.0, 8_192.0, 12_288.0).time_us, 145.57, 0.07, "recv-heavy");
         // Prepare at the busiest rank's tokens, uniform EP8 receive.
         for (tokens, measured) in [(64, 22.56), (1_024, 36.83), (8_192, 131.55), (24_576, 342.57)] {
             let recv = f64::from(tokens) * 8.0 * a2a.uniform_hit;
