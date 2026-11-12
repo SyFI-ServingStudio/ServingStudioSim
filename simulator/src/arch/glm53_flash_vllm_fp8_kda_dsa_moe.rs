@@ -1197,6 +1197,7 @@ pub(crate) fn build_layer_group(
                 router: Glm53MoeRouterLocalWorklet::build(
                     format!("{m}.router"),
                     Glm53MoeRouterLocalWorklet::resolve_config(&cfg.router),
+                    false,
                     bridge,
                 )?,
                 input_glue: atomic(

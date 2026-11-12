@@ -57,6 +57,7 @@ pub mod kv_cache_append;
 pub mod kv_compress_store;
 pub mod logits_topk;
 pub mod mhc_fused_post_pre_rms_norm;
+pub mod mhc_fused_sum_post_pre_rms_norm;
 pub mod mhc_pre_rms_norm;
 pub mod mhc_terminal_head;
 pub mod mla_cache_append;
@@ -298,6 +299,9 @@ pub use logits_topk::{
     LogitsTopkKernel, LogitsTopkKernelConfig, LogitsTopkKernelInput, LogitsTopkSpec,
 };
 pub use mhc_fused_post_pre_rms_norm::{MhcFusedPostPreRmsNormKernel, MhcFusedPostPreRmsNormSpec};
+pub use mhc_fused_sum_post_pre_rms_norm::{
+    MhcFusedSumKernelConfig, MhcFusedSumPostPreRmsNormKernel, MhcFusedSumPostPreRmsNormSpec,
+};
 pub use mhc_pre_rms_norm::{
     MhcPreRmsNormKernel, MhcPreRmsNormSpec, MhcRmsNormKernelConfig, MhcRmsNormKernelInput,
 };

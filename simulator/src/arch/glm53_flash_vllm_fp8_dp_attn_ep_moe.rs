@@ -106,7 +106,8 @@ use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel, MhcRmsNormKernelInput, MoeEpAllGatherKernel,
+    MhcFusedPostPreRmsNormKernel, MhcFusedSumKernelConfig, MhcFusedSumPostPreRmsNormKernel,
+    MhcPreRmsNormKernel, MhcRmsNormKernelConfig, MhcRmsNormKernelInput, MoeEpAllGatherKernel,
     MoeEpAllGatherKernelConfig, MoeEpCollectiveKernelInput, MoeEpQuantizedAllGatherKernel,
     MoeEpQuantizedAllGatherKernelConfig, MoeEpReduceScatterKernel, MoeEpReduceScatterKernelConfig,
     Nvfp4FusedMoeKernel, Nvfp4FusedMoeKernelInput, RmsNormKernel, RmsNormKernelInput,
@@ -149,9 +150,11 @@ pub struct Glm53FlashDpAttnEpParallel {
     /// default is the measured all-gather / reduce-scatter; anything else
     /// needs the NVFP4 checkpoint.
     pub ep_comm: EpCommConfig,
-    /// What-if: fixed us taken off each fused mHC post/pre boundary (the
-    /// leaf keeps only its per-row part and is flagged `extrapolated`).
-    pub mhc_fuse_fixed_us: Option<f64>,
+    /// Which kernel prices the fused mHC post/pre boundaries.
+    pub mhc_boundary: MhcBoundaryPricing,
+    /// Compute the router gate once per MoE layer (the fork since #55736)
+    /// instead of twice (the 2026-09 alignment capture's line).
+    pub router_gate_once: bool,
     /// Attention tensor-parallel degree inside each attention DP group (module
     /// doc, "Attention DP x TP"): `dp_size / attn_tp` groups; 1 is plain DP
     /// attention.
@@ -168,6 +171,36 @@ pub struct Glm53FlashDpAttnEpParallel {
     /// `Glm53KdaAttnLocalWorkletConfig::merge_gate_b`).
     pub kda_gate_b_merged: bool,
 }
+
+/// How the fused mHC post/pre boundaries (every one but layer 0's pre) are
+/// priced. The terminal post is unchanged in all three.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum MhcBoundaryPricing {
+    /// vLLM's fused post/pre kernel rows (the `mhc_fused` backends).
+    #[default]
+    VllmKernel,
+    /// What-if: vLLM's rows less this fixed us per boundary (the leaf keeps
+    /// its per-row part and is flagged `extrapolated`).
+    VllmKernelLessFixedUs(f64),
+    /// The measured one-launch kernel (`cuda_one_launch`). The boundary
+    /// after an MoE layer also sums the combine's partial outputs (`dp_size`
+    /// of them on `fused_allgather`, whose combine leaves each rank's partial
+    /// in the owner's memory; one otherwise) and adds the shared expert, so
+    /// the MoE block's separate shared + routed add is not billed. The last
+    /// MoE layer's add goes to the terminal post, which stays as measured.
+    OneLaunchKernel,
+}
+
+/// The one-launch boundary kernels (`MhcBoundaryPricing::OneLaunchKernel`).
+#[derive(Clone, Debug)]
+pub struct MhcOneLaunchConfigs {
+    /// After attention, and after a dense FFN.
+    pub post_pre: MhcRmsNormKernelConfig,
+    /// After an MoE layer: the combine sum and the shared add, then post/pre.
+    pub after_moe: MhcFusedSumKernelConfig,
+}
+
+const MHC_ONE_LAUNCH_BACKENDS: &[&str] = &["cuda_one_launch"];
 
 /// Which attention layers an `attn_tp > 1` group runs tensor-parallel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -313,6 +346,8 @@ pub struct Glm53FlashDpAttnEpConfigs {
     /// The exchange `ep_comm` puts in place of `dispatch` / `combine`; empty
     /// on the measured all-gather / reduce-scatter.
     pub exchange: EpExchangeConfigs,
+    /// `Some` under `MhcBoundaryPricing::OneLaunchKernel`.
+    pub mhc_one_launch: Option<MhcOneLaunchConfigs>,
 }
 
 /// The MoE dispatch all-gather for the checkpoint's routed experts.
@@ -376,6 +411,29 @@ pub fn build_configs(
     }
     let mut local = local;
     local.kda.merge_gate_b = parallel.kda_gate_b_merged;
+    let mhc_one_launch = (parallel.mhc_boundary == MhcBoundaryPricing::OneLaunchKernel).then(|| {
+        // Its attention boundary differs by what the layer before was.
+        local.groups = split_groups_after_dense(model, std::mem::take(&mut local.groups));
+        let mut post_pre = local.mhc_fused.clone();
+        post_pre.backends = MHC_ONE_LAUNCH_BACKENDS.to_vec();
+        let partials = if parallel.ep_comm.kind == EpCommKind::FusedAllgather {
+            u32::from(dp)
+        } else {
+            1
+        };
+        MhcOneLaunchConfigs {
+            after_moe: MhcFusedSumKernelConfig {
+                backends: MHC_ONE_LAUNCH_BACKENDS.to_vec(),
+                gpu_name: post_pre.gpu_name.clone(),
+                hidden_size: post_pre.hidden_size.clone(),
+                hc_mult: post_pre.hc_mult,
+                hidden_dtype: post_pre.hidden_dtype,
+                num_partials: partials,
+                shared_addend: true,
+            },
+            post_pre,
+        }
+    });
     let kda_tp1 = local.kda.clone();
     if attn_tp > 1 {
         let attn = tp_arch::build_configs(
@@ -469,7 +527,46 @@ pub fn build_configs(
         kda_tp1,
         parallel: parallel.clone(),
         exchange,
+        mhc_one_launch,
     })
+}
+
+/// Splits each MoE group's layers that follow a dense layer into their own
+/// group (`<label>_after_dense`): their attention boundary has no MoE output
+/// to sum.
+fn split_groups_after_dense(
+    model: &Glm53FlashModelCfg,
+    groups: Vec<Glm53FlashLayerGroup>,
+) -> Vec<Glm53FlashLayerGroup> {
+    let mut out = Vec::with_capacity(groups.len() + 1);
+    for group in groups {
+        let (after_dense, after_moe): (Vec<u32>, Vec<u32>) = group
+            .layers
+            .iter()
+            .partition(|&&layer| layer == 0 || model.is_dense(layer - 1));
+        if group.ffn != FfnKind::Moe || after_dense.is_empty() || after_moe.is_empty() {
+            out.push(group);
+            continue;
+        }
+        out.push(Glm53FlashLayerGroup {
+            label: format!("{}_after_dense", group.label),
+            layers: after_dense,
+            ..group.clone()
+        });
+        out.push(Glm53FlashLayerGroup {
+            layers: after_moe,
+            ..group
+        });
+    }
+    out
+}
+
+/// Whether the layer before every layer of `group` is an MoE layer.
+fn follows_moe(model: &Glm53FlashModelCfg, group: &Glm53FlashLayerGroup) -> bool {
+    group
+        .layers
+        .iter()
+        .all(|&layer| layer > 0 && !model.is_dense(layer - 1))
 }
 
 #[derive(Clone, Debug)]
@@ -506,7 +603,9 @@ struct MoeBlock {
     exchange: Exchange,
     /// One per EP rank, ranked by routed workload.
     fused_moe: Vec<Op<Nvfp4FusedMoeKernel>>,
-    combine_glue: Op<ElementwiseKernel>,
+    /// The shared + routed add; `None` when the next mHC boundary does it
+    /// (`MhcBoundaryPricing::OneLaunchKernel`).
+    combine_glue: Option<Op<ElementwiseKernel>>,
 }
 
 /// How the routed tokens reach the experts and come back.
@@ -549,7 +648,7 @@ impl Dispatch {
 struct LayerGroup {
     label: String,
     layers: Vec<u32>,
-    attn_boundary: Boundary,
+    attn_boundary: AttnBoundary,
     attn: Attention,
     /// The attention-TP all-gather + reduce-scatter pair, priced as one TP
     /// all-reduce of the group's rows; `None` at attention TP 1.
@@ -560,6 +659,24 @@ struct LayerGroup {
     ffn_boundary: Op<MhcFusedPostPreRmsNormKernel>,
     ffn: Ffn,
     mhc_fuse_fixed_us: Option<f64>,
+}
+
+/// The mHC boundary ahead of a layer's attention.
+enum AttnBoundary {
+    /// Layer 0's pre, or a fused post/pre of a single block output.
+    Mhc(Boundary),
+    /// After an MoE layer, one-launch: the combine's partial outputs summed,
+    /// the shared expert added, then the fused post/pre.
+    SumAfterMoe(Op<MhcFusedSumPostPreRmsNormKernel>),
+}
+
+impl AttnBoundary {
+    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        match self {
+            Self::Mhc(boundary) => boundary.compile(builder),
+            Self::SumAfterMoe(op) => op.compile(builder),
+        }
+    }
 }
 
 /// A fused mHC post/pre boundary, less `fixed_us` when the what-if is on.
@@ -779,8 +896,13 @@ impl LayerGroup {
 
     fn eval_attn_boundary(&self, rows: u32, ev: &mut Evaluator) {
         match &self.attn_boundary {
-            Boundary::Fused(op) => push_mhc_fused(op, rows, self.mhc_fuse_fixed_us, ev),
-            boundary => boundary.eval(rows, ev),
+            AttnBoundary::Mhc(Boundary::Fused(op)) => {
+                push_mhc_fused(op, rows, self.mhc_fuse_fixed_us, ev)
+            }
+            AttnBoundary::Mhc(boundary) => boundary.eval(rows, ev),
+            AttnBoundary::SumAfterMoe(op) => {
+                push(op, MhcRmsNormKernelInput { num_tokens: rows }, ev)
+            }
         }
     }
 
@@ -840,14 +962,7 @@ impl MoeBlock {
                 .map(|_| self.shared_expert.compile(builder))
                 .collect(),
         };
-        let combine_glue = CostNode::Max {
-            overlap: 1.0,
-            children: (0..dp)
-                .map(|_| self.combine_glue.compile(builder))
-                .collect(),
-        };
-        vec![
-            CostNode::Labeled {
+        let mut sections = vec![CostNode::Labeled {
                 label: format!(
                     "{} (MoE) [{path}; aux-stream shared expert at T_r<={} overlaps]",
                     self.name, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
@@ -856,12 +971,17 @@ impl MoeBlock {
                     overlap: SHARED_EXPERTS_STREAM_OVERLAP,
                     children: vec![CostNode::Sum(chain), concurrent_shared],
                 }),
-            },
-            CostNode::Labeled {
+        }];
+        if let Some(glue) = &self.combine_glue {
+            sections.push(CostNode::Labeled {
                 label: format!("{}.combine_glue [Max over DP ranks]", self.name),
-                child: Box::new(combine_glue),
-            },
-        ]
+                child: Box::new(CostNode::Max {
+                    overlap: 1.0,
+                    children: (0..dp).map(|_| glue.compile(builder)).collect(),
+                }),
+            });
+        }
+        sections
     }
 
     /// Router (twice), routed-input copy, the main-stream shared expert for
@@ -935,14 +1055,16 @@ impl MoeBlock {
                 ev,
             );
         }
-        for rank in &batch.ranks {
-            push(
-                &self.combine_glue,
-                ElementwiseKernelInput {
-                    num_tokens: rank.rows,
-                },
-                ev,
-            );
+        if let Some(glue) = &self.combine_glue {
+            for rank in &batch.ranks {
+                push(
+                    glue,
+                    ElementwiseKernelInput {
+                        num_tokens: rank.rows,
+                    },
+                    ev,
+                );
+            }
         }
     }
 }
@@ -1108,22 +1230,33 @@ fn build_group(
     let local = &cfg.local;
     let prefix = format!("{n}.{}", group.label);
     let p = prefix.as_str();
-    let attn_boundary = if group.opens_stream {
-        Boundary::Pre(atomic(
+    // vLLM's fused post/pre, or the one-launch kernel in its place.
+    let mhc_fused = cfg
+        .mhc_one_launch
+        .as_ref()
+        .map_or(&local.mhc_fused, |one| &one.post_pre);
+    let attn_boundary = match &cfg.mhc_one_launch {
+        _ if group.opens_stream => AttnBoundary::Mhc(Boundary::Pre(atomic(
             p,
             "attn_mhc_pre",
             local.mhc.clone(),
             MhcPreRmsNormKernel::build,
             bridge,
-        )?)
-    } else {
-        Boundary::Fused(atomic(
+        )?)),
+        Some(one) if follows_moe(&local.model, group) => AttnBoundary::SumAfterMoe(atomic(
+            p,
+            "attn_mhc_sum_post_pre",
+            one.after_moe.clone(),
+            MhcFusedSumPostPreRmsNormKernel::build,
+            bridge,
+        )?),
+        _ => AttnBoundary::Mhc(Boundary::Fused(atomic(
             p,
             "attn_mhc_post_pre",
-            local.mhc_fused.clone(),
+            mhc_fused.clone(),
             MhcFusedPostPreRmsNormKernel::build,
             bridge,
-        )?)
+        )?)),
     };
     let attn = match group.attn {
         AttnKind::Kda => Attention::Kda(Glm53KdaAttnLocalWorklet::build(
@@ -1150,6 +1283,7 @@ fn build_group(
                 router: Glm53MoeRouterLocalWorklet::build(
                     format!("{m}.router"),
                     Glm53MoeRouterLocalWorklet::resolve_config(&local.router),
+                    cfg.parallel.router_gate_once,
                     bridge,
                 )?,
                 input_glue: atomic(
@@ -1192,13 +1326,19 @@ fn build_group(
                         )
                     })
                     .collect::<std::result::Result<_, _>>()?,
-                combine_glue: atomic(
-                    m,
-                    "combine_glue",
-                    local.moe_combine_glue.clone(),
-                    ElementwiseKernel::build,
-                    bridge,
-                )?,
+                combine_glue: cfg
+                    .mhc_one_launch
+                    .is_none()
+                    .then(|| {
+                        atomic(
+                            m,
+                            "combine_glue",
+                            local.moe_combine_glue.clone(),
+                            ElementwiseKernel::build,
+                            bridge,
+                        )
+                    })
+                    .transpose()?,
                 name: moe,
             })
         }
@@ -1250,12 +1390,15 @@ fn build_group(
         ffn_boundary: atomic(
             p,
             "ffn_mhc_post_pre",
-            local.mhc_fused.clone(),
+            mhc_fused.clone(),
             MhcFusedPostPreRmsNormKernel::build,
             bridge,
         )?,
         ffn,
-        mhc_fuse_fixed_us: cfg.parallel.mhc_fuse_fixed_us,
+        mhc_fuse_fixed_us: match cfg.parallel.mhc_boundary {
+            MhcBoundaryPricing::VllmKernelLessFixedUs(us) => Some(us),
+            _ => None,
+        },
     })
 }
 
@@ -1881,7 +2024,8 @@ mod tests {
             cudagraph_capture_sizes: Vec::new(),
             kernel_path: Default::default(),
             ep_comm: EpCommConfig::default(),
-            mhc_fuse_fixed_us: None,
+            mhc_boundary: Default::default(),
+            router_gate_once: false,
             attn_tp: 1,
             attn_all_reduce_row_gpus: None,
             attn_tp_layers: Default::default(),
@@ -1975,6 +2119,56 @@ mod tests {
         assert_eq!((dispatch.num_gpus, dispatch.max_total_tokens), (8, 65536));
         assert!(build_configs(&model_cfg(), &parallel(1), &demand).is_err());
         assert!(build_configs(&model_cfg(), &parallel(5), &demand).is_err());
+    }
+
+    /// Catches a one-launch config that sums the wrong partial count, or a
+    /// split that leaves a layer after a dense FFN in a group whose attention
+    /// boundary sums MoE partials.
+    #[test]
+    fn one_launch_splits_layers_after_dense_and_sums_ep_partials() {
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        let model = config("glm53_flash_nvfp4");
+        let mut fused = parallel(8);
+        fused.mhc_boundary = MhcBoundaryPricing::OneLaunchKernel;
+        fused.ep_comm.kind = EpCommKind::FusedAllgather;
+        let configs = build_configs(&model, &fused, &demand).unwrap();
+        let one = configs.mhc_one_launch.as_ref().unwrap();
+        assert_eq!((one.after_moe.num_partials, one.after_moe.shared_addend), (8, true));
+        assert_eq!(one.post_pre.backends, MHC_ONE_LAUNCH_BACKENDS);
+        let mut layers: Vec<u32> = configs.local.groups.iter().flat_map(|g| g.layers.clone()).collect();
+        layers.sort_unstable();
+        assert_eq!(layers, (0..model.num_layers).collect::<Vec<_>>());
+        for group in &configs.local.groups {
+            let after_dense = group.layers.iter().any(|&l| l == 0 || model.is_dense(l - 1));
+            assert!(!(after_dense && follows_moe(&model, group)), "{}", group.label);
+            if group.ffn == FfnKind::Moe && !after_dense {
+                assert!(follows_moe(&model, group), "{}", group.label);
+            }
+        }
+        // Any other exchange leaves the combine's sum in one tensor.
+        let mut measured = parallel(8);
+        measured.mhc_boundary = MhcBoundaryPricing::OneLaunchKernel;
+        let configs = build_configs(&model, &measured, &demand).unwrap();
+        assert_eq!(configs.mhc_one_launch.unwrap().after_moe.num_partials, 1);
+        // Off: vLLM's groups and no one-launch configs.
+        let configs = build_configs(&model, &parallel(8), &demand).unwrap();
+        assert!(configs.mhc_one_launch.is_none());
+        assert!(configs.local.groups.iter().all(|g| !g.label.ends_with("_after_dense")));
+        // Built: no separate shared + routed add, a sum boundary per MoE
+        // group that follows MoE layers, and the gate once when asked.
+        fused.router_gate_once = true;
+        let built = built_with(&model, &fused);
+        let kinds = leaves(&built);
+        let count = |leaf: &str| kinds.iter().filter(|(l, _)| l == leaf).count();
+        assert_eq!(count("combine_glue"), 0);
+        assert_eq!(count("gate_recompute"), 0);
+        assert!(count("attn_mhc_sum_post_pre") > 0);
+        assert!(kinds
+            .iter()
+            .any(|(l, k)| l == "attn_mhc_sum_post_pre" && k == "mhc_fused_sum_post_pre_rms_norm"));
+        let base = leaves(&built_with(&model, &parallel(8)));
+        assert!(base.iter().any(|(l, _)| l == "combine_glue"));
+        assert!(base.iter().any(|(l, _)| l == "gate_recompute"));
     }
 
     #[test]

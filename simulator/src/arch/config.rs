@@ -1482,6 +1482,18 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         mhc_fuse_fixed_us: Option<f64>,
+        /// Price the fused mHC post/pre boundaries from the measured
+        /// one-launch kernel (`cuda_one_launch`); the boundary after an MoE
+        /// layer also sums the combine's partials and adds the shared expert.
+        /// Exclusive with `mhc_fuse_fixed_us`.
+        #[serde(default)]
+        #[param(cache_key)]
+        mhc_one_launch: bool,
+        /// Compute the MoE router gate once per layer (the fork since
+        /// #55736) instead of twice (the 2026-09 capture line).
+        #[serde(default)]
+        #[param(cache_key)]
+        router_gate_once: bool,
     },
     /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`] verifying the
     /// `incoai/GLM-5.3-Flash-DFlash2` proposer's drafts: each verify row is
@@ -1702,6 +1714,18 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         mhc_fuse_fixed_us: Option<f64>,
+        /// Price the fused mHC post/pre boundaries from the measured
+        /// one-launch kernel (`cuda_one_launch`); the boundary after an MoE
+        /// layer also sums the combine's partials and adds the shared expert.
+        /// Exclusive with `mhc_fuse_fixed_us`.
+        #[serde(default)]
+        #[param(cache_key)]
+        mhc_one_launch: bool,
+        /// Compute the MoE router gate once per layer (the fork since
+        /// #55736) instead of twice (the 2026-09 capture line).
+        #[serde(default)]
+        #[param(cache_key)]
+        router_gate_once: bool,
     },
     /// GLM-5.3-Flash NVFP4 + DFlash2 under attention DP with the KDA layers
     /// tensor-parallel in groups of `kda_tp_gpus`, a fused direct-write
@@ -2086,17 +2110,38 @@ impl IterArchSel {
         }
     }
 
-    /// `mhc_fuse_fixed_us` (GLM-5.3-Flash NVFP4 DP arches), else `None`.
-    pub fn mhc_fuse_fixed_us(&self) -> Option<f64> {
-        match self {
+    /// The boundary fusions (`mhc_fuse_fixed_us`, `mhc_one_launch`,
+    /// `router_gate_once`) of the GLM-5.3-Flash NVFP4 DP arches, else none.
+    pub fn glm53_flash_fusions(&self) -> anyhow::Result<Glm53FlashFusions> {
+        use crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MhcBoundaryPricing;
+        let (fixed_us, one_launch, router_gate_once) = match self {
             Self::Glm53FlashVllmNvfp4DpAttnEpMoe {
-                mhc_fuse_fixed_us, ..
+                mhc_fuse_fixed_us,
+                mhc_one_launch,
+                router_gate_once,
+                ..
             }
             | Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
-                mhc_fuse_fixed_us, ..
-            } => *mhc_fuse_fixed_us,
-            _ => None,
-        }
+                mhc_fuse_fixed_us,
+                mhc_one_launch,
+                router_gate_once,
+                ..
+            } => (*mhc_fuse_fixed_us, *mhc_one_launch, *router_gate_once),
+            _ => return Ok(Glm53FlashFusions::default()),
+        };
+        let mhc_boundary = match (fixed_us, one_launch) {
+            (Some(_), true) => anyhow::bail!(
+                "mhc_fuse_fixed_us and mhc_one_launch are exclusive: one prices vLLM's \
+                 boundary less a fixed cost, the other the measured one-launch kernel"
+            ),
+            (Some(us), false) => MhcBoundaryPricing::VllmKernelLessFixedUs(us),
+            (None, true) => MhcBoundaryPricing::OneLaunchKernel,
+            (None, false) => MhcBoundaryPricing::VllmKernel,
+        };
+        Ok(Glm53FlashFusions {
+            mhc_boundary,
+            router_gate_once,
+        })
     }
 
     /// The fast exchanges' `ep_fast_*` params (GLM-5.3-Flash NVFP4 DP arches).
@@ -2883,4 +2928,12 @@ mod layerwise_tests {
         assert!(serde_json::from_str::<AttnArchSel>(llama).is_err());
         assert!(serde_json::from_str::<FfnArchSel>(deepseek).is_err());
     }
+}
+
+/// The boundary fusions a GLM-5.3-Flash NVFP4 DP arch prices
+/// ([`IterArchSel::glm53_flash_fusions`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Glm53FlashFusions {
+    pub mhc_boundary: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MhcBoundaryPricing,
+    pub router_gate_once: bool,
 }
