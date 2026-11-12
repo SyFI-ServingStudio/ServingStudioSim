@@ -88,6 +88,10 @@ python -m launcher alignment-campaign label   --pack <> --out-root <> [--alignme
 python -m launcher alignment-campaign extract [--pack <>] --runs <dir[:dir]> --out metrics.json [--alignment-phase 1|2]
 python -m launcher alignment-campaign compare [--pack <>] --measured metrics.json \
                                               [--json|--markdown] [--record] [--alignment-phase 1|2]
+python -m launcher alignment-campaign bundle  --pack <> --host <> --out-root <> --dest <new dir> \
+                                              [--case ...] [--alignment-phase 1|2] [--upload <dataset> [--no-pr]]
+python -m launcher alignment-campaign verify-bundle --pack <> --out-root <> (--bundle <dir> | --from-hf <repo>@<rev>:<path>) \
+                                              [--check-only] [--replace]
 ```
 
 `--pack` is **optional for `extract` and `compare`** — the read side. Point
@@ -145,6 +149,60 @@ the measured and simulated request contracts. Audit failures block comparison
 eligibility. Missing legacy identity evidence is reported explicitly; it is not
 presented as a successful identity check. Observed-conditioned trace manifests
 are included in provenance when their output hash matches the selected trace.
+
+### Handing captures off: `bundle` / `verify-bundle`
+
+The profile passes need the GPUs; everything after them does not. So a matrix
+can be handed to someone with the hardware as an issue: they run the profile
+steps from the pack and return the capture directories, and the maintainer runs
+the rest. `bundle.py` is the contract.
+
+- **What is sent.** Every profile pass directory of the selected cases, file
+  for file, except the nsys `.sqlite` export (`alignment profile --resume`
+  re-exports it from the `.nsys-rep`, which is sent), plus the trace each pass
+  replayed (`<case>/<pass>.trace.csv`). `bundle.json` lists each file's sha256
+  and size, each pass's state (`complete`, `incomplete`, `missing`), the pack's
+  `campaign.yaml` sha256 and the ServingStudioSim commit.
+- **Scrubbing.** `--host` must be the profile the captures ran with. Text files
+  have the host's paths replaced by `${...}` placeholders: capture dir, case
+  dir, out root, checkout and workspace, home, the host profile's paths and
+  checkpoints, and every mount source the capture recorded. The user and host
+  name are replaced as whole words (names under 5 characters are not
+  replaced); GPU UUIDs become `GPU-<n>`. Then every file, binaries included, is
+  searched for the home, every non-shared host path, and the user and host
+  name (5 characters or more, anywhere), and any hit refuses the bundle. A hit in an `.nsys-rep` is fixed
+  where the capture writes it, never by dropping the file: e.g. the autotune
+  preflight variable carries the container's path
+  (`alignment/image_runtime.py:container_cache_path`). Captures taken before
+  that fix are refused and have to be recaptured to be published.
+- **Published as is.** GPU model, count and driver; the engine image; the model
+  snapshot; server logs and the kernel timeline. nsys stores each GPU's bare
+  UUID in the `.nsys-rep`; it cannot be scrubbed there, so it is published.
+- **Where it goes.** A public Hugging Face dataset,
+  `UW-SyFI/servingstudio-alignment-captures`, under `<pack>/<bundle dir>/`.
+  `--upload` opens a dataset PR, so a contributor needs no write access.
+  `verify-bundle --from-hf` accepts only a pinned revision: a commit sha or the
+  PR ref (`refs/pr/<n>`).
+- **What the maintainer checks.** `verify-bundle` accepts only the case's own
+  profile pass names and safe relative paths; re-hashes every file and rejects
+  a changed, missing or unlisted one; reads the conditions again from the
+  hashed capture (the image in `container_run.json`, the model snapshot in
+  `profile.yaml`, the GPU in `profile_result.json`, the bundled trace) and
+  compares them with what its own checkout renders. A mismatch, or a condition
+  either side cannot state, is an error (so a checkpoint outside the HF hub,
+  which has no `snapshots/<sha>` to compare, cannot be verified), as is a different `campaign.yaml`; a
+  different commit is a warning. A pass marked complete must contain its
+  phase's required artifacts. Nothing is placed unless every check passed.
+  Each pass is then staged beside its case directory, its completion marker
+  written last, and renamed into place, with the structural placeholders
+  restored so the capture's `log_dir` names where it now lives. Every metric is
+  then computed locally by the ordinary phases.
+
+An issue that hands a matrix off names the pack and commit, the reference
+image tag, the model snapshot and the GPUs; gives the command block of
+`skills/operate-run-alignment` up to the profile steps plus the `bundle`
+line; and asks that a failing step be reported with its bundle rather than
+worked around by editing a config.
 
 ### `label`
 

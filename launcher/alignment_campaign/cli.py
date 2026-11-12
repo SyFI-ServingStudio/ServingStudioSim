@@ -12,6 +12,8 @@ would also read as `alignment campaign run --phase simulation` invoking
     label    apply the pack's rule set to a fixpoint
     extract  completed reports -> one metrics document
     compare  judge that document against tolerances and the golden
+    bundle   scrub a campaign's captures into one publishable directory
+    verify-bundle  check a bundle against this checkout and place its captures
 
 `--phase` names a pipeline step (profile_nsys, timing_predict, simulation, ...).
 Its values are artifact directory names, so the step, its config, its output
@@ -31,6 +33,7 @@ import json
 import sys
 from pathlib import Path
 
+from . import bundle as bundle_module
 from . import check as check_module
 from . import compare as compare_module
 from . import execute
@@ -345,6 +348,55 @@ def _compare(args) -> int:
     return 1 if comparison.failures or comparison.unavailable else 0
 
 
+def _bundle(args) -> int:
+    pack = _resolve_pack(args.pack)
+    assert pack is not None
+    host = _resolve_host(args.host)
+    cases = _selected_cases(pack, args.case, args.alignment_phase)
+    report = bundle_module.bundle(pack, host, Path(args.out_root), cases, Path(args.dest))
+    for slug, entry in report.manifest["cases"].items():
+        for name, item in entry["passes"].items():
+            print(f"[bundle] {slug}/{name}: {item['state']}, {len(item.get('files', {}))} files")
+    print(f"[bundle] {report.dest}  ({report.bytes / 1e9:.2f} GB)")
+    if args.upload:
+        url = bundle_module.upload(
+            report.dest, args.upload, args.path_in_repo or f"{pack.name}/{report.dest.name}",
+            create_pr=not args.no_pr,
+        )
+        print(f"[bundle] uploaded: {url}")
+    return 0
+
+
+def _verify_bundle(args) -> int:
+    pack = _resolve_pack(args.pack)
+    assert pack is not None
+    if args.from_hf:
+        if not args.download_dir:
+            raise PackError("--from-hf needs --download-dir")
+        source = bundle_module.download(args.from_hf, Path(args.download_dir))
+    elif args.bundle:
+        source = Path(args.bundle)
+    else:
+        raise PackError("verify-bundle needs --bundle <dir> or --from-hf <repo>@<rev>:<path>")
+    result = bundle_module.verify_bundle(
+        pack, source, Path(args.out_root), place=not args.check_only, replace=args.replace
+    )
+    for line in result.warnings:
+        print(f"[verify-bundle] warning: {line}")
+    for line in result.skipped:
+        print(f"[verify-bundle] not placed: {line}")
+    for line in result.placed:
+        print(f"[verify-bundle] placed {line}")
+    for line in result.errors:
+        print(f"[verify-bundle] error: {line}", file=sys.stderr)
+    if result.ok and result.placed:
+        print(
+            "[verify-bundle] next: `alignment-campaign run --phase timing_predict`, then "
+            "analysis_kernel, simulation, analysis_e2e, extract and compare"
+        )
+    return 0 if result.ok else 1
+
+
 # ── parser ───────────────────────────────────────────────────────────────────
 
 
@@ -445,6 +497,43 @@ def _build_parser() -> argparse.ArgumentParser:
         help="allow --record while calibrated inputs are still provisional",
     )
     compare.set_defaults(handler=_compare)
+
+    bundle = commands.add_parser(
+        "bundle", help="scrub the cases' profile passes into one publishable directory"
+    )
+    bundle.add_argument("--pack", required=True)
+    bundle.add_argument("--host", required=True, help="the host profile the captures ran with")
+    bundle.add_argument("--out-root", required=True)
+    bundle.add_argument("--case", action="append")
+    _add_alignment_phase(bundle)
+    bundle.add_argument("--dest", required=True, help="new directory to write the bundle into")
+    bundle.add_argument(
+        "--upload", metavar="REPO_ID", help="also upload to this Hugging Face dataset"
+    )
+    bundle.add_argument(
+        "--path-in-repo", help="directory in the dataset (default <pack>/<dest name>)"
+    )
+    bundle.add_argument(
+        "--no-pr", action="store_true", help="commit directly instead of opening a PR"
+    )
+    bundle.set_defaults(handler=_bundle)
+
+    verify = commands.add_parser(
+        "verify-bundle", help="check a bundle against this checkout and place its captures"
+    )
+    verify.add_argument("--pack", required=True)
+    verify.add_argument("--out-root", required=True, help="a campaign rendered on this host")
+    source = verify.add_mutually_exclusive_group(required=True)
+    source.add_argument("--bundle", help="local bundle directory")
+    source.add_argument(
+        "--from-hf", metavar="REPO@REV:PATH", help="download from a dataset at a pinned revision"
+    )
+    verify.add_argument(
+        "--download-dir", help="where --from-hf downloads (required with it; several GB)"
+    )
+    verify.add_argument("--check-only", action="store_true", help="verify, place nothing")
+    verify.add_argument("--replace", action="store_true", help="overwrite existing pass dirs")
+    verify.set_defaults(handler=_verify_bundle)
     return parser
 
 
