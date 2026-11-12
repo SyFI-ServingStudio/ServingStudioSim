@@ -133,6 +133,8 @@ const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_no_rope"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_unpadded"];
 const MQA_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
+/// `cooperative_topk`, the fork's "auto" decode top-k for at most 64 rows.
+const COOPERATIVE_TOPK_BACKENDS: &[&str] = &["vllm_cuda_cooperative"];
 /// vLLM's `top_k_per_row_prefill`.
 const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
 /// The fork's `fp8_fp4_mqa_logits` is DeepGEMM's `sm100_mqa_logits`; the
@@ -741,6 +743,7 @@ pub fn build_configs(
             mla_bmm_v_up_backends: V_UP_BACKENDS.to_vec(),
             mqa_logits_backends: MQA_LOGITS_BACKENDS.to_vec(),
             topk_backends: TOPK_BACKENDS.to_vec(),
+            cooperative_topk_backends: COOPERATIVE_TOPK_BACKENDS.to_vec(),
             mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
             topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
             sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),

@@ -19,6 +19,7 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::sparse_indexer_topk::{COOPERATIVE_BACKEND, COOPERATIVE_MAX_ROWS};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -115,10 +116,18 @@ impl KernelSpec for DsaPersistentTopkDecodeSpec {
         let padded_row_bytes = f64::from(config.logits_row_stride.get())
             * f64::from(DType::Fp32.size_bytes())
             * f64::from(config.next_n);
+        // `cooperative_topk` rejects more than 64 rows (`cooperative_topk.cu:63`).
+        let max_rows = if config.backends.contains(&COOPERATIVE_BACKEND) {
+            f64::from(COOPERATIVE_MAX_ROWS)
+        } else {
+            f64::INFINITY
+        };
+        let next_n = f64::from(config.next_n);
         grid.expand_2d(|batch_size, context_len| {
             context_len < min_context_len
                 || context_len > max_model_len
                 || batch_size * padded_row_bytes > MAX_PROFILE_ALLOCATION_BYTES
+                || batch_size * next_n > max_rows
         })
     }
 
