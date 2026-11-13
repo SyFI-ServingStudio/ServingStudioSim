@@ -380,19 +380,6 @@ pub enum AttnTpCollective {
 /// `mnnvl_pull` has each owner read its peers' fabric-mapped buffers. Each
 /// leg is billed at the faster of the two rows.
 const FIXED_GATHER_SCATTER_BACKENDS: &[&str] = &["mnnvl_lamport", "mnnvl_pull"];
-/// Group sizes with a measured `row_all_gather` (2 and 4 GPUs, Slurm 21404);
-/// 8 GPUs has none yet.
-const ROW_ALL_GATHER_GPUS: [u32; 2] = [2, 4];
-
-/// The KDA input all-gather: the measured `row_all_gather` at the group
-/// size, or, where that size has no rows (8 GPUs), the reduce-scatter row
-/// at the same counts as a stand-in (same bytes received per rank, plus the
-/// sum, so it does not under-price).
-enum KdaInputGather {
-    Rows(Op<RowAllGatherKernel>),
-    ReduceScatterStandIn(Op<MoeEpReduceScatterKernel>),
-}
-
 /// The KDA-only attention-TP pair as two leaves (`AttnTpCollective::
 /// FixedGatherScatter`). Both legs move `hidden` bf16 values per row of
 /// every group rank: the gather brings every group rank the other owners'
@@ -401,7 +388,7 @@ enum KdaInputGather {
 /// exchange's rows measured at the group size `b` (`row_all_gather` and
 /// `moe_ep_reduce_scatter`), at the members' own row counts.
 struct KdaGatherScatter {
-    gather: KdaInputGather,
+    gather: Op<RowAllGatherKernel>,
     scatter: Op<MoeEpReduceScatterKernel>,
 }
 
@@ -422,31 +409,21 @@ impl KdaGatherScatter {
             fabric: "nvlink".into(),
             max_total_tokens: RANK_TOKEN_BUDGET * group_gpus,
         };
-        let gather = if ROW_ALL_GATHER_GPUS.contains(&group_gpus) {
-            KdaInputGather::Rows(atomic(
-                prefix,
-                "attn_tp_input_all_gather",
-                RowAllGatherKernelConfig {
-                    backends: FIXED_GATHER_SCATTER_BACKENDS.to_vec(),
-                    gpu_name: gpu_name.to_string(),
-                    num_gpus: group_gpus,
-                    hidden_size: hidden.into(),
-                    dtype: ACTIVATION_DTYPE,
-                    fabric: "nvlink".into(),
-                    max_total_tokens: RANK_TOKEN_BUDGET * group_gpus,
-                },
-                RowAllGatherKernel::build,
-                bridge,
-            )?)
-        } else {
-            KdaInputGather::ReduceScatterStandIn(atomic(
-                prefix,
-                "attn_tp_input_all_gather",
-                config.clone(),
-                MoeEpReduceScatterKernel::build,
-                bridge,
-            )?)
-        };
+        let gather = atomic(
+            prefix,
+            "attn_tp_input_all_gather",
+            RowAllGatherKernelConfig {
+                backends: FIXED_GATHER_SCATTER_BACKENDS.to_vec(),
+                gpu_name: gpu_name.to_string(),
+                num_gpus: group_gpus,
+                hidden_size: hidden.into(),
+                dtype: ACTIVATION_DTYPE,
+                fabric: "nvlink".into(),
+                max_total_tokens: RANK_TOKEN_BUDGET * group_gpus,
+            },
+            RowAllGatherKernel::build,
+            bridge,
+        )?;
         Ok(Self {
             gather,
             scatter: atomic(
@@ -460,26 +437,13 @@ impl KdaGatherScatter {
     }
 
     fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        let gather = match &self.gather {
-            KdaInputGather::Rows(op) => op.compile(builder),
-            KdaInputGather::ReduceScatterStandIn(op) => op.compile(builder),
-        };
-        CostNode::Sum(vec![gather, self.scatter.compile(builder)])
+        CostNode::Sum(vec![self.gather.compile(builder), self.scatter.compile(builder)])
     }
 
     /// The cost-tree label's pricing note.
     fn pricing(&self) -> &'static str {
-        match self.gather {
-            KdaInputGather::Rows(_) => {
-                "input all-gather + output reduce-scatter, two launches on the fixed-pattern \
-                 rows measured at the group size (faster of push and pull)"
-            }
-            KdaInputGather::ReduceScatterStandIn(_) => {
-                "input all-gather + output reduce-scatter, two launches on the fixed-pattern \
-                 rows measured at the group size (faster of push and pull); the gather is a \
-                 STAND-IN (the reduce-scatter row: no all-gather rows at this group size)"
-            }
-        }
+        "input all-gather + output reduce-scatter, two launches on the fixed-pattern \
+         rows measured at the group size (faster of push and pull)"
     }
 
     /// `member_rows`: each group rank's own rows.
@@ -487,10 +451,7 @@ impl KdaGatherScatter {
         let input = MoeEpCollectiveKernelInput {
             per_rank_tokens: member_rows.to_vec(),
         };
-        match &self.gather {
-            KdaInputGather::Rows(op) => push(op, input.clone(), ev),
-            KdaInputGather::ReduceScatterStandIn(op) => push(op, input.clone(), ev),
-        }
+        push(&self.gather, input.clone(), ev);
         push(&self.scatter, input, ev);
     }
 }
@@ -2347,15 +2308,14 @@ mod tests {
         assert!(build("unified".into(), resolve_configs(&configs), &bridge).is_err());
     }
 
-    /// Catches the gather losing its measured rows at 2 / 4 GPUs, or
-    /// claiming rows at 8 GPUs where it still borrows the reduce-scatter's.
+    /// Catches either leg reading rows at another group size than its own.
     #[test]
     fn fixed_gather_scatter_reads_the_group_size_rows() {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
-        for (b, measured_gather) in [(2, true), (4, true), (8, false)] {
+        for b in [2, 4, 8] {
             let pair = KdaGatherScatter::build("t", "NVIDIA B200", 4096, b, &bridge).unwrap();
-            assert_eq!(matches!(pair.gather, KdaInputGather::Rows(_)), measured_gather, "b={b}");
+            assert_eq!(pair.gather.kernel.config.num_gpus, b);
             assert_eq!(pair.scatter.kernel.config.num_gpus, b);
         }
     }

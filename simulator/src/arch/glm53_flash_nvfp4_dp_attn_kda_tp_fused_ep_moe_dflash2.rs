@@ -73,7 +73,7 @@
 //! | f_b / g_b batched GEMM | 实测 (`batched_gemm` `torch_bmm_packed_lhs`) |
 //! | DSA, dense FFN, shared expert, router gate (GateLinear), mHC pre/post (TileLang) | 实测 |
 //! | KDA output reduce-scatter | 实测 at the group size `b` (`moe_ep_reduce_scatter`, faster of `mnnvl_lamport` push and `mnnvl_pull`) |
-//! | KDA input all-gather | 实测 at `b` = 2, 4 (`row_all_gather`, faster of push and pull); `b = 8` stand-in: the reduce-scatter row at the same counts (no 8-GPU all-gather rows yet) |
+//! | KDA input all-gather | 实测 at the group size `b` (`row_all_gather`, faster of push and pull; 8-GPU rows Slurm 21512) |
 //! | routed experts (`nvfp4_fused_moe`, routing precomputed) | 实测 |
 //! | dispatch activation quant, router top-k select | 实测 (elementwise rows) |
 //! | exchange, `fixed_measured` (default): dispatch + combine | 实测 (`moe_ep_quantized_all_gather` / `moe_ep_reduce_scatter` `mnnvl_lamport`, B200 EP8, Slurm 21248) |
@@ -85,10 +85,6 @@
 //!
 //! # Hooks for work in flight (not merged here)
 //!
-//! * **Measured KDA all-gather at 8 GPUs.** At `b = 8` the all-gather leg
-//!   still reads the reduce-scatter row as a stand-in; 8-GPU `row_all_gather`
-//!   rows replace it inside
-//!   `glm53_flash_vllm_fp8_dp_attn_ep_moe::KdaGatherScatter`; no new param.
 //! * **One-launch mHC rows** (worktree `wt-flash-mhc-fuse`): the
 //!   `cuda_one_launch` rows behind `mhc_boundary: fused_rows` are in this
 //!   tree's DB, not yet in the shared DB.
