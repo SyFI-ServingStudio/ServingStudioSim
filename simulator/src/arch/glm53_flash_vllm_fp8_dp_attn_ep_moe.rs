@@ -1419,6 +1419,8 @@ pub struct Glm53FlashDpAttnEpModel {
     kv_cache_layout: KvCacheLayout,
     /// The RecoverSSM commit of a verify graph (see `Glm53FlashVllmModel`).
     pub(crate) kda_commit: Option<tp_arch::KdaCommitPlan>,
+    /// See `Glm53FlashVllmModel::kda_commitless_verify`.
+    pub(crate) kda_commitless_verify: bool,
     /// The layers with a per-token cache, and one layer's MLA latent of one
     /// token: what HiSparse moves to host memory.
     num_dsa_layers: u32,
@@ -1455,20 +1457,19 @@ pub fn build(
     tp1_cfg.kda = cfg.kda_tp1.clone();
     tp1_cfg.kda.decode_query_len = local.kda.decode_query_len;
     tp1_cfg.kda.ssm_state_dtype = local.kda.ssm_state_dtype;
+    tp1_cfg.kda.spec_verify = local.kda.spec_verify;
     let tp1 = tp_arch::resolve_configs(&tp1_cfg);
     let kda_only = cfg.parallel.attn_tp_layers == AttnTpLayers::KdaOnly;
     let layout_tp = if kda_only { 1 } else { cfg.parallel.attn_tp.max(1) };
-    let kda_state_bytes = tp_arch::kda_layer_state_bytes_per_request(if kda_only {
-        &tp1
-    } else {
-        &resolved.local
-    });
+    let layout_kda = if kda_only { &tp1 } else { &resolved.local };
+    let kda_state_bytes = tp_arch::kda_layer_state_bytes_per_request(layout_kda);
     let kv_cache_layout = tp_arch::hybrid_kv_cache_layout(
         model_cfg,
         kda_state_bytes,
         dsa_layers,
         kda_layers,
         kda_layers.div_ceil(dsa_layers.max(1)),
+        layout_kda.kda.state_pages_per_request,
         tp_arch::hybrid_block_tokens(kda_state_bytes, u64::from(model_cfg.kv_lora_rank)),
         layout_tp,
     );
@@ -1534,6 +1535,7 @@ pub fn build(
         },
         kv_cache_layout,
         kda_commit: tp_arch::kda_commit_plan(&tp1),
+        kda_commitless_verify: tp_arch::commitless_verify(&tp1),
         num_dsa_layers: dsa_layers,
         dsa_latent_bytes_per_token: tp_arch::dsa_layer_latent_bytes_per_token(model_cfg),
         hisparse: None,

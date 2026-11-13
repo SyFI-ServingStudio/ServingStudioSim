@@ -66,3 +66,52 @@ def kda_recurrent_decode_reference(
     updated = state_pool.clone()
     updated[slots] = state.transpose(-1, -2).to(state_pool.dtype)
     return output.to(v.dtype), updated
+
+
+def kda_spec_verify_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted: torch.Tensor,
+    *,
+    lower_bound: float,
+    scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The speculative-verify form: ``q`` request-major tokens per request.
+
+    Token tensors are ``[B*q, H, ·]``, ``state_indices`` is ``[B, q]`` and
+    ``num_accepted`` ``[B]``. Request ``n`` starts from the state at slot
+    ``state_indices[n, num_accepted[n] - 1]``, carries it in fp32 through its
+    ``q`` tokens, and the state after token ``t`` is stored (at the pool dtype)
+    into slot ``state_indices[n, t]``. Returns ``(o [B*q,H,V] in v.dtype,
+    updated copy of state_pool)``; the input pool is not mutated.
+    """
+    requests, per_request = state_indices.shape
+    head_dim = q.shape[-1]
+    if scale is None:
+        scale = head_dim**-0.5
+    qf, kf = q.float(), k.float()
+    qn = qf * torch.rsqrt(qf.square().sum(-1, keepdim=True) + L2NORM_EPS) * scale
+    kn = kf * torch.rsqrt(kf.square().sum(-1, keepdim=True) + L2NORM_EPS)
+    decay = kda_safe_gate(raw_g, a_log, dt_bias, lower_bound).exp()
+    beta = raw_beta.float().sigmoid()
+    slots = state_indices.long()
+    start = slots[torch.arange(requests), num_accepted.long() - 1]
+    state = state_pool[start].float().transpose(-1, -2)  # [B, H, K, V]
+    updated = state_pool.clone()
+    output = torch.empty(v.shape, dtype=torch.float32, device=v.device)
+    for token in range(per_request):
+        rows = torch.arange(requests, device=q.device) * per_request + token
+        state = state * decay[rows].unsqueeze(-1)
+        predicted = torch.einsum("bhk,bhkv->bhv", kn[rows], state)
+        correction = beta[rows].unsqueeze(-1) * (v[rows].float() - predicted)
+        state = state + kn[rows].unsqueeze(-1) * correction.unsqueeze(-2)
+        output[rows] = torch.einsum("bhk,bhkv->bhv", qn[rows], state)
+        updated[slots[:, token]] = state.transpose(-1, -2).to(state_pool.dtype)
+    return output.to(v.dtype), updated

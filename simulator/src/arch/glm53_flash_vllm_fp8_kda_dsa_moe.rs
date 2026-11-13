@@ -717,6 +717,7 @@ pub fn build_configs(
             chunk_prefill_backends: KDA_PREFILL_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             decode_query_len: 1,
+            spec_verify: crate::worklet::KdaSpecVerify::Recoverssm,
             ssm_state_dtype: DType::Fp32,
             merge_gate_b: false,
         },
@@ -1282,6 +1283,9 @@ pub struct Glm53FlashVllmModel {
     kv_cache_layout: KvCacheLayout,
     /// The RecoverSSM commit a verify graph's KDA layers need; `None` at width 1.
     pub(crate) kda_commit: Option<KdaCommitPlan>,
+    /// A verify graph whose KDA layers store a state per position
+    /// (`KdaSpecVerify::RecurrentPerPosition`) and so need no commit.
+    pub(crate) kda_commitless_verify: bool,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1309,6 +1313,7 @@ pub fn build(
         dsa_layers,
         kda_layers,
         kda_layers.div_ceil(dsa_layers.max(1)),
+        resolved.kda.state_pages_per_request,
         hybrid_block_tokens(kda_state_bytes, u64::from(model_cfg.kv_lora_rank)),
         cfg.parallel.tp_size,
     );
@@ -1371,6 +1376,7 @@ pub fn build(
         },
         kv_cache_layout,
         kda_commit: kda_commit_plan(&resolved),
+        kda_commitless_verify: commitless_verify(&resolved),
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -1398,7 +1404,9 @@ pub(crate) const MLA_LATENT_PART: &str = "mla";
 /// `block_tokens` tokens, so its bytes are the DSA layers' alone. Each KDA layer
 /// keeps its state in a slot of one of those blocks, padded to an MLA page, and
 /// the KDA layers are dealt over `kda_groups` groups: a request holds one block
-/// per group, `kda_groups` blocks however few KDA layers fill the last one. The
+/// per group, `kda_groups` blocks however few KDA layers fill the last one, and
+/// `kda_state_pages` such sets when each layer keeps that many state pages per
+/// request (a per-position speculative verify keeps `1 + k`). The
 /// kpool tail, the raw index keys of a pool still filling up, takes one more
 /// block per request and is never reused by a prefix hit. vLLM reserves one null
 /// block out of the pool.
@@ -1408,6 +1416,7 @@ pub(crate) fn hybrid_kv_cache_layout(
     dsa_layers: u32,
     kda_layers: u32,
     kda_groups: u32,
+    kda_state_pages: u32,
     block_tokens: u32,
     attn_tp: u16,
 ) -> KvCacheLayout {
@@ -1433,14 +1442,16 @@ pub(crate) fn hybrid_kv_cache_layout(
                 .replicated(tp),
         );
     if kda_layers > 0 {
-        // One rank's slice of every KDA layer's state, times the ranks.
+        // One rank's slice of every KDA layer's state, times the ranks and
+        // the state pages each request keeps per layer.
         let ranks = u64::from(tp);
+        let pages = u64::from(kda_state_pages);
         layout = layout.with_part(
             KvCachePart::per_request(
                 "kda",
-                ranks * u64::from(kda_layers) * kda_state_bytes_per_layer,
+                pages * ranks * u64::from(kda_layers) * kda_state_bytes_per_layer,
             )
-            .padded_to(ranks * u64::from(kda_groups) * block_bytes)
+            .padded_to(pages * ranks * u64::from(kda_groups) * block_bytes)
             .sharded(tp),
         );
     }
@@ -1470,6 +1481,13 @@ pub(crate) fn kda_layer_state_bytes_per_request(resolved: &Glm53FlashVllmResolve
     u64::from(resolved.kda.ssm_state_bytes_per_request)
         + u64::from(resolved.kda.conv_state_bytes_per_request)
         + u64::from(resolved.kda.verify_cache_bytes_per_request)
+}
+
+/// Whether a verify graph stores a KDA state per position, with no commit.
+pub(crate) fn commitless_verify(resolved: &Glm53FlashVllmResolved) -> bool {
+    let kda = &resolved.kda.raw_cfg;
+    kda.decode_query_len > 1
+        && kda.spec_verify == crate::worklet::KdaSpecVerify::RecurrentPerPosition
 }
 
 /// What a speculative verify's RecoverSSM commit needs from a Flash graph.

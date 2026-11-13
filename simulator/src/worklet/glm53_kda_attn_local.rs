@@ -22,9 +22,16 @@
 //!
 //! The state pool is fp32 (vLLM's default) or bf16 (`--mamba-ssm-cache-dtype
 //! bfloat16`). The pool dtype sizes the per-request state and its gather and
-//! scatter, and keys the RecoverSSM verify and commit rows. A bf16 pool is
-//! modeled only for a verify graph: the recurrent and chunked-prefill rows
-//! carry no state-dtype axis and stay fp32-pool measurements.
+//! scatter, and keys the verify rows (RecoverSSM verify and commit, or the
+//! per-position recurrent call). A bf16 pool is modeled only for a verify
+//! graph: the chunked-prefill rows carry no state-dtype axis and stay
+//! fp32-pool measurements.
+//!
+//! A verify graph's core is one of two kernels ([`KdaSpecVerify`]): RecoverSSM
+//! (verify here, commit billed by the arch; one state per request), or the
+//! vLLM fork's GLM path, `fused_recurrent_kda` over `[B, 1 + k]` state slots,
+//! which writes a full state at every position and so holds `1 + k` state
+//! pages per request.
 //!
 //! The prefill core's q/k/v `.contiguous()` copies and the FLA chain's
 //! scratch fills run inside the call `kda_chunk_prefill` times, so they have no
@@ -75,6 +82,24 @@ const BETA_SIGMOID_OUT_BYTES_PER_HEAD: u32 = 4;
 /// (`merge_gate_b`).
 const GATE_B_BMM_BACKENDS: &[&str] = &["torch_bmm_packed_lhs"];
 
+/// How a speculative verify advances the KDA state.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum KdaSpecVerify {
+    /// RecoverSSM: the verify reads each request's state once and caches a
+    /// correction per row; a commit folds the accepted rows into the one
+    /// state the request keeps.
+    #[default]
+    Recoverssm,
+    /// The vLLM fork's GLM path (`kda.py` spec branch): `fused_recurrent_kda`
+    /// reads the last accepted state and stores the state after every
+    /// position into that position's slot, so a request holds `1 + k` state
+    /// pages and needs no commit.
+    RecurrentPerPosition,
+}
+
 #[derive(Clone, Debug)]
 pub struct Glm53KdaAttnLocalWorkletConfig {
     pub hidden: Dim,
@@ -97,9 +122,11 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     pub chunk_prefill_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
     /// Query rows per decode request: 1 for plain decode, `k + 1` for a
-    /// speculative verify. Above 1 the decode core is the RecoverSSM verify
-    /// and commit instead of the recurrent step.
+    /// speculative verify. Above 1 the decode core is the verify kernel
+    /// `spec_verify` selects.
     pub decode_query_len: u32,
+    /// The verify kernel of a graph with `decode_query_len > 1`.
+    pub spec_verify: KdaSpecVerify,
     /// Element type of the recurrent state pool (fp32 or bf16).
     pub ssm_state_dtype: DType,
     /// Not the fork's path: run `f_b` and `g_b` as one batched GEMM over the
@@ -123,8 +150,9 @@ pub struct Glm53KdaAttnLocalWorkletResolved {
     pub state_gather: crate::timing::kernels::ElementwiseKernelConfig,
     pub chunk_prefill: KdaChunkPrefillKernelConfig,
     pub recurrent_decode: KdaRecurrentDecodeKernelConfig,
-    /// The decode core of a verify graph (`decode_query_len > 1`) in place of
-    /// `recurrent_decode`.
+    /// The decode core of a RecoverSSM verify graph (`decode_query_len > 1`)
+    /// in place of `recurrent_decode`. A per-position verify keeps
+    /// `recurrent_decode`, keyed at `decode_query_len` tokens per request.
     pub recoverssm_verify: Option<KdaRecoverSSMVerifyKernelConfig>,
     pub state_scatter: crate::timing::kernels::ElementwiseKernelConfig,
     pub gated_norm: crate::timing::kernels::ElementwiseKernelConfig,
@@ -135,6 +163,10 @@ pub struct Glm53KdaAttnLocalWorkletResolved {
     /// bf16 `(kernel_size - 1 + decode_query_len - 1)`-token conv window of one
     /// request on this rank.
     pub conv_state_bytes_per_request: u32,
+    /// State pages (SSM state + conv window) one request holds per layer: 1,
+    /// or `decode_query_len` for a per-position verify (vLLM `MambaSpec`
+    /// `1 + num_speculative_blocks`).
+    pub state_pages_per_request: u32,
     /// RecoverSSM's per-row verify records of one request on this rank: an
     /// fp32 correction `[H, rows, V]` and an activation-dtype key/gate
     /// `[H, rows, 2K]` (vLLM `append_kda_recoverssm_record`). Zero for plain
@@ -152,7 +184,7 @@ pub struct Glm53KdaAttnLocalWorkletInput {
 
 /// The kernel that advances decode requests' recurrent state.
 pub enum KdaDecodeCore {
-    /// One token per request: `fused_recurrent_kda`.
+    /// `fused_recurrent_kda`: one token per request, or a per-position verify.
     Recurrent(Op<KdaRecurrentDecodeKernel>),
     /// A speculative verify: RecoverSSM reads each request's checkpoint once,
     /// scores its rows, and caches a correction and key/gate per row for the
@@ -214,6 +246,9 @@ impl Glm53KdaAttnLocalWorklet {
         );
         let ssm_state_bytes_per_request =
             heads * head_dim * head_dim * cfg.ssm_state_dtype.size_bytes();
+        let verify = cfg.decode_query_len > 1;
+        let per_position = verify && cfg.spec_verify == KdaSpecVerify::RecurrentPerPosition;
+        let recoverssm = verify && cfg.spec_verify == KdaSpecVerify::Recoverssm;
         assert_eq!(
             ssm_state_bytes_per_request % STATE_TRANSFER_UNIT_BYTES,
             0,
@@ -249,8 +284,7 @@ impl Glm53KdaAttnLocalWorklet {
                 // A verify runs `causal_conv1d_update` in its varlen
                 // speculative form over `decode_query_len` rows per request
                 // (fork `kda.py` spec branch); plain decode keeps one row.
-                tokens_per_request: (cfg.decode_query_len > 1)
-                    .then(|| cfg.decode_query_len.into()),
+                tokens_per_request: (cfg.decode_query_len > 1).then(|| cfg.decode_query_len.into()),
             },
             prefill_small_glue: ew(
                 heads * BETA_SIGMOID_IN_BYTES_PER_HEAD,
@@ -270,21 +304,21 @@ impl Glm53KdaAttnLocalWorklet {
                 num_heads: cfg.num_heads.clone(),
                 head_dim: cfg.head_dim.clone(),
                 dtype: cfg.activation_dtype,
+                state_dtype: cfg.ssm_state_dtype,
+                tokens_per_request: per_position.then(|| cfg.decode_query_len.into()),
             },
-            recoverssm_verify: (cfg.decode_query_len > 1).then(|| {
-                KdaRecoverSSMVerifyKernelConfig {
-                    backends: match cfg.ssm_state_dtype {
-                        DType::Bf16 => RECOVERSSM_VERIFY_BF16_BACKENDS,
-                        _ => RECOVERSSM_VERIFY_FP32_BACKENDS,
-                    }
-                    .to_vec(),
-                    gpu_name: cfg.gpu_name.clone(),
-                    num_heads: cfg.num_heads.clone(),
-                    head_dim: cfg.head_dim.clone(),
-                    spec_query_len: cfg.decode_query_len.into(),
-                    dtype: cfg.activation_dtype,
-                    state_dtype: cfg.ssm_state_dtype,
+            recoverssm_verify: recoverssm.then(|| KdaRecoverSSMVerifyKernelConfig {
+                backends: match cfg.ssm_state_dtype {
+                    DType::Bf16 => RECOVERSSM_VERIFY_BF16_BACKENDS,
+                    _ => RECOVERSSM_VERIFY_FP32_BACKENDS,
                 }
+                .to_vec(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_heads: cfg.num_heads.clone(),
+                head_dim: cfg.head_dim.clone(),
+                spec_query_len: cfg.decode_query_len.into(),
+                dtype: cfg.activation_dtype,
+                state_dtype: cfg.ssm_state_dtype,
             }),
             state_scatter: ew(STATE_TRANSFER_UNIT_BYTES, STATE_TRANSFER_UNIT_BYTES),
             // rmsnorm(o) * w * sigmoid(g): reads o and g, writes the gated o.
@@ -295,7 +329,12 @@ impl Glm53KdaAttnLocalWorklet {
             conv_state_bytes_per_request: conv_channels
                 * (cfg.conv_kernel_size.get() - 1 + cfg.decode_query_len - 1)
                 * bpe,
-            verify_cache_bytes_per_request: if cfg.decode_query_len > 1 {
+            state_pages_per_request: if per_position {
+                cfg.decode_query_len
+            } else {
+                1
+            },
+            verify_cache_bytes_per_request: if recoverssm {
                 heads
                     * cfg.decode_query_len
                     * (head_dim * DType::Fp32.size_bytes() + 2 * head_dim * bpe)
@@ -519,12 +558,18 @@ impl Glm53KdaAttnLocalWorklet {
             ev,
         );
         match &self.decode_core {
+            // Plain decode: a prefill-bearing iteration chunks its decodes.
+            // A verify keeps its spec decodes on this call beside any prefill.
             KdaDecodeCore::Recurrent(op) => push_or_zero(
                 op,
                 KdaRecurrentDecodeKernelInput {
                     batch_size: input.decode_batch_size,
                 },
-                w.prefill_bearing,
+                if w.verify {
+                    input.decode_batch_size == 0
+                } else {
+                    w.prefill_bearing
+                },
                 ev,
             ),
             KdaDecodeCore::RecoverSsmVerify(op) => push_or_zero(
@@ -665,6 +710,7 @@ mod tests {
             chunk_prefill_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
             decode_query_len: 1,
+            spec_verify: KdaSpecVerify::Recoverssm,
             ssm_state_dtype: DType::Fp32,
             merge_gate_b: false,
         }
@@ -852,5 +898,33 @@ mod tests {
         let tree = builder.finish(root);
         assert_eq!(tree.slots.len(), 12);
         assert_eq!(tree.slots[8].name, "m.kda.recoverssm_verify");
+    }
+
+    #[test]
+    fn a_per_position_verify_keeps_the_recurrent_call_and_one_page_per_position() {
+        let mut fork = cfg();
+        fork.decode_query_len = 8;
+        fork.spec_verify = KdaSpecVerify::RecurrentPerPosition;
+        fork.ssm_state_dtype = DType::Bf16;
+        let r = Glm53KdaAttnLocalWorklet::resolve_config(&fork);
+        assert!(r.recoverssm_verify.is_none());
+        assert_eq!(r.recurrent_decode.tokens_per_request, Some(8.into()));
+        assert_eq!(r.recurrent_decode.state_dtype, DType::Bf16);
+        // 1 + k pages, no RecoverSSM records.
+        assert_eq!(r.state_pages_per_request, 8);
+        assert_eq!(r.verify_cache_bytes_per_request, 0);
+        assert_eq!(r.ssm_state_bytes_per_request, 16 * 128 * 128 * 2);
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let worklet = Glm53KdaAttnLocalWorklet::build("m.kda".into(), r, &bridge).unwrap();
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        let tree = builder.finish(root);
+        assert_eq!(tree.slots[8].name, "m.kda.recurrent_decode");
+        // RecoverSSM keeps one page.
+        fork.spec_verify = KdaSpecVerify::Recoverssm;
+        let r = Glm53KdaAttnLocalWorklet::resolve_config(&fork);
+        assert_eq!(r.state_pages_per_request, 1);
+        assert_eq!(r.recurrent_decode.tokens_per_request, None);
     }
 }

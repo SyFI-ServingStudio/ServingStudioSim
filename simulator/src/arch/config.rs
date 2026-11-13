@@ -111,6 +111,8 @@ impl KdaStateDtype {
 
 const KDA_STATE_DTYPES: [&str; 2] = ["fp32", "bf16"];
 
+const KDA_SPEC_VERIFIES: [&str; 2] = ["recoverssm", "recurrent_per_position"];
+
 const ROUTING_KINDS: [&str; 4] = ["uniform", "random", "popularity", "corpus"];
 
 // Only the GLM-5.2 NVFP4 and DeepSeek-V4.1 archs read a token corpus so far;
@@ -1556,6 +1558,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "fp32", choices = KDA_STATE_DTYPES, cache_key)]
         kda_state_dtype: KdaStateDtype,
+        /// How the verify advances the KDA state: `recoverssm` (verify +
+        /// commit, one state per request) or `recurrent_per_position` (the
+        /// vLLM fork's GLM path: `fused_recurrent_kda` storing a state per
+        /// position, `1 + draft_tokens` state pages per request, no commit).
+        #[serde(default)]
+        #[param(string, default = "recoverssm", choices = KDA_SPEC_VERIFIES, cache_key)]
+        kda_spec_verify: crate::worklet::KdaSpecVerify,
     },
     /// [`Self::Glm53FlashVllmNvfp4DpAttnEpMoe`] verifying a DFlash2 proposer's
     /// drafts, one TP1 proposer per attention DP rank. See
@@ -1630,6 +1639,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "fp32", choices = KDA_STATE_DTYPES, cache_key)]
         kda_state_dtype: KdaStateDtype,
+        /// How the verify advances the KDA state: `recoverssm` (verify +
+        /// commit, one state per request) or `recurrent_per_position` (the
+        /// vLLM fork's GLM path: `fused_recurrent_kda` storing a state per
+        /// position, `1 + draft_tokens` state pages per request, no commit).
+        #[serde(default)]
+        #[param(string, default = "recoverssm", choices = KDA_SPEC_VERIFIES, cache_key)]
+        kda_spec_verify: crate::worklet::KdaSpecVerify,
         /// SGLang HiSparse KV offload (`arch::hisparse`) of the 11 DSA layers,
         /// enabled by setting this: the per-request latent buffer on the GPU,
         /// in token slots per layer. Their kpool index cache stays on the GPU,
@@ -1830,6 +1846,13 @@ pub enum IterArchSel {
         #[serde(default = "default_kda_tp_fused_kda_state_dtype")]
         #[param(string, default = "bf16", choices = KDA_STATE_DTYPES, cache_key)]
         kda_state_dtype: KdaStateDtype,
+        /// How the verify advances the KDA state: `recoverssm` (the default:
+        /// verify + commit, one state per request) or `recurrent_per_position`
+        /// (the vLLM fork's GLM path, `1 + draft_tokens` state pages per
+        /// request, no commit).
+        #[serde(default)]
+        #[param(string, default = "recoverssm", choices = KDA_SPEC_VERIFIES, cache_key)]
+        kda_spec_verify: crate::worklet::KdaSpecVerify,
         /// How the mHC post/pre boundaries are priced
         /// ([`crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::MhcBoundary`]).
         #[serde(default)]

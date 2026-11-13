@@ -1639,6 +1639,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     kernel_path: Glm53FlashKernelPath,
     verify_width: u32,
     kda_state_dtype: DType,
+    kda_spec_verify: crate::worklet::KdaSpecVerify,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1667,6 +1668,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     configs.dsa.decode_next_n = verify_width;
     configs.kda.decode_query_len = verify_width;
     configs.kda.ssm_state_dtype = kda_state_dtype;
+    configs.kda.spec_verify = kda_spec_verify;
     let resolved = glm53_flash_vllm_fp8_kda_dsa_moe::resolve_configs(&configs);
     glm53_flash_vllm_fp8_kda_dsa_moe::build(name.to_string(), resolved, bridge)
         .context("building GLM-5.3-Flash model (often a missing profile.db row)")
@@ -2033,6 +2035,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     kernel_path: Glm53FlashKernelPath,
     verify_width: u32,
     kda_state_dtype: DType,
+    kda_spec_verify: crate::worklet::KdaSpecVerify,
     hisparse: Option<&HisparseConfig>,
     ep_comm: &EpCommConfig,
     fusions: crate::arch::config::Glm53FlashFusions,
@@ -2089,6 +2092,8 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     configs.local.kda.ssm_state_dtype = kda_state_dtype;
     configs.kda_tp1.decode_query_len = verify_width;
     configs.kda_tp1.ssm_state_dtype = kda_state_dtype;
+    configs.local.kda.spec_verify = kda_spec_verify;
+    configs.kda_tp1.spec_verify = kda_spec_verify;
     let resolved = glm53_flash_vllm_fp8_dp_attn_ep_moe::resolve_configs(&configs);
     let model = glm53_flash_vllm_fp8_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
         .context("building GLM-5.3-Flash DP-attention/EP model (often a missing profile.db row)")?;
@@ -2303,6 +2308,7 @@ pub fn glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(
         cudagraph_capture_sizes,
         draft_tokens,
         kda_state_dtype,
+        kda_spec_verify,
         ..
     } = sel
     else {
@@ -2322,6 +2328,7 @@ pub fn glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(
         glm53_flash_kernel_path(sel)?,
         *draft_tokens + 1,
         kda_state_dtype.dtype(),
+        *kda_spec_verify,
         gpu,
         name,
         bridge,
@@ -2361,6 +2368,7 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         cudagraph_capture_sizes,
         draft_tokens,
         kda_state_dtype,
+        kda_spec_verify,
         attn_tp,
         attn_all_reduce_row_gpus,
         attn_tp_layers,
@@ -2384,6 +2392,7 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         glm53_flash_kernel_path(sel)?,
         *draft_tokens + 1,
         kda_state_dtype.dtype(),
+        *kda_spec_verify,
         sel.hisparse().as_ref(),
         &sel.ep_comm(),
         sel.glm53_flash_fusions()?,
@@ -3052,6 +3061,7 @@ pub fn build_iter_model(
             glm53_flash_kernel_path(sel)?,
             1,
             DType::Fp32,
+            crate::worklet::KdaSpecVerify::Recoverssm,
             gpu,
             name,
             bridge,
@@ -3187,6 +3197,7 @@ pub fn build_iter_model(
             glm53_flash_kernel_path(sel)?,
             1,
             DType::Fp32,
+            crate::worklet::KdaSpecVerify::Recoverssm,
             sel.hisparse().as_ref(),
             &sel.ep_comm(),
         sel.glm53_flash_fusions()?,
@@ -4648,6 +4659,67 @@ mod tests {
     /// window twice: beside KDA the window is already per-request state, so
     /// the host tier's device bytes are the latent buffer alone, and the KDA
     /// state plus window is unchanged.
+    #[test]
+    fn glm53_flash_dp_dflash2_per_position_verify_keeps_a_page_per_position_and_no_commit() {
+        // The fork's GLM verify (`fused_recurrent_kda` over [B, 1 + k] slots):
+        // no RecoverSSM leaf or commit, the recurrent call keyed at 8 tokens
+        // per request, and 8 KDA state pages (SSM state + conv window, no
+        // RecoverSSM records) per request per layer, padded per page set.
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let sel = |mode: &str, dtype: &str| -> IterArchSel {
+            serde_json::from_value(serde_json::json!({
+                "type": "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+                "model_config": Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("model/config/glm53_flash_nvfp4.json"),
+                "fp8": false,
+                "ep_size": 8,
+                "max_model_len": 131_072,
+                "draft_tokens": 7,
+                "kda_state_dtype": dtype,
+                "kda_spec_verify": mode,
+            }))
+            .unwrap()
+        };
+        let build = |mode: &str, dtype: &str| {
+            glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
+                &sel(mode, dtype),
+                "NVIDIA B200",
+                "test",
+                &bridge,
+            )
+            .unwrap()
+        };
+        let kda_part = |layout: &KvCacheLayout| {
+            layout
+                .parts
+                .iter()
+                .find(|part| part.name == "kda")
+                .map(|part| part.bytes_per_entry)
+                .unwrap()
+        };
+        let fork = build("recurrent_per_position", "fp32");
+        let slots = fork.cost_log_manifest().slots;
+        assert!(slots
+            .iter()
+            .all(|slot| !slot.kind.starts_with("kda_recoverssm")));
+        assert!(slots.iter().any(|slot| slot.kind == "kda_recurrent_decode"));
+        // 64 heads x 128 x 128 fp32 state + bf16 conv window of 24576 x (3 + 7).
+        let page = 64 * 128 * 128 * 4 + 24_576 * 10 * 2;
+        assert!(kda_part(&fork.kv_cache_layout()) >= 8 * 34 * page);
+        assert_eq!(kda_part(&fork.kv_cache_layout()) % 8, 0);
+        let fork_bf16 = build("recurrent_per_position", "bf16");
+        let recoverssm = build("recoverssm", "bf16");
+        assert!(recoverssm
+            .cost_log_manifest()
+            .slots
+            .iter()
+            .any(|slot| slot.kind == "kda_recoverssm_commit"));
+        assert!(
+            kda_part(&fork_bf16.kv_cache_layout()) > 4 * kda_part(&recoverssm.kv_cache_layout())
+        );
+    }
+
     #[test]
     fn glm53_flash_dp_dflash2_hisparse_keeps_the_window_as_state() {
         use crate::arch::contract::KvHostOffload;

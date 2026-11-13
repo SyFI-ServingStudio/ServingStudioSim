@@ -92,8 +92,12 @@ pub trait Dflash2VerifyTarget: IterwiseUnifiedModel {
     /// Query rows per decode request the graph was compiled for.
     fn verify_width(&self) -> u32;
     /// The RecoverSSM commit its KDA layers need after a verify; `None` for a
-    /// target without recurrent layers.
+    /// target without recurrent layers or one whose verify needs none.
     fn kda_commit(&self) -> Option<&KdaCommitPlan>;
+    /// Its KDA verify stores a state per position and needs no commit.
+    fn kda_commitless_verify(&self) -> bool {
+        false
+    }
     fn compile_target(&self, builder: &mut CostTreeBuilder) -> CostNode;
     fn eval_target(&self, input: &UnifiedArchInput, ev: &mut Evaluator);
     /// Ranks of one attention DP group that split its requests between their
@@ -113,6 +117,10 @@ impl Dflash2VerifyTarget for Glm53FlashVllmModel {
 
     fn kda_commit(&self) -> Option<&KdaCommitPlan> {
         self.kda_commit.as_ref()
+    }
+
+    fn kda_commitless_verify(&self) -> bool {
+        self.kda_commitless_verify
     }
 
     fn compile_target(&self, builder: &mut CostTreeBuilder) -> CostNode {
@@ -139,6 +147,10 @@ impl Dflash2VerifyTarget for Glm53FlashDpAttnEpModel {
 
     fn kda_commit(&self) -> Option<&KdaCommitPlan> {
         self.kda_commit.as_ref()
+    }
+
+    fn kda_commitless_verify(&self) -> bool {
+        self.kda_commitless_verify
     }
 
     fn compile_target(&self, builder: &mut CostTreeBuilder) -> CostNode {
@@ -510,7 +522,8 @@ pub fn build<T: Dflash2VerifyTarget>(
         .iter()
         .any(|part| part.name == KDA_STATE_PART && part.growth == KvGrowth::PerRequest);
     let plan = match (target.kda_commit(), recurrent) {
-        (Some(plan), true) => Some(plan),
+        (Some(plan), true) if !target.kda_commitless_verify() => Some(plan),
+        (None, true) if target.kda_commitless_verify() => None,
         (None, false) => None,
         (plan, _) => {
             return Err(BuildError::FitFailed {
