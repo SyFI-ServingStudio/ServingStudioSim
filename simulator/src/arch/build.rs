@@ -2072,6 +2072,8 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         ep_comm: ep_comm.clone(),
         mhc_boundary: fusions.mhc_boundary,
         router_gate_once: fusions.router_gate_once,
+        routed_moe_whatif: fusions.routed_moe_whatif,
+        moe_shared_overlap: fusions.moe_shared_overlap,
         attn_tp,
         attn_all_reduce_row_gpus,
         attn_tp_layers,

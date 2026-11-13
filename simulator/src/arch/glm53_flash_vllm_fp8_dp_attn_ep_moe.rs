@@ -156,6 +156,10 @@ pub struct Glm53FlashDpAttnEpParallel {
     /// Compute the router gate once per MoE layer (the fork since #55736)
     /// instead of twice (the 2026-09 alignment capture's line).
     pub router_gate_once: bool,
+    /// What-if pricing of the routed-expert call; `None` is its rows.
+    pub routed_moe_whatif: Option<RoutedMoeWhatIf>,
+    /// How the aux-stream shared expert overlaps the MoE chain.
+    pub moe_shared_overlap: MoeSharedOverlap,
     /// Attention tensor-parallel degree inside each attention DP group (module
     /// doc, "Attention DP x TP"): `dp_size / attn_tp` groups; 1 is plain DP
     /// attention.
@@ -193,6 +197,140 @@ pub enum MhcBoundaryPricing {
     /// boundary does not bill it again. The last MoE layer's add goes to the
     /// terminal post, which stays as measured.
     OneLaunchKernel,
+}
+
+/// How the aux-stream shared expert (local rows <= 256) is composed with the
+/// MoE chain. vLLM launches it before the router gate and the dispatch
+/// (`runner/moe_runner.py` `_forward_impl`, `maybe_forward_async`) and joins it
+/// after the modular kernel's finalize (`_apply_quant_method`,
+/// `SharedExperts.wait`), so it can run beside the whole chain.
+/// `SHARED_EXPERTS_STREAM_OVERLAP` was calibrated on the routed and shared
+/// kernels slowing each other (union / isolated max), not on the collectives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoeSharedOverlap {
+    /// `Parallel{overlap}[dispatch + routed + combine, shared]` for every
+    /// step, also when no rank runs the shared expert on the aux stream
+    /// (all local rows > 256), where the whole chain is still x 1/overlap.
+    #[default]
+    Chain,
+    /// `dispatch + Parallel{overlap}[routed, shared] + combine` when some rank
+    /// runs the shared expert on the aux stream, else `dispatch + routed +
+    /// combine` with no overlap factor. Same as the fork's structure while
+    /// the shared expert is no longer than the routed call.
+    RoutedOnly,
+}
+
+/// The `moe_shared_overlap` choices the launcher schema advertises.
+pub const MOE_SHARED_OVERLAPS: [&str; 2] = ["chain", "routed_only"];
+
+/// What-if: the routed-expert call (`routed_rank*.fused_moe`) priced from an
+/// external per-token-count table of another kernel instead of only its rows.
+/// Every leaf it touches is flagged `extrapolated`.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutedMoeWhatIf {
+    pub mode: RoutedMoeWhatIfMode,
+    /// Sorted by `tokens`; linear between points. Outside the table the
+    /// nearest point's ours / production ratio scales the row (both modes).
+    pub points: Vec<RoutedMoeWhatIfPoint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutedMoeWhatIfMode {
+    /// Every EP rank's call costs `ours_us` at its token count.
+    Absolute,
+    /// Every EP rank's row is scaled by `ours_us / production_us`.
+    Ratio,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutedMoeWhatIfPoint {
+    /// Tokens in one call on one rank after the dispatch all-gather.
+    pub tokens: u32,
+    pub ours_us: f64,
+    pub production_us: f64,
+}
+
+impl RoutedMoeWhatIf {
+    /// Reads and checks the JSON table at `path`.
+    pub fn load(path: &str) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("routed_moe_whatif_file {path}: {e}"))?;
+        let table: Self = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("routed_moe_whatif_file {path}: {e}"))?;
+        anyhow::ensure!(
+            !table.points.is_empty(),
+            "routed_moe_whatif_file {path}: no points"
+        );
+        for w in table.points.windows(2) {
+            anyhow::ensure!(
+                w[0].tokens < w[1].tokens,
+                "routed_moe_whatif_file {path}: points must be sorted by tokens, strictly"
+            );
+        }
+        for p in &table.points {
+            anyhow::ensure!(
+                p.ours_us > 0.0 && p.production_us > 0.0,
+                "routed_moe_whatif_file {path}: us must be positive at {} tokens",
+                p.tokens
+            );
+        }
+        Ok(table)
+    }
+
+    /// `(ours_us, production_us)` at `tokens`, or `None` outside the table.
+    fn interpolate(&self, tokens: u32) -> Option<(f64, f64)> {
+        let i = self.points.partition_point(|p| p.tokens < tokens);
+        let hi = self.points.get(i)?;
+        if hi.tokens == tokens {
+            return Some((hi.ours_us, hi.production_us));
+        }
+        let lo = self.points.get(i.checked_sub(1)?)?;
+        let f = f64::from(tokens - lo.tokens) / f64::from(hi.tokens - lo.tokens);
+        Some((
+            lo.ours_us + f * (hi.ours_us - lo.ours_us),
+            lo.production_us + f * (hi.production_us - lo.production_us),
+        ))
+    }
+
+    /// The what-if cost of one call whose row reads `measured_ms`.
+    pub fn price_ms(&self, measured_ms: f64, tokens: u32) -> f64 {
+        match (self.mode, self.interpolate(tokens)) {
+            (RoutedMoeWhatIfMode::Absolute, Some((ours, _))) => ours / 1e3,
+            (RoutedMoeWhatIfMode::Ratio, Some((ours, prod))) => measured_ms * ours / prod,
+            (_, None) => {
+                let first = self.points[0];
+                let last = self.points[self.points.len() - 1];
+                let edge = if tokens < first.tokens { first } else { last };
+                measured_ms * edge.ours_us / edge.production_us
+            }
+        }
+    }
+}
+
+/// One rank's routed-expert call, through the what-if table when one is set.
+fn push_routed_fused_moe(
+    op: &Op<Nvfp4FusedMoeKernel>,
+    num_tokens: u32,
+    whatif: Option<&RoutedMoeWhatIf>,
+    zero: bool,
+    ev: &mut Evaluator,
+) {
+    let input = Nvfp4FusedMoeKernelInput { num_tokens };
+    if zero {
+        return ev.push(LeafMetrics::ZERO, || input.clone().into());
+    }
+    let Some(table) = whatif.filter(|_| num_tokens > 0) else {
+        return push(op, input, ev);
+    };
+    let mut metrics = op.kernel.eval(&input);
+    let measured = f64::from(metrics.m.time_ms);
+    metrics.m.time_ms = table.price_ms(measured, num_tokens) as f32;
+    metrics.coverage = metrics.coverage | crate::timing::CoverageFlags::EXTRAPOLATED;
+    ev.push(metrics, || input.clone().into());
 }
 
 /// The one-launch boundary kernels (`MhcBoundaryPricing::OneLaunchKernel`).
@@ -636,6 +774,9 @@ struct MoeBlock {
     exchange: Exchange,
     /// One per EP rank, ranked by routed workload.
     fused_moe: Vec<Op<Nvfp4FusedMoeKernel>>,
+    /// What-if pricing of `fused_moe` (`Glm53FlashDpAttnEpParallel::routed_moe_whatif`).
+    routed_moe_whatif: Option<RoutedMoeWhatIf>,
+    moe_shared_overlap: MoeSharedOverlap,
     /// The shared + routed add; `None` when the next mHC boundary does it
     /// (`MhcBoundaryPricing::OneLaunchKernel`).
     combine_glue: Option<Op<ElementwiseKernel>>,
@@ -958,7 +1099,7 @@ impl MoeBlock {
             Exchange::MeasuredAllgather { dispatch, .. } => vec![dispatch.compile(builder)],
             Exchange::Configured(exchange) => exchange.compile_dispatch(dp, builder),
         };
-        chain.push(CostNode::Labeled {
+        let routed = |builder: &mut CostTreeBuilder| CostNode::Labeled {
             label: format!("{}.ep_ranks (max over EP ranks)", self.name),
             child: Box::new(CostNode::Max {
                 overlap: 1.0,
@@ -968,7 +1109,33 @@ impl MoeBlock {
                     .map(|op| op.compile(builder))
                     .collect(),
             }),
-        });
+        };
+        let shared = |builder: &mut CostTreeBuilder| CostNode::Max {
+            overlap: 1.0,
+            children: (0..dp)
+                .map(|_| self.shared_expert.compile(builder))
+                .collect(),
+        };
+        let routed_only = self.moe_shared_overlap == MoeSharedOverlap::RoutedOnly;
+        if routed_only {
+            // Eval fills exactly one of the two routed copies per step.
+            chain.push(CostNode::Labeled {
+                label: format!(
+                    "{}.routed_beside_aux_shared [some rank T_r<={}]",
+                    self.name, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+                ),
+                child: Box::new(CostNode::Parallel {
+                    overlap: SHARED_EXPERTS_STREAM_OVERLAP,
+                    children: vec![routed(builder), shared(builder)],
+                }),
+            });
+            chain.push(CostNode::Labeled {
+                label: format!("{}.routed_alone [every rank T_r>{}]", self.name, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD),
+                child: Box::new(routed(builder)),
+            });
+        } else {
+            chain.push(routed(builder));
+        }
         let path = match &self.exchange {
             Exchange::MeasuredAllgather { combine, .. } => {
                 chain.push(combine.compile(builder));
@@ -986,13 +1153,17 @@ impl MoeBlock {
                 )
             }
         };
-        let concurrent_shared = CostNode::Max {
-            overlap: 1.0,
-            children: (0..dp)
-                .map(|_| self.shared_expert.compile(builder))
-                .collect(),
-        };
-        let mut sections = vec![CostNode::Labeled {
+        let mut sections = vec![if routed_only {
+            CostNode::Labeled {
+                label: format!(
+                    "{} (MoE) [{path}; aux-stream shared expert at T_r<={} overlaps the routed call only]",
+                    self.name, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+                ),
+                child: Box::new(CostNode::Sum(chain)),
+            }
+        } else {
+            let concurrent_shared = shared(builder);
+            CostNode::Labeled {
                 label: format!(
                     "{} (MoE) [{path}; aux-stream shared expert at T_r<={} overlaps]",
                     self.name, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
@@ -1001,6 +1172,7 @@ impl MoeBlock {
                     overlap: SHARED_EXPERTS_STREAM_OVERLAP,
                     children: vec![CostNode::Sum(chain), concurrent_shared],
                 }),
+            }
         }];
         if let Some(glue) = &self.combine_glue {
             sections.push(CostNode::Labeled {
@@ -1057,14 +1229,40 @@ impl MoeBlock {
                 Some(step)
             }
         };
-        for op in &self.fused_moe {
-            push(
-                op,
-                Nvfp4FusedMoeKernelInput {
-                    num_tokens: batch.gathered_tokens,
-                },
-                ev,
-            );
+        let push_routed = |zero: bool, ev: &mut Evaluator| {
+            for op in &self.fused_moe {
+                push_routed_fused_moe(
+                    op,
+                    batch.gathered_tokens,
+                    self.routed_moe_whatif.as_ref(),
+                    zero,
+                    ev,
+                );
+            }
+        };
+        let push_shared = |ev: &mut Evaluator| {
+            for rank in &batch.ranks {
+                self.shared_expert.eval_or_zero(
+                    &Glm53MlpLocalWorkletInput {
+                        num_tokens: rank.rows,
+                    },
+                    rank.rows > SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
+                    ev,
+                );
+            }
+        };
+        let routed_only = self.moe_shared_overlap == MoeSharedOverlap::RoutedOnly;
+        if routed_only {
+            // Compile order: Parallel[routed, shared], then the lone routed copy.
+            let beside_shared = batch
+                .ranks
+                .iter()
+                .any(|rank| rank.rows > 0 && rank.rows <= SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD);
+            push_routed(!beside_shared, ev);
+            push_shared(ev);
+            push_routed(beside_shared, ev);
+        } else {
+            push_routed(false, ev);
         }
         match (&self.exchange, step) {
             (Exchange::MeasuredAllgather { combine, .. }, _) => push(
@@ -1079,14 +1277,8 @@ impl MoeBlock {
             }
             (Exchange::Configured(_), None) => unreachable!("the dispatch computed the step"),
         }
-        for rank in &batch.ranks {
-            self.shared_expert.eval_or_zero(
-                &Glm53MlpLocalWorkletInput {
-                    num_tokens: rank.rows,
-                },
-                rank.rows > SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
-                ev,
-            );
+        if !routed_only {
+            push_shared(ev);
         }
         if let Some(glue) = &self.combine_glue {
             for rank in &batch.ranks {
@@ -1359,6 +1551,8 @@ fn build_group(
                         )
                     })
                     .collect::<std::result::Result<_, _>>()?,
+                routed_moe_whatif: cfg.parallel.routed_moe_whatif.clone(),
+                moe_shared_overlap: cfg.parallel.moe_shared_overlap,
                 combine_glue: cfg
                     .mhc_one_launch
                     .is_none()
@@ -2048,6 +2242,55 @@ mod tests {
     use crate::timing::kernels::MoeAlltoallDirection;
     use crate::timing::routing::RoutingDistribution;
 
+    fn whatif(mode: RoutedMoeWhatIfMode) -> RoutedMoeWhatIf {
+        let point = |tokens, ours_us, production_us| RoutedMoeWhatIfPoint {
+            tokens,
+            ours_us,
+            production_us,
+        };
+        RoutedMoeWhatIf {
+            mode,
+            points: vec![point(64, 50.0, 100.0), point(1024, 80.0, 100.0), point(4096, 120.0, 150.0)],
+        }
+    }
+
+    #[test]
+    fn routed_moe_whatif_prices_between_and_outside_its_points() {
+        let abs = whatif(RoutedMoeWhatIfMode::Absolute);
+        let ratio = whatif(RoutedMoeWhatIfMode::Ratio);
+        // At a point and halfway between two (linear in tokens).
+        assert!((abs.price_ms(0.2, 1024) - 0.080).abs() < 1e-12);
+        assert!((abs.price_ms(0.2, 2560) - 0.100).abs() < 1e-12);
+        assert!((ratio.price_ms(0.2, 1024) - 0.2 * 0.8).abs() < 1e-12);
+        // 2560: ours 100, production 125 -> 0.8.
+        assert!((ratio.price_ms(0.2, 2560) - 0.2 * 0.8).abs() < 1e-12);
+        // Outside: the nearest point's ratio scales the row in both modes.
+        assert!((abs.price_ms(0.03, 8) - 0.03 * 0.5).abs() < 1e-12);
+        assert!((abs.price_ms(0.3, 8192) - 0.3 * 0.8).abs() < 1e-12);
+    }
+
+    #[test]
+    fn routed_moe_whatif_file_is_checked() {
+        let dir = std::env::temp_dir().join(format!("routed_moe_whatif_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.json");
+        std::fs::write(
+            &good,
+            r#"{"mode": "ratio", "points": [{"tokens": 64, "ours_us": 53.3, "production_us": 66.1}]}"#,
+        )
+        .unwrap();
+        let table = RoutedMoeWhatIf::load(good.to_str().unwrap()).unwrap();
+        assert_eq!(table.mode, RoutedMoeWhatIfMode::Ratio);
+        let unsorted = dir.join("unsorted.json");
+        std::fs::write(
+            &unsorted,
+            r#"{"mode": "absolute", "points": [{"tokens": 128, "ours_us": 1, "production_us": 1}, {"tokens": 64, "ours_us": 1, "production_us": 1}]}"#,
+        )
+        .unwrap();
+        assert!(RoutedMoeWhatIf::load(unsorted.to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn model_cfg() -> Glm53FlashModelCfg {
         config("glm53_flash")
     }
@@ -2067,6 +2310,8 @@ mod tests {
             ep_comm: EpCommConfig::default(),
             mhc_boundary: Default::default(),
             router_gate_once: false,
+            routed_moe_whatif: None,
+            moe_shared_overlap: Default::default(),
             attn_tp: 1,
             attn_all_reduce_row_gpus: None,
             attn_tp_layers: Default::default(),
@@ -2469,6 +2714,25 @@ mod tests {
             CostNode::Scale { child, .. } | CostNode::Labeled { child, .. } => {
                 leaf_order(child, out)
             }
+        }
+    }
+
+    /// `routed_only` keeps eval and slot order aligned and adds exactly one
+    /// lone routed copy (dp leaves) per MoE layer group.
+    #[test]
+    fn routed_only_overlap_adds_one_routed_copy_in_slot_order() {
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        for dp in [4_u16, 8] {
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let mut p = parallel(dp);
+            p.moe_shared_overlap = MoeSharedOverlap::RoutedOnly;
+            let configs = build_configs(&model_cfg(), &p, &demand).unwrap();
+            let model = build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
+            assert_eq!(model.n_slots, built(dp).n_slots + 2 * usize::from(dp));
+            let mut order = Vec::new();
+            leaf_order(&model.cost_tree().root, &mut order);
+            assert_eq!(order, (0..order.len()).collect::<Vec<_>>());
         }
     }
 

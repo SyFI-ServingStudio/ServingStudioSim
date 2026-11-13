@@ -181,6 +181,8 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         kda_tp_comm_pricing,
         expert_exchange,
         router_gate_once,
+        routed_moe_whatif_file,
+        moe_shared_overlap,
         hisparse_buffer_tokens,
         hisparse_top_k,
         hisparse_host_dram_gb_per_node,
@@ -256,6 +258,8 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         mhc_fuse_fixed_us,
         mhc_one_launch,
         router_gate_once: *router_gate_once,
+        routed_moe_whatif_file: routed_moe_whatif_file.clone(),
+        moe_shared_overlap: *moe_shared_overlap,
     })
 }
 

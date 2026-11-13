@@ -1743,6 +1743,21 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         router_gate_once: bool,
+        /// What-if (`extrapolated`): a JSON table `{"mode": "absolute" | "ratio",
+        /// "points": [{"tokens", "ours_us", "production_us"}, ...]}` that prices
+        /// every EP rank's routed-expert call (routing + FC1 + FC2 + finalize) at
+        /// its gathered token count: `absolute` costs `ours_us`, `ratio` scales
+        /// the row by `ours_us / production_us`; linear between points, the
+        /// nearest point's ratio outside them. Absent: the rows.
+        #[serde(default)]
+        #[param(cache_key)]
+        routed_moe_whatif_file: Option<String>,
+        /// How the aux-stream shared expert (local rows <= 256) overlaps the
+        /// MoE chain
+        /// ([`crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap`]).
+        #[serde(default)]
+        #[param(string, default = "chain", choices = crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MOE_SHARED_OVERLAPS, cache_key)]
+        moe_shared_overlap: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap,
     },
     /// GLM-5.3-Flash NVFP4 + DFlash2 under attention DP with the KDA layers
     /// tensor-parallel in groups of `kda_tp_gpus`, a fused direct-write
@@ -1826,6 +1841,21 @@ pub enum IterArchSel {
         #[serde(default = "default_kda_tp_fused_router_gate_once")]
         #[param(default = true, cache_key)]
         router_gate_once: bool,
+        /// What-if (`extrapolated`): a JSON table `{"mode": "absolute" | "ratio",
+        /// "points": [{"tokens", "ours_us", "production_us"}, ...]}` that prices
+        /// every EP rank's routed-expert call (routing + FC1 + FC2 + finalize) at
+        /// its gathered token count: `absolute` costs `ours_us`, `ratio` scales
+        /// the row by `ours_us / production_us`; linear between points, the
+        /// nearest point's ratio outside them. Absent: the rows.
+        #[serde(default)]
+        #[param(cache_key)]
+        routed_moe_whatif_file: Option<String>,
+        /// How the aux-stream shared expert (local rows <= 256) overlaps the
+        /// MoE chain
+        /// ([`crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap`]).
+        #[serde(default)]
+        #[param(string, default = "chain", choices = crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MOE_SHARED_OVERLAPS, cache_key)]
+        moe_shared_overlap: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap,
         /// SGLang HiSparse KV offload of the 11 DSA layers (as on
         /// [`Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2`]); absent keeps the
         /// whole cache on the GPU.
@@ -2181,9 +2211,27 @@ impl IterArchSel {
             (None, true) => MhcBoundaryPricing::OneLaunchKernel,
             (None, false) => MhcBoundaryPricing::VllmKernel,
         };
+        let moe_shared_overlap = match self {
+            Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+                moe_shared_overlap,
+                ..
+            } => *moe_shared_overlap,
+            _ => Default::default(),
+        };
+        let routed_moe_whatif = match self {
+            Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+                routed_moe_whatif_file: Some(path),
+                ..
+            } => Some(
+                crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::RoutedMoeWhatIf::load(path)?,
+            ),
+            _ => None,
+        };
         Ok(Glm53FlashFusions {
             mhc_boundary,
             router_gate_once,
+            routed_moe_whatif,
+            moe_shared_overlap,
         })
     }
 
@@ -2978,8 +3026,11 @@ mod layerwise_tests {
 
 /// The boundary fusions a GLM-5.3-Flash NVFP4 DP arch prices
 /// ([`IterArchSel::glm53_flash_fusions`]).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Glm53FlashFusions {
     pub mhc_boundary: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MhcBoundaryPricing,
     pub router_gate_once: bool,
+    /// `routed_moe_whatif_file`, read.
+    pub routed_moe_whatif: Option<crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::RoutedMoeWhatIf>,
+    pub moe_shared_overlap: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap,
 }
