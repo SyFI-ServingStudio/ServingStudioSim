@@ -8,9 +8,15 @@ see the file headers). Chain construction, inputs and correctness checks follow 
 lane's bench_p.py. The chain per token band is fixed (no per-shape search):
 
     T <= 64           router (tile table)        + fused kernel, 2-tile L2 weight prefetch
-    64 < T <= 512     same                       + early first-stage A loads (P_EARLY=6)
-    512 < T <= 2048   router MODE 7              + fused kernel as for T <= 64
+    64 < T <= 128     same                       + early first-stage A loads (P_EARLY=6),
+                                                   dynamic tile claim after 4 static rounds
+    128 < T <= 512    same                       + early loads, dynamic claim after 8 rounds
+    512 < T <= 2048   router MODE 7              + fused kernel as for T <= 64,
+                                                   dynamic claim after 8 rounds
     T > 2048          router MODE 5 (cl2 table)  + fused kernel on 2-CTA clusters
+
+Lane P round 19 adopted the dynamic claim (p_fused_dyn.py) at T = 128, 256, 512, 1024
+and 2048; the band edges between those points are this runner's choice.
 
 Every call checks, outside timing: routing outputs exact; FC1 code and scale factors
 bit-exact against the lane's standalone FC1 kernel on host-gathered input; FC2 gates
@@ -51,6 +57,13 @@ _VARIANTS = {  # bench_p P_VARIANTS entries of the adopted chains
     "f_rwepf2_tab": dict(P_GL=32, P_RLX=1, P_ORD=2, P_EVF=1, H_PREPF=1, P_PFN=2),
     "f_rwepf2_tabea6": dict(P_GL=32, P_RLX=1, P_ORD=2, P_EVF=1, H_PREPF=1, P_PFN=2, P_EARLY=6),
     "f_rwepf_cl2tab": dict(P_GL=32, P_RLX=1, P_EVF=1, H_PREPF=1, P_CL=2, P_ORD=2),
+    "f_rwepf2_tabea6d4": dict(
+        P_GL=32, P_RLX=1, P_ORD=2, P_EVF=1, H_PREPF=1, P_PFN=2, P_EARLY=6, P_DYN=4
+    ),
+    "f_rwepf2_tabea6d8": dict(
+        P_GL=32, P_RLX=1, P_ORD=2, P_EVF=1, H_PREPF=1, P_PFN=2, P_EARLY=6, P_DYN=8
+    ),
+    "f_rwepf2_tabd8": dict(P_GL=32, P_RLX=1, P_ORD=2, P_EVF=1, H_PREPF=1, P_PFN=2, P_DYN=8),
 }
 
 
@@ -62,9 +75,15 @@ def chain_for(num_tokens: int) -> dict[str, Any]:
     t = num_tokens
     if t <= 64:
         return dict(name="tfusedrepf2", variant="f_rwepf2_tab", ocfg=(1, 128, 0), bits=256)
+    if t <= 128:
+        return dict(
+            name="tfusedrepf2ea6d4", variant="f_rwepf2_tabea6d4", ocfg=(1, 128, 0), bits=256
+        )
     if t <= 512:
-        tb = 2 if 128 < t <= 256 and t % 2 == 0 else 1
-        return dict(name="tfusedrepf2ea6", variant="f_rwepf2_tabea6", ocfg=(tb, 128, 0), bits=256)
+        tb = 2 if t <= 256 and t % 2 == 0 else 1
+        return dict(
+            name="tfusedrepf2ea6d8", variant="f_rwepf2_tabea6d8", ocfg=(tb, 128, 0), bits=256
+        )
     if t <= 2048:
         tb = next(
             (b for b in ((8, 16) if t <= 1024 else (16, 8)) if t % b == 0 and t // b <= 128), None
@@ -73,7 +92,7 @@ def chain_for(num_tokens: int) -> dict[str, Any]:
             raise ProfilerNotImplemented(
                 f"no MODE 7 router block size for T={t} (needs T % TB == 0, T / TB <= 128)"
             )
-        return dict(name="tfusedrepf2", variant="f_rwepf2_tab", ocfg=(tb, 256, 7), bits=256)
+        return dict(name="tfusedrepf2d8", variant="f_rwepf2_tabd8", ocfg=(tb, 256, 7), bits=256)
     if t % 2:
         raise ProfilerNotImplemented(f"router TB=2 needs even T, got {t}")
     return dict(name="ufusedrepfcl2", variant="f_rwepf_cl2tab", ocfg=(2, 128, 5), bits=512)
@@ -139,7 +158,10 @@ def _run(torch: Any, F: Any, args: dict[str, Any]) -> ComputeMetrics:
     ch = chain_for(T)
     build_dir = str(_cache_dir("route8_build"))
     route_mod = _load("p_route.py", {})
-    pm = _load("p_fused.py", dict(_RUN_ENV, **_FUSED_BASE, **_VARIANTS[ch["variant"]]))
+    var = _VARIANTS[ch["variant"]]
+    pm = _load(
+        "p_fused_dyn.py" if var.get("P_DYN") else "p_fused.py", dict(_RUN_ENV, **_FUSED_BASE, **var)
+    )
     # lane bench_p: host FC1 reference module = n_fc1 "vnb" family with the T-dependent zero bytes
     fc1m = _load(
         "n_fc1.py",

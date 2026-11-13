@@ -25,12 +25,14 @@ def test_registered_under_routed_contract() -> None:
     [
         (1, "tfusedrepf2", (1, 128, 0)),
         (64, "tfusedrepf2", (1, 128, 0)),
-        (128, "tfusedrepf2ea6", (1, 128, 0)),
-        (256, "tfusedrepf2ea6", (2, 128, 0)),
-        (512, "tfusedrepf2ea6", (1, 128, 0)),
-        (1024, "tfusedrepf2", (8, 256, 7)),
-        (1152, "tfusedrepf2", (16, 256, 7)),
-        (2048, "tfusedrepf2", (16, 256, 7)),
+        (72, "tfusedrepf2ea6d4", (1, 128, 0)),
+        (128, "tfusedrepf2ea6d4", (1, 128, 0)),
+        (136, "tfusedrepf2ea6d8", (2, 128, 0)),
+        (256, "tfusedrepf2ea6d8", (2, 128, 0)),
+        (512, "tfusedrepf2ea6d8", (1, 128, 0)),
+        (1024, "tfusedrepf2d8", (8, 256, 7)),
+        (1152, "tfusedrepf2d8", (16, 256, 7)),
+        (2048, "tfusedrepf2d8", (16, 256, 7)),
         (3072, "ufusedrepfcl2", (2, 128, 5)),
         (65536, "ufusedrepfcl2", (2, 128, 5)),
     ],
@@ -49,7 +51,7 @@ def test_unsupported_tokens_raise() -> None:
 
 
 def test_vendored_sources_present() -> None:
-    for f in ("p_fused.py", "n_fc1.py", "p_route.py", "p_route8.cuh"):
+    for f in ("p_fused.py", "p_fused_dyn.py", "n_fc1.py", "p_route.py", "p_route8.cuh"):
         text = (_VENDOR / f).read_text()
         assert "d3563d86" in text  # provenance header
         assert "os.environ.get(" not in text
