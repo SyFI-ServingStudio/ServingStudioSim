@@ -44,6 +44,10 @@ fold (``profiling.runners.attention.kda_recoverssm_commit_ws``), shipped by no
 engine: the fork's plan launch, then one launch that folds every layer and
 fuses the conv compaction. It is byte-identical to ``vllm_cute`` on the same
 pages, needs the SD conv layout (channel stride 1) and has no align mode.
+``cuda_persistent_ws_tf32_mma`` is the same structure with the fold as one
+3xTF32 tensor-core MMA over the whole window (time flat in commit_len); its
+state matches ``vllm_cute`` to rounding (the oracle tolerance gates it), its
+conv windows byte for byte. Same SD-only and no-align limits.
 """
 
 from __future__ import annotations
@@ -249,6 +253,40 @@ register(
                 "Persistent warp-specialized CUDA commit (shipped by no engine): the fork's "
                 "plan, then one launch streaming records, state and conv history through a "
                 "shared-memory ring, folding on packed FP32 FMAs and fusing the conv compaction."
+            ),
+        ),
+    )
+)
+
+
+# The same persistent structure with the fold on tensor cores: each item is
+# decoded once by the producer, the gate chain runs over the whole window
+# without branches, and the accepted rows fold as one 3xTF32 MMA per tile, so
+# the time does not depend on commit_len. Rounding differs from ``vllm_cute``
+# (gated by the oracle tolerance); conv windows are byte-identical.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="cuda_persistent_ws_tf32_mma",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_recoverssm_commit_ws",
+            function_name="profile_kda_recoverssm_commit_cuda_persistent_ws_tf32_mma",
+        ),
+        table_name=KIND,
+        args_schema=KdaRecoverSSMCommitArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "Persistent warp-specialized CUDA commit with a 3xTF32 tensor-core fold "
+                "(shipped by no engine): the fork's plan, then one launch whose time does not "
+                "depend on the accepted length; conv compaction fused."
             ),
         ),
     )
