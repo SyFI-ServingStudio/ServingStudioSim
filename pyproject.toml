@@ -111,6 +111,7 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["profiling/runners/moe/pfused_vendor"]  # temporary vendored kernel source, kept byte-close to its origin
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
