@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
 #
 # `default_env` and the envs that share its interpreter (`flashinfer_pip_env`,
-# `causal_conv1d_env`): the project's own `profiling` dependency group --
-# Torch 2.10 cu128, FlashInfer 0.6, Triton, NVSHMEM, DeepGEMM -- installed from
-# uv.lock exactly as `just sync` installs it on a host. Built and tagged by
+# `causal_conv1d_env`): the project's own `profiling` and `deepgemm` dependency
+# groups -- Torch 2.10 cu128, FlashInfer 0.6, Triton, NVSHMEM, DeepGEMM --
+# installed from uv.lock. Built and tagged by
 # `profiling/container/images.py`; see profiling/container/README.md.
 
 ARG CUDA_VERSION=12.8.1
@@ -18,7 +18,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_COMPILE_BYTECODE=1 \
-    DG_USE_LOCAL_VERSION=0 \
     TORCH_CUDA_ARCH_LIST="9.0;10.0" \
     PYTHONPATH=/opt/vibesim:/opt/causal_conv1d \
     TORCH_EXTENSIONS_DIR=/cache/torch-extensions \
@@ -39,12 +38,9 @@ RUN apt-get update \
 WORKDIR /opt/vibesim
 COPY pyproject.toml uv.lock .python-version /opt/vibesim/
 
-# DeepGEMM (its own `deepgemm` group, which no host syncs by default) builds
-# without isolation against the env's Torch, so the profiling group goes in
-# first -- the same two steps as `just sync-deepgemm`.
+# DeepGEMM's build inputs are in pyproject.toml ([tool.uv.extra-build-*]).
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-default-groups --group profiling --no-install-project \
-    && uv sync --frozen --no-default-groups --group profiling --group deepgemm --no-install-project \
+    uv sync --frozen --no-default-groups --group profiling --group deepgemm --no-install-project \
     && uv pip install --python /opt/venv/bin/python --no-deps \
         --target /opt/causal_conv1d "${CAUSAL_CONV1D_WHEEL}"
 

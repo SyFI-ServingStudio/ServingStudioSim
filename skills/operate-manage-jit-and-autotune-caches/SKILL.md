@@ -51,7 +51,7 @@ They persist differently, so do not treat them as one thing.
 | Triton compiled binaries | first launch per shape key | `TRITON_CACHE_DIR` | yes |
 | `triton.autotune` **selections** | first launch per **process** per key | `TRITON_CACHE_DIR`, only with `TRITON_CACHE_AUTOTUNING=1` and no `pre_hook` | only then |
 | torch.compile / inductor | first compiled graph | `TORCHINDUCTOR_CACHE_DIR`, vLLM's `VLLM_CACHE_ROOT` | yes |
-| deep_gemm JIT | `just sync-deepgemm` (host) or the default profiler image build | uv caches the built wheel by commit | yes |
+| deep_gemm JIT | `uv sync --group deepgemm` (host) or the default profiler image build | uv caches the built wheel by commit | yes |
 | CUDA graph capture | every engine start | nothing | no, always paid |
 
 The trap is the two `autotune` rows. `TRITON_CACHE_DIR` persists *compilation*;

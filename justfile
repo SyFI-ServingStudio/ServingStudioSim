@@ -11,13 +11,6 @@
 # `libpython3.12.so` without it on LD_LIBRARY_PATH (uv pins the 3.12 interp).
 libdir := `uv run --no-sync python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"`
 
-# DeepGEMM (grouped_gemm `deepgemm` backend) builds JIT-only and skips its
-# git-clean version assert when this is 0; default is 1, which forces an
-# install-time CUDA compile AND asserts a clean tree (fails in uv's build clone).
-# Exported to every recipe so a cold `just sync` builds deep_gemm correctly
-# without anyone passing it by hand. (Once built, uv caches the wheel by commit.)
-export DG_USE_LOCAL_VERSION := "0"
-
 # Default: the cpu gate.
 default: test-cpu
 
@@ -25,13 +18,6 @@ default: test-cpu
 # (pyproject.toml's `deepgemm` group), so a host compiles nothing here.
 sync:
     uv sync
-
-# Add DeepGEMM to the host env, only to debug its runners with
-# VIBESIM_PROFILE_RUNTIME=host. It compiles from source (DG_USE_LOCAL_VERSION
-# above), and no-build-isolation needs its setup.py imports -- the profiling
-# group, which `sync` installs -- before DeepGEMM itself.
-sync-deepgemm: sync
-    uv sync --group deepgemm
 
 # The image each L1 profile env runs in (profiling/container/README.md):
 # `just profile-container-build default`, or every image with no argument.

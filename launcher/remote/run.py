@@ -212,13 +212,6 @@ class Session:
         sync = f"UV_PROJECT_ENVIRONMENT={q(venv)} uv sync --frozen --no-default-groups " + " ".join(
             f"--group {group}" for group in groups
         )
-        if "profiling" in groups:
-            # As `just sync`: DeepGEMM builds without isolation against the env's
-            # Torch, so everything else goes in first.
-            sync = (
-                f"export DG_USE_LOCAL_VERSION=0; {sync} --inexact "
-                f"--no-install-package deep-gemm && {sync}"
-            )
         sync = (
             f"if [ ! -f {q(ready)} ]; then cd {q(self.layout.src(source.version))} && "
             f"{sync} && touch {q(ready)}; fi"

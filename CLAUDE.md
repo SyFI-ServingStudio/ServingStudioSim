@@ -11,9 +11,9 @@ document per layer, the invariants, and the analyzer contract. Per-module
 
 - **Initialize the env with `just sync`** (install `just` via `cargo install just`),
   which is a plain `uv sync`: the host env compiles nothing. DeepGEMM is in the
-  non-default `deepgemm` group, because only the profiler images run it; `just
-  sync-deepgemm` adds it to the host env for `VIBESIM_PROFILE_RUNTIME=host`
-  debugging (it exports `DG_USE_LOCAL_VERSION=0`, which that build needs).
+  non-default `deepgemm` group, because only the profiler images run it; `uv
+  sync --group deepgemm` adds it to the host env for
+  `VIBESIM_PROFILE_RUNTIME=host` debugging.
 - **Always run under `uv`** (`uv run cargo …`, `uv run python …`, `uv run pytest`).
   It pins the 3.12 venv; a bare `python`/`cargo` links the system 3.9 and crashes
   PyO3 init. The Rust test binary also needs libpython on `LD_LIBRARY_PATH`
