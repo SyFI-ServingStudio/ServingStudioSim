@@ -246,7 +246,11 @@ impl Glm53KdaAttnLocalWorklet {
                 kernel_size: cfg.conv_kernel_size.clone(),
                 dtype: cfg.activation_dtype,
                 state_dtype: cfg.activation_dtype,
-                tokens_per_request: None,
+                // A verify runs `causal_conv1d_update` in its varlen
+                // speculative form over `decode_query_len` rows per request
+                // (fork `kda.py` spec branch); plain decode keeps one row.
+                tokens_per_request: (cfg.decode_query_len > 1)
+                    .then(|| cfg.decode_query_len.into()),
             },
             prefill_small_glue: ew(
                 heads * BETA_SIGMOID_IN_BYTES_PER_HEAD,
@@ -477,12 +481,13 @@ impl Glm53KdaAttnLocalWorklet {
                 ev,
             );
         }
-        // A verify's `causal_conv1d_update` steps each request's rows; it is
-        // billed as that many one-token updates.
+        // One `causal_conv1d_update` over the decode requests: one row each,
+        // or a verify's `decode_query_len` rows each in the varlen form the
+        // config keys (`tokens_per_request`).
         push_or_zero(
             &self.conv_decode,
             GdnCausalConvDecodeKernelInput {
-                batch_size: w.conv_decode_rows,
+                batch_size: input.decode_batch_size,
             },
             !if w.verify {
                 input.decode_batch_size > 0
@@ -587,8 +592,6 @@ struct Work {
     /// Tokens and decode sequences the chunk path covers.
     chunk_tokens: u32,
     chunk_decodes: u32,
-    /// One-token short-conv updates the decode conv bills.
-    conv_decode_rows: u32,
 }
 
 fn derive_work(
@@ -637,7 +640,6 @@ fn derive_work(
         verify,
         chunk_tokens,
         chunk_decodes,
-        conv_decode_rows: decode_tokens,
     })
 }
 
@@ -806,7 +808,7 @@ mod tests {
     fn a_verify_chunks_only_its_prefills_and_steps_every_decode_row() {
         // vLLM keeps spec decodes on their own kernel: the chunk path and its
         // state copies cover the prefill requests alone, while the
-        // projections and conv updates see every verify row.
+        // projections see every verify row.
         let w = derive_work(
             &Glm53KdaAttnLocalWorkletInput {
                 prefill_sequence_lengths: vec![100],
@@ -820,7 +822,6 @@ mod tests {
         assert_eq!(w.total_tokens, 132);
         assert_eq!((w.chunk_tokens, w.chunk_decodes), (100, 0));
         assert_eq!(w.state_units, 256);
-        assert_eq!(w.conv_decode_rows, 32);
     }
 
     #[test]
@@ -834,6 +835,15 @@ mod tests {
             16 * 8 * (128 * 4 + 256 * 2)
         );
         assert_eq!(r.conv_state_bytes_per_request, 6144 * (3 + 7) * 2);
+        // The conv keys the varlen verify rows (R requests x 8 tokens), not
+        // 8R one-token updates; plain decode keys the one-token rows.
+        assert_eq!(r.conv_decode.tokens_per_request, Some(8.into()));
+        assert_eq!(
+            Glm53KdaAttnLocalWorklet::resolve_config(&cfg())
+                .conv_decode
+                .tokens_per_request,
+            None
+        );
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
         let worklet = Glm53KdaAttnLocalWorklet::build("m.kda".into(), r, &bridge).unwrap();

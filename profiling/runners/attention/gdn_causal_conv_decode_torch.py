@@ -181,9 +181,12 @@ def profile_gdn_causal_conv_decode(
     dtype: DType | str,
     state_dtype: DType | str,
     num_tokens: int | None = None,
+    weight_dtype: DType | str | None = None,
 ) -> ComputeMetrics:
     """Profile the complete multi-launch Torch causal-conv decode reference."""
     reject_verify_tokens("gdn_causal_conv_decode:torch", int(batch_size), num_tokens)
+    if weight_dtype is not None and DType.from_value(weight_dtype) is not DType.from_value(dtype):
+        raise ValueError("gdn_causal_conv_decode:torch takes filter taps in dtype only")
     args = _validate_args(
         batch_size=batch_size,
         channels=channels,

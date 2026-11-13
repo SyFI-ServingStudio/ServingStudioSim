@@ -37,6 +37,7 @@ def test_args_field_order_and_coercion() -> None:
         "dtype",
         "state_dtype",
         "num_tokens",
+        "weight_dtype",
     ]
     args = coerce_args(
         GdnCausalConvDecodeArgs,
@@ -507,6 +508,7 @@ def test_generated_facades_and_read_only_missing_query(tmp_path, monkeypatch) ->
         "dtype",
         "state_dtype",
         "num_tokens",
+        "weight_dtype",
     ]
 
 

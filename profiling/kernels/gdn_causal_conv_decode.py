@@ -40,6 +40,13 @@ class GdnCausalConvDecodeArgs(KernelArgs):
             "decodes one token."
         ),
     )
+    weight_dtype: DType | None = optional_arg(
+        same_as="dtype",
+        doc=(
+            "Element type of the filter taps. Absent when it equals dtype; fp32 is a "
+            "vLLM model that keeps its conv1d parameter in fp32 (vllm_triton verify only)."
+        ),
+    )
 
 
 DOC = KernelDoc(

@@ -48,6 +48,7 @@ def build_operands(
     state_dtype: Any,
     device: Any,
     state_dim_first: bool,
+    weight_dtype: Any = None,
 ) -> VerifyOperands:
     generator = torch.Generator(device=device)
     generator.manual_seed(42)
@@ -55,9 +56,11 @@ def build_operands(
     x = torch.empty((num_tokens, channels), dtype=dtype, device=device).uniform_(
         -0.25, 0.25, generator=generator
     )
-    weight = torch.empty((channels, kernel_size), dtype=dtype, device=device).uniform_(
-        -0.125, 0.125, generator=generator
-    )
+    weight = torch.empty(
+        (channels, kernel_size),
+        dtype=dtype if weight_dtype is None else weight_dtype,
+        device=device,
+    ).uniform_(-0.125, 0.125, generator=generator)
     state = conv_state_pool(
         torch,
         (num_tokens + 1, channels, kernel_size - 2 + per_request),

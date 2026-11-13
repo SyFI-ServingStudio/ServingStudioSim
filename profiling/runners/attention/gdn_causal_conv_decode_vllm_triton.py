@@ -250,10 +250,20 @@ def profile_gdn_causal_conv_decode_vllm_triton(
     dtype: DType | str,
     state_dtype: DType | str,
     num_tokens: int | None = None,
+    weight_dtype: DType | str | None = None,
 ) -> ComputeMetrics:
-    """Profile vLLM's fused causal-convolution decode (or verify, ``num_tokens``)."""
+    """Profile vLLM's fused causal-convolution decode (or verify, ``num_tokens``).
+
+    ``weight_dtype`` (verify only) stores the filter taps in another dtype, as a
+    model whose conv1d parameter is fp32 hands them to the kernel."""
     args = _validate_args(batch_size, channels, kernel_size, dtype, state_dtype)
     per_request = tokens_per_request(args.batch_size, num_tokens)
+    taps = args.dtype if weight_dtype is None else DType.from_value(weight_dtype)
+    if taps not in (DType.BF16, DType.FP32) or (taps is not args.dtype and per_request == 1):
+        raise ValueError(
+            f"{_BACKEND} takes fp32 or bf16 filter taps, and fp32 only on a verify step; "
+            f"got {taps.value} with {per_request} token(s) per request"
+        )
     try:
         import torch
     except ImportError as exc:
@@ -279,6 +289,7 @@ def profile_gdn_causal_conv_decode_vllm_triton(
                 channels=args.channels,
                 kernel_size=args.kernel_size,
                 dtype=args.dtype.torch(),
+                weight_dtype=taps.torch(),
                 state_dtype=args.state_dtype.torch(),
                 device=device,
                 state_dim_first=conv_state_dim_first(),
