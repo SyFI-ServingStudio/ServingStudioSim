@@ -2074,6 +2074,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         router_gate_once: fusions.router_gate_once,
         routed_moe_whatif: fusions.routed_moe_whatif,
         moe_shared_overlap: fusions.moe_shared_overlap,
+        moe_shared_pair: fusions.moe_shared_pair,
         attn_tp,
         attn_all_reduce_row_gpus,
         attn_tp_layers,

@@ -1752,6 +1752,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         routed_moe_whatif_file: Option<String>,
+        /// Measured pair (needs `moe_shared_overlap: routed_only`): a JSON table
+        /// `{"points": [{"tokens", "added_us"}, ...]}` of the delay the
+        /// aux-stream shared expert adds to the routed call's end, by gathered
+        /// token count; it replaces the overlap factor. Absent: the factor.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_shared_pair_file: Option<String>,
         /// How the aux-stream shared expert (local rows <= 256) overlaps the
         /// MoE chain
         /// ([`crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap`]).
@@ -1850,6 +1857,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         routed_moe_whatif_file: Option<String>,
+        /// Measured pair (needs `moe_shared_overlap: routed_only`): a JSON table
+        /// `{"points": [{"tokens", "added_us"}, ...]}` of the delay the
+        /// aux-stream shared expert adds to the routed call's end, by gathered
+        /// token count; it replaces the overlap factor. Absent: the factor.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_shared_pair_file: Option<String>,
         /// How the aux-stream shared expert (local rows <= 256) overlaps the
         /// MoE chain
         /// ([`crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap`]).
@@ -2227,11 +2241,26 @@ impl IterArchSel {
             ),
             _ => None,
         };
+        let moe_shared_pair = match self {
+            Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+                moe_shared_pair_file: Some(path),
+                ..
+            } => {
+                anyhow::ensure!(
+                    moe_shared_overlap
+                        == crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap::RoutedOnly,
+                    "moe_shared_pair_file needs moe_shared_overlap: routed_only"
+                );
+                Some(crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedPair::load(path)?)
+            }
+            _ => None,
+        };
         Ok(Glm53FlashFusions {
             mhc_boundary,
             router_gate_once,
             routed_moe_whatif,
             moe_shared_overlap,
+            moe_shared_pair,
         })
     }
 
@@ -3033,4 +3062,6 @@ pub struct Glm53FlashFusions {
     /// `routed_moe_whatif_file`, read.
     pub routed_moe_whatif: Option<crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::RoutedMoeWhatIf>,
     pub moe_shared_overlap: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap,
+    /// `moe_shared_pair_file`, read.
+    pub moe_shared_pair: Option<crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedPair>,
 }

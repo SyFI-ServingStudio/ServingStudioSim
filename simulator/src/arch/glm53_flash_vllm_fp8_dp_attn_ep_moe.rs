@@ -160,6 +160,9 @@ pub struct Glm53FlashDpAttnEpParallel {
     pub routed_moe_whatif: Option<RoutedMoeWhatIf>,
     /// How the aux-stream shared expert overlaps the MoE chain.
     pub moe_shared_overlap: MoeSharedOverlap,
+    /// Measured delay the aux-stream shared expert adds to the routed call
+    /// (`moe_shared_overlap: routed_only` only); `None` is the overlap factor.
+    pub moe_shared_pair: Option<MoeSharedPair>,
     /// Attention tensor-parallel degree inside each attention DP group (module
     /// doc, "Attention DP x TP"): `dp_size / attn_tp` groups; 1 is plain DP
     /// attention.
@@ -311,11 +314,74 @@ impl RoutedMoeWhatIf {
     }
 }
 
+/// Measured pair cost of the aux-stream shared expert beside the routed call:
+/// the delay it adds to the routed call's end (pair makespan minus the routed
+/// call alone, both on one GPU in one CUDA graph), per gathered token count.
+/// With it, `Parallel[routed + delay, shared]` replaces the
+/// `SHARED_EXPERTS_STREAM_OVERLAP` factor. Linear between points, the nearest
+/// point outside them; the routed leaves it touches are flagged extrapolated.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoeSharedPair {
+    pub points: Vec<MoeSharedPairPoint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoeSharedPairPoint {
+    /// Tokens in one call on one rank after the dispatch all-gather.
+    pub tokens: u32,
+    pub added_us: f64,
+}
+
+impl MoeSharedPair {
+    /// Reads and checks the JSON table at `path`.
+    pub fn load(path: &str) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("moe_shared_pair_file {path}: {e}"))?;
+        let table: Self = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("moe_shared_pair_file {path}: {e}"))?;
+        anyhow::ensure!(!table.points.is_empty(), "moe_shared_pair_file {path}: no points");
+        for w in table.points.windows(2) {
+            anyhow::ensure!(
+                w[0].tokens < w[1].tokens,
+                "moe_shared_pair_file {path}: points must be sorted by tokens, strictly"
+            );
+        }
+        for p in &table.points {
+            anyhow::ensure!(
+                p.added_us >= 0.0,
+                "moe_shared_pair_file {path}: added_us must be >= 0 at {} tokens",
+                p.tokens
+            );
+        }
+        Ok(table)
+    }
+
+    /// The delay in ms at `tokens`.
+    pub fn added_ms(&self, tokens: u32) -> f64 {
+        let i = self.points.partition_point(|p| p.tokens < tokens);
+        let us = match (i.checked_sub(1).map(|j| self.points[j]), self.points.get(i)) {
+            (_, Some(hi)) if hi.tokens == tokens => hi.added_us,
+            (Some(lo), Some(hi)) => {
+                let f = f64::from(tokens - lo.tokens) / f64::from(hi.tokens - lo.tokens);
+                lo.added_us + f * (hi.added_us - lo.added_us)
+            }
+            (None, Some(hi)) => hi.added_us,
+            (Some(lo), None) => lo.added_us,
+            (None, None) => 0.0,
+        };
+        us / 1e3
+    }
+}
+
 /// One rank's routed-expert call, through the what-if table when one is set.
+/// `pair_ms`: the measured delay of the aux-stream shared expert beside it.
 fn push_routed_fused_moe(
     op: &Op<Nvfp4FusedMoeKernel>,
     num_tokens: u32,
     whatif: Option<&RoutedMoeWhatIf>,
+    pair_ms: Option<f64>,
     zero: bool,
     ev: &mut Evaluator,
 ) {
@@ -323,12 +389,14 @@ fn push_routed_fused_moe(
     if zero {
         return ev.push(LeafMetrics::ZERO, || input.clone().into());
     }
-    let Some(table) = whatif.filter(|_| num_tokens > 0) else {
+    let whatif = whatif.filter(|_| num_tokens > 0);
+    if whatif.is_none() && pair_ms.is_none() {
         return push(op, input, ev);
-    };
+    }
     let mut metrics = op.kernel.eval(&input);
     let measured = f64::from(metrics.m.time_ms);
-    metrics.m.time_ms = table.price_ms(measured, num_tokens) as f32;
+    let priced = whatif.map_or(measured, |table| table.price_ms(measured, num_tokens));
+    metrics.m.time_ms = (priced + pair_ms.unwrap_or(0.0)) as f32;
     metrics.coverage = metrics.coverage | crate::timing::CoverageFlags::EXTRAPOLATED;
     ev.push(metrics, || input.clone().into());
 }
@@ -738,6 +806,8 @@ struct MoeBlock {
     /// What-if pricing of `fused_moe` (`Glm53FlashDpAttnEpParallel::routed_moe_whatif`).
     routed_moe_whatif: Option<RoutedMoeWhatIf>,
     moe_shared_overlap: MoeSharedOverlap,
+    /// `Glm53FlashDpAttnEpParallel::moe_shared_pair`.
+    moe_shared_pair: Option<MoeSharedPair>,
     /// The shared + routed add; `None` when the next mHC boundary does it
     /// (`MhcBoundaryPricing::OneLaunchKernel`).
     combine_glue: Option<Op<ElementwiseKernel>>,
@@ -1086,7 +1156,12 @@ impl MoeBlock {
                     self.name, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
                 ),
                 child: Box::new(CostNode::Parallel {
-                    overlap: SHARED_EXPERTS_STREAM_OVERLAP,
+                    // A measured pair delay already sits on the routed leaves.
+                    overlap: if self.moe_shared_pair.is_some() {
+                        1.0
+                    } else {
+                        SHARED_EXPERTS_STREAM_OVERLAP
+                    },
                     children: vec![routed(builder), shared(builder)],
                 }),
             });
@@ -1190,12 +1265,13 @@ impl MoeBlock {
                 Some(step)
             }
         };
-        let push_routed = |zero: bool, ev: &mut Evaluator| {
+        let push_routed = |zero: bool, pair_ms: Option<f64>, ev: &mut Evaluator| {
             for op in &self.fused_moe {
                 push_routed_fused_moe(
                     op,
                     batch.gathered_tokens,
                     self.routed_moe_whatif.as_ref(),
+                    pair_ms,
                     zero,
                     ev,
                 );
@@ -1219,11 +1295,15 @@ impl MoeBlock {
                 .ranks
                 .iter()
                 .any(|rank| rank.rows > 0 && rank.rows <= SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD);
-            push_routed(!beside_shared, ev);
+            let pair_ms = self
+                .moe_shared_pair
+                .as_ref()
+                .map(|pair| pair.added_ms(batch.gathered_tokens));
+            push_routed(!beside_shared, pair_ms, ev);
             push_shared(ev);
-            push_routed(beside_shared, ev);
+            push_routed(beside_shared, None, ev);
         } else {
-            push_routed(false, ev);
+            push_routed(false, None, ev);
         }
         match (&self.exchange, step) {
             (Exchange::MeasuredAllgather { combine, .. }, _) => push(
@@ -1514,6 +1594,7 @@ fn build_group(
                     .collect::<std::result::Result<_, _>>()?,
                 routed_moe_whatif: cfg.parallel.routed_moe_whatif.clone(),
                 moe_shared_overlap: cfg.parallel.moe_shared_overlap,
+                moe_shared_pair: cfg.parallel.moe_shared_pair.clone(),
                 combine_glue: cfg
                     .mhc_one_launch
                     .is_none()
@@ -2231,6 +2312,20 @@ mod tests {
     }
 
     #[test]
+    fn moe_shared_pair_interpolates_and_clamps() {
+        let pair = MoeSharedPair {
+            points: vec![
+                MoeSharedPairPoint { tokens: 64, added_us: 12.0 },
+                MoeSharedPairPoint { tokens: 1024, added_us: 16.0 },
+            ],
+        };
+        assert_eq!(pair.added_ms(8), 0.012);
+        assert_eq!(pair.added_ms(64), 0.012);
+        assert!((pair.added_ms(544) - 0.014).abs() < 1e-12);
+        assert_eq!(pair.added_ms(4096), 0.016);
+    }
+
+    #[test]
     fn routed_moe_whatif_file_is_checked() {
         let dir = std::env::temp_dir().join(format!("routed_moe_whatif_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2273,6 +2368,7 @@ mod tests {
             router_gate_once: false,
             routed_moe_whatif: None,
             moe_shared_overlap: Default::default(),
+            moe_shared_pair: None,
             attn_tp: 1,
             attn_all_reduce_row_gpus: None,
             attn_tp_layers: Default::default(),
