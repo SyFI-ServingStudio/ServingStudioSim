@@ -561,6 +561,9 @@ impl DsparkDraftStage {
     }
 
     fn compile(&self, b: &mut CostTreeBuilder, draft_tokens: u32) -> CostNode {
+        // Slots are positional: mint them in the order `eval` pushes
+        // (context_kv before the embedding).
+        let context_kv = self.context_kv.compile(b);
         let mut embedding = vec![self.embedding.compile(b)];
         if let Some(all_reduce) = &self.embedding_all_reduce {
             embedding.push(all_reduce.compile(b));
@@ -569,7 +572,7 @@ impl DsparkDraftStage {
         CostNode::Sum(vec![
             CostNode::Labeled {
                 label: format!("{}.context_kv [every target row of the step]", self.name),
-                child: Box::new(self.context_kv.compile(b)),
+                child: Box::new(context_kv),
             },
             CostNode::Labeled {
                 label: format!("{}.embedding [draft rows]", self.name),

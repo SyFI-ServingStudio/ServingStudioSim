@@ -4811,6 +4811,135 @@ mod tests {
         }
     }
 
+    /// Catches a speculative model whose eval pushes leaf inputs in a
+    /// different order than its compile minted the slots. Slots are positional
+    /// and only their count is asserted, so such a model fills every slot but
+    /// prices the wrong leaves (the DFlash2 draft stage once compiled
+    /// context_kv after its layer and so scaled the context_kv leaves by the
+    /// draft depth; DSpark compiled its embedding before context_kv).
+    #[test]
+    fn speculative_models_push_each_slot_the_input_its_kind_takes() {
+        use crate::arch::contract::{
+            SpeculativeArchGroupInput, SpeculativeArchInput, SpeculativeDecodeInput,
+        };
+        use crate::timing::cost_tree::assert_slot_inputs_match_kinds;
+        let config = |name: &str| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("model/config")
+                .join(name)
+        };
+        let glm = config("glm52_nvfp4.json");
+        let flash = config("glm53_flash_nvfp4.json");
+        let mut selectors = vec![
+            serde_json::json!({
+                "type": "glm53_vllm_nvfp4_dsa_moe_dflash2", "model_config": glm,
+                "fp8": false, "ep_size": 4, "nvl_num_gpu": 4,
+                "max_model_len": 131_072, "draft_tokens": 7,
+            }),
+            serde_json::json!({
+                "type": "glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2", "model_config": glm,
+                "fp8": false, "ep_size": 8, "nvl_num_gpu": 8,
+                "max_model_len": 131_072, "draft_tokens": 7,
+            }),
+            serde_json::json!({
+                "type": "glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2", "model_config": flash,
+                "fp8": false, "tp_size": 8, "draft_tokens": 7, "kda_state_dtype": "bf16",
+            }),
+            serde_json::json!({
+                "type": "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2", "model_config": flash,
+                "fp8": false, "ep_size": 8, "routing": "uniform", "draft_tokens": 7,
+                "mla_layout_copies": false, "kda_state_dtype": "bf16",
+                "router_gate_once": true,
+            }),
+        ];
+        for b in [1_u16, 2, 4, 8] {
+            selectors.push(serde_json::json!({
+                "type": "glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2",
+                "model_config": flash, "fp8": false, "ep_size": 8, "routing": "uniform",
+                "draft_tokens": 7, "mla_layout_copies": false, "kda_state_dtype": "bf16",
+                "kda_tp_gpus": b, "kda_tp_comm_pricing": "gather_scatter",
+                "expert_exchange": "fixed_measured", "mhc_boundary": "fused_less_saving",
+                "mhc_fused_saving_us": 0.5,
+            }));
+        }
+        // The other speculative draft stages compile the same way.
+        let deepseek = config("deepseek_v41_flash.json");
+        selectors.extend([
+            serde_json::json!({
+                "type": "glm52_vllm_nvfp4_dsa_moe_speculative", "model_config": glm,
+                "fp8": false, "ep_size": 4, "nvl_num_gpu": 4,
+                "max_model_len": 131_072, "draft_tokens": 3,
+            }),
+            serde_json::json!({
+                "type": "deepseek_v41_vllm_dspark", "model_config": deepseek,
+                "fp8": true, "routing": "uniform",
+            }),
+            serde_json::json!({
+                "type": "deepseek_v41_vllm_dp_attn_ep_moe_dspark", "model_config": deepseek,
+                "fp8": true, "routing": "uniform",
+            }),
+        ]);
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        for selector in selectors {
+            let label = selector.to_string();
+            let sel: IterArchSel = serde_json::from_value(selector).unwrap();
+            let (model, draft_tokens) =
+                build_speculative_iter_model(&sel, "NVIDIA B200", "test", &bridge).unwrap();
+            let width = draft_tokens + 1;
+            let groups: Vec<SpeculativeArchGroupInput> = (0..model.num_attn_dp_groups())
+                .map(|_| {
+                    let decode_requests: Vec<SpeculativeDecodeInput> = [4_096, 1_000, 8_000]
+                        .into_iter()
+                        .map(|kv_len| SpeculativeDecodeInput {
+                            kv_len,
+                            query_len: width,
+                            committed_rows: 3,
+                        })
+                        .collect();
+                    let decode_tokens = decode_requests.len() as u32 * width;
+                    SpeculativeArchGroupInput {
+                        batch_tokens: decode_tokens,
+                        prefill_tokens: 0,
+                        decode_tokens,
+                        prefill_chunk_pairs: Vec::new(),
+                        total_kv_len: decode_requests.iter().map(|d| d.kv_len).sum(),
+                        decode_requests,
+                    }
+                })
+                .collect();
+            let tokens_per_source_rank = if groups.len() > 1 {
+                groups.iter().map(|group| group.batch_tokens).collect()
+            } else {
+                Vec::new()
+            };
+            let batch = SpeculativeArchInput {
+                draft_tokens,
+                groups,
+                tokens_per_source_rank,
+            };
+            model.check_input(&batch).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let (mut slots, mut scratch, mut inputs) = (Vec::new(), Vec::new(), Vec::new());
+            model.eval_speculative_iter_with_inputs(&batch, &mut slots, &mut scratch, &mut inputs);
+            let manifest = model.cost_log_manifest();
+            assert_slot_inputs_match_kinds(&manifest, &inputs);
+            // The draft attention leaf takes the per-request rectangle list.
+            let draft_attention: Vec<_> = manifest
+                .slots
+                .iter()
+                .zip(&inputs)
+                .filter(|(slot, _)| slot.name == "test.dflash2.layer.attn.attention")
+                .collect();
+            if !label.contains("dflash2") {
+                continue;
+            }
+            assert!(!draft_attention.is_empty(), "{label}");
+            for (_, input) in draft_attention {
+                assert_eq!(input.variant_name(), "Dflash2DraftAttn", "{label}");
+            }
+        }
+    }
+
     #[test]
     fn dflash2_necessary_work_map_covers_the_compiled_locations() {
         use std::collections::BTreeSet;

@@ -502,6 +502,48 @@ impl CostTree {
     }
 }
 
+/// Check that an eval walk pushed each slot an input of the type its compiled
+/// kernel kind takes. `Evaluator::push` is positional and eval only asserts the
+/// slot count, so an eval that pushes in a different order than `compile`
+/// minted slots fills every slot yet prices the wrong leaves. Every leaf of one
+/// kind takes one input type, so a kind that received two kernel input types
+/// within one tree marks a misaligned walk. An aggregating leaf records its
+/// fan-in (a `*Log` type) instead, which any kind may carry.
+#[cfg(test)]
+pub(crate) fn assert_slot_inputs_match_kinds(manifest: &CostManifest, inputs: &[SlotInput]) {
+    use std::collections::BTreeMap;
+    assert_eq!(manifest.slots.len(), inputs.len(), "one input per slot");
+    let mut by_kind: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
+    for (slot, input) in manifest.slots.iter().zip(inputs) {
+        if input.is_fan_in_log() {
+            continue;
+        }
+        by_kind
+            .entry(slot.kind.as_str())
+            .or_default()
+            .entry(input.variant_name())
+            .or_default()
+            .push(slot.name.as_str());
+    }
+    let mixed: Vec<String> = by_kind
+        .iter()
+        .filter(|(_, variants)| variants.len() > 1)
+        .map(|(kind, variants)| {
+            let detail = variants
+                .iter()
+                .map(|(variant, names)| format!("{variant} at {} (+{})", names[0], names.len() - 1))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("kind {kind}: {detail}")
+        })
+        .collect();
+    assert!(
+        mixed.is_empty(),
+        "eval pushed slot inputs out of compile order:\n{}",
+        mixed.join("\n")
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

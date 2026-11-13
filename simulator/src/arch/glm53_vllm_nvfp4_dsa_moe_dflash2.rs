@@ -167,6 +167,9 @@ impl Dflash2DraftStage {
 
     pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let layers = self.num_draft_layers;
+        // Slots are positional: mint them in the order `eval_group` pushes
+        // (context_kv, attn, ffn, selector).
+        let context_kv = self.context_kv.compile(builder);
         let mut layer = vec![self.draft_attn.compile(builder)];
         if let Some(op) = &self.attn_allreduce {
             layer.push(op.compile(builder));
@@ -181,7 +184,7 @@ impl Dflash2DraftStage {
                     "{}.context_kv [prefill-shaped; target rows this step]",
                     self.name
                 ),
-                child: Box::new(self.context_kv.compile(builder)),
+                child: Box::new(context_kv),
             },
             CostNode::Labeled {
                 label: format!(

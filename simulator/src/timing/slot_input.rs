@@ -178,6 +178,25 @@ macro_rules! log_inputs {
                 fn from(v: $ty) -> Self { SlotInput::$variant(v) }
             }
         )+
+        impl SlotInput {
+            /// The input type's variant name, for checking that a slot received
+            /// the input type its compiled kernel kind takes.
+            #[cfg(test)]
+            pub(crate) fn variant_name(&self) -> &'static str {
+                match self {
+                    $( SlotInput::$variant(_) => stringify!($variant), )+
+                }
+            }
+
+            /// Whether this is an aggregating leaf's fan-in record (a `*Log`
+            /// type) rather than one kernel call's input.
+            #[cfg(test)]
+            pub(crate) fn is_fan_in_log(&self) -> bool {
+                match self {
+                    $( SlotInput::$variant(_) => stringify!($ty).ends_with("Log"), )+
+                }
+            }
+        }
     };
 }
 
