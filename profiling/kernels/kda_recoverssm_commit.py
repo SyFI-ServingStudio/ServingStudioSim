@@ -26,6 +26,11 @@ state goes back to the checkpoint's own slot. ``state_dtype`` is the
 checkpoint pool's element type (vLLM ``--mamba-ssm-cache-dtype``); the fold
 runs in fp32 and rounds once on the store.
 
+Backend ``vllm_cute`` is the same call with the context built as
+``backend="cute"``, what the fork selects on SM10x with a bf16 pool: the plan
+and conv compaction stay Triton and ``cute_recoverssm_commit`` replaces the
+Triton fold (one tensor-core launch over every layer of the group).
+
 Backend ``tilelang`` is this repository's own kernel for the same call
 (``profiling.runners.attention.kda_recoverssm_commit_tilelang``), shipped by
 no engine: a Triton prep forms each row's decayed key, then a TileLang fold
@@ -167,6 +172,42 @@ register(
                 "TileLang closed-form fold of the accepted rows as one rank-n update "
                 "per state tile, and the conv compaction; three launches."
             ),
+        ),
+    )
+)
+
+
+# The fork's state fold on SM10x: ``KDARecoverSSMCommitContext(backend="cute")``
+# keeps the Triton plan and conv compaction and replaces the Triton fold with
+# ``cute_recoverssm_commit`` (``cutedsl/commit.py``), one launch over every
+# layer of the group. The layer selects it with its CuTe verify
+# (``can_use_cute_recoverssm``: SM10x, bf16 activations, conv state and SSM
+# state); its fold is compiled for bf16 checkpoints only.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cute",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_recoverssm_vllm_cute",
+            function_name="profile_kda_recoverssm_commit_vllm_cute",
+        ),
+        table_name=KIND,
+        args_schema=KdaRecoverSSMCommitArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM fork's KDARecoverSSMCommitContext.commit with the CuTe fold: Triton "
+                "plan and conv compaction, then one tensor-core launch folding every "
+                "layer's accepted records into its bf16 checkpoint."
+            ),
+            url="https://github.com/vllm-project/vllm",
         ),
     )
 )

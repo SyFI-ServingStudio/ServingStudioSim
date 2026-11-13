@@ -252,10 +252,15 @@ def test_flash_dflash2_floor_handoff_and_exact_semantic_coverage(tmp_path, phase
     ]
     assert all(rules[f"unified.kda_recoverssm_commit_group{group}"] == writes for group in range(4))
     for tag in ("first_kda_dense", "kda_dense", "kda_moe"):
-        assert rules[f"unified.{tag}.kda.recoverssm_verify"] == [
+        # The bf16 pool fuses the short conv into the verify (CuTe), so the
+        # verify also owns the conv-state decode rows.
+        assert rules[f"unified.{tag}.kda.recoverssm_conv_verify"] == [
             f"{tag}.attn.decode",
             f"{tag}.recurrent_state.decode_read",
+            f"{tag}.conv_state.decode_read",
+            f"{tag}.conv_state.decode_write",
         ]
+        assert rules[f"unified.{tag}.kda.short_conv_decode"] == []
     shared = {s for s in names if sum(s in rows for rows in rules.values()) > 1}
     assert shared == {
         *writes,

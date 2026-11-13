@@ -4843,38 +4843,55 @@ mod tests {
         assert_eq!(plain.kv_cache_layout().per_token_bytes(), 47_700 + 12_288);
     }
 
-    /// Catches a bf16 KDA pool that does not reach the RecoverSSM rows: the
-    /// verify must key its rows on the bf16 pool and add FlashInfer's frozen
-    /// verify, while the commit, which FlashInfer lacks, stays the fork's
-    /// Triton op on the same pool.
+    /// Catches a bf16 KDA pool that does not reach the fork's RecoverSSM
+    /// selection: on SM10x a bf16 pool runs the fused CuTe conv + verify and
+    /// the CuTe commit, with no separate verify or conv decode. Asking for the
+    /// separate conv keeps the older selectable verify (FlashInfer's frozen
+    /// verify or the Triton op) and commit (TileLang or Triton) rows.
     #[test]
-    fn a_bf16_kda_pool_keys_the_recoverssm_rows_and_adds_flashinfer_verify() {
+    fn a_bf16_kda_pool_selects_the_cute_recoverssm_rows_unless_the_conv_is_separate() {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
-        let sel: IterArchSel = serde_json::from_value(serde_json::json!({
-            "type": "glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2",
-            "model_config": Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("model/config/glm53_flash_nvfp4.json"),
-            "fp8": false,
-            "tp_size": 8,
-            "draft_tokens": 3,
-            "kda_state_dtype": "bf16",
-        }))
-        .unwrap();
-        glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(&sel, "NVIDIA B200", "test", &bridge).unwrap();
-        let report = bridge.take_enum_report();
-        let of_kind =
-            |kind: &str| -> Vec<_> { report.iter().filter(|leaf| leaf.kind == kind).collect() };
-        let verify = of_kind("kda_recoverssm_verify");
-        let commit = of_kind("kda_recoverssm_commit");
+        let build = |spec_verify: &str| {
+            let sel: IterArchSel = serde_json::from_value(serde_json::json!({
+                "type": "glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2",
+                "model_config": Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("model/config/glm53_flash_nvfp4.json"),
+                "fp8": false,
+                "tp_size": 8,
+                "draft_tokens": 3,
+                "kda_state_dtype": "bf16",
+                "kda_spec_verify": spec_verify,
+            }))
+            .unwrap();
+            glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(&sel, "NVIDIA B200", "test", &bridge)
+                .unwrap();
+            bridge.take_enum_report()
+        };
+        let of_kind = |report: &[crate::timing::bridge::core::KernelEnum], kind: &str| -> Vec<_> {
+            report.iter().filter(|leaf| leaf.kind == kind).cloned().collect()
+        };
+
+        let fused = build("recoverssm");
+        let conv_verify = of_kind(&fused, "kda_recoverssm_conv_verify");
+        let commit = of_kind(&fused, "kda_recoverssm_commit");
+        assert!(!conv_verify.is_empty() && !commit.is_empty());
+        assert!(of_kind(&fused, "kda_recoverssm_verify").is_empty());
+        for leaf in &conv_verify {
+            assert_eq!(leaf.backends, ["vllm_cute"], "{}", leaf.name);
+        }
+        for leaf in &commit {
+            assert_eq!(leaf.backends, ["vllm_cute"], "{}", leaf.name);
+            assert_eq!(leaf.kv_dtype, Some(DType::Bf16), "{}", leaf.name);
+        }
+
+        let separate = build("recoverssm_separate_conv");
+        assert!(of_kind(&separate, "kda_recoverssm_conv_verify").is_empty());
+        let verify = of_kind(&separate, "kda_recoverssm_verify");
+        let commit = of_kind(&separate, "kda_recoverssm_commit");
         assert!(!verify.is_empty() && !commit.is_empty());
         for leaf in &verify {
-            assert_eq!(
-                leaf.backends,
-                ["flashinfer_cute", "vllm_triton"],
-                "{}",
-                leaf.name
-            );
+            assert_eq!(leaf.backends, ["flashinfer_cute", "vllm_triton"], "{}", leaf.name);
             assert_eq!(leaf.kv_dtype, Some(DType::Bf16), "{}", leaf.name);
         }
         for leaf in &commit {

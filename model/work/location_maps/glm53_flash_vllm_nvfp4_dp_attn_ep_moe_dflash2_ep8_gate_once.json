@@ -554,18 +554,17 @@
       "semantics": []
     },
     {
-      "location": "unified.first_kda_dense.kda.recoverssm_verify",
+      "location": "unified.first_kda_dense.kda.recoverssm_conv_verify",
       "semantics": [
         "first_kda_dense.attn.decode",
-        "first_kda_dense.recurrent_state.decode_read"
+        "first_kda_dense.recurrent_state.decode_read",
+        "first_kda_dense.conv_state.decode_read",
+        "first_kda_dense.conv_state.decode_write"
       ]
     },
     {
       "location": "unified.first_kda_dense.kda.short_conv_decode",
-      "semantics": [
-        "first_kda_dense.conv_state.decode_read",
-        "first_kda_dense.conv_state.decode_write"
-      ]
+      "semantics": []
     },
     {
       "location": "unified.first_kda_dense.kda.short_conv_prefill",
@@ -689,18 +688,17 @@
       "semantics": []
     },
     {
-      "location": "unified.kda_dense.kda.recoverssm_verify",
+      "location": "unified.kda_dense.kda.recoverssm_conv_verify",
       "semantics": [
         "kda_dense.attn.decode",
-        "kda_dense.recurrent_state.decode_read"
+        "kda_dense.recurrent_state.decode_read",
+        "kda_dense.conv_state.decode_read",
+        "kda_dense.conv_state.decode_write"
       ]
     },
     {
       "location": "unified.kda_dense.kda.short_conv_decode",
-      "semantics": [
-        "kda_dense.conv_state.decode_read",
-        "kda_dense.conv_state.decode_write"
-      ]
+      "semantics": []
     },
     {
       "location": "unified.kda_dense.kda.short_conv_prefill",
@@ -792,18 +790,17 @@
       "semantics": []
     },
     {
-      "location": "unified.kda_moe.kda.recoverssm_verify",
+      "location": "unified.kda_moe.kda.recoverssm_conv_verify",
       "semantics": [
         "kda_moe.attn.decode",
-        "kda_moe.recurrent_state.decode_read"
+        "kda_moe.recurrent_state.decode_read",
+        "kda_moe.conv_state.decode_read",
+        "kda_moe.conv_state.decode_write"
       ]
     },
     {
       "location": "unified.kda_moe.kda.short_conv_decode",
-      "semantics": [
-        "kda_moe.conv_state.decode_read",
-        "kda_moe.conv_state.decode_write"
-      ]
+      "semantics": []
     },
     {
       "location": "unified.kda_moe.kda.short_conv_prefill",

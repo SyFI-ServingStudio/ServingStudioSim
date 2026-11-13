@@ -96,7 +96,8 @@ pub enum KdaStateDtype {
     #[default]
     Fp32,
     /// `--mamba-ssm-cache-dtype bfloat16`: half the state bytes, and the only
-    /// pool FlashInfer's frozen RecoverSSM verify takes.
+    /// pool the fork's CuTe RecoverSSM kernels (and FlashInfer's frozen
+    /// verify) take.
     Bf16,
 }
 
@@ -111,7 +112,8 @@ impl KdaStateDtype {
 
 const KDA_STATE_DTYPES: [&str; 2] = ["fp32", "bf16"];
 
-const KDA_SPEC_VERIFIES: [&str; 2] = ["recoverssm", "recurrent_per_position"];
+const KDA_SPEC_VERIFIES: [&str; 3] =
+    ["recoverssm", "recoverssm_separate_conv", "recurrent_per_position"];
 
 const ROUTING_KINDS: [&str; 4] = ["uniform", "random", "popularity", "corpus"];
 
@@ -1554,12 +1556,15 @@ pub enum IterArchSel {
         draft_tokens: u32,
         /// KDA recurrent state pool dtype (vLLM `--mamba-ssm-cache-dtype`):
         /// the per-request state bytes, and the pool the RecoverSSM verify and
-        /// commit kernels read. `bf16` adds FlashInfer's frozen verify.
+        /// commit kernels read. `bf16` lets the fork's CuTe RecoverSSM kernels run.
         #[serde(default)]
         #[param(string, default = "fp32", choices = KDA_STATE_DTYPES, cache_key)]
         kda_state_dtype: KdaStateDtype,
         /// How the verify advances the KDA state: `recoverssm` (verify +
-        /// commit, one state per request) or `recurrent_per_position` (the
+        /// commit, one state per request, the kernels the vLLM fork selects:
+        /// CuTe conv + verify and CuTe commit fold on a bf16 pool on SM10x,
+        /// else Triton), `recoverssm_separate_conv` (the conv before the
+        /// verify, any verify/commit backend) or `recurrent_per_position` (the
         /// vLLM fork's GLM path: `fused_recurrent_kda` storing a state per
         /// position, `1 + draft_tokens` state pages per request, no commit).
         #[serde(default)]
@@ -1635,12 +1640,15 @@ pub enum IterArchSel {
         draft_tokens: u32,
         /// KDA recurrent state pool dtype (vLLM `--mamba-ssm-cache-dtype`):
         /// the per-request state bytes, and the pool the RecoverSSM verify and
-        /// commit kernels read. `bf16` adds FlashInfer's frozen verify.
+        /// commit kernels read. `bf16` lets the fork's CuTe RecoverSSM kernels run.
         #[serde(default)]
         #[param(string, default = "fp32", choices = KDA_STATE_DTYPES, cache_key)]
         kda_state_dtype: KdaStateDtype,
         /// How the verify advances the KDA state: `recoverssm` (verify +
-        /// commit, one state per request) or `recurrent_per_position` (the
+        /// commit, one state per request, the kernels the vLLM fork selects:
+        /// CuTe conv + verify and CuTe commit fold on a bf16 pool on SM10x,
+        /// else Triton), `recoverssm_separate_conv` (the conv before the
+        /// verify, any verify/commit backend) or `recurrent_per_position` (the
         /// vLLM fork's GLM path: `fused_recurrent_kda` storing a state per
         /// position, `1 + draft_tokens` state pages per request, no commit).
         #[serde(default)]
@@ -1841,15 +1849,17 @@ pub enum IterArchSel {
         #[serde(default = "default_dflash2_draft_tokens")]
         #[param(default = 7, cache_key)]
         draft_tokens: u32,
-        /// KDA recurrent state pool dtype; `bf16` (the default here) adds
-        /// FlashInfer's frozen RecoverSSM verify.
+        /// KDA recurrent state pool dtype; `bf16` (the default here) lets the
+        /// fork's CuTe RecoverSSM kernels run.
         #[serde(default = "default_kda_tp_fused_kda_state_dtype")]
         #[param(string, default = "bf16", choices = KDA_STATE_DTYPES, cache_key)]
         kda_state_dtype: KdaStateDtype,
         /// How the verify advances the KDA state: `recoverssm` (the default:
-        /// verify + commit, one state per request) or `recurrent_per_position`
-        /// (the vLLM fork's GLM path, `1 + draft_tokens` state pages per
-        /// request, no commit).
+        /// verify + commit, one state per request, with the kernels the vLLM
+        /// fork selects), `recoverssm_separate_conv` (the conv before the
+        /// verify, any verify/commit backend) or `recurrent_per_position` (the
+        /// vLLM fork's GLM path, `1 + draft_tokens` state pages per request, no
+        /// commit).
         #[serde(default)]
         #[param(string, default = "recoverssm", choices = KDA_SPEC_VERIFIES, cache_key)]
         kda_spec_verify: crate::worklet::KdaSpecVerify,

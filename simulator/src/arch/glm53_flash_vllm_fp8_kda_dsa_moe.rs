@@ -81,7 +81,7 @@ use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    KdaRecoverSSMVerifyKernelConfig, MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel,
+    KdaRecoverSSMCommitKernelConfig, MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel,
     MhcRmsNormKernelConfig, MhcRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig,
     RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
@@ -1493,8 +1493,9 @@ pub(crate) fn commitless_verify(resolved: &Glm53FlashVllmResolved) -> bool {
 /// What a speculative verify's RecoverSSM commit needs from a Flash graph.
 #[derive(Clone, Debug)]
 pub struct KdaCommitPlan {
-    /// The rank-local KDA verify shape whose records the commit folds.
-    pub verify: KdaRecoverSSMVerifyKernelConfig,
+    /// The rank-local commit that folds the verify's records, with the
+    /// backends the verify mode selects; `num_layers` is set per group.
+    pub commit: KdaRecoverSSMCommitKernelConfig,
     /// KDA layers in each of vLLM's KDA KV-cache groups; one commit call
     /// covers one group.
     pub cache_group_layers: Vec<u32>,
@@ -1502,10 +1503,10 @@ pub struct KdaCommitPlan {
 
 /// The commit plan of a graph compiled at verify width above 1.
 pub(crate) fn kda_commit_plan(resolved: &Glm53FlashVllmResolved) -> Option<KdaCommitPlan> {
-    let verify = resolved.kda.recoverssm_verify.clone()?;
+    let commit = resolved.kda.recoverssm_commit.clone()?;
     let model = &resolved.raw_cfg.model;
     Some(KdaCommitPlan {
-        verify,
+        commit,
         cache_group_layers: kda_cache_group_layers(
             model.kda_layers.len() as u32,
             model.num_dsa_layers(),
@@ -2014,7 +2015,7 @@ mod tests {
             fp32.kda.ssm_state_bytes_per_request
         );
         let plan = kda_commit_plan(&bf16).unwrap();
-        assert_eq!(plan.verify.state_dtype, DType::Bf16);
+        assert_eq!(plan.commit.state_dtype, DType::Bf16);
     }
 
     #[test]

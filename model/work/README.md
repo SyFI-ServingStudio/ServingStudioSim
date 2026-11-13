@@ -378,8 +378,11 @@ The two GLM-5.3-Flash NVFP4 DFlash2 arches (`glm53_flash_vllm_nvfp4_kda_dsa_moe_
 `incoai/GLM-5.3-Flash-DFlash2`'s config: five layers at hidden 4096) to the Flash
 target the same way. The target's KDA rows are unchanged: one state read and one
 write per verifying request and layer. The simulator verifies with RecoverSSM and
-commits per KV-cache group afterwards, so each stack's `recoverssm_verify`
-location owns its attention and state-read rows, and the four
+commits per KV-cache group afterwards. On SM10x with the BF16 state pool these
+maps describe, the short conv is fused into the verify, so each stack's
+`recoverssm_conv_verify` location owns its attention, state-read and
+conv-state decode rows (the unfused `short_conv_decode` slot prices nothing and
+owns none), and the four
 `kda_recoverssm_commit_group*` locations share the three stacks' state-write rows.
 Location maps exist for the DP-attention EP8 deployment with and without HiSparse
 (whose analytic `hisparse.h2d_miss_io` location owns no row); the TP8 deployment

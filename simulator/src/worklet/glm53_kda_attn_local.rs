@@ -43,6 +43,7 @@
 //! and the state gather/scatter. State movement is expressed in 4-KiB transfer
 //! units, as in `qwen36_gdn_local`, so one 1-MiB state is 256 units.
 
+use crate::common::gpu::compute_capability;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::gdn_causal_conv_prefill::launches_per_sequence;
@@ -52,8 +53,9 @@ use crate::timing::kernels::{
     ElementwiseKernelInput, GdnCausalConvDecodeKernel, GdnCausalConvDecodeKernelConfig,
     GdnCausalConvDecodeKernelInput, GdnCausalConvPrefillKernel, GdnCausalConvPrefillKernelConfig,
     GdnCausalConvPrefillKernelInput, KdaChunkPrefillKernel, KdaChunkPrefillKernelConfig,
-    KdaChunkPrefillKernelInput, KdaRecoverSSMVerifyKernel, KdaRecoverSSMVerifyKernelConfig,
-    KdaRecoverSSMVerifyKernelInput, KdaRecurrentDecodeKernel, KdaRecurrentDecodeKernelConfig,
+    KdaChunkPrefillKernelInput, KdaRecoverSSMCommitKernelConfig, KdaRecoverSSMConvVerifyKernel,
+    KdaRecoverSSMConvVerifyKernelConfig, KdaRecoverSSMConvVerifyKernelInput,
+    KdaRecoverSSMVerifyKernel, KdaRecoverSSMVerifyKernelConfig, KdaRecoverSSMVerifyKernelInput, KdaRecurrentDecodeKernel, KdaRecurrentDecodeKernelConfig,
     KdaRecurrentDecodeKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
@@ -64,16 +66,32 @@ use crate::timing::{
 use super::glm53_common::{atomic, backends_agree, elementwise, push_or_zero, repeated};
 
 const STATE_TRANSFER_UNIT_BYTES: u32 = 4096;
-/// The RecoverSSM verify over an fp32 pool: only the vLLM fork's Triton op.
-const RECOVERSSM_VERIFY_FP32_BACKENDS: &[&str] = &["vllm_triton"];
-/// Over a bf16 pool FlashInfer's frozen WY verify (`recurrent_kda` with
-/// `disable_state_update`) is a drop-in for the fork op; best-of-N keeps the
-/// faster.
-const RECOVERSSM_VERIFY_BF16_BACKENDS: &[&str] = &["flashinfer_cute", "vllm_triton"];
-/// The RecoverSSM commit: this repository's closed-form TileLang fold and the
-/// vLLM fork's Triton kernels (FlashInfer has no commit); best-of-N keeps the
-/// faster.
-pub const RECOVERSSM_COMMIT_BACKENDS: &[&str] = &["tilelang", "vllm_triton"];
+/// The fork's RecoverSSM kernels where its CuTe ones cannot run
+/// (`can_use_cute_recoverssm` false, e.g. an fp32 pool): the Triton
+/// `causal_conv1d_update` + `kda_recoverssm_verify`, and the Triton commit.
+const RECOVERSSM_TRITON_BACKENDS: &[&str] = &["vllm_triton"];
+/// What the fork selects on SM10x (`kda.py` `recoverssm_backend = "cute"`): the
+/// conv + verify in one CuTe launch on its default `[state_len, dim]` conv
+/// pages, and the commit with the CuTe fold.
+const RECOVERSSM_CUTE_CONV_VERIFY_BACKENDS: &[&str] = &["vllm_cute"];
+const RECOVERSSM_CUTE_COMMIT_BACKENDS: &[&str] = &["vllm_cute"];
+/// `RecoverssmSeparateConv` over an fp32 pool: only the fork's Triton verify.
+const SEPARATE_VERIFY_FP32_BACKENDS: &[&str] = &["vllm_triton"];
+/// `RecoverssmSeparateConv` over a bf16 pool: FlashInfer's frozen WY verify
+/// (`recurrent_kda` with `disable_state_update`, which the fork does not call)
+/// or the fork op; best-of-N keeps the faster.
+const SEPARATE_VERIFY_BF16_BACKENDS: &[&str] = &["flashinfer_cute", "vllm_triton"];
+/// `RecoverssmSeparateConv` commit: this repository's closed-form TileLang
+/// fold (no engine ships it) and the fork's Triton kernels; best-of-N.
+const SEPARATE_COMMIT_BACKENDS: &[&str] = &["tilelang", "vllm_triton"];
+/// The fork creates the GLM KDA conv taps in fp32 (`glm5next/common/kda.py`
+/// `conv1d`, `params_dtype=torch.float32`).
+const CONV_WEIGHT_DTYPE: DType = DType::Fp32;
+/// `can_use_cute_recoverssm`: head dim 128 and a 1..8-token window
+/// (`recoverssm/kernels.py` `K`, `MAX_WINDOW`), a width-4 conv.
+const CUTE_RECOVERSSM_HEAD_DIM: u32 = 128;
+const CUTE_RECOVERSSM_MAX_WINDOW: u32 = 8;
+const CUTE_RECOVERSSM_CONV_WIDTH: u32 = 4;
 /// Beta sigmoid ahead of a prefill core that takes beta already passed
 /// through one: reads the bf16 logits, writes fp32 (capture 20260924_0).
 const BETA_SIGMOID_IN_BYTES_PER_HEAD: u32 = 2;
@@ -90,9 +108,17 @@ const GATE_B_BMM_BACKENDS: &[&str] = &["torch_bmm_packed_lhs"];
 pub enum KdaSpecVerify {
     /// RecoverSSM: the verify reads each request's state once and caches a
     /// correction per row; a commit folds the accepted rows into the one
-    /// state the request keeps.
+    /// state the request keeps. The kernels are the ones the fork selects
+    /// (`kda.py` `can_use_cute_recoverssm`): on a bf16 pool the conv and the
+    /// verify in one CuTe launch and the CuTe commit fold; otherwise the
+    /// Triton conv, verify and commit.
     #[default]
     Recoverssm,
+    /// RecoverSSM with the short conv as its own call before the verify, and
+    /// any verify/commit backend (FlashInfer's WY verify, this repository's
+    /// TileLang commit, best-of-N): the pricing before the fork's CuTe
+    /// selection was modelled.
+    RecoverssmSeparateConv,
     /// The vLLM fork's GLM path (`kda.py` spec branch): `fused_recurrent_kda`
     /// reads the last accepted state and stores the state after every
     /// position into that position's slot, so a request holds `1 + k` state
@@ -151,9 +177,17 @@ pub struct Glm53KdaAttnLocalWorkletResolved {
     pub chunk_prefill: KdaChunkPrefillKernelConfig,
     pub recurrent_decode: KdaRecurrentDecodeKernelConfig,
     /// The decode core of a RecoverSSM verify graph (`decode_query_len > 1`)
-    /// in place of `recurrent_decode`. A per-position verify keeps
-    /// `recurrent_decode`, keyed at `decode_query_len` tokens per request.
+    /// in place of `recurrent_decode`, after `conv_decode`. A per-position
+    /// verify keeps `recurrent_decode`, keyed at `decode_query_len` tokens per
+    /// request.
     pub recoverssm_verify: Option<KdaRecoverSSMVerifyKernelConfig>,
+    /// The decode core of a RecoverSSM verify graph that runs the conv inside
+    /// it (the fork's CuTe selection); `conv_decode` then bills nothing on a
+    /// verify.
+    pub recoverssm_conv_verify: Option<KdaRecoverSSMConvVerifyKernelConfig>,
+    /// The commit that goes with this verify, per KDA cache group. The arch
+    /// sets `num_layers` to each group's layer count; here it is 1.
+    pub recoverssm_commit: Option<KdaRecoverSSMCommitKernelConfig>,
     pub state_scatter: crate::timing::kernels::ElementwiseKernelConfig,
     pub gated_norm: crate::timing::kernels::ElementwiseKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
@@ -190,6 +224,8 @@ pub enum KdaDecodeCore {
     /// scores its rows, and caches a correction and key/gate per row for the
     /// commit, which the arch bills once per KDA cache group.
     RecoverSsmVerify(Op<KdaRecoverSSMVerifyKernel>),
+    /// The same verify with the short conv fused in (one launch).
+    RecoverSsmConvVerify(Op<KdaRecoverSSMConvVerifyKernel>),
 }
 
 pub struct Glm53KdaAttnLocalWorklet {
@@ -248,7 +284,9 @@ impl Glm53KdaAttnLocalWorklet {
             heads * head_dim * head_dim * cfg.ssm_state_dtype.size_bytes();
         let verify = cfg.decode_query_len > 1;
         let per_position = verify && cfg.spec_verify == KdaSpecVerify::RecurrentPerPosition;
-        let recoverssm = verify && cfg.spec_verify == KdaSpecVerify::Recoverssm;
+        let recoverssm = verify && cfg.spec_verify != KdaSpecVerify::RecurrentPerPosition;
+        let separate = cfg.spec_verify == KdaSpecVerify::RecoverssmSeparateConv;
+        let cute = recoverssm && !separate && cute_recoverssm(cfg);
         assert_eq!(
             ssm_state_bytes_per_request % STATE_TRANSFER_UNIT_BYTES,
             0,
@@ -307,16 +345,43 @@ impl Glm53KdaAttnLocalWorklet {
                 state_dtype: cfg.ssm_state_dtype,
                 tokens_per_request: per_position.then(|| cfg.decode_query_len.into()),
             },
-            recoverssm_verify: recoverssm.then(|| KdaRecoverSSMVerifyKernelConfig {
-                backends: match cfg.ssm_state_dtype {
-                    DType::Bf16 => RECOVERSSM_VERIFY_BF16_BACKENDS,
-                    _ => RECOVERSSM_VERIFY_FP32_BACKENDS,
+            recoverssm_verify: (recoverssm && !cute).then(|| KdaRecoverSSMVerifyKernelConfig {
+                backends: match (separate, cfg.ssm_state_dtype) {
+                    (true, DType::Bf16) => SEPARATE_VERIFY_BF16_BACKENDS,
+                    (true, _) => SEPARATE_VERIFY_FP32_BACKENDS,
+                    (false, _) => RECOVERSSM_TRITON_BACKENDS,
                 }
                 .to_vec(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_heads: cfg.num_heads.clone(),
                 head_dim: cfg.head_dim.clone(),
                 spec_query_len: cfg.decode_query_len.into(),
+                dtype: cfg.activation_dtype,
+                state_dtype: cfg.ssm_state_dtype,
+            }),
+            recoverssm_conv_verify: cute.then(|| KdaRecoverSSMConvVerifyKernelConfig {
+                backends: RECOVERSSM_CUTE_CONV_VERIFY_BACKENDS.to_vec(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_heads: cfg.num_heads.clone(),
+                head_dim: cfg.head_dim.clone(),
+                spec_query_len: cfg.decode_query_len.into(),
+                dtype: cfg.activation_dtype,
+                conv_weight_dtype: CONV_WEIGHT_DTYPE,
+            }),
+            recoverssm_commit: recoverssm.then(|| KdaRecoverSSMCommitKernelConfig {
+                backends: if separate {
+                    SEPARATE_COMMIT_BACKENDS
+                } else if cute {
+                    RECOVERSSM_CUTE_COMMIT_BACKENDS
+                } else {
+                    RECOVERSSM_TRITON_BACKENDS
+                }
+                .to_vec(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_heads: cfg.num_heads.clone(),
+                head_dim: cfg.head_dim.clone(),
+                spec_query_len: cfg.decode_query_len.into(),
+                num_layers: 1.into(),
                 dtype: cfg.activation_dtype,
                 state_dtype: cfg.ssm_state_dtype,
             }),
@@ -395,19 +460,26 @@ impl Glm53KdaAttnLocalWorklet {
                 KdaChunkPrefillKernel::build,
                 bridge,
             )?,
-            decode_core: match r.recoverssm_verify {
-                None => KdaDecodeCore::Recurrent(atomic(
+            decode_core: match (r.recoverssm_conv_verify, r.recoverssm_verify) {
+                (Some(fused), _) => KdaDecodeCore::RecoverSsmConvVerify(atomic(
                     n,
-                    "recurrent_decode",
-                    r.recurrent_decode,
-                    KdaRecurrentDecodeKernel::build,
+                    "recoverssm_conv_verify",
+                    fused,
+                    KdaRecoverSSMConvVerifyKernel::build,
                     bridge,
                 )?),
-                Some(verify) => KdaDecodeCore::RecoverSsmVerify(atomic(
+                (None, Some(verify)) => KdaDecodeCore::RecoverSsmVerify(atomic(
                     n,
                     "recoverssm_verify",
                     verify,
                     KdaRecoverSSMVerifyKernel::build,
+                    bridge,
+                )?),
+                (None, None) => KdaDecodeCore::Recurrent(atomic(
+                    n,
+                    "recurrent_decode",
+                    r.recurrent_decode,
+                    KdaRecurrentDecodeKernel::build,
                     bridge,
                 )?),
             },
@@ -474,6 +546,7 @@ impl Glm53KdaAttnLocalWorklet {
                     match &self.decode_core {
                         KdaDecodeCore::Recurrent(op) => op.compile(builder),
                         KdaDecodeCore::RecoverSsmVerify(op) => op.compile(builder),
+                        KdaDecodeCore::RecoverSsmConvVerify(op) => op.compile(builder),
                     },
                     self.state_scatter.compile(builder),
                     self.gated_norm.compile(builder),
@@ -522,14 +595,16 @@ impl Glm53KdaAttnLocalWorklet {
         }
         // One `causal_conv1d_update` over the decode requests: one row each,
         // or a verify's `decode_query_len` rows each in the varlen form the
-        // config keys (`tokens_per_request`).
+        // config keys (`tokens_per_request`). A fused conv + verify runs it
+        // inside the verify.
+        let fused_conv = matches!(self.decode_core, KdaDecodeCore::RecoverSsmConvVerify(_));
         push_or_zero(
             &self.conv_decode,
             GdnCausalConvDecodeKernelInput {
                 batch_size: input.decode_batch_size,
             },
             !if w.verify {
-                input.decode_batch_size > 0
+                input.decode_batch_size > 0 && !fused_conv
             } else {
                 decode_conv_runs(per_sequence, w.prefill_bearing, input.decode_batch_size)
             },
@@ -580,11 +655,31 @@ impl Glm53KdaAttnLocalWorklet {
                 input.decode_batch_size == 0,
                 ev,
             ),
+            KdaDecodeCore::RecoverSsmConvVerify(op) => push_or_zero(
+                op,
+                KdaRecoverSSMConvVerifyKernelInput {
+                    batch_size: input.decode_batch_size,
+                },
+                input.decode_batch_size == 0,
+                ev,
+            ),
         }
         push_or_zero(&self.state_scatter, state, decode_only, ev);
         push_or_zero(&self.gated_norm, tokens, false, ev);
         push_or_zero(&self.o_proj, rows, false, ev);
     }
+}
+
+/// Whether the fork's CuTe RecoverSSM kernels serve this layer
+/// (`can_use_cute_recoverssm`): an SM10x GPU, head dim 128, a width-4 conv, a
+/// 1..8-token window, and bf16 activations, conv state and SSM state.
+fn cute_recoverssm(cfg: &Glm53KdaAttnLocalWorkletConfig) -> bool {
+    matches!(compute_capability(&cfg.gpu_name), Some((10, _)))
+        && cfg.head_dim.get() == CUTE_RECOVERSSM_HEAD_DIM
+        && cfg.conv_kernel_size.get() == CUTE_RECOVERSSM_CONV_WIDTH
+        && cfg.decode_query_len <= CUTE_RECOVERSSM_MAX_WINDOW
+        && cfg.activation_dtype == DType::Bf16
+        && cfg.ssm_state_dtype == DType::Bf16
 }
 
 /// Whether the decode short conv launches: in a decode-only iteration, and in
@@ -898,6 +993,45 @@ mod tests {
         let tree = builder.finish(root);
         assert_eq!(tree.slots.len(), 12);
         assert_eq!(tree.slots[8].name, "m.kda.recoverssm_verify");
+    }
+
+    #[test]
+    fn a_bf16_sm100_verify_runs_the_fused_conv_verify_and_others_fall_back() {
+        // can_use_cute_recoverssm: SM10x, bf16 state and activations, a
+        // window up to 8. Anything else keeps the Triton conv + verify.
+        let slot8 = |cfg: &Glm53KdaAttnLocalWorkletConfig| {
+            let r = Glm53KdaAttnLocalWorklet::resolve_config(cfg);
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let worklet = Glm53KdaAttnLocalWorklet::build("m.kda".into(), r, &bridge).unwrap();
+            let mut builder = CostTreeBuilder::new();
+            let root = worklet.compile(&mut builder);
+            builder.finish(root).slots[8].name.clone()
+        };
+        let mut fused = cfg();
+        fused.decode_query_len = 8;
+        fused.ssm_state_dtype = DType::Bf16;
+        let r = Glm53KdaAttnLocalWorklet::resolve_config(&fused);
+        assert!(r.recoverssm_verify.is_none());
+        assert_eq!(
+            r.recoverssm_conv_verify.as_ref().map(|c| c.backends.clone()),
+            Some(vec!["vllm_cute"])
+        );
+        assert_eq!(r.recoverssm_commit.unwrap().backends, ["vllm_cute"]);
+        assert_eq!(slot8(&fused), "m.kda.recoverssm_conv_verify");
+
+        let mut fp32 = fused.clone();
+        fp32.ssm_state_dtype = DType::Fp32;
+        assert_eq!(slot8(&fp32), "m.kda.recoverssm_verify");
+        let mut hopper = fused.clone();
+        hopper.gpu_name = "NVIDIA H100 80GB HBM3".into();
+        assert_eq!(slot8(&hopper), "m.kda.recoverssm_verify");
+        let mut separate = fused.clone();
+        separate.spec_verify = KdaSpecVerify::RecoverssmSeparateConv;
+        let r = Glm53KdaAttnLocalWorklet::resolve_config(&separate);
+        assert!(r.recoverssm_conv_verify.is_none());
+        assert_eq!(r.recoverssm_commit.unwrap().backends, ["tilelang", "vllm_triton"]);
+        assert_eq!(slot8(&separate), "m.kda.recoverssm_verify");
     }
 
     #[test]
