@@ -1,5 +1,5 @@
 # VENDORED (temporary, delete once the kernel ships as a callable package): wt-glm53-decode-investigate/tmp/moe-copy-gap/lanes/P_fused/p_route.py
-# MoE-session lane P, round R16; source tree HEAD d3563d86 (file untracked), mtime 2026-11-12 17:42:53 PST.
+# MoE-session lane P, round R16 + the R20 cbuf sizing (lane mtime 2026-11-12 23:58 PST); source tree HEAD d3563d86 (file untracked).
 # Only change: compile-time config is read from the module global _PFUSED_CFG (a dict) instead of os.environ.
 """Lane P copy of lane O's router (p_route.cuh, + zero-fill of out in the router, bits & 16). ORouter has the same output attributes as lane N's RouterN."""
 import os
@@ -42,7 +42,10 @@ class PRouter:
         if shared is not None:  # share output buffers with another router (e.g. floors writing into the same tensors)
             self.counts, self.perm, self.route_w, self.sfb, self.xg = shared.counts, shared.perm, shared.route_w, shared.sfb, shared.xg
         else:
-            self.cbuf = torch.full((64 + 16384,), -1, dtype=torch.int32, device=dev)  # counts + tile table (round 8)
+            # counts + tile table (round 8). R20: the table is 2 * ntc * S + 160 ints (ntc <= 32 weight tiles per token tile,
+            # S = token tiles <= E * slots / 128); the old fixed 16384 overflowed at S > 507 (u) / 253 (t) -> T=65536 crash.
+            assert slots <= 256 * 128, 'table entry token-tile field is 8 bits'
+            self.cbuf = torch.full((64 + max(16384, 64 * (E * slots // 128) + 160),), -1, dtype=torch.int32, device=dev)
             self.cbuf[:64].zero_()
             self.cbuf[8192:8192 + 1344].zero_()  # round 12 P_FLAG flag area (r12b layout)
             self.counts = self.cbuf[:E]

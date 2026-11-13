@@ -1,5 +1,5 @@
 # VENDORED (temporary, delete once the kernel ships as a callable package): wt-glm53-decode-investigate/tmp/moe-copy-gap/lanes/P_fused/p_fused_dyn.py
-# MoE-session lane P, round R19 (dyn_gen.py output: dynamic tile claiming, P_DYN); source tree HEAD d3563d86 (file untracked), mtime 2026-11-12 20:01:06 PST.
+# MoE-session lane P, round R20 (dyn_gen.py output of the R20 p_fused.py: dynamic tile claim, P_DYN; gate stride _PGS=256); source tree HEAD d3563d86 (file untracked), mtime 2026-11-13 00:35 PST; xchat/from_moe11.md.
 # Only change: compile-time config is read from the module global _PFUSED_CFG (a dict) instead of os.environ.
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
@@ -46,8 +46,8 @@ _CFG = globals().get('_PFUSED_CFG') or {}
 _GK=int(_CFG.get('G_KTILE','4')); _GC=int(_CFG.get('G_CSTAGE','2')); _GCR=int(_CFG.get('G_CREFINE','1')); _GAB=int(_CFG.get('G_ABSTAGE','0'))
 _HF=int(_CFG.get('H_FUSED','1')); _HS=int(_CFG.get('H_SCHED','0')); _HEPI_COLS=int(_CFG.get('P_EC','32')); _HNOEPI=int(_CFG.get('H_NOEPI','0')); _HACC=int(_CFG.get('H_ACC','0')); _HBST=int(_CFG.get('H_BSTAGE','4')); _HZB=int(_CFG.get('H_ZBYTES','0')); _HZPOS=int(_CFG.get('H_ZPOS','0')); _HPDLT=int(_CFG.get('H_PDLTRIG','0')); _HPDLW=int(_CFG.get('H_PDLWAIT','0')); _HPF=int(_CFG.get('H_PREPF','0'))
 _JX=int(_CFG.get('J_X','0')); _JV=int(_CFG.get('J_VN','0')); _JD=int(_CFG.get('J_DYN','0')); _JQ=int(_CFG.get('J_Q','4')); _JS=int(_CFG.get('J_SPLIT','0')); _JW1=4096; _JSMAX=192; _JT=int(_CFG.get('J_TRACE','0')); _JMAX=8192 + 160 * 64
-_PF=1; _PG=int(_CFG.get('P_GATE','1')); _PZ=int(_CFG.get('P_ZERO','1')); _PNG=36*64; _PSTOP=int(_CFG.get('P_STOP','0')); _PNOEPI=int(_CFG.get('P_NOEPI','0')); _PNOB=int(_CFG.get('P_NOB','0')); _PSLEEP=int(_CFG.get('P_SLEEP','256')); _PRLX=int(_CFG.get('P_RLX','0')); _PTR=int(_CFG.get('P_TRACE','0')); _PGL=int(_CFG.get('P_GL','1')); _PUNI=int(_CFG.get('P_UNI','1')); _PPFN=int(_CFG.get('P_PFN','1')); _PEVF=int(_CFG.get('P_EVF','0')); _PSPL=int(_CFG.get('P_SPL','0')); _PEA=int(_CFG.get('P_EARLY','0')); _PEAX=5; _PZT=int(_CFG.get('P_ZT','0')); _PNL0=2*36*64+8+8*160; _PK=int(_CFG.get('P_K2','1')); _PCL=int(_CFG.get('P_CL','1')); _PASK=int(_CFG.get('P_ASK','0')); _PNORED=int(_CFG.get('P_NORED','0')); _PORD=int(_CFG.get('P_ORD','0')); _PZTL=int(_CFG.get('P_ZTAIL','0')); _PNOLD=int(_CFG.get('P_NOLD','0')); _PTDB=int(_CFG.get('P_TDB','0')); _PPFL2=int(_CFG.get('P_PFL2','32'))
-_PDYN=int(_CFG.get('P_DYN','0')); _PDOFF=2*36*64+8+8*160+8192+8*160+16*160+64; _PDYNA=int(_CFG.get('P_DYNA','1')); _PDYNS=int(_CFG.get('P_DYNS','0')); _PDST=int(_CFG.get('P_DST', _CFG.get('P_DYN','0'))); _PRESV=[int(x) for x in _CFG.get('P_RESV','').split(',') if x != '']
+_PF=1; _PG=int(_CFG.get('P_GATE','1')); _PZ=int(_CFG.get('P_ZERO','1')); _PGS=256; _PNG=36*_PGS; _PSTOP=int(_CFG.get('P_STOP','0')); _PNOEPI=int(_CFG.get('P_NOEPI','0')); _PNOB=int(_CFG.get('P_NOB','0')); _PSLEEP=int(_CFG.get('P_SLEEP','256')); _PRLX=int(_CFG.get('P_RLX','0')); _PTR=int(_CFG.get('P_TRACE','0')); _PGL=int(_CFG.get('P_GL','1')); _PUNI=int(_CFG.get('P_UNI','1')); _PPFN=int(_CFG.get('P_PFN','1')); _PEVF=int(_CFG.get('P_EVF','0')); _PSPL=int(_CFG.get('P_SPL','0')); _PEA=int(_CFG.get('P_EARLY','0')); _PEAX=5; _PZT=int(_CFG.get('P_ZT','0')); _PNL0=2*_PNG+8+8*160; _PK=int(_CFG.get('P_K2','1')); _PCL=int(_CFG.get('P_CL','1')); _PASK=int(_CFG.get('P_ASK','0')); _PNORED=int(_CFG.get('P_NORED','0')); _PORD=int(_CFG.get('P_ORD','0')); _PZTL=int(_CFG.get('P_ZTAIL','0')); _PNOLD=int(_CFG.get('P_NOLD','0')); _PTDB=int(_CFG.get('P_TDB','0')); _PPFL2=int(_CFG.get('P_PFL2','32'))
+_PDYN=int(_CFG.get('P_DYN','0')); _PDOFF=2*_PNG+8+8*160+8192+8*160+16*160+64; _PDYNA=int(_CFG.get('P_DYNA','1')); _PDYNS=int(_CFG.get('P_DYNS','0')); _PDST=int(_CFG.get('P_DST', _CFG.get('P_DYN','0'))); _PRESV=[int(x) for x in _CFG.get('P_RESV','').split(',') if x != '']
 _PGRID=int(_CFG.get('P_GRID','0'))
 _GNOMMA=int(_CFG.get('G_NOMMA','0')); _GNOS2T=int(_CFG.get('G_NOS2T','0')); _GNOB=int(_CFG.get('G_NOB','0')); _GNOC=int(_CFG.get('G_NOC','0'))
 from cutlass._mlir import ir
@@ -2091,8 +2091,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     if cutlass.const_expr(_PG):
                         r_bank = (r_ep // (r_G * _PGL)) % 2
                         r_g = r_c
-                        while r_g < _PNG:
-                            p_gates[(1 - r_bank) * _PNG + r_g] = Int32(0)
+                        r_nt = (h_out.shape[1] + 127) // 128  # R20: clear only usable gates (see p_fused.py)
+                        while r_g < (_PNG // _PGS) * r_nt:
+                            p_gates[(1 - r_bank) * _PNG + (r_g // r_nt) * _PGS + r_g % r_nt] = Int32(0)
                             r_g += r_G
                     r_d = p_atom_add(r_gb + Int64(4 * _PDOFF + 4), Int32(1))
                     if r_d == r_G - Int32(1):
@@ -2476,8 +2477,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     g_bank = (g_ep // (g_G * _PGL)) % 2
                     g_i = (gbz * ggy + gby) * ggx + gbx
                     g_i0 = g_i
-                    while g_i < _PNG:
-                        p_gates[(1 - g_bank) * _PNG + g_i] = Int32(0)
+                    g_nt = (h_out.shape[1] + 127) // 128  # R20: token tiles per expert (SLOTS/128); clear only usable gates
+                    while g_i < (_PNG // _PGS) * g_nt:
+                        p_gates[(1 - g_bank) * _PNG + (g_i // g_nt) * _PGS + g_i % g_nt] = Int32(0)
                         g_i += g_G
                     if cutlass.const_expr(_HPDLW):
                         cute.arch.griddepcontrol_wait()
@@ -2495,7 +2497,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     while g_work.is_valid_tile and g_dead == 777 and cutlass.const_expr(_PG != 5 and _PG != 13 and _PG != 15):
                         g_cur = g_work.tile_idx
                         if (g_cur[3] & 1) == 1 and cutlass.const_expr(_PG != 6):
-                            g_addr = g_base + Int64(4) * Int64(g_bank * _PNG + g_cur[2] * 64 + g_cur[1])
+                            g_addr = g_base + Int64(4) * Int64(g_bank * _PNG + g_cur[2] * _PGS + g_cur[1])
                             if cutlass.const_expr(_PG < 7):
                                 if cutlass.const_expr(_PRLX):
                                     g_v = p_unig(p_ld_relaxed(g_addr))
@@ -2720,7 +2722,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         if p_law.is_valid_tile:
                             p_lac = p_law.tile_idx
                             if p_lac[3] == 1:
-                                p_la_v = p_uni(p_ld_relaxed(p_gb + Int64(4) * Int64(p_pbank * _PNG + p_lac[2] * 64 + p_lac[1])))
+                                p_la_v = p_uni(p_ld_relaxed(p_gb + Int64(4) * Int64(p_pbank * _PNG + p_lac[2] * _PGS + p_lac[1])))
                         p_las.advance_to_next_work()
                     p_em = Int32(0)
                     if cutlass.const_expr(_PF):
@@ -2753,7 +2755,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 p_q = p_q + 1
                             if cutlass.const_expr(_PG == 13 or _PG == 15):
                                 if p_cur_v < 32:
-                                    p_ga = p_gb + Int64(4) * Int64(p_pbank * _PNG + cur_tile_coord[2] * 64 + cur_tile_coord[1])
+                                    p_ga = p_gb + Int64(4) * Int64(p_pbank * _PNG + cur_tile_coord[2] * _PGS + cur_tile_coord[1])
                                     p_cur_v = p_uni(p_ld_relaxed(p_ga))
                                     while p_cur_v < 32:
                                         p_nanosleep(_PSLEEP)
@@ -3706,7 +3708,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             p_fence_proxy_async_global()
                             cute.arch.barrier(barrier_id=self.epilog_sync_bar_id, number_of_threads=epi_threads)
                             if tidx == 0:
-                                p_red_release(p_gaddr + Int64(4) * Int64(p_bank * _PNG + l_t * 64 + n_t), Int32(1))
+                                p_red_release(p_gaddr + Int64(4) * Int64(p_bank * _PNG + l_t * _PGS + n_t), Int32(1))
                     if cutlass.const_expr(_JS):
                         if j_role == 1:
                             j_fence_gpu()

@@ -114,6 +114,12 @@ def _load(file: str, cfg: dict[str, Any]) -> Any:
     return _MODULES[key]
 
 
+def _gates_ok(gates: Any, png: int) -> bool:
+    """FC1->FC2 gates after a call: each counter 0 or 32 (FC1 done), the other bank cleared."""
+    gb = gates[: 2 * png].view(2, -1)
+    return bool(((gb == 0) | (gb == 32)).all()) and int(gb.max(1).values.min()) == 0
+
+
 def _cache_dir(sub: str) -> Path:
     # the checkout is mounted read-only in a profiler container; HOME is writable on both sides
     return Path.home() / ".cache" / "vibesim-pfused" / sub
@@ -214,12 +220,16 @@ def _run(torch: Any, F: Any, args: dict[str, Any]) -> ComputeMetrics:
         T, TOPK, E, H, slots, ch["ocfg"], copy=True, pdl=True, shared=orc, build_dir=build_dir
     )
     rtr.bits |= ch["bits"]
+    # FC1->FC2 gate banks: 2 x _PNG (36 experts x _PGS token-tile slots; R20 stride 256), then the
+    # zero/epoch counters, per-CTA bookkeeping and the dynamic-claim counters at the tail (_PDOFF),
+    # laid out as in the lane's bench_p.py
+    png = int(pm._PNG)
     gates = torch.zeros(
-        2 * 36 * 64 + 8 + 8 * 160 + 8192 + 8 * 160 + 16 * 160 + 64 + 64,
+        2 * png + 8 + 8 * 160 + 8192 + 8 * 160 + 16 * 160 + 64 + 64,
         dtype=torch.int32,
         device="cuda",
     )
-    gates[2 * 36 * 64 + 1] = T * H * 2 // 16
+    gates[2 * png + 1] = T * H * 2 // 16
 
     ids_cpu = torch.tensor(
         exact_topk_ids(num_tokens=T, top_k=TOPK, per_expert_batches=peb), dtype=torch.int64
@@ -358,8 +368,8 @@ def _run(torch: Any, F: Any, args: dict[str, Any]) -> ComputeMetrics:
         del W2d
 
     def reset_gates() -> None:
-        gates[: 2 * 36 * 64 + 1].zero_()
-        gates[2 * 36 * 64 + 2 : 2 * 36 * 64 + 8].zero_()
+        gates[: 2 * png + 1].zero_()
+        gates[2 * png + 2 : 2 * png + 8].zero_()
         gates[-64:].zero_()
         torch.cuda.synchronize()
 
@@ -381,6 +391,7 @@ def _run(torch: Any, F: Any, args: dict[str, Any]) -> ComputeMetrics:
     fused()
     torch.cuda.synchronize()
     chk.update(
+        gates_ok_before=_gates_ok(gates, png),
         fc1_code_bitexact=bool(torch.equal(h_out[vmask_h], ref_h[vmask_h])),
         fc1_sf_bitexact=bool(
             torch.equal(h_sf.view(E, -1)[sfo_written], ref_sf.view(E, -1)[sfo_written])
@@ -393,14 +404,13 @@ def _run(torch: Any, F: Any, args: dict[str, Any]) -> ComputeMetrics:
     torch.cuda.synchronize()
     chain()
     torch.cuda.synchronize()
-    gb = gates[: 2 * 36 * 64].view(2, -1)
     chk.update(
         chain_out_cos_after=_cos(F, out, oref),
-        gates_ok_after=bool(((gb == 0) | (gb == 32)).all()) and int(gb.max(1).values.min()) == 0,
+        gates_ok_after=_gates_ok(gates, png),
         fc1_code_bitexact_after=bool(torch.equal(h_out[vmask_h], ref_h[vmask_h])),
     )
     ok = (
-        all(v for k, v in chk.items() if k.endswith("_ok") or "bitexact" in k)
+        all(v for k, v in chk.items() if "_ok" in k or "bitexact" in k)
         and min(chk["out_cos"], chk["chain_out_cos_after"]) >= COS_MIN
     )
     side = dict(
