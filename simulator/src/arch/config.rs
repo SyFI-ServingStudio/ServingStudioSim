@@ -1752,13 +1752,21 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         routed_moe_whatif_file: Option<String>,
-        /// Measured pair (needs `moe_shared_overlap: routed_only`): a JSON table
-        /// `{"points": [{"tokens", "added_us"}, ...]}` of the delay the
-        /// aux-stream shared expert adds to the routed call's end, by gathered
-        /// token count; it replaces the overlap factor. Absent: the factor.
+        /// Measured shared-expert table. With `moe_shared_overlap: routed_only`:
+        /// `{"points": [{"tokens", "added_us"}, ...]}`, the delay the aux-stream
+        /// shared expert adds to the routed call's end, by gathered token count.
+        /// With `moe_shared_overlap: exposed`: `{"points": [{"rows",
+        /// "<column>_us", ...}, ...]}`, the time the aux-stream shared expert
+        /// adds to the MoE block, by rows per rank (`moe_shared_pair_column`
+        /// picks the column). Either replaces the overlap factor. Absent: the factor.
         #[serde(default)]
         #[param(cache_key)]
         moe_shared_pair_file: Option<String>,
+        /// The `<column>_us` column of `moe_shared_pair_file` that
+        /// `moe_shared_overlap: exposed` reads; required there, unused otherwise.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_shared_pair_column: Option<String>,
         /// How the aux-stream shared expert (local rows <= 256) overlaps the
         /// MoE chain
         /// ([`crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap`]).
@@ -1857,13 +1865,21 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         routed_moe_whatif_file: Option<String>,
-        /// Measured pair (needs `moe_shared_overlap: routed_only`): a JSON table
-        /// `{"points": [{"tokens", "added_us"}, ...]}` of the delay the
-        /// aux-stream shared expert adds to the routed call's end, by gathered
-        /// token count; it replaces the overlap factor. Absent: the factor.
+        /// Measured shared-expert table. With `moe_shared_overlap: routed_only`:
+        /// `{"points": [{"tokens", "added_us"}, ...]}`, the delay the aux-stream
+        /// shared expert adds to the routed call's end, by gathered token count.
+        /// With `moe_shared_overlap: exposed`: `{"points": [{"rows",
+        /// "<column>_us", ...}, ...]}`, the time the aux-stream shared expert
+        /// adds to the MoE block, by rows per rank (`moe_shared_pair_column`
+        /// picks the column). Either replaces the overlap factor. Absent: the factor.
         #[serde(default)]
         #[param(cache_key)]
         moe_shared_pair_file: Option<String>,
+        /// The `<column>_us` column of `moe_shared_pair_file` that
+        /// `moe_shared_overlap: exposed` reads; required there, unused otherwise.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_shared_pair_column: Option<String>,
         /// How the aux-stream shared expert (local rows <= 256) overlaps the
         /// MoE chain
         /// ([`crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap`]).
@@ -2243,15 +2259,27 @@ impl IterArchSel {
         };
         let moe_shared_pair = match self {
             Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
-                moe_shared_pair_file: Some(path),
+                moe_shared_pair_file,
+                moe_shared_pair_column,
                 ..
             } => {
-                anyhow::ensure!(
-                    moe_shared_overlap
-                        == crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap::RoutedOnly,
-                    "moe_shared_pair_file needs moe_shared_overlap: routed_only"
-                );
-                Some(crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedPair::load(path)?)
+                use crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::{MoeSharedOverlap, MoeSharedPair};
+                match (moe_shared_overlap, moe_shared_pair_file, moe_shared_pair_column) {
+                    (MoeSharedOverlap::Exposed, Some(path), Some(column)) => {
+                        Some(MoeSharedPair::load_exposed(path, column)?)
+                    }
+                    (MoeSharedOverlap::Exposed, _, _) => anyhow::bail!(
+                        "moe_shared_overlap: exposed needs moe_shared_pair_file and moe_shared_pair_column"
+                    ),
+                    (_, _, Some(_)) => {
+                        anyhow::bail!("moe_shared_pair_column needs moe_shared_overlap: exposed")
+                    }
+                    (MoeSharedOverlap::RoutedOnly, Some(path), None) => Some(MoeSharedPair::load(path)?),
+                    (MoeSharedOverlap::Chain, Some(_), None) => anyhow::bail!(
+                        "moe_shared_pair_file needs moe_shared_overlap: routed_only or exposed"
+                    ),
+                    (_, None, None) => None,
+                }
             }
             _ => None,
         };
@@ -3062,6 +3090,7 @@ pub struct Glm53FlashFusions {
     /// `routed_moe_whatif_file`, read.
     pub routed_moe_whatif: Option<crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::RoutedMoeWhatIf>,
     pub moe_shared_overlap: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap,
-    /// `moe_shared_pair_file`, read.
+    /// `moe_shared_pair_file`, read (keyed by gathered tokens under
+    /// `routed_only`, by rows per rank under `exposed`).
     pub moe_shared_pair: Option<crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedPair>,
 }

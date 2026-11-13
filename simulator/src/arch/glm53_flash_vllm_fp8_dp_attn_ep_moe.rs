@@ -222,10 +222,17 @@ pub enum MoeSharedOverlap {
     /// combine` with no overlap factor. Same as the fork's structure while
     /// the shared expert is no longer than the routed call.
     RoutedOnly,
+    /// `Parallel{1.0}[dispatch + routed + combine, shared]`, with the measured
+    /// time the aux-stream shared expert adds to the whole MoE block
+    /// (`moe_shared_pair_file`, block with it minus block without it, by rows
+    /// per rank) added to the routed call when some rank runs it on the aux
+    /// stream; no overlap factor. When every rank's rows are > 256 the shared
+    /// expert runs on the main stream and nothing is added.
+    Exposed,
 }
 
 /// The `moe_shared_overlap` choices the launcher schema advertises.
-pub const MOE_SHARED_OVERLAPS: [&str; 2] = ["chain", "routed_only"];
+pub const MOE_SHARED_OVERLAPS: [&str; 3] = ["chain", "routed_only", "exposed"];
 
 /// What-if: the routed-expert call (`routed_rank*.fused_moe`) priced from an
 /// external per-token-count table of another kernel instead of only its rows.
@@ -341,6 +348,41 @@ impl MoeSharedPair {
             .map_err(|e| anyhow::anyhow!("moe_shared_pair_file {path}: {e}"))?;
         let table: Self = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("moe_shared_pair_file {path}: {e}"))?;
+        Self::checked(table, path)
+    }
+
+    /// Reads column `<column>_us` of an exposure table `{"points": [{"rows",
+    /// "<column>_us", ...}, ...]}` (`moe_shared_overlap: exposed`); the
+    /// points' `tokens` then hold rows per rank.
+    pub fn load_exposed(path: &str, column: &str) -> Result<Self> {
+        let err = |e: String| anyhow::anyhow!("moe_shared_pair_file {path}: {e}");
+        let text = std::fs::read_to_string(path).map_err(|e| err(e.to_string()))?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            points: Vec<std::collections::BTreeMap<String, f64>>,
+        }
+        let table: Table = serde_json::from_str(&text).map_err(|e| err(e.to_string()))?;
+        let key = format!("{column}_us");
+        let points = table
+            .points
+            .iter()
+            .map(|p| {
+                let rows = p.get("rows").ok_or_else(|| err("a point has no rows".into()))?;
+                anyhow::ensure!(
+                    rows.fract() == 0.0 && *rows >= 1.0 && *rows <= f64::from(u32::MAX),
+                    err(format!("rows {rows} is not a positive integer"))
+                );
+                let us = p
+                    .get(&key)
+                    .ok_or_else(|| err(format!("no {key} at {rows} rows")))?;
+                Ok(MoeSharedPairPoint { tokens: *rows as u32, added_us: *us })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::checked(Self { points }, path)
+    }
+
+    fn checked(table: Self, path: &str) -> Result<Self> {
         anyhow::ensure!(!table.points.is_empty(), "moe_shared_pair_file {path}: no points");
         for w in table.points.windows(2) {
             anyhow::ensure!(
@@ -1199,13 +1241,21 @@ impl MoeBlock {
             }
         } else {
             let concurrent_shared = shared(builder);
+            let exposed = self.moe_shared_overlap == MoeSharedOverlap::Exposed;
             CostNode::Labeled {
                 label: format!(
-                    "{} (MoE) [{path}; aux-stream shared expert at T_r<={} overlaps]",
-                    self.name, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+                    "{} (MoE) [{path}; aux-stream shared expert at T_r<={} {}]",
+                    self.name,
+                    SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
+                    if exposed {
+                        "adds its measured exposed time on the routed call"
+                    } else {
+                        "overlaps"
+                    }
                 ),
                 child: Box::new(CostNode::Parallel {
-                    overlap: SHARED_EXPERTS_STREAM_OVERLAP,
+                    // The measured exposed time already sits on the routed leaves.
+                    overlap: if exposed { 1.0 } else { SHARED_EXPERTS_STREAM_OVERLAP },
                     children: vec![CostNode::Sum(chain), concurrent_shared],
                 }),
             }
@@ -1303,7 +1353,17 @@ impl MoeBlock {
             push_shared(ev);
             push_routed(beside_shared, None, ev);
         } else {
-            push_routed(false, None, ev);
+            let exposed_ms = match (self.moe_shared_overlap, &self.moe_shared_pair) {
+                (MoeSharedOverlap::Exposed, Some(table)) => batch
+                    .ranks
+                    .iter()
+                    .map(|rank| rank.rows)
+                    .filter(|&rows| rows > 0 && rows <= SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD)
+                    .max()
+                    .map(|rows| table.added_ms(rows)),
+                _ => None,
+            };
+            push_routed(false, exposed_ms, ev);
         }
         match (&self.exchange, step) {
             (Exchange::MeasuredAllgather { combine, .. }, _) => push(
@@ -2323,6 +2383,33 @@ mod tests {
         assert_eq!(pair.added_ms(64), 0.012);
         assert!((pair.added_ms(544) - 0.014).abs() < 1e-12);
         assert_eq!(pair.added_ms(4096), 0.016);
+    }
+
+    /// `exposed` reads one column by rows per rank: linear between rows,
+    /// clamped at both ends; a missing column is an error.
+    #[test]
+    fn moe_shared_exposed_reads_its_column_by_rows() {
+        let dir = std::env::temp_dir().join(format!("moe_shared_exposed_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("exposed.json");
+        std::fs::write(
+            &path,
+            r#"{"points": [{"rows": 8, "production_us": 7.8, "fused_us": 8.9},
+                           {"rows": 32, "production_us": 9.2, "fused_us": 10.4},
+                           {"rows": 256, "production_us": 17.5, "fused_us": 17.9}]}"#,
+        )
+        .unwrap();
+        let path = path.to_str().unwrap();
+        let fused = MoeSharedPair::load_exposed(path, "fused").unwrap();
+        let production = MoeSharedPair::load_exposed(path, "production").unwrap();
+        assert!((fused.added_ms(8) - 0.0089).abs() < 1e-12);
+        assert!((production.added_ms(8) - 0.0078).abs() < 1e-12);
+        assert!((fused.added_ms(1) - 0.0089).abs() < 1e-12);
+        assert!((fused.added_ms(16) - (8.9 + (10.4 - 8.9) / 3.0) / 1e3).abs() < 1e-12);
+        assert!((production.added_ms(144) - (9.2 + (17.5 - 9.2) / 2.0) / 1e3).abs() < 1e-12);
+        assert!((fused.added_ms(1024) - 0.0179).abs() < 1e-12);
+        assert!(MoeSharedPair::load_exposed(path, "ours").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

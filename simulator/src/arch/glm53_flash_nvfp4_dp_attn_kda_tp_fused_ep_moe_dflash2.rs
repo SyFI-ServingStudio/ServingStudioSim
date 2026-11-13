@@ -179,6 +179,7 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         router_gate_once,
         routed_moe_whatif_file,
         moe_shared_pair_file,
+        moe_shared_pair_column,
         moe_shared_overlap,
         hisparse_buffer_tokens,
         hisparse_top_k,
@@ -257,6 +258,7 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         router_gate_once: *router_gate_once,
         routed_moe_whatif_file: routed_moe_whatif_file.clone(),
         moe_shared_pair_file: moe_shared_pair_file.clone(),
+        moe_shared_pair_column: moe_shared_pair_column.clone(),
         moe_shared_overlap: *moe_shared_overlap,
     })
 }
