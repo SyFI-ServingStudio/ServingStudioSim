@@ -38,6 +38,12 @@ adds the accepted rows in closed form as one fp32 rank-n update per state
 tile, so the state is read and written once whatever the accepted length;
 the conv compaction is the fork's. It runs in the main environment, not the
 vLLM fork's.
+
+Backend ``cuda_persistent_ws`` is a vendored persistent warp-specialized CUDA
+fold (``profiling.runners.attention.kda_recoverssm_commit_ws``), shipped by no
+engine: the fork's plan launch, then one launch that folds every layer and
+fuses the conv compaction. It is byte-identical to ``vllm_cute`` on the same
+pages, needs the SD conv layout (channel stride 1) and has no align mode.
 """
 
 from __future__ import annotations
@@ -208,6 +214,42 @@ register(
                 "layer's accepted records into its bf16 checkpoint."
             ),
             url="https://github.com/vllm-project/vllm",
+        ),
+    )
+)
+
+
+# A persistent warp-specialized CUDA commit (vendored, see the runner): the
+# fork's plan launch, then one launch that streams every (layer, request, head)
+# item's records, state page and conv history through a shared-memory ring
+# (TMA producer warp, coefficient warps, fold warps) and fuses the conv
+# compaction. Byte-identical to ``vllm_cute`` on the same pages; it needs the
+# SD conv layout (channel stride 1) and has no align mode. No engine ships it.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="cuda_persistent_ws",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_recoverssm_commit_ws",
+            function_name="profile_kda_recoverssm_commit_cuda_persistent_ws",
+        ),
+        table_name=KIND,
+        args_schema=KdaRecoverSSMCommitArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        # Needs the fork's plan kernel and commit context (vllm_env image).
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "Persistent warp-specialized CUDA commit (shipped by no engine): the fork's "
+                "plan, then one launch streaming records, state and conv history through a "
+                "shared-memory ring, folding on packed FP32 FMAs and fusing the conv compaction."
+            ),
         ),
     )
 )
