@@ -9,7 +9,7 @@ Wire string: ``"single_gemm"`` — matches Rust ``KernelSpec::KIND`` in
 by ``profiling.facade`` to generate ``get_single_gemm_times`` /
 ``count_missing_single_gemm``.
 
-Ten backends share this kind/table/schema: ``torch`` (contiguous-RHS
+Eleven backends share this kind/table/schema: ``torch`` (contiguous-RHS
 ``torch.mm``), ``torch_linear`` (model-weight-layout ``F.linear`` in the main
 environment), ``torch_linear_vllm`` (the same expression in vLLM's pinned
 environment), ``sglang_bf16_auto`` and ``sglang_fused_a_auto`` (SGLang's
@@ -18,8 +18,10 @@ production BF16 dispatches, SM100 only), ``deepgemm`` (FP8 dense GEMM,
 linear on SM10x, ``dtype = fp8_e4m3``), ``flashinfer_cutedsl`` (vLLM's default NVFP4 W4A4
 linear on SM10x, ``dtype = nvfp4_e2m1``), and ``flashinfer_mxfp8`` (MXFP8 dense
 linear: activation quant + FlashInfer CuTe-DSL block-scaled GEMM,
-``dtype = mxfp8_e4m3``), and ``flashinfer_mxfp8_prequantized`` (the same linear
-fed an already-quantized MXFP8 activation: the GEMM alone).
+``dtype = mxfp8_e4m3``), ``flashinfer_mxfp8_prequantized`` (the same linear
+fed an already-quantized MXFP8 activation: the GEMM alone), and
+``flashinfer_cutedsl_bf16`` (vLLM's BF16 linear under
+``--linear-backend=flashinfer_cutedsl``: tuned ``mm_bf16``, SM10x).
 BF16/FP16 model defaults offer both generic Torch variants and the timing cache
 selects the faster one per shape.
 
@@ -322,6 +324,40 @@ register(
             url="https://github.com/flashinfer-ai/flashinfer",
         ),
         subprocess_env="vllm_env",
+    )
+)
+
+# vLLM's BF16 linear under --linear-backend=flashinfer_cutedsl on SM10x:
+# dispatch_unquantized_gemm -> cuda_flashinfer_bf16_gemm -> flashinfer_bf16_mm
+# (mm_bf16 backend "cute-dsl"), autotuned per hybrid token bucket at warmup.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_cutedsl_bf16",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.flashinfer_bf16",
+            function_name="profile_single_gemm_flashinfer_cutedsl_bf16",
+        ),
+        tactic_label=tactic_labels.flashinfer_cutedsl_bf16,
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's unquantized BF16 linear with --linear-backend=flashinfer_cutedsl: "
+                "flashinfer mm_bf16(backend='cute-dsl') on the [n, k] weight, tactic "
+                "autotuned once per hybrid token bucket and loaded from the persisted "
+                "tactic file (single_gemm.flashinfer_cutedsl_bf16). SM10x only; k must be "
+                "a multiple of 128, otherwise vLLM runs F.linear."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/utils.py",
+        ),
     )
 )
 
