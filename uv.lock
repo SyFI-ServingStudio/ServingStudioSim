@@ -1313,6 +1313,9 @@ analyze = [
     { name = "matplotlib" },
     { name = "pyarrow" },
 ]
+deepgemm = [
+    { name = "deep-gemm" },
+]
 dev = [
     { name = "duckdb" },
     { name = "pyarrow" },
@@ -1327,7 +1330,6 @@ launcher = [
     { name = "pyyaml" },
 ]
 profiling = [
-    { name = "deep-gemm" },
     { name = "flashinfer-cubin", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux'" },
     { name = "numpy" },
@@ -1353,6 +1355,7 @@ analyze = [
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "pyarrow", specifier = ">=24.0.0" },
 ]
+deepgemm = [{ name = "deep-gemm", git = "https://github.com/serendipity-zk/DeepGEMM.git?rev=891d57b4db1071624b5c8fa0d1e51cb317fa709f" }]
 dev = [
     { name = "duckdb", specifier = ">=1.5.3" },
     { name = "pyarrow", specifier = ">=24.0.0" },
@@ -1367,7 +1370,6 @@ launcher = [
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 profiling = [
-    { name = "deep-gemm", git = "https://github.com/serendipity-zk/DeepGEMM.git?rev=891d57b4db1071624b5c8fa0d1e51cb317fa709f" },
     { name = "flashinfer-cubin", marker = "sys_platform == 'linux'", specifier = ">=0.6.4,<0.7" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux'", specifier = ">=0.6.4,<0.7" },
     { name = "numpy", specifier = ">=2.0.0" },

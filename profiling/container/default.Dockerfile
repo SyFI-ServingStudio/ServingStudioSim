@@ -39,12 +39,12 @@ RUN apt-get update \
 WORKDIR /opt/vibesim
 COPY pyproject.toml uv.lock .python-version /opt/vibesim/
 
-# DeepGEMM builds without isolation against the env's Torch, so everything
-# else goes in first -- the same two steps as `just sync`.
+# DeepGEMM (its own `deepgemm` group, which no host syncs by default) builds
+# without isolation against the env's Torch, so the profiling group goes in
+# first -- the same two steps as `just sync-deepgemm`.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-default-groups --group profiling --no-install-project \
-        --no-install-package deep-gemm \
-    && uv sync --frozen --no-default-groups --group profiling --no-install-project \
+    && uv sync --frozen --no-default-groups --group profiling --group deepgemm --no-install-project \
     && uv pip install --python /opt/venv/bin/python --no-deps \
         --target /opt/causal_conv1d "${CAUSAL_CONV1D_WHEEL}"
 

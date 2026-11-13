@@ -6,7 +6,7 @@ names their tags:
 
 | Image | Profile envs | Holds |
 | --- | --- | --- |
-| `default` | `default_env`, `flashinfer_pip_env`, `causal_conv1d_env` | the project's `profiling` group from `uv.lock` (Torch 2.10 cu128, FlashInfer 0.6, Triton, NVSHMEM, DeepGEMM), plus the causal-conv1d wheel |
+| `default` | `default_env`, `flashinfer_pip_env`, `causal_conv1d_env` | the project's `profiling` and `deepgemm` groups from `uv.lock` (Torch 2.10 cu128, FlashInfer 0.6, Triton, NVSHMEM, DeepGEMM), plus the causal-conv1d wheel |
 | `vllm` | `vllm_env` | the vLLM reference engine (`reference_engines/vllm`): vLLM's official image pinned by digest, with the patches applied to its installed vLLM. Also runs vLLM alignment captures |
 | `sglang` | `sglang_env` | the SGLang reference engine (`reference_engines/sglang`): SGLang's official image pinned by digest, with the patches applied to its checkout, plus `nvtx`. Also runs SGLang alignment captures |
 | `flashinfer-kda` | `flashinfer_kda_env` | FlashInfer's KDA nightly, Torch 2.11 cu130, TVM/TIRx (`requirements/flashinfer_kda.txt`) |

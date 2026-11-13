@@ -21,13 +21,17 @@ export DG_USE_LOCAL_VERSION := "0"
 # Default: the cpu gate.
 default: test-cpu
 
-# Sync the uv env (builds the pinned deep_gemm wheel on a cold cache). Use this
-# as the install entrypoint so DG_USE_LOCAL_VERSION above is in effect.
+# Sync the uv env. DeepGEMM is not in it: only the profiler images run it
+# (pyproject.toml's `deepgemm` group), so a host compiles nothing here.
 sync:
-    # no-build-isolation requires DeepGEMM's setup.py imports to be installed
-    # before DeepGEMM itself. A single cold sync has no such install ordering.
-    uv sync --inexact --no-install-package deep-gemm
     uv sync
+
+# Add DeepGEMM to the host env, only to debug its runners with
+# VIBESIM_PROFILE_RUNTIME=host. It compiles from source (DG_USE_LOCAL_VERSION
+# above), and no-build-isolation needs its setup.py imports -- the profiling
+# group, which `sync` installs -- before DeepGEMM itself.
+sync-deepgemm: sync
+    uv sync --group deepgemm
 
 # The image each L1 profile env runs in (profiling/container/README.md):
 # `just profile-container-build default`, or every image with no argument.

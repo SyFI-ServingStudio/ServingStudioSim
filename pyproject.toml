@@ -19,9 +19,10 @@ package = false
 # deps, so plain `uv run ...` matches the environment used by subprocess
 # profilers. Use `--no-default-groups` only for intentionally minimal checks.
 default-groups = ["dev", "profiling", "launcher", "analyze", "public-api"]
-# DeepGEMM's setup.py imports torch at build time but doesn't declare it as a
-# build dep, so it can't build under PEP-517 isolation. Build it against the
-# already-synced env torch instead. (Reproducible: the commit is pinned below.)
+# DeepGEMM (the `deepgemm` group, not a default one) imports torch in setup.py
+# at build time but doesn't declare it as a build dep, so it can't build under
+# PEP-517 isolation. Build it against the already-synced env torch instead.
+# (Reproducible: the commit is pinned below.)
 no-build-isolation-package = ["deep-gemm"]
 
 [dependency-groups]
@@ -76,6 +77,13 @@ profiling = [
     "flashinfer-python>=0.6.4,<0.7; sys_platform == 'linux'",
     "flashinfer-cubin>=0.6.4,<0.7; sys_platform == 'linux'",
     "nvshmem4py-cu12>=0.3.0",
+]
+
+# DeepGEMM is compiled from source, and only the profiler images run it (the
+# default image installs this group; profiling/container/default.Dockerfile).
+# It is not a default group, so `uv sync` / `uv run` on a host never builds it.
+# `just sync-deepgemm` adds it for VIBESIM_PROFILE_RUNTIME=host debugging.
+deepgemm = [
     # DeepGEMM FP8 grouped-GEMM kernel (grouped_gemm `deepgemm` backend) and the
     # DSA MQA-logits kernels. The commit is the one the instrumented vLLM fork
     # pins in cmake/external_projects/deepgemm.cmake, so this package and the
