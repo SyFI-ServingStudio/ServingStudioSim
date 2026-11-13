@@ -11,22 +11,12 @@
 # `libpython3.12.so` without it on LD_LIBRARY_PATH (uv pins the 3.12 interp).
 libdir := `uv run --no-sync python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"`
 
-# DeepGEMM (grouped_gemm `deepgemm` backend) builds JIT-only and skips its
-# git-clean version assert when this is 0; default is 1, which forces an
-# install-time CUDA compile AND asserts a clean tree (fails in uv's build clone).
-# Exported to every recipe so a cold `just sync` builds deep_gemm correctly
-# without anyone passing it by hand. (Once built, uv caches the wheel by commit.)
-export DG_USE_LOCAL_VERSION := "0"
-
 # Default: the cpu gate.
 default: test-cpu
 
-# Sync the uv env (builds the pinned deep_gemm wheel on a cold cache). Use this
-# as the install entrypoint so DG_USE_LOCAL_VERSION above is in effect.
+# Sync the uv env. DeepGEMM is not in it: only the profiler images run it
+# (pyproject.toml's `deepgemm` group), so a host compiles nothing here.
 sync:
-    # no-build-isolation requires DeepGEMM's setup.py imports to be installed
-    # before DeepGEMM itself. A single cold sync has no such install ordering.
-    uv sync --inexact --no-install-package deep-gemm
     uv sync
 
 # The image each L1 profile env runs in (profiling/container/README.md):

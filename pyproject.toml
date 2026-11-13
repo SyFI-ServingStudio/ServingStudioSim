@@ -19,10 +19,23 @@ package = false
 # deps, so plain `uv run ...` matches the environment used by subprocess
 # profilers. Use `--no-default-groups` only for intentionally minimal checks.
 default-groups = ["dev", "profiling", "launcher", "analyze", "public-api"]
-# DeepGEMM's setup.py imports torch at build time but doesn't declare it as a
-# build dep, so it can't build under PEP-517 isolation. Build it against the
-# already-synced env torch instead. (Reproducible: the commit is pinned below.)
-no-build-isolation-package = ["deep-gemm"]
+
+# DeepGEMM's setup.py imports these at build time without declaring them, so
+# uv adds them to its isolated build env; torch matches the version the env
+# resolves, since the extension is built against it.
+[tool.uv.extra-build-dependencies]
+deep-gemm = [
+    "packaging",
+    "setuptools",
+    "wheel",
+    { requirement = "torch", match-runtime = true },
+]
+
+# DeepGEMM defaults to DG_USE_LOCAL_VERSION=1, which compiles every kernel at
+# install time and asserts a clean git tree (false in uv's build clone). With 0
+# it installs JIT-only.
+[tool.uv.extra-build-variables]
+deep-gemm = { DG_USE_LOCAL_VERSION = "0" }
 
 [dependency-groups]
 dev = [
@@ -62,11 +75,6 @@ launcher = [
 profiling = [
     "numpy>=2.0.0",
     "nvidia-ml-py>=12.0.0",
-    # DeepGEMM uses the legacy setuptools backend and imports these packages
-    # from setup.py. They must exist before its no-build-isolation install.
-    "packaging>=26.0",
-    "setuptools>=81.0.0",
-    "wheel>=0.46.0",
     # Keep the first L1 profiling env close to the known-good reference stack.
     # Broaden these only after validating the cluster driver/runtime pair.
     "torch>=2.10,<2.11",
@@ -76,6 +84,13 @@ profiling = [
     "flashinfer-python>=0.6.4,<0.7; sys_platform == 'linux'",
     "flashinfer-cubin>=0.6.4,<0.7; sys_platform == 'linux'",
     "nvshmem4py-cu12>=0.3.0",
+]
+
+# DeepGEMM is built from source, and only the profiler images run it (the
+# default image installs this group; profiling/container/default.Dockerfile).
+# It is not a default group, so `uv sync` / `uv run` on a host never builds it;
+# `uv sync --group deepgemm` adds it for VIBESIM_PROFILE_RUNTIME=host debugging.
+deepgemm = [
     # DeepGEMM FP8 grouped-GEMM kernel (grouped_gemm `deepgemm` backend) and the
     # DSA MQA-logits kernels. The commit is the one the instrumented vLLM fork
     # pins in cmake/external_projects/deepgemm.cmake, so this package and the
@@ -83,8 +98,8 @@ profiling = [
     # only re-exports `fp8_fp4_mqa_logits`, which older DeepGEMM does not define.
     # The previous pin carried one local fix (hold the smxx layout tensors by
     # value instead of by const reference); upstream has since made the same
-    # change, so nothing is lost by moving onto it. Built with
-    # no-build-isolation (see [tool.uv]) since its setup.py needs env torch.
+    # change, so nothing is lost by moving onto it. Its build inputs are in
+    # [tool.uv.extra-build-dependencies] / [tool.uv.extra-build-variables].
     "deep-gemm @ git+https://github.com/serendipity-zk/DeepGEMM.git@891d57b4db1071624b5c8fa0d1e51cb317fa709f",
 ]
 

@@ -221,7 +221,7 @@ wheels = [
 
 [[package]]
 name = "deep-gemm"
-version = "2.5.0+local"
+version = "2.5.0"
 source = { git = "https://github.com/serendipity-zk/DeepGEMM.git?rev=891d57b4db1071624b5c8fa0d1e51cb317fa709f#891d57b4db1071624b5c8fa0d1e51cb317fa709f" }
 
 [[package]]
@@ -1313,6 +1313,9 @@ analyze = [
     { name = "matplotlib" },
     { name = "pyarrow" },
 ]
+deepgemm = [
+    { name = "deep-gemm" },
+]
 dev = [
     { name = "duckdb" },
     { name = "pyarrow" },
@@ -1327,17 +1330,13 @@ launcher = [
     { name = "pyyaml" },
 ]
 profiling = [
-    { name = "deep-gemm" },
     { name = "flashinfer-cubin", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux'" },
     { name = "numpy" },
     { name = "nvidia-ml-py" },
     { name = "nvshmem4py-cu12" },
-    { name = "packaging" },
-    { name = "setuptools" },
     { name = "torch" },
     { name = "triton", marker = "sys_platform == 'linux'" },
-    { name = "wheel" },
 ]
 public-api = [
     { name = "fastapi" },
@@ -1353,6 +1352,7 @@ analyze = [
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "pyarrow", specifier = ">=24.0.0" },
 ]
+deepgemm = [{ name = "deep-gemm", git = "https://github.com/serendipity-zk/DeepGEMM.git?rev=891d57b4db1071624b5c8fa0d1e51cb317fa709f" }]
 dev = [
     { name = "duckdb", specifier = ">=1.5.3" },
     { name = "pyarrow", specifier = ">=24.0.0" },
@@ -1367,32 +1367,16 @@ launcher = [
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 profiling = [
-    { name = "deep-gemm", git = "https://github.com/serendipity-zk/DeepGEMM.git?rev=891d57b4db1071624b5c8fa0d1e51cb317fa709f" },
     { name = "flashinfer-cubin", marker = "sys_platform == 'linux'", specifier = ">=0.6.4,<0.7" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux'", specifier = ">=0.6.4,<0.7" },
     { name = "numpy", specifier = ">=2.0.0" },
     { name = "nvidia-ml-py", specifier = ">=12.0.0" },
     { name = "nvshmem4py-cu12", specifier = ">=0.3.0" },
-    { name = "packaging", specifier = ">=26.0" },
-    { name = "setuptools", specifier = ">=81.0.0" },
     { name = "torch", specifier = ">=2.10,<2.11" },
     { name = "triton", marker = "sys_platform == 'linux'", specifier = ">=3.6,<3.7" },
-    { name = "wheel", specifier = ">=0.46.0" },
 ]
 public-api = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "uvicorn", specifier = ">=0.30" },
-]
-
-[[package]]
-name = "wheel"
-version = "0.48.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "packaging" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d0/20/50ed6bdf27dec98b568a8ae25dc599f35baa3d9709f9e83fd1edb56b9a90/wheel-0.48.0.tar.gz", hash = "sha256:94800765601e9171bf5d58d066e640662842bcedcbab982b2c90787a2c987322", size = 66471, upload-time = "2026-08-11T22:02:27.327Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/2e/29/69cfbb602cd91690c55d38ba9fe53e6a7e76a6fa647bf38f19c138d25449/wheel-0.48.0-py3-none-any.whl", hash = "sha256:3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab", size = 33320, upload-time = "2026-08-11T22:02:26.1Z" },
 ]
