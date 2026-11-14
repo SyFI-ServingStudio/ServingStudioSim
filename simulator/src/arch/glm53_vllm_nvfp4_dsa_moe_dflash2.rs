@@ -61,6 +61,99 @@ use crate::worklet::{
     Dflash2SelectorLocalWorkletInput, Dflash2SelectorLocalWorkletResolved,
 };
 
+/// The DFlash2 draft attention leaf (`draft_attention`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftAttention {
+    /// FlashInfer `fa2` ragged rect at bf16 query and KV: the only rect
+    /// backend that measured on B200 before the FA4 runner; it reads twice the
+    /// engine's KV bytes.
+    #[default]
+    Fa2Bf16,
+    /// vLLM's FA4 over the fp8 paged cache with `num_splits = 32`, the FULL
+    /// CUDA graph's default (`max_num_splits`): the engine's call. Forward plus
+    /// the split combine.
+    Fa4Fp8Split32,
+    /// The same call at `num_splits = 1`: one forward launch, bit-identical
+    /// output.
+    Fa4Fp8Nosplit,
+}
+
+/// The `draft_attention` choices the launcher schema advertises.
+pub const DRAFT_ATTENTIONS: [&str; 3] = ["fa2_bf16", "fa4_fp8_split32", "fa4_fp8_nosplit"];
+
+impl DraftAttention {
+    fn backend(self) -> &'static str {
+        match self {
+            Self::Fa2Bf16 => "fa2",
+            Self::Fa4Fp8Split32 => "vllm_fa4_split32",
+            Self::Fa4Fp8Nosplit => "vllm_fa4_nosplit",
+        }
+    }
+
+    pub fn dtype(self) -> crate::timing::bridge::DType {
+        use crate::timing::bridge::DType;
+        match self {
+            Self::Fa2Bf16 => DType::Bf16,
+            Self::Fa4Fp8Split32 | Self::Fa4Fp8Nosplit => DType::Fp8E4m3,
+        }
+    }
+
+    pub fn backends(self) -> Vec<&'static str> {
+        vec![self.backend()]
+    }
+}
+
+/// The DFlash2 draft vocabulary top-k (`draft_topk`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftTopk {
+    /// FlashInfer's deterministic radix top-k (the engine's).
+    #[default]
+    Flashinfer,
+    /// Exact threshold top-k (slice maxima, a per-row threshold, an exact
+    /// select over the candidates at or above it): same ids and values.
+    Threshold,
+}
+
+/// The `draft_topk` choices the launcher schema advertises.
+pub const DRAFT_TOPKS: [&str; 2] = ["flashinfer", "threshold"];
+
+impl DraftTopk {
+    pub fn backends(self) -> Vec<&'static str> {
+        match self {
+            // `torch` stays behind it as the semantic fallback.
+            Self::Flashinfer => vec!["flashinfer", "torch"],
+            Self::Threshold => vec!["triton_threshold"],
+        }
+    }
+}
+
+/// The DFlash2 draft-chain options (all off by default).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dflash2DraftChain {
+    pub attention: DraftAttention,
+    pub topk: DraftTopk,
+    /// `draft_context_kv_store`.
+    pub context_kv_store: bool,
+    /// `draft_qk_norm_rope_kv_write`.
+    pub qk_norm_rope_kv_write: bool,
+    /// `draft_conv_residual_norm`.
+    pub conv_residual_norm: bool,
+}
+
+impl Dflash2DraftChain {
+    /// Fail on a combination no engine runs.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.qk_norm_rope_kv_write || self.attention != DraftAttention::Fa2Bf16,
+            "draft_qk_norm_rope_kv_write emits an fp8 query and fp8 K/V for the FA4 call; \
+             it needs draft_attention fa4_fp8_split32 or fa4_fp8_nosplit, not fa2_bf16"
+        );
+        Ok(())
+    }
+}
+
 /// Everything the proposer needs that the target config does not carry. The
 /// draft is a separate checkpoint, so none of it can be derived from the GLM-5.2
 /// expansion.

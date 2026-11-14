@@ -50,6 +50,7 @@ from profiling.kernels import (
     gdn_recurrent_decode,  # noqa: F401
     gdn_recurrent_decode_gated_norm,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
+    grouped_conv_residual_rms_norm,  # noqa: F401
     grouped_gemm,  # noqa: F401
     grouped_rms_norm,  # noqa: F401
     hc_combine,  # noqa: F401
@@ -64,6 +65,7 @@ from profiling.kernels import (
     kda_recurrent_decode,  # noqa: F401
     kv_cache_append,  # noqa: F401
     kv_compress_store,  # noqa: F401
+    layered_kv_norm_rope_cache_write,  # noqa: F401
     logits_topk,  # noqa: F401
     mhc_fused_post_pre_rms_norm,  # noqa: F401
     mhc_fused_sum_post_pre_rms_norm,  # noqa: F401
@@ -98,6 +100,7 @@ from profiling.kernels import (
     ple_short_conv,  # noqa: F401
     q_kv_rms_norm,  # noqa: F401
     q_pad_kv_rope_mxfp8_insert,  # noqa: F401
+    qk_norm_rope_fp8_kv_write,  # noqa: F401
     qk_rms_norm_rope_gate,  # noqa: F401
     qnorm_rope_kv_insert,  # noqa: F401
     rel_bias_attention,  # noqa: F401

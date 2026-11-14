@@ -195,6 +195,11 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         hisparse_h2d_gb_per_s,
         hisparse_exposed_io_fraction,
         hisparse_intra_step_overlap,
+        draft_attention,
+        draft_topk,
+        draft_context_kv_store,
+        draft_qk_norm_rope_kv_write,
+        draft_conv_residual_norm,
     } = sel
     else {
         bail!("{sel:?} is not {ARCH_TAG}");
@@ -269,6 +274,11 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         moe_shared_pair_file: moe_shared_pair_file.clone(),
         moe_shared_pair_column: moe_shared_pair_column.clone(),
         moe_shared_overlap: *moe_shared_overlap,
+        draft_attention: *draft_attention,
+        draft_topk: *draft_topk,
+        draft_context_kv_store: *draft_context_kv_store,
+        draft_qk_norm_rope_kv_write: *draft_qk_norm_rope_kv_write,
+        draft_conv_residual_norm: *draft_conv_residual_norm,
     })
 }
 
