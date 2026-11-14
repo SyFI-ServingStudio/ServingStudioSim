@@ -189,9 +189,17 @@ pub struct Glm53DsaFront {
     /// Cut E with the top-k (indexer back from the logits): the decode rows'
     /// top-k and the cut E page table in one kernel
     /// (`dsa_pooled_logits_page_table`), on this backend only. It absorbs the
-    /// decode top-k (persistent and cooperative) and everything cut E does;
-    /// the two cuts are exclusive.
+    /// decode top-k (persistent and cooperative) and everything cut E does.
+    /// Without [`Self::topk_to_page_table_max_pools`] the two cuts are
+    /// exclusive.
     pub topk_to_page_table: Option<&'static str>,
+    /// Dispatch by context: cut E + top-k runs only for decode launches whose
+    /// longest row has at most this many pools; longer launches run the
+    /// decode top-k and cut E (both backends set). Its threshold comes from a
+    /// 2048-value sample whose target rank shrinks with the row length, so on
+    /// long rows a row overshoots and takes a one-CTA exact fallback over the
+    /// whole row, and the launch waits for it.
+    pub topk_to_page_table_max_pools: Option<u32>,
     pub glue: DsaGlue,
 }
 
@@ -229,19 +237,43 @@ pub const SPLIT_STATE_WRITER_ABSORBS: [&str; 4] = [
     "indexer.kpool_decode_update",
 ];
 
+/// Which page-table cut a decode launch runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodePageTableCut {
+    /// The fork's top-k and post-top-k launches.
+    None,
+    /// Cut E after the decode top-k.
+    PageTable,
+    /// Cut E + top-k.
+    TopkToPageTable,
+}
+
 impl Glm53DsaFront {
     /// Cut A writes the decode rows' state in its epilogue.
     fn split_state_writer(self) -> bool {
         matches!(self.hidden_gemm, DsaFrontGemm::Fp32SplitStateWriter(_))
     }
 
-    /// The decode-row slots the page-table cuts bill zero (their own slot
-    /// prices them instead).
-    pub fn decode_slots_absorbed(self) -> &'static [&'static str] {
+    /// The cut a decode launch whose longest row has `longest_pools` pools
+    /// runs.
+    pub fn decode_page_table_cut(self, longest_pools: u32) -> DecodePageTableCut {
+        let fused_fits = self
+            .topk_to_page_table_max_pools
+            .is_none_or(|max_pools| longest_pools <= max_pools);
         match (self.topk_page_table, self.topk_to_page_table) {
-            (_, Some(_)) => &TOPK_TO_PAGE_TABLE_ABSORBS,
-            (Some(_), None) => &PAGE_TABLE_ABSORBS,
-            (None, None) => &[],
+            (_, Some(_)) if fused_fits => DecodePageTableCut::TopkToPageTable,
+            (Some(_), _) => DecodePageTableCut::PageTable,
+            _ => DecodePageTableCut::None,
+        }
+    }
+
+    /// The decode-row slots a launch of `longest_pools` pools bills zero (the
+    /// cut's own slot prices them instead).
+    pub fn decode_slots_absorbed(self, longest_pools: u32) -> &'static [&'static str] {
+        match self.decode_page_table_cut(longest_pools) {
+            DecodePageTableCut::TopkToPageTable => &TOPK_TO_PAGE_TABLE_ABSORBS,
+            DecodePageTableCut::PageTable => &PAGE_TABLE_ABSORBS,
+            DecodePageTableCut::None => &[],
         }
     }
 }
@@ -1161,13 +1193,26 @@ impl Glm53DsaAttnLocalWorklet {
                     .into(),
             });
         }
-        if front.topk_page_table.is_some() && front.topk_to_page_table.is_some() {
-            return Err(BuildError::FitFailed {
-                kind: "dsa_pooled_logits_page_table",
-                reason: "cut E (topk_page_table) and cut E + top-k (topk_to_page_table) build the \
-                         same page table; set one"
-                    .into(),
-            });
+        let both = front.topk_page_table.is_some() && front.topk_to_page_table.is_some();
+        match front.topk_to_page_table_max_pools {
+            None if both => {
+                return Err(BuildError::FitFailed {
+                    kind: "dsa_pooled_logits_page_table",
+                    reason: "cut E (topk_page_table) and cut E + top-k (topk_to_page_table) build \
+                             the same page table; set one, or both with \
+                             topk_to_page_table_max_pools to dispatch by context"
+                        .into(),
+                });
+            }
+            Some(max_pools) if !both || max_pools == 0 => {
+                return Err(BuildError::FitFailed {
+                    kind: "dsa_pooled_logits_page_table",
+                    reason: "topk_to_page_table_max_pools dispatches between cut E + top-k and \
+                             cut E: it needs both backends and a positive pool count"
+                        .into(),
+                });
+            }
+            _ => {}
         }
         // The backends as built, after any run-config override.
         let topk = &worklet.topk_prefill;
@@ -1312,8 +1357,10 @@ impl Glm53DsaAttnLocalWorklet {
         let split_writer = front.split_state_writer();
         let fork_glue = front.glue == DsaGlue::ForkLaunchList;
         // Cut E or E + top-k builds the decode rows' page table in one launch;
-        // E + top-k also selects their pools.
-        let absorbed = |slot: &str| front.decode_slots_absorbed().contains(&slot);
+        // E + top-k also selects their pools. With a dispatch threshold the
+        // launch's longest row picks the cut.
+        let cut = front.decode_page_table_cut(w.decode_pools);
+        let absorbed = |slot: &str| front.decode_slots_absorbed(w.decode_pools).contains(&slot);
         push_or_zero(&self.fused_qkv_a, rows.clone(), hidden_merged, ev);
         // The q half of the norm folds into cut B's prologue and the kv half
         // into cut D; with only one of them the other half still launches,
@@ -1491,14 +1538,15 @@ impl Glm53DsaAttnLocalWorklet {
                 batch_size: w.decode_requests,
                 context_len: w.decode_pools,
             };
-            push_or_zero(op, input, no_decode, ev);
+            push_or_zero(op, input, no_decode || cut != DecodePageTableCut::PageTable, ev);
         }
         if let Some(op) = &self.topk_to_page_table {
             let input = DsaPooledLogitsPageTableKernelInput {
                 batch_size: w.decode_requests,
                 context_len: self.fused_topk_context(&w),
             };
-            push_or_zero(op, input, no_decode, ev);
+            let idle = no_decode || cut != DecodePageTableCut::TopkToPageTable;
+            push_or_zero(op, input, idle, ev);
         }
         if let Some(g) = &self.fork_glue {
             let decode = tokens(w.decode_rows);
@@ -2398,7 +2446,7 @@ mod tests {
     /// each cut adds exactly its own slot on its named backend.
     #[test]
     fn page_table_cuts_absorb_exactly_the_launches_they_replace() {
-        assert!(Glm53DsaFront::default().decode_slots_absorbed().is_empty());
+        assert!(Glm53DsaFront::default().decode_slots_absorbed(0).is_empty());
         let cut_e = Glm53DsaFront {
             topk_page_table: Some("e2a_kernel"),
             glue: DsaGlue::ForkLaunchList,
@@ -2409,14 +2457,14 @@ mod tests {
             glue: DsaGlue::ForkLaunchList,
             ..Default::default()
         };
-        assert_eq!(cut_e.decode_slots_absorbed(), PAGE_TABLE_ABSORBS);
+        assert_eq!(cut_e.decode_slots_absorbed(1 << 20), PAGE_TABLE_ABSORBS);
         assert_eq!(
-            cut_e_topk.decode_slots_absorbed(),
+            cut_e_topk.decode_slots_absorbed(1 << 20),
             TOPK_TO_PAGE_TABLE_ABSORBS
         );
         let mut fused_set = PAGE_TABLE_ABSORBS.to_vec();
         fused_set.insert(0, "indexer.topk_decode");
-        assert_eq!(cut_e_topk.decode_slots_absorbed(), fused_set);
+        assert_eq!(cut_e_topk.decode_slots_absorbed(1 << 20), fused_set);
         // Not absorbed: the position cast feeds the seq lens either way.
         assert!(!TOPK_TO_PAGE_TABLE_ABSORBS.contains(&"glue.positions_to_int32"));
 
@@ -2427,7 +2475,7 @@ mod tests {
         ] {
             let w = build_front(front, &[]).unwrap();
             let names = slot_names(&w);
-            for absorbed in front.decode_slots_absorbed() {
+            for absorbed in front.decode_slots_absorbed(1) {
                 let name = format!("m.dsa.{absorbed}");
                 assert!(names.contains(&name), "{name} missing from the tree");
             }
@@ -2455,7 +2503,9 @@ mod tests {
         assert_eq!(cfg.context_mode, "uniform_measured");
     }
 
-    /// Both page-table cuts at once would bill the decode page table twice.
+    /// Both page-table cuts at once would bill the decode page table twice,
+    /// unless a pool threshold dispatches each launch to one of them; a
+    /// threshold needs both cuts.
     #[test]
     fn page_table_cuts_are_exclusive() {
         let both = Glm53DsaFront {
@@ -2467,6 +2517,52 @@ mod tests {
             build_front(both, &[]),
             Err(BuildError::FitFailed { .. })
         ));
+        for front in [
+            Glm53DsaFront { topk_to_page_table_max_pools: Some(0), ..both },
+            Glm53DsaFront { topk_page_table: None, topk_to_page_table_max_pools: Some(65_536), ..both },
+            Glm53DsaFront { topk_to_page_table: None, topk_to_page_table_max_pools: Some(65_536), ..both },
+        ] {
+            assert!(matches!(build_front(front, &[]), Err(BuildError::FitFailed { .. })), "{front:?}");
+        }
+    }
+
+    /// Catches a context dispatch that sends a launch to both cuts, to
+    /// neither, or by the wrong row: the fused top-k takes launches whose
+    /// longest row is within the threshold (inclusive); a longer launch runs
+    /// the decode top-k and cut E, which then bills its own slot and zeroes
+    /// only the post-top-k launches.
+    #[test]
+    fn page_table_dispatch_picks_one_cut_by_the_longest_row() {
+        let dispatch = Glm53DsaFront {
+            topk_page_table: Some("e2a_kernel"),
+            topk_to_page_table: Some("t6_kernel"),
+            topk_to_page_table_max_pools: Some(65_536),
+            glue: DsaGlue::ForkLaunchList,
+            ..Default::default()
+        };
+        use DecodePageTableCut::{PageTable, TopkToPageTable};
+        for (pools, cut) in [
+            (1, TopkToPageTable),
+            (59_000, TopkToPageTable),
+            (65_536, TopkToPageTable),
+            (65_537, PageTable),
+            (262_144, PageTable),
+        ] {
+            assert_eq!(dispatch.decode_page_table_cut(pools), cut, "{pools} pools");
+        }
+        assert_eq!(dispatch.decode_slots_absorbed(65_536), TOPK_TO_PAGE_TABLE_ABSORBS);
+        assert_eq!(dispatch.decode_slots_absorbed(65_537), PAGE_TABLE_ABSORBS);
+        assert!(!dispatch.decode_slots_absorbed(65_537).contains(&"indexer.topk_decode"));
+        // Without a threshold a single cut takes every launch.
+        let t6_only = Glm53DsaFront { topk_page_table: None, topk_to_page_table_max_pools: None, ..dispatch };
+        assert_eq!(t6_only.decode_page_table_cut(1 << 20), TopkToPageTable);
+        // Both cuts are built, each on its own backend, and nothing else is added.
+        let w = build_front(dispatch, &[]).unwrap();
+        let base = slot_names(&build_front(Glm53DsaFront { glue: DsaGlue::ForkLaunchList, ..Default::default() }, &[]).unwrap());
+        let added: Vec<_> = slot_names(&w).into_iter().filter(|n| !base.contains(n)).collect();
+        assert_eq!(added, ["m.dsa.indexer.topk_page_table", "m.dsa.indexer.topk_to_page_table"]);
+        assert_eq!(w.topk_page_table.as_ref().unwrap().kernel.config.backends, ["e2a_kernel"]);
+        assert_eq!(w.topk_to_page_table.as_ref().unwrap().kernel.config.backends, ["t6_kernel"]);
     }
 
     /// Catches an fp32-split cut A that prices the wrong width or split, or

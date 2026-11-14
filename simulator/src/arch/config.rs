@@ -1725,10 +1725,19 @@ pub enum IterArchSel {
         /// to the final page table in one kernel (absorbs the decode top-k and
         /// everything cut E absorbs), priced by this backend's
         /// `dsa_pooled_logits_page_table` rows. Exclusive with
-        /// `dsa_topk_page_table_backend`.
+        /// `dsa_topk_page_table_backend` unless
+        /// `dsa_topk_to_page_table_max_pools` dispatches between them.
         #[serde(default)]
         #[param(cache_key)]
         dsa_topk_to_page_table_backend: Option<String>,
+        /// Dispatch by context between the two page-table cuts (both backends
+        /// set): a decode launch whose longest row has at most this many pools
+        /// runs `dsa_topk_to_page_table_backend`; a longer one runs the decode
+        /// top-k and `dsa_topk_page_table_backend`. The fused kernel's sampled
+        /// threshold overshoots on long rows into a one-CTA exact fallback.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_topk_to_page_table_max_pools: Option<u32>,
         #[serde(default = "default_glm53_flash_max_model_len")]
         #[param(default = 8192, cache_key)]
         max_model_len: u32,
@@ -2053,10 +2062,19 @@ pub enum IterArchSel {
         /// to the final page table in one kernel (absorbs the decode top-k and
         /// everything cut E absorbs), priced by this backend's
         /// `dsa_pooled_logits_page_table` rows. Exclusive with
-        /// `dsa_topk_page_table_backend`.
+        /// `dsa_topk_page_table_backend` unless
+        /// `dsa_topk_to_page_table_max_pools` dispatches between them.
         #[serde(default)]
         #[param(cache_key)]
         dsa_topk_to_page_table_backend: Option<String>,
+        /// Dispatch by context between the two page-table cuts (both backends
+        /// set): a decode launch whose longest row has at most this many pools
+        /// runs `dsa_topk_to_page_table_backend`; a longer one runs the decode
+        /// top-k and `dsa_topk_page_table_backend`. The fused kernel's sampled
+        /// threshold overshoots on long rows into a one-CTA exact fallback.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_topk_to_page_table_max_pools: Option<u32>,
         /// How the mHC post/pre boundaries are priced
         /// ([`crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::MhcBoundary`]).
         #[serde(default)]
@@ -2535,6 +2553,7 @@ impl IterArchSel {
             dsa_state_writer_backend,
             dsa_topk_page_table_backend,
             dsa_topk_to_page_table_backend,
+            dsa_topk_to_page_table_max_pools,
             ..
         } = self
         else {
@@ -2592,11 +2611,19 @@ impl IterArchSel {
                  write the kv norm, MLA cache append and kpool decode update; set one"
             );
         }
-        if dsa_topk_page_table_backend.is_some() && dsa_topk_to_page_table_backend.is_some() {
-            anyhow::bail!(
+        let both = dsa_topk_page_table_backend.is_some() && dsa_topk_to_page_table_backend.is_some();
+        match dsa_topk_to_page_table_max_pools {
+            None if both => anyhow::bail!(
                 "dsa_topk_page_table_backend and dsa_topk_to_page_table_backend both price the decode \
-                 page table (cut E, and cut E with the top-k); set one"
-            );
+                 page table (cut E, and cut E with the top-k); set one, or set \
+                 dsa_topk_to_page_table_max_pools to dispatch between them by context"
+            ),
+            Some(_) if !both => anyhow::bail!(
+                "dsa_topk_to_page_table_max_pools dispatches between dsa_topk_to_page_table_backend \
+                 (short launches) and dsa_topk_page_table_backend (long ones); set both"
+            ),
+            Some(0) => anyhow::bail!("dsa_topk_to_page_table_max_pools must be positive"),
+            _ => {}
         }
         Ok(Glm53DsaFront {
             hidden_gemm: gemm("dsa_hidden_gemm", *dsa_hidden_gemm, dsa_hidden_gemm_backend)?,
@@ -2608,6 +2635,7 @@ impl IterArchSel {
                 "dsa_topk_to_page_table_backend",
                 dsa_topk_to_page_table_backend,
             )?,
+            topk_to_page_table_max_pools: *dsa_topk_to_page_table_max_pools,
             glue: match dsa_glue {
                 DsaGluePricing::Placeholder => DsaGlue::Placeholder,
                 DsaGluePricing::ForkLaunchList => DsaGlue::ForkLaunchList,
@@ -2864,6 +2892,34 @@ mod iter_tests {
         .unwrap();
         let err = sel.glm53_flash_fusions().map(|f| f.dsa_front).unwrap_err();
         assert!(err.to_string().contains("set one"), "{err}");
+        let front = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "type": "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+                "model_config": "model/config/glm53_flash_nvfp4.json",
+                "fp8": false,
+                "ep_size": 8,
+            });
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<IterArchSel>(v).unwrap().glm53_flash_fusions().map(|f| f.dsa_front)
+        };
+        // A pool threshold dispatches between the two; it needs both and a positive count.
+        let dispatch = front(serde_json::json!({
+            "dsa_topk_page_table_backend": "cut_e",
+            "dsa_topk_to_page_table_backend": "cut_e_topk",
+            "dsa_topk_to_page_table_max_pools": 65536,
+        }))
+        .unwrap();
+        assert_eq!(dispatch.topk_to_page_table_max_pools, Some(65_536));
+        assert_eq!((dispatch.topk_page_table, dispatch.topk_to_page_table), (Some("cut_e"), Some("cut_e_topk")));
+        assert!(front(serde_json::json!({
+            "dsa_topk_to_page_table_backend": "cut_e_topk", "dsa_topk_to_page_table_max_pools": 65536,
+        }))
+        .is_err());
+        assert!(front(serde_json::json!({
+            "dsa_topk_page_table_backend": "cut_e", "dsa_topk_to_page_table_backend": "cut_e_topk",
+            "dsa_topk_to_page_table_max_pools": 0,
+        }))
+        .is_err());
     }
 
     /// The fp32-split state writer and cut D both write the kv norm, MLA
