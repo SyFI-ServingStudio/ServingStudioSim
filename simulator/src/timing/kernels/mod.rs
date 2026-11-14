@@ -44,6 +44,7 @@ pub mod gdn_recurrent_decode_gated_norm;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
 pub mod grouped_rms_norm;
+pub mod hadamard_fp8_quant;
 pub mod hc_combine;
 pub mod hc_combine_norm;
 pub mod hc_gate_mix;
@@ -270,6 +271,10 @@ pub use hc_gate_mix::{HcGateMixKernel, HcGateMixSpec};
 pub use indexed_row_copy::{
     IndexedRowCopyKernel, IndexedRowCopyKernelConfig, IndexedRowCopyKernelInput,
     IndexedRowCopySpec,
+};
+pub use hadamard_fp8_quant::{
+    HadamardFp8QuantKernel, HadamardFp8QuantKernelConfig, HadamardFp8QuantKernelInput,
+    HadamardFp8QuantSpec,
 };
 pub use inv_rope_fp8_quant::{
     InvRopeFp8QuantKernel, InvRopeFp8QuantKernelConfig, InvRopeFp8QuantKernelInput,

@@ -52,6 +52,7 @@ from profiling.kernels import (
     gemm_fp32_output,  # noqa: F401
     grouped_gemm,  # noqa: F401
     grouped_rms_norm,  # noqa: F401
+    hadamard_fp8_quant,  # noqa: F401
     hc_combine,  # noqa: F401
     hc_combine_norm,  # noqa: F401
     hc_gate_mix,  # noqa: F401
