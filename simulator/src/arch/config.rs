@@ -128,17 +128,23 @@ pub enum DsaFrontGemmMode {
     /// Cut A only: an fp32-output GEMM over every column plus one row-split
     /// epilogue kernel on the `*_backend` param's backend.
     Fp32Split,
+    /// Cut A only: `fp32_split`'s GEMM, whose epilogue on the decode rows is
+    /// one state-update kernel on the `*_backend` param's backend that also
+    /// absorbs the q/kv RMS norm, the MLA cache append, the kpool position
+    /// cast and the kpool decode update (`dsa_fp32_split_state_update`).
+    Fp32SplitStateWriter,
     /// Cut B only: `concat`'s GEMM plus one epilogue kernel on the
     /// `*_backend` param's backend that Hadamard-quantizes the indexer query
     /// in place and scales the head weights.
     ConcatHadamardEpilogue,
 }
 
-const DSA_FRONT_GEMM_MODES: [&str; 5] = [
+const DSA_FRONT_GEMM_MODES: [&str; 6] = [
     "separate",
     "concat",
     "fused",
     "fp32_split",
+    "fp32_split_state_writer",
     "concat_hadamard_epilogue",
 ];
 
@@ -1664,11 +1670,18 @@ pub enum IterArchSel {
         /// `fp32_split`: the same absorption as an fp32-output GEMM over all
         /// columns (`gemm_fp32_output`) plus a row-split epilogue
         /// (`fp32_row_split_layer_norm` on `dsa_hidden_gemm_backend`).
+        /// `fp32_split_state_writer`: `fp32_split` whose decode rows' epilogue
+        /// is one `dsa_fp32_split_state_update` launch on
+        /// `dsa_hidden_gemm_backend` that also absorbs `q_kv_a_norm`, the MLA
+        /// cache append, the kpool position cast and `kpool_decode_update`
+        /// (prefill rows keep `fp32_split`'s launches); exclusive with
+        /// `dsa_state_writer_backend`.
         #[serde(default)]
         #[param(string, default = "separate", choices = DSA_FRONT_GEMM_MODES, cache_key)]
         dsa_hidden_gemm: DsaFrontGemmMode,
-        /// `dsa_hidden_gemm: fused` or `fp32_split` only (required there): its
-        /// backend (for `fp32_split`, the row-split epilogue's).
+        /// `dsa_hidden_gemm: fused`, `fp32_split` or `fp32_split_state_writer`
+        /// only (required there): its backend (for the split modes, the
+        /// epilogue's; the state writer's prefill row split uses it too).
         #[serde(default)]
         #[param(cache_key)]
         dsa_hidden_gemm_backend: Option<String>,
@@ -1985,11 +1998,18 @@ pub enum IterArchSel {
         /// `fp32_split`: the same absorption as an fp32-output GEMM over all
         /// columns (`gemm_fp32_output`) plus a row-split epilogue
         /// (`fp32_row_split_layer_norm` on `dsa_hidden_gemm_backend`).
+        /// `fp32_split_state_writer`: `fp32_split` whose decode rows' epilogue
+        /// is one `dsa_fp32_split_state_update` launch on
+        /// `dsa_hidden_gemm_backend` that also absorbs `q_kv_a_norm`, the MLA
+        /// cache append, the kpool position cast and `kpool_decode_update`
+        /// (prefill rows keep `fp32_split`'s launches); exclusive with
+        /// `dsa_state_writer_backend`.
         #[serde(default)]
         #[param(string, default = "separate", choices = DSA_FRONT_GEMM_MODES, cache_key)]
         dsa_hidden_gemm: DsaFrontGemmMode,
-        /// `dsa_hidden_gemm: fused` or `fp32_split` only (required there): its
-        /// backend (for `fp32_split`, the row-split epilogue's).
+        /// `dsa_hidden_gemm: fused`, `fp32_split` or `fp32_split_state_writer`
+        /// only (required there): its backend (for the split modes, the
+        /// epilogue's; the state writer's prefill row split uses it too).
         #[serde(default)]
         #[param(cache_key)]
         dsa_hidden_gemm_backend: Option<String>,
@@ -2530,8 +2550,15 @@ impl IterArchSel {
                 (DsaFrontGemmMode::Fp32Split, Some(b)) if !b.is_empty() && param == "dsa_hidden_gemm" => {
                     DsaFrontGemm::Fp32Split(intern_backend(b))
                 }
-                (DsaFrontGemmMode::Fp32Split, _) if param != "dsa_hidden_gemm" => {
-                    anyhow::bail!("{param}: fp32_split is a dsa_hidden_gemm mode")
+                (DsaFrontGemmMode::Fp32SplitStateWriter, Some(b))
+                    if !b.is_empty() && param == "dsa_hidden_gemm" =>
+                {
+                    DsaFrontGemm::Fp32SplitStateWriter(intern_backend(b))
+                }
+                (DsaFrontGemmMode::Fp32Split | DsaFrontGemmMode::Fp32SplitStateWriter, _)
+                    if param != "dsa_hidden_gemm" =>
+                {
+                    anyhow::bail!("{param}: fp32_split/fp32_split_state_writer are dsa_hidden_gemm modes")
                 }
                 (DsaFrontGemmMode::ConcatHadamardEpilogue, Some(b))
                     if !b.is_empty() && param == "dsa_q_lora_gemm" =>
@@ -2544,6 +2571,7 @@ impl IterArchSel {
                 (
                     DsaFrontGemmMode::Fused
                     | DsaFrontGemmMode::Fp32Split
+                    | DsaFrontGemmMode::Fp32SplitStateWriter
                     | DsaFrontGemmMode::ConcatHadamardEpilogue,
                     _,
                 ) => {
@@ -2556,6 +2584,14 @@ impl IterArchSel {
             Some(b) if b.is_empty() => anyhow::bail!("{param}: empty backend name"),
             other => Ok(other.as_deref().map(intern_backend)),
         };
+        if *dsa_hidden_gemm == DsaFrontGemmMode::Fp32SplitStateWriter
+            && dsa_state_writer_backend.is_some()
+        {
+            anyhow::bail!(
+                "dsa_hidden_gemm: fp32_split_state_writer and dsa_state_writer_backend (cut D) both \
+                 write the kv norm, MLA cache append and kpool decode update; set one"
+            );
+        }
         if dsa_topk_page_table_backend.is_some() && dsa_topk_to_page_table_backend.is_some() {
             anyhow::bail!(
                 "dsa_topk_page_table_backend and dsa_topk_to_page_table_backend both price the decode \
@@ -2794,6 +2830,19 @@ mod iter_tests {
             "dsa_hidden_gemm": "concat_hadamard_epilogue", "dsa_hidden_gemm_backend": "post_b",
         }))
         .is_err());
+        let k3 = front(serde_json::json!({
+            "dsa_hidden_gemm": "fp32_split_state_writer", "dsa_hidden_gemm_backend": "post_plus",
+        }))
+        .unwrap();
+        assert_eq!(
+            k3.hidden_gemm,
+            crate::worklet::DsaFrontGemm::Fp32SplitStateWriter("post_plus")
+        );
+        assert!(front(serde_json::json!({"dsa_hidden_gemm": "fp32_split_state_writer"})).is_err());
+        assert!(front(serde_json::json!({
+            "dsa_q_lora_gemm": "fp32_split_state_writer", "dsa_q_lora_gemm_backend": "post_plus",
+        }))
+        .is_err());
         let fused_topk = front(serde_json::json!({"dsa_topk_to_page_table_backend": "cut_e_topk"}))
             .unwrap();
         assert_eq!(fused_topk.topk_to_page_table, Some("cut_e_topk"));
@@ -2811,6 +2860,25 @@ mod iter_tests {
             "ep_size": 8,
             "dsa_topk_page_table_backend": "cut_e",
             "dsa_topk_to_page_table_backend": "cut_e_topk",
+        }))
+        .unwrap();
+        let err = sel.glm53_flash_fusions().map(|f| f.dsa_front).unwrap_err();
+        assert!(err.to_string().contains("set one"), "{err}");
+    }
+
+    /// The fp32-split state writer and cut D both write the kv norm, MLA
+    /// cache append and kpool update: both at once would bill one of them
+    /// twice or zero it twice, so the config fails loud.
+    #[test]
+    fn dsa_split_state_writer_and_cut_d_are_exclusive() {
+        let sel: IterArchSel = serde_json::from_value(serde_json::json!({
+            "type": "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+            "model_config": "model/config/glm53_flash_nvfp4.json",
+            "fp8": false,
+            "ep_size": 8,
+            "dsa_hidden_gemm": "fp32_split_state_writer",
+            "dsa_hidden_gemm_backend": "post_plus",
+            "dsa_state_writer_backend": "cut_d",
         }))
         .unwrap();
         let err = sel.glm53_flash_fusions().map(|f| f.dsa_front).unwrap_err();

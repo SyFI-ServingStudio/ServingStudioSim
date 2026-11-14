@@ -88,6 +88,9 @@ pub struct Glm53KpoolSparseMlaInput {
     /// Another launch writes the new rows (a fused state writer): the
     /// `mla_cache_append` slot bills nothing.
     pub cache_append_elsewhere: bool,
+    /// Another launch writes the decode rows' cache entries (a fused decode
+    /// state update): the `mla_cache_append` slot bills only the prefill rows.
+    pub decode_cache_append_elsewhere: bool,
     /// Another launch builds the decode rows' page table (a fused post-top-k
     /// kernel): the `index_remap` slot bills only the prefill rows.
     pub decode_remap_elsewhere: bool,
@@ -249,9 +252,9 @@ impl Glm53KpoolSparseMlaOp {
             .unwrap_or_else(|reason| panic!("invalid Glm53KpoolSparseMlaInput: {reason}"));
 
         let cache_append = MlaCacheAppendKernelInput {
-            num_tokens: shape.num_rows,
+            num_tokens: cache_append_rows(input, shape.num_rows),
         };
-        let metrics = if shape.num_rows == 0 || input.cache_append_elsewhere {
+        let metrics = if cache_append.num_tokens == 0 {
             LeafMetrics::ZERO
         } else {
             self.mla_cache_append.eval(&cache_append)
@@ -395,6 +398,20 @@ fn pooled_valid_total(first: u32, last: u32, index_topk: u32, index_kpool: u32) 
         total += u64::from(pooled_valid_count(span as u32, index_topk, index_kpool));
     }
     total
+}
+
+/// Rows the `mla_cache_append` launch writes: every row, only the prefill
+/// rows when a fused decode launch writes the decode rows, none when a state
+/// writer takes them all.
+fn cache_append_rows(input: &Glm53KpoolSparseMlaInput, num_rows: u32) -> u32 {
+    if input.cache_append_elsewhere {
+        0
+    } else if input.decode_cache_append_elsewhere {
+        // num_rows counts every decode row once, ahead of the prefill rows.
+        num_rows - input.decode_context_lens.len() as u32
+    } else {
+        num_rows
+    }
 }
 
 fn derive_shape(
@@ -599,6 +616,23 @@ mod tests {
             (prefill.num_queries, prefill.num_cache_tokens),
             (1000, 1500)
         );
+    }
+
+    /// Catches the fused decode state update double-billing (or dropping)
+    /// the cache append: decode rows leave the slot, prefill rows stay.
+    #[test]
+    fn decode_cache_append_elsewhere_bills_only_prefill_rows() {
+        let mut input = Glm53KpoolSparseMlaInput {
+            prefill_query_cache_pairs: vec![(3, 5)],
+            decode_context_lens: vec![1000, 1001, 4003],
+            ..Default::default()
+        };
+        let rows = derive_shape(&input, 2048, 4, 2176).unwrap().num_rows;
+        assert_eq!(cache_append_rows(&input, rows), 6);
+        input.decode_cache_append_elsewhere = true;
+        assert_eq!(cache_append_rows(&input, rows), 3);
+        input.cache_append_elsewhere = true;
+        assert_eq!(cache_append_rows(&input, rows), 0);
     }
 
     #[test]

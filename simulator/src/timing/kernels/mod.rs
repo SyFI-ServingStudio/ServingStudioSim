@@ -19,6 +19,7 @@ pub mod dsa_indexer_q_rope_quant_weight_fold;
 pub mod dsa_mqa_logits_prefill;
 pub mod dsa_paged_mqa_logits_decode;
 pub mod dsa_persistent_topk_decode;
+pub mod dsa_fp32_split_state_update;
 pub mod dsa_pooled_index_cache_update;
 pub mod dsa_pooled_logits_page_table;
 pub mod dsa_pooled_topk_page_table;
@@ -180,6 +181,10 @@ pub use dsa_paged_mqa_logits_decode::{
 pub use dsa_persistent_topk_decode::{
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
     DsaPersistentTopkDecodeKernelInput, DsaPersistentTopkDecodeSpec,
+};
+pub use dsa_fp32_split_state_update::{
+    DsaFp32SplitStateUpdateKernel, DsaFp32SplitStateUpdateKernelConfig,
+    DsaFp32SplitStateUpdateKernelInput, DsaFp32SplitStateUpdateSpec,
 };
 pub use dsa_pooled_index_cache_update::{
     DsaPooledIndexCacheUpdateKernel, DsaPooledIndexCacheUpdateKernelConfig,
