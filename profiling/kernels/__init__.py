@@ -15,6 +15,7 @@ from profiling.kernels import (
     all_reduce_fusion,  # noqa: F401
     all_reduce_residual_rms_norm,  # noqa: F401
     batched_gemm,  # noqa: F401
+    batched_gemm_static_fp8_quant,  # noqa: F401
     bf16_fused_moe,  # noqa: F401
     clamped_swiglu,  # noqa: F401
     compressed_sparse_mla_decode,  # noqa: F401
@@ -28,6 +29,9 @@ from profiling.kernels import (
     dsa_mqa_logits_prefill,  # noqa: F401
     dsa_paged_mqa_logits_decode,  # noqa: F401
     dsa_persistent_topk_decode,  # noqa: F401
+    dsa_pooled_index_cache_update,  # noqa: F401
+    dsa_pooled_logits_page_table,  # noqa: F401
+    dsa_pooled_topk_page_table,  # noqa: F401
     dsa_sparse_index_remap,  # noqa: F401
     dsa_sparse_mla_attention,  # noqa: F401
     dsa_sparse_mla_prefill,  # noqa: F401
@@ -42,6 +46,7 @@ from profiling.kernels import (
     fp8_block_quant,  # noqa: F401
     fp8_blockscale_grouped_gemm,  # noqa: F401
     fp8_per_token_group_quant,  # noqa: F401
+    fp32_row_split_layer_norm,  # noqa: F401
     gdn_causal_conv_decode,  # noqa: F401
     gdn_causal_conv_prefill,  # noqa: F401
     gdn_chunk_delta_rule,  # noqa: F401
@@ -52,6 +57,8 @@ from profiling.kernels import (
     gemm_fp32_output,  # noqa: F401
     grouped_gemm,  # noqa: F401
     grouped_rms_norm,  # noqa: F401
+    hadamard_fp8_quant,  # noqa: F401
+    hadamard_fp8_quant_weight_scale,  # noqa: F401
     hc_combine,  # noqa: F401
     hc_combine_norm,  # noqa: F401
     hc_gate_mix,  # noqa: F401
