@@ -69,7 +69,8 @@ use crate::timing::kernels::{
     HadamardFp8QuantWeightScaleKernel, HadamardFp8QuantWeightScaleKernelConfig,
     HadamardFp8QuantWeightScaleKernelInput, QKvRmsNormKernel,
     QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    SingleGemmKernelInput, StaticFp8QuantKernel, StaticFp8QuantKernelConfig,
+    StaticFp8QuantKernelInput,
 };
 use crate::timing::slot_input::DsaIndexerPrefillLog;
 use crate::timing::{
@@ -333,6 +334,8 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub index_remap_backends: Vec<&'static str>,
     /// The indexer query's Hadamard-128 + per-row UE8M0 FP8 quant.
     pub hadamard_quant_backends: Vec<&'static str>,
+    /// The absorbed query's static per-tensor FP8 quant (`QuantFP8`, CUDA).
+    pub static_quant_backends: Vec<&'static str>,
     /// The pooled indexer key cache's decode/verify update.
     pub pooled_index_update_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
@@ -399,7 +402,7 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub expand_pools: ElementwiseKernelConfig,
     pub q_absorb: BatchedGemmKernelConfig,
     pub q_concat: ElementwiseKernelConfig,
-    pub q_fp8_quant: ElementwiseKernelConfig,
+    pub q_fp8_quant: StaticFp8QuantKernelConfig,
     pub sparse_mla: Glm53KpoolSparseMlaConfig,
     pub output_copy: ElementwiseKernelConfig,
     pub v_up: BatchedGemmKernelConfig,
@@ -476,7 +479,7 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub expand_pools: Op<ElementwiseKernel>,
     pub q_absorb: Op<BatchedGemmKernel>,
     pub q_concat: Op<ElementwiseKernel>,
-    pub q_fp8_quant: Op<ElementwiseKernel>,
+    pub q_fp8_quant: Op<StaticFp8QuantKernel>,
     pub sparse_mla: Glm53KpoolSparseMlaOp,
     pub output_copy: Op<ElementwiseKernel>,
     pub v_up: Op<BatchedGemmKernel>,
@@ -539,8 +542,7 @@ impl Glm53DsaAttnLocalWorklet {
             dtype: bf16,
         };
         let max_model_len = Dim::param("max_model_len", cfg.max_model_len);
-        // The per-head latent query, bf16, and its FP8 copy with one fp32
-        // scale per head.
+        // The per-head latent query, bf16.
         let latent_q_bytes = heads * latent * bf16.size_bytes();
         let window = cfg.index_topk + kpool - 1;
         let mut resolved = Glm53DsaAttnLocalWorkletResolved {
@@ -664,7 +666,14 @@ impl Glm53DsaAttnLocalWorklet {
                 Q_CONCAT_EFFECTIVE_FACTOR * latent_q_bytes,
                 Q_CONCAT_EFFECTIVE_FACTOR * latent_q_bytes,
             ),
-            q_fp8_quant: ew(latent_q_bytes, heads * (latent + 4)),
+            // One static per-tensor quant over the token-major (B, N*L) query.
+            q_fp8_quant: StaticFp8QuantKernelConfig {
+                backends: cfg.static_quant_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_dim: (heads * latent).into(),
+                gated: false,
+                dtype: bf16,
+            },
             sparse_mla: Glm53KpoolSparseMlaConfig {
                 sparse_attention_backends: cfg.sparse_attention_backends.clone(),
                 mla_cache_append_backends: cfg.mla_cache_append_backends.clone(),
@@ -956,7 +965,13 @@ impl Glm53DsaAttnLocalWorklet {
             expand_pools: ew("indexer.expand_pools", r.expand_pools)?,
             q_absorb: atomic(n, "q_absorb", r.q_absorb, BatchedGemmKernel::build, bridge)?,
             q_concat: ew("q_concat", r.q_concat)?,
-            q_fp8_quant: ew("q_fp8_quant", r.q_fp8_quant)?,
+            q_fp8_quant: atomic(
+                n,
+                "q_fp8_quant",
+                r.q_fp8_quant,
+                StaticFp8QuantKernel::build,
+                bridge,
+            )?,
             sparse_mla: Glm53KpoolSparseMlaOp::build(
                 format!("{n}.sparse_mla"),
                 r.sparse_mla,
@@ -1468,7 +1483,14 @@ impl Glm53DsaAttnLocalWorklet {
             ev,
         );
         push_or_zero(&self.q_concat, all.clone(), !cfg.mla_layout_copies, ev);
-        push_or_zero(&self.q_fp8_quant, all.clone(), absorb_fused, ev);
+        push_or_zero(
+            &self.q_fp8_quant,
+            StaticFp8QuantKernelInput {
+                num_tokens: w.total_tokens,
+            },
+            absorb_fused,
+            ev,
+        );
         self.sparse_mla.eval(
             &Glm53KpoolSparseMlaInput {
                 prefill_query_cache_pairs: input
@@ -2004,6 +2026,7 @@ mod tests {
             sparse_attention_backends: vec!["flashinfer_trtllm_fp8"],
             mla_cache_append_backends: vec!["vllm_cuda"],
             hadamard_quant_backends: vec!["vllm_triton"],
+            static_quant_backends: vec!["vllm_cuda"],
             pooled_index_update_backends: vec!["vllm_fork_triton"],
             index_remap_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
