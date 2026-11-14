@@ -51,6 +51,8 @@ use crate::timing::kernels::{
     BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, DsaMqaLogitsPrefillKernel,
     DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput, DsaPagedMqaLogitsDecodeKernel,
     DsaPagedMqaLogitsDecodeKernelConfig, DsaPagedMqaLogitsDecodeKernelInput,
+    DsaPooledIndexCacheUpdateKernel, DsaPooledIndexCacheUpdateKernelConfig,
+    DsaPooledIndexCacheUpdateKernelInput,
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
     DsaPersistentTopkDecodeKernelInput, DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig,
     DsaTopkPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
@@ -210,6 +212,8 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub index_remap_backends: Vec<&'static str>,
     /// The indexer query's Hadamard-128 + per-row UE8M0 FP8 quant.
     pub hadamard_quant_backends: Vec<&'static str>,
+    /// The pooled indexer key cache's decode/verify update.
+    pub pooled_index_update_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
     /// The fork's head-major MLA layout copies (`q_concat`, `output_copy`).
     /// Current vLLM writes `ql_nope` token-major through `bmm(out=)` and
@@ -262,7 +266,7 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub index_weight_scale: ElementwiseKernelConfig,
     pub kpool_gate_score: SingleGemmKernelConfig,
     pub prefill_gather: ElementwiseKernelConfig,
-    pub kpool_decode_update: ElementwiseKernelConfig,
+    pub kpool_decode_update: DsaPooledIndexCacheUpdateKernelConfig,
     pub kpool_prefill_write: ElementwiseKernelConfig,
     pub kpool_tail_seed: ElementwiseKernelConfig,
     pub mqa_logits_decode: DsaPagedMqaLogitsDecodeKernelConfig,
@@ -319,7 +323,7 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub index_weight_scale: Op<ElementwiseKernel>,
     pub kpool_gate_score: Op<SingleGemmKernel>,
     pub prefill_gather: Op<ElementwiseKernel>,
-    pub kpool_decode_update: Op<ElementwiseKernel>,
+    pub kpool_decode_update: Op<DsaPooledIndexCacheUpdateKernel>,
     pub kpool_prefill_write: Op<ElementwiseKernel>,
     pub kpool_tail_seed: Op<ElementwiseKernel>,
     pub mqa_logits_decode: Op<DsaPagedMqaLogitsDecodeKernel>,
@@ -440,9 +444,20 @@ impl Glm53DsaAttnLocalWorklet {
             kpool_gate_score: gemm(index_dim, cfg.hidden.clone()),
             // 2*P*2D bytes gathered per prefill token, split over two launches.
             prefill_gather: ew(kpool * 2 * index_dim, kpool * 2 * index_dim),
-            // Per decode row: 524 read + 1536 per completed pool (1 in P rows),
-            // 512 stashed + (D+4) per completed pool.
-            kpool_decode_update: ew(524 + 1536 / kpool, 512 + (index_dim + 4) / kpool),
+            // One program per request walks its next_n rows in order; the
+            // tail ring holds one pool (`index_kpool` slots), as the fork's
+            // KpoolTailSpec(block_size = index_kpool).
+            kpool_decode_update: DsaPooledIndexCacheUpdateKernelConfig {
+                backends: cfg.pooled_index_update_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                next_n: cfg.decode_next_n,
+                pool_size: kpool,
+                tail_ring: kpool,
+                index_dim: cfg.index_head_dim.clone(),
+                block_size: cfg.cache_block_size,
+                input_dtype: bf16,
+                cache_dtype: DType::Fp8E4m3,
+            },
             // Per prefill token: 9 + P*2*2D/P read, (D+4)/P written.
             kpool_prefill_write: ew(9 + 4 * index_dim, (index_dim + 4) / kpool),
             // Reads each prefill token's position; the < P tail rows are noise.
@@ -686,7 +701,13 @@ impl Glm53DsaAttnLocalWorklet {
             index_weight_scale: ew("indexer.weight_scale", r.index_weight_scale)?,
             kpool_gate_score: gemm("indexer.kpool_gate_score", r.kpool_gate_score)?,
             prefill_gather: ew("indexer.prefill_gather", r.prefill_gather)?,
-            kpool_decode_update: ew("indexer.kpool_decode_update", r.kpool_decode_update)?,
+            kpool_decode_update: atomic(
+                n,
+                "indexer.kpool_decode_update",
+                r.kpool_decode_update,
+                DsaPooledIndexCacheUpdateKernel::build,
+                bridge,
+            )?,
             kpool_prefill_write: ew("indexer.kpool_prefill_write", r.kpool_prefill_write)?,
             kpool_tail_seed: ew("indexer.kpool_tail_seed", r.kpool_tail_seed)?,
             mqa_logits_decode: atomic(
@@ -1030,7 +1051,9 @@ impl Glm53DsaAttnLocalWorklet {
         );
         push_or_zero(
             &self.kpool_decode_update,
-            tokens(w.decode_rows),
+            DsaPooledIndexCacheUpdateKernelInput {
+                num_requests: w.decode_requests,
+            },
             no_decode || state_writer,
             ev,
         );
@@ -1546,6 +1569,7 @@ mod tests {
             sparse_attention_backends: vec!["flashinfer_trtllm_fp8"],
             mla_cache_append_backends: vec!["vllm_cuda"],
             hadamard_quant_backends: vec!["vllm_triton"],
+            pooled_index_update_backends: vec!["vllm_fork_triton"],
             index_remap_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
             mla_layout_copies: true,

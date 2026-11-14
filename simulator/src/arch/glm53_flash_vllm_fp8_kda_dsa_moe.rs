@@ -145,6 +145,7 @@ const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_triton"];
 const HADAMARD_QUANT_BACKENDS: &[&str] = &["vllm_triton"];
+const POOLED_INDEX_UPDATE_BACKENDS: &[&str] = &["vllm_fork_triton"];
 const FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_block_sm100"];
 /// vLLM passes `RoutingMethodType.DeepSeekV3` for this sigmoid + bias,
 /// single-group router on both the FP8 block and the NVFP4 MoE path
@@ -752,6 +753,7 @@ pub fn build_configs(
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
             hadamard_quant_backends: HADAMARD_QUANT_BACKENDS.to_vec(),
+            pooled_index_update_backends: POOLED_INDEX_UPDATE_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             mla_layout_copies: parallel.kernel_path.mla_layout_copies,
             indexer_max_logits_bytes: u64::from(parallel.kernel_path.indexer_max_logits_mb)
