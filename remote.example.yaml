@@ -24,10 +24,21 @@
 #   node_local       node-local scratch for each job's TMPDIR and profile.db copy (default /tmp).
 #   env              extra environment for remote jobs.
 #   keep_versions    shipped code versions to keep (default 10); experiments are never deleted.
-#   profile_runtime  `docker` (default): kernel-profile runs every worker in its env's
-#                    image (profiling/container/images.py), sent from here when the
-#                    remote lacks it. `in-image`: the remote is itself a profiling image
-#                    (a pod); it runs kernel-profile only, for the envs that image serves.
+#   profile_runtime  how GPU work (kernel-profile, campaign captures, fills) runs; it always
+#                    runs on the interpreters of its env's profiler image
+#                    (profiling/container/images.py), and nothing GPU-side is built there.
+#                    `docker` (default): each GPU job is one container of that image, sent
+#                    from here when the remote lacks it; the remote needs only docker with GPU
+#                    support. Simulation and timing-predict still run on the remote's own uv
+#                    venv and cargo build. `in-image`: the remote is itself a profiler image
+#                    (a pod); it runs GPU work only, for the envs that image serves.
+#   mounts           docker: host dirs mounted into a GPU job's container at the same path
+#                    (a Hugging Face cache, a text corpus).
+#   gpus             docker, direct launch: the GPU indices or UUIDs a GPU job uses, or
+#                    `auto`: each job takes as many idle GPUs as it needs when it starts.
+#   gpu_wait         docker: {min_free_mib, quiet_s (60), timeout_s (3600)}; a GPU job starts
+#                    once its GPUs have that much free memory for quiet_s (a host whose users
+#                    also run GPU work outside the scheduler), else exits 75.
 #   ephemeral        true when the remote's disk may vanish (a pod): copy results back whole.
 
 remotes:
@@ -65,3 +76,18 @@ remotes:
     workdir: /workspace/vibesim-remote
     profile_runtime: in-image
     ephemeral: true
+
+  # nsys captures and kernel profiling on a Slurm GPU server that has docker;
+  # the checkpoints and the corpus are mounted into each GPU job's container.
+  gpuonly:
+    access: {ssh: me@gpubox.example.org}
+    launch: {slurm: {time: "02:00:00", partition: main}}
+    workdir: /data/me/vibesim-remote
+    mounts: [/data/me/hf, /data/me/corpus]
+
+  # The same, on a shared GPU server without a scheduler: take idle GPUs.
+  gpushared:
+    access: {ssh: me@gpushared.example.org}
+    workdir: /data/me/vibesim-remote
+    gpus: auto
+    gpu_wait: {min_free_mib: 62000, quiet_s: 60, timeout_s: 7200}

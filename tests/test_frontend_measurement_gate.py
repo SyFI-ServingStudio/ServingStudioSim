@@ -219,3 +219,17 @@ def test_server_failure_reads_new_log_lines_and_the_process(tmp_path):
     assert poll().startswith("VIBESIM_AUTOTUNE_FORBIDDEN")
     proc.code = -9
     assert poll() == "server process exited with code -9"
+
+
+def test_a_read_only_venv_takes_its_runtime_lock_in_tmpdir(tmp_path, monkeypatch):
+    import os
+
+    from alignment.profiler import runtime_artifacts
+
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    assert runtime_artifacts._lock_path(venv) == venv / ".vibesim-python-runtime.lock"
+    monkeypatch.setattr(os, "access", lambda path, mode: False)
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path / "tmp"))
+    locked = runtime_artifacts._lock_path(venv)
+    assert locked.parent == tmp_path / "tmp" and locked.name.startswith("vibesim-python-runtime-")

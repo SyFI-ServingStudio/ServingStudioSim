@@ -12,12 +12,14 @@ import argparse
 import dataclasses
 import filecmp
 import json
+import os
 import shutil
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from alignment import artifact_paths
 from alignment.runner import run_profile
 from alignment.timing_predict_input import BuildRequest, build_inputs
 from alignment.timing_predict_input.builder import INPUT_MANIFEST_NAME
@@ -245,9 +247,14 @@ def _load_profile_result(profile_log_dir: Path) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ValueError(f"profile result must be a JSON object: {result_path}")
     recorded = result.get("log_dir")
-    if not isinstance(recorded, str) or Path(recorded).resolve() != profile_log_dir.resolve():
+    # The recorded root is where the capture ran; a profile copied from a remote
+    # GPU host, or moved, keeps its directory name and reads where it lands.
+    if not isinstance(recorded, str) or (
+        Path(recorded).resolve() != profile_log_dir.resolve()
+        and Path(recorded).name != profile_log_dir.resolve().name
+    ):
         raise ValueError(f"profile result does not identify configured directory: {result_path}")
-    return result
+    return artifact_paths.localize(result, profile_log_dir)
 
 
 def _profile_artifact(result: dict[str, Any], key: str) -> Path:
@@ -285,11 +292,23 @@ def _same_trace_source(left: Any, right: Any) -> bool:
         return False
 
 
-def _warn_if_trace_mismatch(params: dict[str, Any], profile_result: dict[str, Any]) -> None:
+def _warn_if_trace_mismatch(
+    params: dict[str, Any], profile_result: dict[str, Any], profile_log_dir: Path
+) -> None:
     workload = params.get("workload")
     traces = workload.get("trace_files") if isinstance(workload, dict) else None
     drive_summary = profile_result.get("drive_summary")
     profile_trace = drive_summary.get("source_trace") if isinstance(drive_summary, dict) else None
+    if isinstance(profile_trace, str):
+        # A capture run elsewhere (a remote GPU host) names its trace there.
+        recorded_root = profile_result.get("log_dir")
+        profile_trace = str(
+            artifact_paths.resolve_beside(
+                profile_trace,
+                profile_log_dir,
+                recorded_root if isinstance(recorded_root, str) else None,
+            )
+        )
     resolved_simulation = []
     if isinstance(traces, list) and all(isinstance(item, str) for item in traces):
         resolved_simulation = [
@@ -499,7 +518,13 @@ def _run_profile(args: argparse.Namespace) -> int:
         args.config,
         require_python_runtime=not args.resume,
     )
-    from alignment.image_runtime import container_config, in_image, run_profile_in_image
+    from alignment.image_runtime import (
+        container_config,
+        in_image,
+        run_profile_in_image,
+        run_profile_unhosted,
+    )
+    from reference_engines.autotune_guard import POLICY_ENV
 
     if args.runtime is None:
         # A resume re-derives artifacts from an existing capture; inside an image
@@ -518,7 +543,12 @@ def _run_profile(args: argparse.Namespace) -> int:
             "--runtime image starts a container from the host; resume an image "
             "capture on the host with --resume, and run nothing nested"
         )
-    if args.allow_autotune and args.runtime != "image":
+    # In an image that no host-side runner started (a remote job, a pod), the
+    # capture owns the autotune policy itself (`run_profile_unhosted`).
+    unhosted = (
+        in_image() and not args.resume and not args.warm_caches and POLICY_ENV not in os.environ
+    )
+    if args.allow_autotune and args.runtime != "image" and not unhosted:
         raise ValueError(
             "--allow-autotune governs the engine image's autotune guard; it needs --runtime image"
         )
@@ -545,6 +575,11 @@ def _run_profile(args: argparse.Namespace) -> int:
         if returncode == 0:
             print(f"[alignment] profiling complete: {config.log_dir}/profile_result.json")
         return returncode
+    if unhosted:
+        print(f"[alignment] profiling in this image: {args.config}")
+        run_profile_unhosted(args.config, allow_autotune=args.allow_autotune)
+        print(f"[alignment] profiling complete: {config.log_dir}/profile_result.json")
+        return 0
     print(f"[alignment] {'resuming' if args.resume else 'profiling'}: {args.config}")
     if args.warm_caches:
         # In the image, for `python -m reference_engines warm-caches` (whose
@@ -604,7 +639,7 @@ def _build_timing_predict_inputs(
     # sharding differently, so a launcher-side guess is brittle. A genuine
     # mismatch surfaces on its own downstream (e.g. the per-rank device-symmetry
     # fold and the labeled-slot coverage), which is where it is meaningful.
-    _warn_if_trace_mismatch(preset, profile_result)
+    _warn_if_trace_mismatch(preset, profile_result, Path(config.profile_log_dir))
     build_result = build_inputs(
         BuildRequest(
             simulation_preset=config.simulation_preset,

@@ -29,6 +29,7 @@ alone -- nothing here records or assumes what a kernel costs.
 from __future__ import annotations
 
 import contextlib
+import json
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -167,6 +168,54 @@ class WorkCollector:
 
     def __bool__(self) -> bool:
         return len(self) > 0
+
+
+#: Format of `write_units` / `read_units`: the work a cache build would issue.
+UNITS_SCHEMA_VERSION = 1
+
+
+def write_units(collector: WorkCollector, path: Path) -> None:
+    """Append ``collector``'s units to the work list at ``path`` (created if absent).
+
+    One cache build per unique cache key writes here, so a sweep's builds add
+    to one list; ``read_units`` folds repeated specs back together.
+    """
+
+    units = [
+        {
+            "kernel_kind": str(unit.kernel_kind),
+            "backend": unit.backend,
+            "gpu_name": unit.gpu_name,
+            "specs": list(unit.specs),
+        }
+        for unit in collector.units()
+    ]
+    existing = json.loads(path.read_text("utf-8"))["units"] if path.is_file() else []
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps({"schema_version": UNITS_SCHEMA_VERSION, "units": existing + units}, indent=1)
+        + "\n",
+        "utf-8",
+    )
+    temporary.replace(path)
+
+
+def read_units(path: Path) -> WorkCollector:
+    """The work list ``write_units`` wrote, as a collector ready for `issue`."""
+
+    document = json.loads(path.read_text("utf-8"))
+    if document.get("schema_version") != UNITS_SCHEMA_VERSION:
+        raise ValueError(f"{path}: not a schema-{UNITS_SCHEMA_VERSION} work list")
+    collector = WorkCollector()
+    for unit in document["units"]:
+        collector.record(
+            KernelKind(unit["kernel_kind"]),
+            unit["backend"],
+            unit["specs"],
+            gpu_name=unit.get("gpu_name"),
+        )
+    return collector
 
 
 def _gpu_count(kernel_kind: KernelKind, backend: str, spec: dict[str, Any]) -> int:

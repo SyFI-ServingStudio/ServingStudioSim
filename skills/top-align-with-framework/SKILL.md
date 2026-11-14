@@ -68,6 +68,9 @@ operating points.
 
 ## Step 0 — Run the alignment
 
+The GPU passes (capture, missing-kernel fill) may run on a remote GPU host:
+`operate-run-remote-profile`.
+
 Route to the **Align ServingStudio Sim to framework** side of `operate-run-alignment`. It produces the artifacts every
 check below reads: the per-iteration labeled kernel breakdown (measured duration
 vs simulated CostTree slot per mapped operation) plus the kernel-align pass's

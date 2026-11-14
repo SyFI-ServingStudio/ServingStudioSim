@@ -144,6 +144,19 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
             }[command]
         )
 
+    fill_parser = subparsers.add_parser(
+        "fill",
+        help="Measure a work list a cache build wrote (launcher --export-missing).",
+    )
+    fill_parser.add_argument(
+        "--work", type=Path, required=True, help="work list JSON (profiling/plan.py write_units)"
+    )
+    fill_parser.add_argument(
+        "--output-dir", type=Path, help="Where to write fill_report.json (under logs/ for --remote)."
+    )
+    fill_parser.add_argument("--db", type=Path, help="profile.db to fill (default VIBESIM_PROFILE_DB).")
+    fill_parser.set_defaults(command_fn=_cmd_fill)
+
     measure_parser = subparsers.add_parser(
         "measure",
         help="Sustained per-launch trend + NVML telemetry for one CUPTI kernel spec.",
@@ -350,6 +363,42 @@ def _cmd_list(args: argparse.Namespace) -> int:
         ],
     )
     return 0
+
+
+def _cmd_fill(args: argparse.Namespace) -> int:
+    """Measure every unit of a work list, one whole unit per idle GPU, as a cache build would."""
+
+    from profiling.exec.local import find_idle_gpus
+    from profiling.gpu_policy import require_gpu
+    from profiling.plan import issue, read_units
+
+    collector = read_units(args.work)
+    _set_db_path(args.db)
+    report_payload: dict[str, Any] = {"work": str(args.work), "specs": len(collector)}
+    if collector:
+        require_gpu(f"measuring {len(collector)} spec(s) from {args.work}")
+        gpus = find_idle_gpus()
+        if not gpus:
+            raise RuntimeError("no idle GPU to measure the work list on")
+        report = issue(collector, db_path=perf_api.DB_PATH, gpu_name=None, gpus=gpus)
+        report_payload |= {
+            "gpus": gpus,
+            "units": report.units,
+            "pieces": report.pieces,
+            "failures": report.failures,
+        }
+    print(
+        f"[fill] {report_payload['specs']} spec(s) in {report_payload.get('units', 0)} unit(s) "
+        f"on GPU(s) {report_payload.get('gpus', [])}; {len(report_payload.get('failures', []))} failed"
+    )
+    for failure in report_payload.get("failures", []):
+        print(f"[fill] failed: {failure}")
+    if args.output_dir is not None:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        (args.output_dir / "fill_report.json").write_text(
+            json.dumps(report_payload, indent=2) + "\n", "utf-8"
+        )
+    return 1 if report_payload.get("failures") else 0
 
 
 def _cmd_count_missing(args: argparse.Namespace) -> int:

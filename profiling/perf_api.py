@@ -36,6 +36,10 @@ DB_PATH = Path(os.environ.get("VIBESIM_PROFILE_DB", Path(__file__).resolve().par
 
 _jit_enabled = False
 
+#: Set to a path: `issue_collected` writes the collected work there as JSON
+#: (`profiling.plan.write_units`) instead of measuring it.
+COLLECT_EXPORT_ENV = "VIBESIM_COLLECT_EXPORT"
+
 
 def enable_jit_profiling() -> None:
     global _jit_enabled
@@ -91,6 +95,15 @@ def issue_collected(expected_specs: int | None = None) -> None:
         raise RuntimeError("issue_collected without begin_collect")
 
     recorded = len(collector)
+    export = os.environ.get(COLLECT_EXPORT_ENV, "").strip()
+    if export:
+        # Measured elsewhere (`kernel-profile fill`, e.g. on a remote GPU host):
+        # write the work instead of issuing it, and need no GPU here.
+        from profiling.plan import write_units
+
+        write_units(collector, Path(export))
+        logging.getLogger(__name__).info("wrote %d missing spec(s) to %s", recorded, export)
+        return
     if expected_specs:
         if recorded == 0:
             raise RuntimeError(

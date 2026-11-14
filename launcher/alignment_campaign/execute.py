@@ -165,10 +165,15 @@ def _recorded_artifacts_exist(directory: Path, kind: str) -> bool:
         return False
     if not isinstance(result, dict):
         return False
-    # By name inside this phase directory: the recorded path is absolute, and a
-    # moved or copied campaign must not look incomplete and re-profile.
+    # Inside this phase directory: a moved or copied campaign must not look
+    # incomplete and re-profile. Older results record absolute paths, read by name.
     return all(
-        isinstance(result[key], str) and (directory / Path(result[key]).name).is_file()
+        isinstance(result[key], str)
+        and (
+            (directory / result[key]).is_file()
+            if not Path(result[key]).is_absolute()
+            else (directory / Path(result[key]).name).is_file()
+        )
         for key in keys
         if result.get(key) is not None
     )

@@ -188,7 +188,10 @@ SUBCOMMANDS: dict[str, Subcommand] = {
     # Drives `alignment` stages across case directories; top-level rather than
     # nested because `alignment`'s parser owns "one explicit stage".
     "alignment-campaign": Subcommand(
-        "alignment-campaign {check,render,run,label,extract,compare} ...", _alignment_campaign
+        "alignment-campaign {check,render,run,label,extract,compare} ...",
+        _alignment_campaign,
+        # `run --phase <profile pass>` only: a capture on a remote GPU host.
+        remote=True,
     ),
     "migrate-artifact-kinds": Subcommand(
         "migrate-artifact-kinds (--check|--apply) [--registry PATH]", _migrate_artifact_kinds

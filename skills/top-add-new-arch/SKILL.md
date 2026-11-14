@@ -84,6 +84,9 @@ Check every design choice, and every subagent brief, against these rules.
 
 ## Phase 0 — Capture the real kernel sequence first
 
+When the target GPU is only on a remote host, capture there and keep the rest
+here: `operate-run-remote-profile`.
+
 **Run this before Phase 1.** Nearly every architecture worth adding already runs
 in vLLM or SGLang, so the kernels you are about to model can be watched instead
 of inferred. A capture answers two questions no amount of source reading answers

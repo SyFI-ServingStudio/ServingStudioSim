@@ -16,6 +16,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 REQ_FRONTEND_ROOT = Path(__file__).resolve().parent / "req-frontend"
 REPLAY_MANIFEST = REQ_FRONTEND_ROOT / "Cargo.toml"
 SESSION_RUNNER = REQ_FRONTEND_ROOT / "target" / "release" / "session_runner"
+# In an engine image the binary sits at the image's own path
+# (`reference_engines/*/Dockerfile`), wherever the running code was mounted from:
+# a remote job runs its shipped tree, not the image's /opt/vibesim copy.
+IMAGE_SESSION_RUNNER = Path(
+    "/opt/vibesim/alignment/load_generator/req-frontend/target/release/session_runner"
+)
 # Draws or materializes a canonical trace (`tracegen describe` lists its knobs).
 TRACEGEN = REQ_FRONTEND_ROOT / "target" / "release" / "tracegen"
 
@@ -45,9 +51,11 @@ def build_session_runner() -> Path:
     from ..image_runtime import in_image
 
     if in_image():
-        if not SESSION_RUNNER.is_file():
-            raise FileNotFoundError(f"the image carries no req-frontend binary at {SESSION_RUNNER}")
-        return SESSION_RUNNER
+        if not IMAGE_SESSION_RUNNER.is_file():
+            raise FileNotFoundError(
+                f"the image carries no req-frontend binary at {IMAGE_SESSION_RUNNER}"
+            )
+        return IMAGE_SESSION_RUNNER
     subprocess.run(
         [
             "cargo",
@@ -107,8 +115,10 @@ def run_replay(
         if config.backend.type == "openai"
         else base_url.rstrip("/")
     )
+    from ..image_runtime import in_image
+
     argv = [
-        str(SESSION_RUNNER),
+        str(IMAGE_SESSION_RUNNER if in_image() else SESSION_RUNNER),
         "--trace",
         str(prepared.trace_path),
         "--input-file-format",

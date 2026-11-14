@@ -111,6 +111,56 @@ def report_cache_coverage(
     return rc
 
 
+def export_missing_work(
+    param_sets: list[dict], registry: Registry, out: Path, build_type: str = "debug"
+) -> int:
+    """Write the specs a cache build would measure to ``out``, measuring nothing.
+
+    Runs `build-cache-only` once per unique cache key, as `prebuild_caches`
+    does, with `issue_collected` told to write its work list instead of issuing
+    it (`profiling.perf_api.COLLECT_EXPORT_ENV`), so no GPU is needed here.
+    `kernel-profile fill --work OUT` measures the list, e.g. on a remote GPU
+    host (`--remote`), and its rows merge back into this profile.db.
+    """
+    from profiling.perf_api import COLLECT_EXPORT_ENV
+
+    binary = binary_path(build_type)
+    out = out.resolve()
+    out.unlink(missing_ok=True)
+    env = {**_build_subprocess_env(), COLLECT_EXPORT_ENV: str(out)}
+    rc = 0
+    with _LAUNCHER_LEASES.profile_database(write=False):
+        for config in _unique_by_cache_key(param_sets, registry):
+            cfg_dir = _prebuild_log_dir(_cache_report_base(param_sets), config)
+            argv = build_cli_command(
+                config, binary, cfg_dir / "run_config.yaml", subcommand="build-cache-only"
+            )
+            result = _PROCESS_SUPERVISOR.run_sync(
+                ProcessSpec(
+                    argv=argv,
+                    cwd=REPO_ROOT,
+                    env=env,
+                    capture_output=True,
+                    name="export-missing",
+                )
+            )
+            print(result.output, end="" if result.output.endswith("\n") else "\n")
+            if not result.succeeded:
+                rc = result.exit_code if result.exit_code != 0 else 1
+    if rc == 0:
+        if not out.is_file():
+            # Nothing was missing: an empty list still says so explicitly.
+            from profiling.plan import WorkCollector, write_units
+
+            write_units(WorkCollector(), out)
+        units = json.loads(out.read_text("utf-8"))["units"]
+        print(
+            f"[export-missing] {sum(len(unit['specs']) for unit in units)} spec(s) "
+            f"in {len(units)} unit(s) -> {out}"
+        )
+    return rc
+
+
 def _cache_report_base(param_sets: list[dict]) -> Path:
     first = Path(log_dir_of(param_sets[0])) if param_sets else Path("logs")
     return first.parent
