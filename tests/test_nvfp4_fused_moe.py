@@ -138,7 +138,9 @@ def test_weight_format_coerces_to_the_nvfp4_dtype() -> None:
 _FP8_BLOCK_BACKEND = "flashinfer_trtllm_fp8_block_sm100"
 _MXFP4_BACKEND = "flashinfer_trtllm_sm100_mxfp4"
 _MXFP4_BF16_BACKEND = "flashinfer_trtllm_sm100_mxfp4_bf16"
-_NON_NVFP4 = {_FP8_BLOCK_BACKEND, _MXFP4_BACKEND, _MXFP4_BF16_BACKEND}
+# SGLang's FlashInfer CUTLASS MXFP8 x MXFP4 experts on SM12x.
+_MXFP4_SM120_BACKEND = "flashinfer_cutlass_sm120_mxfp4"
+_NON_NVFP4 = {_FP8_BLOCK_BACKEND, _MXFP4_BACKEND, _MXFP4_BF16_BACKEND, _MXFP4_SM120_BACKEND}
 
 
 def test_backends_gate_on_the_weight_format_not_the_bf16_input() -> None:
@@ -153,6 +155,8 @@ def test_backends_gate_on_the_weight_format_not_the_bf16_input() -> None:
     assert supported_backends(KIND, DType.MXFP4_E2M1, None, "NVIDIA B200") == [_MXFP4_BACKEND]
     assert supported_backends(KIND, DType.BF16, None, "NVIDIA B200") == [_MXFP4_BF16_BACKEND]
     assert supported_backends(KIND, DType.NVFP4_E2M1, None, "NVIDIA H200") == []
+    rtx_pro = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+    assert supported_backends(KIND, DType.MXFP4_E2M1, None, rtx_pro) == [_MXFP4_SM120_BACKEND]
     # A backend declared at bf16, as these were before, fails the gate.
     bf16_only = BackendSupport(compute=frozenset({DType.BF16}), sm_targets=frozenset({"sm_100f"}))
     assert not bf16_only.allows(DType.NVFP4_E2M1, None, "NVIDIA B200")

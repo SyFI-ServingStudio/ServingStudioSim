@@ -187,6 +187,7 @@ impl Deployment for UnifiedDeployment {
             max_model_len: g.arch.max_model_len().ok(),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
+            max_running_requests: g.worker.max_running_requests(),
             dp_placement: match &g.worker {
                 IterWorkerSel::ChunkedPrefill { dp_placement, .. }
                 | IterWorkerSel::Speculative { dp_placement, .. } => *dp_placement,
@@ -547,6 +548,45 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
+            IterArchSel::DeepseekV41Sglang {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                max_model_len,
+                engram_residency,
+                decoder_swa_bounded_replay,
+                gpu_p2p,
+                ..
+            } => {
+                // Pure TP4 attention (one group, four replicated KV shards).
+                // DSpark is not modeled: the speculative worker is refused.
+                ensure_hp_or_chunked_worker("DeepSeek-V4.1 (SGLang)", &g.worker)?;
+                let model = Arc::new(arch_build::deepseek_v41_sglang(
+                    model_spec,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    *max_model_len,
+                    engram_residency,
+                    *decoder_swa_bounded_replay,
+                    *gpu_p2p,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "DeepSeek-V4.1 (SGLang)",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
             arch @ (IterArchSel::DeepseekV41Vllm {
                 routing,
                 routing_seed,
@@ -874,6 +914,44 @@ impl Deployment for UnifiedDeployment {
                     expert_popularity_file.as_deref(),
                     token_corpus_file.as_deref(),
                     cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
+            IterArchSel::DeepseekV41SglangDspark {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                max_model_len,
+                engram_residency,
+                decoder_swa_bounded_replay,
+                gpu_p2p,
+                draft_tokens,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::deepseek_v41_sglang_dspark(
+                    model_spec,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    *max_model_len,
+                    engram_residency,
+                    *decoder_swa_bounded_replay,
+                    *gpu_p2p,
+                    *draft_tokens,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
@@ -1380,6 +1458,7 @@ mod tests {
             max_batch_tokens: 2048,
             batch_policy: BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionSpec::default(),
+            max_running_requests: None,
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             dp_placement: DpPlacement::RoundRobin,
@@ -1547,6 +1626,7 @@ pools:
             acceptance_seed: Some(7),
             batch_policy: BatchPolicy::Mix,
             kv_admission: Default::default(),
+            max_running_requests: None,
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             kv_accounting: Default::default(),

@@ -151,6 +151,7 @@ _FP4_ARCHS = frozenset(
 #: Speculative arch types: their cost log carries per-stage request geometry.
 _SPECULATIVE_ARCHS = frozenset(
     {
+        "deepseek_v41_sglang_dspark",
         "deepseek_v41_vllm_dspark",
         "deepseek_v41_vllm_dp_attn_ep_moe_dspark",
         "glm52_vllm_nvfp4_dsa_moe_speculative",
@@ -163,6 +164,7 @@ _SPECULATIVE_ARCHS = frozenset(
 #: config.rs``): params.json records the run config as written, so an omitted
 #: depth must resolve to what the simulator ran, not another arch's default.
 _DEFAULT_DRAFT_TOKENS = {
+    "deepseek_v41_sglang_dspark": 6,
     "deepseek_v41_vllm_dspark": 5,
     "deepseek_v41_vllm_dp_attn_ep_moe_dspark": 5,
     "glm52_vllm_nvfp4_dsa_moe_speculative": 5,

@@ -68,9 +68,27 @@ def _validated_shape(
                 f"{context}: speculative/multi-token decode requires a speculative arch"
             )
         return pairs, decode_kv_lens, prefill_tokens + decode_requests
+    queries = metric.get("decode_query_lens")
+    if metric["input_adapter"] == "sglang_text" and not queries:
+        # The SGLang fork (schema 2) records one scheduled token per decoding request and no query widths
+        # (absent, or the empty list the parser fills in).
+        # SGLang's speculative verify is static by default (SGLANG_RAGGED_VERIFY_MODE=static): every decoding
+        # request runs exactly speculative_num_draft_tokens = draft_tokens + 1 query rows. Lower that
+        # literally; a capture under ragged verify would need recorded widths and is rejected here.
+        if scheduled_decode != decode_requests:
+            raise ValueError(
+                f"{context}: sglang_text speculative records without decode_query_lens must schedule "
+                "one token per decoding request (static verify)"
+            )
+        queries = [draft_tokens + 1] * decode_requests
+        decode = []
+        for kv in decode_kv_lens:
+            if kv == 0:
+                raise ValueError(f"{context}: invalid decode_kv_lens")
+            decode.append([kv + draft_tokens + 1, draft_tokens + 1])
+        return list(pairs), decode, prefill_tokens + sum(queries)
     if metric["input_adapter"] != "vllm_text":
         raise ValueError(f"{context}: speculative shape lowering is only defined for vllm_text")
-    queries = metric.get("decode_query_lens")
     if metric["schema_version"] < 3 or not isinstance(queries, list):
         raise ValueError(f"{context}: speculative prediction requires recorded decode_query_lens")
     if len(queries) != decode_requests or any(

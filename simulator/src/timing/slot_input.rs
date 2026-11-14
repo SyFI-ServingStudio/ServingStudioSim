@@ -47,6 +47,7 @@ use crate::timing::kernels::EmbeddingRowGatherKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
 use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
+use crate::timing::kernels::PagedSparseMlaKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
 use crate::timing::kernels::{
@@ -209,6 +210,7 @@ log_inputs! {
     Fa4VarlenAttention => Fa4VarlenAttentionKernelInput,
     PagedAttnBatchDecode => PagedAttnBatchDecodeKernelInput,
     PagedAttnBatchPrefill => PagedAttnBatchPrefillKernelInput,
+    PagedSparseMla => PagedSparseMlaKernelInput,
     MlaRopeQuantizeFp8 => MlaRopeQuantizeFp8KernelInput,
     MoeFinalizeFuseShared => MoeFinalizeFuseSharedKernelInput,
     MhcRmsNorm => MhcRmsNormKernelInput,

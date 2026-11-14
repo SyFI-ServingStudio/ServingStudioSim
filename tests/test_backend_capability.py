@@ -80,9 +80,17 @@ def test_comm_and_elementwise_are_dtype_agnostic():
 def test_supported_backends_filters_options_by_dtype():
     # The dry-run `options` column: filter registered backends to a dtype.
     assert supported_backends("single_gemm", DType.FP8_E4M3) == [
+        "sglang_triton_block32_fp8",
         "deepgemm",
         "flashinfer_fp8_tensor",
     ]
+    # SGLang's block-32 FP8 linear is the SM12x path only.
+    assert "sglang_triton_block32_fp8" not in supported_backends(
+        "single_gemm", DType.FP8_E4M3, gpu="NVIDIA B200"
+    )
+    assert "sglang_triton_block32_fp8" in supported_backends(
+        "single_gemm", DType.FP8_E4M3, gpu="NVIDIA RTX PRO 6000 Blackwell Server Edition"
+    )
     # bmm_fp8's SM10x runners: per-tensor FP8 is not offered on Hopper.
     assert "flashinfer_fp8_tensor" not in supported_backends(
         "single_gemm", DType.FP8_E4M3, gpu="NVIDIA H200"
