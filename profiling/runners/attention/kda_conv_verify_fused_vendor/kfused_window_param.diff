@@ -1,0 +1,168 @@
+--- kfused.cu
++++ kfused_window.cu
+@@ -1,3 +1,17 @@
++// DERIVED (by the ServingStudio Sim session, not the MoE session) from kda_conv_verify_fused_vendor/kfused.cu, i.e.
++// wt-glm53-decode-investigate/tmp/kda-floor/fused/kfused.cu, source md5 33ad67b49997. Modified by us: the window is a
++// compile-time parameter (-DSQ=4 or -DSQ=8, default 8); with -DSQ=8 the code is the original's. Every change:
++//   1. SQ: `#ifndef SQ` default 8, static_assert SQ in {4, 8}; NSLOT = 8 names the tensor-core tiles' token slots.
++//   2. issue_rows FC copy: window rows k < (3 + SQ + 1) / 2 passes and `r < 3 + SQ` (was 6 passes, r < 11);
++//      gate rows k < SQ / 2 (was 4).
++//   3. issue_rows generic copy: 144 + 48 * SQ + 16 * SQ chunks, boundaries 144 + 48 * SQ (was 144 + 384 + 128, 528).
++//   4. next-item L2 prefetch (ABL 32 without 128): thread ranges 18 + 6 * SQ (+ 2 * SQ) (was 66, 82).
++//   5. rolled conv rows: 48 * (SQ + 2) chunks (was 480, two loops); ABL 512 path k < (SQ + 2) / 2 (was 5).
++//   6. key/gate record: 32 * SQ chunks (was 256, three loops); ABL 512 path k < SQ / 4 (was 2).
++//   7. norm sums: ss[t], ss[8 + t] for t in [SQ, NSLOT) set to 0 (the 16-wide reduction is unchanged).
++//   8. W / a fragments: token slots t in [SQ, NSLOT) written as zero (new loop after the fragment loop), so the m16n8k16
++//      tiles keep their 8 + 8 rows and 8 columns and the padded entries contribute nothing.
++// Unchanged: algorithm, CTA shape (128 threads, one CTA per request x head), persistent grid, launch variants, math.
+ // Lane V: fused KDA short conv + RecoverSSM verify for GLM-5.3-Flash decode (B200), grown from its floor.
+ //
+ // Geometry: one CTA (128 threads, 4 warps) per (request b, head h). Thread j owns key / value index j.
+@@ -23,7 +37,11 @@
+ #include <algorithm>
+ 
+ #define KD 128
+-#define SQ 8
++#ifndef SQ
++#define SQ 8  // window (tokens per request); build with -DSQ=4 or -DSQ=8
++#endif
++#define NSLOT 8  // token slots of the tensor-core tiles (m16 = 8 k rows + 8 q rows, n8 = 8 columns); tokens >= SQ are zero
++static_assert(SQ == 4 || SQ == 8, "window 4 or 8");
+ #define CWID 4
+ #define NTH 128
+ 
+@@ -145,29 +163,29 @@
+       const __nv_bfloat16* hsrc = conv + (long long)(ac - 1) * C + off;
+       const __nv_bfloat16* xsrc = a.x + tok0 * a.ldx + off;
+ #pragma unroll
+-      for (int k = 0; k < 6; k++) {
++      for (int k = 0; k < (3 + SQ + 1) / 2; k++) {
+         const int r = r0 + 2 * k;
+         if (r < 3) cp16(dst + r * (3 * KD), hsrc + (long long)r * C);
+-        else if (r < 11) cp16(dst + r * (3 * KD), xsrc + (long long)(r - 3) * a.ldx);
++        else if (r < 3 + SQ) cp16(dst + r * (3 * KD), xsrc + (long long)(r - 3) * a.ldx);
+       }
+     } else {
+       const int u = tid - 96, ch = u & 15, t0 = u >> 4;
+       const __nv_bfloat16* gsrc = a.gate + tok0 * a.ldg + h * KD + ch * 8;
+ #pragma unroll
+-      for (int k = 0; k < 4; k++) cp16(&sm.gs[buf][t0 + 2 * k][ch * 8], gsrc + (long long)(t0 + 2 * k) * a.ldg);
++      for (int k = 0; k < SQ / 2; k++) cp16(&sm.gs[buf][t0 + 2 * k][ch * 8], gsrc + (long long)(t0 + 2 * k) * a.ldg);
+     }
+     asm volatile("cp.async.commit_group;");
+     return;
+   }
+-  for (int c = tid; c < 144 + 384 + 128; c += NTH) {
++  for (int c = tid; c < 144 + 48 * SQ + 16 * SQ; c += NTH) {
+     if (c < 144) {
+       int r = c / 48, rem = c % 48, sec = rem >> 4, ch = rem & 15;
+       cp16(&sm.xs[buf][r][sec * KD + ch * 8], conv + (long long)(ac - 1 + r) * C + sec * HK + h * KD + ch * 8);
+-    } else if (c < 144 + 384) {
++    } else if (c < 144 + 48 * SQ) {
+       int c2 = c - 144, t = c2 / 48, rem = c2 % 48, sec = rem >> 4, ch = rem & 15;
+       cp16(&sm.xs[buf][3 + t][sec * KD + ch * 8], a.x + (tok0 + t) * a.ldx + sec * HK + h * KD + ch * 8);
+     } else {
+-      int c3 = c - 528, t = c3 >> 4, ch = c3 & 15;
++      int c3 = c - (144 + 48 * SQ), t = c3 >> 4, ch = c3 & 15;
+       cp16(&sm.gs[buf][t][ch * 8], a.gate + (tok0 + t) * a.ldg + h * KD + ch * 8);
+     }
+   }
+@@ -217,17 +235,17 @@
+         if (tid == NTH - 1) {
+           asm volatile("cp.async.bulk.prefetch.L2.global [%0], 32768;" ::"l"(blk2 + a.conv_bytes + (long long)h2 * (KD * KD * 2))
+                        : "memory");
+-        } else if (tid < 82) {
++        } else if (tid < 18 + 6 * SQ + 2 * SQ) {
+           const char* p;
+           if (tid < 18) {
+             const int r = tid / 6, rem = tid % 6, sec = rem >> 1, half = rem & 1;
+             const int ac2 = a.acc[b2];
+             p = (const char*)((const __nv_bfloat16*)blk2 + (long long)(ac2 - 1 + r) * C + sec * HK + h2 * KD) + half * 128;
+-          } else if (tid < 66) {
++          } else if (tid < 18 + 6 * SQ) {
+             const int c2 = tid - 18, t = c2 / 6, rem = c2 % 6, sec = rem >> 1, half = rem & 1;
+             p = (const char*)(a.x + ((long long)b2 * SQ + t) * a.ldx + sec * HK + h2 * KD) + half * 128;
+           } else {
+-            const int c3 = tid - 66, t = c3 >> 1, half = c3 & 1;
++            const int c3 = tid - (18 + 6 * SQ), t = c3 >> 1, half = c3 & 1;
+             p = (const char*)(a.gate + ((long long)b2 * SQ + t) * a.ldg + h2 * KD) + half * 128;
+           }
+           asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+@@ -266,13 +284,13 @@
+   __nv_bfloat16* convw = (__nv_bfloat16*)blk;  // rolled rows written in place
+   if constexpr (RUNG == 0) {
+     // rolled conv rows = window rows 1..10
+-    for (int c = tid; c < 480; c += NTH) {
++    for (int c = tid; c < 48 * (SQ + 2); c += NTH) {
+       int r = c / 48, rem = c % 48, sec = rem >> 4, ch = rem & 15;
+       *(uint4*)(convw + (long long)r * C + sec * HK + h * KD + ch * 8) = *(const uint4*)&sm.xs[buf][r + 1][sec * KD + ch * 8];
+     }
+     // key/gate record: [rows][H][S][2K]
+     __nv_bfloat16* kgp = a.kg + ((long long)b * a.H + h) * SQ * 2 * KD;
+-    for (int c = tid; c < 256; c += NTH) {
++    for (int c = tid; c < 32 * SQ; c += NTH) {
+       int t = c >> 5, part = c & 31;
+       uint4 v = part < 16 ? *(const uint4*)&sm.xs[buf][3 + t][KD + part * 8] : *(const uint4*)&sm.gs[buf][t][(part - 16) * 8];
+       *(uint4*)(kgp + t * 2 * KD + part * 8) = v;
+@@ -297,13 +315,13 @@
+         __nv_bfloat16* dst = convw + sec * HK + h * KD + ch * 8;
+         const __nv_bfloat16* src = &sm.xs[buf][1][sec * KD + ch * 8];
+ #pragma unroll
+-        for (int k = 0; k < 5; k++) {
++        for (int k = 0; k < (SQ + 2) / 2; k++) {
+           const int r = r0 + 2 * k;
+           *(uint4*)(dst + (long long)r * C) = *(const uint4*)(src + r * (3 * KD));
+         }
+       }
+     } else
+-    for (int c = tid; c < 480; c += NTH) {
++    for (int c = tid; c < 48 * (SQ + 2); c += NTH) {
+       int r = c / 48, rem = c % 48, sec = rem >> 4, ch = rem & 15;
+       *(uint4*)(convw + (long long)r * C + sec * HK + h * KD + ch * 8) = *(const uint4*)&sm.xs[buf][r + 1][sec * KD + ch * 8];
+     }
+@@ -357,7 +375,7 @@
+       __syncthreads();
+       if constexpr (STAMP) st2 = gtime();
+       __nv_bfloat16* kgp = a.kg + ((long long)b * a.H + h) * SQ * 2 * KD;
+-      for (int c = tid; c < 256; c += NTH) {
++      for (int c = tid; c < 32 * SQ; c += NTH) {
+         int t = c >> 5, part = c & 31;
+         uint4 v = part < 16 ? *(const uint4*)&sm.ks[t][part * 8] : *(const uint4*)&sm.gs[buf][t][(part - 16) * 8];
+         *(uint4*)(kgp + t * 2 * KD + part * 8) = v;
+@@ -379,6 +397,8 @@
+       float ss[16];
+ #pragma unroll
+       for (int t = 0; t < SQ; t++) { ss[t] = ck[t] * ck[t]; ss[8 + t] = cq[t] * cq[t]; }
++#pragma unroll
++      for (int t = SQ; t < NSLOT; t++) { ss[t] = 0.f; ss[8 + t] = 0.f; }
+       if constexpr ((ABL & 256) != 0) {
+         // reduce-scatter: after the 4 halving steps lane holds index ((lane>>4)&1)*8+((lane>>3)&1)*4+((lane>>2)&1)*2+((lane>>1)&1)
+ #pragma unroll
+@@ -424,9 +444,9 @@
+           const int part = tid & 31, t0 = tid >> 5; \
+           const __nv_bfloat16* src = part < 16 ? &sm.ks[t0][part * 8] : &sm.gs[buf][t0][(part - 16) * 8]; \
+ _Pragma("unroll") \
+-          for (int k = 0; k < 2; k++) *(uint4*)(kgp + (t0 + 4 * k) * 2 * KD + part * 8) = *(const uint4*)(src + 4 * k * KD); \
++          for (int k = 0; k < SQ / 4; k++) *(uint4*)(kgp + (t0 + 4 * k) * 2 * KD + part * 8) = *(const uint4*)(src + 4 * k * KD); \
+         } else \
+-        for (int c = tid; c < 256; c += NTH) { \
++        for (int c = tid; c < 32 * SQ; c += NTH) { \
+           int t = c >> 5, part = c & 31; \
+           uint4 v = part < 16 ? *(const uint4*)&sm.ks[t][part * 8] : *(const uint4*)&sm.gs[buf][t][(part - 16) * 8]; \
+           *(uint4*)(kgp + t * 2 * KD + part * 8) = v; \
+@@ -468,6 +488,15 @@
+         if constexpr (ABL & 4096) split_t(kn * Di, hi, lo); else split(kn * Di, hi, lo);
+         abH[(ln * 2 + (fe >= 2)) * 2 + ahalf] = hi; abL[(ln * 2 + (fe >= 2)) * 2 + ahalf] = lo;
+       }
++      // token slots >= SQ: zero rows of W and columns of a (their P, Q, Mk, Mq entries are 0 and never read)
++#pragma unroll
++      for (int t = SQ; t < NSLOT; t++) {
++        const __nv_bfloat16 z = __float2bfloat16(0.f);
++        const int ln = t * 4 + ftq;
++        waH[(ln * 4 + areg + 0) * 2 + ahalf] = z; waL[(ln * 4 + areg + 0) * 2 + ahalf] = z;
++        waH[(ln * 4 + areg + 1) * 2 + ahalf] = z; waL[(ln * 4 + areg + 1) * 2 + ahalf] = z;
++        abH[(ln * 2 + (fe >= 2)) * 2 + ahalf] = z; abL[(ln * 2 + (fe >= 2)) * 2 + ahalf] = z;
++      }
+       __syncthreads();  // (3) W, a fragments complete (ABL 1024: also red, ks)
+       if constexpr ((ABL & 1024) != 0) KG_RECORD();
+       // ABL 1024: per-warp norm factors; lane i (mod 16) holds r_i = rsqrt(|.|^2) (x K^-1/2 for q rows i >= 8)

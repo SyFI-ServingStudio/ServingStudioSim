@@ -34,8 +34,8 @@ Backends differ only in the conv state layout the deployment stores
 ``cuda_persistent_wy_mma`` is not the fork's kernel: a vendored persistent CUDA
 launch (one CTA per request and head) that does the same conv + verify with
 the verify in WY form on tensor cores, writing the same conv window, outputs
-and records. It runs on the default SD pages, with fp32 taps and an 8-token
-window only.
+and records. It runs on the default SD pages with fp32 taps, for windows 8 (the
+vendored source) and 4 (our window-4 build of it, pending the author's review).
 """
 
 from __future__ import annotations
@@ -173,6 +173,6 @@ _register(
     "profile_kda_recoverssm_conv_verify_cuda_persistent_wy_mma",
     "Vendored persistent CUDA conv + verify on the default [state_len, dim] conv pages: "
     "the window's recurrence in WY form on bf16 hi/lo tensor-core GEMMs, records in the "
-    "fork's request-row layout (fp32 taps, 8-token window only).",
+    "fork's request-row layout (fp32 taps; window 8 vendored, window 4 our build of it).",
     module_name="profiling.runners.attention.kda_recoverssm_conv_verify_fused",
 )

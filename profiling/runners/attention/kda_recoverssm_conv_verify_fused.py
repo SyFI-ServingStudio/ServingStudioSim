@@ -12,9 +12,12 @@ checkpoint, and writes the outputs and the per-request fp32 correction and
 key/gate records the commit reads, in the fork's layouts.
 
 It reads and writes only the fork's default SD conv page (``[state_len, dim]``,
-history row ``r`` at ``conv + r * dim``; there is no dim stride), takes fp32
-conv taps, and is compiled for an 8-token window (``SQ``), so it serves
-``spec_query_len`` 8 only. The operands are the CuTe runner's
+history row ``r`` at ``conv + r * dim``; there is no dim stride) and takes fp32
+conv taps. The vendored source is compiled for an 8-token window (``SQ``) and
+serves ``spec_query_len`` 8 unchanged. ``spec_query_len`` 4 runs our window-4
+build, ``kfused_window.cu`` (derived from the vendored file, the window a
+compile-time parameter; its header lists every change; built with ``-DSQ=8`` it
+compiles to the same code), pending the kernel author's review. The operands are the CuTe runner's
 (``build_conv_verify_operands``, SD); one call is checked against the same Torch
 oracles and tolerances as the CuTe backends before timing. Timing is the CUPTI
 sum of the launch.
@@ -42,26 +45,34 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 BACKEND = "kda_recoverssm_conv_verify:cuda_persistent_wy_mma"
-_SOURCE = Path(__file__).resolve().parent / "kda_conv_verify_fused_vendor" / "kfused.cu"
-_MODULE = "kda_recoverssm_conv_verify_wy_mma"
-_WINDOW = 8  # SQ in the kernel
+_VENDOR = Path(__file__).resolve().parent / "kda_conv_verify_fused_vendor"
+_SOURCE = _VENDOR / "kfused.cu"  # vendored, unchanged: window 8
+_WINDOW_SOURCE = _VENDOR / "kfused_window.cu"  # ours: window as -DSQ
+# window -> (source, extension name, extra flags)
+_BUILDS = {
+    8: (_SOURCE, "kda_recoverssm_conv_verify_wy_mma", ()),
+    4: (_WINDOW_SOURCE, "kda_recoverssm_conv_verify_wy_mma_w4", ("-DSQ=4",)),
+}
 _RUNG, _MINB, _ABL = 2, 4, 6064  # the measured variant
-_ext: Any = None
+_exts: dict[str, Any] = {}
 
 
-def _extension() -> Any:
-    """Build the vendored kernel once per process (cached under HOME)."""
-    global _ext
-    if _ext is None:
+def build(source: Path, name: str, flags: tuple[str, ...] = ()) -> Any:
+    """Build one kernel source once per process (cached under HOME)."""
+    if name not in _exts:
         from torch.utils.cpp_extension import load
 
-        _ext = load(
-            name=_MODULE,
-            sources=[str(_SOURCE)],
-            extra_cuda_cflags=["-O3", "-gencode=arch=compute_100a,code=sm_100a", "-std=c++20"],
+        _exts[name] = load(
+            name=name,
+            sources=[str(source)],
+            extra_cuda_cflags=["-O3", "-gencode=arch=compute_100a,code=sm_100a", "-std=c++20", *flags],
             verbose=False,
         )
-    return _ext
+    return _exts[name]
+
+
+def _extension(window: int = 8) -> Any:
+    return build(*_BUILDS[window])
 
 
 def fused_call(torch: Any, ext: Any, operands: ConvVerifyOperands, shape: ConvVerifyShape) -> Any:
@@ -99,15 +110,15 @@ def profile_kda_recoverssm_conv_verify_cuda_persistent_wy_mma(
     shape = validate_conv_verify_args(
         batch_size, num_heads, head_dim, spec_query_len, dtype, conv_weight_dtype, dim_first=False
     )
-    if shape.spec_query_len != _WINDOW:
-        raise ValueError(f"the fused conv + verify is compiled for a {_WINDOW}-token window")
+    if shape.spec_query_len not in _BUILDS:
+        raise ValueError(f"the fused conv + verify is built for windows {sorted(_BUILDS)} only")
     if shape.conv_weight_dtype is not DType.FP32:
         raise ValueError("the fused conv + verify takes fp32 conv taps")
     torch = _import_torch(BACKEND)
     try:
         from vllm.models.kimi_k3.nvidia.ops.recoverssm import KDARecoverSSMRecords
 
-        ext = _extension()
+        ext = _extension(shape.spec_query_len)
         device = torch.device("cuda", torch.cuda.current_device())
         operands = build_conv_verify_operands(torch, KDARecoverSSMRecords, shape, device=device)
         kernel = fused_call(torch, ext, operands, shape)

@@ -31,16 +31,21 @@ def test_args_fields_are_the_runner_kwargs() -> None:
     assert list(signature.parameters) == [f.name for f in fields(KdaRecoverSSMConvVerifyArgs)]
 
 
-def test_vendored_source_is_present() -> None:
-    # Defect: the runner shipped without the kernel it builds.
-    assert runner._SOURCE.is_file()
-    text = runner._SOURCE.read_text()
+@pytest.mark.parametrize("window", [8, 4])
+def test_sources_are_present(window: int) -> None:
+    # Defect: the runner shipped without the kernel it builds, or a window
+    # mapped to a source that cannot build it.
+    source, _, flags = runner._BUILDS[window]
+    assert source.is_file()
+    text = source.read_text()
     assert "k_fused" in text and f"L_({runner._RUNG}, {runner._MINB}, {runner._ABL}, 0)" in text
+    if window != 8:
+        assert f"-DSQ={window}" in flags and "#ifndef SQ" in text
 
 
 @pytest.mark.parametrize(
     "override",
-    [{"spec_query_len": 4}, {"conv_weight_dtype": "bf16"}, {"head_dim": 64}, {"dtype": "fp16"}],
+    [{"spec_query_len": 6}, {"conv_weight_dtype": "bf16"}, {"head_dim": 64}, {"dtype": "fp16"}],
 )
 def test_rejects_shapes_the_kernel_cannot_run(override: dict) -> None:
     # Defect: timing an 8-token, fp32-tap, K=128 kernel on a shape it gets wrong.
