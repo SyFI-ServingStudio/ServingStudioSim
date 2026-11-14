@@ -38,7 +38,8 @@ def test_sources_are_present(window: int) -> None:
     source, _, flags = runner._BUILDS[window]
     assert source.is_file()
     text = source.read_text()
-    assert "k_fused" in text and f"L_({runner._RUNG}, {runner._MINB}, {runner._ABL}, 0)" in text
+    minb, abl = runner._LAUNCH[window]
+    assert "k_fused" in text and f"L_({runner._RUNG}, {minb}, {abl}, 0)" in text
     if window != 8:
         assert f"-DSQ={window}" in flags and "#ifndef SQ" in text
 

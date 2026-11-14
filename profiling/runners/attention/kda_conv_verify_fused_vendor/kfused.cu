@@ -1,6 +1,12 @@
 // VENDORED (temporary, delete once the kernel ships as a callable package): wt-glm53-decode-investigate/tmp/kda-floor/fused/kfused.cu
-// MoE-session lane V fused conv + RecoverSSM verify, variant rung 2 / minb 4 / ABL 6064 (job 22006 / xchat from_moe15.md Addendum 2);
-// source md5 33ad67b49997, mtime 2026-11-13 15:40:21 PST, source tree HEAD d3563d86 (file untracked). Verbatim below this header; no changes.
+// MoE-session lane V fused conv + RecoverSSM verify, window a compile-time parameter (xchat from_moe17.md, job 22037): window 8 = default build,
+// rung 2 / minb 4 / ABL 6064 (job 22006); window 4 = -DSQ=4, rung 2 / minb 4 / ABL 22448. Source md5 245b0847323b2e144b8fb843607970d3,
+// mtime 2026-11-13 16:35:56 PST, source tree HEAD d3563d86 (file untracked). Verbatim below this header; no changes.
+// Window (tokens per request) is a compile-time parameter: -DSQ=8 (default, byte-identical SASS to the SQ-8 file,
+// md5 33ad67b49997) or -DSQ=4 (HiSparse, conv state 6 rows). The window-parameterized copy loops follow the
+// decode session's kfused_window.cu (reviewed: correct). SQ 4 adds its own geometry under ABL 16384 (see there):
+// tokens as the mma N dimension instead of padded M rows. Without 16384 an SQ-4 build is the padded
+// re-parameterization (token slots 4..7 of the m16 / n8 tiles zero), kept as the comparison.
 // Lane V: fused KDA short conv + RecoverSSM verify for GLM-5.3-Flash decode (B200), grown from its floor.
 //
 // Geometry: one CTA (128 threads, 4 warps) per (request b, head h). Thread j owns key / value index j.
@@ -26,7 +32,11 @@
 #include <algorithm>
 
 #define KD 128
-#define SQ 8
+#ifndef SQ
+#define SQ 8  // window (tokens per request); build with -DSQ=4 or -DSQ=8
+#endif
+#define NSLOT 8  // token slots of the tensor-core tiles (m16 = 8 k rows + 8 q rows, n8 = 8 columns); tokens >= SQ are zero
+static_assert(SQ == 4 || SQ == 8, "window 4 or 8");
 #define CWID 4
 #define NTH 128
 
@@ -148,29 +158,29 @@ __device__ __forceinline__ void issue_rows(const Args& a, Smem& sm, const int bu
       const __nv_bfloat16* hsrc = conv + (long long)(ac - 1) * C + off;
       const __nv_bfloat16* xsrc = a.x + tok0 * a.ldx + off;
 #pragma unroll
-      for (int k = 0; k < 6; k++) {
+      for (int k = 0; k < (3 + SQ + 1) / 2; k++) {
         const int r = r0 + 2 * k;
         if (r < 3) cp16(dst + r * (3 * KD), hsrc + (long long)r * C);
-        else if (r < 11) cp16(dst + r * (3 * KD), xsrc + (long long)(r - 3) * a.ldx);
+        else if (r < 3 + SQ) cp16(dst + r * (3 * KD), xsrc + (long long)(r - 3) * a.ldx);
       }
     } else {
       const int u = tid - 96, ch = u & 15, t0 = u >> 4;
       const __nv_bfloat16* gsrc = a.gate + tok0 * a.ldg + h * KD + ch * 8;
 #pragma unroll
-      for (int k = 0; k < 4; k++) cp16(&sm.gs[buf][t0 + 2 * k][ch * 8], gsrc + (long long)(t0 + 2 * k) * a.ldg);
+      for (int k = 0; k < SQ / 2; k++) cp16(&sm.gs[buf][t0 + 2 * k][ch * 8], gsrc + (long long)(t0 + 2 * k) * a.ldg);
     }
     asm volatile("cp.async.commit_group;");
     return;
   }
-  for (int c = tid; c < 144 + 384 + 128; c += NTH) {
+  for (int c = tid; c < 144 + 48 * SQ + 16 * SQ; c += NTH) {
     if (c < 144) {
       int r = c / 48, rem = c % 48, sec = rem >> 4, ch = rem & 15;
       cp16(&sm.xs[buf][r][sec * KD + ch * 8], conv + (long long)(ac - 1 + r) * C + sec * HK + h * KD + ch * 8);
-    } else if (c < 144 + 384) {
+    } else if (c < 144 + 48 * SQ) {
       int c2 = c - 144, t = c2 / 48, rem = c2 % 48, sec = rem >> 4, ch = rem & 15;
       cp16(&sm.xs[buf][3 + t][sec * KD + ch * 8], a.x + (tok0 + t) * a.ldx + sec * HK + h * KD + ch * 8);
     } else {
-      int c3 = c - 528, t = c3 >> 4, ch = c3 & 15;
+      int c3 = c - (144 + 48 * SQ), t = c3 >> 4, ch = c3 & 15;
       cp16(&sm.gs[buf][t][ch * 8], a.gate + (tok0 + t) * a.ldg + h * KD + ch * 8);
     }
   }
@@ -220,17 +230,17 @@ __device__ __forceinline__ bool item_body(const Args& a, Smem& sm, const int ite
         if (tid == NTH - 1) {
           asm volatile("cp.async.bulk.prefetch.L2.global [%0], 32768;" ::"l"(blk2 + a.conv_bytes + (long long)h2 * (KD * KD * 2))
                        : "memory");
-        } else if (tid < 82) {
+        } else if (tid < 18 + 6 * SQ + 2 * SQ) {
           const char* p;
           if (tid < 18) {
             const int r = tid / 6, rem = tid % 6, sec = rem >> 1, half = rem & 1;
             const int ac2 = a.acc[b2];
             p = (const char*)((const __nv_bfloat16*)blk2 + (long long)(ac2 - 1 + r) * C + sec * HK + h2 * KD) + half * 128;
-          } else if (tid < 66) {
+          } else if (tid < 18 + 6 * SQ) {
             const int c2 = tid - 18, t = c2 / 6, rem = c2 % 6, sec = rem >> 1, half = rem & 1;
             p = (const char*)(a.x + ((long long)b2 * SQ + t) * a.ldx + sec * HK + h2 * KD) + half * 128;
           } else {
-            const int c3 = tid - 66, t = c3 >> 1, half = c3 & 1;
+            const int c3 = tid - (18 + 6 * SQ), t = c3 >> 1, half = c3 & 1;
             p = (const char*)(a.gate + ((long long)b2 * SQ + t) * a.ldg + h2 * KD) + half * 128;
           }
           asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
@@ -269,13 +279,13 @@ __device__ __forceinline__ bool item_body(const Args& a, Smem& sm, const int ite
   __nv_bfloat16* convw = (__nv_bfloat16*)blk;  // rolled rows written in place
   if constexpr (RUNG == 0) {
     // rolled conv rows = window rows 1..10
-    for (int c = tid; c < 480; c += NTH) {
+    for (int c = tid; c < 48 * (SQ + 2); c += NTH) {
       int r = c / 48, rem = c % 48, sec = rem >> 4, ch = rem & 15;
       *(uint4*)(convw + (long long)r * C + sec * HK + h * KD + ch * 8) = *(const uint4*)&sm.xs[buf][r + 1][sec * KD + ch * 8];
     }
     // key/gate record: [rows][H][S][2K]
     __nv_bfloat16* kgp = a.kg + ((long long)b * a.H + h) * SQ * 2 * KD;
-    for (int c = tid; c < 256; c += NTH) {
+    for (int c = tid; c < 32 * SQ; c += NTH) {
       int t = c >> 5, part = c & 31;
       uint4 v = part < 16 ? *(const uint4*)&sm.xs[buf][3 + t][KD + part * 8] : *(const uint4*)&sm.gs[buf][t][(part - 16) * 8];
       *(uint4*)(kgp + t * 2 * KD + part * 8) = v;
@@ -300,13 +310,13 @@ __device__ __forceinline__ bool item_body(const Args& a, Smem& sm, const int ite
         __nv_bfloat16* dst = convw + sec * HK + h * KD + ch * 8;
         const __nv_bfloat16* src = &sm.xs[buf][1][sec * KD + ch * 8];
 #pragma unroll
-        for (int k = 0; k < 5; k++) {
+        for (int k = 0; k < (SQ + 2) / 2; k++) {
           const int r = r0 + 2 * k;
           *(uint4*)(dst + (long long)r * C) = *(const uint4*)(src + r * (3 * KD));
         }
       }
     } else
-    for (int c = tid; c < 480; c += NTH) {
+    for (int c = tid; c < 48 * (SQ + 2); c += NTH) {
       int r = c / 48, rem = c % 48, sec = rem >> 4, ch = rem & 15;
       *(uint4*)(convw + (long long)r * C + sec * HK + h * KD + ch * 8) = *(const uint4*)&sm.xs[buf][r + 1][sec * KD + ch * 8];
     }
@@ -360,7 +370,7 @@ __device__ __forceinline__ bool item_body(const Args& a, Smem& sm, const int ite
       __syncthreads();
       if constexpr (STAMP) st2 = gtime();
       __nv_bfloat16* kgp = a.kg + ((long long)b * a.H + h) * SQ * 2 * KD;
-      for (int c = tid; c < 256; c += NTH) {
+      for (int c = tid; c < 32 * SQ; c += NTH) {
         int t = c >> 5, part = c & 31;
         uint4 v = part < 16 ? *(const uint4*)&sm.ks[t][part * 8] : *(const uint4*)&sm.gs[buf][t][(part - 16) * 8];
         *(uint4*)(kgp + t * 2 * KD + part * 8) = v;
@@ -377,11 +387,151 @@ __device__ __forceinline__ bool item_body(const Args& a, Smem& sm, const int ite
         cp[t * KD + tid] = fv + sm.bet[t] + cq[t];
         a.out[(tok0 + t) * HK + h * KD + tid] = __float2bfloat16(fv * sm.bet[t] + cv[t]);
       }
+#if SQ == 4
+    } else if constexpr ((ABL & 16384) != 0) {
+      // ==== window-4 geometry (ABL 16384, SQ 4 only) ====
+      // 4 tokens give 8 W rows (D_t k_t, D_t q_t; unnormalized, norm factors applied to the accumulators).
+      // Instead of padding the m16 tile with 8 zero rows, its two halves carry the bf16 hi and lo parts of the
+      // same 8 rows: A = [W_hi ; W_lo], so one mma per (n-tile, k-step) gives h0 W_hi^T in rows 0..7 and
+      // h0 W_lo^T in rows 8..15 of the same thread (c0 + c2, c1 + c3): 32 HMMA per warp instead of 64, one A
+      // fragment read per k-step, the state stays the B operand in its load order (no register shuffles).
+      // Small GEMM likewise: B = [a_hi | a_lo] (n = s, 4 + s), so C = W_hi a_hi | W_hi a_lo over W_lo a_hi in
+      // one mma per k-step (8 HMMA instead of 24); M = C[t][s] + C[8+t][s] + C[t][4+s].
+      static_assert((ABL & 1280) == 1280, "window-4 geometry assumes ABL 256 | 1024");
+      // ---- norms: 8 sums (|k_t|^2 at t, |q_t|^2 at 4 + t), reduce-scatter (3 halving steps + 2 xor) ----
+      float ss[8];
+#pragma unroll
+      for (int t = 0; t < 4; t++) { ss[t] = ck[t] * ck[t]; ss[4 + t] = cq[t] * cq[t]; }
+#pragma unroll
+      for (int w = 4, o = 16; w >= 1; w >>= 1, o >>= 1) {
+        const bool up = (lane & o) != 0;
+#pragma unroll
+        for (int i = 0; i < w; i++) {
+          const float send = up ? ss[i] : ss[i + w];
+          const float keep = up ? ss[i + w] : ss[i];
+          ss[i] = keep + __shfl_xor_sync(0xffffffffu, send, o);
+        }
+      }
+      ss[0] += __shfl_xor_sync(0xffffffffu, ss[0], 2);
+      ss[0] += __shfl_xor_sync(0xffffffffu, ss[0], 1);
+      if ((lane & 3) == 0) sm.red[warp][((lane >> 4) & 1) * 4 + ((lane >> 3) & 1) * 2 + ((lane >> 2) & 1)] = ss[0];
+      // ---- gates ----
+      const float A = __expf(alog);
+      float G[4];
+      float run = 0.f;
+#pragma unroll
+      for (int t = 0; t < 4; t++) {
+        const float gi = __bfloat162float(sm.gs[buf][t][tid]) + dtb;
+        run += a.lb * sigm_ftz(A * gi);
+        G[t] = run;
+      }
+      // ---- W (A fragments [hi rows 0..7 ; lo rows 8..15], sm.wa[0]) and a (B fragments [hi n 0..3 | lo n 4..7], sm.ab[0]) ----
+      {
+        const int fq = tid >> 5, fr = tid & 31, ftq = fr >> 3, fw = fr & 7, fsub = fw >> 2, fe = fw & 3;
+        const int ks_ = 2 * fq + fsub, areg = (fe >= 2 ? 2 : 0), ahalf = fe & 1;
+        __nv_bfloat16* wA = (__nv_bfloat16*)&sm.wa[0][ks_][0];
+        __nv_bfloat16* aB = (__nv_bfloat16*)&sm.ab[0][ks_][0];
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+          const float D = ex2f(G[t] * L2E), Di = rcpf(D);
+          __nv_bfloat16 hi, lo;
+          const int lk = t * 4 + ftq, lq = (4 + t) * 4 + ftq;  // A lane of rows t (k) and 4 + t (q)
+          if constexpr (ABL & 4096) split_t(D * ck[t], hi, lo); else split(D * ck[t], hi, lo);
+          wA[(lk * 4 + areg + 0) * 2 + ahalf] = hi; wA[(lk * 4 + areg + 1) * 2 + ahalf] = lo;
+          if constexpr (ABL & 4096) split_t(D * cq[t], hi, lo); else split(D * cq[t], hi, lo);
+          wA[(lq * 4 + areg + 0) * 2 + ahalf] = hi; wA[(lq * 4 + areg + 1) * 2 + ahalf] = lo;
+          if constexpr (ABL & 4096) split_t(ck[t] * Di, hi, lo); else split(ck[t] * Di, hi, lo);
+          aB[(lk * 2 + (fe >= 2)) * 2 + ahalf] = hi; aB[(lq * 2 + (fe >= 2)) * 2 + ahalf] = lo;
+        }
+      }
+      __syncthreads();  // (3) red, ks, W^T, a complete
+      // ---- key/gate record (key half from ks, gate half from gs): one 16-byte chunk per thread ----
+      {
+        __nv_bfloat16* kgp = a.kg + ((long long)b * a.H + h) * SQ * 2 * KD;
+        const int part = tid & 31, t0 = tid >> 5;
+        const __nv_bfloat16* src = part < 16 ? &sm.ks[t0][part * 8] : &sm.gs[buf][t0][(part - 16) * 8];
+        *(uint4*)(kgp + t0 * 2 * KD + part * 8) = *(const uint4*)src;
+      }
+      // norm factors: lane i (mod 8) holds r_i = rsqrt(sum_i) (x K^-1/2 for the q columns i >= 4)
+      float rnv;
+      {
+        const int i = lane & 7;
+        rnv = rsqrtf(sm.red[0][i] + sm.red[1][i] + sm.red[2][i] + sm.red[3][i] + 1e-6f);
+        if (i >= 4) rnv *= 0.08838834764831845f;
+      }
+      const float rg = __shfl_sync(0xffffffffu, rnv, gid);  // factor of row n = gid
+      {
+        float acc[4][4];
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+          for (int i = 0; i < 4; i++) acc[nt][i] = 0.f;
+#pragma unroll
+        for (int s = 0; s < 8; s++) {
+          const uint4 aw = sm.wa[0][s][lane];
+          const int q = s >> 1, sub = s & 1;
+#pragma unroll
+          for (int nt = 0; nt < 4; nt++) {
+            const unsigned b0 = sub ? sv[nt][q].z : sv[nt][q].x;
+            const unsigned b1 = sub ? sv[nt][q].w : sv[nt][q].y;
+            mma16816(acc[nt], aw, b0, b1);
+          }
+        }
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+          const int v = warp * 32 + nt * 8 + 2 * tq;
+          *(float2*)&sm.pq[gid][v] = make_float2((acc[nt][0] + acc[nt][2]) * rg, (acc[nt][1] + acc[nt][3]) * rg);
+        }
+      }
+      if (warp == 0) {  // C = [W_hi ; W_lo] [a_hi | a_lo]; M[n][s] = C[n][s] + C[8+n][s] + C[n][4+s]
+        float c[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int s = 0; s < 8; s++) {
+          const uint2 bb = sm.ab[0][s][lane];
+          mma16816(c, sm.wa[0][s][lane], bb.x, bb.y);
+        }
+        const float x0 = __shfl_down_sync(0xffffffffu, c[0], 2), x1 = __shfl_down_sync(0xffffffffu, c[1], 2);
+        const float r0 = __shfl_sync(0xffffffffu, rnv, (2 * tq) & 3), r1 = __shfl_sync(0xffffffffu, rnv, (2 * tq + 1) & 3);
+        if (tq < 2)
+          *(float2*)&sm.mm[gid][2 * tq] = make_float2((c[0] + c[2] + x0) * (rg * r0), (c[1] + c[3] + x1) * (rg * r1));
+      }
+      __syncthreads();  // (4) P, Q, M complete
+      if constexpr (STAMP) st2 = gtime();
+      // ---- forward substitution, thread v = tid (same per-row op order as the SQ 8 ABL-256 path) ----
+      {
+        float mk[4][4], mq[4][4];  // Mk[t][s] = mm[t][s], Mq[t][s] = mm[4 + t][s]
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+          const float4 k4 = *(const float4*)&sm.mm[t][0], q4 = *(const float4*)&sm.mm[4 + t][0];
+          mk[t][0] = k4.x; mk[t][1] = k4.y; mk[t][2] = k4.z; mk[t][3] = k4.w;
+          mq[t][0] = q4.x; mq[t][1] = q4.y; mq[t][2] = q4.z; mq[t][3] = q4.w;
+        }
+        float P[4], Q[4];
+#pragma unroll
+        for (int t = 0; t < 4; t++) { P[t] = sm.pq[t][tid]; Q[t] = sm.pq[4 + t][tid]; }
+        float cc[4];
+        float* cp = a.corr + ((long long)b * a.H + h) * SQ * KD;
+#pragma unroll
+        for (int t = 0; t < 4; t++) {
+          float u = cv[t] - P[t];
+#pragma unroll
+          for (int s2 = 0; s2 < t; s2++) u = fmaf(-mk[t][s2], cc[s2], u);
+          cc[t] = u * sm.sbet[t];
+          float o = Q[t];
+#pragma unroll
+          for (int s2 = 0; s2 <= t; s2++) o = fmaf(mq[t][s2], cc[s2], o);
+          cp[t * KD + tid] = cc[t];
+          a.out[(tok0 + t) * HK + h * KD + tid] = __float2bfloat16(o);
+        }
+      }
+#endif
     } else {
       // ---- norms: |k_t|^2, |q_t|^2 over the 128 channels ----
       float ss[16];
 #pragma unroll
       for (int t = 0; t < SQ; t++) { ss[t] = ck[t] * ck[t]; ss[8 + t] = cq[t] * cq[t]; }
+#pragma unroll
+      for (int t = SQ; t < NSLOT; t++) { ss[t] = 0.f; ss[8 + t] = 0.f; }
       if constexpr ((ABL & 256) != 0) {
         // reduce-scatter: after the 4 halving steps lane holds index ((lane>>4)&1)*8+((lane>>3)&1)*4+((lane>>2)&1)*2+((lane>>1)&1)
 #pragma unroll
@@ -427,9 +577,9 @@ __device__ __forceinline__ bool item_body(const Args& a, Smem& sm, const int ite
           const int part = tid & 31, t0 = tid >> 5; \
           const __nv_bfloat16* src = part < 16 ? &sm.ks[t0][part * 8] : &sm.gs[buf][t0][(part - 16) * 8]; \
 _Pragma("unroll") \
-          for (int k = 0; k < 2; k++) *(uint4*)(kgp + (t0 + 4 * k) * 2 * KD + part * 8) = *(const uint4*)(src + 4 * k * KD); \
+          for (int k = 0; k < SQ / 4; k++) *(uint4*)(kgp + (t0 + 4 * k) * 2 * KD + part * 8) = *(const uint4*)(src + 4 * k * KD); \
         } else \
-        for (int c = tid; c < 256; c += NTH) { \
+        for (int c = tid; c < 32 * SQ; c += NTH) { \
           int t = c >> 5, part = c & 31; \
           uint4 v = part < 16 ? *(const uint4*)&sm.ks[t][part * 8] : *(const uint4*)&sm.gs[buf][t][(part - 16) * 8]; \
           *(uint4*)(kgp + t * 2 * KD + part * 8) = v; \
@@ -470,6 +620,15 @@ _Pragma("unroll") \
         // B fragment of the small GEMM: column n = s = t; lane = t * 4 + ftq, reg = fe >= 2
         if constexpr (ABL & 4096) split_t(kn * Di, hi, lo); else split(kn * Di, hi, lo);
         abH[(ln * 2 + (fe >= 2)) * 2 + ahalf] = hi; abL[(ln * 2 + (fe >= 2)) * 2 + ahalf] = lo;
+      }
+      // token slots >= SQ: zero rows of W and columns of a (their P, Q, Mk, Mq entries are 0 and never read)
+#pragma unroll
+      for (int t = SQ; t < NSLOT; t++) {
+        const __nv_bfloat16 z = __float2bfloat16(0.f);
+        const int ln = t * 4 + ftq;
+        waH[(ln * 4 + areg + 0) * 2 + ahalf] = z; waL[(ln * 4 + areg + 0) * 2 + ahalf] = z;
+        waH[(ln * 4 + areg + 1) * 2 + ahalf] = z; waL[(ln * 4 + areg + 1) * 2 + ahalf] = z;
+        abH[(ln * 2 + (fe >= 2)) * 2 + ahalf] = z; abL[(ln * 2 + (fe >= 2)) * 2 + ahalf] = z;
       }
       __syncthreads();  // (3) W, a fragments complete (ABL 1024: also red, ks)
       if constexpr ((ABL & 1024) != 0) KG_RECORD();
@@ -714,6 +873,9 @@ void fused(int64_t rung, int64_t minb, torch::Tensor pool, int64_t page, int64_t
   L_(2, 4, 1968, 0) L_(2, 4, 5040, 0) L_(2, 4, 6064, 0) L_(2, 4, 5904, 0) L_(2, 4, 6064, 1)
   L_(2, 4, 2992, 0) L_(2, 4, 8112, 0) L_(2, 4, 7952, 0) L_(2, 4, 8112, 1)
   L_(2, 4, 16304, 0) L_(2, 4, 16144, 0) L_(2, 4, 16304, 1)
+#if SQ == 4
+  L_(2, 4, 22448, 0) L_(2, 5, 22448, 0) L_(2, 4, 22448, 1) L_(2, 5, 6064, 0) L_(0, 5, 0, 0) L_(0, 5, 160, 0)
+#endif
 #undef L_
   TORCH_CHECK(false, "unsupported rung/minb");
 }

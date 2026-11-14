@@ -2,7 +2,9 @@
 
 The kernel is the MoE session's fused conv + verify, vendored read-only in
 ``kda_conv_verify_fused_vendor/kfused.cu`` (see its header), launched as that
-session measured it (rung 2, minb 4, ABL 6064). One persistent launch, one CTA
+session ships it: window 8 is the default build with rung 2, minb 4, ABL 6064;
+window 4 is the ``-DSQ=4`` build with rung 2, minb 4, ABL 22448 (its own
+window-4 tile geometry). One persistent launch, one CTA
 per (request, head): it loads the head's 32 KB checkpoint into tensor-core
 fragments, copies the 3 conv history rows and the window's raw ``q|k|v`` and
 gate rows into shared memory, runs the width-4 convolution + SiLU, writes the
@@ -13,11 +15,7 @@ key/gate records the commit reads, in the fork's layouts.
 
 It reads and writes only the fork's default SD conv page (``[state_len, dim]``,
 history row ``r`` at ``conv + r * dim``; there is no dim stride) and takes fp32
-conv taps. The vendored source is compiled for an 8-token window (``SQ``) and
-serves ``spec_query_len`` 8 unchanged. ``spec_query_len`` 4 runs our window-4
-build, ``kfused_window.cu`` (derived from the vendored file, the window a
-compile-time parameter; its header lists every change; built with ``-DSQ=8`` it
-compiles to the same code), pending the kernel author's review. The operands are the CuTe runner's
+conv taps. It serves ``spec_query_len`` 8 and 4. The operands are the CuTe runner's
 (``build_conv_verify_operands``, SD); one call is checked against the same Torch
 oracles and tolerances as the CuTe backends before timing. Timing is the CUPTI
 sum of the launch.
@@ -46,14 +44,14 @@ from profiling.runners.metrics import ComputeMetrics
 
 BACKEND = "kda_recoverssm_conv_verify:cuda_persistent_wy_mma"
 _VENDOR = Path(__file__).resolve().parent / "kda_conv_verify_fused_vendor"
-_SOURCE = _VENDOR / "kfused.cu"  # vendored, unchanged: window 8
-_WINDOW_SOURCE = _VENDOR / "kfused_window.cu"  # ours: window as -DSQ
+_SOURCE = _VENDOR / "kfused.cu"
 # window -> (source, extension name, extra flags)
 _BUILDS = {
-    8: (_SOURCE, "kda_recoverssm_conv_verify_wy_mma", ()),
-    4: (_WINDOW_SOURCE, "kda_recoverssm_conv_verify_wy_mma_w4", ("-DSQ=4",)),
+    8: (_SOURCE, "kda_recoverssm_conv_verify_wy_mma_sq8", ()),
+    4: (_SOURCE, "kda_recoverssm_conv_verify_wy_mma_sq4", ("-DSQ=4",)),
 }
-_RUNG, _MINB, _ABL = 2, 4, 6064  # the measured variant
+_RUNG = 2
+_LAUNCH = {8: (4, 6064), 4: (4, 22448)}  # window -> (minb, ABL), as the kernel author ships them
 _exts: dict[str, Any] = {}
 
 
@@ -89,11 +87,12 @@ def fused_call(torch: Any, ext: Any, operands: ConvVerifyOperands, shape: ConvVe
     width = operands.projected.shape[1]
     records = operands.records
     stamps = torch.zeros(1, dtype=torch.int64, device=pool.device)
+    minb, abl = _LAUNCH[shape.spec_query_len]
     args = (
-        _RUNG, _MINB, pool, page_bytes, conv_bytes, operands.state_indices, operands.accepted,
+        _RUNG, minb, pool, page_bytes, conv_bytes, operands.state_indices, operands.accepted,
         operands.mixed_qkv, width, operands.raw_gate, operands.raw_gate.stride(0), operands.raw_beta, width,
         operands.a_log, operands.dt_bias, operands.conv_weight, operands.out, records.correction,
-        records.key_gate, LOWER_BOUND, shape.batch_size, shape.num_heads, rows, _ABL, 0, stamps,
+        records.key_gate, LOWER_BOUND, shape.batch_size, shape.num_heads, rows, abl, 0, stamps,
     )
     return lambda: ext.fused(*args)
 
