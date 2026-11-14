@@ -129,4 +129,29 @@ register(
     )
 )
 
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_tilelang_post_addend",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.mhc.mhc_fused_sum_post_addend_tilelang",
+            function_name="profile_mhc_fused_sum_post_pre_rms_norm_vllm_tilelang_post_addend",
+        ),
+        table_name=KIND,
+        args_schema=MhcFusedSumArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        supports=BackendSupport(compute=frozenset({DType.BF16})),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's path with the shared expert's add read by the post kernel: above 32 tokens a copy of "
+                "vLLM's mhc_post_tilelang that takes both block outputs (x = bf16(shared + routed) in-register), "
+                "then vLLM's prenorm GEMM and pre big-fuse unchanged; at 32 tokens or fewer vLLM's add and fused "
+                "call unchanged. Only num_partials = 1 with shared_addend. Outputs bit-exact with vllm_tilelang."
+            ),
+        ),
+    )
+)
+
 __all__ = ["KIND", "MhcFusedSumArgs"]

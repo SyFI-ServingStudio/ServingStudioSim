@@ -1909,6 +1909,17 @@ pub enum IterArchSel {
         #[serde(default = "default_true")]
         #[param(default = true, cache_key)]
         moe_input_copy: bool,
+        /// Fold the MoE block's shared + routed add (`moe.combine_glue`) into
+        /// the next mHC post: each boundary after an MoE layer (and the last
+        /// layer's post) is priced by `mhc_fused_sum_post_pre_rms_norm`
+        /// `vllm_tilelang_post_addend` (the post kernel reads both block
+        /// outputs; vLLM's add + call at 32 rows or fewer) and the add is not
+        /// billed. Exclusive with the one-launch boundary and with a nonzero
+        /// `mhc_fused_saving_us` / `mhc_fuse_fixed_us`, whose after-MoE share
+        /// already removes this add.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_combine_add_in_mhc_post: bool,
         /// What-if (`extrapolated`): a JSON table `{"mode": "absolute" | "ratio",
         /// "points": [{"tokens", "ours_us", "production_us"}, ...]}` that prices
         /// every EP rank's routed-expert call (routing + FC1 + FC2 + finalize) at
@@ -2150,6 +2161,17 @@ pub enum IterArchSel {
         #[serde(default = "default_true")]
         #[param(default = true, cache_key)]
         moe_input_copy: bool,
+        /// Fold the MoE block's shared + routed add (`moe.combine_glue`) into
+        /// the next mHC post: each boundary after an MoE layer (and the last
+        /// layer's post) is priced by `mhc_fused_sum_post_pre_rms_norm`
+        /// `vllm_tilelang_post_addend` (the post kernel reads both block
+        /// outputs; vLLM's add + call at 32 rows or fewer) and the add is not
+        /// billed. Exclusive with the one-launch boundary and with a nonzero
+        /// `mhc_fused_saving_us` / `mhc_fuse_fixed_us`, whose after-MoE share
+        /// already removes this add.
+        #[serde(default)]
+        #[param(cache_key)]
+        moe_combine_add_in_mhc_post: bool,
         /// What-if (`extrapolated`): a JSON table `{"mode": "absolute" | "ratio",
         /// "points": [{"tokens", "ours_us", "production_us"}, ...]}` that prices
         /// every EP rank's routed-expert call (routing + FC1 + FC2 + finalize) at
@@ -2575,6 +2597,24 @@ impl IterArchSel {
             Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { moe_input_copy, .. } => *moe_input_copy,
             _ => true,
         };
+        let moe_combine_add_in_mhc_post = match self {
+            Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { moe_combine_add_in_mhc_post, .. } => *moe_combine_add_in_mhc_post,
+            _ => false,
+        };
+        if moe_combine_add_in_mhc_post {
+            match mhc_boundary {
+                MhcBoundaryPricing::OneLaunchKernel => anyhow::bail!(
+                    "moe_combine_add_in_mhc_post: the one-launch boundary after an MoE layer already sums the \
+                     shared expert's output; the add would be removed twice"
+                ),
+                MhcBoundaryPricing::VllmKernelLessFixedUs(us) if us > 0.0 => anyhow::bail!(
+                    "moe_combine_add_in_mhc_post with a {us} us per-boundary saving: that saving was measured as \
+                     the one-launch kernel (with the shared add) against vLLM's add + TileLang, so its after-MoE \
+                     share already removes this add; use the saving only where it is 0"
+                ),
+                _ => {}
+            }
+        }
         let routed_moe_whatif = match self {
             Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
                 routed_moe_whatif_file: Some(path),
@@ -2615,6 +2655,7 @@ impl IterArchSel {
             mhc_boundary,
             router_gate_once,
             moe_input_copy,
+            moe_combine_add_in_mhc_post,
             routed_moe_whatif,
             moe_shared_overlap,
             moe_shared_pair,
@@ -3680,6 +3721,8 @@ pub struct Glm53FlashFusions {
     pub router_gate_once: bool,
     /// `moe_input_copy`: price the routed-input bf16 copy (`moe.input_glue`).
     pub moe_input_copy: bool,
+    /// `moe_combine_add_in_mhc_post`: the shared + routed add folded into the next mHC post.
+    pub moe_combine_add_in_mhc_post: bool,
     /// `routed_moe_whatif_file`, read.
     pub routed_moe_whatif: Option<crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::RoutedMoeWhatIf>,
     pub moe_shared_overlap: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap,
@@ -3695,6 +3738,7 @@ impl Default for Glm53FlashFusions {
             mhc_boundary: Default::default(),
             router_gate_once: false,
             moe_input_copy: true,
+            moe_combine_add_in_mhc_post: false,
             routed_moe_whatif: None,
             moe_shared_overlap: Default::default(),
             moe_shared_pair: None,

@@ -19,8 +19,8 @@
 use std::sync::Arc;
 
 use crate::timing::kernels::{
-    MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel, MhcRmsNormKernelConfig,
-    MhcRmsNormKernelInput,
+    MhcFusedPostPreRmsNormKernel, MhcFusedSumKernelConfig, MhcFusedSumPostPreRmsNormKernel,
+    MhcPreRmsNormKernel, MhcRmsNormKernelConfig, MhcRmsNormKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge, Probe,
@@ -46,6 +46,9 @@ pub struct MhcTerminalPostOp {
     pub name: String,
     pub fused: Arc<MhcFusedPostPreRmsNormKernel>,
     pub pre: Arc<MhcPreRmsNormKernel>,
+    /// After an MoE layer whose shared + routed add is folded into the post
+    /// (`build_after_moe_sum`): `fused_sum - pre` instead of `fused - pre`.
+    pub fused_sum: Option<Arc<MhcFusedSumPostPreRmsNormKernel>>,
 }
 
 impl MhcTerminalPostOp {
@@ -73,11 +76,32 @@ impl MhcTerminalPostOp {
                 pre,
                 bridge,
             )?),
+            fused_sum: None,
             name,
         })
     }
 
+    /// The last layer's post after an MoE layer with the shared + routed add
+    /// in the post kernel: priced as `fused_sum(T') - pre(T')`.
+    pub fn build_after_moe_sum(
+        name: String,
+        cfg: MhcTerminalPostConfig,
+        sum: MhcFusedSumKernelConfig,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let mut op = Self::build(name, cfg, bridge)?;
+        op.fused_sum = Some(Arc::new(MhcFusedSumPostPreRmsNormKernel::build(
+            format!("{}.fused_sum_reference", op.name),
+            sum,
+            bridge,
+        )?));
+        Ok(op)
+    }
+
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        if let Some(sum) = &self.fused_sum {
+            return builder.leaf(self.name.clone(), sum.kind(), sum.describe_config());
+        }
         builder.leaf(
             self.name.clone(),
             self.fused.kind(),
@@ -92,7 +116,11 @@ impl MhcTerminalPostOp {
         let metrics = if input.num_tokens == 0 {
             LeafMetrics::ZERO
         } else {
-            post_only(self.fused.eval(&shape), self.pre.eval(&shape))
+            let fused = match &self.fused_sum {
+                Some(sum) => sum.eval(&shape),
+                None => self.fused.eval(&shape),
+            };
+            post_only(fused, self.pre.eval(&shape))
         };
         ev.push(metrics, || shape.clone().into());
     }

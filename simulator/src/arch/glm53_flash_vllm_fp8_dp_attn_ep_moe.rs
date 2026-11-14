@@ -160,6 +160,10 @@ pub struct Glm53FlashDpAttnEpParallel {
     /// (`moe.input_glue`, from the 2026-09 FP8 TP4/EP4 capture). The fork's
     /// NVFP4 naive DP/EP path has no such copy; `false` drops the leaf.
     pub moe_input_copy: bool,
+    /// Fold the MoE block's shared + routed add into the next mHC post
+    /// (`MHC_POST_ADDEND_BACKENDS`): the boundary after each MoE layer and the
+    /// last layer's post take the sum kind, and `combine_glue` is not billed.
+    pub moe_combine_add_in_mhc_post: bool,
     /// What-if pricing of the routed-expert call; `None` is its rows.
     pub routed_moe_whatif: Option<RoutedMoeWhatIf>,
     /// How the aux-stream shared expert overlaps the MoE chain.
@@ -457,6 +461,10 @@ pub struct MhcOneLaunchConfigs {
 }
 
 const MHC_ONE_LAUNCH_BACKENDS: &[&str] = &["vllm_tilelang", "cuda_one_launch"];
+/// vLLM's after-MoE boundary with the shared + routed add read by the post
+/// kernel (lane N; vLLM's add + call at 32 rows or fewer, where the folded
+/// small-batch kernel is slower).
+const MHC_POST_ADDEND_BACKENDS: &[&str] = &["vllm_tilelang_post_addend"];
 
 /// Which attention layers an `attn_tp > 1` group runs tensor-parallel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -598,6 +606,10 @@ pub struct Glm53FlashDpAttnEpConfigs {
     pub exchange: EpExchangeConfigs,
     /// `Some` under `MhcBoundaryPricing::OneLaunchKernel`.
     pub mhc_one_launch: Option<MhcOneLaunchConfigs>,
+    /// `Some` under `moe_combine_add_in_mhc_post`: the boundary after an MoE
+    /// layer (and the last layer's post) with the shared + routed add in the
+    /// post kernel.
+    pub mhc_post_addend: Option<MhcFusedSumKernelConfig>,
 }
 
 /// The MoE dispatch all-gather for the checkpoint's routed experts.
@@ -678,6 +690,22 @@ pub fn build_configs(
                 shared_addend: true,
             },
             post_pre,
+        }
+    });
+    assert!(
+        !(parallel.moe_combine_add_in_mhc_post && mhc_one_launch.is_some()),
+        "moe_combine_add_in_mhc_post with the one-launch boundary is refused by the selector"
+    );
+    let mhc_post_addend = parallel.moe_combine_add_in_mhc_post.then(|| {
+        local.groups = split_groups_after_dense(model, std::mem::take(&mut local.groups));
+        MhcFusedSumKernelConfig {
+            backends: MHC_POST_ADDEND_BACKENDS.to_vec(),
+            gpu_name: local.mhc_fused.gpu_name.clone(),
+            hidden_size: local.mhc_fused.hidden_size.clone(),
+            hc_mult: local.mhc_fused.hc_mult,
+            hidden_dtype: local.mhc_fused.hidden_dtype,
+            num_partials: 1,
+            shared_addend: true,
         }
     });
     let kda_tp1 = local.kda.clone();
@@ -774,6 +802,7 @@ pub fn build_configs(
         parallel: parallel.clone(),
         exchange,
         mhc_one_launch,
+        mhc_post_addend,
     })
 }
 
@@ -1492,15 +1521,21 @@ pub fn build(
             bridge,
         )?,
         groups,
-        terminal_post: MhcTerminalPostOp::build(
-            format!("{n}.final_mhc_post"),
-            MhcTerminalPostConfig {
+        terminal_post: {
+            let post = MhcTerminalPostConfig {
                 mhc: local.mhc.clone(),
                 pre_backends: local.mhc.backends.clone(),
                 fused_backends: local.mhc.backends.clone(),
-            },
-            bridge,
-        )?,
+            };
+            let name = format!("{n}.final_mhc_post");
+            match &cfg.mhc_post_addend {
+                // The last layer is an MoE layer: its add moves into this post.
+                Some(sum) if !model_cfg.is_dense(model_cfg.num_layers - 1) => {
+                    MhcTerminalPostOp::build_after_moe_sum(name, post, sum.clone(), bridge)?
+                }
+                _ => MhcTerminalPostOp::build(name, post, bridge)?,
+            }
+        },
         hc_contract_mean: atomic(
             n,
             "hc_contract_mean",
@@ -1581,6 +1616,15 @@ fn build_group(
             MhcFusedSumPostPreRmsNormKernel::build,
             bridge,
         )?),
+        None if cfg.mhc_post_addend.is_some() && follows_moe(&local.model, group) => {
+            AttnBoundary::SumAfterMoe(atomic(
+                p,
+                "attn_mhc_sum_post_pre",
+                cfg.mhc_post_addend.clone().unwrap(),
+                MhcFusedSumPostPreRmsNormKernel::build,
+                bridge,
+            )?)
+        }
         _ => AttnBoundary::Mhc(Boundary::Fused(atomic(
             p,
             "attn_mhc_post_pre",
@@ -1666,9 +1710,7 @@ fn build_group(
                 routed_moe_whatif: cfg.parallel.routed_moe_whatif.clone(),
                 moe_shared_overlap: cfg.parallel.moe_shared_overlap,
                 moe_shared_pair: cfg.parallel.moe_shared_pair.clone(),
-                combine_glue: cfg
-                    .mhc_one_launch
-                    .is_none()
+                combine_glue: (cfg.mhc_one_launch.is_none() && cfg.mhc_post_addend.is_none())
                     .then(|| {
                         atomic(
                             m,
@@ -2465,6 +2507,7 @@ mod tests {
             mhc_boundary: Default::default(),
             router_gate_once: false,
             moe_input_copy: true,
+            moe_combine_add_in_mhc_post: false,
             routed_moe_whatif: None,
             moe_shared_overlap: Default::default(),
             moe_shared_pair: None,
@@ -2631,6 +2674,35 @@ mod tests {
         assert!(glue > 0);
         assert!(dropped.iter().all(|(l, _)| l != "input_glue"));
         assert_eq!(dropped.len() + glue, base.len());
+    }
+
+    /// Catches `moe_combine_add_in_mhc_post` keeping the separate shared +
+    /// routed add, missing a sum boundary after an MoE layer, or summing at
+    /// a boundary that follows a dense layer.
+    #[test]
+    fn combine_add_in_mhc_post_moves_the_add_into_the_post_kernel() {
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        let model = config("glm53_flash_nvfp4");
+        let mut on = parallel(8);
+        on.moe_combine_add_in_mhc_post = true;
+        let configs = build_configs(&model, &on, &demand).unwrap();
+        assert!(configs.mhc_one_launch.is_none());
+        let sum = configs.mhc_post_addend.as_ref().unwrap();
+        assert_eq!((sum.num_partials, sum.shared_addend), (1, true));
+        assert_eq!(sum.backends, MHC_POST_ADDEND_BACKENDS);
+        for group in &configs.local.groups {
+            let after_dense = group.layers.iter().any(|&l| l == 0 || model.is_dense(l - 1));
+            assert!(!(after_dense && follows_moe(&model, group)), "{}", group.label);
+        }
+        let kinds = leaves(&built_with(&model, &on));
+        let count = |leaf: &str| kinds.iter().filter(|(l, _)| l == leaf).count();
+        assert_eq!(count("combine_glue"), 0);
+        assert!(kinds
+            .iter()
+            .any(|(l, k)| l == "attn_mhc_sum_post_pre" && k == "mhc_fused_sum_post_pre_rms_norm"));
+        let base = leaves(&built_with(&model, &parallel(8)));
+        assert!(base.iter().any(|(l, _)| l == "combine_glue"));
+        assert!(base.iter().all(|(l, _)| l != "attn_mhc_sum_post_pre"));
     }
 
     #[test]
