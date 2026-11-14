@@ -56,7 +56,10 @@ use crate::timing::kernels::{
     DsaPooledIndexCacheUpdateKernel, DsaPooledIndexCacheUpdateKernelConfig,
     DsaPooledIndexCacheUpdateKernelInput,
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
-    DsaPersistentTopkDecodeKernelInput, DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig,
+    DsaPersistentTopkDecodeKernelInput, DsaPooledLogitsPageTableKernel,
+    DsaPooledLogitsPageTableKernelConfig, DsaPooledLogitsPageTableKernelInput,
+    DsaPooledTopkPageTableKernel, DsaPooledTopkPageTableKernelConfig,
+    DsaPooledTopkPageTableKernelInput, DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig,
     DsaTopkPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
     Fp32RowSplitLayerNormKernel, Fp32RowSplitLayerNormKernelConfig,
     Fp32RowSplitLayerNormKernelInput, GemmFp32OutputKernel, GemmFp32OutputKernelConfig,
@@ -167,14 +170,55 @@ pub struct Glm53DsaFront {
     /// Cut D: one state writer (kv RMS norm + MLA cache append + kpool decode
     /// update), on this backend only.
     pub state_writer: Option<&'static str>,
-    /// Cut E (indexer back, post-top-k): the top-k output to the final
-    /// physical page table and valid counts in one kernel, on this backend
-    /// only. It runs as the sparse MLA op's `index_remap` slot (the same
-    /// callable shape, top-k rows in, page table out) and absorbs the decode
-    /// rows' pool expand and the fork glue's top-k buffer fill, pool-id cast,
-    /// seq-len `+ 1` and buffer copy.
+    /// Cut E (indexer back, post-top-k): the decode rows' selected pools to
+    /// the final physical page table and valid counts in one kernel
+    /// (`dsa_pooled_topk_page_table`), on this backend only. It absorbs the
+    /// decode rows' pool expand and index remap and the fork glue's top-k
+    /// buffer fill, pool-id cast, seq-len `+ 1` and buffer copy. Prefill rows
+    /// keep the fork's expand and remap.
     pub topk_page_table: Option<&'static str>,
+    /// Cut E with the top-k (indexer back from the logits): the decode rows'
+    /// top-k and the cut E page table in one kernel
+    /// (`dsa_pooled_logits_page_table`), on this backend only. It absorbs the
+    /// decode top-k (persistent and cooperative) and everything cut E does;
+    /// the two cuts are exclusive.
+    pub topk_to_page_table: Option<&'static str>,
     pub glue: DsaGlue,
+}
+
+/// The decode-row launches cut E replaces (worklet slot suffixes): the pool
+/// expand and index remap of the decode rows, and the fork glue's top-k
+/// buffer fill, pool-id cast, seq-len `+ 1` and buffer copy.
+pub const PAGE_TABLE_ABSORBS: [&str; 6] = [
+    "indexer.expand_pools",
+    "sparse_mla.index_remap",
+    "glue.topk_buffer_fill",
+    "glue.pool_ids_to_int64",
+    "glue.seq_lens_plus_one",
+    "glue.topk_buffer_copy",
+];
+/// What cut E + top-k replaces: cut E's set and the decode top-k slot (the
+/// persistent kernel, DeepSelect, or the cooperative kernel at <= 64 rows).
+pub const TOPK_TO_PAGE_TABLE_ABSORBS: [&str; 7] = [
+    "indexer.topk_decode",
+    "indexer.expand_pools",
+    "sparse_mla.index_remap",
+    "glue.topk_buffer_fill",
+    "glue.pool_ids_to_int64",
+    "glue.seq_lens_plus_one",
+    "glue.topk_buffer_copy",
+];
+
+impl Glm53DsaFront {
+    /// The decode-row slots the page-table cuts bill zero (their own slot
+    /// prices them instead).
+    pub fn decode_slots_absorbed(self) -> &'static [&'static str] {
+        match (self.topk_page_table, self.topk_to_page_table) {
+            (_, Some(_)) => &TOPK_TO_PAGE_TABLE_ABSORBS,
+            (Some(_), None) => &PAGE_TABLE_ABSORBS,
+            (None, None) => &[],
+        }
+    }
 }
 
 impl DsaFrontGemm {
@@ -317,6 +361,10 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub state_writer: Option<ElementwiseKernelConfig>,
     /// `front.glue == ForkLaunchList`.
     pub fork_glue: Option<DsaForkGlueConfigs>,
+    /// Cut E (`front.topk_page_table`).
+    pub topk_page_table: Option<DsaPooledTopkPageTableKernelConfig>,
+    /// Cut E with the top-k (`front.topk_to_page_table`).
+    pub topk_to_page_table: Option<DsaPooledLogitsPageTableKernelConfig>,
 }
 
 /// One iteration's DSA work on this rank.
@@ -380,6 +428,8 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub q_absorb_fp8: Option<Op<BatchedGemmStaticFp8QuantKernel>>,
     pub state_writer: Option<Op<ElementwiseKernel>>,
     pub fork_glue: Option<DsaForkGlue>,
+    pub topk_page_table: Option<Op<DsaPooledTopkPageTableKernel>>,
+    pub topk_to_page_table: Option<Op<DsaPooledLogitsPageTableKernel>>,
     resolved: Glm53DsaAttnLocalWorkletResolved,
 }
 
@@ -506,7 +556,7 @@ impl Glm53DsaAttnLocalWorklet {
                 next_n: cfg.decode_next_n,
                 max_model_len: max_model_len.clone(),
                 top_k: cfg.index_topk / kpool,
-                logits_row_stride: max_model_len,
+                logits_row_stride: max_model_len.clone(),
                 logits_dtype: DType::Fp32,
                 index_dtype: "int32".into(),
                 // Scores drawn from the measured logit distribution: real
@@ -554,10 +604,7 @@ impl Glm53DsaAttnLocalWorklet {
             sparse_mla: Glm53KpoolSparseMlaConfig {
                 sparse_attention_backends: cfg.sparse_attention_backends.clone(),
                 mla_cache_append_backends: cfg.mla_cache_append_backends.clone(),
-                index_remap_backends: match cfg.front.topk_page_table {
-                    Some(backend) => vec![backend],
-                    None => cfg.index_remap_backends.clone(),
-                },
+                index_remap_backends: cfg.index_remap_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_heads: cfg.num_heads.clone(),
                 latent_dim: cfg.kv_lora_rank.clone(),
@@ -600,6 +647,8 @@ impl Glm53DsaAttnLocalWorklet {
             q_absorb_fp8: None,
             state_writer: None,
             fork_glue: None,
+            topk_page_table: None,
+            topk_to_page_table: None,
             raw_cfg: cfg.clone(),
         };
         let front = cfg.front;
@@ -693,6 +742,41 @@ impl Glm53DsaAttnLocalWorklet {
             seq_lens_plus_one: ew(4, 4),
             topk_buffer_copy: ew(4 * window, 4 * window),
         });
+        // Cuts E and E + top-k. The page-table kernels are compiled for
+        // `index_topk / kpool` pools, `selected_k` slots and the MLA cache
+        // block; the block table spans `max_model_len` tokens.
+        resolved.topk_page_table =
+            front
+                .topk_page_table
+                .map(|backend| DsaPooledTopkPageTableKernelConfig {
+                    backends: vec![backend],
+                    gpu_name: cfg.gpu_name.clone(),
+                    next_n: cfg.decode_next_n,
+                    max_model_len: max_model_len.clone(),
+                    top_k: cfg.index_topk / kpool,
+                    kpool,
+                    page_table_width: cfg.selected_k,
+                    block_size: cfg.cache_block_size,
+                    index_dtype: "int32".into(),
+                });
+        resolved.topk_to_page_table =
+            front
+                .topk_to_page_table
+                .map(|backend| DsaPooledLogitsPageTableKernelConfig {
+                    backends: vec![backend],
+                    gpu_name: cfg.gpu_name.clone(),
+                    next_n: cfg.decode_next_n,
+                    max_model_len: max_model_len.clone(),
+                    // The fork's decode logits rows are `max_model_len / kpool` wide.
+                    logits_row_stride: Dim::param("logits_row_stride", cfg.max_model_len / kpool),
+                    top_k: cfg.index_topk / kpool,
+                    kpool,
+                    page_table_width: cfg.selected_k,
+                    block_size: cfg.cache_block_size,
+                    logits_dtype: DType::Fp32,
+                    index_dtype: "int32".into(),
+                    context_mode: "uniform_measured".into(),
+                });
         resolved.topk_decode_cooperative = (!cfg.cooperative_topk_backends.is_empty()).then(|| {
             DsaPersistentTopkDecodeKernelConfig {
                 backends: cfg.cooperative_topk_backends.clone(),
@@ -853,6 +937,30 @@ impl Glm53DsaAttnLocalWorklet {
                     })
                 })
                 .transpose()?,
+            topk_page_table: r
+                .topk_page_table
+                .map(|c| {
+                    atomic(
+                        n,
+                        "indexer.topk_page_table",
+                        c,
+                        DsaPooledTopkPageTableKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
+            topk_to_page_table: r
+                .topk_to_page_table
+                .map(|c| {
+                    atomic(
+                        n,
+                        "indexer.topk_to_page_table",
+                        c,
+                        DsaPooledLogitsPageTableKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             name,
             resolved,
         };
@@ -929,6 +1037,32 @@ impl Glm53DsaAttnLocalWorklet {
                 .map(|(backend, op)| {
                     (backend, &op.name, &op.kernel.config.backends, "elementwise")
                 }),
+        )
+        .chain(
+            front
+                .topk_page_table
+                .zip(worklet.topk_page_table.as_ref())
+                .map(|(backend, op)| {
+                    (
+                        backend,
+                        &op.name,
+                        &op.kernel.config.backends,
+                        "dsa_pooled_topk_page_table",
+                    )
+                }),
+        )
+        .chain(
+            front
+                .topk_to_page_table
+                .zip(worklet.topk_to_page_table.as_ref())
+                .map(|(backend, op)| {
+                    (
+                        backend,
+                        &op.name,
+                        &op.kernel.config.backends,
+                        "dsa_pooled_logits_page_table",
+                    )
+                }),
         );
         for (backend, role, built, kind) in fused {
             if built.as_slice() != [backend] {
@@ -940,16 +1074,13 @@ impl Glm53DsaAttnLocalWorklet {
                 });
             }
         }
-        if let Some(backend) = front.topk_page_table {
-            let built = &worklet.sparse_mla.index_remap.config.backends;
-            if built.as_slice() != [backend] {
-                return Err(BuildError::NoBackendForLaunch {
-                    kind: "dsa_sparse_index_remap",
-                    role: format!("{}.index_remap", worklet.sparse_mla.name),
-                    backends: built.clone(),
-                    launch: "the fused post-top-k page-table cut, which only its configured backend prices",
-                });
-            }
+        if front.topk_page_table.is_some() && front.topk_to_page_table.is_some() {
+            return Err(BuildError::FitFailed {
+                kind: "dsa_pooled_logits_page_table",
+                reason: "cut E (topk_page_table) and cut E + top-k (topk_to_page_table) build the \
+                         same page table; set one"
+                    .into(),
+            });
         }
         // The backends as built, after any run-config override.
         let topk = &worklet.topk_prefill;
@@ -1055,6 +1186,8 @@ impl Glm53DsaAttnLocalWorklet {
         slots.extend(self.q_lora_epilogue.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.q_absorb_fp8.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.state_writer.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.topk_page_table.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.topk_to_page_table.as_ref().map(|op| op.compile(builder)));
         if let Some(g) = &self.fork_glue {
             slots.extend([
                 g.hidden_fp32_cast.compile(builder),
@@ -1087,7 +1220,9 @@ impl Glm53DsaAttnLocalWorklet {
         let absorb_fused = front.q_absorb_fp8.is_some();
         let state_writer = front.state_writer.is_some();
         let fork_glue = front.glue == DsaGlue::ForkLaunchList;
-        let page_table = front.topk_page_table.is_some();
+        // Cut E or E + top-k builds the decode rows' page table in one launch;
+        // E + top-k also selects their pools.
+        let absorbed = |slot: &str| front.decode_slots_absorbed().contains(&slot);
         push_or_zero(&self.fused_qkv_a, rows.clone(), hidden_merged, ev);
         // The q half of the norm folds into cut B's prologue and the kv half
         // into cut D; with only one of them the other half still launches,
@@ -1155,10 +1290,27 @@ impl Glm53DsaAttnLocalWorklet {
             no_decode,
             ev,
         );
-        self.eval_decode_topk(&input.decode_kv_lens, &w, ev);
+        if absorbed("indexer.topk_decode") {
+            push_or_zero(
+                &self.topk_decode,
+                DsaPersistentTopkDecodeKernelInput {
+                    batch_size: 0,
+                    context_len: 0,
+                },
+                true,
+                ev,
+            );
+        } else {
+            self.eval_decode_topk(&input.decode_kv_lens, &w, ev);
+        }
         self.eval_prefill_indexer(&w.prefill_indexer_chunks, ev);
-        // Cut E expands the decode rows' pools itself.
-        let expand_rows = w.prefill_indexer_rows + if page_table { 0 } else { w.decode_rows };
+        // Cuts E and E + top-k expand the decode rows' pools themselves.
+        let expand_rows = w.prefill_indexer_rows
+            + if absorbed("indexer.expand_pools") {
+                0
+            } else {
+                w.decode_rows
+            };
         push_or_zero(
             &self.expand_pools,
             tokens(expand_rows),
@@ -1185,6 +1337,7 @@ impl Glm53DsaAttnLocalWorklet {
                     cfg.decode_next_n,
                 ),
                 cache_append_elsewhere: state_writer,
+                decode_remap_elsewhere: absorbed("sparse_mla.index_remap"),
             },
             ev,
         );
@@ -1226,20 +1379,48 @@ impl Glm53DsaAttnLocalWorklet {
         if let Some(op) = &self.state_writer {
             push_or_zero(op, all.clone(), false, ev);
         }
+        if let Some(op) = &self.topk_page_table {
+            let input = DsaPooledTopkPageTableKernelInput {
+                batch_size: w.decode_requests,
+                context_len: w.decode_pools,
+            };
+            push_or_zero(op, input, no_decode, ev);
+        }
+        if let Some(op) = &self.topk_to_page_table {
+            let input = DsaPooledLogitsPageTableKernelInput {
+                batch_size: w.decode_requests,
+                context_len: self.fused_topk_context(&w),
+            };
+            push_or_zero(op, input, no_decode, ev);
+        }
         if let Some(g) = &self.fork_glue {
             let decode = tokens(w.decode_rows);
             push_or_zero(&g.hidden_fp32_cast, all, hidden_fused, ev);
-            let post_topk = no_decode || page_table;
-            push_or_zero(&g.topk_buffer_fill, decode.clone(), post_topk, ev);
+            let gone = |slot: &str| no_decode || absorbed(slot);
+            push_or_zero(&g.topk_buffer_fill, decode.clone(), gone("glue.topk_buffer_fill"), ev);
             push_or_zero(&g.positions_to_int32, decode.clone(), no_decode, ev);
-            push_or_zero(&g.pool_ids_to_int64, decode.clone(), post_topk, ev);
-            push_or_zero(&g.seq_lens_plus_one, decode.clone(), post_topk, ev);
-            push_or_zero(&g.topk_buffer_copy, decode, post_topk, ev);
+            push_or_zero(&g.pool_ids_to_int64, decode.clone(), gone("glue.pool_ids_to_int64"), ev);
+            push_or_zero(&g.seq_lens_plus_one, decode.clone(), gone("glue.seq_lens_plus_one"), ev);
+            push_or_zero(&g.topk_buffer_copy, decode, gone("glue.topk_buffer_copy"), ev);
         }
     }
 }
 
 impl Glm53DsaAttnLocalWorklet {
+    /// The context `topk_to_page_table` prices at. One CTA per row: a batch
+    /// within one wave of [`FUSED_TOPK_CTAS_PER_SM`] CTAs per SM takes as long
+    /// as its longest row; past a wave the rows queue on the slots and the time
+    /// follows the batch's total pools, priced at the mean context.
+    fn fused_topk_context(&self, w: &Work) -> u32 {
+        let slots = self
+            .topk_decode_slots
+            .map(|sms| sms * FUSED_TOPK_CTAS_PER_SM);
+        match slots {
+            Some(slots) if w.decode_rows > slots => w.decode_mean_pools,
+            _ => w.decode_pools,
+        }
+    }
+
     fn indexer_budget(&self) -> IndexerBudget {
         let cfg = &self.resolved.raw_cfg;
         IndexerBudget {
@@ -1386,6 +1567,10 @@ const PREFILL_KEY_WORKSPACE_PER_MODEL_LEN: u64 = 40;
 /// keeps cooperative_topk up to 64 rows (a one-line change to `_resolve_auto`).
 /// Any other override (torch) runs every batch on itself.
 const LONG_ROW_BACKENDS: [&str; 2] = ["vllm_cuda", "deep_select"];
+
+/// CTAs per SM of the fused top-k + page-table kernel
+/// (`__launch_bounds__(512, 2)` with ~70 KB of shared memory per CTA).
+const FUSED_TOPK_CTAS_PER_SM: u32 = 2;
 
 /// Rows of the one-wave uniform launch `eval_decode_topk` prices each row
 /// from: below the SM count, so the measured B axis does not straddle a wave
@@ -1978,7 +2163,12 @@ mod tests {
             ..Default::default()
         };
         let w = build_front(front, &[]).unwrap();
-        assert_eq!(w.sparse_mla.index_remap.config.backends, ["cut_e_kernel"]);
+        // Cut E prices its own slot; the remap keeps the fork's backend for prefill rows.
+        assert_eq!(w.sparse_mla.index_remap.config.backends, ["vllm_triton"]);
+        assert_eq!(
+            w.topk_page_table.as_ref().unwrap().kernel.config.backends,
+            ["cut_e_kernel"]
+        );
         assert_eq!(
             w.hidden_gemm.as_ref().unwrap().kernel.config.backends,
             ["cut_a_kernel"]
@@ -2005,7 +2195,7 @@ mod tests {
             "m.dsa.q_lora_gemm",
             "m.dsa.q_absorb_fp8",
             "m.dsa.state_writer",
-            "m.dsa.sparse_mla.index_remap",
+            "m.dsa.indexer.topk_page_table",
         ] {
             assert!(
                 matches!(
@@ -2082,6 +2272,83 @@ mod tests {
             "batched_gemm_static_fp8_quant"
         );
         assert_eq!(op.kernel.config.backends, ["tc_kernel"]);
+    }
+
+    /// Catches a page-table cut that double-bills or misses a launch: cut E
+    /// zeroes exactly the decode rows' post-top-k launches, cut E + top-k also
+    /// the decode top-k, every absorbed slot exists in the compiled tree, and
+    /// each cut adds exactly its own slot on its named backend.
+    #[test]
+    fn page_table_cuts_absorb_exactly_the_launches_they_replace() {
+        assert!(Glm53DsaFront::default().decode_slots_absorbed().is_empty());
+        let cut_e = Glm53DsaFront {
+            topk_page_table: Some("e2a_kernel"),
+            glue: DsaGlue::ForkLaunchList,
+            ..Default::default()
+        };
+        let cut_e_topk = Glm53DsaFront {
+            topk_to_page_table: Some("t6_kernel"),
+            glue: DsaGlue::ForkLaunchList,
+            ..Default::default()
+        };
+        assert_eq!(cut_e.decode_slots_absorbed(), PAGE_TABLE_ABSORBS);
+        assert_eq!(
+            cut_e_topk.decode_slots_absorbed(),
+            TOPK_TO_PAGE_TABLE_ABSORBS
+        );
+        let mut fused_set = PAGE_TABLE_ABSORBS.to_vec();
+        fused_set.insert(0, "indexer.topk_decode");
+        assert_eq!(cut_e_topk.decode_slots_absorbed(), fused_set);
+        // Not absorbed: the position cast feeds the seq lens either way.
+        assert!(!TOPK_TO_PAGE_TABLE_ABSORBS.contains(&"glue.positions_to_int32"));
+
+        let base = slot_names(&build_front(Glm53DsaFront { glue: DsaGlue::ForkLaunchList, ..Default::default() }, &[]).unwrap());
+        for (front, slot, backend) in [
+            (cut_e, "m.dsa.indexer.topk_page_table", "e2a_kernel"),
+            (cut_e_topk, "m.dsa.indexer.topk_to_page_table", "t6_kernel"),
+        ] {
+            let w = build_front(front, &[]).unwrap();
+            let names = slot_names(&w);
+            for absorbed in front.decode_slots_absorbed() {
+                let name = format!("m.dsa.{absorbed}");
+                assert!(names.contains(&name), "{name} missing from the tree");
+            }
+            let added: Vec<_> = names.iter().filter(|n| !base.contains(n)).collect();
+            assert_eq!(added, [slot]);
+            let built = match slot {
+                "m.dsa.indexer.topk_page_table" => &w.topk_page_table.as_ref().unwrap().kernel.config.backends,
+                _ => &w.topk_to_page_table.as_ref().unwrap().kernel.config.backends,
+            };
+            assert_eq!(built, &[backend]);
+            assert!(matches!(
+                build_front(front, &[(slot, "torch")]),
+                Err(BuildError::NoBackendForLaunch { .. })
+            ));
+        }
+        let e2a = build_front(cut_e, &[]).unwrap();
+        let cfg = e2a.resolved.topk_page_table.as_ref().unwrap();
+        assert_eq!(
+            (cfg.top_k, cfg.kpool, cfg.page_table_width, cfg.block_size, cfg.next_n),
+            (512, 4, 2176, 64, e2a.resolved.raw_cfg.decode_next_n)
+        );
+        let t6 = build_front(cut_e_topk, &[]).unwrap();
+        let cfg = t6.resolved.topk_to_page_table.as_ref().unwrap();
+        assert_eq!(cfg.logits_row_stride.get() * 4, cfg.max_model_len.get());
+        assert_eq!(cfg.context_mode, "uniform_measured");
+    }
+
+    /// Both page-table cuts at once would bill the decode page table twice.
+    #[test]
+    fn page_table_cuts_are_exclusive() {
+        let both = Glm53DsaFront {
+            topk_page_table: Some("e2a_kernel"),
+            topk_to_page_table: Some("t6_kernel"),
+            ..Default::default()
+        };
+        assert!(matches!(
+            build_front(both, &[]),
+            Err(BuildError::FitFailed { .. })
+        ));
     }
 
     /// Catches an fp32-split cut A that prices the wrong width or split, or

@@ -20,6 +20,8 @@ pub mod dsa_mqa_logits_prefill;
 pub mod dsa_paged_mqa_logits_decode;
 pub mod dsa_persistent_topk_decode;
 pub mod dsa_pooled_index_cache_update;
+pub mod dsa_pooled_logits_page_table;
+pub mod dsa_pooled_topk_page_table;
 pub mod dsa_sparse_index_remap;
 pub mod dsa_sparse_mla_attention;
 pub mod dsa_sparse_mla_prefill;
@@ -182,6 +184,14 @@ pub use dsa_persistent_topk_decode::{
 pub use dsa_pooled_index_cache_update::{
     DsaPooledIndexCacheUpdateKernel, DsaPooledIndexCacheUpdateKernelConfig,
     DsaPooledIndexCacheUpdateKernelInput, DsaPooledIndexCacheUpdateSpec,
+};
+pub use dsa_pooled_logits_page_table::{
+    DsaPooledLogitsPageTableKernel, DsaPooledLogitsPageTableKernelConfig,
+    DsaPooledLogitsPageTableKernelInput, DsaPooledLogitsPageTableSpec,
+};
+pub use dsa_pooled_topk_page_table::{
+    DsaPooledTopkPageTableKernel, DsaPooledTopkPageTableKernelConfig,
+    DsaPooledTopkPageTableKernelInput, DsaPooledTopkPageTableSpec,
 };
 pub use dsa_sparse_index_remap::{
     DsaSparseIndexRemapKernel, DsaSparseIndexRemapKernelConfig, DsaSparseIndexRemapKernelInput,

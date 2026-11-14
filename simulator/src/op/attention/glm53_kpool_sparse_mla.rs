@@ -88,6 +88,9 @@ pub struct Glm53KpoolSparseMlaInput {
     /// Another launch writes the new rows (a fused state writer): the
     /// `mla_cache_append` slot bills nothing.
     pub cache_append_elsewhere: bool,
+    /// Another launch builds the decode rows' page table (a fused post-top-k
+    /// kernel): the `index_remap` slot bills only the prefill rows.
+    pub decode_remap_elsewhere: bool,
 }
 
 pub struct Glm53KpoolSparseMlaOp {
@@ -410,15 +413,22 @@ fn derive_shape(
         num_rows += 1;
         total_valid_count += u64::from(pooled_valid_count(context, index_topk, index_kpool));
     }
+    let (mut remap_rows, mut remap_valid) = if input.decode_remap_elsewhere {
+        (0, 0)
+    } else {
+        (num_rows, total_valid_count)
+    };
     for (request, &(num_queries, context)) in input.prefill_query_cache_pairs.iter().enumerate() {
         if num_queries == 0 || num_queries > context {
             return Err(format!(
                 "prefill request {request} requires 0 < Q <= S, got ({num_queries}, {context})"
             ));
         }
+        let valid = pooled_valid_total(context - num_queries + 1, context, index_topk, index_kpool);
         num_rows += u64::from(num_queries);
-        total_valid_count +=
-            pooled_valid_total(context - num_queries + 1, context, index_topk, index_kpool);
+        total_valid_count += valid;
+        remap_rows += u64::from(num_queries);
+        remap_valid += valid;
     }
     let num_rows =
         u32::try_from(num_rows).map_err(|_| "query-row count exceeds u32".to_string())?;
@@ -438,9 +448,10 @@ fn derive_shape(
     Ok(Shape {
         num_rows,
         prefill,
-        remap: (num_rows > 0).then_some(DsaSparseIndexRemapKernelInput {
-            num_queries: num_rows,
-            total_valid_count,
+        remap: (remap_rows > 0).then_some(DsaSparseIndexRemapKernelInput {
+            num_queries: u32::try_from(remap_rows)
+                .map_err(|_| "remap row count exceeds u32".to_string())?,
+            total_valid_count: remap_valid,
             workspace_query_rows: 0,
         }),
         decode,

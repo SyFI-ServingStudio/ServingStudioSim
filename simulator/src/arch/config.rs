@@ -1700,14 +1700,22 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         dsa_state_writer_backend: Option<String>,
-        /// Not a fork path: DSA indexer back cut E (post-top-k), the top-k
-        /// output to the final physical page table and valid counts in one
-        /// kernel (pool expand, top-k buffer fill, pool ids to int64, seq lens
-        /// + 1, buffer copy and the index remap), priced by this backend's
-        /// `dsa_sparse_index_remap` rows.
+        /// Not a fork path: DSA indexer back cut E (post-top-k), the decode
+        /// rows' selected pools to the final physical page table and valid
+        /// counts in one kernel (pool expand, top-k buffer fill, pool ids to
+        /// int64, seq lens + 1, buffer copy and the index remap), priced by
+        /// this backend's `dsa_pooled_topk_page_table` rows.
         #[serde(default)]
         #[param(cache_key)]
         dsa_topk_page_table_backend: Option<String>,
+        /// Not a fork path: cut E with the decode top-k, the indexer logits
+        /// to the final page table in one kernel (absorbs the decode top-k and
+        /// everything cut E absorbs), priced by this backend's
+        /// `dsa_pooled_logits_page_table` rows. Exclusive with
+        /// `dsa_topk_page_table_backend`.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_topk_to_page_table_backend: Option<String>,
         #[serde(default = "default_glm53_flash_max_model_len")]
         #[param(default = 8192, cache_key)]
         max_model_len: u32,
@@ -2013,14 +2021,22 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         dsa_state_writer_backend: Option<String>,
-        /// Not a fork path: DSA indexer back cut E (post-top-k), the top-k
-        /// output to the final physical page table and valid counts in one
-        /// kernel (pool expand, top-k buffer fill, pool ids to int64, seq lens
-        /// + 1, buffer copy and the index remap), priced by this backend's
-        /// `dsa_sparse_index_remap` rows.
+        /// Not a fork path: DSA indexer back cut E (post-top-k), the decode
+        /// rows' selected pools to the final physical page table and valid
+        /// counts in one kernel (pool expand, top-k buffer fill, pool ids to
+        /// int64, seq lens + 1, buffer copy and the index remap), priced by
+        /// this backend's `dsa_pooled_topk_page_table` rows.
         #[serde(default)]
         #[param(cache_key)]
         dsa_topk_page_table_backend: Option<String>,
+        /// Not a fork path: cut E with the decode top-k, the indexer logits
+        /// to the final page table in one kernel (absorbs the decode top-k and
+        /// everything cut E absorbs), priced by this backend's
+        /// `dsa_pooled_logits_page_table` rows. Exclusive with
+        /// `dsa_topk_page_table_backend`.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_topk_to_page_table_backend: Option<String>,
         /// How the mHC post/pre boundaries are priced
         /// ([`crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::MhcBoundary`]).
         #[serde(default)]
@@ -2498,6 +2514,7 @@ impl IterArchSel {
             dsa_q_absorb_fp8_backend,
             dsa_state_writer_backend,
             dsa_topk_page_table_backend,
+            dsa_topk_to_page_table_backend,
             ..
         } = self
         else {
@@ -2539,12 +2556,22 @@ impl IterArchSel {
             Some(b) if b.is_empty() => anyhow::bail!("{param}: empty backend name"),
             other => Ok(other.as_deref().map(intern_backend)),
         };
+        if dsa_topk_page_table_backend.is_some() && dsa_topk_to_page_table_backend.is_some() {
+            anyhow::bail!(
+                "dsa_topk_page_table_backend and dsa_topk_to_page_table_backend both price the decode \
+                 page table (cut E, and cut E with the top-k); set one"
+            );
+        }
         Ok(Glm53DsaFront {
             hidden_gemm: gemm("dsa_hidden_gemm", *dsa_hidden_gemm, dsa_hidden_gemm_backend)?,
             q_lora_gemm: gemm("dsa_q_lora_gemm", *dsa_q_lora_gemm, dsa_q_lora_gemm_backend)?,
             q_absorb_fp8: named("dsa_q_absorb_fp8_backend", dsa_q_absorb_fp8_backend)?,
             state_writer: named("dsa_state_writer_backend", dsa_state_writer_backend)?,
             topk_page_table: named("dsa_topk_page_table_backend", dsa_topk_page_table_backend)?,
+            topk_to_page_table: named(
+                "dsa_topk_to_page_table_backend",
+                dsa_topk_to_page_table_backend,
+            )?,
             glue: match dsa_glue {
                 DsaGluePricing::Placeholder => DsaGlue::Placeholder,
                 DsaGluePricing::ForkLaunchList => DsaGlue::ForkLaunchList,
@@ -2750,6 +2777,7 @@ mod iter_tests {
         assert_eq!(fused.q_lora_gemm, crate::worklet::DsaFrontGemm::Concat);
         assert_eq!(fused.state_writer, Some("cut_d"));
         assert_eq!(fused.topk_page_table, Some("cut_e"));
+        assert_eq!(fused.topk_to_page_table, None);
         assert_eq!(fused.glue, crate::worklet::DsaGlue::ForkLaunchList);
         // Cut B lite: a dsa_q_lora_gemm mode that needs its epilogue backend.
         let lite = front(serde_json::json!({
@@ -2766,6 +2794,27 @@ mod iter_tests {
             "dsa_hidden_gemm": "concat_hadamard_epilogue", "dsa_hidden_gemm_backend": "post_b",
         }))
         .is_err());
+        let fused_topk = front(serde_json::json!({"dsa_topk_to_page_table_backend": "cut_e_topk"}))
+            .unwrap();
+        assert_eq!(fused_topk.topk_to_page_table, Some("cut_e_topk"));
+        assert_eq!(fused_topk.topk_page_table, None);
+    }
+
+    /// Cut E and cut E with the top-k build the same decode page table: both
+    /// at once would bill it twice, so the config fails loud.
+    #[test]
+    fn dsa_page_table_cuts_are_exclusive() {
+        let sel: IterArchSel = serde_json::from_value(serde_json::json!({
+            "type": "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+            "model_config": "model/config/glm53_flash_nvfp4.json",
+            "fp8": false,
+            "ep_size": 8,
+            "dsa_topk_page_table_backend": "cut_e",
+            "dsa_topk_to_page_table_backend": "cut_e_topk",
+        }))
+        .unwrap();
+        let err = sel.glm53_flash_fusions().map(|f| f.dsa_front).unwrap_err();
+        assert!(err.to_string().contains("set one"), "{err}");
     }
 
     #[test]
