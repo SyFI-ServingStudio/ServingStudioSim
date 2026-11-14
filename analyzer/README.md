@@ -260,6 +260,25 @@ Current catalog:
 `alignment-timeline` runs with `alignment-iteration` in the kernel-align phase; it
 reads exactly what its sibling reads, so it needs no new artifact.
 
+**Sampled or absent `cost_log`.** A run's `io.cost_log_mode`
+(`run_meta.json` `cost_log`, read by `io::read_cost_log_coverage`) decides what
+the `cost_log` subjects can say:
+
+- `full` (and every run without the field): as above.
+- `stride` (1 in `N` iterations logged): `utilization`, `batch`,
+  `kernel-throughput`, `kernel-input-distribution`, `kernel-time-share` and
+  `optimality` run on the logged iterations, weight run-wide sums (busy time,
+  kernel time, invocation counts, necessary work, locked-shape occurrences) by
+  `N`, align their own `iter_id % stride` samples to multiples of `N`, and carry
+  `cost_log_sampling` (`mode`, `stride_iterations`, `caveat`) in the report and
+  the payload `meta`. Shares and ratios are estimates with sampling error.
+  `workload-conservation` and `alignment-workload` need every iteration and are
+  unavailable with that reason. `trace` and `gen-iter-breakdown` print the
+  caveat and show logged iterations only.
+- `off`: every `cost_log` subject is unavailable with reason "cost_log not
+  written: the run set io.cost_log_mode: off"; request, throughput,
+  concurrency and KV subjects are unaffected.
+
 Both of them shard. A real 2,040-iteration capture holds hundreds of megabytes of
 per-kernel detail — past what a browser can parse as one string, for views that
 draw one iteration at a time. So each payload is an INDEX (one summary row per

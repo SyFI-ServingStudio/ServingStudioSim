@@ -97,11 +97,15 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "full-run vLLM metrics contain no workload iterations"
     );
 
+    let coverage = crate::io::read_cost_log_coverage(simulation_log_dir);
     if !register_cost_log(ctx, simulation_log_dir).await? {
         return Ok(unavailable_pair(
             log_dir,
-            "simulation cost_log/ dir not found",
+            &format!("simulation {}", coverage.absent_reason()),
         ));
+    }
+    if let Some(reason) = coverage.needs_every_iteration_reason() {
+        return Ok(unavailable_pair(log_dir, &format!("simulation {reason}")));
     }
     require_columns(ctx, COST_LOG_TABLE, COST_COLUMNS).await?;
     let simulated = read_simulated_points(ctx).await?;

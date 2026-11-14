@@ -383,7 +383,12 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     )?;
     // Run-level GPU facts sidecar (L7): written before the tick loop so the
     // analyzer can normalize per-GPU even if the run later fails.
-    simulator::log::write_run_meta(log_dir, &flow.cluster().borrow(), cfg.stage_vocab())?;
+    simulator::log::write_run_meta(
+        log_dir,
+        &flow.cluster().borrow(),
+        cfg.stage_vocab(),
+        cfg.io().cost_log_policy()?,
+    )?;
     simulator::log::write_kv_cache(log_dir, &flow.cluster().borrow())?;
     let summary = run_sim(flow.as_mut(), &store, &mut frontend, &mut logger, &tick_cfg)?;
     // run_sim emits the stats summary (completed/throughput/wall) to the log;

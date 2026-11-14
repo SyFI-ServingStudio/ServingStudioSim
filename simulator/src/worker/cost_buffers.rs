@@ -28,7 +28,7 @@ use crate::arch::contract::{
     SpeculativeUnifiedModel, UnifiedArchInput,
 };
 use crate::common::{Time, WorkerId};
-use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
+use crate::log::{CostLogEntry, CostLogPolicy, CostLogger, GroupInputLog};
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
 
 /// Upper bound on distinct cached section results per worker. AFD attn keys churn
@@ -106,6 +106,8 @@ pub struct CostBuffers {
     /// the writer at construction degrades to `None` (with a warn) so the sim
     /// still runs.
     logger: Option<CostLogger>,
+    /// Which iterations write a row while `logger` is attached.
+    policy: CostLogPolicy,
     /// Content-addressed cache of per-section eval results, keyed by the packed
     /// section name + the arch input's [`cost_signature`](GroupLogSource::cost_signature).
     /// AFD is layer-homogeneous (every layer re-evaluates the same section on the
@@ -127,18 +129,20 @@ pub struct CostBuffers {
 
 impl CostBuffers {
     /// Build the buffer set, opening the cost-log writer if a `log_dir` was
-    /// configured. An open failure logs a warning and disables logging — never
-    /// aborts the sim. `pool_tag` names the writer stream (e.g. PD's `prefill` /
+    /// configured and `policy` writes one. An open failure logs a warning and
+    /// disables logging — never aborts the sim. `policy` picks which iterations
+    /// write rows; it never changes the returned times. `pool_tag` names the writer stream (e.g. PD's `prefill` /
     /// `decode`, AFD's `attn` / `ffn`, the offline `predict`); the per-row
     /// `section` field — not `pool_tag` — distinguishes building blocks.
     pub fn new(
         log_dir: Option<PathBuf>,
+        policy: CostLogPolicy,
         pool_tag: &'static str,
         worker_id: WorkerId,
         manifest: &CostManifestDoc,
         gpu_time_multiplier: f64,
     ) -> Self {
-        let logger = match log_dir {
+        let logger = match log_dir.filter(|_| policy.writes()) {
             Some(dir) => match CostLogger::open(&dir, pool_tag, worker_id, manifest) {
                 Ok(logger) => Some(logger),
                 Err(e) => {
@@ -155,6 +159,7 @@ impl CostBuffers {
             groups: Vec::new(),
             worker_id,
             logger,
+            policy,
             cache: HashMap::default(),
             key_scratch: Vec::new(),
             gpu_time_multiplier,
@@ -177,6 +182,7 @@ impl CostBuffers {
     /// with `CostManifestDoc::single("iter", model.cost_log_manifest())`.
     pub fn new_iter<M: IterwiseUnifiedModel + ?Sized>(
         log_dir: Option<PathBuf>,
+        policy: CostLogPolicy,
         pool_tag: &'static str,
         worker_id: WorkerId,
         model: &M,
@@ -184,6 +190,7 @@ impl CostBuffers {
     ) -> Self {
         Self::new(
             log_dir,
+            policy,
             pool_tag,
             worker_id,
             &CostManifestDoc::single("iter", model.cost_log_manifest()),
@@ -263,6 +270,7 @@ impl CostBuffers {
             Option<&mut Vec<SlotInput>>,
         ) -> LeafMetrics,
     {
+        let logs_row = self.policy.logs_iteration(iter_id);
         // Build the key (packed section name + the caller's small identity) and try a
         // hit. Reuses `key_scratch`, so a hit allocates nothing.
         if let Some(ck) = cache_key {
@@ -285,7 +293,7 @@ impl CostBuffers {
             // from the snapshot — so the row is byte-identical to a fresh eval's.
             if let Some(snap) = self.cache.get(self.key_scratch.as_slice()) {
                 let agg = snap.agg;
-                if let Some(logger) = self.logger.as_mut() {
+                if let Some(logger) = self.logger.as_mut().filter(|_| logs_row) {
                     groups.fill_group_log(&mut self.groups);
                     let entry = CostLogEntry {
                         worker_id: self.worker_id.0,
@@ -312,14 +320,16 @@ impl CostBuffers {
 
         // Miss (or un-cached): evaluate, write the row. Capture per-leaf inputs only on
         // the path that will actually write the row — the `*_with_inputs` clone per leaf
-        // is part of the cost_log contract, so we don't pay it when no logger is attached.
-        let capture = self.logger.is_some();
+        // is part of the cost_log contract, so we don't pay it when no row is written.
+        // A cached section still captures under a logger: a later hit may land on a
+        // logged iteration and must replay the inputs with the result.
+        let capture = self.logger.is_some() && (logs_row || cache_key.is_some());
         let agg = eval(
             &mut self.slots,
             &mut self.scratch,
             capture.then_some(&mut self.slot_inputs),
         );
-        if let Some(logger) = self.logger.as_mut() {
+        if let Some(logger) = self.logger.as_mut().filter(|_| logs_row) {
             groups.fill_group_log(&mut self.groups);
             let entry = CostLogEntry {
                 worker_id: self.worker_id.0,
@@ -586,7 +596,7 @@ mod tests {
     use std::cell::Cell;
     use std::fs::File;
 
-    use arrow_array::{Float64Array, Int16Array};
+    use arrow_array::{Float64Array, Int16Array, UInt64Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use tempfile::tempdir;
 
@@ -637,7 +647,14 @@ mod tests {
     /// distinct key or a distinct section misses; `None` never caches.
     #[test]
     fn cache_hit_skips_eval_and_returns_cached_agg() {
-        let mut cost = CostBuffers::new(None, "attn", WorkerId(0), &trivial_manifest(), 1.0);
+        let mut cost = CostBuffers::new(
+            None,
+            CostLogPolicy::Full,
+            "attn",
+            WorkerId(0),
+            &trivial_manifest(),
+            1.0,
+        );
         let a = vec![grp(&[10, 11])];
         let b = vec![grp(&[10, 12])];
         let (ka, kb) = ([7u32], [8u32]); // cheap caller identities (e.g. iter/slot)
@@ -714,7 +731,14 @@ mod tests {
     /// hit replays the same scaled wall Time.
     #[test]
     fn gpu_time_multiplier_scales_returned_wall_time() {
-        let mut cost = CostBuffers::new(None, "attn", WorkerId(0), &trivial_manifest(), 2.0);
+        let mut cost = CostBuffers::new(
+            None,
+            CostLogPolicy::Full,
+            "attn",
+            WorkerId(0),
+            &trivial_manifest(),
+            2.0,
+        );
         let a = vec![grp(&[10, 11])];
         let now = Time::from_ms(0.0);
         // kernel-folded time = 2.5ms; wall = 2.5 × 2.0 = 5.0ms.
@@ -764,13 +788,27 @@ mod tests {
         mixed.groups[0].batch_tokens += 512;
         let now = Time::from_ms(0.0);
 
-        let mut staged = CostBuffers::new(None, "iter", WorkerId(0), &trivial_manifest(), 1.25)
-            .with_prefill_gpu_time_multiplier(Some(1.5));
+        let mut staged = CostBuffers::new(
+            None,
+            CostLogPolicy::Full,
+            "iter",
+            WorkerId(0),
+            &trivial_manifest(),
+            1.25,
+        )
+        .with_prefill_gpu_time_multiplier(Some(1.5));
         assert_eq!(staged.run_iter(&model, &decode, 0, now).as_ms(), 2.5);
         assert_eq!(staged.run_iter(&model, &mixed, 1, now).as_ms(), 3.0);
 
-        let mut single = CostBuffers::new(None, "iter", WorkerId(0), &trivial_manifest(), 1.25)
-            .with_prefill_gpu_time_multiplier(None);
+        let mut single = CostBuffers::new(
+            None,
+            CostLogPolicy::Full,
+            "iter",
+            WorkerId(0),
+            &trivial_manifest(),
+            1.25,
+        )
+        .with_prefill_gpu_time_multiplier(None);
         assert_eq!(single.run_iter(&model, &decode, 0, now).as_ms(), 2.5);
         assert_eq!(single.run_iter(&model, &mixed, 1, now).as_ms(), 2.5);
     }
@@ -822,8 +860,15 @@ mod tests {
         mixed.groups[0].batch_tokens += 512;
         let now = Time::from_ms(0.0);
 
-        let mut staged = CostBuffers::new(None, "iter", WorkerId(0), &trivial_manifest(), 1.25)
-            .with_prefill_gpu_time_multiplier(Some(1.5));
+        let mut staged = CostBuffers::new(
+            None,
+            CostLogPolicy::Full,
+            "iter",
+            WorkerId(0),
+            &trivial_manifest(),
+            1.25,
+        )
+        .with_prefill_gpu_time_multiplier(Some(1.5));
         let model = TwoMsSpeculativeModel;
         assert_eq!(
             staged.run_speculative_iter(&model, &decode, 0, now).as_ms(),
@@ -843,6 +888,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut cost = CostBuffers::new(
             Some(dir.path().to_path_buf()),
+            CostLogPolicy::Full,
             "attn",
             WorkerId(0),
             &trivial_manifest(),
@@ -902,5 +948,131 @@ mod tests {
             "hit re-logs the cached time"
         );
         assert!((ttm.value(2) - 3.0).abs() < 1e-9);
+    }
+
+    fn logged_iter_ids(dir: &std::path::Path) -> Vec<u64> {
+        let path = dir.join("raw/cost_log/worker_attn_0.parquet");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut ids = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let column = batch
+                .column_by_name("iter_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .clone();
+            ids.extend(column.values().iter().copied());
+        }
+        ids
+    }
+
+    /// Under `stride`, only iterations whose id is a multiple of the stride write
+    /// rows, while every call still returns its full time. Inputs are captured for
+    /// a logged row, and for a cached section on any iteration (a later logged hit
+    /// replays them), but not for an unlogged, uncached eval.
+    #[test]
+    fn stride_logs_only_multiples_and_keeps_inputs_for_cached_hits() {
+        let dir = tempdir().unwrap();
+        let mut cost = CostBuffers::new(
+            Some(dir.path().to_path_buf()),
+            CostLogPolicy::Stride {
+                iterations: std::num::NonZeroU32::new(2).unwrap(),
+            },
+            "attn",
+            WorkerId(0),
+            &trivial_manifest(),
+            1.0,
+        );
+        let a = vec![grp(&[10, 11])];
+        let now = Time::from_ms(0.0);
+        let mut captured = Vec::new();
+        let mut total = Time::from_ms(0.0);
+        for iter_id in 0..5u64 {
+            total += cost.run_section(
+                "attn",
+                -1,
+                iter_id,
+                0,
+                &a,
+                None,
+                now,
+                |slots, _sc, inputs| {
+                    captured.push((iter_id, inputs.is_some()));
+                    slots.clear();
+                    slots.push(leaf(1.0));
+                    leaf(1.0)
+                },
+            );
+        }
+        assert!(
+            (total.as_ms() - 5.0).abs() < 1e-9,
+            "every iteration is timed"
+        );
+        assert_eq!(
+            captured,
+            vec![(0, true), (1, false), (2, true), (3, false), (4, true)]
+        );
+        // Iteration 5 misses the cache unlogged (still captures), 6 hits it logged.
+        let key = [9u32];
+        let mut cached_capture = None;
+        cost.run_section(
+            "attn",
+            0,
+            5,
+            0,
+            &a,
+            Some(&key),
+            now,
+            |slots, _sc, inputs| {
+                cached_capture = Some(inputs.is_some());
+                slots.clear();
+                slots.push(leaf(1.0));
+                leaf(1.0)
+            },
+        );
+        cost.run_section("attn", 0, 6, 0, &a, Some(&key), now, |_slots, _sc, _in| {
+            panic!("a repeated cache key must hit")
+        });
+        assert_eq!(cached_capture, Some(true));
+        drop(cost);
+        assert_eq!(logged_iter_ids(dir.path()), vec![0, 2, 4, 6]);
+    }
+
+    /// `off` opens no writer: no `cost_log` and no `cost_manifest` appear.
+    #[test]
+    fn off_writes_no_cost_log_or_manifest() {
+        let dir = tempdir().unwrap();
+        let mut cost = CostBuffers::new(
+            Some(dir.path().to_path_buf()),
+            CostLogPolicy::Off,
+            "attn",
+            WorkerId(0),
+            &trivial_manifest(),
+            1.0,
+        );
+        let a = vec![grp(&[10, 11])];
+        let time = cost.run_section(
+            "attn",
+            -1,
+            0,
+            0,
+            &a,
+            None,
+            Time::from_ms(0.0),
+            |slots, _sc, inputs| {
+                assert!(inputs.is_none());
+                slots.clear();
+                leaf(2.0)
+            },
+        );
+        drop(cost);
+        assert!((time.as_ms() - 2.0).abs() < 1e-9);
+        assert!(!dir.path().join("raw/cost_log").exists());
+        assert!(!dir.path().join("raw/cost_manifest").exists());
     }
 }

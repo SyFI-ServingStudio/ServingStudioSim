@@ -22,7 +22,7 @@ pub mod run_meta;
 pub mod schemas;
 pub mod session;
 
-pub use cost_logger::{cost_log_failures, CostLogger};
+pub use cost_logger::{cost_log_failures, CostLogPolicy, CostLogger};
 pub use kv_cache::{kv_cache_document, kv_cache_text, write_kv_cache};
 pub use kv_sampler::{KvSampler, KvSubmit};
 pub use network_logger::NetworkLogger;

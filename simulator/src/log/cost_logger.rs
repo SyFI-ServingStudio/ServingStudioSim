@@ -13,6 +13,7 @@
 //! `cost_log/worker_<pool>_<id>.error`, which the run driver turns into a failed
 //! run once the workers are dropped ([`cost_log_failures`]).
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::thread::JoinHandle;
@@ -27,6 +28,54 @@ use crate::log::rows::{cost_to_record_batches, CostLogChunk, CostLogEntry, Group
 use crate::log::schemas::cost_log_schema;
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
 use parquet::schema::types::ColumnPath;
+
+/// Which iterations a run writes to `cost_log` (`io.cost_log_mode`, validated
+/// by [`IoSpec::cost_log_policy`](crate::deployment::config::IoSpec::cost_log_policy)).
+/// The simulated timeline never depends on it; only the rows written do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CostLogPolicy {
+    /// Every iteration (and every AFD section of it) writes a row.
+    #[default]
+    Full,
+    /// Only iterations whose `iter_id` is a multiple of `iterations` write
+    /// rows, all of their sections included, so a logged iteration is whole.
+    Stride { iterations: NonZeroU32 },
+    /// No `cost_log` stream and no `cost_manifest` sidecar.
+    Off,
+}
+
+impl CostLogPolicy {
+    /// Whether this policy opens a cost-log writer at all.
+    pub fn writes(self) -> bool {
+        !matches!(self, CostLogPolicy::Off)
+    }
+
+    /// Whether iteration `iter_id` writes its rows.
+    pub fn logs_iteration(self, iter_id: u64) -> bool {
+        match self {
+            CostLogPolicy::Full => true,
+            CostLogPolicy::Stride { iterations } => iter_id % u64::from(iterations.get()) == 0,
+            CostLogPolicy::Off => false,
+        }
+    }
+
+    /// The `io.cost_log_mode` spelling, as recorded in `run_meta.json`.
+    pub fn mode_name(self) -> &'static str {
+        match self {
+            CostLogPolicy::Full => "full",
+            CostLogPolicy::Stride { .. } => "stride",
+            CostLogPolicy::Off => "off",
+        }
+    }
+
+    /// The stride width, `None` outside `stride`.
+    pub fn stride_iterations(self) -> Option<u32> {
+        match self {
+            CostLogPolicy::Stride { iterations } => Some(iterations.get()),
+            _ => None,
+        }
+    }
+}
 
 /// Most rows in one chunk handed to the writer thread.
 const STREAM_FLUSH_ROWS: usize = 8_192;

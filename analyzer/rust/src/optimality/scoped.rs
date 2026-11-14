@@ -284,7 +284,12 @@ pub(crate) async fn compute_scoped(
     let manifests = read_cost_manifests(log_dir)?;
     let selection = resolve_selection(&selector, &manifests)?;
     let hardware = load_hardware_inputs(log_dir, &selection);
-    let measured = measure_scope(ctx, &selection, &manifests, &hardware).await?;
+    let mut measured = measure_scope(ctx, &selection, &manifests, &hardware).await?;
+    // A sampled cost log (`io.cost_log_mode: stride`) holds 1 in N iterations;
+    // every GPU-second rung below sums logged rows, so each stands for N.
+    let coverage = crate::io::read_cost_log_coverage(log_dir);
+    measured.r0_gpu_s *= coverage.weight();
+    measured.r5_gpu_s *= coverage.weight();
 
     let mut rungs = BTreeMap::new();
     rungs.insert(
@@ -319,7 +324,9 @@ pub(crate) async fn compute_scoped(
         compute_semantic_floors(ctx, log_dir, &selection, &manifests, &hardware).await;
     let semantic_provenance;
     match semantic_result {
-        Ok(floors) => {
+        Ok(mut floors) => {
+            floors.r6_gpu_s *= coverage.weight();
+            floors.r7_gpu_s *= coverage.weight();
             rungs.insert(
                 "r6_segmented_necessary".to_owned(),
                 RungReport {
@@ -387,6 +394,7 @@ pub(crate) async fn compute_scoped(
                 "gpu_count_source": if hardware.defaulted_gpu_count { "default_one" } else { "run_meta.workers[].gpu_ids" }
             },
             "semantic": semantic_provenance,
+            "cost_log_sampling": coverage.sampling_note(),
             "global_rungs": "omitted because scheduler and cluster context are undefined for a CostTree subtree"
         }),
     };

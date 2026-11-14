@@ -319,6 +319,17 @@ real-time** after the watchdog fix below):
    `wall_start_ms + total_time_ms`, derivable; it was a high-entropy f64 that
    barely compressed, 6 MiB of a 19 MiB file).
 
+9. **KV decode advance in one jump**: `KvCacheStore::advance(scope, steps)` used
+   to loop `steps` times over the partition; a speculative decode accepts several
+   tokens per iteration, so this was per-token work. It now grows each decode by
+   its accepted tokens once (charges telescope; tests compare against stepwise).
+10. **`io.cost_log_mode`**: on GLM-5.3-Flash DFlash2 DP8 c256 (3600 s) writing the
+   per-iteration `cost_log` (960 MB, 1,220 slots per row) was about a third of
+   sim wall (40 s full vs 27-30 s stride 16 or off).
+   `stride` (`cost_log_stride_iterations: 16`) or `"off"` removes it without
+   changing any simulated number. Before profiling sim speed, check which mode
+   the run used — a `full` run's writer thread and slot capture dominate.
+
 After 6–8 the top sim-thread cost is `SimpleDpFlow::tick` (~29%, the 200M-tick
 orchestration) and per-iteration allocation (~14%, see dhat Step 4). The next
 structural lever is the fixed-tick count itself (coarser `tick_dt` / event-driven

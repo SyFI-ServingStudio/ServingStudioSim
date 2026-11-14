@@ -707,6 +707,10 @@ takes them off before dispatch): `--no-gpu`, and `--remote NAME` with repeatable
 - `--override path=value` patches the **nested** tree by dotted path
   (`io.log_dir`, `pools.main.groups.0.arch.tp_size`); the value is parsed as JSON
   when possible, else kept as a bare string.
+  For example, a sweep that reads only request metrics can drop the per-iteration
+  cost log with `--override io.cost_log_mode=off`, or keep 1 in 16 iterations with
+  `--override io.cost_log_mode=stride --override io.cost_log_stride_iterations=16`
+  (the same keys work under a preset's `io:`; see `simulator/src/log/README.md`).
 - `--dry-run` validates + expands + prints the resolved configs; spawns nothing.
 - `--cache-report` reports profile.db coverage per unique cache key, then exits.
 - `--kv-report` prints each KV pool's layout, what one request at `max_model_len`

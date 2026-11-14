@@ -19,6 +19,7 @@ use crate::batch;
 use crate::breakdown;
 use crate::concurrency;
 use crate::conservation;
+use crate::io::{read_cost_log_coverage, CostLogCoverage};
 use crate::kv;
 use crate::optimality;
 use crate::request;
@@ -70,6 +71,20 @@ pub enum Category {
 }
 
 impl Category {
+    /// Whether the category's subjects read `cost_log`, so a run that logged
+    /// only some iterations (`io.cost_log_mode: stride`) must say so in them.
+    fn reads_cost_log(self) -> bool {
+        matches!(
+            self,
+            Category::Utilization
+                | Category::Batch
+                | Category::Backend
+                | Category::Breakdown
+                | Category::Optimality
+                | Category::Conservation
+        )
+    }
+
     fn label(self) -> &'static str {
         match self {
             Category::Request => "request",
@@ -380,6 +395,40 @@ pub async fn run_subject(
     dir: &Path,
     options: RunOptions,
 ) -> Result<(Value, Value)> {
+    let (mut report, mut payload) = dispatch(name, ctx, dir, options).await?;
+    let reads_cost_log = SUBJECTS
+        .iter()
+        .any(|subject| subject.name == name && subject.category.reads_cost_log());
+    if reads_cost_log {
+        mark_cost_log_sampling(&mut report, &mut payload, read_cost_log_coverage(dir));
+    }
+    Ok((report, payload))
+}
+
+/// Stamp an available `cost_log` subject's report and payload with the sampling
+/// caveat when the run logged only some iterations. The subject itself already
+/// weighted its run-wide totals; this is what tells a reader they are estimates.
+fn mark_cost_log_sampling(report: &mut Value, payload: &mut Value, coverage: CostLogCoverage) {
+    let Some(note) = coverage.sampling_note() else {
+        return;
+    };
+    if report.get("available").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    if let Some(report) = report.as_object_mut() {
+        report.insert("cost_log_sampling".to_owned(), note.clone());
+    }
+    if let Some(meta) = payload.get_mut("meta").and_then(Value::as_object_mut) {
+        meta.insert("cost_log_sampling".to_owned(), note);
+    }
+}
+
+async fn dispatch(
+    name: &str,
+    ctx: &SessionContext,
+    dir: &Path,
+    options: RunOptions,
+) -> Result<(Value, Value)> {
     match name {
         "slo-general" => request::slo::run_slo_general(ctx, dir).await,
         "slo-detailed" => request::slo::run_slo_detailed(ctx, dir).await,
@@ -448,7 +497,29 @@ pub fn select(
 
 #[cfg(test)]
 mod tests {
-    use super::{artifact_names, RunOptions, SUBJECTS};
+    use super::{artifact_names, mark_cost_log_sampling, RunOptions, SUBJECTS};
+    use crate::io::CostLogCoverage;
+    use serde_json::json;
+
+    #[test]
+    fn a_stride_log_marks_available_reports_only() {
+        let stride = CostLogCoverage::Stride { iterations: 16 };
+        let mut report = json!({"available": true});
+        let mut payload = json!({"meta": {}});
+        mark_cost_log_sampling(&mut report, &mut payload, stride);
+        assert_eq!(report["cost_log_sampling"]["stride_iterations"], 16);
+        assert_eq!(payload["meta"]["cost_log_sampling"]["mode"], "stride");
+
+        let mut unavailable = json!({"available": false});
+        let mut payload = json!({"meta": {}});
+        mark_cost_log_sampling(&mut unavailable, &mut payload, stride);
+        assert!(unavailable.get("cost_log_sampling").is_none());
+
+        let mut full = json!({"available": true});
+        let mut payload = json!({"meta": {}});
+        mark_cost_log_sampling(&mut full, &mut payload, CostLogCoverage::Every);
+        assert!(full.get("cost_log_sampling").is_none());
+    }
 
     #[test]
     fn optimality_artifact_names_keep_both_batch_modes() {

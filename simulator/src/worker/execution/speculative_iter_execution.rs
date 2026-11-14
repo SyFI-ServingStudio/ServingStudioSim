@@ -228,6 +228,7 @@ mod tests {
     fn execution() -> SpeculativeIterExecution<FakeSpeculativeModel> {
         let cost = CostBuffers::new(
             None,
+            crate::log::CostLogPolicy::Full,
             "test",
             WorkerId(0),
             &CostManifestDoc::single("iter", FakeSpeculativeModel.cost_log_manifest()),
