@@ -128,9 +128,19 @@ pub enum DsaFrontGemmMode {
     /// Cut A only: an fp32-output GEMM over every column plus one row-split
     /// epilogue kernel on the `*_backend` param's backend.
     Fp32Split,
+    /// Cut B only: `concat`'s GEMM plus one epilogue kernel on the
+    /// `*_backend` param's backend that Hadamard-quantizes the indexer query
+    /// in place and scales the head weights.
+    ConcatHadamardEpilogue,
 }
 
-const DSA_FRONT_GEMM_MODES: [&str; 4] = ["separate", "concat", "fused", "fp32_split"];
+const DSA_FRONT_GEMM_MODES: [&str; 5] = [
+    "separate",
+    "concat",
+    "fused",
+    "fp32_split",
+    "concat_hadamard_epilogue",
+];
 
 /// Which launch list prices the DSA layer's elementwise glue (`dsa_glue`;
 /// worklet [`crate::worklet::DsaGlue`]).
@@ -1665,16 +1675,22 @@ pub enum IterArchSel {
         /// Not a fork path: DSA front cut B, the GEMMs reading the normed q
         /// latent. `concat`: `q_b_proj` and the indexer's `wq_b` as one bf16
         /// GEMM; `fused`: also the q norm, FWHT + quant and weight scale,
-        /// priced by `dsa_q_lora_gemm_backend`'s `single_gemm` rows.
+        /// priced by `dsa_q_lora_gemm_backend`'s `single_gemm` rows;
+        /// `concat_hadamard_epilogue`: `concat`'s GEMM plus one epilogue that
+        /// absorbs the FWHT + quant and weight scale (the q/kv norm stays),
+        /// priced by `dsa_q_lora_gemm_backend`'s
+        /// `hadamard_fp8_quant_weight_scale` rows.
         #[serde(default)]
         #[param(string, default = "separate", choices = DSA_FRONT_GEMM_MODES, cache_key)]
         dsa_q_lora_gemm: DsaFrontGemmMode,
-        /// `dsa_q_lora_gemm: fused` only (required there): its backend.
+        /// `dsa_q_lora_gemm: fused` or `concat_hadamard_epilogue` only
+        /// (required there): its backend (for the latter, the epilogue's).
         #[serde(default)]
         #[param(cache_key)]
         dsa_q_lora_gemm_backend: Option<String>,
         /// Not a fork path: DSA front cut C, `q_absorb` with the fp8 quant in
-        /// its epilogue, priced by this backend's `batched_gemm` rows.
+        /// its epilogue, priced by this backend's `batched_gemm_static_fp8_quant`
+        /// rows.
         #[serde(default)]
         #[param(cache_key)]
         dsa_q_absorb_fp8_backend: Option<String>,
@@ -1972,16 +1988,22 @@ pub enum IterArchSel {
         /// Not a fork path: DSA front cut B, the GEMMs reading the normed q
         /// latent. `concat`: `q_b_proj` and the indexer's `wq_b` as one bf16
         /// GEMM; `fused`: also the q norm, FWHT + quant and weight scale,
-        /// priced by `dsa_q_lora_gemm_backend`'s `single_gemm` rows.
+        /// priced by `dsa_q_lora_gemm_backend`'s `single_gemm` rows;
+        /// `concat_hadamard_epilogue`: `concat`'s GEMM plus one epilogue that
+        /// absorbs the FWHT + quant and weight scale (the q/kv norm stays),
+        /// priced by `dsa_q_lora_gemm_backend`'s
+        /// `hadamard_fp8_quant_weight_scale` rows.
         #[serde(default)]
         #[param(string, default = "separate", choices = DSA_FRONT_GEMM_MODES, cache_key)]
         dsa_q_lora_gemm: DsaFrontGemmMode,
-        /// `dsa_q_lora_gemm: fused` only (required there): its backend.
+        /// `dsa_q_lora_gemm: fused` or `concat_hadamard_epilogue` only
+        /// (required there): its backend (for the latter, the epilogue's).
         #[serde(default)]
         #[param(cache_key)]
         dsa_q_lora_gemm_backend: Option<String>,
         /// Not a fork path: DSA front cut C, `q_absorb` with the fp8 quant in
-        /// its epilogue, priced by this backend's `batched_gemm` rows.
+        /// its epilogue, priced by this backend's `batched_gemm_static_fp8_quant`
+        /// rows.
         #[serde(default)]
         #[param(cache_key)]
         dsa_q_absorb_fp8_backend: Option<String>,
@@ -2494,8 +2516,21 @@ impl IterArchSel {
                 (DsaFrontGemmMode::Fp32Split, _) if param != "dsa_hidden_gemm" => {
                     anyhow::bail!("{param}: fp32_split is a dsa_hidden_gemm mode")
                 }
-                (DsaFrontGemmMode::Fused | DsaFrontGemmMode::Fp32Split, _) => {
-                    anyhow::bail!("{param}: fused/fp32_split needs {param}_backend (the backend whose rows price it)")
+                (DsaFrontGemmMode::ConcatHadamardEpilogue, Some(b))
+                    if !b.is_empty() && param == "dsa_q_lora_gemm" =>
+                {
+                    DsaFrontGemm::ConcatHadamardEpilogue(intern_backend(b))
+                }
+                (DsaFrontGemmMode::ConcatHadamardEpilogue, _) if param != "dsa_q_lora_gemm" => {
+                    anyhow::bail!("{param}: concat_hadamard_epilogue is a dsa_q_lora_gemm mode")
+                }
+                (
+                    DsaFrontGemmMode::Fused
+                    | DsaFrontGemmMode::Fp32Split
+                    | DsaFrontGemmMode::ConcatHadamardEpilogue,
+                    _,
+                ) => {
+                    anyhow::bail!("{param}: fused/fp32_split/concat_hadamard_epilogue needs {param}_backend (the backend whose rows price it)")
                 }
                 (_, Some(_)) => anyhow::bail!("{param}_backend is for {param}: fused"),
             })
@@ -2716,6 +2751,21 @@ mod iter_tests {
         assert_eq!(fused.state_writer, Some("cut_d"));
         assert_eq!(fused.topk_page_table, Some("cut_e"));
         assert_eq!(fused.glue, crate::worklet::DsaGlue::ForkLaunchList);
+        // Cut B lite: a dsa_q_lora_gemm mode that needs its epilogue backend.
+        let lite = front(serde_json::json!({
+            "dsa_q_lora_gemm": "concat_hadamard_epilogue",
+            "dsa_q_lora_gemm_backend": "post_b",
+        }))
+        .unwrap();
+        assert_eq!(
+            lite.q_lora_gemm,
+            crate::worklet::DsaFrontGemm::ConcatHadamardEpilogue("post_b")
+        );
+        assert!(front(serde_json::json!({"dsa_q_lora_gemm": "concat_hadamard_epilogue"})).is_err());
+        assert!(front(serde_json::json!({
+            "dsa_hidden_gemm": "concat_hadamard_epilogue", "dsa_hidden_gemm_backend": "post_b",
+        }))
+        .is_err());
     }
 
     #[test]

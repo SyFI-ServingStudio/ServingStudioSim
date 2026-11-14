@@ -4,6 +4,7 @@ pub mod all_reduce;
 pub mod all_reduce_fusion;
 pub mod all_reduce_residual_rms_norm;
 pub mod batched_gemm;
+pub mod batched_gemm_static_fp8_quant;
 pub mod bf16_fused_moe;
 mod causal_rows;
 pub mod clamped_swiglu;
@@ -47,6 +48,7 @@ pub mod gemm_fp32_output;
 pub mod grouped_gemm;
 pub mod grouped_rms_norm;
 pub mod hadamard_fp8_quant;
+pub mod hadamard_fp8_quant_weight_scale;
 pub mod hc_combine;
 pub mod hc_combine_norm;
 pub mod hc_gate_mix;
@@ -222,6 +224,14 @@ pub use flashinfer_attn_prefill::{
 pub use flashinfer_attn_rect::{
     FlashinferAttnRectKernel, FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput,
     FlashinferAttnRectSpec,
+};
+pub use batched_gemm_static_fp8_quant::{
+    BatchedGemmStaticFp8QuantKernel, BatchedGemmStaticFp8QuantKernelConfig,
+    BatchedGemmStaticFp8QuantKernelInput, BatchedGemmStaticFp8QuantSpec,
+};
+pub use hadamard_fp8_quant_weight_scale::{
+    HadamardFp8QuantWeightScaleKernel, HadamardFp8QuantWeightScaleKernelConfig,
+    HadamardFp8QuantWeightScaleKernelInput, HadamardFp8QuantWeightScaleSpec,
 };
 pub use fp32_row_split_layer_norm::{
     Fp32RowSplitLayerNormKernel, Fp32RowSplitLayerNormKernelConfig,
