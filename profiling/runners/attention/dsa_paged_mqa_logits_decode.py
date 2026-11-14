@@ -334,13 +334,40 @@ def _paged_mqa_logits_entry_point(deep_gemm: Any) -> Any:
     return None
 
 
-def _stable_values(torch: Any, shape: tuple[int, ...], *, phase: int, device: str) -> Any:
-    total = 1
-    for dimension in shape:
-        total *= dimension
-    values = torch.arange(total, dtype=torch.int64, device=device)
-    values = ((values + phase) % 17 - 8).to(torch.float32) / 16.0
-    return values.reshape(shape)
+# Operand values. Keys and scales are drawn per token, queries and head weights
+# per row, from one seeded generator: a live indexer's logits are continuous,
+# with no repeated values. A page template copied into every page repeats each
+# logit once per page, so every row's top-k boundary is a tie of thousands of
+# equal values, which sends value-dependent consumers of these logits (the
+# decode top-k kernels) down their tie paths. The logits kernel's own time does
+# not depend on the values.
+_OPERAND_SEED = 0
+# fp32 per-token key scales: powers of two in [2^-2, 2^1], as a UE8M0 block
+# scale would give.
+_KEY_SCALE_EXPONENTS = (-2, 2)
+_HEAD_WEIGHT_STD = 0.25
+# Pages filled per step: 4096 pages of 64 x 128 keys is a 128 MiB fp32 source.
+_FILL_PAGES = 4096
+
+
+def _random_fp8(torch: Any, shape: tuple[int, ...], *, generator: Any, device: str) -> Any:
+    return torch.randn(shape, generator=generator, device=device).to(torch.float8_e4m3fn)
+
+
+def _fill_random_pages(torch: Any, key_view: Any, scale_view: Any, *, generator: Any) -> None:
+    """Fill every cache page with its own random E4M3 keys and fp32 scales, in place."""
+    num_pages = key_view.shape[0]
+    device = key_view.device
+    low, high = _KEY_SCALE_EXPONENTS
+    for start in range(0, num_pages, _FILL_PAGES):
+        pages = min(_FILL_PAGES, num_pages - start)
+        key_shape = (pages, *key_view.shape[1:])
+        key_view[start : start + pages].copy_(
+            _random_fp8(torch, key_shape, generator=generator, device=device)
+        )
+        scale_shape = (pages, *scale_view.shape[1:])
+        exponents = torch.randint(low, high, scale_shape, generator=generator, device=device)
+        scale_view[start : start + pages].copy_(torch.exp2(exponents.to(torch.float32)))
 
 
 def _page_views(
@@ -362,36 +389,6 @@ def _page_views(
     return key_view, scale_view
 
 
-def _cache_page_templates(
-    torch: Any,
-    *,
-    block_size: int,
-    head_dim: int,
-    device: str,
-) -> tuple[Any, Any]:
-    """Build deterministic page contents with storage independent of page count."""
-    key_template = _stable_values(
-        torch,
-        (block_size, head_dim),
-        phase=5,
-        device=device,
-    ).to(torch.float8_e4m3fn)
-    scale_template = (
-        0.75
-        + (
-            _stable_values(
-                torch,
-                (block_size,),
-                phase=13,
-                device=device,
-            )
-            + 0.5
-        )
-        / 4.0
-    )
-    return key_template, scale_template
-
-
 def _build_operands(
     torch: Any,
     *,
@@ -406,7 +403,7 @@ def _build_operands(
     context_mode: str = _CONTEXT_MODE,
     request_lens: tuple[int, ...] | None = None,
 ) -> _DsaPagedMqaLogitsDecodeOperands:
-    """Construct exact GLM operands and deterministic unique scattered pages.
+    """Construct exact GLM operands over seeded random values and unique scattered pages.
 
     Request b owns ``ceil(length[b] / block_size)`` pages; block-table columns
     past them stay 0 and are never read. ``request_lens`` replaces the
@@ -424,20 +421,17 @@ def _build_operands(
     referenced_page_count = sum(request_pages)
     num_pages = max(256, 2 * referenced_page_count + 1)
 
-    q = _stable_values(
+    generator = torch.Generator(device=device).manual_seed(_OPERAND_SEED)
+    q = _random_fp8(
         torch,
         (batch_size, next_n, num_heads, head_dim),
-        phase=1,
+        generator=generator,
         device=device,
-    ).to(torch.float8_e4m3fn)
-    weights = (
-        _stable_values(
-            torch,
-            (batch_size * next_n, num_heads),
-            phase=9,
-            device=device,
-        )
-        / 4.0
+    )
+    weights = _HEAD_WEIGHT_STD * torch.randn(
+        (batch_size * next_n, num_heads),
+        generator=generator,
+        device=device,
     )
     context_lens = (
         torch.tensor(request_lens, dtype=torch.int32, device=device)
@@ -479,17 +473,9 @@ def _build_operands(
         block_size=block_size,
         head_dim=head_dim,
     )
-    key_template, scale_template = _cache_page_templates(
-        torch,
-        block_size=block_size,
-        head_dim=head_dim,
-        device=device,
-    )
-    # Page counts reach O(10^6) at the largest grid points. Never construct
-    # page-sized int64/FP32 initialization ramps; copy_ broadcasts these small
-    # templates directly into the exact production cache allocation.
-    key_view.copy_(key_template)
-    scale_view.copy_(scale_template)
+    # Page counts reach O(10^6) at the largest grid points: fill in place, a
+    # bounded slab of pages at a time, with no page-sized source.
+    _fill_random_pages(torch, key_view, scale_view, generator=generator)
 
     return _DsaPagedMqaLogitsDecodeOperands(
         q=q,

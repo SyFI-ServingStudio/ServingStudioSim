@@ -145,6 +145,9 @@ const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_triton"];
 const HADAMARD_QUANT_BACKENDS: &[&str] = &["vllm_triton"];
+/// The fork's decode `QuantFP8` runs as a custom op (`CompilationMode.NONE`):
+/// one CUDA `static_scaled_fp8_quant` launch.
+const STATIC_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 const POOLED_INDEX_UPDATE_BACKENDS: &[&str] = &["vllm_fork_triton"];
 const FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_block_sm100"];
 /// vLLM passes `RoutingMethodType.DeepSeekV3` for this sigmoid + bias,
@@ -753,6 +756,7 @@ pub fn build_configs(
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
             hadamard_quant_backends: HADAMARD_QUANT_BACKENDS.to_vec(),
+            static_quant_backends: STATIC_QUANT_BACKENDS.to_vec(),
             pooled_index_update_backends: POOLED_INDEX_UPDATE_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             mla_layout_copies: parallel.kernel_path.mla_layout_copies,

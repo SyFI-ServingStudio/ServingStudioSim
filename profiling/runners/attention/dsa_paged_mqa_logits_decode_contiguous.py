@@ -11,8 +11,12 @@ from typing import Any
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
+    _HEAD_WEIGHT_STD,
+    _OPERAND_SEED,
     _check_deepgemm_launch_bounds,
+    _fill_random_pages,
     _key_passes,
+    _random_fp8,
 )
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
@@ -103,14 +107,6 @@ def _validate_args(
     return _max_ragged_context_lengths(batch_size, context_len)
 
 
-def _stable_values(torch: Any, shape: tuple[int, ...], phase: int, device: Any) -> Any:
-    element_count = 1
-    for dimension in shape:
-        element_count *= dimension
-    values = torch.arange(element_count, dtype=torch.int64, device=device)
-    return (((values + phase) % 17 - 8).to(torch.float32) / 16.0).reshape(shape)
-
-
 def _allocate_aligned_cache(
     torch: Any,
     *,
@@ -181,16 +177,13 @@ def _build_operands(
         head_dim=head_dim,
         device=device,
     )
-    key_template = _stable_values(torch, (block_size, 1, head_dim), 5, device).to(
-        torch.float8_e4m3fn
+    # Seeded random values, as the uniform-layout runner (no repeated logits).
+    generator = torch.Generator(device=device).manual_seed(_OPERAND_SEED)
+    q = _random_fp8(torch, (batch_size, next_n, num_heads, head_dim), generator=generator, device=device)
+    weights = _HEAD_WEIGHT_STD * torch.randn(
+        (batch_size * next_n, num_heads), generator=generator, device=device
     )
-    scale_template = 0.75 + _stable_values(torch, (block_size, 1), 13, device) / 8.0
-    key_view.copy_(key_template)
-    scale_view.copy_(scale_template)
-    q = _stable_values(torch, (batch_size, next_n, num_heads, head_dim), 1, device).to(
-        torch.float8_e4m3fn
-    )
-    weights = _stable_values(torch, (batch_size * next_n, num_heads), 9, device) / 4.0
+    _fill_random_pages(torch, key_view, scale_view, generator=generator)
     # Every next_n row of a request sees the request's context, as in the
     # uniform-layout runner.
     context_lens = (

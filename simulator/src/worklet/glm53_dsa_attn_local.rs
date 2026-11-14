@@ -53,8 +53,9 @@ use crate::timing::kernels::{
     BatchedGemmStaticFp8QuantKernelInput, DsaMqaLogitsPrefillKernel,
     DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput, DsaPagedMqaLogitsDecodeKernel,
     DsaPagedMqaLogitsDecodeKernelConfig, DsaPagedMqaLogitsDecodeKernelInput,
-    DsaPooledIndexCacheUpdateKernel, DsaPooledIndexCacheUpdateKernelConfig,
-    DsaPooledIndexCacheUpdateKernelInput,
+    DsaFp32SplitStateUpdateKernel, DsaFp32SplitStateUpdateKernelConfig,
+    DsaFp32SplitStateUpdateKernelInput, DsaPooledIndexCacheUpdateKernel,
+    DsaPooledIndexCacheUpdateKernelConfig, DsaPooledIndexCacheUpdateKernelInput,
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
     DsaPersistentTopkDecodeKernelInput, DsaPooledLogitsPageTableKernel,
     DsaPooledLogitsPageTableKernelConfig, DsaPooledLogitsPageTableKernelInput,
@@ -68,7 +69,8 @@ use crate::timing::kernels::{
     HadamardFp8QuantWeightScaleKernel, HadamardFp8QuantWeightScaleKernelConfig,
     HadamardFp8QuantWeightScaleKernelInput, QKvRmsNormKernel,
     QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    SingleGemmKernelInput, StaticFp8QuantKernel, StaticFp8QuantKernelConfig,
+    StaticFp8QuantKernelInput,
 };
 use crate::timing::slot_input::DsaIndexerPrefillLog;
 use crate::timing::{
@@ -124,6 +126,14 @@ pub enum DsaFrontGemm {
     /// the bf16 column groups and LayerNorms the indexer k
     /// (`fp32_row_split_layer_norm`). Absorbs what `Fused` absorbs.
     Fp32Split(&'static str),
+    /// Cut A only: `Fp32Split`'s GEMM, whose decode rows' epilogue is one
+    /// state-update kernel on this backend (`dsa_fp32_split_state_update`):
+    /// besides the row split it RMS-norms q and kv, appends the kv rows to the
+    /// FP8 MLA cache, casts the kpool positions and runs the kpool decode
+    /// update ([`SPLIT_STATE_WRITER_ABSORBS`]). Prefill rows keep `Fp32Split`'s
+    /// row split (also on this backend) and the fork's norm and cache append.
+    /// Exclusive with cut D.
+    Fp32SplitStateWriter(&'static str),
     /// Cut B only: `Concat`'s GEMM, plus one epilogue kernel on this backend
     /// that reads the indexer query heads in place from the concatenated
     /// output, Hadamard-rotates and FP8-quantizes them and scales the head
@@ -180,9 +190,17 @@ pub struct Glm53DsaFront {
     /// Cut E with the top-k (indexer back from the logits): the decode rows'
     /// top-k and the cut E page table in one kernel
     /// (`dsa_pooled_logits_page_table`), on this backend only. It absorbs the
-    /// decode top-k (persistent and cooperative) and everything cut E does;
-    /// the two cuts are exclusive.
+    /// decode top-k (persistent and cooperative) and everything cut E does.
+    /// Without [`Self::topk_to_page_table_max_pools`] the two cuts are
+    /// exclusive.
     pub topk_to_page_table: Option<&'static str>,
+    /// Dispatch by context: cut E + top-k runs only for decode launches whose
+    /// longest row has at most this many pools; longer launches run the
+    /// decode top-k and cut E (both backends set). Its threshold comes from a
+    /// 2048-value sample whose target rank shrinks with the row length, so on
+    /// long rows a row overshoots and takes a one-CTA exact fallback over the
+    /// whole row, and the launch waits for it.
+    pub topk_to_page_table_max_pools: Option<u32>,
     pub glue: DsaGlue,
 }
 
@@ -209,14 +227,54 @@ pub const TOPK_TO_PAGE_TABLE_ABSORBS: [&str; 7] = [
     "glue.topk_buffer_copy",
 ];
 
+/// The decode-row launches `Fp32SplitStateWriter` replaces beyond
+/// `Fp32Split` (worklet slot suffixes): both halves of the q/kv RMS norm, the
+/// MLA cache append, one of the fork glue's two position casts (G3, the kpool
+/// `dec_pos`; G5, the top-k seq lens, stays) and the kpool decode update.
+pub const SPLIT_STATE_WRITER_ABSORBS: [&str; 4] = [
+    "q_kv_a_norm",
+    "sparse_mla.mla_cache_append",
+    "glue.positions_to_int32",
+    "indexer.kpool_decode_update",
+];
+
+/// Which page-table cut a decode launch runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodePageTableCut {
+    /// The fork's top-k and post-top-k launches.
+    None,
+    /// Cut E after the decode top-k.
+    PageTable,
+    /// Cut E + top-k.
+    TopkToPageTable,
+}
+
 impl Glm53DsaFront {
-    /// The decode-row slots the page-table cuts bill zero (their own slot
-    /// prices them instead).
-    pub fn decode_slots_absorbed(self) -> &'static [&'static str] {
+    /// Cut A writes the decode rows' state in its epilogue.
+    fn split_state_writer(self) -> bool {
+        matches!(self.hidden_gemm, DsaFrontGemm::Fp32SplitStateWriter(_))
+    }
+
+    /// The cut a decode launch whose longest row has `longest_pools` pools
+    /// runs.
+    pub fn decode_page_table_cut(self, longest_pools: u32) -> DecodePageTableCut {
+        let fused_fits = self
+            .topk_to_page_table_max_pools
+            .is_none_or(|max_pools| longest_pools <= max_pools);
         match (self.topk_page_table, self.topk_to_page_table) {
-            (_, Some(_)) => &TOPK_TO_PAGE_TABLE_ABSORBS,
-            (Some(_), None) => &PAGE_TABLE_ABSORBS,
-            (None, None) => &[],
+            (_, Some(_)) if fused_fits => DecodePageTableCut::TopkToPageTable,
+            (Some(_), _) => DecodePageTableCut::PageTable,
+            _ => DecodePageTableCut::None,
+        }
+    }
+
+    /// The decode-row slots a launch of `longest_pools` pools bills zero (the
+    /// cut's own slot prices them instead).
+    pub fn decode_slots_absorbed(self, longest_pools: u32) -> &'static [&'static str] {
+        match self.decode_page_table_cut(longest_pools) {
+            DecodePageTableCut::TopkToPageTable => &TOPK_TO_PAGE_TABLE_ABSORBS,
+            DecodePageTableCut::PageTable => &PAGE_TABLE_ABSORBS,
+            DecodePageTableCut::None => &[],
         }
     }
 }
@@ -227,7 +285,10 @@ impl DsaFrontGemm {
     }
 
     fn fused(self) -> bool {
-        matches!(self, Self::Fused(_) | Self::Fp32Split(_))
+        matches!(
+            self,
+            Self::Fused(_) | Self::Fp32Split(_) | Self::Fp32SplitStateWriter(_)
+        )
     }
 
     /// The indexer query's FWHT quant and weight scale run inside the cut.
@@ -273,6 +334,8 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub index_remap_backends: Vec<&'static str>,
     /// The indexer query's Hadamard-128 + per-row UE8M0 FP8 quant.
     pub hadamard_quant_backends: Vec<&'static str>,
+    /// The absorbed query's static per-tensor FP8 quant (`QuantFP8`, CUDA).
+    pub static_quant_backends: Vec<&'static str>,
     /// The pooled indexer key cache's decode/verify update.
     pub pooled_index_update_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
@@ -339,7 +402,7 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub expand_pools: ElementwiseKernelConfig,
     pub q_absorb: BatchedGemmKernelConfig,
     pub q_concat: ElementwiseKernelConfig,
-    pub q_fp8_quant: ElementwiseKernelConfig,
+    pub q_fp8_quant: StaticFp8QuantKernelConfig,
     pub sparse_mla: Glm53KpoolSparseMlaConfig,
     pub output_copy: ElementwiseKernelConfig,
     pub v_up: BatchedGemmKernelConfig,
@@ -351,6 +414,9 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     /// Cut A as `Fp32Split`: the fp32-output GEMM and its row-split epilogue.
     pub hidden_gemm_fp32: Option<GemmFp32OutputKernelConfig>,
     pub hidden_row_split: Option<Fp32RowSplitLayerNormKernelConfig>,
+    /// Cut A as `Fp32SplitStateWriter`: the decode rows' state-update epilogue
+    /// (`hidden_row_split` then prices the prefill rows).
+    pub hidden_state_writer: Option<DsaFp32SplitStateUpdateKernelConfig>,
     /// Cut B as one GEMM (`front.q_lora_gemm` not `Separate`).
     pub q_lora_gemm: Option<SingleGemmKernelConfig>,
     /// Cut B as `ConcatHadamardEpilogue`: the indexer query epilogue.
@@ -413,7 +479,7 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub expand_pools: Op<ElementwiseKernel>,
     pub q_absorb: Op<BatchedGemmKernel>,
     pub q_concat: Op<ElementwiseKernel>,
-    pub q_fp8_quant: Op<ElementwiseKernel>,
+    pub q_fp8_quant: Op<StaticFp8QuantKernel>,
     pub sparse_mla: Glm53KpoolSparseMlaOp,
     pub output_copy: Op<ElementwiseKernel>,
     pub v_up: Op<BatchedGemmKernel>,
@@ -423,6 +489,7 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub hidden_gemm: Option<Op<SingleGemmKernel>>,
     pub hidden_gemm_fp32: Option<Op<GemmFp32OutputKernel>>,
     pub hidden_row_split: Option<Op<Fp32RowSplitLayerNormKernel>>,
+    pub hidden_state_writer: Option<Op<DsaFp32SplitStateUpdateKernel>>,
     pub q_lora_gemm: Option<Op<SingleGemmKernel>>,
     pub q_lora_epilogue: Option<Op<HadamardFp8QuantWeightScaleKernel>>,
     pub q_absorb_fp8: Option<Op<BatchedGemmStaticFp8QuantKernel>>,
@@ -475,8 +542,7 @@ impl Glm53DsaAttnLocalWorklet {
             dtype: bf16,
         };
         let max_model_len = Dim::param("max_model_len", cfg.max_model_len);
-        // The per-head latent query, bf16, and its FP8 copy with one fp32
-        // scale per head.
+        // The per-head latent query, bf16.
         let latent_q_bytes = heads * latent * bf16.size_bytes();
         let window = cfg.index_topk + kpool - 1;
         let mut resolved = Glm53DsaAttnLocalWorkletResolved {
@@ -600,7 +666,14 @@ impl Glm53DsaAttnLocalWorklet {
                 Q_CONCAT_EFFECTIVE_FACTOR * latent_q_bytes,
                 Q_CONCAT_EFFECTIVE_FACTOR * latent_q_bytes,
             ),
-            q_fp8_quant: ew(latent_q_bytes, heads * (latent + 4)),
+            // One static per-tensor quant over the token-major (B, N*L) query.
+            q_fp8_quant: StaticFp8QuantKernelConfig {
+                backends: cfg.static_quant_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_dim: (heads * latent).into(),
+                gated: false,
+                dtype: bf16,
+            },
             sparse_mla: Glm53KpoolSparseMlaConfig {
                 sparse_attention_backends: cfg.sparse_attention_backends.clone(),
                 mla_cache_append_backends: cfg.mla_cache_append_backends.clone(),
@@ -642,6 +715,7 @@ impl Glm53DsaAttnLocalWorklet {
             hidden_gemm: None,
             hidden_gemm_fp32: None,
             hidden_row_split: None,
+            hidden_state_writer: None,
             q_lora_gemm: None,
             q_lora_epilogue: None,
             q_absorb_fp8: None,
@@ -653,7 +727,9 @@ impl Glm53DsaAttnLocalWorklet {
         };
         let front = cfg.front;
         let front_gemm = |mode: DsaFrontGemm, concat_n: u32, fused_n: u32, k: Dim| match mode {
-            DsaFrontGemm::Separate | DsaFrontGemm::Fp32Split(_) => None,
+            DsaFrontGemm::Separate
+            | DsaFrontGemm::Fp32Split(_)
+            | DsaFrontGemm::Fp32SplitStateWriter(_) => None,
             DsaFrontGemm::Concat | DsaFrontGemm::ConcatHadamardEpilogue(_) => {
                 Some(gemm(concat_n, k))
             }
@@ -675,7 +751,9 @@ impl Glm53DsaAttnLocalWorklet {
             hidden_concat_n + index_heads,
             cfg.hidden.clone(),
         );
-        if let DsaFrontGemm::Fp32Split(backend) = front.hidden_gemm {
+        if let DsaFrontGemm::Fp32Split(backend) | DsaFrontGemm::Fp32SplitStateWriter(backend) =
+            front.hidden_gemm
+        {
             // [q_a | kv_a | k | gate score | head weights], 2,336 columns.
             resolved.hidden_gemm_fp32 = Some(GemmFp32OutputKernelConfig {
                 backends: cfg.fp32_gemm_backends.clone(),
@@ -691,6 +769,23 @@ impl Glm53DsaAttnLocalWorklet {
                 norm_cols: index_dim.into(),
                 bf16_trail_cols: index_dim.into(),
                 fp32_tail_cols: index_heads.into(),
+            });
+        }
+        if let DsaFrontGemm::Fp32SplitStateWriter(backend) = front.hidden_gemm {
+            // The same row as `hidden_row_split`; the pooled index update's
+            // geometry is `kpool_decode_update`'s.
+            let kpool_update = &resolved.kpool_decode_update;
+            resolved.hidden_state_writer = Some(DsaFp32SplitStateUpdateKernelConfig {
+                backends: vec![backend],
+                gpu_name: cfg.gpu_name.clone(),
+                next_n: cfg.decode_next_n,
+                q_lora_cols: cfg.q_lora_rank.clone(),
+                kv_lora_cols: cfg.kv_lora_rank.clone(),
+                index_dim: cfg.index_head_dim.clone(),
+                fp32_tail_cols: cfg.index_num_heads.clone(),
+                pool_size: kpool_update.pool_size,
+                tail_ring: kpool_update.tail_ring,
+                block_size: kpool_update.block_size,
             });
         }
         // Cut B: [q_b | wq_b] over the normed q latent.
@@ -870,7 +965,13 @@ impl Glm53DsaAttnLocalWorklet {
             expand_pools: ew("indexer.expand_pools", r.expand_pools)?,
             q_absorb: atomic(n, "q_absorb", r.q_absorb, BatchedGemmKernel::build, bridge)?,
             q_concat: ew("q_concat", r.q_concat)?,
-            q_fp8_quant: ew("q_fp8_quant", r.q_fp8_quant)?,
+            q_fp8_quant: atomic(
+                n,
+                "q_fp8_quant",
+                r.q_fp8_quant,
+                StaticFp8QuantKernel::build,
+                bridge,
+            )?,
             sparse_mla: Glm53KpoolSparseMlaOp::build(
                 format!("{n}.sparse_mla"),
                 r.sparse_mla,
@@ -894,6 +995,18 @@ impl Glm53DsaAttnLocalWorklet {
                         "hidden_row_split",
                         c,
                         Fp32RowSplitLayerNormKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
+            hidden_state_writer: r
+                .hidden_state_writer
+                .map(|c| {
+                    atomic(
+                        n,
+                        "hidden_state_writer",
+                        c,
+                        DsaFp32SplitStateUpdateKernel::build,
                         bridge,
                     )
                 })
@@ -992,13 +1105,26 @@ impl Glm53DsaAttnLocalWorklet {
             _ => None,
         })
         .chain(match front.hidden_gemm {
-            DsaFrontGemm::Fp32Split(backend) => {
+            DsaFrontGemm::Fp32Split(backend) | DsaFrontGemm::Fp32SplitStateWriter(backend) => {
                 worklet.hidden_row_split.as_ref().map(|op| {
                     (
                         backend,
                         &op.name,
                         &op.kernel.config.backends,
                         "fp32_row_split_layer_norm",
+                    )
+                })
+            }
+            _ => None,
+        })
+        .chain(match front.hidden_gemm {
+            DsaFrontGemm::Fp32SplitStateWriter(backend) => {
+                worklet.hidden_state_writer.as_ref().map(|op| {
+                    (
+                        backend,
+                        &op.name,
+                        &op.kernel.config.backends,
+                        "dsa_fp32_split_state_update",
                     )
                 })
             }
@@ -1074,13 +1200,34 @@ impl Glm53DsaAttnLocalWorklet {
                 });
             }
         }
-        if front.topk_page_table.is_some() && front.topk_to_page_table.is_some() {
+        if front.split_state_writer() && front.state_writer.is_some() {
             return Err(BuildError::FitFailed {
-                kind: "dsa_pooled_logits_page_table",
-                reason: "cut E (topk_page_table) and cut E + top-k (topk_to_page_table) build the \
-                         same page table; set one"
+                kind: "dsa_fp32_split_state_update",
+                reason: "cut A's split state writer and cut D (state_writer) write the same kv \
+                         norm, MLA cache append and kpool update; set one"
                     .into(),
             });
+        }
+        let both = front.topk_page_table.is_some() && front.topk_to_page_table.is_some();
+        match front.topk_to_page_table_max_pools {
+            None if both => {
+                return Err(BuildError::FitFailed {
+                    kind: "dsa_pooled_logits_page_table",
+                    reason: "cut E (topk_page_table) and cut E + top-k (topk_to_page_table) build \
+                             the same page table; set one, or both with \
+                             topk_to_page_table_max_pools to dispatch by context"
+                        .into(),
+                });
+            }
+            Some(max_pools) if !both || max_pools == 0 => {
+                return Err(BuildError::FitFailed {
+                    kind: "dsa_pooled_logits_page_table",
+                    reason: "topk_to_page_table_max_pools dispatches between cut E + top-k and \
+                             cut E: it needs both backends and a positive pool count"
+                        .into(),
+                });
+            }
+            _ => {}
         }
         // The backends as built, after any run-config override.
         let topk = &worklet.topk_prefill;
@@ -1182,6 +1329,7 @@ impl Glm53DsaAttnLocalWorklet {
         slots.extend(self.hidden_gemm.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.hidden_gemm_fp32.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.hidden_row_split.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.hidden_state_writer.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.q_lora_gemm.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.q_lora_epilogue.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.q_absorb_fp8.as_ref().map(|op| op.compile(builder)));
@@ -1192,7 +1340,7 @@ impl Glm53DsaAttnLocalWorklet {
             slots.extend([
                 g.hidden_fp32_cast.compile(builder),
                 g.topk_buffer_fill.compile(builder),
-                repeated(&g.positions_to_int32, POSITION_CASTS, builder),
+                repeated(&g.positions_to_int32, self.position_casts(), builder),
                 g.pool_ids_to_int64.compile(builder),
                 g.seq_lens_plus_one.compile(builder),
                 g.topk_buffer_copy.compile(builder),
@@ -1219,20 +1367,30 @@ impl Glm53DsaAttnLocalWorklet {
         let index_q_absorbed = front.q_lora_gemm.absorbs_index_q_quant();
         let absorb_fused = front.q_absorb_fp8.is_some();
         let state_writer = front.state_writer.is_some();
+        // Cut A's split state writer takes the decode rows' q/kv norm, cache
+        // append, kpool position cast and kpool update; prefill rows keep them.
+        let split_writer = front.split_state_writer();
         let fork_glue = front.glue == DsaGlue::ForkLaunchList;
         // Cut E or E + top-k builds the decode rows' page table in one launch;
-        // E + top-k also selects their pools.
-        let absorbed = |slot: &str| front.decode_slots_absorbed().contains(&slot);
+        // E + top-k also selects their pools. With a dispatch threshold the
+        // launch's longest row picks the cut.
+        let cut = front.decode_page_table_cut(w.decode_pools);
+        let absorbed = |slot: &str| front.decode_slots_absorbed(w.decode_pools).contains(&slot);
         push_or_zero(&self.fused_qkv_a, rows.clone(), hidden_merged, ev);
         // The q half of the norm folds into cut B's prologue and the kv half
         // into cut D; with only one of them the other half still launches,
         // priced as the whole (latency-bound) norm.
+        let norm_tokens = if split_writer {
+            w.prefill_tokens
+        } else {
+            w.total_tokens
+        };
         push_or_zero(
             &self.q_kv_norm,
             QKvRmsNormKernelInput {
-                num_tokens: w.total_tokens,
+                num_tokens: norm_tokens,
             },
-            q_lora_fused && state_writer,
+            (q_lora_fused && state_writer) || norm_tokens == 0,
             ev,
         );
         push_or_zero(&self.q_b, rows.clone(), q_lora_merged, ev);
@@ -1264,9 +1422,10 @@ impl Glm53DsaAttnLocalWorklet {
         push_or_zero(
             &self.kpool_decode_update,
             DsaPooledIndexCacheUpdateKernelInput {
-                num_requests: w.decode_requests,
+                // Logged as the requests this slot bills.
+                num_requests: if split_writer { 0 } else { w.decode_requests },
             },
-            no_decode || state_writer,
+            no_decode || state_writer || split_writer,
             ev,
         );
         push_or_zero(
@@ -1324,7 +1483,14 @@ impl Glm53DsaAttnLocalWorklet {
             ev,
         );
         push_or_zero(&self.q_concat, all.clone(), !cfg.mla_layout_copies, ev);
-        push_or_zero(&self.q_fp8_quant, all.clone(), absorb_fused, ev);
+        push_or_zero(
+            &self.q_fp8_quant,
+            StaticFp8QuantKernelInput {
+                num_tokens: w.total_tokens,
+            },
+            absorb_fused,
+            ev,
+        );
         self.sparse_mla.eval(
             &Glm53KpoolSparseMlaInput {
                 prefill_query_cache_pairs: input
@@ -1337,6 +1503,7 @@ impl Glm53DsaAttnLocalWorklet {
                     cfg.decode_next_n,
                 ),
                 cache_append_elsewhere: state_writer,
+                decode_cache_append_elsewhere: split_writer,
                 decode_remap_elsewhere: absorbed("sparse_mla.index_remap"),
             },
             ev,
@@ -1358,10 +1525,19 @@ impl Glm53DsaAttnLocalWorklet {
             push_or_zero(op, GemmFp32OutputKernelInput { m: w.total_tokens }, false, ev);
         }
         if let Some(op) = &self.hidden_row_split {
-            let input = Fp32RowSplitLayerNormKernelInput {
-                num_tokens: w.total_tokens,
+            let num_tokens = if split_writer {
+                w.prefill_tokens
+            } else {
+                w.total_tokens
             };
-            push_or_zero(op, input, false, ev);
+            let input = Fp32RowSplitLayerNormKernelInput { num_tokens };
+            push_or_zero(op, input, num_tokens == 0, ev);
+        }
+        if let Some(op) = &self.hidden_state_writer {
+            let input = DsaFp32SplitStateUpdateKernelInput {
+                num_requests: w.decode_requests,
+            };
+            push_or_zero(op, input, no_decode, ev);
         }
         if let Some(op) = &self.q_lora_gemm {
             push_or_zero(op, rows.clone(), false, ev);
@@ -1384,14 +1560,15 @@ impl Glm53DsaAttnLocalWorklet {
                 batch_size: w.decode_requests,
                 context_len: w.decode_pools,
             };
-            push_or_zero(op, input, no_decode, ev);
+            push_or_zero(op, input, no_decode || cut != DecodePageTableCut::PageTable, ev);
         }
         if let Some(op) = &self.topk_to_page_table {
             let input = DsaPooledLogitsPageTableKernelInput {
                 batch_size: w.decode_requests,
                 context_len: self.fused_topk_context(&w),
             };
-            push_or_zero(op, input, no_decode, ev);
+            let idle = no_decode || cut != DecodePageTableCut::TopkToPageTable;
+            push_or_zero(op, input, idle, ev);
         }
         if let Some(g) = &self.fork_glue {
             let decode = tokens(w.decode_rows);
@@ -1407,6 +1584,17 @@ impl Glm53DsaAttnLocalWorklet {
 }
 
 impl Glm53DsaAttnLocalWorklet {
+    /// Fork-glue position casts per decode step: G3 (kpool `dec_pos`) and G5
+    /// (top-k seq lens); cut A's split state writer reads int64 positions, so
+    /// G3 is gone.
+    fn position_casts(&self) -> u32 {
+        if self.resolved.raw_cfg.front.split_state_writer() {
+            POSITION_CASTS - 1
+        } else {
+            POSITION_CASTS
+        }
+    }
+
     /// The context `topk_to_page_table` prices at. One CTA per row: a batch
     /// within one wave of [`FUSED_TOPK_CTAS_PER_SM`] CTAs per SM takes as long
     /// as its longest row; past a wave the rows queue on the slots and the time
@@ -1838,6 +2026,7 @@ mod tests {
             sparse_attention_backends: vec!["flashinfer_trtllm_fp8"],
             mla_cache_append_backends: vec!["vllm_cuda"],
             hadamard_quant_backends: vec!["vllm_triton"],
+            static_quant_backends: vec!["vllm_cuda"],
             pooled_index_update_backends: vec!["vllm_fork_triton"],
             index_remap_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
@@ -2280,7 +2469,7 @@ mod tests {
     /// each cut adds exactly its own slot on its named backend.
     #[test]
     fn page_table_cuts_absorb_exactly_the_launches_they_replace() {
-        assert!(Glm53DsaFront::default().decode_slots_absorbed().is_empty());
+        assert!(Glm53DsaFront::default().decode_slots_absorbed(0).is_empty());
         let cut_e = Glm53DsaFront {
             topk_page_table: Some("e2a_kernel"),
             glue: DsaGlue::ForkLaunchList,
@@ -2291,14 +2480,14 @@ mod tests {
             glue: DsaGlue::ForkLaunchList,
             ..Default::default()
         };
-        assert_eq!(cut_e.decode_slots_absorbed(), PAGE_TABLE_ABSORBS);
+        assert_eq!(cut_e.decode_slots_absorbed(1 << 20), PAGE_TABLE_ABSORBS);
         assert_eq!(
-            cut_e_topk.decode_slots_absorbed(),
+            cut_e_topk.decode_slots_absorbed(1 << 20),
             TOPK_TO_PAGE_TABLE_ABSORBS
         );
         let mut fused_set = PAGE_TABLE_ABSORBS.to_vec();
         fused_set.insert(0, "indexer.topk_decode");
-        assert_eq!(cut_e_topk.decode_slots_absorbed(), fused_set);
+        assert_eq!(cut_e_topk.decode_slots_absorbed(1 << 20), fused_set);
         // Not absorbed: the position cast feeds the seq lens either way.
         assert!(!TOPK_TO_PAGE_TABLE_ABSORBS.contains(&"glue.positions_to_int32"));
 
@@ -2309,7 +2498,7 @@ mod tests {
         ] {
             let w = build_front(front, &[]).unwrap();
             let names = slot_names(&w);
-            for absorbed in front.decode_slots_absorbed() {
+            for absorbed in front.decode_slots_absorbed(1) {
                 let name = format!("m.dsa.{absorbed}");
                 assert!(names.contains(&name), "{name} missing from the tree");
             }
@@ -2337,7 +2526,9 @@ mod tests {
         assert_eq!(cfg.context_mode, "uniform_measured");
     }
 
-    /// Both page-table cuts at once would bill the decode page table twice.
+    /// Both page-table cuts at once would bill the decode page table twice,
+    /// unless a pool threshold dispatches each launch to one of them; a
+    /// threshold needs both cuts.
     #[test]
     fn page_table_cuts_are_exclusive() {
         let both = Glm53DsaFront {
@@ -2349,6 +2540,52 @@ mod tests {
             build_front(both, &[]),
             Err(BuildError::FitFailed { .. })
         ));
+        for front in [
+            Glm53DsaFront { topk_to_page_table_max_pools: Some(0), ..both },
+            Glm53DsaFront { topk_page_table: None, topk_to_page_table_max_pools: Some(65_536), ..both },
+            Glm53DsaFront { topk_to_page_table: None, topk_to_page_table_max_pools: Some(65_536), ..both },
+        ] {
+            assert!(matches!(build_front(front, &[]), Err(BuildError::FitFailed { .. })), "{front:?}");
+        }
+    }
+
+    /// Catches a context dispatch that sends a launch to both cuts, to
+    /// neither, or by the wrong row: the fused top-k takes launches whose
+    /// longest row is within the threshold (inclusive); a longer launch runs
+    /// the decode top-k and cut E, which then bills its own slot and zeroes
+    /// only the post-top-k launches.
+    #[test]
+    fn page_table_dispatch_picks_one_cut_by_the_longest_row() {
+        let dispatch = Glm53DsaFront {
+            topk_page_table: Some("e2a_kernel"),
+            topk_to_page_table: Some("t6_kernel"),
+            topk_to_page_table_max_pools: Some(65_536),
+            glue: DsaGlue::ForkLaunchList,
+            ..Default::default()
+        };
+        use DecodePageTableCut::{PageTable, TopkToPageTable};
+        for (pools, cut) in [
+            (1, TopkToPageTable),
+            (59_000, TopkToPageTable),
+            (65_536, TopkToPageTable),
+            (65_537, PageTable),
+            (262_144, PageTable),
+        ] {
+            assert_eq!(dispatch.decode_page_table_cut(pools), cut, "{pools} pools");
+        }
+        assert_eq!(dispatch.decode_slots_absorbed(65_536), TOPK_TO_PAGE_TABLE_ABSORBS);
+        assert_eq!(dispatch.decode_slots_absorbed(65_537), PAGE_TABLE_ABSORBS);
+        assert!(!dispatch.decode_slots_absorbed(65_537).contains(&"indexer.topk_decode"));
+        // Without a threshold a single cut takes every launch.
+        let t6_only = Glm53DsaFront { topk_page_table: None, topk_to_page_table_max_pools: None, ..dispatch };
+        assert_eq!(t6_only.decode_page_table_cut(1 << 20), TopkToPageTable);
+        // Both cuts are built, each on its own backend, and nothing else is added.
+        let w = build_front(dispatch, &[]).unwrap();
+        let base = slot_names(&build_front(Glm53DsaFront { glue: DsaGlue::ForkLaunchList, ..Default::default() }, &[]).unwrap());
+        let added: Vec<_> = slot_names(&w).into_iter().filter(|n| !base.contains(n)).collect();
+        assert_eq!(added, ["m.dsa.indexer.topk_page_table", "m.dsa.indexer.topk_to_page_table"]);
+        assert_eq!(w.topk_page_table.as_ref().unwrap().kernel.config.backends, ["e2a_kernel"]);
+        assert_eq!(w.topk_to_page_table.as_ref().unwrap().kernel.config.backends, ["t6_kernel"]);
     }
 
     /// Catches an fp32-split cut A that prices the wrong width or split, or
@@ -2380,6 +2617,113 @@ mod tests {
             build_front(front, &[("m.dsa.hidden_row_split", "torch_vllm")]),
             Err(BuildError::NoBackendForLaunch { .. })
         ));
+    }
+
+    /// Each slot's logged input after one eval (structure-only kernels
+    /// answer zero time, so the logged sizes are what a test can read).
+    fn eval_inputs(
+        w: &Glm53DsaAttnLocalWorklet,
+        input: &Glm53DsaAttnLocalWorkletInput,
+    ) -> HashMap<String, serde_json::Value> {
+        let names = slot_names(w);
+        let mut metrics = vec![LeafMetrics::MISS; names.len()];
+        let mut inputs = Vec::new();
+        let mut ev = Evaluator::with_inputs(&mut metrics, &mut inputs);
+        w.eval(input, &mut ev);
+        assert_eq!(ev.filled(), names.len());
+        names
+            .into_iter()
+            .zip(inputs)
+            .map(|(name, input)| (name, serde_json::to_value(input).unwrap()))
+            .collect()
+    }
+
+    /// Catches the split state writer double-billing or dropping a launch:
+    /// on decode rows it alone prices the q/kv norm, cache append, kpool
+    /// position cast and kpool update (and the row split); prefill rows keep
+    /// the incumbent slots; the slot runs on its own backend only.
+    #[test]
+    fn split_state_writer_absorbs_exactly_the_decode_state_launches() {
+        let split = Glm53DsaFront {
+            hidden_gemm: DsaFrontGemm::Fp32Split("triton"),
+            glue: DsaGlue::ForkLaunchList,
+            ..Default::default()
+        };
+        let writer = Glm53DsaFront {
+            hidden_gemm: DsaFrontGemm::Fp32SplitStateWriter("triton"),
+            ..split
+        };
+        let base = build_front(split, &[]).unwrap();
+        let w = build_front(writer, &[]).unwrap();
+        let names = slot_names(&w);
+        for absorbed in SPLIT_STATE_WRITER_ABSORBS {
+            assert!(names.contains(&format!("m.dsa.{absorbed}")), "{absorbed} left the tree");
+        }
+        let base_names = slot_names(&base);
+        let added: Vec<_> = names.iter().filter(|n| !base_names.contains(n)).collect();
+        assert_eq!(added, ["m.dsa.hidden_state_writer"]);
+        let cfg = w.resolved.hidden_state_writer.as_ref().unwrap();
+        let kpool = &w.resolved.kpool_decode_update;
+        assert_eq!(
+            (cfg.q_lora_cols.get(), cfg.kv_lora_cols.get(), cfg.index_dim.get(), cfg.fp32_tail_cols.get()),
+            (1536, 512, 128, 32)
+        );
+        assert_eq!(
+            (cfg.next_n, cfg.pool_size, cfg.tail_ring, cfg.block_size),
+            (kpool.next_n, kpool.pool_size, kpool.tail_ring, kpool.block_size)
+        );
+        // One position cast (G5) left; G3 belongs to the state writer.
+        assert_eq!((base.position_casts(), w.position_casts()), (2, 1));
+
+        let next_n = u64::from(w.resolved.raw_cfg.decode_next_n);
+        let decode = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![4000, 5000],
+        };
+        let mixed = Glm53DsaAttnLocalWorkletInput {
+            prefill_chunk_pairs: vec![(0, 5)],
+            ..decode.clone()
+        };
+        let size = |m: &HashMap<String, serde_json::Value>, s: &str| {
+            let v = &m[&format!("m.dsa.{s}")];
+            ["num_tokens", "num_requests", "m"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(|x| x.as_u64()))
+                .unwrap_or_else(|| panic!("{s}: {v}"))
+        };
+        let (d, b) = (eval_inputs(&w, &decode), eval_inputs(&base, &decode));
+        let (m, bm) = (eval_inputs(&w, &mixed), eval_inputs(&base, &mixed));
+        // (slot, billed with the writer on decode / mixed, without it on decode / mixed)
+        for (s, writer_decode, writer_mixed, base_decode, base_mixed) in [
+            ("q_kv_a_norm", 0, 5, 2 * next_n, 5 + 2 * next_n),
+            ("sparse_mla.mla_cache_append", 0, 5, 2 * next_n, 5 + 2 * next_n),
+            ("indexer.kpool_decode_update", 0, 0, 2, 2),
+            ("hidden_row_split", 0, 5, 2 * next_n, 5 + 2 * next_n),
+            // Decode rows either way; the scale (casts per step) drops to 1.
+            ("glue.positions_to_int32", 2 * next_n, 2 * next_n, 2 * next_n, 2 * next_n),
+            ("hidden_gemm", 2 * next_n, 5 + 2 * next_n, 2 * next_n, 5 + 2 * next_n),
+            ("hidden_state_writer", 2, 2, 2, 2),
+        ] {
+            assert_eq!((size(&d, s), size(&m, s)), (writer_decode, writer_mixed), "{s} with the writer");
+            if s != "hidden_state_writer" {
+                assert_eq!((size(&b, s), size(&bm, s)), (base_decode, base_mixed), "{s} without it");
+            }
+        }
+        assert!(matches!(
+            build_front(writer, &[("m.dsa.hidden_state_writer", "torch")]),
+            Err(BuildError::NoBackendForLaunch { .. })
+        ));
+    }
+
+    /// Cut D and the split state writer write the same state.
+    #[test]
+    fn split_state_writer_and_cut_d_are_exclusive() {
+        let both = Glm53DsaFront {
+            hidden_gemm: DsaFrontGemm::Fp32SplitStateWriter("triton"),
+            state_writer: Some("cut_d_kernel"),
+            ..Default::default()
+        };
+        assert!(matches!(build_front(both, &[]), Err(BuildError::FitFailed { .. })));
     }
 
     /// Catches a launch-list fix that loses a launch or keeps the old

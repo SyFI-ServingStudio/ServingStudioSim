@@ -347,7 +347,7 @@
         "triton"
       ],
       "unified.dsa_moe.dsa.q_fp8_quant": [
-        "triton"
+        "vllm_cuda"
       ],
       "unified.dsa_moe.dsa.sparse_mla.mla_cache_append": [
         "vllm_cuda"
