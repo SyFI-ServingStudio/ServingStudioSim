@@ -1954,12 +1954,15 @@ pub enum IterArchSel {
         /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftAttention`]):
         /// `fa2_bf16` (the default), or the engine's FA4 fp8 paged call with 32
         /// KV splits (`fa4_fp8_split32`, vLLM's FULL-graph default) or one
-        /// (`fa4_fp8_nosplit`).
+        /// (`fa4_fp8_nosplit`), or one split from 16 requests per launch and
+        /// 32 below (`fa4_fp8_nosplit_from16`).
         #[serde(default)]
         #[param(string, default = "fa2_bf16", choices = crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DRAFT_ATTENTIONS, cache_key)]
         draft_attention: crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftAttention,
         /// DFlash2 draft vocabulary top-k
-        /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk`]).
+        /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk`]):
+        /// `flashinfer`, `threshold` everywhere, or `threshold_small_rows`
+        /// (threshold up to 560 rows per launch, FlashInfer above).
         #[serde(default)]
         #[param(string, default = "flashinfer", choices = crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DRAFT_TOPKS, cache_key)]
         draft_topk: crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk,
@@ -2206,12 +2209,15 @@ pub enum IterArchSel {
         /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftAttention`]):
         /// `fa2_bf16` (the default), or the engine's FA4 fp8 paged call with 32
         /// KV splits (`fa4_fp8_split32`, vLLM's FULL-graph default) or one
-        /// (`fa4_fp8_nosplit`).
+        /// (`fa4_fp8_nosplit`), or one split from 16 requests per launch and
+        /// 32 below (`fa4_fp8_nosplit_from16`).
         #[serde(default)]
         #[param(string, default = "fa2_bf16", choices = crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DRAFT_ATTENTIONS, cache_key)]
         draft_attention: crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftAttention,
         /// DFlash2 draft vocabulary top-k
-        /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk`]).
+        /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk`]):
+        /// `flashinfer`, `threshold` everywhere, or `threshold_small_rows`
+        /// (threshold up to 560 rows per launch, FlashInfer above).
         #[serde(default)]
         #[param(string, default = "flashinfer", choices = crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DRAFT_TOPKS, cache_key)]
         draft_topk: crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk,
