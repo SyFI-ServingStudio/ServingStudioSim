@@ -1939,6 +1939,35 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "chain", choices = crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MOE_SHARED_OVERLAPS, cache_key)]
         moe_shared_overlap: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap,
+        /// DFlash2 draft attention leaf
+        /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftAttention`]):
+        /// `fa2_bf16` (the default), or the engine's FA4 fp8 paged call with 32
+        /// KV splits (`fa4_fp8_split32`, vLLM's FULL-graph default) or one
+        /// (`fa4_fp8_nosplit`).
+        #[serde(default)]
+        #[param(string, default = "fa2_bf16", choices = crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DRAFT_ATTENTIONS, cache_key)]
+        draft_attention: crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftAttention,
+        /// DFlash2 draft vocabulary top-k
+        /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk`]).
+        #[serde(default)]
+        #[param(string, default = "flashinfer", choices = crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DRAFT_TOPKS, cache_key)]
+        draft_topk: crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk,
+        /// DFlash2 context K/V: one launch normalizes, rotates and writes every
+        /// draft layer's cache (`layered_kv_norm_rope_cache_write`).
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_context_kv_store: bool,
+        /// DFlash2 draft layers: one launch for q/k norm, RoPE, the fp8 query
+        /// quant and the block's K/V write (`qk_norm_rope_fp8_kv_write`).
+        /// Needs an fp8 `draft_attention`.
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_qk_norm_rope_kv_write: bool,
+        /// DFlash2 draft layers: each conv finish fused with the residual
+        /// RMSNorm after it (`grouped_conv_residual_rms_norm`).
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_conv_residual_norm: bool,
     },
     /// GLM-5.3-Flash NVFP4 + DFlash2 under attention DP with the KDA layers
     /// tensor-parallel in groups of `kda_tp_gpus`, a fused direct-write
@@ -2151,6 +2180,35 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "chain", choices = crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MOE_SHARED_OVERLAPS, cache_key)]
         moe_shared_overlap: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap,
+        /// DFlash2 draft attention leaf
+        /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftAttention`]):
+        /// `fa2_bf16` (the default), or the engine's FA4 fp8 paged call with 32
+        /// KV splits (`fa4_fp8_split32`, vLLM's FULL-graph default) or one
+        /// (`fa4_fp8_nosplit`).
+        #[serde(default)]
+        #[param(string, default = "fa2_bf16", choices = crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DRAFT_ATTENTIONS, cache_key)]
+        draft_attention: crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftAttention,
+        /// DFlash2 draft vocabulary top-k
+        /// ([`crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk`]).
+        #[serde(default)]
+        #[param(string, default = "flashinfer", choices = crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DRAFT_TOPKS, cache_key)]
+        draft_topk: crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::DraftTopk,
+        /// DFlash2 context K/V: one launch normalizes, rotates and writes every
+        /// draft layer's cache (`layered_kv_norm_rope_cache_write`).
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_context_kv_store: bool,
+        /// DFlash2 draft layers: one launch for q/k norm, RoPE, the fp8 query
+        /// quant and the block's K/V write (`qk_norm_rope_fp8_kv_write`).
+        /// Needs an fp8 `draft_attention`.
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_qk_norm_rope_kv_write: bool,
+        /// DFlash2 draft layers: each conv finish fused with the residual
+        /// RMSNorm after it (`grouped_conv_residual_rms_norm`).
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_conv_residual_norm: bool,
         /// SGLang HiSparse KV offload of the 11 DSA layers (as on
         /// [`Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2`]); absent keeps the
         /// whole cache on the GPU.
@@ -2666,6 +2724,33 @@ impl IterArchSel {
                 DsaGluePricing::ForkLaunchList => DsaGlue::ForkLaunchList,
             },
         })
+    }
+
+    /// The DFlash2 draft-chain options of the GLM-5.3-Flash NVFP4 DP DFlash2
+    /// arch; the defaults elsewhere.
+    pub fn dflash2_draft_chain(
+        &self,
+    ) -> anyhow::Result<crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::Dflash2DraftChain> {
+        use crate::arch::glm53_vllm_nvfp4_dsa_moe_dflash2::Dflash2DraftChain;
+        let chain = match self {
+            Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+                draft_attention,
+                draft_topk,
+                draft_context_kv_store,
+                draft_qk_norm_rope_kv_write,
+                draft_conv_residual_norm,
+                ..
+            } => Dflash2DraftChain {
+                attention: *draft_attention,
+                topk: *draft_topk,
+                context_kv_store: *draft_context_kv_store,
+                qk_norm_rope_kv_write: *draft_qk_norm_rope_kv_write,
+                conv_residual_norm: *draft_conv_residual_norm,
+            },
+            _ => Dflash2DraftChain::default(),
+        };
+        chain.validate()?;
+        Ok(chain)
     }
 
     /// The fast exchanges' `ep_fast_*` params (GLM-5.3-Flash NVFP4 DP arches).

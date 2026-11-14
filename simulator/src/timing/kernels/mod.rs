@@ -49,6 +49,7 @@ pub mod gdn_recurrent_decode;
 pub mod gdn_recurrent_decode_gated_norm;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod grouped_conv_residual_rms_norm;
 pub mod grouped_rms_norm;
 pub mod hadamard_fp8_quant;
 pub mod hadamard_fp8_quant_weight_scale;
@@ -63,6 +64,7 @@ pub mod kda_recoverssm_conv_verify;
 pub mod kda_recoverssm_verify;
 pub mod kda_recurrent_decode;
 pub mod kv_cache_append;
+pub mod layered_kv_norm_rope_cache_write;
 pub mod kv_compress_store;
 pub mod logits_topk;
 pub mod mhc_fused_post_pre_rms_norm;
@@ -99,6 +101,7 @@ pub mod ple_short_conv;
 pub mod q_kv_rms_norm;
 pub mod q_pad_kv_rope_mxfp8_insert;
 pub mod qk_rms_norm_rope_gate;
+pub mod qk_norm_rope_fp8_kv_write;
 pub mod qnorm_rope_kv_insert;
 pub mod rel_bias_attention;
 pub mod residual_rms_norm;
@@ -296,6 +299,18 @@ pub use gemm_fp32_output::{
 };
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
+};
+pub use grouped_conv_residual_rms_norm::{
+    GroupedConvResidualRmsNormKernel, GroupedConvResidualRmsNormKernelConfig,
+    GroupedConvResidualRmsNormKernelInput, GroupedConvResidualRmsNormSpec,
+};
+pub use layered_kv_norm_rope_cache_write::{
+    LayeredKvNormRopeCacheWriteKernel, LayeredKvNormRopeCacheWriteKernelConfig,
+    LayeredKvNormRopeCacheWriteKernelInput, LayeredKvNormRopeCacheWriteSpec,
+};
+pub use qk_norm_rope_fp8_kv_write::{
+    QkNormRopeFp8KvWriteKernel, QkNormRopeFp8KvWriteKernelConfig, QkNormRopeFp8KvWriteKernelInput,
+    QkNormRopeFp8KvWriteSpec,
 };
 pub use grouped_rms_norm::{
     GroupedRmsNormKernel, GroupedRmsNormKernelConfig, GroupedRmsNormKernelInput, GroupedRmsNormSpec,
@@ -513,3 +528,14 @@ pub use vllm_fused_moe::{
 pub use vllm_mla_rope::{
     VllmMlaRopeKernel, VllmMlaRopeKernelConfig, VllmMlaRopeKernelInput, VllmMlaRopeSpec,
 };
+
+/// Row counts for the DFlash2 draft-chain kinds: a DP rank's draft block rows
+/// (`requests * (1 + draft_tokens)`) and context rows, dense where the
+/// per-rank batches sit.
+pub const DRAFT_ROW_AXIS: [u32; 18] = [
+    8, 16, 32, 64, 128, 192, 256, 384, 512, 640, 768, 1024, 1280, 1536, 2048, 3072, 4096, 8192,
+];
+
+pub(crate) fn draft_row_axis() -> Vec<f64> {
+    DRAFT_ROW_AXIS.iter().map(|&x| f64::from(x)).collect()
+}

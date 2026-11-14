@@ -19,7 +19,8 @@ encoding (``kv_len = prefix_len + append_len`` >= ``q_len``) cannot. The runner
 ``profiling.runners.attention.flashinfer_attn_prefill_and_rect``) passes these
 straight to the ragged wrapper.
 
-Backends ``{fa2, fa3, cudnn}`` are ServingStudioSim backend strings, not kinds: each
+Backends ``{fa2, fa3, cudnn, vllm_fa4_split32, vllm_fa4_nosplit}`` are ServingStudioSim
+backend strings, not kinds: each
 registers its own spec -> the same ``args_schema`` and table, routing to its own
 ``profile_flashinfer_attn_rect_<backend>`` entry. Unsupported combos raise
 ``ProfilerNotImplemented`` at profile time: ``cudnn+fp8``.
@@ -38,7 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
-from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg, optional_arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -63,9 +64,7 @@ _SUPPORTS = {
         compute=frozenset({DType.BF16, DType.FP8_E4M3}),
         kv=frozenset({DType.BF16, DType.FP8_E4M3}),
     ),
-    "cudnn": BackendSupport(
-        compute=frozenset({DType.BF16}), kv=frozenset({DType.BF16})
-    ),
+    "cudnn": BackendSupport(compute=frozenset({DType.BF16}), kv=frozenset({DType.BF16})),
 }
 
 
@@ -79,8 +78,14 @@ class FlashinferAttnRectArgs(KernelArgs):
     kv_dtype: DType = arg(doc="Key and value element type.")
     o_dtype: DType = arg(doc="Output element type.")
     # Runtime 2D sweep coords (Rust <Name>KernelInput). Direct, not prefix/append.
-    q_len: int = arg(unit="tokens", doc="Query tokens in the measured request.")
-    kv_len: int = arg(unit="tokens", doc="Key and value tokens in the measured request.")
+    q_len: int = arg(unit="tokens", doc="Query tokens in each request.")
+    kv_len: int = arg(unit="tokens", doc="Key and value tokens each request attends.")
+    # Rows written before the batch axis existed measured one request.
+    num_requests: int | None = optional_arg(
+        absent=1,
+        unit="requests",
+        doc="Requests in the one call, each with its own q_len queries and kv_len keys and values.",
+    )
 
 
 DOC = KernelDoc(
@@ -89,16 +94,17 @@ DOC = KernelDoc(
     description=(
         "Attention without a causal mask: every query token sees every key and "
         "value token of its request. The DFlash2 draft layer uses it so each "
-        "drafted position sees the whole context. The measurement is one "
-        "request with q_len queries and kv_len contiguous keys and values; the "
-        "two lengths are independent."
+        "drafted position sees the whole context. One call covers num_requests "
+        "requests, each a block of q_len queries over its own kv_len keys and "
+        "values, so the keys and values are read once per request."
     ),
     category="Attention",
     subcategory="MHA / GQA",
     formula=(
         "O = softmax(Q · Kᵀ / √head_dim) · V, per query head",
-        "TFLOPS = 4 · q_len · kv_len · num_qo_heads · head_dim / time",
-        "GB/s = bytes of Q, K, V and O / time",
+        "TFLOPS = 4 · num_requests · q_len · kv_len · num_qo_heads · head_dim / time",
+        "GB/s = num_requests · (q_len · num_qo_heads · head_dim · (Q + O bytes) "
+        "+ 2 · kv_len · num_kv_heads · head_dim · KV bytes) / time",
     ),
     default_metric="memory_bandwidth_gbps",
     method=(
@@ -109,8 +115,11 @@ DOC = KernelDoc(
         "the fastest."
     ),
     caveats=(
-        "One request with contiguous K and V is measured, not a batch of "
-        "requests of different lengths.",
+        "Every request in a call has the same q_len and kv_len; a batch of "
+        "different lengths is priced at its mean.",
+        "fa2, fa3 and cudnn read contiguous (ragged) K and V; the vllm_fa4 "
+        "backends read a paged fp8 cache (page 16; 16 and 64 measured the same "
+        "in lane J). cudnn measures one request only.",
         "The fp8 path needs fp8 queries and KV with a non-fp8 output, so bf16 "
         "queries over fp8 KV are not measured.",
         "cudnn measures no fp8.",
@@ -129,6 +138,49 @@ _BACKEND_DOCS = {
     ),
 }
 
+
+_FA4_RUNNER_MODULE = "profiling.runners.attention.fa4_block_rect"
+# FA4's SM100 forward is built for sm_100f. The draft attends fp8 queries over an
+# fp8 KV cache (kv_cache_scheme fp8; QuantFP8 on the query) with a bf16 output.
+_FA4_SUPPORT = BackendSupport(
+    compute=frozenset({DType.FP8_E4M3}),
+    kv=frozenset({DType.FP8_E4M3}),
+    sm_targets=frozenset({"sm_100f"}),
+)
+_FA4_BACKEND_DOCS = {
+    "vllm_fa4_split32": BackendDoc(
+        summary=(
+            "vLLM fork flash_attn_varlen_func(fa_version=4, causal=False) over an fp8 "
+            "paged cache with num_splits=32, the max_num_splits a FULL CUDA graph "
+            "passes: split forward plus combine."
+        ),
+    ),
+    "vllm_fa4_nosplit": BackendDoc(
+        summary=(
+            "The same FA4 call with num_splits=1: the forward kernel alone, output "
+            "bit-identical to num_splits=32."
+        ),
+    ),
+}
+
+for _backend, _doc in _FA4_BACKEND_DOCS.items():
+    register(
+        KernelProfilerSpec(
+            kernel_kind=KIND,
+            backend=_backend,
+            supports=_FA4_SUPPORT,
+            runner_ref=RunnerRef(
+                module_name=_FA4_RUNNER_MODULE,
+                function_name=f"profile_flashinfer_attn_rect_{_backend}",
+            ),
+            table_name=KIND,
+            args_schema=FlashinferAttnRectArgs,
+            metric_family=MetricFamily.COMPUTE,
+            batch_outlier_policy=BatchOutlierPolicy(),
+            subprocess_env="vllm_env",
+            doc=_doc,
+        )
+    )
 
 for _backend in _BACKENDS:
     register(

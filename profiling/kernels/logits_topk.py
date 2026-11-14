@@ -124,4 +124,29 @@ register(
     )
 )
 
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="triton_threshold",
+        supports=BackendSupport(compute=frozenset({DType.BF16})),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.dflash2.draft_chain",
+            function_name="profile_logits_topk_triton_threshold",
+        ),
+        table_name=KIND,
+        args_schema=LogitsTopkArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "Vendored lane J exact threshold top-k (slice maxima, a per-row "
+                "threshold, candidates at or above it, exact final select): ids "
+                "and values identical to FlashInfer deterministic, fp32 values and "
+                "int64 ids written directly."
+            ),
+        ),
+    )
+)
+
 __all__ = ["KIND", "LogitsTopkArgs"]

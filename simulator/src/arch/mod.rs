@@ -98,7 +98,7 @@ pub use glm53_flash_vllm_fp8_pp_kda_dsa_moe::{
     Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel, Glm53FlashVllmFp8PpStageModel,
 };
 pub use glm53_vllm_nvfp4_dsa_moe_dflash2::{
-    Dflash2DraftResolved, Glm53VllmNvfp4DsaMoeDflash2Model,
+    Dflash2DraftChain, Dflash2DraftResolved, DraftAttention, DraftTopk, Glm53VllmNvfp4DsaMoeDflash2Model,
 };
 pub use inkling_model_cfg::{InklingExpertPrecision, InklingModelCfg};
 pub use inkling_vllm_nvfp4_rel_attn_moe::{

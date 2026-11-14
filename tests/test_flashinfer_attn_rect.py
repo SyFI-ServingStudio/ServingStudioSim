@@ -26,7 +26,8 @@ _RUNNER_MODULE = "profiling.runners.attention.flashinfer_attn_prefill_and_rect"
 def test_args_field_contract_matches_runner_kwargs():
     # Field set / order is the load-bearing contract (A5): rect uses (q_len,
     # kv_len) directly (NOT prefill's prefix/append), so it can express
-    # q_len > kv_len. Config dims first, then the 2D sweep coords.
+    # q_len > kv_len. Config dims first, then the sweep coords; `num_requests`
+    # (the batch, one K/V per request) is optional so pre-batch rows keep keys.
     field_names = [f.name for f in FlashinferAttnRectArgs.__dataclass_fields__.values()]
     assert field_names == [
         "num_qo_heads",
@@ -37,6 +38,7 @@ def test_args_field_contract_matches_runner_kwargs():
         "o_dtype",
         "q_len",
         "kv_len",
+        "num_requests",
     ]
 
 

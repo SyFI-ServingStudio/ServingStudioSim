@@ -82,7 +82,9 @@ pub struct Dflash2SelectorLocalWorklet {
     pub name: String,
     pub lm_head: Op<SingleGemmKernel>,
     pub candidate_topk: Op<LogitsTopkKernel>,
-    pub candidate_topk_merge: Op<LogitsTopkKernel>,
+    /// `None` on one rank: with nothing gathered there is no second selection
+    /// (`get_top_k_tokens` all-gathers only when `tp_size > 1`).
+    pub candidate_topk_merge: Option<Op<LogitsTopkKernel>>,
     pub hidden_projection: Op<SingleGemmKernel>,
     pub codebook_gather: Op<ElementwiseKernel>,
     pub edge_scores: Op<SingleGemmKernel>,
@@ -195,13 +197,17 @@ impl Dflash2SelectorLocalWorklet {
                 LogitsTopkKernel::build,
                 bridge,
             )?,
-            candidate_topk_merge: build_atomic(
-                &name,
-                "candidate_topk_merge",
-                resolved.candidate_topk_merge.clone(),
-                LogitsTopkKernel::build,
-                bridge,
-            )?,
+            candidate_topk_merge: (resolved.raw_cfg.tp_size > 1)
+                .then(|| {
+                    build_atomic(
+                        &name,
+                        "candidate_topk_merge",
+                        resolved.candidate_topk_merge.clone(),
+                        LogitsTopkKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             hidden_projection: build_atomic(
                 &name,
                 "hidden_projection",
@@ -231,14 +237,19 @@ impl Dflash2SelectorLocalWorklet {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         CostNode::Labeled {
             label: worklet_label(&self.name, &self.resolved.raw_cfg),
-            child: Box::new(CostNode::Sum(vec![
-                self.lm_head.compile(builder),
-                self.candidate_topk.compile(builder),
-                self.candidate_topk_merge.compile(builder),
-                self.hidden_projection.compile(builder),
-                self.codebook_gather.compile(builder),
-                self.edge_scores.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum({
+                let mut nodes = vec![
+                    self.lm_head.compile(builder),
+                    self.candidate_topk.compile(builder),
+                ];
+                if let Some(op) = &self.candidate_topk_merge {
+                    nodes.push(op.compile(builder));
+                }
+                nodes.push(self.hidden_projection.compile(builder));
+                nodes.push(self.codebook_gather.compile(builder));
+                nodes.push(self.edge_scores.compile(builder));
+                nodes
+            })),
         }
     }
 
@@ -252,7 +263,9 @@ impl Dflash2SelectorLocalWorklet {
 
         eval_atomic_or_zero(&self.lm_head, SingleGemmKernelInput { m: rows }, zero, ev);
         eval_atomic_or_zero(&self.candidate_topk, selected.clone(), zero, ev);
-        eval_atomic_or_zero(&self.candidate_topk_merge, selected, zero, ev);
+        if let Some(op) = &self.candidate_topk_merge {
+            eval_atomic_or_zero(op, selected, zero, ev);
+        }
         eval_atomic_or_zero(
             &self.hidden_projection,
             SingleGemmKernelInput { m: rows },

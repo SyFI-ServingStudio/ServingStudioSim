@@ -92,6 +92,10 @@
       ]
     },
     {
+      "location": "unified.dflash2.layer.attn.query_kv_append",
+      "semantics": []
+    },
+    {
       "location": "unified.dflash2.layer.attn.rope",
       "semantics": []
     },
@@ -139,10 +143,6 @@
     },
     {
       "location": "unified.dflash2.selector.candidate_topk",
-      "semantics": []
-    },
-    {
-      "location": "unified.dflash2.selector.candidate_topk_merge",
       "semantics": []
     },
     {

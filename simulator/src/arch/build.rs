@@ -35,7 +35,7 @@ use crate::arch::{
     qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, qwen4_exp_vllm_nvfp4_gdn_qsa_moe,
     AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmDpDsparkModel, DeepseekV41VllmDsparkModel, DeepseekV41VllmModel,
     DeepseekV41VllmParallel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
-    DenseParallel, DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, DsparkCfg,
+    DenseParallel, DenseTpParallel, Dflash2DraftChain, Dflash2DraftResolved, DpAttnTpFfnParallel, DsparkCfg,
     FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel,
     Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
     Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel,
@@ -2167,6 +2167,7 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
         gpu,
         draft_tokens,
         draft_sliding_window,
+        &Dflash2DraftChain::default(),
     )
     .context("expanding the DFlash2 draft configs")?;
     glm53_vllm_nvfp4_dsa_moe_dflash2::build_dflash2(name.to_string(), resolved, draft, bridge)
@@ -2181,36 +2182,17 @@ fn dflash2_draft_resolved(
     gpu: &str,
     draft_tokens: u32,
     sliding_window: u32,
+    chain: &Dflash2DraftChain,
 ) -> Result<Dflash2DraftResolved> {
+    chain.validate()?;
     anyhow::ensure!(draft_tokens > 0, "DFlash2 draft_tokens must be positive");
     anyhow::ensure!(
         sliding_window > 0,
         "DFlash2 draft_sliding_window must be positive"
     );
     let gpu_name = gpu.to_string();
-    let layer_cfg = Dflash2DraftLayerLocalWorkletConfig {
-        residual_norm_backends: vec!["vllm_cuda"],
-        norm_backends: vec!["flashinfer"],
-        gemm_backends: vec!["torch_linear"],
-        elementwise_backends: vec!["triton"],
-        // `fa2` is the only rect backend with a working ragged path on B200,
-        // and it is bf16-only -- see the worklet's note on why the leaf is
-        // measured in bf16 while the engine runs fp8.
-        attention_backends: vec!["fa2"],
-        tp_size,
-        gpu_name: gpu_name.clone(),
-        hidden_dim: Dim::param("dflash2_hidden", checkpoint.hidden_dim),
-        intermediate_dim: Dim::param("dflash2_intermediate", checkpoint.intermediate_dim),
-        num_qo_heads: Dim::param("dflash2_qo_heads", checkpoint.num_qo_heads),
-        num_kv_heads: Dim::param("dflash2_kv_heads", checkpoint.num_kv_heads),
-        head_dim: Dim::param("dflash2_head_dim", checkpoint.head_dim),
-        conv_taps: checkpoint.conv_taps,
-        conv_group_size: checkpoint.conv_group_size,
-        dtype: DType::Bf16,
-        gemm_dtype: DType::Bf16,
-        attn_q_dtype: DType::Bf16,
-        attn_kv_dtype: DType::Bf16,
-    };
+    // The fork's FlashAttention-layout draft cache pages 16 tokens.
+    const DRAFT_PAGE_SIZE: u32 = 16;
     let context_kv_cfg = Dflash2ContextKvLocalWorkletConfig {
         norm_backends: vec!["flashinfer"],
         gemm_backends: vec!["torch_linear"],
@@ -2229,6 +2211,39 @@ fn dflash2_draft_resolved(
         dtype: DType::Bf16,
         gemm_dtype: DType::Bf16,
         kv_dtype: DType::Fp8E4m3,
+        layered_store: chain
+            .context_kv_store
+            .then(|| (vec!["vllm_triton"], DRAFT_PAGE_SIZE)),
+    };
+    let context_kv = Dflash2ContextKvLocalWorklet::resolve_config(&context_kv_cfg);
+    let layer_cfg = Dflash2DraftLayerLocalWorkletConfig {
+        residual_norm_backends: vec!["vllm_cuda"],
+        norm_backends: vec!["flashinfer"],
+        gemm_backends: vec!["torch_linear"],
+        elementwise_backends: vec!["triton"],
+        // `fa2_bf16` (default) is measured in bf16 while the engine runs fp8
+        // -- see the worklet's note; the FA4 choices are the engine's call.
+        attention_backends: chain.attention.backends(),
+        tp_size,
+        gpu_name: gpu_name.clone(),
+        hidden_dim: Dim::param("dflash2_hidden", checkpoint.hidden_dim),
+        intermediate_dim: Dim::param("dflash2_intermediate", checkpoint.intermediate_dim),
+        num_qo_heads: Dim::param("dflash2_qo_heads", checkpoint.num_qo_heads),
+        num_kv_heads: Dim::param("dflash2_kv_heads", checkpoint.num_kv_heads),
+        head_dim: Dim::param("dflash2_head_dim", checkpoint.head_dim),
+        conv_taps: checkpoint.conv_taps,
+        conv_group_size: checkpoint.conv_group_size,
+        dtype: DType::Bf16,
+        gemm_dtype: DType::Bf16,
+        attn_q_dtype: chain.attention.dtype(),
+        attn_kv_dtype: chain.attention.dtype(),
+        // The query block's own K/V goes through the same insert as the
+        // context rows.
+        query_kv_append: context_kv.context_kv_append.clone(),
+        qk_norm_rope_kv_write_backends: chain.qk_norm_rope_kv_write.then(|| vec!["triton"]),
+        kv_cache_page_size: DRAFT_PAGE_SIZE,
+        conv_residual_norm_backends: chain.conv_residual_norm.then(|| vec!["vllm_triton"]),
+        query_block_len: draft_tokens + 1,
     };
     let selector_cfg = Dflash2SelectorLocalWorkletConfig {
         gemm_backends: vec!["torch_linear"],
@@ -2237,7 +2252,7 @@ fn dflash2_draft_resolved(
         // (`RadixTopKKernel_Unified` and the filtered/finalize pair), so that
         // is the identity to price against; `torch` stays behind it as the
         // semantic fallback the kernel kind also registers.
-        topk_backends: vec!["flashinfer", "torch"],
+        topk_backends: chain.topk.backends(),
         tp_size,
         gpu_name: gpu_name.clone(),
         hidden_dim: Dim::param("dflash2_hidden", checkpoint.hidden_dim),
@@ -2249,7 +2264,7 @@ fn dflash2_draft_resolved(
     };
     Ok(Dflash2DraftResolved {
         sliding_window,
-        context_kv: Dflash2ContextKvLocalWorklet::resolve_config(&context_kv_cfg),
+        context_kv,
         draft_attn: Dflash2DraftAttnLocalWorklet::resolve_config(&layer_cfg),
         draft_ffn: Dflash2DraftFfnLocalWorklet::resolve_config(&layer_cfg),
         selector: Dflash2SelectorLocalWorklet::resolve_config(&selector_cfg),
@@ -2271,6 +2286,7 @@ fn glm53_flash_dflash2_draft(
     tp_size: u16,
     gpu: &str,
     draft_tokens: u32,
+    chain: &Dflash2DraftChain,
 ) -> Result<Dflash2DraftResolved> {
     let checkpoint = &GLM53_FLASH_DFLASH2;
     anyhow::ensure!(
@@ -2286,6 +2302,7 @@ fn glm53_flash_dflash2_draft(
         gpu,
         draft_tokens,
         checkpoint.sliding_window,
+        chain,
     )
     .context("expanding the DFlash2 draft configs")
 }
@@ -2336,7 +2353,7 @@ pub fn glm53_flash_vllm_nvfp4_kda_dsa_moe_dflash2(
         name,
         bridge,
     )?;
-    let draft = glm53_flash_dflash2_draft(*tp_size, gpu, *draft_tokens)?;
+    let draft = glm53_flash_dflash2_draft(*tp_size, gpu, *draft_tokens, &Dflash2DraftChain::default())?;
     glm53_flash_vllm_nvfp4_dflash2::build(
         name,
         target,
@@ -2408,7 +2425,7 @@ pub fn glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         name,
         bridge,
     )?;
-    let draft = glm53_flash_dflash2_draft(1, gpu, *draft_tokens)?;
+    let draft = glm53_flash_dflash2_draft(1, gpu, *draft_tokens, &sel.dflash2_draft_chain()?)?;
     glm53_flash_vllm_nvfp4_dflash2::build(
         name,
         target,
@@ -2491,7 +2508,7 @@ pub fn glm53_vllm_nvfp4_dp_attn_ep_moe_dflash2(
         name,
         bridge,
     )?;
-    let draft = dflash2_draft_resolved(checkpoint, 1, gpu, *draft_tokens, *draft_sliding_window)
+    let draft = dflash2_draft_resolved(checkpoint, 1, gpu, *draft_tokens, *draft_sliding_window, &Dflash2DraftChain::default())
         .context("expanding the DFlash2 draft configs")?;
     glm53_flash_vllm_nvfp4_dflash2::build(
         name,
@@ -5367,8 +5384,8 @@ mod tests {
         // allocates the draft layers "as full attention for cache allocation".
         // Billing a window would under-count the pool by context / window,
         // which at 131072 tokens is 64x.
-        let narrow = dflash2_draft_resolved(&GLM53_DFLASH2, 4, "NVIDIA B200", 7, 512).unwrap();
-        let wide = dflash2_draft_resolved(&GLM53_DFLASH2, 4, "NVIDIA B200", 7, 131_072).unwrap();
+        let narrow = dflash2_draft_resolved(&GLM53_DFLASH2, 4, "NVIDIA B200", 7, 512, &Dflash2DraftChain::default()).unwrap();
+        let wide = dflash2_draft_resolved(&GLM53_DFLASH2, 4, "NVIDIA B200", 7, 131_072, &Dflash2DraftChain::default()).unwrap();
         let narrow_bytes =
             glm53_vllm_nvfp4_dsa_moe_dflash2::draft_kv_bytes_per_token(&narrow).unwrap();
         assert_eq!(
@@ -5415,7 +5432,7 @@ mod tests {
 
     #[test]
     fn the_flash_draft_takes_its_own_checkpoint_shapes() {
-        let draft = glm53_flash_dflash2_draft(1, "NVIDIA B200", 7).unwrap();
+        let draft = glm53_flash_dflash2_draft(1, "NVIDIA B200", 7, &Dflash2DraftChain::default()).unwrap();
         assert_eq!(draft.context_kv.raw_cfg.hidden_dim.get(), 4096);
         assert_eq!(draft.context_kv.raw_cfg.num_draft_layers, 5);
         assert_eq!(draft.context_kv.raw_cfg.num_aux_layers, 5);
@@ -5431,9 +5448,9 @@ mod tests {
     #[test]
     fn the_flash_draft_runs_a_block_no_longer_than_its_checkpoints() {
         // block_size 8: up to seven drafts; a shorter block drafts fewer.
-        assert!(glm53_flash_dflash2_draft(1, "NVIDIA B200", 3).is_ok());
+        assert!(glm53_flash_dflash2_draft(1, "NVIDIA B200", 3, &Dflash2DraftChain::default()).is_ok());
         for draft_tokens in [0, 8] {
-            let err = glm53_flash_dflash2_draft(1, "NVIDIA B200", draft_tokens).unwrap_err();
+            let err = glm53_flash_dflash2_draft(1, "NVIDIA B200", draft_tokens, &Dflash2DraftChain::default()).unwrap_err();
             assert!(err.to_string().contains("block_size 8"), "{err}");
         }
     }
