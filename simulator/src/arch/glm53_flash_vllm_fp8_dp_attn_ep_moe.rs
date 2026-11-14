@@ -2175,7 +2175,8 @@ struct RankBatch {
     /// Rows the group's attention runs on (each rank, heads split): `rows`
     /// before the sequence-parallel slice.
     attn_rows: u32,
-    /// lm_head rows: one per scheduled request (none for a dummy batch).
+    /// lm_head rows: one per prefill request plus `verify_width` per decode
+    /// request (none for a dummy batch).
     logits_rows: u32,
     kda: Glm53KdaAttnLocalWorkletInput,
     dsa: Glm53DsaAttnLocalWorkletInput,
@@ -2301,7 +2302,9 @@ fn normalize_input(
         ranks.push(RankBatch {
             rows: total.max(verify_width),
             attn_rows: 0,
-            logits_rows: group.request_count(),
+            // vLLM's target logits: one row per prefill request plus every
+            // verify row of a decode request (`num_reqs + num_draft_tokens`).
+            logits_rows: group.prefill_chunk_pairs.len() as u32 + decode_tokens,
             kda,
             dsa,
         });
@@ -3009,6 +3012,33 @@ mod tests {
         assert_eq!(batch.ranks[2].logits_rows, 0);
         assert_eq!(batch.ranks[2].dsa.decode_kv_lens, [1]);
         assert_eq!(batch.ranks[1].dsa.prefill_chunk_pairs, [(8192, 384)]);
+    }
+
+    /// Catches pricing the target lm_head on one row per request under
+    /// speculative verify: vLLM computes logits for every verify row of a
+    /// decode request (`num_reqs + num_draft_tokens`) and one per prefill.
+    #[test]
+    fn lm_head_reads_every_verify_row() {
+        let mixed = ArchGroupInput {
+            batch_tokens: 100 + 16 * 8,
+            prefill_tokens: 100,
+            decode_tokens: 16 * 8,
+            prefill_chunk_pairs: vec![(0, 100)],
+            decode_kv_lens: vec![4096; 16],
+            total_kv_len: 0,
+        };
+        let decode = ArchGroupInput {
+            batch_tokens: 4 * 8,
+            prefill_tokens: 0,
+            decode_tokens: 4 * 8,
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: vec![4096; 4],
+            total_kv_len: 0,
+        };
+        let batch =
+            normalize_input(&input(vec![mixed, decode]), 2, 1, false, 131072, 8, &[]).unwrap();
+        let logits: Vec<_> = batch.ranks.iter().map(|rank| rank.logits_rows).collect();
+        assert_eq!(logits, [1 + 16 * 8, 4 * 8]);
     }
 
     #[test]

@@ -599,7 +599,7 @@ impl Glm53FlashVllmFp8PpStageModel {
             push(
                 &output.lm_head,
                 SingleGemmKernelInput {
-                    m: batch.request_count,
+                    m: batch.logits_rows,
                 },
                 ev,
             );

@@ -1624,7 +1624,7 @@ impl Glm53FlashVllmModel {
         push(
             &self.lm_head,
             SingleGemmKernelInput {
-                m: batch.request_count,
+                m: batch.logits_rows,
             },
             ev,
         );
@@ -1718,7 +1718,9 @@ pub(crate) fn graph_padded_tokens(sorted_sizes: &[u32], tokens: u32) -> u32 {
 /// One iteration, as every layer sees it (one TP group, no attention DP).
 pub(crate) struct NormalizedBatch {
     pub(crate) total_tokens: u32,
-    pub(crate) request_count: u32,
+    /// lm_head rows: one per prefill request plus `verify_width` per decode
+    /// request.
+    pub(crate) logits_rows: u32,
     kda: Glm53KdaAttnLocalWorkletInput,
     dsa: Glm53DsaAttnLocalWorkletInput,
 }
@@ -1804,7 +1806,9 @@ pub(crate) fn normalize_input(
     let (kda, dsa) = attention_inputs(&group.prefill_chunk_pairs, &group.decode_kv_lens);
     Ok(NormalizedBatch {
         total_tokens,
-        request_count: group.request_count(),
+        // vLLM's target logits: one row per prefill request plus every verify
+        // row of a decode request (`num_reqs + num_draft_tokens`).
+        logits_rows: group.prefill_chunk_pairs.len() as u32 + decode_tokens,
         kda,
         dsa,
     })
@@ -2509,7 +2513,13 @@ mod tests {
             tokens_per_source_rank: Vec::new(),
         };
         let batch = normalize_input(&input, 8192, 1).unwrap();
-        assert_eq!((batch.total_tokens, batch.request_count), (2048, 30));
+        assert_eq!((batch.total_tokens, batch.logits_rows), (2048, 30));
+        // Under speculative verify every decode row reaches the lm_head:
+        // vLLM's target logits are num_reqs + num_draft_tokens rows.
+        let mut spec = input.clone();
+        spec.groups[0].decode_tokens = 29 * 8;
+        spec.groups[0].batch_tokens = 2019 + 29 * 8;
+        assert_eq!(normalize_input(&spec, 8192, 8).unwrap().logits_rows, 1 + 29 * 8);
         assert_eq!(batch.kda.prefill_sequence_lengths, [2019]);
         assert_eq!(batch.kda.decode_batch_size, 29);
         assert_eq!(batch.dsa.decode_kv_lens.len(), 29);
