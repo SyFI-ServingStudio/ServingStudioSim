@@ -186,6 +186,10 @@ const fn default_kda_tp_fused_router_gate_once() -> bool {
     true
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 const fn default_kda_tp_fused_kda_state_dtype() -> KdaStateDtype {
     KdaStateDtype::Bf16
 }
@@ -1767,6 +1771,14 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         router_gate_once: bool,
+        /// Price a bf16 copy of the routed input ([rows, hidden], one read and
+        /// one write) ahead of the dispatch quant (`moe.input_glue`; the default).
+        /// The 2026-09 FP8 TP4/EP4 capture had this elementwise launch; the
+        /// fork's NVFP4 naive DP/EP path quantizes the bf16 hidden directly
+        /// (no copy), so `false` drops the leaf.
+        #[serde(default = "default_true")]
+        #[param(default = true, cache_key)]
+        moe_input_copy: bool,
         /// What-if (`extrapolated`): a JSON table `{"mode": "absolute" | "ratio",
         /// "points": [{"tokens", "ours_us", "production_us"}, ...]}` that prices
         /// every EP rank's routed-expert call (routing + FC1 + FC2 + finalize) at
@@ -1889,6 +1901,14 @@ pub enum IterArchSel {
         #[serde(default = "default_kda_tp_fused_router_gate_once")]
         #[param(default = true, cache_key)]
         router_gate_once: bool,
+        /// Price a bf16 copy of the routed input ([rows, hidden], one read and
+        /// one write) ahead of the dispatch quant (`moe.input_glue`; the default).
+        /// The 2026-09 FP8 TP4/EP4 capture had this elementwise launch; the
+        /// fork's NVFP4 naive DP/EP path quantizes the bf16 hidden directly
+        /// (no copy), so `false` drops the leaf.
+        #[serde(default = "default_true")]
+        #[param(default = true, cache_key)]
+        moe_input_copy: bool,
         /// What-if (`extrapolated`): a JSON table `{"mode": "absolute" | "ratio",
         /// "points": [{"tokens", "ours_us", "production_us"}, ...]}` that prices
         /// every EP rank's routed-expert call (routing + FC1 + FC2 + finalize) at
@@ -2281,6 +2301,10 @@ impl IterArchSel {
             } => *moe_shared_overlap,
             _ => Default::default(),
         };
+        let moe_input_copy = match self {
+            Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 { moe_input_copy, .. } => *moe_input_copy,
+            _ => true,
+        };
         let routed_moe_whatif = match self {
             Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
                 routed_moe_whatif_file: Some(path),
@@ -2319,6 +2343,7 @@ impl IterArchSel {
         Ok(Glm53FlashFusions {
             mhc_boundary,
             router_gate_once,
+            moe_input_copy,
             routed_moe_whatif,
             moe_shared_overlap,
             moe_shared_pair,
@@ -3116,14 +3141,29 @@ mod layerwise_tests {
 
 /// The boundary fusions a GLM-5.3-Flash NVFP4 DP arch prices
 /// ([`IterArchSel::glm53_flash_fusions`]).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Glm53FlashFusions {
     pub mhc_boundary: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MhcBoundaryPricing,
     pub router_gate_once: bool,
+    /// `moe_input_copy`: price the routed-input bf16 copy (`moe.input_glue`).
+    pub moe_input_copy: bool,
     /// `routed_moe_whatif_file`, read.
     pub routed_moe_whatif: Option<crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::RoutedMoeWhatIf>,
     pub moe_shared_overlap: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedOverlap,
     /// `moe_shared_pair_file`, read (keyed by gathered tokens under
     /// `routed_only`, by rows per rank under `exposed`).
     pub moe_shared_pair: Option<crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MoeSharedPair>,
+}
+
+impl Default for Glm53FlashFusions {
+    fn default() -> Self {
+        Self {
+            mhc_boundary: Default::default(),
+            router_gate_once: false,
+            moe_input_copy: true,
+            routed_moe_whatif: None,
+            moe_shared_overlap: Default::default(),
+            moe_shared_pair: None,
+        }
+    }
 }

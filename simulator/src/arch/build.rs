@@ -2075,6 +2075,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         ep_comm: ep_comm.clone(),
         mhc_boundary: fusions.mhc_boundary,
         router_gate_once: fusions.router_gate_once,
+        moe_input_copy: fusions.moe_input_copy,
         routed_moe_whatif: fusions.routed_moe_whatif,
         moe_shared_overlap: fusions.moe_shared_overlap,
         moe_shared_pair: fusions.moe_shared_pair,

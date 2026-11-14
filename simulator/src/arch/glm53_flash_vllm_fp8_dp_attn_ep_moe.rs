@@ -156,6 +156,10 @@ pub struct Glm53FlashDpAttnEpParallel {
     /// Compute the router gate once per MoE layer (the fork since #55736)
     /// instead of twice (the 2026-09 alignment capture's line).
     pub router_gate_once: bool,
+    /// Price the routed-input bf16 copy ahead of the dispatch quant
+    /// (`moe.input_glue`, from the 2026-09 FP8 TP4/EP4 capture). The fork's
+    /// NVFP4 naive DP/EP path has no such copy; `false` drops the leaf.
+    pub moe_input_copy: bool,
     /// What-if pricing of the routed-expert call; `None` is its rows.
     pub routed_moe_whatif: Option<RoutedMoeWhatIf>,
     /// How the aux-stream shared expert overlaps the MoE chain.
@@ -838,7 +842,8 @@ enum Attention {
 struct MoeBlock {
     name: String,
     router: Glm53MoeRouterLocalWorklet,
-    input_glue: Op<ElementwiseKernel>,
+    /// `None` under `moe_input_copy: false`.
+    input_glue: Option<Op<ElementwiseKernel>>,
     shared_expert: Glm53MlpLocalWorklet,
     router_select: Option<Op<ElementwiseKernel>>,
     dispatch_quant: Glm53ActivationQuant,
@@ -977,8 +982,8 @@ impl LayerGroup {
                     Ffn::Moe(block) => {
                         leaves.push(block.router.compile(builder));
                         leaves.extend(block.router_select.as_ref().map(|op| op.compile(builder)));
+                        leaves.extend(block.input_glue.as_ref().map(|op| op.compile(builder)));
                         leaves.extend([
-                            block.input_glue.compile(builder),
                             block.shared_expert.compile(builder),
                             block.dispatch_quant.compile(builder),
                         ]);
@@ -1049,8 +1054,8 @@ impl LayerGroup {
                     Ffn::Moe(block) => {
                         leaves.push(block.router.compile(builder));
                         leaves.extend(block.router_select.as_ref().map(|op| op.compile(builder)));
+                        leaves.extend(block.input_glue.as_ref().map(|op| op.compile(builder)));
                         leaves.extend([
-                            block.input_glue.compile(builder),
                             block.shared_expert.compile(builder),
                             block.dispatch_quant.compile(builder),
                         ]);
@@ -1280,11 +1285,9 @@ impl MoeBlock {
         if let Some(select) = &self.router_select {
             push(select, ElementwiseKernelInput { num_tokens: rows }, ev);
         }
-        push(
-            &self.input_glue,
-            ElementwiseKernelInput { num_tokens: rows },
-            ev,
-        );
+        if let Some(glue) = &self.input_glue {
+            push(glue, ElementwiseKernelInput { num_tokens: rows }, ev);
+        }
         self.shared_expert.eval_or_zero(
             &Glm53MlpLocalWorkletInput { num_tokens: rows },
             rows <= SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
@@ -1614,13 +1617,19 @@ fn build_group(
                     cfg.parallel.router_gate_once,
                     bridge,
                 )?,
-                input_glue: atomic(
-                    m,
-                    "input_glue",
-                    local.moe_input_glue.clone(),
-                    ElementwiseKernel::build,
-                    bridge,
-                )?,
+                input_glue: cfg
+                    .parallel
+                    .moe_input_copy
+                    .then(|| {
+                        atomic(
+                            m,
+                            "input_glue",
+                            local.moe_input_glue.clone(),
+                            ElementwiseKernel::build,
+                            bridge,
+                        )
+                    })
+                    .transpose()?,
                 shared_expert: Glm53MlpLocalWorklet::build(
                     format!("{m}.shared_expert"),
                     resolved.local.shared_expert.clone(),
@@ -2455,6 +2464,7 @@ mod tests {
             ep_comm: EpCommConfig::default(),
             mhc_boundary: Default::default(),
             router_gate_once: false,
+            moe_input_copy: true,
             routed_moe_whatif: None,
             moe_shared_overlap: Default::default(),
             moe_shared_pair: None,
@@ -2605,6 +2615,22 @@ mod tests {
         let base = leaves(&built_with(&model, &parallel(8)));
         assert!(base.iter().any(|(l, _)| l == "combine_glue"));
         assert!(base.iter().any(|(l, _)| l == "gate_recompute"));
+    }
+
+    /// Catches `moe_input_copy: false` keeping the routed-input copy, or the
+    /// default losing it: one `input_glue` leaf per MoE layer kind and rank by
+    /// default, none when off, nothing else removed.
+    #[test]
+    fn moe_input_copy_off_drops_only_the_input_glue() {
+        let model = config("glm53_flash_nvfp4");
+        let base = leaves(&built_with(&model, &parallel(8)));
+        let mut off = parallel(8);
+        off.moe_input_copy = false;
+        let dropped = leaves(&built_with(&model, &off));
+        let glue = base.iter().filter(|(l, _)| l == "input_glue").count();
+        assert!(glue > 0);
+        assert!(dropped.iter().all(|(l, _)| l != "input_glue"));
+        assert_eq!(dropped.len() + glue, base.len());
     }
 
     #[test]

@@ -61,6 +61,11 @@
 //!   real cost lies between them until dedicated all-gather rows exist.
 //! * **Router gate.** Once per MoE layer (`router_gate_once`, default on: the
 //!   vLLM fork's GateLinear since #55736).
+//! * **Routed-input copy.** `moe_input_copy` (default on) prices a bf16
+//!   [rows, hidden] copy ahead of the dispatch quant (`moe.input_glue`), a
+//!   launch seen in the 2026-09 FP8 TP4/EP4 capture. The fork's NVFP4 naive
+//!   DP/EP path quantizes the hidden directly and, with the TRT-LLM / CuTe DSL
+//!   experts, skips the post-gather scale swizzle; `false` drops the leaf.
 //!
 //! # Where each component's time comes from
 //!
@@ -178,6 +183,7 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         kda_tp_comm_pricing,
         expert_exchange,
         router_gate_once,
+        moe_input_copy,
         routed_moe_whatif_file,
         moe_shared_pair_file,
         moe_shared_pair_column,
@@ -258,6 +264,7 @@ pub fn target_selector(sel: &IterArchSel) -> Result<IterArchSel> {
         mhc_fuse_fixed_us,
         mhc_one_launch,
         router_gate_once: *router_gate_once,
+        moe_input_copy: *moe_input_copy,
         routed_moe_whatif_file: routed_moe_whatif_file.clone(),
         moe_shared_pair_file: moe_shared_pair_file.clone(),
         moe_shared_pair_column: moe_shared_pair_column.clone(),
