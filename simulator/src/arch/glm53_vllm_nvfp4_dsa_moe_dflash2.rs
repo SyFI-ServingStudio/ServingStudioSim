@@ -74,20 +74,41 @@ pub enum DraftAttention {
     /// CUDA graph's default (`max_num_splits`): the engine's call. Forward plus
     /// the split combine.
     Fa4Fp8Split32,
-    /// The same call at `num_splits = 1`: one forward launch, bit-identical
-    /// output.
+    /// The same call at `num_splits = 1` at every batch size: one forward
+    /// launch. Bit-identical to 32 splits from 16 requests per launch up
+    /// (lane J); below that it is slower and not bit-identical.
     Fa4Fp8Nosplit,
+    /// The deployable gate: `num_splits = 1` when one launch carries at least
+    /// [`NOSPLIT_MIN_REQUESTS`] requests, 32 splits below, decided per launch.
+    Fa4Fp8NosplitFrom16,
 }
 
+/// Requests per launch from which `fa4_fp8_nosplit_from16` drops the splits.
+pub const NOSPLIT_MIN_REQUESTS: u32 = 16;
+
 /// The `draft_attention` choices the launcher schema advertises.
-pub const DRAFT_ATTENTIONS: [&str; 3] = ["fa2_bf16", "fa4_fp8_split32", "fa4_fp8_nosplit"];
+pub const DRAFT_ATTENTIONS: [&str; 4] = [
+    "fa2_bf16",
+    "fa4_fp8_split32",
+    "fa4_fp8_nosplit",
+    "fa4_fp8_nosplit_from16",
+];
 
 impl DraftAttention {
     fn backend(self) -> &'static str {
         match self {
             Self::Fa2Bf16 => "fa2",
-            Self::Fa4Fp8Split32 => "vllm_fa4_split32",
+            Self::Fa4Fp8Split32 | Self::Fa4Fp8NosplitFrom16 => "vllm_fa4_split32",
             Self::Fa4Fp8Nosplit => "vllm_fa4_nosplit",
+        }
+    }
+
+    /// `Some((min_requests, backends))`: launches of at least `min_requests`
+    /// requests run these backends instead of [`Self::backends`].
+    pub fn large_batch(self) -> Option<(u32, Vec<&'static str>)> {
+        match self {
+            Self::Fa4Fp8NosplitFrom16 => Some((NOSPLIT_MIN_REQUESTS, vec!["vllm_fa4_nosplit"])),
+            _ => None,
         }
     }
 
@@ -95,7 +116,7 @@ impl DraftAttention {
         use crate::timing::bridge::DType;
         match self {
             Self::Fa2Bf16 => DType::Bf16,
-            Self::Fa4Fp8Split32 | Self::Fa4Fp8Nosplit => DType::Fp8E4m3,
+            Self::Fa4Fp8Split32 | Self::Fa4Fp8Nosplit | Self::Fa4Fp8NosplitFrom16 => DType::Fp8E4m3,
         }
     }
 
@@ -112,19 +133,39 @@ pub enum DraftTopk {
     #[default]
     Flashinfer,
     /// Exact threshold top-k (slice maxima, a per-row threshold, an exact
-    /// select over the candidates at or above it): same ids and values.
+    /// select over the candidates at or above it) at every row count: same
+    /// values everywhere; same ids only on FlashInfer's small-row path (up to
+    /// [`THRESHOLD_MAX_ROWS`] rows). Above it FlashInfer breaks exact ties in
+    /// another order, so the proposed token among ties can differ.
     Threshold,
+    /// The bit-exact gate: threshold top-k up to [`THRESHOLD_MAX_ROWS`] rows
+    /// per launch, FlashInfer above.
+    ThresholdSmallRows,
 }
 
+/// Rows per launch up to which the threshold top-k reproduces FlashInfer's
+/// deterministic tie order (job 22385: ids identical at 512-576 rows, 31% at
+/// 640 and 768, where FlashInfer takes another path).
+pub const THRESHOLD_MAX_ROWS: u32 = 560;
+
 /// The `draft_topk` choices the launcher schema advertises.
-pub const DRAFT_TOPKS: [&str; 2] = ["flashinfer", "threshold"];
+pub const DRAFT_TOPKS: [&str; 3] = ["flashinfer", "threshold", "threshold_small_rows"];
 
 impl DraftTopk {
     pub fn backends(self) -> Vec<&'static str> {
         match self {
             // `torch` stays behind it as the semantic fallback.
-            Self::Flashinfer => vec!["flashinfer", "torch"],
+            Self::Flashinfer | Self::ThresholdSmallRows => vec!["flashinfer", "torch"],
             Self::Threshold => vec!["triton_threshold"],
+        }
+    }
+
+    /// `Some((max_rows, backends))`: launches of at most `max_rows` rows run
+    /// these backends instead of [`Self::backends`].
+    pub fn small_rows(self) -> Option<(u32, Vec<&'static str>)> {
+        match self {
+            Self::ThresholdSmallRows => Some((THRESHOLD_MAX_ROWS, vec!["triton_threshold"])),
+            _ => None,
         }
     }
 }
@@ -148,7 +189,7 @@ impl Dflash2DraftChain {
         anyhow::ensure!(
             !self.qk_norm_rope_kv_write || self.attention != DraftAttention::Fa2Bf16,
             "draft_qk_norm_rope_kv_write emits an fp8 query and fp8 K/V for the FA4 call; \
-             it needs draft_attention fa4_fp8_split32 or fa4_fp8_nosplit, not fa2_bf16"
+             it needs an fa4_fp8_* draft_attention, not fa2_bf16"
         );
         Ok(())
     }

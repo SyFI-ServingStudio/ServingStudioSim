@@ -88,6 +88,11 @@ pub struct Dflash2DraftLayerLocalWorkletConfig {
     pub gemm_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
     pub attention_backends: Vec<&'static str>,
+    /// `Some((min_requests, backends))`: a launch carrying at least
+    /// `min_requests` requests runs these backends instead (the engine picks
+    /// its split count per launch); smaller launches keep
+    /// `attention_backends`.
+    pub attention_large_batch: Option<(u32, Vec<&'static str>)>,
     pub tp_size: u16,
     pub gpu_name: String,
     pub hidden_dim: Dim,
@@ -183,6 +188,8 @@ pub struct Dflash2DraftAttnLocalWorkletResolved {
     pub query_kv_append: KvCacheAppendKernelConfig,
     pub qk_norm_rope_kv_write: Option<QkNormRopeFp8KvWriteKernelConfig>,
     pub attention: FlashinferAttnRectKernelConfig,
+    /// `attention` at the large-batch backends, from `min_requests` requests.
+    pub attention_large_batch: Option<(u32, FlashinferAttnRectKernelConfig)>,
     pub o_proj: SingleGemmKernelConfig,
 }
 
@@ -216,6 +223,8 @@ pub struct Dflash2DraftAttnLocalWorklet {
     pub qkv_proj: Op<SingleGemmKernel>,
     pub qk_prep: QkPrep,
     pub attention: Op<FlashinferAttnRectKernel>,
+    /// Its own slot, so the cost log shows which launches took it.
+    pub attention_large_batch: Option<(u32, Op<FlashinferAttnRectKernel>)>,
     pub o_proj: Op<SingleGemmKernel>,
     resolved: Dflash2DraftAttnLocalWorkletResolved,
 }
@@ -252,7 +261,7 @@ impl Dflash2DraftAttnLocalWorklet {
             checked_product("rope.output_bytes_per_token", &[rope_width, dtype_bytes])
                 .expect("validated DFlash2 RoPE output byte rate must fit u32");
 
-        Dflash2DraftAttnLocalWorkletResolved {
+        let mut resolved = Dflash2DraftAttnLocalWorkletResolved {
             input_add_rms_norm: ResidualRmsNormKernelConfig {
                 backends: cfg.residual_norm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -301,6 +310,7 @@ impl Dflash2DraftAttnLocalWorklet {
                     kv_dtype: cfg.attn_kv_dtype,
                 }
             }),
+            attention_large_batch: None,
             attention: FlashinferAttnRectKernelConfig {
                 backends: cfg.attention_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -319,7 +329,16 @@ impl Dflash2DraftAttnLocalWorklet {
                 dtype: cfg.gemm_dtype,
             },
             raw_cfg: cfg.clone(),
-        }
+        };
+        resolved.attention_large_batch =
+            cfg.attention_large_batch
+                .as_ref()
+                .map(|(min_requests, backends)| {
+                    let mut large = resolved.attention.clone();
+                    large.backends = backends.clone();
+                    (*min_requests, large)
+                });
+        resolved
     }
 
     pub fn build(
@@ -407,6 +426,20 @@ impl Dflash2DraftAttnLocalWorklet {
                 FlashinferAttnRectKernel::build,
                 bridge,
             )?,
+            attention_large_batch: resolved
+                .attention_large_batch
+                .as_ref()
+                .map(|(min_requests, cfg)| {
+                    build_atomic(
+                        &name,
+                        "attention_large_batch",
+                        cfg.clone(),
+                        FlashinferAttnRectKernel::build,
+                        bridge,
+                    )
+                    .map(|op| (*min_requests, op))
+                })
+                .transpose()?,
             o_proj: build_atomic(
                 &name,
                 "o_proj",
@@ -445,6 +478,9 @@ impl Dflash2DraftAttnLocalWorklet {
                     QkPrep::Fused(op) => nodes.push(op.compile(builder)),
                 }
                 nodes.push(self.attention.compile(builder));
+                if let Some((_, op)) = &self.attention_large_batch {
+                    nodes.push(op.compile(builder));
+                }
                 nodes.push(self.o_proj.compile(builder));
                 nodes
             })),
@@ -527,16 +563,28 @@ impl Dflash2DraftAttnLocalWorklet {
         // per request. See `batched_rectangles`. `add_fanin` (not `add`) so the
         // slot carries the selected backend rather than the ZERO accumulator's
         // sentinel, which would read as "never executed".
+        // Under `attention_large_batch` the launch goes to exactly one of the
+        // two slots by its request count; the other reads ZERO.
         let mut attention = LeafMetrics::ZERO;
+        let mut large = LeafMetrics::ZERO;
         if let Some(batch) = batched_rectangles(&input.rectangles) {
-            attention.add_fanin(self.attention.kernel.eval(&batch));
+            match &self.attention_large_batch {
+                Some((min_requests, op)) if batch.num_requests >= *min_requests => {
+                    large.add_fanin(op.kernel.eval(&batch))
+                }
+                _ => attention.add_fanin(self.attention.kernel.eval(&batch)),
+            }
         }
-        ev.push(attention, || {
+        let log = || {
             Dflash2DraftAttnLog {
                 rectangles: input.rectangles.clone(),
             }
             .into()
-        });
+        };
+        ev.push(attention, log);
+        if self.attention_large_batch.is_some() {
+            ev.push(large, log);
+        }
 
         eval_atomic_or_zero(&self.o_proj, SingleGemmKernelInput { m: tokens }, zero, ev);
     }
@@ -1016,6 +1064,7 @@ mod tests {
             gemm_backends: vec!["torch"],
             elementwise_backends: vec!["triton"],
             attention_backends: vec!["flashinfer"],
+            attention_large_batch: None,
             tp_size: 4,
             gpu_name: "NVIDIA B200".to_string(),
             hidden_dim: Dim::param("hidden_dim", HIDDEN_DIM),
@@ -1046,6 +1095,24 @@ mod tests {
             conv_residual_norm_backends: None,
             query_block_len: 8,
         }
+    }
+
+    #[test]
+    fn the_large_batch_attention_is_the_same_call_at_other_backends() {
+        let mut gated = cfg();
+        gated.attention_large_batch = Some((16, vec!["vllm_fa4_nosplit"]));
+        let resolved = Dflash2DraftAttnLocalWorklet::resolve_config(&gated);
+        let (min_requests, large) = resolved.attention_large_batch.expect("gated");
+        assert_eq!(min_requests, 16);
+        assert_eq!(large.backends, vec!["vllm_fa4_nosplit"]);
+        assert_eq!(
+            large.num_qo_heads.get(),
+            resolved.attention.num_qo_heads.get()
+        );
+        assert_eq!(resolved.attention.backends, vec!["flashinfer"]);
+        assert!(Dflash2DraftAttnLocalWorklet::resolve_config(&cfg())
+            .attention_large_batch
+            .is_none());
     }
 
     #[test]

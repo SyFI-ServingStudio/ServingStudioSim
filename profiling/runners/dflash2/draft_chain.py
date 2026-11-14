@@ -346,7 +346,7 @@ def profile_grouped_conv_residual_rms_norm_vllm_triton(
 
 
 # ----------------------------------------------------------- vocabulary top-k --
-_TOPK_ID_EXACT_ROWS = 512
+_TOPK_ID_EXACT_ROWS = 560
 
 
 def profile_logits_topk_triton_threshold(
@@ -391,8 +391,9 @@ def profile_logits_topk_triton_threshold(
         )
         # Up to _TOPK_ID_EXACT_ROWS rows FlashInfer's deterministic order is the
         # one the kernel reproduces, so ids must match it exactly; past that
-        # FlashInfer breaks bf16 ties in another order (observed: 30% of rows
-        # identical at 768+ rows) and only values + valid picks are required.
+        # FlashInfer breaks bf16 ties in another order (job 22385: all rows
+        # identical up to 576, 31% at 640 and 768) and only values + valid
+        # picks are required.
         ids_required = num_rows <= _TOPK_ID_EXACT_ROWS
         if not values_ok or not picks_ok or (ids_required and (rows < 1.0 or tie_rows < 1.0)):
             raise KernelLaunchFailed(

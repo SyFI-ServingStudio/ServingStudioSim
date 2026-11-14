@@ -2222,6 +2222,7 @@ fn dflash2_draft_resolved(
         // `fa2_bf16` (default) is measured in bf16 while the engine runs fp8
         // -- see the worklet's note; the FA4 choices are the engine's call.
         attention_backends: chain.attention.backends(),
+        attention_large_batch: chain.attention.large_batch(),
         tp_size,
         gpu_name: gpu_name.clone(),
         hidden_dim: Dim::param("dflash2_hidden", checkpoint.hidden_dim),
@@ -2251,6 +2252,7 @@ fn dflash2_draft_resolved(
         // is the identity to price against; `torch` stays behind it as the
         // semantic fallback the kernel kind also registers.
         topk_backends: chain.topk.backends(),
+        topk_small_rows: chain.topk.small_rows(),
         tp_size,
         gpu_name: gpu_name.clone(),
         hidden_dim: Dim::param("dflash2_hidden", checkpoint.hidden_dim),
