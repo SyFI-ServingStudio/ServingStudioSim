@@ -96,6 +96,72 @@ const FWHT_EFFECTIVE_FACTOR: u32 = 5;
 /// `k[idx]` and `gate_score[idx]` gathers ahead of the prefill kpool write.
 const PREFILL_GATHER_LAUNCHES: u32 = 2;
 
+/// How one group of DSA-front projections that read the same operand
+/// launches. Not the fork's path except `Separate`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DsaFrontGemm {
+    /// The fork: one launch per projection.
+    #[default]
+    Separate,
+    /// The group's bf16 projections as one GEMM over concatenated weights:
+    /// the same callable and backends as the separate ones, a wider N. The
+    /// surrounding launches stay.
+    Concat,
+    /// The whole cut as one kernel with its epilogues, priced only by rows of
+    /// this backend: a missing row fails the build, and an override to any
+    /// other backend is rejected.
+    Fused(&'static str),
+}
+
+/// Which launch list prices the per-iteration elementwise glue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DsaGlue {
+    /// `GLUE_LAUNCHES` launches of `GLUE_BYTES_PER_TOKEN` per token (kept so
+    /// earlier runs reproduce).
+    #[default]
+    Placeholder,
+    /// The fork's decode launch list at its real bytes
+    /// (logs/20261114_0_mainline_v3/dsa_audit.md, glue G1-G7): the hidden
+    /// state's fp32 cast for `head_weights`, the top-k buffer fill, two
+    /// position casts, the pool-id cast to int64, the `+ 1` on the top-k
+    /// sequence lengths, and the copy of the expanded indices into the top-k
+    /// buffer.
+    ForkLaunchList,
+}
+
+/// Fusions of the DSA front (the launches before sparse attention), by input
+/// operand (`from_moe16.md` cuts A-D). The default is the fork's launches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Glm53DsaFront {
+    /// Cut A, the GEMMs reading the hidden state. `Concat`: `fused_qkv_a`,
+    /// `wk_weights` without its head-weight columns, and `kpool_gate_score`
+    /// as one bf16 GEMM; `head_weights` and its cast stay. `Fused`: also
+    /// the fp32 `head_weights` (its 32 columns once, with an fp32 epilogue)
+    /// with its cast and `k_norm` in the epilogue.
+    pub hidden_gemm: DsaFrontGemm,
+    /// Cut B, the GEMMs reading the normed q latent. `Concat`: `q_b` and the
+    /// indexer's `wq_b` as one bf16 GEMM. `Fused`: also the q half of the
+    /// q/kv RMS norm, the indexer's FWHT + quant and its weight scale.
+    pub q_lora_gemm: DsaFrontGemm,
+    /// Cut C: `q_absorb` with the fp8 quant in its epilogue, on this backend
+    /// only.
+    pub q_absorb_fp8: Option<&'static str>,
+    /// Cut D: one state writer (kv RMS norm + MLA cache append + kpool decode
+    /// update), on this backend only.
+    pub state_writer: Option<&'static str>,
+    pub glue: DsaGlue,
+}
+
+impl DsaFrontGemm {
+    fn merged(self) -> bool {
+        self != Self::Separate
+    }
+
+    fn fused(self) -> bool {
+        matches!(self, Self::Fused(_))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Glm53DsaAttnLocalWorkletConfig {
     pub hidden: Dim,
@@ -148,6 +214,25 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     /// index keys) and its top-k selects per row; every other leaf, sparse MLA
     /// included, bills the flattened rows.
     pub decode_next_n: u32,
+    /// Not the fork's path unless default: fused DSA-front launches.
+    pub front: Glm53DsaFront,
+}
+
+/// The fork's decode glue launches ([`DsaGlue::ForkLaunchList`]).
+#[derive(Clone, Debug)]
+pub struct DsaForkGlueConfigs {
+    /// G1, `hidden_states.float()` ahead of `head_weights`, every row.
+    pub hidden_fp32_cast: ElementwiseKernelConfig,
+    /// G2, `topk_indices_buffer[:rows] = -1`.
+    pub topk_buffer_fill: ElementwiseKernelConfig,
+    /// G3 + G5, `positions[:n].to(int32)` (kpool `dec_pos`, top-k seq lens).
+    pub positions_to_int32: ElementwiseKernelConfig,
+    /// G4, `pool_topk.to(int64)`.
+    pub pool_ids_to_int64: ElementwiseKernelConfig,
+    /// G6, the top-k seq lens `+ 1`.
+    pub seq_lens_plus_one: ElementwiseKernelConfig,
+    /// G7, `topk_indices_buffer[:rows, :window] = out`.
+    pub topk_buffer_copy: ElementwiseKernelConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -183,6 +268,16 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub o_proj: SingleGemmKernelConfig,
     pub glue: ElementwiseKernelConfig,
     pub prefill_glue: ElementwiseKernelConfig,
+    /// Cut A as one GEMM (`front.hidden_gemm` not `Separate`).
+    pub hidden_gemm: Option<SingleGemmKernelConfig>,
+    /// Cut B as one GEMM (`front.q_lora_gemm` not `Separate`).
+    pub q_lora_gemm: Option<SingleGemmKernelConfig>,
+    /// Cut C (`front.q_absorb_fp8`).
+    pub q_absorb_fp8: Option<BatchedGemmKernelConfig>,
+    /// Cut D (`front.state_writer`).
+    pub state_writer: Option<ElementwiseKernelConfig>,
+    /// `front.glue == ForkLaunchList`.
+    pub fork_glue: Option<DsaForkGlueConfigs>,
 }
 
 /// One iteration's DSA work on this rank.
@@ -238,8 +333,26 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub o_proj: Op<SingleGemmKernel>,
     pub glue: Op<ElementwiseKernel>,
     pub prefill_glue: Op<ElementwiseKernel>,
+    pub hidden_gemm: Option<Op<SingleGemmKernel>>,
+    pub q_lora_gemm: Option<Op<SingleGemmKernel>>,
+    pub q_absorb_fp8: Option<Op<BatchedGemmKernel>>,
+    pub state_writer: Option<Op<ElementwiseKernel>>,
+    pub fork_glue: Option<DsaForkGlue>,
     resolved: Glm53DsaAttnLocalWorkletResolved,
 }
+
+/// The ops of [`DsaForkGlueConfigs`].
+pub struct DsaForkGlue {
+    pub hidden_fp32_cast: Op<ElementwiseKernel>,
+    pub topk_buffer_fill: Op<ElementwiseKernel>,
+    pub positions_to_int32: Op<ElementwiseKernel>,
+    pub pool_ids_to_int64: Op<ElementwiseKernel>,
+    pub seq_lens_plus_one: Op<ElementwiseKernel>,
+    pub topk_buffer_copy: Op<ElementwiseKernel>,
+}
+
+/// G3 and G5 are the same int64 -> int32 position cast.
+const POSITION_CASTS: u32 = 2;
 
 impl Glm53DsaAttnLocalWorklet {
     pub fn resolve_config(
@@ -422,8 +535,65 @@ impl Glm53DsaAttnLocalWorklet {
             // One int32 index row of `selected_k` lanes in and out per row.
             prefill_glue: ew(4 * cfg.selected_k, 4 * cfg.selected_k),
             topk_decode_cooperative: None,
+            hidden_gemm: None,
+            q_lora_gemm: None,
+            q_absorb_fp8: None,
+            state_writer: None,
+            fork_glue: None,
             raw_cfg: cfg.clone(),
         };
+        let front = cfg.front;
+        let front_gemm = |mode: DsaFrontGemm, concat_n: u32, fused_n: u32, k: Dim| match mode {
+            DsaFrontGemm::Separate => None,
+            DsaFrontGemm::Concat => Some(gemm(concat_n, k)),
+            DsaFrontGemm::Fused(backend) => Some(SingleGemmKernelConfig {
+                backends: vec![backend],
+                ..gemm(fused_n, k)
+            }),
+        };
+        // Cut A. Concat is [qkv_a | k | gate score] in bf16 (2,304 columns for
+        // GLM-5.3-Flash): the 32 bf16 head-weight columns of `wk_weights` are
+        // dropped and `head_weights` stays its own fp32-output GEMM, because a
+        // bf16 output for them changes the selected pools in 62% of rows
+        // (from_moe16.md Addendum 2). The fused cut computes those columns
+        // once with an fp32 epilogue (2,336 columns).
+        let hidden_concat_n = cfg.q_lora_rank.get() + latent + index_dim + index_dim;
+        resolved.hidden_gemm = front_gemm(
+            front.hidden_gemm,
+            hidden_concat_n,
+            hidden_concat_n + index_heads,
+            cfg.hidden.clone(),
+        );
+        // Cut B: [q_b | wq_b] over the normed q latent.
+        let q_lora_n = heads * cfg.qk_nope_head_dim.get() + index_heads * index_dim;
+        resolved.q_lora_gemm = front_gemm(
+            front.q_lora_gemm,
+            q_lora_n,
+            q_lora_n,
+            cfg.q_lora_rank.clone(),
+        );
+        resolved.q_absorb_fp8 = front.q_absorb_fp8.map(|backend| BatchedGemmKernelConfig {
+            backends: vec![backend],
+            ..resolved.q_absorb.clone()
+        });
+        // Cut D moves what its three launches must: the kv latent in (bf16)
+        // and its fp8 cache row out (the normed bf16 copy stays on chip),
+        // plus `kpool_decode_update`'s bytes.
+        resolved.state_writer = front.state_writer.map(|backend| ElementwiseKernelConfig {
+            backends: vec![backend],
+            ..ew(
+                2 * latent + 524 + 1536 / kpool,
+                latent + 512 + (index_dim + 4) / kpool,
+            )
+        });
+        resolved.fork_glue = (front.glue == DsaGlue::ForkLaunchList).then(|| DsaForkGlueConfigs {
+            hidden_fp32_cast: ew(2 * cfg.hidden.get(), 4 * cfg.hidden.get()),
+            topk_buffer_fill: ew(0, 4 * cfg.selected_k),
+            positions_to_int32: ew(8, 4),
+            pool_ids_to_int64: ew(4 * cfg.index_topk / kpool, 8 * cfg.index_topk / kpool),
+            seq_lens_plus_one: ew(4, 4),
+            topk_buffer_copy: ew(4 * window, 4 * window),
+        });
         resolved.topk_decode_cooperative = (!cfg.cooperative_topk_backends.is_empty()).then(|| {
             DsaPersistentTopkDecodeKernelConfig {
                 backends: cfg.cooperative_topk_backends.clone(),
@@ -516,9 +686,87 @@ impl Glm53DsaAttnLocalWorklet {
             o_proj: gemm("o_proj", r.o_proj)?,
             glue: ew("glue", r.glue)?,
             prefill_glue: ew("prefill_glue", r.prefill_glue)?,
+            hidden_gemm: r.hidden_gemm.map(|c| gemm("hidden_gemm", c)).transpose()?,
+            q_lora_gemm: r.q_lora_gemm.map(|c| gemm("q_lora_gemm", c)).transpose()?,
+            q_absorb_fp8: r
+                .q_absorb_fp8
+                .map(|c| atomic(n, "q_absorb_fp8", c, BatchedGemmKernel::build, bridge))
+                .transpose()?,
+            state_writer: r.state_writer.map(|c| ew("state_writer", c)).transpose()?,
+            fork_glue: r
+                .fork_glue
+                .map(|g| -> Result<DsaForkGlue, BuildError> {
+                    Ok(DsaForkGlue {
+                        hidden_fp32_cast: ew("glue.hidden_fp32_cast", g.hidden_fp32_cast)?,
+                        topk_buffer_fill: ew("glue.topk_buffer_fill", g.topk_buffer_fill)?,
+                        positions_to_int32: ew("glue.positions_to_int32", g.positions_to_int32)?,
+                        pool_ids_to_int64: ew("glue.pool_ids_to_int64", g.pool_ids_to_int64)?,
+                        seq_lens_plus_one: ew("glue.seq_lens_plus_one", g.seq_lens_plus_one)?,
+                        topk_buffer_copy: ew("glue.topk_buffer_copy", g.topk_buffer_copy)?,
+                    })
+                })
+                .transpose()?,
             name,
             resolved,
         };
+        // A fused cut is priced by its own backend's rows or not at all: a
+        // run-config override to another backend would price a different
+        // kernel under its name.
+        let front = worklet.resolved.raw_cfg.front;
+        let fused = [
+            (
+                front.hidden_gemm,
+                worklet
+                    .hidden_gemm
+                    .as_ref()
+                    .map(|op| (&op.name, &op.kernel.config.backends, "single_gemm")),
+            ),
+            (
+                front.q_lora_gemm,
+                worklet
+                    .q_lora_gemm
+                    .as_ref()
+                    .map(|op| (&op.name, &op.kernel.config.backends, "single_gemm")),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(mode, op)| match mode {
+            DsaFrontGemm::Fused(backend) => {
+                op.map(|(role, built, kind)| (backend, role, built, kind))
+            }
+            _ => None,
+        })
+        .chain(
+            front
+                .q_absorb_fp8
+                .zip(worklet.q_absorb_fp8.as_ref())
+                .map(|(backend, op)| {
+                    (
+                        backend,
+                        &op.name,
+                        &op.kernel.config.backends,
+                        "batched_gemm",
+                    )
+                }),
+        )
+        .chain(
+            front
+                .state_writer
+                .zip(worklet.state_writer.as_ref())
+                .map(|(backend, op)| {
+                    (backend, &op.name, &op.kernel.config.backends, "elementwise")
+                }),
+        );
+        for (backend, role, built, kind) in fused {
+            if built.as_slice() != [backend] {
+                return Err(BuildError::NoBackendForLaunch {
+                    kind,
+                    role: role.clone(),
+                    backends: built.clone(),
+                    launch: "a fused DSA-front cut, which only its configured backend prices",
+                });
+            }
+        }
         // The backends as built, after any run-config override.
         let topk = &worklet.topk_prefill;
         let backends = topk.kernel.config.backends.clone();
@@ -579,37 +827,58 @@ impl Glm53DsaAttnLocalWorklet {
                  kpool top-{} x {}]",
                 self.name, cfg.num_heads, cfg.index_num_heads, cfg.index_topk, cfg.index_kpool
             ),
-            child: Box::new(CostNode::Sum(vec![
-                self.fused_qkv_a.compile(builder),
-                self.q_kv_norm.compile(builder),
-                self.q_b.compile(builder),
-                self.index_wq_b.compile(builder),
-                self.index_wk_weights.compile(builder),
-                self.index_head_weights.compile(builder),
-                self.index_k_norm.compile(builder),
-                self.index_q_fwht_quant.compile(builder),
-                self.index_weight_scale.compile(builder),
-                self.kpool_gate_score.compile(builder),
-                repeated(&self.prefill_gather, PREFILL_GATHER_LAUNCHES, builder),
-                self.kpool_decode_update.compile(builder),
-                self.kpool_prefill_write.compile(builder),
-                self.kpool_tail_seed.compile(builder),
-                self.mqa_logits_decode.compile(builder),
-                self.topk_decode.compile(builder),
-                self.mqa_logits_prefill.compile(builder),
-                self.topk_prefill.compile(builder),
-                self.expand_pools.compile(builder),
-                self.q_absorb.compile(builder),
-                self.q_concat.compile(builder),
-                self.q_fp8_quant.compile(builder),
-                self.sparse_mla.compile(builder),
-                self.output_copy.compile(builder),
-                self.v_up.compile(builder),
-                self.o_proj.compile(builder),
-                repeated(&self.glue, GLUE_LAUNCHES, builder),
-                repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
-            ])),
+            child: Box::new(CostNode::Sum(self.compile_slots(builder))),
         }
+    }
+
+    /// The fork's launches, then each enabled DSA-front fusion (the launches
+    /// it replaces bill zero in `eval`).
+    fn compile_slots(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
+        let mut slots = vec![
+            self.fused_qkv_a.compile(builder),
+            self.q_kv_norm.compile(builder),
+            self.q_b.compile(builder),
+            self.index_wq_b.compile(builder),
+            self.index_wk_weights.compile(builder),
+            self.index_head_weights.compile(builder),
+            self.index_k_norm.compile(builder),
+            self.index_q_fwht_quant.compile(builder),
+            self.index_weight_scale.compile(builder),
+            self.kpool_gate_score.compile(builder),
+            repeated(&self.prefill_gather, PREFILL_GATHER_LAUNCHES, builder),
+            self.kpool_decode_update.compile(builder),
+            self.kpool_prefill_write.compile(builder),
+            self.kpool_tail_seed.compile(builder),
+            self.mqa_logits_decode.compile(builder),
+            self.topk_decode.compile(builder),
+            self.mqa_logits_prefill.compile(builder),
+            self.topk_prefill.compile(builder),
+            self.expand_pools.compile(builder),
+            self.q_absorb.compile(builder),
+            self.q_concat.compile(builder),
+            self.q_fp8_quant.compile(builder),
+            self.sparse_mla.compile(builder),
+            self.output_copy.compile(builder),
+            self.v_up.compile(builder),
+            self.o_proj.compile(builder),
+            repeated(&self.glue, GLUE_LAUNCHES, builder),
+            repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
+        ];
+        slots.extend(self.hidden_gemm.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.q_lora_gemm.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.q_absorb_fp8.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.state_writer.as_ref().map(|op| op.compile(builder)));
+        if let Some(g) = &self.fork_glue {
+            slots.extend([
+                g.hidden_fp32_cast.compile(builder),
+                g.topk_buffer_fill.compile(builder),
+                repeated(&g.positions_to_int32, POSITION_CASTS, builder),
+                g.pool_ids_to_int64.compile(builder),
+                g.seq_lens_plus_one.compile(builder),
+                g.topk_buffer_copy.compile(builder),
+            ]);
+        }
+        slots
     }
 
     pub fn eval(&self, input: &Glm53DsaAttnLocalWorkletInput, ev: &mut Evaluator) {
@@ -621,28 +890,40 @@ impl Glm53DsaAttnLocalWorklet {
         let all = tokens(w.total_tokens);
         let no_prefill = w.prefill_tokens == 0;
         let no_decode = w.decode_rows == 0;
-        push_or_zero(&self.fused_qkv_a, rows.clone(), false, ev);
+        // What the DSA-front fusions take over (each bills in its own slot).
+        let front = cfg.front;
+        let hidden_merged = front.hidden_gemm.merged();
+        let hidden_fused = front.hidden_gemm.fused();
+        let q_lora_merged = front.q_lora_gemm.merged();
+        let q_lora_fused = front.q_lora_gemm.fused();
+        let absorb_fused = front.q_absorb_fp8.is_some();
+        let state_writer = front.state_writer.is_some();
+        let fork_glue = front.glue == DsaGlue::ForkLaunchList;
+        push_or_zero(&self.fused_qkv_a, rows.clone(), hidden_merged, ev);
+        // The q half of the norm folds into cut B's prologue and the kv half
+        // into cut D; with only one of them the other half still launches,
+        // priced as the whole (latency-bound) norm.
         push_or_zero(
             &self.q_kv_norm,
             QKvRmsNormKernelInput {
                 num_tokens: w.total_tokens,
             },
-            false,
+            q_lora_fused && state_writer,
             ev,
         );
-        push_or_zero(&self.q_b, rows.clone(), false, ev);
-        push_or_zero(&self.index_wq_b, rows.clone(), false, ev);
-        push_or_zero(&self.index_wk_weights, rows.clone(), false, ev);
+        push_or_zero(&self.q_b, rows.clone(), q_lora_merged, ev);
+        push_or_zero(&self.index_wq_b, rows.clone(), q_lora_merged, ev);
+        push_or_zero(&self.index_wk_weights, rows.clone(), hidden_merged, ev);
         push_or_zero(
             &self.index_head_weights,
             GemmFp32OutputKernelInput { m: w.total_tokens },
-            false,
+            hidden_fused,
             ev,
         );
-        push_or_zero(&self.index_k_norm, all.clone(), false, ev);
-        push_or_zero(&self.index_q_fwht_quant, all.clone(), false, ev);
-        push_or_zero(&self.index_weight_scale, all.clone(), false, ev);
-        push_or_zero(&self.kpool_gate_score, rows.clone(), false, ev);
+        push_or_zero(&self.index_k_norm, all.clone(), hidden_fused, ev);
+        push_or_zero(&self.index_q_fwht_quant, all.clone(), q_lora_fused, ev);
+        push_or_zero(&self.index_weight_scale, all.clone(), q_lora_fused, ev);
+        push_or_zero(&self.kpool_gate_score, rows.clone(), hidden_merged, ev);
         push_or_zero(
             &self.prefill_gather,
             tokens(w.prefill_tokens),
@@ -652,7 +933,7 @@ impl Glm53DsaAttnLocalWorklet {
         push_or_zero(
             &self.kpool_decode_update,
             tokens(w.decode_rows),
-            no_decode,
+            no_decode || state_writer,
             ev,
         );
         push_or_zero(
@@ -688,11 +969,11 @@ impl Glm53DsaAttnLocalWorklet {
         push_or_zero(
             &self.q_absorb,
             BatchedGemmKernelInput { m: w.total_tokens },
-            false,
+            absorb_fused,
             ev,
         );
         push_or_zero(&self.q_concat, all.clone(), !cfg.mla_layout_copies, ev);
-        push_or_zero(&self.q_fp8_quant, all.clone(), false, ev);
+        push_or_zero(&self.q_fp8_quant, all.clone(), absorb_fused, ev);
         self.sparse_mla.eval(
             &Glm53KpoolSparseMlaInput {
                 prefill_query_cache_pairs: input
@@ -704,6 +985,7 @@ impl Glm53DsaAttnLocalWorklet {
                     &input.decode_kv_lens,
                     cfg.decode_next_n,
                 ),
+                cache_append_elsewhere: state_writer,
             },
             ev,
         );
@@ -714,9 +996,30 @@ impl Glm53DsaAttnLocalWorklet {
             false,
             ev,
         );
-        push_or_zero(&self.o_proj, rows, false, ev);
-        push_or_zero(&self.glue, all.clone(), false, ev);
-        push_or_zero(&self.prefill_glue, all, no_prefill, ev);
+        push_or_zero(&self.o_proj, rows.clone(), false, ev);
+        push_or_zero(&self.glue, all.clone(), fork_glue, ev);
+        push_or_zero(&self.prefill_glue, all.clone(), no_prefill, ev);
+        if let Some(op) = &self.hidden_gemm {
+            push_or_zero(op, rows.clone(), false, ev);
+        }
+        if let Some(op) = &self.q_lora_gemm {
+            push_or_zero(op, rows.clone(), false, ev);
+        }
+        if let Some(op) = &self.q_absorb_fp8 {
+            push_or_zero(op, BatchedGemmKernelInput { m: w.total_tokens }, false, ev);
+        }
+        if let Some(op) = &self.state_writer {
+            push_or_zero(op, all.clone(), false, ev);
+        }
+        if let Some(g) = &self.fork_glue {
+            let decode = tokens(w.decode_rows);
+            push_or_zero(&g.hidden_fp32_cast, all, hidden_fused, ev);
+            push_or_zero(&g.topk_buffer_fill, decode.clone(), no_decode, ev);
+            push_or_zero(&g.positions_to_int32, decode.clone(), no_decode, ev);
+            push_or_zero(&g.pool_ids_to_int64, decode.clone(), no_decode, ev);
+            push_or_zero(&g.seq_lens_plus_one, decode.clone(), no_decode, ev);
+            push_or_zero(&g.topk_buffer_copy, decode, no_decode, ev);
+        }
     }
 }
 
@@ -1138,6 +1441,7 @@ mod tests {
             mla_layout_copies: true,
             indexer_max_logits_bytes: 512 << 20,
             decode_next_n: 1,
+            front: Default::default(),
         }
     }
 
@@ -1377,6 +1681,142 @@ mod tests {
             .slots
             .iter()
             .any(|slot| slot.name == "m.dsa.sparse_mla.decode"));
+    }
+
+    fn build_front(
+        front: Glm53DsaFront,
+        overrides: &[(&str, &str)],
+    ) -> Result<Glm53DsaAttnLocalWorklet, BuildError> {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let map: HashMap<String, Vec<String>> = overrides
+            .iter()
+            .map(|(role, backend)| (role.to_string(), vec![backend.to_string()]))
+            .collect();
+        let _scope = bridge.with_backend_overrides("main", Some(&map));
+        let mut config = cfg();
+        config.front = front;
+        Glm53DsaAttnLocalWorklet::build(
+            "m.dsa".into(),
+            Glm53DsaAttnLocalWorklet::resolve_config(&config),
+            &bridge,
+        )
+    }
+
+    fn slot_names(worklet: &Glm53DsaAttnLocalWorklet) -> Vec<String> {
+        let mut builder = CostTreeBuilder::new();
+        let root = worklet.compile(&mut builder);
+        builder
+            .finish(root)
+            .slots
+            .iter()
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
+    /// Catches a stage-1 merge that drops or double-counts a projection: the
+    /// concatenated GEMM is the replaced projections' callable at their
+    /// summed width, and the default front adds no slot.
+    #[test]
+    fn concatenated_front_gemms_span_the_projections_they_replace() {
+        let base = build_front(Glm53DsaFront::default(), &[]).unwrap();
+        assert_eq!(slot_names(&base).len(), 24 + 4 + 3);
+        let front = Glm53DsaFront {
+            hidden_gemm: DsaFrontGemm::Concat,
+            q_lora_gemm: DsaFrontGemm::Concat,
+            ..Default::default()
+        };
+        let w = build_front(front, &[]).unwrap();
+        let r = &w.resolved;
+        let hidden = r.hidden_gemm.as_ref().unwrap();
+        let q_lora = r.q_lora_gemm.as_ref().unwrap();
+        let n = |g: &SingleGemmKernelConfig| g.n.get();
+        // The head-weight columns stay with the fp32 `head_weights` GEMM.
+        assert_eq!(
+            n(hidden),
+            n(&r.fused_qkv_a) + n(&r.index_wk_weights) - r.index_head_weights.n.get()
+                + n(&r.kpool_gate_score)
+        );
+        assert_eq!(hidden.k, r.fused_qkv_a.k);
+        assert_eq!(n(q_lora), n(&r.q_b) + n(&r.index_wq_b));
+        assert_eq!(q_lora.k, r.q_b.k);
+        assert_eq!(hidden.backends, r.fused_qkv_a.backends);
+        let names = slot_names(&w);
+        assert_eq!(names.len(), 24 + 4 + 3 + 2);
+        assert!(names.contains(&"m.dsa.hidden_gemm".to_string()));
+        assert!(names.contains(&"m.dsa.q_lora_gemm".to_string()));
+    }
+
+    /// Catches a fused cut that silently prices another kernel: it builds
+    /// only on its named backend, and a run-config override is rejected.
+    #[test]
+    fn fused_front_cuts_price_only_their_named_backend() {
+        let front = Glm53DsaFront {
+            hidden_gemm: DsaFrontGemm::Fused("cut_a_kernel"),
+            q_lora_gemm: DsaFrontGemm::Fused("cut_b_kernel"),
+            q_absorb_fp8: Some("cut_c_kernel"),
+            state_writer: Some("cut_d_kernel"),
+            ..Default::default()
+        };
+        let w = build_front(front, &[]).unwrap();
+        assert_eq!(
+            w.hidden_gemm.as_ref().unwrap().kernel.config.backends,
+            ["cut_a_kernel"]
+        );
+        assert_eq!(
+            w.q_lora_gemm.as_ref().unwrap().kernel.config.backends,
+            ["cut_b_kernel"]
+        );
+        assert_eq!(
+            w.q_absorb_fp8.as_ref().unwrap().kernel.config.backends,
+            ["cut_c_kernel"]
+        );
+        assert_eq!(
+            w.state_writer.as_ref().unwrap().kernel.config.backends,
+            ["cut_d_kernel"]
+        );
+        // Cut A's fused width: the fp32 weight columns once, not twice.
+        assert_eq!(
+            w.resolved.hidden_gemm.as_ref().unwrap().n.get(),
+            2048 + 128 + 32 + 128
+        );
+        for role in [
+            "m.dsa.hidden_gemm",
+            "m.dsa.q_lora_gemm",
+            "m.dsa.q_absorb_fp8",
+            "m.dsa.state_writer",
+        ] {
+            assert!(
+                matches!(
+                    build_front(front, &[(role, "torch_linear_vllm")]),
+                    Err(BuildError::NoBackendForLaunch { .. })
+                ),
+                "{role}"
+            );
+        }
+    }
+
+    /// Catches a launch-list fix that loses a launch or keeps the old
+    /// placeholder: seven fork launches (the two position casts folded).
+    #[test]
+    fn fork_glue_lists_the_seven_decode_launches() {
+        let front = Glm53DsaFront {
+            glue: DsaGlue::ForkLaunchList,
+            ..Default::default()
+        };
+        let w = build_front(front, &[]).unwrap();
+        let mut builder = CostTreeBuilder::new();
+        let root = w.compile(&mut builder);
+        let tree = builder.finish(root);
+        let glue: Vec<_> = tree
+            .slots
+            .iter()
+            .filter(|s| s.name.starts_with("m.dsa.glue."))
+            .collect();
+        assert_eq!(glue.len(), 6);
+        let g = w.resolved.fork_glue.as_ref().unwrap();
+        assert_eq!(g.topk_buffer_fill.input_bytes_per_token, 0);
+        assert_eq!(g.topk_buffer_copy.output_bytes_per_token, 4 * 2051);
     }
 
     #[test]

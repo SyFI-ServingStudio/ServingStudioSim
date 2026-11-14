@@ -85,6 +85,9 @@ pub struct Glm53KpoolSparseMlaInput {
     pub prefill_query_cache_pairs: Vec<(u32, u32)>,
     /// One KV length per decode request, including the token being decoded.
     pub decode_context_lens: Vec<u32>,
+    /// Another launch writes the new rows (a fused state writer): the
+    /// `mla_cache_append` slot bills nothing.
+    pub cache_append_elsewhere: bool,
 }
 
 pub struct Glm53KpoolSparseMlaOp {
@@ -245,7 +248,7 @@ impl Glm53KpoolSparseMlaOp {
         let cache_append = MlaCacheAppendKernelInput {
             num_tokens: shape.num_rows,
         };
-        let metrics = if shape.num_rows == 0 {
+        let metrics = if shape.num_rows == 0 || input.cache_append_elsewhere {
             LeafMetrics::ZERO
         } else {
             self.mla_cache_append.eval(&cache_append)
@@ -540,6 +543,7 @@ mod tests {
         let input = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(3, 5)],
             decode_context_lens: vec![1000, 4003],
+            ..Default::default()
         };
         let shape = derive_shape(&input, 2048, 4, 2176).unwrap();
         assert_eq!(shape.num_rows, 5);
@@ -560,6 +564,7 @@ mod tests {
         let input = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: Vec::new(),
             decode_context_lens: vec![1000, 4003],
+            ..Default::default()
         };
         let shape = derive_shape(&input, 2048, 4, 2176).unwrap();
         assert!(shape.prefill.is_none());
@@ -573,6 +578,7 @@ mod tests {
         let input = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(1000, 1500)],
             decode_context_lens: Vec::new(),
+            ..Default::default()
         };
         let prefill = derive_shape(&input, 2048, 4, 2176)
             .unwrap()
@@ -598,6 +604,7 @@ mod tests {
         let bad = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(6, 5)],
             decode_context_lens: Vec::new(),
+            ..Default::default()
         };
         assert!(derive_shape(&bad, 2048, 4, 2176).is_err());
     }

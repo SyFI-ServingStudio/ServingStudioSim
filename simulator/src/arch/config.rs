@@ -112,6 +112,35 @@ impl KdaStateDtype {
 
 const KDA_STATE_DTYPES: [&str; 2] = ["fp32", "bf16"];
 
+/// How a DSA-front cut of the GLM-5.3-Flash DP arches launches
+/// (`dsa_hidden_gemm`, `dsa_q_lora_gemm`; worklet
+/// [`crate::worklet::DsaFrontGemm`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DsaFrontGemmMode {
+    /// The fork's separate launches.
+    #[default]
+    Separate,
+    /// One bf16 GEMM over the concatenated weights (same callable, wider N).
+    Concat,
+    /// The whole cut on the backend named by the matching `*_backend` param.
+    Fused,
+}
+
+const DSA_FRONT_GEMM_MODES: [&str; 3] = ["separate", "concat", "fused"];
+
+/// Which launch list prices the DSA layer's elementwise glue (`dsa_glue`;
+/// worklet [`crate::worklet::DsaGlue`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DsaGluePricing {
+    #[default]
+    Placeholder,
+    ForkLaunchList,
+}
+
+const DSA_GLUE_PRICINGS: [&str; 2] = ["placeholder", "fork_launch_list"];
+
 const KDA_SPEC_VERIFIES: [&str; 3] =
     ["recoverssm", "recoverssm_separate_conv", "recurrent_per_position"];
 
@@ -1608,6 +1637,46 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(default = false, cache_key)]
         kda_gate_b_merged: bool,
+        /// DSA elementwise glue: `placeholder` (17 launches of 64 B per
+        /// token; earlier runs) or `fork_launch_list` (the fork's 7 decode
+        /// launches at their real bytes: logs/20261114_0_mainline_v3/dsa_audit.md).
+        #[serde(default)]
+        #[param(string, default = "placeholder", choices = DSA_GLUE_PRICINGS, cache_key)]
+        dsa_glue: DsaGluePricing,
+        /// Not a fork path: DSA front cut A, the GEMMs reading the hidden
+        /// state. `concat`: `fused_qkv_a`, `wk_weights` (without the head-weight
+        /// columns, which stay in the fp32 `head_weights`) and
+        /// `kpool_gate_score` as one bf16 GEMM; `fused`: also `head_weights`, its fp32 cast and
+        /// `k_norm`, priced by `dsa_hidden_gemm_backend`'s `single_gemm` rows.
+        #[serde(default)]
+        #[param(string, default = "separate", choices = DSA_FRONT_GEMM_MODES, cache_key)]
+        dsa_hidden_gemm: DsaFrontGemmMode,
+        /// `dsa_hidden_gemm: fused` only (required there): its backend.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_hidden_gemm_backend: Option<String>,
+        /// Not a fork path: DSA front cut B, the GEMMs reading the normed q
+        /// latent. `concat`: `q_b_proj` and the indexer's `wq_b` as one bf16
+        /// GEMM; `fused`: also the q norm, FWHT + quant and weight scale,
+        /// priced by `dsa_q_lora_gemm_backend`'s `single_gemm` rows.
+        #[serde(default)]
+        #[param(string, default = "separate", choices = DSA_FRONT_GEMM_MODES, cache_key)]
+        dsa_q_lora_gemm: DsaFrontGemmMode,
+        /// `dsa_q_lora_gemm: fused` only (required there): its backend.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_q_lora_gemm_backend: Option<String>,
+        /// Not a fork path: DSA front cut C, `q_absorb` with the fp8 quant in
+        /// its epilogue, priced by this backend's `batched_gemm` rows.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_q_absorb_fp8_backend: Option<String>,
+        /// Not a fork path: DSA front cut D, one state writer (kv norm + MLA
+        /// cache append + kpool decode update), priced by this backend's
+        /// `elementwise` rows at the bytes the three launches must move.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_state_writer_backend: Option<String>,
         #[serde(default = "default_glm53_flash_max_model_len")]
         #[param(default = 8192, cache_key)]
         max_model_len: u32,
@@ -1863,6 +1932,46 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "recoverssm", choices = KDA_SPEC_VERIFIES, cache_key)]
         kda_spec_verify: crate::worklet::KdaSpecVerify,
+        /// DSA elementwise glue: `placeholder` (17 launches of 64 B per
+        /// token; earlier runs) or `fork_launch_list` (the fork's 7 decode
+        /// launches at their real bytes: logs/20261114_0_mainline_v3/dsa_audit.md).
+        #[serde(default)]
+        #[param(string, default = "placeholder", choices = DSA_GLUE_PRICINGS, cache_key)]
+        dsa_glue: DsaGluePricing,
+        /// Not a fork path: DSA front cut A, the GEMMs reading the hidden
+        /// state. `concat`: `fused_qkv_a`, `wk_weights` (without the head-weight
+        /// columns, which stay in the fp32 `head_weights`) and
+        /// `kpool_gate_score` as one bf16 GEMM; `fused`: also `head_weights`, its fp32 cast and
+        /// `k_norm`, priced by `dsa_hidden_gemm_backend`'s `single_gemm` rows.
+        #[serde(default)]
+        #[param(string, default = "separate", choices = DSA_FRONT_GEMM_MODES, cache_key)]
+        dsa_hidden_gemm: DsaFrontGemmMode,
+        /// `dsa_hidden_gemm: fused` only (required there): its backend.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_hidden_gemm_backend: Option<String>,
+        /// Not a fork path: DSA front cut B, the GEMMs reading the normed q
+        /// latent. `concat`: `q_b_proj` and the indexer's `wq_b` as one bf16
+        /// GEMM; `fused`: also the q norm, FWHT + quant and weight scale,
+        /// priced by `dsa_q_lora_gemm_backend`'s `single_gemm` rows.
+        #[serde(default)]
+        #[param(string, default = "separate", choices = DSA_FRONT_GEMM_MODES, cache_key)]
+        dsa_q_lora_gemm: DsaFrontGemmMode,
+        /// `dsa_q_lora_gemm: fused` only (required there): its backend.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_q_lora_gemm_backend: Option<String>,
+        /// Not a fork path: DSA front cut C, `q_absorb` with the fp8 quant in
+        /// its epilogue, priced by this backend's `batched_gemm` rows.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_q_absorb_fp8_backend: Option<String>,
+        /// Not a fork path: DSA front cut D, one state writer (kv norm + MLA
+        /// cache append + kpool decode update), priced by this backend's
+        /// `elementwise` rows at the bytes the three launches must move.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_state_writer_backend: Option<String>,
         /// How the mHC post/pre boundaries are priced
         /// ([`crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::MhcBoundary`]).
         #[serde(default)]
@@ -2317,11 +2426,59 @@ impl IterArchSel {
             _ => None,
         };
         Ok(Glm53FlashFusions {
+            dsa_front: self.glm53_dsa_front()?,
             mhc_boundary,
             router_gate_once,
             routed_moe_whatif,
             moe_shared_overlap,
             moe_shared_pair,
+        })
+    }
+
+    /// The DSA-front fusions (`dsa_*` params) of the GLM-5.3-Flash NVFP4
+    /// DFlash2 DP arch, else none.
+    fn glm53_dsa_front(&self) -> anyhow::Result<crate::worklet::Glm53DsaFront> {
+        use crate::timing::bridge::intern_backend;
+        use crate::worklet::{DsaFrontGemm, DsaGlue, Glm53DsaFront};
+        let Self::Glm53FlashVllmNvfp4DpAttnEpMoeDflash2 {
+            dsa_glue,
+            dsa_hidden_gemm,
+            dsa_hidden_gemm_backend,
+            dsa_q_lora_gemm,
+            dsa_q_lora_gemm_backend,
+            dsa_q_absorb_fp8_backend,
+            dsa_state_writer_backend,
+            ..
+        } = self
+        else {
+            return Ok(Glm53DsaFront::default());
+        };
+        let gemm = |param: &str, mode: DsaFrontGemmMode, backend: &Option<String>| {
+            Ok(match (mode, backend) {
+                (DsaFrontGemmMode::Separate, None) => DsaFrontGemm::Separate,
+                (DsaFrontGemmMode::Concat, None) => DsaFrontGemm::Concat,
+                (DsaFrontGemmMode::Fused, Some(b)) if !b.is_empty() => {
+                    DsaFrontGemm::Fused(intern_backend(b))
+                }
+                (DsaFrontGemmMode::Fused, _) => {
+                    anyhow::bail!("{param}: fused needs {param}_backend (the backend whose rows price it)")
+                }
+                (_, Some(_)) => anyhow::bail!("{param}_backend is for {param}: fused"),
+            })
+        };
+        let named = |param: &str, backend: &Option<String>| match backend {
+            Some(b) if b.is_empty() => anyhow::bail!("{param}: empty backend name"),
+            other => Ok(other.as_deref().map(intern_backend)),
+        };
+        Ok(Glm53DsaFront {
+            hidden_gemm: gemm("dsa_hidden_gemm", *dsa_hidden_gemm, dsa_hidden_gemm_backend)?,
+            q_lora_gemm: gemm("dsa_q_lora_gemm", *dsa_q_lora_gemm, dsa_q_lora_gemm_backend)?,
+            q_absorb_fp8: named("dsa_q_absorb_fp8_backend", dsa_q_absorb_fp8_backend)?,
+            state_writer: named("dsa_state_writer_backend", dsa_state_writer_backend)?,
+            glue: match dsa_glue {
+                DsaGluePricing::Placeholder => DsaGlue::Placeholder,
+                DsaGluePricing::ForkLaunchList => DsaGlue::ForkLaunchList,
+            },
         })
     }
 
@@ -2494,6 +2651,36 @@ impl IterArchSel {
 #[cfg(test)]
 mod iter_tests {
     use super::*;
+
+    /// Catches a fused DSA-front cut that would run without the backend
+    /// whose rows price it (or a backend given to a cut that is not fused).
+    #[test]
+    fn dsa_front_fused_cut_needs_its_backend() {
+        let sel = |extra: serde_json::Value| -> IterArchSel {
+            let mut v = serde_json::json!({
+                "type": "glm53_flash_vllm_nvfp4_dp_attn_ep_moe_dflash2",
+                "model_config": "model/config/glm53_flash_nvfp4.json",
+                "fp8": false,
+                "ep_size": 8,
+            });
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(v).unwrap()
+        };
+        let front = |extra| sel(extra).glm53_flash_fusions().map(|f| f.dsa_front);
+        assert_eq!(front(serde_json::json!({})).unwrap(), Default::default());
+        assert!(front(serde_json::json!({"dsa_hidden_gemm": "fused"})).is_err());
+        assert!(front(serde_json::json!({"dsa_q_lora_gemm": "concat", "dsa_q_lora_gemm_backend": "x"})).is_err());
+        let fused = front(serde_json::json!({
+            "dsa_hidden_gemm": "fused", "dsa_hidden_gemm_backend": "cut_a",
+            "dsa_q_lora_gemm": "concat", "dsa_glue": "fork_launch_list",
+            "dsa_state_writer_backend": "cut_d",
+        }))
+        .unwrap();
+        assert_eq!(fused.hidden_gemm, crate::worklet::DsaFrontGemm::Fused("cut_a"));
+        assert_eq!(fused.q_lora_gemm, crate::worklet::DsaFrontGemm::Concat);
+        assert_eq!(fused.state_writer, Some("cut_d"));
+        assert_eq!(fused.glue, crate::worklet::DsaGlue::ForkLaunchList);
+    }
 
     #[test]
     fn qwen36_local_selector_publishes_only_routing_beyond_the_model() {
@@ -3118,6 +3305,8 @@ mod layerwise_tests {
 /// ([`IterArchSel::glm53_flash_fusions`]).
 #[derive(Clone, Debug, Default)]
 pub struct Glm53FlashFusions {
+    /// The DSA-front fusions (`dsa_*` params).
+    pub dsa_front: crate::worklet::Glm53DsaFront,
     pub mhc_boundary: crate::arch::glm53_flash_vllm_fp8_dp_attn_ep_moe::MhcBoundaryPricing,
     pub router_gate_once: bool,
     /// `routed_moe_whatif_file`, read.

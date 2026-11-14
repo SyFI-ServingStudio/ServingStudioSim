@@ -2066,6 +2066,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         num_routed_layers: routed_layers,
     };
     let demand = source.demand(0..routed_layers as usize, verify_width)?;
+    let dsa_front = fusions.dsa_front;
     let parallel = glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpParallel {
         dp_size: ep_size,
         max_model_len,
@@ -2088,6 +2089,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         glm53_flash_vllm_fp8_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
             .context("expanding GLM-5.3-Flash DP-attention/EP architecture configs")?;
     configs.local.dsa.decode_next_n = verify_width;
+    configs.local.dsa.front = dsa_front;
     configs.local.kda.decode_query_len = verify_width;
     configs.local.kda.ssm_state_dtype = kda_state_dtype;
     configs.kda_tp1.decode_query_len = verify_width;
