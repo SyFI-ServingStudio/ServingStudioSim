@@ -54,7 +54,10 @@ use crate::timing::kernels::{
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
     DsaPersistentTopkDecodeKernelInput, DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig,
     DsaTopkPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, QKvRmsNormKernel,
+    Fp32RowSplitLayerNormKernel, Fp32RowSplitLayerNormKernelConfig,
+    Fp32RowSplitLayerNormKernelInput, GemmFp32OutputKernel, GemmFp32OutputKernelConfig,
+    GemmFp32OutputKernelInput,
+    HadamardFp8QuantKernel, HadamardFp8QuantKernelConfig, HadamardFp8QuantKernelInput, QKvRmsNormKernel,
     QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
     SingleGemmKernelInput,
 };
@@ -88,11 +91,6 @@ const Q_CONCAT_EFFECTIVE_FACTOR: u32 = 10;
 ///   (applied as 7/2).
 const OUTPUT_COPY_EFFECTIVE_NUM: u32 = 7;
 const OUTPUT_COPY_EFFECTIVE_DEN: u32 = 2;
-/// * `q_fwht_quant`: the Hadamard-128 + ue8m0 quant is not a streaming kernel;
-///   16.8 us at T = 2048 for 25 MiB of real traffic. The factor matches the
-///   prefill-bearing time; decode (5.5 us at T = 32) stays latency-bound above
-///   any elementwise row and needs a dedicated L1 kind to match.
-const FWHT_EFFECTIVE_FACTOR: u32 = 5;
 /// `k[idx]` and `gate_score[idx]` gathers ahead of the prefill kpool write.
 const PREFILL_GATHER_LAUNCHES: u32 = 2;
 
@@ -111,6 +109,12 @@ pub enum DsaFrontGemm {
     /// this backend: a missing row fails the build, and an override to any
     /// other backend is rejected.
     Fused(&'static str),
+    /// Cut A only: the whole cut as an fp32-output GEMM over every column
+    /// (`gemm_fp32_output`, the separate `head_weights` callable at the full
+    /// width) plus one row-split epilogue kernel on this backend that rounds
+    /// the bf16 column groups and LayerNorms the indexer k
+    /// (`fp32_row_split_layer_norm`). Absorbs what `Fused` absorbs.
+    Fp32Split(&'static str),
 }
 
 /// Which launch list prices the per-iteration elementwise glue.
@@ -165,7 +169,7 @@ impl DsaFrontGemm {
     }
 
     fn fused(self) -> bool {
-        matches!(self, Self::Fused(_))
+        matches!(self, Self::Fused(_) | Self::Fp32Split(_))
     }
 }
 
@@ -204,6 +208,8 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub sparse_attention_backends: Vec<&'static str>,
     pub mla_cache_append_backends: Vec<&'static str>,
     pub index_remap_backends: Vec<&'static str>,
+    /// The indexer query's Hadamard-128 + per-row UE8M0 FP8 quant.
+    pub hadamard_quant_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
     /// The fork's head-major MLA layout copies (`q_concat`, `output_copy`).
     /// Current vLLM writes `ql_nope` token-major through `bmm(out=)` and
@@ -252,7 +258,7 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub index_wk_weights: SingleGemmKernelConfig,
     pub index_head_weights: GemmFp32OutputKernelConfig,
     pub index_k_norm: ElementwiseKernelConfig,
-    pub index_q_fwht_quant: ElementwiseKernelConfig,
+    pub index_q_fwht_quant: HadamardFp8QuantKernelConfig,
     pub index_weight_scale: ElementwiseKernelConfig,
     pub kpool_gate_score: SingleGemmKernelConfig,
     pub prefill_gather: ElementwiseKernelConfig,
@@ -277,6 +283,9 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub prefill_glue: ElementwiseKernelConfig,
     /// Cut A as one GEMM (`front.hidden_gemm` not `Separate`).
     pub hidden_gemm: Option<SingleGemmKernelConfig>,
+    /// Cut A as `Fp32Split`: the fp32-output GEMM and its row-split epilogue.
+    pub hidden_gemm_fp32: Option<GemmFp32OutputKernelConfig>,
+    pub hidden_row_split: Option<Fp32RowSplitLayerNormKernelConfig>,
     /// Cut B as one GEMM (`front.q_lora_gemm` not `Separate`).
     pub q_lora_gemm: Option<SingleGemmKernelConfig>,
     /// Cut C (`front.q_absorb_fp8`).
@@ -306,7 +315,7 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub index_wk_weights: Op<SingleGemmKernel>,
     pub index_head_weights: Op<GemmFp32OutputKernel>,
     pub index_k_norm: Op<ElementwiseKernel>,
-    pub index_q_fwht_quant: Op<ElementwiseKernel>,
+    pub index_q_fwht_quant: Op<HadamardFp8QuantKernel>,
     pub index_weight_scale: Op<ElementwiseKernel>,
     pub kpool_gate_score: Op<SingleGemmKernel>,
     pub prefill_gather: Op<ElementwiseKernel>,
@@ -341,6 +350,8 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub glue: Op<ElementwiseKernel>,
     pub prefill_glue: Op<ElementwiseKernel>,
     pub hidden_gemm: Option<Op<SingleGemmKernel>>,
+    pub hidden_gemm_fp32: Option<Op<GemmFp32OutputKernel>>,
+    pub hidden_row_split: Option<Op<Fp32RowSplitLayerNormKernel>>,
     pub q_lora_gemm: Option<Op<SingleGemmKernel>>,
     pub q_absorb_fp8: Option<Op<BatchedGemmKernel>>,
     pub state_writer: Option<Op<ElementwiseKernel>>,
@@ -418,11 +429,12 @@ impl Glm53DsaAttnLocalWorklet {
             // Inductor-fused fp32 LayerNorm of the indexer k: reads and writes
             // one bf16 D row per token.
             index_k_norm: ew(2 * index_dim, 2 * index_dim),
-            // b2-dsa 7: reads 2*D*Hi, writes (D+4)*Hi per token.
-            index_q_fwht_quant: ew(
-                FWHT_EFFECTIVE_FACTOR * 2 * index_dim * index_heads,
-                FWHT_EFFECTIVE_FACTOR * (index_dim + 4) * index_heads,
-            ),
+            index_q_fwht_quant: HadamardFp8QuantKernelConfig {
+                backends: cfg.hadamard_quant_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                head_dim: index_dim,
+                input_dtype: bf16,
+            },
             // `weights * q_scale * scale`: two fp32 Hi rows in, one out.
             index_weight_scale: ew(2 * 4 * index_heads, 4 * index_heads),
             kpool_gate_score: gemm(index_dim, cfg.hidden.clone()),
@@ -546,6 +558,8 @@ impl Glm53DsaAttnLocalWorklet {
             prefill_glue: ew(4 * cfg.selected_k, 4 * cfg.selected_k),
             topk_decode_cooperative: None,
             hidden_gemm: None,
+            hidden_gemm_fp32: None,
+            hidden_row_split: None,
             q_lora_gemm: None,
             q_absorb_fp8: None,
             state_writer: None,
@@ -554,7 +568,7 @@ impl Glm53DsaAttnLocalWorklet {
         };
         let front = cfg.front;
         let front_gemm = |mode: DsaFrontGemm, concat_n: u32, fused_n: u32, k: Dim| match mode {
-            DsaFrontGemm::Separate => None,
+            DsaFrontGemm::Separate | DsaFrontGemm::Fp32Split(_) => None,
             DsaFrontGemm::Concat => Some(gemm(concat_n, k)),
             DsaFrontGemm::Fused(backend) => Some(SingleGemmKernelConfig {
                 backends: vec![backend],
@@ -574,6 +588,24 @@ impl Glm53DsaAttnLocalWorklet {
             hidden_concat_n + index_heads,
             cfg.hidden.clone(),
         );
+        if let DsaFrontGemm::Fp32Split(backend) = front.hidden_gemm {
+            // [q_a | kv_a | k | gate score | head weights], 2,336 columns.
+            resolved.hidden_gemm_fp32 = Some(GemmFp32OutputKernelConfig {
+                backends: cfg.fp32_gemm_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                n: (hidden_concat_n + index_heads).into(),
+                k: cfg.hidden.clone(),
+                input_dtype: bf16,
+            });
+            resolved.hidden_row_split = Some(Fp32RowSplitLayerNormKernelConfig {
+                backends: vec![backend],
+                gpu_name: cfg.gpu_name.clone(),
+                bf16_lead_cols: (cfg.q_lora_rank.get() + latent).into(),
+                norm_cols: index_dim.into(),
+                bf16_trail_cols: index_dim.into(),
+                fp32_tail_cols: index_heads.into(),
+            });
+        }
         // Cut B: [q_b | wq_b] over the normed q latent.
         let q_lora_n = heads * cfg.qk_nope_head_dim.get() + index_heads * index_dim;
         resolved.q_lora_gemm = front_gemm(
@@ -644,7 +676,13 @@ impl Glm53DsaAttnLocalWorklet {
                 bridge,
             )?,
             index_k_norm: ew("indexer.k_norm", r.index_k_norm)?,
-            index_q_fwht_quant: ew("indexer.q_fwht_quant", r.index_q_fwht_quant)?,
+            index_q_fwht_quant: atomic(
+                n,
+                "indexer.q_fwht_quant",
+                r.index_q_fwht_quant,
+                HadamardFp8QuantKernel::build,
+                bridge,
+            )?,
             index_weight_scale: ew("indexer.weight_scale", r.index_weight_scale)?,
             kpool_gate_score: gemm("indexer.kpool_gate_score", r.kpool_gate_score)?,
             prefill_gather: ew("indexer.prefill_gather", r.prefill_gather)?,
@@ -697,6 +735,22 @@ impl Glm53DsaAttnLocalWorklet {
             glue: ew("glue", r.glue)?,
             prefill_glue: ew("prefill_glue", r.prefill_glue)?,
             hidden_gemm: r.hidden_gemm.map(|c| gemm("hidden_gemm", c)).transpose()?,
+            hidden_gemm_fp32: r
+                .hidden_gemm_fp32
+                .map(|c| atomic(n, "hidden_gemm", c, GemmFp32OutputKernel::build, bridge))
+                .transpose()?,
+            hidden_row_split: r
+                .hidden_row_split
+                .map(|c| {
+                    atomic(
+                        n,
+                        "hidden_row_split",
+                        c,
+                        Fp32RowSplitLayerNormKernel::build,
+                        bridge,
+                    )
+                })
+                .transpose()?,
             q_lora_gemm: r.q_lora_gemm.map(|c| gemm("q_lora_gemm", c)).transpose()?,
             q_absorb_fp8: r
                 .q_absorb_fp8
@@ -743,6 +797,19 @@ impl Glm53DsaAttnLocalWorklet {
         .filter_map(|(mode, op)| match mode {
             DsaFrontGemm::Fused(backend) => {
                 op.map(|(role, built, kind)| (backend, role, built, kind))
+            }
+            _ => None,
+        })
+        .chain(match front.hidden_gemm {
+            DsaFrontGemm::Fp32Split(backend) => {
+                worklet.hidden_row_split.as_ref().map(|op| {
+                    (
+                        backend,
+                        &op.name,
+                        &op.kernel.config.backends,
+                        "fp32_row_split_layer_norm",
+                    )
+                })
             }
             _ => None,
         })
@@ -886,6 +953,8 @@ impl Glm53DsaAttnLocalWorklet {
             repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
         ];
         slots.extend(self.hidden_gemm.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.hidden_gemm_fp32.as_ref().map(|op| op.compile(builder)));
+        slots.extend(self.hidden_row_split.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.q_lora_gemm.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.q_absorb_fp8.as_ref().map(|op| op.compile(builder)));
         slots.extend(self.state_writer.as_ref().map(|op| op.compile(builder)));
@@ -943,7 +1012,14 @@ impl Glm53DsaAttnLocalWorklet {
             ev,
         );
         push_or_zero(&self.index_k_norm, all.clone(), hidden_fused, ev);
-        push_or_zero(&self.index_q_fwht_quant, all.clone(), q_lora_fused, ev);
+        push_or_zero(
+            &self.index_q_fwht_quant,
+            HadamardFp8QuantKernelInput {
+                num_rows: w.total_tokens * cfg.index_num_heads.get(),
+            },
+            q_lora_fused,
+            ev,
+        );
         push_or_zero(&self.index_weight_scale, all.clone(), q_lora_fused, ev);
         push_or_zero(&self.kpool_gate_score, rows.clone(), hidden_merged, ev);
         push_or_zero(
@@ -1024,6 +1100,15 @@ impl Glm53DsaAttnLocalWorklet {
         push_or_zero(&self.prefill_glue, all.clone(), no_prefill, ev);
         if let Some(op) = &self.hidden_gemm {
             push_or_zero(op, rows.clone(), false, ev);
+        }
+        if let Some(op) = &self.hidden_gemm_fp32 {
+            push_or_zero(op, GemmFp32OutputKernelInput { m: w.total_tokens }, false, ev);
+        }
+        if let Some(op) = &self.hidden_row_split {
+            let input = Fp32RowSplitLayerNormKernelInput {
+                num_tokens: w.total_tokens,
+            };
+            push_or_zero(op, input, false, ev);
         }
         if let Some(op) = &self.q_lora_gemm {
             push_or_zero(op, rows.clone(), false, ev);
@@ -1460,6 +1545,7 @@ mod tests {
             topk_prefill_backends: vec!["vllm_cuda"],
             sparse_attention_backends: vec!["flashinfer_trtllm_fp8"],
             mla_cache_append_backends: vec!["vllm_cuda"],
+            hadamard_quant_backends: vec!["vllm_triton"],
             index_remap_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
             mla_layout_copies: true,
@@ -1821,6 +1907,37 @@ mod tests {
                 "{role}"
             );
         }
+    }
+
+    /// Catches an fp32-split cut A that prices the wrong width or split, or
+    /// lets its epilogue drift to another backend.
+    #[test]
+    fn fp32_split_cut_a_is_one_fp32_gemm_and_one_epilogue() {
+        let front = Glm53DsaFront {
+            hidden_gemm: DsaFrontGemm::Fp32Split("split_kernel"),
+            ..Default::default()
+        };
+        let w = build_front(front, &[]).unwrap();
+        assert!(w.hidden_gemm.is_none());
+        let gemm = w.resolved.hidden_gemm_fp32.as_ref().unwrap();
+        assert_eq!((gemm.n.get(), gemm.input_dtype), (2048 + 128 + 128 + 32, DType::Bf16));
+        let split = w.resolved.hidden_row_split.as_ref().unwrap();
+        assert_eq!(
+            (
+                split.bf16_lead_cols.get(),
+                split.norm_cols.get(),
+                split.bf16_trail_cols.get(),
+                split.fp32_tail_cols.get()
+            ),
+            (2048, 128, 128, 32)
+        );
+        let names = slot_names(&w);
+        assert!(names.contains(&"m.dsa.hidden_gemm".to_string()));
+        assert!(names.contains(&"m.dsa.hidden_row_split".to_string()));
+        assert!(matches!(
+            build_front(front, &[("m.dsa.hidden_row_split", "torch_vllm")]),
+            Err(BuildError::NoBackendForLaunch { .. })
+        ));
     }
 
     /// Catches a launch-list fix that loses a launch or keeps the old

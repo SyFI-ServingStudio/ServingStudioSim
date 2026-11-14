@@ -125,9 +125,12 @@ pub enum DsaFrontGemmMode {
     Concat,
     /// The whole cut on the backend named by the matching `*_backend` param.
     Fused,
+    /// Cut A only: an fp32-output GEMM over every column plus one row-split
+    /// epilogue kernel on the `*_backend` param's backend.
+    Fp32Split,
 }
 
-const DSA_FRONT_GEMM_MODES: [&str; 3] = ["separate", "concat", "fused"];
+const DSA_FRONT_GEMM_MODES: [&str; 4] = ["separate", "concat", "fused", "fp32_split"];
 
 /// Which launch list prices the DSA layer's elementwise glue (`dsa_glue`;
 /// worklet [`crate::worklet::DsaGlue`]).
@@ -1648,10 +1651,14 @@ pub enum IterArchSel {
         /// columns, which stay in the fp32 `head_weights`) and
         /// `kpool_gate_score` as one bf16 GEMM; `fused`: also `head_weights`, its fp32 cast and
         /// `k_norm`, priced by `dsa_hidden_gemm_backend`'s `single_gemm` rows.
+        /// `fp32_split`: the same absorption as an fp32-output GEMM over all
+        /// columns (`gemm_fp32_output`) plus a row-split epilogue
+        /// (`fp32_row_split_layer_norm` on `dsa_hidden_gemm_backend`).
         #[serde(default)]
         #[param(string, default = "separate", choices = DSA_FRONT_GEMM_MODES, cache_key)]
         dsa_hidden_gemm: DsaFrontGemmMode,
-        /// `dsa_hidden_gemm: fused` only (required there): its backend.
+        /// `dsa_hidden_gemm: fused` or `fp32_split` only (required there): its
+        /// backend (for `fp32_split`, the row-split epilogue's).
         #[serde(default)]
         #[param(cache_key)]
         dsa_hidden_gemm_backend: Option<String>,
@@ -1951,10 +1958,14 @@ pub enum IterArchSel {
         /// columns, which stay in the fp32 `head_weights`) and
         /// `kpool_gate_score` as one bf16 GEMM; `fused`: also `head_weights`, its fp32 cast and
         /// `k_norm`, priced by `dsa_hidden_gemm_backend`'s `single_gemm` rows.
+        /// `fp32_split`: the same absorption as an fp32-output GEMM over all
+        /// columns (`gemm_fp32_output`) plus a row-split epilogue
+        /// (`fp32_row_split_layer_norm` on `dsa_hidden_gemm_backend`).
         #[serde(default)]
         #[param(string, default = "separate", choices = DSA_FRONT_GEMM_MODES, cache_key)]
         dsa_hidden_gemm: DsaFrontGemmMode,
-        /// `dsa_hidden_gemm: fused` only (required there): its backend.
+        /// `dsa_hidden_gemm: fused` or `fp32_split` only (required there): its
+        /// backend (for `fp32_split`, the row-split epilogue's).
         #[serde(default)]
         #[param(cache_key)]
         dsa_hidden_gemm_backend: Option<String>,
@@ -2477,8 +2488,14 @@ impl IterArchSel {
                 (DsaFrontGemmMode::Fused, Some(b)) if !b.is_empty() => {
                     DsaFrontGemm::Fused(intern_backend(b))
                 }
-                (DsaFrontGemmMode::Fused, _) => {
-                    anyhow::bail!("{param}: fused needs {param}_backend (the backend whose rows price it)")
+                (DsaFrontGemmMode::Fp32Split, Some(b)) if !b.is_empty() && param == "dsa_hidden_gemm" => {
+                    DsaFrontGemm::Fp32Split(intern_backend(b))
+                }
+                (DsaFrontGemmMode::Fp32Split, _) if param != "dsa_hidden_gemm" => {
+                    anyhow::bail!("{param}: fp32_split is a dsa_hidden_gemm mode")
+                }
+                (DsaFrontGemmMode::Fused | DsaFrontGemmMode::Fp32Split, _) => {
+                    anyhow::bail!("{param}: fused/fp32_split needs {param}_backend (the backend whose rows price it)")
                 }
                 (_, Some(_)) => anyhow::bail!("{param}_backend is for {param}: fused"),
             })
