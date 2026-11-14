@@ -1677,6 +1677,14 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         dsa_state_writer_backend: Option<String>,
+        /// Not a fork path: DSA indexer back cut E (post-top-k), the top-k
+        /// output to the final physical page table and valid counts in one
+        /// kernel (pool expand, top-k buffer fill, pool ids to int64, seq lens
+        /// + 1, buffer copy and the index remap), priced by this backend's
+        /// `dsa_sparse_index_remap` rows.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_topk_page_table_backend: Option<String>,
         #[serde(default = "default_glm53_flash_max_model_len")]
         #[param(default = 8192, cache_key)]
         max_model_len: u32,
@@ -1972,6 +1980,14 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         dsa_state_writer_backend: Option<String>,
+        /// Not a fork path: DSA indexer back cut E (post-top-k), the top-k
+        /// output to the final physical page table and valid counts in one
+        /// kernel (pool expand, top-k buffer fill, pool ids to int64, seq lens
+        /// + 1, buffer copy and the index remap), priced by this backend's
+        /// `dsa_sparse_index_remap` rows.
+        #[serde(default)]
+        #[param(cache_key)]
+        dsa_topk_page_table_backend: Option<String>,
         /// How the mHC post/pre boundaries are priced
         /// ([`crate::arch::glm53_flash_nvfp4_dp_attn_kda_tp_fused_ep_moe_dflash2::MhcBoundary`]).
         #[serde(default)]
@@ -2448,6 +2464,7 @@ impl IterArchSel {
             dsa_q_lora_gemm_backend,
             dsa_q_absorb_fp8_backend,
             dsa_state_writer_backend,
+            dsa_topk_page_table_backend,
             ..
         } = self
         else {
@@ -2475,6 +2492,7 @@ impl IterArchSel {
             q_lora_gemm: gemm("dsa_q_lora_gemm", *dsa_q_lora_gemm, dsa_q_lora_gemm_backend)?,
             q_absorb_fp8: named("dsa_q_absorb_fp8_backend", dsa_q_absorb_fp8_backend)?,
             state_writer: named("dsa_state_writer_backend", dsa_state_writer_backend)?,
+            topk_page_table: named("dsa_topk_page_table_backend", dsa_topk_page_table_backend)?,
             glue: match dsa_glue {
                 DsaGluePricing::Placeholder => DsaGlue::Placeholder,
                 DsaGluePricing::ForkLaunchList => DsaGlue::ForkLaunchList,
@@ -2673,12 +2691,13 @@ mod iter_tests {
         let fused = front(serde_json::json!({
             "dsa_hidden_gemm": "fused", "dsa_hidden_gemm_backend": "cut_a",
             "dsa_q_lora_gemm": "concat", "dsa_glue": "fork_launch_list",
-            "dsa_state_writer_backend": "cut_d",
+            "dsa_state_writer_backend": "cut_d", "dsa_topk_page_table_backend": "cut_e",
         }))
         .unwrap();
         assert_eq!(fused.hidden_gemm, crate::worklet::DsaFrontGemm::Fused("cut_a"));
         assert_eq!(fused.q_lora_gemm, crate::worklet::DsaFrontGemm::Concat);
         assert_eq!(fused.state_writer, Some("cut_d"));
+        assert_eq!(fused.topk_page_table, Some("cut_e"));
         assert_eq!(fused.glue, crate::worklet::DsaGlue::ForkLaunchList);
     }
 
