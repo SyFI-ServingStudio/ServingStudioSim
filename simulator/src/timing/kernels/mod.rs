@@ -44,6 +44,7 @@ pub mod gdn_causal_conv_decode;
 pub mod gdn_causal_conv_prefill;
 pub mod gdn_chunk_delta_rule;
 pub mod gdn_gated_rms_norm;
+pub mod sigmoid_gated_rms_norm;
 pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
 pub mod gdn_recurrent_decode_gated_norm;
@@ -281,6 +282,10 @@ pub use gdn_chunk_delta_rule::{
 pub use gdn_gated_rms_norm::{
     GdnGatedRmsNormKernel, GdnGatedRmsNormKernelConfig, GdnGatedRmsNormKernelInput,
     GdnGatedRmsNormSpec,
+};
+pub use sigmoid_gated_rms_norm::{
+    SigmoidGatedRmsNormKernel, SigmoidGatedRmsNormKernelConfig, SigmoidGatedRmsNormKernelInput,
+    SigmoidGatedRmsNormSpec,
 };
 pub use gdn_prefill_post_conv::{
     GdnPrefillPostConvKernel, GdnPrefillPostConvKernelConfig, GdnPrefillPostConvKernelInput,
