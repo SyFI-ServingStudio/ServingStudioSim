@@ -30,6 +30,12 @@ Backends differ only in the conv state layout the deployment stores
   fork runs ``cutedsl/verify.py``.
 - ``vllm_cute_dim_first``: ``[dim, state_len]`` per page (DS); the fork runs
   the warp-specialized ``cutedsl/verify_ws.py`` with bulk copies.
+
+``cuda_persistent_wy_mma`` is not the fork's kernel: a vendored persistent CUDA
+launch (one CTA per request and head) that does the same conv + verify with
+the verify in WY form on tensor cores, writing the same conv window, outputs
+and records. It runs on the default SD pages, with fp32 taps and an 8-token
+window only.
 """
 
 from __future__ import annotations
@@ -116,7 +122,12 @@ DOC = KernelDoc(
 )
 
 
-def _register(backend: str, function_name: str, summary: str) -> None:
+def _register(
+    backend: str,
+    function_name: str,
+    summary: str,
+    module_name: str = "profiling.runners.attention.kda_recoverssm_vllm_cute",
+) -> None:
     register(
         KernelProfilerSpec(
             kernel_kind=KIND,
@@ -128,7 +139,7 @@ def _register(backend: str, function_name: str, summary: str) -> None:
                 sm_targets=frozenset({"sm_100f"}),
             ),
             runner_ref=RunnerRef(
-                module_name="profiling.runners.attention.kda_recoverssm_vllm_cute",
+                module_name=module_name,
                 function_name=function_name,
             ),
             table_name=KIND,
@@ -156,4 +167,12 @@ _register(
     "profile_kda_recoverssm_conv_verify_vllm_cute_dim_first",
     "vLLM fork's CuteRecoverSSMVerify on [dim, state_len] conv pages "
     "(VLLM_SSM_CONV_STATE_LAYOUT=DS): the warp-specialized cutedsl/verify_ws.py.",
+)
+_register(
+    "cuda_persistent_wy_mma",
+    "profile_kda_recoverssm_conv_verify_cuda_persistent_wy_mma",
+    "Vendored persistent CUDA conv + verify on the default [state_len, dim] conv pages: "
+    "the window's recurrence in WY form on bf16 hi/lo tensor-core GEMMs, records in the "
+    "fork's request-row layout (fp32 taps, 8-token window only).",
+    module_name="profiling.runners.attention.kda_recoverssm_conv_verify_fused",
 )

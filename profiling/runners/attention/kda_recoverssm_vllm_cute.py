@@ -255,7 +255,12 @@ def conv_window_reference(torch: Any, operands: ConvVerifyOperands, shape: ConvV
     return torch.cat(outputs, 0), torch.stack(windows)
 
 
-def check_conv_verify(torch: Any, verify: Any, operands: ConvVerifyOperands, shape: ConvVerifyShape) -> None:
+def check_conv_verify(
+    torch: Any, verify: Any, operands: ConvVerifyOperands, shape: ConvVerifyShape, *, invoke: Any = None
+) -> dict[str, float]:
+    """Compare one call against the oracles on the first requests; return the
+    RMSE ratios. ``invoke`` lets another backend of the kind run its own call
+    over the same operands."""
     from profiling.runners.attention.kda_chunk_prefill_reference import rmse_ratio
     from profiling.runners.attention.kda_recoverssm_reference import (
         kda_recoverssm_verify_reference,
@@ -283,7 +288,10 @@ def check_conv_verify(torch: Any, verify: Any, operands: ConvVerifyOperands, sha
         lower_bound=LOWER_BOUND,
     )
     state_before = operands.state[slots].clone()
-    invoke_conv_verify(verify, operands)
+    if invoke is None:
+        invoke_conv_verify(verify, operands)
+    else:
+        invoke()
     torch.cuda.synchronize()
     if not torch.equal(operands.state[slots], state_before):
         raise AssertionError("the conv + verify wrote the checkpoint")
@@ -303,6 +311,7 @@ def check_conv_verify(torch: Any, verify: Any, operands: ConvVerifyOperands, sha
         raise AssertionError(f"conv + verify mismatch vs oracle: {bad}")
     if not torch.equal(operands.conv[slots], windows):
         raise AssertionError("rolled conv window mismatch")
+    return {name: err for name, (err, _) in errors.items()}
 
 
 def _conv_verify(
