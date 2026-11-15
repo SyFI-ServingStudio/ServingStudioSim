@@ -26,8 +26,8 @@ use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_pipeline_head_worker, build_pipeline_stage_worker, resolve_prefix_cache_config,
-    CostSource, IterWorker, IterWorkerSel, PendingOrderKind, PipelineHeadEvent, PipelineHeadMsg,
-    PipelineLayout, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    CostSource, IterWorker, IterWorkerSel, PipelineHeadEvent, PipelineHeadMsg, PipelineLayout,
+    PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -218,12 +218,13 @@ fn worker_config(
         gpu_time_multiplier,
         balance_decode_microbatches,
         prefill_chunk_alignment,
+        pending_order,
         ..
     } = worker
     else {
         bail!("pp: the stage pool requires worker `pipeline_chunked_prefill`, got {worker:?}");
     };
-    // Same defaults as unified `chunked_prefill`: FIFO and opportunistic reuse.
+    // Same default as unified `chunked_prefill`: opportunistic reuse.
     let prefix_cache = resolve_prefix_cache_config(
         "pp",
         PrefixCacheMode::Opportunistic,
@@ -238,7 +239,7 @@ fn worker_config(
         kv_log_stride: cfg.io.kv_log_stride,
         gpu_time_multiplier: *gpu_time_multiplier,
         max_batch_tokens: Some(*max_batch_tokens),
-        pending_order: PendingOrderKind::Fifo,
+        pending_order: *pending_order,
         prefix_cache,
         balance_decode_microbatches: *balance_decode_microbatches,
         prefill_chunk_alignment: *prefill_chunk_alignment,
@@ -246,6 +247,7 @@ fn worker_config(
         ..WorkerConfig::default()
     };
     worker.kv_accounting().apply("pp", &mut config)?;
+    worker.apply_chunked_scheduling("pp", &mut config)?;
     Ok(config)
 }
 

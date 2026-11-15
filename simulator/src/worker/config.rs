@@ -16,7 +16,11 @@ use serde::Deserialize;
 
 use schema_derive::{ParamStruct, ProviderSchema};
 
-use super::admission::PendingOrderKind;
+use crate::common::Time;
+
+use super::admission::{
+    LoadBudget, MicrobatchBudget, PendingOrderKind, PrefillSplit, StartedOrder,
+};
 use super::kv::{
     KvOverhead, PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy, PrefixResumePoints,
 };
@@ -273,12 +277,167 @@ impl KvAccountingSpec {
     }
 }
 
-const PENDING_ORDER_CHOICES: [&str; 4] = [
+/// How a pipeline head sizes each microbatch's prefill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MicrobatchSplit {
+    /// Take as much pending prefill as `max_batch_tokens` allows (vLLM).
+    #[default]
+    Greedy,
+    /// Take one `pp_size`-th of the round: `clamp(ceil((pending + in-flight
+    /// prefill tokens) / pp_size), min_microbatch_tokens, max_batch_tokens)`.
+    Even,
+}
+
+const MICROBATCH_SPLIT_CHOICES: [&str; 2] = ["greedy", "even"];
+
+/// How much prefill one batch takes: a pipeline microbatch, or one attention
+/// DP rank's share of a `chunked_prefill` iteration. Flattened into both
+/// chunked selectors; every key absent is vLLM's greedy fill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ParamStruct)]
+pub struct MicrobatchBudgetSpec {
+    /// `greedy` (vLLM) fills each microbatch's prefill up to
+    /// `max_batch_tokens`; `even` (`pipeline_chunked_prefill` only) sizes it
+    /// to one `pp_size`-th of the pending plus in-flight prefill, so a backlog
+    /// spreads over the pipeline instead of one full microbatch followed by
+    /// small ones. Not vLLM.
+    #[serde(default)]
+    #[param(string, default = "greedy", choices = MICROBATCH_SPLIT_CHOICES)]
+    microbatch_split: MicrobatchSplit,
+    /// Floor on the `even` target, in prefill tokens (`0`: none). Valid only
+    /// with `microbatch_split: even`; never delays a microbatch.
+    #[serde(default)]
+    #[param(default = 0)]
+    min_microbatch_tokens: u32,
+    /// vLLM's `long_prefill_token_threshold`: the most prefill tokens one
+    /// request takes per batch (`0`: no cap, vLLM's default).
+    #[serde(default)]
+    #[param(default = 0)]
+    long_prefill_token_threshold: u32,
+    /// Load-following budget floor (`0`: off, vLLM's fixed budget). The batch
+    /// budget is this many tokens while the prefill backlog (queued and
+    /// started prompts' tokens, and a pipeline's in-flight ones) is at most
+    /// `load_budget_backlog_lo_tokens`, rising linearly to `max_batch_tokens`
+    /// at `load_budget_backlog_hi_tokens`; both bounds are required when the
+    /// floor is set. Each attention DP rank follows its own backlog. Not vLLM.
+    #[serde(default)]
+    #[param(default = 0)]
+    load_budget_low_tokens: u32,
+    #[serde(default)]
+    #[param(default = 0)]
+    load_budget_backlog_lo_tokens: u64,
+    #[serde(default)]
+    #[param(default = 0)]
+    load_budget_backlog_hi_tokens: u64,
+}
+
+impl MicrobatchBudgetSpec {
+    /// Validate the knobs against `max_batch_tokens`; an even split needs a
+    /// pipeline.
+    pub(crate) fn resolve(
+        self,
+        owner: &str,
+        max_batch_tokens: u32,
+        pipelined: bool,
+    ) -> Result<MicrobatchBudget> {
+        let split = match self.microbatch_split {
+            MicrobatchSplit::Greedy => {
+                ensure!(
+                    self.min_microbatch_tokens == 0,
+                    "{owner}: min_microbatch_tokens ({}) only applies with microbatch_split: \
+                     even; greedy takes every pending token it can",
+                    self.min_microbatch_tokens
+                );
+                PrefillSplit::Greedy
+            }
+            MicrobatchSplit::Even => {
+                ensure!(
+                    pipelined,
+                    "{owner}: microbatch_split: even needs a pipeline (pipeline_chunked_prefill)"
+                );
+                ensure!(
+                    self.min_microbatch_tokens <= max_batch_tokens,
+                    "{owner}: min_microbatch_tokens ({}) must be <= max_batch_tokens \
+                     ({max_batch_tokens})",
+                    self.min_microbatch_tokens
+                );
+                PrefillSplit::Even {
+                    min_tokens: self.min_microbatch_tokens,
+                }
+            }
+        };
+        ensure!(
+            self.load_budget_low_tokens <= max_batch_tokens,
+            "{owner}: load_budget_low_tokens ({}) must be <= max_batch_tokens \
+             ({max_batch_tokens})",
+            self.load_budget_low_tokens
+        );
+        let load = if self.load_budget_low_tokens == 0 {
+            ensure!(
+                self.load_budget_backlog_lo_tokens == 0 && self.load_budget_backlog_hi_tokens == 0,
+                "{owner}: load_budget_backlog_*_tokens need load_budget_low_tokens"
+            );
+            None
+        } else {
+            ensure!(
+                self.load_budget_backlog_lo_tokens < self.load_budget_backlog_hi_tokens,
+                "{owner}: load_budget_low_tokens needs load_budget_backlog_lo_tokens < \
+                 load_budget_backlog_hi_tokens, got {} and {}",
+                self.load_budget_backlog_lo_tokens,
+                self.load_budget_backlog_hi_tokens
+            );
+            Some(LoadBudget {
+                low_tokens: self.load_budget_low_tokens,
+                backlog_lo_tokens: self.load_budget_backlog_lo_tokens,
+                backlog_hi_tokens: self.load_budget_backlog_hi_tokens,
+            })
+        };
+        Ok(MicrobatchBudget {
+            split,
+            long_prefill_token_threshold: (self.long_prefill_token_threshold > 0)
+                .then_some(self.long_prefill_token_threshold),
+            load,
+        })
+    }
+}
+
+/// When a queued request is served before the rest of its queue. Flattened
+/// into both chunked selectors.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, ParamStruct)]
+pub struct ForceScheduleSpec {
+    /// Serve a request that has waited this many ms since arrival before the
+    /// rest of its queue, so a shortest-first order cannot starve it (`0`:
+    /// off); with `srpt`, overdue started prompts go first too. Per attention
+    /// DP rank. Not vLLM.
+    #[serde(default)]
+    #[param(default = 0.0)]
+    force_schedule_after_ms: f64,
+}
+
+impl ForceScheduleSpec {
+    /// The bound, `None` when off.
+    pub(crate) fn resolve(self, owner: &str) -> Result<Option<Time>> {
+        let ms = self.force_schedule_after_ms;
+        ensure!(
+            ms.is_finite() && ms >= 0.0,
+            "{owner}: force_schedule_after_ms ({ms}) must be a finite value >= 0"
+        );
+        Ok((ms > 0.0).then(|| Time::from_ms(ms)))
+    }
+}
+
+const PENDING_ORDER_CHOICES: [&str; 5] = [
     "session-start",
     "fifo",
     "shortest-job-first",
+    "shortest-prefill-first",
     "longest-prefix-match",
 ];
+
+/// serde fallback for the chunked selectors' `pending_order`: vLLM's FCFS.
+const fn default_fifo_pending_order() -> PendingOrderKind {
+    PendingOrderKind::Fifo
+}
 
 const PREFIX_CACHE_POLICY_CHOICES: [&str; 4] = ["lru", "fifo", "lfu", "largest-first"];
 const PREFIX_CACHE_MODE_CHOICES: [&str; 2] = ["disabled", "opportunistic"];
@@ -441,6 +600,25 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
         prefill_chunk_alignment: Option<PrefillChunkAlignment>,
+        /// Order of each attention DP rank's waiting queue. `fifo` is vLLM's
+        /// FCFS; `shortest-prefill-first` offers the prompt with the fewest
+        /// tokens to compute first (not vLLM). Started prompts keep priority
+        /// either way unless `srpt`.
+        #[serde(default = "default_fifo_pending_order")]
+        #[param(string, default = "fifo", choices = PENDING_ORDER_CHOICES)]
+        pending_order: PendingOrderKind,
+        /// Shortest remaining prefill first across each rank's started and
+        /// queued prompts (queue order should be `shortest-prefill-first`),
+        /// instead of vLLM's started-first order. Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        srpt: bool,
+        /// Per-rank prefill budget; see [`MicrobatchBudgetSpec`].
+        #[serde(flatten)]
+        microbatch_budget: MicrobatchBudgetSpec,
+        /// Per-rank force-schedule bound; see [`ForceScheduleSpec`].
+        #[serde(flatten)]
+        force_schedule: ForceScheduleSpec,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode, fewer for a
@@ -542,6 +720,26 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         balance_decode_microbatches: bool,
+        /// Order in which queued fresh prompts are offered to the head. `fifo`
+        /// is vLLM; `shortest-prefill-first` offers the prompt with the fewest
+        /// tokens to compute first (not vLLM). Started prompts keep priority
+        /// over fresh ones unless `srpt`.
+        #[serde(default = "default_fifo_pending_order")]
+        #[param(string, default = "fifo", choices = PENDING_ORDER_CHOICES)]
+        pending_order: PendingOrderKind,
+        /// Shortest remaining prefill first across started and queued prompts
+        /// (queue order should be `shortest-prefill-first`), instead of vLLM's
+        /// started-first order. Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        srpt: bool,
+        /// Microbatch prefill budget; see [`MicrobatchBudgetSpec`].
+        #[serde(flatten)]
+        microbatch_budget: MicrobatchBudgetSpec,
+        /// Force-schedule bound, over queued and started prompts; see
+        /// [`ForceScheduleSpec`].
+        #[serde(flatten)]
+        force_schedule: ForceScheduleSpec,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {
@@ -597,6 +795,53 @@ impl IterWorkerSel {
             | Self::PdPrefill { kv_accounting, .. }
             | Self::PdDecode { kv_accounting, .. } => *kv_accounting,
         }
+    }
+
+    /// Validate a chunked selector's scheduling options and set them on
+    /// `config`; every other selector keeps vLLM's scheduler.
+    pub(crate) fn apply_chunked_scheduling(
+        &self,
+        owner: &str,
+        config: &mut WorkerConfig,
+    ) -> Result<()> {
+        let (max_batch_tokens, srpt, microbatch_budget, force_schedule, pipelined) = match self {
+            Self::ChunkedPrefill {
+                max_batch_tokens,
+                srpt,
+                microbatch_budget,
+                force_schedule,
+                ..
+            } => (
+                max_batch_tokens,
+                srpt,
+                microbatch_budget,
+                force_schedule,
+                false,
+            ),
+            Self::PipelineChunkedPrefill {
+                max_batch_tokens,
+                srpt,
+                microbatch_budget,
+                force_schedule,
+                ..
+            } => (
+                max_batch_tokens,
+                srpt,
+                microbatch_budget,
+                force_schedule,
+                true,
+            ),
+            _ => return Ok(()),
+        };
+        config.microbatch_budget =
+            microbatch_budget.resolve(owner, *max_batch_tokens, pipelined)?;
+        config.started_order = if *srpt {
+            StartedOrder::ShortestRemaining
+        } else {
+            StartedOrder::StartOrder
+        };
+        config.force_schedule_after = force_schedule.resolve(owner)?;
+        Ok(())
     }
 
     /// The chunk alignment a chunked selector asks for; `None` follows the

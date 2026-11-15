@@ -124,13 +124,14 @@ impl Deployment for UnifiedDeployment {
                 batch_policy,
                 kv_admission,
                 gpu_time_multiplier,
+                pending_order,
                 // Read by `prefill_gpu_time_multiplier` below.
                 ..
             } => (
                 *attn_gpu_memory_gb,
                 *gpu_time_multiplier,
                 Some(*max_batch_tokens),
-                PendingOrderKind::Fifo,
+                *pending_order,
                 PrefixCacheMode::Opportunistic,
                 PrefixCachePolicy::Lru,
                 None,
@@ -197,6 +198,8 @@ impl Deployment for UnifiedDeployment {
         g.worker
             .kv_accounting()
             .apply("unified", &mut worker_config)?;
+        g.worker
+            .apply_chunked_scheduling("unified", &mut worker_config)?;
 
         let dp_cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
@@ -1385,6 +1388,10 @@ mod tests {
             dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: None,
             kv_accounting: Default::default(),
+            pending_order: crate::worker::PendingOrderKind::Fifo,
+            srpt: false,
+            microbatch_budget: Default::default(),
+            force_schedule: Default::default(),
         }
     }
 
