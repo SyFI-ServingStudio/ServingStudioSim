@@ -34,6 +34,9 @@ std::atomic<bool> g_capture_active = false;
 std::vector<KernelActivityRecord> g_records;
 std::string g_async_error;
 CUpti_ActivityKind g_enabled_activity_kind = CUPTI_ACTIVITY_KIND_INVALID;
+// Opt-in: also record memory copies (cudaMemcpyAsync device-to-device from a
+// contiguous Torch copy_ is a copy-engine record, not a kernel).
+bool g_memcpy_enabled = false;
 
 std::string cupti_error_string(CUptiResult result) {
     const char* error_string = nullptr;
@@ -66,6 +69,37 @@ void record_kernel_activity(const CUpti_ActivityKernel9& kernel) {
     });
 }
 
+const char* memcpy_kind_name(uint8_t copy_kind) {
+    switch (copy_kind) {
+        case CUPTI_ACTIVITY_MEMCPY_KIND_HTOD:
+            return "memcpy_HtoD";
+        case CUPTI_ACTIVITY_MEMCPY_KIND_DTOH:
+            return "memcpy_DtoH";
+        case CUPTI_ACTIVITY_MEMCPY_KIND_DTOD:
+            return "memcpy_DtoD";
+        case CUPTI_ACTIVITY_MEMCPY_KIND_PTOP:
+            return "memcpy_PtoP";
+        default:
+            return "memcpy_other";
+    }
+}
+
+void record_memcpy_activity(const CUpti_ActivityMemcpy6& copy) {
+    if (!g_capture_active) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_records_mutex);
+    g_records.push_back(KernelActivityRecord{
+        .name = memcpy_kind_name(copy.copyKind),
+        .device_id = copy.deviceId,
+        .stream_id = copy.streamId,
+        .correlation_id = copy.correlationId,
+        .start_ns = copy.start,
+        .end_ns = copy.end,
+    });
+}
+
 void CUPTIAPI buffer_requested(uint8_t** buffer, size_t* size, size_t* max_num_records) {
     void* raw_ptr = nullptr;
     if (posix_memalign(&raw_ptr, kActivityBufferAlign, kActivityBufferSize) != 0) {
@@ -91,6 +125,9 @@ void CUPTIAPI buffer_completed(CUcontext, uint32_t, uint8_t* buffer, size_t size
             case CUPTI_ACTIVITY_KIND_KERNEL:
             case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL:
                 record_kernel_activity(*reinterpret_cast<const CUpti_ActivityKernel9*>(record));
+                break;
+            case CUPTI_ACTIVITY_KIND_MEMCPY:
+                record_memcpy_activity(*reinterpret_cast<const CUpti_ActivityMemcpy6*>(record));
                 break;
             default:
                 break;
@@ -133,7 +170,7 @@ public:
         ensure_callbacks_registered();
     }
 
-    void start() {
+    void start(bool include_memcpy) {
         std::lock_guard<std::mutex> lock(g_records_mutex);
         if (g_capture_active) {
             throw std::runtime_error("CUPTI capture already active");
@@ -143,6 +180,10 @@ public:
         g_capture_active = true;
         CUPTI_CHECK(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
         g_enabled_activity_kind = CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL;
+        if (include_memcpy) {
+            CUPTI_CHECK(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY));
+            g_memcpy_enabled = true;
+        }
     }
 
     py::list stop() {
@@ -154,6 +195,10 @@ public:
         if (g_enabled_activity_kind != CUPTI_ACTIVITY_KIND_INVALID) {
             CUPTI_CHECK(cuptiActivityDisable(g_enabled_activity_kind));
             g_enabled_activity_kind = CUPTI_ACTIVITY_KIND_INVALID;
+        }
+        if (g_memcpy_enabled) {
+            CUPTI_CHECK(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_MEMCPY));
+            g_memcpy_enabled = false;
         }
 
         std::vector<KernelActivityRecord> records;
@@ -192,6 +237,6 @@ public:
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<CuptiKernelActivityProfiler>(m, "CuptiKernelActivityProfiler")
         .def(py::init<>())
-        .def("start", &CuptiKernelActivityProfiler::start)
+        .def("start", &CuptiKernelActivityProfiler::start, py::arg("include_memcpy") = false)
         .def("stop", &CuptiKernelActivityProfiler::stop);
 }

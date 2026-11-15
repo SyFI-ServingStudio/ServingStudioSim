@@ -66,6 +66,17 @@ use crate::timing::kernels::{
 };
 use crate::timing::kernels::{EngramGateKernelInput, MegaGateKernelInput, MegaMhcKernelInput};
 use crate::timing::kernels::{
+    CandidateCompactLensKernelInput,
+    CandidateIndexRestoreKernelInput,
+    CompressStatePrefillKernelInput,
+    ExpandSwaIndexKernelInput,
+    FusedNormRopeCastKernelInput,
+    KvIndexCatKernelInput,
+    PagedKvCacheLoadKernelInput,
+    PagedKvCacheStoreKernelInput,
+    RmsNormMxfp8KernelInput,
+};
+use crate::timing::kernels::{
     CandidateBlockMaxKernelInput, DeepSelectTopkKernelInput, MqaLogitsPrefillChunkKernelInput,
     SparseMqaLogitsMetadataKernelInput, SparseMqaLogitsPrefillKernelInput,
 };
@@ -194,6 +205,15 @@ log_inputs! {
     MegaGate => MegaGateKernelInput,
     MegaMhc => MegaMhcKernelInput,
     EngramGate => EngramGateKernelInput,
+    FusedNormRopeCast => FusedNormRopeCastKernelInput,
+    RmsNormMxfp8 => RmsNormMxfp8KernelInput,
+    PagedKvCacheLoad => PagedKvCacheLoadKernelInput,
+    PagedKvCacheStore => PagedKvCacheStoreKernelInput,
+    KvIndexCat => KvIndexCatKernelInput,
+    ExpandSwaIndex => ExpandSwaIndexKernelInput,
+    CompressStatePrefill => CompressStatePrefillKernelInput,
+    CandidateCompactLens => CandidateCompactLensKernelInput,
+    CandidateIndexRestore => CandidateIndexRestoreKernelInput,
     MqaLogitsPrefillChunk => MqaLogitsPrefillChunkKernelInput,
     SparseMqaLogitsPrefill => SparseMqaLogitsPrefillKernelInput,
     SparseMqaLogitsMetadata => SparseMqaLogitsMetadataKernelInput,

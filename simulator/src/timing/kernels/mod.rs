@@ -7,8 +7,11 @@ pub mod batched_gemm;
 pub mod batched_gemm_static_fp8_quant;
 pub mod bf16_fused_moe;
 pub mod candidate_block_max;
+pub mod candidate_compact_lens;
+pub mod candidate_index_restore;
 mod causal_rows;
 pub mod clamped_swiglu;
+pub mod compress_state_prefill;
 pub mod compressed_sparse_mla_decode;
 pub mod compressed_sparse_mla_prefill;
 pub mod compressed_sparse_mla_rope_cast;
@@ -35,6 +38,7 @@ pub mod embedding_row_gather;
 pub mod engine;
 pub mod engram_gate;
 pub mod engram_lookup;
+pub mod expand_swa_index;
 pub mod fa4_varlen_attention;
 pub mod fa4_varlen_projection;
 pub mod flashinfer_attn_decode;
@@ -44,6 +48,7 @@ pub mod fp32_row_split_layer_norm;
 pub mod fp8_block_quant;
 pub mod fp8_blockscale_grouped_gemm;
 pub mod fp8_per_token_group_quant;
+pub mod fused_norm_rope_cast;
 pub mod gdn_causal_conv_decode;
 pub mod gdn_causal_conv_prefill;
 pub mod gdn_chunk_delta_rule;
@@ -70,6 +75,7 @@ pub mod kda_recurrent_decode;
 pub mod kv_cache_append;
 pub mod layered_kv_norm_rope_cache_write;
 pub mod kv_compress_store;
+pub mod kv_index_cat;
 pub mod logits_topk;
 pub mod mega_gate;
 pub mod mega_mhc;
@@ -105,6 +111,8 @@ pub mod p2p_intra;
 pub mod packed_kv_cache_gather;
 pub mod paged_attn_batch_decode;
 pub mod paged_attn_batch_prefill;
+pub mod paged_kv_cache_load;
+pub mod paged_kv_cache_store;
 pub mod ple_gate;
 pub mod ple_ngram_ids;
 pub mod ple_short_conv;
@@ -116,6 +124,7 @@ pub mod qnorm_rope_kv_insert;
 pub mod rel_bias_attention;
 pub mod residual_rms_norm;
 pub mod rms_norm;
+pub mod rms_norm_mxfp8;
 pub mod row_all_gather;
 pub mod rs_sconv_ag_residual_rms_norm;
 pub mod scaled_silu;
@@ -159,8 +168,20 @@ pub use candidate_block_max::{
     CandidateBlockMaxKernel, CandidateBlockMaxKernelConfig, CandidateBlockMaxKernelInput,
     CandidateBlockMaxSpec,
 };
+pub use candidate_compact_lens::{
+    CandidateCompactLensKernel, CandidateCompactLensKernelConfig, CandidateCompactLensKernelInput,
+    CandidateCompactLensSpec,
+};
+pub use candidate_index_restore::{
+    CandidateIndexRestoreKernel, CandidateIndexRestoreKernelConfig,
+    CandidateIndexRestoreKernelInput, CandidateIndexRestoreSpec,
+};
 pub use clamped_swiglu::{
     ClampedSwigluKernel, ClampedSwigluKernelConfig, ClampedSwigluKernelInput, ClampedSwigluSpec,
+};
+pub use compress_state_prefill::{
+    CompressStatePrefillKernel, CompressStatePrefillKernelConfig, CompressStatePrefillKernelInput,
+    CompressStatePrefillSpec,
 };
 pub use compressed_sparse_mla_decode::{
     CompressedSparseMlaDecodeKernel, CompressedSparseMlaDecodeKernelConfig,
@@ -254,6 +275,9 @@ pub use engram_gate::{EngramGateKernel, EngramGateKernelConfig, EngramGateKernel
 pub use engram_lookup::{
     EngramLookupKernel, EngramLookupKernelConfig, EngramLookupKernelInput, EngramLookupSpec,
 };
+pub use expand_swa_index::{
+    ExpandSwaIndexKernel, ExpandSwaIndexKernelConfig, ExpandSwaIndexKernelInput, ExpandSwaIndexSpec,
+};
 pub use fa4_varlen_attention::{
     Fa4VarlenAttentionKernel, Fa4VarlenAttentionKernelConfig, Fa4VarlenAttentionKernelInput,
     Fa4VarlenAttentionSpec,
@@ -284,6 +308,10 @@ pub use fp8_blockscale_grouped_gemm::{
 pub use fp8_per_token_group_quant::{
     Fp8PerTokenGroupQuantKernel, Fp8PerTokenGroupQuantKernelConfig,
     Fp8PerTokenGroupQuantKernelInput, Fp8PerTokenGroupQuantSpec,
+};
+pub use fused_norm_rope_cast::{
+    FusedNormRopeCastKernel, FusedNormRopeCastKernelConfig, FusedNormRopeCastKernelInput,
+    FusedNormRopeCastSpec,
 };
 pub use gdn_causal_conv_decode::{
     GdnCausalConvDecodeKernel, GdnCausalConvDecodeKernelConfig, GdnCausalConvDecodeKernelInput,
@@ -379,6 +407,9 @@ pub use kv_cache_append::{
 pub use kv_compress_store::{
     KvCompressStoreKernel, KvCompressStoreKernelConfig, KvCompressStoreKernelInput,
     KvCompressStoreSpec,
+};
+pub use kv_index_cat::{
+    KvIndexCatKernel, KvIndexCatKernelConfig, KvIndexCatKernelInput, KvIndexCatSpec,
 };
 pub use logits_topk::{
     LogitsTopkKernel, LogitsTopkKernelConfig, LogitsTopkKernelInput, LogitsTopkSpec,
@@ -481,6 +512,14 @@ pub use paged_attn_batch_prefill::{
     PagedAttnBatchPrefillKernel, PagedAttnBatchPrefillKernelConfig,
     PagedAttnBatchPrefillKernelInput, PagedAttnBatchPrefillSpec,
 };
+pub use paged_kv_cache_load::{
+    PagedKvCacheLoadKernel, PagedKvCacheLoadKernelConfig, PagedKvCacheLoadKernelInput,
+    PagedKvCacheLoadSpec,
+};
+pub use paged_kv_cache_store::{
+    PagedKvCacheStoreKernel, PagedKvCacheStoreKernelConfig, PagedKvCacheStoreKernelInput,
+    PagedKvCacheStoreSpec,
+};
 pub use ple_gate::{PleGateKernel, PleGateKernelConfig, PleGateKernelInput, PleGateSpec};
 pub use ple_ngram_ids::{
     PleNgramIdsKernel, PleNgramIdsKernelConfig, PleNgramIdsKernelInput, PleNgramIdsSpec,
@@ -512,6 +551,9 @@ pub use residual_rms_norm::{
     ResidualRmsNormSpec,
 };
 pub use rms_norm::{RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, RmsNormSpec};
+pub use rms_norm_mxfp8::{
+    RmsNormMxfp8Kernel, RmsNormMxfp8KernelConfig, RmsNormMxfp8KernelInput, RmsNormMxfp8Spec,
+};
 pub use row_all_gather::{RowAllGatherKernel, RowAllGatherKernelConfig, RowAllGatherSpec};
 pub use rs_sconv_ag_residual_rms_norm::{
     RsSconvAgResidualRmsNormKernel, RsSconvAgResidualRmsNormKernelConfig,

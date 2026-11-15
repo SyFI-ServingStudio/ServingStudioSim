@@ -18,7 +18,10 @@ from profiling.kernels import (
     batched_gemm_static_fp8_quant,  # noqa: F401
     bf16_fused_moe,  # noqa: F401
     candidate_block_max,  # noqa: F401
+    candidate_compact_lens,  # noqa: F401
+    candidate_index_restore,  # noqa: F401
     clamped_swiglu,  # noqa: F401
+    compress_state_prefill,  # noqa: F401
     compressed_sparse_mla_decode,  # noqa: F401
     compressed_sparse_mla_prefill,  # noqa: F401
     compressed_sparse_mla_rope_cast,  # noqa: F401
@@ -43,6 +46,7 @@ from profiling.kernels import (
     embedding_row_gather,  # noqa: F401
     engram_gate,  # noqa: F401
     engram_lookup,  # noqa: F401
+    expand_swa_index,  # noqa: F401
     fa4_varlen_attention,  # noqa: F401
     flashinfer_attn_decode,  # noqa: F401
     flashinfer_attn_prefill,  # noqa: F401
@@ -51,6 +55,7 @@ from profiling.kernels import (
     fp8_blockscale_grouped_gemm,  # noqa: F401
     fp8_per_token_group_quant,  # noqa: F401
     fp32_row_split_layer_norm,  # noqa: F401
+    fused_norm_rope_cast,  # noqa: F401
     gdn_causal_conv_decode,  # noqa: F401
     gdn_causal_conv_prefill,  # noqa: F401
     gdn_chunk_delta_rule,  # noqa: F401
@@ -77,6 +82,7 @@ from profiling.kernels import (
     kv_cache_append,  # noqa: F401
     kv_compress_store,  # noqa: F401
     layered_kv_norm_rope_cache_write,  # noqa: F401
+    kv_index_cat,  # noqa: F401
     logits_topk,  # noqa: F401
     mega_gate,  # noqa: F401
     mega_mhc,  # noqa: F401
@@ -112,6 +118,8 @@ from profiling.kernels import (
     packed_kv_cache_gather,  # noqa: F401
     paged_attn_batch_decode,  # noqa: F401
     paged_attn_batch_prefill,  # noqa: F401
+    paged_kv_cache_load,  # noqa: F401
+    paged_kv_cache_store,  # noqa: F401
     ple_gate,  # noqa: F401
     ple_ngram_ids,  # noqa: F401
     ple_short_conv,  # noqa: F401
@@ -123,6 +131,7 @@ from profiling.kernels import (
     rel_bias_attention,  # noqa: F401
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
+    rms_norm_mxfp8,  # noqa: F401
     row_all_gather,  # noqa: F401
     rs_sconv_ag_residual_rms_norm,  # noqa: F401
     scaled_silu,  # noqa: F401
