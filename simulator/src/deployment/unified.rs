@@ -205,7 +205,7 @@ impl Deployment for UnifiedDeployment {
             dp_pool: SimpleDpPoolConfig {
                 pool: PoolId(0),
                 num_workers: g.replicas,
-                placement: placement_into(pool.placement),
+                placement: placement_into(pool.placement)?,
             },
         };
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
@@ -1332,11 +1332,14 @@ where
     Box::new(SimpleDpFlow::new(dp_cfg, factory))
 }
 
-fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
-    match p {
+fn placement_into(p: PlacementPolicy) -> anyhow::Result<DpPlacementPolicy> {
+    Ok(match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
-    }
+        PlacementPolicy::LeastWorkAhead => {
+            bail!("unified: placement least-work-ahead is implemented only for the pp deployment")
+        }
+    })
 }
 
 #[cfg(test)]

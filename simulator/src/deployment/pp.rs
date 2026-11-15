@@ -20,7 +20,7 @@ use crate::arch::IterArchSel;
 use crate::common::{Fabric, SharedRequests};
 use crate::deployment::config::PpConfig;
 use crate::orchestrator::{
-    DpPlacementPolicy, Flow, PlacementPolicy, PpFlow, PpStagePoolConfig, PP_STAGE_POOL,
+    Flow, PlacementPolicy, PpFlow, PpPlacement, PpStagePoolConfig, PP_STAGE_POOL,
 };
 use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
@@ -59,8 +59,9 @@ impl Deployment for PpDeployment {
         let gpu_name = g.gpu.clone();
         let log_dir = Some(cfg.io.log_dir.clone());
         let placement = match pool.placement {
-            PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
-            PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+            PlacementPolicy::LeastQueued => PpPlacement::LeastQueued,
+            PlacementPolicy::RoundRobin => PpPlacement::RoundRobin,
+            PlacementPolicy::LeastWorkAhead => PpPlacement::LeastWorkAhead,
         };
         let model_spec = g.arch.model();
         let _scope =
