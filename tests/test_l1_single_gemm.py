@@ -144,6 +144,7 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "flashinfer_mxfp8",
         "flashinfer_mxfp8_prequantized",
         "flashinfer_cutedsl_bf16",
+        "deepgemm_mxfp8",
     }
 
 

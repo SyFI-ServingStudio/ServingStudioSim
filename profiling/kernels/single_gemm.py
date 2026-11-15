@@ -19,9 +19,11 @@ linear on SM10x, ``dtype = fp8_e4m3``), ``flashinfer_cutedsl`` (vLLM's default N
 linear on SM10x, ``dtype = nvfp4_e2m1``), and ``flashinfer_mxfp8`` (MXFP8 dense
 linear: activation quant + FlashInfer CuTe-DSL block-scaled GEMM,
 ``dtype = mxfp8_e4m3``), ``flashinfer_mxfp8_prequantized`` (the same linear
-fed an already-quantized MXFP8 activation: the GEMM alone), and
+fed an already-quantized MXFP8 activation: the GEMM alone),
 ``flashinfer_cutedsl_bf16`` (vLLM's BF16 linear under
-``--linear-backend=flashinfer_cutedsl``: tuned ``mm_bf16``, SM10x).
+``--linear-backend=flashinfer_cutedsl``: tuned ``mm_bf16``, SM10x), and
+``deepgemm_mxfp8`` (DeepInfer's FP8 linear: DeepGEMM ``fp8_fp4_gemm_nt`` on an
+already-cast activation, UE8M0 per 32, ``dtype = mxfp8_e4m3``).
 BF16/FP16 model defaults offer both generic Torch variants and the timing cache
 selects the faster one per shape.
 
@@ -77,6 +79,8 @@ DOC = KernelDoc(
         "GB/s = (m·k + k·n + m·n) · bytes per element / time",
         "deepgemm, flashinfer_fp8_tensor (fp8 in, bf16 out): GB/s = (m·k + k·n + 2·m·n) / time",
         "flashinfer_cutedsl (nvfp4 in, bf16 out): GB/s = ((m·k + k·n)·(1/2 + 1/16) + 2·m·n) / time",
+        "flashinfer_mxfp8_prequantized, deepgemm_mxfp8 (mxfp8 in, bf16 out): "
+        "GB/s = ((m·k + k·n)·(1 + 1/32) + 2·m·n) / time",
     ),
     default_metric="tflops",
     caveats=(
@@ -90,7 +94,9 @@ DOC = KernelDoc(
         "quantization in the time; its GB/s adds the bf16 read and the "
         "quantized write of the activation. flashinfer_mxfp8_prequantized is "
         "the same call on an activation its producer already quantized, so it "
-        "times the GEMM alone.",
+        "times the GEMM alone. deepgemm_mxfp8 is the same operand format "
+        "through DeepGEMM's fp8_fp4_gemm_nt on a prequantized activation, the "
+        "GEMM alone.",
     ),
     method=(
         f"{CUPTI_METHOD} The torch and SGLang backends count overlapping launches "
@@ -99,7 +105,8 @@ DOC = KernelDoc(
         "flashinfer_mxfp8 sum their launches. flashinfer_cutedsl times only the GEMM: "
         "the activation quantization before it is the nvfp4_quant kind. flashinfer_mxfp8 includes "
         "its activation quantization and autotunes the call once before timing; "
-        "flashinfer_mxfp8_prequantized passes a QuantizedActivation and times the GEMM only. "
+        "flashinfer_mxfp8_prequantized passes a QuantizedActivation and times the GEMM only; "
+        "deepgemm_mxfp8 times DeepInfer's apply_weight_fp8 on an (e4m3, sf) pair, the GEMM only. "
         "flashinfer_fp8_tensor times only the GEMM on already-quantized fp8 input, "
         "after autotuning FlashInfer's hybrid token buckets as vLLM's warmup does."
     ),
@@ -423,6 +430,43 @@ register(
                 "GEMM mm_mxfp8 alone, bf16 output."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py",
+        ),
+    )
+)
+
+# DeepInfer's FP8 dense linear: ReplicatedLinear.apply_weight_fp8 on an
+# activation its producer already cast (e4m3 + packed UE8M0 per 32), one
+# DeepGEMM fp8_fp4_gemm_nt(recipe=(1, 1, 32)) launch, bf16 out. mxfp8_e4m3 is
+# that operand format (e4m3, UE8M0 per 32 along K); the backend is the GEMM
+# alone, like flashinfer_mxfp8_prequantized.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="deepgemm_mxfp8",
+        # DeepGEMM's fp8_fp4_gemm_nt dispatches packed-int UE8M0 scales only on
+        # arch_major == 10 (sm100_fp8_fp4_gemm_1d1d, csrc/apis/gemm.hpp); its
+        # SM90 path takes fp32 scales and no per-32 recipe.
+        supports=BackendSupport(
+            compute=frozenset({DType.MXFP8_E4M3}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.deepgemm_mxfp8",
+            function_name="profile_single_gemm_deepgemm_mxfp8",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="deepinfer_env",
+        doc=BackendDoc(
+            summary=(
+                "DeepInfer's ReplicatedLinear.apply_weight_fp8 on an already-cast "
+                "activation: DeepGEMM fp8_fp4_gemm_nt with e4m3 A and B, UE8M0 scales "
+                "per 32 along K (packed, TMA-aligned), recipe (1, 1, 32), bf16 output. "
+                "One sm100_fp8_fp4_gemm_1d1d launch. SM10x only."
+            ),
+            url="https://github.com/deepseek-ai/DeepGEMM",
         ),
     )
 )
