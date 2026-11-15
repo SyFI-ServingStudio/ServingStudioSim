@@ -93,6 +93,14 @@ RUN pip install --no-cache-dir --no-deps --no-index --find-links /opt/vendor-whe
         deep_select flash_mla deep_ep deep_gemm \
     && ls -la /opt/vendor-wheels
 
+# RDMA userspace (rdma-core): DeepEP's EngramBuffer (the Engram tables in CPU memory) runs on
+# NCCL GIN's GDAKI backend, which needs libibverbs and the mlx5 provider; without them NCCL
+# reports no GIN and the engine stops at model load. A container also needs the host's
+# /dev/infiniband/uverbs* devices. ibverbs-utils (ibv_devinfo) checks them in a job.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libibverbs1 ibverbs-providers librdmacm1 ibverbs-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 # DeepInfer itself, patched, built in tree (scripts/build.sh build). No import check: the
 # extensions link libcuda, which only a GPU job provides.
 COPY --from=source /src /opt/deepinfer
