@@ -1781,6 +1781,89 @@ mod tests {
     }
 
     #[test]
+    fn hits_first_when_at_risk_reads_a_rank_context_first_only_while_it_is_at_risk() {
+        // One rank, 120 tokens of HBM, a 64-token budget. Sessions 7 (50
+        // tokens) and 8 (100) run and are written through DRAM; HBM keeps
+        // only session 8. At 10 ms a 100-token prompt of session 9 (arrived
+        // 4 ms) is overdue and session 7's round 1 (9 ms) is not. Oldest first
+        // runs the prompt; written through a 150-token DRAM it evicts session
+        // 7, so round 1 recomputes: the gated split reads it first. In a
+        // 500-token DRAM nothing is at risk: the gate keeps oldest first and
+        // round 1 still finds its context after the prompt.
+        for (dram_tokens, order, hit_tokens, round1_first) in [
+            (150, HitsFirst::Off, 0, false),
+            (150, HitsFirst::Always, 50, true),
+            (150, HitsFirst::WhenAtRisk, 50, true),
+            (500, HitsFirst::Always, 50, true),
+            (500, HitsFirst::WhenAtRisk, 50, false),
+        ] {
+            let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 100, 1), (3, 4, 1)]);
+            as_session(&store, 0, 7, 0, 0.0);
+            as_session(&store, 1, 8, 0, 3.0);
+            as_session(&store, 2, 9, 0, 4.0);
+            as_session(&store, 3, 7, 51, 9.0);
+            let mut config = rank_tiers_config();
+            config.max_batch_tokens = Some(64);
+            config.prefix_tiers[0].capacity_gb = f64::from(dram_tokens) * 1e-9;
+            let mut worker = chunked_worker_with(
+                Rc::clone(&store),
+                FakeModel::for_ms(1.0),
+                WorkerConfig {
+                    pending_order: PendingOrderKind::ShortestPrefillFirst,
+                    started_order: StartedOrder::ShortestRemaining,
+                    force_schedule: Some(ForceSchedule {
+                        after: Time::from_ms(5.0),
+                        hits_first: order,
+                    }),
+                    ..config
+                },
+            );
+            let label = format!("DRAM {dram_tokens}, {order:?}");
+            let mut events = Vec::new();
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+            run_ticks(&mut worker, Time::ZERO, Time::from_ms(2.9), &mut events);
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+            run_ticks(
+                &mut worker,
+                Time::from_ms(3.0),
+                Time::from_ms(9.0),
+                &mut events,
+            );
+            assert_eq!(events.len(), 2, "{label}");
+            let round1 = store.borrow()[RequestId(3)].request.definition.session;
+            assert_eq!(
+                worker.kv_store.resident_prefix_tokens(4, round1),
+                0,
+                "{label}"
+            );
+            assert_eq!(
+                worker.kv_store.reusable_prefix_tokens(0, 4, round1),
+                50,
+                "{label}"
+            );
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(3)));
+            run_ticks(
+                &mut worker,
+                Time::from_ms(10.0),
+                Time::from_ms(80.0),
+                &mut events,
+            );
+            let done: Vec<RequestId> = events
+                .iter()
+                .map(|event| {
+                    let WorkerEventCommon::RequestComplete { req, .. } = event;
+                    *req
+                })
+                .collect();
+            assert_eq!(done.len(), 4, "{label}");
+            assert_eq!(hit(&store, 3), Some(hit_tokens), "{label}");
+            let position = |id| done.iter().position(|&request| request == RequestId(id));
+            assert_eq!(position(3) < position(2), round1_first, "{label}: {done:?}");
+        }
+    }
+
+    #[test]
     fn a_hybrid_rank_stages_its_read_through_the_loading_area() {
         // A 1-token KV byte and a 10-byte recurrent state resumed at the
         // context's end. Session 7's 50-token round is evicted from HBM; its
