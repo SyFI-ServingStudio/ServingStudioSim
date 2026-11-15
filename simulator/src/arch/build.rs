@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use crate::arch::deepseek_v41_engram_fetch::{EngramFetch, EngramHostGather};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
@@ -1141,6 +1142,7 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
     max_num_batched_tokens: u32,
     cudagraph_capture_sizes: &[u32],
     deepinfer: Option<deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>,
+    engram_fetch: EngramFetch,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1169,11 +1171,23 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
         num_routed_layers: model_cfg.num_layers,
     };
     let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
-    let configs = deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
-        .context("expanding DeepSeek-V4.1-Flash DP4/EP4 architecture configs")?;
+    let mut configs =
+        deepseek_v41_vllm_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
+            .context("expanding DeepSeek-V4.1-Flash DP4/EP4 architecture configs")?;
+    if engram_fetch == EngramFetch::Off {
+        configs.engram_prefetch = None;
+    }
+    let host_gather = match (engram_fetch, configs.engram_prefetch.as_mut()) {
+        (EngramFetch::CpuGather, Some(prefetch)) => Some(EngramHostGather::from_prefetch(prefetch)),
+        _ => None,
+    };
     let resolved = deepseek_v41_vllm_dp_attn_ep_moe::resolve_configs(&configs);
-    deepseek_v41_vllm_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
-        .context("building DeepSeek-V4.1-Flash DP4/EP4 model (often a missing profile.db row)")
+    let model = deepseek_v41_vllm_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash DP4/EP4 model (often a missing profile.db row)")?;
+    Ok(match host_gather {
+        Some(gather) => model.with_engram_host_gather(gather),
+        None => model,
+    })
 }
 
 /// Build DeepSeek-V4.1-Flash + DSpark under DP4 attention + EP4 experts: the
@@ -2814,6 +2828,7 @@ pub fn build_iter_model(
                 *yoco_keep_tokens,
                 *engram_fetch,
             )?,
+            *engram_fetch,
             gpu,
             name,
             bridge,

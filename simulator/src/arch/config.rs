@@ -101,10 +101,6 @@ const fn default_decoder_swa_bounded_replay() -> bool {
     true
 }
 
-const fn default_true_engram_fetch() -> bool {
-    true
-}
-
 /// The `engine` choices of `deepseek_v41_vllm_dp_attn_ep_moe` (mirror of
 /// [`DeepseekV41Engine`]).
 const DEEPSEEK_V41_ENGINES: [&str; 2] = ["vllm", "deepinfer"];
@@ -124,14 +120,15 @@ pub fn deepseek_v41_dp_engine(
     engine: DeepseekV41Engine,
     num_redundant_experts: u32,
     yoco_keep_tokens: u32,
-    engram_fetch: bool,
+    engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
 ) -> anyhow::Result<Option<super::deepseek_v41_vllm_dp_attn_ep_moe::DeepInferEngine>> {
+    let engram_fetch = engram_fetch != crate::arch::deepseek_v41_engram_fetch::EngramFetch::Off;
     match engine {
         DeepseekV41Engine::Vllm => {
             anyhow::ensure!(
-                num_redundant_experts == 0 && yoco_keep_tokens == 0 && engram_fetch,
-                "num_redundant_experts, yoco_keep_tokens and engram_fetch are DeepInfer \
-                 options; set engine: deepinfer"
+                num_redundant_experts == 0 && yoco_keep_tokens == 0,
+                "num_redundant_experts and yoco_keep_tokens are DeepInfer options; set \
+                 engine: deepinfer"
             );
             Ok(None)
         }
@@ -619,11 +616,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(default = 0, cache_key)]
         yoco_keep_tokens: u32,
-        /// DeepInfer only: price the Engram table fetch (false leaves it out;
-        /// the Engram blocks' compute stays).
-        #[serde(default = "default_true_engram_fetch")]
-        #[param(default = true, cache_key)]
-        engram_fetch: bool,
+        /// How Engram rows reach the GPU: `uva` (vLLM's host-UVA lookup),
+        /// `cpu_gather` (host gather + one H2D copy per layer + device unpack;
+        /// `arch::deepseek_v41_engram_fetch`), or `off` (the fetch priced out,
+        /// the Engram blocks' compute stays). `true`/`false` read as uva/off.
+        #[serde(default)]
+        #[param(string, default = "uva", choices = ["uva", "cpu_gather", "off"], cache_key)]
+        engram_fetch: crate::arch::deepseek_v41_engram_fetch::EngramFetch,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)

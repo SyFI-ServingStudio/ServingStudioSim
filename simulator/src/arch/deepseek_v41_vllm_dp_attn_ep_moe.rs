@@ -60,6 +60,7 @@ use crate::arch::deepseek_v41_vllm::{
     LayerKind, PlanNode,
 };
 use crate::arch::kv_layout::KvCacheLayout;
+use crate::arch::deepseek_v41_engram_fetch::EngramHostGather;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
@@ -707,6 +708,9 @@ pub struct DeepseekV41VllmDpModel {
     graphs: DeepseekV41CudaGraphs,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
+    /// `Some` under the `cpu_gather` Engram fetch: the last slot is the GPU
+    /// time each step waits for host-gathered rows.
+    host_gather: Option<EngramHostGather>,
 }
 
 pub fn build(
@@ -768,6 +772,7 @@ pub fn build(
         graphs: resolved.graphs,
         cost_flat: Vec::new(),
         n_slots: 0,
+        host_gather: None,
         name,
     };
     let tree = model.cost_tree();
@@ -777,9 +782,32 @@ pub fn build(
 }
 
 impl DeepseekV41VllmDpModel {
+    /// Switch to the `cpu_gather` Engram fetch (the model was built with the
+    /// unpack's prefetch config, [`EngramHostGather::from_prefetch`]).
+    pub fn with_engram_host_gather(mut self, gather: EngramHostGather) -> Self {
+        self.host_gather = Some(gather);
+        let tree = self.cost_tree();
+        self.cost_flat = tree.flatten();
+        self.n_slots = tree.n_slots();
+        self
+    }
+
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
-        let sections = self.compile_sections(&mut b);
+        let mut sections = self.compile_sections(&mut b);
+        if self.host_gather.is_some() {
+            sections.push(CostNode::Labeled {
+                label: format!(
+                    "{}.engram_host_gather [GPU wait for CPU gather + H2D, Max over DP ranks]",
+                    self.name
+                ),
+                child: Box::new(b.leaf(
+                    format!("{}.engram_host_gather", self.name),
+                    "engram_host_gather_wait",
+                    serde_json::json!({}),
+                )),
+            });
+        }
         let root = CostNode::Labeled {
             label: format!(
                 "{} (DeepseekV41VllmDpModel) [DP{DP_SIZE} attention at TP1, EP{DP_SIZE} experts \
@@ -970,13 +998,35 @@ impl DeepseekV41VllmDpModel {
             None => Evaluator::new(slots),
         };
         self.eval_step(&step, &mut evaluator);
+        let max_rows = step.full.ranks.iter().map(|rank| rank.rows).max().unwrap_or(0);
+        if self.host_gather.is_some() {
+            evaluator.push(LeafMetrics::ZERO, || {
+                SlotInput::from(ElementwiseKernelInput {
+                    num_tokens: max_rows,
+                })
+            });
+        }
         assert_eq!(
             evaluator.filled(),
             self.n_slots,
             "eval must fill every compiled slot"
         );
         drop(evaluator);
-        CostTree::aggregate(&self.cost_flat, slots, scratch)
+        let mut total = CostTree::aggregate(&self.cost_flat, slots, scratch);
+        if let Some(gather) = &self.host_gather {
+            // The ranks run in lockstep: the step waits for its slowest rank's
+            // rows. GPU time ahead of layer L: the step's mean per-layer time
+            // times the L layers before it.
+            let per_layer = f64::from(total.m.time_ms) / f64::from(tp_arch::BODY_LAYERS);
+            let available: Vec<f64> = tp_arch::ENGRAM_LAYERS
+                .iter()
+                .map(|&layer| per_layer * f64::from(layer))
+                .collect();
+            let wait = gather.exposed_ms(max_rows, &available) as f32;
+            slots[self.n_slots - 1].m.time_ms = wait;
+            total.m.time_ms += wait;
+        }
+        total
     }
 }
 

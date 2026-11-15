@@ -93,7 +93,7 @@ pub(crate) const TP_SIZE: u32 = 4;
 pub(crate) const EP_SIZE: u32 = 4;
 
 // Checkpoint identity (HF text_config); `from_json` rejects anything else.
-const BODY_LAYERS: u32 = 40;
+pub(crate) const BODY_LAYERS: u32 = 40;
 const MTP_LAYERS: u32 = 3;
 const HIDDEN: u32 = 5120;
 const NUM_EXPERTS: u32 = 384;
@@ -103,7 +103,7 @@ const VOCAB_SIZE: u32 = 129_280;
 const KV_SOURCE_LAYERS: [u32; 4] = [2, 8, 14, 20];
 const INDEX_SOURCE_LAYERS: [u32; 8] = [2, 8, 14, 20, 24, 28, 32, 36];
 const CANDIDATE_SOURCE_LAYER: u32 = 20;
-const ENGRAM_LAYERS: [u32; 2] = [1, 14];
+pub(crate) const ENGRAM_LAYERS: [u32; 2] = [1, 14];
 
 // Deployment identity (capture 2 `profile.yaml` / server log). Its
 // `--max-model-len 131072` is the selector's `max_model_len`, which the
@@ -128,7 +128,7 @@ const PREFILL_CHUNK_SIZE: u32 = 4;
 pub(crate) const MAX_NUM_SEQS: u32 = 64;
 /// Rows of TP rank 0's Engram table slice (`part_num_embeddings`, server log
 /// `engram.py:269`, layer 1): the lookup kind's exact table identity.
-const ENGRAM_TABLE_ROWS_RANK0: u64 = 96_000_564;
+pub(crate) const ENGRAM_TABLE_ROWS_RANK0: u64 = 96_000_564;
 /// `wkv` output width of the Engram block (captured MXFP8 GEMM 6144 -> 25600).
 const ENGRAM_WKV_OUT: u32 = 25_600;
 

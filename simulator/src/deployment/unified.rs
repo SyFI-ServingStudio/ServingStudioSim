@@ -647,6 +647,7 @@ impl Deployment for UnifiedDeployment {
                         *yoco_keep_tokens,
                         *engram_fetch,
                     )?,
+                    *engram_fetch,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

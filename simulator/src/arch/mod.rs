@@ -8,6 +8,7 @@ pub mod build;
 pub mod config;
 pub mod contract;
 pub mod deepseek_v41_dspark_plumbing;
+pub mod deepseek_v41_engram_fetch;
 pub mod deepseek_v41_vllm;
 pub mod deepseek_v41_vllm_dspark;
 pub mod deepseek_v41_vllm_dp_attn_ep_moe;
