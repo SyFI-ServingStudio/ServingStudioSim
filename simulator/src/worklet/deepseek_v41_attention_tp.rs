@@ -446,6 +446,7 @@ impl DeepseekV41AttentionTpWorklet {
         let fused_entry = layer.entry == DeepseekV41AttentionEntry::FusedPostPre;
         let deepinfer = cfg.deepinfer.as_ref();
         let vllm = deepinfer.is_none();
+        let index_q_fused = deepinfer.is_some() && index_source;
         let mhc = |backends: &Vec<&'static str>| MhcRmsNormKernelConfig {
             backends: backends.clone(),
             gpu_name: cfg.gpu_name.clone(),
@@ -520,9 +521,17 @@ impl DeepseekV41AttentionTpWorklet {
                 (cfg.q_lora_rank.get() + head_dim) * 2,
                 (cfg.q_lora_rank.get() + head_dim) * 2,
             ),
+            // DeepInfer attn.py `q_b_proj`: on an index-source layer
+            // (`has_local_index`) the indexer's q_B rows are concatenated onto
+            // Wq.B and the output split after one GEMM.
             wq_b: mxfp8_from(
                 query_backends,
-                cfg.head_dim.clone() * heads_per_rank,
+                if index_q_fused {
+                    cfg.head_dim.clone() * heads_per_rank
+                        + cfg.index_num_heads.clone() * cfg.index_head_dim.clone()
+                } else {
+                    cfg.head_dim.clone() * heads_per_rank
+                },
                 cfg.q_lora_rank.clone(),
             ),
             kv_insert: QPadKvRopeMxfp8InsertKernelConfig {
@@ -558,7 +567,7 @@ impl DeepseekV41AttentionTpWorklet {
                     (cfg.index_head_dim.get() + 4) / ratio.max(1),
                 )
             }),
-            indexer_wq_b: index_source.then(|| {
+            indexer_wq_b: (index_source && !index_q_fused).then(|| {
                 mxfp8_from(
                     query_backends,
                     cfg.index_num_heads.clone() * cfg.index_head_dim.clone(),
