@@ -166,7 +166,8 @@ state was kept for the others (`prefix_resume_points`, default `prompt_end`
 under `vllm`; `context_end` keeps the state at the unfloored context end, so a
 hit is the whole context or nothing; with it, `recurrent_state_checkpoints: k`
 on the chunked selectors keeps the latest `k` round-end states per entry, one
-unit with the context, `kv/shared/state_retention.rs`). A hit is the largest position at or below the declared prefix.
+unit with the context, and `recurrent_state_anchors` the latest hand-back and
+pass ends plus strided earlier pass ends, `kv/shared/state_retention.rs`). A hit is the largest position at or below the declared prefix.
 A running request's tails and states at positions it has already passed are
 live checkpoints: like retained entries they are a soft, evictable tier that
 never enters `fits` or `kv_usage`, and they win the slack over retained
@@ -202,7 +203,14 @@ With `prefix_tier_loading_area` > 0 reads are staged: a loading area of
 `floor(capacity x fraction)` units stays held on HBM (and a DRAM area carved
 from DRAM when SSD is behind it); a staged read holds only what it lands, starts
 when it fits its area or the area is empty, and an SSD read lands in DRAM before
-it hops on to HBM on DRAM's channel. Tier entry changes are `prefix_cache_event` rows with `tier` set; the tiers'
+it hops on to HBM on DRAM's channel. `TierStateOptions` sets how tiers move
+states: the states a round adds (`1 + external_decode`, which a read leaves
+room for), `tier_state_compression_ratio` (stored size in tiers and on SSD,
+decoded on DRAM's channel and in HBM's area), and
+`recurrent_state_anchors_in_place`. With `external_decode` the store's
+`release_handing_back` / `hand_back_context` split a request's release from its
+decode's hand-back, which extends the prompt's HBM context and writes the
+round through. Tier entry changes are `prefix_cache_event` rows with `tier` set; the tiers'
 counters become the pool's `tiers` in `raw/kv_cache.json`, written when the
 store is dropped and rewritten after the run. Rules:
 `doc/detailed_design/L5.md` §3.3.
@@ -439,7 +447,10 @@ shell wakes at each landing (`MicrobatchAdmission::next_read_landing`). With
 staged loading, `start_staged_reads` runs at the start of each fresh pass
 (overdue requests, then the pending order) and starts reads in order until
 both loading areas are out of room; admission passes over a request until its
-read lands. The areas and their arithmetic stay in the KV store.
+read lands. The areas and their arithmetic stay in the KV store. With
+`external_decode` the lifecycle owns an `ExternalDecode` completion rule
+(`admission/external_decode.rs`): a request runs to its first token, and its
+context is handed back after every release of the microbatch.
 
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;
