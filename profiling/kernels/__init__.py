@@ -77,10 +77,13 @@ from profiling.kernels import (
     layered_kv_norm_rope_cache_write,  # noqa: F401
     logits_topk,  # noqa: F401
     mega_gate,  # noqa: F401
+    mega_mhc,  # noqa: F401
     mega_moe,  # noqa: F401
     mhc_fused_post_pre_rms_norm,  # noqa: F401
     mhc_fused_sum_post_pre_rms_norm,  # noqa: F401
+    mhc_post,  # noqa: F401
     mhc_pre_rms_norm,  # noqa: F401
+    mhc_shifted_pre,  # noqa: F401
     mhc_terminal_head,  # noqa: F401
     mla_cache_append,  # noqa: F401
     mla_rope_quantize_fp8,  # noqa: F401

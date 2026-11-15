@@ -70,10 +70,13 @@ pub mod layered_kv_norm_rope_cache_write;
 pub mod kv_compress_store;
 pub mod logits_topk;
 pub mod mega_gate;
+pub mod mega_mhc;
 pub mod mega_moe;
 pub mod mhc_fused_post_pre_rms_norm;
 pub mod mhc_fused_sum_post_pre_rms_norm;
+pub mod mhc_post;
 pub mod mhc_pre_rms_norm;
+pub mod mhc_shifted_pre;
 pub mod mhc_terminal_head;
 pub mod mla_cache_append;
 pub mod mla_rope_quantize_fp8;
@@ -368,11 +371,14 @@ pub use logits_topk::{
     LogitsTopkKernel, LogitsTopkKernelConfig, LogitsTopkKernelInput, LogitsTopkSpec,
 };
 pub use mega_gate::{MegaGateKernel, MegaGateKernelConfig, MegaGateKernelInput, MegaGateSpec};
+pub use mega_mhc::{MegaMhcKernel, MegaMhcKernelConfig, MegaMhcKernelInput, MegaMhcSpec};
 pub use mega_moe::{MegaMoeKernel, MegaMoeKernelConfig, MegaMoeKernelInput, MegaMoeSpec};
 pub use mhc_fused_post_pre_rms_norm::{MhcFusedPostPreRmsNormKernel, MhcFusedPostPreRmsNormSpec};
 pub use mhc_fused_sum_post_pre_rms_norm::{
     MhcFusedSumKernelConfig, MhcFusedSumPostPreRmsNormKernel, MhcFusedSumPostPreRmsNormSpec,
 };
+pub use mhc_post::{MhcPostKernel, MhcPostSpec};
+pub use mhc_shifted_pre::{MhcShiftedPreKernel, MhcShiftedPreSpec};
 pub use mhc_pre_rms_norm::{
     MhcPreRmsNormKernel, MhcPreRmsNormSpec, MhcRmsNormKernelConfig, MhcRmsNormKernelInput,
 };

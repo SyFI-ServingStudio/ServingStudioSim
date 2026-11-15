@@ -55,7 +55,6 @@ use crate::timing::kernels::HadamardFp8QuantKernelInput;
 use crate::timing::kernels::HadamardFp8QuantWeightScaleKernelInput;
 use crate::timing::kernels::IndexedRowCopyKernelInput;
 use crate::timing::kernels::MegaMoeKernelInput;
-use crate::timing::kernels::{EngramGateKernelInput, MegaGateKernelInput};
 use crate::timing::kernels::MoeSinkGateSelectKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::SconvQkvrPrepKernelInput;
@@ -64,6 +63,7 @@ use crate::timing::kernels::{
     GroupedConvResidualRmsNormKernelInput, LayeredKvNormRopeCacheWriteKernelInput,
     QkNormRopeFp8KvWriteKernelInput,
 };
+use crate::timing::kernels::{EngramGateKernelInput, MegaGateKernelInput, MegaMhcKernelInput};
 use crate::timing::kernels::{
     GroupedRmsNormKernelInput, MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput,
     ScaledSiluKernelInput, SiluAndMulKernelInput, SparseIndexExpandKernelInput,
@@ -187,6 +187,7 @@ log_inputs! {
     Nvfp4FusedMoe => Nvfp4FusedMoeKernelInput,
     MegaMoe => MegaMoeKernelInput,
     MegaGate => MegaGateKernelInput,
+    MegaMhc => MegaMhcKernelInput,
     EngramGate => EngramGateKernelInput,
     Bf16FusedMoe => Bf16FusedMoeKernelInput,
     Nvfp4Quant => Nvfp4QuantKernelInput,
