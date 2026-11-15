@@ -68,6 +68,7 @@ pub mod kv_cache_append;
 pub mod layered_kv_norm_rope_cache_write;
 pub mod kv_compress_store;
 pub mod logits_topk;
+pub mod mega_moe;
 pub mod mhc_fused_post_pre_rms_norm;
 pub mod mhc_fused_sum_post_pre_rms_norm;
 pub mod mhc_pre_rms_norm;
@@ -363,6 +364,7 @@ pub use kv_compress_store::{
 pub use logits_topk::{
     LogitsTopkKernel, LogitsTopkKernelConfig, LogitsTopkKernelInput, LogitsTopkSpec,
 };
+pub use mega_moe::{MegaMoeKernel, MegaMoeKernelConfig, MegaMoeKernelInput, MegaMoeSpec};
 pub use mhc_fused_post_pre_rms_norm::{MhcFusedPostPreRmsNormKernel, MhcFusedPostPreRmsNormSpec};
 pub use mhc_fused_sum_post_pre_rms_norm::{
     MhcFusedSumKernelConfig, MhcFusedSumPostPreRmsNormKernel, MhcFusedSumPostPreRmsNormSpec,
