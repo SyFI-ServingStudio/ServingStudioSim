@@ -460,7 +460,7 @@ impl KvAccounting {
     }
 
     /// Units of one reusable state, what each kept round-end state costs.
-    pub(super) fn reusable_state_units(&self) -> u64 {
+    pub(crate) fn reusable_state_units(&self) -> u64 {
         self.reusable_state_units
     }
 

@@ -35,17 +35,20 @@ use crate::log::{
 };
 use crate::worker::kv::shared::kv_accounting::SharedKvAccounting;
 use crate::worker::kv::shared::prefix_cache::{
-    PrefixCache, PrefixCacheBudget, PrefixCacheMutation, PrefixCacheMutationKind,
-    PrefixCacheReturnMetadata,
+    PrefixCache, PrefixCacheBudget, PrefixCacheInsertResult, PrefixCacheMutation,
+    PrefixCacheMutationKind, PrefixCacheReturnMetadata,
 };
 use crate::worker::kv::shared::prefix_cache_journal::PrefixCacheJournal;
 use crate::worker::kv::shared::request_ledger::RequestLedger;
 use crate::worker::kv::shared::resident_partition::ResidentPartitionState;
 use crate::worker::kv::shared::state_retention::Carried;
-use crate::worker::kv::shared::tier_chain::{RoundContext, TierBytes, TierChain, TierSpec};
+use crate::worker::kv::shared::tier_chain::{
+    LeavingContext, RoundContext, TierBytes, TierChain, TierHit, TierSpec,
+};
+use crate::worker::kv::shared::tier_reads::{ReadPhase, ReadRecord, TierReads};
 use crate::worker::kv::{
     ChunkedPrefillKv, HandoffKv, IterWorkerKv, KvStore, PrefixKv, ResolvedPrefillContext,
-    SlotPipelineKv,
+    SlotPipelineKv, TierReadPlan, TieredPrefixKv,
 };
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
 
@@ -77,6 +80,11 @@ pub struct KvCacheStore {
     /// Host DRAM/SSD tiers behind each partition's prefix cache; empty
     /// without tiers.
     tier_chains: Vec<TierChain>,
+    /// Reads from those tiers; `None` without tiers.
+    tier_reads: Option<TierReads>,
+    /// Whether a declared prefix longer than anything the run stored for the
+    /// session is a pre-run context, read from the slowest tier.
+    tier_warm_start: bool,
     journal: PrefixCacheJournal,
     sampler: Option<KvSampler>,
 }
@@ -347,6 +355,174 @@ impl ChunkedPrefillKv for KvCacheStore {
     }
 }
 
+impl TieredPrefixKv for KvCacheStore {
+    fn reusable_prefix_tokens(&self, fresh_prompt_tokens: u32, session_input: SessionInput) -> u32 {
+        let resident = self.resident_prefix_tokens(fresh_prompt_tokens, session_input);
+        let SessionInput::Session {
+            session_id,
+            declared_prefix_tokens,
+            ..
+        } = session_input
+        else {
+            return resident;
+        };
+        // One pipeline head or one rank's tiers: the partition HBM would use.
+        let partition = self.retained_prefix_partition(session_input).unwrap_or(0);
+        self.tier_lookup(partition, session_id, u64::from(declared_prefix_tokens))
+            .map_or(resident, |(hit, _)| resident.max(hit.tokens as u32))
+    }
+
+    fn plan_tier_read(
+        &self,
+        partition: PartitionId,
+        request: RequestId,
+        fresh_prompt_tokens: u32,
+        remaining_output_tokens: u32,
+        session_input: SessionInput,
+        now: Time,
+    ) -> Option<TierReadPlan<KvFootprint>> {
+        let SessionInput::Session {
+            session_id,
+            declared_prefix_tokens,
+            ..
+        } = session_input
+        else {
+            return None;
+        };
+        let resolved = self.preview_prefill_context(partition, fresh_prompt_tokens, session_input);
+        let resident = u64::from(resolved.resident_prefix_tokens());
+        let reads = self.tier_reads.as_ref()?;
+        if let Some(record) = reads
+            .record(request)
+            .filter(|record| record.phase == ReadPhase::Restored)
+        {
+            if resident >= record.hit.tokens {
+                return None;
+            }
+        }
+        let (hit, seeded) = self
+            .tier_lookup(partition, session_id, u64::from(declared_prefix_tokens))
+            .filter(|(hit, _)| hit.tokens > resident)?;
+        let chain = &self.tier_chains[partition as usize];
+        let earlier = if seeded {
+            0
+        } else {
+            chain.read_states(session_id, hit).len() as u64
+        };
+        Some(TierReadPlan {
+            tier: hit.tier,
+            queue_wait: chain.queue_wait(hit.tier, now),
+            hit_tokens: hit.tokens,
+            resident_tokens: resident,
+            hold: KvFootprint {
+                reserved_units: self.accounting.footprint(
+                    u64::from(resolved.post_prefill_context_tokens()),
+                    u64::from(remaining_output_tokens),
+                ) + earlier * self.accounting.reusable_state_units(),
+                basis: ReservationBasis::FullFootprint,
+            },
+        })
+    }
+
+    fn start_tier_read(
+        &mut self,
+        partition: PartitionId,
+        request: RequestId,
+        session_input: SessionInput,
+        plan: TierReadPlan<KvFootprint>,
+        now: Time,
+    ) {
+        let SessionInput::Session {
+            session_id,
+            declared_prefix_tokens,
+            ..
+        } = session_input
+        else {
+            unreachable!("only a session request reads from a tier");
+        };
+        let resident = plan.resident_tokens;
+        let (hit, seeded) = self
+            .tier_lookup(partition, session_id, u64::from(declared_prefix_tokens))
+            .expect("a planned read has a hit");
+        debug_assert_eq!((hit.tier, hit.tokens), (plan.tier, plan.hit_tokens));
+        self.ledger
+            .hold(request, partition, plan.hold.reserved_units(), hit.tokens);
+        // What the hold pushes out of HBM reaches a victim tier after the
+        // read: the read touches its entry first.
+        let evictions = self.trim_prefix_cache_to_physical_slack(partition);
+        let mut evicted = Vec::new();
+        for eviction in evictions {
+            evicted.extend(self.journal_mutation(
+                request,
+                partition,
+                now,
+                eviction,
+                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ActiveKvPressure),
+                0,
+            ));
+        }
+        let reads = self.tier_reads.as_mut().expect("a read implies tiers");
+        let chain = &mut self.tier_chains[partition as usize];
+        if seeded {
+            chain.seed(session_id, self.accounting.resume_positions(hit.tokens, hit.tokens));
+            reads.note_stored(partition, session_id, hit.tokens);
+            reads.note_warm_start(partition, hit.tokens);
+        }
+        let read = chain.read(session_id, hit, resident, now);
+        reads.start(
+            request,
+            ReadRecord {
+                partition,
+                session_id,
+                hit,
+                resident,
+                read,
+                phase: ReadPhase::Reading,
+            },
+        );
+        for context in evicted {
+            chain.take_hbm_eviction(context);
+        }
+    }
+
+    fn next_tier_landing(&self) -> Option<Time> {
+        self.tier_reads.as_ref()?.next_landing()
+    }
+
+    fn take_landed_reads(&mut self, now: Time) -> Vec<(RequestId, Time)> {
+        self.tier_reads
+            .as_mut()
+            .map_or_else(Vec::new, |reads| reads.land(now))
+    }
+
+    fn restore_landed_read(&mut self, partition: PartitionId, request: RequestId, now: Time) {
+        self.ledger.take_held(request);
+        let record = self
+            .tier_reads
+            .as_mut()
+            .expect("a landed read implies tiers")
+            .restore(request)
+            .clone();
+        let physical_limit = self.prefix_cache_physical_limit(partition);
+        let insert_result = self.prefix_caches[partition as usize].restore(
+            record.session_id,
+            record.read.positions,
+            record.read.end,
+            record.read.earlier,
+            physical_limit,
+        );
+        self.record_retention(
+            request,
+            partition,
+            record.session_id,
+            record.hit.tokens,
+            insert_result,
+            now,
+            PrefixCacheRetentionReason::TierRead,
+        );
+    }
+}
+
 impl PrefixKv for KvCacheStore {
     fn retained_prefix_partition(&self, session_input: SessionInput) -> Option<PartitionId> {
         let (session_id, declared_prefix_tokens) = match session_input {
@@ -440,14 +616,17 @@ impl PrefixKv for KvCacheStore {
         }
         self.ledger.set_prefill_context(request, resolved_prefill);
         self.reserve(request, partition, footprint, now);
-        if let (Some(session_id), Some(chain)) = (
-            resolved_prefill.session_id(),
-            self.tier_chains.get_mut(partition as usize),
-        ) {
-            chain.cut(
-                session_id,
-                u64::from(resolved_prefill.declared_prefix_tokens()),
+        if let (Some(session_id), Some(reads)) =
+            (resolved_prefill.session_id(), self.tier_reads.as_mut())
+        {
+            let declared = u64::from(resolved_prefill.declared_prefix_tokens());
+            reads.admit(
+                partition,
+                request,
+                declared,
+                u64::from(resolved_prefill.resident_prefix_tokens()),
             );
+            self.tier_chains[partition as usize].cut(session_id, declared);
         }
     }
 
@@ -521,6 +700,8 @@ impl KvCacheStore {
                 .map(|_| PrefixCache::new(accounting.clone(), prefix_cache))
                 .collect(),
             tier_chains: Vec::new(),
+            tier_reads: None,
+            tier_warm_start: false,
             journal: PrefixCacheJournal::new(prefix_cache_logger),
             sampler,
             accounting,
@@ -535,8 +716,38 @@ impl KvCacheStore {
             self.tier_chains = (0..self.partitions.len())
                 .map(|_| TierChain::new(specs, bytes, retention))
                 .collect();
+            self.tier_reads = Some(TierReads::new(self.partitions.len(), specs.len()));
         }
         self
+    }
+
+    /// Treat a declared prefix longer than anything the run stored for the
+    /// session, by more than one token, as a conversation that began before
+    /// the run: its context is in the slowest tier, as a long-lived session's
+    /// would be in steady state. (A stored context lacks its last output
+    /// token, whose KV the next request computes, so that request may declare
+    /// one token more.)
+    pub(crate) fn with_tier_warm_start(mut self) -> Self {
+        self.tier_warm_start = true;
+        self
+    }
+
+    /// Where a read of the session's `declared` prefix on `partition` would
+    /// come from, and whether it is a pre-run context.
+    fn tier_lookup(&self, partition: PartitionId, session_id: u32, declared: u64) -> Option<(TierHit, bool)> {
+        let chain = self.tier_chains.get(partition as usize)?;
+        let reads = self.tier_reads.as_ref()?;
+        if self.tier_warm_start && declared > reads.stored(partition, session_id) + 1 {
+            let tokens = self.accounting.resume_positions(declared, declared).end();
+            return (tokens > 0).then_some((
+                TierHit {
+                    tier: chain.len() - 1,
+                    tokens,
+                },
+                true,
+            ));
+        }
+        chain.lookup(session_id, declared).map(|hit| (hit, false))
     }
 
     #[inline]
@@ -714,6 +925,9 @@ impl KvCacheStore {
                 now,
                 PrefixCacheRetentionReason::RequestComplete,
             );
+            if let Some(reads) = self.tier_reads.as_mut() {
+                reads.note_stored(partition, session_id, retained_tokens);
+            }
             if let Some(chain) = self.tier_chains.get_mut(partition as usize) {
                 chain.store_round(
                     session_id,
@@ -938,10 +1152,33 @@ impl KvCacheStore {
         request: RequestId,
         partition: PartitionId,
         now: Time,
-        mut mutation: PrefixCacheMutation,
+        mutation: PrefixCacheMutation,
         event_kind: PrefixCacheEventKind,
         retain_requested_tokens: u64,
     ) {
+        let evicted = self.journal_mutation(
+            request,
+            partition,
+            now,
+            mutation,
+            event_kind,
+            retain_requested_tokens,
+        );
+        if let (Some(evicted), Some(chain)) = (evicted, self.tier_chains.get_mut(partition as usize)) {
+            chain.take_hbm_eviction(evicted);
+        }
+    }
+
+    /// Journal one mutation receipt; returns the entry it evicted, if any.
+    fn journal_mutation(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        now: Time,
+        mut mutation: PrefixCacheMutation,
+        event_kind: PrefixCacheEventKind,
+        retain_requested_tokens: u64,
+    ) -> Option<LeavingContext> {
         let evicted = matches!(
             mutation.kind,
             PrefixCacheMutationKind::CapacityEviction
@@ -956,10 +1193,47 @@ impl KvCacheStore {
             event_kind,
             retain_requested_tokens,
         );
-        if let (true, Some(removed), Some(chain)) =
-            (evicted, removed, self.tier_chains.get_mut(partition as usize))
-        {
-            chain.take_hbm_eviction(removed);
+        removed.filter(|_| evicted)
+    }
+
+    /// Journal what a retention did, hand what HBM let go of to a victim
+    /// tier, and record a retention that kept nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn record_retention(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session_id: u32,
+        tokens: u64,
+        insert_result: PrefixCacheInsertResult,
+        now: Time,
+        retain_reason: PrefixCacheRetentionReason,
+    ) {
+        for mutation in insert_result.mutations {
+            let event_kind = PrefixCacheJournal::retain_event_kind(mutation.kind, retain_reason);
+            self.record_mutation(request, partition, now, mutation, event_kind, tokens);
+        }
+        if let Some(unkept) = insert_result.unkept {
+            if let Some(chain) = self.tier_chains.get_mut(partition as usize) {
+                chain.take_hbm_eviction(unkept);
+            }
+        }
+        if insert_result.retained_tokens == 0 {
+            let cache_used = self.prefix_caches[partition as usize].used_tokens();
+            self.journal.record(PrefixCacheEvent {
+                partition_id: partition,
+                time: now,
+                request_id: request,
+                session_id,
+                kind: PrefixCacheEventKind::Retain(PrefixCacheRetentionReason::NoCacheCapacity),
+                entry_tokens_before: 0,
+                entry_tokens_after: 0,
+                cache_used_before: cache_used,
+                cache_used_after: cache_used,
+                requested_tokens: tokens,
+                hit_tokens: 0,
+                full_hit_tokens: 0,
+            });
         }
     }
 
@@ -987,32 +1261,15 @@ impl KvCacheStore {
             physical_limit,
             cache_return_metadata,
         );
-        for mutation in insert_result.mutations {
-            let event_kind = PrefixCacheJournal::retain_event_kind(mutation.kind, retain_reason);
-            self.record_mutation(request, partition, now, mutation, event_kind, tokens);
-        }
-        if let Some(unkept) = insert_result.unkept {
-            if let Some(chain) = self.tier_chains.get_mut(partition as usize) {
-                chain.take_hbm_eviction(unkept);
-            }
-        }
-        if insert_result.retained_tokens == 0 {
-            let cache_used = self.prefix_caches[partition as usize].used_tokens();
-            self.journal.record(PrefixCacheEvent {
-                partition_id: partition,
-                time: now,
-                request_id: request,
-                session_id,
-                kind: PrefixCacheEventKind::Retain(PrefixCacheRetentionReason::NoCacheCapacity),
-                entry_tokens_before: 0,
-                entry_tokens_after: 0,
-                cache_used_before: cache_used,
-                cache_used_after: cache_used,
-                requested_tokens: tokens,
-                hit_tokens: 0,
-                full_hit_tokens: 0,
-            });
-        }
+        self.record_retention(
+            request,
+            partition,
+            session_id,
+            tokens,
+            insert_result,
+            now,
+            retain_reason,
+        );
     }
 }
 
@@ -1147,6 +1404,98 @@ mod tests {
         admit(&mut kv_store, 2, session(7, 200), 50);
         assert_eq!(tier_hit(&kv_store, 7, 300), Some((1, 300)));
         assert_eq!(tier_hit(&kv_store, 7, 200), Some((0, 200)));
+    }
+
+    fn plan(
+        kv_store: &KvCacheStore,
+        id: u32,
+        session_input: SessionInput,
+        fresh: u32,
+        now: Time,
+    ) -> Option<TierReadPlan<KvFootprint>> {
+        kv_store.plan_tier_read(0, RequestId(id), fresh, 1, session_input, now)
+    }
+
+    /// Complete request `id` of `session_input` with `fresh` new tokens.
+    fn complete(kv_store: &mut KvCacheStore, id: u32, session_input: SessionInput, fresh: u32) {
+        admit(kv_store, id, session_input, fresh);
+        kv_store.release_retaining_prefix(RequestId(id), 0, Time::ZERO);
+    }
+
+    #[test]
+    fn a_read_holds_its_request_until_its_context_is_put_back() {
+        let mut kv_store = tiered_store(10_000, &[("dram", 1.0, 1.0, TierWrites::EveryContext)]);
+        complete(&mut kv_store, 1, session(1, 0), 6_000);
+        kv_store.prefix_caches[0].shrink_to(0);
+        let read = plan(&kv_store, 2, session(1, 6_000), 10, Time::ZERO).expect("DRAM holds more");
+        assert_eq!((read.tier, read.hit_tokens, read.resident_tokens), (0, 6_000, 0));
+        assert_eq!(read.hold.reserved_units(), 6_010 + 1);
+        kv_store.start_tier_read(0, RequestId(2), session(1, 6_000), read, Time::ZERO);
+        assert_eq!(kv_store.ledger.partition_held(0), 6_011);
+        // 6000 tokens at 1000 tokens per ms.
+        assert_eq!(kv_store.next_tier_landing(), Some(Time::from_ms(6.0)));
+        assert!(kv_store.take_landed_reads(Time::from_ms(5.0)).is_empty());
+        assert_eq!(
+            kv_store.take_landed_reads(Time::from_ms(7.0)),
+            [(RequestId(2), Time::from_ms(6.0))]
+        );
+        kv_store.restore_landed_read(0, RequestId(2), Time::from_ms(7.0));
+        assert_eq!(kv_store.ledger.partition_held(0), 0);
+        assert_eq!(kv_store.prefix_caches[0].peek(1, 6_000), 6_000);
+        assert!(plan(&kv_store, 2, session(1, 6_000), 10, Time::from_ms(7.0)).is_none());
+        admit(&mut kv_store, 2, session(1, 6_000), 10);
+        let stats = kv_store.tier_reads.as_ref().unwrap().stats(0);
+        assert_eq!((stats.tier_hit_requests[0], stats.tier_hit_tokens[0]), (1, 6_000));
+        assert_eq!(stats.rereads, 0);
+    }
+
+    #[test]
+    fn a_landed_context_evicted_before_admission_is_read_again() {
+        let mut kv_store = tiered_store(10_000, &[("dram", 1.0, 1.0, TierWrites::EveryContext)]);
+        complete(&mut kv_store, 1, session(1, 0), 6_000);
+        kv_store.prefix_caches[0].shrink_to(0);
+        let read = plan(&kv_store, 2, session(1, 6_000), 10, Time::ZERO).unwrap();
+        kv_store.start_tier_read(0, RequestId(2), session(1, 6_000), read, Time::ZERO);
+        let at = Time::from_ms(6.0);
+        kv_store.take_landed_reads(at);
+        // Admission reaches it and puts the context back in HBM, but it is
+        // evicted again before the request is admitted.
+        kv_store.restore_landed_read(0, RequestId(2), at);
+        kv_store.prefix_caches[0].shrink_to(0);
+        let again = plan(&kv_store, 2, session(1, 6_000), 10, at).expect("read again");
+        kv_store.start_tier_read(0, RequestId(2), session(1, 6_000), again, at);
+        assert_eq!(kv_store.tier_reads.as_ref().unwrap().stats(0).rereads, 1);
+        assert_eq!(kv_store.next_tier_landing(), Some(Time::from_ms(12.0)));
+    }
+
+    #[test]
+    fn warm_start_seeds_only_a_context_the_run_never_stored() {
+        let mut kv_store = tiered_store(
+            10_000,
+            &[
+                ("dram", 1.0, 1.0, TierWrites::EveryContext),
+                ("ssd", 1.0, 0.1, TierWrites::EveryContext),
+            ],
+        )
+        .with_tier_warm_start();
+        // A pre-run context: nothing stored, so it reads from the slowest tier.
+        let read = plan(&kv_store, 1, session(7, 500), 10, Time::ZERO).unwrap();
+        assert_eq!((read.tier, read.hit_tokens), (1, 500));
+        assert_eq!(kv_store.reusable_prefix_tokens(10, session(7, 500)), 500);
+        kv_store.start_tier_read(0, RequestId(1), session(7, 500), read, Time::ZERO);
+        let stats = kv_store.tier_reads.as_ref().unwrap().stats(0);
+        assert_eq!((stats.warm_start_reads, stats.warm_start_tokens), (1, 500));
+        assert_eq!(kv_store.tier_chains[0].counters(1).stored_entries, 1);
+        // The next request declares one token more than the stored context
+        // (the last output's KV): an ordinary hit from the fastest tier.
+        complete(&mut kv_store, 2, session(8, 0), 554);
+        kv_store.prefix_caches[0].shrink_to(0);
+        let read = plan(&kv_store, 3, session(8, 555), 10, Time::ZERO).unwrap();
+        assert_eq!((read.tier, read.hit_tokens), (0, 554));
+        // A one-token context does not cover a joining request's context.
+        complete(&mut kv_store, 4, session(9, 0), 1);
+        let read = plan(&kv_store, 5, session(9, 300), 10, Time::ZERO).unwrap();
+        assert_eq!((read.tier, read.hit_tokens), (1, 300));
     }
 
     #[test]

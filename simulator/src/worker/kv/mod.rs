@@ -316,6 +316,61 @@ pub trait SlotPipelineKv: KvStore {
     fn request_kv_weight(&self, request: RequestId) -> u64;
 }
 
+/// A read a host tier would serve before a queued request's admission.
+pub struct TierReadPlan<F> {
+    /// Fastest first.
+    pub tier: usize,
+    /// How long the tier's channel would make the read wait now.
+    pub queue_wait: Time,
+    /// Tokens the read resumes from, and of them what HBM already holds.
+    pub hit_tokens: u64,
+    pub resident_tokens: u64,
+    /// What the read holds in HBM from its start until its context is put
+    /// back: the request's whole footprint and every earlier state it moves.
+    pub hold: F,
+}
+
+/// Prefix refinement with host DRAM/SSD tiers behind HBM, read when admission
+/// reaches a request, as vLLM's KV connector does (`WAITING_FOR_REMOTE_KVS`).
+/// The store decides what a read moves and how long it takes; admission only
+/// decides when to start one and when to admit its request. Without tiers no
+/// request needs a read.
+pub trait TieredPrefixKv: ChunkedPrefillKv {
+    /// The longer of HBM's resident prefix and what a tier would read back:
+    /// what a cache-aware order ranks a request by.
+    fn reusable_prefix_tokens(&self, fresh_prompt_tokens: u32, session_input: SessionInput) -> u32;
+    /// The read the request needs before admission: a tier holds more of its
+    /// declared prefix than `partition`'s HBM. `None`: admit it from HBM.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_tier_read(
+        &self,
+        partition: PartitionId,
+        request: RequestId,
+        fresh_prompt_tokens: u32,
+        remaining_output_tokens: u32,
+        session_input: SessionInput,
+        now: Time,
+    ) -> Option<TierReadPlan<Self::Footprint>>;
+    /// Start the planned read, holding its footprint until the context is
+    /// put back.
+    fn start_tier_read(
+        &mut self,
+        partition: PartitionId,
+        request: RequestId,
+        session_input: SessionInput,
+        plan: TierReadPlan<Self::Footprint>,
+        now: Time,
+    );
+    /// When the next read lands.
+    fn next_tier_landing(&self) -> Option<Time>;
+    /// The requests whose reads landed by `now`, in landing order, each with
+    /// its landing time.
+    fn take_landed_reads(&mut self, now: Time) -> Vec<(RequestId, Time)>;
+    /// Put a landed request's context back into HBM, ending its hold, just
+    /// before admission resolves its prefix.
+    fn restore_landed_read(&mut self, partition: PartitionId, request: RequestId, now: Time);
+}
+
 /// Additional KV lifecycle required by a PD prefill worker.
 pub trait HandoffKv: IterWorkerKv {
     fn hold(&mut self, partition: PartitionId, request: RequestId, kv_tokens: u64);

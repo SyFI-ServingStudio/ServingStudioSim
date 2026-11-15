@@ -41,6 +41,8 @@ pub enum PrefixCacheRetentionReason {
     RequestComplete,
     HandoffComplete,
     NoCacheCapacity,
+    /// A context read back from a host tier, put into HBM at admission.
+    TierRead,
 }
 
 /// One valid prefix-cache operation/reason pair.
@@ -76,6 +78,7 @@ impl PrefixCacheEventKind {
             Self::Retain(PrefixCacheRetentionReason::RequestComplete) => "request-complete",
             Self::Retain(PrefixCacheRetentionReason::HandoffComplete) => "handoff-complete",
             Self::Retain(PrefixCacheRetentionReason::NoCacheCapacity) => "no-cache-capacity",
+            Self::Retain(PrefixCacheRetentionReason::TierRead) => "tier-read",
         }
     }
 }
