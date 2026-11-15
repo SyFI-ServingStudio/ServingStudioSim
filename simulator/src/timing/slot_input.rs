@@ -66,6 +66,11 @@ use crate::timing::kernels::{
 };
 use crate::timing::kernels::{EngramGateKernelInput, MegaGateKernelInput, MegaMhcKernelInput};
 use crate::timing::kernels::{
+    CandidateBlockMaxKernelInput, DeepSelectTopkKernelInput, MqaLogitsPrefillChunkKernelInput,
+    SparseMqaLogitsMetadataKernelInput, SparseMqaLogitsPrefillKernelInput,
+};
+use crate::timing::kernels::{EngramGateKernelInput, MegaGateKernelInput};
+use crate::timing::kernels::{
     GroupedRmsNormKernelInput, MultiAddRmsNormKernelInput, QkRmsNormRopeGateKernelInput,
     ScaledSiluKernelInput, SiluAndMulKernelInput, SparseIndexExpandKernelInput,
     SparseIndexerLogitsDecodeKernelInput, SparseIndexerLogitsPrefillKernelInput,
@@ -190,6 +195,11 @@ log_inputs! {
     MegaGate => MegaGateKernelInput,
     MegaMhc => MegaMhcKernelInput,
     EngramGate => EngramGateKernelInput,
+    MqaLogitsPrefillChunk => MqaLogitsPrefillChunkKernelInput,
+    SparseMqaLogitsPrefill => SparseMqaLogitsPrefillKernelInput,
+    SparseMqaLogitsMetadata => SparseMqaLogitsMetadataKernelInput,
+    CandidateBlockMax => CandidateBlockMaxKernelInput,
+    DeepSelectTopk => DeepSelectTopkKernelInput,
     Bf16FusedMoe => Bf16FusedMoeKernelInput,
     Nvfp4Quant => Nvfp4QuantKernelInput,
     GdnCausalConvDecode => GdnCausalConvDecodeKernelInput,

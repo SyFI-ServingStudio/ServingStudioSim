@@ -6,11 +6,13 @@ pub mod all_reduce_residual_rms_norm;
 pub mod batched_gemm;
 pub mod batched_gemm_static_fp8_quant;
 pub mod bf16_fused_moe;
+pub mod candidate_block_max;
 mod causal_rows;
 pub mod clamped_swiglu;
 pub mod compressed_sparse_mla_decode;
 pub mod compressed_sparse_mla_prefill;
 pub mod compressed_sparse_mla_rope_cast;
+pub mod deep_select_topk;
 pub mod dsa_compressed_mqa_logits_prefill;
 pub mod dsa_compressed_topk_prefill;
 pub mod dsa_fp32_split_state_update;
@@ -93,6 +95,7 @@ pub mod moe_fused_topk;
 pub mod moe_sink_gate_select;
 pub mod moe_sum;
 pub mod moe_topk_softplus_sqrt;
+pub mod mqa_logits_prefill_chunk;
 pub mod multi_add_rms_norm;
 pub mod mxfp4_marlin_moe_gemm;
 pub mod nvfp4_fused_moe;
@@ -127,6 +130,8 @@ pub mod sparse_indexer_logits_prefill;
 pub mod sparse_indexer_prepare;
 pub mod sparse_mla_norm_rope_cast_prefill;
 pub mod sparse_indexer_topk;
+pub mod sparse_mqa_logits_metadata;
+pub mod sparse_mqa_logits_prefill;
 pub mod static_fp8_quant;
 pub mod vllm_fused_moe;
 pub mod vllm_mla_rope;
@@ -150,6 +155,10 @@ pub use batched_gemm_static_fp8_quant::{
 pub use bf16_fused_moe::{
     Bf16FusedMoeKernel, Bf16FusedMoeKernelConfig, Bf16FusedMoeKernelInput, Bf16FusedMoeSpec,
 };
+pub use candidate_block_max::{
+    CandidateBlockMaxKernel, CandidateBlockMaxKernelConfig, CandidateBlockMaxKernelInput,
+    CandidateBlockMaxSpec,
+};
 pub use clamped_swiglu::{
     ClampedSwigluKernel, ClampedSwigluKernelConfig, ClampedSwigluKernelInput, ClampedSwigluSpec,
 };
@@ -166,6 +175,9 @@ pub use compressed_sparse_mla_rope_cast::{
     CompressedSparseMlaRopeCastKernelInput, CompressedSparseMlaRopeCastSpec, prefill_chunk_plan,
     swapab_layer,
     SWAPAB_MAX_TOKENS,
+};
+pub use deep_select_topk::{
+    DeepSelectTopkKernel, DeepSelectTopkKernelConfig, DeepSelectTopkKernelInput, DeepSelectTopkSpec,
 };
 pub use dsa_compressed_mqa_logits_prefill::{
     DsaCompressedMqaLogitsPrefillKernel, DsaCompressedMqaLogitsPrefillKernelConfig,
@@ -437,6 +449,10 @@ pub use moe_topk_softplus_sqrt::{
     MoeTopkSoftplusSqrtKernel, MoeTopkSoftplusSqrtKernelConfig, MoeTopkSoftplusSqrtKernelInput,
     MoeTopkSoftplusSqrtSpec,
 };
+pub use mqa_logits_prefill_chunk::{
+    MqaLogitsPrefillChunkKernel, MqaLogitsPrefillChunkKernelConfig,
+    MqaLogitsPrefillChunkKernelInput, MqaLogitsPrefillChunkSpec,
+};
 pub use multi_add_rms_norm::{
     MultiAddRmsNormKernel, MultiAddRmsNormKernelConfig, MultiAddRmsNormKernelInput,
     MultiAddRmsNormSpec,
@@ -542,6 +558,14 @@ pub use sparse_indexer_prepare::{
     SparseIndexerPrepareSpec,
 };
 pub use sparse_indexer_topk::{SparseIndexerTopkKernel, SparseIndexerTopkSpec};
+pub use sparse_mqa_logits_metadata::{
+    SparseMqaLogitsMetadataKernel, SparseMqaLogitsMetadataKernelConfig,
+    SparseMqaLogitsMetadataKernelInput, SparseMqaLogitsMetadataSpec,
+};
+pub use sparse_mqa_logits_prefill::{
+    SparseMqaLogitsPrefillKernel, SparseMqaLogitsPrefillKernelConfig,
+    SparseMqaLogitsPrefillKernelInput, SparseMqaLogitsPrefillSpec,
+};
 pub use static_fp8_quant::{
     StaticFp8QuantKernel, StaticFp8QuantKernelConfig, StaticFp8QuantKernelInput, StaticFp8QuantSpec,
 };

@@ -17,10 +17,12 @@ from profiling.kernels import (
     batched_gemm,  # noqa: F401
     batched_gemm_static_fp8_quant,  # noqa: F401
     bf16_fused_moe,  # noqa: F401
+    candidate_block_max,  # noqa: F401
     clamped_swiglu,  # noqa: F401
     compressed_sparse_mla_decode,  # noqa: F401
     compressed_sparse_mla_prefill,  # noqa: F401
     compressed_sparse_mla_rope_cast,  # noqa: F401
+    deep_select_topk,  # noqa: F401
     dsa_compressed_mqa_logits_prefill,  # noqa: F401
     dsa_compressed_topk_prefill,  # noqa: F401
     dsa_fp32_split_state_update,  # noqa: F401
@@ -100,6 +102,7 @@ from profiling.kernels import (
     moe_sink_gate_select,  # noqa: F401
     moe_sum,  # noqa: F401
     moe_topk_softplus_sqrt,  # noqa: F401
+    mqa_logits_prefill_chunk,  # noqa: F401
     multi_add_rms_norm,  # noqa: F401
     mxfp4_marlin_moe_gemm,  # noqa: F401
     nvfp4_fused_moe,  # noqa: F401
@@ -133,6 +136,8 @@ from profiling.kernels import (
     sparse_indexer_logits_prefill,  # noqa: F401
     sparse_indexer_prepare,  # noqa: F401
     sparse_mla_norm_rope_cast_prefill,  # noqa: F401
+    sparse_mqa_logits_metadata,  # noqa: F401
+    sparse_mqa_logits_prefill,  # noqa: F401
     static_fp8_quant,  # noqa: F401
     vllm_fused_moe,  # noqa: F401
     vllm_mla_rope,  # noqa: F401
