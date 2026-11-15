@@ -13,6 +13,7 @@ pub mod deepseek_v41_vllm;
 pub mod deepseek_v41_vllm_dspark;
 pub mod deepseek_v41_vllm_dp_attn_ep_moe;
 pub mod deepseek_v41_vllm_dp_attn_ep_moe_dspark;
+pub mod deepseek_v41_vllm_pp;
 pub mod deepseek_v4_vllm;
 pub mod glm52_model_cfg;
 pub mod glm52_sglang_nvfp4_tp_dsa_moe;

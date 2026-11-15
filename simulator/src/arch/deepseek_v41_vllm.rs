@@ -1036,10 +1036,93 @@ pub(crate) fn kv_groups(model: &DeepseekV41ModelCfg, extra_swa_layers: u32) -> D
     }
 }
 
+/// One pipeline stage's cache: [`kv_cache_layout`]'s page rules applied to
+/// the stage's own layers `[start, end)` at TP1 (each PP rank allocates and
+/// packs only what it holds), plus a copy of each KV source in `copies`
+/// (`(source layer, keeps its index K)`): a source another stage computes
+/// whose compressed cache (and index K cache) this stage's layers read. A
+/// copy adds its compressed pages but no compressor ring (the compressor runs
+/// on the source's own stage). A stage holding no compressed cache (layers
+/// 0-1 alone hold only sliding windows) has no full-attention block: its SWA
+/// rows sit in 32-token pages with no stride padding.
+pub(crate) fn stage_kv_cache_layout(
+    model: &DeepseekV41ModelCfg,
+    layers: (u32, u32),
+    copies: &[(u32, bool)],
+) -> KvCacheLayout {
+    let (start, end) = layers;
+    assert!(
+        start < end && end <= model.num_layers,
+        "stage layers {start}..{end}"
+    );
+    // A synthetic layer list: the copied sources first, then the stage's
+    // layers, so the packing helpers index ratios by position.
+    let copied = copies.len() as u32;
+    let rebase = |ids: &[u32]| -> Vec<u32> {
+        ids.iter()
+            .filter(|&&id| (start..end).contains(&id))
+            .map(|&id| id - start + copied)
+            .collect()
+    };
+    let mut stage = model.clone();
+    stage.compress_ratios = copies
+        .iter()
+        .map(|&(source, _)| model.compress_ratios[source as usize])
+        .chain(
+            model.compress_ratios[start as usize..end as usize]
+                .iter()
+                .copied(),
+        )
+        .collect();
+    stage.kv_source_layer_ids = (0..copied)
+        .chain(rebase(&model.kv_source_layer_ids))
+        .collect();
+    stage.index_source_layer_ids = copies
+        .iter()
+        .enumerate()
+        .filter(|(_, &(_, indexed))| indexed)
+        .map(|(position, _)| position as u32)
+        .chain(rebase(&model.index_source_layer_ids))
+        .collect();
+    let swa_layers = u64::from(end - start);
+    if !stage.kv_source_layer_ids.is_empty() {
+        let mut own = stage.clone();
+        own.kv_source_layer_ids.retain(|&id| id >= copied);
+        let (ring_layers, _) = compressor_ring(&own);
+        return kv_cache_layout_over(&stage, 1, swa_layers, ring_layers);
+    }
+    let swa_row = u64::from(MXFP8_RECORD_BYTES);
+    KvCacheLayout::new()
+        .with_part(
+            KvCachePart::sliding_window("swa", model.sliding_window, swa_layers * swa_row)
+                .not_prefix_reusable()
+                .replicated(1),
+        )
+        .with_engine(EngineOverhead {
+            block_tokens: Some(KV_BLOCK_SIZE),
+            fixed_device_bytes: swa_layers * kv_page_bytes(u64::from(SWA_BLOCK_SIZE), swa_row),
+        })
+}
+
 pub(crate) fn kv_cache_layout(
     model: &DeepseekV41ModelCfg,
     tp_size: u32,
     extra_swa_layers: u32,
+) -> KvCacheLayout {
+    let swa_layers = model.compress_ratios.len() as u64 + u64::from(extra_swa_layers);
+    let (ring_layers, _) = compressor_ring(model);
+    kv_cache_layout_over(model, tp_size, swa_layers, ring_layers)
+}
+
+/// [`kv_cache_layout`] with the sliding-window layer count and the
+/// compressor-ring layer count given explicitly (a pipeline stage's own
+/// layers; a stage holding a copy of another stage's KV source keeps its
+/// compressed pages but not its ring).
+fn kv_cache_layout_over(
+    model: &DeepseekV41ModelCfg,
+    tp_size: u32,
+    swa_layers: u64,
+    ring_layers: u64,
 ) -> KvCacheLayout {
     let page = kv_page_bytes;
     let swa_row = u64::from(MXFP8_RECORD_BYTES);
@@ -1049,7 +1132,8 @@ pub(crate) fn kv_cache_layout(
 
     let tp = tp_size;
     let mut layout = KvCacheLayout::new();
-    for (name, ratio, bytes, padded) in full_parts {
+    // A pipeline stage may hold no source of one ratio; that part is absent.
+    for (name, ratio, bytes, padded) in full_parts.into_iter().filter(|part| part.2 > 0) {
         layout = layout.with_part(
             KvCachePart::compressed(name, ratio, bytes)
                 .padded_to(padded)
@@ -1059,27 +1143,29 @@ pub(crate) fn kv_cache_layout(
     // A kind whose layers' pages fill whole groups pays a stride per group.
     let groups = |pages: u64| pages.div_ceil(block);
 
-    let swa_layers = model.compress_ratios.len() as u64 + u64::from(extra_swa_layers);
     let swa_block = u64::from(SWA_BLOCK_SIZE);
-    let swa_groups = u64::from(swa_kv_groups(model, extra_swa_layers));
-    let (ring_layers, ring_layer_bytes) = compressor_ring(model);
-    layout
-        .with_part(
-            KvCachePart::sliding_window("swa", model.sliding_window, swa_layers * swa_row)
-                .padded_to(swa_groups * stride / swa_block)
-                .not_prefix_reusable()
-                .replicated(tp),
-        )
-        .with_part(
+    // `swa_kv_groups` for this layer count.
+    let swa_groups = (swa_layers * page(swa_block, swa_row)).div_ceil(block);
+    let (_, ring_layer_bytes) = compressor_ring(model);
+    layout = layout.with_part(
+        KvCachePart::sliding_window("swa", model.sliding_window, swa_layers * swa_row)
+            .padded_to(swa_groups * stride / swa_block)
+            .not_prefix_reusable()
+            .replicated(tp),
+    );
+    // A pipeline stage whose sources need no compressor ring has no ring part.
+    if ring_layers * ring_layer_bytes > 0 {
+        layout = layout.with_part(
             KvCachePart::per_request("compressor_ring", ring_layers * ring_layer_bytes)
                 .padded_to(groups(ring_layers * page(1, ring_layer_bytes)) * stride)
                 .not_prefix_reusable()
                 .replicated(tp),
-        )
-        .with_engine(EngineOverhead {
-            block_tokens: Some(KV_BLOCK_SIZE),
-            fixed_device_bytes: stride * u64::from(tp),
-        })
+        );
+    }
+    layout.with_engine(EngineOverhead {
+        block_tokens: Some(KV_BLOCK_SIZE),
+        fixed_device_bytes: stride * u64::from(tp),
+    })
 }
 
 fn lcm(a: u64, b: u64) -> u64 {
@@ -1199,7 +1285,7 @@ pub(crate) fn layer_config(
     }
 }
 
-fn resolve_layer(config: &DeepseekV41LayerConfig) -> DeepseekV41LayerResolved {
+pub(crate) fn resolve_layer(config: &DeepseekV41LayerConfig) -> DeepseekV41LayerResolved {
     DeepseekV41LayerResolved {
         layers: config.layers.clone(),
         engram: config
@@ -1238,7 +1324,7 @@ pub fn resolve_configs(configs: &DeepseekV41VllmConfigs) -> DeepseekV41VllmResol
 }
 
 /// One built body layer: optional Engram block, attention, MoE FFN.
-struct DeepseekV41LayerBody {
+pub(crate) struct DeepseekV41LayerBody {
     name: String,
     layers: Vec<u32>,
     engram: Option<DeepseekV41EngramTpWorklet>,
@@ -1247,7 +1333,7 @@ struct DeepseekV41LayerBody {
 }
 
 impl DeepseekV41LayerBody {
-    fn build(
+    pub(crate) fn build(
         model_name: &str,
         resolved: DeepseekV41LayerResolved,
         bridge: &PerfApiBridge,
@@ -1273,7 +1359,7 @@ impl DeepseekV41LayerBody {
         })
     }
 
-    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+    pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let mut children = Vec::new();
         if let Some(engram) = &self.engram {
             children.push(engram.compile(builder));
@@ -1286,7 +1372,7 @@ impl DeepseekV41LayerBody {
         }
     }
 
-    fn eval(&self, input: &LayerInput, evaluator: &mut Evaluator) {
+    pub(crate) fn eval(&self, input: &LayerInput, evaluator: &mut Evaluator) {
         if let Some(engram) = &self.engram {
             engram.eval(
                 &DeepseekV41EngramTpWorkletInput {

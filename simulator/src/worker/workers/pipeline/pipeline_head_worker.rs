@@ -36,7 +36,7 @@ use std::rc::Rc;
 use crate::arch::contract::UnifiedArchInput;
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::MicrobatchAdmission;
-use crate::worker::execution::IterModelExecution;
+use crate::worker::execution::{IterModelExecution, PipelineStageExecution};
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::kv::{IterWorkerKv, TierBytes};
 use crate::worker::shared::context::WorkerContext;
@@ -65,7 +65,7 @@ pub struct PipelineHeadWorker<K, A, E>
 where
     K: IterWorkerKv,
     A: MicrobatchAdmission<K>,
-    E: IterModelExecution<K, Input = UnifiedArchInput>,
+    E: IterModelExecution<K, Input = UnifiedArchInput> + PipelineStageExecution,
 {
     context: WorkerContext,
     kv_store: K,
@@ -95,7 +95,7 @@ impl<K, A, E> PipelineHeadWorker<K, A, E>
 where
     K: IterWorkerKv,
     A: MicrobatchAdmission<K>,
-    E: IterModelExecution<K, Input = UnifiedArchInput>,
+    E: IterModelExecution<K, Input = UnifiedArchInput> + PipelineStageExecution,
 {
     pub(super) fn from_components(
         context: WorkerContext,
@@ -140,7 +140,7 @@ impl<K, A, E> IterWorker for PipelineHeadWorker<K, A, E>
 where
     K: IterWorkerKv,
     A: MicrobatchAdmission<K>,
-    E: IterModelExecution<K, Input = UnifiedArchInput>,
+    E: IterModelExecution<K, Input = UnifiedArchInput> + PipelineStageExecution,
 {
     type Msg = PipelineHeadMsg;
     type Event = PipelineHeadEvent;
@@ -174,7 +174,7 @@ impl<K, A, E> PipelineHeadWorker<K, A, E>
 where
     K: IterWorkerKv,
     A: MicrobatchAdmission<K>,
-    E: IterModelExecution<K, Input = UnifiedArchInput>,
+    E: IterModelExecution<K, Input = UnifiedArchInput> + PipelineStageExecution,
 {
     fn on_msg_request(&mut self, request: RequestId) {
         self.admission
@@ -286,11 +286,15 @@ where
             .map(|group| u64::from(group.batch_tokens))
             .sum();
         let cost = self.execution.evaluate_iteration(&input, id, start);
+        let activation_bytes = self
+            .execution
+            .stage_send_bytes(&input)
+            .unwrap_or(tokens * self.layout.activation_bytes_per_token);
         ComputingMicrobatch {
             microbatch: PipelineMicrobatch {
                 id,
                 input: Rc::new(input),
-                activation_bytes: tokens * self.layout.activation_bytes_per_token,
+                activation_bytes,
                 send_gid: self.send_gid,
                 ready_at: start + cost,
             },

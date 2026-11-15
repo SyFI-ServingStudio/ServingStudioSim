@@ -710,6 +710,55 @@ pub enum IterArchSel {
         #[param(default = 0, cache_key)]
         prefill_chunk_tokens: u32,
     },
+    /// DeepSeek-V4.1-Flash under plain pipeline parallelism on B200: each of
+    /// `pp_size` stages is one GPU running a contiguous layer range at TP1 /
+    /// EP1 (all heads and all 384 experts local, no collective). Any partition
+    /// is modeled; a cut inside a KV-sharing group keeps a copy of the
+    /// upstream KV source on the reading stage and forwards its new entries,
+    /// and bounded replay spans the stages after layer 20 (see
+    /// `arch/deepseek_v41_vllm_pp.rs`). Runs only under deployment `pp`.
+    DeepseekV41VllmPp {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Pipeline stages, one GPU each.
+        #[param(cache_key)]
+        pp_size: u16,
+        /// vLLM `VLLM_PP_LAYER_PARTITION`: layers per stage, `pp_size`
+        /// positive counts summing to 40. Empty: vLLM's `get_pp_indices`.
+        #[serde(default)]
+        layer_partition: Vec<u32>,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Routes are per token,
+        /// so a corpus captured at any EP size folds to EP1.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--max-model-len`, as for `deepseek_v41_vllm`.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
+        /// vLLM's decoder SWA bounded replay, as for `deepseek_v41_vllm`.
+        #[serde(default = "default_decoder_swa_bounded_replay")]
+        #[param(default = true, cache_key)]
+        decoder_swa_bounded_replay: bool,
+        /// vLLM `--max-num-batched-tokens`, as for `deepseek_v41_vllm`.
+        #[serde(default = "default_deepseek_v41_max_num_batched_tokens")]
+        #[param(default = 2048, cache_key)]
+        max_num_batched_tokens: u32,
+        /// vLLM `--cudagraph-capture-sizes`, as for `deepseek_v41_vllm`.
+        /// Omitted: vLLM's default list up to 2048. Empty: eager.
+        #[serde(default = "default_deepseek_v41_cudagraph_capture_sizes")]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)
     /// serialized; the Engram lookups keep racing the main path. An explicit
@@ -1868,6 +1917,7 @@ impl IterArchSel {
             | Self::DeepseekV41VllmDspark { model, .. }
             | Self::DeepseekV41VllmDpAttnEpMoeDspark { model, .. }
             | Self::DeepseekV41VllmDpAttnEpMoe { model, .. }
+            | Self::DeepseekV41VllmPp { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
             | Self::Glm52VllmNvfp4PpDsaMoe { model, .. }
@@ -1937,6 +1987,11 @@ impl IterArchSel {
                 ..
             }
             | Self::DeepseekV41VllmDpAttnEpMoe {
+                model,
+                max_model_len,
+                ..
+            }
+            | Self::DeepseekV41VllmPp {
                 model,
                 max_model_len,
                 ..

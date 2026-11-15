@@ -3,8 +3,11 @@
 //! and owns the pipeline's KV; later stages pull activations over NVLink and
 //! compute their layers.
 //!
-//! Wired pairs: `glm52_vllm_nvfp4_pp_dsa_moe` and the hybrid
-//! `glm53_flash_vllm_fp8_pp_kda_dsa_moe`, each with `pipeline_chunked_prefill`.
+//! Wired pairs: `glm52_vllm_nvfp4_pp_dsa_moe`, the hybrid
+//! `glm53_flash_vllm_fp8_pp_kda_dsa_moe` and `deepseek_v41_vllm_pp`, each with
+//! `pipeline_chunked_prefill`. A stage model may size what it sends to the
+//! next stage itself (`pipeline_send_bytes`); otherwise a microbatch carries
+//! its tokens times the layout's activation bytes per token.
 //! The arch builds every stage's model once; the stage models are shared across
 //! replicas. The head sizes the pipeline's KV from the arch's
 //! `pipeline_kv_cache_layout`: the most constrained stage's cache. Its host
@@ -216,6 +219,75 @@ impl Deployment for PpDeployment {
                     },
                 ))
             }
+            IterArchSel::DeepseekV41VllmPp {
+                pp_size,
+                layer_partition,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                max_model_len,
+                decoder_swa_bounded_replay,
+                max_num_batched_tokens,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                let pipeline = arch_build::deepseek_v41_vllm_pp(
+                    model_spec,
+                    *pp_size,
+                    layer_partition,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    *max_model_len,
+                    *decoder_swa_bounded_replay,
+                    *max_num_batched_tokens,
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?;
+                // Each stage sizes what it sends (`pipeline_send_bytes`); the
+                // per-token size is the hidden-state fallback.
+                let layout = PipelineLayout {
+                    depth: pipeline.pp_size(),
+                    activation_bytes_per_token: pipeline.activation_bytes_per_token(),
+                };
+                let kv_cache_layout = pipeline.pipeline_kv_cache_layout();
+                let head_model = Arc::clone(&pipeline.stages()[0]);
+                let head_store = std::rc::Rc::clone(&store);
+                let head_log_dir = log_dir.clone();
+                let head_gpu = gpu_name.clone();
+                Ok(assemble_pp_flow(
+                    pipeline.stages(),
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name.clone(),
+                    PpStagePoolConfig {
+                        replicas: g.replicas,
+                        depth: layout.depth,
+                        placement,
+                    },
+                    build_activation_cost(&gpu_name, bridge)?,
+                    move |id, cluster| {
+                        build_pipeline_head_worker(
+                            id,
+                            STAGE_POOL_TAG,
+                            Arc::clone(&head_model),
+                            layout,
+                            &kv_cache_layout,
+                            std::rc::Rc::clone(&head_store),
+                            worker_config,
+                            head_log_dir.clone(),
+                            PP_STAGE_POOL,
+                            &head_gpu,
+                            std::rc::Rc::clone(cluster),
+                        )
+                    },
+                ))
+            }
             other => bail!("pp: arch {other:?} has no pipeline-parallel stage model"),
         }
     }
@@ -304,7 +376,8 @@ where
     H: IterWorker<Msg = PipelineHeadMsg, Event = PipelineHeadEvent> + 'static,
 {
     assert_eq!(stages.len(), usize::from(pool_config.depth));
-    Box::new(PpFlow::new(
+    let net_log_dir = log_dir.clone();
+    let flow = PpFlow::new(
         std::rc::Rc::clone(&store),
         &pool_config,
         cost,
@@ -322,5 +395,11 @@ where
                 std::rc::Rc::clone(cluster),
             )
         },
-    ))
+    );
+    // Stage-to-stage activation transfers go to `raw/gpu_cluster.parquet`, as
+    // PD's KV transfers do, once the workers have registered their groups.
+    if let Some(dir) = net_log_dir.as_deref() {
+        flow.cluster().borrow_mut().attach_logger(dir);
+    }
+    Box::new(flow)
 }

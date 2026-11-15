@@ -193,6 +193,14 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// entries and PD transfers from it; see [`crate::arch::kv_layout`].
     fn kv_cache_layout(&self) -> KvCacheLayout;
 
+    /// Bytes this model, run as one pipeline stage, sends to the next stage
+    /// for `batch`, when that is not the pipeline's per-token activation size
+    /// times the batch tokens (a stage that also forwards KV, or sends fewer
+    /// rows than it received). `None`, the default, keeps that product.
+    fn pipeline_send_bytes(&self, _batch: &UnifiedArchInput) -> Option<u64> {
+        None
+    }
+
     /// Whether the `cost_log` must keep each decode request's KV length.
     ///
     /// The default logs decode as a request count plus a KV total, which is all a

@@ -97,7 +97,7 @@ pub(crate) const DP_SIZE: u32 = 4;
 const COLLECTIVE_BACKENDS: &[&str] = &["vllm_pynccl"];
 /// Rows of the whole Engram table at TP1 (DP4 server log `engram.py:1134`,
 /// layer 1: "384006168 rows x 256"): the lookup kind's table identity.
-const ENGRAM_TABLE_ROWS_TP1: u64 = 384_006_168;
+pub(crate) const ENGRAM_TABLE_ROWS_TP1: u64 = 384_006_168;
 
 fn fit_failed(reason: impl Into<String>) -> BuildError {
     BuildError::FitFailed {

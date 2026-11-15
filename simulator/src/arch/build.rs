@@ -26,7 +26,7 @@ use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::qwen4_exp_model_cfg::{PleTableResidency, Qwen4ExpCacheDtype};
 use crate::arch::{
     deepseek_v41_vllm, deepseek_v41_vllm_dp_attn_ep_moe, deepseek_v41_vllm_dp_attn_ep_moe_dspark,
-    deepseek_v41_vllm_dspark, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
+    deepseek_v41_vllm_dspark, deepseek_v41_vllm_pp, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
     glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
     glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
     glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2,
@@ -1203,6 +1203,58 @@ pub fn deepseek_v41_vllm_dp_attn_ep_moe(
         }
         _ => model,
     })
+}
+
+/// Build DeepSeek-V4.1-Flash under plain pipeline parallelism (B200, one
+/// TP1/EP1 GPU per stage). Routed demand is one binding over all 40 routed
+/// layers at EP1, verify width 1.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v41_vllm_pp(
+    model_spec: &ModelSpec,
+    pp_size: u16,
+    layer_partition: &[u32],
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    max_model_len: Option<u32>,
+    decoder_swa_bounded_replay: bool,
+    max_num_batched_tokens: u32,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<deepseek_v41_vllm_pp::DeepseekV41VllmPpModel> {
+    let model_cfg = DeepseekV41ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let parallel = deepseek_v41_vllm_pp::DeepseekV41VllmPpParallel {
+        pp_size,
+        layer_partition: layer_partition.to_vec(),
+        gpu_name: gpu.to_string(),
+        max_model_len: deepseek_v41_vllm::resolve_max_model_len(
+            max_model_len,
+            model_cfg.max_position_embeddings,
+        )?,
+        decoder_swa_bounded_replay,
+        max_num_batched_tokens,
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.top_k,
+        ep_size: 1,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_layers,
+    };
+    let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
+    let configs = deepseek_v41_vllm_pp::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding DeepSeek-V4.1-Flash PP architecture configs")?;
+    let resolved = deepseek_v41_vllm_pp::resolve_configs(&configs);
+    deepseek_v41_vllm_pp::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash PP model (often a missing profile.db row)")
 }
 
 /// Build DeepSeek-V4.1-Flash + DSpark under DP4 attention + EP4 experts: the
@@ -2808,6 +2860,34 @@ pub fn build_iter_model(
             true,
             *decoder_swa_bounded_replay,
             *max_model_len,
+            *max_num_batched_tokens,
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::DeepseekV41VllmPp {
+            model,
+            pp_size,
+            layer_partition,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            max_model_len,
+            decoder_swa_bounded_replay,
+            max_num_batched_tokens,
+            cudagraph_capture_sizes,
+        } => Box::new(deepseek_v41_vllm_pp(
+            model,
+            *pp_size,
+            layer_partition,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            *max_model_len,
+            *decoder_swa_bounded_replay,
             *max_num_batched_tokens,
             cudagraph_capture_sizes,
             gpu,

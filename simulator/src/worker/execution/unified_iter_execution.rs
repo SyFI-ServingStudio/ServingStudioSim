@@ -103,4 +103,8 @@ impl<M: IterwiseUnifiedModel> PipelineStageExecution for UnifiedIterExecution<M>
     fn evaluate_stage(&mut self, input: &UnifiedArchInput, microbatch: u64, start: Time) -> Time {
         UnifiedIterExecution::evaluate_iteration(self, input, microbatch, start)
     }
+
+    fn stage_send_bytes(&self, input: &UnifiedArchInput) -> Option<u64> {
+        self.model.pipeline_send_bytes(input)
+    }
 }
