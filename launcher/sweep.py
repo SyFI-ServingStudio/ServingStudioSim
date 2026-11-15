@@ -458,7 +458,7 @@ async def _run_sweep_async(
 
         if pending:
             if not await prebuild_caches(
-                pending, schema, build_type, base_dir=base_dir
+                pending, schema, build_type, base_dir=base_dir, parallelism=parallelism
             ):
                 print("[error] cache prebuild failed; aborting sweep")
                 return 1
