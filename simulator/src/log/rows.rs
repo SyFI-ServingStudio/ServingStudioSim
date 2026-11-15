@@ -675,6 +675,10 @@ pub struct PrefixCacheEventEntry {
     pub requested_tokens: u64,
     pub hit_tokens: u64,
     pub full_hit_tokens: u64,
+    pub tier: &'static str,
+    pub cache_used_units_before: Option<u64>,
+    pub cache_used_units_after: Option<u64>,
+    pub ready_ms: Option<f64>,
 }
 
 pub(crate) fn prefix_cache_event_to_record_batch(
@@ -772,6 +776,27 @@ pub(crate) fn prefix_cache_event_to_record_batch(
                 entries
                     .iter()
                     .map(|entry| entry.full_hit_tokens)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                entries.iter().map(|entry| entry.tier).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.cache_used_units_before)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.cache_used_units_after)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.ready_ms)
                     .collect::<Vec<_>>(),
             )),
         ],

@@ -393,7 +393,15 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // Dropping the flow drops every worker, which flushes and joins its
     // `cost_log` writer; a writer that failed fails the run here instead of
     // leaving an incomplete cost_log behind a successful exit.
+    let cluster = Rc::clone(flow.cluster());
     drop(flow);
+    if cluster
+        .borrow()
+        .kv_pools()
+        .any(|(.., facts)| !facts.tiers.borrow().is_empty())
+    {
+        simulator::log::write_kv_cache(log_dir, &cluster.borrow())?;
+    }
     let failures = simulator::log::cost_log_failures(log_dir)?;
     anyhow::ensure!(
         failures.is_empty(),

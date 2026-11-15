@@ -39,6 +39,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use serde::Serialize;
+
 use crate::arch::kv_layout::{KvCacheLayout, KvGrowth};
 use crate::common::Time;
 
@@ -46,7 +48,8 @@ use super::kv_accounting::ResumePositions;
 use super::state_retention::{normalize, RoundState, StateRetention, StateTag};
 
 /// What a tier is written.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum TierWrites {
     /// Every finished context, as it finishes (write-through).
     #[default]
@@ -75,7 +78,7 @@ pub struct TierSpec {
 }
 
 /// One GPU's bytes a tier stores per context token and per recurrent state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct TierBytes {
     pub per_token: u64,
     pub state: u64,
@@ -166,8 +169,8 @@ pub(crate) struct TierRead {
     pub(crate) earlier: Vec<RoundState>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TierCounters {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct TierCounters {
     pub(crate) stored_entries: u64,
     /// Tokens newly written: each store writes only what the session's
     /// previous entry in the tier did not hold.
@@ -182,6 +185,27 @@ pub(crate) struct TierCounters {
     pub(crate) loaded_states: u64,
     /// Entries an exclusive tier's reads released.
     pub(crate) released_entries: u64,
+}
+
+/// One tier at the end of a run, for `kv_cache.json`. Units are tier tokens
+/// (one GPU's per-token bytes).
+#[derive(Clone, Debug, Serialize)]
+pub struct TierReport {
+    pub tier: &'static str,
+    pub writes: TierWrites,
+    pub capacity_gb: f64,
+    pub read_gb_per_s: f64,
+    pub capacity_units: u64,
+    pub used_units: u64,
+    /// Context tokens of the entries it holds.
+    pub used_tokens: u64,
+    /// Earlier round-end states its entries hold.
+    pub earlier_states: u64,
+    /// Session requests admitted after reading from it, and their hits.
+    pub hit_requests: u64,
+    pub hit_tokens: u64,
+    #[serde(flatten)]
+    pub counters: TierCounters,
 }
 
 /// What happened to a tier's entry for a session.
@@ -391,21 +415,41 @@ impl TierChain {
         self.tiers[tier].spec.name
     }
 
+    pub(crate) fn bytes(&self) -> TierBytes {
+        self.bytes
+    }
+
+    #[cfg(test)]
     pub(crate) fn counters(&self, tier: usize) -> TierCounters {
         self.tiers[tier].counters
     }
 
-    pub(crate) fn capacity_units(&self, tier: usize) -> u64 {
-        self.tiers[tier].capacity
-    }
-
+    #[cfg(test)]
     pub(crate) fn used_units(&self, tier: usize) -> u64 {
         self.tiers[tier].used
     }
 
-    /// Earlier round-end states `tier` holds now.
+    #[cfg(test)]
     pub(crate) fn earlier_states(&self, tier: usize) -> u64 {
         self.tiers[tier].earlier_states
+    }
+
+    /// `tier` now, given what admission counted reading from it.
+    pub(crate) fn report(&self, tier: usize, hit_requests: u64, hit_tokens: u64) -> TierReport {
+        let state = &self.tiers[tier];
+        TierReport {
+            tier: state.spec.name,
+            writes: state.spec.writes,
+            capacity_gb: state.spec.capacity_gb,
+            read_gb_per_s: state.spec.read_gb_per_s,
+            capacity_units: state.capacity,
+            used_units: state.used,
+            used_tokens: state.used_tokens,
+            earlier_states: state.earlier_states,
+            hit_requests,
+            hit_tokens,
+            counters: state.counters,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

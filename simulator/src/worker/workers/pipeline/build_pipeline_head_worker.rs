@@ -90,7 +90,8 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         kv_store.with_tier_warm_start()
     } else {
         kv_store
-    };
+    }
+    .with_tiers_reports(essentials.tiers_reports);
     let admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
         (),

@@ -29,7 +29,7 @@ pub use network_logger::NetworkLogger;
 pub use parquet_writer::StreamingParquetWriter;
 pub use prefix_cache_logger::{
     PrefixCacheActivation, PrefixCacheEvent, PrefixCacheEventKind, PrefixCacheEvictionReason,
-    PrefixCacheLogger, PrefixCacheRetentionReason,
+    PrefixCacheLogger, PrefixCacheRetentionReason, HBM_TIER,
 };
 pub use rows::{
     CostLogEntry, GpuClusterEntry, GroupInputLog, KvSnapshotEntry, PrefixCacheEventEntry,

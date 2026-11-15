@@ -31,7 +31,7 @@
 use crate::common::{RequestId, SessionInput, Time};
 use crate::log::{
     KvSampler, KvSubmit, PrefixCacheActivation, PrefixCacheEvent, PrefixCacheEventKind,
-    PrefixCacheEvictionReason, PrefixCacheLogger, PrefixCacheRetentionReason,
+    PrefixCacheEvictionReason, PrefixCacheLogger, PrefixCacheRetentionReason, HBM_TIER,
 };
 use crate::worker::kv::shared::kv_accounting::SharedKvAccounting;
 use crate::worker::kv::shared::prefix_cache::{
@@ -45,7 +45,9 @@ use crate::worker::kv::shared::state_retention::Carried;
 use crate::worker::kv::shared::tier_chain::{
     LeavingContext, RoundContext, TierBytes, TierChain, TierHit, TierSpec,
 };
-use crate::worker::kv::shared::tier_reads::{ReadPhase, ReadRecord, TierReads};
+use crate::worker::kv::shared::tier_reads::{
+    ReadPhase, ReadRecord, SharedTiersReports, TierReads, TiersReport,
+};
 use crate::worker::kv::{
     ChunkedPrefillKv, HandoffKv, IterWorkerKv, KvStore, PrefixKv, ResolvedPrefillContext,
     SlotPipelineKv, TierReadPlan, TieredPrefixKv,
@@ -85,6 +87,8 @@ pub struct KvCacheStore {
     /// Whether a declared prefix longer than anything the run stored for the
     /// session is a pre-run context, read from the slowest tier.
     tier_warm_start: bool,
+    /// Where the tiers' end-of-run report goes when the store is dropped.
+    tiers_reports: Option<SharedTiersReports>,
     journal: PrefixCacheJournal,
     sampler: Option<KvSampler>,
 }
@@ -478,7 +482,6 @@ impl TieredPrefixKv for KvCacheStore {
                 partition,
                 session_id,
                 hit,
-                resident,
                 read,
                 phase: ReadPhase::Reading,
             },
@@ -486,6 +489,7 @@ impl TieredPrefixKv for KvCacheStore {
         for context in evicted {
             chain.take_hbm_eviction(context);
         }
+        self.log_tier_events(partition, request, now);
     }
 
     fn next_tier_landing(&self) -> Option<Time> {
@@ -597,6 +601,7 @@ impl PrefixKv for KvCacheStore {
                 "prefill context changed between preview and reservation"
             );
             self.journal.record(PrefixCacheEvent {
+                tier: HBM_TIER,
                 partition_id: partition,
                 time: now,
                 request_id: request,
@@ -613,6 +618,8 @@ impl PrefixKv for KvCacheStore {
                 requested_tokens: u64::from(resolved_prefill.declared_prefix_tokens()),
                 hit_tokens: u64::from(take_result.hit_tokens),
                 full_hit_tokens: u64::from(take_result.full_hit_tokens),
+                cache_used_units: None,
+                ready: None,
             });
             resolved_prefill =
                 resolved_prefill.with_cache_return_metadata(take_result.return_metadata);
@@ -630,6 +637,7 @@ impl PrefixKv for KvCacheStore {
                 u64::from(resolved_prefill.resident_prefix_tokens()),
             );
             self.tier_chains[partition as usize].cut(session_id, declared);
+            self.log_tier_events(partition, request, now);
         }
     }
 
@@ -705,6 +713,7 @@ impl KvCacheStore {
             tier_chains: Vec::new(),
             tier_reads: None,
             tier_warm_start: false,
+            tiers_reports: None,
             journal: PrefixCacheJournal::new(prefix_cache_logger),
             sampler,
             accounting,
@@ -716,8 +725,15 @@ impl KvCacheStore {
     pub(crate) fn with_prefix_tiers(mut self, specs: &[TierSpec], bytes: TierBytes) -> Self {
         if !specs.is_empty() {
             let retention = self.accounting.state_retention();
+            let logging = self.journal.is_logging();
             self.tier_chains = (0..self.partitions.len())
-                .map(|_| TierChain::new(specs, bytes, retention))
+                .map(|_| {
+                    let mut chain = TierChain::new(specs, bytes, retention);
+                    if logging {
+                        chain.record_events();
+                    }
+                    chain
+                })
                 .collect();
             self.tier_reads = Some(TierReads::new(self.partitions.len(), specs.len()));
         }
@@ -733,6 +749,46 @@ impl KvCacheStore {
     pub(crate) fn with_tier_warm_start(mut self) -> Self {
         self.tier_warm_start = true;
         self
+    }
+
+    /// Leave each partition's [`TiersReport`] in `reports` when the store is
+    /// dropped.
+    pub(crate) fn with_tiers_reports(mut self, reports: SharedTiersReports) -> Self {
+        self.tiers_reports = Some(reports);
+        self
+    }
+
+    /// Each partition's tiers now; empty without tiers.
+    pub(crate) fn tiers_reports(&self) -> Vec<TiersReport> {
+        let Some(reads) = &self.tier_reads else {
+            return Vec::new();
+        };
+        self.tier_chains
+            .iter()
+            .enumerate()
+            .map(|(partition, chain)| {
+                let stats = reads.stats(partition as PartitionId);
+                TiersReport {
+                    bytes: chain.bytes(),
+                    session_requests: stats.session_requests,
+                    declared_tokens: stats.declared_tokens,
+                    hbm_hit_tokens: stats.hbm_hit_tokens,
+                    resident_tokens_at_admission: stats.resident_tokens,
+                    warm_start_reads: stats.warm_start_reads,
+                    warm_start_tokens: stats.warm_start_tokens,
+                    rereads: stats.rereads,
+                    tiers: (0..chain.len())
+                        .map(|tier| {
+                            chain.report(
+                                tier,
+                                stats.tier_hit_requests[tier],
+                                stats.tier_hit_tokens[tier],
+                            )
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
     }
 
     /// Where a read of the session's `declared` prefix on `partition` would
@@ -946,6 +1002,7 @@ impl KvCacheStore {
                         shared: shared_tokens,
                     },
                 );
+                self.log_tier_events(partition, request, now);
             }
         }
     }
@@ -1176,6 +1233,20 @@ impl KvCacheStore {
             (evicted, self.tier_chains.get_mut(partition as usize))
         {
             chain.take_hbm_eviction(evicted);
+            self.log_tier_events(partition, request, now);
+        }
+    }
+
+    /// Journal the entry changes `partition`'s tiers made on behalf of
+    /// `request`.
+    fn log_tier_events(&mut self, partition: PartitionId, request: RequestId, now: Time) {
+        let Some(chain) = self.tier_chains.get_mut(partition as usize) else {
+            return;
+        };
+        for event in chain.take_events() {
+            let tier = chain.tier_name(event.tier);
+            self.journal
+                .record_tier_event(request, partition, now, tier, event);
         }
     }
 
@@ -1226,11 +1297,13 @@ impl KvCacheStore {
         if let Some(unkept) = insert_result.unkept {
             if let Some(chain) = self.tier_chains.get_mut(partition as usize) {
                 chain.take_hbm_eviction(unkept);
+                self.log_tier_events(partition, request, now);
             }
         }
         if insert_result.retained_tokens == 0 {
             let cache_used = self.prefix_caches[partition as usize].used_tokens();
             self.journal.record(PrefixCacheEvent {
+                tier: HBM_TIER,
                 partition_id: partition,
                 time: now,
                 request_id: request,
@@ -1243,6 +1316,8 @@ impl KvCacheStore {
                 requested_tokens: tokens,
                 hit_tokens: 0,
                 full_hit_tokens: 0,
+                cache_used_units: None,
+                ready: None,
             });
         }
     }
@@ -1283,10 +1358,19 @@ impl KvCacheStore {
     }
 }
 
+impl Drop for KvCacheStore {
+    fn drop(&mut self) {
+        if let Some(reports) = &self.tiers_reports {
+            *reports.borrow_mut() = self.tiers_reports();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::rc::Rc;
 
     use arrow_array::{StringArray, UInt64Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -1467,6 +1551,96 @@ mod tests {
             (1, 6_000)
         );
         assert_eq!(stats.rereads, 0);
+    }
+
+    #[test]
+    fn tier_changes_are_logged_beside_hbm_and_reported_when_the_store_drops() {
+        let log_directory = tempdir().unwrap();
+        let logger =
+            PrefixCacheLogger::open(log_directory.path(), "main", crate::common::WorkerId(0))
+                .unwrap();
+        let reports = SharedTiersReports::default();
+        let mut kv_store = KvCacheStore::new(
+            1,
+            KvAccounting::tokens_for_test(10_000),
+            capped_prefix_cache(10_000, PrefixCachePolicy::Lru),
+            None,
+            Some(logger),
+        )
+        .with_prefix_tiers(
+            &[TierSpec {
+                name: "dram",
+                capacity_gb: 1.0,
+                read_gb_per_s: 1.0,
+                writes: TierWrites::EveryContext,
+            }],
+            TierBytes {
+                per_token: 1000,
+                state: 0,
+            },
+        )
+        .with_tiers_reports(Rc::clone(&reports));
+        complete(&mut kv_store, 1, session(1, 0), 6_000);
+        kv_store.prefix_caches[0].shrink_to(0);
+        let read = plan(&kv_store, 2, session(1, 6_000), 10, Time::ZERO).unwrap();
+        kv_store.start_tier_read(0, RequestId(2), session(1, 6_000), read, Time::ZERO);
+        kv_store.take_landed_reads(Time::from_ms(6.0));
+        kv_store.restore_landed_read(0, RequestId(2), Time::from_ms(6.0));
+        admit(&mut kv_store, 2, session(1, 6_000), 10);
+        drop(kv_store);
+
+        let path = log_directory
+            .path()
+            .join("raw/prefix_cache_event/worker_main_0.parquet");
+        let batch = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let strings = |name: &str| -> Vec<String> {
+            let column = batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|row| column.value(row).to_string())
+                .collect()
+        };
+        let rows: Vec<(String, String)> = strings("tier")
+            .into_iter()
+            .zip(strings("reason"))
+            .filter(|(tier, _)| tier == "dram")
+            .collect();
+        assert_eq!(
+            rows,
+            [("dram", "write-through"), ("dram", "read")]
+                .map(|(tier, reason)| (tier.to_string(), reason.to_string()))
+        );
+        let ready = batch
+            .column_by_name("ready_ms")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        let read_row = strings("reason")
+            .iter()
+            .position(|reason| reason == "read")
+            .unwrap();
+        assert_eq!(ready.value(read_row), 6.0);
+
+        let reports = reports.borrow();
+        assert_eq!(reports.len(), 1);
+        let dram = &reports[0].tiers[0];
+        assert_eq!(
+            (dram.used_units, dram.hit_requests, dram.hit_tokens),
+            (6_000, 1, 6_000)
+        );
+        assert_eq!((dram.counters.stored_entries, dram.counters.loads), (1, 1));
+        assert_eq!(reports[0].session_requests, 2);
     }
 
     #[test]

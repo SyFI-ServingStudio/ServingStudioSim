@@ -20,7 +20,9 @@ use crate::timing::{CostManifest, CostManifestDoc};
 use crate::worker::config::PrefillChunkAlignment;
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::{KvPoolFacts, SharedGpuCluster};
-use crate::worker::kv::{KvAccounting, KvAccountingOptions, KvCacheStore, SharedKvAccounting};
+use crate::worker::kv::{
+    KvAccounting, KvAccountingOptions, KvCacheStore, SharedKvAccounting, SharedTiersReports,
+};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::WorkerConfig;
 
@@ -31,6 +33,8 @@ pub(super) struct IterBuildEssentials {
     /// Reusable cost/slot buffers, already wired to this worker's cost log. The
     /// recipe hands them to whichever execution adapter it selected.
     pub(super) cost: CostBuffers,
+    /// Where the KV store leaves its tiers' end-of-run report.
+    pub(super) tiers_reports: SharedTiersReports,
 }
 
 /// One KV partition's accounting: the arch's layout against the worker's
@@ -127,8 +131,9 @@ pub(super) fn prepare_iter_build_essentials(
             .borrow_mut()
             .allocate(pool.0, id.0, gpus_per_replica, gpu_name, pool_tag);
 
+    let facts = KvPoolFacts::of(kv_accounting, config.max_model_len);
+    let tiers_reports = facts.tiers.clone();
     {
-        let facts = KvPoolFacts::of(kv_accounting, config.max_model_len);
         let mut cluster = cluster.borrow_mut();
         for partition in 0..num_partitions as u16 {
             cluster.register_kv_pool(pool_tag, pool.0, id.0, partition, facts.clone());
@@ -165,5 +170,6 @@ pub(super) fn prepare_iter_build_essentials(
         allocation_base,
         sampler,
         cost,
+        tiers_reports,
     }
 }

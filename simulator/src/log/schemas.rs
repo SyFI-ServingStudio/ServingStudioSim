@@ -187,6 +187,9 @@ pub fn kv_snapshot_schema() -> Arc<Schema> {
 /// `prefix_cache_event` — an exact per-worker replay of retained-prefix cache
 /// ownership transitions. Unlike the throttled `kv_snapshot`, every row is a
 /// real cache operation and `sequence` totally orders equal-time mutations.
+/// With host tiers behind HBM, their entries' changes are rows too, told apart
+/// by `tier`; their token counts are per tier, and `cache_used_units_*` give
+/// the tier's used capacity in its own units.
 pub fn prefix_cache_event_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("pool_tag", DataType::Utf8, false),
@@ -205,6 +208,10 @@ pub fn prefix_cache_event_schema() -> Arc<Schema> {
         Field::new("requested_tokens", DataType::UInt64, false),
         Field::new("hit_tokens", DataType::UInt64, false),
         Field::new("full_hit_tokens", DataType::UInt64, false),
+        Field::new("tier", DataType::Utf8, false),
+        Field::new("cache_used_units_before", DataType::UInt64, true),
+        Field::new("cache_used_units_after", DataType::UInt64, true),
+        Field::new("ready_ms", DataType::Float64, true),
     ]))
 }
 

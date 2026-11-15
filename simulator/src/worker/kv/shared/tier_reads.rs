@@ -6,13 +6,17 @@
 //! context back into HBM. A context put back but evicted again before its
 //! request is admitted is read again.
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::rc::Rc;
+
+use serde::Serialize;
 
 use crate::common::{RequestId, Time};
 use crate::worker::shared::advance_scope::PartitionId;
 
-use super::tier_chain::{TierHit, TierRead};
+use super::tier_chain::{TierBytes, TierHit, TierRead, TierReport};
 
 /// Where a read is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,8 +34,6 @@ pub(crate) struct ReadRecord {
     pub(crate) partition: PartitionId,
     pub(crate) session_id: u32,
     pub(crate) hit: TierHit,
-    /// What HBM held when the read started.
-    pub(crate) resident: u64,
     pub(crate) read: TierRead,
     pub(crate) phase: ReadPhase,
 }
@@ -54,6 +56,29 @@ pub(crate) struct AdmissionStats {
     /// admission.
     pub(crate) rereads: u64,
 }
+
+/// One partition's tiers at the end of a run, for `kv_cache.json`.
+#[derive(Clone, Debug, Serialize)]
+pub struct TiersReport {
+    /// What each GPU stores per context token and per recurrent state.
+    pub bytes: TierBytes,
+    pub session_requests: u64,
+    pub declared_tokens: u64,
+    /// Resident tokens of the requests admitted without a read.
+    pub hbm_hit_tokens: u64,
+    /// Resident tokens at admission, read or not.
+    pub resident_tokens_at_admission: u64,
+    pub warm_start_reads: u64,
+    pub warm_start_tokens: u64,
+    /// Reads of a context an earlier read put back but HBM evicted before
+    /// admission.
+    pub rereads: u64,
+    pub tiers: Vec<TierReport>,
+}
+
+/// Where a worker leaves each partition's [`TiersReport`] when it is dropped
+/// at the end of the run; empty without tiers.
+pub type SharedTiersReports = Rc<RefCell<Vec<TiersReport>>>;
 
 pub(crate) struct TierReads {
     records: HashMap<RequestId, ReadRecord>,
