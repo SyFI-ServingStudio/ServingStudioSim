@@ -24,7 +24,7 @@ use super::admission::{
 };
 use super::kv::{
     KvOverhead, PartPadding, PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy,
-    PrefixResumePoints, StateRetention, TierSpec, TierWrites,
+    PrefixResumePoints, StateRetention, TierSpec, TierWrites, DRAM_TIER,
 };
 use super::types::WorkerConfig;
 
@@ -425,6 +425,14 @@ pub struct PrefixTierSpec {
     #[serde(default)]
     #[param(default = 0.0)]
     prefix_tier_loading_area: f64,
+    /// Tiers store each recurrent state compressed by this ratio, rounded up,
+    /// encoded and decoded by the host CPU (its time not modeled) while HBM
+    /// keeps it whole: a state costs its stored size in tier capacity, writes
+    /// and on the SSD channel, its decoded size on DRAM's channel and in
+    /// HBM's loading area. Finite and >= 1; `1`: uncompressed. Not vLLM.
+    #[serde(default = "default_tier_state_compression_ratio")]
+    #[param(default = 1.0)]
+    tier_state_compression_ratio: f64,
 }
 
 const fn default_dram_tier_gb_per_s() -> f64 {
@@ -433,6 +441,10 @@ const fn default_dram_tier_gb_per_s() -> f64 {
 
 const fn default_ssd_tier_gb_per_s() -> f64 {
     10.0
+}
+
+const fn default_tier_state_compression_ratio() -> f64 {
+    1.0
 }
 
 impl Default for PrefixTierSpec {
@@ -449,6 +461,7 @@ impl Default for PrefixTierSpec {
             prefix_tier_read_wait_policy: ReadWaitPolicy::default(),
             prefix_tier_warm_start: false,
             prefix_tier_loading_area: 0.0,
+            tier_state_compression_ratio: default_tier_state_compression_ratio(),
         }
     }
 }
@@ -487,7 +500,7 @@ impl PrefixTierSpec {
             SsdTierWrites::DramEvictions => TierWrites::Evictions,
         };
         config.prefix_tiers = [
-            tier("dram", dram_gb, self.dram_tier_gb_per_s, dram_writes)?,
+            tier(DRAM_TIER, dram_gb, self.dram_tier_gb_per_s, dram_writes)?,
             tier("ssd", ssd_gb, self.ssd_tier_gb_per_s, ssd_writes)?,
         ]
         .into_iter()
@@ -526,6 +539,12 @@ impl PrefixTierSpec {
              (prefix_tier_loading_area > 0)"
         );
         config.prefix_tier_loading_area = area;
+        let ratio = self.tier_state_compression_ratio;
+        ensure!(
+            ratio.is_finite() && ratio >= 1.0,
+            "{owner}: tier_state_compression_ratio ({ratio}) must be a finite ratio >= 1"
+        );
+        config.tier_state_compression_ratio = ratio;
         config.prefix_tier_balanced_load = self.prefix_tier_balanced_load;
         config.prefix_tier_warm_start = self.prefix_tier_warm_start;
         Ok(())
@@ -1676,5 +1695,15 @@ mod tests {
             "{dram}prefix_tier_loading_area: 0.1\nprefix_tier_max_read_wait_ms: 1000.0\n"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn a_tier_state_compression_ratio_is_finite_and_at_least_one() {
+        let ratio =
+            |extra: &str| prefix_tiers(extra).map(|config| config.tier_state_compression_ratio);
+        assert_eq!(ratio("").unwrap(), 1.0);
+        assert_eq!(ratio("tier_state_compression_ratio: 1.86\n").unwrap(), 1.86);
+        assert!(ratio("tier_state_compression_ratio: 0.5\n").is_err());
+        assert!(ratio("tier_state_compression_ratio: .inf\n").is_err());
     }
 }

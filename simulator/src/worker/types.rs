@@ -616,6 +616,8 @@ pub struct WorkerConfig {
     /// Fraction of HBM (and of DRAM with an SSD behind it) kept as loading
     /// areas staged tier reads go through; `0`: reads are not staged.
     pub prefix_tier_loading_area: f64,
+    /// Tiers store each recurrent state over this ratio; `1`: uncompressed.
+    pub tier_state_compression_ratio: f64,
     /// Tokens one step may have in flight, which caps what admission charges a
     /// sliding window. `None` is two steps of `max_batch_tokens` (vLLM's async
     /// scheduling), or the whole prompt without a token budget.
@@ -674,6 +676,7 @@ impl Default for WorkerConfig {
             prefix_tier_read_wait: None,
             prefix_tier_warm_start: false,
             prefix_tier_loading_area: 0.0,
+            tier_state_compression_ratio: 1.0,
             kv_max_in_flight_tokens: None,
             max_model_len: None,
             prefill_chunk_alignment: None,

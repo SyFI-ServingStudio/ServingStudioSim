@@ -31,6 +31,12 @@
 //! Where an entry can be resumed follows its [`ResumePositions`], as in HBM,
 //! else its latest kept state at or before the prompt's end.
 //!
+//! A tier may store states compressed ([`TierStateOptions::compression_ratio`]),
+//! encoded and decoded by the host CPU (its time not modeled) while HBM keeps
+//! them whole: a state then costs its stored size in each tier's capacity,
+//! writes and the SSD channel, and its decoded size on DRAM's channel (the
+//! host-to-GPU copy) and in HBM's loading area.
+//!
 //! Reads queue FIFO on one channel per tier (its read bandwidth). A read moves
 //! the KV HBM lacks and, of the entry's states at or before the hit, only those
 //! that survive the round it serves ([`StateRetention::survivors`]): the state
@@ -91,18 +97,38 @@ pub struct TierSpec {
     pub writes: TierWrites,
 }
 
+/// The host DRAM tier's name: its channel is the host-to-GPU copy, which
+/// moves a state decoded.
+pub const DRAM_TIER: &str = "dram";
+
 /// How tiers move recurrent states, beside the retention that picks them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TierStateOptions {
     /// Round-end states a round adds to its context: its pass's end, and with
     /// a decode run elsewhere the handed-back decode's end. A read moves only
     /// the states that survive that many more.
     pub added_per_round: u32,
+    /// Tiers store a state over this ratio, rounded up; `1`: as HBM holds it.
+    pub compression_ratio: f64,
 }
 
 impl Default for TierStateOptions {
     fn default() -> Self {
-        Self { added_per_round: 1 }
+        Self {
+            added_per_round: 1,
+            compression_ratio: 1.0,
+        }
+    }
+}
+
+impl TierStateOptions {
+    /// A state of `bytes` as the tiers store it.
+    pub fn stored_state_bytes(self, bytes: u64) -> u64 {
+        if self.compression_ratio == 1.0 {
+            bytes
+        } else {
+            (bytes as f64 / self.compression_ratio).ceil() as u64
+        }
     }
 }
 
@@ -116,7 +142,12 @@ pub struct TierBytes {
 impl TierBytes {
     /// One state in tier tokens, rounded up.
     pub fn state_tokens(self) -> u64 {
-        self.state.div_ceil(self.per_token.max(1))
+        self.tokens_of(self.state)
+    }
+
+    /// `bytes` in tier tokens, rounded up.
+    fn tokens_of(self, bytes: u64) -> u64 {
+        bytes.div_ceil(self.per_token.max(1))
     }
 
     /// A one-GPU layout's bytes: its per-token parts, and the model's own
@@ -450,8 +481,10 @@ impl Tier {
 pub(crate) struct TierChain {
     tiers: Vec<Tier>,
     bytes: TierBytes,
-    /// One state in tier tokens.
+    /// One state in tier tokens, as the tiers store it.
     state_tokens: u64,
+    /// One state in tier tokens, decoded as HBM holds it.
+    decoded_state_tokens: u64,
     retention: StateRetention,
     options: TierStateOptions,
     /// Staged loading; `None`: reads land straight in HBM.
@@ -470,6 +503,10 @@ impl TierChain {
         assert!(
             options.added_per_round >= 1,
             "a round leaves at least its pass's end state"
+        );
+        assert!(
+            options.compression_ratio.is_finite() && options.compression_ratio >= 1.0,
+            "a tier state compression ratio is finite and >= 1"
         );
         let per_token = bytes.per_token.max(1) as f64;
         let tiers = specs
@@ -497,7 +534,8 @@ impl TierChain {
         Self {
             tiers,
             bytes,
-            state_tokens: bytes.state_tokens(),
+            state_tokens: bytes.tokens_of(options.stored_state_bytes(bytes.state)),
+            decoded_state_tokens: bytes.state_tokens(),
             retention,
             options,
             loading: None,
@@ -552,7 +590,7 @@ impl TierChain {
         Some(StagedCharge {
             queue,
             landed: self.landed_units_of(kv, states),
-            read: self.read_units_of(kv, states),
+            read: self.read_units_of(tier, kv, states),
         })
     }
 
@@ -1027,18 +1065,23 @@ impl TierChain {
     /// state at the hit and the earlier states it moves.
     pub(crate) fn read_units(&self, session_id: u32, hit: TierHit, resident: u64) -> u64 {
         let states = 1 + self.read_states(session_id, hit).len() as u64;
-        self.read_units_of(hit.tokens.saturating_sub(resident), states)
+        self.read_units_of(hit.tier, hit.tokens.saturating_sub(resident), states)
     }
 
-    /// Tier tokens a tier reads for `kv` context tokens and `states` states.
-    fn read_units_of(&self, kv: u64, states: u64) -> u64 {
-        kv + states * self.state_tokens
+    /// Tier tokens `tier`'s channel moves for `kv` context tokens and `states`
+    /// states: DRAM's copies each state decoded, any other reads it stored.
+    fn read_units_of(&self, tier: usize, kv: u64, states: u64) -> u64 {
+        let state_tokens = if self.tiers[tier].spec.name == DRAM_TIER {
+            self.decoded_state_tokens
+        } else {
+            self.state_tokens
+        };
+        kv + states * state_tokens
     }
 
     /// Tier tokens `kv` context tokens and `states` states take in HBM.
-    /// Tiers store states as HBM holds them, so this is what a tier reads.
     fn landed_units_of(&self, kv: u64, states: u64) -> u64 {
-        self.read_units_of(kv, states)
+        kv + states * self.decoded_state_tokens
     }
 
     /// How long a read queued on `tier` now waits for its channel.
@@ -1584,7 +1627,10 @@ mod tests {
                     state: 10_000,
                 },
                 StateRetention::Latest { k },
-                TierStateOptions { added_per_round },
+                TierStateOptions {
+                    added_per_round,
+                    ..TierStateOptions::default()
+                },
             );
             for (tokens, shared) in [(100, 0), (120, 100), (150, 120), (180, 150)] {
                 chain.store_round(1, round(tokens, shared));
@@ -1829,6 +1875,94 @@ mod tests {
             "SSD alone is the fastest tier"
         );
         assert_eq!(chain(&[dram], 0, 1).staged_charge(0, 400, 1), None);
+    }
+
+    /// HBM -> DRAM -> SSD victim chain, 1000 B per token, 1 GB/s (1,000
+    /// tokens per ms), a 50k-token state stored over `ratio`, two states kept.
+    fn compressed_chain(dram_gb: f64, ratio: f64) -> TierChain {
+        TierChain::new(
+            &[
+                spec(DRAM, dram_gb, 1.0, TierWrites::Evictions),
+                spec(SSD, 10.0, 1.0, TierWrites::Evictions),
+            ],
+            TierBytes {
+                per_token: 1000,
+                state: 50_000_000,
+            },
+            StateRetention::Latest { k: 2 },
+            TierStateOptions {
+                compression_ratio: ratio,
+                ..TierStateOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_compressed_state_costs_its_stored_size_except_on_the_host_to_gpu_copy() {
+        // Ratio 2: a state is stored as 25k tier tokens.
+        let mut chain = compressed_chain(1.0, 2.0);
+        chain.take_hbm_eviction(leaving(1, 100_000, &[60_000]));
+        assert_eq!(
+            chain.used_units(0),
+            100_000 + 2 * 25_000,
+            "DRAM stores both states compressed"
+        );
+        assert_eq!(chain.counters(0).written_states, 2);
+        let hit = chain.lookup(1, 100_000).unwrap();
+        assert_eq!(hit.tier, 0);
+        // With k = 2 and one state added per round, the read moves the end
+        // state only, decoded on the host before the copy.
+        assert_eq!(chain.read_units(1, hit, 0), 100_000 + 50_000);
+        assert_eq!(
+            chain.read(1, hit, 0, Time::ZERO).ready,
+            Time::from_ms(150.0)
+        );
+
+        // A DRAM too small for the entry passes it to SSD, compressed.
+        let mut chain = compressed_chain(0.1, 2.0);
+        chain.set_loading_area(0.1, 1_000_000_000);
+        chain.take_hbm_eviction(leaving(2, 100_000, &[60_000]));
+        assert_eq!(chain.used_units(0), 0);
+        assert_eq!(chain.used_units(1), 100_000 + 2 * 25_000);
+        let hit = chain.lookup(2, 100_000).unwrap();
+        assert_eq!(hit.tier, 1);
+        assert_eq!(
+            chain.read_units(2, hit, 0),
+            100_000 + 25_000,
+            "SSD reads the stored state"
+        );
+        let charge = chain.staged_charge(1, 100_000, 1).unwrap();
+        assert_eq!(charge.queue, LoadingQueue::Dram);
+        assert_eq!(charge.read, 100_000 + 25_000, "DRAM's area holds it stored");
+        assert_eq!(charge.landed, 100_000 + 50_000, "HBM lands it decoded");
+        assert_eq!(
+            chain.read(2, hit, 0, Time::ZERO).ready,
+            Time::from_ms(125.0)
+        );
+        assert_eq!(
+            chain.hop(2, 100_000, charge, Time::from_ms(125.0)),
+            Time::from_ms(275.0),
+            "the hop copies it decoded on DRAM's channel"
+        );
+    }
+
+    #[test]
+    fn uncompressed_states_cost_the_same_everywhere() {
+        let chain = compressed_chain(1.0, 1.0);
+        assert_eq!(chain.state_tokens, 50_000);
+        assert_eq!(chain.read_units_of(0, 0, 1), 50_000);
+        assert_eq!(chain.read_units_of(1, 0, 1), 50_000);
+        assert_eq!(chain.landed_units_of(0, 1), 50_000);
+        // A ratio rounds the stored bytes up, then whole tier tokens.
+        let options = TierStateOptions {
+            compression_ratio: 1.86,
+            ..TierStateOptions::default()
+        };
+        assert_eq!(options.stored_state_bytes(36_904_960), 19_841_377);
+        assert_eq!(
+            TierStateOptions::default().stored_state_bytes(36_904_960),
+            36_904_960
+        );
     }
 
     #[test]

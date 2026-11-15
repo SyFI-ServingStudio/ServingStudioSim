@@ -20,7 +20,7 @@ pub use shared::kv_cache_report::KvCacheReport;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub use shared::state_retention::StateRetention;
 pub use shared::tier_chain::{
-    LoadingQueue, StagedCharge, TierBytes, TierSpec, TierStateOptions, TierWrites,
+    LoadingQueue, StagedCharge, TierBytes, TierSpec, TierStateOptions, TierWrites, DRAM_TIER,
 };
 pub use shared::tier_reads::{SharedTiersReports, TiersReport};
 
